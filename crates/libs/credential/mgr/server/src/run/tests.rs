@@ -43,6 +43,7 @@ fn node_local_config() -> CredmgrRunConfig {
     CredmgrRunConfig {
         role: CredmgrRole::Authority,
         socket_path: PathBuf::from(crate::CREDMGR_SOCKET),
+        volume_socket_path: None,
         tcp_listen: None,
         tls_cert: None,
         tls_key: None,
@@ -314,4 +315,21 @@ async fn early_server_exit_stops_parent_and_releases_mutex() {
     .await
     .expect("replacement should acquire the released mutex");
     drop(replacement);
+}
+
+#[test]
+fn volume_socket_requires_a_distinct_uds_listener() {
+    let mut config = node_local_config();
+    config.volume_socket_path = Some(config.socket_path.clone());
+    assert!(matches!(
+        validate_flag_shape(&config),
+        Err(RunCredmgrError::InvalidVolumeSocket)
+    ));
+    config.volume_socket_path = Some(PathBuf::from("/space/run/volume-credentials/credmgr.sock"));
+    validate_flag_shape(&config).unwrap();
+    config.no_uds = true;
+    assert!(matches!(
+        validate_flag_shape(&config),
+        Err(RunCredmgrError::InvalidVolumeSocket)
+    ));
 }

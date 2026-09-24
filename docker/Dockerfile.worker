@@ -24,7 +24,8 @@ LABEL org.opencontainers.image.title="space-worker"
 LABEL org.opencontainers.image.description="SPACE worker node services (node-manager + sandbox-manager)"
 
 # SPACE groups — must match the host GIDs from the AMI's 07-sysctl.sh.
-# Node-manager needs these for socket permissions (getgrnam).
+# Node-manager needs these for socket permissions (getgrnam). Volume-manager
+# has its own UID and credential-socket group; runtime launchers select it.
 COPY infra/space/identity/node-identities.sh /opt/space/etc/node-identities.sh
 RUN . /opt/space/etc/node-identities.sh && \
     for spec in $SPACE_GROUP_SPECS; do \

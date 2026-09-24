@@ -1738,3 +1738,38 @@ async fn every_credential_mapper_answers_a_lost_lock_race_as_unavailable()
     );
     Ok(())
 }
+
+#[test]
+fn volume_principal_has_only_transfer_credential_permissions() {
+    let service = CredentialManagerService::new(
+        Arc::new(InMemoryKeyWrapper::new()),
+        PeerProcessCheckMode::Off,
+    );
+    let caller = ResolvedCaller::UdsPeer(PeerIdentity::new(users::SPACE_VOLMGR.uid, 951, Some(1)));
+    for (operation, allow, expected) in [
+        ("ExchangeToken", ALLOW_EXCHANGE_TOKEN, true),
+        ("IssueDek", ALLOW_ISSUE_DEK, true),
+        ("UnwrapDek", ALLOW_UNWRAP_DEK, true),
+        ("Encrypt", ALLOW_ENVELOPE, false),
+        ("Decrypt", ALLOW_ENVELOPE, false),
+        ("GetOrIssueSandboxVolumeDek", ALLOW_VOLUME_DEK, false),
+        (
+            "IssueIntermediateCertificate",
+            ALLOW_ISSUE_INTERMEDIATE,
+            false,
+        ),
+    ] {
+        let result = service
+            .caller_resolver
+            .authorize_caller(&caller, operation, allow, &[]);
+        if expected {
+            result.unwrap();
+        } else {
+            assert_eq!(
+                result.unwrap_err().code(),
+                tonic::Code::PermissionDenied,
+                "{operation}"
+            );
+        }
+    }
+}

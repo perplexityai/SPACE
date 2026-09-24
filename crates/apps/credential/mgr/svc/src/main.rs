@@ -29,6 +29,9 @@ struct Cli {
     /// Unix socket path for the gRPC service
     #[arg(long, default_value = CREDENTIAL_MANAGER_SOCKET)]
     socket: PathBuf,
+    /// Restricted volume-manager credential socket (ExchangeToken, IssueDek, UnwrapDek).
+    #[arg(long, conflicts_with = "no_uds")]
+    volume_socket: Option<PathBuf>,
     /// TCP listen address for the control-plane deployment
     /// (e.g. 0.0.0.0:9810). Without TLS flags this requires
     /// --allow-plaintext.
@@ -93,6 +96,7 @@ impl From<Cli> for CredmgrRunConfig {
         Self {
             role: cli.role.into(),
             socket_path: cli.socket,
+            volume_socket_path: cli.volume_socket,
             tcp_listen: cli.tcp_listen,
             tls_cert: cli.tls_cert,
             tls_key: cli.tls_key,

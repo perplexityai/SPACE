@@ -250,6 +250,7 @@ async fn gateway_signing_authorizes_sandbox_manager_before_acquiring_a_ca() {
         // whether this caller reached the signer without issuing a real CA.
         for (uid, expected) in [
             (users::SPACE_SBXMGR.uid, Code::InvalidArgument),
+            (users::SPACE_VOLMGR.uid, Code::PermissionDenied),
             (0, Code::PermissionDenied),
             (65534, Code::PermissionDenied),
         ] {

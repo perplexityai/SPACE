@@ -27,9 +27,15 @@
 //!     token resolves to the coarse internal principal.
 
 use std::fmt;
+use std::future::Future;
+use std::pin::Pin;
 use std::str::FromStr;
+use std::task::{Context, Poll};
 
+use pplx_space_common_svc::UdsPeerAccount;
+use pplx_space_common_svc::core::host::linux::identities::{user_names, users};
 use tonic::{Request, Status};
+use tower::{Layer, Service};
 
 use pplx_space_common_svc::core::types::{K8sNodeName, K8sNodeUid, PodName, PodUid};
 use pplx_space_common_svc::{
@@ -382,6 +388,124 @@ fn authorize_tcp_caller_service(
     Err(Status::permission_denied(format!(
         "service {service} is not authorized for {operation}"
     )))
+}
+
+/// Listener-local authorization runs before either the authority or agent can
+/// handle a request. The upstream authority cannot recover the original UID
+/// after the agent has re-originated a call with its own credential.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum CredentialUdsAccess {
+    Standard,
+    Volume,
+}
+
+impl CredentialUdsAccess {
+    fn authorize<T>(
+        &self,
+        path: &str,
+        request: &Request<T>,
+        authorizer: &UdsPeerAuthorizer,
+    ) -> Result<(), Status> {
+        if matches!(
+            path,
+            "/grpc.health.v1.Health/Check" | "/grpc.health.v1.Health/Watch"
+        ) {
+            return Ok(());
+        }
+        match self {
+            Self::Standard => {
+                // Preserve existing policies for other peers, while requiring
+                // volume-manager to use its restricted listener even if it can
+                // traverse the standard socket's shared client group.
+                authorizer.authorize_request(
+                    request,
+                    "standard listener",
+                    &[UdsPeerPrincipal::Root, UdsPeerPrincipal::Other],
+                )?;
+            }
+            Self::Volume => {
+                let operation = match path {
+                    "/space.credential.manager.v1.CredentialManager/ExchangeToken" => {
+                        "ExchangeToken"
+                    }
+                    "/space.credential.manager.v1.CredentialManager/IssueDek" => "IssueDek",
+                    "/space.credential.manager.v1.CredentialManager/UnwrapDek" => "UnwrapDek",
+                    _ => {
+                        return Err(Status::permission_denied(
+                            "operation is not available on the volume credential socket",
+                        ));
+                    }
+                };
+                authorizer.authorize_request(
+                    request,
+                    operation,
+                    &[UdsPeerPrincipal::Service(user_names::SPACE_VOLMGR)],
+                )?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl<S> Layer<S> for CredentialUdsAccess {
+    type Service = CredentialUdsService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        CredentialUdsService {
+            inner,
+            access: *self,
+            authorizer: volume_peer_authorizer(),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct CredentialUdsService<S> {
+    inner: S,
+    access: CredentialUdsAccess,
+    authorizer: UdsPeerAuthorizer,
+}
+
+fn volume_peer_authorizer() -> UdsPeerAuthorizer {
+    UdsPeerAuthorizer::new(
+        "space-credential-manager",
+        [UdsPeerAccount::with_linux_user(users::SPACE_VOLMGR)],
+    )
+}
+
+type UdsBoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
+
+impl<S, ReqBody, ResBody> Service<http::Request<ReqBody>> for CredentialUdsService<S>
+where
+    S: Service<http::Request<ReqBody>, Response = http::Response<ResBody>> + Clone + Send + 'static,
+    S::Future: Send + 'static,
+    S::Error: Into<UdsBoxError> + Send,
+    ReqBody: Send + 'static,
+    ResBody: http_body::Body<Data = bytes::Bytes> + Send + 'static,
+    ResBody::Error: Into<UdsBoxError> + Send + 'static,
+{
+    type Response = http::Response<tonic::body::Body>;
+    type Error = UdsBoxError;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx).map_err(Into::into)
+    }
+
+    fn call(&mut self, request: http::Request<ReqBody>) -> Self::Future {
+        let mut peer = Request::new(());
+        *peer.extensions_mut() = request.extensions().clone();
+        let authorized = self
+            .access
+            .authorize(request.uri().path(), &peer, &self.authorizer);
+        let clone = self.inner.clone();
+        let mut inner = std::mem::replace(&mut self.inner, clone);
+        Box::pin(async move {
+            authorized?;
+            let response = inner.call(request).await.map_err(Into::into)?;
+            Ok(response.map(tonic::body::Body::new))
+        })
+    }
 }
 
 #[cfg(test)]

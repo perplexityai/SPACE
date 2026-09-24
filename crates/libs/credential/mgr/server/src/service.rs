@@ -55,6 +55,7 @@ const SPACE_TMPLMGR_ACCOUNT: &str = user_names::SPACE_TMPLMGR;
 const ALLOW_EXCHANGE_TOKEN: &[UdsPeerPrincipal] = &[
     UdsPeerPrincipal::Service(SPACE_SBXMGR_ACCOUNT),
     UdsPeerPrincipal::Service(SPACE_TMPLMGR_ACCOUNT),
+    UdsPeerPrincipal::Service(user_names::SPACE_VOLMGR),
 ];
 /// Same callers as `ExchangeToken` for now: sandbox-manager and
 /// template-manager are the two on-node services that own data they
@@ -63,11 +64,13 @@ const ALLOW_ISSUE_DEK: &[UdsPeerPrincipal] = &[
     UdsPeerPrincipal::Root,
     UdsPeerPrincipal::Service(SPACE_SBXMGR_ACCOUNT),
     UdsPeerPrincipal::Service(SPACE_TMPLMGR_ACCOUNT),
+    UdsPeerPrincipal::Service(user_names::SPACE_VOLMGR),
 ];
 const ALLOW_UNWRAP_DEK: &[UdsPeerPrincipal] = &[
     UdsPeerPrincipal::Root,
     UdsPeerPrincipal::Service(SPACE_SBXMGR_ACCOUNT),
     UdsPeerPrincipal::Service(SPACE_TMPLMGR_ACCOUNT),
+    UdsPeerPrincipal::Service(user_names::SPACE_VOLMGR),
 ];
 
 /// TCP service identities mirroring the UDS allow-lists above. On the
@@ -295,13 +298,11 @@ impl CredentialManagerService {
                 UdsPeerAuthorizer::new(
                     "space-credential-manager",
                     [
-                        // The uid-keyed allowlist: volume-manager runs as
-                        // this same uid by design (its chart's runAsUser)
-                        // and calls credmgr for token exchange and DEK
-                        // issue/unwrap, so its binary is admitted alongside
-                        // sandbox-manager's.
                         UdsPeerAccount::with_linux_user(users::SPACE_SBXMGR)
                             .require_binary(paths::SPACE_SBXMGR_UID_BINARIES)
+                            .forbid_capabilities(capability::CAP_SYS_PTRACE),
+                        UdsPeerAccount::with_linux_user(users::SPACE_VOLMGR)
+                            .require_binary(paths::SPACE_VOLMGR_SVC_BINARIES)
                             .forbid_capabilities(capability::CAP_SYS_PTRACE),
                         UdsPeerAccount::with_linux_user(users::SPACE_TMPLMGR)
                             .require_binary(paths::SPACE_TMPLMGR_SVC_BINARIES)

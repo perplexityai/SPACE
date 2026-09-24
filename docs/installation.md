@@ -440,3 +440,76 @@ SPACE_KIND_CLUSTER=space-local \
   unset SPACE_API_TOKEN &&
   kind get clusters
 ```
+
+## Separating volume-manager's credential identity
+
+Volume-manager runs as `space-volmgr` (UID/GID 964), independently of
+sandbox-manager (UID 950). The worker image creates both accounts from
+`infra/space/identity/node-identities.sh`. Volume-manager retains
+`space-cache-rw` for shared artifact access and `space-sbxclients` to publish
+its own RPC socket. Neither group grants it access to credential-manager's
+standard listener: that listener rejects the volume-manager principal.
+
+Credential-manager's optional `--volume-socket
+/space/run/volume-credentials/credmgr.sock` listener admits only the
+volume-manager principal and only `ExchangeToken`, `IssueDek`, and `UnwrapDek`.
+It rejects CA/CSR issuance, credential-injection resolution, envelope operations,
+and sandbox-volume-key operations before handling or forwarding the request.
+Both the node agent and local authority support this listener. The standard
+socket and sandbox-manager's gateway signing authorization are unchanged for
+sandbox-manager.
+
+Provision `/space/run/volume-credentials` with mode `0750`, owned by the
+credential-manager runtime UID and `space-volcredclients` (GID 965). Give
+credential-manager and volume-manager that supplementary group. The socket is
+mode `0660`. Set **only volume-manager's** `SPACE_CREDMGR_ENDPOINT` to
+`unix:///space/run/volume-credentials/credmgr.sock`; do not change the agent's
+upstream endpoint. Mount the new socket directory into both pods. Do not give
+volume-manager UID-changing capabilities or sandbox-manager's primary group.
+
+### Rollout and retained state
+
+This is a coordinated image, credential-manager binary, and manifest change.
+The production EKS charts and volume-manager init script are not in this public
+repository. Their corresponding change is required before considering the
+production vulnerability fixed. Reconcile with the existing private identity
+handoff implementation, whose exported test was removed in
+[SPACE #6](https://github.com/perplexityai/SPACE/pull/6).
+
+1. Build the worker image with the new accounts/groups. Provision the new
+   credential socket directory and group memberships, then deploy a
+   credential-manager binary with `--volume-socket`. Old binaries do not
+   understand this flag. New binaries leave the extra listener disabled unless
+   it is supplied. Custom Rust launchers constructing `CredmgrRunConfig` must
+   set its new `volume_socket_path` field.
+2. Stop admission and drain the predecessor volume-manager. Its init must wait
+   for `/space/run/volume-manager/service.mutex` to be released before changing
+   retained state. Preserve the mutex inode. Transfer the volume-manager
+   runtime directory, SQLite database/WAL/SHM, and retained
+   `/space/cache/firecracker/.volmgr-staging` files to UID 964 before starting
+   the successor. Reject symlinks and foreign mounts during migration; do not
+   recursively chown the shared sandbox/template cache. Keep shared artifacts
+   accessible through their existing `space-cache-rw` group modes, including
+   every directory leading to a snapshot. Validate pending upload recovery,
+   snapshot suspend/restore, and template pull under distinct UIDs.
+3. Switch volume-manager's `runAsUser`/`runAsGroup` (or Unix service user/group) to 964,
+   with the canonical supplementary groups and new endpoint. Keep its runtime
+   directory traversable by `space-sbxclients` for existing RPC clients. New
+   local stacks provision private staging with mode `0700` owned by volume-manager.
+   The local launcher refuses legacy UID-950-owned retained state and requires
+   the quiesced ownership migration before restarting; it does not erase it or
+   widen its permissions automatically.
+4. Verify volume-manager can exchange storage credentials and issue/unwrap
+   transfer DEKs, while `poc-local-ca-role-confusion.sh` run as a volume-manager
+   peer gets `PermissionDenied` on either credential socket. The PoC itself is
+   not present in this repository. Exercise sandbox-manager CA issuance too.
+
+New volume-manager configuration cannot use an old credential-manager: its
+socket does not exist. Old volume-manager peers still running as UID 950 remain
+indistinguishable from sandbox-manager, so a partial rollout is **not a security
+fix**. When `SPACE_UDS_PEER_PROCESS_CHECK=enforce` is enabled on a local authority,
+removing volume-manager from UID 950's binary allowlist also requires coordinating
+that authority upgrade with the drained volume-manager transition. Roll back
+identity, endpoint, and retained-state ownership together while quiesced;
+rolling only the UID back can strand persisted jobs and reintroduces the shared
+identity vulnerability. No temporary UID-950 bypass is added to the new socket.

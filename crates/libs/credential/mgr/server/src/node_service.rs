@@ -53,9 +53,8 @@ const ALLOW_EXCHANGE_TOKEN: &[UdsPeerPrincipal] = &[
 ];
 
 /// Who may ask this node to sign a gateway CA: sandbox-manager, the only
-/// process holding both this socket's group and the control socket of every
-/// gateway it launched. A gateway cannot be named here — each runs under its own
-/// sandbox's uid, so peer credentials classify it as `Other`. Root is absent
+/// principal allowed to request gateway signing on this socket. A gateway cannot
+/// be named here — each runs under its own sandbox's uid, so peer credentials classify it as `Other`. Root is absent
 /// deliberately: naming the one service that mints is tighter than granting it to
 /// whatever else runs privileged on the node.
 const ALLOW_GATEWAY_CA_ISSUANCE: &[UdsPeerPrincipal] =
@@ -172,8 +171,8 @@ pub struct NodeCredentialManager {
 impl NodeCredentialManager {
     /// `peer_process_check_mode` is threaded from startup so an armed switch is
     /// consistently live on this resolver rather than silently dropped. It bears
-    /// on the one account this socket configures: sandbox-manager, the only
-    /// principal allowed to resolve injection rules or request certificate signing.
+    /// on the configured accounts. Sandbox-manager remains the only principal
+    /// allowed to resolve injection rules or request certificate signing.
     pub fn new(
         upstream: CredentialManagerGrpcClient,
         node_ca: Arc<NodeCa>,
@@ -190,6 +189,7 @@ impl NodeCredentialManager {
                     [
                         UdsPeerAccount::with_linux_user(users::SPACE_SBXMGR),
                         UdsPeerAccount::with_linux_user(users::SPACE_TMPLMGR),
+                        UdsPeerAccount::with_linux_user(users::SPACE_VOLMGR),
                     ],
                 )
                 .with_process_check_mode(peer_process_check_mode),

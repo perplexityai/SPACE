@@ -90,6 +90,7 @@ pub mod paths {
     pub const NODE_CTL_SOCKET: &str = "/space/run/node-ctl/node-ctl.sock";
     pub const BUILD_MANAGER_DB: &str = "/space/run/build-manager/build-manager.db";
     pub const CREDENTIAL_MANAGER_SOCKET: &str = "/space/run/credential-manager/credmgr.sock";
+    pub const VOLUME_CREDENTIAL_MANAGER_SOCKET: &str = "/space/run/volume-credentials/credmgr.sock";
     pub const VOLUME_MANAGER_SOCKET: &str = "/space/run/volume-manager/volume-manager.sock";
     pub const VOLUME_MANAGER_DB: &str = "/space/run/volume-manager/volume-manager.db";
     /// Where vol-mgr reflinks each push source at submit time. Living under
@@ -169,14 +170,8 @@ pub mod paths {
     // there is no `SPACE_CREDMGR_SVC_BINARIES`: nothing verifies credmgr's
     // own exe.
     //
-    // The sbxmgr uid runs two services: sandbox-manager itself, and
-    // volume-manager, whose container deliberately runs as the same user
-    // (`charts/space-volume-manager` `runAsUser`) and calls credmgr over the
-    // node socket for token exchange and DEK issue/unwrap. A dedicated
-    // volmgr uid would be the stronger split; until that socket-permission
-    // and chart change happens, its binary is admitted here.
-    pub const SPACE_SBXMGR_UID_BINARIES: &[&str] =
-        space_svc_binaries!("space-sbxmgr-svc", "space-volmgr-svc");
+    pub const SPACE_SBXMGR_UID_BINARIES: &[&str] = space_svc_binaries!("space-sbxmgr-svc");
+    pub const SPACE_VOLMGR_SVC_BINARIES: &[&str] = space_svc_binaries!("space-volmgr-svc");
     pub const SPACE_TMPLMGR_SVC_BINARIES: &[&str] = space_svc_binaries!("space-tmplmgr-svc");
 
     /// Marker the kernel appends to a `/proc/<pid>/exe` readlink target

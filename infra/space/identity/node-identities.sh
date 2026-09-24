@@ -19,15 +19,22 @@ space-sbxmgr:960
 space-nodeapi:961
 space-rtmgrclients:962
 space-rtmgr:963
+space-volmgr:964
+space-volcredclients:965
 "
 
 # Groups managed as supplementary access groups for local operators/services.
 # Service primary groups are intentionally excluded.
-SPACE_MANAGED_GROUPS="space-nodeclients space-sbxclients space-cache-rw space-run-rw space-tmplclients space-sidecarclients space-buildclients space-nodectlclients space-rtmgrclients"
+SPACE_MANAGED_GROUPS="space-volcredclients space-nodeclients space-sbxclients space-cache-rw space-run-rw space-tmplclients space-sidecarclients space-buildclients space-nodectlclients space-rtmgrclients"
 
 # Local deploy/debug accounts need only client socket groups. Direct cache/run
 # writes stay scoped to services so RPC authorization remains the control point.
 SPACE_OPERATOR_GROUPS="space-nodeclients space-sbxclients space-tmplclients space-nodectlclients space-rtmgrclients"
+
+SPACE_VOLMGR_USER=space-volmgr
+SPACE_VOLMGR_UID=964
+SPACE_VOLMGR_GROUP=space-volmgr
+SPACE_VOLMGR_GID=964
 
 SPACE_SBXMGR_USER=space-sbxmgr
 SPACE_SBXMGR_UID=950
@@ -62,6 +69,7 @@ SPACE_RTMGR_GID=963
 # alias:name:uid:primary_group. Alias names are used by generators that need
 # stable Rust/Python identifiers while shell consumers use the expanded values.
 SPACE_USER_SPECS="
+SPACE_VOLMGR:$SPACE_VOLMGR_USER:$SPACE_VOLMGR_UID:$SPACE_VOLMGR_GROUP
 SPACE_SBXMGR:$SPACE_SBXMGR_USER:$SPACE_SBXMGR_UID:$SPACE_SBXMGR_GROUP
 SPACE_TMPLMGR:$SPACE_TMPLMGR_USER:$SPACE_TMPLMGR_UID:$SPACE_TMPLMGR_GROUP
 SPACE_NODEAPI:$SPACE_NODEAPI_USER:$SPACE_NODEAPI_UID:$SPACE_NODEAPI_GROUP
@@ -72,8 +80,10 @@ SPACE_RTMGR:$SPACE_RTMGR_USER:$SPACE_RTMGR_UID:$SPACE_RTMGR_GROUP
 
 SPACE_SANDBOX_MANAGER_GROUPS="space-nodeclients space-sbxclients space-tmplclients space-cache-rw space-sidecarclients space-nodectlclients"
 SPACE_TEMPLATE_MANAGER_GROUPS="space-nodeclients space-sbxclients space-tmplclients space-cache-rw space-nodectlclients"
-SPACE_CREDENTIAL_MANAGER_GROUPS="space-sbxclients"
-SPACE_VOLUME_MANAGER_GROUPS="space-sbxclients space-cache-rw"
+SPACE_CREDENTIAL_MANAGER_GROUPS="space-sbxclients space-volcredclients"
+# sbxclients is needed to publish volume-manager's own client socket; it does
+# not authorize this UID on the standard credential-manager listener.
+SPACE_VOLUME_MANAGER_GROUPS="space-sbxclients space-cache-rw space-volcredclients"
 # The runtime manager reads the world-readable vendor and cache layouts; it
 # needs only its own socket group so it can hand that group to its socket.
 SPACE_RUNTIME_MANAGER_GROUPS="space-rtmgrclients"

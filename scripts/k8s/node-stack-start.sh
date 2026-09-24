@@ -40,6 +40,7 @@ SBXMGR_SOCKET="/space/run/sandbox-manager/sandbox-manager.sock"
 TMPLMGR_SOCKET="/space/run/template-manager/template-manager.sock"
 VOLMGR_SOCKET="/space/run/volume-manager/volume-manager.sock"
 CREDMGR_SOCKET="/space/run/credential-manager/credmgr.sock"
+VOLCRED_SOCKET="/space/run/volume-credentials/credmgr.sock"
 RUNTIME_SUPERVISOR_SOCKET="/space/run/runtime-supervisor/runtime-supervisor.sock"
 RUNTIME_MANAGER_SOCKET="/space/run/runtime-manager/runtime-manager.sock"
 
@@ -307,7 +308,21 @@ setup_layout() {
     chmod 0660 "$gate_path"
   done
   install -d -m 0750 -o "$SPACE_SBXMGR_UID" -g "$sbxclients_gid" \
-    /space/run/sandbox-manager /space/run/credential-manager /space/run/volume-manager
+    /space/run/sandbox-manager /space/run/credential-manager
+  # A retained SQLite DB/WAL or staged upload must not be stranded by the UID
+  # change. Production's quiesced handoff is owned by its deployment init; the
+  # local launcher refuses legacy state until that migration is performed.
+  local volmgr_state legacy_owner
+  for volmgr_state in /space/run/volume-manager /space/cache/firecracker/.volmgr-staging; do
+    [[ ! -L "$volmgr_state" ]] || die "volume-manager state must not be a symlink: $volmgr_state"
+    if [[ -d "$volmgr_state" ]]; then
+      legacy_owner="$(find "$volmgr_state" -xdev -mindepth 1 -uid "$SPACE_SBXMGR_UID" -print -quit)"
+      [[ -z "$legacy_owner" ]] || die "volume-manager state requires a quiesced UID migration before startup; see docs/installation.md: $volmgr_state"
+    fi
+  done
+  install -d -m 0750 -o "$SPACE_VOLMGR_UID" -g "$sbxclients_gid" /space/run/volume-manager
+  install -d -m 0750 -o "$SPACE_SBXMGR_UID" -g "$(space_expected_gid_for_group space-volcredclients)" \
+    /space/run/volume-credentials
   install -d -m 0755 -o "$SPACE_SBXMGR_UID" -g "$SPACE_SBXMGR_GID" /space/run/sandbox-host-control
   install -d -m 0750 -o "$SPACE_TMPLMGR_UID" -g "$tmplclients_gid" /space/run/template-manager
   install -d -m 0750 -o "$SPACE_NODECTL_UID" -g "$nodectlclients_gid" /space/run/node-ctl
@@ -324,8 +339,8 @@ setup_layout() {
   install -d -m 2775 -o 0 -g "$cache_rw_gid" \
     /space/cache/firecracker/templates \
     /space/cache/firecracker/sandboxes \
-    /space/cache/firecracker/builds \
-    /space/cache/firecracker/.volmgr-staging
+    /space/cache/firecracker/builds
+  install -d -m 0700 -o "$SPACE_VOLMGR_UID" -g "$SPACE_VOLMGR_GID" /space/cache/firecracker/.volmgr-staging
   install -d -m 0755 -o 0 -g 0 /space/cache/firecracker/jails
 
   chmod 1777 /run/health
@@ -341,6 +356,7 @@ setup_layout() {
     "$TMPLMGR_SOCKET" \
     "$VOLMGR_SOCKET" \
     "$CREDMGR_SOCKET" \
+    "$VOLCRED_SOCKET" \
     "$RUNTIME_SUPERVISOR_SOCKET" \
     "$RUNTIME_MANAGER_SOCKET" \
     /run/health/*.sock
@@ -611,8 +627,8 @@ start_all() {
   # Storage + auth (no socket dependencies on each other). Privileged BYOK
   # volume operations live in node-manager; volume-manager runs under the
   # production service identity with cache access through space-cache-rw.
-  start_service_as volmgr "$SPACE_SBXMGR_USER" "$SPACE_SBXMGR_GROUP" "$SPACE_VOLUME_MANAGER_GROUPS" \
-    space-volmgr-svc
+  start_service_as volmgr "$SPACE_VOLMGR_USER" "$SPACE_VOLMGR_GROUP" "$SPACE_VOLUME_MANAGER_GROUPS" \
+    env "SPACE_CREDMGR_ENDPOINT=unix://$VOLCRED_SOCKET" space-volmgr-svc
   # credmgr runs its (pre-agent-migration) authority role, which resolves org
   # KEK rows from the control-plane DB. Hand the DB URL to credmgr only; no
   # other node service sees Postgres, matching production workers. The
@@ -631,8 +647,9 @@ start_all() {
       && credmgr_env+=("AWS_SESSION_TOKEN=${SPACE_CREDMGR_AWS_SESSION_TOKEN}")
   fi
   start_service_as credmgr "$SPACE_SBXMGR_USER" "$SPACE_SBXMGR_GROUP" "$SPACE_CREDENTIAL_MANAGER_GROUPS" \
-    env "${credmgr_env[@]}" space-credmgr-svc
+    env "${credmgr_env[@]}" space-credmgr-svc --volume-socket "$VOLCRED_SOCKET"
   wait_for_socket credmgr "$CREDMGR_SOCKET"
+  wait_for_socket credmgr "$VOLCRED_SOCKET"
 
   # template-manager. Prefetch resolves seed:latest against the cluster API
   # (space-seed-publish registered it) and pulls through volmgr — the same

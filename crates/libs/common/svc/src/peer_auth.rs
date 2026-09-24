@@ -53,18 +53,15 @@
 //!
 //! The process checks run only where the opted-in service (credmgr)
 //! authorizes UDS peers itself: the authority role serving its Unix socket,
-//! on operator-provisioned systemd nodes. **Neither EKS credmgr shape
-//! reaches this code**: the control-plane
-//! authority deployment runs `--no-uds` and never binds the socket, and the
-//! per-node agent DaemonSet (`--role agent`) forwards its RPCs upstream
-//! without peer authorization — the authority sees the agent's own
-//! credential, not the original caller — while its one locally served
-//! method classifies peers against an authorizer with no configured
-//! accounts, so no per-account process checks exist there either. Arming
-//! the switch on either EKS shape produces no denials and no log lines —
-//! silence there is the absence of the layer, not a passing bake. A
-//! `log-only` bake must run on an authority-with-UDS node until the agent
-//! authorizes its forwarded callers with configured peer accounts.
+//! i.e. direct deployments and local stacks. The TCP-only control-plane
+//! authority authenticates ServiceAccount tokens instead. The node agent's
+//! listener layer authorizes the distinct volume-manager UID and restricts its
+//! separate socket to transfer credential RPCs before forwarding. The agent
+//! also authorizes sandbox-manager for local CA issuance and injection-rule
+//! resolution. These agent checks have no binary/capability requirements;
+//! enabling the process-check switch there does not add `/proc` inspection.
+//! A process-inspection bake must use an authority-with-UDS deployment that
+//! configures per-account binary/capability requirements.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

@@ -325,13 +325,12 @@ fn evaluate_admits_the_content_addressed_systemd_install() {
 }
 
 #[test]
-fn volmgr_exe_is_admitted_under_the_sbxmgr_uid_allowlist() {
-    // volume-manager deliberately runs as the sbxmgr uid (its chart's
-    // runAsUser) and calls credmgr over the node socket for token exchange
-    // and DEK issue/unwrap. The allowlist for that uid must therefore admit
-    // volmgr's binary on both install layouts — otherwise enforce kills S3
-    // transfers and BYOK the moment it arms.
-    let checks = PeerProcessChecks {
+fn volmgr_exe_requires_its_own_uid_allowlist() {
+    let volume_checks = PeerProcessChecks {
+        binary_paths: pplx_space_common_core::host::linux::paths::SPACE_VOLMGR_SVC_BINARIES,
+        ..PeerProcessChecks::EMPTY
+    };
+    let sandbox_checks = PeerProcessChecks {
         binary_paths: pplx_space_common_core::host::linux::paths::SPACE_SBXMGR_UID_BINARIES,
         ..PeerProcessChecks::EMPTY
     };
@@ -340,8 +339,11 @@ fn volmgr_exe_is_admitted_under_the_sbxmgr_uid_allowlist() {
         "/space/apps/space-volmgr-svc-1a2b3c4d",
     ] {
         let snap = snapshot(exe, 1001, 0);
-        evaluate_process_checks(&checks, 1001, &snap, |_| Vec::new())
-            .unwrap_or_else(|err| panic!("{exe} must be admitted for the sbxmgr uid: {err}"));
+        evaluate_process_checks(&volume_checks, 1001, &snap, |_| Vec::new()).unwrap();
+        assert!(matches!(
+            evaluate_process_checks(&sandbox_checks, 1001, &snap, |_| Vec::new()),
+            Err(ProcessCheckFailure::BinaryNotAllowed(_))
+        ));
     }
 }
 
