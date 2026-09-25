@@ -287,6 +287,33 @@ def main():
         )
     inside(GATEWAY, "sysctl", "-qw", "net.ipv4.ip_forward=1")
     run(installer, "setup")
+    run(installer, "validate")
+    inside(GATEWAY, "sysctl", "-qw", "net.ipv4.icmp_ratemask=6160")
+    print(
+        inside(
+            "guest",
+            sys.executable,
+            "-c",
+            """
+import socket, time
+elapsed = []
+for attempt in range(20):
+    with socket.socket(type=socket.SOCK_DGRAM) as s:
+        s.settimeout(0.5)
+        s.connect(('198.18.0.2', 443))
+        start = time.monotonic()
+        try:
+            s.send(b'quic-burst')
+            s.recv(128)
+        except ConnectionRefusedError:
+            elapsed.append((time.monotonic() - start) * 1000)
+        else:
+            raise AssertionError('UDP/443 was not rejected')
+assert len(elapsed) == 20
+print(f'UDP/443 burst: 20/20 ECONNREFUSED, max {max(elapsed):.2f} ms')
+""",
+        ).strip()
+    )
     audit = str(ROOT / "scripts/netgtw/audit-reply-rules.py")
     print(run(sys.executable, audit, GATEWAY).strip())
     before = ruleset()

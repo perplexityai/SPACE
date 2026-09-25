@@ -16,7 +16,8 @@
                      "right": { "set": ["new"] }, "op": "in" } },
       { "match": { "left": { "payload": { "protocol": "udp", "field": "dport" } },
                      "right": 443, "op": "==" } },
-      { "counter": null }
+      { "counter": null },
+      { "reject": { "type": "icmp", "expr": "port-unreachable" } }
     ] } } },
   { "add": { "rule": { "family": "ip", "table": "sandbox", "chain": "pre_tproxy_guardrails",
     "comment": "platform-egress-pre-tproxy-guardrail-cloud-imds",

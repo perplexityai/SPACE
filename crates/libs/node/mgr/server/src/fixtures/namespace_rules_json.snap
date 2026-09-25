@@ -150,6 +150,12 @@ expression: sorted_json(actual)
             },
             {
               "counter": null
+            },
+            {
+              "reject": {
+                "expr": "port-unreachable",
+                "type": "icmp"
+              }
             }
           ],
           "family": "ip",

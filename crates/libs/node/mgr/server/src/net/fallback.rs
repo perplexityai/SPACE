@@ -64,7 +64,8 @@ pub fn reset_namespace_links(ns: &str, net: &NetId) -> Result<(), String> {
     )
 }
 
-pub const NAMESPACE_ICMP_RATEMASK: &str = "6168";
+// Exempt destination-unreachable so parallel QUIC attempts get prompt refusals.
+pub const NAMESPACE_ICMP_RATEMASK: &str = "6160";
 
 pub fn setup_namespace_sysctls(ns: &str) -> Result<(), NetworkOpError> {
     run_in_ns(

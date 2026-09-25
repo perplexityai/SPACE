@@ -217,6 +217,7 @@ def load_cases(directory, pattern):
                         "tunnel_method",
                         "proxy_anyauth",
                         "expect",
+                        "errno",
                         "http_status",
                         "token",
                         "code",
@@ -309,7 +310,11 @@ def load_cases(directory, pattern):
                 port = probe.setdefault("port", PORTS[kind])
                 require(
                     type(port) is int
-                    and (port == PORTS[kind] or kind == "udp" and port == 443),
+                    and (
+                        port == PORTS[kind]
+                        or kind == "udp" and port == 443
+                        or kind == "quic" and port == 8443
+                    ),
                     f"{name}: unsupported fixture port {port} for {kind}",
                 )
                 expected = probe.get("expect")
@@ -666,6 +671,8 @@ def assert_result(spec, result, events):
                 else result.get("http_status", 403) == 403,
                 f"unexpected HTTP status for denied WebSocket traffic: {result}",
             )
+    if "errno" in spec:
+        require(result.get("errno") == spec["errno"], f"unexpected socket error: {result}")
     if expected == "deny":
         inner = kind == "connect" and (
             "tunnel_authority" in spec or "tunnel_method" in spec

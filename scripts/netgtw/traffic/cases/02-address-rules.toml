@@ -12,7 +12,8 @@ probes = [
   { kind = "grpcs", host = "allowed.test", expect = "allow" },
   { kind = "ws", host = "allowed.test", expect = "allow" },
   { kind = "wss", host = "allowed.test", expect = "allow" },
-  { kind = "quic", host = "allowed.test", expect = "allow" },
+  { kind = "quic", host = "allowed.test", expect = "deny" },
+  { kind = "quic", port = 8443, host = "allowed.test", expect = "allow" },
   { kind = "udp", sizes = [64, 1200, 8192], expect = "allow" },
 ]
 

@@ -327,9 +327,12 @@ async def serve(args):
     transports = []
     if args.zone != "guest":
         for address in args.address:
-            transports.append(
-                await protocols.quic_server(address, args.certificate, args.key, record)
-            )
+            for port in (443, 8443):
+                transports.append(
+                    await protocols.quic_server(
+                        address, args.certificate, args.key, record, port
+                    )
+                )
             for port in (53, 9000):
                 (
                     transport,
@@ -459,6 +462,7 @@ def probe(spec, sessions):
             "received": False,
             "error": str(error),
             "error_type": type(error).__name__,
+            "errno": error.errno,
         }
     finally:
         if stream and not session:

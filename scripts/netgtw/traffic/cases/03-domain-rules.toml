@@ -34,7 +34,7 @@ probes = [
   { kind = "wss", target = "198.18.2.2", host = "allowed.test", expect = "deny" },
   { kind = "tcp", expect = "deny" },
   { kind = "udp", expect = "deny" },
-  { kind = "udp", port = 443, expect = "deny" },
+  { kind = "udp", port = 443, expect = "deny", errno = 111 },
   # Domain attribution cannot authorize plaintext HTTP/2/gRPC or QUIC.
   { kind = "h2c", host = "allowed.test", expect = "deny" },
   { kind = "grpc", host = "allowed.test", expect = "deny" },
