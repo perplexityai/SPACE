@@ -11,9 +11,12 @@ FAIL_OPEN_CALLERS = 4
 # Lease-guarded, kind-only operation whose restore is armed before the first
 # write, the Redis fault has its scale-back armed before dispatch, and every
 # sandbox the probes admit carries run metadata the teardown kills by. Caps
-# are low because each admitted create boots a real Firecracker VM.
+# are low because each admitted create boots a real Firecracker VM. The store
+# is opt-in in the bring-up, so the scenario renders it with helm when the
+# bench has none and removes what it created.
 @smoke.scenario(
     "local.rate_limiters_enforce_and_fail_open",
+    required_tools=("helm",),
     # Two API rollouts (enable, restore), a Redis scale-down/up, and about ten
     # real sandbox boots.
     sandbox=smoke.SandboxConfig(timeout=1800),
@@ -27,7 +30,7 @@ def rate_limiters_enforce_and_fail_open(test: smoke.KindEcw) -> None:
 
     limiters = test.rate_limiters
 
-    with test.phase("enable both limiters on the public API, low caps, enforce"):
+    with test.phase("provide Redis, then enable both limiters on the public API, low caps, enforce"):
         limiters.enable_limiters(template=test.sandbox_template_name())
 
     with test.phase("preflight: one create is admitted or rate-limited"):

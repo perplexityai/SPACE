@@ -71,6 +71,10 @@ watch_file("infra/space/kind/charts/space-kind-telemetry")
 if TELEMETRY_MODE == "otel":
     print("OTLP uses the Collectors, not the Agent; install infra/space/kind/metrics/local.sh up and infra/space/kind/traces/local.sh up before selecting otel mode.")
 
+# The Redis limiter store is opt-in; see its block below. `bootstrap.sh` reads
+# the same variable (and accepts `--with-redis` for it), so both paths agree.
+REDIS = os.getenv("SPACE_LOCAL_REDIS", "0") in ("1", "true", "True", "yes")
+
 # ── Image builds ──────────────────────────────────────────────────────────
 #
 # Each rust runtime image chains its FROM base build into the same
@@ -508,14 +512,47 @@ k8s_resource(
 
 # Redis: shared store for the two API rate limiters (cluster activation
 # admission + per-client concurrency). Public docker.io image pulled directly by
-# the kind nodes (no `kind load`). Idle unless SPACE_REDIS_URL points at it; the
-# rate-limiter smoke (scripts/tests/smoke-kind-rate-limiters.sh) wires it up.
-k8s_yaml(helm_release("space", "infra/space/kind/charts/space-redis-local"))
-k8s_resource(
-    "space-redis",
-    labels = ["data"],
-    resource_deps = ["label-kind-infra"],
-)
+# the kind nodes (no `kind load`). Opt-in, defaulted off to match `bootstrap.sh`:
+# nothing in the kind tree sets SPACE_REDIS_URL, so both limiters fail open with
+# or without it. The rate-limiter smoke scenario
+# (`local.rate_limiters_enforce_and_fail_open`) creates it when it is absent.
+if REDIS:
+    k8s_yaml(helm_release("space", "infra/space/kind/charts/space-redis-local"))
+    k8s_resource(
+        "space-redis",
+        labels = ["data"],
+        resource_deps = ["label-kind-infra"],
+    )
+    # Asking for the store makes it the bench's, even one a killed smoke
+    # created and recorded as its own; `bootstrap.sh --with-redis` does the same.
+    local_resource(
+        "claim-redis-store",
+        cmd = [
+            "bash",
+            "infra/space/kind/scripts/claim-redis-store.sh",
+            "kind-" + KIND_CLUSTER,
+            NAMESPACE,
+        ],
+        labels = ["data"],
+        resource_deps = ["space-redis"],
+    )
+else:
+    # Tilt never deletes what an earlier session applied, so a store left by a
+    # `SPACE_LOCAL_REDIS=1` session or a killed smoke would otherwise outlive
+    # the knob. This keeps a default stack store-free, as `bootstrap.sh` does;
+    # it runs once per Tilt session, and `bootstrap_kind_stack` repeats it when
+    # it reuses a live default-mode Tilt (one that has this resource). The
+    # rate-limiter scenario provides its own store.
+    local_resource(
+        "remove-redis-store",
+        cmd = [
+            "bash",
+            "infra/space/kind/scripts/remove-redis-store.sh",
+            "kind-" + KIND_CLUSTER,
+            NAMESPACE,
+        ],
+        labels = ["data"],
+    )
 
 # node-stack: the production worker service set on real Firecracker, on every
 # labeled sandbox worker, wired to SeaweedFS. Needs Postgres up (credmgr

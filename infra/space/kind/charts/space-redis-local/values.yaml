@@ -1,7 +1,13 @@
 # Redis for Kind's cluster activation and per-client concurrency limiters.
-# Both use SPACE_REDIS_URL. This chart provides a local store for
-# scripts/tests/smoke-kind-rate-limiters.sh; without a configured URL the
-# limiters fail open and this pod idles.
+# Both use SPACE_REDIS_URL. This chart provides a local store for the
+# `local.rate_limiters_enforce_and_fail_open` smoke scenario; without a
+# configured URL the limiters fail open and this pod idles.
+#
+# Nothing in the kind tree sets SPACE_REDIS_URL, so the bring-up leaves this
+# chart out unless asked (`bootstrap.sh --with-redis` / `SPACE_LOCAL_REDIS=1`,
+# which the Tiltfile reads too); a default bring-up removes any store an earlier
+# one left. The scenario renders it itself when absent and removes what it
+# created.
 #
 # Single-node, in-memory only (no RDB/AOF persistence): the limiter state is a
 # guardrail, not a source of truth, and a wiped store just refills the buckets.

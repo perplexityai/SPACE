@@ -17,6 +17,7 @@
 #   bash infra/space/kind/scripts/bootstrap.sh
 #   bash infra/space/kind/scripts/bootstrap.sh --skip-images   # reuse last builds
 #   bash infra/space/kind/scripts/bootstrap.sh --no-port-forward
+#   bash infra/space/kind/scripts/bootstrap.sh --with-redis    # + limiter store
 #
 # Env knobs:
 #   SPACE_KIND_CLUSTER       kind cluster name (default: space-local)
@@ -32,6 +33,7 @@
 #                            and all Rust metric types to the Collectors,
 #                            and moves the Go shim's metrics there too. Rust
 #                            metrics sinks are exclusive; logs stay on stdout.
+#   SPACE_LOCAL_REDIS=1      same as --with-redis; the Tiltfile reads it too
 #
 # Host-path knobs, shared with the rendered cluster config and documented in
 # infra/space/kind/scripts/lib/kind-host-paths.sh:
@@ -54,10 +56,14 @@ unset SPACE_CONSOLE_PASSWORD
 
 SKIP_IMAGES=0
 PORT_FORWARD=1
+# The Redis limiter store is opt-in; see the gate at its chart below. The env
+# var is the knob the Tiltfile reads too, with the same truthy spellings.
+case "${SPACE_LOCAL_REDIS:-0}" in 1|true|True|yes) WITH_REDIS=1 ;; *) WITH_REDIS=0 ;; esac
 while (( $# > 0 )); do
   case "$1" in
     --skip-images)     SKIP_IMAGES=1 ;;
     --no-port-forward) PORT_FORWARD=0 ;;
+    --with-redis)      WITH_REDIS=1 ;;
     -h|--help)
       sed -n '2,/^set/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
       exit 0
@@ -324,12 +330,22 @@ helm_apply space "$KIND_DIR/charts/space-seaweedfs"
 log "waiting for seaweedfs Deployment to be ready"
 kubectl --context "$KCTX" -n "$NAMESPACE" rollout status deploy/space-seaweedfs --timeout="${TIMEOUT}s"
 
-# Redis — shared store for the API rate limiters (cluster activation admission
-# + per-client concurrency). Idle unless SPACE_REDIS_URL points at it; the
-# rate-limiter smoke (scripts/tests/smoke-kind-rate-limiters.sh) wires that up.
-helm_apply space "$KIND_DIR/charts/space-redis-local"
-log "waiting for redis Deployment to be ready"
-kubectl --context "$KCTX" -n "$NAMESPACE" rollout status deploy/space-redis --timeout="${TIMEOUT}s"
+# Redis — the store behind the two API rate limiters, opt-in. Nothing in the
+# kind tree renders SPACE_REDIS_URL, so on a default stack both limiters fail
+# open whether or not the pod runs; skipping it saves a chart apply and a
+# rollout wait. The rate-limiter smoke scenario
+# (`local.rate_limiters_enforce_and_fail_open`) creates the store itself when
+# it is absent, so it needs no flag.
+if (( WITH_REDIS )); then
+  helm_apply space "$KIND_DIR/charts/space-redis-local"
+  log "waiting for redis Deployment to be ready"
+  kubectl --context "$KCTX" -n "$NAMESPACE" rollout status deploy/space-redis --timeout="${TIMEOUT}s"
+  # Asking for the store makes it the bench's, even one a killed smoke created.
+  bash "$KIND_DIR/scripts/claim-redis-store.sh" "$KCTX" "$NAMESPACE"
+else
+  # A default stack holds no store; see the script for when it leaves one.
+  bash "$KIND_DIR/scripts/remove-redis-store.sh" "$KCTX" "$NAMESPACE"
+fi
 
 # api-server. The initContainer runs the control-plane migrator against the
 # now-ready postgres. The main container is gated on /readyz, which only

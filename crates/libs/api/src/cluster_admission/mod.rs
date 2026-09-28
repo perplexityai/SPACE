@@ -630,8 +630,8 @@ fn retry_after_with_jitter(earliest: Duration, jitter: Duration) -> Duration {
 /// of what the caller sees — at 6/s and at 60/s alike. The arithmetic only becomes
 /// visible below one token per second, and there it is real: 0.1/s against an
 /// empty bucket is a genuine 10s wait. [`sanitize_config`] accepts any positive
-/// rate and `scripts/tests/smoke-kind-rate-limiters.sh` runs at 0.1, so that
-/// regime is exercised rather than hypothetical.
+/// rate and the `local.rate_limiters_enforce_and_fail_open` smoke scenario runs
+/// at 0.1, so that regime is exercised rather than hypothetical.
 fn earliest_refill(deficit: f64, refill_rps: f64) -> Duration {
     let ratio = deficit / refill_rps;
     // A non-positive ratio from a non-positive *deficit* means there is nothing

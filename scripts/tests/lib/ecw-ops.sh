@@ -8,9 +8,8 @@
 # copies had already diverged on the request timeout — which is the same drift
 # `space-api-ops.sh`'s header describes paying for once.
 #
-# Consumers: `smoke-kind-node-selector-extras.sh`, `smoke-kind-rate-limiters.sh`,
-# `smoke-kind-ecw-template-build.sh` — every *shell* smoke suite that seeds an ECW
-# key. Three others seed one and are deliberately not consumers:
+# Consumers: no shell smoke suite sources this any more (`test-ecw-ops.sh` pins
+# its contract). Three others seed a key and are deliberately not consumers:
 # `smoke-kind-sandbox-fork.py` is Python and
 # cannot source this; `run-local-smokes.sh` seeds a persistent `local-dev-smoke`
 # key it never drops, which is not a run-scoped credential and is in fact the row

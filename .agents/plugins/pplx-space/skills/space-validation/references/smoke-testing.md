@@ -28,6 +28,17 @@ cleanup — the cleanup budget is `min(120 s, 10 %)` of the scenario timeout
 and cannot absorb a rollout wait. `infra/space/kind/README.md` documents
 the local kind harness these scenarios run on.
 
+A run killed between its first write and its restore takes the captured
+record with it, and the next run would capture the leftovers as the baseline.
+Persist the record where the next run can find it (the rate-limiter scenario
+annotates the Deployment) and restore from it when present.
+
+A dependency the default bring-up leaves out, such as the opt-in Redis store,
+is the scenario's to provide: create it only when absent, arm its removal
+immediately, and remove only what the run created. Validate a harness change
+from a known starting state (a fresh cluster, or one checked free of earlier
+runs' objects) and on every opt-in path it adds, not only the default.
+
 ## In-cluster smoke Jobs
 
 `scripts/space-cluster-smoke.py` is the shared in-cluster runner. The owning
