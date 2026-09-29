@@ -31,6 +31,7 @@ pub mod snapshot_scheduler;
 pub mod snapshot_upload;
 pub mod snapshot_upload_jobs;
 pub mod state;
+mod transfer_directory;
 pub mod watchdog;
 
 pub use pplx_space_sbx_mgr_client::{

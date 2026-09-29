@@ -409,6 +409,25 @@ fn actor_claims_are_accepted_only_from_the_node_agent() {
     request.actor_token = Some(ClientService::TemplateManager.to_string());
     request.actor_token_type = Some(SERVICE_ACTOR_TOKEN_TYPE.to_string());
 
+    for (uid, expected_actor) in [
+        (users::SPACE_VOLMGR.uid, ClientService::VolumeManager),
+        (users::SPACE_SBXMGR.uid, ClientService::VolumeManager),
+        (users::SPACE_TMPLMGR.uid, ClientService::TemplateManager),
+    ] {
+        let peer =
+            ResolvedCaller::UdsPeer(pplx_space_common_svc::PeerIdentity::new(uid, uid, None));
+        assert_eq!(
+            parse_request(&peer, template_request(&template, STORAGE_READ_SCOPE))
+                .unwrap()
+                .actor,
+            expected_actor,
+        );
+        assert!(matches!(
+            parse_request(&peer, request.clone()).unwrap_err(),
+            StorageExchangeError::ActorSpoofing
+        ));
+    }
+
     let direct = caller(ClientService::BuildManager, "builder", "builder-uid");
     assert!(matches!(
         parse_request(&direct, request.clone()).unwrap_err(),

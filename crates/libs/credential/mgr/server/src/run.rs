@@ -996,13 +996,13 @@ where
 {
     let (_, health_service) = pplx_space_common_svc::grpc_health_service();
     pplx_space_common_svc::grpc_server_builder()
-        .layer(access)
+        .layer(pplx_space_common_svc::grpc_trace_layer())
         .layer(
             pplx_space_common_svc::conservative_uds_grpc_rate_limiter_layer(
                 "space-credential-manager",
             ),
         )
-        .layer(pplx_space_common_svc::grpc_trace_layer())
+        .layer(access)
         .add_service(health_service)
         .add_service(CredentialManagerServer::new(service))
         .serve_with_incoming_shutdown(UnixListenerStream::new(listener), async move {

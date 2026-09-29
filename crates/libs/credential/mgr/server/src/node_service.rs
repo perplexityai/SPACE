@@ -45,9 +45,10 @@ const ALLOW_RESOLVE_NETWORK_CREDENTIALS: &[UdsPeerPrincipal] =
     &[UdsPeerPrincipal::Service(user_names::SPACE_SBXMGR)];
 
 /// Storage exchange is available only to the two local data-plane consumers.
-/// The shared Sandbox/Volume uid is mapped to Volume Manager for this RPC;
-/// Sandbox Manager has no legitimate storage-token call site.
+/// The old shared UID remains a Volume Manager actor during staged upgrades;
+/// remove that compatibility mapping only after its rollback path is retired.
 const ALLOW_EXCHANGE_TOKEN: &[UdsPeerPrincipal] = &[
+    UdsPeerPrincipal::Service(user_names::SPACE_VOLMGR),
     UdsPeerPrincipal::Service(user_names::SPACE_SBXMGR),
     UdsPeerPrincipal::Service(user_names::SPACE_TMPLMGR),
 ];
@@ -298,15 +299,16 @@ fn forwarded_exchange_request(
             "storage credential actor requires a UDS peer identity",
         ));
     };
-    let actor = if identity.uid() == users::SPACE_SBXMGR.uid {
-        ClientService::VolumeManager
-    } else if identity.uid() == users::SPACE_TMPLMGR.uid {
-        ClientService::TemplateManager
-    } else {
-        return Err(Status::permission_denied(
-            "local service is not authorized for storage credential exchange",
-        ));
-    };
+    let actor =
+        if identity.uid() == users::SPACE_VOLMGR.uid || identity.uid() == users::SPACE_SBXMGR.uid {
+            ClientService::VolumeManager
+        } else if identity.uid() == users::SPACE_TMPLMGR.uid {
+            ClientService::TemplateManager
+        } else {
+            return Err(Status::permission_denied(
+                "local service is not authorized for storage credential exchange",
+            ));
+        };
     request.actor_token = Some(actor.as_str().to_string());
     request.actor_token_type = Some(SERVICE_ACTOR_TOKEN_TYPE.to_string());
     Ok(request)

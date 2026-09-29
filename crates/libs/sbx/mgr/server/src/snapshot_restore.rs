@@ -2078,6 +2078,13 @@ async fn pull_artifact_inner(
     transfer_scope_id: Option<pplx_space_common_core::types::TransferScopeId>,
 ) -> Result<(), RestoreError> {
     let sandbox_id = identity.sandbox_id;
+    let parent = local_path
+        .parent()
+        .ok_or_else(|| RestoreError::Other("snapshot pull destination has no parent".to_owned()))?;
+    crate::transfer_directory::prepare(parent).map_err(|source| RestoreError::CreateDirectory {
+        path: parent.to_owned(),
+        source,
+    })?;
     let s3_uri = restore_artifact_uri(config, file_name);
     let local_path_str = local_path.to_string_lossy().into_owned();
     let adopted = adopt_completed_replacement_temp(sandbox_id, &local_path, &s3_uri);

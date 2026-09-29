@@ -495,7 +495,9 @@ fn effective_actor(
         }
         ResolvedCaller::UdsPeer(identity) => {
             require_no_actor_claim(actor_token, actor_token_type)?;
-            if identity.uid() == users::SPACE_SBXMGR.uid {
+            if identity.uid() == users::SPACE_VOLMGR.uid
+                || identity.uid() == users::SPACE_SBXMGR.uid
+            {
                 Ok(ClientService::VolumeManager)
             } else if identity.uid() == users::SPACE_TMPLMGR.uid {
                 Ok(ClientService::TemplateManager)

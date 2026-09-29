@@ -624,11 +624,6 @@ start_all() {
   start_independent_service_as rtmgr "$SPACE_RTMGR_USER" "$SPACE_RTMGR_GROUP" \
     "$SPACE_RUNTIME_MANAGER_GROUPS" space-rtmgr-svc
 
-  # Storage + auth (no socket dependencies on each other). Privileged BYOK
-  # volume operations live in node-manager; volume-manager runs under the
-  # production service identity with cache access through space-cache-rw.
-  start_service_as volmgr "$SPACE_VOLMGR_USER" "$SPACE_VOLMGR_GROUP" "$SPACE_VOLUME_MANAGER_GROUPS" \
-    env "SPACE_CREDMGR_ENDPOINT=unix://$VOLCRED_SOCKET" space-volmgr-svc
   # credmgr runs its (pre-agent-migration) authority role, which resolves org
   # KEK rows from the control-plane DB. Hand the DB URL to credmgr only; no
   # other node service sees Postgres, matching production workers. The
@@ -650,6 +645,10 @@ start_all() {
     env "${credmgr_env[@]}" space-credmgr-svc --volume-socket "$VOLCRED_SOCKET"
   wait_for_socket credmgr "$CREDMGR_SOCKET"
   wait_for_socket credmgr "$VOLCRED_SOCKET"
+
+  # Pending transfers can need credentials immediately during recovery.
+  start_service_as volmgr "$SPACE_VOLMGR_USER" "$SPACE_VOLMGR_GROUP" "$SPACE_VOLUME_MANAGER_GROUPS" \
+    env "SPACE_CREDMGR_ENDPOINT=unix://$VOLCRED_SOCKET" space-volmgr-svc
 
   # template-manager. Prefetch resolves seed:latest against the cluster API
   # (space-seed-publish registered it) and pulls through volmgr — the same

@@ -325,7 +325,7 @@ fn evaluate_admits_the_content_addressed_systemd_install() {
 }
 
 #[test]
-fn volmgr_exe_requires_its_own_uid_allowlist() {
+fn volmgr_exe_is_admitted_during_the_uid_transition() {
     let volume_checks = PeerProcessChecks {
         binary_paths: pplx_space_common_core::host::linux::paths::SPACE_VOLMGR_SVC_BINARIES,
         ..PeerProcessChecks::EMPTY
@@ -340,10 +340,7 @@ fn volmgr_exe_requires_its_own_uid_allowlist() {
     ] {
         let snap = snapshot(exe, 1001, 0);
         evaluate_process_checks(&volume_checks, 1001, &snap, |_| Vec::new()).unwrap();
-        assert!(matches!(
-            evaluate_process_checks(&sandbox_checks, 1001, &snap, |_| Vec::new()),
-            Err(ProcessCheckFailure::BinaryNotAllowed(_))
-        ));
+        evaluate_process_checks(&sandbox_checks, 1001, &snap, |_| Vec::new()).unwrap();
     }
 }
 

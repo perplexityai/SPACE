@@ -431,6 +431,12 @@ impl CredentialUdsAccess {
                     "/space.credential.manager.v1.CredentialManager/IssueDek" => "IssueDek",
                     "/space.credential.manager.v1.CredentialManager/UnwrapDek" => "UnwrapDek",
                     _ => {
+                        let peer = peer_identity_from_tonic_request(request);
+                        tracing::warn!(
+                            peer_uid = ?peer.as_ref().map(|identity| identity.uid()),
+                            peer_pid = ?peer.as_ref().and_then(|identity| identity.pid()),
+                            "rejecting operation outside the volume credential socket allowlist"
+                        );
                         return Err(Status::permission_denied(
                             "operation is not available on the volume credential socket",
                         ));
@@ -501,7 +507,11 @@ where
         let clone = self.inner.clone();
         let mut inner = std::mem::replace(&mut self.inner, clone);
         Box::pin(async move {
-            authorized?;
+            // Outer tracing/rate-limit layers must see a gRPC response, not a
+            // transport error that tonic would recover only after those layers.
+            if let Err(status) = authorized {
+                return Ok(status.into_http());
+            }
             let response = inner.call(request).await.map_err(Into::into)?;
             Ok(response.map(tonic::body::Body::new))
         })

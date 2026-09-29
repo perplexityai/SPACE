@@ -392,15 +392,15 @@ async fn volume_listener_limits_both_peer_and_methods_before_dispatch() {
                 expected,
                 "{method}: {uid}"
             );
-            match result {
-                Ok(_) => assert!(expected, "{method}: {uid}"),
-                Err(error) => {
-                    assert!(!expected, "{method}: {uid}");
-                    assert_eq!(
-                        Status::from_error(error).code(),
-                        tonic::Code::PermissionDenied
-                    );
-                }
+            let response = result.expect("authorization returns a gRPC response");
+            let status = Status::from_header_map(response.headers());
+            if expected {
+                assert!(
+                    status.is_none(),
+                    "the inner service answered {method}: {uid}"
+                );
+            } else {
+                assert_eq!(status.unwrap().code(), tonic::Code::PermissionDenied);
             }
         }
     }

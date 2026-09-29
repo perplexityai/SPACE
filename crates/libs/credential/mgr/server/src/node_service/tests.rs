@@ -189,6 +189,7 @@ fn peer_request(uid: u32) -> Request<ResolveRequest> {
 #[test]
 fn exchange_forwarding_overwrites_untrusted_actor_claims() {
     for (uid, expected_actor) in [
+        (users::SPACE_VOLMGR.uid, ClientService::VolumeManager),
         (users::SPACE_SBXMGR.uid, ClientService::VolumeManager),
         (users::SPACE_TMPLMGR.uid, ClientService::TemplateManager),
     ] {

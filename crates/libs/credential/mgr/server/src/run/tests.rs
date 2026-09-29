@@ -333,3 +333,6 @@ fn volume_socket_requires_a_distinct_uds_listener() {
         Err(RunCredmgrError::InvalidVolumeSocket)
     ));
 }
+
+#[cfg(target_os = "linux")]
+mod volume_socket;

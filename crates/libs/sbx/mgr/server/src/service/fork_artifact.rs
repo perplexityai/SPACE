@@ -222,9 +222,8 @@ pub(super) async fn copy_objects(
     .ok_or_else(|| Status::unavailable("fork copy staging cleanup is in progress"))?;
     let copy_dir = copy_attempt_staging_dir(operation_id, Uuid::now_v7());
     let staging_attempt = CopyStagingAttempt::new(copy_dir.clone());
-    tokio::fs::create_dir_all(&copy_dir)
-        .await
-        .map_err(|error| Status::internal(format!("create fork copy directory: {error}")))?;
+    crate::transfer_directory::prepare(&copy_dir)
+        .map_err(|error| Status::internal(format!("prepare fork copy directory: {error}")))?;
 
     let copy_result = async {
         let mut volmgr = pplx_space_volmgr_client::connect(VOLMGR_SOCKET)
