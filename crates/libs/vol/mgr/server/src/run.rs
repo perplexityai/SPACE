@@ -29,7 +29,7 @@ pub const SERVICE_NAME: &str = "space-volume-manager";
 const SOCKET_GROUP: &str = group_names::SPACE_SBXCLIENTS;
 // Hard-coded so two instances on the same host cannot be configured to use
 // different mutex files and both acquire concurrently.
-const SERVICE_MUTEX_PATH: &str = "/space/run/volume-manager/service.mutex";
+pub const SERVICE_MUTEX_PATH: &str = "/space/run/volume-manager/service.mutex";
 const UNEXPECTED_SERVER_EXIT_CODE: i32 = 1;
 
 static VOLUME_MANAGER_MIGRATOR: sqlx::migrate::Migrator =

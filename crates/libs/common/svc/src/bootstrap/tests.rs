@@ -3,6 +3,44 @@ use http::HeaderValue;
 use tower_http::classify::{ClassifiedResponse, ClassifyResponse};
 
 #[test]
+fn staging_socket_recognition_follows_the_binder_and_rejects_other_names() {
+    for socket in [
+        "s",
+        "handoff.sock",
+        "volume-manager.sock",
+        "a-very-long-service-name.sock",
+    ] {
+        let path = Path::new(socket);
+        for attempt in 0..64 {
+            let staged =
+                unix_socket_staging_path_for_attempt(path, Uuid::now_v7(), attempt).unwrap();
+            assert!(is_unix_socket_staging_name(
+                path,
+                staged.file_name().unwrap()
+            ));
+        }
+    }
+    let path = Path::new("volume-manager.sock");
+    for name in [
+        "volume-manager.sock",
+        ".handoff-",
+        ".handoff-012345678!",
+        ".handoff-0123456789A",
+        ".handoff-012345678",
+        "xhandoff-0123456789",
+    ] {
+        assert!(
+            !is_unix_socket_staging_name(path, std::ffi::OsStr::new(name)),
+            "{name}"
+        );
+    }
+    assert!(!is_unix_socket_staging_name(
+        Path::new("/"),
+        std::ffi::OsStr::new("s")
+    ));
+}
+
+#[test]
 fn unix_socket_staging_path_preserves_the_published_path_budget() {
     let socket_path = Path::new(
         "/tmp/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.sock",
