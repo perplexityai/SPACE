@@ -443,130 +443,50 @@ SPACE_KIND_CLUSTER=space-local \
 
 ## Separating volume-manager's credential identity
 
-Volume-manager runs as `space-volmgr` (UID/GID 964), independently of
-sandbox-manager (UID 950). The worker image creates both accounts from
-`infra/space/identity/node-identities.sh`. Volume-manager retains
-`space-cache-rw` for shared artifact access and `space-sbxclients` to publish
-its own RPC socket. Neither group grants it access to credential-manager's
-standard listener: that listener rejects the volume-manager principal.
+The worker image provides a separate `space-volmgr` account (UID/GID 964) and
+credential-client group `space-volcredclients` (GID 965). The local launcher
+continues to run volume-manager as `space-sbxmgr` (UID 950), using the standard
+credential socket. Adding these accounts does not change the running identity
+or migrate retained files.
 
-Credential-manager's optional `--volume-socket
-/space/run/volume-credentials/credmgr.sock` listener admits only the
-volume-manager principal and only `ExchangeToken`, `IssueDek`, and `UnwrapDek`.
-It rejects CA/CSR issuance, credential-injection resolution, envelope operations,
-and sandbox-volume-key operations before handling or forwarding the request.
-Both the node agent and local authority support this listener. The standard
-socket and sandbox-manager's gateway signing authorization are unchanged for
-sandbox-manager.
+Credential-manager supports an optional `--volume-socket
+/space/run/volume-credentials/credmgr.sock` listener. It admits only the
+volume-manager identity and only `ExchangeToken`, `IssueDek`, and `UnwrapDek`.
+Certificate issuance and other privileged credential methods are denied before
+handling or forwarding the request. Both the node agent and local authority
+support this listener; existing sandbox-manager and template-manager clients
+continue to use the standard listener.
 
-Provision `/space/run/volume-credentials` with mode `0750`, owned by the
-credential-manager runtime UID and `space-volcredclients` (GID 965). Give
-credential-manager and volume-manager that supplementary group. The socket is
-mode `0660`. Set **only volume-manager's** `SPACE_CREDMGR_ENDPOINT` to
-`unix:///space/run/volume-credentials/credmgr.sock`; do not change the agent's
-upstream endpoint. Mount the new socket directory into both pods. Do not give
-volume-manager UID-changing capabilities or sandbox-manager's primary group.
+To prepare the additional listener:
 
-### Rollout: prepare, verify, then switch
+- Provision `/space/run/volume-credentials` with mode `0750`, owned by the
+  credential-manager runtime UID and group 965. Give credential-manager and
+  volume-manager that supplementary group and mount the directory into both
+  services. The socket is mode `0660`.
+- Give the directory one initializer. Preserve credential-manager's identity
+  and standard socket directory ownership while older launchers remain in use.
+- Deploy compatible binaries before enabling `--volume-socket`. A bind failure
+  on the additional socket currently stops credential-manager, including its
+  standard listener; verify both listeners before proceeding.
+- Exercise token exchange and transfer-key issue/unwrap as UID 964, verify
+  privileged methods are denied, and check legacy UID-950 calls still work.
+  Check the configured peer-process verification mode as well as pod readiness.
 
-The production charts and volume-manager init script live outside this public
-repository. Plan two deployment changes with a verification gate between them;
-merging both changes together does not establish safe deployment order. Keep
-credential-manager's UID, existing socket directory owner, and service-mutex
-path unchanged throughout this volume-manager transition.
+Shared restore and fork directories use `space-cache-rw` (GID 952). Run both
+sandbox-manager and volume-manager with umask `0022`; restrictive masks can
+leave restore parents or downloaded files inaccessible across the identities.
+Validate retained transfers, snapshot restore, and fork with the intended image
+and filesystem settings before changing identities.
 
-**Preparation change — make the new connection available.**
+Changing an existing node's identity requires separate migration tooling and
+deployment orchestration. Stop and drain the predecessor, preserve and acquire
+its existing service-lock inode, and transfer only volume-manager's retained
+state. Change the identity and credential endpoint together; use the same safe
+handoff for rollback. A running volume-manager under UID 964 must use
+`SPACE_CREDMGR_ENDPOINT=unix:///space/run/volume-credentials/credmgr.sock` and is
+denied access to the standard listener.
 
-- Build an image containing the new identities and credential-manager flag,
-  then enable `--volume-socket` with the directory and supplementary groups
-  described above. Old binaries do not understand the flag. Custom Rust
-  launchers must supply `CredmgrRunConfig::volume_socket_path`.
-- Leave volume-manager on UID 950 and its original endpoint. The legacy
-  executable allowance and storage-actor mapping stay available during this
-  stage, including when authority process checks are enforced.
-- Give the new directory one initializer: credential-manager's init. Audit
-  every supported node bootstrap, restart, and rollback image for competing
-  ownership writes. Do not change the old credential directory's owner while
-  legacy node-manager init scripts can still rewrite it.
-- Validate the chart against the actual image and its pinned public source,
-  including rollback combinations. Do not combine a chart requiring the new
-  flag with an older image merely because both builds succeeded. A missing
-  socket group, directory, or bind permission stops credential-manager,
-  including its standard listener; treat any bind failure as a preparation
-  failure and do not proceed to cutover.
-- Before cutover on each node, prove the new listener is active with a real
-  UID-964 client: token exchange and DEK issue/unwrap work; certificate and
-  injection-secret requests are denied. Test legacy UID-950 storage calls too.
-  On local authorities, test the configured `SPACE_UDS_PEER_PROCESS_CHECK` mode
-  too: enforcement requires the authority to inspect the new UID's `/proc`
-  entries and recognize its executable. Block cutover if those checks cannot
-  succeed; do not disable them to pass the gate.
-  Pod readiness alone is insufficient: a replacement credential-manager can
-  report ready while waiting for its predecessor's service mutex.
-
-**Cutover change — move volume-manager onto that connection.**
-
-- Require the preparation gate on the same node before changing its identity.
-  Cover workers and builders, stable and canary releases, and replacement nodes.
-- Use a delete-first transition: stop admission, drain and stop the predecessor,
-  then acquire `/space/run/volume-manager/service.mutex` before changing retained
-  state. Preserve its inode. An init waiting for the old process's mutex under
-  a surge rollout can deadlock if Kubernetes waits for the successor to become
-  ready before terminating the predecessor.
-- Migrate only volume-manager's runtime directory, SQLite database/WAL/SHM, and
-  retained `/space/cache/firecracker/.volmgr-staging` files to UID/GID 964.
-  Reject symlinks, unexpected hard links, and foreign mounts. Do not recursively
-  chown shared sandbox or template caches. Preserve shared artifact access
-  through `space-cache-rw` and runtime socket access through `space-sbxclients`.
-- Switch the UID/GID, supplementary groups, and volume-manager's endpoint
-  together. Verify pending-transfer recovery, template pulls, and snapshot
-  suspend/restore and disk-only forks using retained data, not only an empty
-  node. Sandbox-manager must also contain the shared download-directory
-  permission fix before volume-manager changes UID.
-- Keep the prepared credential-manager deployed during rollback. Drain the new
-  volume-manager and restore its identity, endpoint, and retained-file ownership
-  together under the same mutex. Only then may the extra credential listener be
-  disabled. A rollback to UID 950 reopens the security issue.
-
-Run sandbox-manager and volume-manager with umask `0022` throughout the switch
-and rollback. Restrictive masks such as `0077` can leave existing restore parents
-untraversable or downloads and provenance unreadable across the two identities.
-These failures deny transfers; supporting restrictive masks requires additional
-restore/transfer permission changes. Verify the built image's process settings
-and shared file access before switching identities.
-
-Rehearse both changes locally before a shared-environment rollout: delay the old
-initializer until after the new one, restart either daemon independently,
-interrupt a transfer, and run forward and reverse transitions with retained
-SQLite and staging data. Public tests cover credential authorization and the
-retained-state helper; deployment tests must also verify initializer ordering
-and real suspend/restore/fork behavior with the built image.
-
-The volume-manager executable provides two explicit rollout commands:
-
-- `--check-volume-credentials` checks the configured credential listener with
-  harmless invalid requests, with a 20-second timeout. Run it as the target
-  service identity and groups. It checks privileged-method denial and storage
-  method admission; it does not replace full token exchange and DEK checks.
-- `--prepare-volume-identity separate` (Linux, root only) acquires the existing
-  service mutex, validates and transfers retained state, then exits. It requires
-  kernel support for `openat2` and rejects custom database/socket/staging paths. Use
-  `--prepare-volume-identity legacy` for rollback with the same helper image.
-  `--service-mutex-timeout-secs` bounds the wait for the predecessor. The helper
-  preserves retained bytes and mutex inodes; failed checks can leave directories
-  sealed or partially transferred, requiring inspection before retrying.
-
-Neither command runs during ordinary service startup. Stop the predecessor and
-verify credentials before invoking the ownership helper; do not replace it with
-recursive ownership changes or revert to an older initializer on rollback.
-
-The local launcher creates fresh staging with mode `0700` and refuses retained
-UID-950-owned state (including socket and mutex files) until a quiesced ownership
-migration is complete. Do not delete a mutex to bypass this check. It neither
-erases that state nor grants temporary access to the new listener.
-
-A partial rollout is **not a security fix**: UID-950 volume-manager processes
-remain indistinguishable from sandbox-manager. After every deployment has moved
-and the legacy rollback path is retired, remove volume-manager's entry from the
-UID-950 executable allowance and the legacy storage-actor mapping in a follow-up.
-The new volume identity is denied CA issuance on both listeners throughout.
+The shared-identity vulnerability remains until volume-manager stops running as
+UID 950. Retain legacy authorization during the supported rollback window,
+then remove the UID-950 volume-manager executable allowance and storage-actor
+mapping in a follow-up.

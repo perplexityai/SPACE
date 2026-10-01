@@ -31,22 +31,8 @@ datadog-otel = ["otel", "datadog"]
 [dependencies]
 anyhow = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
-tokio = { workspace = true, features = ["time"] }
-tonic = { workspace = true }
 
 # internal
 pplx-space-common-core = { workspace = true }
 pplx-space-common-svc = { workspace = true }
-pplx-space-credmgr-client = { workspace = true }
 pplx-space-volmgr = { workspace = true }
-
-[target.'cfg(target_os = "linux")'.dependencies]
-libc = { workspace = true }
-
-[dev-dependencies]
-tokio-stream = { workspace = true, features = ["net"] }
-tower = { workspace = true }
-uuid = { workspace = true }
-
-[target.'cfg(target_os = "linux")'.dev-dependencies]
-rusqlite = { workspace = true }
