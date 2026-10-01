@@ -316,7 +316,9 @@ setup_layout() {
   for volmgr_state in /space/run/volume-manager /space/cache/firecracker/.volmgr-staging; do
     [[ ! -L "$volmgr_state" ]] || die "volume-manager state must not be a symlink: $volmgr_state"
     if [[ -d "$volmgr_state" ]]; then
-      legacy_owner="$(find "$volmgr_state" -xdev -mindepth 1 -uid "$SPACE_SBXMGR_UID" -print -quit)"
+      # The daemon replaces the published socket after taking the preserved lock.
+      legacy_owner="$(find "$volmgr_state" -xdev -mindepth 1 -uid "$SPACE_SBXMGR_UID" \
+        ! \( -path /space/run/volume-manager/volume-manager.sock -type s -links 1 \) -print -quit)"
       [[ -z "$legacy_owner" ]] || die "volume-manager state requires a quiesced UID migration before startup; see docs/installation.md: $volmgr_state"
     fi
   done

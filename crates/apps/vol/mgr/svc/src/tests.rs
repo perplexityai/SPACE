@@ -1,0 +1,51 @@
+use super::*;
+
+#[test]
+fn handoff_rejects_service_path_overrides() {
+    let defaults = Cli::try_parse_from(["space-volmgr-svc"]).unwrap();
+    assert!(defaults.prepare_volume_identity.is_none());
+    assert!(!defaults.check_volume_credentials);
+    let probe = Cli::try_parse_from(["space-volmgr-svc", "--check-volume-credentials"]).unwrap();
+    assert!(probe.prepare_volume_identity.is_none());
+    assert!(probe.check_volume_credentials);
+    let normal = Cli::try_parse_from([
+        "space-volmgr-svc",
+        "--db",
+        "/custom/state.db",
+        "--socket",
+        "/custom/service.sock",
+        "--staging-dir",
+        "/custom/staging",
+    ])
+    .unwrap();
+    assert!(normal.prepare_volume_identity.is_none());
+    assert!(!normal.check_volume_credentials);
+
+    for identity in ["legacy", "separate"] {
+        let handoff =
+            Cli::try_parse_from(["space-volmgr-svc", "--prepare-volume-identity", identity])
+                .unwrap();
+        assert!(handoff.prepare_volume_identity.is_some());
+        for option in ["--db", "--socket", "--staging-dir"] {
+            let error = Cli::try_parse_from([
+                "space-volmgr-svc",
+                "--prepare-volume-identity",
+                identity,
+                option,
+                "/custom/path",
+            ])
+            .err()
+            .unwrap();
+            assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+        }
+        let error = Cli::try_parse_from([
+            "space-volmgr-svc",
+            "--prepare-volume-identity",
+            identity,
+            "--check-volume-credentials",
+        ])
+        .err()
+        .unwrap();
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+}

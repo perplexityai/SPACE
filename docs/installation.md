@@ -528,12 +528,37 @@ path unchanged throughout this volume-manager transition.
   together under the same mutex. Only then may the extra credential listener be
   disabled. A rollback to UID 950 reopens the security issue.
 
+Run sandbox-manager and volume-manager with umask `0022` throughout the switch
+and rollback. Restrictive masks such as `0077` can leave existing restore parents
+untraversable or downloads and provenance unreadable across the two identities.
+These failures deny transfers; supporting restrictive masks requires additional
+restore/transfer permission changes. Verify the built image's process settings
+and shared file access before switching identities.
+
 Rehearse both changes locally before a shared-environment rollout: delay the old
 initializer until after the new one, restart either daemon independently,
 interrupt a transfer, and run forward and reverse transitions with retained
-SQLite and staging data. These deployment and retained-state tests belong with
-the private init/chart changes; the public real-peer socket test establishes
-listener authorization and legacy caller compatibility, not storage migration.
+SQLite and staging data. Public tests cover credential authorization and the
+retained-state helper; deployment tests must also verify initializer ordering
+and real suspend/restore/fork behavior with the built image.
+
+The volume-manager executable provides two explicit rollout commands:
+
+- `--check-volume-credentials` checks the configured credential listener with
+  harmless invalid requests, with a 20-second timeout. Run it as the target
+  service identity and groups. It checks privileged-method denial and storage
+  method admission; it does not replace full token exchange and DEK checks.
+- `--prepare-volume-identity separate` (Linux, root only) acquires the existing
+  service mutex, validates and transfers retained state, then exits. It requires
+  kernel support for `openat2` and rejects custom database/socket/staging paths. Use
+  `--prepare-volume-identity legacy` for rollback with the same helper image.
+  `--service-mutex-timeout-secs` bounds the wait for the predecessor. The helper
+  preserves retained bytes and mutex inodes; failed checks can leave directories
+  sealed or partially transferred, requiring inspection before retrying.
+
+Neither command runs during ordinary service startup. Stop the predecessor and
+verify credentials before invoking the ownership helper; do not replace it with
+recursive ownership changes or revert to an older initializer on rollback.
 
 The local launcher creates fresh staging with mode `0700` and refuses retained
 UID-950-owned state (including socket and mutex files) until a quiesced ownership
