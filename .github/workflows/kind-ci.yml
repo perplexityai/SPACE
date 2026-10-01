@@ -116,6 +116,13 @@ jobs:
       # ci/mirrored-images.txt.
       SPACE_CI_IMAGE_MIRROR: ghcr
       SPACE_KIND_RUST_ARTIFACTS: prebuilt
+      # These shards test sandbox lifecycle. The local observability backends
+      # would add twelve pods and six images that ci/mirrored-images.txt does
+      # not carry, on runners whose shared egress is already rate limited, and
+      # a pull failure would surface as a Firecracker smoke failure. Pinned
+      # rather than inherited so a default change cannot add them silently.
+      SPACE_KIND_OBSERVABILITY: "off"
+      SPACE_KIND_TELEMETRY_MODE: datadog
       SPACE_KIND_PREBUILT_RUST_IMAGE_ID: ${{ needs.rust_artifacts.outputs.image_id }}
       SPACE_KIND_PREBUILT_RUST_SHA: ${{ needs.rust_artifacts.outputs.source_sha }}
     runs-on: ubuntu-24.04-16core

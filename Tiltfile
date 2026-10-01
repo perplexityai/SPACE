@@ -74,7 +74,8 @@ TELEMETRY_MODE = TELEMETRY_CONFIG["mode"]
 TELEMETRY_SET = TELEMETRY_CONFIG["helm_set"]
 watch_file("infra/space/kind/charts/space-kind-telemetry")
 if TELEMETRY_MODE == "otel":
-    print("OTLP uses the Collectors, not the Agent; install infra/space/kind/metrics/local.sh up and infra/space/kind/traces/local.sh up before selecting otel mode.")
+    if not TELEMETRY_CONFIG["install_observability"]:
+        print("otel mode with SPACE_KIND_OBSERVABILITY=off: point the telemetry chart's endpoints at your own receiver, or exports will have nowhere to go.")
 
 # ── Image builds ──────────────────────────────────────────────────────────
 #

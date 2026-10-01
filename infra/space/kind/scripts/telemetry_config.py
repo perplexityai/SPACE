@@ -27,6 +27,7 @@ OPTIONS = {
     "SPACE_KIND_OWNER",
     "SPACE_KIND_SHIM_ENV",
     "SPACE_KIND_SHIM_OTLP_ENDPOINT",
+    "SPACE_KIND_OBSERVABILITY",
 }
 PHASES = {"before-main", "after-datadog", "after-otel"}
 MODES = {
@@ -125,7 +126,11 @@ def configuration(env):
         raise ValueError(
             "SPACE_KIND_CLUSTER_ID must be a lowercase DNS label (max 63 characters)"
         )
-    mode = env.get("SPACE_KIND_TELEMETRY_MODE", "datadog")
+    # Kind defaults to otel: the local Collectors come up with the cluster, so
+    # metrics and traces land somewhere queryable without a vendor round trip.
+    # `datadog` stays available and pairs with SPACE_KIND_DATADOG_MODE=fakeintake
+    # to validate DogStatsD output locally.
+    mode = env.get("SPACE_KIND_TELEMETRY_MODE", "otel")
     if mode not in MODES:
         raise ValueError("SPACE_KIND_TELEMETRY_MODE must be datadog, otel, or journald")
     environment = token(
@@ -150,8 +155,18 @@ def configuration(env):
             raise ValueError(f"SPACE_KIND_SHIM_OTLP_ENDPOINT {rejection}")
     version = f"{revision}-{phase}" if revision and phase else revision
     metrics, traces = MODES[mode]
+    # `otel` needs the local Collectors: install-shim resolves their ClusterIPs
+    # and fails without them. `auto` installs them exactly when the mode uses
+    # them. `off` is for a caller supplying its own receiver, and for CI, whose
+    # Kind jobs test sandbox lifecycle and should not pull six more images
+    # through a rate-limited mirror.
+    observability = env.get("SPACE_KIND_OBSERVABILITY", "auto")
+    if observability not in {"auto", "off"}:
+        raise ValueError("SPACE_KIND_OBSERVABILITY must be auto or off")
     return {
         "mode": mode,
+        "observability": observability,
+        "install_observability": observability == "auto" and mode == "otel",
         "kind_cluster": kind_cluster,
         "cluster_id": cluster_id,
         "environment": environment,

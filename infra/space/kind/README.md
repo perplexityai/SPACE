@@ -243,21 +243,34 @@ The Kind-only `datadog-agent-local` chart supports two explicit backends:
 
 ### OTLP telemetry
 
-The `otel` mode sends metrics and traces to the Collectors and does not
-require the Datadog Agent or Datadog credentials.
-
-**The metrics and traces charts must be installed first.** They ship in
-[#85](https://github.com/perplexityai/SPACE/pull/85) and
-[#87](https://github.com/perplexityai/SPACE/pull/87); `otel` mode points every
-workload at their Collector Services, so without them there is nothing
-listening and exports fail. Create the Kind cluster, install the receivers,
-then select the mode in bootstrap or Tilt:
+This is the default. `otel` mode sends metrics and traces to the local
+Collectors and needs neither the Datadog Agent nor Datadog credentials, so an
+ordinary bootstrap gives you a cluster whose telemetry you can query:
 
 ```bash
-bash infra/space/kind/metrics/local.sh up
-bash infra/space/kind/traces/local.sh up
-SPACE_KIND_TELEMETRY_MODE=otel bash infra/space/kind/scripts/bootstrap.sh
+bash infra/space/kind/scripts/bootstrap.sh
 ```
+
+Bootstrap installs the metrics, traces, logs and visualization backends before
+the shim, because `install-shim.sh` resolves the metrics and traces Collector
+Services to ClusterIPs and fails if they are absent. Each helper is idempotent,
+so re-running bootstrap does not churn them.
+
+To keep a cluster lean, or to point the exporters at a receiver you run
+yourself:
+
+```bash
+# No local backends; supply your own receiver.
+SPACE_KIND_OBSERVABILITY=off bash infra/space/kind/scripts/bootstrap.sh
+
+# Native Datadog instead, with local capture rather than the SaaS backend.
+SPACE_KIND_TELEMETRY_MODE=datadog SPACE_KIND_DATADOG_MODE=fakeintake \
+  bash infra/space/kind/scripts/bootstrap.sh
+```
+
+CI pins `SPACE_KIND_OBSERVABILITY=off` and `SPACE_KIND_TELEMETRY_MODE=datadog`
+for the Kind smoke shards: they test sandbox lifecycle, and the backends'
+images are not in `ci/mirrored-images.txt`.
 
 Rust workloads send metrics to
 `http://collector.space-metrics.svc.cluster.local:4317` and traces to

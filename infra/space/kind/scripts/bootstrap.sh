@@ -27,7 +27,10 @@
 #   SPACE_KIND_DATADOG_MODE  off (default), fakeintake, or explicit saas
 #   SPACE_KIND_OBSERVABILITY_CONFIG watched non-secret experiment JSON file;
 #                            required for SaaS. See the Kind README.
-#   SPACE_KIND_TELEMETRY_MODE datadog (default), otel, or journald. The otel
+#   SPACE_KIND_OBSERVABILITY auto (default) installs the local metrics, traces,
+#                            logs and visualization backends when the telemetry
+#                            mode uses them; off skips them.
+#   SPACE_KIND_TELEMETRY_MODE otel (default), datadog, or journald. The otel
 #                            mode sends SPACE traces (including the Go shim)
 #                            and all Rust metric types to the Collectors,
 #                            and moves the Go shim's metrics there too. Rust
@@ -87,8 +90,9 @@ TELEMETRY_HELM_ARGS=()
 while IFS= read -r value; do
   TELEMETRY_HELM_ARGS+=(--set-string "$value")
 done <<<"$telemetry_values"
-if [[ "$TELEMETRY_MODE" == otel ]]; then
-  log "OTLP uses the Collectors, not the Agent; install infra/space/kind/metrics/local.sh up and infra/space/kind/traces/local.sh up before shim installation."
+INSTALL_OBSERVABILITY="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["install_observability"])' <<<"$TELEMETRY_JSON")"
+if [[ "$TELEMETRY_MODE" == otel && "$INSTALL_OBSERVABILITY" != True ]]; then
+  log "otel mode with SPACE_KIND_OBSERVABILITY=off: point SPACE_KIND_SHIM_OTLP_ENDPOINT and the telemetry chart's endpoints at your own receiver, or shim installation will fail."
 fi
 
 # ── Step 0: prereqs ──────────────────────────────────────────────────────────
@@ -245,6 +249,16 @@ done
 # every per-sandbox pod fails to start. install-shim.sh is idempotent: it
 # only builds the shim if needed and only edits containerd config.toml if
 # the runtime stanza isn't already present.
+# The local backends come up before the shim: install-shim resolves the
+# metrics and traces Collector Services to ClusterIPs and fails if they are
+# absent. Each helper is idempotent and refuses any cluster but this bench.
+if [[ "$INSTALL_OBSERVABILITY" == True ]]; then
+  for signal in metrics traces logs grafana; do
+    log "installing the $signal backend (SPACE_KIND_OBSERVABILITY=off to skip)"
+    bash "$KIND_DIR/$signal/local.sh" up
+  done
+fi
+
 log "installing containerd-shim-space-v2 on sandbox workers"
 bash "$KIND_DIR/scripts/install-shim.sh"
 

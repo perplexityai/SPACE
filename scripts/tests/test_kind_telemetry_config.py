@@ -445,3 +445,43 @@ def test_shim_endpoint_override_follows_the_shared_rule(endpoint, rejected) -> N
             config.configuration(environment)
     else:
         assert config.configuration(environment)["shim_endpoint"] == endpoint
+
+
+def test_kind_defaults_to_otel_with_the_local_backends():
+    """An unconfigured bootstrap must land telemetry somewhere queryable.
+
+    The previous default was `datadog`, while `SPACE_KIND_DATADOG_MODE`
+    defaults to `off` -- so a default cluster emitted DogStatsD to an Agent
+    that was never installed and the measurements went nowhere.
+    """
+    settings = config.configuration({})
+    assert settings["mode"] == "otel"
+    assert settings["install_observability"] is True
+
+
+@pytest.mark.parametrize(
+    "env,mode,installs",
+    [
+        ({}, "otel", True),
+        ({"SPACE_KIND_TELEMETRY_MODE": "datadog"}, "datadog", False),
+        ({"SPACE_KIND_TELEMETRY_MODE": "journald"}, "journald", False),
+        ({"SPACE_KIND_OBSERVABILITY": "off"}, "otel", False),
+        ({"SPACE_KIND_OBSERVABILITY": "auto"}, "otel", True),
+    ],
+)
+def test_backends_install_only_when_the_mode_uses_them(env, mode, installs):
+    """`install-shim` resolves the Collector ClusterIPs and fails without them.
+
+    So the install decision has to follow the selected mode, and `off` has to
+    be able to refuse it for a caller that supplies its own receiver -- which
+    is how CI keeps its Kind jobs lean.
+    """
+    settings = config.configuration(dict(env))
+    assert settings["mode"] == mode
+    assert settings["install_observability"] is installs
+
+
+def test_an_unknown_observability_selector_is_rejected():
+    """A typo must not quietly skip the backends the mode needs."""
+    with pytest.raises(ValueError, match="SPACE_KIND_OBSERVABILITY"):
+        config.configuration({"SPACE_KIND_OBSERVABILITY": "yes"})
