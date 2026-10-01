@@ -253,10 +253,19 @@ done
 # metrics and traces Collector Services to ClusterIPs and fails if they are
 # absent. Each helper is idempotent and refuses any cluster but this bench.
 if [[ "$INSTALL_OBSERVABILITY" == True ]]; then
-  for signal in metrics traces logs grafana; do
+  for signal in metrics traces logs; do
     log "installing the $signal backend (SPACE_KIND_OBSERVABILITY=off to skip)"
     bash "$KIND_DIR/$signal/local.sh" up
   done
+  # The chart enables only its Prometheus datasource by default, so it never
+  # provisions one pointing at a backend the operator has not installed. Here
+  # all three are installed, so all three are enabled -- otherwise Loki and
+  # Tempo would run with no dashboard able to reach them, which is the same
+  # shape this change exists to remove.
+  log "installing the grafana backend (SPACE_KIND_OBSERVABILITY=off to skip)"
+  bash "$KIND_DIR/grafana/local.sh" up \
+    --set datasources.loki.enabled=true \
+    --set datasources.tempo.enabled=true
 fi
 
 log "installing containerd-shim-space-v2 on sandbox workers"
