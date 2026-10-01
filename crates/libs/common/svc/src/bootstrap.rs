@@ -412,17 +412,42 @@ fn bind_unix_socket_replacement_at(
     result
 }
 
+const SOCKET_NONCE_ALPHABET: &[u8; 64] =
+    b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz-";
+const SOCKET_STAGING_PREFIX: &[u8] = b".handoff-";
+
+fn unix_socket_staging_shape(path: &Path) -> Option<(usize, &'static [u8])> {
+    let len = path.file_name()?.as_bytes().len().min(25);
+    let prefix = if len >= SOCKET_STAGING_PREFIX.len() + 8 {
+        SOCKET_STAGING_PREFIX
+    } else {
+        &[]
+    };
+    (len > 0).then_some((len, prefix))
+}
+
+/// Whether a filename has the staging shape used to replace this socket.
+///
+/// This classifies names only. Cleanup must separately verify the inode type,
+/// ownership and exclusivity of the directory before removing an entry.
+pub fn is_unix_socket_staging_name(path: &Path, name: &std::ffi::OsStr) -> bool {
+    let Some((len, prefix)) = unix_socket_staging_shape(path) else {
+        return false;
+    };
+    let bytes = name.as_bytes();
+    bytes.len() == len
+        && bytes.strip_prefix(prefix).is_some_and(|nonce| {
+            nonce
+                .iter()
+                .all(|byte| SOCKET_NONCE_ALPHABET.contains(byte))
+        })
+}
+
 fn unix_socket_staging_path_for_attempt(
     path: &Path,
     seed: Uuid,
     attempt: u8,
 ) -> Result<std::path::PathBuf, UnixSocketStagingPathError> {
-    const NONCE_ALPHABET: &[u8; 64] =
-        b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz-";
-    const READABLE_PREFIX: &[u8] = b".handoff-";
-    const MIN_NONCE_LEN_WITH_PREFIX: usize = 8;
-    const MAX_STAGING_FILE_NAME_LEN: usize = 25;
-
     let file_name =
         path.file_name()
             .ok_or_else(|| UnixSocketStagingPathError::MissingFileName {
@@ -435,19 +460,18 @@ fn unix_socket_staging_path_for_attempt(
         });
     }
 
-    let staging_file_name_len = file_name_len.min(MAX_STAGING_FILE_NAME_LEN);
-    let prefix = if staging_file_name_len >= READABLE_PREFIX.len() + MIN_NONCE_LEN_WITH_PREFIX {
-        READABLE_PREFIX
-    } else {
-        &[]
-    };
+    let (staging_file_name_len, prefix) = unix_socket_staging_shape(path).ok_or_else(|| {
+        UnixSocketStagingPathError::EmptyFileName {
+            path: path.to_path_buf(),
+        }
+    })?;
     let nonce_len = staging_file_name_len - prefix.len();
     let mut staging_file_name = Vec::with_capacity(staging_file_name_len);
     staging_file_name.extend_from_slice(prefix);
 
     let mut nonce = seed.as_u128().wrapping_add(u128::from(attempt));
     for _ in 0..nonce_len {
-        let digit = NONCE_ALPHABET
+        let digit = SOCKET_NONCE_ALPHABET
             .get((nonce & 0x3f) as usize)
             .copied()
             .ok_or(UnixSocketStagingPathError::NonceDigitOutOfRange)?;

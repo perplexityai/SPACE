@@ -499,3 +499,53 @@ The shared-identity vulnerability remains until volume-manager stops running as
 UID 950. Retain legacy authorization during the supported rollback window,
 then remove the UID-950 volume-manager executable allowance and storage-actor
 mapping in a follow-up.
+
+### Retained-state migration commands
+
+The volume-manager executable provides two explicit deployment commands:
+
+- `--check-volume-credentials` checks the configured listener using invalid
+  requests under a 20-second timeout. Run it with the target service identity,
+  groups, and endpoint. It verifies privileged-method denial and transfer-key
+  method admission; real token exchange and key round trips remain separate
+  deployment gates.
+- `--prepare-volume-identity legacy|separate` is a Linux, root-only retained-state
+  handoff. It requires `openat2`, acquires the existing volume-manager service
+  lock, and preserves its inode and the database, journals, and staged upload
+  bytes. `--service-mutex-timeout-secs` bounds lock acquisition. Custom database,
+  socket, and staging paths and simultaneous probe mode are rejected.
+
+Neither command runs during normal service startup or changes the launcher's
+selected identity automatically.
+
+**Recovery limitation:** the handoff does not yet persist a recovery record.
+An interruption can leave mixed ownership that neither a forward retry nor a
+reverse migration accepts. Validation can also fail after directories have
+been sealed. These cases need inspection and repair; do not use this helper for
+unattended cutover until resumable handoff and validation ordering are fixed.
+
+The handoff also rejects administrator-owned `/space` symlinks accepted by
+normal runtime. Align trusted-root handling before migrating those installations.
+
+Deployment preparation must install the compatible executable and ownership
+initializer while the selected identity remains `legacy`. Keep that same
+initializer and helper image in the rollback release; rolling back to recursive
+ownership changes can bypass journal and retained-state checks.
+
+For an identity transition, require all of the following:
+
+1. Verify the restricted listener and compatible sandbox-manager on each target
+   node, including replacement nodes, using real credential calls and file access.
+2. Stop new transfer admission and drain old queued pulls: their destination
+   directories may still be writable only by the legacy identity.
+3. Stop volume-manager before acquiring its preserved service lock. Use a
+   delete-first deployment; a new initializer waiting on a live predecessor can
+   deadlock with a rollout waiting for the new process to become ready.
+4. Change retained-state ownership, service identity, groups, and credential
+   endpoint together. Select the switch explicitly for the prepared pool and
+   validate one canary before widening it.
+5. Exercise retained transfers, encrypted and unencrypted restore, and fork.
+   Verify both services' umask and downloaded-file access.
+6. For rollback, stop the separate-identity process and use the same helper in
+   `legacy` mode under the same lock before starting the old identity. Preserve
+   compatible receiver services throughout the rollback window.

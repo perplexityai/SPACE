@@ -7181,9 +7181,17 @@ version = "0.8.0"
 dependencies = [
  "anyhow",
  "clap",
+ "libc",
  "pplx-space-common-core",
  "pplx-space-common-svc",
+ "pplx-space-credmgr-client",
  "pplx-space-volmgr",
+ "rusqlite",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tower",
+ "uuid",
 ]
 
 [[package]]
