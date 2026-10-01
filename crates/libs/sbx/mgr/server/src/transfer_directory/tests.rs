@@ -14,6 +14,7 @@ fn invalid_transfer_paths_cannot_create_directories() {
     );
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 #[ignore = "requires root to switch between two real service UIDs"]
 fn distinct_service_uids_can_exchange_downloads() {
