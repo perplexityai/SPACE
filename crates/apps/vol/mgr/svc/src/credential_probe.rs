@@ -1,7 +1,7 @@
 use anyhow::{Context as _, ensure};
 use pplx_space_credmgr_client::proto::{
-    IssueDekRequest, IssueIntermediateCertificateRequest,
-    UnstableResolveCredentialInjectionBundleRequest, UnwrapDekRequest,
+    IssueDekRequest, IssueIntermediateCertificateRequest, ResolveNetworkCredentialsRequest,
+    UnwrapDekRequest,
 };
 use tonic::Code;
 
@@ -21,16 +21,14 @@ async fn check_client(
         ca.err().is_some_and(|e| e.code() == Code::PermissionDenied),
         "CA RPC was not denied"
     );
-    let injection = client
-        .unstable_resolve_credential_injection_bundle(
-            UnstableResolveCredentialInjectionBundleRequest::default(),
-        )
+    let credentials = client
+        .resolve_network_credentials(ResolveNetworkCredentialsRequest::default())
         .await;
     ensure!(
-        injection
+        credentials
             .err()
             .is_some_and(|e| e.code() == Code::PermissionDenied),
-        "injection RPC was not denied"
+        "network credential RPC was not denied"
     );
     // Malformed DEK requests stop at organization-id validation in both roles.
     // An empty ExchangeToken request is unsafe: legacy mode ignores fields and

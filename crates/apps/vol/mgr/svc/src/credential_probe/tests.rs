@@ -7,7 +7,7 @@ use tonic::{Status, transport::Server};
 async fn probe_requires_both_denials_and_both_allowed_methods() {
     let methods = [
         "IssueIntermediateCertificate",
-        "UnstableResolveCredentialInjectionBundle",
+        "ResolveNetworkCredentials",
         "IssueDek",
         "UnwrapDek",
     ];
