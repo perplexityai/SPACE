@@ -5,6 +5,26 @@ fn handoff_rejects_service_path_overrides() {
     let defaults = Cli::try_parse_from(["space-volmgr-svc"]).unwrap();
     assert!(defaults.prepare_volume_identity.is_none());
     assert!(!defaults.check_volume_credentials);
+    assert!(defaults.expected_volume_identity.is_none());
+    let error = Cli::try_parse_from(["space-volmgr-svc", "--expected-volume-identity", "legacy"])
+        .err()
+        .unwrap();
+    assert_eq!(
+        error.kind(),
+        clap::error::ErrorKind::MissingRequiredArgument
+    );
+    let guarded = Cli::try_parse_from([
+        "space-volmgr-svc",
+        "--prepare-volume-identity",
+        "legacy",
+        "--expected-volume-identity",
+        "legacy",
+    ])
+    .unwrap();
+    assert_eq!(
+        guarded.expected_volume_identity,
+        Some(identity_handoff::Identity::Legacy)
+    );
     let probe = Cli::try_parse_from(["space-volmgr-svc", "--check-volume-credentials"]).unwrap();
     assert!(probe.prepare_volume_identity.is_none());
     assert!(probe.check_volume_credentials);

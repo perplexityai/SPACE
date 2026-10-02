@@ -364,6 +364,9 @@ impl CredentialManager for NodeCredentialManager {
         &self,
         request: Request<IssueDekRequest>,
     ) -> Result<Response<IssueDekResponse>, Status> {
+        // Reject malformed scope locally before an upstream call; validation
+        // must remain available when the authority is unreachable.
+        crate::service::parse_organization_id(&request.get_ref().organization_id)?;
         let mut up = self.upstream.clone();
         self.forward("IssueDek", async move {
             up.issue_dek(request.into_inner()).await
@@ -375,6 +378,9 @@ impl CredentialManager for NodeCredentialManager {
         &self,
         request: Request<UnwrapDekRequest>,
     ) -> Result<Response<UnwrapDekResponse>, Status> {
+        // Reject malformed scope locally before an upstream call; validation
+        // must remain available when the authority is unreachable.
+        crate::service::parse_organization_id(&request.get_ref().organization_id)?;
         let mut up = self.upstream.clone();
         self.forward("UnwrapDek", async move {
             up.unwrap_dek(request.into_inner()).await

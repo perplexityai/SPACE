@@ -514,18 +514,30 @@ The volume-manager executable provides two explicit deployment commands:
   lock, and preserves its inode and the database, journals, and staged upload
   bytes. `--service-mutex-timeout-secs` bounds lock acquisition. Custom database,
   socket, and staging paths and simultaneous probe mode are rejected.
+  `--expected-volume-identity legacy` additionally refuses a different retained
+  identity or an in-progress identity change while holding the lock.
 
 Neither command runs during normal service startup or changes the launcher's
 selected identity automatically.
 
-**Recovery limitation:** the handoff does not yet persist a recovery record.
-An interruption can leave mixed ownership that neither a forward retry nor a
-reverse migration accepts. Validation can also fail after directories have
-been sealed. These cases need inspection and repair; do not use this helper for
-unattended cutover until resumable handoff and validation ordering are fixed.
+The helper records checked inodes and both identities in the root-only
+`/space/run/.volume-manager-identity` directory before changing ownership.
+An interrupted handoff can be retried with either identity. Preserve this
+record, the database and its journals, staging files, and `service.mutex`;
+never delete the lock or use recursive ownership repair. Unknown or unsafe
+entries are rejected before directory access changes. A path replaced during
+handoff fails closed and requires inspection of the retained original.
 
-The handoff also rejects administrator-owned `/space` symlinks accepted by
-normal runtime. Align trusted-root handling before migrating those installations.
+The installation root may be one administrator-owned symlink with an absolute
+target. Its ancestor chain must be protected from service users and groups;
+additional symlinks and access ACLs are rejected. Private retained paths must
+not cross mounts. Both shared cache parents must be root-owned and protected
+against service renames: if group- or world-writable, they must already have the
+sticky bit. Existing unprotected cache namespaces require a provenance audit or
+node replacement; adding permissions now cannot authenticate retained files.
+Existing root-owned service locks without a recovery record
+require an administrator to verify their provenance and correct ownership
+without replacing their inode.
 
 Deployment preparation must install the compatible executable and ownership
 initializer while the selected identity remains `legacy`. Keep that same

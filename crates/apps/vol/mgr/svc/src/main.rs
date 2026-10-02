@@ -36,6 +36,11 @@ struct Cli {
     )]
     prepare_volume_identity: Option<identity_handoff::Identity>,
 
+    /// Require this retained identity under the service lock before preparing files.
+    #[cfg(target_os = "linux")]
+    #[arg(long, value_enum, requires = "prepare_volume_identity")]
+    expected_volume_identity: Option<identity_handoff::Identity>,
+
     /// Verify the restricted production credential listener without minting secrets.
     #[arg(long)]
     check_volume_credentials: bool,
@@ -182,6 +187,7 @@ fn main() -> anyhow::Result<()> {
             std::path::Path::new("/space"),
             identity,
             Duration::from_secs(cli.service_mutex_timeout_secs),
+            cli.expected_volume_identity,
         );
     }
     pplx_space_common_svc::tokio_runtime::build_multi_thread_runtime()

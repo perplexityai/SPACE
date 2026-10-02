@@ -15,7 +15,9 @@ use tonic::{Code, Request, Status};
 
 use crate::node_ca::NodeCa;
 use crate::node_service::NodeCredentialManager;
-use crate::proto::{ExchangeTokenRequest, ExchangeTokenResponse};
+use crate::proto::{
+    ExchangeTokenRequest, ExchangeTokenResponse, IssueDekRequest, UnwrapDekRequest,
+};
 
 /// Re-execution changes only the child's identity. User namespaces let an
 /// unprivileged Linux developer exercise the same kernel credentials as CI.
@@ -93,13 +95,47 @@ async fn uds_client(path: PathBuf) -> tonic::client::Grpc<Channel> {
 }
 
 async fn call(client: &mut tonic::client::Grpc<Channel>, method: &str) -> Code {
+    // Use valid scopes so allowed DEK calls exercise forwarding, rather than
+    // stopping at node-local malformed-input validation.
+    match method {
+        "IssueDek" => {
+            call_request(
+                client,
+                method,
+                IssueDekRequest {
+                    organization_id: "01980000-0000-7000-8000-000000000001".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+        }
+        "UnwrapDek" => {
+            call_request(
+                client,
+                method,
+                UnwrapDekRequest {
+                    organization_id: "01980000-0000-7000-8000-000000000001".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+        }
+        _ => call_request(client, method, ExchangeTokenRequest::default()).await,
+    }
+}
+
+async fn call_request<T: prost::Message + Default + Send + Sync + 'static>(
+    client: &mut tonic::client::Grpc<Channel>,
+    method: &str,
+    message: T,
+) -> Code {
     client.ready().await.unwrap();
     let path = format!("/space.credential.manager.v1.CredentialManager/{method}")
         .parse::<http::uri::PathAndQuery>()
         .unwrap();
     let result: Result<tonic::Response<ExchangeTokenResponse>, Status> = client
         .unary(
-            Request::new(ExchangeTokenRequest::default()),
+            Request::new(message),
             path,
             tonic_prost::ProstCodec::default(),
         )
@@ -190,6 +226,24 @@ async fn exercise_peer(uid: u32) {
             "denials must not reach the authority"
         );
     }
+    let malformed_code = if uid == users::SPACE_VOLMGR.uid {
+        Code::InvalidArgument
+    } else {
+        Code::PermissionDenied
+    };
+    assert_eq!(
+        call_request(&mut volume, "IssueDek", IssueDekRequest::default()).await,
+        malformed_code
+    );
+    assert_eq!(
+        call_request(&mut volume, "UnwrapDek", UnwrapDekRequest::default()).await,
+        malformed_code
+    );
+    assert_eq!(
+        calls.lock().unwrap().len(),
+        forwarded,
+        "malformed probes must not contact the failing authority"
+    );
     let mut standard = uds_client(standard_path).await;
     if uid == users::SPACE_VOLMGR.uid {
         for method in [

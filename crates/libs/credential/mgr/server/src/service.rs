@@ -576,10 +576,7 @@ impl CredentialManager for CredentialManagerService {
         )?;
         let req = request.into_inner();
 
-        let org: OrgId = req
-            .organization_id
-            .parse()
-            .map_err(|e| Status::invalid_argument(format!("organization_id: {e}")))?;
+        let org = parse_organization_id(&req.organization_id)?;
         let provider: KekProvider = req
             .provider
             .parse()
@@ -617,10 +614,7 @@ impl CredentialManager for CredentialManagerService {
         )?;
         let req = request.into_inner();
 
-        let org: OrgId = req
-            .organization_id
-            .parse()
-            .map_err(|e| Status::invalid_argument(format!("organization_id: {e}")))?;
+        let org = parse_organization_id(&req.organization_id)?;
         let provider: KekProvider = req
             .provider
             .parse()
@@ -1079,13 +1073,16 @@ impl CredentialManagerService {
     }
 }
 
+pub(crate) fn parse_organization_id(raw: &str) -> Result<OrgId, Status> {
+    raw.parse()
+        .map_err(|error| Status::invalid_argument(format!("organization_id: {error}")))
+}
+
 fn parse_org_and_user(
     organization_id: &str,
     user_id: Option<&str>,
 ) -> Result<(OrgId, Option<UserId>), Status> {
-    let org: OrgId = organization_id
-        .parse()
-        .map_err(|e| Status::invalid_argument(format!("organization_id: {e}")))?;
+    let org = parse_organization_id(organization_id)?;
     let user_id = user_id
         .map(|raw| {
             raw.parse::<UserId>()

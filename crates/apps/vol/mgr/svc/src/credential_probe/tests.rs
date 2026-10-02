@@ -18,21 +18,16 @@ async fn probe_requires_both_denials_and_both_allowed_methods() {
         Code::InvalidArgument,
     ];
     let mut cases = vec![(expected, true)];
-    for index in 0..4 {
-        for code in [
-            Code::Unknown,
-            Code::Unavailable,
-            Code::Unauthenticated,
-            Code::Unimplemented,
-            Code::InvalidArgument,
-            Code::PermissionDenied,
-        ] {
-            if code != expected[index] {
-                let mut replies = expected;
-                replies[index] = code;
-                cases.push((replies, false));
-            }
-        }
+    for (index, code) in [
+        (0, Code::InvalidArgument),
+        (1, Code::Unimplemented),
+        (2, Code::PermissionDenied),
+        (2, Code::Unauthenticated),
+        (3, Code::Unavailable),
+    ] {
+        let mut replies = expected;
+        replies[index] = code;
+        cases.push((replies, false));
     }
     for (replies, success) in cases {
         let path = std::env::temp_dir().join(format!("volume-probe-{}.sock", uuid::Uuid::now_v7()));

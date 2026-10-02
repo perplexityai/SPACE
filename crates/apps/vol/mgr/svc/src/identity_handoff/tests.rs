@@ -6,6 +6,10 @@ use std::path::PathBuf;
 // Parallel tests spawn children that briefly inherit locked FDs before exec.
 const HANDOFF_TIMEOUT: Duration = Duration::from_secs(10);
 
+fn prepare(root: &Path, identity: Identity, timeout: Duration) -> anyhow::Result<()> {
+    super::prepare(root, identity, timeout, None)
+}
+
 fn rejected(result: anyhow::Result<()>) -> String {
     let error = format!("{:#}", result.unwrap_err());
     assert!(!error.contains("still owns service.mutex"), "{error}");
@@ -94,6 +98,12 @@ fn retained_state_round_trips_without_replacing_mutex_or_bytes() {
     );
     let f = Fixture::new();
     let _socket = UnixListener::bind(f.0.join("run/volume-manager/volume-manager.sock")).unwrap();
+    std::os::unix::fs::chown(
+        f.0.join("run/volume-manager/volume-manager.sock"),
+        Some(950),
+        Some(960),
+    )
+    .unwrap();
     let before = f.snapshot();
     for (identity, uid, gid) in [
         (Identity::Separate, 964, 964),
@@ -123,13 +133,6 @@ fn retained_state_round_trips_without_replacing_mutex_or_bytes() {
                 );
             }
         }
-        if uid == 964 {
-            // A crash after transferring all files but before publishing leaf
-            // ownership can safely resume using the requested target identity.
-            freeze(&File::open(f.0.join("run/volume-manager")).unwrap()).unwrap();
-            freeze(&File::open(f.0.join("cache/firecracker/.volmgr-staging")).unwrap()).unwrap();
-            prepare(&f.0, Identity::Separate, HANDOFF_TIMEOUT).unwrap();
-        }
         let run = std::fs::metadata(f.0.join("run/volume-manager")).unwrap();
         assert_eq!(
             (run.uid(), run.gid(), run.mode() & 0o777),
@@ -140,73 +143,7 @@ fn retained_state_round_trips_without_replacing_mutex_or_bytes() {
 
 #[test]
 #[ignore = "requires root to exercise service identity handoff"]
-fn abandoned_socket_replacement_does_not_block_handoff_or_restart() {
-    use std::os::unix::process::ExitStatusExt;
-    const CHILD: &str = "SPACE_SOCKET_BIND_CRASH_TEST";
-    if let Some(socket) = std::env::var_os(CHILD) {
-        let no_core = libc::rlimit {
-            rlim_cur: 0,
-            rlim_max: 0,
-        };
-        // SAFETY: no_core is a live rlimit; only this disposable child's limits change.
-        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_CORE, &no_core) }, 0);
-        // Kill only this child on the real binder's publish syscall, after bind
-        // and chmod. No sleeps or racing a watcher against rename are needed.
-        let jump = |syscall, offset| libc::sock_filter {
-            code: (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16,
-            jt: offset,
-            jf: 0,
-            k: u32::try_from(syscall).unwrap(),
-        };
-        let filter = [
-            libc::sock_filter {
-                code: (libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16,
-                jt: 0,
-                jf: 0,
-                k: 0,
-            },
-            jump(libc::SYS_rename, 3),
-            jump(libc::SYS_renameat, 2),
-            jump(libc::SYS_renameat2, 1),
-            libc::sock_filter {
-                code: (libc::BPF_RET | libc::BPF_K) as u16,
-                jt: 0,
-                jf: 0,
-                k: libc::SECCOMP_RET_ALLOW,
-            },
-            libc::sock_filter {
-                code: (libc::BPF_RET | libc::BPF_K) as u16,
-                jt: 0,
-                jf: 0,
-                k: libc::SECCOMP_RET_KILL_PROCESS,
-            },
-        ];
-        let program = libc::sock_fprog {
-            len: filter.len() as u16,
-            filter: filter.as_ptr() as *mut _,
-        };
-        assert_eq!(
-            // SAFETY: PR_SET_NO_NEW_PRIVS accepts these scalar arguments.
-            unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) },
-            0
-        );
-        assert_eq!(
-            // SAFETY: program and its filter remain live while the kernel copies them.
-            unsafe { libc::prctl(libc::PR_SET_SECCOMP, libc::SECCOMP_MODE_FILTER, &program) },
-            0
-        );
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_io()
-            .build()
-            .unwrap();
-        let _guard = runtime.enter();
-        pplx_space_common_svc::bind_unix_socket(
-            Path::new(&socket),
-            pplx_space_common_svc::UnixSocketOptions::new(0o660),
-        )
-        .unwrap();
-        panic!("socket replacement must reach the injected crash");
-    }
+fn abandoned_socket_replacement_does_not_block_handoff() {
     for (source, target) in [
         (Identity::Legacy, Identity::Separate),
         (Identity::Separate, Identity::Separate),
@@ -215,24 +152,16 @@ fn abandoned_socket_replacement_does_not_block_handoff_or_restart() {
     ] {
         let f = Fixture::new();
         prepare(&f.0, source, HANDOFF_TIMEOUT).unwrap();
+        let (uid, gid) = source.ids();
         let socket = f.0.join("run/volume-manager/volume-manager.sock");
         drop(UnixListener::bind(&socket).unwrap());
-        let (uid, gid) = source.ids();
         std::os::unix::fs::chown(&socket, Some(uid), Some(gid)).unwrap();
         let before = f.snapshot();
-        let status = std::process::Command::new("setpriv")
-            .args([format!("--reuid={uid}"), format!("--regid={gid}"), "--clear-groups".into(), "--".into()])
-            .arg(std::env::current_exe().unwrap())
-            .args(["--exact", "identity_handoff::tests::abandoned_socket_replacement_does_not_block_handoff_or_restart", "--include-ignored", "--nocapture"])
-            .env(CHILD, &socket).status().unwrap();
-        assert_eq!(status.signal(), Some(libc::SIGSYS));
-        assert_eq!(
-            f.snapshot().len(),
-            before.len() + 1,
-            "real binder must leave an orphan"
-        );
+        let abandoned = f.0.join("run/volume-manager/.handoff-0123456789");
+        drop(UnixListener::bind(&abandoned).unwrap());
+        std::os::unix::fs::chown(&abandoned, Some(uid), Some(gid)).unwrap();
         prepare(&f.0, target, HANDOFF_TIMEOUT).unwrap();
-        assert_eq!(f.snapshot().len(), before.len());
+        assert!(!abandoned.exists());
         for (path, inode, _, _, mode, bytes) in before {
             assert_eq!(std::fs::metadata(&path).unwrap().ino(), inode);
             if mode & libc::S_IFMT == libc::S_IFREG {
@@ -332,7 +261,7 @@ fn an_absent_staging_directory_allows_upgrade_and_rollback() {
         &File::open(f.0.join("cache/firecracker")).unwrap(),
         0,
         952,
-        0o2775,
+        0o3775,
     )
     .unwrap();
     let staging = f.0.join("cache/firecracker/.volmgr-staging");
@@ -502,7 +431,24 @@ fn unsafe_retained_entries_fail_without_reowning_external_data() {
                 .collect::<Vec<_>>()
         };
         let files_before = regular_files();
+        let directory_state = || {
+            ["run/volume-manager", "cache/firecracker/.volmgr-staging"].map(|path| {
+                let metadata = std::fs::symlink_metadata(f.0.join(path)).unwrap();
+                (
+                    metadata.ino(),
+                    metadata.uid(),
+                    metadata.gid(),
+                    metadata.mode(),
+                )
+            })
+        };
+        let directories_before = directory_state();
         rejected(prepare(&f.0, Identity::Separate, HANDOFF_TIMEOUT));
+        assert_eq!(
+            directory_state(),
+            directories_before,
+            "changed directory access before rejecting {variant}"
+        );
         assert_eq!(
             regular_files(),
             files_before,
@@ -517,17 +463,7 @@ fn unsafe_retained_entries_fail_without_reowning_external_data() {
         assert_eq!(after.ino(), external_before.ino());
         assert_eq!(std::fs::read(&external).unwrap(), b"outside state");
         if variant == "foreign-name" {
-            assert_eq!(
-                std::fs::metadata(f.0.join("run/volume-manager"))
-                    .unwrap()
-                    .uid(),
-                0
-            );
             std::fs::remove_file(f.0.join("run/volume-manager/other-service.db")).unwrap();
-            // The sealed directory no longer proves a legacy source. Recover
-            // to the matching old identity first; mixed ownership needs review.
-            rejected(prepare(&f.0, Identity::Separate, HANDOFF_TIMEOUT));
-            prepare(&f.0, Identity::Legacy, HANDOFF_TIMEOUT).unwrap();
             prepare(&f.0, Identity::Separate, HANDOFF_TIMEOUT).unwrap();
             assert_eq!(std::fs::read(&target).unwrap(), b"database");
         }
@@ -615,18 +551,21 @@ fn separated_service_cannot_launder_a_legacy_owned_file_on_restart() {
         let f = Fixture::new();
         prepare(&f.0, Identity::Separate, HANDOFF_TIMEOUT).unwrap();
         let shared = f.0.join("cache/firecracker");
-        set_owner(&File::open(&shared).unwrap(), 0, 952, 0o2775).unwrap();
-        let legacy_dir = shared.join("legacy-private");
+        set_owner(&File::open(&shared).unwrap(), 0, 952, 0o3775).unwrap();
+        let untrusted = shared.join("untrusted");
+        std::fs::create_dir(&untrusted).unwrap();
+        set_owner(&File::open(&untrusted).unwrap(), 964, 952, 0o750).unwrap();
+        let legacy_dir = untrusted.join("legacy-private");
         std::fs::create_dir(&legacy_dir).unwrap();
         set_owner(
             &File::open(&legacy_dir).unwrap(),
             950,
             952,
-            if whole_directory { 0o700 } else { 0o2775 },
+            if whole_directory { 0o770 } else { 0o2775 },
         )
         .unwrap();
         f.file(
-            "cache/firecracker/legacy-private/secret",
+            "cache/firecracker/untrusted/legacy-private/secret",
             b"not readable by volume-manager",
         );
         let source = legacy_dir.join("secret");
@@ -665,4 +604,584 @@ fn rejects_existing_mount_crossings_without_mount_privileges() {
     let root = File::open("/").unwrap();
     let proc = open(root.as_raw_fd(), OsStr::new("proc"), libc::O_PATH, 0, true);
     assert_eq!(proc.unwrap_err().raw_os_error(), Some(libc::EXDEV));
+}
+
+type Checkpoint = Box<dyn FnMut(&str)>;
+
+thread_local! {
+    static CHECKPOINT: std::cell::RefCell<Option<Checkpoint>> = const { std::cell::RefCell::new(None) };
+}
+
+pub(super) fn checkpoint(point: &str) {
+    CHECKPOINT.with_borrow_mut(|callback| {
+        if let Some(callback) = callback {
+            callback(point);
+        }
+    });
+}
+
+fn at_checkpoints<T>(callback: impl FnMut(&str) + 'static, run: impl FnOnce() -> T) -> T {
+    CHECKPOINT.with_borrow_mut(|slot| *slot = Some(Box::new(callback)));
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(run));
+    CHECKPOINT.with_borrow_mut(|slot| *slot = None);
+    result.unwrap_or_else(|error| std::panic::resume_unwind(error))
+}
+
+fn crash_child(root: &Path, target: Identity, point: &str) -> std::process::Output {
+    std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "identity_handoff::tests::killed_handoffs_resume_or_reverse_without_losing_data",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env("SPACE_HANDOFF_CRASH_ROOT", root)
+        .env("SPACE_HANDOFF_CRASH_UID", target.ids().0.to_string())
+        .env("SPACE_HANDOFF_CRASH_POINT", point)
+        .output()
+        .unwrap()
+}
+
+#[test]
+#[ignore = "requires root; terminates only disposable test subprocesses"]
+fn killed_handoffs_resume_or_reverse_without_losing_data() {
+    use std::os::unix::process::ExitStatusExt;
+    if let Some(root) = std::env::var_os("SPACE_HANDOFF_CRASH_ROOT") {
+        let identity = Identity::from_uid(
+            std::env::var("SPACE_HANDOFF_CRASH_UID")
+                .unwrap()
+                .parse()
+                .unwrap(),
+        )
+        .unwrap();
+        let kill_at = std::env::var("SPACE_HANDOFF_CRASH_POINT").unwrap();
+        let points = std::rc::Rc::new(std::cell::Cell::new(0usize));
+        let count = points.clone();
+        at_checkpoints(
+            move |point| {
+                let index = count.get();
+                count.set(index + 1);
+                if kill_at == index.to_string() || kill_at == point {
+                    // SAFETY: SIGKILL affects only this disposable subprocess.
+                    unsafe {
+                        libc::raise(libc::SIGKILL);
+                    }
+                    unreachable!("SIGKILL must terminate the child");
+                }
+            },
+            || prepare(Path::new(&root), identity, HANDOFF_TIMEOUT),
+        )
+        .unwrap();
+        println!("HANDOFF_POINTS={}", points.get());
+        return;
+    }
+    for (source, target) in [
+        (Identity::Legacy, Identity::Separate),
+        (Identity::Separate, Identity::Legacy),
+    ] {
+        for bootstrap in [false, true] {
+            let fixture = || {
+                let f = Fixture::new();
+                prepare(&f.0, source, HANDOFF_TIMEOUT).unwrap();
+                if bootstrap {
+                    std::fs::remove_dir_all(f.0.join("run/volume-manager")).unwrap();
+                    std::fs::remove_dir_all(f.0.join("cache/firecracker/.volmgr-staging")).unwrap();
+                } else {
+                    let abandoned = f.0.join("run/volume-manager/.handoff-0123456789");
+                    drop(UnixListener::bind(&abandoned).unwrap());
+                    std::os::unix::fs::chown(
+                        &abandoned,
+                        Some(source.ids().0),
+                        Some(source.ids().1),
+                    )
+                    .unwrap();
+                }
+                f
+            };
+            let baseline = fixture();
+            let output = crash_child(&baseline.0, target, "never");
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let stdout = String::from_utf8(output.stdout).unwrap();
+            let points: usize = stdout
+                .lines()
+                .find_map(|line| line.strip_prefix("HANDOFF_POINTS="))
+                .unwrap()
+                .parse()
+                .unwrap();
+            assert!(points > 0, "must exercise actual mutation boundaries");
+            for point in 0..points {
+                for retry in [source, target] {
+                    let f = fixture();
+                    let before = if bootstrap { Vec::new() } else { f.snapshot() };
+                    let output = crash_child(&f.0, target, &point.to_string());
+                    assert_eq!(
+                        output.status.signal(),
+                        Some(libc::SIGKILL),
+                        "point {point}: {}",
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                    prepare(&f.0, retry, HANDOFF_TIMEOUT).unwrap_or_else(|error| panic!("bootstrap={bootstrap} target={target:?} point={point} retry={retry:?}: {error:#}"));
+                    for (path, inode, _, _, mode, bytes) in before {
+                        if mode & libc::S_IFMT != libc::S_IFREG {
+                            continue;
+                        }
+                        let metadata = std::fs::metadata(&path).unwrap();
+                        assert_eq!(metadata.ino(), inode);
+                        assert_eq!(metadata.uid(), retry.ids().0);
+                        assert_eq!(std::fs::read(path).unwrap(), bytes);
+                    }
+                    for path in [
+                        "run/volume-manager",
+                        "cache/firecracker/.volmgr-staging",
+                        "run/volume-manager/service.mutex",
+                    ] {
+                        assert_eq!(
+                            std::fs::metadata(f.0.join(path)).unwrap().uid(),
+                            retry.ids().0
+                        );
+                    }
+                    assert!(
+                        !f.0.join("run/.volume-manager-identity/pending.json")
+                            .exists()
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires root to check administrator-owned installation links"]
+fn only_the_trusted_installation_root_may_be_a_symlink() {
+    for invalid in [false, true] {
+        let f = Fixture::new();
+        let link = f.0.join("installation");
+        symlink(&f.0, &link).unwrap();
+        if invalid {
+            std::os::unix::fs::lchown(&link, Some(964), Some(964)).unwrap();
+            rejected(prepare(&link, Identity::Separate, HANDOFF_TIMEOUT));
+            assert_eq!(
+                std::fs::metadata(f.0.join("run/volume-manager"))
+                    .unwrap()
+                    .uid(),
+                950
+            );
+        } else {
+            prepare(&link, Identity::Separate, HANDOFF_TIMEOUT).unwrap();
+            assert_eq!(
+                std::fs::metadata(f.0.join("run/volume-manager"))
+                    .unwrap()
+                    .uid(),
+                964
+            );
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires root to exercise interrupted publication"]
+fn published_record_never_replays_file_ownership() {
+    use std::os::unix::process::ExitStatusExt;
+    for point in ["staging published", "runtime published"] {
+        let f = Fixture::new();
+        assert_eq!(
+            crash_child(&f.0, Identity::Separate, point).status.signal(),
+            Some(libc::SIGKILL)
+        );
+        let staging = f.0.join("cache/firecracker/.volmgr-staging");
+        let deleted = staging.join("01980000-0000-7000-8000-000000000001");
+        std::fs::remove_file(&deleted).unwrap();
+        // Model a target service moving a legacy-owned file from a writable
+        // shared parent into its published staging directory.
+        f.file(
+            "cache/firecracker/.volmgr-staging/foreign",
+            b"legacy secret",
+        );
+        let foreign = staging.join("foreign");
+        let before = std::fs::metadata(&foreign).unwrap();
+        prepare(&f.0, Identity::Separate, HANDOFF_TIMEOUT).unwrap();
+        let after = std::fs::metadata(&foreign).unwrap();
+        assert_eq!(
+            (after.ino(), after.uid(), after.mode()),
+            (before.ino(), 950, before.mode())
+        );
+        assert!(!deleted.exists());
+        // A new transaction must reject that foreign file in either direction.
+        rejected(prepare(&f.0, Identity::Legacy, HANDOFF_TIMEOUT));
+        assert_eq!(std::fs::metadata(foreign).unwrap().uid(), 950);
+    }
+}
+
+#[test]
+#[ignore = "requires root to exercise replacement races"]
+fn replacement_between_validation_and_sealing_is_rejected() {
+    for point in ["state validated", "owner changed"] {
+        let f = Fixture::new();
+        let victim = f.0.join("run/volume-manager/volume-manager.db");
+        let original = f.0.join("original.db");
+        let root = f.0.clone();
+        let victim_hook = victim.clone();
+        let original_hook = original.clone();
+        let mut replaced = false;
+        let result = at_checkpoints(
+            move |seen| {
+                if !replaced && seen == point {
+                    replaced = true;
+                    std::fs::rename(&victim_hook, &original_hook).unwrap();
+                    std::fs::write(&victim_hook, b"substituted").unwrap();
+                    std::os::unix::fs::chown(&victim_hook, Some(950), Some(960)).unwrap();
+                }
+            },
+            || prepare(&root, Identity::Separate, HANDOFF_TIMEOUT),
+        );
+        rejected(result);
+        assert!(original.exists(), "checkpoint must execute");
+        assert_eq!(std::fs::metadata(&victim).unwrap().uid(), 950);
+        for dir in ["run/volume-manager", "cache/firecracker/.volmgr-staging"] {
+            assert_eq!(std::fs::metadata(f.0.join(dir)).unwrap().uid(), 950);
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires root to exercise missing retained directories"]
+fn pending_record_never_recreates_missing_directories() {
+    use std::os::unix::process::ExitStatusExt;
+    for path in ["run/volume-manager", "cache/firecracker/.volmgr-staging"] {
+        let f = Fixture::new();
+        assert_eq!(
+            crash_child(&f.0, Identity::Separate, "publishing durable")
+                .status
+                .signal(),
+            Some(libc::SIGKILL)
+        );
+        let original = f.0.join(path);
+        std::fs::rename(&original, f.0.join("retained-original")).unwrap();
+        rejected(prepare(&f.0, Identity::Separate, HANDOFF_TIMEOUT));
+        assert!(!original.exists());
+        std::fs::rename(f.0.join("retained-original"), &original).unwrap();
+        prepare(&f.0, Identity::Separate, HANDOFF_TIMEOUT).unwrap();
+    }
+}
+
+#[test]
+#[ignore = "requires root and real service credentials"]
+fn service_writable_installation_ancestors_cannot_redirect_handoff() {
+    for (uid, gid, mode) in [(964, 964, 0o755), (0, 952, 0o775), (1000, 1000, 0o2775)] {
+        let f = Fixture::new();
+        let parent = f.0.join("administrator-home");
+        std::fs::create_dir(&parent).unwrap();
+        set_owner(&File::open(&parent).unwrap(), uid, gid, mode).unwrap();
+        let nested = parent.join("installation");
+        let link = f.0.join("space-link");
+        let other = Fixture::new();
+        // A root-owned installation link must not trust a mutable target chain.
+        symlink(&other.0, &nested).unwrap();
+        symlink(&nested, &link).unwrap();
+        rejected(prepare(&link, Identity::Separate, HANDOFF_TIMEOUT));
+        assert_eq!(
+            std::fs::metadata(other.0.join("run/volume-manager/volume-manager.db"))
+                .unwrap()
+                .uid(),
+            950
+        );
+        std::fs::remove_file(&nested).unwrap();
+        std::fs::rename(&other.0, &nested).unwrap();
+        let result = prepare(&link, Identity::Separate, HANDOFF_TIMEOUT);
+        std::fs::rename(&nested, &other.0).unwrap();
+        if uid == 1000 {
+            result.unwrap();
+        } else {
+            rejected(result);
+            assert_eq!(
+                std::fs::metadata(other.0.join("run/volume-manager/volume-manager.db"))
+                    .unwrap()
+                    .uid(),
+                950
+            );
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires root and real service credentials"]
+fn replacing_published_staging_cannot_grant_legacy_files() {
+    use std::os::unix::process::CommandExt;
+    for point in ["staging published", "runtime published"] {
+        let f = Fixture::new();
+        let cache = f.0.join("cache/firecracker");
+        set_owner(&File::open(&cache).unwrap(), 0, 952, 0o3775).unwrap();
+        let untrusted = cache.join("untrusted");
+        std::fs::create_dir(&untrusted).unwrap();
+        set_owner(&File::open(&untrusted).unwrap(), 964, 952, 0o750).unwrap();
+        let foreign = untrusted.join("foreign");
+        std::fs::create_dir(&foreign).unwrap();
+        set_owner(&File::open(&foreign).unwrap(), 950, 952, 0o770).unwrap();
+        f.file(
+            "cache/firecracker/untrusted/foreign/secret",
+            b"legacy secret",
+        );
+        let original_inode = std::fs::metadata(&foreign).unwrap().ino();
+        let cache_hook = cache.clone();
+        let result = at_checkpoints(
+            move |seen| {
+                if seen == point {
+                    for (from, to) in [
+                        (".volmgr-staging", "saved"),
+                        ("untrusted/foreign", ".volmgr-staging"),
+                    ] {
+                        let output = std::process::Command::new("setpriv")
+                            .args(["--reuid=964", "--regid=964", "--groups=952", "mv"])
+                            .arg(cache_hook.join(from))
+                            .arg(cache_hook.join(to))
+                            .output()
+                            .unwrap();
+                        assert!(
+                            output.status.success(),
+                            "{}",
+                            String::from_utf8_lossy(&output.stderr)
+                        );
+                    }
+                }
+            },
+            || prepare(&f.0, Identity::Separate, HANDOFF_TIMEOUT),
+        );
+        rejected(result);
+        let planted = cache.join(".volmgr-staging");
+        let metadata = std::fs::metadata(&planted).unwrap();
+        assert_eq!(
+            (metadata.ino(), metadata.uid(), metadata.mode() & 0o777),
+            (original_inode, 950, 0o770)
+        );
+        assert!(
+            !std::process::Command::new("cat")
+                .arg(planted.join("secret"))
+                .uid(964)
+                .gid(964)
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+        for identity in [Identity::Legacy, Identity::Separate] {
+            rejected(prepare(&f.0, identity, HANDOFF_TIMEOUT));
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires root and access ACL support"]
+fn installation_ancestors_reject_service_acl_and_unprotected_world_writes() {
+    for (mode, acl, accepted) in [
+        (0o1777, false, true),
+        (0o777, false, false),
+        (0o755, true, false),
+    ] {
+        let f = Fixture::new();
+        let parent = f.0.join("parent");
+        std::fs::create_dir(&parent).unwrap();
+        set_owner(&File::open(&parent).unwrap(), 1000, 1000, mode).unwrap();
+        if acl {
+            // Linux POSIX ACL xattr: owner, named user, group, mask, other.
+            let mut access = 2u32.to_le_bytes().to_vec();
+            for (tag, permissions, id) in [
+                (1u16, 7u16, u32::MAX),
+                (2, 7, 964),
+                (4, 5, u32::MAX),
+                (16, 7, u32::MAX),
+                (32, 5, u32::MAX),
+            ] {
+                access.extend(tag.to_le_bytes());
+                access.extend(permissions.to_le_bytes());
+                access.extend(id.to_le_bytes());
+            }
+            let directory = File::open(&parent).unwrap();
+            assert_eq!(
+                // SAFETY: the FD and the complete ACL byte buffer remain live.
+                unsafe {
+                    libc::fsetxattr(
+                        directory.as_raw_fd(),
+                        c"system.posix_acl_access".as_ptr(),
+                        access.as_ptr().cast(),
+                        access.len(),
+                        0,
+                    )
+                },
+                0
+            );
+        }
+        let other = Fixture::new();
+        let nested = parent.join("installation");
+        std::fs::rename(&other.0, &nested).unwrap();
+        let result = prepare(&nested, Identity::Separate, HANDOFF_TIMEOUT);
+        std::fs::rename(&nested, &other.0).unwrap();
+        if accepted {
+            result.unwrap();
+        } else {
+            rejected(result);
+        }
+        assert_eq!(
+            std::fs::metadata(other.0.join("run/volume-manager/volume-manager.db"))
+                .unwrap()
+                .uid(),
+            if accepted { 964 } else { 950 }
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires root and real service credentials"]
+fn services_cannot_read_or_forge_recovery_records() {
+    use std::os::unix::process::ExitStatusExt;
+    let f = Fixture::new();
+    assert_eq!(
+        crash_child(&f.0, Identity::Separate, "publishing durable")
+            .status
+            .signal(),
+        Some(libc::SIGKILL)
+    );
+    let record = f.0.join("run/.volume-manager-identity/pending.json");
+    let original = std::fs::read(&record).unwrap();
+    for uid in ["950", "964"] {
+        for args in [vec!["cat"], vec!["truncate", "-s", "0"]] {
+            let output = std::process::Command::new("setpriv")
+                .args(["--reuid", uid, "--regid", uid, "--groups", "951,952,965"])
+                .args(args)
+                .arg(&record)
+                .output()
+                .unwrap();
+            assert!(!output.status.success());
+        }
+    }
+    assert_eq!(std::fs::read(record).unwrap(), original);
+    prepare(&f.0, Identity::Separate, HANDOFF_TIMEOUT).unwrap();
+}
+
+#[test]
+#[ignore = "requires root and real service credentials"]
+fn initial_handoff_rejects_replaceable_staging_parent() {
+    for replace_cache in [false, true] {
+        let f = Fixture::new();
+        let parent = f.0.join(if replace_cache {
+            "cache"
+        } else {
+            "cache/firecracker"
+        });
+        set_owner(&File::open(&parent).unwrap(), 0, 952, 0o2775).unwrap();
+        let foreign = parent.join("private");
+        std::fs::create_dir(&foreign).unwrap();
+        let staged = if replace_cache {
+            set_owner(&File::open(&foreign).unwrap(), 0, 952, 0o3775).unwrap();
+            let staged = foreign.join(".volmgr-staging");
+            std::fs::create_dir(&staged).unwrap();
+            staged
+        } else {
+            foreign.clone()
+        };
+        set_owner(&File::open(&staged).unwrap(), 950, 960, 0o700).unwrap();
+        let secret = staged.join("secret");
+        std::fs::write(&secret, b"legacy secret").unwrap();
+        set_owner(&File::open(&secret).unwrap(), 950, 960, 0o600).unwrap();
+        let target = if replace_cache {
+            "firecracker"
+        } else {
+            ".volmgr-staging"
+        };
+        for (from, to) in [(target, "saved"), ("private", target)] {
+            assert!(
+                std::process::Command::new("setpriv")
+                    .args(["--reuid=964", "--regid=964", "--groups=952", "mv"])
+                    .arg(parent.join(from))
+                    .arg(parent.join(to))
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        let result = prepare(&f.0, Identity::Separate, HANDOFF_TIMEOUT);
+        let secret = f.0.join("cache/firecracker/.volmgr-staging/secret");
+        assert_eq!(std::fs::metadata(&secret).unwrap().uid(), 950);
+        assert!(
+            !std::process::Command::new("setpriv")
+                .args(["--reuid=964", "--regid=964", "--groups=952", "cat"])
+                .arg(secret)
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+        rejected(result);
+    }
+}
+
+#[test]
+#[ignore = "requires root to check deployment identity under the retained lock"]
+fn expected_identity_prevents_implicit_rollback() {
+    use std::os::unix::process::ExitStatusExt;
+    let f = Fixture::new();
+    super::prepare(
+        &f.0,
+        Identity::Legacy,
+        HANDOFF_TIMEOUT,
+        Some(Identity::Legacy),
+    )
+    .unwrap();
+    prepare(&f.0, Identity::Separate, HANDOFF_TIMEOUT).unwrap();
+    let before = f.snapshot();
+    rejected(super::prepare(
+        &f.0,
+        Identity::Legacy,
+        HANDOFF_TIMEOUT,
+        Some(Identity::Legacy),
+    ));
+    assert_eq!(f.snapshot(), before);
+    prepare(&f.0, Identity::Legacy, HANDOFF_TIMEOUT).unwrap();
+    assert_eq!(
+        crash_child(&f.0, Identity::Separate, "journal committed")
+            .status
+            .signal(),
+        Some(libc::SIGKILL)
+    );
+    rejected(super::prepare(
+        &f.0,
+        Identity::Legacy,
+        HANDOFF_TIMEOUT,
+        Some(Identity::Legacy),
+    ));
+    prepare(&f.0, Identity::Legacy, HANDOFF_TIMEOUT).unwrap();
+}
+
+#[test]
+#[ignore = "requires root and real service credentials"]
+fn initial_handoff_rejects_service_writable_private_state() {
+    for area in ["run/volume-manager", "cache/firecracker/.volmgr-staging"] {
+        let f = Fixture::new();
+        let private = f.0.join(area);
+        set_owner(&File::open(&private).unwrap(), 950, 952, 0o2775).unwrap();
+        let untrusted = f.0.join("untrusted");
+        std::fs::create_dir(&untrusted).unwrap();
+        set_owner(&File::open(&untrusted).unwrap(), 964, 964, 0o700).unwrap();
+        f.file("untrusted/secret", b"legacy secret");
+        let destination = private.join(if area.starts_with("run") {
+            "volume-manager.db"
+        } else {
+            "secret"
+        });
+        assert!(
+            std::process::Command::new("setpriv")
+                .args(["--reuid=964", "--regid=964", "--groups=952", "mv"])
+                .arg(untrusted.join("secret"))
+                .arg(&destination)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let result = prepare(&f.0, Identity::Separate, HANDOFF_TIMEOUT);
+        assert_eq!(std::fs::metadata(&destination).unwrap().uid(), 950);
+        rejected(result);
+    }
 }
