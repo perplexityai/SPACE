@@ -460,14 +460,22 @@ continue to use the standard listener.
 To prepare the additional listener:
 
 - Provision `/space/run/volume-credentials` with mode `0750`, owned by the
-  credential-manager runtime UID and group 965. Give credential-manager and
-  volume-manager that supplementary group and mount the directory into both
-  services. The socket is mode `0660`.
+  credential-manager account `space-sbxmgr` (UID 950) and group 965. Give
+  credential-manager and volume-manager that supplementary group and mount the
+  directory into both services. The socket is mode `0660`. Parent directories
+  must be root-owned and not writable by group or others; only `/space` may be
+  a root-owned symlink, with the same protections on its target's ancestors.
 - Give the directory one initializer. Preserve credential-manager's identity
   and standard socket directory ownership while older launchers remain in use.
-- Deploy compatible binaries before enabling `--volume-socket`. A bind failure
-  on the additional socket currently stops credential-manager, including its
-  standard listener; verify both listeners before proceeding.
+- Deploy compatible binaries before enabling `--volume-socket`. Before
+  advertising passive readiness or taking over from a running predecessor,
+  credential-manager checks the path and binds a temporary socket with the
+  production permissions. Bad provisioning rejects the replacement while the
+  predecessor keeps serving. The probe leaves existing sockets untouched.
+- Verify both real listeners after takeover. Preflight does not cover changes
+  made after its check, an upstream outage, or a rollout that stops the old
+  instance first. A killed preflight can leave a `.p-*` probe socket; remove
+  that file only after confirming its creating process has exited.
 - Exercise token exchange and transfer-key issue/unwrap as UID 964, verify
   privileged methods are denied, and check legacy UID-950 calls still work.
   Check the configured peer-process verification mode as well as pod readiness.

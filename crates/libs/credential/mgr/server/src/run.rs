@@ -65,6 +65,8 @@ const PLATFORM_KEK_IDENTIFIER_ENV: &str = "SPACE_PLATFORM_KEK_IDENTIFIER";
 // different mutex files and both acquire concurrently.
 const SERVICE_MUTEX_PATH: &str = "/space/run/credential-manager/service.mutex";
 
+mod volume_socket;
+
 /// Which side of the control-plane split this process runs as.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CredmgrRole {
@@ -215,6 +217,14 @@ pub enum RunCredmgrError {
     ServiceMutex(#[source] pplx_space_common_svc::service_mutex::AcquireError),
     #[error("failed to bind the credential-manager socket: {0}")]
     BindSocket(#[source] pplx_space_common_svc::bootstrap::BindUnixSocketError),
+    #[error("volume credential socket preflight failed for {path}: {source}")]
+    VolumeSocketPreflight {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("volume credential socket preflight task failed: {0}")]
+    VolumeSocketPreflightTask(#[source] tokio::task::JoinError),
     #[error(
         "the node credential agent serves the node-local Unix socket; \
          --no-uds is invalid in agent mode"
@@ -865,6 +875,16 @@ where
     F: Future<Output = Result<T, RunCredmgrError>>,
 {
     let initialized = initialize.await?;
+    if let Some(path) = config.volume_socket_path.clone() {
+        // Passive readiness lets the rollout retire the predecessor, so even
+        // publishing health must wait until the new listener can be provisioned.
+        tokio::task::spawn_blocking(move || {
+            volume_socket::preflight(&path)
+                .map_err(|source| RunCredmgrError::VolumeSocketPreflight { path, source })
+        })
+        .await
+        .map_err(RunCredmgrError::VolumeSocketPreflightTask)??;
+    }
     let Some(node_local) = prepare_node_local(config, shutdown_token, service_mutex_path).await?
     else {
         return Ok(None);
@@ -945,15 +965,8 @@ impl CredentialListeners {
             .volume_socket_path
             .as_ref()
             .map(|path| {
-                pplx_space_common_svc::bind_unix_socket(
-                    path,
-                    pplx_space_common_svc::UnixSocketOptions::new(0o660).with_group(
-                        pplx_space_common_svc::SocketGroup::Required(
-                            group_names::SPACE_VOLCREDCLIENTS,
-                        ),
-                    ),
-                )
-                .map_err(RunCredmgrError::BindSocket)
+                pplx_space_common_svc::bind_unix_socket(path, volume_socket::options())
+                    .map_err(RunCredmgrError::BindSocket)
             })
             .transpose()?;
         Ok(Self {
