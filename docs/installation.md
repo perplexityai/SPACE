@@ -469,9 +469,10 @@ To prepare the additional listener:
   and standard socket directory ownership while older launchers remain in use.
 - Deploy compatible binaries before enabling `--volume-socket`. Before
   advertising passive readiness or taking over from a running predecessor,
-  credential-manager checks the path and binds a temporary socket with the
-  production permissions. Bad provisioning rejects the replacement while the
-  predecessor keeps serving. The probe leaves existing sockets untouched.
+  credential-manager checks that the path is safe and distinct from the standard
+  endpoint, then binds a temporary socket with the production permissions.
+  Bad provisioning rejects the replacement while the predecessor keeps serving.
+  The probe leaves existing sockets untouched.
 - Verify both real listeners after takeover. Preflight does not cover changes
   made after its check, an upstream outage, or a rollout that stops the old
   instance first. A killed preflight can leave a `.p-*` probe socket; remove

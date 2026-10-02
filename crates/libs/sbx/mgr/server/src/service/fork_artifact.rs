@@ -222,7 +222,16 @@ pub(super) async fn copy_objects(
     .ok_or_else(|| Status::unavailable("fork copy staging cleanup is in progress"))?;
     let copy_dir = copy_attempt_staging_dir(operation_id, Uuid::now_v7());
     let staging_attempt = CopyStagingAttempt::new(copy_dir.clone());
-    crate::transfer_directory::prepare(&copy_dir)
+    let prepare_dir = copy_dir.clone();
+    // Cancellation must not release admission or start cleanup while the
+    // blocking task is still creating the staging directory.
+    let (_copy_permit, _active_operation, staging_attempt) =
+        tokio::task::spawn_blocking(move || {
+            crate::transfer_directory::prepare(&prepare_dir)
+                .map(|()| (_copy_permit, _active_operation, staging_attempt))
+        })
+        .await
+        .map_err(|error| Status::internal(format!("prepare fork copy directory task: {error}")))?
         .map_err(|error| Status::internal(format!("prepare fork copy directory: {error}")))?;
 
     let copy_result = async {

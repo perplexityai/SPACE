@@ -876,10 +876,11 @@ where
 {
     let initialized = initialize.await?;
     if let Some(path) = config.volume_socket_path.clone() {
+        let standard_socket = config.socket_path.clone();
         // Passive readiness lets the rollout retire the predecessor, so even
         // publishing health must wait until the new listener can be provisioned.
         tokio::task::spawn_blocking(move || {
-            volume_socket::preflight(&path)
+            volume_socket::preflight(&path, &standard_socket)
                 .map_err(|source| RunCredmgrError::VolumeSocketPreflight { path, source })
         })
         .await

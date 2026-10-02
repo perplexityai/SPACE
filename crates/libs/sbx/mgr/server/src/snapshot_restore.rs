@@ -2081,10 +2081,16 @@ async fn pull_artifact_inner(
     let parent = local_path
         .parent()
         .ok_or_else(|| RestoreError::Other("snapshot pull destination has no parent".to_owned()))?;
-    crate::transfer_directory::prepare(parent).map_err(|source| RestoreError::CreateDirectory {
-        path: parent.to_owned(),
-        source,
-    })?;
+    let prepare_parent = parent.to_owned();
+    tokio::task::spawn_blocking(move || crate::transfer_directory::prepare(&prepare_parent))
+        .await
+        .map_err(|source| {
+            RestoreError::Other(format!("join transfer directory preparation: {source}"))
+        })?
+        .map_err(|source| RestoreError::CreateDirectory {
+            path: parent.to_owned(),
+            source,
+        })?;
     let s3_uri = restore_artifact_uri(config, file_name);
     let local_path_str = local_path.to_string_lossy().into_owned();
     let adopted = adopt_completed_replacement_temp(sandbox_id, &local_path, &s3_uri);

@@ -48,7 +48,7 @@ fn trusted_parent(path: &Path, allow_installation_link: bool) -> io::Result<()> 
     Ok(())
 }
 
-pub(super) fn preflight(path: &Path) -> io::Result<()> {
+pub(super) fn preflight(path: &Path, standard_socket: &Path) -> io::Result<()> {
     if !path.is_absolute()
         || path
             .components()
@@ -98,6 +98,27 @@ pub(super) fn preflight(path: &Path) -> io::Result<()> {
                 metadata.mode() & 0o7777,
             ),
         ));
+    }
+    // Both binders replace existing sockets. Compare the directory identities
+    // before either bind, including when the socket itself does not exist yet.
+    if standard_socket.file_name() == Some(name) {
+        let standard_parent = standard_socket
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        match fs::metadata(standard_parent) {
+            Ok(standard)
+                if standard.dev() == metadata.dev() && standard.ino() == metadata.ino() =>
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "standard and volume credential sockets name the same filesystem entry",
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
     }
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_socket() => {}

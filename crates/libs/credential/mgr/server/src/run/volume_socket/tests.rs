@@ -103,6 +103,7 @@ fn preflight_checks_real_permissions_without_replacing_live_socket() {
 }
 
 fn exercise(case: &str) -> io::Result<()> {
+    let preflight = |path: &Path| super::preflight(path, Path::new("/run/standard.sock"));
     let path = Path::new(if case == "unsafe-installation-link" {
         "/space/run/volume/credmgr.sock"
     } else {
@@ -119,6 +120,19 @@ fn exercise(case: &str) -> io::Result<()> {
     let result = preflight(path);
     if case == "valid" {
         result?;
+        let redirected = Path::new("/space/run/volume/credmgr.sock");
+        let resolved = Path::new("/install/run/volume/credmgr.sock");
+        assert!(
+            super::preflight(redirected, resolved).is_err(),
+            "accepted aliased standard and volume sockets"
+        );
+        assert!(super::preflight(path, Path::new("/run/volume/../volume/credmgr.sock")).is_err());
+        super::preflight(path, resolved)?;
+        super::preflight(redirected, Path::new("/install/run/volume/other.sock"))?;
+        super::preflight(path, Path::new("/missing/credmgr.sock"))?;
+        std::env::set_current_dir("/install/run/volume")?;
+        assert!(super::preflight(redirected, Path::new("credmgr.sock")).is_err());
+        std::env::set_current_dir("/")?;
         preflight(Path::new("/space/run/volume/absent.sock"))?;
         assert!(!Path::new("/space/run/volume/absent.sock").exists());
         for invalid in [
