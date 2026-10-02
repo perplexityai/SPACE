@@ -363,9 +363,10 @@ pub(super) mod service_tests {
             blocking_probe_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(
                 MAX_BLOCKING_PROBES,
             )),
+            artifact_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
             runtime_supervisor: crate::runtime_supervisor_client::RuntimeSupervisorLazyClient::new(
             ),
-            runtime_inventory: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
+            runtime_inventory: std::sync::Arc::default(),
             runtime_inventory_refresh_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
             runtime_paths: crate::config::RuntimePaths::default(),
             guest_console_logs: false,
@@ -454,9 +455,10 @@ pub(super) mod service_tests {
             blocking_probe_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(
                 MAX_BLOCKING_PROBES,
             )),
+            artifact_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
             runtime_supervisor: crate::runtime_supervisor_client::RuntimeSupervisorLazyClient::new(
             ),
-            runtime_inventory: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
+            runtime_inventory: std::sync::Arc::default(),
             runtime_inventory_refresh_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
             runtime_paths: crate::config::RuntimePaths::default(),
             guest_console_logs: false,

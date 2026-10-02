@@ -770,6 +770,9 @@ pub async fn run(
 
         service.verify_execution_authority().await
             .map_err(RunNodeMgrError::ExecutionAuthority)?;
+        // Before any request: the runtime manager's staging root, and what
+        // an interrupted publication or removal left in the artifact store.
+        service.prepare_artifact_store().await;
 
         let sandbox_cgroup_vcpu_count = sandbox_cgroup_config
             .vcpu_count

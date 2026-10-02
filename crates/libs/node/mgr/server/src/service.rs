@@ -47,15 +47,17 @@ use crate::proto::{
     PrepareEncryptedRootfsRequest, PrepareEncryptedRootfsResponse, PrepareEncryptedVolumeRequest,
     PrepareEncryptedVolumeResponse, PrepareSandboxArtifactDirRequest,
     PrepareSandboxArtifactDirResponse, PrepareSandboxRequest, PrepareSandboxResponse,
-    PrepareSnapshotRootfsRequest, PrepareSnapshotRootfsResponse, ReleaseEncryptedVolumeRequest,
-    ReleaseEncryptedVolumeResponse, ReleaseRequest, ReleaseResponse, RepairNetworkPoolRequest,
-    RepairNetworkPoolResponse, ReservePreparedRootfsRequest, ReservePreparedRootfsResponse,
-    ResumeSandboxRequest, ResumeSandboxResponse, RollbackBtrfsSnapshotRequest,
-    RollbackBtrfsSnapshotResponse, SandboxEndpointProof, SetNetworkPoolConfigRequest,
-    SetNetworkPoolConfigResponse, SetNetworkPoolDrainRequest, SetNetworkPoolDrainResponse,
-    StopProcessRequest, StopProcessResponse, SyncGuestRequest, SyncGuestResponse,
-    UnexposePortRequest, UnexposePortResponse, UpdateCgroupRequest, UpdateCgroupResponse,
-    ValidateSandboxEndpointProofRequest, ValidateSandboxEndpointProofResponse,
+    PrepareSnapshotRootfsRequest, PrepareSnapshotRootfsResponse, PublishArtifactRequest,
+    PublishArtifactResponse, ReleaseEncryptedVolumeRequest, ReleaseEncryptedVolumeResponse,
+    ReleaseRequest, ReleaseResponse, RemoveArtifactRequest, RemoveArtifactResponse,
+    RepairNetworkPoolRequest, RepairNetworkPoolResponse, ReservePreparedRootfsRequest,
+    ReservePreparedRootfsResponse, ResumeSandboxRequest, ResumeSandboxResponse,
+    RollbackBtrfsSnapshotRequest, RollbackBtrfsSnapshotResponse, SandboxEndpointProof,
+    SetNetworkPoolConfigRequest, SetNetworkPoolConfigResponse, SetNetworkPoolDrainRequest,
+    SetNetworkPoolDrainResponse, StopProcessRequest, StopProcessResponse, SyncGuestRequest,
+    SyncGuestResponse, UnexposePortRequest, UnexposePortResponse, UpdateCgroupRequest,
+    UpdateCgroupResponse, ValidateSandboxEndpointProofRequest,
+    ValidateSandboxEndpointProofResponse,
 };
 use crate::slot_pool::{
     ActiveLeaseMemoryReservationError, AllocateSlotError, NETWORK_POOL_SCHEMA_VERSION, NetworkPool,
@@ -164,6 +166,53 @@ const RESERVED_EXPOSE_PORTS: &[(u16, &str)] = &[
 
 const MAX_BLOCKING_PROBES: usize = 4;
 
+/// The discovered runtime inventory, and a generation every change to the
+/// artifact store advances. A discovery that ran across a change stores its
+/// result and then drops it again, so a stale inventory never stays cached.
+pub(crate) struct InventoryCache<T> {
+    current: ArcSwapOption<T>,
+    generation: std::sync::atomic::AtomicU64,
+}
+
+pub(crate) type RuntimeInventoryCache = InventoryCache<RuntimeInventory>;
+
+impl<T> Default for InventoryCache<T> {
+    fn default() -> Self {
+        Self {
+            current: ArcSwapOption::empty(),
+            generation: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+}
+
+impl<T> InventoryCache<T> {
+    pub(crate) fn load(&self) -> Option<std::sync::Arc<T>> {
+        self.current.load_full()
+    }
+
+    /// The generation a discovery starting now belongs to.
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Cache what a discovery begun at `generation` found, unless the store
+    /// changed meanwhile. Stored first and checked after, so a change racing
+    /// with this call always leaves nothing cached.
+    pub(crate) fn store(&self, inventory: std::sync::Arc<T>, generation: u64) {
+        self.current.store(Some(inventory));
+        if self.generation() != generation {
+            self.current.store(None);
+        }
+    }
+
+    /// The store changed: discover again on next use.
+    pub(crate) fn forget(&self) {
+        self.generation
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.current.store(None);
+    }
+}
+
 #[derive(Clone)]
 pub struct NodeManagerService {
     pool: std::sync::Arc<NetworkPool>,
@@ -181,8 +230,12 @@ pub struct NodeManagerService {
     /// Shared drain ownership for detached mutations and lifecycle permits.
     device_op_tasks: tokio_util::task::TaskTracker,
     blocking_probe_slots: std::sync::Arc<tokio::sync::Semaphore>,
+    /// One artifact-store change at a time takes a blocking thread; the
+    /// store's own lock would otherwise leave queued calls holding threads
+    /// the rest of node-manager needs.
+    artifact_slots: std::sync::Arc<tokio::sync::Semaphore>,
     runtime_supervisor: crate::runtime_supervisor_client::RuntimeSupervisorLazyClient,
-    runtime_inventory: std::sync::Arc<ArcSwapOption<RuntimeInventory>>,
+    runtime_inventory: std::sync::Arc<RuntimeInventoryCache>,
     runtime_inventory_refresh_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
     runtime_paths: crate::config::RuntimePaths,
     guest_console_logs: bool,
@@ -328,9 +381,10 @@ impl NodeManagerService {
             blocking_probe_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(
                 MAX_BLOCKING_PROBES,
             )),
+            artifact_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
             runtime_supervisor: crate::runtime_supervisor_client::RuntimeSupervisorLazyClient::new(
             ),
-            runtime_inventory: std::sync::Arc::new(ArcSwapOption::empty()),
+            runtime_inventory: std::sync::Arc::default(),
             runtime_inventory_refresh_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
             runtime_paths: settings.runtime_paths,
             guest_console_logs: settings.guest_console_logs,
@@ -363,7 +417,7 @@ impl NodeManagerService {
     }
 
     async fn runtime_inventory(&self) -> Result<std::sync::Arc<RuntimeInventory>, Status> {
-        if let Some(inventory) = self.runtime_inventory.load_full() {
+        if let Some(inventory) = self.runtime_inventory.load() {
             return Ok(inventory);
         }
         self.refresh_runtime_inventory().await
@@ -371,13 +425,15 @@ impl NodeManagerService {
 
     async fn refresh_runtime_inventory(&self) -> Result<std::sync::Arc<RuntimeInventory>, Status> {
         let _guard = self.runtime_inventory_refresh_lock.lock().await;
-        if let Some(inventory) = self.runtime_inventory.load_full() {
+        if let Some(inventory) = self.runtime_inventory.load() {
             return Ok(inventory);
         }
+        let generation = self.runtime_inventory.generation();
         let crate::config::RuntimePaths {
             vendor: root,
             assets: asset_root,
             kernels: kernel_root,
+            ..
         } = self.runtime_paths.clone();
         // Prepare and Launch also require this cache; diagnostic pressure must
         // not reject cold discovery before lifecycle admission.
@@ -395,7 +451,7 @@ impl NodeManagerService {
             })
             .await
             .map(std::sync::Arc::new)?;
-        self.runtime_inventory.store(Some(inventory.clone()));
+        self.runtime_inventory.store(inventory.clone(), generation);
         Ok(inventory)
     }
 
@@ -633,6 +689,7 @@ mod gateway_isolation;
 mod launch_prepare;
 mod network_helpers;
 pub mod network_pool_metrics;
+mod node_artifacts;
 pub mod node_disk_metrics;
 mod orphan_inventory;
 mod permission_tree;

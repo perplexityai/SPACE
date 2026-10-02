@@ -399,6 +399,20 @@ impl NodeManager for NodeManagerService {
         NodeManagerService::deny_port(self, request).await
     }
 
+    async fn publish_artifact(
+        &self,
+        request: Request<PublishArtifactRequest>,
+    ) -> Result<Response<PublishArtifactResponse>, Status> {
+        NodeManagerService::publish_artifact(self, request).await
+    }
+
+    async fn remove_artifact(
+        &self,
+        request: Request<RemoveArtifactRequest>,
+    ) -> Result<Response<RemoveArtifactResponse>, Status> {
+        NodeManagerService::remove_artifact(self, request).await
+    }
+
     // ─── Btrfs delegation ─────────────────────────────────────────────
 
     async fn btrfs_create_template_subvolume(

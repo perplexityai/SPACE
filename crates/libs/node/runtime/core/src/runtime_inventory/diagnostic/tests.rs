@@ -1130,3 +1130,14 @@ fn the_runtime_managers_kernel_root_is_scanned_once_beside_the_images() {
         .collect();
     assert_eq!(listed, [managed.join("6.1.155/vmlinux.bin")]);
 }
+
+#[test]
+fn the_known_releases_are_the_ones_with_a_state_format() {
+    let layout = ReleaseLayout::of(RuntimeKind::Firecracker).unwrap();
+    let known = (layout.known_releases)();
+    assert!(known.contains(&"1.15.1"), "{known:?}");
+    for release in known {
+        (layout.state_format)(&RuntimeVersion::parse(release).unwrap()).unwrap();
+    }
+    assert!(ReleaseLayout::of(RuntimeKind::CloudHypervisor).is_none());
+}

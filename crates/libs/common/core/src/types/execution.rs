@@ -15,6 +15,10 @@ use super::{Arch, Digest, RuntimeKind, VcpuCount};
 
 /// Firecracker release assigned to durable artifacts written before execution metadata existed.
 pub const INITIAL_FIRECRACKER_RUNTIME_VERSION: &str = "1.15.1";
+/// Guest kernel node images ship as their default and legacy default, which
+/// existing templates and snapshots boot with
+/// [`INITIAL_FIRECRACKER_RUNTIME_VERSION`].
+pub const INITIAL_FIRECRACKER_KERNEL_VERSION: &str = "6.1.155";
 /// Firecracker snapshot format assigned to durable artifacts written before execution metadata.
 pub const INITIAL_FIRECRACKER_STATE_FORMAT_VERSION: &str = "9.0.0";
 /// Canonical name of Firecracker's persisted snapshot format.
@@ -208,6 +212,13 @@ impl fmt::Display for ArtifactComponentKind {
 pub struct RuntimeIdentity {
     pub kind: RuntimeKind,
     pub version: RuntimeVersion,
+}
+
+/// `<runtime> <version>`, as in `firecracker 1.15.1`.
+impl fmt::Display for RuntimeIdentity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{} {}", self.kind, self.version)
+    }
 }
 
 /// Guest operating-system and CPU-architecture identity.

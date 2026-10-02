@@ -39,8 +39,11 @@ use super::{
 };
 
 const KERNEL_IMAGE: &str = "vmlinux.bin";
-const DEFAULT_MARKER: &str = "default";
-const LEGACY_DEFAULT_MARKER: &str = "legacy-default";
+/// The alias in a release or kernel root that names its default: what new
+/// cold boots use.
+pub const DEFAULT_MARKER: &str = "default";
+/// The alias in a kernel root that names the kernel legacy launches use.
+pub const LEGACY_DEFAULT_MARKER: &str = "legacy-default";
 const HASH_CHUNK_BYTES: usize = 1024 * 1024;
 const ELF_HEADER_PROBE_BYTES: usize = 64;
 const ELF_MACHINE_X86_64: u16 = 62;
@@ -1178,6 +1181,10 @@ pub struct ReleaseLayout {
     /// The persisted-state format a release writes, or why it has none the
     /// scan knows.
     pub state_format: fn(&RuntimeVersion) -> Result<StateFormatIdentity, String>,
+    /// Every release this build has a state-format mapping for. The execution
+    /// inventory refuses a node carrying any other, so these are the only
+    /// releases that may be installed.
+    pub known_releases: fn() -> Vec<&'static str>,
 }
 
 impl ReleaseLayout {
@@ -1195,7 +1202,15 @@ impl ReleaseLayout {
 const FIRECRACKER_RELEASE_LAYOUT: ReleaseLayout = ReleaseLayout {
     binaries: &["bin/firecracker", "bin/jailer"],
     state_format: firecracker_state_format,
+    known_releases: firecracker_known_releases,
 };
+
+fn firecracker_known_releases() -> Vec<&'static str> {
+    super::FIRECRACKER_STATE_FORMAT_RELEASES
+        .iter()
+        .map(|release| release.runtime_version)
+        .collect()
+}
 
 fn firecracker_state_format(version: &RuntimeVersion) -> Result<StateFormatIdentity, String> {
     let driver = FirecrackerDriver;
