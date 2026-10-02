@@ -9,6 +9,12 @@ datasources:
   prometheus:
     url: http://prometheus.space-metrics.svc.cluster.local:9090
   loki:
+    # This profile describes the complete local stack, where bootstrap installs
+    # all three backends, so it enables all three datasources. The chart default
+    # stays off: a shared cluster may run neither Loki nor Tempo, and a
+    # datasource pointing at nothing is worse than no datasource.
+    enabled: true
     url: http://loki.space-logs.svc.cluster.local:3100
   tempo:
+    enabled: true
     url: http://tempo.space-traces.svc.cluster.local:3200

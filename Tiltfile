@@ -73,9 +73,21 @@ DATADOG_MODE = TELEMETRY_CONFIG["backend"]
 TELEMETRY_MODE = TELEMETRY_CONFIG["mode"]
 TELEMETRY_SET = TELEMETRY_CONFIG["helm_set"]
 watch_file("infra/space/kind/charts/space-kind-telemetry")
-if TELEMETRY_MODE == "otel":
-    if not TELEMETRY_CONFIG["install_observability"]:
-        print("otel mode with SPACE_KIND_OBSERVABILITY=off: point the telemetry chart's endpoints at your own receiver, or exports will have nowhere to go.")
+INSTALL_OBSERVABILITY = TELEMETRY_CONFIG["install_observability"]
+if TELEMETRY_MODE == "otel" and not INSTALL_OBSERVABILITY:
+    print("otel mode with SPACE_KIND_OBSERVABILITY=off: point the telemetry chart's endpoints at your own receiver, or exports will have nowhere to go.")
+
+# install-shim.sh resolves the metrics and traces Collector Services and exits 2
+# when they are absent, so the backends are a dependency of the shim on this
+# path exactly as they are in bootstrap.sh. Without this, defaulting to otel
+# fails the shim and blocks rust-artifacts and the sandbox stack.
+if INSTALL_OBSERVABILITY and not MINIMAL:
+    local_resource(
+        "install-observability-backends",
+        cmd = "SPACE_KIND_CLUSTER={} bash infra/space/kind/scripts/install-observability.sh".format(KIND_CLUSTER),
+        deps = ["infra/space/kind/scripts/install-observability.sh", "infra/space/observability/charts"],
+        labels = ["bootstrap"],
+    )
 
 # ── Image builds ──────────────────────────────────────────────────────────
 #
@@ -358,6 +370,7 @@ if not MINIMAL:
             TELEMETRY_MODE,
         ),
         deps = [TELEMETRY_SCRIPT, "infra/space/kind/scripts/install-shim.sh"] + ([OBSERVABILITY_CONFIG] if OBSERVABILITY_CONFIG else []),
+        resource_deps = ["install-observability-backends"] if INSTALL_OBSERVABILITY else [],
         labels = ["bootstrap"],
     )
 
