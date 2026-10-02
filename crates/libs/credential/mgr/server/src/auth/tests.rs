@@ -364,7 +364,7 @@ async fn volume_listener_limits_both_peer_and_methods_before_dispatch() {
         ("Decrypt", false),
         ("GetOrIssueSandboxVolumeDek", false),
         ("SandboxVolumeEncryptionEnabled", false),
-        ("UnstableResolveCredentialInjectionBundle", false),
+        ("ResolveNetworkCredentials", false),
         ("FutureMethod", false),
     ] {
         for uid in [users::SPACE_VOLMGR.uid, users::SPACE_SBXMGR.uid, 0, 65534] {
