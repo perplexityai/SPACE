@@ -11,7 +11,7 @@ use pplx_space_node_runtime_core::runtime_inventory::diagnostic::{
 };
 use pplx_space_node_runtime_manager_client::proto;
 
-use crate::kernels::{JobOutcome, KernelInstall, KernelOperation, Operation, OperationState};
+use crate::installs::{JobOutcome, KernelInstall, KernelOperation, Operation, OperationState};
 use crate::protection::{AuditIdentity, PathReport, PathRole, Protection};
 
 /// Mark every scanned kernel an install record names as space-managed, and

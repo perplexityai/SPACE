@@ -1,8 +1,8 @@
 use pplx_space_common_core::types::{Arch, RuntimeKind, StorageUri};
 
 use super::*;
-use crate::kernels::source::FIRECRACKER_CI_KERNEL_SOURCE;
-use crate::kernels::test_support::fc_line;
+use crate::installs::source::FIRECRACKER_CI_KERNEL_SOURCE;
+use crate::installs::test_support::fc_line;
 
 #[test]
 fn the_public_source_addresses_lines_and_objects_by_key() {

@@ -2,7 +2,7 @@ use md5::{Digest as _, Md5};
 use sha2::Sha256;
 
 use super::*;
-use crate::kernels::test_support::boot_kernel;
+use crate::installs::test_support::boot_kernel;
 
 struct Seeded {
     _dir: tempfile::TempDir,
@@ -38,7 +38,7 @@ impl Seeded {
         import(
             &self.db,
             &self.root,
-            crate::kernels::source::host_arch().unwrap(),
+            crate::installs::source::host_arch().unwrap(),
             &self.manifest,
             jiff::Timestamp::now(),
         )
@@ -82,7 +82,10 @@ async fn a_listed_kernel_with_matching_bytes_becomes_space_managed() {
         recorded.digest,
         Digest::sha256(Sha256::digest(&image).into())
     );
-    assert_eq!(recorded.line, crate::kernels::test_support::fc_line("1.15"));
+    assert_eq!(
+        recorded.line,
+        crate::installs::test_support::fc_line("1.15")
+    );
 
     // Every later start finds it recorded.
     let again = seeded.import().unwrap();

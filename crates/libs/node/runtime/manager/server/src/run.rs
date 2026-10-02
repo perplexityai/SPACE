@@ -14,7 +14,7 @@ use std::sync::Arc;
 #[cfg(feature = "s3")]
 use pplx_space_common_core::types::StorageUri;
 
-use crate::kernels::{
+use crate::installs::{
     InstallLimits, Installer, KernelSource, OpenInstallerError, SeedError, SeedReport,
 };
 use crate::service::RuntimeManagerService;
@@ -77,7 +77,7 @@ impl KernelSourceConfig {
     fn into_source(self) -> Arc<dyn KernelSource> {
         match self {
             #[cfg(feature = "s3")]
-            Self::S3(root) => Arc::new(crate::kernels::S3KernelSource::new(root)),
+            Self::S3(root) => Arc::new(crate::installs::S3KernelSource::new(root)),
             Self::Custom(source) => source,
         }
     }
@@ -137,7 +137,7 @@ fn log_seed(manifest: &std::path::Path, imported: Result<SeedReport, SeedError>)
     match imported {
         Ok(report) => {
             for refusal in &report.refused {
-                tracing::warn!(error = %crate::kernels::describe(refusal), "pre-installed kernel left external");
+                tracing::warn!(error = %crate::installs::describe(refusal), "pre-installed kernel left external");
             }
             if !report.seeded.is_empty()
                 || !report.recorded.is_empty()
@@ -153,7 +153,7 @@ fn log_seed(manifest: &std::path::Path, imported: Result<SeedReport, SeedError>)
             }
         }
         Err(error) => tracing::warn!(
-            error = %crate::kernels::describe(&error),
+            error = %crate::installs::describe(&error),
             "pre-installed kernels not imported; they stay external"
         ),
     }

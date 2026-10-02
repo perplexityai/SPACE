@@ -32,9 +32,11 @@
 use sha2::{Digest as _, Sha256};
 
 use super::*;
-use crate::kernels::source::{ContentMd5, SourceKernel};
-use crate::kernels::store::JobPhase;
-use crate::kernels::test_support::{Body, FakeSource, banner_kernel, boot_kernel, fc_line, md5_of};
+use crate::installs::source::{ContentMd5, SourceKernel};
+use crate::installs::store::JobPhase;
+use crate::installs::test_support::{
+    Body, FakeSource, banner_kernel, boot_kernel, fc_line, md5_of,
+};
 
 const LIMITS: InstallLimits = InstallLimits {
     max_bytes: 1 << 20,

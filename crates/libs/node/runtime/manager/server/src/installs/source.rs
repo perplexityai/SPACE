@@ -340,14 +340,14 @@ pub struct VerifiableKernel {
 pub(super) mod storage_uri_text {
     use pplx_space_common_core::types::StorageUri;
 
-    pub(in crate::kernels) fn serialize<S: serde::Serializer>(
+    pub(in crate::installs) fn serialize<S: serde::Serializer>(
         uri: &StorageUri,
         serializer: S,
     ) -> Result<S::Ok, S::Error> {
         serializer.collect_str(uri)
     }
 
-    pub(in crate::kernels) fn deserialize<'de, D: serde::Deserializer<'de>>(
+    pub(in crate::installs) fn deserialize<'de, D: serde::Deserializer<'de>>(
         deserializer: D,
     ) -> Result<StorageUri, D::Error> {
         let text = <String as serde::Deserialize>::deserialize(deserializer)?;

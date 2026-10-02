@@ -13,12 +13,12 @@
 //! does not affect any launch.
 
 mod convert;
-mod kernels;
+mod installs;
 mod protection;
 mod run;
 mod service;
 
-pub use kernels::{
+pub use installs::{
     BoxError, ByteChunks, ContentMd5, ContentMd5ParseError, FIRECRACKER_CI_KERNEL_SOURCE,
     InstallLimits, KernelSource, KernelVersion, KernelVersionParseError, OpenInstallerError,
     PrepareStagingError, ReleaseLine, ReleaseLineParseError, RuntimeLine, SourceError,

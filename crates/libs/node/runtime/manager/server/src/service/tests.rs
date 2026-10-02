@@ -486,8 +486,8 @@ mod kernels {
     };
 
     use super::*;
-    use crate::kernels::test_support::{FakeSource, boot_kernel};
-    use crate::kernels::{InstallLimits, Installer};
+    use crate::installs::test_support::{FakeSource, boot_kernel};
+    use crate::installs::{InstallLimits, Installer};
 
     const INSTALL_LIMITS: InstallLimits = InstallLimits {
         max_bytes: 1 << 20,
@@ -695,7 +695,7 @@ mod kernels {
     async fn uninstall_by_version_removes_only_the_installed_copy() {
         let dir = tempfile::tempdir().unwrap();
         let (service, source) = installing_service(dir.path()).await;
-        let image = crate::kernels::test_support::banner_kernel(4096, "6.1.155+");
+        let image = crate::installs::test_support::banner_kernel(4096, "6.1.155+");
         source.offer("1.15", "6.1.155", &image);
         let bundled = dir
             .path()

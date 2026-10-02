@@ -1,5 +1,5 @@
 use super::*;
-use crate::kernels::test_support::fc_line;
+use crate::installs::test_support::fc_line;
 
 #[test]
 fn a_line_is_named_by_major_and_minor_with_or_without_patch_or_v() {

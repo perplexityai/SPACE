@@ -4,7 +4,7 @@ fn install(version: &str, job_id: JobId) -> KernelInstall {
     KernelInstall {
         version: version.parse().unwrap(),
         path: PathBuf::from(format!("/space/vendor/kernels/{version}")),
-        line: crate::kernels::test_support::fc_line("1.15"),
+        line: crate::installs::test_support::fc_line("1.15"),
         location: format!(
             "s3://fake/firecracker-ci/v1.15/x86_64/vmlinux-{version}?region=us-east-1"
         )

@@ -19,7 +19,7 @@ use pplx_space_node_runtime_manager_client::proto::{
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tonic::{Request, Response, Status};
 
-use crate::kernels::{
+use crate::installs::{
     CancelOperationError, InstallKernelError, Installer, KernelInstall, KernelSource,
     KernelVersion, KernelVersionParseError, LookupOperationError, ReleaseLine,
     ReleaseLineParseError, RuntimeLine, SourceKernel, UninstallKernelError, describe,
@@ -479,7 +479,7 @@ impl RuntimeManager for RuntimeManagerService {
         self.peer_authorizer
             .authorize_request(&request, "ListAvailableKernels", ALLOW_READ)?;
         let source = self.kernel_source()?.clone();
-        let architecture = crate::kernels::host_arch()
+        let architecture = crate::installs::host_arch()
             .ok_or_else(|| Status::failed_precondition("unsupported node architecture"))?;
         let runtime = parse_runtime(request.get_ref().runtime_kind, Some(source.runtime()))?;
         let lines = self
