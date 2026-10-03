@@ -1,16 +1,14 @@
 name = "Authenticated CONNECT preserves opaque forwarding"
 
 [[steps]]
-policy = { default = "deny", tls_interception = "on", allow = ["198.18.53.53", "upstream-proxy.127-0-0-1.dev"] }
+policy = { default = "deny", tls_interception = "on", allow = ["198.18.1.2", "upstream-proxy.127-0-0-1.dev"] }
 probes = [
-  { kind = "dns-udp", target = "198.18.53.53", host = "upstream-proxy.127-0-0-1.dev", expect = "answer" },
   { kind = "connect", host = "upstream-proxy.127-0-0-1.dev", tunnel_host = "inner.127-0-0-1.dev", expect = "allow" },
 ]
 
 [[steps]]
-policy = { default = "deny", tls_interception = "on", allow = ["198.18.53.53", "upstream-proxy.127-0-0-1.dev", "inner.127-0-0-1.dev"] }
+policy = { default = "deny", tls_interception = "on", allow = ["198.18.1.2", "upstream-proxy.127-0-0-1.dev", "inner.127-0-0-1.dev"] }
 probes = [
-  { kind = "dns-udp", target = "198.18.53.53", host = "upstream-proxy.127-0-0-1.dev", expect = "answer" },
   { kind = "connect", host = "upstream-proxy.127-0-0-1.dev", tunnel_host = "inner.127-0-0-1.dev", expect = "allow" },
   { kind = "connect", host = "upstream-proxy.127-0-0-1.dev", tunnel_host = "inner.127-0-0-1.dev", proxy_anyauth = true, expect = "allow" },
   { kind = "connect", host = "upstream-proxy.127-0-0-1.dev", tunnel_host = "forbidden.127-0-0-1.dev", expect = "allow" },
@@ -18,7 +16,7 @@ probes = [
 ]
 
 [[steps]]
-policy = { default = "deny", tls_interception = "on", allow = ["198.18.53.53", "inner.127-0-0-1.dev"] }
+policy = { default = "deny", tls_interception = "on", allow = ["inner.127-0-0-1.dev"] }
 probes = [
   { kind = "connect", host = "upstream-proxy.127-0-0-1.dev", tunnel_host = "inner.127-0-0-1.dev", expect = "deny" },
 ]

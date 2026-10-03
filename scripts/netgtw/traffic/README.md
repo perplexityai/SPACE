@@ -15,8 +15,10 @@ and Buildkite command image supply these dependencies. The CI image pins and ver
 binary. The launcher requires `uv` on `PATH` and fails if it is missing; tool
 installation belongs to the CI image or developer setup.
 No running SPACE services, database, AWS resources, or VM are needed. Reserved
-DNS cases require outbound TCP/853 to Cloudflare (`1.1.1.1`) and Google
-(`8.8.8.8`); the other cases use local peers. Cargo and uv may download dependencies.
+DNS and domain-attribution cases require outbound TCP/853 to Cloudflare
+(`1.1.1.1`) and Google (`8.8.8.8`). Domain-attribution cases also depend on
+`sslip.io` answering synthetic names with the isolated peer's benchmark address;
+application traffic stays local. Cargo and uv may download dependencies.
 Peer libraries are isolated in `target/gateway-traffic/venv`. `requirements.txt`
 pins the complete dependency set; regenerate it from `requirements.in` with the
 `uv pip compile` command recorded at the top of that file.
@@ -44,10 +46,10 @@ real control RPC. Use a preceding DNS probe when a domain permit needs evidence.
 name = "Only the named service is reachable"
 
 [[steps]]
-policy = { default = "deny", allow = ["198.18.53.53", "api.example.test"] }
+policy = { default = "deny", allow = ["1.1.1.1", "api.198-18-1-2.sslip.io"] }
 probes = [
-  { kind = "dns-udp", target = "198.18.53.53", host = "api.example.test", expect = "answer" },
-  { kind = "tls", host = "api.example.test", expect = "allow" },
+  { kind = "dns-udp", target = "1.1.1.1", host = "api.198-18-1-2.sslip.io", expect = "answer" },
+  { kind = "tls", host = "api.198-18-1-2.sslip.io", expect = "allow" },
   { kind = "tls", host = "other.example.test", expect = "deny" },
 ]
 ```
@@ -83,10 +85,25 @@ only which headers matched, so neither results nor logs contain the credential.
 Egress `target` can be `198.18.1.2`, `198.18.2.2`, `198.18.53.53`, `1.1.1.1`,
 `8.8.8.8`, or `169.254.169.254`. All are assigned inside the disposable network;
 even the metadata address is a test peer. Ordinary DNS fixtures answer every A
-query with `198.18.1.2`. Use UDP DNS to `198.18.53.53` to populate the gateway's
-DNS attribution cache for local domain cases, and allow that resolver IP in
-the policy. It is separate from both traffic targets so it grants neither one
-independent address permission. Generic TCP DNS does not populate attribution.
+query with `198.18.1.2`. Generic UDP/TCP DNS replies are relayed but never populate
+the gateway's DNS attribution cache. Case `03` checks the production boundary:
+a successful generic reply must leave HTTP/TLS denied; a subsequent reserved
+DNS reply for the same name and address must permit them.
+
+Domain cases resolve `*.198-18-1-2.sslip.io` through the reserved resolvers and
+require the answer `198.18.1.2`. This preserves exact/wildcard domain admission,
+hostname mismatch and policy-refresh coverage without trusting a guest-selected
+fixture resolver or adding a test-only gateway trust configuration. Resolver
+and authoritative-DNS failures fail these cases; they are not marked flaky.
+Only resolver IPs are independently allowed, not the application peer address.
+
+Guests using custom resolvers must use reserved DNS for domain-only egress and
+hostname-based TLS interception exemptions. Resolver transport still needs
+ordinary IP admission. Independent IP/default egress permissions continue to
+work, but do not supply the hostname binding needed for an exemption. Without
+trusted attribution, normal interception applies and certificate-pinned clients
+may fail. IP exemptions are independent of DNS evidence. The gateway's existing
+TLS-exemption unit table covers bound/unbound hosts with IP and default access.
 
 Reserved DNS is resolved through the real public upstreams. Its positive probes
 query `one.one.one.one` and assert `addresses = ["1.0.0.1", "1.1.1.1"]`, ignoring
@@ -242,8 +259,8 @@ proxy rule generator and real nft JSON round-tripping.
 
 Plaintext hostname-bound connections do not support protocol upgrades. The
 WebSocket probe in `03-domain-rules.toml` therefore expects HTTP 403 with no
-upstream connection or payload, even after DNS attributes `allowed.test` to the
-destination. A transport failure or HTTP 502 cannot satisfy this denial.
+upstream connection or payload, even after trusted DNS attributes the allowed
+name to the destination. A transport failure or HTTP 502 cannot satisfy this denial.
 The adjacent WSS probe continues to require a successful WebSocket exchange.
 
 ## Evidence and isolation

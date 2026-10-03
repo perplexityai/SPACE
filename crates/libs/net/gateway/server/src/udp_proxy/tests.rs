@@ -183,15 +183,11 @@ fn classifies_reserved_and_generic_dns_udp_datagrams() {
 }
 
 #[tokio::test]
-async fn generic_udp_53_replies_relay_without_minting_dns_attribution() {
-    // Any process at an explicitly allowed IP can answer port 53, so its reply
-    // is guest-chosen data: it must reach the guest unchanged and never become
-    // egress evidence for the addresses it names.
+async fn generic_udp_53_replies_relay_unchanged() {
+    // The network-namespace traffic suite checks that generic DNS replies do
+    // not authorize subsequent HTTP/TLS flows through the shared gateway.
+    // This lower-level test owns only transparent reply delivery.
     const ALLOWED_HOST: &str = "allowed.example";
-    let forged_ip: IpAddr = "203.0.113.9".parse().unwrap();
-    let network_state = ready_network_state(v1_policy(&["198.51.100.53", ALLOWED_HOST], &[])).await;
-    let policy = network_state.snapshot().await.policy.unwrap();
-    let dns_allow_cache = DnsAllowCache::default();
 
     // Loopback stand-ins for the allowed "resolver", the guest, and the
     // gateway's connected upstream and spoofed-source response sockets.
@@ -237,8 +233,6 @@ async fn generic_udp_53_replies_relay_without_minting_dns_attribution() {
         .unwrap();
     assert_eq!(source, response_addr);
     assert_eq!(&wire[..length], forged.as_slice());
-    assert!(!dns_allow_cache.allows_ip(forged_ip, policy.as_ref()));
-    assert!(!dns_allow_cache.contains_host_binding(forged_ip, ALLOWED_HOST));
 
     cancel_token.cancel();
     task.await.unwrap();
@@ -315,7 +309,7 @@ async fn reserved_udp_datagrams_are_independent_and_replies_preserve_the_destina
             flow,
             ReservedResolver::Cloudflare,
             &allowed_wire,
-            policy,
+            Arc::clone(&policy),
             reserved_dns_cancellation.operation_token(),
             |addr| {
                 assert_eq!(addr, response_addr);
@@ -330,6 +324,16 @@ async fn reserved_udp_datagrams_are_independent_and_replies_preserve_the_destina
         hickory_resolver::proto::op::ResponseCode::NoError
     );
     assert_eq!(resolver.requests().len(), 1);
+    assert!(
+        proxy
+            .dns_allow_cache
+            .contains_host_binding("192.0.2.10".parse().unwrap(), "allowed.example",)
+    );
+    assert!(
+        proxy
+            .dns_allow_cache
+            .allows_ip("192.0.2.10".parse().unwrap(), policy.as_ref())
+    );
     assert!(proxy.sessions.is_empty());
     dns_tasks.close();
     dns_tasks.wait().await;
