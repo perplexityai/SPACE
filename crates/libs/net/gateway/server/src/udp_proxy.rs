@@ -1002,8 +1002,6 @@ impl UdpProxy {
             response_socket,
             last_active_ms: last_active_ms.clone(),
             stats: Arc::clone(&self.stats),
-            network_state: self.network_state.clone(),
-            dns_allow_cache: self.dns_allow_cache.clone(),
             cancel_token: cancel_token.clone(),
             dead: dead.clone(),
             completion: completion.clone(),
@@ -1312,8 +1310,6 @@ struct ResponseTask {
     response_socket: Arc<UdpSocket>,
     last_active_ms: Arc<AtomicU64>,
     stats: Arc<ProxyStats>,
-    network_state: GatewayNetworkState,
-    dns_allow_cache: DnsAllowCache,
     cancel_token: CancellationToken,
     dead: Arc<AtomicBool>,
     completion: SessionCompletion,
@@ -1333,8 +1329,6 @@ impl ResponseTask {
                 response_socket,
                 last_active_ms,
                 stats,
-                network_state,
-                dns_allow_cache,
                 cancel_token,
                 dead,
                 completion,
@@ -1371,17 +1365,13 @@ impl ResponseTask {
                                     );
                                     continue;
                                 };
-                                if flow.orig_dst.port() == 53 {
-                                    let snapshot = network_state.snapshot().await;
-                                    if let Some(policy) = snapshot.policy {
-                                        let accepted = dns_allow_cache
-                                            .observe_response(datagram, policy.as_ref());
-                                        pplx_space_metrics::gateway::dns_attribution_cache_observation(
-                                            DnsAttributionCacheObservationSource::GenericUdp53,
-                                            accepted,
-                                        );
-                                    }
-                                }
+                                // Replies on a generic flow come from whatever
+                                // the guest addressed, port 53 included, so they
+                                // are relayed opaquely and never feed the DNS
+                                // attribution cache. Only the gateway-mediated
+                                // reserved resolvers mint egress evidence; a
+                                // guest-chosen answer for an allowed name would
+                                // otherwise bind any unguardrailed IP to it.
                                 if let Err(error) =
                                     response_socket.send_to(datagram, flow.guest_src).await
                                 {

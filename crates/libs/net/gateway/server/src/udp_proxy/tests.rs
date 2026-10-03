@@ -183,6 +183,68 @@ fn classifies_reserved_and_generic_dns_udp_datagrams() {
 }
 
 #[tokio::test]
+async fn generic_udp_53_replies_relay_without_minting_dns_attribution() {
+    // Any process at an explicitly allowed IP can answer port 53, so its reply
+    // is guest-chosen data: it must reach the guest unchanged and never become
+    // egress evidence for the addresses it names.
+    const ALLOWED_HOST: &str = "allowed.example";
+    let forged_ip: IpAddr = "203.0.113.9".parse().unwrap();
+    let network_state = ready_network_state(v1_policy(&["198.51.100.53", ALLOWED_HOST], &[])).await;
+    let policy = network_state.snapshot().await.policy.unwrap();
+    let dns_allow_cache = DnsAllowCache::default();
+
+    // Loopback stand-ins for the allowed "resolver", the guest, and the
+    // gateway's connected upstream and spoofed-source response sockets.
+    let resolver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let upstream_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    upstream_socket
+        .connect(resolver.local_addr().unwrap())
+        .await
+        .unwrap();
+    let upstream_addr = upstream_socket.local_addr().unwrap();
+    let guest = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let response_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let response_addr = response_socket.local_addr().unwrap();
+    let flow = FlowKey {
+        guest_src: guest.local_addr().unwrap(),
+        orig_dst: "198.51.100.53:53".parse().unwrap(),
+    };
+    let (session_event_tx, _session_event_rx) = mpsc::channel::<SessionEvent>(1);
+    let cancel_token = CancellationToken::new();
+    let task = ResponseTask {
+        sandbox_id: "test",
+        flow,
+        session_id: 1,
+        started_at: Instant::now(),
+        upstream_socket,
+        response_socket,
+        last_active_ms: Arc::new(AtomicU64::new(0)),
+        stats: Arc::new(ProxyStats::new()),
+        cancel_token: cancel_token.clone(),
+        dead: Arc::new(AtomicBool::new(false)),
+        completion: SessionCompletion::new(),
+        session_event_tx,
+        session_permit: Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap(),
+    }
+    .spawn();
+
+    let forged = dns_a_response(ALLOWED_HOST, [203, 0, 113, 9]);
+    resolver.send_to(&forged, upstream_addr).await.unwrap();
+    let mut wire = [0_u8; 512];
+    let (length, source) = tokio::time::timeout(Duration::from_secs(1), guest.recv_from(&mut wire))
+        .await
+        .expect("relayed UDP/53 reply timed out")
+        .unwrap();
+    assert_eq!(source, response_addr);
+    assert_eq!(&wire[..length], forged.as_slice());
+    assert!(!dns_allow_cache.allows_ip(forged_ip, policy.as_ref()));
+    assert!(!dns_allow_cache.contains_host_binding(forged_ip, ALLOWED_HOST));
+
+    cancel_token.cancel();
+    task.await.unwrap();
+}
+
+#[tokio::test]
 async fn reserved_udp_datagrams_are_independent_and_replies_preserve_the_destination() {
     let resolver =
         crate::reserved_dns::test_support::RecordedResolver::new("192.0.2.10".parse().unwrap());

@@ -202,14 +202,12 @@ impl DnsAttributionCacheUpdateResult {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DnsAttributionCacheObservationSource {
     ReservedDns,
-    GenericUdp53,
 }
 
 impl DnsAttributionCacheObservationSource {
     const fn as_str(self) -> &'static str {
         match self {
             Self::ReservedDns => "reserved_dns",
-            Self::GenericUdp53 => "generic_udp_53",
         }
     }
 }
