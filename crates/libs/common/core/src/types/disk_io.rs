@@ -1,3 +1,5 @@
+use std::num::NonZeroU32;
+
 /// Default per-sandbox disk operation rate used when a warm-pool configuration
 /// has no explicit assignment.
 pub const DEFAULT_DISK_IO_MAX_OPERATIONS_PER_SEC: u64 = 1_000;
@@ -5,6 +7,52 @@ pub const DEFAULT_DISK_IO_MAX_OPERATIONS_PER_SEC: u64 = 1_000;
 /// Default per-sandbox disk bandwidth used when a warm-pool configuration has
 /// no explicit assignment.
 pub const DEFAULT_DISK_IO_MAX_BANDWIDTH_MIB_PER_SEC: u64 = 100;
+
+/// Default seconds of its sustained rates a sandbox drive's buckets hold.
+/// Guest disk requests are mostly one 4 KiB page (the virtio disk takes one
+/// segment per request), so a command that reads a cold Python install or
+/// copies a small tree issues thousands of operations at once, and uploads
+/// arrive in bursts. The buckets let a sandbox that was idle spend that much
+/// at once, as fast as the disk takes it; the sustained rates, and so a
+/// sandbox's long-run share of the node's shared disk, stay those of
+/// [`DiskIoLimits`].
+pub const DEFAULT_DISK_IO_BURST_SECS: NonZeroU32 = NonZeroU32::new(30).unwrap();
+
+/// A Firecracker token bucket: `size` tokens, refilled from empty over
+/// `refill_time_ms`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TokenBucket {
+    pub size: u64,
+    pub refill_time_ms: u64,
+}
+
+/// A Firecracker device rate limiter: one token bucket for bytes and one for
+/// operations.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RateLimiter {
+    pub bandwidth: TokenBucket,
+    pub operations: TokenBucket,
+}
+
+impl RateLimiter {
+    /// The limiter enforcing a sandbox drive's [`DiskIoLimits`]. Each bucket
+    /// holds `burst_secs` of its sustained rate and refills at that rate.
+    pub const fn for_disk(limits: DiskIoLimits, burst_secs: NonZeroU32) -> Self {
+        let burst_secs = burst_secs.get() as u64;
+        Self {
+            bandwidth: TokenBucket {
+                size: limits
+                    .max_bandwidth_bytes_per_sec()
+                    .saturating_mul(burst_secs),
+                refill_time_ms: burst_secs * 1000,
+            },
+            operations: TokenBucket {
+                size: limits.max_operations_per_sec.saturating_mul(burst_secs),
+                refill_time_ms: burst_secs * 1000,
+            },
+        }
+    }
+}
 
 const MIB_BYTES: u64 = 1024 * 1024;
 const MAX_OPERATIONS_PER_SEC: u64 = i64::MAX as u64;
@@ -73,6 +121,11 @@ impl DiskIoLimits {
 
     pub const fn max_bandwidth_mib_per_sec(self) -> u64 {
         self.max_bandwidth_mib_per_sec
+    }
+
+    /// The bandwidth limit in bytes; validation keeps it representable.
+    pub const fn max_bandwidth_bytes_per_sec(self) -> u64 {
+        self.max_bandwidth_mib_per_sec * MIB_BYTES
     }
 }
 

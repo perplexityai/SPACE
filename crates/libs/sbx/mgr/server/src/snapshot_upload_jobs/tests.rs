@@ -96,6 +96,35 @@ async fn upload_executor_converges_unstaged_metadata_failure() {
     );
 }
 
+// The schedule `poll_artifact_job` probes on: soon after a completion, and
+// at a bounded rate through a long transfer. The probing itself needs a
+// volume-manager and is covered by the transfer tests.
+#[test]
+fn the_artifact_poll_schedule_notices_completion_promptly_and_bounds_probes() {
+    // Probe times after submission, for the first minute of a transfer.
+    let mut probes = vec![Duration::ZERO];
+    let mut interval = ARTIFACT_POLL_INITIAL;
+    while *probes.last().unwrap() < Duration::from_secs(60) {
+        let next = *probes.last().unwrap() + interval;
+        probes.push(next);
+        interval = next_artifact_poll_interval(interval);
+    }
+    // A transfer that completes at any moment is seen by the next probe.
+    let lateness = |done: Duration| *probes.iter().find(|probe| **probe >= done).unwrap() - done;
+    assert!(lateness(Duration::from_millis(50)) <= Duration::from_millis(100));
+    for ms in (0..60_000).step_by(37) {
+        assert!(
+            lateness(Duration::from_millis(ms)) <= ARTIFACT_POLL_MAX,
+            "completion at {ms}ms is noticed within the probe cap"
+        );
+    }
+    assert!(
+        probes.len() <= 125,
+        "a minute-long transfer is probed {} times",
+        probes.len()
+    );
+}
+
 #[tokio::test]
 async fn cancelled_transfer_poll_yields_before_connecting() {
     let cancellation = tokio_util::sync::CancellationToken::new();

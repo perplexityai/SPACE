@@ -39,6 +39,7 @@ pub(crate) mod redis_otel;
 pub mod routes;
 mod run;
 pub mod template_build_jobs_store;
+mod template_inventory_store;
 mod template_releases_store;
 pub mod user_role;
 mod wake_trace;

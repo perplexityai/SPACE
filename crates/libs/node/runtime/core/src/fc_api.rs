@@ -1,5 +1,6 @@
 use hyper::body::Bytes;
 use hyper_util::rt::TokioIo;
+use pplx_space_common_core::types::{RateLimiter, TokenBucket};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -122,6 +123,18 @@ impl FcApiClient {
         self.put("/snapshot/load", &body).await
     }
 
+    /// Replace a drive's rate limiter. Valid once the VM exists, including
+    /// right after a snapshot load while it is still paused.
+    pub async fn update_drive_rate_limiter(
+        &self,
+        drive_id: &str,
+        limiter: &RateLimiter,
+    ) -> Result<(), FcApiError> {
+        let body = drive_rate_limiter_request_body(drive_id, limiter);
+        self.request("PATCH", &format!("/drives/{drive_id}"), &body)
+            .await
+    }
+
     /// Query the VM state.
     pub async fn get_vm_state(&self) -> Result<FirecrackerVmState, FcApiError> {
         let stream = UnixStream::connect(&self.socket_path).await?;
@@ -231,6 +244,23 @@ fn create_snapshot_request_body(
         "mem_file_path": mem_file_path,
         "snapshot_type": CREATE_SNAPSHOT_TYPE
     }))
+}
+
+fn drive_rate_limiter_request_body(drive_id: &str, limiter: &RateLimiter) -> serde_json::Value {
+    serde_json::json!({
+        "drive_id": drive_id,
+        "rate_limiter": rate_limiter_json(limiter),
+    })
+}
+
+/// A Firecracker `rate_limiter` object, as a drive or network interface
+/// takes it at boot or in a PATCH.
+pub fn rate_limiter_json(limiter: &RateLimiter) -> serde_json::Value {
+    let bucket = |bucket: TokenBucket| serde_json::json!({ "size": bucket.size, "refill_time": bucket.refill_time_ms });
+    serde_json::json!({
+        "bandwidth": bucket(limiter.bandwidth),
+        "ops": bucket(limiter.operations)
+    })
 }
 
 fn load_snapshot_request_body(

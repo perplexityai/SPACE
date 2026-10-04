@@ -703,6 +703,11 @@ impl SandboxManagerService {
             disarm_guest_activity_on_external_access(&mut state, &sandbox.auto_lifecycle, now);
             clear_error(&mut state, &sandbox.auto_lifecycle);
         }
+        // Activity is recorded at one-second resolution, so back-to-back guest
+        // operations usually leave the state as it was; skip the write then.
+        if state == sandbox.auto_lifecycle_state {
+            return Ok(());
+        }
         let db = self.db_conn()?;
         crate::db::update_auto_lifecycle_state(&db, &sandbox.id, &state)
             .map_err(|e| Status::internal(format!("db auto_lifecycle_state update failed: {e}")))

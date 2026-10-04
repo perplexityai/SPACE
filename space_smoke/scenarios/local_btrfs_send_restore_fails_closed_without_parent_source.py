@@ -9,11 +9,11 @@ import space_smoke as smoke
 # received, nothing materialized, no template conjured from nowhere.
 #
 # Forcing, both kind-only and compensated: the fixture's own template is
-# removed from the other sandbox-pool worker (template-manager's
-# `delete-template`), and the cluster's `template_release_storage_locations`
-# rows for that template are withheld — saved first, the restore armed as a
-# critical compensation before the delete is dispatched, and put back inside
-# the scenario body. With the source cordoned the restore can only try the
+# withheld from the cluster's `template_release_storage_locations` first,
+# then removed from the other sandbox-pool worker (template-manager's
+# `delete-template`). The rows are saved first, their restoration armed as a
+# critical compensation before deletion, and put back inside the scenario
+# body. With the source cordoned the restore can only try the
 # cold worker. The rows go back only after the sandbox, its pods and its local
 # rows are gone: the kubelet keeps retrying the failed restore pod, and a retry
 # that can reach the parent again would bring the sandbox back up there.
@@ -52,9 +52,11 @@ def btrfs_send_restore_fails_closed_without_parent_source(test: smoke.KindEcw) -
         restore.wait_until_restore_portable()
 
     with restore.cordoned(source.node_name):
-        with test.phase("remove the parent from the target and withhold its cluster storage"):
-            codec.evict_template(target_pod, template)
+        with test.phase("withhold the parent's cluster storage, then evict it from the target"):
+            # Evicting first lets prefetch start a download that the restore
+            # can join even after its storage location has been withheld.
             codec.withhold_release_storage(template)
+            codec.evict_template(target_pod, template)
             since = codec.mark_since()
 
         with test.phase("the restore fails at the client"):

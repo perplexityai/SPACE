@@ -1089,6 +1089,12 @@ impl SandboxManagerService {
                         // Restore configuration was checked before activation;
                         // unsupported backends must never reach node-manager.
                         snapshot_volume_mount_dir: snapshot_volume_mount_dir.clone(),
+                        rootfs_rate_limit: self
+                            .rootfs_rate_limiter(
+                                sandbox.user.kind() == SandboxOwnerKind::Builder,
+                                sandbox.disk_io_limits,
+                            )
+                            .map(super::start::drive_rate_limit_proto),
                     })
                     .instrument(tracing::info_span!(
                         "sbxmgr.restore.node.load_snapshot",

@@ -221,7 +221,7 @@ pub async fn run(config: ApiRunConfig, shutdown: CancellationToken) -> Result<()
     // Connect info gives request handlers the TCP peer address — the
     // ECW request log falls back to it when `X-Forwarded-For` is absent.
     let server = axum::serve(
-        listener,
+        pplx_space_common_svc::http_listener::nodelay(listener),
         app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
     .with_graceful_shutdown(shutdown);

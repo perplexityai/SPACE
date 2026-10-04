@@ -59,3 +59,30 @@ fn optional_wire_fields_are_paired() {
         Err(DiskIoLimitsError::PartialPair)
     ));
 }
+
+#[test]
+fn a_drive_limiter_keeps_the_sustained_rates_and_holds_a_burst_of_each() {
+    let burst = std::num::NonZeroU32::new(5).unwrap();
+    let limiter = RateLimiter::for_disk(DiskIoLimits::try_new(1_000, 100).unwrap(), burst);
+    assert_eq!(
+        limiter.bandwidth,
+        TokenBucket {
+            size: 5 * 100 * 1024 * 1024,
+            refill_time_ms: 5_000,
+        },
+        "the bucket holds five seconds and refills at the configured rate"
+    );
+    assert_eq!(
+        limiter.operations,
+        TokenBucket {
+            size: 5_000,
+            refill_time_ms: 5_000,
+        },
+        "the bucket holds five seconds and refills at the configured rate"
+    );
+
+    let largest = DiskIoLimits::try_new(MAX_OPERATIONS_PER_SEC, MAX_BANDWIDTH_MIB_PER_SEC).unwrap();
+    let limiter = RateLimiter::for_disk(largest, std::num::NonZeroU32::MAX);
+    assert_eq!(limiter.operations.size, u64::MAX);
+    assert_eq!(limiter.bandwidth.size, u64::MAX);
+}

@@ -376,7 +376,7 @@ pub async fn run(
     };
 
     axum::serve(
-        listener,
+        pplx_space_common_svc::http_listener::nodelay(listener),
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
     .with_graceful_shutdown(shutdown)

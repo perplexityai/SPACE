@@ -1,3 +1,4 @@
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
@@ -12,9 +13,18 @@ pub struct SandboxConfig {
     /// Default: false. Set true on bare metal (AWS) for better TLB performance.
     #[serde(default)]
     pub hugepages: bool,
+    /// Seconds of their sustained rates a sandbox's rootfs operations and
+    /// bandwidth buckets hold. Default:
+    /// [`DEFAULT_DISK_IO_BURST_SECS`](pplx_space_common_core::types::DEFAULT_DISK_IO_BURST_SECS).
+    pub disk_io_burst_secs: Option<NonZeroU32>,
 }
 
 impl SandboxConfig {
+    pub fn disk_io_burst_secs(&self) -> NonZeroU32 {
+        self.disk_io_burst_secs
+            .unwrap_or(pplx_space_common_core::types::DEFAULT_DISK_IO_BURST_SECS)
+    }
+
     pub fn validate_snapshot_restore(&self) -> Result<(), &'static str> {
         if self.hugepages {
             Err("snapshot restore requires file-backed memory; set hugepages = false")

@@ -743,16 +743,25 @@ async fn wait_for_artifact_job(
     poll_artifact_job(sandbox_id, *job_id, client, cancellation).await
 }
 
+/// Probe interval after the first pending answer. A teardown suspend holds its
+/// caller (an E2B pause) until every artifact is durable, and a compressed
+/// snapshot usually uploads in one to two seconds, so every probe of
+/// node-local volume-manager comes soon. The interval doubles up to
+/// [`ARTIFACT_POLL_MAX`], which bounds how late a completion is noticed.
+const ARTIFACT_POLL_INITIAL: Duration = Duration::from_millis(100);
+const ARTIFACT_POLL_MAX: Duration = Duration::from_millis(500);
+
+fn next_artifact_poll_interval(interval: Duration) -> Duration {
+    (interval * 2).min(ARTIFACT_POLL_MAX)
+}
+
 async fn poll_artifact_job(
     sandbox_id: &str,
     job_id: JobId,
     mut client: pplx_space_volmgr_client::ConnectedVolumeManagerClient,
     cancellation: tokio_util::sync::CancellationToken,
 ) -> Result<ArtifactTransferObservation, JobError> {
-    const POLL_INITIAL: Duration = Duration::from_secs(5);
-    const POLL_MAX: Duration = Duration::from_secs(60);
-
-    let mut interval = POLL_INITIAL;
+    let mut interval = ARTIFACT_POLL_INITIAL;
     loop {
         let resp = tokio::select! {
             biased;
@@ -823,7 +832,7 @@ async fn poll_artifact_job(
                     _ = cancellation.cancelled() => return Err(JobError::YieldedForRestart),
                     _ = tokio::time::sleep(interval) => {}
                 }
-                interval = (interval * 2).min(POLL_MAX);
+                interval = next_artifact_poll_interval(interval);
             }
         }
     }

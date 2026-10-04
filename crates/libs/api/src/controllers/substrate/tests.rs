@@ -175,6 +175,34 @@ async fn node_api_endpoint_connects_to_local_worker_node_api()
     Ok(())
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn kept_worker_channels_serve_every_call_to_a_worker()
+-> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if !crate::test_support::enter_sim_worker_process() {
+        return Ok(());
+    }
+
+    let (server, addr) = start_local_worker_server().await?;
+    let channels =
+        worker_channels::WorkerChannels::new(Duration::from_secs(3), Duration::from_secs(10));
+    for sandbox in ["kept-channel-first", "kept-channel-second"] {
+        let mut client = channels.client(&addr).await?;
+        client
+            .spaced_wait_ready(SpacedWaitReadyRequest {
+                sandbox_id: sandbox.to_string(),
+                timeout: None,
+            })
+            .await?;
+    }
+    assert_eq!(
+        channels.len(),
+        1,
+        "the second call reuses the first channel"
+    );
+    drop(server);
+    Ok(())
+}
+
 #[tokio::test]
 async fn suspended_backup_accepts_current_or_exact_artifact_through_generic_rpc()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {

@@ -1,6 +1,7 @@
 pub mod direct;
 #[cfg(feature = "kubernetes")]
 pub mod kubernetes;
+mod worker_channels;
 
 #[cfg(feature = "kubernetes")]
 pub use kubernetes::ReflectorReady;

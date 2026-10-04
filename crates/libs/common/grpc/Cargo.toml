@@ -22,7 +22,7 @@ tokio-util = { workspace = true, optional = true }
 http = { workspace = true }
 http-body = { workspace = true }
 bytes = { workspace = true }
-hyper-util = { workspace = true, features = ["tokio"] }
+hyper-util = { workspace = true, features = ["client-legacy", "tokio"] }
 rand = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["net", "rt", "time", "sync"] }
