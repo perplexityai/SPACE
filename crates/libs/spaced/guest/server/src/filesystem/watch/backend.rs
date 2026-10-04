@@ -18,10 +18,7 @@ use super::MAX_WATCHED_DIRECTORIES;
 use super::event::WatchEvent;
 use super::filter::WatchFilter;
 use super::now_unix_ms;
-use super::paths::{
-    WatchRegistrationPlan, collect_watch_directories, validate_watch_root,
-    watch_directory_scan_slots,
-};
+use super::paths::{WatchRegistrationPlan, collect_watch_directories, validate_watch_root};
 use super::state::DirectoryAdjustment;
 
 // Losing a raw event makes the watch incomplete, so overflow terminates the
@@ -216,8 +213,10 @@ pub(super) struct NotifyTaskConfig {
     pub(super) shutdown: CancellationToken,
 }
 
+/// `scan_slots` is the owning manager's directory-scan budget.
 pub(super) fn spawn_notify_task<F, Fut, D, DFut>(
     config: NotifyTaskConfig,
+    scan_slots: Arc<tokio::sync::Semaphore>,
     on_event: F,
     adjust_directories: D,
 ) where
@@ -230,9 +229,10 @@ pub(super) fn spawn_notify_task<F, Fut, D, DFut>(
         config,
         on_event,
         adjust_directories,
-        Arc::new(|root, filter, candidates| {
+        Arc::new(move |root, filter, candidates| {
+            let scan_slots = Arc::clone(&scan_slots);
             tokio::spawn(async move {
-                let scan_slot = watch_directory_scan_slots()
+                let scan_slot = scan_slots
                     .acquire_owned()
                     .await
                     .map_err(|_| Status::unavailable("file watcher directory scanner closed"))?;

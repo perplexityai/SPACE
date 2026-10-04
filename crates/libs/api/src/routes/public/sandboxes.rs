@@ -252,7 +252,7 @@ pub async fn get_sandbox_stats(
         .stats(&state.pool, &sandbox, sandbox_id.into())
         .await
         .map_err(controller_error)?;
-    Ok(Json(public_stats_response(sandbox_id, stats)?))
+    Ok(Json(public_stats_response(sandbox_id, stats)))
 }
 
 pub async fn stream_sandbox_metrics(
@@ -314,7 +314,7 @@ fn sandbox_metrics_stream(
                 )
                 .await
                 .map_err(controller_error)
-                .and_then(|stats| public_stats_response(stream.sandbox_id, stats))
+                .map(|stats| public_stats_response(stream.sandbox_id, stats))
             {
                 Ok(stats) => Event::default()
                     .event("metrics")
@@ -940,49 +940,46 @@ fn public_sandbox_from_row(sandbox: PublicSandboxRow) -> Result<PublicSandbox, P
     })
 }
 
+/// The public stats shape. Every sandbox-manager field is named, so a field
+/// added to the proto must be placed here before this compiles.
 fn public_stats_response(
     sandbox_id: PublicSandboxId,
-    stats: serde_json::Value,
-) -> Result<SandboxStatsResponse, PublicApiError> {
-    Ok(SandboxStatsResponse {
+    stats: pplx_space_sbx_mgr_client::proto::StatsResponse,
+) -> SandboxStatsResponse {
+    let pplx_space_sbx_mgr_client::proto::StatsResponse {
+        sandbox_id: _,
+        cpu_max,
+        memory_max,
+        memory_current,
+        pids_max,
+        pids_current,
+        cpu_usage_usec,
+        network_tx_bytes,
+        network_rx_bytes,
+        net_gateway_reachable,
+        tcp_active_connections,
+        tcp_total_connections,
+        udp_active_mappings,
+        bytes_forwarded,
+        tcp_denied_connections,
+    } = stats;
+    SandboxStatsResponse {
         sandbox_id,
-        cpu_max: json_string(&stats, "cpu_max")?,
-        memory_max: json_u64(&stats, "memory_max")?,
-        memory_current: json_u64(&stats, "memory_current")?,
-        pids_max: json_u64(&stats, "pids_max")?,
-        pids_current: json_u64(&stats, "pids_current")?,
-        cpu_usage_usec: json_u64(&stats, "cpu_usage_usec")?,
-        network_tx_bytes: json_u64(&stats, "network_tx_bytes")?,
-        network_rx_bytes: json_u64(&stats, "network_rx_bytes")?,
-        net_gateway_reachable: json_bool(&stats, "net_gateway_reachable")?,
-        tcp_active_connections: json_u64(&stats, "tcp_active_connections")?,
-        tcp_total_connections: json_u64(&stats, "tcp_total_connections")?,
-        tcp_denied_connections: json_u64(&stats, "tcp_denied_connections")?,
-        udp_active_mappings: json_u64(&stats, "udp_active_mappings")?,
-        bytes_forwarded: json_u64(&stats, "bytes_forwarded")?,
-    })
-}
-
-fn json_string(stats: &serde_json::Value, key: &'static str) -> Result<String, PublicApiError> {
-    stats
-        .get(key)
-        .and_then(serde_json::Value::as_str)
-        .map(ToOwned::to_owned)
-        .ok_or_else(PublicApiError::internal)
-}
-
-fn json_u64(stats: &serde_json::Value, key: &'static str) -> Result<u64, PublicApiError> {
-    stats
-        .get(key)
-        .and_then(serde_json::Value::as_u64)
-        .ok_or_else(PublicApiError::internal)
-}
-
-fn json_bool(stats: &serde_json::Value, key: &'static str) -> Result<bool, PublicApiError> {
-    stats
-        .get(key)
-        .and_then(serde_json::Value::as_bool)
-        .ok_or_else(PublicApiError::internal)
+        cpu_max,
+        memory_max,
+        memory_current,
+        pids_max,
+        pids_current,
+        cpu_usage_usec,
+        network_tx_bytes,
+        network_rx_bytes,
+        net_gateway_reachable,
+        tcp_active_connections,
+        tcp_total_connections,
+        tcp_denied_connections,
+        udp_active_mappings,
+        bytes_forwarded,
+    }
 }
 
 fn public_lifecycle_state(lifecycle: &str) -> Result<SandboxLifecycleState, PublicApiError> {

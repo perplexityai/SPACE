@@ -1,5 +1,6 @@
 #[cfg(feature = "host-runtime")]
 pub mod cgroup;
+pub mod cgroup_paths;
 pub mod fc_api;
 #[cfg(feature = "host-runtime")]
 pub mod gateway_launch;

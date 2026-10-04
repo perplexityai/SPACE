@@ -775,9 +775,14 @@ async fn verification_root_loss_is_terminal_without_a_backend_event() {
             super::super::filter::WatchFilterConfig::new(vec![], vec![], false).unwrap(),
         )
         .unwrap();
-        let plan = super::super::paths::plan_watch_registration(&root, true, &filter)
-            .await
-            .unwrap();
+        let plan = super::super::paths::plan_watch_registration(
+            &root,
+            true,
+            &filter,
+            &super::super::paths::new_watch_directory_scan_slots(),
+        )
+        .await
+        .unwrap();
         let mut registration = RegisteredWatch::prepare(plan).await.unwrap();
         // Suppress OS delivery to prove that verification itself detects loss.
         let (_raw_tx, raw_rx) = mpsc::channel(1);
@@ -799,6 +804,7 @@ async fn verification_root_loss_is_terminal_without_a_backend_event() {
                 registration,
                 shutdown: shutdown.clone(),
             },
+            super::super::paths::new_watch_directory_scan_slots(),
             move |event| {
                 let sent = tx.send(event).is_ok();
                 async move { sent }
@@ -852,9 +858,14 @@ async fn registration_rejects_a_root_lost_after_planning() {
     .unwrap();
     for replace_with_file in [false, true] {
         std::fs::create_dir(&root).unwrap();
-        let plan = super::super::paths::plan_watch_registration(&root, true, &filter)
-            .await
-            .unwrap();
+        let plan = super::super::paths::plan_watch_registration(
+            &root,
+            true,
+            &filter,
+            &super::super::paths::new_watch_directory_scan_slots(),
+        )
+        .await
+        .unwrap();
         std::fs::remove_dir(&root).unwrap();
         if replace_with_file {
             std::fs::write(&root, b"replacement").unwrap();
@@ -865,9 +876,14 @@ async fn registration_rejects_a_root_lost_after_planning() {
         }
     }
     std::fs::create_dir(&root).unwrap();
-    let plan = super::super::paths::plan_watch_registration(&root, true, &filter)
-        .await
-        .unwrap();
+    let plan = super::super::paths::plan_watch_registration(
+        &root,
+        true,
+        &filter,
+        &super::super::paths::new_watch_directory_scan_slots(),
+    )
+    .await
+    .unwrap();
     assert!(
         RegisteredWatch::prepare(plan).await.is_ok(),
         "fresh setup can recover"

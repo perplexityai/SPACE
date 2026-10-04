@@ -1,5 +1,5 @@
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tonic::Status;
@@ -11,21 +11,24 @@ use super::filter::WatchFilter;
 use super::{MAX_LEDGER_ROOTS, MAX_WATCHED_DIRECTORIES};
 
 const MAX_CONCURRENT_WATCH_DIRECTORY_SCANS: usize = 4;
-static WATCH_DIRECTORY_SCAN_SLOTS: LazyLock<Arc<Semaphore>> =
-    LazyLock::new(|| Arc::new(Semaphore::new(MAX_CONCURRENT_WATCH_DIRECTORY_SCANS)));
 
-pub(super) fn watch_directory_scan_slots() -> Arc<Semaphore> {
-    Arc::clone(&WATCH_DIRECTORY_SCAN_SLOTS)
+/// The directory-scan budget of one watch manager. Each filesystem service
+/// process (the direct service, or one identity worker) owns a single
+/// manager, so this bounds that process's scans. Owning it per manager rather
+/// than per process keeps independent managers, such as concurrent tests,
+/// from exhausting each other's budget.
+pub(super) fn new_watch_directory_scan_slots() -> Arc<Semaphore> {
+    Arc::new(Semaphore::new(MAX_CONCURRENT_WATCH_DIRECTORY_SCANS))
 }
 
-fn try_acquire_watch_directory_scan_slot() -> Result<OwnedSemaphorePermit, Status> {
-    watch_directory_scan_slots()
-        .try_acquire_owned()
-        .map_err(|_| {
-            Status::resource_exhausted(
-                "too many concurrent file watcher directory scans; retry with backoff",
-            )
-        })
+fn try_acquire_watch_directory_scan_slot(
+    scan_slots: &Arc<Semaphore>,
+) -> Result<OwnedSemaphorePermit, Status> {
+    Arc::clone(scan_slots).try_acquire_owned().map_err(|_| {
+        Status::resource_exhausted(
+            "too many concurrent file watcher directory scans; retry with backoff",
+        )
+    })
 }
 
 pub(super) async fn normalize_watch_root(path: &GuestPath) -> Result<PathBuf, Status> {
@@ -115,6 +118,7 @@ pub(super) async fn plan_watch_registration(
     root: &Path,
     recursive: bool,
     filter: &WatchFilter,
+    scan_slots: &Arc<Semaphore>,
 ) -> Result<WatchRegistrationPlan, Status> {
     if !recursive {
         return Ok(WatchRegistrationPlan {
@@ -122,7 +126,7 @@ pub(super) async fn plan_watch_registration(
             descendants: Vec::new(),
         });
     }
-    let scan_slot = try_acquire_watch_directory_scan_slot()?;
+    let scan_slot = try_acquire_watch_directory_scan_slot(scan_slots)?;
     let root = root.to_path_buf();
     let filter = filter.clone();
     tokio::task::spawn_blocking(move || {

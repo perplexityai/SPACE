@@ -325,3 +325,32 @@ async fn ledger_backend_loss_remains_visible_until_reenabled() {
     assert!(response.monitoring_enabled);
     manager.shutdown().await;
 }
+
+// Recursive watch setup fails fast once its manager's scans are all busy. That
+// budget belongs to the manager, so one manager's scans must not refuse
+// another's setup, as they did when the budget was shared process-wide.
+#[tokio::test]
+async fn watch_managers_do_not_share_a_directory_scan_budget() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = GuestPath::parse(directory.path().display().to_string()).unwrap();
+    let busy = WatchManager::new(CancellationToken::new());
+    let _busy_scans = Arc::clone(&busy.scan_slots)
+        .acquire_many_owned(
+            u32::try_from(busy.scan_slots.available_permits()).expect("scan budget"),
+        )
+        .await
+        .unwrap();
+    let refused = busy
+        .create_watcher(root.clone(), true, false, vec![], vec![], None)
+        .await
+        .expect_err("busy manager refuses a recursive watch");
+    assert_eq!(refused.code(), tonic::Code::ResourceExhausted);
+
+    let other = WatchManager::new(CancellationToken::new());
+    other
+        .create_watcher(root, true, false, vec![], vec![], None)
+        .await
+        .expect("another manager keeps its own scan budget");
+    other.shutdown().await;
+    busy.shutdown().await;
+}

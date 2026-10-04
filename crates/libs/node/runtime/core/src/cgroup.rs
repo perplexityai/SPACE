@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use pplx_space_common_core::types::{SandboxId, VcpuCount};
 
-const CGROUP_BASE: &str = "/sys/fs/cgroup/space";
+use crate::cgroup_paths::{CGROUP_BASE, jailer_cgroup_path};
 const REMOVE_ATTEMPTS: usize = 55;
 const REMOVE_FAST_RETRY_ATTEMPTS: usize = 50;
 const REMOVE_FAST_RETRY_DELAY: Duration = Duration::from_millis(5);
@@ -694,10 +694,6 @@ fn sidecar_cgroup_path_str(sandbox_id: &str) -> String {
 
 fn sidecar_cgroup_path_buf(sandbox_id: &str) -> PathBuf {
     PathBuf::from(sidecar_cgroup_path_str(sandbox_id))
-}
-
-fn jailer_cgroup_path(sandbox_id: &str) -> PathBuf {
-    PathBuf::from(format!("{CGROUP_BASE}/{sandbox_id}"))
 }
 
 fn remove_cgroup_path(

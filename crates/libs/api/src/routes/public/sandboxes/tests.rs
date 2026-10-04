@@ -755,28 +755,22 @@ fn rollback_request_is_only_required_for_rollback_action() {
 }
 
 #[test]
-fn public_stats_uses_prefixed_sandbox_id() {
+fn public_stats_carry_every_sandbox_manager_value_under_the_public_id() {
     let sandbox_id = PublicSandboxId::new();
-    let stats = serde_json::json!({
-        "sandbox_id": sandbox_id.as_uuid().to_string(),
-        "cpu_max": "200000 100000",
-        "memory_max": 1024,
-        "memory_current": 512,
-        "pids_max": 128,
-        "pids_current": 2,
-        "cpu_usage_usec": 42,
-        "network_tx_bytes": 10,
-        "network_rx_bytes": 11,
-        "net_gateway_reachable": true,
-        "tcp_active_connections": 1,
-        "tcp_total_connections": 2,
-        "tcp_denied_connections": 3,
-        "udp_active_mappings": 4,
-        "bytes_forwarded": 5,
-    });
-    let response = public_stats_response(sandbox_id, stats).unwrap();
+    let response = public_stats_response(
+        sandbox_id,
+        pplx_space_sbx_mgr_client::proto::StatsResponse {
+            sandbox_id: "node-local-id".to_string(),
+            cpu_max: "200000 100000".to_string(),
+            cpu_usage_usec: 42,
+            tcp_denied_connections: 3,
+            ..Default::default()
+        },
+    );
     assert_eq!(response.sandbox_id, sandbox_id);
+    assert_eq!(response.cpu_max, "200000 100000");
     assert_eq!(response.cpu_usage_usec, 42);
+    assert_eq!(response.tcp_denied_connections, 3);
 }
 
 #[test]

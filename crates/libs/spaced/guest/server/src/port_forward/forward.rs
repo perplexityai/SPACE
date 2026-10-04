@@ -20,6 +20,25 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 
+/// A forwarding listener that releases its port when dropped, including when
+/// the per-port task is aborted. A child forked by a concurrent process spawn
+/// holds a copy of the listening socket until it execs; closing only this
+/// descriptor would keep the socket listening, so a reopen of the port would
+/// fail with `EADDRINUSE` and report `Direct`. Shutting the socket down takes
+/// every copy out of the listening state, and the port can be bound again.
+struct ReleasingListener(TcpListener);
+
+impl Drop for ReleasingListener {
+    fn drop(&mut self) {
+        use std::os::fd::AsRawFd;
+        if let Err(error) =
+            nix::sys::socket::shutdown(self.0.as_raw_fd(), nix::sys::socket::Shutdown::Both)
+        {
+            tracing::debug!(%error, "failed to shut down a released port-forward listener");
+        }
+    }
+}
+
 const LOOPBACK_DIAL_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_IDLE_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 const ACCEPT_FAILURE_WARNING_INTERVAL: Duration = Duration::from_secs(60);
@@ -65,6 +84,8 @@ pub(super) async fn run(
     cancel: CancellationToken,
 ) {
     tracing::info!(%bind_addr, %dial_addr, "port-forward: listening");
+    let listener = ReleasingListener(listener);
+    let listener = &listener.0;
 
     loop {
         tokio::select! {
