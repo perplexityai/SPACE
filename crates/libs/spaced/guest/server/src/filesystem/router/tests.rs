@@ -35,6 +35,19 @@ async fn connected_worker(
     tokio::task::JoinHandle<io::Result<(u64, u64)>>,
     tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
 ) {
+    let (channel, proxy, server, _relayed) = connected_counted_worker(router).await;
+    (channel, proxy, server)
+}
+
+/// A worker behind a proxy that counts the bytes the worker sends.
+async fn connected_counted_worker(
+    router: &FilesystemRouter,
+) -> (
+    Channel,
+    tokio::task::JoinHandle<io::Result<(u64, u64)>>,
+    tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
+    Arc<std::sync::atomic::AtomicU64>,
+) {
     let (client_stream, proxy_from_client) =
         std::os::unix::net::UnixStream::pair().expect("client socketpair");
     let (proxy_to_server, server_stream) =
@@ -55,8 +68,29 @@ async fn connected_worker(
         tokio::net::UnixStream::from_std(proxy_to_server).expect("tokio proxy server stream");
     let server_stream =
         tokio::net::UnixStream::from_std(server_stream).expect("tokio server stream");
+    let relayed = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let counted = Arc::clone(&relayed);
     let proxy = tokio::spawn(async move {
-        tokio::io::copy_bidirectional(&mut proxy_from_client, &mut proxy_to_server).await
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (mut from_client, mut to_client) = proxy_from_client.split();
+        let (mut from_server, mut to_server) = proxy_to_server.split();
+        let upstream = tokio::io::copy(&mut from_client, &mut to_server);
+        let downstream = async {
+            let mut buffer = vec![0_u8; 64 * 1024];
+            let mut total = 0_u64;
+            loop {
+                let read = from_server.read(&mut buffer).await?;
+                if read == 0 {
+                    return Ok::<_, io::Error>(total);
+                }
+                counted.fetch_add(read as u64, std::sync::atomic::Ordering::Relaxed);
+                total += read as u64;
+                to_client
+                    .write_all(buffer.get(..read).unwrap_or_default())
+                    .await?;
+            }
+        };
+        tokio::try_join!(upstream, downstream)
     });
     let server = tokio::spawn(async move {
         Server::builder()
@@ -90,7 +124,7 @@ async fn connected_worker(
         .insert_test_client(current_user(), channel.clone())
         .await
         .expect("insert worker");
-    (channel, proxy, server)
+    (channel, proxy, server, relayed)
 }
 
 async fn stop_worker(
@@ -100,6 +134,110 @@ async fn stop_worker(
     proxy.abort();
     server.abort();
     let _ = tokio::join!(proxy, server);
+}
+
+// A read goes through a descriptor the worker opened as its user and the
+// router duplicated: the file's bytes never cross the worker's connection,
+// as relaying every chunk through the worker would make them.
+#[tokio::test]
+async fn a_read_streams_from_the_workers_descriptor_without_relaying_through_it() {
+    use futures_util::StreamExt;
+    let router = identity_router();
+    let (channel, _proxy, _server, relayed) = connected_counted_worker(&router).await;
+    router
+        .worker_pool()
+        .expect("worker backend")
+        .insert_test_client_in_this_process(current_user(), channel)
+        .await
+        .expect("worker with a reachable descriptor table");
+    let directory = tempfile::tempdir().expect("directory");
+    let path = directory.path().join("file");
+    let data: Vec<u8> = (0..=250_u8).cycle().take(1 << 20).collect();
+    std::fs::write(&path, &data).expect("file");
+    let before = relayed.load(std::sync::atomic::Ordering::Relaxed);
+
+    let mut stream = read_file(&router, &path).await;
+    let mut read = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        read.extend_from_slice(&chunk.expect("chunk").data);
+    }
+
+    assert_eq!(read, data);
+    let sent = relayed.load(std::sync::atomic::Ordering::Relaxed) - before;
+    assert!(
+        sent < 64 * 1024,
+        "the worker sent {sent} bytes for a 1 MiB read; only its descriptor should cross"
+    );
+}
+
+// The read counts against its worker's admission, which ends with the worker,
+// so the read ends too instead of outliving the limit a replacement starts
+// afresh, and the dead worker is retired as a relayed stream's failure would
+// retire it, so the user's next operation does not reach it.
+#[tokio::test]
+async fn a_read_through_a_workers_descriptor_ends_with_the_worker() {
+    use futures_util::StreamExt;
+    let router = identity_router();
+    let (channel, proxy, server) = connected_worker(&router).await;
+    router
+        .worker_pool()
+        .expect("worker backend")
+        .insert_test_client_in_this_process(current_user(), channel)
+        .await
+        .expect("worker with a reachable descriptor table");
+    let directory = tempfile::tempdir().expect("directory");
+    let path = directory.path().join("file");
+    let data: Vec<u8> = (0..=250_u8).cycle().take(1 << 20).collect();
+    std::fs::write(&path, &data).expect("file");
+
+    let pool = router.worker_pool().expect("worker backend");
+    let worker = router.worker(None).await.expect("cached worker");
+    let mut stream = read_file(&router, &path).await;
+    let mut read = stream
+        .next()
+        .await
+        .expect("first chunk")
+        .expect("chunk")
+        .data
+        .to_vec();
+    stop_worker(proxy, server).await;
+    let mut ended = None;
+    while let Some(chunk) = stream.next().await {
+        match chunk {
+            Ok(chunk) => read.extend_from_slice(&chunk.data),
+            Err(status) => ended = Some(status),
+        }
+    }
+
+    let status = ended.expect("the read fails once its worker is gone");
+    assert_eq!(status.code(), tonic::Code::Unavailable);
+    assert!(
+        read.len() < data.len(),
+        "the read stopped before the end of the file"
+    );
+    assert_eq!(read[..], data[..read.len()]);
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while pool.contains(&worker).await {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the dead worker is retired");
+}
+
+async fn read_file(router: &FilesystemRouter, path: &std::path::Path) -> GuestFileChunkStream {
+    Filesystem::read(
+        router,
+        Request::new(ReadRequest {
+            path: path.to_string_lossy().into_owned(),
+            offset: 0,
+            length: None,
+            user: None,
+        }),
+    )
+    .await
+    .expect("read")
+    .into_inner()
 }
 
 #[tokio::test]

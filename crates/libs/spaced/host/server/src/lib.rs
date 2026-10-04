@@ -231,11 +231,22 @@ struct SpacedHostServiceInner {
         LazyClient<BridgeGuestNetworkingClient<tonic::transport::Channel>>,
     host_control_client: LazyClient<HostControlClient<tonic::transport::Channel>>,
     bridge_retry_policy: RetryPolicy,
-    process_payload_slots: Arc<tokio::sync::Semaphore>,
-    process_request_queue: Arc<tokio::sync::Semaphore>,
+    /// Payload budgets of the process and filesystem services, shared by
+    /// every listener that serves them.
+    process_admission: pplx_space_common_grpc::QueuedSlots,
+    filesystem_admission: pplx_space_common_grpc::QueuedSlots,
     guest_readiness: GuestReadinessCoordinator,
     guest_signal_rate: std::sync::Mutex<GuestSignalRateState>,
     #[cfg(any(test, feature = "test-support"))]
     host_peer_authorization: SpacedHostPeerAuthorization,
     host_peer_authorizer: UdsPeerAuthorizer,
+}
+
+/// `slots` payload slots with the shared bounded queue in front of them.
+fn payload_admission(slots: usize) -> pplx_space_common_grpc::QueuedSlots {
+    pplx_space_common_grpc::QueuedSlots::new(Arc::new(tokio::sync::Semaphore::new(slots)))
+        .with_queue(
+            pplx_space_spaced_common::admission_queue::WAITERS,
+            pplx_space_spaced_common::admission_queue::MAX_WAIT,
+        )
 }

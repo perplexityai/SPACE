@@ -618,11 +618,14 @@ fn insert_file_mutation_paths(paths: &mut Map<String, Value>, idempotency_key_pa
         json!({
             "post": {
                 "summary": "Write bounded bytes to a guest file path",
+                "description": "`data_base64` carries at most 16 MiB of file content. The request body limit covers that payload's base64 and the other fields, plus room for encoders that escape `/` as `\\/` at up to twice the rate of uniformly distributed data. A payload near 16 MiB whose base64 is mostly `/` (long runs of 0xff bytes) can exceed the limit when escaped; send it without escaping `/`, or split it across writes with `append`. Creating a file, or overwriting a regular file that the writing user owns with no other hard links and no access ACL, replaces the destination with a temporary file where it can, which publishes the new content atomically: readers see the previous content (or no file) or the new, never a partial file. A destination that cannot be renamed over (such as a bind mount), a directory that refuses the temporary file, appends and other files are written in place, without that guarantee, and synced before the write is acknowledged. Acknowledgement does not guarantee that a created or overwritten file persists across a sandbox crash, a forced stop or a host failure, and a writeback error can surface after it. An ordinary stop attempts to flush the sandbox's root filesystem first, but proceeds if that attempt fails or times out. No persistence deadline is promised.",
                 "parameters": [idempotency_key_parameter.clone()],
                 "responses": {
                     "200": { "description": "Write result" },
                     "400": { "description": "Invalid file write request" },
-                    "404": { "description": "Sandbox or parent path not found" }
+                    "404": { "description": "Sandbox or parent path not found" },
+                    "412": { "description": "The sandbox's disk or quota is full; free space before retrying" },
+                    "413": { "description": "The request body exceeds the write limit" }
                 }
             }
         }),

@@ -411,8 +411,27 @@ pub(crate) fn pool_store_error(
 
 impl From<tonic::Status> for ControllerError {
     fn from(status: tonic::Status) -> Self {
+        if is_guest_storage_full(&status) {
+            // Retrying cannot succeed until something frees space in the
+            // sandbox, so this must not surface as a retryable rate limit.
+            return Self::new(
+                StatusCode::PRECONDITION_FAILED,
+                format!("sandbox storage is full: {}", status.message()),
+            );
+        }
         Self::new(http_status_for_grpc_code(status.code()), status.to_string())
     }
+}
+
+/// Whether a guest filesystem call failed because the sandbox's disk or quota
+/// is full, as the guest marks it.
+fn is_guest_storage_full(status: &tonic::Status) -> bool {
+    status.code() == tonic::Code::ResourceExhausted
+        && status
+            .metadata()
+            .get(pplx_space_common_core::spaced::ERROR_REASON_METADATA_KEY)
+            .and_then(|reason| reason.to_str().ok())
+            == Some(pplx_space_common_core::spaced::GUEST_STORAGE_FULL)
 }
 
 impl IntoResponse for ControllerError {

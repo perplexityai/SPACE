@@ -249,6 +249,7 @@ impl NodeApiEndpointConfig {
 pub fn configure_node_api_endpoint(endpoint: Endpoint, config: NodeApiEndpointConfig) -> Endpoint {
     let endpoint = endpoint
         .tcp_nodelay(true)
+        .max_frame_size(pplx_space_common_grpc::BULK_HTTP2_MAX_FRAME_SIZE)
         .connect_timeout(config.connect_timeout)
         .http2_keep_alive_interval(config.http2_keep_alive_interval)
         .keep_alive_timeout(config.http2_keep_alive_timeout);

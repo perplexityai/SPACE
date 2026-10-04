@@ -259,14 +259,14 @@ async fn read_relays_to_guest_bridge() {
     .await
     .expect("read timed out")
     .expect("read response");
-    assert_eq!(stream.message().await.unwrap().unwrap().data, b"bc");
+    assert_eq!(&stream.message().await.unwrap().unwrap().data[..], b"bc");
     let mut stopping = tokio::spawn(fixture.stop_gracefully());
     // A live stream belongs to the drain, even after new admission closes.
     tokio::time::timeout(Duration::from_millis(20), &mut stopping)
         .await
         .expect_err("active stream holds drain");
     read_continue.notify_one();
-    assert_eq!(stream.message().await.unwrap().unwrap().data, b"d");
+    assert_eq!(&stream.message().await.unwrap().unwrap().data[..], b"d");
     assert!(stream.message().await.unwrap().is_none());
     stopping.await.unwrap();
     bridge_task.abort();

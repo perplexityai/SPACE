@@ -32,6 +32,7 @@ pub async fn connect_vsock_channel(
     port: u32,
 ) -> Result<tonic::transport::Channel, VsockConnectError> {
     let endpoint = tonic::transport::Endpoint::try_from("http://[::]:50051")
+        .map(|endpoint| endpoint.max_frame_size(crate::BULK_HTTP2_MAX_FRAME_SIZE))
         .map_err(VsockConnectError::Endpoint)?;
     endpoint
         .connect_with_connector(tower::service_fn(move |_| async move {
@@ -75,6 +76,7 @@ pub async fn connect_firecracker_vsock_channel_with_expected_peer(
 ) -> Result<tonic::transport::Channel, FirecrackerVsockConnectError> {
     let path = vsock_uds_path.to_path_buf();
     let endpoint = tonic::transport::Endpoint::try_from("http://[::]:50051")
+        .map(|endpoint| endpoint.max_frame_size(crate::BULK_HTTP2_MAX_FRAME_SIZE))
         .map_err(FirecrackerVsockConnectError::Endpoint)?;
     let connection_claimed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     endpoint

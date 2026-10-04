@@ -406,7 +406,7 @@ impl SpacedGuestService {
         pplx_space_common_grpc::RequestAdmission::new(
             ProcessServer::new(self.clone())
                 .max_decoding_message_size(process_limits::MAX_MESSAGE_BYTES),
-            self.inner.process_payload_slots.clone(),
+            pplx_space_common_grpc::QueuedSlots::new(self.inner.process_payload_slots.clone()),
             process_limits::PAYLOAD_METHODS,
         )
     }

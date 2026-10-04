@@ -3,9 +3,10 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::time::Duration;
 
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::OwnedSemaphorePermit;
+
+use crate::queued_slots::{QueuedSlots, SlotRequest};
 use tonic::{Status, body::Body};
 use tower::Service;
 
@@ -17,9 +18,10 @@ pub struct RequestPermit {
 }
 
 /// Admission for selected request payloads (including uploads).
-/// Clones/listeners must share `slots`. Unselected methods are unaffected.
-/// By default overload is rejected without polling the body. An optional
-/// bounded queue waits briefly for admission, still without polling the body.
+/// Clones/listeners must share one [`QueuedSlots`]. Unselected methods are
+/// unaffected. Overload is rejected, or waits in the slots' bounded queue if
+/// they have one, without polling the body; a queued request's deadline
+/// includes time before the returned future is first polled.
 /// Each selected method specifies its slot cost; larger decoded payloads can
 /// consume more of the same budget without creating a second admission queue.
 /// Admission ends when response headers open, not when a response stream ends.
@@ -27,26 +29,17 @@ pub struct RequestPermit {
 #[derive(Clone, Debug)]
 pub struct RequestAdmission<S> {
     inner: S,
-    slots: Arc<Semaphore>,
+    slots: QueuedSlots,
     methods: &'static [(&'static str, u32)],
-    queue: Option<(Arc<Semaphore>, Duration)>,
 }
 
 impl<S> RequestAdmission<S> {
-    pub fn new(inner: S, slots: Arc<Semaphore>, methods: &'static [(&'static str, u32)]) -> Self {
+    pub fn new(inner: S, slots: QueuedSlots, methods: &'static [(&'static str, u32)]) -> Self {
         Self {
             inner,
             slots,
             methods,
-            queue: None,
         }
-    }
-
-    /// Queue capacity must be shared by every listener using the payload budget.
-    /// The deadline includes time before the returned future is first polled.
-    pub fn with_queue(mut self, waiting: Arc<Semaphore>, max_wait: Duration) -> Self {
-        self.queue = Some((waiting, max_wait));
-        self
     }
 }
 
@@ -69,61 +62,44 @@ where
 
     fn call(&mut self, mut request: http::Request<Body>) -> Self::Future {
         let method = request.uri().path().rsplit('/').next().unwrap_or("");
-        let permit =
-            if let Some((_, weight)) = self.methods.iter().find(|(name, _)| *name == method) {
-                let Ok(permit) = self.slots.clone().try_acquire_many_owned(*weight) else {
-                    if let Some((waiting, max_wait)) = &self.queue
-                        && let Ok(waiting) = waiting.clone().try_acquire_owned()
-                    {
-                        let slots = self.slots.clone();
-                        let weight = *weight;
-                        let deadline = tokio::time::Instant::now() + *max_wait;
-                        // Move the ready service into the future, not its clone.
-                        let replacement = self.inner.clone();
-                        let mut inner = std::mem::replace(&mut self.inner, replacement);
-                        return Box::pin(async move {
-                            let admission =
-                                tokio::time::timeout_at(deadline, slots.acquire_many_owned(weight))
-                                    .await
-                                    .ok()
-                                    .and_then(Result::ok)
-                                    .filter(|_| tokio::time::Instant::now() < deadline);
-                            drop(waiting);
-                            let Some(permit) = admission else {
-                                return Ok(Status::resource_exhausted(
-                                    "payload request capacity exhausted",
-                                )
-                                .into_http());
-                            };
-                            let permit = RequestPermit {
-                                _permit: Arc::new(permit),
-                            };
-                            request.extensions_mut().insert(permit.clone());
-                            let _permit = permit;
-                            inner.call(request).await
-                        });
-                    }
-                    return Box::pin(async {
-                        Ok(
-                            Status::resource_exhausted("payload request capacity exhausted")
-                                .into_http(),
-                        )
+        let permit = match self.methods.iter().find(|(name, _)| *name == method) {
+            None => None,
+            Some((_, weight)) => match self.slots.request(*weight) {
+                SlotRequest::Admitted(permit) => {
+                    let permit = RequestPermit {
+                        _permit: Arc::new(permit),
+                    };
+                    request.extensions_mut().insert(permit.clone());
+                    Some(permit)
+                }
+                SlotRequest::Queued(wait) => {
+                    let replacement = self.inner.clone();
+                    let mut inner = std::mem::replace(&mut self.inner, replacement);
+                    return Box::pin(async move {
+                        let Some(permit) = wait.admitted().await else {
+                            return Ok(capacity_exhausted());
+                        };
+                        let permit = RequestPermit {
+                            _permit: Arc::new(permit),
+                        };
+                        request.extensions_mut().insert(permit.clone());
+                        let _permit = permit;
+                        inner.call(request).await
                     });
-                };
-                let permit = RequestPermit {
-                    _permit: Arc::new(permit),
-                };
-                request.extensions_mut().insert(permit.clone());
-                Some(permit)
-            } else {
-                None
-            };
+                }
+                SlotRequest::Rejected => return Box::pin(async { Ok(capacity_exhausted()) }),
+            },
+        };
         let future = self.inner.call(request);
         Box::pin(async move {
             let _permit = permit;
             future.await
         })
     }
+}
+
+fn capacity_exhausted() -> http::Response<Body> {
+    Status::resource_exhausted("payload request capacity exhausted").into_http()
 }
 
 #[cfg(test)]

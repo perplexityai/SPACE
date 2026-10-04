@@ -19,6 +19,26 @@ fn router() -> FilesystemRouter {
     )
 }
 
+/// A router whose file operations are rejected at once when every slot is
+/// busy, for tests about rejection rather than the queue.
+#[cfg_attr(
+    target_os = "linux",
+    allow(clippy::panic, reason = "the test router is always direct")
+)]
+fn router_without_file_operation_queue() -> FilesystemRouter {
+    let mut router = router();
+    #[cfg(not(target_os = "linux"))]
+    let Backend::Direct(service) = &mut router.backend;
+    #[cfg(target_os = "linux")]
+    let Backend::Direct(service) = &mut router.backend else {
+        panic!("direct test executor")
+    };
+    service.operation_admission = pplx_space_common_grpc::QueuedSlots::new(Arc::new(
+        tokio::sync::Semaphore::new(super::super::MAX_CONCURRENT_FILE_OPERATIONS),
+    ));
+    router
+}
+
 #[tokio::test]
 async fn parent_cancellation_stops_direct_watches_before_drain() {
     let directory = tempfile::tempdir().unwrap();
@@ -85,19 +105,14 @@ async fn wait_for(mut condition: impl FnMut() -> bool) {
 #[tokio::test]
 async fn watch_setup_shares_file_admission_but_live_watches_release_it() {
     let directory = tempfile::tempdir().expect("directory");
-    let router = router();
+    let router = router_without_file_operation_queue();
     #[cfg(not(target_os = "linux"))]
     let Backend::Direct(service) = &router.backend;
     #[cfg(target_os = "linux")]
     let Backend::Direct(service) = &router.backend else {
         panic!("direct test executor")
     };
-    let slots = service
-        .operation_slots
-        .clone()
-        .acquire_many_owned(8)
-        .await
-        .unwrap();
+    let slots = service.operation_admission.acquire(8).await.unwrap();
     let path = directory.path().display().to_string();
     let results = [
         service
@@ -137,11 +152,10 @@ async fn watch_setup_shares_file_admission_but_live_watches_release_it() {
         .await
         .expect("capacity recovered");
     assert!(
-        service
-            .operation_slots
-            .clone()
-            .try_acquire_many_owned(8)
-            .is_ok(),
+        matches!(
+            service.operation_admission.request(8),
+            pplx_space_common_grpc::SlotRequest::Admitted(_)
+        ),
         "stream lifetime must not retain setup admission"
     );
     router.drain().await;
@@ -152,7 +166,7 @@ async fn worker_admission_rejection_allows_same_key_retry_after_capacity_recover
     use pplx_space_spaced_common::proto::bridge_guest::{WriteOpen, write_request::Message};
 
     let directory = tempfile::tempdir().expect("directory");
-    let router = router();
+    let router = router_without_file_operation_queue();
     #[cfg(not(target_os = "linux"))]
     let Backend::Direct(service) = &router.backend;
     #[cfg(target_os = "linux")]
@@ -166,9 +180,8 @@ async fn worker_admission_rejection_allows_same_key_retry_after_capacity_recover
         tokio::fs::write(&path, b"before").await.expect("seed");
         let mut slots = Some(
             service
-                .operation_slots
-                .clone()
-                .acquire_many_owned(8)
+                .operation_admission
+                .acquire(8)
                 .await
                 .expect("occupy file slots"),
         );

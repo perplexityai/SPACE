@@ -109,6 +109,7 @@ async fn connect_uds_channel_inner(
 ) -> Result<tonic::transport::Channel, UdsConnectError> {
     let path = socket_path.to_path_buf();
     let endpoint = tonic::transport::Endpoint::try_from("http://[::]:50051")
+        .map(|endpoint| endpoint.max_frame_size(crate::BULK_HTTP2_MAX_FRAME_SIZE))
         .map_err(UdsConnectError::Endpoint)?;
     // A channel authenticated only by a PID must not transparently reconnect:
     // the PID can be reused after the original peer exits. The caller can

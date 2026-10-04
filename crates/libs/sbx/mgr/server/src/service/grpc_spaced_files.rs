@@ -587,10 +587,11 @@ impl SandboxManagerService {
             .await?;
         route_auth.authorize_sandbox(&sandbox)?;
         let client = self.connect_spaced_host(&sandbox).await?;
-        let mut entries = Vec::new();
-        for entry in operation.entries.iter().cloned() {
-            entries.push(write_batch_entry_to_host(entry));
-        }
+        let entries = operation
+            .entries
+            .into_iter()
+            .map(write_batch_entry_to_host)
+            .collect();
         let response = client
             .write_batch_as_user(
                 entries,

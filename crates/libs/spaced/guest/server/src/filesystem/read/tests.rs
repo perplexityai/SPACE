@@ -52,9 +52,56 @@ async fn fifo_read_rejects_without_a_writer_and_returns_admission() {
     .expect("normal read");
     use futures_util::StreamExt;
     assert_eq!(
-        stream.next().await.expect("chunk").expect("read").data,
+        &stream.next().await.expect("chunk").expect("read").data[..],
         b"data"
     );
     assert!(stream.next().await.is_none());
     assert_eq!(slots.available_permits(), 1);
+}
+
+// A read whose reader has stopped taking chunks still ends when `ended`
+// completes, and releases what it holds without waiting for the reader; the
+// reader then gets the chunks already queued, followed by the failure.
+#[tokio::test]
+async fn a_stalled_read_releases_its_guard_when_it_ends() {
+    use futures_util::StreamExt;
+    let directory = tempfile::tempdir().expect("directory");
+    let path = directory.path().join("file");
+    let data: Vec<u8> = (0..=250_u8).cycle().take(1 << 20).collect();
+    std::fs::write(&path, &data).expect("file");
+    let slots = Arc::new(tokio::sync::Semaphore::new(1));
+    let (end, ended) = tokio::sync::oneshot::channel::<()>();
+    let mut stream = stream_file(
+        std::fs::File::open(&path).expect("open"),
+        None,
+        slots.clone().try_acquire_owned().expect("admission"),
+        async move {
+            let _ = ended.await;
+            Status::unavailable("worker ended")
+        },
+    );
+    // Take nothing, so the queue fills and the read waits for room in it.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert_eq!(slots.available_permits(), 0, "the read holds its guard");
+    end.send(()).expect("end the read");
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while slots.available_permits() == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the read releases its guard while its reader is stalled");
+
+    let mut read = Vec::new();
+    let mut failure = None;
+    while let Some(chunk) = stream.next().await {
+        match chunk {
+            Ok(chunk) => read.extend_from_slice(&chunk.data),
+            Err(status) => failure = Some(status),
+        }
+    }
+    let failure = failure.expect("the stream ends with the failure");
+    assert_eq!(failure.code(), tonic::Code::Unavailable);
+    assert!(read.len() < data.len(), "the read stopped before the end");
+    assert!(data.starts_with(&read), "the queued chunks arrive in order");
 }

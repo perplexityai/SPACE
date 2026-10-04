@@ -19,7 +19,10 @@ fn main() -> anyhow::Result<()> {
             ".space.spaced.operations.v1.SendInputRequest",
             "#[derive(zeroize::Zeroize, zeroize::ZeroizeOnDrop)]",
         )
-        .skip_debug([".space.spaced.operations.v1.SendInputRequest"]);
+        .skip_debug([".space.spaced.operations.v1.SendInputRequest"])
+        // File bytes relay through several hops; as `Bytes`, a decoded chunk
+        // is a slice of the received buffer instead of a new copy.
+        .bytes(".space.spaced.operations.v1.FileChunk.data");
     pplx_space_common_proto_build::compile_protos(
         operations_builder,
         std::slice::from_ref(&operations_proto),
