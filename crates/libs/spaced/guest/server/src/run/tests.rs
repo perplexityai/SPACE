@@ -78,3 +78,24 @@ fn unix_stop_signals_drain_the_service() {
         }
     }
 }
+
+#[test]
+fn bounded_runtime_shutdown_does_not_wait_for_stuck_blocking_threads() {
+    let (release, wait) = std::sync::mpsc::channel::<()>();
+    let started = std::time::Instant::now();
+    super::block_on_bounded(
+        async move {
+            // Stands in for a thread stuck inside a child `spawn`.
+            tokio::task::spawn_blocking(move || {
+                let _ = wait.recv_timeout(std::time::Duration::from_secs(30));
+            });
+        },
+        std::time::Duration::from_millis(50),
+    )
+    .unwrap();
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "runtime shutdown waited for a stuck blocking thread"
+    );
+    drop(release);
+}

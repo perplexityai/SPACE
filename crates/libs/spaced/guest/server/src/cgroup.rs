@@ -63,6 +63,15 @@ pub(crate) struct GuestCgroups {
 }
 
 impl GuestCgroups {
+    /// Place spawned workloads by writing to `workloads_procs`, which a test
+    /// can point at a full pipe to hold a child between fork and exec.
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn with_workloads_procs(workloads_procs: File) -> Self {
+        Self {
+            workloads_procs: Arc::new(workloads_procs),
+        }
+    }
+
     /// Set up the supervisor/workloads split and return a handle used to place
     /// spawned workloads. Returns `None` — degrading to the prior shared-cgroup
     /// behavior — on any non-Linux target or setup failure. Never panics.

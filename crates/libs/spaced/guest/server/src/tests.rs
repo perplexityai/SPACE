@@ -128,7 +128,7 @@ async fn disabled_listeners_observe_shutdown() {
     );
     shutdown.cancel();
     // Test the disabled listeners directly, without unrelated tests' shared
-    // process-spawn lock advancing this runtime's paused clock.
+    // process-start gate advancing this runtime's paused clock.
     let (local, bridge) = tokio::time::timeout(Duration::from_secs(1), async {
         tokio::join!(
             service.clone().run_local_server(),

@@ -453,6 +453,11 @@ ExecStartPre=-/bin/mknod -m 666 /dev/vsock c 10 241
 ExecStart=/usr/local/bin/spaced-svc
 Restart=always
 RestartSec=2
+# The default KillMode (control-group) kills every process left in the unit's
+# cgroup on stop, workloads included. The stop deadline, shorter than the 90s
+# default, covers the daemon's 10s drain plus its 5s telemetry and 5s runtime
+# shutdown bounds.
+TimeoutStopSec=30
 StandardOutput=journal+console
 StandardError=journal+console
 

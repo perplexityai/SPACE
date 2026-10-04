@@ -6,7 +6,11 @@ use std::sync::{Mutex, MutexGuard};
 
 // Retry evidence belongs to this daemon lifetime. A restart loses these records;
 // callers cannot infer exactly-once execution across that boundary.
-const MAX_IDEMPOTENCY_RECORDS: usize = 4_096;
+// Every record is kept for `IDEMPOTENCY_RECORD_TTL`, so this caps the
+// sustained rate of keyed operations (process starts, file mutations) at
+// MAX / TTL per second. Records are small; `MAX_IDEMPOTENCY_KEY_BYTES` bounds
+// their memory.
+const MAX_IDEMPOTENCY_RECORDS: usize = 16_384;
 const MAX_IDEMPOTENCY_KEY_BYTES: usize = 16 * 1024 * 1024;
 const MAX_CONCURRENT_IDEMPOTENCY_LOOKUPS: usize = 1_024;
 const IDEMPOTENCY_PRUNE_INTERVAL: Duration = Duration::from_secs(1);

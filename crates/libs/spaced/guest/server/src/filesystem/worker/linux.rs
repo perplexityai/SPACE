@@ -519,11 +519,20 @@ impl WorkerPool {
             .map_err(worker_io_status)?;
         let router_stream =
             tokio::net::UnixStream::from_std(router_stream).map_err(worker_io_status)?;
-        let child = {
-            let _spawn_guard = crate::GUEST_CHILD_SPAWN_LOCK.lock().await;
-            command.spawn().map_err(worker_io_status)?
-        };
-        drop(command);
+        // The daemon creates its own descriptors CLOEXEC (std and tokio do,
+        // and process starts open PTYs CLOEXEC), so this spawn needs no lock
+        // against concurrent forks. `spawn` blocks until the worker execs, so
+        // it runs off the runtime threads. A caller cancelled meanwhile drops
+        // the spawned child, which `kill_on_drop` terminates.
+        let child = tokio::task::spawn_blocking(move || {
+            let child = command.spawn();
+            // Closes this process's copy of the worker's socket.
+            drop(command);
+            child
+        })
+        .await
+        .map_err(|error| Status::internal(format!("filesystem worker spawn task failed: {error}")))?
+        .map_err(worker_io_status)?;
 
         let stop_token = self.shutdown.child_token();
         let supervisor = Arc::new(Mutex::new(Some(supervise_worker(

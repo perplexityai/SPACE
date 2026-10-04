@@ -1209,6 +1209,97 @@ pub(super) async fn close_with_error(
     let _ = socket.close().await;
 }
 
+const MAX_CLIENT_FRAMES_DURING_OPEN: usize = 64;
+const MAX_CLIENT_BYTES_DURING_OPEN: usize = 1024 * 1024;
+/// How long a pong may wait for a client that stops reading before the client
+/// is treated as gone.
+const PONG_SEND_TIMEOUT: Duration = Duration::from_secs(5);
+
+enum OpenWatch<T> {
+    Opened(T, VecDeque<Message>),
+    ClientClosed,
+    Overflow,
+}
+
+/// Drive the initial backend open while reading the client socket, so a client
+/// that disconnects mid-open drops the open. Pings are answered as the session
+/// loop does; other frames are kept, in order and within a bound, for that loop.
+///
+/// A pong is sent alongside the open and the client read, never instead of
+/// them, so a client that stops reading cannot stall either. Only the latest
+/// unanswered ping is kept, which bounds pings as the limits bound other frames.
+async fn open_while_watching_client<T, S, K>(
+    open: impl Future<Output = T>,
+    source: &mut S,
+    sink: &mut K,
+) -> OpenWatch<T>
+where
+    S: futures_util::Stream<Item = Result<Message, axum::Error>> + Unpin,
+    K: futures_util::Sink<Message> + Unpin,
+{
+    tokio::pin!(open);
+    let mut buffered = VecDeque::new();
+    let mut buffered_bytes = 0_usize;
+    // The payload of the ping to answer, and when its pong must be out by.
+    let mut pong: Option<(bytes::Bytes, tokio::time::Instant)> = None;
+    loop {
+        tokio::select! {
+            biased;
+            result = &mut open => return OpenWatch::Opened(result, buffered),
+            // A send interrupted by another branch is retried; a repeated pong
+            // is harmless.
+            sent = send_pong(sink, pong.clone()), if pong.is_some() => match sent {
+                Ok(()) => pong = None,
+                Err(()) => return OpenWatch::ClientClosed,
+            },
+            message = source.next() => match message {
+                None | Some(Err(_)) | Some(Ok(Message::Close(_))) => return OpenWatch::ClientClosed,
+                Some(Ok(Message::Ping(payload))) => {
+                    let deadline = pong.as_ref().map_or_else(
+                        || tokio::time::Instant::now() + PONG_SEND_TIMEOUT,
+                        |(_, deadline)| *deadline,
+                    );
+                    pong = Some((payload, deadline));
+                }
+                Some(Ok(message)) => {
+                    buffered_bytes = buffered_bytes.saturating_add(client_message_len(&message));
+                    buffered.push_back(message);
+                    if buffered.len() > MAX_CLIENT_FRAMES_DURING_OPEN
+                        || buffered_bytes > MAX_CLIENT_BYTES_DURING_OPEN
+                    {
+                        return OpenWatch::Overflow;
+                    }
+                }
+            },
+        }
+    }
+}
+
+/// Send a pending pong by its deadline; with none pending, never completes.
+async fn send_pong<K>(
+    sink: &mut K,
+    pong: Option<(bytes::Bytes, tokio::time::Instant)>,
+) -> Result<(), ()>
+where
+    K: futures_util::Sink<Message> + Unpin,
+{
+    let Some((payload, deadline)) = pong else {
+        return std::future::pending().await;
+    };
+    match tokio::time::timeout_at(deadline, sink.send(Message::Pong(payload))).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(_)) | Err(_) => Err(()),
+    }
+}
+
+fn client_message_len(message: &Message) -> usize {
+    match message {
+        Message::Text(text) => text.as_str().len(),
+        Message::Binary(data) | Message::Ping(data) | Message::Pong(data) => data.len(),
+        Message::Close(_) => 0,
+    }
+}
+
 pub(super) async fn bridge_process_session(
     state: DataPlaneState,
     session_id: DataPlaneSessionId,
@@ -1216,7 +1307,30 @@ pub(super) async fn bridge_process_session(
     socket: WebSocket,
 ) -> Result<(), StreamBridgeError> {
     let (mut sink, mut source) = socket.split();
-    let initial = open_native_process_stream(&state, session_id, &mut attached, None).await;
+    let open = open_native_process_stream(&state, session_id, &mut attached, None);
+    let (initial, buffered) = match open_while_watching_client(open, &mut source, &mut sink).await {
+        OpenWatch::Opened(initial, buffered) => (initial, buffered),
+        // Dropping the open resets the backend stream, which cancels a start
+        // that is still queued downstream.
+        OpenWatch::ClientClosed => return Ok(()),
+        // The open may already have passed the guest's start, so a fresh
+        // session could run the command twice; only re-attaching this one is
+        // safe, which is not what `retryable` tells a client.
+        OpenWatch::Overflow => {
+            let _ = send_server_frame(
+                &mut sink,
+                &DataPlaneServerFrame::Error {
+                    code: DataPlaneErrorCode::SessionNotReady,
+                    message: "too many client frames before the session was ready".to_string(),
+                    retryable: false,
+                },
+            )
+            .await;
+            let _ = sink.close().await;
+            return Ok(());
+        }
+    };
+    let mut source = futures_util::stream::iter(buffered.into_iter().map(Ok)).chain(source);
     let mut stream = match initial {
         Ok((_client, initial)) => initial,
         Err(error) => {
@@ -2986,3 +3100,6 @@ where
         }
     }
 }
+
+#[cfg(test)]
+mod tests;
