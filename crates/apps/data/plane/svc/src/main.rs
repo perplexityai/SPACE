@@ -20,6 +20,8 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 // the burst resident just as glibc does. Background threads purge on the decay
 // timer instead. jemalloc defines `malloc_conf` as a weak symbol, so this
 // definition replaces it; `_RJEM_MALLOC_CONF` still overrides it at startup.
+// The symbol is a C `const char *`: a reference to a sized array is a thin
+// pointer with that layout, where `&[u8]` would be a (pointer, length) pair.
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 #[unsafe(export_name = "_rjem_malloc_conf")]
 static MALLOC_CONF: &[u8; 23] = b"background_thread:true\0";
