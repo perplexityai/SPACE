@@ -758,6 +758,11 @@ async fn spaced_write_spooled(
         raw_file_write_error,
     )
     .await?;
+    // Unlinking is a blocking syscall too. Error paths above drop `upload`
+    // in place, which unlinks synchronously.
+    if let Err(error) = tokio::task::spawn_blocking(move || upload.close()).await {
+        tracing::warn!(%error, "ECW upload spool file removal task failed");
+    }
     Ok(route)
 }
 
@@ -770,13 +775,21 @@ struct SpooledUpload {
 
 impl SpooledUpload {
     async fn new() -> Result<Self, EcwProxyError> {
-        let tempfile = tempfile::Builder::new()
-            .prefix("space-ecw-upload-")
-            .tempfile()
-            .map_err(|error| {
-                tracing::warn!(%error, "failed to create ECW upload spool file");
-                EcwProxyError::internal("Failed to stage upload")
-            })?;
+        // Creating the file is a blocking syscall; keep it off the runtime.
+        let tempfile = tokio::task::spawn_blocking(|| {
+            tempfile::Builder::new()
+                .prefix("space-ecw-upload-")
+                .tempfile()
+        })
+        .await
+        .map_err(|error| {
+            tracing::warn!(%error, "ECW upload spool file creation task failed");
+            EcwProxyError::internal("Failed to stage upload")
+        })?
+        .map_err(|error| {
+            tracing::warn!(%error, "failed to create ECW upload spool file");
+            EcwProxyError::internal("Failed to stage upload")
+        })?;
         let (file, path) = tempfile.into_parts();
         Ok(Self {
             file: tokio::fs::File::from_std(file),

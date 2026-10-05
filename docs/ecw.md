@@ -173,6 +173,13 @@ return an explicit E2B-shaped `501`; unsupported methods on implemented envd
 routes return `405`. Service-port traffic is intercepted before envd routing,
 so these paths remain available to applications on user sandbox ports.
 
+`POST /files` accepts `multipart/form-data` and `application/octet-stream`
+uploads of up to 256 MiB per request, which the data plane streams to a spool
+file rather than holding in memory. A multipart request may carry at most 1000
+parts. JSON file writes (`{"path": …, "content": …}`, also used when the request
+has no `Content-Type`) are capped at 1 MiB of request body and return `413`
+above that; send larger files as multipart or octet-stream.
+
 ## Choose the SPACE API for new integrations
 
 Use ECW when an existing application needs E2B SDK compatibility. New SPACE

@@ -1,6 +1,6 @@
 use super::multipart::*;
 use super::*;
-use pplx_space_common_core::types::SandboxId;
+use pplx_space_common_core::types::{MAX_GUEST_PATH_BYTES, SandboxId};
 use std::{
     convert::Infallible,
     sync::{
@@ -370,7 +370,7 @@ fn content_disposition_parse_ignores_text_inside_quoted_values() {
         name: name.map(str::to_string),
         filename: filename.map(str::to_string),
     };
-    let cases: [(&[u8], ContentDispositionE2b); 9] = [
+    let cases: [(&[u8], ContentDispositionE2b); 14] = [
         (
             br#"form-data; name="file"; filename="a.txt""#,
             parsed(Some("file"), Some("a.txt")),
@@ -388,8 +388,8 @@ fn content_disposition_parse_ignores_text_inside_quoted_values() {
             parsed(Some("a filename=x"), Some("real.txt")),
         ),
         (
-            br#"form-data; filename="q\"; name=x"; NAME=file"#,
-            parsed(Some("file"), Some(r#"q"; name=x"#)),
+            br#"form-data; filename="q\" name=x"; NAME=file"#,
+            parsed(Some("file"), Some(r#"q" name=x"#)),
         ),
         // Browsers send `"` as `%22` and a backslash as itself.
         (
@@ -407,6 +407,29 @@ fn content_disposition_parse_ignores_text_inside_quoted_values() {
         (
             br#"form-data; filename="a.txt""#,
             parsed(None, Some("a.txt")),
+        ),
+        // A browser filename ending in a backslash, alone and followed by
+        // another parameter.
+        (
+            br#"form-data; name="file"; filename="dir\""#,
+            parsed(Some("file"), Some(r"dir\")),
+        ),
+        (
+            br#"form-data; filename="dir\" ; name="file""#,
+            parsed(Some("file"), Some(r"dir\")),
+        ),
+        // httpx and Go write quoted-pairs for backslashes and quotes.
+        (
+            br#"form-data; name="file"; filename="dir\\""#,
+            parsed(Some("file"), Some(r"dir\")),
+        ),
+        (
+            br#"form-data; name="file"; filename="dir\\f""#,
+            parsed(Some("file"), Some(r"dir\f")),
+        ),
+        (
+            br#"form-data; name="file"; filename="a\\\"b""#,
+            parsed(Some("file"), Some(r#"a\"b"#)),
         ),
     ];
     for (value, expected) in cases {
@@ -427,6 +450,20 @@ fn content_disposition_parse_ignores_text_inside_quoted_values() {
             "{shown}"
         );
     }
+}
+
+#[tokio::test]
+async fn multipart_file_part_with_an_impossible_filename_is_rejected_before_spooling() {
+    let filename = "f".repeat(MAX_GUEST_PATH_BYTES + 1);
+    let body = multipart_body(&[("file", Some(filename.as_str()), b"content")]);
+    let error = spool_multipart_uploads(Body::from(body), MULTIPART_BOUNDARY)
+        .await
+        .unwrap_err();
+    assert_eq!(error.status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        error.message,
+        format!("multipart filename exceeds {MAX_GUEST_PATH_BYTES} bytes")
+    );
 }
 
 #[tokio::test]

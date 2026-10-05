@@ -14,7 +14,7 @@ use axum::{
     http::{HeaderMap, StatusCode, header},
 };
 use futures_util::{Stream, stream};
-use pplx_space_common_core::types::GuestUserName;
+use pplx_space_common_core::types::{GuestUserName, MAX_GUEST_PATH_BYTES};
 
 use super::{
     E2B_FILE_CONTENT_LIMIT_BYTES, EcwProxyError, ResponseKind, ResponseOrigin, SpooledUpload,
@@ -104,6 +104,17 @@ pub(super) async fn spool_multipart_uploads_with_limit(
         let disposition = ContentDispositionE2b::parse(field.headers())?;
         let filename = disposition.filename.filter(|filename| !filename.is_empty());
         let is_file = disposition.name.as_deref() == Some("file");
+        // Filenames become guest paths later; reject an impossible one before
+        // holding it and spooling its part.
+        if is_file
+            && filename
+                .as_ref()
+                .is_some_and(|filename| filename.len() > MAX_GUEST_PATH_BYTES)
+        {
+            return Err(EcwProxyError::bad_request(format!(
+                "multipart filename exceeds {MAX_GUEST_PATH_BYTES} bytes"
+            )));
+        }
         let mut upload = if is_file {
             Some(SpooledUpload::new().await?)
         } else {
@@ -140,10 +151,15 @@ pub(super) struct ContentDispositionE2b {
 }
 
 impl ContentDispositionE2b {
-    /// Splits parameters on `;` outside quoted values. Inside a quoted value
-    /// only `\"` is an escape, matching what browsers and multer do; other
-    /// backslashes, such as Windows path separators, stay literal. The first
-    /// occurrence of a parameter wins. Unbalanced quotes, a quote inside an
+    /// Splits parameters on `;` outside quoted values. Clients disagree on
+    /// escaping inside quoted values: httpx and Go write `\\` and `\"` (RFC
+    /// 7230 quoted-pairs), while browsers, curl, and undici send `"` as `%22`
+    /// and backslashes as themselves. Both read correctly when `\\` and `\"`
+    /// are escapes, except a `\"` that ends the value, which is a literal
+    /// backslash before the closing quote (a browser filename ending in `\`).
+    /// So an escaped quote directly before `;` (an httpx filename containing
+    /// `";`) reads as the end of the value. Other backslashes, such as Windows
+    /// path separators, stay literal. The first occurrence of a parameter wins. Unbalanced quotes, a quote inside an
     /// unquoted value, and non-UTF-8 values reject the part instead of
     /// letting stray quotes reach the write path or a file part go unnamed.
     pub(super) fn parse(headers: &HeaderMap) -> Result<Self, EcwProxyError> {
@@ -156,7 +172,7 @@ impl ContentDispositionE2b {
         let (mut start, mut index, mut in_quotes) = (0, 0, false);
         while let Some(&byte) = value.get(index) {
             match byte {
-                b'\\' if in_quotes && value.get(index + 1) == Some(&b'"') => index += 1,
+                b'\\' if in_quotes && is_escape(value, index) => index += 1,
                 b'"' => in_quotes = !in_quotes,
                 b';' if !in_quotes => {
                     params.extend(value.get(start..index));
@@ -189,15 +205,17 @@ impl ContentDispositionE2b {
             let bytes = match raw.strip_prefix(b"\"") {
                 Some(rest) => {
                     let inner = rest.strip_suffix(b"\"").ok_or_else(malformed)?;
+                    // The closing quote is already stripped, so a trailing
+                    // backslash here is the literal one `is_escape` left alone.
                     let mut unescaped = Vec::with_capacity(inner.len());
                     let mut bytes = inner.iter().peekable();
                     while let Some(&byte) = bytes.next() {
-                        match byte {
-                            b'\\' if bytes.peek() == Some(&&b'"') => {
+                        match (byte, bytes.peek()) {
+                            (b'\\', Some(&&escaped @ (b'\\' | b'"'))) => {
                                 bytes.next();
-                                unescaped.push(b'"');
+                                unescaped.push(escaped);
                             }
-                            b'"' => return Err(malformed()),
+                            (b'"', _) => return Err(malformed()),
                             _ => unescaped.push(byte),
                         }
                     }
@@ -210,6 +228,21 @@ impl ContentDispositionE2b {
             slot.get_or_insert(text);
         }
         Ok(disposition)
+    }
+}
+
+/// Whether the backslash at `index`, inside a quoted value, escapes the next
+/// byte (see `ContentDispositionE2b::parse`).
+fn is_escape(value: &[u8], index: usize) -> bool {
+    match value.get(index + 1) {
+        Some(b'\\') => true,
+        Some(b'"') => !value
+            .get(index + 2..)
+            .unwrap_or_default()
+            .iter()
+            .find(|byte| !byte.is_ascii_whitespace())
+            .is_none_or(|&byte| byte == b';'),
+        _ => false,
     }
 }
 
