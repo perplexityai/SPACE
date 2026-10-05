@@ -1010,6 +1010,8 @@ fn sandbox_port_observation_is_fresh(observed_at: time::OffsetDateTime) -> bool 
 #[derive(Clone)]
 pub struct SandboxController {
     falcon_us2_egress: Option<crate::falcon_egress::FalconUs2Egress>,
+    tls_interception_exemptions:
+        Option<crate::tls_interception_exemptions::TlsInterceptionExemptions>,
     federated_grant_audience: pplx_space_common_core::types::FederatedGrantAudience,
     substrate: Substrate,
     cluster_admission: Option<std::sync::Arc<crate::cluster_admission::ClusterSandboxAdmission>>,
@@ -1035,6 +1037,14 @@ pub enum SandboxControllerInitError {
 }
 
 impl SandboxController {
+    pub(crate) fn with_tls_interception_exemptions(
+        mut self,
+        exemptions: Option<crate::tls_interception_exemptions::TlsInterceptionExemptions>,
+    ) -> Self {
+        self.tls_interception_exemptions = exemptions;
+        self
+    }
+
     pub(crate) fn with_falcon_us2_egress(
         mut self,
         egress: Option<crate::falcon_egress::FalconUs2Egress>,
@@ -1054,6 +1064,7 @@ impl SandboxController {
     pub fn new(substrate: Substrate) -> Self {
         Self {
             falcon_us2_egress: None,
+            tls_interception_exemptions: None,
             federated_grant_audience: crate::federated_identity::FederatedIdentityPolicy::default()
                 .grant_audience,
             substrate,
@@ -1068,6 +1079,7 @@ impl SandboxController {
     ) -> Self {
         Self {
             falcon_us2_egress: None,
+            tls_interception_exemptions: None,
             federated_grant_audience: crate::federated_identity::FederatedIdentityPolicy::default()
                 .grant_audience,
             substrate,

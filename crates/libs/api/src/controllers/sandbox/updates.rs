@@ -241,6 +241,14 @@ impl SandboxController {
         } else {
             "inherit_template_default"
         };
+        let policy_override = crate::tls_interception_exemptions::compose(
+            self.tls_interception_exemptions.as_ref(),
+            policy_override,
+            sandbox
+                .template_network_policy
+                .as_ref()
+                .map(|policy| &policy.0),
+        );
         let base_details = || {
             let mut details = SandboxEventDetails::default()
                 .operation(operation)

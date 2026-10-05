@@ -1075,6 +1075,11 @@ impl SandboxController {
         } else {
             req.network_policy.clone()
         };
+        let network_policy_override = crate::tls_interception_exemptions::compose(
+            self.tls_interception_exemptions.as_ref(),
+            network_policy_override,
+            Some(&template_network_policy),
+        );
         // A sandbox override takes precedence over the resolved template default.
         let tls_interception_on = !network_policy_override
             .as_ref()
