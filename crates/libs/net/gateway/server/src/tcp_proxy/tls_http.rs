@@ -5,7 +5,7 @@ use std::convert::Infallible;
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -15,6 +15,7 @@ use hyper::body::{Body as HttpBody, Bytes, Incoming};
 use hyper::client::conn::{http1, http2};
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
+use hyper_util::server::conn::auto;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::{Mutex, MutexGuard, OnceCell};
 use tokio_util::sync::CancellationToken;
@@ -140,7 +141,10 @@ impl HttpBody for ForwardingBody {
 }
 
 struct Session<F> {
-    protocol: HttpProtocol,
+    /// Protocol of the first request hyper parsed from the guest. Recorded
+    /// once for telemetry; every forwarding decision uses the version of the
+    /// request it is handling instead.
+    served: OnceLock<HttpProtocol>,
     binding: HostBinding,
     lease: Arc<CertificateLease>,
     connect: Mutex<Option<F>>,
@@ -151,16 +155,27 @@ struct Session<F> {
     draining: CancellationToken,
 }
 
+/// Serve inspected HTTP on an established guest TLS stream.
+///
+/// `negotiated` is the ALPN result and is telemetry only. The HTTP version
+/// actually served is detected from the guest's first bytes: an HTTP/2
+/// connection preface selects hyper's h2 server, anything else selects h1.
+/// Go's `net/http` offers `h2` to an `https://` forward proxy and then writes
+/// an HTTP/1.1 `CONNECT`; parsing that as h2 would answer the CONNECT with a
+/// SETTINGS frame and a `PROTOCOL_ERROR` GOAWAY.
+///
+/// `connect` receives the detected guest protocol so the origin leg can be
+/// negotiated to match what the guest actually speaks.
 pub(super) async fn serve<C, F, Fut, U>(
     guest: C,
-    protocol: HttpProtocol,
+    negotiated: HttpProtocol,
     binding: HostBinding,
     lease: Arc<CertificateLease>,
     connect: F,
 ) -> Result<(), TlsTransportError>
 where
     C: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-    F: FnOnce() -> Fut + Send + 'static,
+    F: FnOnce(HttpProtocol) -> Fut + Send + 'static,
     Fut: Future<Output = Result<(U, HttpProtocol), TlsTransportError>> + Send,
     U: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -168,7 +183,7 @@ where
     // Dropping this future on revocation also closes every origin socket.
     let _cancel = shutdown.clone().drop_guard();
     let session = Arc::new(Session {
-        protocol,
+        served: OnceLock::new(),
         binding,
         lease,
         connect: Mutex::new(Some(connect)),
@@ -180,42 +195,25 @@ where
     });
     let service = service_fn(|request: Request<Incoming>| {
         let session = session.clone();
+        let protocol = HttpProtocol::of(request.version());
+        session.observe(protocol, negotiated);
         let request = SanitizedRequest::try_from(request);
         async move {
             Ok::<_, Infallible>(match request {
                 Ok(request) => session.forward(request).await,
-                Err(_) => session.refuse("invalid_headers", StatusCode::BAD_REQUEST),
+                Err(_) => session.refuse(protocol, "invalid_headers", StatusCode::BAD_REQUEST),
             })
         }
     });
-    let result = match protocol {
-        HttpProtocol::Http1 => {
-            let connection = hyper::server::conn::http1::Builder::new()
-                .timer(TokioTimer::new())
-                .header_read_timeout(HEADER_TIMEOUT)
-                .max_headers(MAX_HEADERS)
-                .max_buf_size(MAX_HEADER_BYTES as usize)
-                .serve_connection(TokioIo::new(guest), service)
-                .with_upgrades();
-            tokio::pin!(connection);
-            tokio::select! {
-                result = &mut connection => result,
-                () = session.draining.cancelled() => {
-                    connection.as_mut().graceful_shutdown();
-                    connection.await
-                }
-            }
-        }
-        HttpProtocol::Http2 => {
-            let connection = guest_http2_builder().serve_connection(TokioIo::new(guest), service);
-            tokio::pin!(connection);
-            tokio::select! {
-                result = &mut connection => result,
-                () = session.draining.cancelled() => {
-                    connection.as_mut().graceful_shutdown();
-                    connection.await
-                }
-            }
+    let builder = guest_http_builder();
+    let connection = builder
+        .serve_connection_with_upgrades(TokioIo::new(FirstByteDeadline::new(guest)), service);
+    tokio::pin!(connection);
+    let result = tokio::select! {
+        result = &mut connection => result,
+        () = session.draining.cancelled() => {
+            connection.as_mut().graceful_shutdown();
+            connection.await
         }
     };
     session.upgrades.close();
@@ -223,12 +221,23 @@ where
     session.shutdown.cancel();
     session.tasks.close();
     session.tasks.wait().await;
-    result.map_err(Into::into)
+    result.map_err(guest_connection_error)
 }
 
-fn guest_http2_builder() -> hyper::server::conn::http2::Builder<TokioExecutor> {
-    let mut builder = hyper::server::conn::http2::Builder::new(TokioExecutor::new());
+/// One server for both HTTP versions. hyper-util's `auto` builder reads the
+/// guest's first bytes, compares them with the fixed HTTP/2 connection
+/// preface and hands the stream, bytes replayed, to the matching hyper server.
+/// The h1 and h2 limits are the ones the two dedicated builders used before.
+fn guest_http_builder() -> auto::Builder<TokioExecutor> {
+    let mut builder = auto::Builder::new(TokioExecutor::new());
     builder
+        .http1()
+        .timer(TokioTimer::new())
+        .header_read_timeout(HEADER_TIMEOUT)
+        .max_headers(MAX_HEADERS)
+        .max_buf_size(MAX_HEADER_BYTES as usize);
+    builder
+        .http2()
         .timer(TokioTimer::new())
         .max_concurrent_streams(MAX_STREAMS)
         .max_header_list_size(MAX_HEADER_BYTES)
@@ -240,13 +249,49 @@ fn guest_http2_builder() -> hyper::server::conn::http2::Builder<TokioExecutor> {
     builder
 }
 
+/// The `auto` connection boxes its error. Version detection fails with the
+/// guest socket's `io::Error`; everything after that is hyper's error.
+fn guest_connection_error(error: Box<dyn std::error::Error + Send + Sync>) -> TlsTransportError {
+    match error.downcast::<hyper::Error>() {
+        Ok(error) => TlsTransportError::Http(*error),
+        Err(error) => match error.downcast::<io::Error>() {
+            Ok(error) if error.kind() == io::ErrorKind::TimedOut => {
+                TlsTransportError::HeaderTimeout
+            }
+            Ok(error) => TlsTransportError::Downstream(*error),
+            // `auto` only surfaces the two error types above.
+            Err(error) => TlsTransportError::Downstream(io::Error::other(error)),
+        },
+    }
+}
+
 impl<F, Fut, U> Session<F>
 where
-    F: FnOnce() -> Fut + Send + 'static,
+    F: FnOnce(HttpProtocol) -> Fut + Send + 'static,
     Fut: Future<Output = Result<(U, HttpProtocol), TlsTransportError>> + Send,
     U: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    async fn sender(&self) -> Result<&Sender, TlsTransportError> {
+    /// Record the protocol hyper detected from the guest's first request. The
+    /// `tls.server` span carries `negotiated` (ALPN) from the handshake; this
+    /// fills `protocol` with what is actually being served.
+    fn observe(&self, protocol: HttpProtocol, negotiated: HttpProtocol) {
+        self.served.get_or_init(|| {
+            tracing::Span::current().record("protocol", protocol.as_str());
+            if protocol != negotiated {
+                tracing::info!(
+                    negotiated = negotiated.as_str(),
+                    protocol = protocol.as_str(),
+                    "guest speaks a different HTTP version than its ALPN selected"
+                );
+            }
+            protocol
+        });
+    }
+
+    /// The origin leg is established lazily, by the first request that passes
+    /// authorization. `guest_protocol` is that request's HTTP version so the
+    /// upstream ALPN offer can match what the guest actually speaks.
+    async fn sender(&self, guest_protocol: HttpProtocol) -> Result<&Sender, TlsTransportError> {
         self.upstream
             .get_or_try_init(|| async {
                 // A failed or cancelled initializer has consumed the connector.
@@ -258,7 +303,7 @@ where
                     .await
                     .take()
                     .ok_or(TlsTransportError::Invalidated)?;
-                let (io, protocol) = connect().await?;
+                let (io, protocol) = connect(guest_protocol).await?;
                 let io = TokioIo::new(UpstreamIo {
                     inner: io,
                     _lifetime: self.draining.clone().drop_guard(),
@@ -288,8 +333,12 @@ where
             .await
     }
 
-    fn forwarding_body(&self, body: Incoming, operation: &'static str) -> ForwardingBody {
-        ForwardingBody::new(body, self.protocol.as_str(), operation)
+    fn forwarding_body(
+        protocol: HttpProtocol,
+        body: Incoming,
+        operation: &'static str,
+    ) -> ForwardingBody {
+        ForwardingBody::new(body, protocol.as_str(), operation)
     }
 
     fn drive(&self, connection: impl Future<Output = Result<(), hyper::Error>> + Send + 'static) {
@@ -321,11 +370,16 @@ where
         );
     }
 
-    fn refuse(&self, reason: &'static str, status: StatusCode) -> Response<Body> {
-        self.record(reason, status);
+    fn refuse(
+        &self,
+        protocol: HttpProtocol,
+        reason: &'static str,
+        status: StatusCode,
+    ) -> Response<Body> {
+        Self::record(protocol, reason, status);
         let mut response = Response::new(Either::Right(Empty::new()));
         *response.status_mut() = status;
-        if self.protocol == HttpProtocol::Http1 {
+        if protocol == HttpProtocol::Http1 {
             response
                 .headers_mut()
                 .insert(header::CONNECTION, http::HeaderValue::from_static("close"));
@@ -333,22 +387,104 @@ where
         response
     }
 
-    fn record(&self, outcome: &'static str, status: StatusCode) {
+    fn record(protocol: HttpProtocol, outcome: &'static str, status: StatusCode) {
         pplx_space_metrics::gateway::domain_binding("tcp", "tls_http", outcome, None);
         tracing::debug!(
-            protocol = self.protocol.as_str(),
+            protocol = protocol.as_str(),
             outcome,
             status = status.as_u16(),
             "inspected HTTP request"
         );
         if !matches!(outcome, "allowed" | "websocket" | "connect_forwarded") {
             tracing::info!(
-                protocol = self.protocol.as_str(),
+                protocol = protocol.as_str(),
                 outcome,
                 status = status.as_u16(),
                 "inspected HTTP request refused"
             );
         }
+    }
+}
+
+/// Bounds the wait for a guest's first HTTP byte.
+///
+/// hyper's h1 server enforces `header_read_timeout` only once it owns the
+/// stream, and the `auto` version sniff that precedes it has no timer, so a
+/// guest that finishes TLS and then sends nothing would otherwise hold the
+/// session until the lease is invalidated. The deadline is armed when the
+/// stream is created and disarmed by the first byte read; after that hyper's
+/// own h1 header and h2 keep-alive timers apply unchanged.
+struct FirstByteDeadline<T> {
+    inner: T,
+    deadline: Option<Pin<Box<tokio::time::Sleep>>>,
+}
+
+impl<T> FirstByteDeadline<T> {
+    fn new(inner: T) -> Self {
+        Self {
+            inner,
+            deadline: Some(Box::pin(tokio::time::sleep(HEADER_TIMEOUT))),
+        }
+    }
+}
+
+impl<T: AsyncRead + Unpin> AsyncRead for FirstByteDeadline<T> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let filled = buf.filled().len();
+        let result = Pin::new(&mut self.inner).poll_read(cx, buf);
+        let Some(deadline) = self.deadline.as_mut() else {
+            return result;
+        };
+        match &result {
+            // The first byte disarms the deadline. An EOF before any byte is
+            // a plain client close; hyper's h1 server reports it as today.
+            Poll::Ready(Ok(())) if buf.filled().len() > filled => self.deadline = None,
+            Poll::Ready(Ok(()) | Err(_)) => {}
+            Poll::Pending => {
+                if deadline.as_mut().poll(cx).is_ready() {
+                    self.deadline = None;
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "guest sent no HTTP bytes within the header timeout",
+                    )));
+                }
+            }
+        }
+        result
+    }
+}
+
+impl<T: AsyncWrite + Unpin> AsyncWrite for FirstByteDeadline<T> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write_vectored(cx, bufs)
     }
 }
 

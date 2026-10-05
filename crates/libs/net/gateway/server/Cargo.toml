@@ -35,7 +35,7 @@ h2 = { workspace = true }
 http = { workspace = true }
 http-body-util = { workspace = true }
 hyper = { workspace = true, features = ["client", "server", "http1", "http2"] }
-hyper-util = { workspace = true, features = ["tokio"] }
+hyper-util = { workspace = true, features = ["tokio", "server", "server-auto", "http1", "http2"] }
 libc = { workspace = true }
 lru = { workspace = true }
 parking_lot = { workspace = true }

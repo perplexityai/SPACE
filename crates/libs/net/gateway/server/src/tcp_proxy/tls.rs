@@ -54,6 +54,11 @@ pub(crate) enum TlsTransportError {
     Upstream(#[source] io::Error),
     #[error("HTTP connection failed")]
     Http(#[from] hyper::Error),
+    /// The guest completed TLS and then sent no HTTP bytes within the header
+    /// timeout. Equivalent to hyper's h1 header read timeout, which cannot
+    /// start until the HTTP version has been detected from the first bytes.
+    #[error("guest sent no HTTP bytes within the header timeout")]
+    HeaderTimeout,
 }
 
 impl TlsTransportError {
@@ -61,6 +66,7 @@ impl TlsTransportError {
         let failure = self.failure();
         let http = match self {
             Self::Http(error) => HttpFailure::classify(error),
+            Self::HeaderTimeout => HttpFailure::HEADER_TIMEOUT,
             _ => HttpFailure::NOT_HTTP,
         };
         let io_kind = self.io_error().map(io::Error::kind).or(http.io_kind);
@@ -90,7 +96,7 @@ impl TlsTransportError {
             Self::Certificate(_) | Self::Configuration(_) => "tls_configuration_error",
             Self::Downstream(_) => "tls_downstream_error",
             Self::Upstream(_) => "tls_upstream_error",
-            Self::Http(_) => "http_connection_error",
+            Self::Http(_) | Self::HeaderTimeout => "http_connection_error",
         }
     }
 
@@ -114,7 +120,7 @@ impl TlsTransportError {
             Self::Downstream(error) | Self::Upstream(error) => {
                 tls_failure_from_io(error).unwrap_or_else(|| TlsFailure::new("io"))
             }
-            Self::Http(_) => TlsFailure::new("http"),
+            Self::Http(_) | Self::HeaderTimeout => TlsFailure::new("http"),
         }
     }
 }
@@ -136,6 +142,14 @@ pub(super) struct HttpFailure {
 impl HttpFailure {
     const NOT_HTTP: Self = Self {
         reason: "not_http",
+        io_kind: None,
+        h2_reason: None,
+        h2_origin: None,
+    };
+
+    /// Same bucket hyper's h1 `header_read_timeout` lands in.
+    const HEADER_TIMEOUT: Self = Self {
+        reason: "timeout",
         io_kind: None,
         h2_reason: None,
         h2_origin: None,
@@ -333,6 +347,16 @@ impl HttpProtocol {
         }
     }
 
+    /// The protocol hyper actually parsed a request with. This, not the ALPN
+    /// result, decides how the request is forwarded.
+    pub(super) fn of(version: http::Version) -> Self {
+        if version == http::Version::HTTP_2 {
+            Self::Http2
+        } else {
+            Self::Http1
+        }
+    }
+
     pub(super) const fn as_str(self) -> &'static str {
         match self {
             Self::Http1 => "http1",
@@ -370,6 +394,7 @@ impl TcpProxy {
             "tls.server",
             sandbox_id = self.sandbox_id,
             destination_port = admitted.destination().port(),
+            negotiated = tracing::field::Empty,
             protocol = tracing::field::Empty,
             policy_ref = tracing::field::Empty,
             otel.status_code = "ERROR",
@@ -385,8 +410,12 @@ impl TcpProxy {
             }
             let accounting = WireAccounting::new(self.stats.clone());
             let operation = async {
-                let (downstream, protocol) = accept(client, &lease, &self.tls_interception).await?;
-                tracing::Span::current().record("protocol", protocol.as_str());
+                // ALPN is telemetry here. `tls_http::serve` detects the
+                // version from the guest's first bytes and records `protocol`
+                // once the first request arrives.
+                let (downstream, negotiated) =
+                    accept(client, &lease, &self.tls_interception).await?;
+                tracing::Span::current().record("negotiated", negotiated.as_str());
                 let binding = HostBinding::new(
                     self.sandbox_id,
                     destination,
@@ -397,7 +426,7 @@ impl TcpProxy {
                 let upstream_lease = lease.clone();
                 let wire_read = accounting.read.clone();
                 let wire_written = accounting.written.clone();
-                let connect = move || async move {
+                let connect = move |guest_protocol| async move {
                     let origin = async {
                         Ok(MeteredIo {
                             inner: relay::connect(destination).await?,
@@ -405,9 +434,10 @@ impl TcpProxy {
                             written: wire_written,
                         })
                     };
-                    connect(origin, &upstream_lease, &interception, client_alpn).await
+                    let offer = upstream_alpn_offer(client_alpn, guest_protocol);
+                    connect(origin, &upstream_lease, &interception, offer).await
                 };
-                tls_http::serve(downstream, protocol, binding, lease.clone(), connect).await
+                tls_http::serve(downstream, negotiated, binding, lease.clone(), connect).await
             };
             let result = tokio::select! {
                 biased;
@@ -428,6 +458,25 @@ impl TcpProxy {
         }
         .instrument(span)
         .await
+    }
+}
+
+/// ALPN to offer the origin given what the guest turned out to speak.
+///
+/// The origin leg mirrors the guest's ClientHello offer, except that a guest
+/// which offered h2 and then spoke HTTP/1.1 (Go's `net/http` dialing an
+/// `https://` forward proxy) gets an HTTP/1.1-only upstream. The gateway can
+/// only tunnel CONNECT over an HTTP/1.1 origin leg, and offering h2 there
+/// would let an h2-preferring proxy turn the CONNECT into `invalid_connect`.
+/// Guests without ALPN and genuine h2 guests are unchanged.
+pub(super) fn upstream_alpn_offer(
+    client_alpn: ClientAlpnOffer,
+    guest_protocol: HttpProtocol,
+) -> ClientAlpnOffer {
+    if guest_protocol == HttpProtocol::Http1 && client_alpn.supports(HttpAlpn::Http2) {
+        ClientAlpnOffer::Http1
+    } else {
+        client_alpn
     }
 }
 

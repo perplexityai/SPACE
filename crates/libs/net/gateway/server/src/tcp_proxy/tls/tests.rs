@@ -3,8 +3,36 @@ use std::sync::{Arc, Mutex};
 use pplx_space_observability::test_capture::{CapturedEvent, RecordingVisitor};
 use tracing_subscriber::layer::SubscriberExt;
 
-use super::{HttpProtocol, TlsTransportError};
+use super::{HttpProtocol, TlsTransportError, upstream_alpn_offer};
 use crate::tls_sni::{ClientAlpnOffer, HttpAlpn};
+
+/// The origin leg follows the guest's ClientHello unless the guest offered h2
+/// and then spoke HTTP/1.1, in which case the origin must not be able to pick
+/// h2 (the gateway tunnels CONNECT over HTTP/1.1 only).
+#[test]
+fn origin_alpn_offer_matches_what_the_guest_actually_speaks() {
+    use ClientAlpnOffer as Offer;
+    use HttpProtocol as Http;
+
+    for (client_alpn, guest_protocol, expected) in [
+        (Offer::Http2ThenHttp1, Http::Http1, Offer::Http1),
+        (Offer::Http1ThenHttp2, Http::Http1, Offer::Http1),
+        (Offer::Http2, Http::Http1, Offer::Http1),
+        (Offer::Http2ThenHttp1, Http::Http2, Offer::Http2ThenHttp1),
+        (Offer::Http1ThenHttp2, Http::Http2, Offer::Http1ThenHttp2),
+        (Offer::Http2, Http::Http2, Offer::Http2),
+        (Offer::Http1, Http::Http1, Offer::Http1),
+        (Offer::NoAlpn, Http::Http1, Offer::NoAlpn),
+        (Offer::Unavailable, Http::Http1, Offer::Unavailable),
+        (Offer::Unsupported, Http::Http1, Offer::Unsupported),
+    ] {
+        assert_eq!(
+            upstream_alpn_offer(client_alpn, guest_protocol),
+            expected,
+            "{client_alpn:?} with guest {guest_protocol:?}"
+        );
+    }
+}
 
 #[test]
 fn upstream_protocol_requires_guest_compatibility() {

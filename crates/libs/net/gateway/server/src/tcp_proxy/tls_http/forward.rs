@@ -9,7 +9,7 @@ use crate::certificates::NetworkCredentialAccessError;
 
 impl<F, Fut, U> Session<F>
 where
-    F: FnOnce() -> Fut + Send + 'static,
+    F: FnOnce(HttpProtocol) -> Fut + Send + 'static,
     Fut: Future<Output = Result<(U, HttpProtocol), TlsTransportError>> + Send,
     U: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -18,32 +18,37 @@ where
             return self.connect_request(request).await;
         }
 
-        let mut authorization = Attempt::http_authorization(self.protocol.as_str());
+        let protocol = HttpProtocol::of(request.version());
+        let mut authorization = Attempt::http_authorization(protocol.as_str());
         let handshake = match upgrade::Handshake::request(&request) {
             Ok(handshake) => handshake,
             Err(()) => {
                 authorization.finish(Outcome::Denied, "unsupported_upgrade");
-                return self.refuse("unsupported_upgrade", StatusCode::FORBIDDEN);
+                return self.refuse(protocol, "unsupported_upgrade", StatusCode::FORBIDDEN);
             }
         };
         if let Err(reason) = authorize_authority(&request, self.lease.host(), self.lease.port()) {
             authorization.finish(Outcome::Denied, reason.as_str());
-            return self.refuse(reason.as_str(), StatusCode::FORBIDDEN);
+            return self.refuse(protocol, reason.as_str(), StatusCode::FORBIDDEN);
         }
         if let Err(reason) = self.binding.authorize(&request).await {
             authorization.finish(Outcome::Denied, reason.as_str());
-            return self.refuse(reason.as_str(), reason.refusal_status());
+            return self.refuse(protocol, reason.as_str(), reason.refusal_status());
         }
         let credential_bearing = match credential_headers(&self.lease, &request) {
             Ok(headers) => !headers.is_empty(),
             Err(error) => {
                 authorization.finish(initial_credential_outcome(error), error.as_str());
-                return self.refuse(error.as_str(), error.status());
+                return self.refuse(protocol, error.as_str(), error.status());
             }
         };
         if handshake.is_some() && credential_bearing {
             authorization.finish(Outcome::Denied, "credential_upgrade_unsupported");
-            return self.refuse("credential_upgrade_unsupported", StatusCode::FORBIDDEN);
+            return self.refuse(
+                protocol,
+                "credential_upgrade_unsupported",
+                StatusCode::FORBIDDEN,
+            );
         }
         authorization.finish(Outcome::Success, "authorized");
 
@@ -51,13 +56,13 @@ where
             request.set_websocket_upgrade();
         }
         let upgrade = handshake.map(|handshake| (handshake, request.on_upgrade()));
-        let mut forwarding = Attempt::forwarding(self.protocol.as_str(), "request");
-        let sender = match self.sender().await {
+        let mut forwarding = Attempt::forwarding(protocol.as_str(), "request");
+        let sender = match self.sender(protocol).await {
             Ok(sender) => sender,
             Err(error) => {
                 forwarding.finish(Outcome::Error, "origin_setup");
                 error.record("upstream_setup");
-                return self.refuse(error.as_str(), StatusCode::BAD_GATEWAY);
+                return self.refuse(protocol, error.as_str(), StatusCode::BAD_GATEWAY);
             }
         };
         let sender = match sender.ready().await {
@@ -66,7 +71,7 @@ where
                 forwarding.finish(Outcome::Error, "upstream_http");
                 self.draining.cancel();
                 TlsTransportError::Http(error).record("upstream_request");
-                return self.refuse("upstream_http_error", StatusCode::BAD_GATEWAY);
+                return self.refuse(protocol, "upstream_http_error", StatusCode::BAD_GATEWAY);
             }
         };
 
@@ -76,14 +81,15 @@ where
             Ok(headers) => headers,
             Err(error) => {
                 forwarding.finish(Outcome::Cancelled, error.as_str());
-                return self.refuse(error.as_str(), error.status());
+                return self.refuse(protocol, error.as_str(), error.status());
             }
         };
         inject(&mut request, headers);
         if sender.is_http1() {
             translate_to_http1(&mut request);
         }
-        let request = request.map(|body| Either::Left(self.forwarding_body(body, "request_body")));
+        let request =
+            request.map(|body| Either::Left(Self::forwarding_body(protocol, body, "request_body")));
         let response = sender.send(request).await;
 
         match response {
@@ -99,28 +105,30 @@ where
                 if matches!(handshake, upgrade::Handshake::WebSocket { .. }) {
                     websocket_response_headers(response.headers_mut());
                 }
-                self.record(handshake.as_str(), response.status());
+                Self::record(protocol, handshake.as_str(), response.status());
                 self.upgrades.spawn(
-                    upgrade::relay(guest, origin, self.shutdown.clone(), self.protocol.as_str())
+                    upgrade::relay(guest, origin, self.shutdown.clone(), protocol.as_str())
                         .in_current_span(),
                 );
                 forwarding.finish(Outcome::Success, "response_headers");
                 response.map(|_| Either::Right(Empty::new()))
             }
             Ok(response) if response.status() != StatusCode::SWITCHING_PROTOCOLS => {
-                self.record("allowed", response.status());
+                Self::record(protocol, "allowed", response.status());
                 forwarding.finish(Outcome::Success, "response_headers");
-                response.map(|body| Either::Left(self.forwarding_body(body, "response_body")))
+                response.map(|body| {
+                    Either::Left(Self::forwarding_body(protocol, body, "response_body"))
+                })
             }
             Ok(_) => {
                 forwarding.finish(Outcome::Error, "unexpected_upgrade");
-                self.refuse("unexpected_upgrade", StatusCode::BAD_GATEWAY)
+                self.refuse(protocol, "unexpected_upgrade", StatusCode::BAD_GATEWAY)
             }
             Err(error) => {
                 forwarding.finish(Outcome::Error, "upstream_http");
                 self.draining.cancel();
                 TlsTransportError::Http(error).record("upstream_request");
-                self.refuse("upstream_http_error", StatusCode::BAD_GATEWAY)
+                self.refuse(protocol, "upstream_http_error", StatusCode::BAD_GATEWAY)
             }
         }
     }
