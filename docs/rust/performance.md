@@ -41,6 +41,25 @@ Tools and what each is good for:
 
 Two profilers > one. Different tools surface different bottlenecks.
 
+### Measuring a change
+
+- **Measure cost per unit of work, per process.** CPU milliseconds per MiB
+  served, or per request, show a saving even when the load generator or the
+  network saturates first and throughput stays flat.
+- **Alternate A/B runs** (A B A B) and keep an unchanged control in the same
+  session. Shared clusters drift by tens of percent over hours; back-to-back
+  runs mistake drift for effect.
+- **Run past every burst allowance.** A token-bucket rate limiter serves its
+  stored burst before its sustained rate, so a short run, or the second of two
+  back-to-back runs, can still be spending credit. Run until the rate settles.
+- **Validate the measurement itself.** A negative duration, or a rate above a
+  hard limit, means the harness is wrong (it sampled the wrong process, or
+  started late), not that the code got faster.
+- **Measure sizes and threading choices instead of assuming.** Bigger chunks
+  or a dedicated blocking thread are not automatically faster; the
+  allocation, copying and scheduling they change can cost more than they
+  save.
+
 ---
 
 ## Type sizes
@@ -98,6 +117,45 @@ Verify with a microbench before changing a hot map; in rustc, switching `fxhash 
 - **Lock once.** `println!` locks stdout per call. If you print in a loop, `let mut out = io::stdout().lock();` once.
 - **Skip UTF-8 validation** for byte-oriented protocols: `BufRead::read_until` on bytes, not `read_line` into `String`.
 - **Async I/O** uses the same buffering story: `tokio::io::BufReader`/`BufWriter`. The `tokio_util::codec::Framed` family handles message-boundary buffering for you.
+- **Count requests, not just bytes,** where a device or a rate limiter charges per request. A request may cover only physically contiguous memory, and every `fsync` adds the filesystem's journal commit, so buffer layout and sync frequency can cost more than the data itself.
+
+---
+
+## Data paths: copies, hops and buffers
+
+Bulk bytes that cross several processes pay per byte at every hop. Keep each
+hop from copying them, and keep hops that only forward them off the path.
+
+- **Relay payload fields as `Bytes`.** For a protobuf field that carries bulk
+  data through several hops, generate it as `bytes::Bytes`
+  (`.bytes(".pkg.Message.field")` in `tonic-prost-build`). Each hop then
+  decodes the field as a slice of the received buffer instead of a new `Vec`.
+- **Read into the buffer you send.** Read into the message's own buffer
+  (`Vec::with_capacity` and `read_buf`) and move it into the message, with no
+  staging buffer and no second copy.
+- **Pass a handle, not the bytes.** A process that only forwards a file or a
+  socket can hand the consumer the descriptor (`SCM_RIGHTS`, `pidfd_getfd`)
+  instead of relaying its contents. Keep the resource accounted for where it
+  was admitted, and end the transfer when that accounting ends.
+- **A queue's depth is memory per stream.** Size a per-stream channel to keep
+  the pipe busy, a few chunks, not generously: every open stream holds that
+  many chunks.
+
+---
+
+## Network transport
+
+- **Set `TCP_NODELAY` on accepted and dialled connections.** With Nagle's
+  algorithm on, a small response written in two parts (headers, then body)
+  waits for the peer's delayed ACK, tens of milliseconds per request.
+- **Size HTTP/2 frames for bulk streams.** The default maximum frame is
+  16 KiB, so a 64 KiB message crosses every hop as five DATA frames. The
+  receiver advertises the limit: raise it on servers (`Server::max_frame_size`)
+  and on clients (`Endpoint::max_frame_size`) of channels that carry bulk
+  data.
+- **Reuse channels.** Keep one long-lived `tonic::transport::Channel` per peer
+  instead of dialling per call. Let concurrent callers share one in-flight
+  dial, and do not cache a failed one.
 
 ---
 
@@ -143,4 +201,7 @@ Verify with a microbench before changing a hot map; in rustc, switching `fxhash 
 - [ ] `BufReader`/`BufWriter` around any `File` or socket I/O.
 - [ ] Internal hash maps keyed by our own ids use `FxHashMap` (or have a comment justifying default).
 - [ ] No `tokio::sync::Mutex` where `std::sync::Mutex` would do; no `RwLock` where `Mutex` would do.
-- [ ] If we changed code "for performance", a benchmark or profile is referenced in the PR description.
+- [ ] Bulk payload fields relayed across processes are `Bytes`, and no hop copies them into a fresh buffer.
+- [ ] Accepted and dialled TCP connections set `TCP_NODELAY`; bulk-streaming gRPC channels raise the HTTP/2 maximum frame size.
+- [ ] gRPC channels to a peer are reused, not dialled per call.
+- [ ] If we changed code "for performance", a benchmark or profile is referenced in the PR description, measured as cost per unit of work with alternated runs.

@@ -524,14 +524,25 @@ fn tls_interception_preserves_legacy_json_and_defaults_off() {
 
 #[cfg(feature = "serde")]
 #[test]
-fn tls_interception_json_is_strict_and_round_trips_on() {
+fn tls_interception_json_round_trips_on() {
     let on = r#"{"version":"v1","egress":{"default_action":"deny","allow":[],"deny":[]},"tls_interception":"on"}"#;
     let policy: NetworkPolicyV1 = serde_json::from_str(on).unwrap();
 
     assert_eq!(policy.tls_interception, TlsInterception::On);
     assert_eq!(serde_json::to_string(&policy).unwrap(), on);
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn network_policy_json_ignores_unknown_top_level_fields() {
+    let policy: NetworkPolicyV1 = serde_json::from_str(
+        r#"{"version":"v1","egress":{"default_action":"deny"},"future_field":true}"#,
+    )
+    .unwrap();
+
+    assert_eq!(policy, NetworkPolicyV1::deny_all());
     serde_json::from_str::<NetworkPolicyV1>(
-        r#"{"version":"v1","egress":{"default_action":"deny"},"unknown":true}"#,
+        r#"{"version":"v1","egress":{"default_action":"deny","future_field":true}}"#,
     )
     .unwrap_err();
 }

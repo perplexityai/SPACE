@@ -133,6 +133,11 @@ struct PooledCreateInput<'a> {
     env: &'a BTreeMap<String, String>,
     metric_identity: SandboxApiMetricIdentity,
     planned_sandbox_id: SandboxId,
+    /// The caller already published `planned_sandbox_id` (for example in an
+    /// accepted create operation), so the sandbox must be created under exactly
+    /// that ID. A warm-pool slot carries its own pre-reserved ID, so a pinned
+    /// create cannot adopt one.
+    sandbox_id_pinned: bool,
     create_owner: &'a SandboxCreateOwner,
     auto_lifecycle: &'a AutoLifecyclePolicy,
     backend: &'a str,
@@ -783,6 +788,8 @@ fn pool_slot_claimed_event_details(
 
 struct SandboxCreateExecutionMode<'a> {
     sandbox_id: SandboxId,
+    /// `sandbox_id` is visible to the caller and must be the created ID.
+    sandbox_id_pinned: bool,
     federated: FederatedSandboxCreateContext<'a>,
     restore_from: Option<crate::controllers::substrate::SnapshotRef<'a>>,
     restore_operation_id: Option<OperationId>,
@@ -866,6 +873,7 @@ impl SandboxController {
             metric_identity,
             SandboxCreateExecutionMode {
                 sandbox_id: SandboxId::new(),
+                sandbox_id_pinned: false,
                 federated,
                 restore_from: None,
                 restore_operation_id: None,
@@ -891,6 +899,7 @@ impl SandboxController {
             metric_identity,
             SandboxCreateExecutionMode {
                 sandbox_id,
+                sandbox_id_pinned: true,
                 federated,
                 restore_from: None,
                 restore_operation_id: None,
@@ -915,6 +924,7 @@ impl SandboxController {
             metric_identity,
             SandboxCreateExecutionMode {
                 sandbox_id: restore.sandbox_id,
+                sandbox_id_pinned: true,
                 federated: restore.federated,
                 restore_from: Some(restore.snapshot),
                 restore_operation_id: Some(restore.operation_id),
@@ -938,6 +948,7 @@ impl SandboxController {
         }
         let SandboxCreateExecutionMode {
             sandbox_id,
+            sandbox_id_pinned,
             federated,
             restore_from,
             restore_operation_id,
@@ -1070,6 +1081,7 @@ impl SandboxController {
                         env: &env,
                         metric_identity,
                         planned_sandbox_id: sandbox_id,
+                        sandbox_id_pinned,
                         create_owner: &create_owner,
                         auto_lifecycle: &auto_lifecycle,
                         backend: &backend,
@@ -1601,6 +1613,20 @@ impl SandboxController {
                 org_id = %input.create_owner.org_id,
                 template = input.template,
                 "BYOK create: bypassing warm pool, cold-creating an encrypted sandbox"
+            );
+            return Ok(PoolCreateResult::cold(PoolCreateObservation::cold_direct()));
+        }
+
+        // A warm-pool slot is booted under its own pre-reserved sandbox ID
+        // (pod name, pod metadata, and guest runtime all carry it), and
+        // adoption returns that ID. When the caller has already published the
+        // planned ID, adopting a slot would create the sandbox under a
+        // different ID than the one the caller tracks. Cold-create instead.
+        if input.sandbox_id_pinned {
+            tracing::debug!(
+                sandbox_id = %input.planned_sandbox_id,
+                template = input.template,
+                "pinned sandbox ID: bypassing warm pool, cold-creating"
             );
             return Ok(PoolCreateResult::cold(PoolCreateObservation::cold_direct()));
         }

@@ -691,8 +691,12 @@ impl SpacedHostService {
             {
                 Ok(Some(snapshot)) => return Ok(snapshot),
                 Ok(None) => {}
-                Err(error) if error.code() == tonic::Code::DeadlineExceeded => {
-                    tracing::trace!(%error, "cached guest readiness probe timed out; continuing wait");
+                Err(error)
+                    if !self.inner.shutdown.is_cancelled()
+                        && (pplx_space_spaced_common::status_is_retryable(&error)
+                            || error.code() == tonic::Code::Cancelled) =>
+                {
+                    tracing::trace!(%error, "cached guest readiness probe interrupted; continuing wait");
                 }
                 Err(error) => return Err(error),
             }
@@ -719,14 +723,16 @@ impl SpacedHostService {
                     tracing::trace!(%error, "bridge guest readiness probe timed out");
                 }
                 Err(error)
-                    if matches!(
-                        error.code(),
-                        tonic::Code::Cancelled | tonic::Code::FailedPrecondition
-                    ) =>
+                    if self.inner.shutdown.is_cancelled()
+                        || error.code() == tonic::Code::FailedPrecondition =>
                 {
                     return Err(error);
                 }
                 Err(error) => {
+                    // Tonic also reports a closed transport as Cancelled. A
+                    // read-only readiness probe can reconnect within this same
+                    // deadline; actual shutdown is checked above, and dropping
+                    // the caller still drops its probe and driver permit.
                     tracing::trace!(%error, "bridge guest readiness wait failed");
                 }
             }

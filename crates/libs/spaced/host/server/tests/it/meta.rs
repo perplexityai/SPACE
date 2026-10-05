@@ -35,6 +35,7 @@ struct ReadyWaitGuest {
     active_wait_ready_calls: Option<Arc<AtomicUsize>>,
     ready: Arc<AtomicBool>,
     response_delay: Duration,
+    response_errors: Arc<std::sync::Mutex<std::collections::VecDeque<tonic::Code>>>,
     flush_deadlines: Option<Arc<std::sync::Mutex<Vec<Duration>>>>,
 }
 
@@ -65,6 +66,9 @@ impl BridgeGuestMeta for ReadyWaitGuest {
             ActiveWaitReadyCall(active.clone())
         });
         tokio::time::sleep(self.response_delay).await;
+        if let Some(code) = self.response_errors.lock().unwrap().pop_front() {
+            return Err(Status::new(code, "readiness connection interrupted"));
+        }
         let ready = self.ready.load(Ordering::SeqCst);
         Ok(Response::new(BridgeGuestWaitReadyResponse {
             ready,
@@ -115,6 +119,7 @@ impl ReadyWaitGuest {
             active_wait_ready_calls: None,
             ready: Arc::new(AtomicBool::new(true)),
             response_delay: Duration::ZERO,
+            response_errors: Arc::default(),
             flush_deadlines: None,
         }
     }
@@ -555,7 +560,7 @@ async fn concurrent_readiness_callers_share_one_guest_probe() {
 }
 
 #[tokio::test]
-async fn cancelling_wait_ready_releases_the_guest_probe() {
+async fn caller_cancellation_and_host_shutdown_release_the_guest_probe() {
     let temp_dir = tempfile::tempdir().expect("temp dir created");
     let bridge_guest_socket_path = temp_dir.path().join("spaced-bridge-guest.sock");
     let wait_ready_calls = Arc::new(AtomicUsize::new(0));
@@ -590,7 +595,20 @@ async fn cancelling_wait_ready_releases_the_guest_probe() {
     .await
     .expect("cancelled WaitReady retained its guest readiness probe");
 
-    fixture.stop().await;
+    let client = fixture.client().await;
+    let wait = tokio::spawn(async move { client.wait_ready(Duration::from_secs(3_600)).await });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while active_wait_ready_calls.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("guest readiness probe did not restart");
+    fixture.stop_gracefully().await;
+    assert_eq!(
+        wait.await.unwrap().unwrap_err().code(),
+        tonic::Code::Cancelled
+    );
     bridge_task.abort();
 }
 
@@ -685,6 +703,56 @@ async fn cached_ready_probe_timeout_continues_within_caller_deadline() {
 
     fixture.stop().await;
     bridge_task.abort();
+}
+
+#[tokio::test]
+async fn readiness_transport_failures_recover_within_the_original_deadline() {
+    for cached in [false, true] {
+        for code in [tonic::Code::Cancelled, tonic::Code::Unavailable] {
+            for recovers in [true, false] {
+                let temp_dir = tempfile::tempdir().expect("temp dir created");
+                let socket = temp_dir.path().join("guest.sock");
+                let calls = Arc::new(AtomicUsize::new(0));
+                let guest = ReadyWaitGuest::new(calls.clone());
+                let errors = guest.response_errors.clone();
+                let bridge_task = guest.start(socket.clone()).await;
+                let fixture = HostFixture::start(Some(socket)).await;
+                // Observe one server-side readiness budget, without client retries.
+                let config = pplx_space_spaced_host_client::SpacedHostClientConfig::new()
+                    .with_socket_path(fixture.socket_path.clone())
+                    .with_command_retry_policy(pplx_space_spaced_common::RetryPolicy::none());
+                let _connected = fixture.client().await;
+                let client =
+                    pplx_space_spaced_host_client::SpacedHostClient::new_with_config(config)
+                        .await
+                        .unwrap();
+                if cached {
+                    client.wait_ready(Duration::from_secs(1)).await.unwrap();
+                }
+                // Persistent failures outlast the 100ms readiness budget at the
+                // coordinator's existing retry cadence.
+                errors
+                    .lock()
+                    .unwrap()
+                    .extend(std::iter::repeat_n(code, if recovers { 1 } else { 100 }));
+                let result = tokio::time::timeout(
+                    Duration::from_secs(2),
+                    client.wait_ready(Duration::from_millis(100)),
+                )
+                .await
+                .expect("readiness exceeded its bounded wait");
+                fixture.stop().await;
+                bridge_task.abort();
+                let _ = bridge_task.await;
+                if recovers {
+                    assert!(result.is_ok(), "cached={cached}, code={code:?}: {result:?}");
+                } else {
+                    assert_eq!(result.unwrap_err().code(), tonic::Code::DeadlineExceeded);
+                }
+                assert!(calls.load(Ordering::SeqCst) >= 2);
+            }
+        }
+    }
 }
 
 #[tokio::test]

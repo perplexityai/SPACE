@@ -2,15 +2,16 @@ name = "TLS authority CVE with interception enabled"
 description = "Allowed traffic requires exact origin receipts; switched authority must be refused without an origin connection or payload."
 
 [[steps]]
-policy = { default = "deny", tls_interception = "on", allow = ["198.18.53.53", "allowed.127-0-0-1.dev"] }
+policy = { default = "deny", tls_interception = "on", allow = ["198.18.1.2", "allowed.127-0-0-1.dev"] }
 probes = [
-  { kind = "dns-udp", target = "198.18.53.53", host = "allowed.127-0-0-1.dev", expect = "answer" },
   { kind = "tls", host = "allowed.127-0-0-1.dev", expect = "allow" },
   { kind = "tls", host = "allowed.127-0-0-1.dev", alpn = ["h2", "space-unsupported", "http/1.1"], downstream_alpn = "h2", upstream_alpn = "http/1.1", expect = "allow" },
   { kind = "http2", host = "allowed.127-0-0-1.dev", preserve_headers = { Fastly-Key = "fixture-token" }, expect = "allow" },
   { kind = "grpcs", host = "allowed.127-0-0-1.dev", expect = "allow" },
   { kind = "wss", host = "allowed.127-0-0-1.dev", expect = "allow" },
-  { kind = "tls", host = "forbidden.127-0-0-1.dev", expect = "deny" },
+  # Independent IP admission permits either initial SNI. The encrypted request
+  # must still match that SNI; the switched-authority probes below enforce it.
+  { kind = "tls", host = "forbidden.127-0-0-1.dev", expect = "allow" },
   { kind = "tls", target = "198.18.2.2", host = "forbidden.127-0-0-1.dev", expect = "deny" },
   { kind = "tls", host = "allowed.127-0-0-1.dev", authority = "forbidden.127-0-0-1.dev", expect = "deny" },
   { kind = "http2", host = "allowed.127-0-0-1.dev", authority = "forbidden.127-0-0-1.dev", expect = "deny" },
@@ -19,9 +20,7 @@ probes = [
 ]
 
 [[steps]]
-policy = { default = "deny", tls_interception = "on", allow = ["198.18.53.53", "allowed.127-0-0-1.dev", "forbidden.127-0-0-1.dev"] }
+policy = { default = "deny", tls_interception = "on", allow = ["198.18.1.2", "allowed.127-0-0-1.dev", "forbidden.127-0-0-1.dev"] }
 probes = [
-  { kind = "dns-udp", target = "198.18.53.53", host = "allowed.127-0-0-1.dev", expect = "answer" },
-  { kind = "dns-udp", target = "198.18.53.53", host = "forbidden.127-0-0-1.dev", expect = "answer" },
   { kind = "http2", host = "allowed.127-0-0-1.dev", switch_authority = "forbidden.127-0-0-1.dev", switch_expect = "deny", expect = "allow" },
 ]

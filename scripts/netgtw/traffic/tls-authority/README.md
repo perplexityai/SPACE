@@ -31,6 +31,17 @@ The fixture executable always comes from the current tree. `--filter '01-*'`
 selects the shared-edge cases; `02-*` selects CONNECT; `03-*` selects revocation.
 CI runs the existing suite plus this one.
 
+These inspected-TLS cases independently allow the isolated origin IP. They do
+not use generic DNS answers as attribution: the pinned public development
+identity does not resolve to the isolated peer through trusted public DNS.
+Independent address admission permits either initial SNI, but the encrypted
+HTTP authority must still match that SNI. The suite retains first/later
+authority mismatch denials, including switches to another allowed hostname,
+and closes inspected connections when their IP permission is revoked.
+The main traffic suite's `03-domain-rules.toml` and `05-policy-refresh.toml`
+own domain-only SNI admission and DNS-attributed connection revocation using
+real reserved DNS. No production trust or hostname check is bypassed here.
+
 The suite requires normal traffic to work while forbidden
 authority switches fail. A rejected first authority must not create an upstream
 connection. Reused HTTP/1.1 and concurrent HTTP/2 checks require allowed requests

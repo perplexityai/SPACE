@@ -559,6 +559,7 @@ fn pooled_create_input<'a>(
         env: &req.env,
         metric_identity: SandboxApiMetricIdentity::native("create"),
         planned_sandbox_id: SandboxId::new(),
+        sandbox_id_pinned: false,
         create_owner,
         auto_lifecycle,
         backend: "fc",
@@ -1967,6 +1968,85 @@ async fn postgres_byok_org_bypasses_warm_pool_and_cold_creates() -> TestResult {
         substrate.claim_calls(),
         0,
         "BYOK org must not touch the warm pool"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn postgres_pinned_sandbox_id_bypasses_warm_pool_and_cold_creates() -> TestResult {
+    // A create whose sandbox ID was already handed to the caller must produce
+    // exactly that ID. Warm-pool adoption returns the slot's pre-reserved ID
+    // instead, so even with a claimable, prepare-ready slot the create must
+    // fall through to the cold path without touching the pool.
+    let db = pg_test_db().await?;
+    let actor = insert_actor(&db.pool).await?;
+    let node_id = NodeId::new();
+    let release_id = insert_template_release(&db.pool, "seed", "sha256:pooled").await?;
+    let pool_config_id = Uuid::now_v7();
+    let slot_sandbox_id = SandboxId::new();
+    let auto_lifecycle = AutoLifecyclePolicy::disabled();
+    let mut req = pooled_create_request("pinned-id-cold-start", None);
+    req.boot_mode = None;
+    req.vcpu = None;
+    req.memory_mib = None;
+    req.wait_until_ready = true;
+    let template_network_policy = NetworkPolicyV1::deny_all();
+    let requested_template = TemplateReference::latest(TemplateName::parse("seed").unwrap());
+    let create_owner = SandboxCreateOwner::local(&actor);
+    let mut input = pooled_create_input(
+        &db.pool,
+        &req,
+        &requested_template,
+        &auto_lifecycle,
+        &template_network_policy,
+        &create_owner,
+    );
+    input.template_release_id = release_id;
+    input.boot_mode = CreateBootMode::Fallthrough;
+    input.sandbox_id_pinned = true;
+    assert_ne!(input.planned_sandbox_id, slot_sandbox_id);
+
+    insert_node(&db.pool, node_id).await?;
+    sqlx::query(sql!(
+        "INSERT INTO kubernetes_pool_configs (
+             id, template_release_id, vcpu, memory_mib, target_ready_slots,
+             refill_per_tick, max_warming_slots, namespace, enabled
+         )
+         VALUES ($1, $2, 4, 2048, 3, 1, 1, 'space', true)"
+    ))
+    .bind(pool_config_id)
+    .bind(release_id)
+    .execute(&db.pool)
+    .await?;
+
+    let substrate = RetryingPoolSubstrate::new(
+        db.pool.clone(),
+        pool_config_id,
+        release_id,
+        vec![pooled_claim_with_pod(
+            slot_sandbox_id,
+            node_id,
+            "space-sbx-pooled-g1",
+        )],
+        vec![true],
+    );
+
+    let response = SandboxController::try_create_from_pool_with_substrate(
+        &substrate,
+        input,
+        Arc::new(AtomicU64::new(0)),
+    )
+    .await?;
+
+    assert!(
+        response.response.is_none(),
+        "a pinned sandbox ID must cold-create, not adopt a slot with another ID"
+    );
+    assert_eq!(
+        substrate.claim_calls(),
+        0,
+        "a pinned sandbox ID must not touch the warm pool"
     );
 
     Ok(())
