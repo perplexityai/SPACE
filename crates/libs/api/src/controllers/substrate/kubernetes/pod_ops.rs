@@ -2109,15 +2109,18 @@ impl KubernetesSubstrate {
         connect_timeout: Duration,
     ) -> Option<Channel> {
         let addr = pod_ip.socket_addr(port).to_string();
-        node_api_endpoint(
+        let endpoint = node_api_endpoint(
             &addr,
             connect_timeout,
             crate::controllers::substrate::NODE_RPC_TIMEOUT,
         )
-        .ok()?
-        .connect()
-        .await
-        .ok()
+        .ok()?;
+        crate::controllers::substrate::node_api_transport(endpoint)
+            .await
+            .ok()?
+            .connect()
+            .await
+            .ok()
     }
 
     pub(super) async fn pod_proxy_accepts_tcp(

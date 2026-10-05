@@ -107,6 +107,7 @@ pplx-space-metrics = { workspace = true, features = ["test-capture"] }
 pplx-space-observability = { workspace = true, features = ["test-capture"] }
 pplx-space-node-api-sim = { workspace = true }
 pplx-space-test-env = { workspace = true }
+rcgen = { workspace = true, features = ["aws_lc_rs", "pem"] }
 rstest = { workspace = true }
 tempfile = { workspace = true }
 testcontainers = { workspace = true }

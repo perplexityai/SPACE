@@ -4958,6 +4958,7 @@ dependencies = [
  "prost",
  "prost-types",
  "rand 0.10.2",
+ "rcgen",
  "redis",
  "regex",
  "rstest",

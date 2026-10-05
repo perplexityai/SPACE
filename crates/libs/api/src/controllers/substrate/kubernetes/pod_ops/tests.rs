@@ -1,3 +1,10 @@
+use std::ffi::OsStr;
+
+use pplx_space_common_grpc::internal_transport::{CA_ENV, INSECURE_DEV_ENV};
+use tokio_stream::wrappers::TcpListenerStream;
+use tokio_util::sync::CancellationToken;
+use tonic::transport::{Identity, Server, ServerTlsConfig};
+
 use pplx_space_common_core::types::{NodeId, SandboxId};
 
 use std::sync::{
@@ -854,4 +861,91 @@ mod stopped_restore_plan_tests {
 
         Ok(())
     }
+}
+
+#[tokio::test]
+async fn pod_worker_channel_verifies_tls_for_raw_pod_ips() {
+    let temp = tempfile::tempdir().unwrap();
+    let ca_path = temp.path().join("ca.pem");
+    if !pplx_space_test_env::enter_test_process(&[
+        (CA_ENV, Some(ca_path.as_os_str())),
+        (INSECURE_DEV_ENV, None),
+        (
+            "SPACE_NODE_API_TLS_SERVER_NAME",
+            Some(OsStr::new("node.example")),
+        ),
+    ]) {
+        return;
+    }
+    pplx_space_common_svc::install_default_rustls_crypto_provider();
+    let ca_path = std::path::PathBuf::from(std::env::var_os(CA_ENV).unwrap());
+    // The certificate has no IP SAN: dialing a Pod IP must use the configured
+    // NodeApi identity as well as the mounted CA.
+    let certificate = rcgen::generate_simple_self_signed(vec!["node.example".into()]).unwrap();
+    let untrusted = rcgen::generate_simple_self_signed(vec!["node.example".into()]).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (reporter, health) = tonic_health::server::health_reporter();
+    reporter
+        .set_service_status("", tonic_health::ServingStatus::Serving)
+        .await;
+    let shutdown = CancellationToken::new();
+    let server = tokio::spawn(
+        Server::builder()
+            .tls_config(ServerTlsConfig::new().identity(Identity::from_pem(
+                certificate.cert.pem(),
+                certificate.signing_key.serialize_pem(),
+            )))
+            .unwrap()
+            .add_service(health)
+            .serve_with_incoming_shutdown(
+                TcpListenerStream::new(listener),
+                shutdown.clone().cancelled_owned(),
+            ),
+    );
+    for (trust, accepted) in [
+        (Some(certificate.cert.pem()), true),
+        (Some(untrusted.cert.pem()), false),
+        (None, false),
+    ] {
+        if let Some(pem) = trust {
+            tokio::fs::write(&ca_path, pem).await.unwrap();
+        } else {
+            tokio::fs::remove_file(&ca_path).await.unwrap();
+        }
+        let channel = tokio::time::timeout(
+            Duration::from_secs(3),
+            KubernetesSubstrate::pod_worker_channel(
+                PodIp(address.ip()),
+                address.port(),
+                Duration::from_secs(2),
+            ),
+        )
+        .await
+        .expect("connection establishment must remain bounded");
+        assert_eq!(channel.is_some(), accepted);
+        if let Some(channel) = channel {
+            let response = tokio::time::timeout(
+                Duration::from_secs(3),
+                tonic_health::pb::health_client::HealthClient::new(channel).check(
+                    tonic_health::pb::HealthCheckRequest {
+                        service: String::new(),
+                    },
+                ),
+            )
+            .await
+            .expect("health RPC must remain bounded")
+            .unwrap();
+            assert_eq!(
+                response.into_inner().status,
+                tonic_health::ServingStatus::Serving as i32,
+            );
+        }
+    }
+    shutdown.cancel();
+    tokio::time::timeout(Duration::from_secs(3), server)
+        .await
+        .expect("listener shutdown must remain bounded")
+        .unwrap()
+        .unwrap();
 }
