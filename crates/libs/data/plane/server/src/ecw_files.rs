@@ -295,8 +295,9 @@ pub(super) async fn write_file(
         // parent can't be created fails without spooling the upload. Other
         // write failures still surface after spooling.
         let route = ensure_parent_dir(&state, route, &path, user.clone()).await?;
-        let upload = spool_body_upload(body).await?;
-        spaced_write_spooled(&state, route, path.clone(), upload, user).await?;
+        let mut spool = SpoolFiles::default();
+        let upload = spool_body_upload(body, &mut spool).await?;
+        spaced_write_spooled(&state, route, path.clone(), &upload, user).await?;
         return Ok(Json(vec![file_write_info(path)]));
     }
 
@@ -325,13 +326,17 @@ pub(super) async fn write_file(
                 "multipart/form-data boundary of 1 to 70 characters is required",
             )
         })?;
-        let uploads = spool_multipart_uploads(body, boundary, query.path.is_none()).await?;
+        // Owns every staged file until the request ends, however it ends.
+        let mut spool = SpoolFiles::default();
+        let uploads =
+            spool_multipart_uploads(body, boundary, query.path.is_none(), &mut spool).await?;
         let writes = resolve_multipart_uploads(uploads, query.path, user.as_ref())?;
         let mut written = Vec::with_capacity(writes.len());
         let mut route = route;
         for (path, upload) in writes {
             route = ensure_parent_dir(&state, route, &path, user.clone()).await?;
-            route = spaced_write_spooled(&state, route, path.clone(), upload, user.clone()).await?;
+            route =
+                spaced_write_spooled(&state, route, path.clone(), &upload, user.clone()).await?;
             written.push(file_write_info(path));
         }
         return Ok(Json(written));
@@ -708,8 +713,11 @@ async fn ensure_parent_dir(
     Ok(route)
 }
 
-async fn spool_body_upload(mut body: Body) -> Result<tempfile::TempPath, EcwProxyError> {
-    let mut upload = SpooledUpload::new().await?;
+async fn spool_body_upload(
+    mut body: Body,
+    spool: &mut SpoolFiles,
+) -> Result<StagedUpload, EcwProxyError> {
+    let mut upload = spool.create().await?;
     while let Some(frame) = body.frame().await {
         let frame = frame.map_err(|_| EcwProxyError::bad_request("Invalid request body"))?;
         if let Some(data) = frame.data_ref() {
@@ -719,19 +727,20 @@ async fn spool_body_upload(mut body: Body) -> Result<tempfile::TempPath, EcwProx
     upload.finish().await
 }
 
+/// Streams a staged upload to the guest. Fails, rather than reporting
+/// success, if the spool file can't be read to the end or the guest
+/// acknowledges fewer bytes than were staged.
 async fn spaced_write_spooled(
     state: &DataPlaneState,
     route: EcwResolvedRoute,
     path: String,
-    upload: tempfile::TempPath,
+    upload: &StagedUpload,
     user: Option<GuestUserName>,
 ) -> Result<EcwResolvedRoute, EcwProxyError> {
-    // Callers create the parent directory first.
-    // `upload` deletes the spool file on drop, so it stays bound until the
-    // transfer below has reopened and streamed it.
-    let upload_path = upload.to_path_buf();
-
-    let (_, route) = bounded_ecw_route_transfer(
+    // Callers create the parent directory first. The spool file stays on disk
+    // until the request's `SpoolFiles` drops, so every attempt can reopen it.
+    let upload_path = upload.path.clone();
+    let (response, route) = bounded_ecw_route_transfer(
         state,
         route,
         "filesystem_write",
@@ -749,45 +758,75 @@ async fn spaced_write_spooled(
                     .await
                     .map_err(EcwRouteAttemptError::Proxy)?;
                 let mut client = WorkerApiClient::new(wrap_grpc_client_channel(channel));
-                let stream = spooled_write_requests(route.sandbox_id, path, file, user);
-                client
-                    .spaced_write(node_api_request_with_route_token_state(
-                        stream,
-                        route.space_api_route_token.as_ref(),
-                    )?)
-                    .await
-                    .map(|response| response.into_inner())
-                    .map_err(EcwRouteAttemptError::Status)
+                let (read_failed, read_failure) = tokio::sync::oneshot::channel();
+                let stream =
+                    spooled_write_requests(route.sandbox_id, path, file, user, read_failed);
+                let write = client.spaced_write(node_api_request_with_route_token_state(
+                    stream,
+                    route.space_api_route_token.as_ref(),
+                )?);
+                // A spool read failure must not end the request stream: the
+                // guest commits whatever it received when the stream ends, so
+                // dropping the call here is the only way to fail the write.
+                tokio::select! {
+                    response = write => response
+                        .map(|response| response.into_inner())
+                        .map_err(EcwRouteAttemptError::Status),
+                    Ok(()) = read_failure => Err(EcwRouteAttemptError::Proxy(
+                        EcwProxyError::internal("Failed to read staged upload"),
+                    )),
+                }
             }
         },
         raw_file_write_error,
     )
     .await?;
-    // Unlinking is a blocking syscall too. Any spool path dropped outside this
-    // success path (a failed write, or the remaining staged parts of a
-    // multipart request that fails) unlinks synchronously on drop.
-    match tokio::task::spawn_blocking(move || upload.close()).await {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => tracing::warn!(%error, "failed to remove ECW upload spool file"),
-        Err(error) => tracing::warn!(%error, "ECW upload spool file removal task failed"),
-    }
+    check_spooled_write_len(response.bytes_written, upload.len)?;
     Ok(route)
 }
 
-#[derive(Debug)]
-struct SpooledUpload {
-    file: tokio::fs::File,
-    path: tempfile::TempPath,
-    bytes_written: usize,
+fn check_spooled_write_len(bytes_written: u64, staged_len: usize) -> Result<(), EcwProxyError> {
+    if u64::try_from(staged_len).is_ok_and(|staged_len| staged_len == bytes_written) {
+        return Ok(());
+    }
+    tracing::warn!(
+        bytes_written,
+        staged_len,
+        "guest acknowledged a different length than the staged upload"
+    );
+    Err(EcwProxyError::internal(
+        "Staged upload was not written completely",
+    ))
 }
 
-impl SpooledUpload {
-    async fn new() -> Result<Self, EcwProxyError> {
+/// Spool files staged by one request, removed when this guard drops: on
+/// success, error, and cancellation alike. Removal runs in one blocking task,
+/// so a request that staged many parts doesn't unlink them all on a runtime
+/// thread.
+#[derive(Debug, Default)]
+pub(super) struct SpoolFiles {
+    paths: Vec<tempfile::TempPath>,
+    dir: Option<std::path::PathBuf>,
+}
+
+impl SpoolFiles {
+    #[cfg(test)]
+    pub(super) fn in_dir(dir: std::path::PathBuf) -> Self {
+        Self {
+            paths: Vec::new(),
+            dir: Some(dir),
+        }
+    }
+
+    /// Creates a spool file this guard owns from the start, so even a part
+    /// abandoned mid-write is removed with the rest.
+    pub(super) async fn create(&mut self) -> Result<SpooledUpload, EcwProxyError> {
+        let dir = self.dir.clone().unwrap_or_else(std::env::temp_dir);
         // Creating the file is a blocking syscall; keep it off the runtime.
-        let tempfile = tokio::task::spawn_blocking(|| {
+        let tempfile = tokio::task::spawn_blocking(move || {
             tempfile::Builder::new()
                 .prefix("space-ecw-upload-")
-                .tempfile()
+                .tempfile_in(dir)
         })
         .await
         .map_err(|error| {
@@ -799,14 +838,53 @@ impl SpooledUpload {
             EcwProxyError::internal("Failed to stage upload")
         })?;
         let (file, path) = tempfile.into_parts();
-        Ok(Self {
+        let upload = SpooledUpload {
             file: tokio::fs::File::from_std(file),
-            path,
+            path: path.to_path_buf(),
             bytes_written: 0,
-        })
+        };
+        self.paths.push(path);
+        Ok(upload)
     }
+}
 
-    async fn write_chunk(&mut self, data: &[u8]) -> Result<(), EcwProxyError> {
+impl Drop for SpoolFiles {
+    fn drop(&mut self) {
+        let paths = std::mem::take(&mut self.paths);
+        if paths.is_empty() {
+            return;
+        }
+        let remove = move || {
+            for path in paths {
+                if let Err(error) = path.close() {
+                    tracing::warn!(%error, "failed to remove ECW upload spool file");
+                }
+            }
+        };
+        match tokio::runtime::Handle::try_current() {
+            // Detached: removal needs nothing from the request that dropped it.
+            Ok(runtime) => drop(runtime.spawn_blocking(remove)),
+            Err(_) => remove(),
+        }
+    }
+}
+
+/// A finished spool file: its path, owned by a `SpoolFiles`, and its length.
+#[derive(Debug)]
+pub(super) struct StagedUpload {
+    pub(super) path: std::path::PathBuf,
+    pub(super) len: usize,
+}
+
+#[derive(Debug)]
+pub(super) struct SpooledUpload {
+    file: tokio::fs::File,
+    path: std::path::PathBuf,
+    bytes_written: usize,
+}
+
+impl SpooledUpload {
+    pub(super) async fn write_chunk(&mut self, data: &[u8]) -> Result<(), EcwProxyError> {
         self.bytes_written = checked_file_content_len(self.bytes_written, data.len())?;
         self.file.write_all(data).await.map_err(|error| {
             tracing::warn!(%error, "failed to write ECW upload spool file");
@@ -814,39 +892,52 @@ impl SpooledUpload {
         })
     }
 
-    /// Flushes and closes the spool file, keeping only its path. Writers reopen
-    /// it by path, and a request staging many parts must not hold a descriptor
-    /// for each one.
-    async fn finish(mut self) -> Result<tempfile::TempPath, EcwProxyError> {
+    /// Flushes and closes the spool file, keeping only its path and length.
+    /// Writers reopen it by path, and a request staging many parts must not
+    /// hold a descriptor for each one.
+    pub(super) async fn finish(mut self) -> Result<StagedUpload, EcwProxyError> {
         self.file.flush().await.map_err(|error| {
             tracing::warn!(%error, "failed to flush ECW upload spool file");
             EcwProxyError::internal("Failed to stage upload")
         })?;
-        Ok(self.path)
+        Ok(StagedUpload {
+            path: self.path,
+            len: self.bytes_written,
+        })
     }
 }
 
-struct SpooledWriteState {
+struct SpooledWriteState<R> {
     sandbox_id: SandboxId,
     path: String,
     user: Option<GuestUserName>,
-    file: tokio::fs::File,
+    file: R,
+    read_failed: Option<tokio::sync::oneshot::Sender<()>>,
     open_sent: bool,
     done: bool,
 }
 
-fn spooled_write_requests(
+/// The open message, then the spool file in `E2B_FILE_WRITE_CHUNK_BYTES`
+/// chunks. A read error signals `read_failed` and leaves the stream pending
+/// instead of ending it, since a clean end would let the guest commit the
+/// prefix it already received.
+fn spooled_write_requests<R>(
     sandbox_id: SandboxId,
     path: String,
-    file: tokio::fs::File,
+    file: R,
     user: Option<GuestUserName>,
-) -> impl Stream<Item = SpacedWriteRequest> + Send + 'static {
+    read_failed: tokio::sync::oneshot::Sender<()>,
+) -> impl Stream<Item = SpacedWriteRequest> + Send + 'static
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
     stream::unfold(
         SpooledWriteState {
             sandbox_id,
             path,
             user,
             file,
+            read_failed: Some(read_failed),
             open_sent: false,
             done: false,
         },
@@ -875,7 +966,13 @@ fn spooled_write_requests(
                 Ok(read) => read,
                 Err(error) => {
                     tracing::warn!(%error, "failed to read ECW upload spool file");
-                    return None;
+                    if let Some(read_failed) = state.read_failed.take()
+                        && read_failed.send(()).is_err()
+                    {
+                        // The receiver is gone only once the call has finished.
+                        tracing::debug!("ECW upload write finished before the spool read failed");
+                    }
+                    return std::future::pending().await;
                 }
             };
             if read == 0 {

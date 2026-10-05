@@ -33,14 +33,13 @@ fn chunked_body(chunks: Vec<Vec<u8>>) -> Body {
     Body::from_stream(stream::iter(chunks.into_iter().map(Ok::<_, Infallible>)))
 }
 
-async fn collect_spooled_write(
-    upload: tempfile::TempPath,
-    path: &str,
-) -> (SpacedWriteOpen, Vec<u8>) {
-    let file = tokio::fs::File::open(upload.to_path_buf()).await.unwrap();
-    let requests = spooled_write_requests(SandboxId::new(), path.to_string(), file, None)
-        .collect::<Vec<_>>()
-        .await;
+async fn collect_spooled_write(upload: StagedUpload, path: &str) -> (SpacedWriteOpen, Vec<u8>) {
+    let file = tokio::fs::File::open(upload.path).await.unwrap();
+    let (read_failed, _read_failure) = tokio::sync::oneshot::channel();
+    let requests =
+        spooled_write_requests(SandboxId::new(), path.to_string(), file, None, read_failed)
+            .collect::<Vec<_>>()
+            .await;
     let mut requests = requests.into_iter();
     let open = requests.next().unwrap().operation.unwrap().message.unwrap();
     let spaced_write_request::Message::Open(open) = open else {
@@ -82,10 +81,12 @@ fn e2b_paths_reject_control_and_windows_paths() {
 async fn multipart_single_file_is_spooled_with_filename_and_content() {
     let body = multipart_body(&[("file", Some("nested/a.txt"), b"hello")]);
     let split = body.len() / 2;
+    let mut spool = SpoolFiles::default();
     let uploads = spool_multipart_uploads(
         chunked_body(vec![body[..split].to_vec(), body[split..].to_vec()]),
         MULTIPART_BOUNDARY,
         true,
+        &mut spool,
     )
     .await
     .unwrap();
@@ -106,10 +107,12 @@ async fn multipart_multiple_files_are_spooled_independently() {
         ("file", Some("a.txt"), b"alpha"),
         ("file", Some("b.txt"), b"beta"),
     ]);
+    let mut spool = SpoolFiles::default();
     let uploads = spool_multipart_uploads(
         chunked_body(body.chunks(17).map(<[u8]>::to_vec).collect()),
         MULTIPART_BOUNDARY,
         true,
+        &mut spool,
     )
     .await
     .unwrap();
@@ -133,9 +136,11 @@ async fn multipart_multiple_files_are_spooled_independently() {
 #[tokio::test]
 async fn multipart_path_query_overrides_filename_and_rejects_multiple_files() {
     let single = multipart_body(&[("file", Some("ignored.txt"), b"content")]);
-    let uploads = spool_multipart_uploads(Body::from(single), MULTIPART_BOUNDARY, false)
-        .await
-        .unwrap();
+    let mut spool = SpoolFiles::default();
+    let uploads =
+        spool_multipart_uploads(Body::from(single), MULTIPART_BOUNDARY, false, &mut spool)
+            .await
+            .unwrap();
     let mut writes =
         resolve_multipart_uploads(uploads, Some("override.txt".to_string()), None).unwrap();
     let (path, upload) = writes.pop().unwrap();
@@ -148,9 +153,11 @@ async fn multipart_path_query_overrides_filename_and_rejects_multiple_files() {
         ("file", Some("a.txt"), b"alpha"),
         ("file", Some("b.txt"), b"beta"),
     ]);
-    let error = spool_multipart_uploads(Body::from(multiple), MULTIPART_BOUNDARY, false)
-        .await
-        .unwrap_err();
+    let mut spool = SpoolFiles::default();
+    let error =
+        spool_multipart_uploads(Body::from(multiple), MULTIPART_BOUNDARY, false, &mut spool)
+            .await
+            .unwrap_err();
     assert_eq!(error.status, StatusCode::BAD_REQUEST);
     assert_eq!(
         error.message,
@@ -161,7 +168,8 @@ async fn multipart_path_query_overrides_filename_and_rejects_multiple_files() {
 #[tokio::test]
 async fn multipart_requires_filename_or_path() {
     let body = multipart_body(&[("file", None, b"content")]);
-    let error = spool_multipart_uploads(Body::from(body), MULTIPART_BOUNDARY, true)
+    let mut spool = SpoolFiles::default();
+    let error = spool_multipart_uploads(Body::from(body), MULTIPART_BOUNDARY, true, &mut spool)
         .await
         .unwrap_err();
     assert_eq!(error.status, StatusCode::BAD_REQUEST);
@@ -174,10 +182,12 @@ async fn multipart_requires_filename_or_path() {
 #[tokio::test]
 async fn malformed_multipart_and_missing_boundary_are_rejected() {
     assert_eq!(multipart_boundary("multipart/form-data"), None);
+    let mut spool = SpoolFiles::default();
     let error = spool_multipart_uploads(
         Body::from(multipart_body(&[("file", Some("a.txt"), b"content")])),
         "different-boundary",
         true,
+        &mut spool,
     )
     .await
     .unwrap_err();
@@ -187,9 +197,15 @@ async fn malformed_multipart_and_missing_boundary_are_rejected() {
     let missing_disposition = format!(
         "--{MULTIPART_BOUNDARY}\r\nContent-Type: application/octet-stream\r\n\r\ncontent\r\n--{MULTIPART_BOUNDARY}--\r\n"
     );
-    let error = spool_multipart_uploads(Body::from(missing_disposition), MULTIPART_BOUNDARY, true)
-        .await
-        .unwrap_err();
+    let mut spool = SpoolFiles::default();
+    let error = spool_multipart_uploads(
+        Body::from(missing_disposition),
+        MULTIPART_BOUNDARY,
+        true,
+        &mut spool,
+    )
+    .await
+    .unwrap_err();
     assert_eq!(error.status, StatusCode::BAD_REQUEST);
     assert_eq!(error.message, "Missing multipart Content-Disposition");
 }
@@ -213,10 +229,16 @@ async fn multipart_whole_stream_limit_rejects_without_reading_the_rest() {
     })
     .map(Ok::<_, Infallible>);
 
-    let error =
-        spool_multipart_uploads_with_limit(Body::from_stream(stream), MULTIPART_BOUNDARY, 8, true)
-            .await
-            .unwrap_err();
+    let mut spool = SpoolFiles::default();
+    let error = spool_multipart_uploads_with_limit(
+        Body::from_stream(stream),
+        MULTIPART_BOUNDARY,
+        8,
+        true,
+        &mut spool,
+    )
+    .await
+    .unwrap_err();
     assert_eq!(error.status, StatusCode::PAYLOAD_TOO_LARGE);
     assert!(polls.load(Ordering::SeqCst) < 3);
 }
@@ -236,10 +258,16 @@ async fn multipart_limit_caps_the_whole_body_across_file_parts() {
         ("file", Some("b.txt"), &[b'b'; 6]),
     ]);
     let limit = body.len() - 1;
-    let error =
-        spool_multipart_uploads_with_limit(Body::from(body), MULTIPART_BOUNDARY, limit, true)
-            .await
-            .unwrap_err();
+    let mut spool = SpoolFiles::default();
+    let error = spool_multipart_uploads_with_limit(
+        Body::from(body),
+        MULTIPART_BOUNDARY,
+        limit,
+        true,
+        &mut spool,
+    )
+    .await
+    .unwrap_err();
     assert_eq!(error.status, StatusCode::PAYLOAD_TOO_LARGE);
 }
 
@@ -261,9 +289,15 @@ async fn multipart_part_without_header_terminator_is_rejected_before_buffering_t
     })
     .map(Ok::<_, Infallible>);
 
-    let error = spool_multipart_uploads(Body::from_stream(stream), MULTIPART_BOUNDARY, true)
-        .await
-        .unwrap_err();
+    let mut spool = SpoolFiles::default();
+    let error = spool_multipart_uploads(
+        Body::from_stream(stream),
+        MULTIPART_BOUNDARY,
+        true,
+        &mut spool,
+    )
+    .await
+    .unwrap_err();
     assert_eq!(error.status, StatusCode::BAD_REQUEST);
     assert!(polls.load(Ordering::SeqCst) < frames / 2);
 }
@@ -293,10 +327,12 @@ async fn multipart_framing_lower_bound_never_exceeds_the_encoded_part() {
     let shortest = format!(
         "--{MULTIPART_BOUNDARY}\r\ncontent-type:a\ncontent-disposition:form-data; name=\"file\"; filename=\"a.txt\"\r\n\r\n\r\n"
     );
+    let mut spool = SpoolFiles::default();
     let uploads = spool_multipart_uploads(
         Body::from(format!("{shortest}--{MULTIPART_BOUNDARY}--\r\n")),
         MULTIPART_BOUNDARY,
         true,
+        &mut spool,
     )
     .await
     .unwrap();
@@ -348,7 +384,8 @@ async fn multipart_file_part_with_filename_before_name_is_spooled() {
     let body = format!(
         "--{MULTIPART_BOUNDARY}\r\nContent-Disposition: form-data; filename=\"my name.txt\"; name=\"file\"\r\n\r\ncontent\r\n--{MULTIPART_BOUNDARY}--\r\n"
     );
-    let uploads = spool_multipart_uploads(Body::from(body), MULTIPART_BOUNDARY, true)
+    let mut spool = SpoolFiles::default();
+    let uploads = spool_multipart_uploads(Body::from(body), MULTIPART_BOUNDARY, true, &mut spool)
         .await
         .unwrap();
     assert_eq!(uploads.len(), 1);
@@ -373,6 +410,20 @@ fn content_disposition_parse_ignores_text_inside_quoted_values() {
         filename: filename.map(str::to_string),
     };
     let cases: [(&[u8], ContentDispositionE2b); 14] = [
+        // Under one quoted-pair rule, `name=file` inside a filename stays in
+        // the filename in every parameter order.
+        (
+            br#"form-data; filename="a\"; name=file; x=\"rest"; name="meta""#,
+            parsed(Some("meta"), Some(r#"a"; name=file; x="rest"#)),
+        ),
+        (
+            br#"form-data; name="meta"; filename="a\"; name=file; x=\"rest""#,
+            parsed(Some("meta"), Some(r#"a"; name=file; x="rest"#)),
+        ),
+        (
+            br#"form-data; filename="a\"; name=\"file\"; x=y"; name=meta"#,
+            parsed(Some("meta"), Some(r#"a"; name="file"; x=y"#)),
+        ),
         (
             br#"form-data; name="file"; filename="a.txt""#,
             parsed(Some("file"), Some("a.txt")),
@@ -403,22 +454,8 @@ fn content_disposition_parse_ignores_text_inside_quoted_values() {
             parsed(Some("file"), Some("\u{fc} name.txt")),
         ),
         (
-            br#"form-data; name=file; filename="a.txt"; filename="b.txt""#,
-            parsed(Some("file"), Some("a.txt")),
-        ),
-        (
             br#"form-data; filename="a.txt""#,
             parsed(None, Some("a.txt")),
-        ),
-        // A browser filename ending in a backslash, alone and followed by
-        // another parameter.
-        (
-            br#"form-data; name="file"; filename="dir\""#,
-            parsed(Some("file"), Some(r"dir\")),
-        ),
-        (
-            br#"form-data; filename="dir\" ; name="file""#,
-            parsed(Some("file"), Some(r"dir\")),
         ),
         // httpx doubles backslashes; Go also writes `\"`.
         (
@@ -444,6 +481,12 @@ fn content_disposition_parse_ignores_text_inside_quoted_values() {
         br#"form-data; name="file"; filename=a.txt""#,
         br#"form-data; filename=a"b; name="file""#,
         b"form-data; name=\"file\"; filename=\"\xff.txt\"",
+        // A raw filename ending in a backslash leaves its quote escaped.
+        br#"form-data; name="file"; filename="dir\""#,
+        br#"form-data; filename="dir\" ; name="file""#,
+        // A repeated parameter is ambiguous about which one applies.
+        br#"form-data; name=file; filename="a.txt"; filename="b.txt""#,
+        br#"form-data; name="meta"; filename="a.txt"; name="file""#,
     ] {
         let shown = String::from_utf8_lossy(malformed).into_owned();
         let error = parse(malformed).unwrap_err();
@@ -458,7 +501,8 @@ fn content_disposition_parse_ignores_text_inside_quoted_values() {
 async fn multipart_file_part_with_an_impossible_filename_is_rejected_before_spooling() {
     let filename = "f".repeat(MAX_GUEST_PATH_BYTES + 1);
     let body = multipart_body(&[("file", Some(filename.as_str()), b"content")]);
-    let error = spool_multipart_uploads(Body::from(body), MULTIPART_BOUNDARY, true)
+    let mut spool = SpoolFiles::default();
+    let error = spool_multipart_uploads(Body::from(body), MULTIPART_BOUNDARY, true, &mut spool)
         .await
         .unwrap_err();
     assert_eq!(error.status, StatusCode::BAD_REQUEST);
@@ -472,7 +516,8 @@ async fn multipart_file_part_with_an_impossible_filename_is_rejected_before_spoo
 async fn multipart_filename_is_ignored_when_a_path_query_names_the_file() {
     let filename = "f".repeat(MAX_GUEST_PATH_BYTES + 1);
     let body = multipart_body(&[("file", Some(filename.as_str()), b"content")]);
-    let uploads = spool_multipart_uploads(Body::from(body), MULTIPART_BOUNDARY, false)
+    let mut spool = SpoolFiles::default();
+    let uploads = spool_multipart_uploads(Body::from(body), MULTIPART_BOUNDARY, false, &mut spool)
         .await
         .unwrap();
     assert_eq!(uploads.len(), 1);
@@ -498,7 +543,8 @@ async fn multipart_parts_are_classified_by_their_real_name_parameter() {
     }
     body.extend_from_slice(format!("--{MULTIPART_BOUNDARY}--\r\n").as_bytes());
 
-    let uploads = spool_multipart_uploads(Body::from(body), MULTIPART_BOUNDARY, true)
+    let mut spool = SpoolFiles::default();
+    let uploads = spool_multipart_uploads(Body::from(body), MULTIPART_BOUNDARY, true, &mut spool)
         .await
         .unwrap();
     assert_eq!(uploads.len(), 1);
@@ -523,10 +569,15 @@ async fn multipart_part_count_is_capped() {
     // Tiny parts cost the parser almost nothing each, so the part cap, not the
     // stream cap, is what stops them.
     let parts = vec![("file", Some("a.txt"), b"".as_slice()); E2B_MULTIPART_PART_LIMIT + 1];
-    let error =
-        spool_multipart_uploads(Body::from(multipart_body(&parts)), MULTIPART_BOUNDARY, true)
-            .await
-            .unwrap_err();
+    let mut spool = SpoolFiles::default();
+    let error = spool_multipart_uploads(
+        Body::from(multipart_body(&parts)),
+        MULTIPART_BOUNDARY,
+        true,
+        &mut spool,
+    )
+    .await
+    .unwrap_err();
     assert_eq!(error.status, StatusCode::PAYLOAD_TOO_LARGE);
     assert_eq!(
         error.message,
@@ -545,9 +596,11 @@ async fn multipart_framing_overhead_beyond_the_parse_buffer_is_accepted() {
     let body = multipart_body(&parts);
     let frames = body.chunks(64 * 1024).map(<[u8]>::to_vec).collect();
 
-    let uploads = spool_multipart_uploads(chunked_body(frames), MULTIPART_BOUNDARY, true)
-        .await
-        .unwrap();
+    let mut spool = SpoolFiles::default();
+    let uploads =
+        spool_multipart_uploads(chunked_body(frames), MULTIPART_BOUNDARY, true, &mut spool)
+            .await
+            .unwrap();
     assert_eq!(uploads.len(), 1);
     let upload = uploads.into_iter().next().unwrap();
     assert_eq!(upload.filename.as_deref(), Some("last.txt"));
@@ -571,9 +624,11 @@ async fn multipart_file_larger_than_the_parse_buffer_streams_in_frames() {
     ]);
     let frames = body.chunks(frame_len).map(<[u8]>::to_vec).collect();
 
-    let uploads = spool_multipart_uploads(chunked_body(frames), MULTIPART_BOUNDARY, true)
-        .await
-        .unwrap();
+    let mut spool = SpoolFiles::default();
+    let uploads =
+        spool_multipart_uploads(chunked_body(frames), MULTIPART_BOUNDARY, true, &mut spool)
+            .await
+            .unwrap();
     assert_eq!(uploads.len(), 1);
     let upload = uploads.into_iter().next().unwrap();
     assert_eq!(upload.filename.as_deref(), Some("large.bin"));
@@ -730,16 +785,23 @@ fn content_length_precheck_rejects_oversized_uploads() {
 #[tokio::test]
 async fn octet_stream_upload_is_spooled_and_written_in_chunks() {
     let sandbox_id = SandboxId::new();
-    let upload = spool_body_upload(chunked_body(vec![b"hello ".to_vec(), b"world".to_vec()]))
-        .await
-        .unwrap();
-    let file = tokio::fs::File::open(upload.to_path_buf()).await.unwrap();
+    let mut spool = SpoolFiles::default();
+    let upload = spool_body_upload(
+        chunked_body(vec![b"hello ".to_vec(), b"world".to_vec()]),
+        &mut spool,
+    )
+    .await
+    .unwrap();
+    assert_eq!(upload.len, b"hello world".len());
+    let file = tokio::fs::File::open(&upload.path).await.unwrap();
 
+    let (read_failed, _read_failure) = tokio::sync::oneshot::channel();
     let requests = spooled_write_requests(
         sandbox_id,
         "/tmp/hello.txt".to_string(),
         file,
         Some(GuestUserName::parse("user").unwrap()),
+        read_failed,
     )
     .collect::<Vec<_>>()
     .await;
@@ -793,4 +855,141 @@ async fn in_memory_write_requests_are_replayable() {
 
     assert_eq!(first, second);
     assert_eq!(first.len(), 2);
+}
+
+/// Yields `chunks`, then fails every later read.
+struct FailingAfter {
+    chunks: std::collections::VecDeque<Vec<u8>>,
+}
+
+impl tokio::io::AsyncRead for FailingAfter {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        _context: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(match self.chunks.pop_front() {
+            Some(chunk) => {
+                buf.put_slice(&chunk);
+                Ok(())
+            }
+            None => Err(std::io::Error::other("injected spool read failure")),
+        })
+    }
+}
+
+#[tokio::test]
+async fn spool_read_failure_signals_the_transfer_instead_of_ending_the_stream() {
+    use futures_util::FutureExt as _;
+
+    let (read_failed, mut read_failure) = tokio::sync::oneshot::channel();
+    let mut stream = Box::pin(spooled_write_requests(
+        SandboxId::new(),
+        "/workspace/a".to_string(),
+        FailingAfter {
+            chunks: [b"first chunk".to_vec()].into(),
+        },
+        None,
+        read_failed,
+    ));
+    let open = stream.next().await.unwrap();
+    assert!(matches!(
+        open.operation.unwrap().message.unwrap(),
+        spaced_write_request::Message::Open(_)
+    ));
+    let data = stream.next().await.unwrap();
+    let spaced_write_request::Message::Data(data) = data.operation.unwrap().message.unwrap() else {
+        panic!("second request must carry data");
+    };
+    assert_eq!(data, b"first chunk");
+
+    // The failed read neither yields nor ends the stream, and tells the
+    // transfer, which drops the call.
+    assert!(stream.next().now_or_never().is_none());
+    assert_eq!(read_failure.try_recv(), Ok(()));
+}
+
+#[test]
+fn spooled_write_must_acknowledge_every_staged_byte() {
+    check_spooled_write_len(11, 11).unwrap();
+    let error = check_spooled_write_len(10, 11).unwrap_err();
+    assert_eq!(error.status, StatusCode::INTERNAL_SERVER_ERROR);
+    check_spooled_write_len(12, 11).unwrap_err();
+}
+
+async fn spool_dir_entries(dir: &std::path::Path) -> usize {
+    std::fs::read_dir(dir).unwrap().count()
+}
+
+/// Spool removal runs on a blocking task after the guard drops.
+async fn wait_for_empty_spool_dir(dir: &std::path::Path) {
+    for _ in 0..500 {
+        if spool_dir_entries(dir).await == 0 {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("spool files were not removed: {dir:?}");
+}
+
+#[tokio::test]
+async fn staged_spool_files_are_removed_when_a_later_part_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut body = multipart_body(&[
+        ("file", Some("a.txt"), b"a"),
+        ("file", Some("b.txt"), b"b"),
+        ("file", Some("c.txt"), b"c"),
+    ]);
+    // Replace the closing delimiter with a part whose header block never ends.
+    body.truncate(body.len() - format!("--{MULTIPART_BOUNDARY}--\r\n").len());
+    body.extend_from_slice(
+        format!("--{MULTIPART_BOUNDARY}\r\nContent-Disposition: form-data; name=\"file\"")
+            .as_bytes(),
+    );
+    let mut spool = SpoolFiles::in_dir(dir.path().to_path_buf());
+    spool_multipart_uploads(Body::from(body), MULTIPART_BOUNDARY, true, &mut spool)
+        .await
+        .unwrap_err();
+    assert_eq!(spool_dir_entries(dir.path()).await, 3);
+
+    drop(spool);
+    wait_for_empty_spool_dir(dir.path()).await;
+}
+
+#[tokio::test]
+async fn staged_spool_files_are_removed_when_the_request_is_cancelled() {
+    let dir = tempfile::tempdir().unwrap();
+    let staged = multipart_body(&[("file", Some("a.txt"), b"a"), ("file", Some("b.txt"), b"b")]);
+    // The two parts arrive, then the body stalls inside a third.
+    let prefix = staged[..staged.len() - format!("--{MULTIPART_BOUNDARY}--\r\n").len()].to_vec();
+    let body =
+        Body::from_stream(stream::iter([Ok::<_, Infallible>(prefix)]).chain(stream::pending()));
+    let spool_dir = dir.path().to_path_buf();
+    let request = tokio::spawn(async move {
+        let mut spool = SpoolFiles::in_dir(spool_dir);
+        spool_multipart_uploads(body, MULTIPART_BOUNDARY, true, &mut spool).await
+    });
+    for _ in 0..500 {
+        if spool_dir_entries(dir.path()).await == 2 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(spool_dir_entries(dir.path()).await, 2);
+
+    request.abort();
+    assert!(request.await.unwrap_err().is_cancelled());
+    wait_for_empty_spool_dir(dir.path()).await;
+}
+
+#[tokio::test]
+async fn embedded_name_file_in_a_filename_does_not_make_a_part_a_file() {
+    let body = format!(
+        "--{MULTIPART_BOUNDARY}\r\nContent-Disposition: form-data; filename=\"a\\\"; name=file; x=\\\"rest\"; name=\"meta\"\r\n\r\ncontent\r\n--{MULTIPART_BOUNDARY}--\r\n"
+    );
+    let mut spool = SpoolFiles::default();
+    let uploads = spool_multipart_uploads(Body::from(body), MULTIPART_BOUNDARY, true, &mut spool)
+        .await
+        .unwrap();
+    assert!(uploads.is_empty());
 }

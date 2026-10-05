@@ -17,8 +17,8 @@ use futures_util::{Stream, stream};
 use pplx_space_common_core::types::{GuestUserName, MAX_GUEST_PATH_BYTES};
 
 use super::{
-    E2B_FILE_CONTENT_LIMIT_BYTES, EcwProxyError, ResponseKind, ResponseOrigin, SpooledUpload,
-    e2b_request_root, file_too_large_error,
+    E2B_FILE_CONTENT_LIMIT_BYTES, EcwProxyError, ResponseKind, ResponseOrigin, SpoolFiles,
+    StagedUpload, e2b_request_root, file_too_large_error,
 };
 
 /// Request bytes multer may hold in its parse buffer before feeding pauses.
@@ -39,7 +39,7 @@ pub(super) const E2B_MULTIPART_PART_LIMIT: usize = 1000;
 #[derive(Debug)]
 pub(super) struct MultipartUploadPartE2b {
     pub(super) filename: Option<String>,
-    pub(super) upload: tempfile::TempPath,
+    pub(super) upload: StagedUpload,
 }
 
 fn too_many_multipart_parts_error() -> EcwProxyError {
@@ -71,12 +71,14 @@ pub(super) async fn spool_multipart_uploads(
     body: Body,
     boundary: &str,
     filenames_name_paths: bool,
+    spool: &mut SpoolFiles,
 ) -> Result<Vec<MultipartUploadPartE2b>, EcwProxyError> {
     spool_multipart_uploads_with_limit(
         body,
         boundary,
         E2B_FILE_CONTENT_LIMIT_BYTES,
         filenames_name_paths,
+        spool,
     )
     .await
 }
@@ -86,6 +88,7 @@ pub(super) async fn spool_multipart_uploads_with_limit(
     boundary: &str,
     limit: usize,
     filenames_name_paths: bool,
+    spool: &mut SpoolFiles,
 ) -> Result<Vec<MultipartUploadPartE2b>, EcwProxyError> {
     // Capping the whole body, not each part, keeps the pre-streaming contract
     // and bounds the spool disk a single request can use across all its parts.
@@ -139,7 +142,7 @@ pub(super) async fn spool_multipart_uploads_with_limit(
             ));
         }
         let mut upload = if is_file {
-            Some(SpooledUpload::new().await?)
+            Some(spool.create().await?)
         } else {
             None
         };
@@ -174,21 +177,15 @@ pub(super) struct ContentDispositionE2b {
 }
 
 impl ContentDispositionE2b {
-    /// Splits parameters on `;` outside quoted values. Clients escape quoted
-    /// values differently: browsers, urllib3, curl, and undici send `"` as
-    /// `%22` and backslashes as themselves; httpx doubles backslashes and sends
-    /// `"` as `%22`; Go writes `\\` and `\"`. So `\\` and `\"` are read as
-    /// escapes, except a `\"` that ends the value, which is a literal backslash
-    /// before the closing quote (a browser filename ending in `\`). This reads
-    /// httpx and Go filenames, and browser filenames without backslash runs,
-    /// as sent. Two inputs stay ambiguous: a run of raw backslashes from a
-    /// browser-style client collapses (`a\\b` reads as `a\b`), and a Go
-    /// filename with `"` directly before `;` ends at that quote or is
-    /// rejected. Other backslashes, such as Windows path separators, stay
-    /// literal. The first occurrence of a parameter wins. Unbalanced quotes,
-    /// a quote inside an unquoted value, and non-UTF-8 values reject the part
-    /// instead of letting stray quotes reach the write path or a file part go
-    /// unnamed.
+    /// Splits parameters on `;` outside quoted values. Inside a quoted value,
+    /// `\\` and `\"` are always escapes (RFC 7230 quoted-pairs, as httpx and
+    /// Go write them); any other backslash is literal, which reads browser,
+    /// curl, undici, and urllib3 filenames (`"` sent as `%22`, `\` sent raw)
+    /// as sent. One rule everywhere means a parameter's text can never end or
+    /// start another parameter. Inputs that rule leaves malformed are
+    /// rejected rather than guessed at: unbalanced quotes (including a raw
+    /// filename ending in `\`), a quote inside an unquoted value, a repeated
+    /// `name` or `filename`, and non-UTF-8 values.
     pub(super) fn parse(headers: &HeaderMap) -> Result<Self, EcwProxyError> {
         let value = headers
             .get(header::CONTENT_DISPOSITION)
@@ -232,8 +229,6 @@ impl ContentDispositionE2b {
             let bytes = match raw.strip_prefix(b"\"") {
                 Some(rest) => {
                     let inner = rest.strip_suffix(b"\"").ok_or_else(malformed)?;
-                    // The closing quote is already stripped, so a trailing
-                    // backslash here is the literal one `is_escape` left alone.
                     let mut unescaped = Vec::with_capacity(inner.len());
                     let mut bytes = inner.iter().peekable();
                     while let Some(&byte) = bytes.next() {
@@ -252,7 +247,9 @@ impl ContentDispositionE2b {
                 None => raw.to_vec(),
             };
             let text = String::from_utf8(bytes).map_err(|_| malformed())?;
-            slot.get_or_insert(text);
+            if slot.replace(text).is_some() {
+                return Err(malformed());
+            }
         }
         Ok(disposition)
     }
@@ -261,16 +258,7 @@ impl ContentDispositionE2b {
 /// Whether the backslash at `index`, inside a quoted value, escapes the next
 /// byte (see `ContentDispositionE2b::parse`).
 fn is_escape(value: &[u8], index: usize) -> bool {
-    match value.get(index + 1) {
-        Some(b'\\') => true,
-        Some(b'"') => !value
-            .get(index + 2..)
-            .unwrap_or_default()
-            .iter()
-            .find(|byte| !byte.is_ascii_whitespace())
-            .is_none_or(|&byte| byte == b';'),
-        _ => false,
-    }
+    matches!(value.get(index + 1), Some(b'\\' | b'"'))
 }
 
 fn multipart_upload_error(error: multer::Error) -> EcwProxyError {
@@ -335,7 +323,7 @@ pub(super) fn resolve_multipart_uploads(
     uploads: Vec<MultipartUploadPartE2b>,
     query_path: Option<String>,
     user: Option<&GuestUserName>,
-) -> Result<Vec<(String, tempfile::TempPath)>, EcwProxyError> {
+) -> Result<Vec<(String, StagedUpload)>, EcwProxyError> {
     uploads
         .into_iter()
         .map(|upload| {
