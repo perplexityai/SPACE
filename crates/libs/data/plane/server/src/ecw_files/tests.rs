@@ -36,7 +36,7 @@ async fn collect_spooled_write(
     mut upload: SpooledUpload,
     path: &str,
 ) -> (SpacedWriteOpen, Vec<u8>) {
-    upload.rewind().await.unwrap();
+    upload.flush().await.unwrap();
     let file = tokio::fs::File::open(upload._path.to_path_buf())
         .await
         .unwrap();
@@ -427,7 +427,12 @@ fn content_length_precheck_rejects_oversized_uploads() {
             .parse()
             .unwrap(),
     );
-    let error = reject_oversized_content_length(&headers).unwrap_err();
+    let error = reject_oversized_content_length(
+        &headers,
+        E2B_FILE_CONTENT_LIMIT_BYTES,
+        file_too_large_error,
+    )
+    .unwrap_err();
     assert_eq!(error.status, StatusCode::PAYLOAD_TOO_LARGE);
 }
 

@@ -1,6 +1,5 @@
 use std::{
     convert::Infallible,
-    io::SeekFrom,
     pin::Pin,
     sync::{
         Arc,
@@ -37,7 +36,7 @@ use prost::Message;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use time::{Duration as TimeDuration, OffsetDateTime, format_description::well_known::Rfc3339};
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::{
     AttachedStreamPermit, DataPlaneState, ECW_FILE_WATCH_STREAM_KIND, EcwProxyError,
@@ -53,12 +52,16 @@ use crate::runtime_route::{
 const E2B_FILE_CONTENT_LIMIT_BYTES: usize = 256 * 1024 * 1024;
 const E2B_FILE_WRITE_CHUNK_BYTES: usize = 3 * 1024 * 1024;
 const E2B_PROTO_BODY_LIMIT: usize = 1024 * 1024;
-const E2B_JSON_FILE_WRITE_BODY_LIMIT_BYTES: usize = E2B_PROTO_BODY_LIMIT;
+/// Stated as "1 MiB" in `json_file_write_body_too_large_error`.
+const E2B_JSON_FILE_WRITE_BODY_LIMIT_BYTES: usize = 1024 * 1024;
 /// Request bytes multer may hold without yielding them as field data: part
 /// headers, boundaries, and the preamble. Legitimate parts need a few hundred
 /// bytes; the cap stops a body without a header terminator or boundary from
 /// accumulating in multer's parse buffer.
 const E2B_MULTIPART_PARSE_BUFFER_LIMIT_BYTES: usize = 1024 * 1024;
+/// Body bytes fed to multer per poll before yielding, so its parse buffer drains
+/// between batches instead of absorbing every immediately-ready frame.
+const E2B_MULTIPART_FEED_BATCH_BYTES: usize = 256 * 1024;
 
 #[derive(Debug, Deserialize)]
 pub(super) struct FileReadQueryE2b {
@@ -294,19 +297,20 @@ pub(super) async fn write_file(
         .unwrap_or("application/json");
     let user = extract_write_user(query.username.as_deref(), &headers)?;
     if is_octet_stream_content_type(content_type) {
-        reject_oversized_content_length(&headers)?;
+        reject_oversized_content_length(
+            &headers,
+            E2B_FILE_CONTENT_LIMIT_BYTES,
+            file_too_large_error,
+        )?;
         let Some(path) = query.path else {
             return Err(EcwProxyError::bad_request(
                 "path query parameter is required for octet-stream uploads",
             ));
         };
         let path = e2b_request_root(&path, user.as_ref())?;
-        spaced_write_body_stream(&state, route, path.clone(), body, user).await?;
-        return Ok(Json(vec![FileWriteInfoE2b {
-            name: path_basename(&path).to_string(),
-            file_type: "file",
-            path,
-        }]));
+        let upload = spool_body_upload(body).await?;
+        spaced_write_spooled(&state, route, path.clone(), upload, user).await?;
+        return Ok(Json(vec![file_write_info(path)]));
     }
 
     if is_json_content_type(content_type) {
@@ -320,15 +324,15 @@ pub(super) async fn write_file(
             user,
         )
         .await?;
-        return Ok(Json(vec![FileWriteInfoE2b {
-            name: path_basename(&path).to_string(),
-            file_type: "file",
-            path,
-        }]));
+        return Ok(Json(vec![file_write_info(path)]));
     }
 
     if content_type.starts_with("multipart/form-data") {
-        reject_oversized_content_length(&headers)?;
+        reject_oversized_content_length(
+            &headers,
+            E2B_FILE_CONTENT_LIMIT_BYTES,
+            file_too_large_error,
+        )?;
         let boundary = multipart_boundary(content_type).ok_or_else(|| {
             EcwProxyError::bad_request("multipart/form-data boundary is required")
         })?;
@@ -338,11 +342,7 @@ pub(super) async fn write_file(
         let mut route = route;
         for (path, upload) in writes {
             route = spaced_write_spooled(&state, route, path.clone(), upload, user.clone()).await?;
-            written.push(FileWriteInfoE2b {
-                name: path_basename(&path).to_string(),
-                file_type: "file",
-                path,
-            });
+            written.push(file_write_info(path));
         }
         return Ok(Json(written));
     }
@@ -352,25 +352,19 @@ pub(super) async fn write_file(
     ))
 }
 
-fn reject_oversized_content_length(headers: &HeaderMap) -> Result<(), EcwProxyError> {
-    let Some(content_length) = headers
-        .get(header::CONTENT_LENGTH)
-        .and_then(|value| value.to_str().ok())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    else {
-        return Ok(());
-    };
-    let content_length = content_length
-        .parse::<usize>()
-        .map_err(|_| EcwProxyError::bad_request("Invalid Content-Length"))?;
-    if content_length > E2B_FILE_CONTENT_LIMIT_BYTES {
-        return Err(file_too_large_error());
+fn file_write_info(path: String) -> FileWriteInfoE2b {
+    FileWriteInfoE2b {
+        name: path_basename(&path).to_string(),
+        file_type: "file",
+        path,
     }
-    Ok(())
 }
 
-fn reject_oversized_json_content_length(headers: &HeaderMap) -> Result<(), EcwProxyError> {
+fn reject_oversized_content_length(
+    headers: &HeaderMap,
+    limit: usize,
+    too_large: fn() -> EcwProxyError,
+) -> Result<(), EcwProxyError> {
     let Some(content_length) = headers
         .get(header::CONTENT_LENGTH)
         .and_then(|value| value.to_str().ok())
@@ -382,8 +376,8 @@ fn reject_oversized_json_content_length(headers: &HeaderMap) -> Result<(), EcwPr
     let content_length = content_length
         .parse::<usize>()
         .map_err(|_| EcwProxyError::bad_request("Invalid Content-Length"))?;
-    if content_length > E2B_JSON_FILE_WRITE_BODY_LIMIT_BYTES {
-        return Err(json_file_write_body_too_large_error());
+    if content_length > limit {
+        return Err(too_large());
     }
     Ok(())
 }
@@ -724,33 +718,14 @@ async fn ensure_parent_dir(
     Ok(route)
 }
 
-async fn spaced_write_body_stream(
-    state: &DataPlaneState,
-    route: EcwResolvedRoute,
-    path: String,
-    body: Body,
-    user: Option<GuestUserName>,
-) -> Result<EcwResolvedRoute, EcwProxyError> {
-    let upload = spool_body_upload(body).await?;
-    spaced_write_spooled(state, route, path, upload, user).await
-}
-
-async fn spool_body_upload(body: Body) -> Result<SpooledUpload, EcwProxyError> {
-    spool_body_upload_with_limit(body, E2B_FILE_CONTENT_LIMIT_BYTES).await
-}
-
-async fn spool_body_upload_with_limit(
-    mut body: Body,
-    limit: usize,
-) -> Result<SpooledUpload, EcwProxyError> {
+async fn spool_body_upload(mut body: Body) -> Result<SpooledUpload, EcwProxyError> {
     let mut upload = SpooledUpload::new().await?;
     while let Some(frame) = body.frame().await {
         let frame = frame.map_err(|_| EcwProxyError::bad_request("Invalid request body"))?;
         if let Some(data) = frame.data_ref() {
-            upload.write_chunk_with_limit(data, limit).await?;
+            upload.write_chunk(data).await?;
         }
     }
-    upload.rewind().await?;
     Ok(upload)
 }
 
@@ -762,7 +737,7 @@ async fn spaced_write_spooled(
     user: Option<GuestUserName>,
 ) -> Result<EcwResolvedRoute, EcwProxyError> {
     let route = ensure_parent_dir(state, route, &path, user.clone()).await?;
-    upload.rewind().await?;
+    upload.flush().await?;
     let upload_path = upload._path.to_path_buf();
 
     let (_, route) = bounded_ecw_route_transfer(
@@ -824,29 +799,20 @@ impl SpooledUpload {
         })
     }
 
-    async fn write_chunk_with_limit(
-        &mut self,
-        data: &[u8],
-        limit: usize,
-    ) -> Result<(), EcwProxyError> {
-        self.bytes_written =
-            checked_file_content_len_with_limit(self.bytes_written, data.len(), limit)?;
+    async fn write_chunk(&mut self, data: &[u8]) -> Result<(), EcwProxyError> {
+        self.bytes_written = checked_file_content_len(self.bytes_written, data.len())?;
         self.file.write_all(data).await.map_err(|error| {
             tracing::warn!(%error, "failed to write ECW upload spool file");
             EcwProxyError::internal("Failed to stage upload")
         })
     }
 
-    async fn rewind(&mut self) -> Result<(), EcwProxyError> {
+    /// Writers reopen the spool file by path, so only the flush matters.
+    async fn flush(&mut self) -> Result<(), EcwProxyError> {
         self.file.flush().await.map_err(|error| {
             tracing::warn!(%error, "failed to flush ECW upload spool file");
             EcwProxyError::internal("Failed to stage upload")
-        })?;
-        self.file.seek(SeekFrom::Start(0)).await.map_err(|error| {
-            tracing::warn!(%error, "failed to rewind ECW upload spool file");
-            EcwProxyError::internal("Failed to stage upload")
-        })?;
-        Ok(())
+        })
     }
 }
 
@@ -918,18 +884,10 @@ fn spooled_write_requests(
 }
 
 fn checked_file_content_len(current_len: usize, chunk_len: usize) -> Result<usize, EcwProxyError> {
-    checked_file_content_len_with_limit(current_len, chunk_len, E2B_FILE_CONTENT_LIMIT_BYTES)
-}
-
-fn checked_file_content_len_with_limit(
-    current_len: usize,
-    chunk_len: usize,
-    limit: usize,
-) -> Result<usize, EcwProxyError> {
     let next_len = current_len
         .checked_add(chunk_len)
         .ok_or_else(file_too_large_error)?;
-    if next_len > limit {
+    if next_len > E2B_FILE_CONTENT_LIMIT_BYTES {
         return Err(file_too_large_error());
     }
 
@@ -1011,29 +969,28 @@ async fn read_json_file_write_request(
     headers: &HeaderMap,
     body: Body,
 ) -> Result<FileWriteRequestE2b, EcwProxyError> {
-    reject_oversized_json_content_length(headers)?;
+    reject_oversized_content_length(
+        headers,
+        E2B_JSON_FILE_WRITE_BODY_LIMIT_BYTES,
+        json_file_write_body_too_large_error,
+    )?;
     let body = buffer_json_file_write_body(body).await?;
     serde_json::from_slice(&body)
         .map_err(|_| EcwProxyError::bad_request("Invalid JSON file write request"))
 }
 
-async fn buffer_json_file_write_body(mut body: Body) -> Result<Bytes, EcwProxyError> {
-    let mut buffered = Vec::new();
-    while let Some(frame) = body.frame().await {
-        let frame = frame.map_err(|_| EcwProxyError::bad_request("Invalid request body"))?;
-        let Some(data) = frame.data_ref() else {
-            continue;
-        };
-        let next_len = buffered
-            .len()
-            .checked_add(data.len())
-            .ok_or_else(json_file_write_body_too_large_error)?;
-        if next_len > E2B_JSON_FILE_WRITE_BODY_LIMIT_BYTES {
-            return Err(json_file_write_body_too_large_error());
-        }
-        buffered.extend_from_slice(data);
-    }
-    Ok(Bytes::from(buffered))
+async fn buffer_json_file_write_body(body: Body) -> Result<Bytes, EcwProxyError> {
+    to_bytes(body, E2B_JSON_FILE_WRITE_BODY_LIMIT_BYTES)
+        .await
+        .map_err(|error| {
+            let exceeded_limit = std::error::Error::source(&error)
+                .is_some_and(|source| source.is::<http_body_util::LengthLimitError>());
+            if exceeded_limit {
+                json_file_write_body_too_large_error()
+            } else {
+                EcwProxyError::bad_request("Invalid request body")
+            }
+        })
 }
 
 fn file_write_content_to_bytes(content: Value) -> Result<Vec<u8>, EcwProxyError> {
@@ -1085,6 +1042,7 @@ async fn spool_multipart_uploads_with_limit(
 ) -> Result<Vec<MultipartUploadPartE2b>, EcwProxyError> {
     // Capping the whole body, not each part, keeps the pre-streaming contract
     // and bounds the spool disk a single request can use across all its parts.
+    // It also bounds every part, so spool writes need no separate check.
     let constraints =
         multer::Constraints::new().size_limit(multer::SizeLimit::new().whole_stream(limit as u64));
     let field_bytes = Arc::new(AtomicUsize::new(0));
@@ -1117,11 +1075,10 @@ async fn spool_multipart_uploads_with_limit(
         while let Some(chunk) = field.chunk().await.map_err(multipart_upload_error)? {
             field_bytes.fetch_add(chunk.len(), Ordering::Relaxed);
             if let Some(upload) = upload.as_mut() {
-                upload.write_chunk_with_limit(&chunk, limit).await?;
+                upload.write_chunk(&chunk).await?;
             }
         }
-        if let Some(mut upload) = upload {
-            upload.rewind().await?;
+        if let Some(upload) = upload {
             uploads.push(MultipartUploadPartE2b { filename, upload });
         }
     }
@@ -1140,18 +1097,18 @@ fn fair_body_data_stream(
     field_bytes: Arc<AtomicUsize>,
 ) -> impl Stream<Item = Result<Bytes, axum::Error>> + Send + 'static {
     // Multer drains every immediately-ready frame into its parse buffer. Force
-    // one pending poll between frames so request bursts stay frame-bounded.
+    // a pending poll after each batch so request bursts stay batch-bounded.
     let mut body = Box::pin(body.into_data_stream());
-    let mut yielded_frame = false;
+    let mut fed_since_yield = 0usize;
     let mut fed_bytes = 0usize;
     stream::poll_fn(move |context| {
-        if yielded_frame {
-            yielded_frame = false;
+        if fed_since_yield >= E2B_MULTIPART_FEED_BATCH_BYTES {
+            fed_since_yield = 0;
             context.waker().wake_by_ref();
             return Poll::Pending;
         }
         // Bytes fed to multer but not yet yielded as field data are still in
-        // its parse buffer, so this bounds that buffer to the cap plus a frame.
+        // its parse buffer, so this bounds that buffer to the cap plus a batch.
         let unparsed = fed_bytes.saturating_sub(field_bytes.load(Ordering::Relaxed));
         if unparsed > E2B_MULTIPART_PARSE_BUFFER_LIMIT_BYTES {
             return Poll::Ready(Some(Err(axum::Error::new(
@@ -1161,7 +1118,7 @@ fn fair_body_data_stream(
         let next = body.as_mut().poll_next(context);
         if let Poll::Ready(Some(Ok(data))) = &next {
             fed_bytes = fed_bytes.saturating_add(data.len());
-            yielded_frame = true;
+            fed_since_yield = fed_since_yield.saturating_add(data.len());
         }
         next
     })
@@ -1180,15 +1137,10 @@ fn resolve_multipart_uploads(
     uploads
         .into_iter()
         .map(|upload| {
-            let path = match (&query_path, upload.filename) {
-                (Some(path), _) => path.clone(),
-                (None, Some(filename)) => filename,
-                (None, None) => {
-                    return Err(EcwProxyError::bad_request(
-                        "multipart uploads require a filename or path query",
-                    ));
-                }
-            };
+            // The path query wins over the part's filename.
+            let path = query_path.clone().or(upload.filename).ok_or_else(|| {
+                EcwProxyError::bad_request("multipart uploads require a filename or path query")
+            })?;
             Ok((e2b_request_root(&path, user)?, upload.upload))
         })
         .collect()
