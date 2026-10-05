@@ -5882,3 +5882,90 @@ async fn a_missing_templates_table_degrades_end_to_end() -> TestResult {
 }
 
 mod publication;
+
+#[tokio::test(flavor = "current_thread")]
+async fn ecw_route_resolve_enforces_key_surface_and_organization() -> TestResult {
+    if !pplx_space_test_env::enter_test_process(&[
+        (
+            "SPACE_INTERNAL_RPC_INSECURE_DEV",
+            Some(std::ffi::OsStr::new("true")),
+        ),
+        (
+            "SPACE_INTERNAL_TOKEN",
+            Some(std::ffi::OsStr::new("route-scope-test-token")),
+        ),
+    ]) {
+        return Ok(());
+    }
+    let fixture = cluster_fixture()
+        .await?
+        .expect("Postgres is required for this reproduction");
+    let node_id = NodeId::new();
+    let sandbox_id = SandboxId::new();
+    let key_hash = sha256_hex("route-scope-test-native-only-key");
+    insert_data_plane_worker_node(&fixture.service.pool, node_id, "192.0.2.41").await?;
+    let node_api = sim_worker_node_api(node_id).await?;
+    insert_data_plane_direct_node_endpoint(&fixture.service.pool, node_id, node_api.endpoint())
+        .await?;
+    insert_data_plane_active_sandbox(&fixture.service.pool, sandbox_id, node_id).await?;
+    insert_active_execution(&fixture.service.pool, sandbox_id, "192.0.2.42", 1).await?;
+    insert_e2b_api_key(&fixture.service.pool, &key_hash).await?;
+
+    let request = |hash: String| {
+        Request::new(UnstableResolveSandboxServiceRouteRequest {
+            sandbox_id: sandbox_id.to_string(),
+            port: 49_983,
+            route_kind: SandboxServiceRouteKind::Agent as i32,
+            transport: SandboxServiceRouteTransport::Direct as i32,
+            credential_proofs: vec![route_credential_proof(
+                SandboxServiceRouteCredentialKind::OrgApiKey,
+                hash,
+            )],
+        })
+    };
+
+    let invalid = fixture
+        .service
+        .unstable_resolve_sandbox_service_route(request(sha256_hex("wrong-key")))
+        .await
+        .expect_err("an invalid key must be rejected");
+    assert_eq!(invalid.code(), Code::Unauthenticated);
+
+    for surfaces in [vec!["ecw"], vec!["native"], vec!["ecw", "native"]] {
+        sqlx::query(pplx_space_common_core::sql!(
+            "UPDATE api_keys SET allowed_surfaces = $1 WHERE key_hash = $2"
+        ))
+        .bind(&surfaces)
+        .bind(&key_hash)
+        .execute(&fixture.service.pool)
+        .await?;
+        let result = fixture
+            .service
+            .unstable_resolve_sandbox_service_route(request(key_hash.clone()))
+            .await;
+        if surfaces.contains(&"ecw") {
+            let route = result?.into_inner();
+            assert_eq!(route.sandbox_id, sandbox_id.to_string());
+            assert!(route.space_api_route_token.is_some());
+        } else {
+            assert!(
+                matches!(result, Err(status) if status.code() == Code::Unauthenticated),
+                "native-only keys cannot control the ECW agent"
+            );
+        }
+    }
+
+    sqlx::query(pplx_space_common_core::sql!(
+        "UPDATE api_keys SET org_id = '00000000-0000-0000-0000-000000000002' WHERE key_hash = $1"
+    ))
+    .bind(&key_hash)
+    .execute(&fixture.service.pool)
+    .await?;
+    let other_org = fixture
+        .service
+        .unstable_resolve_sandbox_service_route(request(key_hash))
+        .await
+        .expect_err("a key from another organization must be rejected");
+    assert_eq!(other_org.code(), Code::Unauthenticated);
+    Ok(())
+}

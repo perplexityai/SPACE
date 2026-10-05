@@ -14,6 +14,7 @@
 pub use pplx_space_common_svc::auth;
 pub use pplx_space_node_api_client::proto;
 
+mod api_key_store;
 pub mod node_info;
 pub use node_info::ClusterNodeInfoService;
 
