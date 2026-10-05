@@ -291,8 +291,9 @@ pub(super) async fn write_file(
             ));
         };
         let path = e2b_request_root(&path, user.as_ref())?;
-        // Create the parent before reading the body, so an unwritable
-        // destination fails without spooling the upload.
+        // Create the parent before reading the body, so a destination whose
+        // parent can't be created fails without spooling the upload. Other
+        // write failures still surface after spooling.
         let route = ensure_parent_dir(&state, route, &path, user.clone()).await?;
         let upload = spool_body_upload(body).await?;
         spaced_write_spooled(&state, route, path.clone(), upload, user).await?;
