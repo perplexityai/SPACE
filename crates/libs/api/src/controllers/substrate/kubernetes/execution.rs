@@ -941,6 +941,9 @@ impl KubernetesSubstrate {
         let (_, join_deadline) = ready_wait_bounds(options.ready_timeout);
         let mut join_backoff = RecoveryJoinBackoff::new(self.recovery_join_backoff);
         let restore_claim = loop {
+            self.store
+                .wait_activation_cooldown(sandbox_id, remaining_ready_window(join_deadline))
+                .await?;
             match self
                 .store
                 .begin_restore_lifecycle(sandbox_id, evacuation_placement.is_some())
@@ -1063,6 +1066,10 @@ impl KubernetesSubstrate {
         target: WakeTarget,
         restore_claim_handling: RestoreClaimHandling,
     ) -> Result<ExecutionActivation, SubstrateError> {
+        let timeout = self
+            .store
+            .wait_activation_cooldown(sandbox.id, timeout)
+            .await?;
         // Fail terminal lifecycles fast, before joining a run some other
         // caller started for a still-wakeable row.
         ensure_wake_recovery_lifecycle(sandbox)?;

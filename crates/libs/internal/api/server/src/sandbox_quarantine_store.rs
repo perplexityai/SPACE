@@ -27,6 +27,7 @@ use uuid::Uuid;
 const TRANSITION_RECEIPT_RECORD_COLUMNS: &str = "
     sandbox_id UUID,
     status TEXT,
+    state_changed_at TIMESTAMPTZ,
     transition_receipt_id UUID,
     transition_receipt_kind TEXT,
     transition_receipt_target_state TEXT,
@@ -89,6 +90,8 @@ pub(super) struct ActivationRollbackCandidate {
     pub(super) reason_code: SandboxQuarantineReasonCode,
     pub(super) prior_lifecycle: SandboxLifecycle,
     pub(super) failure_message: Option<String>,
+    retire_kubernetes_execution: bool,
+    rollback_at: Option<OffsetDateTime>,
 }
 
 #[derive(Debug)]
@@ -427,6 +430,8 @@ pub(super) async fn select_activation_rollback_candidates(
         String,
         SandboxLifecycle,
         Option<String>,
+        bool,
+        Option<OffsetDateTime>,
     );
     let query = format!(
         "SELECT s.id,
@@ -436,7 +441,9 @@ pub(super) async fn select_activation_rollback_candidates(
                 input.transition_receipt_target_state,
                 input.transition_receipt_reason_code,
                 LOWER(TRIM(s.lifecycle)),
-                input.failure_reason
+                input.failure_reason,
+                TRUE,
+                input.state_changed_at
            FROM sandboxes s
            JOIN jsonb_to_recordset($2::jsonb) AS input({TRANSITION_RECEIPT_RECORD_COLUMNS})
              ON input.sandbox_id = s.id
@@ -446,6 +453,7 @@ pub(super) async fn select_activation_rollback_candidates(
             AND execution.generation = input.transition_receipt_execution_generation
             AND execution.activation_attempt_id = input.transition_receipt_activation_attempt_id
           WHERE s.active_node_id = $1
+            AND s.managed_by = 'k8s'
             AND input.transition_receipt_kind = $3
             AND LOWER(TRIM(input.status)) = input.transition_receipt_target_state
             AND input.transition_receipt_target_state IN ('created', 'stopped', 'suspended')
@@ -454,15 +462,59 @@ pub(super) async fn select_activation_rollback_candidates(
             )
           FOR UPDATE OF s, execution"
     );
-    let rows: Vec<CandidateRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql!(query.as_str())))
+    let mut rows: Vec<CandidateRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql!(query.as_str())))
         .bind(node_id)
-        .bind(rows_json)
+        .bind(rows_json.clone())
         .bind(SandboxTransitionReceiptKind::ActivationRollback.as_str())
         .fetch_all(&mut *conn)
         .await
         .map_err(|error| {
             Status::internal(format!("select activation rollback receipts: {error}"))
         })?;
+
+    let query = format!(
+        "SELECT s.id,
+                input.transition_receipt_id,
+                input.transition_receipt_execution_generation,
+                input.transition_receipt_activation_attempt_id,
+                input.transition_receipt_target_state,
+                input.transition_receipt_reason_code,
+                LOWER(TRIM(s.lifecycle)),
+                input.failure_reason,
+                FALSE,
+                input.state_changed_at
+           FROM sandboxes s
+           JOIN jsonb_to_recordset($2::jsonb) AS input({TRANSITION_RECEIPT_RECORD_COLUMNS})
+             ON input.sandbox_id = s.id
+           JOIN sandbox_direct_route_identities execution
+             ON execution.sandbox_id = s.id
+            AND execution.execution_generation = input.transition_receipt_execution_generation
+            AND execution.activation_attempt_id = input.transition_receipt_activation_attempt_id
+            AND execution.current_node_id = $1
+            AND execution.substrate_kind = 'space'
+          WHERE s.active_node_id = $1
+            AND s.managed_by = 'space'
+            AND input.state_changed_at IS NOT NULL
+            AND input.transition_receipt_kind = $3
+            AND LOWER(TRIM(input.status)) = input.transition_receipt_target_state
+            AND input.transition_receipt_target_state IN ('created', 'stopped', 'suspended')
+            AND LOWER(TRIM(s.lifecycle)) NOT IN (
+                'quarantined', 'deleted', 'deleting', 'cleanup_required'
+            )
+          FOR UPDATE OF s, execution"
+    );
+    let direct_rows: Vec<CandidateRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql!(query.as_str())))
+        .bind(node_id)
+        .bind(rows_json)
+        .bind(SandboxTransitionReceiptKind::ActivationRollback.as_str())
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(|error| {
+            Status::internal(format!(
+                "select direct activation rollback receipts: {error}"
+            ))
+        })?;
+    rows.extend(direct_rows);
 
     rows.into_iter()
         .map(
@@ -475,6 +527,8 @@ pub(super) async fn select_activation_rollback_candidates(
                 reason_code,
                 prior_lifecycle,
                 failure_message,
+                retire_kubernetes_execution,
+                rollback_at,
             )| {
                 Ok(ActivationRollbackCandidate {
                     sandbox_id,
@@ -493,6 +547,8 @@ pub(super) async fn select_activation_rollback_candidates(
                     })?,
                     prior_lifecycle,
                     failure_message,
+                    retire_kubernetes_execution,
+                    rollback_at,
                 })
             },
         )
@@ -500,9 +556,9 @@ pub(super) async fn select_activation_rollback_candidates(
 }
 
 /// Consume rollback receipts after their generation fence has been locked.
-/// Each statement is intentionally explicit: execution retirement, port
-/// invalidation, and lifecycle convergence share the caller's transaction and
-/// any invariant failure rolls all of them back.
+/// Kubernetes execution retirement, port invalidation, and lifecycle
+/// convergence share the caller's transaction. Direct only projects the
+/// cooldown; its resident worker keeps placement and effective policy authority.
 pub(super) async fn apply_activation_rollback_candidates(
     conn: &mut sqlx::PgConnection,
     node_id: NodeId,
@@ -510,6 +566,34 @@ pub(super) async fn apply_activation_rollback_candidates(
 ) -> Result<Vec<ActivationRollbackCandidate>, Status> {
     let mut applied = Vec::with_capacity(candidates.len());
     for candidate in candidates {
+        if !candidate.retire_kubernetes_execution {
+            // Direct retains its worker and local lifecycle policy. Its stable
+            // state-transition timestamp makes inventory replay idempotent;
+            // receipt generation and attempt were fenced by the locked join.
+            // Untimestamped inventory cannot establish this deadline; the
+            // worker's durable admission gate still protects local activation.
+            let Some(rollback_at) = candidate.rollback_at else {
+                continue;
+            };
+            let updated = sqlx::query(sql!(
+                "UPDATE sandboxes
+                    SET activation_rollback_retry_after = $3::TIMESTAMPTZ + $4::BIGINT * INTERVAL '1 second'
+                  WHERE id = $1 AND active_node_id = $2
+                    AND (activation_rollback_retry_after IS NULL
+                         OR activation_rollback_retry_after < $3::TIMESTAMPTZ + $4::BIGINT * INTERVAL '1 second')"
+            ))
+            .bind(candidate.sandbox_id)
+            .bind(node_id)
+            .bind(rollback_at)
+            .bind(pplx_space_common_core::restore_ownership::ACTIVATION_FAILURE_COOLDOWN.as_secs() as i64)
+            .execute(&mut *conn)
+            .await
+            .map_err(|error| Status::internal(format!("publish direct activation cooldown: {error}")))?;
+            if updated.rows_affected() == 1 {
+                applied.push(candidate);
+            }
+            continue;
+        }
         let execution_state = if candidate.target_state == SandboxTransitionTargetState::Suspended {
             "suspended"
         } else {
@@ -517,15 +601,15 @@ pub(super) async fn apply_activation_rollback_candidates(
         };
         let retired = sqlx::query(sql!(
             "UPDATE sandbox_k8s_executions
-                SET active = FALSE,
-                    state = $3,
-                    pod_ip = NULL,
-                    terminated_at = COALESCE(terminated_at, NOW()),
-                    updated_at = NOW()
-              WHERE sandbox_id = $1
-                AND generation = $2
-                AND activation_attempt_id = $4
-                AND active"
+            SET active = FALSE,
+                state = $3,
+                pod_ip = NULL,
+                terminated_at = COALESCE(terminated_at, NOW()),
+                updated_at = NOW()
+          WHERE sandbox_id = $1
+            AND generation = $2
+            AND activation_attempt_id = $4
+            AND active"
         ))
         .bind(candidate.sandbox_id)
         .bind(candidate.execution_generation)
@@ -561,7 +645,8 @@ pub(super) async fn apply_activation_rollback_candidates(
                     target_node_id = COALESCE(target_node_id, active_node_id),
                     active_node_id = NULL,
                     command_ready_pending = FALSE,
-                    lifecycle_changed_at = NOW()
+                    lifecycle_changed_at = NOW(),
+                    activation_rollback_retry_after = NOW() + $4::BIGINT * INTERVAL '1 second'
               WHERE id = $1
                 AND active_node_id = $2
                 AND lifecycle NOT IN ('quarantined', 'deleted', 'deleting', 'cleanup_required')"
@@ -569,6 +654,9 @@ pub(super) async fn apply_activation_rollback_candidates(
         .bind(candidate.sandbox_id)
         .bind(node_id)
         .bind(candidate.target_state.as_str())
+        .bind(
+            pplx_space_common_core::restore_ownership::ACTIVATION_FAILURE_COOLDOWN.as_secs() as i64,
+        )
         .execute(&mut *conn)
         .await
         .map_err(|error| Status::internal(format!("converge activation rollback: {error}")))?;

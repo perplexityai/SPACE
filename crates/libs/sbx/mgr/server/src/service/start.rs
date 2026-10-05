@@ -1492,6 +1492,15 @@ impl SandboxManagerService {
         span.record("checkpoint_present", !checkpoint.is_empty());
         span.record("target_state", tracing::field::display(target_state));
 
+        let remaining = self
+            .wait_activation_cooldown(
+                sandbox_id,
+                Duration::from_secs(u64::from(ready_timeout_secs)),
+            )
+            .await?;
+        let ready_timeout_secs = super::activation_cooldown::ready_timeout_secs(remaining)?;
+        start_ctx.ready_timeout_secs = ready_timeout_secs;
+
         let start_target = {
             let _entered = tracing::info_span!("sbxmgr.start.lookup_sandbox", sandbox_id).entered();
             self.resolve_start_sandbox_target(

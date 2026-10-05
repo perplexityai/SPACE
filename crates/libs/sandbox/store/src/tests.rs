@@ -615,12 +615,80 @@ async fn restore_observation_uses_database_lease_expiration() -> TestResult {
     };
     let id = insert_sandbox(&db.pool, None, "restoring").await?;
     let id = SandboxId::from_uuid(id);
-    assert!(!super::restore_owner_active(&db.pool, id).await?);
+    assert!(
+        !super::activation_admission_state(&db.pool, id)
+            .await?
+            .restore_owned
+    );
     for (seconds, expected) in [(-60_i64, false), (60, true)] {
         sqlx::query(sql!("UPDATE sandboxes SET restore_lease_token = space_uuid_v7(), restore_lease_expires_at = NOW() + ($2 * INTERVAL '1 second') WHERE id = $1"))
             .bind(id).bind(seconds).execute(&db.pool).await?;
-        assert_eq!(super::restore_owner_active(&db.pool, id).await?, expected);
+        assert_eq!(
+            super::activation_admission_state(&db.pool, id)
+                .await?
+                .restore_owned,
+            expected
+        );
     }
-    assert!(!super::restore_owner_active(&db.pool, SandboxId::new()).await?);
+    assert!(
+        !super::activation_admission_state(&db.pool, SandboxId::new())
+            .await?
+            .restore_owned
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn activation_cooldown_is_shared_expires_and_never_blocks_existing_owners() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let id = SandboxId::from_uuid(insert_sandbox(&db.pool, None, "suspended").await?);
+    for (lifecycle, seconds, owned, expected) in [
+        ("created", 30, false, true),
+        ("stopped", 30, false, true),
+        ("suspended", 30, false, true),
+        ("suspended", -1, false, false),
+        ("restoring", 30, true, false),
+        ("restoring", 30, false, true),
+        ("paused", 30, false, false),
+        ("started", 30, false, false),
+    ] {
+        sqlx::query(sql!(
+            "UPDATE sandboxes SET lifecycle = $2,
+             activation_rollback_retry_after = NOW() + $3 * INTERVAL '1 second',
+             restore_lease_token = CASE WHEN $4 THEN $5 ELSE NULL END,
+             restore_lease_expires_at = CASE WHEN $4 THEN NOW() + INTERVAL '1 minute' ELSE NULL END
+             WHERE id = $1"
+        ))
+        .bind(id)
+        .bind(lifecycle)
+        .bind(seconds as f64)
+        .bind(owned)
+        .bind(Uuid::now_v7())
+        .execute(&db.pool)
+        .await?;
+        let delay = super::activation_admission_state(&db.pool, id)
+            .await?
+            .cooldown;
+        assert_eq!(delay.is_some(), expected, "{lifecycle}/{seconds}/{owned}");
+        if let Some(delay) = delay {
+            assert!(delay <= std::time::Duration::from_secs(30));
+        }
+    }
+    // A successful explicit activation clears prior failure evidence; a later
+    // normal suspend must not inherit that cooldown.
+    sqlx::query(sql!(
+        "UPDATE sandboxes SET lifecycle = 'suspended' WHERE id = $1"
+    ))
+    .bind(id)
+    .execute(&db.pool)
+    .await?;
+    assert!(
+        super::activation_admission_state(&db.pool, id)
+            .await?
+            .cooldown
+            .is_none()
+    );
     Ok(())
 }

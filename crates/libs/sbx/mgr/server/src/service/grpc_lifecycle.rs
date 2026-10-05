@@ -1678,9 +1678,24 @@ impl SandboxManagerService {
         let publish_node_state = !should_skip_node_publish(&request);
         let sandbox_id = sandbox.id.clone();
         let wake_lock = self.auto_lifecycle.wake_lock(&sandbox.id);
-        let _guard = wake_lock.lock().await;
+        let join_started = tokio::time::Instant::now();
+        let budget = Duration::from_secs(u64::from(ready_timeout_secs));
+        let _guard = super::restart_admission::wait_for_activation_join(
+            &sandbox.id,
+            budget,
+            wake_lock.lock(),
+        )
+        .await?;
         let artifact_lock = self.auto_lifecycle.artifact_lock(&sandbox.id);
-        let _guard = artifact_lock.lock().await;
+        let _guard = super::restart_admission::wait_for_activation_join(
+            &sandbox.id,
+            budget.saturating_sub(join_started.elapsed()),
+            artifact_lock.lock(),
+        )
+        .await?;
+        let ready_timeout_secs = super::activation_cooldown::ready_timeout_secs(
+            budget.saturating_sub(join_started.elapsed()),
+        )?;
 
         let sandbox = self.lookup_sandbox(&sandbox.id)?;
         self.authorize_template_manager_sandbox(&peer, &sandbox, "Resume")?;

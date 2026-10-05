@@ -2439,11 +2439,48 @@ pub(crate) fn restore_resident_resume_state(
     }
     let tx = immediate_transaction(conn)?;
     let changed = rollback_activation_state(&tx, id, SandboxState::Resuming, stable_state)?;
-    if changed && stable_state == SandboxState::Started {
-        arm_auto_lifecycle_after_activation(&tx, id)?;
+    if changed {
+        if stable_state == SandboxState::Started {
+            arm_auto_lifecycle_after_activation(&tx, id)?;
+        } else {
+            record_activation_failure(&tx, id)?;
+        }
     }
     tx.commit()?;
     Ok(changed)
+}
+
+/// Called only by the accepted owner's fenced rollback, in the same transaction.
+fn record_activation_failure(conn: &Connection, id: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE sandboxes SET activation_retry_after = ?2 WHERE id = ?1",
+        params![
+            id,
+            SqliteU64(crate::auto_lifecycle::now_secs().saturating_add(
+                pplx_space_common_core::restore_ownership::ACTIVATION_FAILURE_COOLDOWN.as_secs(),
+            ))
+        ],
+    )?;
+    Ok(())
+}
+
+/// Live and transitional executions bypass cooldown: joining an existing owner
+/// is never a new attempt. This timestamp survives a worker process restart.
+pub(crate) fn activation_retry_delay(conn: &Connection, id: &str) -> Result<std::time::Duration> {
+    let deadline = conn
+        .query_row(
+            "SELECT activation_retry_after FROM sandboxes WHERE id = ?1
+         AND state IN ('created', 'stopped', 'paused', 'suspended')",
+            [id],
+            |row| row.get::<_, Option<SqliteU64>>(0),
+        )
+        .optional()?
+        .flatten();
+    Ok(std::time::Duration::from_secs(
+        deadline.map_or(0, |deadline| {
+            deadline.0.saturating_sub(crate::auto_lifecycle::now_secs())
+        }),
+    ))
 }
 
 pub(crate) fn recover_interrupted_pause_state(
@@ -3293,7 +3330,8 @@ fn arm_auto_lifecycle_after_activation(conn: &Connection, id: &str) -> Result<()
         .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
     conn.execute(
         "UPDATE sandboxes
-         SET auto_lifecycle_state_json = ?1,
+         SET activation_retry_after = NULL,
+             auto_lifecycle_state_json = ?1,
              next_auto_event_at = ?2
          WHERE id = ?3",
         params![
@@ -6837,6 +6875,18 @@ fn complete_state_cleanup(
         retained_failure_reason,
         None,
     )?;
+    if applied
+        && matches!(
+            episode.quarantine_reason_code,
+            Some(
+                SandboxQuarantineReasonCode::CreateInterrupted
+                    | SandboxQuarantineReasonCode::ColdActivationInterrupted
+                    | SandboxQuarantineReasonCode::RestoreActivationInterrupted
+            )
+        )
+    {
+        record_activation_failure(tx, sandbox_id)?;
+    }
     if applied && quarantine_completion {
         insert_operator_quarantine_episode(
             tx,

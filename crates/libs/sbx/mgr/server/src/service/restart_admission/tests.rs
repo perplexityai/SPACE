@@ -592,3 +592,40 @@ async fn admitted_finalizer_inherits_ownership_after_drain_closes_admission() {
     .await
     .unwrap();
 }
+
+#[tokio::test(start_paused = true)]
+async fn activation_join_uses_caller_budget_and_retains_passive_cancellation() {
+    use std::time::Duration;
+    wait_for_activation_join(
+        "synthetic",
+        Duration::from_secs(10),
+        tokio::time::sleep(Duration::from_secs(6)),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        wait_for_activation_join(
+            "synthetic",
+            Duration::from_secs(1),
+            std::future::pending::<()>()
+        )
+        .await
+        .unwrap_err()
+        .code(),
+        tonic::Code::DeadlineExceeded
+    );
+    let cancelled = CancellationToken::new();
+    cancelled.cancel();
+    let error = CALLER_CANCELLED
+        .scope(
+            cancelled,
+            wait_for_activation_join(
+                "synthetic",
+                Duration::from_secs(10),
+                std::future::pending::<()>(),
+            ),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::Cancelled);
+}

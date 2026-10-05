@@ -1,3 +1,4 @@
+pub(crate) mod activation_cooldown;
 pub mod direct;
 #[cfg(feature = "kubernetes")]
 pub mod kubernetes;
@@ -1517,6 +1518,10 @@ impl std::fmt::Display for WaitReadyTimeoutPhase {
 // joined it, each of which needs an owned error to return.
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum SubstrateError {
+    /// Return passive waiting to the ingress request instead of occupying an
+    /// independently owned activation task. Ordinary callers wait in place.
+    #[error("activation is cooling down")]
+    ActivationCoolingDown { remaining: Duration },
     #[error("{message}")]
     Unavailable { message: String },
     #[error("{message}")]
@@ -1796,6 +1801,11 @@ impl From<WaitReadyTimeoutPhase> for ControllerRetryAfterCause {
 impl From<SubstrateError> for ControllerError {
     fn from(err: SubstrateError) -> Self {
         match err {
+            SubstrateError::ActivationCoolingDown { remaining } => {
+                ControllerError::service_unavailable("activation is cooling down")
+                    .with_retry_after(remaining)
+                    .with_retry_after_cause(ControllerRetryAfterCause::ActivationCooldown)
+            }
             SubstrateError::Unavailable { message } => {
                 ControllerError::service_unavailable(message)
             }

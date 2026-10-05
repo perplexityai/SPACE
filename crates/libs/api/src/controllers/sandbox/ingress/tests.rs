@@ -8,6 +8,8 @@ use tokio::sync::Notify;
 struct Backend {
     state: Mutex<Observation>,
     calls: AtomicUsize,
+    observations: AtomicUsize,
+    cooldown_on_recheck: AtomicBool,
     reachable: AtomicBool,
     pause_probe: AtomicBool,
     probe_entered: Notify,
@@ -19,7 +21,13 @@ struct Backend {
 #[tonic::async_trait]
 impl AccessBackend for Backend {
     async fn observe(&self, _: SandboxId) -> Result<Observation, Status> {
-        Ok(*self.state.lock().unwrap())
+        let mut state = self.state.lock().unwrap();
+        if self.observations.fetch_add(1, Ordering::SeqCst) == 1
+            && self.cooldown_on_recheck.load(Ordering::SeqCst)
+        {
+            state.cooldown = Some(Duration::from_secs(30));
+        }
+        Ok(*state)
     }
     async fn reachable(&self, _: SandboxId) -> Result<bool, Status> {
         self.probe_entered.notify_one();
@@ -35,6 +43,9 @@ impl AccessBackend for Backend {
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.entered.notify_one();
         self.release.notified().await;
+        if self.outcome == AccessOutcome::CoolingDown {
+            self.state.lock().unwrap().cooldown = Some(Duration::from_secs(30));
+        }
         Ok(self.outcome)
     }
 }
@@ -42,6 +53,8 @@ fn fixture(state: Observation, outcome: AccessOutcome) -> (Arc<Backend>, Activat
     let backend = Arc::new(Backend {
         state: Mutex::new(state),
         calls: AtomicUsize::new(0),
+        observations: AtomicUsize::new(0),
+        cooldown_on_recheck: AtomicBool::new(false),
         reachable: AtomicBool::new(state.lifecycle == SandboxLifecycle::Started),
         pause_probe: AtomicBool::new(false),
         probe_entered: Notify::new(),
@@ -65,6 +78,7 @@ fn suspended(owned: bool) -> Observation {
         lifecycle: SandboxLifecycle::Suspended,
         access_wake: true,
         restore_owned: owned,
+        cooldown: None,
     }
 }
 
@@ -135,7 +149,13 @@ async fn accepted_activation_outlives_timeout_and_disconnect_and_drains() {
 #[tokio::test(start_paused = true)]
 async fn restore_followers_only_observe_completion_or_expiry() {
     for completes in [false, true] {
-        let (backend, activator) = fixture(suspended(true), AccessOutcome::Ready);
+        let (backend, activator) = fixture(
+            Observation {
+                cooldown: Some(Duration::from_secs(30)),
+                ..suspended(true)
+            },
+            AccessOutcome::Ready,
+        );
         let waiter = activator.prepare(SandboxId::new(), Duration::from_secs(15));
         tokio::pin!(waiter);
         tokio::select! { biased; result = &mut waiter => panic!("follower ended early: {result:?}"), _ = tokio::time::sleep(Duration::from_millis(1)) => {} }
@@ -147,6 +167,7 @@ async fn restore_followers_only_observe_completion_or_expiry() {
             },
             restore_owned: false,
             access_wake: true,
+            cooldown: None,
         };
         let result = waiter.await;
         if completes {
@@ -171,6 +192,7 @@ async fn wake_disabled_refuses_dormant_but_allows_running_access() {
                 lifecycle,
                 restore_owned: false,
                 access_wake: false,
+                cooldown: None,
             },
             AccessOutcome::Ready,
         );
@@ -209,6 +231,7 @@ async fn healthy_ingress_bypasses_exhausted_activation_capacity() {
             lifecycle: SandboxLifecycle::Started,
             access_wake: false,
             restore_owned: false,
+            cooldown: None,
         },
         AccessOutcome::Ready,
     );
@@ -361,12 +384,9 @@ async fn stored_ingress_access_resumes_paused_execution_before_reporting_ready()
             assert_eq!(current.lifecycle, "started");
             assert_eq!(current.active_execution_generation, Some(1));
         } else {
-            let expected = if wake_enabled {
-                tonic::Code::Unavailable
-            } else {
-                tonic::Code::FailedPrecondition
-            };
-            assert_eq!(outcome.unwrap_err().code(), expected);
+            // Both desired-policy and worker-local policy refusals are terminal
+            // for this request. Retrying preparation cannot grant wake authority.
+            assert_eq!(outcome.unwrap_err().code(), tonic::Code::FailedPrecondition);
             assert_eq!(worker.state().get(&id.to_string()).await?.status, "paused");
             assert_eq!(
                 fetch_sandbox(&db.pool, id).await?.unwrap().lifecycle,
@@ -375,4 +395,67 @@ async fn stored_ingress_access_resumes_paused_execution_before_reporting_ready()
         }
     }
     Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn cooldown_wait_is_request_owned_without_activation_slots() {
+    for (disconnect, on_recheck, downstream) in [
+        (false, false, false),
+        (true, false, false),
+        (false, true, false),
+        (true, true, false),
+        (false, false, true),
+        (true, false, true),
+    ] {
+        let (backend, activator) = fixture(
+            Observation {
+                cooldown: (!on_recheck && !downstream).then_some(Duration::from_secs(30)),
+                ..suspended(false)
+            },
+            if downstream {
+                AccessOutcome::CoolingDown
+            } else {
+                AccessOutcome::Ready
+            },
+        );
+        backend
+            .cooldown_on_recheck
+            .store(on_recheck, Ordering::SeqCst);
+        backend.release.notify_one();
+        let activator = Arc::new(activator);
+        let waiter = tokio::spawn({
+            let activator = activator.clone();
+            async move {
+                activator
+                    .prepare(SandboxId::new(), Duration::from_secs(15))
+                    .await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert_eq!(
+            backend.calls.load(Ordering::SeqCst),
+            usize::from(downstream),
+            "cooldown must not keep retrying activation"
+        );
+        assert_eq!(activator.owners.slots.available_permits(), 1);
+        assert!(activator.owners.tasks.is_empty());
+        if disconnect {
+            waiter.abort();
+            waiter.await.unwrap_err();
+        } else {
+            assert_eq!(
+                waiter.await.unwrap().unwrap_err().code(),
+                tonic::Code::DeadlineExceeded
+            );
+        }
+        backend.state.lock().unwrap().cooldown = None;
+        tokio::time::advance(Duration::from_secs(30)).await;
+        assert_eq!(
+            backend.calls.load(Ordering::SeqCst),
+            usize::from(downstream),
+            "an expired request cannot start later work"
+        );
+        assert_eq!(activator.owners.slots.available_permits(), 1);
+        assert!(activator.owners.tasks.is_empty());
+    }
 }

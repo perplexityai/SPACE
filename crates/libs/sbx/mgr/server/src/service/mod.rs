@@ -1903,6 +1903,7 @@ async fn prune_local_artifact_metadata_once(
 }
 
 mod activation;
+mod activation_cooldown;
 mod activation_support;
 mod adapter;
 mod auth_lookup;

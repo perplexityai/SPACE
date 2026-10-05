@@ -2697,6 +2697,11 @@ impl SubstrateAdapter for KubernetesSubstrate {
                 message: "kubernetes substrate requires blocking=true for start".to_string(),
             });
         }
+        let mut options = options;
+        options.ready_timeout = self
+            .store
+            .wait_activation_cooldown(sandbox_id, options.ready_timeout)
+            .await?;
         let sandbox = self.store.require_sandbox(sandbox_id).await?;
         if !is_recoverable_live_lifecycle(&sandbox.lifecycle) {
             return Err(SubstrateError::Conflict {

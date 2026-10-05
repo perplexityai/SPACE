@@ -3483,8 +3483,25 @@ async fn activation_rollback_receipts_converge_stable_targets_with_attempt_fence
         );
         assert!(pod_ip.is_none());
 
+        let cooldown = sqlx::query_scalar::<_, Option<time::OffsetDateTime>>(sql!(
+            "SELECT activation_rollback_retry_after FROM sandboxes WHERE id = $1"
+        ))
+        .bind(sandbox_id)
+        .fetch_one(&db.pool)
+        .await?;
+        assert!(cooldown.is_some());
         let replay = publish_sandbox_states(&mut conn, node_id, &[receipt]).await?;
         assert!(replay.post_commit_events.is_empty());
+        let after_replay = sqlx::query_scalar::<_, Option<time::OffsetDateTime>>(sql!(
+            "SELECT activation_rollback_retry_after FROM sandboxes WHERE id = $1"
+        ))
+        .bind(sandbox_id)
+        .fetch_one(&db.pool)
+        .await?;
+        assert_eq!(
+            after_replay, cooldown,
+            "duplicate receipts must not prolong cooldown"
+        );
     }
 
     let stale_id = SandboxId::new();
@@ -3520,6 +3537,13 @@ async fn activation_rollback_receipts_converge_stable_targets_with_attempt_fence
     .fetch_one(&db.pool)
     .await?;
     assert!(newer_execution_active);
+    let cooldown = sqlx::query_scalar::<_, Option<time::OffsetDateTime>>(sql!(
+        "SELECT activation_rollback_retry_after FROM sandboxes WHERE id = $1"
+    ))
+    .bind(stale_id)
+    .fetch_one(&db.pool)
+    .await?;
+    assert!(cooldown.is_none(), "stale receipts cannot install cooldown");
     Ok(())
 }
 
@@ -4379,5 +4403,135 @@ async fn only_a_pruned_inventory_stamps_the_census_timestamp() -> TestResult {
         "a later accepted inventory must advance the timestamp: \
          {advanced} is not after {backdated}"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn direct_activation_rollback_installs_cooldown_once_with_execution_fencing() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let node = NodeId::new();
+    insert_ready_worker_node(&db.pool, node).await?;
+    let id = SandboxId::new();
+    insert_active_sandbox(&db.pool, id, node, "stopped").await?;
+    sqlx::query(sql!(
+        "UPDATE sandboxes SET managed_by = 'space' WHERE id = $1"
+    ))
+    .bind(id)
+    .execute(&db.pool)
+    .await?;
+    let attempt = Uuid::now_v7();
+    sqlx::query(sql!("INSERT INTO sandbox_direct_route_identities
+        (sandbox_id, route_generation, current_node_id, execution_generation, activation_attempt_id, substrate_kind)
+        VALUES ($1, 1, $2, 1, $3, 'space')"))
+        .bind(id).bind(node).bind(attempt).execute(&db.pool).await?;
+    let mut conn = db.pool.acquire().await?;
+    let stale = activation_rollback_state(
+        id,
+        Uuid::now_v7(),
+        "stopped",
+        1,
+        Uuid::now_v7(),
+        SandboxQuarantineReasonCode::ColdActivationInterrupted,
+    );
+    assert!(
+        publish_sandbox_states(&mut conn, node, &[stale])
+            .await?
+            .post_commit_events
+            .is_empty()
+    );
+    let mut receipt = activation_rollback_state(
+        id,
+        Uuid::now_v7(),
+        "stopped",
+        1,
+        attempt,
+        SandboxQuarantineReasonCode::ColdActivationInterrupted,
+    );
+    assert!(
+        publish_sandbox_states(&mut conn, node, std::slice::from_ref(&receipt))
+            .await?
+            .post_commit_events
+            .is_empty(),
+        "untimestamped evidence cannot establish a replay-safe deadline"
+    );
+    receipt.state_changed_at = Some(prost_types::Timestamp {
+        seconds: time::OffsetDateTime::now_utc().unix_timestamp(),
+        nanos: 0,
+    });
+    assert_eq!(
+        publish_sandbox_states(&mut conn, node, std::slice::from_ref(&receipt))
+            .await?
+            .post_commit_events
+            .len(),
+        1
+    );
+    let placement: (String, Option<NodeId>) = sqlx::query_as(sql!(
+        "SELECT placement, active_node_id FROM sandboxes WHERE id = $1"
+    ))
+    .bind(id)
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(
+        placement,
+        ("on_node".into(), Some(node)),
+        "rollback publication must retain the resident worker"
+    );
+    let deadline = sqlx::query_scalar::<_, Option<time::OffsetDateTime>>(sql!(
+        "SELECT activation_rollback_retry_after FROM sandboxes WHERE id = $1"
+    ))
+    .bind(id)
+    .fetch_one(&db.pool)
+    .await?;
+    assert!(deadline.is_some());
+    assert!(
+        publish_sandbox_states(&mut conn, node, std::slice::from_ref(&receipt))
+            .await?
+            .post_commit_events
+            .is_empty()
+    );
+    let replayed = sqlx::query_scalar::<_, Option<time::OffsetDateTime>>(sql!(
+        "SELECT activation_rollback_retry_after FROM sandboxes WHERE id = $1"
+    ))
+    .bind(id)
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(deadline, replayed);
+    let next_attempt = Uuid::now_v7();
+    sqlx::query(sql!("UPDATE sandbox_direct_route_identities SET activation_attempt_id = $2 WHERE sandbox_id = $1"))
+        .bind(id).bind(next_attempt).execute(&db.pool).await?;
+    assert!(
+        publish_sandbox_states(&mut conn, node, std::slice::from_ref(&receipt))
+            .await?
+            .post_commit_events
+            .is_empty(),
+        "superseded attempts cannot publish cooldown"
+    );
+    receipt
+        .transition_receipt
+        .as_mut()
+        .unwrap()
+        .activation_attempt_id = Some(next_attempt.to_string());
+    receipt.transition_receipt.as_mut().unwrap().id = Uuid::now_v7().to_string();
+    receipt.state_changed_at.as_mut().unwrap().seconds += 1;
+    assert_eq!(
+        publish_sandbox_states(&mut conn, node, &[receipt])
+            .await?
+            .post_commit_events
+            .len(),
+        1
+    );
+    let next_deadline = sqlx::query_scalar::<_, Option<time::OffsetDateTime>>(sql!(
+        "SELECT activation_rollback_retry_after FROM sandboxes WHERE id = $1"
+    ))
+    .bind(id)
+    .fetch_one(&db.pool)
+    .await?;
+    assert!(
+        next_deadline > deadline,
+        "a later failed owner must establish its own cooldown"
+    );
+
     Ok(())
 }

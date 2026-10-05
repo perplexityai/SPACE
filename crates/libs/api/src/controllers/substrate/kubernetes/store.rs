@@ -627,6 +627,14 @@ fn emit_started_suspend_recovery_event(
 }
 
 impl K8sStore {
+    pub(super) async fn wait_activation_cooldown(
+        &self,
+        id: SandboxId,
+        budget: std::time::Duration,
+    ) -> Result<std::time::Duration, SubstrateError> {
+        super::super::activation_cooldown::wait(&self.pool, id, budget).await
+    }
+
     pub(super) fn new(pool: PgPool, namespace: String) -> Self {
         Self { pool, namespace }
     }

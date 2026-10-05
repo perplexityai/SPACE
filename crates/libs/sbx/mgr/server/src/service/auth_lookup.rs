@@ -762,12 +762,22 @@ impl SandboxManagerService {
             let sandbox = crate::db::get_sandbox(&db, sandbox_id)
                 .map_err(|e| Status::internal(format!("db error: {e}")))?
                 .ok_or_else(|| Status::not_found(format!("sandbox not found: {sandbox_id}")))?;
+            if sandbox.state == SandboxState::Started {
+                return Ok(());
+            }
             sandbox
                 .state
                 .transition(SandboxState::Resuming)
                 .map_err(|error| Status::failed_precondition(error.to_string()))?;
             sandbox
         };
+        let remaining = self
+            .wait_activation_cooldown(
+                sandbox_id,
+                Duration::from_secs(u64::from(ready_timeout_secs)),
+            )
+            .await?;
+        let ready_timeout_secs = super::activation_cooldown::ready_timeout_secs(remaining)?;
         let sandbox_id_typed = sandbox
             .id
             .parse::<SandboxId>()

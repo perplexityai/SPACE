@@ -576,7 +576,14 @@ impl SandboxManagerService {
                     DEFAULT_BLOCKING_READY_TIMEOUT_SECS.into(),
                 )),
         );
-        let _guard = wait_for_activation_admission(&sandbox.id, wake_lock.lock()).await?;
+        let _guard = super::restart_admission::wait_for_activation_join(
+            &sandbox.id,
+            wait_budget.unwrap_or(Duration::from_secs(u64::from(
+                DEFAULT_BLOCKING_READY_TIMEOUT_SECS,
+            ))),
+            wake_lock.lock(),
+        )
+        .await?;
         loop {
             let sandbox = self.lookup_sandbox(&sandbox.id)?;
             let wake_policy =
@@ -786,7 +793,12 @@ impl SandboxManagerService {
             &sandbox.id,
         )?;
         let wake_lock = self.auto_lifecycle.wake_lock(&sandbox.id);
-        let _guard = wait_for_activation_admission(&sandbox.id, wake_lock.lock()).await?;
+        let _guard = super::restart_admission::wait_for_activation_join(
+            &sandbox.id,
+            Duration::from_secs(u64::from(DEFAULT_BLOCKING_READY_TIMEOUT_SECS)),
+            wake_lock.lock(),
+        )
+        .await?;
 
         let sandbox = self.lookup_sandbox(&sandbox.id)?;
         let transition = wake_transition_for_state(sandbox.state)?;

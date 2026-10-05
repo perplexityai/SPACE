@@ -32,6 +32,19 @@ pub(super) fn inherit_admission_cancellation<T>(
     }
 }
 
+/// Check cancellation without acquiring capacity or waiting on a lock.
+pub(super) fn check_activation_caller(sandbox_id: &str) -> Result<(), tonic::Status> {
+    if CALLER_CANCELLED
+        .try_with(CancellationToken::is_cancelled)
+        .unwrap_or(false)
+    {
+        return Err(tonic::Status::cancelled(format!(
+            "activation caller disconnected before admission for sandbox {sandbox_id}"
+        )));
+    }
+    Ok(())
+}
+
 /// Wait at a cancellation-safe activation admission boundary for at most five
 /// seconds. A disconnected caller loses its queue position immediately; a live
 /// caller gets a retryable contention error. Internal callers have the same cap.
@@ -54,6 +67,21 @@ pub(super) async fn wait_for_activation_admission<T>(
                 "sandbox {sandbox_id} activation admission is busy; retry"
             )))
         }
+    }
+}
+
+/// Passive join and cooldown waits use the caller's activation budget rather
+/// than the short capacity-admission cap. Cancellation never stops an owner.
+pub(super) async fn wait_for_activation_join<T>(
+    sandbox_id: &str,
+    budget: std::time::Duration,
+    wait: impl Future<Output = T>,
+) -> Result<T, tonic::Status> {
+    let cancelled = CALLER_CANCELLED.try_with(Clone::clone).unwrap_or_default();
+    tokio::select! {
+        biased;
+        _ = cancelled.cancelled() => Err(tonic::Status::cancelled(format!("activation waiter disconnected for sandbox {sandbox_id}"))),
+        result = tokio::time::timeout(budget, wait) => result.map_err(|_| tonic::Status::deadline_exceeded("activation join deadline exceeded")),
     }
 }
 

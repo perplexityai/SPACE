@@ -4039,6 +4039,39 @@ async fn implicit_access_wake_honors_the_workers_effective_policy() -> TestResul
             )
             .await?;
         state.suspend_to_shared_dir(&sandbox_id.to_string()).await?;
+        if !expect_wake {
+            let attempt = uuid::Uuid::now_v7();
+            sqlx::query(sql!("INSERT INTO sandbox_direct_route_identities
+                (sandbox_id, route_generation, current_node_id, execution_generation, activation_attempt_id, substrate_kind)
+                VALUES ($1, 1, $2, 1, $3, 'space')"))
+                .bind(sandbox_id).bind(node_id).bind(attempt).execute(&fixture.pool).await?;
+            // Expired evidence must still preserve the worker which owns the
+            // local policy. Publication idempotence is covered at its store.
+            let receipt = pplx_space_internal_api_server::proto::PublishedSandboxState {
+                sandbox_id: sandbox_id.to_string(),
+                present: true,
+                status: Some("suspended".into()),
+                state_changed_at: Some(prost_types::Timestamp {
+                    seconds: time::OffsetDateTime::now_utc().unix_timestamp() - 60,
+                    nanos: 0,
+                }),
+                transition_receipt: Some(pplx_space_sbx_mgr_client::proto::TransitionReceipt {
+                    id: uuid::Uuid::now_v7().to_string(),
+                    kind: "activation_rollback".into(),
+                    target_state: "suspended".into(),
+                    execution_generation: 1,
+                    reason_code: pplx_space_common_core::types::SandboxQuarantineReasonCode::RestoreActivationInterrupted.to_string(),
+                    activation_attempt_id: Some(attempt.to_string()),
+                }),
+                ..Default::default()
+            };
+            pplx_space_internal_api_server::publish_sandbox_states(
+                &mut *fixture.pool.acquire().await?,
+                node_id,
+                &[receipt],
+            )
+            .await?;
+        }
         let sandbox = crate::controllers::sandbox::fetch_sandbox(&fixture.pool, sandbox_id)
             .await?
             .expect("sandbox row");

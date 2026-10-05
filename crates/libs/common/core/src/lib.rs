@@ -274,6 +274,11 @@ pub mod restore_ownership {
     /// active, so this must strictly outlive [`NODE_RPC_TIMEOUT`].
     pub const RESTORE_EXECUTION_OWNERSHIP_TTL: Duration = Duration::from_secs(300);
 
+    /// Delay new attempts after an activation owner rolls back. Workers enforce
+    /// this immediately, including node-local entry points; the control plane
+    /// also enforces published failure evidence before placing another attempt.
+    pub const ACTIVATION_FAILURE_COOLDOWN: Duration = Duration::from_secs(30);
+
     const _: () = assert!(
         RESTORE_EXECUTION_OWNERSHIP_TTL.as_secs() > NODE_RPC_TIMEOUT.as_secs(),
         "execution ownership must outlive the node-RPC timeout (and with it the restore lease)",

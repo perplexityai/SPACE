@@ -500,7 +500,8 @@ fn retry_after_cause_terminal_phase(cause: ControllerRetryAfterCause) -> Reconne
         // Cluster-admission backpressure is a front-door 429, not a reconnect
         // outcome; it shouldn't reach the reconnect terminal path. Map it to the
         // API phase defensively.
-        ControllerRetryAfterCause::ClusterActivationAdmission => ReconnectTerminalPhase::Api,
+        ControllerRetryAfterCause::ClusterActivationAdmission
+        | ControllerRetryAfterCause::ActivationCooldown => ReconnectTerminalPhase::Api,
     }
 }
 
@@ -511,7 +512,8 @@ fn retry_after_cause_reason(cause: ControllerRetryAfterCause) -> ReconnectReason
         ControllerRetryAfterCause::ProxyUnreachable => ReconnectReason::ProxyUnreachable,
         ControllerRetryAfterCause::GuestNotReady => ReconnectReason::GuestNotReady,
         // See note above: not a reconnect cause. Treat as a retryable wait.
-        ControllerRetryAfterCause::ClusterActivationAdmission => ReconnectReason::WaitBudget,
+        ControllerRetryAfterCause::ClusterActivationAdmission
+        | ControllerRetryAfterCause::ActivationCooldown => ReconnectReason::WaitBudget,
     }
 }
 
@@ -522,7 +524,8 @@ fn retry_after_cause_outcome(cause: ControllerRetryAfterCause) -> ReconnectOutco
         | ControllerRetryAfterCause::ProxyUnreachable
         | ControllerRetryAfterCause::GuestNotReady
         // See note above: not a reconnect cause. Treat as retryable (exhausted).
-        | ControllerRetryAfterCause::ClusterActivationAdmission => ReconnectOutcome::Exhausted,
+        | ControllerRetryAfterCause::ClusterActivationAdmission
+        | ControllerRetryAfterCause::ActivationCooldown => ReconnectOutcome::Exhausted,
     }
 }
 
@@ -580,11 +583,13 @@ fn reconnect_error_outcome(
         // wait_budget) so restore-path and direct-wake admission rejections land
         // on one outcome/reason series instead of being split across
         // `rejected/unavailable` vs `exhausted/wait_budget`.
-        SubstrateError::AdmissionRejected { .. } => (
-            ReconnectOutcome::Exhausted,
-            ReconnectTerminalPhase::Api,
-            ReconnectReason::WaitBudget,
-        ),
+        SubstrateError::AdmissionRejected { .. } | SubstrateError::ActivationCoolingDown { .. } => {
+            (
+                ReconnectOutcome::Exhausted,
+                ReconnectTerminalPhase::Api,
+                ReconnectReason::WaitBudget,
+            )
+        }
         SubstrateError::Unavailable { .. } => (
             ReconnectOutcome::WakeFailed,
             initial_lifecycle_terminal_phase(initial_lifecycle),

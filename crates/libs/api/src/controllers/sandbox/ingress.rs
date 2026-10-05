@@ -27,11 +27,13 @@ struct Observation {
     lifecycle: SandboxLifecycle,
     access_wake: bool,
     restore_owned: bool,
+    cooldown: Option<Duration>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AccessOutcome {
     Ready,
     RestoreOwned,
+    CoolingDown,
 }
 
 #[tonic::async_trait]
@@ -54,8 +56,18 @@ impl ActivationOwners {
         backend: Arc<dyn AccessBackend>,
         id: SandboxId,
     ) -> Result<AccessOutcome, Status> {
+        // Recheck in the request future immediately before accepting an owner.
+        // A raced cooldown returns without acquiring a slot or spawning work.
+        let state = backend.observe(id).await?;
         if self.shutdown.is_cancelled() {
             return Err(Status::unavailable("ingress activation is shutting down"));
+        }
+        validate_access(state.lifecycle, state.access_wake)?;
+        if state.restore_owned {
+            return Ok(AccessOutcome::RestoreOwned);
+        }
+        if state.cooldown.is_some() {
+            return Ok(AccessOutcome::CoolingDown);
         }
         let permit = self
             .slots
@@ -67,7 +79,11 @@ impl ActivationOwners {
         self.tasks
             .spawn(async move {
                 let _permit = permit;
-                let result = backend.access(id).await;
+                let result =
+                    crate::controllers::substrate::activation_cooldown::return_wait_to_request(
+                        backend.access(id),
+                    )
+                    .await;
                 if let Err(error) = &result {
                     tracing::warn!(sandbox_id = %id, %error, "ingress access activation failed");
                 }
@@ -114,6 +130,9 @@ impl AccessBackend for StoredAccess {
             .await
             .map_err(|error| Status::internal(error.to_string()))?
             .ok_or_else(|| Status::not_found("sandbox not found"))?;
+        let admission = pplx_space_sandbox_store::activation_admission_state(&self.pool, id)
+            .await
+            .map_err(|error| Status::internal(error.to_string()))?;
         Ok(Observation {
             lifecycle: sandbox
                 .lifecycle
@@ -121,9 +140,8 @@ impl AccessBackend for StoredAccess {
                 .map_err(|error| Status::internal(error.to_string()))?,
             access_wake: ExecutionActivityKind::Access
                 .allows_implicit_wake(&sandbox.auto_lifecycle.0),
-            restore_owned: pplx_space_sandbox_store::restore_owner_active(&self.pool, id)
-                .await
-                .map_err(|error| Status::internal(error.to_string()))?,
+            restore_owned: admission.restore_owned,
+            cooldown: admission.cooldown,
         })
     }
     async fn reachable(&self, id: SandboxId) -> Result<bool, Status> {
@@ -170,7 +188,8 @@ impl AccessBackend for StoredAccess {
             // A resident worker is reachable while paused, but bridge setup
             // requires a running guest. Finish the shared wake path, including
             // lifecycle publication, inside the cancellation-independent owner.
-            self.controller
+            if let Err(error) = self
+                .controller
                 .action(
                     &self.pool,
                     id,
@@ -180,7 +199,9 @@ impl AccessBackend for StoredAccess {
                     None,
                 )
                 .await
-                .map_err(|error| Status::unavailable(error.to_string()))?;
+            {
+                return access_error(error);
+            }
             // A concurrent suspend can supersede a successful wake submission.
             if self.observe(id).await?.lifecycle != SandboxLifecycle::Started {
                 return Err(Status::unavailable("ingress wake has not reached started"));
@@ -199,19 +220,20 @@ impl AccessBackend for StoredAccess {
         .await
         {
             Ok(_) => Ok(AccessOutcome::Ready),
-            Err(error)
-                if error.retry_after_cause()
-                    == Some(crate::controllers::ControllerRetryAfterCause::RestoreInFlight) =>
-            {
-                Ok(AccessOutcome::RestoreOwned)
-            }
-            // A policy refusal is terminal for this request, unlike a runtime
-            // that is merely unavailable.
-            Err(error) if error.status() == axum::http::StatusCode::CONFLICT => {
-                Err(Status::failed_precondition(error.to_string()))
-            }
-            Err(error) => Err(Status::unavailable(error.to_string())),
+            Err(error) => access_error(error),
         }
+    }
+}
+
+fn access_error(error: ControllerError) -> Result<AccessOutcome, Status> {
+    use crate::controllers::ControllerRetryAfterCause;
+    match error.retry_after_cause() {
+        Some(ControllerRetryAfterCause::RestoreInFlight) => Ok(AccessOutcome::RestoreOwned),
+        Some(ControllerRetryAfterCause::ActivationCooldown) => Ok(AccessOutcome::CoolingDown),
+        _ if error.status() == axum::http::StatusCode::CONFLICT => {
+            Err(Status::failed_precondition(error.to_string()))
+        }
+        _ => Err(Status::unavailable(error.to_string())),
     }
 }
 
@@ -259,6 +281,9 @@ impl IngressActivation for Activator {
                     return Err(Status::unavailable(
                         "restore owner ended without a usable route",
                     ));
+                } else if let Some(cooldown) = state.cooldown {
+                    tokio::time::sleep(cooldown.min(Duration::from_millis(500))).await;
+                    continue;
                 } else {
                     if state.lifecycle == SandboxLifecycle::Started
                         && self.backend.reachable(id).await?
@@ -268,6 +293,7 @@ impl IngressActivation for Activator {
                     pplx_space_metrics::internal_api::ingress_preparation_path(false);
                     match self.owners.access(self.backend.clone(), id).await? {
                         AccessOutcome::Ready => return Ok(()),
+                        AccessOutcome::CoolingDown => {}
                         AccessOutcome::RestoreOwned => {
                             pplx_space_metrics::internal_api::ingress_preparation_path(true);
                             observing = true;

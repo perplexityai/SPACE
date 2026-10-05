@@ -2466,6 +2466,9 @@ impl DirectSubstrate {
         sandbox_id: SandboxId,
         options: ActivationOptions,
     ) -> Result<DirectRestoreResult, SubstrateError> {
+        let mut options = options;
+        options.ready_timeout =
+            super::activation_cooldown::wait(&self.pool, sandbox_id, options.ready_timeout).await?;
         // A read-only preflight avoids two lifecycle writes for a wake that
         // has no usable source. It is only an optimization: the candidate set
         // is selected again after the lease claim, which is the serialized
@@ -3751,6 +3754,9 @@ impl SubstrateAdapter for DirectSubstrate {
         options: ActivationOptions,
         charge: crate::controllers::substrate::RecoveryCharge,
     ) -> Result<ExecutionActivation, SubstrateError> {
+        let mut options = options;
+        options.ready_timeout =
+            super::activation_cooldown::wait(&self.pool, sandbox_id, options.ready_timeout).await?;
         // This resident start path does not claim the portable-restore lease,
         // so its deferred restore charge is spent at entry.
         charge.charge_restore_claim().await?;
@@ -3854,6 +3860,7 @@ impl SubstrateAdapter for DirectSubstrate {
         wake_activity: Option<ExecutionActivityKind>,
         charge: crate::controllers::substrate::RecoveryCharge,
     ) -> Result<ExecutionActivation, SubstrateError> {
+        let timeout = super::activation_cooldown::wait(&self.pool, sandbox.id, timeout).await?;
         charge.charge_restore_claim().await?;
         let sandbox_id = sandbox.id;
         let node = self.sandbox_node(sandbox_id).await?;

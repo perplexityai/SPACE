@@ -2164,6 +2164,9 @@ impl NodeDrainSink for SubstrateSink {
             // disposition is unchanged — only the message the operator reads
             // when a promotion keeps failing.
             Err(SubstrateError::LockContention { message }) => Err(PromoteError::Db(message)),
+            Err(error @ SubstrateError::ActivationCoolingDown { .. }) => {
+                Err(PromoteError::NodeApi(error.to_string()))
+            }
             Err(
                 SubstrateError::Unavailable { message }
                 | SubstrateError::NotFound { message }

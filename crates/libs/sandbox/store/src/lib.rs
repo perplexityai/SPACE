@@ -361,20 +361,6 @@ pub async fn update_desired_state(
 #[cfg(test)]
 mod tests;
 
-/// Observe restore ownership using the database clock; this never claims work.
-pub async fn restore_owner_active(
-    executor: impl sqlx::PgExecutor<'_>,
-    id: SandboxId,
-) -> Result<bool, SandboxStoreError> {
-    Ok(sqlx::query_scalar::<_, bool>(sql!(
-        "SELECT COALESCE(restore_lease_expires_at > NOW(), false) FROM sandboxes WHERE id = $1"
-    ))
-    .bind(id)
-    .fetch_optional(executor)
-    .await?
-    .unwrap_or(false))
-}
-
 /// Replace desired lifecycle policy and clear its stale published observation.
 pub async fn set_auto_lifecycle_policy(
     executor: impl sqlx::PgExecutor<'_>,
@@ -461,4 +447,42 @@ pub async fn auto_lifecycle_execution(
     .bind(id)
     .fetch_optional(executor)
     .await?)
+}
+
+/// Shared evidence from completed activation rollbacks; this read never claims work.
+/// The `sandboxes_clear_activation_rollback_cooldown` trigger clears the deadline
+/// on successful lifecycle publication, including writers outside this store.
+/// Worker-local admission covers the interval before receipts are published and
+/// resident resume, which does not retire a central execution.
+#[derive(Debug, Default)]
+pub struct ActivationAdmissionState {
+    pub restore_owned: bool,
+    pub cooldown: Option<std::time::Duration>,
+}
+
+/// Observe ownership and rollback cooldown in one database snapshot.
+/// Expiry uses the database clock; accepted owners are never delayed.
+pub async fn activation_admission_state(
+    executor: impl sqlx::PgExecutor<'_>,
+    id: SandboxId,
+) -> Result<ActivationAdmissionState, SandboxStoreError> {
+    let row = sqlx::query_as::<_, (bool, Option<i64>)>(sql!(
+        "SELECT COALESCE(restore_lease_expires_at > NOW(), false),
+            CASE WHEN lifecycle IN ('created', 'stopped', 'suspended', 'restoring')
+                AND activation_rollback_retry_after > NOW()
+                AND NOT COALESCE(restore_lease_expires_at > NOW(), false)
+            THEN CEIL(EXTRACT(EPOCH FROM (activation_rollback_retry_after - NOW())) * 1000)::BIGINT END
+         FROM sandboxes WHERE id = $1"
+    ))
+    .bind(id)
+    .fetch_optional(executor)
+    .await?;
+    Ok(row.map_or_else(
+        ActivationAdmissionState::default,
+        |(restore_owned, millis)| ActivationAdmissionState {
+            restore_owned,
+            cooldown: millis
+                .map(|millis| std::time::Duration::from_millis(millis.max(0).cast_unsigned())),
+        },
+    ))
 }

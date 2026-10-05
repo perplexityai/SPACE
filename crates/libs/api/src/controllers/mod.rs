@@ -54,6 +54,7 @@ enum ControllerErrorKind {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ControllerRetryAfterCause {
+    ActivationCooldown,
     RestoreInFlight,
     PodNeverReady,
     ProxyUnreachable,

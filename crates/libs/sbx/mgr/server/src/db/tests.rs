@@ -9629,3 +9629,149 @@ fn resident_policy_resume_is_generation_fenced_and_arms_only_after_thaw() {
         }
     }
 }
+
+#[test]
+fn activation_cooldown_tracks_only_current_owner_failure_and_success() {
+    let conn = test_conn();
+    let id = SandboxId::new().to_string();
+    // Use the same real row fixture as the lifecycle state tests.
+    super::super::service::tests::service_tests::insert_test_sandbox(
+        &conn,
+        &id,
+        SandboxState::Resuming,
+    );
+    assert!(activation_retry_delay(&conn, &id).unwrap().is_zero());
+    assert!(restore_resident_resume_state(&conn, &id, SandboxState::Paused).unwrap());
+    let deadline: i64 = conn
+        .query_row(
+            "SELECT activation_retry_after FROM sandboxes WHERE id = ?1",
+            [&id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(!activation_retry_delay(&conn, &id).unwrap().is_zero());
+    assert!(!restore_resident_resume_state(&conn, &id, SandboxState::Paused).unwrap());
+    assert_eq!(
+        conn.query_row(
+            "SELECT activation_retry_after FROM sandboxes WHERE id = ?1",
+            [&id],
+            |row| row.get::<_, i64>(0)
+        )
+        .unwrap(),
+        deadline
+    );
+    for state in [
+        SandboxState::Starting,
+        SandboxState::Restoring,
+        SandboxState::Resuming,
+        SandboxState::Started,
+    ] {
+        assert_eq!(
+            update_state(&conn, &id, state).unwrap(),
+            SandboxStateWriteOutcome::Applied
+        );
+        assert!(
+            activation_retry_delay(&conn, &id).unwrap().is_zero(),
+            "{state}"
+        );
+    }
+    assert_eq!(
+        update_state(&conn, &id, SandboxState::Resuming).unwrap(),
+        SandboxStateWriteOutcome::Applied
+    );
+    assert!(restore_resident_resume_state(&conn, &id, SandboxState::Started).unwrap());
+    assert_eq!(
+        update_state(&conn, &id, SandboxState::Paused).unwrap(),
+        SandboxStateWriteOutcome::Applied
+    );
+    assert!(
+        activation_retry_delay(&conn, &id).unwrap().is_zero(),
+        "success clears prior failure"
+    );
+    record_activation_failure(&conn, &id).unwrap();
+    conn.execute(
+        "UPDATE sandboxes SET activation_retry_after = 1 WHERE id = ?1",
+        [&id],
+    )
+    .unwrap();
+    assert!(
+        activation_retry_delay(&conn, &id).unwrap().is_zero(),
+        "expired evidence permits a new attempt"
+    );
+}
+
+#[test]
+fn activation_cooldown_is_recorded_by_cold_start_and_restore_cleanup_owners() {
+    for (state, kind, reason) in [
+        (
+            SandboxState::Created,
+            ActivationKind::ColdStart,
+            SandboxQuarantineReasonCode::ColdActivationInterrupted,
+        ),
+        (
+            SandboxState::Stopped,
+            ActivationKind::ColdStart,
+            SandboxQuarantineReasonCode::ColdActivationInterrupted,
+        ),
+        (
+            SandboxState::Suspended,
+            ActivationKind::Restore,
+            SandboxQuarantineReasonCode::RestoreActivationInterrupted,
+        ),
+    ] {
+        let conn = test_conn();
+        let id = SandboxId::new().to_string();
+        insert_test_sandbox(&conn, TestSandboxInsert::new(&id, "retry001", state));
+        let episode = begin_activation(&conn, &id, state, kind, None, None)
+            .unwrap()
+            .unwrap();
+        if kind == ActivationKind::Restore {
+            publish_restored_suspended_artifact(
+                &conn,
+                &id,
+                LocalArtifactId::new(),
+                "/cache/synthetic/snapshot",
+            )
+            .unwrap();
+        }
+        request_cleanup_episode(
+            &conn,
+            &id,
+            episode.id,
+            reason,
+            "synthetic activation failure",
+        )
+        .unwrap();
+        assert!(
+            activation_retry_delay(&conn, &id).unwrap().is_zero(),
+            "cleanup is still owned"
+        );
+        assert!(
+            complete_cleanup_episode(&conn, &id, episode.id)
+                .unwrap()
+                .is_some()
+        );
+        let deadline = conn
+            .query_row(
+                "SELECT activation_retry_after FROM sandboxes WHERE id = ?1",
+                [&id],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .unwrap();
+        assert!(deadline.is_some(), "{kind:?}");
+        assert!(
+            complete_cleanup_episode(&conn, &id, episode.id)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            deadline,
+            conn.query_row(
+                "SELECT activation_retry_after FROM sandboxes WHERE id = ?1",
+                [&id],
+                |row| row.get::<_, Option<i64>>(0)
+            )
+            .unwrap()
+        );
+    }
+}
