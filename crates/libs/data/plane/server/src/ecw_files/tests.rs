@@ -33,13 +33,10 @@ fn chunked_body(chunks: Vec<Vec<u8>>) -> Body {
 }
 
 async fn collect_spooled_write(
-    mut upload: SpooledUpload,
+    upload: tempfile::TempPath,
     path: &str,
 ) -> (SpacedWriteOpen, Vec<u8>) {
-    upload.flush().await.unwrap();
-    let file = tokio::fs::File::open(upload._path.to_path_buf())
-        .await
-        .unwrap();
+    let file = tokio::fs::File::open(upload.to_path_buf()).await.unwrap();
     let requests = spooled_write_requests(SandboxId::new(), path.to_string(), file, None)
         .collect::<Vec<_>>()
         .await;
@@ -197,7 +194,7 @@ async fn malformed_multipart_and_missing_boundary_are_rejected() {
 }
 
 #[tokio::test]
-async fn multipart_file_limit_stops_consuming_the_body_mid_stream() {
+async fn multipart_whole_stream_limit_rejects_without_reading_the_rest() {
     let polls = Arc::new(AtomicUsize::new(0));
     let counted_polls = Arc::clone(&polls);
     let first = format!(
@@ -267,6 +264,91 @@ async fn multipart_part_without_header_terminator_is_rejected_before_buffering_t
         .unwrap_err();
     assert_eq!(error.status, StatusCode::BAD_REQUEST);
     assert!(polls.load(Ordering::SeqCst) < frames / 2);
+}
+
+#[test]
+fn multipart_framing_lower_bound_never_exceeds_the_encoded_part() {
+    let part = multipart_body(&[("file", Some("a.txt"), b"")]);
+    let closing = format!("--{MULTIPART_BOUNDARY}--\r\n").len();
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::CONTENT_DISPOSITION,
+        "form-data; name=\"file\"; filename=\"a.txt\""
+            .parse()
+            .unwrap(),
+    );
+    let estimate = multipart_part_framing_lower_bound(MULTIPART_BOUNDARY, &headers)
+        + MULTIPART_PART_DATA_TERMINATOR_BYTES;
+    assert!(
+        estimate <= part.len() - closing,
+        "{estimate} vs {}",
+        part.len() - closing
+    );
+    // Only the space after the header colon goes uncounted.
+    assert_eq!(part.len() - closing - estimate, 1);
+}
+
+#[tokio::test]
+async fn multipart_feed_pauses_once_unconsumed_bytes_pass_the_parse_buffer_cap() {
+    use futures_util::FutureExt as _;
+
+    let frame_len = 64 * 1024;
+    let frames =
+        vec![vec![b'a'; frame_len]; 4 * E2B_MULTIPART_PARSE_BUFFER_LIMIT_BYTES / frame_len];
+    let consumed = Arc::new(AtomicUsize::new(0));
+    let mut stream = Box::pin(throttled_multipart_body(
+        chunked_body(frames),
+        Arc::clone(&consumed),
+    ));
+    let mut fed = 0;
+    while let Some(Some(frame)) = stream.next().now_or_never() {
+        fed += frame.unwrap().len();
+    }
+    // Feeding pauses after the first frame that takes the buffer past the cap.
+    assert_eq!(fed, E2B_MULTIPART_PARSE_BUFFER_LIMIT_BYTES + frame_len);
+
+    // Progress by the parser resumes feeding.
+    consumed.store(fed, Ordering::Relaxed);
+    assert!(matches!(stream.next().now_or_never(), Some(Some(Ok(_)))));
+
+    // A pause the parser cannot answer with progress fails the stream.
+    while let Some(Some(frame)) = stream.next().now_or_never() {
+        frame.unwrap();
+    }
+    assert!(matches!(stream.next().now_or_never(), Some(Some(Err(_)))));
+}
+
+#[tokio::test]
+async fn multipart_with_many_tiny_parts_streams_through_the_feed_throttle() {
+    // Tiny parts make the parser consume far less per field than a frame
+    // delivers, so feeding must pause and resume many times over the body.
+    let tiny_parts = 2 * E2B_MULTIPART_PARSE_BUFFER_LIMIT_BYTES / 64;
+    let mut parts = vec![("n", None, b"".as_slice()); tiny_parts];
+    parts.push(("file", Some("last.txt"), b"content".as_slice()));
+    let body = multipart_body(&parts);
+    assert!(body.len() > E2B_MULTIPART_PARSE_BUFFER_LIMIT_BYTES);
+    let frames = body.chunks(256 * 1024).map(<[u8]>::to_vec).collect();
+
+    let uploads = spool_multipart_uploads(chunked_body(frames), MULTIPART_BOUNDARY)
+        .await
+        .unwrap();
+    assert_eq!(uploads.len(), 1);
+    let (_, data) =
+        collect_spooled_write(uploads.into_iter().next().unwrap().upload, "/last.txt").await;
+    assert_eq!(data, b"content");
+}
+
+#[tokio::test]
+async fn multipart_file_part_count_is_capped() {
+    let parts = vec![("file", Some("a.txt"), b"x".as_slice()); E2B_MULTIPART_FILE_PART_LIMIT + 1];
+    let error = spool_multipart_uploads(Body::from(multipart_body(&parts)), MULTIPART_BOUNDARY)
+        .await
+        .unwrap_err();
+    assert_eq!(error.status, StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(
+        error.message,
+        "multipart uploads are limited to 1000 files per request"
+    );
 }
 
 #[tokio::test]
@@ -463,9 +545,7 @@ async fn octet_stream_upload_is_spooled_and_written_in_chunks() {
     let upload = spool_body_upload(chunked_body(vec![b"hello ".to_vec(), b"world".to_vec()]))
         .await
         .unwrap();
-    let file = tokio::fs::File::open(upload._path.to_path_buf())
-        .await
-        .unwrap();
+    let file = tokio::fs::File::open(upload.to_path_buf()).await.unwrap();
 
     let requests = spooled_write_requests(
         sandbox_id,
