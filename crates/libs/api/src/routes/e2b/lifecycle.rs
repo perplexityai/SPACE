@@ -14,6 +14,7 @@ use crate::public_sandbox_operations::SandboxLifecycleOperationPayload;
 const CONNECT_UNREACHABLE_TOUCH_RETRY_ATTEMPTS: usize = 2;
 const CONNECT_UNREACHABLE_TOUCH_RETRY_DELAY: std::time::Duration =
     std::time::Duration::from_millis(50);
+const CONNECT_V2_DEFAULT_TIMEOUT_SECS: u32 = 300;
 const DELETE_OPERATION_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 const DELETE_OPERATION_POLL: std::time::Duration = std::time::Duration::from_millis(100);
 fn connect_activation_request() -> Option<crate::models::SandboxActivationRequest> {
@@ -650,6 +651,36 @@ fn e2b_operation_failure(
         | None => StatusCode::INTERNAL_SERVER_ERROR,
     };
     E2bApiError::new(status, message)
+}
+
+pub(super) async fn connect_sandbox_v2(
+    state: State<AppState>,
+    host: MatchedEcwHost,
+    org: Extension<AuthOrg>,
+    federated: Option<Extension<crate::middleware::auth::AuthFederatedOwner>>,
+    sandbox_id: Path<String>,
+    headers: HeaderMap,
+    body: Option<crate::e2b::E2bJson<ConnectSandboxRequestE2b>>,
+) -> Result<Json<SandboxResponseE2b>, E2bApiError> {
+    // V2 supplies a five-minute minimum; legacy omission remains an activity-only touch.
+    let mut request = body
+        .map(|crate::e2b::E2bJson(request)| request)
+        .unwrap_or_default();
+    let timeout = request.timeout.unwrap_or(CONNECT_V2_DEFAULT_TIMEOUT_SECS);
+    if timeout == 0 {
+        return Err(E2bApiError::bad_request("Timeout must be greater than 0"));
+    }
+    request.timeout = Some(timeout);
+    connect_sandbox(
+        state,
+        host,
+        org,
+        federated,
+        sandbox_id,
+        headers,
+        Some(crate::e2b::E2bJson(request)),
+    )
+    .await
 }
 
 pub(super) async fn connect_sandbox(

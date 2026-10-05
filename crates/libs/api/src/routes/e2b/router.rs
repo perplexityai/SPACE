@@ -20,9 +20,9 @@ use super::template_build::{
 };
 use super::{
     AppState, ECW_SANDBOX_API_LOG_EVENT, EcwHostConfig, EcwRequestLogContext, connect_sandbox,
-    create_sandbox, delete_sandbox, fork_sandbox, get_sandbox, list_sandboxes, pause_sandbox_e2b,
-    record_ecw_sandbox_span_tag, refresh_sandbox, request_client_id, require_ecw_api_host,
-    resume_sandbox_e2b, timeout_sandbox,
+    connect_sandbox_v2, create_sandbox, delete_sandbox, fork_sandbox, get_sandbox, list_sandboxes,
+    pause_sandbox_e2b, record_ecw_sandbox_span_tag, refresh_sandbox, request_client_id,
+    require_ecw_api_host, resume_sandbox_e2b, timeout_sandbox,
 };
 
 pub(crate) fn dedicated_host_router(state: AppState) -> Router<AppState> {
@@ -280,7 +280,7 @@ fn authenticated_e2b_api_routes() -> Router<AppState> {
         )
         .route(
             "/v2/sandboxes/{sandboxID}/connect",
-            axum::routing::post(connect_sandbox),
+            axum::routing::post(connect_sandbox_v2),
         )
         .route(
             "/sandboxes/{sandboxID}/timeout",
