@@ -54,7 +54,7 @@ const E2B_FILE_WRITE_CHUNK_BYTES: usize = 3 * 1024 * 1024;
 const E2B_PROTO_BODY_LIMIT: usize = 1024 * 1024;
 /// Stated as "1 MiB" in `json_file_write_body_too_large_error`.
 const E2B_JSON_FILE_WRITE_BODY_LIMIT_BYTES: usize = 1024 * 1024;
-/// Request bytes multer may hold without yielding them as field data: part
+/// Request bytes multer may consume without yielding a field or a chunk: part
 /// headers, boundaries, and the preamble. Legitimate parts need a few hundred
 /// bytes; the cap stops a body without a header terminator or boundary from
 /// accumulating in multer's parse buffer.
@@ -1045,9 +1045,9 @@ async fn spool_multipart_uploads_with_limit(
     // It also bounds every part, so spool writes need no separate check.
     let constraints =
         multer::Constraints::new().size_limit(multer::SizeLimit::new().whole_stream(limit as u64));
-    let field_bytes = Arc::new(AtomicUsize::new(0));
+    let unparsed_bytes = Arc::new(AtomicUsize::new(0));
     let mut multipart = multer::Multipart::with_constraints(
-        fair_body_data_stream(body, Arc::clone(&field_bytes)),
+        fair_body_data_stream(body, Arc::clone(&unparsed_bytes)),
         boundary,
         constraints,
     );
@@ -1057,6 +1057,7 @@ async fn spool_multipart_uploads_with_limit(
         .await
         .map_err(multipart_upload_error)?
     {
+        unparsed_bytes.store(0, Ordering::Relaxed);
         if !field.headers().contains_key(header::CONTENT_DISPOSITION) {
             return Err(EcwProxyError::bad_request(
                 "Missing multipart Content-Disposition",
@@ -1073,7 +1074,7 @@ async fn spool_multipart_uploads_with_limit(
             None
         };
         while let Some(chunk) = field.chunk().await.map_err(multipart_upload_error)? {
-            field_bytes.fetch_add(chunk.len(), Ordering::Relaxed);
+            unparsed_bytes.store(0, Ordering::Relaxed);
             if let Some(upload) = upload.as_mut() {
                 upload.write_chunk(&chunk).await?;
             }
@@ -1094,30 +1095,30 @@ fn multipart_upload_error(error: multer::Error) -> EcwProxyError {
 
 fn fair_body_data_stream(
     body: Body,
-    field_bytes: Arc<AtomicUsize>,
+    unparsed_bytes: Arc<AtomicUsize>,
 ) -> impl Stream<Item = Result<Bytes, axum::Error>> + Send + 'static {
     // Multer drains every immediately-ready frame into its parse buffer. Force
     // a pending poll after each batch so request bursts stay batch-bounded.
     let mut body = Box::pin(body.into_data_stream());
     let mut fed_since_yield = 0usize;
-    let mut fed_bytes = 0usize;
     stream::poll_fn(move |context| {
         if fed_since_yield >= E2B_MULTIPART_FEED_BATCH_BYTES {
             fed_since_yield = 0;
             context.waker().wake_by_ref();
             return Poll::Pending;
         }
-        // Bytes fed to multer but not yet yielded as field data are still in
-        // its parse buffer, so this bounds that buffer to the cap plus a batch.
-        let unparsed = fed_bytes.saturating_sub(field_bytes.load(Ordering::Relaxed));
-        if unparsed > E2B_MULTIPART_PARSE_BUFFER_LIMIT_BYTES {
+        // The consumer resets the count whenever multer yields a field or a
+        // chunk, which leaves at most a boundary prefix or one batch of field
+        // data buffered. Bytes fed since then bound its parse buffer to the cap
+        // plus a batch.
+        if unparsed_bytes.load(Ordering::Relaxed) > E2B_MULTIPART_PARSE_BUFFER_LIMIT_BYTES {
             return Poll::Ready(Some(Err(axum::Error::new(
                 "multipart headers or preamble exceed the parse buffer limit",
             ))));
         }
         let next = body.as_mut().poll_next(context);
         if let Poll::Ready(Some(Ok(data))) = &next {
-            fed_bytes = fed_bytes.saturating_add(data.len());
+            unparsed_bytes.fetch_add(data.len(), Ordering::Relaxed);
             fed_since_yield = fed_since_yield.saturating_add(data.len());
         }
         next

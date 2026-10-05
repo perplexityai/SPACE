@@ -270,6 +270,27 @@ async fn multipart_part_without_header_terminator_is_rejected_before_buffering_t
 }
 
 #[tokio::test]
+async fn multipart_framing_overhead_beyond_the_parse_buffer_is_accepted() {
+    // Each ignored part carries ~1 KiB of headers, so the request's total
+    // framing exceeds the parse-buffer cap while no single part comes close.
+    let long_name = format!("note-{}", "x".repeat(1024));
+    let part_count = 2 * E2B_MULTIPART_PARSE_BUFFER_LIMIT_BYTES / long_name.len();
+    let mut parts = vec![(long_name.as_str(), None, b"".as_slice()); part_count];
+    parts.push(("file", Some("last.txt"), b"content".as_slice()));
+    let body = multipart_body(&parts);
+    let frames = body.chunks(64 * 1024).map(<[u8]>::to_vec).collect();
+
+    let uploads = spool_multipart_uploads(chunked_body(frames), MULTIPART_BOUNDARY)
+        .await
+        .unwrap();
+    assert_eq!(uploads.len(), 1);
+    let upload = uploads.into_iter().next().unwrap();
+    assert_eq!(upload.filename.as_deref(), Some("last.txt"));
+    let (_, data) = collect_spooled_write(upload.upload, "/last.txt").await;
+    assert_eq!(data, b"content");
+}
+
+#[tokio::test]
 async fn multipart_file_larger_than_the_parse_buffer_streams_in_frames() {
     let frame_len = 64 * 1024;
     let content = (0..3 * E2B_MULTIPART_PARSE_BUFFER_LIMIT_BYTES)
