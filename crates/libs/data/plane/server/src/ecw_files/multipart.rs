@@ -51,8 +51,8 @@ fn too_many_multipart_parts_error() -> EcwProxyError {
     )
 }
 
-/// RFC 2046 limits a boundary to 70 characters. Multer searches for it on
-/// every poll, so an unbounded boundary multiplies the cost of each frame.
+/// RFC 2046 limits a boundary to 70 characters. Multer formats and searches
+/// for the boundary on every poll, so its length adds to the cost of each one.
 const MULTIPART_BOUNDARY_MAX_LEN: usize = 70;
 
 pub(super) fn multipart_boundary(content_type: &str) -> Option<&str> {
@@ -101,16 +101,9 @@ pub(super) async fn spool_multipart_uploads_with_limit(
             multipart_part_framing_lower_bound(boundary, field.headers()),
             Ordering::Relaxed,
         );
-        if !field.headers().contains_key(header::CONTENT_DISPOSITION) {
-            return Err(EcwProxyError::bad_request(
-                "Missing multipart Content-Disposition",
-            ));
-        }
-        // Multer's `name()` and `file_name()` can return text from inside
-        // another parameter's quoted value, so both are read here instead.
-        let filename = content_disposition_param(field.headers(), "filename")
-            .filter(|filename| !filename.is_empty());
-        let is_file = content_disposition_param(field.headers(), "name").as_deref() == Some("file");
+        let disposition = ContentDispositionE2b::parse(field.headers())?;
+        let filename = disposition.filename.filter(|filename| !filename.is_empty());
+        let is_file = disposition.name.as_deref() == Some("file");
         let mut upload = if is_file {
             Some(SpooledUpload::new().await?)
         } else {
@@ -136,56 +129,88 @@ pub(super) async fn spool_multipart_uploads_with_limit(
     Ok(uploads)
 }
 
-/// Reads parameter `key` of a part's Content-Disposition from the raw header
-/// bytes, treating `;` and `=` inside quoted values as data and unescaping
-/// backslash pairs. Multer 3.1.0 matches `name` and `filename` wherever they
-/// follow whitespace, including inside an earlier parameter's quoted value
-/// (`filename="a name=b.txt"; name="file"`), so its accessors are not used.
-/// Values that are not UTF-8 read as absent.
-pub(super) fn content_disposition_param(headers: &HeaderMap, key: &str) -> Option<String> {
-    let value = headers.get(header::CONTENT_DISPOSITION)?.as_bytes();
-    let mut params = Vec::new();
-    let (mut start, mut in_quotes, mut escaped) = (0, false, false);
-    for (index, &byte) in value.iter().enumerate() {
-        match byte {
-            b'\\' if in_quotes && !escaped => {
-                escaped = true;
-                continue;
-            }
-            b'"' if !escaped => in_quotes = !in_quotes,
-            b';' if !in_quotes => {
-                params.extend(value.get(start..index));
-                start = index + 1;
-            }
-            _ => {}
-        }
-        escaped = false;
-    }
-    params.extend(value.get(start..));
-    // The first segment is the disposition type, e.g. `form-data`.
-    params.into_iter().skip(1).find_map(|param| {
-        let separator = param.iter().position(|&byte| byte == b'=')?;
-        let name = param.get(..separator)?.trim_ascii();
-        if !name.eq_ignore_ascii_case(key.as_bytes()) {
-            return None;
-        }
-        let raw = param.get(separator + 1..)?.trim_ascii();
-        let bytes = match raw
-            .strip_prefix(b"\"")
-            .and_then(|raw| raw.strip_suffix(b"\""))
-        {
-            Some(quoted) => {
-                let mut unescaped = Vec::with_capacity(quoted.len());
-                let mut bytes = quoted.iter();
-                while let Some(&byte) = bytes.next() {
-                    unescaped.push(if byte == b'\\' { *bytes.next()? } else { byte });
+/// The `name` and `filename` of a part's Content-Disposition, parsed from the
+/// raw header bytes. Multer 3.1.0's accessors match `name` and `filename`
+/// wherever they follow whitespace, including inside another parameter's
+/// quoted value (`filename="a name=b.txt"; name="file"`), so they are not used.
+#[derive(Debug, Default, PartialEq)]
+pub(super) struct ContentDispositionE2b {
+    pub(super) name: Option<String>,
+    pub(super) filename: Option<String>,
+}
+
+impl ContentDispositionE2b {
+    /// Splits parameters on `;` outside quoted values. Inside a quoted value
+    /// only `\"` is an escape, matching what browsers and multer do; other
+    /// backslashes, such as Windows path separators, stay literal. The first
+    /// occurrence of a parameter wins. Unbalanced quotes, a quote inside an
+    /// unquoted value, and non-UTF-8 values reject the part instead of
+    /// letting stray quotes reach the write path or a file part go unnamed.
+    pub(super) fn parse(headers: &HeaderMap) -> Result<Self, EcwProxyError> {
+        let value = headers
+            .get(header::CONTENT_DISPOSITION)
+            .ok_or_else(|| EcwProxyError::bad_request("Missing multipart Content-Disposition"))?
+            .as_bytes();
+        let malformed = || EcwProxyError::bad_request("Invalid multipart Content-Disposition");
+        let mut params = Vec::new();
+        let (mut start, mut index, mut in_quotes) = (0, 0, false);
+        while let Some(&byte) = value.get(index) {
+            match byte {
+                b'\\' if in_quotes && value.get(index + 1) == Some(&b'"') => index += 1,
+                b'"' => in_quotes = !in_quotes,
+                b';' if !in_quotes => {
+                    params.extend(value.get(start..index));
+                    start = index + 1;
                 }
-                unescaped
+                _ => {}
             }
-            None => raw.to_vec(),
-        };
-        String::from_utf8(bytes).ok()
-    })
+            index += 1;
+        }
+        if in_quotes {
+            return Err(malformed());
+        }
+        params.extend(value.get(start..));
+
+        let mut disposition = Self::default();
+        // The first segment is the disposition type, e.g. `form-data`.
+        for param in params.into_iter().skip(1) {
+            let Some(separator) = param.iter().position(|&byte| byte == b'=') else {
+                continue;
+            };
+            let key = param.get(..separator).unwrap_or_default().trim_ascii();
+            let slot = if key.eq_ignore_ascii_case(b"name") {
+                &mut disposition.name
+            } else if key.eq_ignore_ascii_case(b"filename") {
+                &mut disposition.filename
+            } else {
+                continue;
+            };
+            let raw = param.get(separator + 1..).unwrap_or_default().trim_ascii();
+            let bytes = match raw.strip_prefix(b"\"") {
+                Some(rest) => {
+                    let inner = rest.strip_suffix(b"\"").ok_or_else(malformed)?;
+                    let mut unescaped = Vec::with_capacity(inner.len());
+                    let mut bytes = inner.iter().peekable();
+                    while let Some(&byte) = bytes.next() {
+                        match byte {
+                            b'\\' if bytes.peek() == Some(&&b'"') => {
+                                bytes.next();
+                                unescaped.push(b'"');
+                            }
+                            b'"' => return Err(malformed()),
+                            _ => unescaped.push(byte),
+                        }
+                    }
+                    unescaped
+                }
+                None if raw.contains(&b'"') => return Err(malformed()),
+                None => raw.to_vec(),
+            };
+            let text = String::from_utf8(bytes).map_err(|_| malformed())?;
+            slot.get_or_insert(text);
+        }
+        Ok(disposition)
+    }
 }
 
 fn multipart_upload_error(error: multer::Error) -> EcwProxyError {

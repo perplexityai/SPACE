@@ -357,52 +357,75 @@ async fn multipart_file_part_with_filename_before_name_is_spooled() {
 }
 
 #[test]
-fn content_disposition_params_ignore_text_inside_quoted_values() {
-    let param = |value: &[u8], key: &str| {
+fn content_disposition_parse_ignores_text_inside_quoted_values() {
+    let parse = |value: &[u8]| {
         let mut headers = HeaderMap::new();
         headers.insert(
             header::CONTENT_DISPOSITION,
             axum::http::HeaderValue::from_bytes(value).unwrap(),
         );
-        content_disposition_param(&headers, key)
+        ContentDispositionE2b::parse(&headers)
     };
-    let cases: [(&[u8], Option<&str>, Option<&str>); 7] = [
+    let parsed = |name: Option<&str>, filename: Option<&str>| ContentDispositionE2b {
+        name: name.map(str::to_string),
+        filename: filename.map(str::to_string),
+    };
+    let cases: [(&[u8], ContentDispositionE2b); 9] = [
         (
             br#"form-data; name="file"; filename="a.txt""#,
-            Some("file"),
-            Some("a.txt"),
+            parsed(Some("file"), Some("a.txt")),
         ),
         (
             br#"form-data; filename="a name=b.txt"; name="file""#,
-            Some("file"),
-            Some("a name=b.txt"),
+            parsed(Some("file"), Some("a name=b.txt")),
         ),
         (
             br#"form-data; filename="x;name=file;"; name="meta""#,
-            Some("meta"),
-            Some("x;name=file;"),
+            parsed(Some("meta"), Some("x;name=file;")),
         ),
         (
             br#"form-data; name="a filename=x"; filename="real.txt""#,
-            Some("a filename=x"),
-            Some("real.txt"),
+            parsed(Some("a filename=x"), Some("real.txt")),
         ),
         (
             br#"form-data; filename="q\"; name=x"; NAME=file"#,
-            Some("file"),
-            Some(r#"q"; name=x"#),
+            parsed(Some("file"), Some(r#"q"; name=x"#)),
+        ),
+        // Browsers send `"` as `%22` and a backslash as itself.
+        (
+            br#"form-data; name="file"; filename="dir\report%22.txt""#,
+            parsed(Some("file"), Some(r"dir\report%22.txt")),
         ),
         (
             "form-data; filename=\"\u{fc} name.txt\"; name=\"file\"".as_bytes(),
-            Some("file"),
-            Some("\u{fc} name.txt"),
+            parsed(Some("file"), Some("\u{fc} name.txt")),
         ),
-        (br#"form-data; filename="a.txt""#, None, Some("a.txt")),
+        (
+            br#"form-data; name=file; filename="a.txt"; filename="b.txt""#,
+            parsed(Some("file"), Some("a.txt")),
+        ),
+        (
+            br#"form-data; filename="a.txt""#,
+            parsed(None, Some("a.txt")),
+        ),
     ];
-    for (value, name, filename) in cases {
-        let shown = String::from_utf8_lossy(value);
-        assert_eq!(param(value, "name").as_deref(), name, "{shown}");
-        assert_eq!(param(value, "filename").as_deref(), filename, "{shown}");
+    for (value, expected) in cases {
+        let shown = String::from_utf8_lossy(value).into_owned();
+        assert_eq!(parse(value).unwrap(), expected, "{shown}");
+    }
+    for malformed in [
+        &br#"form-data; name="file"; filename="a.txt"#[..],
+        br#"form-data; name="file"; filename="a.txt"x"#,
+        br#"form-data; name="file"; filename=a.txt""#,
+        br#"form-data; filename=a"b; name="file""#,
+        b"form-data; name=\"file\"; filename=\"\xff.txt\"",
+    ] {
+        let shown = String::from_utf8_lossy(malformed).into_owned();
+        let error = parse(malformed).unwrap_err();
+        assert_eq!(
+            error.message, "Invalid multipart Content-Disposition",
+            "{shown}"
+        );
     }
 }
 
