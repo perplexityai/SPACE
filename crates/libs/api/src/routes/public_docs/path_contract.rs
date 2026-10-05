@@ -492,7 +492,6 @@ fn path_parameter_schema(name: &str) -> Value {
             })
         }
         "port" => json!({ "type": "integer", "minimum": 1, "maximum": 65535 }),
-        "template_name" => json!({ "type": "string", "minLength": 1 }),
         _ => json!({ "type": "string", "minLength": 1 }),
     }
 }

@@ -31,10 +31,10 @@ fn credential_contended_response(error: &sqlx::Error) -> Response {
 /// `sandbox_id`) while a bounded lock wait still lands at `warn`. A helper
 /// taking a `&'static str` could not do both.
 ///
-/// One function rather than a guard arm per handler: the arms were identical
-/// across the credential handlers. A handler added later without the guard
-/// reports a lost race as permanent and nothing
-/// catches it.
+/// One function rather than a guard arm per call site: the arms are identical
+/// across the internal sandbox credential handlers (`get_sandbox_credentials`
+/// and `advance_sandbox_ecw_credential_epoch`). A call site added later without
+/// the guard reports a lost race as permanent and nothing catches it.
 fn credential_db_error(error: &sqlx::Error, log: impl FnOnce()) -> Response {
     if contention::is_lock_contention(error) {
         return credential_contended_response(error);
