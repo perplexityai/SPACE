@@ -1,0 +1,50 @@
+flowchart TD
+  classDef client fill:#dbeafe,stroke:#1d4ed8,color:#000
+  classDef gate fill:#fef3c7,stroke:#b45309,color:#000
+  classDef disk fill:#dcfce7,stroke:#15803d,color:#000
+  classDef mem fill:#ede9fe,stroke:#6d28d9,color:#000
+  classDef reject fill:#fde2e4,stroke:#c0392b,color:#000
+
+  req["POST /files"]:::client
+  ct{"Content-Type"}:::gate
+  req --> ct
+
+  json["JSON (or no Content-Type)<br/>Content-Length and to_bytes<br/>capped at 1 MiB"]:::mem
+  oct["application/octet-stream<br/>Content-Length ≤ 256 MiB<br/>create parent dir first"]:::gate
+  mp["multipart/form-data<br/>Content-Length ≤ 256 MiB<br/>boundary 1–70 chars"]:::gate
+  other["400 unsupported<br/>(body not read)"]:::reject
+  ct --> json
+  ct --> oct
+  ct --> mp
+  ct --> other
+
+  json -->|"> 1 MiB"| r413a["413: use multipart<br/>or octet-stream"]:::reject
+  json -->|"≤ 1 MiB"| replay["ReplayableSpacedWrite<br/>(Bytes, no copy)"]:::mem
+
+  subgraph feed["throttled_multipart_body"]
+    thr{"bytes fed − consumed<br/>lower bound > 64 KiB?"}:::gate
+    prog{"parser progress<br/>since last pause?"}:::gate
+    pause["pause one poll<br/>so multer parses"]:::gate
+    frame["feed next body frame"]:::client
+    thr -->|"yes"| prog
+    prog -->|"yes"| pause
+    prog -->|"no"| r400a["400: headers or preamble<br/>never complete a part"]:::reject
+    thr -->|"no"| frame
+  end
+
+  mp --> thr
+  frame --> multer["multer<br/>whole stream ≤ 256 MiB"]:::mem
+  pause --> multer
+  multer -->|"> 256 MiB"| r413b["413"]:::reject
+  multer --> part["each part: + framing lower bound,<br/>chunk bytes, CRLF at end<br/>(feeds 'consumed')"]:::mem
+  part -.->|"consumed"| thr
+  part --> cd["ContentDispositionE2b::parse<br/>quote-aware name / filename"]:::gate
+  cd -->|"malformed quoting<br/>or non-UTF-8"| r400b["400"]:::reject
+  cd -->|"> 1000 parts"| r413c["413"]:::reject
+  cd -->|"file part with no filename,<br/>filename > 4096 B, or<br/>2nd file with ?path="| r400c["400 before spooling"]:::reject
+  cd -->|"name = file"| spool
+  oct --> spool["SpooledUpload<br/>temp file in TMPDIR"]:::disk
+  spool --> fin["finish(): flush, close fd,<br/>keep TempPath"]:::disk
+  fin --> write["spaced_write_spooled<br/>reopen by path, 3 MiB gRPC chunks,<br/>route carried per file"]:::disk
+  replay --> rpc["sandbox spaced write"]:::client
+  write --> rpc
