@@ -175,7 +175,6 @@ pub enum StoreError {
 /// The database is restricted to 0600 inside the already private directory.
 pub(crate) async fn open(state_dir: &Path) -> Result<Connection, StoreError> {
     let path = state_dir.join(DATABASE_FILE);
-    let store = pplx_space_common_svc::sql::baselines::RUNTIME_MANAGER;
     pplx_space_common_svc::sql::sqlite::migrate_embedded(
         DATABASE_NAME,
         &path,
@@ -183,8 +182,6 @@ pub(crate) async fn open(state_dir: &Path) -> Result<Connection, StoreError> {
             service: &MIGRATOR,
             common: Some(&COMMON_SCHEMA_MIGRATOR),
         },
-        Some(store.baseline_version),
-        store.migration_failure_policy,
         None,
     )
     .await

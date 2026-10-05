@@ -5,8 +5,7 @@ import { useParams } from 'next/navigation';
 import { adminApi } from '@/lib/api';
 import { useAuth } from '@/lib/auth';
 import { Organization, OrgMasterKey, Sandbox, User } from '@/lib/types';
-import { Card, Table, Typography, Form, Input, Button, ColorPicker, message, Descriptions, Space, Switch, Tag } from 'antd';
-import OrgCredentialsTable from './credentials';
+import { Card, Table, Typography, Form, Input, Button, message, Descriptions, Space, Switch, Tag } from 'antd';
 import { LockOutlined, SaveOutlined } from '@ant-design/icons';
 import type { ColumnsType } from 'antd/es/table';
 
@@ -187,10 +186,6 @@ export default function OrgDetailPage() {
             </Typography.Text>
           )}
         </Space>
-      </Card>
-
-      <Card title="Organization Credentials" style={{ marginTop: 24 }}>
-        <OrgCredentialsTable orgId={id} />
       </Card>
     </div>
   );

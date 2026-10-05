@@ -167,7 +167,7 @@ impl FilesystemRouter {
                 PublicFilesystemServer::new(self.clone())
                     .max_decoding_message_size(filesystem_limits::MAX_MESSAGE_BYTES),
             ),
-            self.payload_slots.clone(),
+            pplx_space_common_grpc::QueuedSlots::new(self.payload_slots.clone()),
             filesystem_limits::PAYLOAD_METHODS,
         )
     }
@@ -378,15 +378,23 @@ impl FilesystemRouter {
                 };
                 // Bound queued bytes as well as frame count, without rejecting
                 // clients that send larger (otherwise valid) protobuf messages.
-                for chunk in data.chunks(filesystem_limits::WRITE_CHUNK_BYTES) {
-                    if tx
-                        .send(worker::WriteFrame {
-                            frame: Some(write_frame::Frame::Data(chunk.to_vec())),
-                        })
-                        .await
-                        .is_err()
-                    {
+                // spaced-host already sends frames of at most this size, so
+                // those move through as they are. A larger one is split one
+                // chunk at a time, so at most one copy waits on the channel.
+                let send = |frame: Vec<u8>| {
+                    tx.send(worker::WriteFrame {
+                        frame: Some(write_frame::Frame::Data(frame)),
+                    })
+                };
+                if data.len() <= filesystem_limits::WRITE_CHUNK_BYTES {
+                    if send(data).await.is_err() {
                         return Ok(PumpExit::ExecutorClosed);
+                    }
+                } else {
+                    for chunk in data.chunks(filesystem_limits::WRITE_CHUNK_BYTES) {
+                        if send(chunk.to_vec()).await.is_err() {
+                            return Ok(PumpExit::ExecutorClosed);
+                        }
                     }
                 }
             }
@@ -560,6 +568,66 @@ impl FilesystemRouter {
             runtime_handle: tokio::runtime::Handle::current(),
             failure_recorded: false,
         })))
+    }
+
+    /// Read through a descriptor the user's worker opened: the worker checks
+    /// access as the user, and this process streams the bytes itself instead
+    /// of relaying every chunk from the worker. `None` falls back to the
+    /// relayed read: a worker without the call, or a descriptor this process
+    /// cannot duplicate.
+    #[cfg(target_os = "linux")]
+    async fn read_through_descriptor(
+        &self,
+        user: Option<String>,
+        request: ReadRequest,
+    ) -> Result<Option<GuestFileChunkStream>, Status> {
+        let worker = self.worker(user).await?;
+        let length = request.length;
+        let response = match worker.client.clone().open_read(request).await {
+            Err(status) if status.code() == tonic::Code::Unimplemented => return Ok(None),
+            result => self.observe_worker_result(&worker, result).await?,
+        };
+        let mut lease = response.into_inner();
+        let Some(opened) = self
+            .observe_worker_result(&worker, lease.message().await)
+            .await?
+        else {
+            return Err(Status::internal(
+                "filesystem worker ended an open without a descriptor",
+            ));
+        };
+        let Some(fd) = worker.duplicate_descriptor(opened.fd) else {
+            return Ok(None);
+        };
+        // The worker keeps its copy and its admission until this read ends,
+        // and the read ends with the worker: its admission is per worker, so
+        // a read outliving it would escape the replacement worker's limit.
+        // The worker sends nothing after the descriptor; its stream ends
+        // only when the worker does. A transport failure retires the worker,
+        // as it does on a relayed stream, without holding up the read's end.
+        let router = self.clone();
+        let leased = worker.clone();
+        let worker_ended = async move {
+            let ended = loop {
+                match lease.message().await {
+                    Ok(Some(_)) => {}
+                    Ok(None) => break None,
+                    Err(status) => break Some(status),
+                }
+            };
+            if ended.as_ref().is_some_and(is_worker_transport_failure) {
+                tokio::spawn(async move {
+                    router.record_worker_failure(&leased).await;
+                });
+            }
+            Status::unavailable("filesystem worker ended during the read")
+        };
+        Ok(Some(super::read::stream_file(
+            std::fs::File::from(fd),
+            length,
+            worker,
+            worker_ended,
+        )))
     }
 
     #[cfg(target_os = "linux")]
@@ -947,8 +1015,14 @@ impl Filesystem for FilesystemRouter {
             #[cfg(target_os = "linux")]
             Backend::Workers(_) => {
                 let mut request = request.into_inner();
-                self.stream(request.user.take(), request, FilesystemClient::read)
-                    .await
+                let user = request.user.take();
+                if let Some(stream) = self
+                    .read_through_descriptor(user.clone(), request.clone())
+                    .await?
+                {
+                    return Ok(Response::new(stream));
+                }
+                self.stream(user, request, FilesystemClient::read).await
             }
         }
     }

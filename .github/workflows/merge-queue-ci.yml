@@ -12,13 +12,6 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  # Inventory only; kept outside required aggregate dependencies.
-  quarantine_backlog:
-    if: github.repository == 'perplexityai/SPACE'
-    uses: ./.github/workflows/quarantine-ci.yml
-    permissions:
-      contents: read
-
   # Queue candidates rerun Rust format, Clippy, and correctness checks against
   # the cumulative merge group. The Rust test build does not deny warnings, and
   # pull requests that each pass Clippy can still fail it together: one

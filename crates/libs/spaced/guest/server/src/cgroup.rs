@@ -14,10 +14,12 @@
 //!   - PIDs: `workloads/pids.max` caps workloads below the guest's effective
 //!     task ceiling (`min(pid_max, threads-max)`), reserving task-creation
 //!     headroom so a fork bomb can't starve the supervisor's own `fork`.
-//!   - Memory: `supervisor/memory.min` keeps spaced's pages resident under
-//!     pressure. Beyond that we rely on the kernel OOM killer's own heuristic:
-//!     a runaway allocator dwarfs spaced's tiny resident set, so it is the
-//!     victim, not the supervisor.
+//!   - Memory: `workloads/memory.max` holds workloads below the guest's
+//!     memory by a reserve, so a workload that runs out of memory is killed
+//!     inside its own cgroup and the guest as a whole never runs out:
+//!     spaced is not an OOM candidate and does not stall reclaiming for a
+//!     workload. `supervisor/memory.min` keeps spaced's pages resident under
+//!     the pressure that remains.
 //!   - I/O: `supervisor/io.weight` dominates, so spaced's own disk I/O (reading
 //!     `/proc`, fs metadata, writing logs) is serviced ahead of a workload
 //!     saturating the device, rather than queuing behind it. This is the one
@@ -63,6 +65,15 @@ pub(crate) struct GuestCgroups {
 }
 
 impl GuestCgroups {
+    /// Place spawned workloads by writing to `workloads_procs`, which a test
+    /// can point at a full pipe to hold a child between fork and exec.
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn with_workloads_procs(workloads_procs: File) -> Self {
+        Self {
+            workloads_procs: Arc::new(workloads_procs),
+        }
+    }
+
     /// Set up the supervisor/workloads split and return a handle used to place
     /// spawned workloads. Returns `None` — degrading to the prior shared-cgroup
     /// behavior — on any non-Linux target or setup failure. Never panics.
@@ -126,7 +137,7 @@ fn place_in_workloads(workloads_procs: &File) -> std::io::Result<()> {
 mod linux {
     use super::{
         GuestCgroups, has_controller, missing_controllers, parse_unified_cgroup,
-        workloads_pids_max_from,
+        workloads_memory_max_from, workloads_pids_max_from,
     };
     use std::path::{Path, PathBuf};
 
@@ -241,6 +252,9 @@ mod linux {
         ];
         if let Some(pids_max) = workloads_pids_max() {
             limits.push((Leaf::Workloads, "pids.max", pids_max.to_string()));
+        }
+        if let Some(memory_max) = workloads_memory_max() {
+            limits.push((Leaf::Workloads, "memory.max", memory_max.to_string()));
         }
         for (leaf, file, value) in &limits {
             write_cgroup(&base.join(leaf.as_str()).join(file), value)?;
@@ -377,6 +391,21 @@ mod linux {
     fn read_kernel_u64(path: &str) -> Option<u64> {
         std::fs::read_to_string(path).ok()?.trim().parse().ok()
     }
+
+    /// `workloads/memory.max` from the guest's `MemTotal`; `None` (leave
+    /// workloads uncapped) if it can't be read.
+    fn workloads_memory_max() -> Option<u64> {
+        let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+        let total_kib: u64 = meminfo
+            .lines()
+            .find_map(|line| line.strip_prefix("MemTotal:"))?
+            .trim()
+            .strip_suffix("kB")?
+            .trim()
+            .parse()
+            .ok()?;
+        workloads_memory_max_from(total_kib.checked_mul(1024)?)
+    }
 }
 
 // Task slots held back from workloads and reserved for the supervisor and
@@ -426,6 +455,24 @@ fn workloads_pids_max_from(pid_max: u64, threads_max: u64) -> Option<u64> {
         return None;
     }
     Some(ceiling - WORKLOADS_PID_RESERVE)
+}
+
+// Memory held back from workloads for spaced, the guest's system daemons and
+// the kernel: an eighth of the guest's memory, at most this much.
+#[cfg(any(target_os = "linux", test))]
+const WORKLOADS_MEMORY_RESERVE_MAX_BYTES: u64 = 128 * 1024 * 1024;
+
+/// The guest's memory minus the supervisor reserve, `min(total / 8, 128 MiB)`.
+/// `None` (leave workloads uncapped) when the reserve would claim half or
+/// more of the guest, where a cap would do more harm than the headroom is
+/// worth.
+#[cfg(any(target_os = "linux", test))]
+fn workloads_memory_max_from(mem_total_bytes: u64) -> Option<u64> {
+    let reserve = (mem_total_bytes / 8).min(WORKLOADS_MEMORY_RESERVE_MAX_BYTES);
+    if reserve == 0 || reserve.saturating_mul(2) >= mem_total_bytes {
+        return None;
+    }
+    Some(mem_total_bytes - reserve)
 }
 
 /// Extract the path of the unified (cgroup v2) hierarchy entry — the line of

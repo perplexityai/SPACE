@@ -26,7 +26,7 @@ use axum::{
     routing::{get, put},
 };
 
-use super::{AppState, authz, credentials, debug};
+use super::{AppState, authz, debug};
 use crate::{
     auth,
     middleware::auth::{AuthOrg, AuthUser, bearer_token},
@@ -243,14 +243,6 @@ pub fn v1_router(state: AppState) -> Router<AppState> {
             axum::routing::delete(api_keys::delete_api_key),
         )
         .route(
-            "/orgs/{org_id}/credentials",
-            get(credentials::list_org_credentials).post(credentials::create_org_credential),
-        )
-        .route(
-            "/orgs/{org_id}/credentials/{credential_id}",
-            put(credentials::update_org_credential).delete(credentials::delete_org_credential),
-        )
-        .route(
             "/users/{user_id}",
             get(identity::get_user)
                 .patch(identity::update_user)
@@ -259,16 +251,6 @@ pub fn v1_router(state: AppState) -> Router<AppState> {
         .route(
             "/users/{user_id}/role",
             axum::routing::put(identity::update_user_role),
-        )
-        .route(
-            "/users/{user_id}/credentials",
-            get(credentials::list_admin_user_credentials)
-                .post(credentials::create_admin_user_credential),
-        )
-        .route(
-            "/users/{user_id}/credentials/{credential_id}",
-            put(credentials::update_admin_user_credential)
-                .delete(credentials::delete_admin_user_credential),
         )
         .route(
             "/sandboxes",

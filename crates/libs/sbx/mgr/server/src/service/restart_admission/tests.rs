@@ -592,3 +592,80 @@ async fn admitted_finalizer_inherits_ownership_after_drain_closes_admission() {
     .await
     .unwrap();
 }
+
+#[tokio::test]
+async fn disconnected_caller_abandons_a_process_start_still_waiting_on_the_guest() {
+    struct StartDropped(Arc<AtomicBool>);
+    impl Drop for StartDropped {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+    let manager = test_service();
+    let started = Arc::new(tokio::sync::Notify::new());
+    let start_dropped = Arc::new(AtomicBool::new(false));
+    let outcome = Arc::new(std::sync::Mutex::new(None));
+    let mut service = manager.restart_admission_layer().layer(tower::service_fn({
+        let started = started.clone();
+        let start_dropped = start_dropped.clone();
+        let outcome = outcome.clone();
+        move |_request: Request<()>| {
+            let started = started.clone();
+            let start_dropped = start_dropped.clone();
+            let outcome = outcome.clone();
+            async move {
+                // Stands in for a start queued at spaced-host admission.
+                let start = async move {
+                    let _guard = StartDropped(start_dropped);
+                    std::future::pending::<Result<(), tonic::Status>>().await
+                };
+                started.notify_one();
+                let result = abandon_start_if_caller_cancelled(start).await;
+                *outcome.lock().unwrap() = Some(matches!(result, GuestStartOutcome::CallerGone));
+                Ok::<_, Infallible>(Response::new(tonic::body::Body::default()))
+            }
+        }
+    }));
+    let call = tokio::spawn(async move {
+        service
+            .call(
+                Request::builder()
+                    .uri("/space.sandbox.manager.v1.SandboxManager/SpacedStartProcess")
+                    .body(())
+                    .unwrap(),
+            )
+            .await
+    });
+    started.notified().await;
+    call.abort();
+    assert!(call.await.unwrap_err().is_cancelled());
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        manager.wait_for_state_transitions_drained(),
+    )
+    .await
+    .expect("an abandoned start must not keep its writer lease");
+    assert!(start_dropped.load(Ordering::Acquire));
+    assert_eq!(
+        *outcome.lock().unwrap(),
+        Some(true),
+        "a disconnected caller is reported apart from guest start failures"
+    );
+}
+
+#[tokio::test]
+async fn guest_start_failures_are_reported_as_failures_not_caller_disconnects() {
+    let failed = CALLER_CANCELLED
+        .scope(
+            CancellationToken::new(),
+            abandon_start_if_caller_cancelled(async {
+                Err::<(), _>(tonic::Status::unavailable("guest gone"))
+            }),
+        )
+        .await;
+    assert!(
+        matches!(failed, GuestStartOutcome::Failed(status) if status.code() == tonic::Code::Unavailable)
+    );
+    let internal = abandon_start_if_caller_cancelled(async { Ok::<_, tonic::Status>(8) }).await;
+    assert!(matches!(internal, GuestStartOutcome::Opened(8)));
+}

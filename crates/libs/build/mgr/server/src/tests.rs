@@ -89,16 +89,13 @@ pub(super) fn initialize_schema(conn: &mut Connection) {
     }
     let service = sqlx::migrate!("../../../../../db/build-manager");
     let common = sqlx::migrate!("../../../../../db/common");
-    if pplx_space_common_svc::sql::baselines::is_public(&service) {
-        pplx_space_common_svc::sql::sqlite::migrate_common_schema_up(conn, &common).unwrap();
-    }
+    pplx_space_common_svc::sql::sqlite::migrate_common_schema_up(conn, &common).unwrap();
     for migration in service
         .iter()
         .filter(|migration| migration.migration_type.is_up_migration())
     {
         conn.execute_batch(migration.sql.as_ref()).unwrap();
     }
-    pplx_space_common_svc::sql::sqlite::migrate_common_schema_up(conn, &common).unwrap();
 }
 
 #[derive(Default)]

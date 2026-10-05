@@ -89,18 +89,8 @@ fn admin_route_patterns_are_valid() {
                         "/orgs/{org_id}/api-keys/{api_key_id}",
                         axum::routing::delete(h),
                     )
-                    .route("/orgs/{org_id}/credentials", get(h).post(h))
-                    .route(
-                        "/orgs/{org_id}/credentials/{credential_id}",
-                        put(h).delete(h),
-                    )
                     .route("/users/{user_id}", get(h).patch(h).delete(h))
                     .route("/users/{user_id}/role", axum::routing::put(h))
-                    .route("/users/{user_id}/credentials", get(h).post(h))
-                    .route(
-                        "/users/{user_id}/credentials/{credential_id}",
-                        put(h).delete(h),
-                    )
                     .route("/sandboxes", get(h))
                     .route("/sandboxes/{spec}", get(h).patch(h).post(h))
                     .route("/sandboxes/{spec}/commands", axum::routing::post(h)),
@@ -163,18 +153,8 @@ fn admin_route_patterns_are_valid() {
                     "/orgs/{org_id}/api-keys/{api_key_id}",
                     axum::routing::delete(h),
                 )
-                .route("/orgs/{org_id}/credentials", get(h).post(h))
-                .route(
-                    "/orgs/{org_id}/credentials/{credential_id}",
-                    put(h).delete(h),
-                )
                 .route("/users/{user_id}", get(h).patch(h).delete(h))
                 .route("/users/{user_id}/role", axum::routing::put(h))
-                .route("/users/{user_id}/credentials", get(h).post(h))
-                .route(
-                    "/users/{user_id}/credentials/{credential_id}",
-                    put(h).delete(h),
-                )
                 .route("/sandboxes", get(h))
                 .route("/sandboxes/{spec}", get(h).patch(h).post(h))
                 .route("/sandboxes/{spec}/commands", axum::routing::post(h)),

@@ -559,6 +559,7 @@ fn pooled_create_input<'a>(
         env: &req.env,
         metric_identity: SandboxApiMetricIdentity::native("create"),
         planned_sandbox_id: SandboxId::new(),
+        sandbox_id_pinned: false,
         create_owner,
         auto_lifecycle,
         backend: "fc",
@@ -1407,6 +1408,152 @@ async fn postgres_pool_configured_resources_uses_enabled_release_shape() -> Test
     Ok(())
 }
 
+async fn insert_inventory_shape(
+    pool: &PgPool,
+    role: &str,
+    content_hash: &str,
+    shape: (i32, i32),
+    observed_secs_ago: i32,
+) -> TestResult {
+    let node_id = Uuid::now_v7();
+    sqlx::query(sql!(
+        "INSERT INTO nodes (id, address, role, managed_by, state)
+         VALUES ($1, '10.0.0.10'::INET, $2, 'space', 'ready')"
+    ))
+    .bind(node_id)
+    .bind(role)
+    .execute(pool)
+    .await?;
+    sqlx::query(sql!(
+        "INSERT INTO node_template_inventory (
+             node_id, template_name, content_hash, runtime, vcpu, memory_mib, observed_at
+         )
+         VALUES ($1, 'app-runtime', $2, 'fc', $3, $4, now() - make_interval(secs => $5))"
+    ))
+    .bind(node_id)
+    .bind(content_hash)
+    .bind(shape.0)
+    .bind(shape.1)
+    .bind(f64::from(observed_secs_ago))
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn postgres_template_build_shape_prefers_the_builder_inventory() -> TestResult {
+    use crate::template_inventory_store::{TemplateBuildShape, release_build_shape};
+    let db = pg_test_db().await?;
+    insert_template_release(&db.pool, "app-runtime", "sha256:shape").await?;
+    insert_inventory_shape(&db.pool, "worker", "sha256:shape", (2, 2048), 0).await?;
+    insert_inventory_shape(&db.pool, "builder", "sha256:shape", (4, 4096), 60).await?;
+    insert_inventory_shape(&db.pool, "builder", "sha256:other", (8, 8192), 0).await?;
+    insert_inventory_shape(&db.pool, "builder", "sha256:partial", (4, 0), 0).await?;
+
+    let template = TemplateName::parse("app-runtime").unwrap();
+    let load = |content_hash| {
+        release_build_shape(&db.pool, &template, content_hash, RuntimeKind::Firecracker)
+    };
+    assert_eq!(
+        load("sha256:shape").await?,
+        Some(TemplateBuildShape {
+            vcpu: pplx_space_common_core::types::VcpuCount::try_from_u32(4).unwrap(),
+            memory: pplx_space_common_core::types::MemorySize::mib(4096).unwrap(),
+        })
+    );
+    assert_eq!(load("sha256:partial").await?, None);
+    assert_eq!(load("sha256:absent").await?, None);
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn postgres_kubernetes_create_fills_unset_resources_from_the_template_shape() -> TestResult {
+    let db = pg_test_db().await?;
+    let release_id = insert_template_release(&db.pool, "app-runtime", "sha256:shape").await?;
+    insert_inventory_shape(&db.pool, "builder", "sha256:shape", (4, 4096), 0).await?;
+    let template = TemplateName::parse("app-runtime").unwrap();
+    let resolve_with = |managed_by, boot_mode, requested, restoring| {
+        resolve_cold_create_resources(
+            &db.pool,
+            ColdCreateShapeInput {
+                managed_by,
+                runtime: RuntimeKind::Firecracker,
+                boot_mode,
+                template: &template,
+                content_hash: "sha256:shape",
+                template_release_id: release_id,
+                requested,
+                restoring,
+            },
+        )
+    };
+    let resolve =
+        |managed_by, boot_mode, requested| resolve_with(managed_by, boot_mode, requested, false);
+    let unset = || SandboxResources {
+        vcpu: None,
+        memory_mib: None,
+        disk_mib: None,
+    };
+    let shape =
+        |resources: &SandboxResources| (resources.vcpu, resources.memory_mib, resources.disk_mib);
+
+    let (resources, _) = resolve("k8s", CreateBootMode::Fallthrough, unset()).await?;
+    assert_eq!(
+        shape(&resources),
+        (Some(4), Some(4096), None),
+        "an unshaped Kubernetes create must not boot at the shim's fixed defaults"
+    );
+
+    let (resources, _) = resolve(
+        "k8s",
+        CreateBootMode::Cold,
+        SandboxResources {
+            vcpu: None,
+            memory_mib: Some(2048),
+            disk_mib: Some(8192),
+        },
+    )
+    .await?;
+    assert_eq!(
+        shape(&resources),
+        (Some(4), Some(2048), Some(8192)),
+        "requested values win; only unset ones come from the template"
+    );
+
+    let (resources, _) = resolve("space", CreateBootMode::Fallthrough, unset()).await?;
+    assert_eq!(
+        shape(&resources),
+        (None, None, None),
+        "direct creates keep the node's snapshot or metadata shape"
+    );
+
+    let (resources, _) = resolve_with("k8s", CreateBootMode::Cold, unset(), true).await?;
+    assert_eq!(
+        shape(&resources),
+        (None, None, None),
+        "a fork keeps its source snapshot's shape"
+    );
+
+    sqlx::query(sql!(
+        "INSERT INTO kubernetes_pool_configs (
+             id, template_release_id, vcpu, memory_mib, disk_mib, target_ready_slots,
+             refill_per_tick, max_warming_slots, namespace, enabled
+         )
+         VALUES ($1, $2, 2, 8192, 32768, 1, 1, 1, 'space', true)"
+    ))
+    .bind(Uuid::now_v7())
+    .bind(release_id)
+    .execute(&db.pool)
+    .await?;
+    let (resources, _) = resolve("k8s", CreateBootMode::Fallthrough, unset()).await?;
+    assert_eq!(
+        shape(&resources),
+        (Some(2), Some(8192), Some(32768)),
+        "a configured pool shape still wins for a fallthrough create"
+    );
+    Ok(())
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn postgres_pool_miss_can_retain_rolling_policy_shape_before_materialization() -> TestResult {
     let db = pg_test_db().await?;
@@ -1821,6 +1968,85 @@ async fn postgres_byok_org_bypasses_warm_pool_and_cold_creates() -> TestResult {
         substrate.claim_calls(),
         0,
         "BYOK org must not touch the warm pool"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn postgres_pinned_sandbox_id_bypasses_warm_pool_and_cold_creates() -> TestResult {
+    // A create whose sandbox ID was already handed to the caller must produce
+    // exactly that ID. Warm-pool adoption returns the slot's pre-reserved ID
+    // instead, so even with a claimable, prepare-ready slot the create must
+    // fall through to the cold path without touching the pool.
+    let db = pg_test_db().await?;
+    let actor = insert_actor(&db.pool).await?;
+    let node_id = NodeId::new();
+    let release_id = insert_template_release(&db.pool, "seed", "sha256:pooled").await?;
+    let pool_config_id = Uuid::now_v7();
+    let slot_sandbox_id = SandboxId::new();
+    let auto_lifecycle = AutoLifecyclePolicy::disabled();
+    let mut req = pooled_create_request("pinned-id-cold-start", None);
+    req.boot_mode = None;
+    req.vcpu = None;
+    req.memory_mib = None;
+    req.wait_until_ready = true;
+    let template_network_policy = NetworkPolicyV1::deny_all();
+    let requested_template = TemplateReference::latest(TemplateName::parse("seed").unwrap());
+    let create_owner = SandboxCreateOwner::local(&actor);
+    let mut input = pooled_create_input(
+        &db.pool,
+        &req,
+        &requested_template,
+        &auto_lifecycle,
+        &template_network_policy,
+        &create_owner,
+    );
+    input.template_release_id = release_id;
+    input.boot_mode = CreateBootMode::Fallthrough;
+    input.sandbox_id_pinned = true;
+    assert_ne!(input.planned_sandbox_id, slot_sandbox_id);
+
+    insert_node(&db.pool, node_id).await?;
+    sqlx::query(sql!(
+        "INSERT INTO kubernetes_pool_configs (
+             id, template_release_id, vcpu, memory_mib, target_ready_slots,
+             refill_per_tick, max_warming_slots, namespace, enabled
+         )
+         VALUES ($1, $2, 4, 2048, 3, 1, 1, 'space', true)"
+    ))
+    .bind(pool_config_id)
+    .bind(release_id)
+    .execute(&db.pool)
+    .await?;
+
+    let substrate = RetryingPoolSubstrate::new(
+        db.pool.clone(),
+        pool_config_id,
+        release_id,
+        vec![pooled_claim_with_pod(
+            slot_sandbox_id,
+            node_id,
+            "space-sbx-pooled-g1",
+        )],
+        vec![true],
+    );
+
+    let response = SandboxController::try_create_from_pool_with_substrate(
+        &substrate,
+        input,
+        Arc::new(AtomicU64::new(0)),
+    )
+    .await?;
+
+    assert!(
+        response.response.is_none(),
+        "a pinned sandbox ID must cold-create, not adopt a slot with another ID"
+    );
+    assert_eq!(
+        substrate.claim_calls(),
+        0,
+        "a pinned sandbox ID must not touch the warm pool"
     );
 
     Ok(())

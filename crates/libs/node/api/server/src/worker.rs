@@ -476,6 +476,9 @@ macro_rules! fwd_sbx_read {
     };
 }
 
+// Forward in the caller's task: a caller that disconnects then drops the
+// sandbox-manager call, which is how an abandoned process start is cancelled.
+// Spawning the forward into an owned task would break that chain.
 macro_rules! fwd_sbx_stream {
     ($service:expr, $method:literal, $rpc:ident, $req:expr) => {
         $service

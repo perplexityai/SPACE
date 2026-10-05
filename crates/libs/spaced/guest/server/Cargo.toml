@@ -48,7 +48,7 @@ globset = { workspace = true }
 hyper-util = { workspace = true, features = ["tokio"] }
 nix = { workspace = true, features = ["signal", "process", "user", "net", "fs", "term", "time"] }
 libc = { workspace = true }
-rustix = { workspace = true, features = ["process", "termios"] }
+rustix = { workspace = true, features = ["fs", "process", "pty", "termios"] }
 notify = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "time", "io-util", "net", "fs", "process", "sync"] }
 tokio-stream = { workspace = true, features = ["net"] }

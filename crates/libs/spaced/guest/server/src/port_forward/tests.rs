@@ -537,11 +537,75 @@ async fn forwarder_recovers_when_upstream_appears_after_bind() {
 /// is the only path `LoopbackBridgeStatus::Direct` takes.
 #[tokio::test]
 async fn real_bind_conflict_surfaces_addr_in_use() {
-    let port = pick_free_port();
-    let addr: SocketAddr = (Ipv4Addr::LOCALHOST, port).into();
-    let _hold = TcpListener::bind(addr).await.unwrap();
+    // Hold the port from the moment it is chosen. Picking a free port and
+    // binding it again leaves a window in which a concurrent test can be
+    // handed the same port, or a child forked by one still holds the picking
+    // socket.
+    let _hold = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let addr = _hold.local_addr().unwrap();
 
     let cancel = CancellationToken::new();
     let outcome = port_forwarder::bind_with_retry(system_listener_factory(), addr, &cancel).await;
     assert!(matches!(outcome, BindOutcome::AddrInUse));
+}
+
+/// Listener factory that binds for real and keeps a duplicate of each
+/// listener's descriptor, as a child forked while the listener was open
+/// holds a copy of it until it execs.
+#[cfg(target_os = "linux")]
+fn inheriting_listener_factory(
+    inherited: Arc<std::sync::Mutex<Vec<std::os::fd::OwnedFd>>>,
+) -> ListenerFactory {
+    Arc::new(move |addr| {
+        let inherited = inherited.clone();
+        Box::pin(async move {
+            let listener = TcpListener::bind(addr).await?;
+            let copy = std::os::fd::AsFd::as_fd(&listener).try_clone_to_owned()?;
+            inherited.lock().unwrap().push(copy);
+            Ok(listener)
+        })
+    })
+}
+
+/// A child forked by a concurrent process spawn keeps the released listener
+/// open until it execs. A reopen while it still holds that copy must forward
+/// again, not report `Direct` for a port nothing else owns. Linux only: BSD
+/// kernels keep a shut-down listening socket bound.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn reopen_succeeds_while_a_child_still_holds_the_released_listener() {
+    let inherited = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (manager, shutdown) = test_manager(inheriting_listener_factory(inherited.clone()));
+    let port = pick_free_port();
+
+    let (status, detail) = manager.open(port, Some(MAX_OPEN_WAIT)).await;
+    assert_eq!(
+        status,
+        LoopbackBridgeStatus::LoopbackForwarded,
+        "{detail:?}"
+    );
+    manager.close(port).await;
+
+    // The "child" still holds its copy of the released listener.
+    assert_eq!(inherited.lock().unwrap().len(), 1);
+    let (status, detail) = manager.open(port, Some(MAX_OPEN_WAIT)).await;
+    assert_eq!(
+        status,
+        LoopbackBridgeStatus::LoopbackForwarded,
+        "reopen reported the inherited copy as a foreign listener: {detail:?}"
+    );
+    inherited.lock().unwrap().clear();
+    shutdown.cancel();
+}
+
+/// Releasing a port shuts down only the manager's own listener: a port that
+/// another process listens on is still reported `Direct`.
+#[tokio::test]
+async fn a_foreign_listener_is_still_reported_direct() {
+    let (manager, shutdown) = test_manager(system_listener_factory());
+    let holder = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let port = holder.local_addr().unwrap().port();
+    let (status, _) = manager.open(port, Some(MAX_OPEN_WAIT)).await;
+    assert_eq!(status, LoopbackBridgeStatus::Direct);
+    shutdown.cancel();
 }

@@ -232,12 +232,7 @@ impl NodeManagerService {
             service.check_execution(&sandbox_id, fence.as_ref(), false)?;
             let api_socket = format!("{JAIL_DIR}/firecracker/{sandbox_id}/root/firecracker.sock");
             let client = crate::fc_api::FcApiClient::new(api_socket);
-            if paused {
-                client.pause().await
-            } else {
-                client.resume().await
-            }
-            .map_err(|error| Status::internal(format!("set VM pause state: {error}")))
+            set_firecracker_paused(&client, paused, VM_PAUSE_STATE_TIMEOUT).await
         })
         .await
     }
@@ -608,7 +603,7 @@ impl NodeManagerService {
                 format!("/{ENC_SNAPSHOT_JAIL_SUBDIR}/{ENC_SNAPSHOT_MEMORY_NAME}");
             self.finish_load_snapshot(
                 &lease,
-                &req.sandbox_id,
+                req,
                 &jail_root,
                 &api_socket,
                 &fc_snapshot_path,
@@ -657,7 +652,7 @@ impl NodeManagerService {
 
         self.finish_load_snapshot(
             &lease,
-            &req.sandbox_id,
+            req,
             &jail_root,
             &api_socket,
             &fc_snapshot_path,
@@ -669,16 +664,25 @@ impl NodeManagerService {
 
     /// Shared tail of the load-snapshot paths (plaintext source_dir and BYOK
     /// encrypted volume): wait for the FC API socket, load the snapshot with the
-    /// given memory file, then fix v.sock permissions.
+    /// given memory file, apply the sandbox's rootfs rate limit, then fix
+    /// v.sock permissions.
     async fn finish_load_snapshot(
         &self,
         lease: &SlotInfo,
-        sandbox_id: &str,
+        request: &LoadSnapshotRequest,
         jail_root: &str,
         api_socket: &str,
         fc_snapshot_path: &str,
         fc_mem_file_path: &str,
     ) -> Result<(), Status> {
+        let sandbox_id = request.sandbox_id.as_str();
+        // Validate before the load, which cannot be undone short of killing
+        // the VM.
+        let rootfs_limiter = request
+            .rootfs_rate_limit
+            .as_ref()
+            .map(drive_rate_limiter)
+            .transpose()?;
         // Wait for the API socket to appear (FC needs time to create it after launch)
         let api_socket_wait_started = Instant::now();
         loop {
@@ -704,6 +708,19 @@ impl NodeManagerService {
             .load_snapshot(fc_snapshot_path, fc_mem_file_path)
             .await
             .map_err(|e| Status::internal(format!("load snapshot failed: {e}")))?;
+        // The loaded drive limiter is the one of the VM the snapshot was taken
+        // from. Replace it with the sandbox's own while the VM is still
+        // paused; a sandbox must not run under another VM's limits.
+        if let Some(limiter) = &rootfs_limiter
+            && let Err(error) = client.update_drive_rate_limiter("rootfs", limiter).await
+        {
+            let status = Status::internal(format!(
+                "apply rootfs rate limit after snapshot load failed: {error}"
+            ));
+            self.rollback_loaded_snapshot(sandbox_id, "rootfs rate limit", &status)
+                .await;
+            return Err(status);
+        }
         self.adopt_validated_lease(sandbox_id, lease)?;
 
         // Fix v.sock permissions so sbx-manager can connect for health checks.
@@ -711,23 +728,13 @@ impl NodeManagerService {
         let vsock_path = format!("{jail_root}/v.sock");
         if std::path::Path::new(&vsock_path).exists() {
             if let Err(status) = chgrp_path(&vsock_path, gids::SPACE_SBXMGR) {
-                self.rollback_loaded_snapshot_after_permission_failure(
-                    sandbox_id,
-                    &vsock_path,
-                    "chgrp",
-                    &status,
-                )
-                .await;
+                self.rollback_loaded_snapshot(sandbox_id, "vsock chgrp", &status)
+                    .await;
                 return Err(status);
             }
             if let Err(status) = chmod_path(&vsock_path, 0o770) {
-                self.rollback_loaded_snapshot_after_permission_failure(
-                    sandbox_id,
-                    &vsock_path,
-                    "chmod",
-                    &status,
-                )
-                .await;
+                self.rollback_loaded_snapshot(sandbox_id, "vsock chmod", &status)
+                    .await;
                 return Err(status);
             }
         }
@@ -735,11 +742,12 @@ impl NodeManagerService {
         Ok(())
     }
 
-    async fn rollback_loaded_snapshot_after_permission_failure(
+    /// Kill the VM a snapshot was loaded into when a later step of the load
+    /// fails, so a retried load starts from a fresh VM.
+    async fn rollback_loaded_snapshot(
         &self,
         sandbox_id: &str,
-        vsock_path: &str,
-        command: &'static str,
+        failed_step: &'static str,
         status: &Status,
     ) {
         let stored_pid = match self.pool.get(sandbox_id) {
@@ -755,10 +763,9 @@ impl NodeManagerService {
         let Some(fc_pid) = fc_pid else {
             tracing::error!(
                 sandbox_id,
-                vsock_path,
-                command,
+                failed_step,
                 error = %status,
-                "unable to roll back loaded snapshot after vsock permission failure because firecracker pid was not found"
+                "unable to roll back loaded snapshot because firecracker pid was not found"
             );
             return;
         };
@@ -766,10 +773,9 @@ impl NodeManagerService {
         tracing::warn!(
             sandbox_id,
             pid = fc_pid,
-            vsock_path,
-            command,
+            failed_step,
             error = %status,
-            "rolling back loaded snapshot after vsock permission failure"
+            "rolling back loaded snapshot after a failed load step"
         );
         kill_launched_process_after_pid_persist_failure(self, sandbox_id, fc_pid).await;
     }
@@ -1182,6 +1188,54 @@ fn validate_cache_artifact_path(local_path: &str) -> Result<(), Status> {
         ));
     }
     Ok(())
+}
+
+fn drive_rate_limiter(
+    limit: &pplx_space_node_mgr_client::proto::DriveRateLimit,
+) -> Result<pplx_space_common_core::types::RateLimiter, Status> {
+    let bucket = |bucket: Option<&pplx_space_node_mgr_client::proto::TokenBucket>, name: &str| {
+        bucket
+            .map(|bucket| pplx_space_common_core::types::TokenBucket {
+                size: bucket.size,
+                refill_time_ms: bucket.refill_time_ms,
+            })
+            .ok_or_else(|| {
+                Status::invalid_argument(format!("rootfs_rate_limit.{name} is required"))
+            })
+    };
+    Ok(pplx_space_common_core::types::RateLimiter {
+        bandwidth: bucket(limit.bandwidth.as_ref(), "bandwidth")?,
+        operations: bucket(limit.operations.as_ref(), "operations")?,
+    })
+}
+
+/// How long a Firecracker pause or resume may take. Both normally finish in
+/// milliseconds; a VMM that does not answer must not keep the sandbox's VM
+/// gate, which termination also takes, held indefinitely.
+const VM_PAUSE_STATE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Pause or resume the VM behind `client`, failing once `timeout` passes.
+pub(super) async fn set_firecracker_paused(
+    client: &crate::fc_api::FcApiClient,
+    paused: bool,
+    timeout: std::time::Duration,
+) -> Result<(), Status> {
+    let change = async {
+        if paused {
+            client.pause().await
+        } else {
+            client.resume().await
+        }
+    };
+    match tokio::time::timeout(timeout, change).await {
+        Ok(changed) => {
+            changed.map_err(|error| Status::internal(format!("set VM pause state: {error}")))
+        }
+        Err(_) => Err(Status::deadline_exceeded(format!(
+            "Firecracker did not {} the VM within {timeout:?}",
+            if paused { "pause" } else { "resume" }
+        ))),
+    }
 }
 
 #[cfg(test)]

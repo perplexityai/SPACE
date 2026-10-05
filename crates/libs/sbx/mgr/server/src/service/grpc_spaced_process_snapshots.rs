@@ -138,9 +138,18 @@ impl SandboxManagerService {
             }
         };
         let options = start_process_options(operation)?;
-        let stream = match async { client.start_process_stream_with_options(options).await }.await {
-            Ok(stream) => stream,
-            Err(error) => {
+        let start = client.start_process_stream_with_options(options);
+        use super::restart_admission::GuestStartOutcome;
+        let stream = match super::restart_admission::abandon_start_if_caller_cancelled(start).await
+        {
+            GuestStartOutcome::Opened(stream) => stream,
+            // A caller that left is not a guest start failure.
+            GuestStartOutcome::CallerGone => {
+                return Err(Status::cancelled(
+                    "process start caller disconnected before the guest opened the process stream",
+                ));
+            }
+            GuestStartOutcome::Failed(error) => {
                 emit_sandbox_event(
                     &req.sandbox_id,
                     SandboxEventType::GuestProcessStartFailed,

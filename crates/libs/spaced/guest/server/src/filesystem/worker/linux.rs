@@ -117,6 +117,8 @@ pub(crate) struct WorkerClient {
     activity: Arc<()>,
     stop_token: CancellationToken,
     supervisor: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    /// The worker process, for duplicating descriptors it opened as its user.
+    pidfd: Option<Arc<std::os::fd::OwnedFd>>,
 }
 
 struct ResidentWorker {
@@ -150,7 +152,7 @@ enum WorkerEntry {
 }
 
 enum ClientAcquisition {
-    Ready(WorkerClient),
+    Ready(Box<WorkerClient>),
     Waiting(watch::Receiver<Option<Result<WorkerClient, Status>>>),
     Start {
         startup_id: uuid::Uuid,
@@ -228,7 +230,7 @@ impl WorkerPool {
             let acquisition = match workers.get_mut(&user) {
                 Some(WorkerEntry::Resident(worker)) => {
                     worker.last_access = Instant::now();
-                    ClientAcquisition::Ready(worker.client.clone())
+                    ClientAcquisition::Ready(Box::new(worker.client.clone()))
                 }
                 Some(WorkerEntry::Starting(worker)) => {
                     ClientAcquisition::Waiting(worker.result.clone())
@@ -278,7 +280,7 @@ impl WorkerPool {
         match acquisition {
             ClientAcquisition::Ready(worker) => {
                 Self::stop_workers(workers_to_stop);
-                Ok(worker)
+                Ok(*worker)
             }
             ClientAcquisition::Waiting(result) => {
                 Self::stop_workers(workers_to_stop);
@@ -360,6 +362,27 @@ impl WorkerPool {
         enabled
     }
 
+    /// [`Self::insert_test_client`] for a worker whose descriptors live in
+    /// this process, so the router can duplicate them as it does a spawned
+    /// worker's.
+    #[cfg(test)]
+    pub(crate) async fn insert_test_client_in_this_process(
+        &self,
+        user: GuestUserName,
+        channel: Channel,
+    ) -> Result<(), Status> {
+        self.insert_test_client(user.clone(), channel).await?;
+        let pidfd = rustix::process::pidfd_open(
+            rustix::process::getpid(),
+            rustix::process::PidfdFlags::empty(),
+        )
+        .map_err(|error| Status::internal(format!("pidfd_open: {error}")))?;
+        if let Some(WorkerEntry::Resident(resident)) = self.workers.lock().await.get_mut(&user) {
+            resident.client.pidfd = Some(Arc::new(pidfd));
+        }
+        Ok(())
+    }
+
     #[cfg(test)]
     pub(crate) async fn insert_test_client(
         &self,
@@ -374,6 +397,7 @@ impl WorkerPool {
             ledger_update_slot: Arc::new(tokio::sync::Semaphore::new(1)),
             stop_token: CancellationToken::new(),
             supervisor: Arc::new(Mutex::new(None)),
+            pidfd: None,
         };
         self.workers.lock().await.insert(
             user,
@@ -519,12 +543,29 @@ impl WorkerPool {
             .map_err(worker_io_status)?;
         let router_stream =
             tokio::net::UnixStream::from_std(router_stream).map_err(worker_io_status)?;
-        let child = {
-            let _spawn_guard = crate::GUEST_CHILD_SPAWN_LOCK.lock().await;
-            command.spawn().map_err(worker_io_status)?
-        };
-        drop(command);
+        // The daemon creates its own descriptors CLOEXEC (std and tokio do,
+        // and process starts open PTYs CLOEXEC), so this spawn needs no lock
+        // against concurrent forks. `spawn` blocks until the worker execs, so
+        // it runs off the runtime threads. A caller cancelled meanwhile drops
+        // the spawned child, which `kill_on_drop` terminates.
+        let child = tokio::task::spawn_blocking(move || {
+            let child = command.spawn();
+            // Closes this process's copy of the worker's socket.
+            drop(command);
+            child
+        })
+        .await
+        .map_err(|error| Status::internal(format!("filesystem worker spawn task failed: {error}")))?
+        .map_err(worker_io_status)?;
 
+        // Taken while the child is ours and unreaped, so its pid is its own.
+        let pidfd = child
+            .id()
+            .and_then(|pid| rustix::process::Pid::from_raw(pid as i32))
+            .and_then(|pid| {
+                rustix::process::pidfd_open(pid, rustix::process::PidfdFlags::empty()).ok()
+            })
+            .map(Arc::new);
         let stop_token = self.shutdown.child_token();
         let supervisor = Arc::new(Mutex::new(Some(supervise_worker(
             child,
@@ -590,6 +631,7 @@ impl WorkerPool {
             ledger_update_slot: Arc::new(tokio::sync::Semaphore::new(1)),
             stop_token,
             supervisor,
+            pidfd,
         })
     }
 }
@@ -632,6 +674,23 @@ fn worker_command_from_environment(
 }
 
 impl WorkerClient {
+    /// A copy of `fd`, a descriptor open in this worker, or `None` where the
+    /// worker cannot be reached that way (no pidfd, or the kernel refuses).
+    pub(crate) fn duplicate_descriptor(&self, fd: i32) -> Option<std::os::fd::OwnedFd> {
+        let pidfd = self.pidfd.as_ref()?;
+        match rustix::process::pidfd_getfd(
+            pidfd.as_ref(),
+            fd,
+            rustix::process::PidfdGetfdFlags::empty(),
+        ) {
+            Ok(fd) => Some(fd),
+            Err(error) => {
+                tracing::debug!(%error, worker = %self.instance_id, "cannot duplicate a worker descriptor");
+                None
+            }
+        }
+    }
+
     pub(crate) async fn stop(&self) {
         self.stop_token.cancel();
         let mut supervisor = self.supervisor.lock().await;

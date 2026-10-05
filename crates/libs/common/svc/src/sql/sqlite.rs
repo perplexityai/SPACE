@@ -1,24 +1,19 @@
 use super::migration_checksums::AcceptedChecksums;
 use pplx_space_common_core::sql;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::error::Error as StdError;
 use std::fmt::Display;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use rusqlite::trace::{TraceEvent, TraceEventCodes};
-use rusqlite::{Connection, Transaction, params};
+use rusqlite::{Connection, params};
 use sqlx::migrate::{Migration, Migrator};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{SqliteConnection, SqlitePool};
 use tracing::Instrument as _;
 
 mod cutover;
-
-use pplx_space_sqlite_migrations::{
-    ensure_common_jobs_lease_index, ensure_common_jobs_priority_index, job_column_exists,
-    job_lease_column_count,
-};
 
 pub type SqliteResult<T> = Result<T, SqliteError>;
 
@@ -83,24 +78,11 @@ impl<T> SqliteContext<T> for Option<T> {
     }
 }
 
-macro_rules! impl_sqlite_error_from {
-    ($($error:ty),+ $(,)?) => {
-        $(
-            impl From<$error> for SqliteError {
-                fn from(source: $error) -> Self {
-                    Self::context("SQLite operation failed", source)
-                }
-            }
-        )+
-    };
+impl From<pplx_space_sqlite_migrations::MigrationCompatibilityError> for SqliteError {
+    fn from(source: pplx_space_sqlite_migrations::MigrationCompatibilityError) -> Self {
+        Self::context("SQLite operation failed", source)
+    }
 }
-
-impl_sqlite_error_from!(
-    pplx_space_sqlite_migrations::MigrationCompatibilityError,
-    pplx_space_sqlite_migrations::InspectJobColumnsError,
-    pplx_space_sqlite_migrations::EnsureCommonJobsLeaseIndexError,
-    pplx_space_sqlite_migrations::EnsureCommonJobsPriorityIndexError,
-);
 
 #[derive(Debug, Clone)]
 pub struct RusqliteOpenOptions {
@@ -141,18 +123,6 @@ impl Default for RusqliteOpenOptions {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MigrationFailurePolicy {
-    /// Return the migration error and leave the database files untouched.
-    Fail,
-    /// Recreate the database after a failed migration.
-    ///
-    /// This is only for node-local SQLite stores whose state is rebuildable
-    /// from local inventory and/or the cluster Postgres SSOT. Do not use it
-    /// for authoritative live state.
-    Recreate,
-}
-
 /// Embedded migration sets for a service-owned SQLite store and any shared
 /// common schema it consumes.
 #[derive(Clone, Copy)]
@@ -162,40 +132,18 @@ pub struct EmbeddedMigrators {
 }
 
 pub type MigrationCompatibilityHook =
-    fn(
-        &Connection,
-        &Migrator,
-    ) -> Result<(), pplx_space_sqlite_migrations::MigrationCompatibilityError>;
+    fn(&Connection) -> Result<(), pplx_space_sqlite_migrations::MigrationCompatibilityError>;
 
-/// Apply a service's embedded migrations and then converge its shared schema.
+/// Apply shared schema and service migrations after validating both histories.
 ///
-/// This is the in-process counterpart of `space-db-migrator ... up`, intended
-/// for daemons that must acquire an ownership mutex before touching SQLite.
+/// Daemons call this after acquiring their database ownership mutex.
 pub async fn migrate_embedded(
     db_name: &str,
     db_path: &Path,
     migrators: EmbeddedMigrators,
-    baseline_version: Option<i64>,
-    failure_policy: MigrationFailurePolicy,
     compatibility_hook: Option<MigrationCompatibilityHook>,
 ) -> SqliteResult<()> {
-    let public_service = super::baselines::is_public(migrators.service);
-    if !public_service && migrators.common.is_some_and(super::baselines::is_public) {
-        return Err(SqliteError::message(format!(
-            "{db_name} requires its service baseline before the shared jobs baseline; see db/SQLITE_BASELINE.md"
-        )));
-    }
     cutover::prepare(db_name, db_path, migrators.service, migrators.common).await?;
-    let baseline_version = if public_service {
-        migrators
-            .service
-            .iter()
-            .filter(|migration| migration.migration_type.is_up_migration())
-            .map(|migration| migration.version)
-            .min()
-    } else {
-        baseline_version
-    };
     let checksums = AcceptedChecksums::embedded().context("invalid migration checksum manifest")?;
     checksums
         .validate(db_name, migrators.service)
@@ -205,92 +153,14 @@ pub async fn migrate_embedded(
             .validate("common", common)
             .context("unlisted common migration checksum")?;
     }
-    match migrate_embedded_once(
-        db_name,
-        db_path,
-        migrators,
-        baseline_version,
-        compatibility_hook,
-    )
-    .await
-    {
-        Ok(()) => Ok(()),
-        Err(first_error) if failure_policy == MigrationFailurePolicy::Fail || public_service => {
-            Err(first_error)
-        }
-        Err(first_error) => {
-            tracing::warn!(
-                db_name,
-                db_path = %db_path.display(),
-                error = %first_error,
-                "embedded SQLite migration failed; recreating local database"
-            );
-            pplx_space_metrics::db::sqlite::recreate(db_name);
-            remove_database_files(db_path).with_context(|| {
-                format!("failed to remove SQLite database {}", db_path.display())
-            })?;
-            migrate_embedded_once(
-                db_name,
-                db_path,
-                migrators,
-                baseline_version,
-                compatibility_hook,
-            )
-            .await
-            .with_context(|| {
-                format!(
-                    "failed to recreate SQLite database {} after embedded migration failure: {first_error}",
-                    db_path.display()
-                )
-            })
-        }
+    if let Some(parent) = db_path.parent() {
+        std::fs::create_dir_all(parent).context("failed to create SQLite directory")?;
     }
-}
-
-async fn migrate_embedded_once(
-    db_name: &str,
-    db_path: &Path,
-    migrators: EmbeddedMigrators,
-    baseline_version: Option<i64>,
-    compatibility_hook: Option<MigrationCompatibilityHook>,
-) -> SqliteResult<()> {
-    let public_baseline =
-        baseline_version.is_some_and(|v| v >= super::baselines::PUBLIC_SQLITE_BASELINE);
-    if public_baseline {
-        if let Some(parent) = db_path.parent() {
-            std::fs::create_dir_all(parent).context("failed to create SQLite directory")?;
-        }
+    {
         let mut conn = Connection::open(db_path).context("failed to open SQLite database")?;
-        // Reject both histories before common DDL or legacy compatibility hooks.
         prepare_public_common_schema(db_name, &mut conn, migrators, compatibility_hook)?;
     }
-    if let Some(compatibility_hook) = compatibility_hook.filter(|_| !public_baseline) {
-        if let Some(parent) = db_path.parent() {
-            std::fs::create_dir_all(parent).with_context(|| {
-                format!("failed to create SQLite directory {}", parent.display())
-            })?;
-        }
-        let conn = Connection::open(db_path)
-            .with_context(|| format!("failed to open SQLite at {}", db_path.display()))?;
-        compatibility_hook(&conn, migrators.service)?;
-    }
-
-    migrate(
-        db_name,
-        db_path,
-        migrators.service,
-        baseline_version,
-        MigrationFailurePolicy::Fail,
-    )
-    .await?;
-
-    if let Some(common_migrator) = migrators.common.filter(|_| !public_baseline) {
-        let mut conn = Connection::open(db_path)
-            .with_context(|| format!("failed to open SQLite at {}", db_path.display()))?;
-        migrate_common_schema_up(&mut conn, common_migrator)?;
-    }
-
-    Ok(())
+    migrate(db_name, db_path, migrators.service).await
 }
 
 fn validate_public_history(
@@ -342,7 +212,7 @@ fn validate_public_history(
             })
         {
             return Err(SqliteError::message(format!(
-                "{table} has failed, modified, or unbundled migration {version}; see db/SQLITE_BASELINE.md"
+                "{table} has failed, modified, or unbundled migration {version}; see db/README.md"
             )));
         }
         applied = true;
@@ -382,7 +252,7 @@ fn prepare_public_common_schema(
         }
     }
     if let Some(hook) = compatibility_hook {
-        hook(conn, migrators.service)?;
+        hook(conn)?;
     }
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS _sqlx_migrations (
@@ -413,74 +283,19 @@ fn public_application_schema(conn: &Connection) -> SqliteResult<Vec<(String, Str
     .context("failed to read untracked SQLite schema")
 }
 
-pub async fn migrate(
-    db_name: &str,
-    db_path: &Path,
-    migrator: &Migrator,
-    baseline_version: Option<i64>,
-    failure_policy: MigrationFailurePolicy,
-) -> SqliteResult<()> {
+pub async fn migrate(db_name: &str, db_path: &Path, migrator: &Migrator) -> SqliteResult<()> {
     cutover::prepare(db_name, db_path, migrator, None).await?;
-    let baseline_version = if super::baselines::is_public(migrator) {
-        migrator
-            .iter()
-            .filter(|migration| migration.migration_type.is_up_migration())
-            .map(|migration| migration.version)
-            .min()
-    } else {
-        baseline_version
-    };
     AcceptedChecksums::embedded()
         .and_then(|checksums| checksums.validate(db_name, migrator))
         .context("invalid migration checksum manifest or unlisted source")?;
-    match migrate_once(db_name, db_path, migrator, baseline_version).await {
-        Ok(()) => Ok(()),
-        Err(first_error)
-            if failure_policy == MigrationFailurePolicy::Fail
-                || baseline_version
-                    .is_some_and(|v| v >= super::baselines::PUBLIC_SQLITE_BASELINE) =>
-        {
-            Err(first_error).with_context(|| {
-                format!(
-                    "failed to migrate {db_name} SQLite at {}",
-                    db_path.display()
-                )
-            })
-        }
-        Err(first_error) => {
-            tracing::warn!(
-                db_name,
-                db_path = %db_path.display(),
-                error = %first_error,
-                "SQLite migration failed; recreating local database"
-            );
-            pplx_space_metrics::db::sqlite::recreate(db_name);
-            remove_database_files(db_path).with_context(|| {
-                format!("failed to remove SQLite database {}", db_path.display())
-            })?;
-            migrate_once(db_name, db_path, migrator, baseline_version)
-                .await
-                .with_context(|| {
-                    format!(
-                        "failed to recreate SQLite database {} after migration failure: {first_error}",
-                        db_path.display()
-                    )
-                })
-        }
-    }
-}
-
-const COMMON_JOBS_LEASES_VERSION: i64 = 2;
-const COMMON_JOBS_PRIORITY_VERSION: i64 = 4;
-const COMMON_JOBS_CANCELLATION_VERSION: i64 = 6;
-fn jobs_table_exists(conn: &Connection) -> SqliteResult<bool> {
-    conn.query_row(
-        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'jobs'",
-        [],
-        |row| row.get::<_, i64>(0),
-    )
-    .map(|count| count > 0)
-    .context("failed to inspect jobs table")
+    migrate_once(db_name, db_path, migrator)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to migrate {db_name} SQLite at {}; see db/README.md",
+                db_path.display()
+            )
+        })
 }
 
 pub fn migrate_common_schema_up(
@@ -514,11 +329,6 @@ fn migrate_common_schema_with_checksums(
                     migration.version
                 )));
             }
-            continue;
-        }
-
-        if should_stamp_common_schema_migration(conn, migration)? {
-            stamp_common_schema_migration(conn, migration)?;
             continue;
         }
 
@@ -587,22 +397,6 @@ pub fn rollback_common_schema_migration(
             format!("common schema migration {current_version} has no bundled down migration")
         })?;
 
-    if common_schema_migration_was_stamped(conn, current_version)? {
-        conn.execute(
-            "DELETE FROM _space_common_schema_migrations WHERE version = ?1",
-            params![current_version],
-        )
-        .with_context(|| {
-            format!("failed to delete common schema migration {current_version} history")
-        })?;
-        return Ok(());
-    }
-
-    let jobs_schema_objects = if current_version == COMMON_JOBS_CANCELLATION_VERSION {
-        jobs_schema_objects(conn)?
-    } else {
-        Vec::new()
-    };
     let tx = conn
         .transaction()
         .with_context(|| format!("failed to begin common schema rollback {current_version}"))?;
@@ -610,7 +404,6 @@ pub fn rollback_common_schema_migration(
         .with_context(|| {
             format!("failed to roll back common schema migration {current_version}")
         })?;
-    restore_missing_jobs_schema_objects(&tx, &jobs_schema_objects)?;
     tx.execute(
         "DELETE FROM _space_common_schema_migrations WHERE version = ?1",
         params![current_version],
@@ -623,28 +416,12 @@ pub fn rollback_common_schema_migration(
     Ok(())
 }
 
-fn common_schema_migration_was_stamped(conn: &Connection, version: i64) -> SqliteResult<bool> {
-    conn.query_row(
-        "SELECT execution_time = -1 FROM _space_common_schema_migrations WHERE version = ?1",
-        params![version],
-        |row| row.get::<_, bool>(0),
-    )
-    .with_context(|| format!("failed to inspect common schema migration {version} history"))
-}
-
 fn validate_common_schema_history(
     applied: &HashMap<i64, Vec<u8>>,
     common_migrator: &Migrator,
 ) -> SqliteResult<()> {
     let bundled = migrations_by_version(common_migrator);
-    let max_bundled = bundled.keys().copied().max().unwrap_or_default();
-    let public = bundled
-        .keys()
-        .any(|v| *v >= super::baselines::PUBLIC_SQLITE_BASELINE);
-    for version in applied
-        .keys()
-        .filter(|version| public || **version <= max_bundled)
-    {
+    for version in applied.keys() {
         if !bundled.contains_key(version) {
             return Err(SqliteError::message(format!(
                 "common schema has applied migration {version}, but it is not bundled"
@@ -654,51 +431,7 @@ fn validate_common_schema_history(
     Ok(())
 }
 
-fn should_stamp_common_schema_migration(
-    conn: &Connection,
-    migration: &Migration,
-) -> SqliteResult<bool> {
-    if migration.version == 1 {
-        return jobs_table_exists(conn);
-    }
-
-    if migration.version == COMMON_JOBS_PRIORITY_VERSION {
-        return should_stamp_common_jobs_priority_migration(conn);
-    }
-
-    if migration.version != COMMON_JOBS_LEASES_VERSION {
-        return Ok(false);
-    }
-
-    let lease_column_count = job_lease_column_count(conn)?;
-    if lease_column_count == 0 {
-        return Ok(false);
-    }
-    if lease_column_count != 3 {
-        return Err(SqliteError::message(format!(
-            "jobs table has a partial lease-column upgrade ({lease_column_count}/3 columns); repair it before applying common schema migrations"
-        )));
-    }
-
-    ensure_common_jobs_lease_index(conn)?;
-    Ok(true)
-}
-
-fn should_stamp_common_jobs_priority_migration(conn: &Connection) -> SqliteResult<bool> {
-    if !job_column_exists(conn, "priority")? {
-        return Ok(false);
-    }
-
-    ensure_common_jobs_priority_index(conn)?;
-    Ok(true)
-}
-
 fn apply_common_schema_migration(conn: &mut Connection, migration: &Migration) -> SqliteResult<()> {
-    let jobs_schema_objects = if migration.version == COMMON_JOBS_CANCELLATION_VERSION {
-        jobs_schema_objects(conn)?
-    } else {
-        Vec::new()
-    };
     let start = std::time::Instant::now();
     let tx = conn.transaction().with_context(|| {
         format!(
@@ -706,16 +439,12 @@ fn apply_common_schema_migration(conn: &mut Connection, migration: &Migration) -
             migration.version
         )
     })?;
-    if migration.version == COMMON_JOBS_CANCELLATION_VERSION {
-        ensure_jobs_traceparent_column(&tx)?;
-    }
     tx.execute_batch(migration.sql.as_ref()).with_context(|| {
         format!(
             "failed to apply common schema migration {}",
             migration.version
         )
     })?;
-    restore_missing_jobs_schema_objects(&tx, &jobs_schema_objects)?;
     let execution_time = i64::try_from(start.elapsed().as_nanos()).unwrap_or(i64::MAX);
     insert_common_schema_migration_row(&tx, migration, execution_time)?;
     tx.commit().with_context(|| {
@@ -724,64 +453,6 @@ fn apply_common_schema_migration(conn: &mut Connection, migration: &Migration) -
             migration.version
         )
     })
-}
-
-fn ensure_jobs_traceparent_column(tx: &Transaction<'_>) -> SqliteResult<()> {
-    let exists = tx
-        .query_row(
-            "SELECT COUNT(*) FROM pragma_table_info('jobs') WHERE name = 'traceparent'",
-            [],
-            |row| row.get::<_, i64>(0),
-        )
-        .context("failed to inspect jobs traceparent column")?
-        > 0;
-    if !exists {
-        tx.execute_batch("ALTER TABLE jobs ADD COLUMN traceparent TEXT;")
-            .context("failed to add jobs traceparent column")?;
-    }
-    Ok(())
-}
-
-fn jobs_schema_objects(conn: &Connection) -> SqliteResult<Vec<(String, String)>> {
-    let mut statement = conn
-        .prepare(
-            "SELECT name, sql
-             FROM sqlite_schema
-             WHERE tbl_name = 'jobs'
-               AND type IN ('index', 'trigger')
-               AND sql IS NOT NULL
-             ORDER BY type, name",
-        )
-        .context("failed to inspect jobs schema objects")?;
-    let rows = statement
-        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
-        .context("failed to query jobs schema objects")?;
-    rows.collect::<rusqlite::Result<Vec<_>>>()
-        .context("failed to read jobs schema objects")
-}
-
-fn restore_missing_jobs_schema_objects(
-    conn: &Connection,
-    objects: &[(String, String)],
-) -> SqliteResult<()> {
-    for (name, sql) in objects {
-        let exists = conn
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name = ?1)",
-                [name],
-                |row| row.get::<_, bool>(0),
-            )
-            .with_context(|| format!("failed to inspect jobs schema object {name}"))?;
-        if !exists {
-            conn.execute_batch(sql)
-                .with_context(|| format!("failed to restore jobs schema object {name}"))?;
-        }
-    }
-    Ok(())
-}
-
-fn stamp_common_schema_migration(conn: &Connection, migration: &Migration) -> SqliteResult<()> {
-    insert_common_schema_migration_row(conn, migration, -1)
 }
 
 fn insert_common_schema_migration_row(
@@ -866,12 +537,7 @@ pub fn restrict_database_permissions(db_path: &Path) -> SqliteResult<()> {
     Ok(())
 }
 
-async fn migrate_once(
-    db_name: &str,
-    db_path: &Path,
-    migrator: &Migrator,
-    baseline_version: Option<i64>,
-) -> SqliteResult<()> {
+async fn migrate_once(db_name: &str, db_path: &Path, migrator: &Migrator) -> SqliteResult<()> {
     let span = tracing::info_span!(
         "sqlite.migrate",
         db.system = "sqlite",
@@ -900,18 +566,22 @@ async fn migrate_once(
             })?;
 
         let result = async {
-            prepare_baseline(db_name, &pool, migrator, baseline_version).await?;
-            let mut rollback_compatible_migrator = rollback_compatible_migrator(migrator);
-            if baseline_version.is_some_and(|v| v >= super::baselines::PUBLIC_SQLITE_BASELINE) {
-                rollback_compatible_migrator.ignore_missing = false;
-            }
+            ensure_tracked_schema(db_name, &pool).await?;
+            let migrator = Migrator {
+                migrations: migrator.migrations.clone(),
+                ignore_missing: false,
+                locking: migrator.locking,
+                no_tx: migrator.no_tx,
+                table_name: migrator.table_name.clone(),
+                create_schemas: migrator.create_schemas.clone(),
+            };
             let mut conn = pool
                 .acquire()
                 .await
                 .context("failed to acquire SQLite migration connection")?;
             AcceptedChecksums::embedded()
                 .context("invalid migration checksum manifest")?
-                .run(db_name, &rollback_compatible_migrator, &mut *conn)
+                .run(db_name, &migrator, &mut *conn)
                 .await
                 .with_context(|| format!("failed to apply {db_name} SQLite migrations"))?;
             Ok(())
@@ -926,17 +596,6 @@ async fn migrate_once(
     }
     .instrument(span)
     .await
-}
-
-fn rollback_compatible_migrator(migrator: &Migrator) -> Migrator {
-    Migrator {
-        migrations: migrator.migrations.clone(),
-        ignore_missing: true,
-        locking: migrator.locking,
-        no_tx: migrator.no_tx,
-        table_name: migrator.table_name.clone(),
-        create_schemas: migrator.create_schemas.clone(),
-    }
 }
 
 fn profile_rusqlite_query(sql: &str, elapsed: Duration) {
@@ -989,231 +648,20 @@ fn sqlite_query_summary(sql: &str) -> &'static str {
     }
 }
 
-async fn ensure_sqlx_migrations_table_conn(conn: &mut SqliteConnection) -> SqliteResult<()> {
-    sqlx::query(sql!(
-        r#"
-        CREATE TABLE IF NOT EXISTS _sqlx_migrations (
-            version BIGINT PRIMARY KEY,
-            description TEXT NOT NULL,
-            installed_on TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            success BOOLEAN NOT NULL,
-            checksum BLOB NOT NULL,
-            execution_time BIGINT NOT NULL
-        )
-        "#
-    ))
-    .execute(conn)
-    .await
-    .context("failed to create SQLite _sqlx_migrations table")?;
-    Ok(())
-}
-
-async fn prepare_baseline(
-    db_name: &str,
-    pool: &SqlitePool,
-    migrator: &Migrator,
-    baseline_version: Option<i64>,
-) -> SqliteResult<()> {
+async fn ensure_tracked_schema(db_name: &str, pool: &SqlitePool) -> SqliteResult<()> {
     let mut conn = pool
         .acquire()
         .await
         .context("failed to acquire SQLite connection")?;
-    sqlx::query(sql!("BEGIN IMMEDIATE"))
-        .execute(&mut *conn)
-        .await
-        .with_context(|| format!("failed to begin {db_name} SQLite baseline transaction"))?;
-
-    let result = prepare_baseline_locked(db_name, &mut conn, migrator, baseline_version).await;
-    match result {
-        Ok(()) => {
-            sqlx::query(sql!("COMMIT"))
-                .execute(&mut *conn)
-                .await
-                .with_context(|| {
-                    format!("failed to commit {db_name} SQLite baseline transaction")
-                })?;
-            Ok(())
-        }
-        Err(error) => {
-            let rollback_result = sqlx::query(sql!("ROLLBACK")).execute(&mut *conn).await;
-            if let Err(rollback_error) = rollback_result {
-                tracing::warn!(
-                    db_name,
-                    error = %rollback_error,
-                    "failed to roll back SQLite baseline transaction"
-                );
-            }
-            Err(error)
-        }
-    }
-}
-
-async fn prepare_baseline_locked(
-    db_name: &str,
-    conn: &mut SqliteConnection,
-    migrator: &Migrator,
-    baseline_version: Option<i64>,
-) -> SqliteResult<()> {
-    if baseline_version.is_some_and(|v| v >= super::baselines::PUBLIC_SQLITE_BASELINE) {
-        if !table_exists_conn(&mut *conn, "_sqlx_migrations").await?
-            && application_object_count(&mut *conn).await? > 0
-        {
-            return Err(SqliteError::message(format!(
-                "{db_name} SQLite requires an explicit public-baseline cutover; see db/SQLITE_BASELINE.md"
-            )));
-        }
-        // SQLx validates the complete history, including the baseline checksum.
-        return Ok(());
-    }
-
-    let applied_versions = applied_versions(&mut *conn).await?;
-    if applied_versions.is_empty() {
-        let object_count = application_object_count(&mut *conn).await?;
-        if object_count > 0 {
-            return Err(SqliteError::message(format!(
-                "{db_name} SQLite has application tables but no SQLx migration history; recreating is required"
-            )));
-        }
-        return Ok(());
-    }
-
-    let migrations_by_version = migrations_by_version(migrator);
-    let max_known = migrations_by_version
-        .keys()
-        .copied()
-        .max()
-        .unwrap_or_default();
-    for version in applied_versions.iter().copied().filter(|version| {
-        baseline_version.is_none_or(|baseline_version| *version >= baseline_version)
-            && *version <= max_known
-    }) {
-        if !migrations_by_version.contains_key(&version) {
-            return Err(SqliteError::message(format!(
-                "{db_name} SQLite has applied migration {version}, but it is not bundled"
-            )));
-        }
-    }
-
-    let Some(baseline_version) = baseline_version else {
-        return Ok(());
-    };
-
-    let max_applied = applied_versions.iter().copied().max().unwrap_or_default();
-    if max_applied < baseline_version {
+    if !table_exists_conn(&mut conn, "_sqlx_migrations").await?
+        && application_object_count(&mut conn).await? > 0
+    {
         return Err(SqliteError::message(format!(
-            "{db_name} SQLite is at migration {max_applied}, below supported baseline {baseline_version}"
+            "{db_name} SQLite has untracked application schema; see db/README.md"
         )));
     }
-
-    let baseline = migrations_by_version
-        .get(&baseline_version)
-        .copied()
-        .with_context(|| {
-            format!("{db_name} baseline migration {baseline_version} is not bundled")
-        })?;
-
-    ensure_sqlx_migrations_table_conn(&mut *conn).await?;
-
-    sqlx::query(sql!("DELETE FROM _sqlx_migrations WHERE version < ?1"))
-        .bind(baseline_version)
-        .execute(&mut *conn)
-        .await
-        .with_context(|| {
-            format!("failed to prune {db_name} SQLite migration history below baseline")
-        })?;
-
-    sqlx::query(sql!(
-        r#"
-        INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time)
-        VALUES (?1, ?2, TRUE, ?3, 0)
-        ON CONFLICT(version) DO UPDATE SET
-            description = excluded.description,
-            success = TRUE,
-            checksum = excluded.checksum,
-            execution_time = 0
-        "#
-    ))
-    .bind(baseline.version)
-    .bind(baseline.description.as_ref())
-    .bind(baseline.checksum.as_ref())
-    .execute(&mut *conn)
-    .await
-    .with_context(|| format!("failed to restamp {db_name} SQLite baseline migration"))?;
-
-    for version in applied_versions
-        .iter()
-        .copied()
-        .filter(|version| *version > baseline_version)
-        .filter(|version| *version <= max_known)
-    {
-        let migration = migrations_by_version
-            .get(&version)
-            .copied()
-            .with_context(|| {
-                format!("{db_name} SQLite has applied migration {version}, but it is not bundled")
-            })?;
-        sqlx::query(sql!(
-            r#"
-            INSERT OR IGNORE INTO _sqlx_migrations
-                (version, description, success, checksum, execution_time)
-            VALUES (?1, ?2, TRUE, ?3, 0)
-            "#
-        ))
-        .bind(migration.version)
-        .bind(migration.description.as_ref())
-        .bind(migration.checksum.as_ref())
-        .execute(&mut *conn)
-        .await
-        .with_context(|| {
-            format!("failed to import {db_name} SQLite migration {version} history")
-        })?;
-    }
-
+    // SQLx validates the complete history, including the baseline checksum.
     Ok(())
-}
-
-async fn applied_versions(conn: &mut SqliteConnection) -> SqliteResult<Vec<i64>> {
-    let mut versions = BTreeSet::new();
-
-    if table_exists_conn(&mut *conn, "_sqlx_migrations").await? {
-        let rows: Vec<i64> = sqlx::query_scalar(sql!(
-            "SELECT version FROM _sqlx_migrations WHERE success = TRUE"
-        ))
-        .fetch_all(&mut *conn)
-        .await
-        .context("failed to load SQLite SQLx migration history")?;
-        versions.extend(rows);
-    }
-
-    if table_exists_conn(&mut *conn, "goose_db_version").await? {
-        let rows: Vec<i64> = sqlx::query_scalar(sql!(
-            r#"
-            SELECT g.version_id
-            FROM goose_db_version g
-            JOIN (
-                SELECT version_id, MAX(id) AS id
-                FROM goose_db_version
-                WHERE version_id > 0
-                GROUP BY version_id
-            ) latest ON latest.version_id = g.version_id AND latest.id = g.id
-            WHERE g.is_applied = 1
-            "#
-        ))
-        .fetch_all(&mut *conn)
-        .await
-        .context("failed to load SQLite goose migration history")?;
-        versions.extend(rows);
-    }
-
-    if table_exists_conn(&mut *conn, "schema_migrations").await? {
-        let rows: Vec<i64> = sqlx::query_scalar(sql!("SELECT version FROM schema_migrations"))
-            .fetch_all(&mut *conn)
-            .await
-            .context("failed to load SQLite schema_migrations history")?;
-        versions.extend(rows);
-    }
-
-    Ok(versions.into_iter().collect())
 }
 
 async fn application_object_count(conn: &mut SqliteConnection) -> SqliteResult<i64> {

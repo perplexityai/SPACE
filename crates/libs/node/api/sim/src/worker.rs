@@ -1188,7 +1188,7 @@ impl WorkerApi for SimWorkerApiService {
             for chunk in data.chunks(64 * 1024) {
                 if tx
                     .send(Ok(sbx::SpacedFileChunk {
-                        data: chunk.to_vec(),
+                        data: chunk.to_vec().into(),
                     }))
                     .await
                     .is_err()

@@ -309,6 +309,7 @@ impl SandboxManagerService {
                         completion: cleanup.completion,
                         published_artifact: None,
                         immediate_kill: Self::cleanup_immediate_kill(cleanup.completion),
+                        guest_flush: crate::db::cleanup_jobs::GuestFlush::Unrequested,
                     },
                     admission,
                 )
@@ -350,6 +351,7 @@ impl SandboxManagerService {
                     context: cleanup.context,
                     completion: cleanup.completion,
                     immediate_kill: Self::cleanup_immediate_kill(cleanup.completion),
+                    guest_flush: crate::db::cleanup_jobs::GuestFlush::Unrequested,
                     persist_intent: false,
                     cleanup_id: None,
                 },
@@ -829,6 +831,12 @@ impl SandboxManagerService {
             );
             let (sandbox_id, uuid8) = Self::cleanup_identity(id, runtime_label.as_ref())?;
             let completion = CleanupCompletion::MarkStopped;
+            // Admission decides from the state it supersedes, under its fence.
+            let guest_flush = if immediate_kill {
+                crate::db::cleanup_jobs::GuestFlush::Forbidden
+            } else {
+                crate::db::cleanup_jobs::GuestFlush::BeforeTermination
+            };
             let admission = self
                 .admit_selected_cleanup(
                     sandbox_id,
@@ -856,6 +864,7 @@ impl SandboxManagerService {
                             completion,
                             published_artifact: None,
                             immediate_kill,
+                            guest_flush,
                         },
                         admission,
                     )
@@ -875,6 +884,8 @@ impl SandboxManagerService {
                         completion,
                         published_artifact: None,
                         immediate_kill,
+                        // Admission persisted the stop's decision; this asks nothing.
+                        guest_flush: crate::db::cleanup_jobs::GuestFlush::Unrequested,
                     },
                     admission,
                 )
@@ -888,6 +899,8 @@ impl SandboxManagerService {
                         context: "cleanup after stop",
                         completion,
                         immediate_kill,
+                        // Admission persisted the stop's decision; this asks nothing.
+                        guest_flush: crate::db::cleanup_jobs::GuestFlush::Unrequested,
                         persist_intent: false,
                         cleanup_id: None,
                     },
@@ -1004,6 +1017,7 @@ impl SandboxManagerService {
                             completion: CleanupCompletion::DeletePoolClone,
                             published_artifact: None,
                             immediate_kill: false,
+                            guest_flush: crate::db::cleanup_jobs::GuestFlush::Unrequested,
                         },
                         episode.id,
                     )
@@ -1016,6 +1030,7 @@ impl SandboxManagerService {
                         context: "explicit prepared clone disposal",
                         completion: CleanupCompletion::DeletePoolClone,
                         immediate_kill: false,
+                        guest_flush: crate::db::cleanup_jobs::GuestFlush::Unrequested,
                         persist_intent: false,
                         cleanup_id: Some(episode.id),
                     });
@@ -1061,6 +1076,7 @@ impl SandboxManagerService {
                             completion,
                             published_artifact: None,
                             immediate_kill: Self::cleanup_immediate_kill(completion),
+                            guest_flush: crate::db::cleanup_jobs::GuestFlush::Unrequested,
                         },
                         admission,
                     )
@@ -1076,6 +1092,7 @@ impl SandboxManagerService {
                         completion,
                         published_artifact: None,
                         immediate_kill: Self::cleanup_immediate_kill(completion),
+                        guest_flush: crate::db::cleanup_jobs::GuestFlush::Unrequested,
                     },
                     admission,
                 )
@@ -1089,6 +1106,7 @@ impl SandboxManagerService {
                         context: "cleanup after delete",
                         completion,
                         immediate_kill: Self::cleanup_immediate_kill(completion),
+                        guest_flush: crate::db::cleanup_jobs::GuestFlush::Unrequested,
                         persist_intent: false,
                         cleanup_id: None,
                     },

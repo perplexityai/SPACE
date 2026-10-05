@@ -6,6 +6,13 @@ use super::spaced_bridge::*;
 use super::tail_support::*;
 use super::*;
 
+fn cpu_stat_usage_usec(content: &str) -> Option<u64> {
+    content.lines().find_map(|line| {
+        line.strip_prefix("usage_usec ")
+            .and_then(|value| value.trim().parse::<u64>().ok())
+    })
+}
+
 fn parse_operation_user(user: Option<String>) -> Result<Option<GuestUserName>, Status> {
     user.map(GuestUserName::parse)
         .transpose()
@@ -50,17 +57,21 @@ impl SandboxManagerService {
             .map_err(|e| Status::internal(format!("inspect failed: {e}")))?
             .into_inner();
 
-        // Read cumulative CPU time from cgroup cpu.stat
-        let cpu_usage_usec =
-            std::fs::read_to_string(format!("/sys/fs/cgroup/space/sbx-{id}/cpu.stat"))
-                .ok()
-                .and_then(|content| {
-                    content.lines().find_map(|line| {
-                        line.strip_prefix("usage_usec ")
-                            .and_then(|v| v.trim().parse::<u64>().ok())
-                    })
-                })
-                .unwrap_or(0);
+        // CPU time comes from the same jailer cgroup inspect reads `cpu_max` from.
+        // Stats stay available without it, but a failed read is logged: a
+        // silent zero is how a wrong cgroup path once went unnoticed.
+        let cpu_stat =
+            pplx_space_node_runtime_core::cgroup_paths::jailer_cgroup_path(id).join("cpu.stat");
+        let cpu_usage_usec = match tokio::fs::read_to_string(&cpu_stat).await {
+            Ok(content) => cpu_stat_usage_usec(&content).unwrap_or_else(|| {
+                tracing::warn!(sandbox_id = %id, path = %cpu_stat.display(), "cpu.stat has no usage_usec");
+                0
+            }),
+            Err(error) => {
+                tracing::warn!(sandbox_id = %id, path = %cpu_stat.display(), %error, "failed to read cpu.stat");
+                0
+            }
+        };
         let health = self.watchdog.get_health(id).await;
         let network_tx_bytes = health
             .as_ref()
@@ -576,10 +587,11 @@ impl SandboxManagerService {
             .await?;
         route_auth.authorize_sandbox(&sandbox)?;
         let client = self.connect_spaced_host(&sandbox).await?;
-        let mut entries = Vec::new();
-        for entry in operation.entries.iter().cloned() {
-            entries.push(write_batch_entry_to_host(entry));
-        }
+        let entries = operation
+            .entries
+            .into_iter()
+            .map(write_batch_entry_to_host)
+            .collect();
         let response = client
             .write_batch_as_user(
                 entries,
@@ -1008,3 +1020,6 @@ impl SandboxManagerService {
         }))
     }
 }
+
+#[cfg(test)]
+mod tests;

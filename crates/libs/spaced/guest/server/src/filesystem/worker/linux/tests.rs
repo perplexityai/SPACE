@@ -288,6 +288,7 @@ async fn expired_worker_shutdown_does_not_block_another_resident() {
         ledger_update_slot: Arc::new(tokio::sync::Semaphore::new(1)),
         stop_token: CancellationToken::new(),
         supervisor: Arc::new(Mutex::new(Some(expired_supervisor))),
+        pidfd: None,
     };
     let resident = WorkerClient {
         client: FilesystemClient::new(channel),
@@ -297,6 +298,7 @@ async fn expired_worker_shutdown_does_not_block_another_resident() {
         ledger_update_slot: Arc::new(tokio::sync::Semaphore::new(1)),
         stop_token: CancellationToken::new(),
         supervisor: Arc::new(Mutex::new(None)),
+        pidfd: None,
     };
     {
         let mut workers = pool.workers.lock().await;
@@ -363,6 +365,7 @@ async fn same_identity_waiters_share_an_in_progress_start() {
         ledger_update_slot: Arc::new(tokio::sync::Semaphore::new(1)),
         stop_token: CancellationToken::new(),
         supervisor: Arc::new(Mutex::new(None)),
+        pidfd: None,
     };
     let published = pool
         .publish_start(&user, startup_id, Ok(worker.clone()))
@@ -434,6 +437,7 @@ async fn invalidating_a_worker_cancels_its_supervisor() {
         ledger_update_slot: Arc::new(tokio::sync::Semaphore::new(1)),
         stop_token: stop_token.clone(),
         supervisor: Arc::new(Mutex::new(None)),
+        pidfd: None,
     };
     pool.workers.lock().await.insert(
         user,

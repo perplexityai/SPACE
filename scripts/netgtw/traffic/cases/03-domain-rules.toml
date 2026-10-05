@@ -1,44 +1,49 @@
 name = "HTTP Host and TLS SNI enforce exact, wildcard and deny rules"
 
 [[steps]]
-policy = { default = "deny", allow = ["198.18.53.53", "allowed.test", "*.allowed.test"], deny = ["blocked.allowed.test"] }
+policy = { default = "deny", allow = ["198.18.53.53", "1.1.1.1", "allowed.198-18-1-2.sslip.io", "*.allowed.198-18-1-2.sslip.io"], deny = ["blocked.allowed.198-18-1-2.sslip.io"] }
 probes = [
   # A hostname alone grants nothing until DNS binds that name to the target.
-  { kind = "http", host = "allowed.test", expect = "deny" },
-  { kind = "tls", host = "allowed.test", expect = "deny" },
-  { kind = "http2", host = "allowed.test", expect = "deny" },
-  { kind = "grpcs", host = "allowed.test", expect = "deny" },
-  { kind = "wss", host = "allowed.test", expect = "deny" },
-  { kind = "dns-udp", target = "198.18.53.53", host = "allowed.test", expect = "answer" },
-  { kind = "dns-udp", target = "198.18.53.53", host = "api.allowed.test", expect = "answer" },
-  { kind = "http", host = "allowed.test", expect = "allow" },
-  { kind = "tls", host = "allowed.test", expect = "allow" },
-  { kind = "http2", host = "allowed.test", expect = "allow" },
-  { kind = "grpcs", host = "allowed.test", expect = "allow" },
+  { kind = "http", host = "allowed.198-18-1-2.sslip.io", expect = "deny" },
+  { kind = "tls", host = "allowed.198-18-1-2.sslip.io", expect = "deny" },
+  { kind = "http2", host = "allowed.198-18-1-2.sslip.io", expect = "deny" },
+  { kind = "grpcs", host = "allowed.198-18-1-2.sslip.io", expect = "deny" },
+  { kind = "wss", host = "allowed.198-18-1-2.sslip.io", expect = "deny" },
+  { kind = "dns-udp", target = "198.18.53.53", host = "allowed.198-18-1-2.sslip.io", expect = "answer" },
+  # A guest-chosen DNS answer is delivered but must not become egress evidence.
+  { kind = "http", host = "allowed.198-18-1-2.sslip.io", expect = "deny" },
+  { kind = "tls", host = "allowed.198-18-1-2.sslip.io", expect = "deny" },
+  # The same hostname/address becomes usable only after trusted resolution.
+  { kind = "dns-udp", target = "1.1.1.1", host = "allowed.198-18-1-2.sslip.io", expect = "answer" },
+  { kind = "dns-tcp", target = "1.1.1.1", host = "api.allowed.198-18-1-2.sslip.io", expect = "answer" },
+  { kind = "http", host = "allowed.198-18-1-2.sslip.io", expect = "allow" },
+  { kind = "tls", host = "allowed.198-18-1-2.sslip.io", expect = "allow" },
+  { kind = "http2", host = "allowed.198-18-1-2.sslip.io", expect = "allow" },
+  { kind = "grpcs", host = "allowed.198-18-1-2.sslip.io", expect = "allow" },
   # Plaintext hostname-bound upgrades are refused before contacting upstream.
-  { kind = "ws", host = "allowed.test", expect = "deny", http_status = 403 },
-  { kind = "wss", host = "allowed.test", expect = "allow" },
-  { kind = "http", host = "api.allowed.test", expect = "allow" },
-  { kind = "tls", host = "api.allowed.test", expect = "allow" },
-  { kind = "http", host = "blocked.allowed.test", expect = "deny" },
-  { kind = "tls", host = "blocked.allowed.test", expect = "deny" },
-  { kind = "http2", host = "blocked.allowed.test", expect = "deny" },
-  { kind = "grpcs", host = "blocked.allowed.test", expect = "deny" },
-  { kind = "wss", host = "blocked.allowed.test", expect = "deny" },
+  { kind = "ws", host = "allowed.198-18-1-2.sslip.io", expect = "deny", http_status = 403 },
+  { kind = "wss", host = "allowed.198-18-1-2.sslip.io", expect = "allow" },
+  { kind = "http", host = "api.allowed.198-18-1-2.sslip.io", expect = "allow" },
+  { kind = "tls", host = "api.allowed.198-18-1-2.sslip.io", expect = "allow" },
+  { kind = "http", host = "blocked.allowed.198-18-1-2.sslip.io", expect = "deny" },
+  { kind = "tls", host = "blocked.allowed.198-18-1-2.sslip.io", expect = "deny" },
+  { kind = "http2", host = "blocked.allowed.198-18-1-2.sslip.io", expect = "deny" },
+  { kind = "grpcs", host = "blocked.allowed.198-18-1-2.sslip.io", expect = "deny" },
+  { kind = "wss", host = "blocked.allowed.198-18-1-2.sslip.io", expect = "deny" },
   { kind = "http", host = "elsewhere.test", expect = "deny" },
   { kind = "tls", host = "elsewhere.test", expect = "deny" },
-  { kind = "http", target = "198.18.2.2", host = "allowed.test", expect = "deny" },
-  { kind = "tls", target = "198.18.2.2", host = "allowed.test", expect = "deny" },
-  { kind = "http2", target = "198.18.2.2", host = "allowed.test", expect = "deny" },
-  { kind = "grpcs", target = "198.18.2.2", host = "allowed.test", expect = "deny" },
-  { kind = "wss", target = "198.18.2.2", host = "allowed.test", expect = "deny" },
+  { kind = "http", target = "198.18.2.2", host = "allowed.198-18-1-2.sslip.io", expect = "deny" },
+  { kind = "tls", target = "198.18.2.2", host = "allowed.198-18-1-2.sslip.io", expect = "deny" },
+  { kind = "http2", target = "198.18.2.2", host = "allowed.198-18-1-2.sslip.io", expect = "deny" },
+  { kind = "grpcs", target = "198.18.2.2", host = "allowed.198-18-1-2.sslip.io", expect = "deny" },
+  { kind = "wss", target = "198.18.2.2", host = "allowed.198-18-1-2.sslip.io", expect = "deny" },
   { kind = "tcp", expect = "deny" },
   { kind = "udp", expect = "deny" },
   { kind = "udp", port = 443, expect = "deny" },
   # Domain attribution cannot authorize plaintext HTTP/2/gRPC or QUIC.
-  { kind = "h2c", host = "allowed.test", expect = "deny" },
-  { kind = "grpc", host = "allowed.test", expect = "deny" },
-  { kind = "quic", host = "allowed.test", expect = "deny" },
+  { kind = "h2c", host = "allowed.198-18-1-2.sslip.io", expect = "deny" },
+  { kind = "grpc", host = "allowed.198-18-1-2.sslip.io", expect = "deny" },
+  { kind = "quic", host = "allowed.198-18-1-2.sslip.io", expect = "deny" },
 ]
 
 [[steps]]
@@ -52,8 +57,8 @@ probes = [
 ]
 
 [[steps]]
-policy = { default = "deny", allow = ["allowed.test"], deny = ["198.18.1.2"] }
+policy = { default = "deny", allow = ["allowed.198-18-1-2.sslip.io"], deny = ["198.18.1.2"] }
 probes = [
-  { kind = "http", host = "allowed.test", expect = "deny" },
-  { kind = "tls", host = "allowed.test", expect = "deny" },
+  { kind = "http", host = "allowed.198-18-1-2.sslip.io", expect = "deny" },
+  { kind = "tls", host = "allowed.198-18-1-2.sslip.io", expect = "deny" },
 ]

@@ -262,7 +262,7 @@ pub(super) async fn read_file(
         let chunk = chunk.map_err(|status| std::io::Error::other(status.to_string()))?;
         bytes_read = checked_file_content_len(bytes_read, chunk.data.len())
             .map_err(|err| std::io::Error::other(err.message))?;
-        Ok::<Bytes, std::io::Error>(Bytes::from(chunk.data))
+        Ok::<Bytes, std::io::Error>(chunk.data)
     });
 
     Ok((

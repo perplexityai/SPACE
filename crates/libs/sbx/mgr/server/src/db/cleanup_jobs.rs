@@ -113,6 +113,58 @@ pub(crate) fn eligibility(
     }
 }
 
+/// Whether cleanup flushes the guest's root filesystem before it terminates
+/// the VM. A stop kills the VM without shutting the guest down, so writes the
+/// guest acknowledged but has not yet committed to its disk would be lost.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum GuestFlush {
+    /// This request asks nothing; merged with pending work, that work's
+    /// choice stands. Work persisted before this field existed reads as this,
+    /// and does not flush.
+    #[default]
+    Unrequested,
+    /// An ordinary stop of a running sandbox: attempt a bounded flush before
+    /// every termination attempt.
+    BeforeTermination,
+    /// A forced stop: never flush, whatever an earlier request asked.
+    Forbidden,
+}
+
+impl GuestFlush {
+    /// What a stop's request becomes, decided under the cleanup fence from the
+    /// state the stop supersedes. A VM known not to be running has nothing to
+    /// flush. Any other state, transitional ones included, is no proof that a
+    /// flush already covered every acknowledged write. That includes Paused:
+    /// pause flushes before it freezes the VM, and a write in progress then
+    /// can complete after that flush, so cleanup resumes a paused VM to
+    /// flush it.
+    pub(crate) fn for_superseded_state(self, state: Option<SandboxState>) -> Self {
+        match (self, state) {
+            (
+                Self::BeforeTermination,
+                Some(
+                    SandboxState::Suspended
+                    | SandboxState::Stopped
+                    | SandboxState::Created
+                    | SandboxState::Creating,
+                ),
+            ) => Self::Unrequested,
+            (requested, _) => requested,
+        }
+    }
+
+    /// A forced stop overrides an ordinary one, and either overrides a
+    /// request that asked nothing.
+    pub(crate) fn merge(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Forbidden, _) | (_, Self::Forbidden) => Self::Forbidden,
+            (Self::BeforeTermination, _) | (_, Self::BeforeTermination) => Self::BeforeTermination,
+            (Self::Unrequested, Self::Unrequested) => Self::Unrequested,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct CleanupWork {
     pub version: u8,
@@ -123,6 +175,8 @@ pub(crate) struct CleanupWork {
     pub completion: CleanupCompletion,
     pub keep_filesystem: bool,
     pub immediate_kill: bool,
+    #[serde(default)]
+    pub guest_flush: GuestFlush,
     pub published_artifact: Option<(LocalArtifactId, String)>,
 }
 
@@ -134,6 +188,7 @@ impl CleanupWork {
     fn compatible(&self, other: &Self) -> bool {
         let mut candidate = other.clone();
         candidate.immediate_kill = self.immediate_kill;
+        candidate.guest_flush = self.guest_flush;
         *self == candidate
     }
 }
@@ -180,6 +235,7 @@ pub(crate) fn persist(
         }
         if previous.compatible(&work) && existing.status != JobStatus::Cancelling.as_str() {
             work.immediate_kill |= previous.immediate_kill;
+            work.guest_flush = work.guest_flush.merge(previous.guest_flush);
             jobs::update_active_job_payload(
                 conn,
                 &id,

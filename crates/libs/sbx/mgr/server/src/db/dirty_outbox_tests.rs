@@ -59,33 +59,3 @@ fn dirty_outbox_revision_exhaustion_keeps_the_pending_obligation() {
     enqueue_node_dirty_sandbox_inventory(&conn, "sandbox").unwrap_err();
     assert_eq!(list_node_dirty_refs(&conn, 10).unwrap(), pending);
 }
-
-#[test]
-fn dirty_outbox_upgrade_preserves_pending_legacy_rows() {
-    if pplx_space_common_svc::sql::baselines::is_public(
-        &pplx_space_sbxmgr_migrations::SANDBOX_MANAGER_MIGRATOR,
-    ) {
-        return;
-    }
-    let conn = test_conn();
-    conn.execute_batch(historical_migration_sql(
-        &pplx_space_sbxmgr_migrations::SANDBOX_MANAGER_MIGRATOR,
-        56,
-        sqlx::migrate::MigrationType::ReversibleDown,
-    ))
-    .unwrap();
-    enqueue_node_dirty_sandbox_inventory(&conn, "sandbox").unwrap();
-    conn.execute_batch(historical_migration_sql(
-        &pplx_space_sbxmgr_migrations::SANDBOX_MANAGER_MIGRATOR,
-        56,
-        sqlx::migrate::MigrationType::ReversibleUp,
-    ))
-    .unwrap();
-    let legacy = list_node_dirty_refs(&conn, 10).unwrap();
-    assert_eq!(legacy.len(), 1);
-    assert_eq!(legacy[0].revision, 0);
-    enqueue_node_dirty_sandbox_inventory(&conn, "sandbox").unwrap();
-    assert_eq!(delete_node_dirty_refs(&conn, &legacy).unwrap(), 0);
-    let latest = list_node_dirty_refs(&conn, 10).unwrap();
-    assert_eq!(delete_node_dirty_refs(&conn, &latest).unwrap(), 1);
-}

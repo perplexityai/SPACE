@@ -519,6 +519,7 @@ async fn pool_clone_cleanup_never_falls_back_and_holds_unsafe_or_exhausted_dispo
                     completion: CleanupCompletion::DeletePoolClone,
                     keep_filesystem: false,
                     immediate_kill: false,
+                    guest_flush: crate::db::cleanup_jobs::GuestFlush::Unrequested,
                     published_artifact: None,
                 },
             )

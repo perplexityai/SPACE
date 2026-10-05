@@ -9,13 +9,6 @@ permissions:
   contents: read
 
 jobs:
-  # Inventory only; kept outside required aggregate dependencies.
-  quarantine_backlog:
-    if: github.repository == 'perplexityai/SPACE'
-    uses: ./.github/workflows/quarantine-ci.yml
-    permissions:
-      contents: read
-
   # The only job that writes the CI image. Pull requests, the merge queue, and
   # the other main jobs read it; each builds it locally until this job has
   # published a new tag. It is not required by space-ci: a failed publish

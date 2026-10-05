@@ -96,6 +96,11 @@ async fn execution_release_rpc_accepts_stop_and_publishes_the_decision() {
         response.disposition,
         ReleaseExecutionDisposition::LifecycleMutationAccepted as i32
     );
+    // A stop keeps the filesystem, so it flushes the guest first.
+    assert_eq!(
+        persisted_guest_flush(&service, &sandbox_id_string),
+        crate::db::cleanup_jobs::GuestFlush::BeforeTermination
+    );
     let row = service.lookup_sandbox(&sandbox_id_string).unwrap();
     assert_eq!(row.state, SandboxState::Stopping);
     assert_eq!(row.cleanup_completion, Some(CleanupCompletion::MarkStopped));
@@ -192,6 +197,11 @@ async fn execution_release_rpc_accepts_delete_and_retires_auto_lifecycle_state()
     assert_eq!(row.state, SandboxState::Deleting);
     assert_eq!(row.cleanup_completion, Some(CleanupCompletion::DeleteRow));
     assert_eq!(row.cleanup_keep_filesystem, Some(false));
+    assert_eq!(
+        persisted_guest_flush(&service, &sandbox_id_string),
+        crate::db::cleanup_jobs::GuestFlush::Unrequested,
+        "a delete discards the disk and never flushes"
+    );
     assert!(
         service
             .auto_lifecycle
@@ -907,4 +917,23 @@ async fn cancelled_cleanup_rpcs_preserve_admitted_termination_strength() {
         observed,
         cases.map(|(_, immediate, _)| (immediate, immediate))
     );
+}
+
+/// The guest flush the sandbox's persisted cleanup work asks for.
+fn persisted_guest_flush(
+    service: &SandboxManagerService,
+    sandbox_id: &str,
+) -> crate::db::cleanup_jobs::GuestFlush {
+    let db = service.db.lock().unwrap();
+    let job =
+        pplx_space_common_jobs::db::find_active_job(&db, crate::db::cleanup_jobs::KIND, sandbox_id)
+            .unwrap()
+            .expect("the release's cleanup is persisted");
+    let payload = pplx_space_common_jobs::db::get_job(&db, &job)
+        .unwrap()
+        .unwrap()
+        .payload;
+    crate::db::cleanup_jobs::decode(&payload)
+        .unwrap()
+        .guest_flush
 }

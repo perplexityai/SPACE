@@ -335,6 +335,7 @@ async fn normalized_selectors_reach_fenced_stop_and_delete_completion() {
                         completion,
                         published_artifact: None,
                         immediate_kill: true,
+                        guest_flush: crate::db::cleanup_jobs::GuestFlush::Unrequested,
                     },
                     Some(admission),
                     None,
@@ -472,4 +473,128 @@ fn exact_cleanup_rejects_target_metadata_damage_and_database_failure() {
         )
         .unwrap_err();
     }
+}
+
+// A stop decides its guest flush under the admission fence, from the state it
+// supersedes: neither a pause still preparing its own flush nor a completed
+// pause proves that every acknowledged write was flushed, while a suspended
+// sandbox has no VM to flush.
+#[tokio::test]
+async fn a_stops_guest_flush_is_decided_from_the_state_it_supersedes() {
+    use crate::db::cleanup_jobs::{self, GuestFlush};
+    use crate::service::tests::service_tests::service_for_teardown_test;
+    for (state, expected) in [
+        (SandboxState::Started, GuestFlush::BeforeTermination),
+        (SandboxState::Pausing, GuestFlush::BeforeTermination),
+        (SandboxState::Paused, GuestFlush::BeforeTermination),
+        (SandboxState::Suspended, GuestFlush::Unrequested),
+    ] {
+        let conn = crate::db::test_conn();
+        let id = SandboxId::new();
+        insert_test_sandbox(&conn, &id.to_string(), state);
+        let service = service_for_teardown_test(conn);
+        // Keep the executor from taking the job before it is read.
+        service.shutdown_token.cancel();
+        let admission = service
+            .admit_selected_cleanup(id, CleanupCompletion::MarkStopped, false, true, None, false)
+            .await
+            .unwrap_or_else(|error| panic!("{state:?}: {}", error.into_status()));
+        let persisted = {
+            let db = service.db_conn().unwrap();
+            let job = pplx_space_common_jobs::db::find_active_job(
+                &db,
+                cleanup_jobs::KIND,
+                &id.to_string(),
+            )
+            .unwrap()
+            .expect("the stop's cleanup is persisted");
+            let payload = pplx_space_common_jobs::db::get_job(&db, &job)
+                .unwrap()
+                .unwrap()
+                .payload;
+            cleanup_jobs::decode(&payload).unwrap().guest_flush
+        };
+        assert_eq!(persisted, expected, "{state:?}");
+        drop(admission);
+    }
+}
+
+// A paused VM is resumed so the flush can reach its guest: writes can
+// complete after the pause's own flush, and stopping the paused VM would
+// discard them. A VM whose state cannot be read is still offered the flush.
+#[test]
+fn a_stops_flush_resumes_a_paused_vm_first() {
+    use crate::service::cleanup::BeforeStopFlush;
+    use pplx_space_node_runtime_core::fc_api::FirecrackerVmState;
+    assert_eq!(
+        BeforeStopFlush::for_vm_state(Some(FirecrackerVmState::Paused)),
+        BeforeStopFlush::ResumeThenFlush
+    );
+    assert_eq!(
+        BeforeStopFlush::for_vm_state(Some(FirecrackerVmState::Running)),
+        BeforeStopFlush::Flush
+    );
+    assert_eq!(BeforeStopFlush::for_vm_state(None), BeforeStopFlush::Flush);
+    assert_eq!(
+        BeforeStopFlush::for_vm_state(Some(FirecrackerVmState::NotStarted)),
+        BeforeStopFlush::NotRunning
+    );
+}
+
+// A stalled step ends the stop's flush attempt at its one budget, so the stop
+// proceeds to terminate: a resume that never answers, or a flush that never
+// finishes after a resume that did.
+#[tokio::test(start_paused = true)]
+async fn a_stops_flush_attempt_ends_at_its_budget_whichever_step_stalls() {
+    use crate::service::cleanup::{StopFlushError, within_stop_flush_budget};
+    let budget = std::time::Duration::from_secs(30);
+    let flushed = std::sync::atomic::AtomicBool::new(false);
+
+    let stalled_resume = within_stop_flush_budget(
+        budget,
+        std::future::pending::<Result<(), StopFlushError>>(),
+        || async {
+            flushed.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok::<(), StopFlushError>(())
+        },
+    )
+    .await;
+    assert!(matches!(stalled_resume, Err(StopFlushError::TimedOut(spent)) if spent == budget));
+    assert!(
+        !flushed.load(std::sync::atomic::Ordering::SeqCst),
+        "no flush follows a resume that never answered"
+    );
+
+    let stalled_flush = within_stop_flush_budget(budget, async { Ok(()) }, || {
+        std::future::pending::<Result<(), StopFlushError>>()
+    })
+    .await;
+    assert!(matches!(stalled_flush, Err(StopFlushError::TimedOut(_))));
+
+    let failed_resume = within_stop_flush_budget(
+        budget,
+        async { Err(StopFlushError::VmNotRunning) },
+        || async { Ok::<(), StopFlushError>(()) },
+    )
+    .await;
+    assert!(matches!(failed_resume, Err(StopFlushError::VmNotRunning)));
+
+    let failed_flush = within_stop_flush_budget(budget, async { Ok(()) }, || async {
+        Err(crate::guest_filesystem_flush::GuestFlushError::Guest(
+            tonic::Status::unavailable("guest unreachable"),
+        ))
+    })
+    .await;
+    assert!(matches!(
+        failed_flush,
+        Err(StopFlushError::Flush(
+            crate::guest_filesystem_flush::GuestFlushError::Guest(_)
+        ))
+    ));
+
+    within_stop_flush_budget(budget, async { Ok(()) }, || async {
+        Ok::<(), StopFlushError>(())
+    })
+    .await
+    .expect("a prompt preparation and flush complete");
 }

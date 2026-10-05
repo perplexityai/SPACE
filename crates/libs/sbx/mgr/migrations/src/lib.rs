@@ -1,19 +1,12 @@
 //! Sandbox-manager schema admission and migrations shared by the daemon and CLI.
-use pplx_space_sqlite_migrations::{
-    ensure_common_jobs_lease_index, ensure_common_jobs_priority_index, job_column_exists,
-    job_lease_columns_complete, stamp_missing_sqlite_migration,
-};
 use rusqlite::Connection;
 use sqlx::migrate::Migrator;
 
 pub static SANDBOX_MANAGER_MIGRATOR: Migrator = sqlx::migrate!("../../../../../db/sandbox-manager");
 pub static COMMON_SCHEMA_MIGRATOR: Migrator = sqlx::migrate!("../../../../../db/common");
 
-const JOBS_LEASES_VERSION: i64 = 27;
-const JOBS_PRIORITY_VERSION: i64 = 37;
-
 // The final schema contraction raises SQLite's application-owned user_version.
-// Admission happens before migration history repair or any service work so a
+// Admission happens before migrations or any service work so a
 // binary from the preparation release cannot operate on the contracted store.
 const SUPPORTED_SCHEMA_FLOOR: i64 = 3;
 
@@ -31,24 +24,14 @@ enum PrepareMigrationsError {
         "active snapshot upload {0} lacks staged metadata; finish or repair it with the preparation release before cutover"
     )]
     LegacyUpload(String),
-    #[error(transparent)]
-    InspectColumns(#[from] pplx_space_sqlite_migrations::InspectJobColumnsError),
-    #[error(transparent)]
-    EnsureLeaseIndex(#[from] pplx_space_sqlite_migrations::EnsureCommonJobsLeaseIndexError),
-    #[error(transparent)]
-    EnsurePriorityIndex(#[from] pplx_space_sqlite_migrations::EnsureCommonJobsPriorityIndexError),
-    #[error(transparent)]
-    Stamp(#[from] pplx_space_sqlite_migrations::StampSqliteMigrationError),
 }
 
-/// Reject an incompatible store before writing, then stamp service migrations
-/// whose columns were already installed by the common migrator. Both entry
-/// points run this before applying service migrations.
+/// Reject an incompatible schema floor or active upload before either the
+/// daemon or CLI writes to the store.
 pub fn prepare_migrations(
     conn: &Connection,
-    service_migrator: &Migrator,
 ) -> Result<(), pplx_space_sqlite_migrations::MigrationCompatibilityError> {
-    prepare_migrations_inner(conn, service_migrator)
+    prepare_migrations_inner(conn)
         .map_err(pplx_space_sqlite_migrations::MigrationCompatibilityError::new)
 }
 
@@ -61,29 +44,9 @@ pub fn ensure_downgrade_allowed(
         .map_err(pplx_space_sqlite_migrations::MigrationCompatibilityError::new)
 }
 
-fn prepare_migrations_inner(
-    conn: &Connection,
-    service_migrator: &Migrator,
-) -> Result<(), PrepareMigrationsError> {
+fn prepare_migrations_inner(conn: &Connection) -> Result<(), PrepareMigrationsError> {
     check_schema_floor(conn, SUPPORTED_SCHEMA_FLOOR)?;
-    check_active_upload_format(conn)?;
-    if service_migrator
-        .iter()
-        .any(|migration| migration.version == JOBS_LEASES_VERSION)
-        && job_lease_columns_complete(conn)?
-    {
-        ensure_common_jobs_lease_index(conn)?;
-        stamp_missing_sqlite_migration(conn, service_migrator, JOBS_LEASES_VERSION)?;
-    }
-    if service_migrator
-        .iter()
-        .any(|migration| migration.version == JOBS_PRIORITY_VERSION)
-        && job_column_exists(conn, "priority")?
-    {
-        ensure_common_jobs_priority_index(conn)?;
-        stamp_missing_sqlite_migration(conn, service_migrator, JOBS_PRIORITY_VERSION)?;
-    }
-    Ok(())
+    check_active_upload_format(conn)
 }
 
 fn check_schema_floor(conn: &Connection, supported: i64) -> Result<(), PrepareMigrationsError> {

@@ -19,13 +19,9 @@ use crate::{
     middleware::auth::AuthUser,
     models::{
         CreateCredentialRequest, CredentialDocument, CredentialMetadata, MergedCredential,
-        UpdateCredentialRequest, User,
+        UpdateCredentialRequest,
     },
-    routes::{
-        AppState,
-        authz::{can_manage_users_in_org, can_update_user_profile},
-    },
-    user_role::UserRole,
+    routes::AppState,
 };
 
 const METADATA_COLUMNS: &str = "id, key, created_at, updated_at";
@@ -125,8 +121,8 @@ fn credential_contended_response(error: &sqlx::Error) -> Response {
 /// taking a `&'static str` could not do both.
 ///
 /// One function rather than a guard arm per handler: the arms were identical
-/// 17 times over, and the failure mode of that shape is silent — a handler
-/// added later without the guard reports a lost race as permanent and nothing
+/// across the credential handlers. A handler added later without the guard
+/// reports a lost race as permanent and nothing
 /// catches it.
 fn credential_db_error(error: &sqlx::Error, log: impl FnOnce()) -> Response {
     if contention::is_lock_contention(error) {
@@ -140,14 +136,6 @@ fn internal_error_response() -> Response {
     (
         StatusCode::INTERNAL_SERVER_ERROR,
         Json(serde_json::json!({"error": "Internal server error"})),
-    )
-        .into_response()
-}
-
-fn forbidden_response() -> Response {
-    (
-        StatusCode::FORBIDDEN,
-        Json(serde_json::json!({"error": "Insufficient permissions"})),
     )
         .into_response()
 }
@@ -295,38 +283,6 @@ async fn update_user_credential_for(
     }
 }
 
-async fn can_manage_user(
-    pool: &PgPool,
-    actor: &User,
-    target_user_id: UserId,
-) -> Result<Option<User>, sqlx::Error> {
-    if actor.role == UserRole::Member {
-        return Ok(None);
-    }
-
-    let Some(target) = sqlx::query_as::<_, User>(sql!("SELECT * FROM users WHERE id = $1"))
-        .bind(target_user_id)
-        .fetch_optional(pool)
-        .await?
-    else {
-        return Ok(None);
-    };
-
-    if can_update_user_profile(pool, actor, &target).await? {
-        Ok(Some(target))
-    } else {
-        Ok(None)
-    }
-}
-
-async fn can_manage_org_credentials(
-    pool: &PgPool,
-    actor: &User,
-    target_org_id: OrgId,
-) -> Result<bool, sqlx::Error> {
-    can_manage_users_in_org(pool, actor, target_org_id).await
-}
-
 pub async fn list_user_credentials(
     State(state): State<AppState>,
     Extension(AuthUser(actor)): Extension<AuthUser>,
@@ -381,242 +337,6 @@ pub async fn delete_user_credential(
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(error) => credential_db_error(&error, || {
             tracing::error!(%error, user_id = %actor.id, %id, "failed to delete user credential");
-        }),
-    }
-}
-
-pub async fn list_admin_user_credentials(
-    State(state): State<AppState>,
-    Extension(AuthUser(actor)): Extension<AuthUser>,
-    Path(user_id): Path<UserId>,
-) -> impl IntoResponse {
-    match can_manage_user(&state.pool, &actor, user_id).await {
-        Ok(Some(_)) => list_user_credentials_for(state.credentials_pool.pool(), user_id).await,
-        Ok(None) => forbidden_response(),
-        Err(error) => credential_db_error(&error, || {
-            tracing::error!(%error, actor_id = %actor.id, %user_id, "credential authorization failed");
-        }),
-    }
-}
-
-pub async fn create_admin_user_credential(
-    State(state): State<AppState>,
-    Extension(AuthUser(actor)): Extension<AuthUser>,
-    Path(user_id): Path<UserId>,
-    Json(request): Json<CreateCredentialRequest>,
-) -> impl IntoResponse {
-    let target = match can_manage_user(&state.pool, &actor, user_id).await {
-        Ok(Some(target)) => target,
-        Ok(None) => return forbidden_response(),
-        Err(error) => {
-            return credential_db_error(&error, || {
-                tracing::error!(%error, actor_id = %actor.id, %user_id, "credential authorization failed");
-            });
-        }
-    };
-    create_user_credential_for(
-        state.credentials_pool.pool(),
-        user_id,
-        target.org_id,
-        request,
-    )
-    .await
-}
-
-pub async fn update_admin_user_credential(
-    State(state): State<AppState>,
-    Extension(AuthUser(actor)): Extension<AuthUser>,
-    Path((user_id, id)): Path<(UserId, Uuid)>,
-    Json(request): Json<UpdateCredentialRequest>,
-) -> impl IntoResponse {
-    let target = match can_manage_user(&state.pool, &actor, user_id).await {
-        Ok(Some(target)) => target,
-        Ok(None) => return forbidden_response(),
-        Err(error) => {
-            return credential_db_error(&error, || {
-                tracing::error!(%error, actor_id = %actor.id, %user_id, "credential authorization failed");
-            });
-        }
-    };
-    update_user_credential_for(
-        state.credentials_pool.pool(),
-        user_id,
-        target.org_id,
-        id,
-        request,
-    )
-    .await
-}
-
-pub async fn delete_admin_user_credential(
-    State(state): State<AppState>,
-    Extension(AuthUser(actor)): Extension<AuthUser>,
-    Path((user_id, id)): Path<(UserId, Uuid)>,
-) -> impl IntoResponse {
-    match can_manage_user(&state.pool, &actor, user_id).await {
-        Ok(Some(_)) => {}
-        Ok(None) => return forbidden_response(),
-        Err(error) => {
-            return credential_db_error(&error, || {
-                tracing::error!(%error, actor_id = %actor.id, %user_id, "credential authorization failed");
-            });
-        }
-    }
-
-    match sqlx::query(sql!(
-        "DELETE FROM user_credentials WHERE id = $1 AND user_id = $2"
-    ))
-    .bind(id)
-    .bind(user_id)
-    .execute(state.credentials_pool.pool())
-    .await
-    {
-        Ok(result) if result.rows_affected() > 0 => StatusCode::NO_CONTENT.into_response(),
-        Ok(_) => not_found_response(),
-        Err(error) => credential_db_error(&error, || {
-            tracing::error!(%error, %user_id, %id, "failed to delete admin user credential");
-        }),
-    }
-}
-
-pub async fn list_org_credentials(
-    State(state): State<AppState>,
-    Extension(AuthUser(actor)): Extension<AuthUser>,
-    Path(org_id): Path<OrgId>,
-) -> impl IntoResponse {
-    match can_manage_org_credentials(&state.pool, &actor, org_id).await {
-        Ok(true) => {}
-        Ok(false) => return forbidden_response(),
-        Err(error) => {
-            return credential_db_error(&error, || {
-                tracing::error!(%error, actor_id = %actor.id, %org_id, "credential authorization failed");
-            });
-        }
-    }
-
-    match sqlx::query_as::<_, CredentialMetadata>(sqlx::AssertSqlSafe(sql!(format!(
-        "SELECT {METADATA_COLUMNS} FROM org_credentials WHERE org_id = $1 ORDER BY key"
-    ))))
-    .bind(org_id)
-    .fetch_all(state.credentials_pool.pool())
-    .await
-    {
-        Ok(credentials) => Json(credentials).into_response(),
-        Err(error) => credential_db_error(&error, || {
-            tracing::error!(%error, %org_id, "failed to list org credentials");
-        }),
-    }
-}
-
-pub async fn create_org_credential(
-    State(state): State<AppState>,
-    Extension(AuthUser(actor)): Extension<AuthUser>,
-    Path(org_id): Path<OrgId>,
-    Json(request): Json<CreateCredentialRequest>,
-) -> impl IntoResponse {
-    match can_manage_org_credentials(&state.pool, &actor, org_id).await {
-        Ok(true) => {}
-        Ok(false) => return forbidden_response(),
-        Err(error) => {
-            return credential_db_error(&error, || {
-                tracing::error!(%error, actor_id = %actor.id, %org_id, "credential authorization failed");
-            });
-        }
-    }
-
-    let id = Uuid::now_v7();
-    let (sealed, wrapped_key) =
-        match seal_credential(org_id, None, id, request.value, request.injection_rules).await {
-            Ok(sealed) => sealed,
-            Err(error) => return error.into_response(),
-        };
-
-    match sqlx::query_as::<_, CredentialMetadata>(sqlx::AssertSqlSafe(sql!(format!(
-        "INSERT INTO org_credentials (id, org_id, key, value, wrapped_key)
-         VALUES ($1, $2, $3, $4, $5)
-         RETURNING {METADATA_COLUMNS}"
-    ))))
-    .bind(id)
-    .bind(org_id)
-    .bind(&request.key)
-    .bind(&sealed)
-    .bind(&wrapped_key)
-    .fetch_one(state.credentials_pool.pool())
-    .await
-    {
-        Ok(credential) => (StatusCode::CREATED, Json(credential)).into_response(),
-        Err(error) => credential_write_error(&error),
-    }
-}
-
-pub async fn update_org_credential(
-    State(state): State<AppState>,
-    Extension(AuthUser(actor)): Extension<AuthUser>,
-    Path((org_id, id)): Path<(OrgId, Uuid)>,
-    Json(request): Json<UpdateCredentialRequest>,
-) -> impl IntoResponse {
-    match can_manage_org_credentials(&state.pool, &actor, org_id).await {
-        Ok(true) => {}
-        Ok(false) => return forbidden_response(),
-        Err(error) => {
-            return credential_db_error(&error, || {
-                tracing::error!(%error, actor_id = %actor.id, %org_id, "credential authorization failed");
-            });
-        }
-    }
-
-    let (sealed, wrapped_key) =
-        match seal_credential(org_id, None, id, request.value, request.injection_rules).await {
-            Ok(sealed) => sealed,
-            Err(error) => return error.into_response(),
-        };
-
-    match sqlx::query_as::<_, CredentialMetadata>(sqlx::AssertSqlSafe(sql!(format!(
-        "UPDATE org_credentials
-         SET value = $1, wrapped_key = $2, updated_at = NOW()
-         WHERE id = $3 AND org_id = $4
-         RETURNING {METADATA_COLUMNS}"
-    ))))
-    .bind(&sealed)
-    .bind(&wrapped_key)
-    .bind(id)
-    .bind(org_id)
-    .fetch_optional(state.credentials_pool.pool())
-    .await
-    {
-        Ok(Some(credential)) => Json(credential).into_response(),
-        Ok(None) => not_found_response(),
-        Err(error) => credential_write_error(&error),
-    }
-}
-
-pub async fn delete_org_credential(
-    State(state): State<AppState>,
-    Extension(AuthUser(actor)): Extension<AuthUser>,
-    Path((org_id, id)): Path<(OrgId, Uuid)>,
-) -> impl IntoResponse {
-    match can_manage_org_credentials(&state.pool, &actor, org_id).await {
-        Ok(true) => {}
-        Ok(false) => return forbidden_response(),
-        Err(error) => {
-            return credential_db_error(&error, || {
-                tracing::error!(%error, actor_id = %actor.id, %org_id, "credential authorization failed");
-            });
-        }
-    }
-
-    match sqlx::query(sql!(
-        "DELETE FROM org_credentials WHERE id = $1 AND org_id = $2"
-    ))
-    .bind(id)
-    .bind(org_id)
-    .execute(state.credentials_pool.pool())
-    .await
-    {
-        Ok(result) if result.rows_affected() == 0 => not_found_response(),
-        Ok(_) => StatusCode::NO_CONTENT.into_response(),
-        Err(error) => credential_db_error(&error, || {
-            tracing::error!(%error, %org_id, %id, "failed to delete org credential");
         }),
     }
 }

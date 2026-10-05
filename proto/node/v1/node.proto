@@ -833,8 +833,27 @@ message LoadSnapshotRequest {
   // `source_dir` is ignored.
   optional string snapshot_volume_mount_dir = 7;
   ExecutionFence execution_fence = 8;
+  // The sandbox's rootfs rate limit. A snapshot carries the drive limiter of
+  // the VM it was taken from, which can be a template or pool VM with other
+  // limits, so node-manager applies this after loading and before the VM
+  // resumes, and fails the load if it cannot. Unset keeps the snapshot's
+  // limiter, as for a builder VM, which has none.
+  optional DriveRateLimit rootfs_rate_limit = 9;
 }
 message LoadSnapshotResponse {}
+
+// A Firecracker drive rate limiter, as sandbox-manager computes it.
+message DriveRateLimit {
+  TokenBucket bandwidth = 1;
+  TokenBucket operations = 2;
+}
+
+// `size` tokens (bytes or operations), refilled from empty over
+// `refill_time_ms`.
+message TokenBucket {
+  uint64 size = 1;
+  uint64 refill_time_ms = 2;
+}
 
 message CreateBtrfsSnapshotRequest {
   string sandbox_id = 1;

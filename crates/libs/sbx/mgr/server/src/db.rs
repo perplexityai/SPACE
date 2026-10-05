@@ -1431,11 +1431,18 @@ pub struct StartupRecoveryRecord {
     pub outcome: StartupRecoveryOutcome,
 }
 
+/// Prepared statements kept per connection. Hot-path reads and writes use
+/// `prepare_cached`; rusqlite's default of 16 lets the statements of
+/// background loops evict them.
+const STATEMENT_CACHE_CAPACITY: usize = 128;
+
 pub fn open() -> Result<Connection, pplx_space_common_svc::sql::sqlite::SqliteError> {
-    pplx_space_common_svc::sql::sqlite::open_rusqlite(
+    let conn = pplx_space_common_svc::sql::sqlite::open_rusqlite(
         Path::new(DB_PATH),
         pplx_space_common_svc::sql::sqlite::RusqliteOpenOptions::default(),
-    )
+    )?;
+    conn.set_prepared_statement_cache_capacity(STATEMENT_CACHE_CAPACITY);
+    Ok(conn)
 }
 
 /// Count every durable sandbox-manager row by its bounded lifecycle. This stays
@@ -8700,7 +8707,10 @@ const GET_SANDBOX_SQL: &str =
          FROM sandboxes WHERE id = ?1";
 
 pub fn get_sandbox(conn: &Connection, id: &str) -> Result<Option<SandboxRow>> {
-    let mut stmt = conn.prepare(GET_SANDBOX_SQL)?;
+    // Every guest file operation and process start looks its sandbox up
+    // several times under the one database connection; parsing this wide
+    // SELECT each time dominated that work.
+    let mut stmt = conn.prepare_cached(GET_SANDBOX_SQL)?;
     let mut rows = stmt.query_map(params![id], row_to_sandbox)?;
     rows.next().transpose()
 }
@@ -10207,18 +10217,18 @@ pub fn update_auto_lifecycle_state(
 ) -> Result<()> {
     let state_json = serde_json::to_string(auto_lifecycle_state)
         .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
-    conn.execute(
+    conn.prepare_cached(
         "UPDATE sandboxes
          SET auto_lifecycle_state_json = ?1, next_auto_event_at = ?2, updated_at = ?3
          WHERE id = ?4
            AND (auto_lifecycle_state_json IS NOT ?1 OR next_auto_event_at IS NOT ?2)",
-        params![
-            state_json,
-            auto_lifecycle_state.next_auto_event_at.map(SqliteU64),
-            now()?,
-            id
-        ],
-    )?;
+    )?
+    .execute(params![
+        state_json,
+        auto_lifecycle_state.next_auto_event_at.map(SqliteU64),
+        now()?,
+        id
+    ])?;
     Ok(())
 }
 
@@ -10773,35 +10783,14 @@ pub fn update_network_counters(
 #[cfg(test)]
 pub(crate) fn create_test_schema(conn: &mut Connection) {
     use pplx_space_sbxmgr_migrations::{COMMON_SCHEMA_MIGRATOR, SANDBOX_MANAGER_MIGRATOR};
-    let public = pplx_space_common_svc::sql::baselines::is_public(&SANDBOX_MANAGER_MIGRATOR);
-    if public {
-        pplx_space_common_svc::sql::sqlite::migrate_common_schema_up(conn, &COMMON_SCHEMA_MIGRATOR)
-            .unwrap();
-    }
+    pplx_space_common_svc::sql::sqlite::migrate_common_schema_up(conn, &COMMON_SCHEMA_MIGRATOR)
+        .unwrap();
     for migration in SANDBOX_MANAGER_MIGRATOR
         .iter()
         .filter(|migration| migration.migration_type.is_up_migration())
     {
         conn.execute_batch(migration.sql.as_ref()).unwrap();
     }
-    if !public {
-        pplx_space_common_svc::sql::sqlite::migrate_common_schema_up(conn, &COMMON_SCHEMA_MIGRATOR)
-            .unwrap();
-    }
-}
-
-#[cfg(test)]
-fn historical_migration_sql(
-    migrator: &sqlx::migrate::Migrator,
-    version: i64,
-    kind: sqlx::migrate::MigrationType,
-) -> &str {
-    migrator
-        .iter()
-        .find(|migration| migration.version == version && migration.migration_type == kind)
-        .expect("historical migration must remain bundled until cutover")
-        .sql
-        .as_ref()
 }
 
 /// Byte image of a freshly migrated database, built once per nextest run of

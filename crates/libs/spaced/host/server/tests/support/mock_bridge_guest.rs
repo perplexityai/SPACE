@@ -193,7 +193,7 @@ impl Filesystem for MockBridgeGuest {
         let read_continue = self.read_continue.clone();
         let first = futures_util::stream::once(async {
             Ok(FileChunk {
-                data: b"bc".to_vec(),
+                data: b"bc".to_vec().into(),
             })
         });
         let last = futures_util::stream::once(async move {
@@ -201,7 +201,7 @@ impl Filesystem for MockBridgeGuest {
                 read_continue.notified().await;
             }
             Ok(FileChunk {
-                data: b"d".to_vec(),
+                data: b"d".to_vec().into(),
             })
         });
         Ok(Response::new(Box::pin(first.chain(last))))

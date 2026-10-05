@@ -664,9 +664,14 @@ impl WakeNetworkContext {
                         | Ok(crate::proto::SandboxSubstrateKind::Direct)
                 )
         });
+        // An identity-free activation is a direct one: Kubernetes launches
+        // always carry their pod's route identity. It keeps the manager-owned
+        // namespace, and route-identity resolution, not a missing namespace,
+        // decides whether it may proceed.
+        let identity_free = start.route_identity.is_none();
         match start.netns_path.as_deref().filter(|path| !path.is_empty()) {
             Some(path) => Self::RuntimePath(path.to_string()),
-            None if direct_route_identity => Self::Unspecified,
+            None if direct_route_identity || identity_free => Self::Unspecified,
             None => Self::MissingRuntimePath,
         }
     }

@@ -5,23 +5,52 @@ use crate::db::CleanupCompletion;
 use crate::service::suspend_snapshot_publication::LOCAL_SNAPSHOT_DIR;
 use pplx_space_common_core::types::ExecutionGeneration;
 
-#[test]
-fn firecracker_disk_rate_limiter_uses_effective_assignment() {
-    let rendered = firecracker_disk_rate_limiter(
-        false,
-        pplx_space_common_core::types::DiskIoLimits::try_new(5_000, 200).unwrap(),
+// A cold boot and a snapshot load give a sandbox the same rootfs limiter,
+// sized by its row's assignment, with both buckets holding the configured
+// burst; builders are exempt.
+#[tokio::test]
+async fn rootfs_rate_limiter_uses_the_assignment_and_configured_burst() {
+    let service = SandboxManagerService::new_with_config(
+        crate::db::test_conn(),
+        Default::default(),
+        crate::config::SandboxConfig {
+            disk_io_burst_secs: std::num::NonZeroU32::new(3),
+            ..Default::default()
+        },
+    );
+    let limits = pplx_space_common_core::types::DiskIoLimits::try_new(5_000, 200).unwrap();
+    let limiter = service
+        .rootfs_rate_limiter(false, limits)
+        .expect("sandbox is limited");
+
+    let rendered = firecracker_rate_limiter_field("rate_limiter", Some(&limiter));
+    let field: serde_json::Value =
+        serde_json::from_str(&format!("{{{}}}", rendered.trim_start_matches(','))).unwrap();
+    assert_eq!(
+        field["rate_limiter"],
+        serde_json::json!({
+            "bandwidth": { "size": 629_145_600, "refill_time": 3000 },
+            "ops": { "size": 15_000, "refill_time": 3000 }
+        })
+    );
+    let loaded = drive_rate_limit_proto(limiter);
+    assert_eq!(
+        loaded.operations,
+        Some(pplx_space_node_mgr_client::proto::TokenBucket {
+            size: 15_000,
+            refill_time_ms: 3_000,
+        })
+    );
+    assert_eq!(
+        loaded.bandwidth,
+        Some(pplx_space_node_mgr_client::proto::TokenBucket {
+            size: 629_145_600,
+            refill_time_ms: 3_000,
+        })
     );
 
-    assert!(rendered.contains(r#""size": 209715200"#));
-    assert!(rendered.contains(r#""size": 5000"#));
-}
-
-#[test]
-fn firecracker_disk_rate_limiter_preserves_builder_exemption() {
-    assert!(
-        firecracker_disk_rate_limiter(true, pplx_space_common_core::types::DiskIoLimits::default())
-            .is_empty()
-    );
+    assert_eq!(service.rootfs_rate_limiter(true, limits), None);
+    assert!(firecracker_rate_limiter_field("rate_limiter", None).is_empty());
 }
 use pplx_space_common_core::types::{
     NodeId, NodeManagedBy, RouteGeneration, SandboxActivationAttemptId,

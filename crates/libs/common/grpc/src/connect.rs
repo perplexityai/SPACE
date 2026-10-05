@@ -202,64 +202,126 @@ pub async fn connect_tcp_channel_with_retry(
     endpoint: tonic::transport::Endpoint,
     retry_policy: GrpcRetryPolicy,
 ) -> Result<tonic::transport::Channel, tonic::transport::Error> {
-    let target = target.as_ref();
+    retry_tcp_connect(service_name, target.as_ref(), retry_policy, || {
+        let endpoint = endpoint.clone();
+        async move { endpoint.connect().await }
+    })
+    .await
+}
+
+/// Run `attempt` until it succeeds or `retry_policy` is spent, with the span,
+/// retry metric and logs every TCP connect shares.
+async fn retry_tcp_connect<T, E, F, Fut>(
+    service_name: &'static str,
+    target: &str,
+    retry_policy: GrpcRetryPolicy,
+    mut attempt: F,
+) -> Result<T, E>
+where
+    E: std::fmt::Display,
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, E>>,
+{
     let started_at = tokio::time::Instant::now();
     let mut retry_index = 0;
-
     loop {
         let connect_span = connect_span(service_name, "Connect", "tcp", &target, retry_index);
-        match endpoint
-            .clone()
-            .connect()
-            .instrument(connect_span.clone())
-            .await
-        {
-            Ok(channel) => {
+        let error = match attempt().instrument(connect_span.clone()).await {
+            Ok(connected) => {
                 record_connect_ok(&connect_span);
-                return Ok(channel);
+                return Ok(connected);
             }
-            Err(error) => {
-                record_connect_error(&connect_span, &error);
-                let Some(delay) = retry_policy.backoff_delay(retry_index) else {
-                    log_tcp_connect_exhausted(
-                        service_name,
-                        target,
-                        started_at,
-                        retry_index + 1,
-                        &error,
-                    );
-                    return Err(error);
-                };
-                let elapsed = started_at.elapsed();
-                if elapsed >= retry_policy.max_elapsed
-                    || delay > retry_policy.max_elapsed.saturating_sub(elapsed)
-                {
-                    log_tcp_connect_exhausted(
-                        service_name,
-                        target,
-                        started_at,
-                        retry_index + 1,
-                        &error,
-                    );
-                    return Err(error);
-                }
-                retry_index += 1;
-                pplx_space_metrics::grpc::client_retry(
-                    service_name,
-                    "Connect",
-                    "connect",
-                    "connect_error",
-                );
-                pplx_space_observability::with_peer_service!(tracing::debug!(
-                    peer.service = service_name,
-                    target,
-                    retry = retry_index,
-                    retry_in = ?delay,
-                    "failed to connect to TCP gRPC service; will retry"
-                ));
-                tokio::time::sleep(delay).await;
-            }
-        }
+            Err(error) => error,
+        };
+        record_connect_error(&connect_span, &error);
+        let elapsed = started_at.elapsed();
+        let delay = retry_policy.backoff_delay(retry_index).filter(|delay| {
+            elapsed < retry_policy.max_elapsed
+                && *delay <= retry_policy.max_elapsed.saturating_sub(elapsed)
+        });
+        let Some(delay) = delay else {
+            log_tcp_connect_exhausted(service_name, target, started_at, retry_index + 1, &error);
+            return Err(error);
+        };
+        retry_index += 1;
+        pplx_space_metrics::grpc::client_retry(service_name, "Connect", "connect", "connect_error");
+        pplx_space_observability::with_peer_service!(tracing::debug!(
+            peer.service = service_name,
+            target,
+            retry = retry_index,
+            retry_in = ?delay,
+            "failed to connect to TCP gRPC service; will retry"
+        ));
+        tokio::time::sleep(delay).await;
+    }
+}
+
+/// Connect a TCP channel meant to be kept and shared. Like
+/// [`connect_tcp_channel_with_retry`] it retries the first dial, and the
+/// channel retries every later redial, after a connection drops, with the same
+/// policy, spans and metrics: a call that arrives while the peer restarts
+/// waits for it, as a call on a freshly dialed channel would. Each dial is
+/// bounded by `attempt_timeout`. Only the TCP dial is retried; TLS, when the
+/// endpoint configures it, is layered on top by the channel.
+pub async fn connect_tcp_channel_with_retrying_redials(
+    service_name: &'static str,
+    endpoint: tonic::transport::Endpoint,
+    attempt_timeout: std::time::Duration,
+    retry_policy: GrpcRetryPolicy,
+) -> Result<tonic::transport::Channel, tonic::transport::Error> {
+    // The connector bounds each dial; the endpoint's bound covers the retries.
+    let endpoint = endpoint.connect_timeout(retry_policy.max_elapsed + attempt_timeout);
+    let mut http = hyper_util::client::legacy::connect::HttpConnector::new();
+    http.enforce_http(false);
+    http.set_nodelay(true);
+    http.set_connect_timeout(Some(attempt_timeout));
+    endpoint
+        .connect_with_connector(RetryingTcpConnector {
+            http,
+            service_name,
+            retry_policy,
+        })
+        .await
+}
+
+#[derive(Clone)]
+struct RetryingTcpConnector {
+    http: hyper_util::client::legacy::connect::HttpConnector,
+    service_name: &'static str,
+    retry_policy: GrpcRetryPolicy,
+}
+
+impl tower::Service<http::Uri> for RetryingTcpConnector {
+    type Response =
+        <hyper_util::client::legacy::connect::HttpConnector as tower::Service<http::Uri>>::Response;
+    type Error =
+        <hyper_util::client::legacy::connect::HttpConnector as tower::Service<http::Uri>>::Error;
+    type Future = std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send>,
+    >;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        self.http.poll_ready(cx)
+    }
+
+    fn call(&mut self, uri: http::Uri) -> Self::Future {
+        let Self {
+            http,
+            service_name,
+            retry_policy,
+        } = self.clone();
+        Box::pin(async move {
+            let target = uri.to_string();
+            retry_tcp_connect(service_name, &target, retry_policy, || {
+                let mut http = http.clone();
+                let uri = uri.clone();
+                async move { tower::Service::call(&mut http, uri).await }
+            })
+            .await
+        })
     }
 }
 
@@ -317,7 +379,7 @@ fn log_tcp_connect_exhausted(
     target: &str,
     started_at: tokio::time::Instant,
     attempts: usize,
-    error: &tonic::transport::Error,
+    error: &dyn std::fmt::Display,
 ) {
     pplx_space_observability::with_peer_service!(tracing::warn!(
         peer.service = service_name,

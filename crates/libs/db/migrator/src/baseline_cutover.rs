@@ -2,6 +2,8 @@ use pplx_space_common_svc::sql;
 use pplx_space_common_svc::sql::baseline_cutover::{CutoverError, CutoverManifest, HistoryRow};
 use sqlx::{PgPool, migrate::Migrator};
 
+const POSTGRES_BASELINE_ADVISORY_LOCK: i64 = 0x5350_4143_455f_424c;
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error(transparent)]
@@ -28,7 +30,7 @@ pub async fn prepare(pool: &PgPool, migrator: &Migrator) -> Result<(), Error> {
     .execute(&mut *tx)
     .await?;
     sqlx::query(sql!("SELECT pg_advisory_xact_lock($1)"))
-        .bind(super::POSTGRES_BASELINE_ADVISORY_LOCK)
+        .bind(POSTGRES_BASELINE_ADVISORY_LOCK)
         .execute(&mut *tx)
         .await?;
     let exists: bool = sqlx::query_scalar(sql!(

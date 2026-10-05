@@ -545,7 +545,7 @@ async fn prepare_activation_admission(
             // flat multiplies the wall clock a queued create spends before
             // terminal failure by about 3x on average, 5x worst case, over the
             // 15 gaps a 16-attempt budget buys. Both figures shrink toward 1
-            // once the dispatcher's 1s tick is counted, since it is a constant
+            // once the dispatcher's tick is counted, since it is a constant
             // addend on either side. Erring long is the right direction for a
             // condition that may clear on its own, and it buys no execution
             // slot: releasing with a hint clears the claim, so the operation

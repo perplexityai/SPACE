@@ -199,7 +199,7 @@ pub(crate) const PHASE_TERMINATING: &str = "terminating";
 // No `'deleted'` phase: per the corrected drain design, terminate
 // success DELETEs the `nodes` row outright (no tombstone state).
 // The CHECK on `drain_phase` only allows `draining`/`drained`/
-// `terminating`/`NULL` — see `db/postgres/055_node_drain_lifecycle.up.sql`.
+// `terminating`/`NULL` — see `db/postgres/20261002070625_baseline.up.sql`.
 
 /// Lifecycle values that count as "still resident on the node" for the
 /// purposes of declaring a drain complete.

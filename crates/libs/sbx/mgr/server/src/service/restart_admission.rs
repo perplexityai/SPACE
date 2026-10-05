@@ -57,6 +57,36 @@ pub(super) async fn wait_for_activation_admission<T>(
     }
 }
 
+/// How a guest process start ended.
+#[derive(Debug)]
+pub(super) enum GuestStartOutcome<T> {
+    Opened(T),
+    Failed(tonic::Status),
+    /// The caller disconnected first; nothing failed in the guest.
+    CallerGone,
+}
+
+/// Abandon a guest process start whose caller has disconnected.
+///
+/// The guest accepts a start only at its idempotency `begin()`. A start
+/// dropped before then releases its reservation and never runs; one already
+/// begun keeps running and is recovered by the caller's same-key retry. So the
+/// start call itself is safe to abandon. Waking the sandbox before it is not,
+/// and stays owned.
+pub(super) async fn abandon_start_if_caller_cancelled<T>(
+    start: impl Future<Output = Result<T, tonic::Status>>,
+) -> GuestStartOutcome<T> {
+    let cancelled = CALLER_CANCELLED.try_with(Clone::clone).unwrap_or_default();
+    tokio::select! {
+        biased;
+        _ = cancelled.cancelled() => GuestStartOutcome::CallerGone,
+        result = start => match result {
+            Ok(opened) => GuestStartOutcome::Opened(opened),
+            Err(status) => GuestStartOutcome::Failed(status),
+        },
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RestartAdmission {
     ReadOnly,

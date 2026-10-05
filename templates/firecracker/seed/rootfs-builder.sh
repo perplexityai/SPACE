@@ -450,9 +450,27 @@ LimitNOFILE=4096
 # stale deadline and restart spaced-svc. Host-side watchdogs own guest health.
 WatchdogSec=0
 ExecStartPre=-/bin/mknod -m 666 /dev/vsock c 10 241
+# Transparent Huge Pages only where memory asks for them (madvise): khugepaged
+# then scans just those regions instead of wasting CPU across FC guests, and
+# spaced's upload buffers can be physically contiguous for large disk requests.
+# Neither faults (defrag) nor khugepaged may compact memory for them. Guests
+# boot with THP off (transparent_hugepage=never), so one from an older seed,
+# without this step, keeps it off whatever spaced it runs; and the minimal boot
+# target does not run systemd-tmpfiles-setup before spaced. So this turns THP
+# on together with both compaction settings, before spaced starts. A kernel
+# without THP has nothing to set; a control that exists but cannot be set fails
+# the start. Inline, so that guests assembled from this seed's units need no
+# helper. Set at boot, never from the seed build: its chroot shares the
+# builder kernel's /sys.
+ExecStartPre=/bin/sh -c 'test -d /sys/kernel/mm/transparent_hugepage || exit 0; echo madvise > /sys/kernel/mm/transparent_hugepage/enabled && echo never > /sys/kernel/mm/transparent_hugepage/defrag && echo 0 > /sys/kernel/mm/transparent_hugepage/khugepaged/defrag'
 ExecStart=/usr/local/bin/spaced-svc
 Restart=always
 RestartSec=2
+# The default KillMode (control-group) kills every process left in the unit's
+# cgroup on stop, workloads included. The stop deadline, shorter than the 90s
+# default, covers the daemon's 10s drain plus its 5s telemetry and 5s runtime
+# shutdown bounds.
+TimeoutStopSec=30
 StandardOutput=journal+console
 StandardError=journal+console
 
@@ -540,17 +558,6 @@ systemctl mask --force \
   ubuntu-advantage.service \
   update-notifier-download.service \
   2>/dev/null || true
-
-# Disable Transparent Huge Pages — khugepaged wastes CPU in FC guests
-echo never > /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null || true
-echo never > /sys/kernel/mm/transparent_hugepage/defrag 2>/dev/null || true
-# FC passes transparent_hugepage=never in boot_args. Keep the tmpfiles entry as
-# a fallback for manually booted/debug guests where tmpfiles is not masked.
-mkdir -p /etc/tmpfiles.d
-cat > /etc/tmpfiles.d/disable-thp.conf <<'THP'
-w /sys/kernel/mm/transparent_hugepage/enabled - - - - never
-w /sys/kernel/mm/transparent_hugepage/defrag - - - - never
-THP
 
 # Disable timers not needed in sandbox VMs
 systemctl disable \

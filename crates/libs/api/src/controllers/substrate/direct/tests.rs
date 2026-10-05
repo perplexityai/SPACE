@@ -477,6 +477,51 @@ fn suspended_direct_wake_carries_control_plane_route_identity() {
     assert_eq!(context.route_identity, Some(route_identity));
 }
 
+// Every node lifecycle state: only those a wake restores or starts reserve
+// an identity first, matching sandbox-manager's wake transitions.
+#[test]
+fn only_a_resident_that_restores_or_starts_reserves_an_identity_before_waking() {
+    use pplx_space_sbx_mgr_client::proto::{SandboxInfo, SandboxLifecycleState as State};
+    let resident = |lifecycle: Option<i32>| SandboxInfo {
+        lifecycle,
+        ..SandboxInfo::default()
+    };
+    let mut seen = 0;
+    for value in 0..=i32::from(u8::MAX) {
+        let Ok(state) = State::try_from(value) else {
+            assert!(!resident_is_dormant(&resident(Some(value))), "{value}");
+            continue;
+        };
+        seen += 1;
+        let dormant = match state {
+            State::Suspended | State::Stopped | State::Created => true,
+            State::Unspecified
+            | State::Creating
+            | State::Starting
+            | State::Started
+            | State::Stopping
+            | State::Deleting
+            | State::Pausing
+            | State::Paused
+            | State::Resuming
+            | State::Checkpointing
+            | State::Suspending
+            | State::Restoring
+            | State::CleanupRequired
+            | State::CleanupFailed
+            | State::Quarantined
+            | State::Failed => false,
+        };
+        assert_eq!(
+            resident_is_dormant(&resident(Some(value))),
+            dormant,
+            "{state:?}"
+        );
+    }
+    assert_eq!(seen, 19, "every lifecycle state is covered");
+    assert!(!resident_is_dormant(&resident(None)));
+}
+
 #[test]
 fn wake_uses_restore_only_when_the_local_sandbox_row_is_missing() {
     assert!(wake_requires_restore(&tonic::Status::not_found(

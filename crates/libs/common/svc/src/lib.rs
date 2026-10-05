@@ -21,6 +21,7 @@ pub mod dependency_drain;
 pub mod disk_admission;
 pub mod ecw_credential;
 pub mod federated_identity;
+pub mod http_listener;
 #[cfg(feature = "k8s")]
 pub mod kube_client;
 pub mod lifecycle;

@@ -624,17 +624,10 @@ pub async fn run(
 
     // Reject incompatible ownership before any host limit can shrink beneath
     // live sandboxes. Pool construction repeats this check before row repair.
-    let store = pplx_space_common_svc::sql::baselines::NODE_MANAGER;
     let db_path = Path::new(pplx_space_common_svc::core::host::linux::paths::NODE_MANAGER_DB);
-    pplx_space_common_svc::sql::sqlite::migrate(
-        "node-manager",
-        db_path,
-        &NODE_MANAGER_MIGRATOR,
-        Some(store.baseline_version),
-        store.migration_failure_policy,
-    )
-    .await
-    .map_err(RunNodeMgrError::Migrate)?;
+    pplx_space_common_svc::sql::sqlite::migrate("node-manager", db_path, &NODE_MANAGER_MIGRATOR)
+        .await
+        .map_err(RunNodeMgrError::Migrate)?;
     crate::slot_pool::NetworkPool::validate_startup(&pool_config, db_path)
         .map_err(RunNodeMgrError::ValidateStartup)?;
 

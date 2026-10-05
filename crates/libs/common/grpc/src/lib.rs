@@ -26,6 +26,10 @@
 //!   [`connect_uds_channel_with_retry`] when the caller only wants to buffer
 //!   initial channel establishment and will not also retry the same RPC.
 
+/// HTTP/2 frame size SPACE peers advertise, so a 64 KiB file chunk travels as
+/// one DATA frame instead of five.
+pub const BULK_HTTP2_MAX_FRAME_SIZE: u32 = 256 * 1024;
+
 mod active_requests;
 mod client;
 mod connect;
@@ -38,6 +42,7 @@ mod preface;
 pub use preface::PrefaceDeadline;
 #[cfg(feature = "internal-tls")]
 pub mod internal_transport;
+mod queued_slots;
 mod request_admission;
 mod request_body;
 mod retry;
@@ -52,9 +57,9 @@ mod trace;
 
 pub use client::GrpcClient;
 pub use connect::{
-    UdsConnectError, connect_tcp_channel_with_retry, connect_uds_channel, connect_uds_channel_lazy,
-    connect_uds_channel_with_endpoint, connect_uds_channel_with_endpoint_with_retry,
-    connect_uds_channel_with_retry,
+    UdsConnectError, connect_tcp_channel_with_retry, connect_tcp_channel_with_retrying_redials,
+    connect_uds_channel, connect_uds_channel_lazy, connect_uds_channel_with_endpoint,
+    connect_uds_channel_with_endpoint_with_retry, connect_uds_channel_with_retry,
 };
 pub use context::GrpcRetryContext;
 pub use idempotency::generated_idempotency_key;
@@ -62,6 +67,7 @@ pub use policy::{
     DEFAULT_GRPC_CONNECT_RETRY_POLICY, DEFAULT_LOCAL_GRPC_RETRY_POLICY,
     DEFAULT_TCP_GRPC_CONNECT_RETRY_POLICY, GrpcRetryPolicy,
 };
+pub use queued_slots::{QueuedSlotWait, QueuedSlots, SlotRequest};
 pub use request_admission::{RequestAdmission, RequestPermit};
 pub use request_body::PreserveInputErrors;
 pub use retry::{

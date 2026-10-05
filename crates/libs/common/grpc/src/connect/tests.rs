@@ -108,3 +108,64 @@ async fn lazy_uds_channel_reconnects_after_socket_replacement() {
         .expect("stop successor health service");
     successor_task.await.expect("join successor");
 }
+
+async fn serve_tcp_health(
+    listener: tokio::net::TcpListener,
+) -> (oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
+    let (reporter, service) = tonic_health::server::health_reporter();
+    reporter
+        .set_service_status("", tonic_health::ServingStatus::Serving)
+        .await;
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let task = tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(service)
+            .serve_with_incoming_shutdown(
+                tokio_stream::wrappers::TcpListenerStream::new(listener),
+                async move {
+                    let _ = shutdown_rx.await;
+                },
+            )
+            .await
+            .expect("serve test health service");
+    });
+    (shutdown_tx, task)
+}
+
+// A kept channel whose peer restarts waits for it on the next call: the redial
+// retries until the peer listens again, instead of failing the call.
+#[tokio::test]
+async fn a_kept_tcp_channel_waits_for_its_peer_to_come_back() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (stop, server) = serve_tcp_health(listener).await;
+    let endpoint = tonic::transport::Endpoint::from_shared(format!("http://{address}")).unwrap();
+    let channel = super::connect_tcp_channel_with_retrying_redials(
+        "test-backend",
+        endpoint,
+        Duration::from_secs(1),
+        crate::DEFAULT_TCP_GRPC_CONNECT_RETRY_POLICY,
+    )
+    .await
+    .expect("first dial");
+    let mut client = HealthClient::new(channel);
+    client.check(health_request()).await.expect("served");
+
+    stop.send(()).unwrap();
+    server.await.unwrap();
+    let mut waiting = client.clone();
+    let call = tokio::spawn(async move {
+        let mut request = health_request();
+        request.set_timeout(Duration::from_secs(10));
+        waiting.check(request).await
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!call.is_finished(), "the call waits while the peer is down");
+    let listener = tokio::net::TcpListener::bind(address).await.unwrap();
+    let (stop, server) = serve_tcp_health(listener).await;
+    call.await
+        .unwrap()
+        .expect("the redial reaches the restarted peer");
+    stop.send(()).unwrap();
+    server.await.unwrap();
+}

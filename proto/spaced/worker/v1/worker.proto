@@ -10,6 +10,10 @@ service WorkerFilesystem {
   rpc Stat(space.spaced.operations.v1.StatRequest) returns (space.spaced.operations.v1.StatResponse);
   rpc List(space.spaced.operations.v1.ListRequest) returns (stream space.spaced.operations.v1.FileInfo);
   rpc Read(space.spaced.operations.v1.ReadRequest) returns (stream space.spaced.operations.v1.FileChunk);
+  // Opens the file as this worker's user and answers with its descriptor
+  // number, kept open until the caller ends the stream, so a privileged
+  // caller can duplicate it (pidfd_getfd) and read the file itself.
+  rpc OpenRead(space.spaced.operations.v1.ReadRequest) returns (stream OpenedFile);
   rpc Write(stream WriteFrame) returns (MutationResult);
   rpc WriteBatch(BatchCommand) returns (MutationResult);
   rpc Mkdir(space.spaced.operations.v1.MkdirRequest) returns (space.spaced.operations.v1.MkdirResponse);
@@ -27,6 +31,9 @@ service WorkerFilesystem {
 
 message ReadyRequest {}
 message ReadyResponse { uint32 protocol_version = 1; }
+// A descriptor number in the worker process, valid while the OpenRead stream
+// that carried it stays open.
+message OpenedFile { int32 fd = 1; }
 message WriteFrame {
   oneof frame {
     WriteStart open = 1;
@@ -67,4 +74,6 @@ message MutationResult {
 message OperationFailure {
   int32 code = 1;
   string message = 2;
+  // The status's `space-error-reason` metadata, if it had one. Empty if not.
+  string reason = 3;
 }

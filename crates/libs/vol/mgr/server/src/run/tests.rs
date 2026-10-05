@@ -613,61 +613,6 @@ async fn embedded_migrations_converge_volume_manager_service_and_common_schema()
     assert_eq!(applied, 1);
 }
 
-#[tokio::test]
-async fn embedded_migrations_converge_legacy_volume_manager_lease_columns() {
-    if pplx_space_common_svc::sql::baselines::is_public(&super::VOLUME_MANAGER_MIGRATOR) {
-        return;
-    }
-    let dir = tempfile::tempdir().expect("tempdir");
-    let db_path = dir.path().join("volume-manager.db");
-    let conn = rusqlite::Connection::open(&db_path).expect("open legacy database");
-    conn.execute_batch(historical_migration_sql(
-        &super::VOLUME_MANAGER_MIGRATOR,
-        1,
-        sqlx::migrate::MigrationType::ReversibleUp,
-    ))
-    .expect("apply initial service migration");
-    pplx_space_volmgr_migrations::stamp_sqlite_migration(&conn, &super::VOLUME_MANAGER_MIGRATOR, 1)
-        .expect("stamp initial service migration");
-    conn.execute_batch(historical_migration_sql(
-        &super::VOLUME_MANAGER_MIGRATOR,
-        2,
-        sqlx::migrate::MigrationType::ReversibleUp,
-    ))
-    .expect("apply legacy traceparent column without migration history");
-    conn.execute_batch(historical_migration_sql(
-        &super::VOLUME_MANAGER_MIGRATOR,
-        3,
-        sqlx::migrate::MigrationType::ReversibleUp,
-    ))
-    .expect("apply legacy lease columns without migration history");
-    drop(conn);
-
-    super::migrate_volume_manager_db(&db_path)
-        .await
-        .expect("converge legacy volume-manager lease columns");
-
-    let conn = rusqlite::Connection::open(&db_path).expect("open converged database");
-    for version in [2, 3] {
-        let applied: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM _sqlx_migrations WHERE version = ?1 AND success = TRUE",
-                [version],
-                |row| row.get(0),
-            )
-            .expect("inspect service migration history");
-        assert_eq!(applied, 1, "service migration {version} must be stamped");
-    }
-    let common_lease_migration: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM _space_common_schema_migrations WHERE version = 2 AND success = TRUE",
-                [],
-                |row| row.get(0),
-            )
-            .expect("inspect common migration history");
-    assert_eq!(common_lease_migration, 1);
-}
-
 #[test]
 fn static_credentials_present_with_session_token() {
     let creds = build_static_credentials(
@@ -742,17 +687,4 @@ fn rejects_duplicate_pull_priority_band_minimums() {
         error.to_string(),
         "duplicate pull priority band minimum 100"
     );
-}
-
-fn historical_migration_sql(
-    migrator: &sqlx::migrate::Migrator,
-    version: i64,
-    kind: sqlx::migrate::MigrationType,
-) -> &str {
-    migrator
-        .iter()
-        .find(|migration| migration.version == version && migration.migration_type == kind)
-        .expect("historical migration must remain bundled until cutover")
-        .sql
-        .as_ref()
 }

@@ -852,10 +852,22 @@ pub(super) async fn connect_sandbox_inner(
     let mut refreshed_response = None;
     if connect_should_touch && !touched_by_wake {
         let mut retries_remaining = CONNECT_UNREACHABLE_TOUCH_RETRY_ATTEMPTS;
+        // The rows a retry re-read, which the next touch and the response use.
+        let mut retried: Option<(Sandbox, SandboxResponse)> = None;
         loop {
-            let touch_outcome =
-                deliver_keepalive_touch(&state, &sandbox, &native, observed_at, "connect").await?;
+            let (touch_sandbox, touch_native) = retried
+                .as_ref()
+                .map_or((&sandbox, &native), |(sandbox, native)| (sandbox, native));
+            let touch_outcome = deliver_keepalive_touch(
+                &state,
+                touch_sandbox,
+                touch_native,
+                observed_at,
+                "connect",
+            )
+            .await?;
             if touch_outcome == LiveKeepaliveTouchOutcome::Delivered {
+                refreshed_response = retried;
                 break;
             }
             let sandbox = fetch_scoped_sandbox(&state, &scope, &sandbox_id).await?;
@@ -911,6 +923,7 @@ pub(super) async fn connect_sandbox_inner(
                     break;
                 }
                 ConnectTouchRecovery::Retry => {
+                    retried = Some((sandbox, native));
                     retries_remaining -= 1;
                     tokio::time::sleep(CONNECT_UNREACHABLE_TOUCH_RETRY_DELAY).await;
                 }
@@ -920,6 +933,10 @@ pub(super) async fn connect_sandbox_inner(
 
     let (sandbox, native) = match refreshed_response {
         Some(refreshed) => refreshed,
+        // Only a wake changes the rows last read; a delivered keepalive touch
+        // updates the runtime alone. Reconnects to running sandboxes are the
+        // common case, so skip reading the same rows again.
+        None if !wake_attempted => (sandbox, native),
         None => {
             let sandbox = fetch_scoped_sandbox(&state, &scope, &sandbox_id).await?;
             let native = match state

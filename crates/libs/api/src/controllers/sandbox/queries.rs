@@ -133,6 +133,11 @@ struct PooledCreateInput<'a> {
     env: &'a BTreeMap<String, String>,
     metric_identity: SandboxApiMetricIdentity,
     planned_sandbox_id: SandboxId,
+    /// The caller already published `planned_sandbox_id` (for example in an
+    /// accepted create operation), so the sandbox must be created under exactly
+    /// that ID. A warm-pool slot carries its own pre-reserved ID, so a pinned
+    /// create cannot adopt one.
+    sandbox_id_pinned: bool,
     create_owner: &'a SandboxCreateOwner,
     auto_lifecycle: &'a AutoLifecyclePolicy,
     backend: &'a str,
@@ -525,6 +530,90 @@ struct KubernetesPoolAssignment {
     disk_io_limits: DiskIoLimits,
 }
 
+struct ColdCreateShapeInput<'a> {
+    managed_by: &'static str,
+    runtime: RuntimeKind,
+    boot_mode: CreateBootMode,
+    template: &'a TemplateName,
+    content_hash: &'a str,
+    template_release_id: Uuid,
+    requested: SandboxResources,
+    /// A fork restores the source snapshot, whose shape is fixed.
+    restoring: bool,
+}
+
+/// Resources for a create that did not adopt a warm-pool sandbox.
+///
+/// A Kubernetes fallthrough create takes a configured pool's shape. Otherwise
+/// a Kubernetes create fills the vCPU and memory the request left unset from
+/// the template's build shape: the node shim boots a pod without those
+/// annotations at fixed defaults (2 vCPU, 1024 MiB), whatever the template
+/// was built for. The filled values do not make the request a custom shape;
+/// the boot mode was already chosen from the request alone. Forks and direct
+/// creates are unchanged: a snapshot fixes their shape on the node, and a
+/// direct cold boot already falls back to the template's metadata.
+async fn resolve_cold_create_resources(
+    pool: &PgPool,
+    input: ColdCreateShapeInput<'_>,
+) -> Result<(SandboxResources, DiskIoLimits), ControllerError> {
+    let ColdCreateShapeInput {
+        managed_by,
+        runtime,
+        boot_mode,
+        template,
+        content_hash,
+        template_release_id,
+        requested,
+        restoring,
+    } = input;
+    if managed_by != "k8s" || runtime != RuntimeKind::Firecracker {
+        return Ok((requested, DiskIoLimits::default()));
+    }
+    if boot_mode == CreateBootMode::Fallthrough
+        && let Some(pool_assignment) = resolve_kubernetes_pool_configured_resources(
+            pool,
+            template.as_str(),
+            template_release_id,
+        )
+        .await?
+    {
+        tracing::debug!(
+            template = %template,
+            content_hash,
+            template_release_id = %template_release_id,
+            vcpu = ?pool_assignment.resources.vcpu,
+            memory_mib = ?pool_assignment.resources.memory_mib,
+            "using Kubernetes pool resources for cold fallthrough create"
+        );
+        return Ok((pool_assignment.resources, pool_assignment.disk_io_limits));
+    }
+    if restoring || (requested.vcpu.is_some() && requested.memory_mib.is_some()) {
+        return Ok((requested, DiskIoLimits::default()));
+    }
+    let shape =
+        crate::template_inventory_store::release_build_shape(pool, template, content_hash, runtime)
+            .await
+            .map_err(|err| db_contention_error("failed to load template build shape", &err))?;
+    let Some(shape) = shape else {
+        return Ok((requested, DiskIoLimits::default()));
+    };
+    let resources = SandboxResources {
+        vcpu: requested.vcpu.or(Some(shape.vcpu.get().get())),
+        memory_mib: requested
+            .memory_mib
+            .or(u32::try_from(shape.memory.as_mib_floor()).ok()),
+        disk_mib: requested.disk_mib,
+    };
+    tracing::debug!(
+        template = %template,
+        content_hash,
+        vcpu = ?resources.vcpu,
+        memory_mib = ?resources.memory_mib,
+        "using the template's build shape for unset create resources"
+    );
+    Ok((resources, DiskIoLimits::default()))
+}
+
 fn validate_inherited_pool_disk(disk_mib: Option<u32>) -> Result<(), ControllerError> {
     if let Some(disk_mib) = disk_mib {
         pplx_space_common_core::sandbox_storage::validate_rootfs_mib(disk_mib).map_err(|error| {
@@ -699,6 +788,8 @@ fn pool_slot_claimed_event_details(
 
 struct SandboxCreateExecutionMode<'a> {
     sandbox_id: SandboxId,
+    /// `sandbox_id` is visible to the caller and must be the created ID.
+    sandbox_id_pinned: bool,
     federated: FederatedSandboxCreateContext<'a>,
     restore_from: Option<crate::controllers::substrate::SnapshotRef<'a>>,
     restore_operation_id: Option<OperationId>,
@@ -782,6 +873,7 @@ impl SandboxController {
             metric_identity,
             SandboxCreateExecutionMode {
                 sandbox_id: SandboxId::new(),
+                sandbox_id_pinned: false,
                 federated,
                 restore_from: None,
                 restore_operation_id: None,
@@ -807,6 +899,7 @@ impl SandboxController {
             metric_identity,
             SandboxCreateExecutionMode {
                 sandbox_id,
+                sandbox_id_pinned: true,
                 federated,
                 restore_from: None,
                 restore_operation_id: None,
@@ -831,6 +924,7 @@ impl SandboxController {
             metric_identity,
             SandboxCreateExecutionMode {
                 sandbox_id: restore.sandbox_id,
+                sandbox_id_pinned: true,
                 federated: restore.federated,
                 restore_from: Some(restore.snapshot),
                 restore_operation_id: Some(restore.operation_id),
@@ -854,6 +948,7 @@ impl SandboxController {
         }
         let SandboxCreateExecutionMode {
             sandbox_id,
+            sandbox_id_pinned,
             federated,
             restore_from,
             restore_operation_id,
@@ -986,6 +1081,7 @@ impl SandboxController {
                         env: &env,
                         metric_identity,
                         planned_sandbox_id: sandbox_id,
+                        sandbox_id_pinned,
                         create_owner: &create_owner,
                         auto_lifecycle: &auto_lifecycle,
                         backend: &backend,
@@ -1016,31 +1112,20 @@ impl SandboxController {
                 "boot_mode=pool requested but no warm-pool sandbox is available",
             ));
         }
-        let (resources, disk_io_limits) =
-            match (self.substrate.managed_by(), backend.as_str(), boot_mode) {
-                ("k8s", "fc", CreateBootMode::Fallthrough) => {
-                    if let Some(pool_assignment) = resolve_kubernetes_pool_configured_resources(
-                        pool,
-                        template,
-                        resolved_template_release_id,
-                    )
-                    .await?
-                    {
-                        tracing::debug!(
-                            template,
-                            content_hash = %resolved_content_hash,
-                            template_release_id = %resolved_template_release_id,
-                            vcpu = ?pool_assignment.resources.vcpu,
-                            memory_mib = ?pool_assignment.resources.memory_mib,
-                            "using Kubernetes pool resources for cold fallthrough create"
-                        );
-                        (pool_assignment.resources, pool_assignment.disk_io_limits)
-                    } else {
-                        (requested_resources, DiskIoLimits::default())
-                    }
-                }
-                _ => (requested_resources, DiskIoLimits::default()),
-            };
+        let (resources, disk_io_limits) = resolve_cold_create_resources(
+            pool,
+            ColdCreateShapeInput {
+                managed_by: self.substrate.managed_by(),
+                runtime,
+                boot_mode,
+                template: &template_name,
+                content_hash: &resolved_content_hash,
+                template_release_id: resolved_template_release_id,
+                requested: requested_resources,
+                restoring: restore_from.is_some(),
+            },
+        )
+        .await?;
 
         self.admit_cluster_activation(crate::cluster_admission::ClusterActivationClass::Cold)
             .await?;
@@ -1528,6 +1613,20 @@ impl SandboxController {
                 org_id = %input.create_owner.org_id,
                 template = input.template,
                 "BYOK create: bypassing warm pool, cold-creating an encrypted sandbox"
+            );
+            return Ok(PoolCreateResult::cold(PoolCreateObservation::cold_direct()));
+        }
+
+        // A warm-pool slot is booted under its own pre-reserved sandbox ID
+        // (pod name, pod metadata, and guest runtime all carry it), and
+        // adoption returns that ID. When the caller has already published the
+        // planned ID, adopting a slot would create the sandbox under a
+        // different ID than the one the caller tracks. Cold-create instead.
+        if input.sandbox_id_pinned {
+            tracing::debug!(
+                sandbox_id = %input.planned_sandbox_id,
+                template = input.template,
+                "pinned sandbox ID: bypassing warm pool, cold-creating"
             );
             return Ok(PoolCreateResult::cold(PoolCreateObservation::cold_direct()));
         }

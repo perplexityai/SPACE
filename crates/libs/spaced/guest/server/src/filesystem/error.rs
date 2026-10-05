@@ -8,7 +8,16 @@ pub(crate) fn map_io_error(error: std::io::Error) -> Status {
             libc::EACCES | libc::EPERM | libc::EROFS => {
                 return Status::permission_denied(error.to_string());
             }
-            libc::ENOSPC => return Status::resource_exhausted(error.to_string()),
+            libc::ENOSPC | libc::EDQUOT => {
+                let mut status = Status::resource_exhausted(error.to_string());
+                status.metadata_mut().insert(
+                    pplx_space_common_core::spaced::ERROR_REASON_METADATA_KEY,
+                    tonic::metadata::MetadataValue::from_static(
+                        pplx_space_common_core::spaced::GUEST_STORAGE_FULL,
+                    ),
+                );
+                return status;
+            }
             libc::EISDIR | libc::ENOTDIR | libc::EXDEV | libc::ELOOP => {
                 return Status::failed_precondition(error.to_string());
             }

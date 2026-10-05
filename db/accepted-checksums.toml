@@ -8,7 +8,5 @@
 # https://github.com/transact-rs/sqlx/issues/3909
 # This adapter accepts reviewed equivalents without rewriting stored history.
 # Retain accepted digests while their migration versions remain bundled.
-# Baseline cutovers validate retired versions using the archived catalog and
-# checksum registry from the prerequisite revision specified in db/BASELINE.md.
 
 migrations = []

@@ -1,7 +1,9 @@
 use super::*;
 use crate::filesystem::map_io_error;
 use crate::guest_path;
-use crate::idempotency::{IdempotencyLookup, IdempotencyRecord, require_idempotency_key};
+use crate::idempotency::{
+    IdempotencyLookup, IdempotencyOperation, IdempotencyRecord, require_idempotency_key,
+};
 use crate::identity::GuestAccount;
 use dashmap::DashMap;
 use pplx_space_common_core::types::{GuestUserName, Pii, ProcessCommand, ProcessId, ProcessSignal};
@@ -37,6 +39,364 @@ const PROCESS_OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 const PROCESS_OUTPUT_LAGGED_MESSAGE: &str =
     "process output stream fell behind retained output buffer";
 const PROCESS_CAPACITY_MESSAGE: &str = "too many retained processes";
+// A start phase slower than this is logged with every phase's duration once
+// the spawn returns, so a slow start names its cause. The account lookup
+// includes its wait for a blocking-pool thread.
+const SLOW_START_PHASE: Duration = Duration::from_secs(1);
+
+#[cfg(target_os = "linux")]
+type ExitObserver = ProcessExitObserver;
+#[cfg(not(target_os = "linux"))]
+type ExitObserver = ();
+
+/// A published process, owned by the start's tracked task until its exit is
+/// recorded and its record's retention ends.
+struct ProcessSupervision {
+    child: tokio::process::Child,
+    exit_observer: ExitObserver,
+    output_tasks: VecDeque<tokio::task::JoinHandle<()>>,
+    timeout: Option<pplx_space_common_core::types::ReadyTimeout>,
+    shutdown: tokio_util::sync::CancellationToken,
+    record: Arc<ProcessRecord>,
+    process_id: ProcessId,
+    pid: u32,
+    registry: ProcessRegistry,
+}
+
+impl ProcessSupervision {
+    async fn run(self) {
+        let ProcessSupervision {
+            mut child,
+            exit_observer,
+            mut output_tasks,
+            timeout,
+            shutdown,
+            record,
+            process_id,
+            pid,
+            registry,
+        } = self;
+        let completion = async {
+            #[cfg(target_os = "linux")]
+            match exit_observer.exited().await {
+                // Preserve the leader's identity until descendants have
+                // released its output, but stop its execution deadline now.
+                Ok(()) => return Ok(None),
+                Err(error) => {
+                    tracing::warn!(%error, pid, "pidfd observation failed; falling back to child wait")
+                }
+            }
+            child.wait().await.map(Some)
+        };
+        let deadline = async {
+            match timeout {
+                Some(timeout) => tokio::time::sleep(timeout.as_duration()).await,
+                None => std::future::pending::<()>().await,
+            }
+        };
+        let waited = tokio::select! {
+            biased;
+            status = completion => Ok(status),
+            _ = shutdown.cancelled() => Err(ProcessExitOutcome::Signaled(libc::SIGKILL)),
+            _ = deadline => Err(ProcessExitOutcome::TimedOut(libc::SIGKILL)),
+        };
+        let outcome = match waited {
+            Ok(Ok(None)) => {
+                let drained = tokio::select! {
+                    drained = drain_process_output_tasks(
+                        &mut output_tasks, &process_id, pid, false,
+                    ) => drained,
+                    _ = shutdown.cancelled() => false,
+                };
+                if !drained && let Err(error) = record.signal_handle.terminate_group() {
+                    tracing::warn!(%error, pid, "failed to terminate descendants holding output open");
+                }
+                process_status_outcome(child.wait().await.ok())
+            }
+            Ok(status) => process_status_outcome(status.ok().flatten()),
+            Err(outcome) => {
+                if let Err(error) = record.signal_handle.terminate_group() {
+                    tracing::warn!(%error, pid, "failed to terminate process group");
+                }
+                if let Err(error) = child.wait().await {
+                    tracing::warn!(%error, pid, "failed to reap terminated child");
+                }
+                outcome
+            }
+        };
+
+        if !output_tasks.is_empty() {
+            drain_process_output_tasks(&mut output_tasks, &process_id, pid, true).await;
+        }
+        let exit = process_exit_event(&process_id, Some(pid), outcome);
+        record.journal.complete(exit);
+        // Release supervisor ownership. Eviction can free this record's
+        // permit once any in-flight stdin/control handlers also release it.
+        drop(record);
+        // The reaped child and its exit-observer pidfd are no longer needed.
+        // Holding them through the retention wait below kept a descriptor
+        // per start for that whole window, exhausting the daemon's limit at
+        // sustained start rates.
+        drop(child);
+        #[cfg(target_os = "linux")]
+        drop(exit_observer);
+        #[cfg(not(target_os = "linux"))]
+        let () = exit_observer;
+        tokio::select! {
+            _ = shutdown.cancelled() => {},
+            _ = tokio::time::sleep(IDEMPOTENCY_RECORD_TTL) => {},
+        }
+        registry.remove_if_expired(&process_id);
+    }
+}
+
+/// An admitted start from `begin` until its process is published. The start's
+/// tracked owner task runs it, so it completes even if the request goes away.
+struct ProcessLaunch {
+    command: Command,
+    prepared_pty: Option<PreparedPty>,
+    stdin_enabled: bool,
+    /// What `list` reports; the pid is filled in once the child exists.
+    info: ProcessInfo,
+    timeout: Option<pplx_space_common_core::types::ReadyTimeout>,
+    process_id: ProcessId,
+    spawn_thread: SpawnThread,
+    claim: ProcessIdClaim,
+    process_reservation: ProcessRecordReservation,
+    /// Held until the child is published.
+    start_admission: ProcessStartAdmission,
+    account_lookup: Duration,
+    inner: Arc<crate::SpacedGuestServiceInner>,
+}
+
+type SpawnOutcome = (io::Result<tokio::process::Child>, Option<PreparedPty>);
+
+#[cfg(test)]
+thread_local! {
+    /// Refuses the spawn threads of starts made on this thread, as a guest
+    /// out of threads would.
+    static REFUSE_SPAWN_THREADS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// A thread of its own for one start's `spawn`. `spawn` blocks until the
+/// child execs, which can take seconds under memory or I/O pressure, so it
+/// stays off the runtime threads that serve every other request. Not on the
+/// blocking pool: a pool task is queued before its thread exists, and when
+/// none can be created `spawn_blocking` panics with the spawn still queued,
+/// to run later for a start that has already failed. The thread is created
+/// before its start begins, so a guest that cannot create one refuses the
+/// start with its key still free for a retry. Dropped before
+/// [`SpawnThread::spawn`], the thread ends without spawning anything. Start
+/// admission bounds these threads to the concurrent starts.
+struct SpawnThread {
+    handoff: tokio::sync::oneshot::Sender<(Command, Option<PreparedPty>)>,
+    outcome: tokio::sync::oneshot::Receiver<SpawnOutcome>,
+}
+
+impl SpawnThread {
+    fn start() -> io::Result<Self> {
+        #[cfg(test)]
+        if REFUSE_SPAWN_THREADS.get() {
+            return Err(io::Error::from_raw_os_error(libc::EAGAIN));
+        }
+        let runtime = tokio::runtime::Handle::current();
+        let (handoff, handoff_rx) = tokio::sync::oneshot::channel();
+        let (outcome_tx, outcome) = tokio::sync::oneshot::channel::<SpawnOutcome>();
+        std::thread::Builder::new()
+            .name("spaced-process-spawn".to_string())
+            .spawn(move || {
+                let Ok((mut command, prepared_pty)) = handoff_rx.blocking_recv() else {
+                    // The start ended before handing over its command.
+                    return;
+                };
+                // Tokio's child handling registers with the runtime.
+                let _runtime = runtime.enter();
+                let child = spawn_child(&mut command);
+                // The PTY slave stays open until `spawn` returns.
+                if let Err((Ok(mut child), _pty)) = outcome_tx.send((child, prepared_pty)) {
+                    // Its start is gone (the runtime is shutting down), so no
+                    // one will supervise the child: stop it.
+                    if let Err(error) = child.start_kill() {
+                        tracing::warn!(%error, "failed to stop an unsupervised spawned child");
+                    }
+                }
+            })?;
+        Ok(Self { handoff, outcome })
+    }
+
+    /// Spawn `command` on the thread. An error once the command is handed
+    /// over leaves unknown whether it ran.
+    async fn spawn(
+        self,
+        command: Command,
+        prepared_pty: Option<PreparedPty>,
+    ) -> Result<SpawnOutcome, Status> {
+        self.handoff
+            .send((command, prepared_pty))
+            .map_err(|_| Status::internal("process spawn thread ended before its command"))?;
+        self.outcome.await.map_err(|_| {
+            Status::internal(
+                "process spawn thread ended without a result; whether the command started is unknown",
+            )
+        })
+    }
+}
+
+/// A published process: what its start answers with, and its supervision.
+struct LaunchedProcess {
+    pid: u32,
+    started: ProcessEvent,
+    record: Arc<ProcessRecord>,
+    supervision: ProcessSupervision,
+}
+
+impl ProcessLaunch {
+    /// Publish the process and settle the start's idempotent operation with
+    /// the outcome, so a same-key retry replays it.
+    async fn run(self, operation: IdempotencyOperation) -> Result<LaunchedProcess, Status> {
+        let process_id = self.process_id.clone();
+        let launched = self.publish().await;
+        operation.complete(match &launched {
+            Ok(_) => Ok(IdempotencyRecord::ProcessStarted { process_id }),
+            Err(status) => Err(status.clone()),
+        });
+        launched
+    }
+
+    async fn publish(self) -> Result<LaunchedProcess, Status> {
+        let ProcessLaunch {
+            command,
+            prepared_pty,
+            stdin_enabled,
+            mut info,
+            timeout,
+            process_id,
+            spawn_thread,
+            claim,
+            process_reservation,
+            start_admission,
+            account_lookup,
+            inner,
+        } = self;
+        let _start_admission = start_admission;
+        let spawn_started_at = Instant::now();
+        let spawned = spawn_thread.spawn(command, prepared_pty).await;
+        let spawn = spawn_started_at.elapsed();
+        if [account_lookup, spawn]
+            .iter()
+            .any(|phase| *phase >= SLOW_START_PHASE)
+        {
+            tracing::warn!(
+                process_id = %process_id,
+                pty = info.pty.unwrap_or_default(),
+                account_lookup_ms = account_lookup.as_millis(),
+                spawn_ms = spawn.as_millis(),
+                spawned = matches!(spawned, Ok((Ok(_), _))),
+                "slow guest process start"
+            );
+        }
+        let (spawn_result, mut prepared_pty) = spawned?;
+        let mut child = spawn_result.map_err(map_io_error)?;
+        let Some(pid) = child.id() else {
+            terminate_and_reap_failed_start(child, process_reservation);
+            return Err(Status::internal("spawned child has no pid"));
+        };
+        let (signal_handle, exit_observer) = match ProcessSignalHandle::open(pid) {
+            Ok(handle) => handle,
+            Err(error) => {
+                terminate_and_reap_failed_start(child, process_reservation);
+                return Err(Status::internal(format!(
+                    "failed to create safe handle for spawned process: {error}"
+                )));
+            }
+        };
+        let (input, pty_reader, stdout, stderr) = if let Some(pty) = prepared_pty.take() {
+            (
+                ProcessInput::Pty(PtyInput {
+                    writer: Mutex::new(pty.writer),
+                    resize_fd: pty.resize_fd,
+                }),
+                Some(pty.reader),
+                None,
+                None,
+            )
+        } else {
+            let stdin = if stdin_enabled {
+                child.stdin.take()
+            } else {
+                None
+            };
+            let input = if stdin_enabled {
+                ProcessInput::Pipe(Mutex::new(stdin))
+            } else {
+                ProcessInput::Disabled
+            };
+            (input, None, child.stdout.take(), child.stderr.take())
+        };
+        let started = match process_started_event(&process_id, Some(pid)) {
+            Ok(started) => started,
+            Err(status) => {
+                terminate_and_reap_failed_start(child, process_reservation);
+                return Err(status);
+            }
+        };
+        info.pid = pid;
+        let record = Arc::new(ProcessRecord::new(
+            started.clone(),
+            info,
+            input,
+            signal_handle,
+            process_reservation,
+        ));
+        claim.publish(Arc::clone(&record));
+
+        let mut output_tasks = VecDeque::new();
+        if let Some(reader) = pty_reader {
+            output_tasks.push_back(spawn_process_output_reader(
+                reader,
+                Arc::clone(&record),
+                process_id.clone(),
+                pid,
+                ProcessOutputKind::Stdout,
+            ));
+        }
+        if let Some(stdout) = stdout {
+            output_tasks.push_back(spawn_process_output_reader(
+                stdout,
+                Arc::clone(&record),
+                process_id.clone(),
+                pid,
+                ProcessOutputKind::Stdout,
+            ));
+        }
+        if let Some(stderr) = stderr {
+            output_tasks.push_back(spawn_process_output_reader(
+                stderr,
+                Arc::clone(&record),
+                process_id.clone(),
+                pid,
+                ProcessOutputKind::Stderr,
+            ));
+        }
+        let supervision = ProcessSupervision {
+            child,
+            exit_observer,
+            output_tasks,
+            timeout,
+            shutdown: inner.shutdown.clone(),
+            record: Arc::clone(&record),
+            process_id,
+            pid,
+            registry: inner.processes.clone(),
+        };
+        Ok(LaunchedProcess {
+            pid,
+            started,
+            record,
+            supervision,
+        })
+    }
+}
 
 impl SpacedGuestService {
     pub(super) fn process_grpc_service(
@@ -46,7 +406,7 @@ impl SpacedGuestService {
         pplx_space_common_grpc::RequestAdmission::new(
             ProcessServer::new(self.clone())
                 .max_decoding_message_size(process_limits::MAX_MESSAGE_BYTES),
-            self.inner.process_payload_slots.clone(),
+            pplx_space_common_grpc::QueuedSlots::new(self.inner.process_payload_slots.clone()),
             process_limits::PAYLOAD_METHODS,
         )
     }
@@ -89,9 +449,59 @@ async fn resolve_process_account(
 // are process-local UUIDs, so a guest-svc crash loses pid→process_id mappings.
 #[derive(Clone)]
 pub(super) struct ProcessRegistry {
-    records: Arc<DashMap<ProcessId, Arc<ProcessRecord>>>,
+    records: Arc<DashMap<ProcessId, ProcessEntry>>,
     record_slots: Arc<Semaphore>,
     shared_output_slots: Arc<Semaphore>,
+}
+
+/// A process id in use: by an admitted start that has not published its
+/// process yet, or by a published process.
+enum ProcessEntry {
+    Starting,
+    Published(Arc<ProcessRecord>),
+}
+
+impl ProcessEntry {
+    fn record(&self) -> Option<&Arc<ProcessRecord>> {
+        match self {
+            Self::Starting => None,
+            Self::Published(record) => Some(record),
+        }
+    }
+}
+
+/// Why a process id could not be claimed.
+enum ProcessIdTaken {
+    /// Another admitted start holds it and has not published its process.
+    Starting,
+    Published,
+}
+
+/// Exclusive use of a process id from start admission until its process is
+/// published, so two starts carrying the same assigned id cannot both spawn.
+/// Dropping an unpublished claim frees the id.
+struct ProcessIdClaim {
+    records: Arc<DashMap<ProcessId, ProcessEntry>>,
+    process_id: ProcessId,
+    published: bool,
+}
+
+impl ProcessIdClaim {
+    fn publish(mut self, record: Arc<ProcessRecord>) {
+        self.records
+            .insert(self.process_id.clone(), ProcessEntry::Published(record));
+        self.published = true;
+    }
+}
+
+impl Drop for ProcessIdClaim {
+    fn drop(&mut self) {
+        if !self.published {
+            self.records.remove_if(&self.process_id, |_, entry| {
+                matches!(entry, ProcessEntry::Starting)
+            });
+        }
+    }
 }
 
 struct ProcessRecord {
@@ -215,14 +625,23 @@ struct PreparedPty {
     control_fd: OwnedFd,
 }
 
+// Outside Linux, `openpty` cannot create both descriptors with CLOEXEC
+// atomically. PTY creation and every child spawn serialize on this lock there,
+// so no concurrent fork can inherit a PTY during the openpty→fcntl window.
+#[cfg(not(target_os = "linux"))]
+static PTY_INHERITANCE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn spawn_child(command: &mut Command) -> io::Result<tokio::process::Child> {
+    #[cfg(not(target_os = "linux"))]
+    let _inheritance_guard = PTY_INHERITANCE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    command.spawn()
+}
+
 fn prepare_pty(size: Option<PtySize>) -> Result<PreparedPty, Status> {
     let winsize = pty_winsize(size)?;
-    let nix::pty::OpenptyResult {
-        master,
-        slave: control_fd,
-    } = nix::pty::openpty(Some(&winsize), None).map_err(|error| map_io_error(error.into()))?;
-    set_cloexec(&master)?;
-    set_cloexec(&control_fd)?;
+    let (master, control_fd) = open_pty_pair(&winsize)?;
     let master = PtyIo::new(master).map_err(map_io_error)?;
 
     Ok(PreparedPty {
@@ -231,6 +650,42 @@ fn prepare_pty(size: Option<PtySize>) -> Result<PreparedPty, Status> {
         resize_fd: master,
         control_fd,
     })
+}
+
+// Both descriptors are CLOEXEC from creation, so a child spawned concurrently
+// on another thread cannot inherit either one and no lock is needed.
+// `TIOCGPTPEER` needs Linux 4.13 or later; every SPACE guest kernel has it.
+#[cfg(target_os = "linux")]
+fn open_pty_pair(winsize: &libc::winsize) -> Result<(OwnedFd, OwnedFd), Status> {
+    use rustix::pty::{OpenptFlags, ioctl_tiocgptpeer, openpt, unlockpt};
+    let io_status = |error: rustix::io::Errno| map_io_error(error.into());
+    let flags = OpenptFlags::RDWR | OpenptFlags::NOCTTY | OpenptFlags::CLOEXEC;
+    let master = openpt(flags).map_err(io_status)?;
+    unlockpt(&master).map_err(io_status)?;
+    let control_fd = ioctl_tiocgptpeer(&master, flags).map_err(io_status)?;
+    rustix::termios::tcsetwinsize(
+        &control_fd,
+        rustix::termios::Winsize {
+            ws_row: winsize.ws_row,
+            ws_col: winsize.ws_col,
+            ws_xpixel: winsize.ws_xpixel,
+            ws_ypixel: winsize.ws_ypixel,
+        },
+    )
+    .map_err(io_status)?;
+    Ok((master, control_fd))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn open_pty_pair(winsize: &libc::winsize) -> Result<(OwnedFd, OwnedFd), Status> {
+    let _inheritance_guard = PTY_INHERITANCE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let nix::pty::OpenptyResult { master, slave } =
+        nix::pty::openpty(Some(winsize), None).map_err(|error| map_io_error(error.into()))?;
+    set_cloexec(&master)?;
+    set_cloexec(&slave)?;
+    Ok((master, slave))
 }
 
 fn pty_winsize(size: Option<PtySize>) -> Result<libc::winsize, Status> {
@@ -358,6 +813,7 @@ impl ProcessExitObserver {
     }
 }
 
+#[cfg(not(target_os = "linux"))]
 fn set_cloexec(fd: impl AsFd) -> Result<(), Status> {
     use nix::fcntl::{FcntlArg, FdFlag, fcntl};
     let flags = FdFlag::from_bits_retain(
@@ -634,6 +1090,29 @@ enum ProcessReplay {
 }
 
 impl ProcessRegistry {
+    fn claim(&self, process_id: &ProcessId) -> Result<ProcessIdClaim, ProcessIdTaken> {
+        match self.records.entry(process_id.clone()) {
+            dashmap::Entry::Occupied(occupied) => Err(match occupied.get() {
+                ProcessEntry::Starting => ProcessIdTaken::Starting,
+                ProcessEntry::Published(_) => ProcessIdTaken::Published,
+            }),
+            dashmap::Entry::Vacant(vacant) => {
+                vacant.insert(ProcessEntry::Starting);
+                Ok(ProcessIdClaim {
+                    records: Arc::clone(&self.records),
+                    process_id: process_id.clone(),
+                    published: false,
+                })
+            }
+        }
+    }
+
+    fn is_published(&self, process_id: &ProcessId) -> bool {
+        self.records
+            .get(process_id)
+            .is_some_and(|entry| entry.record().is_some())
+    }
+
     fn reserve(&self) -> Result<ProcessRecordReservation, Status> {
         loop {
             match self.record_slots.clone().try_acquire_owned() {
@@ -654,6 +1133,7 @@ impl ProcessRegistry {
                 .iter()
                 .filter_map(|entry| {
                     entry
+                        .record()?
                         .journal
                         .completed_at()
                         .map(|completed_at| (entry.key().clone(), completed_at))
@@ -670,7 +1150,7 @@ impl ProcessRegistry {
         let record = self
             .records
             .get(process_id)
-            .map(|entry| Arc::clone(entry.value()))?;
+            .and_then(|entry| entry.record().cloned())?;
         if record.journal.is_expired() {
             self.records.remove(process_id);
             return None;
@@ -711,7 +1191,8 @@ impl ProcessRegistry {
         if self
             .records
             .get(process_id)
-            .is_some_and(|entry| entry.journal.is_expired())
+            .and_then(|entry| entry.record().map(|record| record.journal.is_expired()))
+            .unwrap_or(false)
         {
             self.records.remove(process_id);
         }
@@ -723,11 +1204,12 @@ impl ProcessRegistry {
             .records
             .iter()
             .filter_map(|entry| {
-                if entry.journal.is_expired() {
+                let record = entry.record()?;
+                if record.journal.is_expired() {
                     expired.push(entry.key().clone());
                     return None;
                 }
-                (!entry.journal.is_completed()).then(|| entry.info.clone())
+                (!record.journal.is_completed()).then(|| record.info.clone())
             })
             .collect();
         for process_id in expired {
@@ -1078,6 +1560,7 @@ impl Process for SpacedGuestService {
         mut request: Request<StartRequest>,
     ) -> Result<Response<Self::StartStream>, Status> {
         self.require_ready()?;
+        let received_at = Instant::now();
         let ingress = request
             .extensions_mut()
             .remove::<pplx_space_common_grpc::RequestPermit>();
@@ -1095,6 +1578,35 @@ impl Process for SpacedGuestService {
             .map_err(invalid_argument_status)?;
         let listed_user = user.as_ref().map(|user| user.as_str().to_string());
         let listed_tag = validate_process_tag(request.tag)?;
+
+        // A caller-assigned id lets the control plane name the process before it
+        // starts. A minted id cannot collide, so both cases share one identity
+        // and one uniqueness check, taken again below under the start gate.
+        let process_id = request
+            .process_id
+            .map(ProcessId::parse)
+            .transpose()
+            .map_err(invalid_argument_status)?
+            .unwrap_or_else(ProcessId::new);
+        // An assigned id that is already in use is a definitive answer, so give
+        // it precedence over every later rejection and wait in this handler.
+        // The data plane reconnects only on `AlreadyExists`, and a reconnect
+        // re-sends Start whenever the first attach dropped before binding its
+        // session, which is what a timed-out start leaves behind. Every later
+        // step can fail or stall for such a retry of a still-running process:
+        // the account lookup or PTY setup hits the descriptor limit,
+        // `reserve_or_get` fails an idempotency key past
+        // `IDEMPOTENCY_RECORD_TTL`, and `reserve` reports exhaustion when every
+        // record slot holds a running process. Answering here also keeps the
+        // outcome independent of the idempotency record's lifetime. Payload
+        // admission in front of this handler, here and in spaced-host, still
+        // applies: it runs before the request is decoded, so while every start
+        // slot is held by a stalled spawn, a reconnect waits or is refused there.
+        // Only a published process can be reconnected to. A same-key retry of
+        // a start that is still publishing goes on to wait for its outcome.
+        if self.inner.processes.is_published(&process_id) {
+            return Err(process_id_in_use());
+        }
         let account_name = user.unwrap_or_else(|| self.inner.default_operation_user.clone());
         let (account, _start_admission) = resolve_process_account(
             self.inner.process_payload_slots.clone(),
@@ -1105,6 +1617,7 @@ impl Process for SpacedGuestService {
             },
         )
         .await?;
+        let account_lookup = received_at.elapsed();
         let cwd = requested_cwd
             .as_deref()
             .map(|cwd| guest_path::normalize_for_account(cwd, &account))
@@ -1123,15 +1636,6 @@ impl Process for SpacedGuestService {
         let idempotency_key =
             require_idempotency_key(request.idempotency_key.clone(), "process_start")?;
 
-        // A caller-assigned id lets the control plane name the process before it
-        // starts. A minted id cannot collide, so both cases share one identity
-        // and one uniqueness check, taken below under the spawn lock.
-        let process_id = request
-            .process_id
-            .map(ProcessId::parse)
-            .transpose()
-            .map_err(invalid_argument_status)?
-            .unwrap_or_else(ProcessId::new);
         let process_command = Pii::new(&process_command);
         let argv = process_command.expose_pii().argv();
         let Some((program, args)) = argv.split_first() else {
@@ -1179,12 +1683,9 @@ impl Process for SpacedGuestService {
             command.process_group(0);
         }
         account.configure_child_credentials(&mut command)?;
-        let mut prepared_pty = if let Some(pty_config) = pty_config {
-            let _spawn_guard = GUEST_CHILD_SPAWN_LOCK.lock().await;
-            Some(prepare_pty(pty_config.size)?)
-        } else {
-            None
-        };
+        let mut prepared_pty = pty_config
+            .map(|pty_config| prepare_pty(pty_config.size))
+            .transpose()?;
         if let Some(pty) = prepared_pty.as_mut() {
             let control_fd = pty.control_fd.as_raw_fd();
             // SAFETY: the pre_exec hook calls libc `login_tty` and captures a
@@ -1200,19 +1701,6 @@ impl Process for SpacedGuestService {
             }
             command.stdout(std::process::Stdio::piped());
             command.stderr(std::process::Stdio::piped());
-        }
-
-        // An assigned id that is already live is a definitive answer, so give it
-        // precedence over every other rejection on this path. Both of the
-        // rejections it precedes are reachable for a retry of a still-running
-        // process: `reserve_or_get` fails an idempotency key past
-        // `IDEMPOTENCY_RECORD_TTL`, and `reserve` reports exhaustion when every
-        // record slot holds a running process. The data plane reconnects only
-        // on `AlreadyExists`, so either one would fail the attach instead of
-        // recovering. Answering here also keeps the outcome independent of the
-        // idempotency record's lifetime.
-        if self.inner.processes.records.contains_key(&process_id) {
-            return Err(process_id_in_use());
         }
 
         let reservation = match self
@@ -1238,205 +1726,89 @@ impl Process for SpacedGuestService {
         };
 
         let process_reservation = self.inner.processes.reserve()?;
+        // Before the start begins: a refused thread ends this start with its
+        // key released, so a retry with the same key can succeed.
+        let spawn_thread = SpawnThread::start().map_err(|error| {
+            Status::unavailable(format!("cannot start a process spawn thread: {error}"))
+        })?;
 
         // Cancellation while waiting for admission has no effect to replay:
-        // the unstarted reservation releases its key on Drop. From begin through
-        // supervisor handoff and publication there are no suspension points.
-        let spawn_guard = GUEST_CHILD_SPAWN_LOCK.lock().await;
+        // the unstarted reservation releases its key on Drop. From `begin` until
+        // the owner below is tracked there are no suspension points, and from
+        // then on the owner, not this request, carries the start through
+        // publication and supervisor handoff.
+        let start_gate = self
+            .inner
+            .start_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.require_ready()?;
-        // Re-claim the identity inside the same suspension-free region that
-        // publishes the record. The check above is reachable across a
-        // suspension point, so on its own it would let two starts carrying the
-        // same assigned id both pass and have the second publication replace
-        // the first, leaving its live process unreachable. This one is
-        // authoritative, and it still runs before `spawn` so a refused start
-        // never leaves a child behind.
-        if self.inner.processes.records.contains_key(&process_id) {
-            return Err(process_id_in_use());
-        }
-        let operation = reservation.begin()?;
-        let spawn_result = command.spawn();
-        let mut child = match spawn_result {
-            Ok(child) => child,
-            Err(error) => {
-                let status = map_io_error(error);
-                operation.complete(Err(status.clone()));
-                return Err(status);
-            }
-        };
-        let pid = match child.id() {
-            Some(pid) => pid,
-            None => {
-                let status = Status::internal("spawned child has no pid");
-                terminate_and_reap_failed_start(child, process_reservation);
-                operation.complete(Err(status.clone()));
-                return Err(status);
-            }
-        };
-        let (signal_handle, _exit_observer) = match ProcessSignalHandle::open(pid) {
-            Ok(handle) => handle,
-            Err(error) => {
-                let status = Status::internal(format!(
-                    "failed to create safe handle for spawned process: {error}"
+        // Re-claim the identity inside the gate. The check at the top of this
+        // handler is reachable across suspension points, so on its own it would
+        // let two starts carrying the same assigned id both pass and have the
+        // second publication replace the first, leaving its live process
+        // unreachable. The claim is authoritative until the record is
+        // published, and it is taken before `spawn` so a refused start never
+        // leaves a child behind.
+        let process_id_claim = match self.inner.processes.claim(&process_id) {
+            Ok(claim) => claim,
+            Err(ProcessIdTaken::Published) => return Err(process_id_in_use()),
+            // `AlreadyExists` would send the caller to reconnect, which cannot
+            // succeed until the other start publishes its process.
+            Err(ProcessIdTaken::Starting) => {
+                return Err(Status::unavailable(
+                    "process id is held by a start that has not published its process yet; retry",
                 ));
-                terminate_and_reap_failed_start(child, process_reservation);
-                operation.complete(Err(status.clone()));
-                return Err(status);
             }
         };
-        let (input, pty_reader, stdout, stderr) = if let Some(pty) = prepared_pty.take() {
-            (
-                ProcessInput::Pty(PtyInput {
-                    writer: Mutex::new(pty.writer),
-                    resize_fd: pty.resize_fd,
-                }),
-                Some(pty.reader),
-                None,
-                None,
-            )
-        } else {
-            let stdin = if stdin_enabled {
-                child.stdin.take()
-            } else {
-                None
-            };
-            let input = if stdin_enabled {
-                ProcessInput::Pipe(Mutex::new(stdin))
-            } else {
-                ProcessInput::Disabled
-            };
-            (input, None, child.stdout.take(), child.stderr.take())
-        };
-        let started = match process_started_event(&process_id, Some(pid)) {
-            Ok(started) => started,
-            Err(status) => {
-                terminate_and_reap_failed_start(child, process_reservation);
-                operation.complete(Err(status.clone()));
-                return Err(status);
-            }
-        };
-        let record = Arc::new(ProcessRecord::new(
-            started.clone(),
-            ProcessInfo {
+        let operation = reservation.begin()?;
+        let launch = ProcessLaunch {
+            command,
+            prepared_pty,
+            stdin_enabled,
+            info: ProcessInfo {
                 process_id: process_id.as_str().to_string(),
-                pid,
+                pid: 0,
                 command: listed_command,
                 cwd: listed_cwd,
                 env: listed_env,
                 user: listed_user,
                 tag: listed_tag,
-                pty: Some(matches!(input, ProcessInput::Pty(_))),
+                pty: Some(uses_pty),
             },
-            input,
-            signal_handle,
-            process_reservation,
-        ));
-        self.inner
-            .processes
-            .records
-            .insert(process_id.clone(), Arc::clone(&record));
-
-        let mut output_tasks = VecDeque::new();
-        if let Some(reader) = pty_reader {
-            output_tasks.push_back(spawn_process_output_reader(
-                reader,
-                Arc::clone(&record),
-                process_id.clone(),
-                pid,
-                ProcessOutputKind::Stdout,
-            ));
-        }
-        if let Some(stdout) = stdout {
-            output_tasks.push_back(spawn_process_output_reader(
-                stdout,
-                Arc::clone(&record),
-                process_id.clone(),
-                pid,
-                ProcessOutputKind::Stdout,
-            ));
-        }
-        if let Some(stderr) = stderr {
-            output_tasks.push_back(spawn_process_output_reader(
-                stderr,
-                Arc::clone(&record),
-                process_id.clone(),
-                pid,
-                ProcessOutputKind::Stderr,
-            ));
-        }
-        let registry = self.inner.processes.clone();
-        let record_for_wait = Arc::clone(&record);
-        let process_id_for_wait = process_id.clone();
-        let shutdown = self.inner.shutdown.clone();
-        self.inner.process_tasks.spawn(async move {
-            let completion = async {
-                #[cfg(target_os = "linux")]
-                match _exit_observer.exited().await {
-                    // Preserve the leader's identity until descendants have
-                    // released its output, but stop its execution deadline now.
-                    Ok(()) => return Ok(None),
-                    Err(error) => tracing::warn!(%error, pid, "pidfd observation failed; falling back to child wait"),
-                }
-                child.wait().await.map(Some)
-            };
-            let deadline = async {
-                match timeout {
-                    Some(timeout) => tokio::time::sleep(timeout.as_duration()).await,
-                    None => std::future::pending::<()>().await,
-                }
-            };
-            let waited = tokio::select! {
-                biased;
-                status = completion => Ok(status),
-                _ = shutdown.cancelled() => Err(ProcessExitOutcome::Signaled(libc::SIGKILL)),
-                _ = deadline => Err(ProcessExitOutcome::TimedOut(libc::SIGKILL)),
-            };
-            let outcome = match waited {
-                Ok(Ok(None)) => {
-                    let drained = tokio::select! {
-                        drained = drain_process_output_tasks(
-                            &mut output_tasks, &process_id_for_wait, pid, false,
-                        ) => drained,
-                        _ = shutdown.cancelled() => false,
-                    };
-                    if !drained && let Err(error) = record_for_wait.signal_handle.terminate_group() {
-                        tracing::warn!(%error, pid, "failed to terminate descendants holding output open");
-                    }
-                    process_status_outcome(child.wait().await.ok())
-                }
-                Ok(status) => process_status_outcome(status.ok().flatten()),
-                Err(outcome) => {
-                    if let Err(error) = record_for_wait.signal_handle.terminate_group() {
-                        tracing::warn!(%error, pid, "failed to terminate process group");
-                    }
-                    if let Err(error) = child.wait().await {
-                        tracing::warn!(%error, pid, "failed to reap terminated child");
-                    }
-                    outcome
-                }
-            };
-
-            if !output_tasks.is_empty() {
-                drain_process_output_tasks(&mut output_tasks, &process_id_for_wait, pid, true)
-                    .await;
-            }
-            let exit = process_exit_event(&process_id_for_wait, Some(pid), outcome);
-            record_for_wait.journal.complete(exit);
-            // Release supervisor ownership. Eviction can free this record's
-            // permit once any in-flight stdin/control handlers also release it.
-            drop(record_for_wait);
-            tokio::select! {
-                _ = shutdown.cancelled() => {},
-                _ = tokio::time::sleep(IDEMPOTENCY_RECORD_TTL) => {},
-            }
-            registry.remove_if_expired(&process_id_for_wait);
-        });
-
-        operation.complete(Ok(IdempotencyRecord::ProcessStarted {
+            timeout,
             process_id: process_id.clone(),
-        }));
-        drop(spawn_guard);
+            spawn_thread,
+            claim: process_id_claim,
+            process_reservation,
+            start_admission: _start_admission,
+            account_lookup,
+            inner: Arc::clone(&self.inner),
+        };
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        self.inner.process_tasks.spawn(async move {
+            // The request may be gone. The process stays supervised either way,
+            // and a same-key retry replays it.
+            match launch.run(operation).await {
+                Ok(LaunchedProcess {
+                    pid,
+                    started,
+                    record,
+                    supervision,
+                }) => {
+                    let _ = started_tx.send(Ok((pid, started, record)));
+                    supervision.run().await;
+                }
+                Err(status) => {
+                    let _ = started_tx.send(Err(status));
+                }
+            }
+        });
+        drop(start_gate);
 
+        let (pid, started, record) = started_rx
+            .await
+            .map_err(|_| Status::internal("process start ended without a result"))??;
         tracing::debug!(
             command = "bridge_guest_process_start",
             process_id = %process_id,

@@ -75,6 +75,11 @@ impl std::fmt::Debug for proto::operations::SendInputRequest {
     }
 }
 
+/// HTTP/2 frame size the spaced channels advertise, so a 64 KiB file chunk
+/// travels as one DATA frame instead of five.
+pub const BULK_HTTP2_MAX_FRAME_SIZE: u32 = 256 * 1024;
+
+pub mod admission_queue;
 mod compatibility;
 mod error;
 pub mod filesystem_limits;

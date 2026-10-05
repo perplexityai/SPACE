@@ -138,6 +138,15 @@ pub mod ids {
 pub mod spaced {
     /// Maximum entries sent in one write batch.
     pub const MAX_WRITE_BATCH_ENTRIES: usize = 256;
+
+    /// gRPC metadata key naming why a call failed where its code alone is
+    /// ambiguous. Hops relay a status unchanged, so the key reaches the API.
+    pub const ERROR_REASON_METADATA_KEY: &str = "space-error-reason";
+
+    /// [`ERROR_REASON_METADATA_KEY`] value of a RESOURCE_EXHAUSTED that is the
+    /// sandbox's disk or quota being full (ENOSPC, EDQUOT), as opposed to the
+    /// admission limits that share the code.
+    pub const GUEST_STORAGE_FULL: &str = "guest-storage-full";
 }
 
 /// Stable status markers shared by the sandbox-manager wake producer and

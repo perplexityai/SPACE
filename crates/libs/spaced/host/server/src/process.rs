@@ -6,8 +6,6 @@ use pplx_space_common_core::types::ProcessId;
 const MAX_GUEST_PROCESS_INFO_ARGUMENTS: usize = 4_096;
 const MAX_GUEST_PROCESS_INFO_ENVIRONMENT: usize = 4_096;
 const MAX_GUEST_PROCESS_OUTPUT_BYTES: usize = 64 * 1024;
-pub(super) const PROCESS_QUEUE_CAPACITY: usize = 20;
-const PROCESS_QUEUE_WAIT: std::time::Duration = std::time::Duration::from_millis(100);
 
 #[cfg(test)]
 mod tests;
@@ -20,10 +18,9 @@ impl SpacedHostService {
         pplx_space_common_grpc::RequestAdmission::new(
             ProcessServer::new(self.clone())
                 .max_decoding_message_size(process_limits::MAX_MESSAGE_BYTES),
-            self.inner.process_payload_slots.clone(),
+            self.inner.process_admission.clone(),
             process_limits::PAYLOAD_METHODS,
         )
-        .with_queue(self.inner.process_request_queue.clone(), PROCESS_QUEUE_WAIT)
     }
 }
 

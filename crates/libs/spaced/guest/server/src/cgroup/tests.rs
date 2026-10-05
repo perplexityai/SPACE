@@ -1,6 +1,6 @@
 use super::{
-    WORKLOADS_PID_RESERVE, has_controller, missing_controllers, parse_unified_cgroup,
-    workloads_pids_max_from,
+    WORKLOADS_MEMORY_RESERVE_MAX_BYTES, WORKLOADS_PID_RESERVE, has_controller, missing_controllers,
+    parse_unified_cgroup, workloads_memory_max_from, workloads_pids_max_from,
 };
 
 #[test]
@@ -118,4 +118,24 @@ fn placement_hook_owns_the_descriptor_until_spawn() {
     let mut written = [0];
     assert_eq!(file.read_at(&mut written, 0).unwrap(), 1);
     assert_eq!(&written, b"0");
+}
+
+const MIB: u64 = 1024 * 1024;
+
+// Workloads keep all but an eighth of a small guest, and all but 128 MiB of a
+// larger one, so the guest itself never runs out of memory for them.
+#[test]
+fn workloads_memory_cap_reserves_an_eighth_up_to_128_mib() {
+    assert_eq!(workloads_memory_max_from(512 * MIB), Some(448 * MIB));
+    assert_eq!(workloads_memory_max_from(1024 * MIB), Some(896 * MIB));
+    assert_eq!(
+        workloads_memory_max_from(4096 * MIB),
+        Some(4096 * MIB - WORKLOADS_MEMORY_RESERVE_MAX_BYTES)
+    );
+}
+
+#[test]
+fn workloads_memory_uncapped_when_the_guest_is_too_small_to_split() {
+    assert_eq!(workloads_memory_max_from(0), None);
+    assert_eq!(workloads_memory_max_from(7), None);
 }

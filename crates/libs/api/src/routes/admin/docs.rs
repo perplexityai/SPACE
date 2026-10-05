@@ -353,7 +353,7 @@ fn admin_openapi_value() -> Value {
     insert_org_master_key_paths(paths);
     insert_api_key_paths(paths);
     insert_admin_sandbox_create_paths(paths);
-    insert_identity_credential_paths(paths);
+    insert_identity_profile_paths(paths);
     insert_audit_event_paths(paths);
     spec
 }
@@ -823,7 +823,7 @@ fn insert_org_master_key_paths(paths: &mut Map<String, Value>) {
     );
 }
 
-fn insert_identity_credential_paths(paths: &mut Map<String, Value>) {
+fn insert_identity_profile_paths(paths: &mut Map<String, Value>) {
     if let Some(user) = paths
         .get_mut("/users/{user_id}")
         .and_then(Value::as_object_mut)
@@ -836,48 +836,6 @@ fn insert_identity_credential_paths(paths: &mut Map<String, Value>) {
                     "200": { "description": "User" },
                     "403": { "description": "Caller cannot update this user" },
                     "404": { "description": "User not found" }
-                }
-            }),
-        );
-    }
-    for path in ["/orgs/{org_id}/credentials", "/users/{user_id}/credentials"] {
-        paths.insert(
-            path.to_string(),
-            json!({
-                "get": {
-                    "summary": "List credential metadata",
-                    "responses": { "200": { "description": "Credential metadata list" } }
-                },
-                "post": {
-                    "summary": "Create a sealed credential",
-                    "responses": {
-                        "201": { "description": "Credential metadata" },
-                        "400": { "description": "Invalid credential request" }
-                    }
-                }
-            }),
-        );
-    }
-    for path in [
-        "/orgs/{org_id}/credentials/{credential_id}",
-        "/users/{user_id}/credentials/{credential_id}",
-    ] {
-        paths.insert(
-            path.to_string(),
-            json!({
-                "put": {
-                    "summary": "Replace a sealed credential",
-                    "responses": {
-                        "200": { "description": "Credential metadata" },
-                        "404": { "description": "Credential not found" }
-                    }
-                },
-                "delete": {
-                    "summary": "Delete a credential",
-                    "responses": {
-                        "204": { "description": "Deleted" },
-                        "404": { "description": "Credential not found" }
-                    }
                 }
             }),
         );

@@ -127,6 +127,16 @@ pub fn spaced_bridge_rpc_latency(
     );
 }
 
+/// Outcome of the guest root-filesystem flush an ordinary stop attempts before
+/// terminating the VM: `flushed` or `failed`.
+pub fn stop_guest_flush(outcome: &'static str) {
+    counter(
+        "sandbox.worker.stop.guest_flush",
+        1,
+        &[tag("outcome", outcome)],
+    );
+}
+
 pub fn spaced_bridge_rpc_timeout(bridge: &str, operation: &str) {
     counter(
         "sandbox.worker.spaced_bridge.rpc_timeout",

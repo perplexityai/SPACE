@@ -399,16 +399,9 @@ pub async fn run(
     );
     health_server.mark_starting();
 
-    let store = pplx_space_common_svc::sql::baselines::NODE_CTL;
-    pplx_space_common_svc::sql::sqlite::migrate(
-        "node-ctl",
-        &cli.db_path,
-        &NODE_CTL_MIGRATOR,
-        Some(store.baseline_version),
-        store.migration_failure_policy,
-    )
-    .await
-    .map_err(RunNodeCtlError::Migrate)?;
+    pplx_space_common_svc::sql::sqlite::migrate("node-ctl", &cli.db_path, &NODE_CTL_MIGRATOR)
+        .await
+        .map_err(RunNodeCtlError::Migrate)?;
     let db = pplx_space_common_svc::sql::sqlite::open_rusqlite(
         &cli.db_path,
         pplx_space_common_svc::sql::sqlite::RusqliteOpenOptions::default(),

@@ -23,7 +23,6 @@ tracing = { workspace = true }
 pplx-space-common-svc = { workspace = true, features = ["sqlite"] }
 pplx-space-sbxmgr-migrations = { workspace = true }
 pplx-space-sqlite-migrations = { workspace = true }
-pplx-space-volmgr-migrations = { workspace = true }
 
 [dev-dependencies]
 pplx-space-common-jobs = { workspace = true }

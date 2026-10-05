@@ -4022,6 +4022,7 @@ impl SandboxManagerService {
                 completion: CleanupCompletion::MarkSuspended,
                 published_artifact: Some((local_artifact_id, snapshot_dir.to_string())),
                 immediate_kill: Self::cleanup_immediate_kill(CleanupCompletion::MarkSuspended),
+                guest_flush: crate::db::cleanup_jobs::GuestFlush::Unrequested,
             },
             Some(admission),
             None,
@@ -5438,6 +5439,7 @@ impl SandboxManagerService {
                         completion,
                         published_artifact: None,
                         immediate_kill: Self::cleanup_immediate_kill(completion),
+                        guest_flush: crate::db::cleanup_jobs::GuestFlush::Unrequested,
                     },
                     admission,
                 )
@@ -5463,6 +5465,7 @@ impl SandboxManagerService {
                         completion,
                         published_artifact: None,
                         immediate_kill: Self::cleanup_immediate_kill(completion),
+                        guest_flush: crate::db::cleanup_jobs::GuestFlush::Unrequested,
                     },
                     admission,
                 )
@@ -5486,6 +5489,7 @@ impl SandboxManagerService {
                     context: "cleanup after kill",
                     completion,
                     immediate_kill: Self::cleanup_immediate_kill(completion),
+                    guest_flush: crate::db::cleanup_jobs::GuestFlush::Unrequested,
                     persist_intent: false,
                     cleanup_id: None,
                 },

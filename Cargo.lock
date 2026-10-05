@@ -5673,7 +5673,6 @@ dependencies = [
  "pplx-space-sbxmgr-migrations",
  "pplx-space-sqlite-migrations",
  "pplx-space-test-env",
- "pplx-space-volmgr-migrations",
  "rusqlite",
  "sqlx",
  "tempfile",
@@ -6964,8 +6963,6 @@ dependencies = [
 name = "pplx-space-sqlite-migrations"
 version = "0.8.0"
 dependencies = [
- "rusqlite",
- "sqlx",
  "thiserror 2.0.20",
 ]
 
@@ -7125,7 +7122,6 @@ dependencies = [
  "pplx-space-metrics",
  "pplx-space-object-store",
  "pplx-space-volmgr-client",
- "pplx-space-volmgr-migrations",
  "rusqlite",
  "serde",
  "serde_json",
@@ -7177,16 +7173,6 @@ dependencies = [
  "tonic-prost",
  "tonic-prost-build",
  "tower",
-]
-
-[[package]]
-name = "pplx-space-volmgr-migrations"
-version = "0.8.0"
-dependencies = [
- "pplx-space-sqlite-migrations",
- "rusqlite",
- "sqlx",
- "thiserror 2.0.20",
 ]
 
 [[package]]

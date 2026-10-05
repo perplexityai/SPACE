@@ -74,13 +74,14 @@ not passing expectations or unconditional expected failures. Remove a
 quarantine declaration once its owning fix passes the explicit scenario.
 
 The **Quarantined smoke backlog (non-blocking)** job inventories all declared
-quarantines on every PR, main push, merge-group run, and applicable manual CI
-entry point. Pull CI owns the single PR check; Kind Pull CI does not repeat it.
-It displays counts, reasons, and source links in the job summary
-and warning annotations. The check fails when any scenarios remain quarantined,
-and passes when the backlog is empty. It executes no scenarios or clusters and
-is excluded from required aggregate checks, so its failure does not block those
-gates, and it does not fail the Pull, merge-queue or Main CI run that calls it.
+quarantines on every PR and applicable manual CI entry point. Pull CI owns the
+single PR check; Kind Pull CI does not repeat it, and main pushes and
+merge-group runs do not run it. It displays counts, reasons, and source links
+in the job summary and warning annotations. The check fails when any scenarios
+remain quarantined, and passes when the backlog is empty. It executes no
+scenarios or clusters and is excluded from required aggregate checks, so its
+failure does not block those gates, and it does not fail the Pull CI run that
+calls it.
 Discovery errors also fail the check and report the backlog as unknown, not
 zero. The source of truth is the scenario declaration, not a second list.
 

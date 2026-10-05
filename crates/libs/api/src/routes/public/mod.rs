@@ -1,5 +1,6 @@
 use axum::{
     Router,
+    extract::DefaultBodyLimit,
     handler::Handler,
     middleware,
     routing::{MethodFilter, MethodRouter, on},
@@ -45,6 +46,21 @@ where
     T: 'static,
 {
     (operation, on(method_filter(operation.method()), handler))
+}
+
+/// [`mount`] with a request body limit other than the framework's 2 MiB
+/// default, for an operation whose documented payload is larger.
+fn mount_with_body_limit<H, T>(
+    operation: NativeOperation,
+    handler: H,
+    limit_bytes: usize,
+) -> (NativeOperation, MethodRouter<AppState>)
+where
+    H: Handler<T, AppState>,
+    T: 'static,
+{
+    let (operation, router) = mount(operation, handler);
+    (operation, router.layer(DefaultBodyLimit::max(limit_bytes)))
 }
 
 /// Every native control-plane operation and the handler that serves it.
@@ -163,8 +179,16 @@ fn mounted_operations() -> Vec<(NativeOperation, MethodRouter<AppState>)> {
         mount(native::STAT_FILE, files::stat_file),
         mount(native::LIST_FILES, files::list_files),
         mount(native::READ_FILE, files::read_file),
-        mount(native::WRITE_FILE, files::write_file),
-        mount(native::WRITE_FILE_BATCH, files::write_file_batch),
+        mount_with_body_limit(
+            native::WRITE_FILE,
+            files::write_file,
+            files::WRITE_FILE_BODY_LIMIT_BYTES,
+        ),
+        mount_with_body_limit(
+            native::WRITE_FILE_BATCH,
+            files::write_file_batch,
+            files::WRITE_FILE_BATCH_BODY_LIMIT_BYTES,
+        ),
         mount(
             native::ENABLE_FILE_CHANGES,
             files::enable_file_change_tracking,

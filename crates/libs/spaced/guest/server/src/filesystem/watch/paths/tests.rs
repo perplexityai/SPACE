@@ -22,10 +22,15 @@ async fn registration_plans_bound_nonrecursive_and_filtered_walks() {
         let filter =
             WatchFilter::compile(WatchFilterConfig::new(vec![], excludes, false).expect("config"))
                 .expect("filter");
-        let directories = plan_watch_registration(directory.path(), recursive, &filter)
-            .await
-            .expect("plan")
-            .into_directories();
+        let directories = plan_watch_registration(
+            directory.path(),
+            recursive,
+            &filter,
+            &new_watch_directory_scan_slots(),
+        )
+        .await
+        .expect("plan")
+        .into_directories();
         assert_eq!(directories.len(), count);
         assert!(directories.contains(&directory.path().to_path_buf()));
         assert_eq!(
@@ -118,9 +123,14 @@ async fn required_root_cannot_disappear_or_be_filtered_out_of_a_plan() {
         let filter =
             WatchFilter::compile(WatchFilterConfig::new(vec![], vec![], false).unwrap()).unwrap();
         assert!(
-            plan_watch_registration(&normalized, true, &filter)
-                .await
-                .is_err(),
+            plan_watch_registration(
+                &normalized,
+                true,
+                &filter,
+                &new_watch_directory_scan_slots()
+            )
+            .await
+            .is_err(),
             "a vanished mandatory root must fail setup"
         );
         if replacement.is_some() {
@@ -131,12 +141,16 @@ async fn required_root_cannot_disappear_or_be_filtered_out_of_a_plan() {
     let filter =
         WatchFilter::compile(WatchFilterConfig::new(vec![], vec![glob(".")], false).unwrap())
             .unwrap();
-    let plan = plan_watch_registration(&root, true, &filter).await.unwrap();
+    let plan = plan_watch_registration(&root, true, &filter, &new_watch_directory_scan_slots())
+        .await
+        .unwrap();
     assert_eq!(plan.len(), 1, "filters must retain root lifecycle coverage");
 
     // A glob that excludes only the root must not hide existing children.
     std::fs::create_dir_all(root.join("existing/nested")).unwrap();
-    let plan = plan_watch_registration(&root, true, &filter).await.unwrap();
+    let plan = plan_watch_registration(&root, true, &filter, &new_watch_directory_scan_slots())
+        .await
+        .unwrap();
     assert_eq!(plan.root, root);
     let mut descendants = plan.descendants;
     descendants.sort();

@@ -73,3 +73,76 @@ fn assert_non_utf8_path_error(error: FcApiError, expected_field: &'static str) {
         other => panic!("expected NonUtf8Path error, got {other:?}"),
     }
 }
+
+fn rootfs_limiter() -> RateLimiter {
+    RateLimiter {
+        bandwidth: TokenBucket {
+            size: 104_857_600,
+            refill_time_ms: 1000,
+        },
+        operations: TokenBucket {
+            size: 5_000,
+            refill_time_ms: 5_000,
+        },
+    }
+}
+
+#[test]
+fn drive_rate_limiter_request_matches_firecracker_contract() {
+    assert_eq!(
+        drive_rate_limiter_request_body("rootfs", &rootfs_limiter()),
+        serde_json::json!({
+            "drive_id": "rootfs",
+            "rate_limiter": {
+                "bandwidth": { "size": 104_857_600, "refill_time": 1000 },
+                "ops": { "size": 5_000, "refill_time": 5_000 }
+            }
+        })
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_drive_rate_limiter_update_patches_the_drive() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("firecracker.socket");
+    let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+    let firecracker = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = Vec::new();
+        let mut chunk = [0_u8; 4096];
+        let (head, body) = loop {
+            let read = stream.read(&mut chunk).await.unwrap();
+            assert_ne!(read, 0, "client closed before sending a whole request");
+            request.extend_from_slice(&chunk[..read]);
+            let text = String::from_utf8(request.clone()).unwrap();
+            if let Some((head, body)) = text.split_once("\r\n\r\n") {
+                let length = head
+                    .lines()
+                    .find_map(|line| line.strip_prefix("content-length: "))
+                    .unwrap()
+                    .parse::<usize>()
+                    .unwrap();
+                if body.len() == length {
+                    break (head.to_string(), body.to_string());
+                }
+            }
+        };
+        stream
+            .write_all(b"HTTP/1.1 204 No Content\r\n\r\n")
+            .await
+            .unwrap();
+        (head, body)
+    });
+
+    FcApiClient::new(&socket)
+        .update_drive_rate_limiter("rootfs", &rootfs_limiter())
+        .await
+        .unwrap();
+    let (head, body) = firecracker.await.unwrap();
+    assert_eq!(head.lines().next(), Some("PATCH /drives/rootfs HTTP/1.1"));
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&body).unwrap(),
+        drive_rate_limiter_request_body("rootfs", &rootfs_limiter())
+    );
+}

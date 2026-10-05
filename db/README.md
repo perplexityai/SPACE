@@ -4,11 +4,22 @@ Migrations under `db/` are immutable once they have been applied by any shared
 environment. Do not edit an applied migration to change behavior or fix a bug:
 add a new migration in the same store directory instead.
 
-Public-baseline catalogs automatically adopt fully prepared historical databases
-through normal PostgreSQL migration and SQLite startup. Admission checks the
-complete history and destination checksum before atomically archiving and
-replacing migration metadata. Schema comparison is a rollout prerequisite. See [PostgreSQL adoption](BASELINE.md) and
-[SQLite adoption](SQLITE_BASELINE.md) for prerequisites and rollback constraints.
+The first public PostgreSQL migration is `20261002070625_baseline`; SQLite
+stores start at `20260930000000_baseline`. These preserve the final historical
+schemas and are rollback floors. Startup automatically adopts fully prepared
+historical databases, including shared jobs, after validating the complete
+history and destination checksum. It archives the original history and replaces
+only migration metadata in one transaction; application rows are unchanged.
+Schema comparison remains a rollout prerequisite. Incompatible histories fail
+without repair or automatic database recreation.
+
+Keep automatic cutover support until service and shared histories are verified
+across active and retained databases, including databases returning from offline
+storage. The shared jobs baseline and runtime cleanup may ship together because
+this transition remains available. Images with historical catalogs cannot reopen
+public histories; do not roll back across that boundary.
+
+The PostgreSQL migrator ignores `goose_db_version`, whether present or absent.
 
 SQLx records migration checksums. Editing an applied migration makes the bundled
 checksum diverge from the checksum stored in the database, which correctly stops
@@ -16,9 +27,9 @@ Postgres migration on startup and requires operator intervention. Node-local
 SQLite stores can hold authoritative state. New changes must remain additive
 migrations for every store.
 
-Postgres migrations under `db/postgres/` use SQLx numeric versions. Existing
-legacy migrations keep their historical `NNN_name.up.sql` / `NNN_name.down.sql`
-names through `093`. New Postgres migrations must use a UTC creation timestamp:
+Postgres migrations under `db/postgres/` use SQLx numeric versions. Retired
+legacy migrations used `NNN_name.up.sql` / `NNN_name.down.sql` names through
+`093`. New Postgres migrations must use a UTC creation timestamp:
 `YYYYMMDDHHMMSS_name.up.sql` and `YYYYMMDDHHMMSS_name.down.sql`. The migration
 version guard only evaluates newly added Postgres files, requires their numeric
 prefix to be greater than the fixed legacy cutoff, and rejects a new timestamp
@@ -44,12 +55,13 @@ Commit the registry entry together with the corresponding SQL edit.
 PostgreSQL and SQLite runners embed the registry. They accept a recorded digest
 only when both it and the bundled digest are listed for the same store/version.
 They do not rewrite migration history or rerun already applied SQL. New databases
-record the bundled digest. Unlisted digests remain errors; SQLite retains each
-store's existing failure/recreation policy. The registry does not cover down
+record the bundled digest. Unlisted digests remain errors; public SQLite baselines
+fail closed without recreating the database. The registry does not cover down
 migrations, whose checksums SQLx does not record.
 
-Keep accepted digests permanently so deployments can upgrade directly from older
-releases. This is not a mechanism for changing schema or data behavior: those
+Keep accepted digests while their migration catalog is supported so deployments
+can upgrade directly from older releases.
+This is not a mechanism for changing schema or data behavior: those
 changes still require a new migration. Rollbacks to versions predating a registry
 entry can reject a database created with the revised SQL.
 
@@ -242,31 +254,42 @@ must include Squawk's transaction override comment:
 CREATE INDEX CONCURRENTLY ...
 ```
 
-Common SQLite DDL lives under `db/common/` using the same numbered
-`NNN_name.up.sql` / `NNN_name.down.sql` format as service migration
-directories. For each SQLite store that opts into it, `space-db-migrator`
-applies that store's service-specific migrations and then applies `db/common/`
-as the final convergence phase.
+Common SQLite DDL lives under `db/common/`. Its public catalog starts at
+`20260930000000_baseline`; later common and service migrations use timestamped
+up/down pairs above that floor. The shared catalog is consumed by sandbox,
+volume, template, build, and runtime-manager stores.
 
-Node-local SQLite startup accepts applied migration versions newer than the
-binary bundles so a binary rollback can reuse a database expanded by its
-successor. It preserves those migration rows; missing versions within the
-bundled range and checksum mismatches still fail. Use expand/contract
-sequencing: add backward-compatible schema first, and remove or repurpose it
-only after the rollback window closes.
+Public-catalog startup validates both service and shared histories before
+writes, then applies common schema before service schema. Failed, modified,
+missing, or unbundled applied versions are rejected without recreating the
+database. A binary rollback therefore requires a catalog compatible with the
+complete applied history, even for an otherwise backward-compatible schema.
+Use expand/contract sequencing and retain verified backups.
 
-The `jobs` table currently lives in `db/common/`. Do not add new hand-copied
-`jobs` DDL to individual service migration directories; add future common
-tables, columns, and indexes as new numbered up/down migrations in
-`db/common/`. Service-specific objects that depend on common tables, such as a
-consumer-only index, should remain in that service's own migration directory.
+The migrator never adopts untracked schemas, repairs rejected history, or
+recreates a database after a migration failure. The only history replacement is
+the validated, archived baseline transition described above. The manual cutover
+tools and baseline runbooks are retired; normal startup owns that transition.
 
-One compatibility exception exists for authoritative node-local daemons whose
-startup path runs only the service-specific SQLx migrator before opening the
-database. If shared job code already depends on a new common `jobs` column at
-daemon startup, add a service-specific forward migration with a fresh version
-for that daemon and teach the common-schema convergence path to stamp the common
-migration when the service migration has already produced the same schema.
+Image-only rollback to a historical catalog is unsupported for every public
+SQLite database, including ones created on new nodes. Older binaries can insert
+legacy migration rows; older template-manager binaries can recreate the store
+and lose authoritative local policies and generations. Before any new writes,
+stop all writers and restore the verified original file set, including its
+matching WAL/SHM state, before starting the old binary. After new writes or an
+accidental old-image startup, retain the affected files and use a reviewed
+state-preserving recovery plan. Never edit history rows to bypass validation.
+
+For stores with shared jobs, `down` removes the greatest applied timestamp across
+both catalogs, choosing the service migration first when timestamps match.
+Migration timestamps must reflect release/dependency order. Baseline down
+migrations reject rollback below the supported schema floor.
+
+The `jobs` table belongs to `db/common/`. Add shared tables, columns, and indexes
+there instead of copying jobs DDL into service directories. Service-owned
+objects that depend on common tables, such as a consumer-only index, stay in
+the service catalog. Daemons and the CLI use the shared migration startup path;
+new migrations must not rely on the retired service-to-common history stamping.
 
 ## Control-plane Postgres roles (`bootstrap-roles`)
 

@@ -33,7 +33,7 @@ impl BuilderApiService {
     ) -> RequestAdmission<crate::proto::builder_api_server::BuilderApiServer<Self>> {
         RequestAdmission::new(
             crate::proto::builder_api_server::BuilderApiServer::new(self),
-            upload_slots,
+            pplx_space_common_grpc::QueuedSlots::new(upload_slots),
             &[("UploadBuildBlob", 1)],
         )
     }

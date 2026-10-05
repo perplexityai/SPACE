@@ -14,6 +14,24 @@ const MAX_GUEST_MODIFIED_FILES: usize = 16_384;
 const MAX_GUEST_MODIFIED_FILE_KINDS: usize = 5;
 const MAX_GUEST_WATCHER_EVENTS: usize = 4_096;
 
+impl SpacedHostService {
+    pub(super) fn filesystem_grpc_service(
+        &self,
+    ) -> pplx_space_common_grpc::RequestAdmission<
+        pplx_space_common_grpc::PreserveInputErrors<FilesystemServer<Self>>,
+    > {
+        use pplx_space_spaced_common::filesystem_limits;
+        pplx_space_common_grpc::RequestAdmission::new(
+            pplx_space_common_grpc::PreserveInputErrors::new(
+                FilesystemServer::new(self.clone())
+                    .max_decoding_message_size(filesystem_limits::MAX_MESSAGE_BYTES),
+            ),
+            self.inner.filesystem_admission.clone(),
+            filesystem_limits::PAYLOAD_METHODS,
+        )
+    }
+}
+
 fn host_file_event(
     event: pplx_space_spaced_common::proto::bridge_guest::FileEvent,
 ) -> Result<FileEvent, Status> {
@@ -547,3 +565,6 @@ impl Filesystem for SpacedHostService {
         }))
     }
 }
+
+#[cfg(test)]
+mod tests;

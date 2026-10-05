@@ -652,10 +652,3 @@ export interface MeResponse {
   org: Organization;
   substrate: Substrate;
 }
-
-export interface Credential {
-  id: string;
-  key: string;
-  created_at: string;
-  updated_at: string;
-}

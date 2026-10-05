@@ -37,15 +37,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 // Real migrations and startup worker, inside the harness's disposable /space.
 async fn recover_pool() -> Result<(), Box<dyn std::error::Error>> {
     let db = Path::new(pplx_space_common_core::host::linux::paths::NODE_MANAGER_DB);
-    let store = pplx_space_common_svc::sql::baselines::NODE_MANAGER;
-    pplx_space_common_svc::sql::sqlite::migrate(
-        "node-manager",
-        db,
-        &MIGRATOR,
-        Some(store.baseline_version),
-        store.migration_failure_policy,
-    )
-    .await?;
+    pplx_space_common_svc::sql::sqlite::migrate("node-manager", db, &MIGRATOR).await?;
     let mut config = NetworkPoolConfig::new(3);
     config.pod_netns_path = Some("host".into());
     NetworkPool::validate_startup(&config, db)?;

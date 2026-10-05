@@ -6691,6 +6691,7 @@ pub(crate) mod service_tests {
                     completion: CleanupCompletion::DeleteRow,
                     published_artifact: None,
                     immediate_kill: false,
+                    guest_flush: crate::db::cleanup_jobs::GuestFlush::Unrequested,
                 },
                 &admission,
                 || async {
@@ -9972,6 +9973,7 @@ pub(crate) mod service_tests {
                         completion: CleanupCompletion::MarkStopped,
                         published_artifact: None,
                         immediate_kill: false,
+                        guest_flush: crate::db::cleanup_jobs::GuestFlush::Unrequested,
                     },
                     Some(admission),
                     None,
@@ -10460,6 +10462,7 @@ pub(crate) mod service_tests {
                     completion: CleanupCompletion::MarkStopped,
                     published_artifact: None,
                     immediate_kill: true,
+                    guest_flush: crate::db::cleanup_jobs::GuestFlush::Unrequested,
                 },
                 &admission,
                 || async {
@@ -13305,6 +13308,7 @@ pub(crate) mod service_tests {
             context: "dependency drain recovery test cleanup failed",
             completion: CleanupCompletion::DeleteRow,
             immediate_kill: false,
+            guest_flush: crate::db::cleanup_jobs::GuestFlush::Unrequested,
             persist_intent: false,
             cleanup_id: None,
         });
@@ -15730,8 +15734,11 @@ pub(crate) mod service_tests {
         );
     }
 
+    // An identity-free wake of a dormant direct sandbox carries a start context
+    // without a namespace. It must be told to supply a route identity, which
+    // the caller can act on, not that a runtime namespace is missing.
     #[tokio::test]
-    async fn wake_with_start_context_requires_netns_path() {
+    async fn identity_free_wake_with_a_start_context_asks_for_a_route_identity() {
         let conn = crate::db::test_conn();
         let sandbox_id = SandboxId::new().to_string();
         insert_test_sandbox(&conn, &sandbox_id, SandboxState::Suspended);
@@ -15749,12 +15756,11 @@ pub(crate) mod service_tests {
                 target_state: 0,
             }))
             .await
-            .expect_err("wake without a network namespace must fail before sandbox start");
+            .expect_err("an identity-free dormant wake must not start the sandbox");
 
-        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
-        assert_eq!(
-            error.message(),
-            pplx_space_common_core::wake_signals::MISSING_RUNTIME_CONTEXT_MARKER
+        assert!(
+            pplx_space_sbx_mgr_client::is_authoritative_route_identity_required(&error),
+            "{error:?}"
         );
     }
 
@@ -15993,6 +15999,47 @@ pub(crate) mod service_tests {
                 .is_empty(),
             "disabled lifecycle policy must not synthesize scheduling conditions"
         );
+    }
+
+    // Guest activity is recorded at one-second resolution, so a repeat within
+    // the same second changes nothing. It must return without taking the
+    // database lock that every other sandbox's operations queue on.
+    #[tokio::test]
+    async fn unchanged_guest_activity_does_not_wait_for_the_database() {
+        let conn = crate::db::test_conn();
+        let sandbox_id = SandboxId::new().to_string();
+        insert_test_sandbox(&conn, &sandbox_id, SandboxState::Started);
+        let service = SandboxManagerService::new(conn);
+        for _ in 0..5 {
+            let second = now_secs();
+            let sandbox = service.lookup_sandbox(&sandbox_id).unwrap();
+            service
+                .touch_runtime_state_for_guest_activity(&sandbox, GuestActivityKind::Command)
+                .unwrap();
+            let touched = service.lookup_sandbox(&sandbox_id).unwrap();
+            let held = service.db_conn().unwrap();
+            let (done, finished) = std::sync::mpsc::channel();
+            let toucher = service.clone();
+            std::thread::spawn(move || {
+                let result = toucher
+                    .touch_runtime_state_for_guest_activity(&touched, GuestActivityKind::Command);
+                let _ = done.send(result.is_ok());
+            });
+            let returned = finished.recv_timeout(Duration::from_millis(500));
+            drop(held);
+            if now_secs() != second {
+                // The clock crossed a second, so the repeat could need a write.
+                let _ = finished.recv_timeout(Duration::from_secs(5));
+                continue;
+            }
+            assert_eq!(
+                returned,
+                Ok(true),
+                "an unchanged touch waited for the database lock"
+            );
+            return;
+        }
+        panic!("could not touch twice within one second");
     }
 
     /// Let the spawned forward task run its due interval ticks after a
@@ -18016,6 +18063,7 @@ pub(crate) mod service_tests {
                     completion: CleanupCompletion::MarkSuspended,
                     published_artifact: None,
                     immediate_kill: true,
+                    guest_flush: crate::db::cleanup_jobs::GuestFlush::Unrequested,
                 },
                 None,
                 Some(episode.id),

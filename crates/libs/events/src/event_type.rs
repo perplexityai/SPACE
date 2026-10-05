@@ -41,6 +41,10 @@ pub enum SandboxEventType {
     StopRequested,
     StopCompleted,
     StopFailed,
+    /// An ordinary stop could not flush the guest's root filesystem before
+    /// terminating the VM, and stopped it anyway: writes the guest had not
+    /// committed can be lost.
+    StopGuestFlushFailed,
     KillRequested,
     KillCompleted,
     KillFailed,
@@ -253,6 +257,7 @@ pub const SANDBOX_EVENT_TYPES: &[SandboxEventType] = &[
     SandboxEventType::StopRequested,
     SandboxEventType::StopCompleted,
     SandboxEventType::StopFailed,
+    SandboxEventType::StopGuestFlushFailed,
     SandboxEventType::KillRequested,
     SandboxEventType::KillCompleted,
     SandboxEventType::KillFailed,
@@ -382,6 +387,7 @@ impl SandboxEventType {
             Self::StopRequested => "stop_requested",
             Self::StopCompleted => "stop_completed",
             Self::StopFailed => "stop_failed",
+            Self::StopGuestFlushFailed => "stop_guest_flush_failed",
             Self::KillRequested => "kill_requested",
             Self::KillCompleted => "kill_completed",
             Self::KillFailed => "kill_failed",
@@ -575,6 +581,7 @@ impl SandboxEventType {
             | Self::RestoreFailed
             | Self::SuspendFailed
             | Self::StopFailed
+            | Self::StopGuestFlushFailed
             | Self::KillFailed
             | Self::DeleteFailed
             | Self::PauseFailed

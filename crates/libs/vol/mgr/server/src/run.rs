@@ -37,7 +37,6 @@ static VOLUME_MANAGER_MIGRATOR: sqlx::migrate::Migrator =
 static COMMON_SCHEMA_MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../../../../db/common");
 
 pub(crate) async fn migrate_volume_manager_db(path: &Path) -> Result<(), SqliteError> {
-    let store = pplx_space_common_svc::sql::baselines::VOLUME_MANAGER;
     pplx_space_common_svc::sql::sqlite::migrate_embedded(
         "volume-manager",
         path,
@@ -45,9 +44,7 @@ pub(crate) async fn migrate_volume_manager_db(path: &Path) -> Result<(), SqliteE
             service: &VOLUME_MANAGER_MIGRATOR,
             common: Some(&COMMON_SCHEMA_MIGRATOR),
         },
-        Some(store.baseline_version),
-        store.migration_failure_policy,
-        Some(pplx_space_volmgr_migrations::prepare_common_jobs_migrations),
+        None,
     )
     .await
 }

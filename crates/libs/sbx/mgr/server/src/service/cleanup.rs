@@ -51,6 +51,7 @@ pub(super) struct AsyncCleanupRequest {
     pub(super) context: &'static str,
     pub(super) completion: CleanupCompletion,
     pub(super) immediate_kill: bool,
+    pub(super) guest_flush: crate::db::cleanup_jobs::GuestFlush,
     pub(super) persist_intent: bool,
     pub(super) cleanup_id: Option<SandboxCleanupEpisodeId>,
 }
@@ -63,6 +64,7 @@ pub(super) struct SynchronousCleanupRequest<'a> {
     pub(super) completion: CleanupCompletion,
     pub(super) published_artifact: Option<(LocalArtifactId, String)>,
     pub(super) immediate_kill: bool,
+    pub(super) guest_flush: crate::db::cleanup_jobs::GuestFlush,
 }
 
 pub(super) enum CleanupAdmission {
@@ -444,6 +446,10 @@ pub(super) struct ExecutionReleaseCleanup {
     pub(super) keep_filesystem: bool,
     pub(super) completion: CleanupCompletion,
     pub(super) context: &'static str,
+    /// A released execution that stops keeps its filesystem, so it flushes
+    /// the guest first, as an ordinary stop does; one that deletes discards
+    /// the disk.
+    pub(super) guest_flush: crate::db::cleanup_jobs::GuestFlush,
 }
 
 impl ExecutionReleaseCleanup {
@@ -454,12 +460,14 @@ impl ExecutionReleaseCleanup {
                 keep_filesystem: true,
                 completion: CleanupCompletion::MarkStopped,
                 context: "cleanup after execution release stop",
+                guest_flush: crate::db::cleanup_jobs::GuestFlush::BeforeTermination,
             },
             ExecutionReleaseIntent::Delete => Self {
                 target_state: SandboxState::Deleting,
                 keep_filesystem: false,
                 completion: CleanupCompletion::DeleteRow,
                 context: "cleanup after execution release delete",
+                guest_flush: crate::db::cleanup_jobs::GuestFlush::Unrequested,
             },
         }
     }
@@ -502,6 +510,7 @@ struct CleanupAdmissionSpec {
     completion: CleanupCompletion,
     persist_intent: bool,
     immediate_kill: bool,
+    guest_flush: crate::db::cleanup_jobs::GuestFlush,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -876,6 +885,7 @@ impl SandboxManagerService {
                 keep_filesystem: claim.keep_filesystem,
                 completion: claim.completion,
                 immediate_kill: Self::cleanup_immediate_kill(claim.completion),
+                guest_flush: crate::db::cleanup_jobs::GuestFlush::Unrequested,
                 persist_intent: claim.persist_intent,
             },
         )
@@ -910,6 +920,7 @@ impl SandboxManagerService {
                 keep_filesystem,
                 completion,
                 immediate_kill: Self::cleanup_immediate_kill(completion),
+                guest_flush: crate::db::cleanup_jobs::GuestFlush::Unrequested,
                 persist_intent,
             },
         )
@@ -935,6 +946,7 @@ impl SandboxManagerService {
                 keep_filesystem: cleanup.keep_filesystem,
                 completion: cleanup.completion,
                 immediate_kill: Self::cleanup_immediate_kill(cleanup.completion),
+                guest_flush: cleanup.guest_flush,
                 persist_intent: true,
             },
         )
@@ -956,6 +968,7 @@ impl SandboxManagerService {
                 keep_filesystem: false,
                 completion: CleanupCompletion::DeleteRow,
                 immediate_kill: false,
+                guest_flush: crate::db::cleanup_jobs::GuestFlush::Unrequested,
                 persist_intent: true,
             },
         )
@@ -1012,6 +1025,13 @@ impl SandboxManagerService {
             CleanupCompletion::DeleteRow => false,
             _ => return Err(Status::internal("invalid selected cleanup completion").into()),
         };
+        let guest_flush = if !stop {
+            crate::db::cleanup_jobs::GuestFlush::Unrequested
+        } else if immediate_kill {
+            crate::db::cleanup_jobs::GuestFlush::Forbidden
+        } else {
+            crate::db::cleanup_jobs::GuestFlush::BeforeTermination
+        };
         self.admit_lifecycle_cleanup_inner(
             sandbox_id,
             CleanupAdmissionSpec {
@@ -1027,6 +1047,7 @@ impl SandboxManagerService {
                 completion,
                 persist_intent,
                 immediate_kill,
+                guest_flush,
             },
         )
         .await?
@@ -1092,6 +1113,7 @@ impl SandboxManagerService {
             completion,
             persist_intent,
             immediate_kill,
+            guest_flush,
         } = spec;
         // Fenced callers depend on readable generation lineage. Execution
         // release and auto-lifecycle deletion require the lifecycle claim and
@@ -1447,6 +1469,12 @@ impl SandboxManagerService {
         } else {
             None
         };
+        let guest_flush = guest_flush.for_superseded_state(
+            crate::db::current_state_label(&transaction, &sandbox_id_string)
+                .ok()
+                .flatten()
+                .and_then(|state| state.parse().ok()),
+        );
         if matches!(
             target_state,
             SandboxState::Stopping | SandboxState::Deleting
@@ -1662,6 +1690,7 @@ impl SandboxManagerService {
                     completion,
                     keep_filesystem,
                     immediate_kill,
+                    guest_flush,
                     published_artifact: None,
                 },
             )
@@ -1788,6 +1817,7 @@ impl SandboxManagerService {
                         context,
                         completion,
                         immediate_kill: SandboxManagerService::cleanup_immediate_kill(completion),
+                        guest_flush: crate::db::cleanup_jobs::GuestFlush::Unrequested,
                         persist_intent: false,
                         cleanup_id: Some(cleanup_id),
                     },
@@ -2291,6 +2321,7 @@ impl SandboxManagerService {
             context: "retry blocking cleanup failure",
             completion,
             immediate_kill: Self::cleanup_immediate_kill(completion),
+            guest_flush: crate::db::cleanup_jobs::GuestFlush::Unrequested,
             persist_intent: false,
             cleanup_id: None,
         });
@@ -2388,6 +2419,7 @@ impl SandboxManagerService {
         let context = request.context;
         let completion = request.completion;
         let immediate_kill = request.immediate_kill;
+        let guest_flush = request.guest_flush;
         let return_after_slot_release =
             Self::cleanup_return_after_slot_release(keep_filesystem, completion);
         let job_id = match admission.as_ref() {
@@ -2408,6 +2440,10 @@ impl SandboxManagerService {
                 })
             },
             |mut node_client| async move {
+                // Before every termination attempt: writes can land between
+                // a flush and a retried termination.
+                self.flush_guest_before_termination(sandbox_id, guest_flush)
+                    .await;
                 service_cleanup_via_node_with_options(
                     &self.db,
                     &mut node_client,
@@ -2454,6 +2490,7 @@ impl SandboxManagerService {
             completion,
             published_artifact,
             immediate_kill: _,
+            guest_flush: _,
         } = request;
         // Cheap currentness pre-check *before* allocating the per-sandbox lock
         // entry: an already-stale or gone cleanup has no node-mgr work, so
@@ -2710,11 +2747,14 @@ impl SandboxManagerService {
         let dispatch_keep_filesystem = request.keep_filesystem;
         let dispatch_completion = request.completion;
         let dispatch_immediate_kill = request.immediate_kill;
+        let dispatch_guest_flush = request.guest_flush;
         let dispatch_context = request.context;
         self.run_cleanup_after_persistence_failure_with_node_dispatch(
             request,
             &admission,
             || async move {
+                self.flush_guest_before_termination(dispatch_sandbox_id, dispatch_guest_flush)
+                    .await;
                 let mut node_client = connect_node().await.map_err(|error| {
                     Status::internal(format!(
                         "{dispatch_context}: cannot connect to node-manager: {error}"
@@ -2917,6 +2957,142 @@ impl SandboxManagerService {
                     }
                 });
             }
+        }
+    }
+}
+
+impl SandboxManagerService {
+    /// Attempt the guest flush an ordinary stop asked for, immediately before
+    /// terminating its VM. A failed flush is recorded, and the stop proceeds.
+    async fn flush_guest_before_termination(
+        &self,
+        sandbox_id: &str,
+        guest_flush: crate::db::cleanup_jobs::GuestFlush,
+    ) {
+        if guest_flush != crate::db::cleanup_jobs::GuestFlush::BeforeTermination {
+            return;
+        }
+        let flushed = within_stop_flush_budget(
+            crate::guest_filesystem_flush::GUEST_FILESYSTEM_FLUSH_TIMEOUT,
+            self.resume_paused_vm_before_flush(sandbox_id),
+            || crate::guest_filesystem_flush::flush_guest_root_filesystem_before_stop(sandbox_id),
+        )
+        .await;
+        match flushed {
+            Ok(()) => pplx_space_metrics::sandbox::worker::stop_guest_flush("flushed"),
+            Err(error) => {
+                pplx_space_metrics::sandbox::worker::stop_guest_flush("failed");
+                tracing::warn!(
+                    %sandbox_id,
+                    %error,
+                    "guest filesystem flush before stop failed; stopping anyway, so writes the guest has not committed can be lost"
+                );
+                emit_sandbox_event(
+                    sandbox_id,
+                    SandboxEventType::StopGuestFlushFailed,
+                    SandboxEventSource::SbxManager,
+                    SandboxEventDetails::default().error(error.to_string().as_str()),
+                );
+            }
+        }
+    }
+
+    /// Resume a paused VM so the stop's flush can reach its guest; see
+    /// [`BeforeStopFlush`].
+    async fn resume_paused_vm_before_flush(&self, sandbox_id: &str) -> Result<(), StopFlushError> {
+        let id = SandboxId::from_str(sandbox_id).map_err(StopFlushError::SandboxId)?;
+        let state = crate::firecracker_via_nodemgr::get_firecracker_vm_state(id).await;
+        if let Err(error) = &state {
+            tracing::debug!(%sandbox_id, %error, "VM state unreadable before the stop flush");
+        }
+        match BeforeStopFlush::for_vm_state(state.ok()) {
+            BeforeStopFlush::Flush => Ok(()),
+            BeforeStopFlush::NotRunning => Err(StopFlushError::VmNotRunning),
+            BeforeStopFlush::ResumeThenFlush => {
+                let execution_fence = {
+                    let db = self.db_conn().map_err(StopFlushError::Database)?;
+                    crate::db::node_execution_fence(&db, sandbox_id)
+                        .map_err(StopFlushError::Fence)?
+                        .map(Into::into)
+                };
+                let mut node_client = connect_node().await.map_err(StopFlushError::NodeManager)?;
+                node_client
+                    .resume_sandbox(ResumeSandboxRequest {
+                        execution_fence,
+                        sandbox_id: sandbox_id.to_owned(),
+                    })
+                    .await
+                    .map(drop)
+                    .map_err(StopFlushError::Resume)
+            }
+        }
+    }
+}
+
+/// Why a stop's guest flush did not complete. The stop proceeds either way.
+#[derive(Debug, thiserror::Error)]
+pub(super) enum StopFlushError {
+    #[error("invalid sandbox id: {0}")]
+    SandboxId(#[source] pplx_space_common_core::types::SandboxIdParseError),
+    #[error("the VM is not running")]
+    VmNotRunning,
+    #[error("cannot read the execution fence: {0}")]
+    Database(#[source] Status),
+    #[error("cannot read the execution fence: {0}")]
+    Fence(#[source] rusqlite::Error),
+    #[error("cannot connect to node-manager: {0}")]
+    NodeManager(#[source] NodeManagerConnectError),
+    #[error("cannot resume the paused VM to flush it: {0}")]
+    Resume(#[source] Status),
+    #[error(transparent)]
+    Flush(#[from] crate::guest_filesystem_flush::GuestFlushError),
+    #[error("guest flush before stop timed out after {0:?}")]
+    TimedOut(std::time::Duration),
+}
+
+/// Prepare the guest and flush it within one `budget`. Every step can stall
+/// (a resume that never answers, a guest that never acknowledges), and the
+/// stop holds its cleanup fence meanwhile, which a forced stop also waits on;
+/// so the whole attempt, not each step, is bounded.
+pub(super) async fn within_stop_flush_budget<Flush, FlushError>(
+    budget: std::time::Duration,
+    prepare: impl std::future::Future<Output = Result<(), StopFlushError>>,
+    flush: impl FnOnce() -> Flush,
+) -> Result<(), StopFlushError>
+where
+    Flush: std::future::Future<Output = Result<(), FlushError>>,
+    FlushError: Into<StopFlushError>,
+{
+    tokio::time::timeout(budget, async {
+        prepare.await?;
+        flush().await.map_err(Into::into)
+    })
+    .await
+    .unwrap_or(Err(StopFlushError::TimedOut(budget)))
+}
+
+/// What a stop's flush needs first, from the VM's state. A paused VM cannot
+/// answer a flush, so it is resumed: pause flushes the guest before it
+/// freezes the VM, but a write still in progress then can complete after that
+/// flush, and stopping the paused VM would discard it. A running VM, or one
+/// whose state cannot be read, goes straight to the flush, which has its own
+/// budget.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum BeforeStopFlush {
+    Flush,
+    ResumeThenFlush,
+    NotRunning,
+}
+
+impl BeforeStopFlush {
+    pub(super) fn for_vm_state(
+        state: Option<pplx_space_node_runtime_core::fc_api::FirecrackerVmState>,
+    ) -> Self {
+        use pplx_space_node_runtime_core::fc_api::FirecrackerVmState;
+        match state {
+            Some(FirecrackerVmState::Running) | None => Self::Flush,
+            Some(FirecrackerVmState::Paused) => Self::ResumeThenFlush,
+            Some(FirecrackerVmState::NotStarted) => Self::NotRunning,
         }
     }
 }

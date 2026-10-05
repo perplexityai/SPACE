@@ -21,8 +21,11 @@ const MAX_TOTAL_ENTRIES: usize = 4096;
 /// Bounded cache of DNS-learned `ip -> allowed domain` mappings.
 ///
 /// An entry is created only for a domain allow resolving to an IP the policy
-/// allows. Reads re-check the installed policy so a stale entry cannot grant
-/// access in the interval before a policy-install sweep removes it.
+/// allows, and only from answers the gateway obtained itself through the
+/// reserved resolvers: replies on guest-addressed UDP/53 flows are guest-chosen
+/// data and never reach this cache. Reads re-check the installed policy so a
+/// stale entry cannot grant access in the interval before a policy-install
+/// sweep removes it.
 #[derive(Clone)]
 pub struct DnsAllowCache {
     inner: Arc<ArcSwap<HashMap<IpAddr, Vec<DnsAllowEntry>>>>,
@@ -64,8 +67,8 @@ impl DnsAllowCache {
         hit
     }
 
-    /// Whether a live DNS response observed from the guest's resolver bound
-    /// this exact `host` to `ip`.
+    /// Whether a live DNS response from a reserved resolver bound this exact
+    /// `host` to `ip`.
     ///
     /// An IP-wide mapping is not enough: CDN edge addresses are shared by
     /// unrelated tenants whose services are selected by SNI or HTTP `Host`.

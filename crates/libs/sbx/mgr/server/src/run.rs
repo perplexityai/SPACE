@@ -75,7 +75,6 @@ const STARTUP_RECOVERY_ADMISSION_TIMEOUT: Duration = DEFAULT_SERVICE_MUTEX_TIMEO
 async fn migrate_sandbox_manager_db(
     db_path: &std::path::Path,
 ) -> Result<(), pplx_space_common_svc::sql::sqlite::SqliteError> {
-    let store = pplx_space_common_svc::sql::baselines::SANDBOX_MANAGER;
     pplx_space_common_svc::sql::sqlite::migrate_embedded(
         "sandbox-manager",
         db_path,
@@ -83,8 +82,6 @@ async fn migrate_sandbox_manager_db(
             service: &SANDBOX_MANAGER_MIGRATOR,
             common: Some(&COMMON_SCHEMA_MIGRATOR),
         },
-        Some(store.baseline_version),
-        store.migration_failure_policy,
         Some(pplx_space_sbxmgr_migrations::prepare_migrations),
     )
     .await

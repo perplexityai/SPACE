@@ -90,6 +90,7 @@ async fn only_explicit_pre_execution_rejection_releases_waiting_duplicates() {
         let failure = OperationFailure {
             code: tonic::Code::ResourceExhausted as i32,
             message: "capacity exhausted".into(),
+            reason: String::new(),
         };
         execution.complete(Ok(MutationResult {
             outcome: Some(if rejected {

@@ -53,20 +53,30 @@ pub(super) struct FilesystemWorkerService {
     account: Option<Arc<GuestAccount>>,
     tasks: tokio_util::task::TaskTracker,
     watch_manager: watch::WatchManager,
-    operation_slots: Arc<Semaphore>,
+    /// Admits file operations into a budget of slots, queueing a burst briefly.
+    operation_admission: pplx_space_common_grpc::QueuedSlots,
+    upload_buffers: Arc<write::UploadBufferPool>,
 }
 
 const MAX_CONCURRENT_FILE_OPERATIONS: usize = 8;
-pub(super) const WORKER_PROTOCOL_VERSION: u32 = 2;
+pub(super) const WORKER_PROTOCOL_VERSION: u32 = 3;
 
 impl FilesystemWorkerService {
     pub(super) fn new(default_user: GuestUserName, shutdown: CancellationToken) -> Self {
+        let operation_admission = pplx_space_common_grpc::QueuedSlots::new(Arc::new(
+            Semaphore::new(MAX_CONCURRENT_FILE_OPERATIONS),
+        ))
+        .with_queue(
+            pplx_space_spaced_common::admission_queue::WAITERS,
+            pplx_space_spaced_common::admission_queue::MAX_WAIT,
+        );
         Self {
             default_user,
             account: None,
             tasks: tokio_util::task::TaskTracker::new(),
             watch_manager: watch::WatchManager::new(shutdown),
-            operation_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_FILE_OPERATIONS)),
+            operation_admission,
+            upload_buffers: Arc::new(write::UploadBufferPool::new()),
         }
     }
 
@@ -78,15 +88,12 @@ impl FilesystemWorkerService {
         Fut:
             std::future::Future<Output = Result<mutation_result::Outcome, Status>> + Send + 'static,
     {
-        let permit = match self.acquire_file_operation_slot() {
+        let permit = match self.acquire_file_operation_slot().await {
             Ok(permit) => permit,
             Err(error) => {
                 return Ok(Response::new(MutationResult {
                     outcome: Some(mutation_result::Outcome::RejectedBeforeExecution(
-                        protocol::OperationFailure {
-                            code: error.code() as i32,
-                            message: error.message().to_owned(),
-                        },
+                        operations::operation_failure(&error),
                     )),
                 }));
             }
@@ -119,9 +126,10 @@ impl FilesystemWorkerService {
     ) -> Result<Response<MutationResult>, Status> {
         let cancelled = tokio_util::sync::CancellationToken::new();
         let _cancel_on_drop = cancelled.clone().drop_guard();
+        let upload_buffers = Arc::clone(&self.upload_buffers);
         self.execute(async move |account| {
             let owner = direct_owner.map(|_| account.ownership()).transpose()?;
-            match write::write(stream, &account, owner, cancelled).await {
+            match write::write(stream, &account, owner, cancelled, upload_buffers).await {
                 Ok(response) => Ok(mutation_result::Outcome::Write(response)),
                 Err(write::WriteError::Interrupted) => {
                     Ok(mutation_result::Outcome::Interrupted(protocol::Abort {}))
@@ -132,13 +140,10 @@ impl FilesystemWorkerService {
         .await
     }
 
-    fn acquire_file_operation_slot(&self) -> Result<OwnedSemaphorePermit, Status> {
-        self.operation_slots
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| {
-                Status::resource_exhausted("too many concurrent filesystem file operations")
-            })
+    async fn acquire_file_operation_slot(&self) -> Result<OwnedSemaphorePermit, Status> {
+        self.operation_admission.acquire(1).await.ok_or_else(|| {
+            Status::resource_exhausted("too many concurrent filesystem file operations")
+        })
     }
 
     async fn account(
@@ -148,7 +153,7 @@ impl FilesystemWorkerService {
     ) -> Result<(Arc<GuestAccount>, OwnedSemaphorePermit), Status> {
         let slot = match permit {
             Some(slot) => slot,
-            None => self.acquire_file_operation_slot()?,
+            None => self.acquire_file_operation_slot().await?,
         };
         let user = guest_path::effective_user(user, &self.default_user)?;
         if let Some(account) = &self.account {
@@ -190,6 +195,9 @@ impl WorkerFilesystem for FilesystemWorkerService {
 
     type ListStream = GuestFileInfoStream;
     type ReadStream = GuestFileChunkStream;
+    type OpenReadStream = std::pin::Pin<
+        Box<dyn futures_util::Stream<Item = Result<protocol::OpenedFile, Status>> + Send>,
+    >;
     type WatchStream = watch::WatchStream;
 
     async fn stat(&self, request: Request<StatRequest>) -> Result<Response<StatResponse>, Status> {
@@ -237,7 +245,7 @@ impl WorkerFilesystem for FilesystemWorkerService {
         let request = request.into_inner();
         let path = self.normalize_path(request.path, request.user).await?;
 
-        let stream_slot = self.acquire_file_operation_slot()?;
+        let stream_slot = self.acquire_file_operation_slot().await?;
         let stream = list::list_stream(path.clone(), request.depth, stream_slot).await?;
         tracing::debug!(
             command = "bridge_guest_list",
@@ -255,7 +263,7 @@ impl WorkerFilesystem for FilesystemWorkerService {
         let path = self.normalize_path(request.path, request.user).await?;
         let offset = request.offset;
         let length = request.length;
-        let stream_slot = self.acquire_file_operation_slot()?;
+        let stream_slot = self.acquire_file_operation_slot().await?;
         let stream = read::read_stream(path.clone(), offset, length, stream_slot).await?;
         tracing::debug!(
             command = "bridge_guest_read",
@@ -265,6 +273,29 @@ impl WorkerFilesystem for FilesystemWorkerService {
             "spaced bridge guest command succeeded"
         );
         Ok(Response::new(stream))
+    }
+
+    async fn open_read(
+        &self,
+        request: Request<ReadRequest>,
+    ) -> Result<Response<Self::OpenReadStream>, Status> {
+        use futures_util::StreamExt;
+        use std::os::fd::AsRawFd;
+        let request = request.into_inner();
+        let path = self.normalize_path(request.path, request.user).await?;
+        let stream_slot = self.acquire_file_operation_slot().await?;
+        let (file, stream_slot) = read::open_for_read(path, request.offset, stream_slot).await?;
+        let fd = file.as_raw_fd();
+        // The file and this worker's admission stay held until the caller,
+        // done with its own copy of the descriptor, ends the stream.
+        let lease = (file, stream_slot);
+        let held = futures_util::stream::poll_fn(move |_| {
+            let _lease = &lease;
+            std::task::Poll::Pending
+        });
+        Ok(Response::new(Box::pin(
+            futures_util::stream::once(async move { Ok(protocol::OpenedFile { fd }) }).chain(held),
+        )))
     }
 
     async fn mkdir(
@@ -396,7 +427,7 @@ impl WorkerFilesystem for FilesystemWorkerService {
         // lifetime. Blocking scans separately retain their own scan permits.
         let request = request.into_inner();
         let path = self.normalize_path(request.path, request.user).await?;
-        let _setup_slot = self.acquire_file_operation_slot()?;
+        let _setup_slot = self.acquire_file_operation_slot().await?;
         let recursive = request.recursive;
         let include_globs = watch::parse_watch_globs(request.include_globs, "include_globs")?;
         let exclude_globs = watch::parse_watch_globs(request.exclude_globs, "exclude_globs")?;
@@ -426,7 +457,7 @@ impl WorkerFilesystem for FilesystemWorkerService {
     ) -> Result<Response<CreateWatcherResponse>, Status> {
         let request = request.into_inner();
         let root = self.normalize_path(request.root, request.user).await?;
-        let _setup_slot = self.acquire_file_operation_slot()?;
+        let _setup_slot = self.acquire_file_operation_slot().await?;
         let include_globs = watch::parse_watch_globs(request.include_globs, "include_globs")?;
         let exclude_globs = watch::parse_watch_globs(request.exclude_globs, "exclude_globs")?;
         let (watcher_id, root) = self
@@ -564,3 +595,6 @@ async fn ensure_existing_directory_no_follow(path: &Path) -> Result<(), Status> 
         path.display()
     )))
 }
+
+#[cfg(test)]
+mod tests;

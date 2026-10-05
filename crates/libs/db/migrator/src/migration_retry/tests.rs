@@ -7,10 +7,8 @@ use sqlx::SqlSafeStr as _;
 use sqlx::error::{DatabaseError, ErrorKind};
 use sqlx::migrate::{Migration, MigrationType};
 
-/// Version of `20260825055948_node_census_completeness.up.sql`, the migration
-/// used to construct errors for fabricated `Migrator`s here, never to
-/// mutate `POSTGRES_MIGRATOR`. Shared with the
-/// live-Postgres child module so the two suites cannot drift apart on it.
+/// Synthetic migration version shared with the live-Postgres child module.
+/// It is used only in fabricated migrators, never to mutate `POSTGRES_MIGRATOR`.
 const PROBE_VERSION: i64 = 20_260_825_055_948;
 
 /// Minimal [`DatabaseError`] so the classifier can be exercised on an exact

@@ -691,8 +691,12 @@ impl SpacedHostService {
             {
                 Ok(Some(snapshot)) => return Ok(snapshot),
                 Ok(None) => {}
-                Err(error) if error.code() == tonic::Code::DeadlineExceeded => {
-                    tracing::trace!(%error, "cached guest readiness probe timed out; continuing wait");
+                Err(error)
+                    if !self.inner.shutdown.is_cancelled()
+                        && (pplx_space_spaced_common::status_is_retryable(&error)
+                            || error.code() == tonic::Code::Cancelled) =>
+                {
+                    tracing::trace!(%error, "cached guest readiness probe interrupted; continuing wait");
                 }
                 Err(error) => return Err(error),
             }
@@ -719,14 +723,16 @@ impl SpacedHostService {
                     tracing::trace!(%error, "bridge guest readiness probe timed out");
                 }
                 Err(error)
-                    if matches!(
-                        error.code(),
-                        tonic::Code::Cancelled | tonic::Code::FailedPrecondition
-                    ) =>
+                    if self.inner.shutdown.is_cancelled()
+                        || error.code() == tonic::Code::FailedPrecondition =>
                 {
                     return Err(error);
                 }
                 Err(error) => {
+                    // Tonic also reports a closed transport as Cancelled. A
+                    // read-only readiness probe can reconnect within this same
+                    // deadline; actual shutdown is checked above, and dropping
+                    // the caller still drops its probe and driver permit.
                     tracing::trace!(%error, "bridge guest readiness wait failed");
                 }
             }
@@ -760,12 +766,12 @@ impl SpacedHostService {
                 bridge_guest_networking_client: LazyClient::new(),
                 host_control_client: LazyClient::new(),
                 bridge_retry_policy: DEFAULT_COMMAND_RETRY_POLICY,
-                process_payload_slots: Arc::new(tokio::sync::Semaphore::new(
+                process_admission: crate::payload_admission(
                     pplx_space_spaced_common::process_limits::PAYLOAD_SLOTS,
-                )),
-                process_request_queue: Arc::new(tokio::sync::Semaphore::new(
-                    crate::process::PROCESS_QUEUE_CAPACITY,
-                )),
+                ),
+                filesystem_admission: crate::payload_admission(
+                    pplx_space_spaced_common::filesystem_limits::PAYLOAD_SLOTS,
+                ),
                 guest_readiness: GuestReadinessCoordinator::new(),
                 guest_signal_rate: std::sync::Mutex::new(GuestSignalRateState::default()),
                 #[cfg(any(test, feature = "test-support"))]
@@ -838,17 +844,7 @@ impl SpacedHostService {
                     .layer(host_request_limiter())
                     .layer(pplx_space_common_svc::grpc_trace_layer())
                     .add_service(MetaServer::new(self.clone()))
-                    .add_service(pplx_space_common_grpc::RequestAdmission::new(
-                        pplx_space_common_grpc::PreserveInputErrors::new(
-                            FilesystemServer::new(self.clone()).max_decoding_message_size(
-                                pplx_space_spaced_common::filesystem_limits::MAX_MESSAGE_BYTES,
-                            ),
-                        ),
-                        std::sync::Arc::new(tokio::sync::Semaphore::new(
-                            pplx_space_spaced_common::filesystem_limits::PAYLOAD_SLOTS,
-                        )),
-                        pplx_space_spaced_common::filesystem_limits::PAYLOAD_METHODS,
-                    ))
+                    .add_service(self.filesystem_grpc_service())
                     .add_service(self.process_grpc_service())
                     .add_service(NetworkingServer::new(self.clone()))
                     .serve_with_incoming_shutdown(incoming, async move {

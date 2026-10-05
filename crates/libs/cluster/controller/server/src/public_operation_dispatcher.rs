@@ -1,15 +1,14 @@
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use futures_util::{StreamExt, stream};
 use pplx_space_api::cluster_admission::{ClusterSandboxAdmission, ClusterSandboxAdmissionConfig};
 use pplx_space_api::controllers::sandbox::SandboxController;
 use pplx_space_api::controllers::substrate::Substrate;
 use pplx_space_api::fork_operation_executor::ForkSandboxOperationExecutor;
 use pplx_space_api::public_operations::{
     ApiProduct, ClaimPublicOperations, ClaimedPublicOperation, CompleteClaimedPublicOperation,
-    FailClaimedPublicOperation, PublicOperationRequeueReason, PublicOperationStore,
-    ReleaseClaimedPublicOperation,
+    FailClaimedPublicOperation, PublicOperationClaim, PublicOperationRequeueReason,
+    PublicOperationStore, ReleaseClaimedPublicOperation,
 };
 use pplx_space_api::public_sandbox_operations::{
     CreateSandboxOperationExecutor, PublicOperationExecutionResult,
@@ -21,12 +20,16 @@ use pplx_space_feature_flags::FeatureFlagClient;
 use pplx_space_public_api::{OperationKind, OperationState, PublicErrorCode};
 use sqlx::PgPool;
 use std::sync::Arc;
+use tokio::task::JoinSet;
 use tokio::time::MissedTickBehavior;
 use tokio_util::sync::CancellationToken;
 
 use crate::env_config;
 
-const DEFAULT_TICK: Duration = Duration::from_secs(1);
+/// How often the dispatcher looks for newly queued operations. The claim is
+/// one indexed `FOR UPDATE SKIP LOCKED` statement that returns no rows when the
+/// queue is empty, so a short tick keeps pickup latency low at little cost.
+const DEFAULT_TICK: Duration = Duration::from_millis(200);
 const DEFAULT_CLAIM_LIMIT: u32 = 64;
 const DEFAULT_CLAIM_STALE_AFTER: Duration = Duration::from_secs(60);
 const DEFAULT_RETRY_AFTER: Duration = Duration::from_secs(5);
@@ -360,32 +363,112 @@ pub async fn run<E>(
     interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
     interval.tick().await;
 
+    // Executions run independently of the claim loop: a slow operation holds
+    // one of `execution_concurrency` slots but does not delay pickup of newly
+    // queued operations into the remaining slots.
+    let concurrency = config.execution_concurrency.max(1);
+    let execution_config = OperationExecutionConfig::from(&config);
+    let mut in_flight = JoinSet::new();
+
     loop {
         tokio::select! {
             _ = interval.tick() => {
+                let free = concurrency.saturating_sub(in_flight.len());
+                if free == 0 {
+                    continue;
+                }
                 let started = Instant::now();
-                match tick(&config, &store, &executor).await {
-                    Ok(report) => {
-                        tracing::debug!(
-                            claimed = report.claimed,
-                            succeeded = report.succeeded,
-                            failed = report.failed,
-                            retried = report.retried,
-                            stale_claims = report.stale_claims,
-                            elapsed_ms = started.elapsed().as_millis(),
-                            "public-operation-dispatcher tick completed"
-                        );
+                match claim_up_to(&config, &store, &executor, free).await {
+                    Ok(claim) => {
+                        let claimed = claim.operations.len();
+                        for operation in claim.operations {
+                            in_flight.spawn(execute_claimed_operation(
+                                store.clone(),
+                                executor.clone(),
+                                claim.claim_token.clone(),
+                                execution_config,
+                                operation,
+                            ));
+                        }
+                        if claimed > 0 {
+                            tracing::debug!(
+                                claimed,
+                                in_flight = in_flight.len(),
+                                elapsed_ms = started.elapsed().as_millis(),
+                                "public-operation-dispatcher claimed operations"
+                            );
+                        }
                     }
                     Err(error) => {
-                        tracing::warn!(error = %error, "public-operation-dispatcher tick failed");
+                        tracing::warn!(error = %error, "public-operation-dispatcher claim failed");
                     }
                 }
+            }
+            Some(joined) = in_flight.join_next(), if !in_flight.is_empty() => {
+                log_execution_outcome(joined);
             }
             _ = shutdown_token.cancelled() => break,
         }
     }
+
+    // Stop claiming, but let claimed executions finish and record their
+    // outcome, matching the previous behavior of completing the in-progress
+    // batch before exiting.
+    while let Some(joined) = in_flight.join_next().await {
+        log_execution_outcome(joined);
+    }
 }
 
+fn log_execution_outcome(
+    joined: Result<
+        Result<TickReport, pplx_space_api::public_operations::PublicOperationStoreError>,
+        tokio::task::JoinError,
+    >,
+) {
+    match joined {
+        Ok(Ok(report)) => tracing::debug!(
+            succeeded = report.succeeded,
+            failed = report.failed,
+            retried = report.retried,
+            stale_claims = report.stale_claims,
+            "public-operation-dispatcher execution completed"
+        ),
+        Ok(Err(error)) => {
+            tracing::warn!(error = %error, "public-operation-dispatcher execution failed");
+        }
+        // The claim is no longer renewed, so the operation becomes claimable
+        // again once `claim_stale_after` elapses.
+        Err(error) => {
+            tracing::error!(error = %error, "public-operation-dispatcher execution task panicked");
+        }
+    }
+}
+
+async fn claim_up_to<E>(
+    config: &ReconcilerConfig,
+    store: &PublicOperationStore,
+    executor: &E,
+    free_slots: usize,
+) -> Result<PublicOperationClaim, pplx_space_api::public_operations::PublicOperationStoreError>
+where
+    E: PublicOperationExecutor,
+{
+    let limit = u32::try_from(free_slots)
+        .unwrap_or(u32::MAX)
+        .min(config.claim_limit);
+    store
+        .claim_operations(ClaimPublicOperations {
+            limit,
+            claim_stale_after: config.claim_stale_after,
+            claimable_kinds: executor.supported_kinds(),
+        })
+        .await
+}
+
+/// Claim one batch and run it to completion. [`run`] does not use this: it
+/// keeps a bounded in-flight set so slow executions never block pickup. This
+/// remains as a deterministic single pass for tests.
+#[cfg(test)]
 pub async fn tick<E>(
     config: &ReconcilerConfig,
     store: &PublicOperationStore,
@@ -394,6 +477,8 @@ pub async fn tick<E>(
 where
     E: PublicOperationExecutor + Clone,
 {
+    use futures_util::{StreamExt, stream};
+
     let claim = store
         .claim_operations(ClaimPublicOperations {
             limit: config.claim_limit,
@@ -718,6 +803,7 @@ fn is_native_m1_terminalized_kind(api_product: ApiProduct, kind: OperationKind) 
         )
 }
 
+#[cfg(test)]
 impl TickReport {
     fn merge(&mut self, other: Self) {
         self.claimed += other.claimed;

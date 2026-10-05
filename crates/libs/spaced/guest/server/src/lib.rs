@@ -18,7 +18,7 @@ mod tests;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
@@ -131,12 +131,6 @@ fn observe_connection_admission(
         event.reason().map_or("none", |reason| reason.as_str()),
     );
 }
-
-// `openpty` cannot create both descriptors with CLOEXEC atomically. Every
-// production child spawn in this process takes this lock, so no concurrent
-// fork can inherit a PTY during the short openpty→fcntl window.
-static GUEST_CHILD_SPAWN_LOCK: LazyLock<tokio::sync::Mutex<()>> =
-    LazyLock::new(|| tokio::sync::Mutex::new(()));
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConnectBridgeHostError {
@@ -327,6 +321,13 @@ impl std::fmt::Debug for SpacedGuestService {
 struct SpacedGuestServiceInner {
     shutdown: CancellationToken,
     process_tasks: tokio_util::task::TaskTracker,
+    /// Orders process-start admission with shutdown. A start checks
+    /// readiness, claims its process id, begins its idempotent operation and
+    /// registers its owner in `process_tasks` under this gate, and shutdown
+    /// closes `process_tasks` under it, so no admitted start escapes the
+    /// drain. It is never held across a spawn: a spawn that stalls must not
+    /// stall every other start.
+    start_gate: std::sync::Mutex<()>,
     process_payload_slots: Arc<Semaphore>,
     filesystem_flush_slots: Arc<Semaphore>,
     host_connector_type: HostConnectorType,
@@ -385,6 +386,7 @@ impl SpacedGuestService {
             inner: Arc::new(SpacedGuestServiceInner {
                 shutdown,
                 process_tasks: tokio_util::task::TaskTracker::new(),
+                start_gate: std::sync::Mutex::new(()),
                 filesystem_flush_slots: Arc::new(Semaphore::new(1)),
                 process_payload_slots: Arc::new(Semaphore::new(
                     pplx_space_spaced_common::process_limits::PAYLOAD_SLOTS,
@@ -498,6 +500,18 @@ impl SpacedGuestService {
         .await
     }
 
+    /// Stop admitting process starts. Closure is serialized with start
+    /// admission, so every start admitted before it has its owner tracked in
+    /// `process_tasks` and the drain waits for it.
+    fn close_process_admission(&self) {
+        let _start_gate = self
+            .inner
+            .start_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.inner.process_tasks.close();
+    }
+
     pub async fn run(self) -> Result<(), RunGuestServerError> {
         tracing::info!(
             guest_socket_path = ?self.inner.local_socket_path,
@@ -532,11 +546,7 @@ impl SpacedGuestService {
         let mut local_error = None;
         let mut bridge_error = None;
         let drain = async {
-            // Serialize closure with process publication, not just OS spawn.
-            {
-                let _spawn_guard = GUEST_CHILD_SPAWN_LOCK.lock().await;
-                self.inner.process_tasks.close();
-            }
+            self.close_process_admission();
             tokio::join!(
                 self.inner.filesystem.drain(),
                 self.inner.process_tasks.wait(),

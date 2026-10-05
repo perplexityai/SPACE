@@ -1,7 +1,10 @@
 use super::*;
+use crate::QueuedSlots;
 use std::convert::Infallible;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
+use tokio::sync::Semaphore;
 
 fn request(method: &str) -> http::Request<Body> {
     http::Request::builder()
@@ -33,7 +36,7 @@ async fn overload_never_enters_decoder_and_execution_retains_admission_after_can
     let slots = Arc::new(Semaphore::new(4));
     let mut service = RequestAdmission::new(
         inner,
-        slots.clone(),
+        QueuedSlots::new(slots.clone()),
         &[("Write", 1), ("WriteBatch", 4), ("Rename", 1)],
     );
     let mut other_listener = service.clone();
@@ -79,7 +82,8 @@ async fn dropping_an_unpolled_request_releases_admission() {
         std::future::pending::<Result<http::Response<Body>, Infallible>>()
     });
     let slots = Arc::new(Semaphore::new(1));
-    let mut service = RequestAdmission::new(inner, slots.clone(), &[("Write", 1)]);
+    let mut service =
+        RequestAdmission::new(inner, QueuedSlots::new(slots.clone()), &[("Write", 1)]);
     let request = service.call(request("Write"));
     assert_eq!(slots.available_permits(), 0);
     drop(request);
@@ -96,20 +100,29 @@ async fn bounded_queue_does_not_decode_and_releases_on_cancel_or_timeout() {
     });
     let slots = Arc::new(Semaphore::new(8));
     let occupied = slots.clone().acquire_many_owned(8).await.unwrap();
-    let waiting = Arc::new(Semaphore::new(2));
-    let mut service = RequestAdmission::new(inner, slots.clone(), &[("Start", 4)])
-        .with_queue(waiting.clone(), Duration::from_millis(50));
+    let mut service = RequestAdmission::new(
+        inner,
+        QueuedSlots::new(slots.clone()).with_queue(2, Duration::from_millis(50)),
+        &[("Start", 4)],
+    );
     let first = service.call(request("Start"));
     let second = service.clone().call(request("Start"));
     let rejected = service.call(request("Start")).await.unwrap();
     assert_eq!(rejected.headers()["grpc-status"], "8");
     assert_eq!(entered.load(Ordering::SeqCst), 0);
-    assert_eq!(waiting.available_permits(), 0);
+    // A cancelled waiter frees its place: the next request queues again.
     drop(first);
-    assert_eq!(waiting.available_permits(), 1);
+    let mut requeued = service.call(request("Start"));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(10), &mut requeued)
+            .await
+            .is_err(),
+        "the freed place queues the next request instead of rejecting it"
+    );
     let rejected = second.await.unwrap();
     assert_eq!(rejected.headers()["grpc-status"], "8");
-    assert_eq!(waiting.available_permits(), 2);
+    let rejected = requeued.await.unwrap();
+    assert_eq!(rejected.headers()["grpc-status"], "8");
     assert_eq!(entered.load(Ordering::SeqCst), 0);
     drop(occupied);
     service.call(request("Start")).await.unwrap();
@@ -135,9 +148,11 @@ async fn twenty_starts_drain_without_expanding_decoded_payload_capacity() {
         }
     });
     let slots = Arc::new(Semaphore::new(8));
-    let waiting = Arc::new(Semaphore::new(20));
-    let mut service = RequestAdmission::new(inner, slots.clone(), &[("Start", 4)])
-        .with_queue(waiting.clone(), Duration::from_millis(50));
+    let mut service = RequestAdmission::new(
+        inner,
+        QueuedSlots::new(slots.clone()).with_queue(20, Duration::from_millis(50)),
+        &[("Start", 4)],
+    );
     let mut requests = tokio::task::JoinSet::new();
     for _ in 0..20 {
         requests.spawn(service.call(request("Start")));
@@ -153,7 +168,6 @@ async fn twenty_starts_drain_without_expanding_decoded_payload_capacity() {
     }
     assert_eq!(maximum.load(Ordering::SeqCst), 2);
     assert_eq!(slots.available_permits(), 8);
-    assert_eq!(waiting.available_permits(), 20);
 }
 
 #[tokio::test(start_paused = true)]
@@ -165,12 +179,13 @@ async fn queue_deadline_includes_time_before_first_poll() {
     );
     let slots = Arc::new(Semaphore::new(4));
     let occupied = slots.clone().acquire_many_owned(4).await.unwrap();
-    let waiting = Arc::new(Semaphore::new(1));
-    let mut service = RequestAdmission::new(inner, slots, &[("Start", 4)])
-        .with_queue(waiting.clone(), Duration::from_millis(50));
+    let mut service = RequestAdmission::new(
+        inner,
+        QueuedSlots::new(slots).with_queue(1, Duration::from_millis(50)),
+        &[("Start", 4)],
+    );
     let queued = service.call(request("Start"));
     tokio::time::advance(Duration::from_millis(51)).await;
     drop(occupied);
     assert_eq!(queued.await.unwrap().headers()["grpc-status"], "8");
-    assert_eq!(waiting.available_permits(), 1);
 }

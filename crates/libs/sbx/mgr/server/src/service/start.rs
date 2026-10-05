@@ -3,7 +3,7 @@
 //! Startup and periodic repair stay in `recovery`; this module owns activation
 //! request parsing, placement and memory-policy resolution, and launch sequencing.
 
-use pplx_space_common_core::types::LocalArtifactId;
+use pplx_space_common_core::types::{LocalArtifactId, RateLimiter, TokenBucket};
 
 use super::activation_support::{
     ActivationFailureStage, IdentityFreeDirectActivationAuthority, StartStateTransition,
@@ -1177,6 +1177,7 @@ impl SandboxManagerService {
                 completion: CleanupCompletion::MarkSuspended,
                 published_artifact: None,
                 immediate_kill: Self::cleanup_immediate_kill(CleanupCompletion::MarkSuspended),
+                guest_flush: crate::db::cleanup_jobs::GuestFlush::Unrequested,
             };
             if let Some(cleanup_id) = cleanup_id {
                 start_stage(
@@ -1926,20 +1927,19 @@ impl SandboxManagerService {
         // Build-manager VMs retain their existing rate-limiter exemption. All
         // other sandboxes use the immutable assignment stored on their row.
         let is_builder = sandbox.user.kind() == SandboxOwnerKind::Builder;
-        let disk_rate_limiter = firecracker_disk_rate_limiter(is_builder, sandbox.disk_io_limits);
+        let disk_rate_limiter = firecracker_rate_limiter_field(
+            "rate_limiter",
+            self.rootfs_rate_limiter(is_builder, sandbox.disk_io_limits)
+                .as_ref(),
+        );
         let net_rate_limiters = if is_builder {
             String::new()
         } else {
-            r#",
-    "rx_rate_limiter": {
-      "bandwidth": { "size": 52428800, "refill_time": 1000 },
-      "ops": { "size": 10000, "refill_time": 1000 }
-    },
-    "tx_rate_limiter": {
-      "bandwidth": { "size": 52428800, "refill_time": 1000 },
-      "ops": { "size": 10000, "refill_time": 1000 }
-    }"#
-            .to_string()
+            format!(
+                "{}{}",
+                firecracker_rate_limiter_field("rx_rate_limiter", Some(&NET_RATE_LIMITER)),
+                firecracker_rate_limiter_field("tx_rate_limiter", Some(&NET_RATE_LIMITER)),
+            )
         };
 
         let huge_pages = if self.config.hugepages {
@@ -2489,23 +2489,56 @@ impl SandboxManagerService {
     }
 }
 
-fn firecracker_disk_rate_limiter(
-    is_builder: bool,
-    limits: pplx_space_common_core::types::DiskIoLimits,
-) -> String {
-    if is_builder {
-        return String::new();
+impl SandboxManagerService {
+    /// A sandbox VM's rootfs rate limiter, at cold boot and after a snapshot
+    /// load alike. Build-manager VMs keep their exemption; every other sandbox
+    /// uses the immutable assignment stored on its row.
+    pub(super) fn rootfs_rate_limiter(
+        &self,
+        is_builder: bool,
+        limits: pplx_space_common_core::types::DiskIoLimits,
+    ) -> Option<RateLimiter> {
+        (!is_builder).then(|| RateLimiter::for_disk(limits, self.config.disk_io_burst_secs()))
     }
+}
 
-    let bandwidth_bytes_per_sec = limits.max_bandwidth_mib_per_sec() * 1024 * 1024;
-    format!(
-        r#",
-    "rate_limiter": {{
-      "bandwidth": {{ "size": {bandwidth_bytes_per_sec}, "refill_time": 1000 }},
-      "ops": {{ "size": {operations_per_sec}, "refill_time": 1000 }}
-    }}"#,
-        operations_per_sec = limits.max_operations_per_sec(),
-    )
+/// The limiter for node-manager to apply after a snapshot load, which
+/// otherwise keeps the limiter of the VM the snapshot was taken from.
+pub(super) fn drive_rate_limit_proto(
+    limiter: RateLimiter,
+) -> pplx_space_node_mgr_client::proto::DriveRateLimit {
+    let bucket = |bucket: TokenBucket| pplx_space_node_mgr_client::proto::TokenBucket {
+        size: bucket.size,
+        refill_time_ms: bucket.refill_time_ms,
+    };
+    pplx_space_node_mgr_client::proto::DriveRateLimit {
+        bandwidth: Some(bucket(limiter.bandwidth)),
+        operations: Some(bucket(limiter.operations)),
+    }
+}
+
+/// Each direction of a sandbox's network interface: 50 MiB/s and 10000
+/// packets/s, refilled every second.
+const NET_RATE_LIMITER: RateLimiter = RateLimiter {
+    bandwidth: TokenBucket {
+        size: 52_428_800,
+        refill_time_ms: 1000,
+    },
+    operations: TokenBucket {
+        size: 10_000,
+        refill_time_ms: 1000,
+    },
+};
+
+/// `name`'s entry in the VM configuration's JSON, following the previous
+/// field; nothing without a limiter.
+fn firecracker_rate_limiter_field(name: &str, limiter: Option<&RateLimiter>) -> String {
+    limiter.map_or_else(String::new, |limiter| {
+        format!(
+            ",\n    \"{name}\": {}",
+            pplx_space_node_runtime_core::fc_api::rate_limiter_json(limiter)
+        )
+    })
 }
 
 #[cfg(test)]

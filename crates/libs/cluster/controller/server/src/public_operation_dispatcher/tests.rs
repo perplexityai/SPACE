@@ -268,6 +268,181 @@ async fn delete_execution_renews_claim_while_a_phase_is_blocked() -> TestResult 
     Ok(())
 }
 
+fn fast_loop_config(execution_concurrency: usize) -> ReconcilerConfig {
+    ReconcilerConfig {
+        enabled: true,
+        tick: Duration::from_millis(20),
+        execution_concurrency,
+        ..ReconcilerConfig::default()
+    }
+}
+
+async fn operation_state(pool: &PgPool, operation_id: OperationId) -> Result<String, sqlx::Error> {
+    sqlx::query_scalar(sql!(
+        "SELECT state FROM public_operations WHERE operation_id = $1"
+    ))
+    .bind(operation_id.as_uuid())
+    .fetch_one(pool)
+    .await
+}
+
+async fn wait_for_state(
+    pool: &PgPool,
+    operation_id: OperationId,
+    expected: OperationState,
+) -> TestResult {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if operation_state(pool, operation_id).await? == expected.as_str() {
+                return Ok::<(), sqlx::Error>(());
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn run_slow_execution_does_not_block_newly_queued_operation() -> TestResult {
+    let Some(db) = pplx_space_db_test_fixtures::try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let org_id = OrgId::from_uuid(seed_org(&db.pool).await?);
+    let store = PublicOperationStore::new(db.pool.clone());
+    let slow = create_queued_operation(
+        &store,
+        org_id,
+        ApiProduct::Native,
+        OperationKind::DeleteSandbox,
+        TargetBlockingExecutor::BLOCKED_TARGET,
+    )
+    .await?;
+    let executor = TargetBlockingExecutor::default();
+    let shutdown = CancellationToken::new();
+    let dispatcher = tokio::spawn(run(
+        fast_loop_config(2),
+        store.clone(),
+        executor.clone(),
+        shutdown.clone(),
+    ));
+    executor.started.notified().await;
+
+    let fast = create_queued_operation(
+        &store,
+        org_id,
+        ApiProduct::Native,
+        OperationKind::DeleteSandbox,
+        "sbx_fast",
+    )
+    .await?;
+    wait_for_state(&db.pool, fast, OperationState::Succeeded).await?;
+    assert_eq!(
+        operation_state(&db.pool, slow).await?,
+        OperationState::Running.as_str()
+    );
+
+    executor.release.notify_one();
+    wait_for_state(&db.pool, slow, OperationState::Succeeded).await?;
+    shutdown.cancel();
+    tokio::time::timeout(Duration::from_secs(5), dispatcher).await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn run_never_claims_beyond_execution_concurrency() -> TestResult {
+    let Some(db) = pplx_space_db_test_fixtures::try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let org_id = OrgId::from_uuid(seed_org(&db.pool).await?);
+    let store = PublicOperationStore::new(db.pool.clone());
+    let slow = create_queued_operation(
+        &store,
+        org_id,
+        ApiProduct::Native,
+        OperationKind::DeleteSandbox,
+        TargetBlockingExecutor::BLOCKED_TARGET,
+    )
+    .await?;
+    let executor = TargetBlockingExecutor::default();
+    let shutdown = CancellationToken::new();
+    let dispatcher = tokio::spawn(run(
+        fast_loop_config(1),
+        store.clone(),
+        executor.clone(),
+        shutdown.clone(),
+    ));
+    executor.started.notified().await;
+
+    let waiting = create_queued_operation(
+        &store,
+        org_id,
+        ApiProduct::Native,
+        OperationKind::DeleteSandbox,
+        "sbx_waiting",
+    )
+    .await?;
+    // Many ticks elapse while the only slot is busy; the waiting operation
+    // must stay unclaimed rather than being claimed and left to go stale.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let (state, attempts): (String, i32) = sqlx::query_as(sql!(
+        "SELECT state, attempts FROM public_operations WHERE operation_id = $1"
+    ))
+    .bind(waiting.as_uuid())
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(state, OperationState::Queued.as_str());
+    assert_eq!(attempts, 0);
+
+    executor.release.notify_one();
+    wait_for_state(&db.pool, slow, OperationState::Succeeded).await?;
+    wait_for_state(&db.pool, waiting, OperationState::Succeeded).await?;
+    shutdown.cancel();
+    tokio::time::timeout(Duration::from_secs(5), dispatcher).await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn run_shutdown_drains_in_flight_executions() -> TestResult {
+    let Some(db) = pplx_space_db_test_fixtures::try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let org_id = OrgId::from_uuid(seed_org(&db.pool).await?);
+    let store = PublicOperationStore::new(db.pool.clone());
+    let slow = create_queued_operation(
+        &store,
+        org_id,
+        ApiProduct::Native,
+        OperationKind::DeleteSandbox,
+        TargetBlockingExecutor::BLOCKED_TARGET,
+    )
+    .await?;
+    let executor = TargetBlockingExecutor::default();
+    let shutdown = CancellationToken::new();
+    let dispatcher = tokio::spawn(run(
+        fast_loop_config(1),
+        store.clone(),
+        executor.clone(),
+        shutdown.clone(),
+    ));
+    executor.started.notified().await;
+
+    shutdown.cancel();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        !dispatcher.is_finished(),
+        "shutdown must wait for the in-flight execution"
+    );
+
+    executor.release.notify_one();
+    tokio::time::timeout(Duration::from_secs(5), dispatcher).await??;
+    assert_eq!(
+        operation_state(&db.pool, slow).await?,
+        OperationState::Succeeded.as_str()
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn tick_does_not_exhaust_workflow_progress_requeues() -> TestResult {
     let Some(db) = pplx_space_db_test_fixtures::try_pg_test_db().await? else {
@@ -745,6 +920,45 @@ impl PublicOperationExecutor for BlockingExecutor {
         OperationExecutionResult {
             state: OperationState::Succeeded,
             progress_message: "completed after delayed phase".to_string(),
+            result_json: Some(serde_json::json!({})),
+            terminal_error_code: None,
+            terminal_error_json: None,
+            retry_after: None,
+            requeue_reason: PublicOperationRequeueReason::TransientFailure,
+        }
+    }
+}
+
+/// Blocks only the operation targeting [`Self::BLOCKED_TARGET`] until
+/// released; every other operation succeeds immediately.
+#[derive(Clone, Default)]
+struct TargetBlockingExecutor {
+    started: Arc<Notify>,
+    release: Arc<Notify>,
+}
+
+impl TargetBlockingExecutor {
+    const BLOCKED_TARGET: &'static str = "sbx_slow";
+}
+
+#[async_trait::async_trait]
+impl PublicOperationExecutor for TargetBlockingExecutor {
+    fn supported_kinds(&self) -> &'static [OperationKind] {
+        &[OperationKind::DeleteSandbox]
+    }
+
+    async fn execute(
+        &self,
+        _claim_token: &str,
+        operation: ClaimedPublicOperation,
+    ) -> OperationExecutionResult {
+        if operation.target_id.as_deref() == Some(Self::BLOCKED_TARGET) {
+            self.started.notify_one();
+            self.release.notified().await;
+        }
+        OperationExecutionResult {
+            state: OperationState::Succeeded,
+            progress_message: "completed".to_string(),
             result_json: Some(serde_json::json!({})),
             terminal_error_code: None,
             terminal_error_json: None,

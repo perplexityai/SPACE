@@ -200,6 +200,7 @@ const LOCAL_ENDPOINT_URI: &str = "http://[::]:50051";
 
 fn configured_endpoint() -> Result<Endpoint, tonic::transport::Error> {
     Ok(Endpoint::try_from(LOCAL_ENDPOINT_URI)?
+        .max_frame_size(pplx_space_common_grpc::BULK_HTTP2_MAX_FRAME_SIZE)
         .timeout(REQUEST_TIMEOUT)
         .http2_keep_alive_interval(HTTP2_KEEP_ALIVE_INTERVAL)
         .keep_alive_timeout(KEEP_ALIVE_TIMEOUT))

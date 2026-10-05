@@ -109,7 +109,6 @@ members = [
     "crates/libs/credential/provider/proto",
     "crates/apps/vol/mgr/svc",
     "crates/libs/vol/mgr/client",
-    "crates/libs/vol/mgr/migrations",
     "crates/libs/vol/mgr/server",
 ]
 
@@ -304,7 +303,6 @@ pplx-space-credential-provider-client = { path = "crates/libs/credential/provide
 pplx-space-credential-provider-proto = { path = "crates/libs/credential/provider/proto" }
 pplx-space-volmgr = { path = "crates/libs/vol/mgr/server" }
 pplx-space-volmgr-client = { path = "crates/libs/vol/mgr/client" }
-pplx-space-volmgr-migrations = { path = "crates/libs/vol/mgr/migrations" }
 pplx-space-net-gateway = { path = "crates/libs/net/gateway/server" }
 pplx-space-net-gateway-client = { path = "crates/libs/net/gateway/client" }
 pplx-space-node-api-client = { path = "crates/libs/node/api/client" }

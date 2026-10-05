@@ -268,7 +268,7 @@ impl LocalArtifacts {
     /// Scoped to the pin, not to the disk. Two kinds of unbacked local
     /// bytes are deliberately outside it, because the control-plane queue
     /// this feeds (`node_local_backup_pending`, in
-    /// `db/postgres/20260920025850_node_local_backup_pending.up.sql`) is
+    /// `db/postgres/20261002070625_baseline.up.sql`) is
     /// keyed `PRIMARY KEY (node_id, sandbox_id)` and so holds one artifact
     /// per sandbox: a suspended sandbox carrying **no** pin
     /// (`sandbox_eviction::LocalEvidence::Unpinned`), and `snapshot`-origin
