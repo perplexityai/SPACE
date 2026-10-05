@@ -8,7 +8,9 @@ use pplx_space_public_api::{
     SandboxLifecycleAction as PublicSandboxLifecycleAction,
 };
 
-use crate::public_operations::{CreatePublicOperationResult, PublicOperationStore};
+use crate::public_operations::{
+    CreatePublicOperationResult, PublicOperationStore, PublicOperationStoreError,
+};
 use crate::public_sandbox_operations::SandboxLifecycleOperationPayload;
 
 const CONNECT_UNREACHABLE_TOUCH_RETRY_ATTEMPTS: usize = 2;
@@ -16,6 +18,7 @@ const CONNECT_UNREACHABLE_TOUCH_RETRY_DELAY: std::time::Duration =
     std::time::Duration::from_millis(50);
 const DELETE_OPERATION_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 const DELETE_OPERATION_POLL: std::time::Duration = std::time::Duration::from_millis(100);
+const DELETE_NOT_ACCEPTED_RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(1);
 fn connect_activation_request() -> Option<crate::models::SandboxActivationRequest> {
     None
 }
@@ -529,7 +532,7 @@ pub(super) async fn delete_sandbox(
                 error = %error,
                 "failed to persist durable sandbox delete operation"
             );
-            E2bApiError::internal("Internal server error")
+            delete_admission_error(&error)
         })?;
     let operation_id = match created {
         CreatePublicOperationResult::Created(operation_id)
@@ -539,7 +542,38 @@ pub(super) async fn delete_sandbox(
             return Err(E2bApiError::internal("Internal server error"));
         }
     };
-    wait_for_delete_operation(&store, sandbox.org_id, operation_id, public_sandbox_id).await
+    wait_for_delete_operation(
+        &store,
+        sandbox.org_id,
+        operation_id,
+        public_sandbox_id,
+        DELETE_OPERATION_WAIT,
+    )
+    .await
+}
+
+/// Admission joins any active delete for the target, so a retried DELETE
+/// never queues a second one. A database failure leaves acceptance unproven
+/// and is retryable; only a malformed stored row is a server fault.
+fn delete_admission_error(error: &PublicOperationStoreError) -> E2bApiError {
+    match error {
+        PublicOperationStoreError::Sql(error)
+            if pplx_space_common_svc::sql::contention::is_lock_contention(error) =>
+        {
+            E2bApiError::lock_contention()
+        }
+        PublicOperationStoreError::Sql(_) => delete_not_accepted(),
+        _ => E2bApiError::internal("Internal server error"),
+    }
+}
+
+fn delete_not_accepted() -> E2bApiError {
+    E2bApiError::new(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Sandbox delete was not accepted; retry the request",
+    )
+    .with_classification(ResponseOrigin::Api, ResponseKind::Internal)
+    .with_retry_after(DELETE_NOT_ACCEPTED_RETRY_AFTER)
 }
 
 struct DeleteOperationObserver {
@@ -567,22 +601,24 @@ async fn wait_for_delete_operation(
     org_id: OrgId,
     operation_id: pplx_space_public_api::OperationId,
     sandbox_id: PublicSandboxId,
+    wait: std::time::Duration,
 ) -> Result<StatusCode, E2bApiError> {
     let mut observer = DeleteOperationObserver {
         operation_id,
         sandbox_id,
         completed: false,
     };
-    let result = tokio::time::timeout(DELETE_OPERATION_WAIT, async {
+    let result = tokio::time::timeout(wait, async {
         loop {
-            let operation = store
-                .fetch_operation(org_id, operation_id)
-                .await
-                .map_err(|error| {
-                    tracing::error!(%operation_id, %sandbox_id, %error, "failed to observe sandbox delete operation");
-                    E2bApiError::internal("Internal server error")
-                })?
-                .ok_or_else(|| E2bApiError::internal("Internal server error"))?;
+            let operation = match store.fetch_operation(org_id, operation_id).await {
+                Ok(operation) => operation,
+                Err(error) => {
+                    // The delete is already durable; only this observation failed.
+                    tracing::warn!(%operation_id, %sandbox_id, %error, "failed to observe sandbox delete operation");
+                    return Ok(StatusCode::ACCEPTED);
+                }
+            }
+            .ok_or_else(|| E2bApiError::internal("Internal server error"))?;
             match operation.state {
                 OperationState::Succeeded => return Ok(StatusCode::NO_CONTENT),
                 OperationState::Failed | OperationState::Canceled | OperationState::Expired => {
@@ -613,7 +649,11 @@ async fn wait_for_delete_operation(
                 result = "timeout",
                 "sandbox delete remains in progress after HTTP wait budget"
             );
-            Err(E2bApiError::sandbox_timeout())
+            // A worker that is draining or restarting can hold the delete
+            // past this budget. A data-plane failure shape would send
+            // clients back to reconnect and delete again, but the queued
+            // operation finishes on its own, so report it as accepted.
+            Ok(StatusCode::ACCEPTED)
         }
     }
 }
@@ -649,7 +689,13 @@ fn e2b_operation_failure(
         )
         | None => StatusCode::INTERNAL_SERVER_ERROR,
     };
-    E2bApiError::new(status, message)
+    let error = E2bApiError::new(status, message);
+    // The failed operation is no longer active, so a new DELETE queues fresh work.
+    if status == StatusCode::SERVICE_UNAVAILABLE {
+        error.with_retry_after(DELETE_NOT_ACCEPTED_RETRY_AFTER)
+    } else {
+        error
+    }
 }
 
 pub(super) async fn connect_sandbox(
