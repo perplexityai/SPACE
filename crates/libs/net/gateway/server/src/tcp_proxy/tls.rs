@@ -54,8 +54,21 @@ pub(crate) enum TlsTransportError {
     Upstream(#[source] io::Error),
     #[error("HTTP connection failed")]
     Http(#[from] hyper::Error),
-    #[error("guest did not complete initial HTTP headers within the deadline")]
-    HeaderTimeout,
+}
+
+// hyper-util's auto server erases the error type. Recover it at the boundary
+// to preserve HTTP diagnostics and socket error kinds.
+impl From<Box<dyn std::error::Error + Send + Sync>> for TlsTransportError {
+    fn from(error: Box<dyn std::error::Error + Send + Sync>) -> Self {
+        let error = match error.downcast::<hyper::Error>() {
+            Ok(error) => return Self::Http(*error),
+            Err(error) => error,
+        };
+        Self::Downstream(match error.downcast::<io::Error>() {
+            Ok(error) => *error,
+            Err(error) => io::Error::other(error),
+        })
+    }
 }
 
 impl TlsTransportError {
@@ -63,7 +76,6 @@ impl TlsTransportError {
         let failure = self.failure();
         let http = match self {
             Self::Http(error) => HttpFailure::classify(error),
-            Self::HeaderTimeout => HttpFailure::HEADER_TIMEOUT,
             _ => HttpFailure::NOT_HTTP,
         };
         let io_kind = self.io_error().map(io::Error::kind).or(http.io_kind);
@@ -93,7 +105,7 @@ impl TlsTransportError {
             Self::Certificate(_) | Self::Configuration(_) => "tls_configuration_error",
             Self::Downstream(_) => "tls_downstream_error",
             Self::Upstream(_) => "tls_upstream_error",
-            Self::Http(_) | Self::HeaderTimeout => "http_connection_error",
+            Self::Http(_) => "http_connection_error",
         }
     }
 
@@ -117,7 +129,7 @@ impl TlsTransportError {
             Self::Downstream(error) | Self::Upstream(error) => {
                 tls_failure_from_io(error).unwrap_or_else(|| TlsFailure::new("io"))
             }
-            Self::Http(_) | Self::HeaderTimeout => TlsFailure::new("http"),
+            Self::Http(_) => TlsFailure::new("http"),
         }
     }
 }
@@ -139,14 +151,6 @@ pub(super) struct HttpFailure {
 impl HttpFailure {
     const NOT_HTTP: Self = Self {
         reason: "not_http",
-        io_kind: None,
-        h2_reason: None,
-        h2_origin: None,
-    };
-
-    /// Same bucket hyper's h1 `header_read_timeout` lands in.
-    const HEADER_TIMEOUT: Self = Self {
-        reason: "timeout",
         io_kind: None,
         h2_reason: None,
         h2_origin: None,
@@ -434,7 +438,7 @@ impl TcpProxy {
                     let offer = upstream_alpn_offer(client_alpn, guest_protocol);
                     connect(origin, &upstream_lease, &interception, offer).await
                 };
-                tls_http::serve(downstream, negotiated, binding, lease.clone(), connect).await
+                tls_http::serve(downstream, binding, lease.clone(), connect).await
             };
             let result = tokio::select! {
                 biased;

@@ -216,7 +216,6 @@ def load_cases(directory, pattern):
                         "tunnel_authority",
                         "tunnel_method",
                         "proxy_anyauth",
-                        "client",
                         "expect",
                         "http_status",
                         "token",
@@ -231,16 +230,6 @@ def load_cases(directory, pattern):
                 )
                 kind = probe.get("kind")
                 require(kind in PORTS, f"{name}: unknown kind {kind}")
-                if "client" in probe:
-                    require(
-                        kind == "connect"
-                        and probe["client"] == "go"
-                        and not any(
-                            field in probe
-                            for field in ("proxy_anyauth", "tunnel_authority", "tunnel_method")
-                        ),
-                        f"{name}: client=go requires an unmodified CONNECT probe",
-                    )
                 if "proxy_anyauth" in probe:
                     require(
                         kind == "connect" and type(probe["proxy_anyauth"]) is bool,
@@ -248,7 +237,7 @@ def load_cases(directory, pattern):
                     )
                 if "alpn" in probe:
                     require(
-                        kind == "tls"
+                        kind in ("tls", "connect")
                         and isinstance(probe["alpn"], list)
                         and probe["alpn"]
                         and all(
@@ -258,12 +247,22 @@ def load_cases(directory, pattern):
                         and len(probe["alpn"]) == len(set(probe["alpn"])),
                         f"{name}: alpn requires unique supported fixture protocols",
                     )
+                    if kind == "connect":
+                        require(
+                            not any(
+                                field in probe
+                                for field in (
+                                    "proxy_anyauth", "tunnel_authority", "tunnel_method"
+                                )
+                            ),
+                            f"{name}: CONNECT alpn requires an unmodified tunnel probe",
+                        )
                 for field in ("downstream_alpn", "upstream_alpn"):
                     if field in probe:
                         require(
                             (
                                 kind == "tls"
-                                or (kind == "connect" and probe.get("client") == "go")
+                                or (kind == "connect" and "alpn" in probe)
                             )
                             and probe[field] in ("h2", "http/1.1"),
                             f"{name}: {field} requires a supported TLS protocol",

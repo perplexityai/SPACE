@@ -5,7 +5,7 @@ use std::convert::Infallible;
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -36,6 +36,8 @@ mod upgrade;
 
 type Body = Either<ForwardingBody, Empty<Bytes>>;
 const HEADER_TIMEOUT: Duration = Duration::from_secs(30);
+const H2_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(30);
+const H2_KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_HEADERS: usize = 128;
 const MAX_HEADER_BYTES: u32 = 32 * 1024;
 const MAX_STREAMS: u32 = 32;
@@ -141,8 +143,6 @@ impl HttpBody for ForwardingBody {
 }
 
 struct Session<F> {
-    /// First parsed request; also marks completion of the initial header wait.
-    served: OnceLock<HttpProtocol>,
     binding: HostBinding,
     lease: Arc<CertificateLease>,
     connect: Mutex<Option<F>>,
@@ -155,19 +155,16 @@ struct Session<F> {
 
 /// Serve inspected HTTP on an established guest TLS stream.
 ///
-/// `negotiated` is the ALPN result and is telemetry only. The HTTP version
-/// actually served is detected from the guest's first bytes: an HTTP/2
+/// The HTTP version is detected from the guest's first bytes: an HTTP/2
 /// connection preface selects hyper's h2 server, anything else selects h1.
 /// Go's `net/http` offers `h2` to an `https://` forward proxy and then writes
 /// an HTTP/1.1 `CONNECT`; parsing that as h2 would answer the CONNECT with a
 /// SETTINGS frame and a `PROTOCOL_ERROR` GOAWAY.
 ///
-/// The guest has 30 seconds to send its first complete request headers, including
-/// protocol detection. Request bodies and responses may outlive this deadline.
+/// Protocol detection has no timeout; hyper's timers apply after it completes.
 /// `connect` lazily opens the origin with the detected guest protocol.
 pub(super) async fn serve<C, F, Fut, U>(
     guest: C,
-    negotiated: HttpProtocol,
     binding: HostBinding,
     lease: Arc<CertificateLease>,
     connect: F,
@@ -182,7 +179,6 @@ where
     // Dropping this future on revocation also closes every origin socket.
     let _cancel = shutdown.clone().drop_guard();
     let session = Arc::new(Session {
-        served: OnceLock::new(),
         binding,
         lease,
         connect: Mutex::new(Some(connect)),
@@ -195,7 +191,7 @@ where
     let service = service_fn(|request: Request<Incoming>| {
         let session = session.clone();
         let protocol = HttpProtocol::of(request.version());
-        session.observe(protocol, negotiated);
+        tracing::Span::current().record("protocol", protocol.as_str());
         let request = SanitizedRequest::try_from(request);
         async move {
             Ok::<_, Infallible>(match request {
@@ -207,20 +203,11 @@ where
     let builder = guest_http_builder();
     let connection = builder.serve_connection_with_upgrades(TokioIo::new(guest), service);
     tokio::pin!(connection);
-    // The auto detector has no timer. Keep the initial deadline through complete
-    // headers so a partial HTTP/2 preface cannot escape it.
-    let initial_request_timeout = async {
-        tokio::time::sleep(HEADER_TIMEOUT).await;
-        if session.served.get().is_some() {
-            std::future::pending::<()>().await;
-        }
-    };
     let result = tokio::select! {
-        () = initial_request_timeout => Err(TlsTransportError::HeaderTimeout),
-        result = &mut connection => result.map_err(guest_connection_error),
+        result = &mut connection => result,
         () = session.draining.cancelled() => {
             connection.as_mut().graceful_shutdown();
-            connection.await.map_err(guest_connection_error)
+            connection.await
         }
     };
     session.upgrades.close();
@@ -228,7 +215,7 @@ where
     session.shutdown.cancel();
     session.tasks.close();
     session.tasks.wait().await;
-    result
+    result.map_err(TlsTransportError::from)
 }
 
 fn guest_http_builder() -> auto::Builder<TokioExecutor> {
@@ -247,22 +234,9 @@ fn guest_http_builder() -> auto::Builder<TokioExecutor> {
         .max_send_buf_size(64 * 1024)
         .initial_stream_window_size(GUEST_H2_STREAM_WINDOW)
         .initial_connection_window_size(GUEST_H2_CONNECTION_WINDOW)
-        .keep_alive_interval(Some(Duration::from_secs(30)))
-        .keep_alive_timeout(Duration::from_secs(10));
+        .keep_alive_interval(Some(H2_KEEP_ALIVE_INTERVAL))
+        .keep_alive_timeout(H2_KEEP_ALIVE_TIMEOUT);
     builder
-}
-
-/// The `auto` connection boxes its error. Version detection fails with the
-/// guest socket's `io::Error`; everything after that is hyper's error.
-fn guest_connection_error(error: Box<dyn std::error::Error + Send + Sync>) -> TlsTransportError {
-    match error.downcast::<hyper::Error>() {
-        Ok(error) => TlsTransportError::Http(*error),
-        Err(error) => match error.downcast::<io::Error>() {
-            Ok(error) => TlsTransportError::Downstream(*error),
-            // `auto` only surfaces the two error types above.
-            Err(error) => TlsTransportError::Downstream(io::Error::other(error)),
-        },
-    }
 }
 
 impl<F, Fut, U> Session<F>
@@ -271,23 +245,6 @@ where
     Fut: Future<Output = Result<(U, HttpProtocol), TlsTransportError>> + Send,
     U: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    /// Record the protocol hyper detected from the guest's first request. The
-    /// `tls.server` span carries `negotiated` (ALPN) from the handshake; this
-    /// fills `protocol` with what is actually being served.
-    fn observe(&self, protocol: HttpProtocol, negotiated: HttpProtocol) {
-        self.served.get_or_init(|| {
-            tracing::Span::current().record("protocol", protocol.as_str());
-            if protocol != negotiated {
-                tracing::info!(
-                    negotiated = negotiated.as_str(),
-                    protocol = protocol.as_str(),
-                    "guest speaks a different HTTP version than its ALPN selected"
-                );
-            }
-            protocol
-        });
-    }
-
     /// The origin leg is established lazily, by the first request that passes
     /// authorization. `guest_protocol` is that request's HTTP version so the
     /// upstream ALPN offer can match what the guest actually speaks.

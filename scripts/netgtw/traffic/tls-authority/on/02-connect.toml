@@ -5,7 +5,7 @@ policy = { default = "deny", tls_interception = "on", allow = ["198.18.53.53", "
 probes = [
   { kind = "dns-udp", target = "198.18.53.53", host = "upstream-proxy.127-0-0-1.dev", expect = "answer" },
   { kind = "connect", host = "upstream-proxy.127-0-0-1.dev", tunnel_host = "inner.127-0-0-1.dev", expect = "allow" },
-  { kind = "connect", client = "go", host = "upstream-proxy.127-0-0-1.dev", tunnel_host = "inner.127-0-0-1.dev", downstream_alpn = "h2", upstream_alpn = "http/1.1", expect = "allow" },
+  { kind = "connect", alpn = ["h2", "http/1.1"], host = "upstream-proxy.127-0-0-1.dev", tunnel_host = "inner.127-0-0-1.dev", downstream_alpn = "h2", upstream_alpn = "http/1.1", expect = "allow" },
 ]
 
 [[steps]]

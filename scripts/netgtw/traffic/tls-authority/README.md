@@ -46,18 +46,17 @@ to an otherwise valid Host header can break signed requests.
 | HTTP/2 | Three concurrent 96 KiB streams, WINDOW_UPDATE and full replies | Reject a switched authority, including another allowed origin |
 | WebSocket | Verified TLS upgrade, text, fragmented binary, ping/pong and close | Bind the opening request; close active streams on policy invalidation |
 | gRPC | grpcio unary, client/server/bidirectional streams, binary trailers, trailers-only error, cancellation, deadline, subsequent RPC | Preserve HTTP/2 and use its per-stream authority gate |
-| HTTPS CONNECT | curl and Go proxy authentication, outer TLS, inner TLS and a 96 KiB inner HTTP echo | Authorize the outer proxy route; preserve authentication challenges and opaque tunnel forwarding |
+| HTTPS CONNECT | curl and Python proxy authentication, outer TLS, inner TLS and a 96 KiB inner HTTP echo | Authorize the outer proxy route; preserve authentication challenges and opaque tunnel forwarding |
 | Revocation | Open HTTP/1.1, HTTP/2 and WebSocket sessions | Observe actual EOF within two seconds of policy change; timeout is a test failure |
 | Credential injection | Guest sends an unrelated value; the exact origin receives the runtime-generated credential over HTTP/1.1 and concurrent HTTP/2 streams | Every origin receipt matches without recording the credential value |
 
 Origin receipts require the exact application authentication header, including
 `Fastly-Key`.
 
-CONNECT clients offer both HTTP versions inside the tunnel. The authentication
-probe requires every proxy challenge in order and authenticates with curl's
-`--proxy-anyauth` when the supported scheme is the second challenge. A Go
-`net/http` probe uses `HTTPS_PROXY`, negotiates h2 on the guest-facing TLS leg,
-and sends HTTP/1.1 CONNECT. It requires an HTTP/1.1 origin leg and a verified
+The CONNECT authentication probe requires every proxy challenge in order and authenticates with curl's
+`--proxy-anyauth` when the supported scheme is the second challenge. A Python
+probe reproduces Go `net/http`'s wire behavior: h2 on the guest-facing TLS leg
+followed by HTTP/1.1 CONNECT. It requires an HTTP/1.1 origin leg and a verified
 96 KiB inner HTTPS echo, even though the proxy advertises h2 first.
 
 The fixture uses independent guest-interception and upstream PKIs. It implements
