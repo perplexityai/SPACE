@@ -153,6 +153,19 @@ SQL kept in a `const` or a `fn() -> &'static str` helper gets wrapped at the
 definition, where the SQL text lives. Node-local `rusqlite` call sites are not
 annotated today.
 
+## Statement reuse and no-op writes
+
+Hot node-local `rusqlite` statements go through `Connection::prepare_cached`,
+and the connection's statement cache
+(`set_prepared_statement_cache_capacity`) holds more statements than the
+service runs: rusqlite's default of 16 lets background loops evict the
+request path's statements, which are then parsed and planned on every call.
+`sqlx` caches prepared statements per connection by itself.
+
+Skip writes that change nothing at the value's resolution (for example, a
+last-activity timestamp kept to the second), and do not re-read rows that the
+preceding write did not change.
+
 ## Test placement: sibling module files, not inline `#[cfg(test)] mod tests`
 
 Unit test code lives in a **sibling module file**. A src file never carries an

@@ -196,6 +196,25 @@ Avoid `tokio::spawn` without retaining a handle for any task whose failure or co
 
 ---
 
+## Bursts, waits and shared connections
+
+- **Never stop reading a stream on a shared HTTP/2 connection to wait for a
+  local resource.** HTTP/2 flow control is per connection as well as per
+  stream: a handler that stops consuming one stream's frames until a buffer
+  or slot frees eventually stalls every other stream on that connection.
+  Fall back to a path that needs no wait, or reject.
+- **Queue bursts briefly instead of rejecting them at once.** An admission
+  limit that fails a request whenever every slot is busy turns a short burst
+  into errors the caller can only retry. Let a request take a free slot or
+  wait for one alongside a capped number of others, for a capped time, and
+  reject only past those bounds. Waiting requests should not be decoded yet,
+  so the slots still bound memory.
+- **Poll with a short first delay and exponential backoff to a cap.** A long
+  fixed first interval adds most of itself to every operation that finishes
+  quickly; start at about 100 ms and double up to a cap.
+
+---
+
 ## I/O and serialization on the hot path
 
 - **Buffer** all file/network I/O via `BufReader`/`BufWriter` (or `tokio::io::BufReader`/`BufWriter`). Default Rust I/O is unbuffered.
@@ -212,5 +231,7 @@ Avoid `tokio::spawn` without retaining a handle for any task whose failure or co
 - [ ] CPU work > ~100 µs is in `spawn_blocking` (or `rayon` for parallelism).
 - [ ] Every long-running task takes a `CancellationToken` (cloned or child of the service's `shutdown_token`).
 - [ ] Channels are bounded; backpressure flows via `send().await`.
+- [ ] No handler stops reading a stream on a shared connection to wait for a local resource.
+- [ ] Bursty admission waits briefly in a bounded queue before it rejects; polling backs off from a short first interval.
 - [ ] `select!` branches are cancellation-safe; `biased;` is used when ordering matters.
 - [ ] Shared mutable state is owned by an actor (preferred) or behind a `Mutex` whose guard is never held across an `.await`.
