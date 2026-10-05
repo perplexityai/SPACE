@@ -56,8 +56,14 @@ BUILDX_RATE_LIMIT_INITIAL_DELAY_SECONDS = 2
 # Downstream builder subclasses still read these during their compatibility transition.
 MAIN_HISTORY_DEPTH = 100
 MAIN_HISTORY_READ_ATTEMPTS = 3
-REGISTRY_RATE_LIMIT_PATTERN = re.compile(
-    r"(?:\btoomanyrequests:\s*Rate exceeded\b|\b429 Too Many Requests\b)",
+# BuildKit reports registry failures as `unexpected status from <METHOD>
+# request to <url>: <status>`. Restrict 5xx retries to that request context.
+REGISTRY_TRANSIENT_ERROR_PATTERN = re.compile(
+    r"(?:\btoomanyrequests:\s*Rate exceeded\b"
+    r"|\b429 Too Many Requests\b"
+    r"|\bunexpected status from [A-Z]+ request to \S+:\s*"
+    r"(?:500 Internal Server Error|502 Bad Gateway|503 Service Unavailable"
+    r"|504 Gateway Timeout)\b)",
     re.IGNORECASE,
 )
 
@@ -172,7 +178,7 @@ def run_buildx_command(
     delay_seconds = BUILDX_RATE_LIMIT_INITIAL_DELAY_SECONDS
 
     for attempt in range(1, BUILDX_RATE_LIMIT_MAX_ATTEMPTS + 1):
-        rate_limited = False
+        transient = False
         with subprocess.Popen(
             command,
             text=True,
@@ -185,25 +191,25 @@ def run_buildx_command(
             for line in process.stderr:
                 sys.stderr.write(line)
                 sys.stderr.flush()
-                rate_limited = (
-                    rate_limited or REGISTRY_RATE_LIMIT_PATTERN.search(line) is not None
+                transient = (
+                    transient or REGISTRY_TRANSIENT_ERROR_PATTERN.search(line) is not None
                 )
             returncode = process.wait()
 
         if returncode == 0:
             return subprocess.CompletedProcess(command, returncode)
-        if not rate_limited:
+        if not transient:
             raise subprocess.CalledProcessError(returncode, command)
         if attempt == BUILDX_RATE_LIMIT_MAX_ATTEMPTS:
             print(
-                f"Buildx registry rate limit persisted for {attempt} attempts; "
+                f"Buildx transient registry error persisted for {attempt} attempts; "
                 f"exiting {ECR_TRANSIENT_ERROR_EXIT_STATUS} so Buildkite can retry.",
                 file=sys.stderr,
             )
             raise SystemExit(ECR_TRANSIENT_ERROR_EXIT_STATUS)
 
         print(
-            f"Buildx registry rate limited attempt {attempt}/"
+            f"Buildx transient registry error on attempt {attempt}/"
             f"{BUILDX_RATE_LIMIT_MAX_ATTEMPTS}; retrying in {delay_seconds}s.",
             file=sys.stderr,
         )
