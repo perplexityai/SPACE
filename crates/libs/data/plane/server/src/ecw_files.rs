@@ -2,6 +2,10 @@ use std::{
     convert::Infallible,
     io::SeekFrom,
     pin::Pin,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
     task::{Context, Poll},
     time::Duration as StdDuration,
 };
@@ -50,6 +54,11 @@ const E2B_FILE_CONTENT_LIMIT_BYTES: usize = 256 * 1024 * 1024;
 const E2B_FILE_WRITE_CHUNK_BYTES: usize = 3 * 1024 * 1024;
 const E2B_PROTO_BODY_LIMIT: usize = 1024 * 1024;
 const E2B_JSON_FILE_WRITE_BODY_LIMIT_BYTES: usize = E2B_PROTO_BODY_LIMIT;
+/// Request bytes multer may hold without yielding them as field data: part
+/// headers, boundaries, and the preamble. Legitimate parts need a few hundred
+/// bytes; the cap stops a body without a header terminator or boundary from
+/// accumulating in multer's parse buffer.
+const E2B_MULTIPART_PARSE_BUFFER_LIMIT_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Deserialize)]
 pub(super) struct FileReadQueryE2b {
@@ -301,10 +310,7 @@ pub(super) async fn write_file(
     }
 
     if is_json_content_type(content_type) {
-        reject_oversized_json_content_length(&headers)?;
-        let body = buffer_json_file_write_body(body).await?;
-        let request: FileWriteRequestE2b = serde_json::from_slice(&body)
-            .map_err(|_| EcwProxyError::bad_request("Invalid JSON file write request"))?;
+        let request = read_json_file_write_request(&headers, body).await?;
         let path = e2b_request_root(&request.path, user.as_ref())?;
         spaced_write_bytes(
             &state,
@@ -322,6 +328,7 @@ pub(super) async fn write_file(
     }
 
     if content_type.starts_with("multipart/form-data") {
+        reject_oversized_content_length(&headers)?;
         let boundary = multipart_boundary(content_type).ok_or_else(|| {
             EcwProxyError::bad_request("multipart/form-data boundary is required")
         })?;
@@ -1000,6 +1007,16 @@ fn json_file_write_body_too_large_error() -> EcwProxyError {
     )
 }
 
+async fn read_json_file_write_request(
+    headers: &HeaderMap,
+    body: Body,
+) -> Result<FileWriteRequestE2b, EcwProxyError> {
+    reject_oversized_json_content_length(headers)?;
+    let body = buffer_json_file_write_body(body).await?;
+    serde_json::from_slice(&body)
+        .map_err(|_| EcwProxyError::bad_request("Invalid JSON file write request"))
+}
+
 async fn buffer_json_file_write_body(mut body: Body) -> Result<Bytes, EcwProxyError> {
     let mut buffered = Vec::new();
     while let Some(frame) = body.frame().await {
@@ -1066,10 +1083,16 @@ async fn spool_multipart_uploads_with_limit(
     boundary: &str,
     limit: usize,
 ) -> Result<Vec<MultipartUploadPartE2b>, EcwProxyError> {
-    let constraints = multer::Constraints::new()
-        .size_limit(multer::SizeLimit::new().for_field("file", limit as u64));
-    let mut multipart =
-        multer::Multipart::with_constraints(fair_body_data_stream(body), boundary, constraints);
+    // Capping the whole body, not each part, keeps the pre-streaming contract
+    // and bounds the spool disk a single request can use across all its parts.
+    let constraints =
+        multer::Constraints::new().size_limit(multer::SizeLimit::new().whole_stream(limit as u64));
+    let field_bytes = Arc::new(AtomicUsize::new(0));
+    let mut multipart = multer::Multipart::with_constraints(
+        fair_body_data_stream(body, Arc::clone(&field_bytes)),
+        boundary,
+        constraints,
+    );
     let mut uploads = Vec::new();
     while let Some(mut field) = multipart
         .next_field()
@@ -1092,6 +1115,7 @@ async fn spool_multipart_uploads_with_limit(
             None
         };
         while let Some(chunk) = field.chunk().await.map_err(multipart_upload_error)? {
+            field_bytes.fetch_add(chunk.len(), Ordering::Relaxed);
             if let Some(upload) = upload.as_mut() {
                 upload.write_chunk_with_limit(&chunk, limit).await?;
             }
@@ -1105,7 +1129,7 @@ async fn spool_multipart_uploads_with_limit(
 }
 
 fn multipart_upload_error(error: multer::Error) -> EcwProxyError {
-    if matches!(error, multer::Error::FieldSizeExceeded { .. }) {
+    if matches!(error, multer::Error::StreamSizeExceeded { .. }) {
         return file_too_large_error();
     }
     EcwProxyError::bad_request("Invalid multipart body")
@@ -1113,19 +1137,30 @@ fn multipart_upload_error(error: multer::Error) -> EcwProxyError {
 
 fn fair_body_data_stream(
     body: Body,
+    field_bytes: Arc<AtomicUsize>,
 ) -> impl Stream<Item = Result<Bytes, axum::Error>> + Send + 'static {
     // Multer drains every immediately-ready frame into its parse buffer. Force
     // one pending poll between frames so request bursts stay frame-bounded.
     let mut body = Box::pin(body.into_data_stream());
     let mut yielded_frame = false;
+    let mut fed_bytes = 0usize;
     stream::poll_fn(move |context| {
         if yielded_frame {
             yielded_frame = false;
             context.waker().wake_by_ref();
             return Poll::Pending;
         }
+        // Bytes fed to multer but not yet yielded as field data are still in
+        // its parse buffer, so this bounds that buffer to the cap plus a frame.
+        let unparsed = fed_bytes.saturating_sub(field_bytes.load(Ordering::Relaxed));
+        if unparsed > E2B_MULTIPART_PARSE_BUFFER_LIMIT_BYTES {
+            return Poll::Ready(Some(Err(axum::Error::new(
+                "multipart headers or preamble exceed the parse buffer limit",
+            ))));
+        }
         let next = body.as_mut().poll_next(context);
-        if matches!(next, Poll::Ready(Some(_))) {
+        if let Poll::Ready(Some(Ok(data))) = &next {
+            fed_bytes = fed_bytes.saturating_add(data.len());
             yielded_frame = true;
         }
         next

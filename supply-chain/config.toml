@@ -1038,6 +1038,11 @@ criteria = "safe-to-deploy"
 version = "0.12.16"
 criteria = "safe-to-deploy"
 
+[[exemptions.multer]]
+version = "3.1.0"
+criteria = "safe-to-deploy"
+notes = "Streaming multipart/form-data parser for data-plane POST /files uploads (network input). No imported audit exists. Source reviewed for the exemption, not certified as an audit: forbid(unsafe_code), build.rs only probes rustc for nightly via version_check, and every dependency is already in the graph. The caller caps the whole stream and multer's unparsed buffer."
+
 [[exemptions.multimap]]
 version = "0.10.1"
 criteria = "safe-to-deploy"
