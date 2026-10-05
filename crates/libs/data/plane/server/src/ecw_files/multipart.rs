@@ -107,14 +107,11 @@ pub(super) async fn spool_multipart_uploads_with_limit(
             .filter(|filename| !filename.is_empty())
             .map(str::to_string);
         // Multer stops looking for `name` when an earlier quoted value holds a
-        // space-prefixed `name` (`filename="my name.txt"; name="file"`). Reject
-        // the part rather than silently skipping what may be a file.
-        if field.name().is_none() && filename.is_some() {
-            return Err(EcwProxyError::bad_request(
-                "multipart part has a filename but no readable field name",
-            ));
-        }
-        let is_file = field.name() == Some("file");
+        // space-prefixed `name` (`filename="my name.txt"; name="file"`).
+        let is_file = match field.name() {
+            Some(name) => name == "file",
+            None => content_disposition_name(field.headers()).as_deref() == Some("file"),
+        };
         let mut upload = if is_file {
             Some(SpooledUpload::new().await?)
         } else {
@@ -138,6 +135,47 @@ pub(super) async fn spool_multipart_uploads_with_limit(
         }
     }
     Ok(uploads)
+}
+
+/// Reads the `name` parameter of a part's Content-Disposition, skipping `;`
+/// and `=` inside quoted values. Used only when multer cannot find it.
+pub(super) fn content_disposition_name(headers: &HeaderMap) -> Option<String> {
+    let value = headers.get(header::CONTENT_DISPOSITION)?.to_str().ok()?;
+    let mut params = Vec::new();
+    let (mut start, mut in_quotes, mut escaped) = (0, false, false);
+    for (index, byte) in value.bytes().enumerate() {
+        match byte {
+            b'\\' if in_quotes && !escaped => {
+                escaped = true;
+                continue;
+            }
+            b'"' if !escaped => in_quotes = !in_quotes,
+            b';' if !in_quotes => {
+                params.extend(value.get(start..index));
+                start = index + 1;
+            }
+            _ => {}
+        }
+        escaped = false;
+    }
+    params.extend(value.get(start..));
+    // The first segment is the disposition type, e.g. `form-data`.
+    params.into_iter().skip(1).find_map(|param| {
+        let (key, raw) = param.split_once('=')?;
+        if !key.trim().eq_ignore_ascii_case("name") {
+            return None;
+        }
+        let raw = raw.trim();
+        let Some(quoted) = raw.strip_prefix('"').and_then(|raw| raw.strip_suffix('"')) else {
+            return Some(raw.to_string());
+        };
+        let mut name = String::with_capacity(quoted.len());
+        let mut chars = quoted.chars();
+        while let Some(c) = chars.next() {
+            name.push(if c == '\\' { chars.next()? } else { c });
+        }
+        Some(name)
+    })
 }
 
 fn multipart_upload_error(error: multer::Error) -> EcwProxyError {

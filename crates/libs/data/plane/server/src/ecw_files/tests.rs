@@ -340,20 +340,38 @@ async fn multipart_feed_pauses_once_unconsumed_bytes_pass_the_parse_buffer_cap()
 }
 
 #[tokio::test]
-async fn multipart_file_part_without_a_readable_name_is_rejected() {
+async fn multipart_file_part_with_filename_before_name_is_spooled() {
     // Multer's Content-Disposition parser loses `name` after a quoted filename
-    // containing " name"; such a part must not be dropped as a non-file field.
+    // containing " name"; the part must still be recognized as the file.
     let body = format!(
         "--{MULTIPART_BOUNDARY}\r\nContent-Disposition: form-data; filename=\"my name.txt\"; name=\"file\"\r\n\r\ncontent\r\n--{MULTIPART_BOUNDARY}--\r\n"
     );
-    let error = spool_multipart_uploads(Body::from(body), MULTIPART_BOUNDARY)
+    let uploads = spool_multipart_uploads(Body::from(body), MULTIPART_BOUNDARY)
         .await
-        .unwrap_err();
-    assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        .unwrap();
+    assert_eq!(uploads.len(), 1);
+    let upload = uploads.into_iter().next().unwrap();
+    assert_eq!(upload.filename.as_deref(), Some("my name.txt"));
+    let (_, data) = collect_spooled_write(upload.upload, "/my name.txt").await;
+    assert_eq!(data, b"content");
+}
+
+#[test]
+fn content_disposition_name_skips_separators_inside_quoted_values() {
+    let name = |value: &str| {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONTENT_DISPOSITION, value.parse().unwrap());
+        content_disposition_name(&headers)
+    };
     assert_eq!(
-        error.message,
-        "multipart part has a filename but no readable field name"
+        name(r#"form-data; filename="a; name=x.txt"; name="file""#).as_deref(),
+        Some("file")
     );
+    assert_eq!(
+        name(r#"form-data; filename="q\"; name=x"; NAME=file"#).as_deref(),
+        Some("file")
+    );
+    assert_eq!(name(r#"form-data; filename="a.txt""#), None);
 }
 
 #[tokio::test]
