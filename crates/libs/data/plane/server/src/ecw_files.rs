@@ -1,10 +1,6 @@
 use std::{
     convert::Infallible,
     pin::Pin,
-    sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    },
     task::{Context, Poll},
     time::Duration as StdDuration,
 };
@@ -48,20 +44,13 @@ use crate::runtime_route::{
     EcwRouteAttemptError, bounded_ecw_route_transfer, bounded_node_api_unary,
     retryable_bounded_node_api_unary,
 };
+use multipart::{multipart_boundary, resolve_multipart_uploads, spool_multipart_uploads};
 
 const E2B_FILE_CONTENT_LIMIT_BYTES: usize = 256 * 1024 * 1024;
 const E2B_FILE_WRITE_CHUNK_BYTES: usize = 3 * 1024 * 1024;
 const E2B_PROTO_BODY_LIMIT: usize = 1024 * 1024;
 /// Stated as "1 MiB" in `json_file_write_body_too_large_error`.
 const E2B_JSON_FILE_WRITE_BODY_LIMIT_BYTES: usize = 1024 * 1024;
-/// Request bytes multer may hold in its parse buffer before feeding pauses.
-/// Legitimate part headers need a few hundred bytes, so a body that fills the
-/// buffer without forming a part is malformed.
-const E2B_MULTIPART_PARSE_BUFFER_LIMIT_BYTES: usize = 1024 * 1024;
-/// The CRLF that ends each part's data before the next boundary.
-const MULTIPART_PART_DATA_TERMINATOR_BYTES: usize = 2;
-/// Each `file` part is staged in its own spool file before any is written.
-const E2B_MULTIPART_FILE_PART_LIMIT: usize = 1000;
 
 #[derive(Debug, Deserialize)]
 pub(super) struct FileReadQueryE2b {
@@ -146,12 +135,6 @@ pub(super) struct FileWriteInfoE2b {
     #[serde(rename = "type")]
     file_type: &'static str,
     path: String,
-}
-
-#[derive(Debug)]
-struct MultipartUploadPartE2b {
-    filename: Option<String>,
-    upload: tempfile::TempPath,
 }
 
 #[derive(Clone, PartialEq, Message, Deserialize)]
@@ -960,15 +943,6 @@ fn file_too_large_error() -> EcwProxyError {
     )
 }
 
-fn too_many_multipart_files_error() -> EcwProxyError {
-    EcwProxyError::new(
-        StatusCode::PAYLOAD_TOO_LARGE,
-        "multipart uploads are limited to 1000 files per request",
-        ResponseOrigin::Client,
-        ResponseKind::Validation,
-    )
-}
-
 fn json_file_write_body_too_large_error() -> EcwProxyError {
     EcwProxyError::new(
         StatusCode::PAYLOAD_TOO_LARGE,
@@ -1030,160 +1004,6 @@ fn is_json_content_type(content_type: &str) -> bool {
 
 fn is_octet_stream_content_type(content_type: &str) -> bool {
     content_type.starts_with("application/octet-stream")
-}
-
-fn multipart_boundary(content_type: &str) -> Option<&str> {
-    content_type
-        .split(';')
-        .skip(1)
-        .find_map(|part| part.trim().strip_prefix("boundary="))
-        .map(|boundary| boundary.trim_matches('"'))
-        .filter(|boundary| !boundary.is_empty())
-}
-
-async fn spool_multipart_uploads(
-    body: Body,
-    boundary: &str,
-) -> Result<Vec<MultipartUploadPartE2b>, EcwProxyError> {
-    spool_multipart_uploads_with_limit(body, boundary, E2B_FILE_CONTENT_LIMIT_BYTES).await
-}
-
-async fn spool_multipart_uploads_with_limit(
-    body: Body,
-    boundary: &str,
-    limit: usize,
-) -> Result<Vec<MultipartUploadPartE2b>, EcwProxyError> {
-    // Capping the whole body, not each part, keeps the pre-streaming contract
-    // and bounds the spool disk a single request can use across all its parts.
-    let constraints =
-        multer::Constraints::new().size_limit(multer::SizeLimit::new().whole_stream(limit as u64));
-    let consumed_bytes = Arc::new(AtomicUsize::new(0));
-    let mut multipart = multer::Multipart::with_constraints(
-        throttled_multipart_body(body, Arc::clone(&consumed_bytes)),
-        boundary,
-        constraints,
-    );
-    let mut uploads = Vec::new();
-    while let Some(mut field) = multipart
-        .next_field()
-        .await
-        .map_err(multipart_upload_error)?
-    {
-        consumed_bytes.fetch_add(
-            multipart_part_framing_lower_bound(boundary, field.headers()),
-            Ordering::Relaxed,
-        );
-        if !field.headers().contains_key(header::CONTENT_DISPOSITION) {
-            return Err(EcwProxyError::bad_request(
-                "Missing multipart Content-Disposition",
-            ));
-        }
-        let is_file = field.name() == Some("file");
-        let filename = field
-            .file_name()
-            .filter(|filename| !filename.is_empty())
-            .map(str::to_string);
-        if is_file && uploads.len() == E2B_MULTIPART_FILE_PART_LIMIT {
-            return Err(too_many_multipart_files_error());
-        }
-        let mut upload = if is_file {
-            Some(SpooledUpload::new().await?)
-        } else {
-            None
-        };
-        while let Some(chunk) = field.chunk().await.map_err(multipart_upload_error)? {
-            consumed_bytes.fetch_add(chunk.len(), Ordering::Relaxed);
-            // The whole-stream cap also bounds each part, so this check in
-            // `write_chunk` never trips here; octet-stream uploads rely on it.
-            if let Some(upload) = upload.as_mut() {
-                upload.write_chunk(&chunk).await?;
-            }
-        }
-        // The CRLF before the next boundary. Counting it here also means every
-        // field start, chunk, and field end advances the total, which
-        // `throttled_multipart_body` reads as parser progress.
-        consumed_bytes.fetch_add(MULTIPART_PART_DATA_TERMINATOR_BYTES, Ordering::Relaxed);
-        if let Some(upload) = upload {
-            let upload = upload.finish().await?;
-            uploads.push(MultipartUploadPartE2b { filename, upload });
-        }
-    }
-    Ok(uploads)
-}
-
-fn multipart_upload_error(error: multer::Error) -> EcwProxyError {
-    if matches!(error, multer::Error::StreamSizeExceeded { .. }) {
-        return file_too_large_error();
-    }
-    EcwProxyError::bad_request("Invalid multipart body")
-}
-
-/// Bytes multer consumes to open a part: `--{boundary}\r\n`, each
-/// `name:value\r\n` header (optional whitespace not counted), and the blank
-/// line. Never more than the real count, so bytes fed minus the running total
-/// never understates multer's buffer.
-fn multipart_part_framing_lower_bound(boundary: &str, headers: &HeaderMap) -> usize {
-    headers
-        .iter()
-        .fold(boundary.len() + 6, |len, (name, value)| {
-            len + name.as_str().len() + value.len() + 3
-        })
-}
-
-/// Feeds the request body to multer while bytes fed minus `consumed_bytes`, an
-/// upper bound on multer's parse buffer, stays within
-/// `E2B_MULTIPART_PARSE_BUFFER_LIMIT_BYTES`; the buffer then holds at most the
-/// cap plus one frame. Multer appends every ready frame, so past the cap this
-/// yields once to let it parse what it holds. Without progress by the next poll,
-/// the buffered bytes cannot complete a part and the request fails.
-fn throttled_multipart_body(
-    body: Body,
-    consumed_bytes: Arc<AtomicUsize>,
-) -> impl Stream<Item = Result<Bytes, axum::Error>> + Send + 'static {
-    let mut body = Box::pin(body.into_data_stream());
-    let mut fed_bytes = 0usize;
-    let mut throttled_at = None;
-    stream::poll_fn(move |context| {
-        let consumed = consumed_bytes.load(Ordering::Relaxed);
-        if fed_bytes.saturating_sub(consumed) > E2B_MULTIPART_PARSE_BUFFER_LIMIT_BYTES {
-            if throttled_at == Some(consumed) {
-                return Poll::Ready(Some(Err(axum::Error::new(
-                    "multipart headers or preamble exceed the parse buffer limit",
-                ))));
-            }
-            throttled_at = Some(consumed);
-            context.waker().wake_by_ref();
-            return Poll::Pending;
-        }
-        throttled_at = None;
-        let next = body.as_mut().poll_next(context);
-        if let Poll::Ready(Some(Ok(data))) = &next {
-            fed_bytes = fed_bytes.saturating_add(data.len());
-        }
-        next
-    })
-}
-
-fn resolve_multipart_uploads(
-    uploads: Vec<MultipartUploadPartE2b>,
-    query_path: Option<String>,
-    user: Option<&GuestUserName>,
-) -> Result<Vec<(String, tempfile::TempPath)>, EcwProxyError> {
-    if query_path.is_some() && uploads.len() > 1 {
-        return Err(EcwProxyError::bad_request(
-            "path query parameter only supports a single multipart upload",
-        ));
-    }
-    uploads
-        .into_iter()
-        .map(|upload| {
-            // The path query wins over the part's filename.
-            let path = query_path.clone().or(upload.filename).ok_or_else(|| {
-                EcwProxyError::bad_request("multipart uploads require a filename or path query")
-            })?;
-            Ok((e2b_request_root(&path, user)?, upload.upload))
-        })
-        .collect()
 }
 
 fn file_info_to_connect_entry(info: SpacedFileInfo) -> FilesystemEntryInfoE2b {
@@ -1682,5 +1502,6 @@ fn raw_file_write_error(status: tonic::Status) -> EcwProxyError {
     raw_file_read_error(status)
 }
 
+mod multipart;
 #[cfg(test)]
 mod tests;

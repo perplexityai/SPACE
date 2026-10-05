@@ -1,3 +1,4 @@
+use super::multipart::*;
 use super::*;
 use pplx_space_common_core::types::SandboxId;
 use std::{
@@ -266,8 +267,8 @@ async fn multipart_part_without_header_terminator_is_rejected_before_buffering_t
     assert!(polls.load(Ordering::SeqCst) < frames / 2);
 }
 
-#[test]
-fn multipart_framing_lower_bound_never_exceeds_the_encoded_part() {
+#[tokio::test]
+async fn multipart_framing_lower_bound_never_exceeds_the_encoded_part() {
     let part = multipart_body(&[("file", Some("a.txt"), b"")]);
     let closing = format!("--{MULTIPART_BOUNDARY}--\r\n").len();
     let mut headers = HeaderMap::new();
@@ -284,8 +285,30 @@ fn multipart_framing_lower_bound_never_exceeds_the_encoded_part() {
         "{estimate} vs {}",
         part.len() - closing
     );
-    // Only the space after the header colon goes uncounted.
-    assert_eq!(part.len() - closing - estimate, 1);
+    // Only the space after the header colon and the header's CR go uncounted.
+    assert_eq!(part.len() - closing - estimate, 2);
+
+    // httparse accepts bare-LF header lines inside the CRLF-terminated block,
+    // so a non-final header can cost just `name:value\n`. Multer must accept
+    // this shortest encoding, and the estimate must still fit inside it.
+    let shortest = format!(
+        "--{MULTIPART_BOUNDARY}\r\ncontent-type:a\ncontent-disposition:form-data; name=\"file\"; filename=\"a.txt\"\r\n\r\n\r\n"
+    );
+    let uploads = spool_multipart_uploads(
+        Body::from(format!("{shortest}--{MULTIPART_BOUNDARY}--\r\n")),
+        MULTIPART_BOUNDARY,
+    )
+    .await
+    .unwrap();
+    assert_eq!(uploads.len(), 1);
+    headers.insert(header::CONTENT_TYPE, "a".parse().unwrap());
+    let estimate = multipart_part_framing_lower_bound(MULTIPART_BOUNDARY, &headers)
+        + MULTIPART_PART_DATA_TERMINATOR_BYTES;
+    assert!(
+        estimate <= shortest.len(),
+        "{estimate} vs {}",
+        shortest.len()
+    );
 }
 
 #[tokio::test]
@@ -319,45 +342,27 @@ async fn multipart_feed_pauses_once_unconsumed_bytes_pass_the_parse_buffer_cap()
 }
 
 #[tokio::test]
-async fn multipart_with_many_tiny_parts_streams_through_the_feed_throttle() {
-    // Tiny parts make the parser consume far less per field than a frame
-    // delivers, so feeding must pause and resume many times over the body.
-    let tiny_parts = 2 * E2B_MULTIPART_PARSE_BUFFER_LIMIT_BYTES / 64;
-    let mut parts = vec![("n", None, b"".as_slice()); tiny_parts];
-    parts.push(("file", Some("last.txt"), b"content".as_slice()));
-    let body = multipart_body(&parts);
-    assert!(body.len() > E2B_MULTIPART_PARSE_BUFFER_LIMIT_BYTES);
-    let frames = body.chunks(256 * 1024).map(<[u8]>::to_vec).collect();
-
-    let uploads = spool_multipart_uploads(chunked_body(frames), MULTIPART_BOUNDARY)
-        .await
-        .unwrap();
-    assert_eq!(uploads.len(), 1);
-    let (_, data) =
-        collect_spooled_write(uploads.into_iter().next().unwrap().upload, "/last.txt").await;
-    assert_eq!(data, b"content");
-}
-
-#[tokio::test]
-async fn multipart_file_part_count_is_capped() {
-    let parts = vec![("file", Some("a.txt"), b"x".as_slice()); E2B_MULTIPART_FILE_PART_LIMIT + 1];
+async fn multipart_part_count_is_capped() {
+    // Tiny parts cost the parser almost nothing each, so the part cap, not the
+    // stream cap, is what stops them.
+    let parts = vec![("file", Some("a.txt"), b"".as_slice()); E2B_MULTIPART_PART_LIMIT + 1];
     let error = spool_multipart_uploads(Body::from(multipart_body(&parts)), MULTIPART_BOUNDARY)
         .await
         .unwrap_err();
     assert_eq!(error.status, StatusCode::PAYLOAD_TOO_LARGE);
     assert_eq!(
         error.message,
-        "multipart uploads are limited to 1000 files per request"
+        "multipart uploads are limited to 1000 parts per request"
     );
 }
 
 #[tokio::test]
 async fn multipart_framing_overhead_beyond_the_parse_buffer_is_accepted() {
-    // Each ignored part carries ~1 KiB of headers, so the request's total
-    // framing exceeds the parse-buffer cap while no single part comes close.
-    let long_name = format!("note-{}", "x".repeat(1024));
-    let part_count = 2 * E2B_MULTIPART_PARSE_BUFFER_LIMIT_BYTES / long_name.len();
-    let mut parts = vec![(long_name.as_str(), None, b"".as_slice()); part_count];
+    // Each ignored part carries ~4 KiB of headers, so the request's total
+    // framing is several times the parse-buffer cap while no single part comes
+    // close, and feeding must pause and resume across the body.
+    let long_name = format!("note-{}", "x".repeat(4096));
+    let mut parts = vec![(long_name.as_str(), None, b"".as_slice()); E2B_MULTIPART_PART_LIMIT - 1];
     parts.push(("file", Some("last.txt"), b"content".as_slice()));
     let body = multipart_body(&parts);
     let frames = body.chunks(64 * 1024).map(<[u8]>::to_vec).collect();
