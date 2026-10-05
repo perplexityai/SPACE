@@ -184,7 +184,11 @@ fn mounted_operations() -> Vec<(NativeOperation, MethodRouter<AppState>)> {
             files::write_file,
             files::WRITE_FILE_BODY_LIMIT_BYTES,
         ),
-        mount(native::WRITE_FILE_BATCH, files::write_file_batch),
+        mount_with_body_limit(
+            native::WRITE_FILE_BATCH,
+            files::write_file_batch,
+            files::WRITE_FILE_BATCH_BODY_LIMIT_BYTES,
+        ),
         mount(
             native::ENABLE_FILE_CHANGES,
             files::enable_file_change_tracking,

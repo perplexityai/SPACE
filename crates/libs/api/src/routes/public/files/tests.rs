@@ -256,3 +256,181 @@ async fn the_write_body_limit_admits_the_largest_documented_payload() {
     );
     assert_eq!(send(limit, escaped.into_bytes()).await, StatusCode::OK);
 }
+
+mod batch_body_limits {
+    use super::*;
+    use axum::{
+        Router,
+        body::Body,
+        http::{Method, Request},
+    };
+    use pplx_space_common_core::sql;
+    use pplx_space_db_test_fixtures::{
+        SEED_ORG_ID, SEED_USER_ID, TestDb, TestDbResult, pg_test_db,
+    };
+    use serde_json::{Value, json};
+    use tower::ServiceExt;
+    use uuid::Uuid;
+
+    const KEY: &str = "native-file-write-limit-key";
+
+    struct Fixture {
+        _db: TestDb,
+        app: Router,
+        sandbox_id: PublicSandboxId,
+    }
+
+    /// A native key and a stopped sandbox it owns, so requests pass auth and
+    /// owner scope and reach the handler's body extraction and validation.
+    async fn fixture() -> TestDbResult<Fixture> {
+        let db = pg_test_db().await?;
+        sqlx::query(sql!(
+            "INSERT INTO api_keys (id, org_id, name, key_hash, allowed_surfaces)
+             VALUES ($1, $2, 'native-file-write-limit', $3, ARRAY['native'])"
+        ))
+        .bind(Uuid::now_v7())
+        .bind(SEED_ORG_ID)
+        .bind(crate::auth::hash_token(KEY))
+        .execute(&db.pool)
+        .await?;
+        let sandbox_id = PublicSandboxId::new();
+        sqlx::query(sql!(
+            "INSERT INTO sandboxes (id, user_id, org_id, lifecycle, network_policy_generation)
+             VALUES ($1, $2, $3, 'stopped', 1)"
+        ))
+        .bind(sandbox_id.as_uuid())
+        .bind(SEED_USER_ID)
+        .bind(SEED_ORG_ID)
+        .execute(&db.pool)
+        .await?;
+        let state = AppState::from_pool(db.pool.clone()).await?;
+        let app = Router::new()
+            .nest("/v1", crate::routes::public::v1_router(state.clone()))
+            .with_state(state);
+        Ok(Fixture {
+            _db: db,
+            app,
+            sandbox_id,
+        })
+    }
+
+    /// Serialize `body`, then pad it with trailing JSON whitespace to exactly
+    /// `len` bytes so a test can sit precisely on a body limit.
+    fn padded_body(body: &Value, len: usize) -> Vec<u8> {
+        let mut bytes = serde_json::to_vec(body).expect("test body serializes");
+        assert!(
+            bytes.len() <= len,
+            "body is already {} > {len} bytes",
+            bytes.len()
+        );
+        bytes.resize(len, b' ');
+        bytes
+    }
+
+    async fn post(
+        fixture: &Fixture,
+        action: &str,
+        body: Vec<u8>,
+    ) -> TestDbResult<(StatusCode, Value)> {
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri(format!(
+                "/v1/sandboxes/{}/files:{action}",
+                fixture.sandbox_id
+            ))
+            .header("authorization", format!("Bearer {KEY}"))
+            .header("content-type", "application/json")
+            .header("idempotency-key", "file-write-limit")
+            .body(Body::from(body))?;
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            fixture.app.clone().oneshot(request),
+        )
+        .await??;
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024).await?;
+        Ok((status, serde_json::from_slice(&body)?))
+    }
+
+    fn batch_body(decoded_lens: &[usize]) -> Value {
+        let entries = decoded_lens
+            .iter()
+            .enumerate()
+            .map(|(index, len)| {
+                json!({
+                    "path": format!("/workspace/f{index}"),
+                    "data_base64": BASE64_STANDARD.encode(vec![0u8; *len]),
+                })
+            })
+            .collect::<Vec<_>>();
+        json!({ "entries": entries })
+    }
+
+    fn assert_payload_too_large(status: StatusCode, body: &Value) {
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{body}");
+        assert_eq!(body["code"], "invalid_request", "{body}");
+        assert_eq!(body["retryable"], false, "{body}");
+    }
+
+    fn assert_accepted_past_size_checks(status: StatusCode, body: &Value) {
+        eprintln!("UNDER-LIMIT status={status} body={body}");
+        assert_ne!(status, StatusCode::PAYLOAD_TOO_LARGE, "{body}");
+        assert!(
+            !body["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("too large"),
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn file_write_batch_limits_bound_the_total_payload() -> TestDbResult<()> {
+        let fixture = fixture().await?;
+        let path_bytes = "/workspace/f0".len() + "/workspace/f1".len();
+        let half = (MAX_FILE_WRITE_BATCH_BYTES - path_bytes) / 2;
+        let at_cap = [half, MAX_FILE_WRITE_BATCH_BYTES - path_bytes - half];
+
+        let (status, body) = post(
+            &fixture,
+            "write_batch",
+            padded_body(&batch_body(&at_cap), WRITE_FILE_BATCH_BODY_LIMIT_BYTES),
+        )
+        .await?;
+        assert_accepted_past_size_checks(status, &body);
+
+        let (status, body) = post(
+            &fixture,
+            "write_batch",
+            padded_body(&batch_body(&at_cap), WRITE_FILE_BATCH_BODY_LIMIT_BYTES + 1),
+        )
+        .await?;
+        assert_payload_too_large(status, &body);
+
+        let over_cap = [at_cap[0], at_cap[1] + 1];
+        let (status, body) = post(
+            &fixture,
+            "write_batch",
+            serde_json::to_vec(&batch_body(&over_cap))?,
+        )
+        .await?;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("file write batch is too large"),
+            "{body}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn other_file_routes_keep_the_default_body_limit() -> TestDbResult<()> {
+        let fixture = fixture().await?;
+        let body = padded_body(&json!({ "path": "/workspace" }), 2 * 1024 * 1024 + 1);
+        let (status, body) = post(&fixture, "stat", body).await?;
+        assert_payload_too_large(status, &body);
+        Ok(())
+    }
+}
