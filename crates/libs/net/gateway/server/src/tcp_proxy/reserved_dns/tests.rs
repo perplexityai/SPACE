@@ -303,6 +303,7 @@ fn proxy(
         debug_state: GatewayDebugState::default(),
         shutdown_token,
         refusal_warnings: Arc::default(),
+        connect_failure_warnings: Arc::default(),
     }
 }
 

@@ -112,6 +112,7 @@ async fn failed_plaintext_connect() -> FailedPlaintextConnect {
         debug_state: GatewayDebugState::default(),
         shutdown_token: CancellationToken::new(),
         refusal_warnings: Arc::default(),
+        connect_failure_warnings: Arc::default(),
     };
     let guest_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let (guest, accepted) = tokio::join!(
@@ -201,6 +202,7 @@ async fn dns_attributed_pypi_proxy() -> (TcpProxy, Arc<NetworkPolicyV1>) {
         debug_state: GatewayDebugState::default(),
         shutdown_token: CancellationToken::new(),
         refusal_warnings: Arc::default(),
+        connect_failure_warnings: Arc::default(),
     };
     (proxy, policy)
 }
@@ -546,6 +548,7 @@ async fn tcp_admission_returns_the_authorized_route_or_deny() {
         debug_state: GatewayDebugState::default(),
         shutdown_token: CancellationToken::new(),
         refusal_warnings: Arc::default(),
+        connect_failure_warnings: Arc::default(),
     };
 
     struct Case<'a> {
@@ -702,6 +705,7 @@ async fn tcp_handoff_allows_current_and_rejects_replaced_policy() {
         debug_state: GatewayDebugState::default(),
         shutdown_token: CancellationToken::new(),
         refusal_warnings: Arc::default(),
+        connect_failure_warnings: Arc::default(),
     };
     let destination = "192.0.2.44:443".parse().unwrap();
     let admitted = proxy
@@ -755,6 +759,7 @@ async fn record_emits_one_connection_metric_and_reports_every_failure_outcome() 
         debug_state: GatewayDebugState::default(),
         shutdown_token: CancellationToken::new(),
         refusal_warnings: Arc::default(),
+        connect_failure_warnings: Arc::default(),
     };
     let destination = "93.184.216.34:443".parse().unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -770,80 +775,186 @@ async fn record_emits_one_connection_metric_and_reports_every_failure_outcome() 
         .await;
     let observed_host = observed_host.expect("known SNI should survive the policy failure");
     assert_eq!(observed_host, host);
+    let FlowOutcome::Rejected(Rejection::PolicyMissing(policy_missing)) = policy_missing else {
+        panic!("expected policy rejection");
+    };
 
-    let outcomes = [
-        FlowOutcome::Cancelled,
-        FlowOutcome::Rejected(Rejection::PolicyMissing(PolicyNotReady::ReadyWithoutPolicy)),
-        FlowOutcome::Rejected(Rejection::PolicyMissing(
-            PolicyNotReady::PendingPolicyTimeout,
-        )),
-        policy_missing,
-        FlowOutcome::Rejected(Rejection::PolicyMissing(PolicyNotReady::PolicyError)),
-        FlowOutcome::Rejected(Rejection::PolicyMissing(PolicyNotReady::Draining)),
-        FlowOutcome::Rejected(Rejection::PolicyMissing(PolicyNotReady::Stopped)),
-        FlowOutcome::Rejected(Rejection::PolicyMissing(PolicyNotReady::Unspecified)),
-        FlowOutcome::Rejected(Rejection::PolicyMissing(PolicyNotReady::PendingPolicy)),
-        FlowOutcome::Rejected(Rejection::Admission(TcpAdmissionDenial::DnsAttribution(
-            DenyReason::PlatformGuardrail {
-                guardrail_id: "test",
-            },
-        ))),
-        FlowOutcome::Rejected(Rejection::Admission(TcpAdmissionDenial::DnsAttribution(
-            DenyReason::Rule,
-        ))),
-        FlowOutcome::Rejected(Rejection::Admission(TcpAdmissionDenial::DnsAttribution(
-            DenyReason::Default,
-        ))),
-        FlowOutcome::Rejected(Rejection::Admission(TcpAdmissionDenial::PolicyChanged)),
-        FlowOutcome::RelayFailed(RelayFailure::Connect(io::Error::new(
-            io::ErrorKind::ConnectionRefused,
-            "test connect failure",
-        ))),
-        FlowOutcome::RelayFailed(RelayFailure::PlaintextUpstreamHttp),
-        FlowOutcome::RelayFailed(RelayFailure::PlaintextGuestHttp),
-        FlowOutcome::Rejected(Rejection::TlsInterception(TlsInterceptionError::Timeout)),
-        FlowOutcome::RelayFailed(RelayFailure::Transfer),
-        FlowOutcome::Relayed(Relay::Tunnelled {
-            wire_tx: 1,
-            wire_rx: 2,
-        }),
-        FlowOutcome::Relayed(Relay::HostBoundHttp {
-            requests: 1,
-            forwarded: 1,
-            refused: 0,
-            upstream_failed: 0,
-            wire_tx: 1,
-            wire_rx: 2,
-        }),
-    ];
-    let outcome_count = outcomes.len();
-    let mut emitted_tag_sets = HashSet::with_capacity(outcome_count);
+    let outcomes = || {
+        [
+            FlowOutcome::Cancelled,
+            FlowOutcome::Rejected(Rejection::PolicyMissing(PolicyNotReady::ReadyWithoutPolicy)),
+            FlowOutcome::Rejected(Rejection::PolicyMissing(
+                PolicyNotReady::PendingPolicyTimeout,
+            )),
+            FlowOutcome::Rejected(Rejection::PolicyMissing(policy_missing)),
+            FlowOutcome::Rejected(Rejection::PolicyMissing(PolicyNotReady::PolicyError)),
+            FlowOutcome::Rejected(Rejection::PolicyMissing(PolicyNotReady::Draining)),
+            FlowOutcome::Rejected(Rejection::PolicyMissing(PolicyNotReady::Stopped)),
+            FlowOutcome::Rejected(Rejection::PolicyMissing(PolicyNotReady::Unspecified)),
+            FlowOutcome::Rejected(Rejection::PolicyMissing(PolicyNotReady::PendingPolicy)),
+            FlowOutcome::Rejected(Rejection::Admission(TcpAdmissionDenial::DnsAttribution(
+                DenyReason::PlatformGuardrail {
+                    guardrail_id: "test",
+                },
+            ))),
+            FlowOutcome::Rejected(Rejection::Admission(TcpAdmissionDenial::DnsAttribution(
+                DenyReason::Rule,
+            ))),
+            FlowOutcome::Rejected(Rejection::Admission(TcpAdmissionDenial::DnsAttribution(
+                DenyReason::Default,
+            ))),
+            FlowOutcome::Rejected(Rejection::Admission(TcpAdmissionDenial::PolicyChanged)),
+            FlowOutcome::RelayFailed(RelayFailure::Connect(io::Error::from_raw_os_error(
+                libc::ECONNREFUSED,
+            ))),
+            FlowOutcome::RelayFailed(RelayFailure::PlaintextUpstreamHttp),
+            FlowOutcome::RelayFailed(RelayFailure::PlaintextGuestHttp),
+            FlowOutcome::Rejected(Rejection::TlsInterception(TlsInterceptionError::Timeout)),
+            FlowOutcome::RelayFailed(RelayFailure::Transfer),
+            FlowOutcome::Relayed(Relay::Tunnelled {
+                wire_tx: 1,
+                wire_rx: 2,
+            }),
+            FlowOutcome::Relayed(Relay::HostBoundHttp {
+                requests: 1,
+                forwarded: 1,
+                refused: 0,
+                upstream_failed: 0,
+                wire_tx: 1,
+                wire_rx: 2,
+            }),
+        ]
+    };
+    for (attempted_host, known) in [(Some(&observed_host), true), (None, false)] {
+        let outcomes = outcomes();
+        let outcome_count = outcomes.len();
+        let mut emitted_tag_sets = HashSet::with_capacity(outcome_count);
 
-    for (case, outcome) in outcomes.into_iter().enumerate() {
-        let capture = pplx_space_metrics::test_capture::capture_counters_guard();
-        let failure = matches!(
-            &outcome,
-            FlowOutcome::Rejected(_) | FlowOutcome::RelayFailed(_)
-        );
-        let reported = proxy.record(destination, Some(&observed_host), outcome);
-        assert_eq!(reported, failure);
-        let connection_metrics = capture
-            .finish()
-            .into_iter()
-            .filter(|metric| metric.name == "gateway.tcp.connection")
-            .collect::<Vec<_>>();
+        for (case, outcome) in outcomes.into_iter().enumerate() {
+            let capture = pplx_space_metrics::test_capture::capture_counters_guard();
+            let layer = CapturedEventsLayer::new().with_event_filter(|event| {
+                field_value(event, "message") == Some("TCP upstream connect failed")
+            });
+            let events = layer.events();
+            let subscriber = tracing_subscriber::registry().with(layer);
+            let connect = matches!(&outcome, FlowOutcome::RelayFailed(RelayFailure::Connect(_)));
+            let failure = matches!(
+                &outcome,
+                FlowOutcome::Rejected(_) | FlowOutcome::RelayFailed(_)
+            );
+            let reported = tracing::subscriber::with_default(subscriber, || {
+                proxy.record(destination, attempted_host, outcome)
+            });
+            assert_eq!(reported, failure && known);
+            let diagnostics = events.events();
+            assert_eq!(diagnostics.len(), usize::from(connect && !known));
+            if connect && !known {
+                let mut fields = diagnostics[0].clone();
+                fields.sort();
+                let mut expected = vec![
+                    (
+                        "message".to_owned(),
+                        "TCP upstream connect failed".to_owned(),
+                    ),
+                    ("sandbox_id".to_owned(), "test".to_owned()),
+                    ("destination_port".to_owned(), "443".to_owned()),
+                    ("destination_family".to_owned(), "ipv4".to_owned()),
+                    ("destination_scope".to_owned(), "other".to_owned()),
+                    ("io_kind".to_owned(), "ConnectionRefused".to_owned()),
+                    ("errno".to_owned(), libc::ECONNREFUSED.to_string()),
+                    ("suppressed".to_owned(), "0".to_owned()),
+                ];
+                expected.sort();
+                assert_eq!(fields, expected);
+            }
+            let connection_metrics = capture
+                .finish()
+                .into_iter()
+                .filter(|metric| metric.name == "gateway.tcp.connection")
+                .collect::<Vec<_>>();
 
-        assert_eq!(connection_metrics.len(), 1, "{case}");
-        assert_eq!(connection_metrics[0].value, 1, "{case}");
-        assert_eq!(connection_metrics[0].tags.len(), 2, "{case}");
-        let mut tags = connection_metrics[0].tags.clone();
-        tags.sort_unstable();
-        assert!(
-            emitted_tag_sets.insert(tags),
-            "case {case} reused another terminal outcome's tags"
-        );
+            assert_eq!(connection_metrics.len(), 1, "{case}");
+            assert_eq!(connection_metrics[0].value, 1, "{case}");
+            assert_eq!(connection_metrics[0].tags.len(), 2, "{case}");
+            let mut tags = connection_metrics[0].tags.clone();
+            tags.sort_unstable();
+            assert!(
+                emitted_tag_sets.insert(tags),
+                "case {case} reused another terminal outcome's tags"
+            );
+            if connect && !known {
+                const PRIVATE_ERROR_TEXT: &str =
+                    "https://private.example.invalid/path?query=synthetic";
+                let unknown_host: DomainName = "private.example.invalid".parse().unwrap();
+                let cloned_proxy = proxy.clone();
+                let destination = "[fd00::1]:8443".parse().unwrap();
+                let layer = CapturedEventsLayer::new().with_event_filter(|event| {
+                    field_value(event, "message") == Some("TCP upstream connect failed")
+                });
+                let events = layer.events();
+                let subscriber = tracing_subscriber::registry().with(layer);
+                tracing::subscriber::with_default(subscriber, || {
+                    for _ in 0..2 {
+                        let capture = pplx_space_metrics::test_capture::capture_counters_guard();
+                        assert!(!cloned_proxy.record(
+                            destination,
+                            Some(&unknown_host),
+                            FlowOutcome::RelayFailed(RelayFailure::Connect(io::Error::other(
+                                PRIVATE_ERROR_TEXT
+                            ))),
+                        ));
+                        let metrics = capture.finish();
+                        assert_eq!(metrics.len(), 1);
+                        assert_eq!(metrics[0].value, 1);
+                    }
+                    assert!(events.events().is_empty());
+                    for error in [
+                        io::Error::other(PRIVATE_ERROR_TEXT),
+                        io::Error::from_raw_os_error(i32::MAX),
+                    ] {
+                        cloned_proxy
+                            .connect_failure_warnings
+                            .lock()
+                            .unwrap()
+                            .last_logged_at = Some(Instant::now() - REFUSAL_WARNING_INTERVAL);
+                        let capture = pplx_space_metrics::test_capture::capture_counters_guard();
+                        assert!(!cloned_proxy.record(
+                            destination,
+                            Some(&unknown_host),
+                            FlowOutcome::RelayFailed(RelayFailure::Connect(error)),
+                        ));
+                        let metrics = capture.finish();
+                        assert_eq!(metrics.len(), 1);
+                        assert_eq!(metrics[0].value, 1);
+                    }
+                });
+                let diagnostics = events.events();
+                assert_eq!(diagnostics.len(), 2);
+                for (event, (io_kind, suppressed)) in diagnostics
+                    .iter()
+                    .zip([("Other", "2"), ("Uncategorized", "0")])
+                {
+                    let mut fields = event.clone();
+                    fields.sort();
+                    let mut expected = vec![
+                        (
+                            "message".to_owned(),
+                            "TCP upstream connect failed".to_owned(),
+                        ),
+                        ("sandbox_id".to_owned(), "test".to_owned()),
+                        ("destination_port".to_owned(), "8443".to_owned()),
+                        ("destination_family".to_owned(), "ipv6".to_owned()),
+                        ("destination_scope".to_owned(), "private".to_owned()),
+                        ("io_kind".to_owned(), io_kind.to_owned()),
+                        ("suppressed".to_owned(), suppressed.to_owned()),
+                    ];
+                    expected.sort();
+                    assert_eq!(fields, expected);
+                }
+            }
+        }
+        assert_eq!(emitted_tag_sets.len(), outcome_count);
     }
-    assert_eq!(emitted_tag_sets.len(), outcome_count);
 }
 
 /// Full-path devbox validation: stand up the real [`run`] proxy loop with a
@@ -1076,5 +1187,61 @@ fn refusal_warning_budget_separates_details_within_one_outcome() {
     assert_eq!(
         budget.sample_at("certificate_error", Some("unavailable"), start),
         (false, 0)
+    );
+}
+
+#[test]
+fn connect_destination_scope_classifies_without_retaining_addresses() {
+    for (address, expected) in [
+        ("127.0.0.1", "loopback"),
+        ("::1", "loopback"),
+        ("0.0.0.0", "unspecified"),
+        ("::", "unspecified"),
+        ("224.0.0.1", "multicast"),
+        ("ff02::1", "multicast"),
+        ("169.254.1.2", "link_local"),
+        ("fe80::1", "link_local"),
+        ("10.0.0.1", "private"),
+        ("fd00::1", "private"),
+        ("::ffff:10.0.0.1", "private"),
+        ("192.0.2.1", "other"),
+        ("2001:db8::1", "other"),
+    ] {
+        assert_eq!(
+            connect_destination_scope(address.parse().unwrap()),
+            expected
+        );
+    }
+}
+
+#[test]
+fn connect_warning_budget_has_one_window_and_saturating_suppression() {
+    let mut budget = RefusalWarnState::default();
+    let start = Instant::now();
+    assert_eq!(budget.sample_at(start), (true, 0));
+    assert_eq!(
+        budget.sample_at(start + REFUSAL_WARNING_INTERVAL - Duration::from_nanos(1)),
+        (false, 0)
+    );
+    assert_eq!(
+        budget.sample_at(start + REFUSAL_WARNING_INTERVAL),
+        (true, 1)
+    );
+    assert_eq!(
+        budget.sample_at(start + REFUSAL_WARNING_INTERVAL),
+        (false, 0)
+    );
+    budget.suppressed = u64::MAX;
+    assert_eq!(
+        budget.sample_at(start + REFUSAL_WARNING_INTERVAL),
+        (false, 0)
+    );
+    assert_eq!(
+        budget.sample_at(start + 2 * REFUSAL_WARNING_INTERVAL),
+        (true, u64::MAX)
+    );
+    assert_eq!(
+        budget.sample_at(start + 3 * REFUSAL_WARNING_INTERVAL),
+        (true, 0)
     );
 }

@@ -72,6 +72,7 @@ async fn interception_wiring_preserves_admission_and_never_falls_back_to_relay()
             debug_state: GatewayDebugState::default(),
             shutdown_token: CancellationToken::new(),
             refusal_warnings: Arc::default(),
+            connect_failure_warnings: Arc::default(),
         };
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let (guest, accepted) = tokio::join!(

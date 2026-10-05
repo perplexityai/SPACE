@@ -7,7 +7,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::future::Future;
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -99,6 +99,7 @@ pub async fn run(config: TcpProxyConfig) -> io::Result<()> {
         debug_state,
         shutdown_token: proxy_shutdown_token.clone(),
         refusal_warnings: Arc::default(),
+        connect_failure_warnings: Arc::default(),
     }
     .accept_loop(listener)
     .await;
@@ -126,6 +127,7 @@ struct TcpProxy {
     debug_state: GatewayDebugState,
     shutdown_token: CancellationToken,
     refusal_warnings: Arc<RefusalWarnings>,
+    connect_failure_warnings: Arc<Mutex<RefusalWarnState>>,
 }
 
 /// Per-cause budget for interception refusal warnings.
@@ -147,6 +149,20 @@ struct RefusalWarnState {
     suppressed: u64,
 }
 
+impl RefusalWarnState {
+    fn sample_at(&mut self, now: Instant) -> (bool, u64) {
+        let log = self
+            .last_logged_at
+            .is_none_or(|last| now.duration_since(last) >= REFUSAL_WARNING_INTERVAL);
+        if log {
+            self.last_logged_at = Some(now);
+            return (true, std::mem::take(&mut self.suppressed));
+        }
+        self.suppressed = self.suppressed.saturating_add(1);
+        (false, 0)
+    }
+}
+
 impl RefusalWarnings {
     fn sample(&self, outcome: &'static str, detail: Option<&'static str>) -> (bool, u64) {
         self.sample_at(outcome, detail, Instant::now())
@@ -162,16 +178,27 @@ impl RefusalWarnings {
             // A poisoned budget must not silence a fail-closed refusal.
             return (true, 0);
         };
-        let state = causes.entry((outcome, detail)).or_default();
-        let log = state
-            .last_logged_at
-            .is_none_or(|last| now.duration_since(last) >= REFUSAL_WARNING_INTERVAL);
-        if log {
-            state.last_logged_at = Some(now);
-            return (true, std::mem::take(&mut state.suppressed));
-        }
-        state.suppressed = state.suppressed.saturating_add(1);
-        (false, 0)
+        causes.entry((outcome, detail)).or_default().sample_at(now)
+    }
+}
+
+fn connect_destination_scope(address: IpAddr) -> &'static str {
+    let address = address.to_canonical();
+    if address.is_loopback() {
+        return "loopback";
+    }
+    if address.is_unspecified() {
+        return "unspecified";
+    }
+    if address.is_multicast() {
+        return "multicast";
+    }
+    match address {
+        IpAddr::V4(address) if address.is_link_local() => "link_local",
+        IpAddr::V6(address) if address.is_unicast_link_local() => "link_local",
+        IpAddr::V4(address) if address.is_private() => "private",
+        IpAddr::V6(address) if address.is_unique_local() => "private",
+        _ => "other",
     }
 }
 
@@ -655,7 +682,25 @@ impl TcpProxy {
             // terminal connection metric emitted above.
             FlowOutcome::Cancelled
             | FlowOutcome::InspectedTls
-            | FlowOutcome::RelayFailed(RelayFailure::Connect(_) | RelayFailure::Transfer) => {}
+            | FlowOutcome::RelayFailed(RelayFailure::Transfer) => {}
+            FlowOutcome::RelayFailed(RelayFailure::Connect(error)) => {
+                if !reported && let Ok(mut budget) = self.connect_failure_warnings.lock() {
+                    let (warn_now, suppressed) = budget.sample_at(Instant::now());
+                    drop(budget);
+                    if warn_now {
+                        warn!(
+                            sandbox_id = self.sandbox_id,
+                            destination_port = dst.port(),
+                            destination_family = if dst.is_ipv4() { "ipv4" } else { "ipv6" },
+                            destination_scope = connect_destination_scope(dst.ip()),
+                            io_kind = ?error.kind(),
+                            errno = error.raw_os_error().filter(|errno| (1..=4095).contains(errno)),
+                            suppressed,
+                            "TCP upstream connect failed"
+                        );
+                    }
+                }
+            }
             FlowOutcome::HandledDns {
                 messages,
                 wire_tx,
