@@ -315,8 +315,10 @@ pub enum NetworkPolicyVersion {
     V1,
 }
 
+/// Top-level fields are additive: readers ignore unknown fields, so a new field
+/// must be safe for an older reader to drop. Fields that restrict traffic belong
+/// in a strict nested type such as [`EgressPolicyV1`].
 #[cfg_attr(feature = "serde", derive(Serialize))]
-#[cfg_attr(feature = "serde", serde(deny_unknown_fields))]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NetworkPolicyV1 {
     #[cfg_attr(feature = "serde", serde(default))]
@@ -347,7 +349,6 @@ impl<'de> Deserialize<'de> for NetworkPolicyV1 {
         D: Deserializer<'de>,
     {
         #[derive(Deserialize)]
-        #[serde(deny_unknown_fields)]
         struct Helper {
             #[serde(default)]
             version: NetworkPolicyVersion,
