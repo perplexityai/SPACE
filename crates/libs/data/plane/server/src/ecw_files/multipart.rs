@@ -177,15 +177,21 @@ pub(super) struct ContentDispositionE2b {
 }
 
 impl ContentDispositionE2b {
-    /// Splits parameters on `;` outside quoted values. Inside a quoted value,
-    /// `\\` and `\"` are always escapes (RFC 7230 quoted-pairs, as httpx and
-    /// Go write them); any other backslash is literal, which reads browser,
-    /// curl, undici, and urllib3 filenames (`"` sent as `%22`, `\` sent raw)
-    /// as sent. One rule everywhere means a parameter's text can never end or
-    /// start another parameter. Inputs that rule leaves malformed are
-    /// rejected rather than guessed at: unbalanced quotes (including a raw
-    /// filename ending in `\`), a quote inside an unquoted value, a repeated
-    /// `name` or `filename`, and non-UTF-8 values.
+    /// Splits parameters on `;` outside quoted values, where `\\` and `\"`
+    /// are always escapes and any other backslash is literal. One rule
+    /// everywhere means text inside a quoted value can't end the value or
+    /// start another parameter, so `name=file` inside a filename stays part of
+    /// the filename.
+    ///
+    /// httpx and Go escape this way, so their filenames read as sent.
+    /// Browsers, fetch/undici, curl, and urllib3 send `"` as `%22` and `\`
+    /// raw, so their filenames read as sent unless they contain `\\` (read as
+    /// `\`) or end in `\` (rejected: the closing quote reads as escaped).
+    ///
+    /// Only `name` and `filename` are read; other parameters are skipped
+    /// without validation. A header with unbalanced quotes is rejected, and so
+    /// is a `name` or `filename` that has a quote inside an unquoted value,
+    /// appears twice, or isn't UTF-8.
     pub(super) fn parse(headers: &HeaderMap) -> Result<Self, EcwProxyError> {
         let value = headers
             .get(header::CONTENT_DISPOSITION)

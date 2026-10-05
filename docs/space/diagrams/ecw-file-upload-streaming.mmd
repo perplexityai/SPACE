@@ -38,13 +38,14 @@ flowchart TD
   multer -->|"> 256 MiB"| r413b["413"]:::reject
   multer --> part["each part: + framing lower bound,<br/>chunk bytes, CRLF at end<br/>(feeds 'consumed')"]:::mem
   part -.->|"consumed"| thr
-  part --> cd["ContentDispositionE2b::parse<br/>quote-aware name / filename"]:::gate
-  cd -->|"malformed quoting<br/>or non-UTF-8"| r400b["400"]:::reject
+  part --> cd["ContentDispositionE2b::parse<br/>quoted-pair name / filename"]:::gate
+  cd -->|"malformed quoting,<br/>repeated name/filename,<br/>or non-UTF-8"| r400b["400"]:::reject
   cd -->|"> 1000 parts"| r413c["413"]:::reject
   cd -->|"file part with no filename,<br/>filename > 4096 B, or<br/>2nd file with ?path="| r400c["400 before spooling"]:::reject
   cd -->|"name = file"| spool
-  oct --> spool["SpooledUpload<br/>temp file in TMPDIR"]:::disk
-  spool --> fin["finish(): flush, close fd,<br/>keep TempPath"]:::disk
+  oct --> spool["SpooledUpload in TMPDIR<br/>path owned by the request's SpoolFiles<br/>(all removed in one blocking task on any exit)"]:::disk
+  spool --> fin["finish(): flush, close fd<br/>→ StagedUpload (path, len)"]:::disk
   fin --> write["spaced_write_spooled<br/>reopen by path, 3 MiB gRPC chunks,<br/>route carried per file"]:::disk
+  write -->|"spool read fails (call dropped)<br/>or bytes_written ≠ staged len"| r500["500"]:::reject
   replay --> rpc["sandbox spaced write"]:::client
   write --> rpc

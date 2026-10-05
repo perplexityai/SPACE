@@ -960,7 +960,8 @@ async fn staged_spool_files_are_removed_when_a_later_part_fails() {
 async fn staged_spool_files_are_removed_when_the_request_is_cancelled() {
     let dir = tempfile::tempdir().unwrap();
     let staged = multipart_body(&[("file", Some("a.txt"), b"a"), ("file", Some("b.txt"), b"b")]);
-    // The two parts arrive, then the body stalls inside a third.
+    // Both parts' headers arrive and the body stalls inside the second
+    // part's data, so both spool files exist but the request never finishes.
     let prefix = staged[..staged.len() - format!("--{MULTIPART_BOUNDARY}--\r\n").len()].to_vec();
     let body =
         Body::from_stream(stream::iter([Ok::<_, Infallible>(prefix)]).chain(stream::pending()));
@@ -992,4 +993,37 @@ async fn embedded_name_file_in_a_filename_does_not_make_a_part_a_file() {
         .await
         .unwrap();
     assert!(uploads.is_empty());
+}
+
+#[tokio::test]
+async fn spool_read_failure_fails_a_write_that_has_not_finished() {
+    let (read_failed, read_failure) = tokio::sync::oneshot::channel();
+    read_failed.send(()).unwrap();
+    // The call never finishes on its own; only the read failure ends it.
+    let write =
+        std::future::pending::<Result<tonic::Response<spaced_ops::WriteResponse>, tonic::Status>>();
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        fail_on_spool_read_failure(write, read_failure),
+    )
+    .await
+    .expect("a spool read failure must end the write without waiting for the call");
+    let Err(EcwRouteAttemptError::Proxy(error)) = outcome else {
+        panic!("a spool read failure must fail the write");
+    };
+    assert_eq!(error.status, StatusCode::INTERNAL_SERVER_ERROR);
+}
+
+#[tokio::test]
+async fn write_completes_when_the_spool_was_read_to_the_end() {
+    let (read_failed, read_failure) = tokio::sync::oneshot::channel::<()>();
+    // The stream finished, so its sender is gone.
+    drop(read_failed);
+    let write = std::future::ready(Ok(tonic::Response::new(spaced_ops::WriteResponse {
+        bytes_written: 11,
+    })));
+    let response = fail_on_spool_read_failure(write, read_failure)
+        .await
+        .unwrap_or_else(|_| panic!("a complete read must not fail the write"));
+    assert_eq!(response.bytes_written, 11);
 }

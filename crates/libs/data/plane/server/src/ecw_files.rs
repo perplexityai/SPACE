@@ -765,17 +765,7 @@ async fn spaced_write_spooled(
                     stream,
                     route.space_api_route_token.as_ref(),
                 )?);
-                // A spool read failure must not end the request stream: the
-                // guest commits whatever it received when the stream ends, so
-                // dropping the call here is the only way to fail the write.
-                tokio::select! {
-                    response = write => response
-                        .map(|response| response.into_inner())
-                        .map_err(EcwRouteAttemptError::Status),
-                    Ok(()) = read_failure => Err(EcwRouteAttemptError::Proxy(
-                        EcwProxyError::internal("Failed to read staged upload"),
-                    )),
-                }
+                fail_on_spool_read_failure(write, read_failure).await
             }
         },
         raw_file_write_error,
@@ -783,6 +773,31 @@ async fn spaced_write_spooled(
     .await?;
     check_spooled_write_len(response.bytes_written, upload.len)?;
     Ok(route)
+}
+
+/// Runs the write call until it finishes or `spooled_write_requests` reports
+/// a spool read failure. On a read failure the call is dropped, which resets
+/// the request stream rather than ending it, and the HTTP request fails. The
+/// guest may still keep the bytes it already wrote (it writes the target in
+/// place); this only stops the request from reporting success.
+async fn fail_on_spool_read_failure<W>(
+    write: W,
+    read_failure: tokio::sync::oneshot::Receiver<()>,
+) -> Result<spaced_ops::WriteResponse, EcwRouteAttemptError>
+where
+    W: std::future::Future<
+            Output = Result<tonic::Response<spaced_ops::WriteResponse>, tonic::Status>,
+        >,
+{
+    tokio::select! {
+        response = write => response
+            .map(tonic::Response::into_inner)
+            .map_err(EcwRouteAttemptError::Status),
+        // A dropped sender (the stream finished) disables this arm.
+        Ok(()) = read_failure => Err(EcwRouteAttemptError::Proxy(
+            EcwProxyError::internal("Failed to read staged upload"),
+        )),
+    }
 }
 
 fn check_spooled_write_len(bytes_written: u64, staged_len: usize) -> Result<(), EcwProxyError> {
@@ -861,6 +876,12 @@ impl Drop for SpoolFiles {
                 }
             }
         };
+        // While unwinding, a failure to spawn the blocking task would panic
+        // again and abort, so remove inline instead.
+        if std::thread::panicking() {
+            remove();
+            return;
+        }
         match tokio::runtime::Handle::try_current() {
             // Detached: removal needs nothing from the request that dropped it.
             Ok(runtime) => drop(runtime.spawn_blocking(remove)),
@@ -919,8 +940,9 @@ struct SpooledWriteState<R> {
 
 /// The open message, then the spool file in `E2B_FILE_WRITE_CHUNK_BYTES`
 /// chunks. A read error signals `read_failed` and leaves the stream pending
-/// instead of ending it, since a clean end would let the guest commit the
-/// prefix it already received.
+/// instead of ending it, so the write fails through
+/// `fail_on_spool_read_failure` rather than ending as if the file were
+/// complete.
 fn spooled_write_requests<R>(
     sandbox_id: SandboxId,
     path: String,
