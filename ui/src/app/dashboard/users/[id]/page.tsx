@@ -6,8 +6,7 @@ import { adminApi } from '@/lib/api';
 import { useAuth } from '@/lib/auth';
 import { AdminUser, Organization, UserRole } from '@/lib/types';
 import { assignableRoleOptions, canManageUserRole, roleColors, roleLabels } from '@/lib/userRoles';
-import { Card, Typography, Descriptions, Select, Tag, message } from 'antd';
-import UserCredentialsTable from './credentials';
+import { Typography, Descriptions, Select, Tag, message } from 'antd';
 
 const { Title } = Typography;
 
@@ -77,10 +76,6 @@ export default function UserDetailPage() {
         </Descriptions.Item>
         <Descriptions.Item label="ID" contentStyle={{ fontFamily: 'monospace', fontSize: 12 }}>{user.id}</Descriptions.Item>
       </Descriptions>
-
-      <Card title="Credentials" size="small">
-        <UserCredentialsTable userId={id} />
-      </Card>
     </div>
   );
 }
