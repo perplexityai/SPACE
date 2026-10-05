@@ -402,8 +402,22 @@ fn direct_restore_request_carries_control_plane_route_provenance() {
 fn direct_wake_request_delegates_route_identity_to_sandbox_manager() {
     let sandbox_id = SandboxId::new();
 
-    let request = direct_wake_request(sandbox_id, None, None);
-    assert_eq!(request.start_context, None);
+    for vcpu in [None, Some(8)] {
+        let request = direct_wake_request(sandbox_id, vcpu, None, None);
+        assert_eq!(
+            request
+                .start_context
+                .as_ref()
+                .and_then(|context| context.vcpu),
+            vcpu
+        );
+        assert_eq!(
+            request
+                .start_context
+                .and_then(|context| context.route_identity),
+            None
+        );
+    }
 }
 
 #[test]
@@ -451,29 +465,10 @@ fn suspended_direct_wake_carries_control_plane_route_identity() {
         ..Default::default()
     };
 
-    let request = direct_wake_request(sandbox_id, Some(route_identity.clone()), None);
+    let request = direct_wake_request(sandbox_id, Some(8), Some(route_identity.clone()), None);
 
     let context = request.start_context.expect("activation context");
-    assert_eq!(context.vcpu, None);
-    assert!(
-        context.netns_path.is_none()
-            && context.memory_mib.is_none()
-            && context.suspend_restore_storage_uri.is_none()
-            && context.suspend_restore_source_node.is_none()
-            && context.route_identity.as_ref().is_some_and(|identity| {
-                identity.route_generation.is_some()
-                    && identity.current_node_id.is_some()
-                    && identity.pod_uid.is_none()
-                    && matches!(
-                        pplx_space_sbx_mgr_client::proto::SandboxSubstrateKind::try_from(
-                            identity.substrate_kind
-                        ),
-                        Ok(pplx_space_sbx_mgr_client::proto::SandboxSubstrateKind::Unspecified)
-                            | Ok(pplx_space_sbx_mgr_client::proto::SandboxSubstrateKind::Direct)
-                    )
-            }),
-        "a route-only context must classify as Unspecified on a legacy worker"
-    );
+    assert_eq!(context.vcpu, Some(8));
     assert_eq!(context.route_identity, Some(route_identity));
 }
 
