@@ -822,9 +822,10 @@ fn check_spooled_write_len(bytes_written: u64, staged_len: usize) -> Result<(), 
 }
 
 /// Spool files staged by one request, removed when this guard drops: on
-/// success, error, and cancellation alike. Removal runs in one blocking task,
-/// so a request that staged many parts doesn't unlink them all on a runtime
-/// thread.
+/// success, error, and cancellation alike. Removal normally runs in one
+/// blocking task, so a request that staged many parts doesn't unlink them all
+/// on a runtime thread; it runs inline only while unwinding or without a
+/// runtime.
 #[derive(Debug, Default)]
 pub(super) struct SpoolFiles {
     paths: Vec<tempfile::TempPath>,

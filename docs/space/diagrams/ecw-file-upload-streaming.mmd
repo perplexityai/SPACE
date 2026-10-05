@@ -11,7 +11,7 @@ flowchart TD
 
   json["JSON (or no Content-Type)<br/>Content-Length and to_bytes<br/>capped at 1 MiB"]:::mem
   oct["application/octet-stream<br/>Content-Length ≤ 256 MiB<br/>create parent dir first"]:::gate
-  mp["multipart/form-data<br/>Content-Length ≤ 256 MiB<br/>boundary 1–70 chars"]:::gate
+  mp["multipart/form-data<br/>Content-Length ≤ 256 MiB<br/>boundary 1–70 chars<br/>?path= validated before the body"]:::gate
   other["400 unsupported<br/>(body not read)"]:::reject
   ct --> json
   ct --> oct
@@ -41,7 +41,7 @@ flowchart TD
   part --> cd["ContentDispositionE2b::parse<br/>quoted-pair name / filename"]:::gate
   cd -->|"malformed quoting,<br/>repeated name/filename,<br/>or non-UTF-8"| r400b["400"]:::reject
   cd -->|"> 1000 parts"| r413c["413"]:::reject
-  cd -->|"file part with no filename,<br/>filename > 4096 B, or<br/>2nd file with ?path="| r400c["400 before spooling"]:::reject
+  cd -->|"file part with no filename,<br/>filename not a valid guest path,<br/>or 2nd file with ?path="| r400c["400 before spooling"]:::reject
   cd -->|"name = file"| spool
   oct --> spool["SpooledUpload in TMPDIR<br/>path owned by the request's SpoolFiles<br/>(all removed on any exit,<br/>off the runtime when possible)"]:::disk
   spool --> fin["finish(): flush, close fd<br/>→ StagedUpload (path, len)"]:::disk

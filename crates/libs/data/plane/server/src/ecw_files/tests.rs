@@ -1036,13 +1036,22 @@ async fn write_completes_when_the_spool_was_read_to_the_end() {
 #[tokio::test]
 async fn invalid_multipart_filename_is_rejected_before_spooling() {
     let dir = tempfile::tempdir().unwrap();
-    for filename in ["C:\\Users\\a.txt", "a\u{7}b.txt"] {
+    // Both pass multipart header parsing and fail only guest-path validation:
+    // a tab is a control character httparse allows in header values.
+    for (filename, message) in [
+        (
+            "C:\\Users\\a.txt",
+            "windows-style guest paths are not supported for linux sandboxes",
+        ),
+        ("a\tb.txt", "guest path must be bounded and control-free"),
+    ] {
         let body = multipart_body(&[("file", Some(filename), b"content")]);
         let mut spool = SpoolFiles::in_dir(dir.path().to_path_buf());
         let error = spool_multipart_uploads(Body::from(body), MULTIPART_BOUNDARY, true, &mut spool)
             .await
             .unwrap_err();
         assert_eq!(error.status, StatusCode::BAD_REQUEST, "{filename:?}");
+        assert_eq!(error.message, message, "{filename:?}");
         assert_eq!(spool_dir_entries(dir.path()).await, 0, "{filename:?}");
     }
 }
