@@ -83,14 +83,6 @@ expression: paths_by_method
   "/orgs/{org_id}/api-keys/{api_key_id}": [
     "delete"
   ],
-  "/orgs/{org_id}/credentials": [
-    "get",
-    "post"
-  ],
-  "/orgs/{org_id}/credentials/{credential_id}": [
-    "delete",
-    "put"
-  ],
   "/orgs/{org_id}/master-key": [
     "get"
   ],
@@ -154,14 +146,6 @@ expression: paths_by_method
     "delete",
     "get",
     "patch"
-  ],
-  "/users/{user_id}/credentials": [
-    "get",
-    "post"
-  ],
-  "/users/{user_id}/credentials/{credential_id}": [
-    "delete",
-    "put"
   ],
   "/users/{user_id}/role": [
     "put"
