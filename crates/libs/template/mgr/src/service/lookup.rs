@@ -17,8 +17,16 @@ impl TemplateManagerService {
         &self,
         request: Request<crate::proto::GetTemplateRequest>,
     ) -> Result<Response<crate::proto::GetTemplateResponse>, Status> {
-        self.get_template_resolving(request, crate::volume::find_release_inner)
-            .await
+        self.get_template_resolving(
+            request,
+            crate::volume::find_release_inner,
+            async |name, release| {
+                self.volume_puller
+                    .materialize_release(Arc::clone(&self.db), name, release)
+                    .await
+            },
+        )
+        .await
     }
 
     pub(super) async fn get_template_resolving(
@@ -33,6 +41,10 @@ impl TemplateManagerService {
             crate::volume::ResolvedRelease,
             crate::volume::FindReleaseError,
         >,
+        materialize: impl AsyncFnOnce(
+            &str,
+            crate::volume::ResolvedRelease,
+        ) -> crate::volume::PullOutcome,
     ) -> Result<Response<crate::proto::GetTemplateResponse>, Status> {
         self.authorize_peer(&request, "GetTemplate", ALLOW_TEMPLATE_OBSERVER)?;
         let req = request.get_ref();
@@ -56,9 +68,9 @@ impl TemplateManagerService {
             .map(str::parse::<OrgId>)
             .transpose()
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
-        // Scoped requests authorize before cache access. Unscoped callers keep
-        // their local-first behavior while peers upgrade independently.
-        let release = if caller_org.is_some() {
+        // Explicit tags need authoritative resolution even on cache hits. Trusted
+        // name-only policy refreshes and exact-digest reads can still work offline.
+        let release = if caller_org.is_some() || (req_hash.is_empty() && !req_tag.is_empty()) {
             Some(
                 resolve(template_id, &req_hash, &req_tag, caller_org)
                     .await
@@ -193,11 +205,7 @@ impl TemplateManagerService {
         }
 
         let outcome = match release {
-            Some(release) => {
-                self.volume_puller
-                    .materialize_release(Arc::clone(&self.db), template_id, release)
-                    .await
-            }
+            Some(release) => materialize(template_id, release).await,
             None => {
                 self.volume_puller
                     .pull(
