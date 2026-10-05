@@ -21,3 +21,10 @@ regexes = ['''^eyJhbGciOiJSUzI1NiIsImtpZCI6ImJvZ3VzIn0[.]eyJzdWIiOiJmYWtlIiwiYXV
 description = "Synthetic credential-reference UUID shared by credential test fixtures"
 targetRules = ["generic-api-key"]
 regexes = ['''^019d84bd-280d-7331-99c6-b63377f3a3a2$''']
+
+[[allowlists]]
+description = "Synthetic sandbox UUID in the restore artifact retention fixture"
+targetRules = ["generic-api-key"]
+condition = "AND"
+paths = ['''(^|/)crates/libs/sbx/mgr/server/src/snapshot_restore/tests\.rs$''']
+regexes = ['''^019e31d9-79a6-7132-b90f-007f1c62ddea$''']

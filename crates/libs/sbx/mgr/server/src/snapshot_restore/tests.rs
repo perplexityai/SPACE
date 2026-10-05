@@ -1284,6 +1284,93 @@ fn staging_err(msg: &str) -> RestoreError {
     RestoreError::Other(msg.to_string())
 }
 
+#[tokio::test(start_paused = true)]
+async fn btrfs_staging_receives_as_soon_as_its_inputs_are_ready() {
+    // The memory download is not an input to filesystem reconstruction. Both
+    // must finish before staging returns, including when receive is slower.
+    for (template_ms, rootfs_ms, memory_ms, receive_ms, expected_ms) in [
+        (10, 20, Some(100), 30, 100),
+        (40, 20, Some(100), 80, 120),
+        (10, 20, None, 30, 50),
+    ] {
+        let started = tokio::time::Instant::now();
+        let transfer = |ms| -> BoxFuture<'_, Result<(), RestoreError>> {
+            Box::pin(async move {
+                tokio::time::sleep(Duration::from_millis(ms)).await;
+                Ok(())
+            })
+        };
+        let receive = Box::pin(async move {
+            assert_eq!(
+                started.elapsed(),
+                Duration::from_millis(template_ms.max(rootfs_ms)),
+                "receive must wait only for its template and rootfs stream"
+            );
+            tokio::time::sleep(Duration::from_millis(receive_ms)).await;
+            Ok(())
+        });
+        run_btrfs_staging(
+            transfer(template_ms),
+            vec![transfer(rootfs_ms)],
+            memory_ms.into_iter().map(transfer).collect(),
+            receive,
+        )
+        .await
+        .unwrap();
+        assert_eq!(started.elapsed(), Duration::from_millis(expected_ms));
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn btrfs_staging_joins_failures_before_cleanup_and_preserves_error_order() {
+    use std::sync::atomic::{AtomicU8, Ordering};
+
+    // Bits name template, rootfs, runtime download, and receive failures.
+    // Combined failures pin the existing diagnostic/cleanup precedence.
+    for (failures, expected) in [
+        (0, None),
+        (1, Some("template")),
+        (2, Some("rootfs")),
+        (4, Some("runtime")),
+        (8, Some("receive")),
+        (7, Some("template")),
+        (6, Some("runtime")),
+        (12, Some("runtime")),
+    ] {
+        let completed = AtomicU8::new(0);
+        let stage = |bit, name, ms| -> BoxFuture<'_, Result<(), RestoreError>> {
+            let completed = &completed;
+            Box::pin(async move {
+                tokio::time::sleep(Duration::from_millis(ms)).await;
+                completed.fetch_or(bit, Ordering::Relaxed);
+                if failures & bit != 0 {
+                    Err(staging_err(name))
+                } else {
+                    Ok(())
+                }
+            })
+        };
+        let result = run_btrfs_staging(
+            stage(1, "template", 10),
+            vec![stage(2, "rootfs", 20)],
+            vec![stage(4, "runtime", 100)],
+            stage(8, "receive", 30),
+        )
+        .await;
+        assert_eq!(
+            completed.load(Ordering::Relaxed),
+            if failures & 3 == 0 { 15 } else { 7 },
+            "every transfer must finish, and receive requires both inputs"
+        );
+        match expected {
+            None => result.unwrap(),
+            Some(expected) => {
+                assert!(result.unwrap_err().to_string().contains(expected));
+            }
+        }
+    }
+}
+
 #[tokio::test]
 async fn staging_transfers_overlap_template_ensure_with_pulls() {
     // Cross-dependency only satisfiable under concurrency: the template

@@ -2466,10 +2466,9 @@ async fn stage_btrfs_send_restore(
         ))
     })?;
 
-    // Materialize the template and pull the artifacts concurrently. The
-    // template is only a prerequisite of the `btrfs receive` below — not
-    // of the downloads — so a cold-node template pull hides behind the
-    // large artifact transfers instead of preceding them serially.
+    // Template and rootfs availability gate receive; runtime-state downloads
+    // are independent. Keep them running while node-manager reconstructs the
+    // filesystem, then join all work before publishing or cleaning staging.
     //
     // tmplmgr's `GetTemplate` transparently triggers an on-demand S3
     // pull when the template isn't cached, so this works the first time
@@ -2482,45 +2481,50 @@ async fn stage_btrfs_send_restore(
     // additionally carry binfile + memfile; disk artifacts cold-boot and must
     // not require runtime-state blobs. metadata.json was pulled by the
     // dispatcher.
-    let pulls = btrfs_restore_artifacts(artifact_kind)
-        .into_iter()
-        .map(|(artifact, local_name)| -> BoxFuture<'_, _> {
-            Box::pin(pull_artifact(
-                identity,
-                config,
-                snapshot_dir.join(local_name),
-                artifact,
-                transfer_scope_id,
-            ))
-        })
-        .collect::<Vec<_>>();
-    run_staging_transfers(
-        Some(Box::pin(async {
+    let mut rootfs_pulls = Vec::with_capacity(1);
+    let mut runtime_pulls = Vec::with_capacity(2);
+    for (artifact, local_name) in btrfs_restore_artifacts(artifact_kind) {
+        let pull: BoxFuture<'_, _> = Box::pin(pull_artifact(
+            identity,
+            config,
+            snapshot_dir.join(local_name),
+            artifact,
+            transfer_scope_id,
+        ));
+        if artifact == SnapshotArtifact::RootfsBtrfsSend {
+            rootfs_pulls.push(pull);
+        } else {
+            runtime_pulls.push(pull);
+        }
+    }
+    run_btrfs_staging(
+        Box::pin(async {
             ensure_local_template(sandbox_id, template_name, content_hash)
                 .await
                 .map(drop)
-        })),
-        pulls,
+        }),
+        rootfs_pulls,
+        runtime_pulls,
+        Box::pin(async {
+            // Node-manager retains privileged receive and execution fencing.
+            crate::btrfs_via_nodemgr::receive_instance(
+                sandbox_id,
+                template_name,
+                content_hash,
+                target,
+            )
+            .instrument(tracing::info_span!(
+                "sbxmgr.start.stage",
+                sandbox_id,
+                stage = "restore.snapshot.btrfs_receive",
+                otel.name = "restore.snapshot.btrfs_receive",
+                codec = RestoreCodec::BtrfsSendV1.as_str(),
+            ))
+            .await
+            .map_err(|source| RestoreError::BtrfsReceive { source })
+        }),
     )
     .await?;
-
-    // Delegate the btrfs portion to node-manager (the privileged
-    // daemon — sbxmgr lacks CAP_SYS_ADMIN). nodemgr-side this verifies
-    // the local template has the matching deterministic
-    // `received_uuid`, cleans up stale instance / instance.ro, runs
-    // `btrfs receive`, renames the received subvolume to `instance/`,
-    // toggles RW. Failures (template missing / stamp mismatch /
-    // receive aborted) preserve the status as `RestoreError::BtrfsReceive`.
-    crate::btrfs_via_nodemgr::receive_instance(sandbox_id, template_name, content_hash, target)
-        .instrument(tracing::info_span!(
-            "sbxmgr.start.stage",
-            sandbox_id,
-            stage = "restore.snapshot.btrfs_receive",
-            otel.name = "restore.snapshot.btrfs_receive",
-            codec = RestoreCodec::BtrfsSendV1.as_str(),
-        ))
-        .await
-        .map_err(|source| RestoreError::BtrfsReceive { source })?;
 
     tracing::info!(
         sandbox_id,
@@ -2548,6 +2552,32 @@ fn btrfs_restore_artifacts(artifact_kind: ArtifactKind) -> Vec<(SnapshotArtifact
         crate::snapshot_upload::ROOTFS_BTRFS_SEND_FILENAME,
     ));
     artifacts
+}
+
+async fn run_btrfs_staging<'a>(
+    template: BoxFuture<'a, Result<(), RestoreError>>,
+    rootfs_pulls: Vec<BoxFuture<'a, Result<(), RestoreError>>>,
+    runtime_pulls: Vec<BoxFuture<'a, Result<(), RestoreError>>>,
+    receive: BoxFuture<'a, Result<(), RestoreError>>,
+) -> Result<(), RestoreError> {
+    let rootfs = async {
+        let (template_result, pulls) = tokio::join!(template, join_all(rootfs_pulls));
+        let rootfs_result: Result<(), RestoreError> = pulls.into_iter().collect();
+        let receive_result = if template_result.is_ok() && rootfs_result.is_ok() {
+            receive.await
+        } else {
+            Ok(())
+        };
+        (template_result, rootfs_result, receive_result)
+    };
+    // Do not cancel sibling downloads or receive on failure: cleanup must only
+    // run after all staging work finishes. Preserve the previous error order,
+    // including which failure decides whether completed files survive retry.
+    let ((template, rootfs, receive), runtime) = tokio::join!(rootfs, join_all(runtime_pulls));
+    template?;
+    runtime.into_iter().collect::<Result<(), RestoreError>>()?;
+    rootfs?;
+    receive
 }
 
 /// Ensure `(template_name, content_hash)` is locally cached by asking
