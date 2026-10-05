@@ -90,7 +90,3 @@ k8s:
 serviceAccount:
   name: space-internal-api
 apiReleaseName: space
-
-# Activation is opt-in; substrate wiring alone does not enable automatic wake.
-ingressWake:
-  enabled: false

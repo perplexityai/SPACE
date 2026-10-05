@@ -248,17 +248,10 @@ fn resolve_node_id(path: &Path) -> Result<(String, String), NodeIdError> {
 
 /// Serve the cluster control-plane gRPC API until `shutdown_token` is
 /// cancelled, then drain in-flight requests and return.
-pub async fn run(
-    config: InternalApiRunConfig,
-    shutdown_token: CancellationToken,
-) -> Result<(), RunInternalApiError> {
-    run_with_ingress_activation(config, shutdown_token, None).await
-}
-
 pub async fn run_with_ingress_activation(
     config: InternalApiRunConfig,
     shutdown_token: CancellationToken,
-    factory: Option<&dyn crate::ingress_activation::IngressActivationFactory>,
+    factory: &dyn crate::ingress_activation::IngressActivationFactory,
 ) -> Result<(), RunInternalApiError> {
     let route_ed25519_authority = Some(std::sync::Arc::new(
         pplx_space_common_svc::space_api_route_ed25519::SpaceApiRouteEd25519Authority::load_required_from_env()
@@ -330,28 +323,15 @@ pub async fn run_with_ingress_activation(
         .build_v1()?;
     let (_, health_service) = pplx_space_common_svc::grpc_health_service();
 
-    let activation = if crate::ingress_activation::enabled() {
-        match factory {
-            Some(factory) => Some(
-                factory
-                    .build(
-                        pool.clone(),
-                        route_ed25519_authority.clone(),
-                        activation_tasks.clone(),
-                        shutdown_token.clone(),
-                    )
-                    .await
-                    .map_err(RunInternalApiError::ClusterApiService)?,
-            ),
-            None => {
-                return Err(RunInternalApiError::ClusterApiService(
-                    tonic::Status::failed_precondition("ingress wake requires an activation owner"),
-                ));
-            }
-        }
-    } else {
-        None
-    };
+    let activation = factory
+        .build(
+            pool.clone(),
+            route_ed25519_authority.clone(),
+            activation_tasks.clone(),
+            shutdown_token.clone(),
+        )
+        .await
+        .map_err(RunInternalApiError::ClusterApiService)?;
     let mut svc = ClusterApiService::from_env_with_security_state(
         pool,
         route_ed25519_authority,
@@ -360,7 +340,7 @@ pub async fn run_with_ingress_activation(
     .await
     .map_err(RunInternalApiError::ClusterApiService)?
     .with_visibility_pool(visibility_pool);
-    svc.ingress_activation = activation;
+    svc.ingress_activation = Some(activation);
     let node_info = ClusterNodeInfoService::new(node_id);
     let publisher_auth =
         auth::build::BuildAuthLayer::for_template_publication(token.clone()).await?;

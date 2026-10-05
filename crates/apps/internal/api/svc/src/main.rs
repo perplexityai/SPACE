@@ -44,7 +44,7 @@ fn main() -> anyhow::Result<()> {
             let result = pplx_space_internal_api_server::run_with_ingress_activation(
                 cli.into(),
                 shutdown_token,
-                Some(&pplx_space_api::controllers::sandbox::IngressActivationFactory),
+                &pplx_space_api::controllers::sandbox::IngressActivationFactory,
             )
             .await;
             pplx_space_common_svc::shutdown_telemetry(telemetry).await;

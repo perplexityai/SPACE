@@ -27,7 +27,7 @@ mod trusted_storage;
 
 pub use run::run_with_ingress_activation;
 pub use run::{
-    DEFAULT_LISTEN_ADDR, InternalApiRunConfig, NodeIdError, RunInternalApiError, SERVICE_NAME, run,
+    DEFAULT_LISTEN_ADDR, InternalApiRunConfig, NodeIdError, RunInternalApiError, SERVICE_NAME,
 };
 
 use pplx_space_common_core::sql;
