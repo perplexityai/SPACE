@@ -64,17 +64,27 @@ pub(super) fn multipart_boundary(content_type: &str) -> Option<&str> {
         .filter(|boundary| (1..=MULTIPART_BOUNDARY_MAX_LEN).contains(&boundary.len()))
 }
 
+/// `filenames_name_paths` is false when a `path` query names the file, in
+/// which case part filenames are neither kept nor validated.
 pub(super) async fn spool_multipart_uploads(
     body: Body,
     boundary: &str,
+    filenames_name_paths: bool,
 ) -> Result<Vec<MultipartUploadPartE2b>, EcwProxyError> {
-    spool_multipart_uploads_with_limit(body, boundary, E2B_FILE_CONTENT_LIMIT_BYTES).await
+    spool_multipart_uploads_with_limit(
+        body,
+        boundary,
+        E2B_FILE_CONTENT_LIMIT_BYTES,
+        filenames_name_paths,
+    )
+    .await
 }
 
 pub(super) async fn spool_multipart_uploads_with_limit(
     body: Body,
     boundary: &str,
     limit: usize,
+    filenames_name_paths: bool,
 ) -> Result<Vec<MultipartUploadPartE2b>, EcwProxyError> {
     // Capping the whole body, not each part, keeps the pre-streaming contract
     // and bounds the spool disk a single request can use across all its parts.
@@ -102,14 +112,15 @@ pub(super) async fn spool_multipart_uploads_with_limit(
             Ordering::Relaxed,
         );
         let disposition = ContentDispositionE2b::parse(field.headers())?;
-        let filename = disposition.filename.filter(|filename| !filename.is_empty());
         let is_file = disposition.name.as_deref() == Some("file");
-        // Filenames become guest paths later; reject an impossible one before
-        // holding it and spooling its part.
-        if is_file
-            && filename
-                .as_ref()
-                .is_some_and(|filename| filename.len() > MAX_GUEST_PATH_BYTES)
+        let filename = disposition
+            .filename
+            .filter(|filename| filenames_name_paths && is_file && !filename.is_empty());
+        // The filename becomes a guest path later; reject an impossible one
+        // before holding it and spooling its part.
+        if filename
+            .as_ref()
+            .is_some_and(|filename| filename.len() > MAX_GUEST_PATH_BYTES)
         {
             return Err(EcwProxyError::bad_request(format!(
                 "multipart filename exceeds {MAX_GUEST_PATH_BYTES} bytes"

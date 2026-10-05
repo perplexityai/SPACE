@@ -321,7 +321,7 @@ pub(super) async fn write_file(
                 "multipart/form-data boundary of 1 to 70 characters is required",
             )
         })?;
-        let uploads = spool_multipart_uploads(body, boundary).await?;
+        let uploads = spool_multipart_uploads(body, boundary, query.path.is_none()).await?;
         let writes = resolve_multipart_uploads(uploads, query.path, user.as_ref())?;
         let mut written = Vec::with_capacity(writes.len());
         let mut route = route;
@@ -760,8 +760,10 @@ async fn spaced_write_spooled(
     .await?;
     // Unlinking is a blocking syscall too. Error paths above drop `upload`
     // in place, which unlinks synchronously.
-    if let Err(error) = tokio::task::spawn_blocking(move || upload.close()).await {
-        tracing::warn!(%error, "ECW upload spool file removal task failed");
+    match tokio::task::spawn_blocking(move || upload.close()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => tracing::warn!(%error, "failed to remove ECW upload spool file"),
+        Err(error) => tracing::warn!(%error, "ECW upload spool file removal task failed"),
     }
     Ok(route)
 }

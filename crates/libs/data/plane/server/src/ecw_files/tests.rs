@@ -85,6 +85,7 @@ async fn multipart_single_file_is_spooled_with_filename_and_content() {
     let uploads = spool_multipart_uploads(
         chunked_body(vec![body[..split].to_vec(), body[split..].to_vec()]),
         MULTIPART_BOUNDARY,
+        true,
     )
     .await
     .unwrap();
@@ -108,6 +109,7 @@ async fn multipart_multiple_files_are_spooled_independently() {
     let uploads = spool_multipart_uploads(
         chunked_body(body.chunks(17).map(<[u8]>::to_vec).collect()),
         MULTIPART_BOUNDARY,
+        true,
     )
     .await
     .unwrap();
@@ -131,7 +133,7 @@ async fn multipart_multiple_files_are_spooled_independently() {
 #[tokio::test]
 async fn multipart_path_query_overrides_filename_and_rejects_multiple_files() {
     let single = multipart_body(&[("file", Some("ignored.txt"), b"content")]);
-    let uploads = spool_multipart_uploads(Body::from(single), MULTIPART_BOUNDARY)
+    let uploads = spool_multipart_uploads(Body::from(single), MULTIPART_BOUNDARY, true)
         .await
         .unwrap();
     let mut writes =
@@ -146,7 +148,7 @@ async fn multipart_path_query_overrides_filename_and_rejects_multiple_files() {
         ("file", Some("a.txt"), b"alpha"),
         ("file", Some("b.txt"), b"beta"),
     ]);
-    let uploads = spool_multipart_uploads(Body::from(multiple), MULTIPART_BOUNDARY)
+    let uploads = spool_multipart_uploads(Body::from(multiple), MULTIPART_BOUNDARY, true)
         .await
         .unwrap();
     let error =
@@ -161,7 +163,7 @@ async fn multipart_path_query_overrides_filename_and_rejects_multiple_files() {
 #[tokio::test]
 async fn multipart_requires_filename_or_path() {
     let body = multipart_body(&[("file", None, b"content")]);
-    let uploads = spool_multipart_uploads(Body::from(body), MULTIPART_BOUNDARY)
+    let uploads = spool_multipart_uploads(Body::from(body), MULTIPART_BOUNDARY, true)
         .await
         .unwrap();
     let error = resolve_multipart_uploads(uploads, None, None).unwrap_err();
@@ -178,6 +180,7 @@ async fn malformed_multipart_and_missing_boundary_are_rejected() {
     let error = spool_multipart_uploads(
         Body::from(multipart_body(&[("file", Some("a.txt"), b"content")])),
         "different-boundary",
+        true,
     )
     .await
     .unwrap_err();
@@ -187,7 +190,7 @@ async fn malformed_multipart_and_missing_boundary_are_rejected() {
     let missing_disposition = format!(
         "--{MULTIPART_BOUNDARY}\r\nContent-Type: application/octet-stream\r\n\r\ncontent\r\n--{MULTIPART_BOUNDARY}--\r\n"
     );
-    let error = spool_multipart_uploads(Body::from(missing_disposition), MULTIPART_BOUNDARY)
+    let error = spool_multipart_uploads(Body::from(missing_disposition), MULTIPART_BOUNDARY, true)
         .await
         .unwrap_err();
     assert_eq!(error.status, StatusCode::BAD_REQUEST);
@@ -214,7 +217,7 @@ async fn multipart_whole_stream_limit_rejects_without_reading_the_rest() {
     .map(Ok::<_, Infallible>);
 
     let error =
-        spool_multipart_uploads_with_limit(Body::from_stream(stream), MULTIPART_BOUNDARY, 8)
+        spool_multipart_uploads_with_limit(Body::from_stream(stream), MULTIPART_BOUNDARY, 8, true)
             .await
             .unwrap_err();
     assert_eq!(error.status, StatusCode::PAYLOAD_TOO_LARGE);
@@ -236,9 +239,10 @@ async fn multipart_limit_caps_the_whole_body_across_file_parts() {
         ("file", Some("b.txt"), &[b'b'; 6]),
     ]);
     let limit = body.len() - 1;
-    let error = spool_multipart_uploads_with_limit(Body::from(body), MULTIPART_BOUNDARY, limit)
-        .await
-        .unwrap_err();
+    let error =
+        spool_multipart_uploads_with_limit(Body::from(body), MULTIPART_BOUNDARY, limit, true)
+            .await
+            .unwrap_err();
     assert_eq!(error.status, StatusCode::PAYLOAD_TOO_LARGE);
 }
 
@@ -260,7 +264,7 @@ async fn multipart_part_without_header_terminator_is_rejected_before_buffering_t
     })
     .map(Ok::<_, Infallible>);
 
-    let error = spool_multipart_uploads(Body::from_stream(stream), MULTIPART_BOUNDARY)
+    let error = spool_multipart_uploads(Body::from_stream(stream), MULTIPART_BOUNDARY, true)
         .await
         .unwrap_err();
     assert_eq!(error.status, StatusCode::BAD_REQUEST);
@@ -295,6 +299,7 @@ async fn multipart_framing_lower_bound_never_exceeds_the_encoded_part() {
     let uploads = spool_multipart_uploads(
         Body::from(format!("{shortest}--{MULTIPART_BOUNDARY}--\r\n")),
         MULTIPART_BOUNDARY,
+        true,
     )
     .await
     .unwrap();
@@ -346,7 +351,7 @@ async fn multipart_file_part_with_filename_before_name_is_spooled() {
     let body = format!(
         "--{MULTIPART_BOUNDARY}\r\nContent-Disposition: form-data; filename=\"my name.txt\"; name=\"file\"\r\n\r\ncontent\r\n--{MULTIPART_BOUNDARY}--\r\n"
     );
-    let uploads = spool_multipart_uploads(Body::from(body), MULTIPART_BOUNDARY)
+    let uploads = spool_multipart_uploads(Body::from(body), MULTIPART_BOUNDARY, true)
         .await
         .unwrap();
     assert_eq!(uploads.len(), 1);
@@ -456,7 +461,7 @@ fn content_disposition_parse_ignores_text_inside_quoted_values() {
 async fn multipart_file_part_with_an_impossible_filename_is_rejected_before_spooling() {
     let filename = "f".repeat(MAX_GUEST_PATH_BYTES + 1);
     let body = multipart_body(&[("file", Some(filename.as_str()), b"content")]);
-    let error = spool_multipart_uploads(Body::from(body), MULTIPART_BOUNDARY)
+    let error = spool_multipart_uploads(Body::from(body), MULTIPART_BOUNDARY, true)
         .await
         .unwrap_err();
     assert_eq!(error.status, StatusCode::BAD_REQUEST);
@@ -464,6 +469,17 @@ async fn multipart_file_part_with_an_impossible_filename_is_rejected_before_spoo
         error.message,
         format!("multipart filename exceeds {MAX_GUEST_PATH_BYTES} bytes")
     );
+}
+
+#[tokio::test]
+async fn multipart_filename_is_ignored_when_a_path_query_names_the_file() {
+    let filename = "f".repeat(MAX_GUEST_PATH_BYTES + 1);
+    let body = multipart_body(&[("file", Some(filename.as_str()), b"content")]);
+    let uploads = spool_multipart_uploads(Body::from(body), MULTIPART_BOUNDARY, false)
+        .await
+        .unwrap();
+    assert_eq!(uploads.len(), 1);
+    assert_eq!(uploads[0].filename, None);
 }
 
 #[tokio::test]
@@ -485,7 +501,7 @@ async fn multipart_parts_are_classified_by_their_real_name_parameter() {
     }
     body.extend_from_slice(format!("--{MULTIPART_BOUNDARY}--\r\n").as_bytes());
 
-    let uploads = spool_multipart_uploads(Body::from(body), MULTIPART_BOUNDARY)
+    let uploads = spool_multipart_uploads(Body::from(body), MULTIPART_BOUNDARY, true)
         .await
         .unwrap();
     assert_eq!(uploads.len(), 1);
@@ -510,9 +526,10 @@ async fn multipart_part_count_is_capped() {
     // Tiny parts cost the parser almost nothing each, so the part cap, not the
     // stream cap, is what stops them.
     let parts = vec![("file", Some("a.txt"), b"".as_slice()); E2B_MULTIPART_PART_LIMIT + 1];
-    let error = spool_multipart_uploads(Body::from(multipart_body(&parts)), MULTIPART_BOUNDARY)
-        .await
-        .unwrap_err();
+    let error =
+        spool_multipart_uploads(Body::from(multipart_body(&parts)), MULTIPART_BOUNDARY, true)
+            .await
+            .unwrap_err();
     assert_eq!(error.status, StatusCode::PAYLOAD_TOO_LARGE);
     assert_eq!(
         error.message,
@@ -531,7 +548,7 @@ async fn multipart_framing_overhead_beyond_the_parse_buffer_is_accepted() {
     let body = multipart_body(&parts);
     let frames = body.chunks(64 * 1024).map(<[u8]>::to_vec).collect();
 
-    let uploads = spool_multipart_uploads(chunked_body(frames), MULTIPART_BOUNDARY)
+    let uploads = spool_multipart_uploads(chunked_body(frames), MULTIPART_BOUNDARY, true)
         .await
         .unwrap();
     assert_eq!(uploads.len(), 1);
@@ -557,7 +574,7 @@ async fn multipart_file_larger_than_the_parse_buffer_streams_in_frames() {
     ]);
     let frames = body.chunks(frame_len).map(<[u8]>::to_vec).collect();
 
-    let uploads = spool_multipart_uploads(chunked_body(frames), MULTIPART_BOUNDARY)
+    let uploads = spool_multipart_uploads(chunked_body(frames), MULTIPART_BOUNDARY, true)
         .await
         .unwrap();
     assert_eq!(uploads.len(), 1);
