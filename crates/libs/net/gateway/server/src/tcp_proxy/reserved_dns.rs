@@ -1,3 +1,4 @@
+use std::io;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -73,7 +74,9 @@ where
             ResolveOutcome::Cancelled => return FlowOutcome::Cancelled,
         };
         if reply.is_empty() {
-            return FlowOutcome::RelayFailed(RelayFailure::Transfer);
+            return FlowOutcome::RelayFailed(RelayFailure::Transfer(io::Error::other(
+                "reserved DNS returned an empty reply",
+            )));
         }
         if shutdown.is_cancelled() {
             return FlowOutcome::Cancelled;
@@ -92,8 +95,15 @@ where
             () = shutdown.cancelled() => return FlowOutcome::Cancelled,
             result = tokio::time::timeout(FRAME_IO_TIMEOUT, framed.send(Bytes::from(reply))) => result,
         };
-        if !matches!(sent, Ok(Ok(()))) {
-            return FlowOutcome::RelayFailed(RelayFailure::Transfer);
+        match sent {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => return FlowOutcome::RelayFailed(RelayFailure::Transfer(error)),
+            Err(_) => {
+                return FlowOutcome::RelayFailed(RelayFailure::Transfer(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "reserved DNS reply write timed out",
+                )));
+            }
         }
         wire_rx = wire_rx.saturating_add(reply_wire_bytes);
         messages = messages.saturating_add(1);

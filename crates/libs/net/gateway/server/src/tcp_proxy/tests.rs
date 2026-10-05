@@ -802,7 +802,9 @@ async fn record_emits_one_connection_metric_and_reports_every_failure_outcome() 
         FlowOutcome::RelayFailed(RelayFailure::PlaintextUpstreamHttp),
         FlowOutcome::RelayFailed(RelayFailure::PlaintextGuestHttp),
         FlowOutcome::Rejected(Rejection::TlsInterception(TlsInterceptionError::Timeout)),
-        FlowOutcome::RelayFailed(RelayFailure::Transfer),
+        FlowOutcome::RelayFailed(RelayFailure::Transfer(io::Error::other(
+            "test transfer failure",
+        ))),
         FlowOutcome::Relayed(Relay::Tunnelled {
             wire_tx: 1,
             wire_rx: 2,

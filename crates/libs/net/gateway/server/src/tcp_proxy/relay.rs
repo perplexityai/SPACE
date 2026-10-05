@@ -14,7 +14,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Which half of the relay failed.
 pub(super) enum Failure {
     Connect(io::Error),
-    Copy,
+    Copy(io::Error),
 }
 
 /// Dial `dst` and shuttle bytes until both directions close. Returns the wire
@@ -23,7 +23,7 @@ pub(super) async fn run(mut client: TcpStream, dst: SocketAddr) -> Result<(u64, 
     let mut upstream = connect(dst).await.map_err(Failure::Connect)?;
     copy_bidirectional(&mut client, &mut upstream)
         .await
-        .map_err(|_| Failure::Copy)
+        .map_err(Failure::Copy)
 }
 
 /// `SO_MARK` keeps the reply from being re-captured by this gateway's own TPROXY

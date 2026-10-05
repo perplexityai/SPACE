@@ -218,7 +218,7 @@ impl FlowOutcome {
             Self::RelayFailed(RelayFailure::PlaintextGuestHttp) => {
                 ("relay_failed", "plaintext_guest_http")
             }
-            Self::RelayFailed(RelayFailure::Transfer) => ("relay_failed", "transfer"),
+            Self::RelayFailed(RelayFailure::Transfer(_)) => ("relay_failed", "transfer"),
         }
     }
 
@@ -226,6 +226,9 @@ impl FlowOutcome {
         match self {
             Self::RelayFailed(RelayFailure::Connect(error)) => {
                 Some(format!("upstream_connect: {error}").into())
+            }
+            Self::RelayFailed(RelayFailure::Transfer(error)) => {
+                Some(format!("transfer: {:?}: {error}", error.kind()).into())
             }
             Self::Rejected(_) | Self::RelayFailed(_) => Some(self.metric_tags().1.into()),
             Self::Cancelled | Self::Relayed(_) | Self::HandledDns { .. } | Self::InspectedTls => {
@@ -252,7 +255,8 @@ enum RelayFailure {
     PlaintextUpstreamHttp,
     /// A DNS-authorized plaintext guest flow did not speak HTTP/1.1.
     PlaintextGuestHttp,
-    Transfer,
+    /// Connected, then the byte stream failed (e.g. reset, broken pipe).
+    Transfer(io::Error),
 }
 
 /// How the bytes were carried.
@@ -598,7 +602,9 @@ impl TcpProxy {
             Err(relay::Failure::Connect(error)) => {
                 FlowOutcome::RelayFailed(RelayFailure::Connect(error))
             }
-            Err(relay::Failure::Copy) => FlowOutcome::RelayFailed(RelayFailure::Transfer),
+            Err(relay::Failure::Copy(error)) => {
+                FlowOutcome::RelayFailed(RelayFailure::Transfer(error))
+            }
         }
     }
 
@@ -655,7 +661,7 @@ impl TcpProxy {
             // terminal connection metric emitted above.
             FlowOutcome::Cancelled
             | FlowOutcome::InspectedTls
-            | FlowOutcome::RelayFailed(RelayFailure::Connect(_) | RelayFailure::Transfer) => {}
+            | FlowOutcome::RelayFailed(RelayFailure::Connect(_) | RelayFailure::Transfer(_)) => {}
             FlowOutcome::HandledDns {
                 messages,
                 wire_tx,
