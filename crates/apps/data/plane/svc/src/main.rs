@@ -16,15 +16,21 @@ use pplx_space_data_plane_server::{
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 // Without background threads, jemalloc purges an arena's dirty pages only when
-// that arena allocates again, so a replica that goes idle after a burst keeps
-// the burst resident just as glibc does. Background threads purge on the decay
-// timer instead. jemalloc defines `malloc_conf` as a weak symbol, so this
+// that arena next allocates or frees, so a replica that goes idle after a burst
+// keeps the burst resident just as glibc does. Background threads purge on the
+// decay timer instead. jemalloc defines `malloc_conf` as a weak symbol, so this
 // definition replaces it; `_RJEM_MALLOC_CONF` still overrides it at startup.
 // The symbol is a C `const char *`: a reference to a sized array is a thin
 // pointer with that layout, where `&[u8]` would be a (pointer, length) pair.
+// jemalloc reads the string before `main`, so the assertion keeps a dropped
+// terminator from becoming an out-of-bounds read that no test would observe.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+const JEMALLOC_CONF: &[u8; 23] = b"background_thread:true\0";
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+const _: () = assert!(matches!(JEMALLOC_CONF.last(), Some(0)));
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 #[unsafe(export_name = "_rjem_malloc_conf")]
-static MALLOC_CONF: &[u8; 23] = b"background_thread:true\0";
+static MALLOC_CONF: &[u8; 23] = JEMALLOC_CONF;
 
 const SERVICE_NAME: &str = "space-data-plane";
 

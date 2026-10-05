@@ -346,7 +346,7 @@ holds exactly:
 
 - the clap `Cli`, and `impl From<Cli> for <Svc>RunConfig` (clap `env = "..."`
   attributes are the one sanctioned environment read);
-- an optional `#[global_allocator]`;
+- an optional `#[global_allocator]` and its `malloc_conf`;
 - `main()`: parse, build the runtime if the crate builds one, `init_service`,
   the shutdown token, one `lib::run(config, shutdown).await?`.
 
