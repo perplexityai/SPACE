@@ -86,6 +86,10 @@ pub(crate) async fn local_provider() -> (rcgen::Certificate, GatewayAuthority, C
     local_provider_with_state(GatewayNetworkState::pending_policy()).await
 }
 
+pub(crate) fn retire_authority(owner: &GatewayAuthority) {
+    owner.clear();
+}
+
 pub(crate) fn advance_route(owner: &GatewayAuthority) {
     let (identity, _) = owner.inner.identity.identity_with_epoch().unwrap();
     let mut identity = identity.unwrap();

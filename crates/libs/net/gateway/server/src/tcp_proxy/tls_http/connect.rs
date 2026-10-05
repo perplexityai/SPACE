@@ -79,7 +79,7 @@ fn target<B>(request: &SanitizedRequest<B>) -> Result<Target, ()> {
 
 impl<F, Fut, U> Session<F>
 where
-    F: FnOnce() -> Fut + Send + 'static,
+    F: FnMut() -> Fut + Send + 'static,
     Fut: Future<Output = Result<(U, HttpProtocol), TlsTransportError>> + Send,
     U: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -118,17 +118,17 @@ where
         request.set_host(authority.parse().expect("validated CONNECT target"));
         let guest = request.on_upgrade();
         let mut forwarding = Attempt::forwarding(self.protocol.as_str(), "request");
-        let sender = match self.sender().await {
-            Ok(Sender::Http1(sender)) => sender,
-            Ok(Sender::Http2(_)) => {
-                forwarding.finish(Outcome::Denied, "invalid_connect");
-                return self.refuse("invalid_connect", StatusCode::FORBIDDEN);
-            }
+        let generation = match self.sender().await {
+            Ok(generation) => generation,
             Err(error) => {
                 forwarding.finish(Outcome::Error, "origin_setup");
                 error.record("connect_proxy_setup");
                 return self.refuse(error.as_str(), StatusCode::BAD_GATEWAY);
             }
+        };
+        let Sender::Http1(sender) = &generation.sender else {
+            forwarding.finish(Outcome::Denied, "invalid_connect");
+            return self.refuse("invalid_connect", StatusCode::FORBIDDEN);
         };
         let mut sender = sender.lock().await;
         if !self.lease.is_usable() {
@@ -143,6 +143,7 @@ where
             Ok(response) => response,
             Err(error) => {
                 forwarding.finish(Outcome::Error, "upstream_http");
+                generation.retired.cancel();
                 TlsTransportError::Http(error).record("connect_proxy_request");
                 return self.refuse("upstream_http_error", StatusCode::BAD_GATEWAY);
             }
@@ -158,8 +159,15 @@ where
         }
         let origin = hyper::upgrade::on(&mut response);
         response.headers_mut().remove(header::CONTENT_LENGTH);
-        self.upgrades
-            .spawn(relay(guest, origin, self.shutdown.clone()).in_current_span());
+        let drain = self.draining.clone().drop_guard();
+        let shutdown = self.shutdown.clone();
+        self.upgrades.spawn(
+            async move {
+                let _drain = drain;
+                relay(guest, origin, shutdown).await;
+            }
+            .in_current_span(),
+        );
         self.record("connect_forwarded", response.status());
         forwarding.finish(Outcome::Success, "response_headers");
         response.map(|_| Either::Right(Empty::new()))

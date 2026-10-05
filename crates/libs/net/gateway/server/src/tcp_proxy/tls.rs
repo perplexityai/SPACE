@@ -397,15 +397,21 @@ impl TcpProxy {
                 let upstream_lease = lease.clone();
                 let wire_read = accounting.read.clone();
                 let wire_written = accounting.written.clone();
-                let connect = move || async move {
-                    let origin = async {
-                        Ok(MeteredIo {
-                            inner: relay::connect(destination).await?,
-                            read: wire_read,
-                            written: wire_written,
-                        })
-                    };
-                    connect(origin, &upstream_lease, &interception, client_alpn).await
+                let connect = move || {
+                    let wire_read = wire_read.clone();
+                    let wire_written = wire_written.clone();
+                    let upstream_lease = upstream_lease.clone();
+                    let interception = interception.clone();
+                    async move {
+                        let origin = async {
+                            Ok(MeteredIo {
+                                inner: relay::connect(destination).await?,
+                                read: wire_read,
+                                written: wire_written,
+                            })
+                        };
+                        connect(origin, &upstream_lease, &interception, client_alpn).await
+                    }
                 };
                 tls_http::serve(downstream, protocol, binding, lease.clone(), connect).await
             };

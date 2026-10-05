@@ -16,7 +16,7 @@ use hyper::client::conn::{http1, http2};
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::sync::{Mutex, MutexGuard, OnceCell};
+use tokio::sync::{Mutex, MutexGuard};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use tracing::Instrument;
@@ -38,6 +38,8 @@ const HEADER_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_HEADERS: usize = 128;
 const MAX_HEADER_BYTES: u32 = 32 * 1024;
 const MAX_STREAMS: u32 = 32;
+const MAX_RETIREMENTS: u32 = MAX_STREAMS;
+const UPSTREAM_PREPARATION_TIMEOUT: Duration = Duration::from_secs(10);
 // Guest-facing HTTP/2 receive windows. h2 (>= 0.4.16) closes the connection
 // with GOAWAY ENHANCE_YOUR_CALM once DATA frames under 256 bytes, buffered but
 // not yet read, exceed a budget. Each such frame costs `256 - len`, and the
@@ -74,7 +76,11 @@ impl Sender {
                 Ok(ReadySender::Http1(sender))
             }
             // Each HTTP/2 stream gets its own flow-control handle.
-            Self::Http2(sender) => Ok(ReadySender::Http2(sender.clone())),
+            Self::Http2(sender) => {
+                let mut sender = sender.clone();
+                sender.ready().await?;
+                Ok(ReadySender::Http2(sender))
+            }
         }
     }
 }
@@ -143,12 +149,21 @@ struct Session<F> {
     protocol: HttpProtocol,
     binding: HostBinding,
     lease: Arc<CertificateLease>,
-    connect: Mutex<Option<F>>,
-    upstream: OnceCell<Sender>,
+    upstream: Mutex<Upstream<F>>,
     tasks: TaskTracker,
     upgrades: TaskTracker,
     shutdown: CancellationToken,
     draining: CancellationToken,
+}
+
+struct Upstream<F> {
+    connect: F,
+    current: Option<Arc<Generation>>,
+}
+
+struct Generation {
+    sender: Sender,
+    retired: CancellationToken,
 }
 
 pub(super) async fn serve<C, F, Fut, U>(
@@ -160,7 +175,7 @@ pub(super) async fn serve<C, F, Fut, U>(
 ) -> Result<(), TlsTransportError>
 where
     C: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-    F: FnOnce() -> Fut + Send + 'static,
+    F: FnMut() -> Fut + Send + 'static,
     Fut: Future<Output = Result<(U, HttpProtocol), TlsTransportError>> + Send,
     U: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -171,8 +186,10 @@ where
         protocol,
         binding,
         lease,
-        connect: Mutex::new(Some(connect)),
-        upstream: OnceCell::new(),
+        upstream: Mutex::new(Upstream {
+            connect,
+            current: None,
+        }),
         tasks: TaskTracker::new(),
         upgrades: TaskTracker::new(),
         shutdown,
@@ -242,50 +259,50 @@ fn guest_http2_builder() -> hyper::server::conn::http2::Builder<TokioExecutor> {
 
 impl<F, Fut, U> Session<F>
 where
-    F: FnOnce() -> Fut + Send + 'static,
+    F: FnMut() -> Fut + Send + 'static,
     Fut: Future<Output = Result<(U, HttpProtocol), TlsTransportError>> + Send,
     U: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    async fn sender(&self) -> Result<&Sender, TlsTransportError> {
-        self.upstream
-            .get_or_try_init(|| async {
-                // A failed or cancelled initializer has consumed the connector.
-                // Drain this guest session so another stream cannot reuse it.
-                let failed = self.draining.clone().drop_guard();
-                let connect = self
-                    .connect
-                    .lock()
-                    .await
-                    .take()
-                    .ok_or(TlsTransportError::Invalidated)?;
-                let (io, protocol) = connect().await?;
-                let io = TokioIo::new(UpstreamIo {
-                    inner: io,
-                    _lifetime: self.draining.clone().drop_guard(),
-                });
-                let sender = match protocol {
-                    HttpProtocol::Http1 => {
-                        let (sender, connection) = http1::Builder::new()
-                            .max_headers(MAX_HEADERS)
-                            .handshake(io)
-                            .await?;
-                        self.drive(connection.with_upgrades());
-                        Sender::Http1(Mutex::new(sender))
-                    }
-                    HttpProtocol::Http2 => {
-                        let (sender, connection) = http2::Builder::new(TokioExecutor::new())
-                            .max_header_list_size(MAX_HEADER_BYTES)
-                            .max_send_buf_size(64 * 1024)
-                            .handshake(io)
-                            .await?;
-                        self.drive(connection);
-                        Sender::Http2(sender)
-                    }
-                };
-                failed.disarm();
-                Ok(sender)
-            })
-            .await
+    async fn sender(&self) -> Result<Arc<Generation>, TlsTransportError> {
+        let mut upstream = self.upstream.lock().await;
+        if self.draining.is_cancelled() || !self.lease.is_usable() {
+            return Err(TlsTransportError::Invalidated);
+        }
+        if let Some(current) = &upstream.current
+            && !current.retired.is_cancelled()
+        {
+            return Ok(current.clone());
+        }
+        let failed = self.draining.clone().drop_guard();
+        let (io, protocol) = (upstream.connect)().await?;
+        let retired = CancellationToken::new();
+        let io = TokioIo::new(UpstreamIo {
+            inner: io,
+            _lifetime: retired.clone().drop_guard(),
+        });
+        let sender = match protocol {
+            HttpProtocol::Http1 => {
+                let (sender, connection) = http1::Builder::new()
+                    .max_headers(MAX_HEADERS)
+                    .handshake(io)
+                    .await?;
+                self.drive(connection.with_upgrades());
+                Sender::Http1(Mutex::new(sender))
+            }
+            HttpProtocol::Http2 => {
+                let (sender, connection) = http2::Builder::new(TokioExecutor::new())
+                    .max_header_list_size(MAX_HEADER_BYTES)
+                    .max_send_buf_size(64 * 1024)
+                    .handshake(io)
+                    .await?;
+                self.drive(connection);
+                Sender::Http2(sender)
+            }
+        };
+        let generation = Arc::new(Generation { sender, retired });
+        upstream.current = Some(generation.clone());
+        failed.disarm();
+        Ok(generation)
     }
 
     fn forwarding_body(&self, body: Incoming, operation: &'static str) -> ForwardingBody {
@@ -352,8 +369,7 @@ where
     }
 }
 
-/// An HTTP driver hands its socket to an upgrade without closing it. Drain the
-/// guest only when that socket is dropped, preserving the handshake and relay.
+/// Retirement belongs to this socket's generation, including after an upgrade.
 struct UpstreamIo<T> {
     inner: T,
     _lifetime: tokio_util::sync::DropGuard,

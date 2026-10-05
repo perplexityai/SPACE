@@ -9,7 +9,7 @@ use crate::certificates::NetworkCredentialAccessError;
 
 impl<F, Fut, U> Session<F>
 where
-    F: FnOnce() -> Fut + Send + 'static,
+    F: FnMut() -> Fut + Send + 'static,
     Fut: Future<Output = Result<(U, HttpProtocol), TlsTransportError>> + Send,
     U: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -52,76 +52,117 @@ where
         }
         let upgrade = handshake.map(|handshake| (handshake, request.on_upgrade()));
         let mut forwarding = Attempt::forwarding(self.protocol.as_str(), "request");
-        let sender = match self.sender().await {
-            Ok(sender) => sender,
-            Err(error) => {
-                forwarding.finish(Outcome::Error, "origin_setup");
-                error.record("upstream_setup");
-                return self.refuse(error.as_str(), StatusCode::BAD_GATEWAY);
-            }
-        };
-        let sender = match sender.ready().await {
-            Ok(sender) => sender,
-            Err(error) => {
-                forwarding.finish(Outcome::Error, "upstream_http");
-                self.draining.cancel();
-                TlsTransportError::Http(error).record("upstream_request");
-                return self.refuse("upstream_http_error", StatusCode::BAD_GATEWAY);
-            }
-        };
-
-        // Origin setup and sender readiness can outlive a policy update. This
-        // is the final fence before request headers can leave the gateway.
-        let headers = match credential_headers(&self.lease, &request) {
-            Ok(headers) => headers,
-            Err(error) => {
-                forwarding.finish(Outcome::Cancelled, error.as_str());
-                return self.refuse(error.as_str(), error.status());
-            }
-        };
-        inject(&mut request, headers);
-        if sender.is_http1() {
-            translate_to_http1(&mut request);
-        }
-        let request = request.map(|body| Either::Left(self.forwarding_body(body, "request_body")));
-        let response = sender.send(request).await;
-
-        match response {
-            Ok(mut response)
-                if upgrade
-                    .as_ref()
-                    .is_some_and(|(handshake, _)| handshake.accepts(&response)) =>
+        let mut retirements = 0;
+        let deadline = tokio::time::Instant::now() + UPSTREAM_PREPARATION_TIMEOUT;
+        loop {
+            let generation = match tokio::time::timeout_at(deadline, self.sender())
+                .await
+                .unwrap_or(Err(TlsTransportError::Timeout))
             {
-                let (handshake, guest) = upgrade.expect("matched upgrade response");
-                let origin = hyper::upgrade::on(&mut response);
-
-                response.headers_mut().remove(header::CONTENT_LENGTH);
-                if matches!(handshake, upgrade::Handshake::WebSocket { .. }) {
-                    websocket_response_headers(response.headers_mut());
+                Ok(sender) => sender,
+                Err(error) => {
+                    forwarding.finish(Outcome::Error, "origin_setup");
+                    error.record("upstream_setup");
+                    return self.refuse(error.as_str(), StatusCode::BAD_GATEWAY);
                 }
-                self.record(handshake.as_str(), response.status());
-                self.upgrades.spawn(
-                    upgrade::relay(guest, origin, self.shutdown.clone(), self.protocol.as_str())
+            };
+            let sender = match tokio::time::timeout_at(deadline, generation.sender.ready()).await {
+                Ok(Ok(sender)) => sender,
+                Ok(Err(_)) if retirements < MAX_RETIREMENTS => {
+                    generation.retired.cancel();
+                    retirements += 1;
+                    continue;
+                }
+                Ok(Err(error)) => {
+                    forwarding.finish(Outcome::Error, "upstream_http");
+                    self.draining.cancel();
+                    TlsTransportError::Http(error).record("upstream_request");
+                    return self.refuse("upstream_http_error", StatusCode::BAD_GATEWAY);
+                }
+                Err(_) => {
+                    forwarding.finish(Outcome::Error, "origin_timeout");
+                    self.draining.cancel();
+                    return self
+                        .refuse(TlsTransportError::Timeout.as_str(), StatusCode::BAD_GATEWAY);
+                }
+            };
+
+            // Origin setup and sender readiness can outlive a policy update. This
+            // is the final fence before request headers can leave the gateway.
+            if !self.lease.is_usable() {
+                forwarding.finish(Outcome::Cancelled, "lease_invalidated");
+                return self.refuse("lease_invalidated", StatusCode::FORBIDDEN);
+            }
+            match tokio::time::timeout_at(deadline, self.binding.authorize(&request)).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(reason)) => {
+                    forwarding.finish(Outcome::Cancelled, reason.as_str());
+                    return self.refuse(reason.as_str(), reason.refusal_status());
+                }
+                Err(_) => {
+                    forwarding.finish(Outcome::Error, "origin_timeout");
+                    return self
+                        .refuse(TlsTransportError::Timeout.as_str(), StatusCode::BAD_GATEWAY);
+                }
+            }
+            let headers = match credential_headers(&self.lease, &request) {
+                Ok(headers) => headers,
+                Err(error) => {
+                    forwarding.finish(Outcome::Cancelled, error.as_str());
+                    return self.refuse(error.as_str(), error.status());
+                }
+            };
+            inject(&mut request, headers);
+            if sender.is_http1() {
+                translate_to_http1(&mut request);
+            }
+            let request =
+                request.map(|body| Either::Left(self.forwarding_body(body, "request_body")));
+            let response = sender.send(request).await;
+
+            return match response {
+                Ok(mut response)
+                    if upgrade
+                        .as_ref()
+                        .is_some_and(|(handshake, _)| handshake.accepts(&response)) =>
+                {
+                    let (handshake, guest) = upgrade.expect("matched upgrade response");
+                    let origin = hyper::upgrade::on(&mut response);
+
+                    response.headers_mut().remove(header::CONTENT_LENGTH);
+                    if matches!(handshake, upgrade::Handshake::WebSocket { .. }) {
+                        websocket_response_headers(response.headers_mut());
+                    }
+                    self.record(handshake.as_str(), response.status());
+                    let drain = self.draining.clone().drop_guard();
+                    let shutdown = self.shutdown.clone();
+                    let protocol = self.protocol.as_str();
+                    self.upgrades.spawn(
+                        async move {
+                            let _drain = drain;
+                            upgrade::relay(guest, origin, shutdown, protocol).await;
+                        }
                         .in_current_span(),
-                );
-                forwarding.finish(Outcome::Success, "response_headers");
-                response.map(|_| Either::Right(Empty::new()))
-            }
-            Ok(response) if response.status() != StatusCode::SWITCHING_PROTOCOLS => {
-                self.record("allowed", response.status());
-                forwarding.finish(Outcome::Success, "response_headers");
-                response.map(|body| Either::Left(self.forwarding_body(body, "response_body")))
-            }
-            Ok(_) => {
-                forwarding.finish(Outcome::Error, "unexpected_upgrade");
-                self.refuse("unexpected_upgrade", StatusCode::BAD_GATEWAY)
-            }
-            Err(error) => {
-                forwarding.finish(Outcome::Error, "upstream_http");
-                self.draining.cancel();
-                TlsTransportError::Http(error).record("upstream_request");
-                self.refuse("upstream_http_error", StatusCode::BAD_GATEWAY)
-            }
+                    );
+                    forwarding.finish(Outcome::Success, "response_headers");
+                    response.map(|_| Either::Right(Empty::new()))
+                }
+                Ok(response) if response.status() != StatusCode::SWITCHING_PROTOCOLS => {
+                    self.record("allowed", response.status());
+                    forwarding.finish(Outcome::Success, "response_headers");
+                    response.map(|body| Either::Left(self.forwarding_body(body, "response_body")))
+                }
+                Ok(_) => {
+                    forwarding.finish(Outcome::Error, "unexpected_upgrade");
+                    self.refuse("unexpected_upgrade", StatusCode::BAD_GATEWAY)
+                }
+                Err(error) => {
+                    forwarding.finish(Outcome::Error, "upstream_http");
+                    generation.retired.cancel();
+                    TlsTransportError::Http(error).record("upstream_request");
+                    self.refuse("upstream_http_error", StatusCode::BAD_GATEWAY)
+                }
+            };
         }
     }
 }

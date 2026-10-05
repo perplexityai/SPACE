@@ -11,7 +11,9 @@ pub(crate) use material::NetworkCredentialAccessError;
 pub use material::{CertificateError, CertificateLease};
 
 #[cfg(test)]
-pub(crate) use authority::tests::{local_provider_with_policy, local_provider_with_state};
+pub(crate) use authority::tests::{
+    local_provider_with_policy, local_provider_with_state, retire_authority,
+};
 
 pub type CertificateRequester = std::sync::Arc<
     dyn Fn(

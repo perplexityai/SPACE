@@ -5,6 +5,21 @@ use crate::certificates::NetworkCredentialAccessError;
 use http::HeaderMap;
 use pplx_space_common_core::types::CredentialReferenceId;
 
+fn once_connector<U>(
+    origin: U,
+    protocol: HttpProtocol,
+) -> impl FnMut() -> std::future::Ready<Result<(U, HttpProtocol), TlsTransportError>> {
+    let mut origin = Some(origin);
+    move || {
+        std::future::ready(
+            origin
+                .take()
+                .map(|origin| (origin, protocol))
+                .ok_or(TlsTransportError::Invalidated),
+        )
+    }
+}
+
 #[test]
 fn authority_binds_every_http_routing_field_to_the_tls_origin() {
     let host = "allowed.test".parse().unwrap();
@@ -363,11 +378,14 @@ async fn credential_refusal_before_origin(
         HttpProtocol::Http1,
         binding,
         lease,
-        move || async move {
-            observed.fetch_add(1, Ordering::SeqCst);
-            Err::<(tokio::io::DuplexStream, HttpProtocol), _>(TlsTransportError::Upstream(
-                std::io::Error::from(std::io::ErrorKind::ConnectionRefused),
-            ))
+        move || {
+            let observed = observed.clone();
+            async move {
+                observed.fetch_add(1, Ordering::SeqCst);
+                Err::<(tokio::io::DuplexStream, HttpProtocol), _>(TlsTransportError::Upstream(
+                    std::io::Error::from(std::io::ErrorKind::ConnectionRefused),
+                ))
+            }
         },
     ));
     let (mut sender, connection) = http1::handshake(TokioIo::new(guest_peer)).await.unwrap();
@@ -439,7 +457,7 @@ async fn concurrent_http2_streams_keep_credential_decisions_request_local() {
         HttpProtocol::Http2,
         binding,
         lease,
-        move || async move { Ok((origin, HttpProtocol::Http2)) },
+        once_connector(origin, HttpProtocol::Http2),
     ));
     let (sender, connection) = http2::handshake(TokioExecutor::new(), TokioIo::new(guest_peer))
         .await
@@ -498,15 +516,19 @@ async fn policy_change_during_origin_setup_never_forwards_buffered_credentials()
     let (connect_started_tx, connect_started_rx) = tokio::sync::oneshot::channel();
     let (connect_release_tx, connect_release_rx) = tokio::sync::oneshot::channel();
     let (guest, guest_peer) = tokio::io::duplex(4096);
+    let mut setup = Some((connect_started_tx, connect_release_rx, origin));
     let gateway = tokio::spawn(serve(
         guest,
         HttpProtocol::Http1,
         binding,
         lease,
-        move || async move {
-            let _ = connect_started_tx.send(());
-            let _ = connect_release_rx.await;
-            Ok((origin, HttpProtocol::Http1))
+        move || {
+            let (started, release, origin) = setup.take().expect("one origin setup");
+            async move {
+                let _ = started.send(());
+                let _ = release.await;
+                Ok((origin, HttpProtocol::Http1))
+            }
         },
     ));
     let (mut sender, connection) = http1::handshake(TokioIo::new(guest_peer)).await.unwrap();
@@ -608,7 +630,7 @@ async fn inspected_tls_drops_fastly_routing_headers_before_forwarding() {
             guest_protocol,
             binding,
             lease,
-            move || async move { Ok((origin, origin_protocol)) },
+            once_connector(origin, origin_protocol),
         ));
         let mut request = Request::get("https://allowed.test/")
             .header("fastly-host", "forbidden.test")
@@ -750,131 +772,66 @@ async fn inspected_tls_drops_fastly_routing_headers_before_forwarding() {
 enum UpstreamEnd {
     SetupFailed,
     SetupCancelled,
-    Http1Close,
-    H2Goaway,
 }
 
 #[tokio::test]
-async fn upstream_failure_or_closure_never_leaves_a_poisoned_guest_connection() {
-    use http_body_util::{BodyExt, Full};
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let mut poisoned = Vec::new();
-    for (ending, protocol) in [
-        (UpstreamEnd::SetupFailed, HttpProtocol::Http2),
-        (UpstreamEnd::SetupCancelled, HttpProtocol::Http2),
-        (UpstreamEnd::Http1Close, HttpProtocol::Http1),
-        (UpstreamEnd::Http1Close, HttpProtocol::Http2),
-        (UpstreamEnd::H2Goaway, HttpProtocol::Http2),
-    ] {
+async fn upstream_setup_failure_or_cancellation_drains_the_guest() {
+    use http_body_util::BodyExt;
+    for ending in [UpstreamEnd::SetupFailed, UpstreamEnd::SetupCancelled] {
         let (binding, lease, _) = fixture().await;
         let started = Arc::new(tokio::sync::Notify::new());
-        let completed = Arc::new(tokio::sync::Notify::new());
-        let (origin, mut origin_peer) = tokio::io::duplex(4096);
-        let origin_done = completed.clone();
-        let origin_task = tokio::spawn(async move {
-            match ending {
-                UpstreamEnd::Http1Close => {
-                    let mut header = Vec::new();
-                    while !header.ends_with(b"\r\n\r\n") {
-                        header.push(origin_peer.read_u8().await.unwrap());
-                    }
-                    origin_peer.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\ndone").await.unwrap();
-                }
-                UpstreamEnd::H2Goaway => {
-                    let connection = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
-                        .serve_connection(
-                            TokioIo::new(origin_peer),
-                            service_fn(|_: Request<Incoming>| async {
-                                Ok::<_, Infallible>(Response::new(Full::new(Bytes::from_static(
-                                    b"done",
-                                ))))
-                            }),
-                        );
-                    tokio::pin!(connection);
-                    tokio::select! {
-                        result = &mut connection => { result.unwrap(); return; }
-                        () = origin_done.notified() => {}
-                    }
-                    connection.as_mut().graceful_shutdown();
-                    // The final GOAWAY write can race the gateway's close.
-                    let _ = connection.await;
-                }
-                _ => {}
-            }
-        });
-        let (guest, guest_peer) = tokio::io::duplex(4096);
         let connect_started = started.clone();
-        let gateway = tokio::spawn(serve(guest, protocol, binding, lease, move || async move {
-            connect_started.notify_one();
-            match ending {
-                UpstreamEnd::SetupFailed => Err(TlsTransportError::Upstream(std::io::Error::from(
-                    std::io::ErrorKind::ConnectionRefused,
-                ))),
-                UpstreamEnd::SetupCancelled => std::future::pending().await,
-                UpstreamEnd::Http1Close => Ok((origin, HttpProtocol::Http1)),
-                UpstreamEnd::H2Goaway => Ok((origin, HttpProtocol::Http2)),
-            }
-        }));
-        let request = || {
-            Request::get("https://allowed.test/")
-                .header(header::HOST, "allowed.test")
-                .body(Empty::<Bytes>::new())
-                .unwrap()
-        };
-        let closed = if matches!(protocol, HttpProtocol::Http1) {
-            let (mut sender, connection) =
-                http1::handshake(TokioIo::new(guest_peer)).await.unwrap();
-            let mut client = tokio::spawn(connection);
-            let response = sender.send_request(request()).await.unwrap();
-            assert_eq!(response.status(), StatusCode::OK);
-            assert_eq!(
-                response.into_body().collect().await.unwrap().to_bytes(),
-                "done"
-            );
-            // Keep the sender alive: origin closure, rather than dropping the
-            // client handle, must terminate the guest's keep-alive connection.
-            let ended = tokio::time::timeout(Duration::from_secs(1), &mut client).await;
-            client.abort();
-            drop(sender);
-            ended.is_ok_and(|joined| joined.is_ok_and(|result| result.is_ok()))
-        } else {
-            let (mut sender, connection) =
-                http2::handshake(TokioExecutor::new(), TokioIo::new(guest_peer))
-                    .await
-                    .unwrap();
-            let mut client = tokio::spawn(connection);
-            let sending = tokio::spawn(sender.send_request(request()));
-            started.notified().await;
-            if matches!(ending, UpstreamEnd::SetupCancelled) {
-                sending.abort();
-            } else {
-                let response = sending.await.unwrap().unwrap();
-                assert_eq!(
-                    response.status(),
-                    if matches!(ending, UpstreamEnd::SetupFailed) {
-                        StatusCode::BAD_GATEWAY
-                    } else {
-                        StatusCode::OK
+        let (guest, peer) = tokio::io::duplex(4096);
+        let gateway = tokio::spawn(serve(
+            guest,
+            HttpProtocol::Http2,
+            binding,
+            lease,
+            move || {
+                let started = connect_started.clone();
+                async move {
+                    started.notify_one();
+                    match ending {
+                        UpstreamEnd::SetupFailed => {
+                            Err::<(tokio::io::DuplexStream, HttpProtocol), _>(
+                                TlsTransportError::Upstream(
+                                    io::ErrorKind::ConnectionRefused.into(),
+                                ),
+                            )
+                        }
+                        UpstreamEnd::SetupCancelled => std::future::pending().await,
                     }
-                );
-                response.into_body().collect().await.unwrap();
-            }
-            completed.notify_one();
-            let ended = tokio::time::timeout(Duration::from_secs(1), &mut client).await;
-            client.abort();
-            drop(sender);
-            ended.is_ok_and(|joined| joined.is_ok_and(|result| result.is_ok()))
-        };
-        if !closed {
-            poisoned.push((ending, protocol));
+                }
+            },
+        ));
+        let (mut sender, connection) = http2::handshake(TokioExecutor::new(), TokioIo::new(peer))
+            .await
+            .unwrap();
+        let mut client = tokio::spawn(connection);
+        let sending = tokio::spawn(
+            sender.send_request(
+                Request::get("https://allowed.test/")
+                    .body(Empty::<Bytes>::new())
+                    .unwrap(),
+            ),
+        );
+        started.notified().await;
+        if matches!(ending, UpstreamEnd::SetupCancelled) {
+            sending.abort();
+            let _ = sending.await;
+        } else {
+            let response = sending.await.unwrap().unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+            response.into_body().collect().await.unwrap();
         }
+        let ended = tokio::time::timeout(Duration::from_secs(1), &mut client).await;
+        client.abort();
         gateway.abort();
-        origin_task.abort();
+        assert!(
+            ended.is_ok_and(|joined| joined.is_ok_and(|result| result.is_ok())),
+            "{ending:?} must drain the guest"
+        );
     }
-    assert!(
-        poisoned.is_empty(),
-        "poisoned guest connections: {poisoned:?}"
-    );
 }
 
 #[test]
@@ -964,7 +921,7 @@ async fn connect_relays_private_ca_tls_without_inspecting_the_inner_request() {
         HttpProtocol::Http1,
         binding,
         lease,
-        move || async move { Ok((origin, HttpProtocol::Http1)) },
+        once_connector(origin, HttpProtocol::Http1),
     ));
     let (mut sender, connection) = http1::handshake(TokioIo::new(guest_peer)).await.unwrap();
     let client = tokio::spawn(connection.with_upgrades());
@@ -1041,7 +998,7 @@ async fn upstream_upgrade_completion_preserves_the_guest_handshake_and_stream() 
             HttpProtocol::Http1,
             binding.clone(),
             lease.clone(),
-            move || async move { Ok((origin, HttpProtocol::Http1)) },
+            once_connector(origin, HttpProtocol::Http1),
         ));
         let (mut sender, connection) = http1::handshake(TokioIo::new(guest_peer)).await.unwrap();
         let client = tokio::spawn(connection.with_upgrades());
@@ -1141,4 +1098,550 @@ async fn guest_http2_accepts_backpressured_small_frame_uploads() {
 #[tokio::test]
 async fn guest_http2_still_rejects_tiny_frame_floods() {
     assert!(!small_frame_upload(1, 1_000_000, Duration::from_secs(2)).await);
+}
+
+#[tokio::test]
+async fn lawful_http1_retirement_forwards_queued_requests_once_on_the_original_guest() {
+    use http_body_util::{BodyExt, Full};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    const COUNT: usize = 32;
+    let (binding, lease, _) = fixture().await;
+    let received = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let dials = Arc::new(AtomicUsize::new(0));
+    let origin_received = received.clone();
+    let origin_dials = dials.clone();
+    let origins = TaskTracker::new();
+    let origin_tasks = origins.clone();
+    let (guest, peer) = tokio::io::duplex(64 * 1024);
+    let gateway = tokio::spawn(serve(
+        guest,
+        HttpProtocol::Http2,
+        binding,
+        lease,
+        move || {
+            origin_dials.fetch_add(1, Ordering::SeqCst);
+            let (origin, peer) = tokio::io::duplex(4096);
+            let received = origin_received.clone();
+            origin_tasks.spawn(async move {
+                hyper::server::conn::http1::Builder::new()
+                    .serve_connection(
+                        TokioIo::new(peer),
+                        service_fn(move |request: Request<Incoming>| {
+                            let received = received.clone();
+                            async move {
+                                let body = request.into_body().collect().await.unwrap().to_bytes();
+                                received.lock().unwrap().push(body.clone());
+                                Ok::<_, Infallible>(
+                                    Response::builder()
+                                        .header(header::CONNECTION, "close")
+                                        .body(Full::new(body))
+                                        .unwrap(),
+                                )
+                            }
+                        }),
+                    )
+                    .await
+                    .unwrap();
+            });
+            std::future::ready(Ok((origin, HttpProtocol::Http1)))
+        },
+    ));
+    let (sender, connection) = http2::handshake(TokioExecutor::new(), TokioIo::new(peer))
+        .await
+        .unwrap();
+    let client = tokio::spawn(connection);
+    let completed = tokio::time::timeout(Duration::from_secs(5), async {
+        let responses = (0..COUNT).map(|index| {
+            let mut sender = sender.clone();
+            async move {
+                let payload = format!("write-{index}");
+                let request = Request::post("https://allowed.test/write").body(Full::new(Bytes::from(payload.clone()))).unwrap();
+                let response = sender.send_request(request).await.unwrap();
+                let status = response.status();
+                let body = response.into_body().collect().await.unwrap().to_bytes();
+                (status, body, payload)
+            }
+        });
+        let responses = futures_util::future::join_all(responses).await;
+        let successes = responses.iter().filter(|(status, _, _)| *status == StatusCode::OK).count();
+        let failures = responses.iter().filter(|(status, _, _)| *status == StatusCode::BAD_GATEWAY).count();
+        eprintln!("local close reproduction: successes={successes}, generated502={failures}, origin_received={}, dials={}", received.lock().unwrap().len(), dials.load(Ordering::SeqCst));
+        assert_eq!(successes, COUNT);
+        for (status, body, payload) in responses {
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body, payload);
+        }
+        let mut sender = sender.clone();
+        let response = sender.send_request(Request::post("https://allowed.test/write").body(Full::new(Bytes::from_static(b"original-guest-reuse"))).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.into_body().collect().await.unwrap().to_bytes(), "original-guest-reuse");
+        let received = received.lock().unwrap();
+        assert_eq!(received.len(), COUNT + 1);
+        assert_eq!(received.iter().collect::<std::collections::HashSet<_>>().len(), COUNT + 1);
+        assert_eq!(dials.load(Ordering::SeqCst), COUNT + 1);
+    }).await;
+    client.abort();
+    gateway.abort();
+    let _ = client.await;
+    let _ = gateway.await;
+    origins.close();
+    origins.wait().await;
+    completed.unwrap();
+}
+
+#[tokio::test]
+async fn dns_binding_withdrawn_during_origin_setup_never_forwards_the_request() {
+    use pplx_space_net_common::{
+        EgressDefaultAction, EgressDestinationV1, EgressPolicyV1, NetworkPolicyV1, TlsInterception,
+    };
+    use tokio::io::AsyncReadExt;
+    let mut policy = NetworkPolicyV1::deny_all();
+    policy.tls_interception = TlsInterception::On;
+    policy.egress = EgressPolicyV1::new(
+        EgressDefaultAction::Deny,
+        vec![EgressDestinationV1::Domain("allowed.test".parse().unwrap())],
+        Vec::new(),
+    )
+    .unwrap();
+    let state = crate::state::GatewayNetworkState::pending_policy();
+    let (_, _, provider) = crate::certificates::local_provider_with_policy(
+        state.clone(),
+        policy.clone(),
+        Default::default(),
+    )
+    .await;
+    let lease = provider
+        .get("allowed.test".parse().unwrap(), 443)
+        .await
+        .unwrap();
+    let cache = crate::dns::DnsAllowCache::default();
+    cache.observe_response(
+        &crate::dns::test_fixtures::a_response("allowed.test", [93, 184, 216, 34], 60),
+        &policy,
+    );
+    let binding = HostBinding::new(
+        "test",
+        "93.184.216.34:443".parse().unwrap(),
+        state,
+        cache.clone(),
+    );
+    let (origin, mut origin_peer) = tokio::io::duplex(4096);
+    let mut origin = Some(origin);
+    let (guest, peer) = tokio::io::duplex(4096);
+    let gateway = tokio::spawn(serve(
+        guest,
+        HttpProtocol::Http1,
+        binding,
+        lease,
+        move || {
+            cache.retain_relevant_to_policy(&NetworkPolicyV1::deny_all());
+            let origin = origin.take().unwrap();
+            std::future::ready(Ok((origin, HttpProtocol::Http1)))
+        },
+    ));
+    let (mut sender, connection) = http1::handshake(TokioIo::new(peer)).await.unwrap();
+    let client = tokio::spawn(connection);
+    let response = sender
+        .send_request(
+            Request::get("https://allowed.test/")
+                .header(header::HOST, "allowed.test")
+                .body(Empty::<Bytes>::new())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert!(
+        matches!(origin_peer.read_u8().await, Err(error) if error.kind() == io::ErrorKind::UnexpectedEof)
+    );
+    client.await.unwrap().unwrap();
+    gateway.await.unwrap().unwrap();
+}
+
+async fn session_with_connector<F>(connect: F) -> Session<F> {
+    let (binding, lease, _) = fixture().await;
+    Session {
+        protocol: HttpProtocol::Http2,
+        binding,
+        lease,
+        upstream: Mutex::new(Upstream {
+            connect,
+            current: None,
+        }),
+        tasks: TaskTracker::new(),
+        upgrades: TaskTracker::new(),
+        shutdown: CancellationToken::new(),
+        draining: CancellationToken::new(),
+    }
+}
+
+async fn stop_session<F>(session: &Session<F>) {
+    session.shutdown.cancel();
+    session.tasks.close();
+    session.tasks.wait().await;
+}
+
+#[tokio::test]
+async fn concurrent_replacement_is_singleflight_and_old_socket_drop_is_generation_local() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let dials = Arc::new(AtomicUsize::new(0));
+    let peers = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let origin_dials = dials.clone();
+    let origin_peers = peers.clone();
+    let session = session_with_connector(move || {
+        origin_dials.fetch_add(1, Ordering::SeqCst);
+        let (origin, peer) = tokio::io::duplex(4096);
+        origin_peers.lock().unwrap().push(peer);
+        std::future::ready(Ok((origin, HttpProtocol::Http1)))
+    })
+    .await;
+    let old = session.sender().await.unwrap();
+    old.retired.cancel();
+    let replacements = futures_util::future::join_all((0..32).map(|_| session.sender())).await;
+    let replacement = replacements[0].as_ref().unwrap();
+    assert!(
+        replacements
+            .iter()
+            .all(|result| Arc::ptr_eq(result.as_ref().unwrap(), replacement))
+    );
+    assert_eq!(dials.load(Ordering::SeqCst), 2);
+    drop(peers.lock().unwrap().remove(0));
+    tokio::task::yield_now().await;
+    assert!(!session.draining.is_cancelled());
+    assert!(!replacement.retired.is_cancelled());
+    assert!(Arc::ptr_eq(&session.sender().await.unwrap(), replacement));
+    stop_session(&session).await;
+}
+
+#[tokio::test]
+async fn failed_replacement_is_not_redialed_by_queued_requests() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let dials = Arc::new(AtomicUsize::new(0));
+    let origin_dials = dials.clone();
+    let (origin, _peer) = tokio::io::duplex(4096);
+    let mut origin = Some(origin);
+    let session = session_with_connector(move || {
+        origin_dials.fetch_add(1, Ordering::SeqCst);
+        std::future::ready(
+            origin
+                .take()
+                .map(|origin| (origin, HttpProtocol::Http1))
+                .ok_or_else(|| {
+                    TlsTransportError::Upstream(io::ErrorKind::ConnectionRefused.into())
+                }),
+        )
+    })
+    .await;
+    session.sender().await.unwrap().retired.cancel();
+    let results = futures_util::future::join_all((0..32).map(|_| session.sender())).await;
+    assert!(results.iter().all(Result::is_err));
+    assert_eq!(dials.load(Ordering::SeqCst), 2);
+    assert!(session.draining.is_cancelled());
+    stop_session(&session).await;
+}
+
+#[tokio::test]
+async fn cancelled_replacement_does_not_leave_an_initializer_or_a_redial_storm() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let dials = Arc::new(AtomicUsize::new(0));
+    let origin_dials = dials.clone();
+    let (origin, _peer) = tokio::io::duplex(4096);
+    let mut origin = Some(origin);
+    let (started, mut observed) = tokio::sync::oneshot::channel();
+    let mut started = Some(started);
+    let session = session_with_connector(move || {
+        origin_dials.fetch_add(1, Ordering::SeqCst);
+        let origin = origin.take();
+        let started = if origin.is_none() {
+            started.take()
+        } else {
+            None
+        };
+        async move {
+            if let Some(origin) = origin {
+                return Ok((origin, HttpProtocol::Http1));
+            }
+            started.unwrap().send(()).unwrap();
+            std::future::pending().await
+        }
+    })
+    .await;
+    session.sender().await.unwrap().retired.cancel();
+    {
+        let replacement = session.sender();
+        tokio::pin!(replacement);
+        tokio::select! {
+            result = &mut replacement => panic!("unexpected completion: {}", result.is_ok()),
+            result = &mut observed => result.unwrap(),
+        }
+    }
+    assert!(session.draining.is_cancelled());
+    assert!(session.sender().await.is_err());
+    assert_eq!(dials.load(Ordering::SeqCst), 2);
+    stop_session(&session).await;
+}
+
+#[tokio::test]
+async fn graceful_http2_retirement_preserves_active_response_while_replacing_sender() {
+    use http_body_util::BodyExt;
+    let (origin, peer) = tokio::io::duplex(4096);
+    let (replacement, replacement_peer) = tokio::io::duplex(4096);
+    let mut transports = vec![replacement, origin];
+    let session = session_with_connector(move || {
+        std::future::ready(Ok((transports.pop().unwrap(), HttpProtocol::Http2)))
+    })
+    .await;
+    let (accepted, observed) = tokio::sync::oneshot::channel();
+    let (release, released) = tokio::sync::oneshot::channel();
+    let origin_task = tokio::spawn(async move {
+        let mut connection = h2::server::handshake(peer).await.unwrap();
+        let (_, mut response) = connection.accept().await.unwrap().unwrap();
+        connection.graceful_shutdown();
+        let mut body = response.send_response(Response::new(()), false).unwrap();
+        accepted.send(()).unwrap();
+        let driver = tokio::spawn(async move { while connection.accept().await.is_some() {} });
+        released.await.unwrap();
+        body.send_data(Bytes::from_static(b"original-active-response"), true)
+            .unwrap();
+        driver.await.unwrap();
+    });
+    let replacement_task = tokio::spawn(async move {
+        let mut connection = h2::server::handshake(replacement_peer).await.unwrap();
+        while connection.accept().await.is_some() {}
+    });
+    let old = session.sender().await.unwrap();
+    let request = Request::get("https://allowed.test/")
+        .body(Either::Right(Empty::new()))
+        .unwrap()
+        .try_into()
+        .unwrap();
+    let response = old
+        .sender
+        .ready()
+        .await
+        .unwrap()
+        .send(request)
+        .await
+        .unwrap();
+    observed.await.unwrap();
+    old.retired.cancel();
+    let replacement = session.sender().await.unwrap();
+    assert!(!Arc::ptr_eq(&old, &replacement));
+    assert!(!session.draining.is_cancelled());
+    release.send(()).unwrap();
+    assert_eq!(
+        response.into_body().collect().await.unwrap().to_bytes(),
+        "original-active-response"
+    );
+    origin_task.await.unwrap();
+    assert!(!replacement.retired.is_cancelled());
+    stop_session(&session).await;
+    replacement_task.await.unwrap();
+}
+
+#[derive(Clone, Copy, Debug)]
+enum RetirementFence {
+    Identity,
+    Authority,
+}
+
+#[tokio::test]
+async fn replacement_never_dials_with_a_retired_identity_or_ca_lease() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    for fence in [RetirementFence::Identity, RetirementFence::Authority] {
+        let state = crate::state::GatewayNetworkState::pending_policy();
+        let (_, authority, provider) =
+            crate::certificates::local_provider_with_state(state.clone()).await;
+        let lease = provider
+            .get("allowed.test".parse().unwrap(), 443)
+            .await
+            .unwrap();
+        let dials = Arc::new(AtomicUsize::new(0));
+        let origin_dials = dials.clone();
+        let (origin, _peer) = tokio::io::duplex(4096);
+        let mut origin = Some(origin);
+        let mut session = session_with_connector(move || {
+            origin_dials.fetch_add(1, Ordering::SeqCst);
+            std::future::ready(Ok((origin.take().unwrap(), HttpProtocol::Http1)))
+        })
+        .await;
+        session.lease = lease.clone();
+        session.sender().await.unwrap().retired.cancel();
+        match fence {
+            RetirementFence::Identity => {
+                state
+                    .set_no_identity(crate::state::NetworkStateReason::NoIdentity)
+                    .await;
+            }
+            RetirementFence::Authority => crate::certificates::retire_authority(&authority),
+        }
+        assert!(!lease.is_usable(), "{fence:?}");
+        assert!(
+            matches!(session.sender().await, Err(TlsTransportError::Invalidated)),
+            "{fence:?}"
+        );
+        assert_eq!(dials.load(Ordering::SeqCst), 1, "{fence:?}");
+        stop_session(&session).await;
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn pending_origin_setup_has_one_bounded_preparation_budget() {
+    use http_body_util::BodyExt;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let (binding, lease, _) = fixture().await;
+    let dials = Arc::new(AtomicUsize::new(0));
+    let observed = dials.clone();
+    let (guest, peer) = tokio::io::duplex(4096);
+    let gateway = tokio::spawn(serve(
+        guest,
+        HttpProtocol::Http2,
+        binding,
+        lease,
+        move || {
+            observed.fetch_add(1, Ordering::SeqCst);
+            std::future::pending::<Result<(tokio::io::DuplexStream, HttpProtocol), TlsTransportError>>(
+            )
+        },
+    ));
+    let (mut sender, connection) = http2::handshake(TokioExecutor::new(), TokioIo::new(peer))
+        .await
+        .unwrap();
+    let client = tokio::spawn(connection);
+    let start = tokio::time::Instant::now();
+    let response = sender
+        .send_request(
+            Request::get("https://allowed.test/")
+                .body(Empty::<Bytes>::new())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(start.elapsed(), UPSTREAM_PREPARATION_TIMEOUT);
+    assert_eq!(dials.load(Ordering::SeqCst), 1);
+    assert!(
+        response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .is_empty()
+    );
+    drop(sender);
+    client.abort();
+    gateway.abort();
+    let _ = client.await;
+    let _ = gateway.await;
+}
+
+#[tokio::test]
+async fn active_http2_abort_does_not_replay_writes_and_original_guest_can_recover() {
+    use http_body_util::{BodyExt, Full};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    const COUNT: usize = 32;
+    let (binding, lease, _) = fixture().await;
+    let received = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let dials = Arc::new(AtomicUsize::new(0));
+    let origin_received = received.clone();
+    let origin_dials = dials.clone();
+    let origins = TaskTracker::new();
+    let origin_tasks = origins.clone();
+    let (guest, peer) = tokio::io::duplex(64 * 1024);
+    let gateway = tokio::spawn(serve(
+        guest,
+        HttpProtocol::Http2,
+        binding,
+        lease,
+        move || {
+            let first = origin_dials.fetch_add(1, Ordering::SeqCst) == 0;
+            let received = origin_received.clone();
+            let (origin, peer) = tokio::io::duplex(64 * 1024);
+            origin_tasks.spawn(async move {
+                let mut connection = h2::server::handshake(peer).await.unwrap();
+                let mut responses = Vec::new();
+                while let Some(Ok((request, mut response))) = connection.accept().await {
+                    received
+                        .lock()
+                        .unwrap()
+                        .push(request.headers()["x-write-id"].clone());
+                    if first {
+                        responses.push(response);
+                        if responses.len() == COUNT {
+                            connection.abrupt_shutdown(h2::Reason::INTERNAL_ERROR);
+                            while connection.accept().await.is_some() {}
+                            return;
+                        }
+                    } else {
+                        let mut body = response.send_response(Response::new(()), false).unwrap();
+                        body.send_data(Bytes::from_static(b"recovered-without-replay"), true)
+                            .unwrap();
+                    }
+                }
+            });
+            std::future::ready(Ok((origin, HttpProtocol::Http2)))
+        },
+    ));
+    let (sender, connection) = http2::handshake(TokioExecutor::new(), TokioIo::new(peer))
+        .await
+        .unwrap();
+    let client = tokio::spawn(connection);
+    let completed = tokio::time::timeout(Duration::from_secs(5), async {
+        let responses = futures_util::future::join_all((0..COUNT).map(|index| {
+            let mut sender = sender.clone();
+            async move {
+                sender
+                    .send_request(
+                        Request::post("https://allowed.test/write")
+                            .header("x-write-id", index.to_string())
+                            .body(Full::new(Bytes::from(format!("write-{index}"))))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap()
+                    .status()
+            }
+        }))
+        .await;
+        assert!(
+            responses
+                .iter()
+                .all(|status| *status == StatusCode::BAD_GATEWAY)
+        );
+        assert_eq!(dials.load(Ordering::SeqCst), 1);
+        let mut sender = sender.clone();
+        let response = sender
+            .send_request(
+                Request::post("https://allowed.test/write")
+                    .header("x-write-id", "probe")
+                    .body(Full::new(Bytes::from_static(b"new-write")))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.into_body().collect().await.unwrap().to_bytes(),
+            "recovered-without-replay"
+        );
+        assert_eq!(dials.load(Ordering::SeqCst), 2);
+        let received = received.lock().unwrap();
+        assert_eq!(received.len(), COUNT + 1);
+        assert_eq!(
+            received
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            COUNT + 1
+        );
+    })
+    .await;
+    client.abort();
+    gateway.abort();
+    let _ = client.await;
+    let _ = gateway.await;
+    origins.close();
+    origins.wait().await;
+    completed.unwrap();
 }
