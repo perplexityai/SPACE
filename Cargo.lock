@@ -5657,6 +5657,7 @@ dependencies = [
  "clap",
  "pplx-space-common-svc",
  "pplx-space-data-plane-server",
+ "tikv-jemallocator",
  "tokio",
 ]
 

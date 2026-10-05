@@ -8,6 +8,22 @@ use pplx_space_data_plane_server::{
     DEFAULT_ROUTE_CACHE_TTL_MS, DEFAULT_UNAUTHENTICATED_UPGRADE_CAP_PER_IP, DataPlaneConfig,
 };
 
+// Same allocator choice as space-api-svc: glibc arenas keep the peak of an
+// upload burst resident after the traffic stops, so RSS tracks the largest
+// burst rather than live uploads. Static musl builds keep the target allocator.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+// Without background threads, jemalloc purges an arena's dirty pages only when
+// that arena allocates again, so a replica that goes idle after a burst keeps
+// the burst resident just as glibc does. Background threads purge on the decay
+// timer instead. jemalloc defines `malloc_conf` as a weak symbol, so this
+// definition replaces it; `_RJEM_MALLOC_CONF` still overrides it at startup.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[unsafe(export_name = "_rjem_malloc_conf")]
+static MALLOC_CONF: &[u8; 23] = b"background_thread:true\0";
+
 const SERVICE_NAME: &str = "space-data-plane";
 
 #[derive(Parser)]

@@ -37,3 +37,8 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 # internal
 pplx-space-common-svc = { workspace = true }
 pplx-space-data-plane-server = { workspace = true }
+
+# jemalloc on glibc Linux targets: multipart uploads buffer whole request
+# bodies, and glibc arenas keep the peak of each upload burst resident.
+[target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
+tikv-jemallocator = { workspace = true }
