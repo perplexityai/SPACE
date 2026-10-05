@@ -4984,7 +4984,18 @@ class _SdkSandbox:
             return None
 
     def set_timeout(self, timeout: int) -> None:
-        self._sandbox.set_timeout(timeout)
+        # The pinned SDK drops request_timeout on this route. Use a fresh
+        # connection with a socket timeout; never replay an ambiguous reset,
+        # which could restart the idle clock after the first request applied.
+        _ecw_control_plane_json(
+            self._config,
+            "POST",
+            f"/sandboxes/{quote(self.sandbox_id, safe='')}/timeout",
+            body={"timeout": timeout},
+            idempotency_key=None,
+            expected_status=None,
+            timeout=_ECW_SET_TIMEOUT_REQUEST_SECONDS,
+        )
 
     def refresh(self) -> None:
         _ecw_control_plane_json(
@@ -5696,6 +5707,8 @@ class EcwControlPlaneTransportError(RuntimeError):
 # Statuses the SDK delete path already treats as "try again", mirrored here so
 # routes the pinned SDK does not expose classify identically.
 _ECW_TRANSIENT_STATUSES = frozenset({408, 429, 502, 503, 504})
+
+_ECW_SET_TIMEOUT_REQUEST_SECONDS = 4.0
 
 
 def _ecw_control_plane_json(

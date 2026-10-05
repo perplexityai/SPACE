@@ -10,6 +10,7 @@ import sys
 import types
 import unittest
 from collections.abc import Mapping
+from contextlib import nullcontext
 from email.message import Message
 from typing import BinaryIO, cast
 from unittest import mock
@@ -1054,7 +1055,12 @@ class EcwCommandRoundTripTests(unittest.TestCase):
             ).create(template="seed", timeout=300, metadata={"run": "marker"})
             command = sandbox.run("printf marker")
             info = sandbox.get_info()
-            sandbox.set_timeout(600)
+            with mock.patch(
+                "space_smoke.adapters.urlopen",
+                return_value=nullcontext(types.SimpleNamespace(status=204)),
+            ) as opened:
+                sandbox.set_timeout(600)
+            seen["set_timeout"] = json.loads(opened.call_args.args[0].data)["timeout"]
             sandbox.pause()
             connected = sandbox.connect(timeout=300)
             sandbox.kill()
