@@ -1041,7 +1041,7 @@ criteria = "safe-to-deploy"
 [[exemptions.multer]]
 version = "3.1.0"
 criteria = "safe-to-deploy"
-notes = "Streaming multipart/form-data parser for data-plane POST /files uploads (network input). No imported audit exists. Source reviewed for the exemption, not certified as an audit: forbid(unsafe_code), build.rs only probes rustc for nightly via version_check, and every dependency is already in the graph. multer's parse buffer grows until a part's headers or boundary arrive, so the caller caps the whole stream, pauses feeding while the buffer may exceed 1 MiB, and caps parts per request."
+notes = "Streaming multipart/form-data parser for data-plane POST /files uploads (network input). No imported audit exists. Source reviewed for the exemption, not certified as an audit: forbid(unsafe_code), build.rs only probes rustc for nightly via version_check, and every dependency is already in the graph. multer's parse buffer grows until a part's headers or boundary arrive, so the caller caps the whole stream, pauses feeding while the buffer may exceed 64 KiB, and caps parts per request."
 
 [[exemptions.multimap]]
 version = "0.10.1"

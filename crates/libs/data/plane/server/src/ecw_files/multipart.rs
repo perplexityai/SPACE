@@ -23,13 +23,17 @@ use super::{
 
 /// Request bytes multer may hold in its parse buffer before feeding pauses.
 /// Legitimate part headers need a few hundred bytes, so a body that fills the
-/// buffer without forming a part is malformed.
-pub(super) const E2B_MULTIPART_PARSE_BUFFER_LIMIT_BYTES: usize = 1024 * 1024;
+/// buffer without forming a part is malformed. Multer rescans the buffer for a
+/// header terminator on every poll, so this also caps the cost of each scan
+/// when a client trickles header bytes in tiny frames.
+pub(super) const E2B_MULTIPART_PARSE_BUFFER_LIMIT_BYTES: usize = 64 * 1024;
 /// The CRLF that ends each part's data before the next boundary.
 pub(super) const MULTIPART_PART_DATA_TERMINATOR_BYTES: usize = 2;
 /// Parts per request, `file` or not. Each `file` part is staged in its own
-/// spool file before any is written, and the cap also bounds how far
-/// `multipart_part_framing_lower_bound`'s per-part undercount can accumulate.
+/// spool file before any is written. The cap also bounds how far
+/// `multipart_part_framing_lower_bound`'s undercount accumulates for typical
+/// clients: two headers per part at two bytes each is 4,000 bytes over 1000
+/// parts, well under the parse-buffer cap.
 pub(super) const E2B_MULTIPART_PART_LIMIT: usize = 1000;
 
 #[derive(Debug)]
@@ -41,7 +45,7 @@ pub(super) struct MultipartUploadPartE2b {
 fn too_many_multipart_parts_error() -> EcwProxyError {
     EcwProxyError::new(
         StatusCode::PAYLOAD_TOO_LARGE,
-        "multipart uploads are limited to 1000 parts per request",
+        format!("multipart uploads are limited to {E2B_MULTIPART_PART_LIMIT} parts per request"),
         ResponseOrigin::Client,
         ResponseKind::Validation,
     )
@@ -98,11 +102,19 @@ pub(super) async fn spool_multipart_uploads_with_limit(
                 "Missing multipart Content-Disposition",
             ));
         }
-        let is_file = field.name() == Some("file");
         let filename = field
             .file_name()
             .filter(|filename| !filename.is_empty())
             .map(str::to_string);
+        // Multer stops looking for `name` when an earlier quoted value holds a
+        // space-prefixed `name` (`filename="my name.txt"; name="file"`). Reject
+        // the part rather than silently skipping what may be a file.
+        if field.name().is_none() && filename.is_some() {
+            return Err(EcwProxyError::bad_request(
+                "multipart part has a filename but no readable field name",
+            ));
+        }
+        let is_file = field.name() == Some("file");
         let mut upload = if is_file {
             Some(SpooledUpload::new().await?)
         } else {
@@ -117,7 +129,7 @@ pub(super) async fn spool_multipart_uploads_with_limit(
             }
         }
         // The CRLF before the next boundary. Counting it here also means every
-        // field start, chunk, and field end advances the total, which
+        // field start, non-empty chunk, and field end advances the total, which
         // `throttled_multipart_body` reads as parser progress.
         consumed_bytes.fetch_add(MULTIPART_PART_DATA_TERMINATOR_BYTES, Ordering::Relaxed);
         if let Some(upload) = upload {
@@ -153,9 +165,11 @@ pub(super) fn multipart_part_framing_lower_bound(boundary: &str, headers: &Heade
 /// `E2B_MULTIPART_PARSE_BUFFER_LIMIT_BYTES`; the buffer then holds at most the
 /// cap plus one frame. Multer appends every ready frame, so past the cap this
 /// yields once to let it parse what it holds. Without progress by the next poll,
-/// the buffered bytes cannot complete a part and the request fails; with at
-/// most `E2B_MULTIPART_PART_LIMIT` parts, the bound's undercount of real
-/// consumption stays far below the cap.
+/// the request fails: normally the buffered bytes cannot complete a part. The
+/// bound leaves some consumed bytes uncounted (header whitespace, duplicate
+/// headers multer drops, preamble, transport padding), so an encoding padded
+/// until those exceed the cap is rejected too; typical clients stay far below
+/// it (see `E2B_MULTIPART_PART_LIMIT`).
 pub(super) fn throttled_multipart_body(
     body: Body,
     consumed_bytes: Arc<AtomicUsize>,

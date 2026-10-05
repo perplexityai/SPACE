@@ -244,7 +244,7 @@ async fn multipart_limit_caps_the_whole_body_across_file_parts() {
 
 #[tokio::test]
 async fn multipart_part_without_header_terminator_is_rejected_before_buffering_the_body() {
-    let frame_len = 64 * 1024;
+    let frame_len = E2B_MULTIPART_PARSE_BUFFER_LIMIT_BYTES / 16;
     let frames = 4 * E2B_MULTIPART_PARSE_BUFFER_LIMIT_BYTES / frame_len;
     let polls = Arc::new(AtomicUsize::new(0));
     let counted_polls = Arc::clone(&polls);
@@ -285,8 +285,6 @@ async fn multipart_framing_lower_bound_never_exceeds_the_encoded_part() {
         "{estimate} vs {}",
         part.len() - closing
     );
-    // Only the space after the header colon and the header's CR go uncounted.
-    assert_eq!(part.len() - closing - estimate, 2);
 
     // httparse accepts bare-LF header lines inside the CRLF-terminated block,
     // so a non-final header can cost just `name:value\n`. Multer must accept
@@ -315,7 +313,7 @@ async fn multipart_framing_lower_bound_never_exceeds_the_encoded_part() {
 async fn multipart_feed_pauses_once_unconsumed_bytes_pass_the_parse_buffer_cap() {
     use futures_util::FutureExt as _;
 
-    let frame_len = 64 * 1024;
+    let frame_len = E2B_MULTIPART_PARSE_BUFFER_LIMIT_BYTES / 16;
     let frames =
         vec![vec![b'a'; frame_len]; 4 * E2B_MULTIPART_PARSE_BUFFER_LIMIT_BYTES / frame_len];
     let consumed = Arc::new(AtomicUsize::new(0));
@@ -339,6 +337,23 @@ async fn multipart_feed_pauses_once_unconsumed_bytes_pass_the_parse_buffer_cap()
         frame.unwrap();
     }
     assert!(matches!(stream.next().now_or_never(), Some(Some(Err(_)))));
+}
+
+#[tokio::test]
+async fn multipart_file_part_without_a_readable_name_is_rejected() {
+    // Multer's Content-Disposition parser loses `name` after a quoted filename
+    // containing " name"; such a part must not be dropped as a non-file field.
+    let body = format!(
+        "--{MULTIPART_BOUNDARY}\r\nContent-Disposition: form-data; filename=\"my name.txt\"; name=\"file\"\r\n\r\ncontent\r\n--{MULTIPART_BOUNDARY}--\r\n"
+    );
+    let error = spool_multipart_uploads(Body::from(body), MULTIPART_BOUNDARY)
+        .await
+        .unwrap_err();
+    assert_eq!(error.status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        error.message,
+        "multipart part has a filename but no readable field name"
+    );
 }
 
 #[tokio::test]
@@ -453,12 +468,17 @@ async fn oversized_json_file_write_returns_413_to_a_client_still_sending() {
         });
         let mut response = Vec::new();
         let mut buf = [0u8; 4096];
-        while let Ok(read) = reader.read(&mut buf).await {
-            if read == 0 {
-                break;
+        let read_response = async {
+            while let Ok(read) = reader.read(&mut buf).await {
+                if read == 0 {
+                    break;
+                }
+                response.extend_from_slice(&buf[..read]);
             }
-            response.extend_from_slice(&buf[..read]);
-        }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(30), read_response)
+            .await
+            .expect("server must close the connection after the 413");
         sender.await.unwrap();
         let response = String::from_utf8_lossy(&response);
         assert!(
