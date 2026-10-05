@@ -416,6 +416,7 @@ async fn pending_process_stream_stops_when_receiver_closes() {
             journal: Arc::downgrade(&journal),
             changed: journal.subscribe(),
             next_sequence: 0,
+            primary: None,
         }),
     );
 
@@ -499,6 +500,7 @@ async fn process_journal_reports_lag_when_local_ring_evicts_output() {
                 journal: Arc::downgrade(&journal),
                 changed: journal.subscribe(),
                 next_sequence: 0,
+                primary: None,
             }),
         );
         for _ in 0..count {
@@ -522,6 +524,37 @@ async fn process_journal_reports_lag_when_local_ring_evicts_output() {
         );
         assert!(slow.next().await.is_none());
         assert_eq!(journal.changed.receiver_count(), 0);
+    }
+}
+
+#[tokio::test]
+async fn attached_output_backpressures_and_disconnect_releases_the_producer() {
+    // Exercise both the per-process limit and exhaustion of the shared pool.
+    for shared_bytes in [0, PROCESS_OUTPUT_SHARED_BYTES] {
+        let journal = Arc::new(ProcessEventJournal::new(Arc::new(Semaphore::new(
+            shared_bytes,
+        ))));
+        let process_id = ProcessId::new();
+        let cursor = journal.cursor(Some(0));
+        let event = process_stdout_event(&process_id, Some(1), vec![b'a'; 8192]);
+        while journal.try_append_output(event.clone()).is_none() {}
+        let tail = journal.tail_cursor();
+        let mut stream = process_event_stream_with_prefix(Vec::new(), Some(cursor));
+        let pending = journal.publish_output(event.clone());
+        tokio::pin!(pending);
+        assert!(futures_util::poll!(&mut pending).is_pending());
+        assert!(matches!(journal.read(0), ProcessJournalRead::Event(_)));
+        assert_eq!(stream.next().await.unwrap().unwrap(), event);
+        pending.await;
+        assert_eq!(journal.tail_cursor(), tail + 1);
+
+        let pending = journal.publish_output(event);
+        tokio::pin!(pending);
+        assert!(futures_util::poll!(&mut pending).is_pending());
+        drop(stream);
+        pending.await;
+        assert_eq!(journal.tail_cursor(), tail + 2);
+        assert_eq!(journal.blocked_readers.load(Ordering::Relaxed), 0);
     }
 }
 
@@ -590,6 +623,7 @@ async fn completed_cursor_keeps_terminal_event_without_retaining_journal() {
         journal: Arc::downgrade(&journal),
         changed: journal.subscribe(),
         next_sequence: 0,
+        primary: None,
     };
     journal.complete(exit.clone());
     drop(journal);
@@ -616,6 +650,7 @@ async fn evicted_cursor_reports_lag_before_terminal_event() {
         journal: Arc::downgrade(&journal),
         changed: journal.subscribe(),
         next_sequence: 0,
+        primary: None,
     };
     journal.complete(exit);
     drop(journal);

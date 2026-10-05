@@ -307,15 +307,16 @@ impl WorkerFilesystem for FilesystemWorkerService {
         let (account, _slot) = self.account(request.user, None).await?;
         let path = guest_path::normalize_for_account(&request.path, &account)?;
         let owner = assign_owner.then(|| account.ownership()).transpose()?;
-        let result = if request.parents {
-            create_dir_all_with_owner(Path::new(path.expose()), owner).await
-        } else {
-            create_dir_with_owner(Path::new(path.expose()), owner).await
-        };
+        if request.parents
+            && let Some(parent) = Path::new(path.expose()).parent()
+        {
+            create_dir_all_with_owner(parent, owner).await?;
+        }
+        let result = create_dir_with_owner(Path::new(path.expose()), owner).await;
         match result {
             Ok(()) => {}
             Err(status) if request.exist_ok && status.code() == tonic::Code::AlreadyExists => {
-                ensure_existing_directory_no_follow(Path::new(path.expose())).await?;
+                ensure_existing_directory(Path::new(path.expose())).await?;
             }
             Err(status) => return Err(status),
         }
@@ -575,7 +576,7 @@ async fn create_dir_all_with_owner(path: &Path, owner: Option<(u32, u32)>) -> Re
         match create_dir_with_owner(&current, owner).await {
             Ok(()) => {}
             Err(status) if status.code() == tonic::Code::AlreadyExists => {
-                ensure_existing_directory_no_follow(&current).await?;
+                ensure_existing_directory(&current).await?;
             }
             Err(status) => return Err(status),
         }
@@ -583,10 +584,10 @@ async fn create_dir_all_with_owner(path: &Path, owner: Option<(u32, u32)>) -> Re
     Ok(())
 }
 
-async fn ensure_existing_directory_no_follow(path: &Path) -> Result<(), Status> {
-    let metadata = tokio::fs::symlink_metadata(path)
-        .await
-        .map_err(map_io_error)?;
+async fn ensure_existing_directory(path: &Path) -> Result<(), Status> {
+    // Existing directory links are traversable; only newly created directories
+    // receive ownership changes through the no-follow, descriptor-based helper.
+    let metadata = tokio::fs::metadata(path).await.map_err(map_io_error)?;
     if metadata.file_type().is_dir() {
         return Ok(());
     }

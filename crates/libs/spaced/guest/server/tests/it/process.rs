@@ -118,12 +118,12 @@ async fn bridge_guest_process_send_input_writes_and_close_stdin_signals_eof() {
 }
 
 #[tokio::test]
-async fn bridge_guest_process_start_preserves_fast_large_stdout() {
+async fn bridge_guest_process_start_preserves_large_stdout_for_delayed_reader() {
     let temp_dir = tempfile::tempdir().expect("temp dir created");
     let (service, shutdown) =
         create_ready_guest_service(temp_dir.path().join("spaced-bridge-host.sock"), None, None);
 
-    let payload_len = 2_000_000usize;
+    let payload_len = 16 * 1024 * 1024usize;
     let mut stream = service
         .start(tonic::Request::new(bridge_guest::StartRequest {
             command: vec![
@@ -147,7 +147,11 @@ async fn bridge_guest_process_start_preserves_fast_large_stdout() {
 
     tokio::time::sleep(std::time::Duration::from_millis(250)).await;
 
-    let events = collect_process_events(stream).await;
+    let delayed = stream.then(|event| async move {
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        event
+    });
+    let events = collect_process_events(Box::pin(delayed)).await;
     let output = successful_stdout(&events);
     assert_eq!(output.len(), payload_len);
     assert!(output.iter().all(|byte| *byte == b'x'));

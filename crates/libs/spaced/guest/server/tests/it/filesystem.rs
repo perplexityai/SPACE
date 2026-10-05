@@ -462,16 +462,18 @@ async fn bridge_guest_mkdir_and_remove_flags_work() {
         .await
         .expect("mkdir existing ok");
 
-    let exists_error = client
-        .mkdir(MkdirRequest {
-            path: directory.display().to_string(),
-            parents: false,
-            exist_ok: false,
-            user: None,
-        })
-        .await
-        .expect_err("mkdir existing rejected");
-    assert_eq!(exists_error.code(), tonic::Code::AlreadyExists);
+    for parents in [false, true] {
+        let exists_error = client
+            .mkdir(MkdirRequest {
+                path: directory.display().to_string(),
+                parents,
+                exist_ok: false,
+                user: None,
+            })
+            .await
+            .expect_err("mkdir existing rejected");
+        assert_eq!(exists_error.code(), tonic::Code::AlreadyExists);
+    }
 
     client
         .remove(RemoveRequest {
@@ -564,7 +566,7 @@ async fn bridge_guest_mkdir_with_unknown_user_does_not_create_dirs() {
 }
 
 #[tokio::test]
-async fn bridge_guest_mkdir_parents_rejects_symlink_parent() {
+async fn bridge_guest_mkdir_parents_follows_directory_symlink() {
     let temp_dir = tempfile::tempdir().expect("temp dir created");
     let test_root = temp_dir.path().canonicalize().expect("canonical temp dir");
     let target_dir = test_root.join("target");
@@ -578,7 +580,7 @@ async fn bridge_guest_mkdir_parents_rejects_symlink_parent() {
     let fixture = GuestFixture::start(temp_dir.path()).await;
     let mut client = BridgeGuestFilesystemClient::new(fixture.channel.clone());
 
-    let error = client
+    client
         .mkdir(MkdirRequest {
             path: directory.display().to_string(),
             parents: true,
@@ -586,16 +588,16 @@ async fn bridge_guest_mkdir_parents_rejects_symlink_parent() {
             user: Some(user.name),
         })
         .await
-        .expect_err("symlink parent rejected");
+        .expect("directory symlink traversed");
 
-    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
-    assert!(!target_dir.join("child").exists());
+    assert!(target_dir.join("child").is_dir());
+    assert!(std::fs::symlink_metadata(&link_dir).unwrap().is_symlink());
 
     fixture.stop().await;
 }
 
 #[tokio::test]
-async fn bridge_guest_mkdir_exist_ok_rejects_symlink_leaf() {
+async fn bridge_guest_mkdir_exist_ok_accepts_directory_symlink() {
     let temp_dir = tempfile::tempdir().expect("temp dir created");
     let target_dir = temp_dir.path().join("target");
     let link_dir = temp_dir.path().join("link");
@@ -604,7 +606,7 @@ async fn bridge_guest_mkdir_exist_ok_rejects_symlink_leaf() {
     let fixture = GuestFixture::start(temp_dir.path()).await;
     let mut client = BridgeGuestFilesystemClient::new(fixture.channel.clone());
 
-    let error = client
+    client
         .mkdir(MkdirRequest {
             path: link_dir.display().to_string(),
             parents: false,
@@ -612,9 +614,10 @@ async fn bridge_guest_mkdir_exist_ok_rejects_symlink_leaf() {
             user: None,
         })
         .await
-        .expect_err("exist_ok symlink leaf rejected");
+        .expect("existing directory symlink accepted");
 
-    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    assert!(std::fs::symlink_metadata(&link_dir).unwrap().is_symlink());
+    assert!(target_dir.is_dir());
 
     fixture.stop().await;
 }

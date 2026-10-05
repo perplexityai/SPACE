@@ -9,6 +9,7 @@ use dashmap::DashMap;
 use pplx_space_common_core::types::{GuestUserName, Pii, ProcessCommand, ProcessId, ProcessSignal};
 use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
 use std::sync::Weak;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::{collections::VecDeque, io};
 use tokio::io::AsyncRead;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
@@ -22,7 +23,7 @@ const DEFAULT_PTY_COLS: u32 = 80;
 
 // Charge payloads and event storage, including each repeated process ID: tiny
 // writes must not turn a bounded output window into millions of allocations.
-// A lagging stream fails explicitly without blocking completion or other clients.
+// The primary attached reader applies backpressure; detached replay stays bounded.
 const PROCESS_OUTPUT_RETENTION_TOTAL_BYTES: usize = 64 * 1024 * 1024;
 // Process records retain command/env metadata and task-owned descriptors, so
 // cap them as well as the output bytes. Completed records are evicted first
@@ -104,7 +105,7 @@ impl ProcessSupervision {
             Ok(Ok(None)) => {
                 let drained = tokio::select! {
                     drained = drain_process_output_tasks(
-                        &mut output_tasks, &process_id, pid, false,
+                        &mut output_tasks, &process_id, pid, false, &record.journal,
                     ) => drained,
                     _ = shutdown.cancelled() => false,
                 };
@@ -115,6 +116,7 @@ impl ProcessSupervision {
             }
             Ok(status) => process_status_outcome(status.ok().flatten()),
             Err(outcome) => {
+                record.journal.release_backpressure();
                 if let Err(error) = record.signal_handle.terminate_group() {
                     tracing::warn!(%error, pid, "failed to terminate process group");
                 }
@@ -126,7 +128,17 @@ impl ProcessSupervision {
         };
 
         if !output_tasks.is_empty() {
-            drain_process_output_tasks(&mut output_tasks, &process_id, pid, true).await;
+            tokio::select! {
+                _ = drain_process_output_tasks(
+                    &mut output_tasks, &process_id, pid, true, &record.journal,
+                ) => {},
+                _ = shutdown.cancelled() => {
+                    record.journal.release_backpressure();
+                    drain_process_output_tasks(
+                        &mut output_tasks, &process_id, pid, true, &record.journal,
+                    ).await;
+                },
+            }
         }
         let exit = process_exit_event(&process_id, Some(pid), outcome);
         record.journal.complete(exit);
@@ -246,7 +258,7 @@ impl SpawnThread {
 struct LaunchedProcess {
     pid: u32,
     started: ProcessEvent,
-    record: Arc<ProcessRecord>,
+    cursor: ProcessJournalCursor,
     supervision: ProcessSupervision,
 }
 
@@ -350,6 +362,7 @@ impl ProcessLaunch {
         ));
         claim.publish(Arc::clone(&record));
 
+        let cursor = record.journal.cursor(Some(0));
         let mut output_tasks = VecDeque::new();
         if let Some(reader) = pty_reader {
             output_tasks.push_back(spawn_process_output_reader(
@@ -392,7 +405,7 @@ impl ProcessLaunch {
         Ok(LaunchedProcess {
             pid,
             started,
-            record,
+            cursor,
             supervision,
         })
     }
@@ -828,6 +841,8 @@ struct ProcessEventJournal {
     state: std::sync::Mutex<ProcessJournalState>,
     changed: watch::Sender<ProcessJournalChange>,
     shared_output_slots: Arc<Semaphore>,
+    consumed: watch::Sender<()>,
+    blocked_readers: AtomicUsize,
 }
 
 impl ProcessEventJournal {
@@ -837,6 +852,8 @@ impl ProcessEventJournal {
             state: std::sync::Mutex::new(ProcessJournalState::default()),
             changed,
             shared_output_slots,
+            consumed: watch::channel(()).0,
+            blocked_readers: AtomicUsize::new(0),
         }
     }
 
@@ -844,6 +861,7 @@ impl ProcessEventJournal {
         self.changed.subscribe()
     }
 
+    #[cfg(test)]
     fn tail_cursor(&self) -> u64 {
         self.state
             .lock()
@@ -882,7 +900,65 @@ impl ProcessEventJournal {
             .completed_at
     }
 
+    fn cursor(self: &Arc<Self>, requested: Option<u64>) -> ProcessJournalCursor {
+        let mut state = self
+            .state
+            .lock()
+            .expect("process output journal lock poisoned");
+        let next_sequence = requested.unwrap_or(state.next_sequence);
+        // Only one reader controls the producer. Observers cannot stall an
+        // existing consumer; after disconnect a new attachment can take over.
+        let primary = if !state.backpressure_disabled
+            && state.primary.upgrade().is_none()
+            && next_sequence >= state.first_sequence
+            && next_sequence <= state.next_sequence
+        {
+            let position = Arc::new(AtomicU64::new(next_sequence));
+            state.primary = Arc::downgrade(&position);
+            Some(position)
+        } else {
+            None
+        };
+        ProcessJournalCursor {
+            journal: Arc::downgrade(self),
+            changed: self.subscribe(),
+            next_sequence,
+            primary,
+        }
+    }
+
+    fn release_backpressure(&self) {
+        {
+            let mut state = self
+                .state
+                .lock()
+                .expect("process output journal lock poisoned");
+            state.primary = Weak::new();
+            state.backpressure_disabled = true;
+        }
+        self.consumed.send_replace(());
+    }
+
+    async fn publish_output(&self, mut event: ProcessEvent) {
+        let mut consumed = self.consumed.subscribe();
+        loop {
+            match self.try_append_output(event) {
+                None => return,
+                Some(pending) => event = pending,
+            }
+            let _blocked = BlockedOutputReader::new(&self.blocked_readers);
+            if consumed.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+
+    #[cfg(test)]
     fn append_output(&self, event: ProcessEvent) {
+        assert!(self.try_append_output(event).is_none());
+    }
+
+    fn try_append_output(&self, event: ProcessEvent) -> Option<ProcessEvent> {
         let output_bytes = match event.event.as_ref() {
             Some(pplx_space_spaced_common::proto::bridge_guest::process_event::Event::Stdout(
                 output,
@@ -910,7 +986,7 @@ impl ProcessEventJournal {
             }
             self.changed
                 .send_replace(ProcessJournalChange::OutputChanged);
-            return;
+            return None;
         }
         {
             let mut state = self
@@ -920,9 +996,11 @@ impl ProcessEventJournal {
             let sequence = state.next_sequence;
             while state.retained_bytes.saturating_add(output_bytes) > PROCESS_OUTPUT_RETENTION_BYTES
             {
+                if !can_evict_process_output(&state) {
+                    return Some(event);
+                }
                 evict_oldest_process_output(&mut state);
             }
-            state.next_sequence += 1;
             let shared_output_slot = loop {
                 let guaranteed_bytes = output_bytes
                     .min(PROCESS_OUTPUT_GUARANTEED_BYTES.saturating_sub(state.guaranteed_bytes));
@@ -939,11 +1017,14 @@ impl ProcessEventJournal {
                         Err(TryAcquireError::NoPermits | TryAcquireError::Closed)
                             if !state.output.is_empty() =>
                         {
+                            if !can_evict_process_output(&state) {
+                                return Some(event);
+                            }
                             evict_oldest_process_output(&mut state);
                             continue;
                         }
                         Err(TryAcquireError::NoPermits | TryAcquireError::Closed) => {
-                            state.first_sequence = state.next_sequence;
+                            state.first_sequence = state.next_sequence + 1;
                             break None;
                         }
                     }
@@ -951,11 +1032,12 @@ impl ProcessEventJournal {
                 state.guaranteed_bytes += guaranteed_bytes;
                 break Some((guaranteed_bytes, shared_output_slot));
             };
+            state.next_sequence += 1;
             let Some((guaranteed_bytes, shared_output_slot)) = shared_output_slot else {
                 drop(state);
                 self.changed
                     .send_replace(ProcessJournalChange::OutputChanged);
-                return;
+                return None;
             };
             state.retained_bytes += output_bytes;
             state.output.push_back(SequencedProcessEvent {
@@ -968,6 +1050,7 @@ impl ProcessEventJournal {
         }
         self.changed
             .send_replace(ProcessJournalChange::OutputChanged);
+        None
     }
 
     fn complete(&self, exit: ProcessEvent) {
@@ -1014,6 +1097,8 @@ impl ProcessEventJournal {
 
 #[derive(Default)]
 struct ProcessJournalState {
+    primary: Weak<AtomicU64>,
+    backpressure_disabled: bool,
     output: VecDeque<SequencedProcessEvent>,
     first_sequence: u64,
     next_sequence: u64,
@@ -1029,6 +1114,28 @@ struct SequencedProcessEvent {
     output_bytes: usize,
     guaranteed_bytes: usize,
     _shared_output_slot: Option<OwnedSemaphorePermit>,
+}
+
+fn can_evict_process_output(state: &ProcessJournalState) -> bool {
+    state
+        .primary
+        .upgrade()
+        .is_none_or(|position| position.load(Ordering::Acquire) > state.first_sequence)
+}
+
+struct BlockedOutputReader<'a>(&'a AtomicUsize);
+
+impl<'a> BlockedOutputReader<'a> {
+    fn new(count: &'a AtomicUsize) -> Self {
+        count.fetch_add(1, Ordering::Relaxed);
+        Self(count)
+    }
+}
+
+impl Drop for BlockedOutputReader<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 fn evict_oldest_process_output(state: &mut ProcessJournalState) {
@@ -1076,6 +1183,16 @@ struct ProcessJournalCursor {
     journal: Weak<ProcessEventJournal>,
     changed: watch::Receiver<ProcessJournalChange>,
     next_sequence: u64,
+    primary: Option<Arc<AtomicU64>>,
+}
+
+impl Drop for ProcessJournalCursor {
+    fn drop(&mut self) {
+        self.primary.take();
+        if let Some(journal) = self.journal.upgrade() {
+            journal.consumed.send_replace(());
+        }
+    }
 }
 
 enum ProcessReplay {
@@ -1176,14 +1293,9 @@ impl ProcessRegistry {
                 exit,
             });
         }
-        let next_sequence = output_cursor.unwrap_or_else(|| record.journal.tail_cursor());
         Some(ProcessReplay::Running {
             started: record.started.clone(),
-            cursor: ProcessJournalCursor {
-                journal: Arc::downgrade(&record.journal),
-                changed: record.journal.subscribe(),
-                next_sequence,
-            },
+            cursor: record.journal.cursor(output_cursor),
         })
     }
 
@@ -1254,6 +1366,12 @@ fn process_event_stream_with_prefix(
                 match read {
                     ProcessJournalRead::Event(event) => {
                         current.next_sequence += 1;
+                        if let Some(primary) = &current.primary {
+                            primary.store(current.next_sequence, Ordering::Release);
+                            if let Some(journal) = current.journal.upgrade() {
+                                journal.consumed.send_replace(());
+                            }
+                        }
                         return Some((Ok(event), (prefix, cursor)));
                     }
                     ProcessJournalRead::Exit(exit) => break Ok(exit),
@@ -1365,7 +1483,7 @@ where
                             process_stderr_event(&process_id, Some(pid), data.to_vec())
                         }
                     };
-                    record.journal.append_output(event);
+                    record.journal.publish_output(event).await;
                 }
                 Err(error) => {
                     tracing::warn!(
@@ -1387,22 +1505,32 @@ async fn drain_process_output_tasks(
     process_id: &ProcessId,
     pid: u32,
     abort_on_timeout: bool,
+    journal: &ProcessEventJournal,
 ) -> bool {
-    let drain = async {
-        while let Some(task) = output_tasks.front_mut() {
-            if let Err(error) = task.await {
-                tracing::warn!(%error, pid, "process output task failed");
+    loop {
+        let drain = async {
+            while let Some(task) = output_tasks.front_mut() {
+                if let Err(error) = task.await {
+                    tracing::warn!(%error, pid, "process output task failed");
+                }
+                output_tasks.pop_front();
             }
-            output_tasks.pop_front();
+        };
+        if tokio::time::timeout(PROCESS_OUTPUT_DRAIN_TIMEOUT, drain)
+            .await
+            .is_ok()
+        {
+            return true;
         }
-    };
-    if tokio::time::timeout(PROCESS_OUTPUT_DRAIN_TIMEOUT, drain)
-        .await
-        .is_ok()
-    {
-        return true;
-    }
 
+        // Only the final drain may wait for a slow consumer. The initial
+        // grace period must still expire so descendants cannot keep writing
+        // indefinitely after the leader exits.
+        if abort_on_timeout && journal.blocked_readers.load(Ordering::Relaxed) > 0 {
+            continue;
+        }
+        break;
+    }
     tracing::warn!(
         process_id = process_id.as_str(),
         pid,
@@ -1793,10 +1921,10 @@ impl Process for SpacedGuestService {
                 Ok(LaunchedProcess {
                     pid,
                     started,
-                    record,
+                    cursor,
                     supervision,
                 }) => {
-                    let _ = started_tx.send(Ok((pid, started, record)));
+                    let _ = started_tx.send(Ok((pid, started, cursor)));
                     supervision.run().await;
                 }
                 Err(status) => {
@@ -1806,7 +1934,7 @@ impl Process for SpacedGuestService {
         });
         drop(start_gate);
 
-        let (pid, started, record) = started_rx
+        let (pid, started, cursor) = started_rx
             .await
             .map_err(|_| Status::internal("process start ended without a result"))??;
         tracing::debug!(
@@ -1816,14 +1944,9 @@ impl Process for SpacedGuestService {
             background,
             "spaced bridge guest command succeeded"
         );
-        Ok(Response::new(process_event_stream_with_prefix(
-            vec![started],
-            Some(ProcessJournalCursor {
-                journal: Arc::downgrade(&record.journal),
-                changed: record.journal.subscribe(),
-                next_sequence: 0,
-            }),
-        ) as Self::StartStream))
+        Ok(Response::new(
+            process_event_stream_with_prefix(vec![started], Some(cursor)) as Self::StartStream,
+        ))
     }
 
     async fn connect_process(
@@ -1896,6 +2019,9 @@ impl Process for SpacedGuestService {
             .get_running(&process_id)
             .ok_or_else(|| Status::not_found("process not found"))?;
         handle.signal_handle.signal(signal)?;
+        if signal.as_i32() == libc::SIGKILL {
+            handle.journal.release_backpressure();
+        }
         tracing::debug!(
             command = "bridge_guest_process_send_signal",
             process_id = %process_id,
