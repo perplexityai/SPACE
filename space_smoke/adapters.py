@@ -26,7 +26,9 @@ from urllib.parse import parse_qs, quote, urlencode, urlsplit
 from urllib.request import Request, urlopen
 
 from space_smoke.capabilities import (
+    HalfPresentRedisStore,
     LimiterProbeOutcome,
+    LimiterRunRecord,
     AdminNodeGroupView,
     CensusPublication,
     FencePolicy,
@@ -318,6 +320,17 @@ SNAPSHOT_STATES_SQL = """\
 SELECT state FROM snapshots WHERE sandbox_id = '{sandbox_id}'::uuid AND type = 'full' ORDER BY "timestamp";
 """
 KIND_REDIS_POD_SELECTOR = "app.kubernetes.io/name=space-redis"
+# The rate-limiter scenario's run record (`LimiterRunRecord`), written on the
+# public API Deployment before its first change and cleared after its last undo,
+# so a run killed in between leaves the next run a way back. An annotation on
+# the object metadata, not the pod template, so writing it rolls nothing.
+LIMITER_RUN_RECORD_ANNOTATION = "space.pplx.net/smoke-limiter-run"
+# Opt-in in the bring-up (`bootstrap.sh --with-redis` / `SPACE_LOCAL_REDIS=1`).
+# The release name is fixed at `space`, as in `bootstrap.sh` and the Tiltfile:
+# the chart names the Deployment `{{ .Release.Name }}-redis` and the Service
+# from `service.name`, and the two only both come out `space-redis` under it.
+KIND_REDIS_CHART = REPO_ROOT / "infra/space/kind/charts/space-redis-local"
+KIND_REDIS_RELEASE = "space"
 SANDBOX_ID_LABEL = "space.pplx.net/sandbox-id"
 CHECKPOINT_ANNOTATION = "space.pplx.net/checkpoint"
 RESTORE_SOURCE_NODE_ANNOTATION = "space.pplx.net/suspend-restore-source-node"
@@ -978,6 +991,7 @@ class KindHarness:
         *,
         on_expired_takeover: Callable[[Mapping[str, object], _LeaseOwnership], None]
         | None = None,
+        holder_prefix: str = "",
     ) -> _LeaseOwnership:
         """Create or take over `name`; refuse while another live holder exists.
 
@@ -988,7 +1002,7 @@ class KindHarness:
         started. The callback must fence its own writes on `ownership`.
         """
 
-        holder = f"uid={os.getuid()};pid={os.getpid()};token={secrets.token_hex(16)}"
+        holder = f"{holder_prefix}uid={os.getuid()};pid={os.getpid()};token={secrets.token_hex(16)}"
         acquired_at = datetime.now(UTC)
         spec = {
             "holderIdentity": holder,
@@ -3465,10 +3479,20 @@ ON CONFLICT (key_hash) DO NOTHING;
 
     # --- rate limiters -----------------------------------------------------
 
-    def acquire_public_api_mutation(self) -> Callable[[], None]:
+    def acquire_public_api_mutation(self, *, purpose: str | None = None) -> Callable[[], None]:
+        """Take the public API mutation Lease; `purpose` prefixes the holder identity.
+
+        The kind harness's Redis scripts stand aside for any live holder; the
+        prefix tells them whether it is a rate-limiter smoke (`rate-limiter;`),
+        which `claim-redis-store.sh` warns may still remove a store it created,
+        or another smoke on the same Lease (node groups, node-selector extras).
+        """
+
         context_hash = hashlib.sha256(self.config.context.encode()).hexdigest()[:16]
         ownership = self._acquire_named_mutation_lease(
-            f"space-smoke-public-api-{context_hash}", "public API deployment mutation"
+            f"space-smoke-public-api-{context_hash}",
+            "public API deployment mutation",
+            holder_prefix=f"{purpose};" if purpose else "",
         )
         return lambda: self._release_lease(ownership)
 
@@ -3538,6 +3562,72 @@ ON CONFLICT (key_hash) DO NOTHING;
                 raise ValueError(f"refusing limiter env value {value!r} for {key}")
         self._apply_public_api_env(overrides, "set the public API limiter env")
 
+    def limiter_run_record(self) -> LimiterRunRecord | None:
+        """The run record a killed rate-limiter run left on the Deployment, if any."""
+
+        from space_smoke.rate_limiters import LIMITER_ENV_KEYS
+
+        name = self._public_api_deployment()
+        document = json.loads(
+            _require_ok(
+                self.kubectl("get", "deploy", name, "-o", "json", timeout=15),
+                f"read annotations of {name}",
+            )
+        )
+        raw = (document.get("metadata", {}).get("annotations") or {}).get(
+            LIMITER_RUN_RECORD_ANNOTATION
+        )
+        if raw is None:
+            return None
+        try:
+            record = json.loads(raw)
+        except json.JSONDecodeError:
+            record = None
+        env = record.get("env") if isinstance(record, dict) else None
+        if isinstance(env, dict):
+            # Only the current keys: one added since the killed run has no
+            # recorded value (the live one stands for it), and one removed
+            # since is no longer this scenario's to restore.
+            env = {key: value for key, value in env.items() if key in LIMITER_ENV_KEYS}
+        if (
+            not isinstance(env, dict)
+            or not all(value is None or isinstance(value, str) for value in env.values())
+            or not isinstance(record.get("redis_created"), bool)
+        ):
+            raise SmokeConfigurationError(
+                f"{LIMITER_RUN_RECORD_ANNOTATION} on {name} is not a limiter run record: {raw!r}; "
+                f"remove it with `kubectl annotate deploy/{name} {LIMITER_RUN_RECORD_ANNOTATION}- "
+                f"-n {KIND_NAMESPACE} --context {self.config.context}` and restore the "
+                "limiter env by hand"
+            )
+        return LimiterRunRecord(env=env, redis_created=record["redis_created"])
+
+    def write_limiter_run_record(self, record: LimiterRunRecord) -> None:
+        self._require_isolated_kind("limiter run record")
+        name = self._public_api_deployment()
+        value = json.dumps(
+            {"env": dict(record.env), "redis_created": record.redis_created},
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        _require_ok(
+            self.kubectl(
+                "annotate", "--overwrite", f"deploy/{name}",
+                f"{LIMITER_RUN_RECORD_ANNOTATION}={value}", timeout=15,
+            ),
+            f"write the limiter run record on {name}",
+        )
+
+    def clear_limiter_run_record(self) -> None:
+        self._require_isolated_kind("limiter run record")
+        name = self._public_api_deployment()
+        _require_ok(
+            self.kubectl(
+                "annotate", f"deploy/{name}", f"{LIMITER_RUN_RECORD_ANNOTATION}-", timeout=15
+            ),
+            f"clear the limiter run record on {name}",
+        )
+
     def restore_public_api_env(self, standing: Mapping[str, str | None]) -> None:
         self._apply_public_api_env(standing, "restore the public API limiter env")
 
@@ -3556,6 +3646,80 @@ ON CONFLICT (key_hash) DO NOTHING;
             if time.monotonic() > deadline:
                 raise RuntimeError(f"the public API did not report /readyz=200 within {timeout:g}s")
             time.sleep(1)
+
+    def redis_store_present(self) -> bool:
+        """Whether both store objects exist; a half-present store is refused."""
+
+        objects = (f"deploy/{KIND_REDIS_DEPLOYMENT}", f"svc/{KIND_REDIS_DEPLOYMENT}")
+        # `--ignore-not-found` makes absence exit 0 with nothing printed, so a
+        # non-zero exit is a real error and never reads as "absent".
+        present = _require_ok(
+            self.kubectl("get", *objects, "-o", "name", "--ignore-not-found", timeout=15),
+            "look for the Redis store",
+        ).split()
+        if present and len(present) != len(objects):
+            # Creating the missing half would leave this run owning one object
+            # of a store it did not make; that is the operator's to repair.
+            raise HalfPresentRedisStore(
+                f"the Redis store is half present ({', '.join(present)}); delete it or "
+                "re-run `bootstrap.sh --with-redis` before this scenario"
+            )
+        return bool(present)
+
+    def remove_redis_store(self, names: Sequence[str] | None = None) -> None:
+        self._require_isolated_kind("Redis removal")
+        targets = names or (f"deploy/{KIND_REDIS_DEPLOYMENT}", f"svc/{KIND_REDIS_DEPLOYMENT}")
+        _require_ok(
+            self.kubectl(
+                "delete", *targets, "--ignore-not-found", "--wait=true", "--timeout=30s",
+                timeout=45,
+            ),
+            "remove the Redis store",
+        )
+
+    def provide_redis(self, *, adopt: bool = False) -> Callable[[], None] | None:
+        """Create the Redis store unless the bench has it; return its removal if created.
+
+        `create`, not `apply`: a store that appears between the probe and the
+        write fails with AlreadyExists instead of being claimed. The removal
+        deletes by name, so it assumes nothing replaces the store while the run
+        holds it. A store the bench was given with `--with-redis` is found and
+        left alone (`None`); with `adopt`, the caller knows a killed run created
+        the store it finds, and gets its removal.
+        """
+
+        self._require_isolated_kind("Redis provisioning")
+
+        def remove(names: Sequence[str] | None = None) -> None:
+            self.remove_redis_store(names)
+
+        if self.redis_store_present():
+            return remove if adopt else None
+        manifest = _require_ok(
+            self.executor.run(
+                [
+                    "helm", "template", KIND_REDIS_RELEASE, str(KIND_REDIS_CHART),
+                    "--namespace", KIND_NAMESPACE,
+                ],
+                timeout=60,
+            ),
+            "render the Redis chart",
+        )
+        # `-o name` prints each object as it is created, so a create that fails
+        # partway still names what it made, and only that is rolled back.
+        created = self.kubectl("create", "-f", "-", "-o", "name", input_text=manifest, timeout=30)
+        if created.returncode != 0:
+            if partial := created.stdout.split():
+                try:
+                    remove(partial)
+                except RuntimeError as error:
+                    raise RuntimeError(
+                        f"create the Redis store failed ({created.detail() or '<no output>'}), "
+                        f"and rolling back {', '.join(partial)} failed too: {error}"
+                    ) from error
+            _require_ok(created, "create the Redis store")
+
+        return remove
 
     def redis_replicas(self) -> int:
         previous = _require_ok(

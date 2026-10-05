@@ -23,9 +23,8 @@
 # consuming the timeout; a Tilt bound to a deleted cluster is restarted.
 #
 # Public entry points: `bootstrap_kind_stack`, plus
-# `kind_stack_sweep_stale_node_tombstones`, `kind_stack_psql`, and
-# `kind_stack_ensure_redis` for suites that have to repeat a bring-up step in
-# their own setup or cleanup.
+# `kind_stack_sweep_stale_node_tombstones` and `kind_stack_psql` for suites that
+# have to repeat a bring-up step in their own setup or cleanup.
 #
 # Inputs (env vars, all optional with defaults set by the caller):
 #   API_URL           — health-check URL (e.g. http://localhost:8080)
@@ -490,8 +489,10 @@ bootstrap_kind_stack__start_tilt() {
         cd "$REPO_ROOT" || exit
         # The smokes drive the full production-shaped harness on the
         # multi-worker cluster: KubernetesSubstrate + shim + cluster-controller.
-        # The Tiltfile defaults to exactly this, but both knobs stay explicit so
+        # The Tiltfile defaults to exactly this, but the knobs stay explicit so
         # a caller's environment cannot flip the bench under a running suite.
+        # SPACE_LOCAL_REDIS keeps the limiter store out, as on a default
+        # bring-up; the rate-limiter scenario provides its own.
         #
         # `setsid`: Tilt must outlive whoever started it. `nohup` alone only
         # ignores SIGHUP; a caller killed by process group -- the devbox setup
@@ -500,8 +501,8 @@ bootstrap_kind_stack__start_tilt() {
         # leaving half-built images and a cluster nobody is reconciling
         # (measured on a cold devbox: `tilt up` died mid-compile at exactly
         # 300s). A new session puts Tilt in its own process group.
-        TILT_BROWSER_DISABLED=1 SPACE_KIND_CLUSTER="$KIND_CLUSTER" SPACE_LOCAL_MINIMAL=0 \
-            setsid nohup tilt up >"$log" 2>&1 </dev/null &
+        TILT_BROWSER_DISABLED=1 SPACE_KIND_CLUSTER="$KIND_CLUSTER" \
+            SPACE_LOCAL_MINIMAL=0 SPACE_LOCAL_REDIS=0 setsid nohup tilt up >"$log" 2>&1 </dev/null &
         echo $! >"$pidfile"
     )
 
@@ -610,37 +611,6 @@ kind_stack_psql() {
     kubectl --context "kind-${KIND_CLUSTER}" -n "${NAMESPACE:-space}" \
         exec -i sts/space-postgres -- \
         psql -U "$KIND_STACK_PG_USER" -d "$KIND_STACK_PG_DB" -tA -v ON_ERROR_STOP=1 "$@"
-}
-
-# Redis, the store behind the two API rate limiters. Part of the harness
-# (`bootstrap.sh` / the Tiltfile), so this renders the chart only when it is
-# missing — which keeps the normal path from re-applying it while still letting a
-# suite run against a stack that predates the chart. It always scales to 1 and
-# waits, so it also recovers a prior run that died with Redis scaled to zero.
-#
-# Here rather than in each suite because it is bring-up, not assertion. Two
-# suites had the same twelve lines when it was extracted; one of them
-# (`smoke-kind-node-selector-extras.sh`) dropped its Redis setup later in the same
-# change, once the token bucket turned out not to affect either of its phases — so
-# `smoke-kind-rate-limiters.sh` is the only caller today.
-kind_stack_ensure_redis() {
-    local deploy="${1:-space-redis}"
-    # Declared here rather than in the bring-up loop above, because a suite
-    # running with SKIP_BOOTSTRAP=1 reaches this function and never that loop.
-    if ! command -v helm >/dev/null 2>&1; then
-        echo "ERROR: helm is required to ensure the Redis chart is applied" >&2
-        return 1
-    fi
-    # Targeting flags last, per the repository's kubectl convention. None of
-    # these is an `exec`, where the flags would have to precede `--`.
-    local target=(-n "${NAMESPACE:-space}" --context "kind-${KIND_CLUSTER}")
-    if ! kubectl get "deploy/$deploy" "${target[@]}" >/dev/null 2>&1; then
-        helm template space "$REPO_ROOT/infra/space/kind/charts/space-redis-local" \
-            --namespace "${NAMESPACE:-space}" \
-            | kubectl apply -f - "${target[@]}" >/dev/null
-    fi
-    kubectl scale "deploy/$deploy" --replicas=1 "${target[@]}" >/dev/null 2>&1 || true
-    kubectl rollout status "deploy/$deploy" --timeout=120s "${target[@]}" >/dev/null
 }
 
 # Wait for `space-api` to report `/readyz=200`, up to a caller-chosen bound.
@@ -972,6 +942,15 @@ bootstrap_kind_stack__bring_up() {
         tilt_state=orphaned
     fi
     if [[ "$tilt_state" == "live" ]]; then
+        # The Tiltfile's `remove-redis-store` ran once, when this Tilt started;
+        # a store created since then (a killed smoke) would outlive it. Only a
+        # default-mode Tilt has that resource: one started with
+        # `SPACE_LOCAL_REDIS=1` has `space-redis` instead, and its store is the
+        # one the operator asked for.
+        if timeout 10s tilt get uiresource remove-redis-store --port 10350 >/dev/null 2>&1; then
+            bash "$REPO_ROOT/infra/space/kind/scripts/remove-redis-store.sh" \
+                "kind-${KIND_CLUSTER}" "${NAMESPACE:-space}" || exit 1
+        fi
         if [[ "${KIND_STACK_DETACH:-0}" == "1" ]]; then
             echo "[bootstrap] tilt is already running; KIND_STACK_DETACH=1, not waiting for the stack"
             return 0

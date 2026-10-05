@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, BinaryIO, Generic, Protocol, TypeVar
 
+from space_smoke.runtime import SmokeConfigurationError
+
 
 @dataclass(frozen=True)
 class KindColdCreateConfig:
@@ -485,6 +487,23 @@ class RateLimitProbe(Protocol):
         ...
 
 
+class HalfPresentRedisStore(SmokeConfigurationError):
+    """One of the Redis store's Deployment and Service exists without the other."""
+
+
+@dataclass(frozen=True)
+class LimiterRunRecord:
+    """What a rate-limiter run changes, written before the first change.
+
+    `env` is the limiter env that stood before the run; `redis_created` says the
+    run owns the Redis store and must remove it. A record still present when a
+    run starts was left by a run killed before its cleanup finished.
+    """
+
+    env: dict[str, str | None]
+    redis_created: bool
+
+
 class RateLimiterControl(Protocol):
     """Privileged kind-only operations for the rate-limiter scenario.
 
@@ -493,13 +512,37 @@ class RateLimiterControl(Protocol):
     entry is refused because a literal could not put the reference back. The
     Lease serializes cooperating smokes on the same Deployment. Redis is the
     kind `space-redis` Deployment; taking it to zero is the fail-open fault.
+    The bring-up deploys it only on opt-in, so `provide_redis` creates it
+    when the bench has none.
     """
 
-    def acquire_public_api_mutation(self) -> Callable[[], None]: ...
+    def redis_store_present(self) -> bool:
+        """Whether the store exists; raises `HalfPresentRedisStore` on a half-present one."""
+        ...
+
+    def remove_redis_store(self) -> None: ...
+
+    def provide_redis(self, *, adopt: bool = False) -> Callable[[], None] | None:
+        """Create the store if absent and return its removal.
+
+        A store already present returns `None`, unless `adopt` says a killed run
+        created it, in which case its removal is returned too.
+        """
+        ...
+
+    def acquire_public_api_mutation(self, *, purpose: str | None = None) -> Callable[[], None]: ...
 
     def public_api_env(self, keys: Sequence[str]) -> dict[str, str | None]: ...
 
     def set_public_api_env(self, overrides: Mapping[str, str]) -> None: ...
+
+    def limiter_run_record(self) -> LimiterRunRecord | None:
+        """The record an earlier, killed run left on the Deployment; None if there is none."""
+        ...
+
+    def write_limiter_run_record(self, record: LimiterRunRecord) -> None: ...
+
+    def clear_limiter_run_record(self) -> None: ...
 
     def restore_public_api_env(self, standing: Mapping[str, str | None]) -> None: ...
 

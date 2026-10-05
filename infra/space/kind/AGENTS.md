@@ -55,6 +55,26 @@ or suites.
   `space_smoke/adapters.py` (capture the standing literals, restore from the
   capture, verify running pods); shell ECW key seeding goes through
   `scripts/tests/lib/ecw-ops.sh`.
+- The Redis limiter store (`charts/space-redis-local`) is opt-in:
+  `bootstrap.sh --with-redis` or `SPACE_LOCAL_REDIS=1`, which the Tiltfile reads
+  too. Keep both paths agreeing on what a default stack contains, including
+  removing a store an earlier opt-in left (`scripts/remove-redis-store.sh`,
+  which stands aside while any smoke holds the public-API mutation Lease and
+  otherwise deletes under that Lease) and handing an opt-in store to the bench
+  (`scripts/claim-redis-store.sh`). A smoke that needs the store provides it and
+  removes only what it created, as recorded in its run record; don't make a
+  default bring-up deploy it. A live Tilt started with `SPACE_LOCAL_REDIS=1` is
+  an opt-in stack, not a default one: `bootstrap_kind_stack` reuses it and its
+  store as they are, and only a Tilt it starts itself is pinned to the default.
+- A typed smoke without `SKIP_BOOTSTRAP=1` runs `bootstrap_kind_stack`, which
+  starts Tilt on a `bootstrap.sh`-built stack. Tilt then rebuilds and rolls every
+  Deployment and returns the stack to its default shape, mid-run. Pass
+  `SKIP_BOOTSTRAP=1` to test a live scripted stack, including `--with-redis`.
+- Don't run `bootstrap.sh` or restart Tilt while a typed smoke is running:
+  both roll `space-api` under it, and `bootstrap.sh` also restarts its
+  port-forwards, so the run ends inconclusive. `bootstrap_kind_stack` reusing a
+  live Tilt rolls nothing, which is the overlap the Redis scripts' Lease check
+  covers.
 - SeaweedFS data remains on its node-local hostPath. Preserve the chart's volume
   sizing, 40 GiB sparse worker cache, and Kind-specific disk-admission values.
 
