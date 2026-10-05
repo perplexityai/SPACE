@@ -946,12 +946,6 @@ variable "cred_authority_instance_types" {
   default     = ["m7i.large"]
 }
 
-variable "honeytoken_external_secret_enabled" {
-  description = "Sync the space-honeytoken Secrets Manager value into the space namespace. Off until an operator has populated that value out-of-band (Terraform doesn't write it); an ExternalSecret pointed at an unpopulated secret reports SecretSyncError. The Secrets Manager read grant does not depend on this, so flipping it on is a single change."
-  type        = bool
-  default     = false
-}
-
 variable "mitm_root_ca_external_secret_enabled" {
   description = "Sync the space-mitm-root-ca Secrets Manager value (the public MITM root CA, sourced from the certificates stack in mitm_root_ca.tf) into the space namespace, where the space-build-manager chart mounts it into seed builds. On only where the certificates stack has a root; the Secrets Manager read grant does not depend on this."
   type        = bool

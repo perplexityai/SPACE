@@ -87,8 +87,8 @@ const LABEL_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 /// volume-manager (rootfs and snapshot volumes), sandbox-manager and
 /// node-manager (the shim's create path), node-api (readiness and
 /// command-ready polling), and template-manager (template pulls). The worker
-/// release's other DaemonSets — build-manager, credential-manager, honeytoken
-/// — are deliberately absent: a create does not wait on them, so a node
+/// release's other DaemonSets — build-manager, credential-manager, and any an
+/// operator adds — are deliberately absent: a create does not wait on them, so a node
 /// missing one is not slow to place on.
 ///
 /// Adding a variant is a deliberate act: every node that does not run the new

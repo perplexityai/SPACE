@@ -83,9 +83,21 @@ variable "worker_shim_dogstatsd_socket_path" {
 # Operator-managed secret containers declared by the calling root. The
 # module still owns the shared external-secrets release, so their names cross
 # the boundary while their AWS resources stay outside the reusable module.
-variable "honeytoken_secret_name" {
-  description = "Secrets Manager name containing the node honeytoken credentials"
-  type        = string
+variable "additional_external_secrets" {
+  description = "Caller-owned ExternalSecret entries appended to the module's own, for secrets a deployment syncs into the space namespace without the module naming them. Same shape and validation as the module's entries; the Secrets Manager read grant covers them too."
+  type = list(object({
+    name               = string
+    target_secret_name = string
+    refresh_interval   = optional(string)
+    enabled            = optional(bool, true)
+    data = list(object({
+      secret_key = string
+      remote_key = string
+      property   = optional(string)
+    }))
+  }))
+  default  = []
+  nullable = false
 }
 
 variable "cluster_smoke_ecw_api_key_secret_name" {
