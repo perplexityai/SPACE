@@ -565,6 +565,42 @@ async fn equal_inputs_have_equal_interval_semantics_across_sinks() {
             &["service:interface-b"],
         ),
         Input::counter(
+            "gateway.inspection.admission",
+            1,
+            &[
+                "outcome:denied",
+                "reason:first_byte_timeout",
+                "tls_interception:off",
+                "stage:destination_policy",
+                "path:unknown",
+                "policy_reason:default_deny",
+            ],
+        ),
+        Input::counter(
+            "gateway.inspection.admission",
+            1,
+            &[
+                "outcome:error",
+                "reason:no_identity",
+                "tls_interception:unknown",
+                "stage:policy_readiness",
+                "path:unknown",
+                "policy_reason:not_evaluated",
+            ],
+        ),
+        Input::counter(
+            "gateway.inspection.session",
+            1,
+            &[
+                "outcome:error",
+                "reason:tls_downstream_error",
+                "tls_interception:on",
+                "stage:guest_handshake",
+                "path:tls_inspection",
+                "policy_reason:allowed",
+            ],
+        ),
+        Input::counter(
             "sandbox.worker.lifecycle.count",
             precise,
             &["method:create", "status:success"],

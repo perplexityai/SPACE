@@ -552,12 +552,72 @@ pub fn tcp_connection(status: &str, detail: &str) {
     );
 }
 
+metric_vocabulary! {
+    InspectionMode {
+        On => "on",
+        Off => "off",
+        Unknown => "unknown",
+    }
+}
+
+metric_vocabulary! {
+    InspectionStage {
+        PolicyReadiness => "policy_readiness",
+        ClientHello => "client_hello",
+        DestinationPolicy => "destination_policy",
+        PolicyValidation => "policy_validation",
+        PreTls => "pre_tls",
+        Handoff => "handoff",
+        GuestHandshake => "guest_handshake",
+        SessionForwarding => "session_forwarding",
+    }
+}
+
+metric_vocabulary! {
+    InspectionPath {
+        Unknown => "unknown",
+        Tunnel => "tunnel",
+        HostBoundHttp => "host_bound_http",
+        TlsInspection => "tls_inspection",
+    }
+}
+
 /// One terminal inspection-admission outcome per accepted non-DNS TCP flow.
-pub fn inspection_admission(outcome: &str, reason: &str) {
+pub fn inspection_admission(
+    outcome: &str,
+    reason: &str,
+    mode: InspectionMode,
+    stage: InspectionStage,
+    path: InspectionPath,
+    policy_reason: &str,
+) {
     counter(
         "gateway.inspection.admission",
         1,
-        &[tag("outcome", outcome), tag("reason", reason)],
+        &[
+            tag("outcome", outcome),
+            tag("reason", reason),
+            tag("tls_interception", mode),
+            tag("stage", stage),
+            tag("path", path),
+            tag("policy_reason", policy_reason),
+        ],
+    );
+}
+
+/// One terminal outcome per admitted inspected connection, not per HTTP request.
+pub fn inspection_session(outcome: &str, reason: &str, stage: InspectionStage) {
+    counter(
+        "gateway.inspection.session",
+        1,
+        &[
+            tag("outcome", outcome),
+            tag("reason", reason),
+            tag("tls_interception", InspectionMode::On),
+            tag("stage", stage),
+            tag("path", InspectionPath::TlsInspection),
+            tag("policy_reason", "allowed"),
+        ],
     );
 }
 

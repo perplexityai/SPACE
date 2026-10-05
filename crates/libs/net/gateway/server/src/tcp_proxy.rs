@@ -441,6 +441,8 @@ impl TcpProxy {
 
         let mut inspection = accounting::Attempt::inspection_admission();
         let policy = self.network_state.wait_for_tcp_policy().await;
+        inspection.admission_mode(&policy);
+        inspection.inspection_stage(pplx_space_metrics::gateway::InspectionStage::ClientHello);
         // Policy readiness remains first on the success path. A failed wait
         // still gets one bounded, non-consuming peek so its diagnostic can
         // identify a configured TLS destination.
@@ -464,6 +466,9 @@ impl TcpProxy {
         let policy = match policy {
             TrafficPolicy::Ready(policy) => policy,
             TrafficPolicy::NotReady(reason) => {
+                inspection.inspection_stage(
+                    pplx_space_metrics::gateway::InspectionStage::PolicyReadiness,
+                );
                 // Reserve `denied` for an admission decision. Policy readiness failures never
                 // reached evaluation; only lifecycle shutdown is cancellation.
                 let outcome =
@@ -480,9 +485,15 @@ impl TcpProxy {
             }
         };
 
+        inspection
+            .inspection_stage(pplx_space_metrics::gateway::InspectionStage::DestinationPolicy);
         let admitted = match self.admit(dst, &scan, &policy) {
-            Ok(admitted) => admitted,
+            Ok(admitted) => {
+                inspection.admission_policy("allowed");
+                admitted
+            }
             Err(reason) => {
+                inspection.admission_policy(reason.label());
                 inspection.finish(
                     accounting::Outcome::Denied,
                     inspection_admission_reason(&scan, missing_sni_detail, reason),
@@ -495,6 +506,17 @@ impl TcpProxy {
                 return (host, FlowOutcome::Rejected(Rejection::Admission(reason)));
             }
         };
+        inspection.admission_path(match (policy.tls_interception, &scan, admitted) {
+            (pplx_space_net_common::TlsInterception::On, scan, _)
+                if !matches!(scan, crate::tls_sni::ClientHelloScan::NotTls) =>
+            {
+                pplx_space_metrics::gateway::InspectionPath::TlsInspection
+            }
+            (_, _, AdmittedTcp::Tunnel(_)) => pplx_space_metrics::gateway::InspectionPath::Tunnel,
+            (_, _, AdmittedTcp::HostBoundHttp(_)) => {
+                pplx_space_metrics::gateway::InspectionPath::HostBoundHttp
+            }
+        });
         // Register before the final current-policy check so a concurrent
         // update either rejects this handoff or sees the flow in its resweep.
         let connection = self.dns_attributed_connections.register(
@@ -505,12 +527,14 @@ impl TcpProxy {
             shutdown.clone(),
         );
         let interception_mode = connection.interception_mode;
+        inspection.inspection_stage(pplx_space_metrics::gateway::InspectionStage::PolicyValidation);
         if let Err(reason) = self.validate_admission_policy(&policy) {
             inspection.finish(accounting::Outcome::Cancelled, reason.label());
             return (host, FlowOutcome::Rejected(Rejection::Admission(reason)));
         }
         self.stats.tcp_total.fetch_add(1, Ordering::Relaxed);
 
+        inspection.inspection_stage(pplx_space_metrics::gateway::InspectionStage::PreTls);
         let action = match self
             .tls_interception
             .before_relay(interception_mode, &scan, missing_sni_detail, dst.port())
@@ -526,6 +550,7 @@ impl TcpProxy {
                 );
             }
         };
+        inspection.inspection_stage(pplx_space_metrics::gateway::InspectionStage::Handoff);
         if let Err(reason) = self.validate_admission_policy(&policy) {
             inspection.finish(accounting::Outcome::Cancelled, reason.label());
             return (host, FlowOutcome::Rejected(Rejection::Admission(reason)));
@@ -545,8 +570,9 @@ impl TcpProxy {
             }
             crate::tls_interception::InterceptionAction::Terminate(lease) => {
                 inspection.finish(accounting::Outcome::Success, "admitted");
+                let mut session = accounting::Attempt::inspection_session();
                 match self
-                    .terminate_tls(client, admitted, lease, client_alpn)
+                    .terminate_tls(client, admitted, lease, client_alpn, &mut session)
                     .await
                 {
                     Ok(()) => FlowOutcome::InspectedTls,

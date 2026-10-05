@@ -9,6 +9,204 @@ enum SigningResult {
     Pending,
 }
 
+async fn inspected_proxy() -> (
+    TcpProxy,
+    rcgen::Certificate,
+    Arc<crate::certificates::CertificateLease>,
+) {
+    let (mut proxy, _) = dns_attributed_pypi_proxy().await;
+    proxy.network_state = GatewayNetworkState::pending_policy();
+    let mut policy = NetworkPolicyV1::allow_all();
+    policy.tls_interception = pplx_space_net_common::TlsInterception::On;
+    let (root, _, provider) = crate::certificates::local_provider_with_policy(
+        proxy.network_state.clone(),
+        policy,
+        Default::default(),
+    )
+    .await;
+    let lease = provider
+        .get("allowed.test".parse().unwrap(), 443)
+        .await
+        .unwrap();
+    proxy.tls_interception = TlsInterception::new(Arc::new(move |host, port| {
+        let provider = provider.clone();
+        Box::pin(async move { provider.get(host, port).await })
+    }));
+    (proxy, root, lease)
+}
+
+async fn guest_pair() -> (TcpStream, TcpStream) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (guest, accepted) = tokio::join!(
+        TcpStream::connect(listener.local_addr().unwrap()),
+        listener.accept()
+    );
+    (guest.unwrap(), accepted.unwrap().0)
+}
+
+#[tokio::test]
+async fn admitted_sessions_count_handshake_failure_forwarding_failure_and_completion_separately() {
+    use crate::tls_sni::test_fixtures::client_hello;
+
+    enum Guest {
+        IncompleteHandshake,
+        InvalidHttp,
+        GracefulClose,
+    }
+    for (guest_action, stage, expected_outcome, reason) in [
+        (
+            Guest::IncompleteHandshake,
+            "guest_handshake",
+            "error",
+            "tls_downstream_error",
+        ),
+        (
+            Guest::InvalidHttp,
+            "session_forwarding",
+            "error",
+            "http_connection_error",
+        ),
+        (
+            Guest::GracefulClose,
+            "session_forwarding",
+            "success",
+            "completed",
+        ),
+    ] {
+        let (proxy, root, _) = inspected_proxy().await;
+        let (mut guest, gateway) = guest_pair().await;
+        let capture = pplx_space_metrics::test_capture::capture_counters_guard();
+        let shutdown = CancellationToken::new();
+        let (handled, ()) = tokio::time::timeout(Duration::from_secs(3), async {
+            tokio::join!(
+                proxy.handle(gateway, "203.0.113.10:443".parse().unwrap(), &shutdown),
+                async {
+                    if matches!(guest_action, Guest::IncompleteHandshake) {
+                        guest
+                            .write_all(&client_hello(Some("allowed.test")))
+                            .await
+                            .unwrap();
+                        guest.shutdown().await.unwrap();
+                        return;
+                    }
+                    let mut roots = rustls::RootCertStore::empty();
+                    roots.add(root.der().clone()).unwrap();
+                    let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(
+                        rustls::crypto::aws_lc_rs::default_provider(),
+                    ))
+                    .with_safe_default_protocol_versions()
+                    .unwrap()
+                    .with_root_certificates(roots)
+                    .with_no_client_auth();
+                    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+                    let mut guest = tokio_rustls::TlsConnector::from(Arc::new(config))
+                        .connect("allowed.test".try_into().unwrap(), guest)
+                        .await
+                        .unwrap();
+                    if matches!(guest_action, Guest::InvalidHttp) {
+                        guest.write_all(b"invalid HTTP\r\n\r\n").await.unwrap();
+                    }
+                    guest.shutdown().await.unwrap();
+                }
+            )
+        })
+        .await
+        .expect("local TLS session must terminate");
+        assert_eq!(
+            matches!(handled.1, FlowOutcome::InspectedTls),
+            expected_outcome == "success"
+        );
+        let counters = capture.finish();
+        let inspection: Vec<_> = counters
+            .iter()
+            .filter(|counter| counter.name.starts_with("gateway.inspection."))
+            .collect();
+        assert_eq!(inspection.len(), 2, "{inspection:?}");
+        assert_eq!(inspection[0].name, "gateway.inspection.admission");
+        assert_eq!(
+            inspection[0].tags,
+            [
+                "outcome:success",
+                "reason:admitted",
+                "tls_interception:on",
+                "stage:handoff",
+                "path:tls_inspection",
+                "policy_reason:allowed"
+            ]
+        );
+        assert_eq!(inspection[1].name, "gateway.inspection.session");
+        assert_eq!(inspection[1].value, 1);
+        assert_eq!(
+            inspection[1].tags,
+            [
+                format!("outcome:{expected_outcome}"),
+                format!("reason:{reason}"),
+                "tls_interception:on".to_owned(),
+                format!("stage:{stage}"),
+                "path:tls_inspection".to_owned(),
+                "policy_reason:allowed".to_owned()
+            ]
+        );
+    }
+}
+
+#[tokio::test]
+async fn policy_change_at_handoff_keeps_the_admitting_generation_and_never_starts_a_session() {
+    use crate::tls_sni::test_fixtures::client_hello;
+
+    let (mut proxy, _, lease) = inspected_proxy().await;
+    let state = proxy.network_state.clone();
+    proxy.tls_interception = TlsInterception::new(Arc::new(move |_, _| {
+        let state = state.clone();
+        let lease = lease.clone();
+        Box::pin(async move {
+            install_policy(
+                &state,
+                NetworkPolicyV1::allow_all(),
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            )
+            .await;
+            Ok(lease)
+        })
+    }));
+    let (mut guest, gateway) = guest_pair().await;
+    guest
+        .write_all(&client_hello(Some("allowed.test")))
+        .await
+        .unwrap();
+    let capture = pplx_space_metrics::test_capture::capture_counters_guard();
+    let (_, outcome) = proxy
+        .handle(
+            gateway,
+            "203.0.113.10:443".parse().unwrap(),
+            &CancellationToken::new(),
+        )
+        .await;
+    assert!(matches!(
+        outcome,
+        FlowOutcome::Rejected(Rejection::Admission(TcpAdmissionDenial::PolicyChanged))
+    ));
+    let counters = capture.finish();
+    let inspection: Vec<_> = counters
+        .iter()
+        .filter(|counter| counter.name.starts_with("gateway.inspection."))
+        .collect();
+    let [metric] = inspection.as_slice() else {
+        panic!("expected only one admission: {inspection:?}")
+    };
+    assert_eq!(
+        metric.tags,
+        [
+            "outcome:cancelled",
+            "reason:policy_changed",
+            "tls_interception:on",
+            "stage:handoff",
+            "path:tls_inspection",
+            "policy_reason:allowed"
+        ]
+    );
+}
+
 #[tokio::test]
 async fn interception_wiring_preserves_admission_and_never_falls_back_to_relay() {
     use crate::tls_sni::test_fixtures::client_hello;
@@ -21,17 +219,46 @@ async fn interception_wiring_preserves_admission_and_never_falls_back_to_relay()
     let no_sni = client_hello(None);
     let malformed = client_hello(Some("not a domain"));
     // name, policy allows, bytes, signing result, requests
-    for (name, allowed, bytes, signing_result, requests) in [
-        ("signing error", true, &tls, SigningResult::Unavailable, 1),
-        ("signing timeout", true, &tls, SigningResult::Pending, 1),
-        ("policy denial", false, &tls, SigningResult::Unavailable, 0),
-        ("no SNI", true, &no_sni, SigningResult::Unavailable, 0),
+    for (name, allowed, bytes, signing_result, requests, expected_reason) in [
+        (
+            "signing error",
+            true,
+            &tls,
+            SigningResult::Unavailable,
+            1,
+            "certificate_unavailable",
+        ),
+        (
+            "signing timeout",
+            true,
+            &tls,
+            SigningResult::Pending,
+            1,
+            "certificate_timeout",
+        ),
+        (
+            "policy denial",
+            false,
+            &tls,
+            SigningResult::Unavailable,
+            0,
+            "default_deny",
+        ),
+        (
+            "no SNI",
+            true,
+            &no_sni,
+            SigningResult::Unavailable,
+            0,
+            "sni_not_found",
+        ),
         (
             "malformed SNI",
             true,
             &malformed,
             SigningResult::Unavailable,
             0,
+            "sni_invalid",
         ),
         (
             "incomplete",
@@ -39,6 +266,7 @@ async fn interception_wiring_preserves_admission_and_never_falls_back_to_relay()
             &vec![0x16],
             SigningResult::Unavailable,
             0,
+            "client_hello_completion_timeout",
         ),
     ] {
         let mut policy = if allowed {
@@ -83,12 +311,60 @@ async fn interception_wiring_preserves_admission_and_never_falls_back_to_relay()
         guest.shutdown().await.unwrap();
         let connection = accepted.unwrap().0;
         let shutdown = CancellationToken::new();
+        let capture = pplx_space_metrics::test_capture::capture_counters_guard();
         let (host, outcome) = tokio::time::timeout(
             Duration::from_secs(3),
             proxy.handle(connection, dst, &shutdown),
         )
         .await
         .expect(name);
+        let counters = capture.finish();
+        let admission: Vec<_> = counters
+            .iter()
+            .filter(|counter| counter.name == "gateway.inspection.admission")
+            .collect();
+        let [metric] = admission.as_slice() else {
+            panic!("{name}: expected exactly one admission: {admission:?}")
+        };
+        assert_eq!(metric.value, 1, "{name}");
+        assert_eq!(
+            metric.tags,
+            [
+                format!(
+                    "outcome:{}",
+                    if !allowed || requests == 0 {
+                        "denied"
+                    } else {
+                        "error"
+                    }
+                ),
+                format!("reason:{expected_reason}"),
+                "tls_interception:on".to_owned(),
+                format!(
+                    "stage:{}",
+                    if allowed {
+                        "pre_tls"
+                    } else {
+                        "destination_policy"
+                    }
+                ),
+                format!(
+                    "path:{}",
+                    if allowed { "tls_inspection" } else { "unknown" }
+                ),
+                format!(
+                    "policy_reason:{}",
+                    if allowed { "allowed" } else { "default_deny" }
+                ),
+            ],
+            "{name}"
+        );
+        assert!(
+            !counters
+                .iter()
+                .any(|counter| counter.name == "gateway.inspection.session"),
+            "{name}: no session was admitted"
+        );
         assert!(matches!(outcome, FlowOutcome::Rejected(_)), "{name}");
         assert!(
             upstream.accept().now_or_never().is_none(),

@@ -7,6 +7,68 @@ through OpenTelemetry over OTLP. Each signal is selected independently, by the
 same rules in the Rust services and the Go shim. Logs are not part of this
 selection; see [Logs](#logs).
 
+## Gateway inspection populations
+
+`gateway.inspection.admission` remains one terminal outcome for each non-reserved-DNS
+TCP flow reaching the handler. Its existing `outcome` and `reason` values are
+unchanged: `reason` retains peek/certificate detail such as `first_byte_timeout`.
+Additive dimensions separate the populations:
+
+| Tag | Values / meaning |
+| --- | --- |
+| `tls_interception` | `on`, `off`, `unknown`, from the captured admission policy, never a later inventory lookup |
+| `stage` | `policy_readiness`, `client_hello`, `destination_policy`, `policy_validation`, `pre_tls`, `handoff` |
+| `path` | `unknown` before routing, then `tunnel`, `host_bound_http`, or `tls_inspection` |
+| `policy_reason` | `not_evaluated`, `allowed`, `default_deny`, `explicit_deny`, or `platform_guardrail` |
+
+The destination verdict includes DNS-required host binding. A denial with
+`reason:first_byte_timeout` can therefore retain `policy_reason:default_deny`;
+an independently allowed destination refused during pre-TLS setup retains
+`policy_reason:allowed`. `policy_changed` is a cancellation detail, not a new
+destination verdict: it retains the original policy's mode and verdict.
+`interception_not_ready` proves the installed policy was On; other readiness
+failures remain unknown. Cancellation while waiting for policy is unknown,
+while cancellation during the peek retains the mode already captured.
+
+Off denials are deliberately still `denied`, not `skipped`. To study enabled
+inspection, explicitly filter `tls_interception:on`; exclude
+`outcome:skipped` only if the question excludes admitted plaintext. Do not
+divide a selected On numerator by the unfiltered admission population.
+Admission success means the connection was handed to TLS termination, not that
+a handshake or a request completed. Reserved DNS is excluded as before.
+
+`gateway.inspection.session` is a new, separate terminal counter, emitted once
+for each admitted inspected connection. It has the same tag keys, fixed
+`tls_interception:on`, `path:tls_inspection`, and `policy_reason:allowed`.
+`stage:guest_handshake` includes transport setup and guest-handshake failures;
+the stage advances to `session_forwarding` only after the guest handshake
+actually succeeds. Success is `reason:completed`; failure reasons use the
+bounded TLS transport vocabulary. Lease invalidation / gateway withdrawal are
+cancellations, and dropping unfinished work emits `cancelled/work_dropped`
+at the last reached stage. This is a connection population, not a per-request
+or origin-handshake population: lazy origin setup can fail during forwarding,
+and a guest may close without ever contacting an origin.
+
+The existing `gateway.tcp.connection` counter is unchanged and still includes
+later TLS failures in `rejected/tls_interception`. The existing log
+`stage:tls_session` can contain propagated guest-handshake failures; use its
+new `processing_stage` field or the session counter rather than treating that
+log stage as proof of a completed handshake. No policy references, sandbox IDs,
+hostnames, or destination addresses are added to metric tags.
+
+Both counters use the shared metric emitter, so DogStatsD and OTLP carry the
+same dimensions. Existing ungrouped totals and `outcome`/`reason` filters retain
+their meaning, but the additional tags create new series. Old data and old
+binaries lack these dimensions; absent mode must not be interpreted as Off.
+For Datadog Metrics without Limits configurations, operators must review the
+tag allowlist for `gateway.inspection.admission` and the new
+`gateway.inspection.session`, and enable `tls_interception`, `stage`, `path`,
+and `policy_reason` before using them in grouping/filtering. DogStatsD uses
+the configured namespace prefix; OTLP backend translation may normalize the
+metric name. Verify the actual emitted name in the target backend. Index
+activation, dashboard migration, rollout, and production queries are not
+performed by this code change.
+
 ## Selecting a backend
 
 `SPACE_TRACE_EXPORTER` chooses the trace exporter and `SPACE_METRICS_SINK`

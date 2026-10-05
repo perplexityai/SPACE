@@ -58,6 +58,10 @@ pub(crate) enum TlsTransportError {
 
 impl TlsTransportError {
     pub(super) fn record(&self, stage: &'static str) {
+        self.record_processing(stage, stage);
+    }
+
+    fn record_processing(&self, stage: &'static str, processing_stage: &'static str) {
         let failure = self.failure();
         let http = match self {
             Self::Http(error) => HttpFailure::classify(error),
@@ -67,6 +71,7 @@ impl TlsTransportError {
         tracing::error!(
             telemetry_type = "gateway_boundary_failure",
             stage,
+            processing_stage,
             outcome = self.as_str(),
             reason = failure.reason,
             io_kind = ?io_kind,
@@ -365,6 +370,7 @@ impl TcpProxy {
         admitted: AdmittedTcp,
         lease: Arc<CertificateLease>,
         client_alpn: ClientAlpnOffer,
+        session: &mut Attempt,
     ) -> Result<(), TlsInterceptionError> {
         let span = tracing::info_span!(
             "tls.server",
@@ -381,11 +387,15 @@ impl TcpProxy {
             );
             let destination = admitted.destination();
             if destination.port() != lease.port() {
+                session.finish(Outcome::Error, TlsTransportError::Target.as_str());
                 return Err(TlsTransportError::Target.into());
             }
             let accounting = WireAccounting::new(self.stats.clone());
             let operation = async {
                 let (downstream, protocol) = accept(client, &lease, &self.tls_interception).await?;
+                session.inspection_stage(
+                    pplx_space_metrics::gateway::InspectionStage::SessionForwarding,
+                );
                 tracing::Span::current().record("protocol", protocol.as_str());
                 let binding = HostBinding::new(
                     self.sandbox_id,
@@ -420,9 +430,17 @@ impl TcpProxy {
                 result = operation => result,
             };
             if result.is_ok() {
+                session.finish(Outcome::Success, "completed");
                 tracing::Span::current().record("otel.status_code", "OK");
             } else if let Err(error) = &result {
-                error.record("tls_session");
+                let outcome = match error {
+                    TlsTransportError::Invalidated | TlsTransportError::Withdrawn => {
+                        Outcome::Cancelled
+                    }
+                    _ => Outcome::Error,
+                };
+                session.finish(outcome, error.as_str());
+                error.record_processing("tls_session", session.stage().as_str());
             }
             result.map_err(Into::into)
         }

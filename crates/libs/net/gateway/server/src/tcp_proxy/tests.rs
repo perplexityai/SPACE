@@ -14,6 +14,131 @@ use tracing_subscriber::layer::SubscriberExt as _;
 
 mod tls_interception;
 
+#[tokio::test]
+async fn silent_peers_keep_policy_denials_distinct_from_enabled_inspection() {
+    use pplx_space_net_common::TlsInterception as Mode;
+
+    for (
+        mode,
+        allowed,
+        expected_outcome,
+        expected_reason,
+        expected_stage,
+        expected_path,
+        policy_reason,
+    ) in [
+        (
+            Mode::On,
+            true,
+            "denied",
+            "first_byte_timeout",
+            "pre_tls",
+            "tls_inspection",
+            "allowed",
+        ),
+        (
+            Mode::Off,
+            true,
+            "skipped",
+            "inspection_disabled",
+            "handoff",
+            "tunnel",
+            "allowed",
+        ),
+        (
+            Mode::On,
+            false,
+            "denied",
+            "first_byte_timeout",
+            "destination_policy",
+            "unknown",
+            "default_deny",
+        ),
+        (
+            Mode::Off,
+            false,
+            "denied",
+            "first_byte_timeout",
+            "destination_policy",
+            "unknown",
+            "default_deny",
+        ),
+    ] {
+        let upstream = TcpListener::bind("0.0.0.0:0").await.unwrap();
+        let dst = upstream.local_addr().unwrap();
+        let mut policy = if allowed {
+            NetworkPolicyV1::allow_all()
+        } else {
+            NetworkPolicyV1::deny_all()
+        };
+        policy.tls_interception = mode;
+        let (state, _) = ready_policy(policy).await;
+        let (mut proxy, _) = dns_attributed_pypi_proxy().await;
+        proxy.network_state = state;
+        proxy.tls_interception = TlsInterception::new(Arc::new(|_, _| {
+            Box::pin(async { panic!("a silent peer must not request a certificate") })
+        }));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (guest, accepted) = tokio::join!(
+            TcpStream::connect(listener.local_addr().unwrap()),
+            listener.accept()
+        );
+        let guest = guest.unwrap();
+        let capture = pplx_space_metrics::test_capture::capture_counters_guard();
+        let shutdown = CancellationToken::new();
+        let handle = proxy.handle(accepted.unwrap().0, dst, &shutdown);
+        let (_, outcome) = if mode == Mode::Off && allowed {
+            tokio::pin!(handle);
+            let outcome = tokio::select! {
+                outcome = &mut handle => outcome,
+                accepted = upstream.accept() => {
+                    let (origin, _) = accepted.unwrap();
+                    drop(guest);
+                    drop(origin);
+                    handle.await
+                }
+            };
+            assert!(!matches!(outcome.1, FlowOutcome::Rejected(_)));
+            outcome
+        } else {
+            let outcome = handle.await;
+            assert!(matches!(outcome.1, FlowOutcome::Rejected(_)));
+            assert!(futures_util::FutureExt::now_or_never(upstream.accept()).is_none());
+            drop(guest);
+            outcome
+        };
+        assert_eq!(
+            matches!(outcome, FlowOutcome::Rejected(_)),
+            !(mode == Mode::Off && allowed)
+        );
+        let counters = capture.finish();
+        let admission: Vec<_> = counters
+            .iter()
+            .filter(|counter| counter.name == "gateway.inspection.admission")
+            .collect();
+        let [metric] = admission.as_slice() else {
+            panic!("expected exactly one admission: {admission:?}")
+        };
+        assert_eq!(metric.value, 1);
+        assert_eq!(
+            metric.tags,
+            [
+                format!("outcome:{expected_outcome}"),
+                format!("reason:{expected_reason}"),
+                format!("tls_interception:{}", mode.as_str()),
+                format!("stage:{expected_stage}"),
+                format!("path:{expected_path}"),
+                format!("policy_reason:{policy_reason}"),
+            ]
+        );
+        assert!(
+            !counters
+                .iter()
+                .any(|counter| counter.name == "gateway.inspection.session")
+        );
+    }
+}
+
 fn dns_attribution_denied(reason: DenyReason) -> TcpAdmissionDenial {
     TcpAdmissionDenial::DnsAttribution(reason)
 }
@@ -329,35 +454,120 @@ async fn tls_interception_waits_for_a_late_client_hello_on_an_allowed_destinatio
 async fn a_flow_refused_before_its_client_hello_arrives_is_reset_not_ended() {
     use tokio::io::AsyncReadExt as _;
 
-    let (proxy, _) = dns_attributed_pypi_proxy().await;
-    let destination: SocketAddr = "93.184.216.34:443".parse().unwrap();
-    let guest_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let (guest, accepted) = tokio::join!(
-        TcpStream::connect(guest_listener.local_addr().unwrap()),
-        guest_listener.accept(),
-    );
-    let mut guest = guest.unwrap();
-    let (gateway_guest, _) = accepted.unwrap();
+    for mode in [
+        pplx_space_net_common::TlsInterception::On,
+        pplx_space_net_common::TlsInterception::Off,
+    ] {
+        let (mut proxy, policy) = dns_attributed_pypi_proxy().await;
+        let mut policy = policy.as_ref().clone();
+        policy.tls_interception = mode;
+        let (state, policy) = ready_policy(policy).await;
+        proxy.network_state = state;
+        proxy
+            .dns_allow_cache
+            .observe_response(&dns_a_response("pypi.org", [93, 184, 216, 34], 60), &policy);
+        let destination: SocketAddr = "93.184.216.34:443".parse().unwrap();
+        let guest_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (guest, accepted) = tokio::join!(
+            TcpStream::connect(guest_listener.local_addr().unwrap()),
+            guest_listener.accept(),
+        );
+        let mut guest = guest.unwrap();
+        let (gateway_guest, _) = accepted.unwrap();
 
-    // The guest never sends its ClientHello, so admission refuses the flow
-    // with nothing unread on the socket: a plain close would be a FIN.
-    let (_, outcome) = proxy
-        .handle(gateway_guest, destination, &CancellationToken::new())
-        .await;
-    assert!(
-        matches!(outcome, FlowOutcome::Rejected(Rejection::Admission(_))),
-        "a silent flow to a DNS-attributed address must be refused at admission"
-    );
+        // The guest never sends its ClientHello, so admission refuses the flow
+        // with nothing unread on the socket: a plain close would be a FIN.
+        let capture = pplx_space_metrics::test_capture::capture_counters_guard();
+        let (_, outcome) = proxy
+            .handle(gateway_guest, destination, &CancellationToken::new())
+            .await;
+        assert!(
+            matches!(outcome, FlowOutcome::Rejected(Rejection::Admission(_))),
+            "a silent flow to a DNS-attributed address must be refused at admission"
+        );
+        let counters = capture.finish();
+        let inspection: Vec<_> = counters
+            .iter()
+            .filter(|counter| counter.name.starts_with("gateway.inspection."))
+            .collect();
+        let [metric] = inspection.as_slice() else {
+            panic!("expected one admission: {inspection:?}")
+        };
+        assert_eq!(
+            metric.tags,
+            [
+                "outcome:denied".to_owned(),
+                "reason:first_byte_timeout".to_owned(),
+                format!("tls_interception:{}", mode.as_str()),
+                "stage:destination_policy".to_owned(),
+                "path:unknown".to_owned(),
+                "policy_reason:default_deny".to_owned()
+            ]
+        );
 
-    let mut buf = [0_u8; 1];
-    let read = tokio::time::timeout(Duration::from_secs(1), guest.read(&mut buf))
-        .await
-        .expect("the refusal must close the guest connection");
-    assert_eq!(
-        read.map_err(|error| error.kind()),
-        Err(io::ErrorKind::ConnectionReset),
-        "a refusal must reset, not end, the guest connection"
-    );
+        let mut buf = [0_u8; 1];
+        let read = tokio::time::timeout(Duration::from_secs(1), guest.read(&mut buf))
+            .await
+            .expect("the refusal must close the guest connection");
+        assert_eq!(
+            read.map_err(|error| error.kind()),
+            Err(io::ErrorKind::ConnectionReset),
+            "a refusal must reset, not end, the guest connection"
+        );
+    }
+}
+
+#[tokio::test]
+async fn readiness_refusals_do_not_claim_a_destination_verdict_or_disabled_inspection() {
+    let mut on = NetworkPolicyV1::allow_all();
+    on.tls_interception = pplx_space_net_common::TlsInterception::On;
+    let (gated, _) = ready_policy(on).await;
+    let gated = gated.with_traffic_gate(Arc::new(|| false));
+    for (state, mode, reason) in [
+        (GatewayNetworkState::no_identity(), "unknown", "no_identity"),
+        (gated, "on", "interception_not_ready"),
+    ] {
+        let (mut proxy, _) = dns_attributed_pypi_proxy().await;
+        proxy.network_state = state;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (guest, accepted) = tokio::join!(
+            TcpStream::connect(listener.local_addr().unwrap()),
+            listener.accept()
+        );
+        let guest = guest.unwrap();
+        let capture = pplx_space_metrics::test_capture::capture_counters_guard();
+        let (_, outcome) = proxy
+            .handle(
+                accepted.unwrap().0,
+                "203.0.113.10:443".parse().unwrap(),
+                &CancellationToken::new(),
+            )
+            .await;
+        assert!(matches!(
+            outcome,
+            FlowOutcome::Rejected(Rejection::PolicyMissing(_))
+        ));
+        drop(guest);
+        let counters = capture.finish();
+        let inspection: Vec<_> = counters
+            .iter()
+            .filter(|counter| counter.name.starts_with("gateway.inspection."))
+            .collect();
+        let [metric] = inspection.as_slice() else {
+            panic!("expected one admission: {inspection:?}")
+        };
+        assert_eq!(
+            metric.tags,
+            [
+                "outcome:error".to_owned(),
+                format!("reason:{reason}"),
+                format!("tls_interception:{mode}"),
+                "stage:policy_readiness".to_owned(),
+                "path:unknown".to_owned(),
+                "policy_reason:not_evaluated".to_owned()
+            ]
+        );
+    }
 }
 
 #[tokio::test]
