@@ -291,6 +291,9 @@ pub(super) async fn write_file(
             ));
         };
         let path = e2b_request_root(&path, user.as_ref())?;
+        // Create the parent before reading the body, so an unwritable
+        // destination fails without spooling the upload.
+        let route = ensure_parent_dir(&state, route, &path, user.clone()).await?;
         let upload = spool_body_upload(body).await?;
         spaced_write_spooled(&state, route, path.clone(), upload, user).await?;
         return Ok(Json(vec![file_write_info(path)]));
@@ -326,6 +329,7 @@ pub(super) async fn write_file(
         let mut written = Vec::with_capacity(writes.len());
         let mut route = route;
         for (path, upload) in writes {
+            route = ensure_parent_dir(&state, route, &path, user.clone()).await?;
             route = spaced_write_spooled(&state, route, path.clone(), upload, user.clone()).await?;
             written.push(file_write_info(path));
         }
@@ -721,7 +725,7 @@ async fn spaced_write_spooled(
     upload: tempfile::TempPath,
     user: Option<GuestUserName>,
 ) -> Result<EcwResolvedRoute, EcwProxyError> {
-    let route = ensure_parent_dir(state, route, &path, user.clone()).await?;
+    // Callers create the parent directory first.
     // `upload` deletes the spool file on drop, so it stays bound until the
     // transfer below has reopened and streamed it.
     let upload_path = upload.to_path_buf();
