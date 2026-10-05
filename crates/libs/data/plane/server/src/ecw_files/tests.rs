@@ -408,6 +408,7 @@ fn content_disposition_parse_ignores_text_inside_quoted_values() {
     let parsed = |name: Option<&str>, filename: Option<&str>| ContentDispositionE2b {
         name: name.map(str::to_string),
         filename: filename.map(str::to_string),
+        ..ContentDispositionE2b::default()
     };
     let cases: [(&[u8], ContentDispositionE2b); 14] = [
         // Under one quoted-pair rule, `name=file` inside a filename stays in
@@ -473,7 +474,31 @@ fn content_disposition_parse_ignores_text_inside_quoted_values() {
     ];
     for (value, expected) in cases {
         let shown = String::from_utf8_lossy(value).into_owned();
-        assert_eq!(parse(value).unwrap(), expected, "{shown}");
+        let got = parse(value).unwrap();
+        assert_eq!(
+            (got.name, got.filename),
+            (expected.name, expected.filename),
+            "{shown}"
+        );
+    }
+    // Only an escaped backslash in the filename is flagged: it reads as one
+    // backslash from httpx or Go but two from raw-backslash clients.
+    for (value, flagged) in [
+        (&br#"form-data; name="file"; filename="dir\\f""#[..], true),
+        (br#"form-data; name="file"; filename="a\\\"b""#, true),
+        (br#"form-data; name="a\\b"; filename="f.txt""#, false),
+        (
+            br#"form-data; name="file"; filename="dir\report.txt""#,
+            false,
+        ),
+        (br#"form-data; name="file"; filename="a\"b""#, false),
+    ] {
+        let shown = String::from_utf8_lossy(value).into_owned();
+        assert_eq!(
+            parse(value).unwrap().filename_has_escaped_backslash,
+            flagged,
+            "{shown}"
+        );
     }
     for malformed in [
         &br#"form-data; name="file"; filename="a.txt"#[..],
@@ -1054,4 +1079,34 @@ async fn invalid_multipart_filename_is_rejected_before_spooling() {
         assert_eq!(error.message, message, "{filename:?}");
         assert_eq!(spool_dir_entries(dir.path()).await, 0, "{filename:?}");
     }
+}
+
+#[tokio::test]
+async fn filename_with_an_escaped_backslash_is_rejected_only_when_it_names_the_destination() {
+    let header = r#"form-data; name="file"; filename="dir\\f.txt""#;
+    let body = || {
+        format!(
+            "--{MULTIPART_BOUNDARY}\r\nContent-Disposition: {header}\r\n\r\ncontent\r\n--{MULTIPART_BOUNDARY}--\r\n"
+        )
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let mut spool = SpoolFiles::in_dir(dir.path().to_path_buf());
+    let error = spool_multipart_uploads(Body::from(body()), MULTIPART_BOUNDARY, true, &mut spool)
+        .await
+        .unwrap_err();
+    assert_eq!(error.status, StatusCode::BAD_REQUEST);
+    assert!(
+        error.message.contains("one backslash or two"),
+        "{}",
+        error.message
+    );
+    assert_eq!(spool_dir_entries(dir.path()).await, 0);
+
+    // With a path query the filename is ignored, so the part is written.
+    let mut spool = SpoolFiles::default();
+    let uploads =
+        spool_multipart_uploads(Body::from(body()), MULTIPART_BOUNDARY, false, &mut spool)
+            .await
+            .unwrap();
+    assert_eq!(uploads.len(), 1);
 }

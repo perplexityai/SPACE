@@ -123,6 +123,11 @@ pub(super) async fn spool_multipart_uploads_with_limit(
         // The filename becomes a guest path later; reject an impossible one
         // before holding it and spooling its part.
         if let Some(filename) = &filename {
+            if disposition.filename_has_escaped_backslash {
+                return Err(EcwProxyError::bad_request(
+                    "multipart filename contains \\\\, which clients encode as one backslash or two; send the destination in the path query or use application/octet-stream",
+                ));
+            }
             if filename.len() > MAX_GUEST_PATH_BYTES {
                 return Err(EcwProxyError::bad_request(format!(
                     "multipart filename exceeds {MAX_GUEST_PATH_BYTES} bytes"
@@ -174,6 +179,10 @@ pub(super) async fn spool_multipart_uploads_with_limit(
 pub(super) struct ContentDispositionE2b {
     pub(super) name: Option<String>,
     pub(super) filename: Option<String>,
+    /// The quoted filename contained `\\`. httpx and Go send that for one
+    /// backslash; raw-backslash clients send it for two. The two readings name
+    /// different paths, so a filename used as a destination is rejected.
+    pub(super) filename_has_escaped_backslash: bool,
 }
 
 impl ContentDispositionE2b {
@@ -183,10 +192,12 @@ impl ContentDispositionE2b {
     /// start another parameter, so `name=file` inside a filename stays part of
     /// the filename.
     ///
-    /// httpx and Go escape this way, so their filenames read as sent.
-    /// Browsers, fetch/undici, curl, and urllib3 send `"` as `%22` and `\`
-    /// raw, so their filenames read as sent unless they contain `\\` (read as
-    /// `\`) or end in `\` (rejected: the closing quote reads as escaped).
+    /// httpx and Go escape this way. Browsers, fetch/undici, curl, and urllib3
+    /// send `"` as `%22` and `\` raw. Both families' filenames read as sent,
+    /// except for the one sequence they encode differently: `\\`, which
+    /// `filename_has_escaped_backslash` flags so callers can reject it rather
+    /// than guess. A raw filename ending in `\` is rejected here, because its
+    /// closing quote reads as escaped.
     ///
     /// Only `name` and `filename` are read; other parameters are skipped
     /// without validation. A header with unbalanced quotes is rejected, and so
@@ -225,13 +236,15 @@ impl ContentDispositionE2b {
                 continue;
             };
             let key = param.get(..separator).unwrap_or_default().trim_ascii();
+            let is_filename = key.eq_ignore_ascii_case(b"filename");
             let slot = if key.eq_ignore_ascii_case(b"name") {
                 &mut disposition.name
-            } else if key.eq_ignore_ascii_case(b"filename") {
+            } else if is_filename {
                 &mut disposition.filename
             } else {
                 continue;
             };
+            let mut escaped_backslash = false;
             let raw = param.get(separator + 1..).unwrap_or_default().trim_ascii();
             let bytes = match raw.strip_prefix(b"\"") {
                 Some(rest) => {
@@ -242,6 +255,7 @@ impl ContentDispositionE2b {
                         match (byte, bytes.peek()) {
                             (b'\\', Some(&&escaped @ (b'\\' | b'"'))) => {
                                 bytes.next();
+                                escaped_backslash |= escaped == b'\\';
                                 unescaped.push(escaped);
                             }
                             (b'"', _) => return Err(malformed()),
@@ -257,6 +271,7 @@ impl ContentDispositionE2b {
             if slot.replace(text).is_some() {
                 return Err(malformed());
             }
+            disposition.filename_has_escaped_backslash |= is_filename && escaped_backslash;
         }
         Ok(disposition)
     }

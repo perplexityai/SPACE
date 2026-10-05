@@ -181,8 +181,9 @@ and a boundary of at most 70 characters, and each part may carry at most 32
 headers. Part headers beyond roughly 60 KiB may be rejected, depending on how
 the body is framed and encoded. Only parts named `file` are written. Without a
 `path` query, each `file` part's filename names its destination and may be at
-most 4096 bytes; with a `path` query, the request may carry only one `file`
-part. JSON file writes (`{"path": …, "content": …}`,
+most 4096 bytes. Such a filename may not contain `\\`: clients encode it as
+either one backslash or two, so the request is rejected instead of guessing.
+With a `path` query, the request may carry only one `file` part. JSON file writes (`{"path": …, "content": …}`,
 also used when the request has no `Content-Type`) are capped at 1 MiB of
 request body and return `413` above that; send larger files as multipart or
 octet-stream.
