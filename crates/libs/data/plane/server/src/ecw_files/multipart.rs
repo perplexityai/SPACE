@@ -126,6 +126,17 @@ pub(super) async fn spool_multipart_uploads_with_limit(
                 "multipart filename exceeds {MAX_GUEST_PATH_BYTES} bytes"
             )));
         }
+        // Both are known from the part headers, so reject before spooling.
+        if is_file && filenames_name_paths && filename.is_none() {
+            return Err(EcwProxyError::bad_request(
+                "multipart uploads require a filename or path query",
+            ));
+        }
+        if is_file && !filenames_name_paths && !uploads.is_empty() {
+            return Err(EcwProxyError::bad_request(
+                "path query parameter only supports a single multipart upload",
+            ));
+        }
         let mut upload = if is_file {
             Some(SpooledUpload::new().await?)
         } else {
@@ -162,17 +173,21 @@ pub(super) struct ContentDispositionE2b {
 }
 
 impl ContentDispositionE2b {
-    /// Splits parameters on `;` outside quoted values. Clients disagree on
-    /// escaping inside quoted values: httpx and Go write `\\` and `\"` (RFC
-    /// 7230 quoted-pairs), while browsers, curl, and undici send `"` as `%22`
-    /// and backslashes as themselves. Both read correctly when `\\` and `\"`
-    /// are escapes, except a `\"` that ends the value, which is a literal
-    /// backslash before the closing quote (a browser filename ending in `\`).
-    /// So an escaped quote directly before `;` (an httpx filename containing
-    /// `";`) reads as the end of the value. Other backslashes, such as Windows
-    /// path separators, stay literal. The first occurrence of a parameter wins. Unbalanced quotes, a quote inside an
-    /// unquoted value, and non-UTF-8 values reject the part instead of
-    /// letting stray quotes reach the write path or a file part go unnamed.
+    /// Splits parameters on `;` outside quoted values. Clients escape quoted
+    /// values differently: browsers, urllib3, curl, and undici send `"` as
+    /// `%22` and backslashes as themselves; httpx doubles backslashes and sends
+    /// `"` as `%22`; Go writes `\\` and `\"`. So `\\` and `\"` are read as
+    /// escapes, except a `\"` that ends the value, which is a literal backslash
+    /// before the closing quote (a browser filename ending in `\`). This reads
+    /// httpx and Go filenames, and browser filenames without backslash runs,
+    /// as sent. Two inputs stay ambiguous: a run of raw backslashes from a
+    /// browser-style client collapses (`a\\b` reads as `a\b`), and a Go
+    /// filename with `"` directly before `;` ends at that quote or is
+    /// rejected. Other backslashes, such as Windows path separators, stay
+    /// literal. The first occurrence of a parameter wins. Unbalanced quotes,
+    /// a quote inside an unquoted value, and non-UTF-8 values reject the part
+    /// instead of letting stray quotes reach the write path or a file part go
+    /// unnamed.
     pub(super) fn parse(headers: &HeaderMap) -> Result<Self, EcwProxyError> {
         let value = headers
             .get(header::CONTENT_DISPOSITION)
@@ -320,15 +335,11 @@ pub(super) fn resolve_multipart_uploads(
     query_path: Option<String>,
     user: Option<&GuestUserName>,
 ) -> Result<Vec<(String, tempfile::TempPath)>, EcwProxyError> {
-    if query_path.is_some() && uploads.len() > 1 {
-        return Err(EcwProxyError::bad_request(
-            "path query parameter only supports a single multipart upload",
-        ));
-    }
     uploads
         .into_iter()
         .map(|upload| {
-            // The path query wins over the part's filename.
+            // The path query wins over the part's filename. Spooling has
+            // already rejected parts with neither.
             let path = query_path.clone().or(upload.filename).ok_or_else(|| {
                 EcwProxyError::bad_request("multipart uploads require a filename or path query")
             })?;

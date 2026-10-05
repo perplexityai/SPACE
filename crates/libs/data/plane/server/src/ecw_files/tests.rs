@@ -133,7 +133,7 @@ async fn multipart_multiple_files_are_spooled_independently() {
 #[tokio::test]
 async fn multipart_path_query_overrides_filename_and_rejects_multiple_files() {
     let single = multipart_body(&[("file", Some("ignored.txt"), b"content")]);
-    let uploads = spool_multipart_uploads(Body::from(single), MULTIPART_BOUNDARY, true)
+    let uploads = spool_multipart_uploads(Body::from(single), MULTIPART_BOUNDARY, false)
         .await
         .unwrap();
     let mut writes =
@@ -148,11 +148,9 @@ async fn multipart_path_query_overrides_filename_and_rejects_multiple_files() {
         ("file", Some("a.txt"), b"alpha"),
         ("file", Some("b.txt"), b"beta"),
     ]);
-    let uploads = spool_multipart_uploads(Body::from(multiple), MULTIPART_BOUNDARY, true)
+    let error = spool_multipart_uploads(Body::from(multiple), MULTIPART_BOUNDARY, false)
         .await
-        .unwrap();
-    let error =
-        resolve_multipart_uploads(uploads, Some("override.txt".to_string()), None).unwrap_err();
+        .unwrap_err();
     assert_eq!(error.status, StatusCode::BAD_REQUEST);
     assert_eq!(
         error.message,
@@ -163,10 +161,9 @@ async fn multipart_path_query_overrides_filename_and_rejects_multiple_files() {
 #[tokio::test]
 async fn multipart_requires_filename_or_path() {
     let body = multipart_body(&[("file", None, b"content")]);
-    let uploads = spool_multipart_uploads(Body::from(body), MULTIPART_BOUNDARY, true)
+    let error = spool_multipart_uploads(Body::from(body), MULTIPART_BOUNDARY, true)
         .await
-        .unwrap();
-    let error = resolve_multipart_uploads(uploads, None, None).unwrap_err();
+        .unwrap_err();
     assert_eq!(error.status, StatusCode::BAD_REQUEST);
     assert_eq!(
         error.message,
@@ -423,7 +420,7 @@ fn content_disposition_parse_ignores_text_inside_quoted_values() {
             br#"form-data; filename="dir\" ; name="file""#,
             parsed(Some("file"), Some(r"dir\")),
         ),
-        // httpx and Go write quoted-pairs for backslashes and quotes.
+        // httpx doubles backslashes; Go also writes `\"`.
         (
             br#"form-data; name="file"; filename="dir\\""#,
             parsed(Some("file"), Some(r"dir\")),

@@ -175,10 +175,13 @@ so these paths remain available to applications on user sandbox ports.
 
 `POST /files` accepts `multipart/form-data` and `application/octet-stream`
 uploads of up to 256 MiB per request, which the data plane streams to a spool
-file rather than holding in memory. A multipart request may carry at most 1000
-parts. JSON file writes (`{"path": …, "content": …}`, also used when the request
-has no `Content-Type`) are capped at 1 MiB of request body and return `413`
-above that; send larger files as multipart or octet-stream.
+file rather than holding in memory. For multipart, the 256 MiB includes part
+headers and ignored fields. A multipart request may carry at most 1000 parts,
+a boundary of at most 70 characters, at most 64 KiB of headers per part, and
+filenames of at most 4096 bytes. JSON file writes (`{"path": …, "content": …}`,
+also used when the request has no `Content-Type`) are capped at 1 MiB of
+request body and return `413` above that; send larger files as multipart or
+octet-stream.
 
 ## Choose the SPACE API for new integrations
 
