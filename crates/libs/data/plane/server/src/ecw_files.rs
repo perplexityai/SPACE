@@ -321,6 +321,11 @@ pub(super) async fn write_file(
             E2B_FILE_CONTENT_LIMIT_BYTES,
             file_too_large_error,
         )?;
+        // A query path names the destination, so check it before reading the
+        // body rather than after spooling the upload.
+        if let Some(path) = &query.path {
+            e2b_request_root(path, user.as_ref())?;
+        }
         let boundary = multipart_boundary(content_type).ok_or_else(|| {
             EcwProxyError::bad_request(
                 "multipart/form-data boundary of 1 to 70 characters is required",
@@ -776,10 +781,12 @@ async fn spaced_write_spooled(
 }
 
 /// Runs the write call until it finishes or `spooled_write_requests` reports
-/// a spool read failure. On a read failure the call is dropped, which resets
-/// the request stream rather than ending it, and the HTTP request fails. The
-/// guest may still keep the bytes it already wrote (it writes the target in
-/// place); this only stops the request from reporting success.
+/// a spool read failure. On a read failure the call is dropped and the HTTP
+/// request fails, instead of the stream ending cleanly, which would make the
+/// guest finalize the prefix as a complete write. A dropped call still doesn't
+/// guarantee the guest discards that prefix: it writes the target in place,
+/// and the sandbox manager can end the guest's input cleanly once its own
+/// request stream fails.
 async fn fail_on_spool_read_failure<W>(
     write: W,
     read_failure: tokio::sync::oneshot::Receiver<()>,

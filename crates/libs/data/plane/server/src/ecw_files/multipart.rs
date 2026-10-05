@@ -122,13 +122,13 @@ pub(super) async fn spool_multipart_uploads_with_limit(
             .filter(|filename| filenames_name_paths && is_file && !filename.is_empty());
         // The filename becomes a guest path later; reject an impossible one
         // before holding it and spooling its part.
-        if filename
-            .as_ref()
-            .is_some_and(|filename| filename.len() > MAX_GUEST_PATH_BYTES)
-        {
-            return Err(EcwProxyError::bad_request(format!(
-                "multipart filename exceeds {MAX_GUEST_PATH_BYTES} bytes"
-            )));
+        if let Some(filename) = &filename {
+            if filename.len() > MAX_GUEST_PATH_BYTES {
+                return Err(EcwProxyError::bad_request(format!(
+                    "multipart filename exceeds {MAX_GUEST_PATH_BYTES} bytes"
+                )));
+            }
+            e2b_request_root(filename, None)?;
         }
         // Both are known from the part headers, so reject before spooling.
         if is_file && filenames_name_paths && filename.is_none() {
@@ -191,7 +191,8 @@ impl ContentDispositionE2b {
     /// Only `name` and `filename` are read; other parameters are skipped
     /// without validation. A header with unbalanced quotes is rejected, and so
     /// is a `name` or `filename` that has a quote inside an unquoted value,
-    /// appears twice, or isn't UTF-8.
+    /// text after its closing quote, more than one quoted segment, a second
+    /// occurrence, or a non-UTF-8 value.
     pub(super) fn parse(headers: &HeaderMap) -> Result<Self, EcwProxyError> {
         let value = headers
             .get(header::CONTENT_DISPOSITION)

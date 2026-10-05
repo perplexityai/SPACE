@@ -1019,11 +1019,30 @@ async fn write_completes_when_the_spool_was_read_to_the_end() {
     let (read_failed, read_failure) = tokio::sync::oneshot::channel::<()>();
     // The stream finished, so its sender is gone.
     drop(read_failed);
-    let write = std::future::ready(Ok(tonic::Response::new(spaced_ops::WriteResponse {
-        bytes_written: 11,
-    })));
+    // Pending on its first poll, so the read-failure arm is always polled
+    // while the call is still running, whichever order `select!` picks.
+    let write = async {
+        tokio::task::yield_now().await;
+        Ok(tonic::Response::new(spaced_ops::WriteResponse {
+            bytes_written: 11,
+        }))
+    };
     let response = fail_on_spool_read_failure(write, read_failure)
         .await
         .unwrap_or_else(|_| panic!("a complete read must not fail the write"));
     assert_eq!(response.bytes_written, 11);
+}
+
+#[tokio::test]
+async fn invalid_multipart_filename_is_rejected_before_spooling() {
+    let dir = tempfile::tempdir().unwrap();
+    for filename in ["C:\\Users\\a.txt", "a\u{7}b.txt"] {
+        let body = multipart_body(&[("file", Some(filename), b"content")]);
+        let mut spool = SpoolFiles::in_dir(dir.path().to_path_buf());
+        let error = spool_multipart_uploads(Body::from(body), MULTIPART_BOUNDARY, true, &mut spool)
+            .await
+            .unwrap_err();
+        assert_eq!(error.status, StatusCode::BAD_REQUEST, "{filename:?}");
+        assert_eq!(spool_dir_entries(dir.path()).await, 0, "{filename:?}");
+    }
 }
