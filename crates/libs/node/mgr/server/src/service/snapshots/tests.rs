@@ -268,3 +268,29 @@ async fn detached_capture_finishes_its_cleanup_after_the_caller_cancels() {
         "a cancelled caller left a mount owned by no one"
     );
 }
+
+// A Firecracker API that accepts the connection and never answers fails the
+// pause or resume at its deadline instead of holding the VM gate forever.
+#[tokio::test]
+async fn a_firecracker_that_never_answers_fails_a_pause_state_change_at_its_deadline() {
+    let directory = tempfile::tempdir().unwrap();
+    let socket = directory.path().join("firecracker.sock");
+    let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+    let silent = tokio::spawn(async move {
+        let (connection, _) = listener.accept().await.unwrap();
+        // Hold the connection open without answering.
+        std::future::pending::<()>().await;
+        drop(connection);
+    });
+    let client = crate::fc_api::FcApiClient::new(&socket);
+    for paused in [false, true] {
+        let started = std::time::Instant::now();
+        let error =
+            super::set_firecracker_paused(&client, paused, std::time::Duration::from_millis(200))
+                .await
+                .expect_err("a silent Firecracker fails the change");
+        assert_eq!(error.code(), tonic::Code::DeadlineExceeded, "{paused}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+    silent.abort();
+}

@@ -18,6 +18,7 @@ fn work(conn: &rusqlite::Connection, kill: bool) -> (JobId, CleanupWork) {
         completion: CleanupCompletion::DeleteRow,
         keep_filesystem: false,
         immediate_kill: kill,
+        guest_flush: crate::db::cleanup_jobs::GuestFlush::Unrequested,
         published_artifact: None,
     };
     let tx = conn.unchecked_transaction().unwrap();
@@ -79,6 +80,7 @@ async fn burst_is_bounded_fair_coalesced_and_independent_of_waiter_cancellation(
             context: "duplicate cleanup hint",
             completion: CleanupCompletion::DeleteRow,
             immediate_kill: original.immediate_kill,
+            guest_flush: crate::db::cleanup_jobs::GuestFlush::Unrequested,
             persist_intent: false,
             cleanup_id: None,
         });
@@ -254,6 +256,7 @@ async fn lifecycle_and_job_completion_commit_together_and_recover(
         completion,
         keep_filesystem: completion != CleanupCompletion::DeleteRow,
         immediate_kill: false,
+        guest_flush: crate::db::cleanup_jobs::GuestFlush::Unrequested,
         published_artifact: None,
     };
     let before = crate::db::get_sandbox(&conn, &subject)

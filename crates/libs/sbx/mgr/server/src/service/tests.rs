@@ -6691,6 +6691,7 @@ pub(crate) mod service_tests {
                     completion: CleanupCompletion::DeleteRow,
                     published_artifact: None,
                     immediate_kill: false,
+                    guest_flush: crate::db::cleanup_jobs::GuestFlush::Unrequested,
                 },
                 &admission,
                 || async {
@@ -9972,6 +9973,7 @@ pub(crate) mod service_tests {
                         completion: CleanupCompletion::MarkStopped,
                         published_artifact: None,
                         immediate_kill: false,
+                        guest_flush: crate::db::cleanup_jobs::GuestFlush::Unrequested,
                     },
                     Some(admission),
                     None,
@@ -10460,6 +10462,7 @@ pub(crate) mod service_tests {
                     completion: CleanupCompletion::MarkStopped,
                     published_artifact: None,
                     immediate_kill: true,
+                    guest_flush: crate::db::cleanup_jobs::GuestFlush::Unrequested,
                 },
                 &admission,
                 || async {
@@ -13305,6 +13308,7 @@ pub(crate) mod service_tests {
             context: "dependency drain recovery test cleanup failed",
             completion: CleanupCompletion::DeleteRow,
             immediate_kill: false,
+            guest_flush: crate::db::cleanup_jobs::GuestFlush::Unrequested,
             persist_intent: false,
             cleanup_id: None,
         });
@@ -18059,6 +18063,7 @@ pub(crate) mod service_tests {
                     completion: CleanupCompletion::MarkSuspended,
                     published_artifact: None,
                     immediate_kill: true,
+                    guest_flush: crate::db::cleanup_jobs::GuestFlush::Unrequested,
                 },
                 None,
                 Some(episode.id),

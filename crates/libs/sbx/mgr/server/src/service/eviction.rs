@@ -291,6 +291,7 @@ impl SandboxManagerService {
                 completion: CleanupCompletion::DeleteRow,
                 published_artifact: None,
                 immediate_kill: Self::cleanup_immediate_kill(CleanupCompletion::DeleteRow),
+                guest_flush: crate::db::cleanup_jobs::GuestFlush::Unrequested,
             },
             admission,
         )

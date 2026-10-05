@@ -434,7 +434,9 @@ async fn process_tick(
 
     // This flush belongs to the disk-only snapshots below. A full checkpoint
     // scheduled later on the same tick performs its own pre-memory preparation.
-    flush_guest_filesystems_via_spaced_host(sandbox_id).await?;
+    flush_guest_filesystems_via_spaced_host(sandbox_id)
+        .await
+        .map_err(|error| error.to_string())?;
 
     node_client
         .sync_guest(SyncGuestRequest {

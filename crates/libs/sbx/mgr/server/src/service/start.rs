@@ -1177,6 +1177,7 @@ impl SandboxManagerService {
                 completion: CleanupCompletion::MarkSuspended,
                 published_artifact: None,
                 immediate_kill: Self::cleanup_immediate_kill(CleanupCompletion::MarkSuspended),
+                guest_flush: crate::db::cleanup_jobs::GuestFlush::Unrequested,
             };
             if let Some(cleanup_id) = cleanup_id {
                 start_stage(

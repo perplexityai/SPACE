@@ -15,6 +15,7 @@ fn cleanup_job_admission_is_atomic_deduplicated_and_strength_preserving() {
         completion: CleanupCompletion::MarkSuspended,
         keep_filesystem: true,
         immediate_kill: false,
+        guest_flush: GuestFlush::Unrequested,
         published_artifact: Some((LocalArtifactId::new(), "/cache/suspend".to_owned())),
     };
     {
@@ -61,6 +62,113 @@ fn cleanup_job_admission_is_atomic_deduplicated_and_strength_preserving() {
         jobs::get_job(&conn, &id).unwrap().unwrap().status,
         JobStatus::Cancelled.as_str()
     );
+}
+
+// A stop's guest flush outlives a manager restart in its persisted work, a
+// forced stop overrides an ordinary one in either order, and a retry that
+// asks nothing keeps what the pending stop asked for.
+#[test]
+fn a_stops_guest_flush_persists_and_a_forced_stop_overrides_it() {
+    let conn = test_conn();
+    let sandbox_id = SandboxId::new();
+    let stop = |guest_flush, immediate_kill| CleanupWork {
+        version: 1,
+        sandbox_id,
+        uuid8: SandboxRuntimeLabel::from_sandbox_id(sandbox_id),
+        execution_generation: None,
+        cleanup_id: None,
+        completion: CleanupCompletion::MarkStopped,
+        keep_filesystem: true,
+        immediate_kill,
+        guest_flush,
+        published_artifact: None,
+    };
+    let persisted = |id: &JobId| {
+        decode(&jobs::get_job(&conn, id).unwrap().unwrap().payload)
+            .unwrap()
+            .guest_flush
+    };
+    let tx = conn.unchecked_transaction().unwrap();
+    let id = persist(&tx, stop(GuestFlush::BeforeTermination, false)).unwrap();
+    assert_eq!(
+        persist(&tx, stop(GuestFlush::Unrequested, false)).unwrap(),
+        id
+    );
+    tx.commit().unwrap();
+    assert_eq!(persisted(&id), GuestFlush::BeforeTermination);
+
+    let tx = conn.unchecked_transaction().unwrap();
+    assert_eq!(persist(&tx, stop(GuestFlush::Forbidden, true)).unwrap(), id);
+    assert_eq!(
+        persist(&tx, stop(GuestFlush::BeforeTermination, false)).unwrap(),
+        id
+    );
+    tx.commit().unwrap();
+    assert_eq!(persisted(&id), GuestFlush::Forbidden);
+}
+
+// Only a VM known not to be running skips the flush; a state in transition
+// is no proof that one already ran, a paused VM can hold writes that
+// completed after the pause's own flush, and a forced stop stays forced.
+#[test]
+fn a_stops_guest_flush_is_skipped_only_where_no_vm_runs() {
+    for state in [
+        SandboxState::Suspended,
+        SandboxState::Stopped,
+        SandboxState::Created,
+        SandboxState::Creating,
+    ] {
+        assert_eq!(
+            GuestFlush::BeforeTermination.for_superseded_state(Some(state)),
+            GuestFlush::Unrequested,
+            "{state:?}"
+        );
+    }
+    for state in [
+        Some(SandboxState::Started),
+        Some(SandboxState::Paused),
+        Some(SandboxState::Pausing),
+        Some(SandboxState::Resuming),
+        Some(SandboxState::Checkpointing),
+        Some(SandboxState::Suspending),
+        None,
+    ] {
+        assert_eq!(
+            GuestFlush::BeforeTermination.for_superseded_state(state),
+            GuestFlush::BeforeTermination,
+            "{state:?}"
+        );
+    }
+    assert_eq!(
+        GuestFlush::Forbidden.for_superseded_state(Some(SandboxState::Started)),
+        GuestFlush::Forbidden
+    );
+}
+
+// Work persisted before the field existed decodes, and does not flush.
+#[test]
+fn work_persisted_without_a_guest_flush_does_not_flush() {
+    let sandbox_id = SandboxId::new();
+    let mut payload = serde_json::to_value(CleanupWork {
+        version: 1,
+        sandbox_id,
+        uuid8: SandboxRuntimeLabel::from_sandbox_id(sandbox_id),
+        execution_generation: None,
+        cleanup_id: None,
+        completion: CleanupCompletion::MarkStopped,
+        keep_filesystem: true,
+        immediate_kill: false,
+        guest_flush: GuestFlush::BeforeTermination,
+        published_artifact: None,
+    })
+    .unwrap();
+    payload
+        .as_object_mut()
+        .unwrap()
+        .remove("guest_flush")
+        .unwrap();
+    let work = decode(&payload.to_string()).unwrap();
+    assert_eq!(work.guest_flush, GuestFlush::Unrequested);
 }
 
 #[test]

@@ -102,6 +102,13 @@ so a temporary reduction does not permanently prevent raising the quota again.
 
 By default, sandboxes created through the SPACE API suspend after six hours without access or command activity. This is an idle limit, not a maximum lifetime.
 
+A created or overwritten file that can replace its destination is published
+atomically when its writes complete, and persisted at lifecycle boundaries,
+not per write: an acknowledged one is not guaranteed to survive a sandbox
+crash, forced stop or host failure. [Guest file and disk
+I/O](space/design/guest-io.md) describes the guest's disk, its per-sandbox
+limits, the upload and read paths, and what each lifecycle operation persists.
+
 The **E2B Compatibility Wrapper (ECW)** is SPACE's E2B-compatible API surface.
 It translates E2B-compatible requests and responses at the edge and is distinct
 from the SPACE API. The [ECW guide](ecw.md) defines its tested compatibility

@@ -232,12 +232,7 @@ impl NodeManagerService {
             service.check_execution(&sandbox_id, fence.as_ref(), false)?;
             let api_socket = format!("{JAIL_DIR}/firecracker/{sandbox_id}/root/firecracker.sock");
             let client = crate::fc_api::FcApiClient::new(api_socket);
-            if paused {
-                client.pause().await
-            } else {
-                client.resume().await
-            }
-            .map_err(|error| Status::internal(format!("set VM pause state: {error}")))
+            set_firecracker_paused(&client, paused, VM_PAUSE_STATE_TIMEOUT).await
         })
         .await
     }
@@ -1212,6 +1207,35 @@ fn drive_rate_limiter(
         bandwidth: bucket(limit.bandwidth.as_ref(), "bandwidth")?,
         operations: bucket(limit.operations.as_ref(), "operations")?,
     })
+}
+
+/// How long a Firecracker pause or resume may take. Both normally finish in
+/// milliseconds; a VMM that does not answer must not keep the sandbox's VM
+/// gate, which termination also takes, held indefinitely.
+const VM_PAUSE_STATE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Pause or resume the VM behind `client`, failing once `timeout` passes.
+pub(super) async fn set_firecracker_paused(
+    client: &crate::fc_api::FcApiClient,
+    paused: bool,
+    timeout: std::time::Duration,
+) -> Result<(), Status> {
+    let change = async {
+        if paused {
+            client.pause().await
+        } else {
+            client.resume().await
+        }
+    };
+    match tokio::time::timeout(timeout, change).await {
+        Ok(changed) => {
+            changed.map_err(|error| Status::internal(format!("set VM pause state: {error}")))
+        }
+        Err(_) => Err(Status::deadline_exceeded(format!(
+            "Firecracker did not {} the VM within {timeout:?}",
+            if paused { "pause" } else { "resume" }
+        ))),
+    }
 }
 
 #[cfg(test)]

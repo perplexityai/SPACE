@@ -151,6 +151,7 @@ impl SandboxManagerService {
             completion: request.completion,
             keep_filesystem: request.keep_filesystem,
             immediate_kill: request.immediate_kill,
+            guest_flush: request.guest_flush,
             published_artifact: None,
         };
         if !cleanup_jobs::current(&tx, &work).map_err(storage_status)? {
@@ -202,6 +203,7 @@ impl SandboxManagerService {
             completion: request.completion,
             keep_filesystem: request.keep_filesystem,
             immediate_kill: request.immediate_kill,
+            guest_flush: request.guest_flush,
             published_artifact: request.published_artifact,
         };
         let job = self
@@ -517,6 +519,7 @@ impl SandboxManagerService {
                     keep_filesystem: work.keep_filesystem,
                     completion: work.completion,
                     immediate_kill: work.immediate_kill,
+                    guest_flush: work.guest_flush,
                     published_artifact: work.published_artifact,
                     context: "durable sandbox cleanup",
                 };

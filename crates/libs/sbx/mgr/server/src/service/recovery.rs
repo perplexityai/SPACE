@@ -1718,6 +1718,7 @@ impl SandboxManagerService {
             context: "cleanup recovery failed",
             completion: target.completion,
             immediate_kill: Self::cleanup_immediate_kill(target.completion),
+            guest_flush: crate::db::cleanup_jobs::GuestFlush::Unrequested,
             persist_intent: false,
             cleanup_id: target.cleanup_id,
         });

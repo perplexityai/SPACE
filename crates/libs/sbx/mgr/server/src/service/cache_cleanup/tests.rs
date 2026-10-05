@@ -414,6 +414,7 @@ async fn row_cleanup_retires_policy_only_after_identity_is_deleted() {
                     completion,
                     published_artifact: None,
                     immediate_kill: false,
+                    guest_flush: crate::db::cleanup_jobs::GuestFlush::Unrequested,
                 },
                 None,
                 cleanup_id,
