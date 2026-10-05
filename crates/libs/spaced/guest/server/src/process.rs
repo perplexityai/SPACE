@@ -798,7 +798,10 @@ impl ProcessSignalHandle {
                 nix::sys::signal::Signal::try_from(signal.as_i32())
                     .map_err(|_| Status::invalid_argument("invalid signal"))?,
             )
-            .map_err(|error| Status::internal(error.to_string()))
+            .map_err(|error| match error {
+                nix::errno::Errno::ESRCH => Status::not_found("process not found"),
+                error => Status::internal(error.to_string()),
+            })
         }
     }
 
@@ -2018,8 +2021,14 @@ impl Process for SpacedGuestService {
             .processes
             .get_running(&process_id)
             .ok_or_else(|| Status::not_found("process not found"))?;
-        handle.signal_handle.signal(signal)?;
-        if signal.as_i32() == libc::SIGKILL {
+        let kill = signal.as_i32() == libc::SIGKILL;
+        match handle.signal_handle.signal(signal) {
+            Ok(()) => {}
+            // The leader can be reaped while buffered output still awaits its reader.
+            Err(error) if kill && error.code() == tonic::Code::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        if kill {
             handle.journal.release_backpressure();
         }
         tracing::debug!(

@@ -558,6 +558,85 @@ async fn attached_output_backpressures_and_disconnect_releases_the_producer() {
     }
 }
 
+#[tokio::test]
+async fn kill_reaped_process_releases_stalled_output_and_capacity() {
+    let service = cancellation_service();
+    let mut stream = Process::start(
+        &service,
+        Request::new(StartRequest {
+            command: vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "read line; printf '%8192s' x".into(),
+            ],
+            idempotency_key: Some("kill-reaped".into()),
+            stdin: true,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap()
+    .into_inner();
+    let started = stream.next().await.unwrap().unwrap();
+    let process_id = ProcessId::parse(started.process_id.clone()).unwrap();
+    let record = service.inner.processes.get_running(&process_id).unwrap();
+    // Fill the attached reader's journal before letting the child write and exit.
+    let event = process_stdout_event(&process_id, Some(record.info.pid), vec![0; 8192]);
+    while record.journal.try_append_output(event.clone()).is_none() {}
+    record.write_stdin(b"exit\n").await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let gone =
+                nix::sys::signal::kill(nix::unistd::Pid::from_raw(record.info.pid as i32), None)
+                    == Err(nix::errno::Errno::ESRCH);
+            if gone && record.journal.blocked_readers.load(Ordering::Relaxed) > 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("leader must be reaped while output remains blocked");
+    let missing = Process::send_signal(
+        &service,
+        Request::new(SendSignalRequest {
+            process_id: started.process_id.clone(),
+            signal: libc::SIGTERM,
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(missing.code(), tonic::Code::NotFound);
+    assert!(!record.journal.is_completed());
+    let result = Process::send_signal(
+        &service,
+        Request::new(SendSignalRequest {
+            process_id: started.process_id,
+            signal: libc::SIGKILL,
+        }),
+    )
+    .await;
+    let completed = tokio::time::timeout(Duration::from_secs(2), async {
+        while !service.inner.processes.list().is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    // Clean up even on the unfixed implementation, without releasing the reader first.
+    service.inner.shutdown.cancel();
+    service.inner.process_tasks.close();
+    service.inner.process_tasks.wait().await;
+    result.expect("kill of an exited leader must release output");
+    completed.expect("stalled reader must not prevent process cleanup");
+    drop(record);
+    service.inner.processes.records.remove(&process_id);
+    assert_eq!(
+        service.inner.processes.record_slots.available_permits(),
+        PROCESS_RECORD_LIMIT
+    );
+    drop(stream);
+}
+
 #[test]
 fn process_journal_drops_oversized_chunk_without_panicking() {
     let journal = ProcessEventJournal::new(output_slots());
