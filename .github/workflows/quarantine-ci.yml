@@ -15,8 +15,8 @@ jobs:
     timeout-minutes: 5
     # This check fails visibly but required aggregate gates never depend on it.
     # A failed inventory must say unknown, never zero. The job fails on its own
-    # without failing the Pull, merge-queue and Main CI runs that call this
-    # workflow: their callers cannot set continue-on-error, so it is set here.
+    # without failing the Pull CI run that calls this workflow: its caller
+    # cannot set continue-on-error, so it is set here.
     continue-on-error: true
     permissions:
       contents: read
