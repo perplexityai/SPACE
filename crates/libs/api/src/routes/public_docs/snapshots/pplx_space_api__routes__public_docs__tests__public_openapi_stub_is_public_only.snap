@@ -9,14 +9,6 @@ expression: paths_by_method
   "/credential-references/{credential_reference_id}": [
     "delete"
   ],
-  "/credentials": [
-    "get",
-    "post"
-  ],
-  "/credentials/{credential_id}": [
-    "delete",
-    "put"
-  ],
   "/operations/{operation_id}": [
     "get"
   ],

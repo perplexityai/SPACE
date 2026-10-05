@@ -1136,48 +1136,6 @@ pub struct TemplateFilters {
     pub org_id: Option<OrgId>,
 }
 
-/// The plaintext shape sealed into a credential row by credmgr `Encrypt`:
-/// one JSON document carrying the secret value and its injection rules,
-/// encrypted as a single blob under one per-row DEK.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct CredentialDocument {
-    pub value: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub injection_rules: Option<serde_json::Value>,
-}
-
-/// What the credentials API returns. The API is write-only for secret
-/// material: ciphertext never leaves the database through these routes,
-/// and plaintext exists only inside credmgr.
-#[derive(Debug, Clone, FromRow, Serialize)]
-pub struct CredentialMetadata {
-    pub id: Uuid,
-    pub key: String,
-    #[serde(with = "time::serde::rfc3339")]
-    pub created_at: OffsetDateTime,
-    #[serde(with = "time::serde::rfc3339")]
-    pub updated_at: OffsetDateTime,
-}
-
-/// Create request: plaintext in. The handler seals it via credmgr
-/// `Encrypt` (asserting only the owner's org/user identity — no key
-/// naming) and stores the sealed document plus the self-describing
-/// wrapped DEK.
-#[derive(Debug, Deserialize)]
-pub struct CreateCredentialRequest {
-    pub key: String,
-    pub value: String,
-    #[serde(default)]
-    pub injection_rules: Option<serde_json::Value>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct UpdateCredentialRequest {
-    pub value: String,
-    #[serde(default)]
-    pub injection_rules: Option<serde_json::Value>,
-}
-
 /// Merged credential for the internal sandbox route (user overrides org).
 /// Carries the sealed document and wrapped DEK plus the identity needed to
 /// decrypt it: `user_id` is the owning user for user-scoped rows and

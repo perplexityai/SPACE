@@ -8,7 +8,7 @@ use axum::{
 use pplx_space_public_api::routes::{self as native, NativeHttpMethod, NativeOperation};
 use std::collections::BTreeSet;
 
-use super::{AppState, credentials};
+use super::AppState;
 use crate::middleware::auth::require_native_auth;
 
 mod credential_references;
@@ -83,19 +83,6 @@ fn mounted_operations() -> Vec<(NativeOperation, MethodRouter<AppState>)> {
         ),
         mount(native::LIST_TEMPLATES, templates::list_templates),
         mount(native::GET_TEMPLATE, templates::get_template),
-        mount(native::LIST_CREDENTIALS, credentials::list_user_credentials),
-        mount(
-            native::CREATE_CREDENTIAL,
-            credentials::create_user_credential,
-        ),
-        mount(
-            native::UPDATE_CREDENTIAL,
-            credentials::update_user_credential,
-        ),
-        mount(
-            native::DELETE_CREDENTIAL,
-            credentials::delete_user_credential,
-        ),
         mount(native::CREATE_SANDBOX, sandboxes::create_sandbox),
         mount(native::LIST_SANDBOXES, sandboxes::list_sandboxes),
         mount(native::GET_SANDBOX, sandboxes::get_sandbox),

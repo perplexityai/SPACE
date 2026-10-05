@@ -171,16 +171,12 @@ macro_rules! native_operations {
     };
 }
 
-use NativeHttpMethod::{Delete, Get, Patch, Post, Put};
+use NativeHttpMethod::{Delete, Get, Patch, Post};
 use NativeOperationStatus::{Incubating, M1Supported};
 
 native_operations! {
     REGISTER_CREDENTIAL_REFERENCE = NativeOperation::new("/v1/credential-references", Post, "unstableRegisterCredentialReference", Incubating);
     DELETE_CREDENTIAL_REFERENCE = NativeOperation::new("/v1/credential-references/{credential_reference_id}", Delete, "unstableDeleteCredentialReference", Incubating);
-    LIST_CREDENTIALS = NativeOperation::new("/v1/credentials", Get, "listCredentials", Incubating);
-    CREATE_CREDENTIAL = NativeOperation::new("/v1/credentials", Post, "createCredential", Incubating);
-    DELETE_CREDENTIAL = NativeOperation::new("/v1/credentials/{credential_id}", Delete, "deleteCredential", Incubating);
-    UPDATE_CREDENTIAL = NativeOperation::new("/v1/credentials/{credential_id}", Put, "updateCredential", Incubating);
     GET_OPERATION = NativeOperation::new("/v1/operations/{operation_id}", Get, "getOperation", M1Supported);
     LIST_OPERATION_EVENTS = NativeOperation::new("/v1/operations/{operation_id}/events", Get, "listOperationEvents", Incubating);
     LIST_SANDBOXES = NativeOperation::new("/v1/sandboxes", Get, "listSandboxes", M1Supported);

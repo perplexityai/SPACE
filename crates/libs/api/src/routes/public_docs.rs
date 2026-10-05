@@ -365,7 +365,6 @@ fn public_openapi_value() -> Value {
     insert_snapshot_paths(paths);
     insert_port_paths(paths, &idempotency_key_parameter);
     insert_file_mutation_paths(paths, &idempotency_key_parameter);
-    insert_credential_paths(paths);
     insert_path_parameters(&mut spec);
     complete_control_plane_responses(&mut spec);
     add_generator_safe_enum_names(&mut spec);
@@ -442,47 +441,6 @@ pub(crate) fn m1_sdk_openapi_value() -> Value {
         });
     retain_referenced_schemas(&mut spec);
     spec
-}
-
-fn insert_credential_paths(paths: &mut Map<String, Value>) {
-    paths.insert(
-        "/credentials".to_string(),
-        json!({
-            "get": {
-                "summary": "List credentials owned by the current user",
-                "responses": {
-                    "200": { "description": "Credential metadata list" }
-                }
-            },
-            "post": {
-                "summary": "Create a sealed current-user credential",
-                "responses": {
-                    "201": { "description": "Credential metadata" },
-                    "400": { "description": "Invalid credential request" },
-                    "409": { "description": "Credential name conflict" }
-                }
-            }
-        }),
-    );
-    paths.insert(
-        "/credentials/{credential_id}".to_string(),
-        json!({
-            "put": {
-                "summary": "Replace a sealed current-user credential",
-                "responses": {
-                    "200": { "description": "Credential metadata" },
-                    "404": { "description": "Credential not found" }
-                }
-            },
-            "delete": {
-                "summary": "Delete a current-user credential",
-                "responses": {
-                    "204": { "description": "Deleted" },
-                    "404": { "description": "Credential not found" }
-                }
-            }
-        }),
-    );
 }
 
 fn insert_sandbox_extra_paths(paths: &mut Map<String, Value>) {
