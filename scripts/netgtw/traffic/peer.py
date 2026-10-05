@@ -149,6 +149,7 @@ async def serve(args):
     contexts = {}
     for protocol, advertised in (
         ("h2", ["h2"]),
+        ("proxy", ["h2", "http/1.1"]),
         # Put an unsupported protocol first so fallback probes also prove that
         # interception does not advertise guest protocols it cannot bridge.
         ("http/1.1", ["space-unsupported", "http/1.1"]),
@@ -219,7 +220,9 @@ async def serve(args):
                 return
             if port in protocols.TLS_PORTS:
                 context = contexts[
-                    "grpc"
+                    "proxy"
+                    if port == 8445
+                    else "grpc"
                     if port == 50052
                     else "h2"
                     if port == 8443
@@ -254,7 +257,7 @@ async def serve(args):
                     received,
                     request_received,
                     connect_received,
-                    context,
+                    contexts["http/1.1"],
                 )
                 return
             if port in (8080, 8443):

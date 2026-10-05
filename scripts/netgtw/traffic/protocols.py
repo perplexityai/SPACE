@@ -6,6 +6,8 @@ the runner separately checks receipts from the actual destination socket.
 
 import asyncio
 import base64
+import json
+import os
 import socket
 import ssl
 import subprocess
@@ -146,6 +148,24 @@ async def connect_server(
 
 def connect_probe(spec):
     body = payload(spec["nonce"], 0, 96 * 1024)
+    if spec.get("client") == "go":
+        environment = {
+            **os.environ,
+            "HTTPS_PROXY": f"https://traffic:proxy-token@{spec['host']}:{spec['port']}",
+            "NO_PROXY": "",
+        }
+        for name in ("https_proxy", "http_proxy", "all_proxy", "no_proxy"):
+            environment.pop(name, None)
+        result = subprocess.run(
+            [Path(__file__).resolve().parents[3] / "target/gateway-traffic/go-connect"],
+            input=json.dumps({**spec, "body": base64.b64encode(body).decode()}),
+            text=True,
+            capture_output=True,
+            env=environment,
+            timeout=spec["timeout"] + 1,
+            check=True,
+        )
+        return json.loads(result.stdout)
     command = [
         "curl",
         "--silent",

@@ -54,10 +54,7 @@ pub(crate) enum TlsTransportError {
     Upstream(#[source] io::Error),
     #[error("HTTP connection failed")]
     Http(#[from] hyper::Error),
-    /// The guest completed TLS and then sent no HTTP bytes within the header
-    /// timeout. Equivalent to hyper's h1 header read timeout, which cannot
-    /// start until the HTTP version has been detected from the first bytes.
-    #[error("guest sent no HTTP bytes within the header timeout")]
+    #[error("guest did not complete initial HTTP headers within the deadline")]
     HeaderTimeout,
 }
 

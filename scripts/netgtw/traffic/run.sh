@@ -62,7 +62,7 @@ done
 # Fail schema errors and empty selections before spending time on a build.
 python3 "$SCRIPT_DIR/run.py" --list "$@"
 
-for tool in cargo python3 uv openssl ip nft sysctl unshare mount timeout; do
+for tool in cargo go python3 uv openssl ip nft sysctl unshare mount timeout; do
   command -v "$tool" >/dev/null || { echo "Missing dependency: $tool" >&2; exit 1; }
 done
 cd "$REPO_ROOT"
@@ -73,6 +73,8 @@ if [[ ! -x $environment/bin/python ]]; then
   "$uv_bin" venv --python python3 "$environment"
 fi
 "$uv_bin" pip sync --python "$environment/bin/python" "$SCRIPT_DIR/requirements.txt"
+# Standard-library-only client; build before entering the isolated network.
+GOTOOLCHAIN=local go build -o "$REPO_ROOT/target/gateway-traffic/go-connect" "$SCRIPT_DIR/go-connect.go"
 # Match the other Rust jobs' cache normalization across Buildkite checkouts.
 export SCCACHE_BASEDIRS="${SCCACHE_BASEDIRS:-$REPO_ROOT}"
 target_dir=${CARGO_TARGET_DIR:-$REPO_ROOT/target}

@@ -35,7 +35,7 @@ mod leg;
 mod upgrade;
 
 type Body = Either<ForwardingBody, Empty<Bytes>>;
-const HEADER_TIMEOUT: Duration = Duration::from_secs(10);
+const HEADER_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_HEADERS: usize = 128;
 const MAX_HEADER_BYTES: u32 = 32 * 1024;
 const MAX_STREAMS: u32 = 32;
@@ -141,9 +141,7 @@ impl HttpBody for ForwardingBody {
 }
 
 struct Session<F> {
-    /// Protocol of the first request hyper parsed from the guest. Recorded
-    /// once for telemetry; every forwarding decision uses the version of the
-    /// request it is handling instead.
+    /// First parsed request; also marks completion of the initial header wait.
     served: OnceLock<HttpProtocol>,
     binding: HostBinding,
     lease: Arc<CertificateLease>,
@@ -164,8 +162,9 @@ struct Session<F> {
 /// an HTTP/1.1 `CONNECT`; parsing that as h2 would answer the CONNECT with a
 /// SETTINGS frame and a `PROTOCOL_ERROR` GOAWAY.
 ///
-/// `connect` receives the detected guest protocol so the origin leg can be
-/// negotiated to match what the guest actually speaks.
+/// The guest has 30 seconds to send its first complete request headers, including
+/// protocol detection. Request bodies and responses may outlive this deadline.
+/// `connect` lazily opens the origin with the detected guest protocol.
 pub(super) async fn serve<C, F, Fut, U>(
     guest: C,
     negotiated: HttpProtocol,
@@ -206,14 +205,22 @@ where
         }
     });
     let builder = guest_http_builder();
-    let connection = builder
-        .serve_connection_with_upgrades(TokioIo::new(FirstByteDeadline::new(guest)), service);
+    let connection = builder.serve_connection_with_upgrades(TokioIo::new(guest), service);
     tokio::pin!(connection);
+    // The auto detector has no timer. Keep the initial deadline through complete
+    // headers so a partial HTTP/2 preface cannot escape it.
+    let initial_request_timeout = async {
+        tokio::time::sleep(HEADER_TIMEOUT).await;
+        if session.served.get().is_some() {
+            std::future::pending::<()>().await;
+        }
+    };
     let result = tokio::select! {
-        result = &mut connection => result,
+        () = initial_request_timeout => Err(TlsTransportError::HeaderTimeout),
+        result = &mut connection => result.map_err(guest_connection_error),
         () = session.draining.cancelled() => {
             connection.as_mut().graceful_shutdown();
-            connection.await
+            connection.await.map_err(guest_connection_error)
         }
     };
     session.upgrades.close();
@@ -221,13 +228,9 @@ where
     session.shutdown.cancel();
     session.tasks.close();
     session.tasks.wait().await;
-    result.map_err(guest_connection_error)
+    result
 }
 
-/// One server for both HTTP versions. hyper-util's `auto` builder reads the
-/// guest's first bytes, compares them with the fixed HTTP/2 connection
-/// preface and hands the stream, bytes replayed, to the matching hyper server.
-/// The h1 and h2 limits are the ones the two dedicated builders used before.
 fn guest_http_builder() -> auto::Builder<TokioExecutor> {
     let mut builder = auto::Builder::new(TokioExecutor::new());
     builder
@@ -245,7 +248,7 @@ fn guest_http_builder() -> auto::Builder<TokioExecutor> {
         .initial_stream_window_size(GUEST_H2_STREAM_WINDOW)
         .initial_connection_window_size(GUEST_H2_CONNECTION_WINDOW)
         .keep_alive_interval(Some(Duration::from_secs(30)))
-        .keep_alive_timeout(HEADER_TIMEOUT);
+        .keep_alive_timeout(Duration::from_secs(10));
     builder
 }
 
@@ -255,9 +258,6 @@ fn guest_connection_error(error: Box<dyn std::error::Error + Send + Sync>) -> Tl
     match error.downcast::<hyper::Error>() {
         Ok(error) => TlsTransportError::Http(*error),
         Err(error) => match error.downcast::<io::Error>() {
-            Ok(error) if error.kind() == io::ErrorKind::TimedOut => {
-                TlsTransportError::HeaderTimeout
-            }
             Ok(error) => TlsTransportError::Downstream(*error),
             // `auto` only surfaces the two error types above.
             Err(error) => TlsTransportError::Downstream(io::Error::other(error)),
@@ -403,88 +403,6 @@ where
                 "inspected HTTP request refused"
             );
         }
-    }
-}
-
-/// Bounds the wait for a guest's first HTTP byte.
-///
-/// hyper's h1 server enforces `header_read_timeout` only once it owns the
-/// stream, and the `auto` version sniff that precedes it has no timer, so a
-/// guest that finishes TLS and then sends nothing would otherwise hold the
-/// session until the lease is invalidated. The deadline is armed when the
-/// stream is created and disarmed by the first byte read; after that hyper's
-/// own h1 header and h2 keep-alive timers apply unchanged.
-struct FirstByteDeadline<T> {
-    inner: T,
-    deadline: Option<Pin<Box<tokio::time::Sleep>>>,
-}
-
-impl<T> FirstByteDeadline<T> {
-    fn new(inner: T) -> Self {
-        Self {
-            inner,
-            deadline: Some(Box::pin(tokio::time::sleep(HEADER_TIMEOUT))),
-        }
-    }
-}
-
-impl<T: AsyncRead + Unpin> AsyncRead for FirstByteDeadline<T> {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        let filled = buf.filled().len();
-        let result = Pin::new(&mut self.inner).poll_read(cx, buf);
-        let Some(deadline) = self.deadline.as_mut() else {
-            return result;
-        };
-        match &result {
-            // The first byte disarms the deadline. An EOF before any byte is
-            // a plain client close; hyper's h1 server reports it as today.
-            Poll::Ready(Ok(())) if buf.filled().len() > filled => self.deadline = None,
-            Poll::Ready(Ok(()) | Err(_)) => {}
-            Poll::Pending => {
-                if deadline.as_mut().poll(cx).is_ready() {
-                    self.deadline = None;
-                    return Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        "guest sent no HTTP bytes within the header timeout",
-                    )));
-                }
-            }
-        }
-        result
-    }
-}
-
-impl<T: AsyncWrite + Unpin> AsyncWrite for FirstByteDeadline<T> {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.inner).poll_write(cx, buf)
-    }
-
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.inner).poll_flush(cx)
-    }
-
-    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.inner).poll_shutdown(cx)
-    }
-
-    fn is_write_vectored(&self) -> bool {
-        self.inner.is_write_vectored()
-    }
-
-    fn poll_write_vectored(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        bufs: &[io::IoSlice<'_>],
-    ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.inner).poll_write_vectored(cx, bufs)
     }
 }
 

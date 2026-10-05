@@ -10,7 +10,7 @@ bash scripts/netgtw/traffic/run.sh
 The command installs the pinned peer libraries with `uv`, builds the gateway and
 its control fixture, then requests `sudo` on a devbox. It needs Linux, Python
 3.11+, a preinstalled `uv`, OpenSSL, `iproute2`, `nftables`, `procps`, `mount`,
-and `util-linux`, plus the repository's Rust/protobuf build tools. The SPACE devbox
+`util-linux`, and Go, plus the repository's Rust/protobuf build tools. The SPACE devbox
 and Buildkite command image supply these dependencies. The CI image pins and verifies its `uv`
 binary. The launcher requires `uv` on `PATH` and fails if it is missing; tool
 installation belongs to the CI image or developer setup.

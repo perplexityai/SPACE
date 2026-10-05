@@ -216,6 +216,7 @@ def load_cases(directory, pattern):
                         "tunnel_authority",
                         "tunnel_method",
                         "proxy_anyauth",
+                        "client",
                         "expect",
                         "http_status",
                         "token",
@@ -230,6 +231,16 @@ def load_cases(directory, pattern):
                 )
                 kind = probe.get("kind")
                 require(kind in PORTS, f"{name}: unknown kind {kind}")
+                if "client" in probe:
+                    require(
+                        kind == "connect"
+                        and probe["client"] == "go"
+                        and not any(
+                            field in probe
+                            for field in ("proxy_anyauth", "tunnel_authority", "tunnel_method")
+                        ),
+                        f"{name}: client=go requires an unmodified CONNECT probe",
+                    )
                 if "proxy_anyauth" in probe:
                     require(
                         kind == "connect" and type(probe["proxy_anyauth"]) is bool,
@@ -250,7 +261,10 @@ def load_cases(directory, pattern):
                 for field in ("downstream_alpn", "upstream_alpn"):
                     if field in probe:
                         require(
-                            kind == "tls"
+                            (
+                                kind == "tls"
+                                or (kind == "connect" and probe.get("client") == "go")
+                            )
                             and probe[field] in ("h2", "http/1.1"),
                             f"{name}: {field} requires a supported TLS protocol",
                         )
@@ -567,9 +581,10 @@ def assert_result(spec, result, events):
             f"payload was not delivered in both directions: {result}",
         )
         if "downstream_alpn" in spec:
+            negotiated = result.get("downstream_alpn", result.get("protocol"))
             require(
-                result.get("protocol") == spec["downstream_alpn"],
-                f"downstream selected {result.get('protocol')}; wanted {spec['downstream_alpn']}",
+                negotiated == spec["downstream_alpn"],
+                f"downstream selected {negotiated}; wanted {spec['downstream_alpn']}",
             )
         if "upstream_alpn" in spec:
             negotiated = [

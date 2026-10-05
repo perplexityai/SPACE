@@ -392,7 +392,7 @@ async fn credential_refusal_before_origin(
     result
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn concurrent_http2_streams_keep_credential_decisions_request_local() {
     use http_body_util::Full;
 
@@ -428,6 +428,9 @@ async fn concurrent_http2_streams_keep_credential_decisions_request_local() {
                         ))
                         .await
                         .unwrap();
+                    // Complete headers release the initial deadline even while
+                    // concurrent responses are still pending.
+                    tokio::time::sleep(Duration::from_secs(31)).await;
                     Ok::<_, Infallible>(Response::new(Full::new(Bytes::from_static(b"ok"))))
                 }
             }),
@@ -439,7 +442,10 @@ async fn concurrent_http2_streams_keep_credential_decisions_request_local() {
         HttpProtocol::Http2,
         binding,
         lease,
-        move |_| async move { Ok((origin, HttpProtocol::Http2)) },
+        move |protocol| async move {
+            assert_eq!(protocol, HttpProtocol::Http2);
+            Ok((origin, HttpProtocol::Http2))
+        },
     ));
     let (sender, connection) = http2::handshake(TokioExecutor::new(), TokioIo::new(guest_peer))
         .await
@@ -916,8 +922,8 @@ fn upgrades_require_a_valid_websocket_handshake() {
     assert!(upgrade::Handshake::request(&request.try_into().unwrap()).is_err());
 }
 
-#[tokio::test]
-async fn connect_relays_private_ca_tls_without_inspecting_the_inner_request() {
+#[tokio::test(start_paused = true)]
+async fn connect_over_h2_alpn_relays_private_ca_tls_without_inspecting_the_inner_request() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let (binding, lease, _) = fixture().await;
     // A second issuer is trusted only by the guest's inner TLS client.
@@ -950,6 +956,8 @@ async fn connect_relays_private_ca_tls_without_inspecting_the_inner_request() {
                 .collect::<Vec<_>>(),
             ["fastly-key: fixture-token"]
         );
+        // Waiting for the response may outlive the initial header deadline.
+        tokio::time::sleep(Duration::from_secs(31)).await;
         proxy
             .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
             .await
@@ -967,15 +975,20 @@ async fn connect_relays_private_ca_tls_without_inspecting_the_inner_request() {
     let (guest, guest_peer) = tokio::io::duplex(128);
     let gateway = tokio::spawn(serve(
         guest,
-        HttpProtocol::Http1,
+        // Go offers h2 to an HTTPS proxy, then sends an HTTP/1.1 CONNECT.
+        HttpProtocol::Http2,
         binding,
         lease,
-        move |_| async move { Ok((origin, HttpProtocol::Http1)) },
+        move |protocol| async move {
+            assert_eq!(protocol, HttpProtocol::Http1);
+            Ok((origin, HttpProtocol::Http1))
+        },
     ));
+    tokio::time::sleep(Duration::from_secs(20)).await;
     let (mut sender, connection) = http1::handshake(TokioIo::new(guest_peer)).await.unwrap();
     let client = tokio::spawn(connection.with_upgrades());
     let mut phase = "CONNECT response";
-    let completed = tokio::time::timeout(Duration::from_secs(2), async {
+    let completed = tokio::time::timeout(Duration::from_secs(60), async {
         let request = Request::builder()
             .method("CONNECT")
             .uri("allowed.test:443")
@@ -1149,162 +1162,37 @@ async fn guest_http2_still_rejects_tiny_frame_floods() {
     assert!(!small_frame_upload(1, 1_000_000, Duration::from_secs(2)).await);
 }
 
-/// Go's `net/http` offers `h2` to an `https://` forward proxy and then writes
-/// an HTTP/1.1 `CONNECT` as its first bytes. The gateway must serve the
-/// session as HTTP/1.1 regardless of the ALPN result, and must negotiate the
-/// origin leg as HTTP/1.1 so the CONNECT can be tunnelled.
-#[tokio::test]
-async fn go_style_connect_on_h2_negotiated_session_is_served_as_http1_and_origin_offered_http1() {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let (binding, lease, _) = fixture().await;
-    let (origin, mut proxy) = tokio::io::duplex(4096);
-    let upstream = tokio::spawn(async move {
-        let mut headers = Vec::new();
-        while !headers.ends_with(b"\r\n\r\n") {
-            // The origin leg is never opened when the guest side fails; let
-            // the guest-side assertion report that.
-            let Ok(byte) = proxy.read_u8().await else {
-                return;
-            };
-            headers.push(byte);
-        }
-        let headers = String::from_utf8(headers).unwrap();
-        assert!(
-            headers.starts_with("CONNECT allowed.test:443 HTTP/1.1\r\n"),
-            "origin saw {headers:?}"
-        );
-        assert!(headers.contains("proxy-authorization: Basic eDp5\r\n"));
-        proxy
-            .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
-            .await
-            .unwrap();
-        let mut tunnelled = [0; 4];
-        proxy.read_exact(&mut tunnelled).await.unwrap();
-        proxy.write_all(&tunnelled).await.unwrap();
-        proxy.flush().await.unwrap();
-    });
-    let offered = Arc::new(std::sync::Mutex::new(None));
-    let observed = offered.clone();
-    let (guest, mut guest_peer) = tokio::io::duplex(4096);
-    // ALPN selected h2; the guest speaks HTTP/1.1 anyway.
-    let gateway = tokio::spawn(serve(
-        guest,
-        HttpProtocol::Http2,
-        binding,
-        lease,
-        move |guest_protocol| async move {
-            *observed.lock().unwrap() = Some(guest_protocol);
-            Ok((origin, HttpProtocol::Http1))
-        },
-    ));
-    let completed = tokio::time::timeout(Duration::from_secs(5), async {
-        guest_peer
-            .write_all(
-                b"CONNECT allowed.test:443 HTTP/1.1\r\n\
-                  Host: allowed.test:443\r\n\
-                  Proxy-Authorization: Basic eDp5\r\n\r\n",
-            )
-            .await
-            .unwrap();
-        // Read until the end of the response head or until the gateway
-        // closes. An h2 server answers with a SETTINGS frame and a GOAWAY,
-        // which never contain a blank line.
-        let mut response = Vec::new();
-        let mut chunk = [0; 256];
-        while !response.ends_with(b"\r\n\r\n") {
-            match guest_peer.read(&mut chunk).await.unwrap() {
-                0 => break,
-                read => response.extend_from_slice(&chunk[..read]),
-            }
-        }
-        assert!(
-            response.starts_with(b"HTTP/1.1 200"),
-            "guest received {response:?}"
-        );
-        guest_peer.write_all(b"ping").await.unwrap();
-        let mut echoed = [0; 4];
-        guest_peer.read_exact(&mut echoed).await.unwrap();
-        assert_eq!(&echoed, b"ping");
-        upstream.await.unwrap();
-    })
-    .await;
-    assert!(
-        completed.is_ok(),
-        "CONNECT over a h2-negotiated session stalled"
-    );
-    assert_eq!(*offered.lock().unwrap(), Some(HttpProtocol::Http1));
-    gateway.abort();
-}
-
-/// A genuine h2 guest keeps its h2 session and its h2 origin offer.
-#[tokio::test]
-async fn h2_preface_on_h2_negotiated_session_is_served_as_http2_and_origin_offered_http2() {
-    use http_body_util::Full;
-    let (binding, lease, _) = fixture().await;
-    let (origin, origin_peer) = tokio::io::duplex(4096);
-    let origin_server = tokio::spawn(
-        hyper::server::conn::http2::Builder::new(TokioExecutor::new()).serve_connection(
-            TokioIo::new(origin_peer),
-            service_fn(|_: Request<Incoming>| async {
-                Ok::<_, Infallible>(Response::new(Full::new(Bytes::from_static(b"ok"))))
-            }),
-        ),
-    );
-    let offered = Arc::new(std::sync::Mutex::new(None));
-    let observed = offered.clone();
-    let (guest, guest_peer) = tokio::io::duplex(4096);
-    let gateway = tokio::spawn(serve(
-        guest,
-        HttpProtocol::Http2,
-        binding,
-        lease,
-        move |guest_protocol| async move {
-            *observed.lock().unwrap() = Some(guest_protocol);
-            Ok((origin, HttpProtocol::Http2))
-        },
-    ));
-    let (mut sender, connection) = http2::handshake(TokioExecutor::new(), TokioIo::new(guest_peer))
-        .await
-        .unwrap();
-    let client = tokio::spawn(connection);
-    let response = sender
-        .send_request(
-            Request::get("https://allowed.test/")
-                .body(Empty::<Bytes>::new())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(response.version(), Version::HTTP_2);
-    assert_eq!(*offered.lock().unwrap(), Some(HttpProtocol::Http2));
-    client.abort();
-    gateway.abort();
-    origin_server.abort();
-}
-
-/// The `auto` version sniff has no timer of its own. A guest that completes
-/// TLS and never sends a byte must still be dropped after the header timeout,
-/// classified like hyper's h1 header read timeout.
 #[tokio::test(start_paused = true)]
-async fn silent_guest_is_dropped_after_the_header_timeout() {
-    let (binding, lease, _) = fixture().await;
-    let (guest, guest_peer) = tokio::io::duplex(4096);
-    let gateway = tokio::spawn(serve(
-        guest,
-        HttpProtocol::Http1,
-        binding,
-        lease,
-        |_| async { Ok((tokio::io::duplex(1).0, HttpProtocol::Http1)) },
-    ));
-    tokio::time::sleep(HEADER_TIMEOUT + Duration::from_millis(1)).await;
-    let result = tokio::time::timeout(Duration::from_secs(1), gateway)
-        .await
-        .expect("session ends at the header timeout")
-        .unwrap();
-    assert!(
-        matches!(result, Err(TlsTransportError::HeaderTimeout)),
-        "silent guest ended with {result:?}"
-    );
-    drop(guest_peer);
+async fn initial_request_deadline_covers_silence_prefaces_and_headers() {
+    use tokio::io::AsyncWriteExt;
+
+    for prefix in [
+        &b"P"[..],
+        &b"PRI * HTTP/2.0\r\n"[..],
+        &b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"[..],
+        &b"GET / HTTP/1.1\r\nHost: allowed.test\r\n"[..],
+        &b""[..],
+    ] {
+        let (binding, lease, _) = fixture().await;
+        let (guest, mut guest_peer) = tokio::io::duplex(4096);
+        guest_peer.write_all(prefix).await.unwrap();
+        let gateway = tokio::spawn(serve::<_, _, _, tokio::io::DuplexStream>(
+            guest,
+            HttpProtocol::Http2,
+            binding,
+            lease,
+            |_| async { panic!("incomplete headers must not open an origin") },
+        ));
+        tokio::time::sleep(Duration::from_secs(29)).await;
+        assert!(!gateway.is_finished(), "closed too early for {prefix:?}");
+        let result = tokio::time::timeout(Duration::from_secs(2), gateway)
+            .await
+            .unwrap_or_else(|_| panic!("initial request deadline missed for {prefix:?}"))
+            .unwrap();
+        match result {
+            Err(TlsTransportError::HeaderTimeout) => {}
+            Err(TlsTransportError::Http(error)) if error.is_timeout() => {}
+            result => panic!("unexpected result for {prefix:?}: {result:?}"),
+        }
+    }
 }
