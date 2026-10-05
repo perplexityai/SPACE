@@ -1,6 +1,6 @@
 use super::*;
 use crate::sql::baseline_cutover::{CutoverManifest, HistoryRow};
-use rusqlite::TransactionBehavior;
+use rusqlite::{Transaction, TransactionBehavior};
 
 const SERVICE_HISTORY: &str = "_sqlx_migrations";
 const COMMON_HISTORY: &str = "_space_common_schema_migrations";

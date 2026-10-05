@@ -30,13 +30,11 @@ fn full_scope_preserves_claimed_elements_for_clear() {
 async fn mark_refs_revives_backed_off_dirty_row() -> anyhow::Result<()> {
     let temp = tempfile::tempdir()?;
     let db_path = temp.path().join("node-ctl.db");
-    let store = pplx_space_common_svc::sql::baselines::NODE_CTL;
+
     pplx_space_common_svc::sql::sqlite::migrate(
         "node-ctl-test",
         &db_path,
         &crate::NODE_CTL_MIGRATOR,
-        Some(store.baseline_version),
-        store.migration_failure_policy,
     )
     .await?;
     let conn = pplx_space_common_svc::sql::sqlite::open_rusqlite(
@@ -59,8 +57,6 @@ async fn mark_refs_revives_backed_off_dirty_row() -> anyhow::Result<()> {
         "node-ctl-test",
         &db_path,
         &crate::NODE_CTL_MIGRATOR,
-        Some(store.baseline_version),
-        store.migration_failure_policy,
     )
     .await?;
     let mut conn = pplx_space_common_svc::sql::sqlite::open_rusqlite(
@@ -106,46 +102,46 @@ async fn mark_refs_revives_backed_off_dirty_row() -> anyhow::Result<()> {
     assert_eq!(row.7, 0);
     assert_eq!(row.8, "");
 
-    if pplx_space_common_svc::sql::baselines::is_public(&crate::NODE_CTL_MIGRATOR) {
-        // The retired baseline's actual checksum distinguishes legacy history
-        // from a public migration whose version alone was corrupted.
-        conn.execute(
-            "UPDATE _sqlx_migrations SET version = 4, description = 'baseline',
-             checksum = X'622273a5ff539a8ecbbb30b42b3893dcfb168c11483e6ce3123e03c2b0ca0dec35eb9027f104aadee6445b5720ea7563'",
-            [],
-        )?;
-        let history = conn.query_row(
+    // The retired baseline's actual checksum distinguishes legacy history
+    // from a public migration whose version alone was corrupted.
+    conn.execute(
+        "UPDATE _sqlx_migrations SET version = 4, description = 'baseline',
+         checksum = X'622273a5ff539a8ecbbb30b42b3893dcfb168c11483e6ce3123e03c2b0ca0dec35eb9027f104aadee6445b5720ea7563'",
+        [],
+    )?;
+    let history = conn.query_row(
+        "SELECT version, checksum FROM _sqlx_migrations",
+        [],
+        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?)),
+    )?;
+    drop(conn);
+
+    let error = pplx_space_common_svc::sql::sqlite::migrate(
+        "node-ctl-test",
+        &db_path,
+        &crate::NODE_CTL_MIGRATOR,
+    )
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("db/README.md"));
+
+    let conn = rusqlite::Connection::open(&db_path)?;
+    assert_eq!(
+        conn.query_row(
             "SELECT version, checksum FROM _sqlx_migrations",
             [],
-            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?)),
-        )?;
-        drop(conn);
-
-        pplx_space_common_svc::sql::sqlite::migrate(
-            "node-ctl-test",
-            &db_path,
-            &crate::NODE_CTL_MIGRATOR,
-            Some(store.baseline_version),
-            store.migration_failure_policy,
-        )
-        .await
-        .unwrap_err();
-
-        let conn = rusqlite::Connection::open(&db_path)?;
-        assert_eq!(
-            conn.query_row(
-                "SELECT version, checksum FROM _sqlx_migrations",
-                [],
-                |row| { Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?)) }
-            )?,
-            history
-        );
-        assert_eq!(conn.query_row(
+            |row| { Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?)) }
+        )?,
+        history
+    );
+    assert_eq!(
+        conn.query_row(
             "SELECT dirty, dirty_generation FROM dirty_facets WHERE facet = ?1 AND element = ?2",
             params![FACET_TEMPLATE_INVENTORY, "seed"],
             |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
-        )?, (1, 8));
-    }
+        )?,
+        (1, 8)
+    );
 
     Ok(())
 }

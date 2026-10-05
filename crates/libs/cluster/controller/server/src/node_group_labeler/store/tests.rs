@@ -43,7 +43,7 @@ fn existing(ensured: EnsuredDefaultGroup) -> DefaultNodeGroup {
 /// unavailable (test skips), matching the shared-fixture contract.
 ///
 /// The `node_groups` table comes from the real migration
-/// (`db/postgres/20260819223842_node_groups.up.sql`), which the
+/// (`db/postgres/20261002070625_baseline.up.sql`), which the
 /// shared fixture applies — so these tests run against production's schema,
 /// including its `idx_node_groups_single_default` expression index. A
 /// test must not layer a stand-in schema on top: an index declared here under

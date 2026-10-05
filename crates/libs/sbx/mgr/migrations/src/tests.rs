@@ -1,7 +1,7 @@
 use super::*;
 
 #[test]
-fn upload_format_admission_precedes_history_repair_and_preserves_terminal_evidence() {
+fn upload_format_admission_preserves_terminal_evidence_without_writes() {
     for payload in [
         "malformed",
         "{}",
@@ -21,7 +21,7 @@ fn upload_format_admission_precedes_history_repair_and_preserves_terminal_eviden
             let before = conn.total_changes();
             let expected = !matches!(status, "pending" | "running")
                 || payload == r#"{"includes_metadata_job":true}"#;
-            let result = prepare_migrations_inner(&conn, &SANDBOX_MANAGER_MIGRATOR);
+            let result = prepare_migrations_inner(&conn);
             assert_eq!(result.is_ok(), expected, "{status}: {payload}");
             if !expected {
                 assert!(matches!(
@@ -49,7 +49,7 @@ fn upload_format_admission_precedes_history_repair_and_preserves_terminal_eviden
 }
 
 #[test]
-fn schema_floor_admission_rejects_forward_only_stores_before_history_repair() {
+fn schema_floor_admission_rejects_forward_only_stores_without_writes() {
     for (required, preparation_accepts, previous_cutover_accepts, current_accepts) in [
         (0, true, true, true),
         (1, true, true, true),
@@ -68,7 +68,7 @@ fn schema_floor_admission_rejects_forward_only_stores_before_history_repair() {
         assert_eq!(check_schema_floor(&conn, 3).is_ok(), current_accepts);
         if check_schema_floor(&conn, SUPPORTED_SCHEMA_FLOOR).is_err() {
             let changes = conn.total_changes();
-            let error = prepare_migrations_inner(&conn, &SANDBOX_MANAGER_MIGRATOR).unwrap_err();
+            let error = prepare_migrations_inner(&conn).unwrap_err();
             assert!(matches!(
                 error,
                 PrepareMigrationsError::UnsupportedSchemaFloor { .. }

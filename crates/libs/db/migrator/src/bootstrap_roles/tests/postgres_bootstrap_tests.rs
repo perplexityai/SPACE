@@ -23,13 +23,6 @@ const APP_LOCK_UNSET_TIMEOUTS: SessionTimeouts<'static> = SessionTimeouts {
     ..TEST_TIMEOUTS
 };
 
-/// `20260914145627_normalized_credential_rules`, the migration
-/// [`credential_rules_enforce_constraints_triggers_and_grants`]
-/// applies and reverts, and its immediate predecessor
-/// `20260914055116_credential_references`.
-const NORMALIZATION: i64 = 20260914145627;
-const NORMALIZATION_PREDECESSOR: i64 = 20260914055116;
-
 fn test_passwords() -> BootstrapPasswords {
     BootstrapPasswords {
         superadmin: Some("superadmin-pw".to_string()),
@@ -908,41 +901,9 @@ async fn credential_rules_enforce_constraints_triggers_and_grants() -> TestResul
         return Ok(());
     };
     run_bootstrap(&fixture).await?;
-    let before_normalization = sqlx::migrate::Migrator {
-        migrations: std::borrow::Cow::Owned(
-            crate::POSTGRES_MIGRATOR
-                .iter()
-                .filter(|migration| {
-                    crate::baselines::is_public(&crate::POSTGRES_MIGRATOR)
-                        || migration.version < NORMALIZATION
-                })
-                .cloned()
-                .collect(),
-        ),
-        ..sqlx::migrate::Migrator::DEFAULT
-    };
-    // `Migrator::undo` reverts every down migration newer than its target, so
-    // rolling back through the unfiltered set would replay every migration
-    // added after this one and grow with the tree. Dropping the other down
-    // migrations from the set pins the rollback to the one migration under
-    // test; the up migrations stay, because `undo` rejects an applied version
-    // the set does not contain.
-    let normalization_rollback = sqlx::migrate::Migrator {
-        migrations: std::borrow::Cow::Owned(
-            crate::POSTGRES_MIGRATOR
-                .iter()
-                .filter(|migration| {
-                    !migration.migration_type.is_down_migration()
-                        || migration.version == NORMALIZATION
-                })
-                .cloned()
-                .collect(),
-        ),
-        ..sqlx::migrate::Migrator::DEFAULT
-    };
     let mut conn = fixture.connect_as("postgres").await?;
     assume_migrator_role(&mut conn).await?;
-    before_normalization.run(&mut conn).await?;
+    crate::POSTGRES_MIGRATOR.run(&mut conn).await?;
     let sandbox = SandboxId::new().as_uuid();
     let reference = CredentialReferenceId::new().as_uuid();
     sqlx::query(sql!("INSERT INTO sandboxes (id, user_id, org_id, network_policy_generation) VALUES ($1, $2, $3, 1)"))
@@ -951,24 +912,6 @@ async fn credential_rules_enforce_constraints_triggers_and_grants() -> TestResul
         .bind(reference).bind(SEED_ORG_ID).execute(&mut conn).await?;
     sqlx::query(sql!("INSERT INTO sandbox_credential_injection_rules (sandbox_id, version, rules) VALUES ($1, 7, '\\xff'::bytea)"))
         .bind(sandbox).execute(&mut conn).await?;
-    if !crate::baselines::is_public(&crate::POSTGRES_MIGRATOR) {
-        for rollback in [false, true, false] {
-            if rollback {
-                normalization_rollback
-                    .undo(&mut conn, NORMALIZATION_PREDECESSOR)
-                    .await?;
-            } else {
-                crate::POSTGRES_MIGRATOR.run(&mut conn).await?;
-            }
-            let legacy: (i64, Vec<u8>) = sqlx::query_as(sql!(
-                "SELECT version, rules FROM sandbox_credential_injection_rules WHERE sandbox_id = $1"
-            ))
-            .bind(sandbox)
-            .fetch_one(&mut conn)
-            .await?;
-            assert_eq!(legacy, (7, vec![0xff]));
-        }
-    }
     drop(conn);
     run_bootstrap(&fixture).await?;
     let normalized: (bool, i64, i64) = sqlx::query_as(sql!(

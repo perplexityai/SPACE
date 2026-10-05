@@ -47,7 +47,6 @@ pplx-space-credmgr-client = { workspace = true }
 pplx-space-metrics = { workspace = true }
 pplx-space-object-store = { workspace = true }
 pplx-space-volmgr-client = { workspace = true }
-pplx-space-volmgr-migrations = { workspace = true }
 
 [dev-dependencies]
 bytes = { workspace = true }

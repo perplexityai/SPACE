@@ -63,8 +63,7 @@
         "crates/libs/spaced/common",
         "crates/libs/sqlite/migrations",
         "crates/libs/template/mgr-client",
-        "crates/libs/template/publish",
-        "crates/libs/vol/mgr/migrations"
+        "crates/libs/template/publish"
       ]
     },
     "builder": {
@@ -100,8 +99,7 @@
         "crates/libs/spaced/build",
         "crates/libs/spaced/common",
         "crates/libs/sqlite/migrations",
-        "crates/libs/template/mgr-client",
-        "crates/libs/vol/mgr/migrations"
+        "crates/libs/template/mgr-client"
       ]
     },
     "cluster-controller": {
@@ -275,7 +273,6 @@
         "crates/libs/template/mgr",
         "crates/libs/template/mgr-client",
         "crates/libs/vol/mgr/client",
-        "crates/libs/vol/mgr/migrations",
         "crates/libs/vol/mgr/server"
       ]
     }

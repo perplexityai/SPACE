@@ -10773,35 +10773,14 @@ pub fn update_network_counters(
 #[cfg(test)]
 pub(crate) fn create_test_schema(conn: &mut Connection) {
     use pplx_space_sbxmgr_migrations::{COMMON_SCHEMA_MIGRATOR, SANDBOX_MANAGER_MIGRATOR};
-    let public = pplx_space_common_svc::sql::baselines::is_public(&SANDBOX_MANAGER_MIGRATOR);
-    if public {
-        pplx_space_common_svc::sql::sqlite::migrate_common_schema_up(conn, &COMMON_SCHEMA_MIGRATOR)
-            .unwrap();
-    }
+    pplx_space_common_svc::sql::sqlite::migrate_common_schema_up(conn, &COMMON_SCHEMA_MIGRATOR)
+        .unwrap();
     for migration in SANDBOX_MANAGER_MIGRATOR
         .iter()
         .filter(|migration| migration.migration_type.is_up_migration())
     {
         conn.execute_batch(migration.sql.as_ref()).unwrap();
     }
-    if !public {
-        pplx_space_common_svc::sql::sqlite::migrate_common_schema_up(conn, &COMMON_SCHEMA_MIGRATOR)
-            .unwrap();
-    }
-}
-
-#[cfg(test)]
-fn historical_migration_sql(
-    migrator: &sqlx::migrate::Migrator,
-    version: i64,
-    kind: sqlx::migrate::MigrationType,
-) -> &str {
-    migrator
-        .iter()
-        .find(|migration| migration.version == version && migration.migration_type == kind)
-        .expect("historical migration must remain bundled until cutover")
-        .sql
-        .as_ref()
 }
 
 /// Byte image of a freshly migrated database, built once per nextest run of

@@ -54,7 +54,7 @@
 //!
 //! ## `created_at` is not load-bearing, whatever the migration says
 //!
-//! `20260920025850_node_local_backup_pending.up.sql` states that `created_at`
+//! The historical migration states that `created_at`
 //! means "when *this* artifact entered the queue", that the delete guard
 //! treats an artifact as superseded when a newer full snapshot's `timestamp`
 //! is at or after it, and that the upsert therefore re-stamps the column on
@@ -104,11 +104,9 @@
 //! table carries no foreign key on `node_id`.
 //!
 //! The migration says otherwise — "a writer rollback or a same-name node
-//! replacement ... ages out instead of staying trusted", at
-//! `20260920025850_node_local_backup_pending.up.sql:85-86`. The rollback half
-//! is right and the replacement half is not, for the reason above. That file
-//! is applied and sqlx checksums it, so as with `created_at` the correction
-//! lives here rather than there.
+//! replacement ... ages out instead of staying trusted". The rollback half
+//! is right and the replacement half is not, for the reason above. Historical migrations remain immutable, so as with `created_at` the
+//! correction lives here.
 //!
 //! ## What this module must not touch
 //!

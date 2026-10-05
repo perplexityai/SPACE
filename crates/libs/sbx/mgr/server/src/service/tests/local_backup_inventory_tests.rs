@@ -57,7 +57,7 @@ async fn list_pending(service: &SandboxManagerService) -> Vec<crate::proto::Pend
 /// that silently failed would produce it rather than an error. The queue
 /// this feeds constrains the column to exactly those two values
 /// (`CHECK (artifact_kind IN ('disk', 'full'))` in
-/// `db/postgres/20260920025850_node_local_backup_pending.up.sql`), so an
+/// `db/postgres/20261002070625_baseline.up.sql`), so an
 /// unspecified kind reaching it would be rejected by the database. No
 /// Rust reader exists yet — this pins the producer against the stored
 /// contract, not against a live consumer.

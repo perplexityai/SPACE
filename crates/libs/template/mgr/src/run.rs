@@ -143,7 +143,6 @@ async fn run_service(
     );
     health_server.mark_starting();
 
-    let store = pplx_space_common_svc::sql::baselines::TEMPLATE_MANAGER;
     pplx_space_common_svc::sql::sqlite::migrate_embedded(
         "template-manager",
         std::path::Path::new(DB_PATH),
@@ -151,8 +150,6 @@ async fn run_service(
             service: &TEMPLATE_MANAGER_MIGRATOR,
             common: Some(&COMMON_SCHEMA_MIGRATOR),
         },
-        Some(store.baseline_version),
-        store.migration_failure_policy,
         None,
     )
     .await

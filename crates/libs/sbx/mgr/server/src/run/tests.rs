@@ -1212,60 +1212,11 @@ async fn pre_handoff_timeout_stops_server_tasks_before_returning() {
 #[tokio::test]
 async fn daemon_migrations_converge_jobs_from_each_supported_schema() {
     use pplx_space_common_jobs::{JobPriority, JobStatus, db as jobs};
-    use pplx_space_common_svc::sql::{baselines, sqlite};
-    let public = baselines::is_public(&SANDBOX_MANAGER_MIGRATOR);
-    for schema in [
-        "fresh",
-        "service_only",
-        "common_first",
-        "converged",
-        "pre_operation",
-        "cutover_preparation",
-        "execution_cutover",
-    ] {
-        if public && !matches!(schema, "fresh" | "converged") {
-            continue;
-        }
+    for schema in ["fresh", "converged"] {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("sandbox-manager.db");
         if schema != "fresh" {
-            if public {
-                migrate_sandbox_manager_db(&path).await.unwrap();
-            } else {
-                let legacy = sqlx::migrate::Migrator {
-                    migrations: std::borrow::Cow::Owned(
-                        SANDBOX_MANAGER_MIGRATOR
-                            .iter()
-                            .filter(|migration| match schema {
-                                "common_first" => migration.version <= 25,
-                                "pre_operation" => migration.version <= 54,
-                                "cutover_preparation" => migration.version <= 60,
-                                "execution_cutover" => migration.version <= 61,
-                                _ => true,
-                            })
-                            .cloned()
-                            .collect(),
-                    ),
-                    ignore_missing: false,
-                    locking: true,
-                    no_tx: false,
-                    table_name: SANDBOX_MANAGER_MIGRATOR.table_name.clone(),
-                    create_schemas: SANDBOX_MANAGER_MIGRATOR.create_schemas.clone(),
-                };
-                sqlite::migrate(
-                    "sandbox-manager",
-                    &path,
-                    &legacy,
-                    Some(baselines::SANDBOX_MANAGER.baseline_version),
-                    sqlite::MigrationFailurePolicy::Fail,
-                )
-                .await
-                .unwrap();
-                if matches!(schema, "common_first" | "converged") {
-                    let mut conn = rusqlite::Connection::open(&path).unwrap();
-                    sqlite::migrate_common_schema_up(&mut conn, &COMMON_SCHEMA_MIGRATOR).unwrap();
-                }
-            }
+            migrate_sandbox_manager_db(&path).await.unwrap();
             let conn = rusqlite::Connection::open(&path).unwrap();
             jobs::insert_job(
                 &conn,

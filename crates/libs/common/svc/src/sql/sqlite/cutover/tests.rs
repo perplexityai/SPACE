@@ -232,24 +232,8 @@ async fn startup_uses_the_transition_and_survives_repeated_open() {
         .unwrap();
     drop(conn);
 
-    migrate(
-        store,
-        &path,
-        &service,
-        Some(1),
-        MigrationFailurePolicy::Fail,
-    )
-    .await
-    .unwrap();
-    migrate(
-        store,
-        &path,
-        &service,
-        Some(1),
-        MigrationFailurePolicy::Fail,
-    )
-    .await
-    .unwrap();
+    migrate(store, &path, &service).await.unwrap();
+    migrate(store, &path, &service).await.unwrap();
 
     let conn = Connection::open(path).unwrap();
     assert_eq!(evidence(&conn, store), "retained");
