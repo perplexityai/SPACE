@@ -758,8 +758,9 @@ async fn spaced_write_spooled(
         raw_file_write_error,
     )
     .await?;
-    // Unlinking is a blocking syscall too. Error paths above drop `upload`
-    // in place, which unlinks synchronously.
+    // Unlinking is a blocking syscall too. Any spool path dropped outside this
+    // success path (a failed write, or the remaining staged parts of a
+    // multipart request that fails) unlinks synchronously on drop.
     match tokio::task::spawn_blocking(move || upload.close()).await {
         Ok(Ok(())) => {}
         Ok(Err(error)) => tracing::warn!(%error, "failed to remove ECW upload spool file"),

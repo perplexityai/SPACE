@@ -65,7 +65,8 @@ pub(super) fn multipart_boundary(content_type: &str) -> Option<&str> {
 }
 
 /// `filenames_name_paths` is false when a `path` query names the file, in
-/// which case part filenames are neither kept nor validated.
+/// which case part filenames are not kept or length-checked. Every part's
+/// Content-Disposition is still parsed, so malformed quoting is rejected.
 pub(super) async fn spool_multipart_uploads(
     body: Body,
     boundary: &str,
