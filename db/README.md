@@ -242,31 +242,29 @@ must include Squawk's transaction override comment:
 CREATE INDEX CONCURRENTLY ...
 ```
 
-Common SQLite DDL lives under `db/common/` using the same numbered
-`NNN_name.up.sql` / `NNN_name.down.sql` format as service migration
-directories. For each SQLite store that opts into it, `space-db-migrator`
-applies that store's service-specific migrations and then applies `db/common/`
-as the final convergence phase.
+Common SQLite DDL lives under `db/common/`. Its public catalog starts at
+`20260930000000_baseline`; later common and service migrations use timestamped
+up/down pairs above that floor. The shared baseline requires the sandbox,
+volume, template, build, and runtime-manager service baselines first. See the
+[SQLite cutover procedure](SQLITE_BASELINE.md) for existing databases.
 
-Node-local SQLite startup accepts applied migration versions newer than the
-binary bundles so a binary rollback can reuse a database expanded by its
-successor. It preserves those migration rows; missing versions within the
-bundled range and checksum mismatches still fail. Use expand/contract
-sequencing: add backward-compatible schema first, and remove or repurpose it
-only after the rollback window closes.
+Do not deploy post-baseline service migrations until the final runtime cleanup
+has established rollback ordering across shared and service catalogs. The
+transitional CLI tries shared rollback first and its floor can block service
+rollback even when that service has a later migration.
 
-The `jobs` table currently lives in `db/common/`. Do not add new hand-copied
-`jobs` DDL to individual service migration directories; add future common
-tables, columns, and indexes as new numbered up/down migrations in
-`db/common/`. Service-specific objects that depend on common tables, such as a
-consumer-only index, should remain in that service's own migration directory.
+Public-catalog startup validates both service and shared histories before
+writes, then applies common schema before service schema. Failed, modified,
+missing, or unbundled applied versions are rejected without recreating the
+database. A binary rollback therefore requires a catalog compatible with the
+complete applied history, even for an otherwise backward-compatible schema.
+Use expand/contract sequencing and retain verified backups.
 
-One compatibility exception exists for authoritative node-local daemons whose
-startup path runs only the service-specific SQLx migrator before opening the
-database. If shared job code already depends on a new common `jobs` column at
-daemon startup, add a service-specific forward migration with a fresh version
-for that daemon and teach the common-schema convergence path to stamp the common
-migration when the service migration has already produced the same schema.
+The `jobs` table belongs to `db/common/`. Add shared tables, columns, and indexes
+there instead of copying jobs DDL into service directories. Service-owned
+objects that depend on common tables, such as a consumer-only index, stay in
+the service catalog. Daemons and the CLI use the shared migration startup path;
+new migrations must not rely on the retired service-to-common history stamping.
 
 ## Control-plane Postgres roles (`bootstrap-roles`)
 

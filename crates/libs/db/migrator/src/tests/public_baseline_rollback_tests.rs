@@ -29,7 +29,7 @@ static SERVICE: LazyLock<Migrator> = LazyLock::new(|| Migrator {
 });
 
 #[tokio::test]
-async fn service_baseline_down_preserves_shared_jobs_and_history() {
+async fn shared_baseline_down_preserves_shared_jobs_and_history() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("service.sqlite");
     let database = SqliteDatabase {
@@ -57,7 +57,7 @@ async fn service_baseline_down_preserves_shared_jobs_and_history() {
 
     let result = rollback_last_sqlite_database(database, &path).await;
 
-    assert!(result.is_err());
+    assert!(format!("{:?}", result.unwrap_err()).contains("public baseline is a rollback floor"));
     assert_eq!(
         sqlite::applied_common_schema_migrations(&conn).unwrap(),
         history

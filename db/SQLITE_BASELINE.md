@@ -27,3 +27,8 @@ Prevent old-image and automatic rollback after adoption. Use a compatible forwar
 fix; recovery to old binaries requires a reviewed procedure with writers stopped.
 Keep the cutover bridge until all retained databases have converted or retired.
 The checksum adapter remains useful independently.
+
+Do not deploy post-baseline service migrations until the final runtime cleanup
+establishes rollback ordering across service and shared catalogs. The current
+CLI attempts shared rollback first, so its baseline floor can block rollback
+of a later service migration.

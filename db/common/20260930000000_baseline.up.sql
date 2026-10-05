@@ -1,4 +1,4 @@
-CREATE TABLE jobs_with_cancellation (
+CREATE TABLE "jobs" (
     job_id          TEXT PRIMARY KEY,
     kind            TEXT NOT NULL,
     status          TEXT NOT NULL DEFAULT 'pending'
@@ -37,47 +37,40 @@ CREATE TABLE jobs_with_cancellation (
                     CHECK(failure_reason IS NULL OR error_kind = 'permanent')
 );
 
-INSERT INTO jobs_with_cancellation (
-    job_id, kind, status, payload, subject_id, dedup_key, error_kind,
-    attempts, max_attempts, bytes_processed, error, created_at, started_at,
-    completed_at, next_attempt_at, traceparent, lease_owner, lease_expires_at,
-    heartbeat_at, priority, failure_reason
-)
-SELECT
-    job_id, kind, status, payload, subject_id, dedup_key, error_kind,
-    attempts, max_attempts, bytes_processed, error, created_at, started_at,
-    completed_at, next_attempt_at, traceparent, lease_owner, lease_expires_at,
-    heartbeat_at, priority, failure_reason
-FROM jobs;
+CREATE INDEX idx_jobs_active_kind_status
+    ON jobs(kind, status)
+    WHERE status IN ('pending', 'running', 'cancelling');
 
-DROP TABLE jobs;
-ALTER TABLE jobs_with_cancellation RENAME TO jobs;
+CREATE INDEX idx_jobs_created_at
+    ON jobs(created_at DESC, job_id DESC);
+
+CREATE INDEX idx_jobs_dedup_latest
+    ON jobs(kind, dedup_key, created_at DESC, job_id DESC)
+    WHERE dedup_key IS NOT NULL;
+
+CREATE INDEX idx_jobs_lease_expiry
+    ON jobs(lease_expires_at)
+    WHERE status = 'running' AND lease_expires_at IS NOT NULL;
 
 CREATE INDEX idx_jobs_pending
     ON jobs(next_attempt_at)
     WHERE status = 'pending';
-CREATE INDEX idx_jobs_subject
-    ON jobs(subject_id);
-CREATE INDEX idx_jobs_lease_expiry
-    ON jobs(lease_expires_at)
-    WHERE status = 'running' AND lease_expires_at IS NOT NULL;
-CREATE INDEX idx_jobs_dedup_latest
-    ON jobs(kind, dedup_key, created_at DESC, job_id DESC)
-    WHERE dedup_key IS NOT NULL;
-CREATE INDEX idx_jobs_created_at
-    ON jobs(created_at DESC, job_id DESC);
+
+CREATE INDEX idx_jobs_pending_priority
+    ON jobs(kind, priority DESC, created_at ASC, job_id ASC)
+    WHERE status = 'pending';
+
 CREATE INDEX idx_jobs_status_created_at
     ON jobs(status, created_at DESC, job_id DESC);
+
+CREATE INDEX idx_jobs_subject
+    ON jobs(subject_id);
+
+CREATE INDEX idx_jobs_subject_created_at
+    ON jobs(subject_id, created_at DESC, job_id DESC)
+    WHERE subject_id IS NOT NULL;
+
 CREATE INDEX idx_jobs_terminal_completed_at
     ON jobs(status, completed_at)
     WHERE status IN ('completed', 'failed', 'cancelled')
       AND completed_at IS NOT NULL;
-CREATE INDEX idx_jobs_subject_created_at
-    ON jobs(subject_id, created_at DESC, job_id DESC)
-    WHERE subject_id IS NOT NULL;
-CREATE INDEX idx_jobs_active_kind_status
-    ON jobs(kind, status)
-    WHERE status IN ('pending', 'running', 'cancelling');
-CREATE INDEX idx_jobs_pending_priority
-    ON jobs(kind, priority DESC, created_at ASC, job_id ASC)
-    WHERE status = 'pending';
