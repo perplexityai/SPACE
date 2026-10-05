@@ -357,21 +357,92 @@ async fn multipart_file_part_with_filename_before_name_is_spooled() {
 }
 
 #[test]
-fn content_disposition_name_skips_separators_inside_quoted_values() {
-    let name = |value: &str| {
+fn content_disposition_params_ignore_text_inside_quoted_values() {
+    let param = |value: &[u8], key: &str| {
         let mut headers = HeaderMap::new();
-        headers.insert(header::CONTENT_DISPOSITION, value.parse().unwrap());
-        content_disposition_name(&headers)
+        headers.insert(
+            header::CONTENT_DISPOSITION,
+            axum::http::HeaderValue::from_bytes(value).unwrap(),
+        );
+        content_disposition_param(&headers, key)
     };
+    let cases: [(&[u8], Option<&str>, Option<&str>); 7] = [
+        (
+            br#"form-data; name="file"; filename="a.txt""#,
+            Some("file"),
+            Some("a.txt"),
+        ),
+        (
+            br#"form-data; filename="a name=b.txt"; name="file""#,
+            Some("file"),
+            Some("a name=b.txt"),
+        ),
+        (
+            br#"form-data; filename="x;name=file;"; name="meta""#,
+            Some("meta"),
+            Some("x;name=file;"),
+        ),
+        (
+            br#"form-data; name="a filename=x"; filename="real.txt""#,
+            Some("a filename=x"),
+            Some("real.txt"),
+        ),
+        (
+            br#"form-data; filename="q\"; name=x"; NAME=file"#,
+            Some("file"),
+            Some(r#"q"; name=x"#),
+        ),
+        (
+            "form-data; filename=\"\u{fc} name.txt\"; name=\"file\"".as_bytes(),
+            Some("file"),
+            Some("\u{fc} name.txt"),
+        ),
+        (br#"form-data; filename="a.txt""#, None, Some("a.txt")),
+    ];
+    for (value, name, filename) in cases {
+        let shown = String::from_utf8_lossy(value);
+        assert_eq!(param(value, "name").as_deref(), name, "{shown}");
+        assert_eq!(param(value, "filename").as_deref(), filename, "{shown}");
+    }
+}
+
+#[tokio::test]
+async fn multipart_parts_are_classified_by_their_real_name_parameter() {
+    // Multer reads `name` from inside these quoted filenames; the file part
+    // must still be spooled and the `meta` part, which only mentions
+    // `name=file` inside its filename, must not be.
+    let mut body = Vec::new();
+    for disposition in [
+        r#"form-data; filename="a name=b.txt"; name="file""#,
+        r#"form-data; filename="x;name=file;"; name="meta""#,
+    ] {
+        body.extend_from_slice(
+            format!(
+                "--{MULTIPART_BOUNDARY}\r\nContent-Disposition: {disposition}\r\n\r\ncontent\r\n"
+            )
+            .as_bytes(),
+        );
+    }
+    body.extend_from_slice(format!("--{MULTIPART_BOUNDARY}--\r\n").as_bytes());
+
+    let uploads = spool_multipart_uploads(Body::from(body), MULTIPART_BOUNDARY)
+        .await
+        .unwrap();
+    assert_eq!(uploads.len(), 1);
+    assert_eq!(uploads[0].filename.as_deref(), Some("a name=b.txt"));
+}
+
+#[test]
+fn multipart_boundary_longer_than_rfc_2046_allows_is_rejected() {
+    let boundary = "b".repeat(70);
     assert_eq!(
-        name(r#"form-data; filename="a; name=x.txt"; name="file""#).as_deref(),
-        Some("file")
+        multipart_boundary(&format!("multipart/form-data; boundary={boundary}")),
+        Some(boundary.as_str())
     );
     assert_eq!(
-        name(r#"form-data; filename="q\"; name=x"; NAME=file"#).as_deref(),
-        Some("file")
+        multipart_boundary(&format!("multipart/form-data; boundary={boundary}b")),
+        None
     );
-    assert_eq!(name(r#"form-data; filename="a.txt""#), None);
 }
 
 #[tokio::test]

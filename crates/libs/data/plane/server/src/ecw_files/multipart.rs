@@ -51,13 +51,17 @@ fn too_many_multipart_parts_error() -> EcwProxyError {
     )
 }
 
+/// RFC 2046 limits a boundary to 70 characters. Multer searches for it on
+/// every poll, so an unbounded boundary multiplies the cost of each frame.
+const MULTIPART_BOUNDARY_MAX_LEN: usize = 70;
+
 pub(super) fn multipart_boundary(content_type: &str) -> Option<&str> {
     content_type
         .split(';')
         .skip(1)
         .find_map(|part| part.trim().strip_prefix("boundary="))
         .map(|boundary| boundary.trim_matches('"'))
-        .filter(|boundary| !boundary.is_empty())
+        .filter(|boundary| (1..=MULTIPART_BOUNDARY_MAX_LEN).contains(&boundary.len()))
 }
 
 pub(super) async fn spool_multipart_uploads(
@@ -102,16 +106,11 @@ pub(super) async fn spool_multipart_uploads_with_limit(
                 "Missing multipart Content-Disposition",
             ));
         }
-        let filename = field
-            .file_name()
-            .filter(|filename| !filename.is_empty())
-            .map(str::to_string);
-        // Multer stops looking for `name` when an earlier quoted value holds a
-        // space-prefixed `name` (`filename="my name.txt"; name="file"`).
-        let is_file = match field.name() {
-            Some(name) => name == "file",
-            None => content_disposition_name(field.headers()).as_deref() == Some("file"),
-        };
+        // Multer's `name()` and `file_name()` can return text from inside
+        // another parameter's quoted value, so both are read here instead.
+        let filename = content_disposition_param(field.headers(), "filename")
+            .filter(|filename| !filename.is_empty());
+        let is_file = content_disposition_param(field.headers(), "name").as_deref() == Some("file");
         let mut upload = if is_file {
             Some(SpooledUpload::new().await?)
         } else {
@@ -137,13 +136,17 @@ pub(super) async fn spool_multipart_uploads_with_limit(
     Ok(uploads)
 }
 
-/// Reads the `name` parameter of a part's Content-Disposition, skipping `;`
-/// and `=` inside quoted values. Used only when multer cannot find it.
-pub(super) fn content_disposition_name(headers: &HeaderMap) -> Option<String> {
-    let value = headers.get(header::CONTENT_DISPOSITION)?.to_str().ok()?;
+/// Reads parameter `key` of a part's Content-Disposition from the raw header
+/// bytes, treating `;` and `=` inside quoted values as data and unescaping
+/// backslash pairs. Multer 3.1.0 matches `name` and `filename` wherever they
+/// follow whitespace, including inside an earlier parameter's quoted value
+/// (`filename="a name=b.txt"; name="file"`), so its accessors are not used.
+/// Values that are not UTF-8 read as absent.
+pub(super) fn content_disposition_param(headers: &HeaderMap, key: &str) -> Option<String> {
+    let value = headers.get(header::CONTENT_DISPOSITION)?.as_bytes();
     let mut params = Vec::new();
     let (mut start, mut in_quotes, mut escaped) = (0, false, false);
-    for (index, byte) in value.bytes().enumerate() {
+    for (index, &byte) in value.iter().enumerate() {
         match byte {
             b'\\' if in_quotes && !escaped => {
                 escaped = true;
@@ -161,20 +164,27 @@ pub(super) fn content_disposition_name(headers: &HeaderMap) -> Option<String> {
     params.extend(value.get(start..));
     // The first segment is the disposition type, e.g. `form-data`.
     params.into_iter().skip(1).find_map(|param| {
-        let (key, raw) = param.split_once('=')?;
-        if !key.trim().eq_ignore_ascii_case("name") {
+        let separator = param.iter().position(|&byte| byte == b'=')?;
+        let name = param.get(..separator)?.trim_ascii();
+        if !name.eq_ignore_ascii_case(key.as_bytes()) {
             return None;
         }
-        let raw = raw.trim();
-        let Some(quoted) = raw.strip_prefix('"').and_then(|raw| raw.strip_suffix('"')) else {
-            return Some(raw.to_string());
+        let raw = param.get(separator + 1..)?.trim_ascii();
+        let bytes = match raw
+            .strip_prefix(b"\"")
+            .and_then(|raw| raw.strip_suffix(b"\""))
+        {
+            Some(quoted) => {
+                let mut unescaped = Vec::with_capacity(quoted.len());
+                let mut bytes = quoted.iter();
+                while let Some(&byte) = bytes.next() {
+                    unescaped.push(if byte == b'\\' { *bytes.next()? } else { byte });
+                }
+                unescaped
+            }
+            None => raw.to_vec(),
         };
-        let mut name = String::with_capacity(quoted.len());
-        let mut chars = quoted.chars();
-        while let Some(c) = chars.next() {
-            name.push(if c == '\\' { chars.next()? } else { c });
-        }
-        Some(name)
+        String::from_utf8(bytes).ok()
     })
 }
 

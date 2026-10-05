@@ -317,7 +317,9 @@ pub(super) async fn write_file(
             file_too_large_error,
         )?;
         let boundary = multipart_boundary(content_type).ok_or_else(|| {
-            EcwProxyError::bad_request("multipart/form-data boundary is required")
+            EcwProxyError::bad_request(
+                "multipart/form-data boundary of 1 to 70 characters is required",
+            )
         })?;
         let uploads = spool_multipart_uploads(body, boundary).await?;
         let writes = resolve_multipart_uploads(uploads, query.path, user.as_ref())?;
