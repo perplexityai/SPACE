@@ -3,6 +3,9 @@ use pplx_space_common_core::types::{
     Arch, ExecutionMetadata, TEMPLATE_MANIFEST_SCHEMA_VERSION, TEMPLATE_METADATA_SCHEMA_VERSION,
 };
 
+#[cfg(unix)]
+mod republication;
+
 fn block_on<F: std::future::Future>(future: F) -> F::Output {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()

@@ -117,6 +117,19 @@ impl K8sNodeIdentity {
 }
 
 impl K8sIdentity {
+    /// A synthetic projected-token identity for cross-service authorization tests.
+    #[cfg(feature = "test-hooks")]
+    pub fn for_test(service: ClientService) -> Self {
+        Self::from_token_review(
+            service,
+            "test-pod",
+            "test-pod-uid",
+            "test-node",
+            "test-node-uid",
+        )
+        .expect("valid synthetic Kubernetes identity")
+    }
+
     pub(crate) fn from_token_review(
         service: ClientService,
         pod_name: &str,
