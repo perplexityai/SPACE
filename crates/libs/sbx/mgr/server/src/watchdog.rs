@@ -35,6 +35,8 @@ use crate::service::network_policy::NetworkPolicyReconcileQueue;
 use crate::sidecar::{sidecar_alive, sidecar_live_pid};
 use crate::snapshot_scheduler::SnapshotScheduler;
 
+mod diagnostics;
+
 const SIDECAR_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 // Background observations tolerate a slower reply than foreground Stats,
 // without extending the caller's response latency.
@@ -434,6 +436,10 @@ pub struct SandboxHealth {
     lifecycle_epoch: u64,
     next_health_probe_at: Instant,
     health_probe_sequence: u64,
+    /// When a degraded transition last carried console tails, so a flapping
+    /// sandbox cannot repeat them more often than
+    /// `diagnostics::CONSOLE_TAIL_MIN_INTERVAL`.
+    last_console_tail_at: Option<Instant>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -612,10 +618,27 @@ struct ComposedProbeResult {
 struct ComponentHealth {
     observations: VecDeque<HealthObservation>,
     degraded: bool,
+    /// Failed probes since the last success or not-applicable probe. Unlike
+    /// the bounded history, this keeps counting for as long as the outage
+    /// lasts.
+    consecutive_failures: u32,
+    last_success_at: Option<SystemTime>,
 }
 
 impl ComponentHealth {
     fn push(&mut self, observation: HealthObservation) {
+        match observation.outcome {
+            HealthProbeOutcome::Success => {
+                self.consecutive_failures = 0;
+                self.last_success_at = Some(observation.observed_at);
+            }
+            HealthProbeOutcome::NotApplicable => self.consecutive_failures = 0,
+            HealthProbeOutcome::Timeout
+            | HealthProbeOutcome::Unavailable
+            | HealthProbeOutcome::UnexpectedState => {
+                self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+            }
+        }
         if self.observations.len() == HEALTH_HISTORY_CAPACITY {
             self.observations.pop_front();
         }
@@ -677,6 +700,12 @@ impl HealthLifecycleEpochs {
         };
         health.lifecycle_epoch = health.lifecycle_epoch.wrapping_add(1);
         health.consecutive_guest_probe_failures = 0;
+        for component in HealthComponent::ALL {
+            health
+                .health_components
+                .get_mut(component)
+                .consecutive_failures = 0;
+        }
     }
 }
 
@@ -830,6 +859,7 @@ impl SandboxWatchdog {
             lifecycle_epoch: 0,
             next_health_probe_at: now + initial_health_probe_delay(&id),
             health_probe_sequence: 0,
+            last_console_tail_at: None,
         });
     }
 
@@ -2084,11 +2114,19 @@ async fn composed_health_loop(
 ) {
     let mut interval = tokio::time::interval(HEALTH_SCHEDULER_TICK);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Evidence for degrading transitions is gathered off the probe path so a
+    // burst of them cannot delay the next sweep; dropping the set on shutdown
+    // abandons any still in flight.
+    let mut transition_reports = tokio::task::JoinSet::new();
+    let evidence_permits = Arc::new(tokio::sync::Semaphore::new(
+        diagnostics::EVIDENCE_CONCURRENCY,
+    ));
     loop {
         tokio::select! {
             _ = shutdown_token.cancelled() => return,
             _ = interval.tick() => {}
         }
+        while transition_reports.try_join_next().is_some() {}
 
         let now = Instant::now();
         let due_ids = {
@@ -2138,8 +2176,8 @@ async fn composed_health_loop(
             if !health_probe_lifecycle_is_eligible(lifecycle) {
                 continue;
             }
-            if pending.len() >= HEALTH_PROBE_CONCURRENCY {
-                apply_and_reconcile_composed_health_result(
+            if pending.len() >= HEALTH_PROBE_CONCURRENCY
+                && let Some(transition) = apply_and_reconcile_composed_health_result(
                     &state,
                     &db,
                     snapshot_scheduler.as_ref(),
@@ -2147,7 +2185,14 @@ async fn composed_health_loop(
                     &lifecycle_epochs,
                     pending.join_next().await,
                 )
-                .await;
+                .await
+            {
+                report_health_transition(
+                    &mut transition_reports,
+                    &evidence_permits,
+                    &sidecars,
+                    transition,
+                );
             }
             pending.spawn(async move {
                 let result = probe_composed_health(&sandbox_id, &info, lifecycle).await;
@@ -2155,7 +2200,7 @@ async fn composed_health_loop(
             });
         }
         while !pending.is_empty() {
-            apply_and_reconcile_composed_health_result(
+            if let Some(transition) = apply_and_reconcile_composed_health_result(
                 &state,
                 &db,
                 snapshot_scheduler.as_ref(),
@@ -2163,7 +2208,15 @@ async fn composed_health_loop(
                 &lifecycle_epochs,
                 pending.join_next().await,
             )
-            .await;
+            .await
+            {
+                report_health_transition(
+                    &mut transition_reports,
+                    &evidence_permits,
+                    &sidecars,
+                    transition,
+                );
+            }
         }
     }
 }
@@ -2472,7 +2525,7 @@ async fn apply_and_reconcile_composed_health_result(
     auto_lifecycle: &AutoLifecycleCoordinator,
     lifecycle_epochs: &HealthLifecycleEpochs,
     result: Option<CompletedHealthProbe>,
-) {
+) -> Option<diagnostics::HealthTransition> {
     let pause_failed_recovery = match result.as_ref() {
         Some(Ok((
             sandbox_id,
@@ -2485,37 +2538,60 @@ async fn apply_and_reconcile_composed_health_result(
             .map(|id| (id, *lifecycle_epoch)),
         _ => None,
     };
-    apply_composed_health_result(state, db, result).await;
-    let Some((sandbox_id, lifecycle_epoch)) = pause_failed_recovery else {
+    let transition = apply_composed_health_result(state, db, result).await;
+    if let Some((sandbox_id, lifecycle_epoch)) = pause_failed_recovery {
+        reconcile_pause_failed_quarantine(
+            db,
+            snapshot_scheduler,
+            auto_lifecycle,
+            lifecycle_epochs,
+            &sandbox_id,
+            lifecycle_epoch,
+        )
+        .await;
+    }
+    transition
+}
+
+/// Log a health transition, first gathering evidence for a degrading one in
+/// `pending` under an `evidence_permits` slot. The task looks up the
+/// sandbox's current sidecar authority itself, so evidence reflects the
+/// endpoint the next probe would use.
+fn report_health_transition(
+    pending: &mut tokio::task::JoinSet<()>,
+    evidence_permits: &Arc<tokio::sync::Semaphore>,
+    sidecars: &Arc<Mutex<HashMap<String, SidecarInfo>>>,
+    transition: diagnostics::HealthTransition,
+) {
+    if !transition.needs_evidence() {
+        transition.emit(None);
         return;
-    };
-    reconcile_pause_failed_quarantine(
-        db,
-        snapshot_scheduler,
-        auto_lifecycle,
-        lifecycle_epochs,
-        &sandbox_id,
-        lifecycle_epoch,
-    )
-    .await;
+    }
+    let evidence_permits = Arc::clone(evidence_permits);
+    let sidecars = Arc::clone(sidecars);
+    pending.spawn(async move {
+        // The semaphore is never closed, so acquisition only waits.
+        let _permit = evidence_permits.acquire_owned().await;
+        let info = sidecars.lock().await.get(transition.sandbox_id()).cloned();
+        let evidence = diagnostics::TransitionEvidence::gather(&transition, info.as_ref()).await;
+        transition.emit(Some(&evidence));
+    });
 }
 
 async fn apply_composed_health_result(
     state: &Arc<Mutex<HashMap<String, SandboxHealth>>>,
     db: &Arc<std::sync::Mutex<rusqlite::Connection>>,
     result: Option<CompletedHealthProbe>,
-) {
+) -> Option<diagnostics::HealthTransition> {
     let Some(Ok((sandbox_id, lifecycle, lifecycle_epoch, result))) = result else {
-        return;
+        return None;
     };
     let ComposedProbeResult {
         observations,
         guest_status,
     } = result;
     let mut map = state.lock().await;
-    let Some(health) = map.get_mut(&sandbox_id) else {
-        return;
-    };
+    let health = map.get_mut(&sandbox_id)?;
     if health.lifecycle_epoch != lifecycle_epoch {
         tracing::debug!(
             sandbox_id,
@@ -2523,9 +2599,10 @@ async fn apply_composed_health_result(
             current_epoch = health.lifecycle_epoch,
             "discarded health result from an older lifecycle epoch"
         );
-        return;
+        return None;
     }
     let previous_status = health.health_status;
+    let previous_guest_health = classify_guest_health(GuestHealthProbe::from(&*health));
     for (component, mut observation) in HealthComponent::ALL.into_iter().zip(observations) {
         observation.lifecycle_epoch = lifecycle_epoch;
         let outcome = observation.outcome;
@@ -2566,13 +2643,15 @@ async fn apply_composed_health_result(
         pplx_space_metrics::sandbox::worker::sandbox_health_transition(
             health.health_status.as_metric(),
         );
-        tracing::info!(
-            sandbox_id,
-            previous = ?previous_status,
-            current = ?health.health_status,
-            "sandbox composed health changed"
-        );
     }
+    let transition = diagnostics::HealthTransition::observe(
+        &sandbox_id,
+        lifecycle,
+        previous_status,
+        previous_guest_health,
+        health,
+        Instant::now(),
+    );
     drop(map);
     if let Some(uptime_secs) = guest_uptime {
         match db.lock() {
@@ -2586,6 +2665,7 @@ async fn apply_composed_health_result(
             }
         }
     }
+    transition
 }
 
 async fn reconcile_pause_failed_quarantine(

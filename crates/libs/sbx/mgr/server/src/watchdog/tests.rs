@@ -59,7 +59,7 @@ fn insert_test_sandbox(conn: &rusqlite::Connection, id: &str, state: crate::stat
     .expect("test sandbox insert must succeed");
 }
 
-fn test_health() -> SandboxHealth {
+pub(super) fn test_health() -> SandboxHealth {
     SandboxHealth {
         guest_uptime_secs: 10,
         guest_healthy: true,
@@ -86,6 +86,7 @@ fn test_health() -> SandboxHealth {
         lifecycle_epoch: 0,
         next_health_probe_at: Instant::now(),
         health_probe_sequence: 0,
+        last_console_tail_at: None,
     }
 }
 
@@ -976,7 +977,7 @@ fn guest_health_gauge_values_zero_fill_known_live_buckets() {
     }));
 }
 
-fn sample(outcome: HealthProbeOutcome) -> HealthObservation {
+pub(super) fn sample(outcome: HealthProbeOutcome) -> HealthObservation {
     HealthObservation {
         observed_at: SystemTime::now(),
         latency_micros: 10,

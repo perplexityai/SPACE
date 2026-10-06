@@ -1480,6 +1480,57 @@ pub fn sandbox_health_transition(status: SandboxHealthStatus) {
     );
 }
 
+/// Result of the bare `CONNECT` handshake the sandbox manager sends to a VM's
+/// spaced-guest vsock port once per degrading health transition. It separates
+/// a guest kernel that still services vsock (`accepted`, `refused`) from one
+/// that does not (`timeout`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SandboxRawVsockCheckOutcome {
+    /// Firecracker relayed the guest kernel's acceptance (`OK <port>`).
+    Accepted,
+    /// The connection closed before an acknowledgement: the guest kernel
+    /// reset it, so nothing accepts on the port or its backlog is full.
+    Refused,
+    /// Firecracker answered with something other than an acknowledgement.
+    UnexpectedReply,
+    /// No answer within the check's deadline.
+    Timeout,
+    /// The VM's host-side vsock socket could not be connected.
+    HostSocketUnavailable,
+    /// The sandbox has no recorded vsock socket to check.
+    NotAttempted,
+}
+
+impl SandboxRawVsockCheckOutcome {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Accepted => "accepted",
+            Self::Refused => "refused",
+            Self::UnexpectedReply => "unexpected_reply",
+            Self::Timeout => "timeout",
+            Self::HostSocketUnavailable => "host_socket_unavailable",
+            Self::NotAttempted => "not_attempted",
+        }
+    }
+}
+
+impl fmt::Display for SandboxRawVsockCheckOutcome {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// One raw vsock check run for a sandbox whose composed or guest health just
+/// degraded, tagged only by its outcome. Per-sandbox detail is in the
+/// sandbox manager's health-transition log line, never in tags.
+pub fn sandbox_health_raw_vsock_check(outcome: SandboxRawVsockCheckOutcome) {
+    counter(
+        "sandbox.health.raw_vsock_check",
+        1,
+        &[tag("outcome", outcome.as_str())],
+    );
+}
+
 /// `gateway_sha` value for a gateway running a binary that reports no sha, and
 /// for one that has not answered a stats probe yet.
 pub const NET_GATEWAY_SHA_UNKNOWN: &str = "unknown";

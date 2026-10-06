@@ -88,14 +88,10 @@ pub async fn connect_firecracker_vsock_channel_with_expected_peer(
             let connection_claimed = connection_claimed.clone();
             let pinned = pinned.clone();
             async move {
-                use tokio::io::AsyncWriteExt;
                 crate::uds::claim_single_connection(&connection_claimed)?;
                 let mut stream = tokio::net::UnixStream::connect(&path).await?;
                 crate::uds::validate_expected_uds_peer(&stream, expected_peer)?;
-                stream
-                    .write_all(format!("CONNECT {port}\n").as_bytes())
-                    .await?;
-                read_firecracker_ack(&mut stream).await?;
+                firecracker_vsock_handshake(&mut stream, port).await?;
                 Ok::<_, std::io::Error>(hyper_util::rt::TokioIo::new(crate::uds::PinnedIo::new(
                     stream, &pinned,
                 )))
@@ -109,6 +105,24 @@ pub async fn connect_firecracker_vsock_channel_with_expected_peer(
             source,
         })?;
     Ok((channel, connection))
+}
+
+/// Run only Firecracker's host-initiated vsock handshake on a stream already
+/// connected to the VM's vsock UDS: send `CONNECT {port}` and read the
+/// `OK <host port>` line. Firecracker answers only after the guest kernel
+/// accepts the connection on `port`, so success proves the guest kernel is
+/// servicing vsock even when the process listening on `port` never calls
+/// `accept`. A guest reset closes the stream before the line
+/// (`UnexpectedEof`); a malformed line is `InvalidData`.
+pub async fn firecracker_vsock_handshake(
+    stream: &mut (impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin),
+    port: u32,
+) -> std::io::Result<()> {
+    use tokio::io::AsyncWriteExt;
+    stream
+        .write_all(format!("CONNECT {port}\n").as_bytes())
+        .await?;
+    read_firecracker_ack(stream).await
 }
 
 async fn read_firecracker_ack(
@@ -127,12 +141,16 @@ async fn read_firecracker_ack(
                 .filter(|port| !port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit()))
                 .and_then(|port| port.parse::<u32>().ok());
             return port.map(|_| ()).ok_or_else(|| {
-                std::io::Error::other("invalid Firecracker CONNECT acknowledgement")
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "invalid Firecracker CONNECT acknowledgement",
+                )
             });
         }
         ack.push(byte);
     }
-    Err(std::io::Error::other(
+    Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
         "Firecracker CONNECT acknowledgement too long",
     ))
 }
