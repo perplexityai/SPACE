@@ -329,6 +329,19 @@ async fn encrypted_seal_stop_retries_while_the_runtime_is_still_exiting() {
 }
 
 #[tokio::test]
+async fn encrypted_seal_stop_gives_up_after_the_attempt_cap() {
+    let (service, id, _socket, server) =
+        service_with_stop(tonic::Code::Internal, super::ENC_CAPTURE_STOP_ATTEMPTS).await;
+
+    let error = super::stop_runtime_for_encrypted_seal(&service, &id.to_string())
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::Internal);
+
+    crate::runtime_supervisor_client::tests::stop_supervisor_server(server).await;
+}
+
+#[tokio::test]
 async fn encrypted_seal_stop_does_not_retry_other_failures() {
     let (service, id, _socket, server) =
         service_with_stop(tonic::Code::FailedPrecondition, 1).await;

@@ -1246,6 +1246,8 @@ pub(super) async fn set_firecracker_paused(
 
 /// Stops the runtime before the encrypted seal, re-issuing the idempotent stop
 /// while it fails server-side because the killed Firecracker is still exiting.
+/// Any server-side `Internal` is retried, so a persistent cgroup error surfaces
+/// only after the bounded attempts.
 async fn stop_runtime_for_encrypted_seal(
     service: &NodeManagerService,
     sandbox_id: &str,
