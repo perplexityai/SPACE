@@ -1,6 +1,7 @@
 use super::{
-    ENC_SNAPSHOT_MEMORY_NAME, ENC_SNAPSHOT_VMSTATE_NAME, reown_encrypted_snapshot_inputs,
-    set_snapshot_export_modes, validate_cache_artifact_path,
+    ENC_SNAPSHOT_JAIL_SUBDIR, ENC_SNAPSHOT_MEMORY_NAME, ENC_SNAPSHOT_VMSTATE_NAME,
+    pin_encrypted_snapshot_bind, reown_encrypted_snapshot_inputs, set_snapshot_export_modes,
+    validate_cache_artifact_path,
 };
 use std::os::unix::fs::PermissionsExt;
 
@@ -171,6 +172,45 @@ fn encrypted_load_rejects_links_before_changing_ownership() {
             );
         }
     }
+}
+
+#[test]
+fn encrypted_bind_target_is_pinned_inside_the_jail() {
+    use std::os::unix::fs::{MetadataExt, symlink};
+
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let (volume, jail, outside) = (root.join("volume"), root.join("jail"), root.join("outside"));
+    for dir in [&volume, &jail, &outside] {
+        std::fs::create_dir(dir).unwrap();
+    }
+    let target = jail.join(ENC_SNAPSHOT_JAIL_SUBDIR);
+    symlink(&outside, &target).unwrap();
+
+    // Suspend and restore share this pin; neither may follow the planted link.
+    let mut reowned = false;
+    let error = pin_encrypted_snapshot_bind(&volume, &jail, |_, _| {
+        reowned = true;
+        Ok(())
+    })
+    .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition, "{error}");
+    assert!(!reowned, "volume re-owned before its mountpoint was pinned");
+    assert!(std::fs::read_dir(&outside).unwrap().next().is_none());
+
+    std::fs::remove_file(&target).unwrap();
+    let (pinned_volume, pinned_target) =
+        pin_encrypted_snapshot_bind(&volume, &jail, |_, _| Ok(())).unwrap();
+    assert_eq!(
+        pinned_volume.metadata().unwrap().ino(),
+        std::fs::metadata(&volume).unwrap().ino()
+    );
+    let created = std::fs::symlink_metadata(&target).unwrap();
+    assert!(created.is_dir());
+    assert_eq!(pinned_target.metadata().unwrap().ino(), created.ino());
+    // A retry reuses the existing mountpoint.
+    let (_, retried) = pin_encrypted_snapshot_bind(&volume, &jail, |_, _| Ok(())).unwrap();
+    assert_eq!(retried.metadata().unwrap().ino(), created.ino());
 }
 
 fn cache_root() -> &'static str {

@@ -166,11 +166,24 @@ pub(super) fn open_bind_target(directory: &File, name: &std::ffi::OsStr) -> Resu
     open_regular_file_with_flags(directory, name, OFlag::O_RDONLY | OFlag::O_CREAT)
 }
 
-fn open_regular_file_with_flags(
+pub(super) fn open_bind_directory(
     directory: &File,
     name: &std::ffi::OsStr,
-    flags: OFlag,
 ) -> Result<File, Status> {
+    // The parent may be writable by the sandbox uid. Create and open the
+    // mountpoint relative to the pinned parent so a planted link cannot
+    // redirect a root-owned mount outside it.
+    require_file_name(name)?;
+    match nix::sys::stat::mkdirat(directory, name, Mode::from_bits_truncate(0o700)) {
+        Ok(()) | Err(nix::errno::Errno::EEXIST) => {}
+        Err(error) => return Err(path_error(error)),
+    }
+    openat(directory, name, DIRECTORY, Mode::empty())
+        .map(File::from)
+        .map_err(path_error)
+}
+
+fn require_file_name(name: &std::ffi::OsStr) -> Result<(), Status> {
     if Path::new(name).components().count() != 1
         || !matches!(
             Path::new(name).components().next(),
@@ -179,6 +192,15 @@ fn open_regular_file_with_flags(
     {
         return Err(path_error("expected a file name"));
     }
+    Ok(())
+}
+
+fn open_regular_file_with_flags(
+    directory: &File,
+    name: &std::ffi::OsStr,
+    flags: OFlag,
+) -> Result<File, Status> {
+    require_file_name(name)?;
     let file = File::from(
         openat(
             directory,
