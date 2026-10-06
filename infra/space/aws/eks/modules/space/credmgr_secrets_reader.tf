@@ -8,7 +8,9 @@
 # differs from the session's, so neither this policy nor a secret's resource
 # policy can let one organization's session read another organization's
 # secret. Secrets in another account also need a resource policy that allows
-# this role.
+# this role, and a secret under a customer-managed KMS key (required across
+# accounts) needs that key's policy to allow this role kms:Decrypt with
+# kms:ViaService = secretsmanager.<region>.amazonaws.com.
 #
 # The role grants nothing until a secret is tagged, so it exists on every
 # cluster; the credmgr chart's secretsManagerRoleArn activates it.
@@ -57,6 +59,36 @@ data "aws_iam_policy_document" "credmgr_secrets_reader" {
       test     = "StringEquals"
       variable = "secretsmanager:ResourceTag/space-org-id"
       values   = ["$${aws:PrincipalTag/space-org-id}"]
+    }
+  }
+
+  # Secrets Manager decrypts with the caller's authority. Allow it only inside a
+  # Secrets Manager call, which the tag conditions here already authorize; a
+  # customer-managed key's policy must also allow this role the same way.
+  statement {
+    sid       = "DecryptOnlyThroughSecretsManager"
+    actions   = ["kms:Decrypt"]
+    resources = ["*"]
+
+    condition {
+      test     = "StringLike"
+      variable = "kms:ViaService"
+      values   = ["secretsmanager.*.amazonaws.com"]
+    }
+  }
+
+  # A key policy can grant this role kms access on its own; never outside
+  # Secrets Manager. StringNotLike is also true when the call is direct.
+  statement {
+    sid       = "DenyKmsOutsideSecretsManager"
+    effect    = "Deny"
+    actions   = ["kms:*"]
+    resources = ["*"]
+
+    condition {
+      test     = "StringNotLike"
+      variable = "kms:ViaService"
+      values   = ["secretsmanager.*.amazonaws.com"]
     }
   }
 

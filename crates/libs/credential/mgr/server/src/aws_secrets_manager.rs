@@ -4,11 +4,13 @@
 //! authority assumes the reader role named by
 //! `SPACE_CREDMGR_SECRETS_MANAGER_ROLE_ARN` with the session tag
 //! `space-org-id=<organization>` and a session policy that allows
-//! `GetSecretValue` only on secrets tagged with that same organization. The
-//! session policy caps the session whatever the role's own policy or a secret's
-//! resource policy grants the role, so a reference cannot read another
-//! organization's secret even where the authority's own identity could. The
-//! committed effective network policy limits destinations.
+//! `GetSecretValue` only on secrets tagged with that same organization, and
+//! `kms:Decrypt` only through Secrets Manager. The session policy caps the
+//! session whatever the role's own policy or a secret's resource policy grants
+//! the role, so a reference cannot read another organization's secret even
+//! where the authority's own identity could. A secret under a customer-managed
+//! key also needs that key's policy to allow the role `kms:Decrypt` through
+//! Secrets Manager. The committed effective network policy limits destinations.
 
 use std::num::NonZeroUsize;
 use std::sync::{Mutex, MutexGuard, PoisonError};
@@ -76,7 +78,9 @@ fn parse_reader_role_arn(
 }
 
 /// Session policy limiting an organization's session to secrets tagged with
-/// that organization.
+/// that organization. Secrets Manager decrypts with the caller's authority, so
+/// the session also needs `kms:Decrypt`, but only inside a Secrets Manager call
+/// that the tag condition already authorized.
 fn session_policy(organization_id: Uuid) -> String {
     let mut tag_matches = serde_json::Map::new();
     tag_matches.insert(
@@ -85,12 +89,20 @@ fn session_policy(organization_id: Uuid) -> String {
     );
     serde_json::json!({
         "Version": "2012-10-17",
-        "Statement": [{
-            "Effect": "Allow",
-            "Action": "secretsmanager:GetSecretValue",
-            "Resource": "*",
-            "Condition": { "StringEquals": tag_matches },
-        }]
+        "Statement": [
+            {
+                "Effect": "Allow",
+                "Action": "secretsmanager:GetSecretValue",
+                "Resource": "*",
+                "Condition": { "StringEquals": tag_matches },
+            },
+            {
+                "Effect": "Allow",
+                "Action": "kms:Decrypt",
+                "Resource": "*",
+                "Condition": { "StringLike": { "kms:ViaService": "secretsmanager.*.amazonaws.com" } },
+            },
+        ]
     })
     .to_string()
 }

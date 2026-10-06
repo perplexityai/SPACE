@@ -238,16 +238,28 @@ async fn reads_sign_with_a_session_scoped_to_the_requesting_organization() {
         policy,
         serde_json::json!({
             "Version": "2012-10-17",
-            "Statement": [{
-                "Effect": "Allow",
-                "Action": "secretsmanager:GetSecretValue",
-                "Resource": "*",
-                "Condition": {
-                    "StringEquals": {
-                        "secretsmanager:ResourceTag/space-org-id": organization.to_string()
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Action": "secretsmanager:GetSecretValue",
+                    "Resource": "*",
+                    "Condition": {
+                        "StringEquals": {
+                            "secretsmanager:ResourceTag/space-org-id": organization.to_string()
+                        }
+                    }
+                },
+                {
+                    // Customer-managed keys: decrypt only inside the Secrets
+                    // Manager call the tag condition authorized.
+                    "Effect": "Allow",
+                    "Action": "kms:Decrypt",
+                    "Resource": "*",
+                    "Condition": {
+                        "StringLike": { "kms:ViaService": "secretsmanager.*.amazonaws.com" }
                     }
                 }
-            }]
+            ]
         })
     );
     // The workload identity signs only the AssumeRole; the secret read is
