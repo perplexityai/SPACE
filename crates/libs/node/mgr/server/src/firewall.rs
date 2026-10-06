@@ -19,6 +19,7 @@ const SPACE_TABLE: &str = "space";
 const SANDBOX_TABLE: &str = "sandbox";
 const SANDBOX_L2_TABLE: &str = "sandbox_l2";
 const GUEST_VLAN_DROP_COMMENT: &str = "drop-guest-vlan";
+const STALE_GATEWAY_MAC_COMMENT: &str = "accept-stale-gateway-mac";
 const INBOUND_REPLY_COMMENT: &str = "ct-inbound-replies";
 const TPROXY_INBOUND_REPLY_COMMENT: &str = "skip-tproxy-inbound-replies";
 const LOCAL_SERVICE_REPLY_COMMENT: &str = "skip-tproxy-local-service-replies";
@@ -31,8 +32,22 @@ const PRE_TPROXY_GUARDRAILS_POLICY_PATH: &str =
     "/etc/space/nftables/sandbox-pre-tproxy-guardrails.json";
 
 /// The guest L2 ingress policy as one `nft -f` transaction: the netdev table,
-/// its ingress chain bound to the TAP, and the two VLAN drop rules. Flushing
-/// the owned chain first prevents duplicate rules when it is re-applied.
+/// its ingress chain bound to the TAP, the two VLAN drop rules, and the rule
+/// that accepts the guest's frames for a stale gateway MAC. Flushing the owned
+/// chain first prevents duplicate rules when it is re-applied.
+///
+/// A restored guest keeps the neighbour table it was snapshotted with, whose
+/// gateway entry holds the MAC of the TAP on the slot the snapshot was taken
+/// on. Every TAP has its own MAC, and a restore normally lands on another
+/// slot, on this node or another, so the guest addresses its first frames to
+/// a MAC this TAP does not have. The kernel marks those frames for another
+/// host and drops them before IPv4 or ARP sees them, and the guest, whose
+/// entry still reads as reachable, does not ask again for many seconds. On
+/// this point-to-point link every IPv4 or ARP frame from the guest is meant
+/// for the host, so the last rule reclassifies these as addressed to it. It
+/// changes no verdict: the namespace's IPv4 rules filter them exactly as
+/// frames sent to the TAP's own MAC, and the VLAN drops run first. The host's
+/// next ARP exchange with the guest then corrects the guest's entry.
 ///
 /// Written in nft's native syntax because its JSON input cannot create this
 /// chain on nftables 1.0.4 (Amazon Linux 2023): given `"dev": "tap0"` it skips
@@ -48,6 +63,7 @@ add chain netdev {SANDBOX_L2_TABLE} ingress {{ type filter hook ingress device \
 flush chain netdev {SANDBOX_L2_TABLE} ingress
 add rule netdev {SANDBOX_L2_TABLE} ingress meta protocol {{ 0x8100, 0x88a8 }} counter drop comment \"{GUEST_VLAN_DROP_COMMENT}\"
 add rule netdev {SANDBOX_L2_TABLE} ingress ether type {{ 0x8100, 0x88a8 }} counter drop comment \"{GUEST_VLAN_DROP_COMMENT}\"
+add rule netdev {SANDBOX_L2_TABLE} ingress meta protocol {{ 0x0800, 0x0806 }} meta pkttype other counter meta pkttype set host comment \"{STALE_GATEWAY_MAC_COMMENT}\"
 "
     )
 }
@@ -729,9 +745,9 @@ fn validate_guest_l2_ingress_chain(
         .iter()
         .filter_map(|entry| entry.get("rule"))
         .collect();
-    let [metadata_rule, raw_frame_rule] = rules.as_slice() else {
+    let [metadata_rule, raw_frame_rule, stale_gateway_mac_rule] = rules.as_slice() else {
         return Err(FirewallValidationError::Missing(
-            "guest L2 ingress chain does not contain the two owned VLAN drop rules".to_string(),
+            "guest L2 ingress chain does not contain exactly its three owned rules".to_string(),
         ));
     };
     if !guest_l2_drop_rule_matches(
@@ -745,7 +761,39 @@ fn validate_guest_l2_ingress_chain(
             "guest L2 ingress chain does not contain the two owned VLAN drop rules".to_string(),
         ));
     }
+    if !guest_l2_stale_gateway_mac_rule_matches(stale_gateway_mac_rule) {
+        return Err(FirewallValidationError::Missing(
+            "guest L2 ingress chain does not end with the owned stale gateway MAC rule".to_string(),
+        ));
+    }
     Ok(())
+}
+
+fn guest_l2_stale_gateway_mac_rule_matches(rule: &serde_json::Value) -> bool {
+    if rule.get("comment") != Some(&serde_json::json!(STALE_GATEWAY_MAC_COMMENT)) {
+        return false;
+    }
+    let Some(exprs) = rule.get("expr").and_then(serde_json::Value::as_array) else {
+        return false;
+    };
+    let [protocol_expr, pkttype_expr, counter_expr, mangle_expr] = exprs.as_slice() else {
+        return false;
+    };
+    let expected_protocols = normalize_set_membership_op(&serde_json::json!({
+        "match": {
+            "left": { "meta": { "key": "protocol" } },
+            "right": { "set": [2048, 2054] },
+            "op": "in"
+        }
+    }));
+    let pkttype = serde_json::json!({ "meta": { "key": "pkttype" } });
+    normalize_set_membership_op(protocol_expr) == expected_protocols
+        && pkttype_expr.pointer("/match/op") == Some(&serde_json::json!("=="))
+        && pkttype_expr.pointer("/match/left") == Some(&pkttype)
+        && matches!(pkttype_expr.pointer("/match/right"), Some(right) if right == "other" || right == 3)
+        && counter_expr.get("counter").is_some()
+        && mangle_expr.pointer("/mangle/key") == Some(&pkttype)
+        && matches!(mangle_expr.pointer("/mangle/value"), Some(value) if value == "host" || value == 0)
 }
 
 fn guest_l2_drop_rule_matches(rule: &serde_json::Value, left: serde_json::Value) -> bool {
@@ -968,6 +1016,10 @@ fn normalize_set_membership_op(expr: &serde_json::Value) -> serde_json::Value {
                 *value = serde_json::json!(33024);
             } else if value == "8021ad" {
                 *value = serde_json::json!(34984);
+            } else if value == "ip" {
+                *value = serde_json::json!(2048);
+            } else if value == "arp" {
+                *value = serde_json::json!(2054);
             }
         }
         values.sort_unstable_by_key(serde_json::Value::as_u64);
