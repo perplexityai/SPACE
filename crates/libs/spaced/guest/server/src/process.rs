@@ -1829,7 +1829,7 @@ impl Process for SpacedGuestService {
                     .map(|(key, value)| (key.as_str(), Pii::new(value).expose_pii().expose())),
             );
         }
-        // Place the workload in the capped `workloads/` cgroup before exec, and
+        // Place the workload in its `workloads/` cgroup before exec, and
         // before dropping credentials: the move writes a root-owned
         // `cgroup.procs`, and these pre_exec hooks run in registration order.
         if let Some(cgroups) = self.inner.guest_cgroups.as_ref() {

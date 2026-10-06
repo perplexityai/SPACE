@@ -1,7 +1,7 @@
 use super::{
-    FILESYSTEM_TASKS_MAX, SUPERVISION_TASK_RESERVE, TaskPartition,
-    WORKLOADS_MEMORY_RESERVE_MAX_BYTES, has_controller, missing_controllers, parse_unified_cgroup,
-    task_partition_from, workloads_memory_max_from,
+    FILESYSTEM_TASKS_MAX, SUPERVISION_TASK_RESERVE, TaskPartition, USER_MEMORY_RESERVE_MAX_BYTES,
+    has_controller, missing_controllers, parse_unified_cgroup, task_partition_from,
+    user_memory_max_from,
 };
 
 #[test]
@@ -42,11 +42,13 @@ fn detects_missing_controllers_without_delegation() {
 /// stay below the ceiling by at least the supervision reserve.
 fn assert_partition_holds(ceiling: u64, tasks: TaskPartition) {
     assert_eq!(tasks.filesystem, FILESYSTEM_TASKS_MAX);
-    assert!(tasks.workloads > tasks.sessions);
     assert_eq!(
-        tasks.filesystem + tasks.workloads + tasks.sessions,
+        tasks.filesystem + tasks.user,
         ceiling - SUPERVISION_TASK_RESERVE
     );
+    // Either member filling its cap leaves the other an eighth of the slice.
+    assert!(tasks.user_member < tasks.user);
+    assert!(tasks.user - tasks.user_member >= tasks.user / 8);
 }
 
 #[test]
@@ -129,20 +131,20 @@ fn placement_hook_owns_the_descriptor_until_spawn() {
 
 const MIB: u64 = 1024 * 1024;
 
-// Workloads keep all but an eighth of a small guest, and all but 128 MiB of a
-// larger one, so the guest itself never runs out of memory for them.
+// User work keeps all but an eighth of a small guest, and all but 128 MiB of
+// a larger one, so the guest itself never runs out of memory for it.
 #[test]
-fn workloads_memory_cap_reserves_an_eighth_up_to_128_mib() {
-    assert_eq!(workloads_memory_max_from(512 * MIB), Some(448 * MIB));
-    assert_eq!(workloads_memory_max_from(1024 * MIB), Some(896 * MIB));
+fn user_memory_cap_reserves_an_eighth_up_to_128_mib() {
+    assert_eq!(user_memory_max_from(512 * MIB), Some(448 * MIB));
+    assert_eq!(user_memory_max_from(1024 * MIB), Some(896 * MIB));
     assert_eq!(
-        workloads_memory_max_from(4096 * MIB),
-        Some(4096 * MIB - WORKLOADS_MEMORY_RESERVE_MAX_BYTES)
+        user_memory_max_from(4096 * MIB),
+        Some(4096 * MIB - USER_MEMORY_RESERVE_MAX_BYTES)
     );
 }
 
 #[test]
-fn workloads_memory_uncapped_when_the_guest_is_too_small_to_split() {
-    assert_eq!(workloads_memory_max_from(0), None);
-    assert_eq!(workloads_memory_max_from(7), None);
+fn user_memory_uncapped_when_the_guest_is_too_small_to_split() {
+    assert_eq!(user_memory_max_from(0), None);
+    assert_eq!(user_memory_max_from(7), None);
 }

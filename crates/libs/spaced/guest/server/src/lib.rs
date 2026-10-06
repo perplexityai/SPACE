@@ -353,8 +353,8 @@ struct SpacedGuestServiceInner {
     /// host-side reconcilers can detect guest restarts (which drop the
     /// in-memory authorized port set) and re-apply port bridges.
     service_generation: String,
-    /// Guest cgroup split that places spawned workloads in a capped
-    /// `workloads/` leaf, away from the supervisor. `None` outside a real
+    /// Guest cgroup split that places spawned workloads in the workloads
+    /// unit's leaf, with the rest of user work and away from the supervisor. `None` outside a real
     /// Firecracker guest or when cgroup setup degraded to the shared layout.
     guest_cgroups: Option<Arc<cgroup::GuestCgroups>>,
 }
