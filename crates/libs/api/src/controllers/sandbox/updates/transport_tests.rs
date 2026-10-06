@@ -331,12 +331,12 @@ async fn untransmitted_update_is_replayed_once_on_a_fresh_client() -> TestResult
         let backend: std::net::SocketAddr = worker.endpoint().parse()?;
         let front = RestartingFront::start(backend).await?;
         fixture.move_worker(&front.addr.to_string()).await?;
-        let pooled = fixture
-            .controller
-            .substrate
-            .probe_runtime_client(fixture.sandbox)
-            .await?
-            .expect("direct worker is reachable");
+        // Use the pod-client dial path: pooled direct channels retry refused
+        // redials internally before surfacing the failure.
+        let client = crate::controllers::substrate::connect_worker(
+            tonic::transport::Endpoint::from_shared(format!("http://{}", front.addr))?,
+        )
+        .await?;
         front.stop().await;
         // Let the client observe the closed connection, so the next request
         // takes the redial path rather than racing the close.
@@ -344,7 +344,7 @@ async fn untransmitted_update_is_replayed_once_on_a_fresh_client() -> TestResult
         fixture.move_worker(worker.endpoint()).await?;
 
         fixture
-            .send(pooled, operation.clone())
+            .send(client, operation.clone())
             .await
             .map_err(|error| format!("{label}: {error}"))?;
 
