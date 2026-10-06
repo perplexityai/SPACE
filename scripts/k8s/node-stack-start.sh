@@ -57,32 +57,35 @@ require_env() {
 # like the prod node-service DaemonSets. Services and the cluster API derive
 # the UUID from (name, role) via space_k8s_node_id; nothing here hand-rolls
 # a node identity.
-require_env SPACE_NODE_ID SPACE_NODE_ROLE SPACE_INTERNAL_TOKEN \
-  SPACE_INTERNAL_CONTROL_TOKEN SPACE_INTERNAL_API_ENDPOINT
-case "$SPACE_NODE_ROLE" in
-  worker|builder) ;;
-  *) die "SPACE_NODE_ROLE must be worker or builder (got: $SPACE_NODE_ROLE)" ;;
-esac
+load_node_identity() {
+  require_env SPACE_NODE_ID SPACE_NODE_ROLE SPACE_INTERNAL_TOKEN \
+    SPACE_INTERNAL_CONTROL_TOKEN SPACE_INTERNAL_API_ENDPOINT
+  case "$SPACE_NODE_ROLE" in
+    worker|builder) ;;
+    *) die "SPACE_NODE_ROLE must be worker or builder (got: $SPACE_NODE_ROLE)" ;;
+  esac
 
-# ── Legacy DirectSubstrate registration (3486 bench only) ────────────────────
-# The single-worker `space-local-3486` bench runs the api-server on
-# DirectSubstrate, which schedules off nodes/node_direct rows and has no
-# real registration RPC (production uses the Kubernetes substrate, where the
-# pod reflector + node-ctl publish cover discovery). When the chart opts in,
-# fall back to the bench-era identity (md5 uuid of the node name) and register
-# the node_direct endpoint by SQL after node-api is serving. Requires the
-# chart to render POSTGRES_CONNECTION_STRING; never enabled on the
-# production-shaped `space-local` stack.
-DIRECT_REGISTRATION="${SPACE_DIRECT_SUBSTRATE_REGISTRATION:-0}"
-if [[ "$DIRECT_REGISTRATION" == "1" ]]; then
-  [[ "$SPACE_NODE_ROLE" == "worker" ]] \
-    || die "DirectSubstrate registration is supported only for the worker role"
-  require_env POSTGRES_CONNECTION_STRING SPACE_NODE_API_ENDPOINT
-  hash=$(printf '%s' "$SPACE_NODE_ID" | md5sum | awk '{print $1}')
-  SPACE_NODE_ID="${hash:0:8}-${hash:8:4}-${hash:12:4}-${hash:16:4}-${hash:20:12}"
-  export SPACE_NODE_ID
-  log "DirectSubstrate registration enabled (bench mode); node_id=$SPACE_NODE_ID"
-fi
+  # ── Legacy DirectSubstrate registration (3486 bench only) ──────────────────
+  # The single-worker `space-local-3486` bench runs the api-server on
+  # DirectSubstrate, which schedules off nodes/node_direct rows and has no
+  # real registration RPC (production uses the Kubernetes substrate, where the
+  # pod reflector + node-ctl publish cover discovery). When the chart opts in,
+  # fall back to the bench-era identity (md5 uuid of the node name) and register
+  # the node_direct endpoint by SQL after node-api is serving. Requires the
+  # chart to render POSTGRES_CONNECTION_STRING; never enabled on the
+  # production-shaped `space-local` stack.
+  DIRECT_REGISTRATION="${SPACE_DIRECT_SUBSTRATE_REGISTRATION:-0}"
+  if [[ "$DIRECT_REGISTRATION" == "1" ]]; then
+    [[ "$SPACE_NODE_ROLE" == "worker" ]] \
+      || die "DirectSubstrate registration is supported only for the worker role"
+    require_env POSTGRES_CONNECTION_STRING SPACE_NODE_API_ENDPOINT
+    local hash
+    hash=$(printf '%s' "$SPACE_NODE_ID" | md5sum | awk '{print $1}')
+    SPACE_NODE_ID="${hash:0:8}-${hash:8:4}-${hash:12:4}-${hash:16:4}-${hash:20:12}"
+    export SPACE_NODE_ID
+    log "DirectSubstrate registration enabled (bench mode); node_id=$SPACE_NODE_ID"
+  fi
+}
 
 # ── Loop devices: give the pod the pool a production node has ────────────────
 # Two things in this pod attach loop devices: the btrfs cache image below, and
@@ -180,8 +183,9 @@ ensure_btrfs_cache() {
   # /usr/sbin is off a non-root PATH here. Against a MOUNTED loop device it does
   # not detach — it sets
   # LO_FLAGS_AUTOCLEAR, so the kernel releases the device when the filesystem is
-  # fully unmounted. Workers release it with the pod's mount namespace; builders
-  # propagate the mount to the Kind node and reuse it across pod replacements.
+  # fully unmounted. Workers release it with the pod's mount namespace; on
+  # builders the mount-cache init container mounts it in the kind node's
+  # namespace, where it stays and every later builder pod reuses it.
   # Without it every container restart leaks one device permanently (an attached
   # but unmounted loop is never reclaimed), and a handful of Tilt rollouts
   # exhausts the pool. The mount stays fully usable; verified on a devbox.
@@ -722,6 +726,18 @@ on_term() {
   done
   exit 0
 }
+
+# The builder chart's mount-cache init container runs only this step: it
+# attaches and mounts the btrfs cache in the kind node's mount namespace, the
+# way a production builder's host has /space/cache before any service starts,
+# and exits. It gets no service environment.
+if [[ "${1:-}" == "--mount-cache" ]]; then
+  space_loop_stage_pool log
+  ensure_btrfs_cache
+  exit 0
+fi
+
+load_node_identity
 trap on_term TERM INT
 
 log "node-stack starting (node_id=$SPACE_NODE_ID role=$SPACE_NODE_ROLE cluster_api=$SPACE_INTERNAL_API_ENDPOINT)"
