@@ -1425,6 +1425,7 @@ mod status;
 mod template_publication;
 mod template_registration_store;
 mod template_releases_store;
+mod template_system_publication_grants;
 mod template_visibility_cache;
 #[cfg(test)]
 mod tests;

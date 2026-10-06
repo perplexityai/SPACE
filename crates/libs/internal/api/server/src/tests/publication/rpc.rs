@@ -60,6 +60,27 @@ fn release(name: &str, org: Option<Uuid>) -> RegisterTemplateReleaseRequest {
     }
 }
 
+/// What the API records before it dispatches a system template build.
+async fn grant_system_publication(pool: &sqlx::PgPool, template: &str) -> TestResult {
+    sqlx::query(sql!(
+        "INSERT INTO template_system_publication_grants (id, template_name) VALUES ($1, $2)"
+    ))
+    .bind(Uuid::now_v7())
+    .bind(template)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+async fn system_publication_grants(pool: &sqlx::PgPool, template: &str) -> TestResult<i64> {
+    Ok(sqlx::query_scalar(sql!(
+        "SELECT count(*) FROM template_system_publication_grants WHERE template_name = $1"
+    ))
+    .bind(template)
+    .fetch_one(pool)
+    .await?)
+}
+
 #[test]
 fn authenticated_publication_enforces_identity_owner_and_reserved_outputs() -> TestResult {
     let env = [
@@ -188,6 +209,32 @@ async fn run() -> TestResult {
             "workers",
         ))
         .await?;
+    // Build-manager also publishes tenant templates, so it publishes a system
+    // template only for a system build the API dispatched. The deploy-time
+    // publisher needs no grant.
+    assert_eq!(
+        client
+            .register_template(request(
+                registration("code-runtime", None),
+                "space-build-manager"
+            ))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::PermissionDenied
+    );
+    assert_eq!(
+        client
+            .register_template_release(request(
+                release("code-runtime", None),
+                "space-build-manager"
+            ))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::PermissionDenied
+    );
+    grant_system_publication(&db.pool, "code-runtime").await?;
     for (name, publisher) in [
         ("seed", "space-template-publish"),
         ("code-runtime", "space-build-manager"),
@@ -211,6 +258,33 @@ async fn run() -> TestResult {
             .register_template_release(request(release(name, None), publisher))
             .await?;
     }
+    // One grant covers one release: a second release, an expired grant, or a
+    // grant for another template authorizes nothing.
+    assert_eq!(
+        system_publication_grants(&db.pool, "code-runtime").await?,
+        0
+    );
+    let mut second = release("code-runtime", None);
+    second.hash = format!("sha256:{}", "c".repeat(64));
+    sqlx::query(sql!(
+        "INSERT INTO template_system_publication_grants (id, template_name, granted_at)
+         VALUES ($1, 'code-runtime', NOW() - INTERVAL '8 days')"
+    ))
+    .bind(Uuid::now_v7())
+    .execute(&db.pool)
+    .await?;
+    grant_system_publication(&db.pool, "seed").await?;
+    assert_eq!(
+        client
+            .register_template_release(request(second, "space-build-manager"))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::PermissionDenied
+    );
+    sqlx::query(sql!("DELETE FROM template_system_publication_grants"))
+        .execute(&db.pool)
+        .await?;
     client
         .register_template(request(
             registration("tenant-output", Some(owner)),
@@ -315,9 +389,12 @@ async fn run() -> TestResult {
             .code(),
         Code::PermissionDenied
     );
+    grant_system_publication(&db.pool, "seed").await?;
     client
         .register_template(request(registration("seed", None), "space-build-manager"))
         .await?;
+    // Registering the template leaves the grant for the build's release.
+    assert_eq!(system_publication_grants(&db.pool, "seed").await?, 1);
     sqlx::query(sql!("UPDATE templates SET org_id=$1 WHERE name='seed'"))
         .bind(foreign)
         .execute(&db.pool)

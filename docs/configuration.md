@@ -143,7 +143,7 @@ because disabling it by mistake would leave every create queued forever.
 | `SPACE_TEMPLATE_CACHE_BUDGET_BYTES` | 100 GiB | 0 or an invalid value disables cache GC. |
 | `SPACE_TEMPLATE_BUILD_DISK_MIB` | build-manager default | JSON. |
 | `SPACE_TRUSTED_TEMPLATE_STORAGE_BUCKETS` | empty = any bucket | |
-| `SPACE_TEMPLATE_PUBLISH_SYSTEM_SERVICE_ACCOUNTS`, `SPACE_TEMPLATE_PUBLISH_TENANT_SERVICE_ACCOUNTS` | empty | Startup error when the allowed set is empty. |
+| `SPACE_TEMPLATE_PUBLISH_SYSTEM_SERVICE_ACCOUNTS`, `SPACE_TEMPLATE_PUBLISH_TENANT_SERVICE_ACCOUNTS` | empty | Startup error when the allowed set is empty. An account in both lists (build-manager) publishes a system template only for a system build the API dispatched; one build publishes one release. |
 | `SPACE_BUILD_AUTH_SYSTEM_SERVICE_ACCOUNTS`, `SPACE_BUILD_AUTH_TENANT_SERVICE_ACCOUNTS` | empty | |
 | `SPACE_BUILD_MANAGER_ENDPOINT` | `127.0.0.1:9900` | |
 | `SPACE_BUILD_MANAGER_TLS_SERVER_NAME` | from endpoint | |

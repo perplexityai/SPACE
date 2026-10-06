@@ -298,10 +298,43 @@ impl TemplateController {
             ),
             None => None,
         };
+        // A system build's output is published by build-manager, which
+        // ClusterApi accepts only under this grant; it lands before dispatch
+        // for the same reason as the base grant.
+        let system_publication_grant = match &submission.target {
+            TemplateBuildTarget::System(_) => Some(
+                self.build_jobs
+                    .record_system_publication_grant(&template_name)
+                    .await
+                    .map_err(|error| {
+                        db_contention_error("failed to record system publication grant", &error)
+                    })?,
+            ),
+            TemplateBuildTarget::Organization(_) => None,
+        };
         let client_build_id = submission.client_build_id.clone();
-        let response = self
+        let response = match self
             .start_template_build_request(submission.into_start_build_request())
-            .await?;
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                // An undispatched submission authorizes no publication. If an
+                // ambiguous failure did start the build, its publication is
+                // denied and the build must be resubmitted.
+                if let Some(grant) = system_publication_grant
+                    && let Err(revoke_error) =
+                        self.build_jobs.revoke_system_publication_grant(grant).await
+                {
+                    tracing::warn!(
+                        error = %revoke_error,
+                        %template_name,
+                        "failed to withdraw an undispatched system publication grant; it expires on its own"
+                    );
+                }
+                return Err(error);
+            }
+        };
         self.record_template_build_response(
             org_id,
             template_name,
