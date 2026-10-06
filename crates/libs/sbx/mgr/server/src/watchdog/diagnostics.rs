@@ -14,7 +14,7 @@
 //!   a starved or memory-exhausted guest from one that stalled while idle;
 //! - when the composed status becomes `Degraded`, at most once per
 //!   [`CONSOLE_TAIL_MIN_INTERVAL`] per sandbox, bounded tails of the
-//!   Firecracker log and, if console capture is enabled, the guest console.
+//!   Firecracker log and of the guest console file, when one exists.
 //!
 //! Sandbox IDs appear only in the log line; the one metric is tagged by
 //! outcome alone.
@@ -561,8 +561,9 @@ fn firecracker_log_path(sandbox_id: &str) -> PathBuf {
     ))
 }
 
-/// Written only when `SPACE_ENABLE_GUEST_CONSOLE_LOGS` attaches the serial
-/// console at launch.
+/// Created only when `SPACE_ENABLE_GUEST_CONSOLE_LOGS` is set, as the
+/// jailer's output. Guest serial output reaches it only if Firecracker's own
+/// stdout does, which a daemonizing jailer redirects to `/dev/null`.
 fn guest_console_log_path(sandbox_id: &str) -> PathBuf {
     PathBuf::from(format!("{RUN_DIR}/{sandbox_id}/{GUEST_CONSOLE_LOG_FILE}"))
 }
