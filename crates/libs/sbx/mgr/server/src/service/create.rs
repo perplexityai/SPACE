@@ -685,7 +685,7 @@ impl SandboxManagerService {
         sandbox
             .state
             .transition(SandboxState::Restoring)
-            .map_err(|error| Status::failed_precondition(error.to_string()))?;
+            .map_err(Status::from)?;
 
         // Serialize the whole activation boundary with cleanup. A cleanup
         // admitted for the previous execution must either finish before this

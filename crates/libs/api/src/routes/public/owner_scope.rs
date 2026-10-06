@@ -102,8 +102,40 @@ async fn authorize_request(state: &AppState, request: Request) -> Result<Request
             .sandbox_controller
             .scoped_sandbox(&state.pool, &scope, sandbox_id.into())
             .await
-            .map_err(super::sandboxes::controller_error)?
-            .ok_or_else(|| PublicApiError::not_found("sandbox not found"))?;
+            .map_err(super::sandboxes::controller_error)?;
+        let Some(sandbox) = sandbox else {
+            let matched = parts
+                .extensions
+                .get::<axum::extract::MatchedPath>()
+                .ok_or_else(PublicApiError::internal)?
+                .as_str();
+            let relative = matched
+                .strip_prefix(crate::routes::PUBLIC_API_SHARED_ROOT)
+                .or_else(|| matched.strip_prefix("/v1"));
+            if parts.method == axum::http::Method::DELETE
+                && relative
+                    == Some(pplx_space_public_api::routes::DELETE_SANDBOX.relative_runtime_path())
+            {
+                // Deleted targets have no live owner row. Only an exact replay
+                // of an operation in the caller's owner scope may pass; the
+                // handler rechecks idempotency under its admission lock.
+                if let Some(subject_id) = subject_id {
+                    namespace_idempotency_key(&mut parts.headers, subject_id)?;
+                }
+                if super::sandboxes::delete_replay_in_owner_scope(
+                    &state.pool,
+                    org_id,
+                    subject_id,
+                    &parts.headers,
+                    sandbox_id,
+                )
+                .await?
+                {
+                    return Ok(Request::from_parts(parts, body));
+                }
+            }
+            return Err(PublicApiError::not_found("sandbox not found"));
+        };
         if owner.is_some() && sandbox.owner_source != SandboxOwnerSource::FederatedIdentity {
             return Err(PublicApiError::not_found("sandbox not found"));
         }

@@ -896,6 +896,17 @@ impl PublicOperationAdmission {
         &self.observation
     }
 
+    pub(crate) async fn sandbox_belongs_to_org(
+        &mut self,
+        sandbox_id: SandboxId,
+        org_id: OrgId,
+    ) -> Result<bool, PublicOperationStoreError> {
+        Ok(sandbox_store::get(&mut *self.tx, sandbox_id)
+            .await
+            .map_err(sqlx::Error::from)?
+            .is_some_and(|sandbox| sandbox.org_id == org_id))
+    }
+
     pub(crate) async fn lock_target_lifecycle(
         &mut self,
         target_id: SandboxId,

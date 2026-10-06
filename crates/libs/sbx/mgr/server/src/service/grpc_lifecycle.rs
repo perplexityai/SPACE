@@ -1551,7 +1551,7 @@ impl SandboxManagerService {
         sandbox
             .state
             .transition(SandboxState::Pausing)
-            .map_err(|error| Status::failed_precondition(error.to_string()))?;
+            .map_err(Status::from)?;
 
         {
             let db = self.db_conn()?;
@@ -2587,6 +2587,17 @@ impl SandboxManagerService {
                 outcome,
                 Some(reason.to_string()),
                 metric_outcome,
+                metric_started_at,
+            ));
+        }
+        // A completed STOP has already released this execution's runtime;
+        // retain its disk and let containerd discard only the obsolete task.
+        // Cleanup preserves the retired generation as the release witness.
+        if status.state == SandboxState::Stopped {
+            return Ok(teardown_suspend_prepare_response(
+                TeardownSuspendOutcome::Superseded,
+                Some("a generation-fenced stop retired this execution".to_string()),
+                pplx_space_metrics::sandbox::worker::TeardownSuspendPrepareOutcome::Superseded,
                 metric_started_at,
             ));
         }
@@ -5373,7 +5384,7 @@ impl SandboxManagerService {
         sandbox
             .state
             .transition(SandboxState::Stopping)
-            .map_err(|error| Status::failed_precondition(error.to_string()))?;
+            .map_err(Status::from)?;
 
         let (sandbox_id, uuid8) = Self::cleanup_identity(id, Some(&sandbox.uuid8))?;
         let completion = CleanupCompletion::MarkStopped;

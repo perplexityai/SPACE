@@ -1413,7 +1413,7 @@ fn select_cluster_deleted_evict_candidates<'a>(
 }
 
 /// The local row shapes a cluster-deleted report may reclaim: a
-/// suspended wake-cache copy, a failed cross-node restore's retained
+/// stopped rootfs, a suspended wake-cache copy, a failed cross-node restore's retained
 /// `restoring` row (identified by any persisted `failure_reason`; a
 /// whitespace-only reason is treated as no marker, matching sbx-manager),
 /// or a `suspending` row whose teardown suspend had its durable backup
@@ -1427,7 +1427,11 @@ fn select_cluster_deleted_evict_candidates<'a>(
 fn local_row_is_cluster_deleted_reclaimable(state: &SandboxInfo) -> bool {
     use pplx_space_sbx_mgr_client::proto::SandboxLifecycleState;
     match state.observed_lifecycle().ok() {
-        Some(SandboxLifecycleState::Suspended | SandboxLifecycleState::Quarantined) => true,
+        Some(
+            SandboxLifecycleState::Stopped
+            | SandboxLifecycleState::Suspended
+            | SandboxLifecycleState::Quarantined,
+        ) => true,
         Some(SandboxLifecycleState::Restoring) => state
             .failure_reason
             .as_deref()

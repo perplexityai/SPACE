@@ -46,6 +46,7 @@ class Scenario(Generic[Fixture]):
     timeout_minutes: int
     backends: frozenset[str]
     quarantined: str | None
+    ignored: str | None
     verify: Callable[[Fixture], None]
     source_module: str
 
@@ -79,12 +80,15 @@ def scenario(
     required_tools: Iterable[str] = (),
     api_surfaces: Iterable[str] = ("ecw",),
     quarantined: str | None = None,
+    ignored: str | None = None,
 ) -> Callable[[Callable[[Fixture], None]], Scenario[Fixture]]:
     """Declare a smoke; its typed parameter selects the prepared fixture.
 
     `quarantined` names the reason (a PR or issue) a scenario is withheld from
     implicit selection (`--all`, `--category`). A quarantined scenario still
     runs when named explicitly, so it can be fixed and re-proven in place.
+    `ignored` withholds a proposed contract that is not yet agreed. It stays
+    explicitly runnable and visible in suite logs, outside the defect backlog.
     """
 
     if not id or any(part == "" for part in id.split(".")):
@@ -119,6 +123,10 @@ def scenario(
         )
     if quarantined is not None and not quarantined.strip():
         raise ValueError("smoke quarantine must state its reason")
+    if ignored is not None and not ignored.strip():
+        raise ValueError("ignored smoke must state its reason")
+    if ignored is not None and quarantined is not None:
+        raise ValueError("smoke cannot be both ignored and quarantined")
     supported_surfaces = frozenset(api_surfaces)
     if not supported_surfaces or not supported_surfaces <= {"ecw", "native"}:
         raise ValueError("smoke API surfaces must contain 'ecw' and/or 'native'")
@@ -162,6 +170,7 @@ def scenario(
             timeout_minutes=fixture_type.timeout_minutes,
             backends=FIXTURE_BACKENDS[fixture_type],
             quarantined=quarantined,
+            ignored=ignored,
             verify=verify,
             source_module=verify.__module__,
         )
@@ -232,6 +241,7 @@ class ScenarioRegistry:
         template: str | None = None,
         backend: str | None = None,
         include_quarantined: bool = False,
+        include_ignored: bool = False,
     ) -> tuple[Scenario[Any], ...]:
         return tuple(
             scenario
@@ -240,6 +250,7 @@ class ScenarioRegistry:
             and scenario.applies_to(template)
             and (backend is None or backend in scenario.backends)
             and (include_quarantined or scenario.quarantined is None)
+            and (include_ignored or scenario.ignored is None)
         )
 
 

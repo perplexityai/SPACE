@@ -185,6 +185,125 @@ async fn native_admission_records_effective_owner_and_scopes_replay_and_polling(
 }
 
 #[tokio::test]
+async fn deleted_sandbox_replay_is_authorized_by_its_retained_operation() -> TestDbResult<()> {
+    use crate::public_operations::{ClaimPublicOperations, CompleteClaimedPublicOperation};
+    use pplx_space_public_api::{
+        OperationKind, PublicOperationResult, PublicSandboxOperationResult, SandboxLifecycleAction,
+        SandboxLifecycleState,
+    };
+    use std::time::Duration;
+
+    for owner in [HeaderMap::new(), owner_headers(ORG, "101")] {
+        let fixture = fixture().await?;
+        let (status, created) = send(
+            &fixture.app,
+            Method::POST,
+            "/v1/sandboxes",
+            grant_headers(owner.clone()),
+            json!({"template":"seed:latest"}),
+        )
+        .await?;
+        assert_eq!(status, StatusCode::ACCEPTED, "{created}");
+        let sandbox_id = seed_target(&fixture, &created).await?;
+        let path = format!("/v1/sandboxes/{sandbox_id}");
+        let (status, deleted) = send(
+            &fixture.app,
+            Method::DELETE,
+            &path,
+            owner.clone(),
+            Value::Null,
+        )
+        .await?;
+        assert_eq!(status, StatusCode::ACCEPTED, "{deleted}");
+        let operation_id: OperationId = deleted["operation_id"].as_str().unwrap().parse()?;
+        let store = PublicOperationStore::new(fixture.db.pool.clone());
+        let claim = store
+            .claim_operations(ClaimPublicOperations {
+                limit: 1,
+                claim_stale_after: Duration::from_secs(60),
+                claimable_kinds: &[OperationKind::DeleteSandbox],
+            })
+            .await?;
+        assert_eq!(claim.operations[0].id, operation_id);
+        sqlx::query(sql!("DELETE FROM sandboxes WHERE id = $1"))
+            .bind(sandbox_id.as_uuid())
+            .execute(&fixture.db.pool)
+            .await?;
+        assert!(
+            store
+                .complete_claimed_operation(CompleteClaimedPublicOperation {
+                    claim_token: claim.claim_token,
+                    operation_id,
+                    progress_message: "deleted".into(),
+                    result_json: serde_json::to_value(PublicOperationResult::Sandbox(
+                        PublicSandboxOperationResult {
+                            sandbox_id,
+                            state: SandboxLifecycleState::Deleted,
+                            action: Some(SandboxLifecycleAction::Delete),
+                            controller_response: None
+                        }
+                    ))?,
+                })
+                .await?
+        );
+
+        let (status, replay) = send(
+            &fixture.app,
+            Method::DELETE,
+            &path,
+            owner.clone(),
+            Value::Null,
+        )
+        .await?;
+        assert_eq!(status, StatusCode::ACCEPTED, "{replay}");
+        assert_eq!(replay["operation_id"], deleted["operation_id"]);
+        for headers in [owner.clone(), owner_headers(OTHER_ORG, "101")] {
+            let mut request = Request::builder()
+                .method(Method::DELETE)
+                .uri(&path)
+                .header("authorization", format!("Bearer {KEY}"));
+            request.headers_mut().unwrap().extend(headers);
+            let response = fixture
+                .app
+                .clone()
+                .oneshot(request.body(Body::empty())?)
+                .await?;
+            assert_eq!(
+                response.status(),
+                StatusCode::NOT_FOUND,
+                "an absent key cannot authorize replay"
+            );
+        }
+        let mut fresh = owner.clone();
+        fresh.insert("idempotency-key", "new-delete".parse()?);
+        for (method, target, headers) in [
+            (Method::DELETE, path.clone(), fresh),
+            (Method::DELETE, path.clone(), owner_headers(ORG, "102")),
+            (
+                Method::DELETE,
+                path.clone(),
+                owner_headers(OTHER_ORG, "101"),
+            ),
+            (Method::GET, path.clone(), owner.clone()),
+            (Method::POST, format!("{path}:wake"), owner.clone()),
+            (
+                Method::DELETE,
+                format!(
+                    "/v1/sandboxes/{}",
+                    PublicSandboxId::from(pplx_space_common_core::types::SandboxId::new())
+                ),
+                owner.clone(),
+            ),
+        ] {
+            let (status, response) =
+                send(&fixture.app, method, &target, headers, Value::Null).await?;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{response}");
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn native_create_requires_grant_before_enqueue() -> TestDbResult<()> {
     let fixture = fixture().await?;
     let (status, _) = send(

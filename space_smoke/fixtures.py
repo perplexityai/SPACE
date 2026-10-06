@@ -831,6 +831,7 @@ class CommandSandboxFixture:
     _durable_lifecycle: DurableLifecycleSandbox | None = None
     _resident_lifecycle: ResidentLifecycleSandbox | None = None
     _stoppable_lifecycle: StoppableLifecycleSandbox | None = None
+    _local_cleanup_control: ColdEvictionControl | None = None
     _processes: ProcessSandbox | None = None
 
     fixture_name: ClassVar[str] = "command_sandbox"
@@ -1159,6 +1160,66 @@ class CommandSandboxFixture:
             self.record("restart_error_type", type(error).__name__)
             return f"{type(error).__name__}: {error}"
         return None
+
+    def local_cleanup_worker(self) -> str | None:
+        """Capture the fixture's worker while its execution is still running."""
+        control = self._local_cleanup_control
+        if control is None:
+            return None
+        placement = control.sandbox_pod_placement(self.sandbox.sandbox_id.removeprefix("sbx_"))
+        self.verify(placement is not None, "cannot locate the fixture sandbox worker")
+        assert placement is not None
+        return control.worker_node_stack_pod(placement.node_name)
+
+    def delete_stopped_and_wait_for_local_cleanup(self, worker: str | None) -> None:
+        """Exercise deletion after the runtime route is gone, then observe reconciliation."""
+        control = self._local_cleanup_control
+        if control is None or worker is None:
+            self.delete_sandbox()
+            self.wait_until_deleted()
+            self.record("local_cleanup_observer", "unavailable outside Kind")
+            return
+        sandbox_id = self.sandbox.sandbox_id.removeprefix("sbx_")
+        deadline = time.monotonic() + 90
+        while True:
+            pods = control.sandbox_pods(sandbox_id)
+            if all(pod.phase in ("Succeeded", "Failed") for pod in pods):
+                break
+            self.verify(
+                time.monotonic() < deadline,
+                "stopped execution did not release its task",
+                pods=[pod.pod_name for pod in pods],
+            )
+            self._context.wait(2)
+        self.verify(
+            control.sandbox_cache_dir_present(worker, sandbox_id),
+            "STOP lost the retained rootfs before DELETE",
+        )
+        since_time = _log_since_time()
+        self.delete_sandbox()
+        self.wait_until_deleted()
+        # Kind configures a 10-second quiescence window; allow normal node
+        # reconciliation, its 60-second retry slack and another poll to complete.
+        deadline = time.monotonic() + 180
+        while True:
+            evictions = control.local_evictions(
+                sandbox_id, pod_names=[worker], since_time=since_time
+            )
+            if any(event.reason == "cluster_row_absent" for event in evictions):
+                break
+            self.verify(
+                time.monotonic() < deadline,
+                "deleted stopped sandbox was not reclaimed by node reconciliation",
+                worker=worker,
+                sandbox_id=sandbox_id,
+            )
+            self._context.wait(10)
+        self.verify(
+            not control.sandbox_cache_dir_present(worker, sandbox_id),
+            "node cleanup completed but retained rootfs still exists",
+            worker=worker,
+        )
+        self.record("stopped_delete_local_cleanup", "node eviction completed and rootfs removed")
 
     def start_background_process(
         self, command: str, *, timeout: int = 60
@@ -3264,7 +3325,7 @@ class SuspendCodecAssertions:
         # was created from the template. Privileged scenarios reclaim their
         # own rows at teardown, so on a bench these are the retained suspend
         # bytes of sandboxes other scenarios already deleted (the
-        # cluster-deleted eviction reclaims them only after a 600 s quiescence
+        # cluster-deleted eviction reclaims them only after its quiescence
         # window). They are provably dead once the cluster row is gone, so
         # they are reclaimed here through the daemon's own delete — the
         # reclaim op refuses a row whose sandbox still exists, which is a busy

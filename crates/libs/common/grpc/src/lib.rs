@@ -80,8 +80,9 @@ pub use status::{
     DESIRED_STATE_APPLY_TERMINAL_METADATA, GuestCapability, GuestCapabilityUnsupported,
     GuestServiceUnavailable, RETRY_AFTER_MS_METADATA, RateLimited, SandboxServiceRouteNotReady,
     UdsPerSandboxLimitExceeded, guest_capability_unsupported_status, guest_service_connect_status,
-    is_desired_state_apply_terminal, mark_desired_state_apply_terminal, rate_limited_status,
-    retry_after, sandbox_service_route_not_ready_status, uds_per_sandbox_limit_exceeded_status,
+    is_desired_state_apply_terminal, is_terminal_guest_process_error,
+    mark_desired_state_apply_terminal, mark_guest_process_error, rate_limited_status, retry_after,
+    sandbox_service_route_not_ready_status, uds_per_sandbox_limit_exceeded_status,
     with_retry_after,
 };
 pub use trace::{

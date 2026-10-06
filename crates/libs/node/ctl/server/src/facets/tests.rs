@@ -124,13 +124,16 @@ fn cluster_deleted_evict_selects_suspended_and_quarantined_but_not_started_or_ab
     let absent_id = "019e6370-cfc9-7a43-9337-399c7b51a1d3";
     let quarantined_id = "019e6370-cfc9-7a43-9337-399c7b51a1d4";
     let present_quarantined_id = "019e6370-cfc9-7a43-9337-399c7b51a1d5";
+    let stopped_id = "019e6370-cfc9-7a43-9337-399c7b51a1d6";
     let deleted = vec![
+        stopped_id.to_string(),
         suspended_id.to_string(),
         started_id.to_string(),
         absent_id.to_string(),
         quarantined_id.to_string(),
     ];
     let local_states = BTreeMap::from([
+        local_state(stopped_id, "stopped"),
         local_state(suspended_id, "suspended"),
         local_state(started_id, "started"),
         local_state(quarantined_id, "quarantined"),
@@ -140,7 +143,7 @@ fn cluster_deleted_evict_selects_suspended_and_quarantined_but_not_started_or_ab
     let candidates =
         select_cluster_deleted_evict_candidates(&deleted, &local_states, 25, |_| false);
 
-    assert_eq!(candidates, vec![suspended_id, quarantined_id]);
+    assert_eq!(candidates, vec![suspended_id, quarantined_id, stopped_id]);
 }
 
 #[test]

@@ -244,6 +244,10 @@ templateCache:
   gcGraceSecs: "60"
   prefetchLatestN: "1"
 
+# Keep cluster-deletion cleanup on the normal reconciler, with a short local
+# grace period in disposable Kind clusters. The worker default is 600 seconds.
+clusterDeletedEvictionQuiescenceSecs: "10"
+
 # Cold-sandbox eviction — sandbox-manager's loop that removes a parked,
 # suspended sandbox's entire local presence (cache dir, instance subvolume,
 # node-local rows) once its state is provably restorable from a ready remote

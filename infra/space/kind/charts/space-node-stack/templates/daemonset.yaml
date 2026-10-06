@@ -195,6 +195,10 @@ spec:
               value: {{ . | quote }}
             {{- end }}
             {{- end }}
+            {{- with .Values.clusterDeletedEvictionQuiescenceSecs }}
+            - name: SPACE_SBX_CLUSTER_DELETED_QUIESCENCE_SECS
+              value: {{ . | quote }}
+            {{- end }}
             {{- with .Values.sandboxEviction }}
             {{- if .enabled }}
             # Cold-sandbox eviction (sandbox-manager). Same env the prod

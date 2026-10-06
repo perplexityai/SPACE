@@ -41,8 +41,8 @@ use crate::{
     models::{Sandbox, SandboxMetadata as ControllerSandboxMetadata, SandboxMetadataValue},
     public_operations::{
         ApiProduct, CreatePublicOperation, CreatePublicOperationIdempotency,
-        CreatePublicOperationResult, HttpOperationMethod, OperationPathTemplate,
-        PublicOperationStore,
+        CreatePublicOperationResult, HttpOperationMethod, ObservePublicOperationIdempotency,
+        OperationPathTemplate, PublicOperationStore,
     },
     public_sandbox_operations::{
         CreateSandboxOperationPayload, SandboxLifecycleOperationPayload,
@@ -165,6 +165,14 @@ async fn create_native_sandbox_operation(
 fn prepare_native_create_request(
     request: CreateSandboxRequest,
 ) -> Result<(CreateSandboxRequest, RequestFingerprint), PublicApiError> {
+    if let Some(vcpu) = request
+        .resources
+        .as_ref()
+        .and_then(|resources| resources.vcpu)
+    {
+        pplx_space_common_core::types::VcpuCount::try_from_u32(vcpu)
+            .map_err(|error| PublicApiError::bad_request(format!("vcpu: {error}")))?;
+    }
     if let Some(size_mib) = request
         .resources
         .as_ref()
@@ -483,6 +491,41 @@ impl ListSandboxesQuery {
     }
 }
 
+pub(super) async fn delete_replay_in_owner_scope(
+    pool: &PgPool,
+    org_id: OrgId,
+    subject_id: Option<UserId>,
+    headers: &HeaderMap,
+    sandbox_id: PublicSandboxId,
+) -> Result<bool, PublicApiError> {
+    if !headers.contains_key("idempotency-key") {
+        return Ok(false);
+    }
+    let key = idempotency_key(headers)?;
+    let action = SandboxLifecycleAction::Delete;
+    let fingerprint = lifecycle_request_fingerprint(sandbox_id, action, None)?;
+    let store = PublicOperationStore::new(pool.clone());
+    let observation = store
+        .observe_operation_idempotency(
+            org_id,
+            ApiProduct::Native,
+            &CreatePublicOperationIdempotency {
+                method: lifecycle_method(action),
+                path_template: lifecycle_path_template(action),
+                key: &key,
+                request_fingerprint: &fingerprint,
+            },
+        )
+        .await?;
+    match observation {
+        ObservePublicOperationIdempotency::Existing(operation_id) => Ok(store
+            .operation_in_owner_scope(org_id, subject_id, operation_id)
+            .await?),
+        ObservePublicOperationIdempotency::Missing
+        | ObservePublicOperationIdempotency::Conflict { .. } => Ok(false),
+    }
+}
+
 async fn enqueue_lifecycle_operation(
     pool: &PgPool,
     org_id: OrgId,
@@ -494,8 +537,39 @@ async fn enqueue_lifecycle_operation(
 ) -> Result<(StatusCode, Json<SandboxOperationResponse>), PublicApiError> {
     let idempotency_key = idempotency_key(&headers)?;
     let sandbox_id = parse_public_sandbox_id(sandbox_id)?;
-    ensure_sandbox_owner(pool, org_id, sandbox_id).await?;
     let fingerprint = lifecycle_request_fingerprint(sandbox_id, action, rollback.as_ref())?;
+    let store = PublicOperationStore::new(pool.clone());
+    let idempotency = CreatePublicOperationIdempotency {
+        method: lifecycle_method(action),
+        path_template: lifecycle_path_template(action),
+        key: &idempotency_key,
+        request_fingerprint: &fingerprint,
+    };
+    let mut admission = store
+        .begin_operation_admission(org_id, ApiProduct::Native, &idempotency)
+        .await?;
+    // A completed DELETE outlives its sandbox. The tenant-scoped operation and
+    // request fingerprint authorize replay; only new intent needs a live target.
+    match admission.observation() {
+        ObservePublicOperationIdempotency::Existing(operation_id) => {
+            let operation_id = *operation_id;
+            admission.finish().await?;
+            let response = sandbox_operation_response(&store, org_id, operation_id).await?;
+            return Ok((StatusCode::ACCEPTED, Json(response)));
+        }
+        ObservePublicOperationIdempotency::Conflict { .. } => {
+            return Err(PublicApiError::idempotency_conflict(
+                "idempotency key was already used with a different request",
+            ));
+        }
+        ObservePublicOperationIdempotency::Missing => {}
+    }
+    if !admission
+        .sandbox_belongs_to_org(SandboxId::from_uuid(sandbox_id.as_uuid()), org_id)
+        .await?
+    {
+        return Err(PublicApiError::not_found("sandbox not found"));
+    }
     let sandbox_id_string = sandbox_id.to_string();
     let payload_json = SandboxLifecycleOperationPayload {
         sandbox_id,
@@ -503,9 +577,8 @@ async fn enqueue_lifecycle_operation(
         rollback,
     }
     .into_json();
-    let store = PublicOperationStore::new(pool.clone());
-    let result = store
-        .create_operation(CreatePublicOperation {
+    let result = admission
+        .create(CreatePublicOperation {
             org_id,
             actor_user_id: Some(actor_user_id),
             api_product: ApiProduct::Native,
@@ -513,12 +586,7 @@ async fn enqueue_lifecycle_operation(
             target_type: Some(OperationTargetType::Sandbox),
             target_id: Some(&sandbox_id_string),
             payload_json,
-            idempotency: Some(CreatePublicOperationIdempotency {
-                method: lifecycle_method(action),
-                path_template: lifecycle_path_template(action),
-                key: &idempotency_key,
-                request_fingerprint: &fingerprint,
-            }),
+            idempotency: Some(idempotency),
         })
         .await?;
 

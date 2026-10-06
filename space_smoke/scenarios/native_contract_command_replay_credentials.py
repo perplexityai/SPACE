@@ -5,7 +5,10 @@ from space_smoke.native_hardening import NativeHardeningFixture
 @scenario(
     "native_contract.command_replay_credentials",
     api_surfaces=("native",),
-    quarantined="command retries revoke prior attachment credentials; overlapping retry contract is unresolved",
+    ignored=(
+        "Overlapping credential validity is not an agreed API guarantee; "
+        "decision: docs/native-api-hardening.md#credential-replay-contract-deferred"
+    ),
 )
 def command_replay_credentials(test: NativeHardeningFixture) -> None:
     """A command retry preserves its session and reports any credential invalidation."""
@@ -19,6 +22,4 @@ def command_replay_credentials(test: NativeHardeningFixture) -> None:
     new = test.events(replay.body, timeout=10)
     test.context.verify(new.status == 200, "replayed command credential was unusable", replay_status=new.status)
     test.context.record("credential_replay", {"original_status": old.status, "replay_status": new.status})
-    if old.status in (401, 403):
-        test.context.warn("command replay revoked the earlier attachment credential; concurrent retry contract remains unresolved")
     test.context.verify(old.status == 200, "unexpected original credential response", original_status=old.status)

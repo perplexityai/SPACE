@@ -4728,6 +4728,205 @@ mod kubernetes_tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn published_activation_releases_only_its_completed_lease() -> Result<(), BoxError> {
+        let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+        let sandbox_id = SandboxId::new();
+        insert_test_sandbox_row(&db.pool, sandbox_id, "creating").await?;
+        let substrate = substrate_with_store_and_client(db.pool.clone(), inert_kubernetes_client());
+        let attempt_id = SandboxActivationAttemptId::new();
+        let execution = substrate
+            .store
+            .begin_activation_execution_row(
+                sandbox_id,
+                attempt_id,
+                SandboxTransitionTargetState::Started,
+            )
+            .await?;
+        let completion = Some(crate::controllers::substrate::ActivationLeaseCompletion {
+            generation: execution.generation,
+            attempt_id,
+        });
+        // CREATE's pre-publication release is a no-op: the target is not yet
+        // visible. This is why completion must also run after publication.
+        substrate
+            .store
+            .release_activation_attempt_best_effort(sandbox_id, execution.generation, attempt_id)
+            .await;
+        assert_eq!(
+            substrate
+                .store
+                .active_execution_status(sandbox_id)
+                .await?
+                .unwrap()
+                .activation_attempt_id,
+            Some(attempt_id)
+        );
+        sqlx::query(sql!(
+            "UPDATE sandboxes SET lifecycle = 'started' WHERE id = $1"
+        ))
+        .bind(sandbox_id)
+        .execute(&db.pool)
+        .await?;
+        // STOP may win immediately after publication, before lease release.
+        sqlx::query(sql!(
+            "UPDATE sandboxes SET lifecycle = 'stopped' WHERE id = $1"
+        ))
+        .bind(sandbox_id)
+        .execute(&db.pool)
+        .await?;
+        substrate
+            .complete_activation_lease(sandbox_id, completion)
+            .await;
+        let next = substrate
+            .store
+            .assign_activation_attempt(
+                sandbox_id,
+                execution.generation,
+                SandboxActivationAttemptId::new(),
+                SandboxTransitionTargetState::Started,
+            )
+            .await?;
+        // An immediate START must own its materialization instead of joining
+        // CREATE and trying to wake the exited pod. Late CREATE completion
+        // must not release that new owner, even after its target is published.
+        sqlx::query(sql!(
+            "UPDATE sandboxes SET lifecycle = 'started' WHERE id = $1"
+        ))
+        .bind(sandbox_id)
+        .execute(&db.pool)
+        .await?;
+        substrate
+            .complete_activation_lease(sandbox_id, completion)
+            .await;
+        let current = substrate
+            .store
+            .active_execution_status(sandbox_id)
+            .await?
+            .unwrap();
+        assert_eq!(current.activation_attempt_id, Some(next));
+        assert_eq!(current.route_activation_id, Some(attempt_id));
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn start_failure_before_wake_releases_its_activation_lease() -> Result<(), BoxError> {
+        for source_pending in [true, false] {
+            let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+            let sandbox_id = SandboxId::new();
+            let lifecycle = if source_pending { "stopped" } else { "started" };
+            insert_test_sandbox_row(&db.pool, sandbox_id, lifecycle).await?;
+            insert_k8s_execution(
+                &db.pool,
+                sandbox_id,
+                1,
+                "space-sbx-stopped-g1",
+                "stopped-pod-uid",
+                Some("127.0.0.1"),
+                true,
+            )
+            .await?;
+            let route_id = SandboxActivationAttemptId::new();
+            sqlx::query(sql!(
+                "UPDATE sandbox_k8s_executions SET route_activation_id = $2 WHERE sandbox_id = $1"
+            ))
+            .bind(sandbox_id)
+            .bind(route_id)
+            .execute(&db.pool)
+            .await?;
+            let pod_creates = Arc::new(Mutex::new(Vec::new()));
+            let pod = Pod {
+                metadata: kube::api::ObjectMeta {
+                    name: Some("space-sbx-stopped-g1".into()),
+                    namespace: Some("space".into()),
+                    uid: Some("stopped-pod-uid".into()),
+                    ..Default::default()
+                },
+                status: Some(PodStatus {
+                    phase: Some("Running".into()),
+                    pod_ip: Some("127.0.0.1".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            // Model a stop racing START: materialization sees Running, then
+            // the authoritative pre-dispatch route check sees a terminal pod.
+            let client = suspend_handoff_kubernetes_client(
+                pod.clone(),
+                Arc::new(Semaphore::new(0)),
+                Arc::clone(&pod_creates),
+            );
+            let substrate = substrate_with_store_client_proxy_port_and_pod(
+                db.pool.clone(),
+                client,
+                DEFAULT_SANDBOX_PROXY_PORT,
+                Some(pod),
+            );
+            let error = substrate
+                .start_execution(
+                    SandboxApiMetricIdentity::native("start"),
+                    sandbox_id,
+                    crate::controllers::substrate::ActivationOptions {
+                        blocking: true,
+                        ready_timeout: Duration::from_secs(1),
+                    },
+                    crate::controllers::substrate::RecoveryCharge::Exempt,
+                )
+                .await
+                .expect_err("no worker Wake can be dispatched");
+            if source_pending {
+                assert!(
+                    matches!(error, SubstrateError::Timeout { ref message, .. }
+                    if message.contains("source node or evacuated")),
+                    "{error:?}"
+                );
+            } else {
+                assert!(
+                    matches!(error, SubstrateError::Unavailable { ref message }
+                    if message.contains("terminating or terminal")),
+                    "{error:?}"
+                );
+            }
+            let lease_live: bool = sqlx::query_scalar(sql!(
+                "SELECT COALESCE(activation_attempt_expires_at > NOW(), FALSE)
+                 FROM sandbox_k8s_executions WHERE sandbox_id = $1 AND active"
+            ))
+            .bind(sandbox_id)
+            .fetch_one(&db.pool)
+            .await?;
+            assert!(
+                !lease_live,
+                "a retry must recover the pod, not join an abandoned activation (source_pending={source_pending})"
+            );
+            assert!(pod_creates.lock().unwrap().is_empty());
+            let replacement = substrate
+                .store
+                .assign_activation_attempt(
+                    sandbox_id,
+                    1,
+                    SandboxActivationAttemptId::new(),
+                    SandboxTransitionTargetState::Started,
+                )
+                .await?;
+            substrate
+                .store
+                .release_finished_activation_attempt_best_effort(sandbox_id, 1, route_id)
+                .await;
+            let current = substrate
+                .store
+                .active_execution_status(sandbox_id)
+                .await?
+                .unwrap();
+            assert_eq!(current.route_activation_id, Some(route_id));
+            assert_eq!(
+                current.activation_attempt_id,
+                Some(replacement),
+                "stale cancellation must preserve a successor's lease"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn start_losing_restore_lease_reports_joined_completion() -> Result<(), BoxError> {
         // Arrange.
         let db = pplx_space_db_test_fixtures::pg_test_db().await?;
@@ -6866,6 +7065,120 @@ mod kubernetes_tests {
             stale_existing_pod_reason(&sandbox, &pod, None),
             Some(StalePodReason::SandboxSuspended)
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stopped_restart_replaces_only_execution_retired_by_current_stop()
+    -> Result<(), BoxError> {
+        for predates_stop in [true, false] {
+            let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+            let id = SandboxId::new();
+            insert_test_sandbox_row(&db.pool, id, "stopped").await?;
+            let pod_name = format!("space-sbx-{}-g2", id.as_uuid().simple());
+            insert_k8s_execution(
+                &db.pool,
+                id,
+                2,
+                &pod_name,
+                "restart-pod",
+                Some("127.0.0.1"),
+                true,
+            )
+            .await?;
+            let old_attempt = SandboxActivationAttemptId::new();
+            sqlx::query(sql!(
+                "UPDATE sandbox_k8s_executions SET
+                    created_at = (
+                        SELECT lifecycle_changed_at + make_interval(secs => $3)
+                        FROM sandboxes WHERE id = $1
+                    ),
+                    route_activation_id = $2, activation_attempt_id = $2,
+                    activation_attempt_target_state = 'started',
+                    activation_attempt_expires_at = NOW() - INTERVAL '1 second'
+                 WHERE sandbox_id = $1"
+            ))
+            .bind(id)
+            .bind(old_attempt)
+            .bind(if predates_stop { -1.0_f64 } else { 1.0_f64 })
+            .execute(&db.pool)
+            .await?;
+            let pod = Pod {
+                metadata: kube::api::ObjectMeta {
+                    name: Some(pod_name),
+                    namespace: Some("space".into()),
+                    uid: Some("restart-pod".into()),
+                    annotations: Some(BTreeMap::from([(
+                        SANDBOX_SUSPEND_RESTORE_SOURCE_NODE_ANNOTATION.into(),
+                        "source-node".into(),
+                    )])),
+                    ..Default::default()
+                },
+                status: Some(PodStatus {
+                    phase: Some("Running".into()),
+                    pod_ip: Some("127.0.0.1".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let creates = Arc::new(Mutex::new(Vec::new()));
+            let client = running_pod_kubernetes_client_with_create_barrier(
+                Arc::clone(&creates),
+                "127.0.0.1",
+                None,
+                false,
+                Some(serde_json::to_value(&pod)?),
+            );
+            let substrate = substrate_with_store_client_proxy_port_and_pod(
+                db.pool.clone(),
+                client,
+                DEFAULT_SANDBOX_PROXY_PORT,
+                Some(pod),
+            );
+            let sandbox = fetch_sandbox(&db.pool, id).await?.unwrap();
+            substrate
+                .ensure_pod_exists(
+                    &sandbox,
+                    None,
+                    Some("source-node"),
+                    None,
+                    PodMaterializationOwnership::new(
+                        None,
+                        None,
+                        Some(ActivationAttemptAssignment::new(
+                            SandboxActivationAttemptId::new(),
+                            SandboxTransitionTargetState::Started,
+                        )),
+                    ),
+                )
+                .await?;
+            {
+                let created = creates.lock().unwrap();
+                if predates_stop {
+                    assert_eq!(created.len(), 1, "the stopped predecessor must be replaced");
+                    assert_eq!(
+                        created[0]
+                            .pointer("/metadata/annotations/space.pplx.net~1checkpoint")
+                            .and_then(serde_json::Value::as_str),
+                        Some("stopped")
+                    );
+                } else {
+                    assert!(
+                        created.is_empty(),
+                        "retry must reattach to the running successor"
+                    );
+                }
+            }
+            assert_eq!(
+                substrate
+                    .store
+                    .active_execution_status(id)
+                    .await?
+                    .unwrap()
+                    .generation,
+                if predates_stop { 3 } else { 2 }
+            );
+        }
+        Ok(())
     }
 
     #[test]

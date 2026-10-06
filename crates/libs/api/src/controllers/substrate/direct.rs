@@ -3529,6 +3529,7 @@ impl SubstrateAdapter for DirectSubstrate {
                 .await?;
             let execution_generation = receipt_execution_generation(route_identity.as_ref());
             return Ok(CreateExecutionOutcome {
+                lease_completion: None,
                 sandbox_id,
                 binding: Some(ExecutionBinding {
                     execution_object_id: sandbox_id.to_string(),
@@ -3587,6 +3588,7 @@ impl SubstrateAdapter for DirectSubstrate {
             let execution_generation = receipt_execution_generation(route_identity.as_ref());
 
             return Ok(CreateExecutionOutcome {
+                lease_completion: None,
                 sandbox_id,
                 binding: Some(ExecutionBinding {
                     execution_object_id: sandbox_id.to_string(),
@@ -3708,6 +3710,7 @@ impl SubstrateAdapter for DirectSubstrate {
         let execution_generation = receipt_execution_generation(route_identity.as_ref());
 
         Ok(CreateExecutionOutcome {
+            lease_completion: None,
             sandbox_id,
             binding: Some(ExecutionBinding {
                 execution_object_id: sandbox_id.to_string(),

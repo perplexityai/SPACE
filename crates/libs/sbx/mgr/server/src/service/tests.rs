@@ -7104,7 +7104,11 @@ pub(crate) mod service_tests {
 
     #[tokio::test]
     async fn evict_cluster_deleted_sandbox_reclaims_retained_restoring_and_quarantined_rows() {
-        for state in [SandboxState::Restoring, SandboxState::Quarantined] {
+        for state in [
+            SandboxState::Restoring,
+            SandboxState::Quarantined,
+            SandboxState::Stopped,
+        ] {
             let conn = crate::db::test_conn();
             let sandbox_id = SandboxId::new().to_string();
             let initial_state = if state == SandboxState::Quarantined {
@@ -7126,7 +7130,7 @@ pub(crate) mod service_tests {
                     )
                     .unwrap()
                 );
-            } else {
+            } else if state == SandboxState::Quarantined {
                 crate::db::mark_quarantined(
                     &conn,
                     &sandbox_id,
@@ -8069,36 +8073,49 @@ pub(crate) mod service_tests {
 
     #[tokio::test]
     async fn evict_cluster_deleted_sandbox_refuses_rows_inside_quiescence_window() {
-        for state in [SandboxState::Suspended, SandboxState::Quarantined] {
-            // insert stamps updated_at = now, so the row is inside the window.
-            let conn = crate::db::test_conn();
-            let sandbox_id = SandboxId::new().to_string();
-            insert_platform_owned_sandbox(&conn, &sandbox_id, state, None);
-            let service = service_with_runtime_liveness(conn, false);
+        for (configured, seconds) in [
+            (None, 600),
+            (Some("0"), 600),
+            (Some("invalid"), 600),
+            (Some("10"), 10),
+        ] {
+            for state in [
+                SandboxState::Stopped,
+                SandboxState::Suspended,
+                SandboxState::Quarantined,
+            ] {
+                // insert stamps updated_at = now, so the row is inside the window.
+                let conn = crate::db::test_conn();
+                let sandbox_id = SandboxId::new().to_string();
+                insert_platform_owned_sandbox(&conn, &sandbox_id, state, None);
+                let mut service = service_with_runtime_liveness(conn, false);
+                service.cluster_deleted_eviction_quiescence =
+                    super::eviction::cluster_deleted_eviction_quiescence(configured);
 
-            assert_evict_refused_and_row_untouched(
-                &service,
-                &sandbox_id,
-                state,
-                "quiescence window",
-            )
-            .await;
+                assert_evict_refused_and_row_untouched(
+                    &service,
+                    &sandbox_id,
+                    state,
+                    "quiescence window",
+                )
+                .await;
 
-            // The refusal carries the remaining window as a retry horizon so
-            // node-ctl can come back at quiescence end instead of applying its
-            // flat back-off; a row inserted just now has (almost) the whole
-            // 600 s window left.
-            let refusal = service
-                .evict_cluster_deleted_sandbox(root_peer_request(&sandbox_id))
-                .await
-                .expect_err("still inside the window");
-            let horizon = pplx_space_common_grpc::retry_after(&refusal)
-                .expect("quiescence refusal must carry a retry horizon");
-            assert!(
-                horizon > std::time::Duration::from_secs(590)
-                    && horizon <= std::time::Duration::from_secs(600),
-                "horizon should be the remaining window, got {horizon:?}"
-            );
+                // The refusal carries the remaining window as a retry horizon so
+                // node-ctl can come back at quiescence end instead of applying its
+                // flat back-off; a row inserted just now has (almost) the whole
+                // configured window left.
+                let refusal = service
+                    .evict_cluster_deleted_sandbox(root_peer_request(&sandbox_id))
+                    .await
+                    .expect_err("still inside the window");
+                let horizon = pplx_space_common_grpc::retry_after(&refusal)
+                    .expect("quiescence refusal must carry a retry horizon");
+                assert!(
+                    horizon > std::time::Duration::from_secs(seconds - 5)
+                        && horizon <= std::time::Duration::from_secs(seconds),
+                    "horizon should be the remaining window, got {horizon:?}"
+                );
+            }
         }
     }
 
@@ -10019,7 +10036,12 @@ pub(crate) mod service_tests {
         );
         let row = service.lookup_sandbox(&sandbox_id.to_string()).unwrap();
         assert_eq!(row.state, SandboxState::Stopped);
-        assert!(row.space_api_route_identity.execution_generation.is_none());
+        assert_eq!(
+            row.space_api_route_identity.execution_generation,
+            Some(ExecutionGeneration::new(2).unwrap())
+        );
+        assert!(row.space_api_route_identity.activation_attempt_id.is_none());
+        assert!(row.space_api_route_identity.route_generation.is_none());
     }
 
     #[tokio::test]
@@ -10836,6 +10858,62 @@ pub(crate) mod service_tests {
             .is_some(),
             "deferred bookkeeping keeps durable evidence for maintenance"
         );
+    }
+
+    #[tokio::test]
+    async fn stopped_teardown_detaches_only_a_retired_execution() {
+        for (requested, expected) in [
+            (1, TeardownSuspendOutcome::Superseded),
+            (2, TeardownSuspendOutcome::Superseded),
+            (3, TeardownSuspendOutcome::Pending),
+        ] {
+            let conn = crate::db::test_conn();
+            let sandbox_id = SandboxId::new().to_string();
+            insert_test_sandbox(&conn, &sandbox_id, SandboxState::Started);
+            crate::db::update_runtime_fields(
+                &conn,
+                sandbox_id.parse().unwrap(),
+                runtime_fields(ExecutionGeneration::new(2).unwrap(), 7),
+            )
+            .unwrap();
+            crate::db::update_state(&conn, &sandbox_id, SandboxState::Stopping)
+                .unwrap()
+                .require_applied()
+                .unwrap();
+            crate::db::set_cleanup_intent(
+                &conn,
+                &sandbox_id,
+                true,
+                crate::db::CleanupCompletion::MarkStopped,
+            )
+            .unwrap();
+            crate::db::complete_row_intent_cleanup(
+                &conn,
+                &sandbox_id,
+                crate::db::CleanupCompletion::MarkStopped,
+                None,
+            )
+            .unwrap();
+            let service = service_for_teardown_test(conn);
+            let response = service
+                .prepare_teardown_suspend(internal_request(prepare_teardown_suspend_request(
+                    sandbox_id.clone(),
+                    requested,
+                    TeardownSuspendAction::BeginOrJoin,
+                )))
+                .await
+                .unwrap()
+                .into_inner();
+            assert_eq!(
+                TeardownSuspendOutcome::try_from(response.outcome).unwrap(),
+                expected
+            );
+            assert!(response.published_artifact.is_none());
+            assert_eq!(
+                service.lookup_sandbox(&sandbox_id).unwrap().state,
+                SandboxState::Stopped
+            );
+        }
     }
 
     #[tokio::test]

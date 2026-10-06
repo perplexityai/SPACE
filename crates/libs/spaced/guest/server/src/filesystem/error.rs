@@ -18,7 +18,7 @@ pub(crate) fn map_io_error(error: std::io::Error) -> Status {
                 );
                 return status;
             }
-            libc::EISDIR | libc::ENOTDIR | libc::EXDEV | libc::ELOOP => {
+            libc::EISDIR | libc::ENOTDIR | libc::EXDEV | libc::ELOOP | libc::ENOEXEC => {
                 return Status::failed_precondition(error.to_string());
             }
             // Invalid request content (EINVAL), an overlong path or path

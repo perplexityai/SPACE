@@ -289,6 +289,7 @@ type task struct {
 	executionGeneration int64  // canonical Kubernetes execution generation from the OCI annotation
 	generationTeardown  bool   // final durable-teardown policy captured from the pod contract
 	sandboxDetached     bool   // teardown was released without mutating a newer execution
+	legacyStopIssued    bool   // this task initiated the stop preceding legacy deletion
 	containerID         string // OCI container type
 	pid                 int
 	podIP               string
@@ -525,15 +526,29 @@ func (s *spaceTaskService) Create(ctx context.Context, r *taskAPI.CreateTaskRequ
 				sandboxActivationAttemptID,
 			),
 		}
+		if sandboxCheckpoint != nil && *sandboxCheckpoint == "stopped" {
+			startRequest.Checkpoint, err = stoppedRestartCheckpoint(startCtx, client, sbxID, startRequest.SuspendRestoreStorageUri)
+			if err != nil {
+				startSpanSbxmgr.End(err)
+				emitShimStepError("create", "stopped_restart", "stopped_restart", err)
+				redirect := <-redirectCh
+				if redirect.podIP != "" {
+					removeDataPlaneRedirect(netnsPath, sbxID)
+				}
+				return nil, err
+			}
+		}
 		var startResp *pb.StartResponse
 		if sandboxAutoLifecycle != nil && sandboxAutoLifecycleAuthority == netpb.PolicyAuthority_POLICY_AUTHORITY_CLUSTER {
 			startRequest.ActivationAutoLifecycle = sandboxAutoLifecycle
 			err = requireActivationPolicySupport(startCtx, conn)
-			if err == nil {
+		}
+		if err == nil {
+			if sandboxCheckpoint != nil && *sandboxCheckpoint == "stopped" && startRequest.Checkpoint != nil {
+				startResp, err = startStoppedCheckpoint(startCtx, client, startRequest)
+			} else {
 				startResp, err = client.Start(startCtx, startRequest)
 			}
-		} else {
-			startResp, err = client.Start(startCtx, startRequest)
 		}
 		startSpanSbxmgr.End(err)
 		redirect := <-redirectCh
@@ -777,6 +792,7 @@ type taskTeardownIdentity struct {
 	executionGeneration int64
 	generationTeardown  bool
 	sandboxDetached     bool
+	legacyStopIssued    bool
 }
 
 func (task *task) teardownIdentity() taskTeardownIdentity {
@@ -785,6 +801,7 @@ func (task *task) teardownIdentity() taskTeardownIdentity {
 		executionGeneration: task.executionGeneration,
 		generationTeardown:  task.generationTeardown,
 		sandboxDetached:     task.sandboxDetached,
+		legacyStopIssued:    task.legacyStopIssued,
 	}
 }
 
@@ -902,19 +919,26 @@ func releaseLegacyTaskTeardown(ctx context.Context, client pb.SandboxManagerClie
 	resp, err := sandboxStateWithRetry(ctx, client, identity.sandboxID)
 	if err != nil {
 		if status.Code(err) == codes.NotFound {
-			return false, nil
+			return true, nil
 		}
 		return false, annotateStatus("sbx-manager State", err)
 	}
 	sandbox := firstSandboxState(resp)
 	if sandbox == nil {
-		return false, nil
+		return true, nil
 	}
 	lifecycle, err := observedSandboxLifecycle(sandbox)
 	if err != nil {
 		return false, err
 	}
 	switch lifecycle {
+	case pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_STOPPED:
+		// A user STOP parks the rootfs for a later START. Releasing its pod
+		// must not turn that intent into DELETE. A stop issued by this task's
+		// own Kill remains part of intentional legacy pod deletion.
+		if !identity.legacyStopIssued {
+			return true, nil
+		}
 	case pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_SUSPENDING,
 		pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_SUSPENDED,
 		pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_RESTORING:
@@ -944,6 +968,76 @@ func firstSandboxState(resp *pb.StateResponse) *pb.SandboxInfo {
 		return nil
 	}
 	return sandboxes[0]
+}
+
+// A stopped restart uses its retained disk or an explicitly selected artifact.
+// Never fall back to the latest historical suspend snapshot when that disk is
+// missing: it may predate writes the user already observed.
+func stoppedRestartCheckpoint(ctx context.Context, client pb.SandboxManagerClient, sandboxID string, storageURI *string) (*string, error) {
+	waitCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	for {
+		resp, err := sandboxStateWithRetry(waitCtx, client, sandboxID)
+		if err != nil && status.Code(err) != codes.NotFound {
+			return nil, annotateStatus("sbx-manager State for stopped restart", err)
+		}
+		sandbox := firstSandboxState(resp)
+		if status.Code(err) == codes.NotFound || sandbox == nil {
+			if storageURI != nil && strings.TrimSpace(*storageURI) != "" {
+				return ptr("suspend"), nil
+			}
+			return nil, status.Error(codes.FailedPrecondition, "stopped rootfs is absent and no exact disk artifact was selected")
+		}
+		lifecycle, err := observedSandboxLifecycle(sandbox)
+		if err != nil {
+			return nil, err
+		}
+		switch lifecycle {
+		case pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_STOPPED:
+			return nil, nil
+		case pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_STARTED:
+			return ptr("suspend"), nil
+		case pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_RESTORING:
+			if storageURI != nil && strings.TrimSpace(*storageURI) != "" {
+				// An interrupted stage can retain this state with no active
+				// request. Start owns continuation and checks staging ownership,
+				// runtime evidence and cleanup intent before resuming it.
+				return ptr("suspend"), nil
+			}
+			fallthrough
+		case pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_STARTING,
+			pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_STOPPING:
+			// containerd turns a failed task Create into an exited container.
+			// With restartPolicy Never, wait here within the admission budget
+			// instead of requiring a fresh Kubernetes execution for each poll.
+			if err := sleepContext(waitCtx, sandboxStateRetryDelay); err != nil {
+				return nil, status.FromContextError(err).Err()
+			}
+		default:
+			return nil, status.Errorf(codes.FailedPrecondition, "stopped restart cannot use local lifecycle %s", lifecycle)
+		}
+	}
+}
+
+// A selected checkpoint Start may find another request staging its artifact.
+// Retry the same intent for at most 30 seconds of admission waiting. An
+// admitted transfer keeps the caller's original RPC deadline: the wait budget
+// must not repeatedly cancel a healthy artifact pull that takes longer.
+func startStoppedCheckpoint(ctx context.Context, client pb.SandboxManagerClient, request *pb.StartRequest) (*pb.StartResponse, error) {
+	waitCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	for {
+		if err := waitCtx.Err(); err != nil {
+			return nil, status.FromContextError(err).Err()
+		}
+		response, err := client.Start(ctx, request)
+		if status.Code(err) != codes.Unavailable {
+			return response, err
+		}
+		if err := sleepContext(waitCtx, sandboxStateRetryDelay); err != nil {
+			return nil, status.FromContextError(err).Err()
+		}
+	}
 }
 
 func retryableSandboxStatusError(err error) bool {
@@ -1086,6 +1180,9 @@ func (s *spaceTaskService) mutateTaskAfterTeardownRelease(
 	}
 	if detachSandbox {
 		current.sandboxDetached = true
+	}
+	if needsTeardown && operation == "kill" && !detachSandbox && !current.generationTeardown {
+		current.legacyStopIssued = true
 	}
 	mutate(current)
 	return true, nil

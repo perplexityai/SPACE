@@ -33,6 +33,7 @@ def _describe(scenario_id: str) -> int:
         "fixture": scenario.fixture_name,
         "api_surfaces": sorted(scenario.api_surfaces),
         "quarantined": scenario.quarantined,
+        "ignored": scenario.ignored,
         "selected_api_surface": os.environ.get("SPACE_SMOKE_API_SURFACE", "ecw"),
         "sandbox": {
             "count": scenario.sandbox_count,
@@ -282,10 +283,12 @@ def _run_all(
     # A quarantine is a visible hole in coverage, never a pass: name each one
     # and its reason so the run log shows what the suite did not prove.
     for held in REGISTRY.select(
-        category=category, template=template, include_quarantined=True
+        category=category, template=template, include_quarantined=True, include_ignored=True
     ):
         if held.quarantined is not None:
             print(f"QUARANTINED {held.id}: {held.quarantined}")
+        if held.ignored is not None:
+            print(f"IGNORED {held.id}: {held.ignored}")
     api_surface = os.environ.get("SPACE_SMOKE_API_SURFACE", "ecw")
     if category is None:
         eligible = tuple(

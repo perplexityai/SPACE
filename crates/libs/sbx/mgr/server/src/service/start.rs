@@ -1670,7 +1670,7 @@ impl SandboxManagerService {
             .await?;
         if let Err(error) = sandbox.state.transition(SandboxState::Starting) {
             activation_admission_permit.finish(AdmissionPermitOutcome::Failed);
-            return Err(Status::failed_precondition(error.to_string()));
+            return Err(Status::from(error));
         }
         if let Err(error) = self.resolve_start_context_route_identity(&sandbox, &mut start_ctx) {
             activation_admission_permit.finish(AdmissionPermitOutcome::Failed);

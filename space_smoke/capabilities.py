@@ -1881,8 +1881,8 @@ class SuspendCodecControl(CrossNodeRestoreControl, Protocol):
         The owner's own cleanup, so no row it left can outlive it: the
         retained suspend bytes on its source and the `restoring` row a failed
         cross-node restore keeps on the target, both of which the
-        cluster-deleted eviction reclaims only after a 600 s quiescence. Waits
-        a bounded time for the cluster row and then every unfinished pod of
+        cluster-deleted eviction reclaims after its quiescence window. Waits a
+        bounded time for the cluster row and then every unfinished pod of
         the sandbox to go (a restore pod's retries re-create the row until it
         does; a `Succeeded` or `Failed` pod is never retried and is ignored).
         Then, on its own budget, deletes with `--blocking` on every worker,
@@ -1977,6 +1977,10 @@ class ColdEvictionControl(RestoreStateRead, SandboxEventRead, Protocol):
     knobs on the very pod that will do the evicting, the on-disk cache
     directory, and sbx-manager's own eviction event.
     """
+
+    def sandbox_pods(self, sandbox_id: str) -> list[SandboxPodView]:
+        """Execution pods, including terminal predecessors retained by Kubernetes."""
+        ...
 
     def worker_node_stack_pod(self, node_name: str) -> str:
         """The worker node-stack pod name scheduled on `node_name`."""

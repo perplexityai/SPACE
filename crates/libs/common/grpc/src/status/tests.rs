@@ -102,3 +102,43 @@ fn guest_connect_refusal_is_an_application_precondition_only() {
         }
     }
 }
+
+#[test]
+fn process_errors_require_guest_provenance_and_distinguish_storage_from_admission() {
+    for code in [
+        Code::NotFound,
+        Code::PermissionDenied,
+        Code::InvalidArgument,
+        Code::FailedPrecondition,
+        Code::Unavailable,
+        Code::DeadlineExceeded,
+        Code::ResourceExhausted,
+    ] {
+        let raw = Status::new(code, "synthetic failure");
+        assert!(!is_terminal_guest_process_error(&raw));
+        let mut raw = raw;
+        raw.metadata_mut()
+            .insert(GUEST_PROCESS_ERROR_METADATA, "terminal".parse().unwrap());
+        let marked = mark_guest_process_error(raw);
+        assert_eq!(
+            is_terminal_guest_process_error(&marked),
+            matches!(
+                code,
+                Code::NotFound
+                    | Code::PermissionDenied
+                    | Code::InvalidArgument
+                    | Code::FailedPrecondition
+            )
+        );
+    }
+    let mut full = Status::resource_exhausted("guest filesystem full");
+    full.metadata_mut().insert(
+        pplx_space_common_core::spaced::ERROR_REASON_METADATA_KEY,
+        pplx_space_common_core::spaced::GUEST_STORAGE_FULL
+            .parse()
+            .unwrap(),
+    );
+    assert!(is_terminal_guest_process_error(&mark_guest_process_error(
+        full
+    )));
+}

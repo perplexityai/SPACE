@@ -1558,6 +1558,13 @@ impl SandboxController {
             ));
         }
 
+        // The substrate's readiness return precedes lifecycle publication.
+        // Release only this request's completed lease now; otherwise an
+        // immediate STOP/START can join CREATE's lease and reuse its dead pod.
+        self.substrate
+            .complete_activation_lease(outcome.sandbox_id, outcome.lease_completion)
+            .await;
+
         let sandbox = fetch_sandbox(pool, outcome_sandbox_uuid)
             .await
             .and_then(|opt| opt.ok_or(sqlx::Error::RowNotFound))

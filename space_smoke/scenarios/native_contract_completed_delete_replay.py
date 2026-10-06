@@ -5,7 +5,6 @@ from space_smoke.native_hardening import NativeHardeningFixture
 @scenario(
     "native_contract.completed_delete_replay",
     api_surfaces=("native",),
-    quarantined="completed DELETE replay returns 404 instead of its retained operation",
 )
 def completed_delete_replay(test: NativeHardeningFixture) -> None:
     """A completed DELETE replay returns its original retained operation."""

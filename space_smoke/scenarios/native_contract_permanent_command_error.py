@@ -16,7 +16,6 @@ def _permanent_http(status: int, body: dict[str, object]) -> bool:
 @scenario(
     "native_contract.permanent_command_error",
     api_surfaces=("native",),
-    quarantined="missing executables and working directories return retryable stream_unavailable",
 )
 def permanent_command_error(test: NativeHardeningFixture) -> None:
     """Missing executables and working directories yield permanent command failures."""

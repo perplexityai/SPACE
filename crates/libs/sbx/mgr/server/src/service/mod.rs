@@ -357,6 +357,7 @@ pub struct SandboxManagerService {
     network_policy_reconcile_queue: NetworkPolicyReconcileQueue,
     network_policy_reconciler_started: Arc<AtomicBool>,
     cleanup_locks: CleanupLockMap,
+    cluster_deleted_eviction_quiescence: Duration,
     /// Shared attempt capacity for foreground cleanup and durable retries.
     /// Excess work remains in SQLite until a slot is available.
     cleanup_sem: Arc<tokio::sync::Semaphore>,
@@ -1661,6 +1662,11 @@ impl SandboxManagerService {
             network_policy_reconcile_queue,
             network_policy_reconciler_started: Arc::new(AtomicBool::new(false)),
             cleanup_locks: Arc::new(Mutex::new(BTreeMap::new())),
+            cluster_deleted_eviction_quiescence: eviction::cluster_deleted_eviction_quiescence(
+                std::env::var("SPACE_SBX_CLUSTER_DELETED_QUIESCENCE_SECS")
+                    .ok()
+                    .as_deref(),
+            ),
             cleanup_sem: Arc::new(tokio::sync::Semaphore::new(DEFAULT_CLEANUP_CONCURRENCY_CAP)),
             cleanup_io: Arc::new(tokio::sync::Semaphore::new(CLEANUP_IO_CONCURRENCY_CAP)),
             cleanup_target_streams: Arc::new(tokio::sync::Semaphore::new(4)),

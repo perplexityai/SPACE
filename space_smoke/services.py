@@ -21,6 +21,7 @@ from space_smoke.adapters import (
     validate_loopback_environment,
 )
 from space_smoke.capabilities import (
+    ColdEvictionControl,
     CommandSandbox,
     CommandSandboxFactory,
     DurableLifecycleSandbox,
@@ -266,9 +267,9 @@ class SmokeServices:
             before_create=before_create,
             # Privileged scenarios drive sandboxes across workers (cross-node
             # restores, forced failures), and the local rows those leave are
-            # reclaimed by SPACE only after a 600 s quiescence. Each scenario
-            # removes its own so none outlives it into another scenario's
-            # view of a worker.
+            # reclaimed by SPACE after the configured quiescence. Each
+            # scenario removes its own so none outlives it into another
+            # scenario's view of a worker.
             after_teardown_delete=(
                 kind.reclaim_local_sandbox_everywhere
                 if kind is not None and fixture_type is KindEcw
@@ -368,6 +369,9 @@ class SmokeServices:
             _durable_lifecycle=sandboxes[0],
             _resident_lifecycle=cast(ResidentLifecycleSandbox, sandboxes[0]),
             _stoppable_lifecycle=cast(StoppableLifecycleSandbox, sandboxes[0]),
+            _local_cleanup_control=(
+                cast(ColdEvictionControl, self.kind) if self.kind is not None else None
+            ),
             _processes=cast(ProcessSandbox, sandboxes[0]),
         )
 
@@ -419,8 +423,26 @@ class SmokeServices:
             api_url = values.get("SPACE_API_URL", "http://127.0.0.1:8080")
             data_plane_url = values.get("SPACE_DATA_PLANE_URL", api_url)
             template = values.get("SPACE_TEMPLATE") or scenario.sandbox.template
+            kind = None
+            if backend == KIND_BACKEND and scenario.fixture_type is CommandSandboxFixture:
+                validate_loopback_environment(api_url, False, scenario_id=scenario.id)
+                validate_loopback_environment(
+                    data_plane_url, False, scenario_id=scenario.id,
+                    endpoint_name="SPACE_DATA_PLANE_URL",
+                )
+                kind = KindHarness(
+                    SubprocessExecutor(base_env=values),
+                    KindConfig(
+                        cluster=values.get("KIND_CLUSTER", "space-local"),
+                        api_url=api_url,
+                        data_plane_url=data_plane_url,
+                        skip_bootstrap=values.get("SKIP_BOOTSTRAP", "0") == "1",
+                        bootstrap_timeout=int(values.get("BOOTSTRAP_TIMEOUT", "1800")),
+                    ),
+                    environment=values,
+                )
             return cls(
-                kind=None,
+                kind=kind,
                 ecw=None,
                 api_key="",
                 owns_api_key=False,

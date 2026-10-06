@@ -19,12 +19,24 @@ use crate::node_state_sync::mark_sandbox_dirty;
 /// transitioned more recently than this is refused (`FailedPrecondition`) so
 /// the eviction can never act on state the caller read mid-transition; the
 /// next facet sync retries once the row has settled.
-const CLUSTER_DELETED_EVICTION_QUIESCENCE_SECS: u64 = 600;
+/// Kind uses a shorter window to exercise ordinary reconciliation without
+/// spending ten minutes idle. Invalid or zero overrides keep the default.
+pub(super) fn cluster_deleted_eviction_quiescence(value: Option<&str>) -> Duration {
+    Duration::from_secs(
+        value
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|seconds| *seconds > 0)
+            .unwrap_or(600),
+    )
+}
 
 /// Which local row shape an eviction claims, and the identity it re-asserts
 /// in the CAS.
 #[derive(Debug, Clone)]
 pub(crate) enum EvictionClaim {
+    /// Retained stopped rootfs after authoritative cluster deletion. Requires
+    /// the observed row version and the same cleanup/staging locks as recovery.
+    Stopped,
     /// `suspended → deleting`, re-asserting the **proven identity**: the
     /// exact pinned artifact the eviction decision proved backed, or `None`
     /// asserting the row is still unpinned.
@@ -190,7 +202,9 @@ impl SandboxManagerService {
         // blocking — and a retry cannot restart in that gap because the row
         // is already `deleting`.
         let staging_guard = match claim {
-            EvictionClaim::FailedRestoring | EvictionClaim::Quarantined => Some(
+            EvictionClaim::Stopped
+            | EvictionClaim::FailedRestoring
+            | EvictionClaim::Quarantined => Some(
                 self.auto_lifecycle
                     .try_staging_guard(sandbox_id)
                     .ok_or_else(|| {
@@ -215,6 +229,13 @@ impl SandboxManagerService {
                         expected_updated_at,
                     )
                 }
+                EvictionClaim::Stopped => crate::db::claim_stopped_sandbox_for_eviction(
+                    &db,
+                    sandbox_id,
+                    expected_updated_at.ok_or_else(|| {
+                        Status::internal("stopped eviction requires the observed row version")
+                    })?,
+                ),
                 EvictionClaim::FailedRestoring => {
                     let expected_updated_at = expected_updated_at.ok_or_else(|| {
                         Status::internal(
@@ -252,6 +273,9 @@ impl SandboxManagerService {
         };
         if !claimed {
             return Err(Status::failed_precondition(match &claim {
+                EvictionClaim::Stopped => {
+                    format!("sandbox {sandbox_id} is no longer stopped at the observed row version")
+                }
                 EvictionClaim::SuspendedPinned(_) => format!(
                     "sandbox {sandbox_id} is no longer suspended with the proven artifact pinned"
                 ),
@@ -310,7 +334,7 @@ impl SandboxManagerService {
     /// - the UDS peer must be in [`ALLOW_SANDBOX_CLUSTER_DELETED_EVICT`]
     ///   (node-ctl, root, or the local operator role — the callers that
     ///   can carry the authoritative cluster signal);
-    /// - the local row must still be `quarantined`, `suspended`, or `restoring`
+    /// - the local row must still be `stopped`, `quarantined`, `suspended`, or `restoring`
     ///   with a persisted cross-node staging failure — the row a failed cross-node
     ///   restore keeps on the target "for retry", which no other path
     ///   reclaims once the cluster row is gone — or `suspending` with the
@@ -330,7 +354,7 @@ impl SandboxManagerService {
     ///   claim — all are refused;
     /// - it must have been quiescent for the configured window so the
     ///   eviction cannot race a transition in flight between the caller's
-    ///   read and this call — read on `updated_at` for `suspended`, `restoring`
+    ///   read and this call — read on `updated_at` for `stopped`, `suspended`, `restoring`
     ///   and `quarantined`, and on `state_changed_at` (time since entering
     ///   `suspending`, not since the backup was refused) for the terminal
     ///   teardown suspend, whose row is touched by live loops without
@@ -378,6 +402,7 @@ impl SandboxManagerService {
             (row, state_changed_at)
         };
         let claim = match row.state {
+            crate::state::SandboxState::Stopped => EvictionClaim::Stopped,
             crate::state::SandboxState::Quarantined => EvictionClaim::Quarantined,
             crate::state::SandboxState::Suspended => {
                 EvictionClaim::SuspendedPinned(row.current_local_artifact_id)
@@ -462,7 +487,8 @@ impl SandboxManagerService {
             EvictionClaim::TeardownSuspendPermanentlyFailed { .. } => {
                 ("state_changed_at", state_changed_at.as_str())
             }
-            EvictionClaim::SuspendedPinned(_)
+            EvictionClaim::Stopped
+            | EvictionClaim::SuspendedPinned(_)
             | EvictionClaim::FailedRestoring
             | EvictionClaim::Quarantined => ("updated_at", row.updated_at.as_str()),
         };
@@ -473,7 +499,7 @@ impl SandboxManagerService {
                      {quiescence_since:?}; operator repair required"
                 ))
             })?;
-        let quiescence_secs = CLUSTER_DELETED_EVICTION_QUIESCENCE_SECS;
+        let quiescence_secs = self.cluster_deleted_eviction_quiescence.as_secs();
         let idle_secs =
             crate::sandbox_eviction::now_secs().saturating_sub(quiescent_since_secs.unsigned());
         if idle_secs < quiescence_secs {

@@ -53,11 +53,13 @@ the ordinary smoke job logs.
 | Group | Checks | Normal selection |
 |---|---|---|
 | Contract | Command validation, changed-request idempotency conflicts, token scope, tenant isolation | Included |
-| Contract | Completed DELETE replay, permanent startup errors, replay credential lifetime | Quarantined pending contract fixes |
-| Admission | Zero-vCPU rejection before accepting an operation | Quarantined; Kind only with bounded cleanup |
+| Contract | Completed DELETE replay, permanent startup errors | Included |
+| Proposed contract | Overlapping replay credential validity | Ignored; explicit invocation only |
+| Admission | Zero-vCPU rejection before accepting an operation | Included on Kind with bounded cleanup |
 | Concurrency | Same-key create and command fanout, independent commands, pause/wake contention, slow-reader output integrity | Included |
 | Recovery | Queued create across controller outage/API restart; original command session across data-plane restart | Included on Kind only |
-| Dispatcher fairness | Independent work completes while an earlier valid suspend is blocked | Quarantined; Kind only |
+| Dispatcher fairness | Independent work completes while an earlier valid suspend is blocked | Included on Kind only |
+| Lifecycle | Stopped sandbox restarts with its retained rootfs | Included |
 
 Quarantine uses the existing `quarantined=` scenario declaration. Implicit
 selection prints the scenario and its reason and withholds it. Explicitly
@@ -68,10 +70,10 @@ SPACE_SMOKE_BACKEND=kind SPACE_SMOKE_API_SURFACE=native \
   uv run --frozen --python 3.11 -m space_smoke run native_contract.completed_delete_replay
 ```
 
-DELETE replay and permanent command-error violations fail. Revocation of the
-earlier replay credential warns until that contract is resolved. These are
-not passing expectations or unconditional expected failures. Remove a
-quarantine declaration once its owning fix passes the explicit scenario.
+DELETE replay and permanent command-error violations fail.
+Stopped restart must also read back the original filesystem
+payload. These assertions run in normal selection alongside dispatcher fairness
+and lifecycle contention.
 
 The **Quarantined smoke backlog (non-blocking)** job inventories all declared
 quarantines on every PR and applicable manual CI entry point. Pull CI owns the
@@ -93,6 +95,30 @@ the real retry intervals and participate in duration-balanced sharding.
 Named development benches require `SPACE_SMOKE_KIND_CLUSTER_UID` to match the
 live `kube-system` namespace UID before privileged fixture operations. The
 standard `kind-space-local` setup retains its existing isolation checks.
+
+## Credential replay contract (deferred)
+
+The current API rotates attachment credentials on an idempotent replay.
+`native_concurrency.command_idempotency` remains required: same-key requests
+share session and process identity, execute their side effect once, and return
+an attachable fresh credential after concurrent requests finish.
+
+`native_contract.command_replay_credentials` additionally expects the previous
+credential to remain valid. That stronger guarantee is not agreed. Its reproducer
+is explicitly `ignored`, appears as `IGNORED` in suite logs, and is excluded from
+normal selection and the quarantine defect backlog. It is not fixed or counted
+as a passing scenario. Run its unchanged assertions explicitly with:
+
+```bash
+SPACE_SMOKE_BACKEND=kind SPACE_SMOKE_API_SURFACE=native \
+  uv run --frozen --python 3.11 -m space_smoke run native_contract.command_replay_credentials
+```
+
+The [review decision](https://github.com/perplexityai/SPACE/pull/79#pullrequestreview-5423918313)
+defers overlap. The [separate storage proposal](https://github.com/perplexityai/SPACE/pull/91)
+is not a prerequisite for the smoke repairs. Before adopting an implementation,
+resolve replay versus explicit credential renewal, validity of earlier responses,
+expiry, revocation, issuance bounds, and deployment compatibility together.
 
 ## Concurrency and recovery controls
 
@@ -128,7 +154,7 @@ safety guards; normal Kind suite execution prepares them automatically.
 Both HTTP endpoints must be loopback forwards for that exact cluster.
 Restoration verifies original replica counts, unchanged deployment configuration,
 and ready pods before fixture cleanup. Failures remain visible; database sizing
-is not changed. The quarantined zero-vCPU regression temporarily shortens only
+is not changed. The zero-vCPU regression temporarily shortens only
 the controller create-readiness and operation-age budgets, so an erroneously
 accepted create can be drained. It restores the original literal settings
 (including unset values) and verifies running pods before reporting admission
@@ -164,5 +190,5 @@ independent work and requires that work to complete while the slow operation
 is still pending. It restores storage and drains accepted work before reporting
 the verdict. Fixing CPU admission therefore does not erase dispatcher coverage.
 
-These scenarios reproduce deployed behavior; this PR does not fix the five
-product findings. Each quarantine remains until its explicit regression passes.
+These scenarios remain regression coverage for their admission, replay, error,
+and scheduling contracts.

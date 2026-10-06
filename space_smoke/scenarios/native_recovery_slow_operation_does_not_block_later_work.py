@@ -19,10 +19,6 @@ FAIRNESS_WINDOW_SECONDS = 15
     api_surfaces=("native",),
     required_tools=("kubectl", "kind"),
     rerun_environment=RECOVERY_ENVIRONMENT,
-    quarantined=(
-        "Dispatcher drains an entire claim batch before claiming later work; "
-        "a storage-held suspend blocks an independent ready sandbox's pause"
-    ),
 )
 def slow_operation_does_not_block_later_work(test: KindNativeHardeningFixture) -> None:
     """With an idle dispatcher slot, a later pause finishes while an earlier

@@ -101,6 +101,23 @@ fn native_create_rejects_unsupported_disk_size_before_operation_admission() {
     }
 }
 
+#[test]
+fn native_create_rejects_zero_vcpu_before_operation_admission() {
+    for (vcpu, accepted) in [(None, true), (Some(0), false), (Some(1), true)] {
+        let mut request = create_request_with_auto_lifecycle(None);
+        request.resources = Some(SandboxResources {
+            vcpu,
+            memory_mib: None,
+            disk_mib: None,
+        });
+        assert_eq!(
+            prepare_native_create_request(request).is_ok(),
+            accepted,
+            "{vcpu:?}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn native_create_persists_default_policy_in_operation_payload() -> TestDbResult<()> {
     let db = pg_test_db().await?;
@@ -231,6 +248,109 @@ fn sandboxes_page_uses_limit_plus_one_sentinel() {
     .unwrap();
     assert_eq!(exact_page.data.len(), 2);
     assert!(exact_page.next_cursor.is_none());
+}
+
+#[tokio::test]
+async fn delete_replay_survives_target_removal_without_crossing_tenant_or_request_scope()
+-> TestDbResult<()> {
+    use crate::public_operations::{
+        CompleteClaimedPublicOperation, CreateClaimedPublicOperationResult,
+    };
+
+    let db = pg_test_db().await?;
+    let org_id = OrgId::from_uuid(SEED_ORG_ID);
+    let actor = UserId::from_uuid(SEED_USER_ID);
+    let sandbox_id = PublicSandboxId::from(SandboxId::new());
+    let key = IdempotencyKey::parse("completed-delete")?;
+    let action = SandboxLifecycleAction::Delete;
+    let fingerprint = lifecycle_request_fingerprint(sandbox_id, action, None).unwrap();
+    let target = sandbox_id.to_string();
+    let store = PublicOperationStore::new(db.pool.clone());
+    let CreateClaimedPublicOperationResult::Claimed {
+        claim_token,
+        operation,
+    } = store
+        .create_claimed_operation(CreatePublicOperation {
+            org_id,
+            actor_user_id: Some(actor),
+            api_product: ApiProduct::Native,
+            kind: action.operation_kind(),
+            target_type: Some(OperationTargetType::Sandbox),
+            target_id: Some(&target),
+            payload_json: SandboxLifecycleOperationPayload {
+                sandbox_id,
+                action,
+                rollback: None,
+            }
+            .into_json(),
+            idempotency: Some(CreatePublicOperationIdempotency {
+                method: lifecycle_method(action),
+                path_template: lifecycle_path_template(action),
+                key: &key,
+                request_fingerprint: &fingerprint,
+            }),
+        })
+        .await?
+    else {
+        panic!("fresh operation must be claimed")
+    };
+    assert!(
+        store
+            .complete_claimed_operation(CompleteClaimedPublicOperation {
+                claim_token,
+                operation_id: operation.id,
+                progress_message: "deleted".into(),
+                result_json: serde_json::to_value(
+                    pplx_space_public_api::PublicOperationResult::Sandbox(
+                        pplx_space_public_api::PublicSandboxOperationResult {
+                            sandbox_id,
+                            state: SandboxLifecycleState::Deleted,
+                            action: Some(action),
+                            controller_response: None,
+                        },
+                    )
+                )?,
+            })
+            .await?
+    );
+
+    // The operation outlives its target row. Only an exact, tenant-scoped
+    // replay can recover it; a new request must still prove target ownership.
+    for (org, target, key, expected) in [
+        (
+            org_id,
+            target.clone(),
+            "completed-delete",
+            StatusCode::ACCEPTED,
+        ),
+        (org_id, target.clone(), "new-delete", StatusCode::NOT_FOUND),
+        (
+            OrgId::from_uuid(Uuid::now_v7()),
+            target.clone(),
+            "completed-delete",
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            org_id,
+            PublicSandboxId::from(SandboxId::new()).to_string(),
+            "completed-delete",
+            StatusCode::CONFLICT,
+        ),
+    ] {
+        let mut headers = HeaderMap::new();
+        headers.insert(IDEMPOTENCY_KEY_HEADER, key.parse()?);
+        let result =
+            enqueue_lifecycle_operation(&db.pool, org, actor, headers, &target, action, None).await;
+        match result {
+            Ok((status, Json(response))) => {
+                assert_eq!(status, expected);
+                assert_eq!(response.operation_id, operation.id);
+                assert_eq!(response.sandbox_id, sandbox_id);
+            }
+            Err(error) => assert_eq!(error.into_response().status(), expected),
+        }
+    }
+    Ok(())
 }
 
 #[tokio::test]

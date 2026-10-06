@@ -305,6 +305,9 @@ jobs:
           dir="${RUNNER_TEMP}/kind-node-diagnostics"
           mkdir -p "${dir}"
           k() { timeout "$1" kubectl --context kind-space-local "${@:2}"; }
+          # Preserve the first admission/recovery error, not only its final retry.
+          k 45s -n space logs deployment/space-api --all-containers=true --timestamps \
+            >"${dir}/space-api.log" 2>&1 || true
           for node in $(timeout 30s kind get nodes --name space-local 2>/dev/null); do
             timeout 45s docker exec "${node}" journalctl -u kubelet -u containerd --no-pager -o short-iso \
               >"${dir}/${node}.journal.log" 2>&1 || true

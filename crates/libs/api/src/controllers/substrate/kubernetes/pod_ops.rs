@@ -3093,6 +3093,13 @@ impl KubernetesSubstrate {
                     _ => Vec::new(),
                 };
                 SandboxPodRequest::Restore {
+                    artifact_kind: if sandbox.lifecycle.parse::<SandboxLifecycle>()
+                        == Ok(SandboxLifecycle::Stopped)
+                    {
+                        pplx_space_common_core::types::ArtifactKind::Disk
+                    } else {
+                        pplx_space_common_core::types::ArtifactKind::Full
+                    },
                     common,
                     runtime,
                     // Rendered alongside `direct_node_name` when the restore is
@@ -3118,6 +3125,13 @@ impl KubernetesSubstrate {
                 extra_tolerations,
                 extra_required_affinity,
             }) => SandboxPodRequest::Restore {
+                artifact_kind: if sandbox.lifecycle.parse::<SandboxLifecycle>()
+                    == Ok(SandboxLifecycle::Stopped)
+                {
+                    pplx_space_common_core::types::ArtifactKind::Disk
+                } else {
+                    pplx_space_common_core::types::ArtifactKind::Full
+                },
                 common,
                 runtime,
                 node_group_placement,
@@ -3469,6 +3483,31 @@ impl KubernetesSubstrate {
         Ok(pod_ip)
     }
 
+    async fn stale_pod_reason_for_execution(
+        &self,
+        sandbox: &Sandbox,
+        claim: &SandboxExecutionClaim,
+        pod: &Pod,
+        suspend_restore_storage_uri: Option<&str>,
+    ) -> Result<Option<StalePodReason>, SubstrateError> {
+        // Pod phase and restore annotations do not identify a STOP episode.
+        // A Running successor may have booted successfully before its owner
+        // lost the lease or response; retain it so START can finish publication.
+        if sandbox.lifecycle.parse::<SandboxLifecycle>() == Ok(SandboxLifecycle::Stopped)
+            && self
+                .store
+                .execution_predates_current_stop(sandbox.id, claim.row.generation)
+                .await?
+        {
+            return Ok(Some(StalePodReason::SandboxStopped));
+        }
+        Ok(stale_existing_pod_reason(
+            sandbox,
+            pod,
+            suspend_restore_storage_uri,
+        ))
+    }
+
     async fn cleanup_stale_existing_pod_after_create_error(
         &self,
         sandbox: &Sandbox,
@@ -3476,8 +3515,9 @@ impl KubernetesSubstrate {
         existing: &Pod,
         suspend_restore_storage_uri: Option<&str>,
     ) -> Result<bool, SubstrateError> {
-        let Some(reason) =
-            stale_existing_pod_reason(sandbox, existing, suspend_restore_storage_uri)
+        let Some(reason) = self
+            .stale_pod_reason_for_execution(sandbox, claim, existing, suspend_restore_storage_uri)
+            .await?
         else {
             return Ok(false);
         };
@@ -3898,8 +3938,14 @@ impl KubernetesSubstrate {
                     kube_error_for_substrate("failed to verify stale creating pod", err)
                 })?;
             let replacement_reason = if let Some(existing) = existing.as_ref() {
-                if let Some(reason) =
-                    stale_existing_pod_reason(&sandbox, existing, suspend_restore_storage_uri)
+                if let Some(reason) = self
+                    .stale_pod_reason_for_execution(
+                        &sandbox,
+                        &claim,
+                        existing,
+                        suspend_restore_storage_uri,
+                    )
+                    .await?
                 {
                     tracing::info!(
                         sandbox_id = %sandbox.id,
@@ -4020,8 +4066,14 @@ impl KubernetesSubstrate {
                     kube_error_for_substrate("failed to verify cached sandbox pod", err)
                 })?;
             if let Some(existing) = existing {
-                if let Some(reason) =
-                    stale_existing_pod_reason(&sandbox, &existing, suspend_restore_storage_uri)
+                if let Some(reason) = self
+                    .stale_pod_reason_for_execution(
+                        &sandbox,
+                        &claim,
+                        &existing,
+                        suspend_restore_storage_uri,
+                    )
+                    .await?
                 {
                     if started_recovery_requires_handoff
                         && let Some(pod_uid) = existing

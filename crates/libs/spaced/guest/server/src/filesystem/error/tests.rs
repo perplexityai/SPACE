@@ -8,6 +8,7 @@ fn map_io_error_uses_errno_matrix() {
         (libc::EROFS, tonic::Code::PermissionDenied),
         (libc::EISDIR, tonic::Code::FailedPrecondition),
         (libc::ENOTDIR, tonic::Code::FailedPrecondition),
+        (libc::ENOEXEC, tonic::Code::FailedPrecondition),
         (libc::ELOOP, tonic::Code::FailedPrecondition),
         (libc::EINVAL, tonic::Code::InvalidArgument),
         (libc::EXDEV, tonic::Code::FailedPrecondition),

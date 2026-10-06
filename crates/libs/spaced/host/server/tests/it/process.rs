@@ -53,6 +53,31 @@ async fn interactive_effects_are_single_attempt_after_lost_reply() {
     }
 }
 #[tokio::test]
+async fn process_validation_is_terminal_before_guest_connection() {
+    use pplx_space_spaced_host_client::proto::{
+        ConnectProcessRequest, StartRequest, process_client::ProcessClient,
+    };
+    let fixture = HostFixture::start(None).await;
+    fixture.client().await;
+    let channel = pplx_space_common_grpc::connect_uds_channel("test host", &fixture.socket_path)
+        .await
+        .unwrap();
+    let mut client = ProcessClient::new(channel);
+    let invalid_start = client.start(StartRequest::default()).await.unwrap_err();
+    let invalid_connect = client
+        .connect_process(ConnectProcessRequest::default())
+        .await
+        .unwrap_err();
+    for error in [invalid_start, invalid_connect] {
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert!(pplx_space_common_grpc::is_terminal_guest_process_error(
+            &error
+        ));
+    }
+    fixture.stop().await;
+}
+
+#[tokio::test]
 async fn process_start_relays_to_guest_bridge() {
     let temp_dir = tempfile::tempdir().expect("temp dir created");
     let bridge_guest_socket = temp_dir.path().join("spaced-bridge-guest.sock");

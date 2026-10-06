@@ -2397,6 +2397,29 @@ impl K8sStore {
         }
     }
 
+    /// Use one database clock to distinguish the execution retired by STOP
+    /// from a replacement that booted before its START published completion.
+    pub(super) async fn execution_predates_current_stop(
+        &self,
+        sandbox_id: SandboxId,
+        generation: i64,
+    ) -> Result<bool, SubstrateError> {
+        sqlx::query_scalar(sql!(
+            "SELECT EXISTS (
+                SELECT 1 FROM sandbox_k8s_executions execution
+                JOIN sandboxes sandbox ON sandbox.id = execution.sandbox_id
+                WHERE execution.sandbox_id = $1 AND execution.generation = $2
+                  AND execution.active AND sandbox.lifecycle = 'stopped'
+                  AND execution.created_at <= sandbox.lifecycle_changed_at
+            )"
+        ))
+        .bind(sandbox_id)
+        .bind(generation)
+        .fetch_one(&self.pool)
+        .await
+        .db_context("failed to identify execution retired by stop")
+    }
+
     pub(super) async fn complete_activation_attempt(
         &self,
         sandbox_id: SandboxId,
@@ -2442,6 +2465,41 @@ impl K8sStore {
                 %activation_attempt_id,
                 %error,
                 "deferred activation-attempt release to completion receipt or lease expiry"
+            );
+        }
+    }
+
+    /// Release ownership when this caller proves either that no Wake was
+    /// dispatched or that its activation reached command readiness. A completed
+    /// activation may already have been stopped again; its exact lease can be
+    /// released without changing the newer lifecycle or published route identity.
+    /// Potentially dispatched, unfinished work must retain its lease.
+    pub(super) async fn release_finished_activation_attempt_best_effort(
+        &self,
+        sandbox_id: SandboxId,
+        generation: i64,
+        activation_attempt_id: SandboxActivationAttemptId,
+    ) {
+        if let Err(error) = sqlx::query(sql!(
+            "UPDATE sandbox_k8s_executions
+                SET activation_attempt_id = NULL,
+                    activation_attempt_expires_at = NULL,
+                    activation_attempt_target_state = NULL
+              WHERE sandbox_id = $1 AND generation = $2 AND active
+                AND activation_attempt_id = $3"
+        ))
+        .bind(sandbox_id.as_uuid())
+        .bind(generation)
+        .bind(activation_attempt_id)
+        .execute(&self.pool)
+        .await
+        {
+            tracing::warn!(
+                sandbox_id = %sandbox_id,
+                generation,
+                %activation_attempt_id,
+                %error,
+                "failed to release finished activation; lease expiry will allow recovery"
             );
         }
     }

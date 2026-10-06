@@ -324,10 +324,19 @@ impl ActivationCompletion {
     }
 }
 
+/// Exact operation lease to release after the controller publishes its lifecycle.
+/// A later owner or execution must never be released by this completion.
+#[derive(Debug, Clone, Copy)]
+pub struct ActivationLeaseCompletion {
+    pub generation: i64,
+    pub attempt_id: SandboxActivationAttemptId,
+}
+
 #[derive(Debug, Clone)]
 pub struct ExecutionActivation {
     pub binding: ExecutionBinding,
     pub completion: ActivationCompletion,
+    pub lease_completion: Option<ActivationLeaseCompletion>,
 }
 
 impl ExecutionActivation {
@@ -335,6 +344,7 @@ impl ExecutionActivation {
         Self {
             binding,
             completion: ActivationCompletion::Owned,
+            lease_completion: None,
         }
     }
 
@@ -342,6 +352,7 @@ impl ExecutionActivation {
         Self {
             binding,
             completion: ActivationCompletion::Joined,
+            lease_completion: None,
         }
     }
 }
@@ -1228,6 +1239,7 @@ impl TeardownProgress {
 }
 
 pub struct CreateExecutionOutcome {
+    pub lease_completion: Option<ActivationLeaseCompletion>,
     pub sandbox_id: SandboxId,
     pub binding: Option<ExecutionBinding>,
     pub initial_lifecycle: &'static str,
@@ -2099,6 +2111,14 @@ pub trait SubstrateAdapter: Send + Sync {
         &'a self,
         request: CreateExecutionRequest<'a>,
     ) -> Result<CreateExecutionOutcome, SubstrateError>;
+
+    /// Finish an owned operation only after its target lifecycle is published.
+    async fn complete_activation_lease(
+        &self,
+        _sandbox_id: SandboxId,
+        _completion: Option<ActivationLeaseCompletion>,
+    ) {
+    }
 
     /// Delete the active execution object for a sandbox.
     ///
@@ -3140,6 +3160,26 @@ impl SubstrateAdapter for Substrate {
             Self::Direct(substrate) => substrate.create_execution(request).await,
             #[cfg(feature = "kubernetes")]
             Self::Kubernetes(substrate) => substrate.create_execution(request).await,
+        }
+    }
+
+    async fn complete_activation_lease(
+        &self,
+        sandbox_id: SandboxId,
+        completion: Option<ActivationLeaseCompletion>,
+    ) {
+        match self {
+            Self::Direct(substrate) => {
+                substrate
+                    .complete_activation_lease(sandbox_id, completion)
+                    .await
+            }
+            #[cfg(feature = "kubernetes")]
+            Self::Kubernetes(substrate) => {
+                substrate
+                    .complete_activation_lease(sandbox_id, completion)
+                    .await
+            }
         }
     }
 

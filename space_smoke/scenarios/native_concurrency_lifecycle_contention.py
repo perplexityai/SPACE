@@ -24,11 +24,6 @@ from space_smoke.registry import scenario
     "native_concurrency.lifecycle_contention",
     api_surfaces=("native",),
     rerun_environment=ENVIRONMENT,
-    quarantined=(
-        "a pause right after create can fail terminally: create reports running before "
-        "sbx-mgr leaves Starting, and the executor fails sbx-mgr's transient "
-        "'cannot pause: sandbox is starting' rejection instead of retrying it"
-    ),
 )
 def lifecycle_contention(test: NativeHardeningFixture) -> None:
     """Duplicate lifecycle intents share operations and conflicting intents preserve liveness."""

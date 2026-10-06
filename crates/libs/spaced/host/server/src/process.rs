@@ -57,14 +57,20 @@ impl Process for SpacedHostService {
         &self,
         request: Request<StartRequest>,
     ) -> Result<Response<Self::StartStream>, Status> {
-        let request = bridge_process_start_request(request.into_inner())?;
+        let request = bridge_process_start_request(request.into_inner())
+            .map_err(pplx_space_common_grpc::mark_guest_process_error)?;
         let guest_stream = self
             .call_bridge_guest_process(
                 "bridge_guest_process_start",
                 BridgeGuestOperationBudget::ProcessStreamOpen,
                 move |mut client| {
                     let request = request.clone();
-                    async move { client.start(request).await }
+                    async move {
+                        client
+                            .start(request)
+                            .await
+                            .map_err(pplx_space_common_grpc::mark_guest_process_error)
+                    }
                 },
             )
             .await?;
@@ -75,14 +81,20 @@ impl Process for SpacedHostService {
         &self,
         request: Request<ConnectProcessRequest>,
     ) -> Result<Response<Self::ConnectProcessStream>, Status> {
-        let request = bridge_process_connect_request(request.into_inner())?;
+        let request = bridge_process_connect_request(request.into_inner())
+            .map_err(pplx_space_common_grpc::mark_guest_process_error)?;
         let guest_stream = self
             .call_bridge_guest_process(
                 "bridge_guest_process_connect",
                 BridgeGuestOperationBudget::ProcessStreamOpen,
                 move |mut client| {
                     let request = request.clone();
-                    async move { client.connect_process(request).await }
+                    async move {
+                        client
+                            .connect_process(request)
+                            .await
+                            .map_err(pplx_space_common_grpc::mark_guest_process_error)
+                    }
                 },
             )
             .await?;

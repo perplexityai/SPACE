@@ -2042,6 +2042,7 @@ impl SubstrateAdapter for KubernetesSubstrate {
                         message: "joined create pod has no registered node placement".to_string(),
                     })?;
                 return Ok(CreateExecutionOutcome {
+                    lease_completion: None,
                     sandbox_id,
                     binding: Some(binding),
                     initial_lifecycle: "started",
@@ -2110,6 +2111,7 @@ impl SubstrateAdapter for KubernetesSubstrate {
                 })?;
                 restore_source_sandbox_id = restore.source_sandbox_id.to_string();
                 SandboxPodRequest::Restore {
+                    artifact_kind: pplx_space_common_core::types::ArtifactKind::Disk,
                     common,
                     runtime,
                     suspend_restore_storage_uri: Some(storage_uri),
@@ -2360,6 +2362,7 @@ impl SubstrateAdapter for KubernetesSubstrate {
                         )
                         .await;
                     return Ok(CreateExecutionOutcome {
+                        lease_completion: None,
                         sandbox_id,
                         binding: None,
                         initial_lifecycle: "started",
@@ -2506,6 +2509,10 @@ impl SubstrateAdapter for KubernetesSubstrate {
             )
             .await;
         Ok(CreateExecutionOutcome {
+            lease_completion: Some(super::super::ActivationLeaseCompletion {
+                generation: execution.generation,
+                attempt_id: activation_attempt_id,
+            }),
             sandbox_id,
             binding: Some(binding),
             initial_lifecycle,
@@ -2513,6 +2520,22 @@ impl SubstrateAdapter for KubernetesSubstrate {
             active_node_id,
             command_ready: true,
         })
+    }
+
+    async fn complete_activation_lease(
+        &self,
+        sandbox_id: SandboxId,
+        completion: Option<super::super::ActivationLeaseCompletion>,
+    ) {
+        if let Some(completion) = completion {
+            self.store
+                .release_finished_activation_attempt_best_effort(
+                    sandbox_id,
+                    completion.generation,
+                    completion.attempt_id,
+                )
+                .await;
+        }
     }
 
     async fn delete_execution(&self, sandbox_id: SandboxId) -> Result<(), SubstrateError> {
@@ -2793,7 +2816,19 @@ impl SubstrateAdapter for KubernetesSubstrate {
                     owner_attempt_id,
                     ..
                 }) => (requested_attempt_id, Some(owner_attempt_id)),
-                Err(error) => return Err(error),
+                Err(error) => {
+                    // Materialization can acquire ownership before placement
+                    // is available. No Wake was dispatched, so a retry must
+                    // re-enter recovery instead of joining this abandoned lease.
+                    if let Some((attempt_id, generation)) = activation_assignment.assigned() {
+                        self.store
+                            .release_finished_activation_attempt_best_effort(
+                                sandbox_id, generation, attempt_id,
+                            )
+                            .await;
+                    }
+                    return Err(error);
+                }
             };
             let fence = self
                 .store
@@ -2892,6 +2927,15 @@ impl SubstrateAdapter for KubernetesSubstrate {
             let (wake_outcome, route_identity) = match wake_result {
                 Ok(outcome) => outcome,
                 Err(failure) => {
+                    if failure.operation_release_is_safe()
+                        && let Some((attempt_id, generation)) = owned_attempt
+                    {
+                        self.store
+                            .release_finished_activation_attempt_best_effort(
+                                sandbox_id, generation, attempt_id,
+                            )
+                            .await;
+                    }
                     let dispatched = failure.was_dispatched();
                     let error = failure.into_error();
                     if dispatched {
@@ -2974,7 +3018,16 @@ impl SubstrateAdapter for KubernetesSubstrate {
                 )
                 .await;
         }
-        result.map(|(binding, _)| ExecutionActivation::owned(binding))
+        result.map(|(binding, owned_attempt)| {
+            let mut activation = ExecutionActivation::owned(binding);
+            activation.lease_completion = owned_attempt.map(|(attempt_id, generation)| {
+                super::super::ActivationLeaseCompletion {
+                    generation,
+                    attempt_id,
+                }
+            });
+            activation
+        })
     }
 
     async fn restore_execution(

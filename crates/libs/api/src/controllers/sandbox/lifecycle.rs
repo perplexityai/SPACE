@@ -1634,6 +1634,9 @@ impl SandboxController {
                         return Ok(body);
                     }
                     maybe_update_sandbox_state(pool, id, "started", "on_node").await;
+                    self.substrate
+                        .complete_activation_lease(typed_id, execution.lease_completion)
+                        .await;
                     Ok((Some(SandboxLifecycleStatus::Started), body))
                 }
                 SandboxAction::Wake | SandboxAction::ImplicitWake(_) => {

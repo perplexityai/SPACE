@@ -1204,7 +1204,7 @@ const (
 	// This execution has a remotely ready suspend artifact.
 	TeardownSuspendOutcome_TEARDOWN_SUSPEND_OUTCOME_DURABLE TeardownSuspendOutcome = 2
 	// This execution no longer owns local runtime resources: a newer execution
-	// owns them, or generation-fenced activation rollback conclusively retired
+	// owns them, or generation-fenced stop or activation rollback conclusively retired
 	// them. The task must detach without deleting the sandbox or its filesystem.
 	TeardownSuspendOutcome_TEARDOWN_SUSPEND_OUTCOME_SUPERSEDED TeardownSuspendOutcome = 3
 	// A generation-fenced local delete committed for this execution or a newer

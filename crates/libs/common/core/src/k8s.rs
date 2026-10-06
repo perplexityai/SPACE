@@ -520,6 +520,10 @@ pub enum SandboxPodRequest<'a> {
         node_group_placement: Option<&'a NodeGroupPlacement>,
     },
     Restore {
+        /// Disk restarts use retained rootfs; full restores resume VM memory.
+        /// The shim translates the disk marker into a cold Start or a retry
+        /// attachment after observing the local sandbox state.
+        artifact_kind: crate::types::ArtifactKind,
         common: SandboxPodCommon<'a>,
         runtime: SandboxRuntimePodMetadata<'a>,
         /// Node-group placement recomputed from the *current* template
@@ -740,6 +744,7 @@ pub fn build_sandbox_pod(config: &SandboxPodConfig<'_>, request: SandboxPodReque
             node_group_placement,
         ),
         SandboxPodRequest::Restore {
+            artifact_kind,
             common,
             runtime,
             node_group_placement,
@@ -752,7 +757,10 @@ pub fn build_sandbox_pod(config: &SandboxPodConfig<'_>, request: SandboxPodReque
             extra_tolerations,
             extra_required_affinity,
         } => {
-            let checkpoint = fork_disk_restore.is_none().then_some("suspend");
+            let checkpoint = fork_disk_restore.is_none().then_some(match artifact_kind {
+                crate::types::ArtifactKind::Full => "suspend",
+                crate::types::ArtifactKind::Disk => "stopped",
+            });
             (
                 common,
                 Some(runtime),

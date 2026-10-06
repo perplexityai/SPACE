@@ -63,6 +63,45 @@ pub fn guest_service_connect_status(error: &std::io::Error) -> Status {
     }
 }
 
+const GUEST_PROCESS_ERROR_METADATA: &str = "space-guest-process-error";
+
+/// Mark definitive process-request validation or authenticated guest rejections.
+/// A node lookup or route-token failure may use the same gRPC code.
+pub fn mark_guest_process_error(mut status: Status) -> Status {
+    // The guest is not authoritative about the host's retry contract.
+    status.metadata_mut().remove(GUEST_PROCESS_ERROR_METADATA);
+    let storage_full = status.code() == Code::ResourceExhausted
+        && status
+            .metadata()
+            .get(pplx_space_common_core::spaced::ERROR_REASON_METADATA_KEY)
+            .and_then(|value| value.to_str().ok())
+            == Some(pplx_space_common_core::spaced::GUEST_STORAGE_FULL);
+    if storage_full
+        || matches!(
+            status.code(),
+            Code::NotFound
+                | Code::InvalidArgument
+                | Code::OutOfRange
+                | Code::PermissionDenied
+                | Code::FailedPrecondition
+        )
+    {
+        status.metadata_mut().insert(
+            GUEST_PROCESS_ERROR_METADATA,
+            MetadataValue::from_static("terminal"),
+        );
+    }
+    status
+}
+
+pub fn is_terminal_guest_process_error(status: &Status) -> bool {
+    status
+        .metadata()
+        .get(GUEST_PROCESS_ERROR_METADATA)
+        .and_then(|value| value.to_str().ok())
+        == Some("terminal")
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GuestCapability {
     InteractiveProcessControl,

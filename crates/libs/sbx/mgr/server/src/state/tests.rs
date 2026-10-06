@@ -1,6 +1,24 @@
 use super::SandboxState::*;
 
 #[test]
+fn pause_admission_retries_in_flight_lifecycle_but_rejects_invalid_stable_states() {
+    for (state, expected) in [
+        (Starting, tonic::Code::Unavailable),
+        (Restoring, tonic::Code::Unavailable),
+        (Resuming, tonic::Code::Unavailable),
+        (Checkpointing, tonic::Code::Unavailable),
+        (Pausing, tonic::Code::Unavailable),
+        (Stopped, tonic::Code::FailedPrecondition),
+        (Failed, tonic::Code::FailedPrecondition),
+        (Quarantined, tonic::Code::FailedPrecondition),
+    ] {
+        let error = state.transition(Pausing).unwrap_err();
+        assert_eq!(tonic::Status::from(error).code(), expected, "{state}");
+    }
+    assert_eq!(Started.transition(Pausing).unwrap(), Pausing);
+}
+
+#[test]
 fn every_local_lifecycle_round_trips_through_typed_observations() {
     for state in super::SandboxState::all() {
         let wire = crate::proto::SandboxLifecycleState::from(state);

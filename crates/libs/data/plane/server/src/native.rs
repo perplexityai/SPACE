@@ -251,14 +251,7 @@ pub(super) async fn session_events(
                     let result = stream_bridge_error_label(&error);
                     pplx_space_metrics::data_plane::attach(session_id.kind().as_str(), result);
                     tracing::warn!(%error, "failed to start process event stream");
-                    return data_plane_http_error(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        DataPlaneHttpErrorCode::StreamUnavailable,
-                        "process event stream is not available",
-                        true,
-                        ResponseOrigin::Node,
-                        ResponseKind::BackendTransport,
-                    );
+                    return process_stream_start_http_error(&error);
                 }
             }
         }
@@ -1664,11 +1657,59 @@ async fn open_native_process_stream(
     .await
 }
 
+fn process_stream_start_http_error(error: &StreamBridgeError) -> Response {
+    // Guest spawn failures are terminal for this command. Retrying a missing
+    // executable or working directory cannot repair it; route identity repair
+    // and transport failures must keep their existing retry contract.
+    let permanent = match error {
+        StreamBridgeError::BackendStatus(status)
+            if pplx_space_common_grpc::is_terminal_guest_process_error(status) =>
+        {
+            match status.code() {
+                tonic::Code::NotFound => {
+                    Some((StatusCode::NOT_FOUND, DataPlaneHttpErrorCode::NotFound))
+                }
+                tonic::Code::InvalidArgument
+                | tonic::Code::OutOfRange
+                | tonic::Code::FailedPrecondition
+                | tonic::Code::ResourceExhausted => Some((
+                    StatusCode::BAD_REQUEST,
+                    DataPlaneHttpErrorCode::InvalidRequest,
+                )),
+                tonic::Code::PermissionDenied => {
+                    Some((StatusCode::FORBIDDEN, DataPlaneHttpErrorCode::Forbidden))
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    };
+    if let Some((status, code)) = permanent {
+        return data_plane_http_error(
+            status,
+            code,
+            "command could not be started",
+            false,
+            ResponseOrigin::Node,
+            ResponseKind::BackendTransport,
+        );
+    }
+    data_plane_http_error(
+        StatusCode::SERVICE_UNAVAILABLE,
+        DataPlaneHttpErrorCode::StreamUnavailable,
+        "process event stream is not available",
+        true,
+        ResponseOrigin::Node,
+        ResponseKind::BackendTransport,
+    )
+}
+
 fn stream_start_error_frame(error: &StreamBridgeError) -> DataPlaneServerFrame {
     let retryable = matches!(
         error,
         StreamBridgeError::BackendStatus(status)
-            if backend_stream_status_retryable(status)
+            if !pplx_space_common_grpc::is_terminal_guest_process_error(status)
+                && backend_stream_status_retryable(status)
     );
     DataPlaneServerFrame::Error {
         code: DataPlaneErrorCode::BackendStreamError,

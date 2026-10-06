@@ -58,6 +58,7 @@ class SmokeSuiteTests(unittest.TestCase):
             if "ecw" in scenario.api_surfaces
             and "kind" in scenario.backends
             and scenario.quarantined is None
+            and scenario.ignored is None
         )
         results = tuple(
             ScenarioProcessResult(scenario.id, 0, "", "") for scenario in selected
@@ -100,6 +101,7 @@ class SmokeSuiteTests(unittest.TestCase):
             if "ecw" in scenario.api_surfaces
             and "kind" in scenario.backends
             and scenario.quarantined is None
+            and scenario.ignored is None
         )
         held = dataclasses.replace(live[0], quarantined="tracked in #0000")
         registry = ScenarioRegistry((held, *live[1:]))

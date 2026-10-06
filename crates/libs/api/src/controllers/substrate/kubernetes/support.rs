@@ -602,6 +602,7 @@ impl fmt::Display for TerminalPodPhase {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum StalePodReason {
     SandboxSuspended,
+    SandboxStopped,
     LocalOnlyRestoreNowPortable,
     PodDeleting,
     TerminalPhase(TerminalPodPhase),
@@ -611,6 +612,7 @@ impl fmt::Display for StalePodReason {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::SandboxSuspended => formatter.write_str("sandbox suspended"),
+            Self::SandboxStopped => formatter.write_str("sandbox stopped"),
             Self::LocalOnlyRestoreNowPortable => {
                 formatter.write_str("local-only restore now has remote fallback")
             }

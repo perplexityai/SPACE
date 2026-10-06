@@ -3,6 +3,112 @@ use axum::extract::ws::Message;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+#[tokio::test]
+async fn process_start_http_errors_preserve_permanent_guest_failures() {
+    use http_body_util::BodyExt;
+
+    for (code, guest, expected_status, retryable, websocket_retryable) in [
+        (
+            tonic::Code::NotFound,
+            true,
+            StatusCode::NOT_FOUND,
+            false,
+            false,
+        ),
+        (
+            tonic::Code::InvalidArgument,
+            true,
+            StatusCode::BAD_REQUEST,
+            false,
+            false,
+        ),
+        (
+            tonic::Code::PermissionDenied,
+            true,
+            StatusCode::FORBIDDEN,
+            false,
+            false,
+        ),
+        (
+            tonic::Code::FailedPrecondition,
+            true,
+            StatusCode::BAD_REQUEST,
+            false,
+            false,
+        ),
+        (
+            tonic::Code::NotFound,
+            false,
+            StatusCode::SERVICE_UNAVAILABLE,
+            true,
+            false,
+        ),
+        (
+            tonic::Code::PermissionDenied,
+            false,
+            StatusCode::SERVICE_UNAVAILABLE,
+            true,
+            false,
+        ),
+        (
+            tonic::Code::InvalidArgument,
+            false,
+            StatusCode::SERVICE_UNAVAILABLE,
+            true,
+            false,
+        ),
+        (
+            tonic::Code::Internal,
+            false,
+            StatusCode::SERVICE_UNAVAILABLE,
+            true,
+            false,
+        ),
+        (
+            tonic::Code::Unavailable,
+            false,
+            StatusCode::SERVICE_UNAVAILABLE,
+            true,
+            true,
+        ),
+        (
+            tonic::Code::DeadlineExceeded,
+            false,
+            StatusCode::SERVICE_UNAVAILABLE,
+            true,
+            false,
+        ),
+    ] {
+        let mut status = tonic::Status::new(code, "synthetic process failure");
+        if guest {
+            status
+                .metadata_mut()
+                .insert("space-guest-process-error", "terminal".parse().unwrap());
+        }
+        let error = StreamBridgeError::BackendStatus(status);
+        let response = process_stream_start_http_error(&error);
+        assert_eq!(
+            response.status(),
+            expected_status,
+            "{code:?}, guest={guest}"
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["retryable"], retryable, "{code:?}: {body}");
+        let DataPlaneServerFrame::Error {
+            retryable: actual_websocket_retryable,
+            ..
+        } = stream_start_error_frame(&error)
+        else {
+            panic!("expected error frame")
+        };
+        assert_eq!(
+            actual_websocket_retryable, websocket_retryable,
+            "WebSocket opening errors retain the established stream retry contract"
+        );
+    }
+}
+
 struct OpenDropped(Arc<AtomicBool>);
 impl Drop for OpenDropped {
     fn drop(&mut self) {

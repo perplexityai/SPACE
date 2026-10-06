@@ -1152,7 +1152,7 @@ impl SandboxManagerService {
             sandbox
                 .state
                 .transition(SandboxState::Checkpointing)
-                .map_err(|error| Status::failed_precondition(error.to_string()))?;
+                .map_err(Status::from)?;
         }
 
         // Generate snapshot name with f-/d- prefix (required by list/rollback/export).
@@ -1779,7 +1779,7 @@ impl SandboxManagerService {
             sandbox
                 .state
                 .transition(SandboxState::Checkpointing)
-                .map_err(|error| Status::failed_precondition(error.to_string()))?;
+                .map_err(Status::from)?;
             require_state_write(
                 crate::db::update_state(&db, &sandbox.id, SandboxState::Checkpointing),
                 "begin template checkpoint",

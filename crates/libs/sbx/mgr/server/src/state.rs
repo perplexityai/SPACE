@@ -438,6 +438,15 @@ pub enum StateTransitionError {
     },
 }
 
+impl From<StateTransitionError> for tonic::Status {
+    fn from(error: StateTransitionError) -> Self {
+        match error {
+            StateTransitionError::Transient { .. } => Self::unavailable(error.to_string()),
+            StateTransitionError::Invalid { .. } => Self::failed_precondition(error.to_string()),
+        }
+    }
+}
+
 impl fmt::Display for SandboxState {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())

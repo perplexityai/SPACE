@@ -770,7 +770,7 @@ impl SandboxManagerService {
             sandbox
                 .state
                 .transition(SandboxState::Resuming)
-                .map_err(|error| Status::failed_precondition(error.to_string()))?;
+                .map_err(Status::from)?;
             sandbox
         };
         let sandbox_id_typed = sandbox

@@ -13,10 +13,6 @@ from space_smoke.registry import scenario
     api_surfaces=("native",),
     required_tools=("kubectl", "kind"),
     rerun_environment=RECOVERY_ENVIRONMENT,
-    quarantined=(
-        "zero-vCPU creates are accepted and repeatedly fail worker validation; "
-        "requires scoped Kind operation budgets to drain invalid acceptance"
-    ),
 )
 def zero_vcpu_admission(test: KindNativeHardeningFixture) -> None:
     """A valid create with zero vCPUs fails admission with a permanent client error."""
@@ -34,8 +30,8 @@ def zero_vcpu_admission(test: KindNativeHardeningFixture) -> None:
                     "template": test.config.template,
                     "resources": {"vcpu": 0},
                 })
-                detail = response.body.get("error")
-                error = detail if isinstance(detail, dict) else {}
+                # Native control-plane errors are a flat PublicError envelope.
+                error = response.body
                 test.context.record("zero_vcpu_admission", {
                     "status": response.status,
                     "error_code": error.get("code"),

@@ -15,6 +15,7 @@ import socket
 import ssl
 import struct
 import sys
+from functools import partial
 from pathlib import Path
 
 RESOLVERS = {"1.1.1.1": "cloudflare-dns.com", "8.8.8.8": "dns.google"}
@@ -126,17 +127,23 @@ async def serve(args):
     import protocols
 
     descriptor = os.open(args.events, os.O_CREAT | os.O_WRONLY | os.O_APPEND, 0o600)
+    health_descriptor = os.open(
+        args.health_events, os.O_CREAT | os.O_WRONLY | os.O_APPEND, 0o600
+    )
     credential = (
         Path(args.credential_file).read_text() if args.credential_file else None
     )
 
-    def record(kind, address, port, **fields):
+    def record(kind, address, port, *, health=False, **fields):
         event = dict(zone=args.zone, kind=kind, target=address, port=port, **fields)
-        os.write(descriptor, (json.dumps(event) + "\n").encode())
+        os.write(
+            health_descriptor if health else descriptor,
+            (json.dumps(event) + "\n").encode(),
+        )
 
-    def answer(wire, address, port):
+    def answer(wire, address, port, receipt=record):
         name, end = question(wire)
-        record("dns", address, port, host=name)
+        receipt("dns", address, port, host=name)
         header = wire[:2] + struct.pack("!5H", 0x8180, 1, 1, 0, 0)
         return (
             header
@@ -169,10 +176,15 @@ async def serve(args):
         address, port = writer.get_extra_info("sockname")[:2]
         remote = writer.get_extra_info("peername")
         connection = f"{remote[0]}:{remote[1]}"
-        record("connect", address, port, connection=connection)
+        # Direct health probes run in the destination's namespace and connect
+        # from its own address. Gateway traffic arrives from another namespace.
+        # Keep every receipt on a health connection separate, including control
+        # frames received after the client reports success.
+        record_connection = partial(record, health=remote[0] == address)
+        record_connection("connect", address, port, connection=connection)
 
         def received(data):
-            record(
+            record_connection(
                 "data",
                 address,
                 port,
@@ -193,7 +205,7 @@ async def serve(args):
                 for name in args.credential_header:
                     if name in headers:
                         headers[name] = "<redacted>"
-            record(
+            record_connection(
                 "request",
                 address,
                 port,
@@ -215,7 +227,9 @@ async def serve(args):
                     writer,
                     upstream_reader,
                     upstream_writer,
-                    lambda data: record("dot-data", address, port, bytes=len(data)),
+                    lambda data: record_connection(
+                        "dot-data", address, port, bytes=len(data)
+                    ),
                 )
                 return
             if port in protocols.TLS_PORTS:
@@ -230,7 +244,7 @@ async def serve(args):
                 ]
                 await writer.start_tls(context, ssl_handshake_timeout=2)
                 ssl_object = writer.get_extra_info("ssl_object")
-                record(
+                record_connection(
                     "tls-handshake",
                     address,
                     port,
@@ -243,7 +257,7 @@ async def serve(args):
             if port == 8445:
 
                 def connect_received(host):
-                    record(
+                    record_connection(
                         "connect-request",
                         address,
                         port,
@@ -266,7 +280,7 @@ async def serve(args):
             if port in (8081, 8444):
 
                 def upgrade_received(host):
-                    record(
+                    record_connection(
                         "websocket-upgrade",
                         address,
                         port,
@@ -285,7 +299,9 @@ async def serve(args):
             while True:
                 if port == 53:
                     size = struct.unpack("!H", await reader.readexactly(2))[0]
-                    response = answer(await reader.readexactly(size), address, port)
+                    response = answer(
+                        await reader.readexactly(size), address, port, record_connection
+                    )
                     writer.write(struct.pack("!H", len(response)) + response)
                 else:
                     data = await reader.read(65536)
@@ -352,6 +368,7 @@ async def serve(args):
         if grpc_service:
             await grpc_service.stop(0)
         os.close(descriptor)
+        os.close(health_descriptor)
 
 
 def receive_exact(stream, size):
@@ -487,7 +504,7 @@ if __name__ == "__main__":
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("probe-server")
     server = commands.add_parser("serve")
-    for name in ("zone", "events", "certificate", "key", "ready"):
+    for name in ("zone", "events", "health-events", "certificate", "key", "ready"):
         server.add_argument(f"--{name}", required=True)
     server.add_argument("--address", action="append", default=[])
     server.add_argument("--relay-socket", required=True)

@@ -19,6 +19,7 @@ def test_shards_run_every_eligible_scenario_once_and_propagate_failures(surface)
         if surface in scenario.api_surfaces
         and "kind" in scenario.backends
         and scenario.quarantined is None
+        and scenario.ignored is None
         and scenario.applies_to(None)
     }
     seen = []

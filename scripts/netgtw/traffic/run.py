@@ -1000,6 +1000,8 @@ def run(args, cases):
                 zone,
                 "--events",
                 events_path,
+                "--health-events",
+                output / "health-events.jsonl",
                 "--certificate",
                 certificate,
                 "--key",

@@ -14,6 +14,7 @@ import (
 	"sync"
 	"syscall"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	taskAPI "github.com/containerd/containerd/api/runtime/task/v3"
@@ -1525,7 +1526,7 @@ func TestFirstExecutionWithoutOptInKeepsLegacyTeardown(t *testing.T) {
 	service := &spaceTaskService{tasks: map[string]*task{"task": podTask}}
 	client := &fakeSandboxManagerClient{
 		results: []sandboxStateResult{
-			{resp: &pb.StateResponse{Sandboxes: []*pb.SandboxInfo{{Lifecycle: pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_STOPPED.Enum()}}}},
+			{resp: &pb.StateResponse{Sandboxes: []*pb.SandboxInfo{{Lifecycle: pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_STARTED.Enum()}}}},
 		},
 	}
 
@@ -1875,33 +1876,35 @@ func TestTeardownFailsClosed(t *testing.T) {
 	}
 }
 
-func TestLegacyPodTeardownDoesNotInvokeGenerationSuspend(t *testing.T) {
-	for _, operation := range []string{"kill", "delete"} {
-		t.Run(operation, func(t *testing.T) {
-			client := &fakeSandboxManagerClient{
-				results: []sandboxStateResult{{
-					resp: &pb.StateResponse{Sandboxes: []*pb.SandboxInfo{{Lifecycle: pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_STOPPED.Enum()}}},
-				}},
-			}
-			identity := taskTeardownIdentity{sandboxID: "sbx", executionGeneration: 7}
+func TestLegacyPodTeardownPreservesUserStoppedRootfs(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		state sandboxStateResult
+	}{
+		{"stopped", sandboxStateResult{resp: &pb.StateResponse{Sandboxes: []*pb.SandboxInfo{{Lifecycle: pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_STOPPED.Enum()}}}}},
+		{"missing", sandboxStateResult{err: status.Error(codes.NotFound, "sandbox absent")}},
+		{"empty", sandboxStateResult{resp: &pb.StateResponse{}}},
+	} {
+		for _, operation := range []string{"kill", "delete"} {
+			t.Run(tc.name+"/"+operation, func(t *testing.T) {
+				client := &fakeSandboxManagerClient{results: []sandboxStateResult{tc.state}}
+				identity := taskTeardownIdentity{sandboxID: "sbx", executionGeneration: 7}
 
-			detached, err := releaseLegacyTaskTeardown(context.Background(), client, operation, identity)
-			if err != nil {
-				t.Fatalf("releaseLegacyTaskTeardown() error = %v", err)
-			}
-			if detached {
-				t.Fatal("legacy stopped sandbox was unexpectedly detached")
-			}
-			if len(client.teardownRequests) != 0 {
-				t.Fatal("legacy pod teardown invoked planned suspend")
-			}
-			if operation == "kill" && (client.stopCalls != 1 || client.deleteCalls != 0) {
-				t.Fatalf("legacy kill calls = stop:%d delete:%d", client.stopCalls, client.deleteCalls)
-			}
-			if operation == "delete" && (client.stopCalls != 0 || client.deleteCalls != 1) {
-				t.Fatalf("legacy delete calls = stop:%d delete:%d", client.stopCalls, client.deleteCalls)
-			}
-		})
+				detached, err := releaseLegacyTaskTeardown(context.Background(), client, operation, identity)
+				if err != nil {
+					t.Fatalf("releaseLegacyTaskTeardown() error = %v", err)
+				}
+				if !detached {
+					t.Fatal("user-stopped sandbox must be detached from its terminating pod")
+				}
+				if len(client.teardownRequests) != 0 {
+					t.Fatal("legacy pod teardown invoked planned suspend")
+				}
+				if client.stopCalls != 0 || client.deleteCalls != 0 {
+					t.Fatalf("user-stopped sandbox mutated: stop:%d delete:%d", client.stopCalls, client.deleteCalls)
+				}
+			})
+		}
 	}
 }
 
@@ -2155,6 +2158,142 @@ type fakeSandboxManagerClient struct {
 	onTeardownCall   func()
 	stopCalls        int
 	deleteCalls      int
+}
+
+func TestStoppedRestartCheckpoint(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		lifecycle  pb.SandboxLifecycleState
+		stateError error
+		storageURI *string
+		checkpoint *string
+		code       codes.Code
+	}{
+		{"retained disk", pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_STOPPED, nil, nil, nil, codes.OK},
+		{"completed retry", pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_STARTED, nil, nil, ptr("suspend"), codes.OK},
+		{"missing disk refuses historical snapshot", 0, status.Error(codes.NotFound, "absent"), nil, nil, codes.FailedPrecondition},
+		{"suspended is not stopped", pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_SUSPENDED, nil, nil, nil, codes.FailedPrecondition},
+		{"failed stays failed", pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_FAILED, nil, nil, nil, codes.FailedPrecondition},
+		{"authorization failure", 0, status.Error(codes.PermissionDenied, "denied"), nil, nil, codes.PermissionDenied},
+		{"interrupted remote stage", pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_RESTORING, nil, ptr("s3://example/disk"), ptr("suspend"), codes.OK},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			client := &fakeSandboxManagerClient{results: []sandboxStateResult{{resp: &pb.StateResponse{Sandboxes: []*pb.SandboxInfo{{Lifecycle: tc.lifecycle.Enum()}}}, err: tc.stateError}}}
+			ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+			defer cancel()
+			checkpoint, err := stoppedRestartCheckpoint(ctx, client, "sandbox", tc.storageURI)
+			if status.Code(err) != tc.code {
+				t.Fatalf("code = %s, want %s: %v", status.Code(err), tc.code, err)
+			}
+			if (checkpoint == nil) != (tc.checkpoint == nil) || (checkpoint != nil && tc.checkpoint != nil && *checkpoint != *tc.checkpoint) {
+				t.Fatalf("checkpoint = %v, want %v", checkpoint, tc.checkpoint)
+			}
+		})
+	}
+}
+
+func TestStoppedRestartWaitsForTransitionAndRequiresAnExplicitRemoteArtifact(t *testing.T) {
+	for _, state := range []pb.SandboxLifecycleState{pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_STARTING, pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_STOPPING, pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_RESTORING} {
+		client := &fakeSandboxManagerClient{results: []sandboxStateResult{
+			{resp: &pb.StateResponse{Sandboxes: []*pb.SandboxInfo{{Lifecycle: state.Enum()}}}},
+			{resp: &pb.StateResponse{Sandboxes: []*pb.SandboxInfo{{Lifecycle: pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_STOPPED.Enum()}}}},
+		}}
+		checkpoint, err := stoppedRestartCheckpoint(context.Background(), client, "sandbox", nil)
+		if err != nil || checkpoint != nil {
+			t.Fatalf("transition %s: checkpoint=%v err=%v", state, checkpoint, err)
+		}
+	}
+	for _, stateError := range []error{nil, status.Error(codes.NotFound, "absent")} {
+		client := &fakeSandboxManagerClient{results: []sandboxStateResult{{err: stateError}}}
+		checkpoint, err := stoppedRestartCheckpoint(context.Background(), client, "sandbox", ptr("s3://example/disk"))
+		if err != nil || checkpoint == nil || *checkpoint != "suspend" {
+			t.Fatalf("selected artifact: checkpoint=%v err=%v", checkpoint, err)
+		}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	client := &fakeSandboxManagerClient{results: []sandboxStateResult{{resp: &pb.StateResponse{Sandboxes: []*pb.SandboxInfo{{Lifecycle: pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_STOPPING.Enum()}}}}}}
+	if _, err := stoppedRestartCheckpoint(ctx, client, "sandbox", nil); status.Code(err) != codes.Canceled {
+		t.Fatalf("cancelled wait: %v", err)
+	}
+}
+
+type checkpointStartClient struct {
+	pb.SandboxManagerClient
+	start func(context.Context, *pb.StartRequest) (*pb.StartResponse, error)
+}
+
+func (f checkpointStartClient) Start(ctx context.Context, request *pb.StartRequest, _ ...grpc.CallOption) (*pb.StartResponse, error) {
+	return f.start(ctx, request)
+}
+
+func TestStoppedCheckpointContinuation(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		code codes.Code
+	}{
+		{"interrupted stage", codes.OK},
+		{"busy then admitted", codes.OK},
+		{"healthy slow transfer", codes.OK},
+		{"permanent rejection", codes.FailedPrecondition},
+		{"cancelled admission", codes.Canceled},
+		{"busy until deadline", codes.DeadlineExceeded},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+				defer cancel()
+				request := &pb.StartRequest{
+					SandboxId: "sandbox", Checkpoint: ptr("suspend"),
+					SuspendRestoreStorageUri: ptr("s3://example/disk"),
+				}
+				original := proto.Clone(request)
+				calls := 0
+				client := checkpointStartClient{start: func(callCtx context.Context, got *pb.StartRequest) (*pb.StartResponse, error) {
+					calls++
+					if !proto.Equal(got, original) {
+						t.Fatal("retry changed the selected restore intent")
+					}
+					switch tc.name {
+					case "busy then admitted":
+						if calls == 1 {
+							return nil, status.Error(codes.Unavailable, "staging in progress")
+						}
+					case "healthy slow transfer":
+						time.Sleep(35 * time.Second)
+						if callCtx.Err() != nil {
+							t.Fatal("admission budget cancelled a healthy transfer")
+						}
+					case "permanent rejection":
+						return nil, status.Error(codes.FailedPrecondition, "pending deletion")
+					case "cancelled admission":
+						cancel()
+						return nil, status.Error(codes.Unavailable, "staging in progress")
+					case "busy until deadline":
+						return nil, status.Error(codes.Unavailable, "staging in progress")
+					}
+					return &pb.StartResponse{Pid: 123}, nil
+				}}
+				began := time.Now()
+				response, err := startStoppedCheckpoint(ctx, client, request)
+				if status.Code(err) != tc.code {
+					t.Fatalf("code=%s want=%s err=%v", status.Code(err), tc.code, err)
+				}
+				if err == nil && response.GetPid() != 123 {
+					t.Fatal("lost admitted runtime")
+				}
+				if tc.name == "busy then admitted" && calls != 2 {
+					t.Fatalf("Start calls=%d", calls)
+				}
+				if tc.name == "permanent rejection" && calls != 1 {
+					t.Fatal("retried permanent rejection")
+				}
+				if tc.name == "busy until deadline" && time.Since(began) != 30*time.Second {
+					t.Fatalf("admission wait=%s", time.Since(began))
+				}
+			})
+		})
+	}
 }
 
 type blockingLegacyTeardownClient struct {
