@@ -1,3 +1,5 @@
+use std::io::Read;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use axum::Router;
@@ -21,13 +23,15 @@ struct ReceivedUpload {
     body: Bytes,
 }
 
-/// In-process S3 stand-in that records every upload body off the wire.
-/// `reject_digest` answers every upload the way S3 answers a body that does
-/// not match its `Content-MD5`.
+/// In-process S3 stand-in that records every upload body off the wire and,
+/// like a store that enforces the digest, answers `400 BadDigest` to an upload
+/// whose `Content-MD5` is missing or does not match the received body.
+/// `reject_every_upload` answers `BadDigest` to every upload regardless, to
+/// exercise how the client surfaces the rejection.
 #[derive(Clone, Default)]
 struct FakeS3 {
     uploads: Arc<Mutex<Vec<ReceivedUpload>>>,
-    reject_digest: bool,
+    reject_every_upload: bool,
 }
 
 impl FakeS3 {
@@ -86,6 +90,8 @@ async fn handle(
             let content_md5 = headers
                 .get("content-md5")
                 .map(|value| value.to_str().expect("ASCII Content-MD5").to_string());
+            let digest_matches =
+                content_md5.as_deref() == Some(BASE64_STANDARD.encode(Md5::digest(&body)).as_str());
             s3.uploads
                 .lock()
                 .expect("uploads lock")
@@ -94,7 +100,7 @@ async fn handle(
                     content_md5,
                     body,
                 });
-            if s3.reject_digest {
+            if s3.reject_every_upload || !digest_matches {
                 return xml(
                     StatusCode::BAD_REQUEST,
                     "<Error><Code>BadDigest</Code><Message>The Content-MD5 you \
@@ -242,9 +248,9 @@ async fn every_multipart_part_sends_content_md5_of_its_range() {
 }
 
 #[tokio::test]
-async fn rejected_digest_fails_the_upload() {
+async fn bad_digest_rejection_surfaces_as_put_and_multipart_errors() {
     let s3 = FakeS3 {
-        reject_digest: true,
+        reject_every_upload: true,
         ..FakeS3::default()
     };
     let endpoint = s3.clone().serve().await;
@@ -275,5 +281,77 @@ async fn rejected_digest_fails_the_upload() {
     assert!(
         matches!(&multipart, Err(ObjectStoreError::Multipart(message)) if message.contains("BadDigest")),
         "multipart upload must fail with BadDigest, got {multipart:?}",
+    );
+}
+
+#[test]
+fn file_range_past_end_of_file_is_unexpected_eof() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = write_source(&dir, &test_bytes(1024));
+
+    let err = super::of_file_range(&path, 512, 1024, &AtomicBool::new(false))
+        .expect_err("a range past the end of the file must not digest");
+
+    assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof, "{err}");
+}
+
+/// Reader of `remaining` zero bytes that counts what it hands out and sets
+/// `cancel` after its first read, as a dropped part future would mid-digest.
+struct CancelAfterFirstRead<'a> {
+    remaining: u64,
+    read: &'a AtomicU64,
+    cancel: &'a AtomicBool,
+}
+
+impl Read for CancelAfterFirstRead<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let len = buf
+            .len()
+            .min(usize::try_from(self.remaining).unwrap_or(usize::MAX));
+        buf[..len].fill(0);
+        self.remaining -= len as u64;
+        self.read.fetch_add(len as u64, Ordering::Relaxed);
+        self.cancel.store(true, Ordering::Relaxed);
+        Ok(len)
+    }
+}
+
+#[test]
+fn cancelled_digest_stops_at_the_next_chunk_without_a_digest() {
+    let range_bytes = 64 * super::READ_CHUNK_BYTES as u64;
+    let read = AtomicU64::new(0);
+    let cancel = AtomicBool::new(false);
+    let reader = CancelAfterFirstRead {
+        remaining: range_bytes,
+        read: &read,
+        cancel: &cancel,
+    };
+
+    let result = super::digest_chunks(reader, &cancel);
+
+    assert!(
+        result.is_err(),
+        "a cancelled digest must not produce a digest, got {result:?}"
+    );
+    assert_eq!(
+        read.load(Ordering::Relaxed),
+        super::READ_CHUNK_BYTES as u64,
+        "cancellation must stop the read after one chunk of the {range_bytes}-byte range",
+    );
+}
+
+#[test]
+fn dropping_the_guard_cancels_the_file_range_digest() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = write_source(&dir, &test_bytes(1024));
+    let cancel = super::CancelOnDrop::default();
+    let cancelled = cancel.flag();
+
+    drop(cancel);
+    let result = super::of_file_range(&path, 0, 1024, &cancelled);
+
+    assert!(
+        result.is_err(),
+        "a cancelled digest must not produce a digest, got {result:?}"
     );
 }

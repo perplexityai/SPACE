@@ -14,8 +14,10 @@
 //! header rather than an aws-chunked checksum trailer: see `s3_base_config`
 //! for why trailers stay off.
 
-use std::io::{BufReader, Read, Seek, SeekFrom, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
@@ -34,13 +36,18 @@ pub(crate) fn of_bytes(body: &[u8]) -> String {
 /// streamed in fixed-size chunks. Blocking: call from the blocking pool.
 ///
 /// Fails if the file ends before the range does, rather than digesting fewer
-/// bytes than the upload will declare.
-pub(crate) fn of_file_range(path: &Path, offset: u64, length: u64) -> std::io::Result<String> {
+/// bytes than the upload will declare. Fails once `cancelled` is set, checked
+/// before every chunk: a blocking read cannot be aborted, so this is how a
+/// dropped upload stops reading a range nobody will send.
+pub(crate) fn of_file_range(
+    path: &Path,
+    offset: u64,
+    length: u64,
+    cancelled: &AtomicBool,
+) -> std::io::Result<String> {
     let mut file = std::fs::File::open(path)?;
     file.seek(SeekFrom::Start(offset))?;
-    let mut range = BufReader::with_capacity(READ_CHUNK_BYTES, file.take(length));
-    let mut hasher = Md5::new();
-    let hashed = std::io::copy(&mut range, &mut DigestWriter(&mut hasher))?;
+    let (digest, hashed) = digest_chunks(file.take(length), cancelled)?;
     if hashed != length {
         return Err(std::io::Error::new(
             std::io::ErrorKind::UnexpectedEof,
@@ -51,20 +58,50 @@ pub(crate) fn of_file_range(path: &Path, offset: u64, length: u64) -> std::io::R
             ),
         ));
     }
-    Ok(BASE64_STANDARD.encode(hasher.finalize()))
+    Ok(digest)
 }
 
-/// Feeds [`std::io::copy`] into a hasher.
-struct DigestWriter<'a>(&'a mut Md5);
-
-impl Write for DigestWriter<'_> {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.update(buf);
-        Ok(buf.len())
+/// Digests `reader` to its end in [`READ_CHUNK_BYTES`] reads, returning the
+/// `Content-MD5` value and the byte count, or an error once `cancelled` is set.
+fn digest_chunks(reader: impl Read, cancelled: &AtomicBool) -> std::io::Result<(String, u64)> {
+    let mut reader = BufReader::with_capacity(READ_CHUNK_BYTES, reader);
+    let mut hasher = Md5::new();
+    let mut hashed = 0;
+    loop {
+        if cancelled.load(Ordering::Relaxed) {
+            return Err(std::io::Error::other(format!(
+                "digest cancelled after {hashed} bytes"
+            )));
+        }
+        let chunk = match reader.fill_buf() {
+            Ok([]) => break,
+            Ok(chunk) => chunk,
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(err) => return Err(err),
+        };
+        hasher.update(chunk);
+        let read = chunk.len();
+        hashed += read as u64;
+        reader.consume(read);
     }
+    Ok((BASE64_STANDARD.encode(hasher.finalize()), hashed))
+}
 
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
+/// Sets the shared cancellation flag when dropped. Held by the future awaiting
+/// a blocking [`of_file_range`], so dropping or aborting that future stops the
+/// read at its next chunk.
+#[derive(Default)]
+pub(crate) struct CancelOnDrop(Arc<AtomicBool>);
+
+impl CancelOnDrop {
+    pub(crate) fn flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.0)
+    }
+}
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
     }
 }
 

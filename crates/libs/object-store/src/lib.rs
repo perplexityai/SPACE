@@ -1902,9 +1902,16 @@ where
 /// [`content_md5`] for why every file upload carries one.
 async fn file_range_content_md5(path: &Path, offset: u64, length: u64) -> std::io::Result<String> {
     let path = path.to_path_buf();
-    tokio::task::spawn_blocking(move || content_md5::of_file_range(&path, offset, length))
-        .await
-        .map_err(std::io::Error::other)?
+    // Lives until the digest is awaited; if this future is dropped first (a
+    // sibling part failed and `abort_all` ran), the read stops at its next
+    // chunk instead of finishing a range nobody will upload.
+    let cancel = content_md5::CancelOnDrop::default();
+    let cancelled = cancel.flag();
+    tokio::task::spawn_blocking(move || {
+        content_md5::of_file_range(&path, offset, length, &cancelled)
+    })
+    .await
+    .map_err(std::io::Error::other)?
 }
 
 /// Calls `AbortMultipartUpload` if dropped before [`disarm`](AbortGuard::disarm).
