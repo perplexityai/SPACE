@@ -27,7 +27,11 @@
 //!   8 MiB and up.
 //! - A whole multipart upload of up to 8.4 GiB in waves of 16 parts: p99
 //!   18.5 s, max 37 s, and one 15-part upload took 37 s in a single wave, so
-//!   one part can take about 37 s. 60 s is about 1.6 times that.
+//!   one part can take about 37 s. 60 s is about 1.6 times that. That slow
+//!   tail clusters at 37.2–37.7 s across hosts and part counts, which looks
+//!   like one stalled attempt plus an SDK retry rather than a slow part, so
+//!   the margin is likely larger than it seems. Check
+//!   `space.object_store.s3.attempt_failed` before tuning this bound.
 //!
 //! There are no measurements for `HeadObject`, create/abort/complete, or the
 //! copies; S3 normally answers them within seconds.

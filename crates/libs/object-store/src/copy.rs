@@ -102,6 +102,13 @@ impl S3ObjectStore {
                 size_bytes = source_size,
                 "copying object with a single server-side copy"
             );
+            // S3 holds a single `CopyObject` open until the copy finishes, so
+            // the server-side attempt timeout (30 s by default) covers copying
+            // up to `MAX_SINGLE_COPY_BYTES`. Templates are published within
+            // one bucket today, so this path does not run in prod. If a
+            // separate source bucket is configured, especially in another
+            // region, raise `SPACE_OBJECT_STORE_SERVER_SIDE_ATTEMPT_TIMEOUT_SECS`
+            // or send copies larger than one part through the multipart copy.
             self.base
                 .copy_object()
                 .bucket(dest.bucket)
