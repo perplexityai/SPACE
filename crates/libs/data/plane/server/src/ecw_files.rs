@@ -279,43 +279,28 @@ pub(super) async fn write_file(
         .and_then(|value| value.to_str().ok())
         .unwrap_or("application/json");
     let user = extract_write_user(query.username.as_deref(), &headers)?;
-    if is_octet_stream_content_type(content_type) {
+    // Reject what the headers and query alone can before admission, so a
+    // malformed request never waits for or holds an upload permit.
+    let write_body = if is_octet_stream_content_type(content_type) {
         reject_oversized_content_length(
             &headers,
             E2B_FILE_CONTENT_LIMIT_BYTES,
             file_too_large_error,
         )?;
-        let Some(path) = query.path else {
+        let Some(path) = query.path.as_deref() else {
             return Err(EcwProxyError::bad_request(
                 "path query parameter is required for octet-stream uploads",
             ));
         };
-        let path = e2b_request_root(&path, user.as_ref())?;
-        // Create the parent before reading the body, so a destination whose
-        // parent can't be created fails without spooling the upload. Other
-        // write failures still surface after spooling.
-        let route = ensure_parent_dir(&state, route, &path, user.clone()).await?;
-        let mut spool = SpoolFiles::default();
-        let upload = spool_body_upload(body, &mut spool).await?;
-        spaced_write_spooled(&state, route, path.clone(), &upload, user).await?;
-        return Ok(Json(vec![file_write_info(path)]));
-    }
-
-    if is_json_content_type(content_type) {
-        let request = read_json_file_write_request(&headers, body).await?;
-        let path = e2b_request_root(&request.path, user.as_ref())?;
-        spaced_write_bytes(
-            &state,
-            route,
-            path.clone(),
-            file_write_content_to_bytes(request.content)?,
-            user,
-        )
-        .await?;
-        return Ok(Json(vec![file_write_info(path)]));
-    }
-
-    if content_type.starts_with("multipart/form-data") {
+        WriteBody::OctetStream(e2b_request_root(path, user.as_ref())?)
+    } else if is_json_content_type(content_type) {
+        reject_oversized_content_length(
+            &headers,
+            E2B_JSON_FILE_WRITE_BODY_LIMIT_BYTES,
+            json_file_write_body_too_large_error,
+        )?;
+        WriteBody::Json
+    } else if content_type.starts_with("multipart/form-data") {
         reject_oversized_content_length(
             &headers,
             E2B_FILE_CONTENT_LIMIT_BYTES,
@@ -326,30 +311,103 @@ pub(super) async fn write_file(
         if let Some(path) = &query.path {
             e2b_request_root(path, user.as_ref())?;
         }
-        let boundary = multipart_boundary(content_type).ok_or_else(|| {
+        WriteBody::Multipart(multipart_boundary(content_type).ok_or_else(|| {
             EcwProxyError::bad_request(
                 "multipart/form-data boundary of 1 to 70 characters is required",
             )
-        })?;
-        // Owns every staged file until the request ends, however it ends.
-        let mut spool = SpoolFiles::default();
-        let uploads =
-            spool_multipart_uploads(body, boundary, query.path.is_none(), &mut spool).await?;
-        let writes = resolve_multipart_uploads(uploads, query.path, user.as_ref())?;
-        let mut written = Vec::with_capacity(writes.len());
-        let mut route = route;
-        for (path, upload) in writes {
-            route = ensure_parent_dir(&state, route, &path, user.clone()).await?;
-            route =
-                spaced_write_spooled(&state, route, path.clone(), &upload, user.clone()).await?;
-            written.push(file_write_info(path));
+        })?)
+    } else {
+        return Err(EcwProxyError::bad_request(
+            "Unsupported Content-Type for file write",
+        ));
+    };
+    // Admit after authentication so unauthenticated requests can't queue for
+    // upload slots, and before the body is read so a rejected upload costs
+    // the pod no body bytes.
+    let _upload_permit = match &state.uploads {
+        Some(uploads) => {
+            let reserve = upload_reservation_bytes(&headers, write_body.body_limit());
+            Some(uploads.admit(reserve).await?)
         }
-        return Ok(Json(written));
-    }
+        None => None,
+    };
 
-    Err(EcwProxyError::bad_request(
-        "Unsupported Content-Type for file write",
-    ))
+    match write_body {
+        WriteBody::OctetStream(path) => {
+            // Create the parent before reading the body, so a destination whose
+            // parent can't be created fails without spooling the upload. Other
+            // write failures still surface after spooling.
+            let route = ensure_parent_dir(&state, route, &path, user.clone()).await?;
+            let mut spool = SpoolFiles::default();
+            let upload = spool_body_upload(body, &mut spool).await?;
+            spaced_write_spooled(&state, route, path.clone(), &upload, user).await?;
+            Ok(Json(vec![file_write_info(path)]))
+        }
+        WriteBody::Json => {
+            let request = read_json_file_write_request(&headers, body).await?;
+            let path = e2b_request_root(&request.path, user.as_ref())?;
+            spaced_write_bytes(
+                &state,
+                route,
+                path.clone(),
+                file_write_content_to_bytes(request.content)?,
+                user,
+            )
+            .await?;
+            Ok(Json(vec![file_write_info(path)]))
+        }
+        WriteBody::Multipart(boundary) => {
+            // Owns every staged file until the request ends, however it ends.
+            let mut spool = SpoolFiles::default();
+            let uploads =
+                spool_multipart_uploads(body, boundary, query.path.is_none(), &mut spool).await?;
+            let writes = resolve_multipart_uploads(uploads, query.path, user.as_ref())?;
+            let mut written = Vec::with_capacity(writes.len());
+            let mut route = route;
+            for (path, upload) in writes {
+                route = ensure_parent_dir(&state, route, &path, user.clone()).await?;
+                route = spaced_write_spooled(&state, route, path.clone(), &upload, user.clone())
+                    .await?;
+                written.push(file_write_info(path));
+            }
+            Ok(Json(written))
+        }
+    }
+}
+
+/// The bytes an upload may hold while it runs: its declared `Content-Length`,
+/// or its write path's body limit when the header is missing, since every
+/// write path stops reading at that limit. `write_file` has already rejected a
+/// declared length that is unparsable or over the limit; the clamp only keeps
+/// this total.
+fn upload_reservation_bytes(headers: &HeaderMap, body_limit: usize) -> u64 {
+    let limit = body_limit as u64;
+    headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map_or(limit, |declared| declared.min(limit))
+}
+
+/// How a `POST /files` body is carried, decided from headers alone.
+enum WriteBody<'a> {
+    /// Spooled to disk, then streamed to the guest; carries the validated
+    /// destination path.
+    OctetStream(String),
+    /// Buffered in memory, up to the JSON write limit.
+    Json,
+    /// Spooled to disk part by part; carries the boundary.
+    Multipart(&'a str),
+}
+
+impl WriteBody<'_> {
+    /// The most body this write path reads.
+    fn body_limit(&self) -> usize {
+        match self {
+            Self::OctetStream(_) | Self::Multipart(_) => E2B_FILE_CONTENT_LIMIT_BYTES,
+            Self::Json => E2B_JSON_FILE_WRITE_BODY_LIMIT_BYTES,
+        }
+    }
 }
 
 fn file_write_info(path: String) -> FileWriteInfoE2b {

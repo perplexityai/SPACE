@@ -93,6 +93,12 @@ mod native;
 use ingress_lifetime::{Completion, IngressIo, Progress};
 mod runtime_route;
 mod state;
+mod upload_admission;
+use upload_admission::UploadAdmission;
+pub use upload_admission::{
+    DEFAULT_MAX_CONCURRENT_UPLOADS, DEFAULT_MAX_IN_FLIGHT_UPLOAD_BYTES,
+    DEFAULT_UPLOAD_ADMISSION_WAIT, UploadAdmissionConfig,
+};
 
 #[cfg(test)]
 use native::{
@@ -183,6 +189,8 @@ pub struct DataPlaneConfig {
     pub backend_channel_pool_size: usize,
     pub revocation_check_interval: Duration,
     pub route_cache_ttl: Duration,
+    /// `None` leaves `POST /files` unbounded.
+    pub upload_admission: Option<UploadAdmissionConfig>,
 }
 
 impl Default for DataPlaneConfig {
@@ -197,6 +205,7 @@ impl Default for DataPlaneConfig {
             backend_channel_pool_size: DEFAULT_BACKEND_CHANNEL_POOL_SIZE,
             revocation_check_interval: Duration::from_millis(DEFAULT_REVOCATION_CHECK_INTERVAL_MS),
             route_cache_ttl: Duration::from_millis(DEFAULT_ROUTE_CACHE_TTL_MS),
+            upload_admission: None,
         }
     }
 }
@@ -207,6 +216,7 @@ struct DataPlaneState {
     attach_deadline: Duration,
     unauthenticated: Arc<UnauthenticatedUpgradeLimiter>,
     attached_streams: Arc<AttachedStreamLimiter>,
+    uploads: Option<Arc<UploadAdmission>>,
     native_sessions: Arc<NativeSessionAttachLimiter>,
     backend_channels: Arc<BackendChannelPool>,
     revocation_cache: Arc<RevocationCache>,
@@ -347,6 +357,10 @@ pub async fn run(
             config.max_attached_streams_per_org,
             config.max_attached_streams_per_sandbox,
         )),
+        uploads: config
+            .upload_admission
+            .as_ref()
+            .map(|upload_admission| Arc::new(UploadAdmission::new(upload_admission))),
         native_sessions: Arc::new(NativeSessionAttachLimiter::default()),
         backend_channels: Arc::new(BackendChannelPool::new(config.backend_channel_pool_size)),
         revocation_cache: Arc::new(RevocationCache::default()),

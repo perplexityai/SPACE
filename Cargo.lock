@@ -5666,6 +5666,7 @@ dependencies = [
  "pplx-space-test-env",
  "prost",
  "prost-types",
+ "rand 0.10.2",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -5690,6 +5691,7 @@ dependencies = [
  "clap",
  "pplx-space-common-svc",
  "pplx-space-data-plane-server",
+ "pplx-space-test-env",
  "tikv-jemallocator",
  "tokio",
 ]

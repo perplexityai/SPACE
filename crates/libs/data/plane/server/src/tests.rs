@@ -94,7 +94,7 @@ async fn unsupported_envd_method_returns_explicit_ecw_error() {
     );
 }
 
-fn backend_endpoint(value: &str) -> BackendEndpoint {
+pub(crate) fn backend_endpoint(value: &str) -> BackendEndpoint {
     value.parse().expect("valid backend endpoint")
 }
 
@@ -111,7 +111,7 @@ fn origin_for_target(
     }
 }
 
-fn test_ecw_route_origin(sandbox_id: SandboxId) -> EcwRouteOrigin {
+pub(crate) fn test_ecw_route_origin(sandbox_id: SandboxId) -> EcwRouteOrigin {
     EcwRouteOrigin {
         target: EcwSandboxHost {
             port: ECW_ENVD_PORT,
@@ -124,7 +124,7 @@ fn test_ecw_route_origin(sandbox_id: SandboxId) -> EcwRouteOrigin {
     }
 }
 
-fn ecw_resolved_route(
+pub(crate) fn ecw_resolved_route(
     sandbox_id: SandboxId,
     route_generation: u64,
     backend_endpoint: BackendEndpoint,
@@ -837,7 +837,7 @@ async fn spawn_cluster_api_stub() -> std::net::SocketAddr {
     addr
 }
 
-async fn test_data_plane_state() -> DataPlaneState {
+pub(crate) async fn test_data_plane_state() -> DataPlaneState {
     let addr = spawn_cluster_api_stub().await;
     let cluster_api =
         pplx_space_node_api_client::cluster::connect(format!("http://{addr}"), "test")
@@ -848,6 +848,7 @@ async fn test_data_plane_state() -> DataPlaneState {
         attach_deadline: Duration::from_secs(1),
         unauthenticated: Arc::new(UnauthenticatedUpgradeLimiter::new(1)),
         attached_streams: Arc::new(AttachedStreamLimiter::new(4, 4, 4)),
+        uploads: None,
         native_sessions: Arc::new(NativeSessionAttachLimiter::default()),
         backend_channels: Arc::new(BackendChannelPool::new(1)),
         revocation_cache: Arc::new(RevocationCache::default()),
