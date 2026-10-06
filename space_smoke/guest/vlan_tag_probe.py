@@ -6,10 +6,8 @@ and inside an 802.1ad outer tag with an 802.1Q inner tag. The host answers an
 untagged SYN on any port, because the transparent proxy accepts it or the
 namespace kernel resets it, so a reply is the oracle for "this frame was
 processed". A tagged frame must get no reply: the sandbox tap drops VLAN frames
-before layer-3 handling. Without that drop the Linux receive core strips
-priority tags from a device with no VLAN configuration and processes the inner
-packet as if it had arrived untagged, which is the path a guest-controlled
-virtio checksum offset abuses.
+before layer-3 handling, because a guest's routed point-to-point link carries
+no VLAN configuration.
 
 Only the standard library is used so the probe runs on every guest template.
 It prints one JSON object and exits 0 whenever every probe ran; the scenario
