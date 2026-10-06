@@ -144,29 +144,6 @@ where
     })
 }
 
-pub(super) async fn run_command_status(
-    program: &str,
-    args: &[&str],
-    permit: &crate::lifecycle_limiter::LifecyclePermit,
-) -> std::io::Result<std::process::ExitStatus> {
-    let program = program.to_string();
-    let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
-    spawn_lifecycle_blocking(permit, move || {
-        crate::host_command::output(
-            std::process::Command::new(&program).args(&args),
-            crate::host_command::MUTATION_BUDGET,
-            &[],
-        )
-        .map(|output| output.status)
-    })
-    .await
-    .unwrap_or_else(|join_err| {
-        Err(std::io::Error::other(format!(
-            "blocking command task failed: {join_err}"
-        )))
-    })
-}
-
 pub(super) fn run_permission_command_blocking(
     command: &'static str,
     args: &[&str],
