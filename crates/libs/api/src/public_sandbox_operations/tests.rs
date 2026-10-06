@@ -833,6 +833,8 @@ fn public_create_request() -> pplx_space_public_api::CreateSandboxRequest {
         }),
         network_policy: Some(pplx_space_net_common::NetworkPolicyV1::allow_all()),
         auto_lifecycle: None,
+        idle_timeout: None,
+        idle_action: None,
     }
 }
 

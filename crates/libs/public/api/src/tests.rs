@@ -216,6 +216,73 @@ fn public_wire_enums_use_canonical_strings() {
     }
 }
 
+#[cfg(feature = "serde")]
+#[test]
+fn sandbox_idle_timeout_wire_parsing_matches_whole_second_stage_limits() {
+    for (timeout, expected_seconds) in [
+        (serde_json::Value::Null, Some(None)),
+        (serde_json::json!("600s"), Some(Some(600))),
+        (serde_json::json!("1.5m"), Some(Some(90))),
+        (serde_json::json!("0.5h"), Some(Some(1800))),
+        (serde_json::json!("1d"), Some(Some(86400))),
+        (serde_json::json!(" 600s "), Some(Some(600))),
+        (
+            serde_json::json!("9223372036854775807s"),
+            Some(Some(i64::MAX as u64)),
+        ),
+        (
+            serde_json::json!("153722867280912930m"),
+            Some(Some(9_223_372_036_854_775_800)),
+        ),
+        (serde_json::json!("0s"), None),
+        (serde_json::json!("0.0m"), None),
+        (serde_json::json!("1.5s"), None),
+        (serde_json::json!("0.001m"), None),
+        (serde_json::json!("1.0000000001s"), None),
+        (serde_json::json!("9223372036854775808s"), None),
+        (serde_json::json!("153722867280912931m"), None),
+        (serde_json::json!("18446744073709551616s"), None),
+        (serde_json::json!("-1s"), None),
+        (serde_json::json!("500ms"), None),
+        (serde_json::json!(""), None),
+        (serde_json::json!(600), None),
+        (serde_json::json!(false), None),
+    ] {
+        let request = serde_json::json!({ "template": "seed", "idle_timeout": timeout });
+        let parsed = serde_json::from_value::<CreateSandboxRequest>(request.clone());
+        match expected_seconds {
+            Some(seconds) => assert_eq!(
+                parsed.unwrap().idle_timeout_secs().unwrap(),
+                seconds,
+                "{request}"
+            ),
+            None => assert!(parsed.is_err(), "{request}"),
+        }
+    }
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn sandbox_idle_action_is_closed_on_input() {
+    for (action, accepted) in [
+        (serde_json::Value::Null, true),
+        (serde_json::json!("delete"), true),
+        (serde_json::json!("suspend"), true),
+        (serde_json::json!("pause"), false),
+        (serde_json::json!("stop"), false),
+        (serde_json::json!("hibernate"), false),
+        (serde_json::json!(12), false),
+        (serde_json::json!(false), false),
+    ] {
+        let request = serde_json::json!({ "template": "seed", "idle_timeout": "600s", "idle_action": action });
+        assert_eq!(
+            serde_json::from_value::<CreateSandboxRequest>(request.clone()).is_ok(),
+            accepted,
+            "{request}"
+        );
+    }
+}
+
 #[test]
 fn sandbox_lifecycle_state_uses_wire_value_identity() {
     assert_eq!(

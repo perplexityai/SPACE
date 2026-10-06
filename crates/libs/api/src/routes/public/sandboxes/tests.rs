@@ -1,3 +1,7 @@
+use pplx_space_common_core::types::{
+    AutoLifecycleConditionSet, AutoLifecycleConditionSetId, AutoLifecycleIdleAction,
+    AutoLifecycleStage,
+};
 use pplx_space_common_core::types::{NodeId, SandboxId};
 use pplx_space_common_core::types::{OrgId, UserId};
 use uuid::Uuid;
@@ -24,6 +28,8 @@ fn create_request_with_auto_lifecycle(
         resources: None,
         network_policy: None,
         auto_lifecycle,
+        idle_timeout: None,
+        idle_action: None,
     }
 }
 
@@ -61,9 +67,10 @@ fn native_create_defaults_to_suspending_after_six_hours_idle() {
 #[test]
 fn native_create_preserves_explicit_auto_lifecycle_policy() {
     let explicit_policy = AutoLifecyclePolicy::disabled();
-    let request = with_native_create_defaults(create_request_with_auto_lifecycle(Some(
+    let (request, _) = prepare_native_create_request(create_request_with_auto_lifecycle(Some(
         explicit_policy.clone(),
-    )));
+    )))
+    .unwrap();
 
     assert_eq!(request.auto_lifecycle, Some(explicit_policy));
 }
@@ -72,10 +79,97 @@ fn native_create_preserves_explicit_auto_lifecycle_policy() {
 fn native_create_default_preserves_pre_deploy_idempotency_fingerprint() {
     let request = create_request_with_auto_lifecycle(None);
     let pre_deploy_fingerprint = request_fingerprint(&request).unwrap();
+    let legacy_request = serde_json::json!({
+        "template": "seed:latest", "runtime": null, "name": null, "env": {},
+        "metadata": {}, "resources": null, "network_policy": null, "auto_lifecycle": null
+    });
+    assert_eq!(serde_json::to_value(&request).unwrap(), legacy_request);
 
     let (_, post_deploy_fingerprint) = prepare_native_create_request(request).unwrap();
 
     assert_eq!(post_deploy_fingerprint, pre_deploy_fingerprint);
+}
+
+#[tokio::test]
+async fn native_create_idle_settings_validate_before_admission_with_typed_errors() {
+    use axum::response::IntoResponse;
+    use http_body_util::BodyExt;
+    use pplx_space_public_api::PublicErrorEnvelope;
+
+    for (timeout, action, policy, accepted) in [
+        (None, None, None, true),
+        (Some("600s"), None, None, true),
+        (Some("1.5m"), Some(SandboxIdleAction::Suspend), None, true),
+        (Some("600s"), Some(SandboxIdleAction::Delete), None, true),
+        (None, Some(SandboxIdleAction::Suspend), None, false),
+        (None, Some(SandboxIdleAction::Delete), None, false),
+        (None, None, Some(AutoLifecyclePolicy::disabled()), true),
+        (
+            Some("600s"),
+            None,
+            Some(AutoLifecyclePolicy::disabled()),
+            false,
+        ),
+        (
+            None,
+            Some(SandboxIdleAction::Delete),
+            Some(AutoLifecyclePolicy::disabled()),
+            false,
+        ),
+        (
+            Some("600s"),
+            Some(SandboxIdleAction::Suspend),
+            Some(AutoLifecyclePolicy::disabled()),
+            false,
+        ),
+        (
+            Some("600s"),
+            Some(SandboxIdleAction::Other("hibernate".to_owned())),
+            None,
+            false,
+        ),
+        (Some("1.5s"), None, None, false),
+        (Some("9223372036854775808s"), None, None, false),
+    ] {
+        let mut request = create_request_with_auto_lifecycle(policy);
+        request.idle_timeout = timeout.map(|value| value.parse().unwrap());
+        request.idle_action = action;
+        match prepare_native_create_request(request.clone()) {
+            Ok(_) => assert!(accepted, "{request:?}"),
+            Err(error) => {
+                assert!(!accepted, "{request:?}");
+                let response = error.into_response();
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+                let body = response.into_body().collect().await.unwrap().to_bytes();
+                let envelope: PublicErrorEnvelope = serde_json::from_slice(&body).unwrap();
+                assert_eq!(envelope.code, PublicErrorCode::InvalidRequest);
+            }
+        }
+    }
+}
+
+#[test]
+fn native_create_idle_policies_match_compatibility_policies() {
+    for (timeout, action, seconds, auto_pause) in [
+        ("600s", None, 600, true),
+        ("1.5m", Some(SandboxIdleAction::Suspend), 90, true),
+        ("600s", Some(SandboxIdleAction::Delete), 600, false),
+    ] {
+        let mut request = create_request_with_auto_lifecycle(None);
+        request.idle_timeout = Some(timeout.parse().unwrap());
+        request.idle_action = action;
+        let fingerprint = request_fingerprint(&request).unwrap();
+        let (prepared, prepared_fingerprint) = prepare_native_create_request(request).unwrap();
+        assert_eq!(prepared_fingerprint, fingerprint);
+        let expected = crate::e2b::auto_lifecycle_policy(seconds, auto_pause, auto_pause);
+        assert_eq!(
+            prepared.auto_lifecycle.as_ref().unwrap().wake_on_access(),
+            auto_pause
+        );
+        assert_eq!(prepared.auto_lifecycle, Some(expected));
+        assert!(prepared.idle_timeout.is_none());
+        assert!(prepared.idle_action.is_none());
+    }
 }
 
 #[test]

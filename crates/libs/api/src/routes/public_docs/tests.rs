@@ -543,6 +543,40 @@ fn sandbox_idle_response_fields_are_nullable_incubating_and_extensible() {
 }
 
 #[test]
+fn sandbox_idle_create_fields_are_optional_and_actions_are_closed_on_input() {
+    let spec = public_openapi_value();
+    let schema = &spec["components"]["schemas"]["CreateSandboxRequest"];
+    for field in ["idle_timeout", "idle_action"] {
+        assert_eq!(
+            schema["properties"][field][pplx_space_public_api::routes::M1_STATUS_EXTENSION],
+            "incubating"
+        );
+        assert!(
+            !schema["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!(field))
+        );
+    }
+    let validator = component_validator(&spec, "CreateSandboxRequest");
+    for (action, accepted) in [
+        (Value::Null, true),
+        (json!("delete"), true),
+        (json!("suspend"), true),
+        (json!("pause"), false),
+        (json!("hibernate"), false),
+    ] {
+        let request = json!({ "template": "seed", "idle_timeout": "600s", "idle_action": action });
+        assert_eq!(validator.is_valid(&request), accepted, "{request}");
+        assert_eq!(
+            serde_json::from_value::<CreateSandboxRequest>(request.clone()).is_ok(),
+            accepted,
+            "{request}"
+        );
+    }
+}
+
+#[test]
 fn m1_operation_results_are_generator_safe_tagged_variants() {
     let spec = m1_sdk_openapi_value();
     let variants = spec["components"]["schemas"]["PublicOperationResult"]["oneOf"]

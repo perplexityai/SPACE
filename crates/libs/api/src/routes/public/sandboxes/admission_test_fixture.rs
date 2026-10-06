@@ -179,6 +179,8 @@ impl AdmissionPoolFixture {
             resources: None,
             network_policy: None,
             auto_lifecycle: None,
+            idle_timeout: None,
+            idle_action: None,
         }
     }
 

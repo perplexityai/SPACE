@@ -1152,6 +1152,8 @@ fn public_create_request() -> pplx_space_public_api::CreateSandboxRequest {
         }),
         network_policy: None,
         auto_lifecycle: None,
+        idle_timeout: None,
+        idle_action: None,
     }
 }
 

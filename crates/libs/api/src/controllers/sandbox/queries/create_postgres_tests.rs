@@ -3076,8 +3076,38 @@ async fn unconfigured_falcon_create_continues_to_database_access() -> TestResult
 /// Kubernetes substrate and pool store carry the claim through; only the node
 /// RPC into the slot's pod is faked.
 #[cfg(feature = "kubernetes")]
+#[rstest::rstest]
+#[case(
+    None,
+    None,
+    "21600s",
+    pplx_space_public_api::SandboxIdleAction::Suspend
+)]
+#[case(
+    Some("600s"),
+    None,
+    "600s",
+    pplx_space_public_api::SandboxIdleAction::Suspend
+)]
+#[case(
+    Some("1.5m"),
+    Some(pplx_space_public_api::SandboxIdleAction::Suspend),
+    "90s",
+    pplx_space_public_api::SandboxIdleAction::Suspend
+)]
+#[case(
+    Some("600s"),
+    Some(pplx_space_public_api::SandboxIdleAction::Delete),
+    "600s",
+    pplx_space_public_api::SandboxIdleAction::Delete
+)]
 #[tokio::test(flavor = "current_thread")]
-async fn admission_claim_executes_and_runs_under_the_claimed_id() -> TestResult {
+async fn admission_claim_executes_and_runs_under_the_claimed_id(
+    #[case] idle_timeout: Option<&str>,
+    #[case] idle_action: Option<pplx_space_public_api::SandboxIdleAction>,
+    #[case] expected_timeout: &str,
+    #[case] expected_action: pplx_space_public_api::SandboxIdleAction,
+) -> TestResult {
     use crate::routes::public::sandboxes::admission_test_fixture::{
         AdmissionPoolFixture, NAMESPACE, TEMPLATE,
     };
@@ -3121,12 +3151,11 @@ async fn admission_claim_executes_and_runs_under_the_claimed_id() -> TestResult 
 
     // Admission: the route claims the slot and returns its reserved ID.
     let admission_controller = AdmissionPoolFixture::controller_with(kubernetes());
+    let mut request = fixture.request();
+    request.idle_timeout = idle_timeout.map(|value| value.parse().unwrap());
+    request.idle_action = idle_action;
     let response = fixture
-        .create(
-            Some(&admission_controller),
-            "admission-e2e",
-            fixture.request(),
-        )
+        .create(Some(&admission_controller), "admission-e2e", request)
         .await
         .expect("create is recorded");
     assert_eq!(
@@ -3207,6 +3236,15 @@ async fn admission_claim_executes_and_runs_under_the_claimed_id() -> TestResult 
     .await?;
     assert_eq!(lifecycle, "started");
     assert_eq!(active_node_id, Some(node_id));
+    let public = crate::routes::public::sandboxes::read_public_sandbox(
+        &fixture.db.pool,
+        fixture.org_id,
+        pplx_space_public_api::PublicSandboxId::from(slot.reserved_sandbox_id),
+    )
+    .await
+    .expect("created sandbox is readable");
+    assert_eq!(public.idle_timeout.as_deref(), Some(expected_timeout));
+    assert_eq!(public.idle_action, Some(expected_action));
     let (state, claim_id): (String, Option<Uuid>) = sqlx::query_as(sql!(
         "SELECT state, claim_id FROM kubernetes_pool_slots WHERE id = $1"
     ))

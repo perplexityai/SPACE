@@ -22,6 +22,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 #[cfg(any(feature = "schema", feature = "serde"))]
 mod command;
 pub mod routes;
+mod sandbox;
 #[cfg(feature = "schema")]
 mod schema;
 
@@ -1130,6 +1131,62 @@ pub struct CreateSandboxRequest {
         schemars(schema_with = "schema::optional_auto_lifecycle_policy")
     )]
     pub auto_lifecycle: Option<AutoLifecyclePolicy>,
+    /// Positive compact idle duration, such as `600s` or `1.5m`, resolving to
+    /// whole seconds within the supported deadline range. Omit for the default.
+    #[cfg_attr(
+        feature = "serde",
+        serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "sandbox::deserialize_idle_timeout"
+        )
+    )]
+    #[cfg_attr(
+        feature = "schema",
+        schemars(schema_with = "schema::optional_incubating_string")
+    )]
+    pub idle_timeout: Option<SimpleDuration>,
+    /// Action after the idle duration: delete or suspend. Defaults to suspend
+    /// when idle_timeout is provided. Cannot be combined with auto_lifecycle.
+    /// Suspend allows waking on access; delete does not.
+    #[cfg_attr(
+        feature = "serde",
+        serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "sandbox::deserialize_idle_action"
+        )
+    )]
+    #[cfg_attr(
+        feature = "schema",
+        schemars(schema_with = "schema::optional_incubating_idle_action_input")
+    )]
+    pub idle_action: Option<SandboxIdleAction>,
+}
+
+impl CreateSandboxRequest {
+    pub fn idle_timeout_secs(&self) -> Result<Option<u64>, PublicApiParseError> {
+        if (self.idle_timeout.is_some() || self.idle_action.is_some())
+            && self.auto_lifecycle.is_some()
+        {
+            return Err(PublicApiParseError(
+                "idle settings cannot be combined with auto_lifecycle",
+            ));
+        }
+        if self.idle_timeout.is_none() && self.idle_action.is_some() {
+            return Err(PublicApiParseError("idle_action requires idle_timeout"));
+        }
+        if self
+            .idle_action
+            .as_ref()
+            .is_some_and(|action| !action.is_known())
+        {
+            return Err(PublicApiParseError("idle_action must be delete or suspend"));
+        }
+        self.idle_timeout
+            .map(sandbox::idle_timeout_secs)
+            .transpose()
+    }
 }
 
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]

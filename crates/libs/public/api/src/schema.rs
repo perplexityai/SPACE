@@ -54,6 +54,16 @@ pub(crate) fn optional_incubating_idle_action(generator: &mut SchemaGenerator) -
     incubating(Option::<crate::SandboxIdleAction>::json_schema(generator))
 }
 
+pub(crate) fn optional_incubating_idle_action_input(generator: &mut SchemaGenerator) -> Schema {
+    let _ = generator;
+    incubating(schemars::json_schema!({
+        "anyOf": [
+            { "type": "string", "enum": crate::SandboxIdleAction::KNOWN_VALUES },
+            { "type": "null" }
+        ]
+    }))
+}
+
 fn string_with_pattern(generator: &mut SchemaGenerator, pattern: impl Into<String>) -> Schema {
     let mut schema = String::json_schema(generator);
     schema.insert("pattern".into(), pattern.into().into());

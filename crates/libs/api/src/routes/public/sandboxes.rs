@@ -13,10 +13,7 @@ use axum::{
         sse::{Event, KeepAlive, Sse},
     },
 };
-use pplx_space_common_core::types::{
-    AutoLifecycleConditionSet, AutoLifecycleConditionSetId, AutoLifecycleIdleAction,
-    AutoLifecyclePolicy, AutoLifecycleStage, IdempotencyKey, SandboxLifecycle,
-};
+use pplx_space_common_core::types::{AutoLifecyclePolicy, IdempotencyKey, SandboxLifecycle};
 use pplx_space_common_svc::types::{
     FACET_SANDBOX_DESIRED_STATE, SANDBOX_FAILURE_ACTIVATION_ATTEMPT_ID_KEY,
     SANDBOX_FAILURE_EPISODE_KEY, SANDBOX_FAILURE_EXECUTION_GENERATION_KEY,
@@ -351,8 +348,11 @@ enum NativeCreatePoolPlan<'a> {
 }
 
 fn prepare_native_create_request(
-    request: CreateSandboxRequest,
+    mut request: CreateSandboxRequest,
 ) -> Result<(CreateSandboxRequest, RequestFingerprint), PublicApiError> {
+    let idle_timeout_secs = request
+        .idle_timeout_secs()
+        .map_err(|error| PublicApiError::bad_request(error.to_string()))?;
     if let Some(vcpu) = request
         .resources
         .as_ref()
@@ -373,28 +373,23 @@ fn prepare_native_create_request(
     // idempotent retries stable across rolling deploys where older API replicas
     // still hash the omitted policy as null.
     let fingerprint = request_fingerprint(&request)?;
+    if let Some(timeout_secs) = idle_timeout_secs {
+        let auto_pause = request.idle_action != Some(SandboxIdleAction::Delete);
+        request.auto_lifecycle = Some(crate::e2b::access_idle_policy(
+            timeout_secs,
+            auto_pause,
+            auto_pause,
+        ));
+        request.idle_timeout = None;
+        request.idle_action = None;
+    }
     Ok((with_native_create_defaults(request), fingerprint))
 }
 
 fn with_native_create_defaults(mut request: CreateSandboxRequest) -> CreateSandboxRequest {
-    request
-        .auto_lifecycle
-        .get_or_insert_with(|| AutoLifecyclePolicy {
-            wake: Default::default(),
-            // Command activity advances both the command and access clocks in
-            // sbx-mgr. One access-idle condition therefore means "no access or
-            // command activity"; separate conditions would fire when either
-            // individual clock expired.
-            condition_sets: std::collections::BTreeMap::from([(
-                AutoLifecycleConditionSetId::AccessIdle,
-                AutoLifecycleConditionSet::access_idle(),
-            )]),
-            stages: vec![AutoLifecycleStage {
-                condition_set: AutoLifecycleConditionSetId::AccessIdle,
-                at: DEFAULT_NATIVE_IDLE_TIMEOUT_SECS,
-                action: AutoLifecycleIdleAction::Suspend,
-            }],
-        });
+    request.auto_lifecycle.get_or_insert_with(|| {
+        crate::e2b::access_idle_policy(DEFAULT_NATIVE_IDLE_TIMEOUT_SECS, true, false)
+    });
     request
 }
 
@@ -424,11 +419,20 @@ pub async fn get_sandbox(
     Path(sandbox_id): Path<String>,
 ) -> Result<Json<PublicSandbox>, PublicApiError> {
     let sandbox_id = parse_public_sandbox_id(&sandbox_id)?;
-    let Some(sandbox) = fetch_public_sandbox(&state.pool, org.id, sandbox_id).await? else {
+    Ok(Json(
+        read_public_sandbox(&state.pool, org.id, sandbox_id).await?,
+    ))
+}
+
+pub(crate) async fn read_public_sandbox(
+    pool: &PgPool,
+    org_id: OrgId,
+    sandbox_id: PublicSandboxId,
+) -> Result<PublicSandbox, PublicApiError> {
+    let Some(sandbox) = fetch_public_sandbox(pool, org_id, sandbox_id).await? else {
         return Err(PublicApiError::not_found("sandbox not found"));
     };
-
-    Ok(Json(public_sandbox_from_row(sandbox)?))
+    public_sandbox_from_row(sandbox)
 }
 
 pub async fn get_sandbox_stats(

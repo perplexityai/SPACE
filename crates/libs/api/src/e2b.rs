@@ -72,6 +72,14 @@ pub(crate) fn auto_lifecycle_policy(
     auto_pause: bool,
     auto_resume: bool,
 ) -> AutoLifecyclePolicy {
+    access_idle_policy(u64::from(timeout_secs.max(1)), auto_pause, auto_resume)
+}
+
+pub(crate) fn access_idle_policy(
+    timeout_secs: u64,
+    auto_pause: bool,
+    auto_resume: bool,
+) -> AutoLifecyclePolicy {
     let action = if auto_pause {
         AutoLifecycleIdleAction::Suspend
     } else {
@@ -91,7 +99,7 @@ pub(crate) fn auto_lifecycle_policy(
         )]),
         stages: vec![AutoLifecycleStage {
             condition_set: AutoLifecycleConditionSetId::AccessIdle,
-            at: u64::from(timeout_secs.max(1)),
+            at: timeout_secs,
             action,
         }],
     }
