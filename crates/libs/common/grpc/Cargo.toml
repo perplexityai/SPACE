@@ -40,6 +40,7 @@ pplx-space-observability = { workspace = true }
 [dev-dependencies]
 rustls = { workspace = true, features = ["aws_lc_rs"] }
 rcgen = { workspace = true, features = ["aws_lc_rs", "pem"] }
+socket2 = { workspace = true, features = ["all"] }
 pplx-space-metrics = { workspace = true, features = ["test-capture"] }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }

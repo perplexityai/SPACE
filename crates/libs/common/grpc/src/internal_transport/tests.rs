@@ -276,3 +276,160 @@ async fn rollout_accepts_both_protocols_without_downgrading_tls_or_blocking_on_i
     env.put(CERT_ENV, cert.as_os_str());
     assert!(ServerTransport::from_environment(&env).is_err());
 }
+
+/// Binds like node-api so a replacement process can share the port during a rollout.
+#[cfg(target_os = "linux")]
+fn reuse_port_listener(addr: std::net::SocketAddr) -> tokio::net::TcpListener {
+    let socket = socket2::Socket::new(
+        socket2::Domain::IPV4,
+        socket2::Type::STREAM,
+        Some(socket2::Protocol::TCP),
+    )
+    .unwrap();
+    socket.set_reuse_address(true).unwrap();
+    socket.set_reuse_port(true).unwrap();
+    socket.set_nonblocking(true).unwrap();
+    socket.bind(&addr.into()).unwrap();
+    socket.listen(1024).unwrap();
+    tokio::net::TcpListener::from_std(socket.into()).unwrap()
+}
+
+/// Counts loopback IPv4 sockets in the kernel LISTEN state for `port`.
+#[cfg(target_os = "linux")]
+fn loopback_listeners(port: u16) -> usize {
+    let local = format!("0100007F:{port:04X}");
+    std::fs::read_to_string("/proc/net/tcp")
+        .unwrap()
+        .lines()
+        .skip(1)
+        .filter(|line| {
+            let mut fields = line.split_whitespace().skip(1);
+            fields.next() == Some(local.as_str()) && fields.nth(1) == Some("0A")
+        })
+        .count()
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_releases_reuse_port_listener_while_accepted_connections_drain() {
+    use std::time::{Duration, Instant};
+    use tokio_util::sync::CancellationToken;
+    use tonic_health::pb::health_check_response::ServingStatus;
+
+    let mut env = Env::default();
+    env.put(INSECURE_DEV_ENV, "true");
+    let transport = ServerTransport::from_environment(&env).unwrap();
+    let serve = |listener: tokio::net::TcpListener, shutdown: CancellationToken| {
+        let transport = transport.clone();
+        async move {
+            let (reporter, health) = tonic_health::server::health_reporter();
+            reporter
+                .set_service_status("", tonic_health::ServingStatus::Serving)
+                .await;
+            // Like node-api, only the end of `incoming` starts tonic's graceful drain.
+            let server = tokio::spawn(
+                transport
+                    .server_builder()
+                    .add_service(health)
+                    .serve_with_incoming_shutdown(
+                        transport.incoming(
+                            tonic::transport::server::TcpIncoming::from(listener),
+                            shutdown,
+                        ),
+                        std::future::pending(),
+                    ),
+            );
+            (reporter, server)
+        }
+    };
+    let watch_request = || HealthCheckRequest {
+        service: String::new(),
+    };
+
+    let old_listener = reuse_port_listener("127.0.0.1:0".parse().unwrap());
+    let addr = old_listener.local_addr().unwrap();
+    let old_shutdown = CancellationToken::new();
+    let (old_reporter, old_server) = serve(old_listener, old_shutdown.clone()).await;
+    // Opened before the replacement binds, so this connection belongs to the old server.
+    let draining = Endpoint::from_shared(format!("http://{addr}"))
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+    let mut draining = HealthClient::new(draining);
+    let mut watch = draining.watch(watch_request()).await.unwrap().into_inner();
+    assert_eq!(
+        watch.message().await.unwrap().unwrap().status(),
+        ServingStatus::Serving
+    );
+
+    let new_shutdown = CancellationToken::new();
+    let (_new_reporter, new_server) = serve(reuse_port_listener(addr), new_shutdown.clone()).await;
+    assert_eq!(loopback_listeners(addr.port()), 2);
+
+    old_shutdown.cancel();
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while loopback_listeners(addr.port()) > 1 && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let listeners = loopback_listeners(addr.port());
+
+    // The kernel spreads fresh connections across every listener in the port group.
+    const FRESH: usize = 64;
+    let started = Instant::now();
+    let outcomes = futures_util::future::join_all((0..FRESH).map(|_| async move {
+        tokio::time::timeout(Duration::from_secs(2), async move {
+            let channel = Endpoint::from_shared(format!("http://{addr}"))
+                .unwrap()
+                .connect()
+                .await?;
+            HealthClient::new(channel)
+                .check(watch_request())
+                .await
+                .map_err(Box::new)?;
+            Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
+        })
+        .await
+    }))
+    .await;
+    let elapsed = started.elapsed();
+    let hung = outcomes.iter().filter(|outcome| outcome.is_err()).count();
+    let failed = outcomes
+        .iter()
+        .filter(|outcome| matches!(outcome, Ok(Err(_))))
+        .count();
+    assert!(
+        listeners == 1 && hung == 0 && failed == 0,
+        "after old server shutdown: {listeners} LISTEN sockets on port {}; of {FRESH} fresh \
+         connections {} answered, {hung} hung past the 2 s deadline, {failed} failed \
+         (batch took {elapsed:?})",
+        addr.port(),
+        FRESH - hung - failed,
+    );
+
+    // The connection accepted before shutdown still drains on the old server.
+    old_reporter
+        .set_service_status("", tonic_health::ServingStatus::NotServing)
+        .await;
+    let update = tokio::time::timeout(Duration::from_secs(1), watch.message())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(update.status(), ServingStatus::NotServing);
+    assert!(!old_server.is_finished());
+    drop(watch);
+    drop(draining);
+    tokio::time::timeout(Duration::from_secs(1), old_server)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+
+    new_shutdown.cancel();
+    tokio::time::timeout(Duration::from_secs(1), new_server)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+}
