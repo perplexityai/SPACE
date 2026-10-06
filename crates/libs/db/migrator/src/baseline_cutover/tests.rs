@@ -43,27 +43,45 @@ async fn exact_history_converts_once_and_keeps_application_data() -> TestResult 
         allow_missing_passwords: true,
     })
     .await?;
-    let migrate = || {
+    let run = |command: crate::Command| {
         crate::run_control_plane(crate::ControlPlaneArgs {
             database_url: fixture.database_url("postgres"),
             job_deadline_seconds: 60,
             confirm_data_loss: false,
-            command: crate::Command::Up,
+            command,
         })
     };
-    migrate().await?;
+    let bundled: Vec<i64> = crate::POSTGRES_MIGRATOR
+        .iter()
+        .filter(|migration| migration.migration_type.is_up_migration())
+        .map(|migration| migration.version)
+        .collect();
+    run(crate::Command::Up).await?;
     sqlx::query(sql!(
         "UPDATE organizations SET name = 'Retained evidence' WHERE slug = 'local'"
     ))
     .execute(&fixture.pool)
     .await?;
+    // A historical database holds only the legacy schema, so roll back every
+    // migration after the baseline before replacing the history with the
+    // legacy catalog; the cutover must then apply those migrations itself.
+    for _ in 1..bundled.len() {
+        run(crate::Command::Down).await?;
+    }
     seed_history(&fixture.pool).await?;
     let before = history(&fixture.pool).await?;
 
-    migrate().await?;
-    migrate().await?;
+    run(crate::Command::Up).await?;
+    run(crate::Command::Up).await?;
 
-    assert_eq!(history(&fixture.pool).await?.len(), 1);
+    // The converted history is exactly the bundled catalog: the baseline plus
+    // every migration added after it, each recorded once.
+    let recorded: Vec<i64> = history(&fixture.pool)
+        .await?
+        .into_iter()
+        .map(|row| row.0)
+        .collect();
+    assert_eq!(recorded, bundled);
     let archived: Vec<HistoryRow> = sqlx::query_as(sql!("SELECT version, success, checksum FROM space_migration_archive.postgres_history ORDER BY version"))
         .fetch_all(&fixture.pool).await?;
     assert_eq!(archived, before);
