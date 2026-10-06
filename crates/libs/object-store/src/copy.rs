@@ -108,7 +108,7 @@ impl S3ObjectStore {
                 .key(dest.key)
                 .copy_source(&copy_source)
                 .customize()
-                .config_override(Self::op_config(creds, &dest))
+                .config_override(self.op_config(creds, &dest, S3Operation::CopyObject))
                 .send()
                 .await
                 .map_err(|err| {
@@ -167,7 +167,7 @@ impl S3ObjectStore {
             .bucket(dest.bucket)
             .key(dest.key)
             .customize()
-            .config_override(Self::op_config(creds, &dest))
+            .config_override(self.op_config(creds, &dest, S3Operation::CreateMultipartUpload))
             .send()
             .await
             .map_err(|err| {
@@ -184,7 +184,7 @@ impl S3ObjectStore {
             .ok_or(ObjectStoreError::MissingField("upload_id"))?
             .to_string();
 
-        let abort = AbortGuard::new(self.base.clone(), creds.clone(), &dest, &upload_id);
+        let abort = AbortGuard::new(self, creds, &dest, &upload_id);
 
         let parts = collect_completed_parts(&ranges, self.multipart_concurrency, |range| {
             let client = self.base.clone();
@@ -193,7 +193,7 @@ impl S3ObjectStore {
             let upload_id = upload_id.clone();
             let copy_source = copy_source.to_string();
             let range_header = byte_range_header(range);
-            let cfg = Self::op_config(creds, &dest);
+            let cfg = self.op_config(creds, &dest, S3Operation::UploadPartCopy);
 
             async move {
                 let resp = client
@@ -241,7 +241,7 @@ impl S3ObjectStore {
                     .build(),
             )
             .customize()
-            .config_override(Self::op_config(creds, &dest))
+            .config_override(self.op_config(creds, &dest, S3Operation::CompleteMultipartUpload))
             .send()
             .await
             .map_err(|err| {

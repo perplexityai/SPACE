@@ -1,10 +1,6 @@
 use super::*;
-use crate::{
-    ObjectCredentials, ObjectStore, ObjectStoreError, ObjectTarget, S3ObjectStore, S3Timeouts,
-    s3_base_config,
-};
-use aws_sdk_s3::config::StalledStreamProtectionConfig;
-use aws_sdk_s3::config::retry::RetryConfig;
+use crate::test_support::{Recorder, credentials, every_class, serve, store, target};
+use crate::{ObjectStore, ObjectStoreError};
 use aws_smithy_runtime_api::client::result::ConnectorError;
 use axum::Router;
 use axum::body::Bytes as BodyBytes;
@@ -136,79 +132,6 @@ fn attempt_failures_are_classified_by_cause() {
     }
 }
 
-#[derive(Debug, Default)]
-struct Recorder {
-    failures: Mutex<Vec<FailedAttempt>>,
-    recoveries: Mutex<Vec<RecoveredOperation>>,
-}
-
-impl Recorder {
-    fn failures(&self) -> Vec<FailedAttempt> {
-        self.failures.lock().unwrap().clone()
-    }
-
-    fn recoveries(&self) -> Vec<RecoveredOperation> {
-        self.recoveries.lock().unwrap().clone()
-    }
-}
-
-impl AttemptReporter for Recorder {
-    fn attempt_failed(&self, _target: &AttemptTarget, failure: &FailedAttempt) {
-        self.failures.lock().unwrap().push(failure.clone());
-    }
-
-    fn recovered(&self, _target: &AttemptTarget, recovery: &RecoveredOperation) {
-        self.recoveries.lock().unwrap().push(recovery.clone());
-    }
-}
-
-/// An in-process S3 stand-in that answers every request with `handler`.
-async fn serve(router: Router) -> String {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind S3 stand-in");
-    let address = listener.local_addr().expect("S3 stand-in address");
-    tokio::spawn(async move {
-        axum::serve(listener, router)
-            .await
-            .expect("serve S3 stand-in");
-    });
-    format!("http://{address}")
-}
-
-/// A store wired exactly like production apart from the bounds under test.
-/// Retry backoff is shortened so wall time is spent in the attempts
-/// themselves; the strategy and its three attempts are the SDK standard.
-fn store(timeouts: S3Timeouts, stall_grace: Duration, recorder: &Arc<Recorder>) -> S3ObjectStore {
-    let conf = s3_base_config(timeouts, AttemptObserver::new(recorder.clone()))
-        .retry_config(RetryConfig::standard().with_initial_backoff(Duration::from_millis(10)))
-        .stalled_stream_protection(
-            StalledStreamProtectionConfig::enabled()
-                .grace_period(stall_grace)
-                .build(),
-        )
-        .build();
-    S3ObjectStore::with_base_config(conf)
-}
-
-fn credentials() -> ObjectCredentials {
-    ObjectCredentials {
-        access_key_id: "synthetic-access-key".to_string(),
-        secret_access_key: "synthetic-secret-key".to_string(),
-        session_token: None,
-    }
-}
-
-fn target(endpoint: &str) -> ObjectTarget<'_> {
-    ObjectTarget {
-        bucket: "synthetic-bucket",
-        key: "snapshots/synthetic/memory.bin",
-        region: "us-east-1",
-        endpoint: Some(endpoint),
-        path_style: true,
-    }
-}
-
 fn kinds_and_retries(failures: &[FailedAttempt]) -> Vec<(u32, S3AttemptFailureKind, bool)> {
     failures
         .iter()
@@ -229,50 +152,6 @@ fn never_answering(requests: Arc<AtomicUsize>) -> Router {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn never_answering_endpoint_is_retried_per_attempt_timeout_then_fails() {
-    let requests = Arc::new(AtomicUsize::new(0));
-    let endpoint = serve(never_answering(requests.clone())).await;
-    let recorder = Arc::new(Recorder::default());
-    let operation_timeout = Duration::from_secs(30);
-    let store = store(
-        S3Timeouts {
-            attempt: Duration::from_millis(300),
-            operation: operation_timeout,
-        },
-        Duration::from_secs(5),
-        &recorder,
-    );
-
-    let started_at = Instant::now();
-    let result = store
-        .put_bytes(
-            &credentials(),
-            target(&endpoint),
-            bytes::Bytes::from_static(b"payload"),
-        )
-        .await;
-
-    assert!(
-        matches!(result, Err(ObjectStoreError::Put(_))),
-        "{result:?}"
-    );
-    assert!(
-        started_at.elapsed() < operation_timeout,
-        "attempt timeouts, not the operation timeout, should end the call"
-    );
-    assert_eq!(requests.load(Ordering::SeqCst), 3);
-    assert_eq!(
-        kinds_and_retries(&recorder.failures()),
-        [
-            (1, S3AttemptFailureKind::AttemptTimeout, true),
-            (2, S3AttemptFailureKind::AttemptTimeout, true),
-            (3, S3AttemptFailureKind::AttemptTimeout, false),
-        ]
-    );
-    assert!(recorder.recoveries().is_empty());
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn operation_timeout_bounds_an_attempt_that_never_answers() {
     let requests = Arc::new(AtomicUsize::new(0));
     let endpoint = serve(never_answering(requests.clone())).await;
@@ -280,10 +159,7 @@ async fn operation_timeout_bounds_an_attempt_that_never_answers() {
     let attempt_timeout = Duration::from_secs(30);
     let operation_timeout = Duration::from_millis(500);
     let store = store(
-        S3Timeouts {
-            attempt: attempt_timeout,
-            operation: operation_timeout,
-        },
+        every_class(attempt_timeout, operation_timeout),
         Duration::from_secs(5),
         &recorder,
     );
@@ -327,10 +203,7 @@ async fn stalled_upload_is_cut_and_retried() {
     .await;
     let recorder = Arc::new(Recorder::default());
     let store = store(
-        S3Timeouts {
-            attempt: Duration::from_secs(60),
-            operation: Duration::from_secs(180),
-        },
+        every_class(Duration::from_secs(60), Duration::from_secs(180)),
         Duration::from_millis(500),
         &recorder,
     );
@@ -384,10 +257,7 @@ async fn success_after_a_failed_attempt_reports_the_retry() {
     .await;
     let recorder = Arc::new(Recorder::default());
     let store = store(
-        S3Timeouts {
-            attempt: Duration::from_secs(30),
-            operation: Duration::from_secs(90),
-        },
+        every_class(Duration::from_secs(30), Duration::from_secs(90)),
         Duration::from_secs(5),
         &recorder,
     );
@@ -410,6 +280,6 @@ async fn success_after_a_failed_attempt_reports_the_retry() {
     assert_eq!(failures[0].error_code.as_deref(), Some("InternalError"));
     let recoveries = recorder.recoveries();
     assert_eq!(recoveries.len(), 1);
-    assert_eq!(recoveries[0].operation, S3Operation::PutObject);
-    assert_eq!(recoveries[0].attempts, 2);
+    assert_eq!(recoveries[0].1.operation, S3Operation::PutObject);
+    assert_eq!(recoveries[0].1.attempts, 2);
 }

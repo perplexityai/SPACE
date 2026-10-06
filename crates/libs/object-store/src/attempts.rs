@@ -13,6 +13,12 @@
 //!   a WARN log and an `object_store.s3.attempt_failed` count;
 //! - an operation that succeeds after more than one attempt as an INFO log.
 //!
+//! A `GetObject` response body is read after `send()` returns, outside the
+//! SDK's attempts, so the interceptor never sees it fail. The download paths
+//! report those failures through the same observer
+//! ([`AttemptObserver::body_read_failed`]), with the ranged download's own
+//! chunk retry numbering the attempts.
+//!
 //! A first attempt that fails and ends the operation is not reported here.
 //! That is the operation failing, which the caller's `observe_s3_error`
 //! already logs and counts, and expected outcomes such as a `HeadObject` 404
@@ -47,6 +53,7 @@ use aws_sdk_s3::operation::head_object::{HeadObjectError, HeadObjectInput};
 use aws_sdk_s3::operation::put_object::{PutObjectError, PutObjectInput};
 use aws_sdk_s3::operation::upload_part::{UploadPartError, UploadPartInput};
 use aws_sdk_s3::operation::upload_part_copy::{UploadPartCopyError, UploadPartCopyInput};
+use aws_sdk_s3::primitives::ByteStreamError;
 use aws_smithy_async::future::timeout::TimedOutError;
 use aws_smithy_runtime_api::box_error::BoxError;
 use aws_smithy_runtime_api::client::interceptors::Intercept;
@@ -74,6 +81,8 @@ pub(crate) struct AttemptTarget {
     pub(crate) upload_id: Option<String>,
     pub(crate) part_number: Option<i32>,
     pub(crate) range: Option<String>,
+    /// Position of a ranged download chunk; set only by the chunk retry.
+    pub(crate) chunk_index: Option<usize>,
 }
 
 impl AttemptTarget {
@@ -145,6 +154,7 @@ impl AttemptReporter for LogAndCount {
             upload_id = target.upload_id.as_deref(),
             part_number = target.part_number,
             range = target.range.as_deref(),
+            chunk_index = target.chunk_index,
             error = failure.error,
             "S3 request attempt failed"
         );
@@ -160,6 +170,7 @@ impl AttemptReporter for LogAndCount {
             upload_id = target.upload_id.as_deref(),
             part_number = target.part_number,
             range = target.range.as_deref(),
+            chunk_index = target.chunk_index,
             "S3 operation succeeded after retrying failed attempts"
         );
     }
@@ -183,6 +194,50 @@ impl AttemptObserver {
 
     pub(crate) fn logging() -> Self {
         Self::new(Arc::new(LogAndCount))
+    }
+
+    /// Reports one failed read of a `GetObject` response body. `attempt` and
+    /// `will_retry` describe the caller's own retry of the body, since the
+    /// SDK's ended when `send()` returned. Every failure is reported, the
+    /// last one included: unlike a failed request, nothing else counts it.
+    pub(crate) fn body_read_failed(
+        &self,
+        target: &AttemptTarget,
+        attempt: u32,
+        will_retry: bool,
+        elapsed: Duration,
+        error: &ByteStreamError,
+    ) {
+        self.reporter.attempt_failed(
+            target,
+            &FailedAttempt {
+                operation: S3Operation::GetObject,
+                attempt,
+                kind: classify_body_read_failure(error),
+                will_retry,
+                elapsed,
+                http_status: None,
+                error_code: None,
+                error: DisplayErrorContext(error).to_string(),
+            },
+        );
+    }
+
+    /// Reports a response body read in full after `attempts` tries.
+    pub(crate) fn body_read_recovered(
+        &self,
+        target: &AttemptTarget,
+        attempts: u32,
+        elapsed: Duration,
+    ) {
+        self.reporter.recovered(
+            target,
+            &RecoveredOperation {
+                operation: S3Operation::GetObject,
+                attempts,
+                elapsed,
+            },
+        );
     }
 }
 
@@ -392,10 +447,30 @@ pub(crate) fn classify_attempt_failure<E>(
     }
 }
 
+/// Classifies why reading a response body failed.
+///
+/// A transport failure carries an `io::Error` in its source chain: hyper
+/// reports a reset, a closed connection, and a body that ends before its
+/// `Content-Length` that way. The other producer on this path is download
+/// stalled-stream protection, whose error type is private to
+/// aws-smithy-runtime, so a body failure without an I/O source is a stall
+/// cut.
+pub(crate) fn classify_body_read_failure(error: &ByteStreamError) -> S3AttemptFailureKind {
+    if has_source::<std::io::Error>(error) {
+        S3AttemptFailureKind::Io
+    } else {
+        S3AttemptFailureKind::StalledStream
+    }
+}
+
 fn has_timer_source(error: &(dyn std::error::Error + 'static)) -> bool {
+    has_source::<TimedOutError>(error)
+}
+
+fn has_source<T: std::error::Error + 'static>(error: &(dyn std::error::Error + 'static)) -> bool {
     let mut next = Some(error);
     while let Some(error) = next {
-        if error.is::<TimedOutError>() {
+        if error.is::<T>() {
             return true;
         }
         next = error.source();

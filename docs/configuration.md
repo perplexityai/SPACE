@@ -160,6 +160,8 @@ because disabling it by mistake would leave every create queued forever.
 | `SPACE_OBJECT_STORE_MULTIPART_PART_SIZE_BYTES` | built-in | 8 MiB to 5 GiB. |
 | `SPACE_OBJECT_STORE_MULTIPART_CONCURRENCY` | built-in | 1 to 64 in-flight parts. |
 | `SPACE_OBJECT_STORE_DOWNLOAD_READER_CONCURRENCY`, `SPACE_OBJECT_STORE_DOWNLOAD_CHUNK_SIZE_BYTES`, `SPACE_OBJECT_STORE_DOWNLOAD_BUFFER_BUDGET_BYTES` | 8, 32 MiB, 2 GiB | Peak buffered memory is bounded by the budget; size it below the service's memory limit. |
+| `SPACE_OBJECT_STORE_REQUEST_ATTEMPT_TIMEOUT_SECS`, `SPACE_OBJECT_STORE_BODY_UPLOAD_ATTEMPT_TIMEOUT_SECS`, `SPACE_OBJECT_STORE_SERVER_SIDE_ATTEMPT_TIMEOUT_SECS` | 10, 60, 30 | 5 to 21600. Bound one attempt of a get, head, or create/abort multipart call; of a put or part upload; and of a complete or copy. Raise the body-upload value with the part size. |
+| `SPACE_OBJECT_STORE_REQUEST_OPERATION_TIMEOUT_SECS`, `SPACE_OBJECT_STORE_BODY_UPLOAD_OPERATION_TIMEOUT_SECS`, `SPACE_OBJECT_STORE_SERVER_SIDE_OPERATION_TIMEOUT_SECS` | 3 × attempt + 5 s | 5 to 86400. Bound the same calls across all three SDK attempts. |
 | `SPACE_OBJECT_STORE_STATIC_SESSION_TOKEN` | unset | Session token for temporary static credentials. |
 | `SPACE_SNAPSHOT_BUCKET`, `SPACE_SNAPSHOT_REGION`, `SPACE_SNAPSHOT_ENDPOINT` | unset | Unset disables snapshot upload. |
 
