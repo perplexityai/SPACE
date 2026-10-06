@@ -1,6 +1,6 @@
 apiVersion: v2
 name: space-node-stack
-description: Real SPACE node-side services on a non-Firecracker local substrate for the KinD stack (volume-manager → SeaweedFS; sandbox-manager/node-api/local-node-mgr added incrementally)
+description: Real SPACE node-side services on a non-Firecracker local substrate for the KinD stack (volume-manager → object store; sandbox-manager/node-api/local-node-mgr added incrementally)
 type: application
 version: 0.1.0
 appVersion: "0.8.0"

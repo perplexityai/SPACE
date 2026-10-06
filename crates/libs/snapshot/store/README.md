@@ -19,8 +19,8 @@ identifies the single backend route for that snapshot, not one replica in a
 caller-managed set.
 
 Snapshot metadata SQL belongs here as callers are migrated. S3, local disk,
-SeaweedFS, and other byte-storage implementations remain behind their storage
-backend interfaces.
+S3-compatible stores, and other byte-storage implementations remain behind
+their storage backend interfaces.
 
 ## API directive
 

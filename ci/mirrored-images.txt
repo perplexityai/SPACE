@@ -52,4 +52,6 @@ ubuntu:26.04@sha256:da6fc2be547864451aa253836dd926da33623312df4a9a243e35dc877c37
 # scripts/tests/lib/bootstrap-kind-stack.sh loads into the cluster.
 postgres:16-alpine       sha256:1a66d744c1b459e13b05a8fca341da84cb63383e99ce262210efee5a319d4551 ghcr.io/perplexityai/space-ci-mirror:postgres-16-alpine
 redis:7-alpine           sha256:ca0acbb137c1dc3339c8b147a58fd6f42775d4599327b50e7b116c23de501af2 ghcr.io/perplexityai/space-ci-mirror:redis-7-alpine
-chrislusf/seaweedfs:4.31 sha256:47f474425c0bef52d19579620700aa35dfb3432500790533a433847940757d15 ghcr.io/perplexityai/space-ci-mirror:seaweedfs-4.31
+# Bump versitygw to the first release that contains versity/versitygw#2415
+# (see the space-object-store chart's values); Content-MD5 stays.
+ghcr.io/versity/versitygw:v1.8.0 sha256:97e7d5a35ab758eb1761a9e717644fafc614c5f6026c05482bd1fb77205193a1 ghcr.io/perplexityai/space-ci-mirror:versitygw-v1.8.0

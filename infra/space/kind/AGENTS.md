@@ -55,8 +55,8 @@ or suites.
   `space_smoke/adapters.py` (capture the standing literals, restore from the
   capture, verify running pods); shell ECW key seeding goes through
   `scripts/tests/lib/ecw-ops.sh`.
-- SeaweedFS data remains on its node-local hostPath. Preserve the chart's volume
-  sizing, 40 GiB sparse worker cache, and Kind-specific disk-admission values.
+- Object-store data remains on its node-local hostPath. Preserve that
+  persistence, 40 GiB sparse worker cache, and Kind-specific disk-admission values.
 
 ## Operational boundary
 

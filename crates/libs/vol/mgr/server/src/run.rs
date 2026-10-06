@@ -50,8 +50,8 @@ pub(crate) async fn migrate_volume_manager_db(path: &Path) -> Result<(), SqliteE
 }
 
 // Static S3 credential escape hatch, resolved here at the deployment boundary
-// (not inside the platform library). When these are set — e.g. a local kind +
-// SeaweedFS stack where credmgr's STS/IRSA exchange isn't available — they are
+// (not inside the platform library). When these are set — e.g. a local kind
+// stack with its S3-compatible object store, where credmgr's STS/IRSA exchange isn't available — they are
 // injected into the service and used directly instead of the credmgr exchange.
 // Production leaves them unset and volume-manager uses credmgr as before.
 const STATIC_ACCESS_KEY_ID_ENV: &str = "SPACE_OBJECT_STORE_STATIC_ACCESS_KEY_ID";

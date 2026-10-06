@@ -180,7 +180,7 @@ is safe.
 | Controllers and adapters | Coordinate sandbox lifecycle changes with worker services. In Kind, the Kubernetes adapter, cluster controller, and runtime shim create and manage sandbox pods. |
 | Worker services | Manage VMs, networking, volumes, templates, and credentials. btrfs copy-on-write supports root filesystem creation. |
 | Data plane | Connect clients to guest processes and forward events using scoped tokens. |
-| Builders and object storage | Build templates separately from user sandboxes and store template and snapshot artifacts. The Kind deployment uses SeaweedFS. |
+| Builders and object storage | Build templates separately from user sandboxes and store template and snapshot artifacts. The Kind deployment uses Versity S3 Gateway (versitygw). |
 | Internal API and UI | Support node registration and template-release publication, and provide a browser interface. API clients do not require the UI. |
 
 ## Security boundaries

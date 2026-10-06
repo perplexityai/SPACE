@@ -102,7 +102,7 @@ build_space_node_stack() {
 }
 
 # seed-publish carries the locally built production seed (see build-seed.sh)
-# plus the publisher that uploads it to SeaweedFS and registers the release
+# plus the publisher that uploads it to the object store and registers the release
 # through the real ClusterApi RPCs. build-seed.sh is idempotent and skips the
 # privileged rootfs build when its inputs are unchanged.
 build_space_seed_publish() {

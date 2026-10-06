@@ -31,7 +31,7 @@ from space_smoke.adapters import (
 from space_smoke.runtime import ScenarioContext, SmokeConfigurationError, SubprocessExecutor
 
 DEPLOYMENTS = ("space-api", "space-cluster-controller", "space-data-plane")
-STORAGE_DEPLOYMENT = "space-seaweedfs"
+STORAGE_DEPLOYMENT = "space-object-store"
 RECOVERY_ENVIRONMENT = (
     "SPACE_SMOKE_NATIVE_RECOVERY",
     "SPACE_SMOKE_NATIVE_RECOVERY_CONTEXT",

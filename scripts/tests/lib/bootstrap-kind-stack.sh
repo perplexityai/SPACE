@@ -827,12 +827,19 @@ bootstrap_kind_stack() {
 bootstrap_kind_stack__load_mirrored_chart_images() {
     [[ -n "${SPACE_CI_IMAGE_MIRROR:-}" ]] || return 0
     local chart image images=() present=() nodes="" attempt
-    for chart in space-postgres space-redis-local space-seaweedfs; do
-        images+=("$(awk '/^image:/ { in_image = 1; next } /^[^ ]/ { in_image = 0 }
+    # Each chart's top-level `image:` block, plus the object store's
+    # `bucketInitImage:` (its bucket-init Job runs the aws CLI image).
+    for chart in space-postgres space-redis-local space-object-store; do
+        while IFS= read -r image; do
+            [[ -n "$image" ]] && images+=("$image")
+        done < <(awk '
+            function emit() { if (in_image && repository != "" && tag != "") print repository ":" tag }
+            /^(image|bucketInitImage):/ { emit(); in_image = 1; repository = ""; tag = ""; next }
+            /^[^ ]/ { emit(); in_image = 0 }
             in_image && $1 == "repository:" { repository = $2 }
             in_image && $1 == "tag:" { gsub(/"/, "", $2); tag = $2 }
-            END { if (repository != "" && tag != "") print repository ":" tag }' \
-            "$REPO_ROOT/infra/space/kind/charts/$chart/values.yaml")")
+            END { emit() }' \
+            "$REPO_ROOT/infra/space/kind/charts/$chart/values.yaml")
     done
     bash "$REPO_ROOT/ci/scripts/mirror-images.sh" pull "${images[@]}"
     for image in "${images[@]}"; do
@@ -1017,7 +1024,7 @@ bootstrap_kind_stack__bring_up() {
         fi
     fi
 
-    # The seed-publish Job uploads the locally built seed to SeaweedFS and
+    # The seed-publish Job uploads the locally built seed to the object store and
     # registers the release through the ClusterApi; CreateSandbox validates
     # the template tag against `template_release_tags`, so the smoke tests
     # cannot create sandboxes until it has completed.

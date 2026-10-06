@@ -20,7 +20,7 @@ nodes:
   - role: worker
     labels:
       space.pplx.net/node-pool: sandbox
-  # Infra node — runs Postgres, space-api, SeaweedFS.
+  # Infra node — runs Postgres, space-api, object store.
   - role: worker
     labels:
       space.pplx.net/node-pool: infra

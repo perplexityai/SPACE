@@ -6,7 +6,7 @@
 # infra/space/kind/kind-cluster.yaml.tmpl), brings up the production-shaped
 # topology: api-server on KubernetesSubstrate, cluster-controller materializing
 # per-sandbox pods, the real worker DaemonSet on both sandbox workers, a
-# production-shaped builder DaemonSet on its dedicated node, SeaweedFS for S3,
+# production-shaped builder DaemonSet on its dedicated node, the versitygw object store for S3,
 # and the seed template published through the real ClusterApi + object-store
 # path (space-seed-publish Job).
 #
@@ -311,18 +311,18 @@ helm_apply space "$KIND_DIR/charts/space-postgres"
 log "waiting for postgres StatefulSet to be ready"
 kubectl --context "$KCTX" -n "$NAMESPACE" rollout status sts/space-postgres --timeout="${TIMEOUT}s"
 
-# SeaweedFS — Deployment plus a Job that creates the snapshots bucket once
+# Object store (versitygw) — Deployment plus a Job that creates the buckets once
 # the deployment is reachable.
 # A Job's spec.template is immutable, so re-applying this chart against a
 # cluster whose copy of the Job was rendered from a different commit fails the
-# whole SeaweedFS step with `field is immutable` — before anything downstream
+# whole object-store step with `field is immutable` — before anything downstream
 # runs. Pre-delete it, exactly as space-seed-publish is pre-deleted below. The
-# Job is built to be re-run: it waits for the master, then creates both buckets
-# ignoring "already exists".
-kubectl --context "$KCTX" -n "$NAMESPACE" delete job space-seaweedfs-bucket-init --ignore-not-found >/dev/null
-helm_apply space "$KIND_DIR/charts/space-seaweedfs"
-log "waiting for seaweedfs Deployment to be ready"
-kubectl --context "$KCTX" -n "$NAMESPACE" rollout status deploy/space-seaweedfs --timeout="${TIMEOUT}s"
+# Job is built to be re-run: it waits for the S3 API, then creates whichever
+# bucket is missing.
+kubectl --context "$KCTX" -n "$NAMESPACE" delete job space-object-store-bucket-init --ignore-not-found >/dev/null
+helm_apply space "$KIND_DIR/charts/space-object-store"
+log "waiting for object-store Deployment to be ready"
+kubectl --context "$KCTX" -n "$NAMESPACE" rollout status deploy/space-object-store --timeout="${TIMEOUT}s"
 
 # Redis — shared store for the API rate limiters (cluster activation admission
 # + per-client concurrency). Idle unless SPACE_REDIS_URL points at it; the
@@ -378,7 +378,7 @@ helm_apply space-builder "$KIND_DIR/charts/space-node-stack" \
   ${LOOP_TARGET_ARGS[@]+"${LOOP_TARGET_ARGS[@]}"}
 
 # Seed publish: one-shot Job that uploads the locally built production seed
-# to SeaweedFS and registers the release through the real ClusterApi RPCs.
+# to the versitygw object store and registers the release through the real ClusterApi RPCs.
 # Job specs are immutable, so drop any completed prior run before re-applying
 # (the publish itself is idempotent).
 kubectl --context "$KCTX" -n "$NAMESPACE" delete job space-seed-publish --ignore-not-found >/dev/null
@@ -397,9 +397,9 @@ kubectl --context "$KCTX" -n "$NAMESPACE" rollout status deploy/space-cluster-co
 log "waiting for space-ui Deployment"
 kubectl --context "$KCTX" -n "$NAMESPACE" rollout status deploy/space-ui --timeout="${TIMEOUT}s"
 
-log "waiting for space-seaweedfs bucket-init Job"
+log "waiting for space-object-store bucket-init Job"
 kubectl --context "$KCTX" -n "$NAMESPACE" wait --for=condition=complete \
-  job/space-seaweedfs-bucket-init --timeout="${TIMEOUT}s" >/dev/null
+  job/space-object-store-bucket-init --timeout="${TIMEOUT}s" >/dev/null
 
 log "waiting for space-seed-publish Job (uploads seed + registers the release)"
 kubectl --context "$KCTX" -n "$NAMESPACE" wait --for=condition=complete \
@@ -482,13 +482,13 @@ if (( PORT_FORWARD )); then
   start_pf svc/space-api        8080:8080
   start_pf svc/space-data-plane 8090:8090
   start_pf svc/space-ui         3000:3000
-  # SeaweedFS's S3 API: the node-drain smoke asserts the evacuation's snapshot
+  # The object store's S3 API: the node-drain smoke asserts the evacuation's snapshot
   # artifacts through it, so a stack brought up this way has to expose it just
   # like the Tilt path does. Without it that suite fails after a successful
   # evacuation, blaming the data path for an absent port-forward.
-  # The Service is `seaweedfs` while its Deployment is `space-seaweedfs` (see
-  # the chart's `service.name`) — not a typo to "fix".
-  start_pf svc/seaweedfs        8333:8333
+  # The Service is `object-store` while its Deployment is `space-object-store`
+  # (see the chart's `service.name`) — not a typo to "fix".
+  start_pf svc/object-store     8333:8333
   if [[ "$DATADOG_MODE" == fakeintake ]]; then
     start_pf svc/datadog-fakeintake 8088:80 kube-system
   fi

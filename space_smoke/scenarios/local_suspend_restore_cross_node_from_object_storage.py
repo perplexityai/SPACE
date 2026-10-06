@@ -31,7 +31,7 @@ MARKER = "space-smoke-cross-node-restore-ok"
 # exactly like a product bug. The legacy shell suite guarded it the same way.
 @smoke.scenario(
     "local.suspend_restore_cross_node_from_object_storage",
-    # Cross-node restore pulls the full snapshot from SeaweedFS and re-adopts
+    # Cross-node restore pulls the full snapshot from the object store and re-adopts
     # the artifact identity on the landing node; give a slow KVM bench room.
     sandbox=smoke.SandboxConfig(timeout=900),
 )

@@ -18,7 +18,7 @@ service:
   name: space-redis
   port: 6379
 
-# Pinned to the infra node alongside Postgres/SeaweedFS so a sandbox-worker
+# Pinned to the infra node alongside Postgres/object store so a sandbox-worker
 # drain never disturbs the limiter store.
 nodeSelector:
   space.pplx.net/infra: "true"

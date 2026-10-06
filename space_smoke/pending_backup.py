@@ -16,12 +16,12 @@ artifact is provably backed) and the queue row is gone.
 Why the upload has to be broken: a natural suspend's unbacked window is a few
 seconds on kind while the census fires once per node per poll interval, so an
 unmodified run sees an empty report essentially always, and an empty report
-is indistinguishable from a node that enumerated nothing. SeaweedFS is scaled
+is indistinguishable from a node that enumerated nothing. The object store is scaled
 to zero for the suspend with its scale-back armed first. The restore does not
 finalize the upload at once: the transfer climbs the shared job worker's retry
 ladder (5, 30, 120, 300 s) and can wait out a full 300 s before it uploads, so
 the drain budget is 600 s and the downtime is kept short so the fifth attempt
-never runs with the store still down. Scaling SeaweedFS to zero stops every
+never runs with the store still down. Scaling the object store to zero stops every
 suspend upload on the stack, so this must not run concurrently with another
 suspend-bearing smoke.
 """
@@ -51,19 +51,19 @@ class PendingBackupAssertions:
         self._operation_id: str | None = None
 
     def block_uploads(self, *, timeout: float = 120) -> None:
-        """Scale SeaweedFS to zero; the scale-back is armed before the write."""
+        """Scale the object store to zero; the scale-back is armed before the write."""
 
-        previous = self._control.seaweedfs_replicas()
-        self._fixture.record("seaweedfs_replicas_before", previous)
+        previous = self._control.object_store_replicas()
+        self._fixture.record("object_store_replicas_before", previous)
 
         def back() -> None:
-            self._control.scale_seaweedfs(max(previous, 1))
-            self._control.wait_seaweedfs_rollout(timeout=180)
+            self._control.scale_object_store(max(previous, 1))
+            self._control.wait_object_store_rollout(timeout=180)
 
-        self._store_back = self._scope.defer("scale SeaweedFS back up", back, critical=True)
+        self._store_back = self._scope.defer("scale the object store back up", back, critical=True)
         self._since = self._control.log_since_time()
-        self._control.scale_seaweedfs(0)
-        self._control.wait_seaweedfs_gone(timeout=timeout)
+        self._control.scale_object_store(0)
+        self._control.wait_object_store_gone(timeout=timeout)
 
     def suspend_async(self) -> str:
         """Start the suspend as an operation and return without waiting on it.

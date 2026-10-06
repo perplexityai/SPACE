@@ -3,7 +3,7 @@ name: space-seed-publish
 description: >-
   One-shot Job that publishes the locally built seed template the way the
   production builder publishes releases: artifacts to the cluster object store
-  (SeaweedFS locally), then RegisterTemplate/RegisterTemplateRelease through
+  (versitygw locally), then RegisterTemplate/RegisterTemplateRelease through
   the real ClusterApi on space-internal-api. Workers pull the seed through the
   production template pull path.
 type: application

@@ -223,7 +223,7 @@ impl BucketLocation {
             key,
             region: &self.region,
             // Real S3 only: a custom endpoint and path-style addressing are the
-            // local SeaweedFS harness's business, and the kind stack has its own
+            // local kind object store's business, and the kind stack has its own
             // publish Job.
             endpoint: None,
             path_style: false,

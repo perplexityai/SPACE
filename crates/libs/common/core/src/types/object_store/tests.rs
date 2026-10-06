@@ -114,11 +114,11 @@ fn storage_uri_display_round_trips_every_parseable_shape() {
         "s3://bucket?region=us-east-1",
         "s3://bucket/templates/seed/sha256:ab?region=us-east-1",
         "s3://bucket/p?region=us-east-1&path_style=true",
-        "s3://bucket/p?region=us-east-1&endpoint=http://seaweedfs:8333",
-        "s3://bucket/p?region=us-east-1&endpoint=http://seaweedfs:8333&path_style=false",
+        "s3://bucket/p?region=us-east-1&endpoint=http://object-store:8333",
+        "s3://bucket/p?region=us-east-1&endpoint=http://object-store:8333&path_style=false",
         // Redundant relative to the endpoint-implied default, so Display
         // drops it; the parsed value is what has to survive.
-        "s3://bucket/p?region=us-east-1&endpoint=http://seaweedfs:8333&path_style=true",
+        "s3://bucket/p?region=us-east-1&endpoint=http://object-store:8333&path_style=true",
     ] {
         let parsed = StorageUri::parse(wire).expect("fixture should parse");
         let rendered = parsed.to_string();

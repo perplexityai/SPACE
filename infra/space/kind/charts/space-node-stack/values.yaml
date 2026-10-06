@@ -8,7 +8,7 @@
 # flows through node-ctl →
 # space-internal-api (PublishNodeState); templates are pulled through the
 # production template pull path (ClusterApi.FindTemplateRelease → volmgr).
-# Snapshot artifacts flow through the real volume-manager to SeaweedFS.
+# Snapshot artifacts flow through the real volume-manager to the Kind object store.
 
 image:
   repository: space-node-stack
@@ -137,14 +137,14 @@ builder:
   objectStore:
     bucket: templates
     region: us-east-1
-    endpoint: http://seaweedfs:8333
+    endpoint: http://object-store:8333
     multipartConcurrency: 2
     multipartPartSizeBytes: 67108864
 
 # Optional development wiring for credential-manager's own AWS integrations.
 # ExchangeToken never returns these ambient credentials; kind build-manager
 # and volume-manager consume the separately injected object-store credentials
-# directly for SeaweedFS.
+# directly for the Kind object store.
 credentialManager:
   useObjectStoreCredentials: false
 
@@ -276,7 +276,7 @@ templateCache:
 #   retired compose suites did.
 # - What it means for the bench: any sandbox left suspended for more than
 #   two minutes with a ready remote snapshot loses its local copy and restores
-#   from SeaweedFS on the next wake — exactly what prod does under disk
+#   from the Kind object store on the next wake — exactly what prod does under disk
 #   pressure, on a short clock.
 #
 # WORKERS ONLY; the builder release sets this to null. A change here is a
@@ -327,14 +327,14 @@ snapshotReaper:
 
 # S3-compatible object store the node stack targets for snapshot artifacts.
 s3:
-  # In-cluster SeaweedFS Service S3 endpoint (path-style addressing).
-  endpoint: http://seaweedfs:8333
+  # In-cluster object-store Service S3 endpoint (path-style addressing).
+  endpoint: http://object-store:8333
   region: us-east-1
   bucket: snapshots
-  # Static credentials live in this Secret (rendered by the space-seaweedfs chart):
+  # Static credentials live in this Secret (rendered by the space-object-store chart):
   #   SPACE_OBJECT_STORE_STATIC_ACCESS_KEY_ID
   #   SPACE_OBJECT_STORE_STATIC_SECRET_ACCESS_KEY
-  credentialsSecretName: space-seaweedfs
+  credentialsSecretName: space-object-store
 
 # /space/cache loopback size (SPACE_CACHE_SIZE_MB, read by the kind
 # entrypoint's btrfs image setup). Must sit comfortably above the 16 GiB

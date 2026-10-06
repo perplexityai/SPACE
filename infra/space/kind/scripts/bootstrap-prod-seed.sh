@@ -2,9 +2,9 @@
 # Register externally built SPACE templates in Kind and stage their artifacts
 # on each worker. This optional path requires an explicitly configured S3
 # source. The default bring-up instead builds the seed locally and publishes
-# it through ClusterApi and SeaweedFS (build-seed.sh and space-seed-publish).
+# it through ClusterApi and the object store (build-seed.sh and space-seed-publish).
 #
-# The kind workers' volmgr only has SeaweedFS credentials, so the real-S3
+# The kind workers' volmgr only has object-store credentials, so the real-S3
 # prefetch path can't pull these artifacts itself. This script is the
 # bridge: it runs `scripts/bootstrap-templates.sh` to write the four
 # control-plane rows

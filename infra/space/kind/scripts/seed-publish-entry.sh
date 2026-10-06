@@ -6,7 +6,7 @@
 #
 #   1. uploads metadata.json + manifest.json + rootfs.ext4 to the cluster
 #      object store under templates/<name>/<content_hash>/ (real S3 protocol,
-#      sigv4-signed — SeaweedFS locally, S3 in prod),
+#      sigv4-signed — versitygw locally, S3 in prod),
 #   2. registers the template + release + tag + storage location through the
 #      real ClusterApi RPCs (RegisterTemplate / RegisterTemplateRelease) on
 #      space-internal-api.
@@ -23,7 +23,7 @@
 # Required env:
 #   SPACE_INTERNAL_API_GRPC_ADDR   host:port of space-internal-api (plaintext gRPC)
 #   SPACE_CLUSTER_API_TOKEN_PATH   projected bearer token file for ClusterApi
-#   SPACE_OBJECT_STORE_ENDPOINT    e.g. http://seaweedfs:8333
+#   SPACE_OBJECT_STORE_ENDPOINT    e.g. http://object-store:8333
 #   SPACE_OBJECT_STORE_BUCKET      e.g. templates
 #   SPACE_OBJECT_STORE_REGION     e.g. us-east-1
 #   SPACE_OBJECT_STORE_STATIC_ACCESS_KEY_ID / _SECRET_ACCESS_KEY
@@ -119,7 +119,10 @@ done
 if [[ "$upload_needed" == 1 ]]; then
   for f in metadata.json manifest.json rootfs.ext4; do
     log "uploading $f → s3://${SPACE_OBJECT_STORE_BUCKET}/${S3_PREFIX}/$f"
-    aws --endpoint-url "$SPACE_OBJECT_STORE_ENDPOINT" \
+    # rootfs.ext4 goes multipart, and versitygw's CompleteMultipartUpload
+    # copies the parts into the object before it answers: about 50 s for a
+    # 1.5 GB rootfs, too close to the CLI's 60 s default read timeout.
+    aws --endpoint-url "$SPACE_OBJECT_STORE_ENDPOINT" --cli-read-timeout 300 \
       s3 cp "$SEED_DIR/$f" "s3://${SPACE_OBJECT_STORE_BUCKET}/${S3_PREFIX}/$f" --no-progress
   done
 else

@@ -5,7 +5,7 @@
 //! `CreateSnapshot` rebuilds `rootfs.ext4` from that tree (`mke2fs -d`) and
 //! materializes the Full-codec artifact set — `rootfs.ext4` plus placeholder
 //! `vmstate` / `memory` files — which sandbox-manager uploads through the real
-//! volume-manager → `SeaweedFS`. Restore reflinks `rootfs.ext4` back and extracts
+//! volume-manager → the local object store. Restore reflinks `rootfs.ext4` back and extracts
 //! it (`debugfs rdump`) into the tree for a cold boot.
 
 use std::path::Path;

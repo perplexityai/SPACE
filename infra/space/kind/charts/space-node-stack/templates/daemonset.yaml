@@ -287,7 +287,7 @@ spec:
                 secretKeyRef:
                   name: {{ .Values.postgres.secretName }}
                   key: {{ .Values.postgres.secretKey }}
-            # Kind consumers use their directly injected SeaweedFS credentials.
+            # Kind consumers use their directly injected object-store credentials.
             # Credential exchange stays disabled because no AWS vending role
             # (SPACE_CREDMGR_S3_VEND_ROLE_ARN) is configured here.
             # Kind's legacy authority uses the development-only in-memory KEK.
@@ -411,7 +411,7 @@ spec:
                   key: SPACE_OBJECT_STORE_STATIC_SECRET_ACCESS_KEY
             {{- if .Values.builder.enabled }}
             # Builder publication settings mirror the production
-            # space-build-manager chart, targeting local SeaweedFS.
+            # space-build-manager chart, targeting the local object store.
             - name: SPACE_BUILD_MANAGER_ENDPOINT
               value: {{ .Values.builder.endpoint | quote }}
             - name: SPACE_OBJECT_STORE_BUCKET
@@ -442,7 +442,7 @@ spec:
             # Snapshot upload destination read by sandbox-manager's
             # SnapshotUploadConfig::from_env (the suspend artifact-backup path).
             # Without these, suspend keeps snapshots local-only and never pushes
-            # to SeaweedFS. Static creds are the SPACE_OBJECT_STORE_STATIC_* pair
+            # to the object store. Static creds are the SPACE_OBJECT_STORE_STATIC_* pair
             # above.
             - name: SPACE_SNAPSHOT_BUCKET
               value: {{ .Values.s3.bucket | quote }}

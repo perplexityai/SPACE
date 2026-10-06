@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Values.service.name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: space-object-store
+    app.kubernetes.io/instance: {{ .Release.Name }}
+spec:
+  selector:
+    app.kubernetes.io/name: space-object-store
+    app.kubernetes.io/instance: {{ .Release.Name }}
+  ports:
+    - name: s3
+      port: {{ .Values.service.s3Port }}
+      targetPort: s3
+      protocol: TCP

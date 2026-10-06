@@ -4,7 +4,7 @@ A passing bench shows one queue row appear and disappear. It cannot show that
 a snapshot reaching `ready` while uploads are supposedly blocked fails the
 in-flight verdict, that a queue row without an applied non-empty census fails
 the corroboration, that a drained queue with an unbacked artifact still fails,
-or that the SeaweedFS scale-back is armed before the scale to zero.
+or that the object store scale-back is armed before the scale to zero.
 """
 
 from __future__ import annotations
@@ -45,20 +45,20 @@ class _Control:
         self.backed = False
         self.op_state = "succeeded"
 
-    def seaweedfs_replicas(self) -> int:
+    def object_store_replicas(self) -> int:
         self.calls.append("read")
         return 1
 
-    def scale_seaweedfs(self, replicas: int) -> int:
+    def scale_object_store(self, replicas: int) -> int:
         self.calls.append(f"scale:{replicas}")
         if replicas == 0:
             raise TimeoutError("kubectl scale timed out after the write")
         return 0
 
-    def wait_seaweedfs_gone(self, *, timeout: float) -> None:
+    def wait_object_store_gone(self, *, timeout: float) -> None:
         self.calls.append("gone")
 
-    def wait_seaweedfs_rollout(self, *, timeout: float) -> None:
+    def wait_object_store_rollout(self, *, timeout: float) -> None:
         self.calls.append("rollout")
 
     def log_since_time(self) -> str:

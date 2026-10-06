@@ -1,0 +1,90 @@
+# Object store — local S3-compatible endpoint for the KinD SPACE stack.
+#
+# Versity S3 Gateway (versitygw, Apache-2.0) serving its POSIX backend from a
+# node-local hostPath: each bucket is a directory and each object a file, with
+# object metadata (ETag, content type, user metadata) in extended attributes.
+# volume-manager (real, on the node-stack DaemonSet) uploads/pulls
+# suspend-restore snapshot artifacts here via the production object-store
+# crate with an S3 endpoint override + path-style addressing, and the
+# space-seed-publish Job publishes template releases with the aws CLI. Nothing
+# here is a stub.
+#
+# Replaces SeaweedFS: one Go process with no master/volume/filer split, no
+# volume slots to exhaust and no per-collection volume growth.
+
+image:
+  repository: ghcr.io/versity/versitygw
+  # Bump to the first release that contains versity/versitygw#2415, and
+  # change its ci/mirrored-images.txt line, which pins this tag's
+  # linux/amd64 digest, with it. Through v1.8.0 the gateway commits a
+  # truncated UNSIGNED-PAYLOAD PutObject or UploadPart body as complete when
+  # the client disconnects mid-body (versity/versitygw#2414); the
+  # object-store crate's Content-MD5 on every upload is what rejects those
+  # bodies today, and it stays after the bump as defense in depth.
+  tag: "v1.8.0"
+  pullPolicy: IfNotPresent
+
+# The bucket-init Job creates the buckets through the S3 API with the aws CLI
+# image CI already mirrors (ci/mirrored-images.txt).
+bucketInitImage:
+  repository: public.ecr.aws/aws-cli/aws-cli
+  tag: "2.27.41"
+  pullPolicy: IfNotPresent
+
+datadogTeam: team-space
+
+service:
+  name: object-store
+  # S3 API port (the only one vol-mgr talks to). Kept at SeaweedFS's 8333 so
+  # host port-forwards and S3_ENDPOINT defaults are unchanged.
+  s3Port: 8333
+
+# Health endpoint versitygw serves on the S3 port (`--health`). Probes use it.
+healthPath: /healthz
+
+# Signing region the gateway validates (SigV4 is strict about region).
+region: us-east-1
+
+# Dev-only S3 credentials. Handed to volume-manager as static creds
+# (SPACE_OBJECT_STORE_STATIC_*) and used as the gateway's root account, so
+# sigv4 is actually validated. Do NOT put the
+# substring "space" (or "minio") anywhere in these values: Tilt redacts secret
+# VALUES from command lines (including docker build-args), so a "space"
+# substring would poison every `docker build … space-rust-build-… …`
+# invocation. See space-postgres values.
+credentials:
+  accessKey: localadmin
+  secretKey: localadmin-dev-secret
+
+# Buckets created by the init Job. `snapshots` carries suspend/restore
+# artifacts (volume-manager push/pull); `templates` carries template release
+# artifacts published by the space-seed-publish Job and pulled by worker
+# template-managers.
+snapshotBucket: snapshots
+templateBucket: templates
+
+# Object data lives on this node-local hostPath (see templates/deployment.yaml).
+dataHostPath: /var/lib/space-object-store
+
+# Extra versitygw global flags (before the `posix` backend subcommand).
+# `--pprof` serves Go profiles on loopback only, for stall diagnostics
+# (`kubectl exec … wget -qO- 127.0.0.1:6060/debug/pprof/goroutine?debug=2`).
+extraArgs:
+  - --pprof
+  - 127.0.0.1:6060
+
+# Object store placed on the infra node so a sandbox-worker drain never
+# disturbs it.
+nodeSelector:
+  space.pplx.net/infra: "true"
+
+# Small requests so the infra node fits the rest of the stack; the limits
+# hold through the full Kind suites, whose heaviest gateway work is memory
+# file uploads and multipart completion.
+resources:
+  requests:
+    cpu: 50m
+    memory: 256Mi
+  limits:
+    cpu: "1"
+    memory: 4Gi

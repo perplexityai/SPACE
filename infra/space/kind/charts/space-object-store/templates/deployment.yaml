@@ -1,0 +1,104 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: space-object-store
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: space-object-store
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    team: {{ .Values.datadogTeam | quote }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: space-object-store
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  strategy:
+    # Single gateway over one data dir; never two replicas (object publishes
+    # take advisory lock files that are only safe within one process).
+    type: Recreate
+  template:
+    metadata:
+      annotations:
+        ad.datadoghq.com/tags: '{"team":"{{ .Values.datadogTeam }}"}'
+      labels:
+        app.kubernetes.io/name: space-object-store
+        app.kubernetes.io/instance: {{ .Release.Name }}
+        team: {{ .Values.datadogTeam | quote }}
+    spec:
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      terminationGracePeriodSeconds: 10
+      containers:
+        - name: object-store
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          # Global flags precede the `posix` backend subcommand. The POSIX
+          # backend stores object metadata in user.* xattrs, which the Kind
+          # node's overlay filesystem supports.
+          args:
+            - --port
+            - ":{{ .Values.service.s3Port }}"
+            - --health
+            - {{ .Values.healthPath | quote }}
+            - --region
+            - {{ .Values.region | quote }}
+            {{- range .Values.extraArgs }}
+            - {{ . | quote }}
+            {{- end }}
+            - posix
+            - /data
+          env:
+            - name: ROOT_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: space-object-store
+                  key: SPACE_OBJECT_STORE_STATIC_ACCESS_KEY_ID
+            - name: ROOT_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: space-object-store
+                  key: SPACE_OBJECT_STORE_STATIC_SECRET_ACCESS_KEY
+          ports:
+            - name: s3
+              containerPort: {{ .Values.service.s3Port }}
+              protocol: TCP
+          # The gateway binds in well under a second, so readiness starts
+          # early, but it fails slowly on purpose: this is the Service's only
+          # endpoint, and dropping it during a transient stall turns every
+          # client retry into a fast "connection refused" instead of letting
+          # the stall pass (5 s x 12, a 60 s budget).
+          readinessProbe:
+            httpGet:
+              path: {{ .Values.healthPath }}
+              port: s3
+            initialDelaySeconds: 1
+            periodSeconds: 5
+            failureThreshold: 12
+          livenessProbe:
+            httpGet:
+              path: {{ .Values.healthPath }}
+              port: s3
+            initialDelaySeconds: 10
+            periodSeconds: 20
+            failureThreshold: 6
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+      volumes:
+        # hostPath (not emptyDir): the gateway is pinned to the infra node via
+        # nodeSelector, and object data must survive a pod restart — an
+        # emptyDir wipe loses the published seed + every suspend snapshot,
+        # which strands template pulls and cross-node restores until a manual
+        # re-publish. The node-local dir persists across pod rolls, and with
+        # the POSIX backend the buckets themselves are directories in it.
+        - name: data
+          hostPath:
+            path: {{ .Values.dataHostPath }}
+            type: DirectoryOrCreate

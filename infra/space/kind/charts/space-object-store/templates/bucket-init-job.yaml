@@ -1,0 +1,58 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: space-object-store-bucket-init
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: space-object-store-bucket-init
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    team: {{ .Values.datadogTeam | quote }}
+spec:
+  backoffLimit: 30
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: space-object-store-bucket-init
+        app.kubernetes.io/instance: {{ .Release.Name }}
+    spec:
+      restartPolicy: OnFailure
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: bucket-init
+          image: "{{ .Values.bucketInitImage.repository }}:{{ .Values.bucketInitImage.tag }}"
+          imagePullPolicy: {{ .Values.bucketInitImage.pullPolicy }}
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -eu
+              endpoint="http://{{ .Values.service.name }}:{{ .Values.service.s3Port }}"
+              s3() { aws --no-cli-pager --endpoint-url "$endpoint" "$@"; }
+              echo "waiting for the object store at $endpoint"
+              until s3 s3api list-buckets >/dev/null 2>&1; do
+                sleep 2
+              done
+              # Idempotent: an existing bucket (pod or Job re-run over the
+              # persisted hostPath) is left alone.
+              for bucket in {{ .Values.snapshotBucket }} {{ .Values.templateBucket }}; do
+                s3 s3api head-bucket --bucket "$bucket" >/dev/null 2>&1 \
+                  || s3 s3api create-bucket --bucket "$bucket"
+              done
+              s3 s3api list-buckets --query 'Buckets[].Name' --output text
+              echo "buckets {{ .Values.snapshotBucket }} + {{ .Values.templateBucket }} ready"
+          env:
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: space-object-store
+                  key: SPACE_OBJECT_STORE_STATIC_ACCESS_KEY_ID
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: space-object-store
+                  key: SPACE_OBJECT_STORE_STATIC_SECRET_ACCESS_KEY
+            - name: AWS_DEFAULT_REGION
+              value: {{ .Values.region | quote }}

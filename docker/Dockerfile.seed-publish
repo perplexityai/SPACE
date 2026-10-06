@@ -5,7 +5,7 @@
 # produced by infra/space/kind/scripts/build-seed.sh via the production seed
 # builder) and publishes it the way `space-builder publish` does —
 #
-#   1. upload the artifacts to the cluster object store (SeaweedFS locally,
+#   1. upload the artifacts to the cluster object store (versitygw locally,
 #      S3 in prod) under templates/<name>/<content_hash>/,
 #   2. register the template + release + tag + storage location through the
 #      real ClusterApi RPCs on space-internal-api.
@@ -46,7 +46,7 @@ FROM public.ecr.aws/docker/library/debian:bookworm-slim
 LABEL org.opencontainers.image.title="space-seed-publish"
 LABEL org.opencontainers.image.description="SPACE local kind seed template publisher (S3 upload + ClusterApi release registration)."
 
-# awscli talks the real S3 protocol to SeaweedFS (sigv4, path-style).
+# awscli talks the real S3 protocol to the object store (sigv4, path-style).
 RUN apt-get update && apt-get install -y --no-install-recommends \
       awscli ca-certificates \
     && rm -rf /var/lib/apt/lists/*

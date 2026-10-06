@@ -81,8 +81,8 @@ postgres:
 
 snapshotBucket: snapshots
 snapshotRegion: us-east-1
-snapshotEndpoint: http://seaweedfs:8333
-snapshotCredentialsSecretName: space-seaweedfs
+snapshotEndpoint: http://object-store:8333
+snapshotCredentialsSecretName: space-object-store
 
 # Per-reconciler env overrides. Empty defaults keep prod-equivalent intervals.
 reconcilers:

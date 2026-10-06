@@ -3466,7 +3466,7 @@ pub struct TransferExecutorConfig {
     /// Optional caller-supplied S3 credentials. When set, they are used
     /// directly instead of exchanging a SPACE subject for short-lived AWS
     /// credentials via credmgr. The volume-manager binary resolves these from
-    /// its deployment environment (e.g. a kind/SeaweedFS local stack) and injects
+    /// its deployment environment (e.g. the local kind stack) and injects
     /// them here; production leaves this `None` and uses the credmgr exchange.
     pub static_credentials: Option<pplx_space_object_store::ObjectCredentials>,
 }

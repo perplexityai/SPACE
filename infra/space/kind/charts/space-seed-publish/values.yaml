@@ -12,15 +12,15 @@ internalApi:
 internal:
   secretName: space-internal
 
-# Object store the seed artifacts are uploaded to. Same SeaweedFS the
+# Object store the seed artifacts are uploaded to. Same object store the
 # node-stack's volume-manager pulls from; the storage URI registered with the
 # release carries the endpoint + path-style so the pull path needs no extra
 # config.
 s3:
-  endpoint: http://seaweedfs:8333
+  endpoint: http://object-store:8333
   region: us-east-1
   bucket: templates
-  credentialsSecretName: space-seaweedfs
+  credentialsSecretName: space-object-store
 
 nodeSelector:
   space.pplx.net/infra: "true"

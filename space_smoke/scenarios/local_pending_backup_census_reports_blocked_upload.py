@@ -5,7 +5,7 @@ import space_smoke as smoke
 
 # The populated half of the contract is only observable with the upload
 # broken: a natural suspend is unbacked for seconds while the census fires
-# once a minute. SeaweedFS is scaled to zero for the suspend with its
+# once a minute. The object store is scaled to zero for the suspend with its
 # scale-back armed first and restored the moment the queue row is seen, so
 # the downtime stays inside the API's 300 s durable-suspend budget and the
 # transfer's fifth retry never runs against a dead store; the drain budget
@@ -13,7 +13,7 @@ import space_smoke as smoke
 # concurrently with another suspend-bearing smoke.
 @smoke.scenario(
     "local.pending_backup_census_reports_blocked_upload",
-    # Census budget 300 s plus a drain budget of 600 s, plus the SeaweedFS
+    # Census budget 300 s plus a drain budget of 600 s, plus the object store
     # scale-down and rollout.
     sandbox=smoke.SandboxConfig(timeout=1500),
 )
@@ -27,7 +27,7 @@ def pending_backup_census_reports_blocked_upload(test: smoke.KindEcw) -> None:
 
     census = test.pending_backup
 
-    with test.phase("block uploads: scale SeaweedFS to zero"):
+    with test.phase("block uploads: scale the object store to zero"):
         census.block_uploads()
 
     with test.phase("suspend as an operation; the snapshot stays in flight"):

@@ -1,6 +1,0 @@
-apiVersion: v2
-name: space-seaweedfs
-description: Local S3-compatible object store (SeaweedFS) for the KinD SPACE stack — backs real suspend/restore snapshot objects
-type: application
-version: 0.1.0
-appVersion: "4.31"

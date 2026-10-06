@@ -19,7 +19,7 @@
 #     symlink the canonical paths at the image layer.
 #
 # No seed template is baked here. Workers obtain `seed` through the
-# production template pull path (space-seed-publish Job → SeaweedFS →
+# production template pull path (space-seed-publish Job → object store →
 # ClusterApi.FindTemplateRelease → volume-manager PullFile).
 #
 # Build:

@@ -307,8 +307,8 @@ SELECT lifecycle, coalesce(active_node_id::text, '') FROM sandboxes WHERE id = '
 POD_CAP_QUOTA_NAME = "space-smoke-pod-cap"
 PUBLIC_API_DEPLOYMENT_SELECTOR = "app.kubernetes.io/name=space-api"
 KIND_REDIS_DEPLOYMENT = "space-redis"
-KIND_SEAWEEDFS_DEPLOYMENT = "space-seaweedfs"
-KIND_SEAWEEDFS_POD_SELECTOR = "app.kubernetes.io/name=space-seaweedfs"
+KIND_OBJECT_STORE_DEPLOYMENT = "space-object-store"
+KIND_OBJECT_STORE_POD_SELECTOR = "app.kubernetes.io/name=space-object-store"
 KIND_INTERNAL_API_SELECTOR = "app.kubernetes.io/name=space-internal-api"
 PENDING_BACKUP_QUEUE_SQL = """\
 SELECT artifact_id::text, artifact_kind FROM node_local_backup_pending
@@ -3143,41 +3143,41 @@ ON CONFLICT (key_hash) DO NOTHING;
 
     # --- pending-backup census ------------------------------------------------
 
-    def seaweedfs_replicas(self) -> int:
+    def object_store_replicas(self) -> int:
         previous = _require_ok(
             self.kubectl(
-                "get", "deploy", KIND_SEAWEEDFS_DEPLOYMENT, "-o", "jsonpath={.spec.replicas}", timeout=15
+                "get", "deploy", KIND_OBJECT_STORE_DEPLOYMENT, "-o", "jsonpath={.spec.replicas}", timeout=15
             ),
-            "read SeaweedFS replicas",
+            "read object-store replicas",
         ).strip()
         return int(previous) if previous.isdigit() else 1
 
-    def scale_seaweedfs(self, replicas: int) -> int:
-        self._require_isolated_kind("SeaweedFS scaling")
+    def scale_object_store(self, replicas: int) -> int:
+        self._require_isolated_kind("object-store scaling")
         if replicas < 0 or replicas > 1:
-            raise ValueError(f"refusing to scale SeaweedFS to {replicas} replicas")
-        previous = self.seaweedfs_replicas()
+            raise ValueError(f"refusing to scale the object store to {replicas} replicas")
+        previous = self.object_store_replicas()
         _require_ok(
             self.kubectl(
-                "scale", f"deploy/{KIND_SEAWEEDFS_DEPLOYMENT}", f"--replicas={replicas}", timeout=30
+                "scale", f"deploy/{KIND_OBJECT_STORE_DEPLOYMENT}", f"--replicas={replicas}", timeout=30
             ),
-            f"scale SeaweedFS to {replicas}",
+            f"scale the object store to {replicas}",
         )
         return previous
 
-    def wait_seaweedfs_gone(self, *, timeout: float) -> None:
+    def wait_object_store_gone(self, *, timeout: float) -> None:
         self.kubectl(
-            "wait", "--for=delete", "pod", "-l", KIND_SEAWEEDFS_POD_SELECTOR,
+            "wait", "--for=delete", "pod", "-l", KIND_OBJECT_STORE_POD_SELECTOR,
             f"--timeout={int(timeout)}s", timeout=timeout + 15,
         )
 
-    def wait_seaweedfs_rollout(self, *, timeout: float) -> None:
+    def wait_object_store_rollout(self, *, timeout: float) -> None:
         _require_ok(
             self.kubectl(
-                "rollout", "status", f"deploy/{KIND_SEAWEEDFS_DEPLOYMENT}",
+                "rollout", "status", f"deploy/{KIND_OBJECT_STORE_DEPLOYMENT}",
                 f"--timeout={int(timeout)}s", timeout=timeout + 30,
             ),
-            "await the SeaweedFS rollout",
+            "await the object-store rollout",
         )
 
     def log_since_time(self) -> str:
