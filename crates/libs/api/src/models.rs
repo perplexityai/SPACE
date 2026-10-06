@@ -1136,20 +1136,6 @@ pub struct TemplateFilters {
     pub org_id: Option<OrgId>,
 }
 
-/// Merged credential for the internal sandbox route (user overrides org).
-/// Carries the sealed document and wrapped DEK plus the identity needed to
-/// decrypt it: `user_id` is the owning user for user-scoped rows and
-/// absent for org-scoped ones (the org comes from the sandbox itself).
-/// `id` is the row id, which is the AAD the document was sealed under.
-#[derive(Debug, Serialize)]
-pub struct MergedCredential {
-    pub id: Uuid,
-    pub key: String,
-    pub sealed: Vec<u8>,
-    pub wrapped_key: Vec<u8>,
-    pub user_id: Option<UserId>,
-}
-
 /// An opaque credential-provider grant stored for a federated-owned sandbox.
 ///
 /// `grant_blob` is opaque bearer-style material SPACE never parses; it is a secret
