@@ -75,7 +75,7 @@ impl ServerTransport {
         S: Stream<Item = Result<TcpStream, io::Error>> + Send + 'static,
     {
         let transport = self.clone();
-        incoming
+        let accepted = incoming
             .map(move |socket| {
                 let transport = transport.clone();
                 async move {
@@ -96,8 +96,23 @@ impl ServerTransport {
                 }
             })
             .buffer_unordered(MAX_PENDING_HANDSHAKES)
-            .filter_map(|result| async move { result.transpose() })
-            .take_until(shutdown.cancelled_owned())
+            .filter_map(|result| async move { result.transpose() });
+        // Tonic keeps this stream until accepted connections drain, and
+        // `take_until` would only stop polling it. Dropping it at shutdown
+        // closes the listener and pending handshakes, so an `SO_REUSEPORT`
+        // successor receives every new connection.
+        let mut accepted = Some(Box::pin(accepted));
+        let mut shutdown = Box::pin(shutdown.cancelled_owned());
+        futures_util::stream::poll_fn(move |cx| {
+            let Some(stream) = accepted.as_mut() else {
+                return Poll::Ready(None);
+            };
+            if shutdown.as_mut().poll(cx).is_ready() {
+                accepted = None;
+                return Poll::Ready(None);
+            }
+            stream.as_mut().poll_next(cx)
+        })
     }
 
     async fn accept(&self, socket: TcpStream) -> io::Result<Connection> {
