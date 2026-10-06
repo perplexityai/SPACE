@@ -38,7 +38,7 @@ fn invalid_ecr_configuration_prevents_service_startup() {
     ));
 }
 
-type PublishCall = (String, String, Vec<String>, Option<TemplateOrg>);
+type PublishCall = (String, String, Vec<String>, TemplatePublication);
 
 impl BuildManagerDaemonService {
     pub(crate) fn with_backend(
@@ -103,7 +103,7 @@ struct MockBuildBackend {
     build_results: Mutex<VecDeque<Result<BuildOutcome, BuildError>>>,
     build_calls: Mutex<Vec<String>>,
     cluster_template_results: Mutex<VecDeque<Result<(), PublishError>>>,
-    cluster_template_calls: Mutex<Vec<(String, Option<TemplateOrg>)>>,
+    cluster_template_calls: Mutex<Vec<(String, TemplatePublication)>>,
     publish_results: Mutex<VecDeque<Result<(), PublishError>>>,
     publish_calls: Mutex<Vec<PublishCall>>,
     prune_calls: Mutex<Vec<(String, String)>>,
@@ -162,12 +162,12 @@ impl BuildBackend for MockBuildBackend {
     async fn ensure_cluster_template(
         &self,
         template_id: &str,
-        template_org: Option<TemplateOrg>,
+        publication: TemplatePublication,
     ) -> Result<(), PublishError> {
         self.cluster_template_calls
             .lock()
             .unwrap()
-            .push((template_id.to_string(), template_org));
+            .push((template_id.to_string(), publication));
         self.cluster_template_results
             .lock()
             .unwrap()
@@ -194,7 +194,7 @@ impl BuildBackend for MockBuildBackend {
             self.cluster_template_calls
                 .lock()
                 .unwrap()
-                .contains(&(template_id.to_string(), template_org)),
+                .iter().any(|(name, publication)| name == template_id && publication.org() == template_org),
             "the persisted caller org must reach both template registration and base materialization"
         );
         self.build_calls
@@ -213,13 +213,13 @@ impl BuildBackend for MockBuildBackend {
         template_id: &str,
         content_hash: &str,
         publish_tags: &[String],
-        template_org: Option<TemplateOrg>,
+        publication: TemplatePublication,
     ) -> Result<(), PublishError> {
         self.publish_calls.lock().unwrap().push((
             template_id.to_string(),
             content_hash.to_string(),
             publish_tags.to_vec(),
-            template_org,
+            publication,
         ));
         self.publish_results
             .lock()
@@ -234,7 +234,7 @@ impl BuildBackend for BlockingBuildBackend {
     async fn ensure_cluster_template(
         &self,
         _template_id: &str,
-        _template_org: Option<TemplateOrg>,
+        _publication: TemplatePublication,
     ) -> Result<(), PublishError> {
         Ok(())
     }
@@ -266,7 +266,7 @@ impl BuildBackend for BlockingBuildBackend {
         _template_id: &str,
         _content_hash: &str,
         _publish_tags: &[String],
-        _template_org: Option<TemplateOrg>,
+        _publication: TemplatePublication,
     ) -> Result<(), PublishError> {
         Ok(())
     }
@@ -453,6 +453,7 @@ fn start_build_request(
     publish_tags: Vec<String>,
 ) -> StartBuildRequest {
     StartBuildRequest {
+        system_publication_grant_id: None,
         recipe,
         template_id: template_id.to_string(),
         options: Some(BuildOptions {
@@ -476,6 +477,7 @@ fn build_job_payload(template_id: &str) -> BuildJobPayload {
         force: false,
         publish_tags: vec![],
         template_org: None,
+        system_publication_grant_id: None,
     }
 }
 
@@ -585,47 +587,52 @@ async fn build_defaults_to_publish_enabled() -> TestResult {
             "seed".to_string(),
             "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
             vec!["latest".to_string()],
-            None,
+            TemplatePublication::System(None),
         )]
     );
     Ok(())
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn build_publish_carries_template_org() -> TestResult {
-    let backend = MockBuildBackend::with_build_result(Ok(BuildOutcome {
-        content_hash: Some(
-            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
-        ),
-    }));
-    let service = BuildManagerDaemonService::with_backend(1, backend.clone())?;
-    let org_id = "018f0000-0000-7000-8000-000000000002";
-    let mut request = start_build_request(Some(test_recipe()), "seed", vec!["latest".to_string()]);
-    request.org_id = Some(org_id.to_string());
-
-    let response = service
-        .start_build(authorized_request(request))
-        .await?
-        .into_inner();
-
-    let status = wait_for_terminal_status(&service, &response.job_id).await?;
-    assert_eq!(
-        BuildState::try_from(status.state).expect("known build state"),
-        BuildState::Succeeded
-    );
-    assert_eq!(
-        backend.cluster_template_calls.lock().unwrap().as_slice(),
-        &[("seed".to_string(), Some(TemplateOrg::parse(org_id)?))]
-    );
-    assert_eq!(
-        backend.publish_calls.lock().unwrap().as_slice(),
-        &[(
-            "seed".to_string(),
-            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
+async fn build_publish_carries_publication_authority() -> TestResult {
+    let org = TemplateOrg::parse("018f0000-0000-7000-8000-000000000002")?;
+    let grant = SystemPublicationGrantId::new();
+    for publication in [
+        TemplatePublication::Tenant(org),
+        TemplatePublication::System(Some(grant)),
+    ] {
+        let hash = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let backend = MockBuildBackend::with_build_result(Ok(BuildOutcome {
+            content_hash: Some(hash.to_string()),
+        }));
+        let service = BuildManagerDaemonService::with_backend(1, backend.clone())?;
+        let mut request = start_build_request(
+            Some(test_recipe()),
+            "scope-output",
             vec!["latest".to_string()],
-            Some(TemplateOrg::parse(org_id)?),
-        )]
-    );
+        );
+        request.org_id = publication.org().map(|org| org.org_id().to_string());
+        request.system_publication_grant_id = publication.system_grant().map(|id| id.to_string());
+        let response = service
+            .start_build(authorized_request(request))
+            .await?
+            .into_inner();
+        let status = wait_for_terminal_status(&service, &response.job_id).await?;
+        assert_eq!(BuildState::try_from(status.state)?, BuildState::Succeeded);
+        assert_eq!(
+            backend.cluster_template_calls.lock().unwrap().as_slice(),
+            &[("scope-output".to_string(), publication)]
+        );
+        assert_eq!(
+            backend.publish_calls.lock().unwrap().as_slice(),
+            &[(
+                "scope-output".to_string(),
+                hash.to_string(),
+                vec!["latest".to_string()],
+                publication
+            )]
+        );
+    }
     Ok(())
 }
 

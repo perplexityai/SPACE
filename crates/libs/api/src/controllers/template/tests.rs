@@ -154,7 +154,7 @@ async fn build_admission_authorizes_and_pins_the_base_release(
     accepted.authorize_base(&db.pool).await?;
     sqlx::query(sql!("UPDATE template_release_tags SET template_release_id = (SELECT id FROM template_releases WHERE hash = $1) WHERE template_name = 'private-base' AND tag = 'stable'"))
         .bind(&hash_b).execute(&db.pool).await?;
-    let request = accepted.into_start_build_request();
+    let request = accepted.into_start_build_request(None);
     let Some(recipe) = request.recipe else {
         panic!("inline recipe")
     };
@@ -587,7 +587,7 @@ fn template_build_submission_maps_to_builder_request(#[case] system: Option<Syst
         },
         org_id: OrgId::from_uuid(org_id),
     }
-    .into_start_build_request();
+    .into_start_build_request(None);
 
     assert_eq!(
         request.template_id,
@@ -655,4 +655,62 @@ fn template_build_status_not_found_is_not_transient() {
         )),
         None
     );
+}
+
+/// A system build records its publication grant before dispatch and withdraws
+/// it when dispatch fails, so a submission that never reached a builder
+/// authorizes no publication; an organization build records none. Recording
+/// sweeps stale grants, which is how this test observes that it happened.
+#[tokio::test]
+async fn system_build_withdraws_its_publication_grant_when_dispatch_fails() -> TestDbResult<()> {
+    let db = pg_test_db().await?;
+    let substrate = Substrate::Direct(Box::new(
+        crate::controllers::substrate::direct::DirectSubstrate::new(db.pool.clone()),
+    ));
+    let controller = TemplateController::new(substrate, db.pool.clone());
+    let insert_stale_grant = || {
+        sqlx::query(sql!(
+            "INSERT INTO template_system_publication_grants (id, template_name, granted_at)
+             VALUES ($1, 'seed', NOW() - INTERVAL '8 days')"
+        ))
+        .bind(Uuid::now_v7())
+        .execute(&db.pool)
+    };
+    let grants = || {
+        sqlx::query_scalar::<_, i64>(sql!(
+            "SELECT COUNT(*) FROM template_system_publication_grants"
+        ))
+        .fetch_one(&db.pool)
+    };
+    let submission = |target| TemplateBuildSubmission {
+        target,
+        client_build_id: None,
+        recipe: build_proto::Recipe::default(),
+        force: false,
+        publish_tags: vec![],
+        client: ClientContext::default(),
+        org_id: TEST_ORG,
+    };
+
+    insert_stale_grant().await?;
+    controller
+        .submit_template_build(submission(TemplateBuildTarget::Organization(
+            TemplateName::parse("tenant-output").unwrap(),
+        )))
+        .await
+        .expect_err("no builder node is registered");
+    assert_eq!(grants().await?, 1, "an organization build records no grant");
+
+    controller
+        .submit_template_build(submission(TemplateBuildTarget::System(
+            SystemTemplate::Seed,
+        )))
+        .await
+        .expect_err("no builder node is registered");
+    assert_eq!(
+        grants().await?,
+        0,
+        "the system build swept the stale grant and withdrew its own"
+    );
+    Ok(())
 }

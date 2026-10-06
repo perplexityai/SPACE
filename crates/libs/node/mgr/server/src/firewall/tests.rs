@@ -581,6 +581,18 @@ fn guest_vlan_counter_combines_both_ingress_representations() {
     assert_eq!(guest_vlan_counter(None), 0);
 }
 
+fn stale_gateway_mac_rule() -> serde_json::Value {
+    serde_json::json!({
+        "comment": "accept-stale-gateway-mac",
+        "expr": [
+            {"match": {"left": {"meta": {"key": "protocol"}}, "right": {"set": [2048, 2054]}, "op": "=="}},
+            {"match": {"left": {"meta": {"key": "pkttype"}}, "right": "other", "op": "=="}},
+            {"counter": {"packets": 3, "bytes": 180}},
+            {"mangle": {"key": {"meta": {"key": "pkttype"}}, "value": "host"}}
+        ]
+    })
+}
+
 #[test]
 fn guest_l2_ingress_validator_requires_both_drop_forms() {
     let rule = |left: serde_json::Value| {
@@ -602,6 +614,7 @@ fn guest_l2_ingress_validator_requires_both_drop_forms() {
         serde_json::json!({"rule": rule(serde_json::json!({
             "payload": {"protocol": "ether", "field": "type"}
         }))}),
+        serde_json::json!({"rule": stale_gateway_mac_rule()}),
     ]);
     let valid = serde_json::json!({"nftables": entries});
     validate_guest_l2_ingress_chain(&valid).unwrap();
@@ -623,6 +636,7 @@ add chain netdev sandbox_l2 ingress { type filter hook ingress device "tap0" pri
 flush chain netdev sandbox_l2 ingress
 add rule netdev sandbox_l2 ingress meta protocol { 0x8100, 0x88a8 } counter drop comment "drop-guest-vlan"
 add rule netdev sandbox_l2 ingress ether type { 0x8100, 0x88a8 } counter drop comment "drop-guest-vlan"
+add rule netdev sandbox_l2 ingress meta protocol { 0x0800, 0x0806 } meta pkttype other counter meta pkttype set host comment "accept-stale-gateway-mac"
 "#
     );
 }
@@ -665,6 +679,32 @@ fn guest_l2_ingress_validator_accepts_live_nft_versions_and_checks_native_bindin
                 "/nftables/2/rule/expr/1",
                 serde_json::json!({"accept": null}),
             ),
+            // The stale gateway MAC rule: IPv4 and ARP only, only frames for
+            // another host, reclassified as for this one, and no verdict.
+            (
+                "/nftables/4/rule/expr/0/match/right",
+                serde_json::json!({"set": ["ip"]}),
+            ),
+            (
+                "/nftables/4/rule/expr/0/match/right",
+                serde_json::json!({"set": ["ip", "arp", "ip6"]}),
+            ),
+            (
+                "/nftables/4/rule/expr/1/match/right",
+                serde_json::json!("broadcast"),
+            ),
+            (
+                "/nftables/4/rule/expr/3/mangle/value",
+                serde_json::json!("other"),
+            ),
+            (
+                "/nftables/4/rule/expr/3",
+                serde_json::json!({"accept": null}),
+            ),
+            (
+                "/nftables/4/rule/comment",
+                serde_json::json!("drop-guest-vlan"),
+            ),
         ] {
             let mut invalid = valid.clone();
             *invalid.pointer_mut(path).unwrap() = value;
@@ -676,12 +716,25 @@ fn guest_l2_ingress_validator_accepts_live_nft_versions_and_checks_native_bindin
         ] {
             let mut equivalent = valid.clone();
             for entry in equivalent["nftables"].as_array_mut().unwrap() {
-                if let Some(rule) = entry.get_mut("rule") {
+                if let Some(rule) = entry.get_mut("rule")
+                    && rule["comment"] == "drop-guest-vlan"
+                {
                     rule["expr"][0]["match"]["right"]["set"] = protocols.clone();
                 }
             }
             validate_guest_l2_ingress_chain(&equivalent).unwrap();
         }
+        // nft may print the stale gateway MAC rule's values as numbers.
+        let mut numeric = valid.clone();
+        numeric["nftables"][4]["rule"]["expr"][0]["match"]["right"]["set"] =
+            serde_json::json!([2054, 2048]);
+        numeric["nftables"][4]["rule"]["expr"][1]["match"]["right"] = serde_json::json!(3);
+        numeric["nftables"][4]["rule"]["expr"][3]["mangle"]["value"] = serde_json::json!(0);
+        validate_guest_l2_ingress_chain(&numeric).unwrap();
+        // The VLAN drops must come first.
+        let mut reordered = valid.clone();
+        reordered["nftables"].as_array_mut().unwrap().swap(2, 4);
+        assert!(validate_guest_l2_ingress_chain(&reordered).is_err());
         let mut missing_rule = valid;
         missing_rule["nftables"].as_array_mut().unwrap().pop();
         assert!(validate_guest_l2_ingress_chain(&missing_rule).is_err());

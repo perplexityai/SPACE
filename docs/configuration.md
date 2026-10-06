@@ -121,6 +121,7 @@ because disabling it by mistake would leave every create queued forever.
 | `SPACE_API_CLIENT_CLASSES` | empty | JSON map; invalid JSON fails startup. |
 | `SPACE_CLUSTER_ACTIVATION_ADMISSION_ENABLED` | on | Fails open (with a warning) when `SPACE_REDIS_URL` is unset. |
 | `SPACE_CLUSTER_ACTIVATION_ADMISSION_REFILL_RPS` | 60 | |
+| `SPACE_NATIVE_CREATE_POOL_CLAIM_ENABLED` | off | Env master for claiming a ready warm-pool slot when `POST /v1/sandboxes` admits a create, under the `space-native-create-pool-claim` flag (falls back off). Every `space-cluster-controller` replica must understand claim-carrying create payloads before this is turned on. |
 | `SPACE_REDIS_URL` | unset | |
 | `SPACE_SHARED_VALKEY_URL` | unset | Unset disables the consumer. |
 | `SPACE_GRPC_CLIENT_MAX_CONNECTION_AGE_SECS` | off | |
@@ -142,13 +143,38 @@ because disabling it by mistake would leave every create queued forever.
 | `SPACE_TEMPLATE_CACHE_BUDGET_BYTES` | 100 GiB | 0 or an invalid value disables cache GC. |
 | `SPACE_TEMPLATE_BUILD_DISK_MIB` | build-manager default | JSON. |
 | `SPACE_TRUSTED_TEMPLATE_STORAGE_BUCKETS` | empty = any bucket | |
-| `SPACE_TEMPLATE_PUBLISH_SYSTEM_SERVICE_ACCOUNTS`, `SPACE_TEMPLATE_PUBLISH_TENANT_SERVICE_ACCOUNTS` | empty | Startup error when the allowed set is empty. |
+| `SPACE_TEMPLATE_PUBLISH_SYSTEM_SERVICE_ACCOUNTS`, `SPACE_TEMPLATE_PUBLISH_TENANT_SERVICE_ACCOUNTS` | empty | Startup error when the allowed set is empty. An account in both lists (build-manager) must present the grant issued for that system build by the API or a system-only operator; each grant authorizes one release. |
 | `SPACE_BUILD_AUTH_SYSTEM_SERVICE_ACCOUNTS`, `SPACE_BUILD_AUTH_TENANT_SERVICE_ACCOUNTS` | empty | |
 | `SPACE_BUILD_MANAGER_ENDPOINT` | `127.0.0.1:9900` | |
 | `SPACE_BUILD_MANAGER_TLS_SERVER_NAME` | from endpoint | |
 | `SPACE_BUILD_MANAGER_AUTH_ALLOWED_SERVICE_ACCOUNTS` | empty | |
 | `SPACE_BUILDER_ECR_REPOSITORIES` | unset | JSON. |
 | `SPACE_UBUNTU_APT_MIRROR` | `https://archive.ubuntu.com/ubuntu` | |
+
+For direct `space-buildmgr build` calls without `--org-id`, configure
+`SPACE_INTERNAL_API_ENDPOINT` and `SPACE_CLUSTER_API_TOKEN_PATH` in the CLI's
+process. The projected token must identify an account in the system publication
+list only. The CLI obtains a grant before submitting the build and sends it with
+the job; build-manager's dual-authority credential cannot issue grants. Configure
+`SPACE_BUILD_MANAGER_TOKEN_PATH` separately for permission to submit builds.
+Direct operator builds may still use custom system template names. API system
+builds remain limited to `seed` and `code-runtime` at the node gateway.
+
+The grant follows the persisted build job through template and release
+registration, expires after seven days, and is consumed only when the release
+transaction commits. A failed API dispatch revokes only its own grant. Grants
+left by failed direct submissions expire and are swept when a new grant is issued.
+With no ClusterApi endpoint configured, the CLI retains local-only build behavior;
+cluster publication requires the operator configuration above.
+
+Pause system build submissions and drain older system jobs before rolling out
+ClusterApi's grant enforcement. Apply the grant-table migration and role
+bootstrap first, upgrade build-manager and the node-api gateway, then upgrade
+the API and ClusterApi before resuming submissions. The gateway must understand
+the new field to forward each build's grant. Resubmit any older queued system
+jobs that could not be drained: jobs without a grant cannot publish through a
+dual-authority account after the rollout. System-only deployment publishers
+retain their existing publication authority.
 
 ## Object storage and snapshots
 

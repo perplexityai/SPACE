@@ -111,6 +111,12 @@ pub(super) const ENC_SNAPSHOT_JAIL_SUBDIR: &str = "encsnap";
 /// guards against an unexpected unmount that never reports "not mounted".
 const MAX_ENC_SNAPSHOT_BIND_DRAIN: usize = 8;
 
+/// Retries of the post-capture runtime stop. Firecracker can still be in kernel
+/// exit (KVM teardown) when the supervisor's cgroup removal gives up; the stop
+/// is idempotent, so re-issuing it once the exit finishes completes the seal.
+const ENC_CAPTURE_STOP_ATTEMPTS: usize = 8;
+const ENC_CAPTURE_STOP_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
+
 /// File names Firecracker writes into (suspend) and reads from (restore) the
 /// encrypted snapshot volume. Shared by the FC API paths and the load-side
 /// re-own list so they cannot drift apart.
@@ -133,6 +139,26 @@ fn reown_encrypted_snapshot_inputs(volume: &std::fs::File, uid: u32) -> Result<(
     reown(&vmstate, uid)?;
     reown(&memory, uid)?;
     reown(volume, uid)
+}
+
+/// Pin both ends of the encrypted-snapshot bind before re-owning the volume.
+/// The jail root belongs to the sandbox uid, so its mountpoint is opened
+/// relative to the pinned jail rather than looked up again by pathname.
+fn pin_encrypted_snapshot_bind(
+    mount_dir: &Path,
+    jail_root: &Path,
+    reown: impl FnOnce(&std::fs::File, u32) -> Result<(), Status>,
+) -> Result<(std::fs::File, std::fs::File), Status> {
+    let volume = super::trusted_paths::open_directory(mount_dir)?;
+    let jail = super::trusted_paths::open_directory(jail_root)?;
+    let uid = jail
+        .metadata()
+        .map_err(|e| Status::internal(e.to_string()))?
+        .uid();
+    let target =
+        super::trusted_paths::open_bind_directory(&jail, ENC_SNAPSHOT_JAIL_SUBDIR.as_ref())?;
+    reown(&volume, uid)?;
+    Ok((volume, target))
 }
 
 fn stage_plaintext_snapshot_inputs(
@@ -428,20 +454,13 @@ impl NodeManagerService {
             async move {
                 let _guard = guard;
                 let bind = {
-                    let jail_bind = jail_bind.clone();
                     tokio::task::spawn_blocking(move || -> Result<(), Status> {
-                        let volume = super::trusted_paths::open_directory(Path::new(&mount_dir))?;
-                        let jail = super::trusted_paths::open_directory(Path::new(&jail_root))?;
-                        let uid = jail
-                            .metadata()
-                            .map_err(|e| Status::internal(e.to_string()))?
-                            .uid();
-                        super::trusted_paths::reown(&volume, uid)?;
-                        std::fs::create_dir_all(&jail_bind).map_err(|e| {
-                            Status::internal(format!("create encrypted-snapshot jail dir: {e}"))
-                        })?;
-                        super::trusted_paths::bind_pinned(&volume, Path::new(&jail_bind))?;
-                        Ok(())
+                        let (volume, target) = pin_encrypted_snapshot_bind(
+                            Path::new(&mount_dir),
+                            Path::new(&jail_root),
+                            super::trusted_paths::reown,
+                        )?;
+                        super::trusted_paths::bind_pinned_files(&volume, &target)
                     })
                     .await
                     .map_err(|e| {
@@ -489,7 +508,7 @@ impl NodeManagerService {
                 // Stop the runtime to drop the mmap, then drain any remaining
                 // encsnap bind, so the volume can be sealed. Both are no-ops for
                 // a fresh capture (no restore pin).
-                stop_sandbox_runtime_with_supervisor(&service, &sandbox_id, true, None).await?;
+                stop_runtime_for_encrypted_seal(&service, &sandbox_id).await?;
                 let _ = tokio::task::spawn_blocking(move || {
                     for _ in 0..MAX_ENC_SNAPSHOT_BIND_DRAIN {
                         match unmount_if_present(&jail_bind) {
@@ -576,24 +595,16 @@ impl NodeManagerService {
             .filter(|p| !p.is_empty())
         {
             super::trusted_paths::validate_snapshot_volume(&req.sandbox_id, mount_dir)?;
-            let jail_bind = format!("{jail_root}/{ENC_SNAPSHOT_JAIL_SUBDIR}");
             {
-                let jail_bind = jail_bind.clone();
                 let jail_root = jail_root.clone();
                 let mount_dir = mount_dir.to_string();
                 self.off_runtime("bind encrypted snapshot volume", move || {
-                    let volume = super::trusted_paths::open_directory(Path::new(&mount_dir))?;
-                    let jail = super::trusted_paths::open_directory(Path::new(&jail_root))?;
-                    let uid = jail
-                        .metadata()
-                        .map_err(|e| Status::internal(e.to_string()))?
-                        .uid();
-                    reown_encrypted_snapshot_inputs(&volume, uid)?;
-                    std::fs::create_dir_all(&jail_bind).map_err(|e| {
-                        Status::internal(format!("create encrypted-snapshot jail dir: {e}"))
-                    })?;
-                    super::trusted_paths::bind_pinned(&volume, Path::new(&jail_bind))?;
-                    Ok(())
+                    let (volume, target) = pin_encrypted_snapshot_bind(
+                        Path::new(&mount_dir),
+                        Path::new(&jail_root),
+                        reown_encrypted_snapshot_inputs,
+                    )?;
+                    super::trusted_paths::bind_pinned_files(&volume, &target)
                 })
                 .await?;
             }
@@ -1235,6 +1246,35 @@ pub(super) async fn set_firecracker_paused(
             "Firecracker did not {} the VM within {timeout:?}",
             if paused { "pause" } else { "resume" }
         ))),
+    }
+}
+
+/// Stops the runtime before the encrypted seal, re-issuing the idempotent stop
+/// while it fails server-side because the killed Firecracker is still exiting.
+/// Any server-side `Internal` is retried, so a persistent cgroup error surfaces
+/// only after the bounded attempts.
+async fn stop_runtime_for_encrypted_seal(
+    service: &NodeManagerService,
+    sandbox_id: &str,
+) -> Result<(), Status> {
+    let mut attempt = 1;
+    loop {
+        match stop_sandbox_runtime_with_supervisor(service, sandbox_id, true, None).await {
+            Ok(_) => return Ok(()),
+            Err(error)
+                if error.code() == tonic::Code::Internal && attempt < ENC_CAPTURE_STOP_ATTEMPTS =>
+            {
+                tracing::warn!(
+                    sandbox_id,
+                    attempt,
+                    %error,
+                    "post-capture runtime stop incomplete; retrying before seal"
+                );
+                attempt += 1;
+                tokio::time::sleep(ENC_CAPTURE_STOP_RETRY_DELAY).await;
+            }
+            Err(error) => return Err(error),
+        }
     }
 }
 

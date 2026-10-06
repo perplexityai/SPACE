@@ -844,7 +844,7 @@ pub(super) fn e2b_metadata_value(value: &SandboxMetadataValue) -> String {
     }
 }
 
-pub(super) fn translate_sandbox_state(native: &SandboxResponse) -> Option<SandboxStateE2b> {
+pub(crate) fn translate_sandbox_state(native: &SandboxResponse) -> Option<SandboxStateE2b> {
     translate_lifecycle_state(raw_sandbox_lifecycle(native))
 }
 

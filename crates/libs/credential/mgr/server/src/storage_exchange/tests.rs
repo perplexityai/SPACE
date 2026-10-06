@@ -3,7 +3,8 @@ use pplx_space_common_core::types::SnapshotId;
 use std::collections::HashMap;
 
 use pplx_space_common_svc::core::types::{
-    K8sNodeName, K8sNodeUid, OrgId, SandboxId, StorageUri, TemplateName, snapshot_shard,
+    ContentHash, K8sNodeName, K8sNodeUid, OrgId, SandboxId, StorageUri, TemplateName,
+    snapshot_shard,
 };
 
 use super::*;
@@ -14,6 +15,7 @@ use crate::storage_vend_store::{SandboxNodeIdentity, SandboxStorageContext, Stor
 struct TestStore {
     sandboxes: HashMap<SandboxId, SandboxStorageContext>,
     templates: HashMap<TemplateName, Option<OrgId>>,
+    published: Vec<(TemplateName, ContentHash)>,
     identities: HashMap<OrgId, StorageVendIdentity>,
 }
 
@@ -32,6 +34,17 @@ impl StorageVendStore for TestStore {
         template: &TemplateName,
     ) -> Result<Option<Option<OrgId>>, StorageVendStoreError> {
         Ok(self.templates.get(template).copied())
+    }
+
+    async fn template_release_published(
+        &self,
+        template: &TemplateName,
+        hash: &ContentHash,
+    ) -> Result<bool, StorageVendStoreError> {
+        Ok(self
+            .published
+            .iter()
+            .any(|(name, published)| name == template && published == hash))
     }
 
     async fn org_vend_identity(
@@ -229,6 +242,62 @@ async fn template_publication_is_builder_only() {
             .as_str(),
         role
     );
+}
+
+/// A registered release is immutable: the builder identity may publish a
+/// template once per hash and never rewrite an existing release prefix, no
+/// matter which template it names. Reads of the published release and the
+/// first publication of a new hash are unaffected.
+#[tokio::test]
+async fn builder_cannot_rewrite_a_published_release() {
+    let template = TemplateName::parse("seed").unwrap();
+    let published_hash: ContentHash = format!("sha256:{}", "ab".repeat(32)).parse().unwrap();
+    let store = TestStore {
+        templates: HashMap::from([(template.clone(), None)]),
+        published: vec![(template.clone(), published_hash)],
+        ..Default::default()
+    };
+    let builder = caller(ClientService::BuildManager, "builder", "builder-uid");
+
+    let error = authorize_exchange(
+        &store,
+        &builder,
+        template_request(&template, STORAGE_WRITE_SCOPE),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        StorageExchangeError::ReleaseAlreadyPublished
+    ));
+
+    let mut object = template_request(&template, STORAGE_WRITE_SCOPE);
+    object.resource =
+        format!("arn:aws:s3:::space-snapshots/templates/{template}/{published_hash}/rootfs.ext4");
+    let error = authorize_exchange(&store, &builder, object)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        StorageExchangeError::ReleaseAlreadyPublished
+    ));
+
+    let mut unpublished = template_request(&template, STORAGE_WRITE_SCOPE);
+    unpublished.resource = format!(
+        "arn:aws:s3:::space-snapshots/templates/{template}/sha256:{}/*",
+        "cd".repeat(32)
+    );
+    authorize_exchange(&store, &builder, unpublished)
+        .await
+        .expect("first publication of a new hash is allowed");
+
+    authorize_exchange(
+        &store,
+        &caller(ClientService::TemplateManager, "worker-a", "worker-a-uid"),
+        template_request(&template, STORAGE_READ_SCOPE),
+    )
+    .await
+    .expect("published releases stay readable");
 }
 
 #[tokio::test]

@@ -20,6 +20,21 @@ pub enum CreatePathOutcome {
     Error,
 }
 
+/// What admitting a native create did about a warm-pool slot.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum AdmissionClaimOutcome {
+    /// A ready slot was claimed and the create took its reserved ID.
+    Hit,
+    /// The create was eligible, but no ready slot (or no template release)
+    /// was available; it was admitted cold.
+    Miss,
+    /// The request cannot adopt a slot, or admission could not establish
+    /// that it can; it was admitted cold.
+    Ineligible,
+    /// Admission-time claiming is turned off.
+    Disabled,
+}
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum ReservationOutcome {
     Reserved,
@@ -116,6 +131,17 @@ impl CreatePathOutcome {
             Self::ColdFallback => "cold_fallback",
             Self::ColdDirect => "cold_direct",
             Self::Error => "error",
+        }
+    }
+}
+
+impl AdmissionClaimOutcome {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Hit => "hit",
+            Self::Miss => "miss",
+            Self::Ineligible => "ineligible",
+            Self::Disabled => "disabled",
         }
     }
 }
@@ -405,6 +431,16 @@ pub fn create_path(sample: CreatePath<'_>) {
         "warm_pool.create_path.post_claim.duration_ms",
         (total_duration_ms - sample.claim_duration_ms).max(0.0),
         &tags,
+    );
+}
+
+/// One native create admitted, by what admission did about a warm-pool slot.
+/// Tagged by outcome only: no template, sandbox, or org identifiers.
+pub fn admission_claim(outcome: AdmissionClaimOutcome) {
+    counter(
+        "warm_pool.admission_claim",
+        1,
+        &[tag("outcome", outcome.as_str())],
     );
 }
 

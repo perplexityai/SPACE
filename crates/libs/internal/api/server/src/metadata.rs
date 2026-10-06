@@ -1392,19 +1392,36 @@ pub(super) async fn ensure_template_release(
     Ok(existing)
 }
 
+/// Find the release for `(template_name, hash)` under either spelling of the
+/// hash. `hash` arrives canonical (`sha256:<hex>`); releases registered before
+/// the prefix was required are stored bare, and a republication of one of
+/// those must attach its tags to that row rather than create a second,
+/// artifact-less release beside it.
+///
+/// Where both spellings already exist, the row that owns a recorded storage
+/// location wins regardless of age: tags attached to an artifact-less
+/// duplicate would resolve to a release nothing can pull. Age breaks ties.
 async fn find_template_release_row(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     template_name: &str,
     hash: &str,
 ) -> Result<Option<TemplateReleaseRow>, Status> {
+    let bare_hash = hash.strip_prefix("sha256:").unwrap_or(hash);
     sqlx::query_as::<_, TemplateReleaseRow>(sql!(
-        "SELECT id, template_name, type, hash, org_id, created_at
-         FROM template_releases
-         WHERE template_name = $1
-           AND hash = $2"
+        "SELECT r.id, r.template_name, r.type, r.hash, r.org_id, r.created_at
+         FROM template_releases r
+         WHERE r.template_name = $1
+           AND r.hash IN ($2, $3)
+         ORDER BY EXISTS (
+                      SELECT 1
+                      FROM template_release_storage_locations l
+                      WHERE l.template_release_id = r.id) DESC,
+                  r.created_at ASC
+         LIMIT 1"
     ))
     .bind(template_name)
     .bind(hash)
+    .bind(bare_hash)
     .fetch_optional(&mut **tx)
     .await
     .map_err(|err| Status::internal(format!("query template_release: {err}")))

@@ -19,7 +19,9 @@ use axum::{
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use bytes::Bytes;
 use futures_util::{Stream, StreamExt as _};
-use pplx_space_common_core::types::{DEFAULT_GUEST_USER, NodeId, ProcessId, SandboxId};
+use pplx_space_common_core::types::{
+    DEFAULT_GUEST_USER, IdempotencyKey, NodeId, ProcessId, SandboxId,
+};
 use pplx_space_common_grpc::{
     DEFAULT_TCP_GRPC_CONNECT_RETRY_POLICY, GrpcRetryContext, UdsPerSandboxLimitExceeded,
     generated_idempotency_key, is_temporary_tcp_failure, retry_grpc_status_with_context_if,
@@ -37,8 +39,10 @@ use pplx_space_sbx_mgr_client::proto::{
     SpacedProcessEvent, SpacedResizePtyRequest, SpacedSendInputRequest, SpacedSendSignalRequest,
     SpacedStartProcessRequest,
 };
+use prost::Message as _;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest as _, Sha256};
 use tokio::sync::OwnedMutexGuard;
 
 use super::{
@@ -682,29 +686,92 @@ fn build_process_start_request(
 ) -> Result<SpacedStartProcessRequest, EcwProxyError> {
     let timeout = connect_timeout(headers)?;
     let command = translate_process_start_request(&request)?;
+    let client_key = process_start_client_idempotency_key(headers)?;
+
+    let mut operation = spaced_ops::StartRequest {
+        command,
+        cwd: request
+            .process
+            .cwd
+            .or_else(|| ecw_default_workdir(route.template_id.as_deref())),
+        env: request.process.envs.into_iter().collect(),
+        user: envd_basic_username(headers),
+        timeout,
+        background: false,
+        idempotency_key: None,
+        tag: request.tag,
+        stdin: request.stdin.unwrap_or(true),
+        pty: translate_process_pty_config(request.pty.as_ref())?,
+        clean_env: false,
+        // The E2B path leaves process identity to the guest: its clients
+        // address processes by pid or tag, never by process id.
+        process_id: None,
+    };
+    let idempotency_key = match client_key {
+        Some(client_key) => client_bound_process_start_key(client_key, &operation),
+        None => generated_idempotency_key(),
+    };
+    operation.idempotency_key = Some(idempotency_key.into());
 
     Ok(SpacedStartProcessRequest {
         sandbox_id: route.sandbox_id.to_string(),
-        operation: Some(spaced_ops::StartRequest {
-            command,
-            cwd: request
-                .process
-                .cwd
-                .or_else(|| ecw_default_workdir(route.template_id.as_deref())),
-            env: request.process.envs.into_iter().collect(),
-            user: envd_basic_username(headers),
-            timeout,
-            background: false,
-            idempotency_key: Some(generated_idempotency_key().into()),
-            tag: request.tag,
-            stdin: request.stdin.unwrap_or(true),
-            pty: translate_process_pty_config(request.pty.as_ref())?,
-            clean_env: false,
-            // The E2B path leaves process identity to the guest: its clients
-            // address processes by pid or tag, never by process id.
-            process_id: None,
-        }),
+        operation: Some(operation),
     })
+}
+
+/// A caller that cannot tell whether a start reached the sandbox, such as one
+/// whose request was written to a connection that then failed, retries with the
+/// same `Idempotency-Key`. spaced then replays the original process stream
+/// rather than running the command a second time.
+const PROCESS_START_IDEMPOTENCY_KEY_HEADER: &str = "idempotency-key";
+/// The caller's key is digested into the backend key, so this only bounds the
+/// value read at this boundary.
+const MAX_PROCESS_START_IDEMPOTENCY_KEY_BYTES: usize = 256;
+
+fn process_start_client_idempotency_key(
+    headers: &HeaderMap,
+) -> Result<Option<&str>, EcwProxyError> {
+    let Some(value) = headers.get(PROCESS_START_IDEMPOTENCY_KEY_HEADER) else {
+        return Ok(None);
+    };
+    // Falling back to a generated key would silently drop the retry safety the
+    // caller asked for, so a present but unusable key is rejected.
+    let key = value.to_str().map(str::trim).unwrap_or_default();
+    if key.is_empty() || key.len() > MAX_PROCESS_START_IDEMPOTENCY_KEY_BYTES {
+        return Err(EcwProxyError::bad_request("Invalid idempotency-key header"));
+    }
+    Ok(Some(key))
+}
+
+/// spaced replays by key alone. Binding the caller's key to the start it came
+/// with makes a key reused for a different command start that command instead
+/// of replaying another one's output, and the fixed-size digest keeps the
+/// guest's bounded key table independent of caller input.
+fn client_bound_process_start_key(
+    client_key: &str,
+    operation: &spaced_ops::StartRequest,
+) -> IdempotencyKey {
+    fn update_field(digest: &mut Sha256, tag: u8, value: &[u8]) {
+        digest.update([tag]);
+        digest.update((value.len() as u64).to_be_bytes());
+        digest.update(value);
+    }
+
+    // Retries may reach a different data-plane replica, so the digest must not
+    // depend on map iteration order: env is hashed sorted, and the rest of the
+    // request has no map fields, which makes its protobuf encoding stable.
+    let mut fields = operation.clone();
+    fields.idempotency_key = None;
+    let env: BTreeMap<String, String> = std::mem::take(&mut fields.env).into_iter().collect();
+    let mut digest = Sha256::new();
+    update_field(&mut digest, b'k', client_key.as_bytes());
+    update_field(&mut digest, b'o', &fields.encode_to_vec());
+    for (name, value) in &env {
+        update_field(&mut digest, b'n', name.as_bytes());
+        update_field(&mut digest, b'v', value.as_bytes());
+    }
+    IdempotencyKey::parse(format!("ecw-start-{}", hex::encode(digest.finalize())))
+        .expect("hex digest is a valid idempotency key")
 }
 
 fn ecw_default_workdir(template_id: Option<&str>) -> Option<String> {

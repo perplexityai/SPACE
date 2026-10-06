@@ -631,6 +631,7 @@ async fn native_executor_requeues_create_when_cluster_admission_rejects() -> Tes
         target_id: Some(sandbox_id.to_string()),
         payload: CreateSandboxOperationPayload {
             federated_create: None,
+            pool_claim: None,
             sandbox_id,
             request: public_create_request(),
             node_pool: None,
@@ -655,6 +656,7 @@ async fn native_executor_requeues_create_when_cluster_admission_rejects() -> Tes
         test_route_ed25519_authority(),
         pplx_space_common_svc::federated_identity::FederatedIdentityPolicy::default()
             .grant_audience,
+        None,
     );
 
     let result = executor.execute("claim-token", operation).await;
@@ -693,6 +695,135 @@ async fn native_executor_requeues_create_when_cluster_admission_rejects() -> Tes
          transient-error budget, not indefinite backpressure — a durable capacity outage \
          (all workers gone/cordoned) must eventually terminate, unlike a full token bucket"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn native_executor_persists_exemptions_on_policy_update_and_template_reset() -> TestResult {
+    use pplx_space_api::public_sandbox_operations::UpdateSandboxOperationPayload;
+    use pplx_space_public_api::{SandboxNetworkPolicyPatch, UpdateSandboxRequest};
+
+    let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+    let org_id = OrgId::from_uuid(seed_org(&db.pool).await?);
+    let user_id = UserId::from_uuid(seed_user(&db.pool, org_id).await?);
+    seed_template_release(&db.pool).await?;
+    let template_policy = serde_json::json!({
+        "version": "v1",
+        "egress": {"default_action": "allow", "allow": [], "deny": []},
+        "tls_interception": "on"
+    });
+    let override_policy = serde_json::json!({
+        "version": "v1",
+        "egress": {
+            "default_action": "deny",
+            "allow": [{"domain": "allowed.example.test"}],
+            "deny": [{"domain": "blocked.example.test"}]
+        },
+        "tls_interception": "on"
+    });
+    sqlx::query(sql!(
+        "UPDATE templates SET network_policy_json = $1 WHERE name = 'seed'"
+    ))
+    .bind(&template_policy)
+    .execute(&db.pool)
+    .await?;
+    let exemptions =
+        TlsInterceptionExemptions::from_config(r#"[{"wildcard_domain":"*.relay.example.test"}]"#)?;
+
+    for configured in [false, true] {
+        let sandbox_id = PublicSandboxId::new();
+        sqlx::query(sql!(
+            "INSERT INTO sandboxes (
+                 id, user_id, org_id, managed_by, lifecycle, placement,
+                 template_id, network_policy_generation
+             ) VALUES ($1, $2, $3, 'k8s', 'started', 'unplaced', 'seed', 1)"
+        ))
+        .bind(sandbox_id.as_uuid())
+        .bind(user_id)
+        .bind(org_id)
+        .execute(&db.pool)
+        .await?;
+        let substrate = Substrate::Direct(Box::new(
+            pplx_space_api::controllers::substrate::direct::DirectSubstrate::new(db.pool.clone()),
+        ));
+        let executor = NativePublicOperationExecutor::with_cluster_admission_config(
+            db.pool.clone(),
+            substrate,
+            ClusterSandboxAdmissionConfig {
+                enabled: false,
+                refill_rps: 6.0,
+                burst: 60.0,
+                redis_url: None,
+            },
+            FeatureFlagClient::disabled(),
+            test_route_ed25519_authority(),
+            pplx_space_common_svc::federated_identity::FederatedIdentityPolicy::default()
+                .grant_audience,
+            configured.then(|| exemptions.clone()),
+        );
+
+        for reset in [false, true] {
+            let request = UpdateSandboxRequest {
+                metadata: None,
+                resources: None,
+                network_policy: Some(if reset {
+                    SandboxNetworkPolicyPatch::InheritTemplateDefault
+                } else {
+                    SandboxNetworkPolicyPatch::Set {
+                        policy: serde_json::from_value(override_policy.clone())?,
+                    }
+                }),
+                auto_lifecycle: None,
+            };
+            let operation = ClaimedPublicOperation {
+                id: OperationId::new(),
+                org_id,
+                actor_user_id: Some(user_id),
+                api_product: ApiProduct::Native,
+                kind: OperationKind::UpdateSandbox,
+                target_type: Some(OperationTargetType::Sandbox),
+                target_id: Some(sandbox_id.to_string()),
+                payload: UpdateSandboxOperationPayload {
+                    sandbox_id,
+                    request,
+                }
+                .into_json(),
+                attempts: 1,
+                claim_generation: 1,
+            };
+            let mut first_generation = None;
+            for _ in 0..2 {
+                let result = executor.execute("claim-token", operation.clone()).await;
+                assert_eq!(result.state, OperationState::Succeeded, "{result:?}");
+                let (persisted, generation): (Option<serde_json::Value>, i64) =
+                    sqlx::query_as(sql!(
+                        "SELECT network_policy_override_json, network_policy_generation
+                     FROM sandboxes WHERE id = $1"
+                    ))
+                    .bind(sandbox_id.as_uuid())
+                    .fetch_one(&db.pool)
+                    .await?;
+                assert_eq!(persisted.is_some(), configured || !reset);
+                let effective = persisted.as_ref().unwrap_or(&template_policy);
+                let mut expected = if reset {
+                    template_policy.clone()
+                } else {
+                    override_policy.clone()
+                };
+                if configured {
+                    expected["tls_interception_exemptions"] = serde_json::json!([
+                        {"wildcard_domain": "*.relay.example.test"}
+                    ]);
+                }
+                assert_eq!(effective, &expected);
+                if let Some(first_generation) = first_generation {
+                    assert_eq!(generation, first_generation, "replay must be idempotent");
+                } else {
+                    first_generation = Some(generation);
+                }
+            }
+        }
+    }
     Ok(())
 }
 
@@ -1151,6 +1282,8 @@ fn public_create_request() -> pplx_space_public_api::CreateSandboxRequest {
         }),
         network_policy: None,
         auto_lifecycle: None,
+        idle_timeout: None,
+        idle_action: None,
     }
 }
 

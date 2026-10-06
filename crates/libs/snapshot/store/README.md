@@ -11,6 +11,7 @@ The store owns data access for the transactional aggregate formed by:
 - `snapshots`;
 - `snapshot_storage_locations`;
 - `snapshot_storage_location_encrypted_fields`;
+- `snapshot_artifact_digests`;
 - invariants that span those rows and their owning sandbox.
 
 Each snapshot has zero or one storage-location row. Zero is a valid transient

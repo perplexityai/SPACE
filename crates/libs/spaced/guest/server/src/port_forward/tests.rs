@@ -17,6 +17,23 @@ fn pick_free_port() -> u16 {
     port
 }
 
+/// Opens a forwarded port on a free port and returns it. A port picked with
+/// [`pick_free_port`] can be taken by a concurrent test (a listener, or an
+/// outbound connection's ephemeral port) before the manager binds it; the
+/// manager then rightly reports `Direct`. That is the test's precondition
+/// failing, not the behaviour under test, so try another port.
+async fn open_forwarded_on_a_free_port(manager: &LoopbackBridgeManager) -> u16 {
+    for _ in 0..20 {
+        let port = pick_free_port();
+        match manager.open(port, Some(MAX_OPEN_WAIT)).await {
+            (LoopbackBridgeStatus::LoopbackForwarded, _) => return port,
+            (LoopbackBridgeStatus::Direct, _) => continue,
+            (status, detail) => panic!("initial bridge failed: {status:?} {detail:?}"),
+        }
+    }
+    panic!("no free port could be forwarded in 20 attempts");
+}
+
 /// Listener factory that fails the first `failures` calls with the
 /// given error kind, then binds a real ephemeral loopback listener.
 /// `calls` counts every bind attempt so tests can assert bounded
@@ -269,14 +286,7 @@ async fn open_addr_in_use_reports_direct_without_retry() {
 #[tokio::test]
 async fn close_releases_the_listener_before_reopen_returns() {
     let (manager, shutdown) = test_manager(system_listener_factory());
-    let port = pick_free_port();
-
-    let (status, detail) = manager.open(port, Some(MAX_OPEN_WAIT)).await;
-    assert_eq!(
-        status,
-        LoopbackBridgeStatus::LoopbackForwarded,
-        "initial bridge failed: {detail:?}"
-    );
+    let port = open_forwarded_on_a_free_port(&manager).await;
 
     manager.close(port).await;
 
@@ -576,14 +586,7 @@ fn inheriting_listener_factory(
 async fn reopen_succeeds_while_a_child_still_holds_the_released_listener() {
     let inherited = Arc::new(std::sync::Mutex::new(Vec::new()));
     let (manager, shutdown) = test_manager(inheriting_listener_factory(inherited.clone()));
-    let port = pick_free_port();
-
-    let (status, detail) = manager.open(port, Some(MAX_OPEN_WAIT)).await;
-    assert_eq!(
-        status,
-        LoopbackBridgeStatus::LoopbackForwarded,
-        "{detail:?}"
-    );
+    let port = open_forwarded_on_a_free_port(&manager).await;
     manager.close(port).await;
 
     // The "child" still holds its copy of the released listener.

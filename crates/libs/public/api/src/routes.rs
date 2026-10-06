@@ -229,6 +229,7 @@ native_operations! {
     STOP_SANDBOX = NativeOperation::with_runtime_path("/v1/sandboxes/{sandbox_id}:stop", SANDBOX_ACTION_RUNTIME_PATH, Post, "stopSandbox", Incubating);
     SUSPEND_SANDBOX = NativeOperation::with_runtime_path("/v1/sandboxes/{sandbox_id}:suspend", SANDBOX_ACTION_RUNTIME_PATH, Post, "suspendSandbox", M1Supported);
     WAKE_SANDBOX = NativeOperation::with_runtime_path("/v1/sandboxes/{sandbox_id}:wake", SANDBOX_ACTION_RUNTIME_PATH, Post, "wakeSandbox", M1Supported);
+    SET_SANDBOX_TIMEOUT = NativeOperation::with_runtime_path("/v1/sandboxes/{sandbox_id}:set_timeout", SANDBOX_ACTION_RUNTIME_PATH, Post, "setSandboxTimeout", Incubating);
     ATTACH_SESSION = NativeOperation::data_plane("/v1/sessions/{session_id}/attach", Get, "attachSession", Incubating);
     STREAM_SESSION_EVENTS = NativeOperation::data_plane("/v1/sessions/{session_id}/events", Get, "streamSessionEvents", M1Supported);
     PROXY_SESSION = NativeOperation::data_plane("/v1/sessions/{session_id}/proxy", Get, "proxySession", Incubating);

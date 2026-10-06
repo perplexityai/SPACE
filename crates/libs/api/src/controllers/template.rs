@@ -6,7 +6,8 @@ use pplx_space_build_mgr_client::proto::{
     UploadBlobResponse,
 };
 use pplx_space_common_core::types::{
-    BuildRunId, NodeId, OrgId, SystemTemplate, TemplateName, TemplateReference,
+    BuildRunId, NodeId, OrgId, SystemPublicationGrantId, SystemTemplate, TemplateName,
+    TemplateReference,
 };
 use pplx_space_node_api_client::proto::BuildTemplateResponse;
 use pplx_space_template_mgr_client::proto::{
@@ -151,8 +152,12 @@ impl TemplateBuildSubmission {
         Ok(None)
     }
 
-    fn into_start_build_request(self) -> StartBuildRequest {
+    fn into_start_build_request(
+        self,
+        grant: Option<SystemPublicationGrantId>,
+    ) -> StartBuildRequest {
         StartBuildRequest {
+            system_publication_grant_id: grant.map(|grant| grant.to_string()),
             recipe: Some(self.recipe),
             template_id: self.target.template_name().to_string(),
             options: Some(BuildOptions {
@@ -298,10 +303,45 @@ impl TemplateController {
             ),
             None => None,
         };
+        // A system build's output is published by build-manager, which
+        // ClusterApi accepts only under this grant; it lands before dispatch
+        // for the same reason as the base grant.
+        let system_publication_grant = match &submission.target {
+            TemplateBuildTarget::System(_) => Some(
+                self.build_jobs
+                    .record_system_publication_grant(&template_name)
+                    .await
+                    .map_err(|error| {
+                        build_jobs_store_error("failed to record system publication grant", error)
+                    })?,
+            ),
+            TemplateBuildTarget::Organization(_) => None,
+        };
         let client_build_id = submission.client_build_id.clone();
-        let response = self
-            .start_template_build_request(submission.into_start_build_request())
-            .await?;
+        let response = match self
+            .start_template_build_request(
+                submission.into_start_build_request(system_publication_grant),
+            )
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                // An undispatched submission authorizes no publication. If an
+                // ambiguous failure did start the build, its publication is
+                // denied and the build must be resubmitted.
+                if let Some(grant) = system_publication_grant
+                    && let Err(revoke_error) =
+                        self.build_jobs.revoke_system_publication_grant(grant).await
+                {
+                    tracing::warn!(
+                        error = %revoke_error,
+                        %template_name,
+                        "failed to withdraw an undispatched system publication grant; it expires on its own"
+                    );
+                }
+                return Err(error);
+            }
+        };
         self.record_template_build_response(
             org_id,
             template_name,

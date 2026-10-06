@@ -33,6 +33,9 @@ fn update_claimed_payload_sql() -> &'static str {
 }
 const DEFAULT_IDEMPOTENCY_TTL_HOURS: i64 = 24;
 
+mod responses;
+pub(crate) use responses::ResponseAdmissionError;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApiProduct {
     Native,
@@ -944,6 +947,40 @@ impl PublicOperationAdmission {
     pub async fn finish(self) -> Result<(), PublicOperationStoreError> {
         self.tx.commit().await?;
         Ok(())
+    }
+
+    /// The admission's transaction, for work that must commit only with a
+    /// newly created operation (an admission-time warm-pool claim). Use with
+    /// [`Self::create_or_roll_back`].
+    pub(crate) fn transaction(&mut self) -> &mut Transaction<'static, Postgres> {
+        &mut self.tx
+    }
+
+    /// [`Self::create`], except that only a `Created` result commits. Any
+    /// other result rolls the transaction back, taking with it whatever the
+    /// caller did through [`Self::transaction`].
+    pub(crate) async fn create_or_roll_back(
+        mut self,
+        input: CreatePublicOperation<'_>,
+    ) -> Result<CreatePublicOperationResult, PublicOperationStoreError> {
+        let api_product = input.api_product;
+        let kind = input.kind;
+        let target_type = input.target_type.clone();
+        let result = create_operation_tx(&mut self.tx, input).await?;
+        if !matches!(result, CreatePublicOperationResult::Created(_)) {
+            self.tx.rollback().await?;
+            return Ok(result);
+        }
+        self.tx.commit().await?;
+        pplx_space_metrics::operations::created(
+            api_product.as_str(),
+            kind.as_str(),
+            target_type
+                .as_ref()
+                .map(OperationTargetType::as_str)
+                .unwrap_or("none"),
+        );
+        Ok(result)
     }
 }
 

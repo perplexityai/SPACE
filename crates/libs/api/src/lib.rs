@@ -41,6 +41,7 @@ mod run;
 pub mod template_build_jobs_store;
 mod template_inventory_store;
 mod template_releases_store;
+pub mod tls_interception_exemptions;
 pub mod user_role;
 mod wake_trace;
 

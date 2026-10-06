@@ -15,6 +15,7 @@ use pplx_space_api::public_sandbox_operations::{
     SandboxLifecycleOperationExecutor, UpdateSandboxOperationExecutor,
 };
 use pplx_space_api::public_template_operations::DeleteTemplateOperationExecutor;
+use pplx_space_api::tls_interception_exemptions::TlsInterceptionExemptions;
 use pplx_space_common_core::types::time::format_simple_duration;
 use pplx_space_feature_flags::FeatureFlagClient;
 use pplx_space_public_api::{OperationKind, OperationState, PublicErrorCode};
@@ -182,6 +183,7 @@ impl NativePublicOperationExecutor {
         substrate: Substrate,
         feature_flags: FeatureFlagClient,
         grant_audience: pplx_space_common_core::types::FederatedGrantAudience,
+        tls_interception_exemptions: Option<TlsInterceptionExemptions>,
     ) -> Result<Self, pplx_space_common_svc::space_api_route_ed25519::SpaceApiRouteEd25519Error>
     {
         let route_ed25519_authority = Arc::new(
@@ -194,6 +196,7 @@ impl NativePublicOperationExecutor {
             feature_flags,
             route_ed25519_authority,
             grant_audience,
+            tls_interception_exemptions,
         ))
     }
 
@@ -206,6 +209,7 @@ impl NativePublicOperationExecutor {
             pplx_space_common_svc::space_api_route_ed25519::SpaceApiRouteEd25519Authority,
         >,
         grant_audience: pplx_space_common_core::types::FederatedGrantAudience,
+        tls_interception_exemptions: Option<TlsInterceptionExemptions>,
     ) -> Self {
         // Absent an SDK key the injected client is disabled and the dynamic
         // gate defaults on, leaving the limiter env-var-gated exactly as
@@ -218,7 +222,8 @@ impl NativePublicOperationExecutor {
         let controller =
             SandboxController::with_cluster_admission(substrate.clone(), cluster_admission.clone())
                 .with_route_ed25519_authority(Some(route_ed25519_authority))
-                .with_federated_grant_audience(grant_audience);
+                .with_federated_grant_audience(grant_audience)
+                .with_tls_interception_exemptions(tls_interception_exemptions);
         Self {
             cluster_admission,
             create_sandbox: CreateSandboxOperationExecutor::new(pool.clone(), controller.clone()),

@@ -10,8 +10,6 @@ use sqlx::ConnectOptions as _;
 use sqlx::PgPool;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 
-#[cfg(feature = "sqlite")]
-pub mod baseline_cutover;
 pub mod baselines;
 pub mod contention;
 pub mod federated_service_grants;

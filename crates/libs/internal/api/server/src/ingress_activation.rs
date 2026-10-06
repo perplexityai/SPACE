@@ -22,10 +22,3 @@ pub trait IngressActivationFactory: Send + Sync {
         shutdown: tokio_util::sync::CancellationToken,
     ) -> Result<Arc<dyn IngressActivation>, Status>;
 }
-
-pub fn enabled() -> bool {
-    pplx_space_common_core::env::env_flag(
-        pplx_space_common_core::env::test_hook_var("SPACE_INGRESS_WAKE_ENABLED").as_deref(),
-        false,
-    )
-}

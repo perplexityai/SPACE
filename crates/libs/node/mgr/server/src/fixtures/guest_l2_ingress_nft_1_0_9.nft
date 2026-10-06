@@ -3,5 +3,6 @@ table netdev sandbox_l2 {
 		type filter hook ingress device "tap0" priority -500; policy accept;
 		meta protocol { 8021q, 8021ad } counter packets 0 bytes 0 drop comment "drop-guest-vlan"
 		ether type { 8021q, 8021ad } counter packets 0 bytes 0 drop comment "drop-guest-vlan"
+		meta protocol { ip, arp } meta pkttype other counter packets 0 bytes 0 meta pkttype set host comment "accept-stale-gateway-mac"
 	}
 }

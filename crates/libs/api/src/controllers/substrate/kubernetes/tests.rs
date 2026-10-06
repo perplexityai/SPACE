@@ -14,6 +14,7 @@ pub(crate) use kubernetes_tests::{
     existing_then_created_running_pod_kubernetes_client,
     insert_ready_full_snapshot_relative_to_lifecycle, mock_kubernetes_client,
     running_pod_kubernetes_client, running_pod_kubernetes_client_with_create_barrier,
+    substrate_with_inventory_caches_and_pool, substrate_with_store,
     substrate_with_store_and_client, substrate_with_store_client_proxy_port_and_pod,
 };
 
@@ -184,7 +185,7 @@ mod kubernetes_tests {
         substrate_with_inventory_caches_and_pool(pods, nodes, pool)
     }
 
-    fn substrate_with_inventory_caches_and_pool(
+    pub(crate) fn substrate_with_inventory_caches_and_pool(
         pods: Vec<Pod>,
         nodes: Vec<Node>,
         pool: PgPool,
@@ -1800,7 +1801,7 @@ mod kubernetes_tests {
         substrate_with_store(pool)
     }
 
-    fn substrate_with_store(pool: PgPool) -> KubernetesSubstrate {
+    pub(crate) fn substrate_with_store(pool: PgPool) -> KubernetesSubstrate {
         substrate_with_store_and_client(pool, inert_kubernetes_client())
     }
 

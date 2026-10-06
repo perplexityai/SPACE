@@ -477,3 +477,99 @@ async fn cancelled_worker_supervisor_reaps_its_child() {
         "child is reaped after worker cancellation"
     );
 }
+
+// An idle worker past its TTL is stopped by the reaper even if no further
+// filesystem call ever arrives; a worker kept for the change ledger is not.
+#[tokio::test]
+async fn reaper_stops_an_expired_idle_worker_without_another_acquisition() {
+    let pool = WorkerPool::new(CancellationToken::new());
+    let idle = GuestUserName::parse("root").expect("root");
+    let ledger = GuestUserName::parse("user").expect("user");
+    let channel = Endpoint::from_static("http://[::]:50051").connect_lazy();
+    pool.insert_test_client(idle.clone(), channel.clone())
+        .await
+        .expect("idle worker");
+    pool.insert_test_client(ledger.clone(), channel)
+        .await
+        .expect("ledger worker");
+    {
+        let mut workers = pool.workers.lock().await;
+        for (user, entry) in workers.iter_mut() {
+            let WorkerEntry::Resident(worker) = entry else {
+                panic!("resident");
+            };
+            worker.last_access = Instant::now() - IDENTITY_WORKER_IDLE_TTL - Duration::from_secs(1);
+            worker.ledger_enabled = *user == ledger;
+        }
+    }
+    pool.ensure_reaper();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while pool.workers.lock().await.contains_key(&idle) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the reaper stops the expired idle worker");
+    assert!(
+        pool.workers.lock().await.contains_key(&ledger),
+        "a worker kept for the change ledger does not expire"
+    );
+    // Nothing left that can expire, so the reaper exits rather than wake for
+    // the ledger worker.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while pool
+            .reaper_running
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the reaper exits once no worker can expire");
+}
+
+#[test]
+fn next_expiry_is_the_earliest_idle_ttl_and_rechecks_busy_workers() {
+    let channel = || Endpoint::from_static("http://[::]:50051").connect_lazy();
+    let now = Instant::now();
+    let worker = |user: &str, last_access: Instant, busy: bool| {
+        let client = WorkerClient {
+            client: FilesystemClient::new(channel()),
+            user: GuestUserName::parse(user).expect("user"),
+            instance_id: uuid::Uuid::now_v7(),
+            activity: Arc::new(()),
+            ledger_update_slot: Arc::new(tokio::sync::Semaphore::new(1)),
+            stop_token: CancellationToken::new(),
+            supervisor: Arc::new(Mutex::new(None)),
+            pidfd: None,
+        };
+        let lease = busy.then(|| client.activity.clone());
+        let mut resident = ResidentWorker::new(client);
+        resident.last_access = last_access;
+        (WorkerEntry::Resident(Box::new(resident)), lease)
+    };
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let _guard = runtime.enter();
+    let mut workers = HashMap::new();
+    assert_eq!(next_worker_expiry(&workers, now), None);
+
+    let (recent, _) = worker("root", now - Duration::from_secs(60), false);
+    workers.insert(GuestUserName::parse("root").unwrap(), recent);
+    assert_eq!(
+        next_worker_expiry(&workers, now),
+        Some(now - Duration::from_secs(60) + IDENTITY_WORKER_IDLE_TTL)
+    );
+
+    // Past its TTL but still in use: looked at again later, not now.
+    let (busy, _lease) = worker("user", now - IDENTITY_WORKER_IDLE_TTL * 2, true);
+    let mut only_busy = HashMap::new();
+    only_busy.insert(GuestUserName::parse("user").unwrap(), busy);
+    assert_eq!(
+        next_worker_expiry(&only_busy, now),
+        Some(now + IDENTITY_WORKER_BUSY_RECHECK)
+    );
+    assert!(take_expired_workers(&mut only_busy, now).is_empty());
+}

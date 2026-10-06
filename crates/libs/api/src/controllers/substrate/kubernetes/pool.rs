@@ -1,16 +1,17 @@
 use pplx_space_cluster_pool::{
-    ClaimedPoolSlot, ManualPoolConfigSpec, PoolAssignment, PoolConfigWithCounts, WarmPoolStore,
+    ClaimedPoolSlot, ManualPoolConfigSpec, PoolAssignment, PoolConfigWithCounts, PoolSlotState,
+    ReservedPoolSlot, WarmPoolStore,
 };
 use pplx_space_common_core::sql;
-use pplx_space_common_core::types::{MemorySize, NodeId, PodUid, VcpuCount};
+use pplx_space_common_core::types::{MemorySize, NodeId, PodUid, SandboxId, VcpuCount};
 use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
 use crate::controllers::{
     ControllerError, db_contention_error, pool_store_error,
     substrate::{
-        PooledExecutionClaim, PooledExecutionClaimAttempt, PooledExecutionClaimRequest,
-        PooledExecutionPoolShape,
+        AdmissionPoolClaim, AdmittedPoolClaim, AdmittedPoolClaimLookup, PooledExecutionClaim,
+        PooledExecutionClaimAttempt, PooledExecutionClaimRequest, PooledExecutionPoolShape,
     },
 };
 use crate::models::{ClusterPoolConfigRequest, ClusterPoolConfigResponse};
@@ -189,14 +190,31 @@ async fn claim_pooled_execution_tx(
         "sandbox_id",
         tracing::field::display(slot.reserved_sandbox_id),
     );
-    let pod_ip = slot.pod_ip.ok_or_else(|| {
-        span.record("result", "error");
-        ControllerError::internal("claimed pool slot is missing pod IP")
-    })?;
+    let (claim, pool_shape) = pooled_claim_from_slot(tx, slot, claim_id, content_hash)
+        .await
+        .inspect_err(|_| {
+            span.record("result", "error");
+        })?;
+    span.record("result", "claimed");
+
+    Ok(PooledExecutionClaimAttempt::claimed(claim, pool_shape))
+}
+
+/// Build the execution claim for a slot the caller holds under `claim_id`.
+/// Shared by the any-slot claim and the admitted-slot lookup, so both hand
+/// the adoption path the same pod identity, shape, and generation.
+async fn pooled_claim_from_slot(
+    tx: &mut Transaction<'_, Postgres>,
+    slot: ClaimedPoolSlot,
+    claim_id: Uuid,
+    content_hash: String,
+) -> Result<(PooledExecutionClaim, PooledExecutionPoolShape), ControllerError> {
+    let pod_ip = slot
+        .pod_ip
+        .ok_or_else(|| ControllerError::internal("claimed pool slot is missing pod IP"))?;
 
     let vcpu = slot.vcpu.get().get();
     let memory_mib = u32::try_from(slot.memory.as_mib_floor()).map_err(|err| {
-        span.record("result", "error");
         ControllerError::internal(format!(
             "claimed pool slot memory_mib does not fit request model: {err}"
         ))
@@ -210,11 +228,7 @@ async fn claim_pooled_execution_tx(
 
     let active_node_id = resolve_pool_slot_node_id(tx, slot.k8s_node_name.as_deref())
         .await
-        .map_err(|err| {
-            span.record("result", "error");
-            db_contention_error("failed to resolve pool node", &err)
-        })?;
-    span.record("result", "claimed");
+        .map_err(|err| db_contention_error("failed to resolve pool node", &err))?;
     let pod_uid = slot
         .pod_uid
         .as_deref()
@@ -224,7 +238,7 @@ async fn claim_pooled_execution_tx(
         .transpose()
         .map_err(|err| ControllerError::internal(format!("claimed pool slot pod_uid: {err}")))?;
 
-    Ok(PooledExecutionClaimAttempt::claimed(
+    Ok((
         PooledExecutionClaim {
             claim_id,
             pool_slot_id: Some(slot.id),
@@ -243,6 +257,172 @@ async fn claim_pooled_execution_tx(
         },
         pool_shape,
     ))
+}
+
+/// Read the slot a create was admitted against, under a row lock, and decide
+/// from its row alone whether the create may adopt it.
+///
+/// Adoptable only when the slot reserving `sandbox_id` is the admitted slot,
+/// is still `claimed` under the admitted claim id, lives in this namespace,
+/// was built from the release the create resolved, and has the requested
+/// shape. Pod liveness and node placement are the caller's to check.
+///
+/// Every other answer is about whether the pool still owns a pod under this
+/// ID. A missing slot (collected by the stale-claimed sweep) or a `bound`
+/// receipt (a bind committed and the sandbox was later retired) owns none.
+/// Anything else does, and is taken out of the claimable inventory here so no
+/// other create can bind this ID: a `ready` slot is fenced to an id-less
+/// claim, and our own claim on a slot we will not adopt is invalidated. Both
+/// leave a `claimed` row that the stale-claimed sweep collects, pod included,
+/// because no sandbox row exists for the ID yet.
+#[tracing::instrument(
+    name = "substrate.k8s.pool.lookup_admitted_pooled_execution",
+    skip_all,
+    fields(
+        sandbox_id = %sandbox_id,
+        claim_id = %admitted.claim_id,
+        result = tracing::field::Empty,
+    )
+)]
+pub(super) async fn lookup_admitted_pooled_execution(
+    pool: &PgPool,
+    request: &PooledExecutionClaimRequest<'_>,
+    admitted: AdmittedPoolClaim,
+    sandbox_id: SandboxId,
+    namespace: &str,
+) -> Result<AdmittedPoolClaimLookup, ControllerError> {
+    let span = tracing::Span::current();
+    let mut tx = pool.begin().await.map_err(|err| {
+        db_contention_error("failed to start admitted pool claim transaction", &err)
+    })?;
+    let reserved = WarmPoolStore::lock_reserved_slot(&mut tx, sandbox_id)
+        .await
+        .map_err(|err| pool_store_error("failed to read admitted pool slot", &err))?;
+    let (lookup, result) = match reserved {
+        None => (AdmittedPoolClaimLookup::Released, "slot_missing"),
+        Some(ReservedPoolSlot {
+            state: PoolSlotState::Bound,
+            ..
+        }) => (AdmittedPoolClaimLookup::Released, "slot_bound"),
+        Some(reserved)
+            if reserved.state == PoolSlotState::Claimed
+                && reserved.claim_id == Some(admitted.claim_id) =>
+        {
+            if admitted_slot_matches_request(&reserved, request, admitted, namespace) {
+                let (claim, pool_shape) = pooled_claim_from_slot(
+                    &mut tx,
+                    reserved.slot,
+                    admitted.claim_id,
+                    reserved.content_hash,
+                )
+                .await?;
+                (
+                    AdmittedPoolClaimLookup::Adoptable {
+                        claim: Box::new(claim),
+                        pool_shape,
+                    },
+                    "claimed",
+                )
+            } else {
+                WarmPoolStore::invalidate_claimed_slot_in(&mut tx, admitted.claim_id, sandbox_id)
+                    .await
+                    .map_err(|err| {
+                        pool_store_error("failed to invalidate admitted pool slot", &err)
+                    })?;
+                (AdmittedPoolClaimLookup::ReleasePending, "slot_mismatch")
+            }
+        }
+        Some(reserved) if reserved.state == PoolSlotState::Ready => {
+            WarmPoolStore::fence_ready_slot(&mut tx, reserved.slot.id)
+                .await
+                .map_err(|err| pool_store_error("failed to fence admitted pool slot", &err))?;
+            (AdmittedPoolClaimLookup::ReleasePending, "slot_ready")
+        }
+        Some(_) => (AdmittedPoolClaimLookup::ReleasePending, "slot_held"),
+    };
+    tx.commit().await.map_err(|err| {
+        db_contention_error("failed to commit admitted pool claim transaction", &err)
+    })?;
+    span.record("result", result);
+    Ok(lookup)
+}
+
+fn admitted_slot_matches_request(
+    reserved: &ReservedPoolSlot,
+    request: &PooledExecutionClaimRequest<'_>,
+    admitted: AdmittedPoolClaim,
+    namespace: &str,
+) -> bool {
+    let slot = &reserved.slot;
+    let shape_matches = match (request.vcpu, request.memory_mib) {
+        (Some(vcpu), Some(memory_mib)) => {
+            slot.vcpu.get().get() == vcpu
+                && u32::try_from(slot.memory.as_mib_floor()).ok() == Some(memory_mib)
+        }
+        (None, None) => true,
+        _ => false,
+    };
+    slot.id == admitted.pool_slot_id
+        && slot.pod_namespace == namespace
+        && slot.pod_ip.is_some()
+        && request
+            .template_release_id
+            .is_none_or(|release_id| release_id == reserved.template_release_id)
+        && request
+            .content_hash
+            .is_none_or(|content_hash| content_hash == reserved.content_hash)
+        && shape_matches
+}
+
+/// Claim a ready slot for a create being admitted, inside the caller's
+/// transaction.
+///
+/// The same any-shape claim an ordinary default-shape create makes
+/// ([`WarmPoolStore::claim_ready_slot_for_release`]): this namespace, this
+/// release, an enabled plaintext config. It only reserves the slot. Pod
+/// liveness, node placement, and the bind are the executor's, once the create
+/// runs ([`lookup_admitted_pooled_execution`]); a slot that fails them there
+/// is collected by the pool and the create builds cold under the same ID.
+#[tracing::instrument(
+    name = "substrate.k8s.pool.claim_admission_pool_slot",
+    skip_all,
+    fields(result = tracing::field::Empty)
+)]
+pub(super) async fn claim_admission_pool_slot(
+    tx: &mut Transaction<'_, Postgres>,
+    template_release_id: Uuid,
+    namespace: &str,
+) -> Result<Option<AdmissionPoolClaim>, ControllerError> {
+    let claim_id = Uuid::now_v7();
+    let slot = WarmPoolStore::claim_ready_slot_for_release(
+        tx,
+        template_release_id,
+        namespace,
+        claim_id,
+        false,
+    )
+    .await
+    .map_err(|err| pool_store_error("failed to claim pool slot at admission", &err))?;
+    tracing::Span::current().record("result", if slot.is_some() { "claimed" } else { "miss" });
+    Ok(slot.map(|slot| AdmissionPoolClaim {
+        claim: AdmittedPoolClaim {
+            claim_id,
+            pool_slot_id: slot.id,
+        },
+        sandbox_id: slot.reserved_sandbox_id,
+    }))
+}
+
+/// Whether the slot reserving `sandbox_id` is a `cleanup_pending` work item:
+/// a failed adoption whose sandbox the warm-pool reconciler will tear down.
+pub(super) async fn admitted_pool_cleanup_pending(
+    pool: &PgPool,
+    sandbox_id: SandboxId,
+) -> Result<bool, ControllerError> {
+    WarmPoolStore::new(pool.clone())
+        .reserved_slot_cleanup_pending(sandbox_id)
+        .await
+        .map_err(|err| pool_store_error("failed to read admitted pool slot cleanup", &err))
 }
 
 fn pool_shape_from_domain(assignment: PoolAssignment) -> PooledExecutionPoolShape {

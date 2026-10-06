@@ -49,6 +49,7 @@ fn claimed_create_operation_for(
             request: public_create_request(),
             node_pool: None,
             federated_create: None,
+            pool_claim: None,
         }
         .into_json(),
         attempts: 1,
@@ -60,6 +61,116 @@ fn direct_sandbox_controller(pool: &PgPool) -> SandboxController {
     SandboxController::new(crate::controllers::substrate::Substrate::Direct(Box::new(
         crate::controllers::substrate::direct::DirectSubstrate::new(pool.clone()),
     )))
+}
+
+#[cfg(feature = "kubernetes")]
+#[tokio::test(flavor = "current_thread")]
+async fn native_create_executor_persists_exemptions_without_changing_egress() -> TestResult {
+    use std::sync::{Arc, Mutex};
+
+    use crate::controllers::substrate::kubernetes::tests::{
+        running_pod_kubernetes_client, substrate_with_store_client_proxy_port_and_pod,
+    };
+    use crate::tls_interception_exemptions::TlsInterceptionExemptions;
+    use pplx_space_net_common::NetworkPolicyV1;
+
+    // The fully instrumented native create path needs more than libtest's default stack.
+    if !pplx_space_test_env::enter_test_process(&[(
+        "RUST_MIN_STACK",
+        Some(std::ffi::OsStr::new("16777216")),
+    )]) {
+        return Ok(());
+    }
+    let db = pg_test_db().await?;
+    let org_id = seed_org(&db.pool).await?;
+    let user_id = seed_user(&db.pool, org_id).await?;
+    let policy: NetworkPolicyV1 = serde_json::from_value(serde_json::json!({
+        "egress": {
+            "default_action": "deny",
+            "allow": [{"domain": "allowed.example.test"}],
+            "deny": [{"domain": "blocked.example.test"}]
+        },
+        "tls_interception": "on"
+    }))?;
+    sqlx::query(sql!(
+        "INSERT INTO templates (id, name, org_id, visibility, network_policy_json)
+         VALUES ($1, 'seed', NULL, 'generic', $2)"
+    ))
+    .bind(Uuid::now_v7())
+    .bind(serde_json::to_value(&policy)?)
+    .execute(&db.pool)
+    .await?;
+    let release_id = Uuid::now_v7();
+    sqlx::query(sql!(
+        "INSERT INTO template_releases (id, template_name, type, hash)
+         VALUES ($1, 'seed', 'fc', 'sha256:native-policy-test')"
+    ))
+    .bind(release_id)
+    .execute(&db.pool)
+    .await?;
+    sqlx::query(sql!(
+        "INSERT INTO template_release_tags (template_release_id, template_name, tag)
+         VALUES ($1, 'seed', 'latest')"
+    ))
+    .bind(release_id)
+    .execute(&db.pool)
+    .await?;
+
+    let exemptions =
+        TlsInterceptionExemptions::from_config(r#"[{"wildcard_domain":"*.relay.example.test"}]"#)?;
+    let captured_pods = Arc::new(Mutex::new(Vec::new()));
+    // Native create probes the pod's TCP listener even with command readiness disabled.
+    let pod_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    for configured in [false, true] {
+        let substrate = crate::controllers::substrate::Substrate::Kubernetes(Box::new(
+            substrate_with_store_client_proxy_port_and_pod(
+                db.pool.clone(),
+                running_pod_kubernetes_client(Arc::clone(&captured_pods), "127.0.0.1"),
+                pod_listener.local_addr()?.port(),
+                None,
+            ),
+        ));
+        let controller = SandboxController::new(substrate)
+            .with_tls_interception_exemptions(configured.then(|| exemptions.clone()));
+        let executor = CreateSandboxOperationExecutor::new(db.pool.clone(), controller);
+        for inherit_template in [false, true] {
+            let sandbox_id = SandboxId::new();
+            let mut operation = claimed_create_operation_for(sandbox_id, org_id, user_id);
+            let mut request = public_create_request();
+            request.network_policy = (!inherit_template).then(|| policy.clone());
+            operation.payload = CreateSandboxOperationPayload {
+                sandbox_id: sandbox_id.into(),
+                request,
+                node_pool: None,
+                federated_create: None,
+                pool_claim: None,
+            }
+            .into_json();
+
+            let result = Box::pin(executor.execute(&operation)).await;
+            assert_eq!(result.state, OperationState::Succeeded, "{result:?}");
+            let persisted: Option<sqlx::types::Json<NetworkPolicyV1>> = sqlx::query_scalar(sql!(
+                "SELECT network_policy_override_json FROM sandboxes WHERE id = $1"
+            ))
+            .bind(sandbox_id)
+            .fetch_one(&db.pool)
+            .await?;
+            assert_eq!(persisted.is_some(), configured || !inherit_template);
+            let effective = persisted.as_ref().map(|value| &value.0).unwrap_or(&policy);
+            let mut expected = policy.clone();
+            if configured {
+                expected.tls_interception_exemptions = serde_json::from_value(serde_json::json!([
+                    {"wildcard_domain": "*.relay.example.test"}
+                ]))?;
+            }
+            assert_eq!(effective, &expected);
+        }
+    }
+    assert_eq!(
+        captured_pods.lock().expect("capture mutex poisoned").len(),
+        4
+    );
+    Ok(())
 }
 
 async fn seed_org(pool: &PgPool) -> Result<OrgId, sqlx::Error> {
@@ -241,6 +352,7 @@ async fn existing_row_create_persists_the_renewed_grant() -> TestResult {
             federated_create: Some(
                 crate::fork_operations::ForkFederatedCreateContext::from_request(&owner, &renewed),
             ),
+            pool_claim: None,
         }
         .into_json();
 
@@ -511,6 +623,7 @@ async fn create_executor_retries_unpinned_transient_substrate_failure() {
             request: public_create_request(),
             node_pool: None,
             federated_create: None,
+            pool_claim: None,
         }
         .into_json(),
         attempts: 1,
@@ -596,6 +709,7 @@ fn create_operation_payload_is_wire_compatible_with_old_shape() {
         request: public_create_request(),
         node_pool: None,
         federated_create: None,
+        pool_claim: None,
     };
     let value = serde_json::to_value(&unpinned).unwrap();
     assert!(
@@ -614,6 +728,7 @@ fn create_operation_payload_is_wire_compatible_with_old_shape() {
         request: public_create_request(),
         node_pool: Some(NodePoolName::parse("isolated-test-pool").unwrap()),
         federated_create: None,
+        pool_claim: None,
     };
     let pinned_value = serde_json::to_value(&pinned).unwrap();
     assert_eq!(
@@ -828,6 +943,8 @@ fn public_create_request() -> pplx_space_public_api::CreateSandboxRequest {
         }),
         network_policy: Some(pplx_space_net_common::NetworkPolicyV1::allow_all()),
         auto_lifecycle: None,
+        idle_timeout: None,
+        idle_action: None,
     }
 }
 
@@ -850,4 +967,118 @@ fn public_update_request() -> PublicUpdateSandboxRequest {
         }),
         auto_lifecycle: None,
     }
+}
+
+fn admitted_pool_claim() -> CreateSandboxPoolClaim {
+    CreateSandboxPoolClaim {
+        claim_id: Uuid::now_v7(),
+        pool_slot_id: Uuid::now_v7(),
+    }
+}
+
+#[test]
+fn create_operation_payload_pool_claim_is_optional_on_the_wire() {
+    // Without a claim the payload is byte-identical to today's: no key.
+    let cold = CreateSandboxOperationPayload {
+        sandbox_id: PublicSandboxId::new(),
+        request: public_create_request(),
+        node_pool: None,
+        federated_create: None,
+        pool_claim: None,
+    };
+    let value = serde_json::to_value(&cold).unwrap();
+    assert!(
+        value.get("pool_claim").is_none(),
+        "a payload without a claim must omit pool_claim: {value}"
+    );
+
+    // Payloads written before the field existed still parse, as cold creates.
+    let mut old = value.clone();
+    old.as_object_mut().unwrap().remove("pool_claim");
+    let parsed: CreateSandboxOperationPayload = serde_json::from_value(old).unwrap();
+    assert_eq!(parsed.pool_claim, None);
+
+    // A claim round-trips exactly.
+    let claim = admitted_pool_claim();
+    let admitted = CreateSandboxOperationPayload {
+        pool_claim: Some(claim),
+        ..cold
+    };
+    let admitted_value = serde_json::to_value(&admitted).unwrap();
+    assert_eq!(
+        admitted_value["pool_claim"],
+        serde_json::json!({
+            "claim_id": claim.claim_id,
+            "pool_slot_id": claim.pool_slot_id,
+        })
+    );
+    let parsed: CreateSandboxOperationPayload = serde_json::from_value(admitted_value).unwrap();
+    assert_eq!(parsed.pool_claim, Some(claim));
+
+    // The claim object itself is closed, like the payload.
+    let mut extended = serde_json::to_value(&admitted).unwrap();
+    extended["pool_claim"]["unexpected"] = serde_json::json!(true);
+    serde_json::from_value::<CreateSandboxOperationPayload>(extended).unwrap_err();
+}
+
+#[test]
+fn pool_slot_release_wait_is_workflow_progress() {
+    let op = claimed_create_operation();
+    let err = crate::controllers::ControllerError::service_unavailable("slot still held")
+        .with_retry_after_header(std::time::Duration::from_secs(15))
+        .with_retry_after_cause(crate::controllers::ControllerRetryAfterCause::PoolSlotRelease);
+    let result = controller_error_result(&op, err);
+    assert_eq!(result.state, OperationState::Queued);
+    assert_eq!(
+        result.requeue_reason,
+        PublicOperationRequeueReason::WorkflowProgress,
+        "waiting for the pool to release a slot must not spend the retry budget"
+    );
+    assert_eq!(result.retry_after, Some(std::time::Duration::from_secs(15)));
+}
+
+#[tokio::test]
+async fn admitted_create_re_execution_after_success_does_not_create_again() -> TestResult {
+    let db = pg_test_db().await?;
+    let org_id = seed_org(&db.pool).await?;
+    let user_id = seed_user(&db.pool, org_id).await?;
+    let sandbox_id = seed_sandbox(
+        &db.pool,
+        SandboxSeed {
+            org_id,
+            user_id,
+            lifecycle: SandboxLifecycle::Started,
+            placement: SeedSandboxPlacement::OnNode(NodeId::new()),
+        },
+    )
+    .await?;
+    let executor =
+        CreateSandboxOperationExecutor::new(db.pool.clone(), direct_sandbox_controller(&db.pool));
+    let mut operation = claimed_create_operation_for(sandbox_id, org_id, user_id);
+    let mut payload: CreateSandboxOperationPayload =
+        serde_json::from_value(operation.payload.clone())?;
+    payload.pool_claim = Some(admitted_pool_claim());
+    operation.payload = payload.into_json();
+
+    for _ in 0..2 {
+        let result = executor.execute(&operation).await;
+        assert_eq!(result.state, OperationState::Succeeded);
+    }
+
+    let sandboxes: i64 = sqlx::query_scalar(sql!("SELECT COUNT(*) FROM sandboxes WHERE id = $1"))
+        .bind(sandbox_id)
+        .fetch_one(&db.pool)
+        .await?;
+    assert_eq!(sandboxes, 1);
+    let executions: i64 = sqlx::query_scalar(sql!(
+        "SELECT COUNT(*) FROM sandbox_k8s_executions WHERE sandbox_id = $1"
+    ))
+    .bind(sandbox_id)
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(
+        executions, 0,
+        "re-execution must not start another execution"
+    );
+    Ok(())
 }

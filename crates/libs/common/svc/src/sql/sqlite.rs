@@ -13,8 +13,6 @@ use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{SqliteConnection, SqlitePool};
 use tracing::Instrument as _;
 
-mod cutover;
-
 pub type SqliteResult<T> = Result<T, SqliteError>;
 
 /// An error while opening, migrating, or maintaining a service-owned SQLite store.
@@ -143,7 +141,6 @@ pub async fn migrate_embedded(
     migrators: EmbeddedMigrators,
     compatibility_hook: Option<MigrationCompatibilityHook>,
 ) -> SqliteResult<()> {
-    cutover::prepare(db_name, db_path, migrators.service, migrators.common).await?;
     let checksums = AcceptedChecksums::embedded().context("invalid migration checksum manifest")?;
     checksums
         .validate(db_name, migrators.service)
@@ -247,7 +244,7 @@ fn prepare_public_common_schema(
         };
         if public_application_schema(conn)? != expected {
             return Err(SqliteError::message(
-                "SQLite has untracked application schema; explicit cutover is required",
+                "SQLite has untracked application schema; see db/README.md",
             ));
         }
     }
@@ -274,7 +271,7 @@ fn prepare_public_common_schema(
 fn public_application_schema(conn: &Connection) -> SqliteResult<Vec<(String, String)>> {
     conn.prepare(
         "SELECT name, sql FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%'
-         AND name NOT IN ('_sqlx_migrations', '_space_common_schema_migrations', '_space_baseline_archive') ORDER BY name",
+         AND name NOT IN ('_sqlx_migrations', '_space_common_schema_migrations') ORDER BY name",
     )
     .context("failed to inspect untracked SQLite schema")?
     .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
@@ -284,7 +281,6 @@ fn public_application_schema(conn: &Connection) -> SqliteResult<Vec<(String, Str
 }
 
 pub async fn migrate(db_name: &str, db_path: &Path, migrator: &Migrator) -> SqliteResult<()> {
-    cutover::prepare(db_name, db_path, migrator, None).await?;
     AcceptedChecksums::embedded()
         .and_then(|checksums| checksums.validate(db_name, migrator))
         .context("invalid migration checksum manifest or unlisted source")?;

@@ -1,7 +1,7 @@
 use super::{ClusterApiService, adapter::TemplateOrg};
 use pplx_space_common_core::{
     sql,
-    types::{OrgId, TemplateDesiredState, TemplateName},
+    types::{OrgId, SystemPublicationGrantId, TemplateDesiredState, TemplateName},
 };
 use std::collections::BTreeSet;
 use tonic::Status;
@@ -89,4 +89,28 @@ impl ClusterApiService {
         }
         Ok(owner)
     }
+}
+
+/// Publication authority is distinct from tenant ownership. A grant is never
+/// inferred from the target name or borrowed from another pending build.
+pub(super) fn system_publication_grant(
+    value: Option<&str>,
+    owner: TemplateOrg,
+    requires_grant: bool,
+) -> Result<Option<SystemPublicationGrantId>, Status> {
+    match (owner, value) {
+        (TemplateOrg::Owned { .. }, Some(_)) => Err(Status::invalid_argument(
+            "tenant publication cannot carry a system publication grant",
+        )),
+        (_, Some(value)) => value
+            .parse()
+            .map(Some)
+            .map_err(|_| Status::invalid_argument("invalid system publication grant ID")),
+        (TemplateOrg::System, None) if requires_grant => Err(missing_system_publication_grant()),
+        (_, None) => Ok(None),
+    }
+}
+
+pub(super) fn missing_system_publication_grant() -> Status {
+    Status::permission_denied("system template publication requires a build publication grant")
 }

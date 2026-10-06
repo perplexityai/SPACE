@@ -33,45 +33,10 @@ and contact [space-team@perplexity.ai](mailto:space-team@perplexity.ai) to arran
 signature by an authorized company representative and confirmation of the
 covered GitHub accounts.
 
-### Coauthored contributions
-
-The explicitly listed existing contributors in
-[`ci/cla-exempt-contributors.json`](ci/cla-exempt-contributors.json) are exempt
-from the coauthor-only restriction. This is a reviewed snapshot of account IDs,
-not an automatic exemption for future contributors or organization members.
-Logins are review labels; matching uses stable GitHub user IDs.
-CI reads this record from the trusted PR base revision, not the candidate
-change. Adding an account in a PR does not exempt that PR itself. If the record
-does not yet exist at the base revision, no accounts are exempt.
-
-CLA Assistant currently checks primary commit authors, not coauthor-only
-trailers. Until it covers coauthors, every **non-exempt** GitHub-recognized
-coauthor must also be the primary author of a commit in the **same pull request**.
-Use the account's verified GitHub identity; an unrecognized coauthor cannot pass
-this check. For non-exempt accounts this also applies if they already signed the CLA.
-For an unrecognized coauthor, link their actual commit identity to their GitHub
-account or ask a maintainer for help.
-Do not remove genuine attribution or add a fictitious author to bypass it.
+### Agent-assisted contributions
 
 For agent-assisted work, disclose AI assistance in the pull request description
-instead of adding automation-only `Co-authored-by` trailers. Configure your agent
-to omit those trailers. If an automation-only trailer causes this check to fail,
-remove it from the affected commit message and update the PR branch before
-rerunning CI; coordinate shared-branch rewrites and preserve all genuine human
-coauthor attribution.
-
-The `CLA coauthor coverage` job feeds the required `space-pull-ci` result. It
-checks account coverage only; it does **not** verify CLA signatures. The hosted
-`license/cla` check remains a separate launch gate and must independently be
-required before accepting public contributions. Exempting existing contributors
-from signing also requires the corresponding explicit login list in the hosted
-SPACE configuration; changing this repository file alone does not do that.
-
-This policy takes effect when the workflow change merges. Recheck existing
-open PR heads and requeue any already-queued candidates before relying on it.
-Merge-group CI relies on each PR's required admission check; it does not combine
-authors across PRs or independently recheck coauthor coverage. Like the existing
-CI, changes to the workflow or checker require normal repository review.
+instead of adding automation-only `Co-authored-by` trailers.
 
 ## Before your first commit
 

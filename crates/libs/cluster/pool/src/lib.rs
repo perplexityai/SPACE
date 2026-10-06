@@ -22,7 +22,7 @@ pub use error::{PoolError, Result};
 pub use models::{
     ClaimedPoolSlot, ClaimedSlotBindSource, ManualPoolConfigSpec, NewPoolSlot,
     OpenPoolSlotDeleteLock, PoolAssignment, PoolConfig, PoolConfigWithCounts, PoolSlot,
-    PoolSlotCounts, ProtectedTemplateRelease, ReleasePoolConfigWithCounts,
+    PoolSlotCounts, ProtectedTemplateRelease, ReleasePoolConfigWithCounts, ReservedPoolSlot,
 };
 #[cfg(feature = "kubernetes")]
 pub use owner::{PoolConfigOwner, PoolConfigOwnerParseError};

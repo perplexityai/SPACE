@@ -7,6 +7,9 @@
 //! this library without copying any of the service.
 
 use pplx_space_api::controllers::substrate::Substrate;
+use pplx_space_api::tls_interception_exemptions::{
+    TlsInterceptionExemptions, TlsInterceptionExemptionsConfigError,
+};
 use tokio_util::sync::CancellationToken;
 
 mod admin_audit_retention;
@@ -66,6 +69,8 @@ pub struct ClusterControllerConfig {
 /// caller decides what a non-zero exit means for its own supervisor.
 #[derive(Debug, thiserror::Error)]
 pub enum RunClusterControllerError {
+    #[error("invalid TLS interception exemptions: {0}")]
+    TlsInterceptionExemptions(#[from] TlsInterceptionExemptionsConfigError),
     #[error("failed to initialize the cluster-controller space_user pool: {0}")]
     SpaceUserPool(#[source] pplx_space_common_svc::sql::DatabaseConnectOptionsError),
     #[error("failed to initialize the cluster-controller space_creds pool: {0}")]
@@ -92,6 +97,8 @@ pub async fn run(
     config: ClusterControllerConfig,
     shutdown_token: CancellationToken,
 ) -> Result<(), RunClusterControllerError> {
+    // Validate on standbys too, before leader election can mark a replica Ready.
+    let tls_interception_exemptions = TlsInterceptionExemptions::from_env()?;
     let pool = pplx_space_common_svc::sql::connect_space_user_pool_lazy(
         &config.database_url,
         SERVICE_NAME,
@@ -186,8 +193,14 @@ pub async fn run(
     // or, where election doesn't apply, off the process shutdown token directly.
     let reconciler_token = authority.reconciler_token(&shutdown_token);
     let leadership = authority.into_leadership();
-    let result =
-        reconcilers::run_reconcilers(pool, credentials_pool, substrate, reconciler_token).await;
+    let result = reconcilers::run_reconcilers(
+        pool,
+        credentials_pool,
+        substrate,
+        tls_interception_exemptions,
+        reconciler_token,
+    )
+    .await;
 
     // Only *release* the lease (fast standby takeover) when the reconcilers
     // drained cleanly — otherwise a wedged tick may still be detached and

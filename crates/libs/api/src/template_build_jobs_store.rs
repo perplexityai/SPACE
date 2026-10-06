@@ -2,7 +2,9 @@ use std::str::FromStr;
 
 use pplx_space_common_core::{
     sql,
-    types::{BuildRunId, BuildRunIdParseError, NodeId, OrgId, TemplateName},
+    types::{
+        BuildRunId, BuildRunIdParseError, NodeId, OrgId, SystemPublicationGrantId, TemplateName,
+    },
 };
 use sqlx::PgPool;
 
@@ -156,6 +158,52 @@ impl TemplateBuildJobsStore {
         .execute(&self.pool)
         .await?;
         Ok(grant)
+    }
+
+    /// Record, before `StartBuild` is dispatched, that this submission may
+    /// publish `template_name` as a system template.
+    ///
+    /// Build-manager also publishes tenant builds, so ClusterApi accepts its
+    /// system publication only under such a grant, and the release
+    /// registration consumes it. The grant has to exist before dispatch
+    /// because the build may publish before the API records the response.
+    /// Rows older than the freshness ClusterApi honours are swept here, since
+    /// nothing else observes a build's end.
+    pub(crate) async fn record_system_publication_grant(
+        &self,
+        template_name: &TemplateName,
+    ) -> Result<SystemPublicationGrantId, TemplateBuildJobsStoreError> {
+        sqlx::query(sql!(
+            "DELETE FROM template_system_publication_grants
+             WHERE granted_at < NOW() - INTERVAL '7 days'"
+        ))
+        .execute(&self.pool)
+        .await?;
+        let grant = SystemPublicationGrantId::new();
+        sqlx::query(sql!(
+            "INSERT INTO template_system_publication_grants (id, template_name)
+             VALUES ($1, $2)"
+        ))
+        .bind(grant.as_uuid())
+        .bind(template_name.as_str())
+        .execute(&self.pool)
+        .await?;
+        Ok(grant)
+    }
+
+    /// Withdraw the grant of a submission that was never dispatched. Other
+    /// submissions' grants are untouched.
+    pub(crate) async fn revoke_system_publication_grant(
+        &self,
+        grant: SystemPublicationGrantId,
+    ) -> Result<(), TemplateBuildJobsStoreError> {
+        sqlx::query(sql!(
+            "DELETE FROM template_system_publication_grants WHERE id = $1"
+        ))
+        .bind(grant.as_uuid())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     /// Pin one submission's base grant to the builder that accepted it. From

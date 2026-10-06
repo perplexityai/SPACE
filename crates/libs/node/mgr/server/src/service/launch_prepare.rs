@@ -473,18 +473,18 @@ impl NodeManagerService {
         .map_err(|e| Status::internal(format!("remove stale jail kernel task failed: {e}")))?
         .map_err(|e| Status::internal(format!("cannot remove stale jail kernel: {e}")))?;
 
-        // Chown jail root to sandbox UID (--no-dereference to avoid symlink attacks)
+        // Chown jail root to sandbox UID (--no-dereference to avoid symlink
+        // attacks). A partial chown leaves root-owned files in the jail, so
+        // refuse the launch rather than boot a sandbox on an inconsistent jail.
         let uid_str = format!("{sandbox_uid}:{sandbox_uid}");
-        if let Err(error) =
-            run_command_status("chown", &["-Rh", &uid_str, &jail_root], &_lifecycle_permit).await
-        {
-            tracing::warn!(
-                sandbox_id,
-                jail_root,
-                %error,
-                "jail root chown command failed"
-            );
-        }
+        run_permission_command(
+            "chown",
+            &["-Rh", &uid_str, &jail_root],
+            &jail_root,
+            &uid_str,
+            &_lifecycle_permit,
+        )
+        .await?;
 
         // Snapshot restore starts Firecracker idle, then loads persisted VM
         // state through the API socket. Only cold boot needs a kernel file in

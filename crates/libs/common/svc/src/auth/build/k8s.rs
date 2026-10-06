@@ -8,7 +8,7 @@ use k8s_openapi::api::authentication::v1::{TokenReview, TokenReviewSpec};
 use kube::api::PostParams;
 use tonic::Status;
 
-use super::{BuildAuthError, BuildAuthenticatedCaller, BuildSurface};
+use super::{BuildAuthError, BuildAuthenticatedCaller, BuildSurface, SystemTemplateAuthority};
 use crate::auth::{is_jwt_shaped, k8s::K8sTokenAuthConfig};
 
 pub(super) struct BuildTokenReviewer {
@@ -23,7 +23,35 @@ pub(super) struct BuildPolicy {
     audience: String,
     allowed: BTreeSet<String>,
     system: BTreeSet<String>,
+    /// System publishers whose system publications need an independently
+    /// issued build grant.
+    granted_system: BTreeSet<String>,
     tenant: BTreeSet<String>,
+}
+
+impl BuildPolicy {
+    fn new(
+        surface: BuildSurface,
+        audience: String,
+        allowed: BTreeSet<String>,
+        system: BTreeSet<String>,
+        tenant: BTreeSet<String>,
+    ) -> Self {
+        // A publisher that also publishes tenant templates is the build path:
+        // it carries the independently authorized job scope, but omitting the owner
+        // must not let it classify a build as a system one on its own.
+        let granted_system: BTreeSet<String> = match surface {
+            BuildSurface::Publication => system.intersection(&tenant).cloned().collect(),
+            BuildSurface::Manager | BuildSurface::NodeApi => BTreeSet::new(),
+        };
+        Self {
+            audience,
+            allowed,
+            system: system.difference(&granted_system).cloned().collect(),
+            granted_system,
+            tenant,
+        }
+    }
 }
 
 struct ReviewBudget {
@@ -74,12 +102,13 @@ impl BuildTokenReviewer {
         if allowed.is_empty() {
             return Err(BuildAuthError::AllowedServiceAccountsMissing);
         }
-        let policy = BuildPolicy {
-            audience,
-            allowed,
-            system,
-            tenant,
-        };
+        let policy = BuildPolicy::new(surface, audience, allowed, system, tenant);
+        if !policy.granted_system.is_empty() {
+            tracing::info!(
+                accounts = ?policy.granted_system,
+                "system template publication by these accounts requires an independently issued build grant"
+            );
+        }
         let per_second = std::env::var("SPACE_K8S_TOKEN_AUTH_REVIEW_RATE_PER_SEC")
             .ok()
             .and_then(|value| value.parse::<u64>().ok())
@@ -172,9 +201,16 @@ impl BuildTokenReviewer {
         if !policy.allowed.contains(&username) {
             return Err(Status::permission_denied("caller may not submit builds"));
         }
+        let system = if policy.system.contains(&username) {
+            SystemTemplateAuthority::Unconditional
+        } else if policy.granted_system.contains(&username) {
+            SystemTemplateAuthority::Granted
+        } else {
+            SystemTemplateAuthority::Denied
+        };
         Ok(BuildAuthenticatedCaller {
             can_assert_org: policy.tenant.contains(&username),
-            can_publish_system: policy.system.contains(&username),
+            system,
         })
     }
 }

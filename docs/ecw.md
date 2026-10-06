@@ -188,6 +188,21 @@ also used when the request has no `Content-Type`) are capped at 1 MiB of
 request body and return `413` above that; send larger files as multipart or
 octet-stream.
 
+### Retrying an ambiguous command start
+
+A client can lose a `Process.Start` after writing it, for example when the
+connection stops acknowledging data, and then cannot tell whether the command
+ran. Send an `Idempotency-Key` header of 1 to 256 visible ASCII bytes with the
+start, and retry the identical request with the same key. Within 60 seconds of
+the first attempt, a retry that finds the original start receives that
+process's stream from its first event instead of running the command again; a
+retry that finds no earlier start runs it once. Reusing a key with a different
+request starts that request as a new command. A later retry usually fails with
+`failed_precondition`, but deduplication state is bounded and does not survive
+a sandbox runtime restart, so treat it as retry protection rather than an
+exactly-once guarantee. Starts without the header keep their existing
+behavior.
+
 ## Choose the SPACE API for new integrations
 
 Use ECW when an existing application needs E2B SDK compatibility. New SPACE

@@ -197,6 +197,26 @@ pub fn status_is_invalid_key_reference(status: &tonic::Status) -> bool {
             == Some(CREDMGR_ERROR_REASON_INVALID_KEY_REFERENCE)
 }
 
+/// Reason value: a storage write vend named a template release that already
+/// has a registered storage location. Releases are immutable, so the artifacts
+/// are published and only tags remain to register; a builder that meets this
+/// after its own publication check converges on tags-only registration instead
+/// of failing the build.
+pub const CREDMGR_ERROR_REASON_RELEASE_ALREADY_PUBLISHED: &str = "release-already-published";
+
+/// True when a credmgr error `Status` refuses a storage write because the
+/// template release is already published. Checks the machine-readable reason
+/// metadata, never the human-readable message, and only for
+/// `PERMISSION_DENIED`, so unrelated denials keep failing the caller.
+pub fn status_is_release_already_published(status: &tonic::Status) -> bool {
+    status.code() == tonic::Code::PermissionDenied
+        && status
+            .metadata()
+            .get(CREDMGR_ERROR_REASON_METADATA_KEY)
+            .and_then(|value| value.to_str().ok())
+            == Some(CREDMGR_ERROR_REASON_RELEASE_ALREADY_PUBLISHED)
+}
+
 /// RFC 8693 `grant_type` URI for the token-exchange flow.
 pub const TOKEN_EXCHANGE_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:token-exchange";
 

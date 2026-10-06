@@ -1,7 +1,7 @@
 use super::*;
 use crate::{
     SPACE_API_CLIENT_CONCURRENCY_LIMITER_FLAG, SPACE_CLUSTER_API_CLIENT_SIDE_BALANCING_FLAG,
-    SPACE_CLUSTER_RATE_LIMITER_FLAG,
+    SPACE_CLUSTER_RATE_LIMITER_FLAG, SPACE_NATIVE_CREATE_POOL_CLAIM_FLAG,
 };
 
 /// A declaration reports the key it was given and the fallback chosen for it,
@@ -55,6 +55,7 @@ fn the_shipped_boolean_flags_declare_the_fallbacks_their_features_need() {
         (SPACE_CLUSTER_RATE_LIMITER_FLAG, true),
         (SPACE_API_CLIENT_CONCURRENCY_LIMITER_FLAG, true),
         (SPACE_CLUSTER_API_CLIENT_SIDE_BALANCING_FLAG, false),
+        (SPACE_NATIVE_CREATE_POOL_CLAIM_FLAG, false),
     ] {
         assert_eq!(
             flag.when_unresolved(),

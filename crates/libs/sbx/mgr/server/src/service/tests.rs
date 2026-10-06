@@ -18221,10 +18221,7 @@ pub(crate) mod service_tests {
     async fn ingress_wake_retains_mutation_ownership_after_disconnect() {
         use prost::Message;
         use tonic::codec::Codec;
-        if !crate::service::tests::enter_route_test_process(&[(
-            "SPACE_INGRESS_WAKE_ENABLED",
-            Some(std::ffi::OsStr::new("true")),
-        )]) {
+        if !crate::service::tests::enter_route_test_process(&[]) {
             return;
         }
         struct StartBody(Option<bytes::Bytes>);

@@ -26,6 +26,35 @@ fn detects_the_revocation_reason_and_nothing_else() {
 }
 
 #[test]
+fn detects_the_release_already_published_reason_and_nothing_else() {
+    let mut metadata = tonic::metadata::MetadataMap::new();
+    metadata.insert(
+        CREDMGR_ERROR_REASON_METADATA_KEY,
+        CREDMGR_ERROR_REASON_RELEASE_ALREADY_PUBLISHED
+            .parse()
+            .unwrap(),
+    );
+    let published =
+        tonic::Status::with_metadata(tonic::Code::PermissionDenied, "published", metadata);
+    assert!(status_is_release_already_published(&published));
+
+    // Same code, no reason metadata: an unrelated denial.
+    let plain = tonic::Status::permission_denied("caller is not authorized");
+    assert!(!status_is_release_already_published(&plain));
+
+    // Reason present on another code: not a publication refusal.
+    let mut metadata = tonic::metadata::MetadataMap::new();
+    metadata.insert(
+        CREDMGR_ERROR_REASON_METADATA_KEY,
+        CREDMGR_ERROR_REASON_RELEASE_ALREADY_PUBLISHED
+            .parse()
+            .unwrap(),
+    );
+    let wrong_code = tonic::Status::with_metadata(tonic::Code::Internal, "published", metadata);
+    assert!(!status_is_release_already_published(&wrong_code));
+}
+
+#[test]
 fn detects_a_node_ca_unavailable_reason_of_any_kind_and_nothing_else() {
     for suffix in ["authority_not_configured", "authority_unavailable"] {
         let mut metadata = tonic::metadata::MetadataMap::new();

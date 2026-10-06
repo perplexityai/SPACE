@@ -9,8 +9,8 @@ use futures_util::{FutureExt, TryStream, TryStreamExt};
 use prost::Message;
 
 use pplx_space_build_mgr::{
-    BuildError, BuildOutcome, BuildPhase, PublishError, TemplateBuilder, TemplateOrg, blob,
-    publish_build,
+    BuildError, BuildOutcome, BuildPhase, PublishError, SystemPublicationGrantId, TemplateBuilder,
+    TemplateOrg, TemplatePublication, blob, publish_build,
     recipe::{CopyPayload, Recipe, Step},
     register_build_template,
 };
@@ -268,7 +268,7 @@ trait BuildBackend: Send + Sync {
     async fn ensure_cluster_template(
         &self,
         template_id: &str,
-        template_org: Option<TemplateOrg>,
+        publication: TemplatePublication,
     ) -> Result<(), PublishError>;
 
     async fn build(
@@ -285,7 +285,7 @@ trait BuildBackend: Send + Sync {
         template_id: &str,
         content_hash: &str,
         publish_tags: &[String],
-        template_org: Option<TemplateOrg>,
+        publication: TemplatePublication,
     ) -> Result<(), PublishError>;
 
     /// Deletes the node's superseded local builds of the template, keeping
@@ -301,9 +301,9 @@ impl BuildBackend for RuntimeBuildBackend {
     async fn ensure_cluster_template(
         &self,
         template_id: &str,
-        template_org: Option<TemplateOrg>,
+        publication: TemplatePublication,
     ) -> Result<(), PublishError> {
-        register_build_template(template_id, template_org).await
+        register_build_template(template_id, publication).await
     }
 
     async fn build(
@@ -325,9 +325,9 @@ impl BuildBackend for RuntimeBuildBackend {
         template_id: &str,
         content_hash: &str,
         publish_tags: &[String],
-        template_org: Option<TemplateOrg>,
+        publication: TemplatePublication,
     ) -> Result<(), PublishError> {
-        publish_build(template_id, content_hash, publish_tags, template_org).await
+        publish_build(template_id, content_hash, publish_tags, publication).await
     }
 
     async fn prune_replaced_builds(&self, template_id: &str, keep_hash: &str) {
@@ -388,6 +388,10 @@ impl JobExecutor for BuildExecutor {
         let recipe_label = payload.recipe_label.clone();
         let publish_tags = payload.publish_tags.clone();
         let template_org = payload.template_org;
+        let publication = match template_org {
+            Some(org) => TemplatePublication::Tenant(org),
+            None => TemplatePublication::System(payload.system_publication_grant_id),
+        };
         let build_span = tracing::info_span!(
             "template.build.job",
             otel.kind = "internal",
@@ -410,7 +414,7 @@ impl JobExecutor for BuildExecutor {
             );
 
             let build_result = if let Err(error) = backend
-                .ensure_cluster_template(&template_id, template_org)
+                .ensure_cluster_template(&template_id, publication)
                 .await
             {
                 BuildJobResult {
@@ -459,7 +463,7 @@ impl JobExecutor for BuildExecutor {
                                 "build phase started"
                             );
                             let result = backend
-                                .publish(&template_id, &hash, &publish_tags, template_org)
+                                .publish(&template_id, &hash, &publish_tags, publication)
                                 .await;
                             let step_result = pplx_space_metrics::template::TemplateBuildStepResult::from_ok(result.is_ok());
                             let result_tag = step_result.as_str();
@@ -711,6 +715,7 @@ impl BuildManager for BuildManagerDaemonService {
             request.get_ref().org_id.as_deref(),
         )?;
         let StartBuildRequest {
+            system_publication_grant_id,
             recipe,
             template_id,
             options,
@@ -731,6 +736,16 @@ impl BuildManager for BuildManagerDaemonService {
         };
         let options = options.unwrap_or_default();
         let template_org = parse_template_org(org_id)?;
+        let system_publication_grant_id = system_publication_grant_id
+            .as_deref()
+            .map(str::parse::<SystemPublicationGrantId>)
+            .transpose()
+            .map_err(|_| Status::invalid_argument("invalid system publication grant ID"))?;
+        if template_org.is_some() && system_publication_grant_id.is_some() {
+            return Err(Status::invalid_argument(
+                "tenant builds cannot carry a system publication grant",
+            ));
+        }
         if template_id.is_empty() {
             return Err(Status::invalid_argument("template_id is required"));
         }
@@ -752,6 +767,7 @@ impl BuildManager for BuildManagerDaemonService {
             force: options.force,
             publish_tags: options.publish_tags,
             template_org,
+            system_publication_grant_id,
         };
         // Every submission gets its own job (no dedup key); the worker's
         // serialized-subjects lease claim queues same-template jobs FIFO

@@ -56,5 +56,14 @@ pplx-space-spaced-common = { workspace = true }
 pplx-space-template-mgr-client = { workspace = true }
 
 [dev-dependencies]
+pplx-space-common-svc = { workspace = true, features = ["test-support"] }
+pplx-space-credmgr = { workspace = true, features = ["test-hooks"] }
+pplx-space-db-test-fixtures = { workspace = true }
+pplx-space-internal-api-server = { workspace = true }
+pplx-space-test-env = { workspace = true }
 prost = { workspace = true }
 rstest = { workspace = true }
+sqlx = { workspace = true, features = ["json", "postgres", "runtime-tokio", "uuid"] }
+tokio-stream = { workspace = true, features = ["net"] }
+tokio-util = { workspace = true }
+uuid = { workspace = true, features = ["v7"] }

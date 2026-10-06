@@ -20,6 +20,10 @@ pub const METRICS_TARGET: &str = "space::metrics";
 
 pub(super) trait MetricSink: Send + Sync {
     fn label(&self) -> &'static str;
+    /// Whether emitted metrics leave the process.
+    fn exports(&self) -> bool {
+        true
+    }
     fn emit(&self, metric: Metric<'_>);
     fn shutdown(&self) {}
 }
@@ -86,6 +90,10 @@ impl MetricsSinkMode {
 impl MetricSink for OffSink {
     fn label(&self) -> &'static str {
         "off"
+    }
+
+    fn exports(&self) -> bool {
+        false
     }
 
     fn emit(&self, _metric: Metric<'_>) {}

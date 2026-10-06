@@ -6,18 +6,18 @@ add a new migration in the same store directory instead.
 
 The first public PostgreSQL migration is `20261002070625_baseline`; SQLite
 stores start at `20260930000000_baseline`. These preserve the final historical
-schemas and are rollback floors. Startup automatically adopts fully prepared
-historical databases, including shared jobs, after validating the complete
-history and destination checksum. It archives the original history and replaces
-only migration metadata in one transaction; application rows are unchanged.
-Schema comparison remains a rollout prerequisite. Incompatible histories fail
-without repair or automatic database recreation.
+schemas and are rollback floors. Startup supports fresh databases and compatible
+public migration histories. Historical catalogs predating these baselines are
+unsupported and rejected without rewriting history or recreating the database.
+This also applies to retained databases returning from offline storage. Images
+with historical catalogs cannot reopen public histories; do not roll back across
+that boundary.
 
-Keep automatic cutover support until service and shared histories are verified
-across active and retained databases, including databases returning from offline
-storage. The shared jobs baseline and runtime cleanup may ship together because
-this transition remains available. Images with historical catalogs cannot reopen
-public histories; do not roll back across that boundary.
+Before removing history-conversion support from an existing deployment, deploy
+a release that still supports the conversion and verify that PostgreSQL and all
+service and shared SQLite histories use the public baselines. Account for
+retained and offline databases too; successful startup of active services alone
+does not establish that the transition is complete.
 
 The PostgreSQL migrator ignores `goose_db_version`, whether present or absent.
 
@@ -267,9 +267,9 @@ complete applied history, even for an otherwise backward-compatible schema.
 Use expand/contract sequencing and retain verified backups.
 
 The migrator never adopts untracked schemas, repairs rejected history, or
-recreates a database after a migration failure. The only history replacement is
-the validated, archived baseline transition described above. The manual cutover
-tools and baseline runbooks are retired; normal startup owns that transition.
+recreates a database after a migration failure. Baseline history conversion is
+unsupported. Preserve rejected databases for a reviewed state-preserving recovery
+plan; never edit history rows to bypass validation.
 
 Image-only rollback to a historical catalog is unsupported for every public
 SQLite database, including ones created on new nodes. Older binaries can insert

@@ -42,6 +42,7 @@ impl BuildSurface {
                 path,
                 "/space.node.api.v1.ClusterApi/RegisterTemplate"
                     | "/space.node.api.v1.ClusterApi/RegisterTemplateRelease"
+                    | "/space.node.api.v1.ClusterApi/CreateSystemTemplatePublicationGrant"
             ),
         }
     }
@@ -200,17 +201,27 @@ impl BuildAuthenticator {
     }
 }
 
+/// What a caller may do with system (ownerless) templates.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SystemTemplateAuthority {
+    Denied,
+    /// System publication only for an independently authorized build: ClusterApi
+    /// requires that build's `template_system_publication_grants` row.
+    Granted,
+    Unconditional,
+}
+
 #[derive(Clone, Debug)]
 pub struct BuildAuthenticatedCaller {
     can_assert_org: bool,
-    can_publish_system: bool,
+    system: SystemTemplateAuthority,
 }
 
 impl BuildAuthenticatedCaller {
     const fn trusted_deployment() -> Self {
         Self {
             can_assert_org: true,
-            can_publish_system: true,
+            system: SystemTemplateAuthority::Unconditional,
         }
     }
 
@@ -235,11 +246,36 @@ pub fn authorize_template_build<T>(
         Some(_) if !caller.can_assert_org => Err(Status::permission_denied(
             "tenant build requires organization assertion authority",
         )),
-        None if !caller.can_publish_system => Err(Status::permission_denied(
+        None if caller.system == SystemTemplateAuthority::Denied => Err(Status::permission_denied(
             "system build requires system publisher authority",
         )),
         _ => Ok(()),
     }
+}
+
+/// Only an independently authorized system publisher may delegate publication
+/// to a build. A dual-authority publisher cannot mint its own authorization.
+pub fn authorize_system_publication_grant<T>(request: &Request<T>) -> Result<(), Status> {
+    if request
+        .extensions()
+        .get::<BuildAuthenticatedCaller>()
+        .is_some_and(|caller| caller.system == SystemTemplateAuthority::Unconditional)
+    {
+        Ok(())
+    } else {
+        Err(Status::permission_denied(
+            "issuing a system publication grant requires system-only publisher authority",
+        ))
+    }
+}
+
+/// Whether a system publication by the caller needs an independently issued
+/// build grant. An unauthenticated caller is rejected by [`authorize_template_build`].
+pub fn system_publication_requires_grant<T>(request: &Request<T>) -> bool {
+    request
+        .extensions()
+        .get::<BuildAuthenticatedCaller>()
+        .is_some_and(|caller| caller.system == SystemTemplateAuthority::Granted)
 }
 
 impl<S> Layer<S> for BuildAuthLayer {

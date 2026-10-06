@@ -317,6 +317,7 @@ async fn register_template_with_org(
 ) -> Result<(), tonic::Status> {
     service
         .register_template(publisher_request(RegisterTemplateRequest {
+            system_publication_grant_id: None,
             name: name.to_string(),
             description: None,
             org_id: org_id.map(|org_id| org_id.to_string()),
@@ -347,6 +348,7 @@ async fn register_release(
 ) -> Result<RegisterTemplateReleaseResponse, tonic::Status> {
     Ok(service
         .register_template_release(publisher_request(RegisterTemplateReleaseRequest {
+            system_publication_grant_id: None,
             template_name: "code-runtime".to_string(),
             runtime: "fc".to_string(),
             hash: hash.to_string(),
@@ -369,6 +371,7 @@ async fn register_release_with_execution(
 ) -> Result<RegisterTemplateReleaseResponse, tonic::Status> {
     Ok(service
         .register_template_release(publisher_request(RegisterTemplateReleaseRequest {
+            system_publication_grant_id: None,
             template_name: "code-runtime".to_string(),
             runtime: "fc".to_string(),
             hash: hash.to_string(),
@@ -779,6 +782,7 @@ async fn build_release_keeps_the_submitting_org_and_rejects_another_owner() -> T
     let name = format!("owned-build-{}", Uuid::now_v7());
     register_template_with_org(&fixture.service, &name, Some(OrgId::from_uuid(owner))).await?;
     let request = RegisterTemplateReleaseRequest {
+        system_publication_grant_id: None,
         template_name: name.clone(),
         runtime: "fc".into(),
         hash: format!("sha256:{}", "a".repeat(64)),
@@ -805,6 +809,146 @@ async fn build_release_keeps_the_submitting_org_and_rejects_another_owner() -> T
         "SELECT t.org_id, r.org_id FROM templates t JOIN template_releases r ON r.template_name = t.name WHERE t.name = $1"
     )).bind(&name).fetch_one(&fixture.service.pool).await?;
     assert_eq!((template_org, release_org), (Some(owner), Some(owner)));
+    Ok(())
+}
+
+/// A release registered before the `sha256:` prefix was required is stored
+/// bare. Registering the same digest in canonical form, as build-manager does
+/// when it republishes tags for an already published release, must attach the
+/// tags to that row rather than create a second, artifact-less release beside
+/// it and move the tags there.
+#[tokio::test(flavor = "current_thread")]
+async fn register_template_release_reuses_a_bare_hash_release() -> TestResult {
+    let Some(fixture) = cluster_fixture().await? else {
+        return Ok(());
+    };
+    let pool = &fixture.service.pool;
+    register_template(&fixture.service, "code-runtime").await?;
+    let bare = "c".repeat(64);
+    let canonical = format!("sha256:{bare}");
+    let storage = format!("s3://bucket/templates/code-runtime/{canonical}?region=us-east-1");
+    let legacy_id = Uuid::now_v7();
+    sqlx::query(sql!(
+        "INSERT INTO template_releases (id, template_name, type, hash)
+         VALUES ($1, 'code-runtime', 'fc', $2)"
+    ))
+    .bind(legacy_id)
+    .bind(&bare)
+    .execute(pool)
+    .await?;
+    sqlx::query(sql!(
+        "INSERT INTO template_release_tags (template_name, template_release_id, tag)
+         VALUES ('code-runtime', $1, 'stable')"
+    ))
+    .bind(legacy_id)
+    .execute(pool)
+    .await?;
+    sqlx::query(sql!(
+        "INSERT INTO template_release_storage_locations
+             (template_release_id, storage_connection_string)
+         VALUES ($1, $2)"
+    ))
+    .bind(legacy_id)
+    .bind(&storage)
+    .execute(pool)
+    .await?;
+
+    // A tags-only republication of the canonical spelling.
+    let republished = register_release(&fixture.service, &canonical, &["latest"], &[]).await?;
+    assert_eq!(
+        republished.release.expect("release").id,
+        legacy_id.to_string()
+    );
+    let releases: i64 = sqlx::query_scalar(sql!(
+        "SELECT COUNT(*) FROM template_releases WHERE template_name = 'code-runtime'"
+    ))
+    .fetch_one(pool)
+    .await?;
+    assert_eq!(
+        releases, 1,
+        "no second release may appear beside the bare row"
+    );
+
+    let latest = fixture
+        .service
+        .find_template_release(Request::new(FindTemplateReleaseRequest {
+            caller_org_id: None,
+            template_name: "code-runtime".to_string(),
+            runtime: "firecracker".to_string(),
+            tag: "latest".to_string(),
+        }))
+        .await?
+        .into_inner();
+    assert_eq!(latest.release.expect("latest").id, legacy_id.to_string());
+    assert_eq!(latest.storage_locations.len(), 1);
+    assert_eq!(latest.storage_locations[0].connection_string, storage);
+    Ok(())
+}
+
+/// When a digest already exists under both spellings, registration must land
+/// on the row that owns the recorded artifacts, whichever spelling and
+/// whichever age that is. Tags attached to the artifact-less duplicate would
+/// resolve to a release nothing can pull.
+#[tokio::test(flavor = "current_thread")]
+async fn register_template_release_prefers_the_duplicate_that_owns_a_location() -> TestResult {
+    let Some(fixture) = cluster_fixture().await? else {
+        return Ok(());
+    };
+    let pool = &fixture.service.pool;
+    register_template(&fixture.service, "code-runtime").await?;
+
+    // The older row is always the bare one; the location sits on the older
+    // row in one arrangement and on the newer canonical row in the other.
+    for (digit, location_on_older) in [('d', false), ('e', true)] {
+        let bare = digit.to_string().repeat(64);
+        let canonical = format!("sha256:{bare}");
+        let storage = format!("s3://bucket/templates/code-runtime/{canonical}?region=us-east-1");
+        let older = Uuid::now_v7();
+        let newer = Uuid::now_v7();
+        sqlx::query(sql!(
+            "INSERT INTO template_releases (id, template_name, type, hash, created_at)
+             VALUES ($1, 'code-runtime', 'fc', $2, NOW() - INTERVAL '1 day'),
+                    ($3, 'code-runtime', 'fc', $4, NOW())"
+        ))
+        .bind(older)
+        .bind(&bare)
+        .bind(newer)
+        .bind(&canonical)
+        .execute(pool)
+        .await?;
+        let owner = if location_on_older { older } else { newer };
+        sqlx::query(sql!(
+            "INSERT INTO template_release_storage_locations
+                 (template_release_id, storage_connection_string)
+             VALUES ($1, $2)"
+        ))
+        .bind(owner)
+        .bind(&storage)
+        .execute(pool)
+        .await?;
+
+        let tag = format!("release-{digit}");
+        let republished =
+            register_release(&fixture.service, &canonical, &[tag.as_str()], &[]).await?;
+        assert_eq!(
+            republished.release.expect("release").id,
+            owner.to_string(),
+            "registration must pick the duplicate that owns the artifacts"
+        );
+        let resolved = fixture
+            .service
+            .find_template_release(Request::new(FindTemplateReleaseRequest {
+                caller_org_id: None,
+                template_name: "code-runtime".to_string(),
+                runtime: "firecracker".to_string(),
+                tag,
+            }))
+            .await?
+            .into_inner();
+        assert_eq!(resolved.release.expect("tagged").id, owner.to_string());
+        assert_eq!(resolved.storage_locations.len(), 1);
+        assert_eq!(resolved.storage_locations[0].connection_string, storage);
+    }
     Ok(())
 }
 
@@ -890,6 +1034,7 @@ async fn register_template_release_is_idempotent_by_hash() -> TestResult {
     let retagged = fixture
         .service
         .register_template_release(publisher_request(RegisterTemplateReleaseRequest {
+            system_publication_grant_id: None,
             template_name: "code-runtime".to_string(),
             runtime: "fc".to_string(),
             hash: digest_a.to_string(),
@@ -1086,6 +1231,67 @@ async fn register_template_release_persists_execution_metadata_write_once() -> T
         Some("aarch64")
     );
 
+    Ok(())
+}
+
+/// A tags-only republication, which build-manager issues when the release is
+/// already published or when Credential Manager refused the write for that
+/// reason, carries no storage location and no execution metadata, so it adds
+/// its tag and leaves the published release's locations and metadata exactly
+/// as they were, including a `NULL` metadata column.
+#[tokio::test(flavor = "current_thread")]
+async fn tags_only_republication_leaves_locations_and_metadata_unchanged() -> TestResult {
+    use pplx_space_common_core::types::{Arch, ExecutionMetadata};
+
+    let Some(fixture) = cluster_fixture().await? else {
+        return Ok(());
+    };
+    register_template(&fixture.service, "code-runtime").await?;
+    let digest_a = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let digest_b = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let storage_a = "s3://bucket/templates/code-runtime/sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa?region=us-east-1";
+    let storage_b = "s3://bucket/templates/code-runtime/sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb?region=us-east-1";
+    let stored = |hash: &str| {
+        let pool = fixture.service.pool.clone();
+        let hash = hash.to_string();
+        async move {
+            sqlx::query_as::<_, (Option<String>, i64)>(sql!(
+                "SELECT r.execution_metadata->'guest'->>'architecture',
+                        (SELECT COUNT(*) FROM template_release_storage_locations l
+                          WHERE l.template_release_id = r.id)
+                 FROM template_releases r
+                 WHERE r.template_name = 'code-runtime' AND r.hash = $1"
+            ))
+            .bind(hash)
+            .fetch_one(&pool)
+            .await
+        }
+    };
+
+    // A published release with metadata and one location...
+    let x86 = ExecutionMetadata::initial_firecracker(Arch::X86_64, vec![]);
+    register_release_with_execution(&fixture.service, digest_a, &x86).await?;
+    register_release(&fixture.service, digest_a, &["latest"], &[storage_a]).await?;
+    // ...and one published before metadata was recorded.
+    register_release(&fixture.service, digest_b, &["latest"], &[storage_b]).await?;
+    assert_eq!(stored(digest_a).await?, (Some("x86_64".to_string()), 1));
+    assert_eq!(stored(digest_b).await?, (None, 1));
+
+    for digest in [digest_a, digest_b] {
+        let republished = register_release(&fixture.service, digest, &["stable"], &[]).await?;
+        // The response lists what this call registered: the tag, no location.
+        assert!(republished.storage_locations.is_empty());
+        assert_eq!(
+            republished
+                .tags
+                .iter()
+                .map(|tag| tag.tag.as_str())
+                .collect::<Vec<_>>(),
+            vec!["stable"]
+        );
+    }
+    assert_eq!(stored(digest_a).await?, (Some("x86_64".to_string()), 1));
+    assert_eq!(stored(digest_b).await?, (None, 1));
     Ok(())
 }
 
@@ -3854,6 +4060,7 @@ async fn finalize(
                 target_state: target as i32,
                 bytes_uploaded: bytes,
                 failure_reason: None,
+                artifact_digests: Vec::new(),
             },
             TEST_WORKER_IP,
         ))
@@ -3972,6 +4179,7 @@ async fn finalize_artifact_backup_from_node(
                 target_state: SuspendSnapshotTerminalState::Ready as i32,
                 bytes_uploaded: 42,
                 failure_reason: None,
+                artifact_digests: Vec::new(),
             },
             node_ip,
         ))
@@ -5207,6 +5415,7 @@ async fn finalize_failed_persists_failure_reason() -> TestResult {
                 target_state: SuspendSnapshotTerminalState::Failed as i32,
                 bytes_uploaded: 0,
                 failure_reason: Some(reason.to_string()),
+                artifact_digests: Vec::new(),
             },
             TEST_WORKER_IP,
         ))
@@ -5275,6 +5484,7 @@ async fn finalize_failed_blank_reason_is_treated_as_absent() -> TestResult {
                 target_state: SuspendSnapshotTerminalState::Failed as i32,
                 bytes_uploaded: 0,
                 failure_reason: Some("   \t  ".to_string()),
+                artifact_digests: Vec::new(),
             },
             TEST_WORKER_IP,
         ))
@@ -6322,3 +6532,294 @@ async fn a_missing_templates_table_degrades_end_to_end() -> TestResult {
 }
 
 mod publication;
+
+#[tokio::test(flavor = "current_thread")]
+async fn ecw_route_resolve_enforces_key_surface_and_organization() -> TestResult {
+    if !pplx_space_test_env::enter_test_process(&[
+        (
+            "SPACE_INTERNAL_RPC_INSECURE_DEV",
+            Some(std::ffi::OsStr::new("true")),
+        ),
+        (
+            "SPACE_INTERNAL_TOKEN",
+            Some(std::ffi::OsStr::new("route-scope-test-token")),
+        ),
+    ]) {
+        return Ok(());
+    }
+    let fixture = cluster_fixture()
+        .await?
+        .expect("Postgres is required for this reproduction");
+    let node_id = NodeId::new();
+    let sandbox_id = SandboxId::new();
+    let key_hash = sha256_hex("route-scope-test-native-only-key");
+    insert_data_plane_worker_node(&fixture.service.pool, node_id, "192.0.2.41").await?;
+    let node_api = sim_worker_node_api(node_id).await?;
+    insert_data_plane_direct_node_endpoint(&fixture.service.pool, node_id, node_api.endpoint())
+        .await?;
+    insert_data_plane_active_sandbox(&fixture.service.pool, sandbox_id, node_id).await?;
+    insert_active_execution(&fixture.service.pool, sandbox_id, "192.0.2.42", 1).await?;
+    insert_e2b_api_key(&fixture.service.pool, &key_hash).await?;
+
+    let request = |hash: String| {
+        Request::new(UnstableResolveSandboxServiceRouteRequest {
+            sandbox_id: sandbox_id.to_string(),
+            port: 49_983,
+            route_kind: SandboxServiceRouteKind::Agent as i32,
+            transport: SandboxServiceRouteTransport::Direct as i32,
+            credential_proofs: vec![route_credential_proof(
+                SandboxServiceRouteCredentialKind::OrgApiKey,
+                hash,
+            )],
+        })
+    };
+
+    let invalid = fixture
+        .service
+        .unstable_resolve_sandbox_service_route(request(sha256_hex("wrong-key")))
+        .await
+        .expect_err("an invalid key must be rejected");
+    assert_eq!(invalid.code(), Code::Unauthenticated);
+
+    for surfaces in [vec!["ecw"], vec!["native"], vec!["ecw", "native"]] {
+        sqlx::query(pplx_space_common_core::sql!(
+            "UPDATE api_keys SET allowed_surfaces = $1 WHERE key_hash = $2"
+        ))
+        .bind(&surfaces)
+        .bind(&key_hash)
+        .execute(&fixture.service.pool)
+        .await?;
+        let result = fixture
+            .service
+            .unstable_resolve_sandbox_service_route(request(key_hash.clone()))
+            .await;
+        if surfaces.contains(&"ecw") {
+            let route = result?.into_inner();
+            assert_eq!(route.sandbox_id, sandbox_id.to_string());
+            assert!(route.space_api_route_token.is_some());
+        } else {
+            assert!(
+                matches!(result, Err(status) if status.code() == Code::Unauthenticated),
+                "native-only keys cannot control the ECW agent"
+            );
+        }
+    }
+
+    sqlx::query(pplx_space_common_core::sql!(
+        "UPDATE api_keys SET org_id = '00000000-0000-0000-0000-000000000002' WHERE key_hash = $1"
+    ))
+    .bind(&key_hash)
+    .execute(&fixture.service.pool)
+    .await?;
+    let other_org = fixture
+        .service
+        .unstable_resolve_sandbox_service_route(request(key_hash))
+        .await
+        .expect_err("a key from another organization must be rejected");
+    assert_eq!(other_org.code(), Code::Unauthenticated);
+    Ok(())
+}
+
+fn test_artifact_digests() -> Vec<crate::proto::SnapshotArtifactDigest> {
+    vec![
+        crate::proto::SnapshotArtifactDigest {
+            artifact: "memfile".to_string(),
+            digest: format!("sha256:{}", "22".repeat(32)),
+            size_bytes: 1 << 30,
+        },
+        crate::proto::SnapshotArtifactDigest {
+            artifact: "binfile".to_string(),
+            digest: format!("sha256:{}", "11".repeat(32)),
+            size_bytes: 4096,
+        },
+    ]
+}
+
+async fn finalize_ready_with_digests(
+    service: &ClusterApiService,
+    backup_attempt_id: SnapshotId,
+    artifact_digests: Vec<crate::proto::SnapshotArtifactDigest>,
+) -> Result<(), tonic::Status> {
+    service
+        .finalize_artifact_backup(request_from_node(
+            FinalizeArtifactBackupRequest {
+                backup_attempt_id: backup_attempt_id.to_string(),
+                target_state: SuspendSnapshotTerminalState::Ready as i32,
+                bytes_uploaded: 4096 + (1 << 30),
+                failure_reason: None,
+                artifact_digests,
+            },
+            TEST_WORKER_IP,
+        ))
+        .await
+        .map(|_| ())
+}
+
+/// Digests the source node reports at finalize travel with the backup to
+/// both restore lookups, ordered by artifact file name.
+#[tokio::test(flavor = "current_thread")]
+async fn finalize_to_ready_publishes_artifact_digests_to_restore_lookups() -> TestResult {
+    let Some(fixture) = cluster_fixture().await? else {
+        return Ok(());
+    };
+    let sandbox_id = seed_sandbox(&fixture.service.pool).await?;
+    let local_artifact_id = LocalArtifactId::new();
+    let backup_attempt_id = SnapshotId::new();
+    begin_artifact_backup(
+        &fixture.service,
+        sandbox_id,
+        local_artifact_id,
+        backup_attempt_id,
+        pplx_space_sbx_mgr_client::proto::ArtifactKind::Full,
+        pplx_space_sbx_mgr_client::proto::ArtifactOrigin::Suspend,
+    )
+    .await?;
+    finalize_ready_with_digests(&fixture.service, backup_attempt_id, test_artifact_digests())
+        .await?;
+
+    let mut expected = test_artifact_digests();
+    expected.sort_by(|a, b| a.artifact.cmp(&b.artifact));
+    let artifact = get_artifact_location(
+        &fixture.service,
+        sandbox_id,
+        local_artifact_id,
+        pplx_space_sbx_mgr_client::proto::ArtifactKind::Full,
+    )
+    .await?;
+    assert_eq!(artifact.artifact_digests, expected);
+    let suspend = get_location(&fixture.service, sandbox_id).await?;
+    assert_eq!(suspend.snapshot_id, backup_attempt_id.to_string());
+    assert_eq!(suspend.artifact_digests, expected);
+    Ok(())
+}
+
+/// Malformed digests are refused at the wire boundary and leave the attempt
+/// open for a well-formed retry.
+#[tokio::test(flavor = "current_thread")]
+async fn finalize_rejects_malformed_artifact_digests() -> TestResult {
+    let Some(fixture) = cluster_fixture().await? else {
+        return Ok(());
+    };
+    let sandbox_id = seed_sandbox(&fixture.service.pool).await?;
+    let backup_attempt_id = SnapshotId::new();
+    begin_artifact_backup(
+        &fixture.service,
+        sandbox_id,
+        LocalArtifactId::new(),
+        backup_attempt_id,
+        pplx_space_sbx_mgr_client::proto::ArtifactKind::Full,
+        pplx_space_sbx_mgr_client::proto::ArtifactOrigin::Suspend,
+    )
+    .await?;
+
+    let good = test_artifact_digests();
+    let mut unknown_artifact = good.clone();
+    unknown_artifact[0].artifact = "../memfile".to_string();
+    let mut malformed_digest = good.clone();
+    malformed_digest[0].digest = "sha256:not-hex".to_string();
+    let mut duplicate_artifact = good.clone();
+    duplicate_artifact[1].artifact = "memfile".to_string();
+    for artifact_digests in [unknown_artifact, malformed_digest, duplicate_artifact] {
+        let err =
+            finalize_ready_with_digests(&fixture.service, backup_attempt_id, artifact_digests)
+                .await
+                .expect_err("malformed digests must be refused");
+        assert_eq!(err.code(), Code::InvalidArgument);
+    }
+    let state: String = sqlx::query_scalar("SELECT state FROM snapshots WHERE id = $1")
+        .bind(backup_attempt_id)
+        .fetch_one(&fixture.service.pool)
+        .await?;
+    assert_eq!(state, "creating");
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn restore_locations_keep_digests_during_catalog_deletion() -> TestResult {
+    let Some(fixture) = cluster_fixture_with_max_connections(4).await? else {
+        return Ok(());
+    };
+    let mut results = Vec::new();
+    for use_artifact_lookup in [false, true] {
+        let sandbox_id = seed_sandbox(&fixture.service.pool).await?;
+        let local_artifact_id = LocalArtifactId::new();
+        let attempt = SnapshotId::new();
+        begin_artifact_backup(
+            &fixture.service,
+            sandbox_id,
+            local_artifact_id,
+            attempt,
+            pplx_space_sbx_mgr_client::proto::ArtifactKind::Full,
+            pplx_space_sbx_mgr_client::proto::ArtifactOrigin::Suspend,
+        )
+        .await?;
+        finalize_ready_with_digests(&fixture.service, attempt, test_artifact_digests()).await?;
+
+        // Stop the digest read after the location read, then perform real
+        // teardown. Object bytes outlive the catalog until the orphan sweep.
+        let mut deletion = fixture.service.pool.begin().await?;
+        sqlx::query(sql!(
+            "LOCK TABLE snapshot_artifact_digests IN ACCESS EXCLUSIVE MODE"
+        ))
+        .execute(&mut *deletion)
+        .await?;
+        let blocker: i32 = sqlx::query_scalar(sql!("SELECT pg_backend_pid()"))
+            .fetch_one(&mut *deletion)
+            .await?;
+        let lookup = async {
+            if use_artifact_lookup {
+                get_artifact_location(
+                    &fixture.service,
+                    sandbox_id,
+                    local_artifact_id,
+                    pplx_space_sbx_mgr_client::proto::ArtifactKind::Full,
+                )
+                .await
+                .map(|location| location.artifact_digests)
+            } else {
+                get_location(&fixture.service, sandbox_id)
+                    .await
+                    .map(|location| location.artifact_digests)
+            }
+        };
+        let remove = async {
+            loop {
+                let blocked: bool = sqlx::query_scalar(sql!(
+                    "SELECT EXISTS (
+                         SELECT 1 FROM pg_stat_activity
+                         WHERE datname = current_database()
+                           AND $1 = ANY(pg_blocking_pids(pid)))"
+                ))
+                .bind(blocker)
+                .fetch_one(&fixture.service.pool)
+                .await?;
+                if blocked {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            pplx_space_sandbox_teardown::finalize_sandbox_db_delete_tx(&mut deletion, sandbox_id)
+                .await?;
+            deletion.commit().await
+        };
+        let (result, removed) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            tokio::join!(lookup, remove)
+        })
+        .await?;
+        removed?;
+        results.push((use_artifact_lookup, result));
+    }
+
+    let mut expected = test_artifact_digests();
+    expected.sort_by(|a, b| a.artifact.cmp(&b.artifact));
+    for (use_artifact_lookup, result) in results {
+        match result {
+            Ok(digests) => assert_eq!(
+                digests, expected,
+                "a selected location must retain its digests (artifact lookup: {use_artifact_lookup})"
+            ),
+            Err(status) => assert_eq!(status.code(), Code::NotFound),
+        }
+    }
+    Ok(())
+}

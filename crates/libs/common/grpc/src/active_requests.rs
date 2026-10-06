@@ -28,10 +28,17 @@ pub(crate) fn process_layer() -> InFlightRequestsLayer {
 
 /// Claiming the slot only after a runtime is found leaves a later call — one
 /// made from inside a runtime — free to start sampling, and keeps the spawn to
-/// once however many listeners a process builds.
+/// once however many listeners a process builds. A process that exports no
+/// metrics (its sink is off, as in a sandbox guest) does not sample: the
+/// samples would go nowhere, and the sampler would wake the process every
+/// second for its whole life.
 fn start_sampler(counter: &InFlightRequestsCounter) {
     static SAMPLER: OnceLock<()> = OnceLock::new();
     if SAMPLER.get().is_some() {
+        return;
+    }
+    if !pplx_space_observability::metrics_enabled() {
+        tracing::debug!("metrics are not exported; gRPC active-request sampling not started");
         return;
     }
     let Ok(runtime) = tokio::runtime::Handle::try_current() else {

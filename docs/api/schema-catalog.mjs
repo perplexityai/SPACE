@@ -18,6 +18,7 @@ export const modelGroups = [
       ['SandboxConditionType', 'Condition type', 'Identifies the kind of readiness or failure observation.'],
       ['ConditionStatus', 'Condition status', 'The reported truth value of a sandbox condition.'],
       ['SandboxFailureCode', 'Sandbox failure code', 'A machine-readable classification of an observed sandbox failure.'],
+      ['SandboxIdleAction', 'Idle action', 'What happens when a sandbox stays idle past its idle timeout; tolerate unknown future values.'],
     ],
   },
   {

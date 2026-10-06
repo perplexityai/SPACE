@@ -937,3 +937,232 @@ async fn upsert_pool_config_takes_manual_ownership_from_autoscaler() -> TestResu
     assert_eq!(config.target_ready_slots, 0);
     Ok(())
 }
+
+/// Put the fixture's slot in the state a create admitted against it leaves:
+/// `claimed` under a fresh claim ID, its sandbox not yet created.
+async fn admit_fixture_slot(
+    pool: &PgPool,
+    slot: &ReadyPoolSlotFixture,
+) -> TestResult<AdmittedPoolClaim> {
+    let claim_id = Uuid::now_v7();
+    let pool_slot_id: Uuid = sqlx::query_scalar(sql!(
+        "UPDATE kubernetes_pool_slots
+         SET state = 'claimed', claim_id = $2, claimed_at = NOW()
+         WHERE reserved_sandbox_id = $1
+         RETURNING id"
+    ))
+    .bind(slot.sandbox_id)
+    .bind(claim_id)
+    .fetch_one(pool)
+    .await?;
+    Ok(AdmittedPoolClaim {
+        claim_id,
+        pool_slot_id,
+    })
+}
+
+async fn fixture_slot_state(
+    pool: &PgPool,
+    slot: &ReadyPoolSlotFixture,
+) -> TestResult<Option<(String, Option<Uuid>)>> {
+    Ok(sqlx::query_as(sql!(
+        "SELECT state, claim_id FROM kubernetes_pool_slots WHERE reserved_sandbox_id = $1"
+    ))
+    .bind(slot.sandbox_id)
+    .fetch_optional(pool)
+    .await?)
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn postgres_admitted_claim_adopts_and_binds_the_exact_slot() -> TestResult {
+    let db = pg_test_db().await?;
+    let slot = insert_ready_pool_slot(&db.pool).await?;
+    let admitted = admit_fixture_slot(&db.pool, &slot).await?;
+    let (actor, env, auto_lifecycle, template_network_policy) = claim_test_context(&slot)?;
+    let request = claim_request_with_shape(
+        &actor,
+        &env,
+        &auto_lifecycle,
+        &template_network_policy,
+        slot.release_id,
+        &slot.content_hash,
+        Some(PooledExecutionPoolShape::new(4, 2048, Default::default())),
+    );
+
+    let lookup =
+        lookup_admitted_pooled_execution(&db.pool, &request, admitted, slot.sandbox_id, "space")
+            .await?;
+    let AdmittedPoolClaimLookup::Adoptable { claim, pool_shape } = lookup else {
+        panic!("a matching admitted claim must be adoptable");
+    };
+    assert_eq!(claim.claim_id, admitted.claim_id);
+    assert_eq!(claim.pool_slot_id, Some(admitted.pool_slot_id));
+    assert_eq!(claim.sandbox_id, slot.sandbox_id);
+    assert_eq!(claim.execution_generation, 1);
+    assert_eq!(claim.pod_name, "space-sbx-pooled-g1");
+    assert_eq!(claim.active_node_id, Some(slot.node_id));
+    assert_eq!(
+        pool_shape,
+        PooledExecutionPoolShape::new(4, 2048, Default::default())
+    );
+
+    let mut tx = db.pool.begin().await?;
+    insert_claimed_sandbox(&mut tx, &claim, slot.user_id, slot.org_id).await?;
+    persist_pooled_execution_claim(&mut tx, &request, &claim).await?;
+    tx.commit().await?;
+
+    assert_eq!(
+        fixture_slot_state(&db.pool, &slot).await?,
+        Some(("bound".to_string(), Some(admitted.claim_id)))
+    );
+    let executions: Vec<(i64, String, bool)> = sqlx::query_as(sql!(
+        "SELECT generation, pod_name, active FROM sandbox_k8s_executions WHERE sandbox_id = $1"
+    ))
+    .bind(slot.sandbox_id)
+    .fetch_all(&db.pool)
+    .await?;
+    assert_eq!(
+        executions,
+        vec![(1, "space-sbx-pooled-g1".to_string(), true)]
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn postgres_admitted_claim_mismatch_waits_and_leaves_other_claims_alone() -> TestResult {
+    // A slot claimed under a different claim ID still owns its pod under this
+    // ID; the create waits for the pool to collect it, without touching it.
+    let db = pg_test_db().await?;
+    let slot = insert_ready_pool_slot(&db.pool).await?;
+    let held = admit_fixture_slot(&db.pool, &slot).await?;
+    let (actor, env, auto_lifecycle, template_network_policy) = claim_test_context(&slot)?;
+    let request = pooled_claim_request(&actor, &env, &auto_lifecycle, &template_network_policy);
+    let stale = AdmittedPoolClaim {
+        claim_id: Uuid::now_v7(),
+        pool_slot_id: held.pool_slot_id,
+    };
+
+    let lookup =
+        lookup_admitted_pooled_execution(&db.pool, &request, stale, slot.sandbox_id, "space")
+            .await?;
+
+    assert!(matches!(lookup, AdmittedPoolClaimLookup::ReleasePending));
+    assert_eq!(
+        fixture_slot_state(&db.pool, &slot).await?,
+        Some(("claimed".to_string(), Some(held.claim_id)))
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn postgres_admitted_claim_for_a_different_slot_is_invalidated() -> TestResult {
+    // Our claim ID, but not the slot the operation recorded: never adopt it,
+    // and take it out of the inventory so the pool collects it.
+    let db = pg_test_db().await?;
+    let slot = insert_ready_pool_slot(&db.pool).await?;
+    let admitted = admit_fixture_slot(&db.pool, &slot).await?;
+    let (actor, env, auto_lifecycle, template_network_policy) = claim_test_context(&slot)?;
+    let request = pooled_claim_request(&actor, &env, &auto_lifecycle, &template_network_policy);
+    let other_slot = AdmittedPoolClaim {
+        claim_id: admitted.claim_id,
+        pool_slot_id: Uuid::now_v7(),
+    };
+
+    let lookup =
+        lookup_admitted_pooled_execution(&db.pool, &request, other_slot, slot.sandbox_id, "space")
+            .await?;
+
+    assert!(matches!(lookup, AdmittedPoolClaimLookup::ReleasePending));
+    assert_eq!(
+        fixture_slot_state(&db.pool, &slot).await?,
+        Some(("claimed".to_string(), None))
+    );
+    let reclaimed = claim_pooled_execution(&db.pool, &request, "space").await?;
+    assert!(
+        reclaimed.claim.is_none(),
+        "an invalidated slot is never handed out"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn postgres_admitted_claim_fences_a_slot_returned_to_ready() -> TestResult {
+    // If the slot went back to `ready`, another create could bind this ID.
+    // Fence it out of the inventory instead of adopting or leaving it.
+    let db = pg_test_db().await?;
+    let slot = insert_ready_pool_slot(&db.pool).await?;
+    let (actor, env, auto_lifecycle, template_network_policy) = claim_test_context(&slot)?;
+    let request = pooled_claim_request(&actor, &env, &auto_lifecycle, &template_network_policy);
+    let admitted = AdmittedPoolClaim {
+        claim_id: Uuid::now_v7(),
+        pool_slot_id: Uuid::now_v7(),
+    };
+
+    let lookup =
+        lookup_admitted_pooled_execution(&db.pool, &request, admitted, slot.sandbox_id, "space")
+            .await?;
+
+    assert!(matches!(lookup, AdmittedPoolClaimLookup::ReleasePending));
+    assert_eq!(
+        fixture_slot_state(&db.pool, &slot).await?,
+        Some(("claimed".to_string(), None))
+    );
+    let reclaimed = claim_pooled_execution(&db.pool, &request, "space").await?;
+    assert!(reclaimed.claim.is_none());
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn postgres_admitted_claim_missing_or_bound_slot_is_released() -> TestResult {
+    let db = pg_test_db().await?;
+    let slot = insert_ready_pool_slot(&db.pool).await?;
+    let admitted = admit_fixture_slot(&db.pool, &slot).await?;
+    let (actor, env, auto_lifecycle, template_network_policy) = claim_test_context(&slot)?;
+    let request = pooled_claim_request(&actor, &env, &auto_lifecycle, &template_network_policy);
+
+    // Bound: the slot's pod is a sandbox execution now, and its row only
+    // disappears with that sandbox, so it no longer holds a pool pod here.
+    sqlx::query(sql!(
+        "UPDATE kubernetes_pool_slots SET state = 'bound'
+         WHERE reserved_sandbox_id = $1"
+    ))
+    .bind(slot.sandbox_id)
+    .execute(&db.pool)
+    .await?;
+    let lookup =
+        lookup_admitted_pooled_execution(&db.pool, &request, admitted, slot.sandbox_id, "space")
+            .await?;
+    assert!(matches!(lookup, AdmittedPoolClaimLookup::Released));
+
+    // Missing: the stale-unbound sweep collected the slot and its pod.
+    sqlx::query(sql!(
+        "DELETE FROM kubernetes_pool_slots WHERE reserved_sandbox_id = $1"
+    ))
+    .bind(slot.sandbox_id)
+    .execute(&db.pool)
+    .await?;
+    let lookup =
+        lookup_admitted_pooled_execution(&db.pool, &request, admitted, slot.sandbox_id, "space")
+            .await?;
+    assert!(matches!(lookup, AdmittedPoolClaimLookup::Released));
+    assert!(!admitted_pool_cleanup_pending(&db.pool, slot.sandbox_id).await?);
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn postgres_admitted_pool_cleanup_pending_reports_failed_adoptions() -> TestResult {
+    let db = pg_test_db().await?;
+    let slot = insert_ready_pool_slot(&db.pool).await?;
+    assert!(!admitted_pool_cleanup_pending(&db.pool, slot.sandbox_id).await?);
+    sqlx::query(sql!(
+        "UPDATE kubernetes_pool_slots
+         SET state = 'cleanup_pending', claim_id = $2, claimed_at = NOW()
+         WHERE reserved_sandbox_id = $1"
+    ))
+    .bind(slot.sandbox_id)
+    .bind(Uuid::now_v7())
+    .execute(&db.pool)
+    .await?;
+    assert!(admitted_pool_cleanup_pending(&db.pool, slot.sandbox_id).await?);
+    Ok(())
+}

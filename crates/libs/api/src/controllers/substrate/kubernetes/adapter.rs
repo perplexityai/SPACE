@@ -10,7 +10,8 @@ use crate::controllers::db_contention_error;
 use crate::controllers::substrate::DbContext;
 use crate::controllers::substrate::PooledClaimRefusal;
 use crate::controllers::substrate::{
-    CreateBootMode, PooledExecutionClaim, PooledExecutionClaimAttempt, PooledExecutionClaimRequest,
+    AdmissionPoolClaim, AdmittedPoolClaim, AdmittedPoolClaimLookup, CreateBootMode,
+    PooledExecutionClaim, PooledExecutionClaimAttempt, PooledExecutionClaimRequest,
     PooledPrepareFailureCleanup, PublishedLocalArtifact, create_wait_should_preserve_node_work,
     enqueue_artifact_backup_with_client,
 };
@@ -740,6 +741,55 @@ pub(super) fn network_slot_capacity_preflight(
         NetworkSlotCapacityPreflight::Full
     } else {
         NetworkSlotCapacityPreflight::Unknown
+    }
+}
+
+impl KubernetesSubstrate {
+    /// Whether an admitted warm pod's node is somewhere this sandbox may run,
+    /// by the same rules `claim_pooled_execution` admits a claim under. Only
+    /// the outcomes that claim path *adopts* answer `true`; every outcome it
+    /// declines, refuses, or cannot decide answers `false`. Metrics stay with
+    /// the ordinary claim path, which owns the placement-admission series.
+    async fn admitted_pool_pod_placement_admits(
+        &self,
+        request: &PooledExecutionClaimRequest<'_>,
+        pod: Option<&Pod>,
+    ) -> bool {
+        let resolved = match self
+            .node_group_placement
+            .resolve(
+                NodeGroupResolvePath::PoolClaim,
+                PlacementSubject::Sandbox(request.actor.org_id),
+                request.template,
+            )
+            .await
+        {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                tracing::info!(
+                    template = request.template,
+                    %error,
+                    "could not resolve node-group placement for an admitted warm-pool slot"
+                );
+                return false;
+            }
+        };
+        match resolved.placement() {
+            None => match resolved {
+                ResolvedPlacement::Unprovisioned => matches!(
+                    pooled_pod_node_group(&self.k8s.caches, pod),
+                    PooledPodNodeGroup::Unlabeled
+                ),
+                ResolvedPlacement::Disabled | ResolvedPlacement::Placed(_) => true,
+            },
+            Some(placement) => {
+                placement.admits_shared_capacity()
+                    && matches!(
+                        pooled_pod_node_admission(&self.k8s.caches, placement, pod),
+                        PooledPodAdmission::Admitted
+                    )
+            }
+        }
     }
 }
 
@@ -4295,6 +4345,87 @@ impl SubstrateAdapter for KubernetesSubstrate {
             "stopped claiming Kubernetes warm-pool slots after discarding unusable candidates"
         );
         Ok(PooledExecutionClaimAttempt::missed(attempted_pool_shape))
+    }
+
+    async fn lookup_admitted_pooled_execution(
+        &self,
+        request: &PooledExecutionClaimRequest<'_>,
+        admitted: AdmittedPoolClaim,
+        sandbox_id: SandboxId,
+    ) -> Result<AdmittedPoolClaimLookup, ControllerError> {
+        let lookup = pool::lookup_admitted_pooled_execution(
+            self.store.pool(),
+            request,
+            admitted,
+            sandbox_id,
+            &self.k8s.sandbox_namespace,
+        )
+        .await?;
+        let AdmittedPoolClaimLookup::Adoptable { claim, pool_shape } = lookup else {
+            return Ok(lookup);
+        };
+
+        // The same pod and placement checks `claim_pooled_execution` makes,
+        // with one difference in how a slot is given up. The ordinary claim
+        // may `release` a slot that is fine for another caller; this slot's
+        // reserved ID is already this create's public ID, so returning it to
+        // the inventory would let another create bind the same ID. Every
+        // refusal here invalidates instead: the slot leaves the inventory, the
+        // stale-claimed sweep collects its pod, and this create builds cold.
+        let usable = match self.read_sandbox_pod(&claim.pod_name).await {
+            Ok(pod) => {
+                pooled_claim_pod_is_usable(&claim, pod.as_ref())
+                    && self
+                        .admitted_pool_pod_placement_admits(request, pod.as_ref())
+                        .await
+            }
+            Err(error) => {
+                tracing::warn!(
+                    claim_id = %claim.claim_id,
+                    sandbox_id = %claim.sandbox_id,
+                    pod_name = %claim.pod_name,
+                    %error,
+                    "failed to read the admitted warm-pool pod; not adopting it"
+                );
+                false
+            }
+        };
+        if !usable {
+            tracing::info!(
+                claim_id = %claim.claim_id,
+                sandbox_id = %claim.sandbox_id,
+                pod_name = %claim.pod_name,
+                "invalidating an admitted warm-pool slot this create will not adopt"
+            );
+            pool::invalidate_claimed_pool_slot(self.store.pool(), &claim).await?;
+            return Ok(AdmittedPoolClaimLookup::ReleasePending);
+        }
+        Ok(AdmittedPoolClaimLookup::Adoptable { claim, pool_shape })
+    }
+
+    async fn skip_admitted_pool_generation(
+        &self,
+        sandbox_id: SandboxId,
+    ) -> Result<(), ControllerError> {
+        self.store
+            .retire_pool_reserved_generation(sandbox_id)
+            .await
+            .map_err(ControllerError::from)
+    }
+
+    async fn admitted_pool_cleanup_pending(
+        &self,
+        sandbox_id: SandboxId,
+    ) -> Result<bool, ControllerError> {
+        pool::admitted_pool_cleanup_pending(self.store.pool(), sandbox_id).await
+    }
+
+    async fn claim_admission_pool_slot(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        template_release_id: Uuid,
+    ) -> Result<Option<AdmissionPoolClaim>, ControllerError> {
+        pool::claim_admission_pool_slot(tx, template_release_id, &self.k8s.sandbox_namespace).await
     }
 
     async fn persist_pooled_execution_claim(

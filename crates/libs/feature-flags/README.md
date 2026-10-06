@@ -142,6 +142,7 @@ can match on beyond the subject.
 | `space-api-client-concurrency-quotas` | JSON object | constant `space-cluster` | none | env-configured caps |
 | `space-net-gateway-known-egress-domains` | JSON object | sandbox id | none | the deployment's local list |
 | `space-cluster-api-client-side-balancing` | boolean | `sandbox:`/`session:`/`org:` prefixed id | `cluster_id` | off |
+| `space-native-create-pool-claim` | boolean | constant `space-cluster` | none | off |
 | `space-snapshot-retention-config` | JSON object | cluster id | none | env-configured limits |
 
 Each fallback is chosen so that losing the flag backend cannot turn a

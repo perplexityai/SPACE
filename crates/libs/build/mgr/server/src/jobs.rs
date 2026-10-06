@@ -1,6 +1,6 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use pplx_space_build_mgr::TemplateOrg;
+use pplx_space_build_mgr::{SystemPublicationGrantId, TemplateOrg};
 use pplx_space_build_mgr_client::proto::BuildState;
 use pplx_space_metrics::template::TemplateBuildResult;
 use rusqlite::{Connection, OptionalExtension, params};
@@ -28,6 +28,8 @@ pub struct BuildJobPayload {
     pub force: bool,
     pub publish_tags: Vec<String>,
     pub template_org: Option<TemplateOrg>,
+    #[serde(default)]
+    pub system_publication_grant_id: Option<SystemPublicationGrantId>,
 }
 
 #[derive(Clone, Debug)]
