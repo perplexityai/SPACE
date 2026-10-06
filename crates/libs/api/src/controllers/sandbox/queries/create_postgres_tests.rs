@@ -1,7 +1,9 @@
 use pplx_space_common_core::types::{NodeId, OrgId, SandboxId, UserId};
 
 use super::*;
-use crate::controllers::substrate::{PooledClaimRefusal, PooledExecutionClaimAttempt};
+use crate::controllers::substrate::{
+    AdmittedPoolClaim, AdmittedPoolClaimLookup, PooledClaimRefusal, PooledExecutionClaimAttempt,
+};
 use crate::federated_identity::{
     DEFAULT_FEDERATED_GRANT_AUDIENCE, FEDERATED_OWNER_GRANT_PURPOSE, FederatedOwner,
     FederatedServiceGrant,
@@ -636,6 +638,11 @@ struct RetryingPoolSubstrate {
     /// Reported alongside a miss, as the Kubernetes substrate does when a
     /// sandbox's node-group boundary admits no pooled pod.
     miss_refusal: Option<PooledClaimRefusal>,
+    /// Answers for `lookup_admitted_pooled_execution`, in call order.
+    admitted_lookups: Mutex<VecDeque<AdmittedPoolClaimLookup>>,
+    admitted_lookup_calls: AtomicUsize,
+    rollback_calls: AtomicUsize,
+    prepare_wait_until_ready: Mutex<Vec<bool>>,
 }
 
 impl RetryingPoolSubstrate {
@@ -657,7 +664,28 @@ impl RetryingPoolSubstrate {
             claim_calls: AtomicUsize::new(0),
             prepare_calls: AtomicUsize::new(0),
             miss_refusal: None,
+            admitted_lookups: Mutex::new(VecDeque::new()),
+            admitted_lookup_calls: AtomicUsize::new(0),
+            rollback_calls: AtomicUsize::new(0),
+            prepare_wait_until_ready: Mutex::new(Vec::new()),
         }
+    }
+
+    fn with_admitted_lookup(self, lookup: AdmittedPoolClaimLookup) -> Self {
+        self.admitted_lookups.lock().unwrap().push_back(lookup);
+        self
+    }
+
+    fn admitted_lookup_calls(&self) -> usize {
+        self.admitted_lookup_calls.load(Ordering::SeqCst)
+    }
+
+    fn rollback_calls(&self) -> usize {
+        self.rollback_calls.load(Ordering::SeqCst)
+    }
+
+    fn prepare_wait_until_ready(&self) -> Vec<bool> {
+        self.prepare_wait_until_ready.lock().unwrap().clone()
     }
 
     fn refusing(mut self, message: &str) -> Self {
@@ -840,6 +868,29 @@ impl SubstrateAdapter for RetryingPoolSubstrate {
         })
     }
 
+    async fn lookup_admitted_pooled_execution(
+        &self,
+        _request: &PooledExecutionClaimRequest<'_>,
+        _admitted: AdmittedPoolClaim,
+        _sandbox_id: SandboxId,
+    ) -> Result<AdmittedPoolClaimLookup, ControllerError> {
+        self.admitted_lookup_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(self
+            .admitted_lookups
+            .lock()
+            .unwrap()
+            .pop_front()
+            .expect("missing test admitted lookup"))
+    }
+
+    async fn rollback_pooled_execution_claim(
+        &self,
+        _claim: &PooledExecutionClaim,
+    ) -> Result<(), ControllerError> {
+        self.rollback_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
     async fn persist_pooled_execution_claim(
         &self,
         tx: &mut Transaction<'_, Postgres>,
@@ -933,10 +984,14 @@ impl SubstrateAdapter for RetryingPoolSubstrate {
         _request: &PooledExecutionClaimRequest<'_>,
         claim: &PooledExecutionClaim,
         policy: &AutoLifecyclePolicy,
-        _wait_until_ready: bool,
+        wait_until_ready: bool,
         _timeout: Duration,
     ) -> Result<(), ControllerError> {
         self.prepare_calls.fetch_add(1, Ordering::SeqCst);
+        self.prepare_wait_until_ready
+            .lock()
+            .unwrap()
+            .push(wait_until_ready);
         self.prepared_policies.lock().unwrap().push(policy.clone());
         let succeeds = self
             .prepare_results
@@ -2047,6 +2102,281 @@ async fn postgres_pinned_sandbox_id_bypasses_warm_pool_and_cold_creates() -> Tes
         substrate.claim_calls(),
         0,
         "a pinned sandbox ID must not touch the warm pool"
+    );
+
+    Ok(())
+}
+
+/// Fixture for creates admitted against a warm-pool slot: the create's
+/// public ID is the slot's reserved ID, and the request is otherwise an
+/// ordinary pool-eligible native create (which does not wait for readiness).
+struct AdmittedCreateFixture {
+    db: pplx_space_db_test_fixtures::TestDb,
+    actor: User,
+    node_id: NodeId,
+    release_id: Uuid,
+    pool_config_id: Uuid,
+    sandbox_id: SandboxId,
+    req: CreateSandboxRequest,
+    requested_template: TemplateReference,
+    auto_lifecycle: AutoLifecyclePolicy,
+    template_network_policy: NetworkPolicyV1,
+}
+
+impl AdmittedCreateFixture {
+    async fn new() -> TestResult<Self> {
+        let db = pg_test_db().await?;
+        let actor = insert_actor(&db.pool).await?;
+        let node_id = NodeId::new();
+        let release_id = insert_template_release(&db.pool, "seed", "sha256:pooled").await?;
+        let pool_config_id = Uuid::now_v7();
+        insert_node(&db.pool, node_id).await?;
+        sqlx::query(sql!(
+            "INSERT INTO kubernetes_pool_configs (
+                 id, template_release_id, vcpu, memory_mib, target_ready_slots,
+                 refill_per_tick, max_warming_slots, namespace, enabled
+             )
+             VALUES ($1, $2, 4, 2048, 3, 1, 1, 'space', true)"
+        ))
+        .bind(pool_config_id)
+        .bind(release_id)
+        .execute(&db.pool)
+        .await?;
+        let mut req = pooled_create_request("admitted-create", None);
+        req.boot_mode = None;
+        req.wait_until_ready = false;
+        Ok(Self {
+            db,
+            actor,
+            node_id,
+            release_id,
+            pool_config_id,
+            sandbox_id: SandboxId::new(),
+            req,
+            requested_template: TemplateReference::latest(TemplateName::parse("seed").unwrap()),
+            auto_lifecycle: AutoLifecyclePolicy::disabled(),
+            template_network_policy: NetworkPolicyV1::deny_all(),
+        })
+    }
+
+    fn admitted(&self) -> AdmittedPoolClaim {
+        AdmittedPoolClaim {
+            claim_id: Uuid::now_v7(),
+            pool_slot_id: Uuid::now_v7(),
+        }
+    }
+
+    fn claim(&self, admitted: AdmittedPoolClaim) -> PooledExecutionClaim {
+        let mut claim = pooled_claim(self.sandbox_id, self.node_id);
+        claim.claim_id = admitted.claim_id;
+        claim.pool_slot_id = Some(admitted.pool_slot_id);
+        claim
+    }
+
+    fn substrate(&self) -> RetryingPoolSubstrate {
+        RetryingPoolSubstrate::new(
+            self.db.pool.clone(),
+            self.pool_config_id,
+            self.release_id,
+            Vec::new(),
+            vec![true],
+        )
+    }
+
+    async fn run(
+        &self,
+        substrate: &RetryingPoolSubstrate,
+        admitted: AdmittedPoolClaim,
+        volume_encryption: bool,
+    ) -> Result<PoolCreateResult, ControllerError> {
+        let create_owner = SandboxCreateOwner::local(&self.actor);
+        let mut input = pooled_create_input(
+            &self.db.pool,
+            &self.req,
+            &self.requested_template,
+            &self.auto_lifecycle,
+            &self.template_network_policy,
+            &create_owner,
+        );
+        input.template_release_id = self.release_id;
+        input.boot_mode = CreateBootMode::Fallthrough;
+        input.planned_sandbox_id = self.sandbox_id;
+        input.sandbox_id_pinned = true;
+        input.volume_encryption = volume_encryption;
+        SandboxController::try_create_from_admitted_pool_claim_with_substrate(
+            substrate,
+            input,
+            admitted,
+            true,
+            Arc::new(AtomicU64::new(0)),
+        )
+        .await
+    }
+
+    async fn sandbox_rows(&self) -> TestResult<i64> {
+        Ok(
+            sqlx::query_scalar(sql!("SELECT COUNT(*) FROM sandboxes WHERE id = $1"))
+                .bind(self.sandbox_id)
+                .fetch_one(&self.db.pool)
+                .await?,
+        )
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn postgres_admitted_pool_claim_adopts_the_claimed_slot_under_its_id() -> TestResult {
+    let fixture = AdmittedCreateFixture::new().await?;
+    let admitted = fixture.admitted();
+    let substrate = fixture
+        .substrate()
+        .with_admitted_lookup(AdmittedPoolClaimLookup::Adoptable {
+            claim: Box::new(fixture.claim(admitted)),
+            pool_shape: PooledExecutionPoolShape::new(4, 2048, Default::default()),
+        });
+
+    let result = fixture.run(&substrate, admitted, false).await?;
+
+    let response = result
+        .response
+        .expect("an adoptable admitted slot is adopted");
+    assert_eq!(response.id, fixture.sandbox_id);
+    assert_eq!(substrate.admitted_lookup_calls(), 1);
+    assert_eq!(
+        substrate.claim_calls(),
+        0,
+        "an admitted create must never claim a different slot"
+    );
+    assert_eq!(
+        substrate.prepare_wait_until_ready(),
+        vec![true],
+        "adoption waits for readiness even when the request does not"
+    );
+    let (lifecycle, active_node_id): (String, Option<NodeId>) = sqlx::query_as(sql!(
+        "SELECT lifecycle, active_node_id FROM sandboxes WHERE id = $1"
+    ))
+    .bind(fixture.sandbox_id)
+    .fetch_one(&fixture.db.pool)
+    .await?;
+    assert_eq!(lifecycle, "started");
+    assert_eq!(active_node_id, Some(fixture.node_id));
+    let executions: Vec<(i64, bool)> = sqlx::query_as(sql!(
+        "SELECT generation, active FROM sandbox_k8s_executions WHERE sandbox_id = $1"
+    ))
+    .bind(fixture.sandbox_id)
+    .fetch_all(&fixture.db.pool)
+    .await?;
+    assert_eq!(executions, vec![(1, true)]);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn postgres_admitted_pool_claim_released_slot_builds_cold_without_pool_calls() -> TestResult {
+    let fixture = AdmittedCreateFixture::new().await?;
+    let admitted = fixture.admitted();
+    let substrate = fixture
+        .substrate()
+        .with_admitted_lookup(AdmittedPoolClaimLookup::Released);
+
+    let result = fixture.run(&substrate, admitted, false).await?;
+
+    assert!(result.response.is_none(), "a released slot builds cold");
+    assert_eq!(substrate.claim_calls(), 0);
+    assert_eq!(substrate.prepare_calls(), 0);
+    assert_eq!(substrate.rollback_calls(), 0);
+    assert_eq!(fixture.sandbox_rows().await?, 0);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn postgres_admitted_pool_claim_waits_while_a_slot_holds_the_id() -> TestResult {
+    let fixture = AdmittedCreateFixture::new().await?;
+    let admitted = fixture.admitted();
+    let substrate = fixture
+        .substrate()
+        .with_admitted_lookup(AdmittedPoolClaimLookup::ReleasePending);
+
+    let error = match fixture.run(&substrate, admitted, false).await {
+        Ok(_) => panic!("a held slot must not resolve the create"),
+        Err(error) => error,
+    };
+
+    assert_eq!(
+        error.retry_after_cause(),
+        Some(ControllerRetryAfterCause::PoolSlotRelease)
+    );
+    assert!(error.retry_after_header().is_some());
+    assert_eq!(substrate.claim_calls(), 0);
+    assert_eq!(substrate.prepare_calls(), 0);
+    assert_eq!(fixture.sandbox_rows().await?, 0);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn postgres_admitted_pool_claim_releases_a_slot_it_may_not_adopt() -> TestResult {
+    // An encrypted create can never adopt a plaintext warm member. The slot
+    // is given back to the pool for collection rather than adopted, and the
+    // create waits for it before building cold.
+    let fixture = AdmittedCreateFixture::new().await?;
+    let admitted = fixture.admitted();
+    let substrate = fixture
+        .substrate()
+        .with_admitted_lookup(AdmittedPoolClaimLookup::Adoptable {
+            claim: Box::new(fixture.claim(admitted)),
+            pool_shape: PooledExecutionPoolShape::new(4, 2048, Default::default()),
+        });
+
+    let error = match fixture.run(&substrate, admitted, true).await {
+        Ok(_) => panic!("an encrypted create must not adopt"),
+        Err(error) => error,
+    };
+
+    assert_eq!(
+        error.retry_after_cause(),
+        Some(ControllerRetryAfterCause::PoolSlotRelease)
+    );
+    assert_eq!(substrate.rollback_calls(), 1);
+    assert_eq!(substrate.prepare_calls(), 0);
+    assert_eq!(fixture.sandbox_rows().await?, 0);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn postgres_admitted_pool_claim_prepare_failure_never_reclaims() -> TestResult {
+    // A failed adoption must not fall back to another slot (the ID is fixed)
+    // or report success. It parks the slot for the pool's cleanup and asks to
+    // be retried; the retry builds cold once that cleanup has run.
+    let fixture = AdmittedCreateFixture::new().await?;
+    let admitted = fixture.admitted();
+    let mut substrate =
+        fixture
+            .substrate()
+            .with_admitted_lookup(AdmittedPoolClaimLookup::Adoptable {
+                claim: Box::new(fixture.claim(admitted)),
+                pool_shape: PooledExecutionPoolShape::new(4, 2048, Default::default()),
+            });
+    substrate.prepare_results =
+        Mutex::new(vec![false; MAX_POOLED_PREPARE_IN_PLACE_ATTEMPTS].into());
+
+    let error = match fixture.run(&substrate, admitted, false).await {
+        Ok(_) => panic!("a failed adoption must not succeed"),
+        Err(error) => error,
+    };
+
+    assert_eq!(
+        error.retry_after_cause(),
+        Some(ControllerRetryAfterCause::PoolSlotRelease)
+    );
+    assert_eq!(substrate.claim_calls(), 0, "no other slot is claimed");
+    assert_eq!(substrate.admitted_lookup_calls(), 1);
+    assert_eq!(
+        pooled_slot_and_sandbox_state(&fixture.db.pool, fixture.sandbox_id)
+            .await?
+            .0,
+        "cleanup_pending"
     );
 
     Ok(())

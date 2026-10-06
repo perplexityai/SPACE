@@ -500,7 +500,8 @@ fn retry_after_cause_terminal_phase(cause: ControllerRetryAfterCause) -> Reconne
         // Cluster-admission backpressure is a front-door 429, not a reconnect
         // outcome; it shouldn't reach the reconnect terminal path. Map it to the
         // API phase defensively.
-        ControllerRetryAfterCause::ClusterActivationAdmission => ReconnectTerminalPhase::Api,
+        ControllerRetryAfterCause::ClusterActivationAdmission
+        | ControllerRetryAfterCause::PoolSlotRelease => ReconnectTerminalPhase::Api,
     }
 }
 
@@ -511,7 +512,8 @@ fn retry_after_cause_reason(cause: ControllerRetryAfterCause) -> ReconnectReason
         ControllerRetryAfterCause::ProxyUnreachable => ReconnectReason::ProxyUnreachable,
         ControllerRetryAfterCause::GuestNotReady => ReconnectReason::GuestNotReady,
         // See note above: not a reconnect cause. Treat as a retryable wait.
-        ControllerRetryAfterCause::ClusterActivationAdmission => ReconnectReason::WaitBudget,
+        ControllerRetryAfterCause::ClusterActivationAdmission
+        | ControllerRetryAfterCause::PoolSlotRelease => ReconnectReason::WaitBudget,
     }
 }
 
@@ -522,7 +524,8 @@ fn retry_after_cause_outcome(cause: ControllerRetryAfterCause) -> ReconnectOutco
         | ControllerRetryAfterCause::ProxyUnreachable
         | ControllerRetryAfterCause::GuestNotReady
         // See note above: not a reconnect cause. Treat as retryable (exhausted).
-        | ControllerRetryAfterCause::ClusterActivationAdmission => ReconnectOutcome::Exhausted,
+        | ControllerRetryAfterCause::ClusterActivationAdmission
+        | ControllerRetryAfterCause::PoolSlotRelease => ReconnectOutcome::Exhausted,
     }
 }
 

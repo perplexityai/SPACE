@@ -49,6 +49,7 @@ fn claimed_create_operation_for(
             request: public_create_request(),
             node_pool: None,
             federated_create: None,
+            pool_claim: None,
         }
         .into_json(),
         attempts: 1,
@@ -241,6 +242,7 @@ async fn existing_row_create_persists_the_renewed_grant() -> TestResult {
             federated_create: Some(
                 crate::fork_operations::ForkFederatedCreateContext::from_request(&owner, &renewed),
             ),
+            pool_claim: None,
         }
         .into_json();
 
@@ -511,6 +513,7 @@ async fn create_executor_retries_unpinned_transient_substrate_failure() {
             request: public_create_request(),
             node_pool: None,
             federated_create: None,
+            pool_claim: None,
         }
         .into_json(),
         attempts: 1,
@@ -596,6 +599,7 @@ fn create_operation_payload_is_wire_compatible_with_old_shape() {
         request: public_create_request(),
         node_pool: None,
         federated_create: None,
+        pool_claim: None,
     };
     let value = serde_json::to_value(&unpinned).unwrap();
     assert!(
@@ -614,6 +618,7 @@ fn create_operation_payload_is_wire_compatible_with_old_shape() {
         request: public_create_request(),
         node_pool: Some(NodePoolName::parse("isolated-test-pool").unwrap()),
         federated_create: None,
+        pool_claim: None,
     };
     let pinned_value = serde_json::to_value(&pinned).unwrap();
     assert_eq!(
@@ -850,4 +855,118 @@ fn public_update_request() -> PublicUpdateSandboxRequest {
         }),
         auto_lifecycle: None,
     }
+}
+
+fn admitted_pool_claim() -> CreateSandboxPoolClaim {
+    CreateSandboxPoolClaim {
+        claim_id: Uuid::now_v7(),
+        pool_slot_id: Uuid::now_v7(),
+    }
+}
+
+#[test]
+fn create_operation_payload_pool_claim_is_optional_on_the_wire() {
+    // Without a claim the payload is byte-identical to today's: no key.
+    let cold = CreateSandboxOperationPayload {
+        sandbox_id: PublicSandboxId::new(),
+        request: public_create_request(),
+        node_pool: None,
+        federated_create: None,
+        pool_claim: None,
+    };
+    let value = serde_json::to_value(&cold).unwrap();
+    assert!(
+        value.get("pool_claim").is_none(),
+        "a payload without a claim must omit pool_claim: {value}"
+    );
+
+    // Payloads written before the field existed still parse, as cold creates.
+    let mut old = value.clone();
+    old.as_object_mut().unwrap().remove("pool_claim");
+    let parsed: CreateSandboxOperationPayload = serde_json::from_value(old).unwrap();
+    assert_eq!(parsed.pool_claim, None);
+
+    // A claim round-trips exactly.
+    let claim = admitted_pool_claim();
+    let admitted = CreateSandboxOperationPayload {
+        pool_claim: Some(claim),
+        ..cold
+    };
+    let admitted_value = serde_json::to_value(&admitted).unwrap();
+    assert_eq!(
+        admitted_value["pool_claim"],
+        serde_json::json!({
+            "claim_id": claim.claim_id,
+            "pool_slot_id": claim.pool_slot_id,
+        })
+    );
+    let parsed: CreateSandboxOperationPayload = serde_json::from_value(admitted_value).unwrap();
+    assert_eq!(parsed.pool_claim, Some(claim));
+
+    // The claim object itself is closed, like the payload.
+    let mut extended = serde_json::to_value(&admitted).unwrap();
+    extended["pool_claim"]["unexpected"] = serde_json::json!(true);
+    serde_json::from_value::<CreateSandboxOperationPayload>(extended).unwrap_err();
+}
+
+#[test]
+fn pool_slot_release_wait_is_workflow_progress() {
+    let op = claimed_create_operation();
+    let err = crate::controllers::ControllerError::service_unavailable("slot still held")
+        .with_retry_after_header(std::time::Duration::from_secs(15))
+        .with_retry_after_cause(crate::controllers::ControllerRetryAfterCause::PoolSlotRelease);
+    let result = controller_error_result(&op, err);
+    assert_eq!(result.state, OperationState::Queued);
+    assert_eq!(
+        result.requeue_reason,
+        PublicOperationRequeueReason::WorkflowProgress,
+        "waiting for the pool to release a slot must not spend the retry budget"
+    );
+    assert_eq!(result.retry_after, Some(std::time::Duration::from_secs(15)));
+}
+
+#[tokio::test]
+async fn admitted_create_re_execution_after_success_does_not_create_again() -> TestResult {
+    let db = pg_test_db().await?;
+    let org_id = seed_org(&db.pool).await?;
+    let user_id = seed_user(&db.pool, org_id).await?;
+    let sandbox_id = seed_sandbox(
+        &db.pool,
+        SandboxSeed {
+            org_id,
+            user_id,
+            lifecycle: SandboxLifecycle::Started,
+            placement: SeedSandboxPlacement::OnNode(NodeId::new()),
+        },
+    )
+    .await?;
+    let executor =
+        CreateSandboxOperationExecutor::new(db.pool.clone(), direct_sandbox_controller(&db.pool));
+    let mut operation = claimed_create_operation_for(sandbox_id, org_id, user_id);
+    let mut payload: CreateSandboxOperationPayload =
+        serde_json::from_value(operation.payload.clone())?;
+    payload.pool_claim = Some(admitted_pool_claim());
+    operation.payload = payload.into_json();
+
+    for _ in 0..2 {
+        let result = executor.execute(&operation).await;
+        assert_eq!(result.state, OperationState::Succeeded);
+    }
+
+    let sandboxes: i64 = sqlx::query_scalar(sql!("SELECT COUNT(*) FROM sandboxes WHERE id = $1"))
+        .bind(sandbox_id)
+        .fetch_one(&db.pool)
+        .await?;
+    assert_eq!(sandboxes, 1);
+    let executions: i64 = sqlx::query_scalar(sql!(
+        "SELECT COUNT(*) FROM sandbox_k8s_executions WHERE sandbox_id = $1"
+    ))
+    .bind(sandbox_id)
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(
+        executions, 0,
+        "re-execution must not start another execution"
+    );
+    Ok(())
 }

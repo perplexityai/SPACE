@@ -2,8 +2,9 @@ use pplx_space_common_core::types::{OrgId, SandboxId, UserId};
 
 use super::*;
 use crate::controllers::substrate::{
-    CreateBootMode, PooledClaimRefusal, PooledExecutionClaim, PooledExecutionClaimRequest,
-    PooledExecutionPoolShape, PooledPrepareFailureCleanup,
+    AdmittedPoolClaim, AdmittedPoolClaimLookup, CreateBootMode, PooledClaimRefusal,
+    PooledExecutionClaim, PooledExecutionClaimRequest, PooledExecutionPoolShape,
+    PooledPrepareFailureCleanup,
 };
 use crate::controllers::{db_contention_error, internal_error, pool_store_error};
 use crate::reconcile_queue::finalize_sandbox_db_delete_tx;
@@ -790,6 +791,9 @@ struct SandboxCreateExecutionMode<'a> {
     sandbox_id: SandboxId,
     /// `sandbox_id` is visible to the caller and must be the created ID.
     sandbox_id_pinned: bool,
+    /// The warm-pool slot this create was admitted against. Its reserved ID is
+    /// `sandbox_id`, so this is the one way a pinned create may adopt a slot.
+    admitted_pool_claim: Option<AdmittedPoolClaim>,
     federated: FederatedSandboxCreateContext<'a>,
     restore_from: Option<crate::controllers::substrate::SnapshotRef<'a>>,
     restore_operation_id: Option<OperationId>,
@@ -874,6 +878,7 @@ impl SandboxController {
             SandboxCreateExecutionMode {
                 sandbox_id: SandboxId::new(),
                 sandbox_id_pinned: false,
+                admitted_pool_claim: None,
                 federated,
                 restore_from: None,
                 restore_operation_id: None,
@@ -900,6 +905,7 @@ impl SandboxController {
             SandboxCreateExecutionMode {
                 sandbox_id,
                 sandbox_id_pinned: true,
+                admitted_pool_claim: None,
                 federated,
                 restore_from: None,
                 restore_operation_id: None,
@@ -907,6 +913,53 @@ impl SandboxController {
             },
         )
         .await
+    }
+
+    /// Create under `sandbox_id`, which is the reserved ID of the warm-pool
+    /// slot `admitted` claimed when the create was admitted. Adopts that slot
+    /// when it is still claimed for this create and fit to adopt; otherwise
+    /// builds cold under the same ID, past the slot pod's generation. While a
+    /// slot this create will not adopt still owns a pod under the ID, answers
+    /// a retryable error carrying [`ControllerRetryAfterCause::PoolSlotRelease`].
+    // `create_with_sandbox_id`'s arguments plus the admitted claim.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_with_admitted_pool_claim(
+        &self,
+        pool: &PgPool,
+        actor: &User,
+        req: &CreateSandboxRequest,
+        metric_identity: SandboxApiMetricIdentity,
+        sandbox_id: SandboxId,
+        admitted: AdmittedPoolClaim,
+        federated: FederatedSandboxCreateContext<'_>,
+    ) -> Result<SandboxResponse, ControllerError> {
+        self.create_with_sandbox_id_inner(
+            pool,
+            actor,
+            req,
+            metric_identity,
+            SandboxCreateExecutionMode {
+                sandbox_id,
+                sandbox_id_pinned: true,
+                admitted_pool_claim: Some(admitted),
+                federated,
+                restore_from: None,
+                restore_operation_id: None,
+                restore_lease_seconds: 0,
+            },
+        )
+        .await
+    }
+
+    /// Whether a failed adoption under `sandbox_id` still owes a pool cleanup
+    /// that will tear the sandbox down, so its row does not confirm a create.
+    pub async fn admitted_pool_cleanup_pending(
+        &self,
+        sandbox_id: SandboxId,
+    ) -> Result<bool, ControllerError> {
+        self.substrate
+            .admitted_pool_cleanup_pending(sandbox_id)
+            .await
     }
 
     pub async fn restore_fork_disk_as_new(
@@ -925,6 +978,7 @@ impl SandboxController {
             SandboxCreateExecutionMode {
                 sandbox_id: restore.sandbox_id,
                 sandbox_id_pinned: true,
+                admitted_pool_claim: None,
                 federated: restore.federated,
                 restore_from: Some(restore.snapshot),
                 restore_operation_id: Some(restore.operation_id),
@@ -949,6 +1003,7 @@ impl SandboxController {
         let SandboxCreateExecutionMode {
             sandbox_id,
             sandbox_id_pinned,
+            admitted_pool_claim,
             federated,
             restore_from,
             restore_operation_id,
@@ -1064,7 +1119,55 @@ impl SandboxController {
                 "encrypted sandboxes cannot be fork targets",
             ));
         }
-        if let Some(observation) =
+        let pooled_input = PooledCreateInput {
+            federated_grant_audience: self.federated_grant_audience.clone(),
+            pool,
+            req,
+            env: &env,
+            metric_identity,
+            planned_sandbox_id: sandbox_id,
+            sandbox_id_pinned,
+            create_owner: &create_owner,
+            auto_lifecycle: &auto_lifecycle,
+            backend: &backend,
+            requested_template: &template_reference,
+            template,
+            content_hash: &resolved_content_hash,
+            template_release_id: resolved_template_release_id,
+            template_network_policy: &template_network_policy,
+            template_network_policy_generation,
+            network_policy_override: network_policy_override.as_ref(),
+            boot_mode,
+            federated_owner,
+            federated_service_grant,
+            volume_encryption,
+        };
+        // Set when this create was admitted against a warm-pool slot and is
+        // building cold instead: the slot's pod used this ID's generation 1.
+        let mut skip_pool_reserved_generation = false;
+        if let Some(admitted) = admitted_pool_claim {
+            let adoption_eligible = !placement_requested
+                && restore_from.is_none()
+                && self.admitted_pool_adoption_eligible(req, &auto_lifecycle, boot_mode, &backend);
+            let PoolCreateResult {
+                response,
+                observation,
+            } = Self::try_create_from_admitted_pool_claim_with_substrate(
+                &self.substrate,
+                pooled_input,
+                admitted,
+                adoption_eligible,
+                Arc::clone(&create_path_claim_duration_nanos),
+            )
+            .await?;
+            create_path.set_observation(observation);
+            if let Some(response) = response {
+                create_path.mark_request_succeeded();
+                pplx_space_metrics::sandbox::api::sandbox_created(tls_interception_on);
+                return Ok(response);
+            }
+            skip_pool_reserved_generation = true;
+        } else if let Some(observation) =
             pool_bypass_observation(placement_requested, restore_from.is_some())
         {
             create_path.set_observation(observation);
@@ -1073,32 +1176,7 @@ impl SandboxController {
                 response,
                 observation,
             } = self
-                .try_create_from_pool(
-                    PooledCreateInput {
-                        federated_grant_audience: self.federated_grant_audience.clone(),
-                        pool,
-                        req,
-                        env: &env,
-                        metric_identity,
-                        planned_sandbox_id: sandbox_id,
-                        sandbox_id_pinned,
-                        create_owner: &create_owner,
-                        auto_lifecycle: &auto_lifecycle,
-                        backend: &backend,
-                        requested_template: &template_reference,
-                        template,
-                        content_hash: &resolved_content_hash,
-                        template_release_id: resolved_template_release_id,
-                        template_network_policy: &template_network_policy,
-                        template_network_policy_generation,
-                        network_policy_override: network_policy_override.as_ref(),
-                        boot_mode,
-                        federated_owner,
-                        federated_service_grant,
-                        volume_encryption,
-                    },
-                    Arc::clone(&create_path_claim_duration_nanos),
-                )
+                .try_create_from_pool(pooled_input, Arc::clone(&create_path_claim_duration_nanos))
                 .await?;
             create_path.set_observation(observation);
             if let Some(response) = response {
@@ -1253,6 +1331,28 @@ impl SandboxController {
                 ));
             }
         };
+        if skip_pool_reserved_generation
+            && let Err(error) = self
+                .substrate
+                .skip_admitted_pool_generation(sandbox_id)
+                .await
+        {
+            // Nothing has been created yet; remove the row so a retry starts
+            // clean rather than allocating the slot pod's generation.
+            if let Err(delete_err) = sqlx::query("DELETE FROM sandboxes WHERE id = $1")
+                .bind(sandbox_uuid)
+                .execute(pool)
+                .await
+            {
+                tracing::warn!(
+                    sandbox_id = %sandbox_id,
+                    error = %delete_err,
+                    "failed to delete sandbox row after reserving its execution generation failed"
+                );
+                return Err(error.demoted_after_side_effect());
+            }
+            return Err(error);
+        }
         let create_event_context = SandboxCreateEventContext {
             requested_template: &template_reference,
             template,
@@ -1680,23 +1780,7 @@ impl SandboxController {
             input.create_owner.org_id,
             actor_email,
         );
-        let claim_request = PooledExecutionClaimRequest {
-            metric_identity: input.metric_identity,
-            actor: &actor_ref,
-            template: input.template,
-            content_hash: Some(input.content_hash),
-            template_release_id: Some(input.template_release_id),
-            runtime: input.backend,
-            vcpu: input.req.vcpu,
-            memory_mib: input.req.memory_mib,
-            env: input.env,
-            auto_lifecycle: input.auto_lifecycle,
-            network_policy_override: input.network_policy_override,
-            network_policy_generation: 1,
-            template_network_policy: input.template_network_policy,
-            template_network_policy_generation: input.template_network_policy_generation,
-            volume_encryption: input.volume_encryption,
-        };
+        let claim_request = pooled_execution_claim_request(&input, &actor_ref);
 
         let mut prepare_attempt = 1;
         loop {
@@ -2112,6 +2196,234 @@ impl SandboxController {
         }
     }
 
+    /// Whether this create's request is one a warm-pool slot can serve, by
+    /// the same eligibility test an ordinary pooled create uses. An admitted
+    /// create always waits for readiness, so that is what is asked.
+    fn admitted_pool_adoption_eligible(
+        &self,
+        req: &CreateSandboxRequest,
+        auto_lifecycle: &AutoLifecyclePolicy,
+        boot_mode: CreateBootMode,
+        backend: &str,
+    ) -> bool {
+        let file_changes_enabled = req
+            .file_changes
+            .as_ref()
+            .is_some_and(|file_changes| file_changes.enabled);
+        let implicit_wake_enabled =
+            auto_lifecycle.wake_on_access() || auto_lifecycle.wake_on_command();
+        crate::controllers::substrate::pool_eligible_with_env(
+            self.substrate.pool_eligible_for_request(
+                boot_mode,
+                backend,
+                true,
+                req.disk_mib,
+                file_changes_enabled,
+                implicit_wake_enabled,
+            ),
+            self.substrate.pool_supports_request_env(),
+            !req.env.is_empty(),
+        )
+    }
+
+    /// Adopt the slot this create was admitted against, or report that the
+    /// create must build cold under the same ID.
+    ///
+    /// Never claims a different slot: the create's public ID is this slot's
+    /// reserved ID. Returns a warm response on adoption, a cold result when no
+    /// pool slot owns a pod under the ID any more, and a retryable
+    /// [`ControllerRetryAfterCause::PoolSlotRelease`] error while one still
+    /// does (including after a failed adoption, whose slot the pool collects
+    /// before the retry builds cold). An admitted create always adopts with
+    /// `wait_until_ready`, so a returned sandbox is running and command-ready.
+    async fn try_create_from_admitted_pool_claim_with_substrate<A: SubstrateAdapter + ?Sized>(
+        substrate: &A,
+        input: PooledCreateInput<'_>,
+        admitted: AdmittedPoolClaim,
+        adoption_eligible: bool,
+        claim_duration_nanos: Arc<AtomicU64>,
+    ) -> Result<PoolCreateResult, ControllerError> {
+        let actor_email = Email::parse(input.create_owner.email.clone()).map_err(|error| {
+            ControllerError::bad_request(format!("invalid actor email: {error}"))
+        })?;
+        let actor_ref = ActorRef::new(
+            input.create_owner.user_id,
+            input.create_owner.org_id,
+            actor_email,
+        );
+        let claim_request = pooled_execution_claim_request(&input, &actor_ref);
+
+        let claim_started_at = Instant::now();
+        let claim_duration_guard = ClaimDurationGuard::start(claim_duration_nanos);
+        let lookup = substrate
+            .lookup_admitted_pooled_execution(&claim_request, admitted, input.planned_sandbox_id)
+            .await;
+        drop(claim_duration_guard);
+        let (claim, pool_shape) = match lookup? {
+            AdmittedPoolClaimLookup::Released => {
+                tracing::info!(
+                    sandbox_id = %input.planned_sandbox_id,
+                    claim_id = %admitted.claim_id,
+                    "admitted warm-pool slot is gone; building cold under the same ID"
+                );
+                return Ok(PoolCreateResult::cold(
+                    PoolCreateObservation::after_pool_recovery_failure(),
+                ));
+            }
+            AdmittedPoolClaimLookup::ReleasePending => {
+                return Err(admitted_pool_slot_release_pending());
+            }
+            AdmittedPoolClaimLookup::Adoptable { claim, pool_shape } => (*claim, pool_shape),
+        };
+
+        if claim.sandbox_id != input.planned_sandbox_id
+            || input.volume_encryption
+            || !adoption_eligible
+        {
+            tracing::info!(
+                sandbox_id = %input.planned_sandbox_id,
+                claim_id = %claim.claim_id,
+                volume_encryption = input.volume_encryption,
+                adoption_eligible,
+                "not adopting the admitted warm-pool slot; releasing it"
+            );
+            substrate.rollback_pooled_execution_claim(&claim).await?;
+            return Err(admitted_pool_slot_release_pending());
+        }
+
+        let sandbox_uuid = match commit_pooled_sandbox_claim(
+            input.pool,
+            substrate,
+            &input,
+            input.create_owner,
+            &claim_request,
+            &claim,
+            substrate.managed_by(),
+        )
+        .await
+        {
+            Ok(sandbox_uuid) => sandbox_uuid,
+            Err(error) => {
+                // The sandbox row did not commit, so nothing references the
+                // slot. Take it out of the inventory; the retry waits for the
+                // pool to collect it and then builds cold under this ID.
+                if let Err(rollback_error) = substrate.rollback_pooled_execution_claim(&claim).await
+                {
+                    tracing::warn!(
+                        sandbox_id = %claim.sandbox_id,
+                        %rollback_error,
+                        "failed to roll back admitted pool claim after API commit failure"
+                    );
+                }
+                tracing::warn!(
+                    sandbox_id = %claim.sandbox_id,
+                    claim_id = %claim.claim_id,
+                    %error,
+                    "admitted warm-pool slot bind failed"
+                );
+                return Err(admitted_pool_slot_release_pending());
+            }
+        };
+        let resources = pool_attempt_resources(Some(pool_shape));
+        let create_event_context = SandboxCreateEventContext {
+            requested_template: input.requested_template,
+            template: input.template,
+            content_hash: input.content_hash,
+            runtime: input.backend,
+            boot_mode: input.boot_mode,
+            resources: &resources,
+            federated_owner: input.federated_owner,
+            volume_encryption: input.volume_encryption,
+        };
+        let create_event_details = || create_event_context.details();
+        emit_create_sandbox_event(
+            sandbox_uuid,
+            SandboxEventType::CreateRequested,
+            create_event_details(),
+        );
+        emit_create_sandbox_event(
+            sandbox_uuid,
+            SandboxEventType::PoolSlotClaimed,
+            pool_slot_claimed_event_details(&claim, &create_event_context),
+        );
+
+        let in_place_prepare_attempts = match Self::prepare_pooled_execution_with_retries(
+            substrate,
+            input.metric_identity,
+            &claim_request,
+            &claim,
+            input.pool,
+            true,
+            1,
+        )
+        .await
+        {
+            Ok(attempts) => attempts,
+            Err(PooledPrepareAttemptError { error, attempts }) => {
+                let error = error.without_retry_after();
+                pplx_space_metrics::sandbox::api::create_step_error(
+                    claim.sandbox_id,
+                    input.metric_identity,
+                    "fc",
+                    Some(input.template),
+                    "warm_pool_prepare",
+                    "prepare_failed",
+                    None,
+                );
+                emit_create_sandbox_event(
+                    sandbox_uuid,
+                    SandboxEventType::CreateFailed,
+                    create_event_details().error(error.to_string()),
+                );
+                let rollback = Self::rollback_failed_pooled_create_with_substrate(
+                    substrate, input.pool, &claim,
+                )
+                .await;
+                tracing::warn!(
+                    sandbox_id = %claim.sandbox_id,
+                    claim_id = %claim.claim_id,
+                    attempts,
+                    error = %error,
+                    rollback_ok = rollback.is_ok(),
+                    "admitted warm-pool slot failed to prepare"
+                );
+                // A completed rollback either removed the sandbox row or left
+                // it to the pool's cleanup, which removes it; both end with
+                // no slot under this ID, so the retry builds cold. A failed
+                // rollback may leave the claim live, so stop here.
+                return match rollback {
+                    Ok(_) => Err(admitted_pool_slot_release_pending()),
+                    Err(_) => Err(pooled_create_terminal_error(error, false)),
+                };
+            }
+        };
+
+        let sandbox =
+            update_and_fetch_post_wake_sandbox(input.pool, sandbox_uuid, claim.active_node_id)
+                .await?;
+        emit_create_sandbox_event(
+            sandbox.id,
+            SandboxEventType::CreateCompleted,
+            create_event_details()
+                .lifecycle_state(&sandbox.lifecycle)
+                .placement(&sandbox.placement),
+        );
+        pplx_space_metrics::warm_pool::acquire_duration(
+            input.template,
+            pplx_space_metrics::warm_pool::AcquireOutcome::Hit,
+            claim_started_at,
+        );
+        let outcome = if in_place_prepare_attempts == 1 {
+            pplx_space_metrics::warm_pool::CreatePathOutcome::WarmHit
+        } else {
+            pplx_space_metrics::warm_pool::CreatePathOutcome::SameClaimRetry
+        };
+        Ok(PoolCreateResult::warm(
+            sandbox_to_response(&sandbox, None),
+            outcome,
+        ))
+    }
+
     async fn prepare_pooled_execution_with_retries<A: SubstrateAdapter + ?Sized>(
         substrate: &A,
         metric_identity: SandboxApiMetricIdentity,
@@ -2410,6 +2722,41 @@ async fn insert_pooled_sandbox(
     .map_err(|err| db_contention_error("failed to insert pooled sandbox", &err))?;
 
     Ok(claim.sandbox_id)
+}
+
+fn pooled_execution_claim_request<'a>(
+    input: &PooledCreateInput<'a>,
+    actor: &'a ActorRef,
+) -> PooledExecutionClaimRequest<'a> {
+    PooledExecutionClaimRequest {
+        metric_identity: input.metric_identity,
+        actor,
+        template: input.template,
+        content_hash: Some(input.content_hash),
+        template_release_id: Some(input.template_release_id),
+        runtime: input.backend,
+        vcpu: input.req.vcpu,
+        memory_mib: input.req.memory_mib,
+        env: input.env,
+        auto_lifecycle: input.auto_lifecycle,
+        network_policy_override: input.network_policy_override,
+        network_policy_generation: 1,
+        template_network_policy: input.template_network_policy,
+        template_network_policy_generation: input.template_network_policy_generation,
+        volume_encryption: input.volume_encryption,
+    }
+}
+
+/// How long an admitted create waits before re-checking a pool slot that
+/// still owns a pod under its ID.
+const ADMITTED_POOL_SLOT_RELEASE_RETRY: Duration = Duration::from_secs(15);
+
+fn admitted_pool_slot_release_pending() -> ControllerError {
+    ControllerError::service_unavailable(
+        "a warm-pool slot still holds this sandbox ID; waiting for the pool to release it",
+    )
+    .with_retry_after_header(ADMITTED_POOL_SLOT_RELEASE_RETRY)
+    .with_retry_after_cause(ControllerRetryAfterCause::PoolSlotRelease)
 }
 
 async fn commit_pooled_sandbox_claim<A: SubstrateAdapter + ?Sized>(

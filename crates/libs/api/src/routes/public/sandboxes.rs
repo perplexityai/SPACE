@@ -116,6 +116,7 @@ async fn create_native_sandbox_operation(
         // Placement is operator-only (admin surface); the public API never pins.
         node_pool: None,
         federated_create: federated_create.clone(),
+        pool_claim: None,
     }
     .into_json();
 

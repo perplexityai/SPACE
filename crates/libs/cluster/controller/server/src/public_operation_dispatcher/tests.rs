@@ -631,6 +631,7 @@ async fn native_executor_requeues_create_when_cluster_admission_rejects() -> Tes
         target_id: Some(sandbox_id.to_string()),
         payload: CreateSandboxOperationPayload {
             federated_create: None,
+            pool_claim: None,
             sandbox_id,
             request: public_create_request(),
             node_pool: None,

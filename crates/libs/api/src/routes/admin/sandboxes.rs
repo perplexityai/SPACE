@@ -344,6 +344,7 @@ async fn create_sandbox_for_org(
         request: request.sandbox,
         node_pool: request.node_pool,
         federated_create: None,
+        pool_claim: None,
     }
     .into_json();
 

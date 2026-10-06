@@ -667,6 +667,42 @@ impl K8sStore {
         )
     }
 
+    /// Record generation 1 of a freshly inserted sandbox as already retired,
+    /// so its first execution is allocated generation 2.
+    ///
+    /// For a cold create under an ID a warm-pool slot reserved: the slot's
+    /// pod was built as this ID's generation 1 (`space-sbx-<id>-g1`) and may
+    /// still exist while the pool collects it. Generation allocation is
+    /// `MAX(generation) + 1` everywhere (create, wake, restore, recovery), so
+    /// one retired row moves this execution and every later one past that
+    /// pod's name, route identity, and readiness identity. The row is
+    /// inactive, so nothing routes to it. A no-op when the sandbox already
+    /// has execution rows.
+    pub(super) async fn retire_pool_reserved_generation(
+        &self,
+        sandbox_id: SandboxId,
+    ) -> Result<(), SubstrateError> {
+        let pod_name = Self::execution_pod_name(sandbox_id, 1);
+        sqlx::query(sql!(
+            "INSERT INTO sandbox_k8s_executions (
+                 sandbox_id, generation, pod_name, pod_namespace, state, active,
+                 terminated_at
+             )
+             SELECT $1, 1, $2, $3, 'replaced', FALSE, NOW()
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM sandbox_k8s_executions WHERE sandbox_id = $1
+             )
+             ON CONFLICT DO NOTHING"
+        ))
+        .bind(sandbox_id)
+        .bind(&pod_name)
+        .bind(&self.namespace)
+        .execute(&self.pool)
+        .await
+        .db_context("failed to retire the pool-reserved execution generation")?;
+        Ok(())
+    }
+
     async fn active_execution_row(
         &self,
         conn: &mut PgConnection,

@@ -4,7 +4,7 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::{
-    ClaimedPoolSlot, PoolConfig, PoolError, PoolSlot, PoolSlotCounts, Result,
+    ClaimedPoolSlot, PoolConfig, PoolError, PoolSlot, PoolSlotCounts, ReservedPoolSlot, Result,
     models::{
         PoolObservedDemand, PoolPolicyRelease, parse_disk_io_limits, parse_disk_mib,
         parse_memory_mib, parse_vcpu,
@@ -235,6 +235,30 @@ impl TryFrom<ClaimedPoolSlotRow> for ClaimedPoolSlot {
             pod_uid: row.pod_uid,
             pod_ip: row.pod_ip,
             k8s_node_name: row.k8s_node_name,
+        })
+    }
+}
+
+#[derive(sqlx::FromRow)]
+pub(crate) struct ReservedPoolSlotRow {
+    #[sqlx(flatten)]
+    slot: ClaimedPoolSlotRow,
+    template_release_id: Uuid,
+    content_hash: String,
+    state: String,
+    claim_id: Option<Uuid>,
+}
+
+impl TryFrom<ReservedPoolSlotRow> for ReservedPoolSlot {
+    type Error = PoolError;
+
+    fn try_from(row: ReservedPoolSlotRow) -> Result<Self> {
+        Ok(Self {
+            slot: row.slot.try_into()?,
+            template_release_id: row.template_release_id,
+            content_hash: row.content_hash,
+            state: row.state.parse()?,
+            claim_id: row.claim_id,
         })
     }
 }
