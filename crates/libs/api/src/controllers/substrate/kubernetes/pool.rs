@@ -10,7 +10,7 @@ use uuid::Uuid;
 use crate::controllers::{
     ControllerError, db_contention_error, pool_store_error,
     substrate::{
-        AdmittedPoolClaim, AdmittedPoolClaimLookup, PooledExecutionClaim,
+        AdmissionPoolClaim, AdmittedPoolClaim, AdmittedPoolClaimLookup, PooledExecutionClaim,
         PooledExecutionClaimAttempt, PooledExecutionClaimRequest, PooledExecutionPoolShape,
     },
 };
@@ -372,6 +372,45 @@ fn admitted_slot_matches_request(
             .content_hash
             .is_none_or(|content_hash| content_hash == reserved.content_hash)
         && shape_matches
+}
+
+/// Claim a ready slot for a create being admitted, inside the caller's
+/// transaction.
+///
+/// The same any-shape claim an ordinary default-shape create makes
+/// ([`WarmPoolStore::claim_ready_slot_for_release`]): this namespace, this
+/// release, an enabled plaintext config. It only reserves the slot. Pod
+/// liveness, node placement, and the bind are the executor's, once the create
+/// runs ([`lookup_admitted_pooled_execution`]); a slot that fails them there
+/// is collected by the pool and the create builds cold under the same ID.
+#[tracing::instrument(
+    name = "substrate.k8s.pool.claim_admission_pool_slot",
+    skip_all,
+    fields(result = tracing::field::Empty)
+)]
+pub(super) async fn claim_admission_pool_slot(
+    tx: &mut Transaction<'_, Postgres>,
+    template_release_id: Uuid,
+    namespace: &str,
+) -> Result<Option<AdmissionPoolClaim>, ControllerError> {
+    let claim_id = Uuid::now_v7();
+    let slot = WarmPoolStore::claim_ready_slot_for_release(
+        tx,
+        template_release_id,
+        namespace,
+        claim_id,
+        false,
+    )
+    .await
+    .map_err(|err| pool_store_error("failed to claim pool slot at admission", &err))?;
+    tracing::Span::current().record("result", if slot.is_some() { "claimed" } else { "miss" });
+    Ok(slot.map(|slot| AdmissionPoolClaim {
+        claim: AdmittedPoolClaim {
+            claim_id,
+            pool_slot_id: slot.id,
+        },
+        sandbox_id: slot.reserved_sandbox_id,
+    }))
 }
 
 /// Whether the slot reserving `sandbox_id` is a `cleanup_pending` work item:

@@ -35,7 +35,7 @@ use pplx_space_sbx_mgr_client::proto::{
     SpacedWriteResponse, StatsRequest, StopRequest, TouchAutoLifecycleRequest,
     TouchAutoLifecycleResponse, UpdateRequest, WakeRequest,
 };
-use sqlx::{FromRow, PgPool};
+use sqlx::{FromRow, PgPool, Postgres, Transaction};
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -1005,6 +1005,20 @@ fn sandbox_port_observation_is_fresh(observed_at: time::OffsetDateTime) -> bool 
     observed_at
         >= time::OffsetDateTime::now_utc()
             - time::Duration::seconds(SANDBOX_PORT_OBSERVATION_FRESHNESS_SECS)
+}
+
+/// Whether a native create may be admitted against a warm-pool slot; see
+/// [`SandboxController::plan_admission_pool_claim`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdmissionPoolPlan {
+    /// Claim a ready slot of this template release.
+    Eligible { template_release_id: Uuid },
+    /// The request cannot adopt a slot, or something the decision needs is
+    /// unknown at admission.
+    Ineligible,
+    /// The template did not resolve to a release. The create's own
+    /// execution reports why.
+    TemplateMiss,
 }
 
 #[derive(Clone)]

@@ -121,6 +121,7 @@ because disabling it by mistake would leave every create queued forever.
 | `SPACE_API_CLIENT_CLASSES` | empty | JSON map; invalid JSON fails startup. |
 | `SPACE_CLUSTER_ACTIVATION_ADMISSION_ENABLED` | on | Fails open (with a warning) when `SPACE_REDIS_URL` is unset. |
 | `SPACE_CLUSTER_ACTIVATION_ADMISSION_REFILL_RPS` | 60 | |
+| `SPACE_NATIVE_CREATE_POOL_CLAIM_ENABLED` | off | Env master for claiming a ready warm-pool slot when `POST /v1/sandboxes` admits a create, under the `space-native-create-pool-claim` flag (falls back off). Every `space-cluster-controller` replica must understand claim-carrying create payloads before this is turned on. |
 | `SPACE_REDIS_URL` | unset | |
 | `SPACE_SHARED_VALKEY_URL` | unset | Unset disables the consumer. |
 | `SPACE_GRPC_CLIENT_MAX_CONNECTION_AGE_SECS` | off | |

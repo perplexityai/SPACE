@@ -1032,6 +1032,235 @@ impl SubstrateAdapter for RetryingPoolSubstrate {
     }
 }
 
+/// The real Kubernetes substrate with only its node RPC faked: admitted-claim
+/// lookup, persistence, rollback, and failure cleanup all run against the real
+/// pool store, while `prepare_pooled_execution` (the gRPC calls into the slot's
+/// pod) records its arguments and succeeds.
+#[cfg(feature = "kubernetes")]
+struct NodeRpcStubbedKubernetes {
+    inner: crate::controllers::substrate::kubernetes::KubernetesSubstrate,
+    prepared: Mutex<Vec<(SandboxId, bool)>>,
+}
+
+#[cfg(feature = "kubernetes")]
+impl SubstrateAdapter for NodeRpcStubbedKubernetes {
+    fn managed_by(&self) -> &'static str {
+        self.inner.managed_by()
+    }
+
+    async fn create_execution(
+        &self,
+        _request: CreateExecutionRequest<'_>,
+    ) -> Result<crate::controllers::substrate::CreateExecutionOutcome, SubstrateError> {
+        panic!("unused")
+    }
+
+    async fn delete_execution(&self, _sandbox_id: SandboxId) -> Result<(), SubstrateError> {
+        panic!("unused")
+    }
+
+    async fn retire_execution(
+        &self,
+        _request: crate::controllers::substrate::RetireExecutionRequest,
+    ) -> Result<crate::controllers::substrate::RetireExecutionOutcome, SubstrateError> {
+        panic!("unused")
+    }
+
+    async fn start_execution(
+        &self,
+        _metric_identity: SandboxApiMetricIdentity,
+        _sandbox_id: SandboxId,
+        _options: ActivationOptions,
+        _charge: crate::controllers::substrate::RecoveryCharge,
+    ) -> Result<crate::controllers::substrate::ExecutionActivation, SubstrateError> {
+        panic!("unused")
+    }
+
+    async fn restore_execution(
+        &self,
+        _metric_identity: SandboxApiMetricIdentity,
+        _sandbox_id: SandboxId,
+        _options: ActivationOptions,
+        _charge: crate::controllers::substrate::RecoveryCharge,
+    ) -> Result<crate::controllers::substrate::ActivationCompletion, SubstrateError> {
+        panic!("unused")
+    }
+
+    async fn suspend_execution(
+        &self,
+        _sandbox_id: SandboxId,
+    ) -> Result<Option<crate::controllers::substrate::PublishedLocalArtifact>, SubstrateError> {
+        panic!("unused")
+    }
+
+    async fn wake_execution(
+        &self,
+        _metric_identity: SandboxApiMetricIdentity,
+        _sandbox: &Sandbox,
+        _timeout: Duration,
+        _wake_activity: Option<crate::controllers::substrate::ExecutionActivityKind>,
+        _charge: crate::controllers::substrate::RecoveryCharge,
+    ) -> Result<crate::controllers::substrate::ExecutionActivation, SubstrateError> {
+        panic!("unused")
+    }
+
+    async fn runtime_client(
+        &self,
+        _sandbox_id: SandboxId,
+        _charge: crate::controllers::substrate::RecoveryCharge,
+    ) -> Result<RuntimeClient, ControllerError> {
+        panic!("unused")
+    }
+
+    async fn reachable_runtime_client(
+        &self,
+        _sandbox_id: SandboxId,
+    ) -> Result<Option<RuntimeClient>, ControllerError> {
+        panic!("unused")
+    }
+
+    async fn probe_runtime_client(
+        &self,
+        _sandbox_id: SandboxId,
+    ) -> Result<Option<RuntimeClient>, ControllerError> {
+        panic!("unused")
+    }
+
+    async fn access_runtime_client(
+        &self,
+        _metric_identity: SandboxApiMetricIdentity,
+        _sandbox: &Sandbox,
+        _activity: ExecutionActivityKind,
+        _timeout: Duration,
+        _charge: crate::controllers::substrate::RecoveryCharge,
+    ) -> Result<RuntimeClient, ControllerError> {
+        panic!("unused")
+    }
+
+    async fn sandbox_ip(&self, _sandbox_id: SandboxId) -> Result<Option<String>, ControllerError> {
+        panic!("unused")
+    }
+
+    async fn access_sandbox_ip(
+        &self,
+        _metric_identity: SandboxApiMetricIdentity,
+        _sandbox: &Sandbox,
+        _timeout: Duration,
+        _charge: crate::controllers::substrate::RecoveryCharge,
+    ) -> Result<Option<String>, ControllerError> {
+        panic!("unused")
+    }
+
+    async fn builder_client(
+        &self,
+    ) -> Result<crate::controllers::substrate::BuilderClient, ControllerError> {
+        panic!("unused")
+    }
+
+    async fn builder_client_for_node(
+        &self,
+        _node_id: NodeId,
+    ) -> Result<crate::controllers::substrate::BuilderClient, ControllerError> {
+        panic!("unused")
+    }
+
+    async fn resolve_node_api_endpoint(
+        &self,
+        _target: &NodeApiTarget<'_>,
+    ) -> Result<String, SubstrateError> {
+        panic!("unused")
+    }
+
+    async fn list_inventory_nodes(
+        &self,
+        _role_filter: Option<&str>,
+    ) -> Result<Option<Vec<NodeInventoryEntry>>, SubstrateError> {
+        panic!("unused")
+    }
+
+    fn pool_eligible_for_request(
+        &self,
+        boot_mode: CreateBootMode,
+        backend: &str,
+        wait_until_ready: bool,
+        disk_mib: Option<u32>,
+        file_changes_enabled: bool,
+        implicit_wake_enabled: bool,
+    ) -> bool {
+        self.inner.pool_eligible_for_request(
+            boot_mode,
+            backend,
+            wait_until_ready,
+            disk_mib,
+            file_changes_enabled,
+            implicit_wake_enabled,
+        )
+    }
+
+    fn pool_supports_request_env(&self) -> bool {
+        self.inner.pool_supports_request_env()
+    }
+
+    async fn claim_pooled_execution(
+        &self,
+        _request: &PooledExecutionClaimRequest<'_>,
+    ) -> Result<PooledExecutionClaimAttempt, ControllerError> {
+        panic!("an admitted create must never claim a different slot")
+    }
+
+    async fn lookup_admitted_pooled_execution(
+        &self,
+        request: &PooledExecutionClaimRequest<'_>,
+        admitted: AdmittedPoolClaim,
+        sandbox_id: SandboxId,
+    ) -> Result<AdmittedPoolClaimLookup, ControllerError> {
+        self.inner
+            .lookup_admitted_pooled_execution(request, admitted, sandbox_id)
+            .await
+    }
+
+    async fn rollback_pooled_execution_claim(
+        &self,
+        claim: &PooledExecutionClaim,
+    ) -> Result<(), ControllerError> {
+        self.inner.rollback_pooled_execution_claim(claim).await
+    }
+
+    async fn persist_pooled_execution_claim(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        request: &PooledExecutionClaimRequest<'_>,
+        claim: &PooledExecutionClaim,
+    ) -> Result<(), ControllerError> {
+        self.inner
+            .persist_pooled_execution_claim(tx, request, claim)
+            .await
+    }
+
+    async fn cleanup_failed_pooled_prepare(
+        &self,
+        claim: &PooledExecutionClaim,
+    ) -> Result<PooledPrepareFailureCleanup, ControllerError> {
+        self.inner.cleanup_failed_pooled_prepare(claim).await
+    }
+
+    async fn prepare_pooled_execution(
+        &self,
+        _metric_identity: SandboxApiMetricIdentity,
+        _request: &PooledExecutionClaimRequest<'_>,
+        claim: &PooledExecutionClaim,
+        _policy: &AutoLifecyclePolicy,
+        wait_until_ready: bool,
+        _timeout: Duration,
+    ) -> Result<(), ControllerError> {
+        self.prepared
+            .lock()
+            .unwrap()
+            .push((claim.sandbox_id, wait_until_ready));
+        Ok(())
+    }
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn postgres_insert_pooled_sandbox_writes_api_row() -> TestResult {
     let db = pg_test_db().await?;
@@ -2837,6 +3066,157 @@ async fn unconfigured_falcon_create_continues_to_database_access() -> TestResult
         error
             .to_string()
             .contains("failed to start federated sandbox owner transaction")
+    );
+    Ok(())
+}
+
+/// End to end across both halves: `POST /v1/sandboxes` claims a ready slot at
+/// admission, and the create executor's admitted-claim path adopts exactly
+/// that slot, so the sandbox runs under the ID the 202 returned. The real
+/// Kubernetes substrate and pool store carry the claim through; only the node
+/// RPC into the slot's pod is faked.
+#[cfg(feature = "kubernetes")]
+#[tokio::test(flavor = "current_thread")]
+async fn admission_claim_executes_and_runs_under_the_claimed_id() -> TestResult {
+    use crate::routes::public::sandboxes::admission_test_fixture::{
+        AdmissionPoolFixture, NAMESPACE, TEMPLATE,
+    };
+    use k8s_openapi::api::core::v1::{Pod, PodSpec, PodStatus};
+
+    let fixture = AdmissionPoolFixture::new(1).await?;
+    let slot = &fixture.slots[0];
+    let node_id = NodeId::new();
+    insert_node(&fixture.db.pool, node_id).await?;
+    sqlx::query(sql!(
+        "INSERT INTO node_k8s (node_id, k8s_node_name) VALUES ($1, $2)"
+    ))
+    .bind(node_id)
+    .bind(&slot.node_name)
+    .execute(&fixture.db.pool)
+    .await?;
+    let pod = Pod {
+        metadata: kube::api::ObjectMeta {
+            name: Some(slot.pod_name.clone()),
+            namespace: Some(NAMESPACE.to_string()),
+            uid: Some(slot.pod_uid.clone()),
+            ..Default::default()
+        },
+        spec: Some(PodSpec {
+            node_name: Some(slot.node_name.clone()),
+            ..Default::default()
+        }),
+        status: Some(PodStatus {
+            phase: Some("Running".to_string()),
+            pod_ip: Some(slot.pod_ip.clone()),
+            ..Default::default()
+        }),
+    };
+    let kubernetes = || {
+        crate::controllers::substrate::kubernetes::tests::substrate_with_inventory_caches_and_pool(
+            vec![pod.clone()],
+            Vec::new(),
+            fixture.db.pool.clone(),
+        )
+    };
+
+    // Admission: the route claims the slot and returns its reserved ID.
+    let admission_controller = AdmissionPoolFixture::controller_with(kubernetes());
+    let response = fixture
+        .create(
+            Some(&admission_controller),
+            "admission-e2e",
+            fixture.request(),
+        )
+        .await
+        .expect("create is recorded");
+    assert_eq!(
+        response.sandbox_id,
+        pplx_space_public_api::PublicSandboxId::from(slot.reserved_sandbox_id)
+    );
+    let payload = fixture.payload(response.operation_id).await?;
+    let admitted: AdmittedPoolClaim = payload
+        .pool_claim
+        .expect("the queued create carries the claim")
+        .into();
+
+    // Execution: the executor's input for this payload, through the
+    // admitted-claim path from the previous change.
+    let actor: User = sqlx::query_as(sql!(
+        "SELECT id, email, password_hash, display_name, org_id, role, owner_source,
+                created_at, updated_at
+         FROM users WHERE id = $1"
+    ))
+    .bind(fixture.user_id)
+    .fetch_one(&fixture.db.pool)
+    .await?;
+    let create_owner = SandboxCreateOwner::local(&actor);
+    let req = crate::public_sandbox_operations::controller_create_request(
+        payload.request.clone(),
+        payload.node_pool.clone(),
+    );
+    let requested_template = req
+        .template
+        .clone()
+        .expect("native creates name a template");
+    let auto_lifecycle = req
+        .auto_lifecycle
+        .clone()
+        .expect("native creates carry the default policy");
+    let template_network_policy = NetworkPolicyV1::deny_all();
+    let content_hash = fixture.content_hash.to_string();
+    let mut input = pooled_create_input(
+        &fixture.db.pool,
+        &req,
+        &requested_template,
+        &auto_lifecycle,
+        &template_network_policy,
+        &create_owner,
+    );
+    input.template = TEMPLATE;
+    input.content_hash = &content_hash;
+    input.template_release_id = fixture.release_id;
+    input.boot_mode = CreateBootMode::Fallthrough;
+    input.planned_sandbox_id = SandboxId::from_uuid(payload.sandbox_id.as_uuid());
+    input.sandbox_id_pinned = true;
+    let substrate = NodeRpcStubbedKubernetes {
+        inner: kubernetes(),
+        prepared: Mutex::new(Vec::new()),
+    };
+    let result = SandboxController::try_create_from_admitted_pool_claim_with_substrate(
+        &substrate,
+        input,
+        admitted,
+        true,
+        Arc::new(AtomicU64::new(0)),
+    )
+    .await?;
+
+    let sandbox = result
+        .response
+        .expect("the admitted slot is adopted, not rebuilt cold");
+    assert_eq!(sandbox.id, slot.reserved_sandbox_id);
+    assert_eq!(
+        *substrate.prepared.lock().unwrap(),
+        vec![(slot.reserved_sandbox_id, true)]
+    );
+    let (lifecycle, active_node_id): (String, Option<NodeId>) = sqlx::query_as(sql!(
+        "SELECT lifecycle, active_node_id FROM sandboxes WHERE id = $1"
+    ))
+    .bind(slot.reserved_sandbox_id)
+    .fetch_one(&fixture.db.pool)
+    .await?;
+    assert_eq!(lifecycle, "started");
+    assert_eq!(active_node_id, Some(node_id));
+    let (state, claim_id): (String, Option<Uuid>) = sqlx::query_as(sql!(
+        "SELECT state, claim_id FROM kubernetes_pool_slots WHERE id = $1"
+    ))
+    .bind(slot.id)
+    .fetch_one(&fixture.db.pool)
+    .await?;
+    assert_eq!(
+        (state.as_str(), claim_id),
+        ("bound", Some(admitted.claim_id)),
+        "the admission claim is the one that bound"
     );
     Ok(())
 }

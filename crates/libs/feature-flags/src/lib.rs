@@ -265,3 +265,14 @@ pub const SPACE_NET_GATEWAY_KNOWN_EGRESS_DOMAINS_FLAG: JsonFlag =
 /// startup log or [`FeatureFlagClient::provider_state`] for that.
 pub const SPACE_CLUSTER_API_CLIENT_SIDE_BALANCING_FLAG: BoolFlag =
     BoolFlag::new("space-cluster-api-client-side-balancing", false);
+
+/// Boolean rollout gate for claiming a warm-pool slot when space-api admits a
+/// native create, so the create's public ID is the slot's reserved ID.
+/// Layered under the static `SPACE_NATIVE_CREATE_POOL_CLAIM_ENABLED` env master
+/// (off by default) by [`policy`]. Evaluated on the constant cluster subject
+/// (cluster-wide on/off). Falls back off: a rollout gate, so a provider that
+/// cannot answer means no rollout. Turning it off stops new admission claims
+/// only; creates already queued with a claim still run through the executor's
+/// admitted-claim path.
+pub const SPACE_NATIVE_CREATE_POOL_CLAIM_FLAG: BoolFlag =
+    BoolFlag::new("space-native-create-pool-claim", false);

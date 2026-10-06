@@ -10,9 +10,9 @@ use crate::controllers::db_contention_error;
 use crate::controllers::substrate::DbContext;
 use crate::controllers::substrate::PooledClaimRefusal;
 use crate::controllers::substrate::{
-    AdmittedPoolClaim, AdmittedPoolClaimLookup, CreateBootMode, PooledExecutionClaim,
-    PooledExecutionClaimAttempt, PooledExecutionClaimRequest, PooledPrepareFailureCleanup,
-    PublishedLocalArtifact, create_wait_should_preserve_node_work,
+    AdmissionPoolClaim, AdmittedPoolClaim, AdmittedPoolClaimLookup, CreateBootMode,
+    PooledExecutionClaim, PooledExecutionClaimAttempt, PooledExecutionClaimRequest,
+    PooledPrepareFailureCleanup, PublishedLocalArtifact, create_wait_should_preserve_node_work,
     enqueue_artifact_backup_with_client,
 };
 use crate::models::{ClusterPoolConfigRequest, ClusterPoolConfigResponse};
@@ -4418,6 +4418,14 @@ impl SubstrateAdapter for KubernetesSubstrate {
         sandbox_id: SandboxId,
     ) -> Result<bool, ControllerError> {
         pool::admitted_pool_cleanup_pending(self.store.pool(), sandbox_id).await
+    }
+
+    async fn claim_admission_pool_slot(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        template_release_id: Uuid,
+    ) -> Result<Option<AdmissionPoolClaim>, ControllerError> {
+        pool::claim_admission_pool_slot(tx, template_release_id, &self.k8s.sandbox_namespace).await
     }
 
     async fn persist_pooled_execution_claim(

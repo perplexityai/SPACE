@@ -129,6 +129,7 @@ async fn native_create_persists_default_policy_in_operation_payload() -> TestDbR
         &idempotency_key,
         create_request_with_auto_lifecycle(None),
         None,
+        None,
     )
     .await
     .expect("native create should persist an operation");
@@ -138,6 +139,7 @@ async fn native_create_persists_default_policy_in_operation_payload() -> TestDbR
         UserId::from_uuid(SEED_USER_ID),
         &idempotency_key,
         create_request_with_auto_lifecycle(None),
+        None,
         None,
     )
     .await
@@ -982,4 +984,350 @@ async fn admission_rejections_are_retryable_with_a_retry_after_hint() {
         serde_json::from_slice(&exhausted.into_body().collect().await.unwrap().to_bytes()).unwrap();
     assert_eq!(envelope.code, PublicErrorCode::CapacityUnavailable);
     assert!(envelope.retryable);
+}
+
+/// Admission-time warm-pool claims on `POST /v1/sandboxes`, against the real
+/// Kubernetes substrate's pool store and synthetic slots.
+#[cfg(feature = "kubernetes")]
+mod admission_pool_claim {
+    use pplx_space_feature_flags::{FeatureFlagClient, SPACE_NATIVE_CREATE_POOL_CLAIM_FLAG};
+    use pplx_space_public_api::PublicSandboxId;
+
+    use super::super::admission_test_fixture::AdmissionPoolFixture;
+    use super::*;
+    use crate::controllers::sandbox::AdmissionPoolPlan;
+
+    /// The `outcome` tags of every admission-claim counter in `counters`.
+    fn admission_outcomes(
+        counters: &[pplx_space_metrics::test_capture::CapturedCounter],
+    ) -> Vec<String> {
+        counters
+            .iter()
+            .filter(|counter| counter.name == "warm_pool.admission_claim")
+            .map(|counter| counter.tags.join(","))
+            .collect()
+    }
+
+    #[test]
+    fn the_gate_is_off_unless_both_the_env_master_and_the_flag_are_on() {
+        let flag_on =
+            FeatureFlagClient::fixed_bools([(SPACE_NATIVE_CREATE_POOL_CLAIM_FLAG.key(), true)]);
+        let flag_off =
+            FeatureFlagClient::fixed_bools([(SPACE_NATIVE_CREATE_POOL_CLAIM_FLAG.key(), false)]);
+        let no_provider = FeatureFlagClient::disabled();
+
+        const { assert!(!DEFAULT_NATIVE_CREATE_POOL_CLAIM_ENABLED) };
+        assert!(native_create_pool_claim_gate(true, &flag_on));
+        assert!(!native_create_pool_claim_gate(false, &flag_on));
+        assert!(!native_create_pool_claim_gate(true, &flag_off));
+        // A rollout gate: no provider means no rollout.
+        assert!(!native_create_pool_claim_gate(true, &no_provider));
+        assert!(!native_create_pool_claim_gate(false, &no_provider));
+    }
+
+    /// Off is today's path: a fresh ID, no claim in the payload, and the
+    /// pool untouched.
+    #[tokio::test(flavor = "current_thread")]
+    async fn disabled_admission_takes_a_fresh_id_and_leaves_the_pool_alone() -> TestDbResult<()> {
+        let fixture = AdmissionPoolFixture::new(1).await?;
+        let capture = pplx_space_metrics::test_capture::capture_counters_guard();
+        let response = fixture
+            .create(None, "admission-disabled", fixture.request())
+            .await
+            .expect("create is recorded");
+        let counters = capture.finish();
+
+        let slot = &fixture.slots[0];
+        assert_ne!(
+            response.sandbox_id,
+            PublicSandboxId::from(slot.reserved_sandbox_id)
+        );
+        let payload = fixture.payload(response.operation_id).await?;
+        assert_eq!(payload.pool_claim, None);
+        assert_eq!(payload.sandbox_id, response.sandbox_id);
+        assert_eq!(
+            fixture.slot_state(slot.id).await?,
+            ("ready".to_string(), None)
+        );
+        assert_eq!(admission_outcomes(&counters), vec!["outcome:disabled"]);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn eligible_admission_takes_the_ready_slot_and_its_reserved_id() -> TestDbResult<()> {
+        let fixture = AdmissionPoolFixture::new(1).await?;
+        let controller = fixture.controller();
+        let capture = pplx_space_metrics::test_capture::capture_counters_guard();
+        let response = fixture
+            .create(Some(&controller), "admission-hit", fixture.request())
+            .await
+            .expect("create is recorded");
+        let counters = capture.finish();
+
+        let slot = &fixture.slots[0];
+        assert_eq!(
+            response.sandbox_id,
+            PublicSandboxId::from(slot.reserved_sandbox_id)
+        );
+        // The 202 body's ID is still a valid public sandbox ID.
+        let rendered = response.sandbox_id.to_string();
+        assert!(rendered.starts_with("sbx_"), "{rendered}");
+        assert_eq!(
+            rendered.parse::<PublicSandboxId>().unwrap(),
+            response.sandbox_id
+        );
+        assert_eq!(fixture.target_id(response.operation_id).await?, rendered);
+
+        let payload = fixture.payload(response.operation_id).await?;
+        assert_eq!(payload.sandbox_id, response.sandbox_id);
+        let claim = payload.pool_claim.expect("payload carries the claim");
+        assert_eq!(claim.pool_slot_id, slot.id);
+        assert_eq!(
+            fixture.slot_state(slot.id).await?,
+            ("claimed".to_string(), Some(claim.claim_id))
+        );
+        assert_eq!(admission_outcomes(&counters), vec!["outcome:hit"]);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_idempotent_retry_returns_the_claimed_id_without_claiming_again() -> TestDbResult<()>
+    {
+        let fixture = AdmissionPoolFixture::new(2).await?;
+        let controller = fixture.controller();
+        let first = fixture
+            .create(Some(&controller), "admission-retry", fixture.request())
+            .await
+            .expect("create is recorded");
+        assert_eq!(fixture.slot_count("ready").await?, 1);
+
+        let capture = pplx_space_metrics::test_capture::capture_counters_guard();
+        let retry = fixture
+            .create(Some(&controller), "admission-retry", fixture.request())
+            .await
+            .expect("an identical retry reuses the operation");
+        let counters = capture.finish();
+
+        assert_eq!(retry.operation_id, first.operation_id);
+        assert_eq!(retry.sandbox_id, first.sandbox_id);
+        assert_eq!(fixture.slot_count("ready").await?, 1);
+        assert_eq!(fixture.slot_count("claimed").await?, 1);
+        assert_eq!(fixture.create_operations().await?, 1);
+        assert!(
+            admission_outcomes(&counters).is_empty(),
+            "a retry records no new create"
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn concurrent_same_key_creates_keep_exactly_one_claim() -> TestDbResult<()> {
+        let fixture = AdmissionPoolFixture::new(2).await?;
+        let controller = fixture.controller();
+        let (a, b) = tokio::join!(
+            fixture.create(Some(&controller), "admission-race", fixture.request()),
+            fixture.create(Some(&controller), "admission-race", fixture.request()),
+        );
+        let (a, b) = (a.expect("first racer"), b.expect("second racer"));
+
+        assert_eq!(a.operation_id, b.operation_id);
+        assert_eq!(a.sandbox_id, b.sandbox_id);
+        assert_eq!(fixture.create_operations().await?, 1);
+        assert_eq!(fixture.slot_count("claimed").await?, 1);
+        assert_eq!(fixture.slot_count("ready").await?, 1);
+        let payload = fixture.payload(a.operation_id).await?;
+        let claim = payload
+            .pool_claim
+            .expect("the surviving create carries a claim");
+        let claimed = fixture
+            .slots
+            .iter()
+            .find(|slot| slot.id == claim.pool_slot_id)
+            .expect("the claim names a fixture slot");
+        assert_eq!(
+            a.sandbox_id,
+            PublicSandboxId::from(claimed.reserved_sandbox_id)
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_idempotency_conflict_leaves_the_slot_ready() -> TestDbResult<()> {
+        let fixture = AdmissionPoolFixture::new(2).await?;
+        let controller = fixture.controller();
+        fixture
+            .create(Some(&controller), "admission-conflict", fixture.request())
+            .await
+            .expect("create is recorded");
+        let mut different = fixture.request();
+        different.name = Some("a-different-body".to_string());
+
+        let error = fixture
+            .create(Some(&controller), "admission-conflict", different)
+            .await
+            .expect_err("same key, different body");
+
+        assert_eq!(
+            axum::response::IntoResponse::into_response(error).status(),
+            axum::http::StatusCode::CONFLICT
+        );
+        assert_eq!(fixture.slot_count("ready").await?, 1);
+        assert_eq!(fixture.slot_count("claimed").await?, 1);
+        assert_eq!(fixture.create_operations().await?, 1);
+        Ok(())
+    }
+
+    /// Every slot is plaintext, so an org with encryption enabled never gets
+    /// one, whatever the cluster's encryption opt-in says.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_encrypted_org_never_gets_a_plaintext_slot() -> TestDbResult<()> {
+        let fixture = AdmissionPoolFixture::new(1).await?;
+        fixture.enable_org_encryption().await?;
+        let controller = fixture.controller();
+        let capture = pplx_space_metrics::test_capture::capture_counters_guard();
+        let response = fixture
+            .create(Some(&controller), "admission-encrypted", fixture.request())
+            .await
+            .expect("create is recorded");
+        let counters = capture.finish();
+
+        let slot = &fixture.slots[0];
+        assert_ne!(
+            response.sandbox_id,
+            PublicSandboxId::from(slot.reserved_sandbox_id)
+        );
+        assert_eq!(
+            fixture.payload(response.operation_id).await?.pool_claim,
+            None
+        );
+        assert_eq!(
+            fixture.slot_state(slot.id).await?,
+            ("ready".to_string(), None)
+        );
+        assert_eq!(admission_outcomes(&counters), vec!["outcome:ineligible"]);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_custom_shape_is_admitted_cold() -> TestDbResult<()> {
+        let fixture = AdmissionPoolFixture::new(1).await?;
+        let controller = fixture.controller();
+        for (index, resources) in [
+            pplx_space_public_api::SandboxResources {
+                vcpu: Some(4),
+                memory_mib: None,
+                disk_mib: None,
+            },
+            pplx_space_public_api::SandboxResources {
+                vcpu: None,
+                memory_mib: Some(4096),
+                disk_mib: None,
+            },
+            pplx_space_public_api::SandboxResources {
+                vcpu: None,
+                memory_mib: None,
+                disk_mib: Some(4096),
+            },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut request = fixture.request();
+            request.resources = Some(resources);
+            let capture = pplx_space_metrics::test_capture::capture_counters_guard();
+            let response = fixture
+                .create(
+                    Some(&controller),
+                    &format!("admission-shape-{index}"),
+                    request,
+                )
+                .await
+                .expect("create is recorded");
+            let counters = capture.finish();
+            assert_eq!(
+                fixture.payload(response.operation_id).await?.pool_claim,
+                None
+            );
+            assert_eq!(admission_outcomes(&counters), vec!["outcome:ineligible"]);
+        }
+        assert_eq!(fixture.slot_count("ready").await?, 1);
+        Ok(())
+    }
+
+    /// The public route never pins, but the shared predicate refuses a pin
+    /// for every caller, and an unknown org fails closed.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_admission_plan_refuses_a_node_pool_pin_and_an_unknown_org() -> TestDbResult<()> {
+        let fixture = AdmissionPoolFixture::new(1).await?;
+        let controller = fixture.controller();
+        let request =
+            crate::public_sandbox_operations::controller_create_request(fixture.request(), None);
+        assert_eq!(
+            controller
+                .plan_admission_pool_claim(&fixture.db.pool, fixture.org_id, &request)
+                .await,
+            AdmissionPoolPlan::Eligible {
+                template_release_id: fixture.release_id
+            },
+            "positive control"
+        );
+
+        let pinned = crate::public_sandbox_operations::controller_create_request(
+            fixture.request(),
+            Some(pplx_space_common_core::types::NodePoolName::parse("isolated-test-pool").unwrap()),
+        );
+        assert_eq!(
+            controller
+                .plan_admission_pool_claim(&fixture.db.pool, fixture.org_id, &pinned)
+                .await,
+            AdmissionPoolPlan::Ineligible
+        );
+        assert_eq!(
+            controller
+                .plan_admission_pool_claim(&fixture.db.pool, OrgId::new(), &request)
+                .await,
+            AdmissionPoolPlan::Ineligible
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_pool_miss_is_admitted_cold() -> TestDbResult<()> {
+        let fixture = AdmissionPoolFixture::new(0).await?;
+        let controller = fixture.controller();
+        let capture = pplx_space_metrics::test_capture::capture_counters_guard();
+        let response = fixture
+            .create(Some(&controller), "admission-miss", fixture.request())
+            .await
+            .expect("create is recorded");
+        let counters = capture.finish();
+
+        let payload = fixture.payload(response.operation_id).await?;
+        assert_eq!(payload.pool_claim, None);
+        assert_eq!(payload.sandbox_id, response.sandbox_id);
+        assert_eq!(admission_outcomes(&counters), vec!["outcome:miss"]);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_template_miss_is_admitted_cold() -> TestDbResult<()> {
+        let fixture = AdmissionPoolFixture::new(1).await?;
+        let controller = fixture.controller();
+        let mut request = fixture.request();
+        request.template = "no-such-template:latest".parse().unwrap();
+        let capture = pplx_space_metrics::test_capture::capture_counters_guard();
+        let response = fixture
+            .create(Some(&controller), "admission-template-miss", request)
+            .await
+            .expect("create is recorded; execution reports the missing template");
+        let counters = capture.finish();
+
+        assert_eq!(
+            fixture.payload(response.operation_id).await?.pool_claim,
+            None
+        );
+        assert_eq!(fixture.slot_count("ready").await?, 1);
+        assert_eq!(admission_outcomes(&counters), vec!["outcome:miss"]);
+        Ok(())
+    }
 }

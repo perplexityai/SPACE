@@ -2,9 +2,9 @@ use pplx_space_common_core::types::{OrgId, SandboxId, UserId};
 
 use super::*;
 use crate::controllers::substrate::{
-    AdmittedPoolClaim, AdmittedPoolClaimLookup, CreateBootMode, PooledClaimRefusal,
-    PooledExecutionClaim, PooledExecutionClaimRequest, PooledExecutionPoolShape,
-    PooledPrepareFailureCleanup,
+    AdmissionPoolClaim, AdmittedPoolClaim, AdmittedPoolClaimLookup, CreateBootMode,
+    PooledClaimRefusal, PooledExecutionClaim, PooledExecutionClaimRequest,
+    PooledExecutionPoolShape, PooledPrepareFailureCleanup,
 };
 use crate::controllers::{db_contention_error, internal_error, pool_store_error};
 use crate::reconcile_queue::finalize_sandbox_db_delete_tx;
@@ -305,6 +305,29 @@ enum PooledPrepareFailureAction {
     FallbackToOnDemand,
 }
 
+/// The template a create resolves: the request's, or `seed:latest`.
+fn create_template_reference(req: &CreateSandboxRequest) -> TemplateReference {
+    req.template.clone().unwrap_or_else(|| {
+        "seed:latest"
+            .parse::<TemplateReference>()
+            .expect("seed:latest is a valid template reference")
+    })
+}
+
+/// The auto-lifecycle policy a create runs with: the request's, or the
+/// resolved template's default.
+fn effective_create_auto_lifecycle(
+    req: &CreateSandboxRequest,
+    resolved_template: &ResolvedCreateTemplate,
+) -> Result<AutoLifecyclePolicy, ControllerError> {
+    match req.auto_lifecycle.as_ref() {
+        Some(policy) => create_auto_lifecycle_policy(Some(policy.clone())),
+        None => {
+            create_auto_lifecycle_policy(Some(resolved_template.default_auto_lifecycle.clone()))
+        }
+    }
+}
+
 fn create_runtime_from_request(
     runtime: Option<&str>,
 ) -> Result<(RuntimeKind, &'static str), ControllerError> {
@@ -390,6 +413,16 @@ pub(crate) async fn org_byok_enabled(
             .await
             .map_err(|err| db_contention_error("failed to read org BYOK flag", &err))?;
     Ok(row.map(|(enabled,)| enabled).unwrap_or(false))
+}
+
+/// The owner org's encryption flag, or `None` when the org row is missing.
+/// For decisions that must fail closed on an unknown org, unlike
+/// [`org_byok_enabled`].
+async fn org_encryption_flag(pool: &PgPool, org_id: OrgId) -> Result<Option<bool>, sqlx::Error> {
+    sqlx::query_scalar(sql!("SELECT byok_enabled FROM organizations WHERE id = $1"))
+        .bind(org_id)
+        .fetch_optional(pool)
+        .await
 }
 
 /// Cluster-wide opt-in for stamping `volume_encryption` on new sandboxes.
@@ -962,6 +995,79 @@ impl SandboxController {
             .await
     }
 
+    /// Decide, before a create is recorded, whether it may be admitted
+    /// against a warm-pool slot, and of which template release.
+    ///
+    /// Eligible only for a request the executor would adopt the slot for
+    /// ([`Self::admitted_pool_adoption_eligible`]) and that the slot's shape
+    /// already serves: no custom vcpu, memory, or disk, and no node-pool pin.
+    /// Fails closed: anything this cannot establish here (the org's row, its
+    /// encryption setting, the runtime, the template release, the lifecycle
+    /// policy) answers ineligible, and the create runs cold as it would
+    /// without admission. An org with encryption enabled is always
+    /// ineligible, whatever the cluster's encryption opt-in says, because
+    /// every warm-pool slot is plaintext.
+    pub async fn plan_admission_pool_claim(
+        &self,
+        pool: &PgPool,
+        org_id: OrgId,
+        req: &CreateSandboxRequest,
+    ) -> AdmissionPoolPlan {
+        if req.vcpu.is_some()
+            || req.memory_mib.is_some()
+            || req.disk_mib.is_some()
+            || req.node_pool.is_some()
+        {
+            return AdmissionPoolPlan::Ineligible;
+        }
+        let Ok((runtime, backend)) = create_runtime_from_request(req.runtime.as_deref()) else {
+            return AdmissionPoolPlan::Ineligible;
+        };
+        let Ok(boot_mode) = CreateBootMode::from_api(req.boot_mode.as_deref(), false) else {
+            return AdmissionPoolPlan::Ineligible;
+        };
+        match org_encryption_flag(pool, org_id).await {
+            Ok(Some(false)) => {}
+            Ok(Some(true) | None) => return AdmissionPoolPlan::Ineligible,
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "failed to read the org encryption flag; admitting without a pool claim"
+                );
+                return AdmissionPoolPlan::Ineligible;
+            }
+        }
+        let template_reference = create_template_reference(req);
+        let Ok(resolved_template) = self
+            .resolve_create_template(pool, &template_reference, runtime, org_id)
+            .await
+        else {
+            return AdmissionPoolPlan::TemplateMiss;
+        };
+        let Ok(auto_lifecycle) = effective_create_auto_lifecycle(req, &resolved_template) else {
+            return AdmissionPoolPlan::Ineligible;
+        };
+        if !self.admitted_pool_adoption_eligible(req, &auto_lifecycle, boot_mode, backend) {
+            return AdmissionPoolPlan::Ineligible;
+        }
+        AdmissionPoolPlan::Eligible {
+            template_release_id: resolved_template.template_release_id,
+        }
+    }
+
+    /// Claim a ready slot of `template_release_id` inside `tx`, the
+    /// transaction that records the create. See
+    /// [`SubstrateAdapter::claim_admission_pool_slot`].
+    pub async fn claim_admission_pool_slot(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        template_release_id: Uuid,
+    ) -> Result<Option<AdmissionPoolClaim>, ControllerError> {
+        self.substrate
+            .claim_admission_pool_slot(tx, template_release_id)
+            .await
+    }
+
     pub async fn restore_fork_disk_as_new(
         &self,
         pool: &PgPool,
@@ -1028,11 +1134,7 @@ impl SandboxController {
         let env = sanitize_create_env(&req.env);
         let (runtime, backend) = create_runtime_from_request(req.runtime.as_deref())?;
         let backend = backend.to_string();
-        let template_reference = req.template.clone().unwrap_or_else(|| {
-            "seed:latest"
-                .parse::<TemplateReference>()
-                .expect("seed:latest is a valid template reference")
-        });
+        let template_reference = create_template_reference(req);
         let template_name = template_reference.name().clone();
         let template = template_name.as_str();
         let sandbox_uuid = sandbox_id;
@@ -1046,7 +1148,7 @@ impl SandboxController {
             .resolve_create_template(pool, &template_reference, runtime, create_owner.org_id)
             .await?;
         let resolved_template_release_id = resolved_template.template_release_id;
-        let resolved_content_hash = resolved_template.content_hash;
+        let resolved_content_hash = resolved_template.content_hash.clone();
         let create_path_started_at = Instant::now();
         let create_path_claim_duration_nanos = Arc::new(AtomicU64::new(0));
         let mut create_path = CreatePathEmitter {
@@ -1058,11 +1160,7 @@ impl SandboxController {
             claim_duration_nanos: Arc::clone(&create_path_claim_duration_nanos),
             request_succeeded: false,
         };
-        let auto_lifecycle = if let Some(policy) = req.auto_lifecycle.as_ref() {
-            create_auto_lifecycle_policy(Some(policy.clone()))
-        } else {
-            create_auto_lifecycle_policy(Some(resolved_template.default_auto_lifecycle))
-        }?;
+        let auto_lifecycle = effective_create_auto_lifecycle(req, &resolved_template)?;
         let template_network_policy = resolved_template.default_network_policy;
         let network_policy_override = if let Some(egress) = falcon_us2_egress {
             Some(
@@ -1146,8 +1244,7 @@ impl SandboxController {
         // building cold instead: the slot's pod used this ID's generation 1.
         let mut skip_pool_reserved_generation = false;
         if let Some(admitted) = admitted_pool_claim {
-            let adoption_eligible = !placement_requested
-                && restore_from.is_none()
+            let adoption_eligible = restore_from.is_none()
                 && self.admitted_pool_adoption_eligible(req, &auto_lifecycle, boot_mode, &backend);
             let PoolCreateResult {
                 response,
@@ -2206,6 +2303,11 @@ impl SandboxController {
     /// Whether this create's request is one a warm-pool slot can serve, by
     /// the same eligibility test an ordinary pooled create uses. An admitted
     /// create always waits for readiness, so that is what is asked.
+    ///
+    /// Shared by admission ([`Self::plan_admission_pool_claim`]), which
+    /// claims a slot only when this holds, and by the executor, which adopts
+    /// the claimed slot only when it still holds. A node-pool pin never
+    /// adopts: warm-pool pods are pre-created on general nodes.
     fn admitted_pool_adoption_eligible(
         &self,
         req: &CreateSandboxRequest,
@@ -2213,6 +2315,9 @@ impl SandboxController {
         boot_mode: CreateBootMode,
         backend: &str,
     ) -> bool {
+        if req.node_pool.is_some() {
+            return false;
+        }
         let file_changes_enabled = req
             .file_changes
             .as_ref()

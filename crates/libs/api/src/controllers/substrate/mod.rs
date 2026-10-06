@@ -1343,6 +1343,15 @@ pub struct AdmittedPoolClaim {
     pub pool_slot_id: Uuid,
 }
 
+/// A ready warm-pool slot claimed while a create is being admitted, in the
+/// transaction that records the create. `sandbox_id` is the slot's reserved
+/// ID, which becomes the create's public ID.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AdmissionPoolClaim {
+    pub claim: AdmittedPoolClaim,
+    pub sandbox_id: SandboxId,
+}
+
 /// What the substrate found for an [`AdmittedPoolClaim`].
 pub enum AdmittedPoolClaimLookup {
     /// The admitted slot still carries this claim and passed the same pod
@@ -2511,6 +2520,19 @@ pub trait SubstrateAdapter: Send + Sync {
         Ok(false)
     }
 
+    /// Claim a ready, plaintext, default-shape warm-pool slot of
+    /// `template_release_id` inside `tx`, the transaction that records the
+    /// create being admitted. The claim commits or rolls back with that
+    /// transaction. `None` is a miss. Default: substrates without a warm pool
+    /// always miss.
+    async fn claim_admission_pool_slot(
+        &self,
+        _tx: &mut Transaction<'_, Postgres>,
+        _template_release_id: Uuid,
+    ) -> Result<Option<AdmissionPoolClaim>, ControllerError> {
+        Ok(None)
+    }
+
     /// Persist substrate metadata for a previously claimed pool execution.
     ///
     /// This is called inside the API transaction that inserts the sandbox row,
@@ -3648,6 +3670,26 @@ impl SubstrateAdapter for Substrate {
             #[cfg(feature = "kubernetes")]
             Self::Kubernetes(substrate) => {
                 substrate.admitted_pool_cleanup_pending(sandbox_id).await
+            }
+        }
+    }
+
+    async fn claim_admission_pool_slot(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        template_release_id: Uuid,
+    ) -> Result<Option<AdmissionPoolClaim>, ControllerError> {
+        match self {
+            Self::Direct(substrate) => {
+                substrate
+                    .claim_admission_pool_slot(tx, template_release_id)
+                    .await
+            }
+            #[cfg(feature = "kubernetes")]
+            Self::Kubernetes(substrate) => {
+                substrate
+                    .claim_admission_pool_slot(tx, template_release_id)
+                    .await
             }
         }
     }

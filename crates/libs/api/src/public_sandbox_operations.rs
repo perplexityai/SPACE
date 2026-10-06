@@ -85,6 +85,15 @@ impl From<CreateSandboxPoolClaim> for crate::controllers::substrate::AdmittedPoo
     }
 }
 
+impl From<crate::controllers::substrate::AdmittedPoolClaim> for CreateSandboxPoolClaim {
+    fn from(claim: crate::controllers::substrate::AdmittedPoolClaim) -> Self {
+        Self {
+            claim_id: claim.claim_id,
+            pool_slot_id: claim.pool_slot_id,
+        }
+    }
+}
+
 impl std::fmt::Debug for CreateSandboxOperationPayload {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CreateSandboxOperationPayload")
@@ -611,7 +620,7 @@ impl SandboxLifecycleOperationExecutor {
     }
 }
 
-fn controller_create_request(
+pub(crate) fn controller_create_request(
     request: pplx_space_public_api::CreateSandboxRequest,
     node_pool: Option<NodePoolName>,
 ) -> ControllerCreateSandboxRequest {
