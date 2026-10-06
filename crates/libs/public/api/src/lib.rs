@@ -687,6 +687,11 @@ open_wire_enum!(SandboxFailureCode, "sandbox failure code", {
     RuntimeFailure => "runtime_failure",
 });
 
+open_wire_enum!(SandboxIdleAction, "sandbox idle action", {
+    Delete => "delete",
+    Suspend => "suspend",
+});
+
 open_wire_enum!(SandboxConditionType, "sandbox condition type", {
     Ready => "ready",
     NetworkReady => "network_ready",
@@ -1191,6 +1196,31 @@ pub struct PublicSandbox {
     /// Null fields mean no explicit value was recorded, not zero capacity.
     pub resources: SandboxResources,
     pub metadata: PublicSandboxMetadata,
+    /// Stored idle deadline; null when no automatic lifecycle event is scheduled.
+    #[cfg_attr(
+        feature = "serde",
+        serde(with = "time::serde::rfc3339::option", default)
+    )]
+    #[cfg_attr(
+        feature = "schema",
+        schemars(schema_with = "schema::optional_incubating_date_time")
+    )]
+    pub expires_at: Option<time::OffsetDateTime>,
+    /// Idle duration in seconds, such as `600s`, for a single access-idle stage.
+    /// Null when the policy cannot be represented by idle_timeout and idle_action.
+    #[cfg_attr(feature = "serde", serde(default))]
+    #[cfg_attr(
+        feature = "schema",
+        schemars(schema_with = "schema::optional_incubating_string")
+    )]
+    pub idle_timeout: Option<String>,
+    /// Action paired with idle_timeout; null for policies with other shapes.
+    #[cfg_attr(feature = "serde", serde(default))]
+    #[cfg_attr(
+        feature = "schema",
+        schemars(schema_with = "schema::optional_incubating_idle_action")
+    )]
+    pub idle_action: Option<SandboxIdleAction>,
     #[cfg_attr(feature = "serde", serde(with = "time::serde::rfc3339"))]
     #[cfg_attr(feature = "schema", schemars(schema_with = "schema::date_time"))]
     pub created_at: time::OffsetDateTime,

@@ -173,10 +173,23 @@ fn public_wire_enums_use_canonical_strings() {
         SandboxFailureCode::RuntimeFailure.to_string(),
         "runtime_failure"
     );
+    for action in SandboxIdleAction::ALL {
+        assert_eq!(
+            action.as_str().parse::<SandboxIdleAction>().unwrap(),
+            *action
+        );
+    }
     "terminal_connect".parse::<DataPlaneScope>().unwrap_err();
 
     #[cfg(feature = "serde")]
     {
+        let future_action: SandboxIdleAction =
+            serde_json::from_value(serde_json::json!("hibernate")).unwrap();
+        assert!(!future_action.is_known());
+        assert_eq!(
+            serde_json::to_value(future_action).unwrap(),
+            serde_json::json!("hibernate")
+        );
         assert_eq!(
             serde_json::to_value(OperationState::Queued).unwrap(),
             serde_json::json!("queued")
@@ -271,6 +284,9 @@ fn public_sandbox_failure_code_has_an_exact_nullable_wire_shape() {
             disk_mib: None,
         },
         metadata: PublicSandboxMetadata::new(),
+        expires_at: None,
+        idle_timeout: None,
+        idle_action: None,
         created_at: timestamp,
         updated_at: timestamp,
     };
@@ -291,15 +307,25 @@ fn public_sandbox_failure_code_has_an_exact_nullable_wire_shape() {
                 "disk_mib": null
             },
             "metadata": {},
+            "expires_at": null,
+            "idle_timeout": null,
+            "idle_action": null,
             "created_at": "1970-01-01T00:00:00Z",
             "updated_at": "1970-01-01T00:00:00Z"
         })
     );
 
     sandbox.failure_code = None;
-    let serialized = serde_json::to_value(&sandbox).unwrap();
+    let mut serialized = serde_json::to_value(&sandbox).unwrap();
     assert_eq!(serialized["failure_code"], serde_json::Value::Null);
     assert!(serialized.get("failure_reason").is_none());
+    for field in ["expires_at", "idle_timeout", "idle_action"] {
+        serialized.as_object_mut().unwrap().remove(field);
+    }
+    assert_eq!(
+        serde_json::from_value::<PublicSandbox>(serialized).unwrap(),
+        sandbox
+    );
 }
 
 #[cfg(feature = "serde")]

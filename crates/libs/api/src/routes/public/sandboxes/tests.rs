@@ -186,6 +186,106 @@ fn sandbox_lifecycle_mapping_uses_public_vocabulary() {
 }
 
 #[test]
+fn sandbox_idle_deadline_is_nullable_and_serialized_as_rfc3339() {
+    for (deadline, expected) in [
+        (None, serde_json::Value::Null),
+        (Some(0), serde_json::json!("1970-01-01T00:00:00Z")),
+        (
+            Some(1_700_000_000),
+            serde_json::json!("2023-11-14T22:13:20Z"),
+        ),
+    ] {
+        let mut row = public_sandbox_row(OffsetDateTime::UNIX_EPOCH, SandboxId::new());
+        row.next_auto_event_at = deadline;
+        let sandbox = public_sandbox_from_row(row).unwrap();
+        assert_eq!(
+            sandbox.expires_at.map(|time| time.unix_timestamp()),
+            deadline
+        );
+        assert_eq!(
+            serde_json::to_value(sandbox).unwrap()["expires_at"],
+            expected
+        );
+    }
+}
+
+#[test]
+fn sandbox_idle_configuration_requires_one_access_idle_delete_or_suspend_stage() {
+    let default_policy = with_native_create_defaults(create_request_with_auto_lifecycle(None))
+        .auto_lifecycle
+        .unwrap();
+    let mut cases = vec![
+        (
+            default_policy.clone(),
+            Some("21600s".to_owned()),
+            Some(SandboxIdleAction::Suspend),
+        ),
+        (AutoLifecyclePolicy::disabled(), None, None),
+    ];
+    for (action, expected_action) in [
+        (AutoLifecycleIdleAction::None, None),
+        (AutoLifecycleIdleAction::Pause, None),
+        (
+            AutoLifecycleIdleAction::Suspend,
+            Some(SandboxIdleAction::Suspend),
+        ),
+        (AutoLifecycleIdleAction::Stop, None),
+        (
+            AutoLifecycleIdleAction::Delete,
+            Some(SandboxIdleAction::Delete),
+        ),
+    ] {
+        let mut policy = default_policy.clone();
+        policy.stages[0].at = 600;
+        policy.stages[0].action = action;
+        cases.push((
+            policy,
+            expected_action.as_ref().map(|_| "600s".to_owned()),
+            expected_action,
+        ));
+    }
+    let mut command_policy = default_policy.clone();
+    command_policy.condition_sets = std::collections::BTreeMap::from([(
+        AutoLifecycleConditionSetId::CommandIdle,
+        AutoLifecycleConditionSet::command_idle(),
+    )]);
+    command_policy.stages[0].condition_set = AutoLifecycleConditionSetId::CommandIdle;
+    cases.push((command_policy.clone(), None, None));
+    for second_stage in [
+        default_policy.stages[0].clone(),
+        command_policy.stages[0].clone(),
+    ] {
+        let mut policy = default_policy.clone();
+        policy
+            .condition_sets
+            .extend(command_policy.condition_sets.clone());
+        policy.stages.push(second_stage);
+        cases.push((policy, None, None));
+    }
+    let mut non_access_policy = default_policy.clone();
+    non_access_policy.condition_sets.insert(
+        AutoLifecycleConditionSetId::AccessIdle,
+        AutoLifecycleConditionSet::command_idle(),
+    );
+    cases.push((non_access_policy, None, None));
+    let mut long_policy = default_policy;
+    long_policy.stages[0].at = u64::from(u32::MAX) + 1;
+    cases.push((
+        long_policy,
+        Some("4294967296s".to_owned()),
+        Some(SandboxIdleAction::Suspend),
+    ));
+
+    for (policy, expected_timeout, expected_action) in cases {
+        let mut row = public_sandbox_row(OffsetDateTime::UNIX_EPOCH, SandboxId::new());
+        row.auto_lifecycle = SqlJson(policy.clone());
+        let sandbox = public_sandbox_from_row(row).unwrap();
+        assert_eq!(sandbox.idle_timeout, expected_timeout, "{policy:?}");
+        assert_eq!(sandbox.idle_action, expected_action, "{policy:?}");
+    }
+}
+
+#[test]
 fn sandbox_list_limit_defaults_and_caps() {
     assert_eq!(
         ListSandboxesQuery {
@@ -363,11 +463,16 @@ async fn sandbox_reads_exclude_deleted_tombstones_before_pagination() -> TestDbR
     {
         let id = SandboxId::new();
         let created_at = OffsetDateTime::from_unix_timestamp(1_800_000_000 + offset as i64)?;
+        let deadline = (offset % 2 == 0).then_some(1_800_021_600 + offset as i64);
+        let policy = with_native_create_defaults(create_request_with_auto_lifecycle(None))
+            .auto_lifecycle
+            .unwrap();
         sqlx::query(pplx_space_common_core::sql!(
             "INSERT INTO sandboxes (
                  id, user_id, org_id, lifecycle, created_at,
-                 network_policy_override_json, network_policy_generation
-             ) VALUES ($1, $2, $3, $4, $5, $6, 1)"
+                 network_policy_override_json, network_policy_generation,
+                 next_auto_event_at, auto_lifecycle_json
+             ) VALUES ($1, $2, $3, $4, $5, $6, 1, $7, $8)"
         ))
         .bind(id)
         .bind(SEED_USER_ID)
@@ -375,6 +480,8 @@ async fn sandbox_reads_exclude_deleted_tombstones_before_pagination() -> TestDbR
         .bind(lifecycle)
         .bind(created_at)
         .bind(SqlJson(&pplx_space_net_common::NetworkPolicyV1::default()))
+        .bind(deadline)
+        .bind(SqlJson(&policy))
         .execute(&db.pool)
         .await?;
 
@@ -390,7 +497,15 @@ async fn sandbox_reads_exclude_deleted_tombstones_before_pagination() -> TestDbR
             assert!(row.is_none());
             assert!(fetch_sandbox(&db.pool, id).await?.is_some());
         } else {
-            assert_eq!(row.expect("visible sandbox").lifecycle, lifecycle);
+            let row = row.expect("visible sandbox");
+            assert_eq!(row.lifecycle, lifecycle);
+            let sandbox = public_sandbox_from_row(row).unwrap();
+            assert_eq!(
+                sandbox.expires_at.map(|time| time.unix_timestamp()),
+                deadline
+            );
+            assert_eq!(sandbox.idle_timeout.as_deref(), Some("21600s"));
+            assert_eq!(sandbox.idle_action, Some(SandboxIdleAction::Suspend));
             visible.push((created_at, id));
         }
     }
@@ -404,6 +519,12 @@ async fn sandbox_reads_exclude_deleted_tombstones_before_pagination() -> TestDbR
     );
     let page = sandboxes_page(rows, 1).expect("visible lifecycles project normally");
     assert_eq!(page.data.len(), 1);
+    assert_eq!(
+        page.data[0].expires_at.unwrap().unix_timestamp(),
+        1_800_021_602
+    );
+    assert_eq!(page.data[0].idle_timeout.as_deref(), Some("21600s"));
+    assert_eq!(page.data[0].idle_action, Some(SandboxIdleAction::Suspend));
     assert!(page.next_cursor.is_some());
 
     let next = fetch_sandboxes_page(
@@ -944,6 +1065,8 @@ fn public_sandbox_row(created_at: OffsetDateTime, id: SandboxId) -> PublicSandbo
         memory_mib: Some(1024),
         disk_mib: Some(4096),
         metadata: SqlJson(Default::default()),
+        next_auto_event_at: None,
+        auto_lifecycle: SqlJson(AutoLifecyclePolicy::disabled()),
         created_at,
         updated_at: created_at,
     }

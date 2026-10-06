@@ -33,6 +33,9 @@ pub(super) fn insert_success_examples(spec: &mut Value) {
             disk_mib: None,
         },
         metadata: Default::default(),
+        expires_at: Some(created_at + time::Duration::hours(6)),
+        idle_timeout: Some("21600s".to_owned()),
+        idle_action: Some(pplx_space_public_api::SandboxIdleAction::Suspend),
         created_at,
         updated_at: created_at,
     };

@@ -26,9 +26,9 @@ use pplx_space_public_api::{
     ConditionStatus, CreateSandboxRequest, OperationId, OperationKind, OperationTargetType,
     PageCursor, PublicErrorCode, PublicPage, PublicSandbox, PublicSandboxId, PublicSandboxMetadata,
     PublicSandboxMetadataValue, RequestFingerprint, RollbackSandboxRequest, SandboxCondition,
-    SandboxConditionType, SandboxFailureCode, SandboxLifecycleAction, SandboxLifecycleState,
-    SandboxOperationResponse, SandboxResources, SandboxStatsResponse, UpdateSandboxRequest,
-    routes as native_routes,
+    SandboxConditionType, SandboxFailureCode, SandboxIdleAction, SandboxLifecycleAction,
+    SandboxLifecycleState, SandboxOperationResponse, SandboxResources, SandboxStatsResponse,
+    UpdateSandboxRequest, routes as native_routes,
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -686,6 +686,8 @@ struct PublicSandboxRow {
     memory_mib: Option<i32>,
     disk_mib: Option<i32>,
     metadata: SqlJson<ControllerSandboxMetadata>,
+    next_auto_event_at: Option<i64>,
+    auto_lifecycle: SqlJson<AutoLifecyclePolicy>,
     created_at: OffsetDateTime,
     updated_at: OffsetDateTime,
 }
@@ -736,6 +738,8 @@ const PUBLIC_SANDBOX_SELECT: &str = "SELECT s.id,
             s.memory_mib,
             s.disk_mib,
             s.metadata,
+            s.next_auto_event_at,
+            s.auto_lifecycle_json AS auto_lifecycle,
             s.created_at,
             s.updated_at
      FROM sandboxes s
@@ -988,6 +992,28 @@ fn public_sandbox_from_row(sandbox: PublicSandboxRow) -> Result<PublicSandbox, P
     let failure_code = sandbox
         .has_current_failure
         .then_some(SandboxFailureCode::RuntimeFailure);
+    let expires_at = sandbox
+        .next_auto_event_at
+        .map(OffsetDateTime::from_unix_timestamp)
+        .transpose()
+        .map_err(|error| {
+            tracing::error!(%error, "invalid stored sandbox idle deadline");
+            PublicApiError::internal()
+        })?;
+    let (idle_timeout, idle_action) = match sandbox.auto_lifecycle.0.stages.as_slice() {
+        [stage] => match crate::e2b::lifecycle_config_from_policy(&sandbox.auto_lifecycle.0) {
+            Some(config) => (
+                Some(format!("{}s", stage.at)),
+                Some(if config.auto_pause {
+                    SandboxIdleAction::Suspend
+                } else {
+                    SandboxIdleAction::Delete
+                }),
+            ),
+            None => (None, None),
+        },
+        _ => (None, None),
+    };
     Ok(PublicSandbox {
         id: PublicSandboxId::from(sandbox.id),
         name: sandbox.name,
@@ -1004,6 +1030,9 @@ fn public_sandbox_from_row(sandbox: PublicSandboxRow) -> Result<PublicSandbox, P
             disk_mib: sandbox.disk_mib.and_then(|value| u32::try_from(value).ok()),
         },
         metadata: public_metadata(sandbox.metadata.0),
+        expires_at,
+        idle_timeout,
+        idle_action,
         created_at: sandbox.created_at,
         updated_at: sandbox.updated_at,
     })

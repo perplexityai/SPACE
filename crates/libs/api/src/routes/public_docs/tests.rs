@@ -515,6 +515,34 @@ fn m1_openapi_components_are_exactly_the_reachable_closure() {
 }
 
 #[test]
+fn sandbox_idle_response_fields_are_nullable_incubating_and_extensible() {
+    let spec = public_openapi_value();
+    let schema = &spec["components"]["schemas"]["PublicSandbox"];
+    for field in ["expires_at", "idle_timeout", "idle_action"] {
+        assert_eq!(
+            schema["properties"][field][pplx_space_public_api::routes::M1_STATUS_EXTENSION],
+            "incubating",
+        );
+    }
+    let validator = component_validator(&spec, "PublicSandbox");
+    let mut example = spec["paths"]["/sandboxes/{sandbox_id}"]["get"]["responses"]["200"]
+        ["content"]["application/json"]["examples"]["illustrative"]["value"].clone();
+    validator
+        .validate(&example)
+        .expect("idle configuration example conforms");
+    example["idle_action"] = json!("hibernate");
+    validator
+        .validate(&example)
+        .expect("future idle actions remain valid responses");
+    for field in ["expires_at", "idle_timeout", "idle_action"] {
+        example[field] = Value::Null;
+    }
+    validator
+        .validate(&example)
+        .expect("idle configuration may be null");
+}
+
+#[test]
 fn m1_operation_results_are_generator_safe_tagged_variants() {
     let spec = m1_sdk_openapi_value();
     let variants = spec["components"]["schemas"]["PublicOperationResult"]["oneOf"]
