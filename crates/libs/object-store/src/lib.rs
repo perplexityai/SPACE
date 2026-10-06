@@ -30,6 +30,7 @@ use tracing::{Instrument, debug, info, warn};
 
 use pplx_space_common_core::types::{MULTIPART_CONCURRENCY, MULTIPART_PART_SIZE};
 
+mod content_md5;
 mod copy;
 mod download;
 
@@ -824,10 +825,15 @@ impl ObjectStore for S3ObjectStore {
         target: ObjectTarget<'_>,
         body: Bytes,
     ) -> Result<(), ObjectStoreError> {
+        let digest_body = body.clone();
+        let content_md5 = tokio::task::spawn_blocking(move || content_md5::of_bytes(&digest_body))
+            .await
+            .map_err(|err| ObjectStoreError::Put(err.to_string()))?;
         self.base
             .put_object()
             .bucket(target.bucket)
             .key(target.key)
+            .content_md5(content_md5)
             .body(ByteStream::from(body))
             .customize()
             .config_override(Self::op_config(creds, &target))
@@ -879,6 +885,16 @@ impl ObjectStore for S3ObjectStore {
                 path_style = target.path_style,
                 "uploading object with single put"
             );
+            let content_md5 = file_range_content_md5(src, 0, size).await.map_err(|err| {
+                let error = err.to_string();
+                warn!(
+                    bucket = target.bucket,
+                    key = target.key,
+                    error,
+                    "failed to digest file for single put"
+                );
+                ObjectStoreError::Put(error)
+            })?;
             let body = ByteStream::from_path(src).await.map_err(|err| {
                 let error = DisplayErrorContext(&err).to_string();
                 warn!(
@@ -893,6 +909,7 @@ impl ObjectStore for S3ObjectStore {
                 .put_object()
                 .bucket(target.bucket)
                 .key(target.key)
+                .content_md5(content_md5)
                 .body(body)
                 .customize()
                 .config_override(Self::op_config(creds, &target))
@@ -1526,6 +1543,21 @@ impl S3ObjectStore {
             let cfg = Self::op_config(creds, target);
 
             async move {
+                let content_md5 = file_range_content_md5(&path, range.offset, range.length)
+                    .await
+                    .map_err(|err| {
+                        let error = err.to_string();
+                        warn!(
+                            key,
+                            upload_id,
+                            part_number = range.part_number,
+                            offset_bytes = range.offset,
+                            length_bytes = range.length,
+                            error,
+                            "failed to digest multipart part body"
+                        );
+                        ObjectStoreError::Multipart(error)
+                    })?;
                 let body = ByteStream::read_from()
                     .path(&path)
                     .offset(range.offset)
@@ -1552,6 +1584,7 @@ impl S3ObjectStore {
                     .key(&key)
                     .upload_id(&upload_id)
                     .part_number(range.part_number)
+                    .content_md5(content_md5)
                     .body(body)
                     .customize()
                     .config_override(cfg)
@@ -1592,8 +1625,8 @@ impl S3ObjectStore {
 ///
 /// `part` is called once per range and must return a `'static` future yielding
 /// that part's ETag, so each part owns what it needs and the work can be spawned
-/// rather than polled on one task: parts do real CPU work (checksums over
-/// hundreds of megabytes), so spreading them across the runtime's threads is
+/// rather than polled on one task: an upload part reads and digests hundreds of
+/// megabytes for its `Content-MD5`, so running parts side by side is
 /// load-bearing, not incidental.
 async fn collect_completed_parts<F, Fut>(
     ranges: &[MultipartPartRange],
@@ -1863,6 +1896,15 @@ where
         }
         _ => None,
     }
+}
+
+/// Digests `length` bytes of `path` at `offset` on the blocking pool; see
+/// [`content_md5`] for why every file upload carries one.
+async fn file_range_content_md5(path: &Path, offset: u64, length: u64) -> std::io::Result<String> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || content_md5::of_file_range(&path, offset, length))
+        .await
+        .map_err(std::io::Error::other)?
 }
 
 /// Calls `AbortMultipartUpload` if dropped before [`disarm`](AbortGuard::disarm).

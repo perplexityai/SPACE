@@ -17,9 +17,11 @@ aws-credential-types = { workspace = true, features = ["hardcoded-credentials"] 
 aws-sdk-s3 = { workspace = true, features = ["behavior-version-latest", "default-https-client", "http-1x", "rt-tokio", "sigv4a"] }
 aws-smithy-runtime-api = { workspace = true }
 aws-smithy-types = { workspace = true }
+base64 = { workspace = true }
 bytes = { workspace = true }
 http = { workspace = true }
 jiff = { workspace = true }
+md-5 = { workspace = true }
 percent-encoding = { workspace = true }
 sha2 = { workspace = true }
 thiserror = { workspace = true }
@@ -32,5 +34,6 @@ pplx-space-metrics = { workspace = true }
 
 
 [dev-dependencies]
+axum = { workspace = true }
 tempfile = { workspace = true }
-tokio = { workspace = true, features = ["fs", "io-util", "macros", "rt-multi-thread", "sync"] }
+tokio = { workspace = true, features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "sync"] }
