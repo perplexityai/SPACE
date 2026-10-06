@@ -27,7 +27,6 @@ use sqlx::{PgConnection, PgPool, SqlitePool};
 
 use pplx_space_common_svc::sql::sqlite::{self, SqliteError};
 
-mod baseline_cutover;
 pub mod bootstrap_roles;
 pub mod migration_retry;
 #[cfg(test)]
@@ -169,8 +168,6 @@ impl From<Database> for DbMigrateRunConfig {
 /// driver error as its source.
 #[derive(Debug, thiserror::Error)]
 pub enum RunDbMigrateError {
-    #[error(transparent)]
-    BaselineCutover(#[from] baseline_cutover::Error),
     #[error("reset requires --confirm-data-loss")]
     ResetNotConfirmed,
     #[error("migration {version} has no matching .down.sql file")]
@@ -346,7 +343,6 @@ async fn run_control_plane(args: ControlPlaneArgs) -> Result<(), RunDbMigrateErr
     ));
     match args.command {
         Command::Up => {
-            baseline_cutover::prepare(&pool, &POSTGRES_MIGRATOR).await?;
             apply_control_plane_migrations(&pool, retry_policy, RunDbMigrateError::ApplyMigrations)
                 .await?;
         }

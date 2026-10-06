@@ -5,7 +5,7 @@ use super::super::*;
 use crate::pg_test_support::TestResult;
 
 #[tokio::test]
-async fn postgres_rejects_pre_cutover_history_without_changing_data() -> TestResult {
+async fn postgres_rejects_legacy_history_without_changing_data() -> TestResult {
     let Some(fixture) = try_raw_pg_test_db().await? else {
         return Ok(());
     };
@@ -25,11 +25,12 @@ async fn postgres_rejects_pre_cutover_history_without_changing_data() -> TestRes
     .fetch_one(&fixture.pool)
     .await?;
 
-    let result = apply_control_plane_migrations(
-        &fixture.pool,
-        migration_retry::LockRetryPolicy::DEFAULT,
-        RunDbMigrateError::ApplyMigrations,
-    )
+    let result = run_control_plane(ControlPlaneArgs {
+        database_url: fixture.database_url.clone(),
+        job_deadline_seconds: 60,
+        confirm_data_loss: false,
+        command: Command::Up,
+    })
     .await;
 
     assert!(matches!(result, Err(RunDbMigrateError::ApplyMigrations(_))));
