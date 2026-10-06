@@ -53,24 +53,21 @@ written by one of them onto the module's addresses without replacing anything.
   repository. If `AssumeRoleWithWebIdentity` is denied, compare the list with
   `gh api repos/<owner>/<name>/actions/oidc/customization/sub` for the
   repository whose job was denied.
-- **Trusted repositories.** The default list trusts the repositories that have
-  held the `perplexityai/SPACE` name, oldest first, and the subject the current
-  one's replacement is expected to issue once it's renamed to `SPACE`. A
-  repository renamed away from `SPACE` issues a different subject, so its entry
-  matches nothing unless it's renamed back. The replacement's pre-rename
-  subject isn't listed, so nothing can mint the last entry until the rename.
-  That entry is unverified until then, but only the repository with that id can
-  mint it, so it's safe to list early. `StringEquals` is case-sensitive, so it
-  matches only if the new name is exactly `SPACE`. A repository holding a
-  listed name must protect `main` with rulesets that block deletion and
-  force-pushes and require a pull request with an approval, the required
-  checks, and the merge queue. The role trusts whatever reaches that
-  repository's `main`: a direct push by a ruleset bypass actor, commits pushed
-  after an approval (later pushes don't dismiss it), and anything its admins
-  allow by changing the rulesets. Put that protection, and an admin list no
-  wider than the old repository's, on a replacement repository before it's
-  renamed. Remove a renamed-away repository's entry once renaming it back to
-  `SPACE` is no longer a fallback.
+- **Trusted repositories.** The default list trusts `perplexityai/SPACE` and
+  the subject its replacement repository is expected to issue once it's
+  renamed to `SPACE`. The replacement's pre-rename subject isn't listed, so
+  nothing can mint the second entry until the rename. That entry is unverified
+  until then, but only the repository with that id can mint it, so it's safe to
+  list early. `StringEquals` is case-sensitive, so it matches only if the new
+  name is exactly `SPACE`. A repository holding a listed name must protect
+  `main` with rulesets that block deletion and force-pushes and require a pull
+  request with an approval, the required checks, and the merge queue. The role
+  trusts whatever reaches that repository's `main`: a direct push by a ruleset
+  bypass actor, commits pushed after an approval (later pushes don't dismiss
+  it), and anything its admins allow by changing the rulesets. Put that
+  protection, and an admin list no wider than the old repository's, on a
+  replacement repository before it's renamed. Remove the old repository's
+  entry once the replacement has taken over.
 
 `docs/space/diagrams/oss-image-publish.png` draws the flow.
 
