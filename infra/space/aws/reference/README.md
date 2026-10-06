@@ -347,9 +347,9 @@ renamed away from `SPACE` issues a different subject, so its entry matches
 nothing unless it's renamed back. The replacement's pre-rename subject isn't
 listed, so nothing can mint the last entry until the rename. That entry is
 unverified until then, but only the repository with that id can mint it, so
-it's safe to list early. `StringEquals` is case-sensitive, so it matches only if
-the new name is exactly `SPACE`. Remove the old repository's entry once the
-replacement has taken over.
+it's safe to list early. `StringEquals` is case-sensitive, so it matches only
+if the new name is exactly `SPACE`. Remove a renamed-away repository's entry
+once renaming it back to `SPACE` is no longer a fallback.
 
 A repository can mint its listed subjects as soon as it holds the listed name.
 From then on it must:
