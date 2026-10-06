@@ -41,3 +41,7 @@ This crate retains the daemon contract. General application embedding requires
 an explicit worker launcher, credential/capability policy, native admission and
 shutdown semantics, descendant ownership, and an integration exercising those
 requirements before exposing a separate supported API.
+
+The proposed support profile, ownership contract, and implementation acceptance
+criteria are in the [embedding RFC](../../../../../docs/space/rfcs/2026-10-06-guest-execution-embedding.md).
+It is a proposal; the requirements above describe current behavior.
