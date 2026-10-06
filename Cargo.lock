@@ -6847,6 +6847,7 @@ dependencies = [
  "pplx-space-test-env",
  "prost",
  "prost-types",
+ "rtnetlink",
  "rustix",
  "tempfile",
  "thiserror 2.0.20",

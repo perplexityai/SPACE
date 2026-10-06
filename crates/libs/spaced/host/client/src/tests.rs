@@ -108,6 +108,13 @@ impl proto::networking_server::Networking for RejectingControlService {
     ) -> Result<tonic::Response<proto::CloseLoopbackBridgeResponse>, Status> {
         self.reject()
     }
+
+    async fn flush_gateway_neighbor(
+        &self,
+        _request: Request<proto::FlushGatewayNeighborRequest>,
+    ) -> Result<tonic::Response<proto::FlushGatewayNeighborResponse>, Status> {
+        self.reject()
+    }
 }
 
 impl RejectingControlService {
@@ -193,10 +200,14 @@ async fn single_attempt_controls_do_not_replay_retryable_failures() {
             .close_loopback_bridge(8080)
             .await
             .expect_err("loopback close failure"),
+        client
+            .flush_gateway_neighbor()
+            .await
+            .expect_err("neighbor flush failure"),
     ] {
         assert_eq!(error.code(), tonic::Code::Unavailable);
     }
-    assert_eq!(calls.load(Ordering::SeqCst), 6);
+    assert_eq!(calls.load(Ordering::SeqCst), 7);
 
     server.abort();
     assert!(server.await.unwrap_err().is_cancelled());

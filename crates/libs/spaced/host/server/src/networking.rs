@@ -5,6 +5,7 @@
 
 use pplx_space_spaced_common::proto::bridge_guest::{
     CloseLoopbackBridgeRequest as BridgeGuestCloseLoopbackBridgeRequest,
+    FlushGatewayNeighborRequest as BridgeGuestFlushGatewayNeighborRequest,
     LoopbackBridgeStatus as BridgeGuestLoopbackBridgeStatus,
     OpenLoopbackBridgeRequest as BridgeGuestOpenLoopbackBridgeRequest,
 };
@@ -81,6 +82,23 @@ impl Networking for SpacedHostService {
             )
             .await?;
         Ok(Response::new(proto::CloseLoopbackBridgeResponse {}))
+    }
+
+    async fn flush_gateway_neighbor(
+        &self,
+        _request: Request<proto::FlushGatewayNeighborRequest>,
+    ) -> Result<Response<proto::FlushGatewayNeighborResponse>, Status> {
+        self.call_bridge_guest_networking_once(
+            "bridge_guest_flush_gateway_neighbor",
+            BridgeGuestOperationBudget::NetworkingControl,
+            |mut client| async move {
+                client
+                    .flush_gateway_neighbor(BridgeGuestFlushGatewayNeighborRequest {})
+                    .await
+            },
+        )
+        .await?;
+        Ok(Response::new(proto::FlushGatewayNeighborResponse {}))
     }
 }
 

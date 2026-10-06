@@ -1511,9 +1511,10 @@ async fn mark_restore_after_network_ready(
     Ok(())
 }
 
-// Snapshot restore preserves the guest neighbor table; after cross-node restore,
-// its cached gateway MAC can refer to the previous node's data-plane endpoint.
-// Flush it so restored guest traffic re-resolves the gateway on the current node.
+// Snapshot restore preserves the guest neighbor table, whose gateway entry names
+// the network slot the snapshot was taken on. A restore normally lands on another
+// slot, on this node or another, and each slot's gateway has its own MAC. Flush
+// the entry so restored guest traffic re-resolves the gateway.
 async fn flush_restore_gateway_neighbor_best_effort(sandbox_id: &str) {
     match flush_restore_gateway_neighbor(sandbox_id).await {
         Ok(()) => tracing::debug!(sandbox_id, "flushed restored guest gateway neighbor entry"),
@@ -1531,6 +1532,18 @@ async fn flush_restore_gateway_neighbor(sandbox_id: &str) -> Result<(), String> 
     let client = pplx_space_spaced_host_client::SpacedHostClient::new_with_config(config)
         .await
         .map_err(|error| error.to_string())?;
+    match tokio::time::timeout(
+        RESTORE_GATEWAY_NEIGHBOR_FLUSH_TIMEOUT,
+        client.flush_gateway_neighbor(),
+    )
+    .await
+    {
+        Err(_) => return Err("gateway neighbor flush timed out".to_string()),
+        Ok(Ok(())) => return Ok(()),
+        // A spaced-host or guest that predates the call: flush through `ip`.
+        Ok(Err(status)) if status.code() == tonic::Code::Unimplemented => {}
+        Ok(Err(status)) => return Err(status.to_string()),
+    }
     let mut events = client
         .start_process_stream_with_options(restore_gateway_neighbor_flush_options())
         .await

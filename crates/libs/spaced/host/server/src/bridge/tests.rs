@@ -28,6 +28,13 @@ impl guest_protocol::networking_server::Networking for CloseGuest {
             )),
         }
     }
+
+    async fn flush_gateway_neighbor(
+        &self,
+        _: Request<guest_protocol::FlushGatewayNeighborRequest>,
+    ) -> Result<Response<guest_protocol::FlushGatewayNeighborResponse>, Status> {
+        Err(Status::unimplemented("unused test RPC"))
+    }
 }
 
 #[tokio::test(start_paused = true)]

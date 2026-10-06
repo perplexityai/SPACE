@@ -43,6 +43,7 @@ service Process {
 service Networking {
   rpc OpenLoopbackBridge(space.spaced.operations.v1.OpenLoopbackBridgeRequest) returns (space.spaced.operations.v1.OpenLoopbackBridgeResponse);
   rpc CloseLoopbackBridge(space.spaced.operations.v1.CloseLoopbackBridgeRequest) returns (space.spaced.operations.v1.CloseLoopbackBridgeResponse);
+  rpc FlushGatewayNeighbor(space.spaced.operations.v1.FlushGatewayNeighborRequest) returns (space.spaced.operations.v1.FlushGatewayNeighborResponse);
 }
 
 service Filesystem {

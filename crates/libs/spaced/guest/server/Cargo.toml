@@ -69,6 +69,9 @@ pplx-space-metrics = { workspace = true }
 pplx-space-spaced-common = { workspace = true }
 prost-types = { workspace = true }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+rtnetlink = { workspace = true }
+
 [dev-dependencies]
 pplx-space-common-core = { workspace = true, features = ["test-hooks"] }
 opentelemetry-proto = { workspace = true, features = ["gen-tonic", "metrics"] }

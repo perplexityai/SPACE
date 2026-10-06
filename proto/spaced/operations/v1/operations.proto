@@ -291,6 +291,12 @@ message ProcessSignaled { optional int32 signal = 1; }
 message ProcessTimedOut { optional int32 signal = 1; }
 message ProcessUnknown {}
 
+// Forget the guest's cached link-layer address of its gateway, so the next
+// packet resolves it again. A restored guest keeps its neighbour table, whose
+// gateway entry belongs to the network slot the snapshot was taken on.
+message FlushGatewayNeighborRequest {}
+message FlushGatewayNeighborResponse {}
+
 message OpenLoopbackBridgeRequest {
   uint32 port = 1;
   google.protobuf.Duration wait_timeout = 2;

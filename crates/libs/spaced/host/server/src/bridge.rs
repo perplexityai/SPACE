@@ -71,7 +71,11 @@ fn host_request_limiter() -> pplx_space_common_svc::GrpcRateLimiterLayer {
         ),
         (
             "Networking",
-            &["OpenLoopbackBridge", "CloseLoopbackBridge"][..],
+            &[
+                "OpenLoopbackBridge",
+                "CloseLoopbackBridge",
+                "FlushGatewayNeighbor",
+            ][..],
         ),
     ] {
         for method in methods {

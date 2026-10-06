@@ -4,12 +4,15 @@
 use std::time::Duration;
 
 use pplx_space_spaced_common::proto::bridge_guest::{
-    CloseLoopbackBridgeRequest, CloseLoopbackBridgeResponse, OpenLoopbackBridgeRequest,
-    OpenLoopbackBridgeResponse, networking_server::Networking as BridgeGuestNetworking,
+    CloseLoopbackBridgeRequest, CloseLoopbackBridgeResponse, FlushGatewayNeighborRequest,
+    FlushGatewayNeighborResponse, OpenLoopbackBridgeRequest, OpenLoopbackBridgeResponse,
+    networking_server::Networking as BridgeGuestNetworking,
 };
 use tonic::{Request, Response, Status};
 
 use crate::SpacedGuestService;
+
+mod neighbor;
 
 /// Convert an optional protobuf duration to `std::time::Duration`. Rejects
 /// malformed values (negative seconds/nanos, or `nanos >= 1_000_000_000`) with
@@ -65,5 +68,14 @@ impl BridgeGuestNetworking for SpacedGuestService {
             u16::try_from(req.port).map_err(|_| Status::invalid_argument("port out of range"))?;
         self.inner.loopback_bridge.close(port).await;
         Ok(Response::new(CloseLoopbackBridgeResponse {}))
+    }
+
+    async fn flush_gateway_neighbor(
+        &self,
+        _request: Request<FlushGatewayNeighborRequest>,
+    ) -> Result<Response<FlushGatewayNeighborResponse>, Status> {
+        self.require_ready()?;
+        neighbor::flush_gateway_neighbor().await?;
+        Ok(Response::new(FlushGatewayNeighborResponse {}))
     }
 }

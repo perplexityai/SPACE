@@ -1142,6 +1142,18 @@ impl SpacedHostClient {
         })
         .await
     }
+
+    /// Make the guest forget its cached link-layer address of its gateway.
+    /// `Unimplemented` from a spaced-host or guest that predates the call.
+    pub async fn flush_gateway_neighbor(&self) -> Result<(), tonic::Status> {
+        self.call_networking_once("flush_gateway_neighbor", move |mut client| async move {
+            client
+                .flush_gateway_neighbor(proto::FlushGatewayNeighborRequest {})
+                .await
+        })
+        .await
+        .map(drop)
+    }
 }
 
 #[cfg(test)]
