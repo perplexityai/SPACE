@@ -134,17 +134,20 @@ in a later probe. An existing-session check never silently reconnects. See
 
 The UDP/QUIC allow probes require payload delivery after the first reply. QUIC/8443
 remains allowed; UDP/443 and QUIC/443 exercise the packaged rejection. UDP/443
-probes require `ECONNREFUSED` and check counter increments.
+probes accept `ECONNREFUSED` or a timeout when the ICMP reply is rate-limited.
+Every sent datagram must increment the guardrail counter and none may reach
+upstream. The reply-boundary regression separately requires an isolated attempt
+to receive an explicit refusal and checks a 20-attempt burst.
 The [established-connection bypass](../../../crates/libs/node/mgr/server/src/firewall.rs)
 is restricted to reply-direction traffic so later outbound datagrams still
 reach the gateway proxy.
 
 The worker image packages `docker/space/nftables/sandbox-pre-tproxy-guardrails.json` under `/etc/space/nftables`.
-Its IPv4 UDP/443 reject and namespace `net.ipv4.icmp_ratemask=6160` apply on slot
-setup/reset. The mask exempts destination-unreachable replies from the per-peer
-ICMP limiter, so parallel attempts receive prompt refusals. This also exempts
-other IPv4 destination-unreachable replies within the slot; the source guard
-restricts replies to the guest's own address. Unconnected UDP clients may still
+Its IPv4 UDP/443 reject and namespace `net.ipv4.icmp_ratemask=6168` apply on slot
+setup/reset. The default mask retains ICMP rate limits, including for
+destination-unreachable replies. Bursts may suppress some refusals, but every
+matching UDP/443 packet remains blocked; the source guard restricts replies to
+the guest's own address. Unconnected UDP clients may still
 wait for their handshake timeout. Non-443 QUIC, routed IPv6, and established
 flows are unchanged.
 
@@ -155,7 +158,7 @@ they are not disconnected. **Rollout gate:** wait for recovery to finish, check
 the slot health/degraded count, inspect
 `pre_tproxy_guardrails` in every live namespace, and drain/reset stale leases
 (including long-lived ones) through normal sandbox lifecycle operations. Confirm
-the reject and `icmp_ratemask=6160` in each reused namespace before declaring the
+the reject and `icmp_ratemask=6168` in each reused namespace before declaring the
 rollout complete; a healthy binary or aggregate action gauge is not that proof.
 
 For rollback, use only the recorded #253 observation image digest and follow
@@ -245,7 +248,8 @@ audit, and preserved ingress rules.
 It also runs the real slot-pool startup worker and SQLite migrations, rebuilding
 idle namespaces seeded with the opposite UDP/443 stage and with mask-only drift,
 while leaving a current slot unchanged. Expected verdict and mask come from the
-packaged stage: observation/6168 or reject/6160. Namespace inodes must stay the
+packaged stage; both observation and rejection retain `icmp_ratemask=6168`.
+Mask-only drift is seeded with `0`. Namespace inodes must stay the
 same, proving in-place repair:
 
 ```sh

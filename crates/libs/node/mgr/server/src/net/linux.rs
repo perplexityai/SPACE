@@ -211,8 +211,7 @@ fn configure_namespace_links(net: &NetId) -> Result<(), NetworkOpError> {
     .map_err(NetworkOpError::transient)
 }
 
-// Exempt destination-unreachable so parallel QUIC attempts get prompt refusals.
-pub const NAMESPACE_ICMP_RATEMASK: &str = "6160";
+pub const NAMESPACE_ICMP_RATEMASK: &str = "6168";
 
 pub fn setup_namespace_sysctls(ns: &str) -> Result<(), NetworkOpError> {
     write_sysctl(Some(ns), "net.ipv4.icmp_ratemask", NAMESPACE_ICMP_RATEMASK)

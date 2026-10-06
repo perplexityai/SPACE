@@ -35,8 +35,6 @@ if [[ ${1:-} == __isolated ]]; then
   trap 'exit 130' INT
   trap 'exit 143' TERM
   bash "$SCRIPT_DIR/../bench/topology.sh" up >"$output/topology.log" 2>&1
-  # Match node-manager setup_namespace_sysctls for prompt UDP/443 refusals.
-  ip netns exec ngb-gw sysctl -qw net.ipv4.icmp_ratemask=6160
   # Exercise the packaged early guardrails omitted by the throughput topology.
   ip netns exec ngb-gw nft add table ip sandbox
   ip netns exec ngb-gw nft 'add chain ip sandbox pre_tproxy_guardrails { type filter hook prerouting priority -175; }'

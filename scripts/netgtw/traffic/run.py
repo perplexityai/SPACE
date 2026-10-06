@@ -1154,6 +1154,8 @@ def run(args, cases):
                         baseline.pop("switch_expect", None)
                         baseline.pop("tunnel_authority", None)
                         baseline.pop("tunnel_method", None)
+                        if spec["kind"] == "udp" and spec["port"] == 443:
+                            baseline["expect"] = "allow"
                         if spec["kind"].startswith("dns-") and spec["target"] in (
                             "1.1.1.1",
                             "8.8.8.8",
@@ -1190,7 +1192,15 @@ def run(args, cases):
                         row.update(result=result, events=events)
                         if count_udp443:
                             row["udp443_counter_delta"] = udp443_packets() - before
-                            require(row["udp443_counter_delta"] > 0, "UDP/443 guardrail counter did not increment")
+                            attempted = len(spec.get("sizes", [0]))
+                            require(
+                                result.get("datagrams_sent") == attempted,
+                                "not every UDP/443 datagram was sent",
+                            )
+                            require(
+                                row["udp443_counter_delta"] == attempted,
+                                "not every UDP/443 datagram hit the guardrail",
+                            )
                         children.healthy()
                         row.update(evaluate_probe(spec, result, events))
                     except (ValueError, subprocess.SubprocessError, OSError) as error:

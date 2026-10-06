@@ -14,7 +14,7 @@ probes = [
   # DNS attribution also requires protocol identity; opaque TCP/UDP fail closed.
   { kind = "tcp", expect = "deny" },
   { kind = "udp", expect = "deny" },
-  { kind = "udp", port = 443, expect = "deny", errno = 111 },
+  { kind = "udp", port = 443, expect = "deny" },
   # A denied protocol name must not borrow another name's DNS attribution.
   { kind = "http", host = "blocked.test", expect = "deny" },
   { kind = "tls", host = "blocked.test", expect = "deny" },
