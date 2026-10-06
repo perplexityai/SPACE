@@ -15,12 +15,7 @@ resource "aws_secretsmanager_secret" "network_credential_smoke" {
   name        = "${local.name}-network-credential-smoke"
   description = "Fixed dummy Authorization value for testing network credential injection"
 
-  # The organization-scoped reader role (credmgr_secrets_reader.tf) reads the
-  # fixture only for the smoke organization's sessions.
-  tags = merge(
-    var.common_tags,
-    var.network_credential_smoke_org_id == null ? {} : { "space-org-id" = var.network_credential_smoke_org_id },
-  )
+  tags = var.common_tags
 }
 
 resource "aws_secretsmanager_secret_version" "network_credential_smoke" {
@@ -34,9 +29,7 @@ data "aws_iam_policy_document" "credmgr_authority_secrets_manager_read" {
   count = local.network_credential_smoke_count
 
   # Scoped to the smoke fixture only. Credential Authority's own role must not
-  # read arbitrary secrets in the account. Binaries that read through the
-  # organization-scoped reader role no longer use this grant; remove it once
-  # every cluster with the smoke enabled runs one.
+  # read arbitrary secrets in the account.
   statement {
     sid       = "ReadNetworkCredentialSmokeSecret"
     actions   = ["secretsmanager:GetSecretValue"]
