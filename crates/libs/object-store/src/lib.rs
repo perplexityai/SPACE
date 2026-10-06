@@ -10,7 +10,8 @@ use async_trait::async_trait;
 use aws_config::BehaviorVersion;
 use aws_credential_types::Credentials;
 use aws_credential_types::provider::ProvideCredentials;
-use aws_sdk_s3::config::{Region, RequestChecksumCalculation};
+use aws_sdk_s3::config::timeout::TimeoutConfig;
+use aws_sdk_s3::config::{Region, RequestChecksumCalculation, StalledStreamProtectionConfig};
 use aws_sdk_s3::error::SdkError;
 use aws_sdk_s3::operation::get_object::{GetObjectError, GetObjectOutput};
 use aws_sdk_s3::operation::head_object::HeadObjectError;
@@ -22,7 +23,7 @@ use aws_smithy_types::error::metadata::ProvideErrorMetadata;
 use bytes::Bytes;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
 use tokio::task::JoinSet;
@@ -30,9 +31,12 @@ use tracing::{Instrument, debug, info, warn};
 
 use pplx_space_common_core::types::{MULTIPART_CONCURRENCY, MULTIPART_PART_SIZE};
 
+mod attempts;
 mod content_md5;
 mod copy;
 mod download;
+
+use attempts::AttemptObserver;
 
 pub use download::FinishingWrite;
 use download::{ReorderWindow, SequentialWriter, open_scratch};
@@ -404,6 +408,50 @@ const DEFAULT_DOWNLOAD_BUFFER_BUDGET: usize = 2 * 1024 * 1024 * 1024;
 const DOWNLOAD_BUFFER_BUDGET_MIN: usize = 256 * 1024 * 1024;
 const DOWNLOAD_BUFFER_BUDGET_MAX: usize = 8 * 1024 * 1024 * 1024;
 
+/// Env var that overrides the per-attempt S3 timeout, in whole seconds.
+/// Accepted range is `5..=21600` (6 h). Raise it with the multipart part
+/// size: the default is sized for one 256 MiB part per attempt.
+const ATTEMPT_TIMEOUT_ENV: &str = "SPACE_OBJECT_STORE_ATTEMPT_TIMEOUT_SECS";
+
+/// Env var that overrides the whole-operation S3 timeout, in whole seconds.
+/// Accepted range is `5..=86400` (24 h). When unset it is derived from the
+/// resolved attempt timeout, so raising only the attempt timeout keeps room
+/// for every retry.
+const OPERATION_TIMEOUT_ENV: &str = "SPACE_OBJECT_STORE_OPERATION_TIMEOUT_SECS";
+
+/// Per-attempt timeout. It covers sending the request body and waiting for
+/// the response headers, plus the response body for non-streaming
+/// operations; a `GetObject` attempt ends at the response headers.
+///
+/// The attempt timeout must fit the largest request body this store sends
+/// in one attempt: a full 256 MiB multipart part (or a single put of up to
+/// one part). At a throughput floor of 0.5 MiB/s per in-flight stream — 8
+/// MiB/s across the 16 concurrent parts, far below a healthy node's uplink —
+/// that is 512 s; 600 s leaves 88 s for the endpoint to answer. It exists to
+/// bound the wait after the body is sent, which the SDK otherwise leaves
+/// unbounded. Body stalls are cut much sooner by stalled-stream protection.
+const DEFAULT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// Attempts the SDK's standard retry strategy makes per operation
+/// (aws-smithy-types `RetryConfig::standard`, the default for this behavior
+/// version).
+const SDK_MAX_ATTEMPTS: u32 = 3;
+
+/// Room in the default operation timeout for everything between attempts:
+/// the standard strategy backs off at most 20 s (`max_backoff`) before each
+/// of the two retries, so 40 s worst case, plus connection setup.
+const RETRY_BACKOFF_ALLOWANCE: Duration = Duration::from_secs(60);
+
+const TIMEOUT_SECS_MIN: u64 = 5;
+const ATTEMPT_TIMEOUT_SECS_MAX: u64 = 6 * 60 * 60;
+const OPERATION_TIMEOUT_SECS_MAX: u64 = 24 * 60 * 60;
+
+/// Upload stalled-stream grace period. Equal to the SDK's effective default
+/// (aws-smithy-runtime's default stalled-stream plugin sets 5 s; the 20 s
+/// `DEFAULT_GRACE_PERIOD` constant is only a builder fallback and does not
+/// apply), stated here so the value is visible next to the timeouts.
+const STALLED_STREAM_GRACE_PERIOD: Duration = Duration::from_secs(5);
+
 type S3Response = aws_smithy_runtime_api::http::Response;
 type S3SdkError<E> = SdkError<E, S3Response>;
 
@@ -539,6 +587,32 @@ fn resolve_download_buffer_budget<F: FnOnce(&str) -> Option<String>>(read: F) ->
         .unwrap_or(DEFAULT_DOWNLOAD_BUFFER_BUDGET)
 }
 
+fn resolve_timeout_secs<F: FnOnce(&str) -> Option<String>>(
+    read: F,
+    env_name: &'static str,
+    max_secs: u64,
+) -> Option<Duration> {
+    read(env_name)
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&n| (TIMEOUT_SECS_MIN..=max_secs).contains(&n))
+        .map(Duration::from_secs)
+}
+
+fn resolve_attempt_timeout<F: FnOnce(&str) -> Option<String>>(read: F) -> Duration {
+    resolve_timeout_secs(read, ATTEMPT_TIMEOUT_ENV, ATTEMPT_TIMEOUT_SECS_MAX)
+        .unwrap_or(DEFAULT_ATTEMPT_TIMEOUT)
+}
+
+/// Defaults to every attempt timing out in full plus the backoff between
+/// them: `3 × 600 s + 60 s = 1860 s` (31 min) at the default attempt timeout.
+fn resolve_operation_timeout<F: FnOnce(&str) -> Option<String>>(
+    read: F,
+    attempt_timeout: Duration,
+) -> Duration {
+    resolve_timeout_secs(read, OPERATION_TIMEOUT_ENV, OPERATION_TIMEOUT_SECS_MAX)
+        .unwrap_or(attempt_timeout * SDK_MAX_ATTEMPTS + RETRY_BACKOFF_ALLOWANCE)
+}
+
 /// Telemetry-safe endpoint label: host and optional port only, so a custom
 /// endpoint URL carrying userinfo or other sensitive components never
 /// reaches exported spans.
@@ -672,7 +746,22 @@ where
     );
 }
 
-fn s3_base_config() -> Config {
+/// Bounds on one S3 operation and on each of its attempts.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct S3Timeouts {
+    attempt: Duration,
+    operation: Duration,
+}
+
+impl S3Timeouts {
+    fn from_env() -> Self {
+        let attempt = resolve_attempt_timeout(|name| std::env::var(name).ok());
+        let operation = resolve_operation_timeout(|name| std::env::var(name).ok(), attempt);
+        Self { attempt, operation }
+    }
+}
+
+fn s3_base_config(timeouts: S3Timeouts, observer: AttemptObserver) -> aws_sdk_s3::config::Builder {
     let placeholder_creds = Credentials::new(
         "placeholder",
         "placeholder",
@@ -690,7 +779,22 @@ fn s3_base_config() -> Config {
         // stall until S3 returns RequestTimeout, so keep checksums to
         // operations where S3 requires them.
         .request_checksum_calculation(RequestChecksumCalculation::WhenRequired)
-        .build()
+        .stalled_stream_protection(
+            StalledStreamProtectionConfig::enabled()
+                .grace_period(STALLED_STREAM_GRACE_PERIOD)
+                .build(),
+        )
+        // Without these the SDK sets no attempt or operation timeout, so an
+        // endpoint that accepts the whole body and never answers holds the
+        // request forever. Unset fields, such as the 3.1 s connect timeout,
+        // keep the SDK default: the orchestrator merges timeout layers.
+        .timeout_config(
+            TimeoutConfig::builder()
+                .operation_attempt_timeout(timeouts.attempt)
+                .operation_timeout(timeouts.operation)
+                .build(),
+        )
+        .interceptor(observer)
 }
 
 impl S3ObjectStore {
@@ -717,8 +821,26 @@ impl S3ObjectStore {
     /// - `SPACE_OBJECT_STORE_DOWNLOAD_BUFFER_BUDGET_BYTES`: 256 MiB ..= 8 GiB.
     ///   Process-wide cap on buffered download chunks across every
     ///   concurrent pull.
+    /// - `SPACE_OBJECT_STORE_ATTEMPT_TIMEOUT_SECS`: 5..=21600, default 600.
+    ///   Bounds each S3 request attempt; sized for one 256 MiB part, so
+    ///   raise it with the part size.
+    /// - `SPACE_OBJECT_STORE_OPERATION_TIMEOUT_SECS`: 5..=86400, default
+    ///   three attempt timeouts plus 60 s (1860 s). Bounds an operation
+    ///   across all of its retries.
     pub fn new() -> Self {
-        let conf = s3_base_config();
+        Self::with_base_config(
+            s3_base_config(S3Timeouts::from_env(), AttemptObserver::logging()).build(),
+        )
+    }
+
+    fn with_base_config(conf: Config) -> Self {
+        let timeouts = conf.timeout_config();
+        let attempt_timeout_secs = timeouts
+            .and_then(TimeoutConfig::operation_attempt_timeout)
+            .map(|timeout| timeout.as_secs());
+        let operation_timeout_secs = timeouts
+            .and_then(TimeoutConfig::operation_timeout)
+            .map(|timeout| timeout.as_secs());
         let multipart_part_size = resolve_multipart_part_size(|name| std::env::var(name).ok());
         let multipart_concurrency = resolve_multipart_concurrency(|name| std::env::var(name).ok());
         let download_reader_concurrency =
@@ -735,6 +857,8 @@ impl S3ObjectStore {
             download_chunk_size,
             download_buffer_budget,
             download_buffer_chunks,
+            attempt_timeout_secs,
+            operation_timeout_secs,
             "object-store: transfer tuning"
         );
         Self {

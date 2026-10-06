@@ -145,6 +145,7 @@ aws-sdk-ecr = { version = "1", default-features = false }
 aws-sdk-s3 = { version = "1", default-features = false }
 aws-sdk-secretsmanager = { version = "1", default-features = false }
 aws-sigv4 = { version = "1", default-features = false }
+aws-smithy-async = "1"
 aws-smithy-runtime-api = "1"
 # aws-config 1.12 still uses aws-smithy-json 0.63, which does not compile with
 # aws-smithy-types 1.7. Keep the AWS SDK graph on its latest coherent line.

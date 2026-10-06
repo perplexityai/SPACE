@@ -27,7 +27,11 @@ fn unset_env() -> impl FnOnce(&str) -> Option<String> {
 
 #[test]
 fn base_config_only_calculates_request_checksums_when_required() {
-    let config = s3_base_config();
+    let timeouts = S3Timeouts {
+        attempt: DEFAULT_ATTEMPT_TIMEOUT,
+        operation: DEFAULT_ATTEMPT_TIMEOUT * SDK_MAX_ATTEMPTS,
+    };
+    let config = s3_base_config(timeouts, AttemptObserver::logging()).build();
 
     assert_eq!(
         config.request_checksum_calculation(),
@@ -287,6 +291,41 @@ fn download_chunk_size_default_and_bounds() {
     assert_eq!(
         resolve_download_chunk_size(fake_env(DOWNLOAD_CHUNK_SIZE_ENV, Some("4096"))),
         DEFAULT_DOWNLOAD_CHUNK_SIZE,
+    );
+}
+
+#[test]
+fn s3_timeouts_default_and_bounds() {
+    assert_eq!(
+        resolve_attempt_timeout(unset_env()),
+        DEFAULT_ATTEMPT_TIMEOUT
+    );
+    assert_eq!(
+        resolve_attempt_timeout(fake_env(ATTEMPT_TIMEOUT_ENV, Some("900"))),
+        Duration::from_secs(900),
+    );
+    for rejected in ["4", "21601", "ten"] {
+        assert_eq!(
+            resolve_attempt_timeout(fake_env(ATTEMPT_TIMEOUT_ENV, Some(rejected))),
+            DEFAULT_ATTEMPT_TIMEOUT,
+            "{rejected} should fall back to the default",
+        );
+    }
+
+    // Unset, the operation budget follows the resolved attempt timeout so
+    // every attempt can run to its own timeout.
+    let attempt = Duration::from_secs(900);
+    assert_eq!(
+        resolve_operation_timeout(unset_env(), attempt),
+        Duration::from_secs(3 * 900 + 60),
+    );
+    assert_eq!(
+        resolve_operation_timeout(fake_env(OPERATION_TIMEOUT_ENV, Some("7200")), attempt),
+        Duration::from_secs(7200),
+    );
+    assert_eq!(
+        resolve_operation_timeout(fake_env(OPERATION_TIMEOUT_ENV, Some("86401")), attempt),
+        Duration::from_secs(3 * 900 + 60),
     );
 }
 
