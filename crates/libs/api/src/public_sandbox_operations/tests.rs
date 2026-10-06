@@ -63,6 +63,109 @@ fn direct_sandbox_controller(pool: &PgPool) -> SandboxController {
     )))
 }
 
+#[cfg(feature = "kubernetes")]
+#[tokio::test(flavor = "current_thread")]
+async fn native_create_executor_persists_exemptions_without_changing_egress() -> TestResult {
+    use std::sync::{Arc, Mutex};
+
+    use crate::controllers::substrate::kubernetes::tests::{
+        running_pod_kubernetes_client, substrate_with_store_client_proxy_port_and_pod,
+    };
+    use crate::tls_interception_exemptions::TlsInterceptionExemptions;
+    use pplx_space_net_common::NetworkPolicyV1;
+
+    let db = pg_test_db().await?;
+    let org_id = seed_org(&db.pool).await?;
+    let user_id = seed_user(&db.pool, org_id).await?;
+    let policy: NetworkPolicyV1 = serde_json::from_value(serde_json::json!({
+        "egress": {
+            "default_action": "deny",
+            "allow": [{"domain": "allowed.example.test"}],
+            "deny": [{"domain": "blocked.example.test"}]
+        },
+        "tls_interception": "on"
+    }))?;
+    sqlx::query(sql!(
+        "INSERT INTO templates (id, name, org_id, visibility, network_policy_json)
+         VALUES ($1, 'seed', NULL, 'generic', $2)"
+    ))
+    .bind(Uuid::now_v7())
+    .bind(serde_json::to_value(&policy)?)
+    .execute(&db.pool)
+    .await?;
+    let release_id = Uuid::now_v7();
+    sqlx::query(sql!(
+        "INSERT INTO template_releases (id, template_name, type, hash)
+         VALUES ($1, 'seed', 'fc', 'sha256:native-policy-test')"
+    ))
+    .bind(release_id)
+    .execute(&db.pool)
+    .await?;
+    sqlx::query(sql!(
+        "INSERT INTO template_release_tags (template_release_id, template_name, tag)
+         VALUES ($1, 'seed', 'latest')"
+    ))
+    .bind(release_id)
+    .execute(&db.pool)
+    .await?;
+
+    let exemptions =
+        TlsInterceptionExemptions::from_config(r#"[{"wildcard_domain":"*.relay.example.test"}]"#)?;
+    let captured_pods = Arc::new(Mutex::new(Vec::new()));
+    // Native create probes the pod's TCP listener even with command readiness disabled.
+    let pod_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    for configured in [false, true] {
+        let substrate = crate::controllers::substrate::Substrate::Kubernetes(Box::new(
+            substrate_with_store_client_proxy_port_and_pod(
+                db.pool.clone(),
+                running_pod_kubernetes_client(Arc::clone(&captured_pods), "127.0.0.1"),
+                pod_listener.local_addr()?.port(),
+                None,
+            ),
+        ));
+        let controller = SandboxController::new(substrate)
+            .with_tls_interception_exemptions(configured.then(|| exemptions.clone()));
+        let executor = CreateSandboxOperationExecutor::new(db.pool.clone(), controller);
+        for inherit_template in [false, true] {
+            let sandbox_id = SandboxId::new();
+            let mut operation = claimed_create_operation_for(sandbox_id, org_id, user_id);
+            let mut request = public_create_request();
+            request.network_policy = (!inherit_template).then(|| policy.clone());
+            operation.payload = CreateSandboxOperationPayload {
+                sandbox_id: sandbox_id.into(),
+                request,
+                node_pool: None,
+                federated_create: None,
+                pool_claim: None,
+            }
+            .into_json();
+
+            let result = executor.execute(&operation).await;
+            assert_eq!(result.state, OperationState::Succeeded, "{result:?}");
+            let persisted: Option<sqlx::types::Json<NetworkPolicyV1>> = sqlx::query_scalar(sql!(
+                "SELECT network_policy_override_json FROM sandboxes WHERE id = $1"
+            ))
+            .bind(sandbox_id)
+            .fetch_one(&db.pool)
+            .await?;
+            assert_eq!(persisted.is_some(), configured || !inherit_template);
+            let effective = persisted.as_ref().map(|value| &value.0).unwrap_or(&policy);
+            let mut expected = policy.clone();
+            if configured {
+                expected.tls_interception_exemptions = serde_json::from_value(serde_json::json!([
+                    {"wildcard_domain": "*.relay.example.test"}
+                ]))?;
+            }
+            assert_eq!(effective, &expected);
+        }
+    }
+    assert_eq!(
+        captured_pods.lock().expect("capture mutex poisoned").len(),
+        4
+    );
+    Ok(())
+}
+
 async fn seed_org(pool: &PgPool) -> Result<OrgId, sqlx::Error> {
     let id = OrgId::new();
     sqlx::query(sql!(

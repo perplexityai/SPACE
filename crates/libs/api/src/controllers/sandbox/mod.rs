@@ -1029,6 +1029,10 @@ pub type SpacedProcessEventStream = tonic::Streaming<SpacedProcessEvent>;
 #[derive(Debug, thiserror::Error)]
 pub enum SandboxControllerInitError {
     #[error(transparent)]
+    TlsInterceptionExemptions(
+        #[from] crate::tls_interception_exemptions::TlsInterceptionExemptionsConfigError,
+    ),
+    #[error(transparent)]
     FalconEgress(#[from] crate::falcon_egress::FalconEgressConfigError),
     #[error(transparent)]
     Substrate(#[from] super::substrate::SubstrateError),
@@ -1037,7 +1041,7 @@ pub enum SandboxControllerInitError {
 }
 
 impl SandboxController {
-    pub(crate) fn with_tls_interception_exemptions(
+    pub fn with_tls_interception_exemptions(
         mut self,
         exemptions: Option<crate::tls_interception_exemptions::TlsInterceptionExemptions>,
     ) -> Self {

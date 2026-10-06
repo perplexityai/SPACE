@@ -812,9 +812,12 @@ impl SandboxController {
     pub async fn from_env(pool: &PgPool) -> Result<Self, SandboxControllerInitError> {
         let policy = crate::federated_identity::FederatedIdentityPolicy::from_env()?;
         let falcon_us2_egress = crate::falcon_egress::FalconUs2Egress::from_env()?;
+        let tls_interception_exemptions =
+            crate::tls_interception_exemptions::TlsInterceptionExemptions::from_env()?;
         Ok(Self::new(Substrate::from_env(pool).await?)
             .with_federated_grant_audience(policy.grant_audience)
-            .with_falcon_us2_egress(falcon_us2_egress))
+            .with_falcon_us2_egress(falcon_us2_egress)
+            .with_tls_interception_exemptions(tls_interception_exemptions))
     }
 
     pub async fn list_responses(

@@ -3,7 +3,7 @@ use pplx_space_net_common::{EgressDestinationV1, NetworkPolicyV1};
 const ENV: &str = "SPACE_TLS_INTERCEPTION_EXEMPTIONS";
 
 #[derive(Clone, Debug)]
-pub(crate) struct TlsInterceptionExemptions {
+pub struct TlsInterceptionExemptions {
     destinations: Vec<EgressDestinationV1>,
 }
 
@@ -20,7 +20,7 @@ pub enum TlsInterceptionExemptionsConfigError {
 }
 
 impl TlsInterceptionExemptions {
-    pub(crate) fn from_env() -> Result<Option<Self>, TlsInterceptionExemptionsConfigError> {
+    pub fn from_env() -> Result<Option<Self>, TlsInterceptionExemptionsConfigError> {
         Self::from_environment(std::env::var(ENV))
     }
 
@@ -34,7 +34,7 @@ impl TlsInterceptionExemptions {
         }
     }
 
-    fn from_config(raw: &str) -> Result<Self, TlsInterceptionExemptionsConfigError> {
+    pub fn from_config(raw: &str) -> Result<Self, TlsInterceptionExemptionsConfigError> {
         let destinations: Vec<EgressDestinationV1> =
             serde_json::from_str(raw).map_err(TlsInterceptionExemptionsConfigError::Json)?;
         if destinations.is_empty() {
