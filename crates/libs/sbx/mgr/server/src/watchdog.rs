@@ -2118,19 +2118,27 @@ async fn composed_health_loop(
 ) {
     let mut interval = tokio::time::interval(HEALTH_SCHEDULER_TICK);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    // Evidence for degrading transitions is gathered off the probe path so a
-    // burst of them cannot delay the next sweep; dropping the set on shutdown
-    // abandons any still in flight.
-    let mut transition_reports = tokio::task::JoinSet::new();
-    let evidence_permits = Arc::new(tokio::sync::Semaphore::new(
-        diagnostics::EVIDENCE_CONCURRENCY,
+    // Evidence for degrading transitions is gathered off the probe path by a
+    // fixed set of collectors, so a burst of them can delay neither the next
+    // sweep nor the transition lines. Dropping the set on return aborts them.
+    let evidence_queue = Arc::new(diagnostics::admission::EvidenceQueue::new(
+        diagnostics::admission::EVIDENCE_QUEUE_CAPACITY,
     ));
+    let host_reads = diagnostics::host_reads();
+    let mut evidence_collectors = tokio::task::JoinSet::new();
+    for _ in 0..diagnostics::admission::EVIDENCE_COLLECTORS {
+        evidence_collectors.spawn(diagnostics::run_evidence_collector(
+            Arc::clone(&evidence_queue),
+            Arc::clone(&sidecars),
+            host_reads.clone(),
+            shutdown_token.clone(),
+        ));
+    }
     loop {
         tokio::select! {
             _ = shutdown_token.cancelled() => return,
             _ = interval.tick() => {}
         }
-        while transition_reports.try_join_next().is_some() {}
 
         let now = Instant::now();
         let due_ids = {
@@ -2191,12 +2199,7 @@ async fn composed_health_loop(
                 )
                 .await
             {
-                report_health_transition(
-                    &mut transition_reports,
-                    &evidence_permits,
-                    &sidecars,
-                    transition,
-                );
+                diagnostics::report_transition(&evidence_queue, &transition);
             }
             pending.spawn(async move {
                 let result = probe_composed_health(&sandbox_id, &info, lifecycle).await;
@@ -2214,12 +2217,7 @@ async fn composed_health_loop(
             )
             .await
             {
-                report_health_transition(
-                    &mut transition_reports,
-                    &evidence_permits,
-                    &sidecars,
-                    transition,
-                );
+                diagnostics::report_transition(&evidence_queue, &transition);
             }
         }
     }
@@ -2555,31 +2553,6 @@ async fn apply_and_reconcile_composed_health_result(
         .await;
     }
     transition
-}
-
-/// Log a health transition, first gathering evidence for a degrading one in
-/// `pending` under an `evidence_permits` slot. The task looks up the
-/// sandbox's current sidecar authority itself, so evidence reflects the
-/// endpoint the next probe would use.
-fn report_health_transition(
-    pending: &mut tokio::task::JoinSet<()>,
-    evidence_permits: &Arc<tokio::sync::Semaphore>,
-    sidecars: &Arc<Mutex<HashMap<String, SidecarInfo>>>,
-    transition: diagnostics::HealthTransition,
-) {
-    if !transition.needs_evidence() {
-        transition.emit(None);
-        return;
-    }
-    let evidence_permits = Arc::clone(evidence_permits);
-    let sidecars = Arc::clone(sidecars);
-    pending.spawn(async move {
-        // The semaphore is never closed, so acquisition only waits.
-        let _permit = evidence_permits.acquire_owned().await;
-        let info = sidecars.lock().await.get(transition.sandbox_id()).cloned();
-        let evidence = diagnostics::TransitionEvidence::gather(&transition, info.as_ref()).await;
-        transition.emit(Some(&evidence));
-    });
 }
 
 async fn apply_composed_health_result(

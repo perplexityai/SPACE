@@ -1,10 +1,16 @@
-//! Evidence attached to a sandbox health transition, so a responder can tell
-//! from the log line alone which layer stopped answering.
+//! Evidence for a sandbox health transition, so a responder can tell from
+//! the logs alone which layer stopped answering.
 //!
-//! Every composed or guest health transition logs the probe state the watchdog
-//! already holds: each component's last outcome and error text, its failure
-//! streak, and how long ago it last succeeded. A degrading transition also
-//! gathers, once and within a bounded budget:
+//! Every composed or guest health transition is logged at once, from probe
+//! state the watchdog already holds and without IO: each component's last
+//! outcome and error text, its failure streak, and how long ago it last
+//! succeeded. The line carries a `transition_id`.
+//!
+//! A degrading transition also asks for an evidence report, logged as a
+//! second line with the same `sandbox_id` and `transition_id`. [`admission`]
+//! bounds how many reports wait; a fixed set of collectors gathers each
+//! within [`EVIDENCE_DEADLINE`], and on expiry logs what it has, marked
+//! partial. A report holds:
 //!
 //! - a raw vsock check: a bare Firecracker `CONNECT` to the spaced-guest port.
 //!   `accepted` means the guest kernel still services vsock, so a failing
@@ -12,39 +18,73 @@
 //! - a resource sample of the VM's jailer cgroup (CPU use and throttling over
 //!   a short window, CPU and memory pressure, memory use, OOM kills), to tell
 //!   a starved or memory-exhausted guest from one that stalled while idle;
-//! - when the composed status becomes `Degraded`, at most once per
+//! - when the composed status became `Degraded`, at most once per
 //!   [`CONSOLE_TAIL_MIN_INTERVAL`] per sandbox, bounded tails of the
 //!   Firecracker log and of the guest console file, when one exists.
 //!
-//! Sandbox IDs appear only in the log line; the one metric is tagged by
-//! outcome alone.
+//! Sandbox IDs appear only in log lines; metrics are tagged by outcome alone.
 
+use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
-use pplx_space_metrics::sandbox::worker::SandboxRawVsockCheckOutcome;
+use pplx_space_metrics::sandbox::worker::{
+    SandboxHealthEvidenceOutcome, SandboxRawVsockCheckOutcome,
+};
 use pplx_space_spaced_common::ExpectedUdsPeer;
+use tokio::sync::{Mutex, Semaphore};
+use tokio_util::sync::CancellationToken;
 
 use super::{
     ComposedHealthStatus, GuestHealthCategory, HealthComponent, HealthProbeOutcome, RUN_DIR,
     SandboxHealth, SidecarInfo,
 };
 
+pub(super) mod admission;
+mod tail;
+
+use admission::{Admission, EvidenceQueue, EvidenceRequest};
+use tail::{TailBuffers, TailWindow};
+
 /// Shorter than Firecracker's own 2 s deadline for a host-initiated
 /// connection request, so a guest that never answers reads as `timeout`
 /// rather than as a connection Firecracker closed by itself.
 const RAW_VSOCK_CHECK_TIMEOUT: Duration = Duration::from_secs(1);
-/// CPU use is measured as the cgroup's usage delta over at least this window,
-/// which also bounds how long a degrading transition's log line is delayed.
+/// CPU use is measured as the cgroup's usage delta over at least this window.
 const RESOURCE_SAMPLE_WINDOW: Duration = Duration::from_secs(1);
+/// Collection of one report, from its first host read to its last. A report
+/// normally takes about [`RESOURCE_SAMPLE_WINDOW`]; the margin covers slow
+/// small reads, not a stuck one.
+const EVIDENCE_DEADLINE: Duration = Duration::from_secs(3);
 pub(super) const CONSOLE_TAIL_MIN_INTERVAL: Duration = Duration::from_secs(15 * 60);
 const CONSOLE_TAIL_MAX_BYTES: usize = 4 * 1024;
-/// Degrading transitions gathering evidence at once. A node-wide event
-/// degrades many sandboxes together; extra transitions wait for a slot.
-pub(super) const EVIDENCE_CONCURRENCY: usize = 4;
+/// Upper bound on one cgroup file read; `memory.stat`, the largest, is a few
+/// KiB.
+const SMALL_FILE_MAX_BYTES: u64 = 16 * 1024;
+/// Blocking host reads in flight across all collectors. A read stuck in the
+/// kernel outlives its report's deadline on a blocking-pool thread; this
+/// caps how many such threads collectors can strand.
+const HOST_READS_IN_FLIGHT: usize = admission::EVIDENCE_COLLECTORS;
 const GUEST_CONSOLE_LOG_FILE: &str = "guest-console.log";
 const MIB: u64 = 1024 * 1024;
+
+/// Correlates a transition line with its evidence line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct TransitionId(uuid::Uuid);
+
+impl TransitionId {
+    fn new() -> Self {
+        Self(uuid::Uuid::now_v7())
+    }
+}
+
+impl std::fmt::Display for TransitionId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ConsoleTails {
@@ -61,6 +101,16 @@ impl ConsoleTails {
             Self::NotRequested => "not_requested",
             Self::Included => "included",
             Self::RateLimited => "rate_limited",
+        }
+    }
+
+    /// The tails a report covering both transitions carries: a transition
+    /// that claimed the sandbox's tail allowance keeps it.
+    fn merge(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Included, _) | (_, Self::Included) => Self::Included,
+            (Self::RateLimited, _) | (_, Self::RateLimited) => Self::RateLimited,
+            (Self::NotRequested, Self::NotRequested) => Self::NotRequested,
         }
     }
 }
@@ -107,6 +157,7 @@ impl ComponentSnapshot {
 /// A composed or guest health change, with what is needed to log it.
 #[derive(Debug)]
 pub(super) struct HealthTransition {
+    id: TransitionId,
     sandbox_id: String,
     lifecycle: Option<crate::state::SandboxState>,
     previous: ComposedHealthStatus,
@@ -121,7 +172,8 @@ pub(super) struct HealthTransition {
 impl HealthTransition {
     /// Compare the statuses before and after one probe result. Returns `None`
     /// when neither changed, so steady states cost nothing. Records the
-    /// console-tail rate limit on `health` when this transition claims it.
+    /// console-tail rate limit on `health` when this transition claims it,
+    /// even if its report is later dropped.
     pub(super) fn observe(
         sandbox_id: &str,
         lifecycle: Option<crate::state::SandboxState>,
@@ -152,6 +204,7 @@ impl HealthTransition {
         };
         let observed_at = SystemTime::now();
         Some(Self {
+            id: TransitionId::new(),
             sandbox_id: sandbox_id.to_string(),
             lifecycle,
             previous,
@@ -167,14 +220,16 @@ impl HealthTransition {
         })
     }
 
-    /// Whether this transition needs [`TransitionEvidence::gather`] before
-    /// it is logged. Only degrading transitions pay for it.
-    pub(super) fn needs_evidence(&self) -> bool {
-        self.gather_evidence
-    }
-
-    pub(super) fn sandbox_id(&self) -> &str {
-        &self.sandbox_id
+    /// The evidence report this transition asks for. Only degrading
+    /// transitions ask.
+    pub(super) fn evidence_request(&self) -> Option<EvidenceRequest> {
+        self.gather_evidence.then(|| EvidenceRequest {
+            sandbox_id: self.sandbox_id.clone(),
+            transition_id: self.id,
+            console_tails: self.console_tails,
+            queued_at: Instant::now(),
+            merged_transitions: 0,
+        })
     }
 
     fn component(&self, component: HealthComponent) -> Option<&ComponentSnapshot> {
@@ -218,18 +273,16 @@ impl HealthTransition {
             .join(",")
     }
 
-    /// Log the transition, with `evidence` when it [needs](Self::needs_evidence)
-    /// it.
-    pub(super) fn emit(&self, evidence: Option<&TransitionEvidence>) {
+    /// Log the transition. `admission` is what became of its evidence
+    /// request, when it made one.
+    pub(super) fn emit(&self, admission: Option<Admission>) {
         let guest = self.component(HealthComponent::SpacedGuest);
-        let raw = evidence.map(|evidence| &evidence.raw_vsock);
-        let resources = evidence.map(|evidence| &evidence.resources);
-        let tails = evidence.and_then(|evidence| evidence.console_tails.as_ref());
         macro_rules! emit_transition {
             ($message:literal) => {
                 tracing::info!(
                     target: super::LOG_TARGET,
                     sandbox_id = %self.sandbox_id,
+                    transition_id = %self.id,
                     lifecycle = self.lifecycle.map(|state| state.as_str()),
                     previous = ?self.previous,
                     current = ?self.current,
@@ -242,25 +295,8 @@ impl HealthTransition {
                     guest_probe_latency_ms = guest.map(|snapshot| millis(snapshot.latency_micros)),
                     guest_probe_consecutive_failures = guest.map(|snapshot| snapshot.consecutive_failures),
                     guest_probe_last_success_age_s = guest.and_then(|snapshot| snapshot.last_success_age).map(|age| age.as_secs()),
-                    raw_vsock_check = raw.map_or("not_run", |raw| raw.outcome.as_str()),
-                    raw_vsock_latency_ms = raw.map(|raw| round_tenths(raw.latency.as_secs_f64() * 1_000.0)),
-                    raw_vsock_peer = raw.map(|raw| raw.peer.as_str()),
-                    raw_vsock_detail = raw.map(|raw| raw.detail.as_str()).filter(|detail| !detail.is_empty()),
-                    vm_cpu_util_pct = resources.and_then(|sample| sample.cpu_util_pct),
-                    vm_cpu_throttled_pct = resources.and_then(|sample| sample.cpu_throttled_pct),
-                    vm_cpu_max = resources.and_then(|sample| sample.cpu_max.as_deref()),
-                    vm_cpu_pressure_some_avg10 = resources.and_then(|sample| sample.cpu_pressure_some_avg10),
-                    vm_cpu_pressure_some_avg60 = resources.and_then(|sample| sample.cpu_pressure_some_avg60),
-                    vm_memory_current_mib = resources.and_then(|sample| sample.memory_current_mib),
-                    vm_memory_anon_mib = resources.and_then(|sample| sample.memory_anon_mib),
-                    vm_memory_max_mib = resources.and_then(|sample| sample.memory_max_mib),
-                    vm_memory_pressure_some_avg10 = resources.and_then(|sample| sample.memory_pressure_some_avg10),
-                    vm_memory_max_events = resources.and_then(|sample| sample.memory_max_events),
-                    vm_memory_oom_kills = resources.and_then(|sample| sample.memory_oom_kills),
-                    resource_window_ms = resources.map(|sample| u64::try_from(sample.window.as_millis()).unwrap_or(u64::MAX)),
+                    evidence = admission.map_or("not_requested", Admission::as_str),
                     console_tails = self.console_tails.as_str(),
-                    fc_log_tail = tails.and_then(|tails| tails.firecracker_log.as_deref()),
-                    guest_console_tail = tails.and_then(|tails| tails.guest_console.as_deref()),
                     $message
                 )
             };
@@ -271,6 +307,24 @@ impl HealthTransition {
             emit_transition!("sandbox guest health changed");
         }
     }
+}
+
+/// Log `transition` and admit its evidence request, without waiting: the
+/// line never depends on collectors keeping up.
+pub(super) fn report_transition(queue: &EvidenceQueue, transition: &HealthTransition) {
+    let admission = transition.evidence_request().map(|request| {
+        let admission = queue.admit(request);
+        let outcome = match admission {
+            Admission::Queued => None,
+            Admission::Merged => Some(SandboxHealthEvidenceOutcome::Merged),
+            Admission::Dropped => Some(SandboxHealthEvidenceOutcome::Dropped),
+        };
+        if let Some(outcome) = outcome {
+            pplx_space_metrics::sandbox::worker::sandbox_health_evidence_report(outcome);
+        }
+        admission
+    });
+    transition.emit(admission);
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -388,12 +442,174 @@ pub(super) async fn raw_vsock_check(
     }
 }
 
+/// What collection needs from a sandbox's sidecar record, copied under the
+/// sidecar lock in place of the whole record. The VM's cgroup follows from
+/// the sandbox ID.
+#[derive(Debug)]
+pub(super) struct EvidenceTarget {
+    vsock_uds_path: Option<PathBuf>,
+    expected_peer: Option<ExpectedUdsPeer>,
+}
+
+impl EvidenceTarget {
+    pub(super) fn of(info: &SidecarInfo) -> Self {
+        Self {
+            vsock_uds_path: info.vsock_uds_path.as_deref().map(PathBuf::from),
+            expected_peer: info
+                .runtime_pid
+                .and_then(|pid| i32::try_from(pid).ok())
+                .zip(info.uid)
+                .map(|(pid, uid)| ExpectedUdsPeer::new(pid, uid)),
+        }
+    }
+}
+
+/// Host files a report reads for one sandbox.
+#[derive(Debug)]
+pub(super) struct EvidencePaths {
+    cgroup: PathBuf,
+    firecracker_log: PathBuf,
+    guest_console: PathBuf,
+}
+
+impl EvidencePaths {
+    fn for_sandbox(sandbox_id: &str) -> Self {
+        Self {
+            cgroup: pplx_space_node_runtime_core::cgroup_paths::jailer_cgroup_path(sandbox_id),
+            // The launch configures Firecracker's own log as `/fc.log` inside
+            // the jail.
+            firecracker_log: PathBuf::from(format!(
+                "{}/firecracker/{sandbox_id}/root/fc.log",
+                pplx_space_common_core::host::linux::paths::FIRECRACKER_JAIL_DIR
+            )),
+            // Created only when `SPACE_ENABLE_GUEST_CONSOLE_LOGS` is set, as
+            // the jailer's output. Guest serial output reaches it only if
+            // Firecracker's own stdout does, which a daemonizing jailer
+            // redirects to `/dev/null`.
+            guest_console: PathBuf::from(format!(
+                "{RUN_DIR}/{sandbox_id}/{GUEST_CONSOLE_LOG_FILE}"
+            )),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct EvidenceLimits {
+    deadline: Duration,
+    raw_vsock_timeout: Duration,
+    sample_window: Duration,
+}
+
+impl EvidenceLimits {
+    const PRODUCTION: Self = Self {
+        deadline: EVIDENCE_DEADLINE,
+        raw_vsock_timeout: RAW_VSOCK_CHECK_TIMEOUT,
+        sample_window: RESOURCE_SAMPLE_WINDOW,
+    };
+}
+
+/// Blocking host reads, at most [`HOST_READS_IN_FLIGHT`] at a time across
+/// collectors. A read holds its slot until it actually returns, so a stuck
+/// read keeps one blocking-pool thread and later reads queue for a slot
+/// within their own report's deadline.
+#[derive(Clone)]
+pub(super) struct HostReads {
+    slots: Arc<Semaphore>,
+}
+
+impl HostReads {
+    pub(super) fn new(slots: usize) -> Self {
+        Self {
+            slots: Arc::new(Semaphore::new(slots)),
+        }
+    }
+
+    async fn blocking<T: Send + 'static>(
+        &self,
+        read: impl FnOnce() -> T + Send + 'static,
+    ) -> Option<T> {
+        let slot = Arc::clone(&self.slots).acquire_owned().await.ok()?;
+        tokio::task::spawn_blocking(move || {
+            let _slot = slot;
+            read()
+        })
+        .await
+        .ok()
+    }
+
+    /// A small cgroup or proc file, up to [`SMALL_FILE_MAX_BYTES`]; absent or
+    /// unreadable reads as `None`.
+    async fn small(&self, path: PathBuf) -> Option<String> {
+        self.blocking(move || {
+            use std::io::Read as _;
+            let mut content = String::new();
+            std::fs::File::open(path)
+                .ok()?
+                .take(SMALL_FILE_MAX_BYTES)
+                .read_to_string(&mut content)
+                .ok()?;
+            Some(content)
+        })
+        .await
+        .flatten()
+    }
+
+    /// The newest lines of a log file within `window`. `None` when the file
+    /// does not exist; a read error is reported in place of the text.
+    async fn tail(&self, path: PathBuf, window: TailWindow) -> Option<String> {
+        self.blocking(move || {
+            use std::io::{Seek as _, SeekFrom};
+            let read = || {
+                let mut file = std::fs::File::open(&path)?;
+                let start = file.metadata()?.len().saturating_sub(window.scan_bytes);
+                file.seek(SeekFrom::Start(start))?;
+                tail::tail_lines(file, start > 0, window, &mut TailBuffers::new(window))
+            };
+            match read() {
+                Ok(text) => Some(text),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => Some(format!("<unreadable: {error}>")),
+            }
+        })
+        .await
+        .flatten()
+    }
+}
+
+/// How far collection got; a partial report names the step its deadline
+/// interrupted.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) enum EvidenceStage {
+    #[default]
+    CpuBefore,
+    RawVsock,
+    SampleWindow,
+    CpuAfter,
+    ResourceFiles,
+    ConsoleTails,
+    Done,
+}
+
+impl EvidenceStage {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::CpuBefore => "cpu_before",
+            Self::RawVsock => "raw_vsock",
+            Self::SampleWindow => "sample_window",
+            Self::CpuAfter => "cpu_after",
+            Self::ResourceFiles => "resource_files",
+            Self::ConsoleTails => "console_tails",
+            Self::Done => "done",
+        }
+    }
+}
+
 /// One sample of the VM's jailer cgroup, which holds only the Firecracker
 /// process and its vCPU threads. Every field is best effort: a missing file
 /// (for example PSI disabled on the host) leaves it unset.
 #[derive(Debug, Default)]
 struct ResourceSample {
-    window: Duration,
+    window: Option<Duration>,
     /// CPU time used over `window`, as a percentage of one CPU.
     cpu_util_pct: Option<f64>,
     /// Time throttled by `cpu.max` over `window`, as a percentage of it.
@@ -418,8 +634,8 @@ struct CpuCounters {
 }
 
 impl CpuCounters {
-    async fn read(cgroup: &Path) -> Self {
-        let content = read_small(&cgroup.join("cpu.stat")).await;
+    async fn read(reads: &HostReads, cgroup: &Path) -> Self {
+        let content = reads.small(cgroup.join("cpu.stat")).await;
         let content = content.as_deref().unwrap_or_default();
         Self {
             usage_usec: keyed_u64(content, "usage_usec"),
@@ -429,88 +645,110 @@ impl CpuCounters {
 }
 
 impl ResourceSample {
-    async fn read(
-        cgroup: &Path,
-        before: CpuCounters,
-        after: CpuCounters,
-        window: Duration,
-    ) -> Self {
+    fn record_cpu_window(&mut self, before: CpuCounters, after: CpuCounters, window: Duration) {
         let window_usec = window.as_micros() as f64;
         let percent_of_window = |start: Option<u64>, end: Option<u64>| {
             let delta = end?.checked_sub(start?)?;
             (window_usec > 0.0).then(|| round_tenths(delta as f64 * 100.0 / window_usec))
         };
-        let cpu_pressure = read_small(&cgroup.join("cpu.pressure")).await;
-        let memory_stat = read_small(&cgroup.join("memory.stat")).await;
-        let memory_events = read_small(&cgroup.join("memory.events")).await;
-        let memory_pressure = read_small(&cgroup.join("memory.pressure")).await;
-        Self {
-            window,
-            cpu_util_pct: percent_of_window(before.usage_usec, after.usage_usec),
-            cpu_throttled_pct: percent_of_window(before.throttled_usec, after.throttled_usec),
-            cpu_max: read_small(&cgroup.join("cpu.max"))
-                .await
-                .map(|value| value.trim().to_string()),
-            cpu_pressure_some_avg10: cpu_pressure
-                .as_deref()
-                .and_then(|content| psi_average(content, "some", "avg10")),
-            cpu_pressure_some_avg60: cpu_pressure
-                .as_deref()
-                .and_then(|content| psi_average(content, "some", "avg60")),
-            memory_current_mib: read_small(&cgroup.join("memory.current"))
-                .await
-                .and_then(|value| value.trim().parse::<u64>().ok())
-                .map(|bytes| bytes / MIB),
-            memory_anon_mib: memory_stat
-                .as_deref()
-                .and_then(|content| keyed_u64(content, "anon"))
-                .map(|bytes| bytes / MIB),
-            memory_max_mib: read_small(&cgroup.join("memory.max"))
-                .await
-                .and_then(|value| value.trim().parse::<u64>().ok())
-                .map(|bytes| bytes / MIB),
-            memory_pressure_some_avg10: memory_pressure
-                .as_deref()
-                .and_then(|content| psi_average(content, "some", "avg10")),
-            memory_max_events: memory_events
-                .as_deref()
-                .and_then(|content| keyed_u64(content, "max")),
-            memory_oom_kills: memory_events
-                .as_deref()
-                .and_then(|content| keyed_u64(content, "oom_kill")),
+        self.window = Some(window);
+        self.cpu_util_pct = percent_of_window(before.usage_usec, after.usage_usec);
+        self.cpu_throttled_pct = percent_of_window(before.throttled_usec, after.throttled_usec);
+    }
+
+    /// Read the remaining cgroup files, filling each field as its file
+    /// arrives so a deadline keeps what was read.
+    async fn read_files(&mut self, reads: &HostReads, cgroup: &Path) {
+        let mib = |value: String| value.trim().parse::<u64>().ok().map(|bytes| bytes / MIB);
+        self.cpu_max = reads
+            .small(cgroup.join("cpu.max"))
+            .await
+            .map(|value| value.trim().to_string());
+        if let Some(content) = reads.small(cgroup.join("cpu.pressure")).await {
+            self.cpu_pressure_some_avg10 = psi_average(&content, "some", "avg10");
+            self.cpu_pressure_some_avg60 = psi_average(&content, "some", "avg60");
+        }
+        self.memory_current_mib = reads
+            .small(cgroup.join("memory.current"))
+            .await
+            .and_then(mib);
+        self.memory_anon_mib = reads
+            .small(cgroup.join("memory.stat"))
+            .await
+            .and_then(|content| keyed_u64(&content, "anon"))
+            .map(|bytes| bytes / MIB);
+        self.memory_max_mib = reads.small(cgroup.join("memory.max")).await.and_then(mib);
+        self.memory_pressure_some_avg10 = reads
+            .small(cgroup.join("memory.pressure"))
+            .await
+            .and_then(|content| psi_average(&content, "some", "avg10"));
+        if let Some(content) = reads.small(cgroup.join("memory.events")).await {
+            self.memory_max_events = keyed_u64(&content, "max");
+            self.memory_oom_kills = keyed_u64(&content, "oom_kill");
         }
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct ConsoleTailText {
     firecracker_log: Option<String>,
     guest_console: Option<String>,
 }
 
-/// Evidence gathered for a degrading transition.
-#[derive(Debug)]
+/// Evidence gathered for one report. Fields stay unset when collection
+/// stopped before reaching them.
+#[derive(Debug, Default)]
 pub(super) struct TransitionEvidence {
-    pub(super) raw_vsock: RawVsockCheck,
+    /// Whether the deadline expired, at `stage`.
+    partial: bool,
+    pub(super) stage: EvidenceStage,
+    pub(super) raw_vsock: Option<RawVsockCheck>,
     resources: ResourceSample,
     console_tails: Option<ConsoleTailText>,
+    elapsed: Duration,
 }
 
 impl TransitionEvidence {
-    /// Gather evidence for `transition` in about [`RESOURCE_SAMPLE_WINDOW`]:
-    /// the raw vsock check runs inside the CPU sampling window, and the
-    /// remaining reads are a few small files.
-    pub(super) async fn gather(transition: &HealthTransition, info: Option<&SidecarInfo>) -> Self {
-        let sandbox_id = transition.sandbox_id.as_str();
-        let cgroup = pplx_space_node_runtime_core::cgroup_paths::jailer_cgroup_path(sandbox_id);
-        let before = CpuCounters::read(&cgroup).await;
+    /// Gather evidence for `request` within `limits.deadline`, returning what
+    /// was collected when it expires. The raw vsock check runs inside the CPU
+    /// sampling window, so a full report takes about that window.
+    pub(super) async fn gather(
+        request: &EvidenceRequest,
+        target: Option<&EvidenceTarget>,
+        paths: &EvidencePaths,
+        limits: EvidenceLimits,
+        reads: &HostReads,
+    ) -> Self {
+        let started = Instant::now();
+        let mut evidence = Self::default();
+        evidence.partial = tokio::time::timeout(
+            limits.deadline,
+            evidence.collect(request, target, paths, limits, reads),
+        )
+        .await
+        .is_err();
+        evidence.elapsed = started.elapsed();
+        evidence
+    }
+
+    async fn collect(
+        &mut self,
+        request: &EvidenceRequest,
+        target: Option<&EvidenceTarget>,
+        paths: &EvidencePaths,
+        limits: EvidenceLimits,
+        reads: &HostReads,
+    ) {
+        self.stage = EvidenceStage::CpuBefore;
+        let before = CpuCounters::read(reads, &paths.cgroup).await;
         let window_started = Instant::now();
-        let raw_vsock = match info.and_then(|info| info.vsock_uds_path.as_deref()) {
+        self.stage = EvidenceStage::RawVsock;
+        let raw_vsock = match target.and_then(|target| target.vsock_uds_path.as_deref()) {
             Some(path) => {
                 raw_vsock_check(
-                    Path::new(path),
-                    expected_peer(info),
-                    RAW_VSOCK_CHECK_TIMEOUT,
+                    path,
+                    target.and_then(|target| target.expected_peer),
+                    limits.raw_vsock_timeout,
                 )
                 .await
             }
@@ -524,157 +762,129 @@ impl TransitionEvidence {
         pplx_space_metrics::sandbox::worker::sandbox_health_raw_vsock_check(
             raw_vsock.outcome.as_metric(),
         );
-        tokio::time::sleep_until((window_started + RESOURCE_SAMPLE_WINDOW).into()).await;
-        let after = CpuCounters::read(&cgroup).await;
-        let resources =
-            ResourceSample::read(&cgroup, before, after, window_started.elapsed()).await;
-        let console_tails = if transition.console_tails == ConsoleTails::Included {
-            Some(ConsoleTailText {
-                firecracker_log: read_tail(&firecracker_log_path(sandbox_id), FIRECRACKER_LOG_TAIL)
-                    .await,
-                guest_console: read_tail(&guest_console_log_path(sandbox_id), GUEST_CONSOLE_TAIL)
-                    .await,
-            })
-        } else {
-            None
-        };
-        Self {
-            raw_vsock,
-            resources,
-            console_tails,
+        self.raw_vsock = Some(raw_vsock);
+        self.stage = EvidenceStage::SampleWindow;
+        tokio::time::sleep_until((window_started + limits.sample_window).into()).await;
+        self.stage = EvidenceStage::CpuAfter;
+        let after = CpuCounters::read(reads, &paths.cgroup).await;
+        self.resources
+            .record_cpu_window(before, after, window_started.elapsed());
+        self.stage = EvidenceStage::ResourceFiles;
+        self.resources.read_files(reads, &paths.cgroup).await;
+        if request.console_tails == ConsoleTails::Included {
+            self.stage = EvidenceStage::ConsoleTails;
+            let tails = self.console_tails.insert(ConsoleTailText::default());
+            tails.firecracker_log = reads
+                .tail(paths.firecracker_log.clone(), FIRECRACKER_LOG_TAIL)
+                .await;
+            tails.guest_console = reads
+                .tail(paths.guest_console.clone(), GUEST_CONSOLE_TAIL)
+                .await;
         }
+        self.stage = EvidenceStage::Done;
+    }
+
+    pub(super) fn is_partial(&self) -> bool {
+        self.partial
+    }
+
+    fn emit(&self, request: &EvidenceRequest, queued: Duration) {
+        let raw = self.raw_vsock.as_ref();
+        let resources = &self.resources;
+        let tails = self.console_tails.as_ref();
+        tracing::info!(
+            target: super::LOG_TARGET,
+            sandbox_id = %request.sandbox_id,
+            transition_id = %request.transition_id,
+            merged_transitions = request.merged_transitions,
+            evidence_partial = self.is_partial(),
+            evidence_stalled_at = self.is_partial().then(|| self.stage.as_str()),
+            evidence_queue_ms = duration_ms(queued),
+            evidence_elapsed_ms = duration_ms(self.elapsed),
+            raw_vsock_check = raw.map_or("not_run", |raw| raw.outcome.as_str()),
+            raw_vsock_latency_ms = raw.map(|raw| round_tenths(raw.latency.as_secs_f64() * 1_000.0)),
+            raw_vsock_peer = raw.map(|raw| raw.peer.as_str()),
+            raw_vsock_detail = raw.map(|raw| raw.detail.as_str()).filter(|detail| !detail.is_empty()),
+            vm_cpu_util_pct = resources.cpu_util_pct,
+            vm_cpu_throttled_pct = resources.cpu_throttled_pct,
+            vm_cpu_max = resources.cpu_max.as_deref(),
+            vm_cpu_pressure_some_avg10 = resources.cpu_pressure_some_avg10,
+            vm_cpu_pressure_some_avg60 = resources.cpu_pressure_some_avg60,
+            vm_memory_current_mib = resources.memory_current_mib,
+            vm_memory_anon_mib = resources.memory_anon_mib,
+            vm_memory_max_mib = resources.memory_max_mib,
+            vm_memory_pressure_some_avg10 = resources.memory_pressure_some_avg10,
+            vm_memory_max_events = resources.memory_max_events,
+            vm_memory_oom_kills = resources.memory_oom_kills,
+            resource_window_ms = resources.window.map(duration_ms),
+            console_tails = request.console_tails.as_str(),
+            fc_log_tail = tails.and_then(|tails| tails.firecracker_log.as_deref()),
+            guest_console_tail = tails.and_then(|tails| tails.guest_console.as_deref()),
+            "sandbox health evidence"
+        );
     }
 }
 
-fn expected_peer(info: Option<&SidecarInfo>) -> Option<ExpectedUdsPeer> {
-    let info = info?;
-    let pid = i32::try_from(info.runtime_pid?).ok()?;
-    Some(ExpectedUdsPeer::new(pid, info.uid?))
-}
-
-/// Firecracker's own log, which the launch configures as `/fc.log` inside
-/// the jail.
-fn firecracker_log_path(sandbox_id: &str) -> PathBuf {
-    PathBuf::from(format!(
-        "{}/firecracker/{sandbox_id}/root/fc.log",
-        pplx_space_common_core::host::linux::paths::FIRECRACKER_JAIL_DIR
-    ))
-}
-
-/// Created only when `SPACE_ENABLE_GUEST_CONSOLE_LOGS` is set, as the
-/// jailer's output. Guest serial output reaches it only if Firecracker's own
-/// stdout does, which a daemonizing jailer redirects to `/dev/null`.
-fn guest_console_log_path(sandbox_id: &str) -> PathBuf {
-    PathBuf::from(format!("{RUN_DIR}/{sandbox_id}/{GUEST_CONSOLE_LOG_FILE}"))
-}
-
-/// Read a small cgroup or proc file; absent or unreadable reads as `None`.
-async fn read_small(path: &Path) -> Option<String> {
-    tokio::fs::read_to_string(path).await.ok()
-}
-
-/// What a tail keeps of a log file: the newest whole lines, up to
-/// `keep_bytes`, found in its last `scan_bytes`, skipping lines `noise`
-/// accepts. Scanning more than is kept stops periodic noise from crowding out
-/// the events around it.
-#[derive(Clone, Copy)]
-struct TailWindow {
-    scan_bytes: u64,
-    keep_bytes: usize,
-    noise: fn(&mut NoiseFilter, &str) -> bool,
-}
-
-/// Per-tail state for a [`TailWindow::noise`] filter that pairs lines.
-#[derive(Default)]
-struct NoiseFilter {
-    skipped_request: bool,
-}
-
-/// Firecracker logs every API request and its response at `Info`. The
-/// watchdog reads VM state (`GET /`) on every probe, so without this a tail
-/// is little but those pairs. Any other request, such as a pause, is kept
-/// with its response.
-fn firecracker_state_poll(filter: &mut NoiseFilter, line: &str) -> bool {
-    let follows_skipped_request = std::mem::take(&mut filter.skipped_request);
-    if line.contains(":fc_api] The API server received a Get request on \"/\".") {
-        filter.skipped_request = true;
-        return true;
+/// One of the [`admission::EVIDENCE_COLLECTORS`] long-lived collectors: take
+/// the oldest waiting report, look up the sandbox's current sidecar
+/// authority, so evidence reflects the endpoint the next probe would use,
+/// and log the report. Returns on shutdown, abandoning a report in flight.
+pub(super) async fn run_evidence_collector(
+    queue: Arc<EvidenceQueue>,
+    sidecars: Arc<Mutex<HashMap<String, SidecarInfo>>>,
+    reads: HostReads,
+    shutdown_token: CancellationToken,
+) {
+    loop {
+        let request = tokio::select! {
+            biased;
+            _ = shutdown_token.cancelled() => return,
+            request = queue.next() => request,
+        };
+        let queued = request.queued_at.elapsed();
+        let target = sidecars
+            .lock()
+            .await
+            .get(&request.sandbox_id)
+            .map(EvidenceTarget::of);
+        let paths = EvidencePaths::for_sandbox(&request.sandbox_id);
+        let evidence = tokio::select! {
+            biased;
+            _ = shutdown_token.cancelled() => return,
+            evidence = TransitionEvidence::gather(
+                &request,
+                target.as_ref(),
+                &paths,
+                EvidenceLimits::PRODUCTION,
+                &reads,
+            ) => evidence,
+        };
+        evidence.emit(&request, queued);
+        pplx_space_metrics::sandbox::worker::sandbox_health_evidence_report(
+            if evidence.is_partial() {
+                SandboxHealthEvidenceOutcome::Partial
+            } else {
+                SandboxHealthEvidenceOutcome::Complete
+            },
+        );
     }
-    follows_skipped_request && line.contains(":fc_api] The request was executed successfully.")
 }
 
-fn no_noise(_: &mut NoiseFilter, _: &str) -> bool {
-    false
+pub(super) fn host_reads() -> HostReads {
+    HostReads::new(HOST_READS_IN_FLIGHT)
 }
 
 const FIRECRACKER_LOG_TAIL: TailWindow = TailWindow {
     scan_bytes: 64 * 1024,
     keep_bytes: CONSOLE_TAIL_MAX_BYTES,
-    noise: firecracker_state_poll,
+    noise: tail::firecracker_state_poll,
 };
 
 const GUEST_CONSOLE_TAIL: TailWindow = TailWindow {
     scan_bytes: CONSOLE_TAIL_MAX_BYTES as u64,
     keep_bytes: CONSOLE_TAIL_MAX_BYTES,
-    noise: no_noise,
+    noise: tail::no_noise,
 };
-
-/// The newest lines of a log file within `window`. Invalid UTF-8 and control
-/// characters other than newlines and tabs become `?`, which never lengthens
-/// the text. `None` when the file does not exist; a read error is reported in
-/// place of the text.
-async fn read_tail(path: &Path, window: TailWindow) -> Option<String> {
-    use tokio::io::{AsyncReadExt, AsyncSeekExt};
-    let read = async {
-        let mut file = tokio::fs::File::open(path).await?;
-        let length = file.metadata().await?.len();
-        let start = length.saturating_sub(window.scan_bytes);
-        file.seek(std::io::SeekFrom::Start(start)).await?;
-        let mut bytes = Vec::new();
-        file.take(window.scan_bytes).read_to_end(&mut bytes).await?;
-        Ok::<_, std::io::Error>((bytes, start > 0))
-    };
-    match read.await {
-        Ok((bytes, truncated)) => Some(tail_text(&bytes, truncated, window)),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(error) => Some(format!("<unreadable: {error}>")),
-    }
-}
-
-fn tail_text(bytes: &[u8], truncated: bool, window: TailWindow) -> String {
-    let text = String::from_utf8_lossy(bytes)
-        .chars()
-        .map(|character| {
-            if character == char::REPLACEMENT_CHARACTER
-                || (character.is_control() && character != '\n' && character != '\t')
-            {
-                '?'
-            } else {
-                character
-            }
-        })
-        .collect::<String>();
-    let mut filter = NoiseFilter::default();
-    let lines = text
-        .split_inclusive('\n')
-        // A scan that starts mid-file starts mid-line.
-        .skip(usize::from(truncated))
-        .filter(|line| !(window.noise)(&mut filter, line))
-        .collect::<Vec<_>>();
-    let mut kept = 0;
-    let newest = lines
-        .iter()
-        .rev()
-        .take_while(|line| {
-            kept += line.len();
-            kept <= window.keep_bytes
-        })
-        .count();
-    lines
-        .get(lines.len().saturating_sub(newest)..)
-        .unwrap_or_default()
-        .concat()
-}
 
 /// The value of a `key value` line, as in `cpu.stat`, `memory.stat`, and
 /// `memory.events`.
@@ -703,6 +913,10 @@ fn millis(micros: u64) -> f64 {
 
 fn round_tenths(value: f64) -> f64 {
     (value * 10.0).round() / 10.0
+}
+
+fn duration_ms(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 #[cfg(test)]

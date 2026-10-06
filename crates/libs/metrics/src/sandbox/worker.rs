@@ -1531,6 +1531,51 @@ pub fn sandbox_health_raw_vsock_check(outcome: SandboxRawVsockCheckOutcome) {
     );
 }
 
+/// What became of the evidence report a degrading health transition asks the
+/// sandbox manager for. Each such transition counts exactly once: when its
+/// report is merged or dropped at admission, or when an admitted report is
+/// logged.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SandboxHealthEvidenceOutcome {
+    /// The sandbox already had a report waiting for a collector, which now
+    /// also covers this transition.
+    Merged,
+    /// The evidence queue was full; only the transition line was logged.
+    Dropped,
+    /// Collected in full before the collection deadline.
+    Complete,
+    /// The collection deadline expired; what was gathered was logged.
+    Partial,
+}
+
+impl SandboxHealthEvidenceOutcome {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Merged => "merged",
+            Self::Dropped => "dropped",
+            Self::Complete => "complete",
+            Self::Partial => "partial",
+        }
+    }
+}
+
+impl fmt::Display for SandboxHealthEvidenceOutcome {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// One degrading health transition's evidence report, tagged only by its
+/// outcome. A rising `dropped` or `partial` share means evidence is being
+/// shed under correlated failures or slow host reads.
+pub fn sandbox_health_evidence_report(outcome: SandboxHealthEvidenceOutcome) {
+    counter(
+        "sandbox.health.evidence_report",
+        1,
+        &[tag("outcome", outcome.as_str())],
+    );
+}
+
 /// `gateway_sha` value for a gateway running a binary that reports no sha, and
 /// for one that has not answered a stats probe yet.
 pub const NET_GATEWAY_SHA_UNKNOWN: &str = "unknown";
