@@ -1046,3 +1046,33 @@ async fn ro_reads_api_keys_without_key_hash() -> TestResult {
         .await?;
     Ok(())
 }
+
+#[tokio::test]
+async fn ro_reads_publication_grant_metadata_without_authorization_id() -> TestResult {
+    let Some(fixture) = postgres_fixture().await? else {
+        return Ok(());
+    };
+    run_bootstrap(&fixture).await?;
+    let mut conn = fixture.connect_as("postgres").await?;
+    assume_migrator_role(&mut conn).await?;
+    crate::POSTGRES_MIGRATOR.run(&mut conn).await?;
+    drop(conn);
+    run_bootstrap(&fixture).await?;
+
+    // This ID carries publication authority even though its name does not match
+    // the hash/bearer suffix inventory. Keep public metadata readable.
+    for (column, expected) in [("id", false), ("template_name", true)] {
+        let has: bool = sqlx::query_scalar(sql!(
+            "SELECT has_column_privilege($1, 'public.template_system_publication_grants'::regclass, $2, 'SELECT')"
+        ))
+        .bind(RO_ROLE)
+        .bind(column)
+        .fetch_one(&fixture.pool)
+        .await?;
+        assert_eq!(
+            has, expected,
+            "space_ro SELECT on publication grant {column}"
+        );
+    }
+    Ok(())
+}
