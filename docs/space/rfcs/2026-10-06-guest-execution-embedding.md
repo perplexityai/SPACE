@@ -109,12 +109,18 @@ only the worker channel and documented environment/telemetry inputs.
 Install the selected UID, GID and supplementary groups in children, with no
 inherited supervisor capabilities or privilege gain through set-ID/file-capability
 executables. Check capability state as well as IDs. Never change existing host
-threads' credentials, capabilities, signal handlers or cgroup membership.
+threads' credentials, capabilities or cgroup membership.
 **Direct filesystem mode is unsupported in this profile:** it uses host authority
 and must neither masquerade as impersonation nor serve as a worker-start fallback.
 Keep daemon policy differences explicit within the same identity implementation.
 
 ### Shutdown and ownership
+
+The caller keeps a Tokio runtime with I/O, timers and process support alive
+through drain, and must not reap library-owned children itself. Define compatible
+`SIGCHLD` handling explicitly: Tokio's fallback/orphan reaping can install a
+[process-wide handler](https://docs.rs/tokio/1.53.1/tokio/signal/unix/struct.Signal.html#caveats)
+that outlives the service. Signal-handler neutrality is not promised.
 
 Order operation registration with admission closure: **running → closing → drained**.
 Closing rejects every new operation, including reads, mutations, watches and
@@ -148,7 +154,7 @@ requirements rather than silently skip them.
 | --- | --- |
 | Launch / identity | Invalid launcher, protocol mismatch, failed/cancelled startup, replacement and reaping; UID/GID/groups, access checks, inherited capabilities and executable privilege gain. |
 | Operations / budgets | Complete inventory above, overload, oversized input, streaming backpressure and permits retained through cancellation; equivalent transport/native execution budgets. |
-| Lifecycle / ownership | Admission-close races, every post-close entrypoint, interrupted uploads, repeat/incomplete drain, retry uncertainty, unrelated spawns, descriptor inheritance and surviving descendants. |
+| Lifecycle / ownership | Admission-close races, every post-close entrypoint, interrupted uploads, repeat/incomplete drain, retry uncertainty, runtime/signal compatibility, unrelated spawns, descriptor inheritance and surviving descendants. |
 | Integration | Embedding exercises the supported worker path and caller teardown; existing daemon tests and Kind/Firecracker checks cover shared behavior changes. |
 
 Implement in reviewable steps: **launcher + representative integration → identity
