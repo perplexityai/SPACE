@@ -962,6 +962,36 @@ aws --endpoint-url http://localhost:8333 s3 ls s3://snapshots/ --recursive
 aws --endpoint-url http://localhost:8333 s3 ls s3://templates/ --recursive
 ```
 
+### Object store transition
+
+The object store was SeaweedFS (`space-seaweedfs` chart, Service
+`seaweedfs:8333`, data in `/var/lib/space-seaweedfs` on the infra node). It
+is now versitygw (`space-object-store` chart, Service `object-store:8333`,
+data in `/var/lib/space-object-store`). The two stores share no data, and the
+database of a SeaweedFS-era cluster records every suspend snapshot and
+published template at `http://seaweedfs:8333`. Applying the new charts to such
+a cluster would leave its restores and template pulls depending on a
+deployment nothing manages any more, and pointing the old Service at the new
+gateway would not help, because the objects are not in it.
+
+An existing cluster is therefore recreated, not migrated. `bootstrap.sh`, the
+smoke suites' `scripts/tests/lib/bootstrap-kind-stack.sh` and the `Tiltfile`
+run `infra/space/kind/scripts/check-object-store-transition.sh` against an
+existing cluster before they apply anything; when it still has resources from
+the `space-seaweedfs` chart, they list those resources and stop without
+changing anything: the two scripts exit with status 1, and Tilt reports a
+Tiltfile load error. Recreating deletes the cluster's sandboxes,
+snapshots and templates, and keeps the containerd image caches:
+
+```bash
+bash infra/space/kind/scripts/teardown.sh
+bash infra/space/kind/scripts/bootstrap.sh   # then `tilt up`, for the Tilt loop
+```
+
+A smoke suite such as `scripts/tests/smoke-kind-e2e.sh` creates the cluster
+itself after the teardown. For a non-default cluster, set `SPACE_KIND_CLUSTER`
+on both commands.
+
 ## Tearing down
 
 ```bash

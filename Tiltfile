@@ -47,6 +47,11 @@ KIND_CLUSTER = os.getenv("SPACE_KIND_CLUSTER", "space-local")
 NAMESPACE = "space"
 allow_k8s_contexts("kind-" + KIND_CLUSTER)
 
+# A cluster from before the versitygw object store keeps its objects in
+# SeaweedFS; refuse it rather than apply the new charts over it. See "Object
+# store transition" in infra/space/kind/README.md.
+local(["bash", "infra/space/kind/scripts/check-object-store-transition.sh", KIND_CLUSTER], quiet = True)
+
 # The full Kubernetes stack is the development default. The single-worker
 # DirectSubstrate bench is opt-in: set SPACE_LOCAL_MINIMAL=1 and
 # SPACE_KIND_CLUSTER=space-local-3486 when testing that specific substrate.
@@ -488,7 +493,7 @@ if not MINIMAL:
 
 # ── Object store + node stack + seed publish ─────────────────────────────────
 #
-# Versity S3 Gateway (versitygw, Apache-2.0; replaced the object store, which replaced
+# Versity S3 Gateway (versitygw, Apache-2.0; replaced SeaweedFS, which replaced
 # MinIO) is a real S3-compatible object store on the infra node, serving its
 # POSIX backend from a node-local hostPath. The bucket-init Job creates the
 # `snapshots` + `templates` buckets through the S3 API. Both are public

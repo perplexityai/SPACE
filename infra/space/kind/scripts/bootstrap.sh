@@ -172,6 +172,9 @@ if kind get clusters 2>/dev/null | grep -qx "$KIND_CLUSTER"; then
   # Skipping the create also skips the only read of the config, so a cluster
   # built against a different vendor root would silently keep it.
   kind_assert_live_cluster_mounts "$KIND_CLUSTER"
+  # A cluster from before the versitygw object store keeps its objects in
+  # SeaweedFS; stop before applying anything rather than half-switch it.
+  bash "$KIND_DIR/scripts/check-object-store-transition.sh" "$KIND_CLUSTER" || exit 1
 else
   log "creating kind cluster '$KIND_CLUSTER' from $SPACE_KIND_CONFIG"
   kind create cluster --name "$KIND_CLUSTER" --config "$SPACE_KIND_CONFIG"

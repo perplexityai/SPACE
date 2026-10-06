@@ -948,6 +948,10 @@ bootstrap_kind_stack__bring_up() {
         echo "[bootstrap] kind cluster '$KIND_CLUSTER' already exists"
         # Mount drift was already checked by kind_stack_assert_cluster_mounts,
         # which runs in every mode rather than only this one.
+        # Before Tilt (re)starts and applies the versitygw charts: a cluster
+        # still on SeaweedFS has to be recreated, not half-switched.
+        bash "$REPO_ROOT/infra/space/kind/scripts/check-object-store-transition.sh" \
+            "$KIND_CLUSTER" || exit 1
     fi
 
     # The two-axis decision: api-server reachable? tilt running?

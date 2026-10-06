@@ -3166,10 +3166,15 @@ ON CONFLICT (key_hash) DO NOTHING;
         return previous
 
     def wait_object_store_gone(self, *, timeout: float) -> None:
-        self.kubectl(
+        result = self.kubectl(
             "wait", "--for=delete", "pod", "-l", KIND_OBJECT_STORE_POD_SELECTOR,
             f"--timeout={int(timeout)}s", timeout=timeout + 15,
         )
+        # A selector that matches no pod means the gateway pod is already gone.
+        # Current kubectl exits 0 for it; older releases fail with this message.
+        if result.returncode != 0 and "no matching resources found" in result.detail():
+            return
+        _require_ok(result, "await the object-store pod deletion")
 
     def wait_object_store_rollout(self, *, timeout: float) -> None:
         _require_ok(

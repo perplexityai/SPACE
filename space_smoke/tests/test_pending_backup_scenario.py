@@ -4,7 +4,9 @@ A passing bench shows one queue row appear and disappear. It cannot show that
 a snapshot reaching `ready` while uploads are supposedly blocked fails the
 in-flight verdict, that a queue row without an applied non-empty census fails
 the corroboration, that a drained queue with an unbacked artifact still fails,
-or that the object store scale-back is armed before the scale to zero.
+that the object store scale-back is armed before the scale to zero, or that
+a failed wait for the gateway pod's deletion stops the scenario instead of
+running it without its outage.
 """
 
 from __future__ import annotations
@@ -13,9 +15,10 @@ import unittest
 from types import SimpleNamespace
 from typing import Any, cast
 
+from space_smoke.adapters import KindConfig, KindHarness
 from space_smoke.capabilities import CensusPublication, PendingBackupRow
 from space_smoke.pending_backup import PendingBackupAssertions
-from space_smoke.runtime import InvariantViolation, ResourceScope
+from space_smoke.runtime import CommandResult, InvariantViolation, ResourceScope
 
 SID = "01a0b0c9-b8a3-7473-9c12-3821a701bc28"
 
@@ -152,6 +155,32 @@ class Compensations(unittest.TestCase):
         self.assertEqual(control.calls, ["read", "scale:0"])
         scope.close()
         self.assertEqual(control.calls, ["read", "scale:0", "scale:1", "rollout"])
+
+
+class _OneResultKubectl:
+    def __init__(self, returncode: int, stderr: str) -> None:
+        self.returncode = returncode
+        self.stderr = stderr
+
+    def run(self, command, **_options) -> CommandResult:
+        return CommandResult(tuple(command), self.returncode, "", self.stderr)
+
+
+class ObjectStoreOutageWait(unittest.TestCase):
+    def _wait(self, returncode: int, stderr: str) -> None:
+        KindHarness(_OneResultKubectl(returncode, stderr), KindConfig()).wait_object_store_gone(timeout=5)
+
+    def test_deleted_and_never_matched_pods_are_gone(self) -> None:
+        self._wait(0, "")
+        self._wait(1, "error: no matching resources found")
+
+    def test_a_timeout_or_api_error_fails(self) -> None:
+        for stderr in (
+            "error: timed out waiting for the condition on pods/space-object-store-abc",
+            "error: the server doesn't have a resource type \"pod\"",
+        ):
+            with self.subTest(stderr=stderr), self.assertRaisesRegex(RuntimeError, "object-store pod deletion"):
+                self._wait(1, stderr)
 
 
 if __name__ == "__main__":
