@@ -17,12 +17,13 @@ variable "github_repository" {
 }
 
 variable "github_oidc_subject_prefixes" {
-  description = "Prefixes of the `sub` claims the trust accepts, one per repository. Each repository uses immutable subjects, which carry the owner and repository ids, so a renamed repository keeps its id and a replacement repository needs its own entry; read a repository's value with `gh api repos/<owner>/<name>/actions/oidc/customization/sub` (`sub_claim_prefix`). The defaults are `perplexityai/SPACE` and the subject its replacement repository will issue once it's renamed to `SPACE`. The replacement's pre-rename subject is left out, so the replacement can't assume the role until the rename. `infra/space/aws/reference/bootstrap` holds the same list for the account's other GitHub OIDC role; change both together."
+  description = "Prefixes of the `sub` claims the trust accepts, one per repository. Each repository uses immutable subjects, which carry the owner and repository ids, so a renamed repository keeps its id and a replacement repository needs its own entry; read a repository's value with `gh api repos/<owner>/<name>/actions/oidc/customization/sub` (`sub_claim_prefix`). The defaults are the repositories that have held the `perplexityai/SPACE` name, oldest first, and the subject the current one's replacement will issue once it's renamed to `SPACE`. A repository renamed away from `SPACE` issues a different subject, so its entry matches nothing unless it's renamed back. The replacement's pre-rename subject is left out, so the replacement can't assume the role until the rename. `infra/space/aws/reference/bootstrap` holds the same list for the account's other GitHub OIDC role; change both together."
   type        = list(string)
   nullable    = false
   default = [
     "repo:perplexityai@185426709/SPACE@1370731206",
     "repo:perplexityai@185426709/SPACE@1400568925",
+    "repo:perplexityai@185426709/SPACE@1407686799",
   ]
 
   validation {
