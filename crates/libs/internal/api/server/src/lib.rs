@@ -929,6 +929,8 @@ impl ClusterApiService {
         let artifact_kind = artifact_kind_from_proto(req.artifact_kind)
             .ok_or_else(|| Status::invalid_argument("artifact_kind must be DISK or FULL"))?;
 
+        let mut tx = self.begin_restore_lookup().await?;
+
         #[derive(FromRow)]
         struct BackupLocationRow {
             backup_attempt_id: Uuid,
@@ -951,7 +953,7 @@ impl ClusterApiService {
         .bind(sandbox_id.as_uuid())
         .bind(local_artifact_id.as_uuid())
         .bind(artifact_kind.as_str())
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(|e| Status::internal(format!("artifact backup lookup: {e}")))?;
         let row = row.ok_or_else(|| {
@@ -959,9 +961,14 @@ impl ClusterApiService {
                 "no ready backup for local artifact {local_artifact_id}"
             ))
         })?;
-        let artifact_digests = self
-            .artifact_digests_for_restore(SnapshotId::from_uuid(row.backup_attempt_id))
-            .await?;
+        let artifact_digests = Self::artifact_digests_for_restore(
+            &mut tx,
+            SnapshotId::from_uuid(row.backup_attempt_id),
+        )
+        .await?;
+        tx.commit()
+            .await
+            .map_err(|e| Status::internal(format!("finish artifact backup lookup: {e}")))?;
         Ok(Response::new(GetArtifactBackupLocationResponse {
             local_artifact_id: local_artifact_id.to_string(),
             artifact_kind: artifact_kind_to_proto(artifact_kind),
@@ -1096,6 +1103,8 @@ impl ClusterApiService {
         let sandbox_id = SandboxId::from_str(req.sandbox_id.trim())
             .map_err(|e| Status::invalid_argument(format!("invalid sandbox_id: {e}")))?;
 
+        let mut tx = self.begin_restore_lookup().await?;
+
         #[derive(FromRow)]
         struct LocationRow {
             snapshot_id: SnapshotId,
@@ -1126,7 +1135,7 @@ impl ClusterApiService {
              LIMIT 1"
         ))
         .bind(sandbox_id)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(|e| Status::internal(format!("snapshot lookup: {e}")))?;
 
@@ -1136,7 +1145,10 @@ impl ClusterApiService {
             ))
         })?;
 
-        let artifact_digests = self.artifact_digests_for_restore(row.snapshot_id).await?;
+        let artifact_digests = Self::artifact_digests_for_restore(&mut tx, row.snapshot_id).await?;
+        tx.commit()
+            .await
+            .map_err(|e| Status::internal(format!("finish snapshot lookup: {e}")))?;
         Ok(Response::new(GetSuspendSnapshotLocationResponse {
             snapshot_id: row.snapshot_id.to_string(),
             storage_uri: row.storage_connection_string,
@@ -1145,11 +1157,23 @@ impl ClusterApiService {
         }))
     }
 
-    async fn artifact_digests_for_restore(
+    // Catalog deletion cascades to digests before object cleanup. Both reads
+    // must see the same snapshot so deletion cannot look like a legacy backup
+    // without digests; READ COMMITTED would take a fresh snapshot per query.
+    async fn begin_restore_lookup(
         &self,
+    ) -> Result<sqlx::Transaction<'static, sqlx::Postgres>, Status> {
+        self.pool
+            .begin_with(sql!("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY"))
+            .await
+            .map_err(|e| Status::internal(format!("begin snapshot restore lookup: {e}")))
+    }
+
+    async fn artifact_digests_for_restore(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         snapshot_id: SnapshotId,
     ) -> Result<Vec<crate::proto::SnapshotArtifactDigest>, Status> {
-        let digests = snapshot_store::artifact_digests(&self.pool, snapshot_id)
+        let digests = snapshot_store::artifact_digests(&mut **tx, snapshot_id)
             .await
             .map_err(|e| Status::internal(format!("artifact digest lookup: {e}")))?;
         Ok(digests

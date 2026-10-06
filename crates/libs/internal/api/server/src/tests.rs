@@ -6527,3 +6527,93 @@ async fn finalize_rejects_malformed_artifact_digests() -> TestResult {
     assert_eq!(state, "creating");
     Ok(())
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn restore_locations_keep_digests_during_catalog_deletion() -> TestResult {
+    let Some(fixture) = cluster_fixture_with_max_connections(4).await? else {
+        return Ok(());
+    };
+    let mut results = Vec::new();
+    for use_artifact_lookup in [false, true] {
+        let sandbox_id = seed_sandbox(&fixture.service.pool).await?;
+        let local_artifact_id = LocalArtifactId::new();
+        let attempt = SnapshotId::new();
+        begin_artifact_backup(
+            &fixture.service,
+            sandbox_id,
+            local_artifact_id,
+            attempt,
+            pplx_space_sbx_mgr_client::proto::ArtifactKind::Full,
+            pplx_space_sbx_mgr_client::proto::ArtifactOrigin::Suspend,
+        )
+        .await?;
+        finalize_ready_with_digests(&fixture.service, attempt, test_artifact_digests()).await?;
+
+        // Stop the digest read after the location read, then perform real
+        // teardown. Object bytes outlive the catalog until the orphan sweep.
+        let mut deletion = fixture.service.pool.begin().await?;
+        sqlx::query(sql!(
+            "LOCK TABLE snapshot_artifact_digests IN ACCESS EXCLUSIVE MODE"
+        ))
+        .execute(&mut *deletion)
+        .await?;
+        let blocker: i32 = sqlx::query_scalar(sql!("SELECT pg_backend_pid()"))
+            .fetch_one(&mut *deletion)
+            .await?;
+        let lookup = async {
+            if use_artifact_lookup {
+                get_artifact_location(
+                    &fixture.service,
+                    sandbox_id,
+                    local_artifact_id,
+                    pplx_space_sbx_mgr_client::proto::ArtifactKind::Full,
+                )
+                .await
+                .map(|location| location.artifact_digests)
+            } else {
+                get_location(&fixture.service, sandbox_id)
+                    .await
+                    .map(|location| location.artifact_digests)
+            }
+        };
+        let remove = async {
+            loop {
+                let blocked: bool = sqlx::query_scalar(sql!(
+                    "SELECT EXISTS (
+                         SELECT 1 FROM pg_stat_activity
+                         WHERE datname = current_database()
+                           AND $1 = ANY(pg_blocking_pids(pid)))"
+                ))
+                .bind(blocker)
+                .fetch_one(&fixture.service.pool)
+                .await?;
+                if blocked {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            pplx_space_sandbox_teardown::finalize_sandbox_db_delete_tx(&mut deletion, sandbox_id)
+                .await?;
+            deletion.commit().await
+        };
+        let (result, removed) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            tokio::join!(lookup, remove)
+        })
+        .await?;
+        removed?;
+        results.push((use_artifact_lookup, result));
+    }
+
+    let mut expected = test_artifact_digests();
+    expected.sort_by(|a, b| a.artifact.cmp(&b.artifact));
+    for (use_artifact_lookup, result) in results {
+        match result {
+            Ok(digests) => assert_eq!(
+                digests, expected,
+                "a selected location must retain its digests (artifact lookup: {use_artifact_lookup})"
+            ),
+            Err(status) => assert_eq!(status.code(), Code::NotFound),
+        }
+    }
+    Ok(())
+}
