@@ -64,8 +64,7 @@ and development deployments and permits a listener without certificate files.
 The checked-in Kind charts set this exception. A partially configured listener
 certificate/key pair still fails startup; explicitly configured HTTPS still
 requires trust even with the exception. Steady-state production deployments must leave this
-exception unset/false. A prepared migration may temporarily use it to keep
-callers on plaintext while installing dual-protocol listeners. Plaintext Rust fixtures opt in explicitly in isolated
+exception unset/false. Plaintext Rust fixtures opt in explicitly in isolated
 test subprocesses; ordinary `cargo test` and `cargo nextest run` need no global
 exception. TLS regression tests inject their own configuration. Do not set the
 exception in Cargo's global environment: it would also affect `cargo run`.
@@ -73,33 +72,26 @@ For an intentionally plaintext local service run, scope the exception to that
 command, for example `SPACE_INTERNAL_RPC_INSECURE_DEV=true cargo run -p <service>`.
 Configured-but-empty certificate/key paths still fail instead of downgrading.
 
-## Migration and rollback
+## TLS-only listeners and rollback
 
-`SPACE_INTERNAL_RPC_ALLOW_PLAINTEXT_ROLLOUT=true` explicitly allows a listener
-with a complete TLS identity to accept plaintext HTTP/2 on its existing TCP
-port. It never allows missing, partial or invalid certificate material. The
-listener identifies the protocol before RPC admission, bounds pending handshakes
-and applies a ten-second handshake deadline. Failed TLS is rejected and never
-retried as plaintext. Bearer authorization is unchanged for both protocols.
+A listener configured with TLS identity accepts only TLS transport;
+plaintext HTTP/2 is rejected even when local development callers permit HTTP.
+Discovery advertises HTTPS for TLS-configured listeners and HTTP only for explicit
+identity-free development listeners. Clients do not perform protocol fallback.
+Listeners admit at most 64 pending TLS handshakes, each with a ten-second
+deadline. Established channels do not consume that budget. Shutdown releases
+the listening socket even when handshake admission is saturated.
 
-During compatibility, ClusterApi advertises protocol-neutral Kubernetes node
-addresses in inventory and routes. Callers select their own configured protocol;
-this also permits old cached addresses to remain usable during a caller rollout.
-Explicitly registered direct-node URLs retain their protocol and require their
-own migration. The compatibility flag does not authorize plaintext on clients.
+Migrate every caller and operational tool to TLS before deploying TLS-only
+listener images. Verify lifecycle, discovery, reconciliation, artifact transfers
+and data-plane streams. Existing plaintext connections must drain or reconnect
+using TLS before listener compatibility can be removed.
 
-Install trust and complete listener identities first, keeping callers explicitly
-on plaintext. Verify every listener, including any canaries and build workers,
-accepts authenticated TLS before switching callers to HTTPS. Both protocols
-remain available while callers roll, retry and reconnect. Once every caller and
-operational tool uses TLS, disable listener compatibility and remove the temporary
-plaintext caller configuration. Verify lifecycle, discovery, reconciliation,
-artifact transfers and data-plane streams across the transition.
-
-Rollback callers to the prepared plaintext configuration while keeping compatible
-listeners and trust installed. Verify caller convergence before reverting to
-plaintext-only listener images. Reverting an individual listener while TLS
-callers still exist is unsafe. Clients do not perform protocol fallback.
+Rollback to an earlier TLS-capable image while keeping TLS callers, listener
+identities and trust installed. Restoring plaintext callers requires first
+restoring listener images that support both protocols and verifying that
+compatibility is available everywhere. Plaintext-only listeners cannot safely
+serve callers that still use TLS.
 
 BuildManager uses the same policy for eager CLI connections and NodeApi’s lazy
 backend client. Lazy initialization reads trust without opening a connection;
@@ -116,3 +108,10 @@ callers is the conservative way to converge every path. Use overlapping CA bundl
 rotating issuers: deploy old+new trust, renew listeners, reconnect callers,
 verify convergence, then remove old trust. There is no certificate hot reload.
 Rotate previously exposed static bearers through the existing secret workflow.
+
+The published source capability manifest `ci/runtime-capabilities.json` exposes
+`internal_rpc_tls_only` version 1: a listener configured with TLS identity rejects
+plaintext, independent of client development settings. Deployment tooling may
+use this contract to distinguish TLS-only images from images that support a
+dual-protocol migration. Capability versions describe behavior rather than Rust
+source layout; update the declaration together with changes to that behavior.

@@ -1,8 +1,8 @@
 //! Authenticated TCP transport for internal RPC services. Unix sockets use
 //! peer credentials and deliberately do not pass through this policy.
 
-mod rollout;
-pub use rollout::{ALLOW_PLAINTEXT_ROLLOUT_ENV, ServerTransport};
+mod incoming;
+pub use incoming::Incoming;
 
 use http::Uri;
 use pplx_space_common_core::env::{Environment, ProcessEnvironment};
@@ -32,10 +32,6 @@ impl Service {
 
 #[derive(Debug, thiserror::Error)]
 pub enum TransportError {
-    #[error("invalid internal RPC identity PEM: {0}")]
-    IdentityPem(#[from] rustls::pki_types::pem::Error),
-    #[error("invalid internal RPC TLS identity: {0}")]
-    IdentityTls(#[from] rustls::Error),
     #[error(
         "plaintext internal RPC is disabled; configure HTTPS or explicitly opt into {INSECURE_DEV_ENV} for development"
     )]
@@ -66,20 +62,14 @@ pub fn default_scheme() -> &'static str {
     }
 }
 
-/// Advertise a protocol-neutral address during a dual-protocol listener rollout.
-/// Each caller applies its explicitly selected protocol, including when it
-/// consumes an inventory or cached route from a differently configured server.
+/// Advertise HTTPS when the listener has TLS identity, or HTTP for explicit
+/// development listeners without identity.
 pub fn advertised_endpoint_prefix() -> &'static str {
     advertised_endpoint_prefix_from_environment(&ProcessEnvironment)
 }
 
 fn advertised_endpoint_prefix_from_environment(env: &dyn Environment) -> &'static str {
-    if pplx_space_common_core::env::env_flag(
-        env.var(ALLOW_PLAINTEXT_ROLLOUT_ENV).ok().as_deref(),
-        false,
-    ) {
-        ""
-    } else if insecure(env) {
+    if insecure(env) && env.var_os(CERT_ENV).is_none() && env.var_os(KEY_ENV).is_none() {
         "http://"
     } else {
         "https://"

@@ -177,14 +177,16 @@ async fn authenticated_rpc() -> TestResult<AuthenticatedRpc> {
     );
     let server_shutdown = reviewer.shutdown.clone();
     let server_service = service.clone();
-    let transport = pplx_space_common_grpc::internal_transport::ServerTransport::from_env()?;
-    let server_builder = transport.server_builder();
+    let server_builder = pplx_space_common_grpc::internal_transport::server_builder()?;
     let server = tokio::spawn(async move {
         server_builder
             .layer(layer)
             .add_service(BuildManagerServer::new(server_service))
             .serve_with_incoming_shutdown(
-                transport.incoming(TcpListenerStream::new(listener), server_shutdown.clone()),
+                pplx_space_common_grpc::internal_transport::Incoming::new(
+                    TcpListenerStream::new(listener),
+                    server_shutdown.clone(),
+                ),
                 server_shutdown.cancelled_owned(),
             )
             .await

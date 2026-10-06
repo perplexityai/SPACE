@@ -197,7 +197,6 @@ retain their existing publication authority.
 | `SPACE_INTERNAL_SECRET_NAME` | `space-internal` | |
 | `SPACE_INTERNAL_API_ENDPOINT` | unset | |
 | `SPACE_INTERNAL_RPC_INSECURE_DEV` | off | TLS is required unless set. |
-| `SPACE_INTERNAL_RPC_ALLOW_PLAINTEXT_ROLLOUT` | off | Lets a TLS server also accept plaintext while callers migrate; see `docs/internal-rpc-tls.md`. |
 | `SPACE_INTERNAL_RPC_TLS_CA`, `SPACE_INTERNAL_RPC_TLS_CERT`, `SPACE_INTERNAL_RPC_TLS_KEY` | unset | Cert and key are set together. |
 | `SPACE_K8S_TOKEN_AUTH_ENABLED` | off | |
 | `SPACE_K8S_TOKEN_AUTH_STATIC_FALLBACK_ENABLED` | on | Keeps the shared static token accepted next to ServiceAccount auth. |

@@ -490,18 +490,16 @@ async fn shutdown_releases_listener_while_accepted_connections_drain() {
                 .then(|| "true".into())
         }
     }
-    let transport = pplx_space_common_grpc::internal_transport::ServerTransport::from_environment(
-        &PlaintextDev,
-    )
-    .unwrap();
-    // Compose like `run`, where the wrapper ends the stream before this listener sees shutdown.
+    let mut builder =
+        pplx_space_common_grpc::internal_transport::server_builder_from_environment(&PlaintextDev)
+            .unwrap();
+    // Use the same incoming stream as `run` so shutdown releases the listener before draining.
     let server = tokio::spawn(async move {
-        transport
-            .server_builder()
+        builder
             .add_service(health_service)
             .serve_with_incoming_shutdown(
-                transport.incoming(
-                    ShutdownTcpIncoming::new(listener, server_shutdown.clone()),
+                pplx_space_common_grpc::internal_transport::Incoming::new(
+                    TcpIncoming::from(listener).with_nodelay(Some(true)),
                     server_shutdown,
                 ),
                 std::future::pending(),

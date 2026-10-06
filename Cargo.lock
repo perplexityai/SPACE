@@ -5323,7 +5323,7 @@ name = "pplx-space-common-grpc"
 version = "0.8.0"
 dependencies = [
  "bytes",
- "futures-util",
+ "futures-core",
  "http 1.5.0",
  "http-body 1.1.0",
  "hyper-util",
@@ -5333,11 +5333,9 @@ dependencies = [
  "rand 0.10.2",
  "rcgen",
  "rustls",
- "socket2",
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
- "tokio-rustls",
  "tokio-stream",
  "tokio-util",
  "tonic",

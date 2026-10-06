@@ -87,10 +87,7 @@ pub async fn run(
     shutdown: CancellationToken,
 ) -> Result<(), RunBuildMgrError> {
     // Validate listener identity before starting durable work or background tasks.
-    let transport = pplx_space_common_grpc::internal_transport::ServerTransport::from_env()?;
-    let listener_shutdown = CancellationToken::new();
-    let server = transport
-        .server_builder()
+    let server = pplx_space_common_grpc::internal_transport::server_builder()?
         .timeout(pplx_space_common_svc::bootstrap::GRPC_REQUEST_TIMEOUT)
         .http2_keepalive_interval(Some(
             pplx_space_common_svc::bootstrap::GRPC_HTTP2_KEEPALIVE_INTERVAL,
@@ -146,10 +143,11 @@ pub async fn run(
         .await;
     let drain_timeout = config.drain_timeout;
 
+    let listener_shutdown = CancellationToken::new();
     let drain = {
+        let listener_shutdown = listener_shutdown.clone();
         let service = service.clone();
         let health_reporter = health_reporter.clone();
-        let listener_shutdown = listener_shutdown.clone();
         async move {
             shutdown.cancelled().await;
 
@@ -198,7 +196,6 @@ pub async fn run(
             let _ = expired_lease_reaper.await;
             let _ = terminal_job_pruner.await;
             let _ = blob_reaper.await;
-            // Keep the RPC listener available until builders finish draining.
             listener_shutdown.cancel();
         }
     };
@@ -219,7 +216,7 @@ pub async fn run(
         .add_service(health_service)
         .add_service(build_manager_server)
         .serve_with_incoming_shutdown(
-            transport.incoming(
+            pplx_space_common_grpc::internal_transport::Incoming::new(
                 TcpIncoming::from(listener).with_nodelay(Some(true)),
                 listener_shutdown,
             ),

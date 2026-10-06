@@ -2,6 +2,7 @@
   "common": [
     "ci/scripts/run-space-bundle-builds.py",
     "ci/rust-artifact-inputs.json",
+    "ci/runtime-capabilities.json",
     ".cargo/config.toml",
     ".dockerignore",
     "Cargo.toml",
