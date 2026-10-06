@@ -338,6 +338,18 @@ impl From<crate::public_operations::PublicOperationStoreError> for PublicApiErro
     }
 }
 
+impl From<crate::public_operations::ResponseAdmissionError> for PublicApiError {
+    fn from(error: crate::public_operations::ResponseAdmissionError) -> Self {
+        match error {
+            crate::public_operations::ResponseAdmissionError::Store(error) => Self::from(error),
+            crate::public_operations::ResponseAdmissionError::Sql(error) => Self::from(error),
+            crate::public_operations::ResponseAdmissionError::Conflict => {
+                Self::idempotency_conflict(error.to_string())
+            }
+        }
+    }
+}
+
 impl From<crate::public_sessions::PublicSessionStoreError> for PublicApiError {
     fn from(error: crate::public_sessions::PublicSessionStoreError) -> Self {
         match error {

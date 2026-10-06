@@ -33,6 +33,9 @@ fn update_claimed_payload_sql() -> &'static str {
 }
 const DEFAULT_IDEMPOTENCY_TTL_HOURS: i64 = 24;
 
+mod responses;
+pub(crate) use responses::ResponseAdmissionError;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApiProduct {
     Native,

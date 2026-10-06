@@ -82,6 +82,12 @@ pub(super) fn observed_access_idle_generation(
         .map_err(|_| unavailable())
 }
 
+#[derive(Debug)]
+pub(crate) enum AccessIdleTimeoutOutcome {
+    StoredOnly,
+    Applied,
+}
+
 enum DeadlineExecutionReadiness {
     Ready,
     Pending,
@@ -500,7 +506,8 @@ impl SandboxController {
         timeout_secs: u32,
         observed_at: prost_types::Timestamp,
         deadline: tokio::time::Instant,
-    ) -> Result<(), ControllerError> {
+        expected_policy: Option<&AutoLifecyclePolicy>,
+    ) -> Result<AccessIdleTimeoutOutcome, ControllerError> {
         tokio::time::timeout_at(deadline, async {
             let mut tx = pool
                 .begin()
@@ -549,6 +556,13 @@ impl SandboxController {
                 }
             };
             let current_policy = execution.policy.0.normalized();
+            if expected_policy
+                .is_some_and(|expected| expected.clone().normalized() != current_policy)
+            {
+                return Err(
+                    tonic::Status::failed_precondition("sandbox lifecycle policy changed").into(),
+                );
+            }
             let policy =
                 crate::e2b::policy_for_timeout_update(&current_policy, timeout_secs).normalized();
             if policy != current_policy {
@@ -558,7 +572,7 @@ impl SandboxController {
                 .await
                 .map_err(|error| db_contention_error("commit timeout intent", &error))?;
             if !needs_runtime {
-                return Ok(());
+                return Ok(AccessIdleTimeoutOutcome::StoredOnly);
             }
             // Only an identified execution is eligible for bounded readiness
             // observation. Missing identity alone cannot authorize a new wake.
@@ -583,7 +597,8 @@ impl SandboxController {
                     crate::controllers::auto_lifecycle::policy_to_proto(&policy),
                 ),
             )
-            .await
+            .await?;
+            Ok(AccessIdleTimeoutOutcome::Applied)
         })
         .await
         .map_err(|_| ControllerError::service_unavailable("sandbox deadline update expired"))?

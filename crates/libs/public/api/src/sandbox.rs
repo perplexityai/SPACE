@@ -2,6 +2,17 @@ use pplx_space_common_core::types::SimpleDuration;
 
 use crate::PublicApiParseError;
 
+#[cfg(feature = "serde")]
+pub(crate) fn deserialize_timeout<'de, Deserializer>(
+    deserializer: Deserializer,
+) -> Result<SimpleDuration, Deserializer::Error>
+where
+    Deserializer: serde::Deserializer<'de>,
+{
+    deserialize_idle_timeout(deserializer)?
+        .ok_or_else(|| serde::de::Error::custom("timeout must be a duration string"))
+}
+
 pub(crate) fn idle_timeout_secs(timeout: SimpleDuration) -> Result<u64, PublicApiParseError> {
     let duration = timeout.as_duration();
     if duration.subsec_nanos() != 0 || duration.as_secs() > i64::MAX as u64 {

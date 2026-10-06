@@ -752,3 +752,34 @@ fn operation_result_uses_tagged_public_contract() {
         fork
     );
 }
+
+#[cfg(feature = "serde")]
+#[test]
+fn set_timeout_uses_whole_second_duration_parsing_and_uint32_limit() {
+    for (timeout, expected) in [
+        ("1s", Some(1)),
+        ("1.5m", Some(90)),
+        ("0.5h", Some(1800)),
+        ("4294967295s", Some(u32::MAX)),
+        ("4294967296s", None),
+        ("0s", None),
+        ("1.5s", None),
+        ("nope", None),
+    ] {
+        let request = serde_json::from_value::<SetSandboxTimeoutRequest>(
+            serde_json::json!({"timeout": timeout}),
+        );
+        assert_eq!(
+            request.ok().and_then(|request| request.timeout_secs().ok()),
+            expected,
+            "{timeout}"
+        );
+    }
+    for value in [
+        serde_json::json!({}),
+        serde_json::json!({"timeout": null}),
+        serde_json::json!({"timeout": 60}),
+    ] {
+        serde_json::from_value::<SetSandboxTimeoutRequest>(value).unwrap_err();
+    }
+}

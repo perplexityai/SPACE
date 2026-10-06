@@ -1,5 +1,6 @@
 ---
 source: crates/libs/api/src/routes/public_docs/tests.rs
+assertion_line: 46
 expression: paths_by_method
 ---
 {
@@ -143,6 +144,9 @@ expression: paths_by_method
     "post"
   ],
   "/sandboxes/{sandbox_id}:rollback": [
+    "post"
+  ],
+  "/sandboxes/{sandbox_id}:set_timeout": [
     "post"
   ],
   "/sandboxes/{sandbox_id}:start": [

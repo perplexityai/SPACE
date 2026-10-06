@@ -1305,6 +1305,7 @@ pub(super) async fn timeout_sandbox(
             request.timeout,
             observed_at,
             deadline,
+            None,
         )
         .await
         .map_err(controller_error)?;

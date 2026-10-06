@@ -210,6 +210,62 @@ fn m1_contract_is_frozen() {
 }
 
 #[test]
+fn timeout_contract_is_synchronous_and_excluded_from_the_release_projection() {
+    let spec = public_openapi_value();
+    let path = pplx_space_public_api::routes::SET_SANDBOX_TIMEOUT.relative_path();
+    let operation = &spec["paths"][path]["post"];
+    assert_eq!(
+        operation[pplx_space_public_api::routes::M1_STATUS_EXTENSION],
+        "incubating"
+    );
+    assert_eq!(
+        operation["requestBody"]["content"]["application/json"]["schema"]["$ref"],
+        "#/components/schemas/SetSandboxTimeoutRequest"
+    );
+    assert_eq!(
+        operation["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
+        "#/components/schemas/SetSandboxTimeoutResponse"
+    );
+    assert!(operation["responses"].get("202").is_none());
+    assert!(
+        operation["parameters"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(
+                |parameter| parameter["name"] == "Idempotency-Key" && parameter["required"] == true
+            )
+    );
+    let schema = &spec["components"]["schemas"]["SetSandboxTimeoutResponse"];
+    let validator = Validator::options()
+        .with_draft(Draft::Draft202012)
+        .build(schema)
+        .unwrap();
+    let mut response = json!({
+        "sandbox_id": pplx_space_public_api::PublicSandboxId::new().to_string(),
+        "idle_timeout": "90s",
+        "expires_at": null
+    });
+    assert!(validator.is_valid(&response));
+    response["expires_at"] = json!("2026-10-06T18:00:00Z");
+    assert!(validator.is_valid(&response));
+    response["expires_at"] = json!(90);
+    assert!(!validator.is_valid(&response));
+    let release = m1_sdk_openapi_value();
+    assert!(release["paths"].get(path).is_none());
+    assert!(
+        release["components"]["schemas"]
+            .get("SetSandboxTimeoutRequest")
+            .is_none()
+    );
+    assert!(
+        release["components"]["schemas"]
+            .get("SetSandboxTimeoutResponse")
+            .is_none()
+    );
+}
+
+#[test]
 fn reference_examples_match_their_schemas() {
     let spec = m1_sdk_openapi_value();
     for (path, schema) in [

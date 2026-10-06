@@ -625,7 +625,12 @@ pub async fn apply_custom_sandbox_action(
     headers: HeaderMap,
     Path(sandbox_id_and_action): Path<String>,
     body: Bytes,
-) -> Result<(StatusCode, Json<SandboxOperationResponse>), PublicApiError> {
+) -> Result<Response, PublicApiError> {
+    if let Some(sandbox_id) = sandbox_id_and_action.strip_suffix(":set_timeout") {
+        return super::timeout::set_timeout(&state, org.id, sandbox_id, &headers, &body)
+            .await
+            .map(IntoResponse::into_response);
+    }
     let (sandbox_id, action) = parse_action_segment(&sandbox_id_and_action)?;
     let rollback = rollback_request(action, &body)?;
     enqueue_lifecycle_operation(
@@ -638,6 +643,7 @@ pub async fn apply_custom_sandbox_action(
         rollback,
     )
     .await
+    .map(IntoResponse::into_response)
 }
 
 pub async fn delete_sandbox(
@@ -1038,7 +1044,7 @@ async fn sandbox_operation_response(
     })
 }
 
-fn idempotency_key(headers: &HeaderMap) -> Result<IdempotencyKey, PublicApiError> {
+pub(super) fn idempotency_key(headers: &HeaderMap) -> Result<IdempotencyKey, PublicApiError> {
     let Some(value) = headers
         .get(IDEMPOTENCY_KEY_HEADER)
         .and_then(|value| value.to_str().ok())
@@ -1144,7 +1150,7 @@ fn lifecycle_path_template(action: SandboxLifecycleAction) -> OperationPathTempl
     })
 }
 
-fn parse_public_sandbox_id(value: &str) -> Result<PublicSandboxId, PublicApiError> {
+pub(super) fn parse_public_sandbox_id(value: &str) -> Result<PublicSandboxId, PublicApiError> {
     PublicSandboxId::from_str(value).map_err(|_| PublicApiError::bad_request("invalid sandbox id"))
 }
 

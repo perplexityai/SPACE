@@ -1091,6 +1091,46 @@ pub type PublicSandboxMetadata = BTreeMap<String, PublicSandboxMetadataValue>;
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, PartialEq)]
+pub struct SetSandboxTimeoutRequest {
+    #[cfg_attr(
+        feature = "serde",
+        serde(deserialize_with = "sandbox::deserialize_timeout")
+    )]
+    #[cfg_attr(feature = "schema", schemars(with = "String"))]
+    pub timeout: SimpleDuration,
+}
+
+impl SetSandboxTimeoutRequest {
+    pub fn timeout_secs(&self) -> Result<u32, PublicApiParseError> {
+        let seconds = sandbox::idle_timeout_secs(self.timeout)?;
+        u32::try_from(seconds)
+            .map_err(|_| PublicApiParseError("timeout exceeds 4294967295 seconds"))
+    }
+}
+
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, PartialEq)]
+pub struct SetSandboxTimeoutResponse {
+    #[cfg_attr(
+        feature = "schema",
+        schemars(schema_with = "schema::public_sandbox_id")
+    )]
+    pub sandbox_id: PublicSandboxId,
+    pub idle_timeout: String,
+    /// Conservative running deadline estimate, assuming node and API clocks agree within five
+    /// seconds, clamped to the observation time. Dormant sandboxes report their stored deadline.
+    #[cfg_attr(feature = "serde", serde(with = "time::serde::rfc3339::option"))]
+    #[cfg_attr(
+        feature = "schema",
+        schemars(schema_with = "schema::optional_date_time")
+    )]
+    pub expires_at: Option<time::OffsetDateTime>,
+}
+
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, PartialEq)]
 pub struct CreateSandboxRequest {
     #[cfg_attr(
         feature = "schema",
