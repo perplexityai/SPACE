@@ -34,6 +34,8 @@ pub enum ResolutionError {
 }
 
 /// Common authority context supplied to every provider adapter.
+/// `organization_id` is the sandbox's owner from the authority's own state,
+/// never a caller-supplied value.
 #[derive(Debug, Clone, Copy)]
 pub struct ResolutionContext {
     pub organization_id: Uuid,
@@ -84,6 +86,11 @@ impl<Material> std::fmt::Debug for PreparedCredential<Material> {
 ///
 /// Associated types preserve provider-owned locator and material schemas while
 /// making context and errors uniform.
+///
+/// Implementations must read upstream material with authority scoped to
+/// `ResolutionContext::organization_id`: a reference registered by one
+/// organization must not resolve another organization's credential, even
+/// where Credential Authority's own identity could read it.
 #[async_trait]
 pub trait CredentialProviderResolver: Send + Sync + 'static {
     type Reference: Sync + 'static;

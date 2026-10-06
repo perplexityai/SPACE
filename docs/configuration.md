@@ -192,6 +192,7 @@ because disabling it by mistake would leave every create queued forever.
 | `SPACE_CREDMGR_FAIL_ON_KEYLESS_AUTHORITY` | off | Crash instead of serving Ready-but-broken when a node-local authority has no key. |
 | `SPACE_CREDMGR_S3_VEND_ROLE_ARN` | unset = no storage exchange | |
 | `SPACE_CREDMGR_SCOPED_EXCHANGE_TOKEN_MODE` | `legacy` when the role ARN is set, else `disabled` | `legacy`, `mixed`, `enforce` or `disabled`; see `docs/space/design/credential-token-exchange.md`. |
+| `SPACE_CREDMGR_SECRETS_MANAGER_ROLE_ARN` | unset = credential references are not resolvable | IAM role assumed per organization, with session tag `space-org-id=<organization>`, for every Secrets Manager read. Its policy, and any cross-account secret resource policy, must admit a secret only when the secret's `space-org-id` tag matches `${aws:PrincipalTag/space-org-id}`; the authority's identity needs `sts:AssumeRole` and `sts:TagSession` on it. |
 | `SPACE_CREDMGR_INTERMEDIATE_CA_ARN` | unset | |
 | `SPACE_CREDMGR_INTERMEDIATE_KEY_BROKER_URL`, `SPACE_CREDMGR_INTERMEDIATE_KEY_BROKER_TOKEN_FILE`, `SPACE_CREDMGR_INTERMEDIATE_KEY_BROKER_TLS_CA`, `SPACE_CREDMGR_INTERMEDIATE_KEY_BROKER_GRANT_SCHEME`, `SPACE_CREDMGR_INTERMEDIATE_KEY_BROKER_TENANT_NAMESPACE` | unset | Configure as a group. |
 | `SPACE_PLATFORM_KEK_PROVIDER` | none | |

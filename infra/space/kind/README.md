@@ -850,8 +850,11 @@ SPACE_SMOKE_BACKEND=kind SPACE_SMOKE_API_SURFACE=ecw \
 
 # 6. Explicit AWS Secrets Manager network-credential injection. Before
 #    bootstrap, put short-lived sandbox-account AWS_ACCESS_KEY_ID,
-#    AWS_SECRET_ACCESS_KEY, and AWS_SESSION_TOKEN in private.env. The selected
-#    identity must have secretsmanager:GetSecretValue on the task-owned ARN.
+#    AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN, and
+#    SPACE_CREDMGR_SECRETS_MANAGER_ROLE_ARN in private.env. The selected
+#    identity must be able to sts:AssumeRole and sts:TagSession on that role;
+#    the role reads the task-owned ARN only when the secret's space-org-id tag
+#    equals the smoke organization's ID (docs/configuration.md).
 #    The controlled HTTPS endpoint must return only the lowercase SHA-256 of
 #    the Authorization header it receives.
 SPACE_SMOKE_BACKEND=kind SPACE_SMOKE_API_SURFACE=native \

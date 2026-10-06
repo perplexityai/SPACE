@@ -335,6 +335,12 @@ spec:
                   key: AWS_SESSION_TOKEN
                   optional: true
             {{- end }}
+            - name: SPACE_CREDMGR_SECRETS_MANAGER_ROLE_ARN
+              valueFrom:
+                secretKeyRef:
+                  name: space-aws-creds
+                  key: SPACE_CREDMGR_SECRETS_MANAGER_ROLE_ARN
+                  optional: true
             {{- if .Values.directSubstrate.enabled }}
             # Legacy DirectSubstrate bench (space-local-3486 / Tilt MINIMAL):
             # the api-server schedules off nodes/node_direct rows and there is
