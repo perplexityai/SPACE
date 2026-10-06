@@ -46,7 +46,7 @@ dashmap = { workspace = true }
 futures-util = { version = "0.3" }
 globset = { workspace = true }
 hyper-util = { workspace = true, features = ["tokio"] }
-nix = { workspace = true, features = ["signal", "process", "user", "net", "fs", "term", "time"] }
+nix = { workspace = true, features = ["signal", "process", "user", "net", "fs", "term", "time", "poll"] }
 libc = { workspace = true }
 rustix = { workspace = true, features = ["fs", "process", "pty", "termios"] }
 notify = { workspace = true }

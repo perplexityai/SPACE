@@ -558,6 +558,160 @@ async fn attached_output_backpressures_and_disconnect_releases_the_producer() {
     }
 }
 
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn slow_output_delivery_preserves_descendant_with_closed_output() {
+    use futures_util::FutureExt;
+    let directory = tempfile::tempdir().unwrap();
+    let pid_file = directory.path().join("descendant");
+    let service = cancellation_service();
+    let mut stream = Process::start(&service, Request::new(StartRequest {
+        command: vec!["/bin/sh".into(), "-c".into(),
+            "read ready; sleep 30 </dev/null >/dev/null 2>&1 & echo $! > \"$1\"; printf '%8192s' tail".into(),
+            "test".into(), pid_file.display().to_string()],
+        stdin: true,
+        idempotency_key: Some("slow-closed-output".into()),
+        ..Default::default()
+    })).await.unwrap().into_inner();
+    let started = stream.next().await.unwrap().unwrap();
+    let id = ProcessId::parse(started.process_id).unwrap();
+    let record = service.inner.processes.get_running(&id).unwrap();
+    let (_, leader_exit) = ProcessSignalHandle::open(record.info.pid).unwrap();
+    let event = process_stdout_event(&id, Some(record.info.pid), vec![b'x'; 8192]);
+    let mut expected_bytes = 8192;
+    while record.journal.try_append_output(event.clone()).is_none() {
+        expected_bytes += 8192;
+    }
+    record.write_stdin(b"go\n").await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), leader_exit.exited())
+        .await
+        .unwrap()
+        .unwrap();
+    let descendant: u32 = tokio::fs::read_to_string(pid_file)
+        .await
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let (descendant_handle, descendant_exit) = ProcessSignalHandle::open(descendant).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while record.journal.blocked_readers.load(Ordering::Relaxed) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the attachment must backpressure the output task");
+    // Observe the real descendant beyond the automatic cleanup deadline.
+    // A closed output pipe must not make its continued life depend on delivery.
+    let killed = tokio::time::timeout(PROCESS_OUTPUT_DRAIN_TIMEOUT * 2, descendant_exit.exited())
+        .await
+        .is_ok();
+    let events = tokio::time::timeout(Duration::from_secs(5), async {
+        let mut bytes = 0;
+        while let Some(event) = stream.next().await {
+            match event.unwrap().event.unwrap() {
+                pplx_space_spaced_common::proto::bridge_guest::process_event::Event::Stdout(
+                    output,
+                ) => bytes += output.data.len(),
+                pplx_space_spaced_common::proto::bridge_guest::process_event::Event::Exit(_) => {
+                    break;
+                }
+                _ => {}
+            }
+        }
+        bytes
+    })
+    .await;
+    // Own fixture cleanup even when the regression fails.
+    if descendant_exit.exited().now_or_never().is_none() {
+        descendant_handle.signal(ProcessSignal::sigkill()).unwrap();
+    }
+    descendant_exit.exited().await.unwrap();
+    service.inner.shutdown.cancel();
+    service.inner.process_tasks.close();
+    service.inner.process_tasks.wait().await;
+    assert!(
+        !killed,
+        "slow delivery must not kill a descendant that closed its output"
+    );
+    assert_eq!(
+        events.unwrap(),
+        expected_bytes,
+        "closed-pipe output must be delivered completely"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn fallback_drain_bounds_inherited_writer_despite_consuming_reader() {
+    let (reader, mut writer) = tokio::net::UnixStream::pair().unwrap();
+    let id = ProcessId::new();
+    let pid = std::process::id();
+    let registry = ProcessRegistry::default();
+    let (signal_handle, _) = ProcessSignalHandle::open(pid).unwrap();
+    let record = Arc::new(ProcessRecord::new(
+        process_started_event(&id, Some(pid)).unwrap(),
+        ProcessInfo::default(),
+        ProcessInput::Disabled,
+        signal_handle,
+        registry.reserve().unwrap(),
+    ));
+    let mut stream =
+        process_event_stream_with_prefix(Vec::new(), Some(record.journal.cursor(Some(0))));
+    let event = process_stdout_event(&id, Some(pid), vec![0; 8192]);
+    while record.journal.try_append_output(event.clone()).is_none() {}
+    let source = reader.as_fd().try_clone_to_owned().unwrap();
+    let task = spawn_process_output_reader(
+        reader,
+        source,
+        record.clone(),
+        id.clone(),
+        pid,
+        ProcessOutputKind::Stdout,
+    );
+    let mut tasks = VecDeque::from([task]);
+    let producer = tokio::spawn(async move { while writer.write_all(&[0; 8192]).await.is_ok() {} });
+    let mut completed = false;
+    {
+        // This is the same final drain used after child.wait on non-Linux hosts.
+        let drain = drain_process_output_tasks(&mut tasks, &id, pid, true);
+        tokio::pin!(drain);
+        for _ in 0..3 {
+            stream.next().await.unwrap().unwrap();
+            for _ in 0..1000 {
+                if record.journal.blocked_readers.load(Ordering::Relaxed) > 0 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            assert!(record.journal.blocked_readers.load(Ordering::Relaxed) > 0);
+            if futures_util::poll!(&mut drain).is_ready() {
+                completed = true;
+                break;
+            }
+            tokio::time::advance(PROCESS_OUTPUT_DRAIN_TIMEOUT).await;
+            for _ in 0..20 {
+                tokio::task::yield_now().await;
+            }
+            if futures_util::poll!(&mut drain).is_ready() {
+                completed = true;
+                break;
+            }
+        }
+    }
+    for output in &tasks {
+        output.task.abort();
+    }
+    for output in tasks {
+        let _ = output.task.await;
+    }
+    producer.abort();
+    let _ = producer.await;
+    assert!(
+        completed,
+        "an inherited writer must not renew the drain deadline through backpressure"
+    );
+}
+
 #[tokio::test]
 async fn kill_reaped_process_releases_stalled_output_and_capacity() {
     let service = cancellation_service();

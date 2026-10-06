@@ -9,7 +9,9 @@ use dashmap::DashMap;
 use pplx_space_common_core::types::{GuestUserName, Pii, ProcessCommand, ProcessId, ProcessSignal};
 use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
 use std::sync::Weak;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::{collections::VecDeque, io};
 use tokio::io::AsyncRead;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
@@ -55,7 +57,7 @@ type ExitObserver = ();
 struct ProcessSupervision {
     child: tokio::process::Child,
     exit_observer: ExitObserver,
-    output_tasks: VecDeque<tokio::task::JoinHandle<()>>,
+    output_tasks: VecDeque<ProcessOutputTask>,
     timeout: Option<pplx_space_common_core::types::ReadyTimeout>,
     shutdown: tokio_util::sync::CancellationToken,
     record: Arc<ProcessRecord>,
@@ -105,7 +107,7 @@ impl ProcessSupervision {
             Ok(Ok(None)) => {
                 let drained = tokio::select! {
                     drained = drain_process_output_tasks(
-                        &mut output_tasks, &process_id, pid, false, &record.journal,
+                        &mut output_tasks, &process_id, pid, false,
                     ) => drained,
                     _ = shutdown.cancelled() => false,
                 };
@@ -130,12 +132,12 @@ impl ProcessSupervision {
         if !output_tasks.is_empty() {
             tokio::select! {
                 _ = drain_process_output_tasks(
-                    &mut output_tasks, &process_id, pid, true, &record.journal,
+                    &mut output_tasks, &process_id, pid, true,
                 ) => {},
                 _ = shutdown.cancelled() => {
                     record.journal.release_backpressure();
                     drain_process_output_tasks(
-                        &mut output_tasks, &process_id, pid, true, &record.journal,
+                        &mut output_tasks, &process_id, pid, true,
                     ).await;
                 },
             }
@@ -345,6 +347,27 @@ impl ProcessLaunch {
             };
             (input, None, child.stdout.take(), child.stderr.take())
         };
+        // Retain independent, close-on-exec descriptors to distinguish open
+        // writers from output tasks waiting only for journal delivery. Prepare
+        // them before publishing the child, so allocation failure uses normal
+        // failed-start cleanup.
+        let sources = [
+            pty_reader.as_ref().map(AsFd::as_fd),
+            stdout.as_ref().map(AsFd::as_fd),
+            stderr.as_ref().map(AsFd::as_fd),
+        ];
+        let mut output_sources = match sources
+            .into_iter()
+            .flatten()
+            .map(|fd| fd.try_clone_to_owned())
+            .collect::<io::Result<VecDeque<_>>>()
+        {
+            Ok(sources) => sources,
+            Err(error) => {
+                terminate_and_reap_failed_start(child, process_reservation);
+                return Err(map_io_error(error));
+            }
+        };
         let started = match process_started_event(&process_id, Some(pid)) {
             Ok(started) => started,
             Err(status) => {
@@ -367,6 +390,9 @@ impl ProcessLaunch {
         if let Some(reader) = pty_reader {
             output_tasks.push_back(spawn_process_output_reader(
                 reader,
+                output_sources
+                    .pop_front()
+                    .expect("each reader has an output descriptor"),
                 Arc::clone(&record),
                 process_id.clone(),
                 pid,
@@ -376,6 +402,9 @@ impl ProcessLaunch {
         if let Some(stdout) = stdout {
             output_tasks.push_back(spawn_process_output_reader(
                 stdout,
+                output_sources
+                    .pop_front()
+                    .expect("each reader has an output descriptor"),
                 Arc::clone(&record),
                 process_id.clone(),
                 pid,
@@ -385,6 +414,9 @@ impl ProcessLaunch {
         if let Some(stderr) = stderr {
             output_tasks.push_back(spawn_process_output_reader(
                 stderr,
+                output_sources
+                    .pop_front()
+                    .expect("each reader has an output descriptor"),
                 Arc::clone(&record),
                 process_id.clone(),
                 pid,
@@ -871,6 +903,7 @@ struct ProcessEventJournal {
     changed: watch::Sender<ProcessJournalChange>,
     shared_output_slots: Arc<Semaphore>,
     consumed: watch::Sender<()>,
+    #[cfg(test)]
     blocked_readers: AtomicUsize,
 }
 
@@ -882,6 +915,7 @@ impl ProcessEventJournal {
             changed,
             shared_output_slots,
             consumed: watch::channel(()).0,
+            #[cfg(test)]
             blocked_readers: AtomicUsize::new(0),
         }
     }
@@ -975,6 +1009,7 @@ impl ProcessEventJournal {
                 None => return,
                 Some(pending) => event = pending,
             }
+            #[cfg(test)]
             let _blocked = BlockedOutputReader::new(&self.blocked_readers);
             if consumed.changed().await.is_err() {
                 return;
@@ -1152,8 +1187,10 @@ fn can_evict_process_output(state: &ProcessJournalState) -> bool {
         .is_none_or(|position| position.load(Ordering::Acquire) > state.first_sequence)
 }
 
+#[cfg(test)]
 struct BlockedOutputReader<'a>(&'a AtomicUsize);
 
+#[cfg(test)]
 impl<'a> BlockedOutputReader<'a> {
     fn new(count: &'a AtomicUsize) -> Self {
         count.fetch_add(1, Ordering::Relaxed);
@@ -1161,6 +1198,7 @@ impl<'a> BlockedOutputReader<'a> {
     }
 }
 
+#[cfg(test)]
 impl Drop for BlockedOutputReader<'_> {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::Relaxed);
@@ -1485,17 +1523,51 @@ fn process_stderr_event(process_id: &ProcessId, pid: Option<u32>, data: Vec<u8>)
     }
 }
 
+struct ProcessOutputTask {
+    task: tokio::task::JoinHandle<()>,
+    source: OwnedFd,
+}
+
+impl ProcessOutputTask {
+    fn writers_closed(&self) -> io::Result<bool> {
+        use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
+        // POLLHUP observes the last writer closing even while unread bytes
+        // remain. Waiting for the reader task instead confuses consumer
+        // backpressure with a descendant keeping the pipe or PTY open.
+        let mut sources = [PollFd::new(self.source.as_fd(), PollFlags::empty())];
+        loop {
+            match poll(&mut sources, PollTimeout::ZERO) {
+                Ok(_) => {
+                    let events = sources[0]
+                        .revents()
+                        .ok_or_else(|| io::Error::other("unrecognized output poll events"))?;
+                    if events.contains(PollFlags::POLLHUP) {
+                        return Ok(true);
+                    }
+                    if events.intersects(PollFlags::POLLERR | PollFlags::POLLNVAL) {
+                        return Err(io::Error::other("output descriptor poll failed"));
+                    }
+                    return Ok(false);
+                }
+                Err(nix::errno::Errno::EINTR) => continue,
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+}
+
 fn spawn_process_output_reader<R>(
     mut reader: R,
+    source: OwnedFd,
     record: Arc<ProcessRecord>,
     process_id: ProcessId,
     pid: u32,
     kind: ProcessOutputKind,
-) -> tokio::task::JoinHandle<()>
+) -> ProcessOutputTask
 where
     R: AsyncRead + Unpin + Send + 'static,
 {
-    tokio::spawn(async move {
+    let task = tokio::spawn(async move {
         let mut buffer = vec![0; 8192];
         loop {
             match reader.read(&mut buffer).await {
@@ -1526,21 +1598,24 @@ where
                 }
             }
         }
-    })
+    });
+    ProcessOutputTask { task, source }
 }
 
 async fn drain_process_output_tasks(
-    output_tasks: &mut VecDeque<tokio::task::JoinHandle<()>>,
+    output_tasks: &mut VecDeque<ProcessOutputTask>,
     process_id: &ProcessId,
     pid: u32,
     abort_on_timeout: bool,
-    journal: &ProcessEventJournal,
 ) -> bool {
+    let mut fully_drained = true;
     loop {
         let drain = async {
-            while let Some(task) = output_tasks.front_mut() {
-                if let Err(error) = task.await {
-                    tracing::warn!(%error, pid, "process output task failed");
+            while let Some(output) = output_tasks.front_mut() {
+                match (&mut output.task).await {
+                    Ok(()) => {}
+                    Err(error) if error.is_cancelled() => {}
+                    Err(error) => tracing::warn!(%error, pid, "process output task failed"),
                 }
                 output_tasks.pop_front();
             }
@@ -1549,38 +1624,48 @@ async fn drain_process_output_tasks(
             .await
             .is_ok()
         {
-            return true;
+            return fully_drained;
         }
 
-        // Only the final drain may wait for a slow consumer. The initial
-        // grace period must still expire so descendants cannot keep writing
-        // indefinitely after the leader exits.
-        if abort_on_timeout && journal.blocked_readers.load(Ordering::Relaxed) > 0 {
-            continue;
+        let mut writers_open = false;
+        // Inspect every source, including stderr behind a backpressured stdout.
+        // Closed sources can finish delivering their finite buffered output at
+        // the consumer's pace. Open sources keep the inherited-writer deadline.
+        for output in output_tasks.iter() {
+            if output.task.is_finished() {
+                continue;
+            }
+            match output.writers_closed() {
+                Ok(true) => {}
+                Ok(false) => {
+                    writers_open = true;
+                    if abort_on_timeout {
+                        output.task.abort();
+                        fully_drained = false;
+                    }
+                }
+                Err(error) => {
+                    // An observation failure is not evidence for killing the
+                    // process group. Bound our own reader and report the error.
+                    tracing::warn!(%error, pid, "failed to observe process output closure");
+                    output.task.abort();
+                    fully_drained = false;
+                }
+            }
         }
-        break;
-    }
-    tracing::warn!(
-        process_id = process_id.as_str(),
-        pid,
-        drain_timeout_ms = PROCESS_OUTPUT_DRAIN_TIMEOUT.as_millis() as u64,
-        abort_on_timeout,
-        "process output drain timed out"
-    );
-    if !abort_on_timeout {
-        return false;
-    }
-    for task in output_tasks.iter() {
-        task.abort();
-    }
-    while let Some(task) = output_tasks.pop_front() {
-        match task.await {
-            Ok(()) => {}
-            Err(error) if error.is_cancelled() => {}
-            Err(error) => tracing::warn!(%error, pid, "process output task failed after abort"),
+        if writers_open {
+            tracing::warn!(
+                process_id = process_id.as_str(),
+                pid,
+                drain_timeout_ms = PROCESS_OUTPUT_DRAIN_TIMEOUT.as_millis() as u64,
+                abort_on_timeout,
+                "process output writers remained open after drain deadline"
+            );
+        }
+        if !abort_on_timeout {
+            return !writers_open;
         }
     }
-    false
 }
 
 enum ProcessExitOutcome {
