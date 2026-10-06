@@ -983,6 +983,12 @@ variable "network_credential_smoke_enabled" {
   default     = false
 }
 
+variable "network_credential_smoke_org_id" {
+  description = "Organization ID the network-credential smoke registers its reference under. When set, the fixture is tagged space-org-id=<this ID> so the organization-scoped reader role reads it for that organization; credmgr binaries that read through that role cannot resolve the fixture until it is set."
+  type        = string
+  default     = null
+}
+
 variable "cluster_smoke_slack_webhook_external_secret_enabled" {
   description = "Sync the Slack webhook the in-cluster smoke Job posts its own run summary to. Independent of the key gate above: a cluster can run the smoke and report through logs, its summary artifact, and its metrics without ever posting to Slack. Off until the webhook value is in this account."
   type        = bool

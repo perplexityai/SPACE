@@ -3,9 +3,10 @@
 //! Every read runs in a session scoped to the requesting organization: the
 //! authority assumes the reader role named by
 //! `SPACE_CREDMGR_SECRETS_MANAGER_ROLE_ARN` with the session tag
-//! `space-org-id=<organization>`. The role's policy, and any cross-account
-//! secret resource policy, admits a secret only when its `space-org-id`
-//! resource tag matches that session tag, so a reference cannot read another
+//! `space-org-id=<organization>` and a session policy that allows
+//! `GetSecretValue` only on secrets tagged with that same organization. The
+//! session policy caps the session whatever the role's own policy or a secret's
+//! resource policy grants the role, so a reference cannot read another
 //! organization's secret even where the authority's own identity could. The
 //! committed effective network policy limits destinations.
 
@@ -41,22 +42,57 @@ const MAX_CACHED_ORGANIZATIONS: NonZeroUsize = NonZeroUsize::new(1024).unwrap();
 #[error("{SECRETS_MANAGER_ROLE_ARN_ENV} must be an IAM role ARN")]
 pub struct ReaderRoleArnError;
 
+/// A structurally valid IAM role ARN for the organization-scoped reader role.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReaderRoleArn(String);
+
+impl ReaderRoleArn {
+    pub fn parse(raw: String) -> Result<Self, ReaderRoleArnError> {
+        if crate::iam_role_arn::is_iam_role_arn(&raw) {
+            Ok(Self(raw))
+        } else {
+            Err(ReaderRoleArnError)
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 /// The configured reader role, or `None` when this authority resolves no
 /// credential references.
-pub fn reader_role_arn_from_env() -> Result<Option<String>, ReaderRoleArnError> {
+pub fn reader_role_arn_from_env() -> Result<Option<ReaderRoleArn>, ReaderRoleArnError> {
     parse_reader_role_arn(std::env::var(SECRETS_MANAGER_ROLE_ARN_ENV).ok())
 }
 
-fn parse_reader_role_arn(value: Option<String>) -> Result<Option<String>, ReaderRoleArnError> {
-    match value.filter(|value| !value.is_empty()) {
-        None => Ok(None),
-        Some(arn)
-            if arn.starts_with("arn:") && arn.contains(":iam::") && arn.contains(":role/") =>
-        {
-            Ok(Some(arn))
-        }
-        Some(_) => Err(ReaderRoleArnError),
-    }
+fn parse_reader_role_arn(
+    value: Option<String>,
+) -> Result<Option<ReaderRoleArn>, ReaderRoleArnError> {
+    value
+        .filter(|value| !value.is_empty())
+        .map(ReaderRoleArn::parse)
+        .transpose()
+}
+
+/// Session policy limiting an organization's session to secrets tagged with
+/// that organization.
+fn session_policy(organization_id: Uuid) -> String {
+    let mut tag_matches = serde_json::Map::new();
+    tag_matches.insert(
+        format!("secretsmanager:ResourceTag/{ORGANIZATION_SESSION_TAG}"),
+        organization_id.to_string().into(),
+    );
+    serde_json::json!({
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Effect": "Allow",
+            "Action": "secretsmanager:GetSecretValue",
+            "Resource": "*",
+            "Condition": { "StringEquals": tag_matches },
+        }]
+    })
+    .to_string()
 }
 
 /// Resolved current `SecretString`. The value is zeroized on drop; callers
@@ -93,12 +129,12 @@ struct AwsSecretFetch {
 /// requesting organization.
 pub struct AwsSecretsManagerResolver {
     base_aws_config: aws_config::SdkConfig,
-    reader_role_arn: String,
+    reader_role_arn: ReaderRoleArn,
     organization_configs: Mutex<LruCache<Uuid, aws_config::SdkConfig>>,
 }
 
 impl AwsSecretsManagerResolver {
-    pub fn new(base_aws_config: &aws_config::SdkConfig, reader_role_arn: String) -> Self {
+    pub fn new(base_aws_config: &aws_config::SdkConfig, reader_role_arn: ReaderRoleArn) -> Self {
         Self {
             base_aws_config: base_aws_config.clone(),
             reader_role_arn,
@@ -113,9 +149,10 @@ impl AwsSecretsManagerResolver {
         if let Some(config) = self.cache().get(&organization_id) {
             return config.clone();
         }
-        let session = aws_config::sts::AssumeRoleProvider::builder(&self.reader_role_arn)
+        let session = aws_config::sts::AssumeRoleProvider::builder(self.reader_role_arn.as_str())
             .session_name(format!("space-org-{organization_id}"))
             .tags([(ORGANIZATION_SESSION_TAG, organization_id.to_string())])
+            .policy(session_policy(organization_id))
             .configure(&self.base_aws_config)
             .build()
             .await;
@@ -134,11 +171,6 @@ impl AwsSecretsManagerResolver {
         self.organization_configs
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-    }
-
-    #[cfg(test)]
-    fn cached_organizations(&self) -> usize {
-        self.cache().len()
     }
 }
 

@@ -1,0 +1,114 @@
+# Organization-scoped Secrets Manager reads for credential references.
+#
+# Credential Authority never reads a referenced secret with its own identity.
+# For each read it assumes this role with the session tag
+# space-org-id=<sandbox organization> (SPACE_CREDMGR_SECRETS_MANAGER_ROLE_ARN)
+# and a session policy limited to secrets with that tag. This role's policy
+# also denies, explicitly, any secret whose space-org-id tag is missing or
+# differs from the session's, so neither this policy nor a secret's resource
+# policy can let one organization's session read another organization's
+# secret. Secrets in another account also need a resource policy that allows
+# this role.
+#
+# The role grants nothing until a secret is tagged, so it exists on every
+# cluster; the credmgr chart's secretsManagerRoleArn activates it.
+
+data "aws_iam_policy_document" "credmgr_secrets_reader_assume_role" {
+  statement {
+    sid = "OnlyCredmgrAuthorityMayAssumePerOrganization"
+    # sts:TagSession carries the organization tag, and the authority's EKS Pod
+    # Identity session tags propagate on every downstream AssumeRole
+    # (credmgr_s3_vend.tf).
+    actions = [
+      "sts:AssumeRole",
+      "sts:TagSession",
+    ]
+
+    principals {
+      type        = "AWS"
+      identifiers = [aws_iam_role.credmgr_authority.arn]
+    }
+
+    # A session without an organization tag reads nothing below; refuse to
+    # mint one at all.
+    condition {
+      test     = "Null"
+      variable = "aws:RequestTag/space-org-id"
+      values   = ["false"]
+    }
+  }
+}
+
+resource "aws_iam_role" "credmgr_secrets_reader" {
+  name               = "${local.name}-credmgr-secrets-reader"
+  assume_role_policy = data.aws_iam_policy_document.credmgr_secrets_reader_assume_role.json
+  description        = "Role the credmgr authority assumes per organization to read that organization's tagged Secrets Manager secrets"
+
+  tags = var.common_tags
+}
+
+data "aws_iam_policy_document" "credmgr_secrets_reader" {
+  statement {
+    sid       = "ReadOnlySecretsTaggedForTheSessionOrganization"
+    actions   = ["secretsmanager:GetSecretValue"]
+    resources = ["arn:aws:secretsmanager:*:*:secret:*"]
+
+    condition {
+      test     = "StringEquals"
+      variable = "secretsmanager:ResourceTag/space-org-id"
+      values   = ["$${aws:PrincipalTag/space-org-id}"]
+    }
+  }
+
+  # An Allow above does not stop a same-account resource policy from granting
+  # this role access on its own; an explicit Deny does. StringNotEquals is
+  # also true when the secret has no space-org-id tag.
+  statement {
+    sid       = "DenySecretsNotTaggedForTheSessionOrganization"
+    effect    = "Deny"
+    actions   = ["secretsmanager:*"]
+    resources = ["*"]
+
+    condition {
+      test     = "StringNotEquals"
+      variable = "secretsmanager:ResourceTag/space-org-id"
+      values   = ["$${aws:PrincipalTag/space-org-id}"]
+    }
+  }
+
+  statement {
+    sid       = "DenySessionsWithoutAnOrganization"
+    effect    = "Deny"
+    actions   = ["secretsmanager:*"]
+    resources = ["*"]
+
+    condition {
+      test     = "Null"
+      variable = "aws:PrincipalTag/space-org-id"
+      values   = ["true"]
+    }
+  }
+}
+
+resource "aws_iam_role_policy" "credmgr_secrets_reader" {
+  name   = "${local.name}-credmgr-secrets-reader"
+  role   = aws_iam_role.credmgr_secrets_reader.name
+  policy = data.aws_iam_policy_document.credmgr_secrets_reader.json
+}
+
+data "aws_iam_policy_document" "credmgr_authority_assume_secrets_reader" {
+  statement {
+    sid = "AssumeSecretsReaderRolePerOrganization"
+    actions = [
+      "sts:AssumeRole",
+      "sts:TagSession",
+    ]
+    resources = [aws_iam_role.credmgr_secrets_reader.arn]
+  }
+}
+
+resource "aws_iam_role_policy" "credmgr_authority_assume_secrets_reader" {
+  name   = "${local.name}-credmgr-authority-assume-secrets-reader"
+  role   = aws_iam_role.credmgr_authority.name
+  policy = data.aws_iam_policy_document.credmgr_authority_assume_secrets_reader.json
+}
