@@ -809,8 +809,9 @@ class TemplateBuildControl(Protocol):
 
     def builder_logged_alias(self, pod_name: str, alias: str) -> bool: ...
 
-    def prepared_rootfs_handoff(self, pod_name: str) -> str | None:
-        """None once the builder committed a prepared rootfs for its build; else the failure text."""
+    def prepared_rootfs_handoff(self, pod_name: str, *, window_seconds: int = 60) -> str | None:
+        """None once the builder committed a prepared rootfs for its build; else, after
+        `window_seconds` without one, the failure text."""
         ...
 
     def published_guest_metadata(self, pod_name: str, alias: str) -> GuestMetadata: ...

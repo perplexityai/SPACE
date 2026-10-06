@@ -147,7 +147,7 @@ class _Control:
     def builder_logged_alias(self, pod_name, alias):
         return pod_name in self.accepts_on
 
-    def prepared_rootfs_handoff(self, pod_name):
+    def prepared_rootfs_handoff(self, pod_name, *, window_seconds=60):
         return self.handoff
 
     def published_guest_metadata(self, pod_name, alias):
