@@ -1,4 +1,6 @@
-use super::super::{BuildAuthenticator, authorize_template_build};
+use super::super::{
+    BuildAuthenticator, authorize_template_build, system_publication_requires_grant,
+};
 use super::*;
 use crate::auth::test_support::{TokenReviewStatus, service_account_status, token_review_service};
 use kube::client::{Body, ClientBuilder};
@@ -14,19 +16,21 @@ const TOKEN: &str = "header.untrusted-claims.signature";
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
+fn accounts(names: &[&str]) -> BTreeSet<String> {
+    names
+        .iter()
+        .map(|name| format!("system:serviceaccount:space:{name}"))
+        .collect()
+}
+
 fn policy(audience: &str) -> BuildPolicy {
-    let accounts = |names: &[&str]| {
-        names
-            .iter()
-            .map(|name| format!("system:serviceaccount:space:{name}"))
-            .collect()
-    };
-    BuildPolicy {
-        audience: audience.to_string(),
-        allowed: accounts(&["space-api", "space-builder", "space-build-manager"]),
-        system: accounts(&["space-builder", "space-build-manager"]),
-        tenant: accounts(&["space-api", "space-builder", "space-build-manager"]),
-    }
+    BuildPolicy::new(
+        BuildSurface::Manager,
+        audience.to_string(),
+        accounts(&["space-api", "space-builder", "space-build-manager"]),
+        accounts(&["space-builder", "space-build-manager"]),
+        accounts(&["space-api", "space-builder", "space-build-manager"]),
+    )
 }
 
 fn reviewer(
@@ -262,19 +266,33 @@ async fn unavailable_token_review_never_grants_build_authority() {
     }
 }
 
+/// Build-manager holds both tenant and system publication authority, so its
+/// system publications need the API's system build grant; the deploy-time
+/// publisher holds system authority alone and needs none.
 #[tokio::test]
 async fn publication_authority_is_method_scoped_and_comes_from_token_review() {
-    for (account, owner, expected) in [
-        ("workers", None, Some(Code::PermissionDenied)),
-        ("workers", Some("tenant"), Some(Code::PermissionDenied)),
-        ("space-api", Some("tenant"), Some(Code::PermissionDenied)),
-        ("space-build-manager", None, None),
-        ("space-build-manager", Some("tenant"), None),
-        ("space-template-publish", None, None),
+    for (account, owner, expected, requires_grant) in [
+        ("workers", None, Some(Code::PermissionDenied), false),
+        (
+            "workers",
+            Some("tenant"),
+            Some(Code::PermissionDenied),
+            false,
+        ),
+        (
+            "space-api",
+            Some("tenant"),
+            Some(Code::PermissionDenied),
+            false,
+        ),
+        ("space-build-manager", None, None, true),
+        ("space-build-manager", Some("tenant"), None, true),
+        ("space-template-publish", None, None, false),
         (
             "space-template-publish",
             Some("tenant"),
             Some(Code::PermissionDenied),
+            false,
         ),
     ] {
         for method in ["RegisterTemplate", "RegisterTemplateRelease"] {
@@ -285,17 +303,15 @@ async fn publication_authority_is_method_scoped_and_comes_from_token_review() {
                 ),
                 "space-cluster-api",
             );
-            reviewer.policy.system = ["space-build-manager", "space-template-publish"]
-                .map(|name| format!("system:serviceaccount:space:{name}"))
-                .into();
-            reviewer.policy.tenant =
-                ["system:serviceaccount:space:space-build-manager".to_string()].into();
-            reviewer.policy.allowed = reviewer
-                .policy
-                .system
-                .union(&reviewer.policy.tenant)
-                .cloned()
-                .collect();
+            let system = accounts(&["space-build-manager", "space-template-publish"]);
+            let tenant = accounts(&["space-build-manager"]);
+            reviewer.policy = BuildPolicy::new(
+                BuildSurface::Publication,
+                "space-cluster-api".to_string(),
+                system.union(&tenant).cloned().collect(),
+                system,
+                tenant,
+            );
             let mut auth = authenticator(reviewer, false);
             auth.surface = BuildSurface::Publication;
             let result = auth
@@ -307,11 +323,17 @@ async fn publication_authority_is_method_scoped_and_comes_from_token_review() {
                 .and_then(|caller| {
                     let mut request = tonic::Request::new(());
                     request.extensions_mut().insert(caller.unwrap());
-                    authorize_template_build(&request, owner)
+                    authorize_template_build(&request, owner)?;
+                    Ok(system_publication_requires_grant(&request))
                 });
             assert_eq!(
-                result.err().map(|e| e.code()),
+                result.as_ref().err().map(tonic::Status::code),
                 expected,
+                "{account}: {method}"
+            );
+            assert_eq!(
+                result.unwrap_or(false),
+                requires_grant,
                 "{account}: {method}"
             );
             assert_eq!(calls.load(Ordering::SeqCst), 1);

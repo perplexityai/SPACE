@@ -2,12 +2,9 @@ use super::network_runtime::{network_policy_refresh_error_to_status, refresh_net
 use super::spaced_bridge::cleanup_restored_snapshot_dir_async;
 use super::start_support::ActivationCleanupGuard;
 use super::*;
-use pplx_space_common_core::guest::linux::network::{
-    GATEWAY_IPV4_ADDR as GUEST_GATEWAY, PRIMARY_INTERFACE as GUEST_NETWORK_INTERFACE,
-};
 use pplx_space_common_core::host::linux::identities::users;
 use pplx_space_common_core::types::{
-    ExecutionGeneration, GuestUserName, NodeId, NodeRole as SpaceNodeRole, PodUid, RouteGeneration,
+    ExecutionGeneration, NodeId, NodeRole as SpaceNodeRole, PodUid, RouteGeneration,
     SandboxActivationAttemptId, SandboxQuarantineReasonCode, SpaceApiRouteIdentity,
 };
 use pplx_space_common_core::wake_signals::MISSING_RUNTIME_CONTEXT_MARKER;
@@ -16,7 +13,6 @@ use pplx_space_events::{
     SandboxEventDetails, SandboxEventSource, SandboxEventType, emit_sandbox_event,
 };
 
-const RESTORE_GATEWAY_NEIGHBOR_FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
 const NODE_ID_PATH: &str = "/space/etc/node-id";
 
 #[derive(Clone, Copy, Debug)]
@@ -1440,13 +1436,13 @@ pub(super) async fn complete_restore_and_mark_final(
         ));
     }
 
-    // Guest compatibility does not establish gateway readiness. Clock sync is
-    // best-effort background work and must not add latency to start/restore.
-    // Only kick it off for the Started path: a Paused-final restore means
-    // the VM hasn't been resumed yet, so there's nothing to clock-sync
-    // until the user wakes it.
+    // Clock sync is best-effort background work and must not add latency to
+    // start/restore. Only kick it off for the Started path: a Paused-final
+    // restore means the VM hasn't been resumed yet, so there's nothing to
+    // clock-sync until the user wakes it. The restored guest's cached gateway
+    // MAC needs nothing here: node-manager's guest L2 ingress policy accepts
+    // frames for a stale gateway MAC.
     if final_state == SandboxState::Started {
-        flush_restore_gateway_neighbor_best_effort(sandbox_id).await;
         spawn_resume_clock_sync(
             sandbox_id.to_string(),
             pplx_space_spaced_host_client::proto::ResumeReason::SnapshotRestore,
@@ -1509,112 +1505,6 @@ async fn mark_restore_after_network_ready(
     }
     mark_sandbox_dirty(db, sandbox_id);
     Ok(())
-}
-
-// Snapshot restore preserves the guest neighbor table; after cross-node restore,
-// its cached gateway MAC can refer to the previous node's data-plane endpoint.
-// Flush it so restored guest traffic re-resolves the gateway on the current node.
-async fn flush_restore_gateway_neighbor_best_effort(sandbox_id: &str) {
-    match flush_restore_gateway_neighbor(sandbox_id).await {
-        Ok(()) => tracing::debug!(sandbox_id, "flushed restored guest gateway neighbor entry"),
-        Err(error) => tracing::warn!(
-            sandbox_id,
-            %error,
-            "failed to flush restored guest gateway neighbor entry"
-        ),
-    }
-}
-
-async fn flush_restore_gateway_neighbor(sandbox_id: &str) -> Result<(), String> {
-    let config = pplx_space_spaced_host_client::SpacedHostClientConfig::default()
-        .with_socket_path(spaced_host_socket_path(sandbox_id));
-    let client = pplx_space_spaced_host_client::SpacedHostClient::new_with_config(config)
-        .await
-        .map_err(|error| error.to_string())?;
-    let mut events = client
-        .start_process_stream_with_options(restore_gateway_neighbor_flush_options())
-        .await
-        .map_err(|error| error.to_string())?;
-    while let Some(event) = events.message().await.map_err(|error| error.to_string())? {
-        if matches!(
-            event.event,
-            Some(pplx_space_spaced_host_client::proto::process_event::Event::Exit(_))
-        ) {
-            return restore_gateway_neighbor_flush_succeeded(std::slice::from_ref(&event));
-        }
-    }
-    Err("ip neigh flush produced no exit event".to_string())
-}
-
-#[allow(
-    clippy::expect_used,
-    reason = "Root and neighbor flush argv are bounded nonempty NUL-free constants"
-)]
-fn restore_gateway_neighbor_flush_options() -> pplx_space_spaced_host_client::StartProcessOptions {
-    pplx_space_spaced_host_client::StartProcessOptions {
-        user: Some(GuestUserName::parse("root").expect("root guest user is valid")),
-        timeout: Some(RESTORE_GATEWAY_NEIGHBOR_FLUSH_TIMEOUT),
-        tag: Some("restore-gateway-neighbor-flush".to_string()),
-        ..pplx_space_spaced_host_client::StartProcessOptions::new(
-            pplx_space_common_core::types::ProcessCommand::new(
-                restore_gateway_neighbor_flush_command(),
-            )
-            .expect("neighbor flush command consists of valid constants"),
-        )
-    }
-}
-
-fn restore_gateway_neighbor_flush_command() -> Vec<String> {
-    [
-        "ip",
-        "neigh",
-        "flush",
-        GUEST_GATEWAY,
-        "dev",
-        GUEST_NETWORK_INTERFACE,
-    ]
-    .map(str::to_string)
-    .to_vec()
-}
-
-fn restore_gateway_neighbor_flush_succeeded(
-    events: &[pplx_space_spaced_host_client::proto::ProcessEvent],
-) -> Result<(), String> {
-    for event in events {
-        let Some(pplx_space_spaced_host_client::proto::process_event::Event::Exit(exit)) =
-            &event.event
-        else {
-            continue;
-        };
-        return match &exit.outcome {
-            Some(pplx_space_spaced_host_client::proto::process_exit::Outcome::Exited(exited))
-                if exited.exit_code == 0 =>
-            {
-                Ok(())
-            }
-            Some(pplx_space_spaced_host_client::proto::process_exit::Outcome::Exited(exited)) => {
-                Err(format!("ip neigh flush exited {}", exited.exit_code))
-            }
-            Some(pplx_space_spaced_host_client::proto::process_exit::Outcome::TimedOut(_)) => {
-                Err(format!(
-                    "ip neigh flush timed out after {}s",
-                    RESTORE_GATEWAY_NEIGHBOR_FLUSH_TIMEOUT.as_secs()
-                ))
-            }
-            Some(pplx_space_spaced_host_client::proto::process_exit::Outcome::Signaled(
-                signaled,
-            )) => Err(format!(
-                "ip neigh flush terminated by signal {}",
-                signaled
-                    .signal
-                    .map(|signal| signal.to_string())
-                    .unwrap_or_else(|| "unknown".to_string())
-            )),
-            Some(pplx_space_spaced_host_client::proto::process_exit::Outcome::Unknown(_))
-            | None => Err("ip neigh flush ended with unknown status".to_string()),
-        };
-    }
-    Err("ip neigh flush produced no exit event".to_string())
 }
 
 pub(super) async fn notify_resume_clock_sync_best_effort(

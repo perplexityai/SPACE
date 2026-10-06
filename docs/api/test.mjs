@@ -228,7 +228,9 @@ try {
   assert.equal(await page.locator('details.schema-example').count(), catalog.filter(model => model.primitive).length);
   const create = await page.locator('[data-section-id="operation/createSandbox"]').innerText();
   assert.match(create, /seed:latest/);
-  assert.equal((create.match(/Experimental: outside the supported contract/g) || []).length, 2);
+  const experimentalCreateFields = Object.values(spec.components.schemas.CreateSandboxRequest.properties)
+    .filter(field => field['x-space-m1-status'] === 'incubating').length;
+  assert.equal((create.match(/Experimental: outside the supported contract/g) || []).length, experimentalCreateFields);
   const command = await page.locator('[data-section-id="operation/createCommand"]').innerText();
   assert.match(command, /Hello from SPACE/);
   assert.match(command, /Attaching to the stream starts execution/);

@@ -9,10 +9,10 @@ instrumentation changes. This proves the tested local ingestion/query path,
 - Docker cluster `space-local`, explicit context `kind-space-local`, API
   `https://127.0.0.1:37403` verified against the Docker published control-plane
   port. `kube-system` UID `155bf3b0-7530-4a08-8a71-6a0c72fb678d`.
-- Chart based on main `23124daee2c3c01fad79e4453d8bbb4a51670a0f`; isolated
-  namespace `space-traces`. The integration/Tilt checkout was left clean.
-- Existing Rust fixture built from clean integration source
-  `bfa4b1b4fcfebab054fdfb1472253440e59fc14f`, feature `datadog-otel`.
+- Chart based on main as of the run date; isolated namespace `space-traces`.
+  The integration/Tilt checkout was left clean.
+- Existing Rust fixture built from a clean local integration checkout, feature
+  `datadog-otel`.
   Binary SHA-256 `b07d9d2c4e4ff1b8a6fc28816a344fd34aed78d1d59047181e21616136bb9274`.
   This source contains the tracing implementation; it is not an assertion that
   all tracing-stack PRs are already on main.
@@ -109,8 +109,8 @@ template, with a generated `traceparent: 00-<trace-id>-<parent-id>-01` header.
 Both temporary endpoint overrides targeted only
 `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`; their original absence was restored.
 
-Local evidence remains in
-`/home/dev/space-kind-oss-traces/target/validation-20260923/`: checked fixture
+Local evidence remains in the run checkout's
+`target/validation-20260923/`: checked fixture
 summaries/raw records, compiler output, source/image snapshots, real-smoke
 commands/output, before/after specs, negative-control record, Collector counters
 and PVC snapshots. This directory is gitignored and is not a permanent shared

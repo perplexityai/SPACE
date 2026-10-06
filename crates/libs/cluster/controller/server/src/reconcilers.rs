@@ -13,6 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use pplx_space_api::controllers::substrate::{NodeApiTarget, Substrate, SubstrateError};
+use pplx_space_api::tls_interception_exemptions::TlsInterceptionExemptions;
 use pplx_space_cluster_pool::WarmPoolStore;
 use pplx_space_cluster_reconciler::{
     TriggerEndpointResolver, TriggerFanoutConfig, TriggerNodeApiTarget, metrics, trigger_fanout,
@@ -189,6 +190,7 @@ pub async fn run_reconcilers(
     pool: PgPool,
     credentials_pool: pplx_space_common_svc::sql::CredentialsPool,
     substrate: Substrate,
+    tls_interception_exemptions: Option<TlsInterceptionExemptions>,
     shutdown_token: CancellationToken,
 ) -> Result<ShutdownOutcome, ReconcilerRuntimeError> {
     // Share substrate clients/caches across all reconcilers in this binary so
@@ -212,6 +214,7 @@ pub async fn run_reconcilers(
                 feature_flags.clone(),
                 pplx_space_common_svc::federated_identity::FederatedIdentityPolicy::from_env()?
                     .grant_audience,
+                tls_interception_exemptions,
             )
             .map_err(ReconcilerRuntimeError::from)
         })?;

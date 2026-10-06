@@ -9098,3 +9098,77 @@ async fn placement_retryability_follows_the_operation_not_the_statement() -> Tes
         .expect("the same placement write succeeds once the row lock is released");
     Ok(())
 }
+
+#[tokio::test]
+async fn retired_pool_reserved_generation_moves_cold_create_past_the_pool_pod() -> TestResult {
+    // A create that could not adopt its warm-pool slot builds cold under the
+    // slot's reserved ID. The slot's pod used generation 1 of that ID, so the
+    // cold execution, and every later restore or wake, must start past it.
+    let fixture = postgres_store().await?;
+    let sandbox_id = SandboxId::new();
+    insert_sandbox(&fixture.pool, sandbox_id, "creating").await?;
+
+    fixture
+        .store
+        .retire_pool_reserved_generation(sandbox_id)
+        .await?;
+    // Idempotent for a retried create.
+    fixture
+        .store
+        .retire_pool_reserved_generation(sandbox_id)
+        .await?;
+
+    let claim = fixture
+        .store
+        .ensure_active_execution_claim(sandbox_id)
+        .await?;
+    assert!(claim.created);
+    assert_eq!(claim.row.generation, 2);
+    assert_eq!(
+        claim.row.pod_name,
+        pplx_space_common_core::kubernetes::sandbox_pod_name(sandbox_id, 2)
+    );
+    assert_ne!(
+        claim.row.pod_name,
+        pplx_space_common_core::kubernetes::sandbox_pod_name(sandbox_id, 1)
+    );
+
+    // Once the sandbox has executions, retiring is a no-op.
+    fixture
+        .store
+        .retire_pool_reserved_generation(sandbox_id)
+        .await?;
+    let rows: Vec<(i64, bool, String)> = sqlx::query_as(sql!(
+        "SELECT generation, active, state
+           FROM sandbox_k8s_executions
+          WHERE sandbox_id = $1
+          ORDER BY generation"
+    ))
+    .bind(sandbox_id)
+    .fetch_all(&fixture.pool)
+    .await?;
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0], (1, false, "replaced".to_string()));
+    assert_eq!(rows[1].0, 2);
+    assert!(rows[1].1);
+
+    // A later activation (restore, wake) continues from generation 2.
+    sqlx::query(sql!(
+        "UPDATE sandbox_k8s_executions
+            SET active = FALSE, state = 'replaced', terminated_at = NOW()
+          WHERE sandbox_id = $1 AND generation = 2"
+    ))
+    .bind(sandbox_id)
+    .execute(&fixture.pool)
+    .await?;
+    let next = fixture
+        .store
+        .ensure_active_execution_claim(sandbox_id)
+        .await?;
+    assert_eq!(next.row.generation, 3);
+    assert_eq!(
+        next.row.pod_name,
+        pplx_space_common_core::kubernetes::sandbox_pod_name(sandbox_id, 3)
+    );
+    Ok(())
+}

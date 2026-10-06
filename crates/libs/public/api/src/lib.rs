@@ -22,6 +22,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 #[cfg(any(feature = "schema", feature = "serde"))]
 mod command;
 pub mod routes;
+mod sandbox;
 #[cfg(feature = "schema")]
 mod schema;
 
@@ -687,6 +688,11 @@ open_wire_enum!(SandboxFailureCode, "sandbox failure code", {
     RuntimeFailure => "runtime_failure",
 });
 
+open_wire_enum!(SandboxIdleAction, "sandbox idle action", {
+    Delete => "delete",
+    Suspend => "suspend",
+});
+
 open_wire_enum!(SandboxConditionType, "sandbox condition type", {
     Ready => "ready",
     NetworkReady => "network_ready",
@@ -1085,6 +1091,46 @@ pub type PublicSandboxMetadata = BTreeMap<String, PublicSandboxMetadataValue>;
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, PartialEq)]
+pub struct SetSandboxTimeoutRequest {
+    #[cfg_attr(
+        feature = "serde",
+        serde(deserialize_with = "sandbox::deserialize_timeout")
+    )]
+    #[cfg_attr(feature = "schema", schemars(with = "String"))]
+    pub timeout: SimpleDuration,
+}
+
+impl SetSandboxTimeoutRequest {
+    pub fn timeout_secs(&self) -> Result<u32, PublicApiParseError> {
+        let seconds = sandbox::idle_timeout_secs(self.timeout)?;
+        u32::try_from(seconds)
+            .map_err(|_| PublicApiParseError("timeout exceeds 4294967295 seconds"))
+    }
+}
+
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, PartialEq)]
+pub struct SetSandboxTimeoutResponse {
+    #[cfg_attr(
+        feature = "schema",
+        schemars(schema_with = "schema::public_sandbox_id")
+    )]
+    pub sandbox_id: PublicSandboxId,
+    pub idle_timeout: String,
+    /// Conservative running deadline estimate, assuming node and API clocks agree within five
+    /// seconds, clamped to the observation time. Dormant sandboxes report their stored deadline.
+    #[cfg_attr(feature = "serde", serde(with = "time::serde::rfc3339::option"))]
+    #[cfg_attr(
+        feature = "schema",
+        schemars(schema_with = "schema::optional_date_time")
+    )]
+    pub expires_at: Option<time::OffsetDateTime>,
+}
+
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, PartialEq)]
 pub struct CreateSandboxRequest {
     #[cfg_attr(
         feature = "schema",
@@ -1125,6 +1171,62 @@ pub struct CreateSandboxRequest {
         schemars(schema_with = "schema::optional_auto_lifecycle_policy")
     )]
     pub auto_lifecycle: Option<AutoLifecyclePolicy>,
+    /// Positive compact idle duration, such as `600s` or `1.5m`, resolving to
+    /// whole seconds within the supported deadline range. Omit for the default.
+    #[cfg_attr(
+        feature = "serde",
+        serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "sandbox::deserialize_idle_timeout"
+        )
+    )]
+    #[cfg_attr(
+        feature = "schema",
+        schemars(schema_with = "schema::optional_incubating_string")
+    )]
+    pub idle_timeout: Option<SimpleDuration>,
+    /// Action after the idle duration: delete or suspend. Defaults to suspend
+    /// when idle_timeout is provided. Cannot be combined with auto_lifecycle.
+    /// Suspend allows waking on access; delete does not.
+    #[cfg_attr(
+        feature = "serde",
+        serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "sandbox::deserialize_idle_action"
+        )
+    )]
+    #[cfg_attr(
+        feature = "schema",
+        schemars(schema_with = "schema::optional_incubating_idle_action_input")
+    )]
+    pub idle_action: Option<SandboxIdleAction>,
+}
+
+impl CreateSandboxRequest {
+    pub fn idle_timeout_secs(&self) -> Result<Option<u64>, PublicApiParseError> {
+        if (self.idle_timeout.is_some() || self.idle_action.is_some())
+            && self.auto_lifecycle.is_some()
+        {
+            return Err(PublicApiParseError(
+                "idle settings cannot be combined with auto_lifecycle",
+            ));
+        }
+        if self.idle_timeout.is_none() && self.idle_action.is_some() {
+            return Err(PublicApiParseError("idle_action requires idle_timeout"));
+        }
+        if self
+            .idle_action
+            .as_ref()
+            .is_some_and(|action| !action.is_known())
+        {
+            return Err(PublicApiParseError("idle_action must be delete or suspend"));
+        }
+        self.idle_timeout
+            .map(sandbox::idle_timeout_secs)
+            .transpose()
+    }
 }
 
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
@@ -1191,6 +1293,31 @@ pub struct PublicSandbox {
     /// Null fields mean no explicit value was recorded, not zero capacity.
     pub resources: SandboxResources,
     pub metadata: PublicSandboxMetadata,
+    /// Stored idle deadline; null when no automatic lifecycle event is scheduled.
+    #[cfg_attr(
+        feature = "serde",
+        serde(with = "time::serde::rfc3339::option", default)
+    )]
+    #[cfg_attr(
+        feature = "schema",
+        schemars(schema_with = "schema::optional_incubating_date_time")
+    )]
+    pub expires_at: Option<time::OffsetDateTime>,
+    /// Idle duration in seconds, such as `600s`, for a single access-idle stage.
+    /// Null when the policy cannot be represented by idle_timeout and idle_action.
+    #[cfg_attr(feature = "serde", serde(default))]
+    #[cfg_attr(
+        feature = "schema",
+        schemars(schema_with = "schema::optional_incubating_string")
+    )]
+    pub idle_timeout: Option<String>,
+    /// Action paired with idle_timeout; null for policies with other shapes.
+    #[cfg_attr(feature = "serde", serde(default))]
+    #[cfg_attr(
+        feature = "schema",
+        schemars(schema_with = "schema::optional_incubating_idle_action")
+    )]
+    pub idle_action: Option<SandboxIdleAction>,
     #[cfg_attr(feature = "serde", serde(with = "time::serde::rfc3339"))]
     #[cfg_attr(feature = "schema", schemars(schema_with = "schema::date_time"))]
     pub created_at: time::OffsetDateTime,

@@ -15,6 +15,10 @@ import "template/manager/v1/manager.proto";
 service ClusterApi {
   rpc ListNodes(ListNodesRequest) returns (ListNodesResponse);
 
+  // Delegate one system publication to a build. Only a system-only publisher
+  // may issue these grants; a dual-authority build-manager cannot authorize itself.
+  rpc CreateSystemTemplatePublicationGrant(CreateSystemTemplatePublicationGrantRequest) returns (CreateSystemTemplatePublicationGrantResponse);
+
   // Register a template. Fails with ALREADY_EXISTS if `name` is already taken.
   rpc RegisterTemplate(RegisterTemplateRequest) returns (RegisterTemplateResponse);
 
@@ -280,10 +284,20 @@ message TemplateReleaseStorageLocation {
   string created_at = 3;    // RFC3339
 }
 
+message CreateSystemTemplatePublicationGrantRequest {
+  string template_name = 1;
+}
+
+message CreateSystemTemplatePublicationGrantResponse {
+  string grant_id = 1;
+}
+
 message RegisterTemplateRequest {
   string name = 1;
   optional string description = 2;
   optional string org_id = 4;
+  // One build submission's system publication authorization.
+  optional string system_publication_grant_id = 5;
 }
 
 message RegisterTemplateResponse {
@@ -309,6 +323,8 @@ message RegisterTemplateReleaseRequest {
   // `(template_name, hash)`, so the first registration that carries this wins;
   // later registrations never overwrite stored execution metadata.
   optional space.execution.v1.ExecutionMetadata execution = 8;
+  // Consumed atomically with the release; never substitutes another build's grant.
+  optional string system_publication_grant_id = 9;
 }
 
 message RegisterTemplateReleaseResponse {
@@ -1018,6 +1034,24 @@ message FinalizeArtifactBackupRequest {
   SuspendSnapshotTerminalState target_state = 2;
   int64 bytes_uploaded = 3;
   optional string failure_reason = 4;
+  // Digests of the artifacts this attempt uploaded. Recorded only for READY
+  // and write-once: a replay must repeat the same digests.
+  repeated SnapshotArtifactDigest artifact_digests = 5;
+}
+
+// Content digest of one artifact file in a backup attempt, reported by the
+// uploading node and handed back to restore so the bytes it pulls are
+// verified against the catalog rather than trusted from the object store.
+message SnapshotArtifactDigest {
+  // Canonical file name under the attempt prefix: `memfile`, `binfile`,
+  // `rootfs`, `rootfs.btrfs-send`, `snapshot.luks`, `cow.luks`, or
+  // `metadata.json`.
+  string artifact = 1;
+  // `sha256:<64 lowercase hex>` over the artifact bytes as they exist on the
+  // node, before any transfer compression or encryption.
+  string digest = 2;
+  // Size in bytes of the same bytes the digest covers.
+  uint64 size_bytes = 3;
 }
 
 message FinalizeArtifactBackupResponse {}
@@ -1041,6 +1075,8 @@ message GetArtifactBackupLocationResponse {
   string backup_attempt_id = 3;
   string storage_uri = 4;
   int64 bytes_uploaded = 5;
+  // Empty for attempts finalized before digests were recorded.
+  repeated SnapshotArtifactDigest artifact_digests = 6;
 }
 
 message GetQuarantineRecoveryPlanRequest {
@@ -1101,4 +1137,6 @@ message GetSuspendSnapshotLocationResponse {
   string storage_uri = 2;
   // Total compressed bytes of all VM artifacts that were uploaded.
   int64 bytes_uploaded = 3;
+  // Empty for snapshots finalized before digests were recorded.
+  repeated SnapshotArtifactDigest artifact_digests = 4;
 }

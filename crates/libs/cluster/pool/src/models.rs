@@ -183,6 +183,19 @@ pub struct ClaimedPoolSlot {
     pub k8s_node_name: Option<String>,
 }
 
+/// The slot reserving a given sandbox ID, read under a row lock for a create
+/// that was admitted against that slot. `state` and `claim_id` are what the
+/// caller checks before adopting: only a `claimed` slot carrying the admitted
+/// claim id is the caller's to adopt.
+#[derive(Debug, Clone)]
+pub struct ReservedPoolSlot {
+    pub slot: ClaimedPoolSlot,
+    pub template_release_id: Uuid,
+    pub content_hash: String,
+    pub state: crate::PoolSlotState,
+    pub claim_id: Option<Uuid>,
+}
+
 #[derive(Debug, Clone)]
 pub struct NewPoolSlot<'a> {
     pub config_id: Uuid,

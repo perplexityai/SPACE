@@ -1592,19 +1592,11 @@ async fn api_key_belongs_to_org(
         return Ok(false);
     };
 
-    sqlx::query_scalar::<_, bool>(sql!(
-        "SELECT EXISTS (
-             SELECT 1
-             FROM api_keys
-             WHERE org_id = $1
-               AND key_hash = $2
-         )"
-    ))
-    .bind(org_id.as_uuid())
-    .bind(api_key_sha256)
-    .fetch_one(pool)
-    .await
-    .map_err(|error| Status::internal(format!("validate sandbox service route api key: {error}")))
+    crate::api_key_store::authorizes_ecw_sandbox(pool, api_key_sha256, org_id)
+        .await
+        .map_err(|error| {
+            Status::internal(format!("validate sandbox service route api key: {error}"))
+        })
 }
 
 fn token_matches_ecw_credential(

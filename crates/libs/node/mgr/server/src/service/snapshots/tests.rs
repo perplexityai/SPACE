@@ -1,6 +1,7 @@
 use super::{
-    ENC_SNAPSHOT_MEMORY_NAME, ENC_SNAPSHOT_VMSTATE_NAME, reown_encrypted_snapshot_inputs,
-    set_snapshot_export_modes, validate_cache_artifact_path,
+    ENC_SNAPSHOT_JAIL_SUBDIR, ENC_SNAPSHOT_MEMORY_NAME, ENC_SNAPSHOT_VMSTATE_NAME,
+    pin_encrypted_snapshot_bind, reown_encrypted_snapshot_inputs, set_snapshot_export_modes,
+    validate_cache_artifact_path,
 };
 use std::os::unix::fs::PermissionsExt;
 
@@ -173,6 +174,45 @@ fn encrypted_load_rejects_links_before_changing_ownership() {
     }
 }
 
+#[test]
+fn encrypted_bind_target_is_pinned_inside_the_jail() {
+    use std::os::unix::fs::{MetadataExt, symlink};
+
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let (volume, jail, outside) = (root.join("volume"), root.join("jail"), root.join("outside"));
+    for dir in [&volume, &jail, &outside] {
+        std::fs::create_dir(dir).unwrap();
+    }
+    let target = jail.join(ENC_SNAPSHOT_JAIL_SUBDIR);
+    symlink(&outside, &target).unwrap();
+
+    // Suspend and restore share this pin; neither may follow the planted link.
+    let mut reowned = false;
+    let error = pin_encrypted_snapshot_bind(&volume, &jail, |_, _| {
+        reowned = true;
+        Ok(())
+    })
+    .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition, "{error}");
+    assert!(!reowned, "volume re-owned before its mountpoint was pinned");
+    assert!(std::fs::read_dir(&outside).unwrap().next().is_none());
+
+    std::fs::remove_file(&target).unwrap();
+    let (pinned_volume, pinned_target) =
+        pin_encrypted_snapshot_bind(&volume, &jail, |_, _| Ok(())).unwrap();
+    assert_eq!(
+        pinned_volume.metadata().unwrap().ino(),
+        std::fs::metadata(&volume).unwrap().ino()
+    );
+    let created = std::fs::symlink_metadata(&target).unwrap();
+    assert!(created.is_dir());
+    assert_eq!(pinned_target.metadata().unwrap().ino(), created.ino());
+    // A retry reuses the existing mountpoint.
+    let (_, retried) = pin_encrypted_snapshot_bind(&volume, &jail, |_, _| Ok(())).unwrap();
+    assert_eq!(retried.metadata().unwrap().ino(), created.ino());
+}
+
 fn cache_root() -> &'static str {
     pplx_space_common_core::host::linux::paths::SPACE_CACHE_DIR
 }
@@ -293,4 +333,63 @@ async fn a_firecracker_that_never_answers_fails_a_pause_state_change_at_its_dead
         assert!(started.elapsed() < std::time::Duration::from_secs(5));
     }
     silent.abort();
+}
+
+async fn service_with_stop(
+    code: tonic::Code,
+    failures: usize,
+) -> (
+    crate::service::NodeManagerService,
+    pplx_space_common_core::types::SandboxId,
+    tempfile::TempDir,
+    crate::runtime_supervisor_client::tests::StubSupervisorServer,
+) {
+    let (socket, client, server) =
+        crate::runtime_supervisor_client::tests::flaky_stop_client(code, failures).await;
+    let mut service = crate::service::tests::service_tests::service_for_unit_tests().await;
+    service.runtime_supervisor = client;
+    let id = pplx_space_common_core::types::SandboxId::new();
+    let fence = pplx_space_node_mgr_client::execution_fence::ExecutionFence::new(
+        pplx_space_common_core::types::SandboxActivationAttemptId::new(),
+        None,
+    );
+    service.pool.bind_execution(&id.to_string(), fence).unwrap();
+    (service, id, socket, server)
+}
+
+#[tokio::test]
+async fn encrypted_seal_stop_retries_while_the_runtime_is_still_exiting() {
+    let (service, id, _socket, server) = service_with_stop(tonic::Code::Internal, 2).await;
+
+    super::stop_runtime_for_encrypted_seal(&service, &id.to_string())
+        .await
+        .expect("stop succeeds once the runtime finishes exiting");
+
+    crate::runtime_supervisor_client::tests::stop_supervisor_server(server).await;
+}
+
+#[tokio::test]
+async fn encrypted_seal_stop_gives_up_after_the_attempt_cap() {
+    let (service, id, _socket, server) =
+        service_with_stop(tonic::Code::Internal, super::ENC_CAPTURE_STOP_ATTEMPTS).await;
+
+    let error = super::stop_runtime_for_encrypted_seal(&service, &id.to_string())
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::Internal);
+
+    crate::runtime_supervisor_client::tests::stop_supervisor_server(server).await;
+}
+
+#[tokio::test]
+async fn encrypted_seal_stop_does_not_retry_other_failures() {
+    let (service, id, _socket, server) =
+        service_with_stop(tonic::Code::FailedPrecondition, 1).await;
+
+    let error = super::stop_runtime_for_encrypted_seal(&service, &id.to_string())
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+
+    crate::runtime_supervisor_client::tests::stop_supervisor_server(server).await;
 }

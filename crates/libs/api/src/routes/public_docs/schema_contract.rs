@@ -151,6 +151,7 @@ pub(super) fn insert_generated_m1_schemas(spec: &mut Value) {
     let mut request_generator = settings.clone().for_deserialize().into_generator();
     request_generator.subschema_for::<pplx_space_public_api::credential_references::RegisterCredentialReferenceRequest>();
     request_generator.subschema_for::<pplx_space_public_api::CreateSandboxRequest>();
+    request_generator.subschema_for::<pplx_space_public_api::SetSandboxTimeoutRequest>();
     request_generator.subschema_for::<pplx_space_public_api::CreateCommandRequest>();
     request_generator.subschema_for::<pplx_space_public_api::ProcessSignalRequest>();
     request_generator.subschema_for::<pplx_space_public_api::RollbackSandboxRequest>();
@@ -159,6 +160,7 @@ pub(super) fn insert_generated_m1_schemas(spec: &mut Value) {
     response_generator
         .subschema_for::<pplx_space_public_api::credential_references::CredentialReference>();
     response_generator.subschema_for::<pplx_space_public_api::SandboxOperationResponse>();
+    response_generator.subschema_for::<pplx_space_public_api::SetSandboxTimeoutResponse>();
     response_generator
         .subschema_for::<pplx_space_public_api::PublicPage<pplx_space_public_api::PublicSandbox>>();
     response_generator.subschema_for::<pplx_space_public_api::PublicSandbox>();

@@ -117,6 +117,26 @@ pub(super) fn insert_sandbox_operation_paths(
     paths: &mut Map<String, Value>,
     idempotency_key_parameter: &Value,
 ) {
+    insert_public_route(
+        paths,
+        pplx_space_public_api::routes::SET_SANDBOX_TIMEOUT,
+        json!({
+            "summary": "Set the sandbox idle timeout",
+            "description": "Sets the idle timeout and restarts the idle clock from now. Accepts only a single access-idle delete or suspend rule that can be preserved by the timeout controller; custom wake configurations are rejected. The action and wake settings are preserved. Timeout must resolve to positive whole seconds, at most 4294967295 seconds (for example, 1.5m becomes 90s). Paused or suspended sandboxes persist the timeout without waking; it takes effect once running again, and expires_at reports the stored deadline, which may be null. For a running sandbox, expires_at is a conservative estimate captured before the node call, assuming node and API clocks agree within five seconds, clamped to the observation time; getSandbox reports the published deadline once available. Retry with the same Idempotency-Key to receive the original response without restarting the clock again.",
+            "parameters": [idempotency_key_parameter.clone()],
+            "requestBody": {"required":true,"content":{"application/json":{"schema":{"$ref":"#/components/schemas/SetSandboxTimeoutRequest"}}}},
+            "responses": {
+                "200":{"description":"Idle timeout updated","content":{"application/json":{"schema":{"$ref":"#/components/schemas/SetSandboxTimeoutResponse"}}}},
+                "400":{"description":"Invalid timeout, sandbox identifier or idempotency key"},
+                "401":{"description":"Authentication required"},
+                "404":{"description":"Sandbox not found in your organization"},
+                "409":{"description":"Idempotency conflict"},
+                "412":{"description":"Terminal sandbox, unsupported policy or execution changed"},
+                "500":{"description":"Timeout update failed internally"},
+                "503":{"description":"Deadline update could not be acknowledged; retry"}
+            }
+        }),
+    );
     insert_credential_reference_paths(paths);
     insert_public_route(
         paths,

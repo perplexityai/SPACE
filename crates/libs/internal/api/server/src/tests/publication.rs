@@ -6,6 +6,7 @@ async fn publication_requires_authenticated_authority_before_any_write() -> Test
     let service = ClusterApiService::new(db.pool.clone());
     let error = service
         .register_template(Request::new(RegisterTemplateRequest {
+            system_publication_grant_id: None,
             name: "seed".into(),
             description: None,
             org_id: None,
@@ -15,6 +16,7 @@ async fn publication_requires_authenticated_authority_before_any_write() -> Test
     assert_eq!(error.code(), Code::PermissionDenied);
     let error = service
         .register_template_release(Request::new(RegisterTemplateReleaseRequest {
+            system_publication_grant_id: None,
             template_name: "seed".into(),
             runtime: "fc".into(),
             hash: format!("sha256:{}", "a".repeat(64)),

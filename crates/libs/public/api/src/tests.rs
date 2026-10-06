@@ -173,10 +173,23 @@ fn public_wire_enums_use_canonical_strings() {
         SandboxFailureCode::RuntimeFailure.to_string(),
         "runtime_failure"
     );
+    for action in SandboxIdleAction::ALL {
+        assert_eq!(
+            action.as_str().parse::<SandboxIdleAction>().unwrap(),
+            *action
+        );
+    }
     "terminal_connect".parse::<DataPlaneScope>().unwrap_err();
 
     #[cfg(feature = "serde")]
     {
+        let future_action: SandboxIdleAction =
+            serde_json::from_value(serde_json::json!("hibernate")).unwrap();
+        assert!(!future_action.is_known());
+        assert_eq!(
+            serde_json::to_value(future_action).unwrap(),
+            serde_json::json!("hibernate")
+        );
         assert_eq!(
             serde_json::to_value(OperationState::Queued).unwrap(),
             serde_json::json!("queued")
@@ -199,6 +212,73 @@ fn public_wire_enums_use_canonical_strings() {
         assert_eq!(
             serde_json::from_value::<SessionTargetProtocol>(serde_json::json!("http")).unwrap(),
             SessionTargetProtocol::Http
+        );
+    }
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn sandbox_idle_timeout_wire_parsing_matches_whole_second_stage_limits() {
+    for (timeout, expected_seconds) in [
+        (serde_json::Value::Null, Some(None)),
+        (serde_json::json!("600s"), Some(Some(600))),
+        (serde_json::json!("1.5m"), Some(Some(90))),
+        (serde_json::json!("0.5h"), Some(Some(1800))),
+        (serde_json::json!("1d"), Some(Some(86400))),
+        (serde_json::json!(" 600s "), Some(Some(600))),
+        (
+            serde_json::json!("9223372036854775807s"),
+            Some(Some(i64::MAX as u64)),
+        ),
+        (
+            serde_json::json!("153722867280912930m"),
+            Some(Some(9_223_372_036_854_775_800)),
+        ),
+        (serde_json::json!("0s"), None),
+        (serde_json::json!("0.0m"), None),
+        (serde_json::json!("1.5s"), None),
+        (serde_json::json!("0.001m"), None),
+        (serde_json::json!("1.0000000001s"), None),
+        (serde_json::json!("9223372036854775808s"), None),
+        (serde_json::json!("153722867280912931m"), None),
+        (serde_json::json!("18446744073709551616s"), None),
+        (serde_json::json!("-1s"), None),
+        (serde_json::json!("500ms"), None),
+        (serde_json::json!(""), None),
+        (serde_json::json!(600), None),
+        (serde_json::json!(false), None),
+    ] {
+        let request = serde_json::json!({ "template": "seed", "idle_timeout": timeout });
+        let parsed = serde_json::from_value::<CreateSandboxRequest>(request.clone());
+        match expected_seconds {
+            Some(seconds) => assert_eq!(
+                parsed.unwrap().idle_timeout_secs().unwrap(),
+                seconds,
+                "{request}"
+            ),
+            None => assert!(parsed.is_err(), "{request}"),
+        }
+    }
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn sandbox_idle_action_is_closed_on_input() {
+    for (action, accepted) in [
+        (serde_json::Value::Null, true),
+        (serde_json::json!("delete"), true),
+        (serde_json::json!("suspend"), true),
+        (serde_json::json!("pause"), false),
+        (serde_json::json!("stop"), false),
+        (serde_json::json!("hibernate"), false),
+        (serde_json::json!(12), false),
+        (serde_json::json!(false), false),
+    ] {
+        let request = serde_json::json!({ "template": "seed", "idle_timeout": "600s", "idle_action": action });
+        assert_eq!(
+            serde_json::from_value::<CreateSandboxRequest>(request.clone()).is_ok(),
+            accepted,
+            "{request}"
         );
     }
 }
@@ -271,6 +351,9 @@ fn public_sandbox_failure_code_has_an_exact_nullable_wire_shape() {
             disk_mib: None,
         },
         metadata: PublicSandboxMetadata::new(),
+        expires_at: None,
+        idle_timeout: None,
+        idle_action: None,
         created_at: timestamp,
         updated_at: timestamp,
     };
@@ -291,15 +374,25 @@ fn public_sandbox_failure_code_has_an_exact_nullable_wire_shape() {
                 "disk_mib": null
             },
             "metadata": {},
+            "expires_at": null,
+            "idle_timeout": null,
+            "idle_action": null,
             "created_at": "1970-01-01T00:00:00Z",
             "updated_at": "1970-01-01T00:00:00Z"
         })
     );
 
     sandbox.failure_code = None;
-    let serialized = serde_json::to_value(&sandbox).unwrap();
+    let mut serialized = serde_json::to_value(&sandbox).unwrap();
     assert_eq!(serialized["failure_code"], serde_json::Value::Null);
     assert!(serialized.get("failure_reason").is_none());
+    for field in ["expires_at", "idle_timeout", "idle_action"] {
+        serialized.as_object_mut().unwrap().remove(field);
+    }
+    assert_eq!(
+        serde_json::from_value::<PublicSandbox>(serialized).unwrap(),
+        sandbox
+    );
 }
 
 #[cfg(feature = "serde")]
@@ -658,4 +751,35 @@ fn operation_result_uses_tagged_public_contract() {
         serde_json::from_value::<PublicOperationResult>(encoded).unwrap(),
         fork
     );
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn set_timeout_uses_whole_second_duration_parsing_and_uint32_limit() {
+    for (timeout, expected) in [
+        ("1s", Some(1)),
+        ("1.5m", Some(90)),
+        ("0.5h", Some(1800)),
+        ("4294967295s", Some(u32::MAX)),
+        ("4294967296s", None),
+        ("0s", None),
+        ("1.5s", None),
+        ("nope", None),
+    ] {
+        let request = serde_json::from_value::<SetSandboxTimeoutRequest>(
+            serde_json::json!({"timeout": timeout}),
+        );
+        assert_eq!(
+            request.ok().and_then(|request| request.timeout_secs().ok()),
+            expected,
+            "{timeout}"
+        );
+    }
+    for value in [
+        serde_json::json!({}),
+        serde_json::json!({"timeout": null}),
+        serde_json::json!({"timeout": 60}),
+    ] {
+        serde_json::from_value::<SetSandboxTimeoutRequest>(value).unwrap_err();
+    }
 }

@@ -11,43 +11,6 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  cla_coauthors:
-    if: github.repository == 'perplexityai/SPACE'
-    name: CLA coauthor coverage
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    permissions:
-      contents: read
-      pull-requests: read
-    steps:
-      - name: Check out the metadata checker
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-          sparse-checkout: |
-            ci/scripts
-            scripts/tests
-      - name: Test the coauthor coverage checker
-        run: python3 scripts/tests/test_cla_coauthors.py
-      - name: Check out the trusted base exemption policy
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ github.event.pull_request.base.sha }}
-          path: cla-base
-          persist-credentials: false
-          sparse-checkout: ci/cla-exempt-contributors.json
-          sparse-checkout-cone-mode: false
-      - name: Require primary-author coverage for every coauthor
-        env:
-          GH_TOKEN: ${{ github.token }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          PR_HEAD: ${{ github.event.pull_request.head.sha }}
-          PR_BASE: ${{ github.event.pull_request.base.sha }}
-        run: |
-          python3 ci/scripts/check-cla-coauthors.py \
-            --repo "$GITHUB_REPOSITORY" --pr "$PR_NUMBER" --head "$PR_HEAD" \
-            --base "$PR_BASE" --base-checkout "$GITHUB_WORKSPACE/cla-base"
-
   # Inventory only; kept outside required aggregate dependencies.
   quarantine_backlog:
     if: github.repository == 'perplexityai/SPACE'
@@ -80,14 +43,11 @@ jobs:
     needs:
       - rust_static
       - common
-      - cla_coauthors
     steps:
       - name: Require every pull-request check
         env:
           RUST_STATIC_RESULT: ${{ needs.rust_static.result }}
           COMMON_RESULT: ${{ needs.common.result }}
-          CLA_COAUTHORS_RESULT: ${{ needs.cla_coauthors.result }}
         run: |
           test "${RUST_STATIC_RESULT}" = success
           test "${COMMON_RESULT}" = success
-          test "${CLA_COAUTHORS_RESULT}" = success

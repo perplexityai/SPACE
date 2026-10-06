@@ -23,6 +23,8 @@ message StartBuildRequest {
   // Caller organization: authorizes the base and owns the published template.
   // Omitted only for trusted local/system builds.
   optional string org_id = 7;
+  // Authorization issued before dispatch, retained through publication.
+  optional string system_publication_grant_id = 8;
 }
 
 message BuildOptions {

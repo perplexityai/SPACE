@@ -94,8 +94,8 @@ in. Readiness/liveness use `/api/health`. Upgrade uses Recreate (one replica).
 Background analytics, update checks and plugin preinstallation are disabled.
 
 Validated on 2026-09-23 against Kind API `https://127.0.0.1:37403` (cluster UID
-`155bf3b0-7530-4a08-8a71-6a0c72fb678d`). Chart source is based on main
-`23124daee2c3c01fad79e4453d8bbb4a51670a0f`. Helm render/lint and live datasource
+`155bf3b0-7530-4a08-8a71-6a0c72fb678d`). Chart source is based on main as
+of that date. Helm render/lint and live datasource
 checks passed (Prometheus-only, Loki-only, Tempo-only and all-signal rendering).
 The existing Datadog cluster-coverage guard passed 37 tests and 15 subtests.
 After separation, the unchanged Prometheus retained 18 API create

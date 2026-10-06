@@ -21,8 +21,8 @@ variable "github_oidc_subject_prefixes" {
   type        = list(string)
   nullable    = false
   default = [
-    "repo:perplexityai@185426709/SPACE@1370731206",
     "repo:perplexityai@185426709/SPACE@1400568925",
+    "repo:perplexityai@185426709/SPACE@1407686799",
   ]
 
   validation {

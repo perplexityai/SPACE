@@ -60,6 +60,10 @@ pub struct AppState {
 #[derive(Debug, thiserror::Error)]
 pub enum AppStateError {
     #[error(transparent)]
+    TlsInterceptionExemptions(
+        #[from] crate::tls_interception_exemptions::TlsInterceptionExemptionsConfigError,
+    ),
+    #[error(transparent)]
     FalconEgress(#[from] crate::falcon_egress::FalconEgressConfigError),
     #[error("federated identity configuration failed: {0}")]
     FederatedIdentity(#[from] crate::federated_identity::FederatedIdentityPolicyError),
@@ -106,6 +110,8 @@ impl AppState {
     ) -> Result<Self, AppStateError> {
         let federated_identity = crate::federated_identity::FederatedIdentityConfig::from_env()?;
         let falcon_us2_egress = crate::falcon_egress::FalconUs2Egress::from_env()?;
+        let tls_interception_exemptions =
+            crate::tls_interception_exemptions::TlsInterceptionExemptions::from_env()?;
         let feature_flags = pplx_space_feature_flags::FeatureFlagClient::from_env();
         let client_classification = crate::client_classification::ClientClassification::from_env()?;
         // Cloned into the substrate, which consumes both, so the limiter
@@ -129,7 +135,8 @@ impl AppState {
             )
             .with_route_ed25519_authority(route_ed25519_authority)
             .with_federated_grant_audience(federated_identity.policy.grant_audience.clone())
-            .with_falcon_us2_egress(falcon_us2_egress);
+            .with_falcon_us2_egress(falcon_us2_egress)
+            .with_tls_interception_exemptions(tls_interception_exemptions);
         let template_controller =
             crate::controllers::template::TemplateController::new(substrate.clone(), pool.clone());
         let client_concurrency =

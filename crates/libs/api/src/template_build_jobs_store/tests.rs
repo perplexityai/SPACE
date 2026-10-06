@@ -404,3 +404,46 @@ async fn legacy_build_reads_respect_a_registered_template_owner(
     );
     Ok(())
 }
+
+/// Each system build submission records a fresh grant of its own, grants past
+/// ClusterApi's freshness window are swept on the way, and withdrawing one
+/// submission's grant leaves the others alone.
+#[rstest]
+#[tokio::test]
+async fn system_publication_grants_are_per_submission_and_swept_when_stale(
+    #[future] store_fixture: TestDbResult<StoreFixture>,
+) -> TestDbResult<()> {
+    let fixture = store_fixture.await?;
+    let pool = &fixture.db.pool;
+    let seed = TemplateName::parse("seed").unwrap();
+    sqlx::query(sql!(
+        "INSERT INTO template_system_publication_grants (id, template_name, granted_at)
+         VALUES ($1, 'seed', NOW() - INTERVAL '8 days')"
+    ))
+    .bind(uuid::Uuid::now_v7())
+    .execute(pool)
+    .await?;
+
+    let first = fixture.store.record_system_publication_grant(&seed).await?;
+    let second = fixture.store.record_system_publication_grant(&seed).await?;
+    let grants: Vec<(uuid::Uuid, bool)> = sqlx::query_as(sql!(
+        "SELECT id, granted_at > NOW() - INTERVAL '1 minute'
+         FROM template_system_publication_grants
+         WHERE template_name = 'seed'
+         ORDER BY granted_at, id"
+    ))
+    .fetch_all(pool)
+    .await?;
+    assert_eq!(
+        grants,
+        vec![(first.as_uuid(), true), (second.as_uuid(), true)]
+    );
+
+    fixture.store.revoke_system_publication_grant(first).await?;
+    let remaining: Vec<uuid::Uuid> =
+        sqlx::query_scalar(sql!("SELECT id FROM template_system_publication_grants"))
+            .fetch_all(pool)
+            .await?;
+    assert_eq!(remaining, vec![second.as_uuid()]);
+    Ok(())
+}

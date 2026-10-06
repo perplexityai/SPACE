@@ -210,6 +210,62 @@ fn m1_contract_is_frozen() {
 }
 
 #[test]
+fn timeout_contract_is_synchronous_and_excluded_from_the_release_projection() {
+    let spec = public_openapi_value();
+    let path = pplx_space_public_api::routes::SET_SANDBOX_TIMEOUT.relative_path();
+    let operation = &spec["paths"][path]["post"];
+    assert_eq!(
+        operation[pplx_space_public_api::routes::M1_STATUS_EXTENSION],
+        "incubating"
+    );
+    assert_eq!(
+        operation["requestBody"]["content"]["application/json"]["schema"]["$ref"],
+        "#/components/schemas/SetSandboxTimeoutRequest"
+    );
+    assert_eq!(
+        operation["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
+        "#/components/schemas/SetSandboxTimeoutResponse"
+    );
+    assert!(operation["responses"].get("202").is_none());
+    assert!(
+        operation["parameters"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(
+                |parameter| parameter["name"] == "Idempotency-Key" && parameter["required"] == true
+            )
+    );
+    let schema = &spec["components"]["schemas"]["SetSandboxTimeoutResponse"];
+    let validator = Validator::options()
+        .with_draft(Draft::Draft202012)
+        .build(schema)
+        .unwrap();
+    let mut response = json!({
+        "sandbox_id": pplx_space_public_api::PublicSandboxId::new().to_string(),
+        "idle_timeout": "90s",
+        "expires_at": null
+    });
+    assert!(validator.is_valid(&response));
+    response["expires_at"] = json!("2026-10-06T18:00:00Z");
+    assert!(validator.is_valid(&response));
+    response["expires_at"] = json!(90);
+    assert!(!validator.is_valid(&response));
+    let release = m1_sdk_openapi_value();
+    assert!(release["paths"].get(path).is_none());
+    assert!(
+        release["components"]["schemas"]
+            .get("SetSandboxTimeoutRequest")
+            .is_none()
+    );
+    assert!(
+        release["components"]["schemas"]
+            .get("SetSandboxTimeoutResponse")
+            .is_none()
+    );
+}
+
+#[test]
 fn reference_examples_match_their_schemas() {
     let spec = m1_sdk_openapi_value();
     for (path, schema) in [
@@ -512,6 +568,68 @@ fn m1_openapi_components_are_exactly_the_reachable_closure() {
         reachable, present,
         "M1 components must contain exactly the schemas the document reaches"
     );
+}
+
+#[test]
+fn sandbox_idle_response_fields_are_nullable_incubating_and_extensible() {
+    let spec = public_openapi_value();
+    let schema = &spec["components"]["schemas"]["PublicSandbox"];
+    for field in ["expires_at", "idle_timeout", "idle_action"] {
+        assert_eq!(
+            schema["properties"][field][pplx_space_public_api::routes::M1_STATUS_EXTENSION],
+            "incubating",
+        );
+    }
+    let validator = component_validator(&spec, "PublicSandbox");
+    let mut example = spec["paths"]["/sandboxes/{sandbox_id}"]["get"]["responses"]["200"]
+        ["content"]["application/json"]["examples"]["illustrative"]["value"].clone();
+    validator
+        .validate(&example)
+        .expect("idle configuration example conforms");
+    example["idle_action"] = json!("hibernate");
+    validator
+        .validate(&example)
+        .expect("future idle actions remain valid responses");
+    for field in ["expires_at", "idle_timeout", "idle_action"] {
+        example[field] = Value::Null;
+    }
+    validator
+        .validate(&example)
+        .expect("idle configuration may be null");
+}
+
+#[test]
+fn sandbox_idle_create_fields_are_optional_and_actions_are_closed_on_input() {
+    let spec = public_openapi_value();
+    let schema = &spec["components"]["schemas"]["CreateSandboxRequest"];
+    for field in ["idle_timeout", "idle_action"] {
+        assert_eq!(
+            schema["properties"][field][pplx_space_public_api::routes::M1_STATUS_EXTENSION],
+            "incubating"
+        );
+        assert!(
+            !schema["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!(field))
+        );
+    }
+    let validator = component_validator(&spec, "CreateSandboxRequest");
+    for (action, accepted) in [
+        (Value::Null, true),
+        (json!("delete"), true),
+        (json!("suspend"), true),
+        (json!("pause"), false),
+        (json!("hibernate"), false),
+    ] {
+        let request = json!({ "template": "seed", "idle_timeout": "600s", "idle_action": action });
+        assert_eq!(validator.is_valid(&request), accepted, "{request}");
+        assert_eq!(
+            serde_json::from_value::<CreateSandboxRequest>(request.clone()).is_ok(),
+            accepted,
+            "{request}"
+        );
+    }
 }
 
 #[test]

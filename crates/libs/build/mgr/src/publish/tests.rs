@@ -177,6 +177,7 @@ fn sample_hash() -> ContentHash {
 
 fn sample_template_request() -> RegisterRequest {
     RegisterRequest::Template(RegisterTemplateRequest {
+        system_publication_grant_id: None,
         name: sample_template().as_str().to_string(),
         description: None,
         org_id: None,
@@ -184,22 +185,47 @@ fn sample_template_request() -> RegisterRequest {
 }
 
 #[test]
-fn template_registration_carries_org_for_adoption() {
-    let org =
-        TemplateOrg::parse("00000000-0000-0000-0000-000000000003").expect("valid template org");
-
-    assert_eq!(
-        template_registration_request(&sample_template(), Some(org)),
-        RegisterTemplateRequest {
-            name: "code-runtime".to_string(),
-            description: None,
-            org_id: Some("00000000-0000-0000-0000-000000000003".to_string()),
-        }
-    );
+fn registration_requests_carry_publication_authority() {
+    let org_id = "00000000-0000-0000-0000-000000000003";
+    let grant_id = "018f0000-0000-7000-8000-000000000004";
+    for (publication, expected_org, expected_grant) in [
+        (
+            TemplatePublication::Tenant(TemplateOrg::parse(org_id).unwrap()),
+            Some(org_id),
+            None,
+        ),
+        (
+            TemplatePublication::System(Some(grant_id.parse().unwrap())),
+            None,
+            Some(grant_id),
+        ),
+        (TemplatePublication::System(None), None, None),
+    ] {
+        let template = template_registration_request(&sample_template(), publication);
+        let release = release_registration_request(
+            &sample_template(),
+            sample_hash(),
+            &["latest".to_string()],
+            vec![],
+            publication,
+            None,
+        );
+        assert_eq!(template.org_id.as_deref(), expected_org);
+        assert_eq!(release.org_id.as_deref(), expected_org);
+        assert_eq!(
+            template.system_publication_grant_id.as_deref(),
+            expected_grant
+        );
+        assert_eq!(
+            release.system_publication_grant_id.as_deref(),
+            expected_grant
+        );
+    }
 }
 
 fn sample_release_request() -> RegisterRequest {
     RegisterRequest::Release(RegisterTemplateReleaseRequest {
+        system_publication_grant_id: None,
         template_name: sample_template().as_str().to_string(),
         runtime: RUNTIME_FIRECRACKER_ALIAS.to_string(),
         hash: sample_hash().to_string(),

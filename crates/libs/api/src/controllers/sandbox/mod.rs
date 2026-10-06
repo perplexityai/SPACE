@@ -35,7 +35,7 @@ use pplx_space_sbx_mgr_client::proto::{
     SpacedWriteResponse, StatsRequest, StopRequest, TouchAutoLifecycleRequest,
     TouchAutoLifecycleResponse, UpdateRequest, WakeRequest,
 };
-use sqlx::{FromRow, PgPool};
+use sqlx::{FromRow, PgPool, Postgres, Transaction};
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -500,7 +500,8 @@ fn retry_after_cause_terminal_phase(cause: ControllerRetryAfterCause) -> Reconne
         // Cluster-admission backpressure is a front-door 429, not a reconnect
         // outcome; it shouldn't reach the reconnect terminal path. Map it to the
         // API phase defensively.
-        ControllerRetryAfterCause::ClusterActivationAdmission => ReconnectTerminalPhase::Api,
+        ControllerRetryAfterCause::ClusterActivationAdmission
+        | ControllerRetryAfterCause::PoolSlotRelease => ReconnectTerminalPhase::Api,
     }
 }
 
@@ -511,7 +512,8 @@ fn retry_after_cause_reason(cause: ControllerRetryAfterCause) -> ReconnectReason
         ControllerRetryAfterCause::ProxyUnreachable => ReconnectReason::ProxyUnreachable,
         ControllerRetryAfterCause::GuestNotReady => ReconnectReason::GuestNotReady,
         // See note above: not a reconnect cause. Treat as a retryable wait.
-        ControllerRetryAfterCause::ClusterActivationAdmission => ReconnectReason::WaitBudget,
+        ControllerRetryAfterCause::ClusterActivationAdmission
+        | ControllerRetryAfterCause::PoolSlotRelease => ReconnectReason::WaitBudget,
     }
 }
 
@@ -522,7 +524,8 @@ fn retry_after_cause_outcome(cause: ControllerRetryAfterCause) -> ReconnectOutco
         | ControllerRetryAfterCause::ProxyUnreachable
         | ControllerRetryAfterCause::GuestNotReady
         // See note above: not a reconnect cause. Treat as retryable (exhausted).
-        | ControllerRetryAfterCause::ClusterActivationAdmission => ReconnectOutcome::Exhausted,
+        | ControllerRetryAfterCause::ClusterActivationAdmission
+        | ControllerRetryAfterCause::PoolSlotRelease => ReconnectOutcome::Exhausted,
     }
 }
 
@@ -1004,9 +1007,25 @@ fn sandbox_port_observation_is_fresh(observed_at: time::OffsetDateTime) -> bool 
             - time::Duration::seconds(SANDBOX_PORT_OBSERVATION_FRESHNESS_SECS)
 }
 
+/// Whether a native create may be admitted against a warm-pool slot; see
+/// [`SandboxController::plan_admission_pool_claim`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdmissionPoolPlan {
+    /// Claim a ready slot of this template release.
+    Eligible { template_release_id: Uuid },
+    /// The request cannot adopt a slot, or something the decision needs is
+    /// unknown at admission.
+    Ineligible,
+    /// The template did not resolve to a release. The create's own
+    /// execution reports why.
+    TemplateMiss,
+}
+
 #[derive(Clone)]
 pub struct SandboxController {
     falcon_us2_egress: Option<crate::falcon_egress::FalconUs2Egress>,
+    tls_interception_exemptions:
+        Option<crate::tls_interception_exemptions::TlsInterceptionExemptions>,
     federated_grant_audience: pplx_space_common_core::types::FederatedGrantAudience,
     substrate: Substrate,
     cluster_admission: Option<std::sync::Arc<crate::cluster_admission::ClusterSandboxAdmission>>,
@@ -1024,6 +1043,10 @@ pub type SpacedProcessEventStream = tonic::Streaming<SpacedProcessEvent>;
 #[derive(Debug, thiserror::Error)]
 pub enum SandboxControllerInitError {
     #[error(transparent)]
+    TlsInterceptionExemptions(
+        #[from] crate::tls_interception_exemptions::TlsInterceptionExemptionsConfigError,
+    ),
+    #[error(transparent)]
     FalconEgress(#[from] crate::falcon_egress::FalconEgressConfigError),
     #[error(transparent)]
     Substrate(#[from] super::substrate::SubstrateError),
@@ -1032,6 +1055,14 @@ pub enum SandboxControllerInitError {
 }
 
 impl SandboxController {
+    pub fn with_tls_interception_exemptions(
+        mut self,
+        exemptions: Option<crate::tls_interception_exemptions::TlsInterceptionExemptions>,
+    ) -> Self {
+        self.tls_interception_exemptions = exemptions;
+        self
+    }
+
     pub(crate) fn with_falcon_us2_egress(
         mut self,
         egress: Option<crate::falcon_egress::FalconUs2Egress>,
@@ -1051,6 +1082,7 @@ impl SandboxController {
     pub fn new(substrate: Substrate) -> Self {
         Self {
             falcon_us2_egress: None,
+            tls_interception_exemptions: None,
             federated_grant_audience: crate::federated_identity::FederatedIdentityPolicy::default()
                 .grant_audience,
             substrate,
@@ -1065,6 +1097,7 @@ impl SandboxController {
     ) -> Self {
         Self {
             falcon_us2_egress: None,
+            tls_interception_exemptions: None,
             federated_grant_audience: crate::federated_identity::FederatedIdentityPolicy::default()
                 .grant_audience,
             substrate,
@@ -1397,4 +1430,4 @@ pub use queries::{FederatedSandboxCreateContext, RestoreForkDiskAsNewContext};
 pub use responses::{
     fetch_sandbox, sandbox_query, sandbox_to_response, update_and_fetch_post_wake_sandbox,
 };
-pub(crate) use updates::AutoLifecycleTouchOutcome;
+pub(crate) use updates::{AccessIdleTimeoutOutcome, AutoLifecycleTouchOutcome};

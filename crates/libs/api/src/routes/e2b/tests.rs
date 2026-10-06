@@ -5623,6 +5623,7 @@ async fn timeout_observes_existing_activation_without_retargeting_or_restarting(
             120,
             observed_at,
             deadline,
+            None,
         );
         tokio::pin!(operation);
         // Observe the transaction's real commit before changing activation

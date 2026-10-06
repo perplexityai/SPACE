@@ -428,10 +428,27 @@ DefaultDependencies=no
 After=local-fs.target
 Before=space.target basic.target shutdown.target
 Conflicts=shutdown.target
+# Never stop restarting: the default start limit (5 starts per 10 s) would
+# leave a crash-looping spaced failed for good, and the sandbox unreachable.
+# RestartSec bounds the rate instead; NRestarts and the journal record it.
+StartLimitIntervalSec=0
 
 [Service]
 Type=notify
 NotifyAccess=main
+# READY=1 comes once the bridge listener is bound, well under a second after
+# start; a start that hangs is killed and restarted rather than left waiting
+# for the 90 s default.
+TimeoutStartSec=30
+# Prefer workloads over spaced when the guest runs out of memory: losing spaced
+# makes the sandbox unreachable and, through KillMode, ends every workload
+# anyway. Not -1000: a spaced that is itself the problem must stay killable.
+# Spawned workloads reset their own score to 0 before exec, so they do not
+# inherit this protection.
+OOMScoreAdjust=-900
+# A workload or worker killed by the OOM killer must not stop the service
+# (the default for delegated units, set explicitly).
+OOMPolicy=continue
 # Hand spaced its own cgroup subtree so it can split itself off from the user
 # workloads it spawns: spaced-svc moves into a supervisor/ leaf with a
 # dominating cpu.weight and a memory.min reservation, while workloads land in a

@@ -14,14 +14,15 @@ use uuid::Uuid;
 use crate::{
     ClaimedPoolSlot, ClaimedSlotBindSource, ManualPoolConfigSpec, NewPoolSlot,
     OpenPoolSlotDeleteLock, PoolConfig, PoolConfigOwner, PoolConfigWithCounts, PoolError, PoolSlot,
-    PoolSlotCounts, PoolSlotState, ProtectedTemplateRelease, ReleasePoolConfigWithCounts, Result,
+    PoolSlotCounts, PoolSlotState, ProtectedTemplateRelease, ReleasePoolConfigWithCounts,
+    ReservedPoolSlot, Result,
     models::{
         PoolAutoscaleCandidate, PoolObservedDemand, PoolPolicyRelease, memory_to_mib_i32,
         vcpu_to_i32,
     },
     rows::{
         ClaimedPoolSlotRow, PoolConfigRow, PoolObservedDemandRow, PoolPolicyReleaseRow,
-        PoolSlotCountsRow, PoolSlotRow,
+        PoolSlotCountsRow, PoolSlotRow, ReservedPoolSlotRow,
     },
 };
 
@@ -1323,6 +1324,84 @@ impl WarmPoolStore {
         Ok(source)
     }
 
+    /// Lock and read the slot reserving `reserved_sandbox_id`, in any state.
+    ///
+    /// Used by a create that was admitted against a specific slot (the
+    /// create's public ID is that slot's reserved ID). The caller adopts only
+    /// a `claimed` slot whose claim id matches the one recorded at admission;
+    /// every other answer tells it whether the pool still owns a pod under
+    /// this ID. `reserved_sandbox_id` is unique, so this is at most one row.
+    /// The `FOR UPDATE` lock (no `SKIP LOCKED`) waits out a concurrent sweep
+    /// or bind instead of misreading a locked row as absent.
+    pub async fn lock_reserved_slot(
+        tx: &mut Transaction<'_, Postgres>,
+        reserved_sandbox_id: SandboxId,
+    ) -> Result<Option<ReservedPoolSlot>> {
+        let row = sqlx::query_as::<_, ReservedPoolSlotRow>(sql!(
+            "SELECT id, reserved_sandbox_id, vcpu, memory_mib, disk_mib,
+                    disk_io_max_operations_per_sec, disk_io_max_bandwidth_mib_per_sec,
+                    pod_name, pod_namespace, pod_uid, host(pod_ip) AS pod_ip, k8s_node_name,
+                    template_release_id, content_hash, state, claim_id
+             FROM kubernetes_pool_slots
+             WHERE reserved_sandbox_id = $1
+             FOR UPDATE"
+        ))
+        .bind(reserved_sandbox_id)
+        .fetch_optional(&mut **tx)
+        .await?;
+
+        row.map(TryInto::try_into).transpose()
+    }
+
+    /// Take a `ready` slot out of the claimable inventory without handing it
+    /// to anyone: it becomes a `claimed` row with no claim id, which no bind
+    /// can match and the stale-claimed sweep collects (pod and row) once the
+    /// claim timeout passes. Used when a create owns the slot's reserved ID
+    /// but will not adopt the slot, so no other create may bind that ID.
+    /// `false` means the slot was not `ready`.
+    pub async fn fence_ready_slot(
+        tx: &mut Transaction<'_, Postgres>,
+        slot_id: Uuid,
+    ) -> Result<bool> {
+        let claimed_state = PoolSlotState::Ready.claim()?;
+        let result = sqlx::query(sql!(
+            "UPDATE kubernetes_pool_slots
+             SET state = $1, claim_id = NULL, claimed_at = NOW(), updated_at = NOW()
+             WHERE id = $2
+               AND state = $3"
+        ))
+        .bind(claimed_state.as_str())
+        .bind(slot_id)
+        .bind(PoolSlotState::Ready.as_str())
+        .execute(&mut **tx)
+        .await?;
+
+        Ok(result.rows_affected() == 1)
+    }
+
+    /// Whether the slot reserving `reserved_sandbox_id` is a `cleanup_pending`
+    /// work item, i.e. the warm-pool reconciler still owes that sandbox a pod
+    /// delete and a sandbox finalize.
+    pub async fn reserved_slot_cleanup_pending(
+        &self,
+        reserved_sandbox_id: SandboxId,
+    ) -> Result<bool> {
+        let pending = sqlx::query_scalar::<_, bool>(sql!(
+            "SELECT EXISTS (
+                 SELECT 1
+                 FROM kubernetes_pool_slots
+                 WHERE reserved_sandbox_id = $1
+                   AND state = $2
+             )"
+        ))
+        .bind(reserved_sandbox_id)
+        .bind(PoolSlotState::CleanupPending.as_str())
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(pending)
+    }
+
     /// Which of the given sandbox ids are reserved by a pool slot, in any
     /// state. Deliberately state-free: a slot row's existence means the pool
     /// created that reserved sandbox id (or still holds its receipt), which
@@ -1395,6 +1474,30 @@ impl WarmPoolStore {
         .bind(reserved_sandbox_id)
         .bind(PoolSlotState::Claimed.as_str())
         .execute(&self.pool)
+        .await?;
+
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Transactional form of [`Self::invalidate_claimed_slot`], for a caller
+    /// that already holds the slot's row lock.
+    pub async fn invalidate_claimed_slot_in(
+        tx: &mut Transaction<'_, Postgres>,
+        claim_id: Uuid,
+        reserved_sandbox_id: SandboxId,
+    ) -> Result<bool> {
+        let result = sqlx::query(sql!(
+            "UPDATE kubernetes_pool_slots
+             SET claim_id = NULL,
+                 updated_at = NOW()
+             WHERE claim_id = $1
+               AND reserved_sandbox_id = $2
+               AND state = $3"
+        ))
+        .bind(claim_id)
+        .bind(reserved_sandbox_id)
+        .bind(PoolSlotState::Claimed.as_str())
+        .execute(&mut **tx)
         .await?;
 
         Ok(result.rows_affected() > 0)

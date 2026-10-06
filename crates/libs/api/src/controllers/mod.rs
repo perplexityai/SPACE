@@ -63,6 +63,11 @@ pub enum ControllerRetryAfterCause {
     /// the async dispatcher keys backpressure off this cause so it re-queues
     /// behind the limiter without spending its transient-error retry budget.
     ClusterActivationAdmission,
+    /// A create admitted against a warm-pool slot is waiting for the pool to
+    /// collect a slot that still holds its sandbox ID. Workflow progress, not
+    /// a failure: the async dispatcher re-queues it without spending its
+    /// transient-error retry budget.
+    PoolSlotRelease,
 }
 
 impl ControllerError {
