@@ -154,6 +154,81 @@ fn credmgr_error_context_preserves_machine_readable_reason() {
     assert!(contextualized.message().contains("provider rejected key"));
 }
 
+#[tokio::test(start_paused = true)]
+async fn dek_placement_retry_is_not_found_only_and_returns_the_final_status() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::Poll;
+
+    assert!(
+        DEK_FETCH_TIMEOUT
+            > DEK_PLACEMENT_RETRY_DELAY * u32::try_from(DEK_PLACEMENT_MAX_ATTEMPTS - 1).unwrap()
+    );
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let fetch_calls = calls.clone();
+    let retry = retry_dek_fetch_on_placement_race(move || {
+        let attempt = fetch_calls.fetch_add(1, Ordering::SeqCst) + 1;
+        async move {
+            if attempt == DEK_PLACEMENT_MAX_ATTEMPTS {
+                let mut metadata = tonic::metadata::MetadataMap::new();
+                metadata.insert("placement-proof", "final".parse().unwrap());
+                Err::<(), _>(tonic::Status::with_details_and_metadata(
+                    tonic::Code::NotFound,
+                    "final placement miss",
+                    tonic::codegen::Bytes::from_static(b"final-detail"),
+                    metadata,
+                ))
+            } else {
+                Err::<(), _>(tonic::Status::not_found(format!(
+                    "placement miss {attempt}"
+                )))
+            }
+        }
+    });
+    tokio::pin!(retry);
+
+    assert!(matches!(futures_util::poll!(&mut retry), Poll::Pending));
+    for completed_sleeps in 0..DEK_PLACEMENT_MAX_ATTEMPTS - 1 {
+        assert_eq!(calls.load(Ordering::SeqCst), completed_sleeps + 1);
+        tokio::time::advance(DEK_PLACEMENT_RETRY_DELAY - Duration::from_millis(1)).await;
+        assert!(matches!(futures_util::poll!(&mut retry), Poll::Pending));
+        assert_eq!(calls.load(Ordering::SeqCst), completed_sleeps + 1);
+        tokio::time::advance(Duration::from_millis(1)).await;
+        if completed_sleeps + 1 < DEK_PLACEMENT_MAX_ATTEMPTS - 1 {
+            assert!(matches!(futures_util::poll!(&mut retry), Poll::Pending));
+        }
+    }
+    let error = match futures_util::poll!(&mut retry) {
+        Poll::Ready(Err(error)) => error,
+        other => panic!("tenth NotFound must be returned unchanged, got {other:?}"),
+    };
+    assert_eq!(calls.load(Ordering::SeqCst), DEK_PLACEMENT_MAX_ATTEMPTS);
+    assert_eq!(error.code(), tonic::Code::NotFound);
+    assert_eq!(error.message(), "final placement miss");
+    assert_eq!(error.details(), b"final-detail");
+    assert_eq!(error.metadata().get("placement-proof").unwrap(), "final");
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let fetch_calls = calls.clone();
+    let error = retry_dek_fetch_on_placement_race(move || {
+        fetch_calls.fetch_add(1, Ordering::SeqCst);
+        async {
+            Err::<(), _>(tonic::Status::with_details(
+                tonic::Code::PermissionDenied,
+                "not a placement race",
+                tonic::codegen::Bytes::from_static(b"denied-detail"),
+            ))
+        }
+    })
+    .await
+    .unwrap_err();
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(error.code(), tonic::Code::PermissionDenied);
+    assert_eq!(error.message(), "not a placement race");
+    assert_eq!(error.details(), b"denied-detail");
+}
+
 #[test]
 fn volume_name_accepts_the_snapshot_volume_and_rejects_unsafe_names() {
     assert_eq!(validate_volume_name("snapshot").unwrap(), "snapshot");

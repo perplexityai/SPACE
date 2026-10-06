@@ -22,7 +22,7 @@ use tonic::{Request, Response, Status};
 use crate::auth::{CallerResolver, ClientService, ResolvedCaller};
 use crate::credential_injection_authority::CredentialInjectionAuthority;
 use crate::credential_injection_rpc::CredentialInjectionRpc;
-use crate::credential_store::CredentialStore;
+use crate::credential_store::{CredentialStore, SandboxOwnerScope};
 use crate::envelope;
 use crate::intermediate_ca::csr::NodeCsr;
 use crate::intermediate_ca::{
@@ -430,19 +430,23 @@ impl CredentialManagerService {
         &self,
         request: &Request<T>,
         operation: &'static str,
-    ) -> Result<(), Status> {
+    ) -> Result<SandboxOwnerScope, Status> {
         let caller = self.authorize_caller(
             request,
             operation,
             ALLOW_VOLUME_DEK,
             ALLOW_VOLUME_DEK_SERVICES,
         )?;
-        if matches!(caller, ResolvedCaller::Plaintext) {
-            return Err(Status::permission_denied(format!(
+        match caller {
+            ResolvedCaller::K8sJwt(identity) => Ok(SandboxOwnerScope::KubernetesNode {
+                name: identity.node().node_name().clone(),
+                uid: identity.node().node_uid().clone(),
+            }),
+            ResolvedCaller::UdsPeer(_) => Ok(SandboxOwnerScope::AuthorityOperator),
+            ResolvedCaller::Plaintext => Err(Status::permission_denied(format!(
                 "{operation} requires a mapped node-manager identity"
-            )));
+            ))),
         }
-        Ok(())
     }
 }
 
@@ -743,7 +747,7 @@ impl CredentialManager for CredentialManagerService {
         &self,
         request: Request<GetOrIssueSandboxVolumeDekRequest>,
     ) -> Result<Response<GetOrIssueSandboxVolumeDekResponse>, Status> {
-        self.authorize_volume_caller(&request, "GetOrIssueSandboxVolumeDek")?;
+        let owner_scope = self.authorize_volume_caller(&request, "GetOrIssueSandboxVolumeDek")?;
         let req = request.into_inner();
         let sandbox_id: SandboxId = req
             .sandbox_id
@@ -755,7 +759,7 @@ impl CredentialManager for CredentialManagerService {
         // itself — the whole KEK→DEK chain stays behind this service.
         let owner = self
             .credential_store()?
-            .sandbox_owner(sandbox_id)
+            .sandbox_owner(sandbox_id, owner_scope)
             .await
             .map_err(|e| credential_store_error_to_status("sandbox owner lookup failed", e))?
             .ok_or_else(|| Status::not_found("sandbox not found"))?;

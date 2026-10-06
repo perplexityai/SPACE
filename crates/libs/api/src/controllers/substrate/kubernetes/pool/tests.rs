@@ -421,6 +421,14 @@ async fn postgres_claim_and_bind_pool_slot() -> TestResult {
     assert_eq!(route_activation_id, Some(expected_slot_id));
     assert_ne!(route_activation_id, Some(claim.claim_id));
 
+    let k8s_node_uid: Option<String> = sqlx::query_scalar(sql!(
+        "SELECT k8s_node_uid FROM sandbox_k8s_executions WHERE sandbox_id = $1"
+    ))
+    .bind(slot.sandbox_id)
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(k8s_node_uid.as_deref(), Some("node-uid"));
+
     Ok(())
 }
 

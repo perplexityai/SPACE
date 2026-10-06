@@ -2801,6 +2801,13 @@ impl KubernetesSubstrate {
         pod: &Pod,
         retry: PlacementRetryDisposition,
     ) -> Result<Option<NodeId>, SubstrateError> {
+        let pod_name = pod
+            .metadata
+            .name
+            .as_deref()
+            .ok_or_else(|| SubstrateError::Failed {
+                message: "Kubernetes sandbox pod has no metadata.name".to_string(),
+            })?;
         let Some(node_name) = assigned_pod_node_name(pod) else {
             return Ok(None);
         };
@@ -2844,6 +2851,7 @@ impl KubernetesSubstrate {
             .persist_pod_node_placement_after_pod_exists(
                 PodNodePlacement {
                     sandbox_id,
+                    pod_name,
                     node_name,
                     node_uid,
                     node_id,
@@ -3247,10 +3255,16 @@ impl KubernetesSubstrate {
             return Ok(None);
         }
         let pod_ip = assigned_pod_ip(pod.status.as_ref())?;
+        let current_node_name = assigned_pod_node_name(&pod);
+        let current_node_uid = current_node_name
+            .and_then(|node_name| self.k8s.caches.node_by_name(node_name))
+            .and_then(|node| node.metadata.uid.clone());
         // Let the owned path publish changed routing evidence before returning
         // a client; otherwise ingress would repeatedly resolve stale metadata.
         if row.pod_ip != pod_ip.map(|ip| ip.to_string())
-            || row.k8s_node_name.as_deref() != assigned_pod_node_name(&pod)
+            || row.k8s_node_name.as_deref() != current_node_name
+            || (current_node_name.is_some()
+                && row.k8s_node_uid.as_deref() != current_node_uid.as_deref())
         {
             return Ok(None);
         }
@@ -3438,7 +3452,14 @@ impl KubernetesSubstrate {
         }
 
         let current_node_name = assigned_pod_node_name(&pod).map(str::to_owned);
-        if row.k8s_node_name.as_deref() != current_node_name.as_deref() {
+        let current_node_uid = current_node_name
+            .as_deref()
+            .and_then(|node_name| self.k8s.caches.node_by_name(node_name))
+            .and_then(|node| node.metadata.uid.clone());
+        if row.k8s_node_name.as_deref() != current_node_name.as_deref()
+            || (current_node_name.is_some()
+                && row.k8s_node_uid.as_deref() != current_node_uid.as_deref())
+        {
             let _ = self
                 .remember_pod_node_placement(
                     sandbox_id,

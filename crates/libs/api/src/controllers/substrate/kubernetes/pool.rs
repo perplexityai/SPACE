@@ -500,12 +500,21 @@ pub(super) async fn persist_pooled_execution_claim(
             ControllerError::internal("claimed pool slot missing during execution bind")
         })?;
 
+    // The claimed execution inherits the pool pod's node incarnation so its
+    // volume-key fence holds from the first post-claim node call.
     sqlx::query(sql!(
         "INSERT INTO sandbox_k8s_executions (
              sandbox_id, generation, pod_name, pod_namespace, pod_uid, pod_ip,
-             k8s_node_name, state, active, route_activation_id
+             k8s_node_name, k8s_node_uid, state, active, route_activation_id
          )
-         VALUES ($1, 1, $2, $3, $4, $5::inet, $6, 'running', TRUE, $7)"
+         VALUES (
+             $1, 1, $2, $3, $4, $5::inet, $6,
+             (SELECT k8s_node_uid FROM node_k8s
+              WHERE k8s_node_name = $6 AND k8s_node_uid IS NOT NULL
+              ORDER BY updated_at DESC
+              LIMIT 1),
+             'running', TRUE, $7
+         )"
     ))
     .bind(claim.sandbox_id)
     .bind(&source.pod_name)

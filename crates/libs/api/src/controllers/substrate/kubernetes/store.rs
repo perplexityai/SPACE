@@ -55,6 +55,7 @@ pub(super) struct K8sStore {
 /// proxy-reachability wait.
 pub(super) struct PodNodePlacement<'a> {
     pub sandbox_id: SandboxId,
+    pub pod_name: &'a str,
     pub node_name: &'a str,
     pub node_uid: &'a str,
     pub node_id: NodeId,
@@ -259,6 +260,7 @@ pub(super) struct ActiveExecutionStatusRow {
     pub(super) pod_uid: Option<PodUid>,
     pub(super) pod_ip: Option<String>,
     pub(super) k8s_node_name: Option<String>,
+    pub(super) k8s_node_uid: Option<String>,
     pub(super) current_node_id: Option<NodeId>,
     #[sqlx(try_from = "String")]
     pub(super) state: ActiveExecutionState,
@@ -856,32 +858,42 @@ impl K8sStore {
             .transpose()
     }
 
-    async fn update_active_execution_node_name(
+    async fn update_active_execution_node_identity(
         &self,
         conn: &mut PgConnection,
         sandbox_id: SandboxId,
+        pod_name: Option<&str>,
         node_name: &str,
+        node_uid: &str,
     ) -> Result<bool, SubstrateError> {
         sqlx::query_scalar::<_, bool>(sql!(
             "WITH updated AS (
                 UPDATE sandbox_k8s_executions
-                SET k8s_node_name = $1::TEXT,
+                SET k8s_node_name = $2::TEXT,
+                    k8s_node_uid = $3::TEXT,
                     updated_at = CASE WHEN state = 'recovering' THEN updated_at ELSE NOW() END
-                WHERE sandbox_id = $2 AND active
-                  AND k8s_node_name IS DISTINCT FROM $1::TEXT
+                WHERE sandbox_id = $4 AND active
+                  AND ($1::TEXT IS NULL OR pod_name = $1)
+                  AND (
+                    k8s_node_name IS DISTINCT FROM $2::TEXT
+                    OR k8s_node_uid IS DISTINCT FROM $3::TEXT
+                  )
                 RETURNING 1
              )
              SELECT EXISTS (
                 SELECT 1
                 FROM sandbox_k8s_executions
-                WHERE sandbox_id = $2 AND active
+                WHERE sandbox_id = $4 AND active
+                  AND ($1::TEXT IS NULL OR pod_name = $1)
              )"
         ))
+        .bind(pod_name)
         .bind(node_name)
+        .bind(node_uid)
         .bind(sandbox_id)
         .fetch_one(conn)
         .await
-        .db_context("failed to persist sandbox pod node name")
+        .db_context("failed to persist sandbox pod node identity")
     }
 
     async fn finish_active_execution_in(
@@ -2966,15 +2978,20 @@ impl K8sStore {
         Ok(Some(resulting_state))
     }
 
-    pub(super) async fn persist_pod_node_placement(
+    async fn persist_pod_node_placement_in(
         &self,
-        sandbox_id: SandboxId,
-        node_name: &str,
-        node_uid: &str,
-        node_id: NodeId,
-        role: NodeRole,
-        address: Option<&str>,
+        placement: PodNodePlacement<'_>,
+        require_pod_match: bool,
     ) -> Result<(), SubstrateError> {
+        let PodNodePlacement {
+            sandbox_id,
+            pod_name,
+            node_name,
+            node_uid,
+            node_id,
+            role,
+            address,
+        } = placement;
         let mut tx = self
             .pool
             .begin()
@@ -2998,7 +3015,13 @@ impl K8sStore {
             Self::lock_sandbox_for_execution_mutation_in(&mut tx, sandbox_id).await?;
         if sandbox_exists {
             let active_execution = self
-                .update_active_execution_node_name(&mut tx, sandbox_id, node_name)
+                .update_active_execution_node_identity(
+                    &mut tx,
+                    sandbox_id,
+                    require_pod_match.then_some(pod_name),
+                    node_name,
+                    node_uid,
+                )
                 .await?;
 
             if active_execution {
@@ -3032,7 +3055,32 @@ impl K8sStore {
         Ok(())
     }
 
-    /// [`Self::persist_pod_node_placement`], demoting the whole result when the
+    #[cfg(test)]
+    pub(super) async fn persist_pod_node_placement(
+        &self,
+        sandbox_id: SandboxId,
+        node_name: &str,
+        node_uid: &str,
+        node_id: NodeId,
+        role: NodeRole,
+        address: Option<&str>,
+    ) -> Result<(), SubstrateError> {
+        self.persist_pod_node_placement_in(
+            PodNodePlacement {
+                sandbox_id,
+                pod_name: "",
+                node_name,
+                node_uid,
+                node_id,
+                role,
+                address,
+            },
+            false,
+        )
+        .await
+    }
+
+    /// [`Self::persist_pod_node_placement_in`], demoting the whole result when the
     /// calling operation's retry would not converge.
     ///
     /// This function only ever runs once the pod exists — recording its node
@@ -3054,17 +3102,7 @@ impl K8sStore {
         placement: PodNodePlacement<'_>,
         retry: PlacementRetryDisposition,
     ) -> Result<(), SubstrateError> {
-        let PodNodePlacement {
-            sandbox_id,
-            node_name,
-            node_uid,
-            node_id,
-            role,
-            address,
-        } = placement;
-        let result = self
-            .persist_pod_node_placement(sandbox_id, node_name, node_uid, node_id, role, address)
-            .await;
+        let result = self.persist_pod_node_placement_in(placement, true).await;
         match retry {
             PlacementRetryDisposition::RetryDuplicatesExecution => {
                 result.map_err(SubstrateError::demoted_after_side_effect)
@@ -5049,6 +5087,7 @@ impl K8sStore {
              SET pod_uid = NULL,
                  pod_ip = NULL,
                  k8s_node_name = NULL,
+                 k8s_node_uid = NULL,
                  updated_at = NOW()
              WHERE sandbox_id = $1
                AND generation = $2
@@ -5461,7 +5500,7 @@ impl K8sStore {
         sqlx::query_as(sql!(
             "SELECT e.generation, e.pod_name, NULLIF(BTRIM(e.pod_uid), '') AS pod_uid,
                     host(e.pod_ip) AS pod_ip, s.active_node_id AS current_node_id,
-                    e.k8s_node_name, e.state, s.lifecycle,
+                    e.k8s_node_name, e.k8s_node_uid, e.state, s.lifecycle,
                     e.updated_at <= NOW() - make_interval(secs => $2) AS create_age_expired,
                     e.activation_attempt_id,
                     e.route_activation_id

@@ -889,6 +889,78 @@ async fn inventory_listing_insert_only_does_not_downgrade_ready_node() -> TestRe
     Ok(())
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn pod_placement_persists_the_execution_node_incarnation() -> TestResult {
+    let fixture = postgres_store().await?;
+    let sandbox_id = SandboxId::new();
+    let node_id = NodeId::new();
+    let node_name = format!("space-test-identity-node-{}", node_id.as_uuid().simple());
+    insert_sandbox(&fixture.pool, sandbox_id, "started").await?;
+    let execution = fixture
+        .store
+        .ensure_active_execution_row(sandbox_id)
+        .await?;
+
+    fixture
+        .store
+        .persist_pod_node_placement_after_pod_exists(
+            PodNodePlacement {
+                sandbox_id,
+                pod_name: "stale-sandbox-pod",
+                node_name: &node_name,
+                node_uid: "stale-node-incarnation",
+                node_id,
+                role: NodeRole::Worker,
+                address: Some("10.0.0.30"),
+            },
+            PlacementRetryDisposition::RetryConverges,
+        )
+        .await?;
+    let stale_uid: Option<String> = sqlx::query_scalar(sql!(
+        "SELECT k8s_node_uid
+         FROM sandbox_k8s_executions
+         WHERE sandbox_id = $1 AND active"
+    ))
+    .bind(sandbox_id)
+    .fetch_one(&fixture.pool)
+    .await?;
+    assert_eq!(
+        stale_uid, None,
+        "a stale pod must not retarget an execution"
+    );
+
+    for node_uid in ["first-node-incarnation", "replacement-node-incarnation"] {
+        fixture
+            .store
+            .persist_pod_node_placement_after_pod_exists(
+                PodNodePlacement {
+                    sandbox_id,
+                    pod_name: &execution.pod_name,
+                    node_name: &node_name,
+                    node_uid,
+                    node_id,
+                    role: NodeRole::Worker,
+                    address: Some("10.0.0.30"),
+                },
+                PlacementRetryDisposition::RetryConverges,
+            )
+            .await?;
+    }
+
+    let (stored_name, stored_uid): (Option<String>, Option<String>) = sqlx::query_as(sql!(
+        "SELECT k8s_node_name, k8s_node_uid
+             FROM sandbox_k8s_executions
+             WHERE sandbox_id = $1 AND active"
+    ))
+    .bind(sandbox_id)
+    .fetch_one(&fixture.pool)
+    .await?;
+    assert_eq!(stored_name.as_deref(), Some(node_name.as_str()));
+    assert_eq!(stored_uid.as_deref(), Some("replacement-node-incarnation"));
+
+    Ok(())
+}
+
 /// Pod placement must not own node lifecycle `state`. A live `ready`
 /// node that has a pod placed on it must stay `ready`. The placement
 /// writer previously clobbered `ready` -> `registered` on every pod
@@ -9043,6 +9115,7 @@ async fn placement_retryability_follows_the_operation_not_the_statement() -> Tes
         store.persist_pod_node_placement_after_pod_exists(
             PodNodePlacement {
                 sandbox_id,
+                pod_name: "space-sbx-placement-g1",
                 node_name: "ip-10-0-0-1.ec2.internal",
                 node_uid: "11111111-1111-1111-1111-111111111111",
                 node_id,

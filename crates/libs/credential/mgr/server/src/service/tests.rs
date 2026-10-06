@@ -378,6 +378,16 @@ async fn oversized_plaintext_is_rejected() {
 
 struct TestCredentialStore {
     owner: crate::credential_store::SandboxOwner,
+    expected_scope: crate::credential_store::SandboxOwnerScope,
+}
+
+impl TestCredentialStore {
+    fn authority_operator(owner: crate::credential_store::SandboxOwner) -> Self {
+        Self {
+            owner,
+            expected_scope: crate::credential_store::SandboxOwnerScope::AuthorityOperator,
+        }
+    }
 }
 
 const PERSISTED_WRAP_INVALID_KEY_DETAIL: &str = "provider rejected persisted key";
@@ -420,10 +430,12 @@ impl CredentialStore for TestCredentialStore {
     async fn sandbox_owner(
         &self,
         _sandbox_id: SandboxId,
+        scope: crate::credential_store::SandboxOwnerScope,
     ) -> Result<
         Option<crate::credential_store::SandboxOwner>,
         crate::credential_store::CredentialStoreError,
     > {
+        assert_eq!(scope, self.expected_scope);
         Ok(Some(self.owner))
     }
 }
@@ -506,13 +518,13 @@ fn volume_service_byok(
     .with_kek_store(Arc::new(TestKekStore { rows: kek_rows }))
     .with_volume_wrap_store(store);
     if let Some(owner_org) = sandbox_owner_org {
-        service = service.with_credential_store(Arc::new(TestCredentialStore {
-            owner: crate::credential_store::SandboxOwner {
+        service = service.with_credential_store(Arc::new(TestCredentialStore::authority_operator(
+            crate::credential_store::SandboxOwner {
                 user_id: UserId::new(),
                 org_id: owner_org,
                 byok_enabled,
             },
-        }));
+        )));
     }
     service
 }
@@ -561,6 +573,47 @@ async fn volume_dek_is_one_stable_key_per_sandbox() {
 }
 
 #[tokio::test]
+async fn volume_dek_passes_the_attested_node_incarnation_to_the_store() {
+    let org = OrgId::new();
+    let sandbox_id = SandboxId::new();
+    let owner = crate::credential_store::SandboxOwner {
+        user_id: UserId::new(),
+        org_id: org,
+        byok_enabled: true,
+    };
+    let expected_scope = crate::credential_store::SandboxOwnerScope::KubernetesNode {
+        name: "worker-node".parse().unwrap(),
+        uid: "worker-node-uid".parse().unwrap(),
+    };
+    let service = CredentialManagerService::new(
+        Arc::new(InMemoryKeyWrapper::new()),
+        PeerProcessCheckMode::Off,
+    )
+    .with_kek_store(Arc::new(TestKekStore {
+        rows: HashMap::from([kek_row(org, false)]),
+    }))
+    .with_volume_wrap_store(Arc::new(TestVolumeWrapStore::default()))
+    .with_credential_store(Arc::new(TestCredentialStore {
+        owner,
+        expected_scope,
+    }));
+    let mut request = Request::new(GetOrIssueSandboxVolumeDekRequest {
+        sandbox_id: sandbox_id.to_string(),
+        expected_org_id: String::new(),
+    });
+    request
+        .extensions_mut()
+        .insert(crate::tcp_auth::TcpCallerIdentity::K8sJwt(
+            test_k8s_identity(ClientService::NodeManager),
+        ));
+
+    service
+        .get_or_issue_sandbox_volume_dek(request)
+        .await
+        .expect("the attested node scope must reach the credential store unchanged");
+}
+
+#[tokio::test]
 async fn persisted_volume_wrap_invalid_key_is_machine_readable() {
     let org = OrgId::new();
     let sandbox_id = SandboxId::new();
@@ -582,13 +635,13 @@ async fn persisted_volume_wrap_invalid_key_is_machine_readable() {
         rows: HashMap::from([((cmk_id, row_org), kek)]),
     }))
     .with_volume_wrap_store(store)
-    .with_credential_store(Arc::new(TestCredentialStore {
-        owner: crate::credential_store::SandboxOwner {
+    .with_credential_store(Arc::new(TestCredentialStore::authority_operator(
+        crate::credential_store::SandboxOwner {
             user_id: UserId::new(),
             org_id: org,
             byok_enabled: true,
         },
-    }));
+    )));
 
     let status = service
         .get_or_issue_sandbox_volume_dek(root_request(GetOrIssueSandboxVolumeDekRequest {
@@ -769,13 +822,13 @@ async fn issued_volume_dek_loads_after_byok_disabled() {
                 rows: kek_rows.clone(),
             }))
             .with_volume_wrap_store(store.clone())
-            .with_credential_store(Arc::new(TestCredentialStore {
-                owner: crate::credential_store::SandboxOwner {
+            .with_credential_store(Arc::new(TestCredentialStore::authority_operator(
+                crate::credential_store::SandboxOwner {
                     user_id: UserId::new(),
                     org_id: org,
                     byok_enabled,
                 },
-            }))
+            )))
     };
     let sandbox_id = SandboxId::new().to_string();
 
@@ -919,13 +972,13 @@ fn volume_service_with_kek_store(
     )
     .with_kek_store(kek_store)
     .with_volume_wrap_store(volume_store)
-    .with_credential_store(Arc::new(TestCredentialStore {
-        owner: crate::credential_store::SandboxOwner {
+    .with_credential_store(Arc::new(TestCredentialStore::authority_operator(
+        crate::credential_store::SandboxOwner {
             user_id: UserId::new(),
             org_id: owner_org,
             byok_enabled,
         },
-    }))
+    )))
 }
 
 fn volume_request() -> GetOrIssueSandboxVolumeDekRequest {
