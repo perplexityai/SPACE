@@ -13,7 +13,7 @@ use axum::{
     body::{Body, Bytes},
     http::{HeaderMap, StatusCode, header},
 };
-use futures_util::{Stream, stream};
+use futures_util::{Stream, StreamExt, stream};
 use pplx_space_common_core::types::{GuestUserName, MAX_GUEST_PATH_BYTES};
 
 use super::{
@@ -90,13 +90,22 @@ pub(super) async fn spool_multipart_uploads_with_limit(
     filenames_name_paths: bool,
     spool: &mut SpoolFiles,
 ) -> Result<Vec<MultipartUploadPartE2b>, EcwProxyError> {
-    // Capping the whole body, not each part, keeps the pre-streaming contract
+    // Capping the whole body (here and in the epilogue drain below), not each
+    // part, keeps the pre-streaming contract
     // and bounds the spool disk a single request can use across all its parts.
     let constraints =
         multer::Constraints::new().size_limit(multer::SizeLimit::new().whole_stream(limit as u64));
     let consumed_bytes = Arc::new(AtomicUsize::new(0));
+    let fed_bytes = Arc::new(AtomicUsize::new(0));
+    // Multer only borrows the body, so whatever follows the closing delimiter
+    // can still be read and counted below.
+    let mut body = Box::pin(body.into_data_stream());
     let mut multipart = multer::Multipart::with_constraints(
-        throttled_multipart_body(body, Arc::clone(&consumed_bytes)),
+        throttled_multipart_body(
+            &mut body,
+            Arc::clone(&consumed_bytes),
+            Arc::clone(&fed_bytes),
+        ),
         boundary,
         constraints,
     );
@@ -166,6 +175,18 @@ pub(super) async fn spool_multipart_uploads_with_limit(
         if let Some(upload) = upload {
             let upload = upload.finish().await?;
             uploads.push(MultipartUploadPartE2b { filename, upload });
+        }
+    }
+    // Multer stops at the closing delimiter without reading to the end of the
+    // body. Drain the epilogue under the same cap, so the whole request body,
+    // not just the part multer parsed, stays within `limit`.
+    drop(multipart);
+    let mut body_len = fed_bytes.load(Ordering::Relaxed);
+    while let Some(data) = body.next().await {
+        let data = data.map_err(|_| EcwProxyError::bad_request("Invalid multipart body"))?;
+        body_len = body_len.saturating_add(data.len());
+        if body_len > limit {
+            return Err(file_too_large_error());
         }
     }
     Ok(uploads)
@@ -313,11 +334,15 @@ pub(super) fn multipart_part_framing_lower_bound(boundary: &str, headers: &Heade
 /// headers multer drops, preamble, transport padding), so an encoding padded
 /// until those exceed the cap is rejected too; typical clients stay far below
 /// it (see `E2B_MULTIPART_PART_LIMIT`).
-pub(super) fn throttled_multipart_body(
-    body: Body,
+/// `fed_total` receives the running total of body bytes passed to multer.
+pub(super) fn throttled_multipart_body<'a, S>(
+    body: &'a mut S,
     consumed_bytes: Arc<AtomicUsize>,
-) -> impl Stream<Item = Result<Bytes, axum::Error>> + Send + 'static {
-    let mut body = Box::pin(body.into_data_stream());
+    fed_total: Arc<AtomicUsize>,
+) -> impl Stream<Item = Result<Bytes, axum::Error>> + Send + 'a
+where
+    S: Stream<Item = Result<Bytes, axum::Error>> + Unpin + Send,
+{
     let mut fed_bytes = 0usize;
     let mut throttled_at = None;
     stream::poll_fn(move |context| {
@@ -333,9 +358,10 @@ pub(super) fn throttled_multipart_body(
             return Poll::Pending;
         }
         throttled_at = None;
-        let next = body.as_mut().poll_next(context);
+        let next = std::pin::Pin::new(&mut *body).poll_next(context);
         if let Poll::Ready(Some(Ok(data))) = &next {
             fed_bytes = fed_bytes.saturating_add(data.len());
+            fed_total.store(fed_bytes, Ordering::Relaxed);
         }
         next
     })

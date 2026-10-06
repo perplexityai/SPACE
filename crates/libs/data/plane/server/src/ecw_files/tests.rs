@@ -355,14 +355,18 @@ async fn multipart_feed_pauses_once_unconsumed_bytes_pass_the_parse_buffer_cap()
     let frames =
         vec![vec![b'a'; frame_len]; 4 * E2B_MULTIPART_PARSE_BUFFER_LIMIT_BYTES / frame_len];
     let consumed = Arc::new(AtomicUsize::new(0));
+    let fed_total = Arc::new(AtomicUsize::new(0));
+    let mut body = Box::pin(chunked_body(frames).into_data_stream());
     let mut stream = Box::pin(throttled_multipart_body(
-        chunked_body(frames),
+        &mut body,
         Arc::clone(&consumed),
+        Arc::clone(&fed_total),
     ));
     let mut fed = 0;
     while let Some(Some(frame)) = stream.next().now_or_never() {
         fed += frame.unwrap().len();
     }
+    assert_eq!(fed_total.load(Ordering::Relaxed), fed);
     // Feeding pauses after the first frame that takes the buffer past the cap.
     assert_eq!(fed, E2B_MULTIPART_PARSE_BUFFER_LIMIT_BYTES + frame_len);
 
@@ -1108,5 +1112,53 @@ async fn filename_with_an_escaped_backslash_is_rejected_only_when_it_names_the_d
         spool_multipart_uploads(Body::from(body()), MULTIPART_BOUNDARY, false, &mut spool)
             .await
             .unwrap();
+    assert_eq!(uploads.len(), 1);
+}
+
+/// Spools a complete multipart body, then sends `epilogue_len` more bytes
+/// once the request has parked waiting for more body, after the parser has
+/// returned the closing delimiter.
+async fn spool_with_late_epilogue(
+    epilogue_len: usize,
+    limit_over_multipart: usize,
+) -> Result<Vec<MultipartUploadPartE2b>, EcwProxyError> {
+    let multipart = multipart_body(&[("file", Some("a.txt"), b"content")]);
+    let limit = multipart.len() + limit_over_multipart;
+    let (frames, received) = tokio::sync::mpsc::channel::<Result<Vec<u8>, Infallible>>(2);
+    let body = Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(received));
+    let dir = tempfile::tempdir().unwrap();
+    let spool_dir = dir.path().to_path_buf();
+    let request = tokio::spawn(async move {
+        let mut spool = SpoolFiles::in_dir(spool_dir);
+        spool_multipart_uploads_with_limit(body, MULTIPART_BOUNDARY, limit, true, &mut spool).await
+    });
+    frames.send(Ok(multipart)).await.unwrap();
+    // The part's spool file exists once the parser has reached its data;
+    // the settle time lets it read on through the closing delimiter.
+    for _ in 0..500 {
+        if request.is_finished() || spool_dir_entries(dir.path()).await == 1 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    // A request that stopped reading at the closing delimiter has already
+    // dropped the body, so this send can fail; its result is then `Ok`.
+    if frames.send(Ok(vec![b'e'; epilogue_len])).await.is_err() {
+        assert!(request.is_finished());
+    }
+    drop(frames);
+    request.await.unwrap()
+}
+
+#[tokio::test]
+async fn multipart_epilogue_counts_toward_the_whole_body_limit() {
+    let error = spool_with_late_epilogue(10, 9).await.unwrap_err();
+    assert_eq!(error.status, StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+#[tokio::test]
+async fn multipart_epilogue_within_the_whole_body_limit_is_accepted() {
+    let uploads = spool_with_late_epilogue(10, 10).await.unwrap();
     assert_eq!(uploads.len(), 1);
 }
