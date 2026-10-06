@@ -91,6 +91,9 @@ const WORKER_ENV_ALLOWLIST: &[&str] = &[
 ];
 const MAX_IDENTITY_WORKERS: usize = 16;
 const IDENTITY_WORKER_IDLE_TTL: Duration = Duration::from_secs(10 * 60);
+/// How soon the reaper looks again at a worker whose idle TTL has passed
+/// while an operation still holds it.
+const IDENTITY_WORKER_BUSY_RECHECK: Duration = Duration::from_secs(60);
 const IDENTITY_WORKER_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const IDENTITY_WORKER_START_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
 const IDENTITY_WORKER_MAX_BLOCKING_THREADS: usize = 16;
@@ -166,6 +169,61 @@ pub(crate) struct WorkerPool {
     shutdown: CancellationToken,
     workers: Arc<Mutex<HashMap<GuestUserName, WorkerEntry>>>,
     process_slots: Arc<tokio::sync::Semaphore>,
+    /// Whether the idle reaper task is running. It runs only while a worker
+    /// that can expire is resident, so an unused daemon has no timer.
+    reaper_running: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// Removes resident workers that are idle and past their TTL, for the caller
+/// to stop outside the pool lock.
+fn take_expired_workers(
+    workers: &mut HashMap<GuestUserName, WorkerEntry>,
+    now: Instant,
+) -> Vec<WorkerClient> {
+    let expired_users = workers
+        .iter()
+        .filter(|(_, entry)| {
+            matches!(
+                entry,
+                WorkerEntry::Resident(worker)
+                    if worker.is_idle()
+                        && now.saturating_duration_since(worker.last_access)
+                            > IDENTITY_WORKER_IDLE_TTL
+            )
+        })
+        .map(|(user, _)| user.clone())
+        .collect::<Vec<_>>();
+    expired_users
+        .into_iter()
+        .filter_map(|expired_user| match workers.remove(&expired_user) {
+            Some(WorkerEntry::Resident(worker)) => Some(worker.client),
+            _ => None,
+        })
+        .collect()
+}
+
+/// When the reaper must look next: the earliest TTL expiry among workers
+/// that can expire (a worker kept for the change ledger cannot), or a
+/// recheck for one whose TTL passed while an operation held it. `None` when
+/// no resident worker can expire.
+fn next_worker_expiry(
+    workers: &HashMap<GuestUserName, WorkerEntry>,
+    now: Instant,
+) -> Option<Instant> {
+    workers
+        .values()
+        .filter_map(|entry| match entry {
+            WorkerEntry::Resident(worker) if !worker.ledger_enabled => {
+                let expiry = worker.last_access + IDENTITY_WORKER_IDLE_TTL;
+                Some(if worker.is_idle() {
+                    expiry
+                } else {
+                    expiry.max(now + IDENTITY_WORKER_BUSY_RECHECK)
+                })
+            }
+            _ => None,
+        })
+        .min()
 }
 
 impl WorkerPool {
@@ -201,31 +259,56 @@ impl WorkerPool {
             shutdown,
             workers: Arc::new(Mutex::new(HashMap::new())),
             process_slots: Arc::new(tokio::sync::Semaphore::new(MAX_IDENTITY_WORKERS)),
+            reaper_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
+    }
+
+    /// Stops idle workers once their TTL passes, without waiting for the next
+    /// acquisition: an unused daemon otherwise keeps every worker process
+    /// (and its memory) resident until filesystem traffic resumes. One task
+    /// at most; it sleeps until the next expiry and exits when no resident
+    /// worker can expire.
+    fn ensure_reaper(&self) {
+        use std::sync::atomic::Ordering;
+        if self.reaper_running.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let pool = self.clone();
+        drop(tokio::spawn(async move {
+            loop {
+                let next = {
+                    let mut workers = pool.workers.lock().await;
+                    let expired = take_expired_workers(&mut workers, Instant::now());
+                    let next = next_worker_expiry(&workers, Instant::now());
+                    drop(workers);
+                    Self::stop_workers(expired);
+                    next
+                };
+                let Some(deadline) = next else {
+                    pool.reaper_running.store(false, Ordering::Release);
+                    // A worker published after the look above may have seen
+                    // the reaper as running and not started one: look again.
+                    let expirable = next_worker_expiry(&*pool.workers.lock().await, Instant::now());
+                    if expirable.is_some() && !pool.reaper_running.swap(true, Ordering::AcqRel) {
+                        continue;
+                    }
+                    return;
+                };
+                tokio::select! {
+                    () = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {}
+                    () = pool.shutdown.cancelled() => {
+                        pool.reaper_running.store(false, Ordering::Release);
+                        return;
+                    }
+                }
+            }
+        }));
     }
 
     pub(crate) async fn client_for(&self, user: GuestUserName) -> Result<WorkerClient, Status> {
         let (acquisition, mut workers_to_stop) = {
             let mut workers = self.workers.lock().await;
-            let expired_users = workers
-                .iter()
-                .filter(|(_, entry)| {
-                    matches!(
-                        entry,
-                        WorkerEntry::Resident(worker)
-                            if worker.is_idle()
-                                && worker.last_access.elapsed() > IDENTITY_WORKER_IDLE_TTL
-                    )
-                })
-                .map(|(user, _)| user.clone())
-                .collect::<Vec<_>>();
-            let mut workers_to_stop = expired_users
-                .into_iter()
-                .filter_map(|expired_user| match workers.remove(&expired_user) {
-                    Some(WorkerEntry::Resident(worker)) => Some(worker.client),
-                    _ => None,
-                })
-                .collect::<Vec<_>>();
+            let mut workers_to_stop = take_expired_workers(&mut workers, Instant::now());
 
             let acquisition = match workers.get_mut(&user) {
                 Some(WorkerEntry::Resident(worker)) => {
@@ -330,6 +413,11 @@ impl WorkerPool {
     pub(crate) async fn set_ledger_enabled(&self, worker: &WorkerClient, enabled: bool) -> bool {
         if let Some(mut resident) = self.resident_mut(worker).await {
             resident.ledger_enabled = enabled;
+            drop(resident);
+            if !enabled {
+                // It can expire again.
+                self.ensure_reaper();
+            }
             true
         } else {
             false
@@ -482,6 +570,7 @@ impl WorkerPool {
                             user.clone(),
                             WorkerEntry::Resident(Box::new(ResidentWorker::new(worker.clone()))),
                         );
+                        self.ensure_reaper();
                     }
                     Err(_) => {
                         workers.remove(user);

@@ -668,6 +668,32 @@ fn prepare_pty(size: Option<PtySize>) -> Result<PreparedPty, Status> {
 // Both descriptors are CLOEXEC from creation, so a child spawned concurrently
 // on another thread cannot inherit either one and no lock is needed.
 // `TIOCGPTPEER` needs Linux 4.13 or later; every SPACE guest kernel has it.
+/// Registers a `pre_exec` hook that sets the child's `oom_score_adj` to 0.
+/// Fails closed, like cgroup placement: a workload must not run with
+/// spaced's protection.
+#[cfg(target_os = "linux")]
+fn reset_workload_oom_score(command: &mut Command) {
+    // SAFETY: the closure runs in the forked child before `exec`. It calls only
+    // `open`, `write` and `close` (rustix, on a static NUL-terminated path and
+    // a fixed buffer): async-signal-safe, no allocation, no locks.
+    unsafe {
+        command.pre_exec(|| {
+            let fd = rustix::fs::open(
+                c"/proc/self/oom_score_adj",
+                rustix::fs::OFlags::WRONLY | rustix::fs::OFlags::CLOEXEC,
+                rustix::fs::Mode::empty(),
+            )?;
+            if rustix::io::write(&fd, b"0")? != 1 {
+                return Err(io::ErrorKind::WriteZero.into());
+            }
+            Ok(())
+        });
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn reset_workload_oom_score(_command: &mut Command) {}
+
 #[cfg(target_os = "linux")]
 fn open_pty_pair(winsize: &libc::winsize) -> Result<(OwnedFd, OwnedFd), Status> {
     use rustix::pty::{OpenptFlags, ioctl_tiocgptpeer, openpt, unlockpt};
@@ -1809,6 +1835,11 @@ impl Process for SpacedGuestService {
         if let Some(cgroups) = self.inner.guest_cgroups.as_ref() {
             cgroups.place_spawned_workload(&mut command);
         }
+        // spaced runs with a protective OOM score (the unit's
+        // `OOMScoreAdjust`), and children inherit it: reset the workload to
+        // the default so the OOM killer prefers it over spaced, not the
+        // reverse. Also before dropping credentials.
+        reset_workload_oom_score(&mut command);
         let uses_pty = pty_config.is_some();
         if !uses_pty {
             command.process_group(0);
