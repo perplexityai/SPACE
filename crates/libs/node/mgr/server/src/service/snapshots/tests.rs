@@ -294,3 +294,49 @@ async fn a_firecracker_that_never_answers_fails_a_pause_state_change_at_its_dead
     }
     silent.abort();
 }
+
+async fn service_with_stop(
+    code: tonic::Code,
+    failures: usize,
+) -> (
+    crate::service::NodeManagerService,
+    pplx_space_common_core::types::SandboxId,
+    tempfile::TempDir,
+    crate::runtime_supervisor_client::tests::StubSupervisorServer,
+) {
+    let (socket, client, server) =
+        crate::runtime_supervisor_client::tests::flaky_stop_client(code, failures).await;
+    let mut service = crate::service::tests::service_tests::service_for_unit_tests().await;
+    service.runtime_supervisor = client;
+    let id = pplx_space_common_core::types::SandboxId::new();
+    let fence = pplx_space_node_mgr_client::execution_fence::ExecutionFence::new(
+        pplx_space_common_core::types::SandboxActivationAttemptId::new(),
+        None,
+    );
+    service.pool.bind_execution(&id.to_string(), fence).unwrap();
+    (service, id, socket, server)
+}
+
+#[tokio::test]
+async fn encrypted_seal_stop_retries_while_the_runtime_is_still_exiting() {
+    let (service, id, _socket, server) = service_with_stop(tonic::Code::Internal, 2).await;
+
+    super::stop_runtime_for_encrypted_seal(&service, &id.to_string())
+        .await
+        .expect("stop succeeds once the runtime finishes exiting");
+
+    crate::runtime_supervisor_client::tests::stop_supervisor_server(server).await;
+}
+
+#[tokio::test]
+async fn encrypted_seal_stop_does_not_retry_other_failures() {
+    let (service, id, _socket, server) =
+        service_with_stop(tonic::Code::FailedPrecondition, 1).await;
+
+    let error = super::stop_runtime_for_encrypted_seal(&service, &id.to_string())
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+
+    crate::runtime_supervisor_client::tests::stop_supervisor_server(server).await;
+}

@@ -111,6 +111,12 @@ pub(super) const ENC_SNAPSHOT_JAIL_SUBDIR: &str = "encsnap";
 /// guards against an unexpected unmount that never reports "not mounted".
 const MAX_ENC_SNAPSHOT_BIND_DRAIN: usize = 8;
 
+/// Retries of the post-capture runtime stop. Firecracker can still be in kernel
+/// exit (KVM teardown) when the supervisor's cgroup removal gives up; the stop
+/// is idempotent, so re-issuing it once the exit finishes completes the seal.
+const ENC_CAPTURE_STOP_ATTEMPTS: usize = 8;
+const ENC_CAPTURE_STOP_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
+
 /// File names Firecracker writes into (suspend) and reads from (restore) the
 /// encrypted snapshot volume. Shared by the FC API paths and the load-side
 /// re-own list so they cannot drift apart.
@@ -489,7 +495,7 @@ impl NodeManagerService {
                 // Stop the runtime to drop the mmap, then drain any remaining
                 // encsnap bind, so the volume can be sealed. Both are no-ops for
                 // a fresh capture (no restore pin).
-                stop_sandbox_runtime_with_supervisor(&service, &sandbox_id, true, None).await?;
+                stop_runtime_for_encrypted_seal(&service, &sandbox_id).await?;
                 let _ = tokio::task::spawn_blocking(move || {
                     for _ in 0..MAX_ENC_SNAPSHOT_BIND_DRAIN {
                         match unmount_if_present(&jail_bind) {
@@ -1235,6 +1241,33 @@ pub(super) async fn set_firecracker_paused(
             "Firecracker did not {} the VM within {timeout:?}",
             if paused { "pause" } else { "resume" }
         ))),
+    }
+}
+
+/// Stops the runtime before the encrypted seal, re-issuing the idempotent stop
+/// while it fails server-side because the killed Firecracker is still exiting.
+async fn stop_runtime_for_encrypted_seal(
+    service: &NodeManagerService,
+    sandbox_id: &str,
+) -> Result<(), Status> {
+    let mut attempt = 1;
+    loop {
+        match stop_sandbox_runtime_with_supervisor(service, sandbox_id, true, None).await {
+            Ok(_) => return Ok(()),
+            Err(error)
+                if error.code() == tonic::Code::Internal && attempt < ENC_CAPTURE_STOP_ATTEMPTS =>
+            {
+                tracing::warn!(
+                    sandbox_id,
+                    attempt,
+                    %error,
+                    "post-capture runtime stop incomplete; retrying before seal"
+                );
+                attempt += 1;
+                tokio::time::sleep(ENC_CAPTURE_STOP_RETRY_DELAY).await;
+            }
+            Err(error) => return Err(error),
+        }
     }
 }
 
