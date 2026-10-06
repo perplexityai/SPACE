@@ -7,7 +7,7 @@
 # current failure signatures.
 #
 # What it does:
-#   1. ensures port-forwards to the local space-api and data-plane Services
+#   1. ensures port-forwards to the local space-api, data-plane and object-store Services
 #   2. logs in as the seeded root@local user to mint a session token
 #   3. seeds a local-dev E2B API key into Postgres (idempotent) for the ECW smokes
 #   4. runs the requested smoke groups with local env, teeing logs under a results dir
@@ -40,7 +40,10 @@
 #   E2B_DOMAIN           ECW host suffix         (default local.e2b.test)
 #   RESULTS_DIR          where logs land         (default /tmp/space-local-smokes)
 #   SNAPSHOT_BUCKET      object-store bucket to ensure (default snapshots)
-#   OBJECT_STORE_ENDPOINT  host S3 endpoint for the bucket ensure (default http://127.0.0.1:8333)
+#   OBJECT_STORE_ENDPOINT  host S3 endpoint for the bucket ensure (default http://127.0.0.1:18333;
+#                        if set explicitly it is trusted as-is, otherwise the
+#                        runner port-forwards $KCTX's svc/object-store to it)
+#   LOCAL_OBJECT_STORE_PORT local port for the object-store forward (default 18333)
 set -Eeuo pipefail
 
 WHICH="${1:-all}"
@@ -52,6 +55,7 @@ NS="${NS:-space}"
 # the smokes against that other cluster's api. 18080 is the runner's own lane.
 LOCAL_API_PORT="${LOCAL_API_PORT:-18080}"
 LOCAL_DATA_PLANE_PORT="${LOCAL_DATA_PLANE_PORT:-18090}"
+LOCAL_OBJECT_STORE_PORT="${LOCAL_OBJECT_STORE_PORT:-18333}"
 # Track whether the caller pinned the api url explicitly. If they did, we trust it
 # and only health-check it; if not, we always stand up our own forward to $KCTX so
 # the smokes can't accidentally talk to a foreign cluster's api.
@@ -71,9 +75,11 @@ PF_PIDS=()
 # any smoke fails so it can be used as a verifier, not just a signature-capture
 # printer.
 FAILURES=0
-# Object-store bucket-ensure knobs (mirror the space-object-store chart defaults;
-# the endpoint is Tilt's host port-forward of the S3 API).
-OBJECT_STORE_ENDPOINT="${OBJECT_STORE_ENDPOINT:-http://127.0.0.1:8333}"
+# Object-store bucket-ensure knobs (mirror the space-object-store chart defaults).
+# Like the api url, an explicit endpoint is trusted; otherwise the runner
+# forwards its own port rather than Tilt's 8333, which may be another cluster's.
+if [[ -n "${OBJECT_STORE_ENDPOINT:-}" ]]; then OBJECT_STORE_ENDPOINT_EXPLICIT=1; else OBJECT_STORE_ENDPOINT_EXPLICIT=0; fi
+OBJECT_STORE_ENDPOINT="${OBJECT_STORE_ENDPOINT:-http://127.0.0.1:${LOCAL_OBJECT_STORE_PORT}}"
 OBJECT_STORE_SECRET="${OBJECT_STORE_SECRET:-space-object-store}"
 SNAPSHOT_BUCKET="${SNAPSHOT_BUCKET:-snapshots}"
 mkdir -p "$RESULTS_DIR"
@@ -151,6 +157,25 @@ ensure_data_plane_port_forward() {
   die "space-data-plane did not become reachable at $SPACE_DATA_PLANE_URL (context $KCTX)"
 }
 
+ensure_object_store_port_forward() {
+  if [[ "$OBJECT_STORE_ENDPOINT_EXPLICIT" == "1" ]]; then
+    if curl -fsS -o /dev/null "${OBJECT_STORE_ENDPOINT%/}/healthz" 2>/dev/null; then
+      log "using caller-provided object store at $OBJECT_STORE_ENDPOINT"
+      return
+    fi
+    die "caller-provided OBJECT_STORE_ENDPOINT ($OBJECT_STORE_ENDPOINT) is not reachable"
+  fi
+  log "starting port-forward svc/object-store ${LOCAL_OBJECT_STORE_PORT}:8333 (context $KCTX)"
+  kubectl --context "$KCTX" -n "$NS" port-forward "svc/object-store" "${LOCAL_OBJECT_STORE_PORT}:8333" \
+    >"$RESULTS_DIR/object-store-port-forward.log" 2>&1 &
+  PF_PIDS+=("$!")
+  for _ in $(seq 1 30); do
+    curl -fsS -o /dev/null "${OBJECT_STORE_ENDPOINT%/}/healthz" 2>/dev/null && { log "object store up at $OBJECT_STORE_ENDPOINT"; return; }
+    sleep 1
+  done
+  die "object-store did not become reachable at $OBJECT_STORE_ENDPOINT (context $KCTX)"
+}
+
 login_token() {
   curl -fsS -X POST "${SPACE_API_URL%/}/auth/v1/sessions" \
     -H 'Content-Type: application/json' \
@@ -189,9 +214,10 @@ summarize() {
 # POSIX backend they are directories on the infra node's hostPath and survive
 # pod restarts, but a recreated node (or a wiped hostPath) loses them and
 # nothing re-creates them — a fresh round-trip would then fail "bucket not
-# found". Goes through the S3 API on the host port-forward with the chart's own
-# credentials; an existing bucket is left alone, so this is safe to run every
-# time.
+# found". Goes through the S3 API on the runner's object-store port-forward with
+# the chart's own credentials, and drops any caller AWS session or profile so
+# they cannot override them; an existing bucket is left alone, so this is safe to
+# run every time.
 ensure_snapshot_bucket() {
   local key secret
   if ! command -v aws >/dev/null 2>&1; then
@@ -207,11 +233,17 @@ ensure_snapshot_bucket() {
     return
   fi
   log "ensuring object-store bucket '$SNAPSHOT_BUCKET' exists"
-  local s3=(env AWS_ACCESS_KEY_ID="$key" AWS_SECRET_ACCESS_KEY="$secret" AWS_DEFAULT_REGION=us-east-1
+  local s3=(env -u AWS_SESSION_TOKEN -u AWS_SECURITY_TOKEN -u AWS_PROFILE -u AWS_DEFAULT_PROFILE
+    AWS_CONFIG_FILE=/dev/null AWS_SHARED_CREDENTIALS_FILE=/dev/null
+    AWS_ACCESS_KEY_ID="$key" AWS_SECRET_ACCESS_KEY="$secret" AWS_DEFAULT_REGION=us-east-1
     aws --no-cli-pager --endpoint-url "$OBJECT_STORE_ENDPOINT" s3api)
-  "${s3[@]}" head-bucket --bucket "$SNAPSHOT_BUCKET" >/dev/null 2>&1 \
-    || "${s3[@]}" create-bucket --bucket "$SNAPSHOT_BUCKET" >/dev/null 2>&1 \
-    || log "WARN: bucket ensure failed; round-trip will report the real error"
+  if "${s3[@]}" head-bucket --bucket "$SNAPSHOT_BUCKET" >/dev/null 2>&1; then
+    log "object-store bucket '$SNAPSHOT_BUCKET' exists"
+  elif "${s3[@]}" create-bucket --bucket "$SNAPSHOT_BUCKET" >/dev/null 2>&1; then
+    log "created object-store bucket '$SNAPSHOT_BUCKET'"
+  else
+    log "WARN: bucket ensure failed; round-trip will report the real error"
+  fi
 }
 
 run_native() {
@@ -308,6 +340,9 @@ run_s3_roundtrip() {
 main() {
   command -v jq >/dev/null 2>&1 || die "jq is required"
 
+  case "$WHICH" in
+    s3-roundtrip|all) ensure_object_store_port_forward ;;
+  esac
   # Only the api-driven smokes need a port-forward + session token + E2B key.
   if [[ "$WHICH" != "s3-roundtrip" ]]; then
     ensure_port_forward

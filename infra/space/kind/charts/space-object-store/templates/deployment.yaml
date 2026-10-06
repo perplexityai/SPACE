@@ -36,8 +36,11 @@ spec:
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           # Global flags precede the `posix` backend subcommand. The POSIX
-          # backend stores object metadata in user.* xattrs, which the Kind
-          # node's overlay filesystem supports.
+          # backend stores object metadata in user.* xattrs. The data hostPath
+          # is under the node's /var, which kind mounts as an anonymous Docker
+          # volume on every node (no extraMount covers this path), so the
+          # xattrs land on the filesystem backing that volume, not on the
+          # node's overlay root.
           args:
             - --port
             - ":{{ .Values.service.s3Port }}"

@@ -932,7 +932,10 @@ never firing) if reintroduced:
 - **Object store layout**: versitygw's POSIX backend stores each bucket as a
   directory and each object as a file under the infra node's
   `/var/lib/space-object-store`, with ETags and user metadata in `user.*`
-  xattrs (the Kind node's overlay filesystem supports them). There are no
+  xattrs. kind mounts every node's `/var` as an anonymous Docker volume and
+  no extraMount covers this path, so the data and its xattrs live on the
+  filesystem backing that volume (under Docker's data root), not on the
+  node's overlay root. There are no
   pre-allocated volumes or volume slots to exhaust (the SeaweedFS chart it
   replaced needed `-master.volumeSizeLimitMB=1024 -volume.max=48`), but
   CompleteMultipartUpload assembles the parts with `copy_file_range`, which on
