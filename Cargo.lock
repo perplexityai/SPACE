@@ -6855,6 +6855,7 @@ dependencies = [
  "pplx-space-credential-injection-core",
  "pplx-space-net-common",
  "pplx-space-spaced-build",
+ "pplx-space-spaced-guest-protocol",
  "prost",
  "prost-types",
  "rand 0.10.2",
@@ -6870,7 +6871,6 @@ dependencies = [
  "tower",
  "tracing",
  "uuid",
- "zeroize",
 ]
 
 [[package]]
@@ -6901,17 +6901,62 @@ dependencies = [
 ]
 
 [[package]]
-name = "pplx-space-spaced-guest-server"
+name = "pplx-space-spaced-guest-execution"
 version = "0.8.0"
 dependencies = [
  "dashmap",
  "futures-util",
  "globset",
- "h2",
  "hyper-util",
  "libc",
  "nix 0.31.3",
  "notify",
+ "pplx-space-common-core",
+ "pplx-space-common-grpc",
+ "pplx-space-common-svc",
+ "pplx-space-metrics",
+ "pplx-space-spaced-guest-protocol",
+ "pplx-space-test-env",
+ "prost-types",
+ "rustix",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
+ "tokio-stream",
+ "tokio-util",
+ "tonic",
+ "tower",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "pplx-space-spaced-guest-protocol"
+version = "0.8.0"
+dependencies = [
+ "anyhow",
+ "pplx-space-common-core",
+ "pplx-space-common-proto-build",
+ "pplx-space-spaced-build",
+ "prost",
+ "prost-types",
+ "tokio",
+ "tonic",
+ "tonic-prost",
+ "tonic-prost-build",
+ "tracing",
+ "zeroize",
+]
+
+[[package]]
+name = "pplx-space-spaced-guest-server"
+version = "0.8.0"
+dependencies = [
+ "futures-util",
+ "h2",
+ "hyper-util",
+ "libc",
+ "nix 0.31.3",
  "opentelemetry-proto",
  "pplx-space-common-connection-admission",
  "pplx-space-common-core",
@@ -6921,6 +6966,7 @@ dependencies = [
  "pplx-space-observability",
  "pplx-space-spaced-common",
  "pplx-space-spaced-guest-client",
+ "pplx-space-spaced-guest-execution",
  "pplx-space-test-env",
  "prost",
  "prost-types",

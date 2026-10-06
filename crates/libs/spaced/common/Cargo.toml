@@ -11,6 +11,7 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+pplx-space-spaced-guest-protocol = { workspace = true }
 rand = { workspace = true }
 hyper-util = { workspace = true, features = ["tokio"] }
 http = { workspace = true }
@@ -30,7 +31,6 @@ tonic-prost = { workspace = true }
 tower = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true, features = ["v7"] }
-zeroize = { workspace = true, features = ["derive"] }
 
 
 [build-dependencies]

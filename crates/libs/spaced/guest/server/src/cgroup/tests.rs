@@ -106,29 +106,6 @@ fn no_unified_entry_in_pure_v1() {
     assert_eq!(parse_unified_cgroup(content), None);
 }
 
-#[test]
-fn placement_hook_owns_the_descriptor_until_spawn() {
-    let file = tempfile::tempfile().unwrap();
-    let cgroups = super::GuestCgroups {
-        workloads_procs: std::sync::Arc::new(file.try_clone().unwrap()),
-        filesystem_procs: std::sync::Arc::new(file.try_clone().unwrap()),
-    };
-    let mut command = tokio::process::Command::new("/bin/sh");
-    command.args(["-c", "exit 0"]);
-    cgroups.place_spawned_workload(&mut command);
-    drop(cgroups);
-
-    // The command must keep the placement handle alive independently of the
-    // service that registered the hook. No cgroup privileges are needed to
-    // exercise the write and descriptor lifetime.
-    let status = command.as_std_mut().status().unwrap();
-    assert!(status.success());
-    use std::os::unix::fs::FileExt;
-    let mut written = [0];
-    assert_eq!(file.read_at(&mut written, 0).unwrap(), 1);
-    assert_eq!(&written, b"0");
-}
-
 const MIB: u64 = 1024 * 1024;
 
 // User work keeps all but an eighth of a small guest, and all but 128 MiB of

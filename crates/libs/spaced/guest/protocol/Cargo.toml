@@ -1,0 +1,27 @@
+[package]
+name = "pplx-space-spaced-guest-protocol"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+pplx-space-common-core = { workspace = true }
+prost = { workspace = true }
+prost-types = { workspace = true }
+tokio = { workspace = true, features = ["time"] }
+tonic = { workspace = true }
+tonic-prost = { workspace = true }
+tracing = { workspace = true }
+zeroize = { workspace = true, features = ["derive"] }
+
+[build-dependencies]
+anyhow = { workspace = true }
+pplx-space-common-proto-build = { workspace = true }
+pplx-space-spaced-build = { workspace = true }
+tonic-prost-build = { workspace = true }

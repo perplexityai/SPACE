@@ -1,0 +1,50 @@
+[package]
+name = "pplx-space-spaced-guest-execution"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+test-hooks = ["pplx-space-common-core/test-hooks"]
+telemetry = ["dep:pplx-space-common-svc"]
+otel = ["telemetry", "pplx-space-common-svc/otel"]
+datadog = ["otel", "pplx-space-common-svc/datadog"]
+
+[dependencies]
+dashmap = { workspace = true }
+futures-util = { version = "0.3" }
+globset = { workspace = true }
+hyper-util = { workspace = true, features = ["tokio"] }
+nix = { workspace = true, features = ["signal", "process", "user", "net", "fs", "term", "time", "poll"] }
+libc = { workspace = true }
+rustix = { workspace = true, features = ["fs", "process", "pty", "termios"] }
+notify = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "time", "io-util", "net", "fs", "process", "sync"] }
+tokio-stream = { workspace = true, features = ["net"] }
+tokio-util = { workspace = true, features = ["codec"] }
+tonic = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+tower = { workspace = true }
+uuid = { workspace = true, features = ["v7"] }
+
+# internal
+pplx-space-common-core = { workspace = true }
+pplx-space-common-grpc = { workspace = true }
+pplx-space-common-svc = { workspace = true, optional = true }
+pplx-space-metrics = { workspace = true }
+pplx-space-spaced-guest-protocol = { workspace = true }
+prost-types = { workspace = true }
+
+[dev-dependencies]
+pplx-space-test-env = { workspace = true }
+pplx-space-common-core = { workspace = true, features = ["test-hooks"] }
+tempfile = { workspace = true }
+# Retention and cancellation tests advance virtual time.
+tokio = { workspace = true, features = ["test-util"] }

@@ -8,21 +8,18 @@
 //! Snapshot/resume does not cancel the service. Retry records are not durable
 //! across daemon restart. Watch overflow requires rescan, never silent truncation.
 //!
-//! This crate is the whole service. The `spaced-svc` binary is a thin `main`
-//! that parses flags and calls `run` from the `service-entrypoint` feature, so
-//! a deployment that needs private wiring can supply its own `main` against
-//! this library without copying any of the service.
+//! `ExecutionService` owns process and filesystem operations independently of
+//! listeners and guest startup. The guest daemon uses that same service and adds
+//! readiness, host communication, port forwarding, and guest cgroup setup.
+//! The `spaced-svc` binary calls `run` from the `service-entrypoint` feature.
 
 #[cfg(test)]
 mod tests;
 
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::process::Command;
-use tokio::sync::{Mutex, Notify, RwLock, Semaphore};
+use std::time::Duration;
+use tokio::sync::Semaphore;
 
 use pplx_space_common_connection_admission::{
     ConnectionAdmissionConfig, ConnectionAdmissionFailure, ConnectionAdmissionObservation,
@@ -33,15 +30,14 @@ use pplx_space_spaced_common::proto::bridge_guest::meta_server::{
     Meta as BridgeGuestMeta, MetaServer as BridgeGuestMetaServer,
 };
 use pplx_space_spaced_common::proto::bridge_guest::networking_server::NetworkingServer as BridgeGuestNetworkingServer;
-use pplx_space_spaced_common::proto::bridge_guest::process_server::{Process, ProcessServer};
+use pplx_space_spaced_common::proto::bridge_guest::process_server::Process;
 use pplx_space_spaced_common::proto::bridge_guest::{
     ClockSyncStatus, CloseStdinRequest, CloseStdinResponse, ConfigureProcessEnvRequest,
-    ConfigureProcessEnvResponse, ConnectProcessRequest, FileChunk, FileInfo,
-    FlushFilesystemsRequest, FlushFilesystemsResponse, GuestDiagnosticCallsite,
-    ListProcessesRequest, NotifyResumeRequest, NotifyResumeResponse,
-    PingRequest as BridgeGuestPingRequest, PingResponse as BridgeGuestPingResponse, ProcessEvent,
-    ProcessInfo, PtySize, ResizePtyRequest, ResizePtyResponse, SendInputRequest, SendInputResponse,
-    SendSignalRequest, SendSignalResponse, StartRequest,
+    ConfigureProcessEnvResponse, ConnectProcessRequest, FlushFilesystemsRequest,
+    FlushFilesystemsResponse, GuestDiagnosticCallsite, ListProcessesRequest, NotifyResumeRequest,
+    NotifyResumeResponse, PingRequest as BridgeGuestPingRequest,
+    PingResponse as BridgeGuestPingResponse, ResizePtyRequest, ResizePtyResponse, SendInputRequest,
+    SendInputResponse, SendSignalRequest, SendSignalResponse, StartRequest,
     WaitReadyRequest as BridgeGuestWaitReadyRequest,
     WaitReadyResponse as BridgeGuestWaitReadyResponse,
 };
@@ -68,22 +64,16 @@ use pplx_space_spaced_common::proto::guest::{
     SetActivityStateResponse as LocalSetActivityStateResponse,
 };
 use pplx_space_spaced_common::{
-    DEFAULT_COMMAND_RETRY_POLICY, LazyClient, RetryContext, RetryPolicy, invalid_argument_status,
-    parse_env, proto_env, validate_duration, validate_optional_timeout,
+    DEFAULT_COMMAND_RETRY_POLICY, LazyClient, RetryContext, RetryPolicy, parse_env,
+    validate_duration,
 };
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use tonic::{Request, Response, Status};
 
-use pplx_space_common_core::types::{DEFAULT_GUEST_USER, EnvMap, GuestUserName};
-type GuestFileInfoStream =
-    std::pin::Pin<Box<dyn futures_util::Stream<Item = Result<FileInfo, Status>> + Send>>;
-type GuestFileChunkStream =
-    std::pin::Pin<Box<dyn futures_util::Stream<Item = Result<FileChunk, Status>> + Send>>;
-const IDEMPOTENCY_RECORD_TTL: Duration = Duration::from_secs(60);
+use pplx_space_common_core::types::GuestUserName;
 const BRIDGE_HOST_CALL_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_CONCURRENT_BRIDGE_HOST_CALLS: usize = 32;
-const MAX_PROCESS_TAG_BYTES: usize = 4 * 1024;
 const LOCAL_GUEST_SOCKET_MODE: u32 = 0o666;
 // Physical transports are admitted separately from RPC work. A guest process
 // can keep an HTTP/2 connection idle without reaching a tower request layer,
@@ -171,30 +161,13 @@ pub enum RunGuestServerError {
     Bridge(#[source] RunBridgeGuestServerError),
 }
 
-/// Failure while starting the optional filesystem worker subprocess mode.
-#[derive(Debug, thiserror::Error)]
-#[error("filesystem worker startup failed: {source}")]
-pub struct RunFilesystemWorkerError {
-    #[source]
-    source: Box<dyn std::error::Error + Send + Sync + 'static>,
-}
-
-impl RunFilesystemWorkerError {
-    #[cfg(target_os = "linux")]
-    fn new(source: filesystem::FilesystemWorkerError) -> Self {
-        Self {
-            source: Box::new(source),
-        }
-    }
-}
-
 mod cgroup;
-mod filesystem;
-mod guest_path;
-mod idempotency;
-mod identity;
+pub use pplx_space_spaced_guest_execution::{
+    ExecutionService, ExecutionServiceConfig, FilesystemExecutionMode, RunFilesystemWorkerError,
+    WORKER_SERVICE_NAME, filesystem_worker_requested, run_filesystem_worker_from_environment,
+};
 mod local_admission;
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "service-entrypoint"))]
 mod memlock;
 mod meta;
 mod networking;
@@ -214,18 +187,7 @@ mod run;
 #[cfg(feature = "service-entrypoint")]
 pub use run::{RunSpacedGuestError, SERVICE_NAME, SpacedGuestRunConfig, run, serve};
 
-/// The service name the identity-isolated filesystem worker subprocess reports
-/// to telemetry. Deliberately distinct from the daemon's own service name: the
-/// worker emits service telemetry but does not own the systemd watchdog
-/// contract.
-///
-/// The worker env builder pins this so an inherited OTel service name cannot
-/// rename the child, so it resolves without `service-entrypoint`.
-pub const WORKER_SERVICE_NAME: &str = "space-spaced-guest-worker";
-
-use idempotency::IdempotencyStore;
 use port_forward::LoopbackBridgeManager;
-use process::ProcessRegistry;
 
 const HOST_CONNECTION_PORT: u32 = pplx_space_spaced_common::BRIDGE_HOST_VSOCK_PORT;
 const GUEST_BRIDGE_PORT: u32 = pplx_space_spaced_common::BRIDGE_GUEST_VSOCK_PORT;
@@ -280,7 +242,7 @@ pub struct SpacedGuestServiceConfig {
     pub guest_uptime_source: fn() -> Option<prost_types::Duration>,
     pub default_operation_user: GuestUserName,
     pub filesystem_execution: FilesystemExecutionMode,
-    /// See [`filesystem::router::DEFAULT_CANCELLATION_GRACE`]. Configurable so
+    /// Grace before escalating cancellation of filesystem work. Configurable so
     /// a test can observe the escalation without waiting out the deployed
     /// deadline; the deployed configuration never moves it.
     pub cancellation_grace: std::time::Duration,
@@ -290,14 +252,9 @@ pub struct SpacedGuestServiceConfig {
     pub http2_preface_timeout: Duration,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum FilesystemExecutionMode {
-    IdentityWorkers,
-    Direct,
-}
-
 impl Default for SpacedGuestServiceConfig {
     fn default() -> Self {
+        let execution = ExecutionServiceConfig::default();
         Self {
             host_connector_type: HostConnectorType::default(),
             local_socket_path: Some(
@@ -307,14 +264,9 @@ impl Default for SpacedGuestServiceConfig {
             ),
             bridge_socket_path: Some(pplx_space_spaced_common::default_bridge_guest_uds_path()),
             guest_uptime_source: read_guest_uptime,
-            default_operation_user: GuestUserName::parse(DEFAULT_GUEST_USER)
-                .expect("default guest user constant is valid"),
-            filesystem_execution: if cfg!(target_os = "linux") {
-                FilesystemExecutionMode::IdentityWorkers
-            } else {
-                FilesystemExecutionMode::Direct
-            },
-            cancellation_grace: filesystem::router::DEFAULT_CANCELLATION_GRACE,
+            default_operation_user: execution.default_operation_user,
+            filesystem_execution: execution.filesystem_execution,
+            cancellation_grace: execution.cancellation_grace,
             http2_preface_timeout: DEFAULT_GUEST_HTTP2_PREFACE_TIMEOUT,
         }
     }
@@ -335,15 +287,6 @@ impl std::fmt::Debug for SpacedGuestService {
 
 struct SpacedGuestServiceInner {
     shutdown: CancellationToken,
-    process_tasks: tokio_util::task::TaskTracker,
-    /// Orders process-start admission with shutdown. A start checks
-    /// readiness, claims its process id, begins its idempotent operation and
-    /// registers its owner in `process_tasks` under this gate, and shutdown
-    /// closes `process_tasks` under it, so no admitted start escapes the
-    /// drain. It is never held across a spawn: a spawn that stalls must not
-    /// stall every other start.
-    start_gate: std::sync::Mutex<()>,
-    process_payload_slots: Arc<Semaphore>,
     filesystem_flush_slots: Arc<Semaphore>,
     host_connector_type: HostConnectorType,
     bridge_host_client: LazyClient<BridgeHostClient<tonic::transport::Channel>>,
@@ -353,23 +296,15 @@ struct SpacedGuestServiceInner {
     bridge_socket_path: Option<PathBuf>,
     http2_preface_timeout: Duration,
     guest_uptime_source: fn() -> Option<prost_types::Duration>,
-    default_operation_user: GuestUserName,
     ready: watch::Sender<bool>,
     ready_events: watch::Sender<u64>,
-    process_env: RwLock<EnvMap>,
-    processes: ProcessRegistry,
-    idempotency: IdempotencyStore,
-    filesystem: filesystem::FilesystemRouter,
     loopback_bridge: LoopbackBridgeManager,
     /// Random per-process token regenerated each time spaced-guest-svc
     /// starts. Surfaced in `OpenLoopbackBridgeResponse.service_generation` so
     /// host-side reconcilers can detect guest restarts (which drop the
     /// in-memory authorized port set) and re-apply port bridges.
     service_generation: String,
-    /// Guest cgroup split that places spawned workloads in the workloads
-    /// unit's leaf, with the rest of user work and away from the supervisor. `None` outside a real
-    /// Firecracker guest or when cgroup setup degraded to the shared layout.
-    guest_cgroups: Option<Arc<cgroup::GuestCgroups>>,
+    execution: ExecutionService,
 }
 
 impl SpacedGuestService {
@@ -378,41 +313,35 @@ impl SpacedGuestService {
     }
 
     pub fn with_config(shutdown: CancellationToken, config: SpacedGuestServiceConfig) -> Self {
-        let (ready, _) = watch::channel(false);
-        let (ready_events, _) = watch::channel(0);
-        let loopback_bridge = LoopbackBridgeManager::new(shutdown.clone());
-        let service_generation = uuid::Uuid::now_v7().to_string();
-        let filesystem = filesystem::FilesystemRouter::new(
-            config.filesystem_execution,
-            config.default_operation_user.clone(),
-            shutdown.clone(),
-            config.cancellation_grace,
-        );
-        // Only manage cgroups inside the Firecracker microVM, identified by the
-        // guest vsock transport device. Setup relocates this process and
-        // rewrites cgroup limits, so it must never run against a host's
-        // cgroups; with no `/dev/vsock` (any non-guest environment) it no-ops.
-        // `run()` has normally done it already, before any large allocation
-        // and before telemetry; its report is logged here, where telemetry is
-        // up.
+        // Only initialize cgroups inside a Firecracker guest, including custom
+        // daemon entrypoints. The execution service receives placement only.
         let guest_cgroups = if native_vsock_available() {
             let cgroups = cgroup::GuestCgroups::initialize_for_process();
             cgroup::GuestCgroups::report_process_setup();
-            #[cfg(target_os = "linux")]
+            #[cfg(all(target_os = "linux", feature = "service-entrypoint"))]
             memlock::report();
             cgroups
         } else {
             None
         };
+        let (ready, _) = watch::channel(false);
+        let (ready_events, _) = watch::channel(0);
+        let loopback_bridge = LoopbackBridgeManager::new(shutdown.clone());
+        let service_generation = uuid::Uuid::now_v7().to_string();
+        let execution = ExecutionService::with_cgroups(
+            shutdown.clone(),
+            ExecutionServiceConfig {
+                default_operation_user: config.default_operation_user.clone(),
+                filesystem_execution: config.filesystem_execution,
+                cancellation_grace: config.cancellation_grace,
+                guest_memory_bytes: meta::guest_mem_total_bytes(),
+            },
+            guest_cgroups.map(|cgroups| Arc::clone(&cgroups.placement)),
+        );
         Self {
             inner: Arc::new(SpacedGuestServiceInner {
                 shutdown,
-                process_tasks: tokio_util::task::TaskTracker::new(),
-                start_gate: std::sync::Mutex::new(()),
                 filesystem_flush_slots: Arc::new(Semaphore::new(1)),
-                process_payload_slots: Arc::new(Semaphore::new(
-                    pplx_space_spaced_common::process_limits::PAYLOAD_SLOTS,
-                )),
                 host_connector_type: config.host_connector_type,
                 bridge_host_client: LazyClient::new(),
                 bridge_host_calls: Arc::new(Semaphore::new(MAX_CONCURRENT_BRIDGE_HOST_CALLS)),
@@ -421,18 +350,11 @@ impl SpacedGuestService {
                 bridge_socket_path: config.bridge_socket_path,
                 http2_preface_timeout: config.http2_preface_timeout,
                 guest_uptime_source: config.guest_uptime_source,
-                default_operation_user: config.default_operation_user,
                 ready,
                 ready_events,
-                process_env: RwLock::new(EnvMap::empty()),
-                processes: ProcessRegistry::new(process::ProcessOutputBudget::for_guest_memory(
-                    meta::guest_mem_total_bytes(),
-                )),
-                idempotency: IdempotencyStore::new("process"),
-                filesystem,
                 loopback_bridge,
                 service_generation,
-                guest_cgroups,
+                execution,
             }),
         }
     }
@@ -524,18 +446,6 @@ impl SpacedGuestService {
         .await
     }
 
-    /// Stop admitting process starts. Closure is serialized with start
-    /// admission, so every start admitted before it has its owner tracked in
-    /// `process_tasks` and the drain waits for it.
-    fn close_process_admission(&self) {
-        let _start_gate = self
-            .inner
-            .start_gate
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        self.inner.process_tasks.close();
-    }
-
     pub async fn run(self) -> Result<(), RunGuestServerError> {
         tracing::info!(
             guest_socket_path = ?self.inner.local_socket_path,
@@ -570,10 +480,8 @@ impl SpacedGuestService {
         let mut local_error = None;
         let mut bridge_error = None;
         let drain = async {
-            self.close_process_admission();
             tokio::join!(
-                self.inner.filesystem.drain(),
-                self.inner.process_tasks.wait(),
+                self.inner.execution.drain(),
                 self.inner.loopback_bridge.shutdown(),
                 async {
                     if !local_done {
@@ -785,8 +693,8 @@ impl SpacedGuestService {
                     .supervise(move |incoming| {
                         guest_grpc_server_builder(MAX_BRIDGE_GUEST_STREAMS)
                             .add_service(BridgeGuestMetaServer::new(self.clone()))
-                            .add_service(self.inner.filesystem.grpc_service())
-                            .add_service(self.process_grpc_service())
+                            .add_service(self.inner.execution.filesystem_grpc_service())
+                            .add_service(self.inner.execution.process_grpc_service(self.clone()))
                             .add_service(BridgeGuestNetworkingServer::new(self.clone()))
                             .serve_with_incoming_shutdown(incoming, async move {
                                 self.inner.shutdown.cancelled().await
@@ -821,8 +729,8 @@ impl SpacedGuestService {
                     .supervise(move |incoming| {
                         guest_grpc_server_builder(MAX_BRIDGE_GUEST_STREAMS)
                             .add_service(BridgeGuestMetaServer::new(self.clone()))
-                            .add_service(self.inner.filesystem.grpc_service())
-                            .add_service(self.process_grpc_service())
+                            .add_service(self.inner.execution.filesystem_grpc_service())
+                            .add_service(self.inner.execution.process_grpc_service(self.clone()))
                             .add_service(BridgeGuestNetworkingServer::new(self.clone()))
                             .serve_with_incoming_shutdown(incoming, async move {
                                 self.inner.shutdown.cancelled().await
@@ -833,30 +741,5 @@ impl SpacedGuestService {
                 Ok(())
             }
         }
-    }
-}
-
-pub fn run_filesystem_worker_from_environment() -> Result<bool, RunFilesystemWorkerError> {
-    #[cfg(target_os = "linux")]
-    {
-        filesystem::run_worker_from_environment().map_err(RunFilesystemWorkerError::new)
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        Ok(false)
-    }
-}
-
-#[cfg(target_os = "linux")]
-const FILESYSTEM_WORKER_MODE_ENV: &str = "SPACE_SPACED_FILESYSTEM_WORKER";
-
-pub fn filesystem_worker_requested() -> bool {
-    #[cfg(target_os = "linux")]
-    {
-        std::env::var_os(FILESYSTEM_WORKER_MODE_ENV).is_some()
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        false
     }
 }

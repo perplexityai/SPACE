@@ -35,6 +35,8 @@ members = [
     "crates/apps/mock/llm/svc",
     "crates/apps/mock/branching-key-provider/svc",
     "crates/libs/spaced/build",
+    "crates/libs/spaced/guest/execution",
+    "crates/libs/spaced/guest/protocol",
     "crates/libs/spaced/common",
     "crates/libs/spaced/guest/client",
     "crates/libs/spaced/guest/server",
@@ -342,6 +344,8 @@ pplx-space-sbxmgr-migrations = { path = "crates/libs/sbx/mgr/migrations" }
 pplx-space-sbx-mgr = { path = "crates/libs/sbx/mgr/server" }
 pplx-space-sbx-mgr-client = { path = "crates/libs/sbx/mgr/client" }
 pplx-space-spaced-build = { path = "crates/libs/spaced/build" }
+pplx-space-spaced-guest-protocol = { path = "crates/libs/spaced/guest/protocol" }
+pplx-space-spaced-guest-execution = { path = "crates/libs/spaced/guest/execution" }
 pplx-space-spaced-common = { path = "crates/libs/spaced/common" }
 pplx-space-spaced-guest-client = { path = "crates/libs/spaced/guest/client" }
 pplx-space-spaced-guest-server = { path = "crates/libs/spaced/guest/server" }

@@ -217,7 +217,7 @@ whose 4 KiB blocks are each their own disk request; for small uploads that
 costs several times the requests of the data itself, against the drive's
 operations limit. To make replacements persistent at acknowledgement
 instead, sync the temporary file before the rename (`finalize_written_file`
-in `crates/libs/spaced/guest/server/src/filesystem/write.rs`), keep the
+in `crates/libs/spaced/guest/execution/src/filesystem/write.rs`), keep the
 destination's directory open from `open_replacement`, and sync it after the
 rename; the comment in `Replacement::commit` marks the place.
 
