@@ -91,8 +91,6 @@ const CREDENTIAL_TABLES: &[&str] = &[
     "org_master_keys",
     "org_branching_keys",
     "org_storage_vend_identities",
-    "user_credentials",
-    "org_credentials",
     "sandbox_encrypted_fields",
     "snapshot_storage_location_encrypted_fields",
     "template_release_storage_location_encrypted_fields",
