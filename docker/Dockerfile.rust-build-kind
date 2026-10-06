@@ -1,5 +1,3 @@
-# syntax=docker/dockerfile:1.7
-#
 # Kind-only: every SPACE Rust binary from ONE cargo-chef cook and ONE build.
 #
 # docker/Dockerfile.rust-build-common — the CI/publish path — compiles each

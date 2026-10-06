@@ -1,5 +1,3 @@
-# syntax=docker/dockerfile:1.7
-#
 # Runnable SPACE worker image for Kubernetes DaemonSet deployment.
 #
 # Contains node-manager, sandbox-manager, template-manager, and all host-side services

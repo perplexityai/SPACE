@@ -1,5 +1,3 @@
-# syntax=docker/dockerfile:1.7
-
 ARG SPACE_RUST_BUILD_IMAGE=space-rust-build-builder:local
 FROM ${SPACE_RUST_BUILD_IMAGE} AS rust-build
 

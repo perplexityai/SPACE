@@ -1,5 +1,3 @@
-# syntax=docker/dockerfile:1.7
-
 FROM public.ecr.aws/docker/library/node:22-bookworm AS builder
 
 ENV NEXT_TELEMETRY_DISABLED=1

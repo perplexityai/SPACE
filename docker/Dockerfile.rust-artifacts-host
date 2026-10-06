@@ -1,5 +1,3 @@
-# syntax=docker/dockerfile:1.7
-#
 # Kind-only: the artifact image assembled from the incremental cargo build.
 #
 # infra/space/kind/scripts/build-rust-artifacts.sh (incremental mode) compiles the
