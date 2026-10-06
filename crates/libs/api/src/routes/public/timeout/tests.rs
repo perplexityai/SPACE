@@ -251,13 +251,14 @@ async fn timeout_validation_scope_and_policy_matrix() -> TestDbResult<()> {
 async fn dormant_timeout_persists_without_waking_and_caches_retries() -> TestDbResult<()> {
     let db = pg_test_db().await?;
     let app = app(&db.pool).await?;
-    for (lifecycle, pause, resume) in [
-        ("paused", true, true),
-        ("suspended", false, false),
-        ("created", true, false),
-        ("started", true, false),
+    for (lifecycle, pause, resume, initial_timeout) in [
+        ("paused", true, true, 21_600),
+        ("suspended", false, false, 21_600),
+        ("created", true, false, 21_600),
+        ("started", true, false, 21_600),
+        ("suspended", true, true, u64::from(u32::MAX) + 1),
     ] {
-        let policy = crate::e2b::auto_lifecycle_policy(21_600, pause, resume);
+        let policy = crate::e2b::access_idle_policy(initial_timeout, pause, resume);
         let id = seed(&db.pool, lifecycle, &policy, None).await?;
         if lifecycle == "started" {
             sqlx::query(sql!(

@@ -87,12 +87,15 @@ pub(super) async fn set_timeout(
         ));
     }
     let current_policy = sandbox.auto_lifecycle.0.clone().normalized();
-    let current_timeout = current_policy
-        .stages
-        .first()
-        .and_then(|stage| u32::try_from(stage.at).ok())
-        .ok_or_else(|| PublicApiError::failed_precondition("unsupported idle timeout policy"))?;
-    if crate::e2b::policy_for_timeout_update(&current_policy, current_timeout).normalized()
+    let (Some(config), [stage]) = (
+        crate::e2b::lifecycle_config_from_policy(&current_policy),
+        current_policy.stages.as_slice(),
+    ) else {
+        return Err(PublicApiError::failed_precondition(
+            "unsupported idle timeout policy",
+        ));
+    };
+    if crate::e2b::access_idle_policy(stage.at, config.auto_pause, config.auto_resume).normalized()
         != current_policy
     {
         return Err(PublicApiError::failed_precondition(
