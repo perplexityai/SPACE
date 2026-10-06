@@ -138,20 +138,20 @@ pub(crate) const DEFAULT_TICK: Duration = Duration::from_secs(30);
 /// full [`LABEL_WRITE_TIMEOUT`], deferring the rest.
 pub(crate) const DEFAULT_WRITE_CONCURRENCY: usize = 8;
 /// Ceiling on [`ReconcilerConfig::write_concurrency`], applied by
-/// [`clamp_write_concurrency`] at both boundaries the value can enter through.
+/// [`clamp_write_concurrency`] everywhere the value is read.
 ///
-/// Neither boundary rejects an absurd value on its own:
-/// `env_config::positive_usize` only turns zero and garbage into the default,
-/// and the field is `pub`. So a configured write concurrency of 5,000 would fan 5,000 concurrent
-/// Node PATCHes at the apiserver from one reconciler that has no rate limiter of
-/// its own — and first enablement is exactly when the pending list is the whole
+/// Nothing rejects an absurd value on the way in: the field isn't read from
+/// the environment, but it is `pub`. So a configured write concurrency of
+/// 5,000 would fan 5,000 concurrent Node PATCHes at the apiserver from one
+/// reconciler that has no rate limiter of its own — and first enablement is exactly when the pending list is the whole
 /// fleet, so the fan-out would actually reach that width.
 ///
-/// 8× the default, because the knob's legitimate use is widening a
-/// first-enablement window: throughput is `write_concurrency` × patches per
-/// second for as long as the phase's budget lasts (see [`LABEL_WRITE_TIMEOUT`]),
-/// so 64 clears a four-figure fleet in a tick or two at normal apiserver
-/// latency, while keeping a typo from turning a rollout into a write storm.
+/// 8× the default, because a caller's legitimate reason to raise it is
+/// widening a first-enablement window: throughput is `write_concurrency` ×
+/// patches per second for as long as the phase's budget lasts (see
+/// [`LABEL_WRITE_TIMEOUT`]), so 64 clears a four-figure fleet in a tick or two
+/// at normal apiserver latency, while keeping a careless caller from turning a
+/// rollout into a write storm.
 pub(crate) const MAX_WRITE_CONCURRENCY: usize = 64;
 
 /// Bound `write_concurrency` into `1..=`[`MAX_WRITE_CONCURRENCY`].
@@ -159,9 +159,8 @@ pub(crate) const MAX_WRITE_CONCURRENCY: usize = 64;
 /// Both ends matter and for different reasons. A zero wedges rather than fails:
 /// `buffer_unordered(0)` never fills its queue, so it returns `Pending` forever
 /// with no waker and the tick hangs instead of erroring. The ceiling is the
-/// apiserver's protection above. Called at the env boundary *and* at the
-/// fan-out, because the field is `pub` and a programmatic `ReconcilerConfig`
-/// skips `from_env` entirely.
+/// apiserver's protection above. Called wherever the value is read, because
+/// the field is `pub` and nothing validates it on the way in.
 pub(crate) fn clamp_write_concurrency(value: usize) -> usize {
     value.clamp(1, MAX_WRITE_CONCURRENCY)
 }
@@ -260,8 +259,8 @@ pub struct ReconcilerConfig {
     pub tick: PositiveDuration,
     /// Name to seed the default generic group with when no default exists
     /// yet. Once a default row exists, the row's name wins and this value
-    /// is ignored. Parsed at the env boundary, so an invalid name cannot
-    /// reach a Node label from here.
+    /// is ignored. A [`NodeGroupName`], so an invalid name cannot reach a
+    /// Node label from here.
     pub default_group_name: NodeGroupName,
     /// Label patches issued concurrently. See [`DEFAULT_WRITE_CONCURRENCY`],
     /// and [`clamp_write_concurrency`] for the bounds every reader applies —
@@ -566,8 +565,9 @@ pub struct TickReport {
     /// The two are indistinguishable in `label_deferred` and in the
     /// `node_group_labeler.deferred_nodes` gauge, and they call for opposite
     /// responses: a spent budget is the rollout back-pressuring against
-    /// apiserver latency, and a sustained one means raising `write_concurrency`
-    /// or waiting more ticks, while a shutdown deferral is an orderly wind-down
+    /// apiserver latency, and a sustained one means waiting more ticks (or a
+    /// wider `write_concurrency` from a programmatic caller; it isn't read from
+    /// the environment), while a shutdown deferral is an orderly wind-down
     /// that the next leader resumes with no operator action at all.
     ///
     /// A report field and a summary-log field, deliberately not a metric: the
@@ -808,12 +808,9 @@ pub async fn run<S: NodeGroupSink, L: WorkerNodeLabels>(
     shutdown_token: CancellationToken,
 ) {
     if !config.enabled {
-        // Deliberately does not name a cause: this path is reached both when
-        // SPACE_NODE_GROUP_LABELER_ENABLED is unset/false and when it was set
-        // true but `from_env` force-disabled on an invalid default group name.
-        // The latter is exactly the case an operator debugs ("I enabled it,
-        // why is it inert?"), and `from_env` already logs that reason at
-        // error — claiming "unset" here would contradict it.
+        // Deliberately does not name a cause: besides an unset or false
+        // SPACE_NODE_GROUP_LABELER_ENABLED, a programmatic `ReconcilerConfig`
+        // can disable it, and claiming "unset" would mislead that caller.
         tracing::info!(
             "node-group-labeler reconciler is disabled; waiting on shutdown \
              without running any ticks"
@@ -827,10 +824,9 @@ pub async fn run<S: NodeGroupSink, L: WorkerNodeLabels>(
         tick_secs = config.tick.get().as_secs(),
         default_group_name = %config.default_group_name,
         // The clamped width, which is readable nowhere else: there is no
-        // gauge and no endpoint for it. The configured value is readable from
-        // the pod spec and `values.yaml`, but `clamp_write_concurrency` reduces
-        // an over-large one in silence at both boundaries, so without this line
-        // a mis-rendered chart value looks like it took effect.
+        // gauge and no endpoint for it, and `clamp_write_concurrency` reduces
+        // an over-large configured value in silence, so without this line an
+        // over-large value looks like it took effect.
         write_concurrency = clamp_write_concurrency(config.write_concurrency),
         "starting node-group-labeler reconciler"
     );

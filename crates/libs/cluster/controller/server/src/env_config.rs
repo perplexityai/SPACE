@@ -29,16 +29,10 @@ impl EnvConfig<'_> {
     }
 
     pub(crate) fn test_bounded_u32(&self, var: &str, default: u32, ceiling: u32) -> u32 {
-        match self.test_raw(var).and_then(|raw| raw.parse::<u64>().ok()) {
-            Some(value) if value > 0 => {
-                u32::try_from(value.min(u64::from(ceiling))).unwrap_or(ceiling)
-            }
-            _ => default,
-        }
-    }
-
-    pub(crate) fn test_positive_usize(&self, var: &str, default: usize) -> usize {
-        match self.test_raw(var).and_then(|raw| raw.parse::<usize>().ok()) {
+        match self
+            .test_raw(var)
+            .and_then(|raw| parse_clamped(&raw, ceiling))
+        {
             Some(value) if value > 0 => value,
             _ => default,
         }
@@ -80,6 +74,19 @@ impl EnvConfig<'_> {
         }
     }
 
+    /// Like [`Self::bounded_u32`], for a `usize` setting.
+    pub(crate) fn bounded_usize(&self, var: &str, default: usize, ceiling: usize) -> usize {
+        match self
+            .0
+            .var(var)
+            .ok()
+            .and_then(|raw| parse_clamped(&raw, ceiling))
+        {
+            Some(n) if n > 0 => n,
+            _ => default,
+        }
+    }
+
     pub(crate) fn positive_u32(&self, var: &str, default: u32) -> u32 {
         match self.0.var(var).ok().and_then(|raw| raw.parse::<u32>().ok()) {
             Some(n) if n > 0 => n,
@@ -91,20 +98,24 @@ impl EnvConfig<'_> {
     ///
     /// Use this for safety ceilings where zero is an operational kill switch.
     pub(crate) fn bounded_u32_allow_zero(&self, var: &str, default: u32, ceiling: u32) -> u32 {
-        match self.0.var(var).ok().and_then(|raw| raw.parse::<u64>().ok()) {
-            Some(n) => u32::try_from(n.min(u64::from(ceiling))).unwrap_or(ceiling),
-            None => default,
-        }
+        self.0
+            .var(var)
+            .ok()
+            .and_then(|raw| parse_clamped(&raw, ceiling))
+            .unwrap_or(default)
     }
 
+    /// A positive `u32` clamped to `ceiling`. Unset, `0` or a non-number keeps
+    /// `default`; any value above `ceiling` clamps to it (see
+    /// [`parse_clamped`]).
     pub(crate) fn bounded_u32(&self, var: &str, default: u32, ceiling: u32) -> u32 {
-        // Parse as u64 so a too-large value (an operator typoing extra
-        // digits) clamps to `ceiling` rather than overflowing u32, failing to
-        // parse, and silently falling back to `default`. Clamping is the
-        // documented contract of the ceiling — an in-range over-ceiling value
-        // already clamps, so an out-of-u32-range one must clamp identically.
-        match self.0.var(var).ok().and_then(|raw| raw.parse::<u64>().ok()) {
-            Some(n) if n > 0 => u32::try_from(n.min(u64::from(ceiling))).unwrap_or(ceiling),
+        match self
+            .0
+            .var(var)
+            .ok()
+            .and_then(|raw| parse_clamped(&raw, ceiling))
+        {
+            Some(n) if n > 0 => n,
             _ => default,
         }
     }
@@ -117,6 +128,39 @@ impl EnvConfig<'_> {
         default: Option<Duration>,
     ) -> Option<Duration> {
         snapshot_sweeper_grace_seconds(self.test_raw(var).as_deref(), default)
+    }
+}
+
+/// Parse `raw` as an integer clamped to `ceiling`, or `None` if it isn't one.
+///
+/// A value too large for `T` clamps too. An operator typoing extra digits
+/// meant a big number, and clamping is the ceiling's contract: an over-ceiling
+/// value that fits already clamps, so one that overflows must clamp
+/// identically rather than fail to parse and silently fall back to a default.
+/// Matching the overflow error does that for any length, which parsing into a
+/// wider type can't.
+///
+/// The parser reports overflow as soon as a numeric prefix overflows, before
+/// it reaches a bad character, so only an all-digit value counts as one. A
+/// value like `5000000000 ` stays garbage: several of these readers are safety
+/// caps, and clamping garbage to a `u32::MAX` ceiling would lift the cap.
+fn parse_clamped<T>(raw: &str, ceiling: T) -> Option<T>
+where
+    T: std::str::FromStr<Err = std::num::ParseIntError> + Ord,
+{
+    match raw.parse::<T>() {
+        Ok(n) => Some(n.min(ceiling)),
+        Err(err)
+            if *err.kind() == std::num::IntErrorKind::PosOverflow
+                && raw
+                    .strip_prefix('+')
+                    .unwrap_or(raw)
+                    .bytes()
+                    .all(|b| b.is_ascii_digit()) =>
+        {
+            Some(ceiling)
+        }
+        Err(_) => None,
     }
 }
 
@@ -146,6 +190,19 @@ mod tests {
             env.set("SPACE_TEST_GATE", value);
         }
         EnvConfig(&env).destructive_gate("SPACE_TEST_GATE")
+    }
+
+    #[test]
+    fn parse_clamped_clamps_any_over_ceiling_value() {
+        assert_eq!(parse_clamped::<u32>("7", 10), Some(7));
+        assert_eq!(parse_clamped::<u32>("0", 10), Some(0));
+        for over in ["11", "5000000000", "+5000000000", "99999999999999999999"] {
+            assert_eq!(parse_clamped::<u32>(over, 10), Some(10), "{over:?}");
+        }
+        // An overflowing numeric prefix doesn't make garbage a number.
+        for invalid in ["", "-5", "ten", " 7", "5000000000abc", "4294967296 "] {
+            assert_eq!(parse_clamped::<u32>(invalid, u32::MAX), None, "{invalid:?}");
+        }
     }
 
     #[test]

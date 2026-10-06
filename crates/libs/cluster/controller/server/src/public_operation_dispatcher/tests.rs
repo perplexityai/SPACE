@@ -55,6 +55,38 @@ fn m1_max_age_env_defaults_and_zero_disables() {
     assert_eq!(ReconcilerConfig::from_environment(&env).m1_max_age, None);
 }
 
+// This crate's tests build with `test-hooks` on (a dev-dependency feature), so
+// they can't tell a real environment read from a test-hook read. Keeping this
+// knob off the `test_*` readers is what makes release builds honour it.
+#[test]
+fn execution_concurrency_parses_and_clamps_from_the_environment() {
+    const CONCURRENCY: &str = "SPACE_PUBLIC_OPERATION_DISPATCHER_EXECUTION_CONCURRENCY";
+    let concurrency = |env: &pplx_space_test_env::TestEnv| {
+        ReconcilerConfig::from_environment(env).execution_concurrency
+    };
+    let mut env = pplx_space_test_env::TestEnv::default();
+    assert_eq!(concurrency(&env), DEFAULT_EXECUTION_CONCURRENCY);
+
+    env.set(CONCURRENCY, "40");
+    assert_eq!(concurrency(&env), 40);
+
+    // An over-ceiling value clamps rather than falling back to the default,
+    // including one too large for `usize`.
+    for over in ["500", "99999999999999999999"] {
+        env.set(CONCURRENCY, over);
+        assert_eq!(concurrency(&env), MAX_EXECUTION_CONCURRENCY, "{over:?}");
+    }
+
+    for invalid in ["0", "-5", "sixteen", "", "99999999999999999999x"] {
+        env.set(CONCURRENCY, invalid);
+        assert_eq!(
+            concurrency(&env),
+            DEFAULT_EXECUTION_CONCURRENCY,
+            "{invalid:?}"
+        );
+    }
+}
+
 #[test]
 fn tick_report_merge_sums_outcomes_without_claim_double_counting() {
     let mut report = TickReport {

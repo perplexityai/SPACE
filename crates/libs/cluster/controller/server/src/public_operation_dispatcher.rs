@@ -96,12 +96,14 @@ impl ReconcilerConfig {
                 DEFAULT_CLAIM_LIMIT,
                 1024,
             ),
-            execution_concurrency: config
-                .test_positive_usize(
-                    "SPACE_PUBLIC_OPERATION_DISPATCHER_EXECUTION_CONCURRENCY",
-                    DEFAULT_EXECUTION_CONCURRENCY,
-                )
-                .min(MAX_EXECUTION_CONCURRENCY),
+            // A deployment setting, unlike the test hooks around it: each
+            // execution holds its slot for the whole operation, so this bounds
+            // the dispatcher's throughput.
+            execution_concurrency: config.bounded_usize(
+                "SPACE_PUBLIC_OPERATION_DISPATCHER_EXECUTION_CONCURRENCY",
+                DEFAULT_EXECUTION_CONCURRENCY,
+                MAX_EXECUTION_CONCURRENCY,
+            ),
             claim_stale_after: config.test_duration_secs(
                 "SPACE_PUBLIC_OPERATION_DISPATCHER_CLAIM_STALE_SECS",
                 DEFAULT_CLAIM_STALE_AFTER,
@@ -363,6 +365,12 @@ pub async fn run<E>(
             "public-operation-dispatcher is enabled but has no supported operation kinds"
         );
     }
+    // The effective width, after the ceiling clamp. Nothing else exposes it,
+    // so without this line an over-ceiling setting looks like it took effect.
+    tracing::info!(
+        execution_concurrency = config.execution_concurrency,
+        "starting public-operation-dispatcher"
+    );
 
     let mut interval = tokio::time::interval(config.tick);
     interval.set_missed_tick_behavior(MissedTickBehavior::Delay);

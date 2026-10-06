@@ -2537,6 +2537,85 @@ async fn skipped_terminal_does_not_count_as_recovered_suspended() {
 }
 
 #[test]
+fn classification_rate_limit_from_env_clamps_to_a_finite_ceiling() {
+    const RATE: &str = "SPACE_API_RECONCILER_MAX_CLASSIFICATIONS_PER_MINUTE";
+    let rate = |env: &pplx_space_test_env::TestEnv| {
+        ReconcilerConfig::from_environment(env).max_classifications_per_minute
+    };
+    let mut env = pplx_space_test_env::TestEnv::default();
+
+    env.set(RATE, "10");
+    assert_eq!(rate(&env), 10);
+
+    for over in ["60000", "99999999999999999999"] {
+        env.set(RATE, over);
+        assert_eq!(
+            rate(&env),
+            MAX_CLASSIFICATIONS_PER_MINUTE_CEILING,
+            "{over:?}"
+        );
+    }
+
+    for invalid in ["0", "-5", "sixty", "5000000000abc"] {
+        env.set(RATE, invalid);
+        assert_eq!(
+            rate(&env),
+            DEFAULT_MAX_CLASSIFICATIONS_PER_MINUTE,
+            "{invalid:?}"
+        );
+    }
+}
+
+#[test]
+fn quarantine_breakers_from_env_clamp_to_finite_ceilings() {
+    const ACTIVE: &str = "SPACE_API_RECONCILER_MAX_ACTIVE_QUARANTINES";
+    const PER_SWEEP: &str = "SPACE_API_RECONCILER_MAX_NEW_QUARANTINES_PER_SWEEP";
+    const PERCENTAGE: &str = "SPACE_API_RECONCILER_MAX_QUARANTINE_PERCENTAGE";
+    let breakers = |env: &pplx_space_test_env::TestEnv| {
+        let cfg = ReconcilerConfig::from_environment(env);
+        (
+            cfg.max_active_quarantines,
+            cfg.max_new_quarantines_per_sweep,
+            cfg.max_quarantine_percentage,
+        )
+    };
+    let set_all = |env: &mut pplx_space_test_env::TestEnv, value: &str| {
+        for var in [ACTIVE, PER_SWEEP, PERCENTAGE] {
+            env.set(var, value);
+        }
+    };
+    let mut env = pplx_space_test_env::TestEnv::default();
+    let defaults = (
+        DEFAULT_MAX_ACTIVE_QUARANTINES,
+        DEFAULT_MAX_NEW_QUARANTINES_PER_SWEEP,
+        DEFAULT_MAX_QUARANTINE_PERCENTAGE,
+    );
+
+    set_all(&mut env, "7");
+    assert_eq!(breakers(&env), (7, 7, 7));
+
+    // `0` is the kill switch, not a request for the default.
+    set_all(&mut env, "0");
+    assert_eq!(breakers(&env), (0, 0, 0));
+
+    // However many digits a typo adds, a breaker can't clamp to "no limit".
+    let ceilings = (
+        MAX_ACTIVE_QUARANTINES_CEILING,
+        MAX_NEW_QUARANTINES_PER_SWEEP_CEILING,
+        MAX_QUARANTINE_PERCENTAGE_CEILING,
+    );
+    for over in ["5000", "5000000000", "99999999999999999999"] {
+        set_all(&mut env, over);
+        assert_eq!(breakers(&env), ceilings, "{over:?}");
+    }
+
+    for invalid in ["", "-5", "fifty", "50 ", "5000000000abc"] {
+        set_all(&mut env, invalid);
+        assert_eq!(breakers(&env), defaults, "{invalid:?}");
+    }
+}
+
+#[test]
 fn config_from_env_uses_defaults_when_unset() {
     let env = pplx_space_test_env::TestEnv::default();
     let cfg = ReconcilerConfig::from_environment(&env);

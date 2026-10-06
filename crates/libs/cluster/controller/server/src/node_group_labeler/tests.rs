@@ -3,15 +3,15 @@
 //! ## C — `ReconcilerConfig` + env parsing
 //! The name grammar is `NodeGroupName`'s (in `common-core`, with its own
 //! tests); `store/tests.rs` additionally pins that it still agrees with the
-//! `node_groups.name` CHECK. The rest of the env plumbing mirrors the other
-//! reconcilers' `from_env` helpers verbatim and is not re-tested here, which
-//! leaves `from_env`'s own `clamp_write_concurrency` call covered by inspection
-//! only. What that clamp guards is pinned where it bites: `t53` measures the
-//! patch fan-out's clamp through a real tick — the ceiling that actually bounds
+//! `node_groups.name` CHECK. `write_concurrency` isn't read from the
+//! environment; its clamp is pinned where it bites: `t53` measures the patch
+//! fan-out's clamp through a real tick — the ceiling that actually bounds
 //! concurrent apiserver writes — and `t52` the clamp function's boundaries.
+//! `from_env` reads only `SPACE_NODE_GROUP_LABELER_ENABLED`, through the
+//! shared `env_config::truthy_default`, and is not re-tested here.
 //!
-//! Do not close that gap by mutating the process environment, with or without a
-//! lock. `set_var`'s contract demands exclusion of every concurrent environment
+//! Do not test `from_env` by mutating the process environment, with or without
+//! a lock. `set_var`'s contract demands exclusion of every concurrent environment
 //! *access*, readers included and not merely writers of the same variable, so a
 //! mutex confined to this suite cannot discharge it: under the `cargo test`
 //! fallback that `AGENTS.md` mandates when `cargo nextest` is absent the whole
@@ -24,9 +24,9 @@
 //! count.** The numbering has gaps (t7, t15, t18, t26, t27, t29, t54, t55) and
 //! the highest number therefore exceeds the number of tests. t7/t15/t18/t27/t29
 //! were the `node_group_id` mirror phase's cases, removed with the phase itself
-//! — `node_group_mirror` owns that column now. `t54` asserted `from_env`'s clamp
-//! by mutating the process environment, which section C above explains this
-//! suite cannot do soundly. t26 and t55 folded into `t25`'s outcome table. The
+//! — `node_group_mirror` owns that column now. `t54` asserted an env-read
+//! clamp, since removed, by mutating the process environment, which section C
+//! above explains this suite cannot do soundly. t26 and t55 folded into `t25`'s outcome table. The
 //! gaps stay: the tests
 //! cross-reference each other by these names, so renumbering would rewrite every
 //! surviving one and invalidate every reference. A new case takes the next
@@ -1014,12 +1014,11 @@ async fn t25_a_census_race_owes_an_audit_only_from_an_issued_patch() {
 /// Guards the floor of [`clamp_write_concurrency`] at the fan-out.
 /// `buffer_unordered(0)` never fills its queue, so it yields `Pending` forever
 /// with no waker — a zero would wedge the tick rather than fail it, and this
-/// test would hang instead of failing. Not reachable from the environment
-/// (`env_config::positive_usize` maps `0` to the default), so the clamp
-/// guards a programmatic `ReconcilerConfig`; the field is `pub`, so that is
-/// one careless caller away. `t52` covers the same function's ceiling. The assertions themselves are
-/// concurrency-agnostic on purpose — what is pinned is that a `0` still makes
-/// progress.
+/// test would hang instead of failing. The value isn't read from the
+/// environment, so the clamp guards a programmatic `ReconcilerConfig`; the
+/// field is `pub`, so that is one careless caller away. `t52` covers the same
+/// function's ceiling. The assertions themselves are concurrency-agnostic on
+/// purpose — what is pinned is that a `0` still makes progress.
 #[tokio::test]
 async fn t13_all_nodes_labeled_under_serial_write_concurrency() {
     let sink = std::sync::Arc::new(FakeSink::with_group("workers"));
@@ -2424,8 +2423,8 @@ async fn t51_mislabeled_dedicated_nodes_are_published_as_a_gauge() {
 /// The pure function only, which is not evidence that either caller still
 /// routes through it: `t53` pins the ceiling's effect at the fan-out — the
 /// caller that bounds concurrent apiserver writes — and `t13` the floor's
-/// effect through a tick. The other caller, `from_env`, is deliberately
-/// unpinned; the module header's section C says why. Keep all three: this one
+/// effect through a tick. The other caller, `run`'s startup log, only
+/// reports the width. Keep all three: this one
 /// is the only place the boundaries themselves (`0`, the default, the ceiling
 /// exactly) are cheap to enumerate.
 #[test]

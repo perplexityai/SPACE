@@ -68,6 +68,30 @@ const DEFAULT_MAX_CLASSIFICATIONS_PER_MINUTE: u32 = 60;
 const DEFAULT_MAX_ACTIVE_QUARANTINES: u32 = 50;
 const DEFAULT_MAX_NEW_QUARANTINES_PER_SWEEP: u32 = 20;
 const DEFAULT_MAX_QUARANTINE_PERCENTAGE: u32 = 25;
+// Ceilings on the reconciler's safety limits. They exist so a typo can't
+// switch a limit off: an over-ceiling value clamps, so each ceiling has to be
+// a value at which its limit still bites. Raising a limit for a known cleanup
+// stays possible within the ceiling; the percentage ceiling deliberately caps
+// a cleanup that is almost all quarantines.
+
+/// 10× the default.
+const MAX_ACTIVE_QUARANTINES_CEILING: u32 = 10 * DEFAULT_MAX_ACTIVE_QUARANTINES;
+/// 10× the default, and below the rate ceiling: a small table's sweep fits in
+/// one tick, where the rate limit would stop it first.
+const MAX_NEW_QUARANTINES_PER_SWEEP_CEILING: u32 = 10 * DEFAULT_MAX_NEW_QUARANTINES_PER_SWEEP;
+const _: () =
+    assert!(MAX_NEW_QUARANTINES_PER_SWEEP_CEILING < MAX_CLASSIFICATIONS_PER_MINUTE_CEILING);
+/// 5× the default, and below [`DEFAULT_BATCH_SIZE`]. The limit counts live
+/// actions, and one tick a minute acts on at most one batch of candidates, so
+/// a limit at or above the batch size can't bind within a tick. It could bind
+/// only on the previous tick's actions, when they're still inside the window,
+/// which depends on how late each tick wakes.
+const MAX_CLASSIFICATIONS_PER_MINUTE_CEILING: u32 = 5 * DEFAULT_MAX_CLASSIFICATIONS_PER_MINUTE;
+const _: () = assert!(MAX_CLASSIFICATIONS_PER_MINUTE_CEILING < DEFAULT_BATCH_SIZE);
+/// 3× the default. A sweep's planned quarantines never exceed its planned
+/// dispositions, so at 100 the percentage breaker could never trip.
+const MAX_QUARANTINE_PERCENTAGE_CEILING: u32 = 3 * DEFAULT_MAX_QUARANTINE_PERCENTAGE;
+const _: () = assert!(MAX_QUARANTINE_PERCENTAGE_CEILING < 100);
 const QUARANTINE_PERCENTAGE_MIN_PLANS: u32 = 20;
 
 const RATE_LIMIT_WINDOW: Duration = Duration::from_mins(1);
@@ -175,25 +199,26 @@ impl ReconcilerConfig {
             batch_size: DEFAULT_BATCH_SIZE,
             // A safety rate limit that non-production clusters deliberately
             // lower, so it stays configurable.
-            max_classifications_per_minute: config.positive_u32(
+            max_classifications_per_minute: config.bounded_u32(
                 "SPACE_API_RECONCILER_MAX_CLASSIFICATIONS_PER_MINUTE",
                 DEFAULT_MAX_CLASSIFICATIONS_PER_MINUTE,
+                MAX_CLASSIFICATIONS_PER_MINUTE_CEILING,
             ),
             // Safety ceilings: `0` stops new quarantines.
             max_active_quarantines: config.bounded_u32_allow_zero(
                 "SPACE_API_RECONCILER_MAX_ACTIVE_QUARANTINES",
                 DEFAULT_MAX_ACTIVE_QUARANTINES,
-                u32::MAX,
+                MAX_ACTIVE_QUARANTINES_CEILING,
             ),
             max_new_quarantines_per_sweep: config.bounded_u32_allow_zero(
                 "SPACE_API_RECONCILER_MAX_NEW_QUARANTINES_PER_SWEEP",
                 DEFAULT_MAX_NEW_QUARANTINES_PER_SWEEP,
-                u32::MAX,
+                MAX_NEW_QUARANTINES_PER_SWEEP_CEILING,
             ),
             max_quarantine_percentage: config.bounded_u32_allow_zero(
                 "SPACE_API_RECONCILER_MAX_QUARANTINE_PERCENTAGE",
                 DEFAULT_MAX_QUARANTINE_PERCENTAGE,
-                100,
+                MAX_QUARANTINE_PERCENTAGE_CEILING,
             ),
             // Dry-run defaults to true so a fresh deployment gets
             // observability before any writes happen.
