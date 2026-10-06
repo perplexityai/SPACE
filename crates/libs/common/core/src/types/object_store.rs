@@ -247,7 +247,15 @@ pub enum SnapshotArtifact {
 
 impl SnapshotArtifact {
     /// Returns the file name component as it appears under the snapshot
-    /// directory.
+    /// directory. Parsing reverses it.
+    ///
+    /// ```rust
+    /// # use pplx_space_common_core::types::SnapshotArtifact;
+    /// let artifact: SnapshotArtifact = "rootfs.btrfs-send".parse()?;
+    /// assert_eq!(artifact.file_name(), "rootfs.btrfs-send");
+    /// assert!("../rootfs".parse::<SnapshotArtifact>().is_err());
+    /// # Ok::<(), pplx_space_common_core::types::SnapshotArtifactParseError>(())
+    /// ```
     pub const fn file_name(self) -> &'static str {
         match self {
             Self::Rootfs => "rootfs",
@@ -257,6 +265,34 @@ impl SnapshotArtifact {
             Self::EncryptedSnapshotVolume => "snapshot.luks",
             Self::EncryptedRootfsCow => "cow.luks",
             Self::Metadata => "metadata.json",
+        }
+    }
+}
+
+impl std::fmt::Display for SnapshotArtifact {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.file_name())
+    }
+}
+
+/// Error returned when a string is not a snapshot artifact file name.
+#[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
+#[error("unknown snapshot artifact file name: {0:?}")]
+pub struct SnapshotArtifactParseError(String);
+
+impl FromStr for SnapshotArtifact {
+    type Err = SnapshotArtifactParseError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "rootfs" => Ok(Self::Rootfs),
+            "rootfs.btrfs-send" => Ok(Self::RootfsBtrfsSend),
+            "memfile" => Ok(Self::Memory),
+            "binfile" => Ok(Self::VmState),
+            "snapshot.luks" => Ok(Self::EncryptedSnapshotVolume),
+            "cow.luks" => Ok(Self::EncryptedRootfsCow),
+            "metadata.json" => Ok(Self::Metadata),
+            other => Err(SnapshotArtifactParseError(other.to_owned())),
         }
     }
 }

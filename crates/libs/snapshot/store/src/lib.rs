@@ -11,6 +11,9 @@ use pplx_space_common_core::types::{
     SnapshotKindParseError, SnapshotName, SnapshotParseError, SnapshotState,
     SnapshotStateParseError, TemplateName, TemplateParseError,
 };
+use pplx_space_common_core::types::{
+    Digest, DigestParseError, SnapshotArtifact as SnapshotArtifactFile, SnapshotArtifactParseError,
+};
 use sqlx::FromRow;
 use sqlx::types::Json;
 use time::OffsetDateTime;
@@ -510,6 +513,151 @@ pub async fn delete_snapshot_catalog(
         .execute(&mut **tx)
         .await?;
     Ok(result.rows_affected() == 1)
+}
+
+/// Content digest of one artifact file in a snapshot attempt, as reported by
+/// the node that uploaded it. Restore compares the bytes it pulls against this
+/// instead of trusting the object store.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SnapshotArtifactDigest {
+    pub artifact: SnapshotArtifactFile,
+    pub digest: Digest,
+    pub size_bytes: u64,
+}
+
+/// Recording artifact digests failed.
+#[derive(Debug, thiserror::Error)]
+pub enum RecordArtifactDigestsError {
+    #[error(transparent)]
+    Database(#[from] sqlx::Error),
+
+    #[error("snapshot {snapshot_id} already records a different digest for {artifact}")]
+    Conflict {
+        snapshot_id: SnapshotId,
+        artifact: SnapshotArtifactFile,
+    },
+
+    #[error("snapshot {snapshot_id} reports a size for {artifact} beyond the catalog range")]
+    SizeOutOfRange {
+        snapshot_id: SnapshotId,
+        artifact: SnapshotArtifactFile,
+    },
+}
+
+/// Reading artifact digests failed.
+#[derive(Debug, thiserror::Error)]
+pub enum GetArtifactDigestsError {
+    #[error(transparent)]
+    Database(#[from] sqlx::Error),
+
+    #[error("snapshot {snapshot_id} records an unknown artifact")]
+    InvalidArtifact {
+        snapshot_id: SnapshotId,
+        #[source]
+        source: SnapshotArtifactParseError,
+    },
+
+    #[error("snapshot {snapshot_id} records an invalid digest for {artifact}")]
+    InvalidDigest {
+        snapshot_id: SnapshotId,
+        artifact: SnapshotArtifactFile,
+        #[source]
+        source: DigestParseError,
+    },
+
+    #[error("snapshot {snapshot_id} records a negative size for {artifact}")]
+    InvalidSize {
+        snapshot_id: SnapshotId,
+        artifact: SnapshotArtifactFile,
+    },
+}
+
+/// Record the digests the uploading node reported for `snapshot_id`.
+///
+/// Digests are write-once: a replay that repeats them is a no-op and one that
+/// disagrees is refused, so a later finalize cannot swap what restore verifies.
+pub async fn record_artifact_digests(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    snapshot_id: SnapshotId,
+    digests: &[SnapshotArtifactDigest],
+) -> Result<(), RecordArtifactDigestsError> {
+    for entry in digests {
+        let size_bytes = i64::try_from(entry.size_bytes).map_err(|_| {
+            RecordArtifactDigestsError::SizeOutOfRange {
+                snapshot_id,
+                artifact: entry.artifact,
+            }
+        })?;
+        // The no-op update keeps an identical replay at one affected row while
+        // a differing one touches nothing.
+        let result = sqlx::query(sql!(
+            "INSERT INTO snapshot_artifact_digests
+                 (snapshot_id, artifact, digest, size_bytes)
+             VALUES ($1, $2, $3, $4)
+             ON CONFLICT (snapshot_id, artifact) DO UPDATE
+                 SET digest = EXCLUDED.digest
+               WHERE snapshot_artifact_digests.digest = EXCLUDED.digest
+                 AND snapshot_artifact_digests.size_bytes = EXCLUDED.size_bytes"
+        ))
+        .bind(snapshot_id.as_uuid())
+        .bind(entry.artifact.file_name())
+        .bind(entry.digest.to_string())
+        .bind(size_bytes)
+        .execute(&mut **tx)
+        .await?;
+        if result.rows_affected() != 1 {
+            return Err(RecordArtifactDigestsError::Conflict {
+                snapshot_id,
+                artifact: entry.artifact,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// The digests recorded for `snapshot_id`, ordered by artifact file name.
+/// Empty for attempts finalized before digests were recorded.
+pub async fn artifact_digests(
+    executor: impl sqlx::PgExecutor<'_>,
+    snapshot_id: SnapshotId,
+) -> Result<Vec<SnapshotArtifactDigest>, GetArtifactDigestsError> {
+    let rows: Vec<(String, String, i64)> = sqlx::query_as(sql!(
+        "SELECT artifact, digest, size_bytes
+         FROM snapshot_artifact_digests
+         WHERE snapshot_id = $1
+         ORDER BY artifact"
+    ))
+    .bind(snapshot_id.as_uuid())
+    .fetch_all(executor)
+    .await?;
+
+    rows.into_iter()
+        .map(|(artifact, digest, size_bytes)| {
+            let artifact = SnapshotArtifactFile::from_str(&artifact).map_err(|source| {
+                GetArtifactDigestsError::InvalidArtifact {
+                    snapshot_id,
+                    source,
+                }
+            })?;
+            let digest = Digest::from_str(&digest).map_err(|source| {
+                GetArtifactDigestsError::InvalidDigest {
+                    snapshot_id,
+                    artifact,
+                    source,
+                }
+            })?;
+            let size_bytes =
+                u64::try_from(size_bytes).map_err(|_| GetArtifactDigestsError::InvalidSize {
+                    snapshot_id,
+                    artifact,
+                })?;
+            Ok(SnapshotArtifactDigest {
+                artifact,
+                digest,
+                size_bytes,
+            })
+        })
+        .collect()
 }
 
 /// Fetch one snapshot catalog row by id.

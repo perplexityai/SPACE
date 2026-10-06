@@ -47,9 +47,10 @@ use tonic::{Request, Response, Status};
 
 use pplx_space_common_core::node_drain_signals::EVACUATION_RESTORE_READY_CHANNEL;
 use pplx_space_common_core::types::{
-    ArtifactKind, ArtifactOrigin, AutoLifecyclePolicy, BackupAttemptId, ExactStorageUri,
+    ArtifactKind, ArtifactOrigin, AutoLifecyclePolicy, BackupAttemptId, Digest, ExactStorageUri,
     LocalArtifactId, NodeId, NodeRole as SpaceNodeRole, OrgId, RuntimeKind, SandboxId,
-    SnapshotContentHash, SnapshotId, SnapshotKind, SnapshotName, SnapshotState, TemplateName,
+    SnapshotArtifact as SnapshotArtifactFile, SnapshotContentHash, SnapshotId, SnapshotKind,
+    SnapshotName, SnapshotState, TemplateName,
 };
 use pplx_space_common_svc::types::{
     FACET_NETWORK_POLICY, FACET_NODE_STATUS, FACET_SANDBOX_DESIRED_STATE, FACET_SANDBOX_INVENTORY,
@@ -413,6 +414,36 @@ impl SnapshotSandboxRow {
     }
 }
 
+/// Parse the digests a node reports at finalize: one entry per artifact.
+fn parse_artifact_digests(
+    digests: &[crate::proto::SnapshotArtifactDigest],
+) -> Result<Vec<snapshot_store::SnapshotArtifactDigest>, Status> {
+    let mut seen = std::collections::BTreeSet::new();
+    digests
+        .iter()
+        .map(|entry| {
+            let artifact = SnapshotArtifactFile::from_str(&entry.artifact).map_err(|e| {
+                Status::invalid_argument(format!("invalid artifact_digests.artifact: {e}"))
+            })?;
+            if !seen.insert(artifact) {
+                return Err(Status::invalid_argument(format!(
+                    "duplicate artifact_digests entry for {artifact}"
+                )));
+            }
+            let digest = Digest::from_str(&entry.digest).map_err(|e| {
+                Status::invalid_argument(format!(
+                    "invalid artifact_digests.digest for {artifact}: {e}"
+                ))
+            })?;
+            Ok(snapshot_store::SnapshotArtifactDigest {
+                artifact,
+                digest,
+                size_bytes: entry.size_bytes,
+            })
+        })
+        .collect()
+}
+
 fn snapshot_insert_status(error: snapshot_store::InsertSnapshotError) -> Status {
     match error {
         snapshot_store::InsertSnapshotError::IdentityConflict { .. }
@@ -554,6 +585,7 @@ impl ClusterApiService {
         target_state: SnapshotState,
         bytes_uploaded: i64,
         failure_reason: Option<&str>,
+        artifact_digests: &[snapshot_store::SnapshotArtifactDigest],
         remote_addr: Option<std::net::SocketAddr>,
     ) -> Result<(), Status> {
         let attempt = self
@@ -636,6 +668,22 @@ impl ClusterApiService {
             ));
         }
         let sandbox_id = finalized_snapshot.sandbox_id;
+
+        if target_state.is_ready() {
+            snapshot_store::record_artifact_digests(&mut tx, snapshot_id, artifact_digests)
+                .await
+                .map_err(|error| match &error {
+                    snapshot_store::RecordArtifactDigestsError::Conflict { .. } => {
+                        Status::failed_precondition(error.to_string())
+                    }
+                    snapshot_store::RecordArtifactDigestsError::SizeOutOfRange { .. } => {
+                        Status::invalid_argument(error.to_string())
+                    }
+                    snapshot_store::RecordArtifactDigestsError::Database(_) => {
+                        Status::internal(format!("record artifact digests: {error}"))
+                    }
+                })?;
+        }
 
         let suspend_projection = if target_state.is_ready() {
             project_ready_suspend_snapshot(&mut tx, snapshot_id).await?
@@ -844,11 +892,13 @@ impl ClusterApiService {
                 ));
             }
         };
+        let artifact_digests = parse_artifact_digests(&req.artifact_digests)?;
         self.finalize_backup_attempt(
             SnapshotId::from_uuid(backup_attempt_id.as_uuid()),
             target_state,
             req.bytes_uploaded,
             req.failure_reason.as_deref(),
+            &artifact_digests,
             remote_addr,
         )
         .await?;
@@ -909,12 +959,16 @@ impl ClusterApiService {
                 "no ready backup for local artifact {local_artifact_id}"
             ))
         })?;
+        let artifact_digests = self
+            .artifact_digests_for_restore(SnapshotId::from_uuid(row.backup_attempt_id))
+            .await?;
         Ok(Response::new(GetArtifactBackupLocationResponse {
             local_artifact_id: local_artifact_id.to_string(),
             artifact_kind: artifact_kind_to_proto(artifact_kind),
             backup_attempt_id: row.backup_attempt_id.to_string(),
             storage_uri: row.storage_uri,
             bytes_uploaded: row.size_bytes.unwrap_or(0),
+            artifact_digests,
         }))
     }
 
@@ -1082,11 +1136,30 @@ impl ClusterApiService {
             ))
         })?;
 
+        let artifact_digests = self.artifact_digests_for_restore(row.snapshot_id).await?;
         Ok(Response::new(GetSuspendSnapshotLocationResponse {
             snapshot_id: row.snapshot_id.to_string(),
             storage_uri: row.storage_connection_string,
             bytes_uploaded: row.size_bytes.unwrap_or(0),
+            artifact_digests,
         }))
+    }
+
+    async fn artifact_digests_for_restore(
+        &self,
+        snapshot_id: SnapshotId,
+    ) -> Result<Vec<crate::proto::SnapshotArtifactDigest>, Status> {
+        let digests = snapshot_store::artifact_digests(&self.pool, snapshot_id)
+            .await
+            .map_err(|e| Status::internal(format!("artifact digest lookup: {e}")))?;
+        Ok(digests
+            .into_iter()
+            .map(|digest| crate::proto::SnapshotArtifactDigest {
+                artifact: digest.artifact.file_name().to_string(),
+                digest: digest.digest.to_string(),
+                size_bytes: digest.size_bytes,
+            })
+            .collect())
     }
 
     async fn fetch_nodes(
@@ -1327,7 +1400,6 @@ impl ClusterApiService {
         Ok(origin)
     }
 
-    /// The catalog row for a backup attempt, if the attempt is registered.
     async fn registered_backup_attempt(
         &self,
         snapshot_id: SnapshotId,

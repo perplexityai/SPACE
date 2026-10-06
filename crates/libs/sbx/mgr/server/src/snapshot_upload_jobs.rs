@@ -1008,6 +1008,7 @@ async fn finalize_with_cluster_api_ready(
         target_state: pplx_space_node_api_client::proto::SuspendSnapshotTerminalState::Ready as i32,
         bytes_uploaded: bytes,
         failure_reason: None,
+        artifact_digests: Vec::new(),
     };
 
     match client.finalize_artifact_backup(req).await {
@@ -1084,6 +1085,7 @@ pub(crate) async fn finalize_with_cluster_api_failed(snapshot_id: &str, reason: 
             as i32,
         bytes_uploaded: 0,
         failure_reason: Some(reason.to_string()),
+        artifact_digests: Vec::new(),
     };
     if let Err(status) = client.finalize_artifact_backup(req).await {
         tracing::warn!(

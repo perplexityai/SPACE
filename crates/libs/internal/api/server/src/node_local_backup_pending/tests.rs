@@ -1684,6 +1684,7 @@ async fn finalize(
         target_state: state as i32,
         bytes_uploaded: 1,
         failure_reason: None,
+        artifact_digests: Vec::new(),
     });
     request
         .extensions_mut()
