@@ -317,6 +317,7 @@ async fn register_template_with_org(
 ) -> Result<(), tonic::Status> {
     service
         .register_template(publisher_request(RegisterTemplateRequest {
+            system_publication_grant_id: None,
             name: name.to_string(),
             description: None,
             org_id: org_id.map(|org_id| org_id.to_string()),
@@ -347,6 +348,7 @@ async fn register_release(
 ) -> Result<RegisterTemplateReleaseResponse, tonic::Status> {
     Ok(service
         .register_template_release(publisher_request(RegisterTemplateReleaseRequest {
+            system_publication_grant_id: None,
             template_name: "code-runtime".to_string(),
             runtime: "fc".to_string(),
             hash: hash.to_string(),
@@ -369,6 +371,7 @@ async fn register_release_with_execution(
 ) -> Result<RegisterTemplateReleaseResponse, tonic::Status> {
     Ok(service
         .register_template_release(publisher_request(RegisterTemplateReleaseRequest {
+            system_publication_grant_id: None,
             template_name: "code-runtime".to_string(),
             runtime: "fc".to_string(),
             hash: hash.to_string(),
@@ -779,6 +782,7 @@ async fn build_release_keeps_the_submitting_org_and_rejects_another_owner() -> T
     let name = format!("owned-build-{}", Uuid::now_v7());
     register_template_with_org(&fixture.service, &name, Some(OrgId::from_uuid(owner))).await?;
     let request = RegisterTemplateReleaseRequest {
+        system_publication_grant_id: None,
         template_name: name.clone(),
         runtime: "fc".into(),
         hash: format!("sha256:{}", "a".repeat(64)),
@@ -890,6 +894,7 @@ async fn register_template_release_is_idempotent_by_hash() -> TestResult {
     let retagged = fixture
         .service
         .register_template_release(publisher_request(RegisterTemplateReleaseRequest {
+            system_publication_grant_id: None,
             template_name: "code-runtime".to_string(),
             runtime: "fc".to_string(),
             hash: digest_a.to_string(),

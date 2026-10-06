@@ -6,7 +6,8 @@ use pplx_space_build_mgr_client::proto::{
     UploadBlobResponse,
 };
 use pplx_space_common_core::types::{
-    BuildRunId, NodeId, OrgId, SystemTemplate, TemplateName, TemplateReference,
+    BuildRunId, NodeId, OrgId, SystemPublicationGrantId, SystemTemplate, TemplateName,
+    TemplateReference,
 };
 use pplx_space_node_api_client::proto::BuildTemplateResponse;
 use pplx_space_template_mgr_client::proto::{
@@ -151,8 +152,12 @@ impl TemplateBuildSubmission {
         Ok(None)
     }
 
-    fn into_start_build_request(self) -> StartBuildRequest {
+    fn into_start_build_request(
+        self,
+        grant: Option<SystemPublicationGrantId>,
+    ) -> StartBuildRequest {
         StartBuildRequest {
+            system_publication_grant_id: grant.map(|grant| grant.to_string()),
             recipe: Some(self.recipe),
             template_id: self.target.template_name().to_string(),
             options: Some(BuildOptions {
@@ -307,14 +312,16 @@ impl TemplateController {
                     .record_system_publication_grant(&template_name)
                     .await
                     .map_err(|error| {
-                        db_contention_error("failed to record system publication grant", &error)
+                        build_jobs_store_error("failed to record system publication grant", error)
                     })?,
             ),
             TemplateBuildTarget::Organization(_) => None,
         };
         let client_build_id = submission.client_build_id.clone();
         let response = match self
-            .start_template_build_request(submission.into_start_build_request())
+            .start_template_build_request(
+                submission.into_start_build_request(system_publication_grant),
+            )
             .await
         {
             Ok(response) => response,

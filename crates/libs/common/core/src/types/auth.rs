@@ -461,6 +461,11 @@ macro_rules! uuid_id {
 uuid_id!(CredentialReferenceId);
 
 uuid_id!(
+    /// Authorization for one system template build's publication.
+    SystemPublicationGrantId
+);
+
+uuid_id!(
     /// Identity of a persisted background job, retained across retries and recovery.
     JobId
 );

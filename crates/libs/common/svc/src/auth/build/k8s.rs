@@ -23,8 +23,8 @@ pub(super) struct BuildPolicy {
     audience: String,
     allowed: BTreeSet<String>,
     system: BTreeSet<String>,
-    /// System publishers whose system publications need the API's system
-    /// build grant.
+    /// System publishers whose system publications need an independently
+    /// issued build grant.
     granted_system: BTreeSet<String>,
     tenant: BTreeSet<String>,
 }
@@ -38,7 +38,7 @@ impl BuildPolicy {
         tenant: BTreeSet<String>,
     ) -> Self {
         // A publisher that also publishes tenant templates is the build path:
-        // it carries the job scope the API authorized, but omitting the owner
+        // it carries the independently authorized job scope, but omitting the owner
         // must not let it classify a build as a system one on its own.
         let granted_system: BTreeSet<String> = match surface {
             BuildSurface::Publication => system.intersection(&tenant).cloned().collect(),
@@ -106,7 +106,7 @@ impl BuildTokenReviewer {
         if !policy.granted_system.is_empty() {
             tracing::info!(
                 accounts = ?policy.granted_system,
-                "system template publication by these accounts requires an API system build grant"
+                "system template publication by these accounts requires an independently issued build grant"
             );
         }
         let per_second = std::env::var("SPACE_K8S_TOKEN_AUTH_REVIEW_RATE_PER_SEC")

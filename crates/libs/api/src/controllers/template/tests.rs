@@ -154,7 +154,7 @@ async fn build_admission_authorizes_and_pins_the_base_release(
     accepted.authorize_base(&db.pool).await?;
     sqlx::query(sql!("UPDATE template_release_tags SET template_release_id = (SELECT id FROM template_releases WHERE hash = $1) WHERE template_name = 'private-base' AND tag = 'stable'"))
         .bind(&hash_b).execute(&db.pool).await?;
-    let request = accepted.into_start_build_request();
+    let request = accepted.into_start_build_request(None);
     let Some(recipe) = request.recipe else {
         panic!("inline recipe")
     };
@@ -587,7 +587,7 @@ fn template_build_submission_maps_to_builder_request(#[case] system: Option<Syst
         },
         org_id: OrgId::from_uuid(org_id),
     }
-    .into_start_build_request();
+    .into_start_build_request(None);
 
     assert_eq!(
         request.template_id,

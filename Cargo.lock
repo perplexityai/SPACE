@@ -5077,10 +5077,15 @@ name = "pplx-space-build-mgr-cli"
 version = "0.8.0"
 dependencies = [
  "anyhow",
+ "axum",
  "clap",
+ "http-body-util",
+ "hyper",
  "pplx-space-build-mgr",
  "pplx-space-build-mgr-client",
  "pplx-space-common-cli",
+ "pplx-space-node-api-client",
+ "prost",
  "tempfile",
  "tokio",
  "tokio-stream",

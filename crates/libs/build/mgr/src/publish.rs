@@ -7,8 +7,9 @@ use bytes::Bytes;
 use pplx_space_common_core::host::linux::paths::template_build_dir;
 use pplx_space_common_core::types::{
     AuthIdParseError, ContentHash, OrgId, RUNTIME_FIRECRACKER_ALIAS, StorageUri,
-    TEMPLATE_ROOTFS_ZSTD_CODEC, TEMPLATE_ROOTFS_ZSTD_FILE, TEMPLATE_ROOTFS_ZSTD_LEVEL,
-    TemplateArtifact, TemplateName, template_object_key, template_object_prefix,
+    SystemPublicationGrantId, TEMPLATE_ROOTFS_ZSTD_CODEC, TEMPLATE_ROOTFS_ZSTD_FILE,
+    TEMPLATE_ROOTFS_ZSTD_LEVEL, TemplateArtifact, TemplateName, template_object_key,
+    template_object_prefix,
 };
 use pplx_space_common_svc::page_cache;
 use pplx_space_node_api_client::cluster::{
@@ -16,8 +17,8 @@ use pplx_space_node_api_client::cluster::{
     connect_from_env as connect_cluster_api_from_env,
 };
 use pplx_space_node_api_client::proto::{
-    FacetRef, MarkFacetDirtyRequest, ReconcileFacet, RegisterTemplateReleaseRequest,
-    RegisterTemplateRequest, facet_ref,
+    CreateSystemTemplatePublicationGrantRequest, FacetRef, MarkFacetDirtyRequest, ReconcileFacet,
+    RegisterTemplateReleaseRequest, RegisterTemplateRequest, facet_ref,
 };
 use pplx_space_object_store::{
     ObjectCredentials, ObjectStore, ObjectStoreError, ObjectTarget, S3ObjectStore,
@@ -51,8 +52,35 @@ impl TemplateOrg {
     }
 }
 
+/// The ownership or specific system authorization persisted with a build.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TemplatePublication {
+    Tenant(TemplateOrg),
+    System(Option<SystemPublicationGrantId>),
+}
+
+impl TemplatePublication {
+    pub const fn org(self) -> Option<TemplateOrg> {
+        match self {
+            Self::Tenant(org) => Some(org),
+            Self::System(_) => None,
+        }
+    }
+
+    pub const fn system_grant(self) -> Option<SystemPublicationGrantId> {
+        match self {
+            Self::Tenant(_) => None,
+            Self::System(grant) => grant,
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum PublishError {
+    #[error("authorize operator system build: {0}")]
+    AuthorizeSystemBuild(#[source] tonic::Status),
+    #[error("invalid system publication grant returned by ClusterApi: {0}")]
+    InvalidSystemGrant(#[source] AuthIdParseError),
     #[error(transparent)]
     InvalidTemplateName(#[from] pplx_space_common_core::types::TemplateParseError),
     #[error(transparent)]
@@ -102,9 +130,35 @@ pub enum PublishError {
     RegisterTemplateRelease(#[source] tonic::Status),
 }
 
+/// Called by the direct operator CLI using its own ClusterApi credential,
+/// before submitting to build-manager. Only an unconfigured cluster is local-only;
+/// missing or insufficient operator authority fails before the build is queued.
+pub async fn authorize_operator_system_build(
+    template_id: &str,
+) -> Result<Option<SystemPublicationGrantId>, PublishError> {
+    let template = TemplateName::parse(template_id.to_owned())?;
+    let mut client = match connect_cluster_api_from_env().await {
+        Ok(client) => client,
+        Err(ConnectClusterApiError::MissingEndpoint) => return Ok(None),
+        Err(error) => return Err(PublishError::ClusterApiConnect(error)),
+    };
+    let response = client
+        .create_system_template_publication_grant(CreateSystemTemplatePublicationGrantRequest {
+            template_name: template.to_string(),
+        })
+        .await
+        .map_err(PublishError::AuthorizeSystemBuild)?
+        .into_inner();
+    response
+        .grant_id
+        .parse()
+        .map(Some)
+        .map_err(PublishError::InvalidSystemGrant)
+}
+
 pub async fn register_build_template(
     template_id: &str,
-    template_org: Option<TemplateOrg>,
+    publication: TemplatePublication,
 ) -> Result<(), PublishError> {
     let template = TemplateName::parse(template_id.to_string())?;
     let mut cluster_api = match connect_cluster_api_from_env().await {
@@ -118,14 +172,14 @@ pub async fn register_build_template(
         }
         Err(error) => return Err(PublishError::ClusterApiConnect(error)),
     };
-    ensure_cluster_template(&mut cluster_api, &template, template_org).await
+    ensure_cluster_template(&mut cluster_api, &template, publication).await
 }
 
 pub async fn publish_build(
     template_id: &str,
     content_hash: &str,
     publish_tags: &[String],
-    template_org: Option<TemplateOrg>,
+    publication: TemplatePublication,
 ) -> Result<(), PublishError> {
     let template = TemplateName::parse(template_id.to_string())?;
     let content_hash = content_hash.parse::<ContentHash>()?;
@@ -150,14 +204,14 @@ pub async fn publish_build(
     let execution = Some(load_build_execution_metadata(&build_dir).await?);
 
     let Some(object_store) = ObjectStoreConfig::from_env_optional()? else {
-        ensure_cluster_template(&mut cluster_api, &template, template_org).await?;
+        ensure_cluster_template(&mut cluster_api, &template, publication).await?;
         register_cluster_release(
             &mut cluster_api,
             &template,
             content_hash,
             &release_tags,
             Vec::new(),
-            template_org,
+            publication,
             execution,
         )
         .await?;
@@ -173,7 +227,7 @@ pub async fn publish_build(
     // Register the template identity before asking Credential Manager to
     // authorize publication. A failed upload may leave a template with no
     // release, but never a release that points at partial objects.
-    ensure_cluster_template(&mut cluster_api, &template, template_org).await?;
+    ensure_cluster_template(&mut cluster_api, &template, publication).await?;
     let publication_prefix =
         template_object_prefix(&object_store.key_prefix, &template, content_hash);
     let creds = acquire_after_artifacts_ready(&build_dir, || {
@@ -204,7 +258,7 @@ pub async fn publish_build(
         content_hash,
         &release_tags,
         vec![storage_uri],
-        template_org,
+        publication,
         execution,
     )
     .await?;
@@ -365,9 +419,9 @@ async fn register_with_transient_retry(
 async fn ensure_cluster_template(
     cluster_api: &mut AuthenticatedClusterApiClient,
     template: &TemplateName,
-    template_org: Option<TemplateOrg>,
+    publication: TemplatePublication,
 ) -> Result<(), PublishError> {
-    let request = RegisterRequest::Template(template_registration_request(template, template_org));
+    let request = RegisterRequest::Template(template_registration_request(template, publication));
     match register_with_transient_retry(cluster_api, template, request).await {
         Ok(()) => Ok(()),
         Err(status) if status.code() == Code::AlreadyExists => Ok(()),
@@ -377,12 +431,13 @@ async fn ensure_cluster_template(
 
 fn template_registration_request(
     template: &TemplateName,
-    template_org: Option<TemplateOrg>,
+    publication: TemplatePublication,
 ) -> RegisterTemplateRequest {
     RegisterTemplateRequest {
+        system_publication_grant_id: publication.system_grant().map(|grant| grant.to_string()),
         name: template.as_str().to_string(),
         description: None,
-        org_id: template_org.map(|owner| owner.org_id().to_string()),
+        org_id: publication.org().map(|owner| owner.org_id().to_string()),
     }
 }
 
@@ -392,21 +447,40 @@ async fn register_cluster_release(
     content_hash: ContentHash,
     tags: &[String],
     storage_connection_strings: Vec<String>,
-    template_org: Option<TemplateOrg>,
+    publication: TemplatePublication,
     execution: Option<pplx_space_execution_common::proto::ExecutionMetadata>,
 ) -> Result<(), PublishError> {
-    let request = RegisterRequest::Release(RegisterTemplateReleaseRequest {
+    let request = RegisterRequest::Release(release_registration_request(
+        template,
+        content_hash,
+        tags,
+        storage_connection_strings,
+        publication,
+        execution,
+    ));
+    register_with_transient_retry(cluster_api, template, request)
+        .await
+        .map_err(PublishError::RegisterTemplateRelease)
+}
+
+fn release_registration_request(
+    template: &TemplateName,
+    content_hash: ContentHash,
+    tags: &[String],
+    storage_connection_strings: Vec<String>,
+    publication: TemplatePublication,
+    execution: Option<pplx_space_execution_common::proto::ExecutionMetadata>,
+) -> RegisterTemplateReleaseRequest {
+    RegisterTemplateReleaseRequest {
+        system_publication_grant_id: publication.system_grant().map(|grant| grant.to_string()),
         template_name: template.as_str().to_string(),
         runtime: RUNTIME_FIRECRACKER_ALIAS.to_string(),
         hash: content_hash.to_string(),
         tags: tags.to_vec(),
         storage_connection_strings,
-        org_id: template_org.map(|owner| owner.org_id().to_string()),
+        org_id: publication.org().map(|owner| owner.org_id().to_string()),
         execution,
-    });
-    register_with_transient_retry(cluster_api, template, request)
-        .await
-        .map_err(PublishError::RegisterTemplateRelease)
+    }
 }
 
 /// Loads the build's execution metadata for attachment to the release

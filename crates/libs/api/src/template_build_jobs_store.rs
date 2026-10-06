@@ -2,7 +2,9 @@ use std::str::FromStr;
 
 use pplx_space_common_core::{
     sql,
-    types::{BuildRunId, BuildRunIdParseError, NodeId, OrgId, TemplateName},
+    types::{
+        BuildRunId, BuildRunIdParseError, NodeId, OrgId, SystemPublicationGrantId, TemplateName,
+    },
 };
 use sqlx::PgPool;
 
@@ -26,11 +28,6 @@ impl BuildBaseGrantId {
         self.0
     }
 }
-
-/// One system build submission's pre-dispatch publication grant
-/// (`template_system_publication_grants.id`).
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct SystemPublicationGrantId(uuid::Uuid);
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct BuildSpec {
@@ -175,19 +172,19 @@ impl TemplateBuildJobsStore {
     pub(crate) async fn record_system_publication_grant(
         &self,
         template_name: &TemplateName,
-    ) -> Result<SystemPublicationGrantId, sqlx::Error> {
+    ) -> Result<SystemPublicationGrantId, TemplateBuildJobsStoreError> {
         sqlx::query(sql!(
             "DELETE FROM template_system_publication_grants
              WHERE granted_at < NOW() - INTERVAL '7 days'"
         ))
         .execute(&self.pool)
         .await?;
-        let grant = SystemPublicationGrantId(uuid::Uuid::now_v7());
+        let grant = SystemPublicationGrantId::new();
         sqlx::query(sql!(
             "INSERT INTO template_system_publication_grants (id, template_name)
              VALUES ($1, $2)"
         ))
-        .bind(grant.0)
+        .bind(grant.as_uuid())
         .bind(template_name.as_str())
         .execute(&self.pool)
         .await?;
@@ -199,11 +196,11 @@ impl TemplateBuildJobsStore {
     pub(crate) async fn revoke_system_publication_grant(
         &self,
         grant: SystemPublicationGrantId,
-    ) -> Result<(), sqlx::Error> {
+    ) -> Result<(), TemplateBuildJobsStoreError> {
         sqlx::query(sql!(
             "DELETE FROM template_system_publication_grants WHERE id = $1"
         ))
-        .bind(grant.0)
+        .bind(grant.as_uuid())
         .execute(&self.pool)
         .await?;
         Ok(())

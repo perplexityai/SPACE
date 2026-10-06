@@ -113,6 +113,30 @@ impl ClusterApiService {
 
 #[tonic::async_trait]
 impl ClusterApi for ClusterApiService {
+    async fn create_system_template_publication_grant(
+        &self,
+        request: Request<CreateSystemTemplatePublicationGrantRequest>,
+    ) -> Result<Response<CreateSystemTemplatePublicationGrantResponse>, Status> {
+        pplx_space_common_svc::auth::build::authorize_system_publication_grant(&request)?;
+        let template = template_publication::parse_template_name(&request.get_ref().template_name)?;
+        let mut tx = self.pool.begin().await.map_err(|error| {
+            Status::internal(format!("begin system publication grant: {error}"))
+        })?;
+        let grant = template_system_publication_grants::issue(&mut tx, &template)
+            .await
+            .map_err(|error| {
+                Status::internal(format!("issue system publication grant: {error}"))
+            })?;
+        tx.commit().await.map_err(|error| {
+            Status::internal(format!("commit system publication grant: {error}"))
+        })?;
+        Ok(Response::new(
+            CreateSystemTemplatePublicationGrantResponse {
+                grant_id: grant.to_string(),
+            },
+        ))
+    }
+
     async fn list_nodes(
         &self,
         request: Request<ListNodesRequest>,
@@ -147,6 +171,11 @@ impl ClusterApi for ClusterApiService {
         let name = template_publication::parse_template_name(&request.name)?;
         let description = optional_trimmed(request.description.as_deref());
         let template_org = TemplateOrg::parse(request.org_id.as_deref())?;
+        let system_grant = template_publication::system_publication_grant(
+            request.system_publication_grant_id.as_deref(),
+            template_org,
+            requires_grant,
+        )?;
         self.reserved_template_names
             .authorize(&name, template_org)?;
 
@@ -157,13 +186,12 @@ impl ClusterApi for ClusterApiService {
             .map_err(|err| Status::internal(format!("begin template registration: {err}")))?;
 
         // Registration leaves the grant for the release that follows it.
-        if template_org == TemplateOrg::System
-            && requires_grant
-            && !template_system_publication_grants::covers(&mut *tx, &name)
+        if let Some(grant) = system_grant
+            && !template_system_publication_grants::covers(&mut *tx, &name, grant)
                 .await
                 .map_err(|err| Status::internal(format!("check system publication: {err}")))?
         {
-            return Err(template_system_publication_grants::missing());
+            return Err(template_publication::missing_system_publication_grant());
         }
 
         let inserted = template_registration_store::insert(
@@ -218,6 +246,11 @@ impl ClusterApi for ClusterApiService {
             &self.trusted_template_storage,
         )?;
         let template_org = TemplateOrg::parse(request.org_id.as_deref())?;
+        let system_grant = template_publication::system_publication_grant(
+            request.system_publication_grant_id.as_deref(),
+            template_org,
+            requires_grant,
+        )?;
         self.reserved_template_names
             .authorize(&template_name, template_org)?;
         let execution_metadata = validated_execution_metadata(request.execution.as_ref())?;
@@ -230,13 +263,12 @@ impl ClusterApi for ClusterApiService {
 
         // Consumed with the release it authorizes: a rolled-back publication
         // keeps its grant, and a committed one cannot be repeated.
-        if template_org == TemplateOrg::System
-            && requires_grant
-            && !template_system_publication_grants::consume(&mut *tx, &template_name)
+        if let Some(grant) = system_grant
+            && !template_system_publication_grants::consume(&mut *tx, &template_name, grant)
                 .await
                 .map_err(|err| Status::internal(format!("consume system publication: {err}")))?
         {
-            return Err(template_system_publication_grants::missing());
+            return Err(template_publication::missing_system_publication_grant());
         }
         let release_org_id = self
             .lock_template_for_publication(&mut tx, &template_name, template_org)

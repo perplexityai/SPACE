@@ -434,13 +434,16 @@ async fn system_publication_grants_are_per_submission_and_swept_when_stale(
     ))
     .fetch_all(pool)
     .await?;
-    assert_eq!(grants, vec![(first.0, true), (second.0, true)]);
+    assert_eq!(
+        grants,
+        vec![(first.as_uuid(), true), (second.as_uuid(), true)]
+    );
 
     fixture.store.revoke_system_publication_grant(first).await?;
     let remaining: Vec<uuid::Uuid> =
         sqlx::query_scalar(sql!("SELECT id FROM template_system_publication_grants"))
             .fetch_all(pool)
             .await?;
-    assert_eq!(remaining, vec![second.0]);
+    assert_eq!(remaining, vec![second.as_uuid()]);
     Ok(())
 }

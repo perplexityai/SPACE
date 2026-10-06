@@ -26,3 +26,10 @@ tonic = { workspace = true }
 pplx-space-build-mgr = { workspace = true }
 pplx-space-build-mgr-client = { workspace = true }
 pplx-space-common-cli = { workspace = true }
+
+[dev-dependencies]
+axum = { workspace = true }
+http-body-util = { workspace = true }
+hyper = { workspace = true }
+prost = { workspace = true }
+pplx-space-node-api-client = { workspace = true }

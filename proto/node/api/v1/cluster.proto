@@ -15,6 +15,10 @@ import "template/manager/v1/manager.proto";
 service ClusterApi {
   rpc ListNodes(ListNodesRequest) returns (ListNodesResponse);
 
+  // Delegate one system publication to a build. Only a system-only publisher
+  // may issue these grants; a dual-authority build-manager cannot authorize itself.
+  rpc CreateSystemTemplatePublicationGrant(CreateSystemTemplatePublicationGrantRequest) returns (CreateSystemTemplatePublicationGrantResponse);
+
   // Register a template. Fails with ALREADY_EXISTS if `name` is already taken.
   rpc RegisterTemplate(RegisterTemplateRequest) returns (RegisterTemplateResponse);
 
@@ -280,10 +284,20 @@ message TemplateReleaseStorageLocation {
   string created_at = 3;    // RFC3339
 }
 
+message CreateSystemTemplatePublicationGrantRequest {
+  string template_name = 1;
+}
+
+message CreateSystemTemplatePublicationGrantResponse {
+  string grant_id = 1;
+}
+
 message RegisterTemplateRequest {
   string name = 1;
   optional string description = 2;
   optional string org_id = 4;
+  // One build submission's system publication authorization.
+  optional string system_publication_grant_id = 5;
 }
 
 message RegisterTemplateResponse {
@@ -309,6 +323,8 @@ message RegisterTemplateReleaseRequest {
   // `(template_name, hash)`, so the first registration that carries this wins;
   // later registrations never overwrite stored execution metadata.
   optional space.execution.v1.ExecutionMetadata execution = 8;
+  // Consumed atomically with the release; never substitutes another build's grant.
+  optional string system_publication_grant_id = 9;
 }
 
 message RegisterTemplateReleaseResponse {

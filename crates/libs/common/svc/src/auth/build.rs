@@ -42,6 +42,7 @@ impl BuildSurface {
                 path,
                 "/space.node.api.v1.ClusterApi/RegisterTemplate"
                     | "/space.node.api.v1.ClusterApi/RegisterTemplateRelease"
+                    | "/space.node.api.v1.ClusterApi/CreateSystemTemplatePublicationGrant"
             ),
         }
     }
@@ -204,7 +205,7 @@ impl BuildAuthenticator {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SystemTemplateAuthority {
     Denied,
-    /// System publication only for a system build the API dispatched: ClusterApi
+    /// System publication only for an independently authorized build: ClusterApi
     /// requires that build's `template_system_publication_grants` row.
     Granted,
     Unconditional,
@@ -252,8 +253,24 @@ pub fn authorize_template_build<T>(
     }
 }
 
-/// Whether a system publication by the caller needs the API's system build
-/// grant. An unauthenticated caller is rejected by [`authorize_template_build`].
+/// Only an independently authorized system publisher may delegate publication
+/// to a build. A dual-authority publisher cannot mint its own authorization.
+pub fn authorize_system_publication_grant<T>(request: &Request<T>) -> Result<(), Status> {
+    if request
+        .extensions()
+        .get::<BuildAuthenticatedCaller>()
+        .is_some_and(|caller| caller.system == SystemTemplateAuthority::Unconditional)
+    {
+        Ok(())
+    } else {
+        Err(Status::permission_denied(
+            "issuing a system publication grant requires system-only publisher authority",
+        ))
+    }
+}
+
+/// Whether a system publication by the caller needs an independently issued
+/// build grant. An unauthenticated caller is rejected by [`authorize_template_build`].
 pub fn system_publication_requires_grant<T>(request: &Request<T>) -> bool {
     request
         .extensions()
