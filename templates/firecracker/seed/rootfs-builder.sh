@@ -457,6 +457,12 @@ OOMPolicy=continue
 # daemon can write cgroup.subtree_control and create the leaves. Without it a
 # runaway workload shares spaced's budget and starves the host health pings.
 Delegate=yes
+# No unit-wide task cap. systemd's default (15% of the kernel's task limit)
+# would cover spaced and every workload together, so a workload that creates
+# a few thousand threads would leave spaced unable to start a thread or
+# process. spaced caps its workloads/ leaf below the kernel's task limit
+# instead, keeping a reserve for itself and the system.
+TasksMax=infinity
 # New port exposures are limited to 128 and forwarding is bounded to 256 active
 # connections (two stream FDs each). Leave headroom for grandfathered exposure
 # listeners, RPC transports, process pipes, filesystem watches, and transient
