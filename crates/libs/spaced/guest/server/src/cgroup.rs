@@ -6,14 +6,20 @@
 //! the same CPU/memory/PID budget and can starve it, which makes host health
 //! pings time out and the sandbox fail.
 //!
-//! We split the delegated `spaced.service` subtree into two leaves and apply
-//! the minimal enforcement that protects the supervisor against each starvation
-//! vector — none of which depends on the guest's RAM size:
+//! We split the delegated `spaced.service` subtree into three leaves:
+//! `supervisor/` (spaced itself), `filesystem/` (the filesystem identity
+//! workers it re-executes per user) and `workloads/` (commands started through
+//! the API). SSH sessions and the template start command run outside spaced's
+//! unit, in `space-sessions.slice`, so a spaced restart does not end them; spaced
+//! applies that slice's limits from the same partition. We apply the minimal
+//! enforcement that protects the supervisor against each starvation vector:
 //!   - CPU: `supervisor/cpu.weight` dominates, so spaced preempts a saturated
 //!     workload the instant a ping arrives.
-//!   - PIDs: `workloads/pids.max` caps workloads below the guest's effective
-//!     task ceiling (`min(pid_max, threads-max)`), reserving task-creation
-//!     headroom so a fork bomb can't starve the supervisor's own `fork`.
+//!   - PIDs: the guest's effective task ceiling (`min(pid_max, threads-max)`)
+//!     is partitioned: a reserve for the supervisor, system daemons and
+//!     recovery, a fixed budget for `filesystem/`, and the rest split between
+//!     `workloads/` and the sessions slice. Workloads and sessions forking at
+//!     once still leave spaced its tasks.
 //!   - Memory: `workloads/memory.max` holds workloads below the guest's
 //!     memory by a reserve, so a workload that runs out of memory is killed
 //!     inside its own cgroup and the guest as a whole never runs out:
@@ -33,7 +39,15 @@
 //! where available, io) controllers for our subtree and stop managing it, which
 //! is what lets us write `cgroup.subtree_control` and create the leaves.
 //!
-//! Setup is best-effort and never takes the daemon down. Enabling controllers
+//! spaced places itself in `supervisor/` before it builds its runtime or
+//! initializes telemetry: memory stays charged to the cgroup it was allocated
+//! in, so anything allocated before the move would sit outside the leaf.
+//!
+//! Setup is best-effort and never takes the daemon down. It is idempotent and
+//! always resolved against the delegated root, so a retry after a partial
+//! setup resumes it instead of nesting a second split under `supervisor/`.
+//! Transient failures are retried a few times; a configuration failure (no
+//! delegation, as on a seed older than the split) degrades at once. Enabling controllers
 //! on `spaced.service` requires it to hold no processes, so the one
 //! irreversible step is moving spaced-svc into `supervisor/` up front. That
 //! move is gated behind a read of `cgroup.controllers`: the common failure — a
@@ -62,16 +76,42 @@ pub(crate) struct GuestCgroups {
     /// `exec` closes it, so the spawned user program never inherits a writable
     /// handle to cgroup.procs.
     workloads_procs: Arc<File>,
+    /// The same, for `filesystem/cgroup.procs` (identity workers are Linux-only).
+    #[cfg_attr(
+        not(target_os = "linux"),
+        expect(dead_code, reason = "Linux-only workers")
+    )]
+    filesystem_procs: Arc<File>,
 }
+
+/// The process's split, set up once: [`GuestCgroups::initialize_for_process`]
+/// runs it early in `run()`, and every later caller gets the same handle.
+static PROCESS_CGROUPS: std::sync::OnceLock<Option<Arc<GuestCgroups>>> = std::sync::OnceLock::new();
 
 impl GuestCgroups {
     /// Place spawned workloads by writing to `workloads_procs`, which a test
     /// can point at a full pipe to hold a child between fork and exec.
     #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn with_workloads_procs(workloads_procs: File) -> Self {
+        let filesystem_procs = workloads_procs.try_clone().expect("clone test descriptor");
         Self {
             workloads_procs: Arc::new(workloads_procs),
+            filesystem_procs: Arc::new(filesystem_procs),
         }
+    }
+
+    /// Set up this process's split once and return it; later calls return
+    /// the same result without touching the cgroup tree again.
+    pub(crate) fn initialize_for_process() -> Option<Arc<Self>> {
+        PROCESS_CGROUPS
+            .get_or_init(|| Self::initialize().map(Arc::new))
+            .clone()
+    }
+
+    /// The process's split, if it was set up.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn for_process() -> Option<Arc<Self>> {
+        PROCESS_CGROUPS.get().cloned().flatten()
     }
 
     /// Set up the supervisor/workloads split and return a handle used to place
@@ -119,9 +159,23 @@ impl GuestCgroups {
             command.pre_exec(move || place_in_workloads(&workloads_procs));
         }
     }
+
+    /// Register a `pre_exec` hook that moves a filesystem identity worker into
+    /// `filesystem/` before it execs, as [`Self::place_spawned_workload`] does
+    /// for workloads (before the worker drops its credentials, and failing the
+    /// spawn if the move fails).
+    #[cfg(target_os = "linux")]
+    pub(crate) fn place_filesystem_worker(&self, command: &mut tokio::process::Command) {
+        let filesystem_procs = Arc::clone(&self.filesystem_procs);
+        // SAFETY: as in `place_spawned_workload`: one async-signal-safe `write`
+        // of a fixed buffer in the forked child before `exec`.
+        unsafe {
+            command.pre_exec(move || place_in_workloads(&filesystem_procs));
+        }
+    }
 }
 
-/// Move the calling (forked) process into the workloads cgroup behind `fd`.
+/// Move the calling (forked) process into the leaf cgroup behind `fd`.
 /// Writing "0" to `cgroup.procs` moves the writing task — the kernel resolves
 /// pid 0 to `current` — so we needn't format our own pid between fork and exec.
 fn place_in_workloads(workloads_procs: &File) -> std::io::Result<()> {
@@ -136,8 +190,8 @@ fn place_in_workloads(workloads_procs: &File) -> std::io::Result<()> {
 #[cfg(target_os = "linux")]
 mod linux {
     use super::{
-        GuestCgroups, has_controller, missing_controllers, parse_unified_cgroup,
-        workloads_memory_max_from, workloads_pids_max_from,
+        GuestCgroups, TaskPartition, has_controller, missing_controllers, parse_unified_cgroup,
+        task_partition_from, workloads_memory_max_from,
     };
     use std::path::{Path, PathBuf};
 
@@ -156,6 +210,15 @@ mod linux {
     const SUPERVISOR_IO_WEIGHT: u32 = 10_000;
     // Unreclaimable floor for the supervisor's resident set.
     const SUPERVISOR_MEMORY_MIN_BYTES: u64 = 64 * 1024 * 1024;
+    // Filesystem workers do the user's file I/O: ahead of workloads, behind
+    // the supervisor's control traffic.
+    const FILESYSTEM_CPU_WEIGHT: u32 = 1_000;
+    // Attempts for a setup that fails with a transient error.
+    const SETUP_ATTEMPTS: u32 = 3;
+    const SETUP_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
+    // Where SSH sessions and the template start command run; defined by the
+    // seed, limited here.
+    const SESSIONS_SLICE: &str = "space-sessions.slice";
     #[derive(Debug, thiserror::Error)]
     pub(super) enum CgroupSetupError {
         #[error("reading {path}: {source}")]
@@ -193,11 +256,23 @@ mod linux {
         ControllersUnavailable { missing: String, available: String },
     }
 
+    impl CgroupSetupError {
+        /// A failure retrying cannot fix: where spaced runs, or what the unit
+        /// delegates to it.
+        fn is_configuration(&self) -> bool {
+            matches!(
+                self,
+                Self::NoUnifiedCgroup | Self::CgroupRoot | Self::ControllersUnavailable { .. }
+            )
+        }
+    }
+
     /// The two leaf cgroups created under the delegated `spaced.service`
     /// subtree.
     #[derive(Clone, Copy)]
     enum Leaf {
         Supervisor,
+        Filesystem,
         Workloads,
     }
 
@@ -205,26 +280,66 @@ mod linux {
         fn as_str(self) -> &'static str {
             match self {
                 Leaf::Supervisor => "supervisor",
+                Leaf::Filesystem => "filesystem",
                 Leaf::Workloads => "workloads",
             }
         }
     }
 
     pub(super) fn initialize() -> Result<GuestCgroups, CgroupSetupError> {
-        let base = own_cgroup_dir()?;
+        let base = delegated_root()?;
+        let mut attempt = 1;
+        loop {
+            match initialize_at(&base) {
+                Ok(cgroups) => return Ok(cgroups),
+                Err(error) if error.is_configuration() || attempt >= SETUP_ATTEMPTS => {
+                    return Err(error);
+                }
+                Err(error) => {
+                    tracing::warn!(%error, attempt, "guest cgroup setup failed; retrying");
+                    std::thread::sleep(SETUP_RETRY_DELAY * attempt);
+                    attempt += 1;
+                }
+            }
+        }
+    }
 
+    /// The delegated root (`spaced.service`), whether or not this process has
+    /// already moved itself into `supervisor/` beneath it.
+    fn delegated_root() -> Result<PathBuf, CgroupSetupError> {
+        let own = own_cgroup_dir()?;
+        let moved = own
+            .file_name()
+            .is_some_and(|name| name == Leaf::Supervisor.as_str())
+            && own
+                .parent()
+                .is_some_and(|parent| parent.join(Leaf::Workloads.as_str()).is_dir());
+        if moved {
+            return own
+                .parent()
+                .map(Path::to_path_buf)
+                .ok_or(CgroupSetupError::CgroupRoot);
+        }
+        Ok(own)
+    }
+
+    /// Every step is idempotent, so this resumes a setup an earlier attempt
+    /// left partly applied.
+    fn initialize_at(base: &Path) -> Result<GuestCgroups, CgroupSetupError> {
         // Pre-flight before any mutation. Moving spaced into `supervisor/`
         // (below) is irreversible, and the `subtree_control` write after it
         // fails if these controllers were never delegated — e.g. a new binary
         // on an older seed without `Delegate=yes`. That would strand spaced in
         // `supervisor/` with a half-built split. This read predicts that
         // failure with zero side effects, so we degrade cleanly instead.
-        ensure_controllers_available(&base)?;
+        ensure_controllers_available(base)?;
 
         let supervisor = base.join(Leaf::Supervisor.as_str());
+        let filesystem = base.join(Leaf::Filesystem.as_str());
         let workloads = base.join(Leaf::Workloads.as_str());
 
         create_dir(&supervisor)?;
+        create_dir(&filesystem)?;
         create_dir(&workloads)?;
 
         // Move spaced-svc into supervisor/ first (writing "0" moves the writing
@@ -250,10 +365,18 @@ mod linux {
                 SUPERVISOR_MEMORY_MIN_BYTES.to_string(),
             ),
         ];
-        if let Some(pids_max) = workloads_pids_max() {
-            limits.push((Leaf::Workloads, "pids.max", pids_max.to_string()));
+        limits.push((
+            Leaf::Filesystem,
+            "cpu.weight",
+            FILESYSTEM_CPU_WEIGHT.to_string(),
+        ));
+        let tasks = task_partition();
+        if let Some(tasks) = tasks {
+            limits.push((Leaf::Filesystem, "pids.max", tasks.filesystem.to_string()));
+            limits.push((Leaf::Workloads, "pids.max", tasks.workloads.to_string()));
         }
-        if let Some(memory_max) = workloads_memory_max() {
+        let memory_max = workloads_memory_max();
+        if let Some(memory_max) = memory_max {
             limits.push((Leaf::Workloads, "memory.max", memory_max.to_string()));
         }
         for (leaf, file, value) in &limits {
@@ -264,25 +387,74 @@ mod linux {
         // a precondition of the split: if `io` was never delegated, or any io
         // write fails, log and leave the (cpu/memory/pids) split intact rather
         // than failing the whole setup.
-        if let Err(error) = apply_supervisor_io_weight(&base) {
+        if let Err(error) = apply_supervisor_io_weight(base) {
             tracing::warn!(
                 %error,
                 "supervisor io.weight not applied; cpu/memory/pids protection intact"
             );
         }
 
-        let procs_path = workloads.join("cgroup.procs");
-        let workloads_procs = std::fs::OpenOptions::new()
-            .write(true)
-            .open(&procs_path)
-            .map_err(|source| CgroupSetupError::Open {
-                path: procs_path,
-                source,
-            })?;
+        let workloads_procs = open_procs(&workloads)?;
+        let filesystem_procs = open_procs(&filesystem)?;
+        apply_sessions_limits(tasks, memory_max);
 
         Ok(GuestCgroups {
             workloads_procs: workloads_procs.into(),
+            filesystem_procs: filesystem_procs.into(),
         })
+    }
+
+    fn open_procs(leaf: &Path) -> Result<std::fs::File, CgroupSetupError> {
+        let path = leaf.join("cgroup.procs");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .map_err(|source| CgroupSetupError::Open { path, source })
+    }
+
+    /// Limit the sessions slice from the same partition, through systemd (it
+    /// owns that cgroup, and would reset values written to it directly). On a
+    /// background thread, so it does not hold up readiness; best effort, and a
+    /// no-op on a seed without the slice.
+    fn apply_sessions_limits(tasks: Option<TaskPartition>, memory_max: Option<u64>) {
+        if !Path::new("/etc/systemd/system")
+            .join(SESSIONS_SLICE)
+            .exists()
+        {
+            return;
+        }
+        let mut properties = Vec::new();
+        if let Some(tasks) = tasks {
+            properties.push(format!("TasksMax={}", tasks.sessions));
+        }
+        if let Some(memory_max) = memory_max {
+            properties.push(format!("MemoryMax={memory_max}"));
+        }
+        if properties.is_empty() {
+            return;
+        }
+        let spawned = std::thread::Builder::new()
+            .name("sessions-limits".to_owned())
+            .spawn(move || {
+                let status = std::process::Command::new("systemctl")
+                    .args(["set-property", "--runtime", SESSIONS_SLICE])
+                    .args(&properties)
+                    .status();
+                match status {
+                    Ok(status) if status.success() => {
+                        tracing::info!(?properties, "applied sessions slice limits");
+                    }
+                    Ok(status) => {
+                        tracing::warn!(%status, ?properties, "sessions slice limits not applied");
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "sessions slice limits not applied");
+                    }
+                }
+            });
+        if let Err(error) = spawned {
+            tracing::warn!(%error, "sessions slice limits not applied");
+        }
     }
 
     /// Resolve this process's unified cgroup v2 directory under `/sys/fs/cgroup`
@@ -377,15 +549,12 @@ mod linux {
         })
     }
 
-    /// `workloads.pids.max`, leaving the supervisor a task reserve. Returns
-    /// `None` (leave workloads uncapped) if the kernel limits can't be
-    /// read/parsed, or if the ceiling is so small that the reserve would claim
-    /// half or more of it — in that degenerate case a cap would do more harm
-    /// than the fork-bomb headroom is worth.
-    fn workloads_pids_max() -> Option<u64> {
+    /// The task partition from the kernel's limits; `None` (leave everything
+    /// uncapped) if they can't be read or the ceiling is too small to split.
+    fn task_partition() -> Option<TaskPartition> {
         let pid_max = read_kernel_u64("/proc/sys/kernel/pid_max")?;
         let threads_max = read_kernel_u64("/proc/sys/kernel/threads-max")?;
-        workloads_pids_max_from(pid_max, threads_max)
+        task_partition_from(pid_max, threads_max)
     }
 
     fn read_kernel_u64(path: &str) -> Option<u64> {
@@ -408,13 +577,17 @@ mod linux {
     }
 }
 
-// Task slots held back from workloads and reserved for the supervisor and
-// guest system daemons, so spaced can always fork/spawn — and answer host
-// health pings — even while a workload fork bomb saturates its own leaf.
-// Sized to cover spaced-svc's threads, the processes it spawns, and guest
-// system daemons with comfortable headroom.
+// Task slots held back from every capped group and reserved for the
+// supervisor, guest system daemons and recovery (a restart), so spaced can
+// always fork/spawn, and answer host health pings, even while workloads and
+// sessions saturate their own limits. Sized to cover spaced-svc's threads and
+// guest system daemons with comfortable headroom.
 #[cfg(any(target_os = "linux", test))]
-const WORKLOADS_PID_RESERVE: u64 = 256;
+const SUPERVISION_TASK_RESERVE: u64 = 256;
+// Filesystem identity workers: up to 16, each with a main thread, a
+// current-thread runtime and up to 16 blocking threads.
+#[cfg(any(target_os = "linux", test))]
+const FILESYSTEM_TASKS_MAX: u64 = 512;
 
 // Controllers the split needs delegated to the leaves: cpu (supervisor
 // weight), memory (supervisor floor), pids (workloads cap). All three must
@@ -438,7 +611,18 @@ fn has_controller(available: &str, name: &str) -> bool {
     available.split_whitespace().any(|have| have == name)
 }
 
-/// The effective task ceiling minus the supervisor reserve.
+/// Task limits for the groups that run user or worker code.
+#[cfg(any(target_os = "linux", test))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct TaskPartition {
+    pub(crate) filesystem: u64,
+    pub(crate) workloads: u64,
+    pub(crate) sessions: u64,
+}
+
+/// The effective task ceiling, partitioned: the supervision reserve, the
+/// filesystem budget, and the rest split three to one between workloads and
+/// sessions, so all of them together stay below the ceiling.
 ///
 /// `kernel.pid_max` alone is the wrong basis: it is the maximum PID
 /// *value*, which on a normal guest sits far above the number of tasks the
@@ -448,13 +632,24 @@ fn has_controller(available: &str, name: &str) -> bool {
 /// based on `pid_max` never binds and reserves nothing for the supervisor.
 /// Basing the cap on `min(pid_max, threads-max)` mirrors how systemd
 /// derives `TasksMax`, so the cap binds below the real ceiling.
+///
+/// `None` (leave everything uncapped) when the ceiling is too small for the
+/// reserve and the filesystem budget to claim less than half of it, where caps
+/// would do more harm than the headroom is worth.
 #[cfg(any(target_os = "linux", test))]
-fn workloads_pids_max_from(pid_max: u64, threads_max: u64) -> Option<u64> {
+fn task_partition_from(pid_max: u64, threads_max: u64) -> Option<TaskPartition> {
     let ceiling = pid_max.min(threads_max);
-    if ceiling <= WORKLOADS_PID_RESERVE.saturating_mul(2) {
+    let held_back = SUPERVISION_TASK_RESERVE + FILESYSTEM_TASKS_MAX;
+    if ceiling <= held_back.saturating_mul(2) {
         return None;
     }
-    Some(ceiling - WORKLOADS_PID_RESERVE)
+    let shared = ceiling - held_back;
+    let workloads = shared / 4 * 3;
+    Some(TaskPartition {
+        filesystem: FILESYSTEM_TASKS_MAX,
+        workloads,
+        sessions: shared - workloads,
+    })
 }
 
 // Memory held back from workloads for spaced, the guest's system daemons and

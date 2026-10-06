@@ -372,6 +372,28 @@ DefaultDependencies=no
 SSHSOCKET
 systemctl enable ssh.socket 2>/dev/null || true
 
+# SSH sessions and the E2B template start command run in their own slice,
+# outside spaced.service, whose KillMode would end them whenever spaced
+# restarts. spaced sets the slice's memory and task limits at startup, from the
+# guest's size (systemctl set-property --runtime), so they and spaced's
+# workloads together stay inside the guest's capacity. logind is masked, so PAM
+# opens no session scopes: a session stays in ssh.service's cgroup, here.
+cat > /etc/systemd/system/space-sessions.slice <<'SESSIONSSLICE'
+[Unit]
+Description=SPACE sandbox sessions (SSH, template start command)
+DefaultDependencies=no
+Before=slices.target shutdown.target
+Conflicts=shutdown.target
+SESSIONSSLICE
+mkdir -p /etc/systemd/system/ssh.service.d
+cat > /etc/systemd/system/ssh.service.d/00-space-sessions.conf <<'SSHSLICE'
+[Service]
+Slice=space-sessions.slice
+# The slice's limit, set by spaced from the task partition, is what binds,
+# not systemd's per-unit default.
+TasksMax=infinity
+SSHSLICE
+
 # Permit SSH logins without pulling multi-user.target/basic.target into the
 # snapshot-optimized boot path. The stock systemd-user-sessions.service has
 # DefaultDependencies=yes, so requiring it directly from space.target widens the
@@ -460,8 +482,8 @@ Delegate=yes
 # No unit-wide task cap. systemd's default (15% of the kernel's task limit)
 # would cover spaced and every workload together, so a workload that creates
 # a few thousand threads would leave spaced unable to start a thread or
-# process. spaced caps its workloads/ leaf below the kernel's task limit
-# instead, keeping a reserve for itself and the system.
+# process. spaced partitions the task limit itself: capped workloads/ and
+# filesystem/ leaves and a reserve for the supervisor and system.
 TasksMax=infinity
 # New port exposures are limited to 128 and forwarding is bounded to 256 active
 # connections (two stream FDs each). Leave headroom for grandfathered exposure

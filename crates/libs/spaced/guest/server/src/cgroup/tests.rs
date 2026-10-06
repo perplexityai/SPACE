@@ -1,6 +1,7 @@
 use super::{
-    WORKLOADS_MEMORY_RESERVE_MAX_BYTES, WORKLOADS_PID_RESERVE, has_controller, missing_controllers,
-    parse_unified_cgroup, workloads_memory_max_from, workloads_pids_max_from,
+    FILESYSTEM_TASKS_MAX, SUPERVISION_TASK_RESERVE, TaskPartition,
+    WORKLOADS_MEMORY_RESERVE_MAX_BYTES, has_controller, missing_controllers, parse_unified_cgroup,
+    task_partition_from, workloads_memory_max_from,
 };
 
 #[test]
@@ -37,38 +38,43 @@ fn detects_missing_controllers_without_delegation() {
     assert_eq!(missing_controllers(""), vec!["cpu", "memory", "pids"]);
 }
 
+/// What the partition must hold for any ceiling it caps: the groups together
+/// stay below the ceiling by at least the supervision reserve.
+fn assert_partition_holds(ceiling: u64, tasks: TaskPartition) {
+    assert_eq!(tasks.filesystem, FILESYSTEM_TASKS_MAX);
+    assert!(tasks.workloads > tasks.sessions);
+    assert_eq!(
+        tasks.filesystem + tasks.workloads + tasks.sessions,
+        ceiling - SUPERVISION_TASK_RESERVE
+    );
+}
+
 #[test]
-fn workloads_cap_binds_below_threads_max() {
+fn task_partition_binds_below_threads_max() {
     // Measured on a 1 GiB SPACE guest: pid_max is the kernel default
     // (32768) but threads-max is far lower (~7831), so the memory-derived
-    // ceiling is what a fork bomb hits. The cap must come from
-    // threads-max, not pid_max — the pid_max-only basis returned
-    // 32768 - reserve, a dead cap well above the ~7831 tasks the kernel
-    // will actually create.
-    assert_eq!(
-        workloads_pids_max_from(32768, 7831),
-        Some(7831 - WORKLOADS_PID_RESERVE)
-    );
+    // ceiling is what a fork bomb hits. The partition must come from
+    // threads-max, not pid_max, or the caps would never bind.
+    let tasks = task_partition_from(32768, 7831).expect("partitioned");
+    assert_partition_holds(7831, tasks);
 }
 
 #[test]
-fn workloads_cap_uses_pid_max_when_it_is_the_lower_ceiling() {
+fn task_partition_uses_pid_max_when_it_is_the_lower_ceiling() {
     // Big-memory guest: threads-max exceeds pid_max, so pid_max binds.
-    assert_eq!(
-        workloads_pids_max_from(32768, 63000),
-        Some(32768 - WORKLOADS_PID_RESERVE)
-    );
+    let tasks = task_partition_from(32768, 63000).expect("partitioned");
+    assert_partition_holds(32768, tasks);
 }
 
 #[test]
-fn workloads_uncapped_when_ceiling_too_small_for_reserve() {
-    // A ceiling at or below twice the reserve would have the reserve
-    // claim half or more of it; leave workloads uncapped instead.
-    assert_eq!(
-        workloads_pids_max_from(WORKLOADS_PID_RESERVE * 2, 7831),
-        None
-    );
-    assert_eq!(workloads_pids_max_from(32768, WORKLOADS_PID_RESERVE), None);
+fn tasks_uncapped_when_ceiling_too_small_for_reserve() {
+    // A ceiling at or below twice what is held back would have the reserve
+    // and the filesystem budget claim half or more of it; leave everything
+    // uncapped instead.
+    let held_back = SUPERVISION_TASK_RESERVE + FILESYSTEM_TASKS_MAX;
+    assert_eq!(task_partition_from(held_back * 2, 7831), None);
+    assert_eq!(task_partition_from(32768, held_back), None);
+    assert!(task_partition_from(held_back * 2 + 1, 7831).is_some());
 }
 
 #[test]
@@ -103,6 +109,7 @@ fn placement_hook_owns_the_descriptor_until_spawn() {
     let file = tempfile::tempfile().unwrap();
     let cgroups = super::GuestCgroups {
         workloads_procs: std::sync::Arc::new(file.try_clone().unwrap()),
+        filesystem_procs: std::sync::Arc::new(file.try_clone().unwrap()),
     };
     let mut command = tokio::process::Command::new("/bin/sh");
     command.args(["-c", "exit 0"]);

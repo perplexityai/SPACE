@@ -227,7 +227,7 @@ use process::ProcessRegistry;
 const HOST_CONNECTION_PORT: u32 = pplx_space_spaced_common::BRIDGE_HOST_VSOCK_PORT;
 const GUEST_BRIDGE_PORT: u32 = pplx_space_spaced_common::BRIDGE_GUEST_VSOCK_PORT;
 
-fn native_vsock_available() -> bool {
+pub(crate) fn native_vsock_available() -> bool {
     cfg!(target_os = "linux") && std::path::Path::new("/dev/vsock").exists()
 }
 
@@ -377,8 +377,9 @@ impl SpacedGuestService {
         // guest vsock transport device. Setup relocates this process and
         // rewrites cgroup limits, so it must never run against a host's
         // cgroups; with no `/dev/vsock` (any non-guest environment) it no-ops.
+        // `run()` has normally done it already, before any large allocation.
         let guest_cgroups = if native_vsock_available() {
-            cgroup::GuestCgroups::initialize().map(Arc::new)
+            cgroup::GuestCgroups::initialize_for_process()
         } else {
             None
         };

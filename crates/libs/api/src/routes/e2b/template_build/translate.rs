@@ -546,6 +546,10 @@ fn install_start_cmd_unit(start_cmd: &str) -> build_proto::recipe::Step {
             "\n",
             "[Service]\n",
             "Type=simple\n",
+            // With SSH sessions, outside spaced's unit (a spaced restart does
+            // not end it) and under the limits spaced sets for that slice.
+            "Slice=space-sessions.slice\n",
+            "TasksMax=infinity\n",
             "ExecStart=/bin/sh -lc {cmd_quoted}\n",
             "Restart=on-failure\n",
             "RestartSec=2\n",

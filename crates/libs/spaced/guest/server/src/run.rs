@@ -71,6 +71,13 @@ pub fn run(config: SpacedGuestRunConfig) -> Result<(), RunSpacedGuestError> {
         return Ok(());
     }
 
+    // Move into the supervisor cgroup before the runtime, telemetry or anything
+    // else of size is allocated: memory stays charged to the cgroup it was
+    // allocated in, so it would otherwise sit outside the supervisor leaf.
+    if crate::native_vsock_available() {
+        drop(crate::cgroup::GuestCgroups::initialize_for_process());
+    }
+
     block_on_bounded(
         async move {
             let telemetry =

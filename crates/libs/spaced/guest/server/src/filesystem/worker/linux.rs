@@ -624,6 +624,11 @@ impl WorkerPool {
         unsafe {
             command.pre_exec(move || clear_fd_cloexec(&worker_fd));
         }
+        // Workers run in the `filesystem/` leaf, apart from the supervisor's
+        // control traffic and from workloads.
+        if let Some(cgroups) = crate::cgroup::GuestCgroups::for_process() {
+            cgroups.place_filesystem_worker(&mut command);
+        }
         // Complete fallible socket adoption before a child exists. From spawn
         // to supervisor handoff there must be no error/cancellation gap.
         let router_stream = std::os::unix::net::UnixStream::from(router_fd);
