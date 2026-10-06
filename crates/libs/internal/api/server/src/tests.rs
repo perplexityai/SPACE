@@ -812,6 +812,146 @@ async fn build_release_keeps_the_submitting_org_and_rejects_another_owner() -> T
     Ok(())
 }
 
+/// A release registered before the `sha256:` prefix was required is stored
+/// bare. Registering the same digest in canonical form, as build-manager does
+/// when it republishes tags for an already published release, must attach the
+/// tags to that row rather than create a second, artifact-less release beside
+/// it and move the tags there.
+#[tokio::test(flavor = "current_thread")]
+async fn register_template_release_reuses_a_bare_hash_release() -> TestResult {
+    let Some(fixture) = cluster_fixture().await? else {
+        return Ok(());
+    };
+    let pool = &fixture.service.pool;
+    register_template(&fixture.service, "code-runtime").await?;
+    let bare = "c".repeat(64);
+    let canonical = format!("sha256:{bare}");
+    let storage = format!("s3://bucket/templates/code-runtime/{canonical}?region=us-east-1");
+    let legacy_id = Uuid::now_v7();
+    sqlx::query(sql!(
+        "INSERT INTO template_releases (id, template_name, type, hash)
+         VALUES ($1, 'code-runtime', 'fc', $2)"
+    ))
+    .bind(legacy_id)
+    .bind(&bare)
+    .execute(pool)
+    .await?;
+    sqlx::query(sql!(
+        "INSERT INTO template_release_tags (template_name, template_release_id, tag)
+         VALUES ('code-runtime', $1, 'stable')"
+    ))
+    .bind(legacy_id)
+    .execute(pool)
+    .await?;
+    sqlx::query(sql!(
+        "INSERT INTO template_release_storage_locations
+             (template_release_id, storage_connection_string)
+         VALUES ($1, $2)"
+    ))
+    .bind(legacy_id)
+    .bind(&storage)
+    .execute(pool)
+    .await?;
+
+    // A tags-only republication of the canonical spelling.
+    let republished = register_release(&fixture.service, &canonical, &["latest"], &[]).await?;
+    assert_eq!(
+        republished.release.expect("release").id,
+        legacy_id.to_string()
+    );
+    let releases: i64 = sqlx::query_scalar(sql!(
+        "SELECT COUNT(*) FROM template_releases WHERE template_name = 'code-runtime'"
+    ))
+    .fetch_one(pool)
+    .await?;
+    assert_eq!(
+        releases, 1,
+        "no second release may appear beside the bare row"
+    );
+
+    let latest = fixture
+        .service
+        .find_template_release(Request::new(FindTemplateReleaseRequest {
+            caller_org_id: None,
+            template_name: "code-runtime".to_string(),
+            runtime: "firecracker".to_string(),
+            tag: "latest".to_string(),
+        }))
+        .await?
+        .into_inner();
+    assert_eq!(latest.release.expect("latest").id, legacy_id.to_string());
+    assert_eq!(latest.storage_locations.len(), 1);
+    assert_eq!(latest.storage_locations[0].connection_string, storage);
+    Ok(())
+}
+
+/// When a digest already exists under both spellings, registration must land
+/// on the row that owns the recorded artifacts, whichever spelling and
+/// whichever age that is. Tags attached to the artifact-less duplicate would
+/// resolve to a release nothing can pull.
+#[tokio::test(flavor = "current_thread")]
+async fn register_template_release_prefers_the_duplicate_that_owns_a_location() -> TestResult {
+    let Some(fixture) = cluster_fixture().await? else {
+        return Ok(());
+    };
+    let pool = &fixture.service.pool;
+    register_template(&fixture.service, "code-runtime").await?;
+
+    // The older row is always the bare one; the location sits on the older
+    // row in one arrangement and on the newer canonical row in the other.
+    for (digit, location_on_older) in [('d', false), ('e', true)] {
+        let bare = digit.to_string().repeat(64);
+        let canonical = format!("sha256:{bare}");
+        let storage = format!("s3://bucket/templates/code-runtime/{canonical}?region=us-east-1");
+        let older = Uuid::now_v7();
+        let newer = Uuid::now_v7();
+        sqlx::query(sql!(
+            "INSERT INTO template_releases (id, template_name, type, hash, created_at)
+             VALUES ($1, 'code-runtime', 'fc', $2, NOW() - INTERVAL '1 day'),
+                    ($3, 'code-runtime', 'fc', $4, NOW())"
+        ))
+        .bind(older)
+        .bind(&bare)
+        .bind(newer)
+        .bind(&canonical)
+        .execute(pool)
+        .await?;
+        let owner = if location_on_older { older } else { newer };
+        sqlx::query(sql!(
+            "INSERT INTO template_release_storage_locations
+                 (template_release_id, storage_connection_string)
+             VALUES ($1, $2)"
+        ))
+        .bind(owner)
+        .bind(&storage)
+        .execute(pool)
+        .await?;
+
+        let tag = format!("release-{digit}");
+        let republished =
+            register_release(&fixture.service, &canonical, &[tag.as_str()], &[]).await?;
+        assert_eq!(
+            republished.release.expect("release").id,
+            owner.to_string(),
+            "registration must pick the duplicate that owns the artifacts"
+        );
+        let resolved = fixture
+            .service
+            .find_template_release(Request::new(FindTemplateReleaseRequest {
+                caller_org_id: None,
+                template_name: "code-runtime".to_string(),
+                runtime: "firecracker".to_string(),
+                tag,
+            }))
+            .await?
+            .into_inner();
+        assert_eq!(resolved.release.expect("tagged").id, owner.to_string());
+        assert_eq!(resolved.storage_locations.len(), 1);
+        assert_eq!(resolved.storage_locations[0].connection_string, storage);
+    }
+    Ok(())
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn register_template_release_is_idempotent_by_hash() -> TestResult {
     let Some(fixture) = cluster_fixture().await? else {
@@ -1091,6 +1231,67 @@ async fn register_template_release_persists_execution_metadata_write_once() -> T
         Some("aarch64")
     );
 
+    Ok(())
+}
+
+/// A tags-only republication, which build-manager issues when the release is
+/// already published or when Credential Manager refused the write for that
+/// reason, carries no storage location and no execution metadata, so it adds
+/// its tag and leaves the published release's locations and metadata exactly
+/// as they were, including a `NULL` metadata column.
+#[tokio::test(flavor = "current_thread")]
+async fn tags_only_republication_leaves_locations_and_metadata_unchanged() -> TestResult {
+    use pplx_space_common_core::types::{Arch, ExecutionMetadata};
+
+    let Some(fixture) = cluster_fixture().await? else {
+        return Ok(());
+    };
+    register_template(&fixture.service, "code-runtime").await?;
+    let digest_a = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let digest_b = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let storage_a = "s3://bucket/templates/code-runtime/sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa?region=us-east-1";
+    let storage_b = "s3://bucket/templates/code-runtime/sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb?region=us-east-1";
+    let stored = |hash: &str| {
+        let pool = fixture.service.pool.clone();
+        let hash = hash.to_string();
+        async move {
+            sqlx::query_as::<_, (Option<String>, i64)>(sql!(
+                "SELECT r.execution_metadata->'guest'->>'architecture',
+                        (SELECT COUNT(*) FROM template_release_storage_locations l
+                          WHERE l.template_release_id = r.id)
+                 FROM template_releases r
+                 WHERE r.template_name = 'code-runtime' AND r.hash = $1"
+            ))
+            .bind(hash)
+            .fetch_one(&pool)
+            .await
+        }
+    };
+
+    // A published release with metadata and one location...
+    let x86 = ExecutionMetadata::initial_firecracker(Arch::X86_64, vec![]);
+    register_release_with_execution(&fixture.service, digest_a, &x86).await?;
+    register_release(&fixture.service, digest_a, &["latest"], &[storage_a]).await?;
+    // ...and one published before metadata was recorded.
+    register_release(&fixture.service, digest_b, &["latest"], &[storage_b]).await?;
+    assert_eq!(stored(digest_a).await?, (Some("x86_64".to_string()), 1));
+    assert_eq!(stored(digest_b).await?, (None, 1));
+
+    for digest in [digest_a, digest_b] {
+        let republished = register_release(&fixture.service, digest, &["stable"], &[]).await?;
+        // The response lists what this call registered: the tag, no location.
+        assert!(republished.storage_locations.is_empty());
+        assert_eq!(
+            republished
+                .tags
+                .iter()
+                .map(|tag| tag.tag.as_str())
+                .collect::<Vec<_>>(),
+            vec!["stable"]
+        );
+    }
+    assert_eq!(stored(digest_a).await?, (Some("x86_64".to_string()), 1));
+    assert_eq!(stored(digest_b).await?, (None, 1));
     Ok(())
 }
 

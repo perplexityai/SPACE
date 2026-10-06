@@ -78,6 +78,17 @@ pub enum CredentialExchangeError {
 }
 
 impl CredentialExchangeError {
+    /// True when Credential Manager refused a write because the template
+    /// release is already published. Decoded from the machine-readable reason
+    /// metadata; an unrelated `PERMISSION_DENIED` is not this.
+    pub(crate) fn is_release_already_published(&self) -> bool {
+        matches!(
+            self,
+            Self::Exchange(status)
+                if pplx_space_credmgr_client::status_is_release_already_published(status)
+        )
+    }
+
     pub(crate) fn is_retriable(&self) -> bool {
         match self {
             Self::Connect(error) => match error {

@@ -184,6 +184,92 @@ fn sample_template_request() -> RegisterRequest {
     })
 }
 
+/// A republished release uploads nothing, so it registers tags only: neither
+/// the current object store as a location nor execution metadata from the
+/// manifest that was not uploaded, and the same holds when no cold store is
+/// configured at all. Only a first publication registers where it uploaded,
+/// if anywhere, and what.
+#[test]
+fn republication_registers_tags_only() {
+    let current = "s3://bucket/templates/code-runtime/sha256:ab?region=us-east-1";
+    let execution = || {
+        pplx_space_execution_common::proto::ExecutionMetadata::from(&execution_for(Arch::X86_64))
+    };
+
+    let first = release_registration(false, Some(current), execution());
+    assert_eq!(first.storage_locations, vec![current.to_string()]);
+    assert!(first.execution.is_some());
+
+    let first_without_store = release_registration(false, None, execution());
+    assert!(first_without_store.storage_locations.is_empty());
+    assert!(first_without_store.execution.is_some());
+
+    for uploaded_to in [Some(current), None] {
+        let republished = release_registration(true, uploaded_to, execution());
+        assert!(republished.storage_locations.is_empty());
+        assert!(
+            republished.execution.is_none(),
+            "a republish must not describe artifacts it did not upload"
+        );
+    }
+}
+
+/// Another publisher can register the same hash between this build's
+/// publication lookup and its credential exchange, and under node-scoped
+/// lookups the builder may not even see its own published output. Credential
+/// Manager then refuses the write with a machine-readable reason, and the
+/// build converges on tags-only registration instead of failing. Unrelated
+/// denials still fail the publication.
+#[tokio::test]
+async fn publication_converges_on_tags_only_when_the_release_is_published_meanwhile() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_ready_compressed_rootfs(dir.path());
+    let published_meanwhile = || {
+        let mut metadata = tonic::metadata::MetadataMap::new();
+        metadata.insert(
+            pplx_space_credmgr_client::CREDMGR_ERROR_REASON_METADATA_KEY,
+            pplx_space_credmgr_client::CREDMGR_ERROR_REASON_RELEASE_ALREADY_PUBLISHED
+                .parse()
+                .unwrap(),
+        );
+        CredentialExchangeError::Exchange(tonic::Status::with_metadata(
+            tonic::Code::PermissionDenied,
+            "template release is already published and cannot be rewritten",
+            metadata,
+        ))
+    };
+
+    let outcome =
+        acquire_publication_credentials(dir.path(), || async { Err(published_meanwhile()) })
+            .await
+            .expect("an already-published refusal is an outcome, not a failure");
+    assert!(matches!(outcome, Publication::AlreadyPublished));
+
+    let unrelated = acquire_publication_credentials(dir.path(), || async {
+        Err(CredentialExchangeError::Exchange(
+            tonic::Status::permission_denied("caller is not authorized"),
+        ))
+    })
+    .await
+    .expect_err("an unrelated denial must still fail the publication");
+    assert!(matches!(
+        unrelated,
+        PublishError::CredentialExchange(CredentialExchangeError::Exchange(status))
+            if status.code() == tonic::Code::PermissionDenied
+    ));
+
+    let outcome = acquire_publication_credentials(dir.path(), || async {
+        Ok(ObjectCredentials {
+            access_key_id: "test-access-key".to_string(),
+            secret_access_key: "test-secret-key".to_string(),
+            session_token: None,
+        })
+    })
+    .await
+    .expect("credentials permit the upload");
+    assert!(matches!(outcome, Publication::Upload(_)));
+}
+
 #[test]
 fn registration_requests_carry_publication_authority() {
     let org_id = "00000000-0000-0000-0000-000000000003";
