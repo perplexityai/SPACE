@@ -140,7 +140,8 @@ async fn native_create_executor_persists_exemptions_without_changing_egress() ->
             }
             .into_json();
 
-            let result = executor.execute(&operation).await;
+            // The full create future is too large for the CI test thread's stack.
+            let result = Box::pin(executor.execute(&operation)).await;
             assert_eq!(result.state, OperationState::Succeeded, "{result:?}");
             let persisted: Option<sqlx::types::Json<NetworkPolicyV1>> = sqlx::query_scalar(sql!(
                 "SELECT network_policy_override_json FROM sandboxes WHERE id = $1"
