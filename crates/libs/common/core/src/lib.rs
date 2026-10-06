@@ -138,6 +138,11 @@ pub mod ids {
 pub mod spaced {
     /// Maximum entries sent in one write batch.
     pub const MAX_WRITE_BATCH_ENTRIES: usize = 256;
+    /// Largest gRPC message the sandbox manager and the guest filesystem
+    /// decode; the node API's worker server enforces the same 4 MiB through
+    /// tonic's default. A write batch travels as one message, so it must fit;
+    /// streamed writes are split into smaller messages.
+    pub const MAX_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
 
     /// gRPC metadata key naming why a call failed where its code alone is
     /// ambiguous. Hops relay a status unchanged, so the key reaches the API.

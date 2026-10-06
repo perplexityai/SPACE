@@ -11,6 +11,6 @@ pub const PAYLOAD_METHODS: &[(&str, u32)] = &[
     ("WriteBatch", BATCH_REQUEST_WEIGHT),
     ("Rename", 1),
 ];
-pub const MAX_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_MESSAGE_BYTES: usize = pplx_space_common_core::spaced::MAX_MESSAGE_BYTES;
 pub const WRITE_CHUNK_BYTES: usize = 64 * 1024;
 pub const WRITE_BUFFER_FRAMES: usize = 2;

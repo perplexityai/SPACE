@@ -59,7 +59,7 @@ const SPACE_NODE_ROLE_ENV: &str = "SPACE_NODE_ROLE";
 const SPACE_NODE_MANAGED_BY_ENV: &str = "SPACE_NODE_MANAGED_BY";
 const SOCKET_GROUP: &str = group_names::SPACE_SBXCLIENTS;
 // Keep this above E2B_FILE_WRITE_CHUNK_BYTES (3 MiB) plus protobuf overhead.
-const SANDBOX_MANAGER_MAX_DECODE_BYTES: usize = 4 * 1024 * 1024;
+const SANDBOX_MANAGER_MAX_DECODE_BYTES: usize = pplx_space_common_core::spaced::MAX_MESSAGE_BYTES;
 const HOST_CONTROL_MAX_DECODE_BYTES: usize = 64 * 1024;
 // Hard-coded so two instances on the same host cannot be configured to use
 // different mutex files and both acquire concurrently.

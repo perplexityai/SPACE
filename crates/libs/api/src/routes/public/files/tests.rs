@@ -425,6 +425,38 @@ mod batch_body_limits {
         Ok(())
     }
 
+    /// The mounted `files:write` route carries its own limit: a body past the
+    /// framework's 2 MiB default reaches the handler, and one byte over the
+    /// route's limit gets 413.
+    #[tokio::test]
+    async fn file_write_route_applies_its_body_limit() -> TestDbResult<()> {
+        let fixture = fixture().await?;
+        let write = |decoded_len: usize| {
+            json!({
+                "path": "/workspace/f",
+                "data_base64": BASE64_STANDARD.encode(vec![0u8; decoded_len]),
+                "append": false,
+            })
+        };
+
+        let (status, body) = post(
+            &fixture,
+            "write",
+            padded_body(&write(3 * 1024 * 1024), WRITE_FILE_BODY_LIMIT_BYTES),
+        )
+        .await?;
+        assert_accepted_past_size_checks(status, &body);
+
+        let (status, body) = post(
+            &fixture,
+            "write",
+            padded_body(&write(3 * 1024 * 1024), WRITE_FILE_BODY_LIMIT_BYTES + 1),
+        )
+        .await?;
+        assert_payload_too_large(status, &body);
+        Ok(())
+    }
+
     #[tokio::test]
     async fn other_file_routes_keep_the_default_body_limit() -> TestDbResult<()> {
         let fixture = fixture().await?;

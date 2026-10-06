@@ -15,6 +15,9 @@ mod credential_references;
 mod cursors;
 pub(crate) mod error;
 mod files;
+pub(crate) use files::{
+    MAX_FILE_WRITE_BATCH_BYTES, WRITE_FILE_BATCH_BODY_LIMIT_BYTES, WRITE_FILE_BODY_LIMIT_BYTES,
+};
 pub(crate) mod network_policy;
 mod operations;
 mod owner_scope;
