@@ -65,6 +65,7 @@ async fn records_e2b_build_on_the_pending_job(
             Some(&client_build_id),
             daemon_job_id,
             Some(fixture.builder_nodes[0]),
+            None,
         )
         .await?;
     let job = fixture
@@ -100,6 +101,7 @@ async fn records_admin_build_with_the_daemon_job_id_as_its_build_id(
             None,
             daemon_job_id,
             Some(fixture.builder_nodes[0]),
+            None,
         )
         .await?;
     let job = fixture
@@ -128,6 +130,7 @@ async fn recording_unknown_builder_node_is_atomic(
             None,
             daemon_job_id,
             Some(NodeId::new()),
+            None,
         )
         .await
         .unwrap_err();
@@ -161,6 +164,7 @@ async fn deleting_builder_node_keeps_job_for_unpinned_fallback(
             None,
             daemon_job_id,
             Some(fixture.builder_nodes[0]),
+            None,
         )
         .await?;
 
@@ -205,11 +209,11 @@ async fn job_writes_preserve_owner_and_legacy_nulls(
         .await;
     fixture
         .store
-        .record_accepted_build(TEST_ORG, &name, Some("owned"), job, None)
+        .record_accepted_build(TEST_ORG, &name, Some("owned"), job, None, None)
         .await?;
     fixture
         .store
-        .record_accepted_build(TEST_ORG, &name, Some("legacy"), job, None)
+        .record_accepted_build(TEST_ORG, &name, Some("legacy"), job, None, None)
         .await?;
 
     assert!(matches!(

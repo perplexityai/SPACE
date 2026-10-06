@@ -124,6 +124,32 @@ async fn static_authentication_returns_caller_identity() {
         caller.data_plane_session_refresh_authority(),
         DataPlaneSessionRefreshAuthority::Granted
     );
+    assert_eq!(
+        caller.template_release_read_authority(),
+        TemplateReleaseReadAuthority::Unscoped
+    );
+}
+
+/// Once TokenReview is configured the static token is a lower-trust fallback
+/// that a worker also holds, so it must not read the template catalog
+/// unscoped; a TokenReview identity never does.
+#[cfg(feature = "k8s")]
+#[test]
+fn template_catalog_reads_are_node_scoped_unless_static_only() {
+    assert_eq!(
+        NodeApiAuthenticatedCaller::static_token(KubernetesAuthenticationMode::Configured)
+            .template_release_read_authority(),
+        TemplateReleaseReadAuthority::NodeScoped
+    );
+    assert_eq!(
+        NodeApiAuthenticatedCaller::kubernetes_service_account(
+            WaitReadyLifecycleAuthority::Granted,
+            NetworkPolicyMutationAuthority::Granted,
+            DataPlaneSessionRefreshAuthority::Granted,
+        )
+        .template_release_read_authority(),
+        TemplateReleaseReadAuthority::NodeScoped
+    );
 }
 
 #[tokio::test]

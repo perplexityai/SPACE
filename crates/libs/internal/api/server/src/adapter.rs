@@ -69,6 +69,48 @@ fn project_sandbox_network_policy_states(
     states
 }
 
+impl ClusterApiService {
+    /// Derive the template-catalog scope from the authenticated caller.
+    ///
+    /// `caller_org_id` on the lookup requests is caller-asserted and the node
+    /// pull path omits it, so it cannot authorize anything. A node-scoped
+    /// caller (every TokenReview identity, and the static token once
+    /// TokenReview is configured) is instead bound to the nodes registered at
+    /// its remote address, the same binding `validate_origin_remote_addr`
+    /// applies to node-bound RPCs; a caller with no registered node resolves
+    /// generic templates only. A request that reached the handler without the
+    /// auth layer (tests, local simulators) is unscoped, matching how the
+    /// other narrow authorities treat a missing extension.
+    async fn template_read_scope<T>(
+        &self,
+        request: &Request<T>,
+    ) -> Result<super::template_releases_store::TemplateReadScope, Status> {
+        use super::template_releases_store::TemplateReadScope;
+        use pplx_space_common_svc::auth::{
+            NodeApiAuthenticatedCaller, TemplateReleaseReadAuthority,
+        };
+
+        let node_scoped = request
+            .extensions()
+            .get::<NodeApiAuthenticatedCaller>()
+            .is_some_and(|caller| {
+                caller.template_release_read_authority() == TemplateReleaseReadAuthority::NodeScoped
+            });
+        if !node_scoped {
+            return Ok(TemplateReadScope::Unscoped);
+        }
+        let Some(remote_addr) = request.remote_addr() else {
+            return Ok(TemplateReadScope::NodeScoped {
+                node_ids: Vec::new(),
+            });
+        };
+        self.template_releases_store
+            .node_scope_for_address(normalize_ip(remote_addr.ip()))
+            .await
+            .map_err(|err| Status::internal(format!("resolve caller nodes: {err}")))
+    }
+}
+
 #[tonic::async_trait]
 impl ClusterApi for ClusterApiService {
     async fn list_nodes(
@@ -223,6 +265,7 @@ impl ClusterApi for ClusterApiService {
         &self,
         request: Request<FindTemplateReleaseRequest>,
     ) -> Result<Response<FindTemplateReleaseResponse>, Status> {
+        let scope = self.template_read_scope(&request).await?;
         let request = request.into_inner();
         let template_name = trimmed_required(&request.template_name, "template_name")?;
         let runtime = validated_template_runtime(&request.runtime)?;
@@ -238,7 +281,7 @@ impl ClusterApi for ClusterApiService {
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
         let rows = self
             .template_releases_store
-            .find_by_tag(&template_name, runtime, &tag, caller_org)
+            .find_by_tag(&template_name, runtime, &tag, caller_org, &scope)
             .await
             .map_err(|error| Status::internal(format!("query release: {error}")))?;
 
@@ -287,6 +330,7 @@ impl ClusterApi for ClusterApiService {
         &self,
         request: Request<FindTemplateReleaseByHashRequest>,
     ) -> Result<Response<FindTemplateReleaseResponse>, Status> {
+        let scope = self.template_read_scope(&request).await?;
         let request = request.into_inner();
         let template_name = trimmed_required(&request.template_name, "template_name")?;
         // Canonical `sha256:`-prefixed form.
@@ -312,7 +356,7 @@ impl ClusterApi for ClusterApiService {
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
         let rows = self
             .template_releases_store
-            .find_by_hash(&template_name, &hash, &bare_hash, caller_org)
+            .find_by_hash(&template_name, &hash, &bare_hash, caller_org, &scope)
             .await
             .map_err(|error| Status::internal(format!("query release: {error}")))?;
 
@@ -361,6 +405,7 @@ impl ClusterApi for ClusterApiService {
         &self,
         request: Request<ListLatestTemplateReleasesRequest>,
     ) -> Result<Response<ListLatestTemplateReleasesResponse>, Status> {
+        let scope = self.template_read_scope(&request).await?;
         let request = request.into_inner();
         let template_name = trimmed_required(&request.template_name, "template_name")?;
         let runtime = validated_template_runtime(&request.runtime)?;
@@ -368,7 +413,7 @@ impl ClusterApi for ClusterApiService {
 
         let releases = self
             .template_releases_store
-            .list_latest(&template_name, runtime, i64::from(limit))
+            .list_latest(&template_name, runtime, i64::from(limit), &scope)
             .await?;
 
         let visibility = template_visibility(

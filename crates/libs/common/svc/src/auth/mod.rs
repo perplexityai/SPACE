@@ -288,6 +288,7 @@ pub struct NodeApiAuthenticatedCaller {
     wait_ready_lifecycle_authority: WaitReadyLifecycleAuthority,
     network_policy_authority: NetworkPolicyMutationAuthority,
     data_plane_session_refresh_authority: DataPlaneSessionRefreshAuthority,
+    template_release_read_authority: TemplateReleaseReadAuthority,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -328,6 +329,25 @@ pub enum DataPlaneSessionRefreshAuthority {
     Granted,
 }
 
+/// How far a caller may see into the template-release catalog
+/// (`FindTemplateRelease`, `FindTemplateReleaseByHash`,
+/// `ListLatestTemplateReleases`).
+///
+/// Those requests carry a caller-supplied `caller_org_id` that the server
+/// cannot verify, and the node pull path sends none at all. A node-scoped
+/// caller therefore resolves only generic templates plus the org-specific
+/// templates the control plane has placed on the caller's own nodes; it
+/// cannot discover another tenant's private release by naming it. Only a
+/// static-only deployment's shared token, which is the trust boundary there,
+/// reads the catalog unscoped. Every TokenReview identity is node-scoped: no
+/// control-plane consumer of these reads exists today, and a future one
+/// needs an explicit grant rather than an implicit one.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TemplateReleaseReadAuthority {
+    NodeScoped,
+    Unscoped,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum KubernetesAuthenticationMode {
     Disabled,
@@ -348,23 +368,27 @@ impl NodeApiAuthenticatedCaller {
             wait_ready_lifecycle_authority,
             network_policy_authority,
             data_plane_session_refresh_authority,
+            template_release_read_authority,
         ) = match mode {
             KubernetesAuthenticationMode::Disabled => (
                 WaitReadyLifecycleAuthority::Granted,
                 NetworkPolicyMutationAuthority::Granted,
                 DataPlaneSessionRefreshAuthority::Granted,
+                TemplateReleaseReadAuthority::Unscoped,
             ),
             #[cfg(feature = "k8s")]
             KubernetesAuthenticationMode::Configured => (
                 WaitReadyLifecycleAuthority::Denied,
                 NetworkPolicyMutationAuthority::Denied,
                 DataPlaneSessionRefreshAuthority::Denied,
+                TemplateReleaseReadAuthority::NodeScoped,
             ),
         };
         Self {
             wait_ready_lifecycle_authority,
             network_policy_authority,
             data_plane_session_refresh_authority,
+            template_release_read_authority,
         }
     }
 
@@ -378,6 +402,7 @@ impl NodeApiAuthenticatedCaller {
             wait_ready_lifecycle_authority,
             network_policy_authority,
             data_plane_session_refresh_authority,
+            template_release_read_authority: TemplateReleaseReadAuthority::NodeScoped,
         }
     }
 
@@ -389,6 +414,7 @@ impl NodeApiAuthenticatedCaller {
             wait_ready_lifecycle_authority: WaitReadyLifecycleAuthority::Denied,
             network_policy_authority: NetworkPolicyMutationAuthority::Denied,
             data_plane_session_refresh_authority: DataPlaneSessionRefreshAuthority::Granted,
+            template_release_read_authority: TemplateReleaseReadAuthority::NodeScoped,
         }
     }
 
@@ -399,6 +425,7 @@ impl NodeApiAuthenticatedCaller {
             wait_ready_lifecycle_authority: WaitReadyLifecycleAuthority::Denied,
             network_policy_authority: NetworkPolicyMutationAuthority::Denied,
             data_plane_session_refresh_authority: DataPlaneSessionRefreshAuthority::Denied,
+            template_release_read_authority: TemplateReleaseReadAuthority::NodeScoped,
         }
     }
 
@@ -412,6 +439,10 @@ impl NodeApiAuthenticatedCaller {
 
     pub const fn data_plane_session_refresh_authority(&self) -> DataPlaneSessionRefreshAuthority {
         self.data_plane_session_refresh_authority
+    }
+
+    pub const fn template_release_read_authority(&self) -> TemplateReleaseReadAuthority {
+        self.template_release_read_authority
     }
 }
 

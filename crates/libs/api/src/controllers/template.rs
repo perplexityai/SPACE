@@ -102,7 +102,13 @@ pub struct TemplateBuildSubmission {
 }
 
 impl TemplateBuildSubmission {
-    async fn authorize_base(&mut self, pool: &sqlx::PgPool) -> Result<(), ControllerError> {
+    /// Authorize the recipe's base for the requesting organization and pin it
+    /// to the resolved release digest. Returns the base template's name, or
+    /// `None` for a recipe that builds from scratch.
+    async fn authorize_base(
+        &mut self,
+        pool: &sqlx::PgPool,
+    ) -> Result<Option<TemplateName>, ControllerError> {
         use build_proto::recipe::origin::Kind;
         if let Some(base) =
             self.recipe
@@ -140,8 +146,9 @@ impl TemplateBuildSubmission {
                 })?;
             *base = TemplateReference::with_artifact_digest(reference.name().clone(), hash.into())
                 .to_string();
+            return Ok(Some(reference.name().clone()));
         }
-        Ok(())
+        Ok(None)
     }
 
     fn into_start_build_request(self) -> StartBuildRequest {
@@ -276,7 +283,21 @@ impl TemplateController {
                 "template belongs to another organization",
             ));
         }
-        submission.authorize_base(&self.pool).await?;
+        // The grant must land before dispatch: the builder pulls the base as
+        // soon as it accepts the job, and ClusterApi only lets a builder node
+        // resolve an org-specific base that a fresh grant names. The response
+        // then pins this submission's grant to the accepting builder.
+        let base_grant = match submission.authorize_base(&self.pool).await? {
+            Some(base) => Some(
+                self.build_jobs
+                    .record_base_grant(org_id, &template_name, &base)
+                    .await
+                    .map_err(|error| {
+                        db_contention_error("failed to record build base grant", &error)
+                    })?,
+            ),
+            None => None,
+        };
         let client_build_id = submission.client_build_id.clone();
         let response = self
             .start_template_build_request(submission.into_start_build_request())
@@ -286,6 +307,7 @@ impl TemplateController {
             template_name,
             client_build_id.as_deref(),
             response,
+            base_grant,
         )
         .await
     }
@@ -296,6 +318,7 @@ impl TemplateController {
         template_name: TemplateName,
         client_build_id: Option<&str>,
         response: BuildTemplateResponse,
+        base_grant: Option<crate::template_build_jobs_store::BuildBaseGrantId>,
     ) -> Result<StartBuildResponse, ControllerError> {
         let job_id = response.job_id.parse::<BuildRunId>().map_err(|error| {
             ControllerError::internal(format!("builder returned an invalid build job ID: {error}"))
@@ -327,6 +350,7 @@ impl TemplateController {
                 client_build_id,
                 job_id,
                 builder_node_id,
+                base_grant,
             )
             .await
             // Not classified, deliberately: build-manager has already

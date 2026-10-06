@@ -3037,6 +3037,446 @@ fn request_from_node<T>(message: T, node_ip: std::net::IpAddr) -> Request<T> {
     request
 }
 
+/// A node-scoped request from `node_ip`: the TCP origin plus the narrow
+/// authority every TokenReview identity carries.
+fn node_scoped_request<T>(message: T, node_ip: std::net::Ipv4Addr) -> Request<T> {
+    let mut request = request_from_node(message, std::net::IpAddr::V4(node_ip));
+    request.extensions_mut().insert(
+        pplx_space_common_svc::auth::NodeApiAuthenticatedCaller::unprivileged_workload_for_test(),
+    );
+    request
+}
+
+/// Registers an org-specific template owned by `owner` with one release that
+/// is tagged `latest` and has a storage location. Returns the release id and
+/// its hash.
+async fn seed_private_release(
+    fixture: &ClusterFixture,
+    template: &str,
+    owner: Uuid,
+) -> TestResult<(Uuid, String)> {
+    let pool = &fixture.service.pool;
+    let hash = format!("sha256:{}", "b".repeat(64));
+    register_template_with_org(&fixture.service, template, Some(OrgId::from_uuid(owner))).await?;
+    sqlx::query(sql!(
+        "UPDATE templates SET visibility = 'org_specific' WHERE name = $1"
+    ))
+    .bind(template)
+    .execute(pool)
+    .await?;
+    let release_id = Uuid::now_v7();
+    sqlx::query(sql!(
+        "INSERT INTO template_releases (id, template_name, type, hash, org_id)
+         VALUES ($1, $2, 'fc', $3, $4)"
+    ))
+    .bind(release_id)
+    .bind(template)
+    .bind(&hash)
+    .bind(owner)
+    .execute(pool)
+    .await?;
+    sqlx::query(sql!(
+        "INSERT INTO template_release_tags (template_name, template_release_id, tag)
+         VALUES ($1, $2, 'latest')"
+    ))
+    .bind(template)
+    .bind(release_id)
+    .execute(pool)
+    .await?;
+    sqlx::query(sql!(
+        "INSERT INTO template_release_storage_locations
+             (template_release_id, storage_connection_string, org_id)
+         VALUES ($1, 's3://private/rootfs?region=us-east-2', $2)"
+    ))
+    .bind(release_id)
+    .bind(owner)
+    .execute(pool)
+    .await?;
+    Ok((release_id, hash))
+}
+
+/// Registers a ready Kubernetes-managed node of `role` at `address`.
+async fn insert_k8s_node(
+    pool: &sqlx::PgPool,
+    address: std::net::Ipv4Addr,
+    role: &str,
+) -> TestResult<Uuid> {
+    let id = Uuid::now_v7();
+    sqlx::query(sql!(
+        "INSERT INTO nodes (id, address, role, managed_by, state)
+         VALUES ($1, $2::INET, $3, 'k8s', 'ready')"
+    ))
+    .bind(id)
+    .bind(address.to_string())
+    .bind(role)
+    .execute(pool)
+    .await?;
+    Ok(id)
+}
+
+/// Whether a node at `node_ip` can resolve `template`'s `latest` release. All
+/// three node-facing reads are issued and must agree; `NotFound` and an empty
+/// listing read as not visible, any other error fails the test.
+async fn release_visible_from(
+    fixture: &ClusterFixture,
+    template: &str,
+    hash: &str,
+    node_ip: std::net::Ipv4Addr,
+    caller_org_id: Option<Uuid>,
+) -> TestResult<bool> {
+    fn visible(
+        result: Result<tonic::Response<FindTemplateReleaseResponse>, tonic::Status>,
+    ) -> TestResult<bool> {
+        match result {
+            Ok(_) => Ok(true),
+            Err(status) if status.code() == Code::NotFound => Ok(false),
+            Err(status) => Err(status.into()),
+        }
+    }
+    let caller_org_id = caller_org_id.map(|org| org.to_string());
+    let by_tag = visible(
+        fixture
+            .service
+            .find_template_release(node_scoped_request(
+                FindTemplateReleaseRequest {
+                    caller_org_id: caller_org_id.clone(),
+                    template_name: template.to_string(),
+                    runtime: "firecracker".to_string(),
+                    tag: "latest".to_string(),
+                },
+                node_ip,
+            ))
+            .await,
+    )?;
+    let by_hash = visible(
+        fixture
+            .service
+            .find_template_release_by_hash(node_scoped_request(
+                FindTemplateReleaseByHashRequest {
+                    caller_org_id,
+                    template_name: template.to_string(),
+                    hash: hash.to_string(),
+                },
+                node_ip,
+            ))
+            .await,
+    )?;
+    let listed = !fixture
+        .service
+        .list_latest_template_releases(node_scoped_request(
+            ListLatestTemplateReleasesRequest {
+                template_name: template.to_string(),
+                runtime: "firecracker".to_string(),
+                limit: 5,
+            },
+            node_ip,
+        ))
+        .await?
+        .into_inner()
+        .entries
+        .is_empty();
+    assert_eq!(
+        by_tag, by_hash,
+        "tag and hash lookups must agree for {template}"
+    );
+    assert_eq!(
+        by_tag, listed,
+        "ListLatest must agree with the lookups for {template}"
+    );
+    Ok(by_tag)
+}
+
+/// Node-scoped callers (every TokenReview identity, and the static token once
+/// TokenReview is configured) do not see an org-specific release the control
+/// plane has not tied to their node, whether they are a registered worker or
+/// an address that is not a node at all, and asserting the owner's
+/// `caller_org_id` grants nothing. Generic templates stay resolvable, and a
+/// caller without the auth extension keeps the control-plane view.
+#[tokio::test(flavor = "current_thread")]
+async fn node_scoped_lookups_hide_unplaced_private_releases() -> TestResult {
+    let Some(fixture) = cluster_fixture().await? else {
+        return Ok(());
+    };
+    let owner = Uuid::parse_str("00000000-0000-0000-0000-000000000003")?;
+    let (_, hash) = seed_private_release(&fixture, "private-base", owner).await?;
+    register_template(&fixture.service, "code-runtime").await?;
+    let generic_hash = format!("sha256:{}", "c".repeat(64));
+    register_release(
+        &fixture.service,
+        &generic_hash,
+        &[&generic_hash, "latest"],
+        &["s3://bucket/templates/code-runtime/generic?region=us-east-1"],
+    )
+    .await?;
+    let worker_ip = std::net::Ipv4Addr::new(10, 0, 0, 30);
+    insert_k8s_node(&fixture.service.pool, worker_ip, "worker").await?;
+    let unregistered_ip = std::net::Ipv4Addr::new(10, 0, 0, 99);
+
+    for node_ip in [worker_ip, unregistered_ip] {
+        for caller_org_id in [None, Some(owner)] {
+            assert!(
+                !release_visible_from(&fixture, "private-base", &hash, node_ip, caller_org_id)
+                    .await?,
+                "{node_ip} must not see an unplaced private release (asserted org {caller_org_id:?})"
+            );
+        }
+        assert!(
+            release_visible_from(&fixture, "code-runtime", &generic_hash, node_ip, None).await?,
+            "{node_ip} must still resolve generic templates"
+        );
+    }
+    fixture
+        .service
+        .find_template_release(Request::new(FindTemplateReleaseRequest {
+            caller_org_id: None,
+            template_name: "private-base".to_string(),
+            runtime: "firecracker".to_string(),
+            tag: "latest".to_string(),
+        }))
+        .await?;
+    Ok(())
+}
+
+/// A sandbox of the template placed on a node, by active or target
+/// placement, lets that node and only that node resolve the release.
+#[tokio::test(flavor = "current_thread")]
+async fn placed_sandbox_unlocks_private_release_for_its_node_only() -> TestResult {
+    let Some(fixture) = cluster_fixture().await? else {
+        return Ok(());
+    };
+    let pool = &fixture.service.pool;
+    let owner = Uuid::parse_str("00000000-0000-0000-0000-000000000003")?;
+    let (release_id, hash) = seed_private_release(&fixture, "private-base", owner).await?;
+    let worker_a_ip = std::net::Ipv4Addr::new(10, 0, 0, 30);
+    let worker_b_ip = std::net::Ipv4Addr::new(10, 0, 0, 31);
+    let worker_a = insert_k8s_node(pool, worker_a_ip, "worker").await?;
+    let worker_b = insert_k8s_node(pool, worker_b_ip, "worker").await?;
+
+    let sandbox_id = Uuid::now_v7();
+    sqlx::query(sql!(
+        "INSERT INTO sandboxes (
+             id, user_id, org_id, managed_by, lifecycle, placement,
+             active_node_id, target_node_id, command_ready_pending,
+             network_policy_generation, template_id
+         )
+         VALUES ($1, $2::uuid, $3::uuid, 'k8s', 'started', 'on_node', $4, $4, TRUE, 1, 'private-base')"
+    ))
+    .bind(sandbox_id)
+    .bind(SEEDED_USER_ID)
+    .bind(owner)
+    .bind(worker_a)
+    .execute(pool)
+    .await?;
+    assert!(release_visible_from(&fixture, "private-base", &hash, worker_a_ip, None).await?);
+    assert!(!release_visible_from(&fixture, "private-base", &hash, worker_b_ip, None).await?);
+    let found = fixture
+        .service
+        .find_template_release(node_scoped_request(
+            FindTemplateReleaseRequest {
+                caller_org_id: None,
+                template_name: "private-base".to_string(),
+                runtime: "firecracker".to_string(),
+                tag: "latest".to_string(),
+            },
+            worker_a_ip,
+        ))
+        .await?
+        .into_inner();
+    assert_eq!(
+        found.release.expect("placed release").id,
+        release_id.to_string()
+    );
+    assert_eq!(found.authorized_org_id, None);
+
+    // A pending migration is a target placement; the destination may pull
+    // before it becomes active, and the source keeps access while it still
+    // hosts the sandbox.
+    sqlx::query(sql!(
+        "UPDATE sandboxes SET target_node_id = $2 WHERE id = $1"
+    ))
+    .bind(sandbox_id)
+    .bind(worker_b)
+    .execute(pool)
+    .await?;
+    assert!(release_visible_from(&fixture, "private-base", &hash, worker_a_ip, None).await?);
+    assert!(release_visible_from(&fixture, "private-base", &hash, worker_b_ip, None).await?);
+    sqlx::query(sql!(
+        "UPDATE sandboxes SET active_node_id = $2 WHERE id = $1"
+    ))
+    .bind(sandbox_id)
+    .bind(worker_b)
+    .execute(pool)
+    .await?;
+    assert!(!release_visible_from(&fixture, "private-base", &hash, worker_a_ip, None).await?);
+    Ok(())
+}
+
+/// A pre-dispatch build grant lets registered builder nodes resolve the base
+/// it names while it is fresh, with no `template_build_jobs` row at all: the
+/// API writes the grant before `StartBuild`, and the builder that takes the
+/// job may pull the base before the API learns which builder that was. Once
+/// pinned to the accepting builder, the grant keeps covering that builder
+/// alone well past the unpinned window, so a job queued behind long builds
+/// still resolves its base when it runs, and a second build of the same
+/// target accepted on another builder has a grant of its own, so both keep
+/// access. Workers gain nothing from it, build history alone grants nothing,
+/// stale grants of either phase have expired, and another organization's
+/// grant does not cover this base.
+#[tokio::test(flavor = "current_thread")]
+async fn fresh_build_grant_unlocks_private_base_for_builders_only() -> TestResult {
+    let Some(fixture) = cluster_fixture().await? else {
+        return Ok(());
+    };
+    let pool = &fixture.service.pool;
+    let owner = Uuid::parse_str("00000000-0000-0000-0000-000000000003")?;
+    let stranger = Uuid::parse_str("00000000-0000-0000-0000-000000000002")?;
+    let (_, hash) = seed_private_release(&fixture, "private-base", owner).await?;
+    let builder_ip = std::net::Ipv4Addr::new(10, 0, 0, 40);
+    let worker_ip = std::net::Ipv4Addr::new(10, 0, 0, 30);
+    let builder = insert_k8s_node(pool, builder_ip, "builder").await?;
+    insert_k8s_node(pool, worker_ip, "worker").await?;
+
+    sqlx::query(sql!(
+        "INSERT INTO template_build_base_grants (id, template_id, base_template_name, org_id)
+         VALUES ($1, 'private-child', 'private-base', $2)"
+    ))
+    .bind(Uuid::now_v7())
+    .bind(owner)
+    .execute(pool)
+    .await?;
+    assert!(
+        release_visible_from(&fixture, "private-base", &hash, builder_ip, None).await?,
+        "a fresh grant must cover the builder before any job row exists"
+    );
+    assert!(!release_visible_from(&fixture, "private-base", &hash, worker_ip, None).await?);
+
+    // Build history is not authorization: a recorded job for the owning
+    // organization on this builder grants nothing once the grant is gone.
+    sqlx::query(sql!("DELETE FROM template_build_base_grants"))
+        .execute(pool)
+        .await?;
+    sqlx::query(sql!(
+        "INSERT INTO template_build_jobs (template_id, build_id, org_id, builder_node_id)
+         VALUES ('private-child', 'build-1', $1, $2)"
+    ))
+    .bind(owner)
+    .bind(builder)
+    .execute(pool)
+    .await?;
+    assert!(!release_visible_from(&fixture, "private-base", &hash, builder_ip, Some(owner)).await?);
+
+    // An unpinned grant ages out after the window the pin should have closed.
+    sqlx::query(sql!(
+        "INSERT INTO template_build_base_grants
+             (id, template_id, base_template_name, org_id, granted_at)
+         VALUES ($1, 'private-child', 'private-base', $2, NOW() - INTERVAL '2 hours')"
+    ))
+    .bind(Uuid::now_v7())
+    .bind(owner)
+    .execute(pool)
+    .await?;
+    assert!(!release_visible_from(&fixture, "private-base", &hash, builder_ip, None).await?);
+
+    // Pinned to the builder that accepted the job, the same aged grant keeps
+    // covering that builder and only that builder: a build that waited in its
+    // queue behind long jobs still resolves its base when it finally runs.
+    let other_builder_ip = std::net::Ipv4Addr::new(10, 0, 0, 41);
+    let other_builder = insert_k8s_node(pool, other_builder_ip, "builder").await?;
+    sqlx::query(sql!(
+        "UPDATE template_build_base_grants SET builder_node_id = $1
+         WHERE template_id = 'private-child'"
+    ))
+    .bind(builder)
+    .execute(pool)
+    .await?;
+    assert!(
+        release_visible_from(&fixture, "private-base", &hash, builder_ip, None).await?,
+        "a pinned grant must outlive the unpinned window for its builder"
+    );
+    assert!(!release_visible_from(&fixture, "private-base", &hash, other_builder_ip, None).await?);
+    assert!(!release_visible_from(&fixture, "private-base", &hash, worker_ip, None).await?);
+
+    // A second build of the same target accepted on the other builder has a
+    // grant of its own; accepting it takes nothing from the first builder.
+    sqlx::query(sql!(
+        "INSERT INTO template_build_base_grants
+             (id, template_id, base_template_name, org_id, builder_node_id)
+         VALUES ($1, 'private-child', 'private-base', $2, $3)"
+    ))
+    .bind(Uuid::now_v7())
+    .bind(owner)
+    .bind(other_builder)
+    .execute(pool)
+    .await?;
+    assert!(release_visible_from(&fixture, "private-base", &hash, builder_ip, None).await?);
+    assert!(release_visible_from(&fixture, "private-base", &hash, other_builder_ip, None).await?);
+    assert!(!release_visible_from(&fixture, "private-base", &hash, worker_ip, None).await?);
+
+    // A pinned grant does not last forever either.
+    sqlx::query(sql!(
+        "UPDATE template_build_base_grants SET granted_at = NOW() - INTERVAL '8 days'
+         WHERE template_id = 'private-child'"
+    ))
+    .execute(pool)
+    .await?;
+    assert!(!release_visible_from(&fixture, "private-base", &hash, builder_ip, None).await?);
+
+    // Another organization's grant for the same base name does not apply.
+    sqlx::query(sql!(
+        "INSERT INTO template_build_base_grants (id, template_id, base_template_name, org_id)
+         VALUES ($1, 'stranger-child', 'private-base', $2)"
+    ))
+    .bind(Uuid::now_v7())
+    .bind(stranger)
+    .execute(pool)
+    .await?;
+    assert!(!release_visible_from(&fixture, "private-base", &hash, builder_ip, None).await?);
+    Ok(())
+}
+
+/// An enabled warm pool lets registered workers resolve the pooled template,
+/// because warm slots are scheduled onto any worker before the control plane
+/// records where they landed. Builders and addresses that are not registered
+/// nodes gain nothing, and a disabled pool grants nothing.
+#[tokio::test(flavor = "current_thread")]
+async fn enabled_warm_pool_unlocks_private_release_for_registered_workers_only() -> TestResult {
+    let Some(fixture) = cluster_fixture().await? else {
+        return Ok(());
+    };
+    let pool = &fixture.service.pool;
+    let owner = Uuid::parse_str("00000000-0000-0000-0000-000000000003")?;
+    let (release_id, hash) = seed_private_release(&fixture, "private-base", owner).await?;
+    let worker_ip = std::net::Ipv4Addr::new(10, 0, 0, 30);
+    let builder_ip = std::net::Ipv4Addr::new(10, 0, 0, 40);
+    let unregistered_ip = std::net::Ipv4Addr::new(10, 0, 0, 99);
+    insert_k8s_node(pool, worker_ip, "worker").await?;
+    insert_k8s_node(pool, builder_ip, "builder").await?;
+
+    let config_id: Uuid = sqlx::query_scalar(sql!(
+        "INSERT INTO kubernetes_pool_configs (
+             template_release_id, vcpu, memory_mib, target_ready_slots,
+             refill_per_tick, max_warming_slots, namespace, enabled, managed_by
+         )
+         VALUES ($1, 2, 4096, 1, 1, 1, 'space', FALSE, 'autoscaler')
+         RETURNING id"
+    ))
+    .bind(release_id)
+    .fetch_one(pool)
+    .await?;
+    assert!(!release_visible_from(&fixture, "private-base", &hash, worker_ip, None).await?);
+
+    sqlx::query(sql!(
+        "UPDATE kubernetes_pool_configs SET enabled = TRUE WHERE id = $1"
+    ))
+    .bind(config_id)
+    .execute(pool)
+    .await?;
+    assert!(release_visible_from(&fixture, "private-base", &hash, worker_ip, None).await?);
+    assert!(!release_visible_from(&fixture, "private-base", &hash, builder_ip, None).await?);
+    assert!(!release_visible_from(&fixture, "private-base", &hash, unregistered_ip, None).await?);
+    Ok(())
+}
+
 async fn seed_active_k8s_sandbox(
     pool: &sqlx::PgPool,
     sandbox_id: SandboxId,
