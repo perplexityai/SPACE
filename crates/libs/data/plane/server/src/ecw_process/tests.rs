@@ -1,7 +1,7 @@
 use super::*;
 use crate::ECW_ENVD_PORT;
 use crate::state::{EcwRouteOrigin, EcwSandboxHost};
-use axum::http::StatusCode;
+use axum::http::{HeaderValue, StatusCode};
 use pplx_space_common_core::types::{IdempotencyKey, NodeId, SandboxId};
 use pplx_space_sbx_mgr_client::restart_retry_on_successor_status;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -494,6 +494,85 @@ fn process_stdout_stream_uses_pty_metadata_when_present() {
         process_stdout_stream(&process),
         ecw_connect::EcwProcessStdoutStream::Pty
     );
+}
+
+#[test]
+fn process_start_idempotency_key_binds_caller_key_to_its_start() {
+    let route = test_ecw_route(0);
+    // Enough entries that two independently built env maps are unlikely to
+    // iterate in the same order.
+    let envs: StringMap = (0..32)
+        .map(|index| (format!("VAR_{index}"), format!("value-{index}")))
+        .collect();
+    let backend_key = |client_key: Option<&str>, cmd: &str| {
+        let mut headers = HeaderMap::new();
+        if let Some(client_key) = client_key {
+            headers.insert("idempotency-key", client_key.parse().unwrap());
+        }
+        let request = ProcessStartConnectRequestE2b {
+            process: ProcessConfigRequestE2b {
+                cmd: cmd.to_string(),
+                args: vec!["-c".to_string(), "true".to_string()],
+                envs: envs.clone(),
+                cwd: None,
+            },
+            pty: None,
+            tag: None,
+            stdin: None,
+        };
+        build_process_start_request(&headers, &route, request)
+            .unwrap()
+            .operation
+            .and_then(|operation| operation.idempotency_key)
+            .expect("idempotency key")
+    };
+
+    assert_eq!(
+        backend_key(Some("start-1"), "bash"),
+        backend_key(Some("start-1"), "bash"),
+        "a retried start must reach spaced with the original key",
+    );
+    assert_ne!(
+        backend_key(Some("start-1"), "bash"),
+        backend_key(Some("start-1"), "sh"),
+        "a reused key must not replay a different command",
+    );
+    assert_ne!(
+        backend_key(Some("start-1"), "bash"),
+        backend_key(Some("start-2"), "bash"),
+    );
+    assert_ne!(
+        backend_key(None, "bash"),
+        backend_key(None, "bash"),
+        "starts without a caller key stay distinct",
+    );
+}
+
+#[test]
+fn process_start_rejects_unusable_idempotency_keys() {
+    let route = test_ecw_route(0);
+    for value in [
+        HeaderValue::from_static(" "),
+        HeaderValue::from_str(&"k".repeat(MAX_PROCESS_START_IDEMPOTENCY_KEY_BYTES + 1)).unwrap(),
+        HeaderValue::from_bytes(b"key-\xff").unwrap(),
+    ] {
+        let mut headers = HeaderMap::new();
+        headers.insert("idempotency-key", value);
+        let request = ProcessStartConnectRequestE2b {
+            process: ProcessConfigRequestE2b {
+                cmd: "true".to_string(),
+                args: Vec::new(),
+                envs: StringMap::new(),
+                cwd: None,
+            },
+            pty: None,
+            tag: None,
+            stdin: None,
+        };
+
+        let error = build_process_start_request(&headers, &route, request).unwrap_err();
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+    }
 }
 
 #[test]
