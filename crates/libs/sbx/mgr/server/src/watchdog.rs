@@ -37,6 +37,10 @@ use crate::snapshot_scheduler::SnapshotScheduler;
 
 mod diagnostics;
 
+/// Health transition lines keep the watchdog's target, which log searches
+/// already select on, though `diagnostics` writes them.
+const LOG_TARGET: &str = module_path!();
+
 const SIDECAR_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 // Background observations tolerate a slower reply than foreground Stats,
 // without extending the caller's response latency.

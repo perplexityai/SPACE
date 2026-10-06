@@ -194,28 +194,51 @@ async fn raw_vsock_check_separates_answering_resetting_and_silent_guests() {
 }
 
 #[tokio::test]
-async fn console_tail_is_bounded_to_the_newest_whole_lines() {
+async fn console_tail_keeps_the_newest_whole_lines_without_state_polls() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("fc.log");
+    let poll = "T [vm:fc_api] The API server received a Get request on \"/\".\n\
+                T [vm:fc_api] The request was executed successfully. Status code: 200 OK.\n";
     let mut content = String::new();
-    for line in 0..100 {
-        content.push_str(&format!("line {line:03}\n"));
+    for line in 0..20 {
+        content.push_str(&format!("event {line:02}\n"));
+    }
+    content.push_str("T [vm:fc_api] The API server received a Patch request on \"/vm\".\n");
+    content.push_str(
+        "T [vm:fc_api] The request was executed successfully. Status code: 204 No Content.\n",
+    );
+    for _ in 0..50 {
+        content.push_str(poll);
     }
     content.push_str("last \u{1b}[31mred\u{1b}[0m\tline\n");
     std::fs::write(&path, &content).unwrap();
+    let window = TailWindow {
+        scan_bytes: 64 * 1024,
+        // Exactly the five newest kept lines.
+        keep_bytes: 187,
+        noise: firecracker_state_poll,
+    };
 
-    let tail = read_tail(&path, 64)
+    let tail = read_tail(&path, window)
         .await
         .expect("existing file has a tail");
-    assert!(
-        tail.len() <= 64,
-        "tail of {} bytes exceeds the cap",
-        tail.len()
+    assert_eq!(
+        tail,
+        "event 18\nevent 19\n\
+         T [vm:fc_api] The API server received a Patch request on \"/vm\".\n\
+         T [vm:fc_api] The request was executed successfully. Status code: 204 No Content.\n\
+         last ?[31mred?[0m\tline\n"
     );
-    assert!(tail.starts_with("line "), "tail starts mid-line: {tail:?}");
-    assert!(tail.ends_with("last ?[31mred?[0m\tline\n"));
 
-    std::fs::write(&path, "short\n").unwrap();
-    assert_eq!(read_tail(&path, 64).await.as_deref(), Some("short\n"));
-    assert_eq!(read_tail(&directory.path().join("absent"), 64).await, None);
+    // A scan that starts mid-file drops the partial first line.
+    let short = TailWindow {
+        scan_bytes: 12,
+        keep_bytes: 160,
+        noise: no_noise,
+    };
+    assert_eq!(read_tail(&path, short).await.as_deref(), Some(""));
+    assert_eq!(
+        read_tail(&directory.path().join("absent"), window).await,
+        None
+    );
 }

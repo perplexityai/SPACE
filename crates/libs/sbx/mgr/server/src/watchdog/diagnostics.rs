@@ -39,7 +39,7 @@ const RAW_VSOCK_CHECK_TIMEOUT: Duration = Duration::from_secs(1);
 /// which also bounds how long a degrading transition's log line is delayed.
 const RESOURCE_SAMPLE_WINDOW: Duration = Duration::from_secs(1);
 pub(super) const CONSOLE_TAIL_MIN_INTERVAL: Duration = Duration::from_secs(15 * 60);
-const CONSOLE_TAIL_MAX_BYTES: u64 = 4 * 1024;
+const CONSOLE_TAIL_MAX_BYTES: usize = 4 * 1024;
 /// Degrading transitions gathering evidence at once. A node-wide event
 /// degrades many sandboxes together; extra transitions wait for a slot.
 pub(super) const EVIDENCE_CONCURRENCY: usize = 4;
@@ -228,6 +228,7 @@ impl HealthTransition {
         macro_rules! emit_transition {
             ($message:literal) => {
                 tracing::info!(
+                    target: super::LOG_TARGET,
                     sandbox_id = %self.sandbox_id,
                     lifecycle = self.lifecycle.map(|state| state.as_str()),
                     previous = ?self.previous,
@@ -529,16 +530,10 @@ impl TransitionEvidence {
             ResourceSample::read(&cgroup, before, after, window_started.elapsed()).await;
         let console_tails = if transition.console_tails == ConsoleTails::Included {
             Some(ConsoleTailText {
-                firecracker_log: read_tail(
-                    &firecracker_log_path(sandbox_id),
-                    CONSOLE_TAIL_MAX_BYTES,
-                )
-                .await,
-                guest_console: read_tail(
-                    &guest_console_log_path(sandbox_id),
-                    CONSOLE_TAIL_MAX_BYTES,
-                )
-                .await,
+                firecracker_log: read_tail(&firecracker_log_path(sandbox_id), FIRECRACKER_LOG_TAIL)
+                    .await,
+                guest_console: read_tail(&guest_console_log_path(sandbox_id), GUEST_CONSOLE_TAIL)
+                    .await,
             })
         } else {
             None
@@ -577,39 +572,76 @@ async fn read_small(path: &Path) -> Option<String> {
     tokio::fs::read_to_string(path).await.ok()
 }
 
-/// At most the newest `max_bytes` of a log file, starting at a line boundary
-/// when the file is longer. Invalid UTF-8 and control characters other than
-/// newlines and tabs become `?`, which never lengthens the text. `None` when
-/// the file does not exist; a read error is reported in place of the text.
-pub(super) async fn read_tail(path: &Path, max_bytes: u64) -> Option<String> {
+/// What a tail keeps of a log file: the newest whole lines, up to
+/// `keep_bytes`, found in its last `scan_bytes`, skipping lines `noise`
+/// accepts. Scanning more than is kept stops periodic noise from crowding out
+/// the events around it.
+#[derive(Clone, Copy)]
+struct TailWindow {
+    scan_bytes: u64,
+    keep_bytes: usize,
+    noise: fn(&mut NoiseFilter, &str) -> bool,
+}
+
+/// Per-tail state for a [`TailWindow::noise`] filter that pairs lines.
+#[derive(Default)]
+struct NoiseFilter {
+    skipped_request: bool,
+}
+
+/// Firecracker logs every API request and its response at `Info`. The
+/// watchdog reads VM state (`GET /`) on every probe, so without this a tail
+/// is little but those pairs. Any other request, such as a pause, is kept
+/// with its response.
+fn firecracker_state_poll(filter: &mut NoiseFilter, line: &str) -> bool {
+    let follows_skipped_request = std::mem::take(&mut filter.skipped_request);
+    if line.contains(":fc_api] The API server received a Get request on \"/\".") {
+        filter.skipped_request = true;
+        return true;
+    }
+    follows_skipped_request && line.contains(":fc_api] The request was executed successfully.")
+}
+
+fn no_noise(_: &mut NoiseFilter, _: &str) -> bool {
+    false
+}
+
+const FIRECRACKER_LOG_TAIL: TailWindow = TailWindow {
+    scan_bytes: 64 * 1024,
+    keep_bytes: CONSOLE_TAIL_MAX_BYTES,
+    noise: firecracker_state_poll,
+};
+
+const GUEST_CONSOLE_TAIL: TailWindow = TailWindow {
+    scan_bytes: CONSOLE_TAIL_MAX_BYTES as u64,
+    keep_bytes: CONSOLE_TAIL_MAX_BYTES,
+    noise: no_noise,
+};
+
+/// The newest lines of a log file within `window`. Invalid UTF-8 and control
+/// characters other than newlines and tabs become `?`, which never lengthens
+/// the text. `None` when the file does not exist; a read error is reported in
+/// place of the text.
+async fn read_tail(path: &Path, window: TailWindow) -> Option<String> {
     use tokio::io::{AsyncReadExt, AsyncSeekExt};
     let read = async {
         let mut file = tokio::fs::File::open(path).await?;
         let length = file.metadata().await?.len();
-        let start = length.saturating_sub(max_bytes);
+        let start = length.saturating_sub(window.scan_bytes);
         file.seek(std::io::SeekFrom::Start(start)).await?;
         let mut bytes = Vec::new();
-        file.take(max_bytes).read_to_end(&mut bytes).await?;
+        file.take(window.scan_bytes).read_to_end(&mut bytes).await?;
         Ok::<_, std::io::Error>((bytes, start > 0))
     };
     match read.await {
-        Ok((bytes, truncated)) => Some(sanitize_tail(&bytes, truncated)),
+        Ok((bytes, truncated)) => Some(tail_text(&bytes, truncated, window)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => Some(format!("<unreadable: {error}>")),
     }
 }
 
-fn sanitize_tail(bytes: &[u8], truncated: bool) -> String {
-    let whole_lines = if truncated {
-        bytes
-            .iter()
-            .position(|byte| *byte == b'\n')
-            .and_then(|newline| bytes.get(newline + 1..))
-            .unwrap_or(bytes)
-    } else {
-        bytes
-    };
-    String::from_utf8_lossy(whole_lines)
+fn tail_text(bytes: &[u8], truncated: bool, window: TailWindow) -> String {
+    let text = String::from_utf8_lossy(bytes)
         .chars()
         .map(|character| {
             if character == char::REPLACEMENT_CHARACTER
@@ -620,7 +652,27 @@ fn sanitize_tail(bytes: &[u8], truncated: bool) -> String {
                 character
             }
         })
-        .collect()
+        .collect::<String>();
+    let mut filter = NoiseFilter::default();
+    let lines = text
+        .split_inclusive('\n')
+        // A scan that starts mid-file starts mid-line.
+        .skip(usize::from(truncated))
+        .filter(|line| !(window.noise)(&mut filter, line))
+        .collect::<Vec<_>>();
+    let mut kept = 0;
+    let newest = lines
+        .iter()
+        .rev()
+        .take_while(|line| {
+            kept += line.len();
+            kept <= window.keep_bytes
+        })
+        .count();
+    lines
+        .get(lines.len().saturating_sub(newest)..)
+        .unwrap_or_default()
+        .concat()
 }
 
 /// The value of a `key value` line, as in `cpu.stat`, `memory.stat`, and
