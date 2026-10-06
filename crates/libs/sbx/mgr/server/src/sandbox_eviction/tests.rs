@@ -863,7 +863,7 @@ async fn evict_tick_below_engage_returns_before_candidate_scan() {
         ..Default::default()
     };
 
-    let report = evict_tick(&service, cfg, disk, &mut scan_state)
+    let report = evict_tick(&service, cfg, Some(disk), &mut scan_state)
         .await
         .unwrap();
 
@@ -871,10 +871,52 @@ async fn evict_tick_below_engage_returns_before_candidate_scan() {
     assert_eq!(report.evicted, 0);
     assert_eq!(report.skipped, 0);
     assert_eq!(report.malformed_updated_at, 1);
+    assert_eq!(report.resident_rows, 2);
     assert_eq!(
         scan_state.cursor, None,
         "closed gate must restart oldest-first"
     );
+}
+
+#[test]
+fn resident_rows_count_every_state() {
+    let conn = open_test_db();
+    insert_sandbox(&conn, "a-suspended", "suspended", 1_000);
+    insert_sandbox(&conn, "b-started", "started", 1_000);
+    insert_sandbox(&conn, "c-deleting", "deleting", 1_000);
+
+    assert_eq!(count_resident_rows(&conn).unwrap(), 3);
+}
+
+#[tokio::test]
+async fn evict_tick_without_disk_usage_fails_without_scanning() {
+    let conn = open_test_db();
+    insert_sandbox(&conn, "sbx-cold", "suspended", 1_000);
+    let service = SandboxManagerService::new(conn);
+    let cfg = EvictionConfig {
+        enabled: true,
+        engage_fraction: 0.0,
+        target_fraction: 0.0,
+        min_idle: std::time::Duration::from_secs(0),
+        interval: std::time::Duration::from_secs(60),
+        max_per_tick: 10,
+        reupload_max_per_tick: 5,
+    };
+    let cursor = CandidateCursor {
+        idle_witness_secs: 1_000,
+        sandbox_id: "sbx-previous".to_string(),
+    };
+    let mut scan_state = CandidateScanState {
+        cursor: Some(cursor.clone()),
+        ..Default::default()
+    };
+
+    let error = evict_tick(&service, cfg, None, &mut scan_state)
+        .await
+        .unwrap_err();
+
+    assert!(error.contains("statvfs"), "{error}");
+    assert_eq!(scan_state.cursor, Some(cursor), "nothing was scanned");
 }
 
 #[tokio::test]
@@ -899,7 +941,7 @@ async fn evict_tick_does_not_connect_when_all_candidates_are_backed_off() {
     let mut scan_state = CandidateScanState::default();
     scan_state.back_off("sbx-backed-off", Instant::now());
 
-    let report = evict_tick(&service, cfg, disk, &mut scan_state)
+    let report = evict_tick(&service, cfg, Some(disk), &mut scan_state)
         .await
         .unwrap();
 

@@ -170,3 +170,12 @@ pub fn logical_bytes_freed(reason: &str, bytes: u64) {
 pub fn disk_usage_fraction(fraction: f64) {
     gauge("sandbox.evict.disk_usage_fraction", fraction, &[]);
 }
+
+/// Local `sandboxes` rows on the node at the start of each tick, whatever
+/// their state. node-ctl's full census publishes one entry per row in a
+/// single `PublishNodeState`, so the census size grows with this count and
+/// it flags nodes approaching cluster-api's decode limit. Every tick of an
+/// enabled loop emits it once its row counts succeed.
+pub fn resident_rows(rows: u64) {
+    gauge("sandbox.evict.resident_rows", rows as f64, &[]);
+}

@@ -683,6 +683,15 @@ fn count_malformed_suspended_updated_at(conn: &Connection) -> rusqlite::Result<u
     })
 }
 
+/// Every local `sandboxes` row, whatever its state. node-ctl's full census
+/// publishes one entry per row, so this is the count that sizes it.
+fn count_resident_rows(conn: &Connection) -> rusqlite::Result<usize> {
+    conn.query_row("SELECT COUNT(*) FROM sandboxes", [], |row| {
+        let count: i64 = row.get(0)?;
+        usize::try_from(count).map_err(|_| rusqlite::Error::IntegralValueOutOfRange(0, count))
+    })
+}
+
 /// Gather the local half of the eviction evidence plus the sandbox's
 /// last-transition time (`updated_at`, epoch secs) for the recency
 /// witness. The pin and its artifact row are read in one query so the
@@ -818,6 +827,8 @@ impl LegacyRepairReport {
 struct TickReport {
     candidates: usize,
     malformed_updated_at: usize,
+    /// Local `sandboxes` rows at tick start.
+    resident_rows: usize,
     evicted: usize,
     young_evictions: usize,
     youngest_eviction_age_secs: Option<u64>,
@@ -1176,20 +1187,26 @@ async fn repair_legacy_reupload_candidates(
 async fn evict_tick(
     service: &SandboxManagerService,
     cfg: EvictionConfig,
-    disk: crate::disk_usage::DiskUsage,
+    disk: Option<crate::disk_usage::DiskUsage>,
     scan_state: &mut CandidateScanState,
 ) -> Result<TickReport, String> {
-    let service_for_malformed = service.clone();
-    let malformed_updated_at = tokio::task::spawn_blocking(move || {
-        let conn = service_for_malformed
+    let service_for_counts = service.clone();
+    let (malformed_updated_at, resident_rows) = tokio::task::spawn_blocking(move || {
+        let conn = service_for_counts
             .db_conn()
-            .map_err(|error| error.to_string())?;
-        count_malformed_suspended_updated_at(&conn).map_err(|error| error.to_string())
+            .map_err(|error| format!("eviction row counts db_conn: {error}"))?;
+        let malformed = count_malformed_suspended_updated_at(&conn)
+            .map_err(|error| format!("count_malformed_suspended_updated_at: {error}"))?;
+        let resident =
+            count_resident_rows(&conn).map_err(|error| format!("count_resident_rows: {error}"))?;
+        Ok::<_, String>((malformed, resident))
     })
     .await
-    .map_err(|e| format!("count_malformed_suspended_updated_at spawn_blocking: {e}"))?
-    .map_err(|e| format!("count_malformed_suspended_updated_at: {e}"))?;
+    .map_err(|e| format!("eviction row counts spawn_blocking: {e}"))??;
     pplx_space_metrics::sandbox_eviction::malformed_updated_at(malformed_updated_at as u64);
+    // Counted before the disk check so a tick that can't read disk usage
+    // still reports the population.
+    pplx_space_metrics::sandbox_eviction::resident_rows(resident_rows as u64);
     if malformed_updated_at > 0 {
         warn!(
             malformed_updated_at,
@@ -1197,6 +1214,7 @@ async fn evict_tick(
         );
     }
 
+    let disk = disk.ok_or("statvfs on the cache filesystem failed; cannot evaluate disk gate")?;
     // Hysteresis state: open when usage reached the engage fraction at
     // tick start; closed again mid-tick once evictions bring usage
     // below the target fraction.
@@ -1204,6 +1222,7 @@ async fn evict_tick(
         scan_state.reset_cursor();
         return Ok(TickReport {
             malformed_updated_at,
+            resident_rows,
             ..Default::default()
         });
     }
@@ -1231,6 +1250,7 @@ async fn evict_tick(
     let mut report = TickReport {
         candidates: candidates.len(),
         malformed_updated_at,
+        resident_rows,
         legacy_repair,
         ..Default::default()
     };
@@ -1608,18 +1628,14 @@ pub async fn run_loop(
     let mut scan_state = CandidateScanState::default();
     loop {
         let tick_started = Instant::now();
-        let tick_result = match crate::disk_usage::read_cache_disk_usage() {
-            Some(disk) => {
-                pplx_space_metrics::sandbox_eviction::disk_usage_fraction(disk.fraction());
-                tokio::select! {
-                    biased;
-                    _ = shutdown.cancelled() => return,
-                    result = evict_tick(&service, cfg, disk, &mut scan_state) => result,
-                }
-            }
-            None => {
-                Err("statvfs on the cache filesystem failed; cannot evaluate disk gate".to_string())
-            }
+        let disk = crate::disk_usage::read_cache_disk_usage();
+        if let Some(disk) = disk {
+            pplx_space_metrics::sandbox_eviction::disk_usage_fraction(disk.fraction());
+        }
+        let tick_result = tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => return,
+            result = evict_tick(&service, cfg, disk, &mut scan_state) => result,
         };
 
         match tick_result {
@@ -1643,6 +1659,7 @@ pub async fn run_loop(
                     legacy_repair_skipped = report.legacy_repair.skipped,
                     legacy_repair_failed = report.legacy_repair.failed,
                     malformed_updated_at = report.malformed_updated_at,
+                    resident_rows = report.resident_rows,
                     logical_bytes_freed = report.logical_bytes_freed,
                     "sandbox eviction tick complete",
                 );
