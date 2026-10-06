@@ -74,6 +74,13 @@ async fn native_create_executor_persists_exemptions_without_changing_egress() ->
     use crate::tls_interception_exemptions::TlsInterceptionExemptions;
     use pplx_space_net_common::NetworkPolicyV1;
 
+    // The fully instrumented native create path needs more than libtest's default stack.
+    if !pplx_space_test_env::enter_test_process(&[(
+        "RUST_MIN_STACK",
+        Some(std::ffi::OsStr::new("16777216")),
+    )]) {
+        return Ok(());
+    }
     let db = pg_test_db().await?;
     let org_id = seed_org(&db.pool).await?;
     let user_id = seed_user(&db.pool, org_id).await?;
@@ -140,7 +147,6 @@ async fn native_create_executor_persists_exemptions_without_changing_egress() ->
             }
             .into_json();
 
-            // The full create future is too large for the CI test thread's stack.
             let result = Box::pin(executor.execute(&operation)).await;
             assert_eq!(result.state, OperationState::Succeeded, "{result:?}");
             let persisted: Option<sqlx::types::Json<NetworkPolicyV1>> = sqlx::query_scalar(sql!(
