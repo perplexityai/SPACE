@@ -714,7 +714,12 @@ pub(super) fn unmount_if_present(path: impl AsRef<Path>) -> Result<bool, String>
 #[cfg(target_os = "linux")]
 pub(super) fn unmount_existing_path(path: impl AsRef<Path>) -> Result<bool, String> {
     let path: &Path = path.as_ref();
-    match nix::mount::umount2(path, nix::mount::MntFlags::MNT_DETACH) {
+    // Callers name binds inside a sandbox-writable jail. Never follow a final
+    // link planted there into a host mount.
+    match nix::mount::umount2(
+        path,
+        nix::mount::MntFlags::MNT_DETACH | nix::mount::MntFlags::UMOUNT_NOFOLLOW,
+    ) {
         Ok(()) => Ok(true),
         Err(nix::errno::Errno::EINVAL | nix::errno::Errno::ENOENT) => Ok(false),
         Err(error) => Err(format!("failed to unmount {}: {error}", path.display())),
