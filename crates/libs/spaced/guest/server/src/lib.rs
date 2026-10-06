@@ -193,6 +193,8 @@ mod guest_path;
 mod idempotency;
 mod identity;
 mod local_admission;
+#[cfg(target_os = "linux")]
+mod memlock;
 mod meta;
 mod networking;
 mod port_forward;

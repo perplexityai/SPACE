@@ -76,6 +76,8 @@ pub fn run(config: SpacedGuestRunConfig) -> Result<(), RunSpacedGuestError> {
     // allocated in, so it would otherwise sit outside the supervisor leaf.
     if crate::native_vsock_available() {
         drop(crate::cgroup::GuestCgroups::initialize_for_process());
+        #[cfg(target_os = "linux")]
+        crate::memlock::lock_text();
     }
 
     block_on_bounded(

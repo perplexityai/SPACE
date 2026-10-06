@@ -25,7 +25,9 @@
 //!     inside its own cgroup and the guest as a whole never runs out:
 //!     spaced is not an OOM candidate and does not stall reclaiming for a
 //!     workload. `supervisor/memory.min` keeps spaced's pages resident under
-//!     the pressure that remains.
+//!     the pressure that remains, as far as its ancestors' floors allow.
+//!     Without swap only file pages are reclaimed, and spaced's text is
+//!     locked (`crate::memlock`).
 //!   - I/O: `supervisor/io.weight` dominates, so spaced's own disk I/O (reading
 //!     `/proc`, fs metadata, writing logs) is serviced ahead of a workload
 //!     saturating the device, rather than queuing behind it. This is the one
