@@ -71,23 +71,6 @@ fn scoped_release_response_must_acknowledge_the_org_and_exact_release(
 use pplx_space_common_core::types::TEMPLATE_ROOTFS_ZSTD_FILE;
 
 #[test]
-fn visibility_enforcement_requires_an_explicit_opt_in_value() {
-    for value in [
-        None,
-        Some(""),
-        Some("0"),
-        Some("false"),
-        Some("False"),
-        Some("yes"),
-    ] {
-        assert!(!visibility_enforcement_value_enabled(value), "{value:?}");
-    }
-    for value in [Some("1"), Some("true"), Some("TRUE")] {
-        assert!(visibility_enforcement_value_enabled(value), "{value:?}");
-    }
-}
-
-#[test]
 fn volmgr_admission_rejection_is_retryable() {
     let status = Status::resource_exhausted("pull admission limit reached");
 

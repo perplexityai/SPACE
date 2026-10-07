@@ -214,57 +214,20 @@ fn accumulated_verdict_overrides_skewed_generic_read() {
 /// but a confirmed `Generic` there: otherwise a visibility flip
 /// between the tick's gate and the download would still materialize
 /// a private rootfs. On-demand pulls stay exempt — already
-/// authorized by the API's create-time gate.
+/// authorized by the API's create-time gate. The gate takes no setting:
+/// an absent or invalid configuration cannot open it.
 #[test]
 fn prefetch_pull_fails_closed_on_final_resolve() {
     use crate::volume::prefetch_pull_blocked;
     use TemplateVisibility::{Generic, OrgSpecific, Unspecified};
     for trigger in [PullTrigger::PrefetchTag, PullTrigger::PrefetchLatestRelease] {
-        assert!(prefetch_pull_blocked(true, trigger, OrgSpecific));
-        assert!(prefetch_pull_blocked(true, trigger, Unspecified));
-        assert!(!prefetch_pull_blocked(true, trigger, Generic));
+        assert!(prefetch_pull_blocked(trigger, OrgSpecific));
+        assert!(prefetch_pull_blocked(trigger, Unspecified));
+        assert!(!prefetch_pull_blocked(trigger, Generic));
     }
     for visibility in [Generic, Unspecified, OrgSpecific] {
-        assert!(!prefetch_pull_blocked(
-            true,
-            PullTrigger::OnDemand,
-            visibility
-        ));
+        assert!(!prefetch_pull_blocked(PullTrigger::OnDemand, visibility));
     }
-}
-
-/// With enforcement off the final gate never blocks, for any trigger or
-/// visibility — the kill switch has to reach this path too, not just the
-/// tick's decisions, because a pull queued while enforcement was on can
-/// still be waiting on its semaphore permit when the switch is flipped.
-#[test]
-fn kill_switch_opens_the_final_gate_for_every_input() {
-    use crate::volume::prefetch_pull_blocked;
-    use TemplateVisibility::{Generic, OrgSpecific, Unspecified};
-    for trigger in [
-        PullTrigger::PrefetchTag,
-        PullTrigger::PrefetchLatestRelease,
-        PullTrigger::OnDemand,
-    ] {
-        for visibility in [Generic, Unspecified, OrgSpecific] {
-            assert!(
-                !prefetch_pull_blocked(false, trigger, visibility),
-                "enforcement off must never block: {trigger:?} / {visibility:?}"
-            );
-        }
-    }
-}
-
-/// With both warming and enforcement disabled, the latest-release pass has
-/// no work: querying would spend one RPC per template and delay tag pulls for
-/// a visibility verdict that no caller uses. Enforcement still needs the pass
-/// at `latest_n = 0` so it can remove stale pins after a deleted tag.
-#[test]
-fn latest_release_queries_require_warming_or_enforcement() {
-    assert!(!should_query_latest_releases(0, false));
-    assert!(should_query_latest_releases(0, true));
-    assert!(should_query_latest_releases(1, false));
-    assert!(should_query_latest_releases(u32::MAX, true));
 }
 
 /// The template-level verdict survives an empty latest-releases
@@ -425,5 +388,84 @@ fn every_tuple_of_a_confirmed_template_is_suppressed() {
     assert_eq!(
         suppressed.iter().map(|p| p.tag).collect::<Vec<_>>(),
         vec!["latest", "stable"]
+    );
+}
+
+/// Without an explicit allowlist the node prefetches nothing: there are no
+/// built-in template names. Only an explicit list turns prefetch on, and
+/// an invalid one is an error rather than a fallback.
+#[test]
+fn unset_prefetch_tags_mean_on_demand_only() {
+    assert!(configured_prefetch_tags(None).unwrap().is_empty());
+    assert!(configured_prefetch_tags(Some("[]")).unwrap().is_empty());
+    let configured = configured_prefetch_tags(Some(r#"["seed:latest"]"#)).unwrap();
+    assert_eq!(configured.len(), 1);
+    assert_eq!(configured[0].0.as_str(), "seed");
+    assert_eq!(configured[0].1.as_str(), "latest");
+    configured_prefetch_tags(Some("")).unwrap_err();
+    configured_prefetch_tags(Some("seed:latest")).unwrap_err();
+}
+
+/// On-demand-only operation leaves no prefetch pin behind, so a digest an
+/// earlier allowlist pinned becomes evictable again.
+#[test]
+fn on_demand_only_releases_every_prefetch_pin() {
+    let store = PinnedDigestsStore::new(std::sync::Arc::new(std::sync::Mutex::new(
+        crate::db::test_conn(),
+    )));
+    store.upsert_tag("seed", "latest", "sha256:a").unwrap();
+    store
+        .upsert_release("seed", "sha256:b", "release-b", "2026-10-01T00:00:00Z")
+        .unwrap();
+
+    release_prefetch_pins(&store).unwrap();
+
+    assert!(
+        store
+            .list_pinned_hashes_for_template("seed")
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// A failed on-demand-only cleanup is retried until it succeeds, and one
+/// table failing does not hold back the other.
+#[tokio::test]
+async fn on_demand_only_pin_release_retries_until_it_succeeds() {
+    let conn = std::sync::Arc::new(std::sync::Mutex::new(crate::db::test_conn()));
+    let store = PinnedDigestsStore::new(conn.clone());
+    store.upsert_tag("seed", "latest", "sha256:a").unwrap();
+    store
+        .upsert_release("seed", "sha256:b", "release-b", "2026-10-01T00:00:00Z")
+        .unwrap();
+    let break_tags = |sql: &str| conn.lock().unwrap().execute_batch(sql).unwrap();
+    break_tags("ALTER TABLE template_pinned_tags RENAME TO template_pinned_tags_unavailable");
+
+    let cleanup = tokio::spawn(release_prefetch_pins_until_released(
+        store.clone(),
+        Duration::from_millis(10),
+    ));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !store.list_release_hashes("seed").unwrap().is_empty() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("release pins drop even while the tag table fails");
+    assert!(
+        !cleanup.is_finished(),
+        "cleanup must keep retrying the failed table"
+    );
+
+    break_tags("ALTER TABLE template_pinned_tags_unavailable RENAME TO template_pinned_tags");
+    tokio::time::timeout(Duration::from_secs(5), cleanup)
+        .await
+        .expect("cleanup completes once the table recovers")
+        .unwrap();
+    assert!(
+        store
+            .list_pinned_hashes_for_template("seed")
+            .unwrap()
+            .is_empty()
     );
 }

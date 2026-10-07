@@ -161,31 +161,10 @@ impl PullTrigger {
     }
 }
 
-/// Whether the visibility gate is armed on this node.
-///
-/// **Default-disabled**, unlike every other `SPACE_TEMPLATE_PREFETCH_*`
-/// knob. Enforcement only happens where a cluster has explicitly opted
-/// in; absent, empty, or any unrecognized value leaves the gate inert
-/// and prefetch behaves exactly as it did before the gate existed. See
-/// the rollout note under "Visibility gate" for why.
-///
-/// Read at the point of use rather than captured into
-/// [`crate::prefetch::PrefetchConfig`] at process start. A value captured once is a value
-/// you cannot turn off, and the whole purpose of this switch is that
-/// flipping it stops enforcement without shipping a new binary. The cost
-/// is one environment lookup per tick plus one per dispatched pull,
-/// which is nothing against a 60-second interval and an S3 GET.
-pub(crate) fn visibility_enforcement_enabled() -> bool {
-    visibility_enforcement_value_enabled(std::env::var(ENV_VISIBILITY_ENFORCEMENT).ok().as_deref())
-}
-
-fn visibility_enforcement_value_enabled(value: Option<&str>) -> bool {
-    matches!(value, Some("1") | Some("true") | Some("TRUE"))
-}
-
-/// Opt-in switch for the visibility gate. Named on the struct rather
-/// than inline so the docs, the reader, and the chart cannot drift.
-pub(crate) const ENV_VISIBILITY_ENFORCEMENT: &str =
+/// Former opt-in switch for the visibility gate. The gate is now
+/// unconditional; the name is kept only so startup can warn when a
+/// deployment still sets it.
+pub(crate) const RETIRED_ENV_VISIBILITY_ENFORCEMENT: &str =
     "SPACE_TEMPLATE_PREFETCH_VISIBILITY_ENFORCEMENT";
 
 /// Whether a resolved release must NOT be downloaded for this caller.
@@ -196,18 +175,11 @@ pub(crate) const ENV_VISIBILITY_ENFORCEMENT: &str =
 /// is the freshest answer before bytes hit the disk, so a visibility
 /// flip between the two must abort the download.
 ///
-/// `enforcing` is the rollout kill switch
-/// ([`visibility_enforcement_enabled`]); when it is off
-/// this returns `false` for every input and the download proceeds
-/// exactly as it did before the gate existed. Taken as a parameter
-/// rather than read here so the function stays pure and the fail-closed
-/// matrix keeps its focused test.
-pub(crate) fn prefetch_pull_blocked(
-    enforcing: bool,
-    trigger: PullTrigger,
-    visibility: TemplateVisibility,
-) -> bool {
-    enforcing && trigger.is_prefetch() && visibility != TemplateVisibility::Generic
+/// No setting opens this gate. Prefetch runs on every node, so an absent
+/// or unreadable visibility must never distribute a template beyond the
+/// nodes the control plane placed it on.
+pub(crate) fn prefetch_pull_blocked(trigger: PullTrigger, visibility: TemplateVisibility) -> bool {
+    trigger.is_prefetch() && visibility != TemplateVisibility::Generic
 }
 
 /// Cloneable failure classification published to coalesced pull callers.
@@ -802,15 +774,7 @@ async fn pull_inner(
     // sandbox create (the API's create-time authz gate owns that
     // decision), including org-specific templates on their own org's
     // dedicated nodes.
-    // Read here rather than inheriting the tick's decision: this runs in
-    // a task the tick spawned, so the freshest answer is the right one —
-    // flipping enforcement off should stop a pull that is still waiting
-    // on its semaphore permit.
-    if prefetch_pull_blocked(
-        visibility_enforcement_enabled(),
-        spec.trigger,
-        release.visibility,
-    ) {
+    if prefetch_pull_blocked(spec.trigger, release.visibility) {
         warn!(
             template = name,
             content_hash = %release.hash,

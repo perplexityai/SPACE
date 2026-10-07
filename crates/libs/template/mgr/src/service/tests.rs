@@ -169,6 +169,35 @@ fn list_templates_projects_stored_execution_metadata() {
     );
 }
 
+/// A local inventory read that fails must surface as an error, never as an
+/// empty list: node-ctl publishes a `ListTemplates` answer as the node's
+/// complete template census, and the cluster prunes every inventory row the
+/// census omits.
+#[test]
+fn list_templates_reports_unavailable_when_builds_cannot_be_read() {
+    let conn = crate::db::test_conn();
+    insert_ready_build(&conn, "seed", "sha256:inventory-read-failure");
+    let service = TemplateManagerService::new(conn)
+        .unwrap()
+        .without_sbx_connect_retries();
+    service
+        .db
+        .lock()
+        .unwrap()
+        .execute_batch("ALTER TABLE template_builds RENAME TO template_builds_unreadable")
+        .unwrap();
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let result =
+        runtime.block_on(service.list_templates(internal_request(ListTemplatesRequest {})));
+
+    let status = result.expect_err("an unreadable build inventory must not list as empty");
+    assert_eq!(status.code(), tonic::Code::Unavailable, "{status:?}");
+}
+
 #[test]
 fn proto_policy_to_common_rejects_invalid_default_auto_lifecycle() {
     let policy = sbx_proto::AutoLifecyclePolicy {

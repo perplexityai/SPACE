@@ -140,6 +140,45 @@ fn plan_from_db_respects_pinned_rows() {
     assert_eq!(plan.candidates[0].content_hash, "evictable");
 }
 
+/// A retention change — here an allowlist that no longer names `seed`,
+/// so prefetch released its pins — makes the formerly pinned builds
+/// evictable, but never one an active sandbox still references.
+#[test]
+fn released_prefetch_pins_never_expose_active_builds() {
+    let db = std::sync::Arc::new(std::sync::Mutex::new(crate::db::test_conn()));
+    {
+        let conn = db.lock().unwrap();
+        seed_build(&conn, "seed", "in-use", 1_000);
+        seed_build(&conn, "seed", "idle", 1_000);
+        plant_pin(&conn, "seed", "in-use");
+        // The in-use build is the older one, so plain LRU would pick it.
+        crate::db::set_last_used_at_for_test(&conn, "seed", "in-use", 1).unwrap();
+        crate::db::set_last_used_at_for_test(&conn, "seed", "idle", 2).unwrap();
+    }
+    let pins = crate::pinned_digests::PinnedDigestsStore::new(db.clone());
+    pins.upsert_release("seed", "idle", "release-idle", "2026-01-01T00:00:00Z")
+        .unwrap();
+    pins.prune_tags_outside(&[]).unwrap();
+    pins.prune_release_templates_outside(&[]).unwrap();
+
+    let plan = plan_from_db(
+        &db.lock().unwrap(),
+        &keys(&[("seed", "in-use")]),
+        &HashSet::new(),
+        // Budget below either build: everything unprotected must go.
+        &cfg(500, 0.9, 0, 10_000),
+        |_, _, s, _| s,
+    )
+    .unwrap();
+
+    let evicted: Vec<_> = plan
+        .candidates
+        .iter()
+        .map(|c| c.content_hash.as_str())
+        .collect();
+    assert_eq!(evicted, vec!["idle"]);
+}
+
 /// `execute_one` happy path: pin set is empty, active set is
 /// empty, build row exists — the disk closure runs, both DB
 /// tables are cleared, and the outcome is `Deleted`. We assert

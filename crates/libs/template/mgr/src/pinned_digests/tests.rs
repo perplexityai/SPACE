@@ -262,3 +262,31 @@ fn prune_tags_outside_drops_only_removed_tuples() {
     hashes.sort();
     assert_eq!(hashes, vec!["sha256:aa".to_string()]);
 }
+
+/// Removing a template from the prefetch allowlist drops its release
+/// pins even though the tick never resolves it again; templates still
+/// configured keep theirs.
+#[test]
+fn prune_release_templates_outside_drops_unconfigured_templates_only() {
+    let store = store_with_in_memory_db();
+    store
+        .upsert_release("seed", "sha256:aa", "rel-1", "2026-01-01T00:00:00Z")
+        .unwrap();
+    store
+        .upsert_release("removed", "sha256:bb", "rel-2", "2026-01-01T00:00:00Z")
+        .unwrap();
+
+    let pruned = store
+        .prune_release_templates_outside(&["seed".to_string()])
+        .unwrap();
+
+    assert_eq!(pruned, 1);
+    assert_eq!(
+        store.list_release_hashes("seed").unwrap(),
+        vec!["sha256:aa"]
+    );
+    assert!(store.list_release_hashes("removed").unwrap().is_empty());
+
+    assert_eq!(store.prune_release_templates_outside(&[]).unwrap(), 1);
+    assert!(store.list_release_hashes("seed").unwrap().is_empty());
+}
