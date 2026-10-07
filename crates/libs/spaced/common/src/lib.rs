@@ -104,9 +104,9 @@ pub use retry_policy::{
 };
 pub use server::{BindUdsError, bind_uds, bind_uds_with_mode};
 pub use uds::{
-    ExpectedUdsPeer, UdsConnectError, connect_uds_channel, connect_uds_channel_with_expected_peer,
-    connect_uds_channel_with_expected_peer_and_retry, connect_uds_channel_with_retry,
-    default_bridge_guest_uds_path, default_bridge_host_uds_path,
+    ExpectedUdsPeer, PinnedConnection, UdsConnectError, connect_uds_channel,
+    connect_uds_channel_with_expected_peer, connect_uds_channel_with_expected_peer_and_retry,
+    connect_uds_channel_with_retry, default_bridge_guest_uds_path, default_bridge_host_uds_path,
 };
 pub use validate::{
     validate_duration, validate_optional_duration, validate_optional_reason,

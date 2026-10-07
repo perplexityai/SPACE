@@ -68,21 +68,25 @@ pub fn firecracker_vsock_port_path(
 
 /// Connect to one authenticated Firecracker process without allowing the
 /// channel to reconnect to a replacement process under the same socket path.
+/// The returned [`crate::PinnedConnection`] reports when that connection closes.
 pub async fn connect_firecracker_vsock_channel_with_expected_peer(
     service_name: &'static str,
     vsock_uds_path: &std::path::Path,
     port: u32,
     expected_peer: crate::ExpectedUdsPeer,
-) -> Result<tonic::transport::Channel, FirecrackerVsockConnectError> {
+) -> Result<(tonic::transport::Channel, crate::PinnedConnection), FirecrackerVsockConnectError> {
     let path = vsock_uds_path.to_path_buf();
     let endpoint = tonic::transport::Endpoint::try_from("http://[::]:50051")
         .map(|endpoint| endpoint.max_frame_size(crate::BULK_HTTP2_MAX_FRAME_SIZE))
         .map_err(FirecrackerVsockConnectError::Endpoint)?;
     let connection_claimed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    endpoint
+    let connection = crate::PinnedConnection::new();
+    let pinned = connection.clone();
+    let channel = endpoint
         .connect_with_connector(tower::service_fn(move |_| {
             let path = path.clone();
             let connection_claimed = connection_claimed.clone();
+            let pinned = pinned.clone();
             async move {
                 use tokio::io::AsyncWriteExt;
                 crate::uds::claim_single_connection(&connection_claimed)?;
@@ -92,7 +96,9 @@ pub async fn connect_firecracker_vsock_channel_with_expected_peer(
                     .write_all(format!("CONNECT {port}\n").as_bytes())
                     .await?;
                 read_firecracker_ack(&mut stream).await?;
-                Ok::<_, std::io::Error>(hyper_util::rt::TokioIo::new(stream))
+                Ok::<_, std::io::Error>(hyper_util::rt::TokioIo::new(crate::uds::PinnedIo::new(
+                    stream, &pinned,
+                )))
             }
         }))
         .await
@@ -101,7 +107,8 @@ pub async fn connect_firecracker_vsock_channel_with_expected_peer(
             path: vsock_uds_path.to_path_buf(),
             port,
             source,
-        })
+        })?;
+    Ok((channel, connection))
 }
 
 async fn read_firecracker_ack(

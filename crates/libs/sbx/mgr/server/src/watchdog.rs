@@ -2338,7 +2338,7 @@ async fn probe_spaced_guest_health(
         );
     };
     let result = tokio::time::timeout(SPACED_GUEST_HEALTH_TIMEOUT, async {
-        let channel =
+        let (channel, _) =
             pplx_space_spaced_common::connect_firecracker_vsock_channel_with_expected_peer(
                 "spaced guest health",
                 Path::new(vsock_uds_path),

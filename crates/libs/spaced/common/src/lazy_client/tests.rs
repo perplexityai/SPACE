@@ -69,3 +69,55 @@ async fn clear_if_generation_does_not_clear_newer_client() -> anyhow::Result<()>
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn closed_pinned_connection_is_replaced_before_the_next_lease() -> anyhow::Result<()> {
+    let lazy = LazyClient::new();
+    let connection = crate::PinnedConnection::new();
+    let transport = crate::uds::PinnedIo::new(tokio::io::duplex(64).0, &connection);
+    let first = lazy
+        .get_or_connect_pinned_with_generation::<anyhow::Error, _, _>(|| async {
+            Ok((1, Some(connection.clone())))
+        })
+        .await?;
+    let reused = lazy
+        .get_or_connect_pinned_with_generation::<anyhow::Error, _, _>(|| async { Ok((2, None)) })
+        .await?;
+    assert_eq!(reused.generation(), first.generation());
+    assert_eq!(reused.into_client(), 1);
+
+    drop(transport);
+    let replaced = lazy
+        .get_or_connect_pinned_with_generation::<anyhow::Error, _, _>(|| async { Ok((3, None)) })
+        .await?;
+    assert_ne!(replaced.generation(), first.generation());
+    assert_eq!(replaced.into_client(), 3);
+    Ok(())
+}
+
+#[tokio::test]
+async fn closed_pinned_connection_is_not_leased_when_reconnect_fails() -> anyhow::Result<()> {
+    let lazy = LazyClient::new();
+    let connection = crate::PinnedConnection::new();
+    drop(crate::uds::PinnedIo::new(
+        tokio::io::duplex(64).0,
+        &connection,
+    ));
+    lazy.get_or_connect_pinned_with_generation::<anyhow::Error, _, _>(|| async {
+        Ok((1, Some(connection)))
+    })
+    .await?;
+
+    lazy.get_or_connect_pinned_with_generation::<anyhow::Error, _, _>(|| async {
+        Err(anyhow::anyhow!("guest is restarting"))
+    })
+    .await
+    .expect_err("the failed reconnect must be reported");
+    assert!(!lazy.is_connected());
+    assert_eq!(
+        lazy.get_or_connect::<anyhow::Error, _, _>(|| async { Ok(2) })
+            .await?,
+        2
+    );
+    Ok(())
+}
