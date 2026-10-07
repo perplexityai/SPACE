@@ -10,8 +10,8 @@
 #     single entrypoint supervises the full service set (prod runs one
 #     DaemonSet per service); it also does what the per-service init
 #     containers do in prod. The kind node itself provides what the AMI does
-#     (btrfs cache, cgroup subtree, loop devices, directory skeleton), through
-#     infra/space/kind/scripts/prepare-kind-node.sh.
+#     (btrfs cache, cgroup subtree, loop devices, directory skeleton), from
+#     the SPACE Kind node image (infra/space/kind/node/Dockerfile).
 #   * postgresql-client — ONLY for the legacy DirectSubstrate bench
 #     registration (space-local-3486); the production-shaped path never
 #     touches Postgres from a node.

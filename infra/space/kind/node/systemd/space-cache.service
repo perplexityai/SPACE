@@ -1,5 +1,5 @@
-# Installed on Kind SPACE nodes by infra/space/kind/scripts/prepare-kind-node.sh.
-# See infra/space/kind/node/space-kind-node.sh.
+# Baked into the Kind node image (infra/space/kind/node/Dockerfile) and enabled
+# there. See infra/space/kind/node/space-kind-node.sh.
 [Unit]
 Description=SPACE btrfs /space/cache on a loopback image
 Wants=space-loop-nodes.service

@@ -382,16 +382,18 @@ if not MINIMAL:
         labels = ["bootstrap"],
     )
 
-# The node layer a production node image provides (btrfs /space/cache, cgroup
-# subtree, loop-device headroom, device permissions, /space layout), installed
-# on each sandbox worker and builder as systemd units that run before kubelet on
-# every node start. The node-stack pods only check for it. Both node-stack
-# renders depend on this, and SPACE_LOOP_DEVICE_TARGET is inherited so the
-# nodes stage the pool the renders hand node-manager.
+# Sandbox workers and builders boot the SPACE Kind node image, which bakes in
+# the node layer a production node image provides (btrfs /space/cache, cgroup
+# subtree, loop-device headroom, device permissions, /space layout); the
+# node-stack pods only check for it. A node keeps the image it was created
+# from, so this refuses a cluster whose SPACE nodes predate the image or run an
+# older build of it, with the remedy (recreate the cluster), instead of letting
+# the node-stack pods wait for a cache that never comes.
 local_resource(
-    "prepare-kind-nodes",
-    cmd = "SPACE_KIND_CLUSTER={} bash infra/space/kind/scripts/prepare-kind-node.sh".format(KIND_CLUSTER),
-    deps = ["infra/space/kind/scripts/prepare-kind-node.sh", "infra/space/kind/node",
+    "check-kind-node-image",
+    cmd = "SPACE_KIND_CLUSTER={} bash infra/space/kind/scripts/check-kind-node-image.sh".format(KIND_CLUSTER),
+    deps = ["infra/space/kind/scripts/check-kind-node-image.sh",
+            "infra/space/kind/scripts/kind-node-image.sh", "infra/space/kind/node",
             "scripts/lib/space-loop-devices.sh", "infra/space/identity/node-identities.sh"],
     labels = ["bootstrap"],
 )
@@ -407,7 +409,7 @@ local_resource(
 # holds those while anything else is building.
 RUST_ARTIFACTS_AFTER = ["label-kind-workers", "advertise-kind-worker-network-slots",
                         "label-kind-infra", "stage-fc-vendor", "sandbox-ssh-secret",
-                        "prepare-kind-nodes"]
+                        "check-kind-node-image"]
 if not MINIMAL:
     RUST_ARTIFACTS_AFTER = RUST_ARTIFACTS_AFTER + ["install-space-shim"]
 local_resource(
@@ -566,11 +568,10 @@ k8s_resource(
 # the vendor tree, and the sandbox SSH Secret. The MINIMAL bench opts into
 # the legacy DirectSubstrate SQL registration; the full harness registers
 # purely through node-ctl → internal-api.
-# SPACE_LOOP_DEVICE_TARGET is the one knob for the loop-device pool: the kind
-# node's space-loop-nodes.service stages nodes from it (prepare-kind-nodes), and
-# node-manager reads the same variable once it is up. Inherited from the
-# environment so `SPACE_LOOP_DEVICE_TARGET=128 tilt up` reaches the pod; unset
-# renders nothing and the library's default (64) applies.
+# SPACE_LOOP_DEVICE_TARGET sets the loop-device pool node-manager raises each
+# node to once it is up; the node image stages the library's floor of 64 before
+# that. Inherited from the environment so `SPACE_LOOP_DEVICE_TARGET=128 tilt up`
+# reaches the pod; unset renders nothing and the default applies.
 LOOP_DEVICE_TARGET = os.getenv("SPACE_LOOP_DEVICE_TARGET", "")
 NODE_STACK_SET = TELEMETRY_SET + ["directSubstrate.enabled={}".format("true" if MINIMAL else "false")]
 if LOOP_DEVICE_TARGET:
@@ -587,7 +588,7 @@ k8s_resource(
     labels = ["node-stack"],
     resource_deps = ["label-kind-workers", "space-postgres", "space-internal-api",
                      "space-object-store-bucket-init", "stage-fc-vendor",
-                     "sandbox-ssh-secret", "prepare-kind-nodes"],
+                     "sandbox-ssh-secret", "check-kind-node-image"],
 )
 
 # seed publish: uploads the locally built production seed to the object store and
@@ -617,5 +618,5 @@ if not MINIMAL:
         labels = ["node-stack"],
         resource_deps = ["space-postgres", "space-internal-api",
                          "space-object-store-bucket-init", "space-seed-publish",
-                         "stage-fc-vendor", "sandbox-ssh-secret", "prepare-kind-nodes"],
+                         "stage-fc-vendor", "sandbox-ssh-secret", "check-kind-node-image"],
     )

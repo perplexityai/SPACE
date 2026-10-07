@@ -353,19 +353,18 @@ s3:
 # per running sandbox.
 #
 # Set through SPACE_LOOP_DEVICE_TARGET, which both bring-up paths map onto this
-# value and also pass to prepare-kind-node.sh, whose space-loop-nodes.service
-# stages the same number of nodes in the kind node's /dev before any pod starts.
+# value. Before node-manager starts, the SPACE Kind node image's
+# space-loop-nodes.service stages the floor of 64 in the node's /dev.
 # Changing it on a bench whose Tilt is already running takes a Tilt restart:
 # Tilt reads the environment once, at start, and the bring-up reuses a live
 # process.
 loopDeviceTarget: ""
 
 # /space/cache is not configured here: like a production node's, it belongs to
-# the node. infra/space/kind/scripts/prepare-kind-node.sh installs the kind
-# node's space-cache.service, which mounts a sparse btrfs loopback image
-# (/var/lib/space-cache.img on the node, 40 GiB by default,
-# SPACE_KIND_CACHE_SIZE_MB) before kubelet starts; the chart mounts the node's
-# /space/cache into the pod.
+# the node. The SPACE Kind node image (infra/space/kind/node) bakes in
+# space-cache.service, which mounts a sparse btrfs loopback image
+# (/var/lib/space-cache.img on the node, 40 GiB) before kubelet starts; the
+# chart mounts the node's /space/cache into the pod.
 
 # Disk-admission sizing for /space/cache. Production defaults assume NVMe
 # (50 GiB min-available floor, 8 GiB per-sandbox allocation reservation);

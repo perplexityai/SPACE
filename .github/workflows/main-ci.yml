@@ -32,6 +32,32 @@ jobs:
           GHCR_TOKEN: ${{ github.token }}
         run: bash ci/scripts/ci-image.sh publish
 
+  # The only job that writes the SPACE Kind node image,
+  # ghcr.io/perplexityai/space-kind-node. Its tag is content-addressed, so this
+  # publishes once per change to the image's inputs. Kind CI jobs and developer
+  # bring-ups pull the tag and build it locally until it exists, so space-ci
+  # does not require this job.
+  kind_node_image:
+    if: github.repository == 'perplexityai/SPACE'
+    name: Publish the Kind node image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Check out SPACE
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Publish the Kind node image if its tag is new
+        env:
+          GHCR_TOKEN: ${{ github.token }}
+          # Take the kindest/node base from the third-party image mirror.
+          SPACE_CI_IMAGE_MIRROR: ghcr
+        run: bash infra/space/kind/scripts/kind-node-image.sh publish
+
   # The only job that writes the third-party image mirror,
   # ghcr.io/perplexityai/space-ci-mirror. It copies each digest in
   # ci/mirrored-images.txt that the mirror lacks. Jobs fall back to the source

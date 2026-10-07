@@ -4,9 +4,9 @@
 #
 # A production worker or builder gets its btrfs /space/cache, cgroup subtree,
 # loop-device headroom, device permissions and /space layout from the node
-# image (infra/space/packer) before any SPACE pod starts. A Kind node is a
-# container started from a stock kindest/node image, so the systemd units
-# beside this script do the same on every node start, ordered before kubelet:
+# image (infra/space/packer) before any SPACE pod starts. The Kind node image
+# for sandbox workers and builders (Dockerfile beside this script) bakes in this
+# script and enables the units that run it, ordered before kubelet:
 #
 #   space-loop-nodes.service    loop-device node headroom in the node's /dev
 #   space-kind-devices.service  Kind-only /dev/kvm and vhost permission widening
@@ -16,15 +16,17 @@
 #                                                       11-nvme-cache.sh)
 #
 # A container's /dev, mounts and cgroups do not survive `docker restart`, which
-# is why these are units and not a one-time setup. Each step is idempotent:
-# infra/space/kind/scripts/prepare-kind-node.sh installs the units and re-runs
-# them on a live node, where the cache and the directories are usually already
-# in place.
+# is why these are boot units and not a one-time setup. Each step is
+# idempotent: after a restart the cache image and the directories are already
+# in place, and re-running a unit by hand on a live node is safe.
+#
+# Defaults are baked like the rest of the layer; /etc/space/kind-node.env, when
+# present, overrides SPACE_CACHE_SIZE_MB and SPACE_LOOP_DEVICE_TARGET.
 #
 # Usage: space-kind-node.sh loop-nodes|devices|cgroup|layout|cache
 set -euo pipefail
 
-# Installed together by prepare-kind-node.sh; the source= paths below are their
+# Baked together into the Kind node image; the source= paths below are their
 # repository copies.
 LIB_DIR=/usr/local/lib/space/kind-node
 # shellcheck source=../../identity/node-identities.sh
@@ -196,7 +198,7 @@ cache() {
       die "$CACHE_DIR is mounted but not btrfs: $(findmnt -n -o SOURCE,FSTYPE --mountpoint "$CACHE_DIR")"
     fi
     command -v mkfs.btrfs >/dev/null \
-      || die "mkfs.btrfs missing; prepare-kind-node.sh installs btrfs-progs on the node"
+      || die "mkfs.btrfs missing; this node is not running the SPACE Kind node image (infra/space/kind/node/Dockerfile)"
     space_loop__losetup_bin >/dev/null || die "losetup missing (util-linux)"
     cache_image_is_btrfs || format_cache_image
     mount_cache_image
@@ -208,7 +210,7 @@ cache() {
   local img_mb
   img_mb=$(( $(stat -c %s "$CACHE_IMAGE") / 1048576 ))
   if (( img_mb != CACHE_SIZE_MB )); then
-    log "WARNING: the cache size is ${CACHE_SIZE_MB}M (SPACE_KIND_CACHE_SIZE_MB) but the reused image is ${img_mb}M; see \"The node layer\" in infra/space/kind/README.md to resize"
+    log "WARNING: the cache size is ${CACHE_SIZE_MB}M (SPACE_CACHE_SIZE_MB) but the reused image is ${img_mb}M; see \"The node layer\" in infra/space/kind/README.md to resize"
   fi
   cache_skeleton
 }

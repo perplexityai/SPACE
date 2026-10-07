@@ -207,12 +207,12 @@ in-cluster (see "Seed template" below).
 
 `bootstrap.sh` auto-invokes `install-fc-vendor.sh` if the vendor tree is
 missing (so step 2 is optional in practice), and is otherwise idempotent: it
-creates the kind cluster (if missing), labels nodes, advertises the
-`space.pplx.net/network-slots` extended resource, installs the local
-observability backends in the default `otel` mode, installs the containerd
-shim on the sandbox workers, installs the node layer on the sandbox workers
-and builders (see [The node layer](#the-node-layer)), applies the `space`
-Namespace + `RuntimeClass`,
+creates the kind cluster (if missing) with the SPACE Kind node image on the
+sandbox workers and builders (see [The node layer](#the-node-layer)), labels
+nodes, advertises the `space.pplx.net/network-slots` extended resource,
+installs the local observability backends in the default `otel` mode, installs
+the containerd shim on the sandbox workers, applies the `space` Namespace +
+`RuntimeClass`,
 builds every image and `kind load`s it (first run is the long step; the
 incremental build reuses its target dir and the Docker build is
 cargo-chef-cached after that), and applies every chart with
@@ -671,7 +671,7 @@ Tear it down with `bash infra/space/kind/scripts/teardown.sh`.
 kind cluster: space-local (kind-cluster.yaml.tmpl — 6 nodes)
 ├── control-plane                       (k8s API server, scheduler, etcd)
 ├── worker  [pool=sandbox, space-enabled=true]
-│   ├── space-*.service node layer      (btrfs /space/cache etc., by prepare-kind-node.sh)
+│   ├── space-*.service node layer      (btrfs /space/cache etc., baked into the node image)
 │   ├── containerd-shim-space-v2        (installed into containerd by install-shim.sh)
 │   ├── space-node-stack DaemonSet pod (hostNetwork, host_ip:9800, label component=node-api)
 │   │   ├── space-runtime-supervisor-svc                 (root)
@@ -764,7 +764,7 @@ configuration and the coordinated migration requirements.
 | EKS modules                                               | Local kind                                                                    |
 |-----------------------------------------------------------|-------------------------------------------------------------------------------|
 | One DaemonSet per node service, systemd watchdogs via k8s probes | All node services in one `space-node-stack` pod, supervised by the entrypoint (same binaries, identities, sockets) |
-| Node image (packer) provides `/space/cache`, the cgroup subtree, loop devices, device permissions and the `/space` skeleton before any pod starts | The kind node provides them too, from systemd units `prepare-kind-node.sh` installs on sandbox workers and builders; they run before kubelet on every node start (see [The node layer](#the-node-layer)) |
+| Node image (packer) provides `/space/cache`, the cgroup subtree, loop devices, device permissions and the `/space` skeleton before any pod starts | Sandbox workers and builders boot the SPACE Kind node image, which bakes in the same as systemd units that run before kubelet on every node start (see [The node layer](#the-node-layer)) |
 | `/space/cache` is btrfs on instance-store NVMe            | btrfs on a sparse loopback image at `/var/lib/space-cache.img` on the kind node (40 GiB, same code paths, less I/O headroom), mounted on the node's `/space/cache` by `space-cache.service`, so it outlives pod restarts like the NVMe does. The pods receive it `HostToContainer`, so the mounts their services make under it stay in the pod |
 | Postgres on RDS, secrets via ExternalSecrets / AWS Secrets Manager | In-cluster `space-postgres` StatefulSet, static Kubernetes Secrets             |
 | S3 for snapshots + template artifacts                     | In-cluster versitygw (real S3 protocol, sigv4, path-style)                    |
@@ -820,33 +820,50 @@ a static pool in place of node-controller's dynamic capacity updates.
 
 ## The node layer
 
-A production worker or builder boots with its btrfs `/space/cache`, cgroup
-subtree, loop-device headroom, device permissions and `/space` skeleton in
-place before any SPACE pod starts (`infra/space/packer`). A kind node is a
-stock `kindest/node` container, so
-[`prepare-kind-node.sh`](scripts/prepare-kind-node.sh) installs systemd units
-on every sandbox worker and builder (not the control-plane or infra node) that
-do the same. Both bring-up paths run it before the node charts: `bootstrap.sh`
-after the shim install, Tilt as the `prepare-kind-nodes` resource that both
-node-stack releases depend on. The units are oneshots ordered `Before=kubelet`
-and run on every node start, including after `docker restart`, which discards
-a container's `/dev`, mounts and cgroups. They run
-[`node/space-kind-node.sh`](node/space-kind-node.sh):
+A production worker or builder boots from a node image that already holds its
+node layer (`infra/space/packer`): the packages, scripts and enabled systemd
+units that give it a btrfs `/space/cache`, a cgroup subtree, loop-device
+headroom, device permissions and the `/space` skeleton before any SPACE pod
+starts. Kind does the same with the **SPACE Kind node image**,
+[`node/Dockerfile`](node/Dockerfile): `kindest/node:v1.34.0` (the default of
+the pinned kind v0.30.0, pinned by digest) plus `btrfs-progs`,
+[`node/space-kind-node.sh`](node/space-kind-node.sh) with its libraries, and
+these units, enabled in the image:
 
 | Unit | Does | Production counterpart |
 |---|---|---|
-| `space-loop-nodes.service` | mknods loop-device nodes in the node's `/dev` (64, or `SPACE_LOOP_DEVICE_TARGET`, raised past any index in use); pods copy the node's `/dev` when they start | `max_loop=10000` (07-sysctl.sh) |
+| `space-loop-nodes.service` | mknods loop-device nodes in the node's `/dev` (64, raised past any index in use); pods copy the node's `/dev` when they start | `max_loop=10000` (07-sysctl.sh) |
 | `space-kind-devices.service` | mode 0666 on `/dev/kvm`, `/dev/vhost-vsock`, `/dev/vhost-net` | the `kvm` group; Kind-only, never on a worker |
 | `space-cgroup.service` | `/sys/fs/cgroup/space` with `+cpu +memory +io +pids` delegated | `space-cgroup.service` (07-sysctl.sh) |
 | `space-layout.service` | the `/space/run` skeleton and dependency-drain gates on the hostPath | 07-sysctl.sh directory skeleton |
-| `space-cache.service` | formats `/var/lib/space-cache.img` once (sparse, 40 GiB, `SPACE_KIND_CACHE_SIZE_MB`), mounts it on `/space/cache` with loop autoclear and shared propagation, then creates the cache skeleton | 01-partitions.sh / 11-nvme-cache.sh |
+| `space-cache.service` | formats `/var/lib/space-cache.img` on first boot (sparse, 40 GiB), mounts it on `/space/cache` with loop autoclear and shared propagation, then creates the cache skeleton | 01-partitions.sh / 11-nvme-cache.sh |
 
-The script also installs `btrfs-progs` on those nodes the first time, as the
-packer recipe installs it into the node image, so the node formats its own
-image. This needs the node to reach a Debian package mirror once per node
-container; the package survives `docker restart`. The image sits on the node's
+They are oneshots ordered `Before=kubelet` and run on every boot of the node
+container, including after `docker restart`, which gives it a fresh `/dev`,
+mount table and cgroups. Nothing is installed when the cluster comes up. The
+sandbox workers and builders run this image (`kind-cluster.yaml.tmpl`, and the
+static `kind-cluster-3486.yaml`); the control-plane and infra nodes run its
+base unchanged, as production's non-SPACE nodes carry no SPACE node layer, so
+every node runs the same Kubernetes version. The cache image sits on the node's
 `/var`, which kind keeps on a Docker volume, so the cache survives pod and node
-restarts.
+restarts. Defaults are baked like the rest of the layer; a node's
+`/etc/space/kind-node.env` can override `SPACE_CACHE_SIZE_MB` and
+`SPACE_LOOP_DEVICE_TARGET` for its next boot.
+
+**Distribution.** [`kind-node-image.sh`](scripts/kind-node-image.sh) follows
+`ci/scripts/ci-image.sh`. The tag is the SHA-256 of the image's inputs (the
+Dockerfile and every file it copies), and the build context holds exactly those
+files. `ensure` uses a local image with that tag, else pulls it from
+`ghcr.io/perplexityai/space-kind-node`, else builds it (about ten seconds on a
+warm Docker cache). Both bring-up paths run it before `kind create`, and the
+renderer writes the tag into the cluster config. Main CI publishes each new tag
+once; Kind CI jobs pull it and fall back to a build. Builds take the
+`kindest/node` base from the third-party image mirror (`ci/mirrored-images.txt`)
+when `SPACE_CI_IMAGE_MIRROR` is set, and from the source otherwise. A package
+administrator has to make the `space-kind-node` package public for bring-ups
+outside CI to pull it; until then they build it, with the same result. `ensure`
+also tags `space-kind-node:local`, the name `kind-cluster-3486.yaml` uses, so
+run it before creating that cluster by hand.
 
 Each node-stack pod receives the node's `/space/cache` `HostToContainer`
 (`shared,slave` inside the pod): the services see the node's cache and any
@@ -862,19 +879,33 @@ naming the unit otherwise.
 Diagnose a node with `docker exec <node> systemctl status 'space-*'` and
 `docker exec <node> journalctl -u space-cache`. To start a node's cache clean or
 at a new size, delete the node-stack DaemonSet that runs there, run
-`umount /space/cache && rm /var/lib/space-cache.img` on the node, then rerun
-`prepare-kind-node.sh` and re-apply the chart. Recreating the cluster also
-starts clean.
+`umount /space/cache && rm /var/lib/space-cache.img` on the node (adding
+`SPACE_CACHE_SIZE_MB=<MiB>` to `/etc/space/kind-node.env` for a new size), then
+`systemctl restart space-cache` and re-apply the chart. Recreating the cluster
+also starts clean.
 
-**Upgrading a cluster created before the node layer** needs no cluster delete.
-Rerun `bootstrap.sh`, or let a running Tilt reload, which runs
-`prepare-kind-nodes`; to keep the reload from racing it, run
-`bash infra/space/kind/scripts/prepare-kind-node.sh` once first. On a worker
-whose old pod still has the cache image mounted, `space-cache.service` mounts
-the loop device that pod already holds instead of attaching a second one, so
-the existing cache, its templates and snapshots carry over. The re-applied
-charts drop the old `format-cache-image` and `mount-cache` init containers and
-the worker's `emptyDir`, and the pods roll onto the node's cache.
+**Clusters created before this image, or from an older build of it, must be
+recreated.** A kind node keeps the image it was created from, so such a
+cluster's SPACE nodes lack the layer or carry a stale one. Every bring-up path
+(`bootstrap.sh`, the smoke suites' bring-up, and Tilt's `check-kind-node-image`
+resource) runs
+[`check-kind-node-image.sh`](scripts/check-kind-node-image.sh), which compares
+each SPACE node's image label with the tag this tree builds and, on a mismatch,
+stops with the command to run:
+
+```bash
+kind delete cluster --name space-local   # keeps the containerd image caches
+bash infra/space/kind/scripts/bootstrap.sh   # or `tilt up` via the smoke bring-up
+```
+
+Recreating rather than patching nodes in place is the production model: a new
+node image reaches a fleet by replacing nodes, not by installing onto running
+ones. Keeping an in-place path would have meant a second delivery mechanism
+(installing packages and units into live node containers) that has to track
+every change to the image and is exercised only on old clusters, which is where
+it would drift. Recreation costs a few minutes because the containerd image
+caches stay on disk; it does delete the cluster's sandboxes, snapshots and
+published templates.
 
 ## Smoke test
 

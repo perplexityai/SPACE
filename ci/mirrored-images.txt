@@ -48,6 +48,10 @@ public.ecr.aws/docker/library/rust:1.98.0-bookworm@sha256:82150a52ec202c1b14d781
 # Base of the seed builder, templates/firecracker/seed/Dockerfile (Kind).
 ubuntu:26.04@sha256:da6fc2be547864451aa253836dd926da33623312df4a9a243e35dc877c378a78 sha256:61ebaa5cc23ca45450db85eac015435199ec569e28ec222ea13f2aed2110b8a6 ghcr.io/perplexityai/space-ci-mirror:ubuntu-26.04
 
+# Base of the SPACE Kind node image, infra/space/kind/node/Dockerfile
+# (infra/space/kind/scripts/kind-node-image.sh builds it from this copy).
+kindest/node:v1.34.0@sha256:7416a61b42b1662ca6ca89f02028ac133a309a2a30ba309614e8ec94d976dc5a sha256:ede5bb6984830375d264e41b7169d03643f586d3e35316bf5229eaeb12bb18e0 ghcr.io/perplexityai/space-ci-mirror:kindest-node-v1.34.0
+
 # Images the Kind charts run (infra/space/kind/charts/*/values.yaml), which
 # scripts/tests/lib/bootstrap-kind-stack.sh loads into the cluster.
 postgres:16-alpine       sha256:1a66d744c1b459e13b05a8fca341da84cb63383e99ce262210efee5a319d4551 ghcr.io/perplexityai/space-ci-mirror:postgres-16-alpine

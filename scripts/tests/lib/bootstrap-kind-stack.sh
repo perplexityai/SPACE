@@ -930,6 +930,13 @@ bootstrap_kind_stack__bring_up() {
         # preflight has to check the mounts of the file `kind create` is about
         # to read, or it verifies one config and builds another.
         kind_prepare_host_mounts "$kind_stack_config"
+        # The SPACE Kind node image the config names for sandbox workers and
+        # builders: local, else GHCR, else a local build. Tested like the
+        # create below, so the rendered config never leaks.
+        if ! bash "$REPO_ROOT/infra/space/kind/scripts/kind-node-image.sh" ensure >/dev/null; then
+            rm -f "$kind_stack_config"
+            return 1
+        fi
         echo "[bootstrap] kind cluster '$KIND_CLUSTER' not found; creating from $kind_stack_config"
         # Tested in the `if`, not followed by `$?`: a caller running under
         # `set -e` would exit on the failure before the cleanup and the
@@ -951,6 +958,9 @@ bootstrap_kind_stack__bring_up() {
         # Before Tilt (re)starts and applies the versitygw charts: a cluster
         # still on SeaweedFS has to be recreated, not half-switched.
         bash "$REPO_ROOT/infra/space/kind/scripts/check-object-store-transition.sh" \
+            "$KIND_CLUSTER" || exit 1
+        # SPACE nodes get their node layer from their image, fixed at create.
+        bash "$REPO_ROOT/infra/space/kind/scripts/check-kind-node-image.sh" \
             "$KIND_CLUSTER" || exit 1
     fi
 

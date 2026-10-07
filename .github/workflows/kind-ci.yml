@@ -206,6 +206,14 @@ jobs:
           name: ${{ needs.rust_artifacts.outputs.artifact_name }}
           path: ${{ runner.temp }}/kind-rust
 
+      # The sandbox worker and builder nodes boot this image, which bakes in the
+      # node layer (btrfs /space/cache, cgroup subtree, loop devices). Main CI
+      # publishes each content-addressed tag; until then, or if the pull fails,
+      # this builds it from the mirrored base. The bring-up would do the same,
+      # but here its cost and source show up as a step of their own.
+      - name: Provide the SPACE Kind node image
+        run: bash infra/space/kind/scripts/kind-node-image.sh ensure
+
       - name: Load and verify the shared Rust artifact image
         run: |
           set -euo pipefail

@@ -12,8 +12,9 @@ harness with its stub substrate was deleted on 2026-09-22.
 - Smoke selection and suite-specific contracts: the `space-validation` skill's
   smoke-testing reference and `infra/space/kind/README.md`.
 - What each Kind SPACE node provides before its pods start (btrfs cache,
-  cgroup, loop devices, device permissions, layout): "The node layer" in
-  `infra/space/kind/README.md` and `infra/space/kind/node/`.
+  cgroup, loop devices, device permissions, layout) and how its image is
+  built and distributed: "The node layer" in `infra/space/kind/README.md` and
+  `infra/space/kind/node/`.
 - Loop-device mechanics and sizing: `scripts/lib/space-loop-devices.sh` and
   the production/Kind comparison in `infra/space/kind/README.md`.
 - Chart-specific resource and storage constraints: the comments next to the
@@ -51,10 +52,13 @@ or suites.
   side-staged onto workers.
 - The kind node provides what a production node image does: the btrfs
   `/space/cache`, cgroup subtree, loop-device headroom, device permissions and
-  `/space` skeleton come from the systemd units `prepare-kind-node.sh` installs
-  on sandbox and builder nodes, ordered before kubelet. Keep both bring-up paths
-  running it before the node charts, keep it idempotent and safe on a live
-  cluster, and do not move these duties back into the pod.
+  `/space` skeleton come from units baked into the SPACE Kind node image
+  (`node/Dockerfile`) that sandbox and builder nodes boot, ordered before
+  kubelet. Install nothing onto nodes at bring-up; change the image. Its tag is
+  the hash of the files listed in `scripts/kind-node-image.sh`, so a file the
+  Dockerfile copies must be listed there. Clusters on another node image are
+  recreated, not patched (`scripts/check-kind-node-image.sh`). Do not move these
+  duties back into the pod.
 - Preserve cache-loop autoclear (set by `space-cache.service`), the pods'
   `HostToContainer` view of `/space/cache`, the entrypoint's
   `mount --make-rshared /` and `/space/cache`, and per-jail vhost-vsock device

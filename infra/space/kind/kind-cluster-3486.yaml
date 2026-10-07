@@ -11,16 +11,25 @@
 # into the worker node by the Tiltfile's `stage-fc-vendor` bootstrap resource
 # (docker cp) instead of a bind mount. /dev/kvm is present because kind nodes
 # run as privileged containers.
+#
+# Node images as in kind-cluster.yaml.tmpl: the sandbox worker boots the SPACE
+# Kind node image (node/Dockerfile), which bakes in the node layer; the others
+# run its pinned base. This file is static, so it names the image by the alias
+# `infra/space/kind/scripts/kind-node-image.sh ensure` tags; run that before
+# `kind create`. Keep the base digest equal to node/Dockerfile's FROM.
 kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4
 name: space-local-3486
 nodes:
   - role: control-plane
+    image: kindest/node:v1.34.0@sha256:7416a61b42b1662ca6ca89f02028ac133a309a2a30ba309614e8ec94d976dc5a
   # Single sandbox worker — the node-stack DaemonSet runs here.
   - role: worker
+    image: space-kind-node:local
     labels:
       space.pplx.net/node-pool: sandbox
   # Infra node — runs Postgres, space-api, object store.
   - role: worker
+    image: kindest/node:v1.34.0@sha256:7416a61b42b1662ca6ca89f02028ac133a309a2a30ba309614e8ec94d976dc5a
     labels:
       space.pplx.net/node-pool: infra

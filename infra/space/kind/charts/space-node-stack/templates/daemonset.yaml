@@ -583,11 +583,11 @@ spec:
             type: DirectoryOrCreate
         # Template rootfs, instance clones, snapshot/transfer staging and
         # jails: the kind node's /space/cache, as a production node's is its
-        # host's. The node's space-cache.service mounts it from a btrfs
-        # loopback image before kubelet starts (prepare-kind-node.sh installs
-        # it), so it survives pod restarts the way the instance-store disk
-        # does. DirectoryOrCreate rather than Directory: a pod scheduled before
-        # the node's unit ran starts, waits for the mount to propagate in, and
+        # host's. The node's space-cache.service, baked into the SPACE Kind
+        # node image, mounts it from a btrfs loopback image before kubelet
+        # starts, so it survives pod restarts the way the instance-store disk
+        # does. DirectoryOrCreate rather than Directory: a pod on a node
+        # without the unit starts, waits for the mount to propagate in, and
         # names the missing unit if it never does (node-stack-start.sh).
         - name: cache
           hostPath:

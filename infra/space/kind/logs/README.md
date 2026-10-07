@@ -81,8 +81,8 @@ curl -fsS http://127.0.0.1:13101/loki/api/v1/labels
 - This Kind node-stack writes individual service logs into `/space/logs` and
   tails them to pod stdout. Sidecars inherit the supervisor's output. They are
   not separate Kubernetes container log files. The only SPACE systemd services
-  on Kind nodes are the node-layer oneshots `prepare-kind-node.sh` installs on
-  sandbox and builder nodes (`space-cache.service` and its siblings). Journal
+  on Kind nodes are the node-layer oneshots the SPACE Kind node image bakes
+  into sandbox and builder nodes (`space-cache.service` and its siblings). Journal
   collection allows `space-*.service`, and `containerd.service`. The synthetic journal identifier is test-only.
   Guest journals and the devbox's journal are not mounted or forwarded here.
 - The collector removes the CRI envelope, then extracts fields for labels and

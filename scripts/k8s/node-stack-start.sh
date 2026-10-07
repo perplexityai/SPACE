@@ -13,8 +13,8 @@
 # chart inits), the guest-kernel staging, and the /space/etc files. What the
 # node image provides in production — the btrfs /space/cache, the cgroup
 # subtree, loop-device headroom, device permissions and the packer directory
-# skeleton — the kind node provides through the units
-# infra/space/kind/scripts/prepare-kind-node.sh installs.
+# skeleton — the kind node provides, from the units baked into the SPACE Kind
+# node image (infra/space/kind/node/Dockerfile).
 #
 # Node registration is NOT done here. The node publishes itself through the
 # production path: node-ctl's outbound reconcilers call
@@ -91,8 +91,8 @@ load_node_identity() {
 # ── /space/cache: the node's btrfs cache ─────────────────────────────────────
 # sandbox-manager clones template rootfs into each sandbox's instance dir with
 # btrfs subvolume snapshots, so /space/cache MUST be btrfs. As on a production
-# node, the node provides it: the kind node's space-cache.service (installed by
-# infra/space/kind/scripts/prepare-kind-node.sh) mounts a loopback btrfs image
+# node, the node provides it: the kind node's space-cache.service (baked into
+# the SPACE Kind node image, infra/space/kind/node) mounts a loopback btrfs image
 # on the node's /space/cache before kubelet starts, and the chart passes it in
 # HostToContainer. A cache the node mounts after this pod started still
 # propagates in, which is why this waits briefly before failing.
@@ -104,7 +104,7 @@ require_node_cache() {
       log "waiting up to ${CACHE_WAIT_SECONDS}s for the node's btrfs /space/cache"
     fi
     if (( waited >= CACHE_WAIT_SECONDS )); then
-      die "/space/cache is not a btrfs mount ($(findmnt -n -o SOURCE,FSTYPE -T /space/cache 2>/dev/null || echo unknown)); the kind node provides it: run infra/space/kind/scripts/prepare-kind-node.sh and check 'docker exec $SPACE_NODE_ID journalctl -u space-cache'"
+      die "/space/cache is not a btrfs mount ($(findmnt -n -o SOURCE,FSTYPE -T /space/cache 2>/dev/null || echo unknown)); the kind node provides it from the SPACE Kind node image (check it with infra/space/kind/scripts/check-kind-node-image.sh) and 'docker exec $SPACE_NODE_ID journalctl -u space-cache'"
     fi
     sleep 1
     waited=$((waited + 1))
@@ -268,7 +268,7 @@ EOF
   # parent (space-cgroup.service on the kind node, as packer 07-sysctl.sh does
   # on a production image); say so here rather than as a nodemgr startup crash.
   [[ -d /sys/fs/cgroup/space ]] \
-    || die "/sys/fs/cgroup/space is missing; the kind node's space-cgroup.service creates it (run infra/space/kind/scripts/prepare-kind-node.sh)"
+    || die "/sys/fs/cgroup/space is missing; the kind node's space-cgroup.service creates it (check the node image with infra/space/kind/scripts/check-kind-node-image.sh)"
 
   # Stage the Firecracker kernel asset where the runtime inventory expects it,
   # through the same script the production worker's node-manager init container

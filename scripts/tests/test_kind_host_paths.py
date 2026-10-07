@@ -88,6 +88,9 @@ def base_env(home: str, **overrides: str) -> dict[str, str]:
             "SPACE_VENDOR_ROOT",
             "SPACE_KIND_DATA_ROOT",
             "SPACE_KIND_CONFIG",
+            # Rendered into the node images; the default is the tree's own.
+            "SPACE_KIND_NODE_IMAGE",
+            "SPACE_KIND_BASE_NODE_IMAGE",
             # The vendor default chains through these, so an ambient value
             # would silently move what the tests assert about.
             "SPACE_DEVBOX_PERSIST_ROOT",
