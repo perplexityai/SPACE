@@ -38,8 +38,13 @@ names built at run time (`format!`, `concat!`), constants defined by other
 constants or in another crate, names reached through fields or indexing, hooks
 passed as function values, and names forwarded through locals, closures,
 macros, type aliases, pattern parameters or generic `AsRef<str>` parameters.
-A test module declared with `#[cfg(test)] mod x;` is scanned unless its file is
-named like a test file. The guard's job is the common
+A constant also resolves only in the narrowest scope that defines its name, so
+a same-named constant there (a function-local one, or a test fixture in the
+same file) hides one imported from elsewhere. Aliases defined in another file,
+and aliases of `test_*` wrappers, aren't followed. Rule 2 flags any string
+parameter forwarded to a reader, including one a multi-argument wrapper uses as
+a value rather than a name. A test module declared with `#[cfg(test)] mod x;` is
+scanned unless its file is named like a test file. The guard's job is the common
 regression, a documented setting switched to a test-hook reader; review covers
 the rest.
 
@@ -246,7 +251,7 @@ def functions(text: str) -> list[Function]:
         # Environment` passed along to `test_hook` is not forwarding.
         parameters = set()
         for parameter in top_level_arguments(text[open_paren + 1 : close_paren - 1]):
-            typed = PARAMETER.fullmatch(parameter)
+            typed = PARAMETER.fullmatch(re.sub(r"#\[[^\]]*\]\s*", "", parameter))
             if typed and re.search(r"\b(?:str|String)\b", typed.group(2)):
                 parameters.add(typed.group(1))
         prefix = text[max(0, match.start() - 40) : match.start()]
@@ -289,15 +294,24 @@ def top_level_arguments(arguments: str) -> list[str]:
     return [part.strip() for part in parts]
 
 
-def forwarded(arguments: str, function: Function | None) -> set[str]:
-    """The enclosing function's own string parameters passed as a whole argument."""
+def forwarded(
+    arguments: str, function: Function | None, before: str = ""
+) -> set[str]:
+    """The enclosing function's own string parameters passed as a whole argument.
+
+    `before` is the function's body up to the call; a closure parameter there
+    (`|var| ...`) that rebinds the name isn't the function's parameter.
+    """
     if function is None:
         return set()
     names = set()
     for argument in top_level_arguments(arguments):
         whole = WHOLE_ARGUMENT.fullmatch(argument)
-        if whole and whole.group(1) in function.parameters:
-            names.add(whole.group(1))
+        if not whole or whole.group(1) not in function.parameters:
+            continue
+        if re.search(r"\|[^|]*\b" + re.escape(whole.group(1)) + r"\b[^|]*\|", before):
+            continue
+        names.add(whole.group(1))
     return names
 
 
@@ -322,21 +336,26 @@ def find_readers(files) -> dict[pathlib.Path, set[str]]:
         for crate, text, defined in parsed:
             for call, arguments in reader_calls(text, file_readers(text, readers[crate] | readers[PUBLIC])):
                 owner = innermost(defined, call.start())
-                if (
+                if not (
                     owner
                     and owner.name.startswith("test_")
-                    and owner.name not in readers[crate]
-                    and forwarded(arguments, owner)
+                    and forwarded(arguments, owner, text[owner.start : call.start()])
                 ):
+                    continue
+                # Checked separately, so a private wrapper found first doesn't
+                # stop a same-named `pub` one counting in other crates.
+                if owner.name not in readers[crate]:
                     readers[crate].add(owner.name)
-                    if owner.public:
-                        readers[PUBLIC].add(owner.name)
+                    changed = True
+                if owner.public and owner.name not in readers[PUBLIC]:
+                    readers[PUBLIC].add(owner.name)
                     changed = True
         if not changed:
             return readers
 
 
-IMPL = re.compile(r"\bimpl\b[^;{]*\{")
+# An `impl` block, not `-> impl Trait` or `x: impl Trait` in a signature.
+IMPL = re.compile(r"(?:^|[;{}])\s*(?:unsafe\s+)?impl\b[^;{]*\{", re.M)
 
 
 def enclosing_impl_constants(text: str, impls, offset: int) -> dict[str, set[str]]:
@@ -378,9 +397,10 @@ def violations(root: pathlib.Path) -> list[str]:
                 if literal:
                     names.add(literal)
                     continue
-                # Fail closed: a name stands for every value it has in the
-                # narrowest scope that defines it, so a same-named constant
-                # can't make a documented one disappear.
+                # A name stands for every value it has in the narrowest scope
+                # that defines it. Wider scopes aren't merged in: across a
+                # crate, names like `ENV_INTERVAL_SECS` legitimately mean a
+                # hook in one file and a documented setting in another.
                 scopes = []
                 if path == "Self::":
                     scopes.append(enclosing_impl_constants(text, impls, call.start()))
@@ -396,7 +416,7 @@ def violations(root: pathlib.Path) -> list[str]:
                 )
             owner = innermost(defined, call.start())
             if owner and not owner.name.startswith("test_"):
-                for parameter in sorted(forwarded(arguments, owner)):
+                for parameter in sorted(forwarded(arguments, owner, text[owner.start : call.start()])):
                     failures.append(
                         f"{line}: `{owner.name}` passes its parameter `{parameter}` to "
                         f"test hook `{reader}`; name it `test_*` so its callers are "

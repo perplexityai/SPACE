@@ -174,6 +174,19 @@ WRAPPER = "fn test_raw(var: &str) -> Option<String> { test_hook_var(var) }\n"
         {LIB: "fn test_knob<F: FnOnce() -> Result<(), E>, E>(var: &str, f: F) -> Option<String> {\n"
          "    let _ = f();\n    test_hook_var(var)\n}\n"
          'let n = test_knob("SPACE_EXAMPLE_LIMIT", || Ok(()));'},
+        # A `pub` wrapper counts elsewhere even when a private one shares its name.
+        {
+            "crates/libs/a/Cargo.toml": "",
+            "crates/libs/a/src/a1.rs": "fn test_raw(var: &str) -> Option<String> { test_hook_var(var) }",
+            "crates/libs/a/src/b2.rs": "pub fn test_raw(var: &str) -> Option<String> { test_hook_var(var) }",
+            "crates/libs/b/Cargo.toml": "",
+            "crates/libs/b/src/lib.rs": 'let n = a::b2::test_raw("SPACE_EXAMPLE_LIMIT");',
+        },
+        # `-> impl Trait` isn't an impl block for `Self::` resolution.
+        {LIB: 'impl C {\n    const ENV: &\'static str = "SPACE_EXAMPLE_LIMIT";\n'
+         "    fn knobs() -> impl Iterator<Item = String> {\n"
+         '        const ENV: &str = "SPACE_EXAMPLE_TICK_SECS";\n'
+         "        test_hook_var(Self::ENV).into_iter()\n    }\n}"},
         # A single-letter constant.
         {LIB: 'const X: &str = "SPACE_EXAMPLE_LIMIT";\nlet n = test_hook_var(X);'},
         # A `//` inside a string doesn't hide the rest of the line.
@@ -193,7 +206,7 @@ WRAPPER = "fn test_raw(var: &str) -> Option<String> { test_hook_var(var) }\n"
         "after-test-union-field", "after-test-fn-tuple-field", "trait-impl-wrapper-other-crate",
         "array-return-wrapper", "test-module-in-production-file", "test-function-in-production-file",
         "inner-cfg-test-file", "ambiguous-crate-constant", "shadowed-by-test-constant",
-        "generics-with-arrow", "single-letter-constant",
+        "generics-with-arrow", "pub-wrapper-after-private-namesake", "return-impl-trait", "single-letter-constant",
         "url-in-string", "byte-raw-string",
     ],
 )
@@ -230,6 +243,13 @@ def test_parameter_shapes_forwarded_outside_test_function_fail(tmp_path: Path, s
     assert "`hook` passes its parameter `var`" in failures[0]
 
 
+def test_attributed_parameter_forwarded_outside_test_function_fails(tmp_path: Path) -> None:
+    source = "fn read(#[allow(unused)] var: &str) -> Option<String> { test_hook_var(var) }"
+    failures = guard.violations(tree(tmp_path, {LIB: source}))
+    assert len(failures) == 1, failures
+    assert "`read` passes its parameter `var`" in failures[0]
+
+
 def test_mut_parameter_forwarded_outside_test_function_fails(tmp_path: Path) -> None:
     source = "fn hook(mut name: &str) -> Option<String> { test_hook_var(name) }"
     failures = guard.violations(tree(tmp_path, {LIB: source}))
@@ -261,6 +281,9 @@ READ = 'test_hook_var("SPACE_EXAMPLE_LIMIT")'
           id="parameter-inside-format"),
         P({LIB: "impl C { fn f(&self, name: &str) -> Option<String> { test_hook_var(self.name) } }"},
           id="field-not-parameter"),
+        P({LIB: "pub fn overrides(var: &str) -> Vec<String> {\n"
+               "    KNOBS.iter().filter_map(|var| test_hook_var(var)).collect()\n}"},
+          id="closure-parameter-shadows"),
         P({LIB: "fn tick(service: &str, env: &dyn Environment) -> Option<String> {\n"
                '    test_hook(&service.env_for(env), "SPACE_EXAMPLE_TICK_SECS")\n}'},
           id="parameter-starts-argument"),
