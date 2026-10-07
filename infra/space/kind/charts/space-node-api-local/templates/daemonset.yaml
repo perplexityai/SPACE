@@ -86,6 +86,13 @@ spec:
             - name: SPACE_BUILD_MANAGER_TLS_SERVER_NAME
               value: space-builder-build-manager
             {{- end }}
+          {{- if eq $role "builder" }}
+          # Leave the builder Service's endpoints before draining (values.yaml).
+          lifecycle:
+            preStop:
+              sleep:
+                seconds: {{ .Values.builderPreStopSleepSeconds | int }}
+          {{- end }}
           {{- include "space-node-service.probes" $ctx | nindent 10 }}
           volumeMounts:
             {{- include "space-node-service.mount.run" . | nindent 12 }}

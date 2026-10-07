@@ -811,7 +811,11 @@ jobs before binding its listener. Termination grace follows each service's drain
 the 25 s drains the shared lifecycle defaults are sized against, 120 s for
 volume-manager's 100 s transfer drain plus 10 s server drain, 180 s for
 node-api's 150 s shutdown grace, and 7500 s for build-manager's 7200 s build
-drain. Each chart's values carry the comment and the citation.
+drain. Each chart's values carry the comment and the citation. Builder node-api
+pods also sleep 5 s in preStop: on SIGTERM node-api closes its listener and
+answers new calls "draining" at once, while the API reaches builders through the
+`space-builder-node-api` Service and does not retry a draining build start, so
+the delay lets the pod leave the Service's endpoints first.
 
 **The runtime-supervisor.** node-manager's init container runs the production
 `node-manager-init.sh` unchanged: it stages the host binaries under

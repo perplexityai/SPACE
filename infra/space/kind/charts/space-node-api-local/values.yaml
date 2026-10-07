@@ -25,9 +25,21 @@ buildManagerEndpoint: ""
 
 # On SIGTERM node-api stops accepting connections and gives in-flight
 # requests --shutdown-grace-secs (150 s by default) to finish
-# (crates/libs/node/api/server/src/run.rs). The grace covers that budget plus
-# exit.
+# (crates/libs/node/api/server/src/run.rs). The grace covers that budget, the
+# builders' preStop delay below and exit.
 terminationGracePeriodSeconds: 180
+
+# Builder role only: seconds node-api keeps serving after its pod starts
+# terminating, before SIGTERM. On SIGTERM it closes its listener and answers
+# every new call "node-api draining" at once, with no lame-duck window
+# (drain_before_shutdown, run.rs; drain.rs), while Kubernetes removes the pod
+# from the space-builder-node-api Service's endpoints concurrently. The API
+# reaches builders through that Service and does not retry a draining
+# StartBuild (start_template_build_with_retry,
+# crates/libs/api/src/controllers/template.rs), so without the delay a build
+# submitted in that window fails. Workers are dialled by node IP, where a delay
+# changes nothing. A Kind value long enough for endpoint removal to propagate.
+builderPreStopSleepSeconds: 5
 
 # Kind sizing: requests only (see space-node-manager-local/values.yaml).
 resources:
