@@ -22,6 +22,8 @@
 //! Health and reflection paths bypass authentication so Kubernetes gRPC probes
 //! work without a credential.
 
+mod agent;
+
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -31,10 +33,10 @@ use subtle::ConstantTimeEq;
 use tonic::Status;
 use tower::{Layer, Service};
 
-use crate::auth::agent::AgentAuth;
 use crate::auth::{ClientService, K8sIdentity};
 use crate::credential_store::CredentialStore;
 use crate::k8s_identity::{CredmgrTokenReviewer, K8sAuthConfig, K8sAuthConfigError};
+use agent::AgentAuth;
 use tokio_util::sync::CancellationToken;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
@@ -64,7 +66,7 @@ impl Authenticator {
     async fn authenticate(
         &self,
         auth_header: Option<&str>,
-        extensions: &mut http::Extensions,
+        extensions: &http::Extensions,
         rpc: &str,
     ) -> Result<TcpCallerIdentity, Status> {
         let token = bearer_token(auth_header)?;
@@ -87,15 +89,7 @@ impl Authenticator {
                 if caller.service() == ClientService::NodeCredentialAgent {
                     // TokenReview caches token authenticity only. Recheck the
                     // pod, registered node and transport peer on every request.
-                    if let Some(verified) =
-                        agent.authorize(&caller, peer_ip(extensions), rpc).await?
-                    {
-                        if let Some(audit) = extensions.get::<crate::issuance_audit::RequestAudit>()
-                        {
-                            audit.set_identity(verified.clone());
-                        }
-                        extensions.insert(verified);
-                    }
+                    agent.authorize(&caller, peer_ip(extensions), rpc).await?;
                 }
                 Ok(TcpCallerIdentity::K8sJwt(caller))
             }
@@ -209,46 +203,28 @@ where
 
         Box::pin(async move {
             if !is_auth_exempt(&path) {
-                let authenticated: Result<(), Status> = async {
-                    let identity = match auth_header {
-                        Some(Ok(header)) => {
-                            authenticator
-                                .authenticate(Some(&header), req.extensions_mut(), rpc_name(&path))
-                                .await?
-                        }
-                        None => {
-                            authenticator
-                                .authenticate(None, req.extensions_mut(), rpc_name(&path))
-                                .await?
-                        }
-                        Some(Err(_)) => {
-                            pplx_space_metrics::auth::decision(
-                                "static",
-                                "credmgr-tcp",
-                                "deny",
-                                "invalid_auth_header",
-                            );
-                            return Err(Status::unauthenticated("invalid authorization header"));
-                        }
-                    };
-                    req.extensions_mut().insert(identity);
-                    Ok(())
-                }
-                .await;
-                if let Err(error) = authenticated {
-                    if path == crate::intermediate_ca::ISSUE_INTERMEDIATE_METHOD_PATH {
-                        crate::issuance_audit::record(
-                            req.extensions()
-                                .get::<crate::issuance_audit::RequestAudit>(),
-                            None,
-                            None,
-                            None,
-                            "denied",
-                            error.message(),
-                        );
+                let identity = match auth_header {
+                    Some(Ok(header)) => {
+                        authenticator
+                            .authenticate(Some(&header), req.extensions(), rpc_name(&path))
+                            .await?
                     }
-                    return Err(error.into());
-                }
+                    None => {
+                        authenticator
+                            .authenticate(None, req.extensions(), rpc_name(&path))
+                            .await?
+                    }
+                    Some(Err(_)) => {
+                        pplx_space_metrics::auth::decision(
+                            "static",
+                            "credmgr-tcp",
+                            "deny",
+                            "invalid_auth_header",
+                        );
+                        return Err(Status::unauthenticated("invalid authorization header").into());
+                    }
+                };
+                req.extensions_mut().insert(identity);
             }
             // A `Status` error is recovered by tonic's server into a clean
             // gRPC trailers response (via `Status::from_error`), so an auth

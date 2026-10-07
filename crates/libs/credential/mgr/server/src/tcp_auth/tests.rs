@@ -2,7 +2,6 @@ use super::*;
 
 #[tokio::test]
 async fn cached_token_is_reauthorized_for_each_transport_peer() {
-    use crate::auth::VerifiedAgentIdentity;
     use std::sync::atomic::Ordering;
     use tonic::transport::server::TcpConnectInfo;
     use tower::ServiceExt;
@@ -10,17 +9,13 @@ async fn cached_token_is_reauthorized_for_each_transport_peer() {
     let layer = CredmgrTcpAuthLayer {
         authenticator: Arc::new(Authenticator::ProjectedToken {
             reviewer,
-            agent: Box::new(crate::auth::agent::tests::authorizer()),
+            agent: Box::new(super::agent::tests::authorizer()),
         }),
     };
     let inner = tower::service_fn(|req: http::Request<()>| async move {
-        assert_eq!(
-            req.extensions()
-                .get::<VerifiedAgentIdentity>()
-                .unwrap()
-                .peer_ip,
-            "10.0.0.2".parse::<std::net::IpAddr>().unwrap()
-        );
+        let caller = req.extensions().get::<TcpCallerIdentity>().unwrap();
+        assert!(matches!(caller, TcpCallerIdentity::K8sJwt(identity)
+            if identity.service() == ClientService::NodeCredentialAgent));
         Ok::<_, std::convert::Infallible>(http::Response::new(
             http_body_util::Empty::<bytes::Bytes>::new(),
         ))
@@ -93,7 +88,7 @@ async fn static_token_resolves_to_internal_principal_in_static_only_mode() {
         authn
             .authenticate(
                 Some("Bearer the-secret"),
-                &mut http::Extensions::new(),
+                &http::Extensions::new(),
                 "unknown"
             )
             .await
@@ -103,7 +98,7 @@ async fn static_token_resolves_to_internal_principal_in_static_only_mode() {
     let err = authn
         .authenticate(
             Some("Bearer not-the-secret"),
-            &mut http::Extensions::new(),
+            &http::Extensions::new(),
             "unknown",
         )
         .await
@@ -116,7 +111,7 @@ async fn missing_and_malformed_headers_are_unauthenticated() {
     let authn = Authenticator::StaticToken("the-secret".to_owned());
     assert_eq!(
         authn
-            .authenticate(None, &mut http::Extensions::new(), "unknown")
+            .authenticate(None, &http::Extensions::new(), "unknown")
             .await
             .unwrap_err()
             .code(),
@@ -124,7 +119,7 @@ async fn missing_and_malformed_headers_are_unauthenticated() {
     );
     assert_eq!(
         authn
-            .authenticate(Some("Basic abc"), &mut http::Extensions::new(), "unknown")
+            .authenticate(Some("Basic abc"), &http::Extensions::new(), "unknown")
             .await
             .unwrap_err()
             .code(),

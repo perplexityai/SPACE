@@ -2,7 +2,7 @@ use super::*;
 use crate::auth::ClientService;
 use crate::credential_store::{CredentialStoreError, PgCredentialStore, SandboxOwner};
 use async_trait::async_trait;
-use pplx_space_common_core::types::SandboxId;
+use pplx_space_common_core::types::{K8sNodeName, K8sNodeUid, NodeId, SandboxId};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 struct Nodes(Option<NodeId>);
@@ -162,17 +162,7 @@ async fn checks_current_pod_node_and_peer_in_both_modes() {
                 .authorize(&caller(), peer, "IssueIntermediateCertificate")
                 .await;
             match (reason, mode) {
-                (None, _) => assert_eq!(
-                    result.unwrap(),
-                    Some(VerifiedAgentIdentity {
-                        pod_uid: caller().pod().pod_uid().clone(),
-                        node_name: caller().node().node_name().clone(),
-                        node_uid: caller().node().node_uid().clone(),
-                        node_id,
-                        peer_ip: "10.0.0.2".parse().unwrap(),
-                    })
-                ),
-                (Some(_), AgentAuthzMode::Observe) => assert_eq!(result.unwrap(), None, "{case}"),
+                (None, _) | (Some(_), AgentAuthzMode::Observe) => result.unwrap(),
                 (Some(reason), AgentAuthzMode::Enforce) => {
                     let error = result.unwrap_err();
                     assert_eq!(error.code(), tonic::Code::PermissionDenied, "{case}");
@@ -187,17 +177,14 @@ async fn checks_current_pod_node_and_peer_in_both_modes() {
 async fn normalizes_mapped_ipv4_and_accepts_each_pod_ip() {
     let auth = authorizer();
     for ip in ["10.0.0.2", "::ffff:10.0.0.2", "2001:db8::2"] {
-        assert!(
-            auth.authorize(&caller(), Some(ip.parse().unwrap()), "IssueDek")
-                .await
-                .unwrap()
-                .is_some()
-        );
+        auth.authorize(&caller(), Some(ip.parse().unwrap()), "IssueDek")
+            .await
+            .unwrap();
     }
 }
 
 #[tokio::test]
-async fn dependency_failures_are_retryable_and_observe_never_verifies_them() {
+async fn dependency_failures_are_retryable_in_enforce_and_allowed_in_observe() {
     for mode in [AgentAuthzMode::Observe, AgentAuthzMode::Enforce] {
         let closed_pool = sqlx::postgres::PgPoolOptions::new()
             .connect_lazy("postgres://localhost/unused")
@@ -223,7 +210,7 @@ async fn dependency_failures_are_retryable_and_observe_never_verifies_them() {
                 .authorize(&caller(), Some("10.0.0.2".parse().unwrap()), "IssueDek")
                 .await;
             match mode {
-                AgentAuthzMode::Observe => assert_eq!(result.unwrap(), None),
+                AgentAuthzMode::Observe => result.unwrap(),
                 AgentAuthzMode::Enforce => {
                     let error = result.unwrap_err();
                     assert_eq!(error.code(), tonic::Code::Unavailable);

@@ -906,44 +906,17 @@ impl CredentialManager for CredentialManagerService {
         &self,
         request: Request<IssueIntermediateCertificateRequest>,
     ) -> Result<Response<IssueIntermediateCertificateResponse>, Status> {
-        let audit = request
-            .extensions()
-            .get::<crate::issuance_audit::RequestAudit>()
-            .cloned();
-        let identity = request
-            .extensions()
-            .get::<crate::auth::VerifiedAgentIdentity>()
-            .cloned();
-        if let Err(error) = self.authorize_caller(
+        self.authorize_caller(
             &request,
             "IssueIntermediateCertificate",
             ALLOW_ISSUE_INTERMEDIATE,
             ALLOW_ISSUE_INTERMEDIATE_SERVICES,
-        ) {
-            crate::issuance_audit::record(
-                audit.as_ref(),
-                identity.as_ref(),
-                Some(&request.get_ref().csr),
-                None,
-                "denied",
-                "caller_not_allowed",
-            );
-            return Err(error);
-        }
+        )?;
 
         // The gRPC layer already logs and traces the call; this adds the
         // failure class and the latency of an issuance that polls for seconds.
         let started = Instant::now();
-        let request = request.into_inner();
-        let issued = self.issue_intermediate(request.clone()).await;
-        crate::issuance_audit::record(
-            audit.as_ref(),
-            identity.as_ref(),
-            Some(&request.csr),
-            issued.as_ref().ok().map(Vec::as_slice),
-            if issued.is_ok() { "issued" } else { "error" },
-            intermediate_result_tag(&issued),
-        );
+        let issued = self.issue_intermediate(request.into_inner()).await;
         pplx_space_metrics::credmgr::intermediate_ca_issue(
             intermediate_result_tag(&issued),
             started.elapsed().as_secs_f64() * 1000.0,

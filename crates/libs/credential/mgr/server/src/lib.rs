@@ -12,7 +12,6 @@ pub mod intermediate_ca;
 pub mod intermediate_key_broker;
 pub mod intermediate_key_identity;
 pub mod intermediate_key_store;
-mod issuance_audit;
 pub mod k8s_identity;
 pub mod kek_provisioning;
 pub mod kek_store;

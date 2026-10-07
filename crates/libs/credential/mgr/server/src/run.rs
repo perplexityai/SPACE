@@ -1020,9 +1020,6 @@ where
 {
     let (_, health_service) = pplx_space_common_svc::grpc_health_service();
     pplx_space_common_svc::grpc_server_builder()
-        .layer(tower::util::MapRequestLayer::new(
-            crate::issuance_audit::track_request,
-        ))
         .layer(pplx_space_common_svc::grpc_trace_layer())
         .layer(
             pplx_space_common_svc::conservative_uds_grpc_rate_limiter_layer(
@@ -1323,9 +1320,6 @@ async fn serve_tcp_until(
     // layer so Kubernetes gRPC probes work without a credential.
     let (_, health_service) = pplx_space_common_svc::grpc_health_service();
     builder
-        .layer(tower::util::MapRequestLayer::new(
-            crate::issuance_audit::track_request,
-        ))
         .layer(pplx_space_common_svc::grpc_rate_limiter_layer(
             pplx_space_common_svc::GrpcRateLimiterConfig::enforce("space-credential-manager-tcp")
                 .with_default_limits(

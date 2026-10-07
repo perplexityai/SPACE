@@ -15,7 +15,7 @@ use kube::{
 };
 use tokio_util::sync::CancellationToken;
 
-use pplx_space_common_core::types::{K8sNodeName, K8sNodeUid, NodeId, PodName, PodUid};
+use pplx_space_common_core::types::PodName;
 use tonic::Status;
 
 use crate::auth::K8sIdentity;
@@ -67,17 +67,6 @@ impl fmt::Display for AgentAuthzMode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
     }
-}
-
-/// Available in request extensions only after all five checks passed. Observe
-/// failures never manufacture a verified identity.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct VerifiedAgentIdentity {
-    pub pod_uid: PodUid,
-    pub node_name: K8sNodeName,
-    pub node_uid: K8sNodeUid,
-    pub node_id: NodeId,
-    pub peer_ip: IpAddr,
 }
 
 pub(crate) struct AgentAuth {
@@ -143,7 +132,7 @@ impl AgentAuth {
         caller: &K8sIdentity,
         peer: Option<IpAddr>,
         rpc: &str,
-    ) -> Result<Option<VerifiedAgentIdentity>, Status> {
+    ) -> Result<(), Status> {
         let peer = peer.map(normalize_ip);
         let pod = self.pod(caller.pod().pod_name()).await;
         // Evaluate every independent check even in observe mode and even if an
@@ -210,10 +199,7 @@ impl AgentAuth {
             ("pod_uid", uid),
             ("pod_running", running),
             ("pod_owner", owner),
-            (
-                "node_identity",
-                node.as_ref().map(|_| ()).map_err(Clone::clone),
-            ),
+            ("node_identity", node.map(|_| ())),
             ("peer_ip", peer_check),
         ];
         let mut failure = None;
@@ -238,14 +224,7 @@ impl AgentAuth {
         }
         match (failure, self.mode) {
             (Some(error), AgentAuthzMode::Enforce) => Err(error),
-            (Some(_), AgentAuthzMode::Observe) => Ok(None),
-            (None, _) => Ok(Some(VerifiedAgentIdentity {
-                pod_uid: caller.pod().pod_uid().clone(),
-                node_name: caller.node().node_name().clone(),
-                node_uid: caller.node().node_uid().clone(),
-                node_id: node.expect("successful node check"),
-                peer_ip: peer.expect("successful peer check"),
-            })),
+            _ => Ok(()),
         }
     }
 }
