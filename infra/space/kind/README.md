@@ -724,9 +724,11 @@ reconciler covers kube-Node inventory. **Nothing writes Postgres from the
 node** except credential-manager's legacy authority (below); node status uses
 the normal 30-second freshness window. Both bring-up paths end by waiting until
 the admin node list (`GET /admin/api/v1/nodes`) reports every sandbox and
-builder node with a fresh, reachable status and scheduling status `ready`
+builder node reachable, with scheduling status `ready`, and observed within the
+five node-ctl ticks the API trusts a census for
 (`scripts/wait-node-publication.sh`): ready pods alone are not a registered
-node.
+node. The wait does not require `stale: false`: node-ctl publishes every 60
+seconds, so an idle healthy node reads stale about half the time.
 
 ## Node services
 

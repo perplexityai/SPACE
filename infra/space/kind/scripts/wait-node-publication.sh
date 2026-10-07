@@ -9,7 +9,15 @@
 # network pool) is ready. This polls the admin node list
 # (`GET /admin/api/v1/nodes`) as the local root account until every Kubernetes
 # node in the sandbox and builder pools appears there with its role, a
-# non-stale reachable status and scheduling status `ready`.
+# reachable status observed within the last five node-ctl poll ticks, and
+# scheduling status `ready`.
+#
+# The status's `stale` flag is not the test: it flips 30 s after each publish
+# (NODE_STATUS_STALE_AFTER_SECS) while node-ctl publishes on a 60 s tick, so a
+# healthy idle node reads stale about half the time, and four nodes on
+# different phases may never all read fresh at once. Freshness here is the
+# window the API itself trusts a node's census for (CENSUS_INVENTORY_MAX_AGE,
+# five ticks, crates/libs/common/svc/src/sql/sandbox_residency.rs).
 #
 # Usage:
 #   bash infra/space/kind/scripts/wait-node-publication.sh [timeout-seconds]
@@ -26,6 +34,7 @@ KCTX="kind-$KIND_CLUSTER"
 TIMEOUT="${1:-600}"
 PASSWORD="${SPACE_CONSOLE_PASSWORD-password}"
 API_URL="${SPACE_KIND_API_URL:-}"
+MAX_STATUS_AGE_SECS=300
 
 log() { printf '[wait-node-publication] %s\n' "$*"; }
 die() { printf '[wait-node-publication] ERROR: %s\n' "$*" >&2; exit 1; }
@@ -71,10 +80,11 @@ while true; do
   if [[ -n "$token" ]] && nodes="$(curl -fsS -m 5 -H "authorization: Bearer $token" \
       "$API_URL/admin/api/v1/nodes" 2>/dev/null)"; then
     pending="$(while read -r name role; do
-      jq -e --arg name "$name" --arg role "$role" '
+      jq -e --arg name "$name" --arg role "$role" --argjson max_age "$MAX_STATUS_AGE_SECS" '
         any(.[]; .k8s_node_name == $name and .role == $role and .deleted_at == null
-            and .status.stale == false and .status.reachable == true
-            and .status.scheduling.status == "ready")' <<<"$nodes" >/dev/null \
+            and .status.reachable == true and .status.scheduling.status == "ready"
+            and ((.status.observed_at // "" | sub("\\.[0-9]+"; "") | fromdateiso8601? // 0)
+                 > (now - $max_age)))' <<<"$nodes" >/dev/null \
         || printf '%s %s\n' "$name" "$role"
     done <<<"$expected")"
     [[ -n "$pending" ]] || break
@@ -86,7 +96,7 @@ while true; do
       printf 'nodes not published as ready within %ss:\n' "$TIMEOUT"
       while read -r name role; do
         printf '  %s (%s): %s\n' "$name" "$role" "$(jq -c --arg name "$name" \
-          '[.[] | select(.k8s_node_name == $name) | {role, scheduling_status, status: (.status // {} | {stale, reachable, scheduling: .scheduling.status, error})}]' \
+          '[.[] | select(.k8s_node_name == $name) | {role, scheduling_status, status: (.status // {} | {observed_at, reachable, scheduling: .scheduling.status, error})}]' \
           <<<"${nodes:-[]}" 2>/dev/null || echo unknown)"
       done <<<"$pending"
     } >&2
