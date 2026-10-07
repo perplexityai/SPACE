@@ -50,11 +50,25 @@ allowedServiceAccounts:
 # `space-aws-creds` Secret bootstrap creates from private.env.
 awsRegion: us-east-1
 
-# The in-memory platform KEK lives in one process
-# (crates/libs/credential/mgr/server/src/in_memory.rs), so exactly one
-# replica, replaced rather than overlapped. Its restart makes previously
-# wrapped keys unreadable; a deployment uses a KMS-backed KEK instead.
-replicas: 1
+# The external key provider behind the platform KEK: the Kind-only broker
+# fixture (space-kind-key-broker). The tenant namespace is the durable
+# cryptographic tenant binding the broker sees with every org id, so it must
+# never change while data protected by those keys is kept
+# (proto/credential/provider/v2/README.md); the grant scheme names evidence
+# only federated orgs send. Both are Kind values of the URN shape the code's
+# tests use; no public source fixes production ones.
+keyBroker:
+  url: http://space-kind-key-broker:50051
+  tokenSecretName: space-kind-key-broker-token
+  tenantNamespace: urn:space:kind-local:org
+  grantScheme: urn:space:kind-local:grant:v1
+
+# Two replicas, as the EKS module runs on clusters with live authority traffic
+# (infra/space/aws/eks/modules/space/variables.tf). They share no process
+# state: keys come from the broker, and key provisioning and volume DEK
+# writes are first-writer-wins in Postgres (kek_provisioning.rs,
+# volume_wrap_store.rs). Kind has one infra node, so both run there.
+replicas: 2
 
 # The TCP-only authority has no service mutex or drain budget of its own: on
 # SIGTERM tonic's serve_with_shutdown stops accepting and finishes in-flight

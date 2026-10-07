@@ -191,6 +191,13 @@ rust_runtime_image(
     "docker/Dockerfile.api",
     runtime_deps = ["docker/Dockerfile.api", "scripts/space-db-migrate.sh"],
 )
+# Kind-only: the intermediate-key broker fixture the credential-manager
+# authority uses as its external key provider.
+rust_runtime_image(
+    "space-kind-key-broker",
+    "docker/Dockerfile.kind-key-broker",
+    runtime_deps = ["docker/Dockerfile.kind-key-broker"],
+)
 rust_runtime_image(
     "space-data-plane",
     "docker/Dockerfile.data-plane",
@@ -495,6 +502,14 @@ k8s_resource(
     "space-credmgr-authority",
     labels = ["control-plane"],
     resource_deps = ["space-api", "label-kind-infra"],
+)
+# The authority's external key provider: the Kind-only intermediate-key broker
+# fixture, whose derived keys survive restarts of either side.
+k8s_yaml(helm("infra/space/kind/charts/space-kind-key-broker", name = "space", namespace = NAMESPACE))
+k8s_resource(
+    "space-kind-key-broker",
+    labels = ["control-plane"],
+    resource_deps = ["label-kind-infra"],
 )
 
 # Public data-plane service for native sessions and ECW wildcard hosts.

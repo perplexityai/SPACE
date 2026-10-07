@@ -53,7 +53,9 @@ or suites.
   authority) is authenticated TLS, as deployed: do not set
   `SPACE_INTERNAL_RPC_INSECURE_DEV` or plaintext flags in Kind charts.
   `scripts/internal-rpc-tls.sh` owns the cluster's CA and listener Secrets;
-  keep it run before workloads in both bring-up paths.
+  keep it run before workloads in both bring-up paths. The one plaintext hop is
+  the authority's call to the Kind-only `space-kind-key-broker` fixture, which
+  has no TLS listener; never ship that fixture outside Kind.
 - Node services run one DaemonSet per service and role from
   `charts/space-<service>-local` on the `space-node-service` library, listed in
   `lib/node-services.sh` for every bring-up path. Each pod runs the unmodified

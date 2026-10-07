@@ -690,7 +690,8 @@ kind cluster: space-local (kind-cluster.yaml.tmpl — 6 nodes)
 │   ├── space-object-store    (versitygw S3 gateway + bucket-init Job)
 │   ├── space-api             (Deployment; SPACE_K8S_CONTROL_PLANE=true)
 │   ├── space-internal-api    (Deployment; ClusterApi — node registration + template releases)
-│   ├── space-credmgr-authority (Deployment; credential-manager authority — credential tables + platform KEK)
+│   ├── space-credmgr-authority (Deployment, 2 replicas; credential-manager authority — credential tables + platform KEK)
+│   ├── space-kind-key-broker (Deployment; Kind-only intermediate-key broker fixture behind the platform KEK)
 │   ├── space-data-plane      (Deployment)
 │   ├── space-cluster-controller (Deployment; materializes per-sandbox pods)
 │   ├── space-seed-publish    (Job; publishes the locally built seed)
@@ -869,6 +870,11 @@ listener and caller rolls onto TLS. While they roll, a plaintext caller and a TL
 listener refuse each other, and the services' own restarts carry them until both
 sides have moved.
 
+Organizations enrolled for BYOK before the authority used the key broker keep
+an `in-memory` master-key row that no authority serves any more, so their
+encrypted sandboxes and fields stay unreadable, as they already were after any
+restart of the old single authority. Recreate the cluster to start them clean.
+
 The single-worker DirectSubstrate bench (`space-local-3486`, Tilt
 `SPACE_LOCAL_MINIMAL=1`) was retired with that layout: its node side was the old
 entrypoint's SQL registration of the node, Postgres access from the node that
@@ -906,10 +912,16 @@ token. Each node's credential-manager runs `--role=agent`: it holds the node's
 credential sockets under its service mutex and forwards every call upstream as
 the node credential agent, with no database, KEK or AWS credential. node-manager
 calls the authority directly for sandbox volume DEKs, which the authority grants
-only to node-manager. The Kind KEK is the development-only in-memory backend in
-one process: one replica, replaced rather than overlapped, and its restart makes
-keys it wrapped unreadable. Agents started before the authority exit and are
-restarted until it answers.
+only to node-manager. The platform KEK takes the production provider path, the
+intermediate-key broker: the authority mints each org's intermediate key there
+on first use, keeps only the opaque wrapped key in Postgres and unwraps it
+through the broker. Kind's broker is the in-repo fixture
+(`charts/space-kind-key-broker`, Kind-only image `docker/Dockerfile.kind-key-broker`),
+reached over plaintext because the fixture has no TLS listener. It derives keys
+from the tenant reference and keeps no state, so keys survive restarts of the
+broker and the authority and every replica serves every org, and so Kind's keys
+protect nothing. The authority runs two replicas and rolls one at a time. Agents
+started before the authority exit and are restarted until it answers.
 
 **Internal RPC TLS.** Kind runs ClusterApi, NodeApi, BuildManager,
 IngressActivationApi and the credential-manager authority over authenticated
@@ -949,7 +961,7 @@ internal-api's node-address check is unchanged.
 | `/space/cache` is btrfs on instance-store NVMe            | btrfs on a sparse loopback image at `/var/lib/space-cache.img` on the kind node (40 GiB, same code paths, less I/O headroom), mounted on the node's `/space/cache` by `space-cache.service`, so it outlives pod restarts like the NVMe does |
 | Postgres on RDS, secrets via ExternalSecrets / AWS Secrets Manager | In-cluster `space-postgres` StatefulSet, static Kubernetes Secrets             |
 | S3 for snapshots + template artifacts                     | In-cluster versitygw (real S3 protocol, sigv4, path-style)                    |
-| `space-credmgr-authority` Deployment with a KMS-backed platform KEK and TLS from its own certificate (`credmgr_authority_kms.tf`, `credmgr_authority_tls.tf`) | one replica with the in-memory development KEK, which a restart loses; TLS from a self-signed certificate `internal-rpc-tls.sh` issues per cluster |
+| `space-credmgr-authority` Deployment whose platform KEK comes from an external intermediate-key broker, with TLS from its own certificate (`credmgr_authority_tls.tf`; the direct KMS backend is gone, `credmgr_authority_kms.tf`) | two replicas on the same broker path against the in-repo broker fixture (`space-kind-key-broker`), which derives keys instead of protecting them; TLS from a self-signed certificate `internal-rpc-tls.sh` issues per cluster |
 | Internal RPC CA and listener leaves issued by Terraform and synced by External Secrets (`internal_rpc_tls.tf`) | the same Secrets issued per cluster by `scripts/internal-rpc-tls.sh` |
 | volume-manager credentials via credmgr STS/IRSA           | static `SPACE_OBJECT_STORE_STATIC_*` creds (the documented local escape hatch) |
 | build-manager gets S3 credentials via credential-manager backed by cloud identity | the same directly injected static object-store credentials; credential-manager's storage exchange endpoint is explicitly disabled |

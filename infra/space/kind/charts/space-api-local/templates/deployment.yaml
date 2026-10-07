@@ -134,10 +134,11 @@ spec:
             # plaintext sandboxes exactly as before.
             - name: SPACE_BYOK_VOLUME_ENCRYPTION
               value: {{ .Values.byokVolumeEncryption | quote }}
-            # The admin BYOK-enable gate must agree with the node
-            # credential-manager's development-only authority provisioner.
+            # The admin BYOK-enable gate must agree with the credential-manager
+            # authority's platform KEK provider, which provisions a keyless
+            # org's key lazily (space-credmgr-authority-local).
             - name: SPACE_PLATFORM_KEK_PROVIDER
-              value: in-memory
+              value: intermediate-key-broker
             # Must match the cluster-controller chart's value — see the
             # rationale on `nodeCensusResidency` in values.yaml. `required` so
             # a dropped key fails the render: without it a nil leaf still

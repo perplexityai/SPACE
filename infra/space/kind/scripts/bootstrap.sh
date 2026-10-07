@@ -287,7 +287,7 @@ SPACE_KIND_CLUSTER="$KIND_CLUSTER" bash "$KIND_DIR/scripts/internal-rpc-tls.sh"
 
 # ── Step 5: images ───────────────────────────────────────────────────────────
 if (( SKIP_IMAGES )); then
-  log "--skip-images given; assuming all 7 images are already loaded"
+  log "--skip-images given; assuming every build-images.sh image is already loaded"
 else
   log "building + loading SPACE images (this is the long step on a cold cache)"
   SPACE_KIND_CLUSTER="$KIND_CLUSTER" \
@@ -323,8 +323,8 @@ helm_apply() {
 # ── Optional AWS creds for independent credmgr integrations ──────────────────
 # When AWS_ACCESS_KEY_ID is set (typically sourced from
 # infra/space/kind/private.env — SANDBOX ACCOUNT ONLY), create the
-# `space-aws-creds` Secret the credential-manager chart maps into its env
-# for features such as Private CA. KEK wrapping remains in-memory in Kind.
+# `space-aws-creds` Secret the credential-manager authority chart maps into its
+# env for features such as Private CA. KEK wrapping uses the Kind key broker.
 # These are short-lived STS creds — re-run bootstrap after refreshing
 # private.env to rotate them.
 if [[ -n "${AWS_ACCESS_KEY_ID:-}" && -n "${AWS_SECRET_ACCESS_KEY:-}" ]]; then
@@ -393,6 +393,7 @@ fi
 
 # Once api-server has the control-plane schema, drive everything else.
 helm_apply space "$KIND_DIR/charts/space-internal-api-local"
+helm_apply space "$KIND_DIR/charts/space-kind-key-broker"
 helm_apply space "$KIND_DIR/charts/space-credmgr-authority-local"
 helm_apply space "$KIND_DIR/charts/space-data-plane-local"
 helm_apply space "$KIND_DIR/charts/space-cluster-controller-local"
@@ -432,6 +433,9 @@ helm_apply space "$KIND_DIR/charts/space-seed-publish"
 # ── Step 8: readiness gates ──────────────────────────────────────────────────
 log "waiting for space-internal-api Deployment"
 kubectl --context "$KCTX" -n "$NAMESPACE" rollout status deploy/space-internal-api --timeout="${TIMEOUT}s"
+
+log "waiting for space-kind-key-broker Deployment"
+kubectl --context "$KCTX" -n "$NAMESPACE" rollout status deploy/space-kind-key-broker --timeout="${TIMEOUT}s"
 
 log "waiting for space-credmgr-authority Deployment"
 kubectl --context "$KCTX" -n "$NAMESPACE" rollout status deploy/space-credmgr-authority --timeout="${TIMEOUT}s"

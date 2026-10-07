@@ -328,6 +328,9 @@ jobs:
           # The credential-manager authority every node agent forwards to.
           k 45s -n space logs deployment/space-credmgr-authority --all-containers=true --timestamps \
             >"${dir}/space-credmgr-authority.log" 2>&1 || true
+          # Its Kind key broker fixture.
+          k 45s -n space logs deployment/space-kind-key-broker --all-containers=true --timestamps \
+            >"${dir}/space-kind-key-broker.log" 2>&1 || true
           for node in $(timeout 30s kind get nodes --name space-local 2>/dev/null); do
             timeout 45s docker exec "${node}" journalctl -u kubelet -u containerd --no-pager -o short-iso \
               >"${dir}/${node}.journal.log" 2>&1 || true

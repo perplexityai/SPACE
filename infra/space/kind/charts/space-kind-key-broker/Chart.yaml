@@ -1,0 +1,6 @@
+apiVersion: v2
+name: space-kind-key-broker
+description: Kind-only intermediate-key broker fixture for the KinD SPACE credential-manager authority
+type: application
+version: 0.1.0
+appVersion: "0.8.0"

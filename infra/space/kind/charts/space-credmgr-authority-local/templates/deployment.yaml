@@ -54,9 +54,14 @@ spec:
     matchLabels:
       app.kubernetes.io/name: {{ $name }}
       app.kubernetes.io/instance: {{ .Release.Name }}
-  # Replace, never overlap: the in-memory KEK is per process (values.yaml).
+  # Replicas share every key through the broker and coordinate through the
+  # database alone (values.yaml), so a rollout replaces one at a time while
+  # the other keeps serving.
   strategy:
-    type: Recreate
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
   template:
     metadata:
       annotations:
@@ -114,16 +119,31 @@ spec:
                   key: {{ .Values.postgres.secretKey }}
             - name: SPACE_DB_CREDS_PASSWORD
               value: {{ .Values.postgres.managedCredentialsPassword | quote }}
-            # Development-only in-memory platform KEK, compiled in only with
-            # the Kind images' test-hooks feature. Credential exchange stays
+            # The platform KEK comes from the intermediate-key broker, the
+            # production provider path (crates/libs/credential/mgr/server/src/run.rs):
+            # the authority mints each org's intermediate key there on its
+            # first Encrypt or volume DEK, stores the opaque wrapped key in
+            # Postgres, and unwraps it through the broker, so keys survive
+            # restarts and every replica serves every org. Kind's broker is
+            # the in-repo fixture (space-kind-key-broker), reached over
+            # plaintext, which the code allows for local development only:
+            # the fixture has no TLS listener. Credential exchange stays
             # disabled because no vending role (SPACE_CREDMGR_S3_VEND_ROLE_ARN)
             # is configured.
-            - name: SPACE_CREDMGR_IN_MEMORY_KEK_ENABLED
-              value: "true"
             - name: SPACE_PLATFORM_KEK_PROVIDER
-              value: in-memory
-            - name: SPACE_PLATFORM_KEK_IDENTIFIER
-              value: kind-local-platform-kek
+              value: intermediate-key-broker
+            - name: SPACE_CREDMGR_INTERMEDIATE_KEY_BROKER_URL
+              value: {{ .Values.keyBroker.url | quote }}
+            - name: SPACE_CREDMGR_INTERMEDIATE_KEY_BROKER_TOKEN_FILE
+              value: /var/run/space-key-broker/token
+            # The durable tenant binding sent with every key request, and the
+            # scheme of the authorization evidence a federated org's request
+            # would carry; Kind's orgs are local and send none
+            # (intermediate_key_identity.rs). Kind values, see values.yaml.
+            - name: SPACE_CREDMGR_INTERMEDIATE_KEY_BROKER_TENANT_NAMESPACE
+              value: {{ .Values.keyBroker.tenantNamespace | quote }}
+            - name: SPACE_CREDMGR_INTERMEDIATE_KEY_BROKER_GRANT_SCHEME
+              value: {{ .Values.keyBroker.grantScheme | quote }}
             # Callers present projected tokens with the authority's default
             # audience (space-credential-manager) and are mapped to their
             # client service by ServiceAccount; the reviewed token must name
@@ -177,6 +197,9 @@ spec:
             - name: tls
               mountPath: /etc/space-credmgr-tls
               readOnly: true
+            - name: key-broker-token
+              mountPath: /var/run/space-key-broker
+              readOnly: true
           {{- with .Values.resources }}
           resources:
             {{- toYaml . | nindent 12 }}
@@ -187,6 +210,10 @@ spec:
         - name: tls
           secret:
             secretName: space-credmgr-authority-tls
+            defaultMode: 0440
+        - name: key-broker-token
+          secret:
+            secretName: {{ .Values.keyBroker.tokenSecretName }}
             defaultMode: 0440
 ---
 apiVersion: v1
