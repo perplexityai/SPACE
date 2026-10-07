@@ -539,7 +539,7 @@ def verify_sandbox_phase(board: StatusBoard, main_alias: str) -> int:
                     "systemctl",
                     "show",
                     "--no-pager",
-                    "e2b-template-start.service",
+                    "space-start-cmd.service",
                     "-p",
                     "ActiveState,SubState,Result,ExecMainStatus",
                 ]

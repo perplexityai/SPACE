@@ -26,7 +26,7 @@
 //! Plus two cross-cutting fields on `TemplateBuildStartV2`:
 //!
 //! * `startCmd` -> a build-time Run step that drops a systemd unit at
-//!   `/etc/systemd/system/e2b-template-start.service`, `systemctl enable`s
+//!   `/etc/systemd/system/space-start-cmd.service`, `systemctl enable`s
 //!   it, and gives the unit `WantedBy=space.target`. SPACE sandboxes boot
 //!   to `space.target`, not `multi-user.target`. e2b's real semantics
 //!   would snapshot a warmed-up VM here; SPACE doesn't have that publish
@@ -94,8 +94,8 @@ fn base_template_defaults(base: &str) -> (String, Option<String>) {
 const TEMPLATE_BUILD_DISK_MIB_ENV: &str = "SPACE_TEMPLATE_BUILD_DISK_MIB";
 const MIB: u64 = 1024 * 1024;
 
-const START_UNIT_PATH: &str = "/etc/systemd/system/e2b-template-start.service";
-const START_UNIT_NAME: &str = "e2b-template-start.service";
+const START_UNIT_PATH: &str = "/etc/systemd/system/space-start-cmd.service";
+const START_UNIT_NAME: &str = "space-start-cmd.service";
 
 pub(super) async fn build_recipe(
     org_id: OrgId,
@@ -540,7 +540,7 @@ fn install_start_cmd_unit(start_cmd: &str) -> build_proto::recipe::Step {
     let unit = format!(
         concat!(
             "[Unit]\n",
-            "Description=e2b template start_cmd (translated by space-api)\n",
+            "Description=Template startCmd (installed by space-api)\n",
             "After=local-fs.target network-online.target\n",
             "DefaultDependencies=no\n",
             "\n",
