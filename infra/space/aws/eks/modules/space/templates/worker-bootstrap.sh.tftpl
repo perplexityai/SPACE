@@ -80,12 +80,11 @@ NODEADM
 nodeadm init --config-source file:///etc/eks/nodeadm.yaml
 
 # No template is staged here, deliberately. A node acquires every template only
-# through template-manager — its prefetch loop for the tags the
-# SPACE_TEMPLATE_PREFETCH_TAGS allowlist names, otherwise on demand at the first
-# create — which resolves the release against ClusterApi and verifies what it
-# pulls against the registered release hash. Staging one here instead would
-# mean hashing the artifact a second time, independently of the builder that
-# authored it, with nothing enforcing that the two agree. The cost is a
-# first-boot delay before seed is resident.
+# through template-manager's prefetch loop, which resolves the tags it tracks
+# (seed:latest among them) against ClusterApi and verifies what it pulls against
+# the registered release hash. Staging one here instead would mean hashing the
+# artifact a second time, independently of the builder that authored it, with
+# nothing enforcing that the two agree. The cost is a first-boot delay before
+# seed is resident.
 
 echo "=== SPACE worker bootstrap complete ==="

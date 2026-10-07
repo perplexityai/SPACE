@@ -214,31 +214,24 @@ impl TemplateManagerService {
         request: Request<ListTemplatesRequest>,
     ) -> Result<Response<ListTemplatesResponse>, Status> {
         self.authorize_peer(&request, "ListTemplates", ALLOW_TEMPLATE_OBSERVER)?;
-        // Fetch all builds from DB. A failed read fails the call: node-ctl
-        // publishes this answer as the node's complete template census, so
-        // a partial or empty substitute would prune real inventory.
+        // Fetch all builds from DB
         let db = Arc::clone(&self.db);
         let (builds, all_snapshots, pools, template_settings) =
             tokio::task::spawn_blocking(move || {
                 let conn = db
                     .lock()
                     .map_err(|_| Status::internal("db mutex poisoned while listing templates"))?;
-                let unavailable = |what: &str, error: rusqlite::Error| {
-                    Status::unavailable(format!("template inventory unavailable: {what}: {error}"))
-                };
-                let builds =
-                    crate::db::list_builds(&conn).map_err(|error| unavailable("builds", error))?;
-                let pools =
-                    crate::db::get_all_pools(&conn).map_err(|error| unavailable("pools", error))?;
-                let settings = crate::db::list_template_settings(&conn)
-                    .map_err(|error| unavailable("template settings", error))?;
+                let builds = crate::db::list_builds(&conn).unwrap_or_default();
+                let pools = crate::db::get_all_pools(&conn).unwrap_or_default();
+                let settings = crate::db::list_template_settings(&conn).unwrap_or_default();
                 // Collect all snapshots for each build
                 let mut all_snaps = Vec::new();
                 for build in &builds {
-                    all_snaps.extend(
+                    if let Ok(snaps) =
                         crate::db::list_snapshots(&conn, &build.name, &build.content_hash)
-                            .map_err(|error| unavailable("snapshots", error))?,
-                    );
+                    {
+                        all_snaps.extend(snaps);
+                    }
                 }
                 Ok::<_, Status>((builds, all_snaps, pools, settings))
             })

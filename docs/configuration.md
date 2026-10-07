@@ -144,8 +144,9 @@ because disabling it by mistake would leave every create queued forever.
 
 | Variable | Default | Notes |
 | --- | --- | --- |
-| `SPACE_TEMPLATE_PREFETCH_TAGS` | unset = on-demand only | JSON array of `name:tag` references to prefetch on every node. No built-in list; an invalid value disables prefetch. Prefetch warms only templates the cluster confirms generic, whatever the node's authentication mode. |
-| `SPACE_TEMPLATE_PREFETCH_ENABLED` | on | `0` forces on-demand only. On-demand-only nodes release their prefetch pins so eviction can reclaim them; builds active sandboxes reference stay protected. |
+| `SPACE_TEMPLATE_PREFETCH_ENABLED` | on | |
+| `SPACE_TEMPLATE_PREFETCH_TAGS` | `seed:latest`, `code-runtime:latest` | |
+| `SPACE_TEMPLATE_PREFETCH_VISIBILITY_ENFORCEMENT` | retired | Ignored; prefetch requires confirmed generic visibility. |
 | `SPACE_TEMPLATE_CACHE_BUDGET_BYTES` | 100 GiB | 0 or an invalid value disables cache GC. |
 | `SPACE_TEMPLATE_BUILD_DISK_MIB` | build-manager default | JSON. |
 | `SPACE_TRUSTED_TEMPLATE_STORAGE_BUCKETS` | empty = any bucket | |

@@ -44,9 +44,7 @@
 //!       [`crate::volume::PullTrigger::PrefetchLatestRelease`]) for
 //!       any digest not already on disk and not already dispatched
 //!       this tick by the tag pass (intra-tick dedup `HashSet`).
-//!    4. Drop the release pins of every template the allowlist no
-//!       longer names; nothing else would ever prune them.
-//!    5. After iterating the per-template entries, prune
+//!    4. After iterating the per-template entries, prune
 //!       `template_pinned_releases` to the resolved set, scoped to the
 //!       templates that successfully resolved this tick — a transient
 //!       cluster-API failure for one template must not flush its
@@ -261,21 +259,17 @@
 //! ## Configured tag tuples
 //!
 //! `SPACE_TEMPLATE_PREFETCH_TAGS` supplies the tag tuples at startup. Removed
-//! tuples lose their tag pins on the next tick, and a removed template loses
-//! its release pins too. Each unique template also opts into latest-N
-//! warming. With no tuples the node is on-demand only: the loop releases
-//! every prefetch pin once and exits, so eviction can reclaim what an
-//! earlier allowlist warmed. Builds an active sandbox references remain
-//! protected by eviction's active set.
+//! tuples lose their tag pins on the next tick. Each unique template also opts
+//! into latest-N warming.
 //!
 //! ## Configuration (env vars, daemon-scope)
 //!
-//! - `SPACE_TEMPLATE_PREFETCH_TAGS` — JSON array of `name:tag` references:
-//!   the prefetch allowlist. **Unset or `[]` means on-demand only**; there
-//!   is no built-in list. An invalid value disables prefetch and keeps
-//!   existing pins.
+//! - `SPACE_TEMPLATE_PREFETCH_TAGS` — JSON array of `name:tag` references. Defaults
+//!   to `seed:latest` and `code-runtime:latest`; `[]` disables all tag pins.
 //! - `SPACE_TEMPLATE_PREFETCH_ENABLED` — set to `"0"` or `"false"` to
-//!   force on-demand only whatever the allowlist says. Default: enabled.
+//!   disable. Default: enabled.
+//! - `SPACE_TEMPLATE_PREFETCH_VISIBILITY_ENFORCEMENT` — retired and ignored;
+//!   prefetch always requires confirmed generic visibility.
 //! - `SPACE_TEMPLATE_PREFETCH_LATEST_N` — test hook only (ignored by
 //!   release builds): number of latest releases to warm per template
 //!   (default: 5; `0` disables latest-N *warming* and keeps only tag
@@ -345,6 +339,7 @@ const LATEST_N_TEST_HOOK: &str = "SPACE_TEMPLATE_PREFETCH_LATEST_N";
 const JITTER_FRACTION: f64 = 0.2;
 
 const PREFETCH_TAGS_ENV: &str = "SPACE_TEMPLATE_PREFETCH_TAGS";
+const DEFAULT_PREFETCH_TAGS: &str = r#"["seed:latest","code-runtime:latest"]"#;
 
 #[derive(Debug, thiserror::Error)]
 enum PrefetchTagsParseError {
@@ -367,14 +362,6 @@ fn parse_prefetch_tags(
         .collect()
 }
 
-/// The node's prefetch allowlist. There is no built-in list: unset means
-/// on-demand only, the same as an explicit `[]`.
-fn configured_prefetch_tags(
-    raw: Option<&str>,
-) -> Result<Vec<(TemplateName, TemplateTag)>, PrefetchTagsParseError> {
-    raw.map_or_else(|| Ok(Vec::new()), parse_prefetch_tags)
-}
-
 #[derive(Clone, Debug)]
 pub struct PrefetchConfig {
     pub enabled: bool,
@@ -394,10 +381,8 @@ impl PrefetchConfig {
     /// back to defaults for any unset/malformed entry. The tick interval
     /// (60 s) and download concurrency (2) are fixed.
     ///
-    /// `enabled` defaults to true, but an enabled loop only warms what
-    /// `SPACE_TEMPLATE_PREFETCH_TAGS` names; without that allowlist the
-    /// node is on-demand only. `SPACE_TEMPLATE_PREFETCH_ENABLED=0` (or
-    /// `false`) forces on-demand only whatever the allowlist says.
+    /// Prefetch defaults to **enabled**. To turn it off, set
+    /// `SPACE_TEMPLATE_PREFETCH_ENABLED=0` (or `false`) explicitly.
     pub fn from_env() -> Self {
         // Fail-open: prefetch is best-effort and won't disrupt on-demand
         // traffic if it errors, so an unrecognized value leaves it enabled.
@@ -422,12 +407,11 @@ impl PrefetchConfig {
     }
 }
 
-/// Run the prefetch loop forever. Returns early when the node is
-/// on-demand only (prefetch disabled, or no allowlist), after releasing
-/// every prefetch pin, and when the allowlist is invalid, keeping them —
-/// there is no shutdown signal today; the task is dropped when the tokio
-/// runtime shuts down. A cooperative shutdown via `CancellationToken` is
-/// intentionally deferred to a follow-up PR.
+/// Run the prefetch loop forever. Returns only if `cfg.enabled` is
+/// false (logs and returns immediately) — there is no shutdown signal
+/// today; the task is dropped when the tokio runtime shuts down. A
+/// cooperative shutdown via `CancellationToken` is intentionally
+/// deferred to a follow-up PR.
 pub async fn run_loop(pins: PinnedDigestsStore, volume_puller: VolumePuller, cfg: PrefetchConfig) {
     if std::env::var_os(crate::volume::RETIRED_ENV_VISIBILITY_ENFORCEMENT).is_some() {
         warn!(
@@ -436,31 +420,20 @@ pub async fn run_loop(pins: PinnedDigestsStore, volume_puller: VolumePuller, cfg
         );
     }
 
-    let tag_tuples = if cfg.enabled {
-        match configured_prefetch_tags(std::env::var(PREFETCH_TAGS_ENV).ok().as_deref()) {
-            Ok(tags) => tags,
-            Err(error) => {
-                // Not on-demand-only: the operator asked for prefetch, so
-                // existing pins stay until the allowlist is corrected.
-                warn!(%error, "invalid SPACE_TEMPLATE_PREFETCH_TAGS; prefetch disabled");
-                return;
-            }
-        }
-    } else {
-        Vec::new()
-    };
-
-    if tag_tuples.is_empty() {
-        info!(
-            enabled = cfg.enabled,
-            "template prefetch is on-demand only; set SPACE_TEMPLATE_PREFETCH_TAGS to prefetch",
-        );
-        // Pins left by an earlier allowlist would otherwise keep those
-        // digests out of eviction forever. Builds an active sandbox
-        // references stay protected by eviction's active set.
-        release_prefetch_pins_until_released(pins, cfg.interval).await;
+    if !cfg.enabled {
+        info!("template prefetch disabled (SPACE_TEMPLATE_PREFETCH_ENABLED=0)");
         return;
     }
+
+    let tag_tuples = match parse_prefetch_tags(
+        &std::env::var(PREFETCH_TAGS_ENV).unwrap_or_else(|_| DEFAULT_PREFETCH_TAGS.to_string()),
+    ) {
+        Ok(tags) => tags,
+        Err(error) => {
+            warn!(%error, "invalid SPACE_TEMPLATE_PREFETCH_TAGS; prefetch disabled");
+            return;
+        }
+    };
 
     info!(
         interval_secs = cfg.interval.as_secs(),
@@ -506,29 +479,6 @@ pub async fn run_loop(pins: PinnedDigestsStore, volume_puller: VolumePuller, cfg
         }
         tokio::time::sleep(jittered(cfg.interval)).await;
     }
-}
-
-/// Drop every tag and release pin, retrying every `retry_interval`
-/// (jittered) until both tables are empty: a transient SQLite failure must
-/// not leave stale pins for the life of the process. Never starts prefetch;
-/// cancelled by dropping the task, like the tick loop.
-async fn release_prefetch_pins_until_released(pins: PinnedDigestsStore, retry_interval: Duration) {
-    while let Err(error) = spawn_blocking_store_op(pins.clone(), release_prefetch_pins).await {
-        warn!(
-            %error,
-            retry_secs = retry_interval.as_secs(),
-            "failed to release prefetch pins for on-demand-only operation; retrying",
-        );
-        tokio::time::sleep(jittered(retry_interval)).await;
-    }
-}
-
-/// Drop every tag and release pin: the on-demand-only pin state. Both
-/// tables are attempted even when the first fails.
-fn release_prefetch_pins(pins: &PinnedDigestsStore) -> rusqlite::Result<()> {
-    let tags = pins.prune_tags_outside(&[]);
-    let releases = pins.prune_release_templates_outside(&[]).map(|_| ());
-    tags.and(releases)
 }
 
 /// Apply ±[`JITTER_FRACTION`] uniform jitter to `interval` so workers
@@ -820,252 +770,258 @@ async fn tick(
     // verdict and unpin the now-private rootfs. So it queries at least one
     // release, which keeps the template-level visibility on the response
     // even when nothing will be warmed.
-    let query_limit = latest_n.max(1);
-    for template_name in unique_prefetch_templates(tag_tuples) {
-        let (visibility, releases) =
-            match crate::volume::list_latest_releases(&template_name, query_limit).await {
-                LatestReleasesOutcome::Resolved {
-                    visibility,
-                    releases,
-                } => (visibility, releases),
-                LatestReleasesOutcome::Error => {
-                    record_release_candidate(&template_name, "", "resolve_error");
+    {
+        let query_limit = latest_n.max(1);
+        for template_name in unique_prefetch_templates(tag_tuples) {
+            let (visibility, releases) =
+                match crate::volume::list_latest_releases(&template_name, query_limit).await {
+                    LatestReleasesOutcome::Resolved {
+                        visibility,
+                        releases,
+                    } => (visibility, releases),
+                    LatestReleasesOutcome::Error => {
+                        record_release_candidate(&template_name, "", "resolve_error");
+                        continue;
+                    }
+                };
+
+            // A verdict already accumulated this tick (the tag pass) wins
+            // over a stale or skewed generic latest-N read: without this,
+            // a mid-tick visibility flip could let the release loop below
+            // re-pin and even dispatch pulls for a template the tag pass
+            // confirmed org-specific — the final flush would drop the
+            // pins, but the rootfs would still have materialized.
+            //
+            // Whether the tag pass already marked this template
+            // org-specific. Two consumers, both wanting exactly that
+            // question: the hardening below, and the log level of the
+            // `OrgSpecific` arm further down. The level is deliberately
+            // silent when this is true — the tag pass's own arm is
+            // `debug!` because a monitor watches its counter, so the
+            // marked case is already reported and an `info!` here would
+            // only duplicate it. So a marking the tag pass already
+            // reported leaves no info-level line at all, by design, and
+            // the counter is the record — a marking this pass reaches
+            // alone still logs, which is what the `info!` below is for.
+            // Keep that in view before reusing this flag for a third
+            // purpose that needs marking to be loud.
+            let tag_pass_marked_org_specific = org_specific_templates.contains(&template_name);
+            let reported_visibility = visibility;
+            let visibility = hardened_visibility(tag_pass_marked_org_specific, visibility);
+
+            // Visibility gate (template-level; see module docs). The
+            // verdict applies regardless of whether any releases came
+            // back — the response-level visibility field is exactly what
+            // keeps an org-specific verdict alive for a template whose
+            // releases are all gone, so its stale pins still drop.
+            match visibility {
+                TemplateVisibility::Generic => {}
+                TemplateVisibility::OrgSpecific => {
+                    // No `info!` at all in the case this event usually
+                    // takes: when the tag pass has already marked the
+                    // template — which it does whenever its own resolve
+                    // carried the visibility — the branch below is
+                    // `debug!`, and the tag pass's arm is `debug!` too, so
+                    // the counter is the whole record. That is the state
+                    // the monitor on `outcome:skipped_org_specific` is
+                    // calibrated on.
+                    //
+                    // The `info!` covers the cases where the tag pass
+                    // never marked the template: the tag lookup came back
+                    // `NotFound` — a deleted tag, or a template unknown
+                    // cluster-side (`Unresolved`) — or `resolve_tag`
+                    // errored, or it read `Generic` or `Unspecified` where
+                    // this pass reads `OrgSpecific`. At most one such line
+                    // per template per tick.
+                    //
+                    // Whether the tag metric sees any of them turns on one
+                    // thing: did the tuple reach the pull queue? Only a
+                    // queued tuple is suppressed at the drain, which is
+                    // the one path that records `skipped_org_specific`
+                    // against a verdict this pass reached alone. Every
+                    // other arm `continue`s first — `unresolved`,
+                    // `resolve_error`, `visibility_unknown`, `pin_error`
+                    // and `already_cached` — so for those the tag metric
+                    // carries whatever they recorded and never the
+                    // org-specific outcome.
+                    //
+                    // `already_cached` is the one to hold onto, because it
+                    // is the steady state on a node that is already
+                    // warmed: a stale `Generic` read on such a node
+                    // records `already_cached` and stops. The queued case
+                    // is the exception, not the rule.
+                    //
+                    // None of that leaves the event unrecorded, though —
+                    // this arm also emits `skipped_org_specific` on the
+                    // release counter below, and that `outcome` is
+                    // queryable. So the metric trail for these cases is
+                    // the release pass's, not the tag pass's, and the
+                    // `info!` is the part that names the template, which
+                    // the release counter cannot. A deleted tag
+                    // is the case this pass exists to cover and it does
+                    // not self-heal, which makes this arm the
+                    // steady-state emitter rather than the tag pass's;
+                    // note `resolve_tag`'s error outcome covers durable
+                    // codes too (`Unimplemented`, `PermissionDenied`),
+                    // not just blips.
+                    //
+                    // `tracing` needs a static level, so the two calls
+                    // are spelled out rather than parameterized.
+                    if tag_pass_marked_org_specific {
+                        debug!(
+                            template = %template_name,
+                            reported = ?reported_visibility,
+                            "prefetch: template is org-specific; skipping latest-N \
+                             warming and dropping its release and tag pins",
+                        );
+                    } else {
+                        info!(
+                            template = %template_name,
+                            reported = ?reported_visibility,
+                            "prefetch: template is org-specific; skipping latest-N \
+                             warming and dropping its release and tag pins",
+                        );
+                    }
+                    record_release_candidate(&template_name, "", "skipped_org_specific");
+                    // Drops BOTH pin kinds: the tag pass may not have
+                    // learned the visibility this tick (an org-specific
+                    // template whose configured tag was deleted resolves
+                    // `Unresolved` there), and a pin left from the
+                    // template's generic days would keep its rootfs
+                    // GC-protected on this node.
+                    mark_template_org_specific(
+                        tag_tuples,
+                        &mut org_specific_tag_tuples,
+                        &mut org_specific_templates,
+                        &template_name,
+                    );
                     continue;
                 }
-            };
-
-        // A verdict already accumulated this tick (the tag pass) wins
-        // over a stale or skewed generic latest-N read: without this,
-        // a mid-tick visibility flip could let the release loop below
-        // re-pin and even dispatch pulls for a template the tag pass
-        // confirmed org-specific — the final flush would drop the
-        // pins, but the rootfs would still have materialized.
-        //
-        // Whether the tag pass already marked this template
-        // org-specific. Two consumers, both wanting exactly that
-        // question: the hardening below, and the log level of the
-        // `OrgSpecific` arm further down. The level is deliberately
-        // silent when this is true — the tag pass's own arm is
-        // `debug!` because a monitor watches its counter, so the
-        // marked case is already reported and an `info!` here would
-        // only duplicate it. So a marking the tag pass already
-        // reported leaves no info-level line at all, by design, and
-        // the counter is the record — a marking this pass reaches
-        // alone still logs, which is what the `info!` below is for.
-        // Keep that in view before reusing this flag for a third
-        // purpose that needs marking to be loud.
-        let tag_pass_marked_org_specific = org_specific_templates.contains(&template_name);
-        let reported_visibility = visibility;
-        let visibility = hardened_visibility(tag_pass_marked_org_specific, visibility);
-
-        // Visibility gate (template-level; see module docs). The
-        // verdict applies regardless of whether any releases came
-        // back — the response-level visibility field is exactly what
-        // keeps an org-specific verdict alive for a template whose
-        // releases are all gone, so its stale pins still drop.
-        match visibility {
-            TemplateVisibility::Generic => {}
-            TemplateVisibility::OrgSpecific => {
-                // No `info!` at all in the case this event usually
-                // takes: when the tag pass has already marked the
-                // template — which it does whenever its own resolve
-                // carried the visibility — the branch below is
-                // `debug!`, and the tag pass's arm is `debug!` too, so
-                // the counter is the whole record. That is the state
-                // the monitor on `outcome:skipped_org_specific` is
-                // calibrated on.
-                //
-                // The `info!` covers the cases where the tag pass
-                // never marked the template: the tag lookup came back
-                // `NotFound` — a deleted tag, or a template unknown
-                // cluster-side (`Unresolved`) — or `resolve_tag`
-                // errored, or it read `Generic` or `Unspecified` where
-                // this pass reads `OrgSpecific`. At most one such line
-                // per template per tick.
-                //
-                // Whether the tag metric sees any of them turns on one
-                // thing: did the tuple reach the pull queue? Only a
-                // queued tuple is suppressed at the drain, which is
-                // the one path that records `skipped_org_specific`
-                // against a verdict this pass reached alone. Every
-                // other arm `continue`s first — `unresolved`,
-                // `resolve_error`, `visibility_unknown`, `pin_error`
-                // and `already_cached` — so for those the tag metric
-                // carries whatever they recorded and never the
-                // org-specific outcome.
-                //
-                // `already_cached` is the one to hold onto, because it
-                // is the steady state on a node that is already
-                // warmed: a stale `Generic` read on such a node
-                // records `already_cached` and stops. The queued case
-                // is the exception, not the rule.
-                //
-                // None of that leaves the event unrecorded, though —
-                // this arm also emits `skipped_org_specific` on the
-                // release counter below, and that `outcome` is
-                // queryable. So the metric trail for these cases is
-                // the release pass's, not the tag pass's, and the
-                // `info!` is the part that names the template, which
-                // the release counter cannot. A deleted tag
-                // is the case this pass exists to cover and it does
-                // not self-heal, which makes this arm the
-                // steady-state emitter rather than the tag pass's;
-                // note `resolve_tag`'s error outcome covers durable
-                // codes too (`Unimplemented`, `PermissionDenied`),
-                // not just blips.
-                //
-                // `tracing` needs a static level, so the two calls
-                // are spelled out rather than parameterized.
-                if tag_pass_marked_org_specific {
-                    debug!(
-                        template = %template_name,
-                        reported = ?reported_visibility,
-                        "prefetch: template is org-specific; skipping latest-N \
-                         warming and dropping its release and tag pins",
-                    );
-                } else {
-                    info!(
-                        template = %template_name,
-                        reported = ?reported_visibility,
-                        "prefetch: template is org-specific; skipping latest-N \
-                         warming and dropping its release and tag pins",
-                    );
+                TemplateVisibility::Unspecified => {
+                    // With zero entries this is also the old-server /
+                    // old-schema shape; fall through to the
+                    // long-standing empty-list behavior below (release
+                    // pins prune to {} — the cluster reports zero
+                    // registered releases, so no digest should be
+                    // release-pinned). Tag pins stay preserved either
+                    // way: unknown is not a verdict.
+                    if !releases.is_empty() {
+                        // `debug!` for the same bulk-reachability reason
+                        // as the tag pass's `Unspecified` arm, gated more
+                        // narrowly: the `!releases.is_empty()` check above
+                        // means a template with zero releases produces no
+                        // line here at all.
+                        debug!(
+                            template = %template_name,
+                            "prefetch: template visibility unknown; skipping latest-N \
+                             warming (existing release pins are preserved)",
+                        );
+                        record_release_candidate(&template_name, "", "visibility_unknown");
+                        continue;
+                    }
                 }
-                record_release_candidate(&template_name, "", "skipped_org_specific");
-                // Drops BOTH pin kinds: the tag pass may not have
-                // learned the visibility this tick (an org-specific
-                // template whose configured tag was deleted resolves
-                // `Unresolved` there), and a pin left from the
-                // template's generic days would keep its rootfs
-                // GC-protected on this node.
-                mark_template_org_specific(
-                    tag_tuples,
-                    &mut org_specific_tag_tuples,
-                    &mut org_specific_templates,
+            }
+
+            // Warming + release-pin management is latest-N's job; skip it
+            // when disabled. The org-specific pin-drop above has already
+            // run, so a `latest_n == 0` deploy still enforces isolation —
+            // it just doesn't manage the latest-N warm set (and must not
+            // prune existing release pins on the strength of a
+            // visibility-only limit=1 read).
+            if latest_n == 0 {
+                continue;
+            }
+
+            // Successful resolve (even empty) → this template is
+            // prune-eligible. An empty list narrows the pin set to
+            // {} for this template, which is the right behavior:
+            // if the cluster has zero registered releases, no digest
+            // should be release-pinned.
+            prunable_templates.push(template_name.clone());
+
+            for release in releases {
+                // Push the keep-entry BEFORE the upsert call. The
+                // prune-scope guard above protects against cluster-API
+                // failures by keeping the failing template out of
+                // `prunable_templates`; here we protect against a
+                // narrower failure mode: a transient *per-row*
+                // SQLite-upsert error must not flush the digest's
+                // pre-existing pin. The digest is still in the
+                // latest-N window cluster-side, and the metadata
+                // refresh (release_id, updated_at) can retry next
+                // tick — the keep-set's job is to tell the prune what
+                // the cluster says belongs in the window, not to
+                // record which local upserts happened to succeed
+                // this round.
+                release_pins_keep.push((template_name.clone(), release.content_hash.clone()));
+
+                if let Err(err) = spawn_blocking_store_op(pins.clone(), {
+                    let template_name = template_name.clone();
+                    let content_hash = release.content_hash.clone();
+                    let release_id = release.release_id.clone();
+                    let release_created_at = release.created_at.clone();
+                    move |s| {
+                        s.upsert_release(
+                            &template_name,
+                            &content_hash,
+                            &release_id,
+                            &release_created_at,
+                        )
+                    }
+                })
+                .await
+                {
+                    warn!(
+                        template = %template_name,
+                        hash = %release.content_hash,
+                        error = %err,
+                        "prefetch: release pin upsert failed; skipping dispatch for this release",
+                    );
+                    record_release_candidate(&template_name, &release.content_hash, "pin_error");
+                    continue;
+                }
+
+                let locally_cached =
+                    crate::volume::local_build_exists(&db, &template_name, &release.content_hash);
+                let decision = classify_release_dispatch(
+                    &dispatched_this_tick,
                     &template_name,
+                    &release.content_hash,
+                    locally_cached,
                 );
-                continue;
-            }
-            TemplateVisibility::Unspecified => {
-                // With zero entries this is also the old-server /
-                // old-schema shape; fall through to the
-                // long-standing empty-list behavior below (release
-                // pins prune to {} — the cluster reports zero
-                // registered releases, so no digest should be
-                // release-pinned). Tag pins stay preserved either
-                // way: unknown is not a verdict.
-                if !releases.is_empty() {
-                    // `debug!` for the same bulk-reachability reason
-                    // as the tag pass's `Unspecified` arm, gated more
-                    // narrowly: the `!releases.is_empty()` check above
-                    // means a template with zero releases produces no
-                    // line here at all.
-                    debug!(
-                        template = %template_name,
-                        "prefetch: template visibility unknown; skipping latest-N \
-                         warming (existing release pins are preserved)",
-                    );
-                    record_release_candidate(&template_name, "", "visibility_unknown");
-                    continue;
-                }
-            }
-        }
-
-        // Warming + release-pin management is latest-N's job; skip it
-        // when disabled. The org-specific pin-drop above has already
-        // run, so a `latest_n == 0` deploy still enforces isolation —
-        // it just doesn't manage the latest-N warm set (and must not
-        // prune existing release pins on the strength of a
-        // visibility-only limit=1 read).
-        if latest_n == 0 {
-            continue;
-        }
-
-        // Successful resolve (even empty) → this template is
-        // prune-eligible. An empty list narrows the pin set to
-        // {} for this template, which is the right behavior:
-        // if the cluster has zero registered releases, no digest
-        // should be release-pinned.
-        prunable_templates.push(template_name.clone());
-
-        for release in releases {
-            // Push the keep-entry BEFORE the upsert call. The
-            // prune-scope guard above protects against cluster-API
-            // failures by keeping the failing template out of
-            // `prunable_templates`; here we protect against a
-            // narrower failure mode: a transient *per-row*
-            // SQLite-upsert error must not flush the digest's
-            // pre-existing pin. The digest is still in the
-            // latest-N window cluster-side, and the metadata
-            // refresh (release_id, updated_at) can retry next
-            // tick — the keep-set's job is to tell the prune what
-            // the cluster says belongs in the window, not to
-            // record which local upserts happened to succeed
-            // this round.
-            release_pins_keep.push((template_name.clone(), release.content_hash.clone()));
-
-            if let Err(err) = spawn_blocking_store_op(pins.clone(), {
-                let template_name = template_name.clone();
-                let content_hash = release.content_hash.clone();
-                let release_id = release.release_id.clone();
-                let release_created_at = release.created_at.clone();
-                move |s| {
-                    s.upsert_release(
-                        &template_name,
-                        &content_hash,
-                        &release_id,
-                        &release_created_at,
-                    )
-                }
-            })
-            .await
-            {
-                warn!(
-                    template = %template_name,
-                    hash = %release.content_hash,
-                    error = %err,
-                    "prefetch: release pin upsert failed; skipping dispatch for this release",
-                );
-                record_release_candidate(&template_name, &release.content_hash, "pin_error");
-                continue;
-            }
-
-            let locally_cached =
-                crate::volume::local_build_exists(&db, &template_name, &release.content_hash);
-            let decision = classify_release_dispatch(
-                &dispatched_this_tick,
-                &template_name,
-                &release.content_hash,
-                locally_cached,
-            );
-            match decision {
-                ReleaseDispatchDecision::CoalescedWithTag => {
-                    record_release_candidate(
-                        &template_name,
-                        &release.content_hash,
-                        "coalesced_with_tag",
-                    );
-                }
-                ReleaseDispatchDecision::AlreadyCached => {
-                    record_release_candidate(
-                        &template_name,
-                        &release.content_hash,
-                        "already_cached",
-                    );
-                }
-                ReleaseDispatchDecision::Dispatch => {
-                    record_release_candidate(&template_name, &release.content_hash, "dispatched");
-                    dispatched_this_tick
-                        .insert((template_name.clone(), release.content_hash.clone()));
-                    // Queued rather than dispatched so the single
-                    // drain below can bias toward tag pulls. Spawning
-                    // here would put a cold node's ~20 older-release
-                    // pulls entirely ahead of the 5 tag digests that
-                    // on-demand creates actually resolve to; queueing
-                    // reduces that to whatever the scheduler's LIFO
-                    // slot reorders. See the drain for why that is a
-                    // bias and not a guarantee.
-                    pending_release_pulls.push((template_name.clone(), release.content_hash));
+                match decision {
+                    ReleaseDispatchDecision::CoalescedWithTag => {
+                        record_release_candidate(
+                            &template_name,
+                            &release.content_hash,
+                            "coalesced_with_tag",
+                        );
+                    }
+                    ReleaseDispatchDecision::AlreadyCached => {
+                        record_release_candidate(
+                            &template_name,
+                            &release.content_hash,
+                            "already_cached",
+                        );
+                    }
+                    ReleaseDispatchDecision::Dispatch => {
+                        record_release_candidate(
+                            &template_name,
+                            &release.content_hash,
+                            "dispatched",
+                        );
+                        dispatched_this_tick
+                            .insert((template_name.clone(), release.content_hash.clone()));
+                        // Queued rather than dispatched so the single
+                        // drain below can bias toward tag pulls. Spawning
+                        // here would put a cold node's ~20 older-release
+                        // pulls entirely ahead of the 5 tag digests that
+                        // on-demand creates actually resolve to; queueing
+                        // reduces that to whatever the scheduler's LIFO
+                        // slot reorders. See the drain for why that is a
+                        // bias and not a guarantee.
+                        pending_release_pulls.push((template_name.clone(), release.content_hash));
+                    }
                 }
             }
         }
@@ -1181,17 +1137,16 @@ async fn tick(
     // Prune `template_pinned_releases` rows for the templates that
     // successfully resolved this tick. Templates whose
     // ListLatestTemplateReleases call failed are intentionally NOT in
-    // `prunable_templates` — preserve their last-known pin set. A
-    // template no longer in the allowlist is outside that scoping
-    // altogether, so its release pins drop here regardless of whether
-    // anything resolved.
-    let configured_templates = unique_prefetch_templates(tag_tuples);
-    let release_prune = spawn_blocking_store_op(pins.clone(), move |s| {
-        s.prune_release_templates_outside(&configured_templates)?;
-        s.prune_releases_outside(&prunable_templates, &release_pins_keep)
-    })
-    .await
-    .map_err(|e| format!("prune pinned releases: {e}"));
+    // `prunable_templates` — preserve their last-known pin set.
+    let release_prune = if prunable_templates.is_empty() {
+        Ok(())
+    } else {
+        spawn_blocking_store_op(pins.clone(), move |s| {
+            s.prune_releases_outside(&prunable_templates, &release_pins_keep)
+        })
+        .await
+        .map_err(|e| format!("prune pinned releases: {e}"))
+    };
 
     combine_prune_errors(tag_prune, release_prune)
 }

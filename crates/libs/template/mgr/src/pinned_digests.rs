@@ -231,27 +231,6 @@ impl PinnedDigestsStore {
         Ok(())
     }
 
-    /// Delete every release-pin row whose template is not in
-    /// `configured`, the templates the prefetch allowlist names. The
-    /// tick's [`Self::prune_releases_outside`] only touches templates it
-    /// resolved, so without this a template removed from the allowlist
-    /// would keep its latest-N digests out of eviction indefinitely. An
-    /// empty `configured` drops every release pin.
-    pub fn prune_release_templates_outside(&self, configured: &[String]) -> Result<usize> {
-        let conn = self.lock_conn()?;
-        if configured.is_empty() {
-            return conn.execute("DELETE FROM template_pinned_releases", []);
-        }
-        let placeholders = (1..=configured.len())
-            .map(|i| format!("?{i}"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        conn.execute(
-            &format!("DELETE FROM template_pinned_releases WHERE name NOT IN ({placeholders})"),
-            rusqlite::params_from_iter(configured),
-        )
-    }
-
     /// Distinct content hashes pinned for `name` by any tag pin or
     /// any release pin. Future GC pass joins against this to decide
     /// what not to evict. The UNION dedupes the (common) case where
