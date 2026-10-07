@@ -1,0 +1,22 @@
+flowchart TB
+  client([Client: POST /files]):::ext
+  route["resolve_ecw_envd_route<br/>authenticate + resolve sandbox route"]:::old
+  header["Header phase (no body read)<br/>username · Content-Type · path / boundary<br/>declared Content-Length vs body limit"]:::new
+  bad[["400 / 413<br/>never waits for a permit"]]:::reject
+  admit{"UploadAdmission::admit<br/>1 slot of 64 · reserve declared length<br/>(or 256 MiB / 1 MiB JSON) of 1 GiB<br/>both waits share one 2 s deadline"}:::new
+  busy[["429 + Retry-After 1–5 s (jittered)<br/>data_plane.upload.rejected{reason}<br/>never 503"]]:::reject
+  body["Body phase, permit held<br/>mkdir parent · spool to disk (octet-stream, multipart)<br/>or buffer ≤ 1 MiB (JSON) · write to guest"]:::old
+  ok([200 written]):::ext
+  drop["Handler returns → permit dropped<br/>slot and bytes released"]:::new
+
+  client --> route --> header
+  header -- invalid --> bad
+  header -- valid --> admit
+  admit -- "no slot or bytes by deadline" --> busy
+  admit -- admitted --> body --> ok
+  body --> drop
+
+  classDef ext fill:#eef2ff,stroke:#4f46e5,color:#1e1b4b
+  classDef old fill:#f1f5f9,stroke:#64748b,color:#0f172a
+  classDef new fill:#ecfdf5,stroke:#059669,color:#064e3b
+  classDef reject fill:#fef2f2,stroke:#dc2626,color:#7f1d1d
