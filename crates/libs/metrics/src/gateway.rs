@@ -716,8 +716,9 @@ pub fn tls_handshake_in_flight(leg: &str, active: usize, capacity: usize) {
     );
 }
 
-/// One handshake admission decision. `result` is `immediate`, `queued`, or
-/// `saturated` (the pool stayed full for the complete wait).
+/// One handshake admission decision. `result` is `immediate`, `queued`,
+/// `saturated` (the pool stayed full for the complete wait), or `closed`
+/// (the gateway is shutting down).
 pub fn tls_handshake_admission(leg: &str, result: &str) {
     counter(
         "gateway.tls.handshake.admission",

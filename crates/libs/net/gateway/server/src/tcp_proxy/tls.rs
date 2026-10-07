@@ -20,7 +20,7 @@ use super::{TcpProxy, relay, tls_http};
 use crate::certificates::{CertificateError, CertificateLease};
 use crate::stats::ProxyStats;
 use crate::tls_interception::{
-    Admission, HandshakePermit, Saturated, TlsHandshakeLeg, TlsInterception, TlsInterceptionError,
+    Admission, HandshakePermit, Refused, TlsHandshakeLeg, TlsInterception, TlsInterceptionError,
 };
 use crate::tls_sni::{ClientAlpnOffer, HttpAlpn};
 
@@ -621,7 +621,8 @@ where
 
 /// Admit one handshake into the shared pool. A queued admission is recorded on
 /// the current span. A pool that stays full fails as `tls_capacity`, the same
-/// outcome that an immediate refusal reported before queueing existed.
+/// outcome that an immediate refusal reported before queueing existed. A pool
+/// closed by gateway shutdown fails as `tls_withdrawn`.
 async fn admit_handshake(
     interception: &TlsInterception,
     leg: TlsHandshakeLeg,
@@ -640,9 +641,13 @@ async fn admit_handshake(
             }
             Ok(permit)
         }
-        Err(Saturated { .. }) => {
-            HandshakeAttempt::record_failure(leg, &TlsTransportError::Capacity);
-            Err(TlsTransportError::Capacity)
+        Err(refused) => {
+            let error = match refused {
+                Refused::Saturated { .. } => TlsTransportError::Capacity,
+                Refused::Closed => TlsTransportError::Withdrawn,
+            };
+            HandshakeAttempt::record_failure(leg, &error);
+            Err(error)
         }
     }
 }

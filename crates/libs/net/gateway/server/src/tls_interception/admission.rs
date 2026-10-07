@@ -15,6 +15,9 @@
 //! caller's handshake deadline and [`MAX_QUEUE_WAIT`]. The TCP admission
 //! budget bounds the number of waiters, because each waiter owns an admitted
 //! connection.
+//!
+//! The gateway closes the pool when it shuts down. Queued and later callers
+//! then fail at once with [`Refused::Closed`] instead of waiting.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -54,6 +57,10 @@ struct PerLeg {
 }
 
 impl PerLeg {
+    fn total(&self) -> usize {
+        self.client_to_netgw.load(Ordering::Relaxed) + self.netgw_to_origin.load(Ordering::Relaxed)
+    }
+
     const fn get(&self, leg: TlsHandshakeLeg) -> &AtomicUsize {
         match leg {
             TlsHandshakeLeg::ClientToNetgw => &self.client_to_netgw,
@@ -80,11 +87,15 @@ impl Admission {
     }
 }
 
-/// The pool stayed full for the complete wait.
+/// Why a handshake was not admitted.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
-#[error("TLS handshake capacity stayed exhausted for {waited:?}")]
-pub(crate) struct Saturated {
-    pub(crate) waited: Duration,
+pub(crate) enum Refused {
+    /// The pool stayed full for the complete wait.
+    #[error("TLS handshake capacity stayed exhausted for {waited:?}")]
+    Saturated { waited: Duration },
+    /// The gateway is shutting down and admits no more handshakes.
+    #[error("TLS handshake admission is closed")]
+    Closed,
 }
 
 /// Cloning shares the same pool.
@@ -120,6 +131,12 @@ impl HandshakeAdmission {
         }
     }
 
+    /// Stop admitting handshakes. Queued callers wake with
+    /// [`Refused::Closed`]. Permits already issued stay valid until dropped.
+    pub(crate) fn close(&self) {
+        self.pool.permits.close();
+    }
+
     /// Wait for a permit until `deadline` or the queue limit, whichever is
     /// earlier. The caller keeps the permit for the handshake and drops it
     /// when the handshake ends, on success, failure or cancellation.
@@ -130,20 +147,19 @@ impl HandshakeAdmission {
         &self,
         leg: TlsHandshakeLeg,
         deadline: Instant,
-    ) -> Result<HandshakePermit, Saturated> {
-        let permit = match Arc::clone(&self.pool.permits).try_acquire_owned() {
-            Ok(permit) => permit,
-            Err(TryAcquireError::NoPermits) => return self.wait(leg, deadline).await,
-            Err(TryAcquireError::Closed) => unreachable!("the handshake pool is never closed"),
-        };
-        Ok(self.issue(leg, permit, Admission::Immediate))
+    ) -> Result<HandshakePermit, Refused> {
+        match Arc::clone(&self.pool.permits).try_acquire_owned() {
+            Ok(permit) => Ok(self.issue(leg, permit, Admission::Immediate)),
+            Err(TryAcquireError::NoPermits) => self.wait(leg, deadline).await,
+            Err(TryAcquireError::Closed) => Err(self.refuse(leg, Refused::Closed)),
+        }
     }
 
     async fn wait(
         &self,
         leg: TlsHandshakeLeg,
         deadline: Instant,
-    ) -> Result<HandshakePermit, Saturated> {
+    ) -> Result<HandshakePermit, Refused> {
         let started = Instant::now();
         let stop = deadline.min(started + self.pool.max_wait);
         let acquired = {
@@ -153,18 +169,22 @@ impl HandshakeAdmission {
         let waited = started.elapsed();
         match acquired {
             Ok(Ok(permit)) => Ok(self.issue(leg, permit, Admission::Queued { waited })),
-            Ok(Err(_closed)) => unreachable!("the handshake pool is never closed"),
+            Ok(Err(_closed)) => Err(self.refuse(leg, Refused::Closed)),
             Err(_elapsed) => {
-                pplx_space_metrics::gateway::tls_handshake_admission(leg.as_str(), "saturated");
                 pplx_space_metrics::gateway::tls_handshake_admission_wait_ms(
                     leg.as_str(),
                     "saturated",
                     millis(waited),
                 );
-                self.pool.record_in_flight(leg);
-                Err(Saturated { waited })
+                Err(self.refuse(leg, Refused::Saturated { waited }))
             }
         }
+    }
+
+    fn refuse(&self, leg: TlsHandshakeLeg, refused: Refused) -> Refused {
+        pplx_space_metrics::gateway::tls_handshake_admission(leg.as_str(), refused.as_str());
+        self.pool.record_in_flight(leg);
+        refused
     }
 
     fn issue(
@@ -184,21 +204,20 @@ impl HandshakeAdmission {
         }
         self.pool.record_in_flight(leg);
         HandshakePermit {
-            permit: Some(permit),
             pool: Arc::clone(&self.pool),
             leg,
             admission,
+            _permit: permit,
         }
     }
+}
 
-    #[cfg(test)]
-    pub(crate) fn in_flight(&self, leg: TlsHandshakeLeg) -> usize {
-        self.pool.active.get(leg).load(Ordering::Relaxed)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn queued(&self, leg: TlsHandshakeLeg) -> usize {
-        self.pool.queued.get(leg).load(Ordering::Relaxed)
+impl Refused {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Saturated { .. } => "saturated",
+            Self::Closed => "closed",
+        }
     }
 }
 
@@ -206,7 +225,7 @@ impl Pool {
     fn record_in_flight(&self, leg: TlsHandshakeLeg) {
         pplx_space_metrics::gateway::tls_handshake_in_flight(
             "shared",
-            self.limit - self.permits.available_permits(),
+            self.active.total(),
             self.limit,
         );
         pplx_space_metrics::gateway::tls_handshake_in_flight(
@@ -251,10 +270,11 @@ impl Drop for QueuedGuard<'_> {
 
 /// One admitted handshake. Dropping it returns the permit to the pool.
 pub(crate) struct HandshakePermit {
-    permit: Option<OwnedSemaphorePermit>,
     pool: Arc<Pool>,
     leg: TlsHandshakeLeg,
     admission: Admission,
+    // Released by the field drop that follows `Drop::drop`.
+    _permit: OwnedSemaphorePermit,
 }
 
 impl HandshakePermit {
@@ -278,7 +298,6 @@ impl Drop for HandshakePermit {
             .active
             .get(self.leg)
             .fetch_sub(1, Ordering::Relaxed);
-        drop(self.permit.take());
         self.pool.record_in_flight(self.leg);
     }
 }

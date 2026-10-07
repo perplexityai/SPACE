@@ -9,11 +9,11 @@ use crate::certificates::{CERTIFICATE_REQUEST_BACKSTOP, CertificateLease};
 use crate::sniff::MissingSniDetail;
 use crate::tls_sni::{ClientHelloScan, HttpAlpn};
 
-mod handshake_admission;
+mod admission;
 
 pub use crate::certificates::CertificateRequester;
-use handshake_admission::HandshakeAdmission;
-pub(crate) use handshake_admission::{Admission, HandshakePermit, Saturated, TlsHandshakeLeg};
+use admission::HandshakeAdmission;
+pub(crate) use admission::{Admission, HandshakePermit, Refused, TlsHandshakeLeg};
 
 #[derive(Clone, Default)]
 pub struct TlsInterception {
@@ -82,13 +82,19 @@ impl TlsInterception {
     }
 
     /// Admit one handshake on `leg`, queueing behind a full pool until
-    /// `deadline` at most. See [`handshake_admission`] for what the pool bounds.
+    /// `deadline` at most. See [`admission`] for what the pool bounds.
     pub(crate) async fn admit_handshake(
         &self,
         leg: TlsHandshakeLeg,
         deadline: Instant,
-    ) -> Result<HandshakePermit, Saturated> {
+    ) -> Result<HandshakePermit, Refused> {
         self.upstream.handshakes.admit(leg, deadline).await
+    }
+
+    /// Stop admitting TLS handshakes at gateway shutdown. Queued handshakes
+    /// fail at once instead of waiting for capacity.
+    pub(crate) fn close_handshakes(&self) {
+        self.upstream.handshakes.close();
     }
 
     /// Called only after TCP policy admission. The admitted policy generation
