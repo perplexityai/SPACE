@@ -480,8 +480,9 @@ spec:
             # Snapshot upload destination read by sandbox-manager's
             # SnapshotUploadConfig::from_env (the suspend artifact-backup path).
             # Without these, suspend keeps snapshots local-only and never pushes
-            # to the object store. Static creds are the SPACE_OBJECT_STORE_STATIC_* pair
-            # above.
+            # to the object store. Volume-manager performs the transfer with the
+            # SPACE_OBJECT_STORE_STATIC_* pair above; the entrypoint passes that
+            # pair only to volume-manager and build-manager.
             - name: SPACE_SNAPSHOT_BUCKET
               value: {{ .Values.s3.bucket | quote }}
             - name: SPACE_SNAPSHOT_REGION
