@@ -447,7 +447,11 @@ async fn resolve_process_account(
                 .try_acquire_many_owned(
                     pplx_space_spaced_common::process_limits::START_PAYLOAD_SLOTS,
                 )
-                .map_err(|_| Status::resource_exhausted("payload request capacity exhausted"))?,
+                .map_err(|_| {
+                    crate::refused(Status::resource_exhausted(
+                        "payload request capacity exhausted",
+                    ))
+                })?,
         },
     };
     // NSS may block on external account providers. Keep the existing Start
@@ -1269,7 +1273,9 @@ impl ProcessRegistry {
                     });
                 }
                 Err(TryAcquireError::Closed) => {
-                    return Err(Status::unavailable("process registry is closed"));
+                    return Err(crate::refused(Status::unavailable(
+                        "process registry is closed",
+                    )));
                 }
                 Err(TryAcquireError::NoPermits) => {}
             }
@@ -1286,7 +1292,9 @@ impl ProcessRegistry {
                 })
                 .min_by_key(|(_, completed_at)| *completed_at);
             let Some((process_id, _)) = completed else {
-                return Err(Status::resource_exhausted(PROCESS_CAPACITY_MESSAGE));
+                return Err(crate::refused(Status::resource_exhausted(
+                    PROCESS_CAPACITY_MESSAGE,
+                )));
             };
             self.records.remove(&process_id);
         }
@@ -1891,7 +1899,9 @@ impl Process for SpacedGuestService {
         // Before the start begins: a refused thread ends this start with its
         // key released, so a retry with the same key can succeed.
         let spawn_thread = SpawnThread::start().map_err(|error| {
-            Status::unavailable(format!("cannot start a process spawn thread: {error}"))
+            crate::refused(Status::unavailable(format!(
+                "cannot start a process spawn thread: {error}"
+            )))
         })?;
 
         // Cancellation while waiting for admission has no effect to replay:

@@ -333,9 +333,9 @@ impl WorkerPool {
                         let Some(evict) = evict else {
                             drop(workers);
                             Self::stop_workers(workers_to_stop);
-                            return Err(Status::resource_exhausted(
+                            return Err(crate::refused(Status::resource_exhausted(
                                 "too many active filesystem identity workers",
-                            ));
+                            )));
                         };
                         if let Some(WorkerEntry::Resident(worker)) = workers.remove(&evict) {
                             workers_to_stop.push(worker.client);
@@ -588,14 +588,16 @@ impl WorkerPool {
 
     async fn spawn_worker(&self, user: &GuestUserName) -> Result<WorkerClient, Status> {
         if self.shutdown.is_cancelled() {
-            return Err(Status::unavailable("guest shutting down"));
+            return Err(crate::refused(Status::unavailable("guest shutting down")));
         }
         let process_slot = self
             .process_slots
             .clone()
             .try_acquire_owned()
             .map_err(|_| {
-                Status::resource_exhausted("identity workers still running or terminating")
+                crate::refused(Status::resource_exhausted(
+                    "identity workers still running or terminating",
+                ))
             })?;
         let lookup_user = user.clone();
         let process_slot = tokio::task::spawn_blocking(move || {

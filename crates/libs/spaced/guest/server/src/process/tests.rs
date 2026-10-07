@@ -482,6 +482,8 @@ fn process_registry_bounds_retained_records() {
         Err(error) => error,
     };
     assert_eq!(error.code(), tonic::Code::ResourceExhausted);
+    // Nothing started: the caller is told it may retry.
+    assert!(pplx_space_common_grpc::is_refused_before_start(&error));
 
     reservations.pop();
     registry
@@ -843,7 +845,9 @@ async fn cancelled_account_lookup_retains_admission_until_nss_returns() {
     })
     .await;
     release_tx.send(()).unwrap();
-    assert_eq!(retry.unwrap_err().code(), tonic::Code::ResourceExhausted);
+    let retry = retry.unwrap_err();
+    assert_eq!(retry.code(), tonic::Code::ResourceExhausted);
+    assert!(pplx_space_common_grpc::is_refused_before_start(&retry));
     drop(
         tokio::time::timeout(Duration::from_secs(1), slots.acquire())
             .await

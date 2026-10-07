@@ -48,10 +48,11 @@ impl LocalBudget {
     }
 
     fn admit(&self) -> Result<tokio::sync::OwnedSemaphorePermit, Status> {
-        let permit =
-            self.slots.clone().try_acquire_owned().map_err(|_| {
-                Status::resource_exhausted("local metadata request capacity exhausted")
-            })?;
+        let permit = self.slots.clone().try_acquire_owned().map_err(|_| {
+            crate::refused(Status::resource_exhausted(
+                "local metadata request capacity exhausted",
+            ))
+        })?;
         let mut arrivals = self
             .arrivals
             .lock()
@@ -64,9 +65,9 @@ impl LocalBudget {
             arrivals.pop_front();
         }
         if arrivals.len() >= self.rate {
-            return Err(Status::resource_exhausted(
+            return Err(crate::refused(Status::resource_exhausted(
                 "local metadata request rate exhausted",
-            ));
+            )));
         }
         arrivals.push_back(now);
         Ok(permit)

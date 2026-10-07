@@ -124,9 +124,9 @@ impl IdempotencyStore {
         // request cancellation, bounding waiters that do not consume records.
         let _lookup_permit = self.lookup_slots.clone().try_acquire_owned().map_err(|_| {
             self.record_lookup_rejection();
-            Status::resource_exhausted(
+            crate::refused(Status::resource_exhausted(
                 "too many concurrent idempotency lookups; retry with backoff",
-            )
+            ))
         })?;
         loop {
             let notify = {
@@ -178,9 +178,9 @@ impl IdempotencyStore {
                             let key_bytes = state.key_bytes;
                             drop(state);
                             self.record_capacity_rejection(entries, key_bytes);
-                            return Err(Status::resource_exhausted(
+                            return Err(crate::refused(Status::resource_exhausted(
                                 "idempotency store capacity exhausted; retry after existing keys expire",
-                            ));
+                            )));
                         }
                         let generation = Arc::new(Notify::new());
                         state.insert(

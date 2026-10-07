@@ -739,3 +739,59 @@ fn client_connect_failure_requires_a_local_error_chain() {
         "error trying to connect: Connection refused"
     )));
 }
+
+// A refusal made before the request started carries a retry hint for the
+// caller. Neither retry path loops on it, even when the policy would accept
+// the hint and the caller's own predicate would retry the code.
+#[tokio::test]
+async fn refusals_before_start_are_never_retried_by_either_retry_path() {
+    let accepts_hint = GrpcRetryPolicy {
+        max_server_retry_after: Duration::from_secs(2),
+        ..test_policy()
+    };
+    for code in [Code::ResourceExhausted, Code::Unavailable] {
+        let refused = || {
+            pplx_space_common_grpc::refused_before_start(
+                Status::new(code, "synthetic refusal"),
+                Duration::from_millis(1),
+            )
+        };
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_for_call = Arc::clone(&attempts);
+        let status = retry_grpc_status_with_context_if(
+            "test",
+            "Process.Start",
+            accepts_hint,
+            GrpcRetryContext::none(),
+            |_| true,
+            move || {
+                let attempts = Arc::clone(&attempts_for_call);
+                async move {
+                    attempts.fetch_add(1, Ordering::SeqCst);
+                    Err::<(), _>(refused())
+                }
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(status.code(), code);
+        assert_eq!(attempts.load(Ordering::SeqCst), 1, "{code:?}");
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut client = GrpcClient::new("fake", || async { Ok::<_, &'static str>(()) })
+            .with_retry_policy(accepts_hint);
+        let calls_for_client = Arc::clone(&calls);
+        let status = client
+            .call("Call", GrpcRetryContext::none(), move |()| {
+                let calls = Arc::clone(&calls_for_client);
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Err::<(), _>(refused())
+                }
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(status.code(), code);
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "{code:?}");
+    }
+}

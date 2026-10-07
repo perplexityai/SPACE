@@ -46,6 +46,7 @@ async fn idempotency_store_rejects_new_keys_at_record_limit() {
         Err(error) => error,
     };
     assert_eq!(error.code(), tonic::Code::ResourceExhausted);
+    assert!(pplx_space_common_grpc::is_refused_before_start(&error));
 }
 
 #[test]
@@ -394,6 +395,7 @@ async fn duplicate_waiters_are_bounded_and_release_slots() {
         Err(error) => error,
     };
     assert_eq!(error.code(), tonic::Code::ResourceExhausted);
+    assert!(pplx_space_common_grpc::is_refused_before_start(&error));
 
     waiter.abort();
     let _ = waiter.await;

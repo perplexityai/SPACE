@@ -99,11 +99,11 @@ impl Operations {
             return Ok(Lookup::New(Reservation { claim: None }));
         };
         let key = (user, key);
-        let _waiter = self
-            .waiters
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| Status::resource_exhausted("too many filesystem retry waiters"))?;
+        let _waiter = self.waiters.clone().try_acquire_owned().map_err(|_| {
+            crate::refused(Status::resource_exhausted(
+                "too many filesystem retry waiters",
+            ))
+        })?;
         let deadline = tokio::time::Instant::now() + RETENTION;
         loop {
             let notification = {
@@ -159,9 +159,9 @@ impl Operations {
                             );
                             state.last_capacity_warning = Some(Instant::now());
                         }
-                        return Err(Status::resource_exhausted(
+                        return Err(crate::refused(Status::resource_exhausted(
                             "filesystem retry capacity exhausted",
-                        ));
+                        )));
                     }
                     let generation = Arc::new(Notify::new());
                     state.bytes += key_bytes(&key);
@@ -304,6 +304,11 @@ fn failure_status(failure: OperationFailure) -> Status {
             pplx_space_common_core::spaced::ERROR_REASON_METADATA_KEY,
             reason,
         );
+    }
+    // The reason survives the worker round trip but the retry hint does not;
+    // a refusal gets its hint back, so it reaches the caller whole.
+    if pplx_space_common_grpc::is_refused_before_start(&status) {
+        return crate::refused(status);
     }
     status
 }

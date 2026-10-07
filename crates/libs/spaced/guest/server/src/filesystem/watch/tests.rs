@@ -345,6 +345,7 @@ async fn watch_managers_do_not_share_a_directory_scan_budget() {
         .await
         .expect_err("busy manager refuses a recursive watch");
     assert_eq!(refused.code(), tonic::Code::ResourceExhausted);
+    assert!(pplx_space_common_grpc::is_refused_before_start(&refused));
 
     let other = WatchManager::new(CancellationToken::new());
     other

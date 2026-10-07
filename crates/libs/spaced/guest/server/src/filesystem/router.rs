@@ -201,7 +201,7 @@ impl FilesystemRouter {
 
     async fn executor(&self, user: GuestUserName) -> Result<Executor, Status> {
         if self.shutdown.is_cancelled() {
-            return Err(Status::unavailable("guest shutting down"));
+            return Err(crate::refused(Status::unavailable("guest shutting down")));
         }
         match &self.backend {
             Backend::Direct(service) => {
@@ -279,7 +279,11 @@ impl FilesystemRouter {
         self.execution_slots
             .clone()
             .try_acquire_owned()
-            .map_err(|_| Status::resource_exhausted("too many guest filesystem executions"))
+            .map_err(|_| {
+                crate::refused(Status::resource_exhausted(
+                    "too many guest filesystem executions",
+                ))
+            })
     }
 
     async fn mutate(
@@ -769,14 +773,16 @@ impl FilesystemRouter {
         call: impl std::future::Future<Output = Result<Response<T>, Status>> + Send + 'static,
     ) -> Result<Response<T>, Status> {
         if self.shutdown.is_cancelled() {
-            return Err(Status::unavailable("guest shutting down"));
+            return Err(crate::refused(Status::unavailable("guest shutting down")));
         }
         let permit = worker
             .ledger_update_slot
             .clone()
             .try_acquire_owned()
             .map_err(|_| {
-                Status::resource_exhausted("file-change update in progress; retry with backoff")
+                crate::refused(Status::resource_exhausted(
+                    "file-change update in progress; retry with backoff",
+                ))
             })?;
         let new_identity = if enabled {
             let mut evidence = self.ledger_evidence.lock().await;
@@ -787,9 +793,9 @@ impl FilesystemRouter {
             }
             if !evidence.contains_key(&worker.user) {
                 if evidence.len() >= MAX_LEDGER_IDENTITIES {
-                    return Err(Status::resource_exhausted(
+                    return Err(crate::refused(Status::resource_exhausted(
                         "file-change identity capacity exhausted; reenable then disable an abandoned ledger",
-                    ));
+                    )));
                 }
                 evidence.insert(worker.user.clone(), LedgerEvidence::Tracking);
                 true
@@ -1170,7 +1176,7 @@ impl Filesystem for FilesystemRouter {
             Backend::Workers(_) => {
                 self.prune_watcher_routes().await;
                 let slot = self.watcher_slots.clone().try_acquire_owned()
-                    .map_err(|_| Status::resource_exhausted("watcher route capacity exhausted; remove a watcher or retry after expiry"))?;
+                    .map_err(|_| crate::refused(Status::resource_exhausted("watcher route capacity exhausted; remove a watcher or retry after expiry")))?;
                 let mut request = request.into_inner();
                 let worker = self.worker(request.user.take()).await?;
                 let mut client = worker.client.clone();
@@ -1321,9 +1327,9 @@ impl Filesystem for FilesystemRouter {
                     .clone()
                     .try_acquire_owned()
                     .map_err(|_| {
-                        Status::resource_exhausted(
+                        crate::refused(Status::resource_exhausted(
                             "file-change update in progress; retry with backoff",
-                        )
+                        ))
                     })?;
                 let mut client = worker.client.clone();
                 let result = client.get_modified_files(request).await;

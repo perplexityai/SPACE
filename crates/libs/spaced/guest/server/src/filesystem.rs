@@ -142,7 +142,9 @@ impl FilesystemWorkerService {
 
     async fn acquire_file_operation_slot(&self) -> Result<OwnedSemaphorePermit, Status> {
         self.operation_admission.acquire(1).await.ok_or_else(|| {
-            Status::resource_exhausted("too many concurrent filesystem file operations")
+            crate::refused(Status::resource_exhausted(
+                "too many concurrent filesystem file operations",
+            ))
         })
     }
 

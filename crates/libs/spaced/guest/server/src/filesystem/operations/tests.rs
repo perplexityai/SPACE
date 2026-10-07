@@ -167,8 +167,9 @@ async fn capacity_preserves_active_and_unexpired_terminal_records() {
         reservation.dispatch().complete(Err(unknown_outcome()));
     }
     let extra = Some(IdempotencyKey::parse("extra").expect("key"));
+    // Nothing is recorded for the refused key: the caller may retry it.
     assert!(
-        matches!(store.reserve(identity("root"), extra.clone(), Kind::Write).await, Err(status) if status.code() == tonic::Code::ResourceExhausted)
+        matches!(store.reserve(identity("root"), extra.clone(), Kind::Write).await, Err(status) if status.code() == tonic::Code::ResourceExhausted && pplx_space_common_grpc::is_refused_before_start(&status))
     );
     {
         let mut state = store.state.lock().expect("state");
@@ -237,4 +238,30 @@ async fn poisoned_accounting_preserves_settled_and_active_retry_fences() {
             Lookup::New(_)
         ));
     }
+}
+
+// A refusal relayed from a worker keeps its marker and gets its retry hint
+// back; a validation failure rejected before execution is not a refusal.
+#[test]
+fn relayed_refusals_keep_their_marker_and_retry_hint() {
+    let refused = crate::refused(tonic::Status::resource_exhausted(
+        "too many concurrent filesystem file operations",
+    ));
+    let status = checked_outcome(MutationResult {
+        outcome: Some(mutation_result::Outcome::RejectedBeforeExecution(
+            operation_failure(&refused),
+        )),
+    })
+    .expect_err("refusal");
+    assert!(pplx_space_common_grpc::is_refused_before_start(&status));
+    assert!(pplx_space_common_grpc::retry_after(&status).is_some());
+
+    let invalid = checked_outcome(MutationResult {
+        outcome: Some(mutation_result::Outcome::RejectedBeforeExecution(
+            operation_failure(&tonic::Status::invalid_argument("bad path")),
+        )),
+    })
+    .expect_err("validation failure");
+    assert!(!pplx_space_common_grpc::is_refused_before_start(&invalid));
+    assert!(pplx_space_common_grpc::retry_after(&invalid).is_none());
 }
