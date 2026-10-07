@@ -843,6 +843,25 @@ async fn tenant_publication_requires_an_authorized_build_scenario() -> TestResul
     .await?;
     assert_eq!(created, 0);
 
+    // Removing the pinned builder must revoke its grant, not let another builder use it.
+    sqlx::query(sql!("DELETE FROM nodes WHERE id = $1"))
+        .bind(other_builder)
+        .execute(&pool)
+        .await?;
+    assert_eq!(
+        publish_as_build_manager(
+            client,
+            "tenant-out",
+            tenant,
+            'a',
+            Some(wrong_builder.to_string()),
+        )
+        .await,
+        denied
+    );
+    assert!(!tenant_publication_grant_exists(&pool, wrong_builder).await?);
+    assert!(tenant_publication_grant_exists(&pool, grant).await?);
+
     // The build's own grant publishes, before the API has pinned it.
     // Registering the template leaves it for the release, which consumes it.
     client
