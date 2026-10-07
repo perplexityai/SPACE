@@ -112,6 +112,7 @@ const RO_COLUMN_DENYLIST: &[(&str, &[&str])] = &[
     ("data_plane_sessions", &["token_hash"]),
     ("sandbox_federated_service_grants", &["grant_blob"]),
     ("template_system_publication_grants", &["id"]),
+    ("template_tenant_publication_grants", &["id"]),
 ];
 
 #[derive(Parser)]

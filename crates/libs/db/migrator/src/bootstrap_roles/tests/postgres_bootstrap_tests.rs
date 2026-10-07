@@ -1019,3 +1019,32 @@ async fn ro_reads_publication_grant_metadata_without_authorization_id() -> TestR
     }
     Ok(())
 }
+
+#[tokio::test]
+async fn ro_reads_tenant_publication_grant_metadata_without_authorization_id() -> TestResult {
+    let Some(fixture) = postgres_fixture().await? else {
+        return Ok(());
+    };
+    run_bootstrap(&fixture).await?;
+    let mut conn = fixture.connect_as("postgres").await?;
+    assume_migrator_role(&mut conn).await?;
+    crate::POSTGRES_MIGRATOR.run(&mut conn).await?;
+    drop(conn);
+    run_bootstrap(&fixture).await?;
+
+    // Like the system grant ID, this ID carries publication authority.
+    for (column, expected) in [("id", false), ("template_name", true), ("org_id", true)] {
+        let has: bool = sqlx::query_scalar(sql!(
+            "SELECT has_column_privilege($1, 'public.template_tenant_publication_grants'::regclass, $2, 'SELECT')"
+        ))
+        .bind(RO_ROLE)
+        .bind(column)
+        .fetch_one(&fixture.pool)
+        .await?;
+        assert_eq!(
+            has, expected,
+            "space_ro SELECT on tenant publication grant {column}"
+        );
+    }
+    Ok(())
+}
