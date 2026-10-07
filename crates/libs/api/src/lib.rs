@@ -28,6 +28,7 @@ mod credential_injection;
 mod ingress_activation;
 #[cfg(feature = "kubernetes")]
 pub mod node_group_placement;
+pub mod public_operation_driver;
 pub mod public_operations;
 pub mod public_sandbox_operations;
 mod public_sandbox_projection;

@@ -667,46 +667,7 @@ impl PublicOperationStore {
                 return Ok(CreateClaimedPublicOperationResult::AdmissionDenied);
             }
         };
-        let claim_token = new_claim_token();
-        let row = sqlx::query_as::<_, ClaimedPublicOperationRow>(sql!(
-            "UPDATE public_operations
-             SET state = $3,
-                 attempts = attempts + 1,
-                 claim_token = $2,
-                 claim_generation = claim_generation + 1,
-                 claimed_at = NOW(),
-                 started_at = COALESCE(started_at, NOW()),
-                 progress_message = 'operation claimed',
-                 updated_at = NOW()
-             WHERE operation_id = $1
-             RETURNING operation_id,
-                       org_id,
-                       actor_user_id,
-                       api_product,
-                       kind,
-                       target_type,
-                       target_id,
-                       payload_json,
-                       attempts,
-                       claim_generation,
-                       traceparent"
-        ))
-        .bind(operation_id.as_uuid())
-        .bind(&claim_token)
-        .bind(OperationState::Running.as_str())
-        .fetch_one(&mut *tx)
-        .await?;
-        let operation = ClaimedPublicOperation::try_from(row)?;
-        append_operation_event_tx(
-            &mut tx,
-            operation.id,
-            PublicOperationEventType::Claimed,
-            serde_json::json!({
-                "kind": operation.kind.as_str(),
-                "attempt": operation.attempts,
-            }),
-        )
-        .await?;
+        let (claim_token, operation) = claim_created_operation_tx(&mut tx, operation_id).await?;
         tx.commit().await?;
 
         pplx_space_metrics::operations::created(
@@ -902,6 +863,57 @@ pub enum ObservePublicOperationIdempotency {
     },
 }
 
+/// Claim an operation this transaction just created, as
+/// [`PublicOperationStore::claim_operations`] would: `running`, one attempt,
+/// a fresh claim token and generation, and a `claimed` event. Committed with
+/// the create, so no other claimant ever sees the operation queued.
+async fn claim_created_operation_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    operation_id: OperationId,
+) -> Result<(String, ClaimedPublicOperation), PublicOperationStoreError> {
+    let claim_token = new_claim_token();
+    let row = sqlx::query_as::<_, ClaimedPublicOperationRow>(sql!(
+        "UPDATE public_operations
+         SET state = $3,
+             attempts = attempts + 1,
+             claim_token = $2,
+             claim_generation = claim_generation + 1,
+             claimed_at = NOW(),
+             started_at = COALESCE(started_at, NOW()),
+             progress_message = 'operation claimed',
+             updated_at = NOW()
+         WHERE operation_id = $1
+         RETURNING operation_id,
+                   org_id,
+                   actor_user_id,
+                   api_product,
+                   kind,
+                   target_type,
+                   target_id,
+                   payload_json,
+                   attempts,
+                   claim_generation,
+                   traceparent"
+    ))
+    .bind(operation_id.as_uuid())
+    .bind(&claim_token)
+    .bind(OperationState::Running.as_str())
+    .fetch_one(&mut **tx)
+    .await?;
+    let operation = ClaimedPublicOperation::try_from(row)?;
+    append_operation_event_tx(
+        tx,
+        operation.id,
+        PublicOperationEventType::Claimed,
+        serde_json::json!({
+            "kind": operation.kind.as_str(),
+            "attempt": operation.attempts,
+        }),
+    )
+    .await?;
+    Ok((claim_token, operation))
+}
+
 pub struct PublicOperationAdmission {
     tx: Transaction<'static, Postgres>,
     observation: ObservePublicOperationIdempotency,
@@ -994,6 +1006,55 @@ impl PublicOperationAdmission {
                 .unwrap_or("none"),
         );
         Ok(result)
+    }
+
+    /// [`Self::create_or_roll_back`], except that a newly created operation
+    /// is also claimed in the same transaction, for the caller to execute
+    /// inline. Nothing is claimed for a replay or a conflict, and both roll
+    /// back, as there.
+    pub(crate) async fn create_claimed_or_roll_back(
+        mut self,
+        input: CreatePublicOperation<'_>,
+    ) -> Result<CreateClaimedPublicOperationResult, PublicOperationStoreError> {
+        let api_product = input.api_product;
+        let kind = input.kind;
+        let target_type = input.target_type.clone();
+        let operation_id = match create_operation_tx(&mut self.tx, input).await? {
+            CreatePublicOperationResult::Created(operation_id) => operation_id,
+            CreatePublicOperationResult::Existing(operation_id) => {
+                self.tx.rollback().await?;
+                return Ok(CreateClaimedPublicOperationResult::Existing(operation_id));
+            }
+            CreatePublicOperationResult::IdempotencyConflict {
+                operation_id,
+                expected_fingerprint,
+            } => {
+                self.tx.rollback().await?;
+                return Ok(CreateClaimedPublicOperationResult::IdempotencyConflict {
+                    operation_id,
+                    expected_fingerprint,
+                });
+            }
+            CreatePublicOperationResult::AdmissionDenied => {
+                self.tx.rollback().await?;
+                return Ok(CreateClaimedPublicOperationResult::AdmissionDenied);
+            }
+        };
+        let (claim_token, operation) =
+            claim_created_operation_tx(&mut self.tx, operation_id).await?;
+        self.tx.commit().await?;
+        pplx_space_metrics::operations::created(
+            api_product.as_str(),
+            kind.as_str(),
+            target_type
+                .as_ref()
+                .map(OperationTargetType::as_str)
+                .unwrap_or("none"),
+        );
+        Ok(CreateClaimedPublicOperationResult::Claimed {
+            claim_token,
+            operation,
+        })
     }
 }
 

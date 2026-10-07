@@ -20,6 +20,51 @@ pub fn claimed(api_product: &str, kind: &str) {
     );
 }
 
+/// Which process ran a claimed operation: the cluster-controller dispatcher,
+/// or the API request that created it (a native create that won an
+/// admission-time warm-pool claim).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OperationExecutor {
+    Dispatcher,
+    Inline,
+}
+
+impl OperationExecutor {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Dispatcher => "dispatcher",
+            Self::Inline => "inline",
+        }
+    }
+}
+
+/// [`claimed`], tagged with the executor that took the claim.
+pub fn claimed_by(api_product: &str, kind: &str, executor: &str) {
+    counter(
+        "operations.claimed",
+        1,
+        &[
+            tag("api_product", api_product),
+            tag("kind", kind),
+            tag("executor", executor),
+        ],
+    );
+}
+
+/// [`completed`], tagged with the executor that recorded the result.
+pub fn completed_by(api_product: &str, kind: &str, state: &str, executor: &str) {
+    counter(
+        "operations.completed",
+        1,
+        &[
+            tag("api_product", api_product),
+            tag("kind", kind),
+            tag("state", state),
+            tag("executor", executor),
+        ],
+    );
+}
+
 pub fn completed(api_product: &str, kind: &str, state: &str) {
     counter(
         "operations.completed",

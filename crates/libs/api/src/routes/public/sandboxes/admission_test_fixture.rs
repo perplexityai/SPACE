@@ -192,6 +192,24 @@ impl AdmissionPoolFixture {
         idempotency_key: &str,
         request: CreateSandboxRequest,
     ) -> Result<SandboxOperationResponse, PublicApiError> {
+        self.create_with(
+            pool_claims.map(|controller| super::NativeCreatePoolClaims {
+                controller,
+                inline: None,
+            }),
+            idempotency_key,
+            request,
+        )
+        .await
+    }
+
+    /// [`Self::create`] with inline execution configured as given.
+    pub(crate) async fn create_with(
+        &self,
+        pool_claims: Option<super::NativeCreatePoolClaims<'_>>,
+        idempotency_key: &str,
+        request: CreateSandboxRequest,
+    ) -> Result<SandboxOperationResponse, PublicApiError> {
         super::create_native_sandbox_operation(
             &self.db.pool,
             self.org_id,

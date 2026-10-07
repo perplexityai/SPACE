@@ -2,6 +2,7 @@ use pplx_space_common_core::types::OrgId;
 use pplx_space_common_core::types::UserId;
 
 use super::*;
+use pplx_space_api::public_operations::{ApiProduct, CompleteClaimedPublicOperation};
 use pplx_space_api::public_sandbox_operations::CreateSandboxOperationPayload;
 use pplx_space_common_core::sql;
 use pplx_space_common_core::types::{RuntimeKind, TemplateId, TemplateReference};
