@@ -2,7 +2,7 @@
 # The loop-device pool on a containerized SPACE dev host, and how to grow it.
 #
 # Every dev host that backs a filesystem with a file needs loop devices: the
-# devbox mounts /space/cache from a btrfs image, each kind node-stack pod mounts
+# devbox mounts /space/cache from a btrfs image, each kind SPACE node mounts
 # /space/cache from its own, and each encrypted sandbox attaches two more (the
 # dm-snapshot origin and the LUKS2 COW). All of them are containers, and a
 # container's /dev is a tmpfs the runtime populates ONCE at creation from the
@@ -49,7 +49,8 @@
 # node. Prefer that path; it is ungated by `max_loop` where this one is not.
 #
 # This library exists for the window before it: each harness mounts /space/cache
-# as the first thing its entrypoint does, and node-manager has not started yet.
+# before its services start (on kind, the node's space-cache.service, see
+# infra/space/kind/node/space-kind-node.sh), and node-manager has not started yet.
 # It honors the same `SPACE_LOOP_DEVICE_TARGET`, defaults to that module's floor
 # of 64, and gives nodes the same mode and group, so the two cannot disagree
 # about what a node should look like. It also never stages fewer than the highest
@@ -64,7 +65,7 @@
 # Sourced, never executed. Callers need nothing set up first; growing the pool
 # needs root or passwordless sudo, everything else is read-only.
 
-# Target pool size. One node per node-stack pod (four in the kind topology) plus
+# Target pool size. One node per kind SPACE node's cache (four in the topology) plus
 # the host cache is the floor; ~2 per concurrent encrypted sandbox is what makes
 # the floor the wrong number to provision — the BYOK fleet test asks for 24
 # sandboxes by default, i.e. ~52 devices. Concurrent sandboxes are not the only

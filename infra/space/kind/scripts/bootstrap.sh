@@ -259,6 +259,17 @@ fi
 log "installing containerd-shim-space-v2 on sandbox workers"
 bash "$KIND_DIR/scripts/install-shim.sh"
 
+# ── Step 4b: the node layer on each sandbox worker and builder ───────────────
+# A production node image provides the btrfs /space/cache, the cgroup subtree,
+# loop-device headroom, device permissions and the /space layout before any
+# SPACE pod starts; the node-stack pods only check for them. This installs the
+# kind nodes' equivalent as systemd units that run before kubelet on every node
+# start. Idempotent, and safe on a cluster whose node-stack pods predate it.
+# SPACE_LOOP_DEVICE_TARGET is inherited, so the nodes stage the same pool the
+# node-stack render below hands node-manager.
+log "preparing the SPACE node layer on sandbox workers and builders"
+SPACE_KIND_CLUSTER="$KIND_CLUSTER" bash "$KIND_DIR/scripts/prepare-kind-node.sh"
+
 # ── Step 5: shared manifests (namespace + RuntimeClass) ──────────────────────
 log "applying namespace + RuntimeClass"
 kubectl --context "$KCTX" apply -f "$KIND_DIR/manifests/namespace.yaml" >/dev/null
@@ -377,10 +388,11 @@ helm_apply space "$KIND_DIR/charts/space-internal-api-local"
 helm_apply space "$KIND_DIR/charts/space-data-plane-local"
 helm_apply space "$KIND_DIR/charts/space-cluster-controller-local"
 helm_apply space "$KIND_DIR/charts/space-ui-local"
-# SPACE_LOOP_DEVICE_TARGET is the one knob for the loop-device pool: the
-# entrypoint stages nodes from it before it mounts /space/cache, and node-manager
-# reads the same variable once it is up. Inherited so setting it for a bring-up
-# reaches both renders; unset passes nothing and the library's default applies.
+# SPACE_LOOP_DEVICE_TARGET is the one knob for the loop-device pool: the kind
+# node's space-loop-nodes.service stages nodes from it (step 4b), and
+# node-manager reads the same variable once it is up. Inherited so setting it
+# for a bring-up reaches both renders; unset passes nothing and the library's
+# default applies.
 LOOP_TARGET_ARGS=()
 if [[ -n "${SPACE_LOOP_DEVICE_TARGET:-}" ]]; then
   LOOP_TARGET_ARGS=(--set "loopDeviceTarget=$SPACE_LOOP_DEVICE_TARGET")

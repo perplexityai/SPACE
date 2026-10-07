@@ -206,8 +206,8 @@ Set these for the target cluster, after verifying each on a real node:
   For a builder release named `build-farm` in `builds`, set
   `{namespace: builds, podNamePrefix: build-farm-node-stack-, container: node-stack}`.
   Lists replace defaults: include every builder release, including old names
-  whose files remain on nodes after a rename. Worker containers and the
-  builder's `format-cache-image` init container remain eligible.
+  whose files remain on nodes after a rename. Worker containers remain
+  eligible.
   Alloy reads no Kubernetes metadata and does not honor Datadog exclusion
   annotations. Audit source eligibility before deployment: shared deployments
   with separate builder-service pods need their actual pod/container identities,

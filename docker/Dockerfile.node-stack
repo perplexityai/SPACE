@@ -8,9 +8,10 @@
 #
 #   * node-stack-start.sh — one pod stands in for a whole worker node, so a
 #     single entrypoint supervises the full service set (prod runs one
-#     DaemonSet per service); it also recreates the AMI-provided directory
-#     skeleton/ownership and the btrfs cache filesystem (loopback here,
-#     instance-store NVMe in prod).
+#     DaemonSet per service); it also does what the per-service init
+#     containers do in prod. The kind node itself provides what the AMI does
+#     (btrfs cache, cgroup subtree, loop devices, directory skeleton), through
+#     infra/space/kind/scripts/prepare-kind-node.sh.
 #   * postgresql-client — ONLY for the legacy DirectSubstrate bench
 #     registration (space-local-3486); the production-shaped path never
 #     touches Postgres from a node.
@@ -57,11 +58,6 @@ RUN ln -sfn /space/vendor/firecracker/default/bin/firecracker /space/bin/firecra
 
 COPY --chmod=0755 scripts/k8s/node-stack-start.sh /opt/space/bin/node-stack-start.sh
 COPY --chmod=0755 scripts/k8s/stage-guest-kernel.sh /opt/space/bin/stage-guest-kernel.sh
-# Sourced by the entrypoint, next to node-identities.sh (which Dockerfile.worker
-# stages the same way): the pod has to build its own loop-device pool because
-# its /dev is a snapshot of the kind node's, and both the btrfs cache mount and
-# every encrypted sandbox allocate from it.
-COPY --chmod=0644 scripts/lib/space-loop-devices.sh /opt/space/etc/space-loop-devices.sh
 
 ENV PATH="/opt/space/bin:${PATH}"
 

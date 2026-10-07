@@ -8,9 +8,6 @@
 {{- if and .Values.builder.enabled (le (int .Values.terminationGracePeriodSeconds) (int .Values.builder.drainTimeoutSeconds)) -}}
 {{- fail "builder drain timeout must be less than termination grace period" -}}
 {{- end -}}
-{{- if and .Values.builder.enabled (not .Values.cache.persistImage) -}}
-{{- fail "builder.enabled requires cache.persistImage: the builder's mount-cache init container mounts the node-bound cache image on the kind node" -}}
-{{- end -}}
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
@@ -41,7 +38,7 @@ spec:
         {{- if .Values.datadogLogsExcluded }}
         # node-stack tails service logs and guest command output to stdout.
         # Guest output can contain build secrets, so exclude this container's
-        # logs. The format-cache-image init container runs no build recipes.
+        # logs.
         ad.datadoghq.com/node-stack.logs_exclude: "true"
         {{- end }}
       labels:
@@ -88,70 +85,11 @@ spec:
       # reconciler) — same RBAC as the prod space-node-ctl chart.
       serviceAccountName: {{ .Release.Name }}-node-stack
       terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds | int }}
-      {{- if .Values.cache.persistImage }}
-      # The node-bound cache image must already be a btrfs filesystem when
-      # the node-stack entrypoint attaches it. kubelet creates the
-      # FileOrCreate file empty, and an entrypoint from before
-      # `cache.persistImage` skips formatting anything that exists — so a
-      # chart re-apply that keeps an older image (`bootstrap.sh
-      # --skip-images`) would attach the empty file and crash-loop. Formatting
-      # here, from the same image, makes the chart/image transition order
-      # irrelevant; the entrypoint's own check stays as the second line.
-      initContainers:
-        - name: format-cache-image
-          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
-          imagePullPolicy: {{ .Values.image.pullPolicy }}
-          command:
-            - bash
-            - -c
-            - |
-              set -eu
-              img=/var/lib/space-cache.img
-              if [ -s "$img" ] && btrfs inspect-internal dump-super "$img" >/dev/null 2>&1; then
-                echo "[format-cache-image] $img is already btrfs; reusing"
-                exit 0
-              fi
-              echo "[format-cache-image] formatting $img (${SPACE_CACHE_SIZE_MB}M, sparse)"
-              truncate -s 0 "$img"
-              truncate -s "${SPACE_CACHE_SIZE_MB}M" "$img"
-              mkfs.btrfs -f -L space-cache "$img" >/dev/null
-          env:
-            - name: SPACE_CACHE_SIZE_MB
-              value: {{ .Values.cache.sizeMb | quote }}
-          volumeMounts:
-            - name: cache-image
-              mountPath: /var/lib/space-cache.img
-        {{- if .Values.builder.enabled }}
-        # A production builder's host has its btrfs /space/cache before any
-        # SPACE service starts (infra/space/packer). This init container plays
-        # the host's part: it mounts the node-bound image on the kind node's
-        # /space/cache, once per node (a later pod finds it mounted and reuses
-        # it). The node-stack container below then receives the cache
-        # HostToContainer, so the mounts its services make under it (OCI rootfs
-        # bind mounts, scratch-build chroot mounts, build-VM jails) stay inside
-        # the pod instead of propagating into the node's namespace.
-        - name: mount-cache
-          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
-          imagePullPolicy: {{ .Values.image.pullPolicy }}
-          args: ["--mount-cache"]
-          securityContext:
-            privileged: true
-          env:
-            - name: SPACE_CACHE_SIZE_MB
-              value: {{ .Values.cache.sizeMb | quote }}
-          volumeMounts:
-            - name: cache-image
-              mountPath: /var/lib/space-cache.img
-            - name: cache
-              mountPath: /space/cache
-              mountPropagation: Bidirectional
-        {{- end }}
-      {{- end }}
       containers:
         - name: node-stack
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
-          # Firecracker + jailer + loop-mounted btrfs cache + cgroup subtree
+          # Firecracker + jailer + per-sandbox loop devices + cgroup subtree
           # management need a privileged container. Per-service privilege
           # separation happens inside via the production unix identities
           # (see node-stack-start.sh).
@@ -407,18 +345,13 @@ spec:
               value: {{ .Values.diskAdmission.minAvailableBytes | quote }}
             - name: SPACE_NODE_DISK_ADMISSION_ALLOCATION_RESERVATION_BYTES
               value: {{ .Values.diskAdmission.allocationReservationBytes | quote }}
-            # /space/cache loopback size for the kind entrypoint; see
-            # values.yaml `cache.sizeMb` for why it must exceed the encrypted
-            # suspend-snapshot volume's 16 GiB logical ceiling.
-            - name: SPACE_CACHE_SIZE_MB
-              value: {{ .Values.cache.sizeMb | quote }}
             {{- if ne (toString .Values.loopDeviceTarget) "" }}
-            {{- /* Loop-device nodes the entrypoint stages before it mounts
-                   /space/cache. The same variable node-manager reads once it is
-                   up (crates/libs/node/mgr/server/src/loop_devices.rs), so one
-                   setting covers both; the entrypoint's default matches that
-                   module's floor. Rendered only when set, so the pod spec does
-                   not carry a number the values file does not mention. */}}
+            {{- /* The loop-device pool node-manager raises its node to at
+                   startup (crates/libs/node/mgr/server/src/loop_devices.rs).
+                   The bring-up passes the same SPACE_LOOP_DEVICE_TARGET to the
+                   kind node's space-loop-nodes.service. Rendered only when
+                   set, so the pod spec does not carry a number the values file
+                   does not mention. */}}
             - name: SPACE_LOOP_DEVICE_TARGET
               value: {{ .Values.loopDeviceTarget | quote }}
             {{- end }}
@@ -561,18 +494,14 @@ spec:
               mountPath: /space/logs
             - name: run
               mountPath: /space/run
+            # The node's btrfs cache. HostToContainer receives it, including
+            # a remount by the node's space-cache.service, without sending the
+            # mounts this pod makes under it (jails, snapshot memory files, OCI
+            # rootfs and scratch-build mounts) back to the node, where any
+            # process holding a reference would keep them busy.
             - name: cache
               mountPath: /space/cache
-              {{- if .Values.builder.enabled }}
-              # The node's btrfs cache, mounted by the mount-cache init
-              # container. HostToContainer receives it without sending the
-              # mounts this pod makes under it back to the node.
               mountPropagation: HostToContainer
-              {{- end }}
-            {{- if .Values.cache.persistImage }}
-            - name: cache-image
-              mountPath: /var/lib/space-cache.img
-            {{- end }}
             - name: route-verification-bundle
               mountPath: /var/run/space-route-verification
               readOnly: true
@@ -652,30 +581,18 @@ spec:
           hostPath:
             path: /space/run
             type: DirectoryOrCreate
-        # Instance rootfs clones + snapshot/transfer staging. On kind this is
-        # overlayfs, so vol-mgr's reflink staging falls back to a plain copy.
-        # The entrypoint mounts a loopback btrfs image over it.
+        # Template rootfs, instance clones, snapshot/transfer staging and
+        # jails: the kind node's /space/cache, as a production node's is its
+        # host's. The node's space-cache.service mounts it from a btrfs
+        # loopback image before kubelet starts (prepare-kind-node.sh installs
+        # it), so it survives pod restarts the way the instance-store disk
+        # does. DirectoryOrCreate rather than Directory: a pod scheduled before
+        # the node's unit ran starts, waits for the mount to propagate in, and
+        # names the missing unit if it never does (node-stack-start.sh).
         - name: cache
-          {{- if .Values.builder.enabled }}
-          # The builder's cache is the kind node's /space/cache, as a
-          # production builder's is its host's (see the mount-cache init
-          # container).
           hostPath:
             path: /space/cache
             type: DirectoryOrCreate
-          {{- else }}
-          emptyDir: {}
-          {{- end }}
-        {{- if .Values.cache.persistImage }}
-        # The btrfs image itself, bound from the kind node so the cache
-        # outlives the pod (see values.yaml `cache.persistImage`). A file
-        # hostPath: kubelet creates it empty, the entrypoint formats it once.
-        # `/var/lib` because FileOrCreate does not create parent directories.
-        - name: cache-image
-          hostPath:
-            path: /var/lib/space-cache.img
-            type: FileOrCreate
-        {{- end }}
         - name: route-verification-bundle
           secret:
             secretName: {{ .Values.spaceApiRouteToken.ed25519.verificationSecretName }}

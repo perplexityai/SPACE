@@ -76,13 +76,14 @@ curl -fsS http://127.0.0.1:13101/loki/api/v1/labels
   `node-stack` container, whose combined stdout includes recipe command output.
   The default matches release `space-builder` in namespace `space`; configure
   literal namespace/pod-name-prefix/container entries for renamed or additional
-  releases. Worker logs and `format-cache-image` init logs remain eligible.
+  releases. Worker logs remain eligible.
   These file-source exclusions are independent of Datadog annotations.
 - This Kind node-stack writes individual service logs into `/space/logs` and
   tails them to pod stdout. Sidecars inherit the supervisor's output. They are
-  not separate Kubernetes container log files. No SPACE systemd service was
-  present on the tested Kind nodes. Journal collection allows `space-*.service`,
-  and `containerd.service`. The synthetic journal identifier is test-only.
+  not separate Kubernetes container log files. The only SPACE systemd services
+  on Kind nodes are the node-layer oneshots `prepare-kind-node.sh` installs on
+  sandbox and builder nodes (`space-cache.service` and its siblings). Journal
+  collection allows `space-*.service`, and `containerd.service`. The synthetic journal identifier is test-only.
   Guest journals and the devbox's journal are not mounted or forwarded here.
 - The collector removes the CRI envelope, then extracts fields for labels and
   the event timestamp. It does **not** rewrite the original message JSON.

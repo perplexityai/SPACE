@@ -11,6 +11,9 @@ harness with its stub substrate was deleted on 2026-09-22.
   `infra/space/kind/README.md`.
 - Smoke selection and suite-specific contracts: the `space-validation` skill's
   smoke-testing reference and `infra/space/kind/README.md`.
+- What each Kind SPACE node provides before its pods start (btrfs cache,
+  cgroup, loop devices, device permissions, layout): "The node layer" in
+  `infra/space/kind/README.md` and `infra/space/kind/node/`.
 - Loop-device mechanics and sizing: `scripts/lib/space-loop-devices.sh` and
   the production/Kind comparison in `infra/space/kind/README.md`.
 - Chart-specific resource and storage constraints: the comments next to the
@@ -46,11 +49,19 @@ or suites.
   registration in `scripts/k8s/node-stack-start.sh`. Normal node registration
   and template publication use ClusterApi; templates are not baked into or
   side-staged onto workers.
-- Preserve cache-loop autoclear, the entrypoint's `mount --make-rshared /`, and
-  per-jail vhost-vsock device creation. They are required for restart safety and
-  snapshot restore.
-- `/dev/kvm` permission widening is Kind-only and must not be copied to worker
-  images.
+- The kind node provides what a production node image does: the btrfs
+  `/space/cache`, cgroup subtree, loop-device headroom, device permissions and
+  `/space` skeleton come from the systemd units `prepare-kind-node.sh` installs
+  on sandbox and builder nodes, ordered before kubelet. Keep both bring-up paths
+  running it before the node charts, keep it idempotent and safe on a live
+  cluster, and do not move these duties back into the pod.
+- Preserve cache-loop autoclear (set by `space-cache.service`), the pods'
+  `HostToContainer` view of `/space/cache`, the entrypoint's
+  `mount --make-rshared /` and `/space/cache`, and per-jail vhost-vsock device
+  creation in the entrypoint. They are required for restart safety, mount
+  containment and snapshot restore.
+- `/dev/kvm` and vhost permission widening is Kind-only and must not be copied
+  to worker images.
 - Deployment environment overrides go through the typed harness ops in
   `space_smoke/adapters.py` (capture the standing literals, restore from the
   capture, verify running pods); shell ECW key seeding goes through

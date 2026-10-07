@@ -347,47 +347,29 @@ s3:
   #   SPACE_OBJECT_STORE_STATIC_SECRET_ACCESS_KEY
   credentialsSecretName: space-object-store
 
-# /space/cache loopback size (SPACE_CACHE_SIZE_MB, read by the kind
-# entrypoint's btrfs image setup). Must sit comfortably above the 16 GiB
-# logical ceiling of the encrypted suspend-snapshot volume: the backing file
-# is sparse at the source and small in the object store, but a cross-node
-# encrypted restore's pull materializes the full logical size on the target
-# worker, so a 16 GiB cache can never receive one — the pull ENOSPCs and the
-# node ends up ssd-placement-blocked. The image itself is sparse; unwritten
-# capacity costs no host disk.
-# Loop-device nodes the entrypoint stages before mounting /space/cache. Empty
-# means the library's floor of 64 (matching node-manager's), raised to cover the
-# highest loop index already in use plus SPACE_LOOP_HIGHWATER_SLACK — indices are
-# kernel-global, so a fixed count wedges a restart once peers hold 0..N-1. Pin
-# this only when a bench needs more than that floor from the start — e.g. a large
-# encrypted fleet, which holds ~2 devices per running sandbox.
+# The loop-device pool node-manager raises the node to at startup. Empty means
+# that module's floor of 64. Pin this only when a bench needs more than that
+# floor from the start — e.g. a large encrypted fleet, which holds ~2 devices
+# per running sandbox.
 #
 # Set through SPACE_LOOP_DEVICE_TARGET, which both bring-up paths map onto this
-# value. Changing it on a bench whose Tilt is already running takes a Tilt
-# restart: Tilt reads the environment once, at start, and the bring-up reuses a
-# live process.
+# value and also pass to prepare-kind-node.sh, whose space-loop-nodes.service
+# stages the same number of nodes in the kind node's /dev before any pod starts.
+# Changing it on a bench whose Tilt is already running takes a Tilt restart:
+# Tilt reads the environment once, at start, and the bring-up reuses a live
+# process.
 loopDeviceTarget: ""
 
-cache:
-  sizeMb: "40960"
-  # Bind the btrfs backing image from the kind node (`/var/lib/space-cache.img`,
-  # hostPath `FileOrCreate`) instead of leaving it on the pod's writable
-  # overlay. With it, /space/cache survives a node-stack pod restart the way
-  # the instance-store disk does on EKS: template-manager's startup recovery
-  # and prune, sandbox-manager's local artifacts and both on-node reclaim
-  # loops then see the same tree across a restart that production sees —
-  # instead of every Tilt rollout wiping every template while the SQLite
-  # catalogs under the hostPath /space/run keep their rows. The entrypoint
-  # An init container formats the file the first time (kubelet creates it
-  # empty) and whenever it is not a btrfs filesystem, so a chart re-apply
-  # that keeps an older node-stack image never attaches an empty file; the
-  # entrypoint then reuses a populated image as-is. To start clean, delete
-  # the file on the kind node or recreate the cluster.
-  persistImage: true
+# /space/cache is not configured here: like a production node's, it belongs to
+# the node. infra/space/kind/scripts/prepare-kind-node.sh installs the kind
+# node's space-cache.service, which mounts a sparse btrfs loopback image
+# (/var/lib/space-cache.img on the node, 40 GiB by default,
+# SPACE_KIND_CACHE_SIZE_MB) before kubelet starts; the chart mounts the node's
+# /space/cache into the pod.
 
 # Disk-admission sizing for /space/cache. Production defaults assume NVMe
 # (50 GiB min-available floor, 8 GiB per-sandbox allocation reservation);
-# the kind cache is a sparse loopback btrfs image (cache.sizeMb above), so
+# the kind cache is a sparse loopback btrfs image (see above), so
 # scale both byte knobs to it (1 GiB each) through the same production config
 # surface. Without this every node publishes scheduling_status=full / gets
 # ssd-placement-blocked, and sbxmgr rejects prepare_sandbox with

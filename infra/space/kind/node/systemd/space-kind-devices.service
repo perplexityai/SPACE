@@ -1,0 +1,14 @@
+# Installed on Kind SPACE nodes by infra/space/kind/scripts/prepare-kind-node.sh.
+# See infra/space/kind/node/space-kind-node.sh.
+[Unit]
+Description=SPACE Kind-only KVM and vhost device permissions
+Before=kubelet.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+EnvironmentFile=-/etc/space/kind-node.env
+ExecStart=/usr/local/lib/space/kind-node/space-kind-node.sh devices
+
+[Install]
+WantedBy=multi-user.target

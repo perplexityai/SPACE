@@ -6,12 +6,15 @@
 # template-manager, sandbox-manager, node-ctl, and node-api, plus build-manager
 # for the builder role and the read-only runtime manager — the same binaries, features, and unix identities as
 # the production node DaemonSets. sandbox-manager launches the per-sandbox
-# net-gateway through node-manager when a VM starts. The pod
-# plays the role of a whole node, so this
-# script also stands in for the pieces the AMI + per-service DaemonSet
-# init containers provide in production: directory skeleton + ownership
-# (packer 07-sysctl.sh / node-manager-init.sh), the btrfs cache filesystem
-# (instance-store NVMe on the AMI, loopback here), and the /space/etc files.
+# net-gateway through node-manager when a VM starts. The pod runs every
+# node service in one container, so this script also stands in for the
+# per-service DaemonSet init containers production runs: the services' own
+# directories + ownership (node-manager-init.sh, the node-ctl / volume-manager
+# chart inits), the guest-kernel staging, and the /space/etc files. What the
+# node image provides in production — the btrfs /space/cache, the cgroup
+# subtree, loop-device headroom, device permissions and the packer directory
+# skeleton — the kind node provides through the units
+# infra/space/kind/scripts/prepare-kind-node.sh installs.
 #
 # Node registration is NOT done here. The node publishes itself through the
 # production path: node-ctl's outbound reconcilers call
@@ -24,8 +27,6 @@
 set -euo pipefail
 
 . /opt/space/etc/node-identities.sh
-# shellcheck source=../lib/space-loop-devices.sh
-. /opt/space/etc/space-loop-devices.sh
 
 LOG_DIR="/space/logs"
 # Logs live in a pod-scoped emptyDir so a container retry cannot erase recovery
@@ -87,116 +88,28 @@ load_node_identity() {
   fi
 }
 
-# ── Loop devices: give the pod the pool a production node has ────────────────
-# Two things in this pod attach loop devices: the btrfs cache image below, and
-# every encrypted sandbox (the dm-crypt rootfs attaches the plaintext origin and
-# cryptsetup attaches the LUKS2 COW, ~2 per running sandbox). Both go through
-# `losetup --find`, and this pod's /dev is a tmpfs the runtime snapshotted from
-# the kind node at pod creation — 8 nodes, and nothing ever adds more. The
-# kernel pool is shared by every pod on the box and does not stop at 8, so the
-# nodes are the only missing part; production workers get the same headroom from
-# max_loop=10000 on the AMI. See scripts/lib/space-loop-devices.sh.
-
-# ── Layout: btrfs loopback on /space/cache + dirs on the pod fs ──────────────
-# Production runs /space/cache on a btrfs filesystem (instance-store NVMe on
-# worker images). The sandbox-manager
-# uses btrfs subvolume snapshots to clone the template rootfs into each new
-# sandbox's instance dir, so the cache filesystem MUST support btrfs. The
-# chart's emptyDir is plain overlayfs; mount a loopback btrfs image over it so
-# the production code paths run unmodified. The backing image lives outside
-# /space/cache so the mount doesn't hide it: on the pod's writable overlay by
-# default, or bind-mounted from the kind node when the chart sets
-# `cache.persistImage`, in which case the cache survives pod restarts.
-ensure_btrfs_cache() {
-  local img=/var/lib/space-cache.img
-  local size_mb=${SPACE_CACHE_SIZE_MB:-16384}
-  if findmnt -n -t btrfs /space/cache >/dev/null 2>&1; then
-    log "/space/cache already btrfs"
-    return 0
-  fi
-  command -v mkfs.btrfs >/dev/null \
-    || die "mkfs.btrfs missing (btrfs-progs package); cannot stage /space/cache"
-  # Without losetup every pool count reads as "nothing attached", so an exhaustion
-  # report would claim the pool looks free. Name the real problem here instead.
-  space_loop__losetup_bin >/dev/null \
-    || die "losetup missing (util-linux package); cannot attach the cache image"
-
-  # `-s`, not `-e`: a zero-length file is not a filesystem. The kind chart can
-  # bind-mount the image from the node (`hostPath` type `FileOrCreate`) so the
-  # cache survives pod restarts the way the node disk does on EKS; kubelet
-  # creates that file empty the first time, and it must be formatted, not
-  # attached. A populated image is reused as-is on every later start.
-  # A populated image that is not a btrfs filesystem (a pod killed between
-  # `truncate` and `mkfs`, or damage) would otherwise be attached, fail to
-  # mount, and crash-loop the pod until someone deletes the file on the node.
-  if [[ -s $img ]] && ! btrfs inspect-internal dump-super "$img" >/dev/null 2>&1; then
-    log "backing image $img is not a btrfs filesystem; reformatting it"
-    truncate -s 0 "$img" || die "truncate $img to zero failed"
-  fi
-  if [[ ! -s $img ]]; then
-    log "creating btrfs backing image $img (${size_mb}M, sparse)"
-    # Sparse (truncate, not fallocate): the virtual size gives the
-    # disk-admission math prod-like headroom while real blocks are only
-    # consumed as sandboxes write. The pod overlay would not fit a fully
-    # allocated image per worker.
-    truncate -s "${size_mb}M" "$img" \
-      || die "truncate $img (size=${size_mb}M) failed"
-    mkfs.btrfs -f -L space-cache "$img" >/dev/null \
-      || die "mkfs.btrfs $img failed"
-  fi
-  # Wipe before attaching, not between attach and mount. The emptyDir may hold
-  # content from a prior crash and an old asset symlink would shadow the empty
-  # btrfs view — but on a populated cache this `rm -rf` is not instant, and every
-  # moment it spends between the attach and the mount is a window where a kill
-  # (Tilt roll, OOM, probe) leaves a device attached, unmounted and with
-  # autoclear unarmed, which nothing reclaims. The wipe needs no device, so
-  # doing it first shrinks that window to the mount call itself.
-  rm -rf /space/cache/* /space/cache/.[!.]* 2>/dev/null || true
-
-  # Through the library's retrying attach: allocation is two ioctls and the
-  # kernel drops its mutex between them, so pods starting together can be handed
-  # the same index and one bind fails. losetup's own stderr is left unredirected,
-  # ahead of the diagnostic that explains it.
-  local loopdev=""
-  loopdev="$(space_loop_attach "$img")" || loopdev=""
-  if [[ -z "$loopdev" || ! -b "$loopdev" ]]; then
-    # `losetup --find` reports an exhausted pool as ENOENT against the image
-    # ("No such file or directory"), because the free index the kernel handed it
-    # has no /dev/loopN node in this pod. Say what actually happened — including
-    # when nodes are free, which means this was not exhaustion at all.
-    # To stderr, where losetup's own message and `die` go, so the three stay in
-    # order in the pod log instead of interleaving across two streams.
-    space_loop_exhaustion_report "$img" | while IFS= read -r line; do log "$line" >&2; done
-    die "no loop device available for $img"
-  fi
-  if ! mount -o nosuid "$loopdev" /space/cache; then
-    # Release the device we just took; otherwise a crash-looping pod burns one
-    # from the kernel-global pool on every restart. With a node-bound image,
-    # the replacement pod a DaemonSet starts during the old pod's termination
-    # grace can land here once (same-fsid mount refused while the old mount is
-    # live) and succeeds on the next attempt; a persistent failure means the
-    # image itself — delete it on the kind node to start clean.
-    space_loop_detach "$loopdev" || true
-    die "mount $loopdev /space/cache failed (image $img; if this repeats, delete it on the node)"
-  fi
-  # `space_loop_detach` runs `losetup -d`, resolved by absolute path because
-  # /usr/sbin is off a non-root PATH here. Against a MOUNTED loop device it does
-  # not detach — it sets
-  # LO_FLAGS_AUTOCLEAR, so the kernel releases the device when the filesystem is
-  # fully unmounted. Workers release it with the pod's mount namespace; on
-  # builders the mount-cache init container mounts it in the kind node's
-  # namespace, where it stays and every later builder pod reuses it.
-  # Without it every container restart leaks one device permanently (an attached
-  # but unmounted loop is never reclaimed), and a handful of Tilt rollouts
-  # exhausts the pool. The mount stays fully usable; verified on a devbox.
-  space_loop_detach "$loopdev" \
-    || log "WARNING: could not set autoclear on $loopdev; it will leak on pod restart"
-  local img_mb
-  img_mb=$(( $(stat -c %s "$img") / 1048576 ))
-  if (( img_mb != size_mb )); then
-    log "WARNING: SPACE_CACHE_SIZE_MB=${size_mb} but the reused image is ${img_mb}M; delete $img on the node to resize"
-  fi
-  log "mounted btrfs loop $loopdev on /space/cache (image=${img_mb}M, autoclear)"
+# ── /space/cache: the node's btrfs cache ─────────────────────────────────────
+# sandbox-manager clones template rootfs into each sandbox's instance dir with
+# btrfs subvolume snapshots, so /space/cache MUST be btrfs. As on a production
+# node, the node provides it: the kind node's space-cache.service (installed by
+# infra/space/kind/scripts/prepare-kind-node.sh) mounts a loopback btrfs image
+# on the node's /space/cache before kubelet starts, and the chart passes it in
+# HostToContainer. A cache the node mounts after this pod started still
+# propagates in, which is why this waits briefly before failing.
+CACHE_WAIT_SECONDS="${SPACE_CACHE_WAIT_SECONDS:-60}"
+require_node_cache() {
+  local waited=0
+  until findmnt -n -t btrfs --mountpoint /space/cache >/dev/null 2>&1; do
+    if (( waited == 0 )); then
+      log "waiting up to ${CACHE_WAIT_SECONDS}s for the node's btrfs /space/cache"
+    fi
+    if (( waited >= CACHE_WAIT_SECONDS )); then
+      die "/space/cache is not a btrfs mount ($(findmnt -n -o SOURCE,FSTYPE -T /space/cache 2>/dev/null || echo unknown)); the kind node provides it: run infra/space/kind/scripts/prepare-kind-node.sh and check 'docker exec $SPACE_NODE_ID journalctl -u space-cache'"
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+  log "/space/cache is the node's btrfs cache ($(findmnt -n -o SOURCE --mountpoint /space/cache))"
 }
 
 # The Firecracker jailer mknods /dev/kvm + /dev/urandom + /dev/userfaultfd +
@@ -272,19 +185,20 @@ setup_layout() {
   mount --make-rshared / \
     || die "mount --make-rshared / failed (snapshot restore would break)"
 
-  space_loop_stage_pool log
-  ensure_btrfs_cache
-  # The cache may have been mounted by a prior incarnation of this script
-  # (before / was shared); make it shared explicitly so jail mounts under
-  # it propagate regardless of which incarnation created it.
-  mount --make-rshared /space/cache 2>/dev/null || true
+  require_node_cache
+  # Explicitly for the cache as well: a node mount that propagated in after the
+  # rshared `/` above (a late node unit) arrives only as a slave. Shared, the
+  # mounts node-manager makes under it after a jail exists (the snapshot memory
+  # file on restore) propagate into the jail's namespace; still a slave of the
+  # node's mount (HostToContainer), it sends none of them back to the node.
+  mount --make-rshared /space/cache \
+    || die "mount --make-rshared /space/cache failed (snapshot restore would break)"
 
-  local sbxclients_gid tmplclients_gid nodectlclients_gid rtmgrclients_gid cache_rw_gid gate gate_path
+  local sbxclients_gid tmplclients_gid nodectlclients_gid rtmgrclients_gid gate gate_path
   sbxclients_gid="$(space_expected_gid_for_group space-sbxclients)"
   rtmgrclients_gid="$(space_expected_gid_for_group space-rtmgrclients)"
   tmplclients_gid="$(space_expected_gid_for_group space-tmplclients)"
   nodectlclients_gid="$(space_expected_gid_for_group space-nodectlclients)"
-  cache_rw_gid="$(space_expected_gid_for_group space-cache-rw)"
 
   install -d -m 0755 -o 0 -g 0 \
     "$LOG_DIR" \
@@ -295,9 +209,12 @@ setup_layout() {
     /run/health
   preserve_service_logs
 
-  # Directory skeleton + ownership, exactly as the production worker gets it
-  # from packer 07-sysctl.sh and the per-service DaemonSet init containers
-  # (node-manager-init.sh, and the node-ctl / volume-manager chart inits).
+  # Service directories + ownership, as the per-service DaemonSet init
+  # containers create them in production (node-manager-init.sh, and the
+  # node-ctl / volume-manager chart inits). Like node-manager-init.sh, this
+  # re-asserts the parts of the packer 07-sysctl.sh skeleton those services
+  # depend on; the kind node's space-layout and space-cache units provide that
+  # skeleton itself, including the /space/cache tree.
   install -d -m 0755 -o 0 -g 0 /space/run/node-manager /space/run/runtime-supervisor
   install -d -m 0750 -o 0 -g "$sbxclients_gid" \
     /space/run/dependency-drain /space/run/dependency-drain/sandbox-manager
@@ -320,16 +237,6 @@ setup_layout() {
   if [[ "$SPACE_NODE_ROLE" == "builder" ]]; then
     install -d -m 0750 -o 0 -g 0 /space/run/build-manager
   fi
-  # setgid cache dirs writable by the space-cache-rw services (sbxmgr,
-  # tmplmgr, volmgr), root-owned jails — matches 07-sysctl.sh. The two shared
-  # parents are also sticky, so those services cannot rename away the
-  # root-owned kernel and asset roots staged beneath them.
-  install -d -m 3775 -o 0 -g "$cache_rw_gid" /space/cache /space/cache/firecracker
-  install -d -m 2775 -o 0 -g "$cache_rw_gid" \
-    /space/cache/firecracker/templates \
-    /space/cache/firecracker/sandboxes \
-    /space/cache/firecracker/builds \
-    /space/cache/firecracker/.volmgr-staging
   install -d -m 0755 -o 0 -g 0 /space/cache/firecracker/jails
 
   chmod 1777 /run/health
@@ -356,37 +263,12 @@ EOF
 
   printf '%s\n' "$SPACE_NODE_ID" > /space/etc/node-id
 
-  # Production nodemgr writes /sys/fs/cgroup/space/cpu.max + memory.max at
-  # startup to enforce per-sandbox resource caps. The /sys/fs/cgroup/space
-  # subtree is normally created by the worker AMI's Packer recipe (see
-  # infra/space/packer/scripts/base/07-sysctl.sh). The kind container starts
-  # with a stock cgroup hierarchy, so create it here so nodemgr.startup
-  # doesn't crash with "failed to write /sys/fs/cgroup/space/cpu.max".
-  if [[ -d /sys/fs/cgroup ]] && [[ ! -d /sys/fs/cgroup/space ]]; then
-    log "creating /sys/fs/cgroup/space (cgroup v2 parent for per-sandbox slices)"
-    if ! mkdir -p /sys/fs/cgroup/space 2>/dev/null; then
-      log "WARNING: could not mkdir /sys/fs/cgroup/space — nodemgr will fail"
-    fi
-  fi
-  # Enable the controllers nodemgr delegates to per-sandbox children.
-  # Matches Packer's 07-sysctl.sh.
-  if [[ -w /sys/fs/cgroup/space/cgroup.subtree_control ]]; then
-    echo "+cpu +memory +io +pids" >/sys/fs/cgroup/space/cgroup.subtree_control 2>/dev/null || true
-  fi
-
-  # Make KVM / vhost-vsock / vhost-net usable by the per-sandbox uids the
-  # jailer drops to. Production grants this via the `kvm` group on the worker
-  # AMI (Packer adds the sandbox-uid range to it). In kind we have no AMI; the
-  # sandbox uids are useradd-d on the fly by nodemgr/jailer and are NOT in any
-  # numeric group that owns /dev/kvm (gid 103 inside the kind worker). Without
-  # this chmod, firecracker exits at startup with "KVM object: Permission
-  # denied" and the sandbox lifecycle fails opaquely. Local-dev hack only —
-  # do NOT replicate this on a real worker.
-  for dev in /dev/kvm /dev/vhost-vsock /dev/vhost-net; do
-    if [[ -e $dev ]]; then
-      chmod 0666 "$dev" 2>/dev/null && log "chmod 0666 $dev (kind-only kvm-group workaround)"
-    fi
-  done
+  # nodemgr writes /sys/fs/cgroup/space/{cpu,memory}.max at startup and
+  # delegates its controllers to per-sandbox children. The node creates that
+  # parent (space-cgroup.service on the kind node, as packer 07-sysctl.sh does
+  # on a production image); say so here rather than as a nodemgr startup crash.
+  [[ -d /sys/fs/cgroup/space ]] \
+    || die "/sys/fs/cgroup/space is missing; the kind node's space-cgroup.service creates it (run infra/space/kind/scripts/prepare-kind-node.sh)"
 
   # Stage the Firecracker kernel asset where the runtime inventory expects it,
   # through the same script the production worker's node-manager init container
@@ -752,16 +634,6 @@ on_term() {
   done
   exit 0
 }
-
-# The builder chart's mount-cache init container runs only this step: it
-# attaches and mounts the btrfs cache in the kind node's mount namespace, the
-# way a production builder's host has /space/cache before any service starts,
-# and exits. It gets no service environment.
-if [[ "${1:-}" == "--mount-cache" ]]; then
-  space_loop_stage_pool log
-  ensure_btrfs_cache
-  exit 0
-fi
 
 load_node_identity
 scope_service_environment

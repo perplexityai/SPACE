@@ -16,7 +16,7 @@ builder:
 
 # The node-stack container includes guest command stdout/stderr, which can
 # contain user secrets even when step descriptions are safe. Exclude that
-# container's logs; the format-cache-image init container runs no recipes.
+# container's logs.
 datadogLogsExcluded: true
 
 # Keep the pod's grace period above build-manager's 7200s drain budget when
