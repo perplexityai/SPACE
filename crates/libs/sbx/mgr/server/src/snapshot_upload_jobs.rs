@@ -60,65 +60,6 @@ const JOB_TIMEOUT: Duration = Duration::from_secs(7200);
 const MAX_ATTEMPTS: i32 = 5;
 const TRANSFER_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
-#[derive(Debug, thiserror::Error)]
-pub enum UploadCutoverError {
-    #[error("failed to inspect snapshot upload database: {0}")]
-    InspectPath(#[source] std::io::Error),
-    #[error("failed to read active snapshot uploads: {0}")]
-    Database(#[from] rusqlite::Error),
-    #[error("active snapshot upload {job_id} has an invalid payload: {source}")]
-    InvalidPayload {
-        job_id: JobId,
-        #[source]
-        source: serde_json::Error,
-    },
-    #[error(
-        "active snapshot upload {0} lacks staged metadata; finish or repair it with the preparation release before cutover"
-    )]
-    LegacyMetadata(JobId),
-}
-
-/// Inspect existing durable work before migration raises the rollback floor.
-/// Terminal jobs are evidence, not executable work, and are deliberately ignored.
-pub(crate) fn validate_upload_cutover_path(
-    path: &std::path::Path,
-) -> Result<(), UploadCutoverError> {
-    match std::fs::metadata(path) {
-        Ok(_) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(UploadCutoverError::InspectPath(error)),
-    }
-    let conn =
-        rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-    validate_upload_cutover(&conn)
-}
-
-fn validate_upload_cutover(conn: &rusqlite::Connection) -> Result<(), UploadCutoverError> {
-    let has_jobs: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'jobs')",
-        [],
-        |row| row.get(0),
-    )?;
-    if !has_jobs {
-        return Ok(());
-    }
-    let mut statement = conn.prepare(
-        "SELECT job_id, payload FROM jobs WHERE kind = 'snapshot_upload'
-         AND status IN ('pending', 'running') ORDER BY job_id",
-    )?;
-    let mut rows = statement.query([])?;
-    while let Some(row) = rows.next()? {
-        let job_id: JobId = row.get(0)?;
-        let raw: String = row.get(1)?;
-        let payload: SnapshotUploadJobs = serde_json::from_str(&raw)
-            .map_err(|source| UploadCutoverError::InvalidPayload { job_id, source })?;
-        if !payload.includes_metadata_job {
-            return Err(UploadCutoverError::LegacyMetadata(job_id));
-        }
-    }
-    Ok(())
-}
-
 /// Build a `BackgroundWorker` configured for the snapshot-upload pipeline.
 /// Caller owns the `rusqlite::Connection` (it lives alongside the rest of
 /// sbx-mgr's SQLite state) and is responsible for calling

@@ -541,11 +541,25 @@ async fn embedded_migrations_accept_registered_revisions_and_preserve_history() 
 
 #[tokio::test]
 async fn public_embedded_migrations_reject_both_histories_before_writes() {
+    use sqlx::SqlSafeStr as _;
+    use sqlx::migrate::MigrationType;
+    use std::borrow::Cow;
+
     let (service, common) = public_test_migrators();
     let migrators = EmbeddedMigrators {
         service,
         common: Some(common),
     };
+    let pending_version = super::super::baselines::PUBLIC_SQLITE_BASELINE + 1;
+    let mut common_migrations = common.iter().cloned().collect::<Vec<_>>();
+    common_migrations.push(Migration::new(
+        pending_version,
+        Cow::Borrowed("pending shared work"),
+        MigrationType::Simple,
+        "CREATE TABLE pending_common_work (id INTEGER);".into_sql_str(),
+        false,
+    ));
+    let next_common = Migrator::with_migrations(common_migrations);
     for table in ["_sqlx_migrations", "_space_common_schema_migrations"] {
         for change in ["checksum", "failed", "legacy", "future", "missing"] {
             let directory = tempfile::tempdir().unwrap();
@@ -561,7 +575,7 @@ async fn public_embedded_migrations_reject_both_histories_before_writes() {
                 "checksum" => format!("UPDATE {table} SET checksum = x'00'"),
                 "failed" => format!("UPDATE {table} SET success = 0"),
                 "legacy" => format!("UPDATE {table} SET version = 1"),
-                "future" => format!("UPDATE {table} SET version = version + 1"),
+                "future" => format!("UPDATE {table} SET version = version + 2"),
                 "missing" => format!("DELETE FROM {table}"),
                 _ => unreachable!(),
             };
@@ -572,11 +586,37 @@ async fn public_embedded_migrations_reject_both_histories_before_writes() {
                 .unwrap();
             drop(conn);
 
-            let result = migrate_embedded("test", &path, migrators).await;
+            let result = migrate_embedded(
+                "test",
+                &path,
+                EmbeddedMigrators {
+                    service,
+                    common: Some(&next_common),
+                },
+            )
+            .await;
 
             assert!(result.is_err(), "{table} {change}");
             let conn = Connection::open(&path).unwrap();
             assert_eq!(embedded_history(&conn), before);
+            assert_eq!(
+                conn.query_row(
+                    "SELECT COUNT(*) FROM sqlite_schema WHERE name = 'pending_common_work'",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+                0
+            );
+            assert_eq!(
+                conn.query_row(
+                    "SELECT COUNT(*) FROM _space_common_schema_migrations WHERE version = ?1",
+                    [pending_version],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+                0
+            );
             assert_eq!(
                 conn.pragma_query_value(None, "schema_version", |row| row.get::<_, i64>(0))
                     .unwrap(),

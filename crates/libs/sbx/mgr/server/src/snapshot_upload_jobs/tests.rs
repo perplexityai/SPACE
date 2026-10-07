@@ -25,48 +25,6 @@ fn job_fixture(kind: &str, payload: String) -> Job {
     }
 }
 
-#[test]
-fn upload_cutover_admission_preserves_jobs_and_rejects_only_incompatible_active_work() {
-    let payload = reclaim_fixture_payload("01939e3e-eeee-7000-8000-000000000020", "/unused".into());
-    let staged = serde_json::to_value(payload).unwrap();
-    let mut legacy = staged.clone();
-    legacy["includes_metadata_job"] = serde_json::Value::Bool(false);
-    let mut absent = staged.clone();
-    absent
-        .as_object_mut()
-        .unwrap()
-        .remove("includes_metadata_job");
-    for (raw, compatible) in [
-        (staged.to_string(), true),
-        (legacy.to_string(), false),
-        (absent.to_string(), false),
-        ("malformed".into(), false),
-        (r#"{"includes_metadata_job":true}"#.into(), false),
-    ] {
-        for status in ["pending", "running", "completed", "failed", "cancelled"] {
-            let conn = open_backfill_test_db();
-            insert_job(&conn, "019d84bd-280d-7331-99c6-000000000001", status, &raw);
-            let before = conn.total_changes();
-            let admitted = validate_upload_cutover(&conn).is_ok();
-            assert_eq!(
-                admitted,
-                compatible || !matches!(status, "pending" | "running"),
-                "{status}: {raw}"
-            );
-            assert_eq!(conn.total_changes(), before);
-            assert_eq!(
-                conn.query_row(
-                    "SELECT payload FROM jobs WHERE job_id = '019d84bd-280d-7331-99c6-000000000001'",
-                    [],
-                    |row| row.get::<_, String>(0)
-                )
-                .unwrap(),
-                raw
-            );
-        }
-    }
-}
-
 #[tokio::test]
 async fn upload_executor_converges_unstaged_metadata_failure() {
     let staging = tempfile::tempdir().unwrap();
