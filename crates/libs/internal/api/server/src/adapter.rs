@@ -569,13 +569,7 @@ impl ClusterApi for ClusterApiService {
                         COALESCE(t.network_policy_generation, 0) AS network_policy_generation
                  FROM requested r
                  LEFT JOIN templates t ON t.name = r.template
-                 WHERE EXISTS (
-                        SELECT 1
-                        FROM node_template_inventory nti
-                        WHERE nti.template_name = r.template
-                          AND nti.node_id = $3
-                    )
-                    OR (t.visibility = 'generic' AND t.desired_state = 'present')
+                 WHERE (t.visibility = 'generic' AND t.desired_state = 'present')
                     OR EXISTS (
                         SELECT 1
                         FROM sandboxes sb
@@ -637,22 +631,16 @@ impl ClusterApi for ClusterApiService {
         let sandbox_states = if sandbox_ids.is_empty() {
             Vec::new()
         } else {
-            let rows = sqlx::query_as::<_, SandboxPolicyRow>(sql!(
-                "SELECT s.id AS sandbox_id,
-                        s.template_id,
-                        s.network_policy_override_json AS network_policy_json,
-                        s.network_policy_generation,
-                        t.network_policy_json AS template_network_policy_json
-                 FROM sandboxes s
-                 LEFT JOIN templates t ON t.name = s.template_id
-                 WHERE s.id = ANY($1)
-                   AND (s.active_node_id = $2 OR s.target_node_id = $2)"
-            ))
-            .bind(&sandbox_ids)
-            .bind(origin.id)
-            .fetch_all(&self.pool)
+            let rows = pplx_space_sandbox_store::network_policy_inputs_placed_on(
+                &self.pool,
+                origin.id,
+                &sandbox_ids,
+            )
             .await
-            .map_err(|err| Status::internal(format!("query sandbox policies: {err}")))?;
+            .map_err(|err| Status::internal(format!("query sandbox policies: {err}")))?
+            .into_iter()
+            .map(SandboxPolicyRow::try_from)
+            .collect::<Result<Vec<_>, Status>>()?;
 
             project_sandbox_network_policy_states(rows)
         };
@@ -706,13 +694,7 @@ impl ClusterApi for ClusterApiService {
              LEFT JOIN template_base_snapshot_policies p ON p.template = r.template
              LEFT JOIN local_inventory li ON li.template_name = r.template
              LEFT JOIN templates t ON t.name = r.template
-             WHERE EXISTS (
-                    SELECT 1
-                    FROM node_template_inventory nti
-                    WHERE nti.template_name = r.template
-                      AND nti.node_id = $2
-                )
-                OR (t.visibility = 'generic' AND t.desired_state = 'present')
+             WHERE (t.visibility = 'generic' AND t.desired_state = 'present')
                 OR EXISTS (
                     SELECT 1
                     FROM sandboxes sb
@@ -796,6 +778,10 @@ impl ClusterApi for ClusterApiService {
             }));
         }
 
+        // Visibility follows the node's placement, as the release lookups do.
+        // The one addition is a template the node still holds while it is
+        // being retired: the node must hear `present = false` to delete it.
+        // Inventory is node-reported, so it never admits a present template.
         let rows = sqlx::query_as::<_, TemplateDesiredStateRow>(
             sql!("WITH requested AS (
                  SELECT DISTINCT UNNEST($1::TEXT[]) AS template
@@ -846,13 +832,7 @@ impl ClusterApi for ClusterApiService {
                     ON bsp.template = r.template
              LEFT JOIN local_inventory li
                     ON li.template_name = r.template
-             WHERE EXISTS (
-                    SELECT 1
-                    FROM node_template_inventory nti
-                    WHERE nti.template_name = r.template
-                      AND nti.node_id = $3
-                )
-                OR (t.visibility = 'generic' AND t.desired_state = 'present')
+             WHERE (t.visibility = 'generic' AND t.desired_state = 'present')
                 OR EXISTS (
                     SELECT 1
                     FROM sandboxes sb
@@ -875,6 +855,12 @@ impl ClusterApi for ClusterApiService {
                             AND g.granted_at > NOW() - INTERVAL '1 hour')
                            OR (g.builder_node_id = $3
                                AND g.granted_at > NOW() - INTERVAL '7 days'))
+                ))
+                OR (t.desired_state <> 'present' AND EXISTS (
+                    SELECT 1
+                    FROM node_template_inventory nti
+                    WHERE nti.template_name = r.template
+                      AND nti.node_id = $3
                 ))"),
         )
         .bind(&templates)

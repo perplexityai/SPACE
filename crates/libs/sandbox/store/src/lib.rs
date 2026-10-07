@@ -5,7 +5,7 @@
 //! following the per-table store convention: executor-generic free functions,
 //! a typed record, `sql!` locators, and a small error enum. Verbs
 //! so far: [`get`], [`update_desired_state`],
-//! [`any_undescribed_artifact_owner`].
+//! [`any_undescribed_artifact_owner`], [`network_policy_inputs_placed_on`].
 //!
 //! # Boundaries
 //!
@@ -64,6 +64,7 @@ use pplx_space_sandbox_portability::{
     artifact_has_durable_copy, sandbox_attached_anywhere, sandbox_attached_to_node,
 };
 use serde::{Deserialize, Serialize};
+use sqlx::types::JsonValue;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -151,6 +152,55 @@ pub async fn get(
     .fetch_optional(executor)
     .await?;
     Ok(record)
+}
+
+/// The network-policy inputs of one sandbox placed on a node: its own
+/// override, its generation, and the policy of its template.
+///
+/// Both documents are returned untyped: this crate does not own the
+/// network-policy schema, so the caller that does decodes them at its
+/// boundary.
+#[derive(Clone, Debug, sqlx::FromRow)]
+pub struct SandboxNetworkPolicyInputs {
+    pub sandbox_id: SandboxId,
+    pub template_id: Option<String>,
+    /// `sandboxes.network_policy_override_json`; `None` when the sandbox
+    /// inherits its template's policy.
+    pub network_policy_json: Option<JsonValue>,
+    pub network_policy_generation: i64,
+    /// `templates.network_policy_json` of the sandbox's template, when the
+    /// template exists and has one.
+    pub template_network_policy_json: Option<JsonValue>,
+}
+
+/// The network-policy inputs for those of `sandbox_ids` that are placed on
+/// `node_id`, active or as the target of a pending migration. A requested id
+/// that is not placed there is absent from the result, not an error: the
+/// caller is a node asking about its own set.
+pub async fn network_policy_inputs_placed_on(
+    executor: impl sqlx::PgExecutor<'_>,
+    node_id: NodeId,
+    sandbox_ids: &[SandboxId],
+) -> Result<Vec<SandboxNetworkPolicyInputs>, SandboxStoreError> {
+    if sandbox_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let rows = sqlx::query_as::<_, SandboxNetworkPolicyInputs>(sql!(
+        "SELECT s.id AS sandbox_id,
+                s.template_id,
+                s.network_policy_override_json AS network_policy_json,
+                s.network_policy_generation,
+                t.network_policy_json AS template_network_policy_json
+         FROM sandboxes s
+         LEFT JOIN templates t ON t.name = s.template_id
+         WHERE s.id = ANY($1)
+           AND (s.active_node_id = $2 OR s.target_node_id = $2)"
+    ))
+    .bind(sandbox_ids)
+    .bind(node_id)
+    .fetch_all(executor)
+    .await?;
+    Ok(rows)
 }
 
 /// One of `candidates` that this node may still be holding local bytes for, if

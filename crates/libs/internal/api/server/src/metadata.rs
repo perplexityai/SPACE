@@ -32,13 +32,43 @@ pub(super) struct TemplatePolicyRow {
     pub(super) network_policy_generation: i64,
 }
 
-#[derive(Debug, Clone, FromRow)]
+#[derive(Debug, Clone)]
 pub(super) struct SandboxPolicyRow {
     pub(super) sandbox_id: SandboxId,
     pub(super) template_id: Option<String>,
     pub(super) network_policy_json: Option<Json<pplx_space_net_common::NetworkPolicy>>,
     pub(super) network_policy_generation: i64,
     pub(super) template_network_policy_json: Option<Json<NetworkPolicyV1>>,
+}
+
+/// The store returns the two policy documents untyped; decoding them here
+/// keeps the policy schema with its owner. A stored document that no longer
+/// parses is an internal error, as a failed column decode was before.
+impl TryFrom<pplx_space_sandbox_store::SandboxNetworkPolicyInputs> for SandboxPolicyRow {
+    type Error = Status;
+
+    fn try_from(row: pplx_space_sandbox_store::SandboxNetworkPolicyInputs) -> Result<Self, Status> {
+        let invalid = |column: &str, error: serde_json::Error| {
+            Status::internal(format!("stored {column} is invalid: {error}"))
+        };
+        Ok(Self {
+            sandbox_id: row.sandbox_id,
+            template_id: row.template_id,
+            network_policy_json: row
+                .network_policy_json
+                .map(serde_json::from_value)
+                .transpose()
+                .map_err(|error| invalid("sandbox network policy override", error))?
+                .map(Json),
+            network_policy_generation: row.network_policy_generation,
+            template_network_policy_json: row
+                .template_network_policy_json
+                .map(serde_json::from_value)
+                .transpose()
+                .map_err(|error| invalid("template network policy", error))?
+                .map(Json),
+        })
+    }
 }
 
 /// The generation the node fences a sandbox's effective policy on.
