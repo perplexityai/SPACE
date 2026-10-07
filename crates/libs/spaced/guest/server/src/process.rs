@@ -51,7 +51,7 @@ type ExitObserver = ProcessExitObserver;
 type ExitObserver = ();
 
 /// A published process, owned by the start's tracked task until its exit is
-/// recorded and its record's retention ends.
+/// recorded. The registry's reaper ends its record's retention.
 struct ProcessSupervision {
     child: tokio::process::Child,
     exit_observer: ExitObserver,
@@ -154,11 +154,13 @@ impl ProcessSupervision {
         drop(exit_observer);
         #[cfg(not(target_os = "linux"))]
         let () = exit_observer;
-        tokio::select! {
-            _ = shutdown.cancelled() => {},
-            _ = tokio::time::sleep(IDEMPOTENCY_RECORD_TTL) => {},
-        }
-        registry.remove_if_expired(&process_id);
+        // The record stays for `IDEMPOTENCY_RECORD_TTL`; the registry's single
+        // reaper removes it. Waiting here instead kept this whole task (its
+        // future, about 2 KiB) alive for the retention of every start, so at
+        // sustained start rates spaced held starts/s x 60 s of them: ~48 MiB
+        // at 450 starts/s, though at most 128 records exist.
+        drop(process_id);
+        registry.ensure_reaper(shutdown);
     }
 }
 
@@ -465,6 +467,9 @@ pub(super) struct ProcessRegistry {
     records: Arc<DashMap<ProcessId, ProcessEntry>>,
     record_slots: Arc<Semaphore>,
     shared_output_slots: Arc<Semaphore>,
+    /// Whether the retention reaper is running. It runs only while a
+    /// completed record is retained, so an idle daemon has no timer.
+    reaper_running: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// A process id in use: by an admitted start that has not published its
@@ -564,6 +569,7 @@ impl Default for ProcessRegistry {
             records: Arc::new(DashMap::new()),
             record_slots: Arc::new(Semaphore::new(PROCESS_RECORD_LIMIT)),
             shared_output_slots: Arc::new(Semaphore::new(PROCESS_OUTPUT_SHARED_BYTES)),
+            reaper_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 }
@@ -920,6 +926,16 @@ impl ProcessEventJournal {
             .expect("process output journal lock poisoned")
             .completed_at
             .is_some_and(|completed_at| completed_at.elapsed() > IDEMPOTENCY_RECORD_TTL)
+    }
+
+    /// Moves the completion time back, as if `by` had passed since.
+    #[cfg(all(test, target_os = "linux"))]
+    fn backdate_completion(&self, by: Duration) {
+        let mut state = self
+            .state
+            .lock()
+            .expect("process output journal lock poisoned");
+        state.completed_at = state.completed_at.map(|completed_at| completed_at - by);
     }
 
     fn completed_at(&self) -> Option<Instant> {
@@ -1328,15 +1344,56 @@ impl ProcessRegistry {
         })
     }
 
-    fn remove_if_expired(&self, process_id: &ProcessId) {
-        if self
-            .records
-            .get(process_id)
-            .and_then(|entry| entry.record().map(|record| record.journal.is_expired()))
-            .unwrap_or(false)
-        {
-            self.records.remove(process_id);
+    /// Removes completed records whose retention has ended. One task at most:
+    /// it sleeps until the earliest record expires and exits when no completed
+    /// record is retained; the next process to complete starts it again.
+    fn ensure_reaper(&self, shutdown: tokio_util::sync::CancellationToken) {
+        use std::sync::atomic::Ordering;
+        if self.reaper_running.swap(true, Ordering::AcqRel) {
+            return;
         }
+        let registry = self.clone();
+        drop(tokio::spawn(async move {
+            loop {
+                registry.remove_expired();
+                let Some(next) = registry.next_expiry() else {
+                    registry.reaper_running.store(false, Ordering::Release);
+                    // A record completed after the look above may have seen the
+                    // reaper as running and not started one: look again.
+                    if registry.next_expiry().is_some()
+                        && !registry.reaper_running.swap(true, Ordering::AcqRel)
+                    {
+                        continue;
+                    }
+                    return;
+                };
+                tokio::select! {
+                    () = tokio::time::sleep_until(tokio::time::Instant::from_std(next)) => {}
+                    () = shutdown.cancelled() => {
+                        registry.reaper_running.store(false, Ordering::Release);
+                        return;
+                    }
+                }
+            }
+        }));
+    }
+
+    fn remove_expired(&self) {
+        self.records.retain(|_, entry| {
+            !entry
+                .record()
+                .is_some_and(|record| record.journal.is_expired())
+        });
+    }
+
+    /// When the earliest retained completed record expires (just after, as
+    /// expiry is strictly past the TTL).
+    fn next_expiry(&self) -> Option<Instant> {
+        self.records
+            .iter()
+            .filter_map(|entry| entry.record()?.journal.completed_at())
+            .min()
+            .map(|completed_at| completed_at + IDEMPOTENCY_RECORD_TTL + Duration::from_millis(1))
     }
 
     fn list(&self) -> Vec<ProcessInfo> {

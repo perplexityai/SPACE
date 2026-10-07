@@ -1240,3 +1240,48 @@ fn pty_descriptors_are_close_on_exec() {
         assert!(flags.contains(FdFlag::FD_CLOEXEC));
     }
 }
+
+// An exited process's task ends once its exit is recorded; the record's
+// retention belongs to the registry's single reaper. A task kept alive per
+// start for that window made spaced's memory grow with the start rate.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn an_exited_process_task_does_not_wait_out_its_record_retention() {
+    let service = cancellation_service();
+    let response = Process::start(&service, cancellation_start_request())
+        .await
+        .expect("process starts");
+    let mut events = response.into_inner();
+    while let Some(event) = events.next().await {
+        event.expect("process stream remains successful");
+    }
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !service.inner.process_tasks.is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the exited process's task ends without waiting out the retention");
+    let registry = &service.inner.processes;
+    assert_eq!(registry.records.len(), 1, "the record is still retained");
+    assert!(registry.next_expiry().is_some());
+    assert!(
+        registry
+            .reaper_running
+            .load(std::sync::atomic::Ordering::Acquire),
+        "the reaper owns the retention"
+    );
+
+    // Once the retention has passed, the reaper's pass removes the record and
+    // has nothing left to wait for.
+    for entry in registry.records.iter() {
+        entry
+            .record()
+            .expect("published")
+            .journal
+            .backdate_completion(IDEMPOTENCY_RECORD_TTL + Duration::from_secs(1));
+    }
+    registry.remove_expired();
+    assert_eq!(registry.records.len(), 0);
+    assert_eq!(registry.next_expiry(), None);
+}
