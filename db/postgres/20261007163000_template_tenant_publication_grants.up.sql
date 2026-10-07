@@ -35,9 +35,9 @@ CREATE TABLE IF NOT EXISTS template_tenant_publication_grants (
     -- Organization the build was authorized for and that owns its output.
     org_id          UUID NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
     -- Builder node that accepted the build, recorded from the `StartBuild`
-    -- response. NULL until then. A deleted node clears the pin rather than
-    -- deleting the grant, so the row falls back to the unpinned phase.
-    builder_node_id UUID REFERENCES nodes(id) ON DELETE SET NULL,
+    -- response. NULL until then. Deleting the node revokes the grant so it
+    -- cannot become available to other builders through the unpinned phase.
+    builder_node_id UUID REFERENCES nodes(id) ON DELETE CASCADE,
     granted_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
