@@ -254,6 +254,20 @@ pub(crate) fn data_plane_http_error(
         .into_response()
 }
 
+/// `Retry-After` from a backend retry hint, in whole seconds between one and
+/// a minute; none when the backend gave no hint.
+pub(crate) fn insert_retry_after(response: &mut Response, try_again: Option<std::time::Duration>) {
+    let Some(try_again) = try_again else {
+        return;
+    };
+    let seconds = try_again.as_millis().div_ceil(1000).clamp(1, 60);
+    if let Ok(value) = axum::http::HeaderValue::from_str(&seconds.to_string()) {
+        response
+            .headers_mut()
+            .insert(axum::http::header::RETRY_AFTER, value);
+    }
+}
+
 pub(crate) fn observe_data_plane_http_error(
     status: StatusCode,
     origin: ResponseOrigin,

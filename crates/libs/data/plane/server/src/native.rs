@@ -264,6 +264,9 @@ pub(super) async fn session_events(
                     let result = stream_bridge_error_label(&error);
                     pplx_space_metrics::data_plane::attach(session_id.kind().as_str(), result);
                     tracing::warn!(%error, "failed to start file-watch event stream");
+                    if let Some(response) = backend_refusal_http_error(&error) {
+                        return response;
+                    }
                     return data_plane_http_error(
                         StatusCode::SERVICE_UNAVAILABLE,
                         DataPlaneHttpErrorCode::StreamUnavailable,
@@ -1657,7 +1660,70 @@ async fn open_native_process_stream(
     .await
 }
 
+/// A backend refusal made before this request did anything (an admission
+/// limit, or the sandbox shutting down): retryable, with the backend's retry
+/// hint. It says nothing about an earlier attempt or an already running
+/// process, so the message claims only that this request was refused. The
+/// guest's own wording stays in the logs.
+fn backend_refusal_http_error(error: &StreamBridgeError) -> Option<Response> {
+    let StreamBridgeError::BackendStatus(status) = error else {
+        return None;
+    };
+    if !pplx_space_common_grpc::is_refused_before_start(status) {
+        return None;
+    }
+    let (http, code, message) = if status.code() == tonic::Code::ResourceExhausted {
+        (
+            StatusCode::TOO_MANY_REQUESTS,
+            DataPlaneHttpErrorCode::RateLimited,
+            "sandbox is at capacity; this request was refused",
+        )
+    } else {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            DataPlaneHttpErrorCode::ServiceUnavailable,
+            "sandbox is not accepting requests right now; this request was refused",
+        )
+    };
+    let mut response = data_plane_http_error(
+        http,
+        code,
+        message,
+        true,
+        ResponseOrigin::Node,
+        ResponseKind::Admission,
+    );
+    insert_retry_after(&mut response, pplx_space_common_grpc::retry_after(status));
+    Some(response)
+}
+
+fn guest_storage_full(status: &tonic::Status) -> bool {
+    status.code() == tonic::Code::ResourceExhausted
+        && status
+            .metadata()
+            .get(pplx_space_common_core::spaced::ERROR_REASON_METADATA_KEY)
+            .and_then(|value| value.to_str().ok())
+            == Some(pplx_space_common_core::spaced::GUEST_STORAGE_FULL)
+}
+
 fn process_stream_start_http_error(error: &StreamBridgeError) -> Response {
+    if let Some(response) = backend_refusal_http_error(error) {
+        return response;
+    }
+    // The sandbox's disk or quota is full: not retryable until space is freed,
+    // and named as such rather than as a generic start failure.
+    if let StreamBridgeError::BackendStatus(status) = error
+        && guest_storage_full(status)
+    {
+        return data_plane_http_error(
+            StatusCode::BAD_REQUEST,
+            DataPlaneHttpErrorCode::InvalidRequest,
+            "sandbox storage is full",
+            false,
+            ResponseOrigin::Node,
+            ResponseKind::BackendStatus,
+        );
+    }
     // Guest spawn failures are terminal for this command. Retrying a missing
     // executable or working directory cannot repair it; route identity repair
     // and transport failures must keep their existing retry contract.
@@ -1705,6 +1771,16 @@ fn process_stream_start_http_error(error: &StreamBridgeError) -> Response {
 }
 
 fn stream_start_error_frame(error: &StreamBridgeError) -> DataPlaneServerFrame {
+    // A refusal made before anything started is retryable here as on SSE.
+    if let StreamBridgeError::BackendStatus(status) = error
+        && pplx_space_common_grpc::is_refused_before_start(status)
+    {
+        return DataPlaneServerFrame::Error {
+            code: DataPlaneErrorCode::BackendStreamError,
+            message: format!("this request was refused: {}", status.message()),
+            retryable: true,
+        };
+    }
     let retryable = matches!(
         error,
         StreamBridgeError::BackendStatus(status)
@@ -1831,10 +1907,18 @@ pub(super) async fn bridge_file_watch_session(
     socket: WebSocket,
 ) -> Result<(), StreamBridgeError> {
     let watch = file_watch_request(&attached)?;
-    let (_client, mut stream) =
-        open_native_watch_stream(&state, session_id, &mut attached, watch.clone()).await?;
-
     let (mut sink, mut source) = socket.split();
+    // As for a process: a failed opening, a refusal included, reaches the
+    // client as an error frame rather than a dropped socket.
+    let (_client, mut stream) =
+        match open_native_watch_stream(&state, session_id, &mut attached, watch.clone()).await {
+            Ok(opened) => opened,
+            Err(error) => {
+                let _ = send_server_frame(&mut sink, &stream_start_error_frame(&error)).await;
+                let _ = sink.close().await;
+                return Err(error);
+            }
+        };
     let mut event_seq = 0_u64;
     let mut revocation_tick = revocation_check_interval(&state);
 

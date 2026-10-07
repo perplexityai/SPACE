@@ -470,6 +470,29 @@ pub(super) fn tonic_status_to_ecw_error(status: tonic::Status) -> EcwProxyError 
         .with_retry_after(ECW_BACKEND_BUSY_RETRY_AFTER)
         .with_backend_status(status);
     }
+    // The guest refused before starting anything: say when to come back.
+    // A capacity refusal is a 429; any other (a guest shutting down) keeps the
+    // status E2B clients expect for its code and gains the hint below.
+    let refusal_retry_after = pplx_space_common_grpc::is_refused_before_start(&status).then(|| {
+        pplx_space_common_grpc::retry_after(&status)
+            .unwrap_or(ECW_BACKEND_BUSY_RETRY_AFTER)
+            .clamp(
+                std::time::Duration::from_secs(1),
+                std::time::Duration::from_secs(60),
+            )
+    });
+    if let Some(try_again) = refusal_retry_after
+        && status.code() == tonic::Code::ResourceExhausted
+    {
+        return EcwProxyError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            status.message(),
+            ResponseOrigin::Spaced,
+            ResponseKind::Admission,
+        )
+        .with_retry_after(try_again)
+        .with_backend_status(status);
+    }
 
     let http_status = match status.code() {
         tonic::Code::InvalidArgument => StatusCode::BAD_REQUEST,
@@ -495,7 +518,12 @@ pub(super) fn tonic_status_to_ecw_error(status: tonic::Status) -> EcwProxyError 
         status.message().to_string()
     };
 
-    EcwProxyError::new(http_status, message, origin, kind).with_backend_status(status)
+    let error = EcwProxyError::new(http_status, message, origin, kind);
+    match refusal_retry_after {
+        Some(try_again) => error.with_retry_after(try_again),
+        None => error,
+    }
+    .with_backend_status(status)
 }
 
 fn tonic_status_needs_ecw_not_running_shape(status: &tonic::Status) -> bool {
@@ -514,6 +542,16 @@ fn tonic_status_needs_ecw_not_running_shape(status: &tonic::Status) -> bool {
 fn tonic_status_is_disk_full(status: &tonic::Status) -> bool {
     if status.code() != tonic::Code::ResourceExhausted {
         return false;
+    }
+    // The guest names its full disk or quota (EDQUOT included) in metadata;
+    // the message checks remain for node-side storage admission.
+    if status
+        .metadata()
+        .get(pplx_space_common_core::spaced::ERROR_REASON_METADATA_KEY)
+        .and_then(|value| value.to_str().ok())
+        == Some(pplx_space_common_core::spaced::GUEST_STORAGE_FULL)
+    {
+        return true;
     }
     let message = status.message().to_ascii_lowercase();
     message.contains("no space left on device")

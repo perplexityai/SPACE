@@ -338,7 +338,7 @@ pub async fn mkdir_file(
             },
         )
         .await
-        .map_err(controller_error)?;
+        .map_err(unprotected_mutation_error)?;
     Ok(Json(FileMutationResponse { ok: true }))
 }
 
@@ -370,7 +370,7 @@ pub async fn remove_file(
             },
         )
         .await
-        .map_err(controller_error)?;
+        .map_err(unprotected_mutation_error)?;
     Ok(Json(FileMutationResponse { ok: true }))
 }
 
@@ -446,7 +446,7 @@ pub async fn enable_file_change_tracking(
             },
         )
         .await
-        .map_err(controller_error)?;
+        .map_err(unprotected_mutation_error)?;
     Ok(Json(FileChangeTrackingResponse {
         monitoring_enabled: true,
         observed_since: response.observed_since.and_then(timestamp_to_rfc3339),
@@ -478,7 +478,7 @@ pub async fn disable_file_change_tracking(
             },
         )
         .await
-        .map_err(controller_error)?;
+        .map_err(unprotected_mutation_error)?;
     Ok(Json(FileMutationResponse { ok: true }))
 }
 
@@ -701,12 +701,36 @@ pub(in crate::routes::public) fn controller_error(error: ControllerError) -> Pub
                 .with_classification(ResponseOrigin::Node, ResponseKind::BackendStatus),
             retry_after,
         ),
+        // The sandbox did not answer within the budget; the operation may
+        // still complete, so mutations retry only with the same key.
+        StatusCode::GATEWAY_TIMEOUT | StatusCode::REQUEST_TIMEOUT => with_retry_after_hint(
+            PublicApiError::service_unavailable("sandbox did not answer in time")
+                .with_classification(ResponseOrigin::Node, ResponseKind::Timeout),
+            retry_after,
+        ),
         status if status.is_server_error() => {
             tracing::warn!(%error, "native file operation failed");
             PublicApiError::internal()
                 .with_classification(ResponseOrigin::Node, ResponseKind::BackendStatus)
         }
         _ => PublicApiError::internal(),
+    }
+}
+
+/// For a mutation whose `Idempotency-Key` the sandbox does not see (mkdir,
+/// remove, file-change tracking), a failure that may have left the change
+/// applied must not invite a blind retry: a repeated remove can delete a file
+/// recreated in between. A server error or timeout stays retryable only when
+/// the backend said it refused the request before doing anything; a retry
+/// hint is not that evidence. A 429, from any layer, is answered before work.
+fn unprotected_mutation_error(error: ControllerError) -> PublicApiError {
+    let ambiguous = !error.is_refused_before_start()
+        && (error.status().is_server_error() || error.status() == StatusCode::REQUEST_TIMEOUT);
+    let public = controller_error(error);
+    if ambiguous {
+        public.not_retryable()
+    } else {
+        public
     }
 }
 

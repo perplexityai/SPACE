@@ -36,6 +36,9 @@ pub struct ControllerError {
     /// operation for ECW translation.
     retry_after_header: Option<Duration>,
     retry_after_cause: Option<ControllerRetryAfterCause>,
+    /// The backend refused this request before doing any of its work, as its
+    /// status said (`pplx_space_common_grpc::is_refused_before_start`).
+    refused_before_start: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,7 +83,14 @@ impl ControllerError {
             retry_after: None,
             retry_after_header: None,
             retry_after_cause: None,
+            refused_before_start: false,
         }
+    }
+
+    /// Whether the backend said it refused this request before doing any of
+    /// its work. Only a backend status sets it; a retry hint alone does not.
+    pub fn is_refused_before_start(&self) -> bool {
+        self.refused_before_start
     }
 
     fn node_api_transport(
@@ -424,7 +434,20 @@ impl From<tonic::Status> for ControllerError {
                 format!("sandbox storage is full: {}", status.message()),
             );
         }
-        Self::new(http_status_for_grpc_code(status.code()), status.to_string())
+        // The backend's own message, not tonic's `code: …, message: …`
+        // rendering, and its retry hint (a refusal made before anything
+        // started carries one) as `Retry-After`.
+        let mut error = Self::new(
+            http_status_for_grpc_code(status.code()),
+            status.message().to_owned(),
+        );
+        error.refused_before_start = pplx_space_common_grpc::is_refused_before_start(&status);
+        match pplx_space_common_grpc::retry_after(&status) {
+            Some(try_again) => error.with_retry_after_header(
+                try_again.clamp(Duration::from_secs(1), Duration::from_secs(60)),
+            ),
+            None => error,
+        }
     }
 }
 
