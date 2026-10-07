@@ -11,22 +11,28 @@ and can't.
 Unit tests rarely catch that regression. Crates that read hooks generally
 enable `test-hooks` for their own tests, so in a test build a hook reads the
 environment exactly like a real read. This guard checks the source instead,
-over Rust files under `crates/` minus test files and inline `#[cfg(test)]`
-modules.
+over Rust files under `crates/`, skipping `target/`, test and bench files, and
+items under a `#[cfg(...)]` that mentions `test`.
 
-A *reader* is `test_hook`, `test_hook_var`, an import alias of either, or a
-function named `test_*` that passes one of its own string parameters to a reader
+A *reader* is `test_hook`, `test_hook_var`, an import alias of either in the
+same file, or a function named `test_*` in the same crate that passes one of
+its own string parameters, as a whole argument, to a reader
 (`EnvConfig::test_raw`, for example). Two rules:
 
 1. No reader call may name a documented variable, as a string literal or as a
    `&str` constant. A constant resolves in the reading file first, then in the
-   rest of its crate; a name that means different values across the crate is
-   left unresolved rather than guessed.
-2. A function that passes one of its own string parameters to a reader must be named
-   `test_*`. Otherwise its callers would hide reads from rule 1.
+   rest of its crate; a name with more than one value in that scope is left
+   unresolved rather than guessed.
+2. A function that passes one of its own string parameters, as a whole
+   argument, to a reader must be named `test_*`. Otherwise its callers would
+   hide reads from rule 1.
 
-Not covered: names built at run time (`format!`, `concat!`), constants defined
-by other constants, and hook reads forwarded through closures or macros.
+Not covered, by design, because a textual check can't follow them reliably:
+names built at run time (`format!`, `concat!`), constants defined by other
+constants or in another crate, and names forwarded through locals, closures,
+macros or generic `AsRef<str>` parameters. The guard's job is the common
+regression, a documented setting switched to a test-hook reader; review covers
+the rest.
 
 Run standalone (`python scripts/source_guards/env_test_hook_boundary.py`).
 """
@@ -49,11 +55,15 @@ FN_DEF = re.compile(r"\bfn\s+([a-z_][a-z0-9_]*)")
 # A call, with an optional turbofish: `name(`, `name::<T>(`.
 CALL = re.compile(r"\b([a-z_][a-z0-9_]*)\s*(?:::\s*<[^()]*?>\s*)?\(")
 ALIAS = re.compile(r"\b(test_hook_var|test_hook)\s+as\s+([a-z_][a-z0-9_]*)")
-TEST_MODULE = re.compile(r"#\[cfg\(test\)\]\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+\w+\s*\{")
+# `#[cfg(test)]`, `#[cfg(all(test, ...))]` and the like.
+TEST_CFG = re.compile(r"#\[cfg\([^\]]*\btest\b[^\]]*\)\]")
 NAME_ARG = re.compile(
     r'"(SPACE_[A-Z0-9_]+)"|(?<![A-Za-z0-9_"])((?:[A-Za-z_][A-Za-z0-9_]*::)*)([A-Z][A-Z0-9_]+)\b'
 )
-IDENT = re.compile(r"(?<![A-Za-z0-9_:.])([a-z_][a-z0-9_]*)(?![A-Za-z0-9_(!:])")
+# A parameter passed whole: `name`, `&name`, `&*name`, `name.as_str()`, ...
+WHOLE_ARGUMENT = re.compile(
+    r"&?\*?\s*([a-z_][a-z0-9_]*)(?:\.(?:as_str|as_ref|to_owned|to_string|clone)\(\))?"
+)
 STR_PARAMETER = re.compile(
     r"(?:^|,)\s*(?:mut\s+)?([a-z_][a-z0-9_]*)\s*:\s*(?:&\s*(?:'\w+\s+)?(?:mut\s+)?)?(?:str|String)\b"
 )
@@ -91,11 +101,10 @@ def code_only(text: str) -> str:
 
     while index < length:
         char = text[index]
-        previous = text[index - 1] if index else " "
-        raw = None
-        if char in "br" and not (previous.isalnum() or previous == "_"):
-            raw = RAW_STRING.match(text, index)
+        raw = RAW_STRING.match(text, index) if char in "br" else None
         if char == "'" and (literal := CHAR_LITERAL.match(text, index)):
+            # Blanked so a `'}'` can't end a brace match early.
+            blank(index + 1, literal.end() - 1)
             index = literal.end()
         elif raw or char == '"':
             if raw:
@@ -143,10 +152,17 @@ def matching(text: str, start: int, opener: str, closer: str) -> int:
     return len(text)
 
 
-def without_test_modules(text: str) -> str:
-    for module in reversed(list(TEST_MODULE.finditer(text))):
-        end = matching(text, module.end() - 1, "{", "}")
-        text = text[: module.start()] + re.sub(r"[^\n]", " ", text[module.start() : end]) + text[end:]
+def without_test_items(text: str) -> str:
+    """Blank every item under a test `cfg`, through its body or `;`."""
+    for cfg in reversed(list(TEST_CFG.finditer(text))):
+        brace, semicolon = text.find("{", cfg.end()), text.find(";", cfg.end())
+        if brace == -1 and semicolon == -1:
+            continue
+        if brace == -1 or (semicolon != -1 and semicolon < brace):
+            end = semicolon + 1
+        else:
+            end = matching(text, brace, "{", "}")
+        text = text[: cfg.start()] + re.sub(r"[^\n]", " ", text[cfg.start() : end]) + text[end:]
     return text
 
 
@@ -163,7 +179,7 @@ def sources(root: pathlib.Path) -> list[tuple[pathlib.Path, pathlib.Path, str]]:
         relative = path.relative_to(root)
         if "target" in relative.parts or is_test_source(relative):
             continue
-        text = without_test_modules(code_only(path.read_text()))
+        text = without_test_items(code_only(path.read_text()))
         found.append((relative, crate_of(root, relative), text))
     return found
 
@@ -208,28 +224,57 @@ def reader_calls(text: str, readers: set[str]):
             yield match, text[match.end() : matching(text, match.end() - 1, "(", ")") - 1]
 
 
+def top_level_arguments(arguments: str) -> list[str]:
+    parts, depth, current = [], 0, []
+    for char in arguments:
+        if char in "([{<":
+            depth += 1
+        elif char in ")]}>":
+            depth -= 1
+        if char == "," and depth == 0:
+            parts.append("".join(current))
+            current = []
+        else:
+            current.append(char)
+    parts.append("".join(current))
+    return [part.strip() for part in parts]
+
+
 def forwarded(arguments: str, function: Function | None) -> set[str]:
-    """The enclosing function's own parameters passed straight to a reader."""
+    """The enclosing function's own string parameters passed as a whole argument."""
     if function is None:
         return set()
-    return {name for name in IDENT.findall(arguments) if name in function.parameters}
+    names = set()
+    for argument in top_level_arguments(arguments):
+        whole = WHOLE_ARGUMENT.fullmatch(argument)
+        if whole and whole.group(1) in function.parameters:
+            names.add(whole.group(1))
+    return names
 
 
-def find_readers(files) -> set[str]:
-    readers = set(PRIMITIVES)
-    for _, _, text in files:
-        readers |= {alias for _, alias in ALIAS.findall(text)}
+def file_readers(text: str, crate_readers: set[str]) -> set[str]:
+    return set(PRIMITIVES) | crate_readers | {alias for _, alias in ALIAS.findall(text)}
+
+
+def find_readers(files) -> dict[pathlib.Path, set[str]]:
+    """Each crate's `test_*` wrappers, which count as readers only there."""
+    readers: dict[pathlib.Path, set[str]] = {crate: set() for _, crate, _ in files}
     while True:
-        found = set()
-        for _, _, text in files:
+        changed = False
+        for _, crate, text in files:
             defined = functions(text)
-            for call, arguments in reader_calls(text, readers):
+            for call, arguments in reader_calls(text, file_readers(text, readers[crate])):
                 owner = innermost(defined, call.start())
-                if owner and owner.name.startswith("test_") and forwarded(arguments, owner):
-                    found.add(owner.name)
-        if found <= readers:
+                if (
+                    owner
+                    and owner.name.startswith("test_")
+                    and owner.name not in readers[crate]
+                    and forwarded(arguments, owner)
+                ):
+                    readers[crate].add(owner.name)
+                    changed = True
+        if not changed:
             return readers
-        readers |= found
 
 
 def string_constants(text: str) -> dict[str, set[str]]:
@@ -242,7 +287,7 @@ def string_constants(text: str) -> dict[str, set[str]]:
 def violations(root: pathlib.Path) -> list[str]:
     settings = documented(root)
     files = sources(root)
-    readers = find_readers(files)
+    crate_readers = find_readers(files)
     by_crate: dict[pathlib.Path, dict[str, set[str]]] = {}
     for _, crate, text in files:
         for name, values in string_constants(text).items():
@@ -252,7 +297,7 @@ def violations(root: pathlib.Path) -> list[str]:
     for relative, crate, text in files:
         local = string_constants(text)
         defined = functions(text)
-        for call, arguments in reader_calls(text, readers):
+        for call, arguments in reader_calls(text, file_readers(text, crate_readers[crate])):
             line = f"{relative}:{text.count(chr(10), 0, call.start()) + 1}"
             reader = call.group(1)
             names: set[str] = set()
@@ -260,7 +305,8 @@ def violations(root: pathlib.Path) -> list[str]:
                 if literal:
                     names.add(literal)
                 elif path in ("", "Self::") and constant in local:
-                    names |= local[constant]
+                    if len(local[constant]) == 1:
+                        names |= local[constant]
                 elif len(values := by_crate.get(crate, {}).get(constant, set())) == 1:
                     names |= values
             for name in sorted(names & settings):

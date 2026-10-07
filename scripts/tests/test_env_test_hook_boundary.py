@@ -100,6 +100,19 @@ WRAPPER = "fn test_raw(var: &str) -> Option<String> { test_hook_var(var) }\n"
          '    test_read("SPACE_EXAMPLE_LIMIT");\n}'},
         # A char literal holding `"` doesn't swallow the read after it.
         {LIB: "let q = '\"'; let n = test_hook_var(\"SPACE_EXAMPLE_LIMIT\");"},
+        # Wrappers with `String`, generic or escaped-char surroundings.
+        {LIB: "fn test_raw(var: String) -> Option<String> { test_hook_var(&var) }\n"
+         'let n = test_raw("SPACE_EXAMPLE_LIMIT".to_owned());'},
+        {LIB: "fn test_parse<T: FromStr>(var: &str) -> Option<T> { test_hook_var(var)?.parse().ok() }\n"
+         'let n = test_parse::<u32>("SPACE_EXAMPLE_LIMIT");'},
+        {LIB: "let q = '\\\"'; let n = test_hook_var(\"SPACE_EXAMPLE_LIMIT\");"},
+        {LIB: "fn test_hook_fn<F: Fn(&str) -> u8>(var: &str) -> Option<String> { test_hook_var(var) }\n"
+         'let n = test_hook_fn("SPACE_EXAMPLE_LIMIT");'},
+        # `Self::` resolves in the reading file even when the crate is ambiguous.
+        {
+            LIB: 'impl C { const ENV: &str = "SPACE_EXAMPLE_LIMIT"; fn f() { test_hook_var(Self::ENV); } }',
+            "crates/libs/example/src/other.rs": 'impl D { const ENV: &str = "SPACE_EXAMPLE_TICK_SECS"; }',
+        },
         # A `//` inside a string doesn't hide the rest of the line.
         {LIB: 'let u = "http://x"; let n = test_hook_var("SPACE_EXAMPLE_LIMIT");'},
         {LIB: 'let b = br#"a"b // x"#; let n = test_hook_var("SPACE_EXAMPLE_LIMIT");'},
@@ -109,6 +122,8 @@ WRAPPER = "fn test_raw(var: &str) -> Option<String> { test_hook_var(var) }\n"
         "self-constant-in-sibling", "path-constant-over-local-name", "second-argument",
         "later-branch", "wrapper", "wrapper-with-env-argument", "turbofish-wrapper-of-wrapper",
         "import-alias", "local-constant-wins", "reader-inside-function", "char-quote-before-read",
+        "string-parameter-wrapper", "generic-wrapper", "escaped-char-before-read",
+        "generic-with-parens", "self-local-over-ambiguous-crate",
         "url-in-string", "byte-raw-string",
     ],
 )
@@ -126,6 +141,13 @@ def test_wrapper_not_named_test_fails(tmp_path: Path) -> None:
     failures = guard.violations(tree(tmp_path, {LIB: source}))
     assert len(failures) == 1, failures
     assert "`hook_u32` passes its parameter `name`" in failures[0]
+
+
+def test_mut_parameter_forwarded_outside_test_function_fails(tmp_path: Path) -> None:
+    source = "fn hook(mut name: &str) -> Option<String> { test_hook_var(name) }"
+    failures = guard.violations(tree(tmp_path, {LIB: source}))
+    assert len(failures) == 1, failures
+    assert "`hook` passes its parameter `name`" in failures[0]
 
 
 @pytest.mark.parametrize(
@@ -152,7 +174,33 @@ def test_wrapper_not_named_test_fails(tmp_path: Path) -> None:
         {LIB: '// test_hook_var("SPACE_EXAMPLE_LIMIT")\n'
          '/* a /* b */ test_hook_var("SPACE_EXAMPLE_LIMIT") */'},
         {LIB: "let q = '\"'; // test_hook_var(\"SPACE_EXAMPLE_LIMIT\")"},
+        # A parameter used inside an argument, not passed as one, isn't forwarding.
+        {LIB: 'fn tick(service: &str) -> Option<String> { test_hook(&scoped_env(service), "SPACE_EXAMPLE_TICK_SECS") }'},
+        {LIB: 'fn tick(prefix: &str) -> Option<String> { test_hook_var(&format!("{}_TICK", prefix)) }'},
+        {LIB: "impl C { fn f(&self, name: &str) -> Option<String> { test_hook_var(self.name) } }"},
+        {LIB: "fn tick(service: &str, env: &dyn Environment) -> Option<String> {\n"
+         '    test_hook(&service.env_for(env), "SPACE_EXAMPLE_TICK_SECS")\n}'},
+        # Two impls in one file may reuse a constant name for different variables.
+        {LIB: 'impl A { const ENV: &str = "SPACE_EXAMPLE_LIMIT"; fn f() { std::env::var(Self::ENV); } }\n'
+         'impl B { const ENV: &str = "SPACE_EXAMPLE_TICK_SECS"; fn g() { test_hook_var(Self::ENV); } }'},
+        # Readers and aliases from one crate don't count in another.
+        {
+            "crates/libs/one/Cargo.toml": "",
+            "crates/libs/one/src/lib.rs": "use pplx_space_common_core::env::test_hook_var as var;\n" + WRAPPER,
+            "crates/libs/two/Cargo.toml": "",
+            "crates/libs/two/src/lib.rs": "fn read(name: &str) { std::env::var(name) }\n"
+            'let n = std::env::var("SPACE_EXAMPLE_LIMIT");\n'
+            "struct Probe; impl Probe { fn test_raw(&self, url: &str) {} }\n"
+            "fn check(url: &str) { Probe.test_raw(url) }",
+        },
         # Test code may read anything.
+        {LIB: '#[cfg(test)]\n#[allow(clippy::unwrap_used)]\npub mod tests {\n'
+         '    fn reads() { test_hook_var("SPACE_EXAMPLE_LIMIT"); }\n}'},
+        {LIB: '#[cfg(all(test, target_os = "linux"))]\nmod tests {\n'
+         "    fn a() { let c = '}'; }\n"
+         '    fn reads() { test_hook_var("SPACE_EXAMPLE_LIMIT"); }\n}'},
+        {LIB: '#[cfg(test)]\nfn helper() { test_hook_var("SPACE_EXAMPLE_LIMIT"); }'},
+        {"crates/libs/example/benches/b.rs": 'let n = test_hook_var("SPACE_EXAMPLE_LIMIT");'},
         {LIB: '#[cfg(test)]\nmod tests {\n    fn reads() { test_hook_var("SPACE_EXAMPLE_LIMIT"); }\n}'},
         {"crates/libs/example/src/tests.rs": 'let n = test_hook_var("SPACE_EXAMPLE_LIMIT");'},
         {"crates/libs/example/src/store_tests.rs": 'let n = test_hook_var("SPACE_EXAMPLE_LIMIT");'},
@@ -182,7 +230,10 @@ def test_wrapper_not_named_test_fails(tmp_path: Path) -> None:
     ],
     ids=[
         "undocumented", "real-read", "non-reader-test-fn", "wrapper-definition",
-        "environment-argument", "nested-helper", "multi-line-import", "field", "string-mention",
+        "environment-argument", "nested-helper", "parameter-inside-argument",
+        "parameter-inside-format", "field-not-parameter", "parameter-starts-argument", "same-file-constant-twice",
+        "other-crate-readers", "test-module-with-attribute", "cfg-all-test-with-brace-char",
+        "cfg-test-function", "benches", "multi-line-import", "field", "string-mention",
         "comments", "char-quote", "inline-test-module", "tests-rs", "suffix-tests", "tests-dir",
         "per-file-constant", "ambiguous-constant", "other-crate-constant",
     ],

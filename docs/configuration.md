@@ -10,8 +10,8 @@ test hooks. They are read only by binaries built with the `test-hooks` Cargo
 feature (`pplx-space-common-core/test-hooks`), which the local kind image
 enables and release images never do. They are intentionally undocumented, and
 `scripts/source_guards/env_test_hook_boundary.py` fails CI if code names a
-variable listed here, directly or through a string constant, in a test-hook
-read.
+variable listed here in a test-hook read, directly or through a string constant
+from the same crate.
 
 Secrets are passed as files: set the `*_PATH` variable to a mounted file. The
 inline forms (`SPACE_ECW_CREDENTIAL_KEY`, `SPACE_ECW_CREDENTIAL_PREVIOUS_KEY`,

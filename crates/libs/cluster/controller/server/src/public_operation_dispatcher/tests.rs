@@ -57,8 +57,8 @@ fn m1_max_age_env_defaults_and_zero_disables() {
 
 // This crate's tests build with `test-hooks` on (a dev-dependency feature), so
 // they can't tell a real environment read from a test-hook read. The source
-// guard `scripts/source_guards/env_test_hook_boundary.py` keeps this knob, like
-// every documented setting, off the `test_*` readers.
+// guard `scripts/source_guards/env_test_hook_boundary.py` fails CI if this knob
+// is read through a `test_*` reader again.
 #[test]
 fn execution_concurrency_parses_and_clamps_from_the_environment() {
     const CONCURRENCY: &str = "SPACE_PUBLIC_OPERATION_DISPATCHER_EXECUTION_CONCURRENCY";
