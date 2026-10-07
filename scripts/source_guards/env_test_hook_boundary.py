@@ -11,9 +11,13 @@ and can't.
 Unit tests rarely catch that regression. Crates that read hooks generally
 enable `test-hooks` for their own tests, so in a test build a hook reads the
 environment exactly like a real read. This guard checks the source instead,
-over Rust files under `crates/`, skipping `target/`, test and bench files, and
-items compiled only for tests: an item under `#[cfg(test)]` or
-`#[cfg(all(test, ...))]`, or a file whose inner `#![cfg(...)]` requires `test`.
+over Rust files under `crates/`, skipping `target/` and test and bench files
+(`tests.rs`, `*_tests.rs`, `tests/`, `benches/`).
+
+Test-only code inside a production file (`#[cfg(test)]` items) is checked like
+the rest. Telling it apart takes a Rust parser; a textual guess that skips too
+much hides release code, which is the one failure this guard can't afford. A
+test helper that trips the guard belongs in a test file anyway.
 
 A *reader* is `test_hook`, `test_hook_var`, an import alias of either in the
 same file, or a function named `test_*` (in the same crate, or anywhere if it's
@@ -22,9 +26,9 @@ that passes one of its own string parameters, as a whole argument, to a reader
 (`EnvConfig::test_raw`, for example). Two rules:
 
 1. No reader call may name a documented variable, as a string literal or as a
-   `&str` constant. A constant resolves in the reading file first, then in the
-   rest of its crate; a name with more than one value in that scope is left
-   unresolved rather than guessed.
+   `&str` constant. A constant resolves in the narrowest scope that defines it:
+   its `impl` block for `Self::`, then the reading file, then its crate. A name
+   with several values there stands for all of them, so the check fails closed.
 2. A function that passes one of its own string parameters, as a whole
    argument, to a reader must be named `test_*`. Otherwise its callers would
    hide reads from rule 1.
@@ -34,8 +38,8 @@ names built at run time (`format!`, `concat!`), constants defined by other
 constants or in another crate, names reached through fields or indexing, hooks
 passed as function values, and names forwarded through locals, closures,
 macros, type aliases, pattern parameters or generic `AsRef<str>` parameters.
-Test-only modules declared with `#[cfg(test)] mod x;` are scanned unless their
-file is named like a test file. The guard's job is the common
+A test module declared with `#[cfg(test)] mod x;` is scanned unless its file is
+named like a test file. The guard's job is the common
 regression, a documented setting switched to a test-hook reader; review covers
 the rest.
 
@@ -60,18 +64,6 @@ FN_DEF = re.compile(r"\bfn\s+([a-z_][a-z0-9_]*)")
 # A call, with an optional turbofish: `name(`, `name::<T>(`.
 CALL = re.compile(r"\b([a-z_][a-z0-9_]*)\s*(?:::\s*<[^()]*?>\s*)?\(")
 ALIAS = re.compile(r"\b(test_hook_var|test_hook)\s+as\s+([a-z_][a-z0-9_]*)")
-# An outer `cfg` attribute; `test_only_cfg` decides whether it needs `test`.
-CFG_ATTRIBUTE = re.compile(r"#\[cfg\((.*?)\)\]", re.S)
-INNER_CFG = re.compile(r"#!\[cfg\((.*?)\)\]", re.S)
-INNER_ATTRIBUTES = re.compile(r"\A(?:\s*#!\[.*?\]\s*)*", re.S)
-ATTRIBUTE = re.compile(r"\s*#\[[^\]]*\]")
-ITEM = re.compile(
-    r"\s*(?:pub(?:\([^)]*\))?\s+)?(?:(?:async|const|unsafe|extern(?:\s+\"[^\"]*\")?)\s+)*"
-    # Keywords that introduce a name must be followed by one, so a field
-    # named `union` or a `fn() -> u8` field type isn't taken for an item.
-    r"(?:(?:mod|fn|struct|enum|union|static|type|trait)\s+(?:mut\s+)?[A-Za-z_]"
-    r"|const\s+(?:fn\b|[A-Za-z_])|(?:impl|use)\b|macro_rules!|thread_local!)"
-)
 NAME_ARG = re.compile(
     r'"(SPACE_[A-Z0-9_]+)"|(?<![A-Za-z0-9_"])((?:[A-Za-z_][A-Za-z0-9_]*::)*)([A-Z][A-Z0-9_]*)\b'
 )
@@ -166,64 +158,6 @@ def matching(text: str, start: int, opener: str, closer: str) -> int:
     return len(text)
 
 
-def test_only_cfg(predicate: str) -> bool:
-    """Whether a `cfg` predicate holds only in test builds.
-
-    `test` and `all(..., test, ...)` do; `not(test)` (release code) and
-    `any(test, ...)` don't.
-    """
-    predicate = predicate.strip()
-    if predicate == "test":
-        return True
-    inner = re.fullmatch(r"all\((.*)\)", predicate, re.S)
-    return bool(inner) and any(part == "test" for part in top_level_arguments(inner.group(1)))
-
-
-def item_end(text: str, start: int) -> int:
-    """The end of the item starting at `start`: its `;` or its `{...}` body.
-
-    Only `()` and `[]` nest, so the `;` in `[u8; 4]` doesn't end the item.
-    `<` isn't tracked: in an expression it's a comparison or a shift that never
-    closes, and generics never hold a top-level `;` or `{`.
-    """
-    depth = 0
-    for index in range(start, len(text)):
-        char = text[index]
-        if char in "([":
-            depth += 1
-        elif char in ")]}":
-            if depth == 0:
-                return index  # the enclosing struct, enum or call closes first
-            depth -= 1
-        elif depth == 0 and char in ";,":
-            return index + 1
-        elif depth == 0 and char == "{":
-            return matching(text, index, "{", "}")
-    return len(text)
-
-
-def without_test_items(text: str) -> str:
-    """Blank every item compiled only for tests.
-
-    Only an attribute on an item (`mod`, `fn`, `impl`, ...) counts. A test
-    `cfg` on a field, variant or expression leaves the code around it alone.
-    """
-    header = INNER_ATTRIBUTES.match(text).group(0)
-    if any(test_only_cfg(cfg.group(1)) for cfg in INNER_CFG.finditer(header)):
-        return re.sub(r"[^\n]", " ", text)
-    for cfg in reversed(list(CFG_ATTRIBUTE.finditer(text))):
-        if not test_only_cfg(cfg.group(1)):
-            continue
-        index = cfg.end()
-        while attribute := ATTRIBUTE.match(text, index):
-            index = attribute.end()
-        if not ITEM.match(text, index):
-            continue
-        end = item_end(text, index)
-        text = text[: cfg.start()] + re.sub(r"[^\n]", " ", text[cfg.start() : end]) + text[end:]
-    return text
-
-
 def crate_of(root: pathlib.Path, relative: pathlib.Path) -> pathlib.Path:
     for parent in (root / relative).parents:
         if (parent / "Cargo.toml").exists() or parent == root:
@@ -237,7 +171,7 @@ def sources(root: pathlib.Path) -> list[tuple[pathlib.Path, pathlib.Path, str]]:
         relative = path.relative_to(root)
         if "target" in relative.parts or is_test_source(relative):
             continue
-        text = without_test_items(code_only(path.read_text()))
+        text = code_only(path.read_text())
         found.append((relative, crate_of(root, relative), text))
     return found
 
@@ -251,7 +185,24 @@ class Function:
 
 
 TRAIT = re.compile(r"\btrait\s+[A-Za-z_]\w*[^;{]*\{")
-IMPL_FOR = re.compile(r"\bimpl\b[^;{]*\bfor\b[^;{]*\{")
+# `impl Trait for Type`; a `for<'a>` bound in an inherent impl doesn't count.
+IMPL_FOR = re.compile(r"\bimpl\b[^;{]*\bfor\s+(?!<)[^;{]*\{")
+
+
+def generics_end(text: str, start: int) -> int:
+    """The index just past the `>` closing the generics opened at `start`.
+
+    The `>` of `->` (`F: Fn() -> u8`) doesn't close anything.
+    """
+    depth = 0
+    for index in range(start, len(text)):
+        if text[index] == "<":
+            depth += 1
+        elif text[index] == ">" and text[index - 1] != "-":
+            depth -= 1
+            if depth == 0:
+                return index + 1
+    return len(text)
 
 
 def body_start(text: str, index: int) -> int | None:
@@ -283,7 +234,7 @@ def functions(text: str) -> list[Function]:
     for match in FN_DEF.finditer(text):
         index = match.end()
         if text[index:].lstrip().startswith("<"):
-            index = matching(text, text.index("<", index), "<", ">")
+            index = generics_end(text, text.index("<", index))
         open_paren = text.find("(", index)
         if open_paren == -1:
             continue
@@ -385,6 +336,18 @@ def find_readers(files) -> dict[pathlib.Path, set[str]]:
             return readers
 
 
+IMPL = re.compile(r"\bimpl\b[^;{]*\{")
+
+
+def enclosing_impl_constants(text: str, impls, offset: int) -> dict[str, set[str]]:
+    """The constants of the innermost `impl` block around `offset`."""
+    around = [(start, end) for start, end in impls if start <= offset < end]
+    if not around:
+        return {}
+    start, end = min(around, key=lambda span: span[1] - span[0])
+    return string_constants(text[start:end])
+
+
 def string_constants(text: str) -> dict[str, set[str]]:
     constants: dict[str, set[str]] = {}
     for name, value in STR_CONST.findall(text):
@@ -405,6 +368,7 @@ def violations(root: pathlib.Path) -> list[str]:
     for relative, crate, text in files:
         local = string_constants(text)
         defined = functions(text)
+        impls = [(m.end() - 1, matching(text, m.end() - 1, "{", "}")) for m in IMPL.finditer(text)]
         visible = crate_readers[crate] | crate_readers[PUBLIC]
         for call, arguments in reader_calls(text, file_readers(text, visible)):
             line = f"{relative}:{text.count(chr(10), 0, call.start()) + 1}"
@@ -413,11 +377,17 @@ def violations(root: pathlib.Path) -> list[str]:
             for literal, path, constant in NAME_ARG.findall(arguments):
                 if literal:
                     names.add(literal)
-                elif path in ("", "Self::") and constant in local:
-                    if len(local[constant]) == 1:
-                        names |= local[constant]
-                elif len(values := by_crate.get(crate, {}).get(constant, set())) == 1:
-                    names |= values
+                    continue
+                # Fail closed: a name stands for every value it has in the
+                # narrowest scope that defines it, so a same-named constant
+                # can't make a documented one disappear.
+                scopes = []
+                if path == "Self::":
+                    scopes.append(enclosing_impl_constants(text, impls, call.start()))
+                if path in ("", "Self::"):
+                    scopes.append(local)
+                scopes.append(by_crate.get(crate, {}))
+                names |= next((scope[constant] for scope in scopes if constant in scope), set())
             for name in sorted(names & settings):
                 failures.append(
                     f"{line}: {name} is documented in {DOCS} but read through test "

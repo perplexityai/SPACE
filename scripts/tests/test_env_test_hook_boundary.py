@@ -156,6 +156,24 @@ WRAPPER = "fn test_raw(var: &str) -> Option<String> { test_hook_var(var) }\n"
         # A `;` inside the return type doesn't drop the wrapper.
         {LIB: "fn test_key(name: &str) -> Option<[u8; 4]> { test_hook_var(name).map(|_| [0; 4]) }\n"
          'let k = test_key("SPACE_EXAMPLE_LIMIT");'},
+        # Test-only code inside a production file is checked like the rest.
+        {LIB: "#[cfg(test)]\nmod tests {\n    fn reads() { test_hook_var(\"SPACE_EXAMPLE_LIMIT\"); }\n}"},
+        {LIB: "#[cfg(test)]\nfn helper() { test_hook_var(\"SPACE_EXAMPLE_LIMIT\"); }"},
+        {"crates/libs/example/src/fixtures.rs": "#![cfg(test)]\nfn r() { test_hook_var(\"SPACE_EXAMPLE_LIMIT\"); }"},
+        # A same-named constant elsewhere can't make a documented one disappear.
+        {
+            LIB: "let n = test_hook_var(gc::ENV);",
+            "crates/libs/example/src/gc.rs": 'const ENV: &str = "SPACE_EXAMPLE_TICK_SECS";',
+            "crates/libs/example/src/evict.rs": 'const ENV: &str = "SPACE_EXAMPLE_LIMIT";',
+        },
+        {LIB: 'const GRACE: &str = "SPACE_EXAMPLE_LIMIT";\n'
+         "fn grace() -> Option<String> { test_hook_var(GRACE) }\n"
+         "#[cfg(test)]\nfn fixture() -> Result<(), String> {\n"
+         '    const GRACE: &str = "SPACE_SYNTHETIC_FIXTURE";\n    Ok(())\n}'},
+        # Generics holding `->` don't hide the real parameter list.
+        {LIB: "fn test_knob<F: FnOnce() -> Result<(), E>, E>(var: &str, f: F) -> Option<String> {\n"
+         "    let _ = f();\n    test_hook_var(var)\n}\n"
+         'let n = test_knob("SPACE_EXAMPLE_LIMIT", || Ok(()));'},
         # A single-letter constant.
         {LIB: 'const X: &str = "SPACE_EXAMPLE_LIMIT";\nlet n = test_hook_var(X);'},
         # A `//` inside a string doesn't hide the rest of the line.
@@ -173,7 +191,9 @@ WRAPPER = "fn test_raw(var: &str) -> Option<String> { test_hook_var(var) }\n"
         "cfg-any-test", "pub-wrapper-other-crate", "after-test-comparison", "after-test-shift",
         "inner-cfg-not-test-file", "trait-wrapper-other-crate",
         "after-test-union-field", "after-test-fn-tuple-field", "trait-impl-wrapper-other-crate",
-        "array-return-wrapper", "single-letter-constant",
+        "array-return-wrapper", "test-module-in-production-file", "test-function-in-production-file",
+        "inner-cfg-test-file", "ambiguous-crate-constant", "shadowed-by-test-constant",
+        "generics-with-arrow", "single-letter-constant",
         "url-in-string", "byte-raw-string",
     ],
 )
@@ -252,25 +272,13 @@ READ = 'test_hook_var("SPACE_EXAMPLE_LIMIT")'
           id="string-mention"),
         P({LIB: f"// {READ}\n/* a /* b */ {READ} */"}, id="comments"),
         P({LIB: f"let q = '\"'; // {READ}"}, id="char-quote"),
-        # Test code may read anything.
-        P({LIB: f"#[cfg(test)]\nmod tests {{\n    fn reads() {{ {READ}; }}\n}}"}, id="inline-test-module"),
-        P({LIB: f"#[cfg(test)]\n#[allow(clippy::unwrap_used)]\npub mod tests {{\n    fn reads() {{ {READ}; }}\n}}"},
-          id="test-module-with-attribute"),
-        P({LIB: '#[cfg(all(test, target_os = "linux"))]\nmod tests {\n'
-               "    fn a() { let c = '}'; }\n"
-               f"    fn reads() {{ {READ}; }}\n}}"}, id="cfg-all-test-with-brace-char"),
-        P({LIB: f"#[cfg(test)]\nfn helper() {{ {READ}; }}"}, id="cfg-test-function"),
-        P({LIB: f"#[cfg(test)]\nfn helper(buf: [u8; 4]) {{ {READ}; }}"}, id="cfg-test-function-array-param"),
-        P({LIB: f"#[cfg(all(test, unix))]\nimpl S {{ fn r() {{ {READ}; }} }}"}, id="cfg-all-test-impl"),
-        P({LIB: f"#[cfg(test)]\nmacro_rules! probe {{ () => {{ {READ} }} }}"}, id="cfg-test-macro"),
-        P({"crates/libs/example/src/fixtures.rs": f"#![cfg(test)]\nfn r() {{ {READ}; }}"},
-          id="inner-cfg-test-file"),
+        # Test files may read anything.
         P({"crates/libs/example/src/tests.rs": f"let n = {READ};"}, id="tests-rs"),
         P({"crates/libs/example/src/store_tests.rs": f"let n = {READ};"}, id="suffix-tests"),
         P({"crates/libs/example/tests/it.rs": f"let n = {READ};"}, id="tests-dir"),
         P({"crates/libs/example/benches/b.rs": f"let n = {READ};"}, id="benches"),
-        # Constants: the reading file wins, ambiguity isn't guessed, other
-        # crates don't count.
+        # Constants: the narrowest defining scope wins, and other crates don't
+        # count.
         P({
             "crates/libs/example/src/a.rs": 'const ENV: &str = "SPACE_EXAMPLE_LIMIT";\n'
             "let n = std::env::var(ENV);",
@@ -281,17 +289,20 @@ READ = 'test_hook_var("SPACE_EXAMPLE_LIMIT")'
                'impl B { const ENV: &str = "SPACE_EXAMPLE_TICK_SECS"; fn g() { test_hook_var(Self::ENV); } }'},
           id="same-file-constant-twice"),
         P({
-            LIB: "let n = test_hook_var(gc::ENV);",
-            "crates/libs/example/src/gc.rs": 'const ENV: &str = "SPACE_EXAMPLE_TICK_SECS";',
-            "crates/libs/example/src/evict.rs": 'const ENV: &str = "SPACE_EXAMPLE_LIMIT";',
-        }, id="ambiguous-constant"),
-        P({
             "crates/libs/one/Cargo.toml": "",
             "crates/libs/one/src/lib.rs": "let n = test_hook_var(gc::ENV);",
             "crates/libs/one/src/gc.rs": 'const ENV: &str = "SPACE_EXAMPLE_TICK_SECS";',
             "crates/libs/two/Cargo.toml": "",
             "crates/libs/two/src/lib.rs": 'const ENV: &str = "SPACE_EXAMPLE_LIMIT";',
         }, id="other-crate-constant"),
+        # A `for<'a>` bound doesn't make an inherent impl a trait impl.
+        P({
+            "crates/libs/one/Cargo.toml": "",
+            "crates/libs/one/src/lib.rs": "impl<F> W<F> where F: for<'a> Fn(&'a str) {\n"
+            "    fn test_raw(&self, var: &str) -> Option<String> { test_hook_var(var) }\n}",
+            "crates/libs/two/Cargo.toml": "",
+            "crates/libs/two/src/lib.rs": 'let n = x.test_raw("SPACE_EXAMPLE_LIMIT");',
+        }, id="hrtb-inherent-impl"),
         # A crate-private wrapper's name and an alias mean nothing in another crate.
         P({
             "crates/libs/one/Cargo.toml": "",
