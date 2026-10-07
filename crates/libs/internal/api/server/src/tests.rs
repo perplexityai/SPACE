@@ -6823,3 +6823,141 @@ async fn restore_locations_keep_digests_during_catalog_deletion() -> TestResult 
     }
     Ok(())
 }
+
+/// The node-bound template and policy reads answer for the templates the
+/// node holds, has a sandbox placed on, warms, or builds from, and for the
+/// sandboxes placed on it, so they agree with the node-scoped release lookups.
+#[tokio::test(flavor = "current_thread")]
+async fn node_template_and_policy_reads_follow_placement() -> TestResult {
+    let Some(fixture) = cluster_fixture().await? else {
+        return Ok(());
+    };
+    let pool = &fixture.service.pool;
+    let owner = Uuid::parse_str("00000000-0000-0000-0000-000000000003")?;
+    seed_private_release(&fixture, "private-base", owner).await?;
+    register_template(&fixture.service, "code-runtime").await?;
+    let host_ip = std::net::Ipv4Addr::new(10, 0, 0, 30);
+    let other_ip = std::net::Ipv4Addr::new(10, 0, 0, 31);
+    let host = insert_k8s_node(pool, host_ip, "worker").await?;
+    let other = insert_k8s_node(pool, other_ip, "worker").await?;
+    let sandbox_id = Uuid::now_v7();
+    sqlx::query(sql!(
+        "INSERT INTO sandboxes (
+             id, user_id, org_id, managed_by, lifecycle, placement,
+             active_node_id, target_node_id, command_ready_pending,
+             network_policy_generation, template_id
+         )
+         VALUES ($1, $2::uuid, $3::uuid, 'k8s', 'started', 'on_node', $4, $4, TRUE, 1, 'private-base')"
+    ))
+    .bind(sandbox_id)
+    .bind(SEEDED_USER_ID)
+    .bind(owner)
+    .bind(host)
+    .execute(pool)
+    .await?;
+
+    async fn visible_from(
+        fixture: &ClusterFixture,
+        node: Uuid,
+        node_ip: std::net::Ipv4Addr,
+        sandbox_id: Uuid,
+    ) -> TestResult<(Vec<String>, Vec<String>, Vec<String>, Vec<String>)> {
+        let node_ip = std::net::IpAddr::V4(node_ip);
+        let templates = vec!["private-base".to_string(), "code-runtime".to_string()];
+        let role = Some(ProtoNodeRole::Worker as i32);
+        fn sorted(mut names: Vec<String>) -> Vec<String> {
+            names.sort();
+            names
+        }
+        let policy = fixture
+            .service
+            .get_node_network_policy_state(request_from_node(
+                GetNodeNetworkPolicyStateRequest {
+                    node_id: node.to_string(),
+                    templates: templates.clone(),
+                    sandbox_ids: vec![sandbox_id.to_string()],
+                    role,
+                },
+                node_ip,
+            ))
+            .await?
+            .into_inner();
+        let desired = fixture
+            .service
+            .get_node_template_desired_state(request_from_node(
+                GetNodeTemplateDesiredStateRequest {
+                    node_id: node.to_string(),
+                    templates: templates.clone(),
+                    role,
+                },
+                node_ip,
+            ))
+            .await?
+            .into_inner();
+        let base = fixture
+            .service
+            .get_node_template_base_snapshot_policy_state(request_from_node(
+                GetNodeTemplateBaseSnapshotPolicyStateRequest {
+                    node_id: node.to_string(),
+                    templates,
+                    role,
+                },
+                node_ip,
+            ))
+            .await?
+            .into_inner();
+        Ok((
+            sorted(policy.templates.into_iter().map(|t| t.template).collect()),
+            policy.sandboxes.into_iter().map(|s| s.sandbox_id).collect(),
+            sorted(desired.templates.into_iter().map(|t| t.template).collect()),
+            sorted(base.templates.into_iter().map(|t| t.template).collect()),
+        ))
+    }
+
+    let both = vec!["code-runtime".to_string(), "private-base".to_string()];
+    let generic_only = vec!["code-runtime".to_string()];
+    let placed = vec![sandbox_id.to_string()];
+
+    let (policy, sandboxes, desired, base) =
+        visible_from(&fixture, host, host_ip, sandbox_id).await?;
+    assert_eq!(policy, both, "host sees the template of its placed sandbox");
+    assert_eq!(sandboxes, placed, "host sees its placed sandbox");
+    assert_eq!(desired, both);
+    assert_eq!(base, both);
+
+    let (policy, sandboxes, desired, base) =
+        visible_from(&fixture, other, other_ip, sandbox_id).await?;
+    assert_eq!(
+        policy, generic_only,
+        "unplaced node resolves only generic templates"
+    );
+    assert!(
+        sandboxes.is_empty(),
+        "unplaced node sees no foreign sandbox"
+    );
+    assert_eq!(desired, generic_only);
+    assert_eq!(base, generic_only);
+
+    // A pending migration is a target placement; the destination may read
+    // before the sandbox becomes active there.
+    sqlx::query(sql!(
+        "UPDATE sandboxes SET target_node_id = $1 WHERE id = $2"
+    ))
+    .bind(other)
+    .bind(sandbox_id)
+    .execute(pool)
+    .await?;
+    let (policy, sandboxes, desired, base) =
+        visible_from(&fixture, other, other_ip, sandbox_id).await?;
+    assert_eq!(
+        policy, both,
+        "migration target sees the incoming sandbox's template"
+    );
+    assert_eq!(
+        sandboxes, placed,
+        "migration target sees the incoming sandbox"
+    );
+    assert_eq!(desired, both);
+    assert_eq!(base, both);
+    Ok(())
+}

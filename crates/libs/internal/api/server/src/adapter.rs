@@ -550,7 +550,7 @@ impl ClusterApi for ClusterApiService {
         request: Request<GetNodeNetworkPolicyStateRequest>,
     ) -> Result<Response<GetNodeNetworkPolicyStateResponse>, Status> {
         let role_hint = optional_db_role_from_proto(request.get_ref().role)?;
-        let _ = self
+        let origin = self
             .authenticated_origin_node_id(&request, &request.get_ref().node_id, role_hint)
             .await?;
         let request = request.into_inner();
@@ -569,15 +569,41 @@ impl ClusterApi for ClusterApiService {
                         COALESCE(t.network_policy_generation, 0) AS network_policy_generation
                  FROM requested r
                  LEFT JOIN templates t ON t.name = r.template
-                 WHERE t.name IS NOT NULL
-                    OR EXISTS (
+                 WHERE EXISTS (
                         SELECT 1
                         FROM node_template_inventory nti
                         WHERE nti.template_name = r.template
-                    )"
+                          AND nti.node_id = $3
+                    )
+                    OR (t.visibility = 'generic' AND t.desired_state = 'present')
+                    OR EXISTS (
+                        SELECT 1
+                        FROM sandboxes sb
+                        WHERE sb.template_id = t.name
+                          AND (sb.active_node_id = $3 OR sb.target_node_id = $3)
+                    )
+                    OR ($4 = 'worker' AND EXISTS (
+                        SELECT 1
+                        FROM kubernetes_pool_configs pc
+                        JOIN template_releases pr ON pr.id = pc.template_release_id
+                        WHERE pc.enabled
+                          AND pr.template_name = t.name
+                    ))
+                    OR ($4 = 'builder' AND EXISTS (
+                        SELECT 1
+                        FROM template_build_base_grants g
+                        WHERE g.base_template_name = t.name
+                          AND g.org_id = t.org_id
+                          AND ((g.builder_node_id IS NULL
+                                AND g.granted_at > NOW() - INTERVAL '1 hour')
+                               OR (g.builder_node_id = $3
+                                   AND g.granted_at > NOW() - INTERVAL '7 days'))
+                    ))"
             ))
             .bind(&templates)
             .bind(Json(NetworkPolicyV1::deny_all()))
+            .bind(origin.id)
+            .bind(origin.role.as_str())
             .fetch_all(&self.pool)
             .await
             .map_err(|err| Status::internal(format!("query template policies: {err}")))?
@@ -619,9 +645,11 @@ impl ClusterApi for ClusterApiService {
                         t.network_policy_json AS template_network_policy_json
                  FROM sandboxes s
                  LEFT JOIN templates t ON t.name = s.template_id
-                 WHERE s.id = ANY($1)"
+                 WHERE s.id = ANY($1)
+                   AND (s.active_node_id = $2 OR s.target_node_id = $2)"
             ))
             .bind(&sandbox_ids)
+            .bind(origin.id)
             .fetch_all(&self.pool)
             .await
             .map_err(|err| Status::internal(format!("query sandbox policies: {err}")))?;
@@ -677,19 +705,41 @@ impl ClusterApi for ClusterApiService {
              FROM requested r
              LEFT JOIN template_base_snapshot_policies p ON p.template = r.template
              LEFT JOIN local_inventory li ON li.template_name = r.template
+             LEFT JOIN templates t ON t.name = r.template
              WHERE EXISTS (
-                     SELECT 1
-                     FROM templates t
-                     WHERE t.name = r.template
-                 )
+                    SELECT 1
+                    FROM node_template_inventory nti
+                    WHERE nti.template_name = r.template
+                      AND nti.node_id = $2
+                )
+                OR (t.visibility = 'generic' AND t.desired_state = 'present')
                 OR EXISTS (
-                     SELECT 1
-                     FROM node_template_inventory nti
-                     WHERE nti.template_name = r.template
-                 )"
+                    SELECT 1
+                    FROM sandboxes sb
+                    WHERE sb.template_id = t.name
+                      AND (sb.active_node_id = $2 OR sb.target_node_id = $2)
+                )
+                OR ($3 = 'worker' AND EXISTS (
+                    SELECT 1
+                    FROM kubernetes_pool_configs pc
+                    JOIN template_releases pr ON pr.id = pc.template_release_id
+                    WHERE pc.enabled
+                      AND pr.template_name = t.name
+                ))
+                OR ($3 = 'builder' AND EXISTS (
+                    SELECT 1
+                    FROM template_build_base_grants g
+                    WHERE g.base_template_name = t.name
+                      AND g.org_id = t.org_id
+                      AND ((g.builder_node_id IS NULL
+                            AND g.granted_at > NOW() - INTERVAL '1 hour')
+                           OR (g.builder_node_id = $2
+                               AND g.granted_at > NOW() - INTERVAL '7 days'))
+                ))"
         ))
         .bind(&templates)
         .bind(origin.id)
+        .bind(origin.role.as_str())
         .fetch_all(&self.pool)
         .await
         .map_err(|err| Status::internal(format!("query template base-snapshot policies: {err}")))?;
@@ -795,7 +845,37 @@ impl ClusterApi for ClusterApiService {
              LEFT JOIN template_base_snapshot_policies bsp
                     ON bsp.template = r.template
              LEFT JOIN local_inventory li
-                    ON li.template_name = r.template"),
+                    ON li.template_name = r.template
+             WHERE EXISTS (
+                    SELECT 1
+                    FROM node_template_inventory nti
+                    WHERE nti.template_name = r.template
+                      AND nti.node_id = $3
+                )
+                OR (t.visibility = 'generic' AND t.desired_state = 'present')
+                OR EXISTS (
+                    SELECT 1
+                    FROM sandboxes sb
+                    WHERE sb.template_id = t.name
+                      AND (sb.active_node_id = $3 OR sb.target_node_id = $3)
+                )
+                OR ($2 = 'worker' AND EXISTS (
+                    SELECT 1
+                    FROM kubernetes_pool_configs pc
+                    JOIN template_releases pr ON pr.id = pc.template_release_id
+                    WHERE pc.enabled
+                      AND pr.template_name = t.name
+                ))
+                OR ($2 = 'builder' AND EXISTS (
+                    SELECT 1
+                    FROM template_build_base_grants g
+                    WHERE g.base_template_name = t.name
+                      AND g.org_id = t.org_id
+                      AND ((g.builder_node_id IS NULL
+                            AND g.granted_at > NOW() - INTERVAL '1 hour')
+                           OR (g.builder_node_id = $3
+                               AND g.granted_at > NOW() - INTERVAL '7 days'))
+                ))"),
         )
         .bind(&templates)
         .bind(origin.role.as_str())
