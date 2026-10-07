@@ -13,11 +13,16 @@ spec:
   selector:
     matchLabels:
       {{- include "space-node-service.selectorLabels" $ctx | nindent 6 }}
-  # Surge: runtime-manager holds no node-wide lock and serves read-only
-  # listings, and a successor replaces the socket by rename
-  # (crates/libs/common/svc/src/bootstrap.rs), so two instances may briefly
-  # serve side by side.
-  {{- include "space-node-service.updateStrategy" (dict "strategy" "surge") | nindent 2 }}
+  # Delete first: runtime-manager holds no service mutex, so nothing makes a
+  # successor wait for its predecessor. The successor binds at once and takes
+  # the socket path by rename (crates/libs/common/svc/src/bootstrap.rs), while
+  # both probes target that one shared socket rather than an instance-local
+  # health socket; and with kernel installs enabled the successor's installer
+  # empties the shared staging directory, which it may only do "when nothing
+  # in staging is live" (kernels/staging.rs prepare, kernels/operations.rs).
+  # Two instances therefore must not overlap on a node. Nothing waits on its
+  # listings, so the brief gap during a replacement costs nothing.
+  {{- include "space-node-service.updateStrategy" (dict "strategy" "deleteFirst") | nindent 2 }}
   template:
     metadata:
       annotations:

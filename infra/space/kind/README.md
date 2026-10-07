@@ -755,21 +755,28 @@ reflector use) and `app.kubernetes.io/part-of=space-node`.
 | runtime-manager | space-rtmgr + space-rtmgrclients | non-root, no capabilities, read-only rootfs; `/space/vendor`, `/space/bin`, `/space/cache` read-only | lists runtimes and kernels |
 | volume-manager | space-sbxmgr + SPACE_VOLUME_MANAGER_GROUPS | non-root, no capabilities, read-only rootfs; `/space/cache` HostToContainer | file transfers only (`crates/libs/vol/mgr/server`); keeps the legacy identity `docs/installation.md` describes |
 | credential-manager | space-sbxmgr + SPACE_CREDENTIAL_MANAGER_GROUPS | non-root, no capabilities, read-only rootfs; `/space/run` only; projected token for the authority | the node credential agent (`--role=agent`): sockets only, forwarding to `space-credmgr-authority`; no database, KEK or AWS credential; its peer-process check (`SPACE_UDS_PEER_PROCESS_CHECK`) is off, so no host PID namespace |
-| template-manager | space-tmplmgr + SPACE_TEMPLATE_MANAGER_GROUPS | non-root, no capabilities, read-only rootfs, hostNetwork; `/space/cache` HostToContainer | btrfs work delegated to node-manager (`btrfs_via_nodemgr.rs`); host network because it publishes node state (node-bound ClusterApi RPCs, below) |
+| template-manager | space-tmplmgr + SPACE_TEMPLATE_MANAGER_GROUPS | non-root, no capabilities, read-only rootfs, hostNetwork; `/space/cache` HostToContainer | btrfs work delegated to node-manager (`btrfs_via_nodemgr.rs`); host network because its template-release reads are scoped by source address (below) |
 | sandbox-manager | space-sbxmgr + SPACE_SANDBOX_MANAGER_GROUPS | non-root, no capabilities, read-only rootfs, hostPID, hostNetwork; `/space/cache` HostToContainer, `/space/etc` read-only | gateway callers are authorized by their host pid, and Firecracker pids go to the node's shim (`service/gateway_identity.rs`, `network_runtime.rs`); host network for its node-bound ClusterApi RPCs |
 | node-ctl | space-nodectl + SPACE_NODECTL_GROUPS | non-root, no capabilities, read-only rootfs, hostNetwork; its own ServiceAccount with Node RBAC, fenced by `node-fence.yaml` | the Kubernetes node-local controller; host network for its node-bound ClusterApi RPCs |
 | node-api | space-nodeapi + worker/builder groups | non-root, no capabilities, read-only rootfs, hostNetwork, port `grpc` 9800 | the API dials `host_ip:9800` and reads the `grpc` port; on builders it reaches build-manager on 127.0.0.1 |
-| build-manager | root | privileged, hostNetwork; `/space/cache` and `/var/run/netns` HostToContainer, the node's containerd | loop and bind mounts for OCI assembly, `nsenter --net` into build VMs, `ctr` against the node's containerd (`crates/libs/build/mgr/src`) |
+| build-manager | root | privileged, hostNetwork, hostPID; `/var/run/netns` HostToContainer, `/space/cache` without propagation, the node's containerd | loop and bind mounts for OCI assembly, `nsenter --net` into build VMs through netns handles node-manager mounts after it starts, `ctr` against the node's containerd (`crates/libs/build/mgr/src`); host PID to watch the build VM's host Firecracker pid exit (`vm.rs`); host network for its source-scoped template-release reads (below) and node-api's loopback endpoint |
 | space-node-debug (Kind only) | root | privileged; `/space/run`, `/space/cache` HostToContainer, `/space/bin`, `/space/vendor`, `/run/containerd` | the operator shell; see below |
 
 internal-api binds every node-bound ClusterApi RPC — `PublishNodeState`, the
-node desired-state and reconcile calls, quarantine recovery plans — to the
-node's registered address, bootstrapped from the first such caller's source
-address, and refuses a call from any other address
+node desired-state and reconcile calls (node-ctl), quarantine recovery plans and
+artifact backups (sandbox-manager) — to the node's registered address, the
+Kubernetes Node's InternalIP that cluster-controller's node sync writes, and
+refuses a call from any other source address
 (`validate_origin_remote_addr` in `crates/libs/internal/api/server/src/lib.rs`).
-So node-ctl, template-manager and sandbox-manager, which make those calls, run
-in the node's network namespace; a pod-network caller would register its pod IP
-or be refused.
+The check reads neither the credential nor the transport: it applies alike to
+the static token and to TokenReview-authenticated projected tokens, and internal
+RPC TLS, being server-auth only, does not change it. So node-ctl and
+sandbox-manager run in the node's network namespace. template-manager and
+build-manager make no node-bound call, but under TokenReview authentication
+their template-release reads are scoped to the node whose registered address
+is the caller's source address (`template_read_scope`,
+`crates/libs/internal/api/server/src/adapter.rs`): from a pod IP an org's
+private releases would not resolve, so they run there too.
 
 Services whose `/space/run` directory the node image does not bake (volume-manager,
 node-ctl, runtime-manager) create it in a `prepare-run-dir` init container with
@@ -793,11 +800,13 @@ service socket and build-manager on its gRPC health service.
 the successor starts beside the predecessor, reports ready while passive, and
 takes over, sockets replaced by rename, when the predecessor drains and releases
 the lock. That covers node-manager, volume-manager, credential-manager,
-template-manager, sandbox-manager and node-ctl; runtime-manager holds no lock
-and serves read-only listings, so it surges too. node-api and build-manager
-delete first: node-api's declared port is a host port the scheduler will not
-place twice on a node, and build-manager has no mutex and recovers jobs before
-binding its listener. Termination grace follows each service's drain: 60 s for
+template-manager, sandbox-manager and node-ctl. runtime-manager, node-api and
+build-manager delete first. runtime-manager holds no mutex, so a successor would
+take its socket by rename at once, beside a predecessor its probes can no longer
+reach, and its kernel installer empties shared staging on open, which is only
+safe when nothing in staging is live. node-api's declared port is a host port the
+scheduler will not place twice on a node. build-manager has no mutex and recovers
+jobs before binding its listener. Termination grace follows each service's drain: 60 s for
 the 25 s drains the shared lifecycle defaults are sized against, 120 s for
 volume-manager's 100 s transfer drain plus 10 s server drain, 180 s for
 node-api's 150 s shutdown grace, and 7500 s for build-manager's 7200 s build

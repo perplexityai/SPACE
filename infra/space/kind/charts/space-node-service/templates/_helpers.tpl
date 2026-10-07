@@ -365,13 +365,15 @@ updateStrategy:
 {{- end -}}
 
 {{/*
-Host network for a service that publishes node state through ClusterApi.
+Host network for a service that makes node-bound ClusterApi calls.
 internal-api binds every node-bound RPC (PublishNodeState and the other
-node_id-carrying calls) to the node's registered address, bootstrapped from
-the first caller's source address, and refuses a call from any other address
-(validate_origin_remote_addr in crates/libs/internal/api/server/src/lib.rs).
-So each such caller must reach it from the node's own IP. ClusterFirstWithHostNet
-keeps in-cluster DNS.
+node_id-carrying calls, quarantine recovery plans, artifact backups) to the
+node's registered address — the Kubernetes Node's InternalIP, which
+cluster-controller's node sync writes — and refuses a call from any other
+source address whatever the credential or transport
+(validate_origin_remote_addr in crates/libs/internal/api/server/src/lib.rs;
+internal RPC TLS is server-auth only). So each such caller must reach it from
+the node's own IP. ClusterFirstWithHostNet keeps in-cluster DNS.
 */}}
 {{- define "space-node-service.nodeBoundNetwork" -}}
 hostNetwork: true

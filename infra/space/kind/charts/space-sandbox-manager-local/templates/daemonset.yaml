@@ -28,8 +28,10 @@ spec:
       serviceAccountName: {{ include "space-node-service.name" $ctx }}
       # The ClusterApi token is projected below; no Kubernetes API access.
       automountServiceAccountToken: false
-      # Host network: sandbox-manager publishes sandbox state and fetches quarantine recovery plans, node-bound ClusterApi RPCs
-      # (see space-node-service.nodeBoundNetwork).
+      # Host network: sandbox-manager fetches quarantine recovery plans and
+      # begins and finalizes artifact backups, node-bound ClusterApi RPCs
+      # (snapshot_restore.rs, snapshot_upload_jobs.rs; see
+      # space-node-service.nodeBoundNetwork).
       {{- include "space-node-service.nodeBoundNetwork" . | nindent 6 }}
       # Host PID: sandbox-manager authorizes each sandbox's net-gateway by the
       # SO_PEERCRED pid of its host-control connection, validated against

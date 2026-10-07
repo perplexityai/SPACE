@@ -42,10 +42,23 @@ spec:
       serviceAccountName: {{ include "space-node-service.name" $ctx }}
       # The ClusterApi token is projected below; no Kubernetes API access.
       automountServiceAccountToken: false
-      # Host network: node-api reaches the 127.0.0.1:9900 listener from the
-      # node's network namespace (SPACE_BUILD_MANAGER_ENDPOINT).
+      # Host network: build-manager's ClusterApi template-release reads
+      # (FindTemplateReleaseByHash, crates/libs/build/mgr/src/publish.rs) are
+      # scoped to the node whose registered address is the caller's source
+      # address once ClusterApi authenticates by TokenReview
+      # (template_read_scope, crates/libs/internal/api/server/src/adapter.rs),
+      # so from a pod IP an org's private releases are invisible to it. It is
+      # also how node-api, the sole caller, reaches its loopback listener
+      # (SPACE_BUILD_MANAGER_ENDPOINT, crates/libs/build/mgr/server/src/run.rs).
+      # SSH into build VMs runs inside `nsenter --net` and needs neither.
       hostNetwork: true
       dnsPolicy: ClusterFirstWithHostNet
+      # Host PID: after asking the guest to exit, build-manager waits for the
+      # Firecracker pid sandbox-manager reports, a host-namespace pid, by
+      # checking /proc/<pid> (is_process_alive, crates/libs/build/mgr/src/vm.rs;
+      # the shutdown wait in lib.rs). In its own PID namespace the pid is
+      # never there and the wait ends at once.
+      hostPID: true
       terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds | int }}
       initContainers:
         # build-manager does not migrate its SQLite database itself
@@ -122,12 +135,19 @@ spec:
             # Registers each built template and release through ClusterApi
             # (crates/libs/build/mgr/src/publish.rs).
             {{- include "space-node-service.mount.clusterApiToken" . | nindent 12 }}
-            # HostToContainer: the build's OCI-rootfs and assembly mounts under
-            # /space/cache/firecracker/builds stay in this pod's mount namespace
-            # and never reach the node's mount table.
-            {{- include "space-node-service.mount.cache" (dict) | nindent 12 }}
-            # HostToContainer: the build VM's network namespace, which
-            # node-manager bind-mounts on the node, for `nsenter --net`.
+            # No propagation: build-manager reads only plain files and
+            # subvolumes under /space/cache (the build sandbox's rootfs, its
+            # own work dirs), none of them mounted by someone else after it
+            # starts, and its OCI-rootfs, assembly and snapshot-view mounts
+            # under /space/cache/firecracker/builds must stay in this pod's
+            # mount namespace, never in the node's mount table
+            # (crates/libs/build/mgr/src/oci/{assembly,containerd}.rs).
+            {{- include "space-node-service.mount.cache" (dict "propagation" "None") | nindent 12 }}
+            # HostToContainer: each build VM's network-namespace handle is a
+            # bind mount node-manager makes on the node after build-manager
+            # started (crates/libs/node/mgr/server/src/net/linux.rs); without
+            # propagation the pod would see only the empty placeholder file and
+            # `nsenter --net` into the VM would fail (build/mgr/src/ssh.rs).
             - name: netns
               mountPath: /var/run/netns
               mountPropagation: HostToContainer
