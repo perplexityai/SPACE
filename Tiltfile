@@ -4,6 +4,8 @@
 #   * postgres + versitygw object store (S3)
 #   * space-api-server
 #   * space-internal-api
+#   * space-credmgr-authority, the control-plane credential-manager authority
+#     each node's credential-manager agent forwards to
 #   * space-data-plane
 #   * space-cluster-controller + space-ui (full harness only)
 #   * one DaemonSet per node service on every sandbox worker — node-manager,
@@ -466,6 +468,17 @@ k8s_resource(
     "space-internal-api",
     labels = ["control-plane"],
     resource_deps = ["space-api", "provision-local-console", "label-kind-infra"],
+)
+
+# Control-plane credential-manager authority: owns the credential tables and
+# the platform KEK; each node's credential-manager runs as its agent, and
+# node-manager calls it for sandbox volume DEKs. It needs the API's migrations
+# and the space_creds role the API's bootstrap provisions.
+k8s_yaml(helm_release("space", "infra/space/kind/charts/space-credmgr-authority-local"))
+k8s_resource(
+    "space-credmgr-authority",
+    labels = ["control-plane"],
+    resource_deps = ["space-api", "label-kind-infra"],
 )
 
 # Public data-plane service for native sessions and ECW wildcard hosts.

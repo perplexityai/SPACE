@@ -1,5 +1,5 @@
 # credential-manager on every SPACE Kind node. One release per role: `space`
-# and `space-builder` (`--set node.role=builder -f values-builder.yaml`).
+# and `space-builder` (`--set node.role=builder`).
 
 image:
   repository: space-worker
@@ -11,29 +11,9 @@ clusterId: kind-local
 telemetry: {}
 node: {}
 
-# Control-plane Postgres for the node-local legacy authority role, which
-# resolves org KEK rows from the database. Only credential-manager receives a
-# database URL; no other node service sees Postgres.
-postgres:
-  secretName: space-postgres
-  secretKey: POSTGRES_CONNECTION_STRING
-  # credential-manager's pool connects as space_creds; the role is
-  # provisioned by the api chart's bootstrap-roles initContainer.
-  managedCredentialsPassword: space-dev-creds
-
-# Credentials for credential-manager's own AWS integrations (for example AWS
-# Secrets Manager network-credential references or Private CA). ExchangeToken
-# never returns these ambient credentials.
-#   optional-secret: the optional `space-aws-creds` Secret bootstrap creates
-#     from private.env (sandbox account only); absent keys leave the SDK's
-#     default chain empty.
-#   object-store: the Kind object store's static credentials.
-awsCredentials: optional-secret
-awsRegion: us-east-1
-
-# The authority drains for 25 s, then releases its service mutex
-# (crates/libs/credential/mgr/server/src/run.rs); the shared lifecycle default
-# grace (crates/libs/common/svc/src/lifecycle.rs).
+# The agent drains for the shared 25 s lifecycle default, then releases its
+# service mutex (crates/libs/credential/mgr/server/src/run.rs,
+# crates/libs/common/svc/src/lifecycle.rs).
 terminationGracePeriodSeconds: 60
 
 # Kind sizing: requests only (see space-node-manager-local/values.yaml).

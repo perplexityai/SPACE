@@ -26,6 +26,7 @@ TELEMETRY_CHARTS = tuple(
     for name in (
         "space-api-local",
         "space-internal-api-local",
+        "space-credmgr-authority-local",
         "space-data-plane-local",
         "space-cluster-controller-local",
         "space-node-manager-local",

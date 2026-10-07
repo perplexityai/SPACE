@@ -690,6 +690,7 @@ kind cluster: space-local (kind-cluster.yaml.tmpl — 6 nodes)
 │   ├── space-object-store    (versitygw S3 gateway + bucket-init Job)
 │   ├── space-api             (Deployment; SPACE_K8S_CONTROL_PLANE=true)
 │   ├── space-internal-api    (Deployment; ClusterApi — node registration + template releases)
+│   ├── space-credmgr-authority (Deployment; credential-manager authority — credential tables + platform KEK)
 │   ├── space-data-plane      (Deployment)
 │   ├── space-cluster-controller (Deployment; materializes per-sandbox pods)
 │   ├── space-seed-publish    (Job; publishes the locally built seed)
@@ -720,9 +721,9 @@ outbound reconcilers call `ClusterApi.PublishNodeState`, and the internal
 API derives the node UUID from `(node name, role)` via `space_k8s_node_id`
 and upserts `nodes` / `node_k8s` / `node_status_snapshots` /
 `node_template_inventory`. The cluster-controller's `kube_node_sync`
-reconciler covers kube-Node inventory. **Nothing writes Postgres from the
-node** except credential-manager's legacy authority (below); node status uses
-the normal 30-second freshness window. Both bring-up paths end by waiting until
+reconciler covers kube-Node inventory. **Nothing on the node touches
+Postgres**: credential state belongs to the control-plane credential-manager
+authority (below). Node status uses the normal 30-second freshness window. Both bring-up paths end by waiting until
 the admin node list (`GET /admin/api/v1/nodes`) reports every sandbox and
 builder node reachable, with scheduling status `ready`, and observed within the
 five node-ctl ticks the API trusts a census for
@@ -749,11 +750,11 @@ reflector use) and `app.kubernetes.io/part-of=space-node`.
 
 | Service | Identity | Pod shape | Why (public code) |
 |---|---|---|---|
-| node-manager | root | privileged, hostNetwork, hostPID; `/space/cache` and `/var/run/netns` Bidirectional; `/sys/fs/cgroup`, `/space/bin`, `/space/etc`, `/space/vendor`, `/dev/kvm` | mounts jail rootfs and late snapshot-memory binds that must reach the host jailer, netns binds the host jailer and sidecar launcher open, loop and device-mapper devices, cgroup limits, root-namespace veth/nft/ip_forward, pidfds on host processes (`crates/libs/node/mgr/server`); init container `node-manager-init.sh` writes the node's systemd unit via `nsenter --target 1` |
+| node-manager | root | privileged, hostNetwork, hostPID; `/space/cache` and `/var/run/netns` Bidirectional; `/sys/fs/cgroup`, `/space/bin`, `/space/etc`, `/space/vendor`, `/dev/kvm`; projected token for the credential-manager authority | mounts jail rootfs and late snapshot-memory binds that must reach the host jailer, netns binds the host jailer and sidecar launcher open, loop and device-mapper devices, cgroup limits, root-namespace veth/nft/ip_forward, pidfds on host processes (`crates/libs/node/mgr/server`); init container `node-manager-init.sh` writes the node's systemd unit via `nsenter --target 1` |
 | runtime-supervisor | root | host systemd unit, no pod | `scripts/k8s/node-manager-init.sh`, `node-manager-runtime-supervisor.sh` |
 | runtime-manager | space-rtmgr + space-rtmgrclients | non-root, no capabilities, read-only rootfs; `/space/vendor`, `/space/bin`, `/space/cache` read-only | lists runtimes and kernels |
 | volume-manager | space-sbxmgr + SPACE_VOLUME_MANAGER_GROUPS | non-root, no capabilities, read-only rootfs; `/space/cache` HostToContainer | file transfers only (`crates/libs/vol/mgr/server`); keeps the legacy identity `docs/installation.md` describes |
-| credential-manager | space-sbxmgr + SPACE_CREDENTIAL_MANAGER_GROUPS | non-root, no capabilities, read-only rootfs; `/space/run` only | sockets only; its peer-process check (`SPACE_UDS_PEER_PROCESS_CHECK`) is off, so no host PID namespace |
+| credential-manager | space-sbxmgr + SPACE_CREDENTIAL_MANAGER_GROUPS | non-root, no capabilities, read-only rootfs; `/space/run` only; projected token for the authority | the node credential agent (`--role=agent`): sockets only, forwarding to `space-credmgr-authority`; no database, KEK or AWS credential; its peer-process check (`SPACE_UDS_PEER_PROCESS_CHECK`) is off, so no host PID namespace |
 | template-manager | space-tmplmgr + SPACE_TEMPLATE_MANAGER_GROUPS | non-root, no capabilities, read-only rootfs, hostNetwork; `/space/cache` HostToContainer | btrfs work delegated to node-manager (`btrfs_via_nodemgr.rs`); host network because it publishes node state (node-bound ClusterApi RPCs, below) |
 | sandbox-manager | space-sbxmgr + SPACE_SANDBOX_MANAGER_GROUPS | non-root, no capabilities, read-only rootfs, hostPID, hostNetwork; `/space/cache` HostToContainer, `/space/etc` read-only | gateway callers are authorized by their host pid, and Firecracker pids go to the node's shim (`service/gateway_identity.rs`, `network_runtime.rs`); host network for its node-bound ClusterApi RPCs |
 | node-ctl | space-nodectl + SPACE_NODECTL_GROUPS | non-root, no capabilities, read-only rootfs, hostNetwork; its own ServiceAccount with Node RBAC, fenced by `node-fence.yaml` | the Kubernetes node-local controller; host network for its node-bound ClusterApi RPCs |
@@ -855,8 +856,8 @@ bash infra/space/kind/scripts/bootstrap.sh   # then `tilt up`, for the Tilt loop
 
 The single-worker DirectSubstrate bench (`space-local-3486`, Tilt
 `SPACE_LOCAL_MINIMAL=1`) was retired with that layout: its node side was the old
-entrypoint's SQL registration of the node, the last Postgres access from a node
-service besides credential-manager's legacy authority, and no suite ran on it.
+entrypoint's SQL registration of the node, Postgres access from the node that
+nothing else needs, and no suite ran on it.
 Delete a leftover cluster with `kind delete cluster --name space-local-3486`.
 
 ## Service identities
@@ -879,9 +880,21 @@ every other service. The baseline Kind smoke checks its JSON listing on both a
 worker and a builder, requiring a complete scan with a valid vendor runtime and a
 staged cache kernel. These checks do not gate node readiness.
 
-credential-manager runs its node-local legacy authority role, which resolves org
-KEK rows from the control-plane database: `SPACE_CREDMGR_DATABASE_URL`'s secret
-reaches only that DaemonSet, as `DATABASE_URL`.
+**Credential-manager.** The authority runs on the control plane as the
+`space-credmgr-authority` Deployment (`charts/space-credmgr-authority-local`,
+named as in the EKS module): `--role=authority --no-uds` on TCP port 9810, with
+the control-plane database, the platform KEK and the optional `space-aws-creds`
+for its AWS integrations. It authenticates callers by TokenReview of their
+projected ServiceAccount tokens (audience `space-credential-manager`), maps each
+ServiceAccount to its client service, and never accepts the static internal
+token. Each node's credential-manager runs `--role=agent`: it holds the node's
+credential sockets under its service mutex and forwards every call upstream as
+the node credential agent, with no database, KEK or AWS credential. node-manager
+calls the authority directly for sandbox volume DEKs, which the authority grants
+only to node-manager. The Kind KEK is the development-only in-memory backend in
+one process: one replica, replaced rather than overlapped, and its restart makes
+keys it wrapped unreadable. Agents started before the authority exit and are
+restarted until it answers.
 
 Kind explicitly sets `SPACE_INTERNAL_RPC_INSECURE_DEV=true` for its internal
 ClusterApi/NodeApi HTTP connections. Deployed services default to authenticated
@@ -897,6 +910,7 @@ configuration and the coordinated migration requirements.
 | `/space/cache` is btrfs on instance-store NVMe            | btrfs on a sparse loopback image at `/var/lib/space-cache.img` on the kind node (40 GiB, same code paths, less I/O headroom), mounted on the node's `/space/cache` by `space-cache.service`, so it outlives pod restarts like the NVMe does |
 | Postgres on RDS, secrets via ExternalSecrets / AWS Secrets Manager | In-cluster `space-postgres` StatefulSet, static Kubernetes Secrets             |
 | S3 for snapshots + template artifacts                     | In-cluster versitygw (real S3 protocol, sigv4, path-style)                    |
+| `space-credmgr-authority` Deployment with a KMS-backed platform KEK and TLS from its own certificate (`credmgr_authority_kms.tf`, `credmgr_authority_tls.tf`) | one replica with the in-memory development KEK, which a restart loses; plaintext TCP |
 | volume-manager credentials via credmgr STS/IRSA           | static `SPACE_OBJECT_STORE_STATIC_*` creds (the documented local escape hatch) |
 | build-manager gets S3 credentials via credential-manager backed by cloud identity | the same directly injected static object-store credentials; credential-manager's storage exchange endpoint is explicitly disabled |
 | `/dev/kvm` access via the AMI's kvm group                 | `space-kind-devices.service` makes `/dev/kvm`, `/dev/vhost-vsock` and `/dev/vhost-net` mode 0666 on the node (kind-only; never replicate on a worker) |

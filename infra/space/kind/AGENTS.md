@@ -44,11 +44,11 @@ or suites.
   `docs/installation.md` to provision the harness, then keep the live Tilt
   cluster for iteration instead of rebuilding it for each change.
 - Keep the builder node outside `node.kubernetes.io/space-enabled=true`.
-- Do not add Postgres access to node services. The one exception is
-  credential-manager's legacy authority role, whose DaemonSet alone receives the
-  database URL as `DATABASE_URL`. Normal node registration and template
-  publication use ClusterApi; templates are not baked into or side-staged onto
-  workers.
+- Do not add Postgres access to node services. Credential state belongs to the
+  control-plane `space-credmgr-authority` Deployment; each node's
+  credential-manager runs as its agent without a database URL. Normal node
+  registration and template publication use ClusterApi; templates are not
+  baked into or side-staged onto workers.
 - Node services run one DaemonSet per service and role from
   `charts/space-<service>-local` on the `space-node-service` library, listed in
   `lib/node-services.sh` for every bring-up path. Each pod runs the unmodified

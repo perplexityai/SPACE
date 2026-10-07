@@ -1,7 +1,4 @@
 {{- $ctx := dict "ctx" . "component" "credential-manager" -}}
-{{- if not (has .Values.awsCredentials (list "optional-secret" "object-store")) -}}
-{{- fail "awsCredentials must be optional-secret or object-store" -}}
-{{- end -}}
 {{- include "space-node-service.serviceAccount" $ctx }}
 ---
 apiVersion: apps/v1
@@ -40,69 +37,29 @@ spec:
       containers:
         - name: credential-manager
           {{- include "space-node-service.image" . | nindent 10 }}
+          # The node credential agent: it binds the node-local sockets under
+          # the service mutex and forwards every RPC to the control-plane
+          # authority, holding no database, KEK or AWS credential itself
+          # (run_agent, crates/libs/credential/mgr/server/src/run.rs;
+          # node_service.rs).
           command:
             - /opt/space/bin/space-credmgr-svc
+            - --role=agent
             - --health-socket={{ include "space-node-service.healthSocket" $ctx }}
           {{- include "space-node-service.restrictedContainer" . | nindent 10 }}
           env:
             {{- include "space-node-service.env.identity" . | nindent 12 }}
-            # The node-local legacy authority role (`--role authority`, the
-            # binary's default) with the control-plane database.
-            - name: DATABASE_URL
-              valueFrom:
-                secretKeyRef:
-                  name: {{ .Values.postgres.secretName }}
-                  key: {{ .Values.postgres.secretKey }}
-            - name: SPACE_DB_CREDS_PASSWORD
-              value: {{ .Values.postgres.managedCredentialsPassword | quote }}
-            # Development-only in-memory platform KEK, compiled in only with
-            # the Kind images' test-hooks feature. Credential exchange stays
-            # disabled because no vending role (SPACE_CREDMGR_S3_VEND_ROLE_ARN)
-            # is configured.
-            - name: SPACE_CREDMGR_IN_MEMORY_KEK_ENABLED
+            {{- include "space-node-service.env.credmgrAuthority" . | nindent 12 }}
+            # A node credential-manager started without --role=agent would be
+            # a keyless authority that reports Ready and fails every crypto
+            # call; this makes that misconfiguration exit instead (run.rs).
+            - name: SPACE_CREDMGR_FAIL_ON_KEYLESS_AUTHORITY
               value: "true"
-            - name: SPACE_PLATFORM_KEK_PROVIDER
-              value: in-memory
-            - name: SPACE_PLATFORM_KEK_IDENTIFIER
-              value: kind-local-platform-kek
-            - name: AWS_REGION
-              value: {{ .Values.awsRegion | quote }}
-            {{- if eq .Values.awsCredentials "object-store" }}
-            - name: AWS_ACCESS_KEY_ID
-              valueFrom:
-                secretKeyRef:
-                  name: {{ .Values.node.objectStore.credentialsSecretName }}
-                  key: SPACE_OBJECT_STORE_STATIC_ACCESS_KEY_ID
-            - name: AWS_SECRET_ACCESS_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: {{ .Values.node.objectStore.credentialsSecretName }}
-                  key: SPACE_OBJECT_STORE_STATIC_SECRET_ACCESS_KEY
-            {{- else }}
-            {{- range list "AWS_ACCESS_KEY_ID" "AWS_SECRET_ACCESS_KEY" "AWS_SESSION_TOKEN" }}
-            - name: {{ . }}
-              valueFrom:
-                secretKeyRef:
-                  name: space-aws-creds
-                  key: {{ . }}
-                  optional: true
-            {{- end }}
-            {{- end }}
-            # The reader role every AWS Secrets Manager read assumes, with a
-            # session scoped to the sandbox owner's organization; without it the
-            # Secrets Manager provider is not installed
-            # (crates/libs/credential/mgr/server/src/aws_secrets_manager.rs).
-            # Optional, from the same Secret as the credentials above.
-            - name: SPACE_CREDMGR_SECRETS_MANAGER_ROLE_ARN
-              valueFrom:
-                secretKeyRef:
-                  name: space-aws-creds
-                  key: SPACE_CREDMGR_SECRETS_MANAGER_ROLE_ARN
-                  optional: true
           {{- include "space-node-service.probes" $ctx | nindent 10 }}
           volumeMounts:
             {{- include "space-node-service.mount.run" . | nindent 12 }}
             {{- include "space-node-service.mount.private" . | nindent 12 }}
+            {{- include "space-node-service.mount.credmgrToken" . | nindent 12 }}
           {{- with .Values.resources }}
           resources:
             {{- toYaml . | nindent 12 }}
@@ -110,3 +67,4 @@ spec:
       volumes:
         {{- include "space-node-service.volume.run" . | nindent 8 }}
         {{- include "space-node-service.volume.private" . | nindent 8 }}
+        {{- include "space-node-service.volume.credmgrToken" . | nindent 8 }}

@@ -1,3 +1,0 @@
-# Builders do not host user sandboxes or their network gateways; credential
-# manager's AWS integrations there use the object store's credentials.
-awsCredentials: object-store

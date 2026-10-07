@@ -389,6 +389,7 @@ fi
 
 # Once api-server has the control-plane schema, drive everything else.
 helm_apply space "$KIND_DIR/charts/space-internal-api-local"
+helm_apply space "$KIND_DIR/charts/space-credmgr-authority-local"
 helm_apply space "$KIND_DIR/charts/space-data-plane-local"
 helm_apply space "$KIND_DIR/charts/space-cluster-controller-local"
 helm_apply space "$KIND_DIR/charts/space-ui-local"
@@ -427,6 +428,9 @@ helm_apply space "$KIND_DIR/charts/space-seed-publish"
 # ── Step 8: readiness gates ──────────────────────────────────────────────────
 log "waiting for space-internal-api Deployment"
 kubectl --context "$KCTX" -n "$NAMESPACE" rollout status deploy/space-internal-api --timeout="${TIMEOUT}s"
+
+log "waiting for space-credmgr-authority Deployment"
+kubectl --context "$KCTX" -n "$NAMESPACE" rollout status deploy/space-credmgr-authority --timeout="${TIMEOUT}s"
 
 log "waiting for space-data-plane Deployment"
 kubectl --context "$KCTX" -n "$NAMESPACE" rollout status deploy/space-data-plane --timeout="${TIMEOUT}s"

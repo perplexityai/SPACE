@@ -102,6 +102,20 @@ Pair with the cluster-api-token volume below.
   value: /var/run/space-publication/cluster-api.token
 {{- end -}}
 
+{{/*
+The control-plane credential-manager authority, for the node credential
+agent and node-manager's direct sandbox volume DEK calls: its endpoint
+(SPACE_CREDMGR_ENDPOINT, crates/libs/credential/mgr/client/src/endpoint.rs)
+and the pod's projected ServiceAccount token at the client's default path
+(/var/run/space-auth/credmgr.token, client/src/token.rs) with the
+authority's audience. The authority maps the ServiceAccount to its client
+service by TokenReview. Pair with the credmgr-token volume below.
+*/}}
+{{- define "space-node-service.env.credmgrAuthority" -}}
+- name: SPACE_CREDMGR_ENDPOINT
+  value: {{ .Values.node.credmgrAuthorityEndpoint | quote }}
+{{- end -}}
+
 {{- define "space-node-service.env.internalToken" -}}
 - name: SPACE_INTERNAL_TOKEN
   valueFrom:
@@ -206,6 +220,12 @@ pod's own mounts back to the node.
   readOnly: true
 {{- end -}}
 
+{{- define "space-node-service.mount.credmgrToken" -}}
+- name: credmgr-token
+  mountPath: /var/run/space-auth
+  readOnly: true
+{{- end -}}
+
 {{- define "space-node-service.mount.routeVerification" -}}
 - name: route-verification-bundle
   mountPath: /var/run/space-route-verification
@@ -237,6 +257,17 @@ pod's own mounts back to the node.
     sizeLimit: 1Mi
 - name: tmp
   emptyDir: {}
+{{- end -}}
+
+{{- define "space-node-service.volume.credmgrToken" -}}
+- name: credmgr-token
+  projected:
+    defaultMode: 0444
+    sources:
+      - serviceAccountToken:
+          path: credmgr.token
+          audience: space-credential-manager
+          expirationSeconds: 3600
 {{- end -}}
 
 {{- define "space-node-service.volume.clusterApiToken" -}}

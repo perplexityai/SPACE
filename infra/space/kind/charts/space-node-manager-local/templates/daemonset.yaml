@@ -111,6 +111,12 @@ spec:
           env:
             {{- include "space-node-service.env.identity" . | nindent 12 }}
             {{- include "space-node-service.env.diskAdmission" . | nindent 12 }}
+            # Sandbox volume DEKs come straight from the authority, which
+            # admits GetOrIssueSandboxVolumeDek only from node-manager, never
+            # through the node agent
+            # (crates/libs/node/mgr/server/src/service/encrypted_volumes.rs,
+            # crates/libs/credential/mgr/server/src/service.rs).
+            {{- include "space-node-service.env.credmgrAuthority" . | nindent 12 }}
             # The successor activates a supervisor restart its init container
             # staged, once it holds the service mutex
             # (crates/libs/node/mgr/server/src/run.rs).
@@ -126,6 +132,7 @@ spec:
           {{- include "space-node-service.probes" $ctx | nindent 10 }}
           volumeMounts:
             {{- include "space-node-service.mount.run" . | nindent 12 }}
+            {{- include "space-node-service.mount.credmgrToken" . | nindent 12 }}
             # Bidirectional: the jailer runs on the node under the host
             # runtime-supervisor, in a mount namespace that is a slave of the
             # node's. node-manager bind-mounts each instance's rootfs into its
@@ -171,6 +178,7 @@ spec:
           {{- end }}
       volumes:
         {{- include "space-node-service.volume.run" . | nindent 8 }}
+        {{- include "space-node-service.volume.credmgrToken" . | nindent 8 }}
         {{- include "space-node-service.volume.cache" . | nindent 8 }}
         - name: space-bin
           hostPath:
