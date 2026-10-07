@@ -281,6 +281,10 @@ log "applying namespace + RuntimeClass"
 kubectl --context "$KCTX" apply -f "$KIND_DIR/manifests/namespace.yaml" >/dev/null
 kubectl --context "$KCTX" apply -f "$KIND_DIR/manifests/runtimeclass.yaml" >/dev/null
 
+# Internal RPC TLS: the cluster's CA and the listeners' identities as Secrets,
+# before any workload that mounts them (docs/internal-rpc-tls.md).
+SPACE_KIND_CLUSTER="$KIND_CLUSTER" bash "$KIND_DIR/scripts/internal-rpc-tls.sh"
+
 # ── Step 5: images ───────────────────────────────────────────────────────────
 if (( SKIP_IMAGES )); then
   log "--skip-images given; assuming all 7 images are already loaded"

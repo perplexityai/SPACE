@@ -47,6 +47,9 @@ spec:
         {{- else }}
         {{- include "space-node-service.runAs" (dict "ctx" . "user" "SPACE_NODEAPI" "groups" "SPACE_NODEAPI_WORKER_GROUPS") | nindent 8 }}
         {{- end }}
+        # space-nodeapi's own group owns the mounted TLS key, which is
+        # readable by that group only (volume.rpcIdentity).
+        fsGroup: {{ include "space-node-service.identityNumber" (dict "ctx" . "name" "SPACE_NODEAPI_GID") }}
       containers:
         - name: node-api
           {{- include "space-node-service.image" . | nindent 10 }}
@@ -62,6 +65,9 @@ spec:
           env:
             {{- include "space-node-service.env.identity" . | nindent 12 }}
             {{- include "space-node-service.env.clusterApi" . | nindent 12 }}
+            # The NodeApi listener's TLS identity, the leaf every node-api on
+            # the cluster shares (space-node-api, docs/internal-rpc-tls.md).
+            {{- include "space-node-service.env.rpcIdentity" . | nindent 12 }}
             # Static bearer tokens node-api's listeners require
             # (crates/libs/node/api/server/src/run.rs); the worker role also
             # protects WorkerApiInternal with the control token.
@@ -75,11 +81,17 @@ spec:
             {{- else }}
             - name: SPACE_BUILD_MANAGER_ENDPOINT
               value: {{ .Values.buildManagerEndpoint | quote }}
+            # The endpoint is loopback; build-manager's leaf names the
+            # service (docs/internal-rpc-tls.md).
+            - name: SPACE_BUILD_MANAGER_TLS_SERVER_NAME
+              value: space-builder-build-manager
             {{- end }}
           {{- include "space-node-service.probes" $ctx | nindent 10 }}
           volumeMounts:
             {{- include "space-node-service.mount.run" . | nindent 12 }}
             {{- include "space-node-service.mount.clusterApiToken" . | nindent 12 }}
+            {{- include "space-node-service.mount.rpcCa" . | nindent 12 }}
+            {{- include "space-node-service.mount.rpcIdentity" . | nindent 12 }}
             {{- include "space-node-service.mount.private" . | nindent 12 }}
           {{- with .Values.resources }}
           resources:
@@ -88,6 +100,8 @@ spec:
       volumes:
         {{- include "space-node-service.volume.run" . | nindent 8 }}
         {{- include "space-node-service.volume.clusterApiToken" . | nindent 8 }}
+        {{- include "space-node-service.volume.rpcCa" . | nindent 8 }}
+        {{- include "space-node-service.volume.rpcIdentity" (dict "secret" "space-node-api-tls") | nindent 8 }}
         {{- include "space-node-service.volume.private" . | nindent 8 }}
 ---
 apiVersion: v1

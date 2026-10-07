@@ -863,6 +863,12 @@ bash infra/space/kind/scripts/teardown.sh
 bash infra/space/kind/scripts/bootstrap.sh   # then `tilt up`, for the Tilt loop
 ```
 
+A cluster already on the per-service layout takes the move to internal RPC TLS
+in place: the next bring-up or Tilt reload issues the TLS Secrets and every
+listener and caller rolls onto TLS. While they roll, a plaintext caller and a TLS
+listener refuse each other, and the services' own restarts carry them until both
+sides have moved.
+
 The single-worker DirectSubstrate bench (`space-local-3486`, Tilt
 `SPACE_LOCAL_MINIMAL=1`) was retired with that layout: its node side was the old
 entrypoint's SQL registration of the node, Postgres access from the node that
@@ -905,10 +911,34 @@ one process: one replica, replaced rather than overlapped, and its restart makes
 keys it wrapped unreadable. Agents started before the authority exit and are
 restarted until it answers.
 
-Kind explicitly sets `SPACE_INTERNAL_RPC_INSECURE_DEV=true` for its internal
-ClusterApi/NodeApi HTTP connections. Deployed services default to authenticated
-TLS; see [Internal RPC TLS](../../../docs/internal-rpc-tls.md) for certificate
-configuration and the coordinated migration requirements.
+**Internal RPC TLS.** Kind runs ClusterApi, NodeApi, BuildManager,
+IngressActivationApi and the credential-manager authority over authenticated
+TLS, as deployed services do
+([Internal RPC TLS](../../../docs/internal-rpc-tls.md));
+`SPACE_INTERNAL_RPC_INSECURE_DEV` is not set anywhere. Both bring-up paths run
+[`scripts/internal-rpc-tls.sh`](scripts/internal-rpc-tls.sh) before any
+workload, which keeps the cluster's material in Secrets named as on EKS
+(`internal_rpc_tls.tf`, `credmgr_authority_tls.tf`): a per-cluster ECDSA P-256
+CA (`space-internal-rpc-ca`, mounted by every caller at `/etc/space-rpc-ca`),
+one-year leaves reissued within 60 days of expiry for internal-api
+(`space-cluster-api-tls`: `space-internal-api`, `space-cluster-api`), every
+node-api (`space-node-api-tls`: `space-node-api`), build-manager
+(`space-build-manager-tls`: `space-builder-build-manager`) and the api's
+ingress activation listener (`space-ingress-activation-tls`: `space-api`, the
+Service internal-api dials; the EKS module names no Secret for it, so this
+name is Kind's own), each mounted only by
+its listener at `/etc/space-rpc-tls` with the key readable by the listener's own
+identity, and the authority's self-signed end-entity certificate
+(`space-credmgr-authority-tls`, trusted by its clients through
+`space-credmgr-authority-trust`). The leaves carry service names only, so
+callers that dial node-api by node IP set `SPACE_NODE_API_TLS_SERVER_NAME=space-node-api`
+and builder node-api dials build-manager's loopback listener with
+`SPACE_BUILD_MANAGER_TLS_SERVER_NAME=space-builder-build-manager`. The CA's key
+stays in the Kind-only `space-internal-rpc-ca-signing` Secret, which no workload
+mounts. The script restarts a listener whose identity it reissued, and every
+workload if the CA itself changed, because neither reloads them while running.
+TLS here is server-authenticated: bearer tokens still authorize callers, and
+internal-api's node-address check is unchanged.
 
 ## Differences from the EKS deployment modules
 
@@ -919,7 +949,8 @@ configuration and the coordinated migration requirements.
 | `/space/cache` is btrfs on instance-store NVMe            | btrfs on a sparse loopback image at `/var/lib/space-cache.img` on the kind node (40 GiB, same code paths, less I/O headroom), mounted on the node's `/space/cache` by `space-cache.service`, so it outlives pod restarts like the NVMe does |
 | Postgres on RDS, secrets via ExternalSecrets / AWS Secrets Manager | In-cluster `space-postgres` StatefulSet, static Kubernetes Secrets             |
 | S3 for snapshots + template artifacts                     | In-cluster versitygw (real S3 protocol, sigv4, path-style)                    |
-| `space-credmgr-authority` Deployment with a KMS-backed platform KEK and TLS from its own certificate (`credmgr_authority_kms.tf`, `credmgr_authority_tls.tf`) | one replica with the in-memory development KEK, which a restart loses; plaintext TCP |
+| `space-credmgr-authority` Deployment with a KMS-backed platform KEK and TLS from its own certificate (`credmgr_authority_kms.tf`, `credmgr_authority_tls.tf`) | one replica with the in-memory development KEK, which a restart loses; TLS from a self-signed certificate `internal-rpc-tls.sh` issues per cluster |
+| Internal RPC CA and listener leaves issued by Terraform and synced by External Secrets (`internal_rpc_tls.tf`) | the same Secrets issued per cluster by `scripts/internal-rpc-tls.sh` |
 | volume-manager credentials via credmgr STS/IRSA           | static `SPACE_OBJECT_STORE_STATIC_*` creds (the documented local escape hatch) |
 | build-manager gets S3 credentials via credential-manager backed by cloud identity | the same directly injected static object-store credentials; credential-manager's storage exchange endpoint is explicitly disabled |
 | `/dev/kvm` access via the AMI's kvm group                 | `space-kind-devices.service` makes `/dev/kvm`, `/dev/vhost-vsock` and `/dev/vhost-net` mode 0666 on the node (kind-only; never replicate on a worker) |

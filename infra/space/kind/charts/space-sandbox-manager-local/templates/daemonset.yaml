@@ -151,6 +151,7 @@ spec:
               readOnly: true
             {{- include "space-node-service.mount.routeVerification" . | nindent 12 }}
             {{- include "space-node-service.mount.clusterApiToken" . | nindent 12 }}
+            {{- include "space-node-service.mount.rpcCa" . | nindent 12 }}
             {{- include "space-node-service.mount.private" . | nindent 12 }}
           {{- with .Values.resources }}
           resources:
@@ -165,4 +166,5 @@ spec:
             type: DirectoryOrCreate
         {{- include "space-node-service.volume.routeVerification" . | nindent 8 }}
         {{- include "space-node-service.volume.clusterApiToken" . | nindent 8 }}
+        {{- include "space-node-service.volume.rpcCa" . | nindent 8 }}
         {{- include "space-node-service.volume.private" . | nindent 8 }}

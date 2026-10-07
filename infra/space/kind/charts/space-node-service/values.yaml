@@ -16,11 +16,11 @@ node:
   # Cluster API (space-internal-api). node-ctl publishes node state here
   # (node registration), template-manager resolves releases, sandbox-manager
   # reports snapshot state, build-manager publishes builds.
-  internalApiEndpoint: http://space-internal-api:9800
+  internalApiEndpoint: https://space-internal-api:9800
   # The control-plane credential-manager authority
   # (space-credmgr-authority-local): each node's credential-manager agent
   # forwards to it, and node-manager fetches sandbox volume DEKs from it.
-  credmgrAuthorityEndpoint: http://space-credmgr-authority:9810
+  credmgrAuthorityEndpoint: https://space-credmgr-authority:9810
   # Secret carrying the static inter-service bearer tokens (rendered by the
   # api chart).
   internalSecretName: space-internal

@@ -58,9 +58,7 @@ Identity every node service reports. SPACE_NODE_ID is the raw kube node name
 (fieldRef spec.nodeName); services and the cluster API derive the node UUID
 from (name, role) via space_k8s_node_id, so nothing hand-rolls an id. The
 node and pod names are the observability identity
-(crates/libs/observability/src/identity.rs). SPACE_INTERNAL_RPC_INSECURE_DEV
-is Kind's opt-out of authenticated internal RPC TLS (docs/internal-rpc-tls.md)
-for the node services' TCP clients and listeners.
+(crates/libs/observability/src/identity.rs).
 */}}
 {{- define "space-node-service.env.identity" -}}
 - name: SPACE_NODE_ID
@@ -83,30 +81,59 @@ for the node services' TCP clients and listeners.
   valueFrom:
     fieldRef:
       fieldPath: metadata.name
-- name: SPACE_INTERNAL_RPC_INSECURE_DEV
-  value: "true"
 {{ include "space-kind-telemetry.env" . }}
 {{- end -}}
 
 {{/*
-ClusterApi client wiring: the endpoint plus the pod's own projected
+ClusterApi client wiring: the HTTPS endpoint plus the pod's own projected
 ServiceAccount token (audience space-cluster-api), which internal-api
 authenticates by TokenReview against its allowlist
-(SPACE_CLUSTER_API_AUTH_ALLOWED_SERVICE_ACCOUNTS in space-internal-api-local).
-Pair with the cluster-api-token volume below.
+(SPACE_CLUSTER_API_AUTH_ALLOWED_SERVICE_ACCOUNTS in space-internal-api-local),
+and the internal RPC trust (env.rpcTrust). Pair with the cluster-api-token and
+rpc-ca volumes below.
 */}}
 {{- define "space-node-service.env.clusterApi" -}}
 - name: SPACE_INTERNAL_API_ENDPOINT
   value: {{ .Values.node.internalApiEndpoint | quote }}
 - name: SPACE_CLUSTER_API_TOKEN_PATH
   value: /var/run/space-publication/cluster-api.token
+{{ include "space-node-service.env.rpcTrust" . }}
+{{- end -}}
+
+{{/*
+Internal RPC TLS trust for a ClusterApi, NodeApi or BuildManager TCP caller
+(docs/internal-rpc-tls.md): the cluster's CA bundle
+(internal-rpc-tls.sh's space-internal-rpc-ca, mounted where the EKS module
+mounts it), and the shared NodeApi identity every node-api presents, since
+callers dial node-api by node IP and its leaf carries no IP SANs. ClusterApi
+needs no override: the endpoint host is the leaf's own name.
+*/}}
+{{- define "space-node-service.env.rpcTrust" -}}
+- name: SPACE_INTERNAL_RPC_TLS_CA
+  value: /etc/space-rpc-ca/ca.crt
+- name: SPACE_NODE_API_TLS_SERVER_NAME
+  value: space-node-api
+{{- end -}}
+
+{{/*
+A TLS listener's own identity (internal-rpc-tls.sh's space-<listener>-tls
+Secret, mounted where the EKS module mounts it). Pair with volume.rpcIdentity.
+*/}}
+{{- define "space-node-service.env.rpcIdentity" -}}
+- name: SPACE_INTERNAL_RPC_TLS_CERT
+  value: /etc/space-rpc-tls/tls.crt
+- name: SPACE_INTERNAL_RPC_TLS_KEY
+  value: /etc/space-rpc-tls/tls.key
 {{- end -}}
 
 {{/*
 The control-plane credential-manager authority, for the node credential
-agent and node-manager's direct sandbox volume DEK calls: its endpoint
-(SPACE_CREDMGR_ENDPOINT, crates/libs/credential/mgr/client/src/endpoint.rs)
-and the pod's projected ServiceAccount token at the client's default path
+agent and node-manager's direct sandbox volume DEK calls: its HTTPS endpoint
+(SPACE_CREDMGR_ENDPOINT, crates/libs/credential/mgr/client/src/endpoint.rs),
+whose host must be one of the certificate's names (the client has no
+server-name override); the authority's self-signed certificate as the trust
+anchor (SPACE_CREDMGR_TLS_CA, as on EKS: credmgr_authority_tls.tf); and the
+pod's projected ServiceAccount token at the client's default path
 (/var/run/space-auth/credmgr.token, client/src/token.rs) with the
 authority's audience. The authority maps the ServiceAccount to its client
 service by TokenReview. Pair with the credmgr-token volume below.
@@ -114,6 +141,8 @@ service by TokenReview. Pair with the credmgr-token volume below.
 {{- define "space-node-service.env.credmgrAuthority" -}}
 - name: SPACE_CREDMGR_ENDPOINT
   value: {{ .Values.node.credmgrAuthorityEndpoint | quote }}
+- name: SPACE_CREDMGR_TLS_CA
+  value: /var/run/space-auth/credmgr-ca.crt
 {{- end -}}
 
 {{- define "space-node-service.env.internalToken" -}}
@@ -226,6 +255,18 @@ pod's own mounts back to the node.
   readOnly: true
 {{- end -}}
 
+{{- define "space-node-service.mount.rpcCa" -}}
+- name: rpc-ca
+  mountPath: /etc/space-rpc-ca
+  readOnly: true
+{{- end -}}
+
+{{- define "space-node-service.mount.rpcIdentity" -}}
+- name: rpc-identity
+  mountPath: /etc/space-rpc-tls
+  readOnly: true
+{{- end -}}
+
 {{- define "space-node-service.mount.routeVerification" -}}
 - name: route-verification-bundle
   mountPath: /var/run/space-route-verification
@@ -268,6 +309,30 @@ pod's own mounts back to the node.
           path: credmgr.token
           audience: space-credential-manager
           expirationSeconds: 3600
+      - secret:
+          name: space-credmgr-authority-trust
+          items:
+            - key: ca.crt
+              path: credmgr-ca.crt
+{{- end -}}
+
+{{- define "space-node-service.volume.rpcCa" -}}
+- name: rpc-ca
+  secret:
+    secretName: space-internal-rpc-ca
+    defaultMode: 0444
+{{- end -}}
+
+{{/*
+`secret` is the listener's Secret. The key is readable only by the pod's
+group: a non-root listener sets fsGroup to its own GID (pod securityContext),
+a root listener reads it as owner.
+*/}}
+{{- define "space-node-service.volume.rpcIdentity" -}}
+- name: rpc-identity
+  secret:
+    secretName: {{ .secret }}
+    defaultMode: 0440
 {{- end -}}
 
 {{- define "space-node-service.volume.clusterApiToken" -}}

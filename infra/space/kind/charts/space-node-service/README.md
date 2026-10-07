@@ -19,6 +19,6 @@ are the ones the worker image and the node layer create.
 | Value | Default | Meaning |
 | --- | --- | --- |
 | `node.role` | `worker` | `worker` or `builder`; selects the node pool and the reported role |
-| `node.internalApiEndpoint` | `http://space-internal-api:9800` | ClusterApi |
-| `node.credmgrAuthorityEndpoint` | `http://space-credmgr-authority:9810` | credential-manager authority (agent upstream, node-manager volume DEKs) |
+| `node.internalApiEndpoint` | `https://space-internal-api:9800` | ClusterApi |
+| `node.credmgrAuthorityEndpoint` | `https://space-credmgr-authority:9810` | credential-manager authority (agent upstream, node-manager volume DEKs) |
 | `node.diskAdmission.*` | 1 GiB each | Kind-sized `/space/cache` admission floor and reservation |

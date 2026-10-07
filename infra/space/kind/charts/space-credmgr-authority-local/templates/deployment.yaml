@@ -80,19 +80,24 @@ spec:
         runAsNonRoot: true
         runAsUser: {{ include "space-node-service.identityNumber" (dict "ctx" . "name" "SPACE_SBXMGR_UID") }}
         runAsGroup: {{ include "space-node-service.identityNumber" (dict "ctx" . "name" "SPACE_SBXMGR_GID") }}
+        # That group owns the mounted TLS key, readable by it only.
+        fsGroup: {{ include "space-node-service.identityNumber" (dict "ctx" . "name" "SPACE_SBXMGR_GID") }}
       containers:
         - name: credmgr-authority
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           # The authority role over TCP only (`--no-uds` skips the node-local
-          # sockets and service mutex, crates/libs/credential/mgr/server/src/run.rs).
-          # Plaintext is refused unless explicitly allowed.
+          # sockets and service mutex, crates/libs/credential/mgr/server/src/run.rs),
+          # serving TLS with its self-signed end-entity certificate, mounted
+          # where the EKS module mounts it (credmgr_authority_tls.tf;
+          # internal-rpc-tls.sh issues it). TLS is server-side only.
           command:
             - /opt/space/bin/space-credmgr-svc
             - --role=authority
             - --no-uds
             - --tcp-listen=0.0.0.0:{{ .Values.service.port }}
-            - --allow-plaintext
+            - --tls-cert=/etc/space-credmgr-tls/tls.crt
+            - --tls-key=/etc/space-credmgr-tls/tls.key
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
@@ -159,16 +164,19 @@ spec:
           # (crates/libs/credential/mgr/server/src/tcp_auth.rs).
           readinessProbe:
             exec:
-              command: ["/opt/space/bin/grpc_health_probe", "-addr=127.0.0.1:{{ .Values.service.port }}", "-connect-timeout=2s", "-rpc-timeout=2s"]
+              command: ["/opt/space/bin/grpc_health_probe", "-addr=127.0.0.1:{{ .Values.service.port }}", "-tls", "-tls-ca-cert=/etc/space-credmgr-tls/tls.crt", "-tls-server-name=space-credmgr-authority", "-connect-timeout=2s", "-rpc-timeout=2s"]
             periodSeconds: 5
           livenessProbe:
             exec:
-              command: ["/opt/space/bin/grpc_health_probe", "-addr=127.0.0.1:{{ .Values.service.port }}", "-connect-timeout=3s", "-rpc-timeout=3s"]
+              command: ["/opt/space/bin/grpc_health_probe", "-addr=127.0.0.1:{{ .Values.service.port }}", "-tls", "-tls-ca-cert=/etc/space-credmgr-tls/tls.crt", "-tls-server-name=space-credmgr-authority", "-connect-timeout=3s", "-rpc-timeout=3s"]
             initialDelaySeconds: 10
             periodSeconds: 20
           volumeMounts:
             - name: tmp
               mountPath: /tmp
+            - name: tls
+              mountPath: /etc/space-credmgr-tls
+              readOnly: true
           {{- with .Values.resources }}
           resources:
             {{- toYaml . | nindent 12 }}
@@ -176,6 +184,10 @@ spec:
       volumes:
         - name: tmp
           emptyDir: {}
+        - name: tls
+          secret:
+            secretName: space-credmgr-authority-tls
+            defaultMode: 0440
 ---
 apiVersion: v1
 kind: Service

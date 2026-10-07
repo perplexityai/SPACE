@@ -78,6 +78,7 @@ spec:
             {{- include "space-node-service.mount.run" . | nindent 12 }}
             {{- include "space-node-service.mount.cache" (dict) | nindent 12 }}
             {{- include "space-node-service.mount.clusterApiToken" . | nindent 12 }}
+            {{- include "space-node-service.mount.rpcCa" . | nindent 12 }}
             {{- include "space-node-service.mount.private" . | nindent 12 }}
           {{- with .Values.resources }}
           resources:
@@ -87,4 +88,5 @@ spec:
         {{- include "space-node-service.volume.run" . | nindent 8 }}
         {{- include "space-node-service.volume.cache" . | nindent 8 }}
         {{- include "space-node-service.volume.clusterApiToken" . | nindent 8 }}
+        {{- include "space-node-service.volume.rpcCa" . | nindent 8 }}
         {{- include "space-node-service.volume.private" . | nindent 8 }}

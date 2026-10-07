@@ -61,7 +61,8 @@ listeners after the Secret has refreshed.
 
 `SPACE_INTERNAL_RPC_INSECURE_DEV=true` explicitly permits HTTP for local test
 and development deployments and permits a listener without certificate files.
-The checked-in Kind charts set this exception. A partially configured listener
+The checked-in Kind charts don't set it: `infra/space/kind/scripts/internal-rpc-tls.sh`
+provisions a per-cluster CA and the same listener Secrets locally. A partially configured listener
 certificate/key pair still fails startup; explicitly configured HTTPS still
 requires trust even with the exception. Steady-state production deployments must leave this
 exception unset/false. Plaintext Rust fixtures opt in explicitly in isolated

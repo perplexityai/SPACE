@@ -15,7 +15,7 @@ service:
 
 internal:
   secretName: space-internal
-  apiEndpoint: http://space-internal-api:9800
+  apiEndpoint: https://space-internal-api:9800
 
 grpcClient:
   # Set to "kubernetes" to exercise per-RPC balancing in Kind.

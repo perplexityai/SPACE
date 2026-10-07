@@ -349,6 +349,21 @@ kubectl --context kind-{cluster} -n {ns} create secret generic space-sandbox-ssh
     labels = ["bootstrap"],
 )
 
+# Internal RPC TLS: the cluster's CA and the ClusterApi, NodeApi, BuildManager
+# and credential-manager authority identities as Secrets, before any workload
+# that mounts them. Idempotent; keeps valid material and reissues a leaf near
+# its expiry (docs/internal-rpc-tls.md).
+local_resource(
+    "internal-rpc-tls",
+    cmd = """
+set -eu
+kubectl --context kind-{cluster} apply -f infra/space/kind/manifests/namespace.yaml >/dev/null
+SPACE_KIND_CLUSTER={cluster} bash infra/space/kind/scripts/internal-rpc-tls.sh
+""".format(cluster = KIND_CLUSTER),
+    deps = ["infra/space/kind/scripts/internal-rpc-tls.sh"],
+    labels = ["bootstrap"],
+)
+
 # containerd-shim-space-v2 on each sandbox worker, so per-sandbox pause pods
 # are hijacked into real Firecracker sandboxes. install-shim.sh resolves the
 # local metrics and traces Collector Services, so in otel mode it waits for
@@ -390,7 +405,7 @@ local_resource(
 # runs for minutes. It waits for the serial bootstrap resources because Tilt
 # holds those while anything else is building.
 RUST_ARTIFACTS_AFTER = ["label-kind-workers", "advertise-kind-worker-network-slots",
-                        "label-kind-infra", "sandbox-ssh-secret",
+                        "label-kind-infra", "sandbox-ssh-secret", "internal-rpc-tls",
                         "check-kind-node-image", "install-space-shim"]
 local_resource(
     "rust-artifacts",
@@ -436,7 +451,8 @@ k8s_resource(
 # Per-sandbox pods need the shim wired into containerd before the first create
 # lands.
 SPACE_API_DEPS = ["space-postgres", "label-kind-workers", "label-kind-infra",
-                  "advertise-kind-worker-network-slots", "install-space-shim"]
+                  "advertise-kind-worker-network-slots", "install-space-shim",
+                  "internal-rpc-tls"]
 k8s_yaml(helm_release("space", "infra/space/kind/charts/space-api-local"))
 k8s_resource(
     "space-api",
@@ -568,7 +584,8 @@ for line in NODE_RELEASES:
     k8s_resource(
         "{}-{}".format(release, service),
         labels = ["node-" + role],
-        resource_deps = ["check-kind-node-image", "label-kind-workers", "sandbox-ssh-secret"],
+        resource_deps = ["check-kind-node-image", "label-kind-workers", "sandbox-ssh-secret",
+                         "internal-rpc-tls"],
     )
 
 # Kind-only operator shell on every sandbox worker and builder; the smoke
