@@ -113,6 +113,23 @@ WRAPPER = "fn test_raw(var: &str) -> Option<String> { test_hook_var(var) }\n"
             LIB: 'impl C { const ENV: &str = "SPACE_EXAMPLE_LIMIT"; fn f() { test_hook_var(Self::ENV); } }',
             "crates/libs/example/src/other.rs": 'impl D { const ENV: &str = "SPACE_EXAMPLE_TICK_SECS"; }',
         },
+        # Release code next to test-only fields, variants and expressions.
+        {LIB: "struct S { #[cfg(test)] probe: bool, live: bool }\n"
+         "impl S { fn new() { test_hook_var(\"SPACE_EXAMPLE_LIMIT\"); } }"},
+        {LIB: "enum E { #[cfg(test)]\n Static(u8), Live }\nfn from_env() { test_hook_var(\"SPACE_EXAMPLE_LIMIT\"); }"},
+        {LIB: "fn f() -> u8 { #[cfg(test)]\n return 1;\n 2 }\nfn g() { test_hook_var(\"SPACE_EXAMPLE_LIMIT\"); }"},
+        # `not(test)` is release code, and `any(test, ...)` can be.
+        {LIB: "#[cfg(not(test))]\nfn limit() -> Option<String> { test_hook_var(\"SPACE_EXAMPLE_LIMIT\") }"},
+        {LIB: "#[cfg(any(test, feature = \"x\"))]\nfn limit() -> Option<String> { test_hook_var(\"SPACE_EXAMPLE_LIMIT\") }"},
+        # A `pub` wrapper counts in every crate, not only its own.
+        {
+            "crates/libs/core2/Cargo.toml": "",
+            "crates/libs/core2/src/lib.rs": "pub fn test_flag(name: &str) -> bool { test_hook_var(name).is_some() }",
+            "crates/libs/user/Cargo.toml": "",
+            "crates/libs/user/src/lib.rs": 'let on = core2::test_flag("SPACE_EXAMPLE_LIMIT");',
+        },
+        # A single-letter constant.
+        {LIB: 'const X: &str = "SPACE_EXAMPLE_LIMIT";\nlet n = test_hook_var(X);'},
         # A `//` inside a string doesn't hide the rest of the line.
         {LIB: 'let u = "http://x"; let n = test_hook_var("SPACE_EXAMPLE_LIMIT");'},
         {LIB: 'let b = br#"a"b // x"#; let n = test_hook_var("SPACE_EXAMPLE_LIMIT");'},
@@ -124,6 +141,8 @@ WRAPPER = "fn test_raw(var: &str) -> Option<String> { test_hook_var(var) }\n"
         "import-alias", "local-constant-wins", "reader-inside-function", "char-quote-before-read",
         "string-parameter-wrapper", "generic-wrapper", "escaped-char-before-read",
         "generic-with-parens", "self-local-over-ambiguous-crate",
+        "after-test-field", "after-test-variant", "after-test-expression", "cfg-not-test",
+        "cfg-any-test", "pub-wrapper-other-crate", "single-letter-constant",
         "url-in-string", "byte-raw-string",
     ],
 )
@@ -143,6 +162,23 @@ def test_wrapper_not_named_test_fails(tmp_path: Path) -> None:
     assert "`hook_u32` passes its parameter `name`" in failures[0]
 
 
+@pytest.mark.parametrize(
+    "source",
+    [
+        "fn hook(var: &str) -> Option<String> { test_hook_var(var.trim()) }",
+        "fn hook(var: &&str) -> Option<String> { test_hook_var(*var) }",
+        "fn hook(var: Option<&str>) -> Option<String> { test_hook_var(var?) }",
+        "fn hook(var: Cow<'_, str>) -> Option<String> { test_hook_var(&var) }",
+        "fn hook<F: Fn(&str) -> u8>(f: F, var: &str) -> Option<String> { test_hook_var(var) }",
+    ],
+    ids=["method", "deref", "question-mark", "cow", "fn-bound-before"],
+)
+def test_parameter_shapes_forwarded_outside_test_function_fail(tmp_path: Path, source: str) -> None:
+    failures = guard.violations(tree(tmp_path, {LIB: source}))
+    assert len(failures) == 1, failures
+    assert "`hook` passes its parameter `var`" in failures[0]
+
+
 def test_mut_parameter_forwarded_outside_test_function_fails(tmp_path: Path) -> None:
     source = "fn hook(mut name: &str) -> Option<String> { test_hook_var(name) }"
     failures = guard.violations(tree(tmp_path, {LIB: source}))
@@ -150,41 +186,82 @@ def test_mut_parameter_forwarded_outside_test_function_fails(tmp_path: Path) -> 
     assert "`hook` passes its parameter `name`" in failures[0]
 
 
+P = pytest.param
+READ = 'test_hook_var("SPACE_EXAMPLE_LIMIT")'
+
+
 @pytest.mark.parametrize(
     "files",
     [
-        # An undocumented variable is what test hooks are for.
-        {LIB: 'let n = test_hook_var("SPACE_EXAMPLE_TICK_SECS");'},
-        # A documented variable read from the environment.
-        {LIB: 'let n = config.bounded_u32("SPACE_EXAMPLE_LIMIT", 8, 64);'},
-        # A `test_*` function that isn't a reader may take any argument.
-        {LIB: 'let image = test_image_ref("SPACE_EXAMPLE_LIMIT");'},
-        # A wrapper may forward its parameter.
-        {LIB: WRAPPER + 'let n = test_raw("SPACE_EXAMPLE_TICK_SECS");'},
-        # Passing a non-string parameter along isn't forwarding a name.
-        {LIB: "fn from_environment(env: &dyn Environment) { test_hook(env, Self::TICK); }"},
-        # A nested helper inside a wrapper doesn't change the enclosing function.
-        {LIB: "fn test_raw(var: &str) -> Option<String> { fn trim(s: String) -> String { s }\n"
-         "    test_hook_var(var).map(trim) }"},
-        # Imports, fields and mentions in strings aren't reads.
-        {LIB: "use pplx_space_common_core::env::{\n    env_flag,\n    test_hook_var,\n};"},
-        {LIB: "struct C { test_hook: bool }\nfn f(c: C) -> bool { c.test_hook }"},
-        {LIB: 'fn f() { tracing::info!(r#"call test_hook_var("SPACE_EXAMPLE_LIMIT")"#); }'},
-        # Comments aren't code, nested or not.
-        {LIB: '// test_hook_var("SPACE_EXAMPLE_LIMIT")\n'
-         '/* a /* b */ test_hook_var("SPACE_EXAMPLE_LIMIT") */'},
-        {LIB: "let q = '\"'; // test_hook_var(\"SPACE_EXAMPLE_LIMIT\")"},
-        # A parameter used inside an argument, not passed as one, isn't forwarding.
-        {LIB: 'fn tick(service: &str) -> Option<String> { test_hook(&scoped_env(service), "SPACE_EXAMPLE_TICK_SECS") }'},
-        {LIB: 'fn tick(prefix: &str) -> Option<String> { test_hook_var(&format!("{}_TICK", prefix)) }'},
-        {LIB: "impl C { fn f(&self, name: &str) -> Option<String> { test_hook_var(self.name) } }"},
-        {LIB: "fn tick(service: &str, env: &dyn Environment) -> Option<String> {\n"
-         '    test_hook(&service.env_for(env), "SPACE_EXAMPLE_TICK_SECS")\n}'},
-        # Two impls in one file may reuse a constant name for different variables.
-        {LIB: 'impl A { const ENV: &str = "SPACE_EXAMPLE_LIMIT"; fn f() { std::env::var(Self::ENV); } }\n'
-         'impl B { const ENV: &str = "SPACE_EXAMPLE_TICK_SECS"; fn g() { test_hook_var(Self::ENV); } }'},
-        # Readers and aliases from one crate don't count in another.
-        {
+        # Reads that are what test hooks are for, or not hook reads at all.
+        P({LIB: 'let n = test_hook_var("SPACE_EXAMPLE_TICK_SECS");'}, id="undocumented"),
+        P({LIB: 'let n = config.bounded_u32("SPACE_EXAMPLE_LIMIT", 8, 64);'}, id="real-read"),
+        P({LIB: 'let image = test_image_ref("SPACE_EXAMPLE_LIMIT");'}, id="non-reader-test-fn"),
+        P({LIB: WRAPPER + 'let n = test_raw("SPACE_EXAMPLE_TICK_SECS");'}, id="wrapper-definition"),
+        # Passing along something that isn't a whole string parameter.
+        P({LIB: "fn from_environment(env: &dyn Environment) { test_hook(env, Self::TICK); }"},
+          id="environment-argument"),
+        P({LIB: "fn test_raw(var: &str) -> Option<String> { fn trim(s: String) -> String { s }\n"
+               "    test_hook_var(var).map(trim) }"}, id="nested-helper"),
+        P({LIB: "fn tick(service: &str) -> Option<String> {\n"
+               '    test_hook(&scoped_env(service), "SPACE_EXAMPLE_TICK_SECS")\n}'},
+          id="parameter-inside-argument"),
+        P({LIB: 'fn tick(prefix: &str) -> Option<String> { test_hook_var(&format!("{}_TICK", prefix)) }'},
+          id="parameter-inside-format"),
+        P({LIB: "impl C { fn f(&self, name: &str) -> Option<String> { test_hook_var(self.name) } }"},
+          id="field-not-parameter"),
+        P({LIB: "fn tick(service: &str, env: &dyn Environment) -> Option<String> {\n"
+               '    test_hook(&service.env_for(env), "SPACE_EXAMPLE_TICK_SECS")\n}'},
+          id="parameter-starts-argument"),
+        # Imports, fields and mentions in strings and comments aren't reads.
+        P({LIB: "use pplx_space_common_core::env::{\n    env_flag,\n    test_hook_var,\n};"},
+          id="multi-line-import"),
+        P({LIB: "struct C { test_hook: bool }\nfn f(c: C) -> bool { c.test_hook }"}, id="field"),
+        P({LIB: 'fn f() { tracing::info!(r#"call test_hook_var("SPACE_EXAMPLE_LIMIT")"#); }'},
+          id="string-mention"),
+        P({LIB: f"// {READ}\n/* a /* b */ {READ} */"}, id="comments"),
+        P({LIB: f"let q = '\"'; // {READ}"}, id="char-quote"),
+        # Test code may read anything.
+        P({LIB: f"#[cfg(test)]\nmod tests {{\n    fn reads() {{ {READ}; }}\n}}"}, id="inline-test-module"),
+        P({LIB: f"#[cfg(test)]\n#[allow(clippy::unwrap_used)]\npub mod tests {{\n    fn reads() {{ {READ}; }}\n}}"},
+          id="test-module-with-attribute"),
+        P({LIB: '#[cfg(all(test, target_os = "linux"))]\nmod tests {\n'
+               "    fn a() { let c = '}'; }\n"
+               f"    fn reads() {{ {READ}; }}\n}}"}, id="cfg-all-test-with-brace-char"),
+        P({LIB: f"#[cfg(test)]\nfn helper() {{ {READ}; }}"}, id="cfg-test-function"),
+        P({LIB: f"#[cfg(test)]\nfn helper(buf: [u8; 4]) {{ {READ}; }}"}, id="cfg-test-function-array-param"),
+        P({LIB: f"#[cfg(all(test, unix))]\nimpl S {{ fn r() {{ {READ}; }} }}"}, id="cfg-all-test-impl"),
+        P({"crates/libs/example/src/fixtures.rs": f"#![cfg(test)]\nfn r() {{ {READ}; }}"},
+          id="inner-cfg-test-file"),
+        P({"crates/libs/example/src/tests.rs": f"let n = {READ};"}, id="tests-rs"),
+        P({"crates/libs/example/src/store_tests.rs": f"let n = {READ};"}, id="suffix-tests"),
+        P({"crates/libs/example/tests/it.rs": f"let n = {READ};"}, id="tests-dir"),
+        P({"crates/libs/example/benches/b.rs": f"let n = {READ};"}, id="benches"),
+        # Constants: the reading file wins, ambiguity isn't guessed, other
+        # crates don't count.
+        P({
+            "crates/libs/example/src/a.rs": 'const ENV: &str = "SPACE_EXAMPLE_LIMIT";\n'
+            "let n = std::env::var(ENV);",
+            "crates/libs/example/src/b.rs": 'const ENV: &str = "SPACE_EXAMPLE_TICK_SECS";\n'
+            "let n = test_hook_var(ENV);",
+        }, id="per-file-constant"),
+        P({LIB: 'impl A { const ENV: &str = "SPACE_EXAMPLE_LIMIT"; fn f() { std::env::var(Self::ENV); } }\n'
+               'impl B { const ENV: &str = "SPACE_EXAMPLE_TICK_SECS"; fn g() { test_hook_var(Self::ENV); } }'},
+          id="same-file-constant-twice"),
+        P({
+            LIB: "let n = test_hook_var(gc::ENV);",
+            "crates/libs/example/src/gc.rs": 'const ENV: &str = "SPACE_EXAMPLE_TICK_SECS";',
+            "crates/libs/example/src/evict.rs": 'const ENV: &str = "SPACE_EXAMPLE_LIMIT";',
+        }, id="ambiguous-constant"),
+        P({
+            "crates/libs/one/Cargo.toml": "",
+            "crates/libs/one/src/lib.rs": "let n = test_hook_var(gc::ENV);",
+            "crates/libs/one/src/gc.rs": 'const ENV: &str = "SPACE_EXAMPLE_TICK_SECS";',
+            "crates/libs/two/Cargo.toml": "",
+            "crates/libs/two/src/lib.rs": 'const ENV: &str = "SPACE_EXAMPLE_LIMIT";',
+        }, id="other-crate-constant"),
+        # A crate-private wrapper's name and an alias mean nothing in another crate.
+        P({
             "crates/libs/one/Cargo.toml": "",
             "crates/libs/one/src/lib.rs": "use pplx_space_common_core::env::test_hook_var as var;\n" + WRAPPER,
             "crates/libs/two/Cargo.toml": "",
@@ -192,50 +269,7 @@ def test_mut_parameter_forwarded_outside_test_function_fails(tmp_path: Path) -> 
             'let n = std::env::var("SPACE_EXAMPLE_LIMIT");\n'
             "struct Probe; impl Probe { fn test_raw(&self, url: &str) {} }\n"
             "fn check(url: &str) { Probe.test_raw(url) }",
-        },
-        # Test code may read anything.
-        {LIB: '#[cfg(test)]\n#[allow(clippy::unwrap_used)]\npub mod tests {\n'
-         '    fn reads() { test_hook_var("SPACE_EXAMPLE_LIMIT"); }\n}'},
-        {LIB: '#[cfg(all(test, target_os = "linux"))]\nmod tests {\n'
-         "    fn a() { let c = '}'; }\n"
-         '    fn reads() { test_hook_var("SPACE_EXAMPLE_LIMIT"); }\n}'},
-        {LIB: '#[cfg(test)]\nfn helper() { test_hook_var("SPACE_EXAMPLE_LIMIT"); }'},
-        {"crates/libs/example/benches/b.rs": 'let n = test_hook_var("SPACE_EXAMPLE_LIMIT");'},
-        {LIB: '#[cfg(test)]\nmod tests {\n    fn reads() { test_hook_var("SPACE_EXAMPLE_LIMIT"); }\n}'},
-        {"crates/libs/example/src/tests.rs": 'let n = test_hook_var("SPACE_EXAMPLE_LIMIT");'},
-        {"crates/libs/example/src/store_tests.rs": 'let n = test_hook_var("SPACE_EXAMPLE_LIMIT");'},
-        {"crates/libs/example/tests/it.rs": 'let n = test_hook_var("SPACE_EXAMPLE_LIMIT");'},
-        # The same constant name means another variable in another file; the
-        # reading file's own definition wins.
-        {
-            "crates/libs/example/src/a.rs": 'const ENV: &str = "SPACE_EXAMPLE_LIMIT";\n'
-            "let n = std::env::var(ENV);",
-            "crates/libs/example/src/b.rs": 'const ENV: &str = "SPACE_EXAMPLE_TICK_SECS";\n'
-            "let n = test_hook_var(ENV);",
-        },
-        # A name defined differently across the crate isn't guessed, and other
-        # crates' constants don't count.
-        {
-            LIB: "let n = test_hook_var(gc::ENV);",
-            "crates/libs/example/src/gc.rs": 'const ENV: &str = "SPACE_EXAMPLE_TICK_SECS";',
-            "crates/libs/example/src/evict.rs": 'const ENV: &str = "SPACE_EXAMPLE_LIMIT";',
-        },
-        {
-            "crates/libs/one/Cargo.toml": "",
-            "crates/libs/one/src/lib.rs": "let n = test_hook_var(gc::ENV);",
-            "crates/libs/one/src/gc.rs": 'const ENV: &str = "SPACE_EXAMPLE_TICK_SECS";',
-            "crates/libs/two/Cargo.toml": "",
-            "crates/libs/two/src/lib.rs": 'const ENV: &str = "SPACE_EXAMPLE_LIMIT";',
-        },
-    ],
-    ids=[
-        "undocumented", "real-read", "non-reader-test-fn", "wrapper-definition",
-        "environment-argument", "nested-helper", "parameter-inside-argument",
-        "parameter-inside-format", "field-not-parameter", "parameter-starts-argument", "same-file-constant-twice",
-        "other-crate-readers", "test-module-with-attribute", "cfg-all-test-with-brace-char",
-        "cfg-test-function", "benches", "multi-line-import", "field", "string-mention",
-        "comments", "char-quote", "inline-test-module", "tests-rs", "suffix-tests", "tests-dir",
-        "per-file-constant", "ambiguous-constant", "other-crate-constant",
+        }, id="other-crate-readers"),
     ],
 )
 def test_reads_that_are_not_violations_pass(tmp_path: Path, files: dict[str, str]) -> None:

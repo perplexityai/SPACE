@@ -12,11 +12,12 @@ Unit tests rarely catch that regression. Crates that read hooks generally
 enable `test-hooks` for their own tests, so in a test build a hook reads the
 environment exactly like a real read. This guard checks the source instead,
 over Rust files under `crates/`, skipping `target/`, test and bench files, and
-items under a `#[cfg(...)]` that mentions `test`.
+items compiled only for tests (`#[cfg(test)]` or `#[cfg(all(test, ...))]` on an
+item, or `#![cfg(test)]` on a file).
 
 A *reader* is `test_hook`, `test_hook_var`, an import alias of either in the
-same file, or a function named `test_*` in the same crate that passes one of
-its own string parameters, as a whole argument, to a reader
+same file, or a function named `test_*` (in the same crate, or `pub` anywhere)
+that passes one of its own string parameters, as a whole argument, to a reader
 (`EnvConfig::test_raw`, for example). Two rules:
 
 1. No reader call may name a documented variable, as a string literal or as a
@@ -56,17 +57,23 @@ FN_DEF = re.compile(r"\bfn\s+([a-z_][a-z0-9_]*)")
 CALL = re.compile(r"\b([a-z_][a-z0-9_]*)\s*(?:::\s*<[^()]*?>\s*)?\(")
 ALIAS = re.compile(r"\b(test_hook_var|test_hook)\s+as\s+([a-z_][a-z0-9_]*)")
 # `#[cfg(test)]`, `#[cfg(all(test, ...))]` and the like.
-TEST_CFG = re.compile(r"#\[cfg\([^\]]*\btest\b[^\]]*\)\]")
+# An outer `cfg` attribute; `test_only_cfg` decides whether it needs `test`.
+CFG_ATTRIBUTE = re.compile(r"#\[cfg\((.*?)\)\]", re.S)
+INNER_TEST_CFG = re.compile(r"\A\s*(?:#!\[[^\]]*\]\s*)*#!\[cfg\((?:test|all\([^\]]*\btest\b[^\]]*\))\)\]")
+ATTRIBUTE = re.compile(r"\s*#\[[^\]]*\]")
+ITEM = re.compile(
+    r"\s*(?:pub(?:\([^)]*\))?\s+)?(?:(?:async|const|unsafe|extern(?:\s+\"[^\"]*\")?)\s+)*"
+    r"(?:mod|fn|impl|struct|enum|union|const|static|use|type|trait|macro_rules!)\b"
+)
 NAME_ARG = re.compile(
-    r'"(SPACE_[A-Z0-9_]+)"|(?<![A-Za-z0-9_"])((?:[A-Za-z_][A-Za-z0-9_]*::)*)([A-Z][A-Z0-9_]+)\b'
+    r'"(SPACE_[A-Z0-9_]+)"|(?<![A-Za-z0-9_"])((?:[A-Za-z_][A-Za-z0-9_]*::)*)([A-Z][A-Z0-9_]*)\b'
 )
-# A parameter passed whole: `name`, `&name`, `&*name`, `name.as_str()`, ...
+# A parameter passed whole: `name`, `&name`, `*name`, `name?`, `name.trim()`,
+# `&*name.as_str()`: references, derefs, `?` and argument-free method calls.
 WHOLE_ARGUMENT = re.compile(
-    r"&?\*?\s*([a-z_][a-z0-9_]*)(?:\.(?:as_str|as_ref|to_owned|to_string|clone)\(\))?"
+    r"[&*\s]*([a-z_][a-z0-9_]*)(?:\??\.[a-z_][a-z0-9_]*\(\s*\))*\??"
 )
-STR_PARAMETER = re.compile(
-    r"(?:^|,)\s*(?:mut\s+)?([a-z_][a-z0-9_]*)\s*:\s*(?:&\s*(?:'\w+\s+)?(?:mut\s+)?)?(?:str|String)\b"
-)
+PARAMETER = re.compile(r"(?:mut\s+)?([a-z_][a-z0-9_]*)\s*:(.*)", re.S)
 STR_CONST = re.compile(
     r"\b(?:const|static)\s+([A-Z][A-Z0-9_]*)\s*:\s*&\s*(?:'static\s+)?str\s*=\s*r?#*\"(SPACE_[A-Z0-9_]+)\""
 )
@@ -152,16 +159,52 @@ def matching(text: str, start: int, opener: str, closer: str) -> int:
     return len(text)
 
 
+def test_only_cfg(predicate: str) -> bool:
+    """Whether a `cfg` predicate holds only in test builds.
+
+    `test` and `all(..., test, ...)` do; `not(test)` (release code) and
+    `any(test, ...)` don't.
+    """
+    predicate = predicate.strip()
+    if predicate == "test":
+        return True
+    inner = re.fullmatch(r"all\((.*)\)", predicate, re.S)
+    return bool(inner) and any(part == "test" for part in top_level_arguments(inner.group(1)))
+
+
+def item_end(text: str, start: int) -> int:
+    """The end of the item starting at `start`: its `;` or its `{...}` body."""
+    depth = 0
+    for index in range(start, len(text)):
+        char = text[index]
+        if char in "([<":
+            depth += 1
+        elif char in ")]>" and depth:
+            depth -= 1
+        elif depth == 0 and char == ";":
+            return index + 1
+        elif depth == 0 and char == "{":
+            return matching(text, index, "{", "}")
+    return len(text)
+
+
 def without_test_items(text: str) -> str:
-    """Blank every item under a test `cfg`, through its body or `;`."""
-    for cfg in reversed(list(TEST_CFG.finditer(text))):
-        brace, semicolon = text.find("{", cfg.end()), text.find(";", cfg.end())
-        if brace == -1 and semicolon == -1:
+    """Blank every item compiled only for tests.
+
+    Only an attribute on an item (`mod`, `fn`, `impl`, ...) counts. A test
+    `cfg` on a field, variant or expression leaves the code around it alone.
+    """
+    if INNER_TEST_CFG.match(text):
+        return re.sub(r"[^\n]", " ", text)
+    for cfg in reversed(list(CFG_ATTRIBUTE.finditer(text))):
+        if not test_only_cfg(cfg.group(1)):
             continue
-        if brace == -1 or (semicolon != -1 and semicolon < brace):
-            end = semicolon + 1
-        else:
-            end = matching(text, brace, "{", "}")
+        index = cfg.end()
+        while attribute := ATTRIBUTE.match(text, index):
+            index = attribute.end()
+        if not ITEM.match(text, index):
+            continue
+        end = item_end(text, index)
         text = text[: cfg.start()] + re.sub(r"[^\n]", " ", text[cfg.start() : end]) + text[end:]
     return text
 
@@ -185,8 +228,11 @@ def sources(root: pathlib.Path) -> list[tuple[pathlib.Path, pathlib.Path, str]]:
 
 
 class Function:
-    def __init__(self, name: str, parameters: set[str], start: int, end: int) -> None:
+    def __init__(
+        self, name: str, parameters: set[str], start: int, end: int, public: bool
+    ) -> None:
         self.name, self.parameters, self.start, self.end = name, parameters, start, end
+        self.public = public
 
 
 def functions(text: str) -> list[Function]:
@@ -202,11 +248,17 @@ def functions(text: str) -> list[Function]:
         brace, semicolon = text.find("{", close_paren), text.find(";", close_paren)
         if brace == -1 or (semicolon != -1 and semicolon < brace):
             continue  # a declaration without a body
-        signature = text[open_paren + 1 : close_paren - 1]
         # Only string parameters can carry a variable name; `env: &dyn
         # Environment` passed along to `test_hook` is not forwarding.
-        parameters = set(STR_PARAMETER.findall(signature))
-        found.append(Function(match.group(1), parameters, brace, matching(text, brace, "{", "}")))
+        parameters = set()
+        for parameter in top_level_arguments(text[open_paren + 1 : close_paren - 1]):
+            typed = PARAMETER.fullmatch(parameter)
+            if typed and re.search(r"\b(?:str|String)\b", typed.group(2)):
+                parameters.add(typed.group(1))
+        public = bool(re.search(r"\bpub\s+(?:(?:async|const|unsafe)\s+)*$", text[max(0, match.start() - 24) : match.start()]))
+        found.append(
+            Function(match.group(1), parameters, brace, matching(text, brace, "{", "}"), public)
+        )
     return found
 
 
@@ -226,10 +278,10 @@ def reader_calls(text: str, readers: set[str]):
 
 def top_level_arguments(arguments: str) -> list[str]:
     parts, depth, current = [], 0, []
-    for char in arguments:
+    for index, char in enumerate(arguments):
         if char in "([{<":
             depth += 1
-        elif char in ")]}>":
+        elif char in ")]}" or (char == ">" and arguments[index - 1 : index] != "-"):
             depth -= 1
         if char == "," and depth == 0:
             parts.append("".join(current))
@@ -256,14 +308,22 @@ def file_readers(text: str, crate_readers: set[str]) -> set[str]:
     return set(PRIMITIVES) | crate_readers | {alias for _, alias in ALIAS.findall(text)}
 
 
+PUBLIC = pathlib.Path("<pub>")
+
+
 def find_readers(files) -> dict[pathlib.Path, set[str]]:
-    """Each crate's `test_*` wrappers, which count as readers only there."""
+    """`test_*` wrappers per crate; `pub` ones also count in every crate.
+
+    A private or `pub(crate)` wrapper's name only means a reader where it can
+    be called, so another crate's unrelated `test_raw` doesn't become one.
+    """
     readers: dict[pathlib.Path, set[str]] = {crate: set() for _, crate, _ in files}
+    readers[PUBLIC] = set()
+    parsed = [(crate, text, functions(text)) for _, crate, text in files]
     while True:
         changed = False
-        for _, crate, text in files:
-            defined = functions(text)
-            for call, arguments in reader_calls(text, file_readers(text, readers[crate])):
+        for crate, text, defined in parsed:
+            for call, arguments in reader_calls(text, file_readers(text, readers[crate] | readers[PUBLIC])):
                 owner = innermost(defined, call.start())
                 if (
                     owner
@@ -272,6 +332,8 @@ def find_readers(files) -> dict[pathlib.Path, set[str]]:
                     and forwarded(arguments, owner)
                 ):
                     readers[crate].add(owner.name)
+                    if owner.public:
+                        readers[PUBLIC].add(owner.name)
                     changed = True
         if not changed:
             return readers
@@ -297,7 +359,8 @@ def violations(root: pathlib.Path) -> list[str]:
     for relative, crate, text in files:
         local = string_constants(text)
         defined = functions(text)
-        for call, arguments in reader_calls(text, file_readers(text, crate_readers[crate])):
+        visible = crate_readers[crate] | crate_readers[PUBLIC]
+        for call, arguments in reader_calls(text, file_readers(text, visible)):
             line = f"{relative}:{text.count(chr(10), 0, call.start()) + 1}"
             reader = call.group(1)
             names: set[str] = set()
