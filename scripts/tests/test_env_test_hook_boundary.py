@@ -128,6 +128,18 @@ WRAPPER = "fn test_raw(var: &str) -> Option<String> { test_hook_var(var) }\n"
             "crates/libs/user/Cargo.toml": "",
             "crates/libs/user/src/lib.rs": 'let on = core2::test_flag("SPACE_EXAMPLE_LIMIT");',
         },
+        # A comparison or shift in a test-only item doesn't hide what follows.
+        {LIB: "#[cfg(test)]\nconst SHORT: bool = MAX < 10;\nfn grace() -> Option<String> { test_hook_var(\"SPACE_EXAMPLE_LIMIT\") }"},
+        {LIB: "#[cfg(test)]\nconst MASK: u32 = 1 << 4;\nfn grace() -> Option<String> { test_hook_var(\"SPACE_EXAMPLE_LIMIT\") }"},
+        # A file compiled outside tests, whatever else its `cfg` mentions.
+        {LIB: '#![cfg(all(target_os = "linux", not(test)))]\nfn grace() -> Option<String> { test_hook_var(\"SPACE_EXAMPLE_LIMIT\") }'},
+        # A trait method wrapper counts in other crates.
+        {
+            "crates/libs/a/Cargo.toml": "",
+            "crates/libs/a/src/lib.rs": "pub trait HookExt { fn test_read(&self, var: &str) -> Option<String> { test_hook_var(var) } }",
+            "crates/libs/b/Cargo.toml": "",
+            "crates/libs/b/src/lib.rs": 'let n = x.test_read("SPACE_EXAMPLE_LIMIT");',
+        },
         # A single-letter constant.
         {LIB: 'const X: &str = "SPACE_EXAMPLE_LIMIT";\nlet n = test_hook_var(X);'},
         # A `//` inside a string doesn't hide the rest of the line.
@@ -142,7 +154,8 @@ WRAPPER = "fn test_raw(var: &str) -> Option<String> { test_hook_var(var) }\n"
         "string-parameter-wrapper", "generic-wrapper", "escaped-char-before-read",
         "generic-with-parens", "self-local-over-ambiguous-crate",
         "after-test-field", "after-test-variant", "after-test-expression", "cfg-not-test",
-        "cfg-any-test", "pub-wrapper-other-crate", "single-letter-constant",
+        "cfg-any-test", "pub-wrapper-other-crate", "after-test-comparison", "after-test-shift",
+        "inner-cfg-not-test-file", "trait-wrapper-other-crate", "single-letter-constant",
         "url-in-string", "byte-raw-string",
     ],
 )
@@ -231,6 +244,7 @@ READ = 'test_hook_var("SPACE_EXAMPLE_LIMIT")'
         P({LIB: f"#[cfg(test)]\nfn helper() {{ {READ}; }}"}, id="cfg-test-function"),
         P({LIB: f"#[cfg(test)]\nfn helper(buf: [u8; 4]) {{ {READ}; }}"}, id="cfg-test-function-array-param"),
         P({LIB: f"#[cfg(all(test, unix))]\nimpl S {{ fn r() {{ {READ}; }} }}"}, id="cfg-all-test-impl"),
+        P({LIB: f"#[cfg(test)]\nmacro_rules! probe {{ () => {{ {READ} }} }}"}, id="cfg-test-macro"),
         P({"crates/libs/example/src/fixtures.rs": f"#![cfg(test)]\nfn r() {{ {READ}; }}"},
           id="inner-cfg-test-file"),
         P({"crates/libs/example/src/tests.rs": f"let n = {READ};"}, id="tests-rs"),

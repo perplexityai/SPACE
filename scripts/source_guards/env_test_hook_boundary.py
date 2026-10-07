@@ -12,11 +12,12 @@ Unit tests rarely catch that regression. Crates that read hooks generally
 enable `test-hooks` for their own tests, so in a test build a hook reads the
 environment exactly like a real read. This guard checks the source instead,
 over Rust files under `crates/`, skipping `target/`, test and bench files, and
-items compiled only for tests (`#[cfg(test)]` or `#[cfg(all(test, ...))]` on an
-item, or `#![cfg(test)]` on a file).
+items compiled only for tests: an item under `#[cfg(test)]` or
+`#[cfg(all(test, ...))]`, or a file whose inner `#![cfg(...)]` requires `test`.
 
 A *reader* is `test_hook`, `test_hook_var`, an import alias of either in the
-same file, or a function named `test_*` (in the same crate, or `pub` anywhere)
+same file, or a function named `test_*` (in the same crate, or anywhere if it's
+`pub` or a trait method)
 that passes one of its own string parameters, as a whole argument, to a reader
 (`EnvConfig::test_raw`, for example). Two rules:
 
@@ -30,8 +31,11 @@ that passes one of its own string parameters, as a whole argument, to a reader
 
 Not covered, by design, because a textual check can't follow them reliably:
 names built at run time (`format!`, `concat!`), constants defined by other
-constants or in another crate, and names forwarded through locals, closures,
-macros or generic `AsRef<str>` parameters. The guard's job is the common
+constants or in another crate, names reached through fields or indexing, hooks
+passed as function values, and names forwarded through locals, closures,
+macros, type aliases, pattern parameters or generic `AsRef<str>` parameters.
+Test-only modules declared with `#[cfg(test)] mod x;` are scanned unless their
+file is named like a test file. The guard's job is the common
 regression, a documented setting switched to a test-hook reader; review covers
 the rest.
 
@@ -59,11 +63,12 @@ ALIAS = re.compile(r"\b(test_hook_var|test_hook)\s+as\s+([a-z_][a-z0-9_]*)")
 # `#[cfg(test)]`, `#[cfg(all(test, ...))]` and the like.
 # An outer `cfg` attribute; `test_only_cfg` decides whether it needs `test`.
 CFG_ATTRIBUTE = re.compile(r"#\[cfg\((.*?)\)\]", re.S)
-INNER_TEST_CFG = re.compile(r"\A\s*(?:#!\[[^\]]*\]\s*)*#!\[cfg\((?:test|all\([^\]]*\btest\b[^\]]*\))\)\]")
+INNER_CFG = re.compile(r"#!\[cfg\((.*?)\)\]", re.S)
+INNER_ATTRIBUTES = re.compile(r"\A(?:\s*#!\[.*?\]\s*)*", re.S)
 ATTRIBUTE = re.compile(r"\s*#\[[^\]]*\]")
 ITEM = re.compile(
     r"\s*(?:pub(?:\([^)]*\))?\s+)?(?:(?:async|const|unsafe|extern(?:\s+\"[^\"]*\")?)\s+)*"
-    r"(?:mod|fn|impl|struct|enum|union|const|static|use|type|trait|macro_rules!)\b"
+    r"(?:(?:mod|fn|impl|struct|enum|union|const|static|use|type|trait)\b|macro_rules!|thread_local!)"
 )
 NAME_ARG = re.compile(
     r'"(SPACE_[A-Z0-9_]+)"|(?<![A-Za-z0-9_"])((?:[A-Za-z_][A-Za-z0-9_]*::)*)([A-Z][A-Z0-9_]*)\b'
@@ -173,13 +178,18 @@ def test_only_cfg(predicate: str) -> bool:
 
 
 def item_end(text: str, start: int) -> int:
-    """The end of the item starting at `start`: its `;` or its `{...}` body."""
+    """The end of the item starting at `start`: its `;` or its `{...}` body.
+
+    Only `()` and `[]` nest, so the `;` in `[u8; 4]` doesn't end the item.
+    `<` isn't tracked: in an expression it's a comparison or a shift that never
+    closes, and generics never hold a top-level `;` or `{`.
+    """
     depth = 0
     for index in range(start, len(text)):
         char = text[index]
-        if char in "([<":
+        if char in "([":
             depth += 1
-        elif char in ")]>" and depth:
+        elif char in ")]" and depth:
             depth -= 1
         elif depth == 0 and char == ";":
             return index + 1
@@ -194,7 +204,8 @@ def without_test_items(text: str) -> str:
     Only an attribute on an item (`mod`, `fn`, `impl`, ...) counts. A test
     `cfg` on a field, variant or expression leaves the code around it alone.
     """
-    if INNER_TEST_CFG.match(text):
+    header = INNER_ATTRIBUTES.match(text).group(0)
+    if any(test_only_cfg(cfg.group(1)) for cfg in INNER_CFG.finditer(header)):
         return re.sub(r"[^\n]", " ", text)
     for cfg in reversed(list(CFG_ATTRIBUTE.finditer(text))):
         if not test_only_cfg(cfg.group(1)):
@@ -235,8 +246,12 @@ class Function:
         self.public = public
 
 
+TRAIT = re.compile(r"\btrait\s+[A-Za-z_]\w*[^;{]*\{")
+
+
 def functions(text: str) -> list[Function]:
     found = []
+    traits = [(t.end() - 1, matching(text, t.end() - 1, "{", "}")) for t in TRAIT.finditer(text)]
     for match in FN_DEF.finditer(text):
         index = match.end()
         if text[index:].lstrip().startswith("<"):
@@ -255,7 +270,12 @@ def functions(text: str) -> list[Function]:
             typed = PARAMETER.fullmatch(parameter)
             if typed and re.search(r"\b(?:str|String)\b", typed.group(2)):
                 parameters.add(typed.group(1))
-        public = bool(re.search(r"\bpub\s+(?:(?:async|const|unsafe)\s+)*$", text[max(0, match.start() - 24) : match.start()]))
+        prefix = text[max(0, match.start() - 40) : match.start()]
+        # A trait method is callable wherever the trait is, so it counts as
+        # public like a `pub fn`.
+        public = bool(
+            re.search(r'\bpub\s+(?:(?:async|const|unsafe|extern(?:\s+"[^"]*")?)\s+)*$', prefix)
+        ) or any(start < match.start() < end for start, end in traits)
         found.append(
             Function(match.group(1), parameters, brace, matching(text, brace, "{", "}"), public)
         )
