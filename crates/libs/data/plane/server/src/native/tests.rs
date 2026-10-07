@@ -122,6 +122,36 @@ async fn pending_open(dropped: Arc<AtomicBool>) {
 }
 
 #[tokio::test]
+async fn cdp_discovery_response_is_bounded() {
+    let proxy_base = CdpProxyBase {
+        http_base: "https://space.example.com/v1/sessions/proto_1/proxy".to_string(),
+        ws_base: "wss://space.example.com/v1/sessions/proto_1/proxy".to_string(),
+    };
+    let response =
+        |body: Vec<u8>| hyper::Response::new(http_body_util::Full::new(bytes::Bytes::from(body)));
+
+    let discovery = br#"[{"webSocketDebuggerUrl":"ws://127.0.0.1:9222/devtools/page/1"}]"#;
+    let rewritten = rewrite_cdp_discovery_response(response(discovery.to_vec()), &proxy_base)
+        .await
+        .unwrap();
+    let body = http_body_util::BodyExt::collect(rewritten.into_body())
+        .await
+        .unwrap()
+        .to_bytes();
+    let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        value[0]["webSocketDebuggerUrl"],
+        "wss://space.example.com/v1/sessions/proto_1/proxy/devtools/page/1"
+    );
+
+    let oversized = vec![b' '; CDP_DISCOVERY_BODY_LIMIT_BYTES + 1];
+    let error = rewrite_cdp_discovery_response(response(oversized), &proxy_base)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, ProxyError::Upstream(_)));
+}
+
+#[tokio::test]
 async fn client_close_during_open_drops_the_open() {
     let dropped = Arc::new(AtomicBool::new(false));
     let mut source = futures_util::stream::iter(vec![Ok(Message::Close(None))]);

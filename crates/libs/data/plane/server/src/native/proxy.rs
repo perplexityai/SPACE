@@ -73,12 +73,19 @@ pub(crate) fn is_cdp_discovery_path(path: &str) -> bool {
     path == "/json" || path.starts_with("/json/")
 }
 
-pub(crate) async fn rewrite_cdp_discovery_response(
-    response: hyper::Response<hyper::body::Incoming>,
+/// DevTools discovery documents are a few KiB; matches the ECW JSON body limit.
+pub(crate) const CDP_DISCOVERY_BODY_LIMIT_BYTES: usize = 1024 * 1024;
+
+pub(crate) async fn rewrite_cdp_discovery_response<B>(
+    response: hyper::Response<B>,
     proxy_base: &CdpProxyBase,
-) -> Result<Response, ProxyError> {
+) -> Result<Response, ProxyError>
+where
+    B: hyper::body::Body<Data = bytes::Bytes>,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
     let (mut parts, body) = response.into_parts();
-    let bytes = body
+    let bytes = http_body_util::Limited::new(body, CDP_DISCOVERY_BODY_LIMIT_BYTES)
         .collect()
         .await
         .map_err(|error| {
