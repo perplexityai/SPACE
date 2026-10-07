@@ -460,6 +460,86 @@ fn public_test_migrators() -> (&'static Migrator, &'static Migrator) {
 }
 
 #[tokio::test]
+async fn embedded_migrations_accept_registered_revisions_and_preserve_history() {
+    use sqlx::SqlSafeStr as _;
+    use sqlx::migrate::MigrationType;
+    use std::borrow::Cow;
+
+    let (service, common) = public_test_migrators();
+    for store in ["common", "test"] {
+        let baseline = &if store == "common" { common } else { service }.migrations[0];
+        let revisions: Vec<_> = ["original", "intermediate", "current", "unknown"]
+            .iter()
+            .map(|comment| {
+                Migration::new(
+                    baseline.version,
+                    Cow::Borrowed("baseline"),
+                    MigrationType::Simple,
+                    sqlx::AssertSqlSafe(format!("-- {comment}\n{}", baseline.sql.as_ref()))
+                        .into_sql_str(),
+                    false,
+                )
+            })
+            .collect();
+        let digests: Vec<_> = revisions[..3]
+            .iter()
+            .map(|migration| hex::encode(&migration.checksum))
+            .collect();
+        let checksums = AcceptedChecksums::from_toml(&format!(
+            "[[migrations]]\nstore = {store:?}\nversion = {}\naccepted_checksums = {digests:?}",
+            baseline.version,
+        ))
+        .unwrap();
+        let current = Migrator::with_migrations(vec![revisions[2].clone()]);
+        let migrators = EmbeddedMigrators {
+            service: if store == "test" { &current } else { service },
+            common: Some(if store == "common" { &current } else { common }),
+        };
+
+        for previous in [None, Some(0), Some(1), Some(2), Some(3)] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("database.sqlite");
+            let before = if let Some(previous) = previous {
+                let old = Migrator::with_migrations(vec![revisions[previous].clone()]);
+                migrate_embedded(
+                    "test",
+                    &path,
+                    EmbeddedMigrators {
+                        service: if store == "test" { &old } else { service },
+                        common: Some(if store == "common" { &old } else { common }),
+                    },
+                )
+                .await
+                .unwrap();
+                let conn = Connection::open(&path).unwrap();
+                conn.execute("INSERT INTO jobs (job_id) VALUES ('retained')", [])
+                    .unwrap();
+                Some(embedded_history(&conn))
+            } else {
+                None
+            };
+
+            for _ in 0..2 {
+                let result = migrate_once("test", &path, migrators, &checksums).await;
+
+                assert_eq!(result.is_ok(), previous != Some(3), "{store}: {result:?}");
+            }
+            let conn = Connection::open(&path).unwrap();
+            if let Some(before) = before {
+                assert_eq!(embedded_history(&conn), before);
+                assert_eq!(
+                    conn.query_row("SELECT job_id FROM jobs", [], |row| row.get::<_, String>(0))
+                        .unwrap(),
+                    "retained"
+                );
+            } else {
+                assert_eq!(embedded_history(&conn).len(), 2);
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn public_embedded_migrations_reject_both_histories_before_writes() {
     let (service, common) = public_test_migrators();
     let migrators = EmbeddedMigrators {

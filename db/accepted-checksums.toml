@@ -1,0 +1,12 @@
+# Reviewed, equivalent revisions of historical up migrations.
+# Entries are scoped by the db/ directory name and numeric migration version.
+# Generate a digest with: shasum -a 384 path/to/migration.up.sql
+# Copy only the 96-character hex digest. On Linux, sha384sum also works.
+# List the current SHA-384 checksum and every historical checksum still supported.
+# Add entries only for changes that preserve executable SQL, such as comments.
+# SQLx includes comments in migration checksums; upstream support is tracked at:
+# https://github.com/transact-rs/sqlx/issues/3909
+# This adapter accepts reviewed equivalents without rewriting stored history.
+# Retain accepted digests while their migration versions remain bundled.
+
+migrations = []

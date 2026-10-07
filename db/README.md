@@ -45,13 +45,36 @@ date -u +%Y%m%d%H%M%S
 ## Migration runners
 
 Each database's `up` command runs its embedded SQLx migrations. Applied files
-must retain their exact checksums; there are no checksum exceptions or automatic
-history repairs.
+must retain their exact checksums unless an equivalent revision is explicitly
+registered as described below. There are no automatic history repairs.
 
 SQLite consumers of the common jobs schema run the shared catalog first, using
 `_space_common_schema_migrations`, then the service catalog using
 `_sqlx_migrations`. Both existing histories are validated before either catalog
 can apply SQL. Existing history rows and migration versions are preserved.
+
+## Equivalent historical revisions
+
+A reviewed edit that preserves executable SQL (for example, removing a private
+name from a comment) can retain upgrade compatibility through
+`db/accepted-checksums.toml`. Each entry identifies a store by its directory name
+(`postgres`, `template-manager`, `common`, etc.), a numeric migration version,
+and the SHA-384 digests of **all** accepted up-migration revisions, including the
+currently bundled file. Compute a digest with `shasum -a 384 <migration.up.sql>`.
+Commit the registry entry together with the corresponding SQL edit.
+
+PostgreSQL and SQLite runners embed the registry. They accept a recorded digest
+only when both it and the bundled digest are listed for the same store/version.
+They do not rewrite migration history or rerun already applied SQL. New databases
+record the bundled digest. Unlisted digests remain errors; public SQLite baselines
+fail closed without recreating the database. The registry does not cover down
+migrations, whose checksums SQLx does not record.
+
+Keep accepted digests while their migration catalog is supported so deployments
+can upgrade directly from older releases.
+This is not a mechanism for changing schema or data behavior: those
+changes still require a new migration. Rollbacks to versions predating a registry
+entry can reject a database created with the revised SQL.
 
 ## Console password provisioning
 

@@ -1,3 +1,4 @@
+use super::migration_checksums::AcceptedChecksums;
 use pplx_space_common_core::sql;
 use std::collections::HashMap;
 use std::error::Error as StdError;
@@ -131,7 +132,8 @@ pub async fn migrate_embedded(
     db_path: &Path,
     migrators: EmbeddedMigrators<'_>,
 ) -> SqliteResult<()> {
-    migrate_once(db_name, db_path, migrators)
+    let checksums = AcceptedChecksums::embedded().context("invalid migration checksum manifest")?;
+    migrate_once(db_name, db_path, migrators, &checksums)
         .await
         .with_context(|| {
             format!(
@@ -151,9 +153,11 @@ pub fn common_migrator(migrator: &Migrator) -> Migrator {
 }
 
 fn validate_public_history(
+    store: &str,
     conn: &Connection,
     migrator: &Migrator,
     common: bool,
+    checksums: &AcceptedChecksums,
 ) -> SqliteResult<bool> {
     let table = if common {
         "_space_common_schema_migrations"
@@ -192,9 +196,9 @@ fn validate_public_history(
     for row in rows {
         let (version, success, checksum) = row.context("invalid public migration history")?;
         if !success
-            || bundled
-                .get(&version)
-                .is_none_or(|migration| migration.checksum.as_ref() != checksum.as_slice())
+            || bundled.get(&version).is_none_or(|migration| {
+                !checksums.accepts(store, version, &migration.checksum, &checksum)
+            })
         {
             return Err(SqliteError::message(format!(
                 "{table} has failed, modified, or unbundled migration {version}; see db/README.md"
@@ -205,11 +209,17 @@ fn validate_public_history(
     Ok(applied)
 }
 
-async fn validate_schema(db_path: &Path, migrators: EmbeddedMigrators<'_>) -> SqliteResult<()> {
+async fn validate_schema(
+    db_name: &str,
+    db_path: &Path,
+    migrators: EmbeddedMigrators<'_>,
+    checksums: &AcceptedChecksums,
+) -> SqliteResult<()> {
     let conn = Connection::open(db_path).context("failed to open SQLite database")?;
-    let service_applied = validate_public_history(&conn, migrators.service, false)?;
+    let service_applied =
+        validate_public_history(db_name, &conn, migrators.service, false, checksums)?;
     let common_applied = match migrators.common {
-        Some(common) => validate_public_history(&conn, common, true)?,
+        Some(common) => validate_public_history("common", &conn, common, true, checksums)?,
         None => false,
     };
     if service_applied && migrators.common.is_some() && !common_applied {
@@ -325,7 +335,16 @@ async fn migrate_once(
     db_name: &str,
     db_path: &Path,
     migrators: EmbeddedMigrators<'_>,
+    checksums: &AcceptedChecksums,
 ) -> SqliteResult<()> {
+    checksums
+        .validate(db_name, migrators.service)
+        .context("unlisted migration checksum")?;
+    if let Some(common) = migrators.common {
+        checksums
+            .validate("common", common)
+            .context("unlisted common migration checksum")?;
+    }
     let span = tracing::info_span!(
         "sqlite.migrate",
         db.system = "sqlite",
@@ -354,16 +373,19 @@ async fn migrate_once(
             })?;
 
         let result = async {
-            validate_schema(db_path, migrators).await?;
+            validate_schema(db_name, db_path, migrators, checksums).await?;
+            let mut conn = pool
+                .acquire()
+                .await
+                .context("failed to acquire SQLite migration connection")?;
             if let Some(common) = migrators.common {
-                common_migrator(common)
-                    .run(&pool)
+                checksums
+                    .run("common", &common_migrator(common), &mut *conn)
                     .await
                     .context("failed to apply common SQLite migrations")?;
             }
-            migrators
-                .service
-                .run(&pool)
+            checksums
+                .run(db_name, migrators.service, &mut *conn)
                 .await
                 .with_context(|| format!("failed to apply {db_name} SQLite migrations"))?;
             Ok(())
