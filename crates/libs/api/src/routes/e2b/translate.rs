@@ -24,6 +24,7 @@ pub(super) struct CreateSandboxTranslation {
 }
 
 pub(super) const ECW_FALCON_HEADER: &str = "x-space-falcon";
+const NETWORK_POLICY_METADATA_KEY: &str = "network.policy";
 const TLS_INTERCEPTION_METADATA_KEY: &str = "network.tls_interception";
 
 pub(super) fn falcon_us2_egress_requested(headers: &HeaderMap, federated: bool) -> bool {
@@ -45,10 +46,39 @@ pub(super) fn falcon_us2_egress_requested(headers: &HeaderMap, federated: bool) 
 }
 
 pub(super) fn translate_create_request(
-    req: CreateSandboxRequestE2b,
+    mut req: CreateSandboxRequestE2b,
 ) -> Result<CreateSandboxTranslation, E2bApiError> {
     let mut unsupported = Vec::new();
-    let parsed_network = parse_e2b_network_config(req.network.as_ref())?;
+    let network_policy = if let Some(raw) = req.metadata.remove(NETWORK_POLICY_METADATA_KEY) {
+        if req.network.is_some()
+            || req.allow_internet_access.is_some()
+            || req.metadata.contains_key(TLS_INTERCEPTION_METADATA_KEY)
+        {
+            return Err(E2bApiError::bad_request(
+                "network.policy cannot be combined with network, allow_internet_access, or network.tls_interception",
+            ));
+        }
+        // Full policies have native replacement semantics, including explicit DNS permissions.
+        Some(
+            serde_json::from_str::<NetworkPolicyV1>(&raw).map_err(|error| {
+                E2bApiError::bad_request(format!("invalid network.policy: {error}"))
+            })?,
+        )
+    } else {
+        let parsed_network = parse_e2b_network_config(req.network.as_ref())?;
+        let tls_interception = parse_e2b_tls_interception(&req.metadata)?;
+        let mut policy = resolve_e2b_network_policy(req.allow_internet_access, parsed_network)?;
+        match policy.as_mut() {
+            Some(policy) => policy.tls_interception = tls_interception,
+            None if tls_interception == TlsInterception::On => {
+                return Err(E2bApiError::bad_request(
+                    "network.tls_interception=on requires a concrete network policy",
+                ));
+            }
+            None => {}
+        }
+        policy
+    };
     if req.mcp.is_some() {
         unsupported.push("mcp");
     }
@@ -87,22 +117,11 @@ pub(super) fn translate_create_request(
         .parse::<TemplateReference>()
         .map_err(|error| E2bApiError::bad_request(format!("invalid template_id: {error}")))?;
     record_ecw_template_selector_request(&template);
-    let tls_interception = parse_e2b_tls_interception(&req.metadata)?;
     let metadata = e2b_metadata_to_native(req.metadata);
     let timeout_secs = req.timeout.unwrap_or(ECW_DEFAULT_CREATE_TIMEOUT_SECS);
     let auto_pause = req.auto_pause.unwrap_or(false);
     let auto_resume = parse_e2b_auto_resume(req.auto_resume.as_ref())?;
     let auto_lifecycle = e2b_auto_lifecycle_policy(timeout_secs, auto_pause, auto_resume);
-    let mut network_policy = resolve_e2b_network_policy(req.allow_internet_access, parsed_network)?;
-    match network_policy.as_mut() {
-        Some(policy) => policy.tls_interception = tls_interception,
-        None if tls_interception == TlsInterception::On => {
-            return Err(E2bApiError::bad_request(
-                "network.tls_interception=on requires a concrete network policy",
-            ));
-        }
-        None => {}
-    }
 
     Ok(CreateSandboxTranslation {
         native: CreateSandboxRequest {
