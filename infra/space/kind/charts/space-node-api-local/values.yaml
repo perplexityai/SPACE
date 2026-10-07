@@ -19,8 +19,9 @@ node: {}
 # traffic goes to each pod's host_ip:9800 instead.
 serviceName: space-worker-node-api
 
-# Builder role only: build-manager's loopback listener, reached through the
-# shared host network namespace (crates/libs/build/mgr/client/src/lib.rs).
+# Builder role only: build-manager's node-local Service
+# (space-build-manager-local), whose name is the one its TLS leaf carries
+# (crates/libs/build/mgr/client/src/lib.rs).
 buildManagerEndpoint: ""
 
 # On SIGTERM node-api stops accepting connections and gives in-flight

@@ -759,8 +759,8 @@ reflector use) and `app.kubernetes.io/part-of=space-node`.
 | template-manager | space-tmplmgr + SPACE_TEMPLATE_MANAGER_GROUPS | non-root, no capabilities, read-only rootfs, hostNetwork; `/space/cache` HostToContainer | btrfs work delegated to node-manager (`btrfs_via_nodemgr.rs`); host network because its template-release reads are scoped by source address (below) |
 | sandbox-manager | space-sbxmgr + SPACE_SANDBOX_MANAGER_GROUPS | non-root, no capabilities, read-only rootfs, hostPID, hostNetwork; `/space/cache` HostToContainer, `/space/etc` read-only | gateway callers are authorized by their host pid, and Firecracker pids go to the node's shim (`service/gateway_identity.rs`, `network_runtime.rs`); host network for its node-bound ClusterApi RPCs |
 | node-ctl | space-nodectl + SPACE_NODECTL_GROUPS | non-root, no capabilities, read-only rootfs, hostNetwork; its own ServiceAccount with Node RBAC, fenced by `node-fence.yaml` | the Kubernetes node-local controller; host network for its node-bound ClusterApi RPCs |
-| node-api | space-nodeapi + worker/builder groups | non-root, no capabilities, read-only rootfs, hostNetwork, port `grpc` 9800 | the API dials `host_ip:9800` and reads the `grpc` port; on builders it reaches build-manager on 127.0.0.1 |
-| build-manager | root | privileged, hostNetwork, hostPID; `/var/run/netns` HostToContainer, `/space/cache` without propagation, the node's containerd | loop and bind mounts for OCI assembly, `nsenter --net` into build VMs through netns handles node-manager mounts after it starts, `ctr` against the node's containerd (`crates/libs/build/mgr/src`); host PID to watch the build VM's host Firecracker pid exit (`vm.rs`); host network for its source-scoped template-release reads (below) and node-api's loopback endpoint |
+| node-api | space-nodeapi + worker/builder groups | non-root, no capabilities, read-only rootfs, hostNetwork, port `grpc` 9800 | the API dials `host_ip:9800` and reads the `grpc` port; on builders it reaches build-manager through the node-local `space-builder-build-manager` Service and sleeps 5 s in preStop (below) |
+| build-manager | root | privileged, hostPID, pod network behind the node-local `space-builder-build-manager` Service (`internalTrafficPolicy: Local`); `/var/run/netns` HostToContainer, `/space/cache` without propagation, the node's containerd | loop and bind mounts for OCI assembly, `nsenter --net` into build VMs through netns handles node-manager mounts after it starts, `ctr` against the node's containerd (`crates/libs/build/mgr/src`); host PID to watch the build VM's host Firecracker pid exit (`vm.rs`); no host network: SSH into build VMs runs inside `nsenter --net` |
 | space-node-debug (Kind only) | root | privileged; `/space/run`, `/space/cache` HostToContainer, `/space/bin`, `/space/vendor`, `/run/containerd` | the operator shell; see below |
 
 internal-api binds every node-bound ClusterApi RPC — `PublishNodeState`, the
@@ -772,12 +772,17 @@ refuses a call from any other source address
 The check reads neither the credential nor the transport: it applies alike to
 the static token and to TokenReview-authenticated projected tokens, and internal
 RPC TLS, being server-auth only, does not change it. So node-ctl and
-sandbox-manager run in the node's network namespace. template-manager and
-build-manager make no node-bound call, but under TokenReview authentication
-their template-release reads are scoped to the node whose registered address
-is the caller's source address (`template_read_scope`,
-`crates/libs/internal/api/server/src/adapter.rs`): from a pod IP an org's
-private releases would not resolve, so they run there too.
+sandbox-manager run in the node's network namespace. template-manager makes no
+node-bound call, but under TokenReview authentication its template-release reads
+are scoped to the node whose registered address is the caller's source address
+(`template_read_scope`, `crates/libs/internal/api/server/src/adapter.rs`), and
+nothing maps a pod IP to its node. From the pod network an org's private
+templates do not resolve: sandbox creates from them and private-base builds
+fail, which a pod-network trial confirmed, so template-manager runs on the host
+network too. build-manager's only source-scoped read checks for an existing
+upload, and an org-private base is resolved by template-manager, so it runs on
+the pod network; node-api reaches it through the node-local
+`space-builder-build-manager` Service, named as its TLS leaf.
 
 Services whose `/space/run` directory the node image does not bake (volume-manager,
 node-ctl, runtime-manager) create it in a `prepare-run-dir` init container with
@@ -947,9 +952,9 @@ its listener at `/etc/space-rpc-tls` with the key readable by the listener's own
 identity, and the authority's self-signed end-entity certificate
 (`space-credmgr-authority-tls`, trusted by its clients through
 `space-credmgr-authority-trust`). The leaves carry service names only, so
-callers that dial node-api by node IP set `SPACE_NODE_API_TLS_SERVER_NAME=space-node-api`
-and builder node-api dials build-manager's loopback listener with
-`SPACE_BUILD_MANAGER_TLS_SERVER_NAME=space-builder-build-manager`. The CA's key
+callers that dial node-api by node IP set `SPACE_NODE_API_TLS_SERVER_NAME=space-node-api`,
+while builder node-api dials build-manager by the leaf's own name, through the
+node-local `space-builder-build-manager` Service. The CA's key
 stays in the Kind-only `space-internal-rpc-ca-signing` Secret, which no workload
 mounts. The script restarts a listener whose identity it reissued, and every
 workload if the CA itself changed, because neither reloads them while running.

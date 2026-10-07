@@ -13,9 +13,14 @@ telemetry: {}
 node:
   role: builder
 
-# Loopback listener node-api dials (SPACE_BUILD_MANAGER_ENDPOINT); both pods
-# share the node's network namespace.
-listen: 127.0.0.1:9900
+# Listener on the pod's own address, which node-api dials through the
+# node-local Service (SPACE_BUILD_MANAGER_ENDPOINT); every call is TLS with a
+# bearer token (crates/libs/build/mgr/server/src/run.rs). The probes reach
+# it on loopback inside the pod.
+listen: 0.0.0.0:9900
+probeAddr: 127.0.0.1:9900
+# The node-local Service, named as build-manager's TLS leaf.
+serviceName: space-builder-build-manager
 # Kind sizing: one build at a time fits the 40 GiB local btrfs cache with the
 # 20 GiB default build disk.
 maxConcurrentBuilds: 1

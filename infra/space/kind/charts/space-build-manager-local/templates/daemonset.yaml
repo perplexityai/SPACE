@@ -22,10 +22,11 @@ spec:
   selector:
     matchLabels:
       {{- include "space-node-service.selectorLabels" $ctx | nindent 6 }}
-  # Delete first. build-manager has no service mutex: it recovers its jobs
-  # and starts its queue before binding a plain TCP listener without
-  # SO_REUSEPORT (crates/libs/build/mgr/server/src/run.rs), so a second
-  # instance on the node could claim a job and then fail to bind.
+  # Delete first. build-manager has no service mutex: it recovers the node's
+  # jobs from its SQLite database under /space/run and starts its queue
+  # before binding its listener (crates/libs/build/mgr/server/src/run.rs), so
+  # a second instance on the node, binding its own pod address, would run
+  # the same jobs beside the first.
   {{- include "space-node-service.updateStrategy" (dict "strategy" "deleteFirst") | nindent 2 }}
   template:
     metadata:
@@ -42,17 +43,15 @@ spec:
       serviceAccountName: {{ include "space-node-service.name" $ctx }}
       # The ClusterApi token is projected below; no Kubernetes API access.
       automountServiceAccountToken: false
-      # Host network: build-manager's ClusterApi template-release reads
-      # (FindTemplateReleaseByHash, crates/libs/build/mgr/src/publish.rs) are
-      # scoped to the node whose registered address is the caller's source
-      # address once ClusterApi authenticates by TokenReview
-      # (template_read_scope, crates/libs/internal/api/server/src/adapter.rs),
-      # so from a pod IP an org's private releases are invisible to it. It is
-      # also how node-api, the sole caller, reaches its loopback listener
-      # (SPACE_BUILD_MANAGER_ENDPOINT, crates/libs/build/mgr/server/src/run.rs).
-      # SSH into build VMs runs inside `nsenter --net` and needs neither.
-      hostNetwork: true
-      dnsPolicy: ClusterFirstWithHostNet
+      # Pod network: build-manager needs nothing from the node's network
+      # namespace. SSH into build VMs runs inside `nsenter --net` on the VM's
+      # namespace handle (crates/libs/build/mgr/src/ssh.rs); its other peers
+      # are Unix sockets, ClusterApi, the object store and registries. Its
+      # one ClusterApi read that internal-api scopes by source address
+      # (FindTemplateReleaseByHash, publish.rs) only checks for an existing
+      # upload, and an org-private base is resolved by template-manager, not
+      # by build-manager. node-api reaches it through the node-local Service
+      # below.
       # Host PID: after asking the guest to exit, build-manager waits for the
       # Firecracker pid sandbox-manager reports, a host-namespace pid, by
       # checking /proc/<pid> (is_process_alive, crates/libs/build/mgr/src/vm.rs;
@@ -119,18 +118,18 @@ spec:
               value: {{ .Values.blob.minAvailableBytes | quote }}
           startupProbe:
             exec:
-              command: ["/opt/space/bin/grpc_health_probe", "-addr={{ .Values.listen }}", "-tls", "-tls-ca-cert=/etc/space-rpc-ca/ca.crt", "-tls-server-name=space-builder-build-manager", "-service=build.manager.v1.BuildManager", "-connect-timeout=2s"]
+              command: ["/opt/space/bin/grpc_health_probe", "-addr={{ .Values.probeAddr }}", "-tls", "-tls-ca-cert=/etc/space-rpc-ca/ca.crt", "-tls-server-name=space-builder-build-manager", "-service=build.manager.v1.BuildManager", "-connect-timeout=2s"]
             periodSeconds: 5
             failureThreshold: 60
           # NOT_SERVING once the drain starts.
           readinessProbe:
             exec:
-              command: ["/opt/space/bin/grpc_health_probe", "-addr={{ .Values.listen }}", "-tls", "-tls-ca-cert=/etc/space-rpc-ca/ca.crt", "-tls-server-name=space-builder-build-manager", "-service=build.manager.v1.BuildManager", "-connect-timeout=2s"]
+              command: ["/opt/space/bin/grpc_health_probe", "-addr={{ .Values.probeAddr }}", "-tls", "-tls-ca-cert=/etc/space-rpc-ca/ca.crt", "-tls-server-name=space-builder-build-manager", "-service=build.manager.v1.BuildManager", "-connect-timeout=2s"]
             periodSeconds: 5
             failureThreshold: 6
           livenessProbe:
             exec:
-              command: ["/opt/space/bin/grpc_health_probe", "-addr={{ .Values.listen }}", "-tls", "-tls-ca-cert=/etc/space-rpc-ca/ca.crt", "-tls-server-name=space-builder-build-manager", "-connect-timeout=3s"]
+              command: ["/opt/space/bin/grpc_health_probe", "-addr={{ .Values.probeAddr }}", "-tls", "-tls-ca-cert=/etc/space-rpc-ca/ca.crt", "-tls-server-name=space-builder-build-manager", "-connect-timeout=3s"]
             periodSeconds: 20
             failureThreshold: 3
           volumeMounts:
@@ -191,3 +190,24 @@ spec:
           secret:
             secretName: {{ .Values.sandboxSsh.secretName }}
             defaultMode: 0400
+---
+# node-api reaches its own node's build-manager by the name its TLS leaf
+# carries (space-builder-build-manager, internal-rpc-tls.sh). Local: jobs live
+# in the node's SQLite under /space/run, and node-api stamps its own node as
+# the builder, so a call must never reach another node's build-manager
+# (crates/libs/node/api/server/src/builder.rs).
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Values.serviceName }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "space-node-service.labels" $ctx | nindent 4 }}
+spec:
+  internalTrafficPolicy: Local
+  selector:
+    {{- include "space-node-service.selectorLabels" $ctx | nindent 4 }}
+  ports:
+    - name: grpc
+      port: 9900
+      targetPort: 9900

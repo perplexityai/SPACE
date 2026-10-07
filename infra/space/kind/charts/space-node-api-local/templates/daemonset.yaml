@@ -34,10 +34,9 @@ spec:
       serviceAccountName: {{ include "space-node-service.name" $ctx }}
       # The ClusterApi token is projected below; no Kubernetes API access.
       automountServiceAccountToken: false
-      # Host network: the API dials each node's node-api at host_ip:9800, and
-      # on builders node-api reaches build-manager's 127.0.0.1:9900 listener
-      # in the same network namespace. ClusterFirstWithHostNet keeps
-      # in-cluster DNS for ClusterApi.
+      # Host network: the API dials each node's node-api at host_ip:9800.
+      # ClusterFirstWithHostNet keeps in-cluster DNS for ClusterApi and, on
+      # builders, build-manager's node-local Service.
       hostNetwork: true
       dnsPolicy: ClusterFirstWithHostNet
       terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds | int }}
@@ -81,10 +80,6 @@ spec:
             {{- else }}
             - name: SPACE_BUILD_MANAGER_ENDPOINT
               value: {{ .Values.buildManagerEndpoint | quote }}
-            # The endpoint is loopback; build-manager's leaf names the
-            # service (docs/internal-rpc-tls.md).
-            - name: SPACE_BUILD_MANAGER_TLS_SERVER_NAME
-              value: space-builder-build-manager
             {{- end }}
           {{- if eq $role "builder" }}
           # Leave the builder Service's endpoints before draining (values.yaml).
