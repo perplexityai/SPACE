@@ -43,7 +43,8 @@ a same-named constant there (a function-local one, or a test fixture in the
 same file) hides one imported from elsewhere. Aliases defined in another file,
 and aliases of `test_*` wrappers, aren't followed. Rule 2 flags any string
 parameter forwarded to a reader, including one a multi-argument wrapper uses as
-a value rather than a name. A test module declared with `#[cfg(test)] mod x;` is
+a value rather than a name, and one a closure parameter of the same name
+shadows. A test module declared with `#[cfg(test)] mod x;` is
 scanned unless its file is named like a test file. The guard's job is the common
 regression, a documented setting switched to a test-hook reader; review covers
 the rest.
@@ -294,24 +295,15 @@ def top_level_arguments(arguments: str) -> list[str]:
     return [part.strip() for part in parts]
 
 
-def forwarded(
-    arguments: str, function: Function | None, before: str = ""
-) -> set[str]:
-    """The enclosing function's own string parameters passed as a whole argument.
-
-    `before` is the function's body up to the call; a closure parameter there
-    (`|var| ...`) that rebinds the name isn't the function's parameter.
-    """
+def forwarded(arguments: str, function: Function | None) -> set[str]:
+    """The enclosing function's own string parameters passed as a whole argument."""
     if function is None:
         return set()
     names = set()
     for argument in top_level_arguments(arguments):
         whole = WHOLE_ARGUMENT.fullmatch(argument)
-        if not whole or whole.group(1) not in function.parameters:
-            continue
-        if re.search(r"\|[^|]*\b" + re.escape(whole.group(1)) + r"\b[^|]*\|", before):
-            continue
-        names.add(whole.group(1))
+        if whole and whole.group(1) in function.parameters:
+            names.add(whole.group(1))
     return names
 
 
@@ -339,7 +331,7 @@ def find_readers(files) -> dict[pathlib.Path, set[str]]:
                 if not (
                     owner
                     and owner.name.startswith("test_")
-                    and forwarded(arguments, owner, text[owner.start : call.start()])
+                    and forwarded(arguments, owner)
                 ):
                     continue
                 # Checked separately, so a private wrapper found first doesn't
@@ -416,7 +408,7 @@ def violations(root: pathlib.Path) -> list[str]:
                 )
             owner = innermost(defined, call.start())
             if owner and not owner.name.startswith("test_"):
-                for parameter in sorted(forwarded(arguments, owner, text[owner.start : call.start()])):
+                for parameter in sorted(forwarded(arguments, owner)):
                     failures.append(
                         f"{line}: `{owner.name}` passes its parameter `{parameter}` to "
                         f"test hook `{reader}`; name it `test_*` so its callers are "

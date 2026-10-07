@@ -187,6 +187,15 @@ WRAPPER = "fn test_raw(var: &str) -> Option<String> { test_hook_var(var) }\n"
          "    fn knobs() -> impl Iterator<Item = String> {\n"
          '        const ENV: &str = "SPACE_EXAMPLE_TICK_SECS";\n'
          "        test_hook_var(Self::ENV).into_iter()\n    }\n}"},
+        # Pipes elsewhere in a wrapper don't hide its forwarding.
+        {LIB: "pub fn test_raw(var: &str) -> Option<String> {\n"
+         "    if var.is_empty() || var.len() > 64 || var.contains(' ') { return None; }\n"
+         "    test_hook_var(var)\n}\n"
+         'let n = test_raw("SPACE_EXAMPLE_LIMIT");'},
+        {LIB: "pub fn test_raw(var: &str) -> Option<String> {\n"
+         "    let known = KNOBS.iter().filter(|k| **k == var).map(|k| k.len()).count();\n"
+         "    test_hook_var(var)\n}\n"
+         'let n = test_raw("SPACE_EXAMPLE_LIMIT");'},
         # A single-letter constant.
         {LIB: 'const X: &str = "SPACE_EXAMPLE_LIMIT";\nlet n = test_hook_var(X);'},
         # A `//` inside a string doesn't hide the rest of the line.
@@ -206,7 +215,8 @@ WRAPPER = "fn test_raw(var: &str) -> Option<String> { test_hook_var(var) }\n"
         "after-test-union-field", "after-test-fn-tuple-field", "trait-impl-wrapper-other-crate",
         "array-return-wrapper", "test-module-in-production-file", "test-function-in-production-file",
         "inner-cfg-test-file", "ambiguous-crate-constant", "shadowed-by-test-constant",
-        "generics-with-arrow", "pub-wrapper-after-private-namesake", "return-impl-trait", "single-letter-constant",
+        "generics-with-arrow", "pub-wrapper-after-private-namesake", "return-impl-trait",
+        "or-chain-in-wrapper", "ended-closure-in-wrapper", "single-letter-constant",
         "url-in-string", "byte-raw-string",
     ],
 )
@@ -281,9 +291,6 @@ READ = 'test_hook_var("SPACE_EXAMPLE_LIMIT")'
           id="parameter-inside-format"),
         P({LIB: "impl C { fn f(&self, name: &str) -> Option<String> { test_hook_var(self.name) } }"},
           id="field-not-parameter"),
-        P({LIB: "pub fn overrides(var: &str) -> Vec<String> {\n"
-               "    KNOBS.iter().filter_map(|var| test_hook_var(var)).collect()\n}"},
-          id="closure-parameter-shadows"),
         P({LIB: "fn tick(service: &str, env: &dyn Environment) -> Option<String> {\n"
                '    test_hook(&service.env_for(env), "SPACE_EXAMPLE_TICK_SECS")\n}'},
           id="parameter-starts-argument"),
