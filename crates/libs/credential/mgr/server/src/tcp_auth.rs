@@ -31,8 +31,11 @@ use subtle::ConstantTimeEq;
 use tonic::Status;
 use tower::{Layer, Service};
 
-use crate::auth::K8sIdentity;
-use crate::k8s_identity::CredmgrTokenReviewer;
+use crate::auth::agent::AgentAuth;
+use crate::auth::{ClientService, K8sIdentity};
+use crate::credential_store::CredentialStore;
+use crate::k8s_identity::{CredmgrTokenReviewer, K8sAuthConfig, K8sAuthConfigError};
+use tokio_util::sync::CancellationToken;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
@@ -50,16 +53,24 @@ pub enum TcpCallerIdentity {
 
 /// Authenticates TCP callers and resolves their identity. Cloned per request.
 enum Authenticator {
-    ProjectedToken(CredmgrTokenReviewer),
+    ProjectedToken {
+        reviewer: CredmgrTokenReviewer,
+        agent: Box<AgentAuth>,
+    },
     StaticToken(String),
 }
 
 impl Authenticator {
-    async fn authenticate(&self, auth_header: Option<&str>) -> Result<TcpCallerIdentity, Status> {
+    async fn authenticate(
+        &self,
+        auth_header: Option<&str>,
+        extensions: &mut http::Extensions,
+        rpc: &str,
+    ) -> Result<TcpCallerIdentity, Status> {
         let token = bearer_token(auth_header)?;
 
         match self {
-            Self::ProjectedToken(reviewer) => {
+            Self::ProjectedToken { reviewer, agent } => {
                 // A TokenReview-configured listener has no static credential to
                 // compare against. Non-JWT bearers fail before reaching the
                 // apiserver; JWT-shaped values are reviewed normally.
@@ -72,10 +83,21 @@ impl Authenticator {
                     );
                     return Err(Status::unauthenticated("invalid token"));
                 }
-                reviewer
-                    .authenticate(token)
-                    .await
-                    .map(TcpCallerIdentity::K8sJwt)
+                let caller = reviewer.authenticate(token).await?;
+                if caller.service() == ClientService::NodeCredentialAgent {
+                    // TokenReview caches token authenticity only. Recheck the
+                    // pod, registered node and transport peer on every request.
+                    if let Some(verified) =
+                        agent.authorize(&caller, peer_ip(extensions), rpc).await?
+                    {
+                        if let Some(audit) = extensions.get::<crate::issuance_audit::RequestAudit>()
+                        {
+                            audit.set_identity(verified.clone());
+                        }
+                        extensions.insert(verified);
+                    }
+                }
+                Ok(TcpCallerIdentity::K8sJwt(caller))
             }
             Self::StaticToken(expected) => {
                 if constant_time_eq(token, expected) {
@@ -102,16 +124,31 @@ pub struct CredmgrTcpAuthLayer {
 }
 
 impl CredmgrTcpAuthLayer {
-    /// Build a Kubernetes listener that accepts projected ServiceAccount
-    /// tokens validated by `reviewer`. No static credential is retained.
-    pub fn projected_token(reviewer: CredmgrTokenReviewer) -> Self {
+    /// Build the projected-token authentication path, sharing one Kubernetes
+    /// client between TokenReview and the agent pod reflector.
+    pub async fn projected_token(
+        config: K8sAuthConfig,
+        credential_store: Option<Arc<dyn CredentialStore>>,
+        shutdown: CancellationToken,
+    ) -> Result<Self, K8sAuthConfigError> {
+        let client = pplx_space_common_svc::kube_client::traced_kube_client_from_env().await?;
+        let agent = AgentAuth::new(
+            client.clone(),
+            config.namespace(),
+            credential_store,
+            shutdown,
+        );
+        let reviewer = CredmgrTokenReviewer::new(config, client);
         tracing::info!(
             mode = "k8s_token_review",
             "credmgr TCP auth initialized; static token is not accepted"
         );
-        Self {
-            authenticator: Arc::new(Authenticator::ProjectedToken(reviewer)),
-        }
+        Ok(Self {
+            authenticator: Arc::new(Authenticator::ProjectedToken {
+                reviewer,
+                agent: Box::new(agent),
+            }),
+        })
     }
 
     /// Build a non-Kubernetes listener whose sole credential is the static
@@ -172,20 +209,46 @@ where
 
         Box::pin(async move {
             if !is_auth_exempt(&path) {
-                let identity = match auth_header {
-                    Some(Ok(header)) => authenticator.authenticate(Some(&header)).await?,
-                    None => authenticator.authenticate(None).await?,
-                    Some(Err(_)) => {
-                        pplx_space_metrics::auth::decision(
-                            "static",
-                            "credmgr-tcp",
-                            "deny",
-                            "invalid_auth_header",
+                let authenticated: Result<(), Status> = async {
+                    let identity = match auth_header {
+                        Some(Ok(header)) => {
+                            authenticator
+                                .authenticate(Some(&header), req.extensions_mut(), rpc_name(&path))
+                                .await?
+                        }
+                        None => {
+                            authenticator
+                                .authenticate(None, req.extensions_mut(), rpc_name(&path))
+                                .await?
+                        }
+                        Some(Err(_)) => {
+                            pplx_space_metrics::auth::decision(
+                                "static",
+                                "credmgr-tcp",
+                                "deny",
+                                "invalid_auth_header",
+                            );
+                            return Err(Status::unauthenticated("invalid authorization header"));
+                        }
+                    };
+                    req.extensions_mut().insert(identity);
+                    Ok(())
+                }
+                .await;
+                if let Err(error) = authenticated {
+                    if path == crate::intermediate_ca::ISSUE_INTERMEDIATE_METHOD_PATH {
+                        crate::issuance_audit::record(
+                            req.extensions()
+                                .get::<crate::issuance_audit::RequestAudit>(),
+                            None,
+                            None,
+                            None,
+                            "denied",
+                            error.message(),
                         );
-                        return Err(Status::unauthenticated("invalid authorization header").into());
                     }
-                };
-                req.extensions_mut().insert(identity);
+                    return Err(error.into());
+                }
             }
             // A `Status` error is recovered by tonic's server into a clean
             // gRPC trailers response (via `Status::from_error`), so an auth
@@ -194,6 +257,35 @@ where
             let response = inner.call(req).await.map_err(Into::into)?;
             Ok(response.map(tonic::body::Body::new))
         })
+    }
+}
+
+fn peer_ip(extensions: &http::Extensions) -> Option<std::net::IpAddr> {
+    use tonic::transport::server::{TcpConnectInfo, TlsConnectInfo};
+    extensions
+        .get::<TcpConnectInfo>()
+        .and_then(|info| info.remote_addr)
+        .or_else(|| {
+            extensions
+                .get::<TlsConnectInfo<TcpConnectInfo>>()
+                .and_then(|info| info.get_ref().remote_addr)
+        })
+        .map(|addr| addr.ip())
+}
+
+fn rpc_name(path: &str) -> &str {
+    match path.strip_prefix("/space.credential.manager.v1.CredentialManager/") {
+        Some(
+            method @ ("IssueIntermediateCertificate"
+            | "ExchangeToken"
+            | "Encrypt"
+            | "Decrypt"
+            | "GetOrIssueSandboxVolumeDek"
+            | "ResolveNetworkCredentials"
+            | "IssueDek"
+            | "UnwrapDek"),
+        ) => method,
+        _ => "unknown",
     }
 }
 

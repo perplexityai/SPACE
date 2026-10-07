@@ -243,18 +243,17 @@ pub struct CredmgrTokenReviewer {
 }
 
 impl CredmgrTokenReviewer {
-    pub async fn new(config: K8sAuthConfig) -> Result<Self, K8sAuthConfigError> {
-        let client = pplx_space_common_svc::kube_client::traced_kube_client_from_env().await?;
+    pub(crate) fn new(config: K8sAuthConfig, client: kube::Client) -> Self {
         let review_limiter = Arc::new(tokio::sync::Semaphore::new(config.max_inflight_reviews));
         let rate_limiter = Arc::new(ReviewRateLimiter::new(config.review_rate_per_sec));
-        Ok(Self {
+        Self {
             reviews: kube::Api::all(client),
             config: Arc::new(config),
             cache: Arc::new(Mutex::new(HashMap::new())),
             in_flight: Arc::new(Mutex::new(HashMap::new())),
             review_limiter,
             rate_limiter,
-        })
+        }
     }
 
     /// Authenticate a bearer token and resolve the Kubernetes caller. On
@@ -847,4 +846,4 @@ fn auth_namespace_from(env_value: Option<String>, namespace_path: &Path) -> Opti
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

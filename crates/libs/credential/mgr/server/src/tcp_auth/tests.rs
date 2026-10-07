@@ -1,5 +1,64 @@
 use super::*;
 
+#[tokio::test]
+async fn cached_token_is_reauthorized_for_each_transport_peer() {
+    use crate::auth::VerifiedAgentIdentity;
+    use std::sync::atomic::Ordering;
+    use tonic::transport::server::TcpConnectInfo;
+    use tower::ServiceExt;
+    let (reviewer, reviews) = crate::k8s_identity::tests::agent_reviewer();
+    let layer = CredmgrTcpAuthLayer {
+        authenticator: Arc::new(Authenticator::ProjectedToken {
+            reviewer,
+            agent: Box::new(crate::auth::agent::tests::authorizer()),
+        }),
+    };
+    let inner = tower::service_fn(|req: http::Request<()>| async move {
+        assert_eq!(
+            req.extensions()
+                .get::<VerifiedAgentIdentity>()
+                .unwrap()
+                .peer_ip,
+            "10.0.0.2".parse::<std::net::IpAddr>().unwrap()
+        );
+        Ok::<_, std::convert::Infallible>(http::Response::new(
+            http_body_util::Empty::<bytes::Bytes>::new(),
+        ))
+    });
+    let service = layer.layer(inner);
+    // The same token, two source ports on its real pod, then a stolen-token
+    // caller at another IP. A forwarding header cannot impersonate the peer.
+    for (peer, accepted) in [
+        ("10.0.0.2:1234", true),
+        ("[::ffff:10.0.0.2]:4567", true),
+        ("10.0.0.99:1234", false),
+    ] {
+        let mut request = http::Request::builder()
+            .uri(crate::intermediate_ca::ISSUE_INTERMEDIATE_METHOD_PATH)
+            .header("authorization", "Bearer header.payload.signature")
+            .header("x-forwarded-for", "10.0.0.2")
+            .body(())
+            .unwrap();
+        request.extensions_mut().insert(TcpConnectInfo {
+            local_addr: None,
+            remote_addr: Some(peer.parse().unwrap()),
+        });
+        let result = service.clone().oneshot(request).await;
+        if accepted {
+            assert!(result.is_ok());
+        } else {
+            let status = Status::from_error(result.unwrap_err());
+            assert_eq!(status.code(), tonic::Code::PermissionDenied);
+            assert_eq!(status.message(), "peer_ip_mismatch");
+        }
+    }
+    assert_eq!(
+        reviews.load(Ordering::SeqCst),
+        1,
+        "all requests share one cached TokenReview"
+    );
+}
+
 #[test]
 fn jwt_shape_requires_three_nonempty_parts() {
     assert!(is_jwt_shaped("aaa.bbb.ccc"));
@@ -31,11 +90,22 @@ fn health_and_reflection_are_exempt() {
 async fn static_token_resolves_to_internal_principal_in_static_only_mode() {
     let authn = Authenticator::StaticToken("the-secret".to_owned());
     assert_eq!(
-        authn.authenticate(Some("Bearer the-secret")).await.unwrap(),
+        authn
+            .authenticate(
+                Some("Bearer the-secret"),
+                &mut http::Extensions::new(),
+                "unknown"
+            )
+            .await
+            .unwrap(),
         TcpCallerIdentity::Plaintext
     );
     let err = authn
-        .authenticate(Some("Bearer not-the-secret"))
+        .authenticate(
+            Some("Bearer not-the-secret"),
+            &mut http::Extensions::new(),
+            "unknown",
+        )
         .await
         .unwrap_err();
     assert_eq!(err.code(), tonic::Code::Unauthenticated);
@@ -45,12 +115,16 @@ async fn static_token_resolves_to_internal_principal_in_static_only_mode() {
 async fn missing_and_malformed_headers_are_unauthenticated() {
     let authn = Authenticator::StaticToken("the-secret".to_owned());
     assert_eq!(
-        authn.authenticate(None).await.unwrap_err().code(),
+        authn
+            .authenticate(None, &mut http::Extensions::new(), "unknown")
+            .await
+            .unwrap_err()
+            .code(),
         tonic::Code::Unauthenticated
     );
     assert_eq!(
         authn
-            .authenticate(Some("Basic abc"))
+            .authenticate(Some("Basic abc"), &mut http::Extensions::new(), "unknown")
             .await
             .unwrap_err()
             .code(),

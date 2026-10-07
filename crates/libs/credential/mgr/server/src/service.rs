@@ -233,9 +233,9 @@ pub struct CredentialManagerService {
     /// instances with database access (the control-plane deployment);
     /// node-local instances refuse those RPCs with FAILED_PRECONDITION.
     kek_store: Option<Arc<dyn KekStore>>,
-    /// Sandbox-owner reads for volume encryption.
+    /// Sandbox-owner and registered-node reads for credential authorization.
     /// Present only on instances with database access.
-    credential_store: Option<Arc<dyn CredentialStore>>,
+    pub(crate) credential_store: Option<Arc<dyn CredentialStore>>,
     /// Tenant, placement, template-owner, and per-org role reads for scoped
     /// storage credential exchange. Present only on the authority.
     storage_vend_store: Option<Arc<dyn StorageVendStore>>,
@@ -900,25 +900,50 @@ impl CredentialManager for CredentialManagerService {
 
     /// Certify a node's intermediate CA public key under the SPACE root.
     ///
-    /// Authorizes callers to hold a node CA key, at ServiceAccount granularity:
-    /// every node's credential manager presents the
-    /// same ServiceAccount, so this authorizes *a* node and not *which one*. A
-    /// stolen agent token mints intermediates fleet-wide until that narrows.
+    /// The TCP layer verifies the agent pod, node registration, and connection
+    /// peer before this handler's service-level authorization runs.
     async fn issue_intermediate_certificate(
         &self,
         request: Request<IssueIntermediateCertificateRequest>,
     ) -> Result<Response<IssueIntermediateCertificateResponse>, Status> {
-        self.authorize_caller(
+        let audit = request
+            .extensions()
+            .get::<crate::issuance_audit::RequestAudit>()
+            .cloned();
+        let identity = request
+            .extensions()
+            .get::<crate::auth::VerifiedAgentIdentity>()
+            .cloned();
+        if let Err(error) = self.authorize_caller(
             &request,
             "IssueIntermediateCertificate",
             ALLOW_ISSUE_INTERMEDIATE,
             ALLOW_ISSUE_INTERMEDIATE_SERVICES,
-        )?;
+        ) {
+            crate::issuance_audit::record(
+                audit.as_ref(),
+                identity.as_ref(),
+                Some(&request.get_ref().csr),
+                None,
+                "denied",
+                "caller_not_allowed",
+            );
+            return Err(error);
+        }
 
         // The gRPC layer already logs and traces the call; this adds the
         // failure class and the latency of an issuance that polls for seconds.
         let started = Instant::now();
-        let issued = self.issue_intermediate(request.into_inner()).await;
+        let request = request.into_inner();
+        let issued = self.issue_intermediate(request.clone()).await;
+        crate::issuance_audit::record(
+            audit.as_ref(),
+            identity.as_ref(),
+            Some(&request.csr),
+            issued.as_ref().ok().map(Vec::as_slice),
+            if issued.is_ok() { "issued" } else { "error" },
+            intermediate_result_tag(&issued),
+        );
         pplx_space_metrics::credmgr::intermediate_ca_issue(
             intermediate_result_tag(&issued),
             started.elapsed().as_secs_f64() * 1000.0,

@@ -140,6 +140,21 @@ fn reviewer_returning_error(config: K8sAuthConfig) -> (CredmgrTokenReviewer, Arc
     (test_reviewer(config, client), calls)
 }
 
+pub(crate) fn agent_reviewer() -> (CredmgrTokenReviewer, Arc<AtomicUsize>) {
+    let mut config = test_config();
+    config.allowed = build_allowed_map("space", ["space-credential-manager".to_owned()]).unwrap();
+    let mut reviewed = bound_status(
+        &config.audience,
+        "system:serviceaccount:space:space-credential-manager",
+        "worker",
+        "node-uid",
+    );
+    let extra = reviewed.user.as_mut().unwrap().extra.as_mut().unwrap();
+    extra.insert(POD_NAME_EXTRA.to_owned(), vec!["agent".into()]);
+    extra.insert(POD_UID_EXTRA.to_owned(), vec!["pod-uid".into()]);
+    reviewer_returning_status(config, reviewed)
+}
+
 async fn assert_status_rejected(status: TokenReviewStatus) {
     let (reviewer, _) = reviewer_returning_status(test_config(), status);
     let error = reviewer.authenticate(&projected_token()).await.unwrap_err();

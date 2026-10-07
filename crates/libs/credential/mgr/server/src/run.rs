@@ -279,7 +279,7 @@ pub enum ServeError {
     InternalToken(#[source] tonic::Status),
     #[error("invalid credmgr projected-token (k8sAuth) configuration: {0}")]
     K8sAuthConfig(#[source] crate::k8s_identity::K8sAuthConfigError),
-    #[error("failed to initialize the TokenReview client: {0}")]
+    #[error("failed to initialize the Kubernetes authentication client: {0}")]
     TokenReviewClient(#[source] crate::k8s_identity::K8sAuthConfigError),
     #[error("failed to read TLS PEM at {path}: {source}")]
     ReadTlsPem {
@@ -1020,6 +1020,9 @@ where
 {
     let (_, health_service) = pplx_space_common_svc::grpc_health_service();
     pplx_space_common_svc::grpc_server_builder()
+        .layer(tower::util::MapRequestLayer::new(
+            crate::issuance_audit::track_request,
+        ))
         .layer(pplx_space_common_svc::grpc_trace_layer())
         .layer(
             pplx_space_common_svc::conservative_uds_grpc_rate_limiter_layer(
@@ -1276,10 +1279,12 @@ async fn serve_tcp_until(
                  the static internal token is not accepted"
             );
             crate::tcp_auth::CredmgrTcpAuthLayer::projected_token(
-                crate::k8s_identity::CredmgrTokenReviewer::new(config)
-                    .await
-                    .map_err(ServeError::TokenReviewClient)?,
+                config,
+                service.credential_store.clone(),
+                shutdown_token.clone(),
             )
+            .await
+            .map_err(ServeError::TokenReviewClient)?
         }
         None => {
             tracing::info!(
@@ -1318,6 +1323,9 @@ async fn serve_tcp_until(
     // layer so Kubernetes gRPC probes work without a credential.
     let (_, health_service) = pplx_space_common_svc::grpc_health_service();
     builder
+        .layer(tower::util::MapRequestLayer::new(
+            crate::issuance_audit::track_request,
+        ))
         .layer(pplx_space_common_svc::grpc_rate_limiter_layer(
             pplx_space_common_svc::GrpcRateLimiterConfig::enforce("space-credential-manager-tcp")
                 .with_default_limits(

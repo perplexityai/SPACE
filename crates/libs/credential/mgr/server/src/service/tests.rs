@@ -417,6 +417,17 @@ impl KeyWrapper for InvalidKeyOnUnwrapWrapper {
 
 #[tonic::async_trait]
 impl CredentialStore for TestCredentialStore {
+    async fn registered_node(
+        &self,
+        _: &pplx_space_common_core::types::K8sNodeName,
+        _: &pplx_space_common_core::types::K8sNodeUid,
+    ) -> Result<
+        Option<pplx_space_common_core::types::NodeId>,
+        crate::credential_store::CredentialStoreError,
+    > {
+        Ok(None)
+    }
+
     async fn sandbox_owner(
         &self,
         _sandbox_id: SandboxId,

@@ -26,6 +26,9 @@
 //!   - on non-Kubernetes plaintext profiles only, the shared static internal
 //!     token resolves to the coarse internal principal.
 
+pub(crate) mod agent;
+pub(crate) use agent::VerifiedAgentIdentity;
+
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
