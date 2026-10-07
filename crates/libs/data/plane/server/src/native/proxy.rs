@@ -69,8 +69,13 @@ pub(crate) fn forwarded_header_value(headers: &HeaderMap, name: &'static str) ->
         .map(ToOwned::to_owned)
 }
 
+/// DevTools endpoints whose responses carry debugger URLs to rewrite. Others,
+/// such as the full `/json/protocol` schema, stream unchanged.
 pub(crate) fn is_cdp_discovery_path(path: &str) -> bool {
-    path == "/json" || path.starts_with("/json/")
+    matches!(
+        path.trim_end_matches('/'),
+        "/json" | "/json/list" | "/json/version" | "/json/new"
+    )
 }
 
 /// DevTools discovery documents are a few KiB; matches the ECW JSON body limit.

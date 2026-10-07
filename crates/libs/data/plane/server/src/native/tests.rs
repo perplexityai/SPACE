@@ -151,6 +151,28 @@ async fn cdp_discovery_response_is_bounded() {
     assert!(matches!(error, ProxyError::Upstream(_)));
 }
 
+#[test]
+fn cdp_rewrite_applies_only_to_endpoints_with_debugger_urls() {
+    for path in [
+        "/json",
+        "/json/",
+        "/json/list",
+        "/json/version",
+        "/json/new",
+    ] {
+        assert!(is_cdp_discovery_path(path), "{path}");
+    }
+    for path in [
+        "/json/protocol",
+        "/json/activate/page-1",
+        "/json/close/page-1",
+        "/jsonx",
+        "/devtools/page/1",
+    ] {
+        assert!(!is_cdp_discovery_path(path), "{path}");
+    }
+}
+
 #[tokio::test]
 async fn client_close_during_open_drops_the_open() {
     let dropped = Arc::new(AtomicBool::new(false));
