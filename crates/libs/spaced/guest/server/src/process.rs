@@ -24,18 +24,60 @@ const DEFAULT_PTY_COLS: u32 = 80;
 // Charge payloads and event storage, including each repeated process ID: tiny
 // writes must not turn a bounded output window into millions of allocations.
 // The primary attached reader applies backpressure; detached replay stays bounded.
-const PROCESS_OUTPUT_RETENTION_TOTAL_BYTES: usize = 64 * 1024 * 1024;
+// The total is sized from the guest's memory (see `ProcessOutputBudget`): a
+// fixed budget would be 3% of a 2 GiB guest but an eighth of a 512 MiB one.
+const PROCESS_OUTPUT_RETENTION_MAX_BYTES: usize = 64 * 1024 * 1024;
+const PROCESS_OUTPUT_RETENTION_MIN_BYTES: usize = 16 * 1024 * 1024;
 // Process records retain command/env metadata and task-owned descriptors, so
 // cap them as well as the output bytes. Completed records are evicted first
 // under pressure; if every slot belongs to a running process, admission fails.
 const PROCESS_RECORD_LIMIT: usize = 128;
-const PROCESS_OUTPUT_RETENTION_BYTES: usize = 4 * 1024 * 1024;
-// Every admitted record can retain a useful stream-sized floor without
-// competing globally. Larger replay windows borrow from the shared burst pool;
-// exhaustion evicts only that process's older output.
-const PROCESS_OUTPUT_GUARANTEED_BYTES: usize = 256 * 1024;
+// One process retains at most a quarter of the smallest total.
+const PROCESS_OUTPUT_RETENTION_BYTES: usize = PROCESS_OUTPUT_RETENTION_MIN_BYTES / 4;
+
+/// How much process output spaced retains, sized from the guest's memory: a
+/// thirty-second of it, between 16 and 64 MiB (a 2 GiB guest keeps the full
+/// 64 MiB). Half is guaranteed, split evenly across the record slots, so every
+/// admitted record keeps a useful stream-sized floor without competing
+/// globally; larger replay windows borrow from the shared other half, and
+/// exhaustion evicts only that process's older output.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct ProcessOutputBudget {
+    guaranteed_per_record: usize,
+    shared: usize,
+}
+
+impl ProcessOutputBudget {
+    pub(super) fn for_guest_memory(mem_total_bytes: Option<u64>) -> Self {
+        let total = mem_total_bytes
+            .and_then(|bytes| usize::try_from(bytes / 32).ok())
+            .map_or(PROCESS_OUTPUT_RETENTION_MAX_BYTES, |total| {
+                total.clamp(
+                    PROCESS_OUTPUT_RETENTION_MIN_BYTES,
+                    PROCESS_OUTPUT_RETENTION_MAX_BYTES,
+                )
+            });
+        let guaranteed_per_record = total / 2 / PROCESS_RECORD_LIMIT;
+        Self {
+            guaranteed_per_record,
+            shared: total - guaranteed_per_record * PROCESS_RECORD_LIMIT,
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn total(self) -> usize {
+        self.guaranteed_per_record * PROCESS_RECORD_LIMIT + self.shared
+    }
+}
+
+// The default budget's values, for tests written against a registry or
+// journal built without a guest size.
+#[cfg(test)]
+const PROCESS_OUTPUT_GUARANTEED_BYTES: usize =
+    PROCESS_OUTPUT_RETENTION_MAX_BYTES / 2 / PROCESS_RECORD_LIMIT;
+#[cfg(test)]
 const PROCESS_OUTPUT_SHARED_BYTES: usize =
-    PROCESS_OUTPUT_RETENTION_TOTAL_BYTES - PROCESS_RECORD_LIMIT * PROCESS_OUTPUT_GUARANTEED_BYTES;
+    PROCESS_OUTPUT_RETENTION_MAX_BYTES - PROCESS_RECORD_LIMIT * PROCESS_OUTPUT_GUARANTEED_BYTES;
 const PROCESS_OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 const PROCESS_OUTPUT_LAGGED_MESSAGE: &str =
     "process output stream fell behind retained output buffer";
@@ -470,6 +512,7 @@ pub(super) struct ProcessRegistry {
     /// Whether the retention reaper is running. It runs only while a
     /// completed record is retained, so an idle daemon has no timer.
     reaper_running: Arc<std::sync::atomic::AtomicBool>,
+    output_budget: ProcessOutputBudget,
 }
 
 /// A process id in use: by an admitted start that has not published its
@@ -546,7 +589,10 @@ impl ProcessRecord {
             info,
             input,
             signal_handle,
-            journal: Arc::new(ProcessEventJournal::new(reservation.shared_output_slots)),
+            journal: Arc::new(ProcessEventJournal::with_budget(
+                reservation.shared_output_slots,
+                reservation.output_budget,
+            )),
         }
     }
 
@@ -564,12 +610,20 @@ impl ProcessRecord {
 }
 
 impl Default for ProcessRegistry {
+    /// The budget of a guest of unknown size: the full 64 MiB.
     fn default() -> Self {
+        Self::new(ProcessOutputBudget::for_guest_memory(None))
+    }
+}
+
+impl ProcessRegistry {
+    pub(super) fn new(output_budget: ProcessOutputBudget) -> Self {
         Self {
             records: Arc::new(DashMap::new()),
             record_slots: Arc::new(Semaphore::new(PROCESS_RECORD_LIMIT)),
-            shared_output_slots: Arc::new(Semaphore::new(PROCESS_OUTPUT_SHARED_BYTES)),
+            shared_output_slots: Arc::new(Semaphore::new(output_budget.shared)),
             reaper_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            output_budget,
         }
     }
 }
@@ -577,6 +631,7 @@ impl Default for ProcessRegistry {
 struct ProcessRecordReservation {
     record_slot: OwnedSemaphorePermit,
     shared_output_slots: Arc<Semaphore>,
+    output_budget: ProcessOutputBudget,
 }
 
 enum ProcessInput {
@@ -876,17 +931,27 @@ struct ProcessEventJournal {
     state: std::sync::Mutex<ProcessJournalState>,
     changed: watch::Sender<ProcessJournalChange>,
     shared_output_slots: Arc<Semaphore>,
+    budget: ProcessOutputBudget,
     consumed: watch::Sender<()>,
     blocked_readers: AtomicUsize,
 }
 
 impl ProcessEventJournal {
+    #[cfg(test)]
     fn new(shared_output_slots: Arc<Semaphore>) -> Self {
+        Self::with_budget(
+            shared_output_slots,
+            ProcessOutputBudget::for_guest_memory(None),
+        )
+    }
+
+    fn with_budget(shared_output_slots: Arc<Semaphore>, budget: ProcessOutputBudget) -> Self {
         let (changed, _) = watch::channel(ProcessJournalChange::OutputChanged);
         Self {
             state: std::sync::Mutex::new(ProcessJournalState::default()),
             changed,
             shared_output_slots,
+            budget,
             consumed: watch::channel(()).0,
             blocked_readers: AtomicUsize::new(0),
         }
@@ -1047,8 +1112,11 @@ impl ProcessEventJournal {
                 evict_oldest_process_output(&mut state);
             }
             let shared_output_slot = loop {
-                let guaranteed_bytes = output_bytes
-                    .min(PROCESS_OUTPUT_GUARANTEED_BYTES.saturating_sub(state.guaranteed_bytes));
+                let guaranteed_bytes = output_bytes.min(
+                    self.budget
+                        .guaranteed_per_record
+                        .saturating_sub(state.guaranteed_bytes),
+                );
                 let shared_bytes = output_bytes - guaranteed_bytes;
                 let shared_output_slot = if shared_bytes == 0 {
                     None
@@ -1282,6 +1350,7 @@ impl ProcessRegistry {
                     return Ok(ProcessRecordReservation {
                         record_slot,
                         shared_output_slots: Arc::clone(&self.shared_output_slots),
+                        output_budget: self.output_budget,
                     });
                 }
                 Err(TryAcquireError::Closed) => {

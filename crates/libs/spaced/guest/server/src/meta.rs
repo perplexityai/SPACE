@@ -85,7 +85,7 @@ fn parse_mem_total_bytes(meminfo: &str) -> Option<u64> {
         .flatten()
 }
 
-fn guest_mem_total_bytes() -> Option<u64> {
+pub(crate) fn guest_mem_total_bytes() -> Option<u64> {
     std::fs::read_to_string("/proc/meminfo")
         .ok()
         .and_then(|meminfo| parse_mem_total_bytes(&meminfo))

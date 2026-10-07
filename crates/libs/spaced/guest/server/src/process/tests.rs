@@ -1285,3 +1285,30 @@ async fn an_exited_process_task_does_not_wait_out_its_record_retention() {
     assert_eq!(registry.records.len(), 0);
     assert_eq!(registry.next_expiry(), None);
 }
+
+// The retained-output budget follows the guest's memory: a 2 GiB guest keeps
+// the full 64 MiB, smaller guests a thirty-second of their memory down to
+// 16 MiB, and a guest of unknown size the full budget.
+#[test]
+fn output_budget_scales_with_guest_memory() {
+    const MIB: u64 = 1024 * 1024;
+    let total = |mem: Option<u64>| ProcessOutputBudget::for_guest_memory(mem).total() as u64;
+    assert_eq!(total(None), 64 * MIB);
+    assert_eq!(total(Some(2048 * MIB)), 64 * MIB);
+    assert_eq!(total(Some(8192 * MIB)), 64 * MIB);
+    assert_eq!(total(Some(1024 * MIB)), 32 * MIB);
+    assert_eq!(total(Some(512 * MIB)), 16 * MIB);
+    assert_eq!(total(Some(128 * MIB)), 16 * MIB);
+    let small = ProcessOutputBudget::for_guest_memory(Some(512 * MIB));
+    assert_eq!(small.guaranteed_per_record, 64 * 1024);
+    assert!(PROCESS_OUTPUT_RETENTION_BYTES <= small.total() / 4);
+    // The default registry keeps today's numbers, which the tests above use.
+    assert_eq!(
+        ProcessOutputBudget::for_guest_memory(None).guaranteed_per_record,
+        PROCESS_OUTPUT_GUARANTEED_BYTES
+    );
+    assert_eq!(
+        ProcessOutputBudget::for_guest_memory(None).shared,
+        PROCESS_OUTPUT_SHARED_BYTES
+    );
+}

@@ -403,7 +403,9 @@ impl SpacedGuestService {
                 ready,
                 ready_events,
                 process_env: RwLock::new(EnvMap::empty()),
-                processes: ProcessRegistry::default(),
+                processes: ProcessRegistry::new(process::ProcessOutputBudget::for_guest_memory(
+                    meta::guest_mem_total_bytes(),
+                )),
                 idempotency: IdempotencyStore::new("process"),
                 filesystem,
                 loopback_bridge,
