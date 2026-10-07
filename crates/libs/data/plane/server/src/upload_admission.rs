@@ -5,9 +5,8 @@
 //! Both permits live until the handler returns, so the budget tracks bytes the
 //! pod may still be holding, not bytes already read. Spool files are unlinked
 //! in the background as the handler returns, so disk frees shortly after the
-//! permit does. An upload that
-//! can't get both permits within the admission wait is rejected with 429 and a
-//! jittered `Retry-After`.
+//! permit does. An upload that can't get both permits within the admission
+//! wait is rejected with 429 and a jittered `Retry-After`.
 //!
 //! The rejection is deliberately 429, never 503: 503 invites the immediate
 //! retries that turn an overloaded pod into a retry storm, while 429 with a
@@ -28,7 +27,7 @@ pub const DEFAULT_MAX_CONCURRENT_UPLOADS: NonZeroUsize = NonZeroUsize::new(64).u
 /// 1 GiB of declared request bodies. Octet-stream and multipart uploads spool
 /// to local disk, so for them the budget bounds the spool. JSON writes are
 /// capped at a 1 MiB body each and reserve at most that, though parsing a
-/// byte-array `content` holds several times its body in memory. Re-size the
+/// byte-array `content` holds well over ten times its body in memory. Re-size the
 /// budget against the spool volume's size limit once deployments set one.
 pub const DEFAULT_MAX_IN_FLIGHT_UPLOAD_BYTES: NonZeroU64 = NonZeroU64::new(1 << 30).unwrap();
 pub const DEFAULT_UPLOAD_ADMISSION_WAIT: Duration = Duration::from_secs(2);

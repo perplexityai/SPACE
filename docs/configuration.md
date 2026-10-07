@@ -137,7 +137,7 @@ because disabling it by mistake would leave every create queued forever.
 | `SPACE_CLUSTER_ID` | unset | Required for route signing. |
 | `SPACE_CREATE_COMMAND_READY_TIMEOUT_SECS`, `SPACE_CREATE_DATA_PLANE_READY_TIMEOUT_SECS` | built-in | Create-path waits for command and data-plane readiness. |
 | `SPACE_DATA_PLANE_UPLOAD_ADMISSION` | off | Data plane: admit ECW `POST /files` uploads under the per-replica limits below; rejected uploads get 429 with a jittered `Retry-After`. Accepts `true`/`1`/`yes`/`on` and their negations. |
-| `SPACE_DATA_PLANE_MAX_CONCURRENT_UPLOADS`, `SPACE_DATA_PLANE_MAX_IN_FLIGHT_UPLOAD_BYTES` | 64, 1 GiB | Per-replica upload slots and byte budget. Each upload reserves its declared `Content-Length`, or its path's body limit (256 MiB, or 1 MiB for JSON) when none is declared. Both must be non-zero. |
+| `SPACE_DATA_PLANE_MAX_CONCURRENT_UPLOADS`, `SPACE_DATA_PLANE_MAX_IN_FLIGHT_UPLOAD_BYTES` | 64, 1 GiB | Per-replica upload slots and byte budget. Each upload reserves its declared `Content-Length` rounded up to a KiB, or its path's body limit (256 MiB, or 1 MiB for JSON) when none is declared, so the 1 GiB default fits four undeclared-length uploads at a time. A reservation is capped at the whole budget: a budget smaller than one upload admits uploads one at a time and is exceeded by that upload. Both must be non-zero. |
 | `SPACE_DATA_PLANE_UPLOAD_ADMISSION_WAIT_MS` | 2000 | How long an upload waits for a slot and its bytes before the 429. |
 
 ## Templates and builds
