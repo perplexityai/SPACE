@@ -1170,28 +1170,6 @@ async fn multipart_epilogue_within_the_whole_body_limit_is_accepted() {
     assert_eq!(uploads.len(), 1);
 }
 
-#[test]
-fn upload_reservation_is_the_declared_length_capped_at_the_body_limit() {
-    let with_length = |value: &str| {
-        let mut headers = HeaderMap::new();
-        headers.insert(header::CONTENT_LENGTH, value.parse().unwrap());
-        headers
-    };
-    for limit in [
-        E2B_FILE_CONTENT_LIMIT_BYTES,
-        E2B_JSON_FILE_WRITE_BODY_LIMIT_BYTES,
-    ] {
-        let cap = limit as u64;
-        assert_eq!(upload_reservation_bytes(&with_length("4096"), limit), 4096);
-        assert_eq!(upload_reservation_bytes(&with_length("0"), limit), 0);
-        assert_eq!(upload_reservation_bytes(&HeaderMap::new(), limit), cap);
-        assert_eq!(
-            upload_reservation_bytes(&with_length(&(cap + 1).to_string()), limit),
-            cap
-        );
-    }
-}
-
 /// A router whose ECW route for `sandbox_id` is already cached, so `POST
 /// /files` reaches admission without ClusterApi, and whose limiter has one
 /// slot and a 50 ms wait.
@@ -1223,15 +1201,17 @@ fn upload_request(
     content_length: &str,
     body: Body,
 ) -> Request<Body> {
-    Request::post(path)
+    let mut request = Request::post(path)
         .header(
             header::HOST,
             format!("{ECW_ENVD_PORT}-{sandbox_id}.ecw.test"),
         )
-        .header(header::CONTENT_TYPE, content_type)
-        .header(header::CONTENT_LENGTH, content_length)
-        .body(body)
-        .unwrap()
+        .header(header::CONTENT_TYPE, content_type);
+    // An empty length leaves the header off, as a chunked upload would.
+    if !content_length.is_empty() {
+        request = request.header(header::CONTENT_LENGTH, content_length);
+    }
+    request.body(body).unwrap()
 }
 
 /// An empty body that runs `on_poll` the first time the handler reads it.
@@ -1377,7 +1357,8 @@ async fn saturated_admission_rejects_post_files_before_reading_the_body() {
 }
 
 /// The permit is still held while the handler reads the body, not released
-/// once admission succeeds.
+/// once admission succeeds, and it reserves the declared length, or the JSON
+/// write limit when no length is declared.
 #[tokio::test]
 async fn an_admitted_upload_holds_its_permit_while_reading_the_body() {
     if !pplx_space_test_env::enter_test_process(&[(
@@ -1389,23 +1370,49 @@ async fn an_admitted_upload_holds_its_permit_while_reading_the_body() {
 
     let sandbox_id = SandboxId::new();
     let (app, uploads) = upload_router(sandbox_id).await;
-    let free_slots_during_read = Arc::new(AtomicUsize::new(usize::MAX));
-    let body = {
-        let uploads = uploads.clone();
-        let free_slots_during_read = free_slots_during_read.clone();
-        observed_body(move || {
-            free_slots_during_read.store(uploads.available_uploads(), Ordering::SeqCst);
-        })
-    };
-    let request = upload_request(sandbox_id, "/files", "application/json", "0", body);
-    // The empty JSON body is rejected after the read; only the read matters.
-    let response = app.oneshot(request).await.unwrap();
+    let budget = uploads.available_bytes();
+    for (content_length, reserved) in [
+        ("1000", 1024),
+        ("", E2B_JSON_FILE_WRITE_BODY_LIMIT_BYTES as u64),
+    ] {
+        let during_read = Arc::new(std::sync::Mutex::new(None));
+        let body = {
+            let uploads = uploads.clone();
+            let during_read = during_read.clone();
+            observed_body(move || {
+                *during_read.lock().unwrap() =
+                    Some((uploads.available_uploads(), uploads.available_bytes()));
+            })
+        };
+        let request = upload_request(
+            sandbox_id,
+            "/files",
+            "application/json",
+            content_length,
+            body,
+        );
+        // The empty JSON body is rejected after the read; only the read matters.
+        let response = app.clone().oneshot(request).await.unwrap();
 
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(free_slots_during_read.load(Ordering::SeqCst), 0);
-    assert_eq!(
-        uploads.available_uploads(),
-        1,
-        "the permit returns afterwards"
-    );
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "{content_length:?}"
+        );
+        assert_eq!(
+            *during_read.lock().unwrap(),
+            Some((0, budget - reserved)),
+            "{content_length:?}: slot and reservation held while reading"
+        );
+        assert_eq!(
+            uploads.available_uploads(),
+            1,
+            "the slot returns afterwards"
+        );
+        assert_eq!(
+            uploads.available_bytes(),
+            budget,
+            "the bytes return afterwards"
+        );
+    }
 }

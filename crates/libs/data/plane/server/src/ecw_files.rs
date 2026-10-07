@@ -281,8 +281,8 @@ pub(super) async fn write_file(
     let user = extract_write_user(query.username.as_deref(), &headers)?;
     // Reject what the headers and query alone can before admission, so a
     // malformed request never waits for or holds an upload permit.
-    let write_body = if is_octet_stream_content_type(content_type) {
-        reject_oversized_content_length(
+    let (write_body, declared_len) = if is_octet_stream_content_type(content_type) {
+        let declared_len = reject_oversized_content_length(
             &headers,
             E2B_FILE_CONTENT_LIMIT_BYTES,
             file_too_large_error,
@@ -292,16 +292,17 @@ pub(super) async fn write_file(
                 "path query parameter is required for octet-stream uploads",
             ));
         };
-        WriteBody::OctetStream(e2b_request_root(path, user.as_ref())?)
+        let path = e2b_request_root(path, user.as_ref())?;
+        (WriteBody::OctetStream(path), declared_len)
     } else if is_json_content_type(content_type) {
-        reject_oversized_content_length(
+        let declared_len = reject_oversized_content_length(
             &headers,
             E2B_JSON_FILE_WRITE_BODY_LIMIT_BYTES,
             json_file_write_body_too_large_error,
         )?;
-        WriteBody::Json
+        (WriteBody::Json, declared_len)
     } else if content_type.starts_with("multipart/form-data") {
-        reject_oversized_content_length(
+        let declared_len = reject_oversized_content_length(
             &headers,
             E2B_FILE_CONTENT_LIMIT_BYTES,
             file_too_large_error,
@@ -311,11 +312,12 @@ pub(super) async fn write_file(
         if let Some(path) = &query.path {
             e2b_request_root(path, user.as_ref())?;
         }
-        WriteBody::Multipart(multipart_boundary(content_type).ok_or_else(|| {
+        let boundary = multipart_boundary(content_type).ok_or_else(|| {
             EcwProxyError::bad_request(
                 "multipart/form-data boundary of 1 to 70 characters is required",
             )
-        })?)
+        })?;
+        (WriteBody::Multipart(boundary), declared_len)
     } else {
         return Err(EcwProxyError::bad_request(
             "Unsupported Content-Type for file write",
@@ -326,8 +328,10 @@ pub(super) async fn write_file(
     // the pod no body bytes.
     let _upload_permit = match &state.uploads {
         Some(uploads) => {
-            let reserve = upload_reservation_bytes(&headers, write_body.body_limit());
-            Some(uploads.admit(reserve).await?)
+            // Every write path stops reading at its limit, so an undeclared
+            // length reserves the whole of it.
+            let reserve = declared_len.unwrap_or_else(|| write_body.body_limit());
+            Some(uploads.admit(reserve as u64).await?)
         }
         None => None,
     };
@@ -375,20 +379,6 @@ pub(super) async fn write_file(
     }
 }
 
-/// The bytes an upload may hold while it runs: its declared `Content-Length`,
-/// or its write path's body limit when the header is missing, since every
-/// write path stops reading at that limit. `write_file` has already rejected a
-/// declared length that is unparsable or over the limit; the clamp only keeps
-/// this total.
-fn upload_reservation_bytes(headers: &HeaderMap, body_limit: usize) -> u64 {
-    let limit = body_limit as u64;
-    headers
-        .get(header::CONTENT_LENGTH)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.trim().parse::<u64>().ok())
-        .map_or(limit, |declared| declared.min(limit))
-}
-
 /// How a `POST /files` body is carried, decided from headers alone.
 enum WriteBody<'a> {
     /// Spooled to disk, then streamed to the guest; carries the validated
@@ -418,18 +408,20 @@ fn file_write_info(path: String) -> FileWriteInfoE2b {
     }
 }
 
+/// Rejects a declared `Content-Length` that is unparsable or over `limit`, and
+/// returns the declared length, if any.
 fn reject_oversized_content_length(
     headers: &HeaderMap,
     limit: usize,
     too_large: fn() -> EcwProxyError,
-) -> Result<(), EcwProxyError> {
+) -> Result<Option<usize>, EcwProxyError> {
     let Some(content_length) = headers
         .get(header::CONTENT_LENGTH)
         .and_then(|value| value.to_str().ok())
         .map(str::trim)
         .filter(|value| !value.is_empty())
     else {
-        return Ok(());
+        return Ok(None);
     };
     let content_length = content_length
         .parse::<usize>()
@@ -437,7 +429,7 @@ fn reject_oversized_content_length(
     if content_length > limit {
         return Err(too_large());
     }
-    Ok(())
+    Ok(Some(content_length))
 }
 
 fn extract_write_user(

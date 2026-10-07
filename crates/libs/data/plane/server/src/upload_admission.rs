@@ -122,6 +122,10 @@ impl UploadAdmission {
     }
 }
 
+/// One deadline spans both acquires in `admit`, which is why this isn't
+/// `pplx_space_common_grpc::queued_slots`: a `QueuedSlots` request fixes its
+/// own deadline, so two of them can't share one.
+///
 /// `None` when the deadline passes first. The semaphores are never closed,
 /// so an acquire error can't happen; it's folded into `None` all the same.
 async fn acquire_by(
