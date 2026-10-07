@@ -187,12 +187,20 @@ run_failure() {
   }
 }
 
+# Compare what the build container's `source` assigns, not the file's spelling.
 assert_export() {
   local file="$1"
   local name="$2"
   local value="$3"
-  grep -F "export ${name}=\"${value}\"" "$file" >/dev/null || {
-    echo "expected ${name}=${value} in ${file}" >&2
+  local actual
+  # shellcheck disable=SC2016 # the inner shell expands its own arguments
+  actual="$(env -i bash --noprofile --norc -c \
+    'set -euo pipefail; source "$1"; printf "%s." "${!2}"' _ "$file" "$name")" || {
+    echo "sourcing ${file} failed" >&2
+    exit 1
+  }
+  [[ "${actual%.}" == "$value" ]] || {
+    echo "expected ${name}=${value@Q} in ${file}, got ${actual%.}" >&2
     echo "actual exports:" >&2
     sed 's/^/  /' "$file" >&2
     exit 1
@@ -237,6 +245,36 @@ run_failure guest-kernel-version-only "$kernel_pair_error" \
   SPACE_SEED_KERNEL_VERSION="$kernel_version"
 run_failure guest-kernel-digest-only "$kernel_pair_error" \
   SPACE_SEED_KERNEL_DIGEST="$kernel_digest"
+
+# The privileged build container sources the env file as root, so every
+# staged value must stay data however the caller spelled it.
+marker="${tmp_dir}/shell-metacharacters/sourced-command-ran"
+declare -A hostile=(
+  [SPACE_SEED_UBUNTU_RELEASE]="resolute\"; touch '${marker}'; echo \""
+  [SPACE_SEED_UBUNTU_VERSION]="\$(touch '${marker}')"
+  [SPACE_SEED_UBUNTU_DATE]="\`touch '${marker}'\`"
+  [SPACE_SEED_RUNTIME]=$'firecracker\ntouch '"'${marker}'"
+  [SPACE_SEED_RUNTIME_VERSION]="1.16.0'; touch '${marker}'; '"
+  [SPACE_SEED_STATE_FORMAT_VERSION]="10.1.0\\\"; touch '${marker}' #"
+  [SPACE_SEED_KERNEL_VERSION]="\${PATH:+\$(touch '${marker}')}"
+  [SPACE_SEED_KERNEL_DIGEST]=$'sha256:0\r\n$(touch '"'${marker}'"')'
+  [SPACE_SEED_SPACED_VERSION]="0.1.2\$IFS\$(touch '${marker}')"
+)
+hostile_env=()
+for name in "${!hostile[@]}"; do
+  hostile_env+=("${name}=${hostile[$name]}")
+done
+run_success shell-metacharacters "${hostile_env[@]}"
+# shellcheck disable=SC2016 # the inner shell expands its own argument
+env -i bash --noprofile --norc -c 'source "$1"' _ "$captured_env" >/dev/null 2>&1 || true
+[[ ! -e "$marker" ]] || {
+  echo "shell-metacharacters: sourcing the staged env file ran a command" >&2
+  sed 's/^/  /' "$captured_env" >&2
+  exit 1
+}
+for name in "${!hostile[@]}"; do
+  assert_export "$captured_env" "$name" "${hostile[$name]}"
+done
 
 rootfs_stderr="${tmp_dir}/rootfs-kernel-pair.stderr"
 set +e
