@@ -108,7 +108,7 @@ struct Cli {
     max_concurrent_uploads: NonZeroUsize,
 
     /// In-flight upload bytes per replica, reserved from `Content-Length`
-    /// (the 256 MiB body limit when absent).
+    /// (the write path's body limit when absent: 256 MiB, or 1 MiB for JSON).
     #[arg(
         long,
         env = "SPACE_DATA_PLANE_MAX_IN_FLIGHT_UPLOAD_BYTES",

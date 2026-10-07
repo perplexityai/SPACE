@@ -61,4 +61,7 @@ fn upload_admission_limits_are_overridable_and_reject_zero() {
     assert_eq!(admission.wait, Duration::from_millis(500));
 
     assert!(Cli::try_parse_from(["space-data-plane-svc", "--max-concurrent-uploads=0"]).is_err());
+    assert!(
+        Cli::try_parse_from(["space-data-plane-svc", "--max-in-flight-upload-bytes=0"]).is_err()
+    );
 }

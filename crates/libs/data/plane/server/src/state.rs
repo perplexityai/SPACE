@@ -1564,7 +1564,7 @@ impl EcwProxyError {
         )
     }
 
-    /// Never 503: callers retry 503 immediately, so only a 429 with a
+    /// Never 503: 503 invites immediate retries, so only a 429 with a
     /// jittered `Retry-After` spreads an upload burst out.
     pub(super) fn too_many_uploads(retry_after: Duration) -> Self {
         Self::new(

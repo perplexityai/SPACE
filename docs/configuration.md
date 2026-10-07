@@ -136,6 +136,9 @@ because disabling it by mistake would leave every create queued forever.
 | `SPACE_E2B_HOME_WORKDIR_TEMPLATES`, `SPACE_ECW_HOSTS` | `code-runtime`, none | E2B routes return 404 without hosts. |
 | `SPACE_CLUSTER_ID` | unset | Required for route signing. |
 | `SPACE_CREATE_COMMAND_READY_TIMEOUT_SECS`, `SPACE_CREATE_DATA_PLANE_READY_TIMEOUT_SECS` | built-in | Create-path waits for command and data-plane readiness. |
+| `SPACE_DATA_PLANE_UPLOAD_ADMISSION` | off | Data plane: admit ECW `POST /files` uploads under the per-replica limits below; rejected uploads get 429 with a jittered `Retry-After`. Accepts `true`/`1`/`yes`/`on` and their negations. |
+| `SPACE_DATA_PLANE_MAX_CONCURRENT_UPLOADS`, `SPACE_DATA_PLANE_MAX_IN_FLIGHT_UPLOAD_BYTES` | 64, 1 GiB | Per-replica upload slots and byte budget. Each upload reserves its declared `Content-Length`, or its path's body limit (256 MiB, or 1 MiB for JSON) when none is declared. Both must be non-zero. |
+| `SPACE_DATA_PLANE_UPLOAD_ADMISSION_WAIT_MS` | 2000 | How long an upload waits for a slot and its bytes before the 429. |
 
 ## Templates and builds
 
