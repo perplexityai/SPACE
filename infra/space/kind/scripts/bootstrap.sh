@@ -99,6 +99,39 @@ require_bin() {
 }
 require_bin docker kind kubectl helm openssl
 
+# The sandbox SSH keypair. Fatal, and deliberately never generated here: the
+# builder release mounts the Secret *non-optionally* (`builder-ssh`), so
+# skipping it — what the warning this replaces did — left
+# space-builder-node-stack unable to start at all, not merely without
+# `space-ssh`. Generating one would be worse, because the public half is baked
+# into the seed rootfs and a key invented after `space-seed-publish:local` was
+# built authenticates against nothing.
+#
+# Only checked *early* under --skip-images, which is the one case where nothing
+# downstream will create it. Checking it unconditionally here was a regression:
+# build-images.sh (step 5 below) runs build-seed.sh, which generates the key
+# when absent, so the plain `bash bootstrap.sh` documented in README.md died at
+# second zero on a fresh machine — advising the operator to "re-run without
+# --skip-images", which is the run that had just failed. The post-build
+# assertion further down covers every other path.
+if (( SKIP_IMAGES )); then
+  # Both halves: the Secret is written with `--from-file` for each, so a
+  # missing `.pub` fails at kubectl minutes later instead of here.
+  for half in sandbox_ed25519 sandbox_ed25519.pub; do
+    [[ -f "$SSH_KEY_DIR/$half" ]] || die \
+      "$SSH_KEY_DIR/$half missing and --skip-images was given, so nothing will create it.
+  If the pair is missing entirely, re-run without --skip-images: build-images.sh
+  runs build-seed.sh, which generates it, and then builds and kind-loads
+  space-seed-publish:local so the baked public half matches. build-seed.sh alone
+  is not enough — it builds space-seed-builder:local, not the publisher, and the
+  publish Job pulls IfNotPresent, so it would reuse a cached image baking the old
+  public key while this Secret carries the new private one.
+  If only one half is missing, remove $SSH_KEY_DIR first: build-seed.sh guards
+  key generation on the *private* half alone, so a private key beside a missing
+  .pub is a state no re-run repairs."
+  done
+fi
+
 # Helm 3 is required (helm v2 used a different syntax for `upgrade --install`).
 helm_major=$(helm version --short 2>/dev/null | sed -n 's/^v\([0-9]\+\).*/\1/p')
 [[ "$helm_major" == "3" ]] || die "helm 3 required (found: $(helm version --short 2>/dev/null))"
@@ -262,6 +295,20 @@ else
     bash "$KIND_DIR/scripts/build-images.sh"
 fi
 
+# By here the keypair exists on every path: --skip-images was checked in the
+# preflight block, and otherwise build-seed.sh has just generated it. Asserted
+# rather than assumed, because a build-seed.sh that stopped generating would
+# otherwise surface minutes later as space-builder-node-stack failing to mount
+# a Secret nothing wrote.
+for half in sandbox_ed25519 sandbox_ed25519.pub; do
+  [[ -f "$SSH_KEY_DIR/$half" ]] || die \
+    "$SSH_KEY_DIR/$half still missing after the image step. build-seed.sh (run
+  by build-images.sh) generates the pair, but it guards on the *private* half
+  alone, so a private key beside a missing .pub is a state it skips rather than
+  repairs. The Secret is written from both halves and the builder release mounts
+  it non-optionally, so remove $SSH_KEY_DIR and let build-seed.sh regenerate."
+done
+
 # Re-assert node labels: the shim install and image side-loading above can
 # churn nodes enough to drop admin-applied labels (pool labels from
 # the cluster config survive because the kubelet owns them).
@@ -347,19 +394,19 @@ SPACE_CONSOLE_PASSWORD="$CONSOLE_PASSWORD" bash "$KIND_DIR/scripts/provision-loc
 unset CONSOLE_PASSWORD
 
 # ── Sandbox SSH keypair Secret ────────────────────────────────────────────────
-# Generated once per devbox by build-seed.sh (the local stand-in for the
-# AMI's Packer-generated /space/etc/ssh). The public half is baked into the
-# seed rootfs; the private half is mounted into the node-stack pods so
-# `space-ssh` reaches local sandboxes exactly like on a real worker.
-if [[ -f "$SSH_KEY_DIR/sandbox_ed25519" ]]; then
-  log "creating/refreshing space-sandbox-ssh Secret from $SSH_KEY_DIR"
-  kubectl --context "$KCTX" -n "$NAMESPACE" create secret generic space-sandbox-ssh \
-    --from-file=sandbox_ed25519="$SSH_KEY_DIR/sandbox_ed25519" \
-    --from-file=sandbox_ed25519.pub="$SSH_KEY_DIR/sandbox_ed25519.pub" \
-    --dry-run=client -o yaml | kubectl --context "$KCTX" apply -f - >/dev/null
-else
-  log "WARNING: $SSH_KEY_DIR/sandbox_ed25519 missing (build-seed.sh not run?); space-ssh will not work"
-fi
+# The local stand-in for the worker AMI's Packer-generated /space/etc/ssh. The
+# public half is baked into the seed rootfs; the private half is mounted into
+# the node-stack pods so `space-ssh` reaches local sandboxes exactly like on a
+# real worker. Nothing is conditional here because the material is already
+# guaranteed: under --skip-images by the preflight check, and on every other
+# path by the assertion that follows the image step. (Not "the preflight block
+# above" — that one only fires under --skip-images, so on the documented plain
+# `bash bootstrap.sh` the guarantee comes from the post-build assertion.)
+log "creating/refreshing space-sandbox-ssh Secret from $SSH_KEY_DIR"
+kubectl --context "$KCTX" -n "$NAMESPACE" create secret generic space-sandbox-ssh \
+  --from-file=sandbox_ed25519="$SSH_KEY_DIR/sandbox_ed25519" \
+  --from-file=sandbox_ed25519.pub="$SSH_KEY_DIR/sandbox_ed25519.pub" \
+  --dry-run=client -o yaml | kubectl --context "$KCTX" apply -f - >/dev/null
 
 # Once api-server has the control-plane schema, drive everything else.
 helm_apply space "$KIND_DIR/charts/space-internal-api-local"

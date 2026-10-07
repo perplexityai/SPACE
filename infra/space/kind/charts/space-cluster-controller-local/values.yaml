@@ -61,11 +61,13 @@ internal:
 # Route-token signing material. This lives in its own Secret, written by the
 # space-api-local chart, and NOT in `internal.secretName` — the sibling
 # space-api-local and space-internal-api-local charts already read it this way.
-# The cluster-controller was left reading it out of `space-internal`, where it is
-# never written, so the process failed at startup with "SPACE API Ed25519 route
-# token signing configuration is missing" and the pod crash-looped on the kind
-# harness. Keep these three aligned with the api charts. The signing key is
-# mounted as a file; the key id and issuer are read from the environment.
+# Keep all four values aligned with that chart: the deployment reads them through
+# non-optional secretKeyRefs and a non-optional Secret volume item, so a Secret
+# name or key that does not match what the api chart writes leaves kubelet unable
+# to start the container, which presents as a pod stuck at
+# CreateContainerConfigError or ContainerCreating with no logs rather than as a
+# process failure. The signing key is mounted as a file; the key id and issuer
+# are read from the environment.
 spaceApiRouteToken:
   ed25519:
     signingSecretName: space-route-signing

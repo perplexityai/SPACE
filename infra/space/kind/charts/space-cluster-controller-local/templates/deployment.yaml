@@ -92,11 +92,22 @@ spec:
                   name: {{ .Values.internal.secretName }}
                   key: SPACE_INTERNAL_CONTROL_TOKEN
             # From the route-signing Secret, not `internal.secretName`: the
-            # api-local chart writes this material to its own Secret and never
-            # into `space-internal`, so reading it from there left the process
-            # exiting at startup with "route token signing configuration is
-            # missing". Matches how space-api-local and space-internal-api-local
-            # read the same three values; the key is mounted as a file below.
+            # api-local chart writes this material into its own Secret and never
+            # into `space-internal`. Matches how space-api-local and
+            # space-internal-api-local read the same three values; the key is
+            # mounted as a file below. None of the three is `optional`, so naming
+            # a Secret that lacks a key does not degrade the process: a missing
+            # key id or issuer leaves the pod at CreateContainerConfigError, a
+            # missing signing key leaves the `route-signing` volume unmountable
+            # and the pod at ContainerCreating, and either way there are no logs
+            # to read and the bring-up only learns of it when its rollout wait
+            # times out.
+            #
+            # Dropping them instead is not available while this chart enables the
+            # public-operation dispatcher: the dispatcher's executor loads the
+            # signing material as it is constructed, and the process exits
+            # non-zero when it is absent. Any deployment that enables the
+            # dispatcher must supply the same three values.
             - name: SPACE_API_ROUTE_ED25519_SIGNING_KEY_PATH
               value: /var/run/space-route-signing/signing-key.pem
             - name: SPACE_API_ROUTE_ED25519_SIGNING_KEY_ID
