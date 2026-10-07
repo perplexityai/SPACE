@@ -10,24 +10,23 @@ and can't.
 
 Unit tests rarely catch that regression. Crates that read hooks generally
 enable `test-hooks` for their own tests, so in a test build a hook reads the
-environment exactly like a real read. This guard checks the source instead.
+environment exactly like a real read. This guard checks the source instead,
+over Rust files under `crates/` minus test files and inline `#[cfg(test)]`
+modules.
 
-Two rules, over non-test Rust sources under `crates/`:
+A *reader* is `test_hook`, `test_hook_var`, an import alias of either, or a
+function named `test_*` that passes one of its own string parameters to a reader
+(`EnvConfig::test_raw`, for example). Two rules:
 
-1. A *reader* is `test_hook`, `test_hook_var`, or a function named `test_*`
-   that forwards a variable name into a reader (`EnvConfig::test_raw`, for
-   example). Every argument of a reader call that names a variable, as a
-   string literal or a `&str` constant, must not be a documented variable.
-2. A reader call that names no variable forwards one from elsewhere, so it must
-   sit inside a function named `test_*`. That keeps every forwarding wrapper
-   visible as a reader under rule 1: a closure, macro, loop or differently
-   named helper that forwards a hook read fails here instead of hiding it.
-   Passing `test_hook` or `test_hook_var` as a value fails for the same reason.
+1. No reader call may name a documented variable, as a string literal or as a
+   `&str` constant. A constant resolves in the reading file first, then in the
+   rest of its crate; a name that means different values across the crate is
+   left unresolved rather than guessed.
+2. A function that passes one of its own string parameters to a reader must be named
+   `test_*`. Otherwise its callers would hide reads from rule 1.
 
-Constants resolve in the reading file first, then across the tree; a
-path-qualified constant other than `Self::` resolves across the tree. Names
-built with `concat!` or held in constants defined by other constants aren't
-resolved.
+Not covered: names built at run time (`format!`, `concat!`), constants defined
+by other constants, and hook reads forwarded through closures or macros.
 
 Run standalone (`python scripts/source_guards/env_test_hook_boundary.py`).
 """
@@ -43,19 +42,23 @@ DOCS = pathlib.Path("docs/configuration.md")
 PRIMITIVES = frozenset({"test_hook", "test_hook_var"})
 
 DOCUMENTED = re.compile(r"`(SPACE_[A-Z0-9_]+)`")
-FN_DEF = re.compile(r"\bfn\s+([a-z_][a-z0-9_]*)\b")
+SPACE_NAME = re.compile(r"SPACE_[A-Z0-9_]+")
+CHAR_LITERAL = re.compile(r"'(?:\\(?:x[0-9a-fA-F]{2}|u\{[0-9a-fA-F]+\}|.)|[^\\'\n])'")
+RAW_STRING = re.compile(r'b?r(#*)"')
+FN_DEF = re.compile(r"\bfn\s+([a-z_][a-z0-9_]*)")
 # A call, with an optional turbofish: `name(`, `name::<T>(`.
 CALL = re.compile(r"\b([a-z_][a-z0-9_]*)\s*(?:::\s*<[^()]*?>\s*)?\(")
-PRIMITIVE_USE = re.compile(r"\b(test_hook_var|test_hook)\b")
-# A variable-name candidate in a call's arguments: a string literal (plain or
-# raw), or an upper-case constant, possibly path-qualified (`Self::ENV`).
-STRING = r'r?#*"(SPACE_[A-Z0-9_]+)"#*'
+ALIAS = re.compile(r"\b(test_hook_var|test_hook)\s+as\s+([a-z_][a-z0-9_]*)")
+TEST_MODULE = re.compile(r"#\[cfg\(test\)\]\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+\w+\s*\{")
 NAME_ARG = re.compile(
-    STRING + r'|(?<![A-Za-z0-9_"])((?:[A-Za-z_][A-Za-z0-9_]*::)*)([A-Z][A-Z0-9_]+)\b'
+    r'"(SPACE_[A-Z0-9_]+)"|(?<![A-Za-z0-9_"])((?:[A-Za-z_][A-Za-z0-9_]*::)*)([A-Z][A-Z0-9_]+)\b'
 )
-CHAR_LITERAL = re.compile(r"'(?:\\(?:x[0-9a-fA-F]{2}|u\{[0-9a-fA-F]+\}|.)|[^\\'\n])'")
+IDENT = re.compile(r"(?<![A-Za-z0-9_:.])([a-z_][a-z0-9_]*)(?![A-Za-z0-9_(!:])")
+STR_PARAMETER = re.compile(
+    r"(?:^|,)\s*(?:mut\s+)?([a-z_][a-z0-9_]*)\s*:\s*(?:&\s*(?:'\w+\s+)?(?:mut\s+)?)?(?:str|String)\b"
+)
 STR_CONST = re.compile(
-    r"\b(?:const|static)\s+([A-Z][A-Z0-9_]*)\s*:\s*&(?:'static\s+)?str\s*=\s*r?#*\"([^\"]*)\""
+    r"\b(?:const|static)\s+([A-Z][A-Z0-9_]*)\s*:\s*&\s*(?:'static\s+)?str\s*=\s*r?#*\"(SPACE_[A-Z0-9_]+)\""
 )
 
 
@@ -72,115 +75,158 @@ def is_test_source(relative: pathlib.Path) -> bool:
     )
 
 
-def strip_comments(text: str) -> str:
-    """Blank out `//` and `/* */` comments, leaving string literals intact.
+def code_only(text: str) -> str:
+    """Blank comments and string contents, keeping offsets and line numbers.
 
-    Comment characters become spaces so offsets and line numbers still match
-    the file. A char literal is skipped whole so `'"'` doesn't open a string;
-    a lifetime (`'a`) has no closing quote and is left alone.
+    A string that is exactly a `SPACE_*` name is kept, since that's how a read
+    names its variable; any other string becomes `""` padded with spaces, so
+    text inside it can't look like code. Char literals are skipped whole so
+    `'"'` doesn't open a string.
     """
     out = list(text)
     index, length = 0, len(text)
+
+    def blank(start: int, end: int) -> None:
+        out[start:end] = [c if c == "\n" else " " for c in text[start:end]]
+
     while index < length:
         char = text[index]
-        literal = CHAR_LITERAL.match(text, index) if char == "'" else None
-        if literal:
+        previous = text[index - 1] if index else " "
+        raw = None
+        if char in "br" and not (previous.isalnum() or previous == "_"):
+            raw = RAW_STRING.match(text, index)
+        if char == "'" and (literal := CHAR_LITERAL.match(text, index)):
             index = literal.end()
-        elif char == '"' or (
-            char == "r"
-            and not re.match(r"[A-Za-z0-9_]", text[index - 1 : index] or " ")
-            and re.match(r'r#*"', text[index:])
-        ):
-            hashes = 0
-            if char == "r":
-                index += 1
-                while text[index] == "#":
-                    hashes += 1
-                    index += 1
-            closing = '"' + "#" * hashes
-            index += 1
-            while index < length and not text.startswith(closing, index):
-                index += 2 if text[index] == "\\" and not hashes else 1
-            index += len(closing)
+        elif raw or char == '"':
+            if raw:
+                closing = '"' + raw.group(1)
+                body = raw.end()
+            else:
+                closing, body = '"', index + 1
+            end = body
+            while end < length and not text.startswith(closing, end):
+                end += 2 if text[end] == "\\" and not raw else 1
+            if not SPACE_NAME.fullmatch(text[body:end]):
+                blank(body, end)
+            index = end + len(closing)
         elif text.startswith("//", index):
             end = text.find("\n", index)
             end = length if end == -1 else end
-            out[index:end] = " " * (end - index)
+            blank(index, end)
             index = end
         elif text.startswith("/*", index):
-            end = text.find("*/", index + 2)
-            end = length if end == -1 else end + 2
-            out[index:end] = [c if c == "\n" else " " for c in text[index:end]]
+            depth, end = 1, index + 2
+            while end < length and depth:
+                if text.startswith("/*", end):
+                    depth, end = depth + 1, end + 2
+                elif text.startswith("*/", end):
+                    depth, end = depth - 1, end + 2
+                else:
+                    end += 1
+            blank(index, end)
             index = end
         else:
             index += 1
     return "".join(out)
 
 
-def sources(root: pathlib.Path) -> list[tuple[pathlib.Path, str]]:
+def matching(text: str, start: int, opener: str, closer: str) -> int:
+    """The index just past the `closer` matching the `opener` at `start`."""
+    depth = 0
+    for index in range(start, len(text)):
+        if text[index] == opener:
+            depth += 1
+        elif text[index] == closer:
+            depth -= 1
+            if depth == 0:
+                return index + 1
+    return len(text)
+
+
+def without_test_modules(text: str) -> str:
+    for module in reversed(list(TEST_MODULE.finditer(text))):
+        end = matching(text, module.end() - 1, "{", "}")
+        text = text[: module.start()] + re.sub(r"[^\n]", " ", text[module.start() : end]) + text[end:]
+    return text
+
+
+def crate_of(root: pathlib.Path, relative: pathlib.Path) -> pathlib.Path:
+    for parent in (root / relative).parents:
+        if (parent / "Cargo.toml").exists() or parent == root:
+            return parent
+    return root
+
+
+def sources(root: pathlib.Path) -> list[tuple[pathlib.Path, pathlib.Path, str]]:
     found = []
     for path in sorted(root.glob("crates/**/*.rs")):
         relative = path.relative_to(root)
         if "target" in relative.parts or is_test_source(relative):
             continue
-        found.append((relative, strip_comments(path.read_text())))
+        text = without_test_modules(code_only(path.read_text()))
+        found.append((relative, crate_of(root, relative), text))
     return found
 
 
-def call_arguments(text: str, open_paren: int) -> str:
-    """The text between `(` at `open_paren` and its matching `)`."""
-    depth = 0
-    for index in range(open_paren, len(text)):
-        if text[index] == "(":
-            depth += 1
-        elif text[index] == ")":
-            depth -= 1
-            if depth == 0:
-                return text[open_paren + 1 : index]
-    return text[open_paren + 1 :]
+class Function:
+    def __init__(self, name: str, parameters: set[str], start: int, end: int) -> None:
+        self.name, self.parameters, self.start, self.end = name, parameters, start, end
 
 
-def functions(text: str) -> list[tuple[str, int, int]]:
-    """Each `fn` as (name, start, end), its body running to the next `fn`."""
-    starts = [(m.group(1), m.start()) for m in FN_DEF.finditer(text)]
-    return [
-        (name, start, starts[i + 1][1] if i + 1 < len(starts) else len(text))
-        for i, (name, start) in enumerate(starts)
-    ]
+def functions(text: str) -> list[Function]:
+    found = []
+    for match in FN_DEF.finditer(text):
+        index = match.end()
+        if text[index:].lstrip().startswith("<"):
+            index = matching(text, text.index("<", index), "<", ">")
+        open_paren = text.find("(", index)
+        if open_paren == -1:
+            continue
+        close_paren = matching(text, open_paren, "(", ")")
+        brace, semicolon = text.find("{", close_paren), text.find(";", close_paren)
+        if brace == -1 or (semicolon != -1 and semicolon < brace):
+            continue  # a declaration without a body
+        signature = text[open_paren + 1 : close_paren - 1]
+        # Only string parameters can carry a variable name; `env: &dyn
+        # Environment` passed along to `test_hook` is not forwarding.
+        parameters = set(STR_PARAMETER.findall(signature))
+        found.append(Function(match.group(1), parameters, brace, matching(text, brace, "{", "}")))
+    return found
 
 
-def enclosing_function(text: str, offset: int) -> str | None:
-    name = None
-    for match in FN_DEF.finditer(text, 0, offset):
-        name = match.group(1)
-    return name
+def innermost(functions_in_file: list[Function], offset: int) -> Function | None:
+    enclosing = [f for f in functions_in_file if f.start <= offset < f.end]
+    return min(enclosing, key=lambda f: f.end - f.start) if enclosing else None
 
 
-def calls(text: str, readers: set[str]):
+def reader_calls(text: str, readers: set[str]):
+    # A definition (`fn test_raw(var: &str)`) also matches, but its signature
+    # holds no name-shaped argument and no forwarded parameter, so it reports
+    # nothing.
     for match in CALL.finditer(text):
-        if match.group(1) not in readers:
-            continue
-        if re.search(r"\bfn\s+$", text[max(0, match.start() - 8) : match.start()]):
-            continue
-        yield match, call_arguments(text, match.end() - 1)
+        if match.group(1) in readers:
+            yield match, text[match.end() : matching(text, match.end() - 1, "(", ")") - 1]
 
 
-def forwards(arguments: str) -> bool:
-    """Whether a reader call names no variable itself."""
-    return NAME_ARG.search(arguments) is None
+def forwarded(arguments: str, function: Function | None) -> set[str]:
+    """The enclosing function's own parameters passed straight to a reader."""
+    if function is None:
+        return set()
+    return {name for name in IDENT.findall(arguments) if name in function.parameters}
 
 
-def find_readers(files: list[tuple[pathlib.Path, str]]) -> set[str]:
-    # Only `test_*` functions join: rule 2 already fails any other forwarder.
+def find_readers(files) -> set[str]:
     readers = set(PRIMITIVES)
+    for _, _, text in files:
+        readers |= {alias for _, alias in ALIAS.findall(text)}
     while True:
-        found = {
-            name
-            for _, text in files
-            for name, start, end in functions(text)
-            if name.startswith("test_")
-            and any(forwards(arguments) for _, arguments in calls(text[start:end], readers))
-        }
+        found = set()
+        for _, _, text in files:
+            defined = functions(text)
+            for call, arguments in reader_calls(text, readers):
+                owner = innermost(defined, call.start())
+                if owner and owner.name.startswith("test_") and forwarded(arguments, owner):
+                    found.add(owner.name)
         if found <= readers:
             return readers
         readers |= found
@@ -197,22 +243,17 @@ def violations(root: pathlib.Path) -> list[str]:
     settings = documented(root)
     files = sources(root)
     readers = find_readers(files)
-    # Constant names repeat across crates (`ENV_INTERVAL_SECS` names a
-    # different variable in each eviction loop), so an unqualified name
-    # resolves in its own file before the rest of the tree.
-    everywhere: dict[str, set[str]] = {}
-    for _, text in files:
+    by_crate: dict[pathlib.Path, dict[str, set[str]]] = {}
+    for _, crate, text in files:
         for name, values in string_constants(text).items():
-            everywhere.setdefault(name, set()).update(values)
+            by_crate.setdefault(crate, {}).setdefault(name, set()).update(values)
 
     failures = []
-    for relative, text in files:
+    for relative, crate, text in files:
         local = string_constants(text)
-
-        def location(offset: int) -> str:
-            return f"{relative}:{text.count(chr(10), 0, offset) + 1}"
-
-        for call, arguments in calls(text, readers):
+        defined = functions(text)
+        for call, arguments in reader_calls(text, readers):
+            line = f"{relative}:{text.count(chr(10), 0, call.start()) + 1}"
             reader = call.group(1)
             names: set[str] = set()
             for literal, path, constant in NAME_ARG.findall(arguments):
@@ -220,35 +261,22 @@ def violations(root: pathlib.Path) -> list[str]:
                     names.add(literal)
                 elif path in ("", "Self::") and constant in local:
                     names |= local[constant]
-                else:
-                    names |= everywhere.get(constant, set())
+                elif len(values := by_crate.get(crate, {}).get(constant, set())) == 1:
+                    names |= values
             for name in sorted(names & settings):
                 failures.append(
-                    f"{location(call.start())}: {name} is documented in {DOCS} but "
-                    f"read through test hook `{reader}`, which release builds ignore; "
-                    "read it from the environment or drop it from the docs"
+                    f"{line}: {name} is documented in {DOCS} but read through test "
+                    f"hook `{reader}`, which release builds ignore; read it from the "
+                    "environment or drop it from the docs"
                 )
-            if not names:
-                owner = enclosing_function(text, call.start())
-                if owner is None or not owner.startswith("test_"):
+            owner = innermost(defined, call.start())
+            if owner and not owner.name.startswith("test_"):
+                for parameter in sorted(forwarded(arguments, owner)):
                     failures.append(
-                        f"{location(call.start())}: test hook `{reader}` is called with "
-                        f"a forwarded variable name inside `{owner or 'no function'}`; "
-                        "only a function named `test_*` may forward one, so its own "
-                        "callers stay checked"
+                        f"{line}: `{owner.name}` passes its parameter `{parameter}` to "
+                        f"test hook `{reader}`; name it `test_*` so its callers are "
+                        "checked as test-hook reads"
                     )
-
-        for use in PRIMITIVE_USE.finditer(text):
-            after = text[use.end() :].lstrip()
-            before = text[max(0, use.start() - 8) : use.start()]
-            line_start = text.rfind("\n", 0, use.start()) + 1
-            in_use = re.match(r"\s*(?:pub(?:\([^)]*\))?\s+)?use\b", text[line_start:])
-            if after.startswith(("(", "::")) or re.search(r"\bfn\s+$", before) or in_use:
-                continue
-            failures.append(
-                f"{location(use.start())}: test hook `{use.group(1)}` is used as a "
-                "value; call it with the variable name so the name stays checked"
-            )
     return failures
 
 
