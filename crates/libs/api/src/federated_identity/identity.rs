@@ -76,6 +76,23 @@ pub(crate) async fn resolve_principal(
         .map_err(ResolvePrincipalError::Reload)
 }
 
+/// Read-only lookup of the record [`materialize_owner`] would return for an
+/// owner that is already materialized. `None` when the owner's organization
+/// or subject row does not exist yet. Never writes or locks a row, so a
+/// caller can ask before deciding anything that depends on the owner.
+pub(crate) async fn find_owner_record(
+    pool: &PgPool,
+    owner: &FederatedOwner,
+) -> Result<Option<FederatedOwnerRecord>, sqlx::Error> {
+    Ok(store::find_federated_user_org(pool, owner)
+        .await?
+        .map(|(user, org)| FederatedOwnerRecord {
+            org_id: org.id,
+            user_id: user.id,
+            email: user.email,
+        }))
+}
+
 /// Atomically materialize the organization and subject. This transaction commits
 /// independently of any later sandbox creation; it never persists grant material.
 pub(crate) async fn materialize_owner(

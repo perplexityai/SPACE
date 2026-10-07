@@ -638,6 +638,14 @@ mod postgres {
 
     #[tokio::test(flavor = "current_thread")]
     async fn an_ineligible_create_never_runs_inline() -> TestDbResult<()> {
+        // The org flag alone creates plaintext; with the cluster's volume
+        // encryption opt-in on, the create is encrypted.
+        if !pplx_space_test_env::enter_test_process(&[(
+            "SPACE_BYOK_VOLUME_ENCRYPTION",
+            Some(std::ffi::OsStr::new("true")),
+        )]) {
+            return Ok(());
+        }
         let fixture = AdmissionPoolFixture::new(1).await?;
         let controller = fixture.controller();
         let script = ScriptedCreate::new(Script::Succeed);
