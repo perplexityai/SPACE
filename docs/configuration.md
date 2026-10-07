@@ -8,7 +8,9 @@ the service fail at startup when missing.
 Settings that exist only so tests can shorten a timer or flip a scenario are
 test hooks. They are read only by binaries built with the `test-hooks` Cargo
 feature (`pplx-space-common-core/test-hooks`), which the local kind image
-enables and release images never do. They are intentionally undocumented.
+enables and release images never do. They are intentionally undocumented, and
+`scripts/source_guards/env_test_hook_boundary.py` fails CI if a variable listed
+here is read through one.
 
 Secrets are passed as files: set the `*_PATH` variable to a mounted file. The
 inline forms (`SPACE_ECW_CREDENTIAL_KEY`, `SPACE_ECW_CREDENTIAL_PREVIOUS_KEY`,
