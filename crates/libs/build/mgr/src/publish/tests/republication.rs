@@ -244,7 +244,10 @@ async fn private_republication() -> TestResult {
             &template,
             hash,
             &[tag.to_owned()],
-            TemplatePublication::Tenant(TemplateOrg::new(owner)),
+            TemplatePublication::Tenant {
+                org: TemplateOrg::new(owner),
+                grant: None,
+            },
         )
         .await?;
         assert_eq!(stored_release(&db.pool).await?, before);
@@ -289,7 +292,10 @@ async fn private_republication() -> TestResult {
         &template,
         hash,
         &["denied".to_owned()],
-        TemplatePublication::Tenant(TemplateOrg::new(owner)),
+        TemplatePublication::Tenant {
+            org: TemplateOrg::new(owner),
+            grant: None,
+        },
     )
     .await
     .expect_err("unrelated permission denial must fail publication");

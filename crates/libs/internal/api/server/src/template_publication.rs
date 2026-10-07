@@ -1,7 +1,10 @@
 use super::{ClusterApiService, adapter::TemplateOrg};
 use pplx_space_common_core::{
     sql,
-    types::{OrgId, SystemPublicationGrantId, TemplateDesiredState, TemplateName},
+    types::{
+        NodeId, OrgId, SystemPublicationGrantId, TemplateDesiredState, TemplateName,
+        TenantPublicationGrantId,
+    },
 };
 use std::collections::BTreeSet;
 use tonic::Status;
@@ -53,6 +56,28 @@ impl ReservedTemplateNames {
 }
 
 impl ClusterApiService {
+    /// The registered nodes a publisher connected from. A tenant publication
+    /// grant is bound to the builder that took its build, so the caller's
+    /// transport origin, never a request field, selects the builder.
+    pub(super) async fn publisher_nodes(
+        &self,
+        remote_addr: Option<std::net::SocketAddr>,
+    ) -> Result<Vec<NodeId>, Status> {
+        use super::template_releases_store::TemplateReadScope;
+        let Some(remote_addr) = remote_addr else {
+            return Ok(Vec::new());
+        };
+        match self
+            .template_releases_store
+            .node_scope_for_address(super::normalize_ip(remote_addr.ip()))
+            .await
+            .map_err(|err| Status::internal(format!("resolve publisher nodes: {err}")))?
+        {
+            TemplateReadScope::NodeScoped { node_ids } => Ok(node_ids),
+            TemplateReadScope::Unscoped => Ok(Vec::new()),
+        }
+    }
+
     pub(super) async fn lock_template_for_publication(
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
@@ -113,4 +138,33 @@ pub(super) fn system_publication_grant(
 
 pub(super) fn missing_system_publication_grant() -> Status {
     Status::permission_denied("system template publication requires a build publication grant")
+}
+
+/// Tenant counterpart of [`system_publication_grant`]: a publisher whose
+/// tenant authority is limited to dispatched builds must name the grant the
+/// API issued for this build.
+pub(super) fn tenant_publication_grant(
+    value: Option<&str>,
+    owner: TemplateOrg,
+    requires_grant: bool,
+) -> Result<Option<TenantPublicationGrantId>, Status> {
+    match (owner, value) {
+        (TemplateOrg::System, Some(_)) => Err(Status::invalid_argument(
+            "system publication cannot carry a tenant publication grant",
+        )),
+        (_, Some(value)) => value
+            .parse()
+            .map(Some)
+            .map_err(|_| Status::invalid_argument("invalid tenant publication grant ID")),
+        (TemplateOrg::Owned { .. }, None) if requires_grant => {
+            Err(missing_tenant_publication_grant())
+        }
+        (_, None) => Ok(None),
+    }
+}
+
+pub(super) fn missing_tenant_publication_grant() -> Status {
+    Status::permission_denied(
+        "tenant template publication requires the dispatched build's publication grant",
+    )
 }

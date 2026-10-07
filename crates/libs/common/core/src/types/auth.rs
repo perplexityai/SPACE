@@ -466,6 +466,11 @@ uuid_id!(
 );
 
 uuid_id!(
+    /// Authorization for one tenant template build's publication.
+    TenantPublicationGrantId
+);
+
+uuid_id!(
     /// Identity of a persisted background job, retained across retries and recovery.
     JobId
 );

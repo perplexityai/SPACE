@@ -304,7 +304,10 @@ async fn accepted_build_pins_only_its_own_base_grant(
             child.clone(),
             None,
             without_identity,
-            Some(first),
+            BuilderPinnedGrants {
+                base: Some(first),
+                tenant_publication: None,
+            },
         )
         .await
         .unwrap();
@@ -313,7 +316,16 @@ async fn accepted_build_pins_only_its_own_base_grant(
     let (_, on_builder) = accepted_build(Some(fixture.builder_node_id));
     fixture
         .controller
-        .record_template_build_response(TEST_ORG, child.clone(), None, on_builder, Some(first))
+        .record_template_build_response(
+            TEST_ORG,
+            child.clone(),
+            None,
+            on_builder,
+            BuilderPinnedGrants {
+                base: Some(first),
+                tenant_publication: None,
+            },
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -336,7 +348,10 @@ async fn accepted_build_pins_only_its_own_base_grant(
             child.clone(),
             None,
             on_other_builder,
-            Some(second),
+            BuilderPinnedGrants {
+                base: Some(second),
+                tenant_publication: None,
+            },
         )
         .await
         .unwrap();
@@ -353,7 +368,13 @@ async fn accepted_build_pins_only_its_own_base_grant(
     let (_, from_scratch) = accepted_build(Some(other_builder));
     fixture
         .controller
-        .record_template_build_response(TEST_ORG, child.clone(), None, from_scratch, None)
+        .record_template_build_response(
+            TEST_ORG,
+            child.clone(),
+            None,
+            from_scratch,
+            BuilderPinnedGrants::default(),
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -471,7 +492,13 @@ async fn accepted_build_without_builder_identity_records_unpinned_routing(
 
     let actual = fixture
         .controller
-        .record_template_build_response(TEST_ORG, template_name.clone(), None, response, None)
+        .record_template_build_response(
+            TEST_ORG,
+            template_name.clone(),
+            None,
+            response,
+            BuilderPinnedGrants::default(),
+        )
         .await
         .expect("an old Node API response should preserve the accepted build");
     let job = fixture
@@ -497,7 +524,13 @@ async fn accepted_build_with_builder_identity_records_routing(
 
     let actual = fixture
         .controller
-        .record_template_build_response(TEST_ORG, template_name.clone(), None, response, None)
+        .record_template_build_response(
+            TEST_ORG,
+            template_name.clone(),
+            None,
+            response,
+            BuilderPinnedGrants::default(),
+        )
         .await
         .unwrap();
     let job = fixture
@@ -529,7 +562,7 @@ async fn accepted_e2b_build_records_client_build_mapping(
             template_name.clone(),
             Some(&client_build_id),
             response,
-            None,
+            BuilderPinnedGrants::default(),
         )
         .await?;
     let job = fixture
@@ -553,7 +586,13 @@ async fn accepted_build_with_invalid_builder_identity_is_rejected(
 
     let actual = fixture
         .controller
-        .record_template_build_response(TEST_ORG, template_name.clone(), None, response, None)
+        .record_template_build_response(
+            TEST_ORG,
+            template_name.clone(),
+            None,
+            response,
+            BuilderPinnedGrants::default(),
+        )
         .await
         .unwrap_err();
     let job = fixture
@@ -658,10 +697,10 @@ fn template_build_status_not_found_is_not_transient() {
     );
 }
 
-/// A system build records its publication grant before dispatch and withdraws
+/// Every build records its publication grant before dispatch and withdraws
 /// it when dispatch fails, so a submission that never reached a builder
-/// authorizes no publication; an organization build records none. Recording
-/// sweeps stale grants, which is how this test observes that it happened.
+/// authorizes no publication. Recording sweeps stale grants, which is how
+/// this test observes that it happened.
 #[tokio::test]
 async fn system_build_withdraws_its_publication_grant_when_dispatch_fails() -> TestDbResult<()> {
     let db = pg_test_db().await?;
@@ -693,14 +732,44 @@ async fn system_build_withdraws_its_publication_grant_when_dispatch_fails() -> T
         org_id: TEST_ORG,
     };
 
+    let tenant_grants = || {
+        sqlx::query_scalar::<_, i64>(sql!(
+            "SELECT COUNT(*) FROM template_tenant_publication_grants"
+        ))
+        .fetch_one(&db.pool)
+    };
     insert_stale_grant().await?;
+    sqlx::query(sql!(
+        "INSERT INTO organizations (id, slug, name) VALUES ($1, 'grant-test', 'grant-test')
+         ON CONFLICT (id) DO NOTHING"
+    ))
+    .bind(TEST_ORG.as_uuid())
+    .execute(&db.pool)
+    .await?;
+    sqlx::query(sql!(
+        "INSERT INTO template_tenant_publication_grants (id, template_name, org_id, granted_at)
+         VALUES ($1, 'tenant-output', $2, NOW() - INTERVAL '8 days')"
+    ))
+    .bind(Uuid::now_v7())
+    .bind(TEST_ORG.as_uuid())
+    .execute(&db.pool)
+    .await?;
     controller
         .submit_template_build(submission(TemplateBuildTarget::Organization(
             TemplateName::parse("tenant-output").unwrap(),
         )))
         .await
         .expect_err("no builder node is registered");
-    assert_eq!(grants().await?, 1, "an organization build records no grant");
+    assert_eq!(
+        grants().await?,
+        1,
+        "an organization build records no system grant"
+    );
+    assert_eq!(
+        tenant_grants().await?,
+        0,
+        "the organization build swept the stale grant and withdrew its own"
+    );
 
     controller
         .submit_template_build(submission(TemplateBuildTarget::System(

@@ -7,7 +7,7 @@ use pplx_space_build_mgr_client::proto::{
 };
 use pplx_space_common_core::types::{
     BuildRunId, NodeId, OrgId, SystemPublicationGrantId, SystemTemplate, TemplateName,
-    TemplateReference,
+    TemplateReference, TenantPublicationGrantId,
 };
 use pplx_space_node_api_client::proto::BuildTemplateResponse;
 use pplx_space_template_mgr_client::proto::{
@@ -21,7 +21,9 @@ use super::{
     substrate::{Substrate, SubstrateAdapter},
 };
 use crate::models::{ClusterPoolConfigRequest, ClusterPoolConfigResponse};
-use crate::template_build_jobs_store::{TemplateBuildJobsStore, TemplateBuildJobsStoreError};
+use crate::template_build_jobs_store::{
+    BuilderPinnedGrants, TemplateBuildJobsStore, TemplateBuildJobsStoreError,
+};
 
 /// The build-jobs store's errors at the controller boundary.
 ///
@@ -152,12 +154,14 @@ impl TemplateBuildSubmission {
         Ok(None)
     }
 
-    fn into_start_build_request(
-        self,
-        grant: Option<SystemPublicationGrantId>,
-    ) -> StartBuildRequest {
+    fn into_start_build_request(self, grant: Option<PublicationGrant>) -> StartBuildRequest {
         StartBuildRequest {
-            system_publication_grant_id: grant.map(|grant| grant.to_string()),
+            system_publication_grant_id: grant
+                .and_then(PublicationGrant::system)
+                .map(|grant| grant.to_string()),
+            tenant_publication_grant_id: grant
+                .and_then(PublicationGrant::tenant)
+                .map(|grant| grant.to_string()),
             recipe: Some(self.recipe),
             template_id: self.target.template_name().to_string(),
             options: Some(BuildOptions {
@@ -169,6 +173,30 @@ impl TemplateBuildSubmission {
                 TemplateBuildTarget::Organization(_) => Some(self.org_id.to_string()),
                 TemplateBuildTarget::System(_) => None,
             },
+        }
+    }
+}
+
+/// The authorization one submission carries for publishing its output,
+/// recorded before dispatch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PublicationGrant {
+    System(SystemPublicationGrantId),
+    Tenant(TenantPublicationGrantId),
+}
+
+impl PublicationGrant {
+    const fn system(self) -> Option<SystemPublicationGrantId> {
+        match self {
+            Self::System(grant) => Some(grant),
+            Self::Tenant(_) => None,
+        }
+    }
+
+    const fn tenant(self) -> Option<TenantPublicationGrantId> {
+        match self {
+            Self::System(_) => None,
+            Self::Tenant(grant) => Some(grant),
         }
     }
 }
@@ -303,11 +331,13 @@ impl TemplateController {
             ),
             None => None,
         };
-        // A system build's output is published by build-manager, which
-        // ClusterApi accepts only under this grant; it lands before dispatch
-        // for the same reason as the base grant.
-        let system_publication_grant = match &submission.target {
-            TemplateBuildTarget::System(_) => Some(
+        // Build-manager publishes the output, which ClusterApi accepts only
+        // under this submission's grant: for a system build, the system
+        // grant; for an organization's build, a grant naming the target and
+        // the organization authorized above. It lands before dispatch for the
+        // same reason as the base grant.
+        let publication_grant = match &submission.target {
+            TemplateBuildTarget::System(_) => PublicationGrant::System(
                 self.build_jobs
                     .record_system_publication_grant(&template_name)
                     .await
@@ -315,12 +345,19 @@ impl TemplateController {
                         build_jobs_store_error("failed to record system publication grant", error)
                     })?,
             ),
-            TemplateBuildTarget::Organization(_) => None,
+            TemplateBuildTarget::Organization(_) => PublicationGrant::Tenant(
+                self.build_jobs
+                    .record_tenant_publication_grant(org_id, &template_name)
+                    .await
+                    .map_err(|error| {
+                        build_jobs_store_error("failed to record tenant publication grant", error)
+                    })?,
+            ),
         };
         let client_build_id = submission.client_build_id.clone();
         let response = match self
             .start_template_build_request(
-                submission.into_start_build_request(system_publication_grant),
+                submission.into_start_build_request(Some(publication_grant)),
             )
             .await
         {
@@ -329,14 +366,19 @@ impl TemplateController {
                 // An undispatched submission authorizes no publication. If an
                 // ambiguous failure did start the build, its publication is
                 // denied and the build must be resubmitted.
-                if let Some(grant) = system_publication_grant
-                    && let Err(revoke_error) =
+                let revoked = match publication_grant {
+                    PublicationGrant::System(grant) => {
                         self.build_jobs.revoke_system_publication_grant(grant).await
-                {
+                    }
+                    PublicationGrant::Tenant(grant) => {
+                        self.build_jobs.revoke_tenant_publication_grant(grant).await
+                    }
+                };
+                if let Err(revoke_error) = revoked {
                     tracing::warn!(
                         error = %revoke_error,
                         %template_name,
-                        "failed to withdraw an undispatched system publication grant; it expires on its own"
+                        "failed to withdraw an undispatched publication grant; it expires on its own"
                     );
                 }
                 return Err(error);
@@ -347,7 +389,10 @@ impl TemplateController {
             template_name,
             client_build_id.as_deref(),
             response,
-            base_grant,
+            BuilderPinnedGrants {
+                base: base_grant,
+                tenant_publication: publication_grant.tenant(),
+            },
         )
         .await
     }
@@ -358,7 +403,7 @@ impl TemplateController {
         template_name: TemplateName,
         client_build_id: Option<&str>,
         response: BuildTemplateResponse,
-        base_grant: Option<crate::template_build_jobs_store::BuildBaseGrantId>,
+        grants: BuilderPinnedGrants,
     ) -> Result<StartBuildResponse, ControllerError> {
         let job_id = response.job_id.parse::<BuildRunId>().map_err(|error| {
             ControllerError::internal(format!("builder returned an invalid build job ID: {error}"))
@@ -390,7 +435,7 @@ impl TemplateController {
                 client_build_id,
                 job_id,
                 builder_node_id,
-                base_grant,
+                grants,
             )
             .await
             // Not classified, deliberately: build-manager has already

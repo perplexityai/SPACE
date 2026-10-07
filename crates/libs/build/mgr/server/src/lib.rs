@@ -10,7 +10,8 @@ use prost::Message;
 
 use pplx_space_build_mgr::{
     BuildError, BuildOutcome, BuildPhase, PublishError, SystemPublicationGrantId,
-    TemplateBuildErrorKind, TemplateBuilder, TemplateOrg, TemplatePublication, blob, publish_build,
+    TemplateBuildErrorKind, TemplateBuilder, TemplateOrg, TemplatePublication,
+    TenantPublicationGrantId, blob, publish_build,
     recipe::{CopyPayload, Recipe, Step},
     register_build_template,
 };
@@ -392,7 +393,10 @@ impl JobExecutor for BuildExecutor {
         let publish_tags = payload.publish_tags.clone();
         let template_org = payload.template_org;
         let publication = match template_org {
-            Some(org) => TemplatePublication::Tenant(org),
+            Some(org) => TemplatePublication::Tenant {
+                org,
+                grant: payload.tenant_publication_grant_id,
+            },
             None => TemplatePublication::System(payload.system_publication_grant_id),
         };
         let build_span = tracing::info_span!(
@@ -775,6 +779,7 @@ impl BuildManager for BuildManagerDaemonService {
         )?;
         let StartBuildRequest {
             system_publication_grant_id,
+            tenant_publication_grant_id,
             recipe,
             template_id,
             options,
@@ -805,6 +810,16 @@ impl BuildManager for BuildManagerDaemonService {
                 "tenant builds cannot carry a system publication grant",
             ));
         }
+        let tenant_publication_grant_id = tenant_publication_grant_id
+            .as_deref()
+            .map(str::parse::<TenantPublicationGrantId>)
+            .transpose()
+            .map_err(|_| Status::invalid_argument("invalid tenant publication grant ID"))?;
+        if template_org.is_none() && tenant_publication_grant_id.is_some() {
+            return Err(Status::invalid_argument(
+                "system builds cannot carry a tenant publication grant",
+            ));
+        }
         if template_id.is_empty() {
             return Err(Status::invalid_argument("template_id is required"));
         }
@@ -827,6 +842,7 @@ impl BuildManager for BuildManagerDaemonService {
             publish_tags: options.publish_tags,
             template_org,
             system_publication_grant_id,
+            tenant_publication_grant_id,
         };
         // Every submission gets its own job (no dedup key); the worker's
         // serialized-subjects lease claim queues same-template jobs FIFO

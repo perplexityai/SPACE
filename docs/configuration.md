@@ -160,7 +160,7 @@ Prefetch requires the catalog to confirm generic-only release resolution from th
 | `SPACE_TEMPLATE_CACHE_BUDGET_BYTES` | 100 GiB | 0 or an invalid value disables cache GC. |
 | `SPACE_TEMPLATE_BUILD_DISK_MIB` | build-manager default | JSON. |
 | `SPACE_TRUSTED_TEMPLATE_STORAGE_BUCKETS` | empty = any bucket | |
-| `SPACE_TEMPLATE_PUBLISH_SYSTEM_SERVICE_ACCOUNTS`, `SPACE_TEMPLATE_PUBLISH_TENANT_SERVICE_ACCOUNTS` | empty | Startup error when the allowed set is empty. An account in both lists (build-manager) must present the grant issued for that system build by the API or a system-only operator; each grant authorizes one release. |
+| `SPACE_TEMPLATE_PUBLISH_SYSTEM_SERVICE_ACCOUNTS`, `SPACE_TEMPLATE_PUBLISH_TENANT_SERVICE_ACCOUNTS` | empty | Startup error when the allowed set is empty. An account in both lists (build-manager) must present the grant issued for that system build by the API or a system-only operator; each grant authorizes one release. A tenant-list account must likewise present the grant the API issued before dispatching that organization's build of that template, from the builder node the grant is bound to; it authorizes one release. |
 | `SPACE_BUILD_AUTH_SYSTEM_SERVICE_ACCOUNTS`, `SPACE_BUILD_AUTH_TENANT_SERVICE_ACCOUNTS` | empty | |
 | `SPACE_BUILD_MANAGER_ENDPOINT` | `127.0.0.1:9900` | |
 | `SPACE_BUILD_MANAGER_TLS_SERVER_NAME` | from endpoint | |
@@ -194,6 +194,24 @@ jobs that could not be drained: jobs without a grant cannot publish through a
 dual-authority account after the rollout. System-only deployment publishers
 retain their existing publication authority.
 
+Tenant builds follow the same pattern. Before dispatching an organization's
+build, the API records a tenant publication grant naming the target template
+and that organization, and sends it with `StartBuild`; it withdraws the grant if
+dispatch fails and pins it to the accepting builder node from the response.
+Build-manager forwards the grant to template and release registration.
+ClusterApi accepts a tenant-list account's publication only with a grant that
+names the requested template and organization and that covers the builder node
+registered at the caller's address: any registered builder for one hour while
+unpinned, then only the pinned builder for seven days. Release registration
+consumes the grant in its transaction. Direct `space-buildmgr build --org-id`
+submissions carry no grant, so their builds cannot publish to a cluster through
+a tenant-list account; submit organization builds through the API.
+
+Roll tenant grant enforcement out in the same order: apply the grant-table
+migration and role bootstrap, upgrade build-manager and the node-api gateway,
+then upgrade the API and ClusterApi. Resubmit organization builds that were
+queued before the rollout; they carry no grant and cannot publish afterwards.
+
 ### Template balloon device
 
 A template can opt its sandboxes into a Firecracker
@@ -226,6 +244,7 @@ Hint mode also needs `balloon_hint_timeout_ms` (at most 30000) in the node's
 free-page hinting then runs one hinting pass bounded by this time; timeouts and
 errors are logged and the snapshot proceeds. Unset, suspend makes no balloon
 calls.
+
 
 ## Object storage and snapshots
 

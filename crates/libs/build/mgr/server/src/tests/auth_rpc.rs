@@ -314,7 +314,7 @@ async fn run_authenticated_rpc(fixture: AuthenticatedRpc) -> TestResult {
                 let expected_owner = owner.map(TemplateOrg::parse).transpose()?;
                 let expected_publication = expected_owner.map_or(
                     TemplatePublication::System(proof.map(str::parse).transpose()?),
-                    TemplatePublication::Tenant,
+                    |org| TemplatePublication::Tenant { org, grant: None },
                 );
                 assert_eq!(
                     job.payload_as::<BuildJobPayload>()?.template_org,

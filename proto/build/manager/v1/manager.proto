@@ -25,6 +25,9 @@ message StartBuildRequest {
   optional string org_id = 7;
   // Authorization issued before dispatch, retained through publication.
   optional string system_publication_grant_id = 8;
+  // Authorization issued before dispatch for publishing `org_id`'s output,
+  // retained through publication. Carried only with `org_id`.
+  optional string tenant_publication_grant_id = 9;
 }
 
 message BuildOptions {

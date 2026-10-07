@@ -8,8 +8,8 @@ use pplx_space_common_core::host::linux::paths::template_build_dir;
 use pplx_space_common_core::types::{
     AuthIdParseError, ContentHash, OrgId, RUNTIME_FIRECRACKER_ALIAS, StorageUri,
     SystemPublicationGrantId, TEMPLATE_ROOTFS_ZSTD_CODEC, TEMPLATE_ROOTFS_ZSTD_FILE,
-    TEMPLATE_ROOTFS_ZSTD_LEVEL, TemplateArtifact, TemplateName, template_object_key,
-    template_object_prefix,
+    TEMPLATE_ROOTFS_ZSTD_LEVEL, TemplateArtifact, TemplateName, TenantPublicationGrantId,
+    template_object_key, template_object_prefix,
 };
 use pplx_space_common_svc::page_cache;
 use pplx_space_node_api_client::cluster::{
@@ -53,25 +53,36 @@ impl TemplateOrg {
     }
 }
 
-/// The ownership or specific system authorization persisted with a build.
+/// The ownership and the specific publication authorization persisted with
+/// a build.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TemplatePublication {
-    Tenant(TemplateOrg),
+    Tenant {
+        org: TemplateOrg,
+        grant: Option<TenantPublicationGrantId>,
+    },
     System(Option<SystemPublicationGrantId>),
 }
 
 impl TemplatePublication {
     pub const fn org(self) -> Option<TemplateOrg> {
         match self {
-            Self::Tenant(org) => Some(org),
+            Self::Tenant { org, .. } => Some(org),
             Self::System(_) => None,
         }
     }
 
     pub const fn system_grant(self) -> Option<SystemPublicationGrantId> {
         match self {
-            Self::Tenant(_) => None,
+            Self::Tenant { .. } => None,
             Self::System(grant) => grant,
+        }
+    }
+
+    pub const fn tenant_grant(self) -> Option<TenantPublicationGrantId> {
+        match self {
+            Self::Tenant { grant, .. } => grant,
+            Self::System(_) => None,
         }
     }
 }
@@ -626,6 +637,7 @@ fn template_registration_request(
 ) -> RegisterTemplateRequest {
     RegisterTemplateRequest {
         system_publication_grant_id: publication.system_grant().map(|grant| grant.to_string()),
+        tenant_publication_grant_id: publication.tenant_grant().map(|grant| grant.to_string()),
         name: template.as_str().to_string(),
         description: None,
         org_id: publication.org().map(|owner| owner.org_id().to_string()),
@@ -664,6 +676,7 @@ fn release_registration_request(
 ) -> RegisterTemplateReleaseRequest {
     RegisterTemplateReleaseRequest {
         system_publication_grant_id: publication.system_grant().map(|grant| grant.to_string()),
+        tenant_publication_grant_id: publication.tenant_grant().map(|grant| grant.to_string()),
         template_name: template.as_str().to_string(),
         runtime: RUNTIME_FIRECRACKER_ALIAS.to_string(),
         hash: content_hash.to_string(),

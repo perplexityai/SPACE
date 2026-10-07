@@ -302,6 +302,8 @@ message RegisterTemplateRequest {
   optional string org_id = 4;
   // One build submission's system publication authorization.
   optional string system_publication_grant_id = 5;
+  // One build submission's tenant publication authorization, for `org_id`.
+  optional string tenant_publication_grant_id = 6;
 }
 
 message RegisterTemplateResponse {
@@ -329,6 +331,8 @@ message RegisterTemplateReleaseRequest {
   optional space.execution.v1.ExecutionMetadata execution = 8;
   // Consumed atomically with the release; never substitutes another build's grant.
   optional string system_publication_grant_id = 9;
+  // Tenant counterpart of `system_publication_grant_id`, for `org_id`.
+  optional string tenant_publication_grant_id = 10;
 }
 
 message RegisterTemplateReleaseResponse {

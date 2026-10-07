@@ -659,6 +659,7 @@ async fn register(
     match cluster_api
         .register_template(RegisterTemplateRequest {
             system_publication_grant_id: None,
+            tenant_publication_grant_id: None,
             name: pin.template.as_str().to_string(),
             description: None,
             org_id: None,
@@ -685,6 +686,7 @@ async fn register(
     cluster_api
         .register_template_release(RegisterTemplateReleaseRequest {
             system_publication_grant_id: None,
+            tenant_publication_grant_id: None,
             template_name: pin.template.as_str().to_string(),
             runtime: RUNTIME_FIRECRACKER_ALIAS.to_string(),
             hash: pin.content_hash.to_string(),

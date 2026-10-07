@@ -112,8 +112,27 @@ async fn native_build_fixture() -> TestResult<NativeBuildFixture> {
                     .await
                     .unwrap();
                     assert_eq!(target, request.template_id);
+                    assert!(request.tenant_publication_grant_id.is_none());
                 } else {
                     assert!(request.system_publication_grant_id.is_none());
+                    let grant = request
+                        .tenant_publication_grant_id
+                        .as_deref()
+                        .expect("organization build carries its pre-dispatch grant")
+                        .parse::<Uuid>()
+                        .unwrap();
+                    let (target, owner, pinned): (String, Uuid, Option<Uuid>) =
+                        sqlx::query_as(sql!(
+                            "SELECT template_name, org_id, builder_node_id
+                             FROM template_tenant_publication_grants WHERE id = $1"
+                        ))
+                        .bind(grant)
+                        .fetch_one(&grant_pool)
+                        .await
+                        .unwrap();
+                    assert_eq!(target, request.template_id);
+                    assert_eq!(Some(owner.to_string()), request.org_id);
+                    assert_eq!(pinned, None, "the accepting builder is not known yet");
                 }
                 sender.send(request).await.unwrap();
                 let response = BuildTemplateResponse {
@@ -388,6 +407,11 @@ async fn native_build_session_ownership(
     .await?;
     if expected_status == StatusCode::ACCEPTED {
         let request = build.expect("accepted build must reach the builder");
+        let request_tenant_grant = request
+            .tenant_publication_grant_id
+            .as_deref()
+            .map(str::parse::<Uuid>)
+            .transpose()?;
         assert_eq!(
             request.org_id,
             system.is_none().then(|| user_org.to_string())
@@ -426,6 +450,23 @@ async fn native_build_session_ownership(
                     assert_eq!(base.base, format!("seed@{seed_hash}"));
                 }
             }
+        }
+        if system.is_none() {
+            let grant = request_tenant_grant.expect("organization build grant");
+            let pinned: Option<Uuid> = sqlx::query_scalar(sql!(
+                "SELECT g.builder_node_id
+                 FROM template_tenant_publication_grants g
+                 JOIN nodes n ON n.id = g.builder_node_id
+                 WHERE g.id = $1 AND n.role = 'builder'"
+            ))
+            .bind(grant)
+            .fetch_optional(&fixture.db.pool)
+            .await?
+            .flatten();
+            assert!(
+                pinned.is_some(),
+                "an accepted build's publication grant is pinned to its builder"
+            );
         }
         assert_eq!(jobs, vec![(Some(user_org), fixture.job_id.to_string())]);
         let response: serde_json::Value = serde_json::from_slice(&body)?;

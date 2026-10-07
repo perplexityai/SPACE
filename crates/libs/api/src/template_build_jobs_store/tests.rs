@@ -65,7 +65,7 @@ async fn records_e2b_build_on_the_pending_job(
             Some(&client_build_id),
             daemon_job_id,
             Some(fixture.builder_nodes[0]),
-            None,
+            BuilderPinnedGrants::default(),
         )
         .await?;
     let job = fixture
@@ -101,7 +101,7 @@ async fn records_admin_build_with_the_daemon_job_id_as_its_build_id(
             None,
             daemon_job_id,
             Some(fixture.builder_nodes[0]),
-            None,
+            BuilderPinnedGrants::default(),
         )
         .await?;
     let job = fixture
@@ -130,7 +130,7 @@ async fn recording_unknown_builder_node_is_atomic(
             None,
             daemon_job_id,
             Some(NodeId::new()),
-            None,
+            BuilderPinnedGrants::default(),
         )
         .await
         .unwrap_err();
@@ -164,7 +164,7 @@ async fn deleting_builder_node_keeps_job_for_unpinned_fallback(
             None,
             daemon_job_id,
             Some(fixture.builder_nodes[0]),
-            None,
+            BuilderPinnedGrants::default(),
         )
         .await?;
 
@@ -209,11 +209,25 @@ async fn job_writes_preserve_owner_and_legacy_nulls(
         .await;
     fixture
         .store
-        .record_accepted_build(TEST_ORG, &name, Some("owned"), job, None, None)
+        .record_accepted_build(
+            TEST_ORG,
+            &name,
+            Some("owned"),
+            job,
+            None,
+            BuilderPinnedGrants::default(),
+        )
         .await?;
     fixture
         .store
-        .record_accepted_build(TEST_ORG, &name, Some("legacy"), job, None, None)
+        .record_accepted_build(
+            TEST_ORG,
+            &name,
+            Some("legacy"),
+            job,
+            None,
+            BuilderPinnedGrants::default(),
+        )
         .await?;
 
     assert!(matches!(
@@ -445,5 +459,86 @@ async fn system_publication_grants_are_per_submission_and_swept_when_stale(
             .fetch_all(pool)
             .await?;
     assert_eq!(remaining, vec![second.as_uuid()]);
+    Ok(())
+}
+
+/// Each organization build submission records a grant of its own for its
+/// target and organization, stale grants are swept on the way, accepting one
+/// build pins only that build's grant to its builder, and withdrawing one
+/// submission's grant leaves the others alone.
+#[rstest]
+#[tokio::test]
+async fn tenant_publication_grants_are_per_submission_and_pinned_to_their_builder(
+    #[future] store_fixture: TestDbResult<StoreFixture>,
+) -> TestDbResult<()> {
+    let fixture = store_fixture.await?;
+    let pool = &fixture.db.pool;
+    let name = template_name();
+    sqlx::query(sql!(
+        "INSERT INTO organizations (id, name, slug) VALUES ($1, 'grant-org', 'grant-org')
+         ON CONFLICT (id) DO NOTHING"
+    ))
+    .bind(TEST_ORG.as_uuid())
+    .execute(pool)
+    .await?;
+    sqlx::query(sql!(
+        "INSERT INTO template_tenant_publication_grants (id, template_name, org_id, granted_at)
+         VALUES ($1, $2, $3, NOW() - INTERVAL '8 days')"
+    ))
+    .bind(uuid::Uuid::now_v7())
+    .bind(name.as_str())
+    .bind(TEST_ORG.as_uuid())
+    .execute(pool)
+    .await?;
+
+    let first = fixture
+        .store
+        .record_tenant_publication_grant(TEST_ORG, &name)
+        .await?;
+    let second = fixture
+        .store
+        .record_tenant_publication_grant(TEST_ORG, &name)
+        .await?;
+    let withdrawn = fixture
+        .store
+        .record_tenant_publication_grant(TEST_ORG, &name)
+        .await?;
+    fixture
+        .store
+        .revoke_tenant_publication_grant(withdrawn)
+        .await?;
+    fixture
+        .store
+        .record_accepted_build(
+            TEST_ORG,
+            &name,
+            None,
+            BuildRunId::new(),
+            Some(fixture.builder_nodes[1]),
+            BuilderPinnedGrants {
+                base: None,
+                tenant_publication: Some(second),
+            },
+        )
+        .await?;
+    let grants: Vec<(uuid::Uuid, String, uuid::Uuid, Option<uuid::Uuid>)> = sqlx::query_as(sql!(
+        "SELECT id, template_name, org_id, builder_node_id
+             FROM template_tenant_publication_grants
+             ORDER BY id"
+    ))
+    .fetch_all(pool)
+    .await?;
+    assert_eq!(
+        grants,
+        vec![
+            (first.as_uuid(), name.to_string(), TEST_ORG.as_uuid(), None),
+            (
+                second.as_uuid(),
+                name.to_string(),
+                TEST_ORG.as_uuid(),
+                Some(fixture.builder_nodes[1].as_uuid())
+            ),
+        ]
+    );
     Ok(())
 }

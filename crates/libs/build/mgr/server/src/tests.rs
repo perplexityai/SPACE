@@ -454,6 +454,7 @@ fn start_build_request(
 ) -> StartBuildRequest {
     StartBuildRequest {
         system_publication_grant_id: None,
+        tenant_publication_grant_id: None,
         recipe,
         template_id: template_id.to_string(),
         options: Some(BuildOptions {
@@ -478,6 +479,7 @@ fn build_job_payload(template_id: &str) -> BuildJobPayload {
         publish_tags: vec![],
         template_org: None,
         system_publication_grant_id: None,
+        tenant_publication_grant_id: None,
     }
 }
 
@@ -598,7 +600,10 @@ async fn build_publish_carries_publication_authority() -> TestResult {
     let org = TemplateOrg::parse("018f0000-0000-7000-8000-000000000002")?;
     let grant = SystemPublicationGrantId::new();
     for publication in [
-        TemplatePublication::Tenant(org),
+        TemplatePublication::Tenant {
+            org,
+            grant: Some(TenantPublicationGrantId::new()),
+        },
         TemplatePublication::System(Some(grant)),
     ] {
         let hash = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
@@ -613,6 +618,7 @@ async fn build_publish_carries_publication_authority() -> TestResult {
         );
         request.org_id = publication.org().map(|org| org.org_id().to_string());
         request.system_publication_grant_id = publication.system_grant().map(|id| id.to_string());
+        request.tenant_publication_grant_id = publication.tenant_grant().map(|id| id.to_string());
         let response = service
             .start_build(authorized_request(request))
             .await?

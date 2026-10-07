@@ -1,6 +1,6 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use pplx_space_build_mgr::{SystemPublicationGrantId, TemplateOrg};
+use pplx_space_build_mgr::{SystemPublicationGrantId, TemplateOrg, TenantPublicationGrantId};
 use pplx_space_build_mgr_client::proto::BuildState;
 use pplx_space_metrics::template::TemplateBuildResult;
 use rusqlite::{Connection, OptionalExtension, params};
@@ -30,6 +30,10 @@ pub struct BuildJobPayload {
     pub template_org: Option<TemplateOrg>,
     #[serde(default)]
     pub system_publication_grant_id: Option<SystemPublicationGrantId>,
+    /// Absent for jobs queued before tenant grants existed; ClusterApi then
+    /// refuses their tenant publication.
+    #[serde(default)]
+    pub tenant_publication_grant_id: Option<TenantPublicationGrantId>,
 }
 
 #[derive(Clone, Debug)]

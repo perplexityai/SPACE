@@ -4,6 +4,7 @@ use pplx_space_common_core::{
     sql,
     types::{
         BuildRunId, BuildRunIdParseError, NodeId, OrgId, SystemPublicationGrantId, TemplateName,
+        TenantPublicationGrantId,
     },
 };
 use sqlx::PgPool;
@@ -27,6 +28,14 @@ impl BuildBaseGrantId {
     pub(crate) const fn as_uuid(self) -> uuid::Uuid {
         self.0
     }
+}
+
+/// The pre-dispatch grants of one build submission that are pinned to the
+/// builder that accepts it.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct BuilderPinnedGrants {
+    pub base: Option<BuildBaseGrantId>,
+    pub tenant_publication: Option<TenantPublicationGrantId>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -84,7 +93,7 @@ impl TemplateBuildJobsStore {
         client_build_id: Option<&str>,
         daemon_job_id: BuildRunId,
         builder_node_id: Option<NodeId>,
-        base_grant: Option<BuildBaseGrantId>,
+        grants: BuilderPinnedGrants,
     ) -> Result<(), TemplateBuildJobsStoreError> {
         if !template_build_owner_matches(&self.pool, template_name, org_id).await? {
             return Err(TemplateBuildJobsStoreError::OwnershipConflict);
@@ -117,8 +126,15 @@ impl TemplateBuildJobsStore {
         if result.rows_affected() == 0 {
             return Err(TemplateBuildJobsStoreError::OwnershipConflict);
         }
-        if let (Some(base_grant), Some(builder_node_id)) = (base_grant, builder_node_id) {
+        let Some(builder_node_id) = builder_node_id else {
+            return Ok(());
+        };
+        if let Some(base_grant) = grants.base {
             self.pin_base_grant(base_grant, builder_node_id).await?;
+        }
+        if let Some(publication_grant) = grants.tenant_publication {
+            self.pin_tenant_publication_grant(publication_grant, builder_node_id)
+                .await?;
         }
         Ok(())
     }
@@ -201,6 +217,76 @@ impl TemplateBuildJobsStore {
             "DELETE FROM template_system_publication_grants WHERE id = $1"
         ))
         .bind(grant.as_uuid())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Record, before `StartBuild` is dispatched, that this submission may
+    /// publish `template_name` for `org_id`.
+    ///
+    /// Build-manager's publisher identity can assert any organization, so
+    /// ClusterApi accepts its tenant publication only under such a grant, from
+    /// the builder the grant is bound to, and the release registration
+    /// consumes it. The grant has to exist before dispatch because the build
+    /// may publish before the API records the response;
+    /// [`Self::record_accepted_build`] then pins it to the accepting builder.
+    /// Rows older than the longest validity ClusterApi honours are swept
+    /// here, since nothing else observes a build's end.
+    pub(crate) async fn record_tenant_publication_grant(
+        &self,
+        org_id: OrgId,
+        template_name: &TemplateName,
+    ) -> Result<TenantPublicationGrantId, TemplateBuildJobsStoreError> {
+        sqlx::query(sql!(
+            "DELETE FROM template_tenant_publication_grants
+             WHERE granted_at < NOW() - INTERVAL '7 days'"
+        ))
+        .execute(&self.pool)
+        .await?;
+        let grant = TenantPublicationGrantId::new();
+        sqlx::query(sql!(
+            "INSERT INTO template_tenant_publication_grants (id, template_name, org_id)
+             VALUES ($1, $2, $3)"
+        ))
+        .bind(grant.as_uuid())
+        .bind(template_name.as_str())
+        .bind(org_id.as_uuid())
+        .execute(&self.pool)
+        .await?;
+        Ok(grant)
+    }
+
+    /// Withdraw the grant of a submission that was never dispatched. Other
+    /// submissions' grants are untouched.
+    pub(crate) async fn revoke_tenant_publication_grant(
+        &self,
+        grant: TenantPublicationGrantId,
+    ) -> Result<(), TemplateBuildJobsStoreError> {
+        sqlx::query(sql!(
+            "DELETE FROM template_tenant_publication_grants WHERE id = $1"
+        ))
+        .bind(grant.as_uuid())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Pin one submission's publication grant to the builder that accepted
+    /// it, with the same lifetime as its base grant's pin. Other submissions'
+    /// grants are untouched.
+    async fn pin_tenant_publication_grant(
+        &self,
+        grant: TenantPublicationGrantId,
+        builder_node_id: NodeId,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(sql!(
+            "UPDATE template_tenant_publication_grants
+             SET builder_node_id = $2
+             WHERE id = $1"
+        ))
+        .bind(grant.as_uuid())
+        .bind(builder_node_id.as_uuid())
         .execute(&self.pool)
         .await?;
         Ok(())

@@ -8,7 +8,10 @@ use k8s_openapi::api::authentication::v1::{TokenReview, TokenReviewSpec};
 use kube::api::PostParams;
 use tonic::Status;
 
-use super::{BuildAuthError, BuildAuthenticatedCaller, BuildSurface, SystemTemplateAuthority};
+use super::{
+    BuildAuthError, BuildAuthenticatedCaller, BuildSurface, SystemTemplateAuthority,
+    TenantTemplateAuthority,
+};
 use crate::auth::{is_jwt_shaped, k8s::K8sTokenAuthConfig};
 
 pub(super) struct BuildTokenReviewer {
@@ -27,6 +30,10 @@ pub(super) struct BuildPolicy {
     /// issued build grant.
     granted_system: BTreeSet<String>,
     tenant: BTreeSet<String>,
+    /// Whether tenant authority on this surface is limited to dispatched
+    /// builds' grants. Publication asserts ownership of an output; build
+    /// submission asserts the requester the gateway resolved.
+    tenant_requires_grant: bool,
 }
 
 impl BuildPolicy {
@@ -50,6 +57,7 @@ impl BuildPolicy {
             system: system.difference(&granted_system).cloned().collect(),
             granted_system,
             tenant,
+            tenant_requires_grant: matches!(surface, BuildSurface::Publication),
         }
     }
 }
@@ -208,10 +216,14 @@ impl BuildTokenReviewer {
         } else {
             SystemTemplateAuthority::Denied
         };
-        Ok(BuildAuthenticatedCaller {
-            can_assert_org: policy.tenant.contains(&username),
-            system,
-        })
+        let tenant = if !policy.tenant.contains(&username) {
+            TenantTemplateAuthority::Denied
+        } else if policy.tenant_requires_grant {
+            TenantTemplateAuthority::Granted
+        } else {
+            TenantTemplateAuthority::Unconditional
+        };
+        Ok(BuildAuthenticatedCaller { tenant, system })
     }
 }
 

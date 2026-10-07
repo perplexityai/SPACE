@@ -106,6 +106,9 @@ async fn main() -> anyhow::Result<()> {
             let response = client
                 .start_build(StartBuildRequest {
                     system_publication_grant_id,
+                    // Publication of a direct tenant build is authorized only
+                    // through the API's build submission; ClusterApi refuses it.
+                    tenant_publication_grant_id: None,
                     recipe: Some(parsed_recipe),
                     template_id: id,
                     options: Some(BuildOptions {

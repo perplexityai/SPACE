@@ -46,7 +46,7 @@ use tracing::Instrument as _;
 
 use environment::StepEnvironment;
 pub use environment::{BuildEnvironmentError, PreparedRecipe};
-pub use pplx_space_common_core::types::SystemPublicationGrantId;
+pub use pplx_space_common_core::types::{SystemPublicationGrantId, TenantPublicationGrantId};
 pub use publish::{
     PublishError, TemplateOrg, TemplatePublication, publish_build, register_build_template,
 };

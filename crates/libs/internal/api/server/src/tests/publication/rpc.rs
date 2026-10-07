@@ -43,6 +43,7 @@ fn request<T>(body: T, account: &str) -> Request<T> {
 fn registration(name: &str, org: Option<Uuid>) -> RegisterTemplateRequest {
     RegisterTemplateRequest {
         system_publication_grant_id: None,
+        tenant_publication_grant_id: None,
         name: name.into(),
         description: None,
         org_id: org.map(|v| v.to_string()),
@@ -52,6 +53,7 @@ fn registration(name: &str, org: Option<Uuid>) -> RegisterTemplateRequest {
 fn release(name: &str, org: Option<Uuid>) -> RegisterTemplateReleaseRequest {
     RegisterTemplateReleaseRequest {
         system_publication_grant_id: None,
+        tenant_publication_grant_id: None,
         template_name: name.into(),
         org_id: org.map(|v| v.to_string()),
         runtime: "fc".into(),
@@ -84,8 +86,12 @@ async fn system_publication_grants(pool: &sqlx::PgPool, template: &str) -> TestR
     .await?)
 }
 
-#[test]
-fn authenticated_publication_enforces_identity_owner_and_reserved_outputs() -> TestResult {
+/// Run `scenario` in a child process whose ClusterApi authenticates through a
+/// local TokenReview server.
+fn in_publication_process<F>(scenario: fn() -> F) -> TestResult
+where
+    F: std::future::Future<Output = TestResult>,
+{
     let env = [
         ("SPACE_K8S_TOKEN_AUTH_ENABLED", "true"),
         // This table exercises authorization, not the separately tested rate limiter.
@@ -121,68 +127,105 @@ fn authenticated_publication_enforces_identity_owner_and_reserved_outputs() -> T
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?
-        .block_on(run())
+        .block_on(scenario())
+}
+
+/// A ClusterApi behind the production auth layers, reached from 127.0.0.1.
+struct PublicationServer {
+    db: pplx_space_db_test_fixtures::TestDb,
+    client: ClusterApiClient<tonic::transport::Channel>,
+    shutdown: CancellationToken,
+    server: tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
+    reviewer: tokio::task::JoinHandle<std::io::Result<()>>,
+}
+
+impl PublicationServer {
+    async fn start() -> TestResult<Self> {
+        let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let config = std::path::PathBuf::from(
+            std::env::var_os("KUBECONFIG").expect("test child kubeconfig path"),
+        );
+        std::fs::write(&config, kubeconfig_for_endpoint(listener.local_addr()?))?;
+        let shutdown = CancellationToken::new();
+        // The review response, not the unverified bearer claims, establishes identity.
+        let tokens = [
+            "workers",
+            "space-api",
+            "space-build-manager",
+            "space-template-publish",
+        ]
+        .map(|name| (token(name), name));
+        let reviewer = tokio::spawn(serve_token_reviews(
+            listener,
+            move |review| match tokens
+                .iter()
+                .find(|(token, _)| review.token.as_deref() == Some(token.as_str()))
+            {
+                Some((_, name)) => service_account_status(
+                    "space-cluster-api",
+                    &format!("system:serviceaccount:space:{name}"),
+                ),
+                None => TokenReviewStatus {
+                    authenticated: Some(false),
+                    ..Default::default()
+                },
+            },
+            shutdown.clone(),
+        ));
+        let mut service = ClusterApiService::new(db.pool.clone());
+        service.reserved_template_names =
+            crate::template_publication::ReservedTemplateNames::from_env()?;
+        let outer = auth::NodeApiAuthLayer::from_config(auth::NodeApiAuthConfig::from_env(
+            auth::NodeRole::Cluster,
+            "shared-token".into(),
+            None,
+        )?)
+        .await?;
+        let publisher = BuildAuthLayer::for_template_publication("shared-token".into()).await?;
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let endpoint = format!("http://{}", listener.local_addr()?);
+        let server_shutdown = shutdown.clone();
+        let server = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .layer(outer)
+                .layer(publisher)
+                .add_service(ClusterApiServer::new(service))
+                .serve_with_incoming_shutdown(
+                    TcpListenerStream::new(listener),
+                    server_shutdown.cancelled_owned(),
+                )
+                .await
+        });
+        let client = ClusterApiClient::connect(endpoint).await?;
+        Ok(Self {
+            db,
+            client,
+            shutdown,
+            server,
+            reviewer,
+        })
+    }
+
+    async fn finish(self) -> TestResult {
+        drop(self.client);
+        self.shutdown.cancel();
+        self.server.await??;
+        self.reviewer.await??;
+        drop(self.db);
+        Ok(())
+    }
+}
+
+#[test]
+fn authenticated_publication_enforces_identity_owner_and_reserved_outputs() -> TestResult {
+    in_publication_process(run)
 }
 
 async fn run() -> TestResult {
-    let db = pplx_space_db_test_fixtures::pg_test_db().await?;
-    let listener = TcpListener::bind("127.0.0.1:0").await?;
-    let config = std::path::PathBuf::from(
-        std::env::var_os("KUBECONFIG").expect("test child kubeconfig path"),
-    );
-    std::fs::write(&config, kubeconfig_for_endpoint(listener.local_addr()?))?;
-    let shutdown = CancellationToken::new();
-    let _guard = shutdown.clone().drop_guard();
-    // The review response, not the unverified bearer claims, establishes identity.
-    let tokens = [
-        "workers",
-        "space-api",
-        "space-build-manager",
-        "space-template-publish",
-    ]
-    .map(|name| (token(name), name));
-    let reviewer = tokio::spawn(serve_token_reviews(
-        listener,
-        move |review| match tokens
-            .iter()
-            .find(|(token, _)| review.token.as_deref() == Some(token.as_str()))
-        {
-            Some((_, name)) => service_account_status(
-                "space-cluster-api",
-                &format!("system:serviceaccount:space:{name}"),
-            ),
-            None => TokenReviewStatus {
-                authenticated: Some(false),
-                ..Default::default()
-            },
-        },
-        shutdown.clone(),
-    ));
-    let mut service = ClusterApiService::new(db.pool.clone());
-    service.reserved_template_names =
-        crate::template_publication::ReservedTemplateNames::from_env()?;
-    let outer = auth::NodeApiAuthLayer::from_config(auth::NodeApiAuthConfig::from_env(
-        auth::NodeRole::Cluster,
-        "shared-token".into(),
-        None,
-    )?)
-    .await?;
-    let publisher = BuildAuthLayer::for_template_publication("shared-token".into()).await?;
-    let listener = TcpListener::bind("127.0.0.1:0").await?;
-    let endpoint = format!("http://{}", listener.local_addr()?);
-    let server_shutdown = shutdown.clone();
-    let server = tokio::spawn(async move {
-        tonic::transport::Server::builder()
-            .layer(outer)
-            .layer(publisher)
-            .add_service(ClusterApiServer::new(service))
-            .serve_with_incoming_shutdown(
-                TcpListenerStream::new(listener),
-                server_shutdown.cancelled_owned(),
-            )
-            .await
-    });
-    let mut client = ClusterApiClient::connect(endpoint).await?;
+    let mut fixture = PublicationServer::start().await?;
+    let db = &fixture.db;
+    let client = &mut fixture.client;
     let owner = Uuid::parse_str("00000000-0000-0000-0000-000000000002")?;
     let foreign = Uuid::parse_str("00000000-0000-0000-0000-000000000003")?;
     for account in ["workers", "space-api"] {
@@ -442,15 +485,23 @@ async fn run() -> TestResult {
         system_publication_grants(&db.pool, "rollback-output").await?,
         0
     );
+    // Tenant publication runs under the grant for the build the API
+    // dispatched, from the builder that took it.
+    insert_k8s_node(&db.pool, std::net::Ipv4Addr::LOCALHOST, "builder").await?;
+    let tenant_grant =
+        grant_tenant_publication(&db.pool, "tenant-output", owner, None, "0 seconds").await?;
     client
         .register_template(request(
-            registration("tenant-output", Some(owner)),
+            tenant_registration("tenant-output", owner, Some(tenant_grant.to_string())),
             "space-build-manager",
         ))
         .await?;
     client
         .register_template_release(request(
-            release("tenant-output", Some(owner)),
+            RegisterTemplateReleaseRequest {
+                tenant_publication_grant_id: Some(tenant_grant.to_string()),
+                ..release("tenant-output", Some(owner))
+            },
             "space-build-manager",
         ))
         .await?;
@@ -502,16 +553,22 @@ async fn run() -> TestResult {
             .code(),
         Code::PermissionDenied
     );
-    // A legacy release with mismatched ownership cannot be adopted by publishing.
+    // A legacy release with mismatched ownership cannot be adopted by
+    // publishing, even under a build's grant.
     sqlx::query(sql!(
         "UPDATE template_releases SET org_id=NULL WHERE template_name='tenant-output'"
     ))
     .execute(&db.pool)
     .await?;
+    let adoption_grant =
+        grant_tenant_publication(&db.pool, "tenant-output", owner, None, "0 seconds").await?;
     assert_eq!(
         client
             .register_template_release(request(
-                release("tenant-output", Some(owner)),
+                RegisterTemplateReleaseRequest {
+                    tenant_publication_grant_id: Some(adoption_grant.to_string()),
+                    ..release("tenant-output", Some(owner))
+                },
                 "space-build-manager"
             ))
             .await
@@ -572,9 +629,303 @@ async fn run() -> TestResult {
     let (stored_owner, hash): (Uuid,String) = sqlx::query_as(sql!("SELECT t.org_id, r.hash FROM templates t JOIN template_release_tags tag ON tag.template_name=t.name JOIN template_releases r ON r.id=tag.template_release_id WHERE t.name='tenant-output' AND tag.tag='latest'")).fetch_one(&db.pool).await?;
     assert_eq!(stored_owner, owner);
     assert_eq!(hash, release("tenant-output", Some(owner)).hash);
-    drop(client);
-    shutdown.cancel();
-    server.await??;
-    reviewer.await??;
-    Ok(())
+    fixture.finish().await
+}
+
+/// What the API records before it dispatches an organization's build, and
+/// the pin it records from the `StartBuild` response.
+async fn grant_tenant_publication(
+    pool: &sqlx::PgPool,
+    template: &str,
+    org: Uuid,
+    builder: Option<Uuid>,
+    age: &str,
+) -> TestResult<Uuid> {
+    let grant = Uuid::now_v7();
+    sqlx::query(sql!(
+        "INSERT INTO template_tenant_publication_grants
+             (id, template_name, org_id, builder_node_id, granted_at)
+         VALUES ($1, $2, $3, $4, NOW() - $5::INTERVAL)"
+    ))
+    .bind(grant)
+    .bind(template)
+    .bind(org)
+    .bind(builder)
+    .bind(age)
+    .execute(pool)
+    .await?;
+    Ok(grant)
+}
+
+async fn tenant_publication_grant_exists(pool: &sqlx::PgPool, grant: Uuid) -> TestResult<bool> {
+    Ok(sqlx::query_scalar(sql!(
+        "SELECT EXISTS (SELECT 1 FROM template_tenant_publication_grants WHERE id = $1)"
+    ))
+    .bind(grant)
+    .fetch_one(pool)
+    .await?)
+}
+
+fn tenant_registration(name: &str, org: Uuid, grant: Option<String>) -> RegisterTemplateRequest {
+    RegisterTemplateRequest {
+        tenant_publication_grant_id: grant,
+        ..registration(name, Some(org))
+    }
+}
+
+fn tenant_release(
+    name: &str,
+    org: Uuid,
+    hash: char,
+    grant: Option<String>,
+) -> RegisterTemplateReleaseRequest {
+    RegisterTemplateReleaseRequest {
+        hash: format!("sha256:{}", hash.to_string().repeat(64)),
+        tenant_publication_grant_id: grant,
+        ..release(name, Some(org))
+    }
+}
+
+/// The codes build-manager's identity gets for registering the template and
+/// then its release with this grant.
+async fn publish_as_build_manager(
+    client: &mut ClusterApiClient<tonic::transport::Channel>,
+    name: &str,
+    org: Uuid,
+    hash: char,
+    grant: Option<String>,
+) -> (Code, Code) {
+    let template = client
+        .register_template(request(
+            tenant_registration(name, org, grant.clone()),
+            "space-build-manager",
+        ))
+        .await;
+    let release = client
+        .register_template_release(request(
+            tenant_release(name, org, hash, grant),
+            "space-build-manager",
+        ))
+        .await;
+    (status_code(template), status_code(release))
+}
+
+fn status_code<T>(result: Result<T, tonic::Status>) -> Code {
+    result.map_or_else(|status| status.code(), |_| Code::Ok)
+}
+
+async fn latest_hash(pool: &sqlx::PgPool, template: &str) -> TestResult<Option<String>> {
+    Ok(sqlx::query_scalar(sql!(
+        "SELECT r.hash FROM template_release_tags t
+         JOIN template_releases r ON r.id = t.template_release_id
+         WHERE t.template_name = $1 AND t.tag = 'latest'"
+    ))
+    .bind(template)
+    .fetch_optional(pool)
+    .await?)
+}
+
+/// Tenant publisher authority alone does not let build-manager's identity
+/// publish for whichever organization a request names. Publication needs the
+/// grant the API recorded before dispatching that organization's build of
+/// that target, presented from the builder the grant is bound to, and each
+/// grant publishes one release.
+#[test]
+fn tenant_publication_requires_an_authorized_build() -> TestResult {
+    in_publication_process(tenant_publication_requires_an_authorized_build_scenario)
+}
+
+async fn tenant_publication_requires_an_authorized_build_scenario() -> TestResult {
+    let mut fixture = PublicationServer::start().await?;
+    let pool = fixture.db.pool.clone();
+    let client = &mut fixture.client;
+    let tenant = Uuid::parse_str("00000000-0000-0000-0000-000000000003")?;
+    let other_org = Uuid::parse_str("00000000-0000-0000-0000-000000000002")?;
+    let denied = (Code::PermissionDenied, Code::PermissionDenied);
+
+    // No build exists for this target or organization.
+    assert_eq!(
+        publish_as_build_manager(client, "undispatched", tenant, 'a', None).await,
+        denied
+    );
+    let created: i64 = sqlx::query_scalar(sql!(
+        "SELECT count(*) FROM templates WHERE name = 'undispatched'"
+    ))
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(created, 0);
+
+    // The organization's existing template keeps its `latest` release.
+    let service = ClusterApiService::new(pool.clone());
+    service
+        .register_template(publisher_request(registration("owned", Some(tenant))))
+        .await?;
+    service
+        .register_template_release(publisher_request(release("owned", Some(tenant))))
+        .await?;
+    assert_eq!(
+        client
+            .register_template_release(request(
+                tenant_release("owned", tenant, 'd', None),
+                "space-build-manager",
+            ))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::PermissionDenied
+    );
+    assert_eq!(
+        latest_hash(&pool, "owned").await?,
+        Some(release("owned", Some(tenant)).hash)
+    );
+
+    // A fresh, unpinned grant serves registered builders only. The caller
+    // connects from 127.0.0.1: first unregistered, then a worker.
+    let grant = grant_tenant_publication(&pool, "tenant-out", tenant, None, "0 seconds").await?;
+    assert_eq!(
+        publish_as_build_manager(client, "tenant-out", tenant, 'a', Some(grant.to_string())).await,
+        denied
+    );
+    insert_k8s_node(&pool, std::net::Ipv4Addr::LOCALHOST, "worker").await?;
+    assert_eq!(
+        publish_as_build_manager(client, "tenant-out", tenant, 'a', Some(grant.to_string())).await,
+        denied
+    );
+    let builder = insert_k8s_node(&pool, std::net::Ipv4Addr::LOCALHOST, "builder").await?;
+    let other_builder =
+        insert_k8s_node(&pool, std::net::Ipv4Addr::new(10, 0, 0, 41), "builder").await?;
+
+    // Grants that do not cover this publication authorize nothing.
+    let expired_unpinned =
+        grant_tenant_publication(&pool, "tenant-out", tenant, None, "2 hours").await?;
+    let expired_pinned =
+        grant_tenant_publication(&pool, "tenant-out", tenant, Some(builder), "8 days").await?;
+    let wrong_builder = grant_tenant_publication(
+        &pool,
+        "tenant-out",
+        tenant,
+        Some(other_builder),
+        "0 seconds",
+    )
+    .await?;
+    for (name, org, proof) in [
+        ("tenant-out", other_org, grant),
+        ("other-target", tenant, grant),
+        ("tenant-out", tenant, expired_unpinned),
+        ("tenant-out", tenant, expired_pinned),
+        ("tenant-out", tenant, wrong_builder),
+        ("tenant-out", tenant, Uuid::now_v7()),
+    ] {
+        assert_eq!(
+            publish_as_build_manager(client, name, org, 'a', Some(proof.to_string())).await,
+            denied,
+            "{name} for {org} under {proof}"
+        );
+    }
+    assert_eq!(
+        publish_as_build_manager(client, "tenant-out", tenant, 'a', Some("invalid".into())).await,
+        (Code::InvalidArgument, Code::InvalidArgument)
+    );
+    let mut system_template = registration("code-runtime", None);
+    system_template.tenant_publication_grant_id = Some(grant.to_string());
+    assert_eq!(
+        client
+            .register_template(request(system_template, "space-build-manager"))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::InvalidArgument
+    );
+    let created: i64 = sqlx::query_scalar(sql!(
+        "SELECT count(*) FROM templates WHERE name IN ('tenant-out', 'other-target')"
+    ))
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(created, 0);
+
+    // The build's own grant publishes, before the API has pinned it.
+    // Registering the template leaves it for the release, which consumes it.
+    client
+        .register_template(request(
+            tenant_registration("tenant-out", tenant, Some(grant.to_string())),
+            "space-build-manager",
+        ))
+        .await?;
+    assert!(tenant_publication_grant_exists(&pool, grant).await?);
+    client
+        .register_template_release(request(
+            tenant_release("tenant-out", tenant, 'a', Some(grant.to_string())),
+            "space-build-manager",
+        ))
+        .await?;
+    assert!(!tenant_publication_grant_exists(&pool, grant).await?);
+    assert_eq!(
+        latest_hash(&pool, "tenant-out").await?,
+        Some(format!("sha256:{}", "a".repeat(64)))
+    );
+    let owner: Option<Uuid> = sqlx::query_scalar(sql!(
+        "SELECT org_id FROM templates WHERE name = 'tenant-out'"
+    ))
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(owner, Some(tenant));
+
+    // The completed publication cannot be replayed to move the tag.
+    assert_eq!(
+        publish_as_build_manager(client, "tenant-out", tenant, 'b', Some(grant.to_string())).await,
+        denied
+    );
+    assert_eq!(
+        latest_hash(&pool, "tenant-out").await?,
+        Some(format!("sha256:{}", "a".repeat(64)))
+    );
+
+    // A job that waited in its builder's queue past the unpinned window
+    // still publishes from the builder its grant is pinned to.
+    let queued =
+        grant_tenant_publication(&pool, "tenant-out", tenant, Some(builder), "2 days").await?;
+    assert_eq!(
+        publish_as_build_manager(client, "tenant-out", tenant, 'c', Some(queued.to_string())).await,
+        (Code::Ok, Code::Ok)
+    );
+    assert_eq!(
+        latest_hash(&pool, "tenant-out").await?,
+        Some(format!("sha256:{}", "c".repeat(64)))
+    );
+
+    // A rolled-back release keeps its grant, and concurrent uses of one grant
+    // commit at most once.
+    let rollback =
+        grant_tenant_publication(&pool, "rollback-tenant", tenant, None, "0 seconds").await?;
+    assert_eq!(
+        client
+            .register_template_release(request(
+                tenant_release("rollback-tenant", tenant, 'a', Some(rollback.to_string())),
+                "space-build-manager",
+            ))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::NotFound
+    );
+    assert!(tenant_publication_grant_exists(&pool, rollback).await?);
+    client
+        .register_template(request(
+            tenant_registration("rollback-tenant", tenant, Some(rollback.to_string())),
+            "space-build-manager",
+        ))
+        .await?;
+    let mut concurrent = client.clone();
+    let publication = tenant_release("rollback-tenant", tenant, 'a', Some(rollback.to_string()));
+    let (first, replay) = tokio::join!(
+        client.register_template_release(request(publication.clone(), "space-build-manager")),
+        concurrent.register_template_release(request(publication, "space-build-manager")),
+    );
+    assert_eq!(usize::from(first.is_ok()) + usize::from(replay.is_ok()), 1);
+    assert_eq!(
+        first.err().or_else(|| replay.err()).unwrap().code(),
+        Code::PermissionDenied
+    );
+    assert!(!tenant_publication_grant_exists(&pool, rollback).await?);
+    fixture.finish().await
 }
