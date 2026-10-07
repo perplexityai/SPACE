@@ -17,7 +17,7 @@ items compiled only for tests: an item under `#[cfg(test)]` or
 
 A *reader* is `test_hook`, `test_hook_var`, an import alias of either in the
 same file, or a function named `test_*` (in the same crate, or anywhere if it's
-`pub` or a trait method)
+`pub`, a trait method, or a trait impl's method)
 that passes one of its own string parameters, as a whole argument, to a reader
 (`EnvConfig::test_raw`, for example). Two rules:
 
@@ -60,7 +60,6 @@ FN_DEF = re.compile(r"\bfn\s+([a-z_][a-z0-9_]*)")
 # A call, with an optional turbofish: `name(`, `name::<T>(`.
 CALL = re.compile(r"\b([a-z_][a-z0-9_]*)\s*(?:::\s*<[^()]*?>\s*)?\(")
 ALIAS = re.compile(r"\b(test_hook_var|test_hook)\s+as\s+([a-z_][a-z0-9_]*)")
-# `#[cfg(test)]`, `#[cfg(all(test, ...))]` and the like.
 # An outer `cfg` attribute; `test_only_cfg` decides whether it needs `test`.
 CFG_ATTRIBUTE = re.compile(r"#\[cfg\((.*?)\)\]", re.S)
 INNER_CFG = re.compile(r"#!\[cfg\((.*?)\)\]", re.S)
@@ -68,7 +67,10 @@ INNER_ATTRIBUTES = re.compile(r"\A(?:\s*#!\[.*?\]\s*)*", re.S)
 ATTRIBUTE = re.compile(r"\s*#\[[^\]]*\]")
 ITEM = re.compile(
     r"\s*(?:pub(?:\([^)]*\))?\s+)?(?:(?:async|const|unsafe|extern(?:\s+\"[^\"]*\")?)\s+)*"
-    r"(?:(?:mod|fn|impl|struct|enum|union|const|static|use|type|trait)\b|macro_rules!|thread_local!)"
+    # Keywords that introduce a name must be followed by one, so a field
+    # named `union` or a `fn() -> u8` field type isn't taken for an item.
+    r"(?:(?:mod|fn|struct|enum|union|static|type|trait)\s+(?:mut\s+)?[A-Za-z_]"
+    r"|const\s+(?:fn\b|[A-Za-z_])|(?:impl|use)\b|macro_rules!|thread_local!)"
 )
 NAME_ARG = re.compile(
     r'"(SPACE_[A-Z0-9_]+)"|(?<![A-Za-z0-9_"])((?:[A-Za-z_][A-Za-z0-9_]*::)*)([A-Z][A-Z0-9_]*)\b'
@@ -189,9 +191,11 @@ def item_end(text: str, start: int) -> int:
         char = text[index]
         if char in "([":
             depth += 1
-        elif char in ")]" and depth:
+        elif char in ")]}":
+            if depth == 0:
+                return index  # the enclosing struct, enum or call closes first
             depth -= 1
-        elif depth == 0 and char == ";":
+        elif depth == 0 and char in ";,":
             return index + 1
         elif depth == 0 and char == "{":
             return matching(text, index, "{", "}")
@@ -247,11 +251,35 @@ class Function:
 
 
 TRAIT = re.compile(r"\btrait\s+[A-Za-z_]\w*[^;{]*\{")
+IMPL_FOR = re.compile(r"\bimpl\b[^;{]*\bfor\b[^;{]*\{")
+
+
+def body_start(text: str, index: int) -> int | None:
+    """The `{` opening a function body after its parameters, or `None` for a
+    declaration. A `;` inside brackets (`-> [u8; 4]`) doesn't end it."""
+    depth = 0
+    for position in range(index, len(text)):
+        char = text[position]
+        if char in "([":
+            depth += 1
+        elif char in ")]":
+            depth -= 1
+        elif depth == 0 and char == ";":
+            return None
+        elif depth == 0 and char == "{":
+            return position
+    return None
 
 
 def functions(text: str) -> list[Function]:
     found = []
-    traits = [(t.end() - 1, matching(text, t.end() - 1, "{", "}")) for t in TRAIT.finditer(text)]
+    # Methods of a trait, or of a trait impl, are callable wherever the trait
+    # is, so they count as public like a `pub fn`.
+    traits = [
+        (block.end() - 1, matching(text, block.end() - 1, "{", "}"))
+        for pattern in (TRAIT, IMPL_FOR)
+        for block in pattern.finditer(text)
+    ]
     for match in FN_DEF.finditer(text):
         index = match.end()
         if text[index:].lstrip().startswith("<"):
@@ -260,8 +288,8 @@ def functions(text: str) -> list[Function]:
         if open_paren == -1:
             continue
         close_paren = matching(text, open_paren, "(", ")")
-        brace, semicolon = text.find("{", close_paren), text.find(";", close_paren)
-        if brace == -1 or (semicolon != -1 and semicolon < brace):
+        brace = body_start(text, close_paren)
+        if brace is None:
             continue  # a declaration without a body
         # Only string parameters can carry a variable name; `env: &dyn
         # Environment` passed along to `test_hook` is not forwarding.
@@ -271,8 +299,6 @@ def functions(text: str) -> list[Function]:
             if typed and re.search(r"\b(?:str|String)\b", typed.group(2)):
                 parameters.add(typed.group(1))
         prefix = text[max(0, match.start() - 40) : match.start()]
-        # A trait method is callable wherever the trait is, so it counts as
-        # public like a `pub fn`.
         public = bool(
             re.search(r'\bpub\s+(?:(?:async|const|unsafe|extern(?:\s+"[^"]*")?)\s+)*$', prefix)
         ) or any(start < match.start() < end for start, end in traits)

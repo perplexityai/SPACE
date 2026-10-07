@@ -140,6 +140,22 @@ WRAPPER = "fn test_raw(var: &str) -> Option<String> { test_hook_var(var) }\n"
             "crates/libs/b/Cargo.toml": "",
             "crates/libs/b/src/lib.rs": 'let n = x.test_read("SPACE_EXAMPLE_LIMIT");',
         },
+        # A test-only field named like a keyword doesn't hide the next item.
+        {LIB: "pub struct Sets {\n    #[cfg(test)]\n    union: Vec<u8>,\n    other: u8,\n}\n"
+         f"fn grace() -> Option<String> {{ test_hook_var(\"SPACE_EXAMPLE_LIMIT\") }}"},
+        {LIB: "enum Op { Call(#[cfg(test)] fn() -> u8) }\n"
+         f"fn grace() -> Option<String> {{ test_hook_var(\"SPACE_EXAMPLE_LIMIT\") }}"},
+        # A trait impl's method wrapper counts in other crates.
+        {
+            "crates/libs/a/Cargo.toml": "",
+            "crates/libs/a/src/lib.rs": "pub trait Env { fn test_raw(&self, n: &str) -> Option<String>; }\n"
+            "impl Env for E { fn test_raw(&self, n: &str) -> Option<String> { test_hook_var(n) } }",
+            "crates/libs/b/Cargo.toml": "",
+            "crates/libs/b/src/lib.rs": 'let n = e.test_raw("SPACE_EXAMPLE_LIMIT");',
+        },
+        # A `;` inside the return type doesn't drop the wrapper.
+        {LIB: "fn test_key(name: &str) -> Option<[u8; 4]> { test_hook_var(name).map(|_| [0; 4]) }\n"
+         'let k = test_key("SPACE_EXAMPLE_LIMIT");'},
         # A single-letter constant.
         {LIB: 'const X: &str = "SPACE_EXAMPLE_LIMIT";\nlet n = test_hook_var(X);'},
         # A `//` inside a string doesn't hide the rest of the line.
@@ -155,7 +171,9 @@ WRAPPER = "fn test_raw(var: &str) -> Option<String> { test_hook_var(var) }\n"
         "generic-with-parens", "self-local-over-ambiguous-crate",
         "after-test-field", "after-test-variant", "after-test-expression", "cfg-not-test",
         "cfg-any-test", "pub-wrapper-other-crate", "after-test-comparison", "after-test-shift",
-        "inner-cfg-not-test-file", "trait-wrapper-other-crate", "single-letter-constant",
+        "inner-cfg-not-test-file", "trait-wrapper-other-crate",
+        "after-test-union-field", "after-test-fn-tuple-field", "trait-impl-wrapper-other-crate",
+        "array-return-wrapper", "single-letter-constant",
         "url-in-string", "byte-raw-string",
     ],
 )
