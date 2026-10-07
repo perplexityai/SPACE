@@ -52,6 +52,12 @@ const RECONCILE_FACET_SANDBOX_INVENTORY: i32 = 2;
 
 mod quarantine_scan;
 mod sandbox_row;
+mod teardown_jobs;
+pub(crate) use teardown_jobs::{
+    TeardownSuspendFailure, fail_teardown_suspend_backup_operation,
+    fail_teardown_suspend_operation, reconcile_terminal_teardown_suspend_jobs,
+    teardown_suspend_retry_admissible,
+};
 #[cfg(test)]
 mod test_schema_image_cache;
 pub(crate) use quarantine_scan::PeriodicQuarantineRecoveryScan;
@@ -2152,6 +2158,12 @@ pub fn update_state(
     if matches!(state, SandboxState::Quarantined | SandboxState::Failed) {
         return Err(rusqlite::Error::InvalidQuery);
     }
+    if state == SandboxState::Deleting && conn.is_autocommit() {
+        let tx = immediate_transaction(conn)?;
+        let outcome = update_state(&tx, id, state)?;
+        tx.commit()?;
+        return Ok(outcome);
+    }
     let previous_state = current_state_label(conn, id)?;
     let previous_state_value = previous_state
         .as_deref()
@@ -2236,6 +2248,9 @@ pub fn update_state(
            AND (?1 = 'deleting' OR state != 'quarantined')",
         params![state.as_str(), now()?, id],
     )?;
+    if changed != 0 && state == SandboxState::Deleting {
+        teardown_jobs::fail_active(conn, id, TeardownSuspendFailure::Deleting)?;
+    }
     Ok(if changed == 0 {
         SandboxStateWriteOutcome::Missing
     } else {
@@ -3423,6 +3438,13 @@ fn ensure_teardown_suspend_operation(
     {
         return Err(rusqlite::Error::InvalidQuery);
     }
+    if latest_teardown_suspend_operation(conn, id)?.is_some_and(|latest| {
+        latest.execution_generation == execution_generation
+            && latest.status == TeardownSuspendOperationStatus::Failed
+    }) && !teardown_suspend_retry_admissible(conn, id, execution_generation)?
+    {
+        return Err(rusqlite::Error::QueryReturnedNoRows);
+    }
     let mut superseded_generation = None;
     if let Some(active) = active_teardown_suspend_operation(conn, id)? {
         if active.execution_generation > execution_generation {
@@ -3877,6 +3899,7 @@ pub fn pin_suspended_artifact_for_cleanup(
 /// manual cascade is the single source of truth for sandbox child tables:
 /// add new child tables here, not at the individual delete call sites.
 fn delete_sandbox_child_rows(tx: &Connection, id: &str) -> Result<()> {
+    teardown_jobs::fail_active(tx, id, TeardownSuspendFailure::Deleted)?;
     crate::route_activation_claims::close_claim(tx, id)?;
     tx.execute(
         "DELETE FROM sandbox_cleanup_episodes WHERE sandbox_id = ?1",
@@ -4446,6 +4469,11 @@ fn insert_operator_quarantine_episode(
 }
 
 fn insert_new_quarantine_episode(conn: &Connection, episode: &QuarantineEpisode<'_>) -> Result<()> {
+    teardown_jobs::fail_active(
+        conn,
+        episode.sandbox_id,
+        TeardownSuspendFailure::Quarantined,
+    )?;
     let quarantine_id = uuid::Uuid::now_v7().to_string();
     // A sandbox re-entering quarantine from a non-quarantined state replaces its
     // episode. Two things must survive that: a lease someone is still acting
@@ -8262,7 +8290,7 @@ fn active_teardown_suspend_operation(
         .transpose()
 }
 
-fn latest_teardown_suspend_operation(
+pub(crate) fn latest_teardown_suspend_operation(
     conn: &Connection,
     sandbox_id: &str,
 ) -> Result<Option<TeardownSuspendOperation>> {
@@ -9314,8 +9342,9 @@ pub fn claim_suspended_sandbox_for_eviction(
     expected_pin: Option<&str>,
     expected_updated_at: Option<&str>,
 ) -> Result<bool> {
+    let tx = immediate_transaction(conn)?;
     let changed = match (expected_pin, expected_updated_at) {
-        (Some(pin), Some(updated_at)) => conn.execute(
+        (Some(pin), Some(updated_at)) => tx.execute(
             "UPDATE sandboxes
              SET state = 'deleting',
                  state_changed_at = CASE WHEN state != 'deleting' THEN ?1 ELSE state_changed_at END,
@@ -9325,7 +9354,7 @@ pub fn claim_suspended_sandbox_for_eviction(
                AND updated_at = ?4",
             params![now()?, id, pin, updated_at],
         )?,
-        (Some(pin), None) => conn.execute(
+        (Some(pin), None) => tx.execute(
             "UPDATE sandboxes
              SET state = 'deleting',
                  state_changed_at = CASE WHEN state != 'deleting' THEN ?1 ELSE state_changed_at END,
@@ -9334,7 +9363,7 @@ pub fn claim_suspended_sandbox_for_eviction(
                AND current_local_artifact_id = ?3",
             params![now()?, id, pin],
         )?,
-        (None, Some(updated_at)) => conn.execute(
+        (None, Some(updated_at)) => tx.execute(
             "UPDATE sandboxes
              SET state = 'deleting',
                  state_changed_at = CASE WHEN state != 'deleting' THEN ?1 ELSE state_changed_at END,
@@ -9344,7 +9373,7 @@ pub fn claim_suspended_sandbox_for_eviction(
                AND updated_at = ?3",
             params![now()?, id, updated_at],
         )?,
-        (None, None) => conn.execute(
+        (None, None) => tx.execute(
             "UPDATE sandboxes
              SET state = 'deleting',
                  state_changed_at = CASE WHEN state != 'deleting' THEN ?1 ELSE state_changed_at END,
@@ -9354,6 +9383,10 @@ pub fn claim_suspended_sandbox_for_eviction(
             params![now()?, id],
         )?,
     };
+    if changed == 1 {
+        teardown_jobs::fail_active(&tx, id, TeardownSuspendFailure::Deleting)?;
+    }
+    tx.commit()?;
     Ok(changed == 1)
 }
 
@@ -9394,7 +9427,8 @@ pub fn claim_failed_restoring_sandbox_for_eviction(
     // to that state); every transition out of `restoring` clears them, and
     // so must this one. `state_changed_at` is set unconditionally: the WHERE
     // clause already forbids a row that is not leaving `restoring`.
-    let changed = conn.execute(
+    let tx = immediate_transaction(conn)?;
+    let changed = tx.execute(
         "UPDATE sandboxes
          SET state = 'deleting',
              restore_origin = NULL,
@@ -9408,6 +9442,10 @@ pub fn claim_failed_restoring_sandbox_for_eviction(
            AND updated_at = ?3",
         params![now()?, id, expected_updated_at],
     )?;
+    if changed == 1 {
+        teardown_jobs::fail_active(&tx, id, TeardownSuspendFailure::Deleting)?;
+    }
+    tx.commit()?;
     Ok(changed == 1)
 }
 
@@ -9421,12 +9459,17 @@ pub fn claim_quarantined_sandbox_for_eviction(
     id: &str,
     expected_updated_at: &str,
 ) -> Result<bool> {
-    let changed = conn.execute(
+    let tx = immediate_transaction(conn)?;
+    let changed = tx.execute(
         "UPDATE sandboxes
          SET state = 'deleting', state_changed_at = ?1, updated_at = ?1
          WHERE id = ?2 AND state = 'quarantined' AND updated_at = ?3",
         params![now()?, id, expected_updated_at],
     )?;
+    if changed == 1 {
+        teardown_jobs::fail_active(&tx, id, TeardownSuspendFailure::Deleting)?;
+    }
+    tx.commit()?;
     Ok(changed == 1)
 }
 
@@ -9438,13 +9481,18 @@ pub fn claim_stopped_sandbox_for_eviction(
     id: &str,
     expected_updated_at: &str,
 ) -> Result<bool> {
-    let changed = conn.execute(
+    let tx = immediate_transaction(conn)?;
+    let changed = tx.execute(
         sql!(
             "UPDATE sandboxes SET state = 'deleting', state_changed_at = ?1, updated_at = ?1
               WHERE id = ?2 AND state = 'stopped' AND updated_at = ?3"
         ),
         params![now()?, id, expected_updated_at],
     )?;
+    if changed == 1 {
+        teardown_jobs::fail_active(&tx, id, TeardownSuspendFailure::Deleting)?;
+    }
+    tx.commit()?;
     Ok(changed == 1)
 }
 
@@ -9480,7 +9528,8 @@ pub fn claim_teardown_suspend_failed_sandbox_for_eviction(
     staged_artifact: LocalArtifactId,
     expected_state_changed_at: &str,
 ) -> Result<bool> {
-    let changed = conn.execute(
+    let tx = immediate_transaction(conn)?;
+    let changed = tx.execute(
         "UPDATE sandboxes
          SET state = 'deleting',
              state_changed_at = ?1,
@@ -9497,6 +9546,10 @@ pub fn claim_teardown_suspend_failed_sandbox_for_eviction(
             expected_state_changed_at
         ],
     )?;
+    if changed == 1 {
+        teardown_jobs::fail_active(&tx, id, TeardownSuspendFailure::Deleting)?;
+    }
+    tx.commit()?;
     Ok(changed == 1)
 }
 

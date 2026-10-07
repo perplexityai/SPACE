@@ -353,16 +353,19 @@ pub(super) enum OrgSnapshotConfigResolution {
     /// fall-through; reupload surfaces it as `Internal` so the
     /// reconciler retries instead of escalating to mark-as-failed.
     LookupFailed(String),
-    /// `GetSandboxSnapshotStorageUri` returned `NotFound` — the
-    /// sandbox has no row in the cluster yet. For suspend this is a
-    /// benign create race (local `SandboxRow` exists before the cluster
-    /// row is committed); for reupload it indicates state divergence,
+    /// `GetSandboxSnapshotStorageUri` returned `NotFound`: no sandbox row
+    /// exists at lookup time. This alone does not distinguish a create race
+    /// from deletion. Ordinary suspend permits the create race (the local
+    /// row can precede cluster commit); for reupload it indicates divergence,
     /// because the sandbox must already have been suspended at least
     /// once (and therefore registered with the cluster) before reupload
     /// can be invoked. Suspend collapses this to silent fall-through;
     /// reupload surfaces it as `FailedPrecondition` so the reconciler
     /// stops issuing reupload work that the durable worker would
-    /// permanently fail at the `BeginArtifactBackup` step.
+    /// permanently fail at the `BeginArtifactBackup` step. Teardown combines
+    /// this absence with a permanent backup refusal for an owned execution
+    /// and artifact to close that attempt. It grants no runtime-release proof;
+    /// cluster-deleted eviction still independently verifies deletion.
     ClusterRowMissing,
 }
 
@@ -971,6 +974,7 @@ impl SandboxManagerService {
             },
         )
         .await
+        .map_err(|error| error.to_string())
     }
 }
 
@@ -1387,6 +1391,23 @@ enum ArtifactBackupHandoff {
 pub(super) const AUTO_LIFECYCLE_SUSPEND_BACKUP_FENCE_FAILED_METADATA: &str =
     "x-space-auto-lifecycle-suspend-backup-fence-failed";
 
+#[derive(Debug, thiserror::Error)]
+enum ArtifactBackupSubmissionError {
+    #[error("{0}")]
+    Other(String),
+    #[error("begin restore-visible snapshot backup: {0}")]
+    Begin(#[source] pplx_space_common_jobs::JobError),
+}
+
+impl From<String> for ArtifactBackupSubmissionError {
+    fn from(error: String) -> Self {
+        Self::Other(error)
+    }
+}
+
+const TEARDOWN_BACKUP_FAILED_ARTIFACT_METADATA: &str =
+    "x-space-teardown-backup-failed-artifact-bin";
+
 pub(super) fn artifact_backup_fence_status(error: String) -> Status {
     let mut status = Status::internal(format!("artifact backup submission failed: {error}"));
     status.metadata_mut().insert(
@@ -1394,6 +1415,40 @@ pub(super) fn artifact_backup_fence_status(error: String) -> Status {
         tonic::metadata::MetadataValue::from_static("true"),
     );
     status
+}
+
+fn teardown_artifact_backup_status(
+    error: ArtifactBackupSubmissionError,
+    artifact: LocalArtifactId,
+) -> Status {
+    let permanent = matches!(&error, ArtifactBackupSubmissionError::Begin(error)
+        if error.kind() == pplx_space_common_jobs::JobFailureKind::Permanent);
+    let mut status = artifact_backup_fence_status(error.to_string());
+    if permanent {
+        status = teardown_backup_failure_status(status, artifact);
+    }
+    status
+}
+
+// The shared publication path returns tonic Status. Keep backup provenance on
+// its teardown-only errors until the driver has verified control-plane absence.
+fn teardown_backup_failure_status(mut status: Status, artifact: LocalArtifactId) -> Status {
+    status.metadata_mut().insert_bin(
+        TEARDOWN_BACKUP_FAILED_ARTIFACT_METADATA,
+        tonic::metadata::MetadataValue::from_bytes(artifact.as_uuid().as_bytes()),
+    );
+    status
+}
+
+fn teardown_failed_backup_artifact(status: &Status) -> Option<LocalArtifactId> {
+    let value = status
+        .metadata()
+        .get_bin(TEARDOWN_BACKUP_FAILED_ARTIFACT_METADATA)?
+        .to_bytes()
+        .ok()?;
+    Some(LocalArtifactId::from_uuid(
+        uuid::Uuid::from_slice(&value).ok()?,
+    ))
 }
 
 struct TeardownSuspendBackup<'a> {
@@ -2540,6 +2595,7 @@ impl SandboxManagerService {
                     metric_started_at,
                 ));
             }
+            self.reject_terminal_teardown_suspend(&sandbox_id_string, execution_generation)?;
             return Ok(teardown_suspend_prepare_response(
                 TeardownSuspendOutcome::Pending,
                 Some("sandbox record is not present on this node".to_string()),
@@ -2561,6 +2617,7 @@ impl SandboxManagerService {
             Some(generation) => generation,
             None if status.state == SandboxState::Suspended => execution_generation,
             None => {
+                self.reject_terminal_teardown_suspend(&sandbox_id_string, execution_generation)?;
                 return Ok(teardown_suspend_prepare_response(
                     TeardownSuspendOutcome::Pending,
                     Some("local runtime execution generation is not available".to_string()),
@@ -2613,6 +2670,7 @@ impl SandboxManagerService {
                 metric_started_at,
             ));
         }
+        self.reject_terminal_teardown_suspend(&sandbox_id_string, execution_generation)?;
         if action == TeardownSuspendAction::BeginOrJoin
             && matches!(status.state, SandboxState::Started | SandboxState::Paused)
         {
@@ -2731,6 +2789,46 @@ impl SandboxManagerService {
         ))
     }
 
+    fn reject_terminal_teardown_suspend(
+        &self,
+        sandbox_id: &str,
+        generation: pplx_space_common_core::types::ExecutionGeneration,
+    ) -> Result<(), Status> {
+        let db = self.db_conn()?;
+        let state = crate::db::get_sandbox(&db, sandbox_id)
+            .map_err(|error| Status::internal(format!("db error: {error}")))?
+            .map(|row| row.state);
+        let operation = crate::db::latest_teardown_suspend_operation(&db, sandbox_id)
+            .map_err(|error| Status::internal(format!("db error: {error}")))?;
+        // A failed older generation must not block a new execution.
+        let exact = operation
+            .as_ref()
+            .filter(|operation| operation.execution_generation == generation);
+        let reason = match state {
+            Some(SandboxState::Quarantined) => Some(crate::db::TeardownSuspendFailure::Quarantined),
+            Some(SandboxState::Deleting) => Some(crate::db::TeardownSuspendFailure::Deleting),
+            None if exact.is_some() => Some(crate::db::TeardownSuspendFailure::Missing),
+            _ if exact.is_some_and(|operation| {
+                operation.status == crate::db::TeardownSuspendOperationStatus::Failed
+            }) && !crate::db::teardown_suspend_retry_admissible(
+                &db, sandbox_id, generation,
+            )
+            .map_err(|error| Status::internal(format!("db error: {error}")))? =>
+            {
+                Some(crate::db::TeardownSuspendFailure::Failed)
+            }
+            _ => None,
+        };
+        if let Some(reason) = reason {
+            crate::db::fail_teardown_suspend_operation(&db, sandbox_id, generation, reason)
+                .map_err(|error| {
+                    Status::internal(format!("persist terminal teardown suspend: {error}"))
+                })?;
+            return Err(Status::failed_precondition(reason.as_str()));
+        }
+        Ok(())
+    }
+
     pub(super) fn spawn_teardown_suspend_driver(
         &self,
         sandbox_id: SandboxId,
@@ -2796,6 +2894,94 @@ impl SandboxManagerService {
         event_trigger: SandboxEventTrigger,
     ) -> Result<(), Status> {
         let _state_writer = self.state_writer_lease("PrepareTeardownSuspendBackground")?;
+        let result = self
+            .drive_teardown_suspend_inner(sandbox_id, execution_generation, event_trigger)
+            .await;
+        if let Err(error) = &result {
+            // Registration can also return NotFound for its source node. Confirm
+            // sandbox absence with the sandbox-only lookup before making this final.
+            // Legacy persisted failures have no typed reason, so verify every
+            // permanent backup refusal rather than parsing its historical message.
+            let backup_lookup = if teardown_failed_backup_artifact(error).is_some() {
+                Some(
+                    self.resolve_org_snapshot_upload_config(&sandbox_id.to_string())
+                        .await,
+                )
+            } else {
+                None
+            };
+            if let Err(record_error) = self.record_teardown_suspend_driver_failure(
+                sandbox_id,
+                execution_generation,
+                error,
+                backup_lookup.as_ref(),
+            ) {
+                tracing::warn!(%sandbox_id, %execution_generation, %record_error,
+                    "failed to persist teardown suspend driver failure; caller polling will retry");
+            }
+        }
+        result
+    }
+
+    fn record_teardown_suspend_driver_failure(
+        &self,
+        sandbox_id: SandboxId,
+        execution_generation: pplx_space_common_core::types::ExecutionGeneration,
+        error: &Status,
+        backup_lookup: Option<&OrgSnapshotConfigResolution>,
+    ) -> Result<(), Status> {
+        let db = self.db_conn()?;
+        let local = crate::db::get_sandbox(&db, &sandbox_id.to_string())
+            .map_err(|error| Status::internal(format!("db error: {error}")))?;
+        let reason = match local {
+            None => Some(crate::db::TeardownSuspendFailure::Missing),
+            Some(row) if row.state == SandboxState::Quarantined => {
+                Some(crate::db::TeardownSuspendFailure::Quarantined)
+            }
+            Some(row) if row.state == SandboxState::Deleting => {
+                Some(crate::db::TeardownSuspendFailure::Deleting)
+            }
+            _ => None,
+        };
+        if let Some(reason) = reason {
+            crate::db::fail_teardown_suspend_operation(
+                &db,
+                &sandbox_id.to_string(),
+                execution_generation,
+                reason,
+            )
+            .map_err(|error| {
+                Status::internal(format!("persist terminal teardown suspend: {error}"))
+            })?;
+        } else if let Some(failed_artifact) = teardown_failed_backup_artifact(error)
+            && matches!(
+                backup_lookup,
+                Some(OrgSnapshotConfigResolution::ClusterRowMissing)
+            )
+        {
+            let failed = crate::db::fail_teardown_suspend_backup_operation(
+                &db,
+                &sandbox_id.to_string(),
+                execution_generation,
+                failed_artifact,
+            )
+            .map_err(|error| {
+                Status::internal(format!("persist terminal teardown backup: {error}"))
+            })?;
+            drop(db);
+            if failed {
+                mark_sandbox_dirty(&self.db, &sandbox_id.to_string());
+            }
+        }
+        Ok(())
+    }
+
+    async fn drive_teardown_suspend_inner(
+        &self,
+        sandbox_id: SandboxId,
+        execution_generation: pplx_space_common_core::types::ExecutionGeneration,
+        event_trigger: SandboxEventTrigger,
+    ) -> Result<(), Status> {
         let sandbox_id_string = sandbox_id.to_string();
         let wake_lock = self.auto_lifecycle.wake_lock(&sandbox_id_string);
         let wake_guard = wake_lock.lock_owned().await;
@@ -3909,7 +4095,8 @@ impl SandboxManagerService {
                         published_format,
                         None,
                     )
-                    .await;
+                    .await
+                    .map_err(|error| artifact_backup_fence_status(error.to_string()));
                 self.require_node_local_backup_handoff(&sandbox.id, local_artifact_id, enqueue_result)?;
             }
             pplx_space_metrics::snapshot::create_step(
@@ -4127,8 +4314,10 @@ impl SandboxManagerService {
                     backup.format,
                     Some(&artifact_dedup_key),
                 )
-                .await?
-            {
+                .await
+                .map_err(|error| {
+                    teardown_artifact_backup_status(error, backup.artifact.local_artifact_id)
+                })? {
                 SubmitSuspendSnapshotOutcome::Enqueued { job_id, .. } => job_id,
                 SubmitSuspendSnapshotOutcome::NoUploadConfig => {
                     return Err(Status::failed_precondition(
@@ -4151,10 +4340,17 @@ impl SandboxManagerService {
                     backup.artifact.local_artifact_id,
                 );
             }
-            return Err(Status::internal(
+            let mut error = Status::internal(
                 job.error
                     .unwrap_or_else(|| "durable suspend backup failed".to_string()),
-            ));
+            );
+            if matches!(
+                job.failure,
+                Some(pplx_space_common_jobs::JobFailure::Permanent { .. })
+            ) {
+                error = teardown_backup_failure_status(error, backup.artifact.local_artifact_id);
+            }
+            return Err(error);
         }
         {
             let db = self.db_conn()?;
@@ -5044,7 +5240,7 @@ impl SandboxManagerService {
         &self,
         sandbox: &crate::db::SandboxRow,
         submission: ArtifactBackupSubmission<'_>,
-    ) -> Result<SubmitSuspendSnapshotOutcome, String> {
+    ) -> Result<SubmitSuspendSnapshotOutcome, ArtifactBackupSubmissionError> {
         let ArtifactBackupSubmission {
             local_artifact_id,
             artifact_kind,
@@ -5086,7 +5282,8 @@ impl SandboxManagerService {
                 return Err(format!(
                     "read published snapshot metadata at {} failed: {err}",
                     meta_path.display()
-                ));
+                )
+                .into());
             }
         };
         meta.local_artifact_id = Some(local_artifact_id);
@@ -5152,7 +5349,7 @@ impl SandboxManagerService {
                         .error(reason.clone()),
                 );
                 crate::snapshot_upload::cleanup_metadata_staging_dir(&jobs);
-                return Err(reason);
+                return Err(reason.into());
             }
         };
 
@@ -5216,7 +5413,7 @@ impl SandboxManagerService {
     async fn establish_restore_visible_artifact_backup(
         &self,
         job_id: &JobId,
-    ) -> Result<crate::snapshot_upload::SnapshotUploadJobs, String> {
+    ) -> Result<crate::snapshot_upload::SnapshotUploadJobs, ArtifactBackupSubmissionError> {
         let persisted = self
             .snapshot_upload_worker
             .get_job(job_id)
@@ -5226,7 +5423,8 @@ impl SandboxManagerService {
             return Err(format!(
                 "snapshot-upload job {job_id} terminated before restore-visible handoff: {}",
                 persisted.error.as_deref().unwrap_or("unknown error")
-            ));
+            )
+            .into());
         }
         let mut payload = persisted
             .payload_as::<crate::snapshot_upload::SnapshotUploadJobs>()
@@ -5234,7 +5432,7 @@ impl SandboxManagerService {
         if crate::snapshot_upload_jobs::prepared_upload_requires_begin(&payload) {
             crate::snapshot_upload_jobs::begin_prepared_upload(&payload)
                 .await
-                .map_err(|error| format!("begin restore-visible snapshot backup: {error}"))?;
+                .map_err(ArtifactBackupSubmissionError::Begin)?;
         }
         if payload.job_ids.is_empty() {
             match crate::snapshot_upload::submit_prepared_snapshot(&payload).await {
@@ -5301,7 +5499,7 @@ impl SandboxManagerService {
         snapshot_dir: &str,
         format: pplx_space_sbx_mgr_client::proto::SuspendSnapshotFormat,
         dedup_key: Option<&str>,
-    ) -> Result<SubmitSuspendSnapshotOutcome, Status> {
+    ) -> Result<SubmitSuspendSnapshotOutcome, ArtifactBackupSubmissionError> {
         let request_override = match self.resolve_org_snapshot_upload_config(&sandbox.id).await {
             OrgSnapshotConfigResolution::Resolved(config) => Some(config),
             OrgSnapshotConfigResolution::Absent
@@ -5331,7 +5529,6 @@ impl SandboxManagerService {
             },
         )
         .await
-        .map_err(artifact_backup_fence_status)
     }
 
     pub(super) async fn kill(

@@ -10206,20 +10206,15 @@ pub(crate) mod service_tests {
             TeardownSuspendAction::ObserveOnly,
             TeardownSuspendAction::BeginOrJoin,
         ] {
-            let response = service
+            let error = service
                 .prepare_teardown_suspend(internal_request(prepare_teardown_suspend_request(
                     sandbox_id.clone(),
                     1,
                     action,
                 )))
                 .await
-                .unwrap()
-                .into_inner();
-            assert_eq!(
-                TeardownSuspendOutcome::try_from(response.outcome).unwrap(),
-                TeardownSuspendOutcome::Pending
-            );
-            assert!(response.published_artifact.is_none());
+                .expect_err("quarantine ends polling without authorizing runtime release");
+            assert_eq!(error.code(), tonic::Code::FailedPrecondition);
         }
 
         let error = service
@@ -11233,15 +11228,21 @@ pub(crate) mod service_tests {
                         .prepare_teardown_suspend(internal_request(
                             prepare_teardown_suspend_request(id.clone(), requested, action),
                         ))
-                        .await
-                        .unwrap()
-                        .into_inner();
-                    assert_eq!(
-                        TeardownSuspendOutcome::try_from(response.outcome).unwrap(),
-                        expected,
-                        "{target:?}/{action:?}/{case}"
-                    );
-                    assert!(response.published_artifact.is_none());
+                        .await;
+                    if case == "failed_suspend_job" {
+                        assert_eq!(
+                            response.unwrap_err().code(),
+                            tonic::Code::FailedPrecondition
+                        );
+                    } else {
+                        let response = response.unwrap().into_inner();
+                        assert_eq!(
+                            TeardownSuspendOutcome::try_from(response.outcome).unwrap(),
+                            expected,
+                            "{target:?}/{action:?}/{case}"
+                        );
+                        assert!(response.published_artifact.is_none());
+                    }
                     let db = service.db.lock().unwrap();
                     let after = crate::db::get_sandbox(&db, &id).unwrap().unwrap();
                     assert_eq!(

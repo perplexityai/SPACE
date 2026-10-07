@@ -1,10 +1,13 @@
 use pplx_space_common_core::types::JobId;
 
+use tonic::Status;
+
 use super::{
-    SuspendRequestContext, artifact_backup_format, artifact_backup_lookup_error,
-    current_instance_backup_precondition, encrypted_snapshot_prepare_error_status,
-    ensure_completed_suspend_retry_format, pause_reconciliation_outcome,
-    publish_suspend_snapshot_dir, require_artifact_backup_files, reupload_format_from_sidecar,
+    ArtifactBackupSubmissionError, OrgSnapshotConfigResolution, SuspendRequestContext,
+    artifact_backup_format, artifact_backup_lookup_error, current_instance_backup_precondition,
+    encrypted_snapshot_prepare_error_status, ensure_completed_suspend_retry_format,
+    pause_reconciliation_outcome, publish_suspend_snapshot_dir, require_artifact_backup_files,
+    reupload_format_from_sidecar, teardown_artifact_backup_status,
 };
 use crate::auto_lifecycle::AutoLifecycleCoordinator;
 use crate::guest_filesystem_flush::GuestSnapshotPreparationBudget;
@@ -966,12 +969,12 @@ async fn permanently_refused_teardown_backup_marks_the_suspending_row_terminal()
         )
         .unwrap();
         match failure {
-            pplx_space_common_jobs::JobFailure::Permanent { .. } => {
+            pplx_space_common_jobs::JobFailure::Permanent { reason } => {
                 pplx_space_common_jobs::db::fail_job_permanent(
                     &conn,
                     &backup_job_id,
                     "cluster-api rejected BeginArtifactBackup (NotFound): sandbox not found",
-                    None,
+                    reason,
                 )
                 .unwrap();
             }
@@ -997,7 +1000,7 @@ async fn permanently_refused_teardown_backup_marks_the_suspending_row_terminal()
             local_path: format!("/var/lib/space/sandboxes/{sandbox_id_string}/suspend"),
         };
 
-        service
+        let error = service
             .ensure_teardown_suspend_backup(
                 &row,
                 super::TeardownSuspendBackup {
@@ -1009,6 +1012,33 @@ async fn permanently_refused_teardown_backup_marks_the_suspending_row_terminal()
             .await
             .expect_err("a terminally failed backup cannot make the suspend durable");
 
+        service
+            .record_teardown_suspend_driver_failure(
+                sandbox_id,
+                execution_generation,
+                &error,
+                Some(&OrgSnapshotConfigResolution::ClusterRowMissing),
+            )
+            .unwrap();
+        let terminal = matches!(
+            failure,
+            pplx_space_common_jobs::JobFailure::Permanent { .. }
+        );
+        {
+            let db = service.db.lock().unwrap();
+            let status = crate::db::latest_teardown_suspend_operation(&db, &sandbox_id_string)
+                .unwrap()
+                .unwrap()
+                .status;
+            assert_eq!(
+                status,
+                if terminal {
+                    crate::db::TeardownSuspendOperationStatus::Failed
+                } else {
+                    crate::db::TeardownSuspendOperationStatus::Running
+                }
+            );
+        }
         let marked = {
             let db = service.db.lock().unwrap();
             crate::db::get_sandbox(&db, &sandbox_id_string)
@@ -1022,8 +1052,7 @@ async fn permanently_refused_teardown_backup_marks_the_suspending_row_terminal()
             "{failure:?}"
         );
 
-        // Either way the shim is still told to keep waiting; the marker only
-        // changes who may reclaim the row, never what the caller is told.
+        // A confirmed missing sandbox ends polling without granting release proof.
         let response = service
             .prepare_teardown_suspend(crate::service::activation_support::internal_request(
                 prepare_teardown_suspend_request(
@@ -1032,15 +1061,447 @@ async fn permanently_refused_teardown_backup_marks_the_suspending_row_terminal()
                     crate::proto::TeardownSuspendAction::BeginOrJoin,
                 ),
             ))
+            .await;
+        if terminal {
+            assert_eq!(
+                response.unwrap_err().code(),
+                tonic::Code::FailedPrecondition
+            );
+        } else {
+            assert_eq!(
+                crate::proto::TeardownSuspendOutcome::try_from(
+                    response.unwrap().into_inner().outcome
+                )
+                .unwrap(),
+                crate::proto::TeardownSuspendOutcome::Pending
+            );
+        }
+        service.shutdown_token.cancel();
+        service.task_tracker.close();
+        service.task_tracker.wait().await;
+    }
+}
+
+#[tokio::test]
+async fn teardown_suspend_terminal_driver_failures_stop_polling_without_release_proof() {
+    use crate::service::tests::service_tests::{
+        insert_test_sandbox, prepare_teardown_suspend_request,
+    };
+    use pplx_space_common_core::types::ExecutionGeneration;
+    for state in [
+        Some(SandboxState::Quarantined),
+        Some(SandboxState::Deleting),
+        None,
+    ] {
+        let conn = crate::db::test_conn();
+        let sandbox_id = SandboxId::new();
+        let id = sandbox_id.to_string();
+        insert_test_sandbox(&conn, &id, SandboxState::Paused);
+        let generation = ExecutionGeneration::new(7).unwrap();
+        crate::db::begin_teardown_suspend_operation(&conn, &id, generation).unwrap();
+        // Reproduce legacy jobs without invoking the fixed transition writers.
+        if let Some(state) = state {
+            conn.execute(
+                "UPDATE sandboxes SET state = ?1 WHERE id = ?2",
+                rusqlite::params![state.as_str(), id],
+            )
+            .unwrap();
+        } else {
+            conn.execute("DELETE FROM sandboxes WHERE id = ?1", [&id])
+                .unwrap();
+        }
+        let service = SandboxManagerService::new(conn);
+        service
+            .drive_teardown_suspend(sandbox_id, generation, SandboxEventTrigger::System)
             .await
+            .unwrap_err();
+        {
+            let db = service.db.lock().unwrap();
+            assert_eq!(
+                crate::db::latest_teardown_suspend_operation(&db, &id)
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                crate::db::TeardownSuspendOperationStatus::Failed,
+                "{state:?}"
+            );
+        }
+        for action in [
+            crate::proto::TeardownSuspendAction::BeginOrJoin,
+            crate::proto::TeardownSuspendAction::ObserveOnly,
+        ] {
+            let error = service
+                .prepare_teardown_suspend(crate::service::activation_support::internal_request(
+                    prepare_teardown_suspend_request(id.clone(), generation.get(), action),
+                ))
+                .await
+                .unwrap_err();
+            assert_eq!(error.code(), tonic::Code::FailedPrecondition, "{state:?}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn teardown_suspend_preserves_retryable_and_superseded_driver_work() {
+    use crate::service::tests::service_tests::insert_stranded_teardown_suspend_sandbox;
+    use pplx_space_common_core::types::ExecutionGeneration;
+    let conn = crate::db::test_conn();
+    let sandbox_id = SandboxId::new();
+    let generation = ExecutionGeneration::new(7).unwrap();
+    insert_stranded_teardown_suspend_sandbox(&conn, sandbox_id, generation);
+    let service = SandboxManagerService::new(conn);
+    for error in [
+        Status::unavailable("retry later"),
+        Status::internal("local IO failed"),
+        Status::aborted("generation suspend no longer owns durable suspend artifact"),
+        Status::not_found("runtime RPC object missing"),
+    ] {
+        service
+            .record_teardown_suspend_driver_failure(sandbox_id, generation, &error, None)
+            .unwrap();
+        let db = service.db.lock().unwrap();
+        assert_eq!(
+            crate::db::latest_teardown_suspend_operation(&db, &sandbox_id.to_string())
+                .unwrap()
+                .unwrap()
+                .status,
+            crate::db::TeardownSuspendOperationStatus::Running
+        );
+    }
+    let error = service
+        .drive_teardown_suspend(
+            sandbox_id,
+            ExecutionGeneration::new(6).unwrap(),
+            SandboxEventTrigger::System,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::Aborted);
+    {
+        let db = service.db.lock().unwrap();
+        assert_eq!(
+            crate::db::latest_teardown_suspend_operation(&db, &sandbox_id.to_string())
+                .unwrap()
+                .unwrap()
+                .status,
+            crate::db::TeardownSuspendOperationStatus::Running
+        );
+        db.execute(
+            "UPDATE sandboxes SET state = 'quarantined' WHERE id = ?1",
+            [sandbox_id.to_string()],
+        )
+        .unwrap();
+        db.execute_batch(
+            "CREATE TRIGGER reject_terminal_job BEFORE UPDATE ON jobs
+            WHEN NEW.status = 'failed' BEGIN SELECT RAISE(ABORT, 'synthetic storage failure'); END",
+        )
+        .unwrap();
+    }
+    let error = service
+        .drive_teardown_suspend(sandbox_id, generation, SandboxEventTrigger::System)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    assert_eq!(
+        error.message(),
+        "cannot continue teardown suspend from quarantined",
+        "bookkeeping failure must preserve the original driver error"
+    );
+}
+
+#[tokio::test]
+async fn teardown_suspend_registration_failure_closes_only_the_requested_generation() {
+    use crate::service::tests::service_tests::insert_stranded_teardown_suspend_sandbox;
+    use pplx_space_common_core::types::ExecutionGeneration;
+    let conn = crate::db::test_conn();
+    let sandbox_id = SandboxId::new();
+    let generation = ExecutionGeneration::new(7).unwrap();
+    let failed_artifact = insert_stranded_teardown_suspend_sandbox(&conn, sandbox_id, generation);
+    let service = SandboxManagerService::new(conn);
+    let missing = teardown_artifact_backup_status(
+        ArtifactBackupSubmissionError::Begin(pplx_space_common_jobs::JobError::permanent(
+            "registration refused",
+        )),
+        failed_artifact,
+    );
+    let transient = teardown_artifact_backup_status(
+        ArtifactBackupSubmissionError::Begin(pplx_space_common_jobs::JobError::retriable(
+            "connection unavailable",
+        )),
+        failed_artifact,
+    );
+    service
+        .record_teardown_suspend_driver_failure(
+            sandbox_id,
+            generation,
+            &transient,
+            Some(&OrgSnapshotConfigResolution::ClusterRowMissing),
+        )
+        .unwrap();
+    service
+        .record_teardown_suspend_driver_failure(
+            sandbox_id,
+            ExecutionGeneration::new(6).unwrap(),
+            &missing,
+            Some(&OrgSnapshotConfigResolution::ClusterRowMissing),
+        )
+        .unwrap();
+    {
+        let db = service.db.lock().unwrap();
+        assert!(
+            crate::db::get_sandbox(&db, &sandbox_id.to_string())
+                .unwrap()
+                .unwrap()
+                .failure_reason
+                .is_none(),
+            "transient and stale-generation refusals must not mark the current artifact"
+        );
+        assert_eq!(
+            crate::db::latest_teardown_suspend_operation(&db, &sandbox_id.to_string())
+                .unwrap()
+                .unwrap()
+                .status,
+            crate::db::TeardownSuspendOperationStatus::Running
+        );
+    }
+    // A missing origin node or an inconclusive verification must remain retryable.
+    for resolution in [
+        OrgSnapshotConfigResolution::Absent,
+        OrgSnapshotConfigResolution::LookupFailed("connection unavailable".to_string()),
+    ] {
+        service
+            .record_teardown_suspend_driver_failure(
+                sandbox_id,
+                generation,
+                &missing,
+                Some(&resolution),
+            )
+            .unwrap();
+        let db = service.db.lock().unwrap();
+        assert!(
+            crate::db::get_sandbox(&db, &sandbox_id.to_string())
+                .unwrap()
+                .unwrap()
+                .failure_reason
+                .is_none(),
+            "inconclusive absence verification must not authorize eviction"
+        );
+        assert_eq!(
+            crate::db::latest_teardown_suspend_operation(&db, &sandbox_id.to_string())
+                .unwrap()
+                .unwrap()
+                .status,
+            crate::db::TeardownSuspendOperationStatus::Running
+        );
+    }
+    {
+        let db = service.db.lock().unwrap();
+        crate::db::stage_teardown_suspend_artifact(
+            &db,
+            &sandbox_id.to_string(),
+            generation,
+            LocalArtifactId::new(),
+            "/synthetic/replacement",
+        )
+        .unwrap();
+    }
+    service
+        .record_teardown_suspend_driver_failure(
+            sandbox_id,
+            generation,
+            &missing,
+            Some(&OrgSnapshotConfigResolution::ClusterRowMissing),
+        )
+        .unwrap();
+    {
+        let db = service.db.lock().unwrap();
+        let status = crate::db::teardown_suspend_status(&db, &sandbox_id.to_string())
             .unwrap()
+            .unwrap();
+        assert!(
+            crate::db::get_sandbox(&db, &sandbox_id.to_string())
+                .unwrap()
+                .unwrap()
+                .failure_reason
+                .is_none(),
+            "an old failure must not mark a replacement artifact"
+        );
+        assert_eq!(
+            status.operation.unwrap().status,
+            crate::db::TeardownSuspendOperationStatus::Running
+        );
+        crate::db::stage_teardown_suspend_artifact(
+            &db,
+            &sandbox_id.to_string(),
+            generation,
+            failed_artifact,
+            "/synthetic/original",
+        )
+        .unwrap();
+        db.execute_batch(
+            "CREATE TRIGGER reject_terminal_job BEFORE UPDATE ON jobs
+             WHEN NEW.status = 'failed' BEGIN SELECT RAISE(ABORT, 'synthetic failure'); END",
+        )
+        .unwrap();
+    }
+    service
+        .record_teardown_suspend_driver_failure(
+            sandbox_id,
+            generation,
+            &missing,
+            Some(&OrgSnapshotConfigResolution::ClusterRowMissing),
+        )
+        .unwrap_err();
+    {
+        let db = service.db.lock().unwrap();
+        assert!(
+            crate::db::get_sandbox(&db, &sandbox_id.to_string())
+                .unwrap()
+                .unwrap()
+                .failure_reason
+                .is_none(),
+            "job failure rollback must also roll back eviction evidence"
+        );
+        assert_eq!(
+            crate::db::latest_teardown_suspend_operation(&db, &sandbox_id.to_string())
+                .unwrap()
+                .unwrap()
+                .status,
+            crate::db::TeardownSuspendOperationStatus::Running
+        );
+        db.execute_batch("DROP TRIGGER reject_terminal_job")
+            .unwrap();
+    }
+    service
+        .record_teardown_suspend_driver_failure(
+            sandbox_id,
+            generation,
+            &missing,
+            Some(&OrgSnapshotConfigResolution::ClusterRowMissing),
+        )
+        .unwrap();
+    let db = service.db.lock().unwrap();
+    assert_eq!(
+        crate::db::latest_teardown_suspend_operation(&db, &sandbox_id.to_string())
+            .unwrap()
+            .unwrap()
+            .status,
+        crate::db::TeardownSuspendOperationStatus::Failed
+    );
+    assert_eq!(
+        crate::db::get_sandbox(&db, &sandbox_id.to_string())
+            .unwrap()
+            .unwrap()
+            .failure_reason
+            .as_deref(),
+        Some(pplx_space_sbx_mgr_client::TEARDOWN_SUSPEND_BACKUP_PERMANENTLY_FAILED_REASON),
+        "a closed backup driver must leave the evidence required by cluster-deleted eviction"
+    );
+}
+
+#[tokio::test]
+async fn teardown_suspend_pause_failure_recovery_allows_same_generation_retry() {
+    use crate::service::tests::service_tests::{
+        insert_test_sandbox, prepare_teardown_suspend_request,
+    };
+    use pplx_space_common_core::types::ExecutionGeneration;
+
+    for target in [
+        crate::db::PauseFailedRecoveryTarget::Started,
+        crate::db::PauseFailedRecoveryTarget::Paused,
+    ] {
+        let conn = crate::db::test_conn();
+        let sandbox_id = SandboxId::new();
+        let id = sandbox_id.to_string();
+        let generation = ExecutionGeneration::new(7).unwrap();
+        insert_test_sandbox(&conn, &id, SandboxState::Started);
+        crate::db::update_space_api_route_identity(
+            &conn,
+            sandbox_id,
+            &pplx_space_common_core::types::SpaceApiRouteIdentity {
+                execution_generation: Some(generation),
+                ..Default::default()
+            },
+            crate::auto_lifecycle_delete_receipts::RouteIdentityProvenance::Unfenced,
+        )
+        .unwrap();
+        crate::db::begin_teardown_suspend_operation(&conn, &id, generation).unwrap();
+        let original = crate::db::latest_teardown_suspend_operation(&conn, &id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            crate::db::update_state(&conn, &id, SandboxState::Pausing).unwrap(),
+            crate::db::SandboxStateWriteOutcome::Applied
+        );
+        crate::db::mark_quarantined_from_state(
+            &conn,
+            &id,
+            SandboxState::Pausing,
+            pplx_space_common_core::types::SandboxQuarantineSource::SbxManager,
+            pplx_space_common_core::types::SandboxQuarantineReasonCode::PauseFailed,
+            "ambiguous pause response",
+            pplx_space_common_core::types::SandboxQuarantineNextAction::RequiresOperatorAttention,
+        )
+        .unwrap();
+        let service = SandboxManagerService::new(conn);
+        assert_eq!(
+            service
+                .reject_terminal_teardown_suspend(&id, generation)
+                .unwrap_err()
+                .code(),
+            tonic::Code::FailedPrecondition
+        );
+        {
+            let db = service.db.lock().unwrap();
+            assert!(crate::db::recover_pause_failed_quarantine(&db, &sandbox_id, target).unwrap());
+        }
+        let response = service
+            .prepare_teardown_suspend(crate::service::activation_support::internal_request(
+                prepare_teardown_suspend_request(
+                    id.clone(),
+                    generation.get(),
+                    crate::proto::TeardownSuspendAction::ObserveOnly,
+                ),
+            ))
+            .await
+            .expect("recovery must make this execution eligible to suspend again")
             .into_inner();
         assert_eq!(
             crate::proto::TeardownSuspendOutcome::try_from(response.outcome).unwrap(),
             crate::proto::TeardownSuspendOutcome::Pending,
+            "recovery alone supplies no runtime-release proof"
         );
-        service.shutdown_token.cancel();
-        service.task_tracker.close();
-        service.task_tracker.wait().await;
+        let db = service.db.lock().unwrap();
+        for observed_generation in [None, Some(6), Some(8)] {
+            db.execute(
+                "UPDATE sandboxes SET space_api_route_execution_generation = ?1 WHERE id = ?2",
+                rusqlite::params![observed_generation, id],
+            )
+            .unwrap();
+            crate::db::begin_teardown_suspend_operation(&db, &id, generation).unwrap_err();
+        }
+        db.execute(
+            "UPDATE sandboxes SET space_api_route_execution_generation = ?1 WHERE id = ?2",
+            rusqlite::params![generation.get(), id],
+        )
+        .unwrap();
+        crate::db::begin_teardown_suspend_operation(&db, &id, generation).unwrap();
+        let retry = crate::db::latest_teardown_suspend_operation(&db, &id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(retry.execution_generation, generation);
+        assert_eq!(
+            retry.status,
+            crate::db::TeardownSuspendOperationStatus::Running
+        );
+        assert_ne!(retry.job_id, original.job_id);
+        assert_eq!(
+            pplx_space_common_jobs::db::get_job(&db, &original.job_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            "failed",
+            "retry must retain terminal history"
+        );
     }
 }
