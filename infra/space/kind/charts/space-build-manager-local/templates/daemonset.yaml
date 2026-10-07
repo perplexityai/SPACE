@@ -119,6 +119,9 @@ spec:
             failureThreshold: 3
           volumeMounts:
             {{- include "space-node-service.mount.run" . | nindent 12 }}
+            # Registers each built template and release through ClusterApi
+            # (crates/libs/build/mgr/src/publish.rs).
+            {{- include "space-node-service.mount.clusterApiToken" . | nindent 12 }}
             # HostToContainer: the build's OCI-rootfs and assembly mounts under
             # /space/cache/firecracker/builds stay in this pod's mount namespace
             # and never reach the node's mount table.
@@ -144,6 +147,7 @@ spec:
       volumes:
         {{- include "space-node-service.volume.run" . | nindent 8 }}
         {{- include "space-node-service.volume.cache" . | nindent 8 }}
+        {{- include "space-node-service.volume.clusterApiToken" . | nindent 8 }}
         - name: netns
           hostPath:
             path: /var/run/netns
