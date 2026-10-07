@@ -39,12 +39,13 @@ impl JobExecutor for GatedExecutor {
 }
 
 fn create_jobs_db(path: &Path) {
-    let mut conn = rusqlite::Connection::open(path).unwrap();
-    pplx_space_common_svc::sql::sqlite::migrate_common_schema_up(
-        &mut conn,
-        &super::COMMON_SCHEMA_MIGRATOR,
-    )
-    .unwrap();
+    let conn = rusqlite::Connection::open(path).unwrap();
+    for migration in super::COMMON_SCHEMA_MIGRATOR
+        .iter()
+        .filter(|migration| migration.migration_type.is_up_migration())
+    {
+        conn.execute_batch(migration.sql.as_ref()).unwrap();
+    }
 }
 
 fn open_jobs_db(path: &Path) -> Arc<std::sync::Mutex<rusqlite::Connection>> {

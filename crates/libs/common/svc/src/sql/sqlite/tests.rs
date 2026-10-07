@@ -375,55 +375,6 @@ fn write_table_migration(migrations_dir: &Path, version: i64, name: &str) {
     .unwrap();
 }
 
-#[test]
-fn common_schema_accepts_registered_revisions_and_preserves_history() {
-    use sqlx::SqlSafeStr as _;
-    use sqlx::migrate::{Migration, MigrationType};
-    use std::borrow::Cow;
-
-    let revisions: Vec<_> = ["original", "intermediate", "current", "unknown"]
-        .iter()
-        .map(|comment| {
-            Migration::new(
-                101,
-                Cow::Borrowed("checksum probe"),
-                MigrationType::Simple,
-                sqlx::AssertSqlSafe(format!(
-                    "-- {comment}\nCREATE TABLE checksum_probe (id INTEGER);"
-                ))
-                .into_sql_str(),
-                false,
-            )
-        })
-        .collect();
-    let digests: Vec<_> = revisions[..3]
-        .iter()
-        .map(|m| hex::encode(&m.checksum))
-        .collect();
-    let registry = AcceptedChecksums::from_toml(&format!(
-        "[[migrations]]\nstore = 'common'\nversion = 101\naccepted_checksums = {digests:?}"
-    ))
-    .unwrap();
-    let current = Migrator::with_migrations(vec![revisions[2].clone()]);
-
-    for previous in [None, Some(0), Some(1), Some(2), Some(3)] {
-        let mut conn = Connection::open_in_memory().unwrap();
-        if let Some(previous) = previous {
-            let old = Migrator::with_migrations(vec![revisions[previous].clone()]);
-            migrate_common_schema_up(&mut conn, &old).unwrap();
-        }
-
-        let result = migrate_common_schema_with_checksums(&mut conn, &current, &registry);
-
-        assert_eq!(result.is_ok(), previous != Some(3));
-        let applied = applied_common_schema_migrations(&conn).unwrap();
-        assert_eq!(
-            applied[&101],
-            revisions[previous.unwrap_or(2)].checksum.as_ref()
-        );
-    }
-}
-
 #[tokio::test]
 async fn public_baseline_preserves_rejected_history() {
     let version = super::super::baselines::PUBLIC_SQLITE_BASELINE;
@@ -509,7 +460,7 @@ fn public_test_migrators() -> (&'static Migrator, &'static Migrator) {
 }
 
 #[tokio::test]
-async fn public_embedded_migrations_reject_both_histories_before_hooks_or_writes() {
+async fn public_embedded_migrations_reject_both_histories_before_writes() {
     let (service, common) = public_test_migrators();
     let migrators = EmbeddedMigrators {
         service,
@@ -519,9 +470,7 @@ async fn public_embedded_migrations_reject_both_histories_before_hooks_or_writes
         for change in ["checksum", "failed", "legacy", "future", "missing"] {
             let directory = tempfile::tempdir().unwrap();
             let path = directory.path().join("database.sqlite");
-            migrate_embedded("test", &path, migrators, None)
-                .await
-                .unwrap();
+            migrate_embedded("test", &path, migrators).await.unwrap();
             let conn = Connection::open(&path).unwrap();
             conn.execute(
                 "INSERT INTO jobs VALUES ('retained', 'running', 'owner', 'intent')",
@@ -543,13 +492,7 @@ async fn public_embedded_migrations_reject_both_histories_before_hooks_or_writes
                 .unwrap();
             drop(conn);
 
-            let result = migrate_embedded(
-                "test",
-                &path,
-                migrators,
-                Some(|_| panic!("compatibility hook ran before history admission")),
-            )
-            .await;
+            let result = migrate_embedded("test", &path, migrators).await;
 
             assert!(result.is_err(), "{table} {change}");
             let conn = Connection::open(&path).unwrap();
@@ -609,7 +552,6 @@ async fn public_common_with_legacy_service_preserves_rejected_store() {
             service: &SERVICE,
             common: Some(&COMMON),
         },
-        None,
     )
     .await
     .unwrap();
@@ -632,7 +574,6 @@ async fn public_common_with_legacy_service_preserves_rejected_store() {
             service: &SERVICE,
             common: Some(public_test_migrators().1),
         },
-        None,
     )
     .await;
 
@@ -657,8 +598,24 @@ async fn public_embedded_migrations_resume_after_common_schema_initialization() 
     let (service, common) = public_test_migrators();
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("database.sqlite");
-    let mut conn = Connection::open(&path).unwrap();
-    migrate_common_schema_up(&mut conn, common).unwrap();
+    let conn = Connection::open(&path).unwrap();
+    let baseline = common
+        .iter()
+        .find(|migration| migration.migration_type.is_up_migration())
+        .unwrap();
+    conn.execute_batch(baseline.sql.as_ref()).unwrap();
+    // Model a database written by the former shared-schema runner, before
+    // service initialization. SQLx must adopt its table without restamping it.
+    conn.execute_batch(
+        "CREATE TABLE _space_common_schema_migrations (
+        version BIGINT PRIMARY KEY, description TEXT NOT NULL,
+        installed_on TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        success BOOLEAN NOT NULL, checksum BLOB NOT NULL, execution_time BIGINT NOT NULL
+    );",
+    )
+    .unwrap();
+    conn.execute("INSERT INTO _space_common_schema_migrations VALUES (?1, 'baseline', '2026-01-01 00:00:00', TRUE, ?2, 42)",
+        rusqlite::params![baseline.version, baseline.checksum.as_ref()]).unwrap();
     conn.execute(
         "INSERT INTO jobs VALUES ('retained', 'running', 'owner', 'intent')",
         [],
@@ -674,7 +631,6 @@ async fn public_embedded_migrations_resume_after_common_schema_initialization() 
                 service,
                 common: Some(common),
             },
-            None,
         )
         .await
         .unwrap();
@@ -682,6 +638,17 @@ async fn public_embedded_migrations_resume_after_common_schema_initialization() 
 
     let conn = Connection::open(&path).unwrap();
     assert_eq!(embedded_history(&conn).len(), 2);
+    let recorded: (String, i64, Vec<u8>) = conn
+        .query_row(
+            "SELECT installed_on, execution_time, checksum FROM _space_common_schema_migrations",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        recorded,
+        ("2026-01-01 00:00:00".into(), 42, baseline.checksum.to_vec())
+    );
     assert_eq!(
         conn.query_row("SELECT payload FROM jobs", [], |row| row
             .get::<_, String>(0))

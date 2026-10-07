@@ -52,8 +52,6 @@ async fn service_down_reaches_baseline_without_changing_shared_jobs_or_history()
         default_path: "unused",
         migrator: &SERVICE,
         common_schema: true,
-        compatibility_hook: None,
-        downgrade_admission: None,
     };
     migrate_sqlite_up(database, &path).await.unwrap();
     let conn = Connection::open(&path).unwrap();
@@ -62,7 +60,7 @@ async fn service_down_reaches_baseline_without_changing_shared_jobs_or_history()
         [],
     )
     .unwrap();
-    let history = sqlite::applied_common_schema_migrations(&conn).unwrap();
+    let history = common_history(&conn).unwrap();
 
     rollback_last_sqlite_database(database, &path, &COMMON_SCHEMA_MIGRATOR)
         .await
@@ -77,10 +75,7 @@ async fn service_down_reaches_baseline_without_changing_shared_jobs_or_history()
             )
             .unwrap()
     );
-    assert_eq!(
-        sqlite::applied_common_schema_migrations(&conn).unwrap(),
-        history
-    );
+    assert_eq!(common_history(&conn).unwrap(), history);
     assert_eq!(
         conn.query_row("SELECT MAX(version) FROM _sqlx_migrations", [], |row| row
             .get::<_, i64>(
@@ -96,10 +91,7 @@ async fn service_down_reaches_baseline_without_changing_shared_jobs_or_history()
     let result = rollback_last_sqlite_database(database, &path, &COMMON_SCHEMA_MIGRATOR).await;
 
     assert!(result.is_err());
-    assert_eq!(
-        sqlite::applied_common_schema_migrations(&conn).unwrap(),
-        history
-    );
+    assert_eq!(common_history(&conn).unwrap(), history);
     assert_eq!(
         conn.pragma_query_value(None, "schema_version", |row| row.get::<_, i64>(0))
             .unwrap(),
@@ -127,8 +119,6 @@ async fn mixed_catalog_down_removes_the_newest_migration_and_reopens_the_previou
             default_path: "unused",
             migrator: &SERVICE,
             common_schema: true,
-            compatibility_hook: None,
-            downgrade_admission: None,
         };
         let mut common = COMMON_SCHEMA_MIGRATOR.iter().cloned().collect::<Vec<_>>();
         common.extend([
@@ -149,8 +139,8 @@ async fn mixed_catalog_down_removes_the_newest_migration_and_reopens_the_previou
         ]);
         let common = Migrator::with_migrations(common);
         migrate_sqlite_up(database, &path).await.unwrap();
-        let mut conn = Connection::open(&path).unwrap();
-        sqlite::migrate_common_schema_up(&mut conn, &common).unwrap();
+        let conn = Connection::open(&path).unwrap();
+        migrate_common(&path, &common).await;
         conn.execute(
             "INSERT INTO jobs (job_id, kind, status) VALUES ('retained', 'test', 'running')",
             [],
@@ -181,11 +171,7 @@ async fn mixed_catalog_down_removes_the_newest_migration_and_reopens_the_previou
             service_version
         );
         assert_eq!(
-            sqlite::applied_common_schema_migrations(&conn)
-                .unwrap()
-                .keys()
-                .copied()
-                .max(),
+            common_history(&conn).unwrap().keys().copied().max(),
             Some(shared_version)
         );
         let previous_service = Migrator::with_migrations(
@@ -202,7 +188,7 @@ async fn mixed_catalog_down_removes_the_newest_migration_and_reopens_the_previou
                 .cloned()
                 .collect(),
         );
-        sqlite::migrate_common_schema_up(&mut conn, &previous_common).unwrap();
+        migrate_common(&path, &previous_common).await;
         let pool = sqlite_pool(&path).await.unwrap();
         previous_service.run(&pool).await.unwrap();
         pool.close().await;

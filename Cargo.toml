@@ -41,7 +41,6 @@ members = [
     "crates/libs/spaced/guest/server",
     "crates/libs/spaced/host/client",
     "crates/libs/spaced/host/server",
-    "crates/libs/sqlite/migrations",
     "crates/libs/test-env",
     "crates/libs/sandbox/store",
     "crates/libs/sandbox/teardown",
@@ -290,7 +289,6 @@ pplx-space-common-lru-reaper = { path = "crates/libs/common/lru-reaper" }
 pplx-space-common-proto-build = { path = "crates/libs/common/proto-build" }
 pplx-space-common-svc = { path = "crates/libs/common/svc", default-features = false }
 pplx-space-common-work-coalescer = { path = "crates/libs/common/work-coalescer" }
-pplx-space-sqlite-migrations = { path = "crates/libs/sqlite/migrations" }
 pplx-space-data-plane-server = { path = "crates/libs/data/plane/server" }
 pplx-space-db-migrate = { path = "crates/libs/db/migrator" }
 pplx-space-db-test-fixtures = { path = "crates/libs/db-test-fixtures" }

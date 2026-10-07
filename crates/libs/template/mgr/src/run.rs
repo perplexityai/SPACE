@@ -150,7 +150,6 @@ async fn run_service(
             service: &TEMPLATE_MANAGER_MIGRATOR,
             common: Some(&COMMON_SCHEMA_MIGRATOR),
         },
-        None,
     )
     .await
     .map_err(RunTemplateMgrError::Migrate)?;

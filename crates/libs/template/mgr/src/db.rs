@@ -25,9 +25,9 @@ fn immediate_transaction(conn: &Connection) -> Result<rusqlite::Transaction<'_>>
 pub fn init_in_memory(conn: &mut Connection) {
     let service = sqlx::migrate!("../../../../db/template-manager");
     let common = sqlx::migrate!("../../../../db/common");
-    pplx_space_common_svc::sql::sqlite::migrate_common_schema_up(conn, &common).unwrap();
-    for migration in service
+    for migration in common
         .iter()
+        .chain(service.iter())
         .filter(|migration| migration.migration_type.is_up_migration())
     {
         conn.execute_batch(migration.sql.as_ref()).unwrap();

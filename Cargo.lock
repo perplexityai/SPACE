@@ -5445,7 +5445,6 @@ dependencies = [
  "pplx-space-db-test-fixtures",
  "pplx-space-metrics",
  "pplx-space-observability",
- "pplx-space-sqlite-migrations",
  "pplx-space-test-env",
  "rand 0.10.2",
  "redis",
@@ -5462,7 +5461,6 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tokio-util",
- "toml",
  "tonic",
  "tonic-health",
  "tonic-prost",
@@ -5703,7 +5701,6 @@ dependencies = [
  "pplx-space-common-svc",
  "pplx-space-db-test-fixtures",
  "pplx-space-sbxmgr-migrations",
- "pplx-space-sqlite-migrations",
  "pplx-space-test-env",
  "rusqlite",
  "sqlx",
@@ -6731,10 +6728,7 @@ dependencies = [
 name = "pplx-space-sbxmgr-migrations"
 version = "0.8.0"
 dependencies = [
- "pplx-space-sqlite-migrations",
- "rusqlite",
  "sqlx",
- "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -6995,13 +6989,6 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tracing-subscriber",
-]
-
-[[package]]
-name = "pplx-space-sqlite-migrations"
-version = "0.8.0"
-dependencies = [
- "thiserror 2.0.20",
 ]
 
 [[package]]

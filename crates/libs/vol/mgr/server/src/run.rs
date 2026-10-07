@@ -44,7 +44,6 @@ pub(crate) async fn migrate_volume_manager_db(path: &Path) -> Result<(), SqliteE
             service: &VOLUME_MANAGER_MIGRATOR,
             common: Some(&COMMON_SCHEMA_MIGRATOR),
         },
-        None,
     )
     .await
 }

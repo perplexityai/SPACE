@@ -806,12 +806,13 @@ fn test_worker_with_active_limit(
     Arc<Mutex<rusqlite::Connection>>,
     BackgroundWorker<BlockingExecutor>,
 ) {
-    let mut conn = rusqlite::Connection::open_in_memory().unwrap();
-    pplx_space_common_svc::sql::sqlite::migrate_common_schema_up(
-        &mut conn,
-        &sqlx::migrate!("../../../../../db/common"),
-    )
-    .unwrap();
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    for migration in sqlx::migrate!("../../../../../db/common")
+        .iter()
+        .filter(|migration| migration.migration_type.is_up_migration())
+    {
+        conn.execute_batch(migration.sql.as_ref()).unwrap();
+    }
     let db = Arc::new(Mutex::new(conn));
     let worker = BackgroundWorker::new(
         Arc::clone(&db),

@@ -177,13 +177,6 @@ pub(crate) async fn run_up(
     policy: LockRetryPolicy,
 ) -> Result<u32, MigrationRunFailed> {
     let budget = policy.attempts.get();
-    let checksums = pplx_space_common_svc::sql::migration_checksums::AcceptedChecksums::embedded()
-        .map_err(|source| MigrationRunFailed {
-            attempt: 1,
-            budget,
-            source,
-        })?;
-
     // Pin one connection for every attempt, and keep passing `&mut *conn` so
     // that stays true. sqlx takes a session-level `pg_advisory_lock` before it
     // applies anything and skips its own `unlock` on every error path, so a
@@ -215,7 +208,7 @@ pub(crate) async fn run_up(
     // it most.
     let mut retrying_since: Option<Instant> = None;
     loop {
-        let error = match checksums.run("postgres", migrator, &mut *conn).await {
+        let error = match migrator.run(&mut *conn).await {
             Ok(()) => {
                 if attempt > 1 {
                     info!(

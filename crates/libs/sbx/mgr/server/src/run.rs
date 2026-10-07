@@ -82,7 +82,6 @@ async fn migrate_sandbox_manager_db(
             service: &SANDBOX_MANAGER_MIGRATOR,
             common: Some(&COMMON_SCHEMA_MIGRATOR),
         },
-        Some(pplx_space_sbxmgr_migrations::prepare_migrations),
     )
     .await
 }

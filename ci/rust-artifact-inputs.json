@@ -62,7 +62,6 @@
         "crates/libs/snapshot/store",
         "crates/libs/spaced/build",
         "crates/libs/spaced/common",
-        "crates/libs/sqlite/migrations",
         "crates/libs/template/mgr-client",
         "crates/libs/template/publish"
       ]
@@ -99,7 +98,6 @@
         "crates/libs/sbx/mgr/migrations",
         "crates/libs/spaced/build",
         "crates/libs/spaced/common",
-        "crates/libs/sqlite/migrations",
         "crates/libs/template/mgr-client"
       ]
     },
@@ -150,7 +148,6 @@
         "crates/libs/snapshot/store",
         "crates/libs/spaced/build",
         "crates/libs/spaced/common",
-        "crates/libs/sqlite/migrations",
         "crates/libs/template/mgr-client"
       ]
     },
@@ -178,7 +175,6 @@
         "crates/libs/sbx/mgr/client",
         "crates/libs/spaced/build",
         "crates/libs/spaced/common",
-        "crates/libs/sqlite/migrations",
         "crates/libs/template/mgr-client"
       ]
     },
@@ -270,7 +266,6 @@
         "crates/libs/spaced/guest/server",
         "crates/libs/spaced/host/client",
         "crates/libs/spaced/host/server",
-        "crates/libs/sqlite/migrations",
         "crates/libs/template/mgr",
         "crates/libs/template/mgr-client",
         "crates/libs/vol/mgr/client",

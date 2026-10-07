@@ -1,4 +1,4 @@
-use rusqlite::params;
+use rusqlite::{Connection, params};
 
 use super::*;
 
@@ -15,7 +15,7 @@ static ALL_MIGRATORS: &[(&str, &Migrator)] = &[
 ];
 
 #[tokio::test]
-async fn sandbox_cutover_refuses_down_before_shared_schema_or_history_writes() {
+async fn sandbox_baseline_refuses_down_without_changing_shared_jobs_or_history() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("sandbox.sqlite");
     let database = sqlite_sandbox_manager();
@@ -26,37 +26,29 @@ async fn sandbox_cutover_refuses_down_before_shared_schema_or_history_writes() {
         [],
     )
     .unwrap();
-    // Exercise the preparation command's forward-floor refusal as well as the
-    // final binary's refusal to reverse its otherwise-readable common schema.
-    for required in [2, 3] {
-        conn.pragma_update(None, "user_version", required).unwrap();
-        let before = sqlite::applied_common_schema_migrations(&conn).unwrap();
-        let schema_before: i64 = conn
-            .pragma_query_value(None, "schema_version", |row| row.get(0))
-            .unwrap();
-        let error = rollback_last_sqlite_database(database, &path, &COMMON_SCHEMA_MIGRATOR)
-            .await
-            .unwrap_err();
-        assert!(matches!(error, RunDbMigrateError::DowngradeAdmission(_)));
-        assert_eq!(
-            sqlite::applied_common_schema_migrations(&conn).unwrap(),
-            before
-        );
-        assert_eq!(
-            conn.pragma_query_value(None, "schema_version", |row| row.get::<_, i64>(0))
-                .unwrap(),
-            schema_before
-        );
-        assert_eq!(
-            conn.query_row(
-                "SELECT status FROM jobs WHERE job_id = 'cancelled-witness'",
-                [],
-                |row| row.get::<_, String>(0)
-            )
+    let before = common_history(&conn).unwrap();
+    let schema_before: i64 = conn
+        .pragma_query_value(None, "schema_version", |row| row.get(0))
+        .unwrap();
+    let error = rollback_last_sqlite_database(database, &path, &COMMON_SCHEMA_MIGRATOR)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, RunDbMigrateError::RollbackSqlite(_)));
+    assert_eq!(common_history(&conn).unwrap(), before);
+    assert_eq!(
+        conn.pragma_query_value(None, "schema_version", |row| row.get::<_, i64>(0))
             .unwrap(),
-            "cancelled"
-        );
-    }
+        schema_before
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT status FROM jobs WHERE job_id = 'cancelled-witness'",
+            [],
+            |row| row.get::<_, String>(0)
+        )
+        .unwrap(),
+        "cancelled"
+    );
 }
 
 #[test]
@@ -244,4 +236,16 @@ async fn migration_creates_a_missing_database_parent() {
 
     assert!(db_path.exists());
     assert_common_jobs_table_matches_reader(&db_path);
+}
+
+fn common_history(conn: &Connection) -> rusqlite::Result<std::collections::BTreeMap<i64, Vec<u8>>> {
+    conn.prepare("SELECT version, checksum FROM _space_common_schema_migrations ORDER BY version")?
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect()
+}
+
+async fn migrate_common(path: &Path, migrator: &Migrator) {
+    let pool = sqlite_pool(path).await.unwrap();
+    sqlite::common_migrator(migrator).run(&pool).await.unwrap();
+    pool.close().await;
 }

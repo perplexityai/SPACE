@@ -14,8 +14,6 @@ pub mod baselines;
 pub mod contention;
 pub mod federated_service_grants;
 pub mod identity;
-#[cfg(feature = "sqlite")]
-pub mod migration_checksums;
 pub mod sandbox_quarantine;
 pub mod sandbox_residency;
 pub mod sandbox_routability;

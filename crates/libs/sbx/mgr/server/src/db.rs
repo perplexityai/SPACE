@@ -10804,10 +10804,9 @@ pub fn update_network_counters(
 #[cfg(test)]
 pub(crate) fn create_test_schema(conn: &mut Connection) {
     use pplx_space_sbxmgr_migrations::{COMMON_SCHEMA_MIGRATOR, SANDBOX_MANAGER_MIGRATOR};
-    pplx_space_common_svc::sql::sqlite::migrate_common_schema_up(conn, &COMMON_SCHEMA_MIGRATOR)
-        .unwrap();
-    for migration in SANDBOX_MANAGER_MIGRATOR
+    for migration in COMMON_SCHEMA_MIGRATOR
         .iter()
+        .chain(SANDBOX_MANAGER_MIGRATOR.iter())
         .filter(|migration| migration.migration_type.is_up_migration())
     {
         conn.execute_batch(migration.sql.as_ref()).unwrap();

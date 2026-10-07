@@ -19,8 +19,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use clap::{Parser, Subcommand, ValueEnum};
-use rusqlite::Connection;
-use sqlx::migrate::{MigrateError, MigrationType, Migrator};
+use sqlx::migrate::{Migrate, MigrateError, MigrationType, Migrator};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{PgConnection, PgPool, SqlitePool};
@@ -131,17 +130,12 @@ pub enum Command {
     Reset,
 }
 
-type SqliteDowngradeAdmission =
-    fn(&Connection) -> Result<(), pplx_space_sqlite_migrations::MigrationCompatibilityError>;
-
 #[derive(Clone, Copy)]
 struct SqliteDatabase {
     name: &'static str,
     default_path: &'static str,
     migrator: &'static Migrator,
     common_schema: bool,
-    compatibility_hook: Option<sqlite::MigrationCompatibilityHook>,
-    downgrade_admission: Option<SqliteDowngradeAdmission>,
 }
 
 /// Everything [`run`] needs from the process that hosts it: the binary's
@@ -178,8 +172,6 @@ pub enum RunDbMigrateError {
     UserPassword(#[from] user_password::SetUserPasswordError),
     #[error(transparent)]
     Sqlite(#[from] SqliteError),
-    #[error(transparent)]
-    DowngradeAdmission(#[from] pplx_space_sqlite_migrations::MigrationCompatibilityError),
     #[error("failed to connect to control-plane Postgres: {0}")]
     ConnectPostgres(#[source] sqlx::Error),
     #[error("failed to reconnect to control-plane Postgres after reset: {0}")]
@@ -194,12 +186,6 @@ pub enum RunDbMigrateError {
         #[source]
         source: sqlx::Error,
     },
-    #[error("failed to open SQLite at {path}: {source}")]
-    OpenSqlite {
-        path: PathBuf,
-        #[source]
-        source: rusqlite::Error,
-    },
     #[error("failed to acquire Postgres connection: {0}")]
     AcquirePostgresConnection(#[source] sqlx::Error),
     #[error("failed to drop Postgres public schema: {0}")]
@@ -210,12 +196,10 @@ pub enum RunDbMigrateError {
     GrantPublicSchema(#[source] sqlx::Error),
     #[error("failed to create control-plane Postgres _sqlx_migrations table: {0}")]
     CreatePostgresMigrationsTable(#[source] sqlx::Error),
-    #[error("failed to create SQLite _sqlx_migrations table: {0}")]
-    CreateSqliteMigrationsTable(#[source] sqlx::Error),
     #[error("failed to load control-plane Postgres SQLx migration history: {0}")]
     LoadPostgresHistory(#[source] sqlx::Error),
     #[error("failed to load SQLite SQLx migration history: {0}")]
-    LoadSqliteHistory(#[source] sqlx::Error),
+    LoadSqliteHistory(#[source] MigrateError),
     #[error("failed to roll back control-plane Postgres migration: {0}")]
     RollbackPostgres(#[source] MigrateError),
     #[error("failed to roll back SQLite migration: {0}")]
@@ -250,8 +234,6 @@ fn sqlite_sandbox_manager() -> SqliteDatabase {
         default_path: pplx_space_common_svc::core::host::linux::paths::SANDBOX_MANAGER_DB,
         migrator: &SANDBOX_MANAGER_MIGRATOR,
         common_schema: true,
-        compatibility_hook: Some(pplx_space_sbxmgr_migrations::prepare_migrations),
-        downgrade_admission: Some(pplx_space_sbxmgr_migrations::ensure_downgrade_allowed),
     }
 }
 
@@ -261,8 +243,6 @@ fn sqlite_template_manager() -> SqliteDatabase {
         default_path: pplx_space_common_svc::core::host::linux::paths::TEMPLATE_MANAGER_DB,
         migrator: &TEMPLATE_MANAGER_MIGRATOR,
         common_schema: true,
-        compatibility_hook: None,
-        downgrade_admission: None,
     }
 }
 
@@ -272,8 +252,6 @@ fn sqlite_node_manager() -> SqliteDatabase {
         default_path: pplx_space_common_svc::core::host::linux::paths::NODE_MANAGER_DB,
         migrator: &NODE_MANAGER_MIGRATOR,
         common_schema: false,
-        compatibility_hook: None,
-        downgrade_admission: None,
     }
 }
 
@@ -283,8 +261,6 @@ fn sqlite_node_ctl() -> SqliteDatabase {
         default_path: pplx_space_common_svc::core::host::linux::paths::NODE_CTL_DB,
         migrator: &NODE_CTL_MIGRATOR,
         common_schema: false,
-        compatibility_hook: None,
-        downgrade_admission: None,
     }
 }
 
@@ -294,8 +270,6 @@ fn sqlite_runtime_manager() -> SqliteDatabase {
         default_path: pplx_space_common_svc::core::host::linux::paths::RUNTIME_MANAGER_DB,
         migrator: &RUNTIME_MANAGER_MIGRATOR,
         common_schema: true,
-        compatibility_hook: None,
-        downgrade_admission: None,
     }
 }
 
@@ -305,8 +279,6 @@ fn sqlite_volume_manager() -> SqliteDatabase {
         default_path: pplx_space_common_svc::core::host::linux::paths::VOLUME_MANAGER_DB,
         migrator: &VOLUME_MANAGER_MIGRATOR,
         common_schema: true,
-        compatibility_hook: None,
-        downgrade_admission: None,
     }
 }
 
@@ -316,8 +288,6 @@ fn sqlite_build_manager() -> SqliteDatabase {
         default_path: pplx_space_common_svc::core::host::linux::paths::BUILD_MANAGER_DB,
         migrator: &BUILD_MANAGER_MIGRATOR,
         common_schema: true,
-        compatibility_hook: None,
-        downgrade_admission: None,
     }
 }
 
@@ -441,7 +411,6 @@ async fn migrate_sqlite_up(
             service: database.migrator,
             common: database.common_schema.then_some(&COMMON_SCHEMA_MIGRATOR),
         },
-        database.compatibility_hook,
     )
     .await?)
 }
@@ -505,25 +474,6 @@ async fn ensure_sqlx_migrations_table_postgres_conn(
     Ok(())
 }
 
-async fn ensure_sqlx_migrations_table_sqlite(pool: &SqlitePool) -> Result<(), RunDbMigrateError> {
-    sqlx::query(sql!(
-        r"
-        CREATE TABLE IF NOT EXISTS _sqlx_migrations (
-            version BIGINT PRIMARY KEY,
-            description TEXT NOT NULL,
-            installed_on TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            success BOOLEAN NOT NULL,
-            checksum BLOB NOT NULL,
-            execution_time BIGINT NOT NULL
-        )
-        "
-    ))
-    .execute(pool)
-    .await
-    .map_err(RunDbMigrateError::CreateSqliteMigrationsTable)?;
-    Ok(())
-}
-
 async fn applied_versions_postgres(pool: &PgPool) -> Result<Vec<i64>, RunDbMigrateError> {
     sqlx::query_scalar(sql!(
         "SELECT version FROM _sqlx_migrations WHERE success = TRUE ORDER BY version"
@@ -533,13 +483,33 @@ async fn applied_versions_postgres(pool: &PgPool) -> Result<Vec<i64>, RunDbMigra
     .map_err(RunDbMigrateError::LoadPostgresHistory)
 }
 
-async fn applied_versions_sqlite(pool: &SqlitePool) -> Result<Vec<i64>, RunDbMigrateError> {
-    sqlx::query_scalar(sql!(
-        "SELECT version FROM _sqlx_migrations WHERE success = TRUE ORDER BY version"
-    ))
-    .fetch_all(pool)
-    .await
-    .map_err(RunDbMigrateError::LoadSqliteHistory)
+async fn applied_versions_sqlite(
+    pool: &SqlitePool,
+    migrator: &Migrator,
+) -> Result<Vec<i64>, RunDbMigrateError> {
+    let mut conn = pool
+        .acquire()
+        .await
+        .map_err(|error| RunDbMigrateError::LoadSqliteHistory(error.into()))?;
+    conn.ensure_migrations_table(&migrator.table_name)
+        .await
+        .map_err(RunDbMigrateError::LoadSqliteHistory)?;
+    if let Some(version) = conn
+        .dirty_version(&migrator.table_name)
+        .await
+        .map_err(RunDbMigrateError::LoadSqliteHistory)?
+    {
+        return Err(RunDbMigrateError::LoadSqliteHistory(MigrateError::Dirty(
+            version,
+        )));
+    }
+    Ok(conn
+        .list_applied_migrations(&migrator.table_name)
+        .await
+        .map_err(RunDbMigrateError::LoadSqliteHistory)?
+        .into_iter()
+        .map(|migration| migration.version)
+        .collect())
 }
 
 async fn rollback_last_postgres(
@@ -561,8 +531,7 @@ async fn rollback_last_sqlite(
     pool: &SqlitePool,
     migrator: &Migrator,
 ) -> Result<(), RunDbMigrateError> {
-    ensure_sqlx_migrations_table_sqlite(pool).await?;
-    let applied_versions = applied_versions_sqlite(pool).await?;
+    let applied_versions = applied_versions_sqlite(pool, migrator).await?;
     rollback_last(migrator, &applied_versions, |target| async move {
         migrator
             .undo(pool, target)
@@ -577,60 +546,25 @@ async fn rollback_last_sqlite_database(
     database_path: &Path,
     common_migrator: &Migrator,
 ) -> Result<(), RunDbMigrateError> {
-    if let Some(admit) = database.downgrade_admission {
-        let conn = open_sqlite_connection(database_path)?;
-        admit(&conn)?;
-    }
     let pool = sqlite_pool(database_path).await?;
-    ensure_sqlx_migrations_table_sqlite(&pool).await?;
-
-    let baseline = pplx_space_common_svc::sql::baselines::PUBLIC_SQLITE_BASELINE;
-    if !database.common_schema {
-        return rollback_last_sqlite(&pool, database.migrator).await;
+    if database.common_schema {
+        let common = sqlite::common_migrator(common_migrator);
+        let service_version = applied_versions_sqlite(&pool, database.migrator)
+            .await?
+            .last()
+            .copied();
+        let common_version = applied_versions_sqlite(&pool, &common)
+            .await?
+            .last()
+            .copied();
+        if common_version.is_some_and(|version| {
+            version > pplx_space_common_svc::sql::baselines::PUBLIC_SQLITE_BASELINE
+                && Some(version) > service_version
+        }) {
+            return rollback_last_sqlite(&pool, &common).await;
+        }
     }
-
-    let service_version = applied_versions_sqlite(&pool).await?.last().copied();
-    let mut conn = open_sqlite_connection(database_path)?;
-    sqlite::ensure_common_schema_migrations_table(&conn)?;
-    if sqlite::applied_common_schema_migrations(&conn)?
-        .keys()
-        .copied()
-        .max()
-        .is_some_and(|version| version > baseline && Some(version) > service_version)
-    {
-        return rollback_last_common_schema(&mut conn, common_migrator);
-    }
-
     rollback_last_sqlite(&pool, database.migrator).await
-}
-
-fn open_sqlite_connection(database_path: &Path) -> Result<Connection, RunDbMigrateError> {
-    Connection::open(database_path).map_err(|source| RunDbMigrateError::OpenSqlite {
-        path: database_path.to_path_buf(),
-        source,
-    })
-}
-
-fn rollback_last_common_schema(
-    conn: &mut Connection,
-    migrator: &Migrator,
-) -> Result<(), RunDbMigrateError> {
-    sqlite::ensure_common_schema_migrations_table(conn)?;
-    let applied = sqlite::applied_common_schema_migrations(conn)?;
-    let Some(current_version) = applied.keys().copied().max() else {
-        println!("no applied migrations to roll back");
-        return Ok(());
-    };
-
-    sqlite::rollback_common_schema_migration(conn, migrator, current_version)?;
-    let target_version = applied
-        .keys()
-        .copied()
-        .filter(|version| *version < current_version)
-        .max()
-        .unwrap_or(0);
-    println!("rolled back common schema migration {current_version} to {target_version}");
-    Ok(())
 }
 
 async fn rollback_last<F, Fut>(
@@ -693,22 +627,18 @@ async fn print_status_sqlite_database(
     database_path: &Path,
 ) -> Result<(), RunDbMigrateError> {
     let pool = sqlite_pool(database_path).await?;
-    ensure_sqlx_migrations_table_sqlite(&pool).await?;
-
     if database.common_schema {
-        let conn = open_sqlite_connection(database_path)?;
-        sqlite::ensure_common_schema_migrations_table(&conn)?;
-        let applied = sqlite::applied_common_schema_migrations(&conn)?
-            .keys()
-            .copied()
-            .collect::<Vec<_>>();
-        print_status("common", &COMMON_SCHEMA_MIGRATOR, applied);
+        let common = sqlite::common_migrator(&COMMON_SCHEMA_MIGRATOR);
+        print_status(
+            "common",
+            &common,
+            applied_versions_sqlite(&pool, &common).await?,
+        );
     }
-
     print_status(
         "service",
         database.migrator,
-        applied_versions_sqlite(&pool).await?,
+        applied_versions_sqlite(&pool, database.migrator).await?,
     );
     Ok(())
 }

@@ -11,9 +11,4 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
-rusqlite = { workspace = true }
 sqlx = { workspace = true, features = ["migrate", "macros"] }
-thiserror = { workspace = true }
-
-# internal
-pplx-space-sqlite-migrations = { workspace = true }
