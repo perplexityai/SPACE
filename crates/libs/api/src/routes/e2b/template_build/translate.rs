@@ -25,15 +25,11 @@
 //!
 //! Plus two cross-cutting fields on `TemplateBuildStartV2`:
 //!
-//! * `startCmd` -> a build-time Run step that drops a systemd unit at
-//!   `/etc/systemd/system/e2b-template-start.service`, `systemctl enable`s
-//!   it, and gives the unit `WantedBy=space.target`. SPACE sandboxes boot
-//!   to `space.target`, not `multi-user.target`. e2b's real semantics
-//!   would snapshot a warmed-up VM here; SPACE doesn't have that publish
-//!   path yet, so every sandbox cold-boots through systemd instead. That
-//!   gap is documented in the module header.
-//! * `readyCmd` -> accepted but not enforced (it only matters for the warm
-//!   snapshot gate we don't yet have).
+//! * `startCmd` and `readyCmd` lower to native SetRuntime intent. The
+//!   guest owns startup and readiness; this adapter never writes unit text.
+//!   ENV becomes template defaults. Startup retains SPACE's root, `/`,
+//!   `/bin/sh -lc` defaults. Readiness is enforced at boot/snapshot creation,
+//!   not before publishing the built rootfs.
 //!
 //! Base-template alias: `code-interpreter-v1` (the E2B base)
 //! becomes `code-runtime` before the Recipe is forwarded. Template selectors
@@ -42,7 +38,6 @@
 
 use std::{collections::BTreeMap, str::FromStr};
 
-use base64::{Engine as _, engine::general_purpose::STANDARD as Base64};
 use oci_spec::distribution::Reference as OciReference;
 use pplx_space_build_mgr_client::proto as build_proto;
 use pplx_space_common_core::types::{OrgId, TemplateName, TemplateReference, TemplateSelector};
@@ -93,9 +88,6 @@ fn base_template_defaults(base: &str) -> (String, Option<String>) {
 /// prefix rules as a JSON object. Unconfigured templates use build-manager defaults.
 const TEMPLATE_BUILD_DISK_MIB_ENV: &str = "SPACE_TEMPLATE_BUILD_DISK_MIB";
 const MIB: u64 = 1024 * 1024;
-
-const START_UNIT_PATH: &str = "/etc/systemd/system/e2b-template-start.service";
-const START_UNIT_NAME: &str = "e2b-template-start.service";
 
 pub(super) async fn build_recipe(
     org_id: OrgId,
@@ -162,8 +154,8 @@ pub(super) async fn build_recipe(
         .await?;
     }
 
-    if let Some(start_cmd) = req.start_cmd.as_deref().filter(|s| !s.is_empty()) {
-        steps.push(install_start_cmd_unit(start_cmd));
+    if let Some(runtime) = runtime_step(req)? {
+        steps.push(runtime);
     }
 
     Ok(build_proto::Recipe {
@@ -532,47 +524,50 @@ fn run_in_workdir(command: &str, workdir: &str) -> String {
     format!("cd {} && {{\n{command}\n}}", shell_quote(workdir))
 }
 
-/// Materialize the e2b `startCmd` as a build-time RUN step that writes a
-/// systemd unit and `systemctl enable`s it. We base64-encode the unit
-/// file so nested-quote pitfalls inside `bash -c '...'` from the recipe
-/// step don't bite us.
-fn install_start_cmd_unit(start_cmd: &str) -> build_proto::recipe::Step {
-    let unit = format!(
-        concat!(
-            "[Unit]\n",
-            "Description=e2b template start_cmd (translated by space-api)\n",
-            "After=local-fs.target network-online.target\n",
-            "DefaultDependencies=no\n",
-            "\n",
-            // The seed's drop-in for this unit sets its slice and task limit.
-            "[Service]\n",
-            "Type=simple\n",
-            // One of its processes killed for running out of memory ends that
-            // process, not the whole start command.
-            "OOMPolicy=continue\n",
-            "ExecStart=/bin/sh -lc {cmd_quoted}\n",
-            "Restart=on-failure\n",
-            "RestartSec=2\n",
-            "\n",
-            "[Install]\n",
-            "WantedBy=space.target\n",
-        ),
-        cmd_quoted = shell_quote(start_cmd),
-    );
-    let unit_b64 = Base64.encode(unit.as_bytes());
-    // Trailing `sync` flushes this write (the unit file + the enable symlink)
-    // before the build moves on. This is the final recipe step, so without the
-    // flush the write can still be in the page cache when the build VM is torn
-    // down, and the finalize e2fsck journal recovery may discard it. The build
-    // finalize also syncs the guest before shutdown; this is belt-and-suspenders
-    // at the step that produces the easy-to-lose last mutation.
-    let command = format!(
-        "printf %s {} | base64 -d > {} && systemctl enable {} && sync",
-        shell_quote(&unit_b64),
-        START_UNIT_PATH,
-        START_UNIT_NAME,
-    );
-    run_step(&command, "root")
+fn runtime_step(
+    req: &TemplateBuildStartV2,
+) -> Result<Option<build_proto::recipe::Step>, E2bApiError> {
+    use build_proto::recipe::{RuntimeApp, SetRuntime, runtime_app};
+    let start = req.start_cmd.as_deref().filter(|value| !value.is_empty());
+    let ready = req.ready_cmd.as_deref().filter(|value| !value.is_empty());
+    let Some(start) = start else {
+        if ready.is_some() {
+            return Err(E2bApiError::bad_request("readyCmd requires startCmd"));
+        }
+        return Ok(None); // Native parent declaration is inherited unchanged.
+    };
+    let mut env = std::collections::HashMap::new();
+    for step in &req.steps {
+        if step.kind == "ENV" {
+            env.extend(parse_env_args(&step.args)?);
+        }
+    }
+    let shell = |command: &str| vec!["/bin/sh".into(), "-lc".into(), command.to_owned()];
+    let runtime = SetRuntime {
+        schema_version: 1,
+        apps: vec![RuntimeApp {
+            name: "app".into(),
+            command: shell(start),
+            user: "root".into(),
+            working_directory: "/".into(),
+            env,
+            readiness: Some(match ready {
+                Some(command) => runtime_app::Readiness::Exec(runtime_app::ExecReady {
+                    command: shell(command),
+                }),
+                None => runtime_app::Readiness::Launch(runtime_app::LaunchReady {}),
+            }),
+            startup_timeout_secs: 60,
+            startup_policy: 0,
+        }],
+    };
+    pplx_space_build_mgr_client::runtime::decode(runtime.clone())
+        .map_err(|_| E2bApiError::bad_request("invalid template runtime command or environment"))?;
+    Ok(Some(build_proto::recipe::Step {
+        display_name: None,
+        env_refs: Vec::new(),
+        body: Some(build_proto::recipe::step::Body::SetRuntime(runtime)),
+    }))
 }
 
 #[cfg(test)]

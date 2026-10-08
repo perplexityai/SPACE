@@ -207,3 +207,33 @@ fn copy_stream_propagates_producer_and_consumer_failures() {
 
     assert!(matches!(result, Err(SshError::CopyIo(_))));
 }
+
+#[tokio::test]
+async fn bounded_exchange_closes_stdin_and_limits_output_and_time() {
+    let command = |script: &str| {
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command.args(["-c", script]);
+        command
+    };
+    let payload = vec![b'x'; 128 * 1024];
+    let result = super::exchange_command(
+        command("cat"),
+        &payload,
+        payload.len(),
+        Duration::from_secs(2),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        result, payload,
+        "cat requires EOF after the complete declaration"
+    );
+    assert!(matches!(
+        super::exchange_command(command("printf too-long"), &[], 2, Duration::from_secs(2)).await,
+        Err(SshError::BoundedOperation)
+    ));
+    assert!(matches!(
+        super::exchange_command(command("exec sleep 10"), &[], 0, Duration::from_millis(20)).await,
+        Err(SshError::BoundedOperation)
+    ));
+}

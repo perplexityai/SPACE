@@ -6,6 +6,7 @@ pub mod object_store;
 pub mod oci;
 pub mod publish;
 pub mod recipe;
+mod runtime;
 mod ssh;
 mod storage;
 mod vm;
@@ -814,15 +815,21 @@ impl TemplateBuilder {
             return Err(e);
         }
 
-        if let Err(e) = build_phase(template_id, BuildPhase::ConfigureGuest, async {
-            configure_guest_apt_mirror(&ssh).map_err(BuildError::from)
+        let runtime_build = match build_phase(template_id, BuildPhase::ConfigureGuest, async {
+            let runtime = runtime::RuntimeBuild::prepare(&ssh, &recipe).await?;
+            configure_guest_apt_mirror(&ssh)?;
+            Ok::<_, BuildError>(runtime)
         })
         .await
         {
-            stop_sandbox_best_effort(&mut sbx, &sandbox_id, "guest configuration failed").await;
-            delete_sandbox_best_effort(&mut sbx, &sandbox_id, "guest configuration failed").await;
-            return Err(e);
-        }
+            Ok(runtime) => runtime,
+            Err(error) => {
+                stop_sandbox_best_effort(&mut sbx, &sandbox_id, "guest configuration failed").await;
+                delete_sandbox_best_effort(&mut sbx, &sandbox_id, "guest configuration failed")
+                    .await;
+                return Err(error);
+            }
+        };
 
         // Execute steps
         let mut env_acc: HashMap<String, String> = HashMap::new();
@@ -840,10 +847,15 @@ impl TemplateBuilder {
                 step_count,
                 step = %named_step,
             );
-            let step_result = step_span.in_scope(|| {
-                tracing::info!("build recipe step started");
-                execute_step(named_step, &ssh, &mut env_acc)
-            });
+            let step_result = if matches!(named_step.step, Step::SetRuntime(_) | Step::ClearRuntime)
+            {
+                runtime_build.apply_step(&ssh, &named_step.step).await
+            } else {
+                step_span.in_scope(|| {
+                    tracing::info!("build recipe step started");
+                    execute_step(named_step, &ssh, &mut env_acc)
+                })
+            };
             let step_metric_result =
                 pplx_space_metrics::template::TemplateBuildStepResult::from_ok(step_result.is_ok());
             let result_tag = step_metric_result.as_str();
@@ -877,6 +889,19 @@ impl TemplateBuilder {
                     source: e,
                 });
             }
+        }
+
+        if let Err(error) = runtime_build.finalize(&ssh).await {
+            stop_sandbox_best_effort(&mut sbx, &sandbox_id, "runtime finalization failed").await;
+            delete_sandbox_best_effort(&mut sbx, &sandbox_id, "runtime finalization failed").await;
+            return Err(error);
+        }
+        if runtime_build.requires_durable_stop()
+            && let Err(error) = ssh.exchange(GUEST_FLUSH_CMD, &[], 0).await
+        {
+            stop_sandbox_best_effort(&mut sbx, &sandbox_id, "runtime flush failed").await;
+            delete_sandbox_best_effort(&mut sbx, &sandbox_id, "runtime flush failed").await;
+            return Err(error.into());
         }
 
         // Graceful shutdown
@@ -926,7 +951,8 @@ impl TemplateBuilder {
                 sandbox_id: sandbox_id.clone(),
                 template_filter: None,
                 blocking: true,
-                immediate_kill: false,
+                // The successful flush above makes forced shutdown durable.
+                immediate_kill: runtime_build.requires_durable_stop(),
             })
             .await
             .map_err(|e| BuildError::message(format!("sandbox stop failed: {e}")))?;
@@ -934,11 +960,22 @@ impl TemplateBuilder {
         })
         .await
         {
+            if runtime_build.requires_durable_stop() {
+                delete_sandbox_best_effort(&mut sbx, &sandbox_id, "runtime stop failed").await;
+                return Err(error);
+            }
             tracing::warn!(
                 sandbox_id = %sandbox_id,
                 error = %error,
                 "sandbox stop failed before rootfs copy; continuing with best-effort copy"
             );
+        }
+
+        if runtime_build.requires_durable_stop() && vm::is_process_alive(start_resp.pid) {
+            delete_sandbox_best_effort(&mut sbx, &sandbox_id, "runtime VM still alive").await;
+            return Err(BuildError::message(
+                "cannot seal runtime while build VM is alive",
+            ));
         }
 
         // Copy the modified rootfs out BEFORE delete removes it.
@@ -1740,6 +1777,9 @@ fn execute_step(
     };
 
     match &named_step.step {
+        Step::SetRuntime(_) | Step::ClearRuntime => Err(SshError::CopyPayload(
+            "runtime steps require the finalization owner".into(),
+        )),
         Step::Env { vars } => {
             for (k, v) in vars {
                 env_acc.insert(k.clone(), v.clone());

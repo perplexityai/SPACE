@@ -106,11 +106,11 @@ pub struct TemplateBuildStartV2 {
     pub from_image_registry: Option<serde_json::Value>,
     #[serde(rename = "fromTemplate", default)]
     pub from_template: Option<String>,
-    /// Command e2b would run before snapshotting. We materialize it as a
-    /// systemd unit at build time and `WantedBy=space.target` so every
-    /// sandbox boot runs it.
+    /// Translated into native template boot intent with template-only env.
     #[serde(rename = "startCmd", default)]
     pub start_cmd: Option<String>,
+    #[serde(rename = "readyCmd", default)]
+    pub ready_cmd: Option<String>,
     #[serde(default)]
     pub steps: Vec<TemplateStep>,
 }

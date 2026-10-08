@@ -373,7 +373,7 @@ SSHSOCKET
 systemctl enable ssh.socket 2>/dev/null || true
 
 # All the work users run lives in space.slice: API workloads
-# (space-workloads.service, below with spaced) and SSH sessions and the E2B
+# (space-workloads.service, below with spaced) and SSH sessions and the native
 # template start command (space-sessions.slice). The guest's infrastructure,
 # spaced and the system daemons, stays in system.slice. spaced caps
 # space.slice's memory and tasks at startup, from the guest's size (systemctl
@@ -399,7 +399,7 @@ MemoryMax=90%
 TasksMax=90%
 SPACESLICE
 
-# SSH sessions and the E2B template start command run in their own slice,
+# SSH sessions and the native template start command run in their own slice,
 # outside spaced.service, whose KillMode would end them whenever spaced
 # restarts. logind is masked, so PAM opens no session scopes: a session stays
 # in ssh.service's cgroup, here.
@@ -416,15 +416,16 @@ Conflicts=shutdown.target
 TasksMax=80%
 SESSIONSSLICE
 
-# The E2B template start command (e2b-template-start.service, written by the
-# API's template build) runs with SSH sessions, under the envelope's limits
-# rather than systemd's per-unit task cap.
-mkdir -p /etc/systemd/system/e2b-template-start.service.d
-cat > /etc/systemd/system/e2b-template-start.service.d/00-space-sessions.conf <<'STARTSLICE'
+# Compatibility for templates still emitted by an older ECW translator during
+# rolling upgrades. These drop-ins do not define or enable an application.
+for legacy_unit in e2b-template-start.service space-start-cmd.service; do
+  mkdir -p \"/etc/systemd/system/\${legacy_unit}.d\"
+  cat > \"/etc/systemd/system/\${legacy_unit}.d/00-space-sessions.conf\" <<'STARTSLICE'
 [Service]
 Slice=space-sessions.slice
 TasksMax=infinity
 STARTSLICE
+done
 mkdir -p /etc/systemd/system/ssh.service.d
 cat > /etc/systemd/system/ssh.service.d/00-space-sessions.conf <<'SSHSLICE'
 [Service]

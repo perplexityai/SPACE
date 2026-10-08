@@ -1,3 +1,5 @@
+pub mod runtime;
+
 pub mod proto {
     tonic::include_proto!("build.manager.v1");
 }

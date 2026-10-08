@@ -569,7 +569,9 @@ fn interpolating_fields(step: &TomlStep) -> Vec<&str> {
         | TomlStep::NpmInstallGlobal { .. }
         | TomlStep::Env { .. }
         | TomlStep::Copy { .. }
-        | TomlStep::PlaywrightInstall { .. } => Vec::new(),
+        | TomlStep::PlaywrightInstall { .. }
+        | TomlStep::SetRuntime { .. }
+        | TomlStep::ClearRuntime => Vec::new(),
     }
 }
 
@@ -609,6 +611,8 @@ const VARIANT_STEP_KEYS: &[(&str, &[&str])] = &[
     ("env", &["vars"]),
     ("copy", &["source", "dest"]),
     ("playwright-install", &["browsers"]),
+    ("set-runtime", &["declaration"]),
+    ("clear-runtime", &[]),
 ];
 
 /// Keys in `table` that `TomlNamedStep` would drop, judged against the step's own
@@ -1000,4 +1004,111 @@ fn resolves_env_refs_for_toml_env_values() {
         });
 
     assert_eq!(resolved, "https://user:secret@example.test/path");
+}
+
+#[test]
+fn runtime_recipe_round_trip_and_fail_closed_policy() {
+    let input = r#"
+[metadata]
+name = "native-runtime-example"
+base = "seed"
+[[steps]]
+type = "set-runtime"
+[steps.declaration]
+schema_version = 1
+[[steps.declaration.apps]]
+name = "app"
+command = ["/bin/sleep", "infinity"]
+user = "root"
+working_directory = "/"
+startup_timeout_secs = 10
+[steps.declaration.apps.env]
+EXAMPLE_MODE = "template"
+[steps.declaration.apps.readiness]
+type = "launch"
+[[steps.declaration.apps]]
+name = "worker"
+command = ["/usr/local/bin/worker"]
+user = "root"
+working_directory = "/"
+startup_timeout_secs = 20
+[steps.declaration.apps.readiness]
+type = "launch"
+"#;
+    let recipe: TomlRecipe = toml::from_str(input).unwrap();
+    let wire = recipe
+        .into_proto("example.toml", None, |_, _| unreachable!())
+        .unwrap();
+    let native = Recipe::try_from(wire.clone()).unwrap();
+    let Step::SetRuntime(runtime) = &native.steps[0].step else {
+        panic!("runtime step missing")
+    };
+    assert_eq!(
+        runtime.apps()[0].command().argv(),
+        ["/bin/sleep", "infinity"]
+    );
+    assert_eq!(runtime.apps()[0].startup_timeout().as_secs(), 10);
+    assert_eq!(runtime.apps().len(), 2);
+    assert_eq!(runtime.apps()[1].name().as_str(), "worker");
+    assert_eq!(
+        runtime.apps()[1].command().argv(),
+        ["/usr/local/bin/worker"]
+    );
+    assert_eq!(runtime.apps()[1].startup_timeout().as_secs(), 20);
+    assert!(!format!("{:?}", wire.steps[0]).contains("EXAMPLE_MODE"));
+
+    for steps in [
+        vec![wire.steps[0].clone(), wire.steps[0].clone()],
+        vec![
+            wire.steps[0].clone(),
+            recipe::Step {
+                body: Some(recipe::step::Body::Run(recipe::Run {
+                    command: "true".into(),
+                    user: None,
+                })),
+                ..Default::default()
+            },
+        ],
+        vec![recipe::Step {
+            env_refs: vec!["EXAMPLE_MODE".into()],
+            ..wire.steps[0].clone()
+        }],
+    ] {
+        assert!(matches!(
+            Recipe::try_from(ProtoRecipe {
+                steps,
+                ..wire.clone()
+            }),
+            Err(RecipeProtoError::RuntimePlacement)
+        ));
+    }
+    // An older protobuf intermediary retains Step but drops the unknown body.
+    #[derive(Clone, PartialEq, Message)]
+    struct OldStep {
+        #[prost(string, optional, tag = "1")]
+        display_name: Option<String>,
+    }
+    for body in [
+        wire.steps[0].body.clone().unwrap(),
+        recipe::step::Body::ClearRuntime(recipe::ClearRuntime {}),
+    ] {
+        let step = recipe::Step {
+            body: Some(body),
+            ..Default::default()
+        };
+        let old = OldStep::decode(step.encode_to_vec().as_slice()).unwrap();
+        let dropped = recipe::Step::decode(old.encode_to_vec().as_slice()).unwrap();
+        assert!(matches!(
+            Recipe::try_from(ProtoRecipe {
+                steps: vec![dropped],
+                ..wire.clone()
+            }),
+            Err(RecipeProtoError::MissingStep { index: 1 })
+        ));
+    }
+    let Some(recipe::step::Body::SetRuntime(mut runtime)) = wire.steps[0].body.clone() else {
+        unreachable!()
+    };
+    runtime.apps[0].readiness = None;
+    pplx_space_build_mgr_client::runtime::decode(runtime).unwrap_err();
 }

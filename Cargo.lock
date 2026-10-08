@@ -5105,6 +5105,7 @@ name = "pplx-space-build-mgr-client"
 version = "0.8.0"
 dependencies = [
  "anyhow",
+ "pplx-space-common-core",
  "pplx-space-common-grpc",
  "pplx-space-common-proto-build",
  "pplx-space-common-svc",
@@ -5112,6 +5113,7 @@ dependencies = [
  "prost",
  "rcgen",
  "rustls",
+ "serde_json",
  "tempfile",
  "thiserror 2.0.20",
  "tokio",

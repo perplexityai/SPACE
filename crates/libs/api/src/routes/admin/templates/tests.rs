@@ -850,3 +850,30 @@ fn system_code_runtime_uses_embedded_steps_and_requested_seed() -> TestResult {
     );
     Ok(())
 }
+
+#[test]
+fn native_runtime_http_steps_preserve_required_wire_variants() {
+    let declaration = serde_json::json!({"schema_version":1,"apps":[{"name":"app","command":["/bin/sleep","infinity"],
+        "user":"root","working_directory":"/","env":{},"readiness":{"type":"launch"},"startup_timeout_secs":10}]});
+    let step: TemplateBuildStep =
+        serde_json::from_value(serde_json::json!({"set_runtime":declaration})).unwrap();
+    let wire = template_build_step_proto(1, step).unwrap();
+    let Some(build_proto::recipe::step::Body::SetRuntime(runtime)) = wire.body else {
+        panic!("native runtime body missing")
+    };
+    pplx_space_build_mgr_client::runtime::decode(runtime).unwrap();
+    let step: TemplateBuildStep =
+        serde_json::from_value(serde_json::json!({"clear_runtime":{}})).unwrap();
+    assert!(matches!(
+        template_build_step_proto(1, step).unwrap().body,
+        Some(build_proto::recipe::step::Body::ClearRuntime(_))
+    ));
+    let ambiguous: TemplateBuildStep =
+        serde_json::from_value(serde_json::json!({"set_runtime":declaration,"clear_runtime":{}}))
+            .unwrap();
+    template_build_step_proto(1, ambiguous).unwrap_err();
+    serde_json::from_value::<TemplateBuildStep>(
+        serde_json::json!({"clear_runtime":{"unexpected":true}}),
+    )
+    .unwrap_err();
+}

@@ -27,6 +27,8 @@ pub enum SshError {
     CommandStart(#[source] std::io::Error),
     #[error("ssh command failed after retries")]
     CommandRetries,
+    #[error("bounded guest operation timed out or exceeded its output limit")]
+    BoundedOperation,
     #[error("copy archive transfer failed: {0}")]
     CopyIo(#[source] std::io::Error),
     #[error("copy payload error: {0}")]
@@ -40,6 +42,23 @@ pub(crate) struct SshSession {
 }
 
 impl SshSession {
+    /// Small construction protocol, with an explicit deadline and output bound.
+    /// Keep declaration bytes off command lines and inherited build logs.
+    pub async fn exchange(
+        &self,
+        command: &str,
+        input: &[u8],
+        limit: usize,
+    ) -> Result<Vec<u8>, SshError> {
+        exchange_command(
+            tokio::process::Command::from(self.ssh_cmd("root", command)),
+            input,
+            limit,
+            Duration::from_secs(90),
+        )
+        .await
+    }
+
     pub fn new(host: String, ns: String) -> Result<Self, SshError> {
         let key_path = SSH_KEY_PATH.to_string();
         let key_exists = command_as_root("test")
@@ -170,6 +189,58 @@ impl SshSession {
         ]);
         cmd
     }
+}
+
+async fn exchange_command(
+    mut command: tokio::process::Command,
+    input: &[u8],
+    limit: usize,
+    timeout: Duration,
+) -> Result<Vec<u8>, SshError> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(SshError::CommandStart)?;
+    let mut stdin = child.stdin.take().ok_or(SshError::BoundedOperation)?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or(SshError::BoundedOperation)?
+        .take(limit as u64 + 1);
+    let operation = async {
+        let send = async move {
+            stdin
+                .write_all(input)
+                .await
+                .map_err(SshError::CommandStart)?;
+            drop(stdin); // Pipe shutdown is a no-op on Unix; close to deliver EOF.
+            Ok::<_, SshError>(())
+        };
+        let receive = async {
+            let mut bytes = Vec::new();
+            stdout
+                .read_to_end(&mut bytes)
+                .await
+                .map_err(SshError::CommandStart)?;
+            if bytes.len() > limit {
+                return Err(SshError::BoundedOperation);
+            }
+            Ok(bytes)
+        };
+        let ((), bytes) = tokio::try_join!(send, receive)?;
+        let status = child.wait().await.map_err(SshError::CommandStart)?;
+        if !status.success() {
+            return Err(SshError::CommandStatus(status));
+        }
+        Ok(bytes)
+    };
+    tokio::time::timeout(timeout, operation)
+        .await
+        .map_err(|_| SshError::BoundedOperation)?
 }
 
 fn copy_unpack_command(dest: &str) -> String {

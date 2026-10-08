@@ -140,9 +140,23 @@ The following compatibility limits are important:
   Connect leaves the lifecycle policy unchanged when `timeout` is omitted. An
   explicit timeout replaces the current timeout, including with a shorter
   value; if no E2B policy exists, it creates an auto-delete policy.
-- Template `startCmd` is installed as a systemd unit and runs on cold boot;
-  SPACE does not yet publish the warm snapshot used by E2B for this behavior.
-- Template `readyCmd` is accepted for SDK compatibility but is not enforced.
+- Template `startCmd` and `readyCmd` become the native app named `app` in the
+  native declaration, compiled by the builder into systemd units. A TOML inspection
+  copy is retained in the guest. Native recipes can declare multiple apps; ECW retains
+  its single-command interface. Startup
+  uses template ENV only, as root in `/` through `/bin/sh -lc`. Sandbox environment
+  overrides apply to later commands, not the template application. Apps are optional:
+  `readyCmd` controls the app unit's startup status, not sandbox readiness. Base
+  snapshot preparation waits up to the app startup budget, returns early when ready,
+  and logs a host warning before capturing if the app fails or times out. ECW apps
+  use the default `best-effort` startup policy. Native recipes can opt into
+  `required`, which rejects the snapshot on failure while allowing cold boot.
+  Restore resumes captured state. Rootfs publication does not validate app readiness.
+  A non-empty `readyCmd` without `startCmd` is now rejected; previously it was
+  ignored. App failures do not fail sandbox start, resume, restore, or wake.
+  Clients may receive connection refused immediately after create and must wait
+  for their application separately.
+  See [native template startup](native-template-runtime.md) for limits and rollout.
   Per-step `force=true` is promoted to SPACE's build-wide cache switch, which
   may rebuild more layers but will not reuse the requested layer. Positive
   `minFreeDiskMb` and `teamID` are rejected explicitly.

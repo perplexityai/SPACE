@@ -31,7 +31,7 @@ Checks follow the template-build lifecycle:
      build wrote as testuser).
   8. **set_envs** persists into ``/etc/environment`` for the runtime
      sandbox.
-  9. **start_cmd via systemd** — the unit wires up and runs on boot.
+  9. **native template startup** — translated startup intent runs at boot.
 
 Each step is a small wire-level interaction; the full build pipeline
 runs once (build VM inherits ``code-runtime``, so it's ~minutes, not
@@ -96,7 +96,7 @@ ROSTER: list[StepRow] = [
     StepRow(5, "COPY mode=0o644 chmod applied"),
     StepRow(6, "set_user(testuser) sticks for subsequent run_cmd"),
     StepRow(7, "set_envs persists into /etc/environment"),
-    StepRow(8, "set_start_cmd materializes as systemd unit + runs on boot"),
+    StepRow(8, "set_start_cmd translates to native startup and runs on boot"),
     StepRow(9, "Sandbox boot from built template (Ubuntu 26.04 LTS, base alias)"),
 ]
 
@@ -265,7 +265,7 @@ def make_template_builder(context_dir: Path) -> Template:
         # the test.
         .set_user(TEST_USER)
         .run_cmd(f"whoami > {WHOAMI_OUT}")
-        # Step 8: start_cmd materializes as a systemd unit.
+        # Step 8: start_cmd becomes native template intent.
         .set_start_cmd(
             f"sh -c 'echo {START_MARKER_VAL} > {START_MARKER_OUT}; tail -f /dev/null'",
             wait_for_timeout(1),
@@ -524,10 +524,11 @@ def verify_sandbox_phase(board: StatusBoard, main_alias: str) -> int:
         else:
             board.finish_step(7, "pass", env_line)
 
-    # Step 8: start_cmd systemd unit ran on boot.
+    # Step 8: The optional application runs independently of guest readiness.
     try:
         start = exec_in(
-            ["sh", "-c", f"cat {START_MARKER_OUT} 2>/dev/null || true"]
+            ["sh", "-c", 'for i in $(seq 1 50); do [ -f "$1" ] && cat "$1" && exit; sleep 0.1; done',
+             "runtime-marker", START_MARKER_OUT]
         ).strip()
     except RuntimeError as e:
         board.finish_step(8, "fail", str(e))
@@ -539,7 +540,7 @@ def verify_sandbox_phase(board: StatusBoard, main_alias: str) -> int:
                     "systemctl",
                     "show",
                     "--no-pager",
-                    "e2b-template-start.service",
+                    "space-runtime@app.service",
                     "-p",
                     "ActiveState,SubState,Result,ExecMainStatus",
                 ]

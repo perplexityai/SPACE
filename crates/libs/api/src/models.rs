@@ -900,6 +900,10 @@ pub struct TemplateBuildUbuntuMinimalCloudSquashfs {
 #[serde(deny_unknown_fields)]
 pub struct TemplateBuildStep {
     #[serde(default)]
+    pub set_runtime: Option<pplx_space_common_core::types::TemplateRuntime>,
+    #[serde(default)]
+    pub clear_runtime: Option<TemplateBuildClearRuntime>,
+    #[serde(default)]
     pub display_name: Option<String>,
     #[serde(default)]
     pub env_refs: Vec<String>,
@@ -914,6 +918,10 @@ pub struct TemplateBuildStep {
     #[serde(default)]
     pub playwright_install: Option<TemplateBuildPlaywrightInstallStep>,
 }
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TemplateBuildClearRuntime {}
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]

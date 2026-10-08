@@ -563,42 +563,40 @@ fn copy_blob_step_preserves_e2b_source_path() {
     }
 }
 
-// The seed, not the API, places the start command and lifts its task cap: a
-// unit that set Slice= and TasksMax=infinity itself would run uncapped on a
-// seed without the envelope's limits.
 #[test]
-fn start_cmd_unit_leaves_placement_and_task_cap_to_the_seed() {
-    let step = install_start_cmd_unit("python -m example_daemon");
-    let Some(build_proto::recipe::step::Body::Run(run)) = step.body else {
-        panic!("expected Run step");
+fn runtime_translation_owns_intent_only_and_validates_readiness() {
+    let mut req = TemplateBuildStartV2 {
+        start_cmd: Some("exec app".into()),
+        ready_cmd: Some("test -f /run/ready".into()),
+        steps: vec![TemplateStep {
+            kind: "ENV".into(),
+            args: vec!["APP_MODE".into(), "template".into()],
+            ..Default::default()
+        }],
+        ..Default::default()
     };
-    let encoded = run
-        .command
-        .split_once("printf %s ")
-        .and_then(|(_, rest)| rest.split_once(" | base64 -d"))
-        .map(|(quoted, _)| quoted.trim_matches('\''))
-        .expect("unit payload");
-    let unit = String::from_utf8(Base64.decode(encoded).expect("base64")).expect("utf-8");
-    assert!(unit.contains("ExecStart=/bin/sh -lc"));
-    assert!(!unit.contains("Slice="), "{unit}");
-    assert!(!unit.contains("TasksMax="), "{unit}");
-}
-
-#[test]
-fn install_start_cmd_unit_emits_run_with_unit_text() {
-    let step = install_start_cmd_unit("python -m example_daemon");
-    let body = step.body.expect("step body");
-    match body {
-        build_proto::recipe::step::Body::Run(run) => {
-            assert!(run.command.contains("base64 -d"));
-            assert!(run.command.contains(START_UNIT_PATH));
-            assert!(run.command.contains(START_UNIT_NAME));
-            // The final step must flush so the unit + enable symlink are
-            // durable before the build VM is torn down (else the finalize
-            // e2fsck journal recovery can drop this last write).
-            assert!(run.command.trim_end().ends_with("sync"));
-            assert_eq!(run.user.as_deref(), Some("root"));
-        }
-        other => panic!("expected Run step, got {other:?}"),
-    }
+    let step = runtime_step(&req).unwrap().unwrap();
+    let Some(build_proto::recipe::step::Body::SetRuntime(runtime)) = step.body else {
+        panic!("expected native runtime")
+    };
+    let runtime = pplx_space_build_mgr_client::runtime::decode(runtime).unwrap();
+    assert_eq!(runtime.apps().len(), 1);
+    let runtime = &runtime.apps()[0];
+    assert_eq!(runtime.name().as_str(), "app");
+    assert_eq!(runtime.command().argv(), ["/bin/sh", "-lc", "exec app"]);
+    assert_eq!(runtime.user().as_str(), "root");
+    assert_eq!(runtime.working_directory().expose(), "/");
+    assert!(matches!(
+        runtime.readiness(),
+        pplx_space_common_core::types::RuntimeReadiness::Exec(_)
+    ));
+    let key = pplx_space_common_core::types::EnvKey::parse("APP_MODE").unwrap();
+    assert_eq!(
+        runtime.env().as_map().get(&key).unwrap().expose(),
+        "template"
+    );
+    req.start_cmd = None;
+    runtime_step(&req).unwrap_err();
+    req.ready_cmd = None;
+    assert!(runtime_step(&req).unwrap().is_none());
 }

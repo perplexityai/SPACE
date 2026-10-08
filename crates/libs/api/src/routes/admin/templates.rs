@@ -1335,6 +1335,8 @@ fn template_build_step_proto(
     step: TemplateBuildStep,
 ) -> Result<build_proto::recipe::Step, TemplateBuildRequestError> {
     let bodies = [
+        step.set_runtime.is_some(),
+        step.clear_runtime.is_some(),
         step.package_install.is_some(),
         step.run.is_some(),
         step.env.is_some(),
@@ -1344,7 +1346,13 @@ fn template_build_step_proto(
     if bodies.into_iter().filter(|present| *present).count() != 1 {
         return Err(TemplateBuildRequestError::StepBodyOneof { index });
     }
-    let body = if let Some(step) = step.package_install {
+    let body = if let Some(runtime) = step.set_runtime {
+        build_proto::recipe::step::Body::SetRuntime(pplx_space_build_mgr_client::runtime::encode(
+            &runtime,
+        ))
+    } else if step.clear_runtime.is_some() {
+        build_proto::recipe::step::Body::ClearRuntime(build_proto::recipe::ClearRuntime {})
+    } else if let Some(step) = step.package_install {
         build_proto::recipe::step::Body::PackageInstall(build_proto::recipe::PackageInstall {
             manager: template_build_package_manager_proto(step.manager) as i32,
             packages: step.packages,

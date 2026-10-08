@@ -268,3 +268,5 @@ each node is internally same-family before it starts creating or restoring sandb
 If preflight fails with a compatibility mismatch, rebuild and redeploy the seed template
 from the same compatible source line as the node binaries, then rebuild derived recipe
 templates.
+
+Native application startup is documented in [native template startup](../../../docs/native-template-runtime.md).
