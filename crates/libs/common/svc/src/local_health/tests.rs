@@ -125,67 +125,90 @@ async fn spawned_server_serves_default_and_liveness_while_passive() {
 // forwards and returns Serving again).
 #[tokio::test]
 async fn spawned_server_lifecycle_over_socket() {
-    let dir = tempfile::tempdir().unwrap();
-    let socket_path = dir.path().join("probe.sock");
-    let production_path = dir.path().join("production.sock");
-    let shutdown_token = CancellationToken::new();
+    for initially_waiting in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("probe.sock");
+        let production_path = dir.path().join("production.sock");
+        let shutdown_token = CancellationToken::new();
 
-    let server = LocalHealthServer::spawn_optional(
-        Some(&socket_path),
-        UnixSocketOptions::new(0o600),
-        "local-health-test",
-        shutdown_token.clone(),
-    )
-    .unwrap();
+        let spawn = if initially_waiting {
+            LocalHealthServer::spawn_optional_waiting
+        } else {
+            LocalHealthServer::spawn_optional
+        };
+        let server = spawn(
+            Some(&socket_path),
+            UnixSocketOptions::new(0o600),
+            "local-health-test",
+            shutdown_token.clone(),
+        )
+        .unwrap();
 
-    let listener = bind_unix_socket(&production_path, UnixSocketOptions::new(0o600)).unwrap();
-    let (reporter, health) = crate::bootstrap::grpc_health_service();
-    reporter
-        .set_service_status("", tonic_health::ServingStatus::Serving)
-        .await;
-    let production_shutdown = shutdown_token.clone();
-    let production = tokio::spawn(async move {
-        grpc_server_builder()
-            .add_service(health)
-            .serve_with_incoming_shutdown(UnixListenerStream::new(listener), async move {
-                production_shutdown.cancelled().await
-            })
-            .await
-            .unwrap();
-    });
+        if initially_waiting {
+            assert_eq!(
+                check_over_socket(&socket_path, "").await,
+                ServingStatus::NotServing
+            );
+            assert_eq!(
+                check_over_socket(&socket_path, "readiness").await,
+                ServingStatus::NotServing
+            );
+            assert_eq!(
+                check_over_socket(&socket_path, "liveness").await,
+                ServingStatus::Serving
+            );
+            server.mark_takeover_ready();
+        }
 
-    assert_eq!(
-        check_over_socket(&socket_path, "").await,
-        ServingStatus::Serving
-    );
+        let listener = bind_unix_socket(&production_path, UnixSocketOptions::new(0o600)).unwrap();
+        let (reporter, health) = crate::bootstrap::grpc_health_service();
+        reporter
+            .set_service_status("", tonic_health::ServingStatus::Serving)
+            .await;
+        let production_shutdown = shutdown_token.clone();
+        let production = tokio::spawn(async move {
+            grpc_server_builder()
+                .add_service(health)
+                .serve_with_incoming_shutdown(UnixListenerStream::new(listener), async move {
+                    production_shutdown.cancelled().await
+                })
+                .await
+                .unwrap();
+        });
 
-    server.mark_starting();
-    assert_eq!(
-        check_over_socket(&socket_path, "").await,
-        ServingStatus::NotServing
-    );
-    assert_eq!(
-        check_over_socket(&socket_path, "liveness").await,
-        ServingStatus::Serving
-    );
+        assert_eq!(
+            check_over_socket(&socket_path, "").await,
+            ServingStatus::Serving
+        );
 
-    server.activate(production_path.clone());
-    assert_eq!(
-        check_over_socket(&socket_path, "").await,
-        ServingStatus::Serving
-    );
-    assert_eq!(
-        check_over_socket(&socket_path, "readiness").await,
-        ServingStatus::Serving
-    );
-    assert_eq!(
-        check_over_socket(&socket_path, "liveness").await,
-        ServingStatus::Serving
-    );
+        server.mark_starting();
+        assert_eq!(
+            check_over_socket(&socket_path, "").await,
+            ServingStatus::NotServing
+        );
+        assert_eq!(
+            check_over_socket(&socket_path, "liveness").await,
+            ServingStatus::Serving
+        );
 
-    shutdown_token.cancel();
-    server.join().await;
-    production.await.unwrap();
+        server.activate(production_path.clone());
+        assert_eq!(
+            check_over_socket(&socket_path, "").await,
+            ServingStatus::Serving
+        );
+        assert_eq!(
+            check_over_socket(&socket_path, "readiness").await,
+            ServingStatus::Serving
+        );
+        assert_eq!(
+            check_over_socket(&socket_path, "liveness").await,
+            ServingStatus::Serving
+        );
+
+        shutdown_token.cancel();
+        server.join().await;
+        production.await.unwrap();
+    }
 }
 
 #[tokio::test]
@@ -194,6 +217,7 @@ async fn disabled_server_lifecycle_is_noop() {
     let socket_path = dir.path().join("probe.sock");
     let server = LocalHealthServer::disabled();
 
+    server.mark_takeover_ready();
     server.mark_starting();
     server.activate(socket_path.clone());
     server.join().await;

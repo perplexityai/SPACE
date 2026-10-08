@@ -6,7 +6,8 @@
 //! liveness onto two gRPC service names so the two probes can report
 //! independent signals:
 //!
-//! - `""` (default) and `"readiness"` return a 3-state answer:
+//! - `""` (default) and `"readiness"` report `NotServing` while an optional
+//!   dependency wait is pending, then follow the ownership lifecycle:
 //!   `Passive` → `SERVING` (ready to take over), `Starting` → `NotServing`
 //!   (mutex acquired, running migrations/recovery, production socket not yet
 //!   bound), `Active(path)` → forwards a fresh `Check` to the production
@@ -45,7 +46,7 @@ const READINESS_SERVICE: &str = "readiness";
 pub struct LocalHealth {
     service_name: &'static str,
     liveness: LocalHealthLiveness,
-    starting: Arc<AtomicBool>,
+    readiness_withheld: Arc<AtomicBool>,
     production_socket: Arc<OnceLock<PathBuf>>,
 }
 
@@ -60,22 +61,28 @@ pub enum LocalHealthLiveness {
 }
 
 /// Drives the local health service through its lifecycle:
-/// `Passive` (default) → `Starting` (via [`mark_starting`](Self::mark_starting))
+/// `Waiting` (opt-in) → `Passive` (via [`mark_takeover_ready`](Self::mark_takeover_ready))
+/// → `Starting` (via [`mark_starting`](Self::mark_starting))
 /// → `Active` (via [`activate`](Self::activate)).
 #[derive(Clone)]
 pub struct LocalHealthActivator {
-    starting: Arc<AtomicBool>,
+    readiness_withheld: Arc<AtomicBool>,
     production_socket: Arc<OnceLock<PathBuf>>,
 }
 
 impl LocalHealthActivator {
+    /// Allows takeover after dependency checks, before acquiring ownership.
+    pub fn mark_takeover_ready(&self) {
+        self.readiness_withheld.store(false, Ordering::SeqCst);
+    }
+
     /// Records that this instance has acquired the service mutex and is
     /// running active-startup work (migrations, crash recovery, …) but has
     /// not yet bound its production socket. Readiness probes return
     /// `NotServing` from this point until [`activate`](Self::activate) is
     /// called.
     pub fn mark_starting(&self) {
-        if self.starting.swap(true, Ordering::SeqCst) {
+        if self.readiness_withheld.swap(true, Ordering::SeqCst) {
             tracing::warn!("local health: mark_starting called twice");
         }
     }
@@ -104,17 +111,34 @@ fn local_health_pair_with_liveness(
     service_name: &'static str,
     liveness: LocalHealthLiveness,
 ) -> (LocalHealth, LocalHealthActivator) {
-    let starting = Arc::new(AtomicBool::new(false));
+    local_health_pair_with_readiness(service_name, liveness, InitialReadiness::Passive)
+}
+
+#[derive(Clone, Copy)]
+enum InitialReadiness {
+    Passive,
+    Waiting,
+}
+
+fn local_health_pair_with_readiness(
+    service_name: &'static str,
+    liveness: LocalHealthLiveness,
+    readiness: InitialReadiness,
+) -> (LocalHealth, LocalHealthActivator) {
+    let readiness_withheld = Arc::new(AtomicBool::new(matches!(
+        readiness,
+        InitialReadiness::Waiting
+    )));
     let cell = Arc::new(OnceLock::new());
     (
         LocalHealth {
             service_name,
             liveness,
-            starting: Arc::clone(&starting),
+            readiness_withheld: Arc::clone(&readiness_withheld),
             production_socket: Arc::clone(&cell),
         },
         LocalHealthActivator {
-            starting,
+            readiness_withheld,
             production_socket: cell,
         },
     )
@@ -165,8 +189,27 @@ impl LocalHealthServer {
         liveness: LocalHealthLiveness,
         shutdown_token: CancellationToken,
     ) -> Result<Self, crate::bootstrap::BindUnixSocketError> {
+        Self::spawn_with_readiness(
+            socket_path,
+            socket_options,
+            service_name,
+            liveness,
+            InitialReadiness::Passive,
+            shutdown_token,
+        )
+    }
+
+    fn spawn_with_readiness(
+        socket_path: &Path,
+        socket_options: UnixSocketOptions,
+        service_name: &'static str,
+        liveness: LocalHealthLiveness,
+        readiness: InitialReadiness,
+        shutdown_token: CancellationToken,
+    ) -> Result<Self, crate::bootstrap::BindUnixSocketError> {
         let listener = bind_unix_socket(socket_path, socket_options)?;
-        let (local_health, activator) = local_health_pair_with_liveness(service_name, liveness);
+        let (local_health, activator) =
+            local_health_pair_with_readiness(service_name, liveness, readiness);
         let handle = tokio::spawn(async move {
             let result = grpc_server_builder()
                 .layer(grpc_trace_layer())
@@ -222,6 +265,35 @@ impl LocalHealthServer {
         }
     }
 
+    /// Starts with liveness available and takeover readiness withheld until
+    /// [`mark_takeover_ready`](Self::mark_takeover_ready). The initial state is
+    /// installed before serving, so no probe can authorize premature takeover.
+    pub fn spawn_optional_waiting(
+        socket_path: Option<&Path>,
+        socket_options: UnixSocketOptions,
+        service_name: &'static str,
+        shutdown_token: CancellationToken,
+    ) -> Result<Self, crate::bootstrap::BindUnixSocketError> {
+        match socket_path {
+            Some(path) => Self::spawn_with_readiness(
+                path,
+                socket_options,
+                service_name,
+                LocalHealthLiveness::Process,
+                InitialReadiness::Waiting,
+                shutdown_token,
+            ),
+            None => Ok(Self::disabled()),
+        }
+    }
+
+    /// See [`LocalHealthActivator::mark_takeover_ready`].
+    pub fn mark_takeover_ready(&self) {
+        if let Self::Enabled { activator, .. } = self {
+            activator.mark_takeover_ready();
+        }
+    }
+
     /// See [`LocalHealthActivator::mark_starting`].
     pub fn mark_starting(&self) {
         if let Self::Enabled { activator, .. } = self {
@@ -271,7 +343,7 @@ impl LocalHealth {
         if let Some(socket) = self.production_socket.get() {
             return self.production_status(socket).await;
         }
-        if self.starting.load(Ordering::SeqCst) {
+        if self.readiness_withheld.load(Ordering::SeqCst) {
             ServingStatus::NotServing
         } else {
             ServingStatus::Serving

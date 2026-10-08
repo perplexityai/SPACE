@@ -24,68 +24,38 @@ const EMPTY_WORK_MESSAGE: &str =
 const LOCAL_SUSPEND_FINALIZATION_TIME: Duration = Duration::from_secs(10);
 
 #[tokio::test]
-async fn takeover_readiness_requires_a_reachable_receiver_before_binding() {
-    use pplx_space_node_mgr_client::proto::{InspectSandboxRequest, InspectSandboxResponse};
+async fn takeover_wait_keeps_liveness_and_withholds_readiness() {
+    use super::test_receiver::{Receiver, dial};
+    use pplx_space_node_mgr_client::proto::InspectSandboxResponse;
 
     #[derive(Clone, Copy)]
-    enum Probe {
-        Current,
-        Unavailable,
-        Timeout,
-        Cancel,
+    enum Outcome {
+        Ready,
+        Rejected,
+        Cancelled,
     }
-    for probe in [
-        Probe::Current,
-        Probe::Unavailable,
-        Probe::Timeout,
-        Probe::Cancel,
-    ] {
+    for outcome in [Outcome::Ready, Outcome::Rejected, Outcome::Cancelled] {
         let root = tempfile::tempdir().unwrap();
         let receiver_socket = root.path().join("node.sock");
         let health_socket = root.path().join("health.sock");
-        let listener = tokio::net::UnixListener::bind(&receiver_socket).unwrap();
-        let entered = Arc::new(tokio::sync::Notify::new());
-        let release = Arc::new(tokio::sync::Notify::new());
-        let inspect = tower::service_fn({
-            let entered = entered.clone();
-            let release = release.clone();
-            move |request: Request<InspectSandboxRequest>| {
-                let entered = entered.clone();
+        let release = Arc::new(AtomicBool::new(false));
+        let receiver = Receiver::bind(
+            &receiver_socket,
+            Arc::new({
                 let release = release.clone();
-                async move {
-                    assert!(request.get_ref().execution_only);
-                    entered.notify_one();
-                    release.notified().await;
-                    if matches!(probe, Probe::Unavailable) {
+                move |_| {
+                    if !release.load(Ordering::SeqCst) {
                         return Err(Status::unavailable("receiver restarting"));
                     }
-                    Ok::<_, Status>(tonic::Response::new(InspectSandboxResponse::default()))
+                    match outcome {
+                        Outcome::Rejected => Err(Status::permission_denied("receiver rejected")),
+                        _ => Ok(InspectSandboxResponse::default()),
+                    }
                 }
-            }
-        });
-        let rpc = tower::service_fn(move |request: HttpRequest<tonic::body::Body>| {
-            let inspect = inspect.clone();
-            async move {
-                Ok::<_, std::convert::Infallible>(
-                    tonic::server::Grpc::new(tonic_prost::ProstCodec::default())
-                        .unary(inspect, request)
-                        .await,
-                )
-            }
-        });
-        let server = tokio::spawn(
-            tonic::transport::Server::builder()
-                .serve_with_incoming(rpc, UnixListenerStream::new(listener)),
-        );
-        let channel =
-            pplx_space_common_grpc::connect_uds_channel("readiness-test", &receiver_socket)
-                .await
-                .unwrap();
-        let mut node = pplx_space_node_mgr_client::NodeManagerGrpcClient::new(
-            pplx_space_common_svc::bootstrap::wrap_grpc_client_channel(channel),
+            }),
         );
         let shutdown = CancellationToken::new();
-        let guard = shutdown.clone().drop_guard();
+        let _guard = shutdown.clone().drop_guard();
         let config = SbxMgrRunConfig {
             socket_path: root.path().join("production.sock"),
             host_control_socket_path: root.path().join("control.sock"),
@@ -94,28 +64,44 @@ async fn takeover_readiness_requires_a_reachable_receiver_before_binding() {
         };
         let start = tokio::spawn({
             let shutdown = shutdown.clone();
-            async move { start_takeover_health(&config, &shutdown, &mut node).await }
-        });
-        entered.notified().await;
-        assert!(
-            !health_socket.exists(),
-            "unconfirmed receiver must not publish takeover readiness"
-        );
-        match probe {
-            Probe::Timeout => {
-                tokio::time::pause();
-                tokio::time::advance(Duration::from_secs(11)).await;
-                tokio::time::resume();
+            async move {
+                start_takeover_health(&config, &shutdown, || dial(receiver_socket.clone())).await
             }
-            Probe::Cancel => shutdown.cancel(),
-            _ => release.notify_one(),
+        });
+        receiver.entered.notified().await;
+        assert!(
+            health_socket.exists(),
+            "dependency waits must expose liveness"
+        );
+        let mut health = health_client("readiness-test", &health_socket).await;
+        for (name, expected) in [
+            ("liveness", HealthStatus::Serving),
+            ("readiness", HealthStatus::NotServing),
+        ] {
+            let response = health
+                .check(HealthCheckRequest {
+                    service: name.into(),
+                })
+                .await
+                .unwrap();
+            assert_eq!(response.into_inner().status, expected as i32);
         }
-        let result = start.await.unwrap();
-        match probe {
-            Probe::Current => {
-                let health = result.unwrap();
-                let response = health_client("readiness-test", &health_socket)
-                    .await
+        assert!(
+            !start.is_finished(),
+            "transient outage must not exit startup"
+        );
+        match outcome {
+            Outcome::Cancelled => shutdown.cancel(),
+            _ => release.store(true, Ordering::SeqCst),
+        }
+        let result = tokio::time::timeout(Duration::from_secs(5), start)
+            .await
+            .unwrap()
+            .unwrap();
+        match outcome {
+            Outcome::Ready => {
+                let server = result.unwrap();
+                let response = health
                     .check(HealthCheckRequest {
                         service: String::new(),
                     })
@@ -123,30 +109,98 @@ async fn takeover_readiness_requires_a_reachable_receiver_before_binding() {
                     .unwrap();
                 assert_eq!(response.into_inner().status, HealthStatus::Serving as i32);
                 shutdown.cancel();
-                health.join().await;
+                server.join().await;
             }
-            Probe::Cancel => assert!(matches!(result.unwrap(), LocalHealthServer::Disabled)),
-            _ => {
-                let RunSbxMgrError::ExecutionAuthority(error) = result.err().unwrap() else {
-                    panic!("unexpected startup error");
+            Outcome::Cancelled => assert!(matches!(result.unwrap(), LocalHealthServer::Disabled)),
+            Outcome::Rejected => {
+                let RunSbxMgrError::NodeManagerStartup(error) = result.err().unwrap() else {
+                    panic!("unexpected error")
                 };
-                match probe {
-                    Probe::Unavailable => assert_eq!(error.code(), tonic::Code::Unavailable),
-                    // The RPC deadline and end-to-end deadline race; either
-                    // must withhold readiness rather than permit takeover.
-                    Probe::Timeout => assert!(matches!(
-                        error.code(),
-                        tonic::Code::Cancelled | tonic::Code::DeadlineExceeded
-                    )),
-                    _ => unreachable!(),
-                }
-                assert!(!health_socket.exists());
+                assert_eq!(error.code(), tonic::Code::PermissionDenied);
+                assert!(
+                    health
+                        .check(HealthCheckRequest {
+                            service: "liveness".into()
+                        })
+                        .await
+                        .is_err(),
+                    "failed startup must stop its health task without cancelling the caller"
+                );
+                assert!(!shutdown.is_cancelled());
             }
         }
-        drop(guard);
-        server.abort();
-        assert!(server.await.unwrap_err().is_cancelled());
     }
+}
+
+#[tokio::test]
+async fn recovery_wait_does_not_hold_the_dependency_work_gate() {
+    use super::test_receiver::{Receiver, dial};
+    use nix::fcntl::{Flock, FlockArg};
+    use pplx_space_node_mgr_client::proto::InspectSandboxResponse;
+
+    let root = tempfile::tempdir().unwrap();
+    let capability = root.path().join("capability.lock");
+    let admission = root.path().join("admission.lock");
+    let work = root.path().join("work.lock");
+    for path in [&capability, &admission, &work] {
+        std::fs::File::create(path).unwrap();
+    }
+    let service = SandboxManagerService::new(crate::db::test_conn());
+    service
+        .enable_dependency_restart_drain(&capability, &admission, &work)
+        .unwrap();
+    let socket = root.path().join("node.sock");
+    let ready = Arc::new(AtomicBool::new(false));
+    let receiver = Receiver::bind(
+        &socket,
+        Arc::new({
+            let ready = ready.clone();
+            move |_| {
+                if ready.load(Ordering::SeqCst) {
+                    Ok(InspectSandboxResponse::default())
+                } else {
+                    Err(Status::unavailable("receiver restarting"))
+                }
+            }
+        }),
+    );
+    let shutdown = CancellationToken::new();
+    let _guard = shutdown.clone().drop_guard();
+    let wait = tokio::spawn({
+        let service = service.clone();
+        let shutdown = shutdown.clone();
+        async move { admit_startup_recovery(&service, &shutdown, || dial(socket.clone())).await }
+    });
+    receiver.entered.notified().await;
+    // This is the lock node-manager activation takes before it can listen.
+    let exclusive = Flock::lock(
+        std::fs::File::open(&work).unwrap(),
+        FlockArg::LockExclusiveNonblock,
+    )
+    .unwrap();
+    assert_eq!(service.active_state_transition_count(), 0);
+    drop(exclusive);
+    ready.store(true, Ordering::SeqCst);
+    let lease = tokio::time::timeout(Duration::from_secs(5), wait)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(service.active_state_transition_count(), 1);
+    let (_, error) = Flock::lock(
+        std::fs::File::open(&work).unwrap(),
+        FlockArg::LockExclusiveNonblock,
+    )
+    .unwrap_err();
+    assert_eq!(error, nix::errno::Errno::EWOULDBLOCK);
+    service.prepare_execution_authority().await.unwrap();
+    drop(lease);
+    let _exclusive = Flock::lock(
+        std::fs::File::open(&work).unwrap(),
+        FlockArg::LockExclusiveNonblock,
+    )
+    .unwrap();
 }
 
 #[test]

@@ -376,6 +376,20 @@ pub async fn connect() -> Result<NodeManagerGrpcClient, ConnectError> {
     ))
 }
 
+/// Dial the node-manager socket once, for callers that own their retry loop
+/// and must classify each failure themselves.
+pub async fn connect_once() -> Result<NodeManagerGrpcClient, ConnectError> {
+    let channel = pplx_space_common_grpc::connect_uds_channel_with_endpoint(
+        "node-manager",
+        std::path::Path::new(SOCKET_PATH),
+        endpoint()?,
+    )
+    .await?;
+    Ok(proto::node_manager_client::NodeManagerClient::new(
+        wrap_grpc_client_channel(channel),
+    ))
+}
+
 /// Build a node-manager client without opening the Unix socket immediately.
 pub fn lazy() -> NodeManagerGrpcClient {
     static CLIENT: std::sync::OnceLock<NodeManagerGrpcClient> = std::sync::OnceLock::new();

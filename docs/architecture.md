@@ -189,6 +189,16 @@ is safe.
 | Builders and object storage | Build templates separately from user sandboxes and store template and snapshot artifacts. The Kind deployment uses Versity S3 Gateway (versitygw). |
 | Internal API and UI | Support node registration and template-release publication, and provide a browser interface. API clients do not require the UI. |
 
+Sandbox-manager waits for node-manager before advertising takeover readiness
+and again before acquiring the startup-recovery work gate. Temporary dependency
+failures keep the process waiting with bounded individual attempts and periodic
+warnings; there is no overall dependency-wait deadline. Its optional local health
+socket serves liveness while withholding readiness during these waits. Deployment
+probes must distinguish liveness from readiness; external startup deadlines still
+apply. Local execution-authority validation remains under recovery admission.
+These availability checks do not guarantee that node-manager will stay available
+through recovery, and do not extend any caller's request deadline.
+
 ## Security boundaries
 
 Firecracker isolates guest execution. Host-side services still require privileges to manage VMs, storage, and networking.
