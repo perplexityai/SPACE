@@ -46,11 +46,9 @@ use tokio_util::sync::CancellationToken;
 use tonic::Status;
 
 use pplx_space_common_core::types::{PodName, PodUid};
+use pplx_space_common_svc::sql::node_registration::registered_node;
 
-use self::store::registered_node;
 use crate::auth::{ClientService, K8sIdentity, K8sNodeIdentity};
-
-mod store;
 
 const SPACE_CREDMGR_K8S_AUTH_ENABLED_ENV: &str = "SPACE_CREDMGR_K8S_AUTH_ENABLED";
 const SPACE_CREDMGR_K8S_AUTH_NAMESPACE_ENV: &str = "SPACE_CREDMGR_K8S_AUTH_NAMESPACE";
@@ -306,15 +304,14 @@ pub struct CredmgrTokenReviewer {
     review_limiter: Arc<tokio::sync::Semaphore>,
     rate_limiter: Arc<ReviewRateLimiter>,
     pods: Store<Pod>,
-    // Observe mode supports instances without a database; enforcement rejects them.
-    database_pool: Option<sqlx::PgPool>,
+    database_pool: sqlx::PgPool,
 }
 
 impl CredmgrTokenReviewer {
     pub(crate) fn new(
         config: K8sAuthConfig,
         client: kube::Client,
-        database_pool: Option<sqlx::PgPool>,
+        database_pool: sqlx::PgPool,
         shutdown: CancellationToken,
     ) -> Self {
         let review_limiter = Arc::new(tokio::sync::Semaphore::new(config.max_inflight_reviews));
@@ -392,11 +389,7 @@ impl CredmgrTokenReviewer {
     }
 
     async fn check_node_registration(&self, node: &K8sNodeIdentity) -> Result<(), Status> {
-        let pool = self
-            .database_pool
-            .as_ref()
-            .ok_or_else(|| Status::unavailable("node_store_unavailable"))?;
-        let registered = registered_node(pool, node.node_name(), node.node_uid())
+        let registered = registered_node(&self.database_pool, node.node_name(), node.node_uid())
             .await
             .map_err(|error| {
                 tracing::warn!(%error, "node registration lookup failed");

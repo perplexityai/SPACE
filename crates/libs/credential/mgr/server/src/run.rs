@@ -279,6 +279,8 @@ pub enum ServeError {
     InternalToken(#[source] tonic::Status),
     #[error("invalid credmgr projected-token (k8sAuth) configuration: {0}")]
     K8sAuthConfig(#[source] crate::k8s_identity::K8sAuthConfigError),
+    #[error("Kubernetes authentication requires DATABASE_URL")]
+    K8sAuthMissingDatabase,
     #[error("failed to initialize the Kubernetes authentication client: {0}")]
     TokenReviewClient(#[source] crate::k8s_identity::K8sAuthConfigError),
     #[error("failed to read TLS PEM at {path}: {source}")]
@@ -1269,6 +1271,10 @@ async fn serve_tcp_until(
         .map_err(ServeError::K8sAuthConfig)?
     {
         Some(config) => {
+            let database_pool = service
+                .database_pool
+                .clone()
+                .ok_or(ServeError::K8sAuthMissingDatabase)?;
             tracing::info!(
                 %addr,
                 namespace = config.namespace(),
@@ -1278,7 +1284,7 @@ async fn serve_tcp_until(
             );
             crate::tcp_auth::CredmgrTcpAuthLayer::projected_token(
                 config,
-                service.database_pool.clone(),
+                database_pool,
                 shutdown_token.clone(),
             )
             .await

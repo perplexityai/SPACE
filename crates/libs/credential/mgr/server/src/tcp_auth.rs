@@ -111,7 +111,7 @@ impl CredmgrTcpAuthLayer {
     /// client between TokenReview and the caller pod reflector.
     pub async fn projected_token(
         config: K8sAuthConfig,
-        database_pool: Option<sqlx::PgPool>,
+        database_pool: sqlx::PgPool,
         shutdown: CancellationToken,
     ) -> Result<Self, K8sAuthConfigError> {
         let client = pplx_space_common_svc::kube_client::traced_kube_client_from_env().await?;

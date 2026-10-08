@@ -10,7 +10,7 @@ async fn every_service_rechecks_transport_peer_on_cached_tokens() {
     let (db, _) = registered_node_db().await.unwrap();
     for service in ClientService::ALL {
         for (mode, enforce) in [("observe", false), ("enforce", true)] {
-            let (reviewer, reviews) = caller_reviewer(service, Some(db.pool.clone()), Some(mode));
+            let (reviewer, reviews) = caller_reviewer(service, db.pool.clone(), Some(mode));
             let layer = CredmgrTcpAuthLayer {
                 authenticator: Arc::new(Authenticator::ProjectedToken(Box::new(reviewer))),
             };

@@ -66,7 +66,9 @@ fn test_reviewer(config: K8sAuthConfig, client: kube::Client) -> CredmgrTokenRev
         review_limiter,
         rate_limiter,
         pods,
-        database_pool: None,
+        database_pool: sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://localhost/unused")
+            .unwrap(),
     }
 }
 
@@ -167,7 +169,7 @@ fn reviewer_returning_error(config: K8sAuthConfig) -> (CredmgrTokenReviewer, Arc
 
 pub(crate) fn caller_reviewer(
     service: ClientService,
-    database_pool: Option<sqlx::PgPool>,
+    database_pool: sqlx::PgPool,
     mode: Option<&str>,
 ) -> (CredmgrTokenReviewer, Arc<AtomicUsize>) {
     let mut config = test_config();
@@ -704,7 +706,7 @@ async fn cached_identity_tracks_pod_state_and_configured_mode() {
         (Some("typo"), false),
     ] {
         let (mut reviewer, reviews) =
-            caller_reviewer(ClientService::VolumeManager, Some(db.pool.clone()), raw);
+            caller_reviewer(ClientService::VolumeManager, db.pool.clone(), raw);
         let (pods, mut writer) = reflector::store();
         reviewer.pods = pods;
         writer.apply_watcher_event(&Init);
@@ -762,7 +764,7 @@ async fn cached_identity_tracks_postgres_registration_in_both_modes() {
     for mode in [PodAuthorizationMode::Observe, PodAuthorizationMode::Enforce] {
         let (mut reviewer, reviews) = caller_reviewer(
             ClientService::VolumeManager,
-            Some(db.pool.clone()),
+            db.pool.clone(),
             Some(mode.as_str()),
         );
         let token = projected_token();
@@ -802,18 +804,16 @@ async fn cached_identity_tracks_postgres_registration_in_both_modes() {
                 "{mode:?}: {name:?}/{uid:?}"
             );
         }
-        for pool in [None, Some(closed_pool.clone())] {
-            reviewer.database_pool = pool;
-            let result = reviewer
-                .resolve_token_identity(&token, Some("10.0.0.2".parse().unwrap()))
-                .await;
-            let expected = (mode == PodAuthorizationMode::Enforce)
-                .then_some((Unavailable, "node_store_unavailable"));
-            assert_eq!(
-                result.as_ref().err().map(|e| (e.code(), e.message())),
-                expected
-            );
-        }
+        reviewer.database_pool = closed_pool.clone();
+        let result = reviewer
+            .resolve_token_identity(&token, Some("10.0.0.2".parse().unwrap()))
+            .await;
+        let expected = (mode == PodAuthorizationMode::Enforce)
+            .then_some((Unavailable, "node_store_unavailable"));
+        assert_eq!(
+            result.as_ref().err().map(|e| (e.code(), e.message())),
+            expected
+        );
         assert_eq!(
             reviews.load(Ordering::SeqCst),
             1,
