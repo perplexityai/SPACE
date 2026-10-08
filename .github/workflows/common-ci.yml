@@ -205,7 +205,9 @@ jobs:
               if [[ "$SPACE_CI_PER_COMMIT_MIGRATION_ISOLATION" == true ]]; then
               bash ci/scripts/check-migration-isolation-per-commit.sh "$migration_base";
               else bash scripts/check-postgres-migrations-isolated.sh; fi &&
-              bash scripts/check-postgres-migrations-squawk.sh
+              bash scripts/check-postgres-migrations-squawk.sh &&
+              PROTO_ISOLATION_PER_COMMIT="$SPACE_CI_PER_COMMIT_MIGRATION_ISOLATION"
+              bash scripts/check-proto-changes-isolated.sh "$migration_base"
             runner: ubuntu-24.04
             docker_access: false
             host_network: false
