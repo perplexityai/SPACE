@@ -26,17 +26,28 @@
 //! apiserver QPS.
 
 use std::collections::{HashMap, hash_map::Entry};
+use std::net::IpAddr;
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::{Engine, engine::general_purpose};
 use k8s_openapi::api::authentication::v1::{TokenReview, TokenReviewSpec, TokenReviewStatus};
+use k8s_openapi::api::core::v1::Pod;
 use kube::api::PostParams;
+use kube::runtime::{
+    reflector::{self, Store},
+    watcher,
+};
 use sha2::{Digest, Sha256};
+use tokio_util::sync::CancellationToken;
 use tonic::Status;
 
 use crate::auth::{ClientService, K8sIdentity};
+use crate::credential_store::CredentialStore;
+use credential_manager_pod_authorization::PodAuthorizationMode;
+
+mod credential_manager_pod_authorization;
 
 const SPACE_CREDMGR_K8S_AUTH_ENABLED_ENV: &str = "SPACE_CREDMGR_K8S_AUTH_ENABLED";
 const SPACE_CREDMGR_K8S_AUTH_NAMESPACE_ENV: &str = "SPACE_CREDMGR_K8S_AUTH_NAMESPACE";
@@ -232,6 +243,7 @@ fn allowed_service_names() -> Vec<String> {
 
 /// Validates projected ServiceAccount tokens against the apiserver and maps
 /// them to credmgr [`ClientService`] identities, with caching + backpressure.
+/// Pod, node-registration, and transport-peer checks run on every request.
 #[derive(Clone)]
 pub struct CredmgrTokenReviewer {
     reviews: kube::Api<TokenReview>,
@@ -240,12 +252,30 @@ pub struct CredmgrTokenReviewer {
     in_flight: Arc<Mutex<HashMap<TokenCacheKey, Vec<tokio::sync::oneshot::Sender<()>>>>>,
     review_limiter: Arc<tokio::sync::Semaphore>,
     rate_limiter: Arc<ReviewRateLimiter>,
+    pod_api: kube::Api<Pod>,
+    pods: Store<Pod>,
+    credential_store: Option<Arc<dyn CredentialStore>>,
+    mode: PodAuthorizationMode,
 }
 
 impl CredmgrTokenReviewer {
-    pub(crate) fn new(config: K8sAuthConfig, client: kube::Client) -> Self {
+    pub(crate) fn new(
+        config: K8sAuthConfig,
+        client: kube::Client,
+        credential_store: Option<Arc<dyn CredentialStore>>,
+        shutdown: CancellationToken,
+    ) -> Self {
         let review_limiter = Arc::new(tokio::sync::Semaphore::new(config.max_inflight_reviews));
         let rate_limiter = Arc::new(ReviewRateLimiter::new(config.review_rate_per_sec));
+        let pod_api = kube::Api::namespaced(client.clone(), config.namespace());
+        let (pods, writer) = reflector::store();
+        pplx_space_common_svc::kube_client::spawn_reflector(
+            "credential-manager caller pods",
+            writer,
+            pod_api.clone(),
+            watcher::Config::default(),
+            shutdown,
+        );
         Self {
             reviews: kube::Api::all(client),
             config: Arc::new(config),
@@ -253,14 +283,31 @@ impl CredmgrTokenReviewer {
             in_flight: Arc::new(Mutex::new(HashMap::new())),
             review_limiter,
             rate_limiter,
+            pod_api,
+            pods,
+            credential_store,
+            mode: PodAuthorizationMode::from_env(),
         }
     }
 
-    /// Authenticate a bearer token and resolve the Kubernetes caller. On
-    /// success the token is a projected ServiceAccount JWT whose ServiceAccount
-    /// is a recognized credmgr client and whose Pod and node bindings are
-    /// complete.
-    pub async fn authenticate(&self, token: &str) -> Result<K8sIdentity, Status> {
+    /// Authenticate a projected token and check its caller's pod, registered
+    /// node, and connection IP, including on TokenReview cache hits. Observe
+    /// mode reports pod-check failures; enforce mode rejects them.
+    pub async fn authenticate(
+        &self,
+        token: &str,
+        peer: Option<IpAddr>,
+        rpc: &str,
+    ) -> Result<K8sIdentity, Status> {
+        let caller = self.resolve_token_identity(token).await?;
+        let result = self.check_pod_authorization(&caller, peer, rpc).await;
+        if self.mode == PodAuthorizationMode::Enforce {
+            result?;
+        }
+        Ok(caller)
+    }
+
+    async fn resolve_token_identity(&self, token: &str) -> Result<K8sIdentity, Status> {
         let key = TokenCacheKey {
             token_digest: token_digest(token),
             audience: self.config.audience.clone(),

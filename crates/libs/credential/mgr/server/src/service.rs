@@ -900,7 +900,7 @@ impl CredentialManager for CredentialManagerService {
 
     /// Certify a node's intermediate CA public key under the SPACE root.
     ///
-    /// The TCP layer verifies the agent pod, node registration, and connection
+    /// The TCP layer verifies the caller pod, node registration, and connection
     /// peer before this handler's service-level authorization runs.
     async fn issue_intermediate_certificate(
         &self,

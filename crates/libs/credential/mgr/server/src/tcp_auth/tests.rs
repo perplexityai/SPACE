@@ -1,16 +1,15 @@
 use super::*;
+use crate::auth::ClientService;
 
 #[tokio::test]
 async fn cached_token_is_reauthorized_for_each_transport_peer() {
     use std::sync::atomic::Ordering;
     use tonic::transport::server::TcpConnectInfo;
     use tower::ServiceExt;
-    let (reviewer, reviews) = crate::k8s_identity::tests::agent_reviewer();
+    let (reviewer, reviews) =
+        crate::k8s_identity::tests::caller_reviewer(ClientService::NodeCredentialAgent);
     let layer = CredmgrTcpAuthLayer {
-        authenticator: Arc::new(Authenticator::ProjectedToken {
-            reviewer,
-            agent: Box::new(super::credential_manager_pod_authorization::tests::authorizer()),
-        }),
+        authenticator: Arc::new(Authenticator::ProjectedToken(Box::new(reviewer))),
     };
     let inner = tower::service_fn(|req: http::Request<()>| async move {
         let caller = req.extensions().get::<TcpCallerIdentity>().unwrap();

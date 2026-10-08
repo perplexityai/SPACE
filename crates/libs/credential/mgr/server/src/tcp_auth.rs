@@ -22,8 +22,6 @@
 //! Health and reflection paths bypass authentication so Kubernetes gRPC probes
 //! work without a credential.
 
-mod credential_manager_pod_authorization;
-
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -33,10 +31,9 @@ use subtle::ConstantTimeEq;
 use tonic::Status;
 use tower::{Layer, Service};
 
-use crate::auth::{ClientService, K8sIdentity};
+use crate::auth::K8sIdentity;
 use crate::credential_store::CredentialStore;
 use crate::k8s_identity::{CredmgrTokenReviewer, K8sAuthConfig, K8sAuthConfigError};
-use credential_manager_pod_authorization::AgentAuth;
 use tokio_util::sync::CancellationToken;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
@@ -55,10 +52,7 @@ pub enum TcpCallerIdentity {
 
 /// Authenticates TCP callers and resolves their identity. Cloned per request.
 enum Authenticator {
-    ProjectedToken {
-        reviewer: CredmgrTokenReviewer,
-        agent: Box<AgentAuth>,
-    },
+    ProjectedToken(Box<CredmgrTokenReviewer>),
     StaticToken(String),
 }
 
@@ -72,7 +66,7 @@ impl Authenticator {
         let token = bearer_token(auth_header)?;
 
         match self {
-            Self::ProjectedToken { reviewer, agent } => {
+            Self::ProjectedToken(reviewer) => {
                 // A TokenReview-configured listener has no static credential to
                 // compare against. Non-JWT bearers fail before reaching the
                 // apiserver; JWT-shaped values are reviewed normally.
@@ -85,12 +79,9 @@ impl Authenticator {
                     );
                     return Err(Status::unauthenticated("invalid token"));
                 }
-                let caller = reviewer.authenticate(token).await?;
-                if caller.service() == ClientService::NodeCredentialAgent {
-                    // TokenReview caches token authenticity only. Recheck the
-                    // pod, registered node and transport peer on every request.
-                    agent.authorize(&caller, peer_ip(extensions), rpc).await?;
-                }
+                let caller = reviewer
+                    .authenticate(token, peer_ip(extensions), rpc)
+                    .await?;
                 Ok(TcpCallerIdentity::K8sJwt(caller))
             }
             Self::StaticToken(expected) => {
@@ -119,29 +110,20 @@ pub struct CredmgrTcpAuthLayer {
 
 impl CredmgrTcpAuthLayer {
     /// Build the projected-token authentication path, sharing one Kubernetes
-    /// client between TokenReview and the agent pod reflector.
+    /// client between TokenReview and the caller pod reflector.
     pub async fn projected_token(
         config: K8sAuthConfig,
         credential_store: Option<Arc<dyn CredentialStore>>,
         shutdown: CancellationToken,
     ) -> Result<Self, K8sAuthConfigError> {
         let client = pplx_space_common_svc::kube_client::traced_kube_client_from_env().await?;
-        let agent = AgentAuth::new(
-            client.clone(),
-            config.namespace(),
-            credential_store,
-            shutdown,
-        );
-        let reviewer = CredmgrTokenReviewer::new(config, client);
+        let reviewer = CredmgrTokenReviewer::new(config, client, credential_store, shutdown);
         tracing::info!(
             mode = "k8s_token_review",
             "credmgr TCP auth initialized; static token is not accepted"
         );
         Ok(Self {
-            authenticator: Arc::new(Authenticator::ProjectedToken {
-                reviewer,
-                agent: Box::new(agent),
-            }),
+            authenticator: Arc::new(Authenticator::ProjectedToken(Box::new(reviewer))),
         })
     }
 

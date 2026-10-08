@@ -1,4 +1,4 @@
-//! Per-request authorization of projected node-agent tokens. TokenReview's
+//! Per-request pod authorization for credential-manager callers. TokenReview's
 //! cache proves token authenticity only; neither pod state, node registration,
 //! nor the transport peer's right to use that token is cached here.
 
@@ -6,31 +6,24 @@ use std::{fmt, net::IpAddr, str::FromStr, sync::Arc, time::Duration};
 
 use futures_util::FutureExt;
 use k8s_openapi::api::core::v1::Pod;
-use kube::{
-    Api,
-    runtime::{
-        reflector::{self, ObjectRef, Store},
-        watcher,
-    },
-};
-use tokio_util::sync::CancellationToken;
+use kube::runtime::reflector::ObjectRef;
 
 use pplx_space_common_core::types::PodName;
 use tonic::Status;
 
+use super::CredmgrTokenReviewer;
 use crate::auth::K8sIdentity;
-use crate::credential_store::CredentialStore;
 
 const MODE_ENV: &str = "SPACE_CREDMGR_AGENT_AUTHZ_MODE";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(super) enum AgentAuthzMode {
+pub(super) enum PodAuthorizationMode {
     Observe,
     #[default]
     Enforce,
 }
 
-impl AgentAuthzMode {
+impl PodAuthorizationMode {
     pub fn from_env() -> Self {
         Self::configured(std::env::var(MODE_ENV).ok().as_deref())
     }
@@ -48,10 +41,10 @@ impl AgentAuthzMode {
 }
 
 #[derive(Debug, thiserror::Error)]
-#[error("agent authorization mode must be observe or enforce")]
+#[error("pod authorization mode must be observe or enforce")]
 pub(super) struct InvalidMode;
 
-impl FromStr for AgentAuthzMode {
+impl FromStr for PodAuthorizationMode {
     type Err = InvalidMode;
 
     fn from_str(raw: &str) -> Result<Self, Self::Err> {
@@ -63,46 +56,13 @@ impl FromStr for AgentAuthzMode {
     }
 }
 
-impl fmt::Display for AgentAuthzMode {
+impl fmt::Display for PodAuthorizationMode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
     }
 }
 
-pub(crate) struct AgentAuth {
-    api: Api<Pod>,
-    pods: Store<Pod>,
-    credential_store: Option<Arc<dyn CredentialStore>>,
-    worker_daemonset: String,
-    mode: AgentAuthzMode,
-}
-
-impl AgentAuth {
-    pub(crate) fn new(
-        client: kube::Client,
-        namespace: &str,
-        credential_store: Option<Arc<dyn CredentialStore>>,
-        shutdown: CancellationToken,
-    ) -> Self {
-        let api = Api::namespaced(client, namespace);
-        let (pods, writer) = reflector::store();
-        pplx_space_common_svc::kube_client::spawn_reflector(
-            "credential agent pods",
-            writer,
-            api.clone(),
-            watcher::Config::default().fields("spec.serviceAccountName=space-credential-manager"),
-            shutdown,
-        );
-        Self {
-            api,
-            pods,
-            credential_store,
-            worker_daemonset: std::env::var("SPACE_CREDMGR_AGENT_WORKER_DAEMONSET")
-                .unwrap_or_else(|_| "space-credential-manager".to_owned()),
-            mode: AgentAuthzMode::from_env(),
-        }
-    }
-
+impl CredmgrTokenReviewer {
     async fn pod(&self, name: &PodName) -> Result<Option<Arc<Pod>>, Status> {
         // A cold store cannot establish the caller's current pod identity.
         // Polling readiness once is cancel-safe; no background waiter competes
@@ -111,23 +71,25 @@ impl AgentAuth {
             return Err(Status::unavailable("pod_cache_not_synced"));
         }
         let key = ObjectRef::new(name.as_str())
-            .within(self.api.namespace().expect("agent pod API is namespaced"));
+            .within(self.pod_api.namespace().expect("pod API is namespaced"));
         if let Some(pod) = self.pods.get(&key) {
             return Ok(Some(pod));
         }
         // A newly created pod can precede its watch event. Bound the live GET
         // on a miss; never issue a request-path LIST.
-        match tokio::time::timeout(Duration::from_secs(5), self.api.get_opt(name.as_str())).await {
+        match tokio::time::timeout(Duration::from_secs(5), self.pod_api.get_opt(name.as_str()))
+            .await
+        {
             Ok(Ok(pod)) => Ok(pod.map(Arc::new)),
             Ok(Err(error)) => {
-                tracing::warn!(%error, "agent authorization pod lookup failed");
+                tracing::warn!(%error, "pod authorization pod lookup failed");
                 Err(Status::unavailable("pod_api_unavailable"))
             }
             Err(_) => Err(Status::unavailable("pod_api_unavailable")),
         }
     }
 
-    pub async fn authorize(
+    pub(super) async fn check_pod_authorization(
         &self,
         caller: &K8sIdentity,
         peer: Option<IpAddr>,
@@ -155,24 +117,12 @@ impl AgentAuth {
                 == Some("Running"),
             "pod_not_running",
         );
-        let owner = pod_check(
-            pod.and_then(|p| p.metadata.owner_references.as_ref())
-                .is_some_and(|owners| {
-                    owners.iter().any(|owner| {
-                        owner.controller == Some(true)
-                            && owner.api_version == "apps/v1"
-                            && owner.kind == "DaemonSet"
-                            && owner.name == self.worker_daemonset
-                    })
-                }),
-            "pod_owner_mismatch",
-        );
         let node = match &self.credential_store {
             Some(store) => store
                 .registered_node(caller.node().node_name(), caller.node().node_uid())
                 .await
                 .map_err(|error| {
-                    tracing::warn!(%error, "agent authorization node lookup failed");
+                    tracing::warn!(%error, "pod authorization node lookup failed");
                     Status::unavailable("node_store_unavailable")
                 })
                 .and_then(|node| {
@@ -198,7 +148,6 @@ impl AgentAuth {
         let checks = [
             ("pod_uid", uid),
             ("pod_running", running),
-            ("pod_owner", owner),
             ("node_identity", node.map(|_| ())),
             ("peer_ip", peer_check),
         ];
@@ -206,15 +155,15 @@ impl AgentAuth {
         for (check, result) in checks {
             let result_tag = match (&result, self.mode) {
                 (Ok(()), _) => "allow",
-                (Err(_), AgentAuthzMode::Observe) => "would_deny",
-                (Err(_), AgentAuthzMode::Enforce) => "deny",
+                (Err(_), PodAuthorizationMode::Observe) => "would_deny",
+                (Err(_), PodAuthorizationMode::Enforce) => "deny",
             };
             pplx_space_metrics::credmgr::agent_authz(check, result_tag, self.mode.as_str(), rpc);
             if let Err(error) = result {
                 tracing::warn!(check, result = result_tag, mode = %self.mode, rpc,
                     reason = error.message(), pod_uid = %caller.pod().pod_uid(),
                     node_name = %caller.node().node_name(), peer_ip = ?peer,
-                    "credential agent authorization check failed");
+                    "credential pod authorization check failed");
                 // Infrastructure faults remain retryable even if another
                 // independent check also denied the request.
                 if failure.is_none() || error.code() == tonic::Code::Unavailable {
@@ -222,9 +171,9 @@ impl AgentAuth {
                 }
             }
         }
-        match (failure, self.mode) {
-            (Some(error), AgentAuthzMode::Enforce) => Err(error),
-            _ => Ok(()),
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(()),
         }
     }
 }
