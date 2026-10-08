@@ -87,6 +87,45 @@ target deployment, including kernel availability and SSH trust, before relying
 on a new lineage. Keep the previous digest for rollback through the existing
 admin release-tag API.
 
+## Build environment exports
+
+An `env_refs = ["PACKAGE_TOKEN"]` step requests the guest variable
+`PACKAGE_TOKEN`. The build-manager operator must provide its value as
+`SPACE_BUILD_EXPORT_PACKAGE_TOKEN` in the **daemon's** environment. Setting
+`PACKAGE_TOKEN` alone, on the daemon or the submitting client, does not authorize
+export. There is no fallback to ordinary daemon variables such as
+`SPACE_INTERNAL_TOKEN`; keep that token configured for service authentication.
+
+References must match `[A-Za-z_][A-Za-z0-9_]*`. Invalid names and missing exports
+fail the build; values must be UTF-8 without NUL bytes. Empty exported values
+are allowed. All references are resolved before any VM or recipe step starts.
+Each export overrides the same guest name from prior `env` steps for that step
+only. References are checked even on steps that do not consume them.
+
+For example, an operator can configure `SPACE_BUILD_EXPORT_PACKAGE_TOKEN`
+through the daemon's secret configuration, then submit:
+
+```toml
+[[steps]]
+type = "run"
+env_refs = ["PACKAGE_TOKEN"]
+command = 'test -n "$PACKAGE_TOKEN"'
+```
+
+Only designate values that every authorized recipe author may read or persist
+in the resulting template. Exported values travel over SSH stdin, outside host
+process arguments, and are not added to the persisted recipe. Guest commands
+can still print them or pass them to guest processes; avoid shell tracing and
+secret-bearing command output. Literal recipe `env` values remain recipe data,
+including any client-side TOML interpolation; use `env_refs` for daemon exports.
+
+The maintained `seed`, `code-runtime`, and `oci-python-smoke` recipes need no
+exports. Custom recipes that previously relied on bare daemon variables must
+keep their guest names and provision the corresponding `SPACE_BUILD_EXPORT_`
+variables on every builder before upgrade. Restart builders to apply environment
+changes. Rolling back restores the unrestricted lookup, so prefer correcting
+export configuration over reverting the boundary.
+
 ## Local seed construction
 
 The Docker launcher below is for local rootfs development. Kind/Tilt uses its

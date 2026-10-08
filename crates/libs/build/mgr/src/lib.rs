@@ -2,6 +2,7 @@ use pplx_space_common_core::types::{JobId, OrgId};
 
 pub mod blob;
 mod blob_storage;
+mod environment;
 pub mod object_store;
 pub mod oci;
 pub mod publish;
@@ -43,6 +44,7 @@ use pplx_space_template_mgr_client::proto::{
 use tempfile::TempDir;
 use tracing::Instrument as _;
 
+pub use environment::BuildEnvironmentError;
 pub use pplx_space_common_core::types::SystemPublicationGrantId;
 pub use publish::{
     PublishError, TemplateOrg, TemplatePublication, publish_build, register_build_template,
@@ -172,6 +174,8 @@ struct GuestRuntimeMetadata {
 
 #[derive(Debug, thiserror::Error)]
 pub enum BuildError {
+    #[error(transparent)]
+    Environment(#[from] BuildEnvironmentError),
     #[error(transparent)]
     Recipe(#[from] RecipeError),
     #[error(transparent)]
@@ -541,6 +545,13 @@ impl TemplateBuilder {
         template_id: &str,
         job_id: &JobId,
     ) -> Result<BuildOutcome, BuildError> {
+        // Resolve every export before starting a VM or running any recipe steps.
+        // Keep values out of the recipe persisted in the job database.
+        let step_exports = recipe
+            .steps
+            .iter()
+            .map(|step| environment::resolve_refs(&step.env_refs))
+            .collect::<Result<Vec<_>, _>>()?;
         let (base, base_raw, oci_image) = match &recipe.origin {
             Origin::FromScratch { .. } => {
                 build_phase(template_id, BuildPhase::ValidateRecipe, async {
@@ -833,7 +844,7 @@ impl TemplateBuilder {
 
         // Execute steps
         let mut env_acc: HashMap<String, String> = HashMap::new();
-        for (i, named_step) in recipe.steps.iter().enumerate() {
+        for (i, (named_step, exports)) in recipe.steps.iter().zip(&step_exports).enumerate() {
             let step_num = i + 1;
             let step_count = recipe.steps.len();
             println!("\n=== Step {step_num}/{}: {} ===", step_count, named_step);
@@ -853,7 +864,7 @@ impl TemplateBuilder {
             } else {
                 step_span.in_scope(|| {
                     tracing::info!("build recipe step started");
-                    execute_step(named_step, &ssh, &mut env_acc)
+                    execute_step(named_step, &ssh, &mut env_acc, exports)
                 })
             };
             let step_metric_result =
@@ -1767,14 +1778,10 @@ fn execute_step(
     named_step: &recipe::NamedStep,
     ssh: &SshSession,
     env_acc: &mut HashMap<String, String>,
+    exports: &HashMap<String, String>,
 ) -> Result<(), SshError> {
-    let step_env = if named_step.env_refs.is_empty() {
-        env_acc.clone()
-    } else {
-        let mut step_env = env_acc.clone();
-        inject_env_refs(&mut step_env, &named_step.env_refs);
-        step_env
-    };
+    let mut step_env = env_acc.clone();
+    step_env.extend(exports.clone());
 
     match &named_step.step {
         Step::SetRuntime(_) | Step::ClearRuntime => Err(SshError::CopyPayload(
@@ -2272,15 +2279,6 @@ fn validate_tar_symlink_target(link_path: &Path, target: &Path) -> Result<(), Ss
         }
     }
     Ok(())
-}
-
-/// Read env var names from host environment and inject into the map.
-fn inject_env_refs(env: &mut HashMap<String, String>, refs: &[String]) {
-    for name in refs {
-        if let Ok(val) = std::env::var(name) {
-            env.insert(name.clone(), val);
-        }
-    }
 }
 
 /// Resolve `$VAR` references using a provided env map.

@@ -65,6 +65,8 @@ pub enum RecipeProtoError {
     RuntimePlacement,
     #[error("invalid runtime declaration: {0}")]
     Runtime(#[from] TemplateRuntimeError),
+    #[error(transparent)]
+    Environment(#[from] crate::BuildEnvironmentError),
     #[error("recipe metadata is required")]
     MissingMetadata,
     #[error("recipe origin is required")]
@@ -191,7 +193,7 @@ pub struct SourceConfig {
 pub struct NamedStep {
     /// User-supplied step name, retained as recipe data but omitted from diagnostics.
     pub display_name: Option<String>,
-    /// Host environment variable names to inject into this step.
+    /// Guest names resolved from the operator's SPACE_BUILD_EXPORT_<NAME> values.
     pub env_refs: Vec<String>,
     pub step: Step,
 }
@@ -850,6 +852,9 @@ trait ProtoStepExt {
 
 impl ProtoStepExt for build_proto::recipe::Step {
     fn try_into_named_step(self, index: usize) -> Result<NamedStep, RecipeProtoError> {
+        for name in &self.env_refs {
+            crate::environment::validate_name(name)?;
+        }
         let step = self
             .body
             .ok_or(RecipeProtoError::MissingStep { index })?
@@ -904,7 +909,13 @@ impl ProtoStepBodyExt for build_proto::recipe::step::Body {
                     user: empty_to_none(step.user),
                 })
             }
-            build_proto::recipe::step::Body::Env(step) => Ok(Step::Env { vars: step.vars }),
+            build_proto::recipe::step::Body::Env(step) => {
+                for (name, value) in &step.vars {
+                    crate::environment::validate_name(name)?;
+                    crate::environment::validate_value(name, value)?;
+                }
+                Ok(Step::Env { vars: step.vars })
+            }
             build_proto::recipe::step::Body::Copy(step) => {
                 if step.dest.is_empty() {
                     return Err(RecipeProtoError::EmptyCopyDest { index });

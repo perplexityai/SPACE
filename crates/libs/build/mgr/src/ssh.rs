@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -15,6 +16,10 @@ mod tests;
 
 #[derive(Debug, thiserror::Error)]
 pub enum SshError {
+    #[error(transparent)]
+    Environment(#[from] crate::BuildEnvironmentError),
+    #[error("SSH command input transfer failed: {0}")]
+    CommandInput(#[source] std::io::Error),
     #[error(
         "builder SSH key not found at {path}. Generate one with: sudo mkdir -p /space/etc/builder && sudo ssh-keygen -t ed25519 -f {path} -N \"\""
     )]
@@ -110,30 +115,16 @@ impl SshSession {
         user: &str,
         env: &HashMap<String, String>,
     ) -> Result<(), SshError> {
-        let remote_cmd = if env.is_empty() {
-            command.to_string()
-        } else {
-            let env_prefix: String = env
-                .iter()
-                .map(|(k, v)| {
-                    let escaped = v.replace('\'', "'\\''");
-                    format!("{k}='{escaped}'")
-                })
-                .collect::<Vec<_>>()
-                .join(" ");
-            format!("env {env_prefix} bash -c {}", shell_quote(command))
-        };
+        let script = command_script(command, env)?;
 
         // Retry on SSH connection failures (exit code 255) which can happen
         // when the guest is under heavy load (e.g. large VMs on nested virt).
         for attempt in 0..SSH_EXEC_RETRIES {
-            let status = self
-                .ssh_cmd(user, &remote_cmd)
-                .stdin(Stdio::null())
-                .status();
-            match status {
-                Ok(s) if s.success() => return Ok(()),
-                Ok(s) if s.code() == Some(255) && attempt + 1 < SSH_EXEC_RETRIES => {
+            match send_command_script(self.ssh_cmd(user, "bash -s"), &script) {
+                Ok(()) => return Ok(()),
+                Err(SshError::CommandStatus(s))
+                    if s.code() == Some(255) && attempt + 1 < SSH_EXEC_RETRIES =>
+                {
                     eprintln!(
                         "SSH connection failed (attempt {}/{}), retrying in 5s...",
                         attempt + 1,
@@ -141,8 +132,7 @@ impl SshSession {
                     );
                     std::thread::sleep(std::time::Duration::from_secs(5));
                 }
-                Ok(s) => return Err(SshError::CommandStatus(s)),
-                Err(e) => return Err(SshError::CommandStart(e)),
+                Err(error) => return Err(error),
             }
         }
         Err(SshError::CommandRetries)
@@ -241,6 +231,36 @@ async fn exchange_command(
     tokio::time::timeout(timeout, operation)
         .await
         .map_err(|_| SshError::BoundedOperation)?
+}
+
+fn command_script(command: &str, env: &HashMap<String, String>) -> Result<String, SshError> {
+    let mut script = String::new();
+    for (name, value) in env {
+        crate::environment::validate_name(name)?;
+        crate::environment::validate_value(name, value)?;
+        script.push_str(&format!("export {name}={}\n", shell_quote(value)));
+    }
+    // Parse the whole command before execution, and preserve the step's empty stdin.
+    script.push_str(&format!("{{\n{command}\n}} </dev/null\n"));
+    Ok(script)
+}
+
+fn send_command_script(mut command: Command, script: &str) -> Result<(), SshError> {
+    // Neither resolved values nor commands containing them belong in host argv.
+    let mut child = command
+        .stdin(Stdio::piped())
+        .spawn()
+        .map_err(SshError::CommandStart)?;
+    let written = child
+        .stdin
+        .take()
+        .expect("piped stdin")
+        .write_all(script.as_bytes());
+    let status = child.wait().map_err(SshError::CommandInput)?;
+    if !status.success() {
+        return Err(SshError::CommandStatus(status));
+    }
+    written.map_err(SshError::CommandInput)
 }
 
 fn copy_unpack_command(dest: &str) -> String {

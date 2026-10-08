@@ -1378,6 +1378,7 @@ fn template_build_step_proto(
     };
     Ok(build_proto::recipe::Step {
         display_name: step.display_name,
+        // Keep guest names intact; only the builder can authorize and resolve exports.
         env_refs: step.env_refs,
         body: Some(body),
     })

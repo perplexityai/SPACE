@@ -237,3 +237,49 @@ async fn bounded_exchange_closes_stdin_and_limits_output_and_time() {
         Err(SshError::BoundedOperation)
     ));
 }
+
+#[test]
+fn command_stream_preserves_values_and_empty_stdin_without_secret_argv() {
+    let dir = tempfile::tempdir().unwrap();
+    let value = "synthetic ' \" $(touch injected) `touch injected`\nsecond line";
+    let env = HashMap::from([("TOKEN".into(), value.into())]);
+    let script = command_script(
+        "printf '%s' \"$TOKEN\" > value; cat > input; ps -o args= -p $$ > argv; exit 0",
+        &env,
+    )
+    .unwrap();
+    let mut receiver = Command::new("bash");
+    receiver.arg("-s").current_dir(dir.path());
+
+    send_command_script(receiver, &script).unwrap();
+
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("value")).unwrap(),
+        value
+    );
+    assert!(std::fs::read(dir.path().join("input")).unwrap().is_empty());
+    assert!(!dir.path().join("injected").exists());
+    let args = std::fs::read_to_string(dir.path().join("argv")).unwrap();
+    assert!(!args.contains(value));
+    assert!(args.contains("bash -s"));
+}
+
+#[test]
+fn command_stream_rejects_invalid_names_and_propagates_exit_status() {
+    let env = HashMap::from([("TOKEN;touch injected".into(), "private-value".into())]);
+    let result = command_script("true", &env);
+    assert!(matches!(
+        result,
+        Err(SshError::Environment(
+            crate::BuildEnvironmentError::InvalidName
+        ))
+    ));
+
+    let mut receiver = Command::new("bash");
+    receiver.arg("-s");
+    let result = send_command_script(
+        receiver,
+        &command_script("exit 42", &HashMap::new()).unwrap(),
+    );
+    assert!(matches!(result, Err(SshError::CommandStatus(status)) if status.code() == Some(42)));
+}

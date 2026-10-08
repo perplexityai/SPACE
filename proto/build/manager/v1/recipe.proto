@@ -97,9 +97,9 @@ message Recipe {
   message Step {
     // UI-only label shown in build logs. Not interpreted by the daemon.
     optional string display_name = 1;
-    // Host environment variable names the daemon may resolve and inject
-    // into this step's command/args. Allow-list semantics: only listed
-    // names are exposed. Ignored by steps that don't support env injection.
+    // Guest environment names, matching [A-Za-z_][A-Za-z0-9_]*. The daemon
+    // resolves NAME only from operator-configured SPACE_BUILD_EXPORT_NAME;
+    // missing exports fail the build. Values are scoped to this step.
     repeated string env_refs = 2;
 
     oneof body {

@@ -905,6 +905,7 @@ pub struct TemplateBuildStep {
     pub clear_runtime: Option<TemplateBuildClearRuntime>,
     #[serde(default)]
     pub display_name: Option<String>,
+    /// Guest names backed by operator-configured SPACE_BUILD_EXPORT_<NAME> on the builder.
     #[serde(default)]
     pub env_refs: Vec<String>,
     #[serde(default)]

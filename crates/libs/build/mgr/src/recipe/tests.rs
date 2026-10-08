@@ -1112,3 +1112,34 @@ type = "launch"
     runtime.apps[0].readiness = None;
     pplx_space_build_mgr_client::runtime::decode(runtime).unwrap_err();
 }
+
+#[test]
+fn proto_steps_validate_environment_names_before_execution() {
+    use super::ProtoStepExt;
+
+    for step in [
+        recipe::Step {
+            env_refs: vec!["TOKEN; echo injected".into()],
+            body: Some(recipe::step::Body::Run(recipe::Run {
+                command: "true".into(),
+                user: None,
+            })),
+            ..Default::default()
+        },
+        recipe::Step {
+            body: Some(recipe::step::Body::Env(recipe::Env {
+                vars: [("TOKEN'".into(), "secret-value".into())].into(),
+            })),
+            ..Default::default()
+        },
+    ] {
+        let result = step.try_into_named_step(1);
+
+        assert!(matches!(
+            result,
+            Err(RecipeProtoError::Environment(
+                crate::BuildEnvironmentError::InvalidName
+            ))
+        ));
+    }
+}
