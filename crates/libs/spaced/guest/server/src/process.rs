@@ -9,8 +9,6 @@ use dashmap::DashMap;
 use pplx_space_common_core::types::{GuestUserName, Pii, ProcessCommand, ProcessId, ProcessSignal};
 use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
 use std::sync::Weak;
-#[cfg(test)]
-use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::{collections::VecDeque, io};
 use tokio::io::AsyncRead;
@@ -903,8 +901,6 @@ struct ProcessEventJournal {
     changed: watch::Sender<ProcessJournalChange>,
     shared_output_slots: Arc<Semaphore>,
     consumed: watch::Sender<()>,
-    #[cfg(test)]
-    blocked_readers: AtomicUsize,
 }
 
 impl ProcessEventJournal {
@@ -915,8 +911,6 @@ impl ProcessEventJournal {
             changed,
             shared_output_slots,
             consumed: watch::channel(()).0,
-            #[cfg(test)]
-            blocked_readers: AtomicUsize::new(0),
         }
     }
 
@@ -1009,8 +1003,6 @@ impl ProcessEventJournal {
                 None => return,
                 Some(pending) => event = pending,
             }
-            #[cfg(test)]
-            let _blocked = BlockedOutputReader::new(&self.blocked_readers);
             if consumed.changed().await.is_err() {
                 return;
             }
@@ -1185,24 +1177,6 @@ fn can_evict_process_output(state: &ProcessJournalState) -> bool {
         .primary
         .upgrade()
         .is_none_or(|position| position.load(Ordering::Acquire) > state.first_sequence)
-}
-
-#[cfg(test)]
-struct BlockedOutputReader<'a>(&'a AtomicUsize);
-
-#[cfg(test)]
-impl<'a> BlockedOutputReader<'a> {
-    fn new(count: &'a AtomicUsize) -> Self {
-        count.fetch_add(1, Ordering::Relaxed);
-        Self(count)
-    }
-}
-
-#[cfg(test)]
-impl Drop for BlockedOutputReader<'_> {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::Relaxed);
-    }
 }
 
 fn evict_oldest_process_output(state: &mut ProcessJournalState) {
