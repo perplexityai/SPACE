@@ -34,6 +34,7 @@ use rusqlite::{Connection, OptionalExtension, Result, params};
 
 pub(crate) mod cleanup_jobs;
 pub(crate) mod cleanup_target_scan;
+pub(crate) mod guest_health;
 pub(crate) mod inventory;
 pub(crate) mod inventory_read;
 pub(crate) mod quarantine_history;
@@ -4669,6 +4670,7 @@ pub fn mark_quarantined(
         reason_code,
         reason_message,
         next_action,
+        None,
     )?;
     Ok(())
 }
@@ -5983,9 +5985,14 @@ pub(crate) fn mark_quarantined_from_state(
         reason_code,
         reason_message,
         next_action,
+        None,
     )
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "quarantine admission includes optional probe ownership evidence"
+)]
 fn mark_quarantined_inner(
     conn: &Connection,
     id: &str,
@@ -5994,6 +6001,7 @@ fn mark_quarantined_inner(
     reason_code: SandboxQuarantineReasonCode,
     reason_message: &str,
     next_action: SandboxQuarantineNextAction,
+    probe_authority: Option<&guest_health::GuestProbeAuthority>,
 ) -> std::result::Result<bool, MarkQuarantinedError> {
     let reason_message = reason_message.trim();
     let reason_message = (!reason_message.is_empty()).then_some(reason_message);
@@ -6018,6 +6026,11 @@ fn mark_quarantined_inner(
     let ts = now()?;
 
     let tx = conn.unchecked_transaction()?;
+    if let Some(authority) = probe_authority
+        && guest_health::load_probe_authority(&tx, id)?.as_ref() != Some(authority)
+    {
+        return Ok(false);
+    }
     let changed = tx.execute(
         "UPDATE sandboxes
          SET state = 'quarantined',

@@ -24,6 +24,376 @@ async fn gateway_metric_registry_forgets_retired_builds() {
     assert!(published.is_empty());
 }
 
+async fn apply_guest_probe_at(
+    state: &Arc<Mutex<HashMap<String, SandboxHealth>>>,
+    db: &Arc<std::sync::Mutex<rusqlite::Connection>>,
+    sandbox_id: &str,
+    outcome: HealthProbeOutcome,
+    seconds: u64,
+) {
+    let mut firecracker = sample(HealthProbeOutcome::Success);
+    firecracker.firecracker_state = Some(FirecrackerVmState::Running);
+    apply_guest_probe_with_firecracker_at(state, db, sandbox_id, outcome, seconds, firecracker)
+        .await;
+}
+
+async fn apply_guest_probe_with_firecracker_at(
+    state: &Arc<Mutex<HashMap<String, SandboxHealth>>>,
+    db: &Arc<std::sync::Mutex<rusqlite::Connection>>,
+    sandbox_id: &str,
+    outcome: HealthProbeOutcome,
+    seconds: u64,
+    firecracker: HealthObservation,
+) {
+    let authority = crate::db::guest_health::load_probe_authority(&db.lock().unwrap(), sandbox_id)
+        .unwrap()
+        .unwrap();
+    let mut guest = sample(outcome);
+    guest.observed_at = SystemTime::UNIX_EPOCH + Duration::from_secs(seconds);
+    apply_composed_health_result(
+        state,
+        db,
+        Some(Ok((
+            sandbox_id.to_string(),
+            Some(authority.state),
+            0,
+            ComposedProbeResult {
+                observations: [
+                    firecracker,
+                    sample(HealthProbeOutcome::Success),
+                    guest,
+                    sample(HealthProbeOutcome::Success),
+                ],
+                guest_status: None,
+                authority: Some(authority),
+            },
+        ))),
+    )
+    .await;
+}
+
+fn insert_live_guest_sandbox(conn: &rusqlite::Connection, sandbox_id: &str) {
+    insert_test_sandbox(conn, sandbox_id, crate::state::SandboxState::Started);
+    conn.execute(
+        "UPDATE sandboxes SET node_execution_retired = 0, pid = 4321, vsock_uds_path = '/tmp/test-guest/v.sock' WHERE id = ?1",
+        [sandbox_id],
+    ).unwrap();
+}
+
+#[tokio::test]
+async fn sustained_guest_failure_quarantines_live_vm_only_after_timeout() {
+    for (outcome, firecracker_outcome) in [
+        (HealthProbeOutcome::Unavailable, HealthProbeOutcome::Success),
+        (HealthProbeOutcome::Timeout, HealthProbeOutcome::Success),
+        (HealthProbeOutcome::Unavailable, HealthProbeOutcome::Timeout),
+    ] {
+        let sandbox_id = SandboxId::new().to_string();
+        let conn = crate::db::test_conn();
+        insert_live_guest_sandbox(&conn, &sandbox_id);
+        let db = Arc::new(std::sync::Mutex::new(conn));
+        let state = Arc::new(Mutex::new(HashMap::from([(
+            sandbox_id.clone(),
+            test_health(),
+        )])));
+        let mut firecracker = sample(firecracker_outcome);
+        if firecracker_outcome == HealthProbeOutcome::Success {
+            firecracker.firecracker_state = Some(FirecrackerVmState::Running);
+        }
+        for seconds in [100, 399] {
+            apply_guest_probe_with_firecracker_at(
+                &state,
+                &db,
+                &sandbox_id,
+                outcome,
+                seconds,
+                firecracker.clone(),
+            )
+            .await;
+        }
+        assert_eq!(
+            state.lock().await[&sandbox_id].current_status(),
+            ComposedHealthStatus::Degraded
+        );
+        assert_eq!(
+            crate::db::get_sandbox(&db.lock().unwrap(), &sandbox_id)
+                .unwrap()
+                .unwrap()
+                .state,
+            crate::state::SandboxState::Started
+        );
+        apply_guest_probe_with_firecracker_at(&state, &db, &sandbox_id, outcome, 400, firecracker)
+            .await;
+        let conn = db.lock().unwrap();
+        let row = crate::db::get_sandbox(&conn, &sandbox_id).unwrap().unwrap();
+        assert_eq!(row.state, crate::state::SandboxState::Quarantined);
+        assert!(
+            row.failure_reason
+                .unwrap()
+                .contains("guest agent unresponsive")
+        );
+        let (reason, action): (String, String) = conn.query_row(
+            "SELECT reason_code, next_action FROM sandbox_quarantine_state WHERE sandbox_id = ?1",
+            [&sandbox_id], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        assert_eq!(reason, "runtime_probe_inconsistent");
+        assert_eq!(action, "requires_operator_attention");
+        assert!(
+            !crate::db::list_node_dirty_refs(&conn, 10)
+                .unwrap()
+                .is_empty()
+        );
+    }
+}
+
+#[tokio::test]
+async fn guest_recovery_and_pause_reset_failure_episode() {
+    for reset in [
+        HealthProbeOutcome::Success,
+        HealthProbeOutcome::NotApplicable,
+    ] {
+        let sandbox_id = SandboxId::new().to_string();
+        let conn = crate::db::test_conn();
+        insert_live_guest_sandbox(&conn, &sandbox_id);
+        let db = Arc::new(std::sync::Mutex::new(conn));
+        let state = Arc::new(Mutex::new(HashMap::from([(
+            sandbox_id.clone(),
+            test_health(),
+        )])));
+        apply_guest_probe_at(
+            &state,
+            &db,
+            &sandbox_id,
+            HealthProbeOutcome::Unavailable,
+            100,
+        )
+        .await;
+        if reset == HealthProbeOutcome::NotApplicable {
+            db.lock()
+                .unwrap()
+                .execute(
+                    "UPDATE sandboxes SET state = 'paused', state_changed_at = 42 WHERE id = ?1",
+                    [&sandbox_id],
+                )
+                .unwrap();
+        }
+        apply_guest_probe_at(&state, &db, &sandbox_id, reset, 1000).await;
+        assert_eq!(
+            db.lock()
+                .unwrap()
+                .query_row(
+                    "SELECT count(*) FROM sandbox_guest_probe_failures",
+                    [],
+                    |row| row.get::<_, u32>(0)
+                )
+                .unwrap(),
+            0
+        );
+        if reset == HealthProbeOutcome::NotApplicable {
+            assert_eq!(
+                crate::db::get_sandbox(&db.lock().unwrap(), &sandbox_id)
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                crate::state::SandboxState::Paused
+            );
+            db.lock()
+                .unwrap()
+                .execute(
+                    "UPDATE sandboxes SET state = 'started', state_changed_at = 43 WHERE id = ?1",
+                    [&sandbox_id],
+                )
+                .unwrap();
+        }
+        apply_guest_probe_at(
+            &state,
+            &db,
+            &sandbox_id,
+            HealthProbeOutcome::Unavailable,
+            1100,
+        )
+        .await;
+        apply_guest_probe_at(
+            &state,
+            &db,
+            &sandbox_id,
+            HealthProbeOutcome::Unavailable,
+            1399,
+        )
+        .await;
+        assert_eq!(
+            crate::db::get_sandbox(&db.lock().unwrap(), &sandbox_id)
+                .unwrap()
+                .unwrap()
+                .state,
+            crate::state::SandboxState::Started
+        );
+        apply_guest_probe_at(
+            &state,
+            &db,
+            &sandbox_id,
+            HealthProbeOutcome::Unavailable,
+            1400,
+        )
+        .await;
+        assert_eq!(
+            crate::db::get_sandbox(&db.lock().unwrap(), &sandbox_id)
+                .unwrap()
+                .unwrap()
+                .state,
+            crate::state::SandboxState::Quarantined
+        );
+    }
+}
+
+#[tokio::test]
+async fn guest_failure_timeout_survives_manager_restart() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("sandbox-manager.sqlite");
+    crate::db::create_test_schema_on_disk(&path);
+    let sandbox_id = SandboxId::new().to_string();
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    insert_live_guest_sandbox(&conn, &sandbox_id);
+    conn.execute(
+        "UPDATE sandboxes SET state_changed_at = 10 WHERE id = ?1",
+        [&sandbox_id],
+    )
+    .unwrap();
+    let db = Arc::new(std::sync::Mutex::new(conn));
+    let state = Arc::new(Mutex::new(HashMap::from([(
+        sandbox_id.clone(),
+        test_health(),
+    )])));
+    apply_guest_probe_at(
+        &state,
+        &db,
+        &sandbox_id,
+        HealthProbeOutcome::Unavailable,
+        100,
+    )
+    .await;
+    drop(state);
+    drop(db);
+    let db = Arc::new(std::sync::Mutex::new(
+        rusqlite::Connection::open(&path).unwrap(),
+    ));
+    {
+        let conn = db.lock().unwrap();
+        let adopted = crate::db::get_sandbox(&conn, &sandbox_id).unwrap().unwrap();
+        assert!(
+            crate::db::settle_startup_resident(
+                &conn,
+                &adopted,
+                crate::db::StartupResidentSettlement::Started,
+            )
+            .unwrap()
+        );
+    }
+    let state = Arc::new(Mutex::new(HashMap::from([(
+        sandbox_id.clone(),
+        test_health(),
+    )])));
+    apply_guest_probe_at(
+        &state,
+        &db,
+        &sandbox_id,
+        HealthProbeOutcome::Unavailable,
+        400,
+    )
+    .await;
+    assert_eq!(
+        crate::db::get_sandbox(&db.lock().unwrap(), &sandbox_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        crate::state::SandboxState::Quarantined
+    );
+}
+
+#[test]
+fn guest_failure_evidence_is_fenced_to_execution_and_lifecycle() {
+    for (replacement, new_episode) in [
+        (
+            "UPDATE sandboxes SET node_execution_id = '019f8000-0000-7000-8000-0000000000aa' WHERE id = ?1",
+            true,
+        ),
+        (
+            "UPDATE sandboxes SET state_changed_at = 42 WHERE id = ?1",
+            false,
+        ),
+        ("UPDATE sandboxes SET pid = 1234 WHERE id = ?1", true),
+        (
+            "UPDATE sandboxes SET vsock_uds_path = '/tmp/replacement/v.sock' WHERE id = ?1",
+            true,
+        ),
+    ] {
+        let sandbox_id = SandboxId::new().to_string();
+        let conn = crate::db::test_conn();
+        insert_live_guest_sandbox(&conn, &sandbox_id);
+        let authority = crate::db::guest_health::load_probe_authority(&conn, &sandbox_id)
+            .unwrap()
+            .unwrap();
+        assert!(
+            !reconcile_guest_probe_failure(&conn, &sandbox_id, &authority, true, true, 100)
+                .unwrap()
+        );
+        conn.execute(replacement, [&sandbox_id]).unwrap();
+        assert!(
+            !reconcile_guest_probe_failure(&conn, &sandbox_id, &authority, true, true, 400)
+                .unwrap()
+        );
+        assert!(
+            !crate::db::guest_health::quarantine_unresponsive_guest(&conn, &sandbox_id, &authority)
+                .unwrap()
+        );
+        let authority = crate::db::guest_health::load_probe_authority(&conn, &sandbox_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            reconcile_guest_probe_failure(&conn, &sandbox_id, &authority, true, true, 400).unwrap(),
+            !new_episode
+        );
+        if new_episode {
+            assert!(
+                !reconcile_guest_probe_failure(&conn, &sandbox_id, &authority, true, false, 700)
+                    .unwrap()
+            );
+            assert!(
+                reconcile_guest_probe_failure(&conn, &sandbox_id, &authority, true, true, 701)
+                    .unwrap()
+            );
+        }
+    }
+}
+
+#[test]
+fn pause_without_a_watchdog_probe_resets_guest_failure_evidence() {
+    let sandbox_id = SandboxId::new().to_string();
+    let conn = crate::db::test_conn();
+    insert_live_guest_sandbox(&conn, &sandbox_id);
+    let authority = crate::db::guest_health::load_probe_authority(&conn, &sandbox_id)
+        .unwrap()
+        .unwrap();
+    assert!(
+        !reconcile_guest_probe_failure(&conn, &sandbox_id, &authority, true, true, 100).unwrap()
+    );
+    for state in ["paused", "started"] {
+        conn.execute(
+            "UPDATE sandboxes SET state = ?1 WHERE id = ?2",
+            rusqlite::params![state, sandbox_id],
+        )
+        .unwrap();
+    }
+    let authority = crate::db::guest_health::load_probe_authority(&conn, &sandbox_id)
+        .unwrap()
+        .unwrap();
+    assert!(
+        !reconcile_guest_probe_failure(&conn, &sandbox_id, &authority, true, true, 400).unwrap()
+    );
+    assert!(
+        reconcile_guest_probe_failure(&conn, &sandbox_id, &authority, true, true, 700).unwrap()
+    );
+}
+
 fn insert_test_sandbox(conn: &rusqlite::Connection, id: &str, state: crate::state::SandboxState) {
     let uuid8 = id
         .parse::<SandboxId>()
@@ -1284,6 +1654,7 @@ async fn lifecycle_edge_preserves_status_and_discards_in_flight_probe() {
             0,
             ComposedProbeResult {
                 observations,
+                authority: None,
                 guest_status: None,
             },
         ))),
@@ -1324,6 +1695,7 @@ async fn missing_guest_uptime_preserves_last_observation() {
             0,
             ComposedProbeResult {
                 observations: std::array::from_fn(|_| sample(HealthProbeOutcome::Success)),
+                authority: None,
                 guest_status: Some(pplx_space_spaced_host_client::proto::GetStatusResponse {
                     ready: false,
                     guest_uptime: None,
@@ -1428,6 +1800,7 @@ async fn successful_health_probes_leave_failed_lifecycle_unchanged() {
                 Some(crate::state::SandboxState::Failed),
                 0,
                 ComposedProbeResult {
+                    authority: None,
                     observations: [
                         firecracker,
                         sample(HealthProbeOutcome::Success),

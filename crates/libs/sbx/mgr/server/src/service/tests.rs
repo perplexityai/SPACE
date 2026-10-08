@@ -8524,6 +8524,49 @@ pub(crate) mod service_tests {
         )
     }
 
+    #[tokio::test]
+    async fn guest_activity_and_stale_bridge_lookup_refuse_quarantined_guest() {
+        let conn = crate::db::test_conn();
+        let sandbox_id = SandboxId::new().to_string();
+        insert_test_sandbox(&conn, &sandbox_id, SandboxState::Started);
+        conn.execute(
+            "UPDATE sandboxes SET node_execution_retired = 0 WHERE id = ?1",
+            [&sandbox_id],
+        )
+        .unwrap();
+        let stale_row = crate::db::get_sandbox(&conn, &sandbox_id).unwrap().unwrap();
+        let authority = crate::db::guest_health::load_probe_authority(&conn, &sandbox_id)
+            .unwrap()
+            .unwrap();
+        assert!(
+            crate::db::guest_health::quarantine_unresponsive_guest(&conn, &sandbox_id, &authority)
+                .unwrap()
+        );
+        let service = service_for_teardown_test(conn);
+        let error = match service
+            .ensure_active_for_guest_activity_with_start(
+                None,
+                &sandbox_id,
+                true,
+                None,
+                GuestActivityKind::Command,
+                WakeStartConfig::default(),
+            )
+            .await
+        {
+            Ok(_) => panic!("quarantined sandbox must not admit guest activity"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(error.message().contains("guest agent unresponsive"));
+        let error = match service.connect_spaced_host(&stale_row).await {
+            Ok(_) => panic!("quarantined sandbox must not connect to the guest bridge"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(error.message().contains("guest agent unresponsive"));
+    }
+
     fn route_identity(
         sandbox_id: SandboxId,
         route_generation: u64,

@@ -130,6 +130,21 @@ impl SandboxManagerService {
             SpacedEndpointAttestationResult, spaced_endpoint_attestation,
         };
 
+        let current = self.lookup_sandbox(&sandbox.id)?;
+        if matches!(
+            current.state,
+            SandboxState::Quarantined | SandboxState::Failed
+        ) {
+            return Err(Status::failed_precondition(format!(
+                "sandbox is {}, guest RPCs are disabled: {}",
+                current.state,
+                current
+                    .failure_reason
+                    .as_deref()
+                    .unwrap_or("operator attention required")
+            )));
+        }
+
         let requirement = activation_endpoint_proof_requirement(
             &sandbox.space_api_route_identity,
             sandbox.pool_template.as_deref(),

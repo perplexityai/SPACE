@@ -1,0 +1,2 @@
+DROP TRIGGER reset_sandbox_guest_probe_failure;
+DROP TABLE sandbox_guest_probe_failures;

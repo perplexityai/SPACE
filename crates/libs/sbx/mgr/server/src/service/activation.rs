@@ -732,8 +732,13 @@ impl SandboxManagerService {
                 | SandboxState::Quarantined
                 | SandboxState::Failed => {
                     return Err(Status::failed_precondition(format!(
-                        "sandbox is {}, cannot wake",
-                        sandbox.state
+                        "sandbox is {}, cannot wake{}",
+                        sandbox.state,
+                        sandbox
+                            .failure_reason
+                            .as_deref()
+                            .map(|reason| format!(": {reason}"))
+                            .unwrap_or_default()
                     )));
                 }
             }

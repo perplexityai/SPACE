@@ -50,6 +50,7 @@ const HEALTH_HISTORY_CAPACITY: usize = 5;
 const HEALTH_FAILURE_THRESHOLD: usize = 2;
 const HEALTH_SUCCESS_THRESHOLD: usize = 2;
 const GUEST_HEALTH_FAILURE_THRESHOLD: u32 = 3;
+const GUEST_PROBE_FAILURE_TIMEOUT_SECS: i64 = 300;
 const HEALTH_STALE_AFTER: Duration = Duration::from_secs(72);
 const HEALTH_PROBE_CONCURRENCY: usize = 32;
 const SPACED_HOST_HEALTH_TIMEOUT: Duration = Duration::from_millis(250);
@@ -606,6 +607,7 @@ struct HealthObservation {
 struct ComposedProbeResult {
     observations: [HealthObservation; 4],
     guest_status: Option<pplx_space_spaced_host_client::proto::GetStatusResponse>,
+    authority: Option<crate::db::guest_health::GuestProbeAuthority>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1834,7 +1836,7 @@ fn list_guest_health_rows(
 fn sandbox_states_for_ids(
     db: &Arc<std::sync::Mutex<rusqlite::Connection>>,
     sandbox_ids: &[String],
-) -> Option<HashMap<String, crate::state::SandboxState>> {
+) -> Option<HashMap<String, crate::db::guest_health::GuestProbeAuthority>> {
     let db = match db.lock() {
         Ok(db) => db,
         Err(error) => {
@@ -1842,28 +1844,17 @@ fn sandbox_states_for_ids(
             return None;
         }
     };
-    let mut statement = match db.prepare("SELECT state FROM sandboxes WHERE id = ?1") {
-        Ok(statement) => statement,
-        Err(error) => {
-            tracing::warn!(%error, "failed to prepare watchdog probe-state lookup");
-            return None;
-        }
-    };
     let mut states = HashMap::with_capacity(sandbox_ids.len());
     for sandbox_id in sandbox_ids {
-        let state = match statement.query_row([sandbox_id], |row| row.get::<_, String>(0)) {
-            Ok(state) => state,
-            Err(rusqlite::Error::QueryReturnedNoRows) => continue,
+        let authority = match crate::db::guest_health::load_probe_authority(&db, sandbox_id) {
+            Ok(Some(authority)) => authority,
+            Ok(None) => continue,
             Err(error) => {
                 tracing::warn!(sandbox_id, %error, "failed to load watchdog probe state");
                 continue;
             }
         };
-        let Ok(state) = state.parse::<crate::state::SandboxState>() else {
-            tracing::warn!(sandbox_id, state, "watchdog found an unknown sandbox state");
-            continue;
-        };
-        states.insert(sandbox_id.clone(), state);
+        states.insert(sandbox_id.clone(), authority);
     }
     Some(states)
 }
@@ -2134,7 +2125,16 @@ async fn composed_health_loop(
 
         let mut pending = tokio::task::JoinSet::new();
         for (sandbox_id, lifecycle_epoch, info) in due_sidecars {
-            let lifecycle = sandbox_states.get(&sandbox_id).copied();
+            let Some(authority) = sandbox_states.get(&sandbox_id).cloned() else {
+                continue;
+            };
+            if authority.node_execution_id != info.node_execution_id
+                || authority.runtime_pid != info.runtime_pid
+                || authority.vsock_uds_path != info.vsock_uds_path
+            {
+                continue;
+            }
+            let lifecycle = Some(authority.state);
             if !health_probe_lifecycle_is_eligible(lifecycle) {
                 continue;
             }
@@ -2150,7 +2150,8 @@ async fn composed_health_loop(
                 .await;
             }
             pending.spawn(async move {
-                let result = probe_composed_health(&sandbox_id, &info, lifecycle).await;
+                let mut result = probe_composed_health(&sandbox_id, &info, lifecycle).await;
+                result.authority = Some(authority);
                 (sandbox_id, lifecycle, lifecycle_epoch, result)
             });
         }
@@ -2216,6 +2217,7 @@ async fn probe_composed_health(
     ComposedProbeResult {
         observations: [firecracker, spaced_host, spaced_guest, net_gateway],
         guest_status,
+        authority: None,
     }
 }
 
@@ -2511,7 +2513,18 @@ async fn apply_composed_health_result(
     let ComposedProbeResult {
         observations,
         guest_status,
+        authority,
     } = result;
+    let guest_observation = &observations[2];
+    let guest_failed = !matches!(
+        guest_observation.outcome,
+        HealthProbeOutcome::Success | HealthProbeOutcome::NotApplicable
+    );
+    let observed_at = guest_observation
+        .observed_at
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .ok()
+        .and_then(|elapsed| i64::try_from(elapsed.as_secs()).ok());
     let mut map = state.lock().await;
     let Some(health) = map.get_mut(&sandbox_id) else {
         return;
@@ -2573,7 +2586,38 @@ async fn apply_composed_health_result(
             "sandbox composed health changed"
         );
     }
+    let escalated = match (authority, observed_at) {
+        (Some(authority), Some(observed_at)) => match db.lock() {
+            Ok(db) => match reconcile_guest_probe_failure(
+                &db,
+                &sandbox_id,
+                &authority,
+                guest_failed,
+                health.firecracker_alive,
+                observed_at,
+            ) {
+                Ok(escalated) => escalated,
+                Err(error) => {
+                    tracing::warn!(sandbox_id, %error, "failed to reconcile guest probe failure");
+                    false
+                }
+            },
+            Err(error) => {
+                tracing::warn!(sandbox_id, %error, "sandbox database mutex poisoned while reconciling guest probe failure");
+                false
+            }
+        },
+        _ => false,
+    };
     drop(map);
+    if escalated {
+        mark_sandbox_dirty(db, &sandbox_id);
+        tracing::warn!(
+            sandbox_id,
+            threshold_secs = GUEST_PROBE_FAILURE_TIMEOUT_SECS,
+            "quarantined sandbox after sustained guest agent probe failure with Firecracker alive"
+        );
+    }
     if let Some(uptime_secs) = guest_uptime {
         match db.lock() {
             Ok(db) => {
@@ -2586,6 +2630,31 @@ async fn apply_composed_health_result(
             }
         }
     }
+}
+
+fn reconcile_guest_probe_failure(
+    db: &rusqlite::Connection,
+    sandbox_id: &str,
+    authority: &crate::db::guest_health::GuestProbeAuthority,
+    guest_failed: bool,
+    firecracker_alive: bool,
+    observed_at: i64,
+) -> Result<bool, crate::db::MarkQuarantinedError> {
+    let first_failed_at = crate::db::guest_health::record_guest_probe(
+        db,
+        sandbox_id,
+        authority,
+        guest_failed,
+        observed_at,
+    )?;
+    if firecracker_alive
+        && first_failed_at.is_some_and(|first| {
+            observed_at.saturating_sub(first) >= GUEST_PROBE_FAILURE_TIMEOUT_SECS
+        })
+    {
+        return crate::db::guest_health::quarantine_unresponsive_guest(db, sandbox_id, authority);
+    }
+    Ok(false)
 }
 
 async fn reconcile_pause_failed_quarantine(

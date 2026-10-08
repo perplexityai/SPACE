@@ -109,6 +109,16 @@ crash, forced stop or host failure. [Guest file and disk
 I/O](space/design/guest-io.md) describes the guest's disk, its per-sandbox
 limits, the upload and read paths, and what each lifecycle operation persists.
 
+The sandbox-manager watchdog quarantines a running sandbox when its guest-agent
+probe has failed for at least five minutes and Firecracker liveness monitoring
+still sees the process alive. Shorter outages remain health degradation. A successful
+guest probe clears the failure timer; paused sandboxes are exempt. The timer is
+stored locally against the execution and lifecycle, survives manager restart,
+and is invalidated by lifecycle or runtime ownership changes.
+Quarantine uses the existing `runtime_probe_inconsistent` reason and requires
+operator attention: it does not restart the VM or delete evidence. Subsequent
+guest RPCs return `FAILED_PRECONDITION`, rather than retryable `UNAVAILABLE`.
+
 The **E2B Compatibility Wrapper (ECW)** is SPACE's E2B-compatible API surface.
 It translates E2B-compatible requests and responses at the edge and is distinct
 from the SPACE API. The [ECW guide](ecw.md) defines its tested compatibility
