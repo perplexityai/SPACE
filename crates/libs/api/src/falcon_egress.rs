@@ -1,7 +1,10 @@
-//! Deployment-owned destinations for the existing Falcon US-2 create header.
+//! Deployment-owned destinations for the existing Falcon create header.
 //!
-//! `SPACE_FALCON_US2_EGRESS_DESTINATIONS` is a JSON array of exact `ip` and
-//! `domain` destinations, parsed once at API startup. There is no built-in list.
+//! `SPACE_FALCON_US2_EGRESS_DESTINATIONS` is a JSON array of `ip`, `cidr`, and
+//! exact `domain` destinations, parsed once at API startup. There is no built-in list.
+//! The `us2` header, environment variable, and type names remain for compatibility;
+//! they do not restrict the configured regions. No renaming is included here.
+//! TODO: remove US-2-specific names in a separate coordinated caller/config migration.
 //! `SPACE_FALCON_TLS_INTERCEPTION_EXEMPTIONS_ENABLED` defaults to false and
 //! controls whether composition adds TLS exemptions for these destinations.
 //! Composition produces an ordinary [`NetworkPolicyV1`]; the gateway, shim,
@@ -30,7 +33,7 @@ pub enum FalconEgressConfigError {
     Json(#[source] serde_json::Error),
     #[error("{ENV} must contain at least one destination; unset it to disable Falcon egress")]
     Empty,
-    #[error("{ENV} accepts only exact IP and domain destinations")]
+    #[error("{ENV} accepts only IP addresses, CIDRs, and exact domain destinations")]
     UnsupportedDestination,
 }
 
@@ -61,7 +64,9 @@ impl FalconUs2Egress {
         if destinations.iter().any(|destination| {
             !matches!(
                 destination,
-                EgressDestinationV1::Ip(_) | EgressDestinationV1::Domain(_)
+                EgressDestinationV1::Ip(_)
+                    | EgressDestinationV1::Cidr(_)
+                    | EgressDestinationV1::Domain(_)
             )
         }) {
             return Err(FalconEgressConfigError::UnsupportedDestination);
