@@ -1204,6 +1204,7 @@ async fn get_template_authorizes_and_resolves_before_using_cached_builds(
                     assert_eq!(resolved_tag, tag.unwrap_or_default());
                     assert_eq!(caller, scoped.then_some(org));
                     Ok(ResolvedRelease {
+                        authorized_org: caller,
                         hash: selected.clone(),
                         storage_uris: vec![],
                         visibility:
@@ -1273,12 +1274,17 @@ async fn get_template_authorizes_and_resolves_before_using_cached_builds(
 
     // Revoked access and a missing tag must not fall back to either cached build.
     for (hash, tag, caller_org) in [
-        (Some(hash_a), None, Some(org)),
+        (Some(hash_a.clone()), None, Some(org)),
+        (Some(hash_a), None, None),
         (None, Some("missing"), Some(org)),
         (None, Some("missing"), None),
     ] {
         let mut lookup = request(hash, tag);
         lookup.get_mut().caller_org_id = caller_org.map(|org| org.to_string());
+        pplx_space_common_svc::template_lookup::TemplateLookupScope::Node(
+            "127.0.0.2".parse().unwrap(),
+        )
+        .attach(&mut lookup);
         let error = service
             .get_template_resolving(
                 lookup,

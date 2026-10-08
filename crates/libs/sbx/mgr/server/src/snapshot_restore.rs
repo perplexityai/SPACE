@@ -2708,19 +2708,26 @@ async fn ensure_local_template(
 ) -> Result<String, RestoreError> {
     use crate::template_resolver::TemplateLookupError;
     async {
+        let mut request =
+            tonic::Request::new(pplx_space_template_mgr_client::proto::GetTemplateRequest {
+                caller_org_id: None,
+                template: Some(pplx_space_template_mgr_client::proto::TemplateRef {
+                    name: template_name.to_string(),
+                    content_hash: Some(content_hash.to_string()),
+                    tag: None,
+                }),
+                vcpu: None,
+                memory_mib: None,
+            });
+        let scope = pplx_space_common_svc::template_lookup::TemplateLookupScope::Sandbox {
+            id: sandbox_id.parse().map_err(|error| {
+                RestoreError::Other(format!("invalid template sandbox identity: {error}"))
+            })?,
+            caller_node: None,
+        };
+        scope.attach(&mut request);
         let resp = templates
-            .get_template(tonic::Request::new(
-                pplx_space_template_mgr_client::proto::GetTemplateRequest {
-                    caller_org_id: None,
-                    template: Some(pplx_space_template_mgr_client::proto::TemplateRef {
-                        name: template_name.to_string(),
-                        content_hash: Some(content_hash.to_string()),
-                        tag: None,
-                    }),
-                    vcpu: None,
-                    memory_mib: None,
-                },
-            ))
+            .get_template(request)
             .await
             .map_err(|error| match error {
                 TemplateLookupError::Connect(e) => RestoreError::Other(format!(
@@ -2729,8 +2736,11 @@ async fn ensure_local_template(
                 TemplateLookupError::Rpc(error) => {
                     template_pull_error(template_name, content_hash, error)
                 }
-            })?
-            .into_inner();
+            })?;
+        scope
+            .require_acknowledgement(&resp)
+            .map_err(|error| template_pull_error(template_name, content_hash, error))?;
+        let resp = resp.into_inner();
         if resp.template_dir.is_empty() {
             return Err(RestoreError::Other(format!(
                 "tmplmgr returned no local template dir for {template_name}@{content_hash}"

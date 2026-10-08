@@ -118,6 +118,12 @@ pub(super) fn auth_layer(
 
 pub(super) fn bearer<T>(body: T, token: &str) -> Request<T> {
     let mut request = Request::new(body);
+    request
+        .extensions_mut()
+        .insert(tonic::transport::server::TcpConnectInfo {
+            local_addr: None,
+            remote_addr: Some(([127, 0, 0, 1], 1234).into()),
+        });
     request.metadata_mut().insert(
         "authorization",
         format!("Bearer {token}")

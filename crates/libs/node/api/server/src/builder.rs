@@ -130,9 +130,12 @@ impl BuilderApi for BuilderApiService {
 
     async fn get_template(
         &self,
-        r: Request<pplx_space_template_mgr_client::proto::GetTemplateRequest>,
+        mut r: Request<pplx_space_template_mgr_client::proto::GetTemplateRequest>,
     ) -> Result<Response<pplx_space_template_mgr_client::proto::GetTemplateResponse>, Status> {
-        fwd_retry!("template-manager", self.clients.tmpl(), get_template, r)
+        let scope = crate::template_lookup::bind_caller_scope(&mut r)?;
+        let response = fwd_retry!("template-manager", self.clients.tmpl(), get_template, r)?;
+        scope.require_acknowledgement(&response)?;
+        Ok(response)
     }
 
     async fn update_template_settings(
