@@ -1,5 +1,7 @@
 use super::*;
+mod retry_backoff;
 use pplx_space_common_core::types::TEMPLATE_MANAGER_SANDBOX_OWNER;
+pub(super) use retry_backoff::RetryBackoff;
 
 pub(super) struct BuildBaseSnapshotArgs<'a> {
     pub(super) sandbox_id: &'a str,
@@ -151,6 +153,19 @@ impl TemplateManagerService {
             .await
             .map_err(|e| Status::internal(format!("sbx start: {e}")))?;
 
+        let app_check = sbx_client
+            .wait_template_apps(pplx_space_sbx_mgr_client::proto::WaitTemplateAppsRequest {
+                sandbox_id: sandbox_id.to_string(),
+            })
+            .await
+            .map_err(|e| Status::internal(format!("snapshot app check: {e}")))?
+            .into_inner();
+        let app_warning = app_check.warnings.join("; ");
+        if !app_warning.is_empty() {
+            tracing::warn!(template = template_name, content_hash, warning = %app_warning,
+                "capturing base snapshot with best-effort app warning");
+        }
+
         // 3. Pause the VM
         sbx_client
             .pause(pplx_space_sbx_mgr_client::proto::PauseRequest {
@@ -193,9 +208,8 @@ impl TemplateManagerService {
         std::fs::metadata(&snapshot_base)
             .map_err(|e| Status::internal(format!("stat snapshot.base {snapshot_base}: {e}")))?;
 
-        // 6. Publish the snapshot row. The readiness contract was already
-        // established by the blocking cold start before pause; user restores
-        // trust that captured-ready state instead of probing every restore.
+        // 6. Publish only after required apps passed. Best-effort failures are
+        // logged above. User lifecycle readiness stays agent-only.
         {
             let db = Arc::clone(&self.db);
             let name = template_name.to_string();
@@ -602,18 +616,6 @@ impl TemplateManagerService {
             return SnapshotReconcileOutcome::default();
         }
 
-        {
-            let db = Arc::clone(&self.db);
-            let template = template.clone();
-            let _ = tokio::task::spawn_blocking(move || {
-                let conn = db.lock().map_err(|_| {
-                    crate::db::mutex_poison_error("record snapshot reconcile started")
-                })?;
-                crate::db::record_snapshot_reconcile_started(&conn, &template)
-            })
-            .await;
-        }
-
         if !settings.ensure_base_snapshot {
             match self.delete_base_snapshots_for_template(&template).await {
                 Ok(snapshot_deleted) => {
@@ -753,6 +755,37 @@ impl TemplateManagerService {
             };
         }
 
+        let retry_allowed = match self.snapshot_retry_backoff.lock() {
+            Ok(mut backoff) => backoff.allows(&name, &content_hash, std::time::Instant::now()),
+            Err(_) => {
+                return SnapshotReconcileOutcome {
+                    error: Some("snapshot backoff mutex poisoned".into()),
+                    ..Default::default()
+                };
+            }
+        };
+        if !retry_allowed {
+            return SnapshotReconcileOutcome {
+                content_hash: Some(content_hash),
+                error: Some("snapshot preparation retry deferred after failure (five-minute per-digest backoff)".into()),
+                ..Default::default()
+            };
+        }
+        {
+            let db = Arc::clone(&self.db);
+            let template_to_record = template.clone();
+            let recorded = tokio::task::spawn_blocking(move || {
+                let conn = db.lock().map_err(|_| {
+                    crate::db::mutex_poison_error("record snapshot reconcile started")
+                })?;
+                crate::db::record_snapshot_reconcile_started(&conn, &template_to_record)
+            })
+            .await;
+            if !matches!(recorded, Ok(Ok(()))) {
+                tracing::warn!(template, "could not record snapshot reconcile start");
+            }
+        }
+
         let service = self.clone_for_snapshot_reconcile();
         let task_template = template.clone();
         let task_name = name.clone();
@@ -774,6 +807,7 @@ impl TemplateManagerService {
         match build_task.await {
             Ok(outcome) => outcome,
             Err(err) => {
+                self.defer_failed_snapshot(&template, &content_hash);
                 let message = format!("base snapshot reconcile task failed: {err}");
                 self.record_snapshot_reconcile_result(&template, Some(&message))
                     .await;
@@ -843,6 +877,9 @@ impl TemplateManagerService {
             }
             Err(err) => {
                 let message = err.message().to_string();
+                self.defer_failed_snapshot(&name, &content_hash);
+                tracing::warn!(template, content_hash, error = %message,
+                    "base snapshot preparation failed; cold boot remains available");
                 self.record_snapshot_reconcile_result(&template, Some(&message))
                     .await;
                 SnapshotReconcileOutcome {
@@ -852,6 +889,15 @@ impl TemplateManagerService {
                     ..Default::default()
                 }
             }
+        }
+    }
+
+    fn defer_failed_snapshot(&self, name: &str, hash: &str) {
+        match self.snapshot_retry_backoff.lock() {
+            Ok(mut backoff) => backoff.failed(name, hash, std::time::Instant::now()),
+            Err(_) => tracing::error!(
+                "snapshot backoff mutex poisoned; further preparations will be refused"
+            ),
         }
     }
 

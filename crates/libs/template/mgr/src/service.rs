@@ -347,6 +347,7 @@ pub struct TemplateManagerService {
     artifact_store: TemplateArtifactStore,
     pool_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
     snapshot_reconcile_locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    snapshot_retry_backoff: Arc<Mutex<snapshots::RetryBackoff>>,
     normalized_template_dirs: Arc<Mutex<HashSet<String>>>,
     /// Prevents concurrent imports of the same (name, content_hash).
     importing_templates: Arc<Mutex<std::collections::HashSet<String>>>,
@@ -1427,6 +1428,7 @@ impl TemplateManagerService {
             artifact_store: TemplateArtifactStore::default(),
             pool_handle: Arc::new(Mutex::new(None)),
             snapshot_reconcile_locks: Arc::new(Mutex::new(HashMap::new())),
+            snapshot_retry_backoff: Arc::new(Mutex::new(snapshots::RetryBackoff::default())),
             normalized_template_dirs: Arc::new(Mutex::new(HashSet::new())),
             importing_templates: Arc::new(Mutex::new(std::collections::HashSet::new())),
             volume_puller: crate::volume::VolumePuller::new_with_background_worker(

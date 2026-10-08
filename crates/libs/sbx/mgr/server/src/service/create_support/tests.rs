@@ -473,3 +473,20 @@ fn restore_provenance_classifies_legacy_remote_metadata() {
 
     assert_eq!(provenance, SandboxRestoreProvenance::RemoteMetadataUnknown);
 }
+
+#[tokio::test]
+async fn existing_sandbox_cannot_resolve_a_missing_artifact_by_latest_alias() {
+    // With no template-manager available, this must reject locally rather than
+    // asking it to pick the newest build after the sandbox lost its identity.
+    let error =
+        resolve_template_paths_for_start(pplx_space_template_mgr_client::proto::TemplateRef {
+            name: "app-runtime".into(),
+            content_hash: None,
+            tag: None,
+        })
+        .await
+        .err()
+        .expect("missing identity cannot select a replacement artifact");
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    assert!(error.message().contains("saved template hash"));
+}

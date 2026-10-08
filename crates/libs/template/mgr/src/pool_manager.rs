@@ -305,7 +305,13 @@ async fn do_create_from_base(
             autostart: false,
             pool_template: Some(template.to_string()),
             volume_encryption: false,
-            boot_mode: 0,
+            // Prefer a prepared snapshot; resolve_boot_mode falls through to cold
+            // when required apps prevented this digest's snapshot publication.
+            boot_mode: if from_snapshot {
+                pplx_space_sbx_mgr_client::proto::BootMode::BaseSnapshot.into()
+            } else {
+                pplx_space_sbx_mgr_client::proto::BootMode::Cold.into()
+            },
             blocking: false,
             sandbox_id: None,
             content_hash: None,
@@ -324,7 +330,10 @@ async fn do_create_from_base(
             route_identity: None,
         })
         .await?;
-    let sandbox_id = create_resp.into_inner().sandbox_id;
+    let created = create_resp.into_inner();
+    let from_warm =
+        created.boot_mode_used == pplx_space_sbx_mgr_client::proto::BootMode::BaseSnapshot as i32;
+    let sandbox_id = created.sandbox_id;
 
     let result = async {
         sbx_client
@@ -336,7 +345,7 @@ async fn do_create_from_base(
                 vcpu: Some(vcpu),
                 memory_mib: Some(memory_mib),
                 checkpoint: None,
-                from_warm: from_snapshot,
+                from_warm,
                 blocking: true,
                 netns_path: None,
                 ready_timeout_secs: None,

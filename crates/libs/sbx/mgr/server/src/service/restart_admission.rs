@@ -210,6 +210,7 @@ restart_rpcs! {
     SandboxResume => ("/space.sandbox.manager.v1.SandboxManager/Resume", StateWriter),
     SandboxWake => ("/space.sandbox.manager.v1.SandboxManager/Wake", StateWriter),
     SandboxCreateSnapshot => ("/space.sandbox.manager.v1.SandboxManager/CreateSnapshot", StateWriter),
+    SandboxWaitTemplateApps => ("/space.sandbox.manager.v1.SandboxManager/WaitTemplateApps", StateWriter),
     SandboxCreateTemplateBaseSnapshot => ("/space.sandbox.manager.v1.SandboxManager/CreateTemplateBaseSnapshot", StateWriter),
     SandboxSuspend => ("/space.sandbox.manager.v1.SandboxManager/Suspend", StateWriter),
     SandboxPrepareTeardownSuspend => ("/space.sandbox.manager.v1.SandboxManager/PrepareTeardownSuspend", StateWriter),

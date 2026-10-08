@@ -77,6 +77,7 @@ mod gateway_authority;
 pub(crate) mod network_policy;
 mod restart_admission;
 mod suspend_snapshot_publication;
+mod template_apps;
 
 /// Enables the network-credential authority path (off by default).
 const NETWORK_CREDENTIALS_ENABLED_ENV: &str = "SPACE_SBXMGR_NETWORK_CREDENTIALS_ENABLED";

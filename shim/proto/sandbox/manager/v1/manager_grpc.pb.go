@@ -39,6 +39,7 @@ const (
 	SandboxManager_Resume_FullMethodName                                 = "/space.sandbox.manager.v1.SandboxManager/Resume"
 	SandboxManager_Wake_FullMethodName                                   = "/space.sandbox.manager.v1.SandboxManager/Wake"
 	SandboxManager_CreateSnapshot_FullMethodName                         = "/space.sandbox.manager.v1.SandboxManager/CreateSnapshot"
+	SandboxManager_WaitTemplateApps_FullMethodName                       = "/space.sandbox.manager.v1.SandboxManager/WaitTemplateApps"
 	SandboxManager_CreateTemplateBaseSnapshot_FullMethodName             = "/space.sandbox.manager.v1.SandboxManager/CreateTemplateBaseSnapshot"
 	SandboxManager_Suspend_FullMethodName                                = "/space.sandbox.manager.v1.SandboxManager/Suspend"
 	SandboxManager_PrepareTeardownSuspend_FullMethodName                 = "/space.sandbox.manager.v1.SandboxManager/PrepareTeardownSuspend"
@@ -157,6 +158,9 @@ type SandboxManagerClient interface {
 	// For full: pause + FC snapshot + full memory file + resume.
 	// For disk: btrfs subvolume snapshot (instant CoW).
 	CreateSnapshot(ctx context.Context, in *CreateSnapshotRequest, opts ...grpc.CallOption) (*CreateSnapshotResponse, error)
+	// Internal: observe app startup before template-manager pauses a base-snapshot VM.
+	// Required app failures reject preparation; best-effort failures return warnings.
+	WaitTemplateApps(ctx context.Context, in *WaitTemplateAppsRequest, opts ...grpc.CallOption) (*WaitTemplateAppsResponse, error)
 	// Internal: create a template base snapshot for a template-owned sandbox.
 	// Produces template artifacts snapshot.base + vmstate.base.
 	CreateTemplateBaseSnapshot(ctx context.Context, in *CreateTemplateBaseSnapshotRequest, opts ...grpc.CallOption) (*CreateTemplateBaseSnapshotResponse, error)
@@ -479,6 +483,16 @@ func (c *sandboxManagerClient) CreateSnapshot(ctx context.Context, in *CreateSna
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(CreateSnapshotResponse)
 	err := c.cc.Invoke(ctx, SandboxManager_CreateSnapshot_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *sandboxManagerClient) WaitTemplateApps(ctx context.Context, in *WaitTemplateAppsRequest, opts ...grpc.CallOption) (*WaitTemplateAppsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(WaitTemplateAppsResponse)
+	err := c.cc.Invoke(ctx, SandboxManager_WaitTemplateApps_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -1216,6 +1230,9 @@ type SandboxManagerServer interface {
 	// For full: pause + FC snapshot + full memory file + resume.
 	// For disk: btrfs subvolume snapshot (instant CoW).
 	CreateSnapshot(context.Context, *CreateSnapshotRequest) (*CreateSnapshotResponse, error)
+	// Internal: observe app startup before template-manager pauses a base-snapshot VM.
+	// Required app failures reject preparation; best-effort failures return warnings.
+	WaitTemplateApps(context.Context, *WaitTemplateAppsRequest) (*WaitTemplateAppsResponse, error)
 	// Internal: create a template base snapshot for a template-owned sandbox.
 	// Produces template artifacts snapshot.base + vmstate.base.
 	CreateTemplateBaseSnapshot(context.Context, *CreateTemplateBaseSnapshotRequest) (*CreateTemplateBaseSnapshotResponse, error)
@@ -1408,6 +1425,9 @@ func (UnimplementedSandboxManagerServer) Wake(context.Context, *WakeRequest) (*W
 }
 func (UnimplementedSandboxManagerServer) CreateSnapshot(context.Context, *CreateSnapshotRequest) (*CreateSnapshotResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method CreateSnapshot not implemented")
+}
+func (UnimplementedSandboxManagerServer) WaitTemplateApps(context.Context, *WaitTemplateAppsRequest) (*WaitTemplateAppsResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method WaitTemplateApps not implemented")
 }
 func (UnimplementedSandboxManagerServer) CreateTemplateBaseSnapshot(context.Context, *CreateTemplateBaseSnapshotRequest) (*CreateTemplateBaseSnapshotResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method CreateTemplateBaseSnapshot not implemented")
@@ -1923,6 +1943,24 @@ func _SandboxManager_CreateSnapshot_Handler(srv interface{}, ctx context.Context
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(SandboxManagerServer).CreateSnapshot(ctx, req.(*CreateSnapshotRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _SandboxManager_WaitTemplateApps_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(WaitTemplateAppsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SandboxManagerServer).WaitTemplateApps(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SandboxManager_WaitTemplateApps_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SandboxManagerServer).WaitTemplateApps(ctx, req.(*WaitTemplateAppsRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -2988,6 +3026,10 @@ var SandboxManager_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "CreateSnapshot",
 			Handler:    _SandboxManager_CreateSnapshot_Handler,
+		},
+		{
+			MethodName: "WaitTemplateApps",
+			Handler:    _SandboxManager_WaitTemplateApps_Handler,
 		},
 		{
 			MethodName: "CreateTemplateBaseSnapshot",

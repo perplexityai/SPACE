@@ -672,6 +672,17 @@ pub(super) fn stage_base_snapshot_runtime_metadata(
 pub(super) async fn resolve_template_paths_for_start(
     template_ref: pplx_space_template_mgr_client::proto::TemplateRef,
 ) -> Result<ResolvedTemplatePaths, Status> {
+    // Start restores an existing sandbox's identity. A name-only lookup could
+    // silently pick a new image after an alias moves; only create may do that.
+    if template_ref
+        .content_hash
+        .as_deref()
+        .is_none_or(str::is_empty)
+    {
+        return Err(Status::failed_precondition(
+            "cannot recover sandbox artifact without its saved template hash",
+        ));
+    }
     resolve_template_paths(template_ref)
         .await
         .map_err(start_template_resolution_failed_status)

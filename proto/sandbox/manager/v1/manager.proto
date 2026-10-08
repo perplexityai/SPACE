@@ -79,6 +79,10 @@ service SandboxManager {
   // For disk: btrfs subvolume snapshot (instant CoW).
   rpc CreateSnapshot(CreateSnapshotRequest) returns (CreateSnapshotResponse);
 
+  // Internal: observe app startup before template-manager pauses a base-snapshot VM.
+  // Required app failures reject preparation; best-effort failures return warnings.
+  rpc WaitTemplateApps(WaitTemplateAppsRequest) returns (WaitTemplateAppsResponse);
+
   // Internal: create a template base snapshot for a template-owned sandbox.
   // Produces template artifacts snapshot.base + vmstate.base.
   rpc CreateTemplateBaseSnapshot(CreateTemplateBaseSnapshotRequest) returns (CreateTemplateBaseSnapshotResponse);
@@ -1725,4 +1729,12 @@ message QuarantineRecoveryObservation {
   // The worker could not decode this observation. Consumers preserve the last
   // valid quarantine-recovery subdocument while accepting unrelated state.
   bool degraded = 6;
+}
+
+// Node-internal, template-manager-owned running sandboxes only. No route token.
+// Unknown RPC on an older manager fails snapshot preparation rather than skipping it.
+message WaitTemplateAppsRequest { string sandbox_id = 1; }
+message WaitTemplateAppsResponse {
+  // Best-effort apps that failed or exhausted their startup budget; no tenant output.
+  repeated string warnings = 1;
 }

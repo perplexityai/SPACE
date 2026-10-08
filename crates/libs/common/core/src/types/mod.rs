@@ -57,6 +57,8 @@ pub mod snapshot;
 mod sqlite;
 pub mod subject;
 pub mod template;
+#[cfg(feature = "serde")]
+pub mod template_runtime;
 pub mod time;
 pub mod transport_vsock;
 pub mod version;
@@ -117,6 +119,8 @@ pub use template::{
     TemplateManifestSchemaError, TemplateMetadata, TemplateMetadataSchemaError, ZSTD_CODEC,
     ZSTD_FILENAME_SUFFIX,
 };
+#[cfg(feature = "serde")]
+pub use template_runtime::*;
 pub use time::*;
 pub use transport_vsock::*;
 pub use version::{SemVer, SemVerParseError};

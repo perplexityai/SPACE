@@ -1915,18 +1915,26 @@ impl SandboxManagerService {
         } else {
             ""
         };
+        let is_builder = sandbox.user.kind() == SandboxOwnerKind::Builder;
+        let runtime_boot_args = if is_builder {
+            format!(
+                " {}",
+                pplx_space_common_core::types::TEMPLATE_RUNTIME_BUILD_MASK
+            )
+        } else {
+            String::new()
+        };
         // This only applies on cold boot. Restored sandboxes inherit the
         // kernel state captured in their snapshot, so templates/base snapshots
         // must be rebuilt to roll out boot-arg changes.
         let boot_args = format!(
-            "reboot=k panic=1 pci=off rw root=/dev/vda{clocksource_args} transparent_hugepage=never 8250.nr_uarts={nr_uarts}{console_args} ip={GUEST_IP}::{GUEST_GATEWAY}:{GUEST_NETMASK}:instance:{GUEST_NETWORK_INTERFACE}:off",
+            "reboot=k panic=1 pci=off rw root=/dev/vda{runtime_boot_args}{clocksource_args} transparent_hugepage=never 8250.nr_uarts={nr_uarts}{console_args} ip={GUEST_IP}::{GUEST_GATEWAY}:{GUEST_NETMASK}:instance:{GUEST_NETWORK_INTERFACE}:off",
             clocksource_args = clocksource_args,
             nr_uarts = nr_uarts,
             console_args = console_args,
         );
         // Build-manager VMs retain their existing rate-limiter exemption. All
         // other sandboxes use the immutable assignment stored on their row.
-        let is_builder = sandbox.user.kind() == SandboxOwnerKind::Builder;
         let disk_rate_limiter = firecracker_rate_limiter_field(
             "rate_limiter",
             self.rootfs_rate_limiter(is_builder, sandbox.disk_io_limits)

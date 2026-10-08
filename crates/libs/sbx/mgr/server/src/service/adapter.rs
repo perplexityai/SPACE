@@ -225,6 +225,13 @@ impl SandboxManager for SandboxManagerService {
         SandboxManagerService::create_snapshot(self, request).await
     }
 
+    async fn wait_template_apps(
+        &self,
+        request: Request<crate::proto::WaitTemplateAppsRequest>,
+    ) -> Result<Response<crate::proto::WaitTemplateAppsResponse>, Status> {
+        SandboxManagerService::wait_template_apps(self, request).await
+    }
+
     async fn create_template_base_snapshot(
         &self,
         request: Request<CreateTemplateBaseSnapshotRequest>,

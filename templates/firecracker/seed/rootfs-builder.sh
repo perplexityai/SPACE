@@ -611,6 +611,8 @@ mkdir -p /etc/systemd/journald.conf.d
 cat > /etc/systemd/journald.conf.d/00-volatile.conf <<'JOURNALCONF'
 [Journal]
 Storage=volatile
+RuntimeMaxUse=16M
+RuntimeMaxFileSize=2M
 JOURNALCONF
 rm -rf /var/log/journal
 systemctl mask systemd-journal-flush.service 2>/dev/null || true
