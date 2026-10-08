@@ -110,8 +110,6 @@ RUN --mount=type=secret,id=aws_web_identity_token \
         worker) \
           run-cargo-with-sccache cargo chef cook --locked --release --recipe-path recipe.json \
             --features "pplx-space-node-api-svc/otel,pplx-space-node-api-svc/datadog,pplx-space-node-api-svc/k8s,pplx-space-internal-api-svc/otel,pplx-space-internal-api-svc/datadog,pplx-space-internal-api-svc/k8s,pplx-space-node-ctl-svc/otel,pplx-space-node-ctl-svc/datadog,pplx-space-node-ctl-svc/kubernetes,pplx-space-node-mgr-svc/otel,pplx-space-node-mgr-svc/datadog,pplx-space-build-mgr-svc/otel,pplx-space-build-mgr-svc/datadog,pplx-space-build-mgr-svc/k8s,pplx-space-runtime-supervisor-svc/otel,pplx-space-runtime-supervisor-svc/datadog,pplx-space-runtime-manager-svc/otel,pplx-space-runtime-manager-svc/datadog,pplx-space-sbxmgr-svc/otel,pplx-space-sbxmgr-svc/datadog,pplx-space-spaced-host-svc/otel,pplx-space-spaced-host-svc/datadog,pplx-space-net-gateway-svc/otel,pplx-space-net-gateway-svc/datadog,pplx-space-tmplmgr-svc/otel,pplx-space-tmplmgr-svc/datadog,pplx-space-volmgr-svc/otel,pplx-space-volmgr-svc/datadog" \
-            --bin spaced \
-            --bin spaced-svc \
             --bin space-buildmgr \
             --bin space-buildmgr-svc \
             --bin space-tmplmgr \
@@ -132,6 +130,9 @@ RUN --mount=type=secret,id=aws_web_identity_token \
             --bin space-internal-api-svc \
             --bin space-nodectl-svc \
             --bin space-db-migrator \
+          && run-cargo-with-sccache cargo chef cook --locked --release --recipe-path recipe.json \
+            --bin spaced \
+            --bin spaced-svc \
           ;; \
         builder) \
           run-cargo-with-sccache cargo chef cook --locked --release --recipe-path recipe.json \
@@ -199,8 +200,6 @@ RUN --mount=type=secret,id=aws_web_identity_token \
       -F pplx-space-net-gateway-svc/otel,pplx-space-net-gateway-svc/datadog \
       -F pplx-space-tmplmgr-svc/otel,pplx-space-tmplmgr-svc/datadog \
       -F pplx-space-volmgr-svc/otel,pplx-space-volmgr-svc/datadog \
-      --bin spaced \
-      --bin spaced-svc \
       --bin space-buildmgr \
       --bin space-buildmgr-svc \
       --bin space-tmplmgr \
@@ -220,6 +219,19 @@ RUN --mount=type=secret,id=aws_web_identity_token \
       --bin space-internal-api-svc \
       --bin space-nodectl-svc \
       --bin space-db-migrator
+
+# The guest binaries run inside every sandbox, where nothing receives
+# telemetry. Building them in the invocation above would compile in the
+# Datadog and OTLP exporters the host services enable (cargo unifies a shared
+# dependency's features across one invocation), which in the guest cost
+# threads, memory and wakeups to reach an agent that does not exist. Their own
+# invocation, with no features, keeps them out and the binary smaller.
+RUN --mount=type=secret,id=aws_web_identity_token \
+    run-cargo-with-sccache cargo build --locked --release \
+      -p pplx-space-spaced-guest-cli \
+      -p pplx-space-spaced-guest-svc \
+      --bin spaced \
+      --bin spaced-svc
 
 RUN --mount=type=secret,id=aws_web_identity_token \
     bash scripts/build-runtime-supervisor.sh \

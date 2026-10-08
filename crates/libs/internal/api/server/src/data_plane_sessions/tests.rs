@@ -107,3 +107,66 @@ fn ingress_wake_requires_live_unrevoked_session_even_for_internal_route_refresh(
         );
     }
 }
+
+#[test]
+fn delegated_recovery_only_repairs_ingress_availability() {
+    for code in [
+        Code::Unavailable,
+        Code::FailedPrecondition,
+        Code::NotFound,
+        Code::Aborted,
+        Code::Unauthenticated,
+        Code::PermissionDenied,
+        Code::InvalidArgument,
+        Code::ResourceExhausted,
+        Code::Internal,
+        Code::DeadlineExceeded,
+    ] {
+        let error = Status::new(code, "synthetic route failure");
+        assert!(
+            !activation_may_repair(false, &error),
+            "non-ingress {code:?}"
+        );
+        assert_eq!(
+            activation_may_repair(true, &error),
+            matches!(
+                code,
+                Code::Unavailable | Code::FailedPrecondition | Code::NotFound | Code::Aborted
+            )
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn stalled_current_worker_leaves_time_for_delegated_recovery() {
+    for budget in [Duration::from_millis(400), Duration::from_secs(15)] {
+        let start = tokio::time::Instant::now();
+        let deadline = start + budget;
+        let probe = tokio::time::timeout_at(
+            deadline,
+            prepare_current_ingress_worker(deadline, true, std::future::pending()),
+        )
+        .await;
+        assert_eq!(
+            probe
+                .expect("probe must finish before caller deadline")
+                .unwrap_err()
+                .code(),
+            Code::Unavailable
+        );
+        assert!(deadline - tokio::time::Instant::now() >= budget * 3 / 4);
+        // Recovery that fits the original deadline remains possible after a
+        // stalled probe, rather than losing the entire wait on the old route.
+        tokio::time::timeout_at(deadline, tokio::time::sleep(budget / 2))
+            .await
+            .unwrap();
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(400);
+    let prepare = async {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        Ok(())
+    };
+    prepare_current_ingress_worker(deadline, false, prepare)
+        .await
+        .unwrap();
+}

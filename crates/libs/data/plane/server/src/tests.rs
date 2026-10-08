@@ -4043,3 +4043,58 @@ async fn cached_ingress_refreshes_replaced_execution_but_not_denied_access() {
         server.abort();
     }
 }
+
+// ECW keeps its status shapes, but says when to retry a refusal the guest
+// made before starting anything, and finds a full disk or quota by the
+// guest's reason rather than its wording.
+#[test]
+fn ecw_answers_refusals_with_retry_after_and_full_disks_by_reason() {
+    let refused = pplx_space_common_grpc::refused_before_start(
+        tonic::Status::resource_exhausted("too many concurrent filesystem file operations"),
+        std::time::Duration::from_millis(2500),
+    );
+    let error = ecw_connect::tonic_status_to_ecw_error(refused);
+    assert_eq!(error.status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        error.retry_after,
+        Some(std::time::Duration::from_millis(2500))
+    );
+    assert_eq!(
+        error.message,
+        "too many concurrent filesystem file operations"
+    );
+
+    let mut quota = tonic::Status::resource_exhausted("Disk quota exceeded (os error 122)");
+    quota.metadata_mut().insert(
+        pplx_space_common_core::spaced::ERROR_REASON_METADATA_KEY,
+        pplx_space_common_core::spaced::GUEST_STORAGE_FULL
+            .parse()
+            .unwrap(),
+    );
+    assert_eq!(
+        ecw_connect::tonic_status_to_ecw_error(quota).status,
+        StatusCode::INSUFFICIENT_STORAGE
+    );
+
+    // Any other refusal (a guest shutting down) keeps its status, 502 for
+    // E2B clients, and gains the hint; an unmarked one stays as it was.
+    let shutting_down =
+        ecw_connect::tonic_status_to_ecw_error(pplx_space_common_grpc::refused_before_start(
+            tonic::Status::unavailable("guest shutting down"),
+            std::time::Duration::from_millis(2500),
+        ));
+    assert_eq!(shutting_down.status, StatusCode::BAD_GATEWAY);
+    assert_eq!(
+        shutting_down.retry_after,
+        Some(std::time::Duration::from_millis(2500))
+    );
+    let unmarked =
+        ecw_connect::tonic_status_to_ecw_error(tonic::Status::unavailable("transport closed"));
+    assert_eq!(unmarked.status, StatusCode::BAD_GATEWAY);
+    assert_eq!(unmarked.retry_after, None);
+
+    let plain =
+        ecw_connect::tonic_status_to_ecw_error(tonic::Status::resource_exhausted("unmarked limit"));
+    assert_eq!(plain.status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(plain.retry_after, None);
+}

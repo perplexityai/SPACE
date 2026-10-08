@@ -231,3 +231,182 @@ fn connect_grant_absence_is_unauthorized_in_strict_mode() {
             .is_none()
     );
 }
+
+mod delete {
+    use std::time::Duration;
+
+    use axum::response::IntoResponse;
+    use pplx_space_db_test_fixtures::{SEED_ORG_ID, pg_test_db};
+    use pplx_space_public_api::{
+        OperationKind, PublicOperationResult, PublicSandboxOperationResult, SandboxLifecycleState,
+    };
+    use pplx_space_test_env::TestResult;
+
+    use super::*;
+    use crate::public_operations::{ClaimPublicOperations, CompleteClaimedPublicOperation};
+
+    // Long enough to observe a queued row a few times, short enough that a
+    // dispatcher-free test stays fast.
+    const OBSERVE: Duration = Duration::from_millis(400);
+
+    fn retry_after(error: E2bApiError) -> (StatusCode, Option<HeaderValue>) {
+        let response = error.into_response();
+        (
+            response.status(),
+            response
+                .headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .cloned(),
+        )
+    }
+
+    async fn admit(
+        store: &PublicOperationStore,
+        sandbox_id: PublicSandboxId,
+    ) -> TestResult<pplx_space_public_api::OperationId> {
+        let payload = SandboxLifecycleOperationPayload {
+            sandbox_id,
+            action: PublicSandboxLifecycleAction::Delete,
+            rollback: None,
+        }
+        .into_json();
+        match store
+            .create_or_join_active_sandbox_delete(
+                OrgId::from_uuid(SEED_ORG_ID),
+                &sandbox_id.to_string(),
+                payload,
+            )
+            .await?
+        {
+            CreatePublicOperationResult::Created(id) => Ok(id),
+            other => Err(format!("delete was not admitted: {other:?}").into()),
+        }
+    }
+
+    #[tokio::test]
+    async fn queued_delete_is_accepted_and_completed_delete_is_no_content() -> TestResult {
+        let db = pg_test_db().await?;
+        let store = PublicOperationStore::new(db.pool.clone());
+        let sandbox_id = PublicSandboxId::new();
+        let operation_id = admit(&store, sandbox_id).await?;
+        let org_id = OrgId::from_uuid(SEED_ORG_ID);
+
+        // No dispatcher runs here, as when the owning worker is draining:
+        // the durable operation stays queued past the HTTP wait budget.
+        let queued =
+            wait_for_delete_operation(&store, org_id, operation_id, sandbox_id, OBSERVE).await;
+        assert_eq!(
+            queued.map_err(|error| error.status),
+            Ok(StatusCode::ACCEPTED)
+        );
+
+        let claimed = store
+            .claim_operations(ClaimPublicOperations {
+                limit: 1,
+                claim_stale_after: Duration::from_secs(60),
+                claimable_kinds: &[OperationKind::DeleteSandbox],
+            })
+            .await?;
+        let result = PublicOperationResult::Sandbox(PublicSandboxOperationResult {
+            sandbox_id,
+            state: SandboxLifecycleState::Deleted,
+            action: Some(PublicSandboxLifecycleAction::Delete),
+            controller_response: None,
+        });
+        assert!(
+            store
+                .complete_claimed_operation(CompleteClaimedPublicOperation {
+                    claim_token: claimed.claim_token,
+                    operation_id,
+                    progress_message: "sandbox deleted".to_string(),
+                    result_json: serde_json::to_value(&result)?,
+                })
+                .await?
+        );
+        let completed =
+            wait_for_delete_operation(&store, org_id, operation_id, sandbox_id, OBSERVE).await;
+        assert_eq!(
+            completed.map_err(|error| error.status),
+            Ok(StatusCode::NO_CONTENT)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn lost_observation_of_a_durable_delete_is_still_accepted() -> TestResult {
+        let db = pg_test_db().await?;
+        let store = PublicOperationStore::new(db.pool.clone());
+        let sandbox_id = PublicSandboxId::new();
+        let operation_id = admit(&store, sandbox_id).await?;
+        db.pool.close().await;
+
+        let observed = wait_for_delete_operation(
+            &store,
+            OrgId::from_uuid(SEED_ORG_ID),
+            operation_id,
+            sandbox_id,
+            OBSERVE,
+        )
+        .await;
+        assert_eq!(
+            observed.map_err(|error| error.status),
+            Ok(StatusCode::ACCEPTED)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unproven_delete_admission_is_a_paced_retryable_unavailable() -> TestResult {
+        // Nothing listens on port 1, so admission cannot reach the database.
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(Duration::from_millis(200))
+            .connect_lazy("postgres://unused@127.0.0.1:1/unused")?;
+        let error = PublicOperationStore::new(pool)
+            .create_or_join_active_sandbox_delete(
+                OrgId::from_uuid(SEED_ORG_ID),
+                &PublicSandboxId::new().to_string(),
+                serde_json::json!({}),
+            )
+            .await
+            .expect_err("an unreachable database cannot admit a delete");
+
+        assert_eq!(
+            retry_after(delete_admission_error(&error)),
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Some(HeaderValue::from_static("1"))
+            )
+        );
+        assert_eq!(
+            retry_after(delete_admission_error(
+                &PublicOperationStoreError::InvalidStoredFingerprint("corrupt".into())
+            ))
+            .0,
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn failed_delete_reports_unavailability_as_retryable() {
+        assert_eq!(
+            retry_after(e2b_operation_failure(
+                Some(PublicErrorCode::ServiceUnavailable),
+                None,
+                "worker unavailable",
+            )),
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Some(HeaderValue::from_static("1"))
+            )
+        );
+        assert_eq!(
+            retry_after(e2b_operation_failure(
+                Some(PublicErrorCode::Conflict),
+                None,
+                "conflict"
+            )),
+            (StatusCode::CONFLICT, None)
+        );
+    }
+}

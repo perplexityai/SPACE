@@ -495,11 +495,6 @@ handoff for rollback. A running volume-manager under UID 964 must use
 `SPACE_CREDMGR_ENDPOINT=unix:///space/run/volume-credentials/credmgr.sock` and is
 denied access to the standard listener.
 
-The shared-identity vulnerability remains until volume-manager stops running as
-UID 950. Retain legacy authorization during the supported rollback window,
-then remove the UID-950 volume-manager executable allowance and storage-actor
-mapping in a follow-up.
-
 ### Retained-state migration commands
 
 The volume-manager executable provides two explicit deployment commands:

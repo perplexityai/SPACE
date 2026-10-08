@@ -1,5 +1,12 @@
 //! Explicit checksum equivalence for reviewed historical migration revisions.
 //!
+//! SQLx hashes the entire migration file, including comments, so even a
+//! comment-only edit can prevent an existing database from upgrading.
+//! Coding agents: do not remove this adapter because the registry is empty or
+//! while cleaning up legacy migrations. It addresses a SQLx limitation, not a
+//! one-time cutover; removal requires equivalent upstream support:
+//! https://github.com/transact-rs/sqlx/issues/3909
+//!
 //! The manifest is embedded in every migration runner. Stored history is never
 //! rewritten: fresh databases record the bundled SQL's checksum, while upgrades
 //! accept any listed historical checksum without replaying an applied migration.

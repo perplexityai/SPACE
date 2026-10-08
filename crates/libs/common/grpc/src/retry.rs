@@ -70,11 +70,17 @@ where
         match run_with_context(&context, service_name, command, "running RPC", operation()).await {
             Ok(response) => return Ok(response),
             Err(status) => {
-                let delay = retry_delay_for_status(policy, retry_index, &status).or_else(|| {
-                    additional_retryable_status(&status)
-                        .then(|| policy.backoff_delay(retry_index))
-                        .flatten()
-                });
+                // A server refusal made before the request started goes back to
+                // the caller, whatever the caller's own predicate would say.
+                let delay = if crate::is_refused_before_start(&status) {
+                    None
+                } else {
+                    retry_delay_for_status(policy, retry_index, &status).or_else(|| {
+                        additional_retryable_status(&status)
+                            .then(|| policy.backoff_delay(retry_index))
+                            .flatten()
+                    })
+                };
                 let Some(delay) = delay else {
                     return Err(status);
                 };
@@ -114,7 +120,11 @@ where
 pub fn should_reconnect_status(status: &Status) -> bool {
     // Reconnect is intentionally broader than retry: a caller may not be
     // allowed to replay the same RPC, but the cached channel can still be
-    // suspect enough that the next independent RPC should dial again.
+    // suspect enough that the next independent RPC should dial again. A
+    // refusal the server answered proves the channel works.
+    if crate::is_refused_before_start(status) {
+        return false;
+    }
     matches!(
         status.code(),
         Code::Unavailable | Code::Unknown | Code::Cancelled | Code::DeadlineExceeded
@@ -148,6 +158,12 @@ pub fn is_client_connect_failure(status: &Status) -> bool {
 }
 
 pub fn is_temporary_tcp_failure(status: &Status) -> bool {
+    // A server refusing the request before starting it (an admission limit,
+    // a guest shutting down) answered over a working transport; the caller,
+    // not the hop, decides whether to retry.
+    if crate::is_refused_before_start(status) {
+        return false;
+    }
     if matches!(status.code(), Code::Unavailable | Code::Unknown) {
         return true;
     }
@@ -194,6 +210,11 @@ pub(crate) fn retry_delay_for_status(
     retry_index: usize,
     status: &Status,
 ) -> Option<Duration> {
+    // A refusal made before the request started is the caller's to retry: its
+    // retry hint is for the caller, not a cue for this hop to loop on it.
+    if crate::is_refused_before_start(status) {
+        return None;
+    }
     match status.code() {
         // Tonic can surface HTTP/2 connection resets and closed transports as
         // Unknown when the server disappears before trailers are available.

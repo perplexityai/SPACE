@@ -401,3 +401,44 @@ fn bundle_injection_does_not_remove_rootfs_through_ancestor_symlink(bundle_fixtu
     );
     assert!(bundle_fixture.target.join("etc/ssh").is_dir());
 }
+
+// OCI assembly carries the seed's units with a fixed set of the seed's
+// executables. Every program a seed unit starts must be in that set: an OCI
+// image need not have its own (a workloads unit holding its cgroup with
+// `sleep` would fail to start where the image has none, and spaced, which
+// requires it, with it).
+#[test]
+fn every_program_a_seed_unit_runs_is_carried_in_the_bundle() {
+    let carried: std::collections::BTreeSet<&str> = super::REQUIRED_PATHS
+        .iter()
+        .chain(super::OPTIONAL_PATHS)
+        .copied()
+        .collect();
+    let mut programs = Vec::new();
+    for line in crate::BUNDLED_ROOTFS_BUILDER_SCRIPT.lines() {
+        let Some((key, command)) = line.split_once('=') else {
+            continue;
+        };
+        if !matches!(
+            key,
+            "ExecStart" | "ExecStartPre" | "ExecStartPost" | "ExecStop" | "ExecReload"
+        ) {
+            continue;
+        }
+        let program = command
+            .trim_start_matches(['-', '@', '+', '!', ':'])
+            .split_whitespace()
+            .next()
+            .expect("an Exec line names a program");
+        programs.push(program.to_owned());
+        assert!(
+            carried.contains(program.trim_start_matches('/')),
+            "{key}={program} is not carried in the OCI guest bundle"
+        );
+    }
+    assert!(
+        programs
+            .iter()
+            .any(|program| program == "/usr/local/bin/spaced-svc")
+    );
+}

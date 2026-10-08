@@ -5046,8 +5046,11 @@ dependencies = [
  "pplx-space-build-mgr-client",
  "pplx-space-common-core",
  "pplx-space-common-svc",
+ "pplx-space-credmgr",
  "pplx-space-credmgr-client",
+ "pplx-space-db-test-fixtures",
  "pplx-space-execution-common",
+ "pplx-space-internal-api-server",
  "pplx-space-metrics",
  "pplx-space-net-common",
  "pplx-space-node-api-client",
@@ -5056,6 +5059,7 @@ dependencies = [
  "pplx-space-sbx-mgr-client",
  "pplx-space-spaced-common",
  "pplx-space-template-mgr-client",
+ "pplx-space-test-env",
  "prost",
  "reqwest 0.13.5",
  "rstest",
@@ -5063,13 +5067,17 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.0",
+ "sqlx",
  "tar",
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
+ "tokio-stream",
+ "tokio-util",
  "toml",
  "tonic",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -5077,10 +5085,15 @@ name = "pplx-space-build-mgr-cli"
 version = "0.8.0"
 dependencies = [
  "anyhow",
+ "axum",
  "clap",
+ "http-body-util",
+ "hyper",
  "pplx-space-build-mgr",
  "pplx-space-build-mgr-client",
  "pplx-space-common-cli",
+ "pplx-space-node-api-client",
+ "prost",
  "tempfile",
  "tokio",
  "tokio-stream",
@@ -5318,7 +5331,7 @@ name = "pplx-space-common-grpc"
 version = "0.8.0"
 dependencies = [
  "bytes",
- "futures-util",
+ "futures-core",
  "http 1.5.0",
  "http-body 1.1.0",
  "hyper-util",
@@ -5328,11 +5341,9 @@ dependencies = [
  "rand 0.10.2",
  "rcgen",
  "rustls",
- "socket2",
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
- "tokio-rustls",
  "tokio-stream",
  "tokio-util",
  "tonic",
@@ -5434,7 +5445,6 @@ dependencies = [
  "pplx-space-db-test-fixtures",
  "pplx-space-metrics",
  "pplx-space-observability",
- "pplx-space-sqlite-migrations",
  "pplx-space-test-env",
  "rand 0.10.2",
  "redis",
@@ -5538,6 +5548,7 @@ dependencies = [
  "aws-credential-types",
  "aws-sdk-acmpca",
  "aws-sdk-secretsmanager",
+ "aws-smithy-runtime-api",
  "aws-smithy-types",
  "base64 0.23.1",
  "bytes",
@@ -5553,6 +5564,7 @@ dependencies = [
  "jiff",
  "k8s-openapi",
  "kube",
+ "lru 0.18.4",
  "nix 0.31.3",
  "pplx-space-common-core",
  "pplx-space-common-svc",
@@ -5690,7 +5702,6 @@ dependencies = [
  "pplx-space-common-svc",
  "pplx-space-db-test-fixtures",
  "pplx-space-sbxmgr-migrations",
- "pplx-space-sqlite-migrations",
  "pplx-space-test-env",
  "rusqlite",
  "sqlx",
@@ -5827,7 +5838,6 @@ version = "0.8.0"
 dependencies = [
  "anyhow",
  "clap",
- "pplx-space-api",
  "pplx-space-common-svc",
  "pplx-space-internal-api-server",
  "tikv-jemallocator",
@@ -6441,17 +6451,20 @@ dependencies = [
  "aws-config",
  "aws-credential-types",
  "aws-sdk-s3",
+ "aws-smithy-async",
  "aws-smithy-runtime-api",
  "aws-smithy-types",
  "axum",
  "base64 0.23.1",
  "bytes",
+ "futures-util",
  "http 1.5.0",
  "jiff",
  "md-5 0.11.0",
  "percent-encoding",
  "pplx-space-common-core",
  "pplx-space-metrics",
+ "rand 0.10.2",
  "sha2 0.11.0",
  "tempfile",
  "thiserror 2.0.20",
@@ -6715,10 +6728,7 @@ dependencies = [
 name = "pplx-space-sbxmgr-migrations"
 version = "0.8.0"
 dependencies = [
- "pplx-space-sqlite-migrations",
- "rusqlite",
  "sqlx",
- "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -6979,13 +6989,6 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tracing-subscriber",
-]
-
-[[package]]
-name = "pplx-space-sqlite-migrations"
-version = "0.8.0"
-dependencies = [
- "thiserror 2.0.20",
 ]
 
 [[package]]

@@ -3,12 +3,9 @@
 //! assembly. This is what the `space-node-api-svc` binary's `main` used to
 //! hold; the binary now only parses flags and calls [`run`].
 
-use std::future::Future as _;
 use std::io::ErrorKind;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::pin::Pin;
-use std::task::{Context, Poll};
 
 use crate::auth;
 use crate::builder::BuilderApiService;
@@ -25,9 +22,8 @@ use pplx_space_node_api_client::proto::worker_api_internal_server::WorkerApiInte
 use pplx_space_node_api_client::proto::worker_api_server::WorkerApiServer;
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
-use tokio_stream::Stream;
 use tokio_stream::wrappers::UnixListenerStream;
-use tokio_util::sync::{CancellationToken, WaitForCancellationFutureOwned};
+use tokio_util::sync::CancellationToken;
 use tonic::transport::server::TcpIncoming;
 use tonic_health::ServingStatus as ReporterServingStatus;
 use tonic_health::pb::HealthCheckRequest;
@@ -523,42 +519,6 @@ fn bind_node_api_listener_addr(addr: SocketAddr) -> Result<TcpListener, BindList
         .map_err(|source| BindListenerError::Register { addr, source })
 }
 
-/// Drops the listening socket as soon as shutdown starts while letting tonic
-/// drain connections that were already accepted.
-///
-/// Tonic must receive a pending shutdown future: closing this stream starts
-/// its graceful connection drain without letting the signal branch retain the
-/// listener.
-struct ShutdownTcpIncoming {
-    incoming: Option<TcpIncoming>,
-    shutdown: Pin<Box<WaitForCancellationFutureOwned>>,
-}
-
-impl ShutdownTcpIncoming {
-    fn new(listener: TcpListener, shutdown_token: CancellationToken) -> Self {
-        Self {
-            incoming: Some(TcpIncoming::from(listener).with_nodelay(Some(true))),
-            shutdown: Box::pin(shutdown_token.cancelled_owned()),
-        }
-    }
-}
-
-impl Stream for ShutdownTcpIncoming {
-    type Item = <TcpIncoming as Stream>::Item;
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        if self.shutdown.as_mut().poll(cx).is_ready() {
-            self.incoming.take();
-            return Poll::Ready(None);
-        }
-
-        let Some(incoming) = self.incoming.as_mut() else {
-            return Poll::Ready(None);
-        };
-        Pin::new(incoming).poll_next(cx)
-    }
-}
-
 #[cfg(target_os = "linux")]
 fn bind_node_api_std_listener(
     addr: SocketAddr,
@@ -815,9 +775,7 @@ pub async fn run(
             internal_control_token.clone(),
         )?;
         let auth_layer = auth::NodeApiAuthLayer::from_config(auth_config).await?;
-        let transport = pplx_space_common_grpc::internal_transport::ServerTransport::from_env()?;
-        let mut builder = transport
-            .server_builder()
+        let mut builder = pplx_space_common_grpc::internal_transport::server_builder()?
             .http2_keepalive_interval(Some(std::time::Duration::from_secs(10)))
             .http2_keepalive_timeout(Some(std::time::Duration::from_mins(1)))
             // Trace first (outermost) so denied requests still produce
@@ -882,8 +840,8 @@ pub async fn run(
                     .add_service(NodeInfoServer::new(node_info));
                 set_local_readiness(health_server.as_ref(), ReporterServingStatus::Serving).await;
                 let serve_result = server.serve_with_incoming_shutdown(
-                    transport.incoming(
-                        ShutdownTcpIncoming::new(listener, shutdown_token.clone()),
+                    pplx_space_common_grpc::internal_transport::Incoming::new(
+                        TcpIncoming::from(listener).with_nodelay(Some(true)),
                         shutdown_token.clone(),
                     ),
                     std::future::pending(),
@@ -935,8 +893,8 @@ pub async fn run(
                     .add_service(NodeInfoServer::new(node_info));
                 set_local_readiness(health_server.as_ref(), ReporterServingStatus::Serving).await;
                 let serve_result = server.serve_with_incoming_shutdown(
-                    transport.incoming(
-                        ShutdownTcpIncoming::new(listener, shutdown_token.clone()),
+                    pplx_space_common_grpc::internal_transport::Incoming::new(
+                        TcpIncoming::from(listener).with_nodelay(Some(true)),
                         shutdown_token.clone(),
                     ),
                     std::future::pending(),

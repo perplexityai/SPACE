@@ -328,7 +328,9 @@ impl WatchManager {
 
         let mut state = self.inner.lock().await;
         if self.shutdown.is_cancelled() {
-            return Err(Status::unavailable("file watching shut down"));
+            return Err(crate::refused(Status::unavailable(
+                "file watching shut down",
+            )));
         }
         if state.ledger_generation != generation {
             return Err(Status::aborted(
@@ -436,12 +438,14 @@ impl WatchManager {
         {
             let mut state = self.inner.lock().await;
             if self.shutdown.is_cancelled() {
-                return Err(Status::unavailable("file watching shut down"));
+                return Err(crate::refused(Status::unavailable(
+                    "file watching shut down",
+                )));
             }
             if active_consumer_count(&state) >= MAX_ACTIVE_WATCHER_CONSUMERS {
-                return Err(Status::resource_exhausted(
+                return Err(crate::refused(Status::resource_exhausted(
                     "too many active file watcher consumers",
-                ));
+                )));
             }
             let backend_key = key.clone();
             if state.roots.contains_key(&backend_key) {
@@ -467,13 +471,15 @@ impl WatchManager {
         registration: RegisteredWatch,
     ) -> Result<(WatchRootKey, u64), Status> {
         if self.shutdown.is_cancelled() {
-            return Err(Status::unavailable("file watching shut down"));
+            return Err(crate::refused(Status::unavailable(
+                "file watching shut down",
+            )));
         }
         let directory_count = registration.directory_count();
         if active_consumer_count(state) >= MAX_ACTIVE_WATCHER_CONSUMERS {
-            return Err(Status::resource_exhausted(
+            return Err(crate::refused(Status::resource_exhausted(
                 "too many active file watcher consumers",
-            ));
+            )));
         }
         let backend_key = key.clone();
         if state.roots.contains_key(&backend_key) {
@@ -481,9 +487,9 @@ impl WatchManager {
             return Ok((backend_key, consumer_id));
         }
         if directory_budget_exceeded(state, directory_count) {
-            return Err(Status::resource_exhausted(
+            return Err(crate::refused(Status::resource_exhausted(
                 "file watcher directory budget exceeded",
-            ));
+            )));
         }
 
         let shutdown = self.shutdown.child_token();

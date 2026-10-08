@@ -33,7 +33,13 @@ Ready to run code? Follow [Your first sandbox](../first-sandbox.md) for a comple
 
 Error samples are illustrative, not exhaustive. Messages can change, and the same HTTP status can have different codes or retryability. Follow the returned `retryable` flag and `Retry-After`, not the sample.
 
-Only endpoints that declare a required `Idempotency-Key` deduplicate mutations. For those endpoints, reuse the same method, path, body, and key within 24 hours. Process kill and signal do not use this mechanism: inspect ambiguous outcomes before repeating them, since a repeat can apply an action again. See [safe retries](../troubleshooting.md#retry-without-duplicating-work).
+Only endpoints that declare a required `Idempotency-Key` deduplicate mutations, and not all for the same time:
+
+- **Sandbox lifecycle operations and command creation:** the API keeps the key for 24 hours. Reuse the same method, path, body, and key within that window.
+- **File writes, batch writes, and renames:** the sandbox keeps the key in memory for 60 seconds after the change completes. A retry after that, or after the sandbox's agent restarts, can apply the change again, so an append can land twice. Retry these promptly.
+- **File `mkdir`, `remove`, and change tracking:** they require the key but do not deduplicate.
+
+Process kill and signal do not use this mechanism. Inspect an ambiguous outcome before repeating any of these, since a repeat can apply the action again. See [safe retries](../troubleshooting.md#retry-without-duplicating-work).
 
 ## Browse locally
 

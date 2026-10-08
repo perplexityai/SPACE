@@ -82,6 +82,11 @@ BUILD_DELAY_SECONDS = 15
 # ≤ 60 s, route clear and sandbox kill a few seconds each.
 SETTLE_BUDGET_SECONDS = 30.0
 TEMPLATE_DELETE_BUDGET_SECONDS = 60.0
+# The accepting builder must commit the prepared rootfs within this budget. It
+# is probed in short windows so a build that has already failed surfaces its
+# own error instead of a missing rootfs at the end of the budget.
+HANDOFF_BUDGET_SECONDS = 60.0
+HANDOFF_PROBE_WINDOW_SECONDS = 5
 
 
 def oci_recipe(image: str = OCI_IMAGE) -> TemplateRecipe:
@@ -345,7 +350,7 @@ class TemplateBuildAssertions:
         self._fixture.record("accepted_by", accepted)
         self._fixture.record("poll_peer_builder", other)
         self._fixture.record("pinned_submit_honoured", accepted == submit)
-        handoff_error = self._control.prepared_rootfs_handoff(accepted)
+        handoff_error = self._await_prepared_rootfs(accepted, work)
         self._fixture.verify(
             handoff_error is None,
             "the accepting builder did not commit a prepared rootfs for the build",
@@ -373,6 +378,28 @@ class TemplateBuildAssertions:
         self._fixture.record("build_id", self._result.build_id)
         self._fixture.record("build_log_tail", list(self._result.log_tail))
         return self._result
+
+    def _await_prepared_rootfs(self, builder: str, work: BackgroundWork) -> str | None:
+        """None once `builder` committed the build's prepared rootfs; else the probe's failure text.
+
+        A build that ended before the handoff re-raises its own failure, with the
+        SDK's message, rather than being reported as a missing rootfs.
+        """
+
+        deadline = time.monotonic() + HANDOFF_BUDGET_SECONDS
+        while True:
+            error = self._control.prepared_rootfs_handoff(
+                builder, window_seconds=HANDOFF_PROBE_WINDOW_SECONDS
+            )
+            if error is None:
+                return None
+            if not work.running:
+                # A build that succeeded without a probe seeing its rootfs
+                # still fails the handoff below.
+                work.join(timeout=1)
+                return error
+            if time.monotonic() >= deadline:
+                return error
 
     # --- artefacts on the builder --------------------------------------------
 

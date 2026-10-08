@@ -17,7 +17,7 @@ datadog = ["otel", "pplx-space-observability/datadog"]
 # Deprecated for one release; use otel and datadog.
 datadog-otel = ["otel", "datadog"]
 k8s = ["dep:k8s-openapi", "dep:kube"]
-sqlite = ["dep:pplx-space-sqlite-migrations", "dep:rusqlite", "dep:toml", "sqlx/migrate", "sqlx/runtime-tokio", "sqlx/sqlite-bundled", "sqlx/tls-rustls-aws-lc-rs"]
+sqlite = ["dep:rusqlite", "dep:toml", "sqlx/migrate", "sqlx/runtime-tokio", "sqlx/sqlite-bundled", "sqlx/tls-rustls-aws-lc-rs"]
 # Exposes shared route and authentication test helpers to other crates.
 # Unit tests get them under `cfg(test)`; external test suites opt in through
 # a dev-dependency. Mirrors `pplx-space-metrics`'s `test-capture`.
@@ -36,7 +36,7 @@ http = { workspace = true }
 http-body = { workspace = true }
 jiff = { workspace = true }
 k8s-openapi = { workspace = true, features = ["v1_32"], optional = true }
-kube = { workspace = true, default-features = false, features = ["client", "config", "rustls-tls"], optional = true }
+kube = { workspace = true, default-features = false, features = ["client", "config", "runtime", "rustls-tls"], optional = true }
 libc = { workspace = true }
 log = { workspace = true }
 nix = { workspace = true, features = ["fs", "user"] }
@@ -68,7 +68,6 @@ pplx-space-common-core = { workspace = true, features = ["serde", "sqlx"] }
 pplx-space-common-grpc = { workspace = true }
 pplx-space-metrics = { workspace = true }
 pplx-space-observability = { workspace = true }
-pplx-space-sqlite-migrations = { workspace = true, optional = true }
 
 [dev-dependencies]
 insta = { workspace = true }

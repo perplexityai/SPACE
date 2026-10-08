@@ -96,8 +96,16 @@ async fn main() -> anyhow::Result<()> {
                     })?;
                     Ok(recipe_proto::copy::Payload::BlobSha256(sha.clone()))
                 })?;
+            let system_publication_grant_id = if org_id.is_none() {
+                pplx_space_build_mgr::publish::authorize_operator_system_build(&id)
+                    .await?
+                    .map(|grant| grant.to_string())
+            } else {
+                None
+            };
             let response = client
                 .start_build(StartBuildRequest {
+                    system_publication_grant_id,
                     recipe: Some(parsed_recipe),
                     template_id: id,
                     options: Some(BuildOptions {

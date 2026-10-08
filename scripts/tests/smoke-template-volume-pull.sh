@@ -32,7 +32,10 @@
 #                                 the cluster service so template-mgr
 #                                 can resolve the bucket without
 #                                 object-store env vars on the worker.
-#   NODE_API_ENDPOINT              e.g. http://localhost:9800
+#   NODE_API_ENDPOINT              ClusterApi TCP address or https URL
+#   SPACE_INTERNAL_RPC_TLS_CA      cluster CA PEM file
+#   SPACE_CLUSTER_API_TLS_SERVER_NAME expected certificate identity (optional)
+#   SPACE_INTERNAL_RPC_INSECURE_DEV true for an explicitly plaintext local fixture
 #   SPACE_INTERNAL_TOKEN          bearer for cluster API calls
 #   AWS_ACCESS_KEY_ID             creds for both upload and pull
 #   AWS_SECRET_ACCESS_KEY
@@ -60,6 +63,9 @@ cd "$REPO_ROOT"
 : "${SPACE_INTERNAL_TOKEN:?SPACE_INTERNAL_TOKEN is required}"
 : "${AWS_ACCESS_KEY_ID:?AWS_ACCESS_KEY_ID is required}"
 : "${AWS_SECRET_ACCESS_KEY:?AWS_SECRET_ACCESS_KEY is required}"
+
+source "$REPO_ROOT/scripts/lib/space-cluster-rpc.sh"
+space_cluster_rpc_configure
 
 TEMPLATE="${TEMPLATE:-smoke-$(date +%s)}"
 ROOTFS_SIZE_MB="${ROOTFS_SIZE_MB:-16}"
@@ -148,10 +154,9 @@ trap 'cleanup_local; cleanup_s3' EXIT
 
 echo "==> registering template + release with cluster service"
 # RegisterTemplate may already exist for this name — ignore ALREADY_EXISTS.
-grpcurl -plaintext -H "authorization: Bearer $SPACE_INTERNAL_TOKEN" \
-  -d "{\"name\":\"$TEMPLATE\"}" \
-  "$NODE_API_ENDPOINT" \
-  space.node.api.v1.ClusterApi/RegisterTemplate 2>&1 | tail -n5 || true
+space_cluster_rpc space.node.api.v1.ClusterApi/RegisterTemplate \
+  -H "authorization: Bearer $SPACE_INTERNAL_TOKEN" \
+  -d "{\"name\":\"$TEMPLATE\"}" 2>&1 | tail -n5 || true
 
 # Register from the request file space-upload-template.sh generated — it
 # carries the manifest's execution metadata, which registration (not node
@@ -167,10 +172,9 @@ request = json.load(open(path))
 request["tags"] = ["latest", request["hash"]]
 json.dump(request, open(path, "w"), indent=2)
 PY
-grpcurl -plaintext -H "authorization: Bearer $SPACE_INTERNAL_TOKEN" \
-  -d @ < "$REQUEST_FILE" \
-  "$NODE_API_ENDPOINT" \
-  space.node.api.v1.ClusterApi/RegisterTemplateRelease >/dev/null
+space_cluster_rpc space.node.api.v1.ClusterApi/RegisterTemplateRelease \
+  -H "authorization: Bearer $SPACE_INTERNAL_TOKEN" \
+  -d @ < "$REQUEST_FILE" >/dev/null
 
 echo "==> driving GetTemplate via $TMPLMGR_CLI (auto-pull)"
 echo

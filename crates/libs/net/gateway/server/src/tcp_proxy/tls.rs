@@ -19,7 +19,9 @@ use super::http_host::{HostBinding, MeteredIo};
 use super::{TcpProxy, relay, tls_http};
 use crate::certificates::{CertificateError, CertificateLease};
 use crate::stats::ProxyStats;
-use crate::tls_interception::{TlsHandshakeLeg, TlsInterception, TlsInterceptionError};
+use crate::tls_interception::{
+    Admission, HandshakePermit, Refused, TlsHandshakeLeg, TlsInterception, TlsInterceptionError,
+};
 use crate::tls_sni::{ClientAlpnOffer, HttpAlpn};
 
 const HANDSHAKE_BUDGET: Duration = Duration::from_secs(10);
@@ -381,7 +383,8 @@ fn selected_alpn(alpn: Option<&[u8]>) -> Result<Option<HttpAlpn>, TlsTransportEr
 }
 
 impl TcpProxy {
-    /// Each TLS handshake has eight non-queued slots and a ten-second budget.
+    /// Each TLS handshake waits for a shared pool permit and then completes
+    /// within one ten-second budget that includes the wait.
     /// The complete HTTP/stream lifetime is fenced by the certificate lease;
     /// upstream setup happens only after a request passes authority and policy.
     pub(super) async fn terminate_tls(
@@ -398,6 +401,7 @@ impl TcpProxy {
             negotiated = tracing::field::Empty,
             protocol = tracing::field::Empty,
             policy_ref = tracing::field::Empty,
+            handshake_queue_ms = tracing::field::Empty,
             otel.status_code = "ERROR",
         );
         async {
@@ -490,16 +494,8 @@ pub(super) async fn accept<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let _permit = match interception.handshake_permit(TlsHandshakeLeg::ClientToNetgw) {
-        Ok(permit) => permit,
-        Err(_) => {
-            HandshakeAttempt::record_failure(
-                TlsHandshakeLeg::ClientToNetgw,
-                &TlsTransportError::Capacity,
-            );
-            return Err(TlsTransportError::Capacity);
-        }
-    };
+    let deadline = tokio::time::Instant::now() + HANDSHAKE_BUDGET;
+    let _permit = admit_handshake(interception, TlsHandshakeLeg::ClientToNetgw, deadline).await?;
     let mut attempt = HandshakeAttempt::new(TlsHandshakeLeg::ClientToNetgw);
     let result = async {
         let mut config = rustls::ServerConfig::builder_with_provider(Arc::new(
@@ -514,13 +510,11 @@ where
         config.send_tls13_tickets = 0;
         config.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
         config.max_early_data_size = 0;
-        let downstream = tokio::time::timeout(
-            HANDSHAKE_BUDGET,
-            TlsAcceptor::from(Arc::new(config)).accept(stream),
-        )
-        .await
-        .map_err(|_| TlsTransportError::Timeout)?
-        .map_err(TlsTransportError::Downstream)?;
+        let downstream =
+            tokio::time::timeout_at(deadline, TlsAcceptor::from(Arc::new(config)).accept(stream))
+                .await
+                .map_err(|_| TlsTransportError::Timeout)?
+                .map_err(TlsTransportError::Downstream)?;
         let actual_name = downstream
             .get_ref()
             .1
@@ -541,7 +535,8 @@ where
 }
 
 /// Verify the origin leg independently from the guest-facing interception CA.
-/// The ten-second budget includes transport setup and the complete handshake.
+/// The ten-second budget includes the permit wait, transport setup and the
+/// complete handshake.
 pub(super) async fn connect<S>(
     transport: impl std::future::Future<Output = io::Result<S>>,
     lease: &CertificateLease,
@@ -551,18 +546,10 @@ pub(super) async fn connect<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let _permit = match interception.handshake_permit(TlsHandshakeLeg::NetgwToOrigin) {
-        Ok(permit) => permit,
-        Err(_) => {
-            HandshakeAttempt::record_failure(
-                TlsHandshakeLeg::NetgwToOrigin,
-                &TlsTransportError::Capacity,
-            );
-            return Err(TlsTransportError::Capacity);
-        }
-    };
     async {
         let deadline = tokio::time::Instant::now() + HANDSHAKE_BUDGET;
+        let _permit =
+            admit_handshake(interception, TlsHandshakeLeg::NetgwToOrigin, deadline).await?;
         // TCP setup is not a TLS attempt. Start TLS telemetry only after the
         // transport connects, while retaining the original shared deadline.
         let mut tcp_attempt = Attempt::origin_tcp();
@@ -632,11 +619,45 @@ where
     .await
 }
 
+/// Admit one handshake into the shared pool. A queued admission is recorded on
+/// the current span. A pool that stays full fails as `tls_capacity`, the same
+/// outcome that an immediate refusal reported before queueing existed. A pool
+/// closed by gateway shutdown fails as `tls_withdrawn`.
+async fn admit_handshake(
+    interception: &TlsInterception,
+    leg: TlsHandshakeLeg,
+    deadline: tokio::time::Instant,
+) -> Result<HandshakePermit, TlsTransportError> {
+    match interception.admit_handshake(leg, deadline).await {
+        Ok(permit) => {
+            match permit.admission() {
+                Admission::Immediate => {}
+                Admission::Queued { waited } => {
+                    tracing::Span::current().record(
+                        "handshake_queue_ms",
+                        u64::try_from(waited.as_millis()).unwrap_or(u64::MAX),
+                    );
+                }
+            }
+            Ok(permit)
+        }
+        Err(refused) => {
+            let error = match refused {
+                Refused::Saturated { .. } => TlsTransportError::Capacity,
+                Refused::Closed => TlsTransportError::Withdrawn,
+            };
+            HandshakeAttempt::record_failure(leg, &error);
+            Err(error)
+        }
+    }
+}
+
 fn upstream_span(host: &pplx_space_net_common::DomainName, port: u16) -> tracing::Span {
     tracing::info_span!(
         "tls.client",
         otel.kind = "client",
         otel.status_code = "ERROR",
+        handshake_queue_ms = tracing::field::Empty,
         server.address_length = host.as_str().len(),
         server.port = port,
         network.transport = "tcp"

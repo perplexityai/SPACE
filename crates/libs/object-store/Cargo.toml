@@ -15,7 +15,8 @@ async-trait = { workspace = true }
 aws-config = { workspace = true, features = ["behavior-version-latest"] }
 aws-credential-types = { workspace = true, features = ["hardcoded-credentials"] }
 aws-sdk-s3 = { workspace = true, features = ["behavior-version-latest", "default-https-client", "http-1x", "rt-tokio", "sigv4a"] }
-aws-smithy-runtime-api = { workspace = true }
+aws-smithy-async = { workspace = true }
+aws-smithy-runtime-api = { workspace = true, features = ["client"] }
 aws-smithy-types = { workspace = true }
 base64 = { workspace = true }
 bytes = { workspace = true }
@@ -23,9 +24,10 @@ http = { workspace = true }
 jiff = { workspace = true }
 md-5 = { workspace = true }
 percent-encoding = { workspace = true }
+rand = { workspace = true }
 sha2 = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["fs", "io-util", "macros", "rt", "sync"] }
+tokio = { workspace = true, features = ["fs", "io-util", "macros", "rt", "sync", "time"] }
 tracing = { workspace = true }
 
 # internal
@@ -35,5 +37,6 @@ pplx-space-metrics = { workspace = true }
 
 [dev-dependencies]
 axum = { workspace = true }
+futures-util = { workspace = true }
 tempfile = { workspace = true }
-tokio = { workspace = true, features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "sync"] }
+tokio = { workspace = true, features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }

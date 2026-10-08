@@ -57,32 +57,35 @@ require_env() {
 # like the prod node-service DaemonSets. Services and the cluster API derive
 # the UUID from (name, role) via space_k8s_node_id; nothing here hand-rolls
 # a node identity.
-require_env SPACE_NODE_ID SPACE_NODE_ROLE SPACE_INTERNAL_TOKEN \
-  SPACE_INTERNAL_CONTROL_TOKEN SPACE_INTERNAL_API_ENDPOINT
-case "$SPACE_NODE_ROLE" in
-  worker|builder) ;;
-  *) die "SPACE_NODE_ROLE must be worker or builder (got: $SPACE_NODE_ROLE)" ;;
-esac
+load_node_identity() {
+  require_env SPACE_NODE_ID SPACE_NODE_ROLE SPACE_INTERNAL_TOKEN \
+    SPACE_INTERNAL_CONTROL_TOKEN SPACE_INTERNAL_API_ENDPOINT
+  case "$SPACE_NODE_ROLE" in
+    worker|builder) ;;
+    *) die "SPACE_NODE_ROLE must be worker or builder (got: $SPACE_NODE_ROLE)" ;;
+  esac
 
-# ── Legacy DirectSubstrate registration (3486 bench only) ────────────────────
-# The single-worker `space-local-3486` bench runs the api-server on
-# DirectSubstrate, which schedules off nodes/node_direct rows and has no
-# real registration RPC (production uses the Kubernetes substrate, where the
-# pod reflector + node-ctl publish cover discovery). When the chart opts in,
-# fall back to the bench-era identity (md5 uuid of the node name) and register
-# the node_direct endpoint by SQL after node-api is serving. Requires the
-# chart to render POSTGRES_CONNECTION_STRING; never enabled on the
-# production-shaped `space-local` stack.
-DIRECT_REGISTRATION="${SPACE_DIRECT_SUBSTRATE_REGISTRATION:-0}"
-if [[ "$DIRECT_REGISTRATION" == "1" ]]; then
-  [[ "$SPACE_NODE_ROLE" == "worker" ]] \
-    || die "DirectSubstrate registration is supported only for the worker role"
-  require_env POSTGRES_CONNECTION_STRING SPACE_NODE_API_ENDPOINT
-  hash=$(printf '%s' "$SPACE_NODE_ID" | md5sum | awk '{print $1}')
-  SPACE_NODE_ID="${hash:0:8}-${hash:8:4}-${hash:12:4}-${hash:16:4}-${hash:20:12}"
-  export SPACE_NODE_ID
-  log "DirectSubstrate registration enabled (bench mode); node_id=$SPACE_NODE_ID"
-fi
+  # ── Legacy DirectSubstrate registration (3486 bench only) ──────────────────
+  # The single-worker `space-local-3486` bench runs the api-server on
+  # DirectSubstrate, which schedules off nodes/node_direct rows and has no
+  # real registration RPC (production uses the Kubernetes substrate, where the
+  # pod reflector + node-ctl publish cover discovery). When the chart opts in,
+  # fall back to the bench-era identity (md5 uuid of the node name) and register
+  # the node_direct endpoint by SQL after node-api is serving. Requires the
+  # chart to render POSTGRES_CONNECTION_STRING; never enabled on the
+  # production-shaped `space-local` stack.
+  DIRECT_REGISTRATION="${SPACE_DIRECT_SUBSTRATE_REGISTRATION:-0}"
+  if [[ "$DIRECT_REGISTRATION" == "1" ]]; then
+    [[ "$SPACE_NODE_ROLE" == "worker" ]] \
+      || die "DirectSubstrate registration is supported only for the worker role"
+    require_env POSTGRES_CONNECTION_STRING SPACE_NODE_API_ENDPOINT
+    local hash
+    hash=$(printf '%s' "$SPACE_NODE_ID" | md5sum | awk '{print $1}')
+    SPACE_NODE_ID="${hash:0:8}-${hash:8:4}-${hash:12:4}-${hash:16:4}-${hash:20:12}"
+    export SPACE_NODE_ID
+    log "DirectSubstrate registration enabled (bench mode); node_id=$SPACE_NODE_ID"
+  fi
+}
 
 # ── Loop devices: give the pod the pool a production node has ────────────────
 # Two things in this pod attach loop devices: the btrfs cache image below, and
@@ -180,8 +183,9 @@ ensure_btrfs_cache() {
   # /usr/sbin is off a non-root PATH here. Against a MOUNTED loop device it does
   # not detach — it sets
   # LO_FLAGS_AUTOCLEAR, so the kernel releases the device when the filesystem is
-  # fully unmounted. Workers release it with the pod's mount namespace; builders
-  # propagate the mount to the Kind node and reuse it across pod replacements.
+  # fully unmounted. Workers release it with the pod's mount namespace; on
+  # builders the mount-cache init container mounts it in the kind node's
+  # namespace, where it stays and every later builder pod reuses it.
   # Without it every container restart leaks one device permanently (an attached
   # but unmounted loop is never reclaimed), and a handful of Tilt rollouts
   # exhausts the pool. The mount stays fully usable; verified on a devbox.
@@ -544,7 +548,7 @@ register_direct_node() {
   log "registering DirectSubstrate node $SPACE_NODE_ID (name=$node_name endpoint=$SPACE_NODE_API_ENDPOINT)"
   local attempt
   for attempt in $(seq 1 30); do
-    if psql "$POSTGRES_CONNECTION_STRING" -v ON_ERROR_STOP=1 \
+    if psql "$DIRECT_POSTGRES_CONNECTION_STRING" -v ON_ERROR_STOP=1 \
       -v node_id="$SPACE_NODE_ID" \
       -v node_name="$node_name" \
       -v node_endpoint="$SPACE_NODE_API_ENDPOINT" \
@@ -590,6 +594,31 @@ SQL
   die "DirectSubstrate node registration failed after retries (see direct-register.log)"
 }
 
+# Every service inherits this script's exported environment through setpriv.
+# Move values that belong to a single service into shell locals and hand
+# each back only to the service that reads it (credmgr, volmgr, buildmgr,
+# and the bench-only direct registration below).
+scope_service_environment() {
+  CREDMGR_DATABASE_URL="${SPACE_CREDMGR_DATABASE_URL:-}"
+  CREDMGR_DB_CREDS_PASSWORD="${SPACE_DB_CREDS_PASSWORD:-}"
+  CREDMGR_AWS_ACCESS_KEY_ID="${SPACE_CREDMGR_AWS_ACCESS_KEY_ID:-}"
+  CREDMGR_AWS_SECRET_ACCESS_KEY="${SPACE_CREDMGR_AWS_SECRET_ACCESS_KEY:-}"
+  CREDMGR_AWS_SESSION_TOKEN="${SPACE_CREDMGR_AWS_SESSION_TOKEN:-}"
+  DIRECT_POSTGRES_CONNECTION_STRING="${POSTGRES_CONNECTION_STRING:-}"
+  OBJECT_STORE_STATIC_ENV=()
+  local name
+  for name in SPACE_OBJECT_STORE_STATIC_ACCESS_KEY_ID \
+    SPACE_OBJECT_STORE_STATIC_SECRET_ACCESS_KEY SPACE_OBJECT_STORE_STATIC_SESSION_TOKEN; do
+    if [[ -n "${!name:-}" ]]; then
+      OBJECT_STORE_STATIC_ENV+=("$name=${!name}")
+    fi
+    unset "$name"
+  done
+  unset SPACE_CREDMGR_DATABASE_URL SPACE_DB_CREDS_PASSWORD \
+    SPACE_CREDMGR_AWS_ACCESS_KEY_ID SPACE_CREDMGR_AWS_SECRET_ACCESS_KEY \
+    SPACE_CREDMGR_AWS_SESSION_TOKEN POSTGRES_CONNECTION_STRING
+}
+
 start_all() {
   # Production runtime service ordering (matches the node DaemonSets):
   #   runtime-supervisor → nodemgr
@@ -612,7 +641,7 @@ start_all() {
   # volume operations live in node-manager; volume-manager runs under the
   # production service identity with cache access through space-cache-rw.
   start_service_as volmgr "$SPACE_SBXMGR_USER" "$SPACE_SBXMGR_GROUP" "$SPACE_VOLUME_MANAGER_GROUPS" \
-    space-volmgr-svc
+    env ${OBJECT_STORE_STATIC_ENV[@]+"${OBJECT_STORE_STATIC_ENV[@]}"} space-volmgr-svc
   # credmgr runs its (pre-agent-migration) authority role, which resolves org
   # KEK rows from the control-plane DB. Hand the DB URL to credmgr only; no
   # other node service sees Postgres, matching production workers. The
@@ -620,15 +649,16 @@ start_all() {
   # scoped to credmgr so its independent AWS integrations do not require
   # every node service to inherit AWS credentials.
   credmgr_env=(
-    "DATABASE_URL=${SPACE_CREDMGR_DATABASE_URL:-}"
-    "SPACE_DB_CREDS_PASSWORD=${SPACE_DB_CREDS_PASSWORD:-}"
+    "DATABASE_URL=${CREDMGR_DATABASE_URL}"
+    "SPACE_DB_CREDS_PASSWORD=${CREDMGR_DB_CREDS_PASSWORD}"
     "SPACE_CREDMGR_IN_MEMORY_KEK_ENABLED=${SPACE_CREDMGR_IN_MEMORY_KEK_ENABLED:-}"
+    "SPACE_CREDMGR_SECRETS_MANAGER_ROLE_ARN=${SPACE_CREDMGR_SECRETS_MANAGER_ROLE_ARN:-}"
   )
-  if [[ -n "${SPACE_CREDMGR_AWS_ACCESS_KEY_ID:-}" ]]; then
-    credmgr_env+=("AWS_ACCESS_KEY_ID=${SPACE_CREDMGR_AWS_ACCESS_KEY_ID}")
-    credmgr_env+=("AWS_SECRET_ACCESS_KEY=${SPACE_CREDMGR_AWS_SECRET_ACCESS_KEY:-}")
-    [[ -n "${SPACE_CREDMGR_AWS_SESSION_TOKEN:-}" ]] \
-      && credmgr_env+=("AWS_SESSION_TOKEN=${SPACE_CREDMGR_AWS_SESSION_TOKEN}")
+  if [[ -n "$CREDMGR_AWS_ACCESS_KEY_ID" ]]; then
+    credmgr_env+=("AWS_ACCESS_KEY_ID=${CREDMGR_AWS_ACCESS_KEY_ID}")
+    credmgr_env+=("AWS_SECRET_ACCESS_KEY=${CREDMGR_AWS_SECRET_ACCESS_KEY}")
+    [[ -n "$CREDMGR_AWS_SESSION_TOKEN" ]] \
+      && credmgr_env+=("AWS_SESSION_TOKEN=${CREDMGR_AWS_SESSION_TOKEN}")
   fi
   start_service_as credmgr "$SPACE_SBXMGR_USER" "$SPACE_SBXMGR_GROUP" "$SPACE_CREDENTIAL_MANAGER_GROUPS" \
     env "${credmgr_env[@]}" space-credmgr-svc
@@ -662,11 +692,11 @@ start_all() {
       SPACE_BUILD_MANAGER_DRAIN_TIMEOUT_SECONDS SPACE_BUILD_MANAGER_LISTEN
     # Scope any exporter override to build-manager; the other services in this
     # pod keep the exporter their own environment selects.
-    local buildmgr_prefix=()
+    local buildmgr_env=(${OBJECT_STORE_STATIC_ENV[@]+"${OBJECT_STORE_STATIC_ENV[@]}"})
     if [[ -n "${SPACE_BUILD_MANAGER_TRACE_EXPORTER:-}" ]]; then
-      buildmgr_prefix=(env "SPACE_TRACE_EXPORTER=$SPACE_BUILD_MANAGER_TRACE_EXPORTER")
+      buildmgr_env+=("SPACE_TRACE_EXPORTER=$SPACE_BUILD_MANAGER_TRACE_EXPORTER")
     fi
-    start_service buildmgr ${buildmgr_prefix[@]+"${buildmgr_prefix[@]}"} space-buildmgr-svc \
+    start_service buildmgr env ${buildmgr_env[@]+"${buildmgr_env[@]}"} space-buildmgr-svc \
       --max-concurrent-builds="$SPACE_BUILD_MANAGER_MAX_CONCURRENT_BUILDS" \
       --db=/space/run/build-manager/build-manager.db \
       --drain-timeout-seconds="$SPACE_BUILD_MANAGER_DRAIN_TIMEOUT_SECONDS" \
@@ -722,6 +752,19 @@ on_term() {
   done
   exit 0
 }
+
+# The builder chart's mount-cache init container runs only this step: it
+# attaches and mounts the btrfs cache in the kind node's mount namespace, the
+# way a production builder's host has /space/cache before any service starts,
+# and exits. It gets no service environment.
+if [[ "${1:-}" == "--mount-cache" ]]; then
+  space_loop_stage_pool log
+  ensure_btrfs_cache
+  exit 0
+fi
+
+load_node_identity
+scope_service_environment
 trap on_term TERM INT
 
 log "node-stack starting (node_id=$SPACE_NODE_ID role=$SPACE_NODE_ROLE cluster_api=$SPACE_INTERNAL_API_ENDPOINT)"

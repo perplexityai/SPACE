@@ -107,10 +107,8 @@ builds and guest health, were not validated by this API-only run.
   `sha256:6c6046efcc6ee907b98cf5e3fe219374e50e520405cecdbb9adc8184d804ee73`.
   Its OCI revision and binary Git SHA are `unknown`; the version label is **not**
   proof of its exact source commit. No application image was rebuilt for this run.
-- Smoke/code inspection checkout: `/home/dev/space-telemetry-kind`, clean
-  `bfa4b1b4fcfebab054fdfb1472253440e59fc14f`.
-- Dashboard checkout: `/home/dev/space-kind-oss-logs`,
-  `b35f68fdc1c1864da3e0710651502be06468df21` plus local dashboard changes.
+- Smoke/code inspection used a clean local checkout of the telemetry branch; the
+  dashboard came from a separate local checkout plus local dashboard changes.
 - Collector Contrib **0.161.0**, Prometheus **3.14.0**, Grafana **13.2.2**;
   pinned image digests remain in `values.yaml`. Only Grafana rolled for the
   dashboard update; Collector and Prometheus retained their original pods.

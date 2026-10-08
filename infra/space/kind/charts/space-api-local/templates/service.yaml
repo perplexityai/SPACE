@@ -12,6 +12,10 @@ spec:
     app.kubernetes.io/name: space-api
     app.kubernetes.io/instance: {{ .Release.Name }}
   ports:
+    - name: activation
+      port: 9801
+      targetPort: activation
+      protocol: TCP
     - name: http
       port: {{ .Values.service.port }}
       targetPort: http

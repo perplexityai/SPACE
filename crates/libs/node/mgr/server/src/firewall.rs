@@ -27,6 +27,7 @@ const INGRESS_TABLE: &str = "ingress";
 const INGRESS_DNAT_COMMENT_PREFIX: &str = "space-dnat-";
 const LEGACY_INGRESS_DNAT_COMMENT_PREFIX: &str = "dnat-";
 const PRE_TPROXY_GUARDRAILS_CHAIN: &str = "pre_tproxy_guardrails";
+const UDP443_COMMENT: &str = "platform-egress-pre-tproxy-guardrail-quic-udp443";
 const PRE_TPROXY_GUARDRAILS_PRIO: i32 = -175;
 const PRE_TPROXY_GUARDRAILS_POLICY_PATH: &str =
     "/etc/space/nftables/sandbox-pre-tproxy-guardrails.json";
@@ -561,7 +562,7 @@ fn udp443_counter(chain: Option<&serde_json::Value>) -> Option<(u64, GuestUdp443
     let rule = entries
         .iter()
         .filter_map(|entry| entry.get("rule"))
-        .find(|rule| rule["comment"] == "platform-egress-pre-tproxy-guardrail-quic-udp443")?;
+        .find(|rule| rule["comment"] == UDP443_COMMENT)?;
     let exprs = rule["expr"].as_array()?;
     let packets = exprs
         .iter()
@@ -653,8 +654,6 @@ pub fn validate_namespace_firewall_config(
                 )
             },
         )?;
-    validate_guest_source_guard_chain(&pre_tproxy_guardrails, guest_ip)?;
-
     let guest_l2_ingress = nft_chain_json(Some(ns), "netdev", SANDBOX_L2_TABLE, "ingress")?
         .ok_or_else(|| {
             FirewallValidationError::Missing(
@@ -667,47 +666,7 @@ pub fn validate_namespace_firewall_config(
     let policy = load_pre_tproxy_guardrail_rules()?;
     let packaged: Vec<serde_json::Value> =
         serde_json::from_str(&format!("[{}]", policy)).map_err(PackagedPolicyError)?;
-    validate_udp443_guardrail(&pre_tproxy_guardrails, &packaged)
-}
-
-const UDP443_COMMENT: &str = "platform-egress-pre-tproxy-guardrail-quic-udp443";
-
-fn validate_udp443_guardrail(
-    pre_tproxy_guardrails: &serde_json::Value,
-    packaged: &[serde_json::Value],
-) -> Result<(), FirewallValidationError> {
-    let expected = packaged
-        .iter()
-        .filter_map(|entry| entry.pointer("/add/rule"))
-        .find(|rule| rule["comment"] == UDP443_COMMENT);
-    let mut actual = pre_tproxy_guardrails
-        .get("nftables")
-        .and_then(serde_json::Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|entry| entry.get("rule"))
-        .filter(|rule| rule["comment"] == UDP443_COMMENT);
-    let actual = actual.next().filter(|_| actual.next().is_none());
-    let expressions = |rule: &serde_json::Value| {
-        rule["expr"].as_array().map(|expr| {
-            expr.iter()
-                .map(|expr| {
-                    if expr.get("counter").is_some() {
-                        serde_json::json!({"counter": null})
-                    } else {
-                        normalize_set_membership_op(expr)
-                    }
-                })
-                .collect::<Vec<_>>()
-        })
-    };
-    let expected = expected.and_then(expressions);
-    if expected.is_none() || expected != actual.and_then(expressions) {
-        return Err(FirewallValidationError::Missing(
-            "namespace UDP/443 guardrail differs from packaged policy".into(),
-        ));
-    }
-    Ok(())
+    validate_pre_tproxy_guardrails_chain(&pre_tproxy_guardrails, guest_ip, &packaged)
 }
 
 fn validate_guest_l2_ingress_chain(
@@ -908,9 +867,10 @@ fn validate_forward_drop_chain(
     Ok(())
 }
 
-fn validate_guest_source_guard_chain(
+fn validate_pre_tproxy_guardrails_chain(
     pre_tproxy_guardrails: &serde_json::Value,
     guest_ip: &str,
+    packaged: &[serde_json::Value],
 ) -> Result<(), FirewallValidationError> {
     let source_guard = [
         serde_json::json!({
@@ -967,6 +927,43 @@ fn validate_guest_source_guard_chain(
     if source_guard_position >= established_bypass_position {
         return Err(FirewallValidationError::Missing(
             "namespace tap0 guest source guard must precede established/related return".to_string(),
+        ));
+    }
+    let expected = packaged
+        .iter()
+        .filter_map(|entry| entry.pointer("/add/rule"))
+        .find(|rule| rule["comment"] == UDP443_COMMENT);
+    let mut actual = pre_tproxy_guardrails
+        .get("nftables")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.get("rule"))
+        .enumerate()
+        .filter(|(_, rule)| rule["comment"] == UDP443_COMMENT);
+    let actual = actual.next().filter(|_| actual.next().is_none());
+    if actual.is_some_and(|(position, _)| position <= source_guard_position) {
+        return Err(FirewallValidationError::Missing(
+            "namespace tap0 guest source guard must precede UDP/443 guardrail".into(),
+        ));
+    }
+    let expressions = |rule: &serde_json::Value| {
+        rule["expr"].as_array().map(|expr| {
+            expr.iter()
+                .map(|expr| {
+                    if expr.get("counter").is_some() {
+                        serde_json::json!({"counter": null})
+                    } else {
+                        normalize_set_membership_op(expr)
+                    }
+                })
+                .collect::<Vec<_>>()
+        })
+    };
+    let expected = expected.and_then(expressions);
+    if expected.is_none() || expected != actual.and_then(|(_, rule)| expressions(rule)) {
+        return Err(FirewallValidationError::Missing(
+            "namespace UDP/443 guardrail differs from packaged policy".into(),
         ));
     }
     Ok(())

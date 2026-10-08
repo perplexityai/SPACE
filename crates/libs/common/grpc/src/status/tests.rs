@@ -142,3 +142,61 @@ fn process_errors_require_guest_provenance_and_distinguish_storage_from_admissio
         full
     )));
 }
+
+#[test]
+fn refused_before_start_round_trips_with_its_retry_hint() {
+    let status = refused_before_start(
+        Status::resource_exhausted("too many concurrent filesystem file operations"),
+        Duration::from_millis(1500),
+    );
+    assert!(is_refused_before_start(&status));
+    assert_eq!(retry_after(&status), Some(Duration::from_millis(1500)));
+    assert_eq!(status.code(), Code::ResourceExhausted);
+    assert_eq!(
+        status.message(),
+        "too many concurrent filesystem file operations"
+    );
+    // The guest's storage-full reason shares the key but is not a refusal.
+    let mut full = Status::resource_exhausted("guest filesystem full");
+    full.metadata_mut().insert(
+        pplx_space_common_core::spaced::ERROR_REASON_METADATA_KEY,
+        pplx_space_common_core::spaced::GUEST_STORAGE_FULL
+            .parse()
+            .unwrap(),
+    );
+    assert!(!is_refused_before_start(&full));
+    assert!(!is_refused_before_start(&Status::resource_exhausted(
+        "unmarked"
+    )));
+}
+
+#[test]
+fn uds_per_sandbox_limit_is_a_refusal_before_start() {
+    let status = uds_per_sandbox_limit_exceeded_status("per-sandbox limit");
+    assert!(is_refused_before_start(&status));
+    assert!(retry_after(&status).is_some());
+    assert_eq!(
+        UdsPerSandboxLimitExceeded::from_status(&status),
+        Some(UdsPerSandboxLimitExceeded)
+    );
+}
+
+// A refusal arrived over a working transport: neither a TCP failure to
+// retry nor a reason to redial.
+#[test]
+fn refusals_are_not_transport_failures() {
+    for code in [Code::Unavailable, Code::Unknown, Code::ResourceExhausted] {
+        let refused = refused_before_start(
+            Status::new(code, "guest shutting down"),
+            Duration::from_secs(1),
+        );
+        assert!(!crate::is_temporary_tcp_failure(&refused));
+        assert!(!crate::should_reconnect_status(&refused));
+    }
+    assert!(crate::is_temporary_tcp_failure(&Status::unavailable(
+        "transport closed"
+    )));
+    assert!(crate::should_reconnect_status(&Status::unavailable(
+        "transport closed"
+    )));
+}

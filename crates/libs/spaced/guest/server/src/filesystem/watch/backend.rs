@@ -64,7 +64,11 @@ fn directory_admission(count: usize) -> Result<tokio::sync::OwnedSemaphorePermit
     WATCH_DIRECTORY_SLOTS
         .clone()
         .try_acquire_many_owned(count as u32)
-        .map_err(|_| Status::resource_exhausted("watch directory registration capacity exhausted"))
+        .map_err(|_| {
+            crate::refused(Status::resource_exhausted(
+                "watch directory registration capacity exhausted",
+            ))
+        })
 }
 
 struct BlockingWatcher {
@@ -155,7 +159,9 @@ impl RegisteredWatch {
             .clone()
             .try_acquire_owned()
             .map_err(|_| {
-                Status::resource_exhausted("too many registering or retiring watch backends")
+                crate::refused(Status::resource_exhausted(
+                    "too many registering or retiring watch backends",
+                ))
             })?;
         let directory_slot = directory_admission(directories.len())?;
         let runtime = tokio::runtime::Handle::current();

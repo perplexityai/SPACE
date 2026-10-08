@@ -1246,6 +1246,21 @@ fn org_kek_access_revoked_status() -> Status {
     )
 }
 
+/// `PERMISSION_DENIED` carrying the machine-readable already-published reason,
+/// so a builder whose publication check raced another publisher, or could not
+/// see the release, converges on tags-only registration instead of failing.
+/// Decode with [`pplx_space_credmgr_client::status_is_release_already_published`].
+fn release_already_published_status(message: String) -> Status {
+    let mut metadata = tonic::metadata::MetadataMap::new();
+    metadata.insert(
+        pplx_space_credmgr_client::CREDMGR_ERROR_REASON_METADATA_KEY,
+        pplx_space_credmgr_client::CREDMGR_ERROR_REASON_RELEASE_ALREADY_PUBLISHED
+            .parse()
+            .expect("static ASCII metadata value"),
+    );
+    Status::with_metadata(tonic::Code::PermissionDenied, message, metadata)
+}
+
 fn invalid_key_reference_status(message: String) -> Status {
     let mut metadata = tonic::metadata::MetadataMap::new();
     metadata.insert(
@@ -1451,6 +1466,9 @@ fn storage_exchange_error_to_status(error: StorageExchangeError) -> Status {
         | StorageExchangeError::UnauthorizedResource
         | StorageExchangeError::UnknownSubject
         | StorageExchangeError::WrongNode => Status::permission_denied(error.to_string()),
+        StorageExchangeError::ReleaseAlreadyPublished => {
+            release_already_published_status(error.to_string())
+        }
         StorageExchangeError::MissingVendRole
         | StorageExchangeError::InvalidVendRole
         | StorageExchangeError::InvalidStorageConfiguration

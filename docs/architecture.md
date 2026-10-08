@@ -118,8 +118,15 @@ to SPACE suspend, and its resume maps to SPACE restore.
 Service-port ingress has a separate connection lifetime. With ingress protection
 enabled and completion framing negotiated, automatic lifecycle transitions defer until the HTTP response body or
 WebSocket connection completes; explicit lifecycle operations retain their
-existing authority. Optional ingress wake authorizes access and respects the
-sandbox's access-wake policy before preparing a dormant backend. Transport idle
+existing authority. Ingress wake authorizes access and respects the
+sandbox's access-wake policy before preparing a dormant backend. Route resolution
+first prepares the current worker path. If activation or recovery is needed,
+the cluster API delegates through the authenticated `IngressActivationApi` to
+the API process's existing lifecycle controller. It re-resolves and reauthorizes
+after activation, within the original request deadline. The cluster API does
+not construct a Kubernetes substrate or retain the sandbox-pod reflector cache.
+Accepted activation remains owned by the API's tracked lifecycle tasks and
+existing execution leases; a caller timeout only ends its wait. Transport idle
 limits still apply, and SPACE does not generate WebSocket keepalives.
 During coordinated deployment, a temporary metadata opt-in falls back to ordinary
 stream termination for older callers or gateways. Drain existing attachments
@@ -136,11 +143,10 @@ current execution generation from the worker before applying a fenced mutation.
 This lookup remains necessary after rollout; missing API identity is not proof
 of a dormant execution. Ingress protection does not cover unrelated background
 operations.
-Accepted ingress activation survives request cancellation. Shutdown draining is
-best-effort within the deployment termination budget: the application allows up
-to 150 seconds after server shutdown, while the local internal-API chart allows
-10 seconds total. Existing activation leases provide recovery if the process
-exits before completion.
+Accepted ingress activation survives request cancellation. The API's HTTP and
+activation listeners share its shutdown signal and drain budget. Draining is
+best-effort within the deployment termination grace; existing activation leases
+provide recovery if the process exits before completion.
 
 ### Lifecycle policy at activation
 

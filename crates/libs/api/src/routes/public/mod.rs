@@ -28,6 +28,7 @@ pub(crate) mod sandboxes;
 pub(crate) mod sessions;
 mod snapshots;
 mod templates;
+mod timeout;
 
 fn method_filter(method: NativeHttpMethod) -> MethodFilter {
     match method {
@@ -113,6 +114,10 @@ fn mounted_operations() -> Vec<(NativeOperation, MethodRouter<AppState>)> {
             sandboxes::apply_custom_sandbox_action,
         ),
         mount(native::WAKE_SANDBOX, sandboxes::apply_custom_sandbox_action),
+        mount(
+            native::SET_SANDBOX_TIMEOUT,
+            sandboxes::apply_custom_sandbox_action,
+        ),
         mount(native::KILL_SANDBOX, sandboxes::apply_custom_sandbox_action),
         mount(
             native::CHECKPOINT_SANDBOX,

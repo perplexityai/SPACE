@@ -32,13 +32,43 @@ pub(super) struct TemplatePolicyRow {
     pub(super) network_policy_generation: i64,
 }
 
-#[derive(Debug, Clone, FromRow)]
+#[derive(Debug, Clone)]
 pub(super) struct SandboxPolicyRow {
     pub(super) sandbox_id: SandboxId,
     pub(super) template_id: Option<String>,
     pub(super) network_policy_json: Option<Json<pplx_space_net_common::NetworkPolicy>>,
     pub(super) network_policy_generation: i64,
     pub(super) template_network_policy_json: Option<Json<NetworkPolicyV1>>,
+}
+
+/// The store returns the two policy documents untyped; decoding them here
+/// keeps the policy schema with its owner. A stored document that no longer
+/// parses is an internal error, as a failed column decode was before.
+impl TryFrom<pplx_space_sandbox_store::SandboxNetworkPolicyInputs> for SandboxPolicyRow {
+    type Error = Status;
+
+    fn try_from(row: pplx_space_sandbox_store::SandboxNetworkPolicyInputs) -> Result<Self, Status> {
+        let invalid = |column: &str, error: serde_json::Error| {
+            Status::internal(format!("stored {column} is invalid: {error}"))
+        };
+        Ok(Self {
+            sandbox_id: row.sandbox_id,
+            template_id: row.template_id,
+            network_policy_json: row
+                .network_policy_json
+                .map(serde_json::from_value)
+                .transpose()
+                .map_err(|error| invalid("sandbox network policy override", error))?
+                .map(Json),
+            network_policy_generation: row.network_policy_generation,
+            template_network_policy_json: row
+                .template_network_policy_json
+                .map(serde_json::from_value)
+                .transpose()
+                .map_err(|error| invalid("template network policy", error))?
+                .map(Json),
+        })
+    }
 }
 
 /// The generation the node fences a sandbox's effective policy on.
@@ -1392,19 +1422,36 @@ pub(super) async fn ensure_template_release(
     Ok(existing)
 }
 
+/// Find the release for `(template_name, hash)` under either spelling of the
+/// hash. `hash` arrives canonical (`sha256:<hex>`); releases registered before
+/// the prefix was required are stored bare, and a republication of one of
+/// those must attach its tags to that row rather than create a second,
+/// artifact-less release beside it.
+///
+/// Where both spellings already exist, the row that owns a recorded storage
+/// location wins regardless of age: tags attached to an artifact-less
+/// duplicate would resolve to a release nothing can pull. Age breaks ties.
 async fn find_template_release_row(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     template_name: &str,
     hash: &str,
 ) -> Result<Option<TemplateReleaseRow>, Status> {
+    let bare_hash = hash.strip_prefix("sha256:").unwrap_or(hash);
     sqlx::query_as::<_, TemplateReleaseRow>(sql!(
-        "SELECT id, template_name, type, hash, org_id, created_at
-         FROM template_releases
-         WHERE template_name = $1
-           AND hash = $2"
+        "SELECT r.id, r.template_name, r.type, r.hash, r.org_id, r.created_at
+         FROM template_releases r
+         WHERE r.template_name = $1
+           AND r.hash IN ($2, $3)
+         ORDER BY EXISTS (
+                      SELECT 1
+                      FROM template_release_storage_locations l
+                      WHERE l.template_release_id = r.id) DESC,
+                  r.created_at ASC
+         LIMIT 1"
     ))
     .bind(template_name)
     .bind(hash)
+    .bind(bare_hash)
     .fetch_optional(&mut **tx)
     .await
     .map_err(|err| Status::internal(format!("query template_release: {err}")))

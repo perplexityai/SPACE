@@ -23,7 +23,6 @@ default = []
 k8s = [
     "pplx-space-common-svc/k8s",
     "pplx-space-internal-api-server/kubernetes",
-    "pplx-space-api/kubernetes",
 ]
 otel = [
     "pplx-space-common-svc/otel",
@@ -43,7 +42,6 @@ clap = { workspace = true, features = ["derive"] }
 
 # internal
 pplx-space-internal-api-server = { workspace = true }
-pplx-space-api = { workspace = true }
 pplx-space-common-svc = { workspace = true }
 
 # jemalloc on glibc Linux targets: node inventories publish multi-megabyte

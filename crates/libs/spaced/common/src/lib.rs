@@ -104,9 +104,9 @@ pub use retry_policy::{
 };
 pub use server::{BindUdsError, bind_uds, bind_uds_with_mode};
 pub use uds::{
-    ExpectedUdsPeer, UdsConnectError, connect_uds_channel, connect_uds_channel_with_expected_peer,
-    connect_uds_channel_with_expected_peer_and_retry, connect_uds_channel_with_retry,
-    default_bridge_guest_uds_path, default_bridge_host_uds_path,
+    ExpectedUdsPeer, PinnedConnection, UdsConnectError, connect_uds_channel,
+    connect_uds_channel_with_expected_peer, connect_uds_channel_with_expected_peer_and_retry,
+    connect_uds_channel_with_retry, default_bridge_guest_uds_path, default_bridge_host_uds_path,
 };
 pub use validate::{
     validate_duration, validate_optional_duration, validate_optional_reason,
@@ -179,11 +179,23 @@ macro_rules! spaced_client_config {
     };
 }
 
+/// Whether a hop should retry `status` itself: a transport-shaped failure,
+/// unless the server refused the request before starting it. Such a refusal
+/// (an admission limit, a guest shutting down) goes back to the caller, who
+/// decides whether and when to retry.
 pub fn status_is_retryable(status: &tonic::Status) -> bool {
     matches!(
         status.code(),
         tonic::Code::Unavailable | tonic::Code::Unknown | tonic::Code::DeadlineExceeded
-    )
+    ) && !status_is_refused_before_start(status)
+}
+
+fn status_is_refused_before_start(status: &tonic::Status) -> bool {
+    status
+        .metadata()
+        .get(pplx_space_common_core::spaced::ERROR_REASON_METADATA_KEY)
+        .and_then(|value| value.to_str().ok())
+        == Some(pplx_space_common_core::spaced::REQUEST_REFUSED)
 }
 
 pub fn spaced_version() -> &'static str {

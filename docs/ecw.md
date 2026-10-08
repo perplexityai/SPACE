@@ -150,6 +150,13 @@ The following compatibility limits are important:
   are not supported.
 - `code-interpreter-v1` is translated to SPACE's `code-runtime` template. That
   template must exist if callers rely on the alias.
+- Sandbox delete records a durable delete operation and waits briefly for it.
+  It returns `204` when the delete has finished and `202` when the delete is
+  queued but has not finished, for example while the sandbox's node is draining
+  or restarting. Both are SDK success responses; repeated deletes join the same
+  queued operation, so a `202` needs no retry. The sandbox can remain visible
+  until the queued delete finishes. If the delete cannot be recorded, the
+  response is a retryable `503` with `Retry-After`.
 
 ECW routes are not included in the SPACE OpenAPI document. Treat the pinned SDK
 tests and the behavior documented here as the compatibility baseline. When

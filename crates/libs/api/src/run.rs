@@ -117,6 +117,8 @@ pub enum RunApiError {
     CredentialsPool(#[source] pplx_space_common_svc::sql::DatabaseConnectOptionsError),
     #[error(transparent)]
     AppState(#[from] crate::routes::AppStateError),
+    #[error("ingress activation service: {0}")]
+    Activation(#[from] tonic::Status),
     #[error("the API server exited with an error: {0}")]
     Serve(#[source] std::io::Error),
 }
@@ -197,6 +199,10 @@ pub async fn run(config: ApiRunConfig, shutdown: CancellationToken) -> Result<()
     )
     .await?;
 
+    let activation_server =
+        crate::ingress_activation::server(&state, task_tracker.clone(), shutdown_token.clone())
+            .await?;
+
     let app = match config.surface {
         ApiSurface::Public => crate::routes::router(state),
         ApiSurface::Shared => crate::routes::shared_host_router(state),
@@ -228,10 +234,23 @@ pub async fn run(config: ApiRunConfig, shutdown: CancellationToken) -> Result<()
     let tracked_server = {
         let shutdown_token = shutdown_token.clone();
         async move {
-            let result = server.await;
-            if shutdown_token.is_cancelled() {
-                task_tracker.wait().await;
-            }
+            let http = async { server.await.map_err(RunApiError::Serve) };
+            let activation = async { activation_server.await.map_err(RunApiError::Activation) };
+            tokio::pin!(http, activation);
+            let result = tokio::select! {
+                result = &mut http => {
+                    shutdown_token.cancel();
+                    let other = activation.await;
+                    result.and(other)
+                }
+                result = &mut activation => {
+                    shutdown_token.cancel();
+                    let other = http.await;
+                    result.and(other)
+                }
+            };
+            task_tracker.close();
+            task_tracker.wait().await;
             result
         }
     };
@@ -247,7 +266,7 @@ pub async fn run(config: ApiRunConfig, shutdown: CancellationToken) -> Result<()
     // server returned on its own or the drain budget ran out.
     shutdown_token.cancel();
     if let Some(result) = drain_outcome {
-        result.map_err(RunApiError::Serve)?;
+        result?;
     }
 
     Ok(())

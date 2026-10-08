@@ -99,8 +99,15 @@ where
 }
 
 fn capacity_exhausted() -> http::Response<Body> {
-    Status::resource_exhausted("payload request capacity exhausted").into_http()
+    crate::refused_before_start(
+        Status::resource_exhausted("payload request capacity exhausted"),
+        CAPACITY_RETRY_AFTER,
+    )
+    .into_http()
 }
+
+// Payload slots free as in-flight transfers finish; a second is a fair wait.
+const CAPACITY_RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(1);
 
 #[cfg(test)]
 mod tests;

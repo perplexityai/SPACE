@@ -1,0 +1,12 @@
+syntax = "proto3";
+package space.node.api.v1;
+
+// Served by the lifecycle API using its existing controller. Only trusted
+// route resolvers may call this service, after authorizing client access.
+service IngressActivationApi {
+  rpc PrepareIngress(PrepareIngressRequest) returns (PrepareIngressResponse);
+}
+message PrepareIngressRequest {
+  string sandbox_id = 1;
+}
+message PrepareIngressResponse {}

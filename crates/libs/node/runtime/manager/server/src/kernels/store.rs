@@ -182,7 +182,6 @@ pub(crate) async fn open(state_dir: &Path) -> Result<Connection, StoreError> {
             service: &MIGRATOR,
             common: Some(&COMMON_SCHEMA_MIGRATOR),
         },
-        None,
     )
     .await
     .map_err(StoreError::Migrate)?;

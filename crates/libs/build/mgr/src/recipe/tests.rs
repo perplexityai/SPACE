@@ -326,6 +326,74 @@ fn pinned_scratch_guest_kernel_fails_closed_through_legacy_proxy() {
     assert!(matches!(error, RecipeProtoError::MissingOriginKind));
 }
 
+/// Scratch source selectors reach a URL and a privileged build container, so
+/// the shared conversion accepts only Ubuntu Minimal Cloud release names.
+#[rstest]
+#[case::current_seed("resolute", "26.04", "release-20260908", None)]
+#[case::moving_release("resolute", "26.04", "release", None)]
+#[case::older_lts_point_release("noble", "24.04.1", "release-20240423.1", None)]
+#[case::empty_release("", "26.04", "release", Some("release"))]
+#[case::uppercase_release("Resolute", "26.04", "release", Some("release"))]
+#[case::release_path("resolute/../x", "26.04", "release", Some("release"))]
+#[case::release_quote("resolute\"; id; echo \"", "26.04", "release", Some("release"))]
+#[case::release_newline("resolute\nid", "26.04", "release", Some("release"))]
+#[case::version_substitution("resolute", "$(id)", "release", Some("version"))]
+#[case::version_trailing_space("resolute", "26.04 ", "release", Some("version"))]
+#[case::version_one_part("resolute", "26", "release", Some("version"))]
+#[case::version_four_parts("resolute", "26.04.1.2", "release", Some("version"))]
+#[case::date_backticks("resolute", "26.04", "`id`", Some("date"))]
+#[case::date_short("resolute", "26.04", "release-2026090", Some("date"))]
+#[case::date_traversal("resolute", "26.04", "release/../../x", Some("date"))]
+#[case::date_empty_serial("resolute", "26.04", "release-20260908.", Some("date"))]
+#[case::date_unprefixed("resolute", "26.04", "20260908", Some("date"))]
+fn scratch_source_selectors_are_validated(
+    #[case] release: &str,
+    #[case] version: &str,
+    #[case] date: &str,
+    #[case] invalid_field: Option<&str>,
+) {
+    let mut recipe = scratch_proto_with_kernel(KERNEL_VERSION, KERNEL_DIGEST);
+    let Some(recipe::origin::Kind::PinnedFromScratch(recipe::origin::PinnedFromScratch {
+        source:
+            Some(recipe::Source {
+                kind: Some(recipe::source::Kind::UbuntuMinimalCloudSquashfs(source)),
+            }),
+        ..
+    })) = recipe
+        .origin
+        .as_mut()
+        .and_then(|origin| origin.kind.as_mut())
+    else {
+        panic!("pinned scratch source should be set");
+    };
+    *source = recipe::source::UbuntuMinimalCloudSquashfs {
+        release: release.to_string(),
+        version: version.to_string(),
+        date: date.to_string(),
+    };
+
+    let result = Recipe::try_from(recipe);
+
+    match invalid_field {
+        None => {
+            let recipe = result.expect("supported scratch source should convert");
+            assert!(matches!(
+                recipe.origin,
+                Origin::FromScratch { source, .. }
+                    if source.release == release && source.version == version && source.date == date
+            ));
+        }
+        Some(field) => {
+            let error = result.expect_err("malformed scratch source should be rejected");
+            assert!(
+                matches!(&error, RecipeProtoError::InvalidScratchSource { field: actual, .. }
+                    if actual.as_str() == field),
+                "unexpected error for {field}: {error:?}"
+            );
+        }
+    }
+}
+
 fn scratch_proto_with_kernel(version: &str, digest: &str) -> ProtoRecipe {
     ProtoRecipe {
         metadata: Some(recipe::Metadata { description: None }),

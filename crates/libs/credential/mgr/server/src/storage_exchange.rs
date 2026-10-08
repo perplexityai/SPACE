@@ -240,30 +240,7 @@ pub(crate) struct VendRoleArn(String);
 impl VendRoleArn {
     pub(crate) fn parse(raw: impl Into<String>) -> Result<Self, StorageExchangeError> {
         let raw = raw.into();
-        let mut parts = raw.splitn(6, ':');
-        let valid = parts.next() == Some("arn")
-            && parts
-                .next()
-                .is_some_and(|partition| matches!(partition, "aws" | "aws-us-gov" | "aws-cn"))
-            && parts.next() == Some("iam")
-            && parts.next() == Some("")
-            && parts.next().is_some_and(|account| {
-                account.len() == 12 && account.bytes().all(|byte| byte.is_ascii_digit())
-            })
-            && parts.next().is_some_and(|resource| {
-                resource.strip_prefix("role/").is_some_and(|role| {
-                    !role.is_empty()
-                        && role.len() <= 512
-                        && role.bytes().all(|byte| {
-                            byte.is_ascii_alphanumeric()
-                                || matches!(
-                                    byte,
-                                    b'+' | b'=' | b',' | b'.' | b'@' | b'_' | b'-' | b'/'
-                                )
-                        })
-                })
-            });
-        if valid {
+        if crate::iam_role_arn::is_iam_role_arn(&raw) {
             Ok(Self(raw))
         } else {
             Err(StorageExchangeError::InvalidVendRole)
@@ -340,19 +317,17 @@ pub(crate) async fn authorize_exchange(
 ) -> Result<AuthorizedExchange, StorageExchangeError> {
     let parsed = parse_request(caller, request)?;
     authorize_actor(&parsed)?;
-    let snapshot_resource = validate_subject_resource(&parsed.subject, &parsed.resource)?;
+    let subject_resource = validate_subject_resource(&parsed.subject, &parsed.resource)?;
 
     let mut organization_id = None;
     let mut role_override = None;
     match &parsed.subject {
         StorageSubject::Resource(SubjectId::Sandbox(sandbox_id)) => {
+            let SubjectResource::Snapshot(snapshot) = subject_resource else {
+                unreachable!("sandbox validation returns a snapshot identity")
+            };
             let context = store
-                .sandbox_context(
-                    *sandbox_id,
-                    snapshot_resource
-                        .expect("sandbox validation returns a snapshot identity")
-                        .snapshot_id,
-                )
+                .sandbox_context(*sandbox_id, snapshot.snapshot_id)
                 .await?
                 .ok_or(StorageExchangeError::UnknownSubject)?;
             if let ResolvedCaller::K8sJwt(identity) = caller {
@@ -405,6 +380,19 @@ pub(crate) async fn authorize_exchange(
                 .template_owner(template)
                 .await?
                 .ok_or(StorageExchangeError::UnknownSubject)?;
+            let SubjectResource::TemplateRelease(hash) = subject_resource else {
+                unreachable!("template validation returns the release hash")
+            };
+            // A registered release is immutable. The builder vends write
+            // credentials before RegisterTemplateRelease, so first publication
+            // and upload retries pass, while a rewrite of any already-published
+            // release prefix (including the platform's system templates) is
+            // refused no matter which template the caller names.
+            if parsed.actions.includes_write()
+                && store.template_release_published(template, &hash).await?
+            {
+                return Err(StorageExchangeError::ReleaseAlreadyPublished);
+            }
         }
         StorageSubject::BuildInput(_) => {}
     }
@@ -539,18 +527,27 @@ fn authorize_actor(parsed: &ParsedExchange) -> Result<(), StorageExchangeError> 
 fn validate_subject_resource(
     subject: &StorageSubject,
     resource: &S3Resource,
-) -> Result<Option<SnapshotResource>, StorageExchangeError> {
+) -> Result<SubjectResource, StorageExchangeError> {
     match subject {
         StorageSubject::Resource(SubjectId::Sandbox(sandbox_id)) => {
-            validate_snapshot_resource(*sandbox_id, resource).map(Some)
+            validate_snapshot_resource(*sandbox_id, resource).map(SubjectResource::Snapshot)
         }
         StorageSubject::Resource(SubjectId::Template(template)) => {
-            validate_template_resource(template, resource).map(|()| None)
+            validate_template_resource(template, resource).map(SubjectResource::TemplateRelease)
         }
         StorageSubject::BuildInput(digest) => {
-            validate_build_input_resource(digest, resource).map(|()| None)
+            validate_build_input_resource(digest, resource).map(|()| SubjectResource::BuildInput)
         }
     }
+}
+
+/// What the validated resource key identifies within the subject.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SubjectResource {
+    Snapshot(SnapshotResource),
+    /// The release hash segment of `templates/<name>/<hash>[/<file>]`.
+    TemplateRelease(ContentHash),
+    BuildInput,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -641,7 +638,7 @@ fn valid_snapshot_artifact(value: &str) -> bool {
 fn validate_template_resource(
     template: &TemplateName,
     resource: &S3Resource,
-) -> Result<(), StorageExchangeError> {
+) -> Result<ContentHash, StorageExchangeError> {
     let segments: Vec<_> = resource.key.split('/').collect();
     let marker = segments
         .iter()
@@ -650,22 +647,20 @@ fn validate_template_resource(
     let Some(tail) = segments.get(marker + 1..) else {
         return Err(StorageExchangeError::UnauthorizedResource);
     };
-    let valid = match (resource.prefix, tail) {
-        (true, [name, hash]) => *name == template.as_str() && hash.parse::<ContentHash>().is_ok(),
-        (false, [name, hash, file]) => {
-            *name == template.as_str()
-                && hash.parse::<ContentHash>().is_ok()
+    let hash = match (resource.prefix, tail) {
+        (true, [name, hash]) if *name == template.as_str() => hash.parse::<ContentHash>().ok(),
+        (false, [name, hash, file])
+            if *name == template.as_str()
                 && (*file == "rootfs.ext4"
                     || TemplateArtifact::PUBLISHED
                         .into_iter()
-                        .any(|artifact| artifact.file_name() == *file))
+                        .any(|artifact| artifact.file_name() == *file)) =>
+        {
+            hash.parse::<ContentHash>().ok()
         }
-        _ => false,
+        _ => None,
     };
-    if !valid {
-        return Err(StorageExchangeError::UnauthorizedResource);
-    }
-    Ok(())
+    hash.ok_or(StorageExchangeError::UnauthorizedResource)
 }
 
 fn validate_build_input_resource(
@@ -706,6 +701,8 @@ pub(crate) enum StorageExchangeError {
     UnknownSubject,
     #[error("sandbox is not assigned to the authenticated node incarnation")]
     WrongNode,
+    #[error("template release is already published and cannot be rewritten")]
+    ReleaseAlreadyPublished,
     #[error("storage credential vending is not configured")]
     MissingVendRole,
     #[error("configured storage vend role ARN is invalid")]
@@ -730,6 +727,7 @@ impl StorageExchangeError {
             Self::UnauthorizedResource => "unauthorized_resource",
             Self::UnknownSubject => "unknown_subject",
             Self::WrongNode => "wrong_node",
+            Self::ReleaseAlreadyPublished => "release_already_published",
             Self::MissingVendRole => "missing_vend_role",
             Self::InvalidVendRole => "invalid_vend_role",
             Self::InvalidStorageConfiguration => "invalid_storage_configuration",

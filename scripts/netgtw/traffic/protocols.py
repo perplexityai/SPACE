@@ -768,19 +768,19 @@ def grpc_probe(spec):
         }
 
 
-async def quic_server(address, certificate, key, record):
+async def quic_server(address, certificate, key, record, port=443):
     class ReceiptServer(QuicServer):
         def datagram_received(self, data, remote):
             # Log before parsing: even a leaked Initial which never establishes
             # TLS must fail a deny probe. Decrypted stream bytes are logged below.
-            record("datagram", address, 443, bytes=len(data))
+            record("datagram", address, port, bytes=len(data))
             # Preserve the existing raw UDP/443 probes on this same endpoint.
             # QUIC Initial packets have a binary long header, never this prefix.
             if data.startswith((b"traffic-", b"health-")):
                 record(
                     "data",
                     address,
-                    443,
+                    port,
                     data=data.decode("ascii", errors="replace"),
                     connection=f"{remote[0]}:{remote[1]}",
                 )
@@ -796,7 +796,7 @@ async def quic_server(address, certificate, key, record):
                 record(
                     "data",
                     address,
-                    443,
+                    port,
                     data=event.data.decode("ascii", errors="replace"),
                     connection=f"{id(self)}:{event.stream_id}",
                 )
@@ -810,7 +810,7 @@ async def quic_server(address, certificate, key, record):
     configuration.load_cert_chain(certificate, key)
     transport, _ = await asyncio.get_running_loop().create_datagram_endpoint(
         lambda: ReceiptServer(configuration=configuration, create_protocol=Echo),
-        local_addr=(address, 443),
+        local_addr=(address, port),
     )
     return transport
 

@@ -42,7 +42,10 @@ use pplx_space_template_mgr_client::proto::{
 use tempfile::TempDir;
 use tracing::Instrument as _;
 
-pub use publish::{PublishError, TemplateOrg, publish_build, register_build_template};
+pub use pplx_space_common_core::types::SystemPublicationGrantId;
+pub use publish::{
+    PublishError, TemplateOrg, TemplatePublication, publish_build, register_build_template,
+};
 pub use recipe::RecipeError;
 pub use ssh::SshError;
 pub use storage::StorageAdmissionError;

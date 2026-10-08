@@ -152,6 +152,14 @@ pub mod spaced {
     /// sandbox's disk or quota being full (ENOSPC, EDQUOT), as opposed to the
     /// admission limits that share the code.
     pub const GUEST_STORAGE_FULL: &str = "guest-storage-full";
+
+    /// [`ERROR_REASON_METADATA_KEY`] value of a request refused before any of
+    /// its work started: an admission limit, or a guest or registry shutting
+    /// down. This request did nothing, so the caller may retry it, after the
+    /// retry hint the status carries and with the same operation identity (an
+    /// earlier attempt may still have run); hops return it as-is rather than
+    /// retrying it for the caller.
+    pub const REQUEST_REFUSED: &str = "request-refused";
 }
 
 /// Stable status markers shared by the sandbox-manager wake producer and

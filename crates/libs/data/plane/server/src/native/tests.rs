@@ -122,6 +122,58 @@ async fn pending_open(dropped: Arc<AtomicBool>) {
 }
 
 #[tokio::test]
+async fn cdp_discovery_response_is_bounded() {
+    let proxy_base = CdpProxyBase {
+        http_base: "https://space.example.com/v1/sessions/proto_1/proxy".to_string(),
+        ws_base: "wss://space.example.com/v1/sessions/proto_1/proxy".to_string(),
+    };
+    let response =
+        |body: Vec<u8>| hyper::Response::new(http_body_util::Full::new(bytes::Bytes::from(body)));
+
+    let discovery = br#"[{"webSocketDebuggerUrl":"ws://127.0.0.1:9222/devtools/page/1"}]"#;
+    let rewritten = rewrite_cdp_discovery_response(response(discovery.to_vec()), &proxy_base)
+        .await
+        .unwrap();
+    let body = http_body_util::BodyExt::collect(rewritten.into_body())
+        .await
+        .unwrap()
+        .to_bytes();
+    let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        value[0]["webSocketDebuggerUrl"],
+        "wss://space.example.com/v1/sessions/proto_1/proxy/devtools/page/1"
+    );
+
+    let oversized = vec![b' '; CDP_DISCOVERY_BODY_LIMIT_BYTES + 1];
+    let error = rewrite_cdp_discovery_response(response(oversized), &proxy_base)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, ProxyError::Upstream(_)));
+}
+
+#[test]
+fn cdp_rewrite_applies_only_to_endpoints_with_debugger_urls() {
+    for path in [
+        "/json",
+        "/json/",
+        "/json/list",
+        "/json/version",
+        "/json/new",
+    ] {
+        assert!(is_cdp_discovery_path(path), "{path}");
+    }
+    for path in [
+        "/json/protocol",
+        "/json/activate/page-1",
+        "/json/close/page-1",
+        "/jsonx",
+        "/devtools/page/1",
+    ] {
+        assert!(!is_cdp_discovery_path(path), "{path}");
+    }
+}
+
+#[tokio::test]
 async fn client_close_during_open_drops_the_open() {
     let dropped = Arc::new(AtomicBool::new(false));
     let mut source = futures_util::stream::iter(vec![Ok(Message::Close(None))]);
@@ -257,4 +309,63 @@ async fn an_unread_pong_closes_the_client_at_its_deadline() {
     assert!(matches!(outcome, OpenWatch::ClientClosed));
     assert_eq!(started.elapsed(), PONG_SEND_TIMEOUT);
     assert!(dropped.load(Ordering::Acquire));
+}
+
+// A refusal the guest made before starting anything is retryable on both
+// the SSE and WebSocket openings, with the guest's hint as Retry-After and
+// none of its wording in the public body.
+#[tokio::test]
+async fn refusals_before_start_are_retryable_with_retry_after() {
+    use http_body_util::BodyExt;
+
+    for (code, expected_status, expected_code) in [
+        (
+            tonic::Code::ResourceExhausted,
+            StatusCode::TOO_MANY_REQUESTS,
+            "rate_limited",
+        ),
+        (
+            tonic::Code::Unavailable,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "service_unavailable",
+        ),
+    ] {
+        let status = pplx_space_common_grpc::refused_before_start(
+            tonic::Status::new(code, "synthetic guest wording"),
+            std::time::Duration::from_millis(1500),
+        );
+        let error = StreamBridgeError::BackendStatus(status);
+        let response = process_stream_start_http_error(&error);
+        assert_eq!(response.status(), expected_status, "{code:?}");
+        assert_eq!(response.headers()[axum::http::header::RETRY_AFTER], "2");
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["code"], expected_code, "{body}");
+        assert_eq!(body["error"]["retryable"], true, "{body}");
+        assert!(!body.to_string().contains("synthetic guest wording"));
+        let DataPlaneServerFrame::Error { retryable, .. } = stream_start_error_frame(&error) else {
+            panic!("expected error frame")
+        };
+        assert!(retryable, "WebSocket agrees with SSE for {code:?}");
+    }
+}
+
+// A full sandbox disk is named and not retryable.
+#[tokio::test]
+async fn full_guest_storage_is_named_and_not_retryable() {
+    use http_body_util::BodyExt;
+
+    let mut status = tonic::Status::resource_exhausted("No space left on device (os error 28)");
+    status.metadata_mut().insert(
+        pplx_space_common_core::spaced::ERROR_REASON_METADATA_KEY,
+        pplx_space_common_core::spaced::GUEST_STORAGE_FULL
+            .parse()
+            .unwrap(),
+    );
+    let response = process_stream_start_http_error(&StreamBridgeError::BackendStatus(status));
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(body["error"]["message"], "sandbox storage is full");
+    assert_eq!(body["error"]["retryable"], false);
 }

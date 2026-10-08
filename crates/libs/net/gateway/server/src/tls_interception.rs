@@ -1,18 +1,19 @@
 //! Opt-in interception admission. TLS transport never authorizes HTTP forwarding.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 use pplx_space_net_common::TlsInterception as PolicyTlsInterception;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
+use tokio::time::Instant;
 
 use crate::certificates::{CERTIFICATE_REQUEST_BACKSTOP, CertificateLease};
 use crate::sniff::MissingSniDetail;
 use crate::tls_sni::{ClientHelloScan, HttpAlpn};
 
-pub use crate::certificates::CertificateRequester;
+mod admission;
 
-const MAX_TLS_HANDSHAKES: usize = 256;
+pub use crate::certificates::CertificateRequester;
+use admission::HandshakeAdmission;
+pub(crate) use admission::{Admission, HandshakePermit, Refused, TlsHandshakeLeg};
 
 #[derive(Clone, Default)]
 pub struct TlsInterception {
@@ -23,97 +24,7 @@ pub struct TlsInterception {
 #[derive(Clone)]
 struct UpstreamTls {
     config: Arc<rustls::ClientConfig>,
-    handshakes: Arc<HandshakeCapacity>,
-}
-
-struct HandshakeCapacity {
-    permits: Arc<Semaphore>,
-    limit: usize,
-    client_to_netgw: AtomicUsize,
-    netgw_to_origin: AtomicUsize,
-}
-
-#[derive(Clone, Copy, Debug)]
-pub(crate) enum TlsHandshakeLeg {
-    ClientToNetgw,
-    NetgwToOrigin,
-}
-
-impl TlsHandshakeLeg {
-    pub(crate) const fn as_str(self) -> &'static str {
-        match self {
-            Self::ClientToNetgw => "client_to_netgw",
-            Self::NetgwToOrigin => "netgw_to_origin",
-        }
-    }
-}
-
-pub(crate) struct TlsHandshakePermit {
-    permit: Option<OwnedSemaphorePermit>,
-    capacity: Arc<HandshakeCapacity>,
-    leg: TlsHandshakeLeg,
-}
-
-impl HandshakeCapacity {
-    fn new(limit: usize) -> Self {
-        Self {
-            permits: Arc::new(Semaphore::new(limit)),
-            limit,
-            client_to_netgw: AtomicUsize::new(0),
-            netgw_to_origin: AtomicUsize::new(0),
-        }
-    }
-
-    fn leg_active(&self, leg: TlsHandshakeLeg) -> &AtomicUsize {
-        match leg {
-            TlsHandshakeLeg::ClientToNetgw => &self.client_to_netgw,
-            TlsHandshakeLeg::NetgwToOrigin => &self.netgw_to_origin,
-        }
-    }
-
-    fn record(&self, leg: TlsHandshakeLeg) {
-        pplx_space_metrics::gateway::tls_handshake_in_flight(
-            "shared",
-            self.limit - self.permits.available_permits(),
-            self.limit,
-        );
-        pplx_space_metrics::gateway::tls_handshake_in_flight(
-            leg.as_str(),
-            self.leg_active(leg).load(Ordering::Relaxed),
-            self.limit,
-        );
-    }
-
-    fn try_acquire(
-        self: &Arc<Self>,
-        leg: TlsHandshakeLeg,
-    ) -> Result<TlsHandshakePermit, TryAcquireError> {
-        let permit = match self.permits.clone().try_acquire_owned() {
-            Ok(permit) => permit,
-            Err(error) => {
-                self.record(leg);
-                return Err(error);
-            }
-        };
-        let permit = TlsHandshakePermit {
-            permit: Some(permit),
-            capacity: Arc::clone(self),
-            leg,
-        };
-        self.leg_active(leg).fetch_add(1, Ordering::Relaxed);
-        self.record(leg);
-        Ok(permit)
-    }
-}
-
-impl Drop for TlsHandshakePermit {
-    fn drop(&mut self) {
-        self.capacity
-            .leg_active(self.leg)
-            .fetch_sub(1, Ordering::Relaxed);
-        drop(self.permit.take());
-        self.capacity.record(self.leg);
-    }
+    handshakes: HandshakeAdmission,
 }
 
 impl Default for UpstreamTls {
@@ -137,7 +48,7 @@ impl UpstreamTls {
         config.resumption = rustls::client::Resumption::disabled();
         Self {
             config: Arc::new(config),
-            handshakes: Arc::new(HandshakeCapacity::new(MAX_TLS_HANDSHAKES)),
+            handshakes: HandshakeAdmission::default(),
         }
     }
 }
@@ -170,11 +81,20 @@ impl TlsInterception {
         Arc::new(config)
     }
 
-    pub(crate) fn handshake_permit(
+    /// Admit one handshake on `leg`, queueing behind a full pool until
+    /// `deadline` at most. See [`admission`] for what the pool bounds.
+    pub(crate) async fn admit_handshake(
         &self,
         leg: TlsHandshakeLeg,
-    ) -> Result<TlsHandshakePermit, TryAcquireError> {
-        self.upstream.handshakes.try_acquire(leg)
+        deadline: Instant,
+    ) -> Result<HandshakePermit, Refused> {
+        self.upstream.handshakes.admit(leg, deadline).await
+    }
+
+    /// Stop admitting TLS handshakes at gateway shutdown. Queued handshakes
+    /// fail at once instead of waiting for capacity.
+    pub(crate) fn close_handshakes(&self) {
+        self.upstream.handshakes.close();
     }
 
     /// Called only after TCP policy admission. The admitted policy generation

@@ -16,7 +16,7 @@
 //! primary key's own index and filters the whole table to answer "nothing".
 //!
 //! Three properties pin the fix, all read straight off the plan as rows
-//! examined or plan structure rather than as timings or costs:
+//! examined or executions rather than as timings or costs:
 //!
 //! 1. **The work is bounded by the node, not the table.**
 //!    [`enumeration_reads_only_the_nodes_pinned_rows`] counts the `sandboxes`
@@ -28,20 +28,38 @@
 //!    not the planner's business — that the composite index is what produces
 //!    the bound — by dropping it and requiring the plan to degrade to reading
 //!    the whole table.
-//! 2. **The durability probe stays un-pullable.**
-//!    [`durability_check_stays_an_unpullable_subquery`] asserts the
-//!    scalar-subquery fence structurally, as its twin in the node-drain store
-//!    does. That one is not about the access path: it stops the planner
-//!    realising the durability check as an anti-join over the whole snapshot
-//!    catalog after updated statistics change its cost estimate. A cost-based
-//!    bias is not evidence.
-//! 3. **The in-flight probe reads only the sandboxes it is asked about.**
-//!    [`inflight_check_reads_only_the_probed_sandboxes`] counts the `snapshots`
-//!    rows the in-flight check examines, across [`PLAN_CASES`], and
-//!    requires them to stay within the node's own snapshots. The check is
-//!    fenced like the durability one; unfenced, the planner is free to
-//!    merge-join it along the snapshots index and read snapshots belonging to
-//!    other nodes' sandboxes.
+//! 2. **No `snapshots` scan reads more than the node has.**
+//!    [`snapshot_scans_stay_within_the_nodes_snapshots`] counts the rows each
+//!    `snapshots` scan examines, across [`PLAN_CASES`], and requires every
+//!    one to read no more in total than the node's own snapshots plus one per
+//!    execution. That's a total, not a per-sandbox guarantee: a per-execution
+//!    scan of this fixture's small in-flight set is accepted and stays under
+//!    it. Unfenced and written as a top-level conjunct, the in-flight check
+//!    is pulled up into a merge anti-join over the fleet's snapshots, which
+//!    exceeds it. Its own catch is an in-flight probe whose per-execution
+//!    reads add up past the total, a per-row scan of the table for one, which
+//!    property 3 exempts from its read bound. A rewrite to conjuncts that
+//!    drops the in-flight fence fails here too, and also fails property 3's
+//!    lower bound.
+//! 3. **The in-flight probe runs only for non-durable rows.**
+//!    [`inflight_check_runs_only_for_non_durable_rows`] counts how often the
+//!    in-flight check executes against a cluster with thousands of in-flight
+//!    uploads elsewhere, across [`PLAN_CASES`]. It requires at least one
+//!    execution per row the page returns and no more than the node's
+//!    non-durable rows. Property 2 bounds the reads it can see, which excludes
+//!    a bitmap index scan's; this one bounds how many executions there are,
+//!    whatever plan serves each. It applies property 2's per-scan read bound
+//!    to this larger fixture as well, except to the in-flight probe's own
+//!    scan, whose per-execution cost is the planner's choice. That bound is
+//!    what catches a rewrite to conjuncts that drops the durability fence:
+//!    here the pulled-up check reads every durable snapshot in the fixture,
+//!    while on property 2's smaller fixture it stays inside the node.
+//!
+//! Neither scalar-subquery fence has a structural test of its own. Inside the
+//! `CASE` a fence changes nothing these tests measure, so a test for its
+//! shape would fail on a refactor that preserves behaviour. Writing the
+//! predicate as conjuncts is what makes the fences matter, and properties 2
+//! and 3 measure what an unfenced conjunct reads.
 //!
 //! [`page_is_the_lowest_ids_and_excludes_non_suspended_rows`] covers the
 //! behavioural contract: the page is the ascending-id prefix of the eligible
@@ -97,6 +115,15 @@ const FLEET_ELSEWHERE: usize = 10000;
 /// the in-flight predicate quantifies over, and the fixture keeps it non-empty
 /// so that predicate is planned against the shape production has rather than
 /// against an empty join side.
+///
+/// Small enough that a per-execution scan of the whole set, which the
+/// statement accepts, stays under the per-scan bound in
+/// [`snapshot_scans_stay_within_the_nodes_snapshots`], the node's snapshots
+/// plus one per execution: at
+/// [`PRODUCTION_PAGE`], [`GENUINE_WORK`] executions of 120 rows is 840, under
+/// 900 + 7. Growing this constant or [`GENUINE_WORK`], or shrinking
+/// [`DURABLE_HISTORY`], past that margin makes the test reject an accepted
+/// plan.
 const FOREIGN_INFLIGHT_UPLOADS: usize = 120;
 
 /// Page size the ordering assertions use: smaller than [`GENUINE_WORK`], so a
@@ -204,43 +231,83 @@ async fn insert_ready_backups(pool: &PgPool, sandbox_ids: &[Uuid]) -> TestResult
     Ok(())
 }
 
-/// Sandboxes on other nodes that [`seed_fleet_below_node`] seeds beneath the
-/// node under test, each with a durable snapshot.
+/// Register a fresh `state='creating'` full snapshot uploading from
+/// `source_node` for every sandbox in `sandbox_ids`: the population the
+/// in-flight check quantifies over.
+async fn insert_inflight_uploads(
+    pool: &PgPool,
+    sandbox_ids: &[Uuid],
+    source_node: Uuid,
+) -> TestResult {
+    sqlx::query(sql!(
+        "INSERT INTO snapshots (id, sandbox_id, type, state, source_node_id, timestamp)
+         SELECT space_uuid_v7(), t.sandbox_id, 'full', 'creating', $2, NOW()
+           FROM UNNEST($1::uuid[]) AS t(sandbox_id)"
+    ))
+    .bind(sandbox_ids)
+    .bind(source_node)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Sandboxes on other nodes that [`snapshot_scans_stay_within_the_nodes_snapshots`]
+/// seeds beneath the node under test through [`seed_fleet_below_node`].
 const FLEET_BELOW_NODE: usize = 3000;
 
-/// Seed a fleet whose sandbox ids all sort below the node under test, then the
-/// node itself, and `ANALYZE`. Returns the node and how many snapshots its own
-/// sandboxes carry.
+/// `state='creating'` full snapshots on other nodes' sandboxes for
+/// [`inflight_check_runs_only_for_non_durable_rows`]. Thousands rather than
+/// [`FOREIGN_INFLIGHT_UPLOADS`]'s 120, so the planner costs the in-flight
+/// probe against a population of that size. Whether it then picks a plan that
+/// scans the whole set per execution is its choice; the test asserts the
+/// execution count, which holds either way.
+const CROWDED_INFLIGHT_UPLOADS: usize = 4000;
+
+/// `ANALYZE` the tables the statement reads, so the planner sees the fixture
+/// rather than an empty-table default.
+async fn analyze(pool: &PgPool) -> TestResult {
+    sqlx::query(sql!(
+        "ANALYZE sandboxes, snapshots, snapshot_storage_locations"
+    ))
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Seed a fleet of `fleet_size` durable sandboxes whose ids all sort below the
+/// node under test, the first `inflight_uploads` of them with an in-flight
+/// upload, then the node itself, and `ANALYZE`. Returns the node and how many
+/// snapshots its own sandboxes carry.
 ///
 /// Ids are UUIDv7, so seeding the fleet first gives it the lower ids. A merge
 /// anti-join along `idx_snapshots_sandbox_id` then has to walk the fleet's
 /// snapshots to reach the node's, which is what makes that plan visible as
 /// reads outside the node. [`seed_fleet`] seeds the fleet last, where the walk
 /// passes over only the other node's history.
-async fn seed_fleet_below_node(pool: &PgPool) -> TestResult<(Uuid, u64)> {
+///
+/// The node's durable history is seeded before its [`GENUINE_WORK`], so the
+/// node-ordered scan reaches every durable row before a non-durable one and no
+/// page size lets the `LIMIT` stop before the whole history has been checked.
+/// That's the shape a long-lived node has.
+async fn seed_fleet_below_node(
+    pool: &PgPool,
+    fleet_size: usize,
+    inflight_uploads: usize,
+) -> TestResult<(Uuid, u64)> {
+    assert!(
+        fleet_size >= inflight_uploads,
+        "fleet must cover the in-flight population it is sliced from"
+    );
     let fleet_node = Uuid::now_v7();
-    let fleet = insert_generated_suspended_rows(pool, fleet_node, FLEET_BELOW_NODE).await?;
+    let fleet = insert_generated_suspended_rows(pool, fleet_node, fleet_size).await?;
     insert_ready_backups(pool, &fleet).await?;
-    sqlx::query(sql!(
-        "INSERT INTO snapshots (id, sandbox_id, type, state, source_node_id, timestamp)
-         SELECT space_uuid_v7(), t.sandbox_id, 'full', 'creating', $2, NOW()
-           FROM UNNEST($1::uuid[]) AS t(sandbox_id)"
-    ))
-    .bind(&fleet[..FOREIGN_INFLIGHT_UPLOADS])
-    .bind(fleet_node)
-    .execute(pool)
-    .await?;
+    insert_inflight_uploads(pool, &fleet[..inflight_uploads], fleet_node).await?;
 
     let node = Uuid::now_v7();
     let history = insert_generated_suspended_rows(pool, node, DURABLE_HISTORY).await?;
     insert_ready_backups(pool, &history).await?;
     insert_generated_suspended_rows(pool, node, GENUINE_WORK).await?;
-
-    sqlx::query(sql!(
-        "ANALYZE sandboxes, snapshots, snapshot_storage_locations"
-    ))
-    .execute(pool)
-    .await?;
+    analyze(pool).await?;
 
     let node_snapshots: i64 = sqlx::query_scalar(sql!(
         "SELECT count(*)
@@ -291,8 +358,9 @@ struct Fleet {
 /// `fleet_elsewhere` is a parameter because only the two bound tests,
 /// [`enumeration_reads_only_the_nodes_pinned_rows`] and
 /// [`the_composite_index_is_what_bounds_the_scan`], compare against the fleet;
-/// the others assert node-local properties and would otherwise pay for inserts
-/// they don't read. They pass [`FOREIGN_INFLIGHT_UPLOADS`], which is the floor —
+/// [`page_is_the_lowest_ids_and_excludes_non_suspended_rows`] asserts
+/// node-local properties and would otherwise pay for inserts it doesn't read.
+/// It passes [`FOREIGN_INFLIGHT_UPLOADS`], which is the floor —
 /// the in-flight population is sliced out of the fleet.
 async fn seed_fleet(pool: &PgPool, fleet_elsewhere: usize) -> TestResult<Fleet> {
     assert!(
@@ -319,21 +387,8 @@ async fn seed_fleet(pool: &PgPool, fleet_elsewhere: usize) -> TestResult<Fleet> 
     let fleet_node = Uuid::now_v7();
     let fleet = insert_generated_suspended_rows(pool, fleet_node, fleet_elsewhere).await?;
     insert_ready_backups(pool, &fleet).await?;
-    sqlx::query(sql!(
-        "INSERT INTO snapshots (id, sandbox_id, type, state, source_node_id, timestamp)
-         SELECT space_uuid_v7(), t.sandbox_id, 'full', 'creating', $2, NOW()
-           FROM UNNEST($1::uuid[]) AS t(sandbox_id)"
-    ))
-    .bind(&fleet[..FOREIGN_INFLIGHT_UPLOADS])
-    .bind(fleet_node)
-    .execute(pool)
-    .await?;
-
-    sqlx::query(sql!(
-        "ANALYZE sandboxes, snapshots, snapshot_storage_locations"
-    ))
-    .execute(pool)
-    .await?;
+    insert_inflight_uploads(pool, &fleet[..FOREIGN_INFLIGHT_UPLOADS], fleet_node).await?;
+    analyze(pool).await?;
 
     // Read the counts back rather than deriving them from the constants, so a
     // fixture that silently seeded less than it meant to cannot make the bound
@@ -370,8 +425,6 @@ struct Explained {
 
 #[derive(Debug, serde::Deserialize)]
 struct PlanNode {
-    #[serde(rename = "Node Type")]
-    node_type: String,
     #[serde(rename = "Relation Name")]
     relation: Option<String>,
     #[serde(rename = "Actual Rows", default)]
@@ -415,60 +468,57 @@ impl PlanNode {
             .sum::<u64>()
     }
 
-    /// Is the durability probe planned inside a scalar subquery?
+    /// Every `snapshots` scan in the plan, each with the rows it examined
+    /// (emitted plus filtered out, times its loops, as in
+    /// [`PlanNode::sandbox_rows_examined`]) and its loop count.
     ///
-    /// True iff some `Result` node — which is how Postgres realises a scalar
-    /// subquery — has the `snapshot_storage_locations` access somewhere beneath
-    /// it. Unfenced, that access hangs off a top-level join instead.
-    fn durability_probe_is_fenced(&self) -> bool {
-        fn reaches_storage_locations(node: &PlanNode) -> bool {
-            node.relation.as_deref() == Some("snapshot_storage_locations")
-                || node.children.iter().any(reaches_storage_locations)
+    /// Reported per scan rather than per probe, because a scan can't always be
+    /// told apart by its conditions: the durability probe is served by a
+    /// partial index whose predicate is its `state`/`type` filter, so the plan
+    /// shows no `state` condition on it at all.
+    ///
+    /// Each entry also says whether the scan is the in-flight probe's, by
+    /// [`PlanNode::names_creating`].
+    fn snapshot_scans(&self) -> Vec<SnapshotScan> {
+        let mut scans = Vec::new();
+        self.collect_snapshot_scans(&mut scans);
+        scans
+    }
+
+    fn collect_snapshot_scans(&self, scans: &mut Vec<SnapshotScan>) {
+        if self.relation.as_deref() == Some("snapshots") {
+            let loops = self.loops.max(1);
+            scans.push(SnapshotScan {
+                read: (self.rows + self.rows_removed) * loops,
+                loops,
+                inflight: self.names_creating(),
+            });
         }
-        (self.node_type == "Result" && reaches_storage_locations(self))
-            || self
-                .children
-                .iter()
-                .any(PlanNode::durability_probe_is_fenced)
+        for child in &self.children {
+            child.collect_snapshot_scans(scans);
+        }
     }
 
-    /// How many `snapshots` rows the in-flight check examined: every scan of
-    /// the table whose conditions name `state = 'creating'`, counted the same
-    /// way as [`PlanNode::sandbox_rows_examined`]. The durability probe reads
-    /// `snapshots` too, but never filters on `creating`, so it is not counted.
-    fn inflight_probe_rows_examined(&self) -> u64 {
-        let own = if self.names_creating() {
-            (self.rows + self.rows_removed) * self.loops.max(1)
-        } else {
-            0
-        };
-        own + self
-            .children
+    /// How many times the in-flight check executed: the most loops any of its
+    /// `snapshots` scans ran. The probe reads that one table with no join, so
+    /// its scan runs once per execution. Raw loops, so a probe that never ran
+    /// counts zero.
+    fn inflight_probe_executions(&self) -> u64 {
+        let own = if self.names_creating() { self.loops } else { 0 };
+        self.children
             .iter()
-            .map(PlanNode::inflight_probe_rows_examined)
-            .sum::<u64>()
-    }
-
-    /// How many times the in-flight check's `snapshots` scans executed, summed.
-    fn inflight_probe_loops(&self) -> u64 {
-        let own = if self.names_creating() {
-            self.loops.max(1)
-        } else {
-            0
-        };
-        own + self
-            .children
-            .iter()
-            .map(PlanNode::inflight_probe_loops)
-            .sum::<u64>()
-    }
-
-    /// Does the plan contain the in-flight check's `snapshots` scan at all?
-    fn reaches_inflight_probe(&self) -> bool {
-        self.names_creating() || self.children.iter().any(PlanNode::reaches_inflight_probe)
+            .map(PlanNode::inflight_probe_executions)
+            .fold(own, u64::max)
     }
 
     /// Is this a `snapshots` scan whose conditions name `state = 'creating'`?
+    ///
+    /// The in-flight probe is recognised by that literal. An index whose
+    /// predicate absorbed it would hide the probe the way
+    /// `idx_snapshots_sandbox_ready_latest_covering` hides the durability
+    /// probe's `state`, and [`inflight_check_runs_only_for_non_durable_rows`]
+    /// would then fail with zero executions rather than pass: adding such an
+    /// index means updating this match.
     fn names_creating(&self) -> bool {
         self.relation.as_deref() == Some("snapshots")
             && [&self.index_cond, &self.recheck_cond, &self.filter]
@@ -480,9 +530,9 @@ impl PlanNode {
 
 /// `EXPLAIN (ANALYZE, FORMAT JSON)` one statement against `node`.
 async fn explain(pool: &PgPool, query: &str, node: Uuid) -> TestResult<PlanNode> {
-    // `TIMING OFF`: every assertion here reads row counts or node types, which
-    // per-node timing does not affect, and instrumenting a subplan that runs
-    // once per pinned row costs more than the plan does.
+    // `TIMING OFF`: every assertion here reads row counts, loops or condition
+    // text, which per-node timing does not affect, and instrumenting a subplan
+    // that runs once per pinned row costs more than the plan does.
     let statement = format!("EXPLAIN (ANALYZE, TIMING OFF, FORMAT JSON) {query}");
     let raw: serde_json::Value = sqlx::query_scalar(sqlx::AssertSqlSafe(sql!(statement.as_str())))
         .bind(node)
@@ -562,8 +612,9 @@ async fn enumeration_reads_only_the_nodes_pinned_rows() -> TestResult {
     // Both plan-cache modes, because sqlx prepares the statement and a pooled
     // connection may switch it to a generic plan, and both page sizes, because
     // the literal `LIMIT` feeds the plan choice. The index alone does not hold
-    // the bound in both: without the fences, the generic plan on this fixture
-    // reads the whole table even with the composite index present.
+    // the bound in both: with the probes written as bare conjuncts, the
+    // generic plan on this fixture reads the whole table even with the
+    // composite index present.
     for (page, plan_cache_mode) in PLAN_CASES {
         let query = pinned_local_only_sandboxes_query(page);
         let plan = explain_prepared(pool, &query, node, plan_cache_mode).await?;
@@ -641,84 +692,170 @@ async fn the_composite_index_is_what_bounds_the_scan() -> TestResult {
     Ok(())
 }
 
-/// The durability `NOT EXISTS` is wrapped in a scalar subquery so the planner
-/// *cannot* realise it as a hash or merge anti-join over the whole
-/// `snapshots` ⋈ `snapshot_storage_locations` product — only as a per-row
-/// `SubPlan` whose own `sn.sandbox_id = s.id` makes each execution an index
-/// probe.
+/// One `snapshots` scan from [`PlanNode::snapshot_scans`].
+struct SnapshotScan {
+    /// Rows examined, summed over loops.
+    read: u64,
+    loops: u64,
+    /// Whether this is the in-flight probe's scan.
+    inflight: bool,
+}
+
+/// Which `snapshots` scans [`assert_snapshot_scans_stay_on_the_node`] bounds.
+#[derive(Clone, Copy)]
+enum Scans {
+    /// Every scan.
+    All,
+    /// Every scan but the in-flight probe's, for a fixture whose in-flight set
+    /// is large enough that a per-execution scan of it, which the statement's
+    /// docs accept, would exceed the bound.
+    ExceptInflight,
+}
+
+/// Assert that no bounded `snapshots` scan in `plan` reads past the node's own
+/// snapshots: see [`snapshot_scans_stay_within_the_nodes_snapshots`] for the bound.
+fn assert_snapshot_scans_stay_on_the_node(
+    plan: &PlanNode,
+    node_snapshots: u64,
+    which: Scans,
+    page: NonZeroUsize,
+    plan_cache_mode: &str,
+) {
+    let scans: Vec<SnapshotScan> = plan
+        .snapshot_scans()
+        .into_iter()
+        .filter(|scan| matches!(which, Scans::All) || !scan.inflight)
+        .collect();
+    assert!(
+        !scans.is_empty(),
+        "the plan must read `snapshots` somewhere, or the bound below proves \
+         nothing (LIMIT {page}, {plan_cache_mode}); plan was {plan:?}"
+    );
+    for SnapshotScan { read, loops, .. } in scans {
+        let bound = node_snapshots + loops;
+        assert!(
+            read <= bound,
+            "no `snapshots` scan may read more in total than the node's own snapshots \
+             (LIMIT {page}, {plan_cache_mode}): one read {read} rows, above the node's \
+             own {node_snapshots} plus {loops} for rounding. Plan was {plan:?}"
+        );
+    }
+}
+
+/// Both checks are fenced in scalar subqueries, so each execution is
+/// correlated on the one sandbox being asked about. Asserted as a total per
+/// `snapshots` scan, whichever probe it belongs to: no scan reads more than
+/// the node's own snapshots plus one per execution.
 ///
-/// A `LIMIT` alone can make the nested loop cheaper, but updated statistics
-/// can shift the outer row estimate and favor a merge anti-join over the whole
-/// snapshot catalog. The guard must be structural rather than a timing or cost
-/// assertion.
+/// Unfenced and written as a top-level conjunct, either check is a sublink
+/// the planner may pull up into an anti-join. For the in-flight check, the
+/// node-ordered scan makes a merge anti-join along `idx_snapshots_sandbox_id`
+/// available, and on this fixture the planner takes it in both plan-cache
+/// modes: it walks every snapshot whose sandbox id sorts below the page,
+/// whichever node that sandbox belongs to. [`seed_fleet_below_node`] puts the
+/// whole fleet below the node, so that walk reads the fleet's snapshots. The
+/// durability check, pulled up on this fixture, becomes a nested-loop
+/// anti-join that stays inside the node, so this test doesn't catch it;
+/// [`inflight_check_runs_only_for_non_durable_rows`] does. Inside the
+/// statement's `CASE` no sublink is pulled up, fenced or not. Against the
+/// statement as written, what only this test sees is an in-flight probe whose
+/// per-execution reads add up past that total, such as a per-row scan of the
+/// table, since
+/// [`inflight_check_runs_only_for_non_durable_rows`] exempts the in-flight
+/// scan from its read bound.
+///
+/// The bound is the node's own snapshots plus one per execution of the scan.
+/// A probe served by a `sandbox_id`-keyed index reads only the probed
+/// sandboxes' snapshots, so its scan stays inside the first term; a
+/// per-execution scan of the in-flight set stays under it too, by the margin
+/// [`FOREIGN_INFLIGHT_UPLOADS`] documents. The second term absorbs
+/// `EXPLAIN`'s per-loop rounding, which can add up to one row per execution.
+/// Both terms are fixed by the node and the scan, not by how many rows a
+/// regressed plan reads, so an anti-join over the fleet, which executes once,
+/// exceeds it.
+///
+/// It doesn't bound how often a probe runs. Nor does it count every per-row
+/// scan of a state's snapshots: it reads `snapshots` rows off scan nodes that
+/// name the relation, and a `Bitmap Index Scan` names an index instead, so
+/// the reads of a `BitmapAnd` over `idx_snapshots_state_type` aren't counted
+/// here.
+/// [`inflight_check_runs_only_for_non_durable_rows`] bounds the count, which
+/// caps that cost whatever plan serves the probe.
 #[tokio::test(flavor = "current_thread")]
-async fn durability_check_stays_an_unpullable_subquery() -> TestResult {
+async fn snapshot_scans_stay_within_the_nodes_snapshots() -> TestResult {
     let Some(db) = try_pg_test_db().await? else {
         return Ok(());
     };
     let pool = &db.pool;
-    let fleet = seed_fleet(pool, FOREIGN_INFLIGHT_UPLOADS).await?;
-
+    let (node, node_snapshots) =
+        seed_fleet_below_node(pool, FLEET_BELOW_NODE, FOREIGN_INFLIGHT_UPLOADS).await?;
     for (page, plan_cache_mode) in PLAN_CASES {
         let query = pinned_local_only_sandboxes_query(page);
-        let plan = explain_prepared(pool, &query, fleet.work_node, plan_cache_mode).await?;
-        assert!(
-            plan.durability_probe_is_fenced(),
-            "the durability check must be planned inside a scalar subquery (a `Result` \
-             node above the `snapshot_storage_locations` access), not as a join the \
-             planner is free to re-cost into a hash or merge anti-join (LIMIT {page}, \
-             {plan_cache_mode}); plan was {plan:?}"
+        let plan = explain_prepared(pool, &query, node, plan_cache_mode).await?;
+        assert_snapshot_scans_stay_on_the_node(
+            &plan,
+            node_snapshots,
+            Scans::All,
+            page,
+            plan_cache_mode,
         );
     }
     Ok(())
 }
 
-/// The in-flight check is fenced like the durability check, so each
-/// execution looks up the one sandbox being asked about and never reads
-/// another node's snapshots.
+/// The in-flight check runs only for rows the durability check didn't already
+/// exclude, whatever plan the planner gives it.
 ///
-/// Unfenced, it is a sublink the planner may pull up into an anti-join. The
-/// node-ordered scan makes a merge anti-join along `idx_snapshots_sandbox_id`
-/// available, and on this fixture the planner takes it in both plan-cache
-/// modes: it walks every snapshot whose sandbox id sorts below the page,
-/// whichever node that sandbox belongs to. [`seed_fleet_below_node`] puts the
-/// whole fleet below the node, so that walk reads the fleet's snapshots.
+/// The statement guarantees that by evaluation order rather than by plan; see
+/// [`pinned_local_only_sandboxes_query`]. Left as two `AND`ed conjuncts, the
+/// planner puts the in-flight check first on this fixture, and the check runs
+/// for every suspended row the scan reaches, durable history included.
 ///
-/// The bound is the node's own snapshots plus one per execution of the probe.
-/// The fenced probe only ever reads the probed sandbox's snapshots, so it
-/// stays inside the first term; the second absorbs `EXPLAIN`'s per-loop
-/// rounding, which can add up to one row per execution. Both terms are fixed
-/// by the node and the probe, not by how many rows a regressed plan scans, so
-/// a merge walk over the fleet, which executes once, exceeds it. It holds
-/// whichever order Postgres evaluates the two probes in.
-///
-/// What it does not catch is a fenced probe that scans the whole in-flight set
-/// on each execution: when the durability check runs first, few rows reach
-/// the probe, and the reads can stay under the bound.
+/// Read as executions rather than rows: a per-execution scan of the in-flight
+/// set is a plan the planner may legitimately choose, so its reads aren't the
+/// invariant. How often it runs is: once per non-durable row the scan reaches,
+/// against a durable history over a hundred times [`GENUINE_WORK`]. How many
+/// rows that is depends on the plan. The ordered index scan stops once the
+/// page fills, while the narrow index plus a `Sort`, which the statement's docs
+/// also accept, filters every row before sorting. So the bound is a range: at
+/// least the rows the page returns, so a probe that stopped running or became
+/// a hash or merge join fails, and at most the node's non-durable rows.
 #[tokio::test(flavor = "current_thread")]
-async fn inflight_check_reads_only_the_probed_sandboxes() -> TestResult {
+async fn inflight_check_runs_only_for_non_durable_rows() -> TestResult {
     let Some(db) = try_pg_test_db().await? else {
         return Ok(());
     };
     let pool = &db.pool;
-    let (node, node_snapshots) = seed_fleet_below_node(pool).await?;
+    let (node, node_snapshots) =
+        seed_fleet_below_node(pool, CROWDED_INFLIGHT_UPLOADS, CROWDED_INFLIGHT_UPLOADS).await?;
     for (page, plan_cache_mode) in PLAN_CASES {
         let query = pinned_local_only_sandboxes_query(page);
         let plan = explain_prepared(pool, &query, node, plan_cache_mode).await?;
-        assert!(
-            plan.reaches_inflight_probe(),
-            "the in-flight check's `snapshots` scan must be found in the plan, or \
-             the count below proves nothing (LIMIT {page}, {plan_cache_mode}); plan \
-             was {plan:?}"
+        // Property 2's per-scan read bound, against the larger fixture, for
+        // every scan but the in-flight probe's: a durability check pulled up
+        // into an anti-join reads every durable snapshot here, which the
+        // execution count below only catches as a side effect. The in-flight
+        // probe is left out because a per-execution scan of this in-flight
+        // set is a plan the statement accepts.
+        assert_snapshot_scans_stay_on_the_node(
+            &plan,
+            node_snapshots,
+            Scans::ExceptInflight,
+            page,
+            plan_cache_mode,
         );
-        let executions = plan.inflight_probe_loops();
-        let read = plan.inflight_probe_rows_examined();
-        let bound = node_snapshots + executions;
+        // Every non-durable row is an answer, so each row the page returns
+        // went through the probe.
+        let returned = u64::try_from(page.get().min(GENUINE_WORK))?;
+        let non_durable = u64::try_from(GENUINE_WORK)?;
+        let executions = plan.inflight_probe_executions();
         assert!(
-            read <= bound,
-            "the in-flight check must read only the probed sandboxes' snapshots \
-             (LIMIT {page}, {plan_cache_mode}): it read {read} snapshot rows, above the \
-             node's own {node_snapshots} plus {executions} for rounding. Plan was {plan:?}"
+            (returned..=non_durable).contains(&executions),
+            "the in-flight check must run as a per-row probe for between the {returned} \
+             rows the page returned and the node's {non_durable} non-durable rows, never \
+             for its {DURABLE_HISTORY} durable ones; fewer means it stopped running or \
+             became a hash or merge join (LIMIT {page}, {plan_cache_mode}); it ran {executions} \
+             times. Plan was {plan:?}"
         );
     }
     Ok(())

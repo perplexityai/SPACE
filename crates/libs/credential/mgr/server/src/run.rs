@@ -190,6 +190,8 @@ pub enum RunCredmgrError {
     ),
     #[error("invalid AWS Private CA configuration: {0}")]
     IntermediateCaConfig(#[source] crate::intermediate_ca::aws_private_ca::ConfigError),
+    #[error(transparent)]
+    SecretsManagerReaderRole(#[from] crate::aws_secrets_manager::ReaderRoleArnError),
     #[error(
         "SPACE_PLATFORM_KEK_PROVIDER=in-memory requires \
          SPACE_CREDMGR_IN_MEMORY_KEK_ENABLED=true"
@@ -553,19 +555,27 @@ async fn initialize_authority_service(
 
     let private_ca_config =
         AwsPrivateCaConfig::from_env().map_err(RunCredmgrError::IntermediateCaConfig)?;
-    // Database-backed credential resolution is installed even without a
-    // provider document. Node-local deployments without DATABASE_URL skip it.
+    let secrets_manager_role_arn = crate::aws_secrets_manager::reader_role_arn_from_env()?;
+    // Database-backed credential resolution reads secrets only through the
+    // organization-scoped reader role. Without a role, or on node-local
+    // deployments without DATABASE_URL, references are not resolvable.
+    if pool.is_some() && secrets_manager_role_arn.is_none() {
+        tracing::warn!(
+            env = crate::aws_secrets_manager::SECRETS_MANAGER_ROLE_ARN_ENV,
+            "no Secrets Manager reader role; credential references are not resolvable"
+        );
+    }
+    let secrets_manager_role_arn = secrets_manager_role_arn.filter(|_| pool.is_some());
     let (private_ca_issuer, aws_secrets_manager_resolver) =
-        if private_ca_config.is_none() && pool.is_none() {
+        if private_ca_config.is_none() && secrets_manager_role_arn.is_none() {
             tracing::info!("AWS integrations disabled; skipping AWS SDK configuration");
             (None, None)
         } else {
             let aws_config = load_authority_aws_config().await;
             let private_ca_issuer = private_ca_config
                 .map(|config| Arc::new(AwsPrivateCaIssuer::from_config(config, &aws_config)));
-            let resolver = pool
-                .as_ref()
-                .map(|_| Arc::new(AwsSecretsManagerResolver::new(&aws_config)));
+            let resolver = secrets_manager_role_arn
+                .map(|role| Arc::new(AwsSecretsManagerResolver::new(&aws_config, role)));
             (private_ca_issuer, resolver)
         };
 

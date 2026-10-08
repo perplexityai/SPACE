@@ -372,6 +372,71 @@ DefaultDependencies=no
 SSHSOCKET
 systemctl enable ssh.socket 2>/dev/null || true
 
+# All the work users run lives in space.slice: API workloads
+# (space-workloads.service, below with spaced) and SSH sessions and the E2B
+# template start command (space-sessions.slice). The guest's infrastructure,
+# spaced and the system daemons, stays in system.slice. spaced caps
+# space.slice's memory and tasks at startup, from the guest's size (systemctl
+# set-property --runtime), so user work of either kind can use the whole
+# envelope but together cannot exhaust the guest. Under contention it runs
+# behind the infrastructure, as workloads used to run behind spaced inside its
+# unit (weight 1 against the default 100).
+cat > /etc/systemd/system/space.slice <<'SPACESLICE'
+[Unit]
+Description=SPACE sandbox user work (API workloads, SSH sessions, template start command)
+DefaultDependencies=no
+Before=slices.target shutdown.target
+Conflicts=shutdown.target
+
+[Slice]
+CPUWeight=1
+IOWeight=1
+# Caps from boot, before spaced replaces them with exact values from the
+# guest's size: user work that starts first (the template start command)
+# is bounded, and they stay if spaced's own write fails. Tighter than
+# spaced's values on a 2 GiB guest; tasks are a share of the kernel's limit.
+MemoryMax=90%
+TasksMax=90%
+SPACESLICE
+
+# SSH sessions and the E2B template start command run in their own slice,
+# outside spaced.service, whose KillMode would end them whenever spaced
+# restarts. logind is masked, so PAM opens no session scopes: a session stays
+# in ssh.service's cgroup, here.
+cat > /etc/systemd/system/space-sessions.slice <<'SESSIONSSLICE'
+[Unit]
+Description=SPACE sandbox sessions (SSH, template start command)
+DefaultDependencies=no
+Before=slices.target shutdown.target
+Conflicts=shutdown.target
+
+[Slice]
+# The boot-time share of space.slice's tasks, as there: spaced replaces it
+# with the exact share (an eighth below the slice) at startup.
+TasksMax=80%
+SESSIONSSLICE
+
+# The E2B template start command (e2b-template-start.service, written by the
+# API's template build) runs with SSH sessions, under the envelope's limits
+# rather than systemd's per-unit task cap.
+mkdir -p /etc/systemd/system/e2b-template-start.service.d
+cat > /etc/systemd/system/e2b-template-start.service.d/00-space-sessions.conf <<'STARTSLICE'
+[Service]
+Slice=space-sessions.slice
+TasksMax=infinity
+STARTSLICE
+mkdir -p /etc/systemd/system/ssh.service.d
+cat > /etc/systemd/system/ssh.service.d/00-space-sessions.conf <<'SSHSLICE'
+[Service]
+Slice=space-sessions.slice
+# space.slice's limit, set by spaced from the task partition, is what binds,
+# not systemd's per-unit default.
+TasksMax=infinity
+# A session killed for running out of memory must not stop or restart sshd
+# for every other session.
+OOMPolicy=continue
+SSHSLICE
+
 # Permit SSH logins without pulling multi-user.target/basic.target into the
 # snapshot-optimized boot path. The stock systemd-user-sessions.service has
 # DefaultDependencies=yes, so requiring it directly from space.target widens the
@@ -421,6 +486,39 @@ systemctl set-default space.target 2>/dev/null || true
 # spaced guest daemon — runs as root, listens on /run/spaced.sock for
 # CLI and agent processes (user UID 2000), and vsock for host communication.
 if [ -f /usr/local/bin/spaced-svc ]; then
+  # The cgroup for commands spaced starts through the API, inside space.slice
+  # with the rest of user work. spaced creates its workloads/ leaf and places
+  # each command there before exec. Workloads end with spaced, as they would
+  # inside its unit: PartOf= restarts this unit whenever spaced stops or
+  # restarts, including the automatic restart after a crash, and its KillMode
+  # ends every workload it holds. spaced orders itself after this unit, so the
+  # unit's fresh cgroup exists when spaced builds the leaf.
+  cat > /etc/systemd/system/space-workloads.service <<'WORKLOADSEOF'
+[Unit]
+Description=SPACE API workloads (started by spaced)
+DefaultDependencies=no
+PartOf=spaced.service
+Before=shutdown.target
+Conflicts=shutdown.target
+
+[Service]
+Slice=space.slice
+# systemd removes an empty cgroup, so a process holds this one open, in a
+# subgroup of its own: the unit's root must hold no processes for spaced to
+# enable controllers on it. spaced-svc itself is the holder: it is in every
+# guest bundle, where an OCI image may have no sleep.
+ExecStart=/usr/local/bin/spaced-svc --hold-cgroup
+Delegate=yes
+DelegateSubgroup=holder
+Restart=always
+RestartSec=1
+# A workload killed for running out of memory must not stop the unit and end
+# the others; space.slice's limit is what binds, not a per-unit task default.
+OOMPolicy=continue
+TasksMax=infinity
+TimeoutStopSec=10
+WORKLOADSEOF
+
   cat > /etc/systemd/system/spaced.service <<'SVCEOF'
 [Unit]
 Description=SPACE Guest Daemon
@@ -428,18 +526,44 @@ DefaultDependencies=no
 After=local-fs.target
 Before=space.target basic.target shutdown.target
 Conflicts=shutdown.target
+# Where spaced places API workloads. A restart of that unit (which removes the
+# leaf spaced built in it) restarts spaced too, so it builds the leaf again.
+Requires=space-workloads.service
+After=space-workloads.service
+# Never stop restarting: the default start limit (5 starts per 10 s) would
+# leave a crash-looping spaced failed for good, and the sandbox unreachable.
+# RestartSec bounds the rate instead; NRestarts and the journal record it.
+StartLimitIntervalSec=0
 
 [Service]
 Type=notify
 NotifyAccess=main
-# Hand spaced its own cgroup subtree so it can split itself off from the user
-# workloads it spawns: spaced-svc moves into a supervisor/ leaf with a
-# dominating cpu.weight and a memory.min reservation, while workloads land in a
-# capped workloads/ leaf. Delegate=yes is what makes systemd enable the
+# READY=1 comes once the bridge listener is bound, well under a second after
+# start; a start that hangs is killed and restarted rather than left waiting
+# for the 90 s default.
+TimeoutStartSec=30
+# Prefer workloads over spaced when the guest runs out of memory: losing spaced
+# makes the sandbox unreachable and, through space-workloads.service, ends
+# every workload anyway. Not -1000: a spaced that is itself the problem must
+# stay killable.
+# Spawned workloads reset their own score to 0 before exec, so they do not
+# inherit this protection.
+OOMScoreAdjust=-900
+# A workload or worker killed by the OOM killer must not stop the service
+# (the default for delegated units, set explicitly).
+OOMPolicy=continue
+# Hand spaced its own cgroup subtree so it can split itself from the
+# filesystem identity workers it spawns: spaced-svc moves into a supervisor/
+# leaf with a dominating cpu.weight and a memory.min reservation, while workers
+# land in a filesystem/ leaf. Delegate=yes is what makes systemd enable the
 # cpu/memory/pids controllers for this subtree and stop managing it, so the
-# daemon can write cgroup.subtree_control and create the leaves. Without it a
-# runaway workload shares spaced's budget and starves the host health pings.
+# daemon can write cgroup.subtree_control and create the leaves.
 Delegate=yes
+# No unit-wide task cap. systemd's default (15% of the kernel's task limit)
+# would bind spaced and its workers below what the partition reserves for
+# them. spaced partitions the task limit itself: a capped filesystem/ leaf,
+# space.slice for user work, and a reserve for the supervisor and system.
+TasksMax=infinity
 # New port exposures are limited to 128 and forwarding is bounded to 256 active
 # connections (two stream FDs each). Leave headroom for grandfathered exposure
 # listeners, RPC transports, process pipes, filesystem watches, and transient
@@ -467,9 +591,9 @@ ExecStart=/usr/local/bin/spaced-svc
 Restart=always
 RestartSec=2
 # The default KillMode (control-group) kills every process left in the unit's
-# cgroup on stop, workloads included. The stop deadline, shorter than the 90s
-# default, covers the daemon's 10s drain plus its 5s telemetry and 5s runtime
-# shutdown bounds.
+# cgroup on stop; workloads end with space-workloads.service. The stop
+# deadline, shorter than the 90s default, covers the daemon's 10s drain plus
+# its 5s telemetry and 5s runtime shutdown bounds.
 TimeoutStopSec=30
 StandardOutput=journal+console
 StandardError=journal+console

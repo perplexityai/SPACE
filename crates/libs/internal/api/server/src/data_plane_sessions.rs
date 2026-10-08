@@ -83,6 +83,7 @@ struct SessionRouteRow {
     token_hash: Option<String>,
     token_expires_at: Option<OffsetDateTime>,
     sandbox_active_node_id: Option<NodeId>,
+    sandbox_lifecycle: SandboxLifecycle,
     node_address: Option<String>,
     node_managed_by: Option<String>,
     k8s_node_name: Option<String>,
@@ -162,6 +163,7 @@ struct ReconnectRow {
 }
 
 pub(super) async fn resolve_session_route(
+    budget: Duration,
     activation: Option<&dyn crate::ingress_activation::IngressActivation>,
     pool: &sqlx::PgPool,
     route_ed25519_authority: Option<&SpaceApiRouteEd25519Authority>,
@@ -172,152 +174,177 @@ pub(super) async fn resolve_session_route(
     let protocol_session_id = optional(request.protocol_session_id.as_deref());
     let token_sha256 = optional(request.token_sha256.as_deref());
     let required_scope = optional(request.required_scope.as_deref());
-    let mut row = fetch_route_row(pool, &session_id, protocol_session_id.as_deref()).await?;
-    validate_attach_authorization(
-        &row,
-        refresh_authority,
-        token_sha256.as_deref(),
-        required_scope.as_deref(),
-    )?;
-    let _waiter = if matches!(
-        row.kind.parse::<SessionKind>(),
-        Ok(SessionKind::Port | SessionKind::Protocol)
-    ) {
-        Some(
-            pplx_space_common_svc::ingress_admission::IngressPreparationPermit::acquire(Some(
-                row.sandbox_id,
-            ))?,
-        )
-    } else {
-        None
-    };
-    if matches!(
-        row.kind.parse::<SessionKind>(),
-        Ok(SessionKind::Port | SessionKind::Protocol)
-    ) && let Some(activation) = activation
-    {
-        validate_ingress_session(&row)?;
-        activation
-            .prepare(
-                row.sandbox_id,
-                pplx_space_common_svc::ingress_admission::preparation_timeout(),
-            )
-            .await?;
-        row = fetch_route_row(pool, &session_id, protocol_session_id.as_deref()).await?;
-        validate_ingress_session(&row)?;
+    let deadline = tokio::time::Instant::now() + budget;
+    let mut activated = false;
+    loop {
+        let mut row = fetch_route_row(pool, &session_id, protocol_session_id.as_deref()).await?;
         validate_attach_authorization(
             &row,
             refresh_authority,
             token_sha256.as_deref(),
             required_scope.as_deref(),
         )?;
-    }
-    let current_node_id = row.sandbox_active_node_id.ok_or_else(|| {
-        Status::failed_precondition("data-plane session sandbox is not assigned to a node")
-    })?;
-    let backend_endpoint = resolve_backend_endpoint(&row).ok_or_else(|| {
-        Status::failed_precondition(missing_backend_endpoint_message(
-            "data-plane session",
-            row.sandbox_active_node_id,
-            row.node_managed_by.as_deref(),
-            row.k8s_node_name.as_deref(),
-        ))
-    })?;
-    let backend_transport = row
-        .backend_transport
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or(BACKEND_TRANSPORT_GRPC)
-        .to_string();
+        let _waiter = if matches!(
+            row.kind.parse::<SessionKind>(),
+            Ok(SessionKind::Port | SessionKind::Protocol)
+        ) {
+            validate_ingress_session(&row)?;
+            Some(
+                pplx_space_common_svc::ingress_admission::IngressPreparationPermit::acquire(Some(
+                    row.sandbox_id,
+                ))?,
+            )
+        } else {
+            None
+        };
+        let ingress = matches!(
+            row.kind.parse::<SessionKind>(),
+            Ok(SessionKind::Port | SessionKind::Protocol)
+        );
+        let sandbox_id = row.sandbox_id;
+        let result = async {
+            if matches!(
+                row.kind.parse::<SessionKind>(),
+                Ok(SessionKind::Port | SessionKind::Protocol)
+            ) {
+                require_started_ingress(row.sandbox_lifecycle)?;
+            }
+            let current_node_id = row.sandbox_active_node_id.ok_or_else(|| {
+                Status::failed_precondition("data-plane session sandbox is not assigned to a node")
+            })?;
+            let backend_endpoint = resolve_backend_endpoint(&row).ok_or_else(|| {
+                Status::failed_precondition(missing_backend_endpoint_message(
+                    "data-plane session",
+                    row.sandbox_active_node_id,
+                    row.node_managed_by.as_deref(),
+                    row.k8s_node_name.as_deref(),
+                ))
+            })?;
+            let backend_transport = row
+                .backend_transport
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or(BACKEND_TRANSPORT_GRPC)
+                .to_string();
 
-    if row.current_node_id != Some(current_node_id)
-        || row.backend_endpoint.as_deref() != Some(backend_endpoint.as_str())
-        || row.backend_transport.as_deref() != Some(backend_transport.as_str())
-    {
-        row = update_route_row(
-            pool,
-            &session_id,
-            current_node_id,
-            &backend_endpoint,
-            &backend_transport,
-        )
-        .await?;
-    }
+            if row.current_node_id != Some(current_node_id)
+                || row.backend_endpoint.as_deref() != Some(backend_endpoint.as_str())
+                || row.backend_transport.as_deref() != Some(backend_transport.as_str())
+            {
+                row = update_route_row(
+                    pool,
+                    &session_id,
+                    current_node_id,
+                    &backend_endpoint,
+                    &backend_transport,
+                )
+                .await?;
+            }
 
-    let route_generation = row.route_generation.get();
-    let kind = row.kind.parse::<SessionKind>().map_err(|error| {
-        Status::internal(format!("data-plane session kind is invalid: {error}"))
-    })?;
-    data_plane_session_transport(request.requested_transport, kind)?;
-    if matches!(kind, SessionKind::Port | SessionKind::Protocol) {
-        let port = row
-            .target_port
-            .and_then(|value| u16::try_from(value).ok())
-            .and_then(|value| GuestPort::try_from_u16(value).ok())
-            .ok_or_else(|| Status::failed_precondition("service session target port is invalid"))?;
-        ensure_sandbox_service_port_ingress_path(
-            pool,
-            SandboxServicePortRouteIdentity {
-                sandbox_id: row.sandbox_id,
-                active_node_id: current_node_id,
-                route_generation: row
-                    .execution_generation
-                    .and_then(|value| u64::try_from(value.get()).ok())
-                    .and_then(|value| RouteGeneration::new(value).ok())
+            let route_generation = row.route_generation.get();
+            let kind = row.kind.parse::<SessionKind>().map_err(|error| {
+                Status::internal(format!("data-plane session kind is invalid: {error}"))
+            })?;
+            data_plane_session_transport(request.requested_transport, kind)?;
+            if matches!(kind, SessionKind::Port | SessionKind::Protocol) {
+                let port = row
+                    .target_port
+                    .and_then(|value| u16::try_from(value).ok())
+                    .and_then(|value| GuestPort::try_from_u16(value).ok())
                     .ok_or_else(|| {
-                        Status::failed_precondition(
-                            "service session execution generation is missing",
+                        Status::failed_precondition("service session target port is invalid")
+                    })?;
+                prepare_current_ingress_worker(
+                    deadline,
+                    activation.is_some() && !activated,
+                    async {
+                        ensure_sandbox_service_port_ingress_path(
+                            pool,
+                            SandboxServicePortRouteIdentity {
+                                sandbox_id: row.sandbox_id,
+                                active_node_id: current_node_id,
+                                route_generation: row
+                                    .execution_generation
+                                    .and_then(|value| u64::try_from(value.get()).ok())
+                                    .and_then(|value| RouteGeneration::new(value).ok())
+                                    .ok_or_else(|| {
+                                        Status::failed_precondition(
+                                            "service session execution generation is missing",
+                                        )
+                                    })?,
+                                execution_generation: row.execution_generation,
+                                pod_uid: row.sandbox_pod_uid.clone(),
+                                substrate_kind: row
+                                    .node_managed_by
+                                    .as_deref()
+                                    .and_then(|value| value.parse().ok()),
+                                activation_attempt_id: row.activation_attempt_id,
+                            },
+                            port,
+                            &backend_endpoint,
+                            route_ed25519_authority,
                         )
-                    })?,
-                execution_generation: row.execution_generation,
-                pod_uid: row.sandbox_pod_uid.clone(),
-                substrate_kind: row
-                    .node_managed_by
-                    .as_deref()
-                    .and_then(|value| value.parse().ok()),
-                activation_attempt_id: row.activation_attempt_id,
-            },
-            port,
-            &backend_endpoint,
-            route_ed25519_authority,
-        )
-        .await?;
+                        .await?;
+                        Ok(())
+                    },
+                )
+                .await?;
+            }
+            let space_api_route_token = space_api_route_token_for_session(
+                &row,
+                row.current_node_id.unwrap_or(current_node_id),
+                route_ed25519_authority,
+            )?;
+            Ok(ResolveDataPlaneSessionRouteResponse {
+                session_id: row.session_id,
+                protocol_session_id: row.protocol_session_id,
+                route_generation,
+                current_node_id: row.current_node_id.unwrap_or(current_node_id).to_string(),
+                backend: Some(DataPlaneBackendEndpoint {
+                    node_id: current_node_id.to_string(),
+                    endpoint: row.backend_endpoint.unwrap_or(backend_endpoint),
+                    transport: Some(backend_transport),
+                }),
+                revocation: Some(revocation_state(
+                    row.revocation_epoch,
+                    &row.revocation_status,
+                    row.revocation_updated_at,
+                    row.revocation_reason,
+                    row.org_revocation_epoch,
+                )?),
+                sandbox_id: row.sandbox_id.to_string(),
+                kind: row.kind,
+                target_port: row
+                    .target_port
+                    .and_then(|value| u16::try_from(value).ok())
+                    .map(u32::from),
+                target_protocol: row.target_protocol,
+                target_path: row.target_path,
+                adapter_state_json: row.adapter_state_json,
+                backend_process_id: row.backend_process_id,
+                org_id: row.org_id.to_string(),
+                space_api_route_token,
+            })
+        }
+        .await;
+        let error = match result {
+            Ok(response) => return Ok(response),
+            Err(error) => error,
+        };
+        let Some(owner) =
+            activation.filter(|_| !activated && activation_may_repair(ingress, &error))
+        else {
+            return Err(error);
+        };
+        owner
+            .prepare(
+                sandbox_id,
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+            )
+            .await?;
+        activated = true;
+        // Re-read identity and authorization after activation; never replay bytes.
     }
-    let space_api_route_token = space_api_route_token_for_session(
-        &row,
-        row.current_node_id.unwrap_or(current_node_id),
-        route_ed25519_authority,
-    )?;
-    Ok(ResolveDataPlaneSessionRouteResponse {
-        session_id: row.session_id,
-        protocol_session_id: row.protocol_session_id,
-        route_generation,
-        current_node_id: row.current_node_id.unwrap_or(current_node_id).to_string(),
-        backend: Some(DataPlaneBackendEndpoint {
-            node_id: current_node_id.to_string(),
-            endpoint: row.backend_endpoint.unwrap_or(backend_endpoint),
-            transport: Some(backend_transport),
-        }),
-        revocation: Some(revocation_state(
-            row.revocation_epoch,
-            &row.revocation_status,
-            row.revocation_updated_at,
-            row.revocation_reason,
-            row.org_revocation_epoch,
-        )?),
-        sandbox_id: row.sandbox_id.to_string(),
-        kind: row.kind,
-        target_port: row
-            .target_port
-            .and_then(|value| u16::try_from(value).ok())
-            .map(u32::from),
-        target_protocol: row.target_protocol,
-        target_path: row.target_path,
-        adapter_state_json: row.adapter_state_json,
-        backend_process_id: row.backend_process_id,
-        org_id: row.org_id.to_string(),
-        space_api_route_token,
-    })
 }
 
 pub(super) async fn bind_session_process(
@@ -445,6 +472,7 @@ pub(super) async fn record_session_reconnect(
 }
 
 pub(super) async fn unstable_resolve_sandbox_service_route(
+    budget: Duration,
     activation: Option<&dyn crate::ingress_activation::IngressActivation>,
     pool: &sqlx::PgPool,
     route_ed25519_authority: Option<&SpaceApiRouteEd25519Authority>,
@@ -457,35 +485,10 @@ pub(super) async fn unstable_resolve_sandbox_service_route(
     let port = sandbox_service_route_port(request.port)?;
     let route_kind = sandbox_service_route_kind(request.route_kind)?;
     let transport = sandbox_service_route_transport(request.transport, route_kind)?;
-    let mut row = fetch_sandbox_service_route_row(pool, sandbox_id).await?;
-    validate_unstable_sandbox_service_route_authorization(
-        pool,
-        &row,
-        route_kind,
-        ecw_credential_keyring,
-        &request,
-    )
-    .await?;
-
-    let _waiter = if transport == SandboxServiceRouteTransport::ServicePortIngress {
-        Some(
-            pplx_space_common_svc::ingress_admission::IngressPreparationPermit::acquire(Some(
-                sandbox_id,
-            ))?,
-        )
-    } else {
-        None
-    };
-    if transport == SandboxServiceRouteTransport::ServicePortIngress
-        && let Some(activation) = activation
-    {
-        activation
-            .prepare(
-                sandbox_id,
-                pplx_space_common_svc::ingress_admission::preparation_timeout(),
-            )
-            .await?;
-        row = fetch_sandbox_service_route_row(pool, sandbox_id).await?;
+    let deadline = tokio::time::Instant::now() + budget;
+    let mut activated = false;
+    loop {
+        let row = fetch_sandbox_service_route_row(pool, sandbox_id).await?;
         validate_unstable_sandbox_service_route_authorization(
             pool,
             &row,
@@ -494,112 +497,161 @@ pub(super) async fn unstable_resolve_sandbox_service_route(
             &request,
         )
         .await?;
-    }
 
-    let current_node_id = row.active_node_id.ok_or_else(|| {
-        sandbox_service_route_not_ready_status(
-            Code::FailedPrecondition,
-            "sandbox service route sandbox is not assigned to a node",
-        )
-    })?;
-    let backend_endpoint = resolve_sandbox_service_backend_endpoint(&row).ok_or_else(|| {
-        sandbox_service_route_not_ready_status(
-            Code::FailedPrecondition,
-            missing_backend_endpoint_message(
-                "sandbox service route",
-                row.active_node_id,
-                row.node_managed_by.as_ref().map(|value| value.as_str()),
-                row.k8s_node_name.as_deref(),
-            ),
-        )
-    })?;
-    let route_generation =
-        required_route_generation(row.execution_generation, "sandbox service route")?;
-    let (bridge_route_token, service_port_ingress_token) = match transport {
-        SandboxServiceRouteTransport::Direct => {
-            let bridge_route_token = space_api_route_token_for_sandbox_service_route(
-                &row,
-                current_node_id,
-                port,
-                SpaceApiRoutePurpose::SpaceApiBridge,
-                route_ed25519_authority,
-            )?;
-            ensure_sandbox_service_route_command_ready(
-                pool,
-                &row,
-                &backend_endpoint,
-                bridge_route_token.as_ref(),
+        let _waiter = if transport == SandboxServiceRouteTransport::ServicePortIngress {
+            Some(
+                pplx_space_common_svc::ingress_admission::IngressPreparationPermit::acquire(Some(
+                    sandbox_id,
+                ))?,
             )
-            .await?;
-            (bridge_route_token, None)
-        }
-        SandboxServiceRouteTransport::ServicePortIngress => {
-            let ingress_port = GuestPort::try_from_u16(
-                u16::try_from(port).map_err(|_| Status::invalid_argument("port is invalid"))?,
-            )
-            .map_err(|_| Status::invalid_argument("port is invalid"))?;
-            // Activation normally clears this marker. Keep the existing probe
-            // for deployments without an activation adapter or a pending result.
-            if row.command_ready_pending {
-                let readiness_route_token = space_api_route_token_for_sandbox_service_route(
-                    &row,
-                    current_node_id,
-                    port,
-                    SpaceApiRoutePurpose::SpaceApiBridge,
-                    route_ed25519_authority,
-                )?;
-                ensure_sandbox_service_route_command_ready(
-                    pool,
-                    &row,
-                    &backend_endpoint,
-                    readiness_route_token.as_ref(),
-                )
-                .await?;
+        } else {
+            None
+        };
+        let ingress = transport == SandboxServiceRouteTransport::ServicePortIngress;
+        let result = async {
+            if transport == SandboxServiceRouteTransport::ServicePortIngress {
+                require_started_ingress(row.lifecycle.parse().map_err(|error| {
+                    Status::internal(format!("invalid sandbox lifecycle: {error}"))
+                })?)?;
             }
-            ensure_sandbox_service_port_ingress_path(
-                pool,
-                SandboxServicePortRouteIdentity {
-                    sandbox_id: row.sandbox_id,
-                    active_node_id: current_node_id,
-                    route_generation,
-                    execution_generation: row.execution_generation,
-                    pod_uid: row.sandbox_pod_uid.clone(),
-                    substrate_kind: row.node_managed_by,
-                    activation_attempt_id: row.activation_attempt_id,
-                },
-                ingress_port,
-                &backend_endpoint,
-                route_ed25519_authority,
+            let current_node_id = row.active_node_id.ok_or_else(|| {
+                sandbox_service_route_not_ready_status(
+                    Code::FailedPrecondition,
+                    "sandbox service route sandbox is not assigned to a node",
+                )
+            })?;
+            let backend_endpoint =
+                resolve_sandbox_service_backend_endpoint(&row).ok_or_else(|| {
+                    sandbox_service_route_not_ready_status(
+                        Code::FailedPrecondition,
+                        missing_backend_endpoint_message(
+                            "sandbox service route",
+                            row.active_node_id,
+                            row.node_managed_by.as_ref().map(|value| value.as_str()),
+                            row.k8s_node_name.as_deref(),
+                        ),
+                    )
+                })?;
+            let route_generation =
+                required_route_generation(row.execution_generation, "sandbox service route")?;
+            let (bridge_route_token, service_port_ingress_token) = match transport {
+                SandboxServiceRouteTransport::Direct => {
+                    let bridge_route_token = space_api_route_token_for_sandbox_service_route(
+                        &row,
+                        current_node_id,
+                        port,
+                        SpaceApiRoutePurpose::SpaceApiBridge,
+                        route_ed25519_authority,
+                    )?;
+                    ensure_sandbox_service_route_command_ready(
+                        pool,
+                        &row,
+                        &backend_endpoint,
+                        bridge_route_token.as_ref(),
+                    )
+                    .await?;
+                    (bridge_route_token, None)
+                }
+                SandboxServiceRouteTransport::ServicePortIngress => {
+                    let ingress_port = GuestPort::try_from_u16(
+                        u16::try_from(port)
+                            .map_err(|_| Status::invalid_argument("port is invalid"))?,
+                    )
+                    .map_err(|_| Status::invalid_argument("port is invalid"))?;
+                    prepare_current_ingress_worker(
+                        deadline,
+                        activation.is_some() && !activated,
+                        async {
+                            // Activation normally clears this marker. Keep the existing probe
+                            // for deployments without an activation adapter or a pending result.
+                            if row.command_ready_pending {
+                                let readiness_route_token =
+                                    space_api_route_token_for_sandbox_service_route(
+                                        &row,
+                                        current_node_id,
+                                        port,
+                                        SpaceApiRoutePurpose::SpaceApiBridge,
+                                        route_ed25519_authority,
+                                    )?;
+                                ensure_sandbox_service_route_command_ready(
+                                    pool,
+                                    &row,
+                                    &backend_endpoint,
+                                    readiness_route_token.as_ref(),
+                                )
+                                .await?;
+                            }
+                            ensure_sandbox_service_port_ingress_path(
+                                pool,
+                                SandboxServicePortRouteIdentity {
+                                    sandbox_id: row.sandbox_id,
+                                    active_node_id: current_node_id,
+                                    route_generation,
+                                    execution_generation: row.execution_generation,
+                                    pod_uid: row.sandbox_pod_uid.clone(),
+                                    substrate_kind: row.node_managed_by,
+                                    activation_attempt_id: row.activation_attempt_id,
+                                },
+                                ingress_port,
+                                &backend_endpoint,
+                                route_ed25519_authority,
+                            )
+                            .await?;
+                            Ok(())
+                        },
+                    )
+                    .await?;
+                    let service_port_ingress_token =
+                        space_api_route_token_for_sandbox_service_route(
+                            &row,
+                            current_node_id,
+                            port,
+                            SpaceApiRoutePurpose::ServicePortIngress,
+                            route_ed25519_authority,
+                        )?;
+                    (None, service_port_ingress_token)
+                }
+                SandboxServiceRouteTransport::Unspecified => {
+                    unreachable!("transport is normalized")
+                }
+            };
+
+            Ok(UnstableResolveSandboxServiceRouteResponse {
+                sandbox_id: row.sandbox_id.to_string(),
+                org_id: row.org_id.to_string(),
+                port,
+                lifecycle: row.lifecycle,
+                route_generation: route_generation.get(),
+                current_node_id: current_node_id.to_string(),
+                backend: Some(DataPlaneBackendEndpoint {
+                    node_id: current_node_id.to_string(),
+                    endpoint: backend_endpoint,
+                    transport: Some(BACKEND_TRANSPORT_GRPC.to_string()),
+                }),
+                template_id: row.template_id,
+                space_api_route_token: bridge_route_token,
+                service_port_ingress_token,
+            })
+        }
+        .await;
+        let error = match result {
+            Ok(response) => return Ok(response),
+            Err(error) => error,
+        };
+        let Some(owner) =
+            activation.filter(|_| !activated && activation_may_repair(ingress, &error))
+        else {
+            return Err(error);
+        };
+        owner
+            .prepare(
+                sandbox_id,
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
             )
             .await?;
-            let service_port_ingress_token = space_api_route_token_for_sandbox_service_route(
-                &row,
-                current_node_id,
-                port,
-                SpaceApiRoutePurpose::ServicePortIngress,
-                route_ed25519_authority,
-            )?;
-            (None, service_port_ingress_token)
-        }
-        SandboxServiceRouteTransport::Unspecified => unreachable!("transport is normalized"),
-    };
-
-    Ok(UnstableResolveSandboxServiceRouteResponse {
-        sandbox_id: row.sandbox_id.to_string(),
-        org_id: row.org_id.to_string(),
-        port,
-        lifecycle: row.lifecycle,
-        route_generation: route_generation.get(),
-        current_node_id: current_node_id.to_string(),
-        backend: Some(DataPlaneBackendEndpoint {
-            node_id: current_node_id.to_string(),
-            endpoint: backend_endpoint,
-            transport: Some(BACKEND_TRANSPORT_GRPC.to_string()),
-        }),
-        template_id: row.template_id,
-        space_api_route_token: bridge_route_token,
-        service_port_ingress_token,
-    })
+        activated = true;
+        // Re-read identity and authorization after activation; never replay bytes.
+    }
 }
 
 pub(super) async fn reset_sandbox_service_route(
@@ -800,6 +852,7 @@ async fn fetch_route_row(
                 d.scopes,
                 d.token_hash,
                 d.token_expires_at,
+                s.lifecycle AS sandbox_lifecycle,
                 COALESCE(direct_route.current_node_id, s.active_node_id)
                     AS sandbox_active_node_id,
                 HOST(n.address) AS node_address,
@@ -891,6 +944,7 @@ async fn update_route_row(
                    d.scopes,
                    d.token_hash,
                    d.token_expires_at,
+                   s.lifecycle AS sandbox_lifecycle,
                    COALESCE(direct_route.current_node_id, s.active_node_id)
                        AS sandbox_active_node_id,
                    HOST(n.address) AS node_address,
@@ -1592,19 +1646,11 @@ async fn api_key_belongs_to_org(
         return Ok(false);
     };
 
-    sqlx::query_scalar::<_, bool>(sql!(
-        "SELECT EXISTS (
-             SELECT 1
-             FROM api_keys
-             WHERE org_id = $1
-               AND key_hash = $2
-         )"
-    ))
-    .bind(org_id.as_uuid())
-    .bind(api_key_sha256)
-    .fetch_one(pool)
-    .await
-    .map_err(|error| Status::internal(format!("validate sandbox service route api key: {error}")))
+    crate::api_key_store::authorizes_ecw_sandbox(pool, api_key_sha256, org_id)
+        .await
+        .map_err(|error| {
+            Status::internal(format!("validate sandbox service route api key: {error}"))
+        })
 }
 
 fn token_matches_ecw_credential(
@@ -1809,3 +1855,41 @@ fn optional(value: Option<&str>) -> Option<String> {
 
 #[cfg(test)]
 mod tests;
+
+fn activation_may_repair(ingress: bool, error: &Status) -> bool {
+    ingress
+        && matches!(
+            error.code(),
+            Code::Unavailable | Code::FailedPrecondition | Code::NotFound | Code::Aborted
+        )
+}
+
+fn require_started_ingress(lifecycle: SandboxLifecycle) -> Result<(), Status> {
+    if lifecycle == SandboxLifecycle::Started {
+        Ok(())
+    } else {
+        Err(sandbox_service_route_not_ready_status(
+            Code::FailedPrecondition,
+            "sandbox execution is not started",
+        ))
+    }
+}
+
+/// Preparing the existing path is idempotent and sends no application bytes.
+/// Reserve at least three quarters of the remaining budget for activation and
+/// attachment when the current worker stalls, with a one-second probe ceiling.
+async fn prepare_current_ingress_worker(
+    deadline: tokio::time::Instant,
+    can_activate: bool,
+    prepare: impl std::future::Future<Output = Result<(), Status>>,
+) -> Result<(), Status> {
+    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    let budget = if can_activate {
+        (remaining / 4).min(Duration::from_secs(1))
+    } else {
+        remaining
+    };
+    tokio::time::timeout(budget, prepare)
+        .await
+        .map_err(|_| Status::unavailable("current ingress worker preparation timed out"))?
+}

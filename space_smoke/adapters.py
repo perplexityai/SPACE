@@ -3417,8 +3417,11 @@ ON CONFLICT (key_hash) DO NOTHING;
         )
         return result.returncode == 0 and _template_alias(alias) in result.stdout
 
-    def prepared_rootfs_handoff(self, pod_name: str) -> str | None:
-        result = self._node_stack_exec(pod_name, _PREPARED_ROOTFS_HANDOFF_SCRIPT, timeout=120)
+    def prepared_rootfs_handoff(self, pod_name: str, *, window_seconds: int = 60) -> str | None:
+        if window_seconds <= 0:
+            raise ValueError(f"refusing handoff window {window_seconds!r}")
+        script = _PREPARED_ROOTFS_HANDOFF_SCRIPT.replace("__WINDOW_SECONDS__", str(int(window_seconds)))
+        result = self._node_stack_exec(pod_name, script, timeout=window_seconds + 60)
         return None if result.returncode == 0 else (result.detail() or f"exit {result.returncode}")
 
     def published_guest_metadata(self, pod_name: str, alias: str) -> GuestMetadata:
@@ -4515,9 +4518,10 @@ def _endpoint_target_pods(endpoints_json: str) -> list[str]:
 
 # The shell suite's handoff check: the accepting builder committed a prepared
 # rootfs (marker present, in-progress marker gone, a btrfs subvolume, the
-# rootfs sized to the marker's MiB) for a sandbox row owned by builder@local.
+# rootfs sized to the marker's MiB) for a sandbox row owned by builder@local,
+# within __WINDOW_SECONDS__.
 _PREPARED_ROOTFS_HANDOFF_SCRIPT = r"""set -eu
-deadline=$(( $(date +%s) + 60 ))
+deadline=$(( $(date +%s) + __WINDOW_SECONDS__ ))
 while [ "$(date +%s)" -le "$deadline" ]; do
   sandboxes="$(/space/bin/space-sbxmgr list)"
   for marker in /space/cache/firecracker/sandboxes/*/instance/.space-prepared-rootfs-ready; do

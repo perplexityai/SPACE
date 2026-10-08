@@ -39,6 +39,92 @@ pub(crate) fn claim_single_connection(
     Ok(())
 }
 
+/// Reports whether the one connection behind an authenticated channel closed.
+///
+/// That channel cannot reconnect, so every RPC dispatched after the close
+/// fails. Replace the channel, re-attesting the peer, instead of using it.
+#[derive(Clone, Debug)]
+pub struct PinnedConnection(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl PinnedConnection {
+    pub(crate) fn new() -> Self {
+        Self(std::sync::Arc::default())
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+/// The transport side of a [`PinnedConnection`]. HTTP/2 drops its transport
+/// when the connection ends for any reason: EOF, I/O error, or GOAWAY.
+pub(crate) struct PinnedIo<S> {
+    stream: S,
+    closed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl<S> PinnedIo<S> {
+    pub(crate) fn new(stream: S, connection: &PinnedConnection) -> Self {
+        Self {
+            stream,
+            closed: connection.0.clone(),
+        }
+    }
+}
+
+impl<S> Drop for PinnedIo<S> {
+    fn drop(&mut self) {
+        self.closed
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+impl<S: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for PinnedIo<S> {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().stream).poll_read(cx, buf)
+    }
+}
+
+impl<S: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for PinnedIo<S> {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.get_mut().stream).poll_write(cx, buf)
+    }
+
+    fn poll_write_vectored(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.get_mut().stream).poll_write_vectored(cx, bufs)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.stream.is_write_vectored()
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().stream).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().stream).poll_shutdown(cx)
+    }
+}
+
 pub(crate) fn validate_expected_uds_peer(
     stream: &tokio::net::UnixStream,
     expected_peer: ExpectedUdsPeer,

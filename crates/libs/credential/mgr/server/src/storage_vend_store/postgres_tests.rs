@@ -87,6 +87,80 @@ async fn reads_sandbox_template_and_per_org_vend_authority() -> TestDbResult<()>
 }
 
 #[tokio::test]
+async fn template_release_is_published_once_a_storage_location_is_registered() -> TestDbResult<()> {
+    let db = pg_test_db().await?;
+    let template = TemplateName::parse("storage-vend-release")?;
+    let hash: ContentHash = format!("sha256:{}", "ab".repeat(32)).parse()?;
+    let unregistered: ContentHash = format!("sha256:{}", "cd".repeat(32)).parse()?;
+    sqlx::query(sql!(
+        "INSERT INTO templates (id, name, org_id) VALUES ($1, $2, $3)"
+    ))
+    .bind(Uuid::now_v7())
+    .bind(template.as_str())
+    .bind(SEED_ORG_ID)
+    .execute(&db.pool)
+    .await?;
+    let release_id = Uuid::now_v7();
+    sqlx::query(sql!(
+        "INSERT INTO template_releases (id, template_name, type, hash, org_id)
+         VALUES ($1, $2, 'fc', $3, $4)"
+    ))
+    .bind(release_id)
+    .bind(template.as_str())
+    .bind(hash.to_string())
+    .bind(SEED_ORG_ID)
+    .execute(&db.pool)
+    .await?;
+    let store = PgStorageVendStore::new(db.pool.clone());
+
+    // A release row without artifacts has not been published yet.
+    assert!(!store.template_release_published(&template, &hash).await?);
+
+    sqlx::query(sql!(
+        "INSERT INTO template_release_storage_locations
+             (template_release_id, storage_connection_string, org_id)
+         VALUES ($1, 's3://artifacts/templates/storage-vend-release/x?region=us-east-1', $2)"
+    ))
+    .bind(release_id)
+    .bind(SEED_ORG_ID)
+    .execute(&db.pool)
+    .await?;
+    assert!(store.template_release_published(&template, &hash).await?);
+    assert!(
+        !store
+            .template_release_published(&template, &unregistered)
+            .await?
+    );
+
+    // A release registered before the `sha256:` prefix was required is stored
+    // bare, and is just as published.
+    let bare_hex = "ef".repeat(32);
+    let bare_release_id = Uuid::now_v7();
+    sqlx::query(sql!(
+        "INSERT INTO template_releases (id, template_name, type, hash, org_id)
+         VALUES ($1, $2, 'fc', $3, $4)"
+    ))
+    .bind(bare_release_id)
+    .bind(template.as_str())
+    .bind(&bare_hex)
+    .bind(SEED_ORG_ID)
+    .execute(&db.pool)
+    .await?;
+    sqlx::query(sql!(
+        "INSERT INTO template_release_storage_locations
+             (template_release_id, storage_connection_string, org_id)
+         VALUES ($1, 's3://artifacts/templates/storage-vend-release/y?region=us-east-1', $2)"
+    ))
+    .bind(bare_release_id)
+    .bind(SEED_ORG_ID)
+    .execute(&db.pool)
+    .await?;
+    let legacy: ContentHash = format!("sha256:{bare_hex}").parse()?;
+    assert!(store.template_release_published(&template, &legacy).await?);
+    Ok(())
+}
+
+#[tokio::test]
 async fn reads_unplaced_node_history_and_the_recorded_snapshot_uri() -> TestDbResult<()> {
     let db = pg_test_db().await?;
     let execution_node_id = NodeId::new();

@@ -191,6 +191,115 @@ async fn a_full_sandbox_disk_is_not_a_retryable_rate_limit() {
     }
 }
 
+/// A refusal the guest made before starting anything reaches the caller as a
+/// retryable 429 or 503 with the guest's hint as `Retry-After` and its own
+/// message, not tonic's rendering; a sandbox that does not answer in time is
+/// a retryable 503, not a 500.
+#[tokio::test]
+async fn guest_refusals_and_timeouts_are_retryable_with_their_hint() {
+    use axum::response::IntoResponse;
+    use http_body_util::BodyExt;
+    use pplx_space_public_api::{PublicErrorCode, PublicErrorEnvelope};
+
+    async fn envelope(status: tonic::Status) -> (StatusCode, Option<String>, PublicErrorEnvelope) {
+        let response = controller_error(ControllerError::from(status)).into_response();
+        let code = response.status();
+        let retry_after = response
+            .headers()
+            .get(axum::http::header::RETRY_AFTER)
+            .map(|value| value.to_str().unwrap().to_owned());
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        (code, retry_after, serde_json::from_slice(&body).unwrap())
+    }
+
+    for (code, expected_status, expected_code) in [
+        (
+            tonic::Code::ResourceExhausted,
+            StatusCode::TOO_MANY_REQUESTS,
+            PublicErrorCode::RateLimited,
+        ),
+        (
+            tonic::Code::Unavailable,
+            StatusCode::SERVICE_UNAVAILABLE,
+            PublicErrorCode::ServiceUnavailable,
+        ),
+    ] {
+        let refused = pplx_space_common_grpc::refused_before_start(
+            tonic::Status::new(code, "too many concurrent filesystem file operations"),
+            std::time::Duration::from_millis(1500),
+        );
+        let (status, retry_after, envelope) = envelope(refused).await;
+        assert_eq!(status, expected_status, "{code:?}");
+        assert_eq!(retry_after.as_deref(), Some("2"), "{code:?}");
+        assert_eq!(envelope.code, expected_code, "{code:?}");
+        assert!(envelope.retryable, "{code:?}");
+        assert_eq!(
+            envelope.message,
+            "too many concurrent filesystem file operations"
+        );
+    }
+
+    let (status, _, timeout) = envelope(tonic::Status::deadline_exceeded(
+        "request deadline exceeded",
+    ))
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(timeout.code, PublicErrorCode::ServiceUnavailable);
+    assert!(timeout.retryable);
+}
+
+/// mkdir, remove and file-change tracking require an `Idempotency-Key` that
+/// the sandbox never sees, so a failure that may have applied the change is
+/// not retryable there; a refusal made before anything started still is.
+#[tokio::test]
+async fn unprotected_mutations_do_not_invite_a_blind_retry() {
+    use axum::response::IntoResponse;
+    use http_body_util::BodyExt;
+    use pplx_space_public_api::PublicErrorEnvelope;
+
+    async fn retry(status: tonic::Status) -> (bool, bool) {
+        let response = unprotected_mutation_error(ControllerError::from(status)).into_response();
+        let has_retry_after = response
+            .headers()
+            .contains_key(axum::http::header::RETRY_AFTER);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let envelope: PublicErrorEnvelope = serde_json::from_slice(&body).unwrap();
+        (envelope.retryable, has_retry_after)
+    }
+    let refused = |code| {
+        pplx_space_common_grpc::refused_before_start(
+            tonic::Status::new(code, "synthetic refusal"),
+            std::time::Duration::from_secs(1),
+        )
+    };
+
+    // The change may have been applied: no retry. A retry hint without the
+    // refusal marker is not evidence that nothing happened.
+    for ambiguous in [
+        tonic::Status::deadline_exceeded("request deadline exceeded"),
+        tonic::Status::unavailable("transport closed"),
+        tonic::Status::internal("guest failed"),
+        pplx_space_common_grpc::with_retry_after(
+            tonic::Status::unavailable("hinted but unmarked"),
+            std::time::Duration::from_secs(1),
+        ),
+    ] {
+        let code = ambiguous.code();
+        assert_eq!(retry(ambiguous).await, (false, false), "{code:?}");
+    }
+    // This request did nothing: retry after the hint.
+    assert_eq!(
+        retry(refused(tonic::Code::ResourceExhausted)).await,
+        (true, true)
+    );
+    assert_eq!(retry(refused(tonic::Code::Unavailable)).await, (true, true));
+    // Mapped as before otherwise.
+    assert_eq!(
+        retry(tonic::Status::not_found("no such file")).await,
+        (false, false)
+    );
+}
+
 /// `files:write` accepts a body carrying its largest documented payload,
 /// which the framework's 2 MiB default rejected with 413 above about 1.5 MiB.
 #[tokio::test]

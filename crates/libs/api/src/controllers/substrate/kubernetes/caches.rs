@@ -4,18 +4,18 @@
 
 use std::time::Duration;
 
-use futures_util::StreamExt;
 use k8s_openapi::api::core::v1::{Node, Pod};
 use kube::{
     Api, Client,
     runtime::{
-        WatchStreamExt,
         reflector::{self, Store},
         watcher,
     },
 };
 use pplx_space_common_core::types::NodeRole as SpaceNodeRole;
+use pplx_space_common_svc::kube_client::spawn_reflector;
 use tokio::time::timeout;
+use tokio_util::sync::CancellationToken;
 
 const NODE_API_COMPONENT_LABEL: &str = "app.kubernetes.io/component=node-api";
 const STORE_READY_TIMEOUT: Duration = Duration::from_secs(30);
@@ -42,12 +42,24 @@ impl K8sCaches {
         let pod_api: Api<Pod> = Api::namespaced(client.clone(), node_api_namespace);
         let pod_config = watcher::Config::default().labels(NODE_API_COMPONENT_LABEL);
         let (pod_store, pod_writer) = reflector::store::<Pod>();
-        spawn_reflector("node-api pods", pod_writer, pod_api, pod_config);
+        spawn_reflector(
+            "node-api pods",
+            pod_writer,
+            pod_api,
+            pod_config,
+            CancellationToken::new(),
+        );
 
         let node_api: Api<Node> = Api::all(client);
         let node_config = watcher::Config::default();
         let (node_store, node_writer) = reflector::store::<Node>();
-        spawn_reflector("nodes", node_writer, node_api, node_config);
+        spawn_reflector(
+            "nodes",
+            node_writer,
+            node_api,
+            node_config,
+            CancellationToken::new(),
+        );
 
         // Mark the node cache ready once its initial LIST populates the store.
         // Independent of the best-effort startup `wait_until_ready` gate below:
@@ -166,33 +178,6 @@ pub enum CacheReadyError {
     WriterDropped,
     #[error("timed out waiting for reflector first list")]
     Timeout,
-}
-
-fn spawn_reflector<K>(
-    label: &'static str,
-    writer: reflector::store::Writer<K>,
-    api: Api<K>,
-    config: watcher::Config,
-) where
-    K: kube::Resource
-        + Clone
-        + serde::de::DeserializeOwned
-        + std::fmt::Debug
-        + Send
-        + Sync
-        + 'static,
-    K::DynamicType: Default + Eq + std::hash::Hash + Clone,
-{
-    let stream = reflector::reflector(writer, watcher::watcher(api, config)).default_backoff();
-    tokio::spawn(async move {
-        futures_util::pin_mut!(stream);
-        while let Some(event) = stream.next().await {
-            if let Err(err) = event {
-                tracing::warn!(reflector = label, error = %err, "watcher error");
-            }
-        }
-        tracing::warn!(reflector = label, "watcher stream ended");
-    });
 }
 
 /// Read the pod IP from a Pod's status, if assigned.

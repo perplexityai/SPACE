@@ -213,6 +213,27 @@ pub fn with_retry_after(mut status: Status, try_again: Duration) -> Status {
     status
 }
 
+/// Mark `status` as a request refused before any of its work started (see
+/// [`pplx_space_common_core::spaced::REQUEST_REFUSED`]), with a retry hint.
+/// Hops relay it unchanged and do not retry it; the public surfaces answer it
+/// as retryable, with `Retry-After`.
+pub fn refused_before_start(mut status: Status, try_again: Duration) -> Status {
+    status.metadata_mut().insert(
+        pplx_space_common_core::spaced::ERROR_REASON_METADATA_KEY,
+        MetadataValue::from_static(pplx_space_common_core::spaced::REQUEST_REFUSED),
+    );
+    with_retry_after(status, try_again)
+}
+
+/// Whether `status` was marked by [`refused_before_start`].
+pub fn is_refused_before_start(status: &Status) -> bool {
+    status
+        .metadata()
+        .get(pplx_space_common_core::spaced::ERROR_REASON_METADATA_KEY)
+        .and_then(|value| value.to_str().ok())
+        == Some(pplx_space_common_core::spaced::REQUEST_REFUSED)
+}
+
 /// The retry hint carried by [`RETRY_AFTER_MS_METADATA`], if the server set
 /// one (see [`with_retry_after`]). Metadata only: the message-text fallback
 /// exists solely for the rate-limit status.
@@ -266,14 +287,22 @@ impl UdsPerSandboxLimitExceeded {
     }
 }
 
+/// The node API refuses the call before it reaches the guest, so it is also a
+/// [`refused_before_start`] refusal.
 pub fn uds_per_sandbox_limit_exceeded_status(message: impl Into<String>) -> Status {
-    let mut status = Status::resource_exhausted(message.into());
+    let mut status = refused_before_start(
+        Status::resource_exhausted(message.into()),
+        UDS_PER_SANDBOX_RETRY_AFTER,
+    );
     status.metadata_mut().insert(
         NODE_API_ERROR_METADATA,
         MetadataValue::from_static(UDS_PER_SANDBOX_LIMIT_EXCEEDED),
     );
     status
 }
+
+// A slot frees when one of the sandbox's other calls ends.
+const UDS_PER_SANDBOX_RETRY_AFTER: Duration = Duration::from_secs(1);
 
 /// Tag `status` as a terminal sandbox desired-state apply precondition (see
 /// [`DESIRED_STATE_APPLY_TERMINAL_METADATA`]). The caller passes the

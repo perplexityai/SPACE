@@ -5,7 +5,7 @@ use pplx_space_common_core::types::SnapshotId;
 use std::str::FromStr;
 
 use pplx_space_common_svc::core::types::{
-    K8sNodeName, K8sNodeUid, OrgId, SandboxId, StorageUri, TemplateName,
+    ContentHash, K8sNodeName, K8sNodeUid, OrgId, SandboxId, StorageUri, TemplateName,
 };
 use pplx_space_common_svc::sql;
 
@@ -87,6 +87,14 @@ pub trait StorageVendStore: Send + Sync + 'static {
         &self,
         template: &TemplateName,
     ) -> Result<Option<Option<OrgId>>, StorageVendStoreError>;
+
+    /// True once a storage location is registered for the release
+    /// `templates/<template>/<hash>`. A published release is immutable.
+    async fn template_release_published(
+        &self,
+        template: &TemplateName,
+        hash: &ContentHash,
+    ) -> Result<bool, StorageVendStoreError>;
 
     async fn org_vend_identity(
         &self,
@@ -242,6 +250,36 @@ impl StorageVendStore for PgStorageVendStore {
                 .fetch_optional(&self.pool)
                 .await?;
         Ok(owner.map(|organization_id| organization_id.map(OrgId::from_uuid)))
+    }
+
+    async fn template_release_published(
+        &self,
+        template: &TemplateName,
+        hash: &ContentHash,
+    ) -> Result<bool, StorageVendStoreError> {
+        // `template_releases.hash` holds the canonical `sha256:<hex>` form
+        // and, for releases registered before the prefix was required, the
+        // bare hex. A published release must be found under either spelling.
+        let canonical = hash.to_string();
+        let bare = canonical
+            .strip_prefix("sha256:")
+            .unwrap_or(&canonical)
+            .to_string();
+        let published: bool = sqlx::query_scalar(sql!(
+            "SELECT EXISTS (
+                 SELECT 1
+                 FROM template_release_storage_locations location
+                 JOIN template_releases release
+                   ON release.id = location.template_release_id
+                 WHERE release.template_name = $1
+                   AND release.hash IN ($2, $3))"
+        ))
+        .bind(template.as_str())
+        .bind(canonical)
+        .bind(bare)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(published)
     }
 
     async fn org_vend_identity(

@@ -354,10 +354,24 @@ fn namespace_source_guard_validator_rejects_ineffective_rules() {
     let guest_ip = "169.254.0.21";
     let source_guard = rule_with_exprs(guest_source_guard_exprs(guest_ip));
     let established_bypass = rule_with_exprs(established_bypass_exprs());
+    let (valid, packaged) = udp443_validation_fixture();
+    let udp443 = valid["nftables"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find_map(|entry| {
+            (entry["rule"]["comment"] == UDP443_COMMENT).then(|| entry["rule"].clone())
+        })
+        .unwrap();
 
-    validate_guest_source_guard_chain(
-        &chain_with_rules(vec![source_guard.clone(), established_bypass.clone()]),
+    validate_pre_tproxy_guardrails_chain(
+        &chain_with_rules(vec![
+            source_guard.clone(),
+            established_bypass.clone(),
+            udp443,
+        ]),
         guest_ip,
+        &packaged,
     )
     .unwrap();
 
@@ -384,7 +398,7 @@ fn namespace_source_guard_validator_rejects_ineffective_rules() {
 
     for (case, chain, expected) in cases {
         assert_eq!(
-            validate_guest_source_guard_chain(&chain, guest_ip)
+            validate_pre_tproxy_guardrails_chain(&chain, guest_ip, &packaged)
                 .unwrap_err()
                 .to_string(),
             expected,
@@ -405,7 +419,8 @@ fn namespace_source_guard_validator_accepts_live_nft_chain_output() {
     ))
     .expect("captured nft chain fixture must parse");
 
-    validate_guest_source_guard_chain(&chain, "169.254.0.21")
+    let (_, packaged) = udp443_validation_fixture();
+    validate_pre_tproxy_guardrails_chain(&chain, "169.254.0.21", &packaged)
         .expect("validator must accept the chain shape real nft lists back");
 }
 
@@ -549,18 +564,32 @@ fn inbound_reply_disable_removes_live_rule() {
 
 #[test]
 fn guest_udp443_counter_parses_packets_and_action() {
-    for action in [GuestUdp443Action::Observe, GuestUdp443Action::Reject] {
-        let mut expr = vec![serde_json::json!({"counter": {"packets": 42, "bytes": 1200}})];
-        if action == GuestUdp443Action::Reject {
-            expr.push(serde_json::json!({"reject": {"type": "icmp", "expr": "port-unreachable"}}));
+    let mut chain: serde_json::Value = serde_json::from_str(include_str!(
+        "../fixtures/live_pre_tproxy_guardrails_chain.json"
+    ))
+    .unwrap();
+    assert_eq!(
+        udp443_counter(Some(&chain)),
+        Some((0, GuestUdp443Action::Reject))
+    );
+    // Preserve the real readback shape while exercising observation and a nonzero count.
+    for entry in chain["nftables"].as_array_mut().unwrap() {
+        if entry["rule"]["comment"] == "platform-egress-pre-tproxy-guardrail-quic-udp443" {
+            entry["rule"]["expr"]
+                .as_array_mut()
+                .unwrap()
+                .retain(|expr| expr.get("reject").is_none());
+            for expr in entry["rule"]["expr"].as_array_mut().unwrap() {
+                if expr.get("counter").is_some() {
+                    expr["counter"]["packets"] = serde_json::json!(42);
+                }
+            }
         }
-        let chain = serde_json::json!({"nftables": [
-            {"metainfo": {"json_schema_version": 1}},
-            {"rule": {"comment": "other", "expr": [{"counter": {"packets": 999}}]}},
-            {"rule": {"comment": "platform-egress-pre-tproxy-guardrail-quic-udp443", "expr": expr}}
-        ]});
-        assert_eq!(udp443_counter(Some(&chain)), Some((42, action)));
     }
+    assert_eq!(
+        udp443_counter(Some(&chain)),
+        Some((42, GuestUdp443Action::Observe))
+    );
     assert_eq!(udp443_counter(None), None);
 }
 
@@ -774,7 +803,7 @@ fn udp443_guardrail_accepts_live_counters_and_equivalent_ct_state() {
             expr["counter"] = serde_json::json!({"packets": 7, "bytes": 280});
         }
     }
-    validate_udp443_guardrail(&chain, &packaged).unwrap();
+    validate_pre_tproxy_guardrails_chain(&chain, "169.254.0.21", &packaged).unwrap();
 
     for state in [
         serde_json::json!("new"),
@@ -791,7 +820,7 @@ fn udp443_guardrail_accepts_live_counters_and_equivalent_ct_state() {
                 }
             }
         }
-        validate_udp443_guardrail(&equivalent, &packaged).unwrap();
+        validate_pre_tproxy_guardrails_chain(&equivalent, "169.254.0.21", &packaged).unwrap();
     }
 }
 
@@ -817,7 +846,7 @@ fn udp443_guardrail_rejects_extra_verdict_duplicate_and_missing_rule() {
         }
         assert!(
             matches!(
-                validate_udp443_guardrail(&stale, &packaged),
+                validate_pre_tproxy_guardrails_chain(&stale, "169.254.0.21", &packaged),
                 Err(FirewallValidationError::Missing(_))
             ),
             "{defect}"
@@ -853,4 +882,37 @@ fn malformed_packaged_policy_is_a_typed_host_fault_that_keeps_its_source() {
             .contains("sandbox-pre-tproxy-guardrails.json"),
         "the message must name the file an operator has to fix: {error}"
     );
+}
+
+#[test]
+fn udp443_guardrail_requires_source_validation_and_packaged_policy() {
+    let (chain, packaged) = udp443_validation_fixture();
+    validate_pre_tproxy_guardrails_chain(&chain, "169.254.0.21", &packaged).unwrap();
+    for defect in ["observe-only", "before source", "before return"] {
+        let mut stale = chain.clone();
+        let entries = stale["nftables"].as_array_mut().unwrap();
+        let index = entries
+            .iter()
+            .position(|entry| entry["rule"]["comment"] == UDP443_COMMENT)
+            .unwrap();
+        let mut rule = entries.remove(index);
+        match defect {
+            "observe-only" => {
+                rule["rule"]["expr"]
+                    .as_array_mut()
+                    .unwrap()
+                    .retain(|expr| expr.get("reject").is_none());
+                entries.insert(index, rule);
+            }
+            "before source" => entries.insert(0, rule),
+            "before return" => entries.insert(index - 1, rule),
+            _ => {}
+        }
+        let result = validate_pre_tproxy_guardrails_chain(&stale, "169.254.0.21", &packaged);
+        assert_eq!(
+            result.is_ok(),
+            defect == "before return",
+            "{defect}: {result:?}"
+        );
+    }
 }

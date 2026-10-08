@@ -1,3 +1,4 @@
+pub mod activation;
 pub mod cluster;
 
 pub mod proto {

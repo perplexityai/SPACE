@@ -111,10 +111,9 @@ Reference semantics:
 ## Local validation: 2026-09-23
 
 Historical dashboard validation (before the independent chart split):
-configuration was added on top of source
-`b35f68fdc1c1864da3e0710651502be06468df21`, in the `codex/kind-oss-logs`
-worktree. The verified target was Docker Kind `space-local`, context
-`kind-space-local`, loopback API `https://127.0.0.1:37403`. Existing image pins
+configuration was added on top of a local logs-branch checkout. The verified
+target was Docker Kind `space-local`, context `kind-space-local`, loopback API
+`https://127.0.0.1:37403`. Existing image pins
 were retained: Grafana 13.2.2, Prometheus 3.14.0, Collector Contrib 0.161.0,
 Alloy 1.19.2 and Loki 3.7.8. No application image was rebuilt or redeployed.
 Grafana's immutable image digest remains in `values.yaml`.

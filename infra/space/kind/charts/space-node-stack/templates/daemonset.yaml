@@ -8,6 +8,9 @@
 {{- if and .Values.builder.enabled (le (int .Values.terminationGracePeriodSeconds) (int .Values.builder.drainTimeoutSeconds)) -}}
 {{- fail "builder drain timeout must be less than termination grace period" -}}
 {{- end -}}
+{{- if and .Values.builder.enabled (not .Values.cache.persistImage) -}}
+{{- fail "builder.enabled requires cache.persistImage: the builder's mount-cache init container mounts the node-bound cache image on the kind node" -}}
+{{- end -}}
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
@@ -118,6 +121,31 @@ spec:
           volumeMounts:
             - name: cache-image
               mountPath: /var/lib/space-cache.img
+        {{- if .Values.builder.enabled }}
+        # A production builder's host has its btrfs /space/cache before any
+        # SPACE service starts (infra/space/packer). This init container plays
+        # the host's part: it mounts the node-bound image on the kind node's
+        # /space/cache, once per node (a later pod finds it mounted and reuses
+        # it). The node-stack container below then receives the cache
+        # HostToContainer, so the mounts its services make under it (OCI rootfs
+        # bind mounts, scratch-build chroot mounts, build-VM jails) stay inside
+        # the pod instead of propagating into the node's namespace.
+        - name: mount-cache
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["--mount-cache"]
+          securityContext:
+            privileged: true
+          env:
+            - name: SPACE_CACHE_SIZE_MB
+              value: {{ .Values.cache.sizeMb | quote }}
+          volumeMounts:
+            - name: cache-image
+              mountPath: /var/lib/space-cache.img
+            - name: cache
+              mountPath: /space/cache
+              mountPropagation: Bidirectional
+        {{- end }}
       {{- end }}
       containers:
         - name: node-stack
@@ -339,6 +367,12 @@ spec:
                   key: AWS_SESSION_TOKEN
                   optional: true
             {{- end }}
+            - name: SPACE_CREDMGR_SECRETS_MANAGER_ROLE_ARN
+              valueFrom:
+                secretKeyRef:
+                  name: space-aws-creds
+                  key: SPACE_CREDMGR_SECRETS_MANAGER_ROLE_ARN
+                  optional: true
             {{- if .Values.directSubstrate.enabled }}
             # Legacy DirectSubstrate bench (space-local-3486 / Tilt MINIMAL):
             # the api-server schedules off nodes/node_direct rows and there is
@@ -446,8 +480,9 @@ spec:
             # Snapshot upload destination read by sandbox-manager's
             # SnapshotUploadConfig::from_env (the suspend artifact-backup path).
             # Without these, suspend keeps snapshots local-only and never pushes
-            # to the object store. Static creds are the SPACE_OBJECT_STORE_STATIC_* pair
-            # above.
+            # to the object store. Volume-manager performs the transfer with the
+            # SPACE_OBJECT_STORE_STATIC_* pair above; the entrypoint passes that
+            # pair only to volume-manager and build-manager.
             - name: SPACE_SNAPSHOT_BUCKET
               value: {{ .Values.s3.bucket | quote }}
             - name: SPACE_SNAPSHOT_REGION
@@ -523,8 +558,10 @@ spec:
             - name: cache
               mountPath: /space/cache
               {{- if .Values.builder.enabled }}
-              # Scratch builds run in the node's containerd mount namespace.
-              mountPropagation: Bidirectional
+              # The node's btrfs cache, mounted by the mount-cache init
+              # container. HostToContainer receives it without sending the
+              # mounts this pod makes under it back to the node.
+              mountPropagation: HostToContainer
               {{- end }}
             {{- if .Values.cache.persistImage }}
             - name: cache-image
@@ -614,7 +651,9 @@ spec:
         # The entrypoint mounts a loopback btrfs image over it.
         - name: cache
           {{- if .Values.builder.enabled }}
-          # Containerd must resolve the builder's input/output paths on the node.
+          # The builder's cache is the kind node's /space/cache, as a
+          # production builder's is its host's (see the mount-cache init
+          # container).
           hostPath:
             path: /space/cache
             type: DirectoryOrCreate

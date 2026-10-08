@@ -6,6 +6,7 @@ mod credential_injection_rpc;
 pub mod credential_provider;
 pub mod credential_store;
 pub mod envelope;
+mod iam_role_arn;
 pub mod in_memory;
 pub mod intermediate_ca;
 pub mod intermediate_key_broker;

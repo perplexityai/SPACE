@@ -6,6 +6,7 @@ fn main() -> anyhow::Result<()> {
     let common_file = proto_root.join("node/api/v1/common.proto");
     let worker_file = proto_root.join("node/api/v1/worker.proto");
     let builder_file = proto_root.join("node/api/v1/builder.proto");
+    let activation_file = proto_root.join("node/api/v1/activation.proto");
     let cluster_file = proto_root.join("node/api/v1/cluster.proto");
 
     let raw_descriptor_path = out_dir.join("node_api_descriptor_raw.bin");
@@ -37,7 +38,13 @@ fn main() -> anyhow::Result<()> {
     pplx_space_common_proto_build::compile_protos_with_descriptor_set(
         builder,
         &raw_descriptor_path,
-        &[common_file, worker_file, builder_file, cluster_file],
+        &[
+            common_file,
+            worker_file,
+            builder_file,
+            cluster_file,
+            activation_file,
+        ],
         &[proto_root],
     )?;
 

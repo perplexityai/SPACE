@@ -21,12 +21,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 firewall::allow_guest_port(namespace, "vpeer", 9000, protocol)?;
             }
         }
+        Some("validate") => {
+            firewall::validate_namespace_firewall_config(namespace, "vpeer", "169.254.0.21")?;
+        }
         Some("reapply") => {
             net::setup_tproxy(namespace, 12345, "vpeer")?;
         }
         _ => {
             return Err(
-                "expected setup, reapply, or recover inside the isolated reply-boundary harness"
+                "expected setup, validate, reapply, or recover inside the isolated reply-boundary harness"
                     .into(),
             );
         }

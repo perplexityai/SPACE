@@ -111,6 +111,7 @@ const RO_COLUMN_DENYLIST: &[(&str, &[&str])] = &[
     ("api_keys", &["key_hash"]),
     ("data_plane_sessions", &["token_hash"]),
     ("sandbox_federated_service_grants", &["grant_blob"]),
+    ("template_system_publication_grants", &["id"]),
 ];
 
 #[derive(Parser)]
@@ -1312,18 +1313,6 @@ async fn adopt_type_ownership(conn: &mut PgConnection) -> Result<usize, Bootstra
 /// `ALTER ... OWNER TO` requires the prospective owner to hold CREATE on the
 /// relation's schema (PG15+ locked-down `public` grants nothing by default).
 async fn converge_schema_privileges(conn: &mut PgConnection) -> Result<usize, BootstrapRolesError> {
-    for sql in [
-        format!(
-            "CREATE SCHEMA IF NOT EXISTS space_migration_archive AUTHORIZATION {MIGRATOR_ROLE}"
-        ),
-        format!(
-            "REVOKE ALL ON SCHEMA space_migration_archive FROM PUBLIC, {USER_ROLE}, {RO_ROLE}, {CREDS_ROLE}"
-        ),
-    ] {
-        execute(conn, &sql)
-            .await
-            .map_err(|source| BootstrapRolesError::Statement { sql, source })?;
-    }
     let mut skipped = 0_usize;
     for sql in [
         format!(

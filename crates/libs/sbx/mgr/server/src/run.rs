@@ -82,7 +82,6 @@ async fn migrate_sandbox_manager_db(
             service: &SANDBOX_MANAGER_MIGRATOR,
             common: Some(&COMMON_SCHEMA_MIGRATOR),
         },
-        Some(pplx_space_sbxmgr_migrations::prepare_migrations),
     )
     .await
 }
@@ -583,10 +582,6 @@ pub enum RunSbxMgrError {
     Migrate(#[source] pplx_space_common_svc::sql::sqlite::SqliteError),
     #[error("failed to open the sandbox-manager database: {0}")]
     OpenDatabase(#[source] pplx_space_common_svc::sql::sqlite::SqliteError),
-    #[error("snapshot upload cutover preflight failed: {0}")]
-    UploadCutover(#[source] crate::snapshot_upload_jobs::UploadCutoverError),
-    #[error("snapshot upload cutover preflight task failed: {0}")]
-    UploadCutoverTask(#[source] tokio::task::JoinError),
     #[error("invalid {SPACE_NODE_ROLE_ENV} {role:?}: {source}")]
     NodeRole {
         role: String,
@@ -772,17 +767,6 @@ pub async fn run(
     );
     health_server.mark_starting();
 
-    // The scan is complete but streaming: keep startup ownership off-runtime
-    // with the SQLite work so a large queue cannot starve the health watchdog.
-    let (service_mutex, upload_cutover) = tokio::task::spawn_blocking(move || {
-        let result = crate::snapshot_upload_jobs::validate_upload_cutover_path(
-            std::path::Path::new(pplx_space_common_core::host::linux::paths::SANDBOX_MANAGER_DB),
-        );
-        (service_mutex, result)
-    })
-    .await
-    .map_err(RunSbxMgrError::UploadCutoverTask)?;
-    upload_cutover.map_err(RunSbxMgrError::UploadCutover)?;
     migrate_sandbox_manager_db(std::path::Path::new(
         pplx_space_common_core::host::linux::paths::SANDBOX_MANAGER_DB,
     ))

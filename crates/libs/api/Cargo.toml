@@ -95,9 +95,9 @@ pplx-space-sandbox-store = { workspace = true }
 pplx-space-sandbox-teardown = { workspace = true }
 pplx-space-sbx-mgr-client = { workspace = true }
 pplx-space-template-mgr-client = { workspace = true }
-pplx-space-internal-api-server = { workspace = true }
 
 [dev-dependencies]
+pplx-space-internal-api-server = { workspace = true }
 pplx-space-common-core = { workspace = true, features = ["serde", "sqlx", "test-hooks"] }
 insta = { workspace = true, features = ["json", "yaml", "redactions"] }
 jsonschema = { workspace = true }

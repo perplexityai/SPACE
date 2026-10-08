@@ -1,8 +1,8 @@
 //! Volume-pull glue for [`crate::service::TemplateManagerService`].
 //!
-//! Scoped `GetTemplate` requests authorize and resolve tags before reading the
-//! local cache. Unscoped requests retain the legacy local-first lookup.
-//! A scoped cache miss materializes the already-authorized release:
+//! Scoped and explicit-tag `GetTemplate` requests resolve an exact release before
+//! reading the local cache. Unscoped name-only and exact-digest requests retain
+//! local-first lookup. A resolved cache miss materializes that same release:
 //!
 //! 1. Asking `ClusterApi.FindTemplateRelease` (cluster-role node-api,
 //!    over TCP with SPACE internal bearer auth) for the release

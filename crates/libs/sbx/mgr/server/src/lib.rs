@@ -1,3 +1,5 @@
+//! Node-local sandbox lifecycle service.
+
 #![forbid(unsafe_code)]
 #![cfg_attr(not(test), deny(clippy::expect_used))]
 

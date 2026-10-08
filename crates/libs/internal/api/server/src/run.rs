@@ -252,14 +252,6 @@ pub async fn run(
     config: InternalApiRunConfig,
     shutdown_token: CancellationToken,
 ) -> Result<(), RunInternalApiError> {
-    run_with_ingress_activation(config, shutdown_token, None).await
-}
-
-pub async fn run_with_ingress_activation(
-    config: InternalApiRunConfig,
-    shutdown_token: CancellationToken,
-    factory: Option<&dyn crate::ingress_activation::IngressActivationFactory>,
-) -> Result<(), RunInternalApiError> {
     let route_ed25519_authority = Some(std::sync::Arc::new(
         pplx_space_common_svc::space_api_route_ed25519::SpaceApiRouteEd25519Authority::load_required_from_env()
             .map_err(RunInternalApiError::RouteSigningConfig)?,
@@ -321,7 +313,6 @@ pub async fn run_with_ingress_activation(
     // the signal wiring; this is the token it handed over.
     let shutdown_signal = shutdown_token.clone();
     let shutdown = async move { shutdown_signal.cancelled().await };
-    let activation_tasks = tokio_util::task::TaskTracker::new();
 
     let reflection = tonic_reflection::server::Builder::configure()
         .register_encoded_file_descriptor_set(
@@ -330,28 +321,11 @@ pub async fn run_with_ingress_activation(
         .build_v1()?;
     let (_, health_service) = pplx_space_common_svc::grpc_health_service();
 
-    let activation = if crate::ingress_activation::enabled() {
-        match factory {
-            Some(factory) => Some(
-                factory
-                    .build(
-                        pool.clone(),
-                        route_ed25519_authority.clone(),
-                        activation_tasks.clone(),
-                        shutdown_token.clone(),
-                    )
-                    .await
-                    .map_err(RunInternalApiError::ClusterApiService)?,
-            ),
-            None => {
-                return Err(RunInternalApiError::ClusterApiService(
-                    tonic::Status::failed_precondition("ingress wake requires an activation owner"),
-                ));
-            }
-        }
-    } else {
-        None
-    };
+    let activation = std::sync::Arc::new(
+        pplx_space_node_api_client::activation::RemoteIngressActivation::from_env()
+            .await
+            .map_err(RunInternalApiError::ClusterApiService)?,
+    );
     let mut svc = ClusterApiService::from_env_with_security_state(
         pool,
         route_ed25519_authority,
@@ -360,16 +334,14 @@ pub async fn run_with_ingress_activation(
     .await
     .map_err(RunInternalApiError::ClusterApiService)?
     .with_visibility_pool(visibility_pool);
-    svc.ingress_activation = activation;
+    svc.ingress_activation = Some(activation);
     let node_info = ClusterNodeInfoService::new(node_id);
     let publisher_auth =
         auth::build::BuildAuthLayer::for_template_publication(token.clone()).await?;
     let auth_config = auth::NodeApiAuthConfig::from_env(auth::NodeRole::Cluster, token, None)?;
     let auth_layer = auth::NodeApiAuthLayer::from_config(auth_config).await?;
 
-    let transport = pplx_space_common_grpc::internal_transport::ServerTransport::from_env()?;
-    let serve_result = transport
-        .server_builder()
+    let serve_result = pplx_space_common_grpc::internal_transport::server_builder()?
         .http2_keepalive_interval(Some(std::time::Duration::from_secs(10)))
         .http2_keepalive_timeout(Some(std::time::Duration::from_mins(1)))
         // Trace first (outermost) so denied requests still produce server
@@ -382,7 +354,7 @@ pub async fn run_with_ingress_activation(
         .add_service(cluster_api_server(svc))
         .add_service(NodeInfoServer::new(node_info))
         .serve_with_incoming_shutdown(
-            transport.incoming(
+            pplx_space_common_grpc::internal_transport::Incoming::new(
                 TcpIncoming::from(listener).with_nodelay(Some(true)),
                 shutdown_token.clone(),
             ),
@@ -391,22 +363,6 @@ pub async fn run_with_ingress_activation(
         .await;
 
     shutdown_token.cancel();
-    activation_tasks.close();
-    // The short ingress wait must not cancel accepted restore ownership. Allow
-    // its existing node-RPC budget to drain even after the server stops serving.
-    // Deployment termination grace can cut this short; lease recovery remains
-    // authoritative after process exit.
-    if tokio::time::timeout(
-        pplx_space_common_core::restore_ownership::NODE_RPC_TIMEOUT,
-        activation_tasks.wait(),
-    )
-    .await
-    .is_err()
-    {
-        tracing::warn!(
-            "ingress activation shutdown budget exhausted; remaining ownership will recover through existing leases"
-        );
-    }
     serve_result?;
     Ok(())
 }

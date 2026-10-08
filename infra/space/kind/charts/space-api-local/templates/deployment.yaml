@@ -85,6 +85,8 @@ spec:
             - --listen
             - "0.0.0.0:{{ .Values.service.port }}"
           env:
+            - name: SPACE_INGRESS_ACTIVATION_LISTEN
+              value: "0.0.0.0:9801"
             # Local Kind only; deployed services require authenticated internal RPC TLS.
             - name: SPACE_INTERNAL_RPC_INSECURE_DEV
               value: "true"
@@ -223,6 +225,9 @@ spec:
               value: {{ .Values.internal.secretName | quote }}
             {{- end }}
           ports:
+            - name: activation
+              containerPort: 9801
+              protocol: TCP
             - name: http
               containerPort: {{ .Values.service.port }}
               protocol: TCP

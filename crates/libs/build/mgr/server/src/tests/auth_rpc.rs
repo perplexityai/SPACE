@@ -177,14 +177,16 @@ async fn authenticated_rpc() -> TestResult<AuthenticatedRpc> {
     );
     let server_shutdown = reviewer.shutdown.clone();
     let server_service = service.clone();
-    let transport = pplx_space_common_grpc::internal_transport::ServerTransport::from_env()?;
-    let server_builder = transport.server_builder();
+    let server_builder = pplx_space_common_grpc::internal_transport::server_builder()?;
     let server = tokio::spawn(async move {
         server_builder
             .layer(layer)
             .add_service(BuildManagerServer::new(server_service))
             .serve_with_incoming_shutdown(
-                transport.incoming(TcpListenerStream::new(listener), server_shutdown.clone()),
+                pplx_space_common_grpc::internal_transport::Incoming::new(
+                    TcpListenerStream::new(listener),
+                    server_shutdown.clone(),
+                ),
                 server_shutdown.cancelled_owned(),
             )
             .await
@@ -228,17 +230,37 @@ async fn run_authenticated_rpc(fixture: AuthenticatedRpc) -> TestResult {
         worker,
     } = &reviewer.tokens;
     let org = "018f0000-0000-7000-8000-000000000002";
-    for (rotation, (token, owner, expected)) in [
+    let grant = SystemPublicationGrantId::new().to_string();
+    for (rotation, (token, owner, proof, expected)) in [
         (
             Some(worker.as_str()),
             Some(org),
+            None,
             Err(Code::PermissionDenied),
         ),
-        (Some(tenant.as_str()), None, Err(Code::PermissionDenied)),
-        (None, Some(org), Err(Code::Unauthenticated)),
-        (None, None, Err(Code::Unauthenticated)),
-        (Some(tenant.as_str()), Some(org), Ok(())),
-        (Some(system.as_str()), None, Ok(())),
+        (
+            Some(tenant.as_str()),
+            None,
+            None,
+            Err(Code::PermissionDenied),
+        ),
+        (None, Some(org), None, Err(Code::Unauthenticated)),
+        (None, None, None, Err(Code::Unauthenticated)),
+        (
+            Some(system.as_str()),
+            None,
+            Some("invalid-grant"),
+            Err(Code::InvalidArgument),
+        ),
+        (
+            Some(tenant.as_str()),
+            Some(org),
+            Some(grant.as_str()),
+            Err(Code::InvalidArgument),
+        ),
+        (Some(tenant.as_str()), Some(org), None, Ok(())),
+        (Some(system.as_str()), None, None, Ok(())),
+        (Some(system.as_str()), None, Some(grant.as_str()), Ok(())),
     ]
     .into_iter()
     .enumerate()
@@ -269,6 +291,7 @@ async fn run_authenticated_rpc(fixture: AuthenticatedRpc) -> TestResult {
             vec!["latest".to_string()],
         );
         request.org_id = owner.map(str::to_string);
+        request.system_publication_grant_id = proof.map(str::to_string);
 
         let result = match token {
             Some(_) => client.start_build(request).await,
@@ -289,6 +312,10 @@ async fn run_authenticated_rpc(fixture: AuthenticatedRpc) -> TestResult {
                     .get_job(&job_id.parse().unwrap())?
                     .expect("queued build");
                 let expected_owner = owner.map(TemplateOrg::parse).transpose()?;
+                let expected_publication = expected_owner.map_or(
+                    TemplatePublication::System(proof.map(str::parse).transpose()?),
+                    TemplatePublication::Tenant,
+                );
                 assert_eq!(
                     job.payload_as::<BuildJobPayload>()?.template_org,
                     expected_owner
@@ -297,7 +324,7 @@ async fn run_authenticated_rpc(fixture: AuthenticatedRpc) -> TestResult {
                 assert_eq!(BuildState::try_from(status.state)?, BuildState::Succeeded);
                 assert_eq!(
                     backend.cluster_template_calls.lock().unwrap().last(),
-                    Some(&("rpc-template".to_string(), expected_owner))
+                    Some(&("rpc-template".to_string(), expected_publication))
                 );
                 assert_eq!(
                     backend.publish_calls.lock().unwrap().last(),
@@ -305,7 +332,7 @@ async fn run_authenticated_rpc(fixture: AuthenticatedRpc) -> TestResult {
                         "rpc-template".to_string(),
                         hash,
                         vec!["latest".to_string()],
-                        expected_owner
+                        expected_publication
                     ))
                 );
             }

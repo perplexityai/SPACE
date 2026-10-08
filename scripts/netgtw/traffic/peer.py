@@ -346,9 +346,12 @@ async def serve(args):
     transports = []
     if args.zone != "guest":
         for address in args.address:
-            transports.append(
-                await protocols.quic_server(address, args.certificate, args.key, record)
-            )
+            for port in (443, 8443):
+                transports.append(
+                    await protocols.quic_server(
+                        address, args.certificate, args.key, record, port
+                    )
+                )
             for port in (53, 9000):
                 (
                     transport,
@@ -442,12 +445,24 @@ def probe(spec, sessions):
         if kind == "udp":
             # A sizes array adds multiple datagrams on the same flow; existing
             # cases retain their single nonce echo.
+            blocked_udp443 = port == 443 and spec["expect"] == "deny"
+            if blocked_udp443:
+                stream.settimeout(0.1)
+            errors = []
             for index, size in enumerate(spec.get("sizes", [len(nonce)])):
                 data = (nonce + bytes(range(256)) * (size // 256 + 1))[:size]
                 stream.sendall(data)
                 try:
                     response = stream.recv(65536)
+                except ConnectionRefusedError:
+                    if blocked_udp443:
+                        errors.append("ConnectionRefusedError")
+                        continue
+                    raise
                 except TimeoutError:
+                    if blocked_udp443:
+                        errors.append("TimeoutError")
+                        continue
                     return {
                         "received": False,
                         "error": f"UDP datagram {index + 1} ({size} bytes) timed out",
@@ -455,8 +470,16 @@ def probe(spec, sessions):
                         "datagrams_received": index,
                         "timeout_datagram": index + 1,
                     }
+                if blocked_udp443:
+                    raise ValueError("denied UDP/443 received a reply")
                 if response != data:
                     raise ValueError("UDP datagram was corrupted or truncated")
+            if errors:
+                return {
+                    "received": False,
+                    "errors": errors,
+                    "datagrams_sent": len(spec.get("sizes", [len(nonce)])),
+                }
             return {"received": True, "protocol": "udp"}
         data = nonce
         stream.sendall(data)
@@ -479,6 +502,7 @@ def probe(spec, sessions):
             "received": False,
             "error": str(error),
             "error_type": type(error).__name__,
+            "errno": error.errno,
         }
     finally:
         if stream and not session:

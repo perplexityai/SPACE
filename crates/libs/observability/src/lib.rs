@@ -850,6 +850,13 @@ pub fn timing_ms(name: &str, value_ms: f64, tags: &[String]) {
     }
 }
 
+/// Whether this process exports metrics: false before telemetry starts and
+/// when the selected sink is off. Lets periodic samplers skip work whose
+/// output nobody receives.
+pub fn metrics_enabled() -> bool {
+    METRICS.get().is_some_and(|sink| sink.exports())
+}
+
 pub fn distribution(name: &str, value: f64, tags: &[String]) {
     if let Some(sink) = METRICS.get() {
         sink.emit(sink::Metric {

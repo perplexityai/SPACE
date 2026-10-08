@@ -54,6 +54,44 @@ pub struct CreateSandboxOperationPayload {
     /// Consumers must be upgraded before federated native admission is enabled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub federated_create: Option<crate::fork_operations::ForkFederatedCreateContext>,
+    /// The warm-pool slot claimed for this create at admission, whose reserved
+    /// ID is `sandbox_id`. The executor adopts that exact slot, or builds cold
+    /// under the same ID if the slot can no longer be adopted.
+    ///
+    /// Same mixed-version rule as `node_pool`: absent payloads serialize
+    /// byte-identically and old payloads parse unchanged, while a present key
+    /// is rejected by an older executor's `deny_unknown_fields` — and an
+    /// executor that ignored it would cold-boot under the slot's ID next to
+    /// the slot's pod. Every `space-cluster-controller` replica must run this
+    /// release before any producer sets it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool_claim: Option<CreateSandboxPoolClaim>,
+}
+
+/// Identifies the warm-pool slot claim recorded on an admitted native create.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CreateSandboxPoolClaim {
+    pub claim_id: uuid::Uuid,
+    pub pool_slot_id: uuid::Uuid,
+}
+
+impl From<CreateSandboxPoolClaim> for crate::controllers::substrate::AdmittedPoolClaim {
+    fn from(claim: CreateSandboxPoolClaim) -> Self {
+        Self {
+            claim_id: claim.claim_id,
+            pool_slot_id: claim.pool_slot_id,
+        }
+    }
+}
+
+impl From<crate::controllers::substrate::AdmittedPoolClaim> for CreateSandboxPoolClaim {
+    fn from(claim: crate::controllers::substrate::AdmittedPoolClaim) -> Self {
+        Self {
+            claim_id: claim.claim_id,
+            pool_slot_id: claim.pool_slot_id,
+        }
+    }
 }
 
 impl std::fmt::Debug for CreateSandboxOperationPayload {
@@ -62,6 +100,7 @@ impl std::fmt::Debug for CreateSandboxOperationPayload {
             .field("sandbox_id", &self.sandbox_id)
             .field("node_pool", &self.node_pool)
             .field("federated", &self.federated_create.is_some())
+            .field("pool_claim", &self.pool_claim)
             .finish_non_exhaustive()
     }
 }
@@ -330,6 +369,19 @@ impl CreateSandboxOperationExecutor {
                     .upsert_federated_service_grant(&self.pool, existing.id, &owner, &grant)
                     .await?;
             }
+            // A failed adoption can leave its row behind for the pool's
+            // cleanup to tear down; that row is not a created sandbox.
+            if payload.pool_claim.is_some()
+                && self
+                    .controller
+                    .admitted_pool_cleanup_pending(existing.id)
+                    .await?
+            {
+                return Ok(PublicOperationExecutionResult::workflow_progress(
+                    "waiting for a failed warm-pool adoption to be cleaned up",
+                    CREATE_RETRY_AFTER,
+                ));
+            }
             let lifecycle = existing.lifecycle.parse::<SandboxLifecycle>()?;
             ensure_existing_row_confirms_create(existing.active_node_id, lifecycle)?;
             return Ok(create_success_result(
@@ -359,20 +411,39 @@ impl CreateSandboxOperationExecutor {
         }
         let planned_sandbox_id = SandboxId::from(payload.sandbox_id);
         let controller_request = controller_create_request(payload.request, payload.node_pool);
-        let response = self
-            .controller
-            .create_with_sandbox_id(
-                &self.pool,
-                &actor,
-                &controller_request,
-                SandboxApiMetricIdentity::native("create"),
-                planned_sandbox_id,
-                FederatedSandboxCreateContext::new(
-                    federated.as_ref().map(|(owner, _)| owner),
-                    federated.as_ref().map(|(_, grant)| grant),
-                ),
-            )
-            .await?;
+        let federated_context = FederatedSandboxCreateContext::new(
+            federated.as_ref().map(|(owner, _)| owner),
+            federated.as_ref().map(|(_, grant)| grant),
+        );
+        let response = match payload.pool_claim {
+            None => {
+                self.controller
+                    .create_with_sandbox_id(
+                        &self.pool,
+                        &actor,
+                        &controller_request,
+                        SandboxApiMetricIdentity::native("create"),
+                        planned_sandbox_id,
+                        federated_context,
+                    )
+                    .await?
+            }
+            Some(pool_claim) => {
+                // Adoption always waits for readiness; `wait_until_ready` on
+                // the request still governs only the cold path.
+                self.controller
+                    .create_with_admitted_pool_claim(
+                        &self.pool,
+                        &actor,
+                        &controller_request,
+                        SandboxApiMetricIdentity::native("create"),
+                        planned_sandbox_id,
+                        pool_claim.into(),
+                        federated_context,
+                    )
+                    .await?
+            }
+        };
         let lifecycle = response
             .lifecycle
             .as_deref()
@@ -549,7 +620,7 @@ impl SandboxLifecycleOperationExecutor {
     }
 }
 
-fn controller_create_request(
+pub(crate) fn controller_create_request(
     request: pplx_space_public_api::CreateSandboxRequest,
     node_pool: Option<NodePoolName>,
 ) -> ControllerCreateSandboxRequest {
@@ -969,6 +1040,14 @@ fn controller_error_result(
     operation: &ClaimedPublicOperation,
     error: ControllerError,
 ) -> PublicOperationExecutionResult {
+    if let Some(retry_after) = error.retry_after_header()
+        && error.retry_after_cause()
+            == Some(crate::controllers::ControllerRetryAfterCause::PoolSlotRelease)
+    {
+        // Waiting for the pool to collect a slot holding this create's ID is
+        // bounded by the pool's own sweep, so it is progress, not a failure.
+        return PublicOperationExecutionResult::workflow_progress(error.to_string(), retry_after);
+    }
     if let Some(retry_after) = error.retry_after_header() {
         let result = PublicOperationExecutionResult::retry(error.to_string(), retry_after);
         // A cluster activation admission 429 is backpressure, not a failure:

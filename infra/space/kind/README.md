@@ -737,7 +737,7 @@ configuration and the coordinated migration requirements.
 | EKS modules                                               | Local kind                                                                    |
 |-----------------------------------------------------------|-------------------------------------------------------------------------------|
 | One DaemonSet per node service, systemd watchdogs via k8s probes | All node services in one `space-node-stack` pod, supervised by the entrypoint (same binaries, identities, sockets) |
-| `/space/cache` is btrfs on instance-store NVMe            | btrfs loopback image, bound from the kind node at `/var/lib/space-cache.img` so it outlives pod restarts like the NVMe does (same code paths, less I/O headroom) |
+| `/space/cache` is btrfs on instance-store NVMe            | btrfs loopback image, bound from the kind node at `/var/lib/space-cache.img` so it outlives pod restarts like the NVMe does (same code paths, less I/O headroom). Workers mount it inside the pod; on builders the `mount-cache` init container mounts it on the kind node's `/space/cache`, as the host does on EKS, and the services receive it `HostToContainer`, so the mounts they make under it stay in the pod |
 | Postgres on RDS, secrets via ExternalSecrets / AWS Secrets Manager | In-cluster `space-postgres` StatefulSet, static Kubernetes Secrets             |
 | S3 for snapshots + template artifacts                     | In-cluster versitygw (real S3 protocol, sigv4, path-style)                    |
 | volume-manager credentials via credmgr STS/IRSA           | static `SPACE_OBJECT_STORE_STATIC_*` creds (the documented local escape hatch) |
@@ -850,8 +850,11 @@ SPACE_SMOKE_BACKEND=kind SPACE_SMOKE_API_SURFACE=ecw \
 
 # 6. Explicit AWS Secrets Manager network-credential injection. Before
 #    bootstrap, put short-lived sandbox-account AWS_ACCESS_KEY_ID,
-#    AWS_SECRET_ACCESS_KEY, and AWS_SESSION_TOKEN in private.env. The selected
-#    identity must have secretsmanager:GetSecretValue on the task-owned ARN.
+#    AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN, and
+#    SPACE_CREDMGR_SECRETS_MANAGER_ROLE_ARN in private.env. The selected
+#    identity must be able to sts:AssumeRole and sts:TagSession on that role;
+#    the role reads the task-owned ARN only when the secret's space-org-id tag
+#    equals the smoke organization's ID (docs/configuration.md).
 #    The controlled HTTPS endpoint must return only the lowercase SHA-256 of
 #    the Authorization header it receives.
 SPACE_SMOKE_BACKEND=kind SPACE_SMOKE_API_SURFACE=native \

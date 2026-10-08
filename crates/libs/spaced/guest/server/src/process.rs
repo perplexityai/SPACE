@@ -9,7 +9,7 @@ use dashmap::DashMap;
 use pplx_space_common_core::types::{GuestUserName, Pii, ProcessCommand, ProcessId, ProcessSignal};
 use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
 use std::sync::Weak;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::{collections::VecDeque, io};
 use tokio::io::AsyncRead;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
@@ -24,18 +24,60 @@ const DEFAULT_PTY_COLS: u32 = 80;
 // Charge payloads and event storage, including each repeated process ID: tiny
 // writes must not turn a bounded output window into millions of allocations.
 // The primary attached reader applies backpressure; detached replay stays bounded.
-const PROCESS_OUTPUT_RETENTION_TOTAL_BYTES: usize = 64 * 1024 * 1024;
+// The total is sized from the guest's memory (see `ProcessOutputBudget`): a
+// fixed budget would be 3% of a 2 GiB guest but an eighth of a 512 MiB one.
+const PROCESS_OUTPUT_RETENTION_MAX_BYTES: usize = 64 * 1024 * 1024;
+const PROCESS_OUTPUT_RETENTION_MIN_BYTES: usize = 16 * 1024 * 1024;
 // Process records retain command/env metadata and task-owned descriptors, so
 // cap them as well as the output bytes. Completed records are evicted first
 // under pressure; if every slot belongs to a running process, admission fails.
 const PROCESS_RECORD_LIMIT: usize = 128;
-const PROCESS_OUTPUT_RETENTION_BYTES: usize = 4 * 1024 * 1024;
-// Every admitted record can retain a useful stream-sized floor without
-// competing globally. Larger replay windows borrow from the shared burst pool;
-// exhaustion evicts only that process's older output.
-const PROCESS_OUTPUT_GUARANTEED_BYTES: usize = 256 * 1024;
+// One process retains at most a quarter of the smallest total.
+const PROCESS_OUTPUT_RETENTION_BYTES: usize = PROCESS_OUTPUT_RETENTION_MIN_BYTES / 4;
+
+/// How much process output spaced retains, sized from the guest's memory: a
+/// thirty-second of it, between 16 and 64 MiB (a 2 GiB guest keeps the full
+/// 64 MiB). Half is guaranteed, split evenly across the record slots, so every
+/// admitted record keeps a useful stream-sized floor without competing
+/// globally; larger replay windows borrow from the shared other half, and
+/// exhaustion evicts only that process's older output.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct ProcessOutputBudget {
+    guaranteed_per_record: usize,
+    shared: usize,
+}
+
+impl ProcessOutputBudget {
+    pub(super) fn for_guest_memory(mem_total_bytes: Option<u64>) -> Self {
+        let total = mem_total_bytes
+            .and_then(|bytes| usize::try_from(bytes / 32).ok())
+            .map_or(PROCESS_OUTPUT_RETENTION_MAX_BYTES, |total| {
+                total.clamp(
+                    PROCESS_OUTPUT_RETENTION_MIN_BYTES,
+                    PROCESS_OUTPUT_RETENTION_MAX_BYTES,
+                )
+            });
+        let guaranteed_per_record = total / 2 / PROCESS_RECORD_LIMIT;
+        Self {
+            guaranteed_per_record,
+            shared: total - guaranteed_per_record * PROCESS_RECORD_LIMIT,
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn total(self) -> usize {
+        self.guaranteed_per_record * PROCESS_RECORD_LIMIT + self.shared
+    }
+}
+
+// The default budget's values, for tests written against a registry or
+// journal built without a guest size.
+#[cfg(test)]
+const PROCESS_OUTPUT_GUARANTEED_BYTES: usize =
+    PROCESS_OUTPUT_RETENTION_MAX_BYTES / 2 / PROCESS_RECORD_LIMIT;
+#[cfg(test)]
 const PROCESS_OUTPUT_SHARED_BYTES: usize =
-    PROCESS_OUTPUT_RETENTION_TOTAL_BYTES - PROCESS_RECORD_LIMIT * PROCESS_OUTPUT_GUARANTEED_BYTES;
+    PROCESS_OUTPUT_RETENTION_MAX_BYTES - PROCESS_RECORD_LIMIT * PROCESS_OUTPUT_GUARANTEED_BYTES;
 const PROCESS_OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 const PROCESS_OUTPUT_LAGGED_MESSAGE: &str =
     "process output stream fell behind retained output buffer";
@@ -51,11 +93,11 @@ type ExitObserver = ProcessExitObserver;
 type ExitObserver = ();
 
 /// A published process, owned by the start's tracked task until its exit is
-/// recorded and its record's retention ends.
+/// recorded. The registry's reaper ends its record's retention.
 struct ProcessSupervision {
     child: tokio::process::Child,
     exit_observer: ExitObserver,
-    output_tasks: VecDeque<tokio::task::JoinHandle<()>>,
+    output_tasks: VecDeque<ProcessOutputTask>,
     timeout: Option<pplx_space_common_core::types::ReadyTimeout>,
     shutdown: tokio_util::sync::CancellationToken,
     record: Arc<ProcessRecord>,
@@ -105,7 +147,7 @@ impl ProcessSupervision {
             Ok(Ok(None)) => {
                 let drained = tokio::select! {
                     drained = drain_process_output_tasks(
-                        &mut output_tasks, &process_id, pid, false, &record.journal,
+                        &mut output_tasks, &process_id, pid, false,
                     ) => drained,
                     _ = shutdown.cancelled() => false,
                 };
@@ -130,12 +172,12 @@ impl ProcessSupervision {
         if !output_tasks.is_empty() {
             tokio::select! {
                 _ = drain_process_output_tasks(
-                    &mut output_tasks, &process_id, pid, true, &record.journal,
+                    &mut output_tasks, &process_id, pid, true,
                 ) => {},
                 _ = shutdown.cancelled() => {
                     record.journal.release_backpressure();
                     drain_process_output_tasks(
-                        &mut output_tasks, &process_id, pid, true, &record.journal,
+                        &mut output_tasks, &process_id, pid, true,
                     ).await;
                 },
             }
@@ -154,11 +196,13 @@ impl ProcessSupervision {
         drop(exit_observer);
         #[cfg(not(target_os = "linux"))]
         let () = exit_observer;
-        tokio::select! {
-            _ = shutdown.cancelled() => {},
-            _ = tokio::time::sleep(IDEMPOTENCY_RECORD_TTL) => {},
-        }
-        registry.remove_if_expired(&process_id);
+        // The record stays for `IDEMPOTENCY_RECORD_TTL`; the registry's single
+        // reaper removes it. Waiting here instead kept this whole task (its
+        // future, about 2 KiB) alive for the retention of every start, so at
+        // sustained start rates spaced held starts/s x 60 s of them: ~48 MiB
+        // at 450 starts/s, though at most 128 records exist.
+        drop(process_id);
+        registry.ensure_reaper(shutdown);
     }
 }
 
@@ -345,6 +389,27 @@ impl ProcessLaunch {
             };
             (input, None, child.stdout.take(), child.stderr.take())
         };
+        // Retain independent, close-on-exec descriptors to distinguish open
+        // writers from output tasks waiting only for journal delivery. Prepare
+        // them before publishing the child, so allocation failure uses normal
+        // failed-start cleanup.
+        let sources = [
+            pty_reader.as_ref().map(AsFd::as_fd),
+            stdout.as_ref().map(AsFd::as_fd),
+            stderr.as_ref().map(AsFd::as_fd),
+        ];
+        let mut output_sources = match sources
+            .into_iter()
+            .flatten()
+            .map(|fd| fd.try_clone_to_owned())
+            .collect::<io::Result<VecDeque<_>>>()
+        {
+            Ok(sources) => sources,
+            Err(error) => {
+                terminate_and_reap_failed_start(child, process_reservation);
+                return Err(map_io_error(error));
+            }
+        };
         let started = match process_started_event(&process_id, Some(pid)) {
             Ok(started) => started,
             Err(status) => {
@@ -367,6 +432,9 @@ impl ProcessLaunch {
         if let Some(reader) = pty_reader {
             output_tasks.push_back(spawn_process_output_reader(
                 reader,
+                output_sources
+                    .pop_front()
+                    .expect("each reader has an output descriptor"),
                 Arc::clone(&record),
                 process_id.clone(),
                 pid,
@@ -376,6 +444,9 @@ impl ProcessLaunch {
         if let Some(stdout) = stdout {
             output_tasks.push_back(spawn_process_output_reader(
                 stdout,
+                output_sources
+                    .pop_front()
+                    .expect("each reader has an output descriptor"),
                 Arc::clone(&record),
                 process_id.clone(),
                 pid,
@@ -385,6 +456,9 @@ impl ProcessLaunch {
         if let Some(stderr) = stderr {
             output_tasks.push_back(spawn_process_output_reader(
                 stderr,
+                output_sources
+                    .pop_front()
+                    .expect("each reader has an output descriptor"),
                 Arc::clone(&record),
                 process_id.clone(),
                 pid,
@@ -447,7 +521,11 @@ async fn resolve_process_account(
                 .try_acquire_many_owned(
                     pplx_space_spaced_common::process_limits::START_PAYLOAD_SLOTS,
                 )
-                .map_err(|_| Status::resource_exhausted("payload request capacity exhausted"))?,
+                .map_err(|_| {
+                    crate::refused(Status::resource_exhausted(
+                        "payload request capacity exhausted",
+                    ))
+                })?,
         },
     };
     // NSS may block on external account providers. Keep the existing Start
@@ -465,6 +543,10 @@ pub(super) struct ProcessRegistry {
     records: Arc<DashMap<ProcessId, ProcessEntry>>,
     record_slots: Arc<Semaphore>,
     shared_output_slots: Arc<Semaphore>,
+    /// Whether the retention reaper is running. It runs only while a
+    /// completed record is retained, so an idle daemon has no timer.
+    reaper_running: Arc<std::sync::atomic::AtomicBool>,
+    output_budget: ProcessOutputBudget,
 }
 
 /// A process id in use: by an admitted start that has not published its
@@ -541,7 +623,10 @@ impl ProcessRecord {
             info,
             input,
             signal_handle,
-            journal: Arc::new(ProcessEventJournal::new(reservation.shared_output_slots)),
+            journal: Arc::new(ProcessEventJournal::with_budget(
+                reservation.shared_output_slots,
+                reservation.output_budget,
+            )),
         }
     }
 
@@ -559,11 +644,20 @@ impl ProcessRecord {
 }
 
 impl Default for ProcessRegistry {
+    /// The budget of a guest of unknown size: the full 64 MiB.
     fn default() -> Self {
+        Self::new(ProcessOutputBudget::for_guest_memory(None))
+    }
+}
+
+impl ProcessRegistry {
+    pub(super) fn new(output_budget: ProcessOutputBudget) -> Self {
         Self {
             records: Arc::new(DashMap::new()),
             record_slots: Arc::new(Semaphore::new(PROCESS_RECORD_LIMIT)),
-            shared_output_slots: Arc::new(Semaphore::new(PROCESS_OUTPUT_SHARED_BYTES)),
+            shared_output_slots: Arc::new(Semaphore::new(output_budget.shared)),
+            reaper_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            output_budget,
         }
     }
 }
@@ -571,6 +665,7 @@ impl Default for ProcessRegistry {
 struct ProcessRecordReservation {
     record_slot: OwnedSemaphorePermit,
     shared_output_slots: Arc<Semaphore>,
+    output_budget: ProcessOutputBudget,
 }
 
 enum ProcessInput {
@@ -668,6 +763,32 @@ fn prepare_pty(size: Option<PtySize>) -> Result<PreparedPty, Status> {
 // Both descriptors are CLOEXEC from creation, so a child spawned concurrently
 // on another thread cannot inherit either one and no lock is needed.
 // `TIOCGPTPEER` needs Linux 4.13 or later; every SPACE guest kernel has it.
+/// Registers a `pre_exec` hook that sets the child's `oom_score_adj` to 0.
+/// Fails closed, like cgroup placement: a workload must not run with
+/// spaced's protection.
+#[cfg(target_os = "linux")]
+fn reset_workload_oom_score(command: &mut Command) {
+    // SAFETY: the closure runs in the forked child before `exec`. It calls only
+    // `open`, `write` and `close` (rustix, on a static NUL-terminated path and
+    // a fixed buffer): async-signal-safe, no allocation, no locks.
+    unsafe {
+        command.pre_exec(|| {
+            let fd = rustix::fs::open(
+                c"/proc/self/oom_score_adj",
+                rustix::fs::OFlags::WRONLY | rustix::fs::OFlags::CLOEXEC,
+                rustix::fs::Mode::empty(),
+            )?;
+            if rustix::io::write(&fd, b"0")? != 1 {
+                return Err(io::ErrorKind::WriteZero.into());
+            }
+            Ok(())
+        });
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn reset_workload_oom_score(_command: &mut Command) {}
+
 #[cfg(target_os = "linux")]
 fn open_pty_pair(winsize: &libc::winsize) -> Result<(OwnedFd, OwnedFd), Status> {
     use rustix::pty::{OpenptFlags, ioctl_tiocgptpeer, openpt, unlockpt};
@@ -844,19 +965,27 @@ struct ProcessEventJournal {
     state: std::sync::Mutex<ProcessJournalState>,
     changed: watch::Sender<ProcessJournalChange>,
     shared_output_slots: Arc<Semaphore>,
+    budget: ProcessOutputBudget,
     consumed: watch::Sender<()>,
-    blocked_readers: AtomicUsize,
 }
 
 impl ProcessEventJournal {
+    #[cfg(test)]
     fn new(shared_output_slots: Arc<Semaphore>) -> Self {
+        Self::with_budget(
+            shared_output_slots,
+            ProcessOutputBudget::for_guest_memory(None),
+        )
+    }
+
+    fn with_budget(shared_output_slots: Arc<Semaphore>, budget: ProcessOutputBudget) -> Self {
         let (changed, _) = watch::channel(ProcessJournalChange::OutputChanged);
         Self {
             state: std::sync::Mutex::new(ProcessJournalState::default()),
             changed,
             shared_output_slots,
+            budget,
             consumed: watch::channel(()).0,
-            blocked_readers: AtomicUsize::new(0),
         }
     }
 
@@ -894,6 +1023,16 @@ impl ProcessEventJournal {
             .expect("process output journal lock poisoned")
             .completed_at
             .is_some_and(|completed_at| completed_at.elapsed() > IDEMPOTENCY_RECORD_TTL)
+    }
+
+    /// Moves the completion time back, as if `by` had passed since.
+    #[cfg(all(test, target_os = "linux"))]
+    fn backdate_completion(&self, by: Duration) {
+        let mut state = self
+            .state
+            .lock()
+            .expect("process output journal lock poisoned");
+        state.completed_at = state.completed_at.map(|completed_at| completed_at - by);
     }
 
     fn completed_at(&self) -> Option<Instant> {
@@ -949,7 +1088,6 @@ impl ProcessEventJournal {
                 None => return,
                 Some(pending) => event = pending,
             }
-            let _blocked = BlockedOutputReader::new(&self.blocked_readers);
             if consumed.changed().await.is_err() {
                 return;
             }
@@ -1005,8 +1143,11 @@ impl ProcessEventJournal {
                 evict_oldest_process_output(&mut state);
             }
             let shared_output_slot = loop {
-                let guaranteed_bytes = output_bytes
-                    .min(PROCESS_OUTPUT_GUARANTEED_BYTES.saturating_sub(state.guaranteed_bytes));
+                let guaranteed_bytes = output_bytes.min(
+                    self.budget
+                        .guaranteed_per_record
+                        .saturating_sub(state.guaranteed_bytes),
+                );
                 let shared_bytes = output_bytes - guaranteed_bytes;
                 let shared_output_slot = if shared_bytes == 0 {
                     None
@@ -1126,21 +1267,6 @@ fn can_evict_process_output(state: &ProcessJournalState) -> bool {
         .is_none_or(|position| position.load(Ordering::Acquire) > state.first_sequence)
 }
 
-struct BlockedOutputReader<'a>(&'a AtomicUsize);
-
-impl<'a> BlockedOutputReader<'a> {
-    fn new(count: &'a AtomicUsize) -> Self {
-        count.fetch_add(1, Ordering::Relaxed);
-        Self(count)
-    }
-}
-
-impl Drop for BlockedOutputReader<'_> {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::Relaxed);
-    }
-}
-
 fn evict_oldest_process_output(state: &mut ProcessJournalState) {
     let removed = state
         .output
@@ -1240,10 +1366,13 @@ impl ProcessRegistry {
                     return Ok(ProcessRecordReservation {
                         record_slot,
                         shared_output_slots: Arc::clone(&self.shared_output_slots),
+                        output_budget: self.output_budget,
                     });
                 }
                 Err(TryAcquireError::Closed) => {
-                    return Err(Status::unavailable("process registry is closed"));
+                    return Err(crate::refused(Status::unavailable(
+                        "process registry is closed",
+                    )));
                 }
                 Err(TryAcquireError::NoPermits) => {}
             }
@@ -1260,7 +1389,9 @@ impl ProcessRegistry {
                 })
                 .min_by_key(|(_, completed_at)| *completed_at);
             let Some((process_id, _)) = completed else {
-                return Err(Status::resource_exhausted(PROCESS_CAPACITY_MESSAGE));
+                return Err(crate::refused(Status::resource_exhausted(
+                    PROCESS_CAPACITY_MESSAGE,
+                )));
             };
             self.records.remove(&process_id);
         }
@@ -1302,15 +1433,56 @@ impl ProcessRegistry {
         })
     }
 
-    fn remove_if_expired(&self, process_id: &ProcessId) {
-        if self
-            .records
-            .get(process_id)
-            .and_then(|entry| entry.record().map(|record| record.journal.is_expired()))
-            .unwrap_or(false)
-        {
-            self.records.remove(process_id);
+    /// Removes completed records whose retention has ended. One task at most:
+    /// it sleeps until the earliest record expires and exits when no completed
+    /// record is retained; the next process to complete starts it again.
+    fn ensure_reaper(&self, shutdown: tokio_util::sync::CancellationToken) {
+        use std::sync::atomic::Ordering;
+        if self.reaper_running.swap(true, Ordering::AcqRel) {
+            return;
         }
+        let registry = self.clone();
+        drop(tokio::spawn(async move {
+            loop {
+                registry.remove_expired();
+                let Some(next) = registry.next_expiry() else {
+                    registry.reaper_running.store(false, Ordering::Release);
+                    // A record completed after the look above may have seen the
+                    // reaper as running and not started one: look again.
+                    if registry.next_expiry().is_some()
+                        && !registry.reaper_running.swap(true, Ordering::AcqRel)
+                    {
+                        continue;
+                    }
+                    return;
+                };
+                tokio::select! {
+                    () = tokio::time::sleep_until(tokio::time::Instant::from_std(next)) => {}
+                    () = shutdown.cancelled() => {
+                        registry.reaper_running.store(false, Ordering::Release);
+                        return;
+                    }
+                }
+            }
+        }));
+    }
+
+    fn remove_expired(&self) {
+        self.records.retain(|_, entry| {
+            !entry
+                .record()
+                .is_some_and(|record| record.journal.is_expired())
+        });
+    }
+
+    /// When the earliest retained completed record expires (just after, as
+    /// expiry is strictly past the TTL).
+    fn next_expiry(&self) -> Option<Instant> {
+        self.records
+            .iter()
+            .filter_map(|entry| entry.record()?.journal.completed_at())
+            .min()
+            .map(|completed_at| completed_at + IDEMPOTENCY_RECORD_TTL + Duration::from_millis(1))
     }
 
     fn list(&self) -> Vec<ProcessInfo> {
@@ -1459,17 +1631,51 @@ fn process_stderr_event(process_id: &ProcessId, pid: Option<u32>, data: Vec<u8>)
     }
 }
 
+struct ProcessOutputTask {
+    task: tokio::task::JoinHandle<()>,
+    source: OwnedFd,
+}
+
+impl ProcessOutputTask {
+    fn writers_closed(&self) -> io::Result<bool> {
+        use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
+        // POLLHUP observes the last writer closing even while unread bytes
+        // remain. Waiting for the reader task instead confuses consumer
+        // backpressure with a descendant keeping the pipe or PTY open.
+        let mut sources = [PollFd::new(self.source.as_fd(), PollFlags::empty())];
+        loop {
+            match poll(&mut sources, PollTimeout::ZERO) {
+                Ok(_) => {
+                    let events = sources[0]
+                        .revents()
+                        .ok_or_else(|| io::Error::other("unrecognized output poll events"))?;
+                    if events.contains(PollFlags::POLLHUP) {
+                        return Ok(true);
+                    }
+                    if events.intersects(PollFlags::POLLERR | PollFlags::POLLNVAL) {
+                        return Err(io::Error::other("output descriptor poll failed"));
+                    }
+                    return Ok(false);
+                }
+                Err(nix::errno::Errno::EINTR) => continue,
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+}
+
 fn spawn_process_output_reader<R>(
     mut reader: R,
+    source: OwnedFd,
     record: Arc<ProcessRecord>,
     process_id: ProcessId,
     pid: u32,
     kind: ProcessOutputKind,
-) -> tokio::task::JoinHandle<()>
+) -> ProcessOutputTask
 where
     R: AsyncRead + Unpin + Send + 'static,
 {
-    tokio::spawn(async move {
+    let task = tokio::spawn(async move {
         let mut buffer = vec![0; 8192];
         loop {
             match reader.read(&mut buffer).await {
@@ -1500,21 +1706,24 @@ where
                 }
             }
         }
-    })
+    });
+    ProcessOutputTask { task, source }
 }
 
 async fn drain_process_output_tasks(
-    output_tasks: &mut VecDeque<tokio::task::JoinHandle<()>>,
+    output_tasks: &mut VecDeque<ProcessOutputTask>,
     process_id: &ProcessId,
     pid: u32,
     abort_on_timeout: bool,
-    journal: &ProcessEventJournal,
 ) -> bool {
+    let mut fully_drained = true;
     loop {
         let drain = async {
-            while let Some(task) = output_tasks.front_mut() {
-                if let Err(error) = task.await {
-                    tracing::warn!(%error, pid, "process output task failed");
+            while let Some(output) = output_tasks.front_mut() {
+                match (&mut output.task).await {
+                    Ok(()) => {}
+                    Err(error) if error.is_cancelled() => {}
+                    Err(error) => tracing::warn!(%error, pid, "process output task failed"),
                 }
                 output_tasks.pop_front();
             }
@@ -1523,38 +1732,48 @@ async fn drain_process_output_tasks(
             .await
             .is_ok()
         {
-            return true;
+            return fully_drained;
         }
 
-        // Only the final drain may wait for a slow consumer. The initial
-        // grace period must still expire so descendants cannot keep writing
-        // indefinitely after the leader exits.
-        if abort_on_timeout && journal.blocked_readers.load(Ordering::Relaxed) > 0 {
-            continue;
+        let mut writers_open = false;
+        // Inspect every source, including stderr behind a backpressured stdout.
+        // Closed sources can finish delivering their finite buffered output at
+        // the consumer's pace. Open sources keep the inherited-writer deadline.
+        for output in output_tasks.iter() {
+            if output.task.is_finished() {
+                continue;
+            }
+            match output.writers_closed() {
+                Ok(true) => {}
+                Ok(false) => {
+                    writers_open = true;
+                    if abort_on_timeout {
+                        output.task.abort();
+                        fully_drained = false;
+                    }
+                }
+                Err(error) => {
+                    // An observation failure is not evidence for killing the
+                    // process group. Bound our own reader and report the error.
+                    tracing::warn!(%error, pid, "failed to observe process output closure");
+                    output.task.abort();
+                    fully_drained = false;
+                }
+            }
         }
-        break;
-    }
-    tracing::warn!(
-        process_id = process_id.as_str(),
-        pid,
-        drain_timeout_ms = PROCESS_OUTPUT_DRAIN_TIMEOUT.as_millis() as u64,
-        abort_on_timeout,
-        "process output drain timed out"
-    );
-    if !abort_on_timeout {
-        return false;
-    }
-    for task in output_tasks.iter() {
-        task.abort();
-    }
-    while let Some(task) = output_tasks.pop_front() {
-        match task.await {
-            Ok(()) => {}
-            Err(error) if error.is_cancelled() => {}
-            Err(error) => tracing::warn!(%error, pid, "process output task failed after abort"),
+        if writers_open {
+            tracing::warn!(
+                process_id = process_id.as_str(),
+                pid,
+                drain_timeout_ms = PROCESS_OUTPUT_DRAIN_TIMEOUT.as_millis() as u64,
+                abort_on_timeout,
+                "process output writers remained open after drain deadline"
+            );
+        }
+        if !abort_on_timeout {
+            return !writers_open;
         }
     }
-    false
 }
 
 enum ProcessExitOutcome {
@@ -1803,12 +2022,17 @@ impl Process for SpacedGuestService {
                     .map(|(key, value)| (key.as_str(), Pii::new(value).expose_pii().expose())),
             );
         }
-        // Place the workload in the capped `workloads/` cgroup before exec, and
+        // Place the workload in its `workloads/` cgroup before exec, and
         // before dropping credentials: the move writes a root-owned
         // `cgroup.procs`, and these pre_exec hooks run in registration order.
         if let Some(cgroups) = self.inner.guest_cgroups.as_ref() {
             cgroups.place_spawned_workload(&mut command);
         }
+        // spaced runs with a protective OOM score (the unit's
+        // `OOMScoreAdjust`), and children inherit it: reset the workload to
+        // the default so the OOM killer prefers it over spaced, not the
+        // reverse. Also before dropping credentials.
+        reset_workload_oom_score(&mut command);
         let uses_pty = pty_config.is_some();
         if !uses_pty {
             command.process_group(0);
@@ -1860,7 +2084,9 @@ impl Process for SpacedGuestService {
         // Before the start begins: a refused thread ends this start with its
         // key released, so a retry with the same key can succeed.
         let spawn_thread = SpawnThread::start().map_err(|error| {
-            Status::unavailable(format!("cannot start a process spawn thread: {error}"))
+            crate::refused(Status::unavailable(format!(
+                "cannot start a process spawn thread: {error}"
+            )))
         })?;
 
         // Cancellation while waiting for admission has no effect to replay:

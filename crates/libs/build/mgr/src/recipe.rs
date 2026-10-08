@@ -71,6 +71,11 @@ pub enum RecipeProtoError {
     MissingScratchSource,
     #[error("scratch recipe source kind is required")]
     MissingScratchSourceKind,
+    #[error("scratch recipe source {field} {value:?} is invalid; expected {}", field.expected())]
+    InvalidScratchSource {
+        field: ScratchSourceField,
+        value: String,
+    },
     #[error("pinned scratch recipe guest kernel is required")]
     MissingScratchGuestKernel,
     #[error("OCI image reference {value:?} is invalid: {source}")]
@@ -727,12 +732,86 @@ impl TryFrom<build_proto::recipe::Source> for SourceConfig {
             .ok_or(RecipeProtoError::MissingScratchSourceKind)?
         {
             build_proto::recipe::source::Kind::UbuntuMinimalCloudSquashfs(source) => Ok(Self {
-                release: source.release,
-                version: source.version,
-                date: source.date,
+                release: ScratchSourceField::Release.validate(source.release)?,
+                version: ScratchSourceField::Version.validate(source.version)?,
+                date: ScratchSourceField::Date.validate(source.date)?,
             }),
         }
     }
+}
+
+/// Ubuntu Minimal Cloud selectors become URL path segments and values staged
+/// for a privileged build container, so only the published shapes are
+/// accepted: `minimal/releases/<release>/<date>/ubuntu-<version>-...`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScratchSourceField {
+    Release,
+    Version,
+    Date,
+}
+
+impl ScratchSourceField {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Release => "release",
+            Self::Version => "version",
+            Self::Date => "date",
+        }
+    }
+
+    fn expected(self) -> &'static str {
+        match self {
+            Self::Release => "a lowercase Ubuntu codename such as \"resolute\"",
+            Self::Version => "an Ubuntu version such as \"26.04\"",
+            Self::Date => "\"release\" or \"release-YYYYMMDD[.N]\"",
+        }
+    }
+
+    fn accepts(self, value: &str) -> bool {
+        match self {
+            Self::Release => {
+                (1..=32).contains(&value.len()) && value.bytes().all(|b| b.is_ascii_lowercase())
+            }
+            Self::Version => {
+                let mut parts = value.split('.');
+                let (Some(year), Some(month), point, None) =
+                    (parts.next(), parts.next(), parts.next(), parts.next())
+                else {
+                    return false;
+                };
+                is_ascii_digits(year, 2..=2)
+                    && is_ascii_digits(month, 2..=2)
+                    && point.is_none_or(|point| is_ascii_digits(point, 1..=2))
+            }
+            Self::Date => match value.strip_prefix("release-") {
+                None => value == "release",
+                Some(stamp) => match stamp.split_once('.') {
+                    None => is_ascii_digits(stamp, 8..=8),
+                    Some((day, serial)) => {
+                        is_ascii_digits(day, 8..=8) && is_ascii_digits(serial, 1..=3)
+                    }
+                },
+            },
+        }
+    }
+
+    fn validate(self, value: String) -> Result<String, RecipeProtoError> {
+        if self.accepts(&value) {
+            Ok(value)
+        } else {
+            Err(RecipeProtoError::InvalidScratchSource { field: self, value })
+        }
+    }
+}
+
+impl std::fmt::Display for ScratchSourceField {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+fn is_ascii_digits(value: &str, len: std::ops::RangeInclusive<usize>) -> bool {
+    len.contains(&value.len()) && value.bytes().all(|b| b.is_ascii_digit())
 }
 
 trait ProtoStepExt {

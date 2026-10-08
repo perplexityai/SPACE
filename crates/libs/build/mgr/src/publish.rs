@@ -7,8 +7,9 @@ use bytes::Bytes;
 use pplx_space_common_core::host::linux::paths::template_build_dir;
 use pplx_space_common_core::types::{
     AuthIdParseError, ContentHash, OrgId, RUNTIME_FIRECRACKER_ALIAS, StorageUri,
-    TEMPLATE_ROOTFS_ZSTD_CODEC, TEMPLATE_ROOTFS_ZSTD_FILE, TEMPLATE_ROOTFS_ZSTD_LEVEL,
-    TemplateArtifact, TemplateName, template_object_key, template_object_prefix,
+    SystemPublicationGrantId, TEMPLATE_ROOTFS_ZSTD_CODEC, TEMPLATE_ROOTFS_ZSTD_FILE,
+    TEMPLATE_ROOTFS_ZSTD_LEVEL, TemplateArtifact, TemplateName, template_object_key,
+    template_object_prefix,
 };
 use pplx_space_common_svc::page_cache;
 use pplx_space_node_api_client::cluster::{
@@ -16,8 +17,9 @@ use pplx_space_node_api_client::cluster::{
     connect_from_env as connect_cluster_api_from_env,
 };
 use pplx_space_node_api_client::proto::{
-    FacetRef, MarkFacetDirtyRequest, ReconcileFacet, RegisterTemplateReleaseRequest,
-    RegisterTemplateRequest, facet_ref,
+    CreateSystemTemplatePublicationGrantRequest, FacetRef, FindTemplateReleaseByHashRequest,
+    MarkFacetDirtyRequest, ReconcileFacet, RegisterTemplateReleaseRequest, RegisterTemplateRequest,
+    facet_ref,
 };
 use pplx_space_object_store::{
     ObjectCredentials, ObjectStore, ObjectStoreError, ObjectTarget, S3ObjectStore,
@@ -51,8 +53,35 @@ impl TemplateOrg {
     }
 }
 
+/// The ownership or specific system authorization persisted with a build.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TemplatePublication {
+    Tenant(TemplateOrg),
+    System(Option<SystemPublicationGrantId>),
+}
+
+impl TemplatePublication {
+    pub const fn org(self) -> Option<TemplateOrg> {
+        match self {
+            Self::Tenant(org) => Some(org),
+            Self::System(_) => None,
+        }
+    }
+
+    pub const fn system_grant(self) -> Option<SystemPublicationGrantId> {
+        match self {
+            Self::Tenant(_) => None,
+            Self::System(grant) => grant,
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum PublishError {
+    #[error("authorize operator system build: {0}")]
+    AuthorizeSystemBuild(#[source] tonic::Status),
+    #[error("invalid system publication grant returned by ClusterApi: {0}")]
+    InvalidSystemGrant(#[source] AuthIdParseError),
     #[error(transparent)]
     InvalidTemplateName(#[from] pplx_space_common_core::types::TemplateParseError),
     #[error(transparent)]
@@ -100,11 +129,39 @@ pub enum PublishError {
     RegisterTemplate(#[source] tonic::Status),
     #[error("register template release failed: {0}")]
     RegisterTemplateRelease(#[source] tonic::Status),
+    #[error("find template release failed: {0}")]
+    FindTemplateRelease(#[source] tonic::Status),
+}
+
+/// Called by the direct operator CLI using its own ClusterApi credential,
+/// before submitting to build-manager. Only an unconfigured cluster is local-only;
+/// missing or insufficient operator authority fails before the build is queued.
+pub async fn authorize_operator_system_build(
+    template_id: &str,
+) -> Result<Option<SystemPublicationGrantId>, PublishError> {
+    let template = TemplateName::parse(template_id.to_owned())?;
+    let mut client = match connect_cluster_api_from_env().await {
+        Ok(client) => client,
+        Err(ConnectClusterApiError::MissingEndpoint) => return Ok(None),
+        Err(error) => return Err(PublishError::ClusterApiConnect(error)),
+    };
+    let response = client
+        .create_system_template_publication_grant(CreateSystemTemplatePublicationGrantRequest {
+            template_name: template.to_string(),
+        })
+        .await
+        .map_err(PublishError::AuthorizeSystemBuild)?
+        .into_inner();
+    response
+        .grant_id
+        .parse()
+        .map(Some)
+        .map_err(PublishError::InvalidSystemGrant)
 }
 
 pub async fn register_build_template(
     template_id: &str,
-    template_org: Option<TemplateOrg>,
+    publication: TemplatePublication,
 ) -> Result<(), PublishError> {
     let template = TemplateName::parse(template_id.to_string())?;
     let mut cluster_api = match connect_cluster_api_from_env().await {
@@ -118,14 +175,14 @@ pub async fn register_build_template(
         }
         Err(error) => return Err(PublishError::ClusterApiConnect(error)),
     };
-    ensure_cluster_template(&mut cluster_api, &template, template_org).await
+    ensure_cluster_template(&mut cluster_api, &template, publication).await
 }
 
 pub async fn publish_build(
     template_id: &str,
     content_hash: &str,
     publish_tags: &[String],
-    template_org: Option<TemplateOrg>,
+    publication: TemplatePublication,
 ) -> Result<(), PublishError> {
     let template = TemplateName::parse(template_id.to_string())?;
     let content_hash = content_hash.parse::<ContentHash>()?;
@@ -133,7 +190,6 @@ pub async fn publish_build(
         template.as_str(),
         &content_hash.to_string(),
     ));
-    let release_tags = release_tags(content_hash, publish_tags);
     let mut cluster_api = match connect_cluster_api_from_env().await {
         Ok(client) => client,
         Err(ConnectClusterApiError::MissingEndpoint | ConnectClusterApiError::MissingToken(_)) => {
@@ -147,70 +203,232 @@ pub async fn publish_build(
         Err(error) => return Err(PublishError::ClusterApiConnect(error)),
     };
 
-    let execution = Some(load_build_execution_metadata(&build_dir).await?);
+    publish_build_from_dir(
+        &mut cluster_api,
+        &build_dir,
+        &template,
+        content_hash,
+        publish_tags,
+        publication,
+    )
+    .await?;
+    mark_local_template_inventory_dirty(&template).await;
+    Ok(())
+}
+
+async fn publish_build_from_dir(
+    cluster_api: &mut AuthenticatedClusterApiClient,
+    build_dir: &Path,
+    template: &TemplateName,
+    content_hash: ContentHash,
+    publish_tags: &[String],
+    publication: TemplatePublication,
+) -> Result<(), PublishError> {
+    let release_tags = release_tags(content_hash, publish_tags);
+    let execution = load_build_execution_metadata(build_dir).await?;
+
+    // Register the template identity before anything that depends on it. A
+    // failed upload may leave a template with no release, but never a release
+    // that points at partial objects.
+    ensure_cluster_template(cluster_api, template, publication).await?;
+    // A registered release is immutable: Credential Manager refuses write
+    // credentials for a release prefix that already has a storage location.
+    // A rebuild that reproduced an already-published hash therefore uploads
+    // nothing and re-registers its tags only: neither a location it did not
+    // upload to nor execution metadata from a manifest that never left here.
+    // That holds whether or not a cold store is configured.
+    let recorded_locations =
+        recorded_release_locations(cluster_api, template, content_hash, publication.org()).await?;
 
     let Some(object_store) = ObjectStoreConfig::from_env_optional()? else {
-        ensure_cluster_template(&mut cluster_api, &template, template_org).await?;
+        let registration = release_registration(recorded_locations.is_some(), None, execution);
         register_cluster_release(
-            &mut cluster_api,
-            &template,
+            cluster_api,
+            template,
             content_hash,
             &release_tags,
-            Vec::new(),
-            template_org,
-            execution,
+            registration.storage_locations,
+            publication,
+            registration.execution,
         )
         .await?;
         tracing::info!(
             template = template.as_str(),
             hash = %content_hash,
+            already_published = recorded_locations.is_some(),
             "cold store is not configured; registered release without storage location"
         );
-        mark_local_template_inventory_dirty(&template).await;
         return Ok(());
     };
-    let storage_uri = build_storage_uri(&object_store, &template, content_hash);
-    // Register the template identity before asking Credential Manager to
-    // authorize publication. A failed upload may leave a template with no
-    // release, but never a release that points at partial objects.
-    ensure_cluster_template(&mut cluster_api, &template, template_org).await?;
-    let publication_prefix =
-        template_object_prefix(&object_store.key_prefix, &template, content_hash);
-    let creds = acquire_after_artifacts_ready(&build_dir, || {
-        object_store_credentials(
-            &object_store.bucket,
-            &publication_prefix,
-            true,
-            crate::object_store::CredentialSubject::Template(&template),
-            StorageAccess::Write,
-        )
-    })
-    .await?;
-    let store = S3ObjectStore::new();
-
-    upload_build_artifacts(
-        &store,
-        &creds,
-        &object_store,
-        &template,
-        content_hash,
-        &build_dir,
-    )
-    .await?;
+    let storage_uri = build_storage_uri(&object_store, template, content_hash);
+    let published = if let Some(recorded) = &recorded_locations {
+        if recorded.contains(&storage_uri) {
+            tracing::info!(
+                template = template.as_str(),
+                hash = %content_hash,
+                "release is already published; skipping artifact upload"
+            );
+        } else {
+            tracing::warn!(
+                template = template.as_str(),
+                hash = %content_hash,
+                recorded_locations = recorded.len(),
+                "release is already published elsewhere; skipping artifact upload and \
+                 registering tags only, no location at the current object store"
+            );
+        }
+        true
+    } else {
+        let publication_prefix =
+            template_object_prefix(&object_store.key_prefix, template, content_hash);
+        let vend = acquire_publication_credentials(build_dir, || {
+            object_store_credentials(
+                &object_store.bucket,
+                &publication_prefix,
+                true,
+                crate::object_store::CredentialSubject::Template(template),
+                StorageAccess::Write,
+            )
+        })
+        .await?;
+        match vend {
+            Publication::Upload(creds) => {
+                let store = S3ObjectStore::new();
+                upload_build_artifacts(
+                    &store,
+                    &creds,
+                    &object_store,
+                    template,
+                    content_hash,
+                    build_dir,
+                )
+                .await?;
+                false
+            }
+            Publication::AlreadyPublished => {
+                // Another publisher registered this hash after the lookup, or
+                // the lookup could not see the release. The artifacts are
+                // published either way; only the tags remain to register.
+                tracing::info!(
+                    template = template.as_str(),
+                    hash = %content_hash,
+                    "credential manager reports the release as already published; \
+                     skipping artifact upload and registering tags only"
+                );
+                true
+            }
+        }
+    };
+    let registration = release_registration(published, Some(&storage_uri), execution);
 
     register_cluster_release(
-        &mut cluster_api,
-        &template,
+        cluster_api,
+        template,
         content_hash,
         &release_tags,
-        vec![storage_uri],
-        template_org,
-        execution,
+        registration.storage_locations,
+        publication,
+        registration.execution,
     )
     .await?;
-    mark_local_template_inventory_dirty(&template).await;
-
     Ok(())
+}
+
+/// The storage locations the cluster already records for this release, when
+/// an earlier publication uploaded and registered its artifacts. `None` when
+/// the release has no recorded location, is unregistered, or is not visible to
+/// this builder (`NotFound`). With a cold store configured, these cases require
+/// a credential exchange before deciding whether to upload or register tags only.
+async fn recorded_release_locations(
+    cluster_api: &mut AuthenticatedClusterApiClient,
+    template: &TemplateName,
+    content_hash: ContentHash,
+    template_org: Option<TemplateOrg>,
+) -> Result<Option<Vec<String>>, PublishError> {
+    let request = FindTemplateReleaseByHashRequest {
+        template_name: template.as_str().to_string(),
+        hash: content_hash.to_string(),
+        caller_org_id: template_org.map(|org| org.org_id().as_uuid().to_string()),
+    };
+    match cluster_api.find_template_release_by_hash(request).await {
+        Ok(response) => {
+            let locations: Vec<String> = response
+                .into_inner()
+                .storage_locations
+                .into_iter()
+                .map(|location| location.connection_string)
+                .collect();
+            Ok((!locations.is_empty()).then_some(locations))
+        }
+        Err(status) if status.code() == Code::NotFound => Ok(None),
+        Err(status) => Err(PublishError::FindTemplateRelease(status)),
+    }
+}
+
+/// What a publication registers besides its tags.
+struct ReleaseRegistration {
+    storage_locations: Vec<String>,
+    execution: Option<pplx_space_execution_common::proto::ExecutionMetadata>,
+}
+
+/// A release that is already published, whether the lookup said so or
+/// Credential Manager refused the write, was not uploaded again, so it
+/// registers neither a location, even when the current object store differs
+/// from every recorded one, nor execution metadata: the local manifest
+/// describes artifacts that never left this builder, and the published
+/// release's metadata must keep describing what is in the bucket. A first
+/// publication registers the location it uploaded to, if a cold store is
+/// configured, and its manifest's execution metadata.
+fn release_registration(
+    published: bool,
+    uploaded_to: Option<&str>,
+    execution: pplx_space_execution_common::proto::ExecutionMetadata,
+) -> ReleaseRegistration {
+    if published {
+        ReleaseRegistration {
+            storage_locations: Vec::new(),
+            execution: None,
+        }
+    } else {
+        ReleaseRegistration {
+            storage_locations: uploaded_to.map(str::to_string).into_iter().collect(),
+            execution: Some(execution),
+        }
+    }
+}
+
+/// The write vend's outcome for a release the publication lookup did not
+/// report as published.
+#[derive(Debug)]
+enum Publication {
+    /// Credentials for uploading the artifacts.
+    Upload(ObjectCredentials),
+    /// Credential Manager refused the write because the release already has
+    /// a storage location: another publisher registered this hash after the
+    /// lookup, or the lookup could not see the release. The artifacts are
+    /// published either way and only tags remain to register.
+    AlreadyPublished,
+}
+
+/// Acquire write credentials once the artifacts are ready, treating Credential
+/// Manager's machine-readable already-published refusal as a publication
+/// outcome rather than a failure. Every other error, including unrelated
+/// `PERMISSION_DENIED` refusals, still fails the publication.
+async fn acquire_publication_credentials<Acquire, AcquireFuture>(
+    build_dir: &Path,
+    acquire: Acquire,
+) -> Result<Publication, PublishError>
+where
+    Acquire: FnOnce() -> AcquireFuture,
+    AcquireFuture: std::future::Future<Output = Result<ObjectCredentials, CredentialExchangeError>>,
+{
+    match acquire_after_artifacts_ready(build_dir, acquire).await {
+        Ok(credentials) => Ok(Publication::Upload(credentials)),
+        Err(PublishError::CredentialExchange(error)) if error.is_release_already_published() => {
+            Ok(Publication::AlreadyPublished)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 async fn mark_local_template_inventory_dirty(template: &TemplateName) {
@@ -365,9 +583,9 @@ async fn register_with_transient_retry(
 async fn ensure_cluster_template(
     cluster_api: &mut AuthenticatedClusterApiClient,
     template: &TemplateName,
-    template_org: Option<TemplateOrg>,
+    publication: TemplatePublication,
 ) -> Result<(), PublishError> {
-    let request = RegisterRequest::Template(template_registration_request(template, template_org));
+    let request = RegisterRequest::Template(template_registration_request(template, publication));
     match register_with_transient_retry(cluster_api, template, request).await {
         Ok(()) => Ok(()),
         Err(status) if status.code() == Code::AlreadyExists => Ok(()),
@@ -377,12 +595,13 @@ async fn ensure_cluster_template(
 
 fn template_registration_request(
     template: &TemplateName,
-    template_org: Option<TemplateOrg>,
+    publication: TemplatePublication,
 ) -> RegisterTemplateRequest {
     RegisterTemplateRequest {
+        system_publication_grant_id: publication.system_grant().map(|grant| grant.to_string()),
         name: template.as_str().to_string(),
         description: None,
-        org_id: template_org.map(|owner| owner.org_id().to_string()),
+        org_id: publication.org().map(|owner| owner.org_id().to_string()),
     }
 }
 
@@ -392,21 +611,40 @@ async fn register_cluster_release(
     content_hash: ContentHash,
     tags: &[String],
     storage_connection_strings: Vec<String>,
-    template_org: Option<TemplateOrg>,
+    publication: TemplatePublication,
     execution: Option<pplx_space_execution_common::proto::ExecutionMetadata>,
 ) -> Result<(), PublishError> {
-    let request = RegisterRequest::Release(RegisterTemplateReleaseRequest {
+    let request = RegisterRequest::Release(release_registration_request(
+        template,
+        content_hash,
+        tags,
+        storage_connection_strings,
+        publication,
+        execution,
+    ));
+    register_with_transient_retry(cluster_api, template, request)
+        .await
+        .map_err(PublishError::RegisterTemplateRelease)
+}
+
+fn release_registration_request(
+    template: &TemplateName,
+    content_hash: ContentHash,
+    tags: &[String],
+    storage_connection_strings: Vec<String>,
+    publication: TemplatePublication,
+    execution: Option<pplx_space_execution_common::proto::ExecutionMetadata>,
+) -> RegisterTemplateReleaseRequest {
+    RegisterTemplateReleaseRequest {
+        system_publication_grant_id: publication.system_grant().map(|grant| grant.to_string()),
         template_name: template.as_str().to_string(),
         runtime: RUNTIME_FIRECRACKER_ALIAS.to_string(),
         hash: content_hash.to_string(),
         tags: tags.to_vec(),
         storage_connection_strings,
-        org_id: template_org.map(|owner| owner.org_id().to_string()),
+        org_id: publication.org().map(|owner| owner.org_id().to_string()),
         execution,
-    });
-    register_with_transient_retry(cluster_api, template, request)
-        .await
-        .map_err(PublishError::RegisterTemplateRelease)
+    }
 }
 
 /// Loads the build's execution metadata for attachment to the release

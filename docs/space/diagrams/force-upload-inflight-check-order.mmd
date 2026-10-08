@@ -1,0 +1,32 @@
+flowchart TB
+    scan["Node-ordered scan<br/>idx_sandboxes_target_node_ordered<br/>target_node_id = $1, lifecycle = 'suspended'"]:::scan
+
+    subgraph before["Before: AND NOT (durable) AND NOT (in-flight)"]
+        direction TB
+        b_order["Planner orders the two conjuncts by its cost estimate"]:::risk
+        b_inflight["In-flight probe can run first,<br/>on every suspended row the node pinned"]:::bad
+        b_durable["Durability probe"]:::probe
+        b_order --> b_inflight --> b_durable
+    end
+
+    subgraph after["After: CASE WHEN (durable) THEN false ELSE NOT (in-flight) END"]
+        direction TB
+        a_durable["Durability probe<br/>always evaluated first"]:::probe
+        a_skip["Durable row: excluded,<br/>in-flight probe never runs"]:::good
+        a_inflight["Non-durable row: in-flight probe runs<br/>once per backlog row, until the LIMIT fills"]:::good
+        a_durable -->|durable| a_skip
+        a_durable -->|not durable| a_inflight
+    end
+
+    scan --> b_order
+    scan --> a_durable
+
+    page["Page: lowest ids first, ORDER BY s.id, LIMIT cap + 1<br/>same result set in both forms"]:::scan
+    b_durable --> page
+    a_inflight --> page
+
+    classDef scan fill:#e8f0fe,stroke:#4a6fa5,color:#1a2b4a
+    classDef probe fill:#f3f3f3,stroke:#777,color:#222
+    classDef risk fill:#fff4e5,stroke:#c77700,color:#4a2c00
+    classDef bad fill:#fde8e8,stroke:#c0392b,color:#5a1010
+    classDef good fill:#e6f4ea,stroke:#2e7d32,color:#0f3d14

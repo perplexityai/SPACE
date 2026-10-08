@@ -75,7 +75,7 @@ only which headers matched, so neither results nor logs contain the credential.
 | `http2` | `198.18.1.2:8443` | `allow` / `deny`, verified TLS with required `h2` ALPN |
 | `grpc`, `grpcs` | `198.18.1.2:50051`, `:50052` | `allow` / `deny`, plaintext / verified TLS gRPC unary and bidirectional streaming |
 | `ws`, `wss` | `198.18.1.2:8081`, `:8444` | `allow` / `deny`, plaintext / verified TLS WebSocket upgrade, messages, ping/pong and close |
-| `quic` | `198.18.1.2:443` (UDP) | `allow` / `deny`, verified QUIC handshake and concurrent bidirectional streams |
+| `quic` | `198.18.1.2:443/8443` (UDP) | `allow` / `deny`, verified QUIC handshake and concurrent bidirectional streams |
 | `connect` | `198.18.1.2:8445` | `allow` / `deny`, authenticated HTTPS CONNECT with verified inner HTTPS |
 | `tls-echo` | `198.18.1.2:9443` | `allow` / `deny`, TLS SNI `host` and byte echo |
 | `udp` | `198.18.1.2:9000` | `allow` / `deny`; also accepts `port = 443` and a `sizes` array for multiple datagrams on one socket |
@@ -149,23 +149,48 @@ in a later probe. An existing-session check never silently reconnects. See
 
 ### Established connections
 
-The UDP/QUIC allow probes require payload delivery after the first reply;
-UDP/443 probes also check the packaged pre-TPROXY counter increments.
+The UDP/QUIC allow probes require payload delivery after the first reply. QUIC/8443
+remains allowed; UDP/443 and QUIC/443 exercise the packaged rejection. UDP/443
+probes accept `ECONNREFUSED` or a timeout when the ICMP reply is rate-limited.
+Every sent datagram must increment the guardrail counter and none may reach
+upstream. The reply-boundary regression separately requires an isolated attempt
+to receive an explicit refusal and checks a 20-attempt burst.
 The [established-connection bypass](../../../crates/libs/node/mgr/server/src/firewall.rs)
 is restricted to reply-direction traffic so later outbound datagrams still
 reach the gateway proxy.
 
 The worker image packages `docker/space/nftables/sandbox-pre-tproxy-guardrails.json` under `/etc/space/nftables`.
-Its IPv4 UDP/443 counter is observation-only and applies on slot setup/reset, not live gateway restart.
+Its IPv4 UDP/443 reject and namespace `net.ipv4.icmp_ratemask=6168` apply on slot
+setup/reset. The default mask retains ICMP rate limits, including for
+destination-unreachable replies. Bursts may suppress some refusals, but every
+matching UDP/443 packet remains blocked; the source guard restricts replies to
+the guest's own address. Unconnected UDP clients may still
+wait for their handshake timeout. Non-443 QUIC, routed IPv6, and established
+flows are unchanged.
+
+On upgrade, startup marks idle slots unknown/non-allocatable until firewall
+validation passes. Observe-only or missing UDP/443 rejects fail validation and
+use the existing idle-slot rebuild path. Live leases are only marked degraded;
+they are not disconnected. **Rollout gate:** wait for recovery to finish, check
+the slot health/degraded count, inspect
+`pre_tproxy_guardrails` in every live namespace, and drain/reset stale leases
+(including long-lived ones) through normal sandbox lifecycle operations. Confirm
+the reject and `icmp_ratemask=6168` in each reused namespace before declaring the
+rollout complete; a healthy binary or aggregate action gauge is not that proof.
+
+For rollback, use only the recorded #253 observation image digest and follow
+the [per-namespace rollback procedure](#udp443-policy-rollback) below.
+
 The existing 15-second network metrics loop emits `node_mgr.guest_udp443_packets`, a gauge summing current kernel counters across active slots per `action:observe|reject` (from the rule verdict), without sandbox tags.
 These count conntrack-new packets, including retries, rather than unique flows. Use Datadog `monotonic_diff()` or rate calculations for volume visibility; slot resets/removals lower the sum, so the difference misses that interval.
 
 ### UDP/443 policy rollback
 
 Startup validation fences idle slots whose UDP/443 rule differs from the image's
-packaged policy; the existing repair path rebuilds them before reuse. Slot setup
-and reset restore the default `net.ipv4.icmp_ratemask=6168`; readiness validation
-also repairs mask-only drift. Before enabling a rejecting policy, deploy and
+packaged policy; the existing repair path rebuilds them before reuse. After
+rolling back to the observation image, slot setup/reset restores the default
+`net.ipv4.icmp_ratemask=6168`; readiness validation also repairs mask-only drift.
+Before enabling a rejecting policy, deploy and
 record a #253-or-later observation image digest as its rollback target. Older
 observation images do not repair stale rejecting namespaces.
 
@@ -240,7 +265,8 @@ audit, and preserved ingress rules.
 It also runs the real slot-pool startup worker and SQLite migrations, rebuilding
 idle namespaces seeded with the opposite UDP/443 stage and with mask-only drift,
 while leaving a current slot unchanged. Expected verdict and mask come from the
-packaged stage: observation/6168 or reject/6160. Namespace inodes must stay the
+packaged stage; both observation and rejection retain `icmp_ratemask=6168`.
+Mask-only drift is seeded with `0`. Namespace inodes must stay the
 same, proving in-place repair:
 
 ```sh

@@ -1,18 +1,14 @@
 //! Bounded ingress waiting over independently owned access activation.
 use super::*;
 use pplx_space_common_core::types::{SandboxId, SandboxLifecycle};
-use pplx_space_common_svc::space_api_route_ed25519::SpaceApiRouteEd25519Authority;
-use pplx_space_internal_api_server::ingress_activation::{
-    IngressActivation, IngressActivationFactory as Factory,
-};
 use pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity;
+use pplx_space_node_api_client::activation::IngressActivation;
 use sqlx::PgPool;
 use std::{sync::Arc, time::Duration};
 use tokio::sync::Semaphore;
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use tonic::Status;
 
-pub struct IngressActivationFactory;
 struct Activator {
     backend: Arc<dyn AccessBackend>,
     owners: ActivationOwners,
@@ -78,33 +74,21 @@ impl ActivationOwners {
     }
 }
 
-#[tonic::async_trait]
-impl Factory for IngressActivationFactory {
-    async fn build(
-        &self,
-        pool: PgPool,
-        authority: Option<Arc<SpaceApiRouteEd25519Authority>>,
-        tasks: TaskTracker,
-        shutdown: CancellationToken,
-    ) -> Result<Arc<dyn IngressActivation>, Status> {
-        let substrate = Substrate::from_env(&pool)
-            .await
-            .map_err(|error| Status::unavailable(error.to_string()))?;
-        let admission = crate::cluster_admission::ClusterSandboxAdmission::new(
-            substrate.clone(),
-            pplx_space_feature_flags::FeatureFlagClient::from_env(),
-        );
-        let controller = SandboxController::with_cluster_admission(substrate, admission)
-            .with_route_ed25519_authority(authority);
-        Ok(Arc::new(Activator {
-            backend: Arc::new(StoredAccess { pool, controller }),
-            owners: ActivationOwners {
-                tasks,
-                slots: Arc::new(Semaphore::new(128)),
-                shutdown,
-            },
-        }))
-    }
+/// Reuse the API's controller, admission, caches and lifecycle task ownership.
+pub(crate) fn ingress_activation(
+    pool: PgPool,
+    controller: SandboxController,
+    tasks: TaskTracker,
+    shutdown: CancellationToken,
+) -> Arc<dyn IngressActivation> {
+    Arc::new(Activator {
+        backend: Arc::new(StoredAccess { pool, controller }),
+        owners: ActivationOwners {
+            tasks,
+            slots: Arc::new(Semaphore::new(128)),
+            shutdown,
+        },
+    })
 }
 
 #[tonic::async_trait]

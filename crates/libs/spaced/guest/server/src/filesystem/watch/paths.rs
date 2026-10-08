@@ -25,9 +25,9 @@ fn try_acquire_watch_directory_scan_slot(
     scan_slots: &Arc<Semaphore>,
 ) -> Result<OwnedSemaphorePermit, Status> {
     Arc::clone(scan_slots).try_acquire_owned().map_err(|_| {
-        Status::resource_exhausted(
+        crate::refused(Status::resource_exhausted(
             "too many concurrent file watcher directory scans; retry with backoff",
-        )
+        ))
     })
 }
 

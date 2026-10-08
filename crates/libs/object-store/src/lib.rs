@@ -10,11 +10,12 @@ use async_trait::async_trait;
 use aws_config::BehaviorVersion;
 use aws_credential_types::Credentials;
 use aws_credential_types::provider::ProvideCredentials;
-use aws_sdk_s3::config::{Region, RequestChecksumCalculation};
+use aws_sdk_s3::config::timeout::TimeoutConfig;
+use aws_sdk_s3::config::{Region, RequestChecksumCalculation, StalledStreamProtectionConfig};
 use aws_sdk_s3::error::SdkError;
 use aws_sdk_s3::operation::get_object::{GetObjectError, GetObjectOutput};
 use aws_sdk_s3::operation::head_object::HeadObjectError;
-use aws_sdk_s3::primitives::{ByteStream, Length};
+use aws_sdk_s3::primitives::{ByteStream, ByteStreamError, Length};
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
 use aws_sdk_s3::{Client, Config};
 use aws_smithy_types::error::display::DisplayErrorContext;
@@ -22,7 +23,7 @@ use aws_smithy_types::error::metadata::ProvideErrorMetadata;
 use bytes::Bytes;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
 use tokio::task::JoinSet;
@@ -30,9 +31,16 @@ use tracing::{Instrument, debug, info, warn};
 
 use pplx_space_common_core::types::{MULTIPART_CONCURRENCY, MULTIPART_PART_SIZE};
 
+mod attempts;
 mod content_md5;
 mod copy;
 mod download;
+#[cfg(test)]
+mod test_support;
+mod timeouts;
+
+use attempts::{AttemptObserver, AttemptTarget};
+use timeouts::S3Timeouts;
 
 pub use download::FinishingWrite;
 use download::{ReorderWindow, SequentialWriter, open_scratch};
@@ -345,6 +353,10 @@ pub trait ObjectStore: Send + Sync {
 #[derive(Clone)]
 pub struct S3ObjectStore {
     base: Client,
+    timeouts: S3Timeouts,
+    /// The observer the base client's interceptor reports through, for
+    /// failures the SDK cannot see: a response body read after `send()`.
+    attempts: AttemptObserver,
     multipart_part_size: usize,
     multipart_concurrency: usize,
     download_reader_concurrency: usize,
@@ -403,6 +415,12 @@ const DOWNLOAD_CHUNK_SIZE_MAX: usize = 256 * 1024 * 1024;
 const DEFAULT_DOWNLOAD_BUFFER_BUDGET: usize = 2 * 1024 * 1024 * 1024;
 const DOWNLOAD_BUFFER_BUDGET_MIN: usize = 256 * 1024 * 1024;
 const DOWNLOAD_BUFFER_BUDGET_MAX: usize = 8 * 1024 * 1024 * 1024;
+
+/// Upload stalled-stream grace period. Equal to the SDK's effective default
+/// (aws-smithy-runtime's default stalled-stream plugin sets 5 s; the 20 s
+/// `DEFAULT_GRACE_PERIOD` constant is only a builder fallback and does not
+/// apply), stated here so the value is visible next to the timeouts.
+const STALLED_STREAM_GRACE_PERIOD: Duration = Duration::from_secs(5);
 
 type S3Response = aws_smithy_runtime_api::http::Response;
 type S3SdkError<E> = SdkError<E, S3Response>;
@@ -672,7 +690,7 @@ where
     );
 }
 
-fn s3_base_config() -> Config {
+fn s3_base_config(timeouts: S3Timeouts, observer: AttemptObserver) -> aws_sdk_s3::config::Builder {
     let placeholder_creds = Credentials::new(
         "placeholder",
         "placeholder",
@@ -690,7 +708,16 @@ fn s3_base_config() -> Config {
         // stall until S3 returns RequestTimeout, so keep checksums to
         // operations where S3 requires them.
         .request_checksum_calculation(RequestChecksumCalculation::WhenRequired)
-        .build()
+        .stalled_stream_protection(
+            StalledStreamProtectionConfig::enabled()
+                .grace_period(STALLED_STREAM_GRACE_PERIOD)
+                .build(),
+        )
+        // Every call overrides this with its own class's bounds (see
+        // `timeouts`); the base carries the tightest class so a call that
+        // names none is still bounded.
+        .timeout_config(timeouts.request.timeout_config())
+        .interceptor(observer)
 }
 
 impl S3ObjectStore {
@@ -717,8 +744,28 @@ impl S3ObjectStore {
     /// - `SPACE_OBJECT_STORE_DOWNLOAD_BUFFER_BUDGET_BYTES`: 256 MiB ..= 8 GiB.
     ///   Process-wide cap on buffered download chunks across every
     ///   concurrent pull.
+    /// - `SPACE_OBJECT_STORE_{REQUEST,BODY_UPLOAD,SERVER_SIDE}_ATTEMPT_TIMEOUT_SECS`:
+    ///   5..=21600, defaults 10, 60, and 30. Bound each attempt of an
+    ///   operation in that class; see `timeouts` for which operations each
+    ///   class holds and the measurements behind the defaults. The
+    ///   body-upload default fits one 256 MiB part, so raise it with the part
+    ///   size.
+    /// - `SPACE_OBJECT_STORE_{REQUEST,BODY_UPLOAD,SERVER_SIDE}_OPERATION_TIMEOUT_SECS`:
+    ///   5..=86400, default three attempt timeouts plus 5 s of retry backoff
+    ///   (35, 185, and 95). Bound an operation across all of its retries.
     pub fn new() -> Self {
-        let conf = s3_base_config();
+        let timeouts = S3Timeouts::from_env();
+        let attempts = AttemptObserver::logging();
+        Self::with_base_config(
+            s3_base_config(timeouts, attempts.clone()).build(),
+            timeouts,
+            attempts,
+        )
+    }
+
+    /// `attempts` must be the observer `conf` carries, so body-read failures
+    /// the SDK never sees reach the same reporter as its own attempts.
+    fn with_base_config(conf: Config, timeouts: S3Timeouts, attempts: AttemptObserver) -> Self {
         let multipart_part_size = resolve_multipart_part_size(|name| std::env::var(name).ok());
         let multipart_concurrency = resolve_multipart_concurrency(|name| std::env::var(name).ok());
         let download_reader_concurrency =
@@ -735,10 +782,18 @@ impl S3ObjectStore {
             download_chunk_size,
             download_buffer_budget,
             download_buffer_chunks,
+            request_attempt_timeout_secs = timeouts.request.attempt.as_secs(),
+            request_operation_timeout_secs = timeouts.request.operation.as_secs(),
+            body_upload_attempt_timeout_secs = timeouts.body_upload.attempt.as_secs(),
+            body_upload_operation_timeout_secs = timeouts.body_upload.operation.as_secs(),
+            server_side_attempt_timeout_secs = timeouts.server_side.attempt.as_secs(),
+            server_side_operation_timeout_secs = timeouts.server_side.operation.as_secs(),
             "object-store: transfer tuning"
         );
         Self {
             base: Client::from_conf(conf),
+            timeouts,
+            attempts,
             multipart_part_size,
             multipart_concurrency,
             download_reader_concurrency,
@@ -747,10 +802,22 @@ impl S3ObjectStore {
         }
     }
 
-    /// Builds a per-request config override from the caller's creds + target.
+    /// Builds a per-request config override from the caller's creds +
+    /// target, bounded by `operation`'s timeout class.
     fn op_config(
+        &self,
         creds: &ObjectCredentials,
         target: &ObjectTarget<'_>,
+        operation: S3Operation,
+    ) -> aws_sdk_s3::config::Builder {
+        Self::op_config_with(creds, target, self.timeouts.for_operation(operation))
+    }
+
+    /// [`Self::op_config`] for work that outlives the borrow of the store.
+    fn op_config_with(
+        creds: &ObjectCredentials,
+        target: &ObjectTarget<'_>,
+        timeouts: TimeoutConfig,
     ) -> aws_sdk_s3::config::Builder {
         let credentials = Credentials::new(
             creds.access_key_id.clone(),
@@ -762,7 +829,8 @@ impl S3ObjectStore {
         let mut builder = aws_sdk_s3::config::Builder::new()
             .region(Region::new(target.region.to_string()))
             .credentials_provider(credentials)
-            .force_path_style(target.path_style);
+            .force_path_style(target.path_style)
+            .timeout_config(timeouts);
         if let Some(endpoint) = target.endpoint {
             builder = builder.endpoint_url(endpoint);
         }
@@ -783,7 +851,7 @@ impl ObjectStore for S3ObjectStore {
             .bucket(target.bucket)
             .key(target.key)
             .customize()
-            .config_override(Self::op_config(creds, &target))
+            .config_override(self.op_config(creds, &target, S3Operation::HeadObject))
             .send()
             .await
         {
@@ -836,7 +904,7 @@ impl ObjectStore for S3ObjectStore {
             .content_md5(content_md5)
             .body(ByteStream::from(body))
             .customize()
-            .config_override(Self::op_config(creds, &target))
+            .config_override(self.op_config(creds, &target, S3Operation::PutObject))
             .send()
             .await
             .map_err(|err| {
@@ -857,14 +925,18 @@ impl ObjectStore for S3ObjectStore {
             .bucket(target.bucket)
             .key(target.key)
             .customize()
-            .config_override(Self::op_config(creds, &target))
+            .config_override(self.op_config(creds, &target, S3Operation::GetObject))
             .send()
             .await
             .map_err(|err| classify_get_error(err, target.bucket, target.key))?;
+        let read_started_at = Instant::now();
         resp.body
             .collect()
             .await
-            .map_err(|err| ObjectStoreError::Get(DisplayErrorContext(&err).to_string()))
+            .map_err(|err| {
+                self.single_get_body_failed(&target, read_started_at, &err);
+                ObjectStoreError::Get(DisplayErrorContext(&err).to_string())
+            })
             .map(|aggregated| aggregated.to_vec())
     }
 
@@ -912,7 +984,7 @@ impl ObjectStore for S3ObjectStore {
                 .content_md5(content_md5)
                 .body(body)
                 .customize()
-                .config_override(Self::op_config(creds, &target))
+                .config_override(self.op_config(creds, &target, S3Operation::PutObject))
                 .send()
                 .await
                 .map_err(|err| {
@@ -950,7 +1022,7 @@ impl ObjectStore for S3ObjectStore {
             .bucket(target.bucket)
             .key(target.key)
             .customize()
-            .config_override(Self::op_config(creds, &target))
+            .config_override(self.op_config(creds, &target, S3Operation::CreateMultipartUpload))
             .send()
             .await
             .map_err(|err| {
@@ -973,7 +1045,7 @@ impl ObjectStore for S3ObjectStore {
             "created multipart upload"
         );
 
-        let abort = AbortGuard::new(self.base.clone(), creds.clone(), &target, &upload_id);
+        let abort = AbortGuard::new(self, creds, &target, &upload_id);
         let parts = self
             .upload_parts(creds, &target, &upload_id, src, size)
             .await
@@ -999,7 +1071,7 @@ impl ObjectStore for S3ObjectStore {
             .upload_id(&upload_id)
             .multipart_upload(completed)
             .customize()
-            .config_override(Self::op_config(creds, &target))
+            .config_override(self.op_config(creds, &target, S3Operation::CompleteMultipartUpload))
             .send()
             .await
             .map_err(|err| {
@@ -1035,7 +1107,7 @@ impl ObjectStore for S3ObjectStore {
             .bucket(target.bucket)
             .key(target.key)
             .customize()
-            .config_override(Self::op_config(creds, &target))
+            .config_override(self.op_config(creds, &target, S3Operation::GetObject))
             .send()
             .await
             .map_err(|err| classify_get_error(err, target.bucket, target.key))?;
@@ -1092,7 +1164,7 @@ impl ObjectStore for S3ObjectStore {
             .bucket(target.bucket)
             .key(target.key)
             .customize()
-            .config_override(Self::op_config(creds, &target))
+            .config_override(self.op_config(creds, &target, S3Operation::GetObject))
             .send()
             .await
             .map_err(|err| classify_get_error(err, target.bucket, target.key))?;
@@ -1156,7 +1228,33 @@ impl S3ObjectStore {
         );
         let mut body = resp.body;
         let mut writer = tokio::fs::File::create(dst).await?;
-        write_body_to_file(&mut writer, &mut body, size, "object body").await
+        let read_started_at = Instant::now();
+        write_body_to_file(&mut writer, &mut body, size, "object body", |error| {
+            self.single_get_body_failed(&target, read_started_at, error);
+        })
+        .await
+    }
+
+    /// Reports a failed read of a whole-object `GetObject` body. Not
+    /// retried: without a pinned ETag a re-read could return another
+    /// version, and only small objects take this path when one is pinned.
+    fn single_get_body_failed(
+        &self,
+        target: &ObjectTarget<'_>,
+        read_started_at: Instant,
+        error: &ByteStreamError,
+    ) {
+        self.attempts.body_read_failed(
+            &AttemptTarget {
+                bucket: Some(target.bucket.to_string()),
+                key: Some(target.key.to_string()),
+                ..AttemptTarget::default()
+            },
+            1,
+            false,
+            read_started_at.elapsed(),
+            error,
+        );
     }
 
     /// Ranged download with parallel readers and one sequential writer.
@@ -1278,24 +1376,29 @@ impl S3ObjectStore {
                     .get(chunk_index)
                     .copied()
                     .expect("next_chunk_index is bounded by ranges length");
-                let range_header = byte_range_header(range);
-                let length = range.length;
-                let client = self.base.clone();
-                let creds = creds.clone();
-                let bucket = target.bucket.to_string();
-                let key = target.key.to_string();
-                let region = target.region.to_string();
-                let endpoint = target.endpoint.map(str::to_string);
-                let path_style = target.path_style;
-                let etag = etag.clone();
+                let fetch = ChunkFetch {
+                    client: self.base.clone(),
+                    creds: creds.clone(),
+                    bucket: target.bucket.to_string(),
+                    key: target.key.to_string(),
+                    region: target.region.to_string(),
+                    endpoint: target.endpoint.map(str::to_string),
+                    path_style: target.path_style,
+                    etag: etag.clone(),
+                    chunk_index,
+                    range_header: byte_range_header(range),
+                    length: range.length,
+                    timeouts: self.timeouts.for_operation(S3Operation::GetObject),
+                    attempts: self.attempts.clone(),
+                };
 
                 debug!(
-                    bucket,
-                    key,
+                    bucket = fetch.bucket,
+                    key = fetch.key,
                     chunk_index,
                     offset_bytes = range.offset,
-                    length_bytes = length,
-                    range = range_header,
+                    length_bytes = range.length,
+                    range = fetch.range_header,
                     in_flight,
                     reader_concurrency,
                     "scheduling ranged download chunk"
@@ -1312,93 +1415,18 @@ impl S3ObjectStore {
                     otel.status_code = tracing::field::Empty,
                     otel.status_description = tracing::field::Empty,
                     "operation.name" = "s3.client",
-                    s3.bucket = %bucket,
-                    s3.key = %key,
-                    s3.range = %range_header,
+                    s3.bucket = %fetch.bucket,
+                    s3.key = %fetch.key,
+                    s3.range = %fetch.range_header,
                     s3.chunk_index = chunk_index,
-                    s3.endpoint = %endpoint_span_label(endpoint.as_deref()),
+                    s3.endpoint = %endpoint_span_label(fetch.endpoint.as_deref()),
                 );
                 tasks.spawn(
                     async move {
-                        let outcome: Result<FetchedChunk, ObjectStoreError> = async {
-                            let started_at = Instant::now();
-                            let target = ObjectTarget {
-                                bucket: &bucket,
-                                key: &key,
-                                region: &region,
-                                endpoint: endpoint.as_deref(),
-                                path_style,
-                            };
-                            let resp = match client
-                                .get_object()
-                                .bucket(&bucket)
-                                .key(&key)
-                                .range(&range_header)
-                                .if_match(etag)
-                                .customize()
-                                .config_override(Self::op_config(&creds, &target))
-                                .send()
-                                .await
-                            {
-                                Ok(resp) => resp,
-                                Err(err) => {
-                                    let error = classify_get_error(err, &bucket, &key);
-                                    warn!(
-                                        key,
-                                        chunk_index,
-                                        range = range_header,
-                                        elapsed_ms = started_at.elapsed().as_millis(),
-                                        error = %error,
-                                        "ranged download chunk failed"
-                                    );
-                                    return Err(error);
-                                }
-                            };
-
-                            // An endpoint or proxy that ignores `Range` can
-                            // return the full object; reading unboundedly
-                            // would materialize it under a single chunk
-                            // permit and bypass the buffer budget. Reject an
-                            // oversized advertised length up front and cap
-                            // the streamed read at the requested range.
-                            if let Some(advertised) = resp.content_length()
-                                && u64::try_from(advertised).ok() != Some(length)
-                            {
-                                return Err(ObjectStoreError::RangeLengthMismatch {
-                                    range: range_header,
-                                    got: usize::try_from(advertised).unwrap_or(usize::MAX),
-                                    expected: length,
-                                });
-                            }
-                            let mut body = resp.body;
-                            let mut buf = bytes::BytesMut::with_capacity(length as usize);
-                            while let Some(part) = body.try_next().await.map_err(|err| {
-                                ObjectStoreError::RangeBodyRead {
-                                    range: range_header.clone(),
-                                    message: DisplayErrorContext(&err).to_string(),
-                                }
-                            })? {
-                                if buf.len() + part.len() > length as usize {
-                                    return Err(ObjectStoreError::RangeLengthMismatch {
-                                        range: range_header,
-                                        got: buf.len() + part.len(),
-                                        expected: length,
-                                    });
-                                }
-                                buf.extend_from_slice(&part);
-                            }
-                            let bytes = buf.freeze();
-                            if bytes.len() as u64 != length {
-                                return Err(ObjectStoreError::RangeLengthMismatch {
-                                    range: range_header,
-                                    got: bytes.len(),
-                                    expected: length,
-                                });
-                            }
-
-                            Ok((chunk_index, bytes, permit, started_at.elapsed().as_millis()))
-                        }
-                        .await;
+                        let started_at = Instant::now();
+                        let outcome = fetch.fetch().await.map(|bytes| {
+                            (chunk_index, bytes, permit, started_at.elapsed().as_millis())
+                        });
                         // External-client spans must record an outcome on
                         // every exit path, not just expose latency.
                         let current = tracing::Span::current();
@@ -1540,7 +1568,7 @@ impl S3ObjectStore {
             let key = target.key.to_string();
             let upload_id = upload_id.to_string();
             let path = src.to_path_buf();
-            let cfg = Self::op_config(creds, target);
+            let cfg = self.op_config(creds, target, S3Operation::UploadPart);
 
             async move {
                 let content_md5 = file_range_content_md5(&path, range.offset, range.length)
@@ -1611,6 +1639,175 @@ impl S3ObjectStore {
             }
         })
         .await
+    }
+}
+
+/// Backoff before each retry of a ranged-download chunk whose response body
+/// failed mid-read, so a chunk gets up to three attempts. Each is jittered
+/// down to half. Short on purpose: the failure is one connection, and the
+/// other readers keep going while this one waits.
+const CHUNK_RETRY_BACKOFF: [Duration; 2] = [Duration::from_millis(250), Duration::from_secs(1)];
+
+/// One chunk of a ranged single-writer download, owned so the fetch can run
+/// on its own task.
+struct ChunkFetch {
+    client: Client,
+    creds: ObjectCredentials,
+    bucket: String,
+    key: String,
+    region: String,
+    endpoint: Option<String>,
+    path_style: bool,
+    etag: String,
+    chunk_index: usize,
+    range_header: String,
+    length: u64,
+    timeouts: TimeoutConfig,
+    attempts: AttemptObserver,
+}
+
+/// Why one chunk attempt failed.
+enum ChunkFailure {
+    /// The response body failed mid-read: a stall cut, reset, or early EOF.
+    Body(ByteStreamError),
+    /// Anything else, which a chunk retry cannot fix.
+    Fatal(ObjectStoreError),
+}
+
+impl ChunkFetch {
+    /// Fetches the chunk, retrying a response body that fails mid-read.
+    ///
+    /// The SDK retries the request, but the body is read after `send()`
+    /// returns, outside its retry loop; without this, one stalled or cut
+    /// connection fails the whole download and the caller restarts the
+    /// entire transfer. Each retry re-issues the ranged GET pinned to the
+    /// same ETag, so an object that changed in between still fails with 412
+    /// rather than mixing versions.
+    ///
+    /// Not retried: a failed request, which the SDK has already retried
+    /// (a 412 is not retryable there either); a length mismatch, which a
+    /// misbehaving endpoint repeats; and cancellation, which drops this
+    /// future. The caller's buffer permit stays held across retries, and a
+    /// failed attempt's partial buffer is dropped before the next starts, so
+    /// a retry never takes more than its one chunk of the buffer budget.
+    async fn fetch(&self) -> Result<Bytes, ObjectStoreError> {
+        let started_at = Instant::now();
+        let mut attempt = 1;
+        loop {
+            let attempt_started_at = Instant::now();
+            let error = match self.fetch_once().await {
+                Ok(bytes) => {
+                    if attempt > 1 {
+                        self.attempts.body_read_recovered(
+                            &self.attempt_target(),
+                            attempt,
+                            started_at.elapsed(),
+                        );
+                    }
+                    return Ok(bytes);
+                }
+                Err(ChunkFailure::Fatal(error)) => return Err(error),
+                Err(ChunkFailure::Body(error)) => error,
+            };
+            let backoff = CHUNK_RETRY_BACKOFF.get(attempt as usize - 1);
+            self.attempts.body_read_failed(
+                &self.attempt_target(),
+                attempt,
+                backoff.is_some(),
+                attempt_started_at.elapsed(),
+                &error,
+            );
+            let Some(backoff) = backoff else {
+                return Err(ObjectStoreError::RangeBodyRead {
+                    range: self.range_header.clone(),
+                    message: DisplayErrorContext(&error).to_string(),
+                });
+            };
+            tokio::time::sleep(backoff.mul_f64(rand::random_range(0.5..=1.0))).await;
+            attempt += 1;
+        }
+    }
+
+    async fn fetch_once(&self) -> Result<Bytes, ChunkFailure> {
+        let started_at = Instant::now();
+        let target = ObjectTarget {
+            bucket: &self.bucket,
+            key: &self.key,
+            region: &self.region,
+            endpoint: self.endpoint.as_deref(),
+            path_style: self.path_style,
+        };
+        let resp = match self
+            .client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(&self.key)
+            .range(&self.range_header)
+            .if_match(&self.etag)
+            .customize()
+            .config_override(S3ObjectStore::op_config_with(
+                &self.creds,
+                &target,
+                self.timeouts.clone(),
+            ))
+            .send()
+            .await
+        {
+            Ok(resp) => resp,
+            Err(err) => {
+                let error = classify_get_error(err, &self.bucket, &self.key);
+                warn!(
+                    key = self.key,
+                    chunk_index = self.chunk_index,
+                    range = self.range_header,
+                    elapsed_ms = started_at.elapsed().as_millis(),
+                    error = %error,
+                    "ranged download chunk failed"
+                );
+                return Err(ChunkFailure::Fatal(error));
+            }
+        };
+
+        let length = self.length;
+        let mismatch = |got: usize| {
+            ChunkFailure::Fatal(ObjectStoreError::RangeLengthMismatch {
+                range: self.range_header.clone(),
+                got,
+                expected: length,
+            })
+        };
+        // An endpoint or proxy that ignores `Range` can return the full
+        // object; reading unboundedly would materialize it under a single
+        // chunk permit and bypass the buffer budget. Reject an oversized
+        // advertised length up front and cap the streamed read at the
+        // requested range.
+        if let Some(advertised) = resp.content_length()
+            && u64::try_from(advertised).ok() != Some(length)
+        {
+            return Err(mismatch(usize::try_from(advertised).unwrap_or(usize::MAX)));
+        }
+        let mut body = resp.body;
+        let mut buf = bytes::BytesMut::with_capacity(length as usize);
+        while let Some(part) = body.try_next().await.map_err(ChunkFailure::Body)? {
+            if buf.len() + part.len() > length as usize {
+                return Err(mismatch(buf.len() + part.len()));
+            }
+            buf.extend_from_slice(&part);
+        }
+        if buf.len() as u64 != length {
+            return Err(mismatch(buf.len()));
+        }
+        Ok(buf.freeze())
+    }
+
+    fn attempt_target(&self) -> AttemptTarget {
+        AttemptTarget {
+            bucket: Some(self.bucket.clone()),
+            key: Some(self.key.clone()),
+            range: Some(self.range_header.clone()),
+            chunk_index: Some(self.chunk_index),
+            ..AttemptTarget::default()
+        }
     }
 }
 
@@ -1817,18 +2014,23 @@ fn get_object_content_length(
     })
 }
 
+/// `on_body_error` sees a failed read of `body` before it becomes the
+/// returned error.
 async fn write_body_to_file(
     writer: &mut tokio::fs::File,
     body: &mut ByteStream,
     expected_length: u64,
     description: &str,
+    on_body_error: impl FnOnce(&ByteStreamError),
 ) -> Result<u64, ObjectStoreError> {
     let mut written: u64 = 0;
-    while let Some(chunk) = body
-        .try_next()
-        .await
-        .map_err(|err| ObjectStoreError::Get(DisplayErrorContext(&err).to_string()))?
-    {
+    let mut on_body_error = Some(on_body_error);
+    while let Some(chunk) = body.try_next().await.map_err(|err| {
+        if let Some(report) = on_body_error.take() {
+            report(&err);
+        }
+        ObjectStoreError::Get(DisplayErrorContext(&err).to_string())
+    })? {
         let chunk_len = chunk.len() as u64;
         let next_written = written.checked_add(chunk_len).ok_or_else(|| {
             ObjectStoreError::Get(format!(
@@ -1920,6 +2122,7 @@ async fn file_range_content_md5(path: &Path, offset: u64, length: u64) -> std::i
 /// can run from `Drop` without touching the original borrows.
 struct AbortGuard {
     client: Client,
+    timeouts: TimeoutConfig,
     creds: ObjectCredentials,
     bucket: String,
     key: String,
@@ -1932,14 +2135,17 @@ struct AbortGuard {
 
 impl AbortGuard {
     fn new(
-        client: Client,
-        creds: ObjectCredentials,
+        store: &S3ObjectStore,
+        creds: &ObjectCredentials,
         target: &ObjectTarget<'_>,
         upload_id: &str,
     ) -> Self {
         Self {
-            client,
-            creds,
+            client: store.base.clone(),
+            timeouts: store
+                .timeouts
+                .for_operation(S3Operation::AbortMultipartUpload),
+            creds: creds.clone(),
             bucket: target.bucket.to_string(),
             key: target.key.to_string(),
             region: target.region.to_string(),
@@ -1961,6 +2167,7 @@ impl Drop for AbortGuard {
             return;
         }
         let client = self.client.clone();
+        let timeouts = self.timeouts.clone();
         let creds = self.creds.clone();
         let bucket = std::mem::take(&mut self.bucket);
         let key = std::mem::take(&mut self.key);
@@ -1978,7 +2185,7 @@ impl Drop for AbortGuard {
                     endpoint: endpoint.as_deref(),
                     path_style,
                 };
-                let cfg = S3ObjectStore::op_config(&creds, &target);
+                let cfg = S3ObjectStore::op_config_with(&creds, &target, timeouts);
                 if let Err(err) = client
                     .abort_multipart_upload()
                     .bucket(&bucket)

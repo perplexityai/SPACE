@@ -24,6 +24,7 @@ async fn register_inventory_template(pool: &PgPool) -> TestResult {
     ClusterApiService::new(pool.clone())
         .register_template(crate::tests::publisher_request(
             crate::RegisterTemplateRequest {
+                system_publication_grant_id: None,
                 name: "code-runtime".to_string(),
                 description: None,
                 org_id: None,

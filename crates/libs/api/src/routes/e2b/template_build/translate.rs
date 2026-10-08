@@ -544,8 +544,12 @@ fn install_start_cmd_unit(start_cmd: &str) -> build_proto::recipe::Step {
             "After=local-fs.target network-online.target\n",
             "DefaultDependencies=no\n",
             "\n",
+            // The seed's drop-in for this unit sets its slice and task limit.
             "[Service]\n",
             "Type=simple\n",
+            // One of its processes killed for running out of memory ends that
+            // process, not the whole start command.
+            "OOMPolicy=continue\n",
             "ExecStart=/bin/sh -lc {cmd_quoted}\n",
             "Restart=on-failure\n",
             "RestartSec=2\n",

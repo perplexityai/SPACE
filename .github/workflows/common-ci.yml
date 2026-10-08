@@ -95,32 +95,16 @@ jobs:
       - name: Install documentation dependencies
         run: npm ci --prefix docs/api --ignore-scripts --no-fund
 
-      - name: Build guide and API while installing the test browser
+      - name: Build guide and API
         env:
           SPACE_API_DOCS_RUST_IMAGE: space-ci:${{ github.sha }}
           SPACE_DOCS_NPM_CI_DONE: '1'
-        run: |
-          bash scripts/build-docs.sh &
-          build_pid=$!
-          npm --prefix docs/api exec -- playwright install --with-deps --only-shell chromium &
-          browser_pid=$!
-          status=0
-          wait "$build_pid" || status=1
-          wait "$browser_pid" || status=1
-          exit "$status"
+        run: bash scripts/build-docs.sh
 
       - name: Check standalone outputs and the combined site
         run: |
           python3 docs/book/test.py
           python3 docs/site/test_build.py
-          node docs/api/test.mjs &
-          api_pid=$!
-          node docs/site/test.mjs &
-          site_pid=$!
-          status=0
-          wait "$api_pid" || status=1
-          wait "$site_pid" || status=1
-          exit "$status"
 
       - name: Retain private preview assets
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -128,14 +112,6 @@ jobs:
           name: space-docs-${{ github.event.pull_request.head.sha || github.sha }}
           path: target/docs/site/
           include-hidden-files: true
-          retention-days: 1
-          if-no-files-found: error
-
-      - name: Retain visual check screenshots
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: space-docs-checks-${{ github.event.pull_request.head.sha || github.sha }}
-          path: target/docs/site-checks/
           retention-days: 1
           if-no-files-found: error
 

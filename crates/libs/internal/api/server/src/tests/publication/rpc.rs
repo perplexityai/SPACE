@@ -42,6 +42,7 @@ fn request<T>(body: T, account: &str) -> Request<T> {
 
 fn registration(name: &str, org: Option<Uuid>) -> RegisterTemplateRequest {
     RegisterTemplateRequest {
+        system_publication_grant_id: None,
         name: name.into(),
         description: None,
         org_id: org.map(|v| v.to_string()),
@@ -50,6 +51,7 @@ fn registration(name: &str, org: Option<Uuid>) -> RegisterTemplateRequest {
 
 fn release(name: &str, org: Option<Uuid>) -> RegisterTemplateReleaseRequest {
     RegisterTemplateReleaseRequest {
+        system_publication_grant_id: None,
         template_name: name.into(),
         org_id: org.map(|v| v.to_string()),
         runtime: "fc".into(),
@@ -60,10 +62,34 @@ fn release(name: &str, org: Option<Uuid>) -> RegisterTemplateReleaseRequest {
     }
 }
 
+/// What the API records before it dispatches a system template build.
+async fn grant_system_publication(pool: &sqlx::PgPool, template: &str) -> TestResult<Uuid> {
+    let grant = Uuid::now_v7();
+    sqlx::query(sql!(
+        "INSERT INTO template_system_publication_grants (id, template_name) VALUES ($1, $2)"
+    ))
+    .bind(grant)
+    .bind(template)
+    .execute(pool)
+    .await?;
+    Ok(grant)
+}
+
+async fn system_publication_grants(pool: &sqlx::PgPool, template: &str) -> TestResult<i64> {
+    Ok(sqlx::query_scalar(sql!(
+        "SELECT count(*) FROM template_system_publication_grants WHERE template_name = $1"
+    ))
+    .bind(template)
+    .fetch_one(pool)
+    .await?)
+}
+
 #[test]
 fn authenticated_publication_enforces_identity_owner_and_reserved_outputs() -> TestResult {
     let env = [
         ("SPACE_K8S_TOKEN_AUTH_ENABLED", "true"),
+        // This table exercises authorization, not the separately tested rate limiter.
+        ("SPACE_K8S_TOKEN_AUTH_REVIEW_RATE_PER_SEC", "1000"),
         ("SPACE_K8S_TOKEN_AUTH_STATIC_FALLBACK_ENABLED", "false"),
         ("KUBERNETES_SERVICE_HOST", "127.0.0.1"),
         ("SPACE_K8S_TOKEN_AUTH_NAMESPACE", "space"),
@@ -188,6 +214,71 @@ async fn run() -> TestResult {
             "workers",
         ))
         .await?;
+    for account in ["workers", "space-api", "space-build-manager"] {
+        assert_eq!(
+            client
+                .create_system_template_publication_grant(request(
+                    CreateSystemTemplatePublicationGrantRequest {
+                        template_name: "direct-custom".into()
+                    },
+                    account,
+                ))
+                .await
+                .unwrap_err()
+                .code(),
+            Code::PermissionDenied
+        );
+    }
+    let operator_grant = client
+        .create_system_template_publication_grant(request(
+            CreateSystemTemplatePublicationGrantRequest {
+                template_name: "direct-custom".into(),
+            },
+            "space-template-publish",
+        ))
+        .await?
+        .into_inner()
+        .grant_id;
+    let mut direct_template = registration("direct-custom", None);
+    direct_template.system_publication_grant_id = Some(operator_grant.clone());
+    client
+        .register_template(request(direct_template, "space-build-manager"))
+        .await?;
+    let mut direct_release = release("direct-custom", None);
+    direct_release.system_publication_grant_id = Some(operator_grant);
+    client
+        .register_template_release(request(direct_release, "space-build-manager"))
+        .await?;
+    assert_eq!(
+        system_publication_grants(&db.pool, "direct-custom").await?,
+        0
+    );
+    // Build-manager also publishes tenant templates, so it publishes a system
+    // template only for an independently authorized build. The deploy-time
+    // publisher needs no grant.
+    assert_eq!(
+        client
+            .register_template(request(
+                registration("code-runtime", None),
+                "space-build-manager"
+            ))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::PermissionDenied
+    );
+    assert_eq!(
+        client
+            .register_template_release(request(
+                release("code-runtime", None),
+                "space-build-manager"
+            ))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::PermissionDenied
+    );
+    let grant = grant_system_publication(&db.pool, "code-runtime").await?;
     for (name, publisher) in [
         ("seed", "space-template-publish"),
         ("code-runtime", "space-build-manager"),
@@ -204,13 +295,153 @@ async fn run() -> TestResult {
                 .code(),
             Code::PermissionDenied
         );
+        let mut template = registration(name, None);
+        let mut publication = release(name, None);
+        if publisher == "space-build-manager" {
+            template.system_publication_grant_id = Some(grant.to_string());
+            publication.system_publication_grant_id = Some(grant.to_string());
+        }
         client
-            .register_template(request(registration(name, None), publisher))
+            .register_template(request(template, publisher))
             .await?;
         client
-            .register_template_release(request(release(name, None), publisher))
+            .register_template_release(request(publication, publisher))
             .await?;
     }
+    // One grant covers one release: a second release, an expired grant, or a
+    // grant for another template authorizes nothing.
+    assert_eq!(
+        system_publication_grants(&db.pool, "code-runtime").await?,
+        0
+    );
+    let expired = Uuid::now_v7();
+    sqlx::query(sql!(
+        "INSERT INTO template_system_publication_grants (id, template_name, granted_at)
+         VALUES ($1, 'code-runtime', NOW() - INTERVAL '8 days')"
+    ))
+    .bind(expired)
+    .execute(&db.pool)
+    .await?;
+    let other_template = grant_system_publication(&db.pool, "seed").await?;
+    for (proof, expected) in [
+        (None, Code::PermissionDenied),
+        (Some(grant.to_string()), Code::PermissionDenied),
+        (Some(expired.to_string()), Code::PermissionDenied),
+        (Some(other_template.to_string()), Code::PermissionDenied),
+        (Some(Uuid::now_v7().to_string()), Code::PermissionDenied),
+        (Some("invalid-grant".to_string()), Code::InvalidArgument),
+    ] {
+        let mut template = registration("code-runtime", None);
+        template.system_publication_grant_id = proof.clone();
+        let mut second = release("code-runtime", None);
+        second.hash = format!("sha256:{}", "c".repeat(64));
+        second.system_publication_grant_id = proof;
+        assert_eq!(
+            client
+                .register_template(request(template, "space-build-manager"))
+                .await
+                .unwrap_err()
+                .code(),
+            expected
+        );
+        assert_eq!(
+            client
+                .register_template_release(request(second, "space-build-manager"))
+                .await
+                .unwrap_err()
+                .code(),
+            expected
+        );
+    }
+    sqlx::query(sql!("DELETE FROM template_system_publication_grants"))
+        .execute(&db.pool)
+        .await?;
+    // B publishes while A is still dispatching. Withdrawing A afterward must
+    // leave no unused publication authority from B.
+    let grant_a = Uuid::now_v7();
+    let grant_b = Uuid::now_v7();
+    sqlx::query(sql!(
+        "INSERT INTO template_system_publication_grants (id, template_name, granted_at)
+         VALUES ($1, 'code-runtime', NOW() - INTERVAL '2 seconds'),
+                ($2, 'code-runtime', NOW() - INTERVAL '1 second')"
+    ))
+    .bind(grant_a)
+    .bind(grant_b)
+    .execute(&db.pool)
+    .await?;
+    let mut publication_b = release("code-runtime", None);
+    publication_b.system_publication_grant_id = Some(grant_b.to_string());
+    client
+        .register_template_release(request(publication_b.clone(), "space-build-manager"))
+        .await?;
+    let remaining: Vec<Uuid> = sqlx::query_scalar(sql!(
+        "SELECT id FROM template_system_publication_grants WHERE template_name = 'code-runtime'"
+    ))
+    .fetch_all(&db.pool)
+    .await?;
+    assert_eq!(remaining, vec![grant_a], "B must consume its own grant");
+    // A's still-valid grant cannot authorize a replay of B.
+    assert_eq!(
+        client
+            .register_template_release(request(publication_b.clone(), "space-build-manager"))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::PermissionDenied
+    );
+    sqlx::query(sql!(
+        "DELETE FROM template_system_publication_grants WHERE id = $1"
+    ))
+    .bind(grant_a)
+    .execute(&db.pool)
+    .await?;
+    assert_eq!(
+        system_publication_grants(&db.pool, "code-runtime").await?,
+        0
+    );
+    assert_eq!(
+        client
+            .register_template_release(request(publication_b, "space-build-manager"))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::PermissionDenied
+    );
+    let rollback_grant = grant_system_publication(&db.pool, "rollback-output").await?;
+    let mut rollback_release = release("rollback-output", None);
+    rollback_release.system_publication_grant_id = Some(rollback_grant.to_string());
+    assert_eq!(
+        client
+            .register_template_release(request(rollback_release.clone(), "space-build-manager"))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::NotFound
+    );
+    assert_eq!(
+        system_publication_grants(&db.pool, "rollback-output").await?,
+        1
+    );
+    let mut rollback_template = registration("rollback-output", None);
+    rollback_template.system_publication_grant_id = Some(rollback_grant.to_string());
+    client
+        .register_template(request(rollback_template, "space-build-manager"))
+        .await?;
+    let mut concurrent_client = client.clone();
+    let (first, replay) = tokio::join!(
+        client.register_template_release(request(rollback_release.clone(), "space-build-manager")),
+        concurrent_client
+            .register_template_release(request(rollback_release, "space-build-manager")),
+    );
+    assert_eq!(usize::from(first.is_ok()) + usize::from(replay.is_ok()), 1);
+    assert_eq!(
+        first.err().or_else(|| replay.err()).unwrap().code(),
+        Code::PermissionDenied
+    );
+    assert_eq!(
+        system_publication_grants(&db.pool, "rollback-output").await?,
+        0
+    );
     client
         .register_template(request(
             registration("tenant-output", Some(owner)),
@@ -315,9 +546,14 @@ async fn run() -> TestResult {
             .code(),
         Code::PermissionDenied
     );
+    let grant = grant_system_publication(&db.pool, "seed").await?;
+    let mut template = registration("seed", None);
+    template.system_publication_grant_id = Some(grant.to_string());
     client
-        .register_template(request(registration("seed", None), "space-build-manager"))
+        .register_template(request(template, "space-build-manager"))
         .await?;
+    // Registering the template leaves the grant for the build's release.
+    assert_eq!(system_publication_grants(&db.pool, "seed").await?, 1);
     sqlx::query(sql!("UPDATE templates SET org_id=$1 WHERE name='seed'"))
         .bind(foreign)
         .execute(&db.pool)

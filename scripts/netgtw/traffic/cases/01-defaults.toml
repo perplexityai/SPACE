@@ -7,14 +7,16 @@ probes = [
   { kind = "http", host = "allowed.test", expect = "allow" },
   { kind = "tls", host = "allowed.test", expect = "allow" },
   { kind = "udp", expect = "allow" },
-  { kind = "udp", port = 443, expect = "allow" },
+  { kind = "udp", port = 443, expect = "deny" },
+  { kind = "udp", port = 443, sizes = [64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64], expect = "deny" },
   { kind = "h2c", host = "allowed.test", expect = "allow" },
   { kind = "http2", host = "allowed.test", expect = "allow" },
   { kind = "grpc", host = "allowed.test", expect = "allow" },
   { kind = "grpcs", host = "allowed.test", expect = "allow" },
   { kind = "ws", host = "allowed.test", expect = "allow" },
   { kind = "wss", host = "allowed.test", expect = "allow" },
-  { kind = "quic", host = "allowed.test", expect = "allow" },
+  { kind = "quic", host = "allowed.test", expect = "deny" },
+  { kind = "quic", port = 8443, host = "allowed.test", expect = "allow" },
   { kind = "udp", sizes = [64, 1200, 8192], expect = "allow" },
 ]
 

@@ -1333,6 +1333,46 @@ pub struct PooledExecutionClaim {
     pub route_identity: Option<SandboxRouteIdentity>,
 }
 
+/// A warm-pool slot claimed for a create when the create was admitted, before
+/// it was queued. The create's public sandbox ID is that slot's reserved ID,
+/// so the executor must adopt exactly this slot (or build cold under the same
+/// ID) and never claim a different one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AdmittedPoolClaim {
+    pub claim_id: Uuid,
+    pub pool_slot_id: Uuid,
+}
+
+/// A ready warm-pool slot claimed while a create is being admitted, in the
+/// transaction that records the create. `sandbox_id` is the slot's reserved
+/// ID, which becomes the create's public ID.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AdmissionPoolClaim {
+    pub claim: AdmittedPoolClaim,
+    pub sandbox_id: SandboxId,
+}
+
+/// What the substrate found for an [`AdmittedPoolClaim`].
+pub enum AdmittedPoolClaimLookup {
+    /// The admitted slot still carries this claim and passed the same pod
+    /// and placement checks an ordinary claim makes. The caller must persist
+    /// it with `persist_pooled_execution_claim` or compensate it with
+    /// `rollback_pooled_execution_claim`.
+    Adoptable {
+        claim: Box<PooledExecutionClaim>,
+        pool_shape: PooledExecutionPoolShape,
+    },
+    /// No unbound slot owns a pod under this sandbox ID any more (the slot
+    /// was collected, or was bound and retired). A cold create under the same
+    /// ID is safe once it skips the generation the slot's pod used.
+    Released,
+    /// A slot still owns a pod under this sandbox ID that this create will
+    /// not adopt. It has been taken out of the claimable inventory, and the
+    /// pool's own cleanup collects it; until then a cold create under this ID
+    /// would leave that pod with nothing to collect it, so the caller waits.
+    ReleasePending,
+}
+
 pub struct PooledExecutionClaimAttempt {
     pub claim: Option<PooledExecutionClaim>,
     /// Exact release-and-shape pool selected by this attempt. A miss can have
@@ -2445,6 +2485,54 @@ pub trait SubstrateAdapter: Send + Sync {
         Ok(PooledExecutionClaimAttempt::missed(None))
     }
 
+    /// Look up the slot a create was admitted against. Substrates without
+    /// admission-time pool claims own no slot under the ID, so the default
+    /// answers [`AdmittedPoolClaimLookup::Released`] and the create builds
+    /// cold.
+    async fn lookup_admitted_pooled_execution(
+        &self,
+        _request: &PooledExecutionClaimRequest<'_>,
+        _admitted: AdmittedPoolClaim,
+        _sandbox_id: SandboxId,
+    ) -> Result<AdmittedPoolClaimLookup, ControllerError> {
+        Ok(AdmittedPoolClaimLookup::Released)
+    }
+
+    /// Before a cold create under an ID whose admitted slot was not adopted,
+    /// record that the slot's pod used this ID's first execution generation,
+    /// so the cold execution is allocated the next one and cannot share a
+    /// name with a pod that may still be shutting down. Default: nothing to
+    /// skip.
+    async fn skip_admitted_pool_generation(
+        &self,
+        _sandbox_id: SandboxId,
+    ) -> Result<(), ControllerError> {
+        Ok(())
+    }
+
+    /// Whether a failed adoption under this ID still owes a pool cleanup that
+    /// will tear the sandbox down. A create that finds its row in that state
+    /// has not succeeded yet. Default: no such cleanup exists.
+    async fn admitted_pool_cleanup_pending(
+        &self,
+        _sandbox_id: SandboxId,
+    ) -> Result<bool, ControllerError> {
+        Ok(false)
+    }
+
+    /// Claim a ready, plaintext, default-shape warm-pool slot of
+    /// `template_release_id` inside `tx`, the transaction that records the
+    /// create being admitted. The claim commits or rolls back with that
+    /// transaction. `None` is a miss. Default: substrates without a warm pool
+    /// always miss.
+    async fn claim_admission_pool_slot(
+        &self,
+        _tx: &mut Transaction<'_, Postgres>,
+        _template_release_id: Uuid,
+    ) -> Result<Option<AdmissionPoolClaim>, ControllerError> {
+        Ok(None)
+    }
+
     /// Persist substrate metadata for a previously claimed pool execution.
     ///
     /// This is called inside the API transaction that inserts the sandbox row,
@@ -3536,6 +3624,73 @@ impl SubstrateAdapter for Substrate {
             Self::Direct(substrate) => substrate.claim_pooled_execution(request).await,
             #[cfg(feature = "kubernetes")]
             Self::Kubernetes(substrate) => substrate.claim_pooled_execution(request).await,
+        }
+    }
+
+    async fn lookup_admitted_pooled_execution(
+        &self,
+        request: &PooledExecutionClaimRequest<'_>,
+        admitted: AdmittedPoolClaim,
+        sandbox_id: SandboxId,
+    ) -> Result<AdmittedPoolClaimLookup, ControllerError> {
+        match self {
+            Self::Direct(substrate) => {
+                substrate
+                    .lookup_admitted_pooled_execution(request, admitted, sandbox_id)
+                    .await
+            }
+            #[cfg(feature = "kubernetes")]
+            Self::Kubernetes(substrate) => {
+                substrate
+                    .lookup_admitted_pooled_execution(request, admitted, sandbox_id)
+                    .await
+            }
+        }
+    }
+
+    async fn skip_admitted_pool_generation(
+        &self,
+        sandbox_id: SandboxId,
+    ) -> Result<(), ControllerError> {
+        match self {
+            Self::Direct(substrate) => substrate.skip_admitted_pool_generation(sandbox_id).await,
+            #[cfg(feature = "kubernetes")]
+            Self::Kubernetes(substrate) => {
+                substrate.skip_admitted_pool_generation(sandbox_id).await
+            }
+        }
+    }
+
+    async fn admitted_pool_cleanup_pending(
+        &self,
+        sandbox_id: SandboxId,
+    ) -> Result<bool, ControllerError> {
+        match self {
+            Self::Direct(substrate) => substrate.admitted_pool_cleanup_pending(sandbox_id).await,
+            #[cfg(feature = "kubernetes")]
+            Self::Kubernetes(substrate) => {
+                substrate.admitted_pool_cleanup_pending(sandbox_id).await
+            }
+        }
+    }
+
+    async fn claim_admission_pool_slot(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        template_release_id: Uuid,
+    ) -> Result<Option<AdmissionPoolClaim>, ControllerError> {
+        match self {
+            Self::Direct(substrate) => {
+                substrate
+                    .claim_admission_pool_slot(tx, template_release_id)
+                    .await
+            }
+            #[cfg(feature = "kubernetes")]
+            Self::Kubernetes(substrate) => {
+                substrate
+                    .claim_admission_pool_slot(tx, template_release_id)
+                    .await
+            }
         }
     }
 

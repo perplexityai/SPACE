@@ -217,6 +217,7 @@ def load_cases(directory, pattern):
                         "tunnel_method",
                         "proxy_anyauth",
                         "expect",
+                        "errno",
                         "http_status",
                         "token",
                         "code",
@@ -322,7 +323,11 @@ def load_cases(directory, pattern):
                 port = probe.setdefault("port", PORTS[kind])
                 require(
                     type(port) is int
-                    and (port == PORTS[kind] or kind == "udp" and port == 443),
+                    and (
+                        port == PORTS[kind]
+                        or kind == "udp" and port == 443
+                        or kind == "quic" and port == 8443
+                    ),
                     f"{name}: unsupported fixture port {port} for {kind}",
                 )
                 expected = probe.get("expect")
@@ -680,6 +685,8 @@ def assert_result(spec, result, events):
                 else result.get("http_status", 403) == 403,
                 f"unexpected HTTP status for denied WebSocket traffic: {result}",
             )
+    if "errno" in spec:
+        require(result.get("errno") == spec["errno"], f"unexpected socket error: {result}")
     if expected == "deny":
         inner = kind == "connect" and (
             "tunnel_authority" in spec or "tunnel_method" in spec
@@ -1163,6 +1170,8 @@ def run(args, cases):
                         baseline.pop("switch_expect", None)
                         baseline.pop("tunnel_authority", None)
                         baseline.pop("tunnel_method", None)
+                        if spec["kind"] == "udp" and spec["port"] == 443:
+                            baseline["expect"] = "allow"
                         if spec["kind"].startswith("dns-") and spec["target"] in (
                             "1.1.1.1",
                             "8.8.8.8",
@@ -1199,7 +1208,15 @@ def run(args, cases):
                         row.update(result=result, events=events)
                         if count_udp443:
                             row["udp443_counter_delta"] = udp443_packets() - before
-                            require(row["udp443_counter_delta"] > 0, "UDP/443 guardrail counter did not increment")
+                            attempted = len(spec.get("sizes", [0]))
+                            require(
+                                result.get("datagrams_sent") == attempted,
+                                "not every UDP/443 datagram was sent",
+                            )
+                            require(
+                                row["udp443_counter_delta"] == attempted,
+                                "not every UDP/443 datagram hit the guardrail",
+                            )
                         children.healthy()
                         row.update(evaluate_probe(spec, result, events))
                     except (ValueError, subprocess.SubprocessError, OSError) as error:

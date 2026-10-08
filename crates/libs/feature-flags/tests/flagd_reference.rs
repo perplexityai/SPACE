@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use pplx_space_feature_flags::{
     SPACE_API_CLIENT_CONCURRENCY_LIMITER_FLAG, SPACE_API_CLIENT_CONCURRENCY_QUOTAS_FLAG,
     SPACE_CLUSTER_API_CLIENT_SIDE_BALANCING_FLAG, SPACE_CLUSTER_RATE_LIMITER_FLAG,
-    SPACE_NET_GATEWAY_KNOWN_EGRESS_DOMAINS_FLAG,
+    SPACE_NATIVE_CREATE_POOL_CLAIM_FLAG, SPACE_NET_GATEWAY_KNOWN_EGRESS_DOMAINS_FLAG,
 };
 
 const REFERENCE: &str = include_str!("../reference/flagd-space-flags.json");
@@ -62,9 +62,10 @@ enum Shape {
 }
 
 /// Every flag SPACE reads, with the shape its reader expects.
-const FLAGS_READ_BY_SPACE: [(&str, Shape); 6] = [
+const FLAGS_READ_BY_SPACE: [(&str, Shape); 7] = [
     (SPACE_CLUSTER_RATE_LIMITER_FLAG.key(), Shape::Bool),
     (SPACE_API_CLIENT_CONCURRENCY_LIMITER_FLAG.key(), Shape::Bool),
+    (SPACE_NATIVE_CREATE_POOL_CLAIM_FLAG.key(), Shape::Bool),
     (
         SPACE_CLUSTER_API_CLIENT_SIDE_BALANCING_FLAG.key(),
         Shape::Bool,

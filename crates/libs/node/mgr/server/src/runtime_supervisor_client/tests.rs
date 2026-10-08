@@ -228,12 +228,32 @@ pub(crate) async fn stop_failure_client(
     (root, client, server)
 }
 
+/// Stop fails with `code` `failures` times, then succeeds.
+pub(crate) async fn flaky_stop_client(
+    code: tonic::Code,
+    failures: usize,
+) -> (
+    tempfile::TempDir,
+    RuntimeSupervisorLazyClient,
+    StubSupervisorServer,
+) {
+    let (root, path) = test_socket_path();
+    let mut stub = StubRuntimeSupervisor::counting(Arc::new(AtomicUsize::new(0)));
+    stub.stop_status = code;
+    stub.stop_failures = Some(Arc::new(AtomicUsize::new(failures)));
+    let server = spawn_supervisor_server(&path, stub).await;
+    let client = supervisor_test_client(path, Arc::new(AtomicUsize::new(0)));
+    (root, client, server)
+}
+
 #[derive(Clone)]
 struct StubRuntimeSupervisor {
     launch_firecracker_calls: Arc<AtomicUsize>,
     reject_launch_firecracker: bool,
     launch_gate: Option<Arc<tokio::sync::Notify>>,
     stop_status: tonic::Code,
+    /// When set, stop fails with `stop_status` this many times, then succeeds.
+    stop_failures: Option<Arc<AtomicUsize>>,
 }
 
 impl StubRuntimeSupervisor {
@@ -243,6 +263,7 @@ impl StubRuntimeSupervisor {
             reject_launch_firecracker: false,
             launch_gate: None,
             stop_status: tonic::Code::Unimplemented,
+            stop_failures: None,
         }
     }
 
@@ -252,6 +273,7 @@ impl StubRuntimeSupervisor {
             reject_launch_firecracker: true,
             launch_gate: None,
             stop_status: tonic::Code::Unimplemented,
+            stop_failures: None,
         }
     }
 
@@ -263,6 +285,7 @@ impl StubRuntimeSupervisor {
             reject_launch_firecracker: false,
             launch_gate: Some(gate),
             stop_status: tonic::Code::Unimplemented,
+            stop_failures: None,
         }
     }
 }
@@ -319,6 +342,15 @@ impl proto::runtime_supervisor_server::RuntimeSupervisor for StubRuntimeSupervis
             return Err(Status::invalid_argument(
                 "test stop requires explicit identity",
             ));
+        }
+        if let Some(failures) = &self.stop_failures
+            && failures
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                    left.checked_sub(1)
+                })
+                .is_err()
+        {
+            return Ok(Response::new(proto::StopSandboxRuntimeResponse::default()));
         }
         Err(Status::new(self.stop_status, "stop completion unavailable"))
     }

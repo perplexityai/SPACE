@@ -1,4 +1,5 @@
 use super::*;
+use pplx_space_metrics::object_store::S3AttemptFailureKind;
 use std::io::SeekFrom;
 use tokio::io::AsyncSeekExt;
 
@@ -27,7 +28,7 @@ fn unset_env() -> impl FnOnce(&str) -> Option<String> {
 
 #[test]
 fn base_config_only_calculates_request_checksums_when_required() {
-    let config = s3_base_config();
+    let config = s3_base_config(S3Timeouts::resolve(|_| None), AttemptObserver::logging()).build();
 
     assert_eq!(
         config.request_checksum_calculation(),
@@ -568,6 +569,7 @@ async fn write_body_accepts_stream_chunks_smaller_than_expected_range() {
         &mut body,
         body_bytes.len() as u64,
         "range bytes=11-36",
+        |_| {},
     )
     .await
     .unwrap();
@@ -593,9 +595,15 @@ async fn write_body_rejects_short_or_overlong_s3_bodies() {
         .unwrap();
     let mut short_body = ByteStream::from(vec![1, 2, 3]);
 
-    let short_err = write_body_to_file(&mut short_writer, &mut short_body, 4, "range bytes=0-3")
-        .await
-        .unwrap_err();
+    let short_err = write_body_to_file(
+        &mut short_writer,
+        &mut short_body,
+        4,
+        "range bytes=0-3",
+        |_| {},
+    )
+    .await
+    .unwrap_err();
     assert!(
         short_err
             .to_string()
@@ -611,9 +619,15 @@ async fn write_body_rejects_short_or_overlong_s3_bodies() {
         .unwrap();
     let mut long_body = ByteStream::from(vec![1, 2, 3, 4, 5]);
 
-    let long_err = write_body_to_file(&mut long_writer, &mut long_body, 4, "range bytes=0-3")
-        .await
-        .unwrap_err();
+    let long_err = write_body_to_file(
+        &mut long_writer,
+        &mut long_body,
+        4,
+        "range bytes=0-3",
+        |_| {},
+    )
+    .await
+    .unwrap_err();
     assert!(
         long_err
             .to_string()
@@ -622,4 +636,212 @@ async fn write_body_rejects_short_or_overlong_s3_bodies() {
 
     let _ = tokio::fs::remove_file(short_dst).await;
     let _ = tokio::fs::remove_file(long_dst).await;
+}
+
+/// How the ranged-download stand-in breaks one chunk's response body.
+#[derive(Clone, Copy, Debug)]
+enum BodyFault {
+    /// Send half the body, then drop the connection short of its
+    /// `Content-Length`.
+    Truncate,
+    /// Send half the body, then nothing more.
+    Stall,
+    /// Refuse the request with 412, as S3 does once the pinned object has
+    /// been overwritten.
+    PreconditionFailed,
+}
+
+const CHUNK_TEST_ETAG: &str = "\"synthetic-etag\"";
+
+/// Serves `object` with ranged GETs pinned to [`CHUNK_TEST_ETAG`]. The
+/// first `faults` requests for `faulty_range` fail with `fault`; every
+/// request for that range is counted.
+fn ranged_stand_in(
+    object: Bytes,
+    faulty_range: String,
+    fault: BodyFault,
+    faults: usize,
+    requests: Arc<std::sync::atomic::AtomicUsize>,
+) -> axum::Router {
+    use axum::http::{HeaderMap, StatusCode, header};
+    use axum::response::IntoResponse;
+    use futures_util::StreamExt;
+    use std::sync::atomic::Ordering;
+
+    axum::Router::new().fallback(move |headers: HeaderMap| {
+        let (object, faulty_range, requests) =
+            (object.clone(), faulty_range.clone(), requests.clone());
+        async move {
+            let etag = [(header::ETAG, CHUNK_TEST_ETAG)];
+            let Some(range) = headers.get(header::RANGE).and_then(|v| v.to_str().ok()) else {
+                return (StatusCode::OK, etag, object).into_response();
+            };
+            assert_eq!(
+                headers.get(header::IF_MATCH).and_then(|v| v.to_str().ok()),
+                Some(CHUNK_TEST_ETAG),
+                "every ranged GET must be pinned",
+            );
+            let (start, end) = range
+                .strip_prefix("bytes=")
+                .and_then(|span| span.split_once('-'))
+                .map(|(start, end)| {
+                    (
+                        start.parse::<usize>().unwrap(),
+                        end.parse::<usize>().unwrap(),
+                    )
+                })
+                .expect("range header");
+            let chunk = object.slice(start..=end);
+            let head = [
+                (header::ETAG, CHUNK_TEST_ETAG.to_string()),
+                (header::CONTENT_LENGTH, chunk.len().to_string()),
+                (
+                    header::CONTENT_RANGE,
+                    format!("bytes {start}-{end}/{}", object.len()),
+                ),
+            ];
+            if range != faulty_range || requests.fetch_add(1, Ordering::SeqCst) >= faults {
+                return (StatusCode::PARTIAL_CONTENT, head, chunk).into_response();
+            }
+            let half = chunk.slice(..chunk.len() / 2);
+            let first = futures_util::stream::iter([Ok::<_, std::io::Error>(half)]);
+            let body = match fault {
+                BodyFault::PreconditionFailed => {
+                    return (
+                        StatusCode::PRECONDITION_FAILED,
+                        "<Error><Code>PreconditionFailed</Code>\
+                         <Message>synthetic</Message></Error>",
+                    )
+                        .into_response();
+                }
+                // The pause lets the server flush the headers and the first
+                // half, so the cut lands mid-body rather than before the
+                // response.
+                BodyFault::Truncate => {
+                    axum::body::Body::from_stream(first.chain(futures_util::stream::once(async {
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        Err(std::io::Error::other("synthetic cut"))
+                    })))
+                }
+                BodyFault::Stall => {
+                    axum::body::Body::from_stream(first.chain(futures_util::stream::pending()))
+                }
+            };
+            (StatusCode::PARTIAL_CONTENT, head, body).into_response()
+        }
+    })
+}
+
+struct RangedDownload {
+    result: Result<u64, ObjectStoreError>,
+    expected: Bytes,
+    written: Option<Vec<u8>>,
+    faulty_requests: usize,
+    recorder: Arc<crate::test_support::Recorder>,
+}
+
+/// Downloads a four-chunk object through [`ranged_stand_in`] with the
+/// second chunk faulty.
+async fn ranged_download(fault: BodyFault, faults: usize) -> RangedDownload {
+    use crate::test_support::{Recorder, credentials, serve, store};
+
+    const CHUNK: usize = 256 * 1024;
+    let object: Bytes = (0..4 * CHUNK).map(|i| (i % 251) as u8).collect();
+    let faulty_range = format!("bytes={}-{}", CHUNK, 2 * CHUNK - 1);
+    let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let endpoint = serve(ranged_stand_in(
+        object.clone(),
+        faulty_range,
+        fault,
+        faults,
+        requests.clone(),
+    ))
+    .await;
+    let recorder = Arc::new(Recorder::default());
+    let mut store = store(
+        S3Timeouts::resolve(|_| None),
+        Duration::from_millis(300),
+        &recorder,
+    );
+    store.download_chunk_size = CHUNK;
+
+    let dir = tempfile::tempdir().expect("download dir");
+    let dst = dir.path().join("memory.bin");
+    let result = store
+        .get_file(&credentials(), crate::test_support::target(&endpoint), &dst)
+        .await;
+    RangedDownload {
+        result,
+        expected: object,
+        written: std::fs::read(&dst).ok(),
+        faulty_requests: requests.load(std::sync::atomic::Ordering::SeqCst),
+        recorder,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ranged_download_retries_a_chunk_whose_body_fails_once() {
+    for (fault, kind) in [
+        (BodyFault::Truncate, S3AttemptFailureKind::Io),
+        (BodyFault::Stall, S3AttemptFailureKind::StalledStream),
+    ] {
+        let download = ranged_download(fault, 1).await;
+
+        assert_eq!(
+            download.result.as_ref().ok(),
+            Some(&(download.expected.len() as u64)),
+            "{fault:?}: {:?}",
+            download.result,
+        );
+        assert!(
+            download.written.as_deref() == Some(&download.expected[..]),
+            "{fault:?}: downloaded bytes differ from the object"
+        );
+        assert_eq!(download.faulty_requests, 2, "{fault:?}");
+        let failures = download.recorder.failed_targets();
+        assert_eq!(failures.len(), 1, "{fault:?}: {failures:?}");
+        let (target, failure) = &failures[0];
+        assert_eq!(
+            (failure.attempt, failure.kind, failure.will_retry),
+            (1, kind, true),
+            "{fault:?}",
+        );
+        assert_eq!(target.chunk_index, Some(1), "{fault:?}");
+        let recoveries = download.recorder.recoveries();
+        assert_eq!(recoveries.len(), 1, "{fault:?}");
+        assert_eq!(recoveries[0].1.attempts, 2, "{fault:?}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ranged_download_fails_after_three_chunk_body_failures() {
+    let download = ranged_download(BodyFault::Truncate, usize::MAX).await;
+
+    assert!(
+        matches!(download.result, Err(ObjectStoreError::RangeBodyRead { .. })),
+        "{:?}",
+        download.result,
+    );
+    assert_eq!(download.faulty_requests, 3);
+    let failures = download.recorder.failures();
+    assert_eq!(
+        failures
+            .iter()
+            .map(|failure| (failure.attempt, failure.will_retry))
+            .collect::<Vec<_>>(),
+        [(1, true), (2, true), (3, false)],
+    );
+    assert!(download.recorder.recoveries().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ranged_download_does_not_retry_a_changed_object() {
+    let download = ranged_download(BodyFault::PreconditionFailed, usize::MAX).await;
+
+    assert!(
+        matches!(download.result, Err(ObjectStoreError::Get(_))),
+        "{:?}",
+        download.result,
+    );
+    assert_eq!(download.faulty_requests, 1);
 }

@@ -74,7 +74,7 @@ DISCRIMINATOR_VALUE_ENV = "SPACE_SANDBOX_NODE_SELECTOR_VALUE"
 ADMISSION_ENABLED_ENV = "SPACE_CLUSTER_ACTIVATION_ADMISSION_ENABLED"
 # Every Deployment whose process composes the sandbox node selector. The source
 # guard checks this against the Rust call sites.
-RENDERER_DEPLOYMENTS: tuple[str, ...] = ("space-api", "space-cluster-controller", "space-internal-api")
+RENDERER_DEPLOYMENTS: tuple[str, ...] = ("space-api", "space-cluster-controller")
 # A prefix of the API's `ClusterAdmissionError::EmptyCluster` message; the
 # source guard checks it against `cluster_admission/mod.rs`.
 SERVER_CAPACITY_MESSAGE = "Server capacity limit: no eligible sandbox activation nodes"

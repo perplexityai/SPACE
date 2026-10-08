@@ -33,13 +33,23 @@ const FIRST_BYTES_TIMEOUT: Duration = Duration::from_millis(50);
 /// first write, and a longer wait grants no bypass. 50 ms is shorter than one
 /// TCP retransmit (Linux's minimum RTO is 200 ms), so a cold guest's lost or
 /// late first segment was denied as if never sent and surfaced as a TLS EOF on
-/// an allowed hostname. This covers one retransmit with margin.
-const FAIL_CLOSED_FIRST_BYTES_TIMEOUT: Duration = Duration::from_millis(500);
+/// an allowed hostname. 500 ms covered only one retransmit and still sat
+/// inside the observed arrival tail of legitimate ClientHellos, so slow but
+/// valid clients were reset. Since waiting grants no bypass, this bound only
+/// reclaims a pending socket from a flow that never writes: 5 s covers four
+/// consecutive retransmits (0.2 + 0.4 + 0.8 + 1.6 s), stays below common
+/// client TLS handshake timeouts so the client sees this reset rather than
+/// its own timeout, and matches the order of SNI-peek bounds in other proxies
+/// (HAProxy `inspect-delay` 5 s, Envoy `listener_filters_timeout` 15 s,
+/// nginx `preread_timeout` 30 s).
+const FAIL_CLOSED_FIRST_BYTES_TIMEOUT: Duration = Duration::from_secs(5);
 /// Budget for the rest of the ClientHello once the flow is confirmed to carry
 /// handshake bytes, counted from those first bytes. Reaching it only delays a
 /// TLS flow whose ClientHello is still arriving; a non-TLS flow is rejected on
-/// the first peek instead.
-const COMPLETION_DEADLINE: Duration = Duration::from_millis(250);
+/// the first peek instead. On a denied path, reaching it rejects a valid TLS
+/// flow whose later segments were lost or delayed, so it covers more than one
+/// retransmit.
+const COMPLETION_DEADLINE: Duration = Duration::from_secs(1);
 
 /// What admission does with a flow whose ClientHello never arrives, which
 /// decides how long the peek waits for one.

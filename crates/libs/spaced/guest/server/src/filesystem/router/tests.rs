@@ -201,6 +201,17 @@ async fn a_read_through_a_workers_descriptor_ends_with_the_worker() {
         .data
         .to_vec();
     stop_worker(proxy, server).await;
+    // The read learns of the worker's end asynchronously, through its lease
+    // stream failing. Drain only once the dead worker is retired: by then the
+    // read has observed the end, so it cannot race the rest of the file
+    // through its few buffered chunks first (which a fast, busy host did).
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while pool.contains(&worker).await {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the dead worker is retired");
     let mut ended = None;
     while let Some(chunk) = stream.next().await {
         match chunk {
@@ -216,13 +227,6 @@ async fn a_read_through_a_workers_descriptor_ends_with_the_worker() {
         "the read stopped before the end of the file"
     );
     assert_eq!(read[..], data[..read.len()]);
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        while pool.contains(&worker).await {
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("the dead worker is retired");
 }
 
 async fn read_file(router: &FilesystemRouter, path: &std::path::Path) -> GuestFileChunkStream {

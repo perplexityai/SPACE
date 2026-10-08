@@ -41,12 +41,7 @@ fn main() -> anyhow::Result<()> {
             // provider used by the kube TokenReview client; no separate install here.
             let telemetry = pplx_space_common_svc::init_service(SERVICE_NAME)?;
             let shutdown_token = pplx_space_common_svc::shutdown_token();
-            let result = pplx_space_internal_api_server::run_with_ingress_activation(
-                cli.into(),
-                shutdown_token,
-                Some(&pplx_space_api::controllers::sandbox::IngressActivationFactory),
-            )
-            .await;
+            let result = pplx_space_internal_api_server::run(cli.into(), shutdown_token).await;
             pplx_space_common_svc::shutdown_telemetry(telemetry).await;
             Ok(result?)
         })

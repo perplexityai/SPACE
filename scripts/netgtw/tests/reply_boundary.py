@@ -124,7 +124,7 @@ def check_udp443_recovery(installer, policy):
         if entry.get("add", {}).get("rule", {}).get("comment") == comment
     )
     rejects = any("reject" in expr for expr in packaged["expr"])
-    expected_mask, stale_mask = (6160, 6168) if rejects else (6168, 6160)
+    expected_mask, stale_mask = 6168, 0
     run("ip", "netns", "add", "host")
     inside("host", "ip", "link", "add", "uplink", "type", "dummy")
     inside("host", "ip", "link", "set", "uplink", "up")
@@ -287,6 +287,89 @@ def main():
         )
     inside(GATEWAY, "sysctl", "-qw", "net.ipv4.ip_forward=1")
     run(installer, "setup")
+    run(installer, "validate")
+
+    def udp443_packets():
+        return sum(
+            expr["counter"]["packets"]
+            for entry in ruleset()["nftables"]
+            if entry.get("rule", {}).get("comment")
+            == "platform-egress-pre-tproxy-guardrail-quic-udp443"
+            for expr in entry["rule"]["expr"]
+            if "counter" in expr
+        )
+
+    before_packets = udp443_packets()
+    with subprocess.Popen(
+        [
+            "ip",
+            "netns",
+            "exec",
+            "peer",
+            sys.executable,
+            "-c",
+            """
+import select, socket, sys
+with socket.socket(type=socket.SOCK_DGRAM) as server:
+    server.bind(("198.18.0.2", 443))
+    print("ready", flush=True)
+    readable, _, _ = select.select([server, sys.stdin], [], [], 8)
+    assert sys.stdin in readable and server not in readable, "UDP/443 reached upstream"
+""",
+        ],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    ) as upstream:
+        assert select.select([upstream.stdout], [], [], 5)[0], (
+            "UDP/443 listener not ready"
+        )
+        assert upstream.stdout.readline().strip() == "ready"
+        print(
+            inside(
+                "guest",
+                sys.executable,
+                "-c",
+                """
+import socket, time
+refusals = 0
+timeouts = 0
+with socket.socket(type=socket.SOCK_DGRAM) as isolated:
+    isolated.settimeout(0.5)
+    isolated.connect(("198.18.0.2", 443))
+    start = time.monotonic()
+    isolated.send(b"quic-isolated")
+    try:
+        isolated.recv(128)
+    except ConnectionRefusedError:
+        print(f"UDP/443 isolated: ECONNREFUSED in {(time.monotonic() - start) * 1000:.2f} ms")
+    else:
+        raise AssertionError("isolated UDP/443 did not receive an explicit refusal")
+for attempt in range(20):
+    with socket.socket(type=socket.SOCK_DGRAM) as stream:
+        stream.settimeout(0.1)
+        stream.connect(("198.18.0.2", 443))
+        stream.send(b"quic-burst")
+        try:
+            stream.recv(128)
+        except ConnectionRefusedError:
+            refusals += 1
+        except TimeoutError:
+            timeouts += 1
+        else:
+            raise AssertionError("UDP/443 was not blocked")
+assert refusals + timeouts == 20
+print(f"UDP/443 burst: {refusals} refusals, {timeouts} rate-limited replies")
+""",
+            ).strip()
+        )
+        upstream.stdin.write("done\n")
+        upstream.stdin.flush()
+        assert upstream.wait(timeout=5) == 0, upstream.stderr.read()
+    assert udp443_packets() - before_packets == 21, (
+        "not every UDP/443 packet was blocked"
+    )
     audit = str(ROOT / "scripts/netgtw/audit-reply-rules.py")
     print(run(sys.executable, audit, GATEWAY).strip())
     before = ruleset()

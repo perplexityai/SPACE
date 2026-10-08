@@ -144,29 +144,6 @@ where
     })
 }
 
-pub(super) async fn run_command_status(
-    program: &str,
-    args: &[&str],
-    permit: &crate::lifecycle_limiter::LifecyclePermit,
-) -> std::io::Result<std::process::ExitStatus> {
-    let program = program.to_string();
-    let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
-    spawn_lifecycle_blocking(permit, move || {
-        crate::host_command::output(
-            std::process::Command::new(&program).args(&args),
-            crate::host_command::MUTATION_BUDGET,
-            &[],
-        )
-        .map(|output| output.status)
-    })
-    .await
-    .unwrap_or_else(|join_err| {
-        Err(std::io::Error::other(format!(
-            "blocking command task failed: {join_err}"
-        )))
-    })
-}
-
 pub(super) fn run_permission_command_blocking(
     command: &'static str,
     args: &[&str],
@@ -714,7 +691,12 @@ pub(super) fn unmount_if_present(path: impl AsRef<Path>) -> Result<bool, String>
 #[cfg(target_os = "linux")]
 pub(super) fn unmount_existing_path(path: impl AsRef<Path>) -> Result<bool, String> {
     let path: &Path = path.as_ref();
-    match nix::mount::umount2(path, nix::mount::MntFlags::MNT_DETACH) {
+    // Callers name binds inside a sandbox-writable jail. Never follow a final
+    // link planted there into a host mount.
+    match nix::mount::umount2(
+        path,
+        nix::mount::MntFlags::MNT_DETACH | nix::mount::MntFlags::UMOUNT_NOFOLLOW,
+    ) {
         Ok(()) => Ok(true),
         Err(nix::errno::Errno::EINVAL | nix::errno::Errno::ENOENT) => Ok(false),
         Err(error) => Err(format!("failed to unmount {}: {error}", path.display())),

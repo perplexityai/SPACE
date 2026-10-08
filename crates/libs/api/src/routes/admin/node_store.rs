@@ -881,10 +881,11 @@ pub(super) async fn sandbox_occupancy_for_node_in_tx(
 /// page size. Work is bounded by the node's own pinned history — which is the
 /// question being asked — rather than by the table.
 ///
-/// The index makes that plan available; the two fences below are part of what
-/// keeps the planner on it. With both probes left bare, the planner can prefer
-/// a join-driven plan that reads the whole table even with this index present,
-/// and on the test fixture a generic plan does exactly that.
+/// The index makes that plan available; the predicate's shape keeps the
+/// planner on it. Written as two bare conjuncts, the probes can be pulled up
+/// into a join-driven plan that reads the whole table even with this index
+/// present, and on the test fixture a generic plan does exactly that. The
+/// `CASE` and the scalar-subquery fences below each rule that plan out.
 ///
 /// The planner may still pick the narrow `idx_sandboxes_target_node` plus a
 /// sort when the table is small enough that the two cost the same. That plan
@@ -901,10 +902,17 @@ pub(super) async fn sandbox_occupancy_for_node_in_tx(
 ///
 /// ## Why both probes are wrapped in scalar subqueries
 ///
-/// `AND NOT (SELECT {snapshot_exists})` rather than `AND NOT
-/// {snapshot_exists}`, and the same for the in-flight check. The two forms are
-/// identical in truth — `EXISTS` yields a non-NULL boolean and the scalar
-/// subquery returns exactly one row — but the bare sublink is *pullable*:
+/// The `CASE` described below already keeps both checks out of reach of
+/// sublink pull-up, which Postgres applies only to a top-level `WHERE` or
+/// `JOIN … ON` conjunct, including a top-level `NOT` directly over an
+/// `EXISTS`. The fences are a second guard for the conjunct form: if the
+/// predicate is ever written as conjuncts, they keep the plan this
+/// section describes. The rest of the section is about that form.
+///
+/// `(SELECT {snapshot_exists})` rather than a bare `{snapshot_exists}`, and
+/// the same for the in-flight check. The two forms are identical in truth —
+/// `EXISTS` yields a non-NULL boolean and the scalar subquery returns exactly
+/// one row — but as a top-level conjunct the bare sublink is *pullable*:
 /// Postgres may realise it as a nested loop, a hash anti-join, or a merge
 /// anti-join over the whole `snapshots` ⋈
 /// `snapshot_storage_locations` product. A nested loop keeps the work bounded
@@ -923,16 +931,49 @@ pub(super) async fn sandbox_occupancy_for_node_in_tx(
 /// node-ordered scan beneath it also makes a merge anti-join
 /// along `idx_snapshots_sandbox_id` available, and that one walks every
 /// snapshot whose sandbox id sorts below the page, whichever node owns it.
-/// Fenced, each execution is keyed on the one sandbox being asked about, so it
-/// reads at most that sandbox's snapshots, provided the planner reaches for a
-/// `sandbox_id` index. Which index it uses is still a cost choice; in every
-/// plan measured it was `idx_snapshots_sandbox_id`. The plan tests bound its
-/// reads by the node's own snapshots, which catches a walk over other nodes'
-/// snapshots; a per-row scan of the in-flight set can stay under that bound
-/// when few rows reach the probe, so they don't rule it out.
-/// The fence gives up the plan [`inflight_suspend_upload_exists`] is shaped
-/// to allow, reading the in-flight set once, in exchange for a per-row cost
-/// that does not depend on the catalog.
+/// Fenced, each execution is correlated on the one sandbox being asked about.
+/// That doesn't make each execution cheap. Which index serves it is still a
+/// cost choice: the test fixtures' plans use a scan keyed on
+/// `idx_snapshots_sandbox_id`, but a planner that overestimates how many
+/// snapshots a sandbox has can instead `BitmapAnd` that index with
+/// `idx_snapshots_state_type`, whose side reads the cluster's whole in-flight
+/// set on every execution. The test fixture doesn't reproduce that plan, and
+/// the plan tests' read counts don't include a bitmap index scan's reads,
+/// which is why they also bound how often the check runs. The fence bounds which
+/// sandboxes the check is about; the evaluation order below bounds how often
+/// it runs.
+///
+/// ## Why the in-flight check sits in a `CASE` branch
+///
+/// `CASE WHEN (SELECT {snapshot_exists}) THEN false ELSE NOT (SELECT
+/// {inflight_upload}) END` rather than two `AND NOT` conjuncts. The two forms
+/// are identical in truth, since neither scalar subquery can yield NULL. But
+/// Postgres orders the conjuncts of a filter by its own cost estimate, so it's
+/// free to evaluate the in-flight check first, on every suspended row the node
+/// ever pinned. A long-lived node's pinned history is almost entirely durable,
+/// so that order runs the check once per row of history. Under the bitmap plan
+/// above, each of those executions also passes over the in-flight set, and the
+/// statement's cost becomes history × in-flight set.
+///
+/// Postgres documents that a `CASE` evaluates only the subexpressions needed
+/// to determine its result, in order, so the in-flight check runs only for
+/// rows the durability check didn't exclude. That's the node's backlog, which
+/// is what an operator came to drain, and it holds whichever plan the planner
+/// picks for the check itself. Postgres calls the rule not ironclad and names
+/// constant subexpressions folded at planning time and aggregates as the
+/// cases that break it. Neither applies: both conditions read the row.
+///
+/// The fixed order has a cost of its own: the durability check runs on
+/// every suspended row, including those the in-flight check alone would have
+/// excluded. That cost is bounded by the node's rows, and each execution has
+/// an index that fits it exactly: `idx_snapshots_sandbox_ready_latest_covering`
+/// is keyed on `sandbox_id` with the probe's own `state = 'ready' AND type =
+/// 'full'` as its predicate, and it serves the probe in every plan the tests
+/// measure. `snapshot_scans_stay_within_the_nodes_snapshots` and
+/// `inflight_check_runs_only_for_non_durable_rows` both bound its reads per
+/// scan; only the first bounds the in-flight check's the same way.
+///
+/// ## Why `limit` is a literal
 ///
 /// `limit` is interpolated as a literal rather than bound. `LIMIT $2` is not
 /// a constant when Postgres builds a *generic* plan, so there is no
@@ -977,8 +1018,8 @@ fn pinned_local_only_sandboxes_query(limit: NonZeroUsize) -> String {
            FROM sandboxes s
           WHERE s.target_node_id = $1
             AND s.lifecycle = 'suspended'
-            AND NOT (SELECT {snapshot_exists})
-            AND NOT (SELECT {inflight_upload})
+            AND CASE WHEN (SELECT {snapshot_exists}) THEN false
+                     ELSE NOT (SELECT {inflight_upload}) END
           ORDER BY s.id
           LIMIT {limit}"
     )
@@ -1093,8 +1134,8 @@ mod live_residents_tests;
 
 /// Postgres-backed plan-structure and page-shape regression for the
 /// `:force-upload-local-snapshots` enumeration: the scan stays bounded by the
-/// node's own pinned history rather than the fleet, the durability probe stays
-/// un-pullable, and the page stays the ascending-id prefix the handler's
-/// `deferred[]` tail depends on.
+/// node's own pinned history rather than the fleet, the in-flight probe runs
+/// only for non-durable rows, and the page stays the ascending-id prefix the
+/// handler's `deferred[]` tail depends on.
 #[cfg(test)]
 mod pinned_local_only_plan_tests;

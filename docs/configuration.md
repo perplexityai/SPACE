@@ -121,6 +121,7 @@ because disabling it by mistake would leave every create queued forever.
 | `SPACE_API_CLIENT_CLASSES` | empty | JSON map; invalid JSON fails startup. |
 | `SPACE_CLUSTER_ACTIVATION_ADMISSION_ENABLED` | on | Fails open (with a warning) when `SPACE_REDIS_URL` is unset. |
 | `SPACE_CLUSTER_ACTIVATION_ADMISSION_REFILL_RPS` | 60 | |
+| `SPACE_NATIVE_CREATE_POOL_CLAIM_ENABLED` | off | Env master for claiming a ready warm-pool slot when `POST /v1/sandboxes` admits a create, under the `space-native-create-pool-claim` flag (falls back off). Every `space-cluster-controller` replica must understand claim-carrying create payloads before this is turned on. |
 | `SPACE_REDIS_URL` | unset | |
 | `SPACE_SHARED_VALKEY_URL` | unset | Unset disables the consumer. |
 | `SPACE_GRPC_CLIENT_MAX_CONNECTION_AGE_SECS` | off | |
@@ -142,13 +143,38 @@ because disabling it by mistake would leave every create queued forever.
 | `SPACE_TEMPLATE_CACHE_BUDGET_BYTES` | 100 GiB | 0 or an invalid value disables cache GC. |
 | `SPACE_TEMPLATE_BUILD_DISK_MIB` | build-manager default | JSON. |
 | `SPACE_TRUSTED_TEMPLATE_STORAGE_BUCKETS` | empty = any bucket | |
-| `SPACE_TEMPLATE_PUBLISH_SYSTEM_SERVICE_ACCOUNTS`, `SPACE_TEMPLATE_PUBLISH_TENANT_SERVICE_ACCOUNTS` | empty | Startup error when the allowed set is empty. |
+| `SPACE_TEMPLATE_PUBLISH_SYSTEM_SERVICE_ACCOUNTS`, `SPACE_TEMPLATE_PUBLISH_TENANT_SERVICE_ACCOUNTS` | empty | Startup error when the allowed set is empty. An account in both lists (build-manager) must present the grant issued for that system build by the API or a system-only operator; each grant authorizes one release. |
 | `SPACE_BUILD_AUTH_SYSTEM_SERVICE_ACCOUNTS`, `SPACE_BUILD_AUTH_TENANT_SERVICE_ACCOUNTS` | empty | |
 | `SPACE_BUILD_MANAGER_ENDPOINT` | `127.0.0.1:9900` | |
 | `SPACE_BUILD_MANAGER_TLS_SERVER_NAME` | from endpoint | |
 | `SPACE_BUILD_MANAGER_AUTH_ALLOWED_SERVICE_ACCOUNTS` | empty | |
 | `SPACE_BUILDER_ECR_REPOSITORIES` | unset | JSON. |
 | `SPACE_UBUNTU_APT_MIRROR` | `https://archive.ubuntu.com/ubuntu` | |
+
+For direct `space-buildmgr build` calls without `--org-id`, configure
+`SPACE_INTERNAL_API_ENDPOINT` and `SPACE_CLUSTER_API_TOKEN_PATH` in the CLI's
+process. The projected token must identify an account in the system publication
+list only. The CLI obtains a grant before submitting the build and sends it with
+the job; build-manager's dual-authority credential cannot issue grants. Configure
+`SPACE_BUILD_MANAGER_TOKEN_PATH` separately for permission to submit builds.
+Direct operator builds may still use custom system template names. API system
+builds remain limited to `seed` and `code-runtime` at the node gateway.
+
+The grant follows the persisted build job through template and release
+registration, expires after seven days, and is consumed only when the release
+transaction commits. A failed API dispatch revokes only its own grant. Grants
+left by failed direct submissions expire and are swept when a new grant is issued.
+With no ClusterApi endpoint configured, the CLI retains local-only build behavior;
+cluster publication requires the operator configuration above.
+
+Pause system build submissions and drain older system jobs before rolling out
+ClusterApi's grant enforcement. Apply the grant-table migration and role
+bootstrap first, upgrade build-manager and the node-api gateway, then upgrade
+the API and ClusterApi before resuming submissions. The gateway must understand
+the new field to forward each build's grant. Resubmit any older queued system
+jobs that could not be drained: jobs without a grant cannot publish through a
+dual-authority account after the rollout. System-only deployment publishers
+retain their existing publication authority.
 
 ## Object storage and snapshots
 
@@ -160,6 +186,8 @@ because disabling it by mistake would leave every create queued forever.
 | `SPACE_OBJECT_STORE_MULTIPART_PART_SIZE_BYTES` | built-in | 8 MiB to 5 GiB. |
 | `SPACE_OBJECT_STORE_MULTIPART_CONCURRENCY` | built-in | 1 to 64 in-flight parts. |
 | `SPACE_OBJECT_STORE_DOWNLOAD_READER_CONCURRENCY`, `SPACE_OBJECT_STORE_DOWNLOAD_CHUNK_SIZE_BYTES`, `SPACE_OBJECT_STORE_DOWNLOAD_BUFFER_BUDGET_BYTES` | 8, 32 MiB, 2 GiB | Peak buffered memory is bounded by the budget; size it below the service's memory limit. |
+| `SPACE_OBJECT_STORE_REQUEST_ATTEMPT_TIMEOUT_SECS`, `SPACE_OBJECT_STORE_BODY_UPLOAD_ATTEMPT_TIMEOUT_SECS`, `SPACE_OBJECT_STORE_SERVER_SIDE_ATTEMPT_TIMEOUT_SECS` | 10, 60, 30 | 5 to 21600. Bound one attempt of a get, head, or create/abort multipart call; of a put or part upload; and of a complete or copy. Raise the body-upload value with the part size. |
+| `SPACE_OBJECT_STORE_REQUEST_OPERATION_TIMEOUT_SECS`, `SPACE_OBJECT_STORE_BODY_UPLOAD_OPERATION_TIMEOUT_SECS`, `SPACE_OBJECT_STORE_SERVER_SIDE_OPERATION_TIMEOUT_SECS` | 3 × attempt + 5 s | 5 to 86400. Bound the same calls across all three SDK attempts. |
 | `SPACE_OBJECT_STORE_STATIC_SESSION_TOKEN` | unset | Session token for temporary static credentials. |
 | `SPACE_SNAPSHOT_BUCKET`, `SPACE_SNAPSHOT_REGION`, `SPACE_SNAPSHOT_ENDPOINT` | unset | Unset disables snapshot upload. |
 
@@ -171,7 +199,6 @@ because disabling it by mistake would leave every create queued forever.
 | `SPACE_INTERNAL_SECRET_NAME` | `space-internal` | |
 | `SPACE_INTERNAL_API_ENDPOINT` | unset | |
 | `SPACE_INTERNAL_RPC_INSECURE_DEV` | off | TLS is required unless set. |
-| `SPACE_INTERNAL_RPC_ALLOW_PLAINTEXT_ROLLOUT` | off | Lets a TLS server also accept plaintext while callers migrate; see `docs/internal-rpc-tls.md`. |
 | `SPACE_INTERNAL_RPC_TLS_CA`, `SPACE_INTERNAL_RPC_TLS_CERT`, `SPACE_INTERNAL_RPC_TLS_KEY` | unset | Cert and key are set together. |
 | `SPACE_K8S_TOKEN_AUTH_ENABLED` | off | |
 | `SPACE_K8S_TOKEN_AUTH_STATIC_FALLBACK_ENABLED` | on | Keeps the shared static token accepted next to ServiceAccount auth. |
@@ -192,6 +219,7 @@ because disabling it by mistake would leave every create queued forever.
 | `SPACE_CREDMGR_FAIL_ON_KEYLESS_AUTHORITY` | off | Crash instead of serving Ready-but-broken when a node-local authority has no key. |
 | `SPACE_CREDMGR_S3_VEND_ROLE_ARN` | unset = no storage exchange | |
 | `SPACE_CREDMGR_SCOPED_EXCHANGE_TOKEN_MODE` | `legacy` when the role ARN is set, else `disabled` | `legacy`, `mixed`, `enforce` or `disabled`; see `docs/space/design/credential-token-exchange.md`. |
+| `SPACE_CREDMGR_SECRETS_MANAGER_ROLE_ARN` | unset = credential references are not resolvable | IAM role assumed per organization for every Secrets Manager read, with session tag `space-org-id=<organization>` and a session policy that allows `GetSecretValue` only on secrets tagged with that organization and `kms:Decrypt` only through Secrets Manager; a malformed ARN fails startup. The role's trust policy admits only the authority's identity, with `sts:AssumeRole` and `sts:TagSession`, and requires the `space-org-id` request tag. Its policy allows `GetSecretValue` only when `secretsmanager:ResourceTag/space-org-id` equals `${aws:PrincipalTag/space-org-id}`, allows `kms:Decrypt` only with `kms:ViaService` `secretsmanager.*.amazonaws.com`, and explicitly denies secrets whose `space-org-id` tag is missing or differs from the session's, sessions without the tag, and any KMS use outside Secrets Manager; the explicit denials also hold against same-account resource and key policies. Tag each referenced secret `space-org-id=<owning organization ID>`. A secret in another account also needs a resource policy allowing the role, and a secret under a customer-managed KMS key (required across accounts) needs the key policy to allow the role `kms:Decrypt` with `kms:ViaService` `secretsmanager.<region>.amazonaws.com`. |
 | `SPACE_CREDMGR_INTERMEDIATE_CA_ARN` | unset | |
 | `SPACE_CREDMGR_INTERMEDIATE_KEY_BROKER_URL`, `SPACE_CREDMGR_INTERMEDIATE_KEY_BROKER_TOKEN_FILE`, `SPACE_CREDMGR_INTERMEDIATE_KEY_BROKER_TLS_CA`, `SPACE_CREDMGR_INTERMEDIATE_KEY_BROKER_GRANT_SCHEME`, `SPACE_CREDMGR_INTERMEDIATE_KEY_BROKER_TENANT_NAMESPACE` | unset | Configure as a group. |
 | `SPACE_PLATFORM_KEK_PROVIDER` | none | |

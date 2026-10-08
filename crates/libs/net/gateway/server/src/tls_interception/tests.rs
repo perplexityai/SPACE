@@ -1,29 +1,6 @@
 use super::*;
 
 #[test]
-fn handshake_legs_share_capacity_and_restore_it_on_drop() {
-    let capacity = Arc::new(HandshakeCapacity::new(2));
-    let downstream = capacity
-        .try_acquire(TlsHandshakeLeg::ClientToNetgw)
-        .unwrap();
-    let _upstream = capacity
-        .try_acquire(TlsHandshakeLeg::NetgwToOrigin)
-        .unwrap();
-
-    assert!(
-        capacity
-            .try_acquire(TlsHandshakeLeg::ClientToNetgw)
-            .is_err(),
-        "both legs must consume the same pool"
-    );
-    drop(downstream);
-    assert!(
-        capacity.try_acquire(TlsHandshakeLeg::NetgwToOrigin).is_ok(),
-        "a completed handshake should immediately restore capacity"
-    );
-}
-
-#[test]
 fn upstream_config_preserves_typed_http_alpn_order() {
     let interception = TlsInterception::default();
     for (offered, expected) in [

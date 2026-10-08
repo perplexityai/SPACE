@@ -49,6 +49,15 @@
       },
       "targeting": {}
     },
+    "space-native-create-pool-claim": {
+      "state": "ENABLED",
+      "defaultVariant": "off",
+      "variants": {
+        "on": true,
+        "off": false
+      },
+      "targeting": {}
+    },
     "space-cluster-api-client-side-balancing": {
       "state": "ENABLED",
       "defaultVariant": "off",

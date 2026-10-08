@@ -2,6 +2,7 @@
   "common": [
     "ci/scripts/run-space-bundle-builds.py",
     "ci/rust-artifact-inputs.json",
+    "ci/runtime-capabilities.json",
     ".cargo/config.toml",
     ".dockerignore",
     "Cargo.toml",
@@ -43,7 +44,6 @@
         "crates/libs/events",
         "crates/libs/execution/common",
         "crates/libs/feature-flags",
-        "crates/libs/internal/api/server",
         "crates/libs/metrics",
         "crates/libs/net/common",
         "crates/libs/net/gateway/client",
@@ -51,17 +51,14 @@
         "crates/libs/node/mgr/client",
         "crates/libs/object-store",
         "crates/libs/observability",
-        "crates/libs/placement/machine",
         "crates/libs/public/api",
         "crates/libs/sandbox/portability",
         "crates/libs/sandbox/store",
         "crates/libs/sandbox/teardown",
         "crates/libs/sbx/mgr/client",
         "crates/libs/sbx/mgr/migrations",
-        "crates/libs/snapshot/store",
         "crates/libs/spaced/build",
         "crates/libs/spaced/common",
-        "crates/libs/sqlite/migrations",
         "crates/libs/template/mgr-client",
         "crates/libs/template/publish"
       ]
@@ -98,7 +95,6 @@
         "crates/libs/sbx/mgr/migrations",
         "crates/libs/spaced/build",
         "crates/libs/spaced/common",
-        "crates/libs/sqlite/migrations",
         "crates/libs/template/mgr-client"
       ]
     },
@@ -130,7 +126,6 @@
         "crates/libs/events",
         "crates/libs/execution/common",
         "crates/libs/feature-flags",
-        "crates/libs/internal/api/server",
         "crates/libs/metrics",
         "crates/libs/net/common",
         "crates/libs/net/gateway/client",
@@ -138,7 +133,6 @@
         "crates/libs/node/mgr/client",
         "crates/libs/object-store",
         "crates/libs/observability",
-        "crates/libs/placement/machine",
         "crates/libs/public/api",
         "crates/libs/sandbox/portability",
         "crates/libs/sandbox/store",
@@ -149,7 +143,6 @@
         "crates/libs/snapshot/store",
         "crates/libs/spaced/build",
         "crates/libs/spaced/common",
-        "crates/libs/sqlite/migrations",
         "crates/libs/template/mgr-client"
       ]
     },
@@ -177,7 +170,6 @@
         "crates/libs/sbx/mgr/client",
         "crates/libs/spaced/build",
         "crates/libs/spaced/common",
-        "crates/libs/sqlite/migrations",
         "crates/libs/template/mgr-client"
       ]
     },
@@ -210,7 +202,6 @@
         "crates/apps/template/mgr/svc",
         "crates/apps/vol/mgr/cli",
         "crates/apps/vol/mgr/svc",
-        "crates/libs/api",
         "crates/libs/build/mgr",
         "crates/libs/build/mgr/client",
         "crates/libs/build/mgr/server",
@@ -226,7 +217,6 @@
         "crates/libs/common/lru-reaper",
         "crates/libs/common/proto-build",
         "crates/libs/common/svc",
-        "crates/libs/common/work-coalescer",
         "crates/libs/credential/injection/core",
         "crates/libs/credential/injection/store",
         "crates/libs/credential/mgr/client",
@@ -269,7 +259,6 @@
         "crates/libs/spaced/guest/server",
         "crates/libs/spaced/host/client",
         "crates/libs/spaced/host/server",
-        "crates/libs/sqlite/migrations",
         "crates/libs/template/mgr",
         "crates/libs/template/mgr-client",
         "crates/libs/vol/mgr/client",

@@ -18,6 +18,8 @@ fn directory_budget_counts_cumulative_traversal_not_stack_width() {
     .expect_err("cumulative directory budget should reject another directory");
 
     assert_eq!(error.code(), tonic::Code::ResourceExhausted);
+    // The request's own size, not load: retrying gives the same answer.
+    assert!(!pplx_space_common_grpc::is_refused_before_start(&error));
     assert!(pending.is_empty());
     assert_eq!(directories_enqueued, MAX_LIST_DIRECTORIES);
 }

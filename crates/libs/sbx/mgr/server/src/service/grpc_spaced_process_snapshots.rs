@@ -639,20 +639,15 @@ impl SandboxManagerService {
         let route_auth =
             self.prepare_service_port_ingress(&metadata, &sandbox_id_str, "ServicePortIngress")?;
         route_auth.authorize_service_port(&self.lookup_sandbox(&sandbox_id_str)?, port)?;
-        if pplx_space_common_core::env::env_flag(
-            pplx_space_common_core::env::test_hook_var("SPACE_INGRESS_WAKE_ENABLED").as_deref(),
-            false,
-        ) {
-            self.ensure_active_for_read_only_guest_activity(
-                Some(route_auth.clone()),
-                &sandbox_id_str,
-                true,
-                Some(pplx_space_common_svc::ingress_admission::preparation_timeout()),
-                GuestActivityKind::Access,
-                "ServicePortIngress",
-            )
-            .await?;
-        }
+        self.ensure_active_for_read_only_guest_activity(
+            Some(route_auth.clone()),
+            &sandbox_id_str,
+            true,
+            Some(pplx_space_common_svc::ingress_admission::preparation_timeout()),
+            GuestActivityKind::Access,
+            "ServicePortIngress",
+        )
+        .await?;
         let ingress_protection::AdmittedIngress {
             sandbox,
             fence: identity_token,

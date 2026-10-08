@@ -32,6 +32,38 @@ pub(crate) fn optional_date_time(generator: &mut SchemaGenerator) -> Schema {
     })
 }
 
+fn incubating(mut schema: Schema) -> Schema {
+    schema.insert(
+        crate::routes::M1_STATUS_EXTENSION.into(),
+        crate::routes::NativeOperationStatus::Incubating
+            .as_str()
+            .into(),
+    );
+    schema
+}
+
+pub(crate) fn optional_incubating_date_time(generator: &mut SchemaGenerator) -> Schema {
+    incubating(optional_date_time(generator))
+}
+
+pub(crate) fn optional_incubating_string(generator: &mut SchemaGenerator) -> Schema {
+    incubating(Option::<String>::json_schema(generator))
+}
+
+pub(crate) fn optional_incubating_idle_action(generator: &mut SchemaGenerator) -> Schema {
+    incubating(Option::<crate::SandboxIdleAction>::json_schema(generator))
+}
+
+pub(crate) fn optional_incubating_idle_action_input(generator: &mut SchemaGenerator) -> Schema {
+    let _ = generator;
+    incubating(schemars::json_schema!({
+        "anyOf": [
+            { "type": "string", "enum": crate::SandboxIdleAction::KNOWN_VALUES },
+            { "type": "null" }
+        ]
+    }))
+}
+
 fn string_with_pattern(generator: &mut SchemaGenerator, pattern: impl Into<String>) -> Schema {
     let mut schema = String::json_schema(generator);
     schema.insert("pattern".into(), pattern.into().into());

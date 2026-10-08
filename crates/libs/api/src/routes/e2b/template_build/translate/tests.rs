@@ -563,6 +563,27 @@ fn copy_blob_step_preserves_e2b_source_path() {
     }
 }
 
+// The seed, not the API, places the start command and lifts its task cap: a
+// unit that set Slice= and TasksMax=infinity itself would run uncapped on a
+// seed without the envelope's limits.
+#[test]
+fn start_cmd_unit_leaves_placement_and_task_cap_to_the_seed() {
+    let step = install_start_cmd_unit("python -m example_daemon");
+    let Some(build_proto::recipe::step::Body::Run(run)) = step.body else {
+        panic!("expected Run step");
+    };
+    let encoded = run
+        .command
+        .split_once("printf %s ")
+        .and_then(|(_, rest)| rest.split_once(" | base64 -d"))
+        .map(|(quoted, _)| quoted.trim_matches('\''))
+        .expect("unit payload");
+    let unit = String::from_utf8(Base64.decode(encoded).expect("base64")).expect("utf-8");
+    assert!(unit.contains("ExecStart=/bin/sh -lc"));
+    assert!(!unit.contains("Slice="), "{unit}");
+    assert!(!unit.contains("TasksMax="), "{unit}");
+}
+
 #[test]
 fn install_start_cmd_unit_emits_run_with_unit_text() {
     let step = install_start_cmd_unit("python -m example_daemon");

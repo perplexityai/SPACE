@@ -59,6 +59,16 @@ impl<T> std::fmt::Debug for LazyClient<T> {
 struct CachedClient<T> {
     generation: u64,
     client: T,
+    connection: Option<crate::PinnedConnection>,
+}
+
+impl<T> CachedClient<T> {
+    fn is_usable(&self) -> bool {
+        !self
+            .connection
+            .as_ref()
+            .is_some_and(crate::PinnedConnection::is_closed)
+    }
 }
 
 pub struct LazyClientLease<T> {
@@ -143,15 +153,41 @@ where
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = Result<T, E>>,
     {
-        if let Some(cached) = self.client.lock().await.as_ref() {
-            return Ok(LazyClientLease {
-                generation: cached.generation,
-                client: cached.client.clone(),
-            });
+        self.get_or_connect_pinned_with_generation(move || async move {
+            connect().await.map(|client| (client, None))
+        })
+        .await
+    }
+
+    /// Like [`Self::get_or_connect_with_generation`], but a client whose pinned
+    /// connection has closed is replaced before it is leased again.
+    pub async fn get_or_connect_pinned_with_generation<E, F, Fut>(
+        &self,
+        connect: F,
+    ) -> Result<LazyClientLease<T>, E>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<(T, Option<crate::PinnedConnection>), E>>,
+    {
+        {
+            let mut cached = self.client.lock().await;
+            match cached.as_ref() {
+                Some(cached) if cached.is_usable() => {
+                    return Ok(LazyClientLease {
+                        generation: cached.generation,
+                        client: cached.client.clone(),
+                    });
+                }
+                Some(_) => {
+                    *cached = None;
+                    self.connected.store(false, Ordering::Relaxed);
+                }
+                None => {}
+            }
         }
 
         match connect().await {
-            Ok(client) => {
+            Ok((client, connection)) => {
                 let mut cached = self.client.lock().await;
                 if let Some(existing) = cached.as_ref() {
                     self.connected.store(true, Ordering::Relaxed);
@@ -164,6 +200,7 @@ where
                 *cached = Some(CachedClient {
                     generation,
                     client: client.clone(),
+                    connection,
                 });
                 self.connected.store(true, Ordering::Relaxed);
                 Ok(LazyClientLease { generation, client })

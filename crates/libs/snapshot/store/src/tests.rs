@@ -1,12 +1,14 @@
 use super::{
-    GetSnapshotError, InsertSnapshotError, NewSnapshot, SnapshotArtifact, delete_snapshot_catalog,
-    get, insert,
+    GetSnapshotError, InsertSnapshotError, NewSnapshot, RecordArtifactDigestsError,
+    SnapshotArtifact, SnapshotArtifactDigest, artifact_digests, delete_snapshot_catalog, get,
+    insert, record_artifact_digests,
 };
 use jiff::Timestamp;
 use pplx_space_common_core::sql;
 use pplx_space_common_core::types::{
-    Arch, ArtifactKind, ArtifactOrigin, ExactStorageUri, ExecutionGeneration, ExecutionMetadata,
-    LocalArtifactId, NodeId, OrgId, SandboxId, SnapshotContentHash, SnapshotExecutionMetadata,
+    Arch, ArtifactKind, ArtifactOrigin, Digest, ExactStorageUri, ExecutionGeneration,
+    ExecutionMetadata, LocalArtifactId, NodeId, OrgId, SandboxId,
+    SnapshotArtifact as SnapshotArtifactFile, SnapshotContentHash, SnapshotExecutionMetadata,
     SnapshotId, SnapshotKind, SnapshotName, SnapshotState, TemplateArtifactDigest, TemplateName,
 };
 use pplx_space_db_test_fixtures::{
@@ -356,5 +358,83 @@ async fn snapshot_catalog_store_contract() -> TestResult {
         restored.storage_location().map(|location| location.id()),
         Some(location_id)
     );
+    Ok(())
+}
+
+/// Digests recorded at finalize are read back for restore, a replay cannot
+/// rewrite them, and they leave the catalog with their snapshot.
+#[tokio::test(flavor = "current_thread")]
+async fn artifact_digests_follow_their_snapshot() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let sandbox_id = SandboxId::new();
+    sqlx::query(sql!(
+        "INSERT INTO sandboxes (id, user_id, org_id, network_policy_generation)
+         VALUES ($1, $2::UUID, $3::UUID, 1)"
+    ))
+    .bind(sandbox_id)
+    .bind(SEEDED_USER_ID)
+    .bind(SEEDED_ORG_ID)
+    .execute(&db.pool)
+    .await?;
+    let snapshot_id = SnapshotId::new();
+    sqlx::query(sql!(
+        "INSERT INTO snapshots (id, sandbox_id, type, state)
+         VALUES ($1, $2, 'full', 'creating')"
+    ))
+    .bind(snapshot_id.as_uuid())
+    .bind(sandbox_id)
+    .execute(&db.pool)
+    .await?;
+
+    let digests = [
+        SnapshotArtifactDigest {
+            artifact: SnapshotArtifactFile::Memory,
+            digest: Digest::sha256([0x22; 32]),
+            size_bytes: 1 << 30,
+        },
+        SnapshotArtifactDigest {
+            artifact: SnapshotArtifactFile::VmState,
+            digest: Digest::sha256([0x11; 32]),
+            size_bytes: 4096,
+        },
+    ];
+    let mut tx = db.pool.begin().await?;
+    record_artifact_digests(&mut tx, snapshot_id, &digests).await?;
+    tx.commit().await?;
+
+    let mut expected = digests.to_vec();
+    expected.sort_by_key(|digest| digest.artifact.file_name());
+    assert_eq!(artifact_digests(&db.pool, snapshot_id).await?, expected);
+
+    // An identical replay is a no-op; a conflicting one is refused and
+    // leaves the recorded digests untouched.
+    let mut tx = db.pool.begin().await?;
+    record_artifact_digests(&mut tx, snapshot_id, &digests[..1]).await?;
+    tx.commit().await?;
+    let mut tx = db.pool.begin().await?;
+    let conflict = record_artifact_digests(
+        &mut tx,
+        snapshot_id,
+        &[SnapshotArtifactDigest {
+            artifact: SnapshotArtifactFile::VmState,
+            digest: Digest::sha256([0x33; 32]),
+            size_bytes: 4096,
+        }],
+    )
+    .await;
+    assert!(matches!(
+        conflict,
+        Err(RecordArtifactDigestsError::Conflict { artifact, .. })
+            if artifact == SnapshotArtifactFile::VmState
+    ));
+    tx.rollback().await?;
+    assert_eq!(artifact_digests(&db.pool, snapshot_id).await?, expected);
+
+    let mut tx = db.pool.begin().await?;
+    assert!(delete_snapshot_catalog(&mut tx, snapshot_id).await?);
+    tx.commit().await?;
+    assert!(artifact_digests(&db.pool, snapshot_id).await?.is_empty());
     Ok(())
 }

@@ -60,6 +60,7 @@ pub use template_build::TemplateBuildState;
 use template_build::{
     file_upload_capability_org, file_upload_signing_secret, mint_file_upload_query,
 };
+pub(crate) use translate::translate_sandbox_state;
 use translate::*;
 use types::*;
 

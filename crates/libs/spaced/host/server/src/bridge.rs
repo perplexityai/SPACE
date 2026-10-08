@@ -324,6 +324,9 @@ async fn serve_until_shutdown(
     result
 }
 
+/// A bridge guest channel or client and, for vsock, the connection it is pinned to.
+type WithPinnedConnection<T> = (T, Option<pplx_space_spaced_common::PinnedConnection>);
+
 /// Stamps out a `call_bridge_guest_{meta,filesystem,process}` wrapper.
 ///
 /// Each wrapper retries connection acquisition; only replay-safe calls also
@@ -483,7 +486,7 @@ impl SpacedHostService {
             BRIDGE_GUEST_PROBE_TIMEOUT,
             "bridge guest ping timed out",
             async {
-                let mut client = self.connect_bridge_guest().await.map_err(|error| {
+                let (mut client, _) = self.connect_bridge_guest().await.map_err(|error| {
                     host_relay_status(
                         Status::unavailable(error.to_string()),
                         "bridge_guest_ping",
@@ -536,7 +539,7 @@ impl SpacedHostService {
         &self,
         timeout: std::time::Duration,
     ) -> Result<Option<GuestReadySnapshot>, Status> {
-        let mut client = with_bridge_guest_timeout(
+        let (mut client, _) = with_bridge_guest_timeout(
             BRIDGE_GUEST_PROBE_TIMEOUT,
             "bridge guest readiness connection timed out",
             async {
@@ -896,13 +899,12 @@ impl SpacedHostService {
 
     pub(super) async fn connect_bridge_guest_channel(
         &self,
-    ) -> Result<tonic::transport::Channel, ConnectBridgeGuestError> {
+    ) -> Result<WithPinnedConnection<tonic::transport::Channel>, ConnectBridgeGuestError> {
         match &self.inner.bridge_guest_connector {
-            BridgeGuestConnector::Uds(path) => Ok(pplx_space_spaced_common::connect_uds_channel(
-                "spaced bridge guest",
-                path,
-            )
-            .await?),
+            BridgeGuestConnector::Uds(path) => Ok((
+                pplx_space_spaced_common::connect_uds_channel("spaced bridge guest", path).await?,
+                None,
+            )),
             BridgeGuestConnector::FirecrackerVsock {
                 vsock_uds_path,
                 port,
@@ -914,43 +916,50 @@ impl SpacedHostService {
                     *port,
                     *expected_peer,
                 )
-                .await?,
+                .await
+                .map(|(channel, connection)| (channel, Some(connection)))?,
             ),
         }
     }
 
     pub(super) async fn connect_bridge_guest(
         &self,
-    ) -> Result<BridgeGuestClient<tonic::transport::Channel>, ConnectBridgeGuestError> {
-        Ok(BridgeGuestClient::new(
-            self.connect_bridge_guest_channel().await?,
-        ))
+    ) -> Result<
+        WithPinnedConnection<BridgeGuestClient<tonic::transport::Channel>>,
+        ConnectBridgeGuestError,
+    > {
+        let (channel, connection) = self.connect_bridge_guest_channel().await?;
+        Ok((BridgeGuestClient::new(channel), connection))
     }
 
     pub(super) async fn connect_bridge_guest_filesystem(
         &self,
-    ) -> Result<BridgeGuestFilesystemClient<tonic::transport::Channel>, ConnectBridgeGuestError>
-    {
-        Ok(BridgeGuestFilesystemClient::new(
-            self.connect_bridge_guest_channel().await?,
-        ))
+    ) -> Result<
+        WithPinnedConnection<BridgeGuestFilesystemClient<tonic::transport::Channel>>,
+        ConnectBridgeGuestError,
+    > {
+        let (channel, connection) = self.connect_bridge_guest_channel().await?;
+        Ok((BridgeGuestFilesystemClient::new(channel), connection))
     }
 
     pub(super) async fn connect_bridge_guest_process(
         &self,
-    ) -> Result<BridgeGuestProcessClient<tonic::transport::Channel>, ConnectBridgeGuestError> {
-        Ok(BridgeGuestProcessClient::new(
-            self.connect_bridge_guest_channel().await?,
-        ))
+    ) -> Result<
+        WithPinnedConnection<BridgeGuestProcessClient<tonic::transport::Channel>>,
+        ConnectBridgeGuestError,
+    > {
+        let (channel, connection) = self.connect_bridge_guest_channel().await?;
+        Ok((BridgeGuestProcessClient::new(channel), connection))
     }
 
     pub(super) async fn connect_bridge_guest_networking(
         &self,
-    ) -> Result<BridgeGuestNetworkingClient<tonic::transport::Channel>, ConnectBridgeGuestError>
-    {
-        Ok(BridgeGuestNetworkingClient::new(
-            self.connect_bridge_guest_channel().await?,
-        ))
+    ) -> Result<
+        WithPinnedConnection<BridgeGuestNetworkingClient<tonic::transport::Channel>>,
+        ConnectBridgeGuestError,
+    > {
+        let (channel, connection) = self.connect_bridge_guest_channel().await?;
+        Ok((BridgeGuestNetworkingClient::new(channel), connection))
     }
 
     pub(super) async fn connect_host_control(
@@ -1119,7 +1128,7 @@ impl SpacedHostService {
     > {
         self.inner
             .bridge_guest_filesystem_client
-            .get_or_connect_with_generation(|| async {
+            .get_or_connect_pinned_with_generation(|| async {
                 self.connect_bridge_guest_filesystem()
                     .await
                     .map_err(|error| Status::unavailable(error.to_string()))
@@ -1304,7 +1313,7 @@ impl SpacedHostService {
     > {
         self.inner
             .bridge_guest_meta_client
-            .get_or_connect_with_generation(|| async {
+            .get_or_connect_pinned_with_generation(|| async {
                 self.connect_bridge_guest()
                     .await
                     .map_err(|error| Status::unavailable(error.to_string()))
@@ -1322,7 +1331,7 @@ impl SpacedHostService {
     > {
         self.inner
             .bridge_guest_process_client
-            .get_or_connect_with_generation(|| async {
+            .get_or_connect_pinned_with_generation(|| async {
                 self.connect_bridge_guest_process()
                     .await
                     .map_err(|error| Status::unavailable(error.to_string()))
@@ -1340,7 +1349,7 @@ impl SpacedHostService {
     > {
         self.inner
             .bridge_guest_networking_client
-            .get_or_connect_with_generation(|| async {
+            .get_or_connect_pinned_with_generation(|| async {
                 self.connect_bridge_guest_networking()
                     .await
                     .map_err(|error| Status::unavailable(error.to_string()))

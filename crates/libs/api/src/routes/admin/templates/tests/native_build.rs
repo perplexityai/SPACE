@@ -86,13 +86,35 @@ async fn native_build_fixture() -> TestResult<NativeBuildFixture> {
 
     // Only the builder RPC is simulated; HTTP auth, routing and job persistence are real.
     let (sender, builds) = mpsc::channel(1);
+    let grant_pool = db.pool.clone();
     let builder = Router::new().route(
         "/space.node.api.v1.BuilderApi/BuildTemplate",
         post(move |body: Bytes| {
             let sender = sender.clone();
+            let grant_pool = grant_pool.clone();
             async move {
                 assert_eq!(body[0], 0, "the build RPC must be uncompressed");
                 let request = build_proto::StartBuildRequest::decode(&body[5..]).unwrap();
+                // A fast builder can publish before returning StartBuild. Observe
+                // the actual grant here, while dispatch is still in progress.
+                if request.org_id.is_none() {
+                    let grant = request
+                        .system_publication_grant_id
+                        .as_deref()
+                        .expect("system build carries its pre-dispatch grant")
+                        .parse::<Uuid>()
+                        .unwrap();
+                    let target: String = sqlx::query_scalar(sql!(
+                        "SELECT template_name FROM template_system_publication_grants WHERE id = $1"
+                    ))
+                    .bind(grant)
+                    .fetch_one(&grant_pool)
+                    .await
+                    .unwrap();
+                    assert_eq!(target, request.template_id);
+                } else {
+                    assert!(request.system_publication_grant_id.is_none());
+                }
                 sender.send(request).await.unwrap();
                 let response = BuildTemplateResponse {
                     job_id: job_id.to_string(),
@@ -371,6 +393,21 @@ async fn native_build_session_ownership(
             system.is_none().then(|| user_org.to_string())
         );
         if let Some(template) = system {
+            let grant = request
+                .system_publication_grant_id
+                .as_deref()
+                .expect("system build grant")
+                .parse::<Uuid>()?;
+            let retained: bool = sqlx::query_scalar(sql!(
+                "SELECT EXISTS (SELECT 1 FROM template_system_publication_grants WHERE id = $1)"
+            ))
+            .bind(grant)
+            .fetch_one(&fixture.db.pool)
+            .await?;
+            assert!(
+                retained,
+                "successful dispatch retains its publication grant"
+            );
             assert_eq!(request.template_id, template.as_str());
             assert!(request.options.as_ref().unwrap().publish_tags.is_empty());
             let Some(recipe) = request.recipe else {

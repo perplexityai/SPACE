@@ -9305,3 +9305,211 @@ fn resident_policy_resume_is_generation_fenced_and_arms_only_after_thaw() {
         }
     }
 }
+
+#[test]
+fn teardown_suspend_terminal_transitions_close_jobs_atomically() {
+    for target in [SandboxState::Deleting, SandboxState::Quarantined] {
+        let conn = test_conn();
+        insert_test_sandbox(
+            &conn,
+            TestSandboxInsert::new("sandbox-1", "sandbox1", SandboxState::Paused),
+        );
+        let generation = ExecutionGeneration::new(7).unwrap();
+        begin_teardown_suspend_operation(&conn, "sandbox-1", generation).unwrap();
+        match target {
+            SandboxState::Deleting => {
+                mark_deleting_superseding_activation(&conn, "sandbox-1").unwrap();
+            }
+            SandboxState::Quarantined => {
+                mark_quarantined(
+                    &conn,
+                    "sandbox-1",
+                    SandboxQuarantineSource::SbxManager,
+                    SandboxQuarantineReasonCode::RuntimeProbeInconsistent,
+                    "runtime unavailable",
+                    SandboxQuarantineNextAction::RequiresOperatorAttention,
+                )
+                .unwrap();
+            }
+            _ => unreachable!(),
+        }
+        assert_eq!(
+            latest_teardown_suspend_operation(&conn, "sandbox-1")
+                .unwrap()
+                .unwrap()
+                .status,
+            TeardownSuspendOperationStatus::Failed,
+            "{target}"
+        );
+    }
+    let conn = test_conn();
+    insert_test_sandbox(
+        &conn,
+        TestSandboxInsert::new("sandbox-1", "sandbox1", SandboxState::Paused),
+    );
+    begin_teardown_suspend_operation(&conn, "sandbox-1", ExecutionGeneration::new(7).unwrap())
+        .unwrap();
+    let tx = immediate_transaction(&conn).unwrap();
+    delete_sandbox_child_rows(&tx, "sandbox-1").unwrap();
+    assert!(
+        active_teardown_suspend_operation(&tx, "sandbox-1")
+            .unwrap()
+            .is_none()
+    );
+    tx.rollback().unwrap();
+    assert!(
+        active_teardown_suspend_operation(&conn, "sandbox-1")
+            .unwrap()
+            .is_some()
+    );
+    delete_sandbox(&conn, "sandbox-1").unwrap();
+    assert_eq!(
+        latest_teardown_suspend_operation(&conn, "sandbox-1")
+            .unwrap()
+            .unwrap()
+            .status,
+        TeardownSuspendOperationStatus::Failed
+    );
+}
+
+#[test]
+fn teardown_suspend_terminal_failure_is_generation_fenced() {
+    let conn = test_conn();
+    insert_test_sandbox(
+        &conn,
+        TestSandboxInsert::new("sandbox-1", "sandbox1", SandboxState::Paused),
+    );
+    let old = ExecutionGeneration::new(7).unwrap();
+    let current = ExecutionGeneration::new(8).unwrap();
+    begin_teardown_suspend_operation(&conn, "sandbox-1", old).unwrap();
+    begin_teardown_suspend_operation(&conn, "sandbox-1", current).unwrap();
+    assert!(
+        !fail_teardown_suspend_operation(&conn, "sandbox-1", old, TeardownSuspendFailure::Missing)
+            .unwrap()
+    );
+    assert_eq!(
+        active_teardown_suspend_operation(&conn, "sandbox-1")
+            .unwrap()
+            .unwrap()
+            .execution_generation,
+        current
+    );
+    assert!(
+        fail_teardown_suspend_operation(
+            &conn,
+            "sandbox-1",
+            current,
+            TeardownSuspendFailure::Missing
+        )
+        .unwrap()
+    );
+    assert!(
+        !fail_teardown_suspend_operation(
+            &conn,
+            "sandbox-1",
+            current,
+            TeardownSuspendFailure::Missing
+        )
+        .unwrap()
+    );
+    begin_teardown_suspend_operation(&conn, "sandbox-1", current).unwrap_err();
+    begin_teardown_suspend_operation(&conn, "sandbox-1", ExecutionGeneration::new(9).unwrap())
+        .unwrap();
+}
+
+#[test]
+fn teardown_suspend_reconciliation_skips_healthy_and_retained_jobs_and_bounds_closures() {
+    let conn = test_conn();
+    let generation = ExecutionGeneration::new(7).unwrap();
+    let unrelated_job = JobId::new();
+    pplx_space_common_jobs::db::insert_job(
+        &conn,
+        pplx_space_common_jobs::db::InsertJob {
+            job_id: &unrelated_job,
+            kind: "synthetic_other_job",
+            payload: "{}",
+            subject_id: Some("absent"),
+            dedup_key: None,
+            max_attempts: 1,
+            traceparent: None,
+            priority: Default::default(),
+        },
+    )
+    .unwrap();
+    for index in 0..260 {
+        let id = format!("sandbox-{index}");
+        insert_test_sandbox(
+            &conn,
+            TestSandboxInsert::new(&id, format!("sbx{index:05}"), SandboxState::Paused),
+        );
+        claim_teardown_suspend_operation(&conn, &id, generation).unwrap();
+    }
+    // Simulate rows persisted by a binary without transition cleanup, both pending and running.
+    for index in 127..259 {
+        let state = if index % 2 == 0 {
+            "quarantined"
+        } else {
+            "deleting"
+        };
+        conn.execute(
+            "UPDATE sandboxes SET state = ?1 WHERE id = ?2",
+            params![state, format!("sandbox-{index}")],
+        )
+        .unwrap();
+    }
+    // Retained failed history must not consume the closure budget or be rewritten.
+    let retained = active_teardown_suspend_operation(&conn, "sandbox-0")
+        .unwrap()
+        .unwrap();
+    pplx_space_common_jobs::db::fail_job_permanent(
+        &conn,
+        &retained.job_id,
+        "synthetic retained failure",
+        None,
+    )
+    .unwrap();
+    claim_teardown_suspend_operation(&conn, "sandbox-0", ExecutionGeneration::new(8).unwrap())
+        .unwrap();
+    mark_teardown_suspend_operation_running(&conn, "sandbox-259", generation).unwrap();
+    conn.execute("DELETE FROM sandboxes WHERE id = 'sandbox-259'", [])
+        .unwrap();
+    assert_eq!(
+        reconcile_terminal_teardown_suspend_jobs(&conn).unwrap(),
+        128
+    );
+    assert_eq!(reconcile_terminal_teardown_suspend_jobs(&conn).unwrap(), 5);
+    assert_eq!(reconcile_terminal_teardown_suspend_jobs(&conn).unwrap(), 0);
+    assert_eq!(
+        pplx_space_common_jobs::db::get_job(&conn, &retained.job_id)
+            .unwrap()
+            .unwrap()
+            .error
+            .as_deref(),
+        Some("synthetic retained failure")
+    );
+    assert!(
+        !pplx_space_common_jobs::db::get_job(&conn, &unrelated_job)
+            .unwrap()
+            .unwrap()
+            .is_terminal()
+    );
+    for index in 0..127 {
+        assert!(
+            active_teardown_suspend_operation(&conn, &format!("sandbox-{index}"))
+                .unwrap()
+                .is_some()
+        );
+    }
+    for index in 127..260 {
+        let operation = latest_teardown_suspend_operation(&conn, &format!("sandbox-{index}"))
+            .unwrap()
+            .unwrap();
+        let job = pplx_space_common_jobs::db::get_job(&conn, &operation.job_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            job.failure,
+            Some(pplx_space_common_jobs::JobFailure::Permanent { reason: None })
+        );
+    }
+}

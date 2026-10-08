@@ -1157,8 +1157,10 @@ fn cached_base_fixture() -> CachedBaseFixture {
 #[tokio::test]
 async fn get_template_authorizes_and_resolves_before_using_cached_builds(
     cached_base_fixture: CachedBaseFixture,
+    #[values(false, true)] scoped: bool,
+    #[values(false, true)] cold: bool,
 ) {
-    use crate::volume::{FindReleaseError, ResolvedRelease};
+    use crate::volume::{FindReleaseError, PullOutcome, ResolvedRelease};
     let CachedBaseFixture {
         root,
         service,
@@ -1166,6 +1168,10 @@ async fn get_template_authorizes_and_resolves_before_using_cached_builds(
         hash_a,
         hash_b,
     } = cached_base_fixture;
+    if cold {
+        crate::db::delete_build(&service.db.lock().unwrap(), "base", &hash_a).unwrap();
+    }
+    let materialized = std::cell::Cell::new(false);
     let request = |hash: Option<String>, tag: Option<&str>| {
         internal_request(crate::proto::GetTemplateRequest {
             template: Some(crate::proto::TemplateRef {
@@ -1184,16 +1190,33 @@ async fn get_template_authorizes_and_resolves_before_using_cached_builds(
         (&hash_b, None, Some("stable")),
         (&hash_a, Some(hash_a.clone()), None),
     ] {
+        let expected_hash = hash.clone().unwrap_or_default();
+        let mut lookup = request(hash, tag);
+        lookup.get_mut().caller_org_id = scoped.then(|| org.to_string());
         let response = service
-            .get_template_resolving(request(hash, tag), async |name, _, _, caller| {
-                assert_eq!(name, "base");
-                assert_eq!(caller, Some(org));
-                Ok(ResolvedRelease {
-                    hash: selected.clone(),
-                    storage_uris: vec![],
-                    visibility: pplx_space_node_api_client::proto::TemplateVisibility::OrgSpecific,
-                })
-            })
+            .get_template_resolving(
+                lookup,
+                async |name, hash, resolved_tag, caller| {
+                    assert_eq!(name, "base");
+                    assert_eq!(hash, expected_hash);
+                    assert_eq!(resolved_tag, tag.unwrap_or_default());
+                    assert_eq!(caller, scoped.then_some(org));
+                    Ok(ResolvedRelease {
+                        hash: selected.clone(),
+                        storage_uris: vec![],
+                        visibility:
+                            pplx_space_node_api_client::proto::TemplateVisibility::OrgSpecific,
+                    })
+                },
+                async |name, release| {
+                    assert_eq!(name, "base");
+                    assert_eq!(release.hash, hash_a);
+                    assert!(cold);
+                    assert!(!materialized.replace(true));
+                    insert_ready_build(&service.db.lock().unwrap(), name, &release.hash);
+                    PullOutcome::Materialized
+                },
+            )
             .await
             .unwrap()
             .into_inner();
@@ -1201,19 +1224,20 @@ async fn get_template_authorizes_and_resolves_before_using_cached_builds(
             response.template.unwrap().content_hash.as_ref(),
             Some(selected)
         );
-        assert_eq!(response.authorized_org_id, Some(org.to_string()));
+        assert_eq!(response.authorized_org_id, scoped.then(|| org.to_string()));
         assert_eq!(
             response.template_dir,
             root.path().join("base").join(selected).to_string_lossy()
         );
     }
+    assert_eq!(materialized.get(), cold);
 
     // Sandbox Start reads template policy without a digest, tag, or dimensions.
     // That trusted lookup must work for locally registered, unpublished templates.
     for (hash, tag, selected) in [
         (Some(hash_a.clone()), None, &hash_a),
+        (Some(hash_a.clone()), Some("stable"), &hash_a),
         (None, None, &hash_b),
-        (None, Some("stable"), &hash_b),
     ] {
         let mut legacy_request = request(hash, tag);
         legacy_request.get_mut().caller_org_id = None;
@@ -1221,9 +1245,11 @@ async fn get_template_authorizes_and_resolves_before_using_cached_builds(
         legacy_request.get_mut().memory_mib = None;
 
         let response = service
-            .get_template_resolving(legacy_request, async |_, _, _, _| {
-                panic!("legacy cache hit must not depend on ClusterApi")
-            })
+            .get_template_resolving(
+                legacy_request,
+                async |_, _, _, _| panic!("trusted cache hit must not depend on ClusterApi"),
+                async |_, _| panic!("cached build must not be pulled"),
+            )
             .await
             .unwrap()
             .into_inner();
@@ -1244,11 +1270,19 @@ async fn get_template_authorizes_and_resolves_before_using_cached_builds(
     }
 
     // Revoked access and a missing tag must not fall back to either cached build.
-    for (hash, tag) in [(Some(hash_a), None), (None, Some("missing"))] {
+    for (hash, tag, caller_org) in [
+        (Some(hash_a), None, Some(org)),
+        (None, Some("missing"), Some(org)),
+        (None, Some("missing"), None),
+    ] {
+        let mut lookup = request(hash, tag);
+        lookup.get_mut().caller_org_id = caller_org.map(|org| org.to_string());
         let error = service
-            .get_template_resolving(request(hash, tag), async |_, _, _, _| {
-                Err(FindReleaseError::NotFound)
-            })
+            .get_template_resolving(
+                lookup,
+                async |_, _, _, _| Err(FindReleaseError::NotFound),
+                async |_, _| panic!("unresolved release must not be pulled"),
+            )
             .await
             .unwrap_err();
         assert_eq!(error.code(), tonic::Code::NotFound);

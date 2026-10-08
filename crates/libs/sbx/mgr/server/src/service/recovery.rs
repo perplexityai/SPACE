@@ -2079,6 +2079,14 @@ impl SandboxManagerService {
                 service.retire_rowless_restore_transfer_scope_batch(&mut transfer_scan, &shutdown_token),
             ).await;
             if shutdown_token.is_cancelled() { break; }
+            match service.storage(move |db| {
+                crate::db::reconcile_terminal_teardown_suspend_jobs(db)
+                    .map_err(|error| Status::internal(format!("teardown job reconciliation: {error}")))
+            }).await {
+                Ok(failed) if failed > 0 => tracing::info!(failed, "reconciled terminal teardown suspend jobs"),
+                Ok(_) => {},
+                Err(error) => tracing::warn!(%error, "teardown suspend job reconciliation failed; will retry"),
+            }
             let mut cursor = std::mem::take(&mut recovery_cursor);
             let candidates = match service.storage(move |db| {
                 let rows = crate::db::periodic_lifecycle_recovery_batch(db, &mut cursor)
