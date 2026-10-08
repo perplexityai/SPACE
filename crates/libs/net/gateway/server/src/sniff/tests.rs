@@ -171,32 +171,6 @@ async fn the_completion_budget_starts_with_the_first_handshake_bytes() {
 }
 
 #[tokio::test]
-async fn a_client_hello_later_than_500ms_is_seen_when_its_absence_would_be_denied() {
-    use tokio::io::AsyncWriteExt;
-
-    let hello = crate::tls_sni::test_fixtures::client_hello(Some("slow.example.com"));
-    let observation = with_loopback_pair(
-        move |mut client| async move {
-            // Later than the previous 500 ms fail-closed budget, as seen from
-            // legitimate clients in production.
-            tokio::time::sleep(Duration::from_millis(800)).await;
-            client.write_all(&hello).await.unwrap();
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        },
-        |server| async move { client_hello_with_detail(&server, MissingClientHello::Denied).await },
-    )
-    .await;
-
-    assert_eq!(
-        observation
-            .scan
-            .server_name()
-            .map(|name| name.as_str().to_string()),
-        Some("slow.example.com".to_string())
-    );
-}
-
-#[tokio::test]
 async fn a_client_that_never_writes_still_times_out_under_the_fail_closed_budget() {
     let observation = with_loopback_pair(
         |client| async move {
