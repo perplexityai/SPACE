@@ -7,12 +7,12 @@
 # image, baked in at build time the way a production node image bakes it
 # (infra/space/kind/node/Dockerfile). Docker fixes a container's image when it
 # creates the container, so a cluster created before the image existed, or from
-# an older build of it, keeps its node layer for its whole life: the node-stack
-# pods would wait for a btrfs /space/cache that never appears, or run on a layer
-# the tree no longer describes. As with a production node image, the remedy is
-# to replace the nodes; for kind, that is recreating the cluster. Each node's
-# image carries the tag of the inputs it was built from as the label
-# org.opencontainers.image.version, which containers inherit.
+# an older build of it, keeps its node layer for its whole life: the node
+# service pods would wait for a btrfs /space/cache that never appears, or run
+# on a layer the tree no longer describes. As with a production node image, the
+# remedy is to replace the nodes; for kind, that is recreating the cluster.
+# Each node's image carries the tag of the inputs it was built from as the
+# label org.opencontainers.image.version, which containers inherit.
 #
 # Read-only. Exits 0 when the cluster does not exist or every SPACE node runs
 # this tree's image, 1 (with the remedy on stderr) otherwise or when the
