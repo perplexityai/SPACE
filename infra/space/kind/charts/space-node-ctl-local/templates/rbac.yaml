@@ -1,0 +1,43 @@
+{{- $ctx := dict "ctx" . "component" "node-ctl" -}}
+{{- $name := include "space-node-service.name" $ctx -}}
+# Same RBAC shape as the prod space-node-ctl chart: node-ctl's Kubernetes
+# node-local controller watches its own Node and advertises the
+# space.pplx.net/network-slots extended resource on status.capacity (the
+# production source of the capacity bootstrap.sh also seeds statically). Only
+# node-ctl's ServiceAccount holds it; no other node service talks to the
+# Kubernetes API.
+{{ include "space-node-service.serviceAccount" $ctx }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "space-node-service.labels" $ctx | nindent 4 }}
+rules:
+  # Cluster-wide, and narrowed at admission instead: see
+  # templates/node-fence.yaml. `patch nodes/status` below reaches
+  # `metadata.labels` too, so the fence matches both resources.
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch", "patch"]
+  # Advertise the space.pplx.net/network-slots extended resource on the Node's
+  # status.capacity so the scheduler accounts for node-manager network slots.
+  - apiGroups: [""]
+    resources: ["nodes/status"]
+    verbs: ["get", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "space-node-service.labels" $ctx | nindent 4 }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ $name }}
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ $name }}

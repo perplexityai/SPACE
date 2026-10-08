@@ -35,12 +35,12 @@ def btrfs_send_restore_rejects_corrupted_stream(test: smoke.KindEcw) -> None:
 
     with test.phase("locate the source worker and the target"):
         source = restore.current_placement()
-        source_pod = codec.worker_pod(source.node_name)
-        target_node, target_pod = codec.other_sandbox_worker(source.node_name)
+        source_worker = source.node_name
+        target_node = codec.other_sandbox_worker(source.node_name)
         test.record("target_node", target_node)
 
     with test.phase("the worker resolves an omitted suspend format to the stream codec"):
-        codec.require_btrfs_send_default(source_pod)
+        codec.require_btrfs_send_default(source_worker)
 
     with test.phase("suspend without naming a format"):
         suspended_at = codec.mark_since()
@@ -68,4 +68,4 @@ def btrfs_send_restore_rejects_corrupted_stream(test: smoke.KindEcw) -> None:
             )
 
         with test.phase("no instance and no partial receive remain on the target"):
-            codec.expect_no_instance(target_pod)
+            codec.expect_no_instance(target_node)

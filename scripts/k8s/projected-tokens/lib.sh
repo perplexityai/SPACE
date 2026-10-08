@@ -10,21 +10,21 @@ set -euo pipefail
 # kube context + namespace for the local stack. KCTX defaults to your current
 # kube-context — whatever `kind create` / `tilt up` selected — so it tracks the
 # cluster Tilt actually brought up regardless of its name (the Tiltfile derives
-# the name from SPACE_KIND_CLUSTER, default "space-local-3486"). The mutating
+# the name from SPACE_KIND_CLUSTER, default "space-local"). The mutating
 # scripts call assert_local_context, which refuses any non-kind context so this
 # can never touch testing/prod.
 KCTX="${KCTX:-$(kubectl config current-context 2>/dev/null || echo kind-space-local)}"
 NS="${NS:-space}"
 
-# Server side: the node-stack DaemonSet bundles node-api. It runs as the
-# namespace `default` ServiceAccount (the chart sets no serviceAccountName).
-NODE_STACK_DS="${NODE_STACK_DS:-space-node-stack}"
-NODE_STACK_CONTAINER="${NODE_STACK_CONTAINER:-node-stack}"
-NODE_STACK_SA="${NODE_STACK_SA:-default}"
+# Server side: the worker node-api DaemonSet (space-node-api-local), container
+# `node-api`, ServiceAccount `space-node-api`.
+NODE_API_DS="${NODE_API_DS:-space-node-api}"
+NODE_API_CONTAINER="${NODE_API_CONTAINER:-node-api}"
+NODE_API_SA="${NODE_API_SA:-space-node-api}"
 NODE_API_PORT="${NODE_API_PORT:-9800}"
 
-# Client side: space-api dials node-api (DirectSubstrate). It runs as SA
-# `space-api`, container `api`.
+# Client side: space-api dials node-api. It runs as SA `space-api`, container
+# `api`.
 SPACE_API_DEPLOY="${SPACE_API_DEPLOY:-space-api}"
 SPACE_API_CONTAINER="${SPACE_API_CONTAINER:-api}"
 SPACE_API_SA="${SPACE_API_SA:-space-api}"
@@ -34,8 +34,8 @@ NODE_API_AUDIENCE="${NODE_API_AUDIENCE:-space-node-api}"
 NODE_API_INTERNAL_AUDIENCE="${NODE_API_INTERNAL_AUDIENCE:-space-node-api-internal}"
 
 # Which client ServiceAccounts node-api accepts on the NodeApi surface.
-# space-api is the DirectSubstrate caller; the controller and cluster-api
-# entries keep the local wiring aligned with the deployed node-api allowlist.
+# space-api is the caller under test; the controller and cluster-api entries
+# keep the local wiring aligned with the deployed node-api allowlist.
 NODE_API_ALLOWED_SAS="${NODE_API_ALLOWED_SAS:-space-api,space-cluster-controller,space-cluster-api}"
 # Exact subset authorized for tokenless SpacedWaitReady lifecycle probes.
 NODE_API_TRUSTED_WAIT_READY_SAS="${NODE_API_TRUSTED_WAIT_READY_SAS:-space-api,space-cluster-controller}"
@@ -67,9 +67,9 @@ log() { printf '\033[1;34m[pt]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[pt] WARN:\033[0m %s\n' "$*" >&2; }
 die() { printf '\033[1;31m[pt] ERROR:\033[0m %s\n' "$*" >&2; exit 1; }
 
-# Resolve the (single) node-stack pod name.
-node_stack_pod() {
-  k get pod -l app.kubernetes.io/name="${NODE_STACK_DS}" \
+# Resolve one worker node-api pod name.
+node_api_pod() {
+  k get pod -l app.kubernetes.io/name=space-worker,app.kubernetes.io/component=node-api \
     -o jsonpath='{.items[0].metadata.name}' 2>/dev/null
 }
 
@@ -77,7 +77,7 @@ require() { command -v "$1" >/dev/null 2>&1 || die "missing dependency: $1"; }
 
 # Refuse to run cluster-mutating steps against anything that isn't a local kind
 # cluster, so the harness can never touch testing/prod. The 01/02/03 scripts call
-# this; 00 (which only edits a Dockerfile) does not.
+# this.
 assert_local_context() {
   case "$KCTX" in
     kind-*) log "targeting kube-context: $KCTX" ;;

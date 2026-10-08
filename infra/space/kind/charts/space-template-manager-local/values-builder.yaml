@@ -1,0 +1,6 @@
+# No template-cache eviction on the builder (see values.yaml `templateCache`):
+# build-manager's register → publish reads the digest dir after register, and
+# a freshly registered build is unpinned and unreferenced, so a 60 s grace
+# could reclaim it under the upload. Null renders none of the SPACE_TEMPLATE_*
+# environment.
+templateCache: null

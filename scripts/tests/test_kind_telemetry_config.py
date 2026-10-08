@@ -10,6 +10,7 @@ import subprocess
 
 import pytest
 from kind_chart_render import (
+    BUILD_MANAGER_CHART,
     KIND_DIR,
     TELEMETRY_CHARTS,
     bootstrap_guard_environment,
@@ -172,6 +173,23 @@ def test_chart_and_executed_shim_share_isolated_identity(mode, tmp_path, monkeyp
         assert (key in launched_resources) == identity_present, (
             f"{mode}: {key} in {launched_resources}"
         )
+
+
+def test_build_manager_traces_stay_off_when_the_mode_selects_otlp():
+    """Build failures can carry guest output, so build-manager exports no traces."""
+    manifests = render(
+        BUILD_MANAGER_CHART, "space-builder",
+        "--set-string", "telemetry.metricsSink=otlp",
+        "--set-string", "telemetry.traceExporter=otlp",
+    )
+    workload = next(doc for doc in manifests if doc["kind"] == "DaemonSet")
+    env = {
+        entry["name"]: entry.get("value")
+        for entry in workload["spec"]["template"]["spec"]["containers"][0]["env"]
+    }
+    assert env["SPACE_TRACE_EXPORTER"] == "off"
+    assert "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT" not in env
+    assert env["SPACE_METRICS_SINK"] == "otlp"
 
 
 @pytest.mark.parametrize("chart", TELEMETRY_CHARTS, ids=lambda chart: chart.name)
@@ -358,7 +376,7 @@ def test_default_bootstrap_ships_no_empty_tags():
     args = [
         item for setting in settings["helm_set"] for item in ("--set-string", setting)
     ]
-    for chart in ("space-api-local", "space-node-stack"):
+    for chart in ("space-api-local", "space-sandbox-manager-local"):
         workload = next(
             doc
             for doc in render(KIND_DIR / "charts" / chart, "space", *args)

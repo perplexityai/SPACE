@@ -1,0 +1,19 @@
+apiVersion: v2
+name: space-volume-manager-local
+description: Kind DaemonSet for the SPACE volume-manager node service
+type: application
+version: 0.1.0
+appVersion: "0.8.0"
+dependencies:
+  - name: space-kind-telemetry
+    version: 0.1.0
+    repository: "file://../space-kind-telemetry"
+    import-values:
+      - child: telemetry
+        parent: telemetry
+  - name: space-node-service
+    version: 0.1.0
+    repository: "file://../space-node-service"
+    import-values:
+      - child: node
+        parent: node

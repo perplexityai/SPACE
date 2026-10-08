@@ -44,7 +44,6 @@ spec:
             # Local Kind only; deployed services require authenticated internal RPC TLS.
             - name: SPACE_INTERNAL_RPC_INSECURE_DEV
               value: "true"
-            {{- if .Values.k8s.enabled }}
             - name: SPACE_K8S_CONTROL_PLANE
               value: "true"
             - name: SPACE_SANDBOX_NAMESPACE
@@ -57,19 +56,23 @@ spec:
               value: {{ .Values.k8s.sandboxNodeSelectorValue | quote }}
             - name: SPACE_INTERNAL_SECRET_NAME
               value: {{ .Values.internal.secretName | quote }}
-            {{- end }}
             - name: SPACE_K8S_TOKEN_AUTH_ENABLED
               value: "true"
             - name: SPACE_K8S_TOKEN_AUTH_NAMESPACE
               value: {{ .Release.Namespace | quote }}
             - name: SPACE_K8S_TOKEN_AUTH_STATIC_FALLBACK_ENABLED
               value: "false"
+            # Each node service that calls ClusterApi authenticates with its
+            # own DaemonSet's ServiceAccount (space-node-service's projected
+            # cluster-api token), per role.
             - name: SPACE_CLUSTER_API_AUTH_ALLOWED_SERVICE_ACCOUNTS
-              value: "space-node-stack,space-builder-node-stack,space-api,space-cluster-controller,space-data-plane,space-template-publish"
+              value: {{ join "," (concat .Values.clusterApiAuth.nodeServiceAccounts .Values.clusterApiAuth.controlPlaneServiceAccounts) | quote }}
+            # Only build-manager publishes builds; the seed-publish Job
+            # publishes the system seed.
             - name: SPACE_TEMPLATE_PUBLISH_SYSTEM_SERVICE_ACCOUNTS
-              value: "space-builder-node-stack,space-template-publish"
+              value: {{ join "," .Values.clusterApiAuth.systemPublishers | quote }}
             - name: SPACE_TEMPLATE_PUBLISH_TENANT_SERVICE_ACCOUNTS
-              value: "space-builder-node-stack"
+              value: {{ join "," .Values.clusterApiAuth.tenantPublishers | quote }}
             {{- with .Values.visibilityCache }}
             {{- /*
                  Rendered per key and only when set, so an unset value leaves the

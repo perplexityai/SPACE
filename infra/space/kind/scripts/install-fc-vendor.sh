@@ -2,8 +2,8 @@
 # install-fc-vendor.sh — fetch Firecracker binaries + guest kernel into the
 # vendor tree the kind cluster mounts into each sandbox worker.
 #
-# Without this, the kind workers crash-loop because the node-stack pod's
-# hostPath mount points at a directory that has not been staged. This
+# Without this, the kind workers crash-loop because the node services'
+# /space/vendor hostPath mounts point at a directory that has not been staged. This
 # installer stages only the artifacts the kind harness needs:
 #
 #   $VENDOR_ROOT/firecracker/v1.15.1/bin/{firecracker,jailer}

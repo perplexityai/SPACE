@@ -1,7 +1,7 @@
 # Kind workload telemetry
 
 This library owns the common telemetry defaults and environment template used
-by the five Kind workload charts. It deploys no resources and contains no
+by the Kind workload and node-service charts. It deploys no resources and contains no
 experiment or validation code. Override `telemetry` in the consuming chart.
 
 Each consumer imports these defaults and includes `space-kind-telemetry.env`.

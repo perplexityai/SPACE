@@ -1,0 +1,6 @@
+apiVersion: v2
+name: space-node-debug
+description: Kind-only operator shell on each SPACE node (the node host's root shell stand-in)
+type: application
+version: 0.1.0
+appVersion: "0.8.0"

@@ -117,8 +117,8 @@ spec:
             # plaintext sandboxes exactly as before.
             - name: SPACE_BYOK_VOLUME_ENCRYPTION
               value: {{ .Values.byokVolumeEncryption | quote }}
-            # The admin BYOK-enable gate must agree with the node-stack's
-            # development-only authority provisioner.
+            # The admin BYOK-enable gate must agree with the node
+            # credential-manager's development-only authority provisioner.
             - name: SPACE_PLATFORM_KEK_PROVIDER
               value: in-memory
             # Must match the cluster-controller chart's value — see the
@@ -207,10 +207,9 @@ spec:
             - name: EPPO_BASE_URL
               value: {{ .Values.eppo.baseUrl | quote }}
             {{- end }}
-            {{- if .Values.k8s.enabled }}
-            # Switch from DirectSubstrate to KubernetesSubstrate. Sandbox
-            # placement now flows through the Pod reflector and node watcher;
-            # node inventory is synthesized from labelled space-worker Pods.
+            # KubernetesSubstrate: sandbox placement flows through the Pod
+            # reflector and node watcher; node inventory is synthesized from
+            # the labelled node-api Pods.
             - name: SPACE_K8S_CONTROL_PLANE
               value: "true"
             - name: SPACE_SANDBOX_NAMESPACE
@@ -223,7 +222,6 @@ spec:
               value: {{ .Values.k8s.sandboxNodeSelectorValue | quote }}
             - name: SPACE_INTERNAL_SECRET_NAME
               value: {{ .Values.internal.secretName | quote }}
-            {{- end }}
           ports:
             - name: activation
               containerPort: 9801

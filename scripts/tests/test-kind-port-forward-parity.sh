@@ -160,7 +160,7 @@ TILT
 
     export TEST_TILT_CONTEXT=kind-space-local
     (bootstrap_kind_stack__bring_up) >"$work/result" 2>&1 || exit 1
-    for TEST_TILT_CONTEXT in kind-space-local-3486 kind-production ""; do
+    for TEST_TILT_CONTEXT in kind-space-local-other kind-production ""; do
         export TEST_TILT_CONTEXT
         if (bootstrap_kind_stack__bring_up) >"$work/result" 2>&1; then
             echo "FAIL: detached bring-up accepted an unverified Tilt context" >&2

@@ -58,10 +58,10 @@ nodes:
   # extraMounts on sandbox workers:
   #   - SPACE_VENDOR_ROOT : where install-fc-vendor.sh stages
   #     Firecracker v1.15.1 (binary, jailer,
-  #     vmlinux). The node-stack pod hostPath-mounts /space/vendor through,
-  #     matching production where /space/vendor is populated by Packer on
-  #     the AMI. Without this the node-stack image would have to bake the
-  #     FC tree itself.
+  #     vmlinux). The host runtime-supervisor and the node services read
+  #     /space/vendor from the node, matching production where
+  #     /space/vendor is populated by Packer on the AMI. Without this the
+  #     worker image would have to bake the FC tree itself.
   #   - /dev/kvm : Firecracker needs the host KVM character device. kind
   #     nodes run as privileged docker containers; bind-mounting the device
   #     file lets the container's /dev/kvm work.

@@ -6,39 +6,34 @@
 #   * space-internal-api
 #   * space-data-plane
 #   * space-cluster-controller + space-ui (full harness only)
-#   * the space-node-stack DaemonSet — the production worker service set
-#     (runtime-supervisor, node-manager, volume-manager, credential-manager,
-#     template-manager, sandbox-manager, node-ctl, node-api, plus per-sandbox
-#     net-gateways launched on demand) on real Firecracker, under production
-#     unix identities
-#   * full harness only: a dedicated builder node-stack with that runtime set
-#     plus build-manager and a stable builder node-api Service
+#   * one DaemonSet per node service on every sandbox worker — node-manager,
+#     runtime-manager, volume-manager, credential-manager, template-manager,
+#     sandbox-manager, node-ctl and node-api — from the production worker
+#     image, under production unix identities; node-manager's init container
+#     installs runtime-supervisor as a systemd unit on each node, which runs
+#     Firecracker and the per-sandbox net-gateways
+#   * the same set plus build-manager on the dedicated builder nodes, with a
+#     stable builder node-api Service
+#   * a Kind-only operator shell DaemonSet (space-node-debug) on those nodes
 #   * the space-seed-publish Job — builds the production seed locally and
 #     publishes it through the real ClusterApi + object-store path; workers
 #     pull it via template-manager prefetch → volume-manager
 #   * optional: Datadog Agent + in-cluster Fake Intake for local telemetry
 #     capture (`SPACE_KIND_DATADOG_MODE=fakeintake`)
 #
-# Two modes:
-#   * Full harness (default, SPACE_LOCAL_MINIMAL=0, cluster `space-local`): api-server
-#     on the KubernetesSubstrate; every sandbox is its own K8s pod whose pause
-#     container is hijacked by containerd-shim-space-v2 into a Firecracker
-#     microVM — the production topology.
-#   * MINIMAL (SPACE_LOCAL_MINIMAL=1, cluster `space-local-3486`): DirectSubstrate bench —
-#     api-server dials the single worker's node-api directly; no per-sandbox
-#     pods, no cluster-controller, no UI. Fits a 16 GiB Docker Desktop VM.
+# The api-server runs on the KubernetesSubstrate: every sandbox is its own K8s
+# pod whose pause container is hijacked by containerd-shim-space-v2 into a
+# Firecracker microVM — the production topology.
 #
 # Prereqs (do once on a fresh machine):
 #   bash infra/space/kind/scripts/install-prereqs.sh
-#   bash infra/space/kind/scripts/install-fc-vendor.sh   # space-local only
+#   bash infra/space/kind/scripts/install-fc-vendor.sh
 #   # two steps, because inline as `--config "$(...)"` the renderer's failure
 #   # is unchecked and `kind create --config ""` does not error — it builds a
 #   # DEFAULT cluster: one node, no extraMounts, no labels. An assignment
 #   # keeps the exit status, so `&&` stops before kind runs at all.
 #   config="$(bash infra/space/kind/scripts/render-cluster-config.sh)" \
 #     && kind create cluster --config "$config"
-#   # ... or, for the MINIMAL bench, --config infra/space/kind/kind-cluster-3486.yaml
-#   # (no extraMounts, so nothing to render)
 #
 # Then:
 #   tilt up
@@ -52,10 +47,10 @@ allow_k8s_contexts("kind-" + KIND_CLUSTER)
 # store transition" in infra/space/kind/README.md.
 local(["bash", "infra/space/kind/scripts/check-object-store-transition.sh", KIND_CLUSTER], quiet = True)
 
-# The full Kubernetes stack is the development default. The single-worker
-# DirectSubstrate bench is opt-in: set SPACE_LOCAL_MINIMAL=1 and
-# SPACE_KIND_CLUSTER=space-local-3486 when testing that specific substrate.
-MINIMAL = os.getenv("SPACE_LOCAL_MINIMAL", "false") in ("1", "true", "True", "yes")
+# A cluster from before the per-service node DaemonSets still runs the single
+# node-stack pod per node; refuse it rather than run both layouts at once. See
+# "Upgrading from the node-stack layout" in infra/space/kind/README.md.
+local(["bash", "infra/space/kind/scripts/check-node-layout.sh", KIND_CLUSTER], quiet = True)
 
 # Select one metrics sink per process. The Datadog and OTel comparison modes
 # also select the matching trace exporter; journald leaves traces on Datadog.
@@ -81,7 +76,7 @@ if TELEMETRY_MODE == "otel" and not INSTALL_OBSERVABILITY:
 # when they are absent, so the backends are a dependency of the shim on this
 # path exactly as they are in bootstrap.sh. Without this, defaulting to otel
 # fails the shim and blocks rust-artifacts and the sandbox stack.
-if INSTALL_OBSERVABILITY and not MINIMAL:
+if INSTALL_OBSERVABILITY:
     local_resource(
         "install-observability-backends",
         cmd = "SPACE_KIND_CLUSTER={} bash infra/space/kind/scripts/install-observability.sh".format(KIND_CLUSTER),
@@ -151,18 +146,13 @@ def pull_base_images(*dockerfiles):
 def mirrored_bases(dockerfile):
     return "$(bash ci/scripts/mirror-images.sh build-contexts {})".format(dockerfile)
 
-# Up to eight updates at once in the full harness instead of Tilt's default
-# three. Every Rust image waits on the artifact lock anyway, so the default mostly
-# kept image builds and kind loads that could overlap in three strict waves after
-# the compile: 124-176 s of a cold or warm bring-up with the host under 30 % CPU
-# (2026-09-23 bench).
-#
-# The MINIMAL bench keeps Tilt's three: it targets a Docker Desktop VM, where
-# parallel image builds and kind loads starve kind's etcd (see
-# scripts/k8s/projected-tokens/README.md, "Troubleshooting").
-# SPACE_TILT_MAX_PARALLEL_UPDATES in Tilt's environment overrides either default;
+# Up to eight updates at once instead of Tilt's default three. Every Rust image
+# waits on the artifact lock anyway, so the default mostly kept image builds and
+# kind loads that could overlap in three strict waves after the compile: 124-176 s
+# of a cold or warm bring-up with the host under 30 % CPU (2026-09-23 bench).
+# SPACE_TILT_MAX_PARALLEL_UPDATES in Tilt's environment overrides the default;
 # `tilt up` has no flag for it.
-MAX_PARALLEL_UPDATES = int(os.getenv("SPACE_TILT_MAX_PARALLEL_UPDATES", "3" if MINIMAL else "8"))
+MAX_PARALLEL_UPDATES = int(os.getenv("SPACE_TILT_MAX_PARALLEL_UPDATES", "8"))
 update_settings(max_parallel_updates = MAX_PARALLEL_UPDATES)
 
 # No `kind load` in the custom_build commands: Tilt loads every custom_build
@@ -210,32 +200,33 @@ rust_runtime_image(
     runtime_deps = ["docker/Dockerfile.cluster-controller"],
 )
 
-# space-node-stack: the production worker image (docker/Dockerfile.worker —
-# same binaries, cargo features, unix identities, nftables policies as the
-# prod EKS worker/builder DaemonSets) plus the kind entrypoint layer. LTO disabled
-# for faster local iteration. Runs as a DaemonSet on the sandbox workers
-# against real Firecracker, wired to the object store for snapshot artifacts.
+# space-worker: the production worker image (docker/Dockerfile.worker — the
+# binaries, cargo features, unix identities, init scripts, nftables policies and
+# recipes the production node DaemonSets run). Every node-service DaemonSet,
+# the operator shell and space-internal-api run it unchanged. LTO disabled for
+# faster local iteration.
 custom_build(
-    ref = "space-node-stack:local",
+    ref = "space-worker:local",
     command = " && ".join([
-        pull_base_images("docker/Dockerfile.worker", "docker/Dockerfile.node-stack"),
+        pull_base_images("docker/Dockerfile.worker"),
         RUST_ARTIFACT_BUILD,
         # --provenance=false keeps buildx from emitting a multi-platform
         # manifest list, which `kind load docker-image` cannot ingest
         # ("content digest ... not found").
-        ("docker build --provenance=false --sbom=false -t space-worker:local " +
+        ("docker build --provenance=false --sbom=false -t $EXPECTED_REF " +
          "-f docker/Dockerfile.worker {} " +
          "--build-arg SPACE_RUST_BUILD_IMAGE={} .").format(
             mirrored_bases("docker/Dockerfile.worker"), RUST_ARTIFACT_IMAGE),
-        ("docker build --provenance=false --sbom=false -t $EXPECTED_REF " +
-         "-f docker/Dockerfile.node-stack " +
-         "--build-arg SPACE_WORKER_IMAGE=space-worker:local ."),
     ]),
     deps = RUST_ARTIFACT_DEPS + [
             "docker/Dockerfile.worker",
-            "docker/Dockerfile.node-stack",
-            "scripts/k8s/node-stack-start.sh",
-            "scripts/k8s/stage-guest-kernel.sh"],
+            "docker/space/nftables",
+            "scripts/k8s/node-manager-init.sh",
+            "scripts/k8s/node-manager-runtime-supervisor.sh",
+            "scripts/k8s/stage-guest-kernel.sh",
+            "scripts/k8s/sandbox-manager-start.sh",
+            "scripts/space-sbx-db-migrate.sh",
+            "templates/firecracker/recipes"],
     skips_local_docker = False,
 )
 
@@ -333,20 +324,10 @@ local_resource(
     labels = ["bootstrap"],
 )
 
-# Firecracker vendor tree (binary + jailer + vmlinux) at /space/vendor inside
-# each sandbox or builder node. `space-local` gets it via kind extraMounts; the
-# 3486 bench can't bind-mount macOS host paths so the script docker-cps it.
-# No-ops when already present.
-local_resource(
-    "stage-fc-vendor",
-    cmd = "bash infra/space/kind/scripts/stage-fc-vendor.sh {}".format(KIND_CLUSTER),
-    labels = ["bootstrap"],
-)
-
 # Sandbox SSH keypair Secret — the local stand-in for the AMI's
-# Packer-generated /space/etc/ssh. build-seed.sh generates the keypair (and
-# bakes the public half into the seed); the private half is mounted into the
-# node-stack pods so `space-ssh` works. ssh-keygen here is idempotent and
+# Packer-generated key. build-seed.sh generates the keypair (and bakes the
+# public half into the seed); the private half is mounted into build-manager,
+# which SSHes into build VMs. ssh-keygen here is idempotent and
 # uses the same path build-seed.sh does.
 local_resource(
     "sandbox-ssh-secret",
@@ -366,29 +347,28 @@ kubectl --context kind-{cluster} -n {ns} create secret generic space-sandbox-ssh
     labels = ["bootstrap"],
 )
 
-# containerd-shim-space-v2 on each sandbox worker — required by the full
-# harness (KubernetesSubstrate) so per-sandbox pause pods are hijacked into
-# real Firecracker sandboxes. The MINIMAL bench (DirectSubstrate) creates no
-# per-sandbox pods and needs no shim.
-if not MINIMAL:
-    local_resource(
-        "install-space-shim",
-        cmd = "SPACE_KIND_CLUSTER={} SPACE_KIND_TELEMETRY_MODE={} bash infra/space/kind/scripts/install-shim.sh".format(
-            KIND_CLUSTER,
-            TELEMETRY_MODE,
-        ),
-        deps = [TELEMETRY_SCRIPT, "infra/space/kind/scripts/install-shim.sh"] + ([OBSERVABILITY_CONFIG] if OBSERVABILITY_CONFIG else []),
-        resource_deps = ["install-observability-backends"] if INSTALL_OBSERVABILITY else [],
-        labels = ["bootstrap"],
-    )
+# containerd-shim-space-v2 on each sandbox worker, so per-sandbox pause pods
+# are hijacked into real Firecracker sandboxes. install-shim.sh resolves the
+# local metrics and traces Collector Services, so in otel mode it waits for
+# the observability backends.
+local_resource(
+    "install-space-shim",
+    cmd = "SPACE_KIND_CLUSTER={} SPACE_KIND_TELEMETRY_MODE={} bash infra/space/kind/scripts/install-shim.sh".format(
+        KIND_CLUSTER,
+        TELEMETRY_MODE,
+    ),
+    deps = [TELEMETRY_SCRIPT, "infra/space/kind/scripts/install-shim.sh"] + ([OBSERVABILITY_CONFIG] if OBSERVABILITY_CONFIG else []),
+    resource_deps = ["install-observability-backends"] if INSTALL_OBSERVABILITY else [],
+    labels = ["bootstrap"],
+)
 
 # Sandbox workers and builders boot the SPACE Kind node image, which bakes in
 # the node layer a production node image provides (btrfs /space/cache, cgroup
-# subtree, loop-device headroom, device permissions, /space layout); the
-# node-stack pods only check for it. A node keeps the image it was created
-# from, so this refuses a cluster whose SPACE nodes predate the image or run an
-# older build of it, with the remedy (recreate the cluster), instead of letting
-# the node-stack pods wait for a cache that never comes.
+# subtree, loop-device headroom, device permissions, SPACE accounts, /space
+# layout). A node keeps the image it was created from, so this refuses a cluster
+# whose SPACE nodes predate the image or run an older build of it, with the
+# remedy (recreate the cluster), instead of letting the node services wait for a
+# cache that never comes. Every node-service release depends on it.
 local_resource(
     "check-kind-node-image",
     cmd = "SPACE_KIND_CLUSTER={} bash infra/space/kind/scripts/check-kind-node-image.sh".format(KIND_CLUSTER),
@@ -408,10 +388,8 @@ local_resource(
 # runs for minutes. It waits for the serial bootstrap resources because Tilt
 # holds those while anything else is building.
 RUST_ARTIFACTS_AFTER = ["label-kind-workers", "advertise-kind-worker-network-slots",
-                        "label-kind-infra", "stage-fc-vendor", "sandbox-ssh-secret",
-                        "check-kind-node-image"]
-if not MINIMAL:
-    RUST_ARTIFACTS_AFTER = RUST_ARTIFACTS_AFTER + ["install-space-shim"]
+                        "label-kind-infra", "sandbox-ssh-secret",
+                        "check-kind-node-image", "install-space-shim"]
 local_resource(
     "rust-artifacts",
     cmd = RUST_ARTIFACT_BUILD,
@@ -453,22 +431,11 @@ k8s_resource(
 )
 
 # API server.
+# Per-sandbox pods need the shim wired into containerd before the first create
+# lands.
 SPACE_API_DEPS = ["space-postgres", "label-kind-workers", "label-kind-infra",
-                  "advertise-kind-worker-network-slots"]
-if not MINIMAL:
-    # Full harness: per-sandbox pods need the shim wired into containerd
-    # before the first create lands.
-    SPACE_API_DEPS = SPACE_API_DEPS + ["install-space-shim"]
-# k8s.enabled tracks the harness mode: the full harness runs the api on the
-# KubernetesSubstrate (per-sandbox pods, cluster-controller); the MINIMAL
-# bench uses DirectSubstrate. The chart defaults k8s.enabled=true (prod
-# shape); override to false for the bench.
-k8s_yaml(helm(
-    "infra/space/kind/charts/space-api-local",
-    name = "space",
-    namespace = NAMESPACE,
-    set = TELEMETRY_SET + ["k8s.enabled={}".format("false" if MINIMAL else "true")],
-))
+                  "advertise-kind-worker-network-slots", "install-space-shim"]
+k8s_yaml(helm_release("space", "infra/space/kind/charts/space-api-local"))
 k8s_resource(
     "space-api",
     port_forwards = ["8080:8080"],
@@ -494,7 +461,6 @@ k8s_yaml(helm(
     "infra/space/kind/charts/space-internal-api-local",
     name = "space",
     namespace = NAMESPACE,
-    set = ["k8s.enabled={}".format("false" if MINIMAL else "true")],
 ))
 k8s_resource(
     "space-internal-api",
@@ -511,26 +477,24 @@ k8s_resource(
     resource_deps = ["space-api", "space-internal-api", "label-kind-infra"],
 )
 
-# Cluster-controller + UI are full-harness components: the controller
-# materializes per-sandbox pods under the KubernetesSubstrate and hosts the
-# cluster-singleton reconcilers; the MINIMAL bench needs neither.
-if not MINIMAL:
-    k8s_yaml(helm_release("space", "infra/space/kind/charts/space-cluster-controller-local"))
-    k8s_resource(
-        "space-cluster-controller",
-        labels = ["control-plane"],
-        resource_deps = ["space-api", "label-kind-infra"],
-    )
+# The cluster-controller materializes per-sandbox pods under the
+# KubernetesSubstrate and hosts the cluster-singleton reconcilers.
+k8s_yaml(helm_release("space", "infra/space/kind/charts/space-cluster-controller-local"))
+k8s_resource(
+    "space-cluster-controller",
+    labels = ["control-plane"],
+    resource_deps = ["space-api", "label-kind-infra"],
+)
 
-    k8s_yaml(helm_release("space", "infra/space/kind/charts/space-ui-local"))
-    k8s_resource(
-        "space-ui",
-        port_forwards = ["3000:3000"],
-        labels = ["frontend"],
-        resource_deps = ["space-api", "provision-local-console"],
-    )
+k8s_yaml(helm_release("space", "infra/space/kind/charts/space-ui-local"))
+k8s_resource(
+    "space-ui",
+    port_forwards = ["3000:3000"],
+    labels = ["frontend"],
+    resource_deps = ["space-api", "provision-local-console"],
+)
 
-# ── Object store + node stack + seed publish ─────────────────────────────────
+# ── Object store + node services + seed publish ──────────────────────────────
 #
 # Versity S3 Gateway (versitygw, Apache-2.0; replaced SeaweedFS, which replaced
 # MinIO) is a real S3-compatible object store on the infra node, serving its
@@ -562,33 +526,45 @@ k8s_resource(
     resource_deps = ["label-kind-infra"],
 )
 
-# node-stack: the production worker service set on real Firecracker, on every
-# labeled sandbox worker, wired to the object store. Needs Postgres up (credmgr
-# authority role), the internal API (node-ctl registration + template pulls),
-# the vendor tree, and the sandbox SSH Secret. The MINIMAL bench opts into
-# the legacy DirectSubstrate SQL registration; the full harness registers
-# purely through node-ctl → internal-api.
+# Node services: one release of each per role — `space` on the sandbox workers,
+# `space-builder` (node.role=builder) on the builder nodes, which add
+# build-manager — mirroring production's per-service DaemonSets. Each service
+# tolerates peers that are not ready yet and restarts on its own, so nothing
+# here orders them; they wait only for the node layer and the bootstrap
+# resources their pods mount. A chart's values-builder.yaml carries its builder
+# overrides.
 # SPACE_LOOP_DEVICE_TARGET sets the loop-device pool node-manager raises each
 # node to once it is up; the node image stages the library's floor of 64 before
 # that. Inherited from the environment so `SPACE_LOOP_DEVICE_TARGET=128 tilt up`
 # reaches the pod; unset renders nothing and the default applies.
 LOOP_DEVICE_TARGET = os.getenv("SPACE_LOOP_DEVICE_TARGET", "")
-NODE_STACK_SET = TELEMETRY_SET + ["directSubstrate.enabled={}".format("true" if MINIMAL else "false")]
-if LOOP_DEVICE_TARGET:
-    NODE_STACK_SET.append("loopDeviceTarget={}".format(LOOP_DEVICE_TARGET))
+# The release list is shared with bootstrap.sh and the smoke bring-up.
+NODE_RELEASES = str(local(["bash", "infra/space/kind/lib/node-services.sh", "releases"], quiet = True)).strip().split("\n")
+watch_file("infra/space/kind/lib/node-services.sh")
+watch_file("infra/space/kind/charts/space-node-service")
+for line in NODE_RELEASES:
+    release, role, service = line.split(" ")
+    chart = "infra/space/kind/charts/space-{}-local".format(service)
+    values = []
+    if role == "builder" and os.path.exists(chart + "/values-builder.yaml"):
+        values = [chart + "/values-builder.yaml"]
+    node_set = TELEMETRY_SET + ["node.role={}".format(role)]
+    if service == "node-manager" and LOOP_DEVICE_TARGET:
+        node_set.append("loopDeviceTarget={}".format(LOOP_DEVICE_TARGET))
+    k8s_yaml(helm(chart, name = release, namespace = NAMESPACE, values = values, set = node_set))
+    k8s_resource(
+        "{}-{}".format(release, service),
+        labels = ["node-" + role],
+        resource_deps = ["check-kind-node-image", "label-kind-workers", "sandbox-ssh-secret"],
+    )
 
-k8s_yaml(helm(
-    "infra/space/kind/charts/space-node-stack",
-    name = "space",
-    namespace = NAMESPACE,
-    set = NODE_STACK_SET,
-))
+# Kind-only operator shell on every sandbox worker and builder; the smoke
+# harness's on-node checks run here.
+k8s_yaml(helm("infra/space/kind/charts/space-node-debug", name = "space", namespace = NAMESPACE))
 k8s_resource(
-    "space-node-stack",
-    labels = ["node-stack"],
-    resource_deps = ["label-kind-workers", "space-postgres", "space-internal-api",
-                     "space-object-store-bucket-init", "stage-fc-vendor",
-                     "sandbox-ssh-secret", "check-kind-node-image"],
+    "space-node-debug",
+    labels = ["node-debug"],
+    resource_deps = ["check-kind-node-image", "label-kind-workers"],
 )
 
 # seed publish: uploads the locally built production seed to the object store and
@@ -600,23 +576,3 @@ k8s_resource(
     labels = ["bootstrap"],
     resource_deps = ["space-internal-api", "space-object-store-bucket-init"],
 )
-
-# Full-harness builder role: a second render of the node-stack chart targets
-# only the dedicated builder pool. It adds build-manager, exposes the stable
-# space-builder-node-api Service expected by space-api, and publishes recipe
-# outputs to the object store's templates bucket. MINIMAL remains worker-only.
-if not MINIMAL:
-    k8s_yaml(helm(
-        "infra/space/kind/charts/space-node-stack",
-        name = "space-builder",
-        namespace = NAMESPACE,
-        values = ["infra/space/kind/charts/space-node-stack/values-builder.yaml"],
-        set = TELEMETRY_SET + (["loopDeviceTarget={}".format(LOOP_DEVICE_TARGET)] if LOOP_DEVICE_TARGET else []),
-    ))
-    k8s_resource(
-        "space-builder-node-stack",
-        labels = ["node-stack"],
-        resource_deps = ["space-postgres", "space-internal-api",
-                         "space-object-store-bucket-init", "space-seed-publish",
-                         "stage-fc-vendor", "sandbox-ssh-secret", "check-kind-node-image"],
-    )

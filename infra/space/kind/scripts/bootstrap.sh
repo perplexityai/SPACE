@@ -5,8 +5,9 @@
 # Targets the multi-worker `space-local` kind cluster (config rendered from
 # infra/space/kind/kind-cluster.yaml.tmpl), brings up the production-shaped
 # topology: api-server on KubernetesSubstrate, cluster-controller materializing
-# per-sandbox pods, the real worker DaemonSet on both sandbox workers, a
-# production-shaped builder DaemonSet on its dedicated node, the versitygw object store for S3,
+# per-sandbox pods, one DaemonSet per node service on both sandbox workers and
+# on the dedicated builder nodes (plus build-manager there), runtime-supervisor
+# as a systemd unit on each of those nodes, the versitygw object store for S3,
 # and the seed template published through the real ClusterApi + object-store
 # path (space-seed-publish Job).
 #
@@ -138,8 +139,9 @@ log "rendering kind cluster config → $kind_config_published"
 kind_render_cluster_config "$KIND_DIR/kind-cluster.yaml.tmpl"
 
 # ── Step 0b: stage the Firecracker vendor tree ───────────────────────────────
-# The sandbox and builder kind nodes hostPath-mount $SPACE_VENDOR_ROOT into
-# the node-stack pod at /space/vendor. Reuse an already staged vendor tree
+# The sandbox and builder kind nodes bind-mount $SPACE_VENDOR_ROOT at
+# /space/vendor, where the host runtime-supervisor and the node services read
+# it. Reuse an already staged vendor tree
 # or run the artifact installer here. The root is
 # named at the call site even though sourcing the library already exported it:
 # one resolved value reaching both the mount and the writer is the whole point
@@ -183,6 +185,10 @@ if kind get clusters 2>/dev/null | grep -qx "$KIND_CLUSTER"; then
   # created from, so a cluster from before the SPACE Kind node image, or from
   # an older build of it, has to be recreated rather than patched.
   bash "$KIND_DIR/scripts/check-kind-node-image.sh" "$KIND_CLUSTER"
+  # A cluster from before the per-service node DaemonSets runs every node
+  # service, and its sandboxes, in one pod per node; stop rather than run both
+  # layouts on a node.
+  bash "$KIND_DIR/scripts/check-node-layout.sh" "$KIND_CLUSTER" || exit 1
 else
   # The sandbox workers and builders boot the SPACE Kind node image, which
   # bakes in the node layer a production node image provides (btrfs
@@ -313,7 +319,7 @@ helm_apply() {
 # ── Optional AWS creds for independent credmgr integrations ──────────────────
 # When AWS_ACCESS_KEY_ID is set (typically sourced from
 # infra/space/kind/private.env — SANDBOX ACCOUNT ONLY), create the
-# `space-aws-creds` Secret the node-stack chart maps into credmgr-scoped env
+# `space-aws-creds` Secret the credential-manager chart maps into its env
 # for features such as Private CA. KEK wrapping remains in-memory in Kind.
 # These are short-lived STS creds — re-run bootstrap after refreshing
 # private.env to rotate them.
@@ -366,13 +372,11 @@ log "waiting for space-api Deployment to be ready (initContainer runs migrations
 kubectl --context "$KCTX" -n "$NAMESPACE" rollout status deploy/space-api --timeout="${TIMEOUT}s"
 
 SPACE_CONSOLE_PASSWORD="$CONSOLE_PASSWORD" bash "$KIND_DIR/scripts/provision-local-console.sh"
-unset CONSOLE_PASSWORD
 
 # ── Sandbox SSH keypair Secret ────────────────────────────────────────────────
 # Generated once per devbox by build-seed.sh (the local stand-in for the
-# AMI's Packer-generated /space/etc/ssh). The public half is baked into the
-# seed rootfs; the private half is mounted into the node-stack pods so
-# `space-ssh` reaches local sandboxes exactly like on a real worker.
+# AMI's Packer-generated key). The public half is baked into the seed rootfs;
+# the private half is mounted into build-manager, which SSHes into build VMs.
 if [[ -f "$SSH_KEY_DIR/sandbox_ed25519" ]]; then
   log "creating/refreshing space-sandbox-ssh Secret from $SSH_KEY_DIR"
   kubectl --context "$KCTX" -n "$NAMESPACE" create secret generic space-sandbox-ssh \
@@ -388,20 +392,30 @@ helm_apply space "$KIND_DIR/charts/space-internal-api-local"
 helm_apply space "$KIND_DIR/charts/space-data-plane-local"
 helm_apply space "$KIND_DIR/charts/space-cluster-controller-local"
 helm_apply space "$KIND_DIR/charts/space-ui-local"
+# Node services: one release of each per role (lib/node-services.sh) —
+# `space` on the sandbox workers, `space-builder` with node.role=builder and
+# the chart's values-builder.yaml on the builders — mirroring production's
+# per-service DaemonSets. They need no order: each service tolerates peers that
+# are not ready yet and restarts on its own.
 # SPACE_LOOP_DEVICE_TARGET sets the loop-device pool node-manager raises each
 # node to once it is up; the node image stages the library's floor of 64 before
-# that. Inherited so setting it for a bring-up reaches both renders; unset
-# passes nothing and the default applies.
-LOOP_TARGET_ARGS=()
-if [[ -n "${SPACE_LOOP_DEVICE_TARGET:-}" ]]; then
-  LOOP_TARGET_ARGS=(--set "loopDeviceTarget=$SPACE_LOOP_DEVICE_TARGET")
-  log "passing loopDeviceTarget=$SPACE_LOOP_DEVICE_TARGET to both node-stack renders"
-fi
-helm_apply space "$KIND_DIR/charts/space-node-stack" \
-  ${LOOP_TARGET_ARGS[@]+"${LOOP_TARGET_ARGS[@]}"}
-helm_apply space-builder "$KIND_DIR/charts/space-node-stack" \
-  -f "$KIND_DIR/charts/space-node-stack/values-builder.yaml" \
-  ${LOOP_TARGET_ARGS[@]+"${LOOP_TARGET_ARGS[@]}"}
+# that. Inherited so setting it for a bring-up reaches both node-manager
+# renders; unset passes nothing and the default applies.
+# shellcheck source=../lib/node-services.sh
+. "$KIND_DIR/lib/node-services.sh"
+while read -r release role service; do
+  chart="$KIND_DIR/charts/space-$service-local"
+  node_args=(--set "node.role=$role")
+  if [[ "$role" == builder && -f "$chart/values-builder.yaml" ]]; then
+    node_args+=(-f "$chart/values-builder.yaml")
+  fi
+  if [[ "$service" == node-manager && -n "${SPACE_LOOP_DEVICE_TARGET:-}" ]]; then
+    node_args+=(--set "loopDeviceTarget=$SPACE_LOOP_DEVICE_TARGET")
+  fi
+  helm_apply "$release" "$chart" "${node_args[@]}"
+done < <(space_kind_node_releases)
+# Kind-only operator shell on the sandbox workers and builders.
+helm_apply space "$KIND_DIR/charts/space-node-debug"
 
 # Seed publish: one-shot Job that uploads the locally built production seed
 # to the versitygw object store and registers the release through the real ClusterApi RPCs.
@@ -431,13 +445,18 @@ log "waiting for space-seed-publish Job (uploads seed + registers the release)"
 kubectl --context "$KCTX" -n "$NAMESPACE" wait --for=condition=complete \
   job/space-seed-publish --timeout="${TIMEOUT}s" >/dev/null
 
-log "waiting for space-node-stack DaemonSet to roll out on all sandbox workers"
-kubectl --context "$KCTX" -n "$NAMESPACE" rollout status \
-  ds/space-node-stack --timeout="${TIMEOUT}s" >/dev/null
+while read -r daemonset; do
+  log "waiting for $daemonset DaemonSet to roll out"
+  kubectl --context "$KCTX" -n "$NAMESPACE" rollout status \
+    "ds/$daemonset" --timeout="${TIMEOUT}s" >/dev/null
+done < <(space_kind_node_daemonsets)
 
-log "waiting for space-builder-node-stack DaemonSet (node-api + build-manager)"
-kubectl --context "$KCTX" -n "$NAMESPACE" rollout status \
-  ds/space-builder-node-stack --timeout="${TIMEOUT}s" >/dev/null
+# Ready pods are not a registered node: wait until each node's node-ctl has
+# published it through ClusterApi and the API reports it schedulable.
+log "waiting for every SPACE node to be published and ready"
+SPACE_KIND_CLUSTER="$KIND_CLUSTER" SPACE_CONSOLE_PASSWORD="$CONSOLE_PASSWORD" \
+  bash "$KIND_DIR/scripts/wait-node-publication.sh" "$TIMEOUT"
+unset CONSOLE_PASSWORD
 
 # SPACE is ready before optional telemetry is reconciled. Comparison commands
 # still require successful Agent verification and never accept missing capture.

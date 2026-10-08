@@ -14,7 +14,8 @@
 # to compare against, because none of those yields an honest verdict. Also
 # guaranteed: Tilt is running, the api-server is
 # reachable at `$API_URL`, the template-seed Job has completed, and
-# the worker and builder node-stack DaemonSets are ready, the
+# every worker and builder node-service DaemonSet has rolled out and every
+# SPACE node is published through ClusterApi and schedulable, the
 # cluster-controller Deployment is on its latest generation, Tilt has no
 # build pending or in progress and every workload in the namespace has
 # finished rolling, (when DATA_PLANE_URL is supplied) the public data plane
@@ -159,7 +160,7 @@ bootstrap_kind_stack__tilt_running() {
     pgrep -f "tilt up" >/dev/null 2>&1 \
         && curl -sf -m 2 http://localhost:10350/ >/dev/null 2>&1 || return 1
     # Query the serving Tilt instance, not the caller's kubeconfig or process
-    # environment: an old DirectSubstrate watcher can still own this port.
+    # environment: a watcher for another cluster can still own this port.
     local context
     context=$(timeout 5s tilt get cluster default --port 10350 \
         -o 'jsonpath={.status.connection.kubernetes.context}' 2>/dev/null) || return 1
@@ -500,7 +501,7 @@ bootstrap_kind_stack__start_tilt() {
         # leaving half-built images and a cluster nobody is reconciling
         # (measured on a cold devbox: `tilt up` died mid-compile at exactly
         # 300s). A new session puts Tilt in its own process group.
-        TILT_BROWSER_DISABLED=1 SPACE_KIND_CLUSTER="$KIND_CLUSTER" SPACE_LOCAL_MINIMAL=0 \
+        TILT_BROWSER_DISABLED=1 SPACE_KIND_CLUSTER="$KIND_CLUSTER" \
             setsid nohup tilt up >"$log" 2>&1 </dev/null &
         echo $! >"$pidfile"
     )
@@ -885,9 +886,7 @@ bootstrap_kind_stack__bring_up() {
     # resolved and stamped in here the same way
     # `infra/space/kind/scripts/bootstrap.sh` does it — including staging the
     # vendor tree, because `kind_prepare_host_mounts` refuses a missing one and
-    # this suite is documented as self-bootstrapping. Before the paths were
-    # parameterised the equivalent self-heal came from Tilt's `stage-fc-vendor`
-    # resource filling the host dir after an empty mount was already live.
+    # this suite is documented as self-bootstrapping.
     # shellcheck source=../../../infra/space/kind/scripts/lib/kind-host-paths.sh
     source "$REPO_ROOT/infra/space/kind/scripts/lib/kind-host-paths.sh"
     # Process-private, not the shared $SPACE_KIND_CONFIG, and for the same
@@ -961,6 +960,10 @@ bootstrap_kind_stack__bring_up() {
             "$KIND_CLUSTER" || exit 1
         # SPACE nodes get their node layer from their image, fixed at create.
         bash "$REPO_ROOT/infra/space/kind/scripts/check-kind-node-image.sh" \
+            "$KIND_CLUSTER" || exit 1
+        # A cluster still running one node-stack pod per node has to be
+        # recreated before the per-service node DaemonSets land beside it.
+        bash "$REPO_ROOT/infra/space/kind/scripts/check-node-layout.sh" \
             "$KIND_CLUSTER" || exit 1
     fi
 
@@ -1085,17 +1088,29 @@ bootstrap_kind_stack__bring_up() {
         exit 1
     fi
 
-    echo "[bootstrap] waiting for worker and builder node stacks to roll"
-    local node_stack
-    for node_stack in space-node-stack space-builder-node-stack; do
+    echo "[bootstrap] waiting for the worker and builder node-service DaemonSets to roll"
+    # shellcheck source=../../../infra/space/kind/lib/node-services.sh
+    . "$REPO_ROOT/infra/space/kind/lib/node-services.sh"
+    local node_daemonset
+    while read -r node_daemonset; do
         if ! kubectl --context "kind-${KIND_CLUSTER}" rollout status \
-                "daemonset/$node_stack" -n space --timeout=600s >/dev/null; then
-            echo "ERROR: $node_stack did not become Ready within 600s" >&2
+                "daemonset/$node_daemonset" -n space --timeout=600s >/dev/null; then
+            echo "ERROR: $node_daemonset did not become Ready within 600s" >&2
             kubectl --context "kind-${KIND_CLUSTER}" get \
-                "daemonset/$node_stack" -n space -o wide >&2 || true
+                "daemonset/$node_daemonset" -n space -o wide >&2 || true
+            kubectl --context "kind-${KIND_CLUSTER}" get pods -n space -o wide \
+                -l app.kubernetes.io/part-of=space-node >&2 || true
             exit 1
         fi
-    done
+    done < <(space_kind_node_daemonsets)
+
+    # Ready pods are not a registered node: each node's node-ctl publishes it
+    # through ClusterApi, and only then does the API schedule onto it.
+    echo "[bootstrap] waiting for every SPACE node to be published and ready"
+    if ! SPACE_KIND_CLUSTER="$KIND_CLUSTER" SPACE_KIND_API_URL="$API_URL" \
+            bash "$REPO_ROOT/infra/space/kind/scripts/wait-node-publication.sh" 600; then
+        exit 1
+    fi
 
     # Cluster-controller rollout: any chart-value or image change Tilt
     # picked up needs to roll before the smoke tests touch reconciler-

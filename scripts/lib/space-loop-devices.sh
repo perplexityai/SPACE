@@ -38,8 +38,8 @@
 #
 # — which names the wrong problem entirely. It reads as a missing backing image,
 # and the image is fine; the pool is full. That misdirection has cost a bring-up:
-# the devbox's host btrfs cache held loops, the kind node-stack cache images held
-# the rest, and the last node-stack pod crash-looped on an errno about a file
+# the devbox's host btrfs cache held loops, the kind nodes' cache images held
+# the rest, and the last pod to attach one crash-looped on an errno about a file
 # that exists.
 #
 # node-manager owns this at runtime — `crates/libs/node/mgr/server/src/loop_devices.rs`
@@ -239,9 +239,9 @@ space_loop_attached() {
     "$bin" -a 2>/dev/null || true
 }
 
-# Device names only. The kernel pool is global — a kind node-stack pod's
-# `losetup -a` lists devices attached by pods on other nodes and by the devbox
-# itself, and it can name a device this container has no node for.
+# Device names only. The kernel pool is global — a kind node or pod's
+# `losetup -a` lists devices attached on other nodes and by the devbox itself,
+# and it can name a device this container has no node for.
 space_loop__attached_devices() {
     space_loop__attached_devices_from "$(space_loop_attached)"
 }
@@ -816,7 +816,7 @@ space_loop__apply_node_permissions() { # <mode> <gid> [node...]
 # Retried, because allocation is two steps and the kernel does not hold them
 # together: `loop_control_get_free` returns the id of an unbound device *after*
 # dropping `loop_ctl_mutex`, and the caller binds it in a second ioctl. Two
-# callers racing — four node-stack pods start at once on a cold bring-up — can be
+# callers racing — four kind nodes attach their caches at once on a cold bring-up — can be
 # handed the same index, and the loser's bind fails with EBUSY. Retrying is not
 # only about recovering: a lost race reported as pool exhaustion would be the
 # same misdiagnosis this file exists to remove.
@@ -974,7 +974,7 @@ space_loop_exhaustion_report() {
             "Remedy: create more nodes (space_loop_ensure_nodes in" \
             "scripts/lib/space-loop-devices.sh, or mknod /dev/loopN b 7 N) and retry;" \
             "raise the target to change it — SPACE_LOOP_DEVICE_TARGET in a compose" \
-            "worker or on the devbox, loopDeviceTarget for the kind node-stack chart."
+            "worker or on the devbox, loopDeviceTarget for the kind node-manager chart."
     else
         printf '%s\n' \
             "The pool is not out, so creating more nodes is not the remedy. Two things" \

@@ -35,8 +35,7 @@
 #                         ../kind-node-image.sh prints for `ref` / `base`)
 
 # The binary a sandbox worker executes through /space/vendor. The staging
-# check in bootstrap.sh and the node probe in stage-fc-vendor.sh gate on this
-# same path; this is the one definition.
+# check in bootstrap.sh gates on this same path; this is the one definition.
 KIND_HOST_PATHS_VENDOR_PROBE="firecracker/default/bin/firecracker"
 
 # The node image script, found from this file so every caller resolves the same
@@ -439,7 +438,7 @@ kind_assert_live_cluster_mounts() {
   # makes a wholly missing mount visible, and it covers every destination the
   # config declares, so adding a mount to the template extends this
   # automatically. Hardcoding the pair silently exempted /dev/kvm: a cluster
-  # built without it passed, bootstrap skipped creation, and the node-stack
+  # built without it passed, bootstrap skipped creation, and the node-manager
   # pods could not start because the chart requires that path as a CharDevice.
   #
   # What a count does not catch: the right number of mounts distributed over
@@ -448,7 +447,7 @@ kind_assert_live_cluster_mounts() {
   # key off `worker3` for infra; a per-node comparison is therefore possible
   # and would be stricter. It isn't done here, so a pre-existing cluster whose
   # node order differs from the template's passes this check and fails later
-  # at the node-stack rollout instead.
+  # at the node-service rollout instead.
   local dest_expected dest_live
   while read -r dest; do
     [[ -n "$dest" ]] || continue
@@ -499,8 +498,8 @@ kind_prepare_host_mounts() {
         # source by creating a *directory* — the behaviour this whole library
         # exists to defend against — so a bring-up on a host without KVM is
         # itself how /dev/kvm becomes a directory. That directory then passes
-        # an existence test forever, while the node-stack chart's
-        # `type: CharDevice` (charts/space-node-stack/templates/daemonset.yaml)
+        # an existence test forever, while the node-manager chart's
+        # `type: CharDevice` (charts/space-node-manager-local/templates/daemonset.yaml)
         # makes kubelet refuse the volume and the pod never starts.
         if [[ ! -e "$host" ]]; then
           missing+=("$host")

@@ -75,7 +75,7 @@ class SnapshotDirProbeFailsClosed(unittest.TestCase):
             harness.sandbox_snapshot_dirs("p", sid)
         # The on-node script only lists a path that exists; anything else
         # `ls` says is propagated, not swallowed.
-        script = kubectl.calls[0][-1]
+        script = next(call for call in kubectl.calls if call[5] == "exec")[-1]
         self.assertIn("if [ ! -e ", script)
         self.assertNotIn("2>/dev/null", script)
 
@@ -177,7 +177,7 @@ class ReapedLineScan(unittest.TestCase):
         ]
         harness = KindHarness(_RecordingKubectl(logs="\n".join(lines)), KindConfig())
         # The SDK may hand back a non-canonical id form; the join canonicalizes.
-        reaped = harness.reaped_artifacts("space-node-stack-x", sid.upper(), since_time="2026-01-01T00:00:00Z")
+        reaped = harness.reaped_artifacts("worker-1", sid.upper(), since_time="2026-01-01T00:00:00Z")
         self.assertEqual(
             [(r.node_name, r.local_artifact_id[:8]) for r in reaped],
             [("worker-1", "aaaaaaaa")],

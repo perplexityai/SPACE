@@ -36,12 +36,14 @@ class _RecordingKubectl:
             return self.exec_results.pop(0)
         if verb == "logs":
             return CommandResult(argv, 0, self.logs, "")
+        if verb == "get" and "jsonpath={.items[*].metadata.name}" in argv:
+            return CommandResult(argv, 0, "space-node-debug-x", "")
         if verb == "get" and "pods" in argv:
             return CommandResult(
                 argv,
                 0,
                 json.dumps(
-                    {"items": [{"metadata": {"name": "space-node-stack-x"}, "spec": {"nodeName": "worker-1"}}]}
+                    {"items": [{"metadata": {"name": "space-sandbox-manager-x"}, "spec": {"nodeName": "worker-1"}}]}
                 ),
                 "",
             )
@@ -86,7 +88,7 @@ class BenchWithTheLoopOffIsAConfigurationError(unittest.TestCase):
         from space_smoke.fixtures import ColdEvictionAssertions
 
         class Control:
-            def cold_eviction_config(self, pod):
+            def cold_eviction_config(self, node):
                 return _cold_eviction_config_from_env({})
 
         assertions = ColdEvictionAssertions(None, Control(), None)  # type: ignore[arg-type]

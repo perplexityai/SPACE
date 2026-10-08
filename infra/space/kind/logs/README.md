@@ -72,17 +72,18 @@ curl -fsS http://127.0.0.1:13101/loki/api/v1/labels
   CRI files under `/var/log/pods/space_*/*/*.log` and, under the Kind overlay,
   the actual volatile node journal `/run/log/journal`. Fixture pod globs are enabled only by the separate test overlay; it never
   collects its own logs. No Kubernetes API credentials or RBAC are needed.
-- Before tailing, `collection.excludedPodSources` removes the builder's
-  `node-stack` container, whose combined stdout includes recipe command output.
+- Before tailing, `collection.excludedPodSources` removes the builders'
+  `build-manager` container, whose stdout includes recipe command output.
   The default matches release `space-builder` in namespace `space`; configure
   literal namespace/pod-name-prefix/container entries for renamed or additional
   releases. Worker logs remain eligible.
   These file-source exclusions are independent of Datadog annotations.
-- This Kind node-stack writes individual service logs into `/space/logs` and
-  tails them to pod stdout. Sidecars inherit the supervisor's output. They are
-  not separate Kubernetes container log files. The only SPACE systemd services
-  on Kind nodes are the node-layer oneshots the SPACE Kind node image bakes
-  into sandbox and builder nodes (`space-cache.service` and its siblings). Journal
+- Each node service runs in its own DaemonSet pod and logs to that pod's
+  stdout, a separate Kubernetes container log file per service. The SPACE
+  systemd services on Kind sandbox and builder nodes are the node layer the
+  SPACE Kind node image bakes in (`space-cache.service` and its siblings) and
+  `space-runtime-supervisor.service`, which node-manager's init container
+  installs; the per-sandbox sidecars it launches inherit its output. Journal
   collection allows `space-*.service`, and `containerd.service`. The synthetic journal identifier is test-only.
   Guest journals and the devbox's journal are not mounted or forwarded here.
 - The collector removes the CRI envelope, then extracts fields for labels and

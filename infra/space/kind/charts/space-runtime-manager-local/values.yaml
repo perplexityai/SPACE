@@ -1,0 +1,25 @@
+# runtime-manager on every SPACE Kind node: lists the node's Firecracker
+# releases and guest kernels (`space-rtmgr list`). Nothing depends on it yet.
+# One release per role: `space` and `space-builder` (`--set node.role=builder`).
+
+image:
+  repository: space-worker
+  tag: local
+  pullPolicy: IfNotPresent
+
+datadogEnvironment: kind-local
+clusterId: kind-local
+telemetry: {}
+node: {}
+
+# runtime-manager has no service mutex and no drain budget of its own; its
+# gRPC server shuts down gracefully on SIGTERM
+# (crates/libs/node/runtime/manager/server/src/run.rs). The shared lifecycle
+# default grace (crates/libs/common/svc/src/lifecycle.rs).
+terminationGracePeriodSeconds: 60
+
+# Kind sizing: requests only (see space-node-manager-local/values.yaml).
+resources:
+  requests:
+    cpu: 10m
+    memory: 32Mi

@@ -6,12 +6,11 @@ supplies the granularity at admission as a `ValidatingAdmissionPolicy`, and
 `kubectl auth can-i patch nodes` still answers `yes` for that ServiceAccount —
 so only a real projected token in front of a real apiserver shows the writes
 are refused. `smoke-kind-node-ctl-fence.sh` was that proof; this module is its
-typed form. The CEL itself, and the chart shape, stay covered without a cluster
-by `scripts/tests/test_node_ctl_node_fence.py`.
+typed form.
 
 Two halves, and the second is the one that would fail silently:
 
-1. **Refusals, by rule.** With the token kubelet projects into the node-stack
+1. **Refusals, by rule.** With the token kubelet projects into the node-ctl
    pod on the fixture sandbox's worker (pod-bound, so the apiserver surfaces
    `authentication.kubernetes.io/node-name` for it, which the own-node rule
    keys off), each forbidden write is refused *by the named policy and by the
@@ -53,7 +52,7 @@ from typing import TYPE_CHECKING
 from space_smoke.capabilities import (
     FencePolicy,
     NodeFenceControl,
-    NodeStackIdentity,
+    NodeCtlIdentity,
     SaWriteOutcome,
 )
 from space_smoke.runtime import Compensation, ResourceScope
@@ -258,7 +257,7 @@ class NodeFenceAssertions:
         self._fixture = fixture
         self._control = control
         self._scope = scope
-        self._identity: NodeStackIdentity | None = None
+        self._identity: NodeCtlIdentity | None = None
         self._other_node: str | None = None
         self._policy: FencePolicy | None = None
         self._kubeconfig: str | None = None
@@ -271,8 +270,8 @@ class NodeFenceAssertions:
 
     # --- locate + fence -------------------------------------------------------
 
-    def locate(self) -> NodeStackIdentity:
-        identity = self._control.node_stack_identity_for_sandbox(self._fixture.sandbox.sandbox_id)
+    def locate(self) -> NodeCtlIdentity:
+        identity = self._control.node_ctl_identity_for_sandbox(self._fixture.sandbox.sandbox_id)
         others = [n for n in self._control.kube_node_names() if n != identity.node_name]
         self._fixture.verify(
             bool(others),
@@ -282,7 +281,7 @@ class NodeFenceAssertions:
         self._identity, self._other_node = identity, others[0]
         self._fixture.record("own_node", identity.node_name)
         self._fixture.record("other_node", self._other_node)
-        self._fixture.record("node_stack_pod", identity.pod_name)
+        self._fixture.record("node_ctl_pod", identity.pod_name)
         self._fixture.record("service_account", identity.service_account)
         return identity
 
@@ -291,7 +290,7 @@ class NodeFenceAssertions:
         policy = self._control.fence_policy_for(identity.service_account)
         self._fixture.verify(
             policy is not None,
-            "no ValidatingAdmissionPolicy matches the node-stack ServiceAccount",
+            "no ValidatingAdmissionPolicy matches the node-ctl ServiceAccount",
             service_account=identity.service_account,
         )
         assert policy is not None
@@ -330,7 +329,7 @@ class NodeFenceAssertions:
         expected = f"system:serviceaccount:{self._control.namespace}:{identity.service_account}"
         self._fixture.verify(
             whoami.username == expected,
-            "the SA kubeconfig does not authenticate as the node-stack ServiceAccount; every refusal would be meaningless",
+            "the SA kubeconfig does not authenticate as the node-ctl ServiceAccount; every refusal would be meaningless",
             username=whoami.username,
             expected=expected,
         )
@@ -515,7 +514,7 @@ class NodeFenceAssertions:
                 "node-ctl did not write back an owned label and its slot capacity within the budget; check its logs for an admission denial",
                 reconciled=dict(seen),
                 budget_seconds=budget,
-                node_ctl_log_tail=self._control.node_stack_log_tail(self._require_identity().pod_name, 40),
+                node_ctl_log_tail=self._control.node_ctl_log_tail(self._require_identity().pod_name, 40),
             )
         self._fixture.record("reconciled_after_seconds", seen)
         return seen
@@ -536,7 +535,7 @@ class NodeFenceAssertions:
             self._fixture.verify(found == [], "residue remains after the reverts", node=node, residue=found)
         self._fixture.record("final_residue", "none")
 
-    def _require_identity(self) -> NodeStackIdentity:
+    def _require_identity(self) -> NodeCtlIdentity:
         if self._identity is None:
             raise RuntimeError("locate() must run first")
         return self._identity

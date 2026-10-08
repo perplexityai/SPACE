@@ -7,8 +7,9 @@ harness with its stub substrate was deleted on 2026-09-22.
 
 ## Load detail by task
 
-- Setup, topology, service identities, production differences, and teardown:
-  `infra/space/kind/README.md`.
+- Setup, topology, node services (pod shapes, rollouts, the host
+  runtime-supervisor, the operator shell), service identities, production
+  differences, and teardown: `infra/space/kind/README.md`.
 - Smoke selection and suite-specific contracts: the `space-validation` skill's
   smoke-testing reference and `infra/space/kind/README.md`.
 - What each Kind SPACE node provides before its pods start (btrfs cache,
@@ -32,9 +33,8 @@ node-ctl publishing.
 
 Direct state manipulation is limited to faults or state with no public setup
 path: the run-scoped ECW API key, stale node tombstones contradicted by
-Kubernetes, the opt-in DirectSubstrate bench registration, stranded lifecycle
-rows created by the sweeper smoke, and Kubernetes Node patches exercised by the
-node-ctl admission smoke. Keep these exceptions inside their existing helpers
+Kubernetes, stranded lifecycle rows created by the sweeper smoke, and
+Kubernetes Node patches exercised by the node-ctl admission smoke. Keep these exceptions inside their existing helpers
 or suites.
 
 ## Harness invariants
@@ -44,26 +44,44 @@ or suites.
   `docs/installation.md` to provision the harness, then keep the live Tilt
   cluster for iteration instead of rebuilding it for each change.
 - Keep the builder node outside `node.kubernetes.io/space-enabled=true`.
-- Do not add Postgres access to node services. The existing exceptions are
-  credmgr's legacy authority role (`SPACE_CREDMGR_DATABASE_URL`, passed only to
-  credmgr as `DATABASE_URL`) and opt-in `directSubstrate.enabled` bench SQL
-  registration in `scripts/k8s/node-stack-start.sh`. Normal node registration
-  and template publication use ClusterApi; templates are not baked into or
-  side-staged onto workers.
+- Do not add Postgres access to node services. The one exception is
+  credential-manager's legacy authority role, whose DaemonSet alone receives the
+  database URL as `DATABASE_URL`. Normal node registration and template
+  publication use ClusterApi; templates are not baked into or side-staged onto
+  workers.
+- Node services run one DaemonSet per service and role from
+  `charts/space-<service>-local` on the `space-node-service` library, listed in
+  `lib/node-services.sh` for every bring-up path. Each pod runs the unmodified
+  production worker image and launch path under its `node-identities.sh`
+  identity, with only the privileges, host namespaces, propagation and
+  capabilities its service's code needs, each commented with the code that
+  requires it. Do not reintroduce a shared pod, an entrypoint that supervises
+  several services, or an orchestrated startup order: services tolerate peers
+  that are not ready and restart per pod.
+- runtime-supervisor is the host systemd unit node-manager's init container
+  installs and upgrades through the unmodified `scripts/k8s/node-manager-init.sh`;
+  do not run it in a pod.
+- The smoke harness execs node-local CLIs and on-node checks only in the
+  Kind-only `space-node-debug` shell, and reads logs and env from the owning
+  service's pod. Do not add tools, identities or privileges to a service
+  container for the harness.
 - The kind node provides what a production node image does: the btrfs
   `/space/cache`, cgroup subtree, loop-device headroom, device permissions and
-  `/space` skeleton come from units baked into the SPACE Kind node image
-  (`node/Dockerfile`) that sandbox and builder nodes boot, ordered before
-  kubelet. Install nothing onto nodes at bring-up; change the image. Its tag is
-  the hash of the files listed in `scripts/kind-node-image.sh`, so a file the
-  Dockerfile copies must be listed there. Clusters on another node image are
-  recreated, not patched (`scripts/check-kind-node-image.sh`). Do not move these
-  duties back into the pod.
-- Preserve cache-loop autoclear (set by `space-cache.service`), the pods'
-  `HostToContainer` view of `/space/cache`, the entrypoint's
-  `mount --make-rshared /` and `/space/cache`, and per-jail vhost-vsock device
-  creation in the entrypoint. They are required for restart safety, mount
-  containment and snapshot restore.
+  `/space` skeleton (with the SPACE accounts and the Kind-only vhost-vsock jail
+  unit) come from units baked into the SPACE Kind node image (`node/Dockerfile`)
+  that sandbox and builder nodes boot, ordered before kubelet. Install nothing
+  onto nodes at bring-up; change the image. Its tag is the hash of the files
+  listed in `scripts/kind-node-image.sh`, so a file the Dockerfile copies must be
+  listed there. Clusters on another node image are recreated, not patched
+  (`scripts/check-kind-node-image.sh`). Do not move these duties back into a
+  pod.
+- Preserve cache-loop autoclear and the shared `/space/cache` mount (set by
+  `space-cache.service`), node-manager's `Bidirectional` view of `/space/cache`
+  and `/var/run/netns`, every other pod's `HostToContainer` view of the cache
+  (build-manager's mounts must never reach the node's mount table), and
+  per-jail vhost-vsock device creation by `space-kind-vsock-jails.service`.
+  They are required for restart safety, mount containment and snapshot
+  restore.
 - `/dev/kvm` and vhost permission widening is Kind-only and must not be copied
   to worker images.
 - Deployment environment overrides go through the typed harness ops in

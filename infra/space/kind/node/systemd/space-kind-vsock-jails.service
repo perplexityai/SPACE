@@ -1,0 +1,16 @@
+# Baked into the Kind node image (infra/space/kind/node/Dockerfile) and enabled
+# there. See infra/space/kind/node/space-kind-node.sh.
+[Unit]
+Description=SPACE Kind-only vhost-vsock nodes in Firecracker jails
+Wants=space-cache.service
+After=space-cache.service
+Before=kubelet.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/lib/space/kind-node/space-kind-node.sh vsock-jails
+Restart=always
+RestartSec=1
+
+[Install]
+WantedBy=multi-user.target

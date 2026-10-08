@@ -35,7 +35,8 @@ RUN systemctl enable \
       space-kind-devices.service \
       space-cgroup.service \
       space-layout.service \
-      space-cache.service
+      space-cache.service \
+      space-kind-vsock-jails.service
 
 # The inputs tag, so a node can be matched against the tree that should have
 # built it (scripts/check-kind-node-image.sh). Containers inherit image labels.

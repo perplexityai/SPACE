@@ -1,0 +1,94 @@
+{{- $ctx := dict "ctx" . "component" "runtime-manager" -}}
+{{- $socket := "/space/run/runtime-manager/runtime-manager.sock" -}}
+{{- include "space-node-service.serviceAccount" $ctx }}
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "space-node-service.name" $ctx }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "space-node-service.labels" $ctx | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "space-node-service.selectorLabels" $ctx | nindent 6 }}
+  # Surge: runtime-manager holds no node-wide lock and serves read-only
+  # listings, and a successor replaces the socket by rename
+  # (crates/libs/common/svc/src/bootstrap.rs), so two instances may briefly
+  # serve side by side.
+  {{- include "space-node-service.updateStrategy" (dict "strategy" "surge") | nindent 2 }}
+  template:
+    metadata:
+      annotations:
+        {{- include "space-node-service.podAnnotations" $ctx | nindent 8 }}
+      labels:
+        {{- include "space-node-service.labels" $ctx | nindent 8 }}
+    spec:
+      {{- include "space-node-service.nodeSelector" $ctx | nindent 6 }}
+      serviceAccountName: {{ include "space-node-service.name" $ctx }}
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds | int }}
+      # space-rtmgr with only its socket group
+      # (SPACE_RUNTIME_MANAGER_GROUPS: it reads the world-readable vendor and
+      # cache layouts).
+      securityContext:
+        {{- include "space-node-service.runAs" (dict "ctx" . "user" "SPACE_RTMGR" "groups" "SPACE_RUNTIME_MANAGER_GROUPS") | nindent 8 }}
+      initContainers:
+        {{- include "space-node-service.prepareRunDir" (dict "ctx" . "path" "/space/run/runtime-manager" "mode" "0750"
+            "uid" (include "space-node-service.identityNumber" (dict "ctx" . "name" "SPACE_RTMGR_UID"))
+            "gid" (include "space-node-service.groupId" (dict "ctx" . "name" "space-rtmgrclients"))) | nindent 8 }}
+      containers:
+        - name: runtime-manager
+          {{- include "space-node-service.image" . | nindent 10 }}
+          command: ["/opt/space/bin/space-rtmgr-svc"]
+          {{- include "space-node-service.restrictedContainer" . | nindent 10 }}
+          env:
+            {{- include "space-node-service.env.identity" . | nindent 12 }}
+          # No instance-local health socket; probe the service socket's
+          # standard gRPC health service.
+          startupProbe:
+            exec:
+              command: ["/opt/space/bin/grpc_health_probe", "-addr=unix://{{ $socket }}", "-connect-timeout=2s", "-rpc-timeout=2s"]
+            periodSeconds: 5
+            failureThreshold: 24
+          readinessProbe:
+            exec:
+              command: ["/opt/space/bin/grpc_health_probe", "-addr=unix://{{ $socket }}", "-connect-timeout=2s", "-rpc-timeout=2s"]
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            exec:
+              command: ["/opt/space/bin/grpc_health_probe", "-addr=unix://{{ $socket }}", "-connect-timeout=3s", "-rpc-timeout=3s"]
+            periodSeconds: 20
+            failureThreshold: 3
+          volumeMounts:
+            {{- include "space-node-service.mount.run" . | nindent 12 }}
+            {{- include "space-node-service.mount.cache" (dict "readOnly" true) | nindent 12 }}
+            # The runtime aliases (/space/bin/firecracker, jailer) and the
+            # vendor releases and kernels they resolve to.
+            - name: space-bin
+              mountPath: /space/bin
+              readOnly: true
+            - name: vendor
+              mountPath: /space/vendor
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+      volumes:
+        {{- include "space-node-service.volume.run" . | nindent 8 }}
+        {{- include "space-node-service.volume.cache" . | nindent 8 }}
+        - name: space-bin
+          hostPath:
+            path: /space/bin
+            type: DirectoryOrCreate
+        - name: vendor
+          hostPath:
+            path: /space/vendor
+            type: Directory
+        - name: tmp
+          emptyDir: {}

@@ -35,7 +35,7 @@ use crate::types::{NodeGroup, NodeGroupName, OrgId, TemplateCompatSpec, Template
 /// cannot express it.
 ///
 /// A `ValidatingAdmissionPolicy` supplies it (see
-/// `infra/space/kind/charts/space-node-stack/`), pinning each node-ctl identity
+/// `infra/space/kind/charts/space-node-ctl-local/`), pinning each node-ctl identity
 /// to its own Node and to the metadata keys its reconcilers own — this prefix
 /// and [`DEDICATED_NODE_TAINT_KEY`] excluded. That file states each rule; do
 /// not restate them here, where nothing ties the description to the policy.

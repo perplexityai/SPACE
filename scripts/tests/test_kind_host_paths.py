@@ -644,7 +644,7 @@ class LiveClusterMountTests(unittest.TestCase):
 
         The vendor and containerd mounts agree, so a check that counted only
         those two destinations reported success; bootstrap then skipped
-        creation and the node-stack pods could not start, because the chart
+        creation and the node-manager pods could not start, because the chart
         requires /dev/kvm as a CharDevice. The count now covers every
         destination the config declares.
         """
@@ -1096,7 +1096,7 @@ class PrepareHostMountsTests(unittest.TestCase):
         Docker answers a missing bind source by creating a directory — the
         behaviour this library exists to defend against — so a bring-up on a
         host without KVM is itself how `/dev/kvm` becomes a directory. An
-        existence test then blesses it forever, while the node-stack chart's
+        existence test then blesses it forever, while the node-manager chart's
         `type: CharDevice` makes kubelet refuse the volume and the pod never
         starts.
         """

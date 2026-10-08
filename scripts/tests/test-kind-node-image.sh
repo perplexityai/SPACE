@@ -59,11 +59,6 @@ base="$(bash "$image_script" base)"
 [[ "$base" =~ ^kindest/node:v[0-9.]+@sha256:[0-9a-f]{64}$ ]] || fail "the base is not pinned by digest: $base"
 bash "$repo_root/ci/scripts/mirror-images.sh" listed "$base" \
   || fail "$base is not in ci/mirrored-images.txt"
-static="$repo_root/infra/space/kind/kind-cluster-3486.yaml"
-[[ "$(grep -c "image: $base\$" "$static")" == 2 ]] \
-  || fail "kind-cluster-3486.yaml must run $base on its control-plane and infra nodes"
-grep -q 'image: space-kind-node:local$' "$static" \
-  || fail "kind-cluster-3486.yaml must run the SPACE Kind node image on its sandbox worker"
 
 # The rendered space-local config: SPACE nodes on the image, the rest on its base.
 rendered="$work/kind-cluster.yaml"

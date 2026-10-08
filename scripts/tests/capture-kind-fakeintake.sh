@@ -136,7 +136,8 @@ capture() { # phase window
 
   kubectl --context "$KIND_CONTEXT" -n "$NAMESPACE" get deploy,ds -o json \
     | jq '[.items[]
-      | select(.metadata.name | test("^space-(api|cluster-controller|data-plane|internal-api|node-stack|builder-node-stack)$"))
+      | select((.metadata.name | test("^space-(api|cluster-controller|data-plane|internal-api)$"))
+          or .metadata.labels["app.kubernetes.io/part-of"] == "space-node")
       | {kind, name: .metadata.name, uid: .metadata.uid,
          images: [.spec.template.spec.containers[].image],
          telemetry_env: [.spec.template.spec.containers[].env[]?

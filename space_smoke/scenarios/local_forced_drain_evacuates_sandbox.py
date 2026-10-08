@@ -39,7 +39,7 @@ def forced_drain_evacuates_sandbox(test: smoke.KindEcw) -> None:
 
     marker = f"{MARKER}-{test.sandbox.sandbox_id}"
     drain = test.node_drain
-    # Opened before the drain: its node-stack event window starts here, so the
+    # Opened before the drain: its sandbox-manager event window starts here, so the
     # evacuation's `runtime_activated` event falls inside it.
     restore = test.cross_node_restore
 

@@ -4,7 +4,7 @@ A passing bench shows two episodes paced correctly. It cannot show that the
 flat once-per-tick cadence fails, that a non-contiguous or short attempt list
 fails, that a `RetryScheduled` record without `attempt_count` is refused as
 oracle drift rather than counted as zero, that the retirement is armed before
-the plant, or that a replaced node-stack pod is a refusal to judge.
+the plant, or that a replaced sandbox-manager pod is a refusal to judge.
 """
 
 from __future__ import annotations
@@ -114,21 +114,21 @@ class _Control:
         self.attempts: dict[str, list[RecoveryAttempt]] = {}
         self.present: set[str] = set()
 
-    def node_stack_pod_for_sandbox(self, sandbox_id: str) -> tuple[str, str]:
-        return "space-node-stack-a", self.uid
+    def sandbox_manager_for_sandbox(self, sandbox_id: str) -> tuple[str, str, str]:
+        return "worker-a", "space-sandbox-manager-a", self.uid
 
-    def node_stack_pod_uid(self, pod_name: str) -> str | None:
+    def pod_uid(self, pod_name: str) -> str | None:
         return self.uid
 
-    def plant_orphan_staging(self, pod_name: str, sandbox_id: str) -> None:
+    def plant_orphan_staging(self, node_name: str, sandbox_id: str) -> None:
         self.calls.append(f"plant:{sandbox_id[:4]}")
         self.present.add(sandbox_id)
 
-    def remove_orphan_sandbox(self, pod_name: str, sandbox_id: str) -> None:
+    def remove_orphan_sandbox(self, node_name: str, sandbox_id: str) -> None:
         self.calls.append(f"remove:{sandbox_id[:4]}")
         self.present.discard(sandbox_id)
 
-    def orphan_absent(self, pod_name: str, sandbox_id: str) -> bool:
+    def orphan_absent(self, node_name: str, sandbox_id: str) -> bool:
         return sandbox_id not in self.present
 
     def orphan_quarantined(self, pod_name: str, sandbox_id: str) -> bool:
@@ -159,7 +159,7 @@ class Lifecycle(unittest.TestCase):
     def test_a_plant_that_raises_still_has_its_retirement_armed(self) -> None:
         control = _Control()
 
-        def failing(pod, sandbox_id):
+        def failing(node, sandbox_id):
             control.calls.append(f"plant:{sandbox_id[:4]}")
             raise RuntimeError("mkdir: read-only file system")
 
@@ -182,7 +182,7 @@ class Lifecycle(unittest.TestCase):
 
     def test_residue_after_retirement_fails(self) -> None:
         control = _Control()
-        control.remove_orphan_sandbox = lambda pod, sid: control.calls.append("remove")  # type: ignore[method-assign]
+        control.remove_orphan_sandbox = lambda node, sid: control.calls.append("remove")  # type: ignore[method-assign]
         _, recovery, _ = _assertions(control)
         recovery.induce(count=1)
         with self.assertRaisesRegex(InvariantViolation, "survived its retirement"):
@@ -238,6 +238,8 @@ class _ScriptedKubectl:
 
 
 ARGV = ("kubectl",)
+# The operator shell lookup every on-node exec starts with.
+SHELL = CommandResult(ARGV, 0, "space-node-debug-a", "")
 
 
 def _harness(*results: CommandResult) -> tuple[KindHarness, _ScriptedKubectl]:
@@ -248,51 +250,59 @@ def _harness(*results: CommandResult) -> tuple[KindHarness, _ScriptedKubectl]:
 class HarnessOps(unittest.TestCase):
     """The kind ops behind the control, driven against a scripted kubectl.
 
-    Bench round 1 (2026-09-23) died in `node_stack_pod_uid` on an attribute the
+    Bench round 1 (2026-09-23) died in the pod-uid read on an attribute the
     kubectl result type does not have; every op here reads the real result type.
     """
 
     def test_pod_uid_reads_the_jsonpath_and_is_none_when_kubectl_fails(self) -> None:
         harness, _ = _harness(CommandResult(ARGV, 0, "uid-1\n", ""), CommandResult(ARGV, 1, "", "NotFound"))
-        self.assertEqual(harness.node_stack_pod_uid("space-node-stack-a"), "uid-1")
-        self.assertIsNone(harness.node_stack_pod_uid("space-node-stack-a"))
+        self.assertEqual(harness.pod_uid("space-sandbox-manager-a"), "uid-1")
+        self.assertIsNone(harness.pod_uid("space-sandbox-manager-a"))
 
     def test_plant_execs_one_mkdir_of_a_suspend_publish_staging_under_the_orphan(self) -> None:
-        harness, kubectl = _harness(CommandResult(ARGV, 0, "/space/cache/...\n", ""))
-        harness.plant_orphan_staging("space-node-stack-a", ORPHAN)
-        (call,) = kubectl.calls
+        harness, kubectl = _harness(SHELL, CommandResult(ARGV, 0, "/space/cache/...\n", ""))
+        harness.plant_orphan_staging("worker-a", ORPHAN)
+        lookup, call = kubectl.calls
+        self.assertIn("app.kubernetes.io/name=space-node-debug", lookup)
+        self.assertIn("spec.nodeName=worker-a", lookup)
         self.assertIn("exec", call)
-        self.assertIn("node-stack", call)
+        self.assertIn("space-node-debug-a", call)
+        self.assertIn("shell", call)
         script = call[-1]
         self.assertIn(f"/space/cache/firecracker/sandboxes/{ORPHAN}/snapshots/.suspend-publish-", script)
         self.assertTrue(script.startswith("mkdir -p "))
 
     def test_plant_failure_is_an_error_not_a_silent_pass(self) -> None:
-        harness, _ = _harness(CommandResult(ARGV, 1, "", "mkdir: read-only file system"))
+        harness, _ = _harness(SHELL, CommandResult(ARGV, 1, "", "mkdir: read-only file system"))
         with self.assertRaises(Exception):
-            harness.plant_orphan_staging("space-node-stack-a", ORPHAN)
+            harness.plant_orphan_staging("worker-a", ORPHAN)
 
     def test_retire_deletes_the_row_then_the_directory(self) -> None:
-        harness, kubectl = _harness(CommandResult(ARGV, 0, "", ""))
-        harness.remove_orphan_sandbox("space-node-stack-a", ORPHAN)
-        script = kubectl.calls[0][-1]
+        harness, kubectl = _harness(SHELL, CommandResult(ARGV, 0, "", ""))
+        harness.remove_orphan_sandbox("worker-a", ORPHAN)
+        script = kubectl.calls[1][-1]
         self.assertLess(script.index(f"space-sbxmgr delete {ORPHAN}"), script.index("rm -rf"))
         self.assertIn(f"/space/cache/firecracker/sandboxes/{ORPHAN}", script)
 
     def test_absence_reads_the_exec_return_code(self) -> None:
-        harness, _ = _harness(CommandResult(ARGV, 0, "", ""), CommandResult(ARGV, 1, "", ""))
-        self.assertTrue(harness.orphan_absent("space-node-stack-a", ORPHAN))
-        self.assertFalse(harness.orphan_absent("space-node-stack-a", ORPHAN))
+        harness, _ = _harness(
+            SHELL, CommandResult(ARGV, 0, "", ""), SHELL, CommandResult(ARGV, 1, "", "")
+        )
+        self.assertTrue(harness.orphan_absent("worker-a", ORPHAN))
+        self.assertFalse(harness.orphan_absent("worker-a", ORPHAN))
 
-    def test_quarantine_and_attempts_read_the_grepped_log(self) -> None:
+    def test_quarantine_and_attempts_read_the_sandbox_managers_log(self) -> None:
         lines = "\n".join([
             json.dumps({"timestamp": "2026-09-23T14:00:00Z", "message": "quarantined", "sandbox_id": ORPHAN, "reason_code": "orphaned_sandbox_row_missing"}),
             _json_line("2026-09-23T14:01:00Z", "RetryScheduled { attempt_count: 1, next_attempt_at: 1 }"),
+            _json_line("2026-09-23T14:02:00Z", "RetryScheduled { attempt_count: 9 }", sandbox=SID),
         ])
         harness, kubectl = _harness(CommandResult(ARGV, 0, lines, ""), CommandResult(ARGV, 0, lines, ""))
-        self.assertTrue(harness.orphan_quarantined("space-node-stack-a", ORPHAN))
-        self.assertEqual([a.attempt for a in harness.recovery_attempts("space-node-stack-a", ORPHAN)], [1])
-        self.assertIn("/space/logs/sbxmgr.log", kubectl.calls[0][-1])
+        self.assertTrue(harness.orphan_quarantined("space-sandbox-manager-a", ORPHAN))
+        self.assertEqual([a.attempt for a in harness.recovery_attempts("space-sandbox-manager-a", ORPHAN)], [1])
+        logs = kubectl.calls[0]
+        self.assertEqual(logs[logs.index("logs"):logs.index("logs") + 4],
+                         ("logs", "space-sandbox-manager-a", "-c", "sandbox-manager"))
 
 
 if __name__ == "__main__":

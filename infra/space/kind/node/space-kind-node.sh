@@ -3,17 +3,25 @@
 # space-kind-node.sh — the Kind node's stand-in for the SPACE node image.
 #
 # A production worker or builder gets its btrfs /space/cache, cgroup subtree,
-# loop-device headroom, device permissions and /space layout from the node
-# image (infra/space/packer) before any SPACE pod starts. The Kind node image
-# for sandbox workers and builders (Dockerfile beside this script) bakes in this
-# script and enables the units that run it, ordered before kubelet:
+# loop-device headroom, device permissions, SPACE accounts and /space layout
+# from the node image (infra/space/packer) before any SPACE pod starts. The Kind
+# node image for sandbox workers and builders (Dockerfile beside this script)
+# bakes in this script and enables the units that run it, ordered before
+# kubelet:
 #
-#   space-loop-nodes.service    loop-device node headroom in the node's /dev
-#   space-kind-devices.service  Kind-only /dev/kvm and vhost permission widening
-#   space-cgroup.service        /sys/fs/cgroup/space   (packer 07-sysctl.sh)
-#   space-layout.service        /space/run skeleton    (packer 07-sysctl.sh)
-#   space-cache.service         btrfs /space/cache     (packer 01-partitions.sh,
-#                                                       11-nvme-cache.sh)
+#   space-loop-nodes.service       loop-device node headroom in the node's /dev
+#   space-kind-devices.service     Kind-only /dev/kvm and vhost permission widening
+#   space-cgroup.service           /sys/fs/cgroup/space   (packer 07-sysctl.sh)
+#   space-layout.service           SPACE accounts, /space skeleton, Firecracker
+#                                  links, sandbox.toml    (packer 04-firecracker.sh,
+#                                                          07-sysctl.sh)
+#   space-cache.service            btrfs /space/cache     (packer 01-partitions.sh,
+#                                                          11-nvme-cache.sh)
+#   space-kind-vsock-jails.service Kind-only vhost-vsock nodes in Firecracker jails
+#
+# The node also runs space-runtime-supervisor.service, which node-manager's
+# init container installs and upgrades (scripts/k8s/node-manager-init.sh), as
+# on a production node.
 #
 # A container's /dev, mounts and cgroups do not survive `docker restart`, which
 # is why these are boot units and not a one-time setup. Each step is
@@ -23,7 +31,7 @@
 # Defaults are baked like the rest of the layer; /etc/space/kind-node.env, when
 # present, overrides SPACE_CACHE_SIZE_MB and SPACE_LOOP_DEVICE_TARGET.
 #
-# Usage: space-kind-node.sh loop-nodes|devices|cgroup|layout|cache
+# Usage: space-kind-node.sh loop-nodes|devices|cgroup|layout|cache|vsock-jails
 set -euo pipefail
 
 # Baked together into the Kind node image; the source= paths below are their
@@ -79,15 +87,44 @@ cgroup() {
   log "/sys/fs/cgroup/space delegates: $(cat /sys/fs/cgroup/space/cgroup.subtree_control)"
 }
 
-# ── /space/run skeleton ──────────────────────────────────────────────────────
-# The host state directories packer 07-sysctl.sh bakes into the node image, on
-# the hostPath the node-stack pod mounts. The directories only SPACE services'
-# own init containers create in production stay with the pod entrypoint.
+# ── SPACE accounts ───────────────────────────────────────────────────────────
+# The groups and service users packer 07-sysctl.sh creates on the node image,
+# with the same numbers the worker image uses: the host runtime-supervisor and
+# the sidecars it launches run here, and the node's files carry these owners.
+ensure_identities() {
+  local spec group gid actual _alias user uid primary
+  for spec in $SPACE_GROUP_SPECS; do
+    group="${spec%%:*}" gid="${spec##*:}"
+    if actual="$(getent group "$group" | cut -d: -f3)" && [[ -n $actual ]]; then
+      [[ $actual == "$gid" ]] || groupmod -g "$gid" "$group"
+    else
+      groupadd -g "$gid" "$group"
+    fi
+  done
+  while IFS=: read -r _alias user uid primary; do
+    [[ -n $user ]] || continue
+    if id "$user" >/dev/null 2>&1; then
+      [[ "$(id -u "$user")" == "$uid" ]] || usermod -u "$uid" "$user"
+      usermod -g "$primary" "$user"
+    else
+      useradd --system --no-create-home --uid "$uid" --gid "$primary" \
+        --shell /usr/sbin/nologin "$user"
+    fi
+  done <<<"$SPACE_USER_SPECS"
+}
+
+# ── /space skeleton ──────────────────────────────────────────────────────────
+# The host state directories, Firecracker links and per-VM defaults packer
+# bakes into the node image, on the hostPaths the node-service pods mount. The
+# directories only a service's own init container creates in production
+# (volume-manager's, node-ctl's, runtime-manager's, build-manager's) are left
+# to those charts.
 layout() {
   local sbxclients_gid gate gate_path
+  ensure_identities
   sbxclients_gid="$(space_expected_gid_for_group space-sbxclients)"
-  install -d -m 0755 -o 0 -g 0 /space /space/etc /space/run /space/run/node-manager \
-    /space/run/firecracker /space/run/firecracker/sandboxes
+  install -d -m 0755 -o 0 -g 0 /space /space/etc /space/bin /space/run /space/run/node-manager \
+    /space/run/firecracker /space/run/firecracker/sandboxes /var/run/netns
   install -d -m 0750 -o 0 -g "$sbxclients_gid" \
     /space/run/dependency-drain /space/run/dependency-drain/sandbox-manager
   # Lock files a running sandbox-manager may hold: create or re-own them, never
@@ -106,7 +143,18 @@ layout() {
   install -d -m 0755 -o "$SPACE_SBXMGR_UID" -g "$SPACE_SBXMGR_GID" /space/run/sandbox-host-control
   install -d -m 0750 -o "$SPACE_TMPLMGR_UID" -g "$(space_expected_gid_for_group space-tmplclients)" \
     /space/run/template-manager
-  log "/space/run skeleton in place"
+  # The canonical binary paths the runtime inventory and the jailer launch
+  # use, onto the vendor tree kind-cluster.yaml.tmpl bind-mounts (packer
+  # 04-firecracker.sh). node-manager's init container stages the SPACE host
+  # binaries beside them.
+  ln -sfn ../vendor/firecracker/default/bin/firecracker /space/bin/firecracker
+  ln -sfn ../vendor/firecracker/default/bin/jailer /space/bin/jailer
+  # Per-VM defaults sandbox-manager reads; packer writes its sizing knobs here,
+  # and Kind sets none of them.
+  printf '%s\n' "# Generated by the Kind node layer (infra/space/kind/node/space-kind-node.sh)" \
+    >/space/etc/sandbox.toml
+  chmod 0644 /space/etc/sandbox.toml
+  log "SPACE accounts and /space skeleton in place"
 }
 
 # ── btrfs /space/cache ───────────────────────────────────────────────────────
@@ -142,10 +190,9 @@ format_cache_image() {
 mount_cache_image() {
   local loopdev reused=0
   # A device already bound to this image is reused rather than a second one
-  # attached: one a node-stack pod from before this unit existed attached and
-  # still has mounted (btrfs refuses a second device with the same fsid while
-  # that mount lives), or one a crash left attached and unmounted, which would
-  # otherwise never be reclaimed.
+  # attached: one an earlier attach still has mounted (btrfs refuses a second
+  # device with the same fsid while that mount lives), or one a crash left
+  # attached and unmounted, which would otherwise never be reclaimed.
   loopdev="$(losetup -l -n -O NAME -j "$CACHE_IMAGE" 2>/dev/null | head -n 1 | tr -d '[:space:]')"
   if [[ -n $loopdev && -b $loopdev ]]; then
     reused=1
@@ -215,11 +262,45 @@ cache() {
   cache_skeleton
 }
 
+# ── vhost-vsock nodes in Firecracker jails (Kind only) ───────────────────────
+# The jailer mknods /dev/kvm, /dev/net/tun, /dev/urandom and /dev/userfaultfd
+# into each jail, but not /dev/vhost-vsock (a known Firecracker jailer
+# limitation). Without it Firecracker silently disables the vsock device, the
+# host bridge cannot reach the guest, and readiness expires at 30 s. A
+# production node image provides the device to its jails; here this
+# long-running unit races the jailer instead: as soon as a jail's dev/ appears
+# it mknods the node into it, polling at 10 ms because Firecracker opens the
+# device very shortly after exec. The jails live in the node's mount
+# namespace, under the host runtime-supervisor, so they appear here directly.
+# Do NOT replicate this on a real worker.
+vsock_jails() {
+  local src=/dev/vhost-vsock major minor jail_dev
+  if [[ ! -c $src ]]; then
+    log "no /dev/vhost-vsock on this node; nothing to provide"
+    exec sleep infinity
+  fi
+  major=$((16#$(stat -c '%t' "$src")))
+  minor=$((16#$(stat -c '%T' "$src")))
+  log "providing vhost-vsock (c $major $minor) to Firecracker jails"
+  while true; do
+    for jail_dev in "$CACHE_DIR"/firecracker/jails/firecracker/*/root/dev; do
+      [[ -d $jail_dev && ! -e $jail_dev/vhost-vsock ]] || continue
+      # 0666 so the sandbox uid Firecracker switches to can open it.
+      if mknod "$jail_dev/vhost-vsock" c "$major" "$minor" 2>/dev/null; then
+        chmod 0666 "$jail_dev/vhost-vsock" 2>/dev/null || true
+        log "mknod $jail_dev/vhost-vsock"
+      fi
+    done
+    sleep 0.01
+  done
+}
+
 case "$STEP" in
   loop-nodes) loop_nodes ;;
   devices) devices ;;
   cgroup) cgroup ;;
   layout) layout ;;
   cache) cache ;;
-  *) die "usage: $0 loop-nodes|devices|cgroup|layout|cache" ;;
+  vsock-jails) vsock_jails ;;
+  *) die "usage: $0 loop-nodes|devices|cgroup|layout|cache|vsock-jails" ;;
 esac

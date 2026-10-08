@@ -9,8 +9,8 @@
 #      WorkerApiInternal accepts it (nodeApiInternal allowlist), while a SA that
 #      is not on that allowlist is denied (the cluster-controller warm-pool edge).
 #
-# Requires `grpcurl` (brew install grpcurl) and a node-stack built with the
-# `k8s` feature + ./01-apply-auth.sh already applied.
+# Requires `grpcurl` (brew install grpcurl) and ./01-apply-auth.sh already
+# applied.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib.sh
 source "${SCRIPT_DIR}/lib.sh"
@@ -20,7 +20,7 @@ require kubectl
 require grpcurl
 assert_local_context
 
-POD="$(node_stack_pod)"; [[ -n "$POD" ]] || die "node-stack pod not found"
+POD="$(node_api_pod)"; [[ -n "$POD" ]] || die "node-api pod not found"
 APIPOD="$(k get pod -l app.kubernetes.io/name="${SPACE_API_DEPLOY}" -o jsonpath='{.items[0].metadata.name}')"
 [[ -n "$APIPOD" ]] || die "space-api pod not found"
 

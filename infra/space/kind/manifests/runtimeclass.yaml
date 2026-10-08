@@ -4,9 +4,8 @@
 # a `space` CRI runtime that points at it. The shim hijacks the per-sandbox
 # pod's pause container, reads the SPACE annotations (sandbox-id, vcpu,
 # memory, template, …), and calls into the local sandbox-manager UDS to
-# create a real sandbox via node-manager. Locally that node-manager is
-# `space-local-nodemgr-svc`, which boots the guest as a systemd-nspawn
-# container; in prod the same socket fronts Firecracker.
+# create a real sandbox via node-manager, which launches Firecracker through
+# the node's runtime-supervisor, as in production.
 #
 # If the shim isn't installed (e.g. on a fresh cluster before bootstrap.sh
 # has run install-shim.sh), kubelet will fail pod-start with

@@ -78,7 +78,7 @@ class PodDeletionGuard(unittest.TestCase):
         with self.assertRaises(ValueError):
             harness.delete_sandbox_pod("space-api-7c9d8-abcde")
         with self.assertRaises(ValueError):
-            harness.delete_sandbox_pod("space-node-stack-abcde")
+            harness.delete_sandbox_pod("space-sandbox-manager-abcde")
 
 
 

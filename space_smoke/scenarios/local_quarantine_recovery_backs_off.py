@@ -25,7 +25,7 @@ def quarantine_recovery_backs_off(test: smoke.KindEcw) -> None:
 
     recovery = test.quarantine_recovery
 
-    with test.phase("pin the worker's node-stack pod; induce two interrupted suspend publications"):
+    with test.phase("pin the worker's sandbox-manager pod; induce two interrupted suspend publications"):
         recovery.induce(count=2)
 
     with test.phase("the reconciler quarantines both as orphaned_sandbox_row_missing"):

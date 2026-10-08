@@ -1,0 +1,25 @@
+# volume-manager on every SPACE Kind node: snapshot and template transfers
+# between /space/cache and the object store. One release per role: `space`
+# and `space-builder` (`--set node.role=builder`).
+
+image:
+  repository: space-worker
+  tag: local
+  pullPolicy: IfNotPresent
+
+datadogEnvironment: kind-local
+clusterId: kind-local
+telemetry: {}
+node: {}
+
+# On SIGTERM volume-manager closes transfer admission, drains queued
+# transfers for up to --drain-timeout-secs (100 s), then stops its gRPC server
+# within --server-drain-timeout-secs (10 s)
+# (crates/libs/vol/mgr/server/src/run.rs). The grace covers both plus exit.
+terminationGracePeriodSeconds: 120
+
+# Kind sizing: requests only (see space-node-manager-local/values.yaml).
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi

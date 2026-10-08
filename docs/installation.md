@@ -260,7 +260,7 @@ If you change the cluster name, update the explicit Kubernetes contexts in these
 
 ## Verify the installation
 
-Running pods alone do not mean that `seed:latest` is available. Wait for the seed publication job and node-stack rollout before creating a sandbox.
+Running pods alone do not mean that `seed:latest` is available. Wait for the seed publication job and the rollout of every node-service DaemonSet before creating a sandbox. Each node service (node-manager, sandbox-manager, template-manager and the rest) runs as its own DaemonSet, as in production; `infra/space/kind/lib/node-services.sh` lists them.
 
 ```bash
 export SPACE_API_URL=http://127.0.0.1:8080
@@ -275,8 +275,10 @@ export SPACE_DATA_PLANE_URL=http://127.0.0.1:8090
     wait --for=condition=complete \
     job/space-seed-publish --timeout=300s
 
-  kubectl --context kind-space-local -n space \
-    rollout status ds/space-node-stack --timeout=300s
+  for ds in $(bash infra/space/kind/lib/node-services.sh daemonsets); do
+    kubectl --context kind-space-local -n space \
+      rollout status "ds/$ds" --timeout=300s
+  done
 
   curl --noproxy '*' --fail-with-body --silent --show-error \
     --max-time 15 \
@@ -444,9 +446,9 @@ SPACE_KIND_CLUSTER=space-local \
 ## Separating volume-manager's credential identity
 
 The worker image provides a separate `space-volmgr` account (UID/GID 964) and
-credential-client group `space-volcredclients` (GID 965). The local launcher
-continues to run volume-manager as `space-sbxmgr` (UID 950), using the standard
-credential socket. Adding these accounts does not change the running identity
+credential-client group `space-volcredclients` (GID 965). The Kind
+volume-manager DaemonSet continues to run volume-manager as `space-sbxmgr`
+(UID 950), using the standard credential socket. Adding these accounts does not change the running identity
 or migrate retained files.
 
 Credential-manager supports an optional `--volume-socket

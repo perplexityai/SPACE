@@ -13,57 +13,39 @@ deployments can disable that fallback.
 
 ```mermaid
 flowchart LR
-  api["space-api pod<br/>SA space-api"] -->|"Bearer projected JWT<br/>aud = space-node-api"| na["node-api (node-stack)<br/>built with the k8s feature"]
+  api["space-api pod<br/>SA space-api"] -->|"Bearer projected JWT<br/>aud = space-node-api"| na["node-api DaemonSet pod<br/>SA space-node-api"]
   na -->|"TokenReview(JWT, audience)"| kas["kind kube-apiserver"]
   kas -->|"valid → system:serviceaccount:space:space-api"| na
   na -->|"allowlist check → accept (mode:k8s)"| na
   api -. "static secret (mode:static) when projected token absent" .-> na
 ```
 
-## Why this needs a special build + a direct RPC test
+## Why a direct RPC test
 
-Two local-only wrinkles, both real:
+The Kind node-api is built with the `k8s` Cargo feature
+(`docker/Dockerfile.rust-build-kind`), so it has the TokenReview code; the local
+charts simply run it in static mode. Enabling `k8sAuth` here switches it on.
 
-1. **The dev node-stack image is built k8s-free.** The `build-node-stack` lane in
-   `docker/Dockerfile.rust-build-common` omits the `k8s` Cargo feature, so the
-   local node-api has no TokenReview code. With `k8sAuth` enabled it would
-   **fail loud** (`KubernetesAuthFeatureDisabled`). `00-enable-node-stack-k8s-build.sh`
-   adds the feature for a local rebuild (revert before committing — we do not
-   ship k8s in the dev image).
-
-2. **The full async create flow doesn't traverse this edge locally.** The local
-   stack runs **DirectSubstrate** (space-api dials the node-stack DaemonSet's
-   node-api directly — this is the edge where `mode:k8s` lives). The async
-   operation processor is the **cluster-controller**, which requires
-   `SPACE_K8S_CONTROL_PLANE=true` (**KubernetesSubstrate**) and creates a
-   **per-sandbox Pod** instead of calling the DaemonSet's node-api. So a
-   `POST /v1/sandboxes` in non-MINIMAL would route around this edge entirely.
-   We therefore exercise the path with a **direct `WorkerApi` RPC** carrying
-   space-api's real projected token — the node-api auth behaviour is identical
-   to what the DirectSubstrate client does.
+The full async create flow does not exercise every edge a deployment
+authenticates: sandbox creation goes through the cluster-controller and a
+per-sandbox Pod. So the scripts exercise the path with a **direct `WorkerApi`
+RPC** carrying space-api's real projected token — the node-api auth behaviour
+is identical to what space-api's own client does.
 
 ## Prerequisites
 
 - A running local stack on `kind` (see the
   [installation guide](../../../docs/installation.md) and `Tiltfile`).
-  The Tiltfile names the cluster from `SPACE_KIND_CLUSTER` (built-in default
-  `space-local-3486`); these examples pass `SPACE_KIND_CLUSTER=space-local`, but
-  either name works — the scripts default `KCTX` to your **current kube-context**
-  (whatever Tilt left selected) and refuse any non-`kind-*` context. MINIMAL mode
-  is fine.
+  The scripts default `KCTX` to your **current kube-context** (whatever Tilt
+  left selected) and refuse any non-`kind-*` context.
 - `kubectl`, `grpcurl` (`brew install grpcurl`), and `nc`.
-- node-stack built **with** the k8s feature (step 0 below).
 
 ## Usage
 
 ```bash
 cd scripts/k8s/projected-tokens
 
-# 0. (dev-only) add the k8s feature to the node-stack build lane, then rebuild.
-./00-enable-node-stack-k8s-build.sh
-SPACE_KIND_CLUSTER=space-local tilt up          # rebuilds node-stack with k8s
-
-# 1. wire the auth: TokenReview RBAC + node-stack k8sAuth env + space-api
+# 1. wire the auth: TokenReview RBAC + node-api k8sAuth env + space-api
 #    projected token. Idempotent; re-run after any `tilt up` reconcile.
 ./01-apply-auth.sh
 
@@ -145,8 +127,7 @@ you hit this:
 
 - Build **sequentially** or bound parallelism — start Tilt with
   `SPACE_TILT_MAX_PARALLEL_UPDATES=1` (or `2`) in its environment; the Tiltfile
-  reads it (`tilt up` has no parallelism flag). The MINIMAL bench defaults to 3,
-  the full harness to 8. Slower, but it keeps the control plane responsive. `tilt ci` is the most likely to trip
+  reads it (`tilt up` has no parallelism flag). It defaults to 8. Slower, but it keeps the control plane responsive. `tilt ci` is the most likely to trip
   this since it gates on everything going green in one shot.
 - Prefer a **local image registry** (`kind-with-registry`) — it removes the
   `kind load` IO entirely (containerd pulls directly), which is the single biggest
@@ -158,7 +139,6 @@ you hit this:
 | File | Purpose |
 | --- | --- |
 | `lib.sh` | Shared config (context, namespace, SAs, audiences, ports) + helpers |
-| `00-enable-node-stack-k8s-build.sh` | Dev-only: add the `k8s` feature to the node-stack build lane |
 | `01-apply-auth.sh` | Wire TokenReview RBAC + server env + client projected token |
 | `02-test.sh` | Positive + negative TokenReview tests via `grpcurl` |
 | `03-teardown.sh` | Revert the wiring to static-only auth |

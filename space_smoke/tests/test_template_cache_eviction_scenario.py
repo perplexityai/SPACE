@@ -91,6 +91,9 @@ class _RecordingKubectl:
             if self.exec_results:
                 return self.exec_results.pop(0)
             return CommandResult(argv, 0, "", "")
+        if verb == "get" and "jsonpath={.items[*].metadata.name}" in argv:
+            # The pod lookup an on-node operation or log read starts with.
+            return CommandResult(argv, 0, "space-pod-x", "")
         if verb in {"get", "logs"}:
             return CommandResult(argv, 0, self.get_output, "")
         return CommandResult(argv, 0, "", "")
@@ -100,11 +103,11 @@ class OnNodeOperations(unittest.TestCase):
     def test_only_the_scenarios_own_throwaway_names_reach_the_shell(self) -> None:
         harness = KindHarness(_RecordingKubectl(), KindConfig())
         with self.assertRaises(ValueError):
-            harness.register_unpinned_template("space-node-stack-x", "seed", 1)
+            harness.register_unpinned_template("worker-1", "seed", 1)
         with self.assertRaises(ValueError):
-            harness.delete_template("space-node-stack-x", "smoke-lru-$(id)", )
+            harness.delete_template("worker-1", "smoke-lru-$(id)", )
         with self.assertRaises(ValueError):
-            harness.register_unpinned_template("space-node-stack-x", "smoke-lru-0123abcd", 0)
+            harness.register_unpinned_template("worker-1", "smoke-lru-0123abcd", 0)
 
     def test_build_state_reads_the_state_line_and_maps_not_found_to_none(self) -> None:
         argv = ("kubectl",)
@@ -166,7 +169,7 @@ class GcTickParsing(unittest.TestCase):
         unrelated = json.dumps({"fields": {"message": "template GC tick failed"}})
         kubectl = _RecordingKubectl(get_output="\n".join([nested, flat, unrelated, "not json"]))
         ticks = KindHarness(kubectl, KindConfig()).template_gc_ticks(
-            "space-node-stack-x", since_time="2026-01-01T00:00:00Z"
+            "worker-1", since_time="2026-01-01T00:00:00Z"
         )
         self.assertEqual([t.deleted for t in ticks], [1, 0])
         self.assertEqual(ticks[0].bytes_freed, 4)

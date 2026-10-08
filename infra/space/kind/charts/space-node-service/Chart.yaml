@@ -1,0 +1,5 @@
+apiVersion: v2
+name: space-node-service
+description: Shared pod shape for the Kind per-service SPACE node DaemonSets
+type: library
+version: 0.1.0

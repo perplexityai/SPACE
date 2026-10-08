@@ -19,7 +19,7 @@ from types import SimpleNamespace
 from typing import Any, cast
 
 from space_smoke.adapters import KindConfig, KindHarness
-from space_smoke.capabilities import FencePolicy, NodeStackIdentity, SaWriteOutcome, WhoAmI
+from space_smoke.capabilities import FencePolicy, NodeCtlIdentity, SaWriteOutcome, WhoAmI
 from space_smoke.node_fence import (
     BOUNDARY_LABEL,
     FOREIGN_CAPACITY_RESOURCE,
@@ -38,7 +38,7 @@ from space_smoke.node_fence import (
 from space_smoke.runtime import CommandResult, InvariantViolation, ResourceScope
 
 SID = "01a0b0c9-b8a3-7473-9c12-3821a701bc28"
-POLICY = "space-worker-node-ctl-node-fence"
+POLICY = "space-node-ctl-node-fence"
 OWN, OTHER = "space-local-worker", "space-local-worker2"
 
 
@@ -103,11 +103,11 @@ class _Control:
 
     def __init__(self) -> None:
         self.calls: list[str] = []
-        self.identity = NodeStackIdentity("space-node-stack-a", "uid-1", OWN, "space-worker-node-stack")
+        self.identity = NodeCtlIdentity("space-node-ctl-a", "uid-1", OWN, "space-node-ctl")
         self.nodes = {OWN: _node(OWN), OTHER: _node(OTHER)}
         self.policy: FencePolicy | None = FencePolicy(POLICY, ["Deny"], 0)
         self.token_readable = True
-        self.who = WhoAmI("system:serviceaccount:space:space-worker-node-stack", OWN)
+        self.who = WhoAmI("system:serviceaccount:space:space-node-ctl", OWN)
         self.can_patch = True
         self.refuse_all = True
         self.reconcile_after_polls = 1
@@ -117,7 +117,7 @@ class _Control:
         self.calls.append("lease")
         return lambda: self.calls.append("lease:release")
 
-    def node_stack_identity_for_sandbox(self, sandbox_id):
+    def node_ctl_identity_for_sandbox(self, sandbox_id):
         return self.identity
 
     def kube_node_names(self):
@@ -213,7 +213,7 @@ class _Control:
             capacity[SLOTS_RESOURCE] = live_slots
         return ["restoring .spec taints/unschedulable"] if node == OWN and self.refuse_all is False else []
 
-    def node_stack_log_tail(self, pod, lines):
+    def node_ctl_log_tail(self, pod, lines):
         return ["denied"]
 
     # the fake node-ctl: writes back after N polls of node_label/node_capacity
@@ -311,7 +311,7 @@ class Preconditions(unittest.TestCase):
 
     def test_a_token_claiming_another_node_is_refused(self) -> None:
         control = _Control()
-        control.who = WhoAmI("system:serviceaccount:space:space-worker-node-stack", OTHER)
+        control.who = WhoAmI("system:serviceaccount:space:space-node-ctl", OTHER)
         _, fence, _, _ = _assertions(control)
         fence.locate()
         fence.expect_fence_enforcing()
@@ -326,7 +326,7 @@ class Preconditions(unittest.TestCase):
         fence.expect_fence_enforcing()
         with self.assertRaisesRegex(InvariantViolation, "does not authenticate as"):
             fence.read_credential()
-        control.who = WhoAmI("system:serviceaccount:space:space-worker-node-stack", OWN)
+        control.who = WhoAmI("system:serviceaccount:space:space-node-ctl", OWN)
         control.can_patch = False
         with self.assertRaisesRegex(InvariantViolation, "RBAC no longer grants"):
             fence.read_credential()
@@ -477,17 +477,17 @@ class HarnessOps(unittest.TestCase):
         with self.assertRaises(ValueError):
             harness.apply_as("/tmp/k", "apiVersion: v1", field_manager="bad manager")
         with self.assertRaises(ValueError):
-            harness.pod_file("space-node-stack-a", "../etc/passwd")
+            harness.pod_file("space-node-ctl-a", "../etc/passwd")
 
     def test_fence_policy_is_matched_by_the_service_account_and_read_with_its_binding(self) -> None:
         policies = json.dumps({"items": [
             {"metadata": {"name": "other"}, "spec": {"matchConditions": [{"expression": 'request.userInfo.username == "x"'}]}},
-            {"metadata": {"name": POLICY}, "spec": {"matchConditions": [{"expression": 'request.userInfo.username == "system:serviceaccount:space:space-worker-node-stack"'}]},
+            {"metadata": {"name": POLICY}, "spec": {"matchConditions": [{"expression": 'request.userInfo.username == "system:serviceaccount:space:space-node-ctl"'}]},
              "status": {"typeChecking": {"expressionWarnings": []}}},
         ]})
         bindings = json.dumps({"items": [{"spec": {"policyName": POLICY, "validationActions": ["Deny"]}}]})
         harness = KindHarness(_ScriptedKubectl([CommandResult(ARGV, 0, policies, ""), CommandResult(ARGV, 0, bindings, "")]), KindConfig())
-        policy = harness.fence_policy_for("space-worker-node-stack")
+        policy = harness.fence_policy_for("space-node-ctl")
         self.assertEqual(policy, FencePolicy(POLICY, ["Deny"], 0))
 
     def test_revert_from_snapshot_repairs_only_by_marker(self) -> None:

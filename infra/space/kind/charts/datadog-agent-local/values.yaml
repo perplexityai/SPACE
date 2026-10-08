@@ -16,10 +16,10 @@
 # * Logs use the stdout path in every transport mode. The backend helper
 #   restricts collection to the SPACE namespace and disables optional process,
 #   image, lifecycle, event and orchestrator inventory for bounded experiments.
-#   That namespace scope still includes the builder, which opts out separately
-#   through `ad.datadoghq.com/node-stack.logs_exclude`: guest command output
-#   can contain build secrets even when step descriptions omit user inputs.
-#   See space-node-stack/values-builder.yaml.
+#   That namespace scope still includes the builders' build-manager, which
+#   opts out separately through `ad.datadoghq.com/build-manager.logs_exclude`:
+#   guest command output can contain build secrets even when step descriptions
+#   omit user inputs. See space-build-manager-local/templates/daemonset.yaml.
 
 # Fake Intake is deliberately single-replica and in-memory. A second replica
 # would split writes and make a query return only part of a comparison run.

@@ -1,0 +1,64 @@
+# template-manager on every SPACE Kind node: resolves template releases
+# through ClusterApi, pulls them through volume-manager and keeps the node's
+# template cache. One release per role: `space` and `space-builder`
+# (`--set node.role=builder -f values-builder.yaml`).
+
+image:
+  repository: space-worker
+  tag: local
+  pullPolicy: IfNotPresent
+
+datadogEnvironment: kind-local
+clusterId: kind-local
+telemetry: {}
+node: {}
+
+# On-node template cache LRU eviction. `GcConfig::from_env` reads these once at
+# template-manager start: an unset or zero budget means the loop spawns, logs
+# once and exits, so a bench without this block never exercises eviction at
+# all. Set here so `local.template_cache_lru_eviction_reclaims` proves the
+# production loop against a real worker, and so kind carries the same
+# steady-state behavior prod does: an unpinned, unreferenced build is reclaimed
+# once the node is over budget.
+#
+# The numbers are smoke-sized, not prod-sized, and that is deliberate. The seed
+# is ~462 MiB as a subvolume. Prefetch's latest-N pins that many release
+# digests per warmed template (binary default 5) and pinned bytes count toward
+# the budget without ever being reclaimable, so `prefetchLatestN` is rendered
+# here as 1: only the newest seed release stays pinned, and an older seed a
+# rebuilt bench left behind becomes reclaimable like any other stale build.
+# With that, a 1.5 GiB budget at the binary's 0.9 headroom targets ~1.35 GiB
+# (1,449,551,462 bytes): the pinned seed is far under target and a single
+# budget-sized build is over it by itself. Prefetch pins (`seed:latest`), the
+# active-sandbox set and warm-pool releases are never evicted, so the only
+# builds this reclaims on a worker are ones nothing references — e.g. an ECW
+# template build whose last sandbox was deleted more than `gcGraceSecs` ago,
+# which a later create re-pulls through the normal path. Grace sits exactly at
+# the binary's 60 s safety floor (below it the daemon warns at startup); the
+# floor exists because grace is the only guard for the create-vs-GC race, and
+# 60 s is already wide for a bench.
+#
+# WORKERS ONLY. values-builder.yaml sets this to null: build-manager registers
+# a build and then publishes it by reading the digest dir template-manager
+# just created, and a fresh build is unpinned and unreferenced — a 60 s grace
+# could delete it under the upload. Builder cleanup needs a grace period long
+# enough for publication, or an explicit prune after publishing.
+#
+# A change here rolls template-manager only; the sandboxes on the node keep
+# running.
+templateCache:
+  budgetBytes: "1610612736"
+  gcIntervalSecs: "15"
+  gcGraceSecs: "60"
+  prefetchLatestN: "1"
+
+# template-manager drains for 25 s, then exits while holding its service mutex
+# if work is still running (crates/libs/template/mgr/src/run.rs); the shared
+# lifecycle default grace (crates/libs/common/svc/src/lifecycle.rs).
+terminationGracePeriodSeconds: 60
+
+# Kind sizing: requests only (see space-node-manager-local/values.yaml).
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi

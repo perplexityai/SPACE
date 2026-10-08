@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Guards for the kind node-stack chart's known-egress block.
+"""Guards for the kind sandbox-manager chart's known-egress block.
 
 sandbox-manager reads `SPACE_NET_GATEWAY_KNOWN_EGRESS_DOMAINS` to decide
 which failed DNS or TCP connections net-gateway reports. The Rust side is
@@ -19,21 +19,21 @@ import unittest
 
 import yaml
 
-from kind_chart_render import NODE_STACK_CHART, env_by_name, object_named, render
+from kind_chart_render import SANDBOX_MANAGER_CHART, env_by_name, object_named, render
 
 RELEASE = "space"
 DOMAINS_ENV = "SPACE_NET_GATEWAY_KNOWN_EGRESS_DOMAINS"
 
 
-def node_stack_env(*extra: str) -> dict[str, dict]:
-    documents = render(NODE_STACK_CHART, RELEASE, *extra)
-    return env_by_name(object_named(documents, "DaemonSet", f"{RELEASE}-node-stack"))
+def sandbox_manager_env(*extra: str) -> dict[str, dict]:
+    documents = render(SANDBOX_MANAGER_CHART, RELEASE, *extra)
+    return env_by_name(object_named(documents, "DaemonSet", f"{RELEASE}-sandbox-manager"))
 
 
 def refusal(*extra: str) -> str:
     """The stderr of a render the chart is expected to fail."""
     try:
-        render(NODE_STACK_CHART, RELEASE, *extra)
+        render(SANDBOX_MANAGER_CHART, RELEASE, *extra)
     except subprocess.CalledProcessError as error:
         return error.stderr
     raise AssertionError(f"render with {extra} succeeded; the chart should refuse it")
@@ -47,9 +47,9 @@ class KnownEgressDefaultsTests(unittest.TestCase):
         one deployment's hostnames to every kind bench and every public
         consumer of the chart. Filling it in has to fail this test.
         """
-        values = yaml.safe_load((NODE_STACK_CHART / "values.yaml").read_text())
+        values = yaml.safe_load((SANDBOX_MANAGER_CHART / "values.yaml").read_text())
         self.assertEqual(values["knownEgress"]["domains"], "")
-        self.assertNotIn(DOMAINS_ENV, node_stack_env())
+        self.assertNotIn(DOMAINS_ENV, sandbox_manager_env())
 
     def test_a_nulled_map_takes_the_default_rather_than_failing(self) -> None:
         """`knownEgress: null` is "unset", not a misconfiguration.
@@ -57,13 +57,13 @@ class KnownEgressDefaultsTests(unittest.TestCase):
         Helm's coalescing deletes the key, so this is the one case that reaches
         the template's own fallback.
         """
-        env = node_stack_env("--set", "knownEgress=null")
+        env = sandbox_manager_env("--set", "knownEgress=null")
         self.assertNotIn(DOMAINS_ENV, env)
 
 
 class KnownEgressRenderingTests(unittest.TestCase):
     def test_master_on_with_a_local_list_renders_both(self) -> None:
-        env = node_stack_env(
+        env = sandbox_manager_env(
             "--set", r"knownEgress.domains=a.example.test\,b.example.test"
         )
         self.assertEqual(env[DOMAINS_ENV]["value"], "a.example.test,b.example.test")

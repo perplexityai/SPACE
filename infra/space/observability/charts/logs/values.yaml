@@ -24,10 +24,12 @@ collection:
   podTargets:
     - {path: "/var/log/pods/space_*/*/*.log", namespace: space}
   # Literal CRI source identity, independent of the indexed namespace label.
-  # List every builder release; a node-stack pod is <release>-node-stack-<suffix>.
-  # These exclusions apply to every podTargets glob, before files are tailed.
+  # List every builder release; a build-manager pod is
+  # <release>-build-manager-<suffix>, and its container logs recipe command
+  # output. These exclusions apply to every podTargets glob, before files are
+  # tailed.
   excludedPodSources:
-    - {namespace: space, podNamePrefix: space-builder-node-stack-, container: node-stack}
+    - {namespace: space, podNamePrefix: space-builder-build-manager-, container: build-manager}
   journal:
     enabled: true
     # Kind keeps a volatile journal at /run/log/journal; persistent hosts use

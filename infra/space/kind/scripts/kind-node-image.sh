@@ -13,9 +13,7 @@
 #   ensure   make the reference available locally: use a local image with that
 #            tag, else pull it from GHCR, else build it. Main CI publishes each
 #            new tag, so a registry miss (a tag main has not published yet, or
-#            no access) costs a local build, never a failed bring-up. Also tags
-#            space-kind-node:local, the name static configs use
-#            (kind-cluster-3486.yaml).
+#            no access) costs a local build, never a failed bring-up.
 #   build    build the reference locally, whatever is present
 #   publish  push the reference to GHCR unless it is already there (main CI)
 #
@@ -29,7 +27,6 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../../../.." && pwd)"
 REPOSITORY="${SPACE_KIND_NODE_IMAGE_REPOSITORY:-ghcr.io/perplexityai/space-kind-node}"
-LOCAL_ALIAS="space-kind-node:local"
 SOURCE_URL="https://github.com/perplexityai/SPACE"
 DOCKERFILE=infra/space/kind/node/Dockerfile
 # Everything the Dockerfile copies, and the Dockerfile itself. A new COPY has to
@@ -42,6 +39,7 @@ INPUTS=(
   infra/space/kind/node/systemd/space-cache.service
   infra/space/kind/node/systemd/space-cgroup.service
   infra/space/kind/node/systemd/space-kind-devices.service
+  infra/space/kind/node/systemd/space-kind-vsock-jails.service
   infra/space/kind/node/systemd/space-layout.service
   infra/space/kind/node/systemd/space-loop-nodes.service
   infra/space/identity/node-identities.sh
@@ -125,7 +123,6 @@ ensure() {
       build_local
     fi
   fi
-  docker tag "${ref}" "${LOCAL_ALIAS}"
   printf '%s\n' "${ref}"
 }
 

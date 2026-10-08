@@ -15,7 +15,7 @@ from space_smoke.runtime import CommandResult
 
 SID = "00000000-0000-4000-8000-000000000001"
 NODE = "space-local-worker2"
-POD = "space-node-stack-abcde"
+POD = "space-sandbox-manager-abcde"
 ARGV = ("kubectl",)
 
 # Synthetic response retaining the retryable gRPC status and error text.
@@ -33,14 +33,14 @@ def _reclaim(*results: CommandResult, budget: float) -> tuple[str | None, list[s
     harness = KindHarness(mock.Mock(), KindConfig())
     scripts: list[str] = []
 
-    def execute(_pod: str, script: str, *, timeout: float) -> CommandResult:
+    def execute(_node: str, script: str, *, timeout: float) -> CommandResult:
         scripts.append(script)
         return outcomes.pop(0)
 
     outcomes = list(results)
     with (
-        mock.patch.object(harness, "ready_worker_node_stack_pod", return_value=POD),
-        mock.patch.object(harness, "_node_stack_exec", side_effect=execute),
+        mock.patch.object(harness, "ready_node_service_pod", return_value=POD),
+        mock.patch.object(harness, "_node_shell_exec", side_effect=execute),
         mock.patch("space_smoke.adapters.time.sleep"),
     ):
         failure = harness._reclaim_local_sandbox_on(NODE, SID, time.monotonic() + budget)

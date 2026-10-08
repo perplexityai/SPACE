@@ -17,16 +17,16 @@ one episode starving another. Every episode legitimately makes no progress
 with backoff; the suite reads the `RetryScheduled` no-progress records out of
 the sandbox-manager log and judges the cadence with `judge_cadence`.
 
-The log is pod-local, so the worker's node-stack pod is pinned by uid and a
-replacement mid-run is a refusal to judge, not a verdict. Cleanup retires each
+The log lives and dies with the worker's sandbox-manager pod, so that pod is
+pinned by uid and a replacement mid-run is a refusal to judge, not a verdict. Cleanup retires each
 induced row through the production on-node path (`space-sbxmgr delete`) before
 removing the directory; leaving either would quarantine-poison the next smoke.
 
 Not ported, recorded in the coverage map with the shell suite's reasoning: a
 sandbox that actually recovers (no writer in the tree produces the bookkeeping
 state that makes a failed restore automatically recoverable) and backoff
-durability across a service restart (the pod starts its services without a
-supervisor and the log dies with the pod).
+durability across a service restart (the log the cadence is read from dies with
+the sandbox-manager pod).
 """
 
 from __future__ import annotations
@@ -107,6 +107,7 @@ class QuarantineRecoveryAssertions:
         self._fixture = fixture
         self._control = control
         self._scope = scope
+        self._node: str | None = None
         self._pod: str | None = None
         self._pod_uid: str | None = None
         self._orphans: list[str] = []
@@ -122,9 +123,12 @@ class QuarantineRecoveryAssertions:
         still retired at scope end.
         """
 
-        pod, uid = self._control.node_stack_pod_for_sandbox(self._fixture.sandbox.sandbox_id)
-        self._pod, self._pod_uid = pod, uid
-        self._fixture.record("node_stack_pod", pod)
+        node, pod, uid = self._control.sandbox_manager_for_sandbox(
+            self._fixture.sandbox.sandbox_id
+        )
+        self._node, self._pod, self._pod_uid = node, pod, uid
+        self._fixture.record("worker_node", node)
+        self._fixture.record("sandbox_manager_pod", pod)
         for _ in range(count):
             orphan = str(uuid.uuid4())
             self._removals.append(
@@ -134,7 +138,7 @@ class QuarantineRecoveryAssertions:
                     critical=True,
                 )
             )
-            self._control.plant_orphan_staging(pod, orphan)
+            self._control.plant_orphan_staging(node, orphan)
             self._orphans.append(orphan)
         self._fixture.record("induced_orphans", list(self._orphans))
         self._assert_same_pod()
@@ -212,7 +216,7 @@ class QuarantineRecoveryAssertions:
         removals, self._removals = self._removals, []
         for compensation in removals:
             compensation.release()
-        residue = [o for o in self._orphans if self._pod and not self._control.orphan_absent(self._pod, o)]
+        residue = [o for o in self._orphans if self._node and not self._control.orphan_absent(self._node, o)]
         self._fixture.verify(
             not residue,
             "an induced sandbox directory survived its retirement",
@@ -220,8 +224,9 @@ class QuarantineRecoveryAssertions:
         )
 
     def _remove(self, orphan: str) -> None:
-        pod = self._require_pod()
-        self._control.remove_orphan_sandbox(pod, orphan)
+        self._require_pod()
+        assert self._node is not None
+        self._control.remove_orphan_sandbox(self._node, orphan)
 
     def _require_pod(self) -> str:
         if self._pod is None:
@@ -230,11 +235,11 @@ class QuarantineRecoveryAssertions:
 
     def _assert_same_pod(self) -> None:
         pod = self._require_pod()
-        current = self._control.node_stack_pod_uid(pod)
+        current = self._control.pod_uid(pod)
         self._fixture.verify(
             current == self._pod_uid,
-            "the node-stack pod was replaced mid-run; the induced state and its log live in "
-            "that pod, so this run cannot be judged — re-run once the stack has settled",
+            "the sandbox-manager pod was replaced mid-run; the log the cadence is read from "
+            "lives in that pod, so this run cannot be judged — re-run once it has settled",
             pod=pod,
             uid_before=self._pod_uid,
             uid_now=current,

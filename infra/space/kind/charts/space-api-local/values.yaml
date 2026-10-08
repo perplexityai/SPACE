@@ -51,26 +51,14 @@ postgres:
   bootstrapReadOnlyPassword: space-dev-ro
   bootstrapMigratorPassword: space-dev-migrator
 
-# K8s control-plane substrate. Setting SPACE_K8S_CONTROL_PLANE=true switches
-# the api-server from DirectSubstrate to KubernetesSubstrate so it discovers
-# workers via the Pod reflector (watching pods with label
-# app.kubernetes.io/component=node-api) and so cluster-controller can run
-# alongside materializing per-sandbox pods.
-#
-# Enabled by default. The space-node-stack DaemonSet
-# carries the component=node-api label so the reflector finds each worker;
-# per-sandbox pods are pause containers hijacked by containerd-shim-space-v2
-# into real Firecracker sandboxes (install-shim.sh wires the shim into each
-# sandbox worker's containerd).
-#
-# DirectSubstrate (`enabled: false`) is the single-worker / no-cluster-controller
-# bench used by the space-local-3486 cluster + Tilt MINIMAL mode. In that
-# path the api-server dials the worker node-api directly via the
-# space-worker-node-api Service, placement flows through the Postgres node
-# tables (nodes/node_direct/node_status_snapshots/node_template_inventory),
-# and no per-sandbox pods are created.
+# K8s control-plane substrate. SPACE_K8S_CONTROL_PLANE=true runs the
+# api-server on the KubernetesSubstrate: it discovers nodes through the Pod
+# reflector (watching pods with label app.kubernetes.io/component=node-api, the
+# space-node-api-local DaemonSets), and cluster-controller materializes
+# per-sandbox pods, pause containers hijacked by containerd-shim-space-v2 into
+# real Firecracker sandboxes (install-shim.sh wires the shim into each sandbox
+# worker's containerd).
 k8s:
-  enabled: true
   # Namespace where per-sandbox pause pods are created and where the
   # KubernetesSubstrate's pod reflector watches.
   sandboxNamespace: space

@@ -1,0 +1,27 @@
+# Kind-only. A root shell on every sandbox worker and builder, standing in for
+# the operator's shell on a production node host: the node-local CLIs
+# (space-sbxmgr, space-tmplmgr, space-rtmgr, space-volmgr), btrfs, dmsetup,
+# cryptsetup and ctr against the node's /space and containerd. The smoke
+# harness's on-node checks and fault injection run here
+# (space_smoke/adapters.py), so no service container needs a tool, an
+# identity or a privilege its own code does not.
+#
+# Not a SPACE service: it serves nothing, holds no ServiceAccount token, and
+# carries no app.kubernetes.io/component label the API's reflector or the
+# cluster-controller's node-service readiness would read.
+
+# The production worker image: the same CLIs and system tools the services
+# use.
+image:
+  repository: space-worker
+  tag: local
+  pullPolicy: IfNotPresent
+
+pools:
+  - sandbox
+  - builder
+
+resources:
+  requests:
+    cpu: 10m
+    memory: 16Mi

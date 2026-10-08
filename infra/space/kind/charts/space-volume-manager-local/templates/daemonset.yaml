@@ -1,0 +1,75 @@
+{{- $ctx := dict "ctx" . "component" "volume-manager" -}}
+{{- include "space-node-service.serviceAccount" $ctx }}
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "space-node-service.name" $ctx }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "space-node-service.labels" $ctx | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "space-node-service.selectorLabels" $ctx | nindent 6 }}
+  # Surge: volume-manager holds /space/run/volume-manager/service.mutex; the
+  # successor stays ready while passive, migrates only once it holds the lock
+  # and re-queues the persisted jobs its predecessor did not finish
+  # (crates/libs/vol/mgr/server/src/run.rs). An identity change would need
+  # delete-first instead (docs/installation.md, "Separating volume-manager's
+  # credential identity"); this chart keeps the legacy identity.
+  {{- include "space-node-service.updateStrategy" (dict "strategy" "surge") | nindent 2 }}
+  template:
+    metadata:
+      annotations:
+        {{- include "space-node-service.podAnnotations" $ctx | nindent 8 }}
+      labels:
+        {{- include "space-node-service.labels" $ctx | nindent 8 }}
+    spec:
+      {{- include "space-node-service.nodeSelector" $ctx | nindent 6 }}
+      serviceAccountName: {{ include "space-node-service.name" $ctx }}
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds | int }}
+      # The legacy volume-manager identity: space-sbxmgr (UID 950) with
+      # SPACE_VOLUME_MANAGER_GROUPS, using the standard credential socket. The
+      # separate space-volmgr account (UID 964) is a documented migration that
+      # needs credential-manager's --volume-socket and a retained-state
+      # handoff (docs/installation.md); it is not the shape described as
+      # running today.
+      securityContext:
+        {{- include "space-node-service.runAs" (dict "ctx" . "user" "SPACE_SBXMGR" "groups" "SPACE_VOLUME_MANAGER_GROUPS") | nindent 8 }}
+      initContainers:
+        # sandbox-manager and template-manager reach the socket through
+        # space-sbxclients (crates/libs/vol/mgr/server/src/run.rs).
+        {{- include "space-node-service.prepareRunDir" (dict "ctx" . "path" "/space/run/volume-manager" "mode" "0750"
+            "uid" (include "space-node-service.identityNumber" (dict "ctx" . "name" "SPACE_SBXMGR_UID"))
+            "gid" (include "space-node-service.groupId" (dict "ctx" . "name" "space-sbxclients"))) | nindent 8 }}
+      containers:
+        - name: volume-manager
+          {{- include "space-node-service.image" . | nindent 10 }}
+          command:
+            - /opt/space/bin/space-volmgr-svc
+            - --health-socket={{ include "space-node-service.healthSocket" $ctx }}
+          # File transfers only: no mounts, devices or ownership changes in
+          # the service path (crates/libs/vol/mgr/server/src/{executor,staging}.rs).
+          {{- include "space-node-service.restrictedContainer" . | nindent 10 }}
+          env:
+            {{- include "space-node-service.env.identity" . | nindent 12 }}
+            {{- include "space-node-service.env.diskAdmission" . | nindent 12 }}
+            # Static object-store credentials instead of credential-manager's
+            # token exchange (the local escape hatch,
+            # crates/libs/vol/mgr/server/src/run.rs).
+            {{- include "space-node-service.env.objectStoreCredentials" . | nindent 12 }}
+          {{- include "space-node-service.probes" $ctx | nindent 10 }}
+          volumeMounts:
+            {{- include "space-node-service.mount.run" . | nindent 12 }}
+            {{- include "space-node-service.mount.cache" (dict) | nindent 12 }}
+            {{- include "space-node-service.mount.private" . | nindent 12 }}
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+      volumes:
+        {{- include "space-node-service.volume.run" . | nindent 8 }}
+        {{- include "space-node-service.volume.cache" . | nindent 8 }}
+        {{- include "space-node-service.volume.private" . | nindent 8 }}
