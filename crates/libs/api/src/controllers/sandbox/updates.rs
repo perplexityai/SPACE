@@ -1,5 +1,6 @@
 use super::*;
 use crate::controllers::db_contention_error;
+use crate::controllers::substrate::RuntimeRpcError;
 use pplx_space_common_core::sql;
 use pplx_space_common_core::types::{ExecutionGeneration, SandboxId};
 use pplx_space_common_svc::types::ReconcileReason;
@@ -741,13 +742,18 @@ impl SandboxController {
                 // Missing published identity does not prove the runtime is absent.
                 // Read its current generation; the mutation's generation fence
                 // rejects a replacement between this read and the write.
-                let mut request =
-                    tonic::Request::new(pplx_space_sbx_mgr_client::proto::StateRequest {
-                        sandbox_ids: vec![sandbox_id.to_string()],
-                    });
-                request
-                    .set_timeout(deadline.saturating_duration_since(tokio::time::Instant::now()));
-                let response = client.sandbox_state(request).await?;
+                let request = tonic::Request::new(pplx_space_sbx_mgr_client::proto::StateRequest {
+                    sandbox_ids: vec![sandbox_id.to_string()],
+                });
+                let response = client
+                    .call(
+                        &self.substrate,
+                        sandbox_id,
+                        deadline,
+                        request,
+                        |mut client, request| async move { client.sandbox_state(request).await },
+                    )
+                    .await?;
                 observed_access_idle_generation(sandbox_id, response.into_inner())?.get()
             }
         };
@@ -756,48 +762,36 @@ impl SandboxController {
 
     async fn send_access_idle_deadline(
         &self,
-        client: RuntimeClient,
+        mut client: RuntimeClient,
         sandbox_id: SandboxId,
         generation: i64,
         observed_at: prost_types::Timestamp,
         deadline: tokio::time::Instant,
         operation: AccessIdleOperation,
     ) -> Result<(), ControllerError> {
-        let attempt = |mut client: RuntimeClient| {
-            let operation = operation.clone();
-            async move {
-                let request = access_idle_deadline_request(
+        let request = access_idle_deadline_request(
+            sandbox_id,
+            generation,
+            observed_at,
+            deadline,
+            operation.clone(),
+        )?;
+        let response =
+            client
+                .call(
+                    &self.substrate,
                     sandbox_id,
-                    generation,
-                    observed_at,
                     deadline,
-                    operation,
-                )?;
-                Ok::<_, ControllerError>(client.touch_sandbox_auto_lifecycle(request).await)
-            }
-        };
-        let mut response = attempt(client).await?;
-        if let Err(status) = &response
-            && classify_access_idle_send_failure(status) == AccessIdleSendFailure::Untransmitted
-        {
-            // A restarting worker drops the pooled connection, so the redial
-            // fails before any bytes are sent. That is replay-safe even for
-            // ResetPolicy; one fresh dial absorbs it within the same deadline.
-            tracing::debug!(
-                sandbox_id = %sandbox_id,
-                error = %status,
-                "access deadline update was not transmitted; retrying on a fresh runtime client"
-            );
-            let client = self
-                .substrate
-                .probe_runtime_client(sandbox_id)
-                .await?
-                .ok_or_else(unconfirmed_access_idle_update)?;
-            response = attempt(client).await?;
-        }
+                    request,
+                    |mut client, request| async move {
+                        client.touch_sandbox_auto_lifecycle(request).await
+                    },
+                )
+                .await;
         let status = match response {
             Ok(response) => return require_access_idle_update_acknowledgement(response),
-            Err(status) => status,
+            Err(RuntimeRpcError::Rpc(status)) => status,
+            Err(RuntimeRpcError::Client(error)) => return Err(error),
         };
         match classify_access_idle_send_failure(&status) {
             AccessIdleSendFailure::Rejected => Err(status.into()),
@@ -842,11 +836,19 @@ impl SandboxController {
                 return Ok(false);
             }
         };
-        let mut request = tonic::Request::new(pplx_space_sbx_mgr_client::proto::StateRequest {
+        let request = tonic::Request::new(pplx_space_sbx_mgr_client::proto::StateRequest {
             sandbox_ids: vec![sandbox_id.to_string()],
         });
-        request.set_timeout(deadline.saturating_duration_since(tokio::time::Instant::now()));
-        match client.sandbox_state(request).await {
+        match client
+            .call(
+                &self.substrate,
+                sandbox_id,
+                deadline,
+                request,
+                |mut client, request| async move { client.sandbox_state(request).await },
+            )
+            .await
+        {
             Ok(response) => access_idle_update_observed(
                 sandbox_id,
                 generation,

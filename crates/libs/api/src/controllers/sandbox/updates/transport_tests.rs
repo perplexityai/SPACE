@@ -343,6 +343,22 @@ async fn untransmitted_update_is_replayed_once_on_a_fresh_client() -> TestResult
         tokio::time::sleep(Duration::from_millis(100)).await;
         fixture.move_worker(worker.endpoint()).await?;
 
+        let mut reader = client.clone();
+        let state = reader
+            .call(
+                &fixture.controller.substrate,
+                fixture.sandbox,
+                tokio::time::Instant::now() + Duration::from_secs(10),
+                tonic::Request::new(pplx_space_sbx_mgr_client::proto::StateRequest {
+                    sandbox_ids: vec![fixture.sandbox.to_string()],
+                }),
+                |mut client, request| async move { client.sandbox_state(request).await },
+            )
+            .await?
+            .into_inner();
+        assert_eq!(state.sandboxes.len(), 1);
+        assert_eq!(state.sandboxes[0].execution_generation, Some(GENERATION));
+
         fixture
             .send(client, operation.clone())
             .await

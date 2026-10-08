@@ -1,7 +1,10 @@
 pub mod direct;
 #[cfg(feature = "kubernetes")]
 pub mod kubernetes;
+mod runtime_rpc;
 mod worker_channels;
+
+pub(crate) use runtime_rpc::RuntimeRpcError;
 
 #[cfg(feature = "kubernetes")]
 pub use kubernetes::ReflectorReady;
