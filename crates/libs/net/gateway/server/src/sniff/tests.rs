@@ -112,7 +112,7 @@ async fn a_late_client_hello_is_seen_only_when_its_absence_would_be_denied() {
         let hello = crate::tls_sni::test_fixtures::client_hello(Some("late.example.com"));
         let observation = with_loopback_pair(
             move |mut client| async move {
-                // Past the 50 ms budget, within one retransmit's.
+                // Past the 50 ms budget, well within the fail-closed one.
                 tokio::time::sleep(Duration::from_millis(150)).await;
                 let _ = client.write_all(&hello).await;
                 tokio::time::sleep(Duration::from_millis(100)).await;
@@ -150,7 +150,7 @@ async fn the_completion_budget_starts_with_the_first_handshake_bytes() {
             // The record header lands after COMPLETION_DEADLINE has passed
             // since the accept; the rest follows well within the budget
             // counted from the header.
-            tokio::time::sleep(Duration::from_millis(300)).await;
+            tokio::time::sleep(COMPLETION_DEADLINE + Duration::from_millis(200)).await;
             client.write_all(&head).await.unwrap();
             client.flush().await.unwrap();
             tokio::time::sleep(Duration::from_millis(30)).await;
@@ -171,10 +171,36 @@ async fn the_completion_budget_starts_with_the_first_handshake_bytes() {
 }
 
 #[tokio::test]
+async fn a_client_hello_later_than_500ms_is_seen_when_its_absence_would_be_denied() {
+    use tokio::io::AsyncWriteExt;
+
+    let hello = crate::tls_sni::test_fixtures::client_hello(Some("slow.example.com"));
+    let observation = with_loopback_pair(
+        move |mut client| async move {
+            // Later than the previous 500 ms fail-closed budget, as seen from
+            // legitimate clients in production.
+            tokio::time::sleep(Duration::from_millis(800)).await;
+            client.write_all(&hello).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        },
+        |server| async move { client_hello_with_detail(&server, MissingClientHello::Denied).await },
+    )
+    .await;
+
+    assert_eq!(
+        observation
+            .scan
+            .server_name()
+            .map(|name| name.as_str().to_string()),
+        Some("slow.example.com".to_string())
+    );
+}
+
+#[tokio::test]
 async fn a_client_that_never_writes_still_times_out_under_the_fail_closed_budget() {
     let observation = with_loopback_pair(
         |client| async move {
-            tokio::time::sleep(Duration::from_millis(700)).await;
+            tokio::time::sleep(FAIL_CLOSED_FIRST_BYTES_TIMEOUT + Duration::from_millis(200)).await;
             drop(client);
         },
         |server| async move { client_hello_with_detail(&server, MissingClientHello::Denied).await },
