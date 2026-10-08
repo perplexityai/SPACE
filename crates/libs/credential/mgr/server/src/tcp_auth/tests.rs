@@ -2,60 +2,61 @@ use super::*;
 use crate::auth::ClientService;
 
 #[tokio::test]
-async fn cached_token_is_reauthorized_for_each_transport_peer() {
+async fn every_service_rechecks_transport_peer_on_cached_tokens() {
+    use crate::k8s_identity::tests::{caller_reviewer, registered_node_db, test_identity};
     use std::sync::atomic::Ordering;
     use tonic::transport::server::TcpConnectInfo;
     use tower::ServiceExt;
-    let db = crate::k8s_identity::tests::registered_node_db()
-        .await
-        .unwrap();
-    let (reviewer, reviews) = crate::k8s_identity::tests::caller_reviewer(
-        ClientService::NodeCredentialAgent,
-        Some(db.pool.clone()),
-    );
-    let layer = CredmgrTcpAuthLayer {
-        authenticator: Arc::new(Authenticator::ProjectedToken(Box::new(reviewer))),
-    };
-    let inner = tower::service_fn(|req: http::Request<()>| async move {
-        let caller = req.extensions().get::<TcpCallerIdentity>().unwrap();
-        assert!(matches!(caller, TcpCallerIdentity::K8sJwt(identity)
-            if identity.service() == ClientService::NodeCredentialAgent));
-        Ok::<_, std::convert::Infallible>(http::Response::new(
-            http_body_util::Empty::<bytes::Bytes>::new(),
-        ))
-    });
-    let service = layer.layer(inner);
-    // The same token, two source ports on its real pod, then a stolen-token
-    // caller at another IP. A forwarding header cannot impersonate the peer.
-    for (peer, accepted) in [
-        ("10.0.0.2:1234", true),
-        ("[::ffff:10.0.0.2]:4567", true),
-        ("10.0.0.99:1234", false),
-    ] {
-        let mut request = http::Request::builder()
-            .uri(crate::intermediate_ca::ISSUE_INTERMEDIATE_METHOD_PATH)
-            .header("authorization", "Bearer header.payload.signature")
-            .header("x-forwarded-for", "10.0.0.2")
-            .body(())
-            .unwrap();
-        request.extensions_mut().insert(TcpConnectInfo {
-            local_addr: None,
-            remote_addr: Some(peer.parse().unwrap()),
-        });
-        let result = service.clone().oneshot(request).await;
-        if accepted {
-            assert!(result.is_ok());
-        } else {
-            let status = Status::from_error(result.unwrap_err());
-            assert_eq!(status.code(), tonic::Code::PermissionDenied);
-            assert_eq!(status.message(), "peer_ip_mismatch");
+    let (db, _) = registered_node_db().await.unwrap();
+    for service in ClientService::ALL {
+        for (mode, enforce) in [("observe", false), ("enforce", true)] {
+            let (reviewer, reviews) = caller_reviewer(service, Some(db.pool.clone()), Some(mode));
+            let layer = CredmgrTcpAuthLayer {
+                authenticator: Arc::new(Authenticator::ProjectedToken(Box::new(reviewer))),
+            };
+            let inner = tower::service_fn(move |req: http::Request<()>| async move {
+                assert_eq!(
+                    req.extensions().get::<TcpCallerIdentity>(),
+                    Some(&TcpCallerIdentity::K8sJwt(test_identity(service)))
+                );
+                let body = http_body_util::Empty::<bytes::Bytes>::new();
+                Ok::<_, std::convert::Infallible>(http::Response::new(body))
+            });
+            let authenticated = layer.layer(inner);
+            for (peer, failure) in [
+                (Some("10.0.0.2:1234"), None),
+                (Some("[::ffff:10.0.0.2]:4567"), None),
+                (Some("[2001:db8::2]:1234"), None),
+                (Some("10.0.0.99:1234"), Some("peer_ip_mismatch")),
+                (None, Some("peer_address_missing")),
+            ] {
+                let mut request = http::Request::builder()
+                    .uri(crate::intermediate_ca::ISSUE_INTERMEDIATE_METHOD_PATH)
+                    .header("authorization", "Bearer header.payload.signature")
+                    .header("x-forwarded-for", "10.0.0.2")
+                    .body(())
+                    .unwrap();
+                request.extensions_mut().insert(TcpConnectInfo {
+                    local_addr: None,
+                    remote_addr: peer.map(|peer| peer.parse().unwrap()),
+                });
+                let result = authenticated.clone().oneshot(request).await;
+                match failure.filter(|_| enforce) {
+                    None => assert!(result.is_ok(), "{service}: {peer:?}"),
+                    Some(reason) => {
+                        let error = Status::from_error(result.unwrap_err());
+                        assert_eq!(error.code(), tonic::Code::PermissionDenied, "{service}");
+                        assert_eq!(error.message(), reason, "{service}");
+                    }
+                }
+            }
+            assert_eq!(
+                reviews.load(Ordering::SeqCst),
+                1,
+                "{service}: one cached TokenReview"
+            );
         }
     }
-    assert_eq!(
-        reviews.load(Ordering::SeqCst),
-        1,
-        "all requests share one cached TokenReview"
-    );
 }
 
 #[test]

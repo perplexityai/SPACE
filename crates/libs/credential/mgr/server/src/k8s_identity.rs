@@ -47,8 +47,10 @@ use tonic::Status;
 
 use pplx_space_common_core::types::{PodName, PodUid};
 
+use self::store::registered_node;
 use crate::auth::{ClientService, K8sIdentity, K8sNodeIdentity};
-use crate::credential_store::registered_node;
+
+mod store;
 
 const SPACE_CREDMGR_K8S_AUTH_ENABLED_ENV: &str = "SPACE_CREDMGR_K8S_AUTH_ENABLED";
 const SPACE_CREDMGR_K8S_AUTH_NAMESPACE_ENV: &str = "SPACE_CREDMGR_K8S_AUTH_NAMESPACE";
@@ -173,7 +175,7 @@ impl K8sAuthConfig {
     }
 }
 
-const MODE_ENV: &str = "SPACE_CREDMGR_AGENT_AUTHZ_MODE";
+const MODE_ENV: &str = "SPACE_CREDMGR_POD_AUTHORIZATION_MODE";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum PodAuthorizationMode {
@@ -418,7 +420,7 @@ impl CredmgrTokenReviewer {
             (Err(_), PodAuthorizationMode::Observe) => "would_deny",
             (Err(_), PodAuthorizationMode::Enforce) => "deny",
         };
-        pplx_space_metrics::credmgr::agent_authz(check, result_tag, mode.as_str());
+        pplx_space_metrics::credmgr::pod_authorization(check, result_tag, mode.as_str());
         if let Err(error) = result {
             tracing::warn!(check, result = result_tag, %mode,
                 reason = error.message(), pod_uid = %caller.pod().pod_uid(),

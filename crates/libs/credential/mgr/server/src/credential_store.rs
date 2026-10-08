@@ -1,7 +1,7 @@
-//! Read-only credential authorization lookups. Runs as the read-only
+//! Direct Postgres reads for sandbox-owner resolution. Runs as the read-only
 //! `space_credmgr` role.
 
-use pplx_space_common_core::types::{K8sNodeName, K8sNodeUid, NodeId, OrgId, SandboxId, UserId};
+use pplx_space_common_core::types::{OrgId, SandboxId, UserId};
 
 use pplx_space_common_svc::sql;
 
@@ -23,7 +23,7 @@ pub enum CredentialStoreError {
     Query(#[from] sqlx::Error),
 }
 
-/// Credential authorization lookups. A trait so handlers can be exercised without a
+/// Sandbox-owner lookup. A trait so the handlers can be exercised without a
 /// live Postgres.
 #[tonic::async_trait]
 pub trait CredentialStore: Send + Sync + 'static {
@@ -43,22 +43,6 @@ impl PgCredentialStore {
     pub fn new(pool: sqlx::PgPool) -> Self {
         Self { pool }
     }
-}
-
-/// Require both name and UID; a registration without a UID cannot match.
-pub(crate) async fn registered_node(
-    executor: impl sqlx::PgExecutor<'_>,
-    name: &K8sNodeName,
-    uid: &K8sNodeUid,
-) -> Result<Option<NodeId>, CredentialStoreError> {
-    Ok(sqlx::query_scalar(sql!(
-        "SELECT node_id FROM node_k8s
-         WHERE k8s_node_name = $1 AND k8s_node_uid = $2 AND k8s_node_uid IS NOT NULL"
-    ))
-    .bind(name.as_str())
-    .bind(uid.as_str())
-    .fetch_optional(executor)
-    .await?)
 }
 
 #[tonic::async_trait]
@@ -82,6 +66,3 @@ impl CredentialStore for PgCredentialStore {
         }))
     }
 }
-
-#[cfg(test)]
-mod tests;
