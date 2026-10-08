@@ -2284,6 +2284,81 @@ fn create_translation_maps_tls_interception_metadata() {
     }
 }
 
+#[test]
+fn create_translation_maps_tls_interception_exemptions_metadata() {
+    use pplx_space_net_common::EgressDefaultAction;
+
+    let destinations = json!([
+        {"domain": "relay.example.test"},
+        {"wildcard_domain": "*.relay.example.test"},
+        {"ip": "192.0.2.1"},
+        {"cidr": "198.51.100.0/24"},
+    ]);
+    let raw = destinations.to_string();
+    let cases = [
+        (Some("on"), true, raw.as_str(), Some(destinations.clone())),
+        (Some("off"), true, raw.as_str(), Some(destinations.clone())),
+        (None, true, raw.as_str(), Some(destinations.clone())),
+        (Some("on"), true, "[]", Some(json!([]))),
+        (None, false, "[]", Some(json!([]))),
+        (Some("on"), false, raw.as_str(), None),
+        (None, false, raw.as_str(), None),
+        (Some("on"), true, "not-json", None),
+        (Some("off"), true, "not-json", None),
+        (None, false, "not-json", None),
+        (Some("on"), true, "null", None),
+        (Some("on"), true, "{}", None),
+        (Some("on"), true, r#"[{"domain":"invalid domain"}]"#, None),
+        (Some("on"), true, r#"[{"unknown":"example.test"}]"#, None),
+    ];
+    for (marker, concrete_policy, exemptions, expected) in cases {
+        let mut request = base_create_request();
+        if concrete_policy {
+            request.allow_internet_access = Some(false);
+            request.network = Some(json!({"denyOut": ["203.0.113.0/24"]}));
+        }
+        if let Some(marker) = marker {
+            request
+                .metadata
+                .insert("network.tls_interception".to_string(), marker.to_string());
+        }
+        request.metadata.insert(
+            "network.tls_interception_exemptions".to_string(),
+            exemptions.to_string(),
+        );
+        match expected {
+            Some(expected) => {
+                let translated = translate_create_request(request).unwrap();
+                assert_eq!(
+                    translated
+                        .native
+                        .metadata
+                        .get("network.tls_interception_exemptions"),
+                    Some(&SandboxMetadataValue::String(exemptions.to_string())),
+                );
+                if concrete_policy {
+                    let policy = translated.native.network_policy.unwrap();
+                    assert_eq!(
+                        serde_json::to_value(policy.tls_interception_exemptions).unwrap(),
+                        expected
+                    );
+                    assert_eq!(policy.egress.default_action, EgressDefaultAction::Deny);
+                    assert_eq!(
+                        serde_json::to_value(policy.egress.deny).unwrap(),
+                        json!([{ "cidr": "203.0.113.0/24" }])
+                    );
+                } else {
+                    assert!(translated.native.network_policy.is_none());
+                }
+            }
+            None => assert_eq!(
+                translate_create_request(request).unwrap_err().status,
+                StatusCode::BAD_REQUEST,
+            ),
+        }
+    }
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn e2b_tls_interception_on_persists_and_reads_through_policy_api() -> TestResult {
     use pplx_space_net_common::{NetworkPolicyV1, TlsInterception};
@@ -2293,6 +2368,10 @@ async fn e2b_tls_interception_on_persists_and_reads_through_policy_api() -> Test
     request
         .metadata
         .insert("network.tls_interception".to_string(), "on".to_string());
+    request.metadata.insert(
+        "network.tls_interception_exemptions".to_string(),
+        r#"[{"wildcard_domain":"*.relay.example.test"}]"#.to_string(),
+    );
     let translated = translate_create_request(request)?;
     let policy = translated
         .native
@@ -2337,6 +2416,10 @@ async fn e2b_tls_interception_on_persists_and_reads_through_policy_api() -> Test
     let body = to_bytes(response.into_body(), usize::MAX).await?;
     let persisted: NetworkPolicyV1 = serde_json::from_slice(&body)?;
     assert_eq!(persisted.tls_interception, TlsInterception::On);
+    assert_eq!(
+        serde_json::to_value(persisted.tls_interception_exemptions)?,
+        json!([{ "wildcard_domain": "*.relay.example.test" }]),
+    );
     Ok(())
 }
 

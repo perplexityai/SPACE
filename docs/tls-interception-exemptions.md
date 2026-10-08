@@ -1,4 +1,36 @@
-# Deployment-configured TLS interception exemptions
+# TLS interception exemptions
+
+## Client-supplied exemptions
+
+Native clients set `NetworkPolicyV1.tls_interception_exemptions` directly. ECW
+clients can supply the same list as a JSON-encoded string in create metadata:
+
+```json
+{
+  "allowInternetAccess": true,
+  "metadata": {
+    "network.tls_interception": "on",
+    "network.tls_interception_exemptions": "[{\"wildcard_domain\":\"*.relay.example.test\"}]"
+  }
+}
+```
+
+The translator accepts all native `EgressDestinationV1` selectors (`domain`,
+`wildcard_domain`, `ip`, and `cidr`) with their native validation. Malformed JSON,
+non-array values, and invalid destinations return HTTP 400 even when interception
+is off. Omission or `[]` means no client exemptions. A nonempty list requires a
+concrete policy, selected via `allowInternetAccess` or network rules; it cannot be
+applied to an inherited template policy implicitly. Lists on a concrete policy
+are retained when interception is off, but have no additional effect then.
+
+Like `network.tls_interception`, this key remains in persisted metadata for ECW
+round-tripping. Connect/resume and timeout updates do not translate it or replace
+the saved network policy. Native network-policy updates replace the whole policy:
+callers must include every exemption they still need. Exemptions never add egress
+allows or override denies. The optional deployment fallback below still composes
+with client-supplied lists.
+
+## Deployment-configured fallback
 
 TLS interception currently terminates TLS and parses the decrypted stream as
 HTTP. Non-HTTP TLS protocols (for example TURN-over-TLS) can therefore receive

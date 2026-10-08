@@ -25,6 +25,7 @@ pub(super) struct CreateSandboxTranslation {
 
 pub(super) const ECW_FALCON_HEADER: &str = "x-space-falcon";
 const TLS_INTERCEPTION_METADATA_KEY: &str = "network.tls_interception";
+const TLS_INTERCEPTION_EXEMPTIONS_METADATA_KEY: &str = "network.tls_interception_exemptions";
 
 pub(super) fn falcon_us2_egress_requested(headers: &HeaderMap, federated: bool) -> bool {
     let Some(value) = headers.get(ECW_FALCON_HEADER) else {
@@ -71,7 +72,12 @@ pub(super) fn translate_create_request(
     let ignored_metadata = req
         .metadata
         .keys()
-        .filter(|key| !matches!(key.as_str(), "name" | TLS_INTERCEPTION_METADATA_KEY))
+        .filter(|key| {
+            !matches!(
+                key.as_str(),
+                "name" | TLS_INTERCEPTION_METADATA_KEY | TLS_INTERCEPTION_EXEMPTIONS_METADATA_KEY
+            )
+        })
         .cloned()
         .collect::<Vec<_>>();
     if !ignored_metadata.is_empty() {
@@ -88,6 +94,17 @@ pub(super) fn translate_create_request(
         .map_err(|error| E2bApiError::bad_request(format!("invalid template_id: {error}")))?;
     record_ecw_template_selector_request(&template);
     let tls_interception = parse_e2b_tls_interception(&req.metadata)?;
+    let tls_interception_exemptions = req
+        .metadata
+        .get(TLS_INTERCEPTION_EXEMPTIONS_METADATA_KEY)
+        .map(|raw| serde_json::from_str::<Vec<EgressDestinationV1>>(raw))
+        .transpose()
+        .map_err(|error| {
+            E2bApiError::bad_request(format!(
+                "invalid {TLS_INTERCEPTION_EXEMPTIONS_METADATA_KEY}: {error}"
+            ))
+        })?
+        .unwrap_or_default();
     let metadata = e2b_metadata_to_native(req.metadata);
     let timeout_secs = req.timeout.unwrap_or(ECW_DEFAULT_CREATE_TIMEOUT_SECS);
     let auto_pause = req.auto_pause.unwrap_or(false);
@@ -95,10 +112,18 @@ pub(super) fn translate_create_request(
     let auto_lifecycle = e2b_auto_lifecycle_policy(timeout_secs, auto_pause, auto_resume);
     let mut network_policy = resolve_e2b_network_policy(req.allow_internet_access, parsed_network)?;
     match network_policy.as_mut() {
-        Some(policy) => policy.tls_interception = tls_interception,
+        Some(policy) => {
+            policy.tls_interception = tls_interception;
+            policy.tls_interception_exemptions = tls_interception_exemptions;
+        }
         None if tls_interception == TlsInterception::On => {
             return Err(E2bApiError::bad_request(
                 "network.tls_interception=on requires a concrete network policy",
+            ));
+        }
+        None if !tls_interception_exemptions.is_empty() => {
+            return Err(E2bApiError::bad_request(
+                "network.tls_interception_exemptions requires a concrete network policy",
             ));
         }
         None => {}
