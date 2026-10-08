@@ -22,7 +22,7 @@
 //! Health and reflection paths bypass authentication so Kubernetes gRPC probes
 //! work without a credential.
 
-mod agent;
+mod credential_manager_pod_authorization;
 
 use std::future::Future;
 use std::pin::Pin;
@@ -36,7 +36,7 @@ use tower::{Layer, Service};
 use crate::auth::{ClientService, K8sIdentity};
 use crate::credential_store::CredentialStore;
 use crate::k8s_identity::{CredmgrTokenReviewer, K8sAuthConfig, K8sAuthConfigError};
-use agent::AgentAuth;
+use credential_manager_pod_authorization::AgentAuth;
 use tokio_util::sync::CancellationToken;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;

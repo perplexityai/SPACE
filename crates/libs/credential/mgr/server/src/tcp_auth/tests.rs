@@ -9,7 +9,7 @@ async fn cached_token_is_reauthorized_for_each_transport_peer() {
     let layer = CredmgrTcpAuthLayer {
         authenticator: Arc::new(Authenticator::ProjectedToken {
             reviewer,
-            agent: Box::new(super::agent::tests::authorizer()),
+            agent: Box::new(super::credential_manager_pod_authorization::tests::authorizer()),
         }),
     };
     let inner = tower::service_fn(|req: http::Request<()>| async move {
