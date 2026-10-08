@@ -240,6 +240,20 @@ spec:
               value: {{ .Values.k8s.sandboxNodeSelectorValue | quote }}
             - name: SPACE_INTERNAL_SECRET_NAME
               value: {{ .Values.internal.secretName | quote }}
+            # The ingress activation listener's Cluster bearer surface
+            # (ingress_activation::server; docs/internal-rpc-tls.md, "Ingress
+            # activation delegation"): TokenReview with audience
+            # space-cluster-api, no static fallback, and only the route
+            # resolvers that have already authorized the request. No other
+            # api surface reads these settings.
+            - name: SPACE_K8S_TOKEN_AUTH_ENABLED
+              value: "true"
+            - name: SPACE_K8S_TOKEN_AUTH_NAMESPACE
+              value: {{ .Release.Namespace | quote }}
+            - name: SPACE_K8S_TOKEN_AUTH_STATIC_FALLBACK_ENABLED
+              value: "false"
+            - name: SPACE_CLUSTER_API_AUTH_ALLOWED_SERVICE_ACCOUNTS
+              value: {{ join "," .Values.ingressActivation.allowedServiceAccounts | quote }}
           ports:
             - name: activation
               containerPort: 9801

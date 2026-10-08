@@ -959,7 +959,11 @@ stays in the Kind-only `space-internal-rpc-ca-signing` Secret, which no workload
 mounts. The script restarts a listener whose identity it reissued, and every
 workload if the CA itself changed, because neither reloads them while running.
 TLS here is server-authenticated: bearer tokens still authorize callers, and
-internal-api's node-address check is unchanged.
+internal-api's node-address check is unchanged. The api's ingress activation
+listener admits only internal-api's ServiceAccount, by TokenReview of its
+projected `space-cluster-api` token with no static fallback, as
+[Ingress activation delegation](../../../docs/internal-rpc-tls.md#ingress-activation-delegation)
+asks of the hosting deployment.
 
 ## Differences from the EKS deployment modules
 

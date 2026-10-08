@@ -41,6 +41,11 @@ spec:
           env:
             - name: SPACE_INGRESS_ACTIVATION_ENDPOINT
               value: {{ .Values.activationEndpoint | quote }}
+            # RemoteIngressActivation authenticates as a ClusterApi caller;
+            # the listener reviews this projected token (audience
+            # space-cluster-api) and admits only this ServiceAccount.
+            - name: SPACE_CLUSTER_API_TOKEN_PATH
+              value: /var/run/space-activation/cluster-api.token
             # Authenticated internal RPC TLS (docs/internal-rpc-tls.md): the
             # ClusterApi listener's identity (space-internal-api,
             # space-cluster-api), and, for internal-api's own NodeApi and
@@ -185,6 +190,9 @@ spec:
             - name: rpc-ca
               mountPath: /etc/space-rpc-ca
               readOnly: true
+            - name: activation-token
+              mountPath: /var/run/space-activation
+              readOnly: true
             - name: route-signing
               mountPath: /var/run/space-route-signing
               readOnly: true
@@ -200,6 +208,14 @@ spec:
           secret:
             secretName: space-internal-rpc-ca
             defaultMode: 0444
+        - name: activation-token
+          projected:
+            defaultMode: 0444
+            sources:
+              - serviceAccountToken:
+                  path: cluster-api.token
+                  audience: space-cluster-api
+                  expirationSeconds: 3600
         - name: route-signing
           secret:
             secretName: {{ .Values.spaceApiRouteToken.ed25519.signingSecretName }}

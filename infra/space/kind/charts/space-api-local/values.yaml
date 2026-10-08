@@ -120,6 +120,12 @@ eppo:
 serviceAccount:
   name: space-api
 
+# ServiceAccounts the ingress activation listener admits: internal-api, the
+# only route resolver that delegates cold wakes (RemoteIngressActivation).
+ingressActivation:
+  allowedServiceAccounts:
+    - space-internal-api
+
 resources:
   requests:
     cpu: 50m
