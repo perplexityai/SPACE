@@ -2042,6 +2042,12 @@ impl TemplateManagerService {
         Ok(())
     }
 
+    /// Imports may refresh description/build timestamps and recompute the
+    /// compressed artifact. All other JSON fields must match the local build,
+    /// including execution provenance, configuration, lineage and resource
+    /// defaults. Omitted metadata preserves the existing document. Changing
+    /// execution metadata requires the separate authorized registration path;
+    /// an import's rootfs digest does not authenticate those fields.
     async fn refresh_existing_build_from_sources(
         &self,
         template_id: &str,
@@ -2107,14 +2113,67 @@ impl TemplateManagerService {
             false,
         )?;
 
-        expand_template_rootfs(template_id, content_hash, &staging_dir, trigger).await?;
-        generate_template_compressed_rootfs(template_id, content_hash, &staging_dir, trigger)
-            .await?;
+        import_helpers::validate_existing_refresh_metadata(digest_path, staging_path)?;
+        crate::rootfs_cache::verify_rootfs_from_metadata(staging_path).map_err(|error| {
+            Status::failed_precondition(format!("verify staged rootfs: {error}"))
+        })?;
+        let observed_hash = compute_template_file_hash(
+            staging_path.join(TEMPLATE_ROOTFS_FILE),
+            "hash staged rootfs",
+        )
+        .await?;
+        if observed_hash != content_hash {
+            return Err(Status::failed_precondition(format!(
+                "staged rootfs has hash {observed_hash} but expected {content_hash}"
+            )));
+        }
+        let stats =
+            generate_template_compressed_rootfs(template_id, content_hash, &staging_dir, trigger)
+                .await?;
+        let manifest = import_helpers::parse_template_manifest(
+            "staged manifest",
+            &std::fs::read(staging_path.join("manifest.json"))
+                .map_err(|error| Status::internal(format!("read staged manifest: {error}")))?,
+        )?;
+        let metadata = match std::fs::read(staging_path.join("metadata.json")) {
+            Ok(bytes) => serde_json::from_slice(&bytes).map_err(|error| {
+                Status::invalid_argument(format!("parse staged metadata: {error}"))
+            })?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Default::default(),
+            Err(error) => return Err(Status::internal(format!("read staged metadata: {error}"))),
+        };
+        let manifest = normalize_template_manifest(
+            manifest,
+            template_id,
+            content_hash,
+            &metadata,
+            stats.rootfs_size,
+            Some((&stats.compressed_hash, stats.compressed_size)),
+        )
+        .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        write_template_manifest_atomic(
+            &staging_path.join("manifest.json"),
+            serde_json::to_vec_pretty(&manifest)
+                .map_err(|error| Status::internal(format!("serialize staged manifest: {error}")))?,
+        )?;
         normalize_template_cache_tree(staging_path)?;
 
         let replaced_path = replace_template_build_dir(staging_path, digest_path)?;
         staging_guard.disarm();
-        if let Err(error) = std::fs::remove_dir_all(&replaced_path)
+        if let Err(error) = self
+            .upsert_build_from_digest_dir(
+                template_id,
+                content_hash,
+                digest_dir,
+                RootfsHashVerification::AlreadyVerified,
+            )
+            .await
+        {
+            let rejected_path = replace_template_build_dir(&replaced_path, digest_path)?;
+            drop(ImportStagingGuard::new(rejected_path));
+            return Err(error);
+        }
+        if let Err(error) = remove_staging_path(&replaced_path)
             && error.kind() != std::io::ErrorKind::NotFound
         {
             tracing::warn!(
@@ -2124,13 +2183,7 @@ impl TemplateManagerService {
             );
         }
 
-        self.upsert_build_from_digest_dir(
-            template_id,
-            content_hash,
-            digest_dir,
-            RootfsHashVerification::AlreadyVerified,
-        )
-        .await
+        Ok(())
     }
 
     /// Register-time refresh for a digest_dir that already exists.

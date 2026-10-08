@@ -37,9 +37,67 @@ pub(super) fn template_manifest_identity_conflicts(
     existing: &serde_json::Value,
     incoming: &serde_json::Value,
 ) -> bool {
-    existing.get("name") != incoming.get("name")
-        || existing.get("runtime") != incoming.get("runtime")
-        || existing.get("arch") != incoming.get("arch")
+    let identity = |value: &serde_json::Value| {
+        let mut value = value.clone();
+        if let Some(object) = value.as_object_mut() {
+            object.remove("build_date");
+            if let Some(files) = object
+                .get_mut("files")
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                files.remove(TEMPLATE_ROOTFS_ZSTD_FILE);
+            }
+        }
+        value
+    };
+    identity(existing) != identity(incoming)
+}
+
+pub(super) fn validate_existing_refresh_metadata(
+    digest_path: &Path,
+    staging_path: &Path,
+) -> Result<(), Status> {
+    // Only descriptive fields may refresh through import. Execution, sizing,
+    // lineage and unknown fields retain the locally authorized values.
+    let identity = |path: &Path| -> Result<serde_json::Value, Status> {
+        let bytes = match std::fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => b"{}".to_vec(),
+            Err(error) => {
+                return Err(Status::internal(format!(
+                    "read {}: {error}",
+                    path.display()
+                )));
+            }
+        };
+        let mut value = parse_template_manifest_value("template metadata", &bytes)?;
+        let object = value
+            .as_object_mut()
+            .ok_or_else(|| Status::invalid_argument("template metadata must be an object"))?;
+        object.remove("description");
+        object.remove("built_at");
+        Ok(value)
+    };
+    if identity(&digest_path.join("metadata.json"))?
+        != identity(&staging_path.join("metadata.json"))?
+    {
+        return Err(Status::already_exists(
+            "existing build has different execution or identity metadata",
+        ));
+    }
+    let existing = std::fs::read(digest_path.join("manifest.json"))
+        .map_err(|error| Status::data_loss(format!("read existing manifest: {error}")))?;
+    let incoming = std::fs::read(staging_path.join("manifest.json"))
+        .map_err(|error| Status::internal(format!("read staged manifest: {error}")))?;
+    if template_manifest_identity_conflicts(
+        &parse_template_manifest_value("existing manifest", &existing)?,
+        &parse_template_manifest_value("staged manifest", &incoming)?,
+    ) {
+        return Err(Status::already_exists(
+            "existing build has different manifest identity fields",
+        ));
+    }
+    Ok(())
 }
 
 pub(super) fn parse_template_manifest(
@@ -300,16 +358,6 @@ impl TemplateManagerService {
             (!header.manifest_json.is_empty()).then_some(header.manifest_json.as_slice());
         let metadata_json =
             (!header.metadata_json.is_empty()).then_some(header.metadata_json.as_slice());
-        self.refresh_existing_build_from_sources(
-            template_id,
-            content_hash,
-            digest_dir,
-            manifest_json,
-            metadata_json,
-            "local_import",
-        )
-        .await?;
-
         if header.include_snapshot {
             let dimensions = required_snapshot_dimensions(header)?;
             let snap_dir = snapshot_dir(template_id, content_hash, dimensions.0, dimensions.1);
@@ -320,9 +368,19 @@ impl TemplateManagerService {
                 .await?;
         } else {
             while let Some(msg) = stream.next().await {
-                let _ = msg;
+                msg?;
             }
         }
+
+        self.refresh_existing_build_from_sources(
+            template_id,
+            content_hash,
+            digest_dir,
+            manifest_json,
+            metadata_json,
+            "local_import",
+        )
+        .await?;
 
         crate::node_state_sync::mark_template_dirty(&self.db, template_id);
         Ok(import_template_response(template_id, content_hash))

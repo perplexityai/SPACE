@@ -344,7 +344,7 @@ fn template_import_manifest_identity_detects_conflicts() {
         "name": "code-runtime",
         "runtime": "firecracker",
         "arch": "x86_64",
-        "metadata": {"ignored": true}
+        "build_date": "2026-06-01T00:00:00Z"
     });
     let different_arch = serde_json::json!({
         "name": "code-runtime",
@@ -1567,6 +1567,146 @@ fn refresh_register_existing_expanded_build_rejects_hash_mismatch() {
         "expected hash-mismatch message, got: {}",
         error.message()
     );
+}
+
+#[tokio::test]
+async fn existing_import_refresh_preserves_authorized_build_on_rejection() {
+    for change in [
+        "execution",
+        "versioned_execution",
+        "disk",
+        "config",
+        "digest",
+        "size",
+        "corrupt",
+        "schema",
+        "registration",
+    ] {
+        let (temp, content_hash, _) = expanded_test_rootfs_setup();
+        let service = TemplateManagerService::new(crate::db::test_conn()).unwrap();
+        let digest_dir = temp.path().to_str().unwrap();
+        service
+            .upsert_build_from_digest_dir(
+                "register-refresh-test",
+                &content_hash,
+                digest_dir,
+                RootfsHashVerification::Verify,
+            )
+            .await
+            .unwrap();
+        let manifest_before = std::fs::read(temp.path().join("manifest.json")).unwrap();
+        let metadata_before = std::fs::read(temp.path().join("metadata.json")).unwrap();
+        let mut manifest: serde_json::Value = serde_json::from_slice(&manifest_before).unwrap();
+        let mut metadata: serde_json::Value = serde_json::from_slice(&metadata_before).unwrap();
+        match change {
+            "execution" => metadata["spaced_compatibility_family"] = "changed".into(),
+            "versioned_execution" => {
+                let execution = serde_json::json!({
+                    "runtime": {"kind": "firecracker", "version": "1.15.1"},
+                    "guest": {"os": "linux", "architecture": "x86_64"},
+                    "state_format": {"format": "firecracker-snapshot", "version": "9.0.0"},
+                    "components": []
+                });
+                manifest["schema_version"] = 2.into();
+                manifest["execution"] = execution.clone();
+                metadata["schema_version"] = 2.into();
+                metadata["execution"] = execution;
+            }
+            "disk" => metadata["disk_size_mb"] = 8.into(),
+            "config" => manifest["config"] = serde_json::json!({"command": "different"}),
+            "digest" => manifest["content_hash"] = format!("sha256:{}", "0".repeat(64)).into(),
+            "size" => manifest["files"]["rootfs.ext4"]["size"] = 8.into(),
+            "corrupt" => {
+                let mut bytes = std::fs::read(temp.path().join("rootfs.ext4")).unwrap();
+                bytes[0] ^= 1;
+                std::fs::write(temp.path().join("rootfs.ext4"), bytes).unwrap();
+                metadata["description"] = "updated description".into();
+            }
+            "schema" => manifest["schema_version"] = 99.into(),
+            "registration" => {
+                metadata["description"] = "updated description".into();
+                service
+                    .db
+                    .lock()
+                    .unwrap()
+                    .pragma_update(None, "query_only", true)
+                    .unwrap();
+            }
+            _ => unreachable!(),
+        }
+        let rootfs_before = std::fs::read(temp.path().join("rootfs.ext4")).unwrap();
+
+        let result = service
+            .refresh_existing_build_from_sources(
+                "register-refresh-test",
+                &content_hash,
+                digest_dir,
+                Some(&serde_json::to_vec(&manifest).unwrap()),
+                Some(&serde_json::to_vec(&metadata).unwrap()),
+                "local_import",
+            )
+            .await;
+
+        assert!(result.is_err(), "{change} must be rejected");
+        assert_eq!(
+            std::fs::read(temp.path().join("rootfs.ext4")).unwrap(),
+            rootfs_before,
+            "{change}"
+        );
+        assert_eq!(
+            std::fs::read(temp.path().join("manifest.json")).unwrap(),
+            manifest_before,
+            "{change}"
+        );
+        assert_eq!(
+            std::fs::read(temp.path().join("metadata.json")).unwrap(),
+            metadata_before,
+            "{change}"
+        );
+        let conn = service.db.lock().unwrap();
+        let build = crate::db::get_build(&conn, "register-refresh-test", &content_hash)
+            .unwrap()
+            .unwrap();
+        assert_eq!(build.manifest_json.as_bytes(), manifest_before, "{change}");
+        assert_eq!(build.state, "ready");
+        assert!(build.execution_metadata_json.is_none());
+    }
+}
+
+#[tokio::test]
+async fn existing_import_refresh_allows_descriptive_updates() {
+    let (temp, content_hash, rootfs_before) = expanded_test_rootfs_setup();
+    let service = TemplateManagerService::new(crate::db::test_conn()).unwrap();
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(temp.path().join("manifest.json")).unwrap()).unwrap();
+    manifest["build_date"] = "2026-06-01T00:00:00Z".into();
+    let metadata = br#"{"disk_size_mb":4,"description":"updated description","built_at":"2026-06-01T00:00:00Z"}"#;
+
+    service
+        .refresh_existing_build_from_sources(
+            "register-refresh-test",
+            &content_hash,
+            temp.path().to_str().unwrap(),
+            Some(&serde_json::to_vec(&manifest).unwrap()),
+            Some(metadata),
+            "local_import",
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        std::fs::read(temp.path().join("rootfs.ext4")).unwrap(),
+        rootfs_before
+    );
+    assert_eq!(
+        std::fs::read(temp.path().join("metadata.json")).unwrap(),
+        metadata
+    );
+    let conn = service.db.lock().unwrap();
+    let build = crate::db::get_build(&conn, "register-refresh-test", &content_hash)
+        .unwrap()
+        .unwrap();
+    assert_eq!(build.build_date, "2026-06-01T00:00:00Z");
 }
 
 #[test]
