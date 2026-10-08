@@ -4451,6 +4451,20 @@ impl SubstrateAdapter for KubernetesSubstrate {
             })
     }
 
+    async fn abandon_admitted_pool_claim(
+        &self,
+        claim: &PooledExecutionClaim,
+    ) -> Result<(), ControllerError> {
+        pool::abandon_admitted_pool_slot(self.store.pool(), claim)
+            .await
+            .map_err(|error| {
+                ControllerError::internal(format!(
+                    "pool claim leaked for pod {}: failed to abandon admitted pool slot: {error}",
+                    claim.pod_name
+                ))
+            })
+    }
+
     async fn cleanup_failed_pooled_prepare(
         &self,
         claim: &PooledExecutionClaim,

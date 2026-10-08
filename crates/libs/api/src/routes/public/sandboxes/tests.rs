@@ -1214,6 +1214,15 @@ mod admission_pool_claim {
     use super::*;
     use crate::controllers::sandbox::AdmissionPoolPlan;
 
+    /// Run the calling test in a child process with the cluster's volume
+    /// encryption opt-in on or off. Returns false in the parent.
+    fn enter_encryption_process(engaged: bool) -> bool {
+        pplx_space_test_env::enter_test_process(&[(
+            "SPACE_BYOK_VOLUME_ENCRYPTION",
+            engaged.then_some(std::ffi::OsStr::new("true")),
+        )])
+    }
+
     /// The `outcome` tags of every admission-claim counter in `counters`.
     fn admission_outcomes(
         counters: &[pplx_space_metrics::test_capture::CapturedCounter],
@@ -1398,6 +1407,9 @@ mod admission_pool_claim {
     /// one, whatever the cluster's encryption opt-in says.
     #[tokio::test(flavor = "current_thread")]
     async fn an_encrypted_org_never_gets_a_plaintext_slot() -> TestDbResult<()> {
+        if !enter_encryption_process(true) {
+            return Ok(());
+        }
         let fixture = AdmissionPoolFixture::new(1).await?;
         fixture.enable_org_encryption().await?;
         let controller = fixture.controller();
@@ -1481,7 +1493,7 @@ mod admission_pool_claim {
             crate::public_sandbox_operations::controller_create_request(fixture.request(), None);
         assert_eq!(
             controller
-                .plan_admission_pool_claim(&fixture.db.pool, fixture.org_id, &request)
+                .plan_admission_pool_claim(&fixture.db.pool, fixture.org_id, None, &request)
                 .await,
             AdmissionPoolPlan::Eligible {
                 template_release_id: fixture.release_id
@@ -1495,15 +1507,206 @@ mod admission_pool_claim {
         );
         assert_eq!(
             controller
-                .plan_admission_pool_claim(&fixture.db.pool, fixture.org_id, &pinned)
+                .plan_admission_pool_claim(&fixture.db.pool, fixture.org_id, None, &pinned)
                 .await,
             AdmissionPoolPlan::Ineligible
         );
         assert_eq!(
             controller
-                .plan_admission_pool_claim(&fixture.db.pool, OrgId::new(), &request)
+                .plan_admission_pool_claim(&fixture.db.pool, OrgId::new(), None, &request)
                 .await,
             AdmissionPoolPlan::Ineligible
+        );
+        Ok(())
+    }
+
+    /// Admission decides encryption exactly as the executor does: an org
+    /// flag without the cluster opt-in creates a plaintext sandbox either
+    /// way, so the create may take a plaintext slot.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_org_flag_without_the_cluster_opt_in_matches_the_executor() -> TestDbResult<()> {
+        if !enter_encryption_process(false) {
+            return Ok(());
+        }
+        let fixture = AdmissionPoolFixture::new(1).await?;
+        fixture.enable_org_encryption().await?;
+        let controller = fixture.controller();
+        let response = fixture
+            .create(Some(&controller), "admission-flag-only", fixture.request())
+            .await
+            .expect("create is recorded");
+
+        let slot = &fixture.slots[0];
+        assert_eq!(
+            response.sandbox_id,
+            PublicSandboxId::from(slot.reserved_sandbox_id)
+        );
+        assert!(
+            fixture
+                .payload(response.operation_id)
+                .await?
+                .pool_claim
+                .is_some()
+        );
+        Ok(())
+    }
+
+    /// A federated create is decided for its owner's org, which the route
+    /// records it under once authentication has resolved the owner: an
+    /// encrypted owner org never gets a plaintext slot, even though the
+    /// integration's own org is not encrypted.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_federated_owner_in_an_encrypted_org_never_gets_a_plaintext_slot() -> TestDbResult<()>
+    {
+        if !enter_encryption_process(true) {
+            return Ok(());
+        }
+        let fixture = AdmissionPoolFixture::new(1).await?;
+        let owner = AdmissionPoolFixture::federated_owner("encrypted");
+        let record = fixture.materialize(&owner).await?;
+        fixture.set_org_encryption(record.org_id, true).await?;
+        let controller = fixture.controller();
+        let request =
+            crate::public_sandbox_operations::controller_create_request(fixture.request(), None);
+
+        // The integration's org is plaintext, and on its own would claim.
+        assert_eq!(
+            controller
+                .plan_admission_pool_claim(&fixture.db.pool, fixture.org_id, None, &request)
+                .await,
+            AdmissionPoolPlan::Eligible {
+                template_release_id: fixture.release_id
+            },
+            "positive control"
+        );
+        // For the owner, under either org, it does not.
+        for org_id in [record.org_id, fixture.org_id] {
+            assert_eq!(
+                controller
+                    .plan_admission_pool_claim(&fixture.db.pool, org_id, Some(&owner), &request)
+                    .await,
+                AdmissionPoolPlan::Ineligible
+            );
+        }
+
+        let capture = pplx_space_metrics::test_capture::capture_counters_guard();
+        let response = fixture
+            .create_federated(
+                Some(&controller),
+                "admission-federated-encrypted",
+                fixture.request(),
+                &owner,
+                &record,
+            )
+            .await
+            .expect("create is recorded");
+        let counters = capture.finish();
+        let slot = &fixture.slots[0];
+        assert_ne!(
+            response.sandbox_id,
+            PublicSandboxId::from(slot.reserved_sandbox_id)
+        );
+        let payload = fixture.payload(response.operation_id).await?;
+        assert_eq!(payload.pool_claim, None);
+        assert!(payload.federated_create.is_some());
+        assert_eq!(
+            fixture.slot_state(slot.id).await?,
+            ("ready".to_string(), None)
+        );
+        assert_eq!(admission_outcomes(&counters), vec!["outcome:ineligible"]);
+        Ok(())
+    }
+
+    /// Admission only looks the owner up: one not materialized yet gets no
+    /// claim, and admission does not create it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_federated_owner_not_yet_materialized_gets_no_claim() -> TestDbResult<()> {
+        let fixture = AdmissionPoolFixture::new(1).await?;
+        let owner = AdmissionPoolFixture::federated_owner("absent");
+        let controller = fixture.controller();
+        let request =
+            crate::public_sandbox_operations::controller_create_request(fixture.request(), None);
+        assert_eq!(
+            controller
+                .plan_admission_pool_claim(&fixture.db.pool, fixture.org_id, Some(&owner), &request)
+                .await,
+            AdmissionPoolPlan::Ineligible
+        );
+        let federated_orgs: i64 = sqlx::query_scalar(sql!(
+            "SELECT COUNT(*) FROM organizations WHERE owner_source = 'federated_identity'"
+        ))
+        .fetch_one(&fixture.db.pool)
+        .await?;
+        assert_eq!(
+            federated_orgs, 0,
+            "admission must not materialize the owner"
+        );
+        assert_eq!(fixture.slot_count("ready").await?, 1);
+        Ok(())
+    }
+
+    /// Template resolution uses the owner's org too: a release visible only
+    /// to the owner's org is claimed for the owner, and an owner that does
+    /// not resolve to the org the create is recorded under gets no claim.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_federated_create_resolves_the_template_for_its_owner() -> TestDbResult<()> {
+        let fixture = AdmissionPoolFixture::new(1).await?;
+        let owner = AdmissionPoolFixture::federated_owner("template");
+        let record = fixture.materialize(&owner).await?;
+        sqlx::query(sql!(
+            "UPDATE templates SET visibility = 'org_specific', org_id = $2 WHERE name = $1"
+        ))
+        .bind(super::super::admission_test_fixture::TEMPLATE)
+        .bind(record.org_id)
+        .execute(&fixture.db.pool)
+        .await?;
+        let controller = fixture.controller();
+        let request =
+            crate::public_sandbox_operations::controller_create_request(fixture.request(), None);
+
+        // The integration's org cannot see the template at all.
+        assert_eq!(
+            controller
+                .plan_admission_pool_claim(&fixture.db.pool, fixture.org_id, None, &request)
+                .await,
+            AdmissionPoolPlan::TemplateMiss
+        );
+        assert_eq!(
+            controller
+                .plan_admission_pool_claim(&fixture.db.pool, record.org_id, Some(&owner), &request)
+                .await,
+            AdmissionPoolPlan::Eligible {
+                template_release_id: fixture.release_id
+            }
+        );
+        assert_eq!(
+            controller
+                .plan_admission_pool_claim(&fixture.db.pool, fixture.org_id, Some(&owner), &request)
+                .await,
+            AdmissionPoolPlan::Ineligible
+        );
+
+        let response = fixture
+            .create_federated(
+                Some(&controller),
+                "admission-federated-template",
+                fixture.request(),
+                &owner,
+                &record,
+            )
+            .await
+            .expect("create is recorded");
+        let slot = &fixture.slots[0];
+        assert_eq!(
+            response.sandbox_id,
+            PublicSandboxId::from(slot.reserved_sandbox_id)
+        );
+        assert!(
+            fixture
+                .payload(response.operation_id)
+                .await?
+                .pool_claim
+                .is_some()
         );
         Ok(())
     }

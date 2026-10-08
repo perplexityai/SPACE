@@ -272,9 +272,10 @@ async fn pooled_claim_from_slot(
 /// receipt (a bind committed and the sandbox was later retired) owns none.
 /// Anything else does, and is taken out of the claimable inventory here so no
 /// other create can bind this ID: a `ready` slot is fenced to an id-less
-/// claim, and our own claim on a slot we will not adopt is invalidated. Both
+/// claim, and our own claim on a slot we will not adopt is abandoned. Both
 /// leave a `claimed` row that the stale-claimed sweep collects, pod included,
-/// because no sandbox row exists for the ID yet.
+/// because no sandbox row exists for the ID yet; an abandoned one on the
+/// sweep's next pass rather than after the claim timeout.
 #[tracing::instrument(
     name = "substrate.k8s.pool.lookup_admitted_pooled_execution",
     skip_all,
@@ -324,10 +325,10 @@ pub(super) async fn lookup_admitted_pooled_execution(
                     "claimed",
                 )
             } else {
-                WarmPoolStore::invalidate_claimed_slot_in(&mut tx, admitted.claim_id, sandbox_id)
+                WarmPoolStore::abandon_claimed_slot_in(&mut tx, admitted.claim_id, sandbox_id)
                     .await
                     .map_err(|err| {
-                        pool_store_error("failed to invalidate admitted pool slot", &err)
+                        pool_store_error("failed to abandon admitted pool slot", &err)
                     })?;
                 (AdmittedPoolClaimLookup::ReleasePending, "slot_mismatch")
             }
@@ -568,6 +569,20 @@ pub(super) async fn invalidate_claimed_pool_slot(
         .invalidate_claimed_slot(claim.claim_id, claim.sandbox_id)
         .await
         .map_err(|err| pool_store_error("failed to invalidate claimed pool slot", &err))?;
+    Ok(())
+}
+
+/// Abandon an admitted claim the create will not adopt, so the pool's next
+/// stale-claimed sweep collects the slot (see
+/// [`WarmPoolStore::abandon_claimed_slot`]).
+pub(super) async fn abandon_admitted_pool_slot(
+    pool: &PgPool,
+    claim: &PooledExecutionClaim,
+) -> Result<(), ControllerError> {
+    WarmPoolStore::new(pool.clone())
+        .abandon_claimed_slot(claim.claim_id, claim.sandbox_id)
+        .await
+        .map_err(|err| pool_store_error("failed to abandon admitted pool slot", &err))?;
     Ok(())
 }
 

@@ -2710,6 +2710,114 @@ async fn store_stale_claimed_slot_exists_tracks_staleness_and_bind_stamp() -> Te
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn store_abandoned_claim_is_swept_without_waiting_out_the_timeout() -> TestResult {
+    // arrange: a fresh claim, which the sweep must not touch yet
+    let fixture = postgres_fixture().await?;
+    let template = TemplateName::parse("seed")?;
+    let (template_release_id, config_id, content_hash) =
+        seed_pool_config(&fixture.pool, 0x48).await?;
+    let (vcpu, memory) = default_shape()?;
+    let claim_id = Uuid::now_v7();
+    let timeout = Duration::from_secs(5 * 60);
+    let slot = insert_ready_slot(
+        &fixture,
+        new_slot(
+            config_id,
+            template_release_id,
+            &template,
+            content_hash,
+            vcpu,
+            memory,
+            "space-sbx-abandoned-g1",
+        ),
+        "10.90.0.11",
+    )
+    .await?;
+    let mut claim_tx = fixture.pool.begin().await?;
+    WarmPoolStore::claim_ready_slot(
+        &mut claim_tx,
+        template_release_id,
+        vcpu,
+        memory,
+        "space",
+        claim_id,
+        false,
+    )
+    .await?;
+    claim_tx.commit().await?;
+    assert!(
+        !fixture
+            .store
+            .stale_unbound_claimed_slot_exists(slot.id, timeout)
+            .await?
+    );
+
+    // act + assert: another claim id cannot abandon it
+    assert!(
+        !fixture
+            .store
+            .abandon_claimed_slot(Uuid::now_v7(), slot.reserved_sandbox_id)
+            .await?
+    );
+    assert!(
+        !fixture
+            .store
+            .stale_unbound_claimed_slot_exists(slot.id, timeout)
+            .await?
+    );
+
+    // act: the holder abandons its claim
+    assert!(
+        fixture
+            .store
+            .abandon_claimed_slot(claim_id, slot.reserved_sandbox_id)
+            .await?
+    );
+
+    // assert: still claimed, never ready again, no claim id to bind with,
+    // and already past the sweep's timeout
+    let (state, stored_claim_id): (String, Option<Uuid>) =
+        sqlx::query_as("SELECT state, claim_id FROM kubernetes_pool_slots WHERE id = $1")
+            .bind(slot.id)
+            .fetch_one(&fixture.pool)
+            .await?;
+    assert_eq!(state, "claimed");
+    assert_eq!(stored_claim_id, None);
+    let mut bind_tx = fixture.pool.begin().await?;
+    assert!(
+        !WarmPoolStore::bind_claimed_slot(&mut bind_tx, claim_id, slot.reserved_sandbox_id).await?
+    );
+    bind_tx.rollback().await?;
+    assert!(
+        fixture
+            .store
+            .stale_unbound_claimed_slot_exists(slot.id, timeout)
+            .await?
+    );
+    let batch = fixture
+        .store
+        .stale_unbound_claimed_slots(timeout, 10)
+        .await?;
+    assert!(batch.iter().any(|candidate| candidate.id == slot.id));
+    let mut delete_tx = fixture.pool.begin().await?;
+    assert!(
+        WarmPoolStore::lock_stale_unbound_claimed_slot_for_delete(&mut delete_tx, slot.id, timeout)
+            .await?
+    );
+    delete_tx.rollback().await?;
+
+    // assert: a second abandon is a no-op
+    assert!(
+        !fixture
+            .store
+            .abandon_claimed_slot(claim_id, slot.reserved_sandbox_id)
+            .await?
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn store_cleanup_pending_slots_can_be_locked_and_deleted() -> TestResult {
     // arrange
     let fixture = postgres_fixture().await?;

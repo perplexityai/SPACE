@@ -1226,6 +1226,13 @@ impl SubstrateAdapter for NodeRpcStubbedKubernetes {
         self.inner.rollback_pooled_execution_claim(claim).await
     }
 
+    async fn abandon_admitted_pool_claim(
+        &self,
+        claim: &PooledExecutionClaim,
+    ) -> Result<(), ControllerError> {
+        self.inner.abandon_admitted_pool_claim(claim).await
+    }
+
     async fn persist_pooled_execution_claim(
         &self,
         tx: &mut Transaction<'_, Postgres>,
@@ -3256,5 +3263,204 @@ async fn admission_claim_executes_and_runs_under_the_claimed_id(
         ("bound", Some(admitted.claim_id)),
         "the admission claim is the one that bound"
     );
+    Ok(())
+}
+
+/// How a test makes the executor refuse the slot admission claimed for it.
+#[cfg(feature = "kubernetes")]
+#[derive(Debug, Clone, Copy)]
+enum AdmittedRefusal {
+    /// The request is no longer adoptable once resolved for execution.
+    Ineligible,
+    /// The create will be encrypted, so a plaintext slot cannot serve it.
+    Encrypted,
+    /// The template resolved to another release by the time it ran.
+    ReleaseMoved,
+}
+
+/// A refused admission claim is collected on the pool's next sweep, not
+/// after the claim timeout, and the retry then builds cold under the ID.
+#[cfg(feature = "kubernetes")]
+#[rstest::rstest]
+#[case::ineligible(AdmittedRefusal::Ineligible)]
+#[case::encrypted(AdmittedRefusal::Encrypted)]
+#[case::release_moved(AdmittedRefusal::ReleaseMoved)]
+#[tokio::test(flavor = "current_thread")]
+async fn a_refused_admission_claim_is_collected_on_the_next_sweep(
+    #[case] refusal: AdmittedRefusal,
+) -> TestResult {
+    use crate::routes::public::sandboxes::admission_test_fixture::{
+        AdmissionPoolFixture, NAMESPACE, TEMPLATE,
+    };
+    use k8s_openapi::api::core::v1::{Pod, PodSpec, PodStatus};
+    use pplx_space_cluster_pool::WarmPoolStore;
+
+    // The controller's default stale-claimed timeout; an abandoned claim
+    // must be due well before it.
+    const CLAIM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+    let fixture = AdmissionPoolFixture::new(1).await?;
+    let slot = &fixture.slots[0];
+    let pod = Pod {
+        metadata: kube::api::ObjectMeta {
+            name: Some(slot.pod_name.clone()),
+            namespace: Some(NAMESPACE.to_string()),
+            uid: Some(slot.pod_uid.clone()),
+            ..Default::default()
+        },
+        spec: Some(PodSpec {
+            node_name: Some(slot.node_name.clone()),
+            ..Default::default()
+        }),
+        status: Some(PodStatus {
+            phase: Some("Running".to_string()),
+            pod_ip: Some(slot.pod_ip.clone()),
+            ..Default::default()
+        }),
+    };
+    let kubernetes = || {
+        crate::controllers::substrate::kubernetes::tests::substrate_with_inventory_caches_and_pool(
+            vec![pod.clone()],
+            Vec::new(),
+            fixture.db.pool.clone(),
+        )
+    };
+
+    let admission_controller = AdmissionPoolFixture::controller_with(kubernetes());
+    let response = fixture
+        .create(
+            Some(&admission_controller),
+            "admission-refused",
+            fixture.request(),
+        )
+        .await
+        .expect("create is recorded");
+    let payload = fixture.payload(response.operation_id).await?;
+    let admitted: AdmittedPoolClaim = payload
+        .pool_claim
+        .expect("the queued create carries the claim")
+        .into();
+
+    let actor: User = sqlx::query_as(sql!(
+        "SELECT id, email, password_hash, display_name, org_id, role, owner_source,
+                created_at, updated_at
+         FROM users WHERE id = $1"
+    ))
+    .bind(fixture.user_id)
+    .fetch_one(&fixture.db.pool)
+    .await?;
+    let create_owner = SandboxCreateOwner::local(&actor);
+    let req = crate::public_sandbox_operations::controller_create_request(
+        payload.request.clone(),
+        payload.node_pool.clone(),
+    );
+    let requested_template = req
+        .template
+        .clone()
+        .expect("native creates name a template");
+    let auto_lifecycle = req
+        .auto_lifecycle
+        .clone()
+        .expect("native creates carry the default policy");
+    let template_network_policy = NetworkPolicyV1::deny_all();
+    let content_hash = fixture.content_hash.to_string();
+    let substrate = NodeRpcStubbedKubernetes {
+        inner: kubernetes(),
+        prepared: Mutex::new(Vec::new()),
+    };
+    let run = |release_id: Uuid, volume_encryption: bool, adoption_eligible: bool| {
+        let mut input = pooled_create_input(
+            &fixture.db.pool,
+            &req,
+            &requested_template,
+            &auto_lifecycle,
+            &template_network_policy,
+            &create_owner,
+        );
+        input.template = TEMPLATE;
+        input.content_hash = &content_hash;
+        input.template_release_id = release_id;
+        input.boot_mode = CreateBootMode::Fallthrough;
+        input.planned_sandbox_id = SandboxId::from_uuid(payload.sandbox_id.as_uuid());
+        input.sandbox_id_pinned = true;
+        input.volume_encryption = volume_encryption;
+        SandboxController::try_create_from_admitted_pool_claim_with_substrate(
+            &substrate,
+            input,
+            admitted,
+            adoption_eligible,
+            Arc::new(AtomicU64::new(0)),
+        )
+    };
+
+    // The executor refuses the slot.
+    let (release_id, volume_encryption, adoption_eligible) = match refusal {
+        AdmittedRefusal::Ineligible => (fixture.release_id, false, false),
+        AdmittedRefusal::Encrypted => (fixture.release_id, true, true),
+        AdmittedRefusal::ReleaseMoved => (Uuid::now_v7(), false, true),
+    };
+    let error = match run(release_id, volume_encryption, adoption_eligible).await {
+        Ok(_) => panic!("a refused slot must not be adopted"),
+        Err(error) => error,
+    };
+    assert_eq!(
+        error.retry_after_cause(),
+        Some(ControllerRetryAfterCause::PoolSlotRelease)
+    );
+    assert!(substrate.prepared.lock().unwrap().is_empty());
+
+    // The slot is out of the inventory for good, has no claim to bind with,
+    // and the sweep's next pass takes it although it was claimed just now.
+    assert_eq!(
+        fixture.slot_state(slot.id).await?,
+        ("claimed".to_string(), None)
+    );
+    assert_eq!(fixture.slot_count("ready").await?, 0);
+    let store = WarmPoolStore::new(fixture.db.pool.clone());
+    assert!(
+        store
+            .stale_unbound_claimed_slot_exists(slot.id, CLAIM_TIMEOUT)
+            .await?
+    );
+    assert!(
+        store
+            .stale_unbound_claimed_slots(CLAIM_TIMEOUT, 10)
+            .await?
+            .iter()
+            .any(|candidate| candidate.id == slot.id)
+    );
+
+    // Until the sweep runs, the retry keeps waiting and creates nothing.
+    let error = match run(fixture.release_id, false, true).await {
+        Ok(_) => panic!("the slot still holds the ID"),
+        Err(error) => error,
+    };
+    assert_eq!(
+        error.retry_after_cause(),
+        Some(ControllerRetryAfterCause::PoolSlotRelease)
+    );
+    let sandbox_rows: i64 =
+        sqlx::query_scalar(sql!("SELECT COUNT(*) FROM sandboxes WHERE id = $1"))
+            .bind(slot.reserved_sandbox_id)
+            .fetch_one(&fixture.db.pool)
+            .await?;
+    assert_eq!(sandbox_rows, 0);
+
+    // The sweep's bookkeeping once it has deleted the pod.
+    let mut tx = fixture.db.pool.begin().await?;
+    assert!(
+        WarmPoolStore::lock_stale_unbound_claimed_slot_for_delete(&mut tx, slot.id, CLAIM_TIMEOUT)
+            .await?
+    );
+    assert!(WarmPoolStore::delete_locked_claimed_slot(&mut tx, slot.id).await?);
+    tx.commit().await?;
+
+    // The retry now builds cold under the same ID.
+    let result = run(fixture.release_id, false, true).await?;
+    assert!(
+        result.response.is_none(),
+        "with the slot gone the create builds cold"
+    );
+    assert!(substrate.prepared.lock().unwrap().is_empty());
     Ok(())
 }

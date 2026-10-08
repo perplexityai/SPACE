@@ -5,8 +5,8 @@
 use pplx_space_cluster_pool::{NewPoolSlot, WarmPoolStore};
 use pplx_space_common_core::sql;
 use pplx_space_common_core::types::{
-    ContentHash, Digest, IdempotencyKey, MemorySize, OrgId, SandboxId, TemplateName, UserId,
-    VcpuCount,
+    ContentHash, Digest, IdempotencyKey, MemorySize, OrgId, SandboxId, TemplateName,
+    UpstreamIssuer, UpstreamOrgId, UpstreamSubjectId, UserId, VcpuCount,
 };
 use pplx_space_db_test_fixtures::{TestDb, TestDbResult, pg_test_db};
 use pplx_space_public_api::{CreateSandboxRequest, OperationId, SandboxOperationResponse};
@@ -17,6 +17,8 @@ use crate::controllers::{
     sandbox::SandboxController,
     substrate::{Substrate, kubernetes::KubernetesSubstrate},
 };
+use crate::federated_identity::{FederatedOwner, FederatedOwnerRecord, FederatedServiceGrant};
+use crate::fork_operations::ForkFederatedCreateContext;
 use crate::public_sandbox_operations::CreateSandboxOperationPayload;
 use crate::routes::public::error::PublicApiError;
 
@@ -257,12 +259,67 @@ impl AdmissionPoolFixture {
     }
 
     pub(crate) async fn enable_org_encryption(&self) -> TestDbResult<()> {
+        self.set_org_encryption(self.org_id, true).await
+    }
+
+    pub(crate) async fn set_org_encryption(
+        &self,
+        org_id: OrgId,
+        enabled: bool,
+    ) -> TestDbResult<()> {
         sqlx::query(sql!(
-            "UPDATE organizations SET byok_enabled = TRUE WHERE id = $1"
+            "UPDATE organizations SET byok_enabled = $2 WHERE id = $1"
         ))
-        .bind(self.org_id)
+        .bind(org_id)
+        .bind(enabled)
         .execute(&self.db.pool)
         .await?;
         Ok(())
+    }
+
+    /// A synthetic upstream owner, distinct per `label`.
+    pub(crate) fn federated_owner(label: &str) -> FederatedOwner {
+        FederatedOwner {
+            issuer: UpstreamIssuer::parse("example-issuer").expect("synthetic issuer parses"),
+            org_id: UpstreamOrgId::parse(format!("upstream-org-{label}"))
+                .expect("synthetic upstream org parses"),
+            subject_id: UpstreamSubjectId::parse(format!("upstream-user-{label}"))
+                .expect("synthetic upstream subject parses"),
+        }
+    }
+
+    /// Materialize `owner` as authentication does before the route runs.
+    pub(crate) async fn materialize(
+        &self,
+        owner: &FederatedOwner,
+    ) -> TestDbResult<FederatedOwnerRecord> {
+        Ok(crate::federated_identity::materialize_owner(&self.db.pool, owner).await?)
+    }
+
+    /// `POST /v1/sandboxes` for a federated create, as the route records it
+    /// once authentication has made `owner` the effective org and actor.
+    pub(crate) async fn create_federated(
+        &self,
+        pool_claims: Option<&SandboxController>,
+        idempotency_key: &str,
+        request: CreateSandboxRequest,
+        owner: &FederatedOwner,
+        record: &FederatedOwnerRecord,
+    ) -> Result<SandboxOperationResponse, PublicApiError> {
+        let grant = FederatedServiceGrant::new(
+            b"synthetic-grant".to_vec(),
+            time::OffsetDateTime::now_utc() + time::Duration::hours(1),
+        )
+        .expect("synthetic grant is valid");
+        super::create_native_sandbox_operation(
+            &self.db.pool,
+            record.org_id,
+            record.user_id,
+            &IdempotencyKey::parse(idempotency_key).expect("fixture idempotency key parses"),
+            request,
+            Some(ForkFederatedCreateContext::from_request(owner, &grant)),
+            pool_claims,
+        )
+        .await
     }
 }

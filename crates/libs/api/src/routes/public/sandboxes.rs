@@ -160,8 +160,16 @@ pub(crate) async fn create_native_sandbox_operation(
         None => NativeCreatePoolPlan::Unclaimed(AdmissionClaimOutcome::Disabled),
         Some(controller) => {
             let controller_request = controller_create_request(request.clone(), None);
+            let federated_owner = federated_create
+                .as_ref()
+                .map(crate::fork_operations::ForkFederatedCreateContext::owner);
             match controller
-                .plan_admission_pool_claim(pool, org_id, &controller_request)
+                .plan_admission_pool_claim(
+                    pool,
+                    org_id,
+                    federated_owner.as_ref(),
+                    &controller_request,
+                )
                 .await
             {
                 AdmissionPoolPlan::Eligible {

@@ -425,6 +425,21 @@ async fn org_encryption_flag(pool: &PgPool, org_id: OrgId) -> Result<Option<bool
         .await
 }
 
+/// Whether a new sandbox owned by `org_id` gets volume encryption: the org's
+/// encryption flag and the cluster opt-in ([`byok_volume_encryption_engaged`]).
+/// `None` when the org row is missing. The one decision both the create
+/// executor and admission-time pool claiming make, so they cannot drift: the
+/// executor treats a missing org as unencrypted, admission as ineligible.
+async fn create_volume_encryption(
+    pool: &PgPool,
+    org_id: OrgId,
+) -> Result<Option<bool>, ControllerError> {
+    let flag = org_encryption_flag(pool, org_id)
+        .await
+        .map_err(|err| db_contention_error("failed to read org BYOK flag", &err))?;
+    Ok(flag.map(|enabled| enabled && byok_volume_encryption_engaged()))
+}
+
 /// Cluster-wide opt-in for stamping `volume_encryption` on new sandboxes.
 /// `organizations.byok_enabled` is an advisory flag shared with the
 /// credential-encryption feature, so volume encryption additionally requires
@@ -1004,16 +1019,23 @@ impl SandboxController {
     /// Eligible only for a request the executor would adopt the slot for
     /// ([`Self::admitted_pool_adoption_eligible`]) and that the slot's shape
     /// already serves: no custom vcpu, memory, or disk, and no node-pool pin.
-    /// Fails closed: anything this cannot establish here (the org's row, its
-    /// encryption setting, the runtime, the template release, the lifecycle
-    /// policy) answers ineligible, and the create runs cold as it would
-    /// without admission. An org with encryption enabled is always
-    /// ineligible, whatever the cluster's encryption opt-in says, because
-    /// every warm-pool slot is plaintext.
+    ///
+    /// Decided for the owner the executor will create the sandbox for: the
+    /// federated owner's org for a federated create, otherwise `org_id`, the
+    /// actor's. A federated owner is only looked up, never materialized, and
+    /// must already resolve to `org_id`, as the executor requires.
+    ///
+    /// Fails closed: anything this cannot establish here (the owner, the
+    /// org's row, its encryption setting, the runtime, the template release,
+    /// the lifecycle policy) answers ineligible, and the create runs cold as
+    /// it would without admission. A create the executor would encrypt
+    /// ([`create_volume_encryption`]) is always ineligible, because every
+    /// warm-pool slot is plaintext.
     pub async fn plan_admission_pool_claim(
         &self,
         pool: &PgPool,
         org_id: OrgId,
+        federated_owner: Option<&crate::federated_identity::FederatedOwner>,
         req: &CreateSandboxRequest,
     ) -> AdmissionPoolPlan {
         if req.vcpu.is_some()
@@ -1029,7 +1051,23 @@ impl SandboxController {
         let Ok(boot_mode) = CreateBootMode::from_api(req.boot_mode.as_deref(), false) else {
             return AdmissionPoolPlan::Ineligible;
         };
-        match org_encryption_flag(pool, org_id).await {
+        let owner_org_id = match federated_owner {
+            None => org_id,
+            Some(owner) => match crate::federated_identity::find_owner_record(pool, owner).await {
+                Ok(Some(record)) if record.org_id == org_id => record.org_id,
+                // Not materialized yet, or not the org the create is recorded
+                // under (which the executor rejects): nothing to decide for.
+                Ok(_) => return AdmissionPoolPlan::Ineligible,
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        "failed to look up the federated owner; admitting without a pool claim"
+                    );
+                    return AdmissionPoolPlan::Ineligible;
+                }
+            },
+        };
+        match create_volume_encryption(pool, owner_org_id).await {
             Ok(Some(false)) => {}
             Ok(Some(true) | None) => return AdmissionPoolPlan::Ineligible,
             Err(error) => {
@@ -1042,7 +1080,7 @@ impl SandboxController {
         }
         let template_reference = create_template_reference(req);
         let Ok(resolved_template) = self
-            .resolve_create_template(pool, &template_reference, runtime, org_id)
+            .resolve_create_template(pool, &template_reference, runtime, owner_org_id)
             .await
         else {
             return AdmissionPoolPlan::TemplateMiss;
@@ -1209,8 +1247,9 @@ impl SandboxController {
         // Immutable per-sandbox encryption stamp: decided exactly once, here.
         // It gates the pool bypass below, lands on the control-plane row, and
         // rides the substrate create to the node row.
-        let volume_encryption =
-            org_byok_enabled(pool, create_owner.org_id).await? && byok_volume_encryption_engaged();
+        let volume_encryption = create_volume_encryption(pool, create_owner.org_id)
+            .await?
+            .unwrap_or(false);
         // A placed create must land in its pool. Warm-pool pods are pre-created
         // on general nodes, so a pin can't adopt one — bypass the warm pool when
         // a pin is set, and reject the incompatible `boot_mode=pool` + pin combo.
@@ -2405,9 +2444,12 @@ impl SandboxController {
                 claim_id = %claim.claim_id,
                 volume_encryption = input.volume_encryption,
                 adoption_eligible,
-                "not adopting the admitted warm-pool slot; releasing it"
+                "not adopting the admitted warm-pool slot; abandoning it"
             );
-            substrate.rollback_pooled_execution_claim(&claim).await?;
+            // No sandbox row exists for the ID yet, and none is created
+            // until the pool has collected the slot (the retry sees it gone
+            // and builds cold), so the slot can go on the pool's next sweep.
+            substrate.abandon_admitted_pool_claim(&claim).await?;
             return Err(admitted_pool_slot_release_pending());
         }
 
@@ -2426,13 +2468,14 @@ impl SandboxController {
             Err(error) => {
                 // The sandbox row did not commit, so nothing references the
                 // slot. Take it out of the inventory; the retry waits for the
-                // pool to collect it and then builds cold under this ID.
-                if let Err(rollback_error) = substrate.rollback_pooled_execution_claim(&claim).await
-                {
+                // pool to collect it and then builds cold under this ID. If
+                // the bind did commit after all, the slot is `bound` and this
+                // is a no-op; the retry then finds the sandbox row.
+                if let Err(rollback_error) = substrate.abandon_admitted_pool_claim(&claim).await {
                     tracing::warn!(
                         sandbox_id = %claim.sandbox_id,
                         %rollback_error,
-                        "failed to roll back admitted pool claim after API commit failure"
+                        "failed to abandon admitted pool claim after API commit failure"
                     );
                 }
                 tracing::warn!(

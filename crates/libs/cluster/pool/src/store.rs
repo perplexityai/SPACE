@@ -1503,6 +1503,54 @@ impl WarmPoolStore {
         Ok(result.rows_affected() > 0)
     }
 
+    /// Strip the claim id from a claimed slot and back-date its claim so the
+    /// next stale-claimed sweep collects it, pod included, without waiting
+    /// out the claim timeout.
+    ///
+    /// For a claim holder that has decided, under its own claim, never to
+    /// bind the slot. Unlike [`Self::invalidate_claimed_slot`], which keeps
+    /// the claim time so that a bind still in flight elsewhere has the full
+    /// timeout to land, there is no other bind to wait for here: the caller
+    /// is the only holder of `claim_id`, and once the id is stripped no bind
+    /// can match it. The sweep still deletes the pod only while no sandbox
+    /// row exists for the reserved ID, so a holder that wants to create one
+    /// must wait for the slot row to be gone first.
+    pub async fn abandon_claimed_slot_in(
+        tx: &mut Transaction<'_, Postgres>,
+        claim_id: Uuid,
+        reserved_sandbox_id: SandboxId,
+    ) -> Result<bool> {
+        let result = sqlx::query(sql!(
+            "UPDATE kubernetes_pool_slots
+             SET claim_id = NULL,
+                 claimed_at = TIMESTAMPTZ 'epoch',
+                 updated_at = NOW()
+             WHERE claim_id = $1
+               AND reserved_sandbox_id = $2
+               AND state = $3"
+        ))
+        .bind(claim_id)
+        .bind(reserved_sandbox_id)
+        .bind(PoolSlotState::Claimed.as_str())
+        .execute(&mut **tx)
+        .await?;
+
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// [`Self::abandon_claimed_slot_in`] in its own transaction.
+    pub async fn abandon_claimed_slot(
+        &self,
+        claim_id: Uuid,
+        reserved_sandbox_id: SandboxId,
+    ) -> Result<bool> {
+        let mut tx = self.pool.begin().await?;
+        let abandoned =
+            Self::abandon_claimed_slot_in(&mut tx, claim_id, reserved_sandbox_id).await?;
+        tx.commit().await?;
+        Ok(abandoned)
+    }
+
     pub async fn stale_unbound_claimed_slots(
         &self,
         older_than: Duration,
