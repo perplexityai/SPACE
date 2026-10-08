@@ -45,6 +45,20 @@ fn config_defaults_enabled() {
 }
 
 #[test]
+fn tick_defaults_to_25ms_and_the_test_override_takes_whole_seconds() {
+    const TICK: &str = "SPACE_PUBLIC_OPERATION_DISPATCHER_TICK_SECS";
+    let tick = |env: &pplx_space_test_env::TestEnv| ReconcilerConfig::from_environment(env).tick;
+    let mut env = pplx_space_test_env::TestEnv::default();
+    assert_eq!(tick(&env), Duration::from_millis(25));
+    env.set(TICK, "2");
+    assert_eq!(tick(&env), Duration::from_secs(2));
+    for invalid in ["0", "abc", ""] {
+        env.set(TICK, invalid);
+        assert_eq!(tick(&env), DEFAULT_TICK, "{invalid:?}");
+    }
+}
+
+#[test]
 fn m1_max_age_env_defaults_and_zero_disables() {
     let mut env = pplx_space_test_env::TestEnv::default();
     assert_eq!(

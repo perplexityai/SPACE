@@ -30,7 +30,11 @@ use crate::env_config;
 /// How often the dispatcher looks for newly queued operations. The claim is
 /// one indexed `FOR UPDATE SKIP LOCKED` statement that returns no rows when the
 /// queue is empty, so a short tick keeps pickup latency low at little cost.
-const DEFAULT_TICK: Duration = Duration::from_millis(200);
+/// Pickup waits half a tick on average, which at 200 ms was a large share of
+/// a warm-pool create's latency.
+const DEFAULT_TICK: Duration = Duration::from_millis(25);
+/// A failing claim fails on every tick; warn about it at most this often.
+const CLAIM_FAILURE_WARN_INTERVAL: Duration = Duration::from_secs(1);
 const DEFAULT_CLAIM_LIMIT: u32 = 64;
 const DEFAULT_CLAIM_STALE_AFTER: Duration = Duration::from_secs(60);
 const DEFAULT_RETRY_AFTER: Duration = Duration::from_secs(5);
@@ -382,6 +386,8 @@ pub async fn run<E>(
     let concurrency = config.execution_concurrency.max(1);
     let execution_config = OperationExecutionConfig::from(&config);
     let mut in_flight = JoinSet::new();
+    let mut last_claim_failure_warn: Option<Instant> = None;
+    let mut suppressed_claim_failures: u64 = 0;
 
     loop {
         tokio::select! {
@@ -413,7 +419,19 @@ pub async fn run<E>(
                         }
                     }
                     Err(error) => {
-                        tracing::warn!(error = %error, "public-operation-dispatcher claim failed");
+                        if last_claim_failure_warn
+                            .is_none_or(|at| at.elapsed() >= CLAIM_FAILURE_WARN_INTERVAL)
+                        {
+                            tracing::warn!(
+                                error = %error,
+                                suppressed = suppressed_claim_failures,
+                                "public-operation-dispatcher claim failed"
+                            );
+                            last_claim_failure_warn = Some(Instant::now());
+                            suppressed_claim_failures = 0;
+                        } else {
+                            suppressed_claim_failures += 1;
+                        }
                     }
                 }
             }
