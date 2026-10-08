@@ -61,7 +61,6 @@ impl Authenticator {
         &self,
         auth_header: Option<&str>,
         extensions: &http::Extensions,
-        rpc: &str,
     ) -> Result<TcpCallerIdentity, Status> {
         let token = bearer_token(auth_header)?;
 
@@ -79,9 +78,7 @@ impl Authenticator {
                     );
                     return Err(Status::unauthenticated("invalid token"));
                 }
-                let caller = reviewer
-                    .authenticate(token, peer_ip(extensions), rpc)
-                    .await?;
+                let caller = reviewer.authenticate(token, peer_ip(extensions)).await?;
                 Ok(TcpCallerIdentity::K8sJwt(caller))
             }
             Self::StaticToken(expected) => {
@@ -188,14 +185,10 @@ where
                 let identity = match auth_header {
                     Some(Ok(header)) => {
                         authenticator
-                            .authenticate(Some(&header), req.extensions(), rpc_name(&path))
+                            .authenticate(Some(&header), req.extensions())
                             .await?
                     }
-                    None => {
-                        authenticator
-                            .authenticate(None, req.extensions(), rpc_name(&path))
-                            .await?
-                    }
+                    None => authenticator.authenticate(None, req.extensions()).await?,
                     Some(Err(_)) => {
                         pplx_space_metrics::auth::decision(
                             "static",
@@ -229,22 +222,6 @@ fn peer_ip(extensions: &http::Extensions) -> Option<std::net::IpAddr> {
                 .and_then(|info| info.get_ref().remote_addr)
         })
         .map(|addr| addr.ip())
-}
-
-fn rpc_name(path: &str) -> &str {
-    match path.strip_prefix("/space.credential.manager.v1.CredentialManager/") {
-        Some(
-            method @ ("IssueIntermediateCertificate"
-            | "ExchangeToken"
-            | "Encrypt"
-            | "Decrypt"
-            | "GetOrIssueSandboxVolumeDek"
-            | "ResolveNetworkCredentials"
-            | "IssueDek"
-            | "UnwrapDek"),
-        ) => method,
-        _ => "unknown",
-    }
 }
 
 /// Health and reflection bypass auth so Kubernetes gRPC probes work without a

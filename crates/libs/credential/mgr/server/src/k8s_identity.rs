@@ -30,13 +30,15 @@ use std::net::IpAddr;
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::{fmt, str::FromStr};
 
 use base64::{Engine, engine::general_purpose};
+use futures_util::FutureExt;
 use k8s_openapi::api::authentication::v1::{TokenReview, TokenReviewSpec, TokenReviewStatus};
 use k8s_openapi::api::core::v1::Pod;
 use kube::api::PostParams;
 use kube::runtime::{
-    reflector::{self, Store},
+    reflector::{self, ObjectRef, Store},
     watcher,
 };
 use sha2::{Digest, Sha256};
@@ -45,9 +47,6 @@ use tonic::Status;
 
 use crate::auth::{ClientService, K8sIdentity};
 use crate::credential_store::CredentialStore;
-use credential_manager_pod_authorization::PodAuthorizationMode;
-
-mod credential_manager_pod_authorization;
 
 const SPACE_CREDMGR_K8S_AUTH_ENABLED_ENV: &str = "SPACE_CREDMGR_K8S_AUTH_ENABLED";
 const SPACE_CREDMGR_K8S_AUTH_NAMESPACE_ENV: &str = "SPACE_CREDMGR_K8S_AUTH_NAMESPACE";
@@ -69,6 +68,16 @@ const NODE_NAME_EXTRA: &str = "authentication.kubernetes.io/node-name";
 const NODE_UID_EXTRA: &str = "authentication.kubernetes.io/node-uid";
 
 const AUTH_SURFACE: &str = "credmgr-tcp";
+
+fn normalize_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(ip) => ip
+            .to_ipv4_mapped()
+            .map(IpAddr::V4)
+            .unwrap_or(IpAddr::V6(ip)),
+        ip => ip,
+    }
+}
 
 /// Errors that prevent the TCP listener from coming up with JWT identity
 /// enabled. Fail loud at boot rather than silently accept no callers.
@@ -123,6 +132,7 @@ pub struct K8sAuthConfig {
     max_inflight_reviews: usize,
     review_rate_per_sec: u64,
     review_timeout: Duration,
+    pod_authorization_mode: PodAuthorizationMode,
 }
 
 impl K8sAuthConfig {
@@ -158,6 +168,7 @@ impl K8sAuthConfig {
             max_inflight_reviews: DEFAULT_MAX_INFLIGHT,
             review_rate_per_sec: DEFAULT_REVIEW_RATE_PER_SEC,
             review_timeout: Duration::from_secs(DEFAULT_REVIEW_TIMEOUT_SECS),
+            pod_authorization_mode: PodAuthorizationMode::from_env(),
         }))
     }
 
@@ -167,6 +178,54 @@ impl K8sAuthConfig {
 
     pub fn audience(&self) -> &str {
         &self.audience
+    }
+}
+
+const MODE_ENV: &str = "SPACE_CREDMGR_AGENT_AUTHZ_MODE";
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum PodAuthorizationMode {
+    Observe,
+    #[default]
+    Enforce,
+}
+
+impl PodAuthorizationMode {
+    fn from_env() -> Self {
+        Self::configured(std::env::var(MODE_ENV).ok().as_deref())
+    }
+
+    fn configured(raw: Option<&str>) -> Self {
+        raw.and_then(|raw| raw.parse().ok()).unwrap_or_default()
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Observe => "observe",
+            Self::Enforce => "enforce",
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("pod authorization mode must be observe or enforce")]
+struct InvalidMode;
+
+impl FromStr for PodAuthorizationMode {
+    type Err = InvalidMode;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        match raw {
+            "observe" => Ok(Self::Observe),
+            "enforce" => Ok(Self::Enforce),
+            _ => Err(InvalidMode),
+        }
+    }
+}
+
+impl fmt::Display for PodAuthorizationMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -252,10 +311,8 @@ pub struct CredmgrTokenReviewer {
     in_flight: Arc<Mutex<HashMap<TokenCacheKey, Vec<tokio::sync::oneshot::Sender<()>>>>>,
     review_limiter: Arc<tokio::sync::Semaphore>,
     rate_limiter: Arc<ReviewRateLimiter>,
-    pod_api: kube::Api<Pod>,
     pods: Store<Pod>,
     credential_store: Option<Arc<dyn CredentialStore>>,
-    mode: PodAuthorizationMode,
 }
 
 impl CredmgrTokenReviewer {
@@ -272,7 +329,7 @@ impl CredmgrTokenReviewer {
         pplx_space_common_svc::kube_client::spawn_reflector(
             "credential-manager caller pods",
             writer,
-            pod_api.clone(),
+            pod_api,
             watcher::Config::default(),
             shutdown,
         );
@@ -283,10 +340,8 @@ impl CredmgrTokenReviewer {
             in_flight: Arc::new(Mutex::new(HashMap::new())),
             review_limiter,
             rate_limiter,
-            pod_api,
             pods,
             credential_store,
-            mode: PodAuthorizationMode::from_env(),
         }
     }
 
@@ -297,14 +352,113 @@ impl CredmgrTokenReviewer {
         &self,
         token: &str,
         peer: Option<IpAddr>,
-        rpc: &str,
     ) -> Result<K8sIdentity, Status> {
         let caller = self.resolve_token_identity(token).await?;
-        let result = self.check_pod_authorization(&caller, peer, rpc).await;
-        if self.mode == PodAuthorizationMode::Enforce {
+        let result = self.check_pod_authorization(&caller, peer).await;
+        if self.config.pod_authorization_mode == PodAuthorizationMode::Enforce {
             result?;
         }
         Ok(caller)
+    }
+
+    async fn check_pod_authorization(
+        &self,
+        caller: &K8sIdentity,
+        peer: Option<IpAddr>,
+    ) -> Result<(), Status> {
+        let peer = peer.map(normalize_ip);
+        // A cold reflector cannot establish the caller's current pod identity.
+        let pod = if matches!(self.pods.wait_until_ready().now_or_never(), Some(Ok(()))) {
+            self.pods
+                .get(
+                    &ObjectRef::new(caller.pod().pod_name().as_str())
+                        .within(self.config.namespace()),
+                )
+                .ok_or_else(|| Status::permission_denied("pod_not_found"))
+        } else {
+            Err(Status::unavailable("pod_cache_not_synced"))
+        };
+        // Evaluate every independent check even in observe mode and even if an
+        // earlier check failed. An unavailable dependency is not a denial.
+        let pod_failure = pod.as_ref().err().cloned();
+        let pod = pod.as_deref().ok();
+        let pod_check = |passes: bool, reason: &'static str| match &pod_failure {
+            Some(error) => Err(error.clone()),
+            None if passes => Ok(()),
+            None => Err(Status::permission_denied(reason)),
+        };
+        let uid = pod_check(
+            pod.is_some_and(|p| p.metadata.uid.as_deref() == Some(caller.pod().pod_uid().as_str())),
+            "pod_uid_mismatch",
+        );
+        let running = pod_check(
+            pod.and_then(|p| p.status.as_ref())
+                .and_then(|s| s.phase.as_deref())
+                == Some("Running"),
+            "pod_not_running",
+        );
+        let node = match &self.credential_store {
+            Some(store) => store
+                .registered_node(caller.node().node_name(), caller.node().node_uid())
+                .await
+                .map_err(|error| {
+                    tracing::warn!(%error, "pod authorization node lookup failed");
+                    Status::unavailable("node_store_unavailable")
+                })
+                .and_then(|node| {
+                    node.ok_or_else(|| Status::permission_denied("node_identity_mismatch"))
+                }),
+            None => Err(Status::unavailable("node_store_unavailable")),
+        };
+        let peer_check = match peer {
+            None => Err(Status::permission_denied("peer_address_missing")),
+            Some(peer) => pod_check(
+                pod.and_then(|p| p.status.as_ref())
+                    .and_then(|s| s.pod_ips.as_ref())
+                    .is_some_and(|ips| {
+                        ips.iter().any(|ip| {
+                            ip.ip
+                                .parse::<IpAddr>()
+                                .is_ok_and(|ip| normalize_ip(ip) == peer)
+                        })
+                    }),
+                "peer_ip_mismatch",
+            ),
+        };
+        let checks = [
+            ("pod_uid", uid),
+            ("pod_running", running),
+            ("node_identity", node.map(|_| ())),
+            ("peer_ip", peer_check),
+        ];
+        let mut failure = None;
+        for (check, result) in checks {
+            let result_tag = match (&result, self.config.pod_authorization_mode) {
+                (Ok(()), _) => "allow",
+                (Err(_), PodAuthorizationMode::Observe) => "would_deny",
+                (Err(_), PodAuthorizationMode::Enforce) => "deny",
+            };
+            pplx_space_metrics::credmgr::agent_authz(
+                check,
+                result_tag,
+                self.config.pod_authorization_mode.as_str(),
+            );
+            if let Err(error) = result {
+                tracing::warn!(check, result = result_tag, mode = %self.config.pod_authorization_mode,
+                    reason = error.message(), pod_uid = %caller.pod().pod_uid(),
+                    node_name = %caller.node().node_name(), peer_ip = ?peer,
+                    "credential pod authorization check failed");
+                // Infrastructure faults remain retryable even if another
+                // independent check also denied the request.
+                if failure.is_none() || error.code() == tonic::Code::Unavailable {
+                    failure = Some(error);
+                }
+            }
+        }
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
     async fn resolve_token_identity(&self, token: &str) -> Result<K8sIdentity, Status> {

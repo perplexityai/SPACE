@@ -1,7 +1,7 @@
 use super::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use crate::credential_store::{CredentialStoreError, SandboxOwner};
+use crate::credential_store::{CredentialStoreError, PgCredentialStore, SandboxOwner};
 use async_trait::async_trait;
 use k8s_openapi::api::authentication::v1::UserInfo;
 use kube::client::{Body, ClientBuilder};
@@ -50,18 +50,16 @@ fn test_config() -> K8sAuthConfig {
         max_inflight_reviews: 8,
         review_rate_per_sec: 1000,
         review_timeout: Duration::from_secs(5),
+        pod_authorization_mode: PodAuthorizationMode::Enforce,
     }
 }
 
 fn test_reviewer(config: K8sAuthConfig, client: kube::Client) -> CredmgrTokenReviewer {
     let review_limiter = Arc::new(tokio::sync::Semaphore::new(config.max_inflight_reviews));
     let rate_limiter = Arc::new(ReviewRateLimiter::new(config.review_rate_per_sec));
-    let pod_api = kube::Api::namespaced(client.clone(), config.namespace());
     let (pods, mut writer) = reflector::store();
     writer.apply_watcher_event(&watcher::Event::Init);
-    writer.apply_watcher_event(&watcher::Event::InitApply(
-        credential_manager_pod_authorization::tests::pod(),
-    ));
+    writer.apply_watcher_event(&watcher::Event::InitApply(pod()));
     writer.apply_watcher_event(&watcher::Event::InitDone);
     CredmgrTokenReviewer {
         reviews: kube::Api::all(client),
@@ -70,10 +68,8 @@ fn test_reviewer(config: K8sAuthConfig, client: kube::Client) -> CredmgrTokenRev
         in_flight: Arc::new(Mutex::new(HashMap::new())),
         review_limiter,
         rate_limiter,
-        pod_api,
         pods,
         credential_store: Some(Arc::new(Nodes(Some(NodeId::new())))),
-        mode: PodAuthorizationMode::Enforce,
     }
 }
 
@@ -187,13 +183,9 @@ pub(crate) fn caller_reviewer(service: ClientService) -> (CredmgrTokenReviewer, 
 async fn assert_status_rejected(status: TokenReviewStatus) {
     let (mut reviewer, _) = reviewer_returning_status(test_config(), status);
     for mode in [PodAuthorizationMode::Observe, PodAuthorizationMode::Enforce] {
-        reviewer.mode = mode;
+        Arc::make_mut(&mut reviewer.config).pod_authorization_mode = mode;
         let error = reviewer
-            .authenticate(
-                &projected_token(),
-                Some("10.0.0.2".parse().unwrap()),
-                "IssueDek",
-            )
+            .authenticate(&projected_token(), Some("10.0.0.2".parse().unwrap()))
             .await
             .unwrap_err();
         assert_eq!(error.code(), tonic::Code::Unauthenticated);
@@ -234,7 +226,7 @@ async fn valid_token_resolves_to_full_kubernetes_identity() {
     let token = projected_token();
 
     let identity = reviewer
-        .authenticate(&token, Some("10.0.0.2".parse().unwrap()), "IssueDek")
+        .authenticate(&token, Some("10.0.0.2".parse().unwrap()))
         .await
         .unwrap();
     assert_eq!(identity.service(), ClientService::VolumeManager);
@@ -245,7 +237,7 @@ async fn valid_token_resolves_to_full_kubernetes_identity() {
     // Second call is served from cache: no extra TokenReview.
     assert_eq!(
         reviewer
-            .authenticate(&token, Some("10.0.0.2".parse().unwrap()), "IssueDek")
+            .authenticate(&token, Some("10.0.0.2".parse().unwrap()))
             .await
             .unwrap(),
         identity
@@ -265,11 +257,7 @@ async fn ordinary_service_without_pod_or_node_binding_is_rejected() {
     )]));
     let (reviewer, calls) = reviewer_returning_status(test_config(), unbound);
     let error = reviewer
-        .authenticate(
-            &projected_token(),
-            Some("10.0.0.2".parse().unwrap()),
-            "IssueDek",
-        )
+        .authenticate(&projected_token(), Some("10.0.0.2".parse().unwrap()))
         .await
         .unwrap_err();
     assert_eq!(error.code(), tonic::Code::Unauthenticated);
@@ -394,42 +382,27 @@ async fn every_service_rechecks_pod_and_peer_on_cached_tokens() {
         let (mut reviewer, calls) = caller_reviewer(service);
         let token = projected_token();
         let peer = Some("10.0.0.2".parse().unwrap());
-        let identity = reviewer
-            .authenticate(&token, peer, "IssueDek")
-            .await
-            .unwrap();
+        let identity = reviewer.authenticate(&token, peer).await.unwrap();
         assert_eq!(identity, test_identity(service));
-        assert_eq!(
-            reviewer
-                .authenticate(&token, peer, "IssueDek")
-                .await
-                .unwrap(),
-            identity
-        );
+        assert_eq!(reviewer.authenticate(&token, peer).await.unwrap(), identity);
 
         for (peer, reason) in [
             (None, "peer_address_missing"),
             (Some("10.0.0.99".parse().unwrap()), "peer_ip_mismatch"),
         ] {
-            let error = reviewer
-                .authenticate(&token, peer, "IssueDek")
-                .await
-                .unwrap_err();
+            let error = reviewer.authenticate(&token, peer).await.unwrap_err();
             assert_eq!(error.code(), tonic::Code::PermissionDenied, "{service}");
             assert_eq!(error.message(), reason, "{service}");
         }
 
         let (pods, mut writer) = reflector::store();
-        let mut pod = credential_manager_pod_authorization::tests::pod();
+        let mut pod = pod();
         pod.metadata.uid = Some("replacement-pod-uid".into());
         writer.apply_watcher_event(&watcher::Event::Init);
         writer.apply_watcher_event(&watcher::Event::InitApply(pod));
         writer.apply_watcher_event(&watcher::Event::InitDone);
         reviewer.pods = pods;
-        let error = reviewer
-            .authenticate(&token, peer, "IssueDek")
-            .await
-            .unwrap_err();
+        let error = reviewer.authenticate(&token, peer).await.unwrap_err();
         assert_eq!(error.code(), tonic::Code::PermissionDenied, "{service}");
         assert_eq!(error.message(), "pod_uid_mismatch", "{service}");
         assert_eq!(
@@ -450,11 +423,7 @@ async fn unrecognized_service_account_is_permission_denied() {
         ),
     );
     let err = reviewer
-        .authenticate(
-            &projected_token(),
-            Some("10.0.0.2".parse().unwrap()),
-            "IssueDek",
-        )
+        .authenticate(&projected_token(), Some("10.0.0.2".parse().unwrap()))
         .await
         .unwrap_err();
     assert_eq!(err.code(), tonic::Code::PermissionDenied);
@@ -470,11 +439,7 @@ async fn audience_mismatch_is_unauthenticated() {
         ),
     );
     let err = reviewer
-        .authenticate(
-            &projected_token(),
-            Some("10.0.0.2".parse().unwrap()),
-            "IssueDek",
-        )
+        .authenticate(&projected_token(), Some("10.0.0.2".parse().unwrap()))
         .await
         .unwrap_err();
     assert_eq!(err.code(), tonic::Code::Unauthenticated);
@@ -486,11 +451,11 @@ async fn apiserver_outage_is_retryable_and_not_cached() {
     let token = projected_token();
 
     let first = reviewer
-        .authenticate(&token, Some("10.0.0.2".parse().unwrap()), "IssueDek")
+        .authenticate(&token, Some("10.0.0.2".parse().unwrap()))
         .await
         .unwrap_err();
     let second = reviewer
-        .authenticate(&token, Some("10.0.0.2".parse().unwrap()), "IssueDek")
+        .authenticate(&token, Some("10.0.0.2".parse().unwrap()))
         .await
         .unwrap_err();
 
@@ -781,5 +746,207 @@ fn validate_status_returns_username_on_success() {
             node_name: None,
             node_uid: None,
         })
+    );
+}
+
+fn auth(
+    pod: Option<Pod>,
+    credential_store: Option<Arc<dyn CredentialStore>>,
+    mode: PodAuthorizationMode,
+) -> CredmgrTokenReviewer {
+    let (pods, mut writer) = reflector::store();
+    writer.apply_watcher_event(&watcher::Event::Init);
+    if let Some(pod) = pod {
+        writer.apply_watcher_event(&watcher::Event::InitApply(pod));
+    }
+    writer.apply_watcher_event(&watcher::Event::InitDone);
+    let (mut reviewer, _) = caller_reviewer(ClientService::NodeCredentialAgent);
+    reviewer.pods = pods;
+    reviewer.credential_store = credential_store;
+    Arc::make_mut(&mut reviewer.config).pod_authorization_mode = mode;
+    reviewer
+}
+
+fn pod() -> Pod {
+    serde_json::from_value(serde_json::json!({
+        "metadata": {"name": TEST_POD_NAME, "namespace": "space", "uid": TEST_POD_UID,
+            "ownerReferences": [{"apiVersion": "apps/v1", "kind": "DaemonSet",
+                "name": "worker-agents", "uid": "ds-uid", "controller": true}]},
+        "spec": {"serviceAccountName": "space-credential-manager", "nodeName": TEST_NODE_NAME},
+        "status": {"phase": "Running", "podIPs": [{"ip": "10.0.0.2"}, {"ip": "2001:db8::2"}]}
+    }))
+    .unwrap()
+}
+
+#[tokio::test]
+async fn checks_current_pod_node_and_peer_in_both_modes() {
+    // Each mutation represents an otherwise legitimate request. The oracle is
+    // the four authorization conditions, not the check implementation.
+    for case in [
+        "allow",
+        "uid",
+        "phase",
+        "owner",
+        "no_owner",
+        "node",
+        "peer",
+        "missing_peer",
+        "missing_pod",
+    ] {
+        for mode in [PodAuthorizationMode::Observe, PodAuthorizationMode::Enforce] {
+            let node_id = NodeId::new();
+            let mut pod = pod();
+            let mut peer = Some("10.0.0.2".parse().unwrap());
+            let reason = match case {
+                "allow" => None,
+                "uid" => {
+                    pod.metadata.uid = Some("replacement".into());
+                    Some("pod_uid_mismatch")
+                }
+                "phase" => {
+                    pod.status.as_mut().unwrap().phase = Some("Pending".into());
+                    Some("pod_not_running")
+                }
+                "owner" => {
+                    let owner = &mut pod.metadata.owner_references.as_mut().unwrap()[0];
+                    owner.kind = "ReplicaSet".into();
+                    owner.name = "workload".into();
+                    None
+                }
+                "no_owner" => {
+                    pod.metadata.owner_references = None;
+                    None
+                }
+                "node" => Some("node_identity_mismatch"),
+                "peer" => {
+                    peer = Some("10.0.0.99".parse().unwrap());
+                    Some("peer_ip_mismatch")
+                }
+                "missing_peer" => {
+                    peer = None;
+                    Some("peer_address_missing")
+                }
+                "missing_pod" => Some("pod_not_found"),
+                _ => unreachable!(),
+            };
+            let auth = auth(
+                (case != "missing_pod").then_some(pod),
+                Some(Arc::new(Nodes((case != "node").then_some(node_id)))),
+                mode,
+            );
+            let result = auth.authenticate(&projected_token(), peer).await;
+            match (reason, mode) {
+                (None, _) | (Some(_), PodAuthorizationMode::Observe) => {
+                    result.unwrap();
+                }
+                (Some(reason), PodAuthorizationMode::Enforce) => {
+                    let error = result.unwrap_err();
+                    assert_eq!(error.code(), tonic::Code::PermissionDenied, "{case}");
+                    assert_eq!(error.message(), reason, "{case}");
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn normalizes_mapped_ipv4_and_accepts_each_pod_ip() {
+    let (auth, _) = caller_reviewer(ClientService::NodeCredentialAgent);
+    for ip in ["10.0.0.2", "::ffff:10.0.0.2", "2001:db8::2"] {
+        auth.authenticate(&projected_token(), Some(ip.parse().unwrap()))
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn dependency_failures_are_retryable_in_enforce_and_allowed_in_observe() {
+    for mode in [PodAuthorizationMode::Observe, PodAuthorizationMode::Enforce] {
+        let closed_pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://localhost/unused")
+            .unwrap();
+        closed_pool.close().await;
+        for (store, reason) in [
+            (
+                Some(Arc::new(Nodes(Some(NodeId::new()))) as Arc<dyn CredentialStore>),
+                "pod_cache_not_synced",
+            ),
+            (
+                Some(Arc::new(PgCredentialStore::new(closed_pool.clone()))),
+                "node_store_unavailable",
+            ),
+            (None, "node_store_unavailable"),
+        ] {
+            let mut auth = auth(Some(pod()), store, mode);
+            let (cold_store, _writer) = reflector::store();
+            if reason == "pod_cache_not_synced" {
+                auth.pods = cold_store;
+            }
+            let result = auth
+                .authenticate(&projected_token(), Some("10.0.0.2".parse().unwrap()))
+                .await;
+            match mode {
+                PodAuthorizationMode::Observe => {
+                    result.unwrap();
+                }
+                PodAuthorizationMode::Enforce => {
+                    let error = result.unwrap_err();
+                    assert_eq!(error.code(), tonic::Code::Unavailable);
+                    assert_eq!(error.message(), reason);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn missing_or_unknown_mode_enforces() {
+    for raw in [
+        None,
+        Some(""),
+        Some("ENFORCE"),
+        Some("observ"),
+        Some("enforce"),
+        Some("observe"),
+    ] {
+        let mode = PodAuthorizationMode::configured(raw);
+        assert_eq!(
+            mode,
+            if raw == Some("observe") {
+                PodAuthorizationMode::Observe
+            } else {
+                PodAuthorizationMode::Enforce
+            }
+        );
+    }
+}
+
+#[tokio::test]
+async fn authorization_tracks_reflector_readiness_creation_and_deletion() {
+    let (mut reviewer, calls) = caller_reviewer(ClientService::NodeCredentialAgent);
+    let (pods, mut writer) = reflector::store();
+    reviewer.pods = pods;
+    let token = projected_token();
+    let peer = Some("10.0.0.2".parse().unwrap());
+    let error = reviewer.authenticate(&token, peer).await.unwrap_err();
+    assert_eq!(error.code(), tonic::Code::Unavailable);
+    assert_eq!(error.message(), "pod_cache_not_synced");
+
+    writer.apply_watcher_event(&watcher::Event::Init);
+    writer.apply_watcher_event(&watcher::Event::InitDone);
+    let error = reviewer.authenticate(&token, peer).await.unwrap_err();
+    assert_eq!(error.code(), tonic::Code::PermissionDenied);
+    assert_eq!(error.message(), "pod_not_found");
+
+    writer.apply_watcher_event(&watcher::Event::Apply(pod()));
+    reviewer.authenticate(&token, peer).await.unwrap();
+    writer.apply_watcher_event(&watcher::Event::Delete(pod()));
+    let error = reviewer.authenticate(&token, peer).await.unwrap_err();
+    assert_eq!(error.code(), tonic::Code::PermissionDenied);
+    assert_eq!(error.message(), "pod_not_found");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "only the TokenReview is cached"
     );
 }

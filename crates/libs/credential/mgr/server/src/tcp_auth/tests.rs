@@ -85,21 +85,13 @@ async fn static_token_resolves_to_internal_principal_in_static_only_mode() {
     let authn = Authenticator::StaticToken("the-secret".to_owned());
     assert_eq!(
         authn
-            .authenticate(
-                Some("Bearer the-secret"),
-                &http::Extensions::new(),
-                "unknown"
-            )
+            .authenticate(Some("Bearer the-secret"), &http::Extensions::new())
             .await
             .unwrap(),
         TcpCallerIdentity::Plaintext
     );
     let err = authn
-        .authenticate(
-            Some("Bearer not-the-secret"),
-            &http::Extensions::new(),
-            "unknown",
-        )
+        .authenticate(Some("Bearer not-the-secret"), &http::Extensions::new())
         .await
         .unwrap_err();
     assert_eq!(err.code(), tonic::Code::Unauthenticated);
@@ -110,7 +102,7 @@ async fn missing_and_malformed_headers_are_unauthenticated() {
     let authn = Authenticator::StaticToken("the-secret".to_owned());
     assert_eq!(
         authn
-            .authenticate(None, &http::Extensions::new(), "unknown")
+            .authenticate(None, &http::Extensions::new())
             .await
             .unwrap_err()
             .code(),
@@ -118,7 +110,7 @@ async fn missing_and_malformed_headers_are_unauthenticated() {
     );
     assert_eq!(
         authn
-            .authenticate(Some("Basic abc"), &http::Extensions::new(), "unknown")
+            .authenticate(Some("Basic abc"), &http::Extensions::new())
             .await
             .unwrap_err()
             .code(),

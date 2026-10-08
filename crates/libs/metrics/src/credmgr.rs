@@ -7,9 +7,8 @@ use crate::emit::{counter, tag, timing_ms};
 
 /// Every Kubernetes caller pod authorization check, outside the TokenReview cache.
 /// `check`: pod_uid, pod_running, node_identity, peer_ip.
-/// `result`: allow, deny, would_deny. `mode`: observe, enforce. `rpc` is the
-/// recognized CredentialManager method name (unknown paths use `unknown`).
-pub fn agent_authz(check: &str, result: &str, mode: &str, rpc: &str) {
+/// `result`: allow, deny, would_deny. `mode`: observe, enforce.
+pub fn agent_authz(check: &str, result: &str, mode: &str) {
     counter(
         "credmgr.agent_authz",
         1,
@@ -17,7 +16,6 @@ pub fn agent_authz(check: &str, result: &str, mode: &str, rpc: &str) {
             tag("check", check),
             tag("result", result),
             tag("mode", mode),
-            tag("rpc", rpc),
         ],
     );
 }
