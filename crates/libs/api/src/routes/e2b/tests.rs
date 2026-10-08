@@ -2284,6 +2284,72 @@ fn create_translation_maps_tls_interception_metadata() {
     }
 }
 
+#[test]
+fn e2b_full_network_policy_translation() {
+    use pplx_space_net_common::NetworkPolicyV1;
+    let raw = serde_json::json!({
+        "version": "v1",
+        "egress": {"default_action": "deny", "allow": [{"domain": "sensor.example.com"}],
+                   "deny": [{"ip": "192.0.2.1"}]},
+        "tls_interception": "on",
+        "tls_interception_exemptions": [{"domain": "sensor.example.com"}],
+        "network_credential_rules": [{
+            "rule_id": "api", "destination": {"exact_host": "api.example.com", "path_prefix": "/"},
+            "credential_header_bindings": [{"header_name": "Authorization",
+                "credential_reference_id": "018f1e9d-7b7a-7d3a-8000-000000000001"}],
+            "supported_http_methods": ["GET"]
+        }]
+    })
+    .to_string();
+    let expected: NetworkPolicyV1 = serde_json::from_str(&raw).unwrap();
+    let mut request = base_create_request();
+    request
+        .metadata
+        .insert("network.policy".into(), raw.clone());
+    request.metadata.insert("name".into(), "sample".into());
+    let translated = translate_create_request(request.clone()).unwrap();
+    assert_eq!(translated.native.network_policy, Some(expected));
+    assert!(!translated.native.metadata.contains_key("network.policy"));
+    assert_eq!(
+        translated.native.metadata.get("name"),
+        Some(&SandboxMetadataValue::String("sample".into()))
+    );
+
+    for conflict in [
+        "network",
+        "allow_internet_access",
+        "network.tls_interception",
+    ] {
+        let mut conflicting = request.clone();
+        match conflict {
+            "network" => conflicting.network = Some(serde_json::json!({})),
+            "allow_internet_access" => conflicting.allow_internet_access = Some(false),
+            _ => {
+                conflicting.metadata.insert(conflict.into(), "off".into());
+            }
+        }
+        assert_eq!(
+            translate_create_request(conflicting).unwrap_err().status,
+            StatusCode::BAD_REQUEST
+        );
+    }
+    for malformed in [
+        "null",
+        "[]",
+        "{",
+        r#"{"egress":{"default_action":"invalid"}}"#,
+    ] {
+        let mut invalid = request.clone();
+        invalid
+            .metadata
+            .insert("network.policy".into(), malformed.into());
+        assert_eq!(
+            translate_create_request(invalid).unwrap_err().status,
+            StatusCode::BAD_REQUEST
+        );
+    }
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn e2b_tls_interception_on_persists_and_reads_through_policy_api() -> TestResult {
     use pplx_space_net_common::{NetworkPolicyV1, TlsInterception};
