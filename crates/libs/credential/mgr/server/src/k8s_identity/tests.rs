@@ -1,10 +1,11 @@
 use super::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use crate::credential_store::PgCredentialStore;
-use async_trait::async_trait;
 use k8s_openapi::api::authentication::v1::UserInfo;
 use kube::client::{Body, ClientBuilder};
+use pplx_space_common_core::types::NodeId;
+use pplx_space_common_svc::sql;
+use pplx_space_db_test_fixtures::{TestDb, TestDbResult, insert_ready_worker_node, pg_test_db};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 pub(super) const TEST_POD_NAME: &str = "caller-pod";
@@ -12,16 +13,19 @@ pub(super) const TEST_POD_UID: &str = "018f1f4f-7e70-7f10-bc3c-12b1605a18c5";
 pub(super) const TEST_NODE_NAME: &str = "kind-worker";
 pub(super) const TEST_NODE_UID: &str = "kind-worker-uid";
 
-pub(super) struct Nodes(pub(super) Option<NodeId>);
-#[async_trait]
-impl NodeRegistry for Nodes {
-    async fn registered_node(
-        &self,
-        _: &K8sNodeName,
-        _: &K8sNodeUid,
-    ) -> Result<Option<NodeId>, NodeRegistrationError> {
-        Ok(self.0)
-    }
+pub(crate) async fn registered_node_db() -> TestDbResult<TestDb> {
+    let db = pg_test_db().await?;
+    let id = NodeId::new();
+    insert_ready_worker_node(&db.pool, id).await?;
+    sqlx::query(sql!(
+        "INSERT INTO node_k8s (node_id, k8s_node_name, k8s_node_uid) VALUES ($1, $2, $3)"
+    ))
+    .bind(id)
+    .bind(TEST_NODE_NAME)
+    .bind(TEST_NODE_UID)
+    .execute(&db.pool)
+    .await?;
+    Ok(db)
 }
 
 fn test_config() -> K8sAuthConfig {
@@ -62,7 +66,7 @@ fn test_reviewer(config: K8sAuthConfig, client: kube::Client) -> CredmgrTokenRev
         review_limiter,
         rate_limiter,
         pods,
-        node_registry: Some(Arc::new(Nodes(Some(NodeId::new())))),
+        database_pool: None,
     }
 }
 
@@ -161,7 +165,10 @@ fn reviewer_returning_error(config: K8sAuthConfig) -> (CredmgrTokenReviewer, Arc
     (test_reviewer(config, client), calls)
 }
 
-pub(crate) fn caller_reviewer(service: ClientService) -> (CredmgrTokenReviewer, Arc<AtomicUsize>) {
+pub(crate) fn caller_reviewer(
+    service: ClientService,
+    database_pool: Option<sqlx::PgPool>,
+) -> (CredmgrTokenReviewer, Arc<AtomicUsize>) {
     let mut config = test_config();
     config.allowed = build_allowed_map("space", [service.to_string()]).unwrap();
     let reviewed = bound_status(
@@ -170,7 +177,9 @@ pub(crate) fn caller_reviewer(service: ClientService) -> (CredmgrTokenReviewer, 
         TEST_NODE_NAME,
         TEST_NODE_UID,
     );
-    reviewer_returning_status(config, reviewed)
+    let (mut reviewer, calls) = reviewer_returning_status(config, reviewed);
+    reviewer.database_pool = database_pool;
+    (reviewer, calls)
 }
 
 async fn assert_status_rejected(status: TokenReviewStatus) {
@@ -207,7 +216,8 @@ pub(super) fn projected_token() -> String {
 
 #[tokio::test]
 async fn valid_token_resolves_to_full_kubernetes_identity() {
-    let (reviewer, calls) = reviewer_returning_status(
+    let db = registered_node_db().await.unwrap();
+    let (mut reviewer, calls) = reviewer_returning_status(
         test_config(),
         bound_status(
             "space-credential-manager",
@@ -216,6 +226,7 @@ async fn valid_token_resolves_to_full_kubernetes_identity() {
             TEST_NODE_UID,
         ),
     );
+    reviewer.database_pool = Some(db.pool.clone());
     let token = projected_token();
 
     let identity = reviewer
@@ -371,8 +382,9 @@ async fn ordinary_service_with_multiple_node_uids_is_rejected() {
 
 #[tokio::test]
 async fn every_service_rechecks_pod_and_peer_on_cached_tokens() {
+    let db = registered_node_db().await.unwrap();
     for service in ClientService::ALL {
-        let (mut reviewer, calls) = caller_reviewer(service);
+        let (mut reviewer, calls) = caller_reviewer(service, Some(db.pool.clone()));
         let token = projected_token();
         let peer = Some("10.0.0.2".parse().unwrap());
         let identity = reviewer.resolve_token_identity(&token, peer).await.unwrap();
@@ -753,7 +765,7 @@ fn validate_status_returns_username_on_success() {
 
 fn auth(
     pod: Option<Pod>,
-    node_registry: Option<Arc<dyn NodeRegistry>>,
+    database_pool: Option<sqlx::PgPool>,
     mode: PodAuthorizationMode,
 ) -> CredmgrTokenReviewer {
     let (pods, mut writer) = reflector::store();
@@ -762,9 +774,8 @@ fn auth(
         writer.apply_watcher_event(&watcher::Event::InitApply(pod));
     }
     writer.apply_watcher_event(&watcher::Event::InitDone);
-    let (mut reviewer, _) = caller_reviewer(ClientService::NodeCredentialAgent);
+    let (mut reviewer, _) = caller_reviewer(ClientService::NodeCredentialAgent, database_pool);
     reviewer.pods = pods;
-    reviewer.node_registry = node_registry;
     Arc::make_mut(&mut reviewer.config).pod_authorization_mode = mode;
     reviewer
 }
@@ -782,6 +793,7 @@ fn pod() -> Pod {
 
 #[tokio::test]
 async fn checks_current_pod_node_and_peer_in_both_modes() {
+    let db = registered_node_db().await.unwrap();
     // Each mutation represents an otherwise legitimate request. The oracle is
     // the four authorization conditions, not the check implementation.
     for case in [
@@ -795,8 +807,20 @@ async fn checks_current_pod_node_and_peer_in_both_modes() {
         "missing_peer",
         "missing_pod",
     ] {
+        // Simulate a node replacement while the token still carries its old UID.
+        sqlx::query(sql!(
+            "UPDATE node_k8s SET k8s_node_uid = $1 WHERE k8s_node_name = $2"
+        ))
+        .bind(if case == "node" {
+            "replacement-node-uid"
+        } else {
+            TEST_NODE_UID
+        })
+        .bind(TEST_NODE_NAME)
+        .execute(&db.pool)
+        .await
+        .unwrap();
         for mode in [PodAuthorizationMode::Observe, PodAuthorizationMode::Enforce] {
-            let node_id = NodeId::new();
             let mut pod = pod();
             let mut peer = Some("10.0.0.2".parse().unwrap());
             let reason = match case {
@@ -833,7 +857,7 @@ async fn checks_current_pod_node_and_peer_in_both_modes() {
             };
             let auth = auth(
                 (case != "missing_pod").then_some(pod),
-                Some(Arc::new(Nodes((case != "node").then_some(node_id)))),
+                Some(db.pool.clone()),
                 mode,
             );
             let result = auth.resolve_token_identity(&projected_token(), peer).await;
@@ -851,35 +875,27 @@ async fn checks_current_pod_node_and_peer_in_both_modes() {
     }
 }
 
-#[tokio::test]
-async fn normalizes_mapped_ipv4_and_accepts_each_pod_ip() {
-    let (auth, _) = caller_reviewer(ClientService::NodeCredentialAgent);
+#[test]
+fn normalizes_mapped_ipv4_and_accepts_each_pod_ip() {
     for ip in ["10.0.0.2", "::ffff:10.0.0.2", "2001:db8::2"] {
-        auth.resolve_token_identity(&projected_token(), Some(ip.parse().unwrap()))
-            .await
-            .unwrap();
+        check_peer_ip(&pod(), Some(ip.parse().unwrap())).unwrap();
     }
 }
 
 #[tokio::test]
 async fn dependency_failures_are_retryable_in_enforce_and_allowed_in_observe() {
+    let db = registered_node_db().await.unwrap();
     for mode in [PodAuthorizationMode::Observe, PodAuthorizationMode::Enforce] {
         let closed_pool = sqlx::postgres::PgPoolOptions::new()
             .connect_lazy("postgres://localhost/unused")
             .unwrap();
         closed_pool.close().await;
-        for (store, reason) in [
-            (
-                Some(Arc::new(Nodes(Some(NodeId::new()))) as Arc<dyn NodeRegistry>),
-                "pod_cache_not_synced",
-            ),
-            (
-                Some(Arc::new(PgCredentialStore::new(closed_pool.clone()))),
-                "node_store_unavailable",
-            ),
+        for (pool, reason) in [
+            (Some(db.pool.clone()), "pod_cache_not_synced"),
+            (Some(closed_pool.clone()), "node_store_unavailable"),
             (None, "node_store_unavailable"),
         ] {
-            let mut auth = auth(Some(pod()), store, mode);
+            let mut auth = auth(Some(pod()), pool, mode);
             let (cold_store, _writer) = reflector::store();
             if reason == "pod_cache_not_synced" {
                 auth.pods = cold_store;
@@ -925,7 +941,9 @@ fn pod_authorization_enforces_only_when_explicitly_configured() {
 
 #[tokio::test]
 async fn authorization_tracks_reflector_readiness_creation_and_deletion() {
-    let (mut reviewer, calls) = caller_reviewer(ClientService::NodeCredentialAgent);
+    let db = registered_node_db().await.unwrap();
+    let (mut reviewer, calls) =
+        caller_reviewer(ClientService::NodeCredentialAgent, Some(db.pool.clone()));
     let (pods, mut writer) = reflector::store();
     reviewer.pods = pods;
     let token = projected_token();

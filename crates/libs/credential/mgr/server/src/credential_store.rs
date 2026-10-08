@@ -5,8 +5,6 @@ use pplx_space_common_core::types::{K8sNodeName, K8sNodeUid, NodeId, OrgId, Sand
 
 use pplx_space_common_svc::sql;
 
-use crate::k8s_identity::{NodeRegistrationError, NodeRegistry};
-
 /// The owner identity a sandbox's credentials are resolved against.
 #[derive(Debug, Clone, Copy)]
 pub struct SandboxOwner {
@@ -28,7 +26,7 @@ pub enum CredentialStoreError {
 /// Credential authorization lookups. A trait so handlers can be exercised without a
 /// live Postgres.
 #[tonic::async_trait]
-pub trait CredentialStore: NodeRegistry {
+pub trait CredentialStore: Send + Sync + 'static {
     /// Resolve the sandbox's owner, or `None` when the sandbox does not
     /// exist.
     async fn sandbox_owner(
@@ -47,22 +45,20 @@ impl PgCredentialStore {
     }
 }
 
-#[tonic::async_trait]
-impl NodeRegistry for PgCredentialStore {
-    async fn registered_node(
-        &self,
-        name: &K8sNodeName,
-        uid: &K8sNodeUid,
-    ) -> Result<Option<NodeId>, NodeRegistrationError> {
-        Ok(sqlx::query_scalar(sql!(
-            "SELECT node_id FROM node_k8s
-             WHERE k8s_node_name = $1 AND k8s_node_uid = $2 AND k8s_node_uid IS NOT NULL"
-        ))
-        .bind(name.as_str())
-        .bind(uid.as_str())
-        .fetch_optional(&self.pool)
-        .await?)
-    }
+/// Require both name and UID; a registration without a UID cannot match.
+pub(crate) async fn registered_node(
+    executor: impl sqlx::PgExecutor<'_>,
+    name: &K8sNodeName,
+    uid: &K8sNodeUid,
+) -> Result<Option<NodeId>, CredentialStoreError> {
+    Ok(sqlx::query_scalar(sql!(
+        "SELECT node_id FROM node_k8s
+         WHERE k8s_node_name = $1 AND k8s_node_uid = $2 AND k8s_node_uid IS NOT NULL"
+    ))
+    .bind(name.as_str())
+    .bind(uid.as_str())
+    .fetch_optional(executor)
+    .await?)
 }
 
 #[tonic::async_trait]

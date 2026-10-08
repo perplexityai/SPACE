@@ -6,8 +6,13 @@ async fn cached_token_is_reauthorized_for_each_transport_peer() {
     use std::sync::atomic::Ordering;
     use tonic::transport::server::TcpConnectInfo;
     use tower::ServiceExt;
-    let (reviewer, reviews) =
-        crate::k8s_identity::tests::caller_reviewer(ClientService::NodeCredentialAgent);
+    let db = crate::k8s_identity::tests::registered_node_db()
+        .await
+        .unwrap();
+    let (reviewer, reviews) = crate::k8s_identity::tests::caller_reviewer(
+        ClientService::NodeCredentialAgent,
+        Some(db.pool.clone()),
+    );
     let layer = CredmgrTcpAuthLayer {
         authenticator: Arc::new(Authenticator::ProjectedToken(Box::new(reviewer))),
     };

@@ -690,6 +690,7 @@ async fn initialize_authority_service(
 
     let mut service = CredentialManagerService::new(key_wrapper, peer_process_check_mode)
         .with_exchange_token_mode(exchange_token_mode);
+    service.database_pool = pool.clone();
     if let Some(role) = storage_vend_role {
         service = service.with_storage_vend_role(role);
     }
@@ -1277,10 +1278,7 @@ async fn serve_tcp_until(
             );
             crate::tcp_auth::CredmgrTcpAuthLayer::projected_token(
                 config,
-                service
-                    .credential_store
-                    .clone()
-                    .map(|store| store as Arc<dyn crate::k8s_identity::NodeRegistry>),
+                service.database_pool.clone(),
                 shutdown_token.clone(),
             )
             .await

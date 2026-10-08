@@ -233,9 +233,11 @@ pub struct CredentialManagerService {
     /// instances with database access (the control-plane deployment);
     /// node-local instances refuse those RPCs with FAILED_PRECONDITION.
     kek_store: Option<Arc<dyn KekStore>>,
-    /// Sandbox-owner and registered-node reads for credential authorization.
+    /// Shared authority pool used for TCP caller node-registration checks.
+    pub(crate) database_pool: Option<sqlx::PgPool>,
+    /// Sandbox-owner reads for volume encryption.
     /// Present only on instances with database access.
-    pub(crate) credential_store: Option<Arc<dyn CredentialStore>>,
+    credential_store: Option<Arc<dyn CredentialStore>>,
     /// Tenant, placement, template-owner, and per-org role reads for scoped
     /// storage credential exchange. Present only on the authority.
     storage_vend_store: Option<Arc<dyn StorageVendStore>>,
@@ -315,6 +317,7 @@ impl CredentialManagerService {
             storage_vend_role: None,
             key_wrapper,
             kek_store: None,
+            database_pool: None,
             credential_store: None,
             storage_vend_store: None,
             volume_wrap_store: None,

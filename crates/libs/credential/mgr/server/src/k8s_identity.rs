@@ -45,9 +45,10 @@ use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 use tonic::Status;
 
-use pplx_space_common_core::types::{K8sNodeName, K8sNodeUid, NodeId, PodName, PodUid};
+use pplx_space_common_core::types::{PodName, PodUid};
 
 use crate::auth::{ClientService, K8sIdentity, K8sNodeIdentity};
+use crate::credential_store::registered_node;
 
 const SPACE_CREDMGR_K8S_AUTH_ENABLED_ENV: &str = "SPACE_CREDMGR_K8S_AUTH_ENABLED";
 const SPACE_CREDMGR_K8S_AUTH_NAMESPACE_ENV: &str = "SPACE_CREDMGR_K8S_AUTH_NAMESPACE";
@@ -291,23 +292,6 @@ fn allowed_service_names() -> Vec<String> {
     }
 }
 
-/// Read-only lookup of registered SPACE node incarnations.
-#[tonic::async_trait]
-pub trait NodeRegistry: Send + Sync + 'static {
-    /// Require both name and UID; a registration without a UID cannot match.
-    async fn registered_node(
-        &self,
-        name: &K8sNodeName,
-        uid: &K8sNodeUid,
-    ) -> Result<Option<NodeId>, NodeRegistrationError>;
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum NodeRegistrationError {
-    #[error("node registration query failed: {0}")]
-    Query(#[from] sqlx::Error),
-}
-
 /// Validates projected ServiceAccount tokens against the apiserver and maps
 /// them to credmgr [`ClientService`] identities, with caching + backpressure.
 /// Pod, node-registration, and transport-peer checks run on every request.
@@ -321,14 +305,14 @@ pub struct CredmgrTokenReviewer {
     rate_limiter: Arc<ReviewRateLimiter>,
     pods: Store<Pod>,
     // Observe mode supports instances without a database; enforcement rejects them.
-    node_registry: Option<Arc<dyn NodeRegistry>>,
+    database_pool: Option<sqlx::PgPool>,
 }
 
 impl CredmgrTokenReviewer {
     pub(crate) fn new(
         config: K8sAuthConfig,
         client: kube::Client,
-        node_registry: Option<Arc<dyn NodeRegistry>>,
+        database_pool: Option<sqlx::PgPool>,
         shutdown: CancellationToken,
     ) -> Self {
         let review_limiter = Arc::new(tokio::sync::Semaphore::new(config.max_inflight_reviews));
@@ -350,7 +334,7 @@ impl CredmgrTokenReviewer {
             review_limiter,
             rate_limiter,
             pods,
-            node_registry,
+            database_pool,
         }
     }
 
@@ -406,12 +390,11 @@ impl CredmgrTokenReviewer {
     }
 
     async fn check_node_registration(&self, node: &K8sNodeIdentity) -> Result<(), Status> {
-        let registry = self
-            .node_registry
+        let pool = self
+            .database_pool
             .as_ref()
             .ok_or_else(|| Status::unavailable("node_store_unavailable"))?;
-        let registered = registry
-            .registered_node(node.node_name(), node.node_uid())
+        let registered = registered_node(pool, node.node_name(), node.node_uid())
             .await
             .map_err(|error| {
                 tracing::warn!(%error, "node registration lookup failed");
