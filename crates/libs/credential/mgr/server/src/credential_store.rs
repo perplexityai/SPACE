@@ -5,6 +5,8 @@ use pplx_space_common_core::types::{K8sNodeName, K8sNodeUid, NodeId, OrgId, Sand
 
 use pplx_space_common_svc::sql;
 
+use crate::k8s_identity::{NodeRegistrationError, NodeRegistry};
+
 /// The owner identity a sandbox's credentials are resolved against.
 #[derive(Debug, Clone, Copy)]
 pub struct SandboxOwner {
@@ -26,15 +28,7 @@ pub enum CredentialStoreError {
 /// Credential authorization lookups. A trait so handlers can be exercised without a
 /// live Postgres.
 #[tonic::async_trait]
-pub trait CredentialStore: Send + Sync + 'static {
-    /// Resolve the current registered node incarnation. A missing UID cannot
-    /// authorize a caller, including an older row for the same node name.
-    async fn registered_node(
-        &self,
-        name: &K8sNodeName,
-        uid: &K8sNodeUid,
-    ) -> Result<Option<NodeId>, CredentialStoreError>;
-
+pub trait CredentialStore: NodeRegistry {
     /// Resolve the sandbox's owner, or `None` when the sandbox does not
     /// exist.
     async fn sandbox_owner(
@@ -54,12 +48,12 @@ impl PgCredentialStore {
 }
 
 #[tonic::async_trait]
-impl CredentialStore for PgCredentialStore {
+impl NodeRegistry for PgCredentialStore {
     async fn registered_node(
         &self,
         name: &K8sNodeName,
         uid: &K8sNodeUid,
-    ) -> Result<Option<NodeId>, CredentialStoreError> {
+    ) -> Result<Option<NodeId>, NodeRegistrationError> {
         Ok(sqlx::query_scalar(sql!(
             "SELECT node_id FROM node_k8s
              WHERE k8s_node_name = $1 AND k8s_node_uid = $2 AND k8s_node_uid IS NOT NULL"
@@ -69,7 +63,10 @@ impl CredentialStore for PgCredentialStore {
         .fetch_optional(&self.pool)
         .await?)
     }
+}
 
+#[tonic::async_trait]
+impl CredentialStore for PgCredentialStore {
     async fn sandbox_owner(
         &self,
         sandbox_id: SandboxId,

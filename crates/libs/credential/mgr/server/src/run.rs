@@ -1277,7 +1277,10 @@ async fn serve_tcp_until(
             );
             crate::tcp_auth::CredmgrTcpAuthLayer::projected_token(
                 config,
-                service.credential_store.clone(),
+                service
+                    .credential_store
+                    .clone()
+                    .map(|store| store as Arc<dyn crate::k8s_identity::NodeRegistry>),
                 shutdown_token.clone(),
             )
             .await

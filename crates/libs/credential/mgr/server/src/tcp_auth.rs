@@ -32,8 +32,7 @@ use tonic::Status;
 use tower::{Layer, Service};
 
 use crate::auth::K8sIdentity;
-use crate::credential_store::CredentialStore;
-use crate::k8s_identity::{CredmgrTokenReviewer, K8sAuthConfig, K8sAuthConfigError};
+use crate::k8s_identity::{CredmgrTokenReviewer, K8sAuthConfig, K8sAuthConfigError, NodeRegistry};
 use tokio_util::sync::CancellationToken;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
@@ -78,7 +77,9 @@ impl Authenticator {
                     );
                     return Err(Status::unauthenticated("invalid token"));
                 }
-                let caller = reviewer.authenticate(token, peer_ip(extensions)).await?;
+                let caller = reviewer
+                    .resolve_token_identity(token, peer_ip(extensions))
+                    .await?;
                 Ok(TcpCallerIdentity::K8sJwt(caller))
             }
             Self::StaticToken(expected) => {
@@ -110,11 +111,11 @@ impl CredmgrTcpAuthLayer {
     /// client between TokenReview and the caller pod reflector.
     pub async fn projected_token(
         config: K8sAuthConfig,
-        credential_store: Option<Arc<dyn CredentialStore>>,
+        node_registry: Option<Arc<dyn NodeRegistry>>,
         shutdown: CancellationToken,
     ) -> Result<Self, K8sAuthConfigError> {
         let client = pplx_space_common_svc::kube_client::traced_kube_client_from_env().await?;
-        let reviewer = CredmgrTokenReviewer::new(config, client, credential_store, shutdown);
+        let reviewer = CredmgrTokenReviewer::new(config, client, node_registry, shutdown);
         tracing::info!(
             mode = "k8s_token_review",
             "credmgr TCP auth initialized; static token is not accepted"
