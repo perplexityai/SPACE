@@ -15,7 +15,7 @@ use kube::api::{Api, DeleteParams, Preconditions};
 use pplx_space_api::controllers::substrate::kubernetes::KubernetesSubstrate;
 use pplx_space_common_core::types::{PodUid, SandboxId};
 
-use super::classify::{RestorePodSnapshot, SandboxRestoreState, pod_is_restore};
+use super::classify::{RestorePodSnapshot, SandboxRestoreState};
 
 /// Outcome of a pod delete attempt against the apiserver.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -110,8 +110,10 @@ impl PodBackend for KubernetesPodBackend {
             .iter()
             // Gate the (allocating) snapshot build on the cheap annotation
             // check so the per-tick cost scales with the restore-pod subset,
-            // not every sandbox pod in the cache.
-            .filter(|pod| pod_is_restore(pod))
+            // not every sandbox pod in the cache. A restored sandbox's pod
+            // keeps the annotation after the restore completes, so the
+            // sandbox-row disposition, not this filter, decides orphanhood.
+            .filter(|pod| pod.has_restore_annotation())
             .map(|pod| RestorePodSnapshot::from_pod(pod))
             .collect()
     }

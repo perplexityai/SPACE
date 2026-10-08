@@ -30,6 +30,7 @@ use pplx_space_common_core::{
         DEFAULT_SANDBOX_NODE_SELECTOR_VALUE, DEFAULT_SANDBOX_POD_IMAGE,
         DEFAULT_SANDBOX_RUNTIME_CLASS, SANDBOX_INTERNAL_SECRET_NAME_ENV,
         SANDBOX_NODE_SELECTOR_LABELS_ENV, SANDBOX_NODE_SELECTOR_VALUE_ENV, SANDBOX_POD_IMAGE_ENV,
+        SANDBOX_POOL_CONFIG_ID_KEY, SANDBOX_POOL_ROLE_KEY,
     },
     types::{ContentHash, Digest, MemorySize, TemplateName, VcpuCount},
 };
@@ -749,10 +750,16 @@ fn ready_slot_requires_matching_pod_identity() {
         }),
     };
 
-    assert!(ready_slot_matches_pod(&slot, &pod));
+    assert!(ready_slot_matches_pod(
+        &slot,
+        &SandboxPodView::from(pod.clone())
+    ));
 
     pod.metadata.uid = Some("replacement-pod-uid".to_string());
-    assert!(!ready_slot_matches_pod(&slot, &pod));
+    assert!(!ready_slot_matches_pod(
+        &slot,
+        &SandboxPodView::from(pod.clone())
+    ));
 }
 
 #[tokio::test]
@@ -762,7 +769,7 @@ async fn claimable_slot_metadata_rejects_running_pod_until_sandbox_started() {
 
     let metadata = claimable_slot_metadata(
         &slot,
-        &pod,
+        &SandboxPodView::from(pod.clone()),
         &FakeReadyProbe { started: false },
         "sha256:test",
     )
@@ -778,7 +785,7 @@ async fn claimable_slot_metadata_accepts_started_sandbox() {
 
     let metadata = claimable_slot_metadata(
         &slot,
-        &pod,
+        &SandboxPodView::from(pod.clone()),
         &FakeReadyProbe { started: true },
         "sha256:test",
     )
@@ -861,7 +868,7 @@ async fn observe_warming_slots_retries_not_started_probe_and_promotes_slot() -> 
     );
     let (pod_store, mut pod_writer) = reflector::store();
     pod_writer.apply_watcher_event(&Event::Init);
-    pod_writer.apply_watcher_event(&Event::InitApply(pod));
+    pod_writer.apply_watcher_event(&Event::InitApply(SandboxPodView::from(pod)));
     pod_writer.apply_watcher_event(&Event::InitDone);
     let (node_store, _) = reflector::store();
     let reconciler = Reconciler {
@@ -1775,29 +1782,29 @@ fn cached_warm_pods_by_name_filters_to_pool_config() {
     other_config.id = Uuid::from_str("019e6040-0f0f-7296-b521-a1043e0ff49b").unwrap();
     let config_id = config.id.to_string();
     let other_config_id = other_config.id.to_string();
-    let (pod_store, mut pod_writer) = reflector::store::<Pod>();
+    let (pod_store, mut pod_writer) = reflector::store::<SandboxPodView>();
     pod_writer.apply_watcher_event(&Event::Init);
-    pod_writer.apply_watcher_event(&Event::InitApply(pod_with_labels(
+    pod_writer.apply_watcher_event(&Event::InitApply(SandboxPodView::from(pod_with_labels(
         "matching-warm",
         [
             (SANDBOX_POOL_ROLE_KEY, SANDBOX_POOL_ROLE_WARM),
             (SANDBOX_POOL_CONFIG_ID_KEY, config_id.as_str()),
         ],
-    )));
-    pod_writer.apply_watcher_event(&Event::InitApply(pod_with_labels(
+    ))));
+    pod_writer.apply_watcher_event(&Event::InitApply(SandboxPodView::from(pod_with_labels(
         "other-config-warm",
         [
             (SANDBOX_POOL_ROLE_KEY, SANDBOX_POOL_ROLE_WARM),
             (SANDBOX_POOL_CONFIG_ID_KEY, other_config_id.as_str()),
         ],
-    )));
-    pod_writer.apply_watcher_event(&Event::InitApply(pod_with_labels(
+    ))));
+    pod_writer.apply_watcher_event(&Event::InitApply(SandboxPodView::from(pod_with_labels(
         "matching-config-non-warm",
         [
             (SANDBOX_POOL_ROLE_KEY, "claimed"),
             (SANDBOX_POOL_CONFIG_ID_KEY, config_id.as_str()),
         ],
-    )));
+    ))));
     pod_writer.apply_watcher_event(&Event::InitDone);
 
     let pods = cached_warm_pods_by_name(&pod_store, &config);
@@ -1922,8 +1929,11 @@ fn unready_warming_pod_deletion_keeps_young_pending_pods() {
     let slot = pool_slot_created_at(OffsetDateTime::now_utc());
     let pod = pod_with_phase("Pending");
 
-    let should_delete =
-        should_delete_unready_warming_pod(&pod, &slot, super::DEFAULT_WARMING_SLOT_TIMEOUT);
+    let should_delete = should_delete_unready_warming_pod(
+        &SandboxPodView::from(pod.clone()),
+        &slot,
+        super::DEFAULT_WARMING_SLOT_TIMEOUT,
+    );
 
     assert!(!should_delete);
 }
@@ -1933,8 +1943,11 @@ fn unready_warming_pod_deletion_removes_old_pending_pods() {
     let slot = pool_slot_created_at(OffsetDateTime::now_utc() - TimeDuration::minutes(11));
     let pod = pod_with_phase("Pending");
 
-    let should_delete =
-        should_delete_unready_warming_pod(&pod, &slot, super::DEFAULT_WARMING_SLOT_TIMEOUT);
+    let should_delete = should_delete_unready_warming_pod(
+        &SandboxPodView::from(pod.clone()),
+        &slot,
+        super::DEFAULT_WARMING_SLOT_TIMEOUT,
+    );
 
     assert!(should_delete);
 }
@@ -1944,8 +1957,11 @@ fn unready_warming_pod_deletion_removes_failed_pods() {
     let slot = pool_slot_created_at(OffsetDateTime::now_utc());
     let pod = pod_with_phase("Failed");
 
-    let should_delete =
-        should_delete_unready_warming_pod(&pod, &slot, super::DEFAULT_WARMING_SLOT_TIMEOUT);
+    let should_delete = should_delete_unready_warming_pod(
+        &SandboxPodView::from(pod.clone()),
+        &slot,
+        super::DEFAULT_WARMING_SLOT_TIMEOUT,
+    );
 
     assert!(should_delete);
 }

@@ -64,12 +64,9 @@ use jiff::{SignedDuration, Timestamp};
 use k8s_openapi::api::core::v1::Pod;
 use kube::Client;
 use kube::api::{Api, DeleteParams, Preconditions};
+use pplx_space_api::controllers::substrate::kubernetes::{SandboxPodKey, SandboxPodView};
 use pplx_space_cluster_pool::WarmPoolStore;
-use pplx_space_common_core::kubernetes::{
-    SANDBOX_CHECKPOINT_ANNOTATION, SANDBOX_ID_ANNOTATION, SANDBOX_POOL_ROLE_KEY,
-    SANDBOX_POOL_ROLE_WARM, SANDBOX_POOL_SLOT_ID_KEY,
-    SANDBOX_SUSPEND_RESTORE_SOURCE_NODE_ANNOTATION, SANDBOX_SUSPEND_RESTORE_STORAGE_URI_ANNOTATION,
-};
+use pplx_space_common_core::kubernetes::SANDBOX_POOL_ROLE_WARM;
 use pplx_space_common_core::types::{PodUid, SandboxId};
 use pplx_space_events::{
     SandboxEvent, SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
@@ -86,14 +83,6 @@ pub(crate) const DEFAULT_MAX_DELETES_PER_TICK: u32 = 20;
 /// which runs inside the warm-pool reconcile tick, can't starve slot cleanup /
 /// replenishment while a backlog drains.
 pub(crate) const DEFAULT_MAX_STAGE_DURATION: Duration = Duration::from_secs(10);
-
-/// Restore annotations `build_sandbox_pod` stamps only on restore pods; a warm
-/// slot pod carries none. A pod that ever restored is excluded conservatively.
-const RESTORE_ANNOTATIONS: &[&str] = &[
-    SANDBOX_CHECKPOINT_ANNOTATION,
-    SANDBOX_SUSPEND_RESTORE_STORAGE_URI_ANNOTATION,
-    SANDBOX_SUSPEND_RESTORE_SOURCE_NODE_ANNOTATION,
-];
 
 /// Per-call I/O timeouts, sourced from the warm-pool reconciler's own
 /// `io_timeouts`. Bundled so [`sweep`] stays within clippy's argument ceiling.
@@ -184,39 +173,28 @@ pub(crate) struct WarmPodSnapshot {
 }
 
 impl WarmPodSnapshot {
-    pub(crate) fn from_pod(pod: &Pod) -> Self {
-        let meta = &pod.metadata;
-        let annotations = meta.annotations.as_ref();
-        let labels = meta.labels.as_ref();
-
-        let slot_id = annotations
-            .and_then(|a| a.get(SANDBOX_POOL_SLOT_ID_KEY))
+    pub(crate) fn from_pod(pod: &SandboxPodView) -> Self {
+        let slot_id = pod
+            .annotation(SandboxPodKey::PoolSlotId)
             .and_then(|raw| Uuid::parse_str(raw).ok());
-        let sandbox_id = annotations
-            .and_then(|a| a.get(SANDBOX_ID_ANNOTATION))
-            .or_else(|| labels.and_then(|l| l.get(SANDBOX_ID_ANNOTATION)))
+        let sandbox_id = pod
+            .annotation_or_label(SandboxPodKey::SandboxId)
             .and_then(|raw| raw.parse::<SandboxId>().ok());
-        let is_warm_pool = labels
-            .and_then(|l| l.get(SANDBOX_POOL_ROLE_KEY))
-            .map(String::as_str)
-            == Some(SANDBOX_POOL_ROLE_WARM);
-        let is_restore =
-            annotations.is_some_and(|a| RESTORE_ANNOTATIONS.iter().any(|key| a.contains_key(*key)));
-        let status = pod.status.as_ref();
-        let phase_terminal = matches!(
-            status.and_then(|s| s.phase.as_deref()),
-            Some("Succeeded" | "Failed")
-        );
+        let is_warm_pool = is_warm_pool_labelled(pod);
+        // A warm slot pod carries no restore annotation; a pod that ever
+        // restored is excluded conservatively.
+        let is_restore = pod.has_restore_annotation();
+        let phase_terminal = pod.is_terminal();
 
         Self {
-            pod_name: meta.name.clone().unwrap_or_default(),
-            pod_uid: meta.uid.as_deref().and_then(|uid| uid.parse().ok()),
-            resource_version: meta.resource_version.clone(),
+            pod_name: pod.name().to_owned(),
+            pod_uid: pod.uid().and_then(|uid| uid.parse().ok()),
+            resource_version: pod.resource_version().map(str::to_owned),
             slot_id,
             sandbox_id,
             is_warm_pool,
             is_restore,
-            terminating: meta.deletion_timestamp.is_some(),
+            terminating: pod.is_deleting(),
             phase_terminal,
             terminal_since: terminal_since(pod),
         }
@@ -521,7 +499,7 @@ async fn act_on_orphan(
     let name = &candidate.snapshot.pod_name;
 
     let fresh = match timed_at(deadline, timeouts.k8s, pods.get_opt(name)).await {
-        Ok(Ok(pod)) => pod.as_ref().map(WarmPodSnapshot::from_pod),
+        Ok(Ok(pod)) => pod.map(|pod| WarmPodSnapshot::from_pod(&pod.into())),
         other => {
             report.errors += 1;
             emit(cfg, O::ReadError, candidate, Some(kube_err(other)));
@@ -696,38 +674,28 @@ fn emit_cleanup(sandbox_id: SandboxId, candidate: &Candidate, outcome: CleanupOu
     .emit_with(details);
 }
 
-/// Cheap `pool-role=warm` label check on the raw reflector object.
-fn is_warm_pool_labelled(pod: &Pod) -> bool {
-    pod.metadata
-        .labels
-        .as_ref()
-        .and_then(|labels| labels.get(SANDBOX_POOL_ROLE_KEY))
-        .map(String::as_str)
-        == Some(SANDBOX_POOL_ROLE_WARM)
+/// Cheap `pool-role=warm` label check on the cached view.
+fn is_warm_pool_labelled(pod: &SandboxPodView) -> bool {
+    pod.label(SandboxPodKey::PoolRole) == Some(SANDBOX_POOL_ROLE_WARM)
 }
 
 /// When the pod became terminal (see [`WarmPodSnapshot::terminal_since`]): the
 /// latest container `finishedAt`, else the `creationTimestamp` **only** for a
 /// pod that never ran a container (creation ≈ failure time then), else `None`.
-fn terminal_since(pod: &Pod) -> Option<Timestamp> {
+fn terminal_since(pod: &SandboxPodView) -> Option<Timestamp> {
     latest_terminated_at(pod).or_else(|| {
         if never_ran_container(pod) {
-            pod.metadata.creation_timestamp.as_ref().map(|t| t.0)
+            pod.creation_timestamp()
         } else {
             None
         }
     })
 }
 
-fn latest_terminated_at(pod: &Pod) -> Option<Timestamp> {
-    let status = pod.status.as_ref()?;
-    let app = status.container_statuses.iter().flatten();
-    let init = status.init_container_statuses.iter().flatten();
-    app.chain(init)
-        .filter_map(|c| c.state.as_ref())
-        .filter_map(|state| state.terminated.as_ref())
-        .filter_map(|term| term.finished_at.as_ref())
-        .map(|t| t.0)
+fn latest_terminated_at(pod: &SandboxPodView) -> Option<Timestamp> {
+    pod.container_statuses()
+        .app_and_init()
+        .filter_map(|state| state.terminated.as_ref()?.finished_at)
         .max()
 }
 
@@ -735,19 +703,9 @@ fn latest_terminated_at(pod: &Pod) -> Option<Timestamp> {
 /// ran a container (e.g. a `Failed` from admission), so `creationTimestamp` is
 /// a safe terminal-since. A pod that ran always carries container status, so
 /// this stays `false` for the long-lived-then-terminal case.
-fn never_ran_container(pod: &Pod) -> bool {
-    let Some(status) = pod.status.as_ref() else {
-        return true;
-    };
-    let app_empty = status
-        .container_statuses
-        .as_ref()
-        .is_none_or(|v| v.is_empty());
-    let init_empty = status
-        .init_container_statuses
-        .as_ref()
-        .is_none_or(|v| v.is_empty());
-    app_empty && init_empty
+fn never_ran_container(pod: &SandboxPodView) -> bool {
+    let statuses = pod.container_statuses();
+    statuses.containers.is_empty() && statuses.init_containers.is_empty()
 }
 
 /// Wrap one I/O future in a timeout so a hung apiserver / Postgres call can't

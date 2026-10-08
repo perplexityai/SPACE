@@ -1,12 +1,12 @@
 use std::time::Duration;
 
-use futures_util::{Stream, StreamExt};
+use futures_util::{Stream, StreamExt, TryStreamExt};
 use k8s_openapi::api::core::v1::Pod;
 use kube::{
     Api, Client,
     runtime::{
         WatchStreamExt,
-        reflector::{self, ObjectRef, Store},
+        reflector::{ObjectRef, Store},
         watcher::{self, Config as WatcherConfig},
     },
 };
@@ -14,6 +14,8 @@ use tokio::{
     sync::{broadcast, watch},
     time::{Instant, sleep_until, timeout},
 };
+
+use super::sandbox_pod_view::{self, NodeNetworkSlots, SandboxPodView, SandboxPodWriter};
 
 const SANDBOX_POD_LABEL_SELECTOR: &str = "space.pplx.net/managed-by=space-api";
 /// Buffer depth for the per-name event broadcast. Sized well above the steady-
@@ -140,10 +142,10 @@ impl PodEvents {
     }
 
     /// Wait up to `budget` for a reflector event referencing `pod_name`.
-    /// The broadcast is fed by `touched_objects()`, so the signal fires on pod
+    /// The broadcast carries every touched pod name, so the signal fires on pod
     /// add/modify *and* delete events; a delete signal lets a waiter observe
-    /// pod absence (by re-checking the reflector `Store<Pod>`) without polling
-    /// the apiserver.
+    /// pod absence (by re-checking the reflector `Store<SandboxPodView>`)
+    /// without polling the apiserver.
     ///
     /// Returns `true` only if such an event was definitively observed within
     /// the budget. `Lagged` (consumer fell behind, broadcast dropped messages)
@@ -194,7 +196,7 @@ pub(super) enum ReflectorAbsence {
 }
 
 /// Wait up to `deadline` for `pod_name` to disappear from the reflector
-/// `Store<Pod>`, driven by the `PodEvents` delete signal rather than a
+/// `Store<SandboxPodView>`, driven by the `PodEvents` delete signal rather than a
 /// fixed-interval apiserver poll. This opens no new watch; it rides the shared
 /// reflector.
 ///
@@ -234,14 +236,14 @@ pub(super) enum ReflectorAbsence {
 /// present disappears from the store, or [`ReflectorAbsence::Pending`] if the
 /// budget elapses without such a transition.
 pub(super) async fn wait_for_pod_absence(
-    pod_store: &Store<Pod>,
+    pod_store: &Store<SandboxPodView>,
     namespace: &str,
     pod_events: &PodEvents,
     pod_name: &str,
     deadline: Instant,
     present_before_delete: bool,
 ) -> ReflectorAbsence {
-    let key = ObjectRef::<Pod>::new(pod_name).within(namespace);
+    let key = ObjectRef::<SandboxPodView>::new(pod_name).within(namespace);
     // Subscribe directly rather than via `PodEvents::wait_for`: we re-check the
     // store on *every* wakeup, including `Lagged`, so a delete signal dropped
     // under burst can't strand us for the whole budget while the store has
@@ -290,13 +292,17 @@ pub(super) async fn wait_for_pod_absence(
 }
 
 /// Starts a kube reflector that watches sandbox pods in `namespace` and
-/// populates a `Store<Pod>`. The watcher runs in a detached background task
-/// for the lifetime of the process. The returned store is cheap to clone
-/// (internally an `Arc`) and is safe to call from any sync context.
+/// populates a `Store<SandboxPodView>`. Each watcher event is converted to the
+/// slim [`SandboxPodView`] before the store sees it, so the cache never holds
+/// a full `Pod`. The watcher runs in a detached background task for the
+/// lifetime of the process. The returned store is cheap to clone (internally
+/// an `Arc`) and is safe to call from any sync context.
 ///
-/// The returned `PodEvents` is fed by the same watch stream (decoded via
-/// `touched_objects()`) and lets callers wait for the next add/modify/delete
-/// event for a specific pod name.
+/// The returned [`NodeNetworkSlots`] is the per-node network-slot index,
+/// written from the same events just before the store.
+///
+/// The returned `PodEvents` is fed by the same watch stream and lets callers
+/// wait for the next add/modify/delete event for a specific pod name.
 ///
 /// The returned `ReflectorReady` is flipped to `true` once the reflector's
 /// initial `LIST` populates the store. The HTTP `/readyz` probe gates the
@@ -305,18 +311,27 @@ pub(super) async fn wait_for_pod_absence(
 /// immediately — the boot budget is enforced by the Kubernetes startup probe
 /// (which restarts the pod after `failureThreshold * periodSeconds`), not by
 /// an inline timeout here.
-pub fn start(client: Client, namespace: String) -> (Store<Pod>, PodEvents, ReflectorReady) {
+pub fn start(
+    client: Client,
+    namespace: String,
+) -> (
+    Store<SandboxPodView>,
+    NodeNetworkSlots,
+    PodEvents,
+    ReflectorReady,
+) {
     let pods: Api<Pod> = Api::namespaced(client, &namespace);
     let cfg = WatcherConfig::default().labels(SANDBOX_POD_LABEL_SELECTOR);
-    let (store, writer) = reflector::store::<Pod>();
-    let stream = reflector::reflector(writer, watcher::watcher(pods, cfg));
+    let (store, network_slots, writer) = sandbox_pod_view::sandbox_pod_cache();
+    let stream = watcher::watcher(pods, cfg)
+        .map_ok(sandbox_pod_view::sandbox_pod_view_event)
+        .default_backoff();
     let (events, events_tx) = PodEvents::new();
     let ready = ReflectorReady::new();
 
     let log_namespace = namespace.clone();
     tokio::spawn(async move {
-        let s = stream.default_backoff().touched_objects().boxed();
-        broadcast_pod_events(s, events_tx, &log_namespace).await;
+        reflect_sandbox_pods(stream.boxed(), writer, events_tx, &log_namespace).await;
     });
 
     let ready_for_task = ready.clone();
@@ -343,26 +358,34 @@ pub fn start(client: Client, namespace: String) -> (Store<Pod>, PodEvents, Refle
         }
     });
 
-    (store, events, ready)
+    (store, network_slots, events, ready)
 }
 
-/// Drains a decoded sandbox-pod event stream, broadcasting each touched pod's
-/// name on `events_tx`. The stream is decoded with `touched_objects()`, so
-/// both applied (add/modify) and deleted pods flow through here. Waiters in
-/// `PodEvents::wait_for` re-check the reflector `Store<Pod>` after a signal,
-/// so a delete signal lets them observe pod absence without an apiserver poll.
-async fn broadcast_pod_events<S>(
+/// Drains the sandbox-pod watcher stream: applies each event to the slot index
+/// and store, then broadcasts the touched pod's name on `events_tx`. Applied
+/// (add/modify, including re-list `InitApply`) and deleted pods are both
+/// broadcast, matching `touched_objects()`. A re-list `InitApply` only fills the
+/// store's private buffer, so its broadcast can precede the pod becoming
+/// readable at `InitDone`. Waiters in `PodEvents::wait_for` re-check the store
+/// after a signal, so a delete signal lets them observe pod absence without an
+/// apiserver poll.
+async fn reflect_sandbox_pods<S>(
     mut stream: S,
+    mut writer: SandboxPodWriter,
     events_tx: broadcast::Sender<String>,
     namespace: &str,
 ) where
-    S: Stream<Item = Result<Pod, watcher::Error>> + Unpin,
+    S: Stream<Item = Result<watcher::Event<SandboxPodView>, watcher::Error>> + Unpin,
 {
     while let Some(event) = stream.next().await {
         match event {
-            Ok(pod) => {
-                if let Some(name) = pod.metadata.name.as_deref() {
-                    let _ = events_tx.send(name.to_string());
+            Ok(event) => {
+                writer.apply_watcher_event(&event);
+                if let watcher::Event::Apply(pod)
+                | watcher::Event::InitApply(pod)
+                | watcher::Event::Delete(pod) = &event
+                {
+                    let _ = events_tx.send(pod.name().to_string());
                 }
             }
             Err(err) => {

@@ -11,10 +11,7 @@ use crate::node_group_placement::{
     PlacementSubject, ResolvePath as NodeGroupResolvePath, ResolvedPlacement, RestoreSourceNode,
     check_local_restore_source,
 };
-use pplx_space_common_core::kubernetes::{
-    EvacuationPlacement, NodeGroupPlacement, PodToleration,
-    SANDBOX_EXECUTION_GENERATION_ANNOTATION, SANDBOX_ID_ANNOTATION,
-};
+use pplx_space_common_core::kubernetes::{EvacuationPlacement, NodeGroupPlacement, PodToleration};
 use pplx_space_common_core::types::{
     ExecutionGeneration, NodeRole as SpaceNodeRole, PodUid, PolicyAuthority,
     SandboxActivationAttemptId, SandboxLifecycle, SandboxOwner, SandboxTransitionTargetState,
@@ -348,7 +345,7 @@ impl PodMaterializationOwnership {
 pub(super) enum RedriveOutcome {
     /// The pinned pod was confirmed unschedulable, torn down, and a source-less
     /// successor was created and persisted under the same generation.
-    Redriven(Box<Pod>),
+    Redriven(Arc<SandboxPodView>),
     /// Nothing was torn down: the authoritative read found the pod bound after
     /// all (the caller's `Unschedulable` verdict was stale) or already replaced
     /// by a concurrent re-drive's successor (required pin absent). The live pod
@@ -390,7 +387,7 @@ enum PreconditionReread {
 }
 
 fn classify_precondition_reread(
-    now_live: Option<&Pod>,
+    now_live: Option<&SandboxPodView>,
     caller_source_node: Option<&str>,
 ) -> PreconditionReread {
     let Some(pod) = now_live else {
@@ -404,13 +401,12 @@ fn classify_precondition_reread(
             cross_node: Some(node_name.as_str()) != caller_source_node,
         },
         // Not bound, pin gone: a concurrent re-drive's cross-node successor runs.
-        _ if !pod_has_required_source_pin(pod) => PreconditionReread::Retain { cross_node: true },
+        _ if !pod.has_required_source_pin() => PreconditionReread::Retain { cross_node: true },
         // Not bound, still pinned: status-only RV bump. Retry with fresh identity.
         _ => match pod
-            .metadata
-            .uid
-            .clone()
-            .zip(pod.metadata.resource_version.clone())
+            .uid()
+            .map(str::to_owned)
+            .zip(pod.resource_version().map(str::to_owned))
         {
             Some((uid, resource_version)) => PreconditionReread::RetryDelete {
                 uid,
@@ -685,43 +681,26 @@ fn restore_placement_sample(
 
 fn terminal_cleanup_phase_after_uncached_check(
     cached_phase: TerminalPodPhase,
-    authoritative_pod: Option<&Pod>,
+    authoritative_pod: Option<&SandboxPodView>,
 ) -> Option<TerminalPodPhase> {
     match authoritative_pod {
-        Some(pod) => terminal_pod_phase(pod.status.as_ref()),
+        Some(pod) => terminal_pod_phase(pod),
         None => Some(cached_phase),
     }
 }
 
-fn succeeded_pod_publication_grace_remaining(pod: &Pod, now: jiff::Timestamp) -> Option<Duration> {
-    if terminal_pod_phase(pod.status.as_ref()) != Some(TerminalPodPhase::Succeeded) {
+fn succeeded_pod_publication_grace_remaining(
+    pod: &SandboxPodView,
+    now: jiff::Timestamp,
+) -> Option<Duration> {
+    if terminal_pod_phase(pod) != Some(TerminalPodPhase::Succeeded) {
         return None;
     }
-    let status = pod.status.as_ref()?;
-    let finished_at = [
-        status.container_statuses.as_deref().unwrap_or_default(),
-        status
-            .ephemeral_container_statuses
-            .as_deref()
-            .unwrap_or_default(),
-        status
-            .init_container_statuses
-            .as_deref()
-            .unwrap_or_default(),
-    ]
-    .into_iter()
-    .flatten()
-    .filter_map(|status| {
-        status
-            .state
-            .as_ref()?
-            .terminated
-            .as_ref()?
-            .finished_at
-            .as_ref()
-    })
-    .filter_map(|finished_at| finished_at.0.to_string().parse::<jiff::Timestamp>().ok())
-    .max()?;
+    let finished_at = pod
+        .container_statuses()
+        .all()
+        .filter_map(|state| state.terminated.as_ref()?.finished_at)
+        .max()?;
     let grace = jiff::SignedDuration::from_secs(
         i64::try_from(SUCCEEDED_POD_SUSPEND_PUBLICATION_GRACE.as_secs()).ok()?,
     );
@@ -800,23 +779,22 @@ struct RoutablePodIdentity {
 /// is never selected — a name-only exclusion would delete it. Pods without a
 /// parseable generation annotation are conservatively skipped.
 fn lingering_sandbox_pod_names<'a>(
-    pods: impl IntoIterator<Item = &'a Pod>,
+    pods: impl IntoIterator<Item = &'a SandboxPodView>,
     sandbox_id: SandboxId,
     claim_generation: i64,
 ) -> Vec<String> {
     let sandbox_id = sandbox_id.to_string();
     pods.into_iter()
         .filter(|pod| {
-            let Some(annotations) = pod.metadata.annotations.as_ref() else {
-                return false;
-            };
-            annotations.get(SANDBOX_ID_ANNOTATION) == Some(&sandbox_id)
-                && annotations
-                    .get(SANDBOX_EXECUTION_GENERATION_ANNOTATION)
+            pod.annotation(SandboxPodKey::SandboxId) == Some(sandbox_id.as_str())
+                && pod
+                    .annotation(SandboxPodKey::ExecutionGeneration)
                     .and_then(|value| value.parse::<i64>().ok())
                     .is_some_and(|generation| generation < claim_generation)
         })
-        .filter_map(|pod| pod.metadata.name.clone())
+        .map(SandboxPodView::name)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
         .collect()
 }
 
@@ -824,13 +802,14 @@ fn lingering_sandbox_pod_names<'a>(
 /// sandbox-id and execution-generation stamps written at create time. Phase-
 /// agnostic (unlike [`restored_pod_routability`]): used to recognize a
 /// still-Pending successor a prior interrupted attempt created.
-fn pod_matches_execution_generation(pod: &Pod, sandbox_id: SandboxId, generation: i64) -> bool {
-    let Some(annotations) = pod.metadata.annotations.as_ref() else {
-        return false;
-    };
-    annotations.get(SANDBOX_ID_ANNOTATION) == Some(&sandbox_id.to_string())
-        && annotations
-            .get(SANDBOX_EXECUTION_GENERATION_ANNOTATION)
+fn pod_matches_execution_generation(
+    pod: &SandboxPodView,
+    sandbox_id: SandboxId,
+    generation: i64,
+) -> bool {
+    pod.annotation(SandboxPodKey::SandboxId) == Some(sandbox_id.to_string().as_str())
+        && pod
+            .annotation(SandboxPodKey::ExecutionGeneration)
             .and_then(|value| value.parse::<i64>().ok())
             == Some(generation)
 }
@@ -844,23 +823,22 @@ fn pod_matches_execution_generation(pod: &Pod, sandbox_id: SandboxId, generation
 /// * the pod is phase `Running` and not being deleted,
 /// * the pod has an IP.
 fn restored_pod_routability(
-    pod: &Pod,
+    pod: &SandboxPodView,
     sandbox_id: SandboxId,
     generation: i64,
 ) -> Option<RoutablePodIdentity> {
     if !pod_matches_execution_generation(pod, sandbox_id, generation) {
         return None;
     }
-    if pod.metadata.deletion_timestamp.is_some() {
+    if pod.is_deleting() {
         return None;
     }
-    let status = pod.status.as_ref()?;
-    if status.phase.as_deref() != Some("Running") {
+    if pod.phase() != Some("Running") {
         return None;
     }
-    let pod_ip = status.pod_ip.clone()?;
+    let pod_ip = pod.pod_ip()?.to_owned();
     Some(RoutablePodIdentity {
-        pod_uid: pod.metadata.uid.clone(),
+        pod_uid: pod.uid().map(str::to_owned),
         pod_ip,
     })
 }
@@ -907,13 +885,12 @@ impl KubernetesSubstrate {
         }
         let config = &self.k8s.sandbox_pod_config;
         let selector = config.base_node_selector();
-        let pods = self.pod_store.state();
         self.k8s.caches.nodes.state().iter().any(|node| {
             node.metadata.name.as_deref() == Some(source_node_name)
                 && adapter::node_schedulable(node)
                 && selector.matches(node)
                 && (!config.ssd_headroom_tier_affinity || adapter::node_not_placement_blocked(node))
-                && adapter::node_network_slot_available(node, &pods)
+                && adapter::node_network_slot_available(node, &self.pod_network_slots)
         })
     }
 
@@ -1040,9 +1017,11 @@ impl KubernetesSubstrate {
         Ok(true)
     }
 
-    pub fn lookup_sandbox_pod(&self, pod_name: &str) -> Option<Pod> {
-        let key = ObjectRef::<Pod>::new(pod_name).within(&self.k8s.sandbox_namespace);
-        self.pod_store.get(&key).map(|arc| (*arc).clone())
+    /// The cached view of `pod_name`, shared with the store rather than
+    /// copied: the `Arc` is a refcount bump, not a deep clone.
+    pub fn lookup_sandbox_pod(&self, pod_name: &str) -> Option<Arc<SandboxPodView>> {
+        let key = ObjectRef::<SandboxPodView>::new(pod_name).within(&self.k8s.sandbox_namespace);
+        self.pod_store.get(&key)
     }
 
     /// Delete a sandbox pod and block until its deletion is observed, bounded
@@ -1140,8 +1119,7 @@ impl KubernetesSubstrate {
         // wait with this lets it confirm immediately if the reflector removes
         // the pod between the accepted DELETE and the wait starting (fast-delete
         // race) instead of treating the now-absent store as an ambiguous miss.
-        let pod_key = ObjectRef::<Pod>::new(pod_name).within(&self.k8s.sandbox_namespace);
-        let present_before_delete = self.pod_store.get(&pod_key).is_some();
+        let present_before_delete = self.lookup_sandbox_pod(pod_name).is_some();
 
         let delete_params = match preconditions {
             Some((uid, resource_version)) => DeleteParams {
@@ -1283,7 +1261,7 @@ impl KubernetesSubstrate {
     pub async fn read_sandbox_pod_uncached(
         &self,
         pod_name: &str,
-    ) -> Result<Option<Pod>, KubeError> {
+    ) -> Result<Option<Arc<SandboxPodView>>, KubeError> {
         fetch_sandbox_pod_uncached(&self.k8s, pod_name).await
     }
 
@@ -1312,7 +1290,10 @@ impl KubernetesSubstrate {
     /// (or terminal/unschedulable), the cache is authoritative and no GET
     /// happens. Extra GETs are bounded to the brief window between pod
     /// creation/scheduling and the reflector observing the bind event.
-    pub async fn read_sandbox_pod(&self, pod_name: &str) -> Result<Option<Pod>, KubeError> {
+    pub async fn read_sandbox_pod(
+        &self,
+        pod_name: &str,
+    ) -> Result<Option<Arc<SandboxPodView>>, KubeError> {
         if let Some(pod) = self.lookup_sandbox_pod(pod_name)
             && pod_status_is_settled(&pod)
         {
@@ -1359,13 +1340,12 @@ impl KubernetesSubstrate {
         budget: Duration,
     ) -> Result<Option<SchedulingOutcome>, SubstrateError> {
         let deadline = Instant::now() + budget;
-        // Inspect the cached `Arc<Pod>` in place rather than via
-        // `lookup_sandbox_pod` (which deep-clones the whole Pod): the classifier
-        // reads only `status.conditions` and `spec.nodeName`, and this loop can
-        // re-check up to ~20 times against a lagging scheduler.
-        let key = ObjectRef::<Pod>::new(pod_name).within(&self.k8s.sandbox_namespace);
+        // Against a lagging scheduler this loop re-checks about every
+        // `REFLECTOR_WAIT_BUDGET`, plus once per event for this pod; each check
+        // is a store lookup plus an `Arc` bump, and the classifier reads only
+        // the view's node name and unschedulable verdict.
         loop {
-            if let Some(pod) = self.pod_store.get(&key)
+            if let Some(pod) = self.lookup_sandbox_pod(pod_name)
                 && let Some(outcome) = scheduling_outcome_of(&pod)
             {
                 return Ok(Some(outcome));
@@ -1384,7 +1364,7 @@ impl KubernetesSubstrate {
             .map_err(|err| {
                 kube_error_for_substrate("failed to read pod while awaiting scheduling", err)
             })?;
-        Ok(pod.as_ref().and_then(scheduling_outcome_of))
+        Ok(pod.as_deref().and_then(scheduling_outcome_of))
     }
 
     /// Tear down a source-pinned restore pod that came back `Unschedulable` and
@@ -1443,7 +1423,7 @@ impl KubernetesSubstrate {
                 if matches!(
                     scheduling_outcome_of(pod),
                     Some(SchedulingOutcome::Scheduled { .. })
-                ) || !pod_has_required_source_pin(pod) =>
+                ) || !pod.has_required_source_pin() =>
             {
                 tracing::info!(
                     sandbox_id = %sandbox.id,
@@ -1460,15 +1440,14 @@ impl KubernetesSubstrate {
                     Some(SchedulingOutcome::Scheduled { node_name }) => {
                         Some(node_name.as_str()) != caller_source_node
                     }
-                    _ => !pod_has_required_source_pin(pod),
+                    _ => !pod.has_required_source_pin(),
                 };
                 return Ok(RedriveOutcome::PodRetained { cross_node });
             }
             Some(pod) => pod
-                .metadata
-                .uid
-                .clone()
-                .zip(pod.metadata.resource_version.clone()),
+                .uid()
+                .map(str::to_owned)
+                .zip(pod.resource_version().map(str::to_owned)),
             None => None,
         };
         // The wedged pod's annotation is the authoritative source-node
@@ -1479,10 +1458,9 @@ impl KubernetesSubstrate {
         // never ships without provenance.
         let source_node_annotation: Option<String> = live
             .as_ref()
-            .and_then(|pod| pod.metadata.annotations.as_ref())
-            .and_then(|annotations| annotations.get(SANDBOX_SUSPEND_RESTORE_SOURCE_NODE_ANNOTATION))
+            .and_then(|pod| pod.annotation(SandboxPodKey::SuspendRestoreSourceNode))
             .filter(|value| !value.trim().is_empty())
-            .cloned()
+            .map(str::to_owned)
             .or_else(|| caller_source_node.map(str::to_string));
         // UID + resourceVersion preconditioned delete: it can only remove the
         // exact pod *state* inspected above. A same-name successor created in
@@ -1520,7 +1498,8 @@ impl KubernetesSubstrate {
                                     err,
                                 )
                             })?;
-                        match classify_precondition_reread(now_live.as_ref(), caller_source_node) {
+                        match classify_precondition_reread(now_live.as_deref(), caller_source_node)
+                        {
                             // Absent: a conflict does not prove a successor
                             // exists. Fall through to the successor POST (its
                             // own 409 handling steps aside for a real creator)
@@ -1751,12 +1730,12 @@ impl KubernetesSubstrate {
                     sandbox.id,
                     claim.row.generation,
                     claim_lifecycle,
-                    cross_node_pod.metadata.uid.as_deref(),
+                    cross_node_pod.uid(),
                     None,
                 )
                 .await
             {
-                Ok(Some(_)) => Ok(RedriveOutcome::Redriven(Box::new(cross_node_pod))),
+                Ok(Some(_)) => Ok(RedriveOutcome::Redriven(Arc::new(cross_node_pod))),
                 Ok(None) => {
                     // Materialization ownership was revoked between the two
                     // creates; drop the cross-node pod we just made and let the
@@ -1950,19 +1929,18 @@ impl KubernetesSubstrate {
         else {
             return Ok(None);
         };
-        let annotations = pod.metadata.annotations.unwrap_or_default();
-        let storage_uri = annotations
-            .get(SANDBOX_SUSPEND_RESTORE_STORAGE_URI_ANNOTATION)
-            .cloned();
+        let storage_uri = pod
+            .annotation(SandboxPodKey::SuspendRestoreStorageUri)
+            .map(str::to_owned);
         if let Some(storage_uri) = &storage_uri {
             StorageUri::parse(storage_uri).map_err(|err| SubstrateError::Failed {
                 message: format!("invalid suspend restore storage URI on Kubernetes pod: {err}"),
             })?;
         }
-        let source_node_name = annotations
-            .get(SANDBOX_SUSPEND_RESTORE_SOURCE_NODE_ANNOTATION)
+        let source_node_name = pod
+            .annotation(SandboxPodKey::SuspendRestoreSourceNode)
             .filter(|value| !value.trim().is_empty())
-            .cloned();
+            .map(str::to_owned);
         if source_node_name.is_none() && storage_uri.is_none() {
             return Ok(None);
         }
@@ -2264,9 +2242,7 @@ impl KubernetesSubstrate {
             return Ok(None);
         };
         let live_pod_uid = pod
-            .metadata
-            .uid
-            .as_deref()
+            .uid()
             .and_then(|uid| PodUid::parse(uid).ok())
             .ok_or_else(|| SubstrateError::Unavailable {
                 message: "selected Wake pod has no valid Kubernetes UID".to_string(),
@@ -2277,9 +2253,7 @@ impl KubernetesSubstrate {
                     .to_string(),
             });
         }
-        if pod.metadata.deletion_timestamp.is_some()
-            || terminal_pod_phase(pod.status.as_ref()).is_some()
-        {
+        if pod.is_deleting() || terminal_pod_phase(&pod).is_some() {
             // Never dial a stopped Pod, including while node-local suspend
             // finishes its backup. Only the exact selected execution may ask
             // its recovery owner to wait for that handoff and reselect.
@@ -2300,7 +2274,7 @@ impl KubernetesSubstrate {
                     .to_string(),
             });
         }
-        let Some(pod_ip) = assigned_pod_ip(pod.status.as_ref())? else {
+        let Some(pod_ip) = assigned_pod_ip(&pod)? else {
             return Ok(None);
         };
         let live_pod_ip = pod_ip.to_string();
@@ -2798,7 +2772,7 @@ impl KubernetesSubstrate {
     pub(super) async fn remember_pod_node_placement(
         &self,
         sandbox_id: SandboxId,
-        pod: &Pod,
+        pod: &SandboxPodView,
         retry: PlacementRetryDisposition,
     ) -> Result<Option<NodeId>, SubstrateError> {
         let Some(node_name) = assigned_pod_node_name(pod) else {
@@ -3238,15 +3212,15 @@ impl KubernetesSubstrate {
         else {
             return Ok(None);
         };
-        if pod.metadata.deletion_timestamp.is_some()
-            || terminal_pod_phase(pod.status.as_ref()).is_some()
-            || pod_unschedulable_message(pod.status.as_ref()).is_some()
+        if pod.is_deleting()
+            || terminal_pod_phase(&pod).is_some()
+            || pod.unschedulable_message().is_some()
             || row.pod_uid.is_none()
-            || row.pod_uid.as_ref().map(PodUid::as_str) != pod.metadata.uid.as_deref()
+            || row.pod_uid.as_ref().map(PodUid::as_str) != pod.uid()
         {
             return Ok(None);
         }
-        let pod_ip = assigned_pod_ip(pod.status.as_ref())?;
+        let pod_ip = assigned_pod_ip(&pod)?;
         // Let the owned path publish changed routing evidence before returning
         // a client; otherwise ingress would repeatedly resolve stale metadata.
         if row.pod_ip != pod_ip.map(|ip| ip.to_string())
@@ -3368,7 +3342,7 @@ impl KubernetesSubstrate {
             }
         };
 
-        let pod = if let Some(cached_phase) = terminal_pod_phase(pod.status.as_ref()) {
+        let pod = if let Some(cached_phase) = terminal_pod_phase(&pod) {
             let authoritative_pod = fetch_sandbox_pod_uncached(&self.k8s, &row.pod_name)
                 .await
                 .map_err(|err| {
@@ -3379,7 +3353,7 @@ impl KubernetesSubstrate {
                 })?;
             if let Some(phase) = terminal_cleanup_phase_after_uncached_check(
                 cached_phase,
-                authoritative_pod.as_ref(),
+                authoritative_pod.as_deref(),
             ) {
                 let publication_grace_remaining = authoritative_pod
                     .as_ref()
@@ -3431,7 +3405,7 @@ impl KubernetesSubstrate {
             pod
         };
 
-        if let Some(message) = pod_unschedulable_message(pod.status.as_ref()) {
+        if let Some(message) = pod.unschedulable_message() {
             return Err(SubstrateError::Unavailable {
                 message: format!("sandbox pod is unschedulable: {message}"),
             });
@@ -3448,8 +3422,8 @@ impl KubernetesSubstrate {
                 .await?;
         }
 
-        let pod_uid = pod.metadata.uid.clone();
-        let pod_ip = assigned_pod_ip(pod.status.as_ref())?;
+        let pod_uid = pod.uid().map(str::to_owned);
+        let pod_ip = assigned_pod_ip(&pod)?;
         let pod_ip_string = pod_ip.map(|ip| ip.to_string());
         if row.pod_uid.as_ref().map(PodUid::as_str) != pod_uid.as_deref()
             || row.pod_ip.as_deref() != pod_ip_string.as_deref()
@@ -3487,7 +3461,7 @@ impl KubernetesSubstrate {
         &self,
         sandbox: &Sandbox,
         claim: &SandboxExecutionClaim,
-        pod: &Pod,
+        pod: &SandboxPodView,
         suspend_restore_storage_uri: Option<&str>,
     ) -> Result<Option<StalePodReason>, SubstrateError> {
         // Pod phase and restore annotations do not identify a STOP episode.
@@ -3512,7 +3486,7 @@ impl KubernetesSubstrate {
         &self,
         sandbox: &Sandbox,
         claim: &SandboxExecutionClaim,
-        existing: &Pod,
+        existing: &SandboxPodView,
         suspend_restore_storage_uri: Option<&str>,
     ) -> Result<bool, SubstrateError> {
         let Some(reason) = self
@@ -3752,12 +3726,11 @@ impl KubernetesSubstrate {
         // `restore_source_node_hard_pin` config: a flag rollback must not
         // strand pods a previous deployment pinned. Gated on a portable
         // snapshot so the successor has a source to restore from;
-        // `pod_has_required_source_pin` is false once a prior retry already
+        // `has_required_source_pin` is false once a prior retry already
         // re-drove cross-node, so this converges without looping.
         if !claim.created && suspend_restore_storage_uri.is_some() {
-            let key = ObjectRef::<Pod>::new(&pod_name).within(&self.k8s.sandbox_namespace);
-            let existing_pod: Option<Pod> = match self.pod_store.get(&key) {
-                Some(existing) => Some((*existing).clone()),
+            let existing_pod = match self.lookup_sandbox_pod(&pod_name) {
+                Some(existing) => Some(existing),
                 // Cache miss on a *persisted* claim (`created`: pod_uid set,
                 // pod_ip NULL): the pod exists on the apiserver, but a retry can
                 // land on a replica whose reflector hasn't observed it yet.
@@ -3793,7 +3766,7 @@ impl KubernetesSubstrate {
             // return for the full stale-create age instead.
             if let Some(existing) = existing_pod
                 .as_ref()
-                .filter(|existing| !pod_has_required_source_pin(existing))
+                .filter(|existing| !existing.has_required_source_pin())
                 .filter(|existing| {
                     execution_pod_create_in_flight(claim.row.state)
                         && pod_matches_execution_generation(
@@ -3809,13 +3782,13 @@ impl KubernetesSubstrate {
                     PlacementRetryDisposition::RetryConverges,
                 )
                 .await?;
-                let pod_ip = assigned_pod_ip(existing.status.as_ref())?.map(|ip| ip.to_string());
+                let pod_ip = assigned_pod_ip(existing)?.map(|ip| ip.to_string());
                 if self
                     .store
                     .persist_pod_metadata(
                         sandbox.id,
                         claim.row.generation,
-                        existing.metadata.uid.as_deref(),
+                        existing.uid(),
                         pod_ip.as_deref(),
                     )
                     .await?
@@ -3831,7 +3804,9 @@ impl KubernetesSubstrate {
                 return Ok(());
             }
             let pin_state = existing_pod.as_ref().and_then(|existing| {
-                pod_has_required_source_pin(existing).then(|| scheduling_outcome_of(existing))
+                existing
+                    .has_required_source_pin()
+                    .then(|| scheduling_outcome_of(existing))
             });
             if let Some(cached_outcome) = pin_state {
                 // Trust a settled cached decision; otherwise re-observe with the
@@ -3878,12 +3853,7 @@ impl KubernetesSubstrate {
                             // source annotation says whether the source still
                             // held trusted local bytes.
                             let local_snapshot_present = cross_node_pod
-                                .metadata
-                                .annotations
-                                .as_ref()
-                                .and_then(|annotations| {
-                                    annotations.get(SANDBOX_SUSPEND_RESTORE_SOURCE_NODE_ANNOTATION)
-                                })
+                                .annotation(SandboxPodKey::SuspendRestoreSourceNode)
                                 .is_some_and(|value| !value.trim().is_empty());
                             pplx_space_metrics::sandbox::restore::placement_directed(
                                 pplx_space_metrics::sandbox::restore::PlacementSample {
@@ -3975,14 +3945,13 @@ impl KubernetesSubstrate {
                         PlacementRetryDisposition::RetryConverges,
                     )
                     .await?;
-                    let pod_ip =
-                        assigned_pod_ip(existing.status.as_ref())?.map(|ip| ip.to_string());
+                    let pod_ip = assigned_pod_ip(existing)?.map(|ip| ip.to_string());
                     if self
                         .store
                         .persist_pod_metadata(
                             sandbox.id,
                             claim.row.generation,
-                            existing.metadata.uid.as_deref(),
+                            existing.uid(),
                             pod_ip.as_deref(),
                         )
                         .await?
@@ -4076,11 +4045,8 @@ impl KubernetesSubstrate {
                     .await?
                 {
                     if started_recovery_requires_handoff
-                        && let Some(pod_uid) = existing
-                            .metadata
-                            .uid
-                            .as_deref()
-                            .and_then(|uid| PodUid::parse(uid).ok())
+                        && let Some(pod_uid) =
+                            existing.uid().and_then(|uid| PodUid::parse(uid).ok())
                     {
                         let generation =
                             ExecutionGeneration::new(claim.row.generation).map_err(|error| {
@@ -4186,14 +4152,13 @@ impl KubernetesSubstrate {
                             PlacementRetryDisposition::RetryConverges,
                         )
                         .await?;
-                    let pod_ip =
-                        assigned_pod_ip(existing.status.as_ref())?.map(|ip| ip.to_string());
+                    let pod_ip = assigned_pod_ip(&existing)?.map(|ip| ip.to_string());
                     if self
                         .store
                         .persist_pod_metadata(
                             sandbox.id,
                             claim.row.generation,
-                            existing.metadata.uid.as_deref(),
+                            existing.uid(),
                             pod_ip.as_deref(),
                         )
                         .await?
@@ -4433,7 +4398,7 @@ impl KubernetesSubstrate {
         )
         .await;
         let (pod, created) = match pod_result {
-            Ok(pod) => (pod, true),
+            Ok(pod) => (Arc::new(pod), true),
             Err(err) if matches!(&err, kube::Error::Api(resp) if resp.code == 409) => {
                 let execution = &claim.row;
                 let pod_name = execution.pod_name.clone();
@@ -4512,14 +4477,14 @@ impl KubernetesSubstrate {
             }
         };
 
-        let pod_ip = assigned_pod_ip(pod.status.as_ref())?.map(|ip| ip.to_string());
+        let pod_ip = assigned_pod_ip(&pod)?.map(|ip| ip.to_string());
         match self
             .store
             .persist_materialized_pod_metadata(
                 sandbox.id,
                 claim.row.generation,
                 claim_lifecycle,
-                pod.metadata.uid.as_deref(),
+                pod.uid(),
                 pod_ip.as_deref(),
             )
             .await
@@ -4551,7 +4516,7 @@ impl KubernetesSubstrate {
                         claim.row.pod_name
                     )));
                 }
-                let Some(pod_uid) = pod.metadata.uid.as_deref() else {
+                let Some(pod_uid) = pod.uid() else {
                     return Err(SubstrateError::restore_in_flight(format!(
                         "{error}; created Kubernetes pod {} had no UID, so its absence could not \
                          be confirmed",
@@ -4664,7 +4629,7 @@ impl KubernetesSubstrate {
                                 sample.placement = RestorePlacement::CrossNode;
                                 sample.pin = SourcePin::None;
                             }
-                            placement_pod = *cross_node_pod;
+                            placement_pod = cross_node_pod;
                         }
                         // Nothing torn down. A retained cross-node successor
                         // (installed by a concurrent re-drive) must still be

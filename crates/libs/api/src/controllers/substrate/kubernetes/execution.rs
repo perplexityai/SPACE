@@ -278,14 +278,10 @@ impl KubernetesSubstrate {
         }
     }
 
-    fn cached_restore_pod(&self, pod_name: &str, generation: u64) -> Option<Arc<Pod>> {
-        let key = ObjectRef::new(pod_name).within(&self.k8s.sandbox_namespace);
-        let pod = self.pod_store.get(&key)?;
+    fn cached_restore_pod(&self, pod_name: &str, generation: u64) -> Option<Arc<SandboxPodView>> {
+        let pod = self.lookup_sandbox_pod(pod_name)?;
         let observed_generation = pod
-            .metadata
-            .annotations
-            .as_ref()?
-            .get(pplx_space_common_core::kubernetes::SANDBOX_EXECUTION_GENERATION_ANNOTATION)?
+            .annotation(SandboxPodKey::ExecutionGeneration)?
             .parse::<u64>()
             .ok()?;
         // Re-drives can reuse a Pod name while the reflector still holds the
@@ -300,12 +296,9 @@ impl KubernetesSubstrate {
         let Some(pod) = self.cached_restore_pod(pod_name, generation) else {
             return;
         };
-        let source = pod.metadata.annotations.as_ref().and_then(|annotations| {
-            annotations.get(SANDBOX_SUSPEND_RESTORE_SOURCE_NODE_ANNOTATION)
-        });
         trace.restore_placement(
-            source.map(String::as_str),
-            pod.spec.as_ref().and_then(|spec| spec.node_name.as_deref()),
+            pod.annotation(SandboxPodKey::SuspendRestoreSourceNode),
+            pod.node_name(),
         );
     }
 
@@ -323,9 +316,7 @@ impl KubernetesSubstrate {
         // The winning API pod stores the materialization context on the Pod.
         // Read only the reflector here: diagnostics must not add API traffic.
         if let Some(pod) = self.cached_restore_pod(&pod_name, execution_generation)
-            && let Some(traceparent) = pod.metadata.annotations.as_ref().and_then(|annotations| {
-                annotations.get(pplx_space_common_core::kubernetes::SANDBOX_TRACEPARENT_ANNOTATION)
-            })
+            && let Some(traceparent) = pod.annotation(SandboxPodKey::Traceparent)
         {
             pplx_space_observability::trace_propagation::link_span_from_traceparent(
                 &tracing::Span::current(),

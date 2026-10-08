@@ -10,28 +10,14 @@
 //! original `startTime`). The reconciler measures continuous-`ContainerCreating`
 //! age with an in-memory observation clock instead.
 
-use k8s_openapi::api::core::v1::{Pod, PodStatus};
-use pplx_space_common_core::kubernetes::{
-    SANDBOX_CHECKPOINT_ANNOTATION, SANDBOX_ID_ANNOTATION, SANDBOX_POOL_ROLE_KEY,
-    SANDBOX_POOL_ROLE_WARM, SANDBOX_SUSPEND_RESTORE_SOURCE_NODE_ANNOTATION,
-    SANDBOX_SUSPEND_RESTORE_STORAGE_URI_ANNOTATION,
-};
+use pplx_space_api::controllers::substrate::kubernetes::{SandboxPodKey, SandboxPodView};
+use pplx_space_common_core::kubernetes::SANDBOX_POOL_ROLE_WARM;
 use pplx_space_common_core::types::{PodUid, SandboxId};
 use uuid::Uuid;
 
 /// kubelet's `waiting.reason` while the container runtime is creating the
 /// container (for SPACE sandbox pods, the shim setting up the microVM).
 const CONTAINER_CREATING_REASON: &str = "ContainerCreating";
-
-/// Annotations `build_sandbox_pod` stamps only on restore pods (never on a
-/// fresh create). A remote restore carries the storage-URI; a node-local
-/// restore carries the source-node and/or checkpoint instead, so all three
-/// must be checked. Fresh creates carry none of them.
-const RESTORE_ANNOTATIONS: &[&str] = &[
-    SANDBOX_CHECKPOINT_ANNOTATION,
-    SANDBOX_SUSPEND_RESTORE_STORAGE_URI_ANNOTATION,
-    SANDBOX_SUSPEND_RESTORE_SOURCE_NODE_ANNOTATION,
-];
 
 /// Flattened, time-library-agnostic view of the parts of a `Pod` the GC reasons
 /// about. Extracted once from the reflector object so the classifier and tests
@@ -91,52 +77,36 @@ pub struct PodSnapshot {
 }
 
 impl PodSnapshot {
-    pub(crate) fn from_pod(pod: &Pod) -> Self {
-        let meta = &pod.metadata;
+    pub(crate) fn from_pod(pod: &SandboxPodView) -> Self {
         // The shared pod builder stamps the sandbox id into both the annotation
         // and a same-keyed label; the constant is documented as an annotation,
         // so read the annotation first and fall back to the label. Reading only
         // one would classify a real stuck pod as `missing_sandbox_id` and skip
         // it if a future change ever dropped that copy.
-        let sandbox_id = meta
-            .annotations
-            .as_ref()
-            .and_then(|annotations| annotations.get(SANDBOX_ID_ANNOTATION))
-            .or_else(|| {
-                meta.labels
-                    .as_ref()
-                    .and_then(|labels| labels.get(SANDBOX_ID_ANNOTATION))
-            })
+        let sandbox_id = pod
+            .annotation_or_label(SandboxPodKey::SandboxId)
             .and_then(|raw| Uuid::parse_str(raw).ok())
             .map(SandboxId::from_uuid);
         let node_name = pod
-            .spec
-            .as_ref()
-            .and_then(|spec| spec.node_name.clone())
-            .filter(|name| !name.is_empty());
-        let is_restore = meta.annotations.as_ref().is_some_and(|annotations| {
-            RESTORE_ANNOTATIONS
-                .iter()
-                .any(|key| annotations.contains_key(*key))
-        });
-        let is_warm_pool = meta
-            .labels
-            .as_ref()
-            .and_then(|labels| labels.get(SANDBOX_POOL_ROLE_KEY))
-            .map(String::as_str)
-            == Some(SANDBOX_POOL_ROLE_WARM);
-        let status = pod.status.as_ref();
-        let phase_pending = status.and_then(|s| s.phase.as_deref()) == Some("Pending");
-        let (has_container_creating, any_container_running) = container_signals(status);
+            .node_name()
+            .filter(|name| !name.is_empty())
+            .map(str::to_owned);
+        // Restore-only annotations (`SandboxPodKey::RESTORE_ANNOTATIONS`): a
+        // remote restore carries the storage URI; a node-local restore carries
+        // the source node and/or checkpoint. Fresh creates carry none of them.
+        let is_restore = pod.has_restore_annotation();
+        let is_warm_pool = pod.label(SandboxPodKey::PoolRole) == Some(SANDBOX_POOL_ROLE_WARM);
+        let phase_pending = pod.phase() == Some("Pending");
+        let (has_container_creating, any_container_running) = container_signals(pod);
         Self {
-            pod_name: meta.name.clone().unwrap_or_default(),
-            pod_uid: meta.uid.as_deref().and_then(|uid| uid.parse().ok()),
-            resource_version: meta.resource_version.clone(),
+            pod_name: pod.name().to_owned(),
+            pod_uid: pod.uid().and_then(|uid| uid.parse().ok()),
+            resource_version: pod.resource_version().map(str::to_owned),
             sandbox_id,
             node_name,
             is_restore,
             is_warm_pool,
-            terminating: meta.deletion_timestamp.is_some(),
+            terminating: pod.is_deleting(),
             phase_pending,
             has_container_creating,
             any_container_running,
@@ -144,33 +114,23 @@ impl PodSnapshot {
     }
 }
 
-/// Reads the container-state signals the classifier needs out of a `PodStatus`,
-/// across **both** app and init containers: whether any is `waiting` with
-/// reason `ContainerCreating` (the wedged signal — a pod can be stuck creating
-/// an init container just as easily as an app container), and whether any has
-/// reached `running` (the progress guard — a running init container means the
-/// pod is progressing through initialization, not wedged).
-fn container_signals(status: Option<&PodStatus>) -> (bool, bool) {
-    let Some(status) = status else {
-        return (false, false);
-    };
+/// Reads the container-state signals the classifier needs out of the pod's
+/// statuses, across **both** app and init containers: whether any is `waiting`
+/// with reason `ContainerCreating` (the wedged signal — a pod can be stuck
+/// creating an init container just as easily as an app container), and
+/// whether any has reached `running` (the progress guard — a running init
+/// container means the pod is progressing through initialization, not wedged).
+fn container_signals(pod: &SandboxPodView) -> (bool, bool) {
     let mut has_container_creating = false;
     let mut any_running = false;
-    let containers = status
-        .container_statuses
-        .iter()
-        .flatten()
-        .chain(status.init_container_statuses.iter().flatten());
-    for container in containers {
-        if let Some(state) = &container.state {
-            if state.running.is_some() {
-                any_running = true;
-            }
-            if let Some(waiting) = &state.waiting
-                && waiting.reason.as_deref() == Some(CONTAINER_CREATING_REASON)
-            {
-                has_container_creating = true;
-            }
+    for state in pod.container_statuses().app_and_init() {
+        if state.running {
+            any_running = true;
+        }
+        if let Some(waiting) = &state.waiting
+            && waiting.reason.as_deref() == Some(CONTAINER_CREATING_REASON)
+        {
+            has_container_creating = true;
         }
     }
     (has_container_creating, any_running)

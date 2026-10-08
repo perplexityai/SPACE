@@ -76,12 +76,8 @@ use pplx_space_common_core::types::{LocalArtifactId, NodeId};
 
 use std::time::{Duration, Instant};
 
-use k8s_openapi::api::core::v1::Pod;
 use pplx_space_api::controllers::substrate::kubernetes::{
-    K8sBlockingDeleteOutcome, KubernetesSubstrate,
-};
-use pplx_space_common_core::kubernetes::{
-    SANDBOX_EXECUTION_GENERATION_ANNOTATION, SANDBOX_ID_ANNOTATION, SANDBOX_MANAGED_BY_LABEL,
+    K8sBlockingDeleteOutcome, KubernetesSubstrate, SandboxPodKey, SandboxPodView,
 };
 use pplx_space_common_core::types::{PositiveDuration, SandboxId};
 use pplx_space_events::{
@@ -443,26 +439,26 @@ impl TerminalSucceededPodCleaner for SuspendedExecutionPodAccess {
 }
 
 fn validate_terminal_succeeded_pod(
-    pod: &Pod,
+    pod: &SandboxPodView,
     candidate: &StaleExecutionCandidate,
 ) -> Result<(), TerminalPodCleanupSkipReason> {
-    if pod.metadata.name.as_deref() != Some(candidate.pod_name.as_str()) {
+    if pod.name() != candidate.pod_name.as_str() {
         return Err(TerminalPodCleanupSkipReason::IdentityMismatch);
     }
     if let Some(expected_uid) = candidate.pod_uid.as_deref()
-        && pod.metadata.uid.as_deref() != Some(expected_uid)
+        && pod.uid() != Some(expected_uid)
     {
         return Err(TerminalPodCleanupSkipReason::IdentityMismatch);
     }
     if !pod_label_matches(
         pod,
-        SANDBOX_ID_ANNOTATION,
+        SandboxPodKey::SandboxId,
         &candidate.sandbox_id.to_string(),
     ) || !pod_label_matches(
         pod,
-        SANDBOX_EXECUTION_GENERATION_ANNOTATION,
+        SandboxPodKey::ExecutionGeneration,
         &candidate.generation.to_string(),
-    ) || !pod_label_matches(pod, SANDBOX_MANAGED_BY_LABEL, "space-api")
+    ) || !pod_label_matches(pod, SandboxPodKey::ManagedBy, "space-api")
     {
         return Err(TerminalPodCleanupSkipReason::IdentityMismatch);
     }
@@ -472,15 +468,11 @@ fn validate_terminal_succeeded_pod(
     Ok(())
 }
 
-fn pod_label_matches(pod: &Pod, key: &str, expected: &str) -> bool {
+fn pod_label_matches(pod: &SandboxPodView, key: SandboxPodKey, expected: &str) -> bool {
     // Missing labels are tolerated intentionally: name + optional UID +
     // terminal status carry the hard identity guard, while these labels add
     // safety when present on SPACE-rendered pods.
-    pod.metadata
-        .labels
-        .as_ref()
-        .and_then(|labels| labels.get(key))
-        .is_none_or(|actual| actual == expected)
+    pod.label(key).is_none_or(|actual| actual == expected)
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]

@@ -622,8 +622,8 @@ impl fmt::Display for StalePodReason {
     }
 }
 
-pub(super) fn terminal_pod_phase(status: Option<&PodStatus>) -> Option<TerminalPodPhase> {
-    match status.and_then(|status| status.phase.as_deref()) {
+pub(super) fn terminal_pod_phase(pod: &SandboxPodView) -> Option<TerminalPodPhase> {
+    match pod.phase() {
         Some("Succeeded") => Some(TerminalPodPhase::Succeeded),
         Some("Failed") => Some(TerminalPodPhase::Failed),
         _ => None,
@@ -636,11 +636,10 @@ pub(super) fn terminal_pod_phase(status: Option<&PodStatus>) -> Option<TerminalP
 /// pre-binding `Pending` with no IP) is treated as cache-stale so the
 /// reflector watch lag cannot stall callers that are already past the
 /// per-pod watch.
-pub(super) fn pod_status_is_settled(pod: &Pod) -> bool {
-    let status = pod.status.as_ref();
-    assigned_pod_ip(status).ok().flatten().is_some()
-        || terminal_pod_phase(status).is_some()
-        || pod_unschedulable_message(status).is_some()
+pub(super) fn pod_status_is_settled(pod: &SandboxPodView) -> bool {
+    assigned_pod_ip(pod).ok().flatten().is_some()
+        || terminal_pod_phase(pod).is_some()
+        || pod.unschedulable_message().is_some()
 }
 
 pub(super) fn execution_pod_create_in_flight(state: ActiveExecutionState) -> bool {
@@ -688,11 +687,11 @@ pub(super) enum PooledPodNodeGroup {
     Unreadable,
 }
 
-pub(super) fn pooled_pod_node_group(caches: &K8sCaches, pod: Option<&Pod>) -> PooledPodNodeGroup {
-    let Some(node_name) = pod
-        .and_then(|pod| pod.spec.as_ref())
-        .and_then(|spec| spec.node_name.as_deref())
-    else {
+pub(super) fn pooled_pod_node_group(
+    caches: &K8sCaches,
+    pod: Option<&SandboxPodView>,
+) -> PooledPodNodeGroup {
+    let Some(node_name) = pod.and_then(SandboxPodView::node_name) else {
         return PooledPodNodeGroup::Unreadable;
     };
     let Some(node) = caches.node_by_name(node_name) else {
@@ -762,7 +761,7 @@ pub(super) enum PooledPodAdmission {
 pub(super) fn pooled_pod_node_admission(
     caches: &K8sCaches,
     placement: &NodeGroupPlacement,
-    pod: Option<&Pod>,
+    pod: Option<&SandboxPodView>,
 ) -> PooledPodAdmission {
     // Defensive: the usability gate makes this unreachable from the only
     // production caller. `spec.nodeName` is written by the binding and kubelet
@@ -771,10 +770,7 @@ pub(super) fn pooled_pod_node_admission(
     // implies a bound node — and both sources here hand over one whole object,
     // so there is no torn read to produce the pair. Kept because it costs
     // nothing and the alternative is an `expect`.
-    let Some(node_name) = pod
-        .and_then(|pod| pod.spec.as_ref())
-        .and_then(|spec| spec.node_name.as_deref())
-    else {
+    let Some(node_name) = pod.and_then(SandboxPodView::node_name) else {
         return PooledPodAdmission::Unknown;
     };
     // Readiness is deliberately not consulted at all: a miss is `Unknown`
@@ -808,52 +804,44 @@ pub(super) fn pooled_pod_node_admission(
     }
 }
 
-pub(super) fn pooled_claim_pod_is_usable(claim: &PooledExecutionClaim, pod: Option<&Pod>) -> bool {
+pub(super) fn pooled_claim_pod_is_usable(
+    claim: &PooledExecutionClaim,
+    pod: Option<&SandboxPodView>,
+) -> bool {
     let Some(pod) = pod else {
         return false;
     };
-    let Some(status) = pod.status.as_ref() else {
-        return false;
-    };
 
-    pod.metadata.deletion_timestamp.is_none()
-        && status.phase.as_deref() == Some("Running")
+    !pod.is_deleting()
+        && pod.phase() == Some("Running")
         && claim.pod_uid.is_some()
-        && pod.metadata.uid.as_deref() == claim.pod_uid.as_ref().map(|uid| uid.as_str())
-        && status.pod_ip.as_deref() == Some(claim.pod_ip.as_str())
+        && pod.uid() == claim.pod_uid.as_ref().map(|uid| uid.as_str())
+        && pod.pod_ip() == Some(claim.pod_ip.as_str())
 }
 
 pub(super) fn stale_existing_pod_reason(
     sandbox: &Sandbox,
-    pod: &Pod,
+    pod: &SandboxPodView,
     suspend_restore_storage_uri: Option<&str>,
 ) -> Option<StalePodReason> {
-    let annotations = pod.metadata.annotations.as_ref();
     // Restore flips the DB lifecycle after the pod is created, so a restore
     // pod can be valid while the sandbox row still reads suspended.
-    let pod_is_restore_in_progress = annotations.is_some_and(|annotations| {
-        annotations.contains_key(SANDBOX_SUSPEND_RESTORE_STORAGE_URI_ANNOTATION)
-            || annotations.contains_key(SANDBOX_SUSPEND_RESTORE_SOURCE_NODE_ANNOTATION)
-    });
+    let pod_is_restore_in_progress = pod.has_annotation(SandboxPodKey::SuspendRestoreStorageUri)
+        || pod.has_annotation(SandboxPodKey::SuspendRestoreSourceNode);
     if is_suspended_lifecycle(&sandbox.lifecycle) && !pod_is_restore_in_progress {
         return Some(StalePodReason::SandboxSuspended);
     }
     let is_pending_local_only_restore = suspend_restore_storage_uri.is_some()
-        && annotations.is_some_and(|annotations| {
-            annotations.contains_key(SANDBOX_SUSPEND_RESTORE_SOURCE_NODE_ANNOTATION)
-                && !annotations.contains_key(SANDBOX_SUSPEND_RESTORE_STORAGE_URI_ANNOTATION)
-        })
-        && assigned_pod_ip(pod.status.as_ref())
-            .ok()
-            .flatten()
-            .is_none();
+        && pod.has_annotation(SandboxPodKey::SuspendRestoreSourceNode)
+        && !pod.has_annotation(SandboxPodKey::SuspendRestoreStorageUri)
+        && assigned_pod_ip(pod).ok().flatten().is_none();
     if is_pending_local_only_restore {
         return Some(StalePodReason::LocalOnlyRestoreNowPortable);
     }
-    if pod.metadata.deletion_timestamp.is_some() {
+    if pod.is_deleting() {
         return Some(StalePodReason::PodDeleting);
     }
-    terminal_pod_phase(pod.status.as_ref()).map(StalePodReason::TerminalPhase)
+    terminal_pod_phase(pod).map(StalePodReason::TerminalPhase)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -996,18 +984,6 @@ pub(super) fn retire_can_skip_backup_enqueue_error(err: &SubstrateError) -> bool
     }
 }
 
-pub(super) fn pod_unschedulable_message(status: Option<&PodStatus>) -> Option<&str> {
-    status
-        .and_then(|status| status.conditions.as_ref())?
-        .iter()
-        .find(|condition| {
-            condition.type_ == "PodScheduled"
-                && condition.status == "False"
-                && condition.reason.as_deref() == Some("Unschedulable")
-        })
-        .and_then(|condition| condition.message.as_deref().or(condition.reason.as_deref()))
-}
-
 /// The scheduler's first placement decision for a freshly-created pod.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum SchedulingOutcome {
@@ -1027,41 +1003,16 @@ pub(super) enum SchedulingOutcome {
 /// condition, and classifying that pod as unschedulable would let the re-drive
 /// path delete a pod that is no longer inert. The reverse misread cannot
 /// happen: `nodeName` is never set on an unbound pod.
-pub(super) fn scheduling_outcome_of(pod: &Pod) -> Option<SchedulingOutcome> {
+pub(super) fn scheduling_outcome_of(pod: &SandboxPodView) -> Option<SchedulingOutcome> {
     if let Some(node_name) = assigned_pod_node_name(pod) {
         return Some(SchedulingOutcome::Scheduled {
             node_name: node_name.to_string(),
         });
     }
-    if pod_unschedulable_message(pod.status.as_ref()).is_some() {
+    if pod.unschedulable_message().is_some() {
         return Some(SchedulingOutcome::Unschedulable);
     }
     None
-}
-
-/// Whether `pod` carries a **required** source-node pin — a
-/// `nodeAffinity.matchFields: metadata.name` term (the source-aware hard pin).
-/// Read from the live pod so a retry can tell a still-pinned restore pod (must
-/// re-drive) from one already re-driven cross-node (pin dropped, leave alone).
-pub(super) fn pod_has_required_source_pin(pod: &Pod) -> bool {
-    pod.spec
-        .as_ref()
-        .and_then(|spec| spec.affinity.as_ref())
-        .and_then(|affinity| affinity.node_affinity.as_ref())
-        .and_then(|node_affinity| {
-            node_affinity
-                .required_during_scheduling_ignored_during_execution
-                .as_ref()
-        })
-        .is_some_and(|selector| {
-            selector.node_selector_terms.iter().any(|term| {
-                term.match_fields.as_ref().is_some_and(|fields| {
-                    fields.iter().any(|field| {
-                        field.key == pplx_space_common_core::kubernetes::NODE_NAME_MATCH_FIELD
-                    })
-                })
-            })
-        })
 }
 
 /// Why is `CancelGuard` running its cleanup path? Lets `Drop` choose
@@ -1335,16 +1286,10 @@ pub(super) fn is_nodemgr_unreachable(err: &SubstrateError) -> bool {
         || m.contains("connection refused")
 }
 
-pub(super) fn assigned_pod_ip(status: Option<&PodStatus>) -> Result<Option<PodIp>, SubstrateError> {
-    status
-        .and_then(|status| status.pod_ip.as_deref())
-        .map(PodIp::parse)
-        .transpose()
+pub(super) fn assigned_pod_ip(pod: &SandboxPodView) -> Result<Option<PodIp>, SubstrateError> {
+    pod.pod_ip().map(PodIp::parse).transpose()
 }
 
-pub(super) fn assigned_pod_node_name(pod: &Pod) -> Option<&str> {
-    pod.spec
-        .as_ref()
-        .and_then(|spec| spec.node_name.as_deref())
-        .filter(|node_name| !node_name.is_empty())
+pub(super) fn assigned_pod_node_name(pod: &SandboxPodView) -> Option<&str> {
+    pod.node_name().filter(|node_name| !node_name.is_empty())
 }

@@ -9,6 +9,7 @@ use super::pod_ops::{
 };
 use super::support::*;
 use super::*;
+use k8s_openapi::api::core::v1::PodStatus;
 
 pub(crate) use kubernetes_tests::{
     existing_then_created_running_pod_kubernetes_client,
@@ -192,12 +193,15 @@ mod kubernetes_tests {
     ) -> KubernetesSubstrate {
         let shutdown_token = CancellationToken::new();
         let task_tracker = tokio_util::task::TaskTracker::new();
-        let (pod_store, mut pod_writer) = reflector::store::<Pod>();
-        pod_writer.apply_watcher_event(&Event::Init);
-        for pod in pods {
-            pod_writer.apply_watcher_event(&Event::InitApply(pod));
+        // Fixtures mix node-api and sandbox pods; each cache gets the full
+        // list, as each production reflector would see its own label subset.
+        let (node_api_pod_store, mut node_api_pod_writer) = reflector::store::<Pod>();
+        node_api_pod_writer.apply_watcher_event(&Event::Init);
+        for pod in &pods {
+            node_api_pod_writer.apply_watcher_event(&Event::InitApply(pod.clone()));
         }
-        pod_writer.apply_watcher_event(&Event::InitDone);
+        node_api_pod_writer.apply_watcher_event(&Event::InitDone);
+        let (pod_store, pod_network_slots, _) = sandbox_pod_view::seeded_sandbox_pod_cache(pods);
 
         let (node_store, mut node_writer) = reflector::store::<Node>();
         node_writer.apply_watcher_event(&Event::Init);
@@ -206,7 +210,7 @@ mod kubernetes_tests {
         }
         node_writer.apply_watcher_event(&Event::InitDone);
 
-        let caches = Arc::new(K8sCaches::for_test(pod_store.clone(), node_store, true));
+        let caches = Arc::new(K8sCaches::for_test(node_api_pod_store, node_store, true));
         KubernetesSubstrate {
             k8s: KubernetesState {
                 client: inert_kubernetes_client(),
@@ -229,6 +233,7 @@ mod kubernetes_tests {
             ),
             store: K8sStore::new(pool.clone(), "space".to_string()),
             pod_store,
+            pod_network_slots,
             pod_events: pod_reflector::PodEvents::for_test(),
             pod_reflector_ready: ReflectorReady::always_ready(),
             cancel_tracker: Arc::new(CancelRateTracker::with_budget(64)),
@@ -385,31 +390,37 @@ mod kubernetes_tests {
         // Bound to a node — the outcome carries the landing site so shortlist
         // restores can record source-vs-fallback placement.
         assert_eq!(
-            scheduling_outcome_of(&pod_with_scheduling(Some("worker-a"), false)),
+            scheduling_outcome_of(&SandboxPodView::from(pod_with_scheduling(
+                Some("worker-a"),
+                false
+            ))),
             Some(SchedulingOutcome::Scheduled {
                 node_name: "worker-a".to_string()
             })
         );
         // Scheduler rejected every pinned node: still Pending, no nodeName.
         assert_eq!(
-            scheduling_outcome_of(&pod_with_scheduling(None, true)),
+            scheduling_outcome_of(&SandboxPodView::from(pod_with_scheduling(None, true))),
             Some(SchedulingOutcome::Unschedulable)
         );
         // Not yet decided — neither bound nor marked unschedulable.
         assert_eq!(
-            scheduling_outcome_of(&pod_with_scheduling(None, false)),
+            scheduling_outcome_of(&SandboxPodView::from(pod_with_scheduling(None, false))),
             None
         );
         // An empty nodeName is not a bind.
         assert_eq!(
-            scheduling_outcome_of(&pod_with_scheduling(Some(""), false)),
+            scheduling_outcome_of(&SandboxPodView::from(pod_with_scheduling(Some(""), false))),
             None
         );
         // A bind is authoritative even when a stale Unschedulable condition
         // lingers: nodeName is immutable once set, so the pod is no longer
         // inert and must never be classified deletable-unschedulable.
         assert_eq!(
-            scheduling_outcome_of(&pod_with_scheduling(Some("worker-a"), true)),
+            scheduling_outcome_of(&SandboxPodView::from(pod_with_scheduling(
+                Some("worker-a"),
+                true
+            ))),
             Some(SchedulingOutcome::Scheduled {
                 node_name: "worker-a".to_string()
             })
@@ -417,7 +428,7 @@ mod kubernetes_tests {
     }
 
     #[test]
-    fn pod_has_required_source_pin_detects_only_the_required_matchfields_pin() {
+    fn required_source_pin_detects_only_the_required_matchfields_pin() {
         use k8s_openapi::api::core::v1::{
             Affinity, NodeAffinity, NodeSelector, NodeSelectorRequirement, NodeSelectorTerm,
             PreferredSchedulingTerm,
@@ -448,7 +459,7 @@ mod kubernetes_tests {
             }),
             ..Default::default()
         }));
-        assert!(pod_has_required_source_pin(&required));
+        assert!(SandboxPodView::from(required).has_required_source_pin());
 
         // Only a *preferred* metadata.name term (legacy soft affinity) -> not pinned.
         let preferred = pod_with_affinity(Some(Affinity {
@@ -466,7 +477,7 @@ mod kubernetes_tests {
             }),
             ..Default::default()
         }));
-        assert!(!pod_has_required_source_pin(&preferred));
+        assert!(!SandboxPodView::from(preferred).has_required_source_pin());
 
         // Required term without matchFields (e.g. only the ssd-block exclusion)
         // -> not pinned (a cross-node re-driven pod).
@@ -486,10 +497,10 @@ mod kubernetes_tests {
             }),
             ..Default::default()
         }));
-        assert!(!pod_has_required_source_pin(&required_no_pin));
+        assert!(!SandboxPodView::from(required_no_pin).has_required_source_pin());
 
         // No affinity at all -> not pinned.
-        assert!(!pod_has_required_source_pin(&pod_with_affinity(None)));
+        assert!(!SandboxPodView::from(pod_with_affinity(None)).has_required_source_pin());
     }
 
     fn node_with_network_slots(
@@ -557,6 +568,13 @@ mod kubernetes_tests {
         })
     }
 
+    /// The per-node slot index the reflector would build from `pods`.
+    fn network_slots_for(pods: &[Arc<Pod>]) -> NodeNetworkSlots {
+        let (_, network_slots, _) =
+            sandbox_pod_view::seeded_sandbox_pod_cache(pods.iter().map(|pod| (**pod).clone()));
+        network_slots
+    }
+
     #[test]
     fn network_slot_preflight_admits_matching_node_with_free_capacity() {
         let config = SandboxPodConfigValues::default();
@@ -571,7 +589,11 @@ mod kubernetes_tests {
         let pods = vec![sandbox_pod_on_node("sandbox-a", "node-a", 1, "Running")];
 
         assert_eq!(
-            super::adapter::network_slot_capacity_preflight(&nodes, &pods, &config),
+            super::adapter::network_slot_capacity_preflight(
+                &nodes,
+                &network_slots_for(&pods),
+                &config
+            ),
             super::adapter::NetworkSlotCapacityPreflight::Available
         );
     }
@@ -581,7 +603,11 @@ mod kubernetes_tests {
         let config = SandboxPodConfigValues::default();
 
         assert_eq!(
-            super::adapter::network_slot_capacity_preflight(&[], &[], &config),
+            super::adapter::network_slot_capacity_preflight(
+                &[],
+                &NodeNetworkSlots::default(),
+                &config
+            ),
             super::adapter::NetworkSlotCapacityPreflight::Unknown
         );
     }
@@ -600,7 +626,11 @@ mod kubernetes_tests {
         let pods = vec![sandbox_pod_on_node("sandbox-a", "node-a", 1, "Running")];
 
         assert_eq!(
-            super::adapter::network_slot_capacity_preflight(&nodes, &pods, &config),
+            super::adapter::network_slot_capacity_preflight(
+                &nodes,
+                &network_slots_for(&pods),
+                &config
+            ),
             super::adapter::NetworkSlotCapacityPreflight::Full
         );
     }
@@ -619,7 +649,11 @@ mod kubernetes_tests {
         let pods = vec![sandbox_pod_on_node("sandbox-a", "node-a", 1, "Succeeded")];
 
         assert_eq!(
-            super::adapter::network_slot_capacity_preflight(&nodes, &pods, &config),
+            super::adapter::network_slot_capacity_preflight(
+                &nodes,
+                &network_slots_for(&pods),
+                &config
+            ),
             super::adapter::NetworkSlotCapacityPreflight::Available
         );
     }
@@ -653,7 +687,11 @@ mod kubernetes_tests {
         ];
 
         assert_eq!(
-            super::adapter::network_slot_capacity_preflight(&nodes, &[], &config),
+            super::adapter::network_slot_capacity_preflight(
+                &nodes,
+                &NodeNetworkSlots::default(),
+                &config
+            ),
             super::adapter::NetworkSlotCapacityPreflight::Unknown
         );
     }
@@ -1844,11 +1882,15 @@ mod kubernetes_tests {
     ) -> KubernetesSubstrate {
         let shutdown_token = CancellationToken::new();
         let task_tracker = tokio_util::task::TaskTracker::new();
-        let (pod_store, mut pod_writer) = reflector::store::<Pod>();
+        let (node_api_pod_store, mut node_api_pod_writer) = reflector::store::<Pod>();
+        let (pod_store, pod_network_slots, mut pod_writer) = sandbox_pod_view::sandbox_pod_cache();
         if let Some(pod) = initial_pod {
             use kube::runtime::watcher::Event;
+            node_api_pod_writer.apply_watcher_event(&Event::Init);
+            node_api_pod_writer.apply_watcher_event(&Event::InitApply(pod.clone()));
+            node_api_pod_writer.apply_watcher_event(&Event::InitDone);
             pod_writer.apply_watcher_event(&Event::Init);
-            pod_writer.apply_watcher_event(&Event::InitApply(pod));
+            pod_writer.apply_watcher_event(&Event::InitApply(pod.into()));
             pod_writer.apply_watcher_event(&Event::InitDone);
         }
         let (node_store, mut node_writer) = reflector::store::<Node>();
@@ -1857,7 +1899,7 @@ mod kubernetes_tests {
             node_writer.apply_watcher_event(&Event::InitApply(node));
         }
         node_writer.apply_watcher_event(&Event::InitDone);
-        let caches = Arc::new(K8sCaches::for_test(pod_store.clone(), node_store, true));
+        let caches = Arc::new(K8sCaches::for_test(node_api_pod_store, node_store, true));
 
         KubernetesSubstrate {
             k8s: KubernetesState {
@@ -1881,6 +1923,7 @@ mod kubernetes_tests {
             ),
             store: K8sStore::new(pool.clone(), "space".to_string()),
             pod_store,
+            pod_network_slots,
             pod_events: pod_reflector::PodEvents::for_test(),
             pod_reflector_ready: ReflectorReady::always_ready(),
             cancel_tracker: Arc::new(CancelRateTracker::with_budget(64)),
@@ -7063,7 +7106,7 @@ mod kubernetes_tests {
         let pod = Pod::default();
 
         assert_eq!(
-            stale_existing_pod_reason(&sandbox, &pod, None),
+            stale_existing_pod_reason(&sandbox, &SandboxPodView::from(pod.clone()), None),
             Some(StalePodReason::SandboxSuspended)
         );
     }
@@ -8829,9 +8872,10 @@ mod kubernetes_tests {
         }
         node_writer.apply_watcher_event(&Event::InitDone);
 
-        let (pod_store, _) = reflector::store::<Pod>();
+        let (node_api_pod_store, _) = reflector::store::<Pod>();
+        let (pod_store, pod_network_slots, _) = sandbox_pod_view::sandbox_pod_cache();
         let caches = Arc::new(K8sCaches::for_test(
-            pod_store.clone(),
+            node_api_pod_store,
             node_store,
             nodes_ready,
         ));
@@ -8862,6 +8906,7 @@ mod kubernetes_tests {
             ),
             store: K8sStore::new(pool.clone(), "space".to_string()),
             pod_store,
+            pod_network_slots,
             pod_events: pod_reflector::PodEvents::for_test(),
             pod_reflector_ready: ReflectorReady::always_ready(),
             cancel_tracker: Arc::new(CancelRateTracker::with_budget(64)),
@@ -10389,7 +10434,11 @@ mod kubernetes_tests {
             "s3://snap/current",
         );
         assert_eq!(
-            stale_existing_pod_reason(&sandbox, &s3_restore_pod, Some("s3://snap/current")),
+            stale_existing_pod_reason(
+                &sandbox,
+                &SandboxPodView::from(s3_restore_pod.clone()),
+                Some("s3://snap/current")
+            ),
             None
         );
 
@@ -10398,7 +10447,11 @@ mod kubernetes_tests {
             "source-node",
         );
         assert_eq!(
-            stale_existing_pod_reason(&sandbox, &local_restore_pod, None),
+            stale_existing_pod_reason(
+                &sandbox,
+                &SandboxPodView::from(local_restore_pod.clone()),
+                None
+            ),
             None
         );
     }
@@ -10419,9 +10472,16 @@ mod kubernetes_tests {
             ..Default::default()
         };
 
-        assert_eq!(stale_existing_pod_reason(&sandbox, &pod, None), None);
         assert_eq!(
-            stale_existing_pod_reason(&sandbox, &pod, Some("s3://snap/current")),
+            stale_existing_pod_reason(&sandbox, &SandboxPodView::from(pod.clone()), None),
+            None
+        );
+        assert_eq!(
+            stale_existing_pod_reason(
+                &sandbox,
+                &SandboxPodView::from(pod.clone()),
+                Some("s3://snap/current")
+            ),
             Some(StalePodReason::LocalOnlyRestoreNowPortable)
         );
     }
@@ -10438,7 +10498,7 @@ mod kubernetes_tests {
         };
 
         assert_eq!(
-            stale_existing_pod_reason(&sandbox, &pod, None),
+            stale_existing_pod_reason(&sandbox, &SandboxPodView::from(pod.clone()), None),
             Some(StalePodReason::TerminalPhase(TerminalPodPhase::Succeeded))
         );
     }
@@ -10469,8 +10529,13 @@ mod kubernetes_tests {
             }]),
             ..Default::default()
         };
-        let message =
-            pod_unschedulable_message(Some(&status)).expect("pod should be unschedulable");
+        let pod = SandboxPodView::from(Pod {
+            status: Some(status),
+            ..Default::default()
+        });
+        let message = pod
+            .unschedulable_message()
+            .expect("pod should be unschedulable");
         let err = SubstrateError::Unavailable {
             message: format!("sandbox pod is unschedulable: {message}"),
         };
@@ -10641,7 +10706,7 @@ mod kubernetes_tests {
     }
 
     #[test]
-    fn pod_unschedulable_message_extracts_scheduler_reason() {
+    fn unschedulable_message_extracts_scheduler_reason() {
         let status = PodStatus {
             conditions: Some(vec![k8s_openapi::api::core::v1::PodCondition {
                 type_: "PodScheduled".to_string(),
@@ -10653,10 +10718,11 @@ mod kubernetes_tests {
             ..Default::default()
         };
 
-        assert_eq!(
-            pod_unschedulable_message(Some(&status)),
-            Some("0/3 nodes are available")
-        );
+        let pod = SandboxPodView::from(Pod {
+            status: Some(status),
+            ..Default::default()
+        });
+        assert_eq!(pod.unschedulable_message(), Some("0/3 nodes are available"));
     }
 
     fn test_sandbox_id() -> SandboxId {
@@ -10849,29 +10915,26 @@ mod kubernetes_tests {
 
     #[test]
     fn terminal_pod_phase_matches_only_succeeded_and_failed() {
-        let succeeded = PodStatus {
-            phase: Some("Succeeded".to_string()),
-            ..Default::default()
-        };
-        let failed = PodStatus {
-            phase: Some("Failed".to_string()),
-            ..Default::default()
-        };
-        let running = PodStatus {
-            phase: Some("Running".to_string()),
-            ..Default::default()
+        let with_phase = |phase: Option<&str>| {
+            SandboxPodView::from(Pod {
+                status: phase.map(|phase| PodStatus {
+                    phase: Some(phase.to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
         };
 
         assert_eq!(
-            terminal_pod_phase(Some(&succeeded)),
+            terminal_pod_phase(&with_phase(Some("Succeeded"))),
             Some(TerminalPodPhase::Succeeded)
         );
         assert_eq!(
-            terminal_pod_phase(Some(&failed)),
+            terminal_pod_phase(&with_phase(Some("Failed"))),
             Some(TerminalPodPhase::Failed)
         );
-        assert_eq!(terminal_pod_phase(Some(&running)), None);
-        assert_eq!(terminal_pod_phase(None), None);
+        assert_eq!(terminal_pod_phase(&with_phase(Some("Running"))), None);
+        assert_eq!(terminal_pod_phase(&with_phase(None)), None);
     }
 
     /// The pooled pod a [`pool_claim_fixture`] puts in front of the claim.
@@ -11623,7 +11686,7 @@ mod kubernetes_tests {
             pooled_pod_node_admission(
                 &substrate.k8s.caches,
                 &placement,
-                Some(&pod_on(Some("in-set-worker"))),
+                Some(&SandboxPodView::from(pod_on(Some("in-set-worker")))),
             ),
             PooledPodAdmission::Admitted,
             "a pod on an in-set node is adoptable"
@@ -11663,7 +11726,11 @@ mod kubernetes_tests {
             ),
         ] {
             assert_eq!(
-                pooled_pod_node_admission(&substrate.k8s.caches, &placement, Some(&pod_on(node))),
+                pooled_pod_node_admission(
+                    &substrate.k8s.caches,
+                    &placement,
+                    Some(&SandboxPodView::from(pod_on(node)))
+                ),
                 want,
                 "{why}"
             );
@@ -11695,7 +11762,7 @@ mod kubernetes_tests {
             pooled_pod_node_admission(
                 &cold.k8s.caches,
                 &placement,
-                Some(&pod_on(Some("in-set-worker"))),
+                Some(&SandboxPodView::from(pod_on(Some("in-set-worker")))),
             ),
             PooledPodAdmission::Admitted,
             "a cold store's own entry is evidence: an in-set node is adoptable"
@@ -11704,7 +11771,7 @@ mod kubernetes_tests {
             pooled_pod_node_admission(
                 &cold.k8s.caches,
                 &placement,
-                Some(&pod_on(Some("not-loaded-yet-worker"))),
+                Some(&SandboxPodView::from(pod_on(Some("not-loaded-yet-worker")))),
             ),
             PooledPodAdmission::Unknown,
             "a miss against a cold store must be Unknown — never OutsideSet, or a \
@@ -11743,11 +11810,17 @@ mod kubernetes_tests {
             ..Default::default()
         };
 
-        assert!(pooled_claim_pod_is_usable(&claim, Some(&pod)));
+        assert!(pooled_claim_pod_is_usable(
+            &claim,
+            Some(&SandboxPodView::from(pod.clone()))
+        ));
         assert!(!pooled_claim_pod_is_usable(&claim, None));
 
         pod.metadata.uid = Some("replacement-pod-uid".to_string());
-        assert!(!pooled_claim_pod_is_usable(&claim, Some(&pod)));
+        assert!(!pooled_claim_pod_is_usable(
+            &claim,
+            Some(&SandboxPodView::from(pod.clone()))
+        ));
     }
 
     #[test]

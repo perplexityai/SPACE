@@ -26,7 +26,6 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use k8s_openapi::api::core::v1::{ContainerStatus, Pod, PodStatus};
 use pplx_space_common_core::types::{
     PodUid, SandboxId, SandboxLifecycle, SandboxQuarantineHistoryAction,
     SandboxQuarantineNextAction, SandboxQuarantineReasonCode, SandboxQuarantineSource,
@@ -54,7 +53,7 @@ use uuid::Uuid;
 use pplx_space_api::reconcile_queue::ReconcileElementRef;
 
 use pplx_space_api::controllers::substrate::kubernetes::{
-    K8sBlockingDeleteError, K8sBlockingDeleteOutcome, KubernetesSubstrate,
+    K8sBlockingDeleteError, K8sBlockingDeleteOutcome, KubernetesSubstrate, SandboxPodView,
 };
 
 use crate::env_config;
@@ -997,55 +996,28 @@ impl PodPresence for ReflectorPresence {
     }
 }
 
-pub(crate) fn classify_pod_presence(pod: &Pod) -> PodPresenceStatus {
-    if pod.metadata.deletion_timestamp.is_some() {
+pub(crate) fn classify_pod_presence(pod: &SandboxPodView) -> PodPresenceStatus {
+    if pod.is_deleting() {
         return PodPresenceStatus::Unready;
     }
 
-    let Some(status) = pod.status.as_ref() else {
-        return PodPresenceStatus::Unready;
-    };
-    if status.phase.as_deref() == Some("Running") && status.pod_ip.is_some() {
+    if pod.phase() == Some("Running") && pod.pod_ip().is_some() {
         return PodPresenceStatus::Present;
     }
-    match status.phase.as_deref() {
-        Some("Succeeded") if pod_status_all_containers_terminated(status) => {
+    match pod.phase() {
+        Some("Succeeded") if pod_all_containers_terminated(pod) => {
             PodPresenceStatus::TerminalSucceeded
         }
-        Some("Failed") if pod_status_all_containers_terminated(status) => {
-            PodPresenceStatus::TerminalFailed
-        }
+        Some("Failed") if pod_all_containers_terminated(pod) => PodPresenceStatus::TerminalFailed,
         _ => PodPresenceStatus::Unready,
     }
 }
 
-fn pod_status_all_containers_terminated(status: &PodStatus) -> bool {
-    let Some(container_statuses) = status.container_statuses.as_deref() else {
-        return false;
-    };
-    if container_statuses.is_empty() {
-        return false;
-    }
-    container_statuses.iter().all(container_status_terminated)
-        && status
-            .init_container_statuses
-            .as_deref()
-            .unwrap_or_default()
-            .iter()
-            .all(container_status_terminated)
-        && status
-            .ephemeral_container_statuses
-            .as_deref()
-            .unwrap_or_default()
-            .iter()
-            .all(container_status_terminated)
-}
-
-fn container_status_terminated(status: &ContainerStatus) -> bool {
-    status
-        .state
-        .as_ref()
-        .is_some_and(|state| state.terminated.is_some())
+/// Every app, init and ephemeral container has terminated, and there is at
+/// least one app container status to say so.
+fn pod_all_containers_terminated(pod: &SandboxPodView) -> bool {
+    let statuses = pod.container_statuses();
+    !statuses.containers.is_empty() && statuses.all().all(|state| state.terminated.is_some())
 }
 
 /// Real `OrphanActionSink` that joins the candidate scan against

@@ -46,6 +46,9 @@ use pplx_space_common_core::types::PositiveDuration;
 use uuid::Uuid;
 
 use super::*;
+use pplx_space_common_core::kubernetes::{
+    SANDBOX_EXECUTION_GENERATION_ANNOTATION, SANDBOX_ID_ANNOTATION, SANDBOX_MANAGED_BY_LABEL,
+};
 
 // -----------------------------------------------------------------
 // Fakes
@@ -501,12 +504,15 @@ async fn t12_terminal_failed_pod_is_audit_only() {
 fn t13_terminal_pod_validation_requires_matching_identity() {
     let candidate = candidate("pod-terminal");
     let pod = terminal_pod_for(&candidate);
-    assert_eq!(validate_terminal_succeeded_pod(&pod, &candidate), Ok(()));
+    assert_eq!(
+        validate_terminal_succeeded_pod(&SandboxPodView::from(pod.clone()), &candidate),
+        Ok(())
+    );
 
     let mut wrong_uid = pod.clone();
     wrong_uid.metadata.uid = Some("other-uid".to_string());
     assert_eq!(
-        validate_terminal_succeeded_pod(&wrong_uid, &candidate),
+        validate_terminal_succeeded_pod(&SandboxPodView::from(wrong_uid.clone()), &candidate),
         Err(TerminalPodCleanupSkipReason::IdentityMismatch)
     );
 
@@ -516,7 +522,7 @@ fn t13_terminal_pod_validation_requires_matching_identity() {
         Uuid::now_v7().to_string(),
     );
     assert_eq!(
-        validate_terminal_succeeded_pod(&wrong_sandbox, &candidate),
+        validate_terminal_succeeded_pod(&SandboxPodView::from(wrong_sandbox.clone()), &candidate),
         Err(TerminalPodCleanupSkipReason::IdentityMismatch)
     );
 
@@ -526,7 +532,10 @@ fn t13_terminal_pod_validation_requires_matching_identity() {
         "2".to_string(),
     );
     assert_eq!(
-        validate_terminal_succeeded_pod(&wrong_generation, &candidate),
+        validate_terminal_succeeded_pod(
+            &SandboxPodView::from(wrong_generation.clone()),
+            &candidate
+        ),
         Err(TerminalPodCleanupSkipReason::IdentityMismatch)
     );
 }
@@ -543,14 +552,14 @@ fn t14_terminal_pod_validation_requires_safe_succeeded_status() {
         ..Default::default()
     }]);
     assert_eq!(
-        validate_terminal_succeeded_pod(&running, &candidate),
+        validate_terminal_succeeded_pod(&SandboxPodView::from(running.clone()), &candidate),
         Err(TerminalPodCleanupSkipReason::NoLongerSucceeded)
     );
 
     let mut failed = terminal_pod_for(&candidate);
     failed.status.as_mut().unwrap().phase = Some("Failed".to_string());
     assert_eq!(
-        validate_terminal_succeeded_pod(&failed, &candidate),
+        validate_terminal_succeeded_pod(&SandboxPodView::from(failed.clone()), &candidate),
         Err(TerminalPodCleanupSkipReason::NoLongerSucceeded)
     );
 }

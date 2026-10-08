@@ -2,6 +2,7 @@ use pplx_space_common_core::types::SandboxId;
 
 use super::per_sandbox_setup::{NetworkPolicySetup, NodeFilesystemSetup, PerSandboxSetup};
 use super::pool::pooled_route_activation_id;
+use super::sandbox_pod_view::quantity_as_u64;
 use super::store::{ActiveExecutionStatusRow, PlacementRetryDisposition, SuspendExecutionClaim};
 use super::support::*;
 use super::wait_ready::{CommandReadyPod, PodProxyWaitTarget};
@@ -448,19 +449,19 @@ pub(super) enum NetworkSlotCapacityPreflight {
 fn fenced_runtime_pod_ip(
     lifecycle: &str,
     state: ActiveExecutionState,
-    live_pod: Option<&Pod>,
+    live_pod: Option<&SandboxPodView>,
 ) -> Option<PodIp> {
     if is_suspended_lifecycle(lifecycle) || execution_pod_lookup_in_flight(state) {
         return None;
     }
     let live_pod = live_pod?;
-    if live_pod.metadata.deletion_timestamp.is_some()
-        || terminal_pod_phase(live_pod.status.as_ref()).is_some()
-        || pod_unschedulable_message(live_pod.status.as_ref()).is_some()
+    if live_pod.is_deleting()
+        || terminal_pod_phase(live_pod).is_some()
+        || live_pod.unschedulable_message().is_some()
     {
         return None;
     }
-    assigned_pod_ip(live_pod.status.as_ref()).ok().flatten()
+    assigned_pod_ip(live_pod).ok().flatten()
 }
 
 /// Project the world as it is now into the same shape the fence carries, so
@@ -469,7 +470,7 @@ fn fenced_runtime_pod_ip(
 /// fields.
 fn current_execution_identity(
     active: &ActiveExecutionStatusRow,
-    live_pod: Option<&Pod>,
+    live_pod: Option<&SandboxPodView>,
 ) -> ExecutionIdentity {
     ExecutionIdentity {
         pod_name: PodName::parse(&active.pod_name)
@@ -485,20 +486,13 @@ fn current_execution_identity(
         },
         pod: match live_pod {
             None => ObservedPod::Absent,
-            Some(pod) => match pod
-                .metadata
-                .uid
-                .as_deref()
-                .and_then(|uid| PodUid::parse(uid).ok())
-            {
+            Some(pod) => match pod.uid().and_then(|uid| PodUid::parse(uid).ok()) {
                 Some(pod_uid) => ObservedPod::Seen {
                     pod_uid,
                     resource_version: pod
-                        .metadata
-                        .resource_version
-                        .as_deref()
+                        .resource_version()
                         .and_then(|version| PodResourceVersion::parse(version).ok()),
-                    terminal: terminal_pod_phase(pod.status.as_ref()).is_some(),
+                    terminal: terminal_pod_phase(pod).is_some(),
                 },
                 // A live object we cannot identify is not something any fence
                 // can be proven against.
@@ -630,12 +624,6 @@ pub(super) fn node_services_not_ready(node: &Node) -> bool {
         })
 }
 
-fn quantity_as_u64(
-    quantity: &k8s_openapi::apimachinery::pkg::api::resource::Quantity,
-) -> Option<u64> {
-    quantity.0.parse::<u64>().ok()
-}
-
 fn node_network_slot_capacity(node: &Node) -> Option<u64> {
     let status = node.status.as_ref()?;
     let advertised = status
@@ -659,55 +647,19 @@ fn node_network_slot_capacity(node: &Node) -> Option<u64> {
         .or(Some(advertised))
 }
 
-fn active_pod_network_slot_request(pod: &Pod) -> u64 {
-    if pod.metadata.deletion_timestamp.is_some()
-        || terminal_pod_phase(pod.status.as_ref()).is_some()
-    {
-        return 0;
-    }
-
-    pod.spec
-        .as_ref()
-        .map(|spec| {
-            spec.containers
-                .iter()
-                .filter_map(|container| {
-                    container
-                        .resources
-                        .as_ref()
-                        .and_then(|resources| resources.requests.as_ref())
-                        .and_then(|requests| {
-                            requests.get(
-                                pplx_space_common_core::kubernetes::SANDBOX_NETWORK_SLOTS_RESOURCE,
-                            )
-                        })
-                        .and_then(quantity_as_u64)
-                })
-                .sum()
-        })
-        .unwrap_or(0)
-}
-
-pub(super) fn node_network_slot_available(node: &Node, pods: &[std::sync::Arc<Pod>]) -> bool {
+pub(super) fn node_network_slot_available(node: &Node, network_slots: &NodeNetworkSlots) -> bool {
     let Some(node_name) = node.metadata.name.as_deref() else {
         return false;
     };
     let Some(capacity) = node_network_slot_capacity(node) else {
         return false;
     };
-    let requested: u64 = pods
-        .iter()
-        .filter(|pod| {
-            pod.spec.as_ref().and_then(|spec| spec.node_name.as_deref()) == Some(node_name)
-        })
-        .map(|pod| active_pod_network_slot_request(pod))
-        .sum();
-    requested < capacity
+    network_slots.requested_on(node_name) < capacity
 }
 
 pub(super) fn network_slot_capacity_preflight(
     nodes: &[std::sync::Arc<Node>],
-    pods: &[std::sync::Arc<Pod>],
+    network_slots: &NodeNetworkSlots,
     config: &SandboxPodConfigValues,
 ) -> NetworkSlotCapacityPreflight {
     let selector = config.base_node_selector();
@@ -724,15 +676,7 @@ pub(super) fn network_slot_capacity_preflight(
         };
         saw_capacity_node = true;
 
-        let requested: u64 = pods
-            .iter()
-            .filter(|pod| {
-                pod.spec.as_ref().and_then(|spec| spec.node_name.as_deref()) == Some(node_name)
-            })
-            .map(|pod| active_pod_network_slot_request(pod))
-            .sum();
-
-        if requested < capacity {
+        if network_slots.requested_on(node_name) < capacity {
             return NetworkSlotCapacityPreflight::Available;
         }
     }
@@ -753,7 +697,7 @@ impl KubernetesSubstrate {
     async fn admitted_pool_pod_placement_admits(
         &self,
         request: &PooledExecutionClaimRequest<'_>,
-        pod: Option<&Pod>,
+        pod: Option<&SandboxPodView>,
     ) -> bool {
         let resolved = match self
             .node_group_placement
@@ -1119,10 +1063,7 @@ impl KubernetesSubstrate {
             // above). Fall through to the authoritative GET in that window.
             Some(pod)
                 if assigned_pod_node_name(&pod).is_some()
-                    && assigned_pod_ip(pod.status.as_ref())
-                        .ok()
-                        .flatten()
-                        .is_some() =>
+                    && assigned_pod_ip(&pod).ok().flatten().is_some() =>
             {
                 pod
             }
@@ -1132,14 +1073,12 @@ impl KubernetesSubstrate {
                 .flatten()?,
         };
         assigned_pod_node_name(&pod)?;
-        if pod.metadata.deletion_timestamp.is_some()
-            || terminal_pod_phase(pod.status.as_ref()).is_some()
-        {
+        if pod.is_deleting() || terminal_pod_phase(&pod).is_some() {
             return None;
         }
         // Live evidence the runtime is reachable — not merely that an IP was
         // assigned. Same probe + timeout the create proxy-reachable loop uses.
-        let pod_ip = assigned_pod_ip(pod.status.as_ref()).ok().flatten()?;
+        let pod_ip = assigned_pod_ip(&pod).ok().flatten()?;
         if !Self::pod_proxy_accepts_tcp(
             pod_ip,
             self.k8s.sandbox_proxy_port,
@@ -1194,16 +1133,14 @@ impl KubernetesSubstrate {
         // One comparison, over the whole identity. Every earlier bug on this
         // path was a site that compared a different subset of these fields, or
         // read one of them being absent as "no expectation here".
-        let current = current_execution_identity(&active, live_pod.as_ref());
+        let current = current_execution_identity(&active, live_pod.as_deref());
         if let Err(mismatch) = fence.observed().reconcile(&current) {
             if mismatch == PodFenceMismatch::PodIdentityUnverified
-                && let Some(observed_uid) = live_pod
-                    .as_ref()
-                    .and_then(|pod| pod.metadata.uid.as_deref())
+                && let Some(observed_uid) = live_pod.as_deref().and_then(SandboxPodView::uid)
             {
                 self.hydrate_materialized_pod_uid(
                     sandbox_id,
-                    &current_execution_identity(&active, live_pod.as_ref()),
+                    &current_execution_identity(&active, live_pod.as_deref()),
                     observed_uid,
                 )
                 .await;
@@ -1215,11 +1152,11 @@ impl KubernetesSubstrate {
                 ObservedPod::Seen { pod_uid, .. } => Some(pod_uid.clone()),
                 ObservedPod::Absent | ObservedPod::Unobserved => None,
             },
-            identity: current_execution_identity(&active, live_pod.as_ref()),
+            identity: current_execution_identity(&active, live_pod.as_deref()),
             runtime_pod_ip: fenced_runtime_pod_ip(
                 &active.lifecycle,
                 active.state,
-                live_pod.as_ref(),
+                live_pod.as_deref(),
             ),
         })))
     }
@@ -1248,10 +1185,10 @@ impl KubernetesSubstrate {
         state: ActiveExecutionState,
         pod_name: &PodName,
         freshness: FenceReadFreshness,
-    ) -> Result<Option<Pod>, SubstrateError> {
+    ) -> Result<Option<Arc<SandboxPodView>>, SubstrateError> {
         let cached = self.lookup_sandbox_pod(pod_name.as_str());
         let authorizes_stop = cached
-            .as_ref()
+            .as_deref()
             .is_some_and(|pod| fenced_runtime_pod_ip(lifecycle, state, Some(pod)).is_some());
         if cached.is_some() && !authorizes_stop && freshness == FenceReadFreshness::CacheIsEnough {
             return Ok(cached);
@@ -1507,7 +1444,7 @@ impl KubernetesSubstrate {
                             message: format!("failed to re-read an unfenceable sandbox pod: {err}"),
                         })?
             {
-                if let Some(observed_uid) = materialized.metadata.uid.as_deref() {
+                if let Some(observed_uid) = materialized.uid() {
                     self.hydrate_materialized_pod_uid(sandbox_id, &fenced.identity, observed_uid)
                         .await;
                 }
@@ -1708,7 +1645,7 @@ impl KubernetesSubstrate {
             // about, the object the caller wanted removed is not there. Report
             // it as the pod having changed, which is the conservative half.
             Ok(None) => PodFenceMismatch::PodUidChanged,
-            Ok(Some(pod)) => match pod.metadata.uid.as_deref() {
+            Ok(Some(pod)) => match pod.uid() {
                 Some(uid) if uid == fenced_uid.as_str() => {
                     PodFenceMismatch::PodResourceVersionChanged
                 }
@@ -1955,7 +1892,7 @@ impl SubstrateAdapter for KubernetesSubstrate {
 
         match network_slot_capacity_preflight(
             &self.k8s.caches.nodes.state(),
-            &self.pod_store.state(),
+            &self.pod_network_slots,
             &self.k8s.sandbox_pod_config,
         ) {
             NetworkSlotCapacityPreflight::Available => {}
@@ -2205,11 +2142,7 @@ impl SubstrateAdapter for KubernetesSubstrate {
         {
             Ok(pod) => {
                 // Pod exists — arm the guard so cancellation triggers cleanup.
-                let pod_uid = pod
-                    .metadata
-                    .uid
-                    .as_deref()
-                    .and_then(|uid| PodUid::parse(uid).ok());
+                let pod_uid = pod.uid().and_then(|uid| PodUid::parse(uid).ok());
                 cancel_guard.arm(self.k8s.clone(), self.store.clone(), pod_uid);
                 pod
             }
@@ -2265,13 +2198,9 @@ impl SubstrateAdapter for KubernetesSubstrate {
                 PlacementRetryDisposition::RetryDuplicatesExecution,
             )
             .await?;
-        let pod_uid = pod.metadata.uid.clone();
-        let pod_status = pod.status.as_ref();
-        let pod_ip = assigned_pod_ip(pod_status)?;
-        let phase = normalize_pod_phase(
-            pod_status.and_then(|status| status.phase.clone()),
-            "pending",
-        );
+        let pod_uid = pod.uid().map(str::to_owned);
+        let pod_ip = assigned_pod_ip(&pod)?;
+        let phase = normalize_pod_phase(pod.phase().map(str::to_owned), "pending");
 
         let pod_ip_string = pod_ip.map(|ip| ip.to_string());
         match self
@@ -2614,15 +2543,9 @@ impl SubstrateAdapter for KubernetesSubstrate {
             .iter()
             .filter_map(|pod_name| {
                 let pod = self.lookup_sandbox_pod(pod_name.as_str())?;
-                let pod_uid = pod
-                    .metadata
-                    .uid
-                    .as_deref()
-                    .and_then(|uid| PodUid::parse(uid).ok())?;
+                let pod_uid = pod.uid().and_then(|uid| PodUid::parse(uid).ok())?;
                 let resource_version = pod
-                    .metadata
-                    .resource_version
-                    .as_deref()
+                    .resource_version()
                     .and_then(|version| PodResourceVersion::parse(version).ok());
                 Some((
                     pod_name.clone(),
@@ -3867,7 +3790,7 @@ impl SubstrateAdapter for KubernetesSubstrate {
             // first would let an unreadable node turn a dead pod's slot into a
             // `release`, which puts it back at the front of the queue for every
             // create that follows.
-            if !pooled_claim_pod_is_usable(&claim, pod.as_ref()) {
+            if !pooled_claim_pod_is_usable(&claim, pod.as_deref()) {
                 tracing::warn!(
                     claim_id = %claim.claim_id,
                     sandbox_id = %claim.sandbox_id,
@@ -4042,7 +3965,7 @@ impl SubstrateAdapter for KubernetesSubstrate {
                         // released and the sandbox builds cold. On a genuinely
                         // unprovisioned cluster no node is labeled and nothing
                         // changes.
-                        match pooled_pod_node_group(&self.k8s.caches, pod.as_ref()) {
+                        match pooled_pod_node_group(&self.k8s.caches, pod.as_deref()) {
                             PooledPodNodeGroup::Labeled(group) => {
                                 pplx_space_metrics::node_group_placement::pool_claim_admission(
                                     pplx_space_metrics::node_group_placement::PoolClaimAdmission::UnprovisionedLabeledNode,
@@ -4252,7 +4175,7 @@ impl SubstrateAdapter for KubernetesSubstrate {
                             PooledClaimRefusal::PlacementIncompatible { message },
                         ));
                     }
-                    match pooled_pod_node_admission(&self.k8s.caches, placement, pod.as_ref()) {
+                    match pooled_pod_node_admission(&self.k8s.caches, placement, pod.as_deref()) {
                         PooledPodAdmission::Admitted => {
                             pplx_space_metrics::node_group_placement::pool_claim_admission(pplx_space_metrics::node_group_placement::PoolClaimAdmission::Admitted);
                             return Ok(PooledExecutionClaimAttempt {
@@ -4374,9 +4297,9 @@ impl SubstrateAdapter for KubernetesSubstrate {
         // stale-claimed sweep collects its pod, and this create builds cold.
         let usable = match self.read_sandbox_pod(&claim.pod_name).await {
             Ok(pod) => {
-                pooled_claim_pod_is_usable(&claim, pod.as_ref())
+                pooled_claim_pod_is_usable(&claim, pod.as_deref())
                     && self
-                        .admitted_pool_pod_placement_admits(request, pod.as_ref())
+                        .admitted_pool_pod_placement_admits(request, pod.as_deref())
                         .await
             }
             Err(error) => {
