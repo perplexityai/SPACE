@@ -693,3 +693,78 @@ async fn restore_releases_artifact_lock_while_waiting_for_cleanup_completion() {
     service.task_tracker.close();
     service.task_tracker.wait().await;
 }
+
+// A template's metadata.json balloon setting reaches the cold-boot VM config
+// as Firecracker's top-level `balloon` object; without one the config gains
+// nothing, and an invalid one fails the start instead of booting without it.
+#[test]
+fn template_balloon_renders_into_the_cold_boot_vm_config() {
+    use crate::service::validation::template_runtime_defaults;
+
+    let vsock = "{\n  \"vsock\": {\n    \"guest_cid\": 3,\n    \"uds_path\": \"/v.sock\"\n  }";
+    let render = |metadata: &str, memory_mib: u32| {
+        let template = tempfile::tempdir().unwrap();
+        std::fs::write(template.path().join("metadata.json"), metadata).unwrap();
+        let defaults = template_runtime_defaults(template.path().to_str().unwrap());
+        defaults
+            .balloon
+            .for_memory_mib(memory_mib)
+            .map(|balloon| format!("{vsock}{}\n}}", firecracker_balloon_field(balloon)))
+    };
+
+    assert_eq!(
+        render(r#"{"vcpu":2,"memory_mib":8192}"#, 8192).unwrap(),
+        format!("{vsock}\n}}"),
+        "no balloon setting leaves the config byte-identical"
+    );
+    assert!(firecracker_balloon_field(None).is_empty());
+
+    let cases = [
+        (
+            r#"{"mode":"inflate","amount_mib":1024,"deflate_on_oom":true}"#,
+            serde_json::json!({
+                "amount_mib": 1024, "deflate_on_oom": true, "stats_polling_interval_s": 0,
+                "free_page_hinting": false, "free_page_reporting": false
+            }),
+        ),
+        (
+            r#"{"mode":"report","stats_polling_interval_s":1}"#,
+            serde_json::json!({
+                "amount_mib": 0, "deflate_on_oom": false, "stats_polling_interval_s": 1,
+                "free_page_hinting": false, "free_page_reporting": true
+            }),
+        ),
+        (
+            r#"{"mode":"hint"}"#,
+            serde_json::json!({
+                "amount_mib": 0, "deflate_on_oom": false, "stats_polling_interval_s": 0,
+                "free_page_hinting": true, "free_page_reporting": false
+            }),
+        ),
+    ];
+    for (balloon, expected) in cases {
+        let rendered = render(
+            &format!(r#"{{"memory_mib":8192,"balloon":{balloon}}}"#),
+            8192,
+        )
+        .unwrap();
+        let config: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+        assert_eq!(config["balloon"], expected, "{balloon}");
+        assert_eq!(config["vsock"]["guest_cid"], 3, "{balloon}");
+    }
+
+    for (metadata, memory_mib) in [
+        (r#"{"balloon":{"mode":"deflate"}}"#, 8192),
+        (r#"{"balloon":{"mode":"hint","amount_mib":1}}"#, 8192),
+        (r#"{"balloon":{"mode":"inflate","amount_mib":1024}}"#, 8192),
+        // The effective memory, not the template default, bounds inflation.
+        (
+            r#"{"balloon":{"mode":"inflate","amount_mib":1024,"deflate_on_oom":true}}"#,
+            1024,
+        ),
+    ] {
+        let error = render(metadata, memory_mib).unwrap_err();
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition, "{metadata}");
+        assert!(error.message().contains("balloon"), "{metadata}: {error}");
+    }
+}

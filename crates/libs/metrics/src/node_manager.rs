@@ -1,6 +1,6 @@
 use std::{fmt, time::Instant};
 
-use crate::emit::{counter, elapsed_ms, gauge, tag, timing_ms};
+use crate::emit::{counter, distribution, elapsed_ms, gauge, tag, timing_ms};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GuestUdp443Action {
@@ -172,4 +172,60 @@ pub fn loop_device_capacity_failed(phase: &str) {
         1,
         &[tag("phase", phase)],
     );
+}
+
+metric_vocabulary!(
+    /// How the free-page-hinting pass before a snapshot pause ended. The
+    /// pause and snapshot proceed in every case.
+    BalloonHintResult {
+        /// The guest hinted every free range it found.
+        Completed => "completed",
+        /// The bounded wait ended first; the run was stopped.
+        TimedOut => "timed_out",
+        /// A Firecracker balloon API call failed.
+        Failed => "failed",
+    }
+);
+
+metric_vocabulary!(
+    /// The balloon read before a snapshot pause that failed.
+    BalloonSnapshotProbe {
+        /// `GET /balloon`.
+        Device => "device",
+        /// `GET /balloon/statistics`.
+        Statistics => "statistics",
+    }
+);
+
+/// `node_mgr.balloon.hint.duration_ms`: one free-page-hinting pass before a
+/// snapshot pause, from start to completion, timeout, or failure.
+pub fn balloon_free_page_hint(result: BalloonHintResult, duration_ms: f64) {
+    timing_ms(
+        "node_mgr.balloon.hint.duration_ms",
+        duration_ms.max(0.0),
+        &[tag("result", result)],
+    );
+}
+
+/// `node_mgr.balloon.probe_failed`: a balloon read before a snapshot pause
+/// failed; the pause proceeded without it.
+pub fn balloon_snapshot_probe_failed(probe: BalloonSnapshotProbe) {
+    counter("node_mgr.balloon.probe_failed", 1, &[tag("probe", probe)]);
+}
+
+/// Balloon statistics sampled just before a snapshot pause, tagged with the
+/// device's `mode` (`inflate`, `report`, or `hint`):
+/// `node_mgr.balloon.actual_mib` is the memory the balloon holds and
+/// `node_mgr.balloon.guest_free_mib` the guest's free memory, when the guest
+/// has reported it.
+pub fn balloon_snapshot_statistics(
+    mode: pplx_space_common_core::types::BalloonMode,
+    actual_mib: u64,
+    guest_free_mib: Option<u64>,
+) {
+    let tags = [tag("mode", mode)];
+    distribution("node_mgr.balloon.actual_mib", actual_mib as f64, &tags);
+    if let Some(free_mib) = guest_free_mib {
+        distribution("node_mgr.balloon.guest_free_mib", free_mib as f64, &tags);
+    }
 }

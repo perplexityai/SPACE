@@ -25,6 +25,7 @@
 pub mod admin;
 pub mod auth;
 pub mod auto_lifecycle;
+pub mod balloon;
 pub mod cluster;
 pub mod compute;
 pub mod data;
@@ -67,6 +68,7 @@ pub mod version;
 pub use admin::*;
 pub use auth::*;
 pub use auto_lifecycle::*;
+pub use balloon::*;
 pub use cluster::*;
 pub use compute::*;
 pub use data::*;

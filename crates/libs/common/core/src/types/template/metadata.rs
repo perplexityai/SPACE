@@ -39,7 +39,8 @@
 //!   "arch": "aarch64",
 //!   "vcpu": 2,
 //!   "memory_mib": 1024,
-//!   "disk_size_mb": 4096
+//!   "disk_size_mb": 4096,
+//!   "balloon": { "mode": "report" }
 //! }
 //! ```
 //!
@@ -65,6 +66,8 @@
 //!   read-side permissiveness (legacy seed metadata.json may omit
 //!   them). They skip when `None`. The recipe-build writer always
 //!   wraps `Some(...)`, so wire output is unchanged.
+//! - `balloon` is optional and skips when `None`; see
+//!   [`crate::types::BalloonConfig`] for its strictly validated shape.
 
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
@@ -213,6 +216,17 @@ pub struct TemplateMetadata {
         serde(default, skip_serializing_if = "Option::is_none")
     )]
     pub disk_size_mb: Option<u32>,
+
+    /// Opt-in virtio balloon device for VMs that cold boot from this
+    /// template. Absent means no balloon device. Snapshots keep the device
+    /// they were taken with, so a change applies after the template's base
+    /// snapshot is rebuilt. Skips when `None` so existing documents are
+    /// unchanged.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub balloon: Option<crate::types::BalloonConfig>,
 }
 
 impl TemplateMetadata {

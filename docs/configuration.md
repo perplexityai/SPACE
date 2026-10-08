@@ -112,6 +112,7 @@ because disabling it by mistake would leave every create queued forever.
 | `SPACE_FIRECRACKER_VENDOR_DIR`, `SPACE_FIRECRACKER_ASSET_DIR`, `SPACE_FIRECRACKER_KERNEL_ASSET_DIR` | built-in paths | Node-manager runtime asset locations. |
 | `SPACE_SUSPEND_WAKE_ARBITRATION` | on | Kill switch: off lets a suspend that queued behind a concurrent wake through instead of rejecting it as superseded. |
 | `SPACE_SUSPEND_DEFAULT_FORMAT` | `btrfs-send` | Set `full` to roll the suspend codec default back. |
+| `SPACE_SANDBOX_BALLOON_HINT_TIMEOUT_MS` | unset | Kubernetes node stack only; written to `/space/etc/sandbox.toml` as `balloon_hint_timeout_ms` (at most 30000). Before each suspend snapshot, a VM whose balloon has free-page hinting runs one hinting pass bounded by this time; timeouts and errors are logged and the snapshot proceeds. Unset, suspend makes no balloon calls. See [Template balloon device](#template-balloon-device). |
 | `SPACE_CLUSTER_CONTROLLER_LEADER_ELECTION_ENABLED` | on | Kill switch; off runs the reconcilers without a lease, which is only safe with one replica. |
 
 ## API, admission and limits
@@ -179,6 +180,34 @@ the new field to forward each build's grant. Resubmit any older queued system
 jobs that could not be drained: jobs without a grant cannot publish through a
 dual-authority account after the rollout. System-only deployment publishers
 retain their existing publication authority.
+
+### Template balloon device
+
+A template can opt its sandboxes into a Firecracker
+[balloon device](https://github.com/firecracker-microvm/firecracker/blob/main/docs/ballooning.md)
+through `balloon` in its recipe's `[metadata]`, which the build records in the
+template's `metadata.json`:
+
+```toml
+[metadata]
+memory_mib = 8192
+# One of:
+balloon = { mode = "inflate", amount_mib = 1024, deflate_on_oom = true }
+balloon = { mode = "report" }  # free-page reporting
+balloon = { mode = "hint" }    # free-page hinting
+```
+
+`stats_polling_interval_s` (default 0, off) enables balloon statistics in any
+mode. `amount_mib` and `deflate_on_oom` are required for `inflate` and rejected
+otherwise; `amount_mib` must be below the sandbox's memory. Unknown modes and
+fields are rejected. Without `balloon`, the VM configuration is unchanged.
+
+The device is rendered only when a sandbox cold-boots from the template build,
+which includes creating the template's base snapshot. Sandboxes restored from a
+snapshot keep the device that snapshot captured, so changing the setting takes
+effect only after rebuilding the template and its base snapshot. Hint mode
+also needs `SPACE_SANDBOX_BALLOON_HINT_TIMEOUT_MS` on the node; the REST build
+API does not accept the setting yet.
 
 ## Object storage and snapshots
 

@@ -146,3 +146,201 @@ async fn a_drive_rate_limiter_update_patches_the_drive() {
         drive_rate_limiter_request_body("rootfs", &rootfs_limiter())
     );
 }
+
+#[test]
+fn balloon_device_json_matches_firecracker_contract_for_each_mode() {
+    use pplx_space_common_core::types::{BalloonConfig, BalloonDevice};
+    use std::num::NonZeroU32;
+
+    let cases = [
+        (
+            BalloonConfig::new(
+                BalloonDevice::Inflate {
+                    amount_mib: NonZeroU32::new(1024).unwrap(),
+                    deflate_on_oom: true,
+                },
+                0,
+            ),
+            serde_json::json!({
+                "amount_mib": 1024,
+                "deflate_on_oom": true,
+                "stats_polling_interval_s": 0,
+                "free_page_hinting": false,
+                "free_page_reporting": false
+            }),
+        ),
+        (
+            BalloonConfig::new(BalloonDevice::FreePageReporting, 5),
+            serde_json::json!({
+                "amount_mib": 0,
+                "deflate_on_oom": false,
+                "stats_polling_interval_s": 5,
+                "free_page_hinting": false,
+                "free_page_reporting": true
+            }),
+        ),
+        (
+            BalloonConfig::new(BalloonDevice::FreePageHinting, 0),
+            serde_json::json!({
+                "amount_mib": 0,
+                "deflate_on_oom": false,
+                "stats_polling_interval_s": 0,
+                "free_page_hinting": true,
+                "free_page_reporting": false
+            }),
+        ),
+    ];
+    for (config, expected) in cases {
+        let rendered = balloon_json(config);
+        assert_eq!(rendered, expected, "{config:?}");
+        // What Firecracker reports back for the device maps to the same mode.
+        assert_eq!(
+            FirecrackerBalloon::from_json(&rendered).unwrap().mode(),
+            config.mode()
+        );
+    }
+}
+
+/// One canned Firecracker API exchange: the request line it answers and the
+/// raw HTTP response.
+type Exchange = (&'static str, String);
+
+fn http_response(status: &str, body: &str) -> String {
+    format!(
+        "HTTP/1.1 {status}\r\ncontent-length: {}\r\n\r\n{body}",
+        body.len()
+    )
+}
+
+const HINT_START: &str = "PATCH /balloon/hinting/start HTTP/1.1";
+const HINT_STATUS: &str = "GET /balloon/hinting/status HTTP/1.1";
+const HINT_STOP: &str = "PATCH /balloon/hinting/stop HTTP/1.1";
+
+fn hint_started() -> Exchange {
+    (HINT_START, http_response("200 OK", ""))
+}
+
+fn hint_running() -> Exchange {
+    (
+        HINT_STATUS,
+        http_response("200 OK", r#"{"host_cmd":2,"guest_cmd":2}"#),
+    )
+}
+
+fn hint_done() -> Exchange {
+    (
+        HINT_STATUS,
+        http_response("200 OK", r#"{"host_cmd":1,"guest_cmd":0}"#),
+    )
+}
+
+/// Serve `script` in order, then answer further status polls as still
+/// running and a stop as accepted. Ends after a completed status or a stop
+/// and returns the request lines it answered. A client that abandons a
+/// request mid-exchange is tolerated, as a timed-out poll does.
+fn fake_firecracker(socket: &Path, script: Vec<Exchange>) -> tokio::task::JoinHandle<Vec<String>> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::UnixListener::bind(socket).unwrap();
+    tokio::spawn(async move {
+        let mut script = script.into_iter();
+        let mut seen = Vec::new();
+        loop {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 4096];
+            let head = loop {
+                let Ok(read) = stream.read(&mut chunk).await else {
+                    break None;
+                };
+                if read == 0 {
+                    break None;
+                }
+                request.extend_from_slice(&chunk[..read]);
+                let text = String::from_utf8_lossy(&request).into_owned();
+                if let Some((head, body)) = text.split_once("\r\n\r\n") {
+                    let length = head
+                        .lines()
+                        .find_map(|line| line.strip_prefix("content-length: "))
+                        .map_or(0, |value| value.parse::<usize>().unwrap());
+                    if body.len() >= length {
+                        break Some(head.to_string());
+                    }
+                }
+            };
+            let Some(head) = head else { continue };
+            let line = head.lines().next().unwrap().to_string();
+            let (expected, response) = script.next().unwrap_or_else(|| {
+                if line == HINT_STOP {
+                    (HINT_STOP, http_response("200 OK", ""))
+                } else {
+                    hint_running()
+                }
+            });
+            assert_eq!(line, expected);
+            let finished = line == HINT_STOP || response.contains(r#""host_cmd":1"#);
+            seen.push(line);
+            // The client may already have given up on this request.
+            let _ = stream.write_all(response.as_bytes()).await;
+            if finished {
+                return seen;
+            }
+        }
+    })
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn free_page_hinting_waits_for_the_guest_to_finish() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("firecracker.socket");
+    let firecracker = fake_firecracker(&socket, vec![hint_started(), hint_running(), hint_done()]);
+
+    let outcome = FcApiClient::new(&socket)
+        .hint_free_pages(Duration::from_secs(30), Duration::from_millis(1))
+        .await
+        .unwrap();
+
+    assert!(matches!(outcome, FreePageHintOutcome::Completed { .. }));
+    assert_eq!(
+        firecracker.await.unwrap(),
+        [HINT_START, HINT_STATUS, HINT_STATUS]
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn unfinished_free_page_hinting_is_stopped_at_the_timeout() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("firecracker.socket");
+    let firecracker = fake_firecracker(&socket, vec![hint_started()]);
+
+    let timeout = Duration::from_millis(50);
+    let outcome = FcApiClient::new(&socket)
+        .hint_free_pages(timeout, Duration::from_millis(5))
+        .await
+        .unwrap();
+
+    let FreePageHintOutcome::TimedOut { elapsed } = outcome else {
+        panic!("expected a timeout, got {outcome:?}");
+    };
+    assert!(elapsed >= timeout, "{elapsed:?}");
+    let seen = firecracker.await.unwrap();
+    assert_eq!(seen.first().map(String::as_str), Some(HINT_START));
+    assert_eq!(seen.last().map(String::as_str), Some(HINT_STOP));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_vm_without_a_balloon_reports_none() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("firecracker.socket");
+    let _firecracker = fake_firecracker(
+        &socket,
+        vec![(
+            "GET /balloon HTTP/1.1",
+            http_response(
+                "400 Bad Request",
+                r#"{"fault_message":"The balloon device was not configured."}"#,
+            ),
+        )],
+    );
+
+    assert_eq!(FcApiClient::new(&socket).balloon().await.unwrap(), None);
+}

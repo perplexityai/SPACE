@@ -23,6 +23,36 @@ message Recipe {
     optional uint64 memory_bytes = 2;
     // Guest rootfs capacity in bytes.
     optional uint64 disk_bytes = 3;
+    // Opt-in Firecracker balloon device recorded in the built template's
+    // metadata. Sandboxes get it only when they cold-boot from the build,
+    // including when its base snapshot is created; restores keep the device
+    // their snapshot captured. Unset: no balloon device.
+    Balloon balloon = 4;
+  }
+
+  // Exactly one mode must be set.
+  message Balloon {
+    oneof mode {
+      Inflate inflate = 1;
+      FreePageReporting free_page_reporting = 2;
+      FreePageHinting free_page_hinting = 3;
+    }
+    // Seconds between guest statistics updates; 0 disables statistics.
+    // At most 65535.
+    uint32 stats_polling_interval_s = 4;
+
+    // A fixed-size inflation balloon.
+    message Inflate {
+      // Required. Positive and below the sandbox's guest memory.
+      uint32 amount_mib = 1;
+      // Whether the guest may deflate the balloon to avoid OOM.
+      bool deflate_on_oom = 2;
+    }
+    // The guest continuously reports freed pages to the host.
+    message FreePageReporting {}
+    // The host asks the guest to hint free pages before each suspend
+    // snapshot when the node enables it.
+    message FreePageHinting {}
   }
 
   // Origin selects a template base, a scratch image, or an OCI filesystem

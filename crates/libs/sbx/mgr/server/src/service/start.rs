@@ -1802,6 +1802,12 @@ impl SandboxManagerService {
         let memory_policy =
             self.resolve_sandbox_memory_policy(requested_memory_mib, node_memory_policy);
         let mem_mib = memory_policy.effective_memory_mib;
+        // Like boot args, the balloon device exists only from a cold boot:
+        // snapshots carry the device state they were taken with.
+        let balloon = template_defaults
+            .balloon
+            .for_memory_mib(mem_mib)
+            .map_err(|error| activation_cleanup.failure(error))?;
         if mem_mib < requested_memory_mib {
             tracing::info!(
                 sandbox_id = %id,
@@ -1983,8 +1989,9 @@ impl SandboxManagerService {
   "vsock": {{
     "guest_cid": {guest_cid},
     "uds_path": "/v.sock"
-  }}
+  }}{balloon}
 }}"#,
+            balloon = firecracker_balloon_field(balloon),
             guest_network_interface = GUEST_NETWORK_INTERFACE,
             guest_mac = alloc.guest_mac,
             tap_device = alloc.tap_device,
@@ -2545,6 +2552,19 @@ fn firecracker_rate_limiter_field(name: &str, limiter: Option<&RateLimiter>) -> 
         format!(
             ",\n    \"{name}\": {}",
             pplx_space_node_runtime_core::fc_api::rate_limiter_json(limiter)
+        )
+    })
+}
+
+/// The top-level `balloon` member of a cold-boot VM configuration, or nothing
+/// at all when the template has no balloon so the configuration is unchanged.
+fn firecracker_balloon_field(
+    balloon: Option<pplx_space_common_core::types::BalloonConfig>,
+) -> String {
+    balloon.map_or_else(String::new, |balloon| {
+        format!(
+            ",\n  \"balloon\": {}",
+            pplx_space_node_runtime_core::fc_api::balloon_json(balloon)
         )
     })
 }

@@ -152,3 +152,22 @@ fn always_serialized_string_fields_preserve_pre_typing_wire() {
         );
     }
 }
+
+#[test]
+fn balloon_is_omitted_when_absent_and_rejected_when_invalid() {
+    let json = serde_json::to_string(&TemplateMetadata::default()).unwrap();
+    assert!(!json.contains("balloon"), "{json}");
+
+    let m: TemplateMetadata =
+        serde_json::from_str(r#"{"memory_mib":8192,"balloon":{"mode":"report"}}"#).unwrap();
+    assert_eq!(
+        m.balloon,
+        Some(crate::types::BalloonConfig::new(
+            crate::types::BalloonDevice::FreePageReporting,
+            0
+        ))
+    );
+
+    serde_json::from_str::<TemplateMetadata>(r#"{"balloon":{"mode":"shrink"}}"#)
+        .expect_err("an unknown balloon mode must not parse");
+}

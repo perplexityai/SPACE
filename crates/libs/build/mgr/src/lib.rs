@@ -561,6 +561,13 @@ impl TemplateBuilder {
         };
         let vcpu = recipe.build_config.vcpu.unwrap_or(4);
         let mem_mib = recipe.build_config.memory_mib.unwrap_or(4096);
+        // The recorded memory is the template's default; sandboxes that ask
+        // for less are checked again at cold boot.
+        if let Some(balloon) = recipe.build_config.balloon {
+            balloon
+                .validate_for_memory_mib(mem_mib)
+                .map_err(|error| BuildError::message(error.to_string()))?;
+        }
 
         println!("=== Building template '{template_id}' from recipe '{recipe_label}' ===");
         println!("  Base: {base_raw}");
@@ -1168,6 +1175,7 @@ impl TemplateBuilder {
             vcpu: Some(vcpu),
             memory_mib: Some(mem_mib),
             disk_size_mb: recipe.build_config.disk_size_mb,
+            balloon: recipe.build_config.balloon,
             // Recipe builds don't write `arch` today — the seed builder
             // and downstream consumers fall back to the manifest's
             // `arch` field. Leaving None preserves that behavior.
@@ -1507,6 +1515,7 @@ fn validate_scratch_recipe(recipe: &Recipe) -> Result<(), BuildError> {
     if recipe.build_config.vcpu.is_some()
         || recipe.build_config.memory_mib.is_some()
         || recipe.build_config.disk_size_mb.is_some()
+        || recipe.build_config.balloon.is_some()
     {
         return Err(BuildError::message(
             "build_config is not supported for scratch recipes yet",

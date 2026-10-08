@@ -868,6 +868,7 @@ pub async fn do_checkpoint(
             .pause_sandbox(PauseSandboxRequest {
                 execution_fence: execution_fence.clone(),
                 sandbox_id: sandbox_id.to_string(),
+                balloon_hint_timeout_ms: None,
             })
             .await
     {

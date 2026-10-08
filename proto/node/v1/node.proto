@@ -783,6 +783,13 @@ message ListOrphanCandidatesResponse {
 message PauseSandboxRequest {
   string sandbox_id = 1;
   ExecutionFence execution_fence = 2;
+  // Set only by a pause that precedes a snapshot. Before pausing, the node
+  // manager reads the VM's balloon device, if it has one: it logs the
+  // device's statistics when polling is enabled and, when free-page hinting
+  // is enabled, runs one hinting pass bounded by this many milliseconds.
+  // Balloon failures and timeouts are logged and never fail the pause.
+  // Unset: pause only, with no balloon calls.
+  optional uint32 balloon_hint_timeout_ms = 3;
 }
 message PauseSandboxResponse {}
 

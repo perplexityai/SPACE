@@ -228,8 +228,14 @@ impl NodeManagerService {
     ) -> Result<Response<PauseSandboxResponse>, Status> {
         self.authorize_peer(&request, "PauseSandbox", ALLOW_NODE_ADMIN_OR_SBXMGR)?;
         let req = request.into_inner();
-        self.set_vm_paused(req.sandbox_id, req.execution_fence, true)
-            .await?;
+        let balloon_hint_timeout = req.balloon_hint_timeout_ms.map(balloon_hint_timeout);
+        self.set_vm_paused(
+            req.sandbox_id,
+            req.execution_fence,
+            true,
+            balloon_hint_timeout,
+        )
+        .await?;
         Ok(Response::new(PauseSandboxResponse {}))
     }
 
@@ -239,7 +245,7 @@ impl NodeManagerService {
     ) -> Result<Response<ResumeSandboxResponse>, Status> {
         self.authorize_peer(&request, "ResumeSandbox", ALLOW_NODE_ADMIN_OR_SBXMGR)?;
         let req = request.into_inner();
-        self.set_vm_paused(req.sandbox_id, req.execution_fence, false)
+        self.set_vm_paused(req.sandbox_id, req.execution_fence, false, None)
             .await?;
         Ok(Response::new(ResumeSandboxResponse {}))
     }
@@ -249,6 +255,7 @@ impl NodeManagerService {
         sandbox_id: String,
         fence: Option<crate::proto::ExecutionFence>,
         paused: bool,
+        balloon_hint_timeout: Option<std::time::Duration>,
     ) -> Result<(), Status> {
         validate_sandbox_id(&sandbox_id)?;
         let owner = sandbox_id.clone();
@@ -258,6 +265,9 @@ impl NodeManagerService {
             service.check_execution(&sandbox_id, fence.as_ref(), false)?;
             let api_socket = format!("{JAIL_DIR}/firecracker/{sandbox_id}/root/firecracker.sock");
             let client = crate::fc_api::FcApiClient::new(api_socket);
+            if let Some(hint_timeout) = balloon_hint_timeout {
+                prepare_balloon_for_snapshot(&client, &sandbox_id, hint_timeout).await;
+            }
             set_firecracker_paused(&client, paused, VM_PAUSE_STATE_TIMEOUT).await
         })
         .await
@@ -1224,6 +1234,120 @@ fn drive_rate_limiter(
 /// milliseconds; a VMM that does not answer must not keep the sandbox's VM
 /// gate, which termination also takes, held indefinitely.
 const VM_PAUSE_STATE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Upper bound on a requested pre-snapshot free-page-hinting wait. The pause
+/// holds the sandbox's VM gate meanwhile, which termination also takes.
+const MAX_BALLOON_HINT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How often a hinting run's completion is polled. Firecracker reports runs of
+/// about 200 ms per GiB of guest memory.
+const BALLOON_HINT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// Bound for each balloon read before a snapshot pause; Firecracker answers
+/// them from memory without involving the guest.
+const BALLOON_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
+fn balloon_hint_timeout(timeout_ms: u32) -> std::time::Duration {
+    std::time::Duration::from_millis(u64::from(timeout_ms)).min(MAX_BALLOON_HINT_TIMEOUT)
+}
+
+/// Before a snapshot pause, record the VM's balloon statistics and, when the
+/// device has free-page hinting, run one hinting pass so that free guest
+/// memory is released before the snapshot captures it. This fails open: a VM
+/// without a balloon is untouched beyond one read, and every balloon error or
+/// timeout is logged and counted while the pause and snapshot proceed.
+/// Latency is bounded by `hint_timeout` plus the fixed probe and stop bounds.
+async fn prepare_balloon_for_snapshot(
+    client: &crate::fc_api::FcApiClient,
+    sandbox_id: &str,
+    hint_timeout: std::time::Duration,
+) {
+    use pplx_space_metrics::node_manager::{
+        BalloonHintResult, BalloonSnapshotProbe, balloon_free_page_hint,
+        balloon_snapshot_probe_failed, balloon_snapshot_statistics,
+    };
+
+    let balloon = match tokio::time::timeout(BALLOON_PROBE_TIMEOUT, client.balloon()).await {
+        Ok(Ok(Some(balloon))) => balloon,
+        Ok(Ok(None)) => return,
+        Ok(Err(error)) => {
+            tracing::warn!(sandbox_id, %error, "balloon read before snapshot pause failed");
+            balloon_snapshot_probe_failed(BalloonSnapshotProbe::Device);
+            return;
+        }
+        Err(_) => {
+            tracing::warn!(sandbox_id, "balloon read before snapshot pause timed out");
+            balloon_snapshot_probe_failed(BalloonSnapshotProbe::Device);
+            return;
+        }
+    };
+    let mode = balloon.mode();
+    if balloon.stats_polling_interval_s > 0 {
+        match tokio::time::timeout(BALLOON_PROBE_TIMEOUT, client.balloon_statistics()).await {
+            Ok(Ok(stats)) => {
+                let mib = |bytes: Option<u64>| bytes.map(|bytes| bytes / (1024 * 1024));
+                tracing::info!(
+                    sandbox_id,
+                    balloon_mode = %mode,
+                    target_mib = stats.target_mib,
+                    actual_mib = stats.actual_mib,
+                    guest_free_mib = mib(stats.free_memory_bytes),
+                    guest_available_mib = mib(stats.available_memory_bytes),
+                    guest_total_mib = mib(stats.total_memory_bytes),
+                    guest_disk_caches_mib = mib(stats.disk_caches_bytes),
+                    "balloon statistics before snapshot pause"
+                );
+                balloon_snapshot_statistics(mode, stats.actual_mib, mib(stats.free_memory_bytes));
+            }
+            Ok(Err(error)) => {
+                tracing::warn!(sandbox_id, %error, "balloon statistics read before snapshot pause failed");
+                balloon_snapshot_probe_failed(BalloonSnapshotProbe::Statistics);
+            }
+            Err(_) => {
+                tracing::warn!(
+                    sandbox_id,
+                    "balloon statistics read before snapshot pause timed out"
+                );
+                balloon_snapshot_probe_failed(BalloonSnapshotProbe::Statistics);
+            }
+        }
+    }
+    if !balloon.free_page_hinting {
+        return;
+    }
+    let started = Instant::now();
+    let (result, elapsed) = match client
+        .hint_free_pages(hint_timeout, BALLOON_HINT_POLL_INTERVAL)
+        .await
+    {
+        Ok(crate::fc_api::FreePageHintOutcome::Completed { elapsed }) => {
+            tracing::info!(
+                sandbox_id,
+                elapsed_ms = elapsed.as_millis(),
+                "free-page hinting before snapshot pause completed"
+            );
+            (BalloonHintResult::Completed, elapsed)
+        }
+        Ok(crate::fc_api::FreePageHintOutcome::TimedOut { elapsed }) => {
+            tracing::warn!(
+                sandbox_id,
+                timeout_ms = hint_timeout.as_millis(),
+                elapsed_ms = elapsed.as_millis(),
+                "free-page hinting before snapshot pause timed out; snapshotting anyway"
+            );
+            (BalloonHintResult::TimedOut, elapsed)
+        }
+        Err(error) => {
+            tracing::warn!(
+                sandbox_id,
+                %error,
+                "free-page hinting before snapshot pause failed; snapshotting anyway"
+            );
+            (BalloonHintResult::Failed, started.elapsed())
+        }
+    };
+    balloon_free_page_hint(result, elapsed.as_secs_f64() * 1000.0);
+}
 
 /// Pause or resume the VM behind `client`, failing once `timeout` passes.
 pub(super) async fn set_firecracker_paused(

@@ -164,6 +164,7 @@ pub(super) async fn build_recipe(
             vcpu: cpu_count,
             memory_bytes: memory_mb.map(|mb| u64::from(mb) * MIB),
             disk_bytes: default_disk_mib(template_name.as_str())?.map(|disk_mib| disk_mib * MIB),
+            balloon: None,
         }),
         origin: Some(build_proto::recipe::Origin { kind: Some(origin) }),
         steps,

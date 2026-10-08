@@ -140,16 +140,60 @@ pub(super) fn template_execution_metadata(
     }
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub(super) struct TemplateRuntimeDefaults {
     pub(super) vcpu: Option<u32>,
     pub(super) memory_mib: Option<u32>,
+    pub(super) balloon: TemplateBalloon,
+}
+
+/// The template's opt-in balloon device. Unlike the sizing defaults, a
+/// present but invalid setting is kept so a cold boot can reject it rather
+/// than silently boot without the device the template asked for.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(super) enum TemplateBalloon {
+    #[default]
+    Absent,
+    Configured(pplx_space_common_core::types::BalloonConfig),
+    Invalid(String),
+}
+
+impl TemplateBalloon {
+    fn from_metadata(value: Option<serde_json::Value>) -> Self {
+        match value {
+            None => Self::Absent,
+            Some(value) => match serde_json::from_value(value) {
+                Ok(config) => Self::Configured(config),
+                Err(error) => Self::Invalid(error.to_string()),
+            },
+        }
+    }
+
+    /// The device a cold boot with `memory_mib` of guest memory renders.
+    pub(super) fn for_memory_mib(
+        &self,
+        memory_mib: u32,
+    ) -> Result<Option<pplx_space_common_core::types::BalloonConfig>, Status> {
+        match self {
+            Self::Absent => Ok(None),
+            Self::Configured(config) => config
+                .validate_for_memory_mib(memory_mib)
+                .map(|()| Some(*config))
+                .map_err(|error| {
+                    Status::failed_precondition(format!("template metadata balloon: {error}"))
+                }),
+            Self::Invalid(error) => Err(Status::failed_precondition(format!(
+                "template metadata balloon: {error}"
+            ))),
+        }
+    }
 }
 
 #[derive(Debug, Default, serde::Deserialize)]
 struct TemplateMetadataReader {
     vcpu: Option<u8>,
     memory_mib: Option<u32>,
+    balloon: Option<serde_json::Value>,
 }
 
 impl TemplateMetadataReader {
@@ -158,6 +202,7 @@ impl TemplateMetadataReader {
         TemplateRuntimeDefaults {
             vcpu: self.vcpu.filter(|value| *value > 0).map(u32::from),
             memory_mib: positive(self.memory_mib),
+            balloon: TemplateBalloon::from_metadata(self.balloon),
         }
     }
 }

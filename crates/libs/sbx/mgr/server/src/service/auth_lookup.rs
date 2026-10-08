@@ -918,6 +918,7 @@ impl SandboxManagerService {
                     .pause_sandbox(PauseSandboxRequest {
                         execution_fence: sandbox.node_execution_fence(),
                         sandbox_id: sandbox.id.clone(),
+                        balloon_hint_timeout_ms: None,
                     })
                     .await
                 {

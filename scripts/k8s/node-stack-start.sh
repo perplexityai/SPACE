@@ -353,6 +353,14 @@ setup_layout() {
   cat > /space/etc/sandbox.toml <<'EOF'
 # Defaults
 EOF
+  # Opt-in free-page hinting before suspend snapshots of VMs whose template
+  # enables the hinting balloon; see SandboxConfig::balloon_hint_timeout_ms.
+  if [[ -n "${SPACE_SANDBOX_BALLOON_HINT_TIMEOUT_MS:-}" ]]; then
+    [[ "$SPACE_SANDBOX_BALLOON_HINT_TIMEOUT_MS" =~ ^[1-9][0-9]*$ ]] ||
+      die "SPACE_SANDBOX_BALLOON_HINT_TIMEOUT_MS must be a positive integer"
+    printf 'balloon_hint_timeout_ms = %s\n' "$SPACE_SANDBOX_BALLOON_HINT_TIMEOUT_MS" \
+      >> /space/etc/sandbox.toml
+  fi
 
   printf '%s\n' "$SPACE_NODE_ID" > /space/etc/node-id
 

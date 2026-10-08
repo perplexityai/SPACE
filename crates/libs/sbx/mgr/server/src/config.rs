@@ -17,7 +17,19 @@ pub struct SandboxConfig {
     /// bandwidth buckets hold. Default:
     /// [`DEFAULT_DISK_IO_BURST_SECS`](pplx_space_common_core::types::DEFAULT_DISK_IO_BURST_SECS).
     pub disk_io_burst_secs: Option<NonZeroU32>,
+    /// Milliseconds a suspend may spend on free-page hinting before it pauses
+    /// a VM whose template enabled the hinting balloon (template
+    /// `metadata.json` `balloon.mode = "hint"`). The node manager first reads
+    /// the VM's balloon device and then hints only when the device has
+    /// hinting; timeouts and errors are logged and the snapshot proceeds.
+    /// At most [`MAX_BALLOON_HINT_TIMEOUT_MS`]. Default: unset, which makes
+    /// no balloon calls at suspend.
+    pub balloon_hint_timeout_ms: Option<NonZeroU32>,
 }
+
+/// Upper bound on `balloon_hint_timeout_ms`: a suspend holds the sandbox's
+/// lifecycle lock while it hints.
+pub const MAX_BALLOON_HINT_TIMEOUT_MS: u32 = 30_000;
 
 impl SandboxConfig {
     pub fn disk_io_burst_secs(&self) -> NonZeroU32 {
@@ -48,6 +60,10 @@ pub enum ConfigLoadError {
     },
     #[error("invalid sandbox configuration {path}: max_memory_mib must be positive")]
     InvalidMemoryCap { path: PathBuf },
+    #[error(
+        "invalid sandbox configuration {path}: balloon_hint_timeout_ms must be at most {MAX_BALLOON_HINT_TIMEOUT_MS}"
+    )]
+    InvalidBalloonHintTimeout { path: PathBuf },
 }
 
 pub fn load() -> Result<SandboxConfig, ConfigLoadError> {
@@ -74,6 +90,14 @@ fn load_from(path: &Path) -> Result<SandboxConfig, ConfigLoadError> {
         })?;
     if config.max_memory_mib == Some(0) {
         return Err(ConfigLoadError::InvalidMemoryCap {
+            path: path.to_owned(),
+        });
+    }
+    if config
+        .balloon_hint_timeout_ms
+        .is_some_and(|timeout| timeout.get() > MAX_BALLOON_HINT_TIMEOUT_MS)
+    {
+        return Err(ConfigLoadError::InvalidBalloonHintTimeout {
             path: path.to_owned(),
         });
     }

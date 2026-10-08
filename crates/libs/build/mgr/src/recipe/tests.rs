@@ -1112,3 +1112,100 @@ type = "launch"
     runtime.apps[0].readiness = None;
     pplx_space_build_mgr_client::runtime::decode(runtime).unwrap_err();
 }
+
+#[test]
+fn balloon_round_trips_from_toml_through_the_wire() {
+    use pplx_space_common_core::types::BalloonMode;
+
+    let parse = |balloon: &str| {
+        toml::from_str::<TomlRecipe>(&format!(
+            "[metadata]\nname = \"balloon\"\nbase = \"seed\"\nmemory_mib = 8192\n{balloon}"
+        ))
+    };
+    for (balloon, mode, amount_mib) in [
+        (
+            r#"balloon = { mode = "inflate", amount_mib = 1024, deflate_on_oom = true }"#,
+            BalloonMode::Inflate,
+            1024,
+        ),
+        (
+            r#"balloon = { mode = "report", stats_polling_interval_s = 1 }"#,
+            BalloonMode::FreePageReporting,
+            0,
+        ),
+        (
+            r#"balloon = { mode = "hint" }"#,
+            BalloonMode::FreePageHinting,
+            0,
+        ),
+    ] {
+        let toml = parse(balloon).expect(balloon);
+        let expected = toml.metadata.balloon.expect(balloon);
+        let proto = toml
+            .try_into_proto(None, &mut |_index, _source| unreachable!("no copy steps"))
+            .expect(balloon);
+        // Through protobuf bytes, as the build request travels.
+        let proto = ProtoRecipe::decode(proto.encode_to_vec().as_slice()).unwrap();
+        let recipe = Recipe::try_from(proto).expect(balloon);
+        assert_eq!(recipe.build_config.balloon, Some(expected), "{balloon}");
+        assert_eq!(expected.mode(), mode);
+        assert_eq!(expected.amount_mib(), amount_mib);
+    }
+
+    let without = parse("").unwrap();
+    assert_eq!(without.metadata.balloon, None);
+    let proto = without
+        .try_into_proto(None, &mut |_index, _source| unreachable!("no copy steps"))
+        .unwrap();
+    assert_eq!(proto.build_config.as_ref().unwrap().balloon, None);
+    assert_eq!(Recipe::try_from(proto).unwrap().build_config.balloon, None);
+
+    for invalid in [
+        r#"balloon = { mode = "deflate" }"#,
+        r#"balloon = { mode = "inflate", amount_mib = 1024 }"#,
+        r#"balloon = { mode = "hint", deflate_on_oom = true }"#,
+    ] {
+        parse(invalid).expect_err(invalid);
+    }
+
+    let mut proto = parse(r#"balloon = { mode = "hint" }"#)
+        .unwrap()
+        .try_into_proto(None, &mut |_index, _source| unreachable!("no copy steps"))
+        .unwrap();
+    let balloon = proto
+        .build_config
+        .as_mut()
+        .and_then(|config| config.balloon.as_mut())
+        .unwrap();
+    balloon.mode = None;
+    assert!(matches!(
+        Recipe::try_from(proto.clone()),
+        Err(RecipeProtoError::MissingBalloonMode)
+    ));
+    let balloon = proto
+        .build_config
+        .as_mut()
+        .and_then(|config| config.balloon.as_mut())
+        .unwrap();
+    balloon.mode = Some(recipe::balloon::Mode::Inflate(recipe::balloon::Inflate {
+        amount_mib: 0,
+        deflate_on_oom: true,
+    }));
+    assert!(matches!(
+        Recipe::try_from(proto.clone()),
+        Err(RecipeProtoError::ZeroBalloonAmount)
+    ));
+    let balloon = proto
+        .build_config
+        .as_mut()
+        .and_then(|config| config.balloon.as_mut())
+        .unwrap();
+    balloon.mode = Some(recipe::balloon::Mode::FreePageHinting(
+        recipe::balloon::FreePageHinting {},
+    ));
+    balloon.stats_polling_interval_s = 65_536;
+    assert!(matches!(
+        Recipe::try_from(proto),
+        Err(RecipeProtoError::BalloonStatsIntervalOutOfRange { value: 65_536 })
+    ));
+}

@@ -254,6 +254,7 @@ async fn pause_with_reconciliation(
     sandbox_id: &SandboxId,
     reason_context: &str,
     guest_preparation_budget: GuestSnapshotPreparationBudget,
+    balloon_hint_timeout_ms: Option<std::num::NonZeroU32>,
 ) -> SandboxState {
     let sandbox_id_string = sandbox_id.to_string();
     let mut last_reason = None;
@@ -262,6 +263,11 @@ async fn pause_with_reconciliation(
             .pause_sandbox(PauseSandboxRequest {
                 execution_fence: execution_fence.clone(),
                 sandbox_id: sandbox_id_string.clone(),
+                // A retry follows a failed or unconfirmed pause and must not
+                // spend the hinting budget again.
+                balloon_hint_timeout_ms: balloon_hint_timeout_ms
+                    .filter(|_| attempt == 0)
+                    .map(std::num::NonZeroU32::get),
             })
             .await
         {
@@ -1656,6 +1662,7 @@ impl SandboxManagerService {
             &sandbox_id,
             "pause failed",
             GuestSnapshotPreparationBudget::Standard,
+            None,
         )
         .await;
         if pause_state != SandboxState::Paused {
@@ -3452,6 +3459,7 @@ impl SandboxManagerService {
                 &sandbox_id,
                 "auto-pause failed",
                 guest_preparation_budget,
+                self.config.balloon_hint_timeout_ms,
             )
             .await;
             if pause_state != SandboxState::Paused {

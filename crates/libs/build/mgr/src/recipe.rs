@@ -67,6 +67,12 @@ pub enum RecipeProtoError {
     Runtime(#[from] TemplateRuntimeError),
     #[error("recipe metadata is required")]
     MissingMetadata,
+    #[error("recipe build_config balloon mode is required")]
+    MissingBalloonMode,
+    #[error("recipe build_config balloon stats_polling_interval_s {value} exceeds 65535")]
+    BalloonStatsIntervalOutOfRange { value: u32 },
+    #[error("recipe build_config balloon inflate amount_mib must be greater than 0")]
+    ZeroBalloonAmount,
     #[error("recipe origin is required")]
     MissingOrigin,
     #[error("recipe origin kind is required")]
@@ -154,6 +160,9 @@ pub struct BuildConfig {
     pub vcpu: Option<u8>,
     pub memory_mib: Option<u32>,
     pub disk_size_mb: Option<u32>,
+    /// Recorded in the built template's metadata for its sandboxes'
+    /// cold boots; the build VM itself boots with its base's setting.
+    pub balloon: Option<pplx_space_common_core::types::BalloonConfig>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -268,6 +277,8 @@ pub struct TomlRecipeMetadata {
     pub vcpu: Option<u8>,
     pub memory_mib: Option<u32>,
     pub disk_size_mb: Option<u32>,
+    /// Same shape as template `metadata.json` `balloon`.
+    pub balloon: Option<pplx_space_common_core::types::BalloonConfig>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
@@ -460,6 +471,7 @@ impl TomlRecipe {
                     .map_err(|_overflow| RecipeAdapterError::DiskOverflow {
                         value: self.metadata.disk_size_mb.unwrap_or_default(),
                     })?,
+                balloon: self.metadata.balloon.map(balloon_proto),
             }),
             origin: Some(origin),
             steps: self
@@ -656,8 +668,54 @@ impl TryFrom<build_proto::recipe::BuildConfig> for BuildConfig {
                 .map_err(|_| RecipeProtoError::DiskOutOfRange {
                     value: config.disk_bytes.unwrap_or_default(),
                 })?,
+            balloon: config.balloon.map(balloon_from_proto).transpose()?,
         })
     }
+}
+
+fn balloon_proto(
+    balloon: pplx_space_common_core::types::BalloonConfig,
+) -> build_proto::recipe::Balloon {
+    use build_proto::recipe::balloon::{FreePageHinting, FreePageReporting, Inflate, Mode};
+    use pplx_space_common_core::types::BalloonDevice;
+    let mode = match balloon.device() {
+        BalloonDevice::Inflate {
+            amount_mib,
+            deflate_on_oom,
+        } => Mode::Inflate(Inflate {
+            amount_mib: amount_mib.get(),
+            deflate_on_oom,
+        }),
+        BalloonDevice::FreePageReporting => Mode::FreePageReporting(FreePageReporting {}),
+        BalloonDevice::FreePageHinting => Mode::FreePageHinting(FreePageHinting {}),
+    };
+    build_proto::recipe::Balloon {
+        mode: Some(mode),
+        stats_polling_interval_s: u32::from(balloon.stats_polling_interval_s()),
+    }
+}
+
+fn balloon_from_proto(
+    balloon: build_proto::recipe::Balloon,
+) -> Result<pplx_space_common_core::types::BalloonConfig, RecipeProtoError> {
+    use build_proto::recipe::balloon::Mode;
+    use pplx_space_common_core::types::{BalloonConfig, BalloonDevice};
+    let device = match balloon.mode.ok_or(RecipeProtoError::MissingBalloonMode)? {
+        Mode::Inflate(inflate) => BalloonDevice::Inflate {
+            amount_mib: std::num::NonZeroU32::new(inflate.amount_mib)
+                .ok_or(RecipeProtoError::ZeroBalloonAmount)?,
+            deflate_on_oom: inflate.deflate_on_oom,
+        },
+        Mode::FreePageReporting(_) => BalloonDevice::FreePageReporting,
+        Mode::FreePageHinting(_) => BalloonDevice::FreePageHinting,
+    };
+    let stats_polling_interval_s =
+        u16::try_from(balloon.stats_polling_interval_s).map_err(|_| {
+            RecipeProtoError::BalloonStatsIntervalOutOfRange {
+                value: balloon.stats_polling_interval_s,
+            }
+        })?;
+    Ok(BalloonConfig::new(device, stats_polling_interval_s))
 }
 
 impl TryFrom<build_proto::recipe::Origin> for Origin {
