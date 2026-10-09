@@ -4,36 +4,20 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tempfile::tempdir;
 
 #[test]
-fn storage_vend_role_is_a_startup_precondition_except_when_disabled() {
+fn storage_vend_role_is_optional_but_must_be_valid_when_set() {
+    assert!(
+        resolve_storage_vend_role(Err(std::env::VarError::NotPresent))
+            .unwrap()
+            .is_none()
+    );
     assert!(matches!(
-        resolve_storage_vend_role(
-            ExchangeTokenMode::Legacy,
-            Err(std::env::VarError::NotPresent)
-        ),
-        Err(RunCredmgrError::MissingStorageVendRole)
-    ));
-    assert!(matches!(
-        resolve_storage_vend_role(
-            ExchangeTokenMode::Mixed,
-            Ok("arn:aws:iam::123456789012:role/storage\n".to_string()),
-        ),
+        resolve_storage_vend_role(Ok("arn:aws:iam::123456789012:role/storage\n".to_string())),
         Err(RunCredmgrError::InvalidStorageVendRole)
     ));
     assert!(
-        resolve_storage_vend_role(
-            ExchangeTokenMode::Enforce,
-            Ok("arn:aws:iam::123456789012:role/storage".to_string()),
-        )
-        .unwrap()
-        .is_some()
-    );
-    assert!(
-        resolve_storage_vend_role(
-            ExchangeTokenMode::Disabled,
-            Err(std::env::VarError::NotPresent),
-        )
-        .unwrap()
-        .is_none()
+        resolve_storage_vend_role(Ok("arn:aws:iam::123456789012:role/storage".to_string()))
+            .unwrap()
+            .is_some()
     );
 }
 

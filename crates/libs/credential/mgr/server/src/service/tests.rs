@@ -1270,55 +1270,6 @@ fn build_manager_may_exchange_storage_credentials_only() {
 }
 
 #[test]
-fn exchange_token_rollout_modes_cover_old_and_new_wire_shapes() {
-    let legacy_request = ExchangeTokenRequest::default();
-    let mut modern_request = ExchangeTokenRequest::default();
-    // Presence is the version marker. Even an invalid value must select the
-    // scoped parser and be rejected there instead of downgrading.
-    modern_request.requested_expires_in = Some(0);
-
-    for mode in [
-        ExchangeTokenMode::Legacy,
-        ExchangeTokenMode::Mixed,
-        ExchangeTokenMode::Enforce,
-        ExchangeTokenMode::Disabled,
-    ] {
-        let expected = match mode {
-            ExchangeTokenMode::Legacy => (ExchangeTokenRoute::Legacy, ExchangeTokenRoute::Legacy),
-            ExchangeTokenMode::Mixed => (ExchangeTokenRoute::Legacy, ExchangeTokenRoute::Scoped),
-            ExchangeTokenMode::Enforce => (ExchangeTokenRoute::Scoped, ExchangeTokenRoute::Scoped),
-            ExchangeTokenMode::Disabled => {
-                (ExchangeTokenRoute::Disabled, ExchangeTokenRoute::Disabled)
-            }
-        };
-        assert_eq!(mode.route(&legacy_request, true), expected.0, "{mode}");
-        assert_eq!(mode.route(&modern_request, true), expected.1, "{mode}");
-    }
-
-    assert_eq!(
-        ExchangeTokenMode::Mixed.route(&modern_request, false),
-        ExchangeTokenRoute::Legacy,
-        "mixed mode must preserve availability when transport identity or the authority store is absent"
-    );
-}
-
-#[test]
-fn exchange_token_rollout_modes_parse_strictly() {
-    assert_eq!(ExchangeTokenMode::default(), ExchangeTokenMode::Legacy);
-    for mode in [
-        ExchangeTokenMode::Legacy,
-        ExchangeTokenMode::Mixed,
-        ExchangeTokenMode::Enforce,
-        ExchangeTokenMode::Disabled,
-    ] {
-        assert_eq!(mode.as_str().parse(), Ok(mode));
-    }
-    for invalid in ["", "true", "compat", "MIXED", "mixed "] {
-        assert!(invalid.parse::<ExchangeTokenMode>().is_err(), "{invalid:?}");
-    }
-}
-
-#[test]
 fn invalid_durable_storage_configuration_is_a_precondition_failure() {
     for error in [
         StorageExchangeError::InvalidStorageConfiguration,
@@ -1331,13 +1282,14 @@ fn invalid_durable_storage_configuration_is_a_precondition_failure() {
     }
 }
 
+/// Without a storage vend role the authority wires no authorization store,
+/// so every exchange fails closed before any request parsing or issuance.
 #[tokio::test]
-async fn disabled_exchange_mode_fails_closed_before_issuance() {
+async fn unconfigured_storage_exchange_fails_closed_before_issuance() {
     let service = CredentialManagerService::new(
         Arc::new(InMemoryKeyWrapper::new()),
         PeerProcessCheckMode::Off,
-    )
-    .with_exchange_token_mode(ExchangeTokenMode::Disabled);
+    );
     let mut request = Request::new(ExchangeTokenRequest::default());
     request
         .extensions_mut()
@@ -1347,7 +1299,13 @@ async fn disabled_exchange_mode_fails_closed_before_issuance() {
 
     let status = service.exchange_token(request).await.unwrap_err();
     assert_eq!(status.code(), tonic::Code::FailedPrecondition);
-    assert_eq!(status.message(), "storage credential exchange is disabled");
+    assert!(
+        status
+            .message()
+            .starts_with("storage credential exchange is not configured"),
+        "{}",
+        status.message()
+    );
 }
 
 /// Encrypt/Decrypt are the control-plane API's credential CRUD. The agent has

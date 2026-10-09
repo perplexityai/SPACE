@@ -12,7 +12,7 @@ use pplx_space_credmgr::{
     auth::{ClientService, K8sIdentity},
     in_memory::InMemoryKeyWrapper,
     proto::credential_manager_server::CredentialManagerServer,
-    service::{CredentialManagerService, ExchangeTokenMode},
+    service::CredentialManagerService,
     storage_vend_store::PgStorageVendStore,
     tcp_auth::TcpCallerIdentity,
 };
@@ -155,7 +155,6 @@ async fn private_republication() -> TestResult {
         Arc::new(InMemoryKeyWrapper::new()),
         pplx_space_common_svc::PeerProcessCheckMode::Off,
     )
-    .with_exchange_token_mode(ExchangeTokenMode::Enforce)
     .with_storage_vend_store(Arc::new(PgStorageVendStore::new(db.pool.clone())));
     let credential_service =
         CredentialManagerServer::with_interceptor(authority, move |mut request: Request<()>| {
