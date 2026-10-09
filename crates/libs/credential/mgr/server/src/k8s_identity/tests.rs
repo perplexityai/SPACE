@@ -47,7 +47,6 @@ fn test_config() -> K8sAuthConfig {
         max_inflight_reviews: 8,
         review_rate_per_sec: 1000,
         review_timeout: Duration::from_secs(5),
-        pod_authorization_mode: PodAuthorizationMode::Enforce,
     }
 }
 
@@ -170,10 +169,8 @@ fn reviewer_returning_error(config: K8sAuthConfig) -> (CredmgrTokenReviewer, Arc
 pub(crate) fn caller_reviewer(
     service: ClientService,
     database_pool: sqlx::PgPool,
-    mode: Option<&str>,
 ) -> (CredmgrTokenReviewer, Arc<AtomicUsize>) {
     let mut config = test_config();
-    config.pod_authorization_mode = PodAuthorizationMode::configured(mode);
     config.allowed = build_allowed_map("space", [service.to_string()]).unwrap();
     let reviewed = bound_status(
         &config.audience,
@@ -187,15 +184,12 @@ pub(crate) fn caller_reviewer(
 }
 
 async fn assert_status_rejected(status: TokenReviewStatus) {
-    let (mut reviewer, _) = reviewer_returning_status(test_config(), status);
-    for mode in [PodAuthorizationMode::Observe, PodAuthorizationMode::Enforce] {
-        Arc::make_mut(&mut reviewer.config).pod_authorization_mode = mode;
-        let error = reviewer
-            .resolve_token_identity(&projected_token(), Some("10.0.0.2".parse().unwrap()))
-            .await
-            .unwrap_err();
-        assert_eq!(error.code(), tonic::Code::Unauthenticated);
-    }
+    let (reviewer, _) = reviewer_returning_status(test_config(), status);
+    let error = reviewer
+        .resolve_token_identity(&projected_token(), Some("10.0.0.2".parse().unwrap()))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::Unauthenticated);
 }
 
 pub(crate) fn test_identity(service: ClientService) -> K8sIdentity {
@@ -694,130 +688,112 @@ fn pod() -> Pod {
 }
 
 #[tokio::test]
-async fn cached_identity_tracks_pod_state_and_configured_mode() {
+async fn cached_identity_tracks_pod_state() {
     use tonic::Code::{PermissionDenied, Unavailable};
     use watcher::Event::{Apply, Delete, Init, InitDone};
     let (db, _) = registered_node_db().await.unwrap();
-    // Only an explicit enforce setting may reject an otherwise valid token.
-    for (raw, enforce) in [
-        (None, false),
-        (Some("observe"), false),
-        (Some("enforce"), true),
-        (Some("typo"), false),
+    let (mut reviewer, reviews) = caller_reviewer(ClientService::VolumeManager, db.pool.clone());
+    let (pods, mut writer) = reflector::store();
+    reviewer.pods = pods;
+    writer.apply_watcher_event(&Init);
+    let mut replacement = pod();
+    replacement.metadata.uid = Some("replacement-pod-uid".into());
+    let mut pending = pod();
+    pending.status.as_mut().unwrap().phase = Some("Pending".into());
+    let token = projected_token();
+    for (event, failure) in [
+        (None, Some((Unavailable, "pod_cache_not_synced"))),
+        (Some(InitDone), Some((PermissionDenied, "pod_not_found"))),
+        (Some(Apply(pod())), None),
+        (
+            Some(Apply(replacement)),
+            Some((PermissionDenied, "pod_uid_mismatch")),
+        ),
+        (
+            Some(Apply(pending)),
+            Some((PermissionDenied, "pod_not_running")),
+        ),
+        (
+            Some(Delete(pod())),
+            Some((PermissionDenied, "pod_not_found")),
+        ),
+        (Some(Apply(pod())), None),
     ] {
-        let (mut reviewer, reviews) =
-            caller_reviewer(ClientService::VolumeManager, db.pool.clone(), raw);
-        let (pods, mut writer) = reflector::store();
-        reviewer.pods = pods;
-        writer.apply_watcher_event(&Init);
-        let mut replacement = pod();
-        replacement.metadata.uid = Some("replacement-pod-uid".into());
-        let mut pending = pod();
-        pending.status.as_mut().unwrap().phase = Some("Pending".into());
-        let token = projected_token();
-        for (event, failure) in [
-            (None, Some((Unavailable, "pod_cache_not_synced"))),
-            (Some(InitDone), Some((PermissionDenied, "pod_not_found"))),
-            (Some(Apply(pod())), None),
-            (
-                Some(Apply(replacement)),
-                Some((PermissionDenied, "pod_uid_mismatch")),
-            ),
-            (
-                Some(Apply(pending)),
-                Some((PermissionDenied, "pod_not_running")),
-            ),
-            (
-                Some(Delete(pod())),
-                Some((PermissionDenied, "pod_not_found")),
-            ),
-            (Some(Apply(pod())), None),
-        ] {
-            if let Some(event) = event {
-                writer.apply_watcher_event(&event);
-            }
-            let result = reviewer
-                .resolve_token_identity(&token, Some("10.0.0.2".parse().unwrap()))
-                .await;
-            assert_eq!(
-                result.as_ref().err().map(|e| (e.code(), e.message())),
-                if enforce { failure } else { None },
-                "{raw:?}"
-            );
+        if let Some(event) = event {
+            writer.apply_watcher_event(&event);
         }
+        let result = reviewer
+            .resolve_token_identity(&token, Some("10.0.0.2".parse().unwrap()))
+            .await;
         assert_eq!(
-            reviews.load(Ordering::SeqCst),
-            1,
-            "pod state is never part of the token cache"
+            result.as_ref().err().map(|e| (e.code(), e.message())),
+            failure
         );
     }
+    assert_eq!(
+        reviews.load(Ordering::SeqCst),
+        1,
+        "pod state is never part of the token cache"
+    );
 }
 
 #[tokio::test]
-async fn cached_identity_tracks_postgres_registration_in_both_modes() {
+async fn cached_identity_tracks_postgres_registration() {
     use tonic::Code::{PermissionDenied, Unavailable};
     let (db, node_id) = registered_node_db().await.unwrap();
     let closed_pool = sqlx::postgres::PgPoolOptions::new()
         .connect_lazy("postgres://localhost/unused")
         .unwrap();
     closed_pool.close().await;
-    for mode in [PodAuthorizationMode::Observe, PodAuthorizationMode::Enforce] {
-        let (mut reviewer, reviews) = caller_reviewer(
-            ClientService::VolumeManager,
-            db.pool.clone(),
-            Some(mode.as_str()),
-        );
-        let token = projected_token();
-        // The same authenticated token must follow current name/UID registration,
-        // including deletion and a row that has not acquired its UID yet.
-        for (name, uid, registered) in [
-            (Some(TEST_NODE_NAME), Some(TEST_NODE_UID), true),
-            (Some("replacement-node"), Some(TEST_NODE_UID), false),
-            (Some(TEST_NODE_NAME), Some("replacement-uid"), false),
-            (Some(TEST_NODE_NAME), None, false),
-            (None, None, false),
-        ] {
-            sqlx::query(sql!("DELETE FROM node_k8s WHERE node_id = $1"))
-                .bind(node_id)
-                .execute(&db.pool)
-                .await
-                .unwrap();
-            if let Some(name) = name {
-                sqlx::query(sql!(
-                    "INSERT INTO node_k8s (node_id, k8s_node_name, k8s_node_uid) VALUES ($1, $2, $3)"
-                ))
-                .bind(node_id)
-                .bind(name)
-                .bind(uid)
-                .execute(&db.pool)
-                .await
-                .unwrap();
-            }
-            let result = reviewer
-                .resolve_token_identity(&token, Some("10.0.0.2".parse().unwrap()))
-                .await;
-            let expected = (mode == PodAuthorizationMode::Enforce && !registered)
-                .then_some((PermissionDenied, "node_identity_mismatch"));
-            assert_eq!(
-                result.as_ref().err().map(|e| (e.code(), e.message())),
-                expected,
-                "{mode:?}: {name:?}/{uid:?}"
-            );
+    let (mut reviewer, reviews) = caller_reviewer(ClientService::VolumeManager, db.pool.clone());
+    let token = projected_token();
+    // The same authenticated token must follow current name/UID registration,
+    // including deletion and a row that has not acquired its UID yet.
+    for (name, uid, registered) in [
+        (Some(TEST_NODE_NAME), Some(TEST_NODE_UID), true),
+        (Some("replacement-node"), Some(TEST_NODE_UID), false),
+        (Some(TEST_NODE_NAME), Some("replacement-uid"), false),
+        (Some(TEST_NODE_NAME), None, false),
+        (None, None, false),
+    ] {
+        sqlx::query(sql!("DELETE FROM node_k8s WHERE node_id = $1"))
+            .bind(node_id)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        if let Some(name) = name {
+            sqlx::query(sql!(
+                "INSERT INTO node_k8s (node_id, k8s_node_name, k8s_node_uid) VALUES ($1, $2, $3)"
+            ))
+            .bind(node_id)
+            .bind(name)
+            .bind(uid)
+            .execute(&db.pool)
+            .await
+            .unwrap();
         }
-        reviewer.database_pool = closed_pool.clone();
         let result = reviewer
             .resolve_token_identity(&token, Some("10.0.0.2".parse().unwrap()))
             .await;
-        let expected = (mode == PodAuthorizationMode::Enforce)
-            .then_some((Unavailable, "node_store_unavailable"));
+        let expected = (!registered).then_some((PermissionDenied, "node_identity_mismatch"));
         assert_eq!(
             result.as_ref().err().map(|e| (e.code(), e.message())),
-            expected
-        );
-        assert_eq!(
-            reviews.load(Ordering::SeqCst),
-            1,
-            "node registration is never part of the token cache"
+            expected,
+            "{name:?}/{uid:?}"
         );
     }
+    reviewer.database_pool = closed_pool.clone();
+    let result = reviewer
+        .resolve_token_identity(&token, Some("10.0.0.2".parse().unwrap()))
+        .await;
+    let expected = Some((Unavailable, "node_store_unavailable"));
+    assert_eq!(
+        result.as_ref().err().map(|e| (e.code(), e.message())),
+        expected
+    );
+    assert_eq!(
+        reviews.load(Ordering::SeqCst),
+        1,
+        "node registration is never part of the token cache"
+    );
 }
