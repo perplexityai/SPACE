@@ -285,8 +285,30 @@ impl From<MasterKeyIdentifier> for String {
 /// artifact key or vice versa — credmgr's AAD check fails across domains.
 const VOLUME_WRAP_AAD_PREFIX: &[u8] = b"space-rootfs-vol/v1";
 
+/// Domain prefix bound into the credmgr wrap/unwrap AAD for a sandbox
+/// snapshot-artifact DEK (vol-mgr's envelope-encrypted `PushFilesAsync` /
+/// `PullFilesAsync` artifacts).
+const ARTIFACT_WRAP_AAD_PREFIX: &[u8] = b"space-artifact-wrap/v1";
+
+/// AAD bound into a sandbox snapshot-artifact DEK. Layout:
+/// `ARTIFACT_WRAP_AAD_PREFIX || 0x00 || org_id(16) || sandbox_id(16)`.
+///
+/// credmgr derives it from the sandbox's durable owner when it issues or
+/// unwraps an artifact DEK, so a caller can never choose the AAD; vol-mgr
+/// derives the same bytes as the prefix of each entry's per-chunk AEAD AAD.
+/// `artifact_id` is intentionally absent: each artifact has its own DEK, so
+/// per-DEK isolation already prevents cross-artifact swaps.
+pub fn artifact_wrap_aad(org_id: super::OrgId, sandbox_id: &super::SandboxId) -> Vec<u8> {
+    let mut out = Vec::with_capacity(ARTIFACT_WRAP_AAD_PREFIX.len() + 1 + 16 + 16);
+    out.extend_from_slice(ARTIFACT_WRAP_AAD_PREFIX);
+    out.push(0);
+    out.extend_from_slice(org_id.as_uuid().as_bytes());
+    out.extend_from_slice(sandbox_id.as_uuid().as_bytes());
+    out
+}
+
 /// AAD bound into a sandbox's node-local volume DEK at credmgr
-/// `IssueDek`/`UnwrapDek` time. Layout:
+/// `GetOrIssueSandboxVolumeDek` time. Layout:
 /// `VOLUME_WRAP_AAD_PREFIX || 0x00 || org_id(16) || sandbox_id(16)`, the NUL
 /// separator preventing prefix collisions even though both ids are
 /// fixed-length UUIDs. Deterministic from `(org_id, sandbox_id)` — the issuer

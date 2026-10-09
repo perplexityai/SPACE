@@ -3952,8 +3952,6 @@ fn transfer_payload_with_encryption_round_trips() {
     // implicit key on push).
     let enc = TransferEncryption {
         organization_id: "019e31d9-79a6-7132-b90f-007f1c62ddea".parse().unwrap(),
-        provider: KekProvider::InMemory,
-        master_key_identifier: "test/key-1".parse().unwrap(),
         wrapped_dek: vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
     };
     let p = TransferPayload {
@@ -3993,8 +3991,6 @@ fn artifact_payload_round_trips() {
     // nobody can reproduce.
     let enc = TransferEncryption {
         organization_id: "019e31d9-79a6-7132-b90f-007f1c62ddea".parse().unwrap(),
-        provider: KekProvider::InMemory,
-        master_key_identifier: "test/key-1".parse().unwrap(),
         wrapped_dek: vec![9, 8, 7, 6, 5, 4, 3, 2, 1],
     };
     let payload = ArtifactPayload {
@@ -4084,7 +4080,10 @@ fn transfer_payload_encryption_wire_shape_is_plain_strings() {
     // payload from another release of vol-mgr is interpreted the
     // same way. A regression here (e.g. someone changes OrgId to
     // a tuple representation) would corrupt every persisted job
-    // payload across an upgrade.
+    // payload across an upgrade. Rows written before credmgr chose the
+    // KEK still carry `provider` / `master_key_identifier`; they must
+    // keep parsing (the fields are ignored) so the worker can fail those
+    // jobs through credmgr rather than at deserialization.
     let json = r#"{
         "subject_id": "sandbox:019d84bd-280d-7331-99c6-b63377f3a3a2",
         "local_path": "/tmp/x",
@@ -4103,8 +4102,6 @@ fn transfer_payload_encryption_wire_shape_is_plain_strings() {
         enc.organization_id.to_string(),
         "019e31d9-79a6-7132-b90f-007f1c62ddea"
     );
-    assert_eq!(enc.provider, KekProvider::InMemory);
-    assert_eq!(enc.master_key_identifier.as_str(), "test/key-1");
     assert_eq!(enc.wrapped_dek, vec![1, 2, 3, 4]);
 }
 
@@ -4281,8 +4278,6 @@ fn dedup_key_distinguishes_different_encryption_keys() {
     let base = ("push", "sandbox:abc", "/tmp/x", "s3://b/k?region=us");
     let mk_enc = |wrap: &[u8]| TransferEncryption {
         organization_id: "019e31d9-79a6-7132-b90f-007f1c62ddea".parse().unwrap(),
-        provider: KekProvider::InMemory,
-        master_key_identifier: "test/key-1".parse().unwrap(),
         wrapped_dek: wrap.to_vec(),
     };
     let enc_a = mk_enc(b"wrap-bytes-A");
@@ -4432,8 +4427,6 @@ async fn stage_encrypted_temp_returns_partial_enc_path_on_aad_derivation_error()
     };
     let enc = TransferEncryption {
         organization_id: "019e31d9-79a6-7132-b90f-007f1c62ddea".parse().unwrap(),
-        provider: KekProvider::InMemory,
-        master_key_identifier: "test/key-1".parse().unwrap(),
         wrapped_dek: vec![0u8; 16],
     };
 
@@ -4594,8 +4587,6 @@ async fn encrypted_compressed_memory_restore_is_sparse() {
 
     let encryption = TransferEncryption {
         organization_id: "019e31d9-79a6-7132-b90f-007f1c62ddea".parse().unwrap(),
-        provider: KekProvider::InMemory,
-        master_key_identifier: "test/key-1".parse().unwrap(),
         wrapped_dek: vec![0; 16],
     };
     let payload = TransferPayload {

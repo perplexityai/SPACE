@@ -1,7 +1,7 @@
 use super::proto::{
     AwsCredentials, DecryptResponse, EncryptRequest, ExchangeTokenRequest, ExchangeTokenResponse,
-    GetOrIssueSandboxVolumeDekResponse, IssueDekResponse, ResolveNetworkCredentialsResponse,
-    UnwrapDekResponse, exchange_token_response,
+    GetOrIssueSandboxVolumeDekResponse, IssueSandboxArtifactDekResponse,
+    ResolveNetworkCredentialsResponse, UnwrapSandboxArtifactDekResponse, exchange_token_response,
 };
 use zeroize::Zeroize;
 
@@ -13,8 +13,8 @@ fn secret_bearing_wire_types_zeroize_on_drop() {
     assert_zeroize_on_drop::<ExchangeTokenResponse>();
     assert_zeroize_on_drop::<exchange_token_response::Payload>();
     assert_zeroize_on_drop::<AwsCredentials>();
-    assert_zeroize_on_drop::<IssueDekResponse>();
-    assert_zeroize_on_drop::<UnwrapDekResponse>();
+    assert_zeroize_on_drop::<IssueSandboxArtifactDekResponse>();
+    assert_zeroize_on_drop::<UnwrapSandboxArtifactDekResponse>();
     assert_zeroize_on_drop::<EncryptRequest>();
     assert_zeroize_on_drop::<DecryptResponse>();
     assert_zeroize_on_drop::<GetOrIssueSandboxVolumeDekResponse>();
@@ -75,7 +75,7 @@ fn token_exchange_secrets_zeroize() {
 
 #[test]
 fn plaintext_deks_zeroize() {
-    let mut issued = IssueDekResponse {
+    let mut issued = IssueSandboxArtifactDekResponse {
         plaintext_dek: b"secret-issued-dek".to_vec(),
         wrapped_dek: b"wrapped-dek".to_vec(),
     };
@@ -83,7 +83,7 @@ fn plaintext_deks_zeroize() {
     assert!(issued.plaintext_dek.is_empty());
     assert!(issued.wrapped_dek.is_empty());
 
-    let mut unwrapped = UnwrapDekResponse {
+    let mut unwrapped = UnwrapSandboxArtifactDekResponse {
         plaintext_dek: b"secret-unwrapped-dek".to_vec(),
     };
     unwrapped.zeroize();

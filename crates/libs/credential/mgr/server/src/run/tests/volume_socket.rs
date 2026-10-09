@@ -16,7 +16,8 @@ use tonic::{Code, Request, Status};
 use crate::node_ca::NodeCa;
 use crate::node_service::NodeCredentialManager;
 use crate::proto::{
-    ExchangeTokenRequest, ExchangeTokenResponse, IssueDekRequest, UnwrapDekRequest,
+    ExchangeTokenRequest, ExchangeTokenResponse, IssueSandboxArtifactDekRequest,
+    UnwrapSandboxArtifactDekRequest,
 };
 
 /// Re-execution changes only the child's identity. User namespaces let an
@@ -98,23 +99,23 @@ async fn call(client: &mut tonic::client::Grpc<Channel>, method: &str) -> Code {
     // Use valid scopes so allowed DEK calls exercise forwarding, rather than
     // stopping at node-local malformed-input validation.
     match method {
-        "IssueDek" => {
+        "IssueSandboxArtifactDek" => {
             call_request(
                 client,
                 method,
-                IssueDekRequest {
-                    organization_id: "01980000-0000-7000-8000-000000000001".into(),
+                IssueSandboxArtifactDekRequest {
+                    sandbox_id: "01980000-0000-7000-8000-000000000001".into(),
                     ..Default::default()
                 },
             )
             .await
         }
-        "UnwrapDek" => {
+        "UnwrapSandboxArtifactDek" => {
             call_request(
                 client,
                 method,
-                UnwrapDekRequest {
-                    organization_id: "01980000-0000-7000-8000-000000000001".into(),
+                UnwrapSandboxArtifactDekRequest {
+                    sandbox_id: "01980000-0000-7000-8000-000000000001".into(),
                     ..Default::default()
                 },
             )
@@ -198,8 +199,8 @@ async fn exercise_peer(uid: u32) {
     let mut forwarded = 0;
     for (method, transfer) in [
         ("ExchangeToken", true),
-        ("IssueDek", true),
-        ("UnwrapDek", true),
+        ("IssueSandboxArtifactDek", true),
+        ("UnwrapSandboxArtifactDek", true),
         ("IssueIntermediateCertificate", false),
         ("Encrypt", false),
         ("Decrypt", false),
@@ -231,11 +232,21 @@ async fn exercise_peer(uid: u32) {
         Code::PermissionDenied
     };
     assert_eq!(
-        call_request(&mut volume, "IssueDek", IssueDekRequest::default()).await,
+        call_request(
+            &mut volume,
+            "IssueSandboxArtifactDek",
+            IssueSandboxArtifactDekRequest::default()
+        )
+        .await,
         malformed_code
     );
     assert_eq!(
-        call_request(&mut volume, "UnwrapDek", UnwrapDekRequest::default()).await,
+        call_request(
+            &mut volume,
+            "UnwrapSandboxArtifactDek",
+            UnwrapSandboxArtifactDekRequest::default()
+        )
+        .await,
         malformed_code
     );
     assert_eq!(
@@ -247,8 +258,8 @@ async fn exercise_peer(uid: u32) {
     if uid == users::SPACE_VOLMGR.uid {
         for method in [
             "ExchangeToken",
-            "IssueDek",
-            "UnwrapDek",
+            "IssueSandboxArtifactDek",
+            "UnwrapSandboxArtifactDek",
             "IssueIntermediateCertificate",
         ] {
             assert_eq!(
@@ -259,7 +270,11 @@ async fn exercise_peer(uid: u32) {
         }
         assert_eq!(calls.lock().unwrap().len(), forwarded);
     } else if uid == users::SPACE_SBXMGR.uid {
-        for method in ["ExchangeToken", "IssueDek", "UnwrapDek"] {
+        for method in [
+            "ExchangeToken",
+            "IssueSandboxArtifactDek",
+            "UnwrapSandboxArtifactDek",
+        ] {
             assert_eq!(
                 call(&mut standard, method).await,
                 Code::Aborted,
@@ -278,6 +293,14 @@ async fn exercise_peer(uid: u32) {
             "template-manager must retain standard-listener storage access"
         );
         assert_eq!(calls.lock().unwrap().len(), forwarded + 1);
+        for method in ["IssueSandboxArtifactDek", "UnwrapSandboxArtifactDek"] {
+            assert_eq!(
+                call(&mut standard, method).await,
+                Code::PermissionDenied,
+                "template-manager must not reach artifact keys: {method}"
+            );
+        }
+        assert_eq!(calls.lock().unwrap().len(), forwarded + 1);
     }
     drop((standard, volume));
     shutdown.cancel();
@@ -286,13 +309,15 @@ async fn exercise_peer(uid: u32) {
     }
     upstream_server.await.unwrap();
     if uid == users::SPACE_VOLMGR.uid || uid == users::SPACE_SBXMGR.uid {
-        authority_dek_round_trip(uid).await;
+        authority_admits_artifact_dek_peer(uid).await;
     }
 }
 
-async fn authority_dek_round_trip(uid: u32) {
-    use crate::proto::{DekSpec, IssueDekRequest, UnwrapDekRequest};
-
+/// The authority's own listeners admit the volume peer to the artifact-DEK
+/// handlers. This authority has no database, so reaching the handler surfaces
+/// its FAILED_PRECONDITION; a listener or allow-list denial would be
+/// PERMISSION_DENIED. Key semantics are covered by the service tests.
+async fn authority_admits_artifact_dek_peer(uid: u32) {
     let dir = tempdir().unwrap();
     let standard_path = dir.path().join("standard.sock");
     let volume_path = dir.path().join("volume.sock");
@@ -316,31 +341,24 @@ async fn authority_dek_round_trip(uid: u32) {
         standard_path
     };
     let mut client = CredentialManagerClient::new(uds_channel(path).await);
-    let organization_id = uuid::Uuid::now_v7().to_string();
-    let issued = client
-        .issue_dek(IssueDekRequest {
-            organization_id: organization_id.clone(),
-            provider: "in-memory".to_string(),
-            master_key_identifier: "volume-transfer".to_string(),
-            spec: DekSpec::Aes256 as i32,
-            aad: b"transfer".to_vec(),
+    let sandbox_id = uuid::Uuid::now_v7().to_string();
+    let issue = client
+        .issue_sandbox_artifact_dek(IssueSandboxArtifactDekRequest {
+            sandbox_id: sandbox_id.clone(),
+            expected_org_id: String::new(),
         })
         .await
-        .unwrap()
-        .into_inner();
-    let unwrapped = client
-        .unwrap_dek(UnwrapDekRequest {
-            organization_id,
-            provider: "in-memory".to_string(),
-            master_key_identifier: "volume-transfer".to_string(),
-            wrapped_dek: issued.wrapped_dek.clone(),
-            aad: b"transfer".to_vec(),
+        .unwrap_err();
+    assert_eq!(issue.code(), Code::FailedPrecondition, "{issue:?}");
+    let unwrap = client
+        .unwrap_sandbox_artifact_dek(UnwrapSandboxArtifactDekRequest {
+            sandbox_id,
+            expected_org_id: String::new(),
+            wrapped_dek: Vec::new(),
         })
         .await
-        .unwrap()
-        .into_inner();
-    assert_eq!(issued.plaintext_dek.len(), 32);
-    assert_eq!(unwrapped.plaintext_dek, issued.plaintext_dek);
+        .unwrap_err();
+    assert_eq!(unwrap.code(), Code::FailedPrecondition, "{unwrap:?}");
     drop(client);
     shutdown.cancel();
     while let Some(result) = servers.join_next().await {

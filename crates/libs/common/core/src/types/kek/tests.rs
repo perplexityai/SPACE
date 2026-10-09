@@ -55,3 +55,18 @@ fn master_key_identifier_rejects_oversized() {
     let big = "k".repeat(2049);
     MasterKeyIdentifier::parse(big).unwrap_err();
 }
+
+#[test]
+fn artifact_wrap_aad_pins_wire_layout_and_differs_from_volume_domain() {
+    let org = crate::types::OrgId::from_uuid(uuid::Uuid::from_u128(1));
+    let sandbox = crate::types::SandboxId::from_uuid(uuid::Uuid::from_u128(2));
+    let aad = artifact_wrap_aad(org, &sandbox);
+    let mut expected = b"space-artifact-wrap/v1\0".to_vec();
+    expected.extend_from_slice(org.as_uuid().as_bytes());
+    expected.extend_from_slice(sandbox.as_uuid().as_bytes());
+    assert_eq!(
+        aad, expected,
+        "persisted artifact wraps depend on this layout"
+    );
+    assert_ne!(aad, volume_wrap_aad(org, &sandbox));
+}

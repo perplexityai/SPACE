@@ -451,7 +451,8 @@ or migrate retained files.
 
 Credential-manager supports an optional `--volume-socket
 /space/run/volume-credentials/credmgr.sock` listener. It admits only the
-volume-manager identity and only `ExchangeToken`, `IssueDek`, and `UnwrapDek`.
+volume-manager identity and only `ExchangeToken`, `IssueSandboxArtifactDek`, and
+`UnwrapSandboxArtifactDek`.
 Certificate issuance and other privileged credential methods are denied before
 handling or forwarding the request. Both the node agent and local authority
 support this listener; existing sandbox-manager and template-manager clients

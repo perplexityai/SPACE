@@ -53,6 +53,14 @@ const ALLOW_EXCHANGE_TOKEN: &[UdsPeerPrincipal] = &[
     UdsPeerPrincipal::Service(user_names::SPACE_TMPLMGR),
 ];
 
+/// Sandbox artifact DEKs belong to Volume Manager's encrypted transfers. The
+/// shared-UID mapping is the same staged-upgrade compatibility as above. The
+/// authority fences this agent's node to the sandbox's durable placement.
+const ALLOW_SANDBOX_ARTIFACT_DEK: &[UdsPeerPrincipal] = &[
+    UdsPeerPrincipal::Service(user_names::SPACE_VOLMGR),
+    UdsPeerPrincipal::Service(user_names::SPACE_SBXMGR),
+];
+
 /// Who may ask this node to sign a gateway CA: sandbox-manager, the only
 /// principal allowed to request gateway signing on this socket. A gateway cannot
 /// be named here — each runs under its own sandbox's uid, so peer credentials classify it as `Other`. Root is absent
@@ -285,6 +293,23 @@ impl NodeCredentialManager {
         );
         result
     }
+
+    /// Admit only the node-local volume-manager before re-originating an
+    /// artifact-DEK call under this agent's node-bound identity.
+    fn authorize_sandbox_artifact_dek<T>(
+        &self,
+        request: &Request<T>,
+        operation: &'static str,
+    ) -> Result<(), Status> {
+        let caller = self.caller_resolver.resolve(request)?;
+        if !matches!(caller, ResolvedCaller::UdsPeer(_)) {
+            return Err(Status::permission_denied(
+                "sandbox artifact keys require the node-local volume manager",
+            ));
+        }
+        self.caller_resolver
+            .authorize_caller(&caller, operation, ALLOW_SANDBOX_ARTIFACT_DEK, &[])
+    }
 }
 
 /// Replace both actor fields after local authorization. Treating caller input
@@ -360,30 +385,30 @@ impl CredentialManager for NodeCredentialManager {
         .await
     }
 
-    async fn issue_dek(
+    async fn issue_sandbox_artifact_dek(
         &self,
-        request: Request<IssueDekRequest>,
-    ) -> Result<Response<IssueDekResponse>, Status> {
+        request: Request<IssueSandboxArtifactDekRequest>,
+    ) -> Result<Response<IssueSandboxArtifactDekResponse>, Status> {
+        self.authorize_sandbox_artifact_dek(&request, "IssueSandboxArtifactDek")?;
         // Reject malformed scope locally before an upstream call; validation
         // must remain available when the authority is unreachable.
-        crate::service::parse_organization_id(&request.get_ref().organization_id)?;
+        crate::service::parse_sandbox_id(&request.get_ref().sandbox_id)?;
         let mut up = self.upstream.clone();
-        self.forward("IssueDek", async move {
-            up.issue_dek(request.into_inner()).await
+        self.forward("IssueSandboxArtifactDek", async move {
+            up.issue_sandbox_artifact_dek(request.into_inner()).await
         })
         .await
     }
 
-    async fn unwrap_dek(
+    async fn unwrap_sandbox_artifact_dek(
         &self,
-        request: Request<UnwrapDekRequest>,
-    ) -> Result<Response<UnwrapDekResponse>, Status> {
-        // Reject malformed scope locally before an upstream call; validation
-        // must remain available when the authority is unreachable.
-        crate::service::parse_organization_id(&request.get_ref().organization_id)?;
+        request: Request<UnwrapSandboxArtifactDekRequest>,
+    ) -> Result<Response<UnwrapSandboxArtifactDekResponse>, Status> {
+        self.authorize_sandbox_artifact_dek(&request, "UnwrapSandboxArtifactDek")?;
+        crate::service::parse_sandbox_id(&request.get_ref().sandbox_id)?;
         let mut up = self.upstream.clone();
-        self.forward("UnwrapDek", async move {
-            up.unwrap_dek(request.into_inner()).await
+        self.forward("UnwrapSandboxArtifactDek", async move {
+            up.unwrap_sandbox_artifact_dek(request.into_inner()).await
         })
         .await
     }

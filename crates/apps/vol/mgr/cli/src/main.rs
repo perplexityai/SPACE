@@ -149,15 +149,10 @@ enum Commands {
         /// One per file: `role:local_path:s3_uri`. Repeatable.
         #[arg(long = "entry", required = true)]
         entries: Vec<String>,
-        /// Org UUID for the KEK; omit for a plaintext batch.
-        #[arg(long, requires = "provider", requires = "master_key_identifier")]
+        /// Expected owning org UUID of the sandbox; encrypts the batch
+        /// under that org's active KEK. Omit for a plaintext batch.
+        #[arg(long)]
         organization_id: Option<String>,
-        /// Registered KEK provider, such as `external-branching` or `in-memory`.
-        #[arg(long)]
-        provider: Option<String>,
-        /// KEK identifier within the provider.
-        #[arg(long)]
-        master_key_identifier: Option<String>,
     },
     /// Submit a multi-file artifact download (`PullFilesAsync`) and
     /// return the artifact `job_id`. Debug/test surface mirroring
@@ -175,20 +170,10 @@ enum Commands {
         /// One per file: `role:local_path:s3_uri`. Repeatable.
         #[arg(long = "entry", required = true)]
         entries: Vec<String>,
-        /// Org UUID for the KEK; omit for a plaintext batch.
-        #[arg(
-            long,
-            requires = "provider",
-            requires = "master_key_identifier",
-            requires = "wrap_hex"
-        )]
+        /// Expected owning org UUID of the sandbox; omit for a plaintext
+        /// batch.
+        #[arg(long, requires = "wrap_hex")]
         organization_id: Option<String>,
-        /// Registered KEK provider, such as `external-branching` or `in-memory`.
-        #[arg(long)]
-        provider: Option<String>,
-        /// KEK identifier within the provider.
-        #[arg(long)]
-        master_key_identifier: Option<String>,
         /// Wrapped DEK as hex (from the `push-artifact` response or
         /// cluster-api's snapshot sidecar). Required for encrypted
         /// batches.
@@ -368,8 +353,6 @@ async fn main() -> anyhow::Result<()> {
             artifact_id,
             entries,
             organization_id,
-            provider,
-            master_key_identifier,
         } => {
             let mut files = Vec::with_capacity(entries.len());
             for raw in &entries {
@@ -386,17 +369,8 @@ async fn main() -> anyhow::Result<()> {
                     snapshot_artifact: SnapshotArtifact::Unspecified as i32,
                 });
             }
-            let encryption = match (organization_id, provider, master_key_identifier) {
-                (Some(org), Some(prov), Some(mk)) => Some(BatchEncryptionConfig {
-                    organization_id: org,
-                    provider: prov,
-                    master_key_identifier: mk,
-                }),
-                (None, None, None) => None,
-                _ => anyhow::bail!(
-                    "--organization-id, --provider, and --master-key-identifier must all be set together for an encrypted batch"
-                ),
-            };
+            let encryption =
+                organization_id.map(|organization_id| BatchEncryptionConfig { organization_id });
             let response = client
                 .push_files_async(PushFilesAsyncRequest {
                     subject_id: subject,
@@ -422,8 +396,6 @@ async fn main() -> anyhow::Result<()> {
             artifact_id,
             entries,
             organization_id,
-            provider,
-            master_key_identifier,
             wrap_hex,
         } => {
             let mut files = Vec::with_capacity(entries.len());
@@ -442,19 +414,14 @@ async fn main() -> anyhow::Result<()> {
                     snapshot_artifact: SnapshotArtifact::Unspecified as i32,
                 });
             }
-            let encryption = match (organization_id, provider, master_key_identifier, wrap_hex) {
-                (Some(org), Some(prov), Some(mk), Some(hex)) => {
-                    let wrapped_dek = hex_to_bytes(&hex)?;
-                    Some(BatchDecryptionConfig {
-                        organization_id: org,
-                        provider: prov,
-                        master_key_identifier: mk,
-                        wrapped_dek,
-                    })
-                }
-                (None, None, None, None) => None,
+            let encryption = match (organization_id, wrap_hex) {
+                (Some(organization_id), Some(hex)) => Some(BatchDecryptionConfig {
+                    organization_id,
+                    wrapped_dek: hex_to_bytes(&hex)?,
+                }),
+                (None, None) => None,
                 _ => anyhow::bail!(
-                    "--organization-id, --provider, --master-key-identifier, and --wrap-hex must all be set together for an encrypted batch"
+                    "--organization-id and --wrap-hex must be set together for an encrypted batch"
                 ),
             };
             let response = client

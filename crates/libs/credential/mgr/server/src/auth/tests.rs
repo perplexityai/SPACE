@@ -58,7 +58,7 @@ fn k8s_jwt_in_allow_list_is_authorized() {
     plain_resolver()
         .authorize_caller(
             &ResolvedCaller::K8sJwt(k8s_identity(ClientService::VolumeManager)),
-            "IssueDek",
+            "IssueSandboxArtifactDek",
             &[],
             &[ClientService::SandboxManager, ClientService::VolumeManager],
         )
@@ -85,7 +85,12 @@ fn plaintext_is_authorized_for_any_operation() {
     // Reachable only on direct-node plaintext profiles; by then the caller is
     // the shared internal principal.
     plain_resolver()
-        .authorize_caller(&ResolvedCaller::Plaintext, "UnwrapDek", &[], &[])
+        .authorize_caller(
+            &ResolvedCaller::Plaintext,
+            "UnwrapSandboxArtifactDek",
+            &[],
+            &[],
+        )
         .unwrap();
 }
 
@@ -118,7 +123,7 @@ fn uds_peer_in_allow_list_is_authorized() {
     plain_resolver()
         .authorize_caller(
             &ResolvedCaller::UdsPeer(PeerIdentity::new(0, 0, Some(1))),
-            "IssueDek",
+            "IssueSandboxArtifactDek",
             &[UdsPeerPrincipal::Root],
             &[],
         )
@@ -130,7 +135,7 @@ fn uds_peer_outside_allow_list_is_rejected() {
     let err = plain_resolver()
         .authorize_caller(
             &ResolvedCaller::UdsPeer(PeerIdentity::new(12_345, 12_345, Some(1))),
-            "IssueDek",
+            "IssueSandboxArtifactDek",
             &[UdsPeerPrincipal::Root],
             &[],
         )
@@ -195,7 +200,7 @@ fn uds_peer_process_checks_reject_when_enforcing() {
     let err = resolver
         .authorize_caller(
             &caller,
-            "IssueDek",
+            "IssueSandboxArtifactDek",
             &[UdsPeerPrincipal::Service(TEST_PEER)],
             &[],
         )
@@ -236,7 +241,12 @@ fn uds_peer_binary_check_is_reached_when_uids_match() {
             .insert(PeerIdentity::new(0, 0, pid));
         let caller = resolver.resolve(&request).expect("root peer resolves");
         resolver
-            .authorize_caller(&caller, "IssueDek", &[UdsPeerPrincipal::Root], &[])
+            .authorize_caller(
+                &caller,
+                "IssueSandboxArtifactDek",
+                &[UdsPeerPrincipal::Root],
+                &[],
+            )
             .expect("root classifies before account matching; no account checks run");
         return;
     }
@@ -260,7 +270,7 @@ fn uds_peer_binary_check_is_reached_when_uids_match() {
     let err = resolver
         .authorize_caller(
             &caller,
-            "IssueDek",
+            "IssueSandboxArtifactDek",
             &[UdsPeerPrincipal::Service(TEST_PEER)],
             &[],
         )
@@ -301,7 +311,7 @@ fn uds_peer_process_checks_are_skipped_when_gate_is_off() {
     resolver
         .authorize_caller(
             &caller,
-            "IssueDek",
+            "IssueSandboxArtifactDek",
             &[UdsPeerPrincipal::Service(TEST_PEER)],
             &[],
         )
@@ -324,7 +334,7 @@ fn uds_peer_forged_principal_does_not_bypass_classification() {
                 9_999,
                 Some(std::process::id() as i32),
             )),
-            "IssueDek",
+            "IssueSandboxArtifactDek",
             &[UdsPeerPrincipal::Root],
             &[],
         )
@@ -343,7 +353,12 @@ fn uds_peer_process_checks_do_not_run_before_the_allow_list() {
         .expect("peer credentials resolve to a UDS caller");
 
     let err = resolver
-        .authorize_caller(&caller, "IssueDek", &[UdsPeerPrincipal::Root], &[])
+        .authorize_caller(
+            &caller,
+            "IssueSandboxArtifactDek",
+            &[UdsPeerPrincipal::Root],
+            &[],
+        )
         .expect_err("principal is not in the allow-list");
     assert_eq!(err.code(), tonic::Code::PermissionDenied);
     assert!(err.message().contains("is not authorized for"), "{err:?}");
@@ -357,8 +372,11 @@ async fn volume_listener_limits_both_peer_and_methods_before_dispatch() {
 
     for (method, allowed) in [
         ("ExchangeToken", true),
-        ("IssueDek", true),
-        ("UnwrapDek", true),
+        ("IssueSandboxArtifactDek", true),
+        ("UnwrapSandboxArtifactDek", true),
+        // The removed caller-keyed RPCs must stay unreachable.
+        ("IssueDek", false),
+        ("UnwrapDek", false),
         ("IssueIntermediateCertificate", false),
         ("Encrypt", false),
         ("Decrypt", false),

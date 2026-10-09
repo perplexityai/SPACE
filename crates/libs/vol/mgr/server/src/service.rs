@@ -6,7 +6,6 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use crate::artifact::{ArtifactEntryRole, ArtifactId};
-use crate::crypto::wrap_aad;
 use pplx_space_common_core::types::{
     MaterializationMode, SnapshotArtifact, StorageUri, SubjectId, TransferScopeId,
     parse_snapshot_object_key,
@@ -16,7 +15,7 @@ use pplx_space_common_jobs::{
     WorkerConfig,
 };
 use pplx_space_common_svc::core::host::linux::identities::{user_names, users};
-use pplx_space_common_svc::core::types::{KekProvider, MasterKeyIdentifier, OrgId};
+use pplx_space_common_svc::core::types::OrgId;
 use pplx_space_common_svc::{
     AuthorizedUdsPeer, UdsPeerAccount, UdsPeerAuthorizer, UdsPeerPrincipal,
 };
@@ -663,7 +662,7 @@ async fn submit_push(
 /// Stage a push source file into vol-mgr-owned staging. Split out of
 /// [`submit_push`] so batched callers can pre-stage every source up front
 /// — fail-fast before any irreversible side effect like a credmgr
-/// `IssueDek` round-trip — and then call [`register_push_job`] per file
+/// `IssueSandboxArtifactDek` round-trip — and then call [`register_push_job`] per file
 /// with the already-staged path.
 async fn stage_push_source(staging: &StagingDir, local_path: &str) -> Result<PathBuf, Status> {
     let src = Path::new(local_path);
@@ -939,7 +938,7 @@ fn classify_pull_artifact_retry<E: JobExecutor>(
     identity: ArtifactRetryIdentity<'_>,
     assignment: impl Into<MaterializationAssignment>,
     entries: &[ArtifactEntryPayload],
-    kek: Option<(&OrgId, &KekProvider, &MasterKeyIdentifier)>,
+    kek: Option<&OrgId>,
     wrapped_dek: Option<&[u8]>,
     mut is_authorized: impl FnMut(&pplx_space_common_jobs::Job) -> bool,
 ) -> Result<Option<pplx_space_common_jobs::Job>, Status> {
@@ -1414,8 +1413,8 @@ impl VolumeManager for VolumeManagerService {
             validate_entry_roles(req.files.iter().map(|f| f.role.as_str()))?;
         }
 
-        // Parse the KEK identity once (push carries no wrapped DEK — vol-mgr
-        // mints it). Reused for the retry-equivalence check and IssueDek.
+        // Parse the expected owner once (push carries no wrapped DEK — vol-mgr
+        // mints it). Reused for the retry-equivalence check and the issue.
         let kek = req
             .encryption
             .map(parse_batch_encryption_config)
@@ -1441,18 +1440,13 @@ impl VolumeManager for VolumeManagerService {
         if let Some(existing) = self
             .worker
             .find_job_by_dedup_key(PUSH_ARTIFACT_KIND, &dedup)?
+            && let Some((existing, persisted)) =
+                classify_artifact_retry(existing, &dedup, &entries, kek.as_ref(), None)?
         {
-            let kek_id = kek
-                .as_ref()
-                .map(|k| (&k.organization_id, &k.provider, &k.master_key_identifier));
-            if let Some((existing, persisted)) =
-                classify_artifact_retry(existing, &dedup, &entries, kek_id, None)?
-            {
-                return Ok(Response::new(PushFilesAsyncResponse {
-                    job_id: existing.job_id.to_string(),
-                    wrapped_dek: persisted.encryption.map(|e| e.wrapped_dek),
-                }));
-            }
+            return Ok(Response::new(PushFilesAsyncResponse {
+                job_id: existing.job_id.to_string(),
+                wrapped_dek: persisted.encryption.map(|e| e.wrapped_dek),
+            }));
         }
 
         // Pre-stage every source into vol-mgr-owned staging before issuing
@@ -1476,26 +1470,20 @@ impl VolumeManager for VolumeManagerService {
             }
         }
 
-        // Issue exactly one DEK for the artifact when encryption is set,
-        // bound to the artifact-level wrap AAD `(org, sandbox)`. The
-        // plaintext DEK is dropped here (the `Zeroizing` wrapper scrubs
-        // it); every entry re-unwraps from the persisted wrap at execute
-        // time, so the caller never sees the plaintext bytes.
+        // Issue exactly one DEK for the artifact when encryption is set.
+        // credmgr binds it to the sandbox's durable owner and this node's
+        // assignment to the sandbox. The plaintext DEK is dropped here (the
+        // `Zeroizing` wrapper scrubs it); every entry re-unwraps from the
+        // persisted wrap at execute time, so the caller never sees the
+        // plaintext bytes.
         let encryption = match kek {
             None => None,
-            Some(parsed) => {
+            Some(organization_id) => {
                 // `kek.is_some()` iff `req.encryption.is_some()`, which is the
                 // exact condition under which `sandbox_id` was resolved above.
                 let sandbox_id =
                     sandbox_id.expect("encrypted artifact ⇒ sandbox subject resolved above");
-                let aad = wrap_aad(parsed.organization_id, &sandbox_id);
-                let issued = match crate::credentials::issue_dek(
-                    parsed.organization_id,
-                    parsed.provider,
-                    &parsed.master_key_identifier,
-                    &aad,
-                )
-                .await
+                let issued = match crate::credentials::issue_dek(&sandbox_id, organization_id).await
                 {
                     Ok(issued) => issued,
                     Err(e) => {
@@ -1506,9 +1494,7 @@ impl VolumeManager for VolumeManagerService {
                     }
                 };
                 Some(TransferEncryption {
-                    organization_id: parsed.organization_id,
-                    provider: parsed.provider,
-                    master_key_identifier: parsed.master_key_identifier,
+                    organization_id,
                     wrapped_dek: issued.wrapped_dek,
                 })
             }
@@ -1635,9 +1621,7 @@ impl VolumeManager for VolumeManagerService {
         // through to mint a fresh job so a corrected retry can make progress
         // (returning the failed job would let a `GetTransferJob` poll see the
         // old failure and never advance).
-        let kek_id = encryption
-            .as_ref()
-            .map(|e| (&e.organization_id, &e.provider, &e.master_key_identifier));
+        let kek_id = encryption.as_ref().map(|e| &e.organization_id);
         let wrap = encryption.as_ref().map(|e| e.wrapped_dek.as_slice());
         let existing = classify_pull_artifact_retry(
             &self.worker,
@@ -1695,57 +1679,19 @@ impl VolumeManager for VolumeManagerService {
     }
 }
 
-/// Parsed shape of [`BatchEncryptionConfig`] after the gRPC boundary.
-struct ParsedBatchEncryption {
-    organization_id: OrgId,
-    provider: KekProvider,
-    master_key_identifier: MasterKeyIdentifier,
-}
-
-fn parse_batch_encryption_config(
-    cfg: BatchEncryptionConfig,
-) -> Result<ParsedBatchEncryption, Status> {
-    let organization_id: OrgId = cfg
-        .organization_id
-        .trim()
-        .parse()
-        .map_err(|e| Status::invalid_argument(format!("encryption.organization_id: {e}")))?;
-    let provider: KekProvider = cfg
-        .provider
-        .trim()
-        .parse()
-        .map_err(|e| Status::invalid_argument(format!("encryption.provider: {e}")))?;
-    let master_key_identifier: MasterKeyIdentifier =
-        cfg.master_key_identifier.trim().parse().map_err(|e| {
-            Status::invalid_argument(format!("encryption.master_key_identifier: {e}"))
-        })?;
-    Ok(ParsedBatchEncryption {
-        organization_id,
-        provider,
-        master_key_identifier,
-    })
+/// Parse a push-side [`BatchEncryptionConfig`] into the owner the caller
+/// expects for the sandbox. credmgr chooses the KEK.
+fn parse_batch_encryption_config(cfg: BatchEncryptionConfig) -> Result<OrgId, Status> {
+    parse_expected_org(&cfg.organization_id)
 }
 
 /// Parse a pull-side [`BatchDecryptionConfig`] into the typed
 /// [`TransferEncryption`] stored on the artifact's entries. The
 /// caller-supplied `wrapped_dek` is the wrap recorded from the paired
-/// `PushFilesAsync`; vol-mgr re-unwraps it (bound to the artifact wrap
-/// AAD) at execute time.
+/// `PushFilesAsync`; vol-mgr asks credmgr to unwrap it for the
+/// artifact's sandbox at execute time.
 fn parse_batch_decryption_config(cfg: BatchDecryptionConfig) -> Result<TransferEncryption, Status> {
-    let organization_id: OrgId = cfg
-        .organization_id
-        .trim()
-        .parse()
-        .map_err(|e| Status::invalid_argument(format!("encryption.organization_id: {e}")))?;
-    let provider: KekProvider = cfg
-        .provider
-        .trim()
-        .parse()
-        .map_err(|e| Status::invalid_argument(format!("encryption.provider: {e}")))?;
-    let master_key_identifier: MasterKeyIdentifier =
-        cfg.master_key_identifier.trim().parse().map_err(|e| {
-            Status::invalid_argument(format!("encryption.master_key_identifier: {e}"))
-        })?;
+    let organization_id = parse_expected_org(&cfg.organization_id)?;
     if cfg.wrapped_dek.is_empty() {
         return Err(Status::invalid_argument(
             "encryption.wrapped_dek must not be empty",
@@ -1753,10 +1699,14 @@ fn parse_batch_decryption_config(cfg: BatchDecryptionConfig) -> Result<TransferE
     }
     Ok(TransferEncryption {
         organization_id,
-        provider,
-        master_key_identifier,
         wrapped_dek: cfg.wrapped_dek,
     })
+}
+
+fn parse_expected_org(raw: &str) -> Result<OrgId, Status> {
+    raw.trim()
+        .parse()
+        .map_err(|e| Status::invalid_argument(format!("encryption.organization_id: {e}")))
 }
 
 /// Parse the caller-minted artifact id at the gRPC boundary.
@@ -1817,15 +1767,15 @@ fn pull_batch_entry_payload(
 
 /// Whether an idempotent retry's intended artifact matches the one already
 /// persisted under the same `artifact_id`. Compares the entry tuples
-/// (role, snapshot artifact, local_path, s3_uri, file_mode) and the KEK identity
-/// (organization / provider / master key). The server-minted `wrapped_dek` is
+/// (role, snapshot artifact, local_path, s3_uri, file_mode) and the expected
+/// owning organization. The server-minted `wrapped_dek` is
 /// compared only when the caller supplied one (pull): the push caller never
 /// sends a wrap, so there is nothing to compare on that side. `staged_path` is
 /// excluded — it is server-assigned and differs per attempt.
 fn artifact_request_matches(
     persisted: &ArtifactPayload,
     entries: &[ArtifactEntryPayload],
-    kek: Option<(&OrgId, &KekProvider, &MasterKeyIdentifier)>,
+    kek: Option<&OrgId>,
     wrapped_dek: Option<&[u8]>,
 ) -> bool {
     if persisted.entries.len() != entries.len() {
@@ -1843,11 +1793,8 @@ fn artifact_request_matches(
     }
     match (persisted.encryption.as_ref(), kek) {
         (None, None) => true,
-        (Some(p), Some((org, provider, master_key))) => {
-            p.organization_id == *org
-                && p.provider == *provider
-                && p.master_key_identifier == *master_key
-                && wrapped_dek.is_none_or(|w| p.wrapped_dek == w)
+        (Some(p), Some(org)) => {
+            p.organization_id == *org && wrapped_dek.is_none_or(|w| p.wrapped_dek == w)
         }
         _ => false,
     }
@@ -1876,7 +1823,7 @@ fn classify_artifact_retry(
     existing: pplx_space_common_jobs::Job,
     artifact_id: &str,
     entries: &[ArtifactEntryPayload],
-    kek: Option<(&OrgId, &KekProvider, &MasterKeyIdentifier)>,
+    kek: Option<&OrgId>,
     wrapped_dek: Option<&[u8]>,
 ) -> Result<Option<(pplx_space_common_jobs::Job, ArtifactPayload)>, Status> {
     if existing.status == "failed" {

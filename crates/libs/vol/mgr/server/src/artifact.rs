@@ -6,7 +6,7 @@
 //! [`crate::crypto::entry_aad`]) so two entries sharing the artifact's
 //! DEK cannot be substituted for one another. The artifact id is NOT
 //! bound into the wrap AAD — cross-artifact non-interchangeability
-//! comes from per-DEK isolation (one fresh `IssueDek` per artifact),
+//! comes from per-DEK isolation (one fresh `IssueSandboxArtifactDek` per artifact),
 //! so a caller that lost the original `artifact_id` can still recover
 //! the ciphertext with the persisted wrap.
 //!
@@ -22,7 +22,7 @@ use uuid::Uuid;
 /// key: a retry is idempotent and recovers the same persisted wrapped
 /// DEK. Intentionally NOT bound into the encryption AAD —
 /// cross-artifact ciphertext replay is prevented by per-DEK isolation
-/// (each artifact gets a fresh `IssueDek`), so an entry's ciphertext
+/// (each artifact gets a fresh `IssueSandboxArtifactDek`), so an entry's ciphertext
 /// can't be replayed against a different artifact even though the
 /// wrap AADs match. The pull side therefore doesn't need the same
 /// `ArtifactId` to reproduce the AAD; it only needs the persisted

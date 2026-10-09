@@ -1,7 +1,7 @@
 use super::proto::{
     AwsCredentials, DecryptResponse, EncryptRequest, ExchangeTokenRequest, ExchangeTokenResponse,
-    GetOrIssueSandboxVolumeDekResponse, IssueDekResponse, ResolveNetworkCredentialsResponse,
-    UnwrapDekResponse, exchange_token_response,
+    GetOrIssueSandboxVolumeDekResponse, IssueSandboxArtifactDekResponse,
+    ResolveNetworkCredentialsResponse, UnwrapSandboxArtifactDekResponse, exchange_token_response,
 };
 
 fn assert_redacted(value: &impl std::fmt::Debug, type_name: &str) {
@@ -56,17 +56,17 @@ fn token_exchange_debug_output_is_redacted() {
 #[test]
 fn plaintext_dek_debug_output_is_redacted() {
     assert_redacted(
-        &IssueDekResponse {
+        &IssueSandboxArtifactDekResponse {
             plaintext_dek: b"secret-issued-dek".to_vec(),
             wrapped_dek: b"wrapped-dek".to_vec(),
         },
-        "IssueDekResponse",
+        "IssueSandboxArtifactDekResponse",
     );
     assert_redacted(
-        &UnwrapDekResponse {
+        &UnwrapSandboxArtifactDekResponse {
             plaintext_dek: b"secret-unwrapped-dek".to_vec(),
         },
-        "UnwrapDekResponse",
+        "UnwrapSandboxArtifactDekResponse",
     );
     assert_redacted(
         &GetOrIssueSandboxVolumeDekResponse {

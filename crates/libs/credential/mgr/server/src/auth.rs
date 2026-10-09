@@ -441,8 +441,12 @@ impl CredentialUdsAccess {
                     "/space.credential.manager.v1.CredentialManager/ExchangeToken" => {
                         "ExchangeToken"
                     }
-                    "/space.credential.manager.v1.CredentialManager/IssueDek" => "IssueDek",
-                    "/space.credential.manager.v1.CredentialManager/UnwrapDek" => "UnwrapDek",
+                    "/space.credential.manager.v1.CredentialManager/IssueSandboxArtifactDek" => {
+                        "IssueSandboxArtifactDek"
+                    }
+                    "/space.credential.manager.v1.CredentialManager/UnwrapSandboxArtifactDek" => {
+                        "UnwrapSandboxArtifactDek"
+                    }
                     _ => {
                         let peer = peer_identity_from_tonic_request(request);
                         tracing::warn!(

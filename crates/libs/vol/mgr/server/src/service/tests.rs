@@ -571,8 +571,6 @@ fn rootfs_mode_is_enabled_only_for_sandboxes() {
 fn valid_dec_cfg() -> BatchDecryptionConfig {
     BatchDecryptionConfig {
         organization_id: "019e31d9-79a6-7132-b90f-007f1c62ddea".to_string(),
-        provider: "in-memory".to_string(),
-        master_key_identifier: "test/key-1".to_string(),
         wrapped_dek: vec![1, 2, 3, 4],
     }
 }
@@ -584,8 +582,6 @@ fn parse_batch_decryption_config_accepts_well_formed() {
         enc.organization_id.to_string(),
         "019e31d9-79a6-7132-b90f-007f1c62ddea"
     );
-    assert_eq!(enc.provider, KekProvider::InMemory);
-    assert_eq!(enc.master_key_identifier.as_str(), "test/key-1");
     assert_eq!(enc.wrapped_dek, vec![1, 2, 3, 4]);
 }
 
@@ -593,14 +589,6 @@ fn parse_batch_decryption_config_accepts_well_formed() {
 fn parse_batch_decryption_config_rejects_malformed_org_id() {
     let mut cfg = valid_dec_cfg();
     cfg.organization_id = "not-a-uuid".to_string();
-    let err = parse_batch_decryption_config(cfg).unwrap_err();
-    assert_eq!(err.code(), tonic::Code::InvalidArgument);
-}
-
-#[test]
-fn parse_batch_decryption_config_rejects_unknown_provider() {
-    let mut cfg = valid_dec_cfg();
-    cfg.provider = "ms-azure-kv".to_string();
     let err = parse_batch_decryption_config(cfg).unwrap_err();
     assert_eq!(err.code(), tonic::Code::InvalidArgument);
 }
@@ -712,8 +700,6 @@ fn validate_entry_roles_accepts_distinct_and_rejects_duplicate_or_empty() {
 fn enc(wrapped_dek: Vec<u8>) -> TransferEncryption {
     TransferEncryption {
         organization_id: "019e31d9-79a6-7132-b90f-007f1c62ddea".parse().unwrap(),
-        provider: KekProvider::InMemory,
-        master_key_identifier: "test/key-1".parse().unwrap(),
         wrapped_dek,
     }
 }
@@ -1418,11 +1404,7 @@ async fn protected_priority_pull_is_admitted_when_default_band_is_full() {
 fn classify_artifact_retry_reuses_equivalent_live_job() {
     let art = sample_artifact();
     let kek = art.encryption.as_ref().unwrap();
-    let kek_id = Some((
-        &kek.organization_id,
-        &kek.provider,
-        &kek.master_key_identifier,
-    ));
+    let kek_id = Some(&kek.organization_id);
     // Same entries + KEK identity, push side (no wrap supplied) → reuse.
     let out = classify_artifact_retry(
         persisted_job("running", &art),
@@ -1458,11 +1440,7 @@ fn classify_artifact_retry_mints_fresh_when_prior_attempt_failed() {
 fn classify_artifact_retry_rejects_divergent_entries() {
     let art = sample_artifact();
     let kek = art.encryption.as_ref().unwrap();
-    let kek_id = Some((
-        &kek.organization_id,
-        &kek.provider,
-        &kek.master_key_identifier,
-    ));
+    let kek_id = Some(&kek.organization_id);
     // Same artifact_id, different S3 destination for the entry → reject.
     let diverged = vec![entry("memfile", "s3://b/snap/OTHER?region=us-east-2")];
     match classify_artifact_retry(
@@ -1487,11 +1465,7 @@ fn artifact_retry_rejects_divergent_semantic_artifact() {
     assert!(!artifact_request_matches(
         &art,
         &diverged,
-        Some((
-            &encryption.organization_id,
-            &encryption.provider,
-            &encryption.master_key_identifier,
-        )),
+        Some(&encryption.organization_id),
         None,
     ));
 }
@@ -1506,11 +1480,7 @@ fn artifact_retry_accepts_legacy_missing_identity_when_role_is_canonical() {
     assert!(artifact_request_matches(
         &persisted,
         &requested.entries,
-        Some((
-            &encryption.organization_id,
-            &encryption.provider,
-            &encryption.master_key_identifier,
-        )),
+        Some(&encryption.organization_id),
         None,
     ));
 }
@@ -1527,11 +1497,7 @@ fn artifact_retry_rejects_missing_identity_for_opaque_role() {
     assert!(!artifact_request_matches(
         &persisted,
         &requested,
-        Some((
-            &encryption.organization_id,
-            &encryption.provider,
-            &encryption.master_key_identifier,
-        )),
+        Some(&encryption.organization_id),
         None,
     ));
 }
@@ -1540,11 +1506,7 @@ fn artifact_retry_rejects_missing_identity_for_opaque_role() {
 fn classify_artifact_retry_rejects_divergent_wrap_on_pull() {
     let art = sample_artifact();
     let kek = art.encryption.as_ref().unwrap();
-    let kek_id = Some((
-        &kek.organization_id,
-        &kek.provider,
-        &kek.master_key_identifier,
-    ));
+    let kek_id = Some(&kek.organization_id);
     // Pull supplies the wrap; a mismatch against the persisted wrap (e.g. a
     // stale id reused with a different DEK) must surface, not silently
     // execute the persisted wrap.

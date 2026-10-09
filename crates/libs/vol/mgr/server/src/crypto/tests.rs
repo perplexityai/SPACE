@@ -15,8 +15,9 @@ fn wrap_aad_is_deterministic_and_prefixed() {
     let a = wrap_aad(org(), &sbx("a2"));
     let b = wrap_aad(org(), &sbx("a2"));
     assert_eq!(a, b, "same inputs must produce the same AAD");
-    assert_eq!(&a[..WRAP_AAD_PREFIX.len()], WRAP_AAD_PREFIX);
-    assert_eq!(a.len(), WRAP_AAD_PREFIX.len() + 1 + 16 + 16);
+    let prefix = b"space-artifact-wrap/v1";
+    assert_eq!(&a[..prefix.len()], prefix);
+    assert_eq!(a.len(), prefix.len() + 1 + 16 + 16);
 }
 
 #[test]
@@ -25,7 +26,7 @@ fn wrap_aad_differs_per_sandbox() {
 }
 
 /// `wrap_aad` intentionally does NOT bind `artifact_id`: every
-/// artifact already has its own DEK (fresh `IssueDek` per push),
+/// artifact already has its own DEK (fresh `IssueSandboxArtifactDek` per push),
 /// so cross-artifact swap protection comes from key isolation,
 /// not from the AAD. A wrap from one artifact can be supplied at
 /// pull time even when the caller has lost the original

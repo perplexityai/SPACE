@@ -15,8 +15,8 @@ use crate::credentials::{StorageAccess, UnwrapDekError, exchange_credentials, un
 use crate::crypto::{self, CryptoError, decrypted_sibling, encrypted_sibling};
 use dashmap::DashMap;
 use pplx_space_common_core::types::{
-    KekProvider, MasterKeyIdentifier, MaterializationLayout, MaterializationMode, OrgId, SandboxId,
-    SnapshotArtifact, StorageUri, SubjectId, SubjectIdParseError, TransferScopeId,
+    MaterializationLayout, MaterializationMode, OrgId, SandboxId, SnapshotArtifact, StorageUri,
+    SubjectId, SubjectIdParseError, TransferScopeId,
 };
 use pplx_space_common_io::sparse::{SparseDataRange, SparseFileWriter, SparseMaterialization};
 use pplx_space_common_jobs::{
@@ -617,38 +617,29 @@ pub struct TransferPayload {
 /// Envelope-encryption parameters for an artifact, stored on its
 /// [`ArtifactPayload`] (and copied onto each synthetic per-entry
 /// [`TransferPayload`]). A serde-friendly Rust struct so the persisted
-/// JSON stays self-contained. Identifying fields are typed via the
-/// shared `common-core` newtypes, so deserialising a stored payload
-/// re-runs the same parse/validate path as the gRPC boundary; corrupt
-/// or hand-edited rows fail the worker's `from_json` step rather than
-/// reaching credmgr. `wrapped_dek` is the opaque ciphertext we persist;
-/// the AADs (artifact-level wrap + per-entry chunk) are derived at
-/// execute time from the payload's subject, `artifact_id`, and entry
-/// `role` via [`derive_artifact_aads`], so no AAD bytes round-trip
-/// through the request or the SQLite row.
+/// JSON stays self-contained. `organization_id` is the owner the
+/// caller expects; credmgr verifies it against the sandbox's durable
+/// owner and resolves the KEK from the self-describing `wrapped_dek`,
+/// so no KEK identity is persisted here. The per-entry chunk AADs are
+/// derived at execute time from the payload's subject and entry `role`
+/// via [`derive_artifact_aads`], so no AAD bytes round-trip through the
+/// request or the SQLite row.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct TransferEncryption {
     pub organization_id: OrgId,
-    pub provider: KekProvider,
-    pub master_key_identifier: MasterKeyIdentifier,
     pub wrapped_dek: Vec<u8>,
 }
 
 impl TransferEncryption {
-    /// Stable fingerprint of `(org_id, provider, master_key_identifier,
-    /// wrapped_dek)` for use in the job dedup key. Different
-    /// callers asking to encrypt the same `(subject, local_path,
-    /// s3_uri)` with different DEKs (or even the same wrapped bytes
-    /// under different orgs) produce different ciphertext, so they
-    /// must NOT collapse onto a single in-flight job. SHA-256 of the
-    /// NUL-separated concatenation, hex-encoded.
+    /// Stable fingerprint of `(org_id, wrapped_dek)` for use in the job
+    /// dedup key. Different callers asking to encrypt the same
+    /// `(subject, local_path, s3_uri)` with different DEKs (or even the
+    /// same wrapped bytes under different orgs) produce different
+    /// ciphertext, so they must NOT collapse onto a single in-flight
+    /// job. SHA-256 of the NUL-separated concatenation, hex-encoded.
     fn fingerprint(&self) -> String {
         let mut hasher = Sha256::new();
         hasher.update(self.organization_id.as_uuid().as_bytes());
-        hasher.update([0]);
-        hasher.update(self.provider.as_str().as_bytes());
-        hasher.update([0]);
-        hasher.update(self.master_key_identifier.as_str().as_bytes());
         hasher.update([0]);
         hasher.update(&self.wrapped_dek);
         let digest = hasher.finalize();
@@ -656,18 +647,14 @@ impl TransferEncryption {
     }
 }
 
-/// Derive the two AADs an encrypted artifact entry needs from its
-/// synthetic [`TransferPayload`]:
+/// Derive what an encrypted artifact entry needs from its synthetic
+/// [`TransferPayload`]: the sandbox that names the artifact DEK at
+/// credmgr (which derives the wrap AAD itself), and the per-entry
+/// **chunk AAD** `wrap_aad || role` that binds each file's AES-GCM
+/// chunks so entries sharing the artifact DEK are not interchangeable.
 ///
-/// - the artifact-level **wrap AAD** `(org, sandbox)` that binds the
-///   DEK at credmgr `IssueDek`/`UnwrapDek` (cross-artifact swaps are
-///   blocked by per-DEK isolation, not by binding artifact_id here), and
-/// - the per-entry **chunk AAD** `wrap_aad || role` that binds each
-///   file's AES-GCM chunks so entries sharing the artifact DEK are not
-///   interchangeable.
-///
-/// Both reproduce deterministically on push and on pull without
-/// the AAD bytes ever crossing the wire — the caller round-trips
+/// The chunk AAD reproduces deterministically on push and on pull
+/// without AAD bytes ever crossing the wire — the caller round-trips
 /// the entry `role`; `(org_id, sandbox_id)` are inherent properties
 /// of the encrypted artifact. Encrypted transfers are
 /// sandbox-scoped artifacts: a non-sandbox subject or a missing
@@ -676,7 +663,7 @@ impl TransferEncryption {
 fn derive_artifact_aads(
     p: &TransferPayload,
     organization_id: OrgId,
-) -> Result<(Vec<u8>, Vec<u8>), JobError> {
+) -> Result<(SandboxId, Vec<u8>), JobError> {
     let subject = parse_subject_id_with_legacy_fallback(&p.subject_id)
         .map_err(|e| JobError::Permanent(format!("derive AAD: subject_id parse: {e}")))?;
     let sandbox_id = match subject {
@@ -695,7 +682,7 @@ fn derive_artifact_aads(
         .map_err(|e| JobError::Permanent(format!("derive AAD: entry_role parse: {e}")))?;
     let wrap = crypto::wrap_aad(organization_id, &sandbox_id);
     let entry = crypto::entry_aad(&wrap, &role);
-    Ok((wrap, entry))
+    Ok((sandbox_id, entry))
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -3084,24 +3071,16 @@ async fn stage_decrypted_temp(
         materialization_mode: requested_mode,
     } = options;
     let plaintext_tmp = decrypted_sibling(ciphertext_path);
-    let (wrap_aad, entry_aad) = match derive_artifact_aads(p, enc.organization_id) {
+    let (sandbox_id, entry_aad) = match derive_artifact_aads(p, enc.organization_id) {
         Ok(a) => a,
         Err(e) => return Err((plaintext_tmp, e)),
     };
     // The artifact path unwraps once for the whole set and passes the DEK in
-    // (`resolved_dek`), avoiding a per-entry credmgr `UnwrapDek` / KMS
-    // `Decrypt` for the same artifact DEK.
+    // (`resolved_dek`), avoiding a per-entry credmgr unwrap / KMS `Decrypt`
+    // for the same artifact DEK.
     let dek = match resolved_dek {
         Some(d) => zeroize::Zeroizing::new(d.to_vec()),
-        None => match unwrap_dek(
-            enc.organization_id,
-            enc.provider,
-            &enc.master_key_identifier,
-            &enc.wrapped_dek,
-            &wrap_aad,
-        )
-        .await
-        {
+        None => match unwrap_dek(&sandbox_id, enc.organization_id, &enc.wrapped_dek).await {
             Ok(d) => d,
             Err(e) => return Err((plaintext_tmp, unwrap_error_to_job_error(e))),
         },
@@ -3959,7 +3938,7 @@ pub struct ArtifactPayload {
     /// combines this identity with non-default materialization postconditions;
     /// the persisted artifact identity itself remains unchanged. It is not
     /// bound into the wrap AAD — cross-artifact ciphertext is already
-    /// non-interchangeable via per-DEK isolation (one fresh `IssueDek` per
+    /// non-interchangeable via per-DEK isolation (one fresh `IssueSandboxArtifactDek` per
     /// artifact), so callers can recover the wrap without persisting
     /// `artifact_id` alongside it.
     pub artifact_id: String,
@@ -4203,11 +4182,10 @@ impl TransferExecutor {
             }
         }
 
-        // Unwrap the artifact DEK once. The wrap AAD is artifact-scoped
-        // (org, sandbox, artifact_id), so a single unwrap is
-        // correctness-equivalent to unwrapping per entry — and avoids N
-        // parallel credmgr `UnwrapDek` / KMS `Decrypt` calls, which a retry
-        // would otherwise multiply on every attempt.
+        // Unwrap the artifact DEK once. Every entry shares the artifact DEK,
+        // so a single unwrap is correctness-equivalent to unwrapping per
+        // entry — and avoids N parallel credmgr unwrap / KMS `Decrypt` calls,
+        // which a retry would otherwise multiply on every attempt.
         let dek = match &art.encryption {
             None => None,
             Some(enc) => {
@@ -4220,16 +4198,9 @@ impl TransferExecutor {
                         ));
                     }
                 };
-                let aad = crypto::wrap_aad(enc.organization_id, sandbox_id);
-                let dek = unwrap_dek(
-                    enc.organization_id,
-                    enc.provider,
-                    &enc.master_key_identifier,
-                    &enc.wrapped_dek,
-                    &aad,
-                )
-                .await
-                .map_err(unwrap_error_to_job_error)?;
+                let dek = unwrap_dek(sandbox_id, enc.organization_id, &enc.wrapped_dek)
+                    .await
+                    .map_err(unwrap_error_to_job_error)?;
                 Some(dek)
             }
         };
@@ -4449,25 +4420,19 @@ async fn stage_encrypted_temp(
     let enc_path_buf = enc_path.clone();
     let subject_id = p.subject_id.clone();
     let result: Result<(), JobError> = async {
-        // wrap_aad binds the DEK (IssueDek/UnwrapDek); entry_aad binds the
+        // credmgr binds the DEK to the sandbox; entry_aad binds the
         // per-chunk AEAD so this file's ciphertext can't be fed into a
         // different entry's slot under the same artifact DEK.
-        let (wrap_aad, entry_aad) = derive_artifact_aads(p, enc.organization_id)?;
+        let (sandbox_id, entry_aad) = derive_artifact_aads(p, enc.organization_id)?;
         // The artifact path unwraps the DEK once for the whole set and passes
         // it in (`resolved_dek`), so the per-entry fan-out does not multiply
-        // credmgr `UnwrapDek` / KMS `Decrypt` calls. The copy into `Zeroizing`
+        // credmgr unwrap / KMS `Decrypt` calls. The copy into `Zeroizing`
         // keeps the move-into-`spawn_blocking` shape and scrubs on drop.
         let dek = match resolved_dek {
             Some(d) => zeroize::Zeroizing::new(d.to_vec()),
-            None => unwrap_dek(
-                enc.organization_id,
-                enc.provider,
-                &enc.master_key_identifier,
-                &enc.wrapped_dek,
-                &wrap_aad,
-            )
-            .await
-            .map_err(unwrap_error_to_job_error)?,
+            None => unwrap_dek(&sandbox_id, enc.organization_id, &enc.wrapped_dek)
+                .await
+                .map_err(unwrap_error_to_job_error)?,
         };
         tracing::debug!(
             job_id = %job.job_id,

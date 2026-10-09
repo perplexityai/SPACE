@@ -10,9 +10,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use aws_credential_types::provider::ProvideCredentials;
 use pplx_space_common_svc::core::host::linux::identities::{user_names, users};
 use pplx_space_common_svc::core::host::linux::paths;
-use pplx_space_common_svc::core::types::{
-    KekProvider, MasterKeyIdentifier, OrgId, SandboxId, volume_wrap_aad,
-};
+use pplx_space_common_svc::core::types::{OrgId, SandboxId, artifact_wrap_aad, volume_wrap_aad};
 use pplx_space_common_svc::sql::contention;
 use pplx_space_common_svc::{
     PeerProcessCheckMode, UdsPeerAccount, UdsPeerAuthorizer, UdsPeerPrincipal, capability,
@@ -22,7 +20,7 @@ use tonic::{Request, Response, Status};
 use crate::auth::{CallerResolver, ClientService, ResolvedCaller};
 use crate::credential_injection_authority::CredentialInjectionAuthority;
 use crate::credential_injection_rpc::CredentialInjectionRpc;
-use crate::credential_store::CredentialStore;
+use crate::credential_store::{CredentialStore, SandboxOwner};
 use crate::envelope;
 use crate::intermediate_ca::csr::NodeCsr;
 use crate::intermediate_ca::{
@@ -34,12 +32,13 @@ use crate::kek_store::{KekRecord, KekStore, KekStoreError};
 use crate::key_wrapper::{DekKeySpec, GenerateDekOutput, KeyWrapper, UnwrapError, WrapError};
 use crate::proto::credential_manager_server::CredentialManager;
 use crate::proto::{
-    AwsCredentials, DecryptRequest, DecryptResponse, DekSpec, EncryptRequest, EncryptResponse,
+    AwsCredentials, DecryptRequest, DecryptResponse, EncryptRequest, EncryptResponse,
     ExchangeTokenRequest, ExchangeTokenResponse, GetOrIssueSandboxVolumeDekRequest,
-    GetOrIssueSandboxVolumeDekResponse, IssueDekRequest, IssueDekResponse,
-    IssueIntermediateCertificateRequest, IssueIntermediateCertificateResponse,
-    ResolveNetworkCredentialsRequest, ResolveNetworkCredentialsResponse, UnwrapDekRequest,
-    UnwrapDekResponse, exchange_token_response,
+    GetOrIssueSandboxVolumeDekResponse, IssueIntermediateCertificateRequest,
+    IssueIntermediateCertificateResponse, IssueSandboxArtifactDekRequest,
+    IssueSandboxArtifactDekResponse, ResolveNetworkCredentialsRequest,
+    ResolveNetworkCredentialsResponse, UnwrapSandboxArtifactDekRequest,
+    UnwrapSandboxArtifactDekResponse, exchange_token_response,
 };
 use crate::storage_exchange::{
     AuthorizedExchange, StorageExchangeError, VendRoleArn, authorize_exchange,
@@ -57,19 +56,14 @@ const ALLOW_EXCHANGE_TOKEN: &[UdsPeerPrincipal] = &[
     UdsPeerPrincipal::Service(SPACE_TMPLMGR_ACCOUNT),
     UdsPeerPrincipal::Service(user_names::SPACE_VOLMGR),
 ];
-/// Same callers as `ExchangeToken` for now: sandbox-manager and
-/// template-manager are the two on-node services that own data they
-/// might want to envelope-encrypt.
-const ALLOW_ISSUE_DEK: &[UdsPeerPrincipal] = &[
+/// Sandbox artifact DEKs serve volume-manager's encrypted artifact transfers.
+/// The sandbox-manager account stays listed because volume-manager runs under
+/// that uid on layouts without a dedicated volume-manager user (the same
+/// mapping ExchangeToken's actor resolution applies). Root remains available
+/// for operator debugging.
+const ALLOW_SANDBOX_ARTIFACT_DEK: &[UdsPeerPrincipal] = &[
     UdsPeerPrincipal::Root,
     UdsPeerPrincipal::Service(SPACE_SBXMGR_ACCOUNT),
-    UdsPeerPrincipal::Service(SPACE_TMPLMGR_ACCOUNT),
-    UdsPeerPrincipal::Service(user_names::SPACE_VOLMGR),
-];
-const ALLOW_UNWRAP_DEK: &[UdsPeerPrincipal] = &[
-    UdsPeerPrincipal::Root,
-    UdsPeerPrincipal::Service(SPACE_SBXMGR_ACCOUNT),
-    UdsPeerPrincipal::Service(SPACE_TMPLMGR_ACCOUNT),
     UdsPeerPrincipal::Service(user_names::SPACE_VOLMGR),
 ];
 
@@ -85,8 +79,9 @@ const ALLOW_UNWRAP_DEK: &[UdsPeerPrincipal] = &[
 /// original caller's. ExchangeToken accepts the agent only because that RPC
 /// separately validates the locally authenticated Volume/Template actor claim;
 /// Sandbox Manager is not in its storage authorization matrix. Build Manager
-/// reaches the authority directly and receives only token exchange. The
-/// DEK-operation lists remain the union of the node services the agent fronts.
+/// reaches the authority directly and receives only token exchange. Sandbox
+/// artifact DEKs accept the agent because the agent admits only volume-manager
+/// and the handler fences the agent's node to the sandbox's durable placement.
 const ALLOW_RESOLVE_NETWORK_CREDENTIAL_SERVICES: &[ClientService] =
     &[ClientService::NodeCredentialAgent];
 const ALLOW_EXCHANGE_TOKEN_SERVICES: &[ClientService] = &[
@@ -95,13 +90,10 @@ const ALLOW_EXCHANGE_TOKEN_SERVICES: &[ClientService] = &[
     ClientService::BuildManager,
     ClientService::NodeCredentialAgent,
 ];
-const ALLOW_ISSUE_DEK_SERVICES: &[ClientService] = &[
-    ClientService::SandboxManager,
+const ALLOW_SANDBOX_ARTIFACT_DEK_SERVICES: &[ClientService] = &[
     ClientService::VolumeManager,
-    ClientService::TemplateManager,
     ClientService::NodeCredentialAgent,
 ];
-const ALLOW_UNWRAP_DEK_SERVICES: &[ClientService] = ALLOW_ISSUE_DEK_SERVICES;
 
 /// Encrypt/Decrypt serve the control-plane API's credential CRUD. api-svc
 /// is never an on-node UDS peer, so the UDS list is root-only (debugging).
@@ -121,7 +113,7 @@ const ALLOW_VOLUME_DEK_SERVICES: &[ClientService] = &[ClientService::NodeManager
 const ALLOW_ISSUE_INTERMEDIATE: &[UdsPeerPrincipal] = &[UdsPeerPrincipal::Root];
 const ALLOW_ISSUE_INTERMEDIATE_SERVICES: &[ClientService] = &[ClientService::NodeCredentialAgent];
 /// Cap on `EncryptRequest.plaintext`. Encrypt is for credential values and
-/// other small blobs; bulk data goes through IssueDek + the streaming
+/// other small blobs; bulk data goes through IssueSandboxArtifactDek + the streaming
 /// pipeline, so anything larger here is a caller bug.
 const MAX_ENCRYPT_PLAINTEXT_LEN: usize = 64 * 1024;
 /// Decrypt-side cap: sealed form adds a version byte, a 12-byte nonce, and
@@ -447,6 +439,73 @@ impl CredentialManagerService {
         }
         Ok(())
     }
+
+    /// Resolve the sandbox's owner for an artifact-DEK operation and fence a
+    /// node caller to the sandbox's durable placement.
+    ///
+    /// A Kubernetes caller (the node credential agent, or a directly
+    /// authenticated volume-manager) carries the node its token is bound to;
+    /// that node must be one the control plane assigned to the sandbox.
+    /// The placement check runs before the owner lookup and the expected-org
+    /// comparison, so a node outside the placement learns nothing about the
+    /// sandbox's existence or owner. A UDS peer is node-local to this
+    /// authority (single-node and local deployments) and has no node identity
+    /// to compare.
+    async fn authorize_sandbox_artifact(
+        &self,
+        caller: &ResolvedCaller,
+        sandbox_id: SandboxId,
+        expected_org_id: &str,
+        operation: &'static str,
+    ) -> Result<SandboxOwner, Status> {
+        let store = self.credential_store()?;
+        match caller {
+            ResolvedCaller::K8sJwt(identity) => {
+                let nodes = store
+                    .sandbox_placement_nodes(sandbox_id)
+                    .await
+                    .map_err(|e| {
+                        credential_store_error_to_status("sandbox placement lookup failed", e)
+                    })?;
+                let caller_node = identity.node();
+                if !nodes.iter().any(|node| {
+                    node.name == *caller_node.node_name() && node.uid == *caller_node.node_uid()
+                }) {
+                    tracing::warn!(
+                        operation,
+                        sandbox_id = %sandbox_id,
+                        caller_node = %caller_node.node_name(),
+                        "artifact DEK refused: caller node is not a placement of the sandbox"
+                    );
+                    return Err(Status::permission_denied(format!(
+                        "{operation} requires a node assigned to the sandbox"
+                    )));
+                }
+            }
+            ResolvedCaller::UdsPeer(_) => {}
+            ResolvedCaller::Plaintext => {
+                return Err(Status::permission_denied(format!(
+                    "{operation} requires an authenticated service identity"
+                )));
+            }
+        }
+        let owner = store
+            .sandbox_owner(sandbox_id)
+            .await
+            .map_err(|e| credential_store_error_to_status("sandbox owner lookup failed", e))?
+            .ok_or_else(|| Status::not_found("sandbox not found"))?;
+        if !expected_org_id.trim().is_empty() {
+            let expected: OrgId = expected_org_id
+                .parse()
+                .map_err(|e| Status::invalid_argument(format!("expected_org_id: {e}")))?;
+            if expected != owner.org_id {
+                return Err(Status::failed_precondition(
+                    "sandbox is not owned by the organization the caller expected",
+                ));
+            }
+        }
+        Ok(owner)
+    }
 }
 
 #[tonic::async_trait]
@@ -567,73 +626,112 @@ impl CredentialManager for CredentialManagerService {
         }))
     }
 
-    async fn issue_dek(
+    /// Issue a sandbox artifact DEK. The caller names only the sandbox;
+    /// credmgr resolves the owner, the active KEK, and the AAD, so this cannot
+    /// mint keys for an organization or context the caller chooses.
+    async fn issue_sandbox_artifact_dek(
         &self,
-        request: Request<IssueDekRequest>,
-    ) -> Result<Response<IssueDekResponse>, Status> {
-        self.authorize_caller(
+        request: Request<IssueSandboxArtifactDekRequest>,
+    ) -> Result<Response<IssueSandboxArtifactDekResponse>, Status> {
+        const OPERATION: &str = "IssueSandboxArtifactDek";
+        let caller = self.authorize_caller(
             &request,
-            "IssueDek",
-            ALLOW_ISSUE_DEK,
-            ALLOW_ISSUE_DEK_SERVICES,
+            OPERATION,
+            ALLOW_SANDBOX_ARTIFACT_DEK,
+            ALLOW_SANDBOX_ARTIFACT_DEK_SERVICES,
         )?;
         let req = request.into_inner();
+        let sandbox_id = parse_sandbox_id(&req.sandbox_id)?;
+        let owner = self
+            .authorize_sandbox_artifact(&caller, sandbox_id, &req.expected_org_id, OPERATION)
+            .await?;
+        let org = owner.org_id;
+        // Defense in depth behind the callers that stamp encryption from the
+        // org's enrollment, mirroring GetOrIssueSandboxVolumeDek: only BYOK
+        // orgs get new artifact keys. Unwrap stays available so existing
+        // artifacts remain readable after BYOK is toggled off.
+        if !owner.byok_enabled {
+            return Err(Status::failed_precondition(
+                "sandbox's organization does not have BYOK enabled",
+            ));
+        }
 
-        let org = parse_organization_id(&req.organization_id)?;
-        let provider: KekProvider = req
-            .provider
-            .parse()
-            .map_err(|e| Status::invalid_argument(format!("provider: {e}")))?;
-        let master_key: MasterKeyIdentifier = req
-            .master_key_identifier
-            .parse()
-            .map_err(|e| Status::invalid_argument(format!("master_key_identifier: {e}")))?;
-        let spec = dek_spec_to_key_spec(req.spec);
-
+        let kek = self
+            .active_or_provisioned_kek(org, Some(sandbox_id))
+            .await?;
+        let aad = artifact_wrap_aad(org, &sandbox_id);
         let GenerateDekOutput {
             plaintext_dek,
             wrapped_dek,
         } = self
             .key_wrapper
-            .generate_and_wrap_dek(org, None, provider, &master_key, spec, &req.aad)
+            .generate_and_wrap_dek(
+                org,
+                Some(sandbox_id),
+                kek.provider,
+                &kek.key_identifier,
+                DekKeySpec::Aes256,
+                &aad,
+            )
             .await
             .map_err(wrap_error_to_status)?;
 
-        Ok(Response::new(IssueDekResponse {
+        Ok(Response::new(IssueSandboxArtifactDekResponse {
             plaintext_dek,
-            wrapped_dek,
+            wrapped_dek: envelope::encode_wrapped_dek(kek.cmk_id, &wrapped_dek),
         }))
     }
 
-    async fn unwrap_dek(
+    /// Unwrap a sandbox artifact DEK under the same placement fence as issue.
+    /// The KEK comes from the wrap's envelope and must belong to the
+    /// sandbox's organization; the AAD is re-derived here.
+    async fn unwrap_sandbox_artifact_dek(
         &self,
-        request: Request<UnwrapDekRequest>,
-    ) -> Result<Response<UnwrapDekResponse>, Status> {
-        self.authorize_caller(
+        request: Request<UnwrapSandboxArtifactDekRequest>,
+    ) -> Result<Response<UnwrapSandboxArtifactDekResponse>, Status> {
+        const OPERATION: &str = "UnwrapSandboxArtifactDek";
+        let caller = self.authorize_caller(
             &request,
-            "UnwrapDek",
-            ALLOW_UNWRAP_DEK,
-            ALLOW_UNWRAP_DEK_SERVICES,
+            OPERATION,
+            ALLOW_SANDBOX_ARTIFACT_DEK,
+            ALLOW_SANDBOX_ARTIFACT_DEK_SERVICES,
         )?;
         let req = request.into_inner();
+        let sandbox_id = parse_sandbox_id(&req.sandbox_id)?;
+        let owner = self
+            .authorize_sandbox_artifact(&caller, sandbox_id, &req.expected_org_id, OPERATION)
+            .await?;
+        let org = owner.org_id;
 
-        let org = parse_organization_id(&req.organization_id)?;
-        let provider: KekProvider = req
-            .provider
-            .parse()
-            .map_err(|e| Status::invalid_argument(format!("provider: {e}")))?;
-        let master_key: MasterKeyIdentifier = req
-            .master_key_identifier
-            .parse()
-            .map_err(|e| Status::invalid_argument(format!("master_key_identifier: {e}")))?;
-
+        let (cmk_id, backend_wrap) = envelope::decode_wrapped_dek(&req.wrapped_dek)
+            .map_err(|e| Status::invalid_argument(format!("wrapped_dek: {e}")))?;
+        let kek = self
+            .kek_store()?
+            .kek_for_org(cmk_id, org)
+            .await
+            .map_err(kek_store_error_to_status)?
+            .ok_or_else(|| {
+                Status::permission_denied(
+                    "the wrapped DEK does not belong to a KEK of the sandbox's organization",
+                )
+            })?;
+        let aad = artifact_wrap_aad(org, &sandbox_id);
         let plaintext_dek = self
             .key_wrapper
-            .unwrap_dek(org, None, provider, &master_key, &req.wrapped_dek, &req.aad)
+            .unwrap_dek(
+                org,
+                Some(sandbox_id),
+                kek.provider,
+                &kek.key_identifier,
+                backend_wrap,
+                &aad,
+            )
             .await
             .map_err(unwrap_error_to_status)?;
 
-        Ok(Response::new(UnwrapDekResponse { plaintext_dek }))
+        Ok(Response::new(UnwrapSandboxArtifactDekResponse {
+            plaintext_dek,
+        }))
     }
 
     async fn encrypt(
@@ -647,7 +745,7 @@ impl CredentialManager for CredentialManagerService {
         if req.plaintext.len() > MAX_ENCRYPT_PLAINTEXT_LEN {
             return Err(Status::invalid_argument(format!(
                 "plaintext exceeds the {MAX_ENCRYPT_PLAINTEXT_LEN}-byte Encrypt cap; \
-                 use IssueDek and the streaming pipeline for bulk data"
+                 use IssueSandboxArtifactDek and the streaming pipeline for bulk data"
             )));
         }
         if req.purpose.is_empty() {
@@ -748,10 +846,7 @@ impl CredentialManager for CredentialManagerService {
     ) -> Result<Response<GetOrIssueSandboxVolumeDekResponse>, Status> {
         self.authorize_volume_caller(&request, "GetOrIssueSandboxVolumeDek")?;
         let req = request.into_inner();
-        let sandbox_id: SandboxId = req
-            .sandbox_id
-            .parse()
-            .map_err(|e| Status::invalid_argument(format!("sandbox_id: {e}")))?;
+        let sandbox_id = parse_sandbox_id(&req.sandbox_id)?;
 
         // The caller named only the sandbox. credmgr resolves the sandbox's
         // organization, the org's active KEK, and the stored per-sandbox wrap
@@ -1074,9 +1169,14 @@ impl CredentialManagerService {
     }
 }
 
-pub(crate) fn parse_organization_id(raw: &str) -> Result<OrgId, Status> {
+fn parse_organization_id(raw: &str) -> Result<OrgId, Status> {
     raw.parse()
         .map_err(|error| Status::invalid_argument(format!("organization_id: {error}")))
+}
+
+pub(crate) fn parse_sandbox_id(raw: &str) -> Result<SandboxId, Status> {
+    raw.parse()
+        .map_err(|error| Status::invalid_argument(format!("sandbox_id: {error}")))
 }
 
 fn parse_org_and_user(
@@ -1208,23 +1308,13 @@ fn credential_store_error_to_status(
     what: &'static str,
     e: crate::credential_store::CredentialStoreError,
 ) -> Status {
-    let crate::credential_store::CredentialStoreError::Query(error) = &e;
-    if let Some(contended) = contention_status(what, error) {
+    if let crate::credential_store::CredentialStoreError::Query(error) = &e
+        && let Some(contended) = contention_status(what, error)
+    {
         return contended;
     }
     tracing::error!(error = %e, what, "credential store lookup failed");
     Status::internal(what)
-}
-
-/// Resolve a proto [`DekSpec`] discriminant to a typed [`DekKeySpec`].
-/// Unknown / `UNSPECIFIED` defaults to AES-256 to keep the API
-/// forward-compatible: clients that haven't been recompiled against
-/// a newer proto get a sensible 32-byte key.
-fn dek_spec_to_key_spec(spec: i32) -> DekKeySpec {
-    match DekSpec::try_from(spec).unwrap_or(DekSpec::Aes256) {
-        DekSpec::Unspecified | DekSpec::Aes256 => DekKeySpec::Aes256,
-        DekSpec::Aes128 => DekKeySpec::Aes128,
-    }
 }
 
 /// `FAILED_PRECONDITION` carrying the machine-readable revocation reason in

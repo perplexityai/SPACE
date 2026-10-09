@@ -7,11 +7,12 @@
 //!   as [`ObjectCredentials`]. These authorize *who* can read/write
 //!   bytes at a destination.
 //! - **Artifact-encryption keys**: `issue_dek` / `unwrap_dek` mint and
-//!   recover DEKs wrapped under a per-org KEK, used to encrypt the
-//!   artifact bytes themselves (`TransferEncryption` carries the
-//!   wrap; the plaintext DEK lives in [`Zeroizing<Vec<u8>>`]). These
-//!   authorize *the bytes themselves*, independently of where
-//!   they're stored.
+//!   recover a sandbox artifact's DEK, used to encrypt the artifact
+//!   bytes themselves (`TransferEncryption` carries the wrap; the
+//!   plaintext DEK lives in [`Zeroizing<Vec<u8>>`]). vol-mgr names only
+//!   the sandbox: credmgr resolves the owner's KEK and the wrap AAD and
+//!   checks that this node is assigned to the sandbox. These authorize
+//!   *the bytes themselves*, independently of where they're stored.
 //!
 //! Store-side server protection (e.g. S3 SSE-KMS) and protected-mount
 //! activation grants are separate concerns from both of the above and
@@ -19,12 +20,13 @@
 //! store and the filesystem layer respectively, not folded into a
 //! single "encryption" type here.
 
-use pplx_space_common_core::types::{KekProvider, MasterKeyIdentifier, OrgId, SubjectId};
+use pplx_space_common_core::types::{OrgId, SandboxId, SubjectId};
 use pplx_space_credmgr_client::{
     AWS_CREDENTIALS_TOKEN_TYPE, STORAGE_READ_SCOPE, STORAGE_SESSION_TTL_SECONDS,
     STORAGE_TOKEN_AUDIENCE, STORAGE_WRITE_SCOPE, SUBJECT_ID_TOKEN_TYPE, TOKEN_EXCHANGE_GRANT_TYPE,
     proto::{
-        DekSpec, ExchangeTokenRequest, IssueDekRequest, UnwrapDekRequest, exchange_token_response,
+        ExchangeTokenRequest, IssueSandboxArtifactDekRequest, UnwrapSandboxArtifactDekRequest,
+        exchange_token_response,
     },
 };
 use pplx_space_object_store::ObjectCredentials;
@@ -94,7 +96,7 @@ pub async fn exchange_credentials(
 /// Errors surfaced by [`unwrap_dek`].
 ///
 /// Split from [`tonic::Status`] so the executor can map permanent
-/// credmgr-side rejections (bad provider, AAD mismatch, malformed
+/// credmgr-side rejections (wrong sandbox, foreign KEK, malformed
 /// wrap) onto [`pplx_space_common_jobs::JobError::Permanent`] and
 /// transport blips onto `Retriable`. The credmgr's own gRPC code
 /// taxonomy informs this split: `InvalidArgument`, `FailedPrecondition`,
@@ -106,27 +108,17 @@ pub enum UnwrapDekError {
     /// not running, etc). Transient; the executor retries.
     #[error("credmgr connect: {0}")]
     Connect(String),
-    /// `gRPC UnwrapDek` returned a permanent rejection — wrong AAD,
-    /// unknown KEK, malformed wrap, unsupported provider. Re-asking
-    /// will keep failing.
+    /// credmgr returned a permanent rejection — wrong sandbox, a node
+    /// outside the sandbox's placement, a foreign KEK, a malformed wrap.
+    /// Re-asking will keep failing.
     #[error("credmgr unwrap rejected: {code:?}: {message}")]
     Permanent { code: Code, message: String },
-    /// `gRPC UnwrapDek` returned a transient failure (unavailable,
-    /// internal error, etc).
+    /// credmgr returned a transient failure (unavailable, internal
+    /// error, etc).
     #[error("credmgr unwrap transient: {code:?}: {message}")]
     Transient { code: Code, message: String },
 }
 
-/// Recover the plaintext DEK previously produced by credmgr `IssueDek`.
-///
-/// The returned bytes live inside [`Zeroizing`] so dropping the value
-/// scrubs the memory — callers should keep the binding short-lived and
-/// drop it immediately after the encrypt/decrypt call completes.
-///
-/// `organization_id`, `provider`, and `master_key_identifier` are
-/// rendered to their canonical wire form (each newtype's `Display`)
-/// and forwarded to credmgr; credmgr re-parses them at its own
-/// boundary for defense in depth.
 /// Errors surfaced by [`issue_dek`]. Same Permanent / Transient split
 /// as [`UnwrapDekError`] so the caller can map onto the right
 /// `JobError` (or in the session case, `Status`) variant.
@@ -152,27 +144,22 @@ pub struct IssuedDek {
     pub wrapped_dek: Vec<u8>,
 }
 
-/// Mint a fresh DEK + wrap it under the named per-org KEK. Symmetric
-/// to [`unwrap_dek`]; same UDS connection pattern, same error
-/// taxonomy. The caller is responsible for zeroising the returned
-/// `plaintext_dek` after use (typically by moving it into a
-/// `Zeroizing<Vec<u8>>`).
+/// Mint a fresh DEK for one of `sandbox_id`'s artifacts. credmgr wraps it
+/// under the sandbox owner's active KEK, bound to `(owner, sandbox)`;
+/// `expected_org` makes credmgr refuse a stale ownership view instead of
+/// minting a wrap the real owner could never unwrap. Symmetric to
+/// [`unwrap_dek`]; same UDS connection pattern, same error taxonomy.
 pub async fn issue_dek(
-    organization_id: OrgId,
-    provider: KekProvider,
-    master_key_identifier: &MasterKeyIdentifier,
-    aad: &[u8],
+    sandbox_id: &SandboxId,
+    expected_org: OrgId,
 ) -> Result<IssuedDek, IssueDekError> {
     let mut client = pplx_space_credmgr_client::connect_from_env()
         .await
         .map_err(|e| IssueDekError::Connect(e.to_string()))?;
     let mut resp = client
-        .issue_dek(IssueDekRequest {
-            organization_id: organization_id.to_string(),
-            provider: provider.to_string(),
-            master_key_identifier: master_key_identifier.to_string(),
-            spec: DekSpec::Aes256 as i32,
-            aad: aad.to_vec(),
+        .issue_sandbox_artifact_dek(IssueSandboxArtifactDekRequest {
+            sandbox_id: sandbox_id.to_string(),
+            expected_org_id: expected_org.to_string(),
         })
         .await
         .map_err(|status| {
@@ -198,23 +185,24 @@ pub async fn issue_dek(
     })
 }
 
+/// Recover the plaintext DEK that [`issue_dek`] minted for `sandbox_id`.
+///
+/// The returned bytes live inside [`Zeroizing`] so dropping the value
+/// scrubs the memory — callers should keep the binding short-lived and
+/// drop it immediately after the encrypt/decrypt call completes.
 pub async fn unwrap_dek(
-    organization_id: OrgId,
-    provider: KekProvider,
-    master_key_identifier: &MasterKeyIdentifier,
+    sandbox_id: &SandboxId,
+    expected_org: OrgId,
     wrapped_dek: &[u8],
-    aad: &[u8],
 ) -> Result<Zeroizing<Vec<u8>>, UnwrapDekError> {
     let mut client = pplx_space_credmgr_client::connect_from_env()
         .await
         .map_err(|e| UnwrapDekError::Connect(e.to_string()))?;
     let mut resp = client
-        .unwrap_dek(UnwrapDekRequest {
-            organization_id: organization_id.to_string(),
-            provider: provider.to_string(),
-            master_key_identifier: master_key_identifier.to_string(),
+        .unwrap_sandbox_artifact_dek(UnwrapSandboxArtifactDekRequest {
+            sandbox_id: sandbox_id.to_string(),
+            expected_org_id: expected_org.to_string(),
             wrapped_dek: wrapped_dek.to_vec(),
-            aad: aad.to_vec(),
         })
         .await
         .map_err(|status| {

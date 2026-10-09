@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """
-Quick IssueDek / UnwrapDek round-trip against a local credmgr UDS.
+Quick sandbox artifact DEK round-trip against a local credmgr authority UDS.
 
-Must run as root (to seteuid into space-sbxmgr before connecting, so the
-credmgr's UdsPeerAuthorizer accepts the caller as Service(space-sbxmgr)):
+The authority needs database access, and SANDBOX_ID must name an existing
+sandbox whose organization has BYOK enabled. credmgr resolves the KEK and AAD
+from that sandbox; the caller names nothing else.
+
+Must run as root (to seteuid into a volume-manager identity before connecting,
+so the credmgr's UdsPeerAuthorizer accepts the caller):
 
   pip install grpcio grpcio-tools
-  sudo python3 scripts/tests/test-credmgr-dek.py [SOCKET] [--as space-tmplmgr]
-
-Override a registered backend/key with the PROVIDER and KEY environment variables.
+  sudo python3 scripts/tests/test-credmgr-dek.py SANDBOX_ID [SOCKET] [--as space-volmgr]
 """
 import argparse
 import os
@@ -23,12 +25,13 @@ from grpc_tools import protoc
 
 # Hardcoded fallbacks matching crates/libs/common/core/.../linux_identities.rs
 # (canonical source: infra/space/identity/node-identities.sh).
-FALLBACK_UIDS = {"space-sbxmgr": 950, "space-tmplmgr": 955}
+FALLBACK_UIDS = {"space-sbxmgr": 950, "space-volmgr": 964}
 
 ap = argparse.ArgumentParser()
+ap.add_argument("sandbox_id", type=uuid.UUID)
 ap.add_argument("socket", nargs="?", default="/space/run/credential-manager.sock")
 ap.add_argument("--as", dest="as_user", default="space-sbxmgr",
-                choices=["space-sbxmgr", "space-tmplmgr"])
+                choices=["space-sbxmgr", "space-volmgr"])
 args = ap.parse_args()
 
 if os.geteuid() != 0:
@@ -55,8 +58,6 @@ PROTOS = [
     PROTO_DIR / "credential/manager/v1/credential_manager.proto",
     PROTO_DIR / "credential/manager/v1/network_credential.proto",
 ]
-PROVIDER = os.environ.get("PROVIDER", "in-memory")
-KEY = os.environ.get("KEY", "test-key-1")
 
 out = Path(tempfile.mkdtemp(prefix="credmgr-py-"))
 if protoc.main(["protoc", f"-I{PROTO_DIR}", f"--python_out={out}",
@@ -76,32 +77,26 @@ channel = grpc.insecure_channel(
     options=[("grpc.default_authority", "localhost")],
 )
 client = rpc.CredentialManagerStub(channel)
-org = str(uuid.uuid4())
-aad = b"sandbox=test/record=1"
+sandbox = str(args.sandbox_id)
 
-print(f"→ IssueDek  org={org} provider={PROVIDER} key={KEY}")
-issued = client.IssueDek(pb.IssueDekRequest(
-    organization_id=org, provider=PROVIDER, master_key_identifier=KEY,
-    spec=pb.DEK_SPEC_AES_256, aad=aad,
-))
+print(f"→ IssueSandboxArtifactDek  sandbox={sandbox}")
+issued = client.IssueSandboxArtifactDek(pb.IssueSandboxArtifactDekRequest(sandbox_id=sandbox))
 print(f"  plaintext_dek={len(issued.plaintext_dek)}B  wrapped_dek={len(issued.wrapped_dek)}B")
 
-print("→ UnwrapDek")
-unwrapped = client.UnwrapDek(pb.UnwrapDekRequest(
-    organization_id=org, provider=PROVIDER, master_key_identifier=KEY,
-    wrapped_dek=issued.wrapped_dek, aad=aad,
+print("→ UnwrapSandboxArtifactDek")
+unwrapped = client.UnwrapSandboxArtifactDek(pb.UnwrapSandboxArtifactDekRequest(
+    sandbox_id=sandbox, wrapped_dek=issued.wrapped_dek,
 ))
 assert unwrapped.plaintext_dek == issued.plaintext_dek, "round-trip mismatch"
 print("✓ round-trip matches")
 
-print("→ UnwrapDek with wrong AAD (must fail PERMISSION_DENIED)")
+print("→ UnwrapSandboxArtifactDek for another sandbox (must fail)")
 try:
-    client.UnwrapDek(pb.UnwrapDekRequest(
-        organization_id=org, provider=PROVIDER, master_key_identifier=KEY,
-        wrapped_dek=issued.wrapped_dek, aad=b"different",
+    client.UnwrapSandboxArtifactDek(pb.UnwrapSandboxArtifactDekRequest(
+        sandbox_id=str(uuid.uuid4()), wrapped_dek=issued.wrapped_dek,
     ))
-    sys.exit("✗ wrong-AAD unwrap unexpectedly succeeded")
+    sys.exit("✗ cross-sandbox unwrap unexpectedly succeeded")
 except grpc.RpcError as e:
-    assert e.code() == grpc.StatusCode.PERMISSION_DENIED, e.code()
+    assert e.code() in (grpc.StatusCode.PERMISSION_DENIED, grpc.StatusCode.NOT_FOUND), e.code()
     print(f"  got {e.code().name}: {e.details()}")
 print("✓ all good")

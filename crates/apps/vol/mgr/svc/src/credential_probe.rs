@@ -1,7 +1,7 @@
 use anyhow::{Context as _, ensure};
 use pplx_space_credmgr_client::proto::{
-    IssueDekRequest, IssueIntermediateCertificateRequest, ResolveNetworkCredentialsRequest,
-    UnwrapDekRequest,
+    IssueIntermediateCertificateRequest, IssueSandboxArtifactDekRequest,
+    ResolveNetworkCredentialsRequest, UnwrapSandboxArtifactDekRequest,
 };
 use tonic::Code;
 
@@ -30,10 +30,12 @@ async fn check_client(
             .is_some_and(|e| e.code() == Code::PermissionDenied),
         "network credential RPC was not denied"
     );
-    // Malformed DEK requests stop at organization-id validation in both roles.
+    // Malformed DEK requests stop at sandbox-id validation in both roles.
     // An empty ExchangeToken request is unsafe: legacy mode ignores fields and
     // could mint credentials. Full token exchange remains a release gate.
-    let issue = client.issue_dek(IssueDekRequest::default()).await;
+    let issue = client
+        .issue_sandbox_artifact_dek(IssueSandboxArtifactDekRequest::default())
+        .await;
     let status = issue
         .err()
         .context("empty DEK request unexpectedly succeeded")?;
@@ -42,7 +44,9 @@ async fn check_client(
         "DEK probe expected INVALID_ARGUMENT, got {}",
         status.code()
     );
-    let unwrap = client.unwrap_dek(UnwrapDekRequest::default()).await;
+    let unwrap = client
+        .unwrap_sandbox_artifact_dek(UnwrapSandboxArtifactDekRequest::default())
+        .await;
     let status = unwrap
         .err()
         .context("empty unwrap request unexpectedly succeeded")?;

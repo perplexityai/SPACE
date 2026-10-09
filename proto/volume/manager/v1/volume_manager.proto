@@ -72,7 +72,7 @@ service VolumeManager {
     // (when encryption is set) the wrapped DEK — as ONE job keyed on the
     // caller-minted `artifact_id` before any upload runs, then uploads
     // the entries concurrently (each idempotent). It owns the DEK
-    // lifecycle: credmgr IssueDek once at submit time on the push side,
+    // lifecycle: credmgr IssueSandboxArtifactDek once at submit time on the push side,
     // wrap persisted in the job and returned; the caller records it in
     // its own durable store (e.g. cluster-api's sidecar) and supplies it
     // back on the pull side. The caller never sees the plaintext DEK.
@@ -81,7 +81,7 @@ service VolumeManager {
     // `artifact_id`, recovery never depends on the wrap coming back only
     // in the RPC response. Per-entry AAD (sandbox + role) keeps entries
     // non-interchangeable within an artifact; per-DEK isolation (one
-    // fresh `IssueDek` per artifact) keeps them non-interchangeable
+    // fresh `IssueSandboxArtifactDek` per artifact) keeps them non-interchangeable
     // across artifacts in the same sandbox. These RPCs are
     // transitional toward a general
     // StorageArtifact/EnsureReplica surface; new transfer shapes should
@@ -291,7 +291,7 @@ message PushFilesAsyncRequest {
     // Per-file entries of the artifact.
     repeated PushFileBatchEntry files = 2;
     // Optional encryption config. When set, vol-mgr calls credmgr
-    // IssueDek once at submit time, persists the wrap in the artifact
+    // IssueSandboxArtifactDek once at submit time, persists the wrap in the artifact
     // job, and returns it so the caller can record it in its own durable
     // store (e.g. cluster-api's sidecar) for `PullFilesAsync`. Absent =
     // plaintext (or zstd-only) batch.
@@ -300,7 +300,7 @@ message PushFilesAsyncRequest {
     // the job dedup key so retries are idempotent and recover the same
     // persisted wrap. Not bound into the wrap AAD — cross-artifact
     // non-interchangeability comes from per-DEK isolation (one fresh
-    // `IssueDek` per artifact), so callers don't need to persist
+    // `IssueSandboxArtifactDek` per artifact), so callers don't need to persist
     // `artifact_id` alongside the wrap. Required.
     string artifact_id = 4;
 }
@@ -327,13 +327,16 @@ message PushFileBatchEntry {
     SnapshotArtifact snapshot_artifact = 4;
 }
 
-// Identifying info for the KEK that wraps the per-batch DEK.
+// Requests envelope encryption of a sandbox artifact. Callers name no
+// KEK: credmgr wraps the artifact DEK under the sandbox owner's active
+// KEK. `organization_id` is the owner the caller expects; credmgr
+// refuses the request if the sandbox's durable owner differs.
 // `wrapped_dek` is *not* a field on push (vol-mgr issues the DEK on
 // the way in); it appears on the pull-side `BatchDecryptionConfig`.
 message BatchEncryptionConfig {
+    reserved 2, 3;
+    reserved "provider", "master_key_identifier";
     string organization_id = 1;
-    string provider = 2;
-    string master_key_identifier = 3;
 }
 
 message PushFilesAsyncResponse {
@@ -379,10 +382,12 @@ message PullFileBatchEntry {
     SnapshotArtifact snapshot_artifact = 5;
 }
 
+// `wrapped_dek` names its own KEK; `organization_id` is the expected
+// owner, as on `BatchEncryptionConfig`.
 message BatchDecryptionConfig {
+    reserved 2, 3;
+    reserved "provider", "master_key_identifier";
     string organization_id = 1;
-    string provider = 2;
-    string master_key_identifier = 3;
     bytes wrapped_dek = 4;
 }
 

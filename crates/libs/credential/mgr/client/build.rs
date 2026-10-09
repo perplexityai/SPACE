@@ -17,11 +17,11 @@ fn main() -> anyhow::Result<()> {
             "#[derive(zeroize::Zeroize, zeroize::ZeroizeOnDrop)]",
         )
         .type_attribute(
-            ".space.credential.manager.v1.IssueDekResponse",
+            ".space.credential.manager.v1.IssueSandboxArtifactDekResponse",
             "#[derive(zeroize::Zeroize, zeroize::ZeroizeOnDrop)]",
         )
         .type_attribute(
-            ".space.credential.manager.v1.UnwrapDekResponse",
+            ".space.credential.manager.v1.UnwrapSandboxArtifactDekResponse",
             "#[derive(zeroize::Zeroize, zeroize::ZeroizeOnDrop)]",
         )
         .type_attribute(
@@ -44,8 +44,8 @@ fn main() -> anyhow::Result<()> {
             ".space.credential.manager.v1.ExchangeTokenRequest",
             ".space.credential.manager.v1.ExchangeTokenResponse",
             ".space.credential.manager.v1.AwsCredentials",
-            ".space.credential.manager.v1.IssueDekResponse",
-            ".space.credential.manager.v1.UnwrapDekResponse",
+            ".space.credential.manager.v1.IssueSandboxArtifactDekResponse",
+            ".space.credential.manager.v1.UnwrapSandboxArtifactDekResponse",
             ".space.credential.manager.v1.EncryptRequest",
             ".space.credential.manager.v1.DecryptResponse",
             ".space.credential.manager.v1.GetOrIssueSandboxVolumeDekResponse",

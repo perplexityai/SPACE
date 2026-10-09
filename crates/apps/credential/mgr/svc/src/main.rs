@@ -29,7 +29,8 @@ struct Cli {
     /// Unix socket path for the gRPC service
     #[arg(long, default_value = CREDENTIAL_MANAGER_SOCKET)]
     socket: PathBuf,
-    /// Restricted volume-manager credential socket (ExchangeToken, IssueDek, UnwrapDek).
+    /// Restricted volume-manager credential socket (ExchangeToken and the
+    /// sandbox artifact-DEK RPCs).
     #[arg(long, conflicts_with = "no_uds")]
     volume_socket: Option<PathBuf>,
     /// TCP listen address for the control-plane deployment

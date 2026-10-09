@@ -3,6 +3,7 @@ use pplx_space_common_core::types::{OrgId, SandboxId, UserId};
 use std::collections::HashMap;
 
 use pplx_space_common_svc::PeerIdentity;
+use pplx_space_common_svc::core::types::{KekProvider, MasterKeyIdentifier};
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
@@ -378,6 +379,8 @@ async fn oversized_plaintext_is_rejected() {
 
 struct TestCredentialStore {
     owner: crate::credential_store::SandboxOwner,
+    /// Durable placement nodes reported for every sandbox.
+    nodes: Vec<crate::storage_vend_store::SandboxNodeIdentity>,
 }
 
 const PERSISTED_WRAP_INVALID_KEY_DETAIL: &str = "provider rejected persisted key";
@@ -425,6 +428,16 @@ impl CredentialStore for TestCredentialStore {
         crate::credential_store::CredentialStoreError,
     > {
         Ok(Some(self.owner))
+    }
+
+    async fn sandbox_placement_nodes(
+        &self,
+        _sandbox_id: SandboxId,
+    ) -> Result<
+        Vec<crate::storage_vend_store::SandboxNodeIdentity>,
+        crate::credential_store::CredentialStoreError,
+    > {
+        Ok(self.nodes.clone())
     }
 }
 
@@ -507,6 +520,7 @@ fn volume_service_byok(
     .with_volume_wrap_store(store);
     if let Some(owner_org) = sandbox_owner_org {
         service = service.with_credential_store(Arc::new(TestCredentialStore {
+            nodes: Vec::new(),
             owner: crate::credential_store::SandboxOwner {
                 user_id: UserId::new(),
                 org_id: owner_org,
@@ -583,6 +597,7 @@ async fn persisted_volume_wrap_invalid_key_is_machine_readable() {
     }))
     .with_volume_wrap_store(store)
     .with_credential_store(Arc::new(TestCredentialStore {
+        nodes: Vec::new(),
         owner: crate::credential_store::SandboxOwner {
             user_id: UserId::new(),
             org_id: org,
@@ -770,6 +785,7 @@ async fn issued_volume_dek_loads_after_byok_disabled() {
             }))
             .with_volume_wrap_store(store.clone())
             .with_credential_store(Arc::new(TestCredentialStore {
+                nodes: Vec::new(),
                 owner: crate::credential_store::SandboxOwner {
                     user_id: UserId::new(),
                     org_id: org,
@@ -920,6 +936,7 @@ fn volume_service_with_kek_store(
     .with_kek_store(kek_store)
     .with_volume_wrap_store(volume_store)
     .with_credential_store(Arc::new(TestCredentialStore {
+        nodes: Vec::new(),
         owner: crate::credential_store::SandboxOwner {
             user_id: UserId::new(),
             org_id: owner_org,
@@ -1206,9 +1223,8 @@ async fn encrypt_lazily_provisions_when_a_provisioner_is_installed() {
     );
 }
 
-/// The node agent proxies these RPCs for sandbox-manager, volume-manager, and
-/// template-manager under its own credential, so its identity must clear each
-/// one's TCP allow-list.
+/// The node agent proxies these RPCs for node-local services under its own
+/// credential, so its identity must clear each one's TCP allow-list.
 fn test_k8s_identity(service: ClientService) -> crate::auth::K8sIdentity {
     crate::auth::K8sIdentity::from_token_review(
         service,
@@ -1228,8 +1244,14 @@ fn node_agent_is_authorized_on_the_rpcs_it_proxies() {
             ALLOW_RESOLVE_NETWORK_CREDENTIAL_SERVICES,
         ),
         ("ExchangeToken", ALLOW_EXCHANGE_TOKEN_SERVICES),
-        ("IssueDek", ALLOW_ISSUE_DEK_SERVICES),
-        ("UnwrapDek", ALLOW_UNWRAP_DEK_SERVICES),
+        (
+            "IssueSandboxArtifactDek",
+            ALLOW_SANDBOX_ARTIFACT_DEK_SERVICES,
+        ),
+        (
+            "UnwrapSandboxArtifactDek",
+            ALLOW_SANDBOX_ARTIFACT_DEK_SERVICES,
+        ),
     ] {
         CallerResolver::new(UdsPeerAuthorizer::new("space-credential-manager", []))
             .authorize_caller(
@@ -1257,8 +1279,16 @@ fn build_manager_may_exchange_storage_credentials_only() {
         .expect("build-manager must be able to exchange template-storage credentials");
 
     for (operation, uds_allow, service_allow) in [
-        ("IssueDek", ALLOW_ISSUE_DEK, ALLOW_ISSUE_DEK_SERVICES),
-        ("UnwrapDek", ALLOW_UNWRAP_DEK, ALLOW_UNWRAP_DEK_SERVICES),
+        (
+            "IssueSandboxArtifactDek",
+            ALLOW_SANDBOX_ARTIFACT_DEK,
+            ALLOW_SANDBOX_ARTIFACT_DEK_SERVICES,
+        ),
+        (
+            "UnwrapSandboxArtifactDek",
+            ALLOW_SANDBOX_ARTIFACT_DEK,
+            ALLOW_SANDBOX_ARTIFACT_DEK_SERVICES,
+        ),
         ("Encrypt", ALLOW_ENVELOPE, ALLOW_ENVELOPE_SERVICES),
         ("Decrypt", ALLOW_ENVELOPE, ALLOW_ENVELOPE_SERVICES),
     ] {
@@ -1748,8 +1778,8 @@ fn volume_principal_has_only_transfer_credential_permissions() {
     let caller = ResolvedCaller::UdsPeer(PeerIdentity::new(users::SPACE_VOLMGR.uid, 951, Some(1)));
     for (operation, allow, expected) in [
         ("ExchangeToken", ALLOW_EXCHANGE_TOKEN, true),
-        ("IssueDek", ALLOW_ISSUE_DEK, true),
-        ("UnwrapDek", ALLOW_UNWRAP_DEK, true),
+        ("IssueSandboxArtifactDek", ALLOW_SANDBOX_ARTIFACT_DEK, true),
+        ("UnwrapSandboxArtifactDek", ALLOW_SANDBOX_ARTIFACT_DEK, true),
         ("Encrypt", ALLOW_ENVELOPE, false),
         ("Decrypt", ALLOW_ENVELOPE, false),
         ("GetOrIssueSandboxVolumeDek", ALLOW_VOLUME_DEK, false),
@@ -1772,4 +1802,240 @@ fn volume_principal_has_only_transfer_credential_permissions() {
             );
         }
     }
+}
+
+/// A sandbox-artifact service whose credential store reports `owner_org` as
+/// every sandbox's owner and `nodes` as its durable placement.
+fn artifact_service(
+    owner_org: OrgId,
+    byok_enabled: bool,
+    nodes: Vec<crate::storage_vend_store::SandboxNodeIdentity>,
+    kek_rows: HashMap<(Uuid, OrgId), KekRecord>,
+) -> CredentialManagerService {
+    CredentialManagerService::new(
+        Arc::new(InMemoryKeyWrapper::new()),
+        PeerProcessCheckMode::Off,
+    )
+    .with_kek_store(Arc::new(TestKekStore { rows: kek_rows }))
+    .with_credential_store(Arc::new(TestCredentialStore {
+        owner: crate::credential_store::SandboxOwner {
+            user_id: UserId::new(),
+            org_id: owner_org,
+            byok_enabled,
+        },
+        nodes,
+    }))
+}
+
+/// The node that [`test_k8s_identity`] binds every test token to.
+fn test_identity_node() -> crate::storage_vend_store::SandboxNodeIdentity {
+    crate::storage_vend_store::SandboxNodeIdentity {
+        name: pplx_space_common_svc::core::types::K8sNodeName::parse("worker-node").unwrap(),
+        uid: pplx_space_common_svc::core::types::K8sNodeUid::parse("worker-node-uid").unwrap(),
+    }
+}
+
+fn other_node() -> crate::storage_vend_store::SandboxNodeIdentity {
+    crate::storage_vend_store::SandboxNodeIdentity {
+        name: pplx_space_common_svc::core::types::K8sNodeName::parse("worker-other").unwrap(),
+        uid: pplx_space_common_svc::core::types::K8sNodeUid::parse("worker-other-uid").unwrap(),
+    }
+}
+
+fn issue_artifact(sandbox: SandboxId) -> IssueSandboxArtifactDekRequest {
+    IssueSandboxArtifactDekRequest {
+        sandbox_id: sandbox.to_string(),
+        expected_org_id: String::new(),
+    }
+}
+
+fn unwrap_artifact(sandbox: SandboxId, wrapped_dek: &[u8]) -> UnwrapSandboxArtifactDekRequest {
+    UnwrapSandboxArtifactDekRequest {
+        sandbox_id: sandbox.to_string(),
+        expected_org_id: String::new(),
+        wrapped_dek: wrapped_dek.to_vec(),
+    }
+}
+
+/// credmgr resolves the KEK and AAD itself: the wrap it returns names the
+/// org's active KEK, and unwrapping it for the same sandbox recovers the DEK.
+#[tokio::test]
+async fn sandbox_artifact_dek_round_trips_under_the_owner_kek() {
+    let org = OrgId::new();
+    let (row_key, record) = kek_row(org, false);
+    let service = artifact_service(
+        org,
+        true,
+        vec![test_identity_node()],
+        HashMap::from([(row_key, record.clone())]),
+    );
+    let sandbox = SandboxId::new();
+
+    let mut issued = service
+        .issue_sandbox_artifact_dek(agent_request(issue_artifact(sandbox)))
+        .await
+        .expect("placement node may issue")
+        .into_inner();
+    let (cmk_id, _) = envelope::decode_wrapped_dek(&issued.wrapped_dek).unwrap();
+    assert_eq!(cmk_id, record.cmk_id);
+    assert_eq!(issued.plaintext_dek.len(), 32);
+
+    let mut unwrapped = service
+        .unwrap_sandbox_artifact_dek(agent_request(unwrap_artifact(sandbox, &issued.wrapped_dek)))
+        .await
+        .expect("placement node may unwrap")
+        .into_inner();
+    assert_eq!(
+        std::mem::take(&mut unwrapped.plaintext_dek),
+        std::mem::take(&mut issued.plaintext_dek)
+    );
+}
+
+/// The unwrap-oracle regression: a node credential agent on a node that is not
+/// the sandbox's placement cannot issue or unwrap that sandbox's artifact DEK,
+/// even holding a valid wrap.
+#[tokio::test]
+async fn sandbox_artifact_dek_refuses_a_node_outside_the_placement() {
+    let org = OrgId::new();
+    let rows = HashMap::from([kek_row(org, false)]);
+    let sandbox = SandboxId::new();
+    let issued = artifact_service(org, true, vec![test_identity_node()], rows.clone())
+        .issue_sandbox_artifact_dek(agent_request(issue_artifact(sandbox)))
+        .await
+        .unwrap()
+        .into_inner();
+
+    let elsewhere = artifact_service(org, true, vec![other_node()], rows);
+    let issue = elsewhere
+        .issue_sandbox_artifact_dek(agent_request(issue_artifact(sandbox)))
+        .await
+        .unwrap_err();
+    assert_eq!(issue.code(), tonic::Code::PermissionDenied);
+    let unwrap = elsewhere
+        .unwrap_sandbox_artifact_dek(agent_request(unwrap_artifact(sandbox, &issued.wrapped_dek)))
+        .await
+        .unwrap_err();
+    assert_eq!(unwrap.code(), tonic::Code::PermissionDenied);
+}
+
+/// The AAD is derived from the named sandbox, so a wrap lifted from one
+/// sandbox cannot be unwrapped by naming another sandbox the caller is placed
+/// on.
+#[tokio::test]
+async fn sandbox_artifact_wrap_does_not_unwrap_for_another_sandbox() {
+    let org = OrgId::new();
+    let service = artifact_service(
+        org,
+        true,
+        vec![test_identity_node()],
+        HashMap::from([kek_row(org, false)]),
+    );
+    let issued = service
+        .issue_sandbox_artifact_dek(agent_request(issue_artifact(SandboxId::new())))
+        .await
+        .unwrap()
+        .into_inner();
+    let status = service
+        .unwrap_sandbox_artifact_dek(agent_request(unwrap_artifact(
+            SandboxId::new(),
+            &issued.wrapped_dek,
+        )))
+        .await
+        .unwrap_err();
+    assert_eq!(status.code(), tonic::Code::PermissionDenied);
+}
+
+/// A wrap whose envelope names another organization's KEK is refused before
+/// any backend unwrap: credmgr loads only the sandbox owner's KEKs.
+#[tokio::test]
+async fn sandbox_artifact_wrap_naming_a_foreign_kek_is_refused() {
+    let victim = OrgId::new();
+    let attacker = OrgId::new();
+    let sandbox = SandboxId::new();
+    let rows = HashMap::from([kek_row(victim, false), kek_row(attacker, false)]);
+    let victim_wrap = artifact_service(victim, true, vec![test_identity_node()], rows.clone())
+        .issue_sandbox_artifact_dek(root_request(issue_artifact(sandbox)))
+        .await
+        .unwrap()
+        .into_inner()
+        .wrapped_dek
+        .clone();
+
+    let status = artifact_service(attacker, true, vec![test_identity_node()], rows)
+        .unwrap_sandbox_artifact_dek(root_request(unwrap_artifact(sandbox, &victim_wrap)))
+        .await
+        .unwrap_err();
+    assert_eq!(status.code(), tonic::Code::PermissionDenied);
+    assert!(status.message().contains("KEK"), "{}", status.message());
+}
+
+#[tokio::test]
+async fn sandbox_artifact_dek_requires_byok_and_the_expected_owner() {
+    let org = OrgId::new();
+    let sandbox = SandboxId::new();
+    let non_byok = artifact_service(org, false, Vec::new(), HashMap::from([kek_row(org, false)]));
+    let status = non_byok
+        .issue_sandbox_artifact_dek(root_request(issue_artifact(sandbox)))
+        .await
+        .unwrap_err();
+    assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+
+    let byok = artifact_service(org, true, Vec::new(), HashMap::from([kek_row(org, false)]));
+    let mut request = issue_artifact(sandbox);
+    request.expected_org_id = OrgId::new().to_string();
+    let status = byok
+        .issue_sandbox_artifact_dek(root_request(request))
+        .await
+        .unwrap_err();
+    assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+}
+
+#[tokio::test]
+async fn sandbox_artifact_dek_refuses_plaintext_and_non_volume_services() {
+    let org = OrgId::new();
+    let service = artifact_service(
+        org,
+        true,
+        vec![test_identity_node()],
+        HashMap::from([kek_row(org, false)]),
+    );
+    let sandbox = SandboxId::new();
+    let status = service
+        .issue_sandbox_artifact_dek(plaintext_request(issue_artifact(sandbox)))
+        .await
+        .unwrap_err();
+    assert_eq!(status.code(), tonic::Code::PermissionDenied);
+
+    for client in [
+        ClientService::SandboxManager,
+        ClientService::TemplateManager,
+    ] {
+        let mut request = Request::new(issue_artifact(sandbox));
+        request
+            .extensions_mut()
+            .insert(crate::tcp_auth::TcpCallerIdentity::K8sJwt(
+                test_k8s_identity(client),
+            ));
+        let status = service
+            .issue_sandbox_artifact_dek(request)
+            .await
+            .unwrap_err();
+        assert_eq!(status.code(), tonic::Code::PermissionDenied, "{client:?}");
+    }
+
+    let template_manager = ResolvedCaller::UdsPeer(PeerIdentity::new(
+        users::SPACE_TMPLMGR.uid,
+        users::SPACE_TMPLMGR.uid,
+        Some(1),
+    ));
+    let status = service
+        .caller_resolver
+        .authorize_caller(
+            &template_manager,
+            "IssueSandboxArtifactDek",
+            ALLOW_SANDBOX_ARTIFACT_DEK,
+            &[],
+        )
+        .unwrap_err();
+    assert_eq!(status.code(), tonic::Code::PermissionDenied);
 }
