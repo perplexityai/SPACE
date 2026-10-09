@@ -38,6 +38,27 @@ pub(in crate::service) fn teardown_suspend_event_trigger(
     }
 }
 
+/// How a terminal local state affects a generation suspend request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::service) enum TerminalTeardownSuspend {
+    /// Not terminal: keep preparing the request.
+    Open,
+    /// Deleting: the job is closed and the delete's receipt will release the
+    /// execution.
+    AwaitingDelete,
+}
+
+fn awaiting_delete_response(
+    started_at: std::time::Instant,
+) -> Response<PrepareTeardownSuspendResponse> {
+    teardown_suspend_prepare_response(
+        TeardownSuspendOutcome::Pending,
+        Some("sandbox is deleting; its delete receipt releases this execution".to_string()),
+        pplx_space_metrics::sandbox::worker::TeardownSuspendPrepareOutcome::Pending,
+        started_at,
+    )
+}
+
 fn teardown_suspend_prepare_response(
     outcome: TeardownSuspendOutcome,
     reason: Option<String>,
@@ -165,7 +186,11 @@ impl SandboxManagerService {
                     metric_started_at,
                 ));
             }
-            self.reject_terminal_teardown_suspend(&sandbox_id_string, execution_generation)?;
+            if self.close_terminal_teardown_suspend(&sandbox_id_string, execution_generation)?
+                == TerminalTeardownSuspend::AwaitingDelete
+            {
+                return Ok(awaiting_delete_response(metric_started_at));
+            }
             return Ok(teardown_suspend_prepare_response(
                 TeardownSuspendOutcome::Pending,
                 Some("sandbox record is not present on this node".to_string()),
@@ -187,7 +212,11 @@ impl SandboxManagerService {
             Some(generation) => generation,
             None if status.state == SandboxState::Suspended => execution_generation,
             None => {
-                self.reject_terminal_teardown_suspend(&sandbox_id_string, execution_generation)?;
+                if self.close_terminal_teardown_suspend(&sandbox_id_string, execution_generation)?
+                    == TerminalTeardownSuspend::AwaitingDelete
+                {
+                    return Ok(awaiting_delete_response(metric_started_at));
+                }
                 return Ok(teardown_suspend_prepare_response(
                     TeardownSuspendOutcome::Pending,
                     Some("local runtime execution generation is not available".to_string()),
@@ -240,7 +269,11 @@ impl SandboxManagerService {
                 metric_started_at,
             ));
         }
-        self.reject_terminal_teardown_suspend(&sandbox_id_string, execution_generation)?;
+        if self.close_terminal_teardown_suspend(&sandbox_id_string, execution_generation)?
+            == TerminalTeardownSuspend::AwaitingDelete
+        {
+            return Ok(awaiting_delete_response(metric_started_at));
+        }
         if action == TeardownSuspendAction::BeginOrJoin
             && matches!(status.state, SandboxState::Started | SandboxState::Paused)
         {
@@ -359,11 +392,19 @@ impl SandboxManagerService {
         ))
     }
 
-    pub(super) fn reject_terminal_teardown_suspend(
+    /// Closes this generation's suspend job when the sandbox is terminal.
+    ///
+    /// A quarantined sandbox, a missing row and a failed job that may not retry
+    /// are refused, so callers stop polling without release proof. A deleting
+    /// sandbox's job is closed too, but its delete commits a receipt that
+    /// releases this execution, so callers are told to keep polling. Refusing
+    /// it instead raced the shim's single exit-path release, which containerd
+    /// does not retry, and left the generation's pod unreleased.
+    pub(super) fn close_terminal_teardown_suspend(
         &self,
         sandbox_id: &str,
         generation: pplx_space_common_core::types::ExecutionGeneration,
-    ) -> Result<(), Status> {
+    ) -> Result<TerminalTeardownSuspend, Status> {
         let db = self.db_conn()?;
         let state = crate::db::get_sandbox(&db, sandbox_id)
             .map_err(|error| Status::internal(format!("db error: {error}")))?
@@ -389,14 +430,16 @@ impl SandboxManagerService {
             }
             _ => None,
         };
-        if let Some(reason) = reason {
-            crate::db::fail_teardown_suspend_operation(&db, sandbox_id, generation, reason)
-                .map_err(|error| {
-                    Status::internal(format!("persist terminal teardown suspend: {error}"))
-                })?;
-            return Err(Status::failed_precondition(reason.as_str()));
+        let Some(reason) = reason else {
+            return Ok(TerminalTeardownSuspend::Open);
+        };
+        crate::db::fail_teardown_suspend_operation(&db, sandbox_id, generation, reason).map_err(
+            |error| Status::internal(format!("persist terminal teardown suspend: {error}")),
+        )?;
+        if reason == crate::db::TeardownSuspendFailure::Deleting {
+            return Ok(TerminalTeardownSuspend::AwaitingDelete);
         }
-        Ok(())
+        Err(Status::failed_precondition(reason.as_str()))
     }
 
     pub(in crate::service) fn spawn_teardown_suspend_driver(

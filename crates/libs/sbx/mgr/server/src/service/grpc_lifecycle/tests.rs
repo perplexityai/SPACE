@@ -1105,11 +1105,9 @@ async fn teardown_suspend_terminal_driver_failures_stop_polling_without_release_
         insert_test_sandbox, prepare_teardown_suspend_request,
     };
     use pplx_space_common_core::types::ExecutionGeneration;
-    for state in [
-        Some(SandboxState::Quarantined),
-        Some(SandboxState::Deleting),
-        None,
-    ] {
+    // A deleting sandbox keeps polling for its delete receipt; see
+    // `teardown_suspend_keeps_polling_until_a_deleting_sandbox_commits_its_delete`.
+    for state in [Some(SandboxState::Quarantined), None] {
         let conn = crate::db::test_conn();
         let sandbox_id = SandboxId::new();
         let id = sandbox_id.to_string();
@@ -1155,6 +1153,91 @@ async fn teardown_suspend_terminal_driver_failures_stop_polling_without_release_
                 .unwrap_err();
             assert_eq!(error.code(), tonic::Code::FailedPrecondition, "{state:?}");
         }
+    }
+}
+
+#[tokio::test]
+async fn teardown_suspend_keeps_polling_until_a_deleting_sandbox_commits_its_delete() {
+    use crate::service::tests::service_tests::{
+        insert_test_sandbox, prepare_teardown_suspend_request,
+    };
+    use pplx_space_common_core::types::ExecutionGeneration;
+    let conn = crate::db::test_conn();
+    let sandbox_id = SandboxId::new();
+    let id = sandbox_id.to_string();
+    insert_test_sandbox(&conn, &id, SandboxState::Paused);
+    let generation = ExecutionGeneration::new(7).unwrap();
+    crate::db::begin_teardown_suspend_operation(&conn, &id, generation).unwrap();
+    conn.execute(
+        "UPDATE sandboxes SET state = ?1 WHERE id = ?2",
+        rusqlite::params![SandboxState::Deleting.as_str(), id],
+    )
+    .unwrap();
+    let service = SandboxManagerService::new(conn);
+    let actions = [
+        crate::proto::TeardownSuspendAction::BeginOrJoin,
+        crate::proto::TeardownSuspendAction::ObserveOnly,
+    ];
+
+    // The shim releases a stopped task once, on containerd's exit path, and
+    // nothing retries a refusal. While the delete is in flight it must hear
+    // Pending, not FailedPrecondition.
+    for action in actions {
+        let response = service
+            .prepare_teardown_suspend(crate::service::activation_support::internal_request(
+                prepare_teardown_suspend_request(id.clone(), generation.get(), action),
+            ))
+            .await
+            .expect("a deleting sandbox keeps the caller polling")
+            .into_inner();
+        assert_eq!(
+            crate::proto::TeardownSuspendOutcome::try_from(response.outcome).unwrap(),
+            crate::proto::TeardownSuspendOutcome::Pending,
+            "{action:?}"
+        );
+    }
+    {
+        let db = service.db.lock().unwrap();
+        // The job is still closed, so no driver restarts for the deleting row.
+        assert_eq!(
+            crate::db::latest_teardown_suspend_operation(&db, &id)
+                .unwrap()
+                .unwrap()
+                .status,
+            crate::db::TeardownSuspendOperationStatus::Failed
+        );
+        // The delete commits its receipt and removes the row together.
+        let deleted_at = i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO sandbox_execution_delete_receipts (
+                 sandbox_id, execution_generation, deleted_at
+             ) VALUES (?1, ?2, ?3)",
+            rusqlite::params![id, generation.get(), deleted_at],
+        )
+        .unwrap();
+        db.execute("DELETE FROM sandboxes WHERE id = ?1", [&id])
+            .unwrap();
+    }
+
+    for action in actions {
+        let response = service
+            .prepare_teardown_suspend(crate::service::activation_support::internal_request(
+                prepare_teardown_suspend_request(id.clone(), generation.get(), action),
+            ))
+            .await
+            .expect("the delete receipt releases the execution")
+            .into_inner();
+        assert_eq!(
+            crate::proto::TeardownSuspendOutcome::try_from(response.outcome).unwrap(),
+            crate::proto::TeardownSuspendOutcome::Deleted,
+            "{action:?}"
+        );
     }
 }
 
@@ -1463,7 +1546,7 @@ async fn teardown_suspend_pause_failure_recovery_allows_same_generation_retry() 
         let service = SandboxManagerService::new(conn);
         assert_eq!(
             service
-                .reject_terminal_teardown_suspend(&id, generation)
+                .close_terminal_teardown_suspend(&id, generation)
                 .unwrap_err()
                 .code(),
             tonic::Code::FailedPrecondition
