@@ -3,7 +3,7 @@ use std::collections::HashMap;
 
 #[test]
 fn package_index_arguments_use_only_explicit_recipe_environment() {
-    let env = HashMap::from([
+    let env = pplx_space_common_core::types::EnvMap::try_from(HashMap::from([
         ("PACKAGE_TOKEN".into(), "token$NOT_EXPANDED".into()),
         (
             "PACKAGE_INDEX_URL".into(),
@@ -13,7 +13,9 @@ fn package_index_arguments_use_only_explicit_recipe_environment() {
             "CODEARTIFACT_INDEX_URL".into(),
             "https://registry.example/simple".into(),
         ),
-    ]);
+    ]))
+    .unwrap();
+    let env = super::StepEnvironment::from_env(&env);
 
     for (input, expected) in [
         (

@@ -274,7 +274,7 @@ trait BuildBackend: Send + Sync {
     async fn build(
         &self,
         recipe_label: &str,
-        recipe: Recipe,
+        recipe: pplx_space_build_mgr::PreparedRecipe,
         template_id: &str,
         job_id: &pplx_space_common_jobs::JobId,
         template_org: Option<TemplateOrg>,
@@ -309,14 +309,14 @@ impl BuildBackend for RuntimeBuildBackend {
     async fn build(
         &self,
         recipe_label: &str,
-        recipe: Recipe,
+        recipe: pplx_space_build_mgr::PreparedRecipe,
         template_id: &str,
         job_id: &pplx_space_common_jobs::JobId,
         template_org: Option<TemplateOrg>,
     ) -> Result<BuildOutcome, BuildError> {
         TemplateBuilder::new()
             .with_caller_org(template_org.map(TemplateOrg::org_id))
-            .build(recipe_label, recipe, template_id, job_id)
+            .build_prepared(recipe_label, recipe, template_id, job_id)
             .await
     }
 
@@ -365,8 +365,10 @@ impl JobExecutor for BuildExecutor {
         let recipe: Recipe = proto_recipe
             .try_into()
             .map_err(|error| JobError::permanent(format!("invalid recipe payload: {error}")))?;
+        let recipe = pplx_space_build_mgr::PreparedRecipe::new(recipe)
+            .map_err(|error| JobError::permanent(error.to_string()))?;
         let mut materialized = HashSet::new();
-        for step in &recipe.steps {
+        for step in &recipe.recipe().steps {
             let Step::Copy {
                 payload: CopyPayload::BlobSha256(sha256),
                 ..

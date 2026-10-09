@@ -1,5 +1,6 @@
 use super::*;
 use pplx_space_common_core::types::{ArtifactVersion, Digest};
+use std::collections::HashMap;
 
 const KERNEL_VERSION: &str = "vmlinux-6.1.200-custom";
 const KERNEL_DIGEST: &str =

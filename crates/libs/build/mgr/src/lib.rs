@@ -12,7 +12,6 @@ mod ssh;
 mod storage;
 mod vm;
 
-use std::collections::HashMap;
 use std::fmt;
 use std::fs;
 use std::future::Future;
@@ -44,7 +43,8 @@ use pplx_space_template_mgr_client::proto::{
 use tempfile::TempDir;
 use tracing::Instrument as _;
 
-pub use environment::BuildEnvironmentError;
+use environment::StepEnvironment;
+pub use environment::{BuildEnvironmentError, PreparedRecipe};
 pub use pplx_space_common_core::types::SystemPublicationGrantId;
 pub use publish::{
     PublishError, TemplateOrg, TemplatePublication, publish_build, register_build_template,
@@ -545,22 +545,32 @@ impl TemplateBuilder {
         template_id: &str,
         job_id: &JobId,
     ) -> Result<BuildOutcome, BuildError> {
-        // Resolve every export before starting a VM or running any recipe steps.
-        // Keep values out of the recipe persisted in the job database.
-        let step_exports = recipe
-            .steps
-            .iter()
-            .map(|step| environment::resolve_refs(&step.env_refs))
-            .collect::<Result<Vec<_>, _>>()?;
+        self.build_prepared(
+            recipe_label,
+            PreparedRecipe::new(recipe)?,
+            template_id,
+            job_id,
+        )
+        .await
+    }
+
+    pub async fn build_prepared(
+        &self,
+        recipe_label: &str,
+        prepared: PreparedRecipe,
+        template_id: &str,
+        job_id: &JobId,
+    ) -> Result<BuildOutcome, BuildError> {
+        let recipe = prepared.recipe();
         let (base, base_raw, oci_image) = match &recipe.origin {
             Origin::FromScratch { .. } => {
                 build_phase(template_id, BuildPhase::ValidateRecipe, async {
-                    validate_scratch_recipe(&recipe)?;
+                    validate_scratch_recipe(recipe)?;
                     Ok::<(), BuildError>(())
                 })
                 .await?;
                 return self
-                    .build_from_scratch(recipe_label, template_id, job_id, &recipe)
+                    .build_from_scratch(recipe_label, template_id, job_id, recipe)
                     .await;
             }
             Origin::FromTemplate { base, base_raw } => (base.clone(), base_raw.clone(), None),
@@ -827,7 +837,7 @@ impl TemplateBuilder {
         }
 
         let runtime_build = match build_phase(template_id, BuildPhase::ConfigureGuest, async {
-            let runtime = runtime::RuntimeBuild::prepare(&ssh, &recipe).await?;
+            let runtime = runtime::RuntimeBuild::prepare(&ssh, recipe).await?;
             configure_guest_apt_mirror(&ssh)?;
             Ok::<_, BuildError>(runtime)
         })
@@ -843,8 +853,9 @@ impl TemplateBuilder {
         };
 
         // Execute steps
-        let mut env_acc: HashMap<String, String> = HashMap::new();
-        for (i, (named_step, exports)) in recipe.steps.iter().zip(&step_exports).enumerate() {
+        for (i, (named_step, step_env)) in
+            recipe.steps.iter().zip(prepared.environments()).enumerate()
+        {
             let step_num = i + 1;
             let step_count = recipe.steps.len();
             println!("\n=== Step {step_num}/{}: {} ===", step_count, named_step);
@@ -864,7 +875,7 @@ impl TemplateBuilder {
             } else {
                 step_span.in_scope(|| {
                     tracing::info!("build recipe step started");
-                    execute_step(named_step, &ssh, &mut env_acc, exports)
+                    execute_step(named_step, &ssh, &step_env)
                 })
             };
             let step_metric_result =
@@ -925,11 +936,11 @@ impl TemplateBuilder {
             // see GUEST_FLUSH_CMD. Best-effort: if the flush call fails we still
             // attempt the exit, but log it since a failed flush is exactly the
             // condition that can drop the last write.
-            if let Err(e) = ssh.exec(GUEST_FLUSH_CMD, "root", &HashMap::new()) {
+            if let Err(e) = ssh.exec(GUEST_FLUSH_CMD, "root", &StepEnvironment::default()) {
                 tracing::warn!(error = %e, "guest pre-shutdown sync failed; last write may not be durable");
                 eprintln!("Guest pre-shutdown sync failed: {e}");
             }
-            if let Err(e) = ssh.exec(GUEST_EXIT_CMD, "root", &HashMap::new()) {
+            if let Err(e) = ssh.exec(GUEST_EXIT_CMD, "root", &StepEnvironment::default()) {
                 tracing::warn!(error = %e, "guest exit request failed; force cleanup may be needed");
                 eprintln!("Guest exit request failed, force cleaning: {e}");
             }
@@ -1770,29 +1781,20 @@ fn configure_guest_apt_mirror(ssh: &SshSession) -> Result<(), SshError> {
            fi\n\
          fi"
     );
-    ssh.exec(&cmd, "root", &HashMap::new())
+    ssh.exec(&cmd, "root", &StepEnvironment::default())
 }
 
 /// Execute a single build step.
 fn execute_step(
     named_step: &recipe::NamedStep,
     ssh: &SshSession,
-    env_acc: &mut HashMap<String, String>,
-    exports: &HashMap<String, String>,
+    step_env: &StepEnvironment<'_>,
 ) -> Result<(), SshError> {
-    let mut step_env = env_acc.clone();
-    step_env.extend(exports.clone());
-
     match &named_step.step {
         Step::SetRuntime(_) | Step::ClearRuntime => Err(SshError::CopyPayload(
             "runtime steps require the finalization owner".into(),
         )),
-        Step::Env { vars } => {
-            for (k, v) in vars {
-                env_acc.insert(k.clone(), v.clone());
-            }
-            Ok(())
-        }
+        Step::Env { .. } => Ok(()),
         Step::PackageInstall {
             manager: PackageManager::Apt,
             packages,
@@ -1813,7 +1815,7 @@ fn execute_step(
                  || (echo 'apt retry 1...' && sleep 10 && {clean} && apt-get update && {install}) \
                  || (echo 'apt retry 2...' && sleep 30 && {clean} && apt-get update && {install})"
             );
-            ssh.exec(&cmd, "root", &step_env)
+            ssh.exec(&cmd, "root", step_env)
         }
         Step::PackageInstall {
             manager: PackageManager::Pip,
@@ -1822,7 +1824,7 @@ fn execute_step(
         } => {
             let resolved_extra: Vec<String> = extra_args
                 .iter()
-                .map(|a| resolve_env_var_in_string(a, &step_env))
+                .map(|a| resolve_env_var_in_string(a, step_env))
                 .collect();
 
             let extra = if resolved_extra.is_empty() {
@@ -1838,7 +1840,7 @@ fn execute_step(
             let cmd = format!(
                 "python3 -m pip install --quiet --break-system-packages --root-user-action=ignore{extra} {pkgs}"
             );
-            ssh.exec(&cmd, "root", &step_env)
+            ssh.exec(&cmd, "root", step_env)
         }
         Step::PackageInstall {
             manager: PackageManager::Npm,
@@ -1854,7 +1856,7 @@ fn execute_step(
                  || (echo 'npm retry 1...' && sleep 15 && {clean} && {install}) \
                  || (echo 'npm retry 2...' && sleep 30 && {clean} && {install})"
             );
-            ssh.exec(&cmd, DEFAULT_GUEST_USER, &step_env)
+            ssh.exec(&cmd, DEFAULT_GUEST_USER, step_env)
         }
         Step::PackageInstall {
             manager: PackageManager::NpmGlobal,
@@ -1869,11 +1871,11 @@ fn execute_step(
                  || (echo 'npm retry 1...' && sleep 15 && {clean} && {install}) \
                  || (echo 'npm retry 2...' && sleep 30 && {clean} && {install})"
             );
-            ssh.exec(&cmd, "root", &step_env)
+            ssh.exec(&cmd, "root", step_env)
         }
         Step::Run { command, user } => {
             let user = user.as_deref().unwrap_or("root");
-            ssh.exec(command, user, &step_env)
+            ssh.exec(command, user, step_env)
         }
         Step::Copy {
             payload,
@@ -1886,10 +1888,10 @@ fn execute_step(
         Step::PlaywrightInstall { browsers } => {
             let browsers_str = browsers.join(" ");
             let cmd_deps = format!("npx playwright install-deps {browsers_str}");
-            ssh.exec(&cmd_deps, "root", &step_env)?;
+            ssh.exec(&cmd_deps, "root", step_env)?;
             let cmd_install =
                 format!("HOME=/home/{DEFAULT_GUEST_USER} npx playwright install {browsers_str}");
-            ssh.exec(&cmd_install, DEFAULT_GUEST_USER, &step_env)
+            ssh.exec(&cmd_install, DEFAULT_GUEST_USER, step_env)
         }
     }
 }
@@ -1925,17 +1927,17 @@ fn copy_staged_payload_to_guest(
             dir = shell_quote(&remote_stage_dir)
         ),
         "root",
-        &HashMap::new(),
+        &StepEnvironment::default(),
     )?;
     let remote_source = guest_path_join(&remote_stage_dir, source_name);
     let finalize = guest_copy_finalize_command(&remote_source, dest);
     let result = ssh
         .copy(source, &remote_stage_dir, "root")
-        .and_then(|()| ssh.exec(&finalize, "root", &HashMap::new()));
+        .and_then(|()| ssh.exec(&finalize, "root", &StepEnvironment::default()));
     let cleanup = ssh.exec(
         &format!("rm -rf {}", shell_quote(&remote_stage_dir)),
         "root",
-        &HashMap::new(),
+        &StepEnvironment::default(),
     );
     result.and(cleanup)
 }
@@ -2282,7 +2284,7 @@ fn validate_tar_symlink_target(link_path: &Path, target: &Path) -> Result<(), Ss
 }
 
 /// Resolve `$VAR` references using a provided env map.
-fn resolve_env_var_in_string(s: &str, env: &HashMap<String, String>) -> String {
+fn resolve_env_var_in_string(s: &str, env: &StepEnvironment<'_>) -> String {
     let mut resolved = String::with_capacity(s.len());
     let mut rest = s;
     while let Some(pos) = rest.find('$') {
@@ -2302,8 +2304,11 @@ fn resolve_env_var_in_string(s: &str, env: &HashMap<String, String>) -> String {
             rest = after_dollar;
             continue;
         }
-        let val = env.get(var_name).cloned().unwrap_or_default();
-        resolved.push_str(&val);
+        let val = env
+            .get(var_name)
+            .map(|value| value.expose())
+            .unwrap_or_default();
+        resolved.push_str(val);
         rest = after_var;
     }
     resolved.push_str(rest);

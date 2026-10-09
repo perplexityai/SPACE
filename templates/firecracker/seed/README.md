@@ -96,11 +96,18 @@ An `env_refs = ["PACKAGE_TOKEN"]` step requests the guest variable
 export. There is no fallback to ordinary daemon variables such as
 `SPACE_INTERNAL_TOKEN`; keep that token configured for service authentication.
 
-References must match `[A-Za-z_][A-Za-z0-9_]*`. Invalid names and missing exports
-fail the build; values must be UTF-8 without NUL bytes. Empty exported values
-are allowed. All references are resolved before any VM or recipe step starts.
-Each export overrides the same guest name from prior `env` steps for that step
-only. References are checked even on steps that do not consume them.
+References must match `[A-Za-z_][A-Za-z0-9_]*` and fit in 128 bytes. Values must
+be UTF-8 without NUL bytes and fit in 8 KiB; empty values are allowed. The shared
+environment limits apply: at most 256 unique exports and 64 KiB of combined
+name/value bytes per build, and the same count/byte bounds on each step's
+effective environment, including accumulated literal `env` values. Invalid
+input and missing exports fail with a one-based step index and field, without
+including values.
+
+Job execution resolves unique names once and retains those values before
+materializing blobs, registering template state, or starting a VM. Each export
+overrides the same guest name from prior `env` steps for that step only.
+References are checked even on steps that do not consume them.
 
 For example, an operator can configure `SPACE_BUILD_EXPORT_PACKAGE_TOKEN`
 through the daemon's secret configuration, then submit:
@@ -116,8 +123,22 @@ Only designate values that every authorized recipe author may read or persist
 in the resulting template. Exported values travel over SSH stdin, outside host
 process arguments, and are not added to the persisted recipe. Guest commands
 can still print them or pass them to guest processes; avoid shell tracing and
-secret-bearing command output. Literal recipe `env` values remain recipe data,
+secret-bearing command output. The builder disables ambient OpenSSH configuration
+(`-F none`), so host `SendEnv` policies cannot bypass export authorization.
+Seed guests retain `AcceptEnv *` for the interactive SSH CLI's explicit
+`SetEnv` workflow. Builders need no seed rebuild for this isolation.
+
+Steps without environment values use the selected account's login shell as
+before. Populated environments start `env NAME=... bash -c ...` through SSH
+stdin, preserving Bash startup variables, aliases and shell options; the step
+command receives empty stdin. Literal recipe `env` values remain recipe data,
 including any client-side TOML interpolation; use `env_refs` for daemon exports.
+
+On a disposable Linux host with OpenSSH server installed, run
+`sudo scripts/tests/smoke-build-environment-ssh.sh /path/to/pplx_space_build_mgr-<hash>`
+after `cargo test -p pplx-space-build-mgr --all-features --no-run`. The runner
+uses private mount, PID and network namespaces, synthetic keys and values, and
+checks real SSH transport, host argv, ambient `SendEnv`, and explicit `SetEnv`.
 
 The maintained `seed`, `code-runtime`, and `oci-python-smoke` recipes need no
 exports. Custom recipes that previously relied on bare daemon variables must

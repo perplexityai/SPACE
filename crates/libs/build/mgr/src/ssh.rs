@@ -1,10 +1,9 @@
-use std::collections::HashMap;
 use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use crate::command_as_root;
+use crate::{command_as_root, environment::StepEnvironment};
 use pplx_space_common_core::types::DEFAULT_GUEST_USER;
 
 const SSH_KEY_PATH: &str = "/root/.ssh/sandbox_ed25519";
@@ -16,8 +15,8 @@ mod tests;
 
 #[derive(Debug, thiserror::Error)]
 pub enum SshError {
-    #[error(transparent)]
-    Environment(#[from] crate::BuildEnvironmentError),
+    #[error("SSH command wait failed: {0}")]
+    CommandWait(#[source] std::io::Error),
     #[error("SSH command input transfer failed: {0}")]
     CommandInput(#[source] std::io::Error),
     #[error(
@@ -113,14 +112,28 @@ impl SshSession {
         &self,
         command: &str,
         user: &str,
-        env: &HashMap<String, String>,
+        env: &StepEnvironment<'_>,
     ) -> Result<(), SshError> {
-        let script = command_script(command, env)?;
+        let script = (!env.is_empty()).then(|| command_script(command, env));
 
         // Retry on SSH connection failures (exit code 255) which can happen
         // when the guest is under heavy load (e.g. large VMs on nested virt).
         for attempt in 0..SSH_EXEC_RETRIES {
-            match send_command_script(self.ssh_cmd(user, "bash -s"), &script) {
+            let result = if let Some(script) = &script {
+                send_command_script(self.ssh_cmd(user, "bash -s"), script)
+            } else {
+                let status = self
+                    .ssh_cmd(user, command)
+                    .stdin(Stdio::null())
+                    .status()
+                    .map_err(SshError::CommandStart)?;
+                if status.success() {
+                    Ok(())
+                } else {
+                    Err(SshError::CommandStatus(status))
+                }
+            };
+            match result {
                 Ok(()) => return Ok(()),
                 Err(SshError::CommandStatus(s))
                     if s.code() == Some(255) && attempt + 1 < SSH_EXEC_RETRIES =>
@@ -152,6 +165,8 @@ impl SshSession {
         cmd.args([
             &format!("--net=/var/run/netns/{}", self.ns),
             "ssh",
+            "-F",
+            "none",
             "-i",
             &self.key_path,
             "-o",
@@ -222,7 +237,7 @@ async fn exchange_command(
             Ok(bytes)
         };
         let ((), bytes) = tokio::try_join!(send, receive)?;
-        let status = child.wait().await.map_err(SshError::CommandStart)?;
+        let status = child.wait().await.map_err(SshError::CommandWait)?;
         if !status.success() {
             return Err(SshError::CommandStatus(status));
         }
@@ -233,16 +248,13 @@ async fn exchange_command(
         .map_err(|_| SshError::BoundedOperation)?
 }
 
-fn command_script(command: &str, env: &HashMap<String, String>) -> Result<String, SshError> {
-    let mut script = String::new();
-    for (name, value) in env {
-        crate::environment::validate_name(name)?;
-        crate::environment::validate_value(name, value)?;
-        script.push_str(&format!("export {name}={}\n", shell_quote(value)));
+fn command_script(command: &str, env: &StepEnvironment<'_>) -> String {
+    let mut script = String::from("env");
+    for (name, value) in env.iter() {
+        script.push_str(&format!(" {name}={}", shell_quote(value.expose())));
     }
-    // Parse the whole command before execution, and preserve the step's empty stdin.
-    script.push_str(&format!("{{\n{command}\n}} </dev/null\n"));
-    Ok(script)
+    script.push_str(&format!(" bash -c {} </dev/null\n", shell_quote(command)));
+    script
 }
 
 fn send_command_script(mut command: Command, script: &str) -> Result<(), SshError> {
@@ -256,7 +268,7 @@ fn send_command_script(mut command: Command, script: &str) -> Result<(), SshErro
         .take()
         .expect("piped stdin")
         .write_all(script.as_bytes());
-    let status = child.wait().map_err(SshError::CommandInput)?;
+    let status = child.wait().map_err(SshError::CommandWait)?;
     if !status.success() {
         return Err(SshError::CommandStatus(status));
     }
