@@ -253,9 +253,10 @@ bash infra/space/kind/scripts/bootstrap.sh
 ```
 
 Bootstrap and full-stack Tilt install the metrics, traces, logs and visualization
-backends before the shim, because `install-shim.sh` resolves the metrics and
-traces Collector Services to ClusterIPs and fails if they are absent. No manual
-Collector installation is needed on these default paths. Each helper is
+backends, but nothing waits on them: the shim and the Rust services start
+without a receiver and retry their exports until one answers, so the backends
+can be removed and reinstalled under a running stack. No manual Collector
+installation is needed on these default paths. Each helper is
 idempotent, so re-running bootstrap does not churn them.
 
 To keep a cluster lean, or to point the exporters at a receiver you run
@@ -326,7 +327,7 @@ over the launch environment, including during rollback.
 
 The default Kind telemetry mode sends Rust custom metrics and traces through
 the upstream OpenTelemetry SDKs and local Collectors. On an existing Kind
-cluster, full-stack Tilt installs the backends before the shim automatically:
+cluster, full-stack Tilt installs the backends automatically:
 
 ```bash
 tilt up
@@ -356,7 +357,7 @@ harness. A direct render must choose `values-fakeintake.yaml` or an existing
 SaaS Secret explicitly. The ordinary chart defaults do not deploy a backend.
 
 SPACE bootstrap completes application readiness before installing the optional
-Datadog Agent; the default local OTLP backends are installed before the shim.
+Datadog Agent; the default local OTLP backends are installed with the stack.
 An Agent failure is reported as a failure without preventing the SPACE releases
 from being installed. Comparison runs still require verified Agents and
 received payloads.
@@ -443,23 +444,37 @@ and OTel identity settings unset, so the shim's DogStatsD tags are exactly
 what they were before this mode existed. Because containerd starts
 the shim on the Kind node rather than in a Pod, `install-shim.sh` installs a
 small production-shaped wrapper around the compiled binary instead of relying
-on workload environment inheritance. In `otel` mode, installation looks up
-`collector` in both `space-traces` and `space-metrics` using the selected
-Kind context and uses `http://<ClusterIP>:4317` for each signal. Kind nodes cannot
-resolve pod DNS, but kube-proxy routes the Service's ClusterIP. Installation fails
-if either Service is missing or has no ClusterIP. Default bootstrap and
-full-stack Tilt install them automatically. For a standalone shim install, run
-`infra/space/kind/traces/local.sh up` and `infra/space/kind/metrics/local.sh up`
-first, or set `SPACE_KIND_SHIM_OTLP_ENDPOINT` to another OTLP/gRPC receiver
-reachable from the Kind node. An explicit override bypasses Service discovery
-for both signals.
+on workload environment inheritance. Kind nodes cannot resolve pod DNS, but
+kube-proxy routes a Service's ClusterIP, so in `otel` mode the wrapper sends
+each signal to `http://<ClusterIP>:4317` of its Collector. The addresses are
+fixed by `collector.clusterIP` in each chart's `profiles/kind.yaml`:
+`10.96.0.20` for `space-metrics` and `10.96.0.21` for `space-traces`, in the
+first 256 addresses of Kind's `10.96.0.0/16` Service range, which dynamic
+allocation avoids. The shim can therefore be installed before the Collectors,
+and reinstalling them does not leave the wrapper with a stale address. Set
+`SPACE_KIND_SHIM_OTLP_ENDPOINT` to send both signals to another OTLP/gRPC
+receiver reachable from the Kind node instead.
+
+A Collector installed before its address was pinned keeps the ClusterIP it was
+allocated, which Kubernetes will not change in place: `local.sh up` fails with
+`spec.clusterIPs[0]: ... may not change once set`. Only that Service is
+immutable; the data lives in the release's PersistentVolumeClaim. Delete the
+Service and run `up` again, which recreates it at the pinned address and keeps
+the stored metrics and traces:
+
+```bash
+kubectl --context kind-space-local -n space-metrics delete svc collector
+bash infra/space/kind/metrics/local.sh up
+```
+
+Do the same for `space-traces`, then re-run `install-shim.sh` (bootstrap and
+Tilt both do) so the wrapper names the pinned addresses.
 
 The shim takes `SPACE_METRICS_SINK` from the same telemetry mode as the Rust
 workloads: `datadog` keeps DogStatsD, `otel` selects OTLP, and `journald` maps to
 `off` because the Go shim has no journald sink and rejects that value. Left
 unset the shim would default to `auto`, meaning native Datadog, and would keep
 emitting DogStatsD metrics through an otel comparison.
-Re-run `install-shim.sh` if the Service is recreated with a different ClusterIP.
 Datadog mode keeps the existing node-local shim settings.
 
 Updating the shim binary or wrapper does not restart containerd unless its

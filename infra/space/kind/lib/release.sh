@@ -45,8 +45,8 @@ guard_namespace() {
 release_init() {
   local name=$1
   # The chart directory, namespace and release are all the short signal name.
-  # SHIM_COLLECTORS and the space-kind-telemetry OTLP endpoints resolve these
-  # namespaces by name; they move in the same commit as this.
+  # The space-kind-telemetry OTLP endpoints resolve these namespaces by name;
+  # they move in the same commit as this.
   owner=$name
   # bootstrap.sh and the Tiltfile both support a non-default bench through
   # SPACE_KIND_CLUSTER, and they now invoke these helpers automatically. The

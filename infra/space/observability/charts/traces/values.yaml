@@ -20,6 +20,9 @@ networkPolicy:
   monitoringPeers: []
   additionalEgress: []
 collector:
+  # Fixed Service ClusterIP. Empty lets Kubernetes allocate one; only the Kind
+  # profile sets it, for the node-hosted shim, which has no cluster DNS.
+  clusterIP: ""
   resources:
     requests: {cpu: 100m, memory: 128Mi}
     limits: {cpu: 500m, memory: 512Mi, ephemeral-storage: 256Mi}

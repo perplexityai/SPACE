@@ -2,9 +2,9 @@
 # Install the local observability backends for this Kind bench.
 #
 # Both supported bring-up paths call this: bootstrap.sh, and the Tiltfile's
-# install-observability-backends resource. install-shim.sh resolves the metrics
-# and traces Collector Services to ClusterIPs and exits 2 if they are absent, so
-# every path that installs the shim must run this first.
+# install-observability-backends resource. It may run before or after the shim
+# and workloads: they address the Collectors by fixed ClusterIPs and retry
+# exports until a receiver answers.
 #
 # Each helper is idempotent and refuses any cluster but the selected bench.
 set -Eeuo pipefail

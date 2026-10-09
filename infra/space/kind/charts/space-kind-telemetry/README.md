@@ -27,5 +27,5 @@ Each signal's endpoint and protocol variables are emitted only when its sink
 or exporter is `otlp`. `telemetry.otlpProtocol` defaults to `grpc` and supplies
 both per-signal protocol variables. The generic `OTEL_EXPORTER_OTLP_ENDPOINT`
 is not emitted. Logs stay on stdout for Alloy to collect; they need no endpoint.
-The node-hosted shim resolves the traces Service's ClusterIP separately during
-installation because it cannot use pod DNS.
+The node-hosted shim cannot use pod DNS, so it addresses each Collector by the
+fixed ClusterIP that chart's Kind profile pins.

@@ -5,7 +5,6 @@ import json
 import os
 import pathlib
 import re
-import shlex
 import subprocess
 
 import pytest
@@ -15,14 +14,11 @@ from kind_chart_render import (
     TELEMETRY_CHARTS,
     bootstrap_guard_environment,
     render,
-    stub_command,
 )
 
 SCRIPT = KIND_DIR / "scripts/telemetry_config.py"
 METRICS_ENDPOINT = "http://collector.space-metrics.svc.cluster.local:4317"
 TRACES_ENDPOINT = "http://collector.space-traces.svc.cluster.local:4317"
-COLLECTOR_IP = "10.96.23.45"
-COLLECTOR_ENDPOINT = f"http://{COLLECTOR_IP}:4317"
 SHIM_OVERRIDE = "http://192.0.2.10:4317"
 LOCAL_ENDPOINT = "http://127.0.0.1:4317"
 spec = importlib.util.spec_from_file_location("kind_telemetry_config", SCRIPT)
@@ -30,23 +26,8 @@ config = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(config)
 
 
-def stub_collector(tmp_path, response=COLLECTOR_IP, exit_code=0):
-    calls = tmp_path / "kubectl-args"
-    stub_command(
-        tmp_path / "bin",
-        "kubectl",
-        # Append: an otel render resolves both the traces and metrics Collectors,
-        # and overwriting would hide the first call.
-        f"printf '%s\\n' \"$@\" >> {shlex.quote(str(calls))}\n"
-        f"printf '%s' {shlex.quote(response)}\nexit {exit_code}",
-    )
-    return calls
-
-
 @pytest.mark.parametrize("mode", ["datadog", "otel", "journald"])
-def test_chart_and_executed_shim_share_isolated_identity(mode, tmp_path, monkeypatch):
-    calls = stub_collector(tmp_path)
-    monkeypatch.setenv("PATH", f"{tmp_path / 'bin'}:{os.environ['PATH']}")
+def test_chart_and_executed_shim_share_isolated_identity(mode, tmp_path):
     settings = config.configuration(
         {
             "SPACE_KIND_TELEMETRY_MODE": mode,
@@ -128,19 +109,11 @@ def test_chart_and_executed_shim_share_isolated_identity(mode, tmp_path, monkeyp
         assert env["DD_TAGS"] == launch["DD_TAGS"]
         if chart.name != "space-data-plane-local":
             assert env["SPACE_CLUSTER_ID"] == launch["SPACE_CLUSTER_ID"]
+    # Each signal goes to its own Collector: traces for the shim's spans,
+    # metrics for its OTLP sink.
     assert launch["OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"] == (
-        COLLECTOR_ENDPOINT if mode == "otel" else LOCAL_ENDPOINT
+        config.collector_endpoint(settings, "traces") if mode == "otel" else LOCAL_ENDPOINT
     )
-    assert calls.exists() == (mode == "otel")
-    if mode == "otel":
-        # Two discoveries now: traces for the shim's spans, metrics for its
-        # OTLP sink. Each must read its own Collector Service.
-        recorded = calls.read_text().splitlines()
-        for namespace in ("space-traces", "space-metrics"):
-            assert namespace in recorded, recorded
-        assert recorded.count("jsonpath={.spec.clusterIP}") == 2, recorded
-        assert recorded.count("--request-timeout=10s") == 2, recorded
-        assert "kind-space-local" in recorded
     assert launch["SPACE_TRACE_EXPORTER"] == ("otlp" if mode == "otel" else "datadog")
     # The shim reads SPACE_METRICS_SINK as well; it must follow the mode, or an
     # otel run leaves the shim on native metrics while the workloads move.
@@ -149,6 +122,12 @@ def test_chart_and_executed_shim_share_isolated_identity(mode, tmp_path, monkeyp
     # Shim metrics have no endpoint fallback, unlike traces.
     assert ("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT" in launch) == (mode == "otel")
     if mode == "otel":
+        assert launch["OTEL_EXPORTER_OTLP_METRICS_ENDPOINT"] == config.collector_endpoint(
+            settings, "metrics"
+        )
+        assert launch["OTEL_EXPORTER_OTLP_METRICS_ENDPOINT"] != launch[
+            "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"
+        ]
         assert launch["OTEL_EXPORTER_OTLP_METRICS_PROTOCOL"] == "grpc"
 
     launched_resources = dict(
@@ -212,7 +191,7 @@ def test_chart_otlp_endpoints_can_be_overridden_independently(chart):
     assert env["OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"] == custom_traces
 
 
-def test_shim_endpoint_override_skips_discovery(tmp_path):
+def test_shim_endpoint_override_replaces_the_collectors(tmp_path):
     env = bootstrap_guard_environment(tmp_path)
     env.update({
         "SPACE_KIND_TELEMETRY_MODE": "otel",
@@ -231,45 +210,9 @@ def test_shim_endpoint_override_skips_discovery(tmp_path):
     assert not (tmp_path / "unexpected-operation").exists()
 
 
-@pytest.mark.parametrize(
-    "response,exit_code",
-    [("", 1), ("", 0), ("None", 0)],
-    ids=["missing-service", "missing-cluster-ip", "headless-service"],
-)
-def test_shim_install_requires_traces_collector(response, exit_code, tmp_path):
-    env = bootstrap_guard_environment(tmp_path)
-    calls = stub_collector(tmp_path, response, exit_code)
-    # Avoid building a shim: discovery must fail before any node is modified.
-    binary = stub_command(tmp_path / "bin", "shim", "exit 0")
-    env.update({"SPACE_KIND_TELEMETRY_MODE": "otel", "SPACE_SHIM_BIN": str(binary)})
-    result = subprocess.run(
-        ["bash", str(KIND_DIR / "scripts/install-shim.sh")],
-        env=env, capture_output=True, text=True, timeout=10,
-    )
-    assert result.returncode != 0
-    assert "space-traces/collector" in result.stderr
-    assert "infra/space/kind/traces/local.sh up" in result.stderr
-    assert "SPACE_KIND_SHIM_OTLP_ENDPOINT" in result.stderr
-    assert calls.exists()
-    assert not (tmp_path / "unexpected-operation").exists()
-
-
-def test_shim_discovery_uses_selected_context_and_ipv6(tmp_path, monkeypatch):
-    calls = stub_collector(tmp_path, "fd00:10:96::17")
-    monkeypatch.setenv("PATH", f"{tmp_path / 'bin'}:{os.environ['PATH']}")
-    settings = config.configuration({
-        "SPACE_KIND_TELEMETRY_MODE": "otel", "SPACE_KIND_CLUSTER": "space-local-bench",
-    })
-    wrapper = config.shim_wrapper(settings, "/usr/bin/env", "local")
-    launch = subprocess.run(
-        ["bash"], input=wrapper, check=True, capture_output=True, text=True,
-    )
-    values = dict(row.split("=", 1) for row in launch.stdout.splitlines())
-    assert values["OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"] == "http://[fd00:10:96::17]:4317"
-    assert calls.read_text().splitlines()[:2] == ["--context", "kind-space-local-bench"]
-
-
-@pytest.mark.parametrize("command", ["json", "helm-set"])
+# The shim wrapper included: it is installed before the Collectors exist and
+# must not need them.
+@pytest.mark.parametrize("command", ["json", "helm-set", "shim-wrapper"])
 def test_otel_configuration_does_not_require_a_cluster(command, tmp_path):
     env = bootstrap_guard_environment(tmp_path)
     env["SPACE_KIND_TELEMETRY_MODE"] = "otel"
@@ -401,39 +344,6 @@ def test_empty_explicit_env_falls_back_to_the_legacy_variable():
 
 
 @pytest.mark.parametrize(
-    "signal,namespace", [("traces", "space-traces"), ("metrics", "space-metrics")]
-)
-def test_collector_discovery_resolves_each_signal(monkeypatch, signal, namespace):
-    """Each signal resolves its own Collector Service to a ClusterIP."""
-    seen = {}
-
-    def fake_run(argv, **kwargs):
-        seen["argv"] = argv
-        return subprocess.CompletedProcess(argv, 0, stdout="10.96.0.42\n", stderr="")
-
-    monkeypatch.setattr(config.subprocess, "run", fake_run)
-    settings = config.configuration({"SPACE_KIND_TELEMETRY_MODE": "otel"})
-    assert config.collector_endpoint(settings, signal) == "http://10.96.0.42:4317"
-    assert "-n" in seen["argv"] and namespace in seen["argv"]
-
-
-def test_collector_discovery_failure_names_the_install_command(monkeypatch):
-    """A missing Collector must say which chart installs it, not just fail."""
-
-    def fake_run(argv, **kwargs):
-        raise OSError("kubectl not found")
-
-    monkeypatch.setattr(config.subprocess, "run", fake_run)
-    settings = config.configuration({"SPACE_KIND_TELEMETRY_MODE": "otel"})
-    with pytest.raises(ValueError) as raised:
-        config.collector_endpoint(settings, "metrics")
-    message = str(raised.value)
-    assert "space-metrics/collector" in message
-    assert "metrics/local.sh up" in message
-    assert "SPACE_KIND_SHIM_OTLP_ENDPOINT" in message
-
-
-@pytest.mark.parametrize(
     "endpoint, rejected",
     [
         ("http://127.0.0.1:4317", False),
@@ -488,7 +398,7 @@ def test_kind_defaults_to_otel_with_the_local_backends():
     ],
 )
 def test_backends_install_only_when_the_mode_uses_them(env, mode, installs):
-    """`install-shim` resolves the Collector ClusterIPs and fails without them.
+    """The backends serve only `otel` mode.
 
     So the install decision has to follow the selected mode, and `off` has to
     be able to refuse it for a caller that supplies its own receiver -- which

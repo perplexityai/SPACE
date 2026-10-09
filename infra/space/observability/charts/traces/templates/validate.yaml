@@ -2,4 +2,7 @@
 {{- include "common.sharedGuards" . }}
 {{- if eq .Values.profile "shared" }}
 {{- include "common.sharedStorageGuard" (dict "storage" .Values.storage "key" "storage") }}
+{{- if .Values.collector.clusterIP }}
+{{- fail "A fixed Collector ClusterIP is Kind-only; shared producers use the Service name" }}
+{{- end }}
 {{- end }}

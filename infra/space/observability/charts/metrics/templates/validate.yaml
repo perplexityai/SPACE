@@ -5,4 +5,7 @@
 {{- if .Values.collector.debug }}
 {{- fail "Diagnostic metric dumps are Kind-only" }}
 {{- end }}
+{{- if .Values.collector.clusterIP }}
+{{- fail "A fixed Collector ClusterIP is Kind-only; shared producers use the Service name" }}
+{{- end }}
 {{- end }}

@@ -3,3 +3,10 @@ storage:
   retain: false
 networkPolicy:
   enabled: false
+collector:
+  # The Kind node's shim has no cluster DNS, so it addresses this Collector
+  # here; SHIM_COLLECTORS in infra/space/kind/scripts/telemetry_config.py must
+  # match. Kind's IPv4 Service range is 10.96.0.0/16; dynamic allocation
+  # avoids its first 256 addresses, which are left for fixed ones like this
+  # (kubernetes is .1, kube-dns .10).
+  clusterIP: 10.96.0.21

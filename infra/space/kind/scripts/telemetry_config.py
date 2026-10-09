@@ -2,14 +2,12 @@
 """Shared, non-secret Kind telemetry configuration for Tilt, bootstrap and shims."""
 
 import argparse
-import ipaddress
 import json
 import os
 import re
 import shlex
 import socket
 import urllib.parse
-import subprocess
 from pathlib import Path
 
 OPTIONS = {
@@ -155,11 +153,10 @@ def configuration(env):
             raise ValueError(f"SPACE_KIND_SHIM_OTLP_ENDPOINT {rejection}")
     version = f"{revision}-{phase}" if revision and phase else revision
     metrics, traces = MODES[mode]
-    # `otel` needs the local Collectors: install-shim resolves their ClusterIPs
-    # and fails without them. `auto` installs them exactly when the mode uses
-    # them. `off` is for a caller supplying its own receiver, and for CI, whose
-    # Kind jobs test sandbox lifecycle and should not pull six more images
-    # through a rate-limited mirror.
+    # Only `otel` exports to the local Collectors. `auto` installs them exactly
+    # when the mode uses them. `off` is for a caller supplying its own
+    # receiver, and for CI, whose Kind jobs test sandbox lifecycle and should
+    # not pull six more images through a rate-limited mirror.
     observability = env.get("SPACE_KIND_OBSERVABILITY", "auto")
     if observability not in {"auto", "off"}:
         raise ValueError("SPACE_KIND_OBSERVABILITY must be auto or off")
@@ -193,42 +190,20 @@ def configuration(env):
 # on that value. Left unset it defaults to auto -> datadog, which would keep the
 # shim on native metrics while every workload moved to OTLP: wrong, silently.
 SHIM_METRICS_SINKS = {"datadog": "datadog", "otel": "otlp", "journald": "off"}
-# Each signal has its own Collector Service; the shim needs both.
-SHIM_COLLECTORS = {"traces": "space-traces", "metrics": "space-metrics"}
+# Each signal has its own Collector Service; the shim needs both. containerd
+# runs the shim on the Kind node, which has no cluster DNS, so the wrapper names
+# each Service by the fixed ClusterIP that chart's profiles/kind.yaml pins as
+# collector.clusterIP; change the two together. Because it is fixed rather than
+# looked up, the wrapper can be written before the Collectors exist and stays
+# right when they are reinstalled.
+SHIM_COLLECTORS = {"metrics": "10.96.0.20", "traces": "10.96.0.21"}
 
 
 def collector_endpoint(config, signal):
-    """A node-reachable OTLP endpoint for one signal's Collector.
-
-    containerd runs outside pods, so the Kind node has no cluster DNS: resolve
-    the Service to its ClusterIP and let kube-proxy route. Only at install time.
-    """
+    """A node-reachable OTLP endpoint for one signal's Collector."""
     if config["shim_endpoint"] is not None:
         return config["shim_endpoint"]
-    namespace = SHIM_COLLECTORS[signal]
-    context = f"kind-{config['kind_cluster']}"
-    try:
-        result = subprocess.run(
-            [
-                "kubectl", "--context", context,
-                "get", "svc", "collector", "-n", namespace,
-                "-o", "jsonpath={.spec.clusterIP}", "--request-timeout=10s",
-            ],
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=15,
-        )
-        address = ipaddress.ip_address(result.stdout.strip())
-    except (OSError, subprocess.SubprocessError, ValueError) as error:
-        raise ValueError(
-            f"cannot resolve the {signal} Collector Service {namespace}/collector "
-            f"to a ClusterIP in {context}; install it with "
-            f"infra/space/kind/{signal}/local.sh up, or set "
-            "SPACE_KIND_SHIM_OTLP_ENDPOINT to a node-reachable OTLP/gRPC endpoint"
-        ) from error
-    host = f"[{address}]" if address.version == 6 else str(address)
-    return f"http://{host}:4317"
+    return f"http://{SHIM_COLLECTORS[signal]}:4317"
 
 
 def shim_endpoint(config):

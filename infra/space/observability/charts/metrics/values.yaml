@@ -14,6 +14,9 @@ networkPolicy:
   queryPeers: []
   additionalEgress: []
 collector:
+  # Fixed Service ClusterIP. Empty lets Kubernetes allocate one; only the Kind
+  # profile sets it, for the node-hosted shim, which has no cluster DNS.
+  clusterIP: ""
   debug: false
   maxStreams: 10000
   maxStale: 2m

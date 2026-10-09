@@ -19,6 +19,9 @@ metadata:
   name: {{ $name }}
 spec:
   type: ClusterIP
+  {{- if and (eq $name "collector") $.Values.collector.clusterIP }}
+  clusterIP: {{ $.Values.collector.clusterIP | quote }}
+  {{- end }}
   selector: {app: {{ $name }}}
   ports:
     - {name: otlp-grpc, port: 4317, targetPort: 4317}

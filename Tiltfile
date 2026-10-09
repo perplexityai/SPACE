@@ -74,10 +74,9 @@ INSTALL_OBSERVABILITY = TELEMETRY_CONFIG["install_observability"]
 if TELEMETRY_MODE == "otel" and not INSTALL_OBSERVABILITY:
     print("otel mode with SPACE_KIND_OBSERVABILITY=off: point the telemetry chart's endpoints at your own receiver, or exports will have nowhere to go.")
 
-# install-shim.sh resolves the metrics and traces Collector Services and exits 2
-# when they are absent, so the backends are a dependency of the shim on this
-# path exactly as they are in bootstrap.sh. Without this, defaulting to otel
-# fails the shim and blocks rust-artifacts and the sandbox stack.
+# The local backends otel mode exports to, installed as on the bootstrap path.
+# Nothing waits on them: the shim addresses the Collectors by fixed ClusterIPs,
+# and every exporter retries until a receiver answers.
 if INSTALL_OBSERVABILITY:
     local_resource(
         "install-observability-backends",
@@ -372,9 +371,7 @@ SPACE_KIND_CLUSTER={cluster} bash infra/space/kind/scripts/internal-rpc-tls.sh
 )
 
 # containerd-shim-space-v2 on each sandbox worker, so per-sandbox pause pods
-# are hijacked into real Firecracker sandboxes. install-shim.sh resolves the
-# local metrics and traces Collector Services, so in otel mode it waits for
-# the observability backends.
+# are hijacked into real Firecracker sandboxes.
 local_resource(
     "install-space-shim",
     cmd = "SPACE_KIND_CLUSTER={} SPACE_KIND_TELEMETRY_MODE={} bash infra/space/kind/scripts/install-shim.sh".format(
@@ -382,7 +379,6 @@ local_resource(
         TELEMETRY_MODE,
     ),
     deps = [TELEMETRY_SCRIPT, "infra/space/kind/scripts/install-shim.sh"] + ([OBSERVABILITY_CONFIG] if OBSERVABILITY_CONFIG else []),
-    resource_deps = ["install-observability-backends"] if INSTALL_OBSERVABILITY else [],
     labels = ["bootstrap"],
 )
 
