@@ -1847,10 +1847,9 @@ async fn postgres_pool_miss_can_retain_rolling_policy_shape_before_materializati
         "INSERT INTO warm_pool_policies (
              template_name, runtime, vcpu, memory_mib, disk_mib, min_ready_slots,
              max_ready_slots, refill_per_tick, max_warming_slots, retain_releases,
-             retain_shape_on_miss, disk_io_max_operations_per_sec,
-             disk_io_max_bandwidth_mib_per_sec
+             disk_io_max_operations_per_sec, disk_io_max_bandwidth_mib_per_sec
          )
-         VALUES ('app-runtime', 'fc', 4, 8192, 32768, 1, 4, 1, 2, 1, TRUE, 2000, 200)"
+         VALUES ('app-runtime', 'fc', 4, 8192, 32768, 1, 4, 1, 2, 1, 2000, 200)"
     ))
     .execute(&db.pool)
     .await?;
@@ -1882,10 +1881,11 @@ async fn postgres_pool_miss_can_retain_rolling_policy_shape_before_materializati
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn postgres_pool_miss_does_not_retain_policy_shape_without_opt_in() -> TestResult {
+async fn postgres_pool_miss_retains_policy_shape_without_legacy_opt_in() -> TestResult {
     let db = pg_test_db().await?;
     let release_id = insert_template_release(&db.pool, "app-runtime", "sha256:new-release").await?;
 
+    // The deprecated per-policy flag no longer gates miss sizing.
     sqlx::query(sql!(
         "INSERT INTO warm_pool_policies (
              template_name, runtime, vcpu, memory_mib, min_ready_slots,
@@ -1898,10 +1898,27 @@ async fn postgres_pool_miss_does_not_retain_policy_shape_without_opt_in() -> Tes
     .execute(&db.pool)
     .await?;
 
+    let assignment =
+        resolve_kubernetes_pool_configured_resources(&db.pool, "app-runtime", release_id)
+            .await?
+            .expect("an enabled policy supplies the cold-miss shape without the legacy flag");
+    assert_eq!(assignment.resources.vcpu, Some(4));
+    assert_eq!(assignment.resources.memory_mib, Some(8192));
+    assert_eq!(
+        assignment.disk_io_limits,
+        DiskIoLimits::try_new(2_000, 200).unwrap()
+    );
+
+    sqlx::query(sql!(
+        "UPDATE warm_pool_policies SET enabled = FALSE WHERE template_name = 'app-runtime'"
+    ))
+    .execute(&db.pool)
+    .await?;
     assert!(
         resolve_kubernetes_pool_configured_resources(&db.pool, "app-runtime", release_id)
             .await?
-            .is_none()
+            .is_none(),
+        "a disabled policy does not supply a cold-miss shape"
     );
     Ok(())
 }
@@ -1927,10 +1944,9 @@ async fn postgres_pool_miss_retains_shape_for_release_outside_warming_window() -
         "INSERT INTO warm_pool_policies (
              template_name, runtime, vcpu, memory_mib, min_ready_slots,
              max_ready_slots, refill_per_tick, max_warming_slots, retain_releases,
-             retain_shape_on_miss, disk_io_max_operations_per_sec,
-             disk_io_max_bandwidth_mib_per_sec
+             disk_io_max_operations_per_sec, disk_io_max_bandwidth_mib_per_sec
          )
-         VALUES ('app-runtime', 'fc', 4, 8192, 1, 4, 1, 2, 1, TRUE, 2000, 200)"
+         VALUES ('app-runtime', 'fc', 4, 8192, 1, 4, 1, 2, 1, 2000, 200)"
     ))
     .execute(&db.pool)
     .await?;
@@ -1963,12 +1979,11 @@ async fn postgres_pool_miss_uses_same_policy_priority_as_zero_demand_materializa
         "INSERT INTO warm_pool_policies (
              template_name, runtime, vcpu, memory_mib, min_ready_slots,
              max_ready_slots, refill_per_tick, max_warming_slots, retain_releases,
-             retain_shape_on_miss, disk_io_max_operations_per_sec,
-             disk_io_max_bandwidth_mib_per_sec
+             disk_io_max_operations_per_sec, disk_io_max_bandwidth_mib_per_sec
          )
          VALUES
-             ('app-runtime', 'fc', 4, 8192, 1, 100, 1, 2, 1, TRUE, 2000, 200),
-             ('app-runtime', 'fc', 8, 16384, 5, 10, 1, 2, 1, TRUE, 3000, 250)"
+             ('app-runtime', 'fc', 4, 8192, 1, 100, 1, 2, 1, 2000, 200),
+             ('app-runtime', 'fc', 8, 16384, 5, 10, 1, 2, 1, 3000, 250)"
     ))
     .execute(&db.pool)
     .await?;
@@ -1976,7 +1991,7 @@ async fn postgres_pool_miss_uses_same_policy_priority_as_zero_demand_materializa
     let assignment =
         resolve_kubernetes_pool_configured_resources(&db.pool, "app-runtime", release_id)
             .await?
-            .expect("a retained policy should provide the cold-miss assignment");
+            .expect("an enabled policy should provide the cold-miss assignment");
 
     assert_eq!(assignment.resources.vcpu, Some(8));
     assert_eq!(assignment.resources.memory_mib, Some(16384));

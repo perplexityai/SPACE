@@ -1056,6 +1056,8 @@ pub struct WarmPoolPolicyResponse {
     pub refill_per_tick: u32,
     pub max_warming_slots: u32,
     pub retain_releases: u32,
+    /// Deprecated: cold misses always retain the preferred enabled policy
+    /// shape, so this is always `true`. Kept for older admin clients.
     pub retain_shape_on_miss: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disk_io_max_operations_per_sec: Option<u64>,
@@ -1087,7 +1089,9 @@ pub struct WarmPoolPolicyRequest {
     #[serde(default = "default_warm_pool_policy_max_warming_slots")]
     pub max_warming_slots: u32,
     pub retain_releases: u32,
-    // Optional so older admin clients preserve an existing assignment.
+    /// Deprecated and ignored: cold misses always retain the preferred enabled
+    /// policy shape. Still accepted because the request denies unknown fields
+    /// and older admin clients may send it.
     #[serde(default)]
     pub retain_shape_on_miss: Option<bool>,
     #[serde(default)]

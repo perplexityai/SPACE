@@ -1211,8 +1211,14 @@ impl WarmPoolStore {
     }
 
     /// Preferred enabled Firecracker policy assignment for a template. This
-    /// is the fallback shape for cold creates when no release-specific pool
-    /// config has been materialized yet.
+    /// is the fallback shape for every cold create when no release-specific
+    /// pool config has been materialized, including releases outside the
+    /// policy's `retain_releases` window. Persisting the policy shape on the
+    /// sandbox row lets that demand match the policy when the autoscaler
+    /// decides whether to re-admit a pool for the release.
+    ///
+    /// Ordering mirrors zero-demand policy materialization: the policy with
+    /// the most `min_ready_slots` wins, then the most recently updated one.
     pub async fn preferred_enabled_policy_assignment(
         &self,
         template_name: &str,
@@ -1225,7 +1231,6 @@ impl WarmPoolStore {
              WHERE template_name = $1
                AND runtime = 'fc'
                AND enabled
-               AND retain_shape_on_miss
              ORDER BY min_ready_slots DESC, updated_at DESC
              LIMIT 1"
         ))

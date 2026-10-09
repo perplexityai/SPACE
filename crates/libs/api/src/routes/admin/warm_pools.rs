@@ -80,7 +80,6 @@ struct WarmPoolPolicyRow {
     refill_per_tick: i32,
     max_warming_slots: i32,
     retain_releases: i32,
-    retain_shape_on_miss: bool,
     disk_io_max_operations_per_sec: Option<i64>,
     disk_io_max_bandwidth_mib_per_sec: Option<i64>,
     enabled: bool,
@@ -90,7 +89,6 @@ struct WarmPoolPolicyRow {
 
 #[derive(Debug, Serialize)]
 pub struct WarmPoolPolicyCapabilitiesResponse {
-    retain_shape_on_miss: bool,
     disk_capacity: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     disk_io: Option<WarmPoolDiskIoCapability>,
@@ -199,7 +197,7 @@ async fn fetch_policies(pool: &sqlx::PgPool) -> Result<Vec<WarmPoolPolicyRow>, s
     sqlx::query_as::<_, WarmPoolPolicyRow>(sql!(
         "SELECT template_name, runtime, vcpu, memory_mib, disk_mib, min_ready_slots,
                 max_ready_slots, refill_per_tick, max_warming_slots,
-                retain_releases, retain_shape_on_miss, disk_io_max_operations_per_sec,
+                retain_releases, disk_io_max_operations_per_sec,
                 disk_io_max_bandwidth_mib_per_sec, enabled, created_at, updated_at
          FROM warm_pool_policies
          WHERE runtime = 'fc'
@@ -217,12 +215,12 @@ async fn store_policy(
         "INSERT INTO warm_pool_policies (
              template_name, runtime, vcpu, memory_mib, disk_mib, min_ready_slots,
              max_ready_slots, refill_per_tick, max_warming_slots,
-             retain_releases, retain_shape_on_miss, disk_io_max_operations_per_sec,
+             retain_releases, disk_io_max_operations_per_sec,
              disk_io_max_bandwidth_mib_per_sec, enabled
          )
-         VALUES ($1, 'fc', $2, $3, $4, $5, $6, $7, $8, $9, COALESCE($10, FALSE), $11, $12, $13)
+         VALUES ($1, 'fc', $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
          ON CONFLICT (template_name, runtime, vcpu, memory_mib) DO UPDATE
-         SET disk_mib = CASE WHEN $14 THEN NULL
+         SET disk_mib = CASE WHEN $13 THEN NULL
                              ELSE COALESCE(EXCLUDED.disk_mib, warm_pool_policies.disk_mib)
                         END,
              min_ready_slots = EXCLUDED.min_ready_slots,
@@ -230,14 +228,13 @@ async fn store_policy(
              refill_per_tick = EXCLUDED.refill_per_tick,
              max_warming_slots = EXCLUDED.max_warming_slots,
              retain_releases = EXCLUDED.retain_releases,
-             retain_shape_on_miss = COALESCE($10, warm_pool_policies.retain_shape_on_miss),
              disk_io_max_operations_per_sec =
-                 CASE WHEN $15 THEN NULL
+                 CASE WHEN $14 THEN NULL
                       ELSE COALESCE(EXCLUDED.disk_io_max_operations_per_sec,
                                     warm_pool_policies.disk_io_max_operations_per_sec)
                  END,
              disk_io_max_bandwidth_mib_per_sec =
-                 CASE WHEN $15 THEN NULL
+                 CASE WHEN $14 THEN NULL
                       ELSE COALESCE(EXCLUDED.disk_io_max_bandwidth_mib_per_sec,
                                     warm_pool_policies.disk_io_max_bandwidth_mib_per_sec)
                  END,
@@ -245,7 +242,7 @@ async fn store_policy(
              updated_at = NOW()
          RETURNING template_name, runtime, vcpu, memory_mib, disk_mib, min_ready_slots,
                    max_ready_slots, refill_per_tick, max_warming_slots,
-                   retain_releases, retain_shape_on_miss, disk_io_max_operations_per_sec,
+                   retain_releases, disk_io_max_operations_per_sec,
                    disk_io_max_bandwidth_mib_per_sec, enabled, created_at, updated_at"
     ))
     .bind(request.template_name.trim())
@@ -257,7 +254,6 @@ async fn store_policy(
     .bind(request.refill_per_tick as i32)
     .bind(request.max_warming_slots as i32)
     .bind(request.retain_releases as i32)
-    .bind(request.retain_shape_on_miss)
     .bind(request.disk_io_max_operations_per_sec.map(u64_to_i64))
     .bind(request.disk_io_max_bandwidth_mib_per_sec.map(u64_to_i64))
     .bind(request.enabled)
@@ -436,7 +432,6 @@ fn disk_io_policy_capability_from_values(
         }
     };
     Ok(WarmPoolPolicyCapabilitiesResponse {
-        retain_shape_on_miss: true,
         disk_capacity: true,
         disk_io,
     })
@@ -480,7 +475,7 @@ impl From<WarmPoolPolicyRow> for WarmPoolPolicyResponse {
             refill_per_tick: row.refill_per_tick.cast_unsigned(),
             max_warming_slots: row.max_warming_slots.cast_unsigned(),
             retain_releases: row.retain_releases.cast_unsigned(),
-            retain_shape_on_miss: row.retain_shape_on_miss,
+            retain_shape_on_miss: true,
             disk_io_max_operations_per_sec: disk_io_limits.map(|limits| limits.0),
             disk_io_max_bandwidth_mib_per_sec: disk_io_limits.map(|limits| limits.1),
             disk_io_source: disk_io_limits.map(|_| "warm_pool"),

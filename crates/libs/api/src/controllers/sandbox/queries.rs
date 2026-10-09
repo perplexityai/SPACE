@@ -578,7 +578,9 @@ struct ColdCreateShapeInput<'a> {
 
 /// Resources for a create that did not adopt a warm-pool sandbox.
 ///
-/// A Kubernetes fallthrough create takes a configured pool's shape. Otherwise
+/// A Kubernetes fallthrough create takes a configured pool's shape, or the
+/// shape of the template's preferred enabled warm-pool policy when the release
+/// has no materialized pool config. Otherwise
 /// a Kubernetes create fills the vCPU and memory the request left unset from
 /// the template's build shape: the node shim boots a pod without those
 /// annotations at fixed defaults (2 vCPU, 1024 MiB), whatever the template
@@ -661,8 +663,9 @@ fn validate_inherited_pool_disk(disk_mib: Option<u32>) -> Result<(), ControllerE
 
 // The policy fallback deliberately mirrors the zero-demand policy priority in
 // `pplx-space-cluster-pool`. `retain_releases` controls which releases receive
-// warm slots; it must not limit `retain_shape_on_miss`, which applies the
-// template policy to any cold fallthrough create.
+// warm slots; it must not limit miss sizing. Any enabled template policy
+// supplies the shape for every cold fallthrough create so the persisted shape
+// counts as demand for that policy.
 async fn resolve_kubernetes_pool_configured_resources(
     pool: &PgPool,
     template_name: &str,

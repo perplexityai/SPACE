@@ -36,7 +36,6 @@ fn row(disk_io_limits: Option<DiskIoLimits>) -> WarmPoolPolicyRow {
         refill_per_tick: 1,
         max_warming_slots: 2,
         retain_releases: 1,
-        retain_shape_on_miss: false,
         disk_io_max_operations_per_sec: disk_io_limits
             .map(|limits| i64::try_from(limits.max_operations_per_sec()).unwrap()),
         disk_io_max_bandwidth_mib_per_sec: disk_io_limits
@@ -143,17 +142,27 @@ async fn legacy_upsert_preserves_disk_capacity_and_explicit_reset_clears_it() ->
 }
 
 #[tokio::test]
-async fn legacy_upsert_preserves_retain_shape_on_miss() -> TestResult {
+async fn deprecated_retain_shape_on_miss_is_accepted_and_ignored() -> TestResult {
     let db = pg_test_db().await?;
-    let mut enabled = request(None);
-    enabled.retain_shape_on_miss = Some(true);
-    assert!(store_policy(&db.pool, &enabled).await?.retain_shape_on_miss);
+    for legacy_value in [false, true] {
+        let request: WarmPoolPolicyRequest = serde_json::from_value(serde_json::json!({
+            "template_name": "custom-runtime",
+            "vcpu": 4,
+            "memory_mib": 8192,
+            "min_ready_slots": 1,
+            "max_ready_slots": 4,
+            "retain_releases": 1,
+            "retain_shape_on_miss": legacy_value,
+            "enabled": true
+        }))?;
+        assert_eq!(request.retain_shape_on_miss, Some(legacy_value));
 
-    assert!(
-        store_policy(&db.pool, &request(None))
-            .await?
-            .retain_shape_on_miss
-    );
+        let response = WarmPoolPolicyResponse::from(store_policy(&db.pool, &request).await?);
+        assert!(
+            response.retain_shape_on_miss,
+            "cold misses always retain the policy shape"
+        );
+    }
     Ok(())
 }
 
@@ -216,7 +225,7 @@ fn disk_io_capability_is_hidden_without_an_explicit_cluster_ceiling() {
     assert!(capability.disk_io.is_none());
     assert_eq!(
         serde_json::to_value(capability).unwrap(),
-        serde_json::json!({ "retain_shape_on_miss": true, "disk_capacity": true })
+        serde_json::json!({ "disk_capacity": true })
     );
 }
 
@@ -227,7 +236,6 @@ fn disk_io_capability_reports_cluster_ceiling_and_platform_defaults() {
     assert_eq!(
         serde_json::to_value(capability).unwrap(),
         serde_json::json!({
-            "retain_shape_on_miss": true,
             "disk_capacity": true,
             "disk_io": {
                 "max_operations_per_sec": 5_000,
