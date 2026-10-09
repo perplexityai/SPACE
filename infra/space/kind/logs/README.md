@@ -1,9 +1,9 @@
 # Local logs: Alloy → Loki
 
-Opt-in, standalone logs ingestion for the existing SPACE Kind environment.
-This chart deploys only Alloy and Loki; neither metrics nor Grafana is required.
-It neither changes
-SPACE images/environment nor removes or reconfigures Datadog. No application
+Standalone logs ingestion, installed automatically by default Kind bootstrap
+and full-stack Tilt in `otel` mode. This chart deploys only Alloy and Loki;
+neither metrics nor Grafana is required. It neither changes SPACE
+images/environment nor removes or reconfigures Datadog. No application
 exporter, trace correlation, metrics pipeline, or production integration is added.
 
 ## Start and query
@@ -27,9 +27,9 @@ For shared clusters use the portable
 not this local test harness. Its Kind guard is intentionally unchanged.
 
 Keep `ui` running for the Loki HTTP API at <http://127.0.0.1:13101>.
-For optional visualization, independently install the `grafana` chart
-when that PR is available, with `datasources.loki.enabled=true`. Its datasource
-URL is `http://loki.space-logs.svc.cluster.local:3100`. Open its provisioned
+The default Kind bring-up also installs the independent `grafana` chart with
+the Loki datasource enabled at `http://loki.space-logs.svc.cluster.local:3100`.
+For a standalone backend, visualization remains optional. Open its provisioned
 [SPACE logs dashboard](http://127.0.0.1:13000/d/space-main-health-logs).
 It works with anonymous Viewer; **Explore is not permitted for this role**.
 Select namespace `space` for real services, `space-logs` for fixture

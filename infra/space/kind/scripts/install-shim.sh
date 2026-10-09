@@ -17,7 +17,7 @@
 #   SPACE_KIND_CLUSTER   kind cluster name (default: space-local)
 #   SPACE_SHIM_BIN       prebuilt shim path (default: build from ./shim with go)
 #   GO_BIN               go binary to use when building (default: PATH or /usr/local/go/bin/go)
-#   SPACE_KIND_TELEMETRY_MODE datadog, otel, or journald (default: datadog)
+#   SPACE_KIND_TELEMETRY_MODE otel (default), datadog, or journald
 #   SPACE_KIND_SHIM_OTLP_ENDPOINT OTLP/gRPC trace endpoint visible from the
 #                         kind node (otel default: traces Collector ClusterIP;
 #                         other modes retain http://127.0.0.1:4317)

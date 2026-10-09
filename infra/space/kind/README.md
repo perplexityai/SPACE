@@ -208,28 +208,31 @@ in-cluster (see "Seed template" below).
 `bootstrap.sh` auto-invokes `install-fc-vendor.sh` if the vendor tree is
 missing (so step 2 is optional in practice), and is otherwise idempotent: it
 creates the kind cluster (if missing), labels nodes, advertises the
-`space.pplx.net/network-slots` extended resource, installs the containerd
+`space.pplx.net/network-slots` extended resource, installs the local
+observability backends in the default `otel` mode, installs the containerd
 shim on the sandbox workers, applies the `space` Namespace + `RuntimeClass`,
 builds every image and `kind load`s it (first run is the long step; the
 incremental build reuses its target dir and the Docker build is
 cargo-chef-cached after that), and applies every chart with
 `helm template | kubectl apply`.
 
-### Metrics (isolated local experiment)
+### Metrics (default local backend)
 
-For an opt-in Collector → Prometheus stack consuming SPACE OTLP
-metrics, see [the metrics runbook](metrics/README.md). It uses its own
-namespace and synthetic workload, preserves the Datadog Agent, and does not
-change shared deployment defaults. Grafana is an optional independent release;
-it is not required for ingestion or query validation.
+The default Kind bring-up installs Collector → Prometheus to receive SPACE
+OTLP metrics; see [the metrics runbook](metrics/README.md) for queries and
+independent release management. Synthetic validation workloads are separate
+and opt-in. Grafana is also installed by default but remains an independent
+release, not a requirement for ingestion or query validation. These Kind
+defaults do not change shared deployments or reconfigure an existing
+Datadog Agent.
 
-### Logs (optional)
+### Logs (default local backend)
 
-The isolated [Alloy → Loki setup](logs/README.md) collects SPACE
+The [Alloy → Loki setup](logs/README.md), installed by default, collects SPACE
 container and Kind node journal logs without changing application images,
 Datadog collection, or metrics/traces settings. It includes local-only UI access,
 an existing-process-fixture validation workflow, and scoped cleanup commands.
-Metrics and visualization releases are optional and independently deployed.
+The ingestion and visualization releases can still be managed independently.
 
 ### Datadog (optional)
 
@@ -251,10 +254,11 @@ ordinary bootstrap gives you a cluster whose telemetry you can query:
 bash infra/space/kind/scripts/bootstrap.sh
 ```
 
-Bootstrap installs the metrics, traces, logs and visualization backends before
-the shim, because `install-shim.sh` resolves the metrics and traces Collector
-Services to ClusterIPs and fails if they are absent. Each helper is idempotent,
-so re-running bootstrap does not churn them.
+Bootstrap and full-stack Tilt install the metrics, traces, logs and visualization
+backends before the shim, because `install-shim.sh` resolves the metrics and
+traces Collector Services to ClusterIPs and fails if they are absent. No manual
+Collector installation is needed on these default paths. Each helper is
+idempotent, so re-running bootstrap does not churn them.
 
 To keep a cluster lean, or to point the exporters at a receiver you run
 yourself:
@@ -268,6 +272,11 @@ SPACE_KIND_TELEMETRY_MODE=datadog SPACE_KIND_DATADOG_MODE=fakeintake \
   bash infra/space/kind/scripts/bootstrap.sh
 ```
 
+When skipping local backends in `otel` mode, set `SPACE_KIND_SHIM_OTLP_ENDPOINT`
+to a node-reachable OTLP/gRPC receiver and configure the workload endpoints
+described below. `SPACE_KIND_OBSERVABILITY=off` skips backend installation; it
+does not disable exporters or uninstall existing releases.
+
 CI pins `SPACE_KIND_OBSERVABILITY=off` and `SPACE_KIND_TELEMETRY_MODE=datadog`
 for the Kind smoke shards: they test sandbox lifecycle, and the backends'
 images are not in `ci/mirrored-images.txt`.
@@ -280,9 +289,9 @@ and `telemetry.otlpTracesEndpoint` in the workload Helm values. Endpoint and
 protocol environment variables are per-signal and emitted only for OTLP
 exporters. Logs stay on stdout for Alloy to collect; no log endpoint is needed.
 
-SPACE uses the native Datadog exporters by default. Set
-`SPACE_KIND_TELEMETRY_MODE=otel` for an exclusive OTLP comparison with
-compatible application binaries. `datadog` is the default and rollback mode.
+`otel` is the Kind default. Set `SPACE_KIND_TELEMETRY_MODE=datadog` to return
+to native Datadog metrics and traces; pair it with
+`SPACE_KIND_DATADOG_MODE=fakeintake` for local capture.
 
 One thing the table does not show: `journald` suppresses Rust metrics rather
 than writing them to the journal. The sink emits on a tracing target every
@@ -298,17 +307,17 @@ There is no dual-publish or non-counter mode. The `otel` mode uses `always_on`
 diagnostic trace sampling, not the production sampling policy. Logs remain
 structured JSON on stdout in every mode; there is no OTLP log exporter.
 
-The default is always `off`, even when `DD_API_KEY` is set. **`off` and stopping
-Tilt do not stop an existing Agent's export.** Use the explicit rollback below.
-For a local metrics/traces/logs comparison with no
+`SPACE_KIND_DATADOG_MODE` defaults to `off`, even when `DD_API_KEY` is set.
+**`off` and stopping Tilt do not stop an existing Agent's export.** Use the
+explicit rollback below. For native Datadog metrics/traces/logs capture with no
 telemetry egress to Datadog SaaS:
 
 ```bash
-SPACE_KIND_DATADOG_MODE=fakeintake \
+SPACE_KIND_TELEMETRY_MODE=datadog SPACE_KIND_DATADOG_MODE=fakeintake \
   bash infra/space/kind/scripts/bootstrap.sh --skip-images
 
 # Or start the Tilt-managed stack in the same mode:
-SPACE_KIND_DATADOG_MODE=fakeintake tilt up
+SPACE_KIND_TELEMETRY_MODE=datadog SPACE_KIND_DATADOG_MODE=fakeintake tilt up
 ```
 
 Both paths install Agent `7.81.1`, expose Fake Intake at
@@ -317,20 +326,19 @@ local environment. Environment-only settings require a Tilt restart; the
 optional `SPACE_KIND_OBSERVABILITY_CONFIG` JSON file is watched and authoritative
 over the launch environment, including during rollback.
 
-SPACE keeps its native Datadog metrics and trace exporters unless the Kind-only
-telemetry mode is changed. To send Rust custom metrics and traces through the
-upstream OpenTelemetry SDKs and the Collectors instead — having installed
-those charts first:
+The default Kind telemetry mode sends Rust custom metrics and traces through
+the upstream OpenTelemetry SDKs and local Collectors. On an existing Kind
+cluster, full-stack Tilt installs the backends before the shim automatically:
 
 ```bash
-SPACE_KIND_TELEMETRY_MODE=otel tilt up
+tilt up
 ```
 
 Add `SPACE_KIND_DATADOG_MODE=fakeintake` alongside it to keep an Agent running
 for a side-by-side capture; `otel` does not require one.
 
-`datadog` is the default and rollback mode. `otel` selects the exclusive
-`SPACE_METRICS_SINK=otlp` and `SPACE_TRACE_EXPORTER=otlp` paths with an
+`datadog` remains an explicit rollback option. The default `otel` mode selects
+the exclusive `SPACE_METRICS_SINK=otlp` and `SPACE_TRACE_EXPORTER=otlp` paths with an
 `always_on` diagnostic trace sampler. `journald` suppresses Rust metrics and
 leaves traces on Datadog. In `otel` mode the shim moves to OTLP as well.
 There is no dual-publish or non-counter mode. Counters use the same metric
@@ -349,10 +357,11 @@ rejected because its host-port deployment and intake URLs belong to this Kind
 harness. A direct render must choose `values-fakeintake.yaml` or an existing
 SaaS Secret explicitly. The ordinary chart defaults do not deploy a backend.
 
-SPACE bootstrap completes application readiness before installing optional
-telemetry. An Agent failure is reported as a failure without preventing the
-SPACE releases from being installed. Comparison runs still require verified
-Agents and received payloads.
+SPACE bootstrap completes application readiness before installing the optional
+Datadog Agent; the default local OTLP backends are installed before the shim.
+An Agent failure is reported as a failure without preventing the SPACE releases
+from being installed. Comparison runs still require verified Agents and
+received payloads.
 
 Fake Intake is a single-replica, in-memory test backend. It captures the real
 Agent payloads but does not implement Datadog dashboards or SaaS-side indexing.
@@ -440,7 +449,8 @@ on workload environment inheritance. In `otel` mode, installation looks up
 `collector` in both `space-traces` and `space-metrics` using the selected
 Kind context and uses `http://<ClusterIP>:4317` for each signal. Kind nodes cannot
 resolve pod DNS, but kube-proxy routes the Service's ClusterIP. Installation fails
-if either Service is missing or has no ClusterIP; install
+if either Service is missing or has no ClusterIP. Default bootstrap and
+full-stack Tilt install them automatically. For a standalone shim install, run
 `infra/space/kind/traces/local.sh up` and `infra/space/kind/metrics/local.sh up`
 first, or set `SPACE_KIND_SHIM_OTLP_ENDPOINT` to another OTLP/gRPC receiver
 reachable from the Kind node. An explicit override bypasses Service discovery

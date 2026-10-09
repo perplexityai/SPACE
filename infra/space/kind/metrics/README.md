@@ -4,6 +4,9 @@ Install Collector Contrib and Prometheus on the verified `kind-space-local`
 bench. The helper checks cluster identity and namespace ownership. Shared
 installations use the [observability deployment runbook](../../observability/README.md).
 
+Default Kind bootstrap and full-stack Tilt install this backend automatically
+in `otel` mode. Use this helper to manage the release independently.
+
 ## Deploy and query
 
 Run from the repository root:
@@ -20,8 +23,9 @@ bash infra/space/kind/metrics/local.sh ui
 
 The release owns only the backend, configuration, storage and access policies.
 Installing it creates no producer Jobs and changes no SPACE sink. Grafana is an
-independent optional release. Kind uses disposable local storage and does not
-provide enforced network isolation, authentication or production sizing.
+independent release, also installed by default but not required for ingestion.
+Kind uses disposable local storage and does not provide enforced network
+isolation, authentication or production sizing.
 
 ## Validate
 

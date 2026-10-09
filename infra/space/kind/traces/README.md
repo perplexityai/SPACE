@@ -1,9 +1,11 @@
 # Local traces: Collector → Tempo
 
-Opt-in **traces-only** ingestion for verified Docker Kind `space-local`.
-Independent from metrics, logs and Grafana. No application instrumentation,
-sampling policy, deployment defaults or Datadog Agent settings are changed.
-No tail sampling, span metrics, logs pipeline or service-graph generator.
+**Traces-only** ingestion for verified Docker Kind `space-local`, installed
+automatically by default Kind bootstrap and full-stack Tilt in `otel` mode.
+The release remains independent from metrics, logs and Grafana. Running this
+helper alone changes no application instrumentation, sampling policy, exporter
+selection or Datadog Agent settings. There is no tail sampling, span metrics,
+logs pipeline or service-graph generator.
 
 ## Start and query
 
@@ -30,8 +32,10 @@ tenant isolation. Never expose these ports publicly.
 
 The in-cluster receiver is
 `http://collector.space-traces.svc.cluster.local:4317` (plaintext OTLP/gRPC).
-This does not install or redirect any SPACE producer. Keep the Datadog Agent.
-If a selected process already uses OTLP traces, temporarily override only
+The default Kind `otel` mode already points SPACE producers here and needs no
+Datadog Agent. Installing this backend independently does not redirect producers
+or reconfigure an existing Agent. For a separate canary, if a selected process
+already uses OTLP traces, temporarily override only
 `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`. Native producers additionally need an
 explicit, separately reviewed `SPACE_TRACE_EXPORTER=otlp` opt-in. Configure
 selected workloads through their owning chart's per-signal telemetry values;
@@ -66,8 +70,9 @@ Other useful TraceQL examples:
 {resource.service.name="space-cluster-api"}
 ```
 
-Optional UI: install the independent `grafana` chart with
-`datasources.tempo.enabled=true`, URL `http://tempo.space-traces.svc.cluster.local:3200`.
+The default Kind bring-up also installs the independent `grafana` chart with
+the Tempo datasource enabled at `http://tempo.space-traces.svc.cluster.local:3200`.
+For a standalone backend, that UI remains optional.
 Open `/d/space-traces` on its localhost UI; click a trace ID for the detail
 dashboard. Grafana is neither bundled here nor required to validate ingestion.
 
