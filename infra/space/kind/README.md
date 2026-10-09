@@ -920,7 +920,14 @@ ServiceAccount to its client service, and never accepts the static internal
 token. On every request it also requires the token's pod to be current and
 Running in its namespace, with the connection's source address among that
 pod's IPs, and the token's node to be registered under that name and UID; its
-Role lists and watches the namespace's pods for this. Each node's
+Role lists and watches the namespace's pods for this. Builder nodes fail the
+node check: internal-api registers a node without its UID, which only the
+node inventory sync, listing the sandbox-selector nodes, or a sandbox pod
+placed on the node records
+(`crates/libs/api/src/controllers/substrate/kubernetes/node_sync.rs`), so the
+authority refuses builder callers with `node_identity_mismatch`. Kind's
+builders do not need it: their build-manager and volume-manager read the
+object store's static keys instead of exchanging tokens. Each node's
 credential-manager runs `--role=agent`: it holds the node's credential sockets
 under its service mutex and forwards every call upstream as the node credential
 agent, with no database, KEK or AWS credential. node-manager
