@@ -278,7 +278,9 @@ async fn handlers_run_inside_the_request_span_for_every_admission_class() {
         // another task does not inherit it unless carried explicitly.
         let request_span = tracing::info_span!("grpc.server");
         let future = request_span.in_scope(|| service.call(request));
-        future.instrument(request_span.clone()).await.unwrap();
+        tracing::Instrument::instrument(future, request_span.clone())
+            .await
+            .unwrap();
 
         let observed = observed_rx.await.unwrap();
         assert_eq!(
