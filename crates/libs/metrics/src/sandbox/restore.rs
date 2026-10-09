@@ -14,9 +14,15 @@
 //! cross-node-share signal this counter feeds — and are deliberately not worth
 //! a durable per-execution emission marker.
 //!
+//! [`cross_node_redrive`] fires once per in-request cross-node re-drive
+//! attempt on a `required_affinity` pod the scheduler ruled `Unschedulable`.
+//! A re-drive that fails, is dropped, or loses ownership returns before its
+//! request emits a placement sample, so this counter is that request's only
+//! record of the re-drive.
+//!
 //! End-to-end restore duration stays on the existing
 //! `snapshot.restore.duration_ms` distribution (node side); this module owns
-//! only the placement decision.
+//! only the placement decision and its re-drive.
 
 use crate::emit::{counter, tag};
 
@@ -121,4 +127,79 @@ pub fn placement_directed(sample: PlacementSample) {
         tag("pin", sample.pin.as_str()),
     ];
     counter("sandbox.restore.placement", 1, &tags);
+}
+
+/// Which request path ran a cross-node re-drive.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RedrivePath {
+    /// The create path's scheduling watch, in the attempt that created the
+    /// pinned pod, saw it ruled `Unschedulable`.
+    FreshCreate,
+    /// The existing-pod path found an already-created pinned pod ruled
+    /// `Unschedulable`.
+    Retry,
+}
+
+impl RedrivePath {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::FreshCreate => "fresh_create",
+            Self::Retry => "retry",
+        }
+    }
+}
+
+impl std::fmt::Display for RedrivePath {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// How one cross-node re-drive attempt ended.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RedriveOutcome {
+    /// A successor without the source pin was created and persisted under the
+    /// same generation.
+    Redriven,
+    /// This attempt created no successor: it found the pod bound, found a pod
+    /// without the source pin at the name, or lost the successor POST to a
+    /// concurrent re-drive.
+    Retained,
+    /// This attempt stepped aside without a successor of its own: its
+    /// create-claim reset or its successor's persist matched no row it owns.
+    /// That doesn't prove another attempt is driving the restore.
+    OwnershipLost,
+    /// The re-drive returned an error, which the caller propagates. It may
+    /// have failed before or after deleting the pinned pod.
+    Failed,
+    /// The re-drive's future was dropped or unwound before it returned, for
+    /// example when a caller's wait budget expired around it, including
+    /// during cleanup after an outcome was already reached. It produced no
+    /// result, so failure ratios should count it with `Failed`.
+    Dropped,
+}
+
+impl RedriveOutcome {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Redriven => "redriven",
+            Self::Retained => "retained",
+            Self::OwnershipLost => "ownership_lost",
+            Self::Failed => "failed",
+            Self::Dropped => "dropped",
+        }
+    }
+}
+
+impl std::fmt::Display for RedriveOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Emit one cross-node re-drive attempt's outcome. A retry that re-drives the
+/// same pinned pod again emits again, so this counts attempts, not sandboxes.
+pub fn cross_node_redrive(path: RedrivePath, outcome: RedriveOutcome) {
+    let tags = [tag("path", path.as_str()), tag("outcome", outcome.as_str())];
+    counter("sandbox.restore.redrive", 1, &tags);
 }

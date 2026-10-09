@@ -346,16 +346,51 @@ pub(super) enum RedriveOutcome {
     /// The pinned pod was confirmed unschedulable, torn down, and a source-less
     /// successor was created and persisted under the same generation.
     Redriven(Arc<SandboxPodView>),
-    /// Nothing was torn down: the authoritative read found the pod bound after
-    /// all (the caller's `Unschedulable` verdict was stale) or already replaced
-    /// by a concurrent re-drive's successor (required pin absent). The live pod
-    /// drives the restore. `cross_node` distinguishes a retained cross-node
-    /// successor / fallback bind from the original pinned pod binding on the
-    /// source — the caller's placement metric must reflect what's running.
+    /// No successor from this attempt: the authoritative read found the pod
+    /// bound after all (the caller's `Unschedulable` verdict was stale) or
+    /// already replaced by a concurrent re-drive's successor (required pin
+    /// absent), or a concurrent re-drive's successor POST won (this
+    /// attempt's POST hit 409). The live pod drives the restore.
+    /// `cross_node` distinguishes a retained cross-node successor / fallback
+    /// bind from the original pinned pod binding on the source — the caller's
+    /// placement metric must reflect what's running.
     PodRetained { cross_node: bool },
-    /// Materialization ownership was revoked mid-flight; the successor was
-    /// discarded and the winning attempt drives the restore.
+    /// Materialization ownership wasn't confirmed mid-flight: the claim reset
+    /// or the successor's persist matched no row this attempt owns. Any
+    /// successor this attempt created was discarded.
     OwnershipLost,
+}
+
+/// The `outcome` tag a finished re-drive attempt reports on
+/// `sandbox.restore.redrive`.
+fn redrive_metric_outcome(
+    result: &Result<RedriveOutcome, SubstrateError>,
+) -> pplx_space_metrics::sandbox::restore::RedriveOutcome {
+    use pplx_space_metrics::sandbox::restore::RedriveOutcome as Metric;
+    match result {
+        Ok(RedriveOutcome::Redriven(_)) => Metric::Redriven,
+        Ok(RedriveOutcome::PodRetained { .. }) => Metric::Retained,
+        Ok(RedriveOutcome::OwnershipLost) => Metric::OwnershipLost,
+        Err(_) => Metric::Failed,
+    }
+}
+
+/// Emits exactly one `sandbox.restore.redrive` sample per re-drive attempt:
+/// the recorded outcome when the attempt finishes, `dropped` when its future
+/// is dropped (or unwinds) first.
+struct RedriveMetricGuard {
+    path: pplx_space_metrics::sandbox::restore::RedrivePath,
+    outcome: Option<pplx_space_metrics::sandbox::restore::RedriveOutcome>,
+}
+
+impl Drop for RedriveMetricGuard {
+    fn drop(&mut self) {
+        pplx_space_metrics::sandbox::restore::cross_node_redrive(
+            self.path,
+            self.outcome
+                .unwrap_or(pplx_space_metrics::sandbox::restore::RedriveOutcome::Dropped),
+        );
+    }
 }
 
 /// Classification of a pod re-read after its UID+resourceVersion preconditioned
@@ -1365,6 +1400,39 @@ impl KubernetesSubstrate {
                 kube_error_for_substrate("failed to read pod while awaiting scheduling", err)
             })?;
         Ok(pod.as_deref().and_then(scheduling_outcome_of))
+    }
+
+    /// [`Self::redrive_unschedulable_restore_cross_node`], recording the
+    /// attempt's outcome on `sandbox.restore.redrive`. Both call sites go
+    /// through here so the counter sees every attempt, including the ones
+    /// that return before any placement sample is emitted.
+    #[allow(clippy::too_many_arguments)]
+    async fn redrive_unschedulable_restore_cross_node_recorded(
+        &self,
+        path: pplx_space_metrics::sandbox::restore::RedrivePath,
+        sandbox: &Sandbox,
+        claim: &SandboxExecutionClaim,
+        claim_lifecycle: SandboxLifecycle,
+        caller_source_node: Option<&str>,
+        suspend_restore_storage_uri: Option<&str>,
+        restore_lease_token: Option<Uuid>,
+    ) -> Result<RedriveOutcome, SubstrateError> {
+        let mut metric = RedriveMetricGuard {
+            path,
+            outcome: None,
+        };
+        let result = self
+            .redrive_unschedulable_restore_cross_node(
+                sandbox,
+                claim,
+                claim_lifecycle,
+                caller_source_node,
+                suspend_restore_storage_uri,
+                restore_lease_token,
+            )
+            .await;
+        metric.outcome = Some(redrive_metric_outcome(&result));
+        result
     }
 
     /// Tear down a source-pinned restore pod that came back `Unschedulable` and
@@ -3829,7 +3897,8 @@ impl KubernetesSubstrate {
                     // only a pointer, not the re-drive sub-future. The re-drive
                     // itself re-verifies the pod with an authoritative GET
                     // before any teardown.
-                    match Box::pin(self.redrive_unschedulable_restore_cross_node(
+                    match Box::pin(self.redrive_unschedulable_restore_cross_node_recorded(
+                        pplx_space_metrics::sandbox::restore::RedrivePath::Retry,
                         &sandbox,
                         &claim,
                         claim_lifecycle,
@@ -3846,12 +3915,15 @@ impl KubernetesSubstrate {
                                 PlacementRetryDisposition::RetryConverges,
                             )
                             .await?;
-                            // The interrupted original never reached the metric
-                            // emission for the pinned pod, so this retry's
-                            // successful fallback would otherwise be invisible
-                            // to the cross-host-share signal. The successor's
-                            // source annotation says whether the source still
-                            // held trusted local bytes.
+                            // The original may not have emitted a landing
+                            // for this restore (it was interrupted, or its
+                            // watch ended undecided and recorded
+                            // `placement:unknown`, which share queries
+                            // exclude), so this retry's successful fallback
+                            // could otherwise be invisible to the
+                            // cross-host-share signal. The successor's source
+                            // annotation says whether the source still held
+                            // trusted local bytes.
                             let local_snapshot_present = cross_node_pod
                                 .annotation(SandboxPodKey::SuspendRestoreSourceNode)
                                 .is_some_and(|value| !value.trim().is_empty());
@@ -4609,7 +4681,8 @@ impl KubernetesSubstrate {
                 // frame embeds only a pointer; the re-drive re-verifies the pod
                 // with an authoritative GET before any teardown.
                 Some(SchedulingOutcome::Unschedulable) => {
-                    match Box::pin(self.redrive_unschedulable_restore_cross_node(
+                    match Box::pin(self.redrive_unschedulable_restore_cross_node_recorded(
+                        pplx_space_metrics::sandbox::restore::RedrivePath::FreshCreate,
                         &sandbox,
                         &claim,
                         claim_lifecycle,
