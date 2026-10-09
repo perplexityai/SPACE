@@ -16,6 +16,7 @@ aws-config = { workspace = true, features = ["behavior-version-latest"] }
 aws-credential-types = { workspace = true, features = ["hardcoded-credentials"] }
 aws-sdk-s3 = { workspace = true, features = ["behavior-version-latest", "default-https-client", "http-1x", "rt-tokio", "sigv4a"] }
 aws-smithy-async = { workspace = true }
+aws-smithy-http-client = { workspace = true, features = ["rustls-aws-lc"] }
 aws-smithy-runtime-api = { workspace = true, features = ["client"] }
 aws-smithy-types = { workspace = true }
 base64 = { workspace = true }
@@ -23,6 +24,7 @@ bytes = { workspace = true }
 futures-util = { workspace = true }
 http = { workspace = true }
 http-body = { workspace = true }
+hyper = { workspace = true }
 jiff = { workspace = true }
 md-5 = { workspace = true }
 percent-encoding = { workspace = true }

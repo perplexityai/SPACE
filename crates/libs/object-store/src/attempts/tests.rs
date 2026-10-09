@@ -1,5 +1,7 @@
 use super::*;
-use crate::test_support::{Recorder, credentials, every_class, serve, store, target};
+use crate::test_support::{
+    Recorder, credentials, every_class, serve, store, store_with_pool_idle, target,
+};
 use crate::{ObjectStore, ObjectStoreError};
 use aws_smithy_runtime_api::client::result::ConnectorError;
 use axum::Router;
@@ -7,6 +9,8 @@ use axum::body::Bytes as BodyBytes;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
 
 #[derive(Debug)]
 struct Opaque;
@@ -61,6 +65,16 @@ fn attempt_failures_are_classified_by_cause() {
             connector(ConnectorError::io(Box::new(std::io::Error::from(
                 std::io::ErrorKind::ConnectionReset,
             )))),
+            None,
+            None,
+            S3AttemptFailureKind::Io,
+        ),
+        (
+            "broken pipe the HTTP client did not mark as I/O",
+            connector(ConnectorError::other(
+                Box::new(std::io::Error::from(std::io::ErrorKind::BrokenPipe)),
+                None,
+            )),
             None,
             None,
             S3AttemptFailureKind::Io,
@@ -282,4 +296,123 @@ async fn success_after_a_failed_attempt_reports_the_retry() {
     assert_eq!(recoveries.len(), 1);
     assert_eq!(recoveries[0].1.operation, S3Operation::PutObject);
     assert_eq!(recoveries[0].1.attempts, 2);
+}
+
+/// An S3 stand-in that answers every request `200 OK` on a keep-alive
+/// connection and closes a connection once it has sat idle for
+/// `idle_close`, as S3 does. The close takes effect when the client's next
+/// request arrives, which is what the client sees when the server's close
+/// and its request cross on the wire. A close sent ahead of the request
+/// would reach the client's pool over loopback before its next checkout
+/// and only show the race that rarely.
+async fn closes_idle_connections(idle_close: Duration) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind S3 stand-in");
+    let address = listener.local_addr().expect("S3 stand-in address");
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.expect("accept connection");
+            tokio::spawn(serve_until_idle(stream, idle_close));
+        }
+    });
+    format!("http://{address}")
+}
+
+async fn serve_until_idle(mut stream: TcpStream, idle_close: Duration) {
+    let mut buffered = Vec::new();
+    let mut last_response: Option<Instant> = None;
+    loop {
+        let head_end = loop {
+            if let Some(at) = buffered.windows(4).position(|w| w == b"\r\n\r\n") {
+                break at + 4;
+            }
+            let mut chunk = [0_u8; 8192];
+            match stream.read(&mut chunk).await {
+                Ok(0) | Err(_) => return,
+                Ok(read) => buffered.extend_from_slice(&chunk[..read]),
+            }
+        };
+        let idle = last_response.map(|at| at.elapsed());
+        let head = String::from_utf8_lossy(&buffered[..head_end]).to_ascii_lowercase();
+        let body_len = head
+            .lines()
+            .find_map(|line| line.strip_prefix("content-length:"))
+            .map_or(0, |len| {
+                len.trim().parse::<usize>().expect("content-length")
+            });
+        while buffered.len() < head_end + body_len {
+            let mut chunk = [0_u8; 8192];
+            match stream.read(&mut chunk).await {
+                Ok(0) | Err(_) => return,
+                Ok(read) => buffered.extend_from_slice(&chunk[..read]),
+            }
+        }
+        buffered.drain(..head_end + body_len);
+        if idle.is_some_and(|idle| idle >= idle_close) {
+            // Closed with the request read, so the client sees a FIN rather
+            // than a reset.
+            return;
+        }
+        let response = "HTTP/1.1 200 OK\r\netag: \"synthetic-etag\"\r\ncontent-length: 0\r\n\r\n";
+        if stream.write_all(response.as_bytes()).await.is_err() {
+            return;
+        }
+        last_response = Some(Instant::now());
+    }
+}
+
+/// Two uploads separated by an idle gap longer than the server's idle
+/// close, through a store whose connection pool keeps idle connections for
+/// `pool_idle_timeout`.
+async fn uploads_across_an_idle_close(pool_idle_timeout: Duration) -> Arc<Recorder> {
+    let idle_close = Duration::from_millis(600);
+    let endpoint = closes_idle_connections(idle_close).await;
+    let recorder = Arc::new(Recorder::default());
+    let store = store_with_pool_idle(
+        every_class(Duration::from_secs(10), Duration::from_secs(30)),
+        Duration::from_secs(5),
+        pool_idle_timeout,
+        &recorder,
+    );
+
+    let credentials = credentials();
+    let upload = || {
+        store.put_bytes(
+            &credentials,
+            target(&endpoint),
+            bytes::Bytes::from_static(b"payload"),
+        )
+    };
+    upload().await.expect("first upload");
+    tokio::time::sleep(idle_close * 2).await;
+    upload().await.expect("second upload");
+    recorder
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reusing_a_connection_the_server_closed_fails_as_io_and_is_retried() {
+    let recorder = uploads_across_an_idle_close(Duration::from_secs(90)).await;
+
+    let failures = recorder.failures();
+    assert_eq!(
+        kinds_and_retries(&failures),
+        [(1, S3AttemptFailureKind::Io, true)],
+        "{failures:?}"
+    );
+    assert!(
+        failures[0]
+            .error
+            .contains("connection closed before message completed"),
+        "{failures:?}"
+    );
+    assert_eq!(recorder.recoveries().len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pool_drops_idle_connections_before_the_server_closes_them() {
+    let recorder = uploads_across_an_idle_close(Duration::from_millis(200)).await;
+
+    assert_eq!(recorder.failures(), []);
+    assert_eq!(recorder.recoveries(), []);
 }

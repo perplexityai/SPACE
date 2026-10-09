@@ -29,8 +29,10 @@ metric_vocabulary!(
         /// The operation-wide deadline expired while this attempt was in
         /// flight.
         OperationTimeout => "operation_timeout",
-        /// Transport failure: connect error or timeout, reset, or refused
-        /// connection.
+        /// Transport failure: connect error or timeout, refused or reset
+        /// connection, or a connection the peer closed before the response
+        /// completed (such as a reused keep-alive connection the server had
+        /// already closed).
         Io => "io",
         /// The endpoint answered with a non-throttling 5xx status.
         Http5xx => "http_5xx",

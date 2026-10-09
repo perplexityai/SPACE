@@ -18,6 +18,9 @@ use aws_sdk_s3::operation::head_object::HeadObjectError;
 use aws_sdk_s3::primitives::{ByteStream, ByteStreamError, Length};
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
 use aws_sdk_s3::{Client, Config};
+use aws_smithy_http_client::proxy::ProxyConfig;
+use aws_smithy_http_client::{ConnectorBuilder, tls};
+use aws_smithy_runtime_api::client::http::SharedHttpClient;
 use aws_smithy_types::error::display::DisplayErrorContext;
 use aws_smithy_types::error::metadata::ProvideErrorMetadata;
 use bytes::Bytes;
@@ -417,6 +420,12 @@ const DOWNLOAD_CHUNK_SIZE_ENV: &str = "SPACE_OBJECT_STORE_DOWNLOAD_CHUNK_SIZE_BY
 /// no longer scales with the pull-slot count.
 const DOWNLOAD_BUFFER_BUDGET_ENV: &str = "SPACE_OBJECT_STORE_DOWNLOAD_BUFFER_BUDGET_BYTES";
 
+/// Env var that overrides how long an idle pooled connection stays eligible
+/// for reuse, in whole seconds. Accepted range is `1..=90`; 90 s is hyper's
+/// default, which lets S3 close a connection before the pool drops it. Keep
+/// it below the endpoint's idle close.
+const POOL_IDLE_TIMEOUT_ENV: &str = "SPACE_OBJECT_STORE_POOL_IDLE_TIMEOUT_SECS";
+
 const MULTIPART_PART_SIZE_MIN: usize = 8 * 1024 * 1024;
 const MULTIPART_PART_SIZE_MAX: usize = 5 * 1024 * 1024 * 1024;
 const MULTIPART_CONCURRENCY_MIN: usize = 1;
@@ -428,6 +437,18 @@ const DOWNLOAD_CHUNK_SIZE_MAX: usize = 256 * 1024 * 1024;
 const DEFAULT_DOWNLOAD_BUFFER_BUDGET: usize = 2 * 1024 * 1024 * 1024;
 const DOWNLOAD_BUFFER_BUDGET_MIN: usize = 256 * 1024 * 1024;
 const DOWNLOAD_BUFFER_BUDGET_MAX: usize = 8 * 1024 * 1024 * 1024;
+
+/// How long an idle pooled connection stays eligible for reuse. S3
+/// (us-east-1, measured 2026-10) closes an idle HTTPS keep-alive connection
+/// 6.0 s after its last response, with a TLS close_notify and a FIN; reuse
+/// after 5.8 s works and after 6.2 s fails. The SDK's default client keeps
+/// hyper's 90 s, so a request that takes a pooled connection as S3 closes it
+/// fails with "connection closed before message completed". Half the
+/// server's window leaves room for the time between S3 finishing a response
+/// and the client returning the connection to the pool.
+const DEFAULT_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(3);
+const POOL_IDLE_TIMEOUT_SECS_MIN: u64 = 1;
+const POOL_IDLE_TIMEOUT_SECS_MAX: u64 = 90;
 
 /// Upload stalled-stream grace period. Equal to the SDK's effective default
 /// (aws-smithy-runtime's default stalled-stream plugin sets 5 s; the 20 s
@@ -570,6 +591,13 @@ fn resolve_download_buffer_budget<F: FnOnce(&str) -> Option<String>>(read: F) ->
         .unwrap_or(DEFAULT_DOWNLOAD_BUFFER_BUDGET)
 }
 
+fn resolve_pool_idle_timeout<F: FnOnce(&str) -> Option<String>>(read: F) -> Duration {
+    read(POOL_IDLE_TIMEOUT_ENV)
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&n| (POOL_IDLE_TIMEOUT_SECS_MIN..=POOL_IDLE_TIMEOUT_SECS_MAX).contains(&n))
+        .map_or(DEFAULT_POOL_IDLE_TIMEOUT, Duration::from_secs)
+}
+
 /// Telemetry-safe endpoint label: host and optional port only, so a custom
 /// endpoint URL carrying userinfo or other sensitive components never
 /// reaches exported spans.
@@ -703,7 +731,34 @@ where
     );
 }
 
-fn s3_base_config(timeouts: S3Timeouts, observer: AttemptObserver) -> aws_sdk_s3::config::Builder {
+/// The SDK's default HTTPS client (aws-smithy-runtime
+/// `default_https_client`: rustls with aws-lc, proxy settings from the
+/// environment, the SDK's connect timeout) with `pool_idle_timeout` on its
+/// connection pool. The idle timeout has to be set on the connector builder:
+/// a connector function ignores the outer builder's pool settings.
+fn s3_http_client(pool_idle_timeout: Duration) -> SharedHttpClient {
+    aws_smithy_http_client::Builder::new().build_with_connector_fn(
+        move |settings, runtime_components| {
+            let mut connector = ConnectorBuilder::default()
+                .pool_idle_timeout(pool_idle_timeout)
+                .tls_provider(tls::Provider::Rustls(
+                    tls::rustls_provider::CryptoMode::AwsLc,
+                ));
+            connector.set_connector_settings(settings.cloned());
+            if let Some(components) = runtime_components {
+                connector.set_sleep_impl(components.sleep_impl());
+            }
+            connector.set_proxy_config(Some(ProxyConfig::from_env()));
+            connector.build()
+        },
+    )
+}
+
+fn s3_base_config(
+    timeouts: S3Timeouts,
+    pool_idle_timeout: Duration,
+    observer: AttemptObserver,
+) -> aws_sdk_s3::config::Builder {
     let placeholder_creds = Credentials::new(
         "placeholder",
         "placeholder",
@@ -715,6 +770,7 @@ fn s3_base_config(timeouts: S3Timeouts, observer: AttemptObserver) -> aws_sdk_s3
         .behavior_version(BehaviorVersion::latest())
         .region(Region::new("us-east-1"))
         .credentials_provider(placeholder_creds)
+        .http_client(s3_http_client(pool_idle_timeout))
         // aws-sdk-s3 1.79+ defaults to `WhenSupported`, which can add
         // opportunistic CRC trailers to ordinary PUT bodies via streaming
         // chunked encoding. SPACE snapshot uploads have seen those requests
@@ -766,19 +822,30 @@ impl S3ObjectStore {
     /// - `SPACE_OBJECT_STORE_{REQUEST,BODY_UPLOAD,SERVER_SIDE}_OPERATION_TIMEOUT_SECS`:
     ///   5..=86400, default three attempt timeouts plus 5 s of retry backoff
     ///   (35, 185, and 95). Bound an operation across all of its retries.
+    /// - `SPACE_OBJECT_STORE_POOL_IDLE_TIMEOUT_SECS`: 1..=90, default 3. How
+    ///   long an idle pooled connection stays eligible for reuse; keep it
+    ///   below the endpoint's idle close (S3: 6 s).
     pub fn new() -> Self {
         let timeouts = S3Timeouts::from_env();
+        let pool_idle_timeout = resolve_pool_idle_timeout(|name| std::env::var(name).ok());
         let attempts = AttemptObserver::logging();
         Self::with_base_config(
-            s3_base_config(timeouts, attempts.clone()).build(),
+            s3_base_config(timeouts, pool_idle_timeout, attempts.clone()).build(),
             timeouts,
+            pool_idle_timeout,
             attempts,
         )
     }
 
     /// `attempts` must be the observer `conf` carries, so body-read failures
-    /// the SDK never sees reach the same reporter as its own attempts.
-    fn with_base_config(conf: Config, timeouts: S3Timeouts, attempts: AttemptObserver) -> Self {
+    /// the SDK never sees reach the same reporter as its own attempts, and
+    /// `pool_idle_timeout` the one its HTTP client was built with.
+    fn with_base_config(
+        conf: Config,
+        timeouts: S3Timeouts,
+        pool_idle_timeout: Duration,
+        attempts: AttemptObserver,
+    ) -> Self {
         let multipart_part_size = resolve_multipart_part_size(|name| std::env::var(name).ok());
         let multipart_concurrency = resolve_multipart_concurrency(|name| std::env::var(name).ok());
         let download_reader_concurrency =
@@ -801,6 +868,7 @@ impl S3ObjectStore {
             body_upload_operation_timeout_secs = timeouts.body_upload.operation.as_secs(),
             server_side_attempt_timeout_secs = timeouts.server_side.attempt.as_secs(),
             server_side_operation_timeout_secs = timeouts.server_side.operation.as_secs(),
+            pool_idle_timeout_secs = pool_idle_timeout.as_secs(),
             "object-store: transfer tuning"
         );
         Self {

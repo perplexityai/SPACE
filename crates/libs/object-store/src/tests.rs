@@ -28,7 +28,12 @@ fn unset_env() -> impl FnOnce(&str) -> Option<String> {
 
 #[test]
 fn base_config_only_calculates_request_checksums_when_required() {
-    let config = s3_base_config(S3Timeouts::resolve(|_| None), AttemptObserver::logging()).build();
+    let config = s3_base_config(
+        S3Timeouts::resolve(|_| None),
+        DEFAULT_POOL_IDLE_TIMEOUT,
+        AttemptObserver::logging(),
+    )
+    .build();
 
     assert_eq!(
         config.request_checksum_calculation(),
@@ -215,6 +220,27 @@ fn download_reader_concurrency_default_and_bounds() {
         resolve_download_reader_concurrency(fake_env(DOWNLOAD_READER_CONCURRENCY_ENV, Some("0"))),
         DEFAULT_DOWNLOAD_READER_CONCURRENCY,
     );
+}
+
+#[test]
+fn pool_idle_timeout_overrides_and_falls_back_out_of_range() {
+    assert_eq!(
+        resolve_pool_idle_timeout(unset_env()),
+        DEFAULT_POOL_IDLE_TIMEOUT
+    );
+    assert_eq!(
+        resolve_pool_idle_timeout(fake_env(POOL_IDLE_TIMEOUT_ENV, Some("5"))),
+        Duration::from_secs(5),
+    );
+    let below = (POOL_IDLE_TIMEOUT_SECS_MIN - 1).to_string();
+    let above = (POOL_IDLE_TIMEOUT_SECS_MAX + 1).to_string();
+    for value in [below.as_str(), above.as_str(), "3.5", "soon"] {
+        assert_eq!(
+            resolve_pool_idle_timeout(|_: &str| Some(value.to_string())),
+            DEFAULT_POOL_IDLE_TIMEOUT,
+            "{value}"
+        );
+    }
 }
 
 #[test]

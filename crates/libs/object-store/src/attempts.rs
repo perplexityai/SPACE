@@ -414,8 +414,11 @@ fn service_error_code(error: &Error) -> Option<&str> {
 /// [`TimedOutError`] in their source chain, so they are transport failures.
 /// The other producer is upload stalled-stream protection, whose error type
 /// is private to aws-smithy-runtime; a connector timeout without that marker
-/// is therefore a stall cut. Throttling is checked first and uses the same
-/// rule as the operation-level `s3_error` classification.
+/// is therefore a stall cut. A connection the peer closed before the
+/// response arrived is a transport failure too, although the HTTP client
+/// reports hyper's `IncompleteMessage` as a transient *other* connector
+/// error rather than an I/O one. Throttling is checked first and uses the
+/// same rule as the operation-level `s3_error` classification.
 pub(crate) fn classify_attempt_failure<E>(
     error: &OrchestratorError<E>,
     http_status: Option<u16>,
@@ -431,7 +434,7 @@ pub(crate) fn classify_attempt_failure<E>(
             } else {
                 S3AttemptFailureKind::StalledStream
             }
-        } else if connector.is_io() {
+        } else if connector.is_io() || is_closed_by_peer(connector) {
             S3AttemptFailureKind::Io
         } else {
             S3AttemptFailureKind::Other
@@ -467,10 +470,38 @@ fn has_timer_source(error: &(dyn std::error::Error + 'static)) -> bool {
     has_source::<TimedOutError>(error)
 }
 
+/// Whether the peer closed or reset the connection under the request: hyper
+/// saw the connection end before a complete response head
+/// (`IncompleteMessage`, the shape of reusing a pooled connection the server
+/// has just closed), or the socket failed with a reset or broken pipe.
+fn is_closed_by_peer(error: &(dyn std::error::Error + 'static)) -> bool {
+    any_source(error, |error| {
+        if let Some(error) = error.downcast_ref::<hyper::Error>() {
+            return error.is_incomplete_message();
+        }
+        error.downcast_ref::<std::io::Error>().is_some_and(|error| {
+            matches!(
+                error.kind(),
+                std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::UnexpectedEof
+            )
+        })
+    })
+}
+
 fn has_source<T: std::error::Error + 'static>(error: &(dyn std::error::Error + 'static)) -> bool {
+    any_source(error, |error| error.is::<T>())
+}
+
+fn any_source(
+    error: &(dyn std::error::Error + 'static),
+    matches: impl Fn(&(dyn std::error::Error + 'static)) -> bool,
+) -> bool {
     let mut next = Some(error);
     while let Some(error) = next {
-        if error.is::<T>() {
+        if matches(error) {
             return true;
         }
         next = error.source();
