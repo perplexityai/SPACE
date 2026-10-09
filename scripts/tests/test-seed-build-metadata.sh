@@ -56,14 +56,35 @@ case "${1:-}" in
       exit 97
     }
     env_file=""
+    container_id=""
+    prev=""
     while [[ $# -gt 0 ]]; do
       if [[ "$1" == type=bind,src=*,dst=/workspace/inputs,* ]]; then
         src="${1#type=bind,src=}"
         src="${src%%,dst=*}"
         env_file="${src}/rootfs-builder.env"
       fi
+      # ctr run <options> <image-ref> <container-id> <cmd...>
+      if [[ -z "$container_id" && "$prev" == docker.io/*@sha256:* ]]; then
+        container_id="$1"
+      fi
+      prev="$1"
       shift
     done
+    # Mirror containerd's identifier validation (identifiers.Validate).
+    [[ -n "$container_id" ]] || {
+      echo "ctr run: no container ID after the image ref" >&2
+      exit 1
+    }
+    if (( ${#container_id} > 76 )); then
+      echo "ctr: create container failed validation: container.ID: identifier \"${container_id}\" greater than maximum length (76 characters): invalid argument" >&2
+      exit 1
+    fi
+    [[ "$container_id" =~ ^[A-Za-z0-9]+([._-][A-Za-z0-9]+)*$ ]] || {
+      echo "ctr: container.ID: identifier \"${container_id}\" must match ^[A-Za-z0-9]+(?:[._-](?:[A-Za-z0-9]+))*\$: invalid argument" >&2
+      exit 1
+    }
+    printf '%s\n' "$container_id" >"${CAPTURED_CONTAINER_ID:?CAPTURED_CONTAINER_ID is required}"
     [[ -n "$env_file" && -f "$env_file" ]] || {
       echo "rootfs-builder env file was not staged" >&2
       exit 1
@@ -120,6 +141,7 @@ make_case_dirs() {
   guest_bin_dir="${case_root}/guest-bin"
   rootfs_builder="${case_root}/rootfs-builder.sh"
   captured_env="${case_root}/rootfs-builder.env"
+  captured_container_id="${case_root}/container-id"
   pubkey="${case_root}/sandbox_ed25519.pub"
   cargo_toml="${case_root}/Cargo.toml"
 
@@ -138,6 +160,7 @@ run_success() {
     PATH="${fake_bin}:${PATH}" \
     ALLOW_CTR_RUN=1 \
     CAPTURED_ENV="$captured_env" \
+    CAPTURED_CONTAINER_ID="$captured_container_id" \
     SPACE_SEED_OUTPUT_DIR="$out_dir" \
     SPACE_SEED_CACHE_DIR="$cache_dir" \
     SPACE_SEED_STAGE_ROOT="$stage_root" \
@@ -275,6 +298,35 @@ env -i bash --noprofile --norc -c 'source "$1"' _ "$captured_env" >/dev/null 2>&
 for name in "${!hostile[@]}"; do
   assert_export "$captured_env" "$name" "${hostile[$name]}"
 done
+
+# The ctr container ID is bounded by containerd's 76-character identifier
+# limit. It must fit for any template ID and for any PID the kernel can hand
+# out (pid_max is at most 2^22, i.e. 7 digits), so a long-lived builder whose
+# PID counter passed 1,000,000 cannot push a long template ID over the limit.
+assert_container_id_fits() {
+  local case_name="$1"
+  local container_id pid_suffix base
+  container_id="$(cat "$captured_container_id")"
+  pid_suffix="${container_id##*-}"
+  base="${container_id%-*}"
+  [[ "$pid_suffix" =~ ^[0-9]+$ ]] || {
+    echo "${case_name}: expected a PID suffix in container ID ${container_id}" >&2
+    exit 1
+  }
+  (( ${#base} + 1 + 7 <= 76 )) || {
+    echo "${case_name}: container ID ${container_id} exceeds 76 characters with a 7-digit PID" >&2
+    exit 1
+  }
+}
+
+# Shape used by the template recipe build smoke: seed-bk-smoke-<job uuid>.
+smoke_shaped_id="seed-bk-smoke-00000000-0000-4000-8000-000000000000"
+run_success "$smoke_shaped_id"
+assert_container_id_fits smoke-shaped-id
+
+long_id="seed-$(printf 'x%.0s' {1..120})"
+run_success "$long_id"
+assert_container_id_fits long-id
 
 rootfs_stderr="${tmp_dir}/rootfs-kernel-pair.stderr"
 set +e

@@ -112,7 +112,12 @@ echo "Architecture: ${ARCH} (containerd: ${CONTAINER_PLATFORM}, rust: ${RUST_TAR
 OUTDIR="${SPACE_SEED_OUTPUT_DIR:-${REPO_ROOT}/templates/firecracker/seed/output/${ID}}"
 CACHEDIR="${SPACE_SEED_CACHE_DIR:-${REPO_ROOT}/templates/firecracker/seed/.cache}"
 GUEST_BINS=(spaced-svc spaced)
-CONTAINER_NAME="space-seed-builder-${ID}-$$"
+# containerd rejects container IDs longer than 76 characters. Embedding the raw
+# template ID made the name depend on both the ID length and the PID digit count,
+# so long IDs failed once a builder's PID counter passed 1,000,000. A short
+# digest keeps the name unique per ID and bounded (19 + 16 + 1 + <=7 digits).
+CONTAINER_ID_DIGEST="$(printf '%s' "$ID" | sha256sum | cut -c1-16)"
+CONTAINER_NAME="space-seed-builder-${CONTAINER_ID_DIGEST}-$$"
 STAGE_ROOT="${SPACE_SEED_STAGE_ROOT:-$(dirname "${CACHEDIR}")/scratch-bundles}"
 BUNDLE_DIR=""
 INPUT_DIR=""
