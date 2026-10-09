@@ -621,6 +621,8 @@ pub async fn run(
         "acquired service mutex; transitioning to active"
     );
     health_server.mark_starting();
+    // Blocking startup work retains a clone if its awaiting future is dropped.
+    let service_mutex = std::sync::Arc::new(service_mutex);
 
     // Reject incompatible ownership before any host limit can shrink beneath
     // live sandboxes. Pool construction repeats this check before row repair.
@@ -750,19 +752,26 @@ pub async fn run(
     // Initialization can start pool workers. Drain them on every exit while
     // retaining active ownership, including a later initialization failure.
     let active_result: Result<(), RunNodeMgrError> = async {
-        let service = NodeManagerService::with_memory_admission_config_and_task_tracker(
+        let service = match NodeManagerService::with_memory_admission_config_and_task_tracker(
             pool_config.clone(),
             sandbox_cgroup_config,
             memory_admission_config,
             service_settings,
             task_tracker.clone(),
             shutdown_token.clone(),
+            service_mutex.clone(),
         )
-        .await
-        .map_err(RunNodeMgrError::NodeManagerService)?;
+        .await {
+            Ok(service) => service,
+            Err(crate::slot_pool::PoolOpenError::StartupCancelled) => return Ok(()),
+            Err(error) => return Err(RunNodeMgrError::NodeManagerService(error)),
+        };
 
         service.verify_execution_authority().await
             .map_err(RunNodeMgrError::ExecutionAuthority)?;
+        if shutdown_token.is_cancelled() {
+            return Ok(());
+        }
 
         let sandbox_cgroup_vcpu_count = sandbox_cgroup_config
             .vcpu_count

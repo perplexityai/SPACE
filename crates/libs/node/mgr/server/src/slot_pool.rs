@@ -304,6 +304,10 @@ pub enum SlotStoreError {
 
 #[derive(Debug, thiserror::Error)]
 pub enum PoolOpenError {
+    #[error("network pool startup was cancelled")]
+    StartupCancelled,
+    #[error("network pool startup task failed: {0}")]
+    StartupTask(#[source] tokio::task::JoinError),
     #[error("invalid network pool configuration: {0}")]
     Configuration(String),
     #[error("cannot create network pool database directory {}: {source}", path.display())]
@@ -705,50 +709,17 @@ impl NetworkPool {
         // Existing durable TAP namespaces must carry both containments before
         // the node admits work: guest L2 ingress filtering and the constrained
         // direct inbound reply path. Probe each TAP once and apply both.
-        let mut containment_error = None;
-        for record in query_records(&conn, None).map_err(SlotStoreError::from)? {
-            let namespace = record.info.ns_name();
-            if !net::ns_exists(&namespace) {
-                continue;
-            }
-            let tap_exists = match net::try_link_exists_in(net::TAP_DEVICE, Some(&namespace)) {
-                Ok(tap_exists) => tap_exists,
-                Err(source) => {
-                    let error = PoolOpenError::ExistingTapProbe {
-                        namespace: namespace.clone(),
-                        source,
-                    };
-                    tracing::error!(%error, "cannot inspect existing TAP containment");
-                    containment_error.get_or_insert(error);
-                    continue;
-                }
-            };
-            if !tap_exists {
-                continue;
-            }
-            if let Err(source) = crate::firewall::ensure_guest_l2_ingress_policy(&namespace) {
-                let error = PoolOpenError::GuestL2Ingress {
-                    namespace: namespace.clone(),
-                    source,
-                };
-                tracing::error!(%error, "cannot install existing TAP containment");
-                containment_error.get_or_insert(error);
-            }
-            if let Err(source) = crate::firewall::constrain_direct_inbound_reply_path(&namespace) {
-                let error = PoolOpenError::DirectInboundReplyPath {
-                    namespace: namespace.clone(),
-                    source,
-                };
-                tracing::error!(%error, "cannot constrain existing direct inbound reply path");
-                containment_error.get_or_insert(error);
-            }
-        }
-        // Attempt every existing TAP before failing activation. Quarantining and
-        // continuing would leave an active leased VM reachable, while repair only
-        // rebuilds quarantined rows after the lease is cleared.
-        if let Some(error) = containment_error {
-            return Err(error);
-        }
+        let namespaces: Vec<_> = query_records(&conn, None)
+            .map_err(SlotStoreError::from)?
+            .into_iter()
+            .map(|record| record.info.ns_name())
+            .collect();
+        startup_containment::contain_namespaces(
+            &namespaces,
+            startup_containment::CONCURRENCY,
+            &shutdown_token,
+            startup_containment::contain_namespace,
+        )?;
         let startup_leasing = query_startup_leasing(&conn)?;
         let startup_leases = query_startup_leases(&conn)?;
         backfill_active_memory_reservations(&conn, legacy_active_memory_reservation_mib)
@@ -2018,6 +1989,7 @@ mod execution;
 mod liveness;
 mod reset;
 mod scheduler;
+mod startup_containment;
 use liveness::{LeaseLiveness, lease_liveness, lease_may_be_live};
 #[cfg(test)]
 mod tests;

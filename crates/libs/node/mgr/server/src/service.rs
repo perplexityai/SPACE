@@ -290,13 +290,21 @@ impl NodeManagerService {
         settings: crate::config::ServiceSettings,
         task_tracker: tokio_util::task::TaskTracker,
         shutdown_token: tokio_util::sync::CancellationToken,
+        startup_ownership: std::sync::Arc<pplx_space_common_svc::service_mutex::ServiceMutex>,
     ) -> Result<Self, crate::slot_pool::PoolOpenError> {
-        let pool = NetworkPool::open(
-            config,
-            sandbox_cgroup_config.memory_mib_or_default(),
-            task_tracker.clone(),
-            shutdown_token,
-        )?;
+        let pool_tracker = task_tracker.clone();
+        let memory_mib = sandbox_cgroup_config.memory_mib_or_default();
+        let span = tracing::Span::current();
+        // Startup host commands must not stall liveness. Track and await the
+        // whole pass; shutdown cannot abandon namespace mutations under ownership.
+        let pool = task_tracker
+            .spawn_blocking(move || {
+                let _ownership = startup_ownership;
+                let _entered = span.enter();
+                NetworkPool::open(config, memory_mib, pool_tracker, shutdown_token)
+            })
+            .await
+            .map_err(crate::slot_pool::PoolOpenError::StartupTask)??;
         let disk_admission = std::sync::Arc::new(DiskAdmission::new(settings.disk_admission).await);
         let prepared_rootfs_reservations = prepared_rootfs::PreparedRootfsReservations::recover(
             &disk_admission,

@@ -199,6 +199,21 @@ apply. Local execution-authority validation remains under recovery admission.
 These availability checks do not guarantee that node-manager will stay available
 through recovery, and do not extend any caller's request deadline.
 
+Existing namespace containment runs with at most four workers, preserving the
+order of checks within each namespace. All checks finish before admission;
+any failure prevents activation. Shutdown stops scheduling new namespaces and
+waits for in-flight host commands before releasing service ownership. The pool
+opens on tracked blocking work so its host commands do not stall local liveness.
+
+An opt-in Linux benchmark exercises production containment against synthetic
+network namespaces and nftables rules, comparing sequential and bounded parallel
+passes. Run only inside a disposable container with network namespace capabilities:
+
+```sh
+SPACE_RUN_CONTAINMENT_BENCHMARK=1 cargo test -p pplx-space-node-mgr --lib \
+  linux_containment_benchmark -- --ignored --nocapture
+```
+
 ## Security boundaries
 
 Firecracker isolates guest execution. Host-side services still require privileges to manage VMs, storage, and networking.
