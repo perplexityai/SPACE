@@ -26,7 +26,7 @@ config = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(config)
 
 
-@pytest.mark.parametrize("mode", ["datadog", "otel", "journald"])
+@pytest.mark.parametrize("mode", ["datadog", "otel", "off"])
 def test_chart_and_executed_shim_share_isolated_identity(mode, tmp_path):
     settings = config.configuration(
         {
@@ -88,7 +88,7 @@ def test_chart_and_executed_shim_share_isolated_identity(mode, tmp_path):
             == {
                 "datadog": "datadog",
                 "otel": "otlp",
-                "journald": "journald",
+                "off": "off",
             }[mode]
         )
         if mode == "otel":
@@ -111,14 +111,19 @@ def test_chart_and_executed_shim_share_isolated_identity(mode, tmp_path):
             assert env["SPACE_CLUSTER_ID"] == launch["SPACE_CLUSTER_ID"]
     # Each signal goes to its own Collector: traces for the shim's spans,
     # metrics for its OTLP sink.
-    assert launch["OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"] == (
-        config.collector_endpoint(settings, "traces") if mode == "otel" else LOCAL_ENDPOINT
-    )
-    assert launch["SPACE_TRACE_EXPORTER"] == ("otlp" if mode == "otel" else "datadog")
+    if mode == "off":
+        assert not any(key.startswith("OTEL_EXPORTER_OTLP_") for key in launch)
+    else:
+        assert launch["OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"] == (
+            config.collector_endpoint(settings, "traces")
+            if mode == "otel"
+            else LOCAL_ENDPOINT
+        )
     # The shim reads SPACE_METRICS_SINK as well; it must follow the mode, or an
     # otel run leaves the shim on native metrics while the workloads move.
-    assert launch["SPACE_METRICS_SINK"] == ("otlp" if mode == "otel" else
-                                            "off" if mode == "journald" else "datadog")
+    expected = {"datadog": "datadog", "otel": "otlp", "off": "off"}[mode]
+    assert launch["SPACE_TRACE_EXPORTER"] == expected
+    assert launch["SPACE_METRICS_SINK"] == expected
     # Shim metrics have no endpoint fallback, unlike traces.
     assert ("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT" in launch) == (mode == "otel")
     if mode == "otel":
@@ -375,41 +380,11 @@ def test_shim_endpoint_override_follows_the_shared_rule(endpoint, rejected) -> N
         assert config.configuration(environment)["shim_endpoint"] == endpoint
 
 
-def test_kind_defaults_to_otel_with_the_local_backends():
+def test_kind_defaults_to_otel():
     """An unconfigured bootstrap must land telemetry somewhere queryable.
 
     The previous default was `datadog`, while `SPACE_KIND_DATADOG_MODE`
     defaults to `off` -- so a default cluster emitted DogStatsD to an Agent
     that was never installed and the measurements went nowhere.
     """
-    settings = config.configuration({})
-    assert settings["mode"] == "otel"
-    assert settings["install_observability"] is True
-
-
-@pytest.mark.parametrize(
-    "env,mode,installs",
-    [
-        ({}, "otel", True),
-        ({"SPACE_KIND_TELEMETRY_MODE": "datadog"}, "datadog", False),
-        ({"SPACE_KIND_TELEMETRY_MODE": "journald"}, "journald", False),
-        ({"SPACE_KIND_OBSERVABILITY": "off"}, "otel", False),
-        ({"SPACE_KIND_OBSERVABILITY": "auto"}, "otel", True),
-    ],
-)
-def test_backends_install_only_when_the_mode_uses_them(env, mode, installs):
-    """The backends serve only `otel` mode.
-
-    So the install decision has to follow the selected mode, and `off` has to
-    be able to refuse it for a caller that supplies its own receiver -- which
-    is how CI keeps its Kind jobs lean.
-    """
-    settings = config.configuration(dict(env))
-    assert settings["mode"] == mode
-    assert settings["install_observability"] is installs
-
-
-def test_an_unknown_observability_selector_is_rejected():
-    """A typo must not quietly skip the backends the mode needs."""
-    with pytest.raises(ValueError, match="SPACE_KIND_OBSERVABILITY"):
-        config.configuration({"SPACE_KIND_OBSERVABILITY": "yes"})
+    assert config.configuration({})["mode"] == "otel"

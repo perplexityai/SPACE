@@ -54,8 +54,8 @@ local(["bash", "infra/space/kind/scripts/check-object-store-transition.sh", KIND
 # "Upgrading from the node-stack layout" in infra/space/kind/README.md.
 local(["bash", "infra/space/kind/scripts/check-node-layout.sh", KIND_CLUSTER], quiet = True)
 
-# Select one metrics sink per process. The Datadog and OTel comparison modes
-# also select the matching trace exporter; journald leaves traces on Datadog.
+# Select one metrics sink per process. The datadog and otel modes also select
+# the matching trace exporter; off disables both.
 # These local selectors do not activate any deployed environment.
 TELEMETRY_SCRIPT = "infra/space/kind/scripts/telemetry_config.py"
 OBSERVABILITY_CONFIG = os.getenv("SPACE_KIND_OBSERVABILITY_CONFIG", "")
@@ -70,14 +70,11 @@ DATADOG_MODE = TELEMETRY_CONFIG["backend"]
 TELEMETRY_MODE = TELEMETRY_CONFIG["mode"]
 TELEMETRY_SET = TELEMETRY_CONFIG["helm_set"]
 watch_file("infra/space/kind/charts/space-kind-telemetry")
-INSTALL_OBSERVABILITY = TELEMETRY_CONFIG["install_observability"]
-if TELEMETRY_MODE == "otel" and not INSTALL_OBSERVABILITY:
-    print("otel mode with SPACE_KIND_OBSERVABILITY=off: point the telemetry chart's endpoints at your own receiver, or exports will have nowhere to go.")
 
 # The local backends otel mode exports to, installed as on the bootstrap path.
 # Nothing waits on them: the shim addresses the Collectors by fixed ClusterIPs,
 # and every exporter retries until a receiver answers.
-if INSTALL_OBSERVABILITY:
+if TELEMETRY_MODE == "otel":
     local_resource(
         "install-observability-backends",
         cmd = "SPACE_KIND_CLUSTER={} bash infra/space/kind/scripts/install-observability.sh".format(KIND_CLUSTER),

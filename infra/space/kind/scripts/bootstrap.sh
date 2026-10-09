@@ -28,14 +28,13 @@
 #   SPACE_KIND_DATADOG_MODE  off (default), fakeintake, or explicit saas
 #   SPACE_KIND_OBSERVABILITY_CONFIG watched non-secret experiment JSON file;
 #                            required for SaaS. See the Kind README.
-#   SPACE_KIND_OBSERVABILITY auto (default) installs the local metrics, traces,
-#                            logs and visualization backends when the telemetry
-#                            mode uses them; off skips them.
-#   SPACE_KIND_TELEMETRY_MODE otel (default), datadog, or journald. The otel
-#                            mode sends SPACE traces (including the Go shim)
-#                            and all Rust metric types to the Collectors,
-#                            and moves the Go shim's metrics there too. Rust
-#                            metrics sinks are exclusive; logs stay on stdout.
+#   SPACE_KIND_TELEMETRY_MODE otel (default), datadog, or off. The otel
+#                            mode installs the local metrics, traces, logs and
+#                            visualization backends and sends SPACE traces and
+#                            all metric types, the Go shim's included, to the
+#                            Collectors. datadog uses the native exporters; off
+#                            disables metrics and traces. Metrics sinks are
+#                            exclusive; logs stay on stdout in every mode.
 #
 # Host-path knobs, shared with the rendered cluster config and documented in
 # infra/space/kind/scripts/lib/kind-host-paths.sh:
@@ -91,10 +90,6 @@ TELEMETRY_HELM_ARGS=()
 while IFS= read -r value; do
   TELEMETRY_HELM_ARGS+=(--set-string "$value")
 done <<<"$telemetry_values"
-INSTALL_OBSERVABILITY="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["install_observability"])' <<<"$TELEMETRY_JSON")"
-if [[ "$TELEMETRY_MODE" == otel && "$INSTALL_OBSERVABILITY" != True ]]; then
-  log "otel mode with SPACE_KIND_OBSERVABILITY=off: point SPACE_KIND_SHIM_OTLP_ENDPOINT and the telemetry chart's endpoints at your own receiver, or exports will have nowhere to go."
-fi
 
 # ── Step 0: prereqs ──────────────────────────────────────────────────────────
 require_bin() {
@@ -270,7 +265,7 @@ done
 # has a receiver, but nothing depends on them: the shim addresses the
 # Collectors by fixed ClusterIPs, and every exporter retries until a receiver
 # answers. Each helper is idempotent and refuses any cluster but this bench.
-if [[ "$INSTALL_OBSERVABILITY" == True ]]; then
+if [[ "$TELEMETRY_MODE" == otel ]]; then
   bash "$KIND_DIR/scripts/install-observability.sh"
 fi
 

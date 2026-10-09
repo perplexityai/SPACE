@@ -23,9 +23,10 @@ and `infra/space/kind/traces/local.sh up`; no Datadog Agent is required.
 | `telemetry.otlpMetricsEndpoint` | `http://collector.space-metrics.svc.cluster.local:4317` | `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` |
 | `telemetry.otlpTracesEndpoint` | `http://collector.space-traces.svc.cluster.local:4317` | `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` |
 
-Each signal's endpoint and protocol variables are emitted only when its sink
-or exporter is `otlp`. `telemetry.otlpProtocol` defaults to `grpc` and supplies
-both per-signal protocol variables. The generic `OTEL_EXPORTER_OTLP_ENDPOINT`
-is not emitted. Logs stay on stdout for Alloy to collect; they need no endpoint.
-The node-hosted shim cannot use pod DNS, so it addresses each Collector by the
+Each signal's endpoint and protocol variables are emitted only when its sink or
+exporter is `otlp`, so `off` mode renders `off` for both and no endpoints.
+`telemetry.otlpProtocol` defaults to `grpc` and supplies both per-signal
+protocol variables. The generic `OTEL_EXPORTER_OTLP_ENDPOINT` is not emitted.
+Logs stay on stdout for Alloy to collect; they need no endpoint. The
+node-hosted shim cannot use pod DNS, so it addresses each Collector by the
 fixed ClusterIP that chart's Kind profile pins.

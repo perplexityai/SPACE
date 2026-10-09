@@ -259,26 +259,25 @@ can be removed and reinstalled under a running stack. No manual Collector
 installation is needed on these default paths. Each helper is
 idempotent, so re-running bootstrap does not churn them.
 
-To keep a cluster lean, or to point the exporters at a receiver you run
-yourself:
+The `off` and `datadog` modes install no local backends:
 
 ```bash
-# No local backends; supply your own receiver.
-SPACE_KIND_OBSERVABILITY=off bash infra/space/kind/scripts/bootstrap.sh
+# No metrics or traces at all, and no local backends.
+SPACE_KIND_TELEMETRY_MODE=off bash infra/space/kind/scripts/bootstrap.sh
 
 # Native Datadog instead, with local capture rather than the SaaS backend.
 SPACE_KIND_TELEMETRY_MODE=datadog SPACE_KIND_DATADOG_MODE=fakeintake \
   bash infra/space/kind/scripts/bootstrap.sh
 ```
 
-When skipping local backends in `otel` mode, set `SPACE_KIND_SHIM_OTLP_ENDPOINT`
-to a node-reachable OTLP/gRPC receiver and configure the workload endpoints
-described below. `SPACE_KIND_OBSERVABILITY=off` skips backend installation; it
-does not disable exporters or uninstall existing releases.
-
-CI pins `SPACE_KIND_OBSERVABILITY=off` and `SPACE_KIND_TELEMETRY_MODE=datadog`
-for the Kind smoke shards: they test sandbox lifecycle, and the backends'
+`off` sets `SPACE_METRICS_SINK=off` and `SPACE_TRACE_EXPORTER=off` for every
+Rust service and the shim, with no OTLP endpoint or identity overrides. CI pins
+it for the Kind smoke shards: they test sandbox lifecycle, and the backends'
 images are not in `ci/mirrored-images.txt`.
+
+To export to a receiver you run yourself, stay in `otel` mode, set
+`SPACE_KIND_SHIM_OTLP_ENDPOINT` for the shim and override the workload
+endpoints below. The local backends are still installed alongside it.
 
 Rust workloads send metrics to
 `http://collector.space-metrics.svc.cluster.local:4317` and traces to
@@ -291,11 +290,6 @@ exporters. Logs stay on stdout for Alloy to collect; no log endpoint is needed.
 `otel` is the Kind default. Set `SPACE_KIND_TELEMETRY_MODE=datadog` to return
 to native Datadog metrics and traces; pair it with
 `SPACE_KIND_DATADOG_MODE=fakeintake` for local capture.
-
-One thing the table does not show: `journald` suppresses Rust metrics rather
-than writing them to the journal. The sink emits on a tracing target every
-formatting layer filters out, and no journald layer is installed, so expect no
-Rust metric output. It keeps Datadog traces.
 
 The two selectors are independent. `SPACE_KIND_DATADOG_MODE` chooses where the
 Agent sends what it collects, and `SPACE_KIND_TELEMETRY_MODE=otel` bypasses the
@@ -338,8 +332,8 @@ for a side-by-side capture; `otel` does not require one.
 
 `datadog` remains an explicit rollback option. The default `otel` mode selects
 the exclusive `SPACE_METRICS_SINK=otlp` and `SPACE_TRACE_EXPORTER=otlp` paths with an
-`always_on` diagnostic trace sampler. `journald` suppresses Rust metrics and
-leaves traces on Datadog. In `otel` mode the shim moves to OTLP as well.
+`always_on` diagnostic trace sampler, and `off` turns both signals off. In
+`otel` mode the shim moves to OTLP as well.
 There is no dual-publish or non-counter mode. Counters use the same metric
 names: native intake reports RATE and OTLP reports COUNT. Compare event totals
 rather than raw values, and keep a same-name type comparison off any backend
@@ -438,10 +432,10 @@ verify. Previously ingested SaaS data remains subject to backend retention.
 
 The same mode selects the Go containerd shim's trace exporter and its metrics
 sink: `datadog` keeps DogStatsD, `otel` moves the shim to OTLP alongside the
-workloads, and `journald` disables shim metrics, since the shim has no
-journald sink. In `datadog` and `journald` modes the wrapper leaves the SPACE
-and OTel identity settings unset, so the shim's DogStatsD tags are exactly
-what they were before this mode existed. Because containerd starts
+workloads, and `off` disables both. In `datadog` and `off` modes the wrapper
+leaves the SPACE and OTel identity settings unset, so the shim's DogStatsD tags
+are exactly what they were before this mode existed; `off` sets no OTLP
+endpoint either. Because containerd starts
 the shim on the Kind node rather than in a Pod, `install-shim.sh` installs a
 small production-shaped wrapper around the compiled binary instead of relying
 on workload environment inheritance. Kind nodes cannot resolve pod DNS, but
@@ -471,10 +465,9 @@ Do the same for `space-traces`, then re-run `install-shim.sh` (bootstrap and
 Tilt both do) so the wrapper names the pinned addresses.
 
 The shim takes `SPACE_METRICS_SINK` from the same telemetry mode as the Rust
-workloads: `datadog` keeps DogStatsD, `otel` selects OTLP, and `journald` maps to
-`off` because the Go shim has no journald sink and rejects that value. Left
-unset the shim would default to `auto`, meaning native Datadog, and would keep
-emitting DogStatsD metrics through an otel comparison.
+workloads: `datadog` keeps DogStatsD, `otel` selects OTLP, and `off` selects
+`off`. Left unset the shim would default to `auto`, meaning native Datadog, and
+would keep emitting DogStatsD metrics through an otel comparison.
 Datadog mode keeps the existing node-local shim settings.
 
 Updating the shim binary or wrapper does not restart containerd unless its
