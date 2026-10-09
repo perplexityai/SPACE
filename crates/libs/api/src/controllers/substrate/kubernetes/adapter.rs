@@ -2176,6 +2176,7 @@ impl SubstrateAdapter for KubernetesSubstrate {
                     restore_node_shortlist: Vec::new(),
                     extra_tolerations: &[],
                     extra_required_affinity: None,
+                    excluded_host_cpus: &[],
                     // A fork restore creates a *new* sandbox from a snapshot,
                     // so the set is the target org's for the target template —
                     // resolved above with the rest of the create path. It

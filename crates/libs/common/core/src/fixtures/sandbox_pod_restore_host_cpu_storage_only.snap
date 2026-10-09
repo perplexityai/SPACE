@@ -1,0 +1,103 @@
+---
+source: crates/libs/common/core/src/k8s/tests.rs
+expression: pod
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  annotations:
+    space.pplx.net/activation-attempt-id: 019f8000-0000-7000-8000-0000000000aa
+    space.pplx.net/auto-lifecycle: "{\"wake\":{\"on\":[]},\"condition_sets\":{\"access_idle\":{\"kind\":\"inactivity\",\"activity_source\":\"access\",\"max_guest_idle_extension\":null}},\"stages\":[{\"condition_set\":\"access_idle\",\"at\":\"1m\",\"action\":\"delete\"}]}"
+    space.pplx.net/auto-lifecycle-authority: cluster
+    space.pplx.net/checkpoint: suspend
+    space.pplx.net/content-hash: "sha256:969f3d03c5e44174169acb4fc5a8019590338e04aa48e5c11f0fd2e10716e254"
+    space.pplx.net/disk-io-max-bandwidth-mib-per-sec: "100"
+    space.pplx.net/disk-io-max-operations-per-sec: "1000"
+    space.pplx.net/execution-generation: "18"
+    space.pplx.net/network-policy: "{\"version\":\"v1\",\"egress\":{\"default_action\":\"deny\",\"allow\":[],\"deny\":[]}}"
+    space.pplx.net/network-policy-authority: cluster
+    space.pplx.net/network-policy-generation: "1"
+    space.pplx.net/route-generation: "18"
+    space.pplx.net/sandbox-id: 019de674-63d7-7ef0-a588-8e106a878093
+    space.pplx.net/sandbox-owner: "user:00000000-0000-0000-0000-000000000020"
+    space.pplx.net/sandbox-user: "user:00000000-0000-0000-0000-000000000020"
+    space.pplx.net/suspend-restore-storage-uri: "s3://space-test/suspend-snapshots/current?region=us-east-1"
+    space.pplx.net/template: seed
+  labels:
+    app.kubernetes.io/name: space-sandbox
+    space.pplx.net/execution-generation: "18"
+    space.pplx.net/managed-by: space-api
+    space.pplx.net/org-id: 00000000-0000-0000-0000-000000000002
+    space.pplx.net/route-generation: "18"
+    space.pplx.net/sandbox-id: 019de674-63d7-7ef0-a588-8e106a878093
+    space.pplx.net/user-id: 00000000-0000-0000-0000-000000000020
+  name: space-sbx-019de67463d77ef0a5888e106a878093-g18
+  namespace: space
+spec:
+  affinity:
+    nodeAffinity:
+      preferredDuringSchedulingIgnoredDuringExecution:
+        - preference:
+            matchExpressions:
+              - key: space.pplx.net/template-build-seed-5be19f0b8d84ffe93681a4c2
+                operator: In
+                values:
+                  - "true"
+          weight: 50
+        - preference:
+            matchExpressions:
+              - key: space.pplx.net/ssd-headroom-tier
+                operator: In
+                values:
+                  - "1"
+          weight: 5
+        - preference:
+            matchExpressions:
+              - key: space.pplx.net/ssd-headroom-tier
+                operator: In
+                values:
+                  - "2"
+          weight: 22
+        - preference:
+            matchExpressions:
+              - key: space.pplx.net/ssd-headroom-tier
+                operator: In
+                values:
+                  - "3"
+                  - "4"
+                  - "5"
+                  - "6"
+                  - "7"
+                  - "8"
+                  - "9"
+                  - "10"
+          weight: 50
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+          - matchExpressions:
+              - key: space.pplx.net/host-cpu
+                operator: NotIn
+                values:
+                  - genuineintel-6-85-7
+              - key: space.pplx.net/ssd-placement-blocked
+                operator: NotIn
+                values:
+                  - "true"
+  automountServiceAccountToken: false
+  containers:
+    - image: "registry.k8s.io/pause:3.10"
+      imagePullPolicy: IfNotPresent
+      name: sandbox
+      resources:
+        limits:
+          space.pplx.net/network-slots: "1"
+        requests:
+          space.pplx.net/network-slots: "1"
+  nodeSelector:
+    node.kubernetes.io/space-enabled: "true"
+    space.pplx.net/node-pool: workers
+    space.pplx.net/subnet-tier: secondary
+    workload: workers
+  restartPolicy: Never
+  runtimeClassName: space
+  terminationGracePeriodSeconds: 10

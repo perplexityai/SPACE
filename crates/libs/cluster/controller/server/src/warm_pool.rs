@@ -60,7 +60,7 @@ use crate::pod::{build_pool_pod, pool_pod_name, ready_pod_metadata};
 #[derive(Debug, thiserror::Error)]
 pub enum WarmPoolError {
     #[error(transparent)]
-    PodConfig(#[from] pplx_space_common_core::kubernetes::NodeSelectorLabelsParseError),
+    PodConfig(#[from] pplx_space_common_core::kubernetes::SandboxPodConfigError),
     #[error("warm slot create semaphore closed")]
     CreatePermitsClosed(#[source] tokio::sync::AcquireError),
     #[error("warm pool config reconcile worker panicked: {0}")]

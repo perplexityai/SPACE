@@ -16,17 +16,18 @@ use kube::{
 };
 use pplx_space_common_core::{
     kubernetes::{
-        DEFAULT_SANDBOX_PROXY_PORT, ForkDiskRestorePodContext,
-        MAX_SANDBOX_NETWORK_POLICY_ANNOTATION_BYTES, NodeGroupPlacement,
-        NodeSelectorLabelsParseError, SANDBOX_NETWORK_POLICY_ANNOTATION,
-        SANDBOX_NETWORK_POLICY_AUTHORITY_ANNOTATION, SANDBOX_NETWORK_POLICY_GENERATION_ANNOTATION,
+        DEFAULT_SANDBOX_PROXY_PORT, ForkDiskRestorePodContext, HOST_CPU_LABEL,
+        MAX_SANDBOX_NETWORK_POLICY_ANNOTATION_BYTES, NodeGroupPlacement, PodToleration,
+        SANDBOX_NETWORK_POLICY_ANNOTATION, SANDBOX_NETWORK_POLICY_AUTHORITY_ANNOTATION,
+        SANDBOX_NETWORK_POLICY_GENERATION_ANNOTATION,
         SANDBOX_SUSPEND_RESTORE_SOURCE_NODE_ANNOTATION,
         SANDBOX_SUSPEND_RESTORE_STORAGE_URI_ANNOTATION, SandboxPodCommon, SandboxPodConfig,
         SandboxPodConfigValues, SandboxPodRequest, SandboxRuntimePodMetadata, build_sandbox_pod,
         node_group_label,
     },
     types::{
-        NodeRole as SpaceNodeRole, PodName, PodResourceVersion, PodUid, SandboxId, StorageUri,
+        HostCpu, NodeRole as SpaceNodeRole, PodName, PodResourceVersion, PodUid, SandboxId,
+        StorageUri,
     },
 };
 use pplx_space_common_svc::types::k8s::space_k8s_node_id;
@@ -226,6 +227,52 @@ fn shortlist_from_candidates(
     shortlist
 }
 
+/// The [`HostCpu`] `node` publishes as its [`HOST_CPU_LABEL`], if any.
+///
+/// Only a label already in canonical form counts. kube-scheduler compares the
+/// rendered `NotIn` values with the raw label, so a value [`HostCpu::parse`]
+/// would normalize (an uppercase vendor, say) is one the term can't exclude;
+/// reading it as unlabeled keeps the API's view of the node the scheduler's.
+fn node_host_cpu(node: &Node) -> Option<HostCpu> {
+    let label = node.metadata.labels.as_ref()?.get(HOST_CPU_LABEL)?;
+    HostCpu::parse(label.as_str())
+        .ok()
+        .filter(|host_cpu| host_cpu.as_str() == label)
+}
+
+/// Whether a pod carrying `tolerations` may be scheduled onto `node` as far as
+/// its taints go: every `NoSchedule` and `NoExecute` taint is matched by one of
+/// them, with the Kubernetes matching rules (an empty key with `Exists`
+/// matches every key, `Exists` ignores the value, an empty effect matches
+/// every effect). `PreferNoSchedule` taints don't exclude a node.
+fn node_taints_tolerated(node: &Node, tolerations: &[PodToleration]) -> bool {
+    let taints = node
+        .spec
+        .as_ref()
+        .and_then(|spec| spec.taints.as_deref())
+        .unwrap_or_default();
+    taints
+        .iter()
+        .filter(|taint| matches!(taint.effect.as_str(), "NoSchedule" | "NoExecute"))
+        .all(|taint| {
+            tolerations.iter().any(|toleration| {
+                let exists = toleration.operator.as_deref() == Some("Exists");
+                let key_matches = match toleration.key.as_deref() {
+                    None | Some("") => exists,
+                    Some(key) => key == taint.key,
+                };
+                let value_matches = exists
+                    || toleration.value.as_deref().unwrap_or_default()
+                        == taint.value.as_deref().unwrap_or_default();
+                let effect_matches = toleration
+                    .effect
+                    .as_deref()
+                    .is_none_or(|effect| effect.is_empty() || effect == taint.effect);
+                key_matches && value_matches && effect_matches
+            })
+        })
+}
+
 /// Share of the eligible fleet that may be labelled
 /// `node-services-ready=false` before the signal is treated as unusable and
 /// ignored for candidate *filtering*.
@@ -398,7 +445,7 @@ pub enum KubernetesStateInitError {
     #[error(transparent)]
     Kube(#[from] KubeError),
     #[error(transparent)]
-    NodeSelectorLabels(#[from] NodeSelectorLabelsParseError),
+    PodConfig(#[from] pplx_space_common_core::kubernetes::SandboxPodConfigError),
 }
 
 impl KubernetesState {
@@ -962,6 +1009,7 @@ impl KubernetesSubstrate {
         sandbox_id: SandboxId,
         source_node: &str,
         node_group_placement: Option<&NodeGroupPlacement>,
+        excluded_host_cpus: &[HostCpu],
     ) -> Vec<String> {
         if !self.k8s.caches.nodes_ready() {
             return vec![source_node.to_string()];
@@ -1064,9 +1112,38 @@ impl KubernetesSubstrate {
         let exclude_not_ready_services = config.node_services_ready_affinity
             && node_services_signal_usable(&eligible)
             && node_services_signal_trustworthy(in_set);
-        let candidates: Vec<String> = in_set
+        // The CPU exclusion is ANDed into every shortlist term the same way the
+        // node-group boundary is, so a fallback known to have an excluded CPU
+        // would render a term no node satisfies: filter it here for the same
+        // reason that comment gives. An unlabeled node isn't known to, and
+        // stays. The source is again exempt; when it has an excluded CPU its
+        // term is unsatisfiable, so the pod can only land on a listed fallback.
+        let cpu_compatible: Vec<&std::sync::Arc<Node>> = in_set
             .iter()
+            .filter(|node| {
+                excluded_host_cpus.is_empty()
+                    || node_host_cpu(node)
+                        .is_none_or(|host_cpu| !excluded_host_cpus.contains(&host_cpu))
+            })
+            .collect();
+        let services_ready: Vec<&std::sync::Arc<Node>> = cpu_compatible
+            .iter()
+            .copied()
             .filter(|node| !exclude_not_ready_services || !adapter::node_services_not_ready(node))
+            .collect();
+        // The readiness filter must not empty a CPU-constrained list on its
+        // own: `restore_host_cpu_requirement` decided a compatible host exists
+        // without consulting readiness, and a shortlist of only an incompatible
+        // source can't satisfy the CPU term at all. A not-ready node costs a
+        // slower restore; no candidate costs the restore, the same trade the
+        // valve above makes.
+        let candidates = if services_ready.is_empty() && !excluded_host_cpus.is_empty() {
+            cpu_compatible
+        } else {
+            services_ready
+        };
+        let candidates: Vec<String> = candidates
+            .into_iter()
             .filter_map(|node| node.metadata.name.clone())
             .collect();
         shortlist_from_candidates(sandbox_id, source_node, candidates)

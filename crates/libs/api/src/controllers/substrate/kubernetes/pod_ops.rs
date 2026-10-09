@@ -5,7 +5,8 @@ use super::*;
 use crate::controllers::substrate::kubernetes::store::{
     ActiveExecutionState, ActiveExecutionStatusRow, FailedRecoveryPodAbsenceOutcome,
     PlacementRetryDisposition, PodNodePlacement, PodTrackingCleanupCause, SandboxExecutionClaim,
-    StartedRecoveryReplacement, StartedRecoveryRestoreContext, StartedRecoveryRestoreSource,
+    SnapshotCaptureHost, StartedRecoveryReplacement, StartedRecoveryRestoreContext,
+    StartedRecoveryRestoreSource,
 };
 use crate::node_group_placement::{
     PlacementSubject, ResolvePath as NodeGroupResolvePath, ResolvedPlacement, RestoreSourceNode,
@@ -16,7 +17,7 @@ use pplx_space_common_core::kubernetes::{
     SANDBOX_EXECUTION_GENERATION_ANNOTATION, SANDBOX_ID_ANNOTATION,
 };
 use pplx_space_common_core::types::{
-    ExecutionGeneration, NodeRole as SpaceNodeRole, PodUid, PolicyAuthority,
+    ExecutionGeneration, HostCpu, NodeRole as SpaceNodeRole, PodUid, PolicyAuthority,
     SandboxActivationAttemptId, SandboxLifecycle, SandboxOwner, SandboxTransitionTargetState,
 };
 use pplx_space_events::{
@@ -159,6 +160,44 @@ pub(super) struct SandboxPodRequestInputs<'a> {
     /// `None` renders no node-group constraints: the gate is off, or the
     /// cluster has no generic node group.
     pub(super) node_group_placement: Option<&'a NodeGroupPlacement>,
+    /// CPU identities the restore pod must stay off, from
+    /// [`KubernetesSubstrate::host_cpu_exclusions`]. Empty renders no CPU
+    /// constraint; it's ignored for non-restore builds.
+    pub(super) excluded_host_cpus: &'a [HostCpu],
+}
+
+/// The required node-selector terms and tolerations a restore pod renders
+/// besides its CPU term, as far as they decide which nodes could host it. See
+/// [`KubernetesSubstrate::restore_schedulable_node_exists`].
+#[derive(Clone, Copy, Default)]
+pub(super) struct RestorePlacementBounds<'a> {
+    /// The node-group candidate set, when the placement gate resolves one.
+    pub(super) node_group_placement: Option<&'a NodeGroupPlacement>,
+    /// An evacuation's cohort pin.
+    pub(super) extra_required_label: Option<(&'a str, &'a str)>,
+    /// An evacuation's cohort tolerations.
+    pub(super) extra_tolerations: &'a [PodToleration],
+}
+
+impl<'a> RestorePlacementBounds<'a> {
+    fn for_context(
+        context: &'a PodCreateContext<'a>,
+        node_group_placement: Option<&'a NodeGroupPlacement>,
+    ) -> Self {
+        let (extra_required_label, extra_tolerations) = match context {
+            PodCreateContext::Restore(RestoreContext::Evacuation {
+                extra_required_affinity,
+                extra_tolerations,
+                ..
+            }) => (*extra_required_affinity, *extra_tolerations),
+            _ => (None, &[][..]),
+        };
+        Self {
+            node_group_placement,
+            extra_required_label,
+            extra_tolerations,
+        }
+    }
 }
 
 impl PodCreateContext<'_> {
@@ -183,6 +222,23 @@ impl PodCreateContext<'_> {
             Self::Restore(RestoreContext::UserRestore {
                 direct_node_name, ..
             }) => *direct_node_name,
+        }
+    }
+
+    /// The remote snapshot this build restores from, if it has one.
+    fn suspend_restore_storage_uri(&self) -> Option<&str> {
+        match self {
+            Self::OnDemand => None,
+            Self::Restore(
+                RestoreContext::UserRestore {
+                    suspend_restore_storage_uri,
+                    ..
+                }
+                | RestoreContext::Evacuation {
+                    suspend_restore_storage_uri,
+                    ..
+                },
+            ) => *suspend_restore_storage_uri,
         }
     }
 }
@@ -1706,6 +1762,15 @@ impl KubernetesSubstrate {
             let node_group_placement = self
                 .resolve_node_group_placement(sandbox, &cross_node_context)
                 .await?;
+            // The successor drops the source pin, not the capture CPU: landing
+            // "anywhere" must still mean on a host that can load the snapshot.
+            let excluded_host_cpus = self
+                .restore_excluded_host_cpus(
+                    sandbox,
+                    &cross_node_context,
+                    node_group_placement.placement(),
+                )
+                .await?;
 
             let cross_node_pod = match create_sandbox_pod(
                 &self.k8s,
@@ -1717,6 +1782,7 @@ impl KubernetesSubstrate {
                         auto_lifecycle_json: &auto_lifecycle_json,
                         network_policy_json: &network_policy_json,
                         node_group_placement: node_group_placement.placement(),
+                        excluded_host_cpus: &excluded_host_cpus,
                     },
                     cross_node_context,
                 ),
@@ -1980,6 +2046,10 @@ impl KubernetesSubstrate {
         let existing = self
             .existing_suspend_restore_annotations(sandbox.id)
             .await?;
+        // A plan read back from the active execution's pod, in any phase,
+        // belongs to a restore already materialized for that execution; it is
+        // never redirected.
+        let from_live_pod = existing.is_some();
         let storage_uri = match existing.as_ref().and_then(|plan| plan.storage_uri.clone()) {
             Some(storage_uri) => Some(storage_uri),
             None => {
@@ -2014,6 +2084,14 @@ impl KubernetesSubstrate {
                     .to_string(),
                 phase: None,
             });
+        }
+        if !from_live_pod
+            && let (Some(source_node), None) = (source_node_name.as_deref(), storage_uri.as_ref())
+            && let Some(redirect) = self
+                .cpu_incompatible_local_source_redirect(sandbox, source_node)
+                .await?
+        {
+            return Ok(redirect);
         }
         Ok(SuspendRestorePlan {
             source_node_name,
@@ -2949,6 +3027,392 @@ impl KubernetesSubstrate {
         Ok(resolved)
     }
 
+    /// The capture host CPU a restore pod must require so it lands only where
+    /// the snapshot's vCPU state can be loaded, or `None` to render no CPU
+    /// constraint. Always `None` while
+    /// [`SANDBOX_RESTORE_HOST_CPU_PLACEMENT_ENABLED_ENV`](pplx_space_common_core::kubernetes::SANDBOX_RESTORE_HOST_CPU_PLACEMENT_ENABLED_ENV)
+    /// is off, which also leaves the source-aware shortlist unfiltered.
+    ///
+    /// Only a restore from a remote full snapshot gets one. A disk-only
+    /// restore (a `stopped` sandbox) carries no vCPU state. A local-only
+    /// restore has no storage URI and is pre-bound to the node that holds its
+    /// bytes, so there's no snapshot row to read and no other node to choose.
+    /// A snapshot that predates the recorded CPU is constrained by its
+    /// capturing node's live label while that node is still in the cluster
+    /// ([`Self::capture_host_cpu`]), and stays unconstrained otherwise.
+    /// An evacuation's cohort pin and the node-group set narrow which nodes
+    /// count, since the pod builder ANDs both with the CPU term.
+    ///
+    /// The capture CPU becomes a `NotIn` exclusion of every published identity
+    /// that can't load it ([`Self::host_cpu_exclusions`]), which leaves
+    /// unlabeled nodes eligible. It's withheld unless the node cache shows at
+    /// least one node a restore pod could land on whose CPU can load it
+    /// ([`Self::restore_schedulable_node_exists`]), so a cluster whose
+    /// node-ctl hasn't published labels yet, or that has lost every host able
+    /// to load it, keeps today's unconstrained placement rather than leaving
+    /// every such restore `Unschedulable`. A cold cache withholds it for the
+    /// same reason: it can't show that any node qualifies.
+    ///
+    /// The check is for existence, not capacity. When every node the pod may
+    /// use (those whose CPU can load it, and unlabeled ones) is full, the pod stays
+    /// `Unschedulable`, and the cross-node re-drive keeps the term, so the
+    /// restore waits for one of them. That's deliberate. The identity can't
+    /// tell which CPU pairs load each other's state (a CPU whose MSR set is a
+    /// superset of another's can load that one's state, but not the reverse),
+    /// so every unequal identity is excluded unless the configured
+    /// [`HostCpuCompatibility`](pplx_space_common_core::types::HostCpuCompatibility)
+    /// lists it as a loader. A restore that lands on a host that can't load it
+    /// fails on every retry, while one that waits succeeds once capacity
+    /// frees. Listing a known one-way pair removes the wait for that pair.
+    pub(super) async fn restore_host_cpu_requirement(
+        &self,
+        sandbox: &Sandbox,
+        context: &PodCreateContext<'_>,
+        node_group_placement: Option<&NodeGroupPlacement>,
+    ) -> Result<Option<HostCpu>, SubstrateError> {
+        if !self
+            .k8s
+            .sandbox_pod_config
+            .restore_host_cpu_placement_enabled
+        {
+            return Ok(None);
+        }
+        let Some(storage_uri) = context.suspend_restore_storage_uri() else {
+            return Ok(None);
+        };
+        if sandbox.lifecycle.parse::<SandboxLifecycle>() == Ok(SandboxLifecycle::Stopped) {
+            return Ok(None);
+        }
+        // Checked before the snapshot read: a cluster whose nodes publish no
+        // CPU at all can't have a qualifying node, whatever the snapshot says.
+        let bounds = RestorePlacementBounds::for_context(context, node_group_placement);
+        if !self.restore_schedulable_node_exists(bounds, |node| node_host_cpu(node).is_some()) {
+            return Ok(None);
+        }
+        let Some(host_cpu) = self
+            .store
+            .snapshot_capture_host(sandbox.id, storage_uri)
+            .await?
+            .and_then(|capture| self.capture_host_cpu(&capture))
+        else {
+            return Ok(None);
+        };
+        if !self.restore_schedulable_node_exists(bounds, |node| self.node_can_load(node, &host_cpu))
+        {
+            // Debug, not warn: this fires on every restore of such a snapshot
+            // for as long as no reachable node has its CPU, which a fleet
+            // change can make the norm, and which nodes carry which value is
+            // directly visible on the Node objects.
+            tracing::debug!(
+                sandbox_id = %sandbox.id,
+                %host_cpu,
+                node_cache_ready = self.k8s.caches.nodes_ready(),
+                "no schedulable node's CPU can load the snapshot's capture host CPU; restoring \
+                 without a CPU constraint"
+            );
+            return Ok(None);
+        }
+        Ok(Some(host_cpu))
+    }
+
+    /// The CPU identities a restore pod built from `context` stays off:
+    /// [`Self::host_cpu_exclusions`] of [`Self::restore_host_cpu_requirement`].
+    /// Empty renders no CPU constraint.
+    pub(super) async fn restore_excluded_host_cpus(
+        &self,
+        sandbox: &Sandbox,
+        context: &PodCreateContext<'_>,
+        node_group_placement: Option<&NodeGroupPlacement>,
+    ) -> Result<Vec<HostCpu>, SubstrateError> {
+        let capture = self
+            .restore_host_cpu_requirement(sandbox, context, node_group_placement)
+            .await?;
+        Ok(self.host_cpu_exclusions(capture.as_ref()))
+    }
+
+    /// Whether `node` publishes a CPU that can load state captured on
+    /// `capture`. An unlabeled node doesn't count: it isn't known to.
+    fn node_can_load(&self, node: &Node, capture: &HostCpu) -> bool {
+        node_host_cpu(node).is_some_and(|host| self.host_cpu_can_load(capture, &host))
+    }
+
+    /// Whether a host of CPU `host` can load state captured on `capture`, per
+    /// the configured compatibility list.
+    fn host_cpu_can_load(&self, capture: &HostCpu, host: &HostCpu) -> bool {
+        self.k8s
+            .sandbox_pod_config
+            .host_cpu_compatibility
+            .can_load(capture, host)
+    }
+
+    /// The CPU identities a restore pod for `capture` stays off: every
+    /// identity a node in the cache publishes that can't load `capture`'s
+    /// state (anything but `capture` itself and the loaders the configured
+    /// [`HostCpuCompatibility`](pplx_space_common_core::types::HostCpuCompatibility)
+    /// lists for it), sorted. Empty when `capture` is `None` or no labeled
+    /// node is excluded. Rendered as `NotIn`, the exclusion leaves unlabeled
+    /// nodes eligible, so a node node-ctl hasn't labeled yet, or can't, still
+    /// takes restores as it did before the label.
+    pub(super) fn host_cpu_exclusions(&self, capture: Option<&HostCpu>) -> Vec<HostCpu> {
+        let Some(capture) = capture else {
+            return Vec::new();
+        };
+        self.k8s
+            .caches
+            .nodes
+            .state()
+            .iter()
+            .filter_map(|node| node_host_cpu(node))
+            .filter(|host_cpu| !self.host_cpu_can_load(capture, host_cpu))
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
+    /// Whether the node cache shows a node a restore pod could land on that
+    /// also satisfies `matches`: schedulable, carrying the sandbox node
+    /// selector, not placement-blocked when that exclusion is rendered, inside
+    /// `node_group_placement`'s candidate set, and carrying
+    /// `extra_required_label` (an evacuation's cohort pin) when those are
+    /// given, and without a `NoSchedule` or `NoExecute` taint the pod's
+    /// tolerations don't cover. Those are the constraints the pod builder
+    /// renders alongside the CPU term, so a matching node failing any of them
+    /// can't host the pod. `false` while the cache is cold, since it can't
+    /// show that any node qualifies.
+    fn restore_schedulable_node_exists(
+        &self,
+        bounds: RestorePlacementBounds<'_>,
+        matches: impl Fn(&Node) -> bool,
+    ) -> bool {
+        if !self.k8s.caches.nodes_ready() {
+            return false;
+        }
+        let RestorePlacementBounds {
+            node_group_placement,
+            extra_required_label,
+            extra_tolerations,
+        } = bounds;
+        // The tolerations the pod builder renders for a restore: the
+        // evacuation's, plus the dedicated-group one when the placement
+        // targets dedicated capacity. Restores never carry a node-pool pin.
+        let mut tolerations = extra_tolerations.to_vec();
+        tolerations.extend(node_group_placement.and_then(NodeGroupPlacement::dedicated_toleration));
+        let config = &self.k8s.sandbox_pod_config;
+        let selector = config.base_node_selector();
+        self.k8s
+            .caches
+            .nodes
+            .find(|node| {
+                adapter::node_schedulable(node)
+                    && selector.matches(node)
+                    && (!config.ssd_headroom_tier_affinity
+                        || adapter::node_not_placement_blocked(node))
+                    && node_group_placement.is_none_or(|placement| {
+                        node_group_label(node).is_some_and(|group| placement.admits_group(group))
+                    })
+                    && extra_required_label.is_none_or(|(key, value)| {
+                        node.metadata
+                            .labels
+                            .as_ref()
+                            .and_then(|labels| labels.get(key))
+                            .is_some_and(|label| label == value)
+                    })
+                    && node_taints_tolerated(node, &tolerations)
+                    && matches(node)
+            })
+            .is_some()
+    }
+
+    /// The CPU that captured a snapshot: the recorded identity, else the live
+    /// [`HOST_CPU_LABEL`] of the node that uploaded it. The label is only a
+    /// stand-in for snapshots that predate the recorded field, and only from a
+    /// Node object created before the snapshot's second: node names derive from
+    /// the instance's IP, so a replacement instance can reuse the capturing
+    /// machine's name, and its Node object is newer than the snapshot. `None`
+    /// means unknown.
+    fn capture_host_cpu(&self, capture: &SnapshotCaptureHost) -> Option<HostCpu> {
+        capture.recorded.clone().or_else(|| {
+            let node = self
+                .k8s
+                .caches
+                .node_by_name(capture.source_node_name.as_deref()?)?;
+            let created = node.metadata.creation_timestamp.as_ref()?.0.as_second();
+            // `creationTimestamp` has whole-second precision, so a Node from
+            // the snapshot's own second is ambiguous and doesn't count.
+            ((created as f64) < capture.snapshot_epoch_seconds.floor())
+                .then(|| node_host_cpu(&node))
+                .flatten()
+        })
+    }
+
+    /// Whether any pod of this sandbox could be hosting a live VM: phase
+    /// `Running`, `Unknown`, or not yet reported. `Pending` doesn't count, so
+    /// a pod whose sandbox kubelet can't create, which stays `Pending`, doesn't
+    /// block the redirect it exists for. `None` while the pod reflector is
+    /// cold.
+    fn sandbox_pod_may_be_live(&self, sandbox_id: SandboxId) -> Option<bool> {
+        if !self.pod_reflector_ready.is_ready() {
+            return None;
+        }
+        let sandbox_id = sandbox_id.to_string();
+        Some(
+            self.pod_store
+                .find(|pod| {
+                    pod.metadata
+                        .annotations
+                        .as_ref()
+                        .and_then(|annotations| annotations.get(SANDBOX_ID_ANNOTATION))
+                        == Some(&sandbox_id)
+                        && !matches!(
+                            pod.status
+                                .as_ref()
+                                .and_then(|status| status.phase.as_deref()),
+                            Some("Pending" | "Succeeded" | "Failed")
+                        )
+                })
+                .is_some(),
+        )
+    }
+
+    /// A portable plan to replace a local-only restore that can't succeed:
+    /// the plan pins the sandbox to `source_node`, but that node's CPU can't
+    /// load the CPU that captured the sandbox's newest snapshot (unequal, and
+    /// not a listed loader).
+    ///
+    /// This is the state a failed cross-node restore leaves behind. The target
+    /// node pulled the snapshot, couldn't load its vCPU state, and became the
+    /// sandbox's placement, which also moved `placement_changed_at` past the
+    /// snapshot. From then on the placement-freshness gate rejects the remote
+    /// snapshot, so every wake is a local-only restore pinned to the node that
+    /// can't load it. Restoring from the snapshot's storage URI instead lets
+    /// [`Self::restore_host_cpu_requirement`] place it on a compatible host.
+    ///
+    /// Returns `None`, keeping the local-only plan, unless all of these hold:
+    ///
+    /// * host-CPU-aware restore placement is enabled
+    ///   ([`SANDBOX_RESTORE_HOST_CPU_PLACEMENT_ENABLED_ENV`](pplx_space_common_core::kubernetes::SANDBOX_RESTORE_HOST_CPU_PLACEMENT_ENABLED_ENV));
+    /// * the plan didn't come from the active execution's pod (checked by the
+    ///   caller, `suspend_restore_plan`);
+    /// * the source node's CPU and the snapshot's capture CPU are both known
+    ///   and the source can't load it, and a node the redirected pod could land
+    ///   on, inside the sandbox's node-group set, can;
+    /// * no pod of the sandbox could be hosting a live VM
+    ///   ([`Self::sandbox_pod_may_be_live`]), read from a warm pod reflector;
+    /// * the sandbox has no local artifact marker, which would name bytes
+    ///   newer than any backup, its newest snapshot covers the last recorded
+    ///   command and access, and, for a `restoring` row, no full snapshot
+    ///   postdates the restore's start
+    ///   ([`K8sStore::activity_current_markerless_snapshot`]).
+    ///
+    /// The restore-create path reaches this with the row already `restoring`:
+    /// the restore lifecycle begins before the plan is computed, and that's
+    /// also when the stranded state shows, since the retry selector rejects a
+    /// snapshot older than the failed placement. An access to a `suspended`
+    /// sandbox computes the plan before any restore begins, so the
+    /// restoring-row bound doesn't apply there.
+    ///
+    /// What these establish, and what they don't. The swap loses no work the
+    /// control plane recorded: the snapshot is at least as new as the
+    /// command and access clocks. Those clocks only move when a newer value
+    /// is more than a minute ahead (`published_state.rs`), and they see only
+    /// commands and accesses, so guest work after the snapshot with neither
+    /// isn't covered. The pod check is a cache read, not a lock, so it isn't
+    /// the exclusion [`newest_suspend_snapshot_activity_current`]'s contract
+    /// asks for. Exclusion of a second live runtime rests, as for every
+    /// restore, on the execution claim and on the create path deleting
+    /// older-generation pods before it materializes a successor.
+    ///
+    /// The checks that need only the caches run first, so a cluster whose
+    /// nodes all publish one CPU, or none, never reaches the snapshot read or
+    /// the node-group resolution.
+    ///
+    /// [`newest_suspend_snapshot_activity_current`]: pplx_space_sandbox_portability::newest_suspend_snapshot_activity_current
+    async fn cpu_incompatible_local_source_redirect(
+        &self,
+        sandbox: &Sandbox,
+        source_node: &str,
+    ) -> Result<Option<SuspendRestorePlan>, SubstrateError> {
+        if !self
+            .k8s
+            .sandbox_pod_config
+            .restore_host_cpu_placement_enabled
+        {
+            return Ok(None);
+        }
+        let Some(source_cpu) = self
+            .k8s
+            .caches
+            .node_by_name(source_node)
+            .and_then(|node| node_host_cpu(&node))
+        else {
+            return Ok(None);
+        };
+        // A necessary condition only, so deliberately looser than the final
+        // check below: any node in the cache publishing a different CPU,
+        // whatever its taints or group.
+        if !self.k8s.caches.nodes_ready()
+            || self
+                .k8s
+                .caches
+                .nodes
+                .find(|node| node_host_cpu(node).is_some_and(|cpu| cpu != source_cpu))
+                .is_none()
+        {
+            return Ok(None);
+        }
+        if self.sandbox_pod_may_be_live(sandbox.id) != Some(false) {
+            return Ok(None);
+        }
+        let Some((storage_uri, capture)) = self
+            .store
+            .activity_current_markerless_snapshot(sandbox.id)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let Some(capture_cpu) = self.capture_host_cpu(&capture) else {
+            return Ok(None);
+        };
+        if self.host_cpu_can_load(&capture_cpu, &source_cpu) {
+            return Ok(None);
+        }
+        // The redirected restore is a storage-only build, placed inside the
+        // sandbox's node-group set. Without a host in that set whose CPU can
+        // load the snapshot, the CPU term would be withheld and the restore
+        // could land on another incompatible host and fail there. With one, an
+        // unlabeled node still passes the `NotIn` term, so the redirect fully
+        // protects only a labeled fleet: a restore that lands on an unlabeled,
+        // incompatible node fails there and is pinned to it, and the redirect
+        // can't fire for it again until node-ctl labels that node.
+        let redirected = PodCreateContext::Restore(RestoreContext::UserRestore {
+            suspend_restore_storage_uri: Some(storage_uri.as_str()),
+            suspend_restore_source_node: None,
+            direct_node_name: None,
+            preferred_node_name: None,
+        });
+        let placement = self
+            .resolve_node_group_placement(sandbox, &redirected)
+            .await?;
+        if !self.restore_schedulable_node_exists(
+            RestorePlacementBounds::for_context(&redirected, placement.placement()),
+            |node| self.node_can_load(node, &capture_cpu),
+        ) {
+            return Ok(None);
+        }
+        tracing::info!(
+            sandbox_id = %sandbox.id,
+            source_node,
+            %source_cpu,
+            %capture_cpu,
+            "local-only restore source's CPU can't load the snapshot's capture CPU; \
+             restoring from the snapshot's storage URI instead"
+        );
+        Ok(Some(SuspendRestorePlan {
+            source_node_name: None,
+            storage_uri: Some(storage_uri),
+        }))
+    }
+
     /// [`Self::resolve_node_group_placement`] with the claim discipline
     /// `pod_create_context_for_claim` uses: a claim this call is about to
     /// leave unmaterialized is retired before the error propagates, so the
@@ -3011,6 +3475,7 @@ impl KubernetesSubstrate {
             auto_lifecycle_json,
             network_policy_json,
             node_group_placement,
+            excluded_host_cpus,
         } = inputs;
         let disk_io_limits = u64::try_from(sandbox.disk_io_max_operations_per_sec)
             .ok()
@@ -3088,7 +3553,12 @@ impl KubernetesSubstrate {
                         if self.k8s.sandbox_pod_config.restore_source_node_hard_pin
                             && suspend_restore_storage_uri.is_some() =>
                     {
-                        self.restore_node_shortlist(sandbox.id, source, node_group_placement)
+                        self.restore_node_shortlist(
+                            sandbox.id,
+                            source,
+                            node_group_placement,
+                            excluded_host_cpus,
+                        )
                     }
                     _ => Vec::new(),
                 };
@@ -3118,6 +3588,7 @@ impl KubernetesSubstrate {
                     restore_node_shortlist,
                     extra_tolerations: &[],
                     extra_required_affinity: None,
+                    excluded_host_cpus,
                 }
             }
             PodCreateContext::Restore(RestoreContext::Evacuation {
@@ -3143,6 +3614,7 @@ impl KubernetesSubstrate {
                 restore_node_shortlist: Vec::new(),
                 extra_tolerations,
                 extra_required_affinity,
+                excluded_host_cpus,
             },
         }
     }
@@ -4291,6 +4763,27 @@ impl KubernetesSubstrate {
         let node_group_placement = self
             .resolve_node_group_placement_for_claim(&sandbox, &claim, &pod_create_context)
             .await?;
+        // Resolved here for the same reason: before any pod exists, while the
+        // context is still in hand, retiring the claim on failure like the
+        // reads below.
+        let excluded_host_cpus = match self
+            .restore_excluded_host_cpus(
+                &sandbox,
+                &pod_create_context,
+                node_group_placement.placement(),
+            )
+            .await
+        {
+            Ok(excluded_host_cpus) => excluded_host_cpus,
+            Err(error) => {
+                if claim.created && execution_pod_create_in_flight(claim.row.state) {
+                    self.store
+                        .abandon_created_unmaterialized_create_claim(sandbox.id, &claim)
+                        .await?;
+                }
+                return Err(error);
+            }
+        };
 
         let auto_lifecycle = match self
             .store
@@ -4427,6 +4920,7 @@ impl KubernetesSubstrate {
                     auto_lifecycle_json: &auto_lifecycle_json,
                     network_policy_json: &network_policy_json,
                     node_group_placement: node_group_placement.placement(),
+                    excluded_host_cpus: &excluded_host_cpus,
                 },
                 pod_create_context,
             ),

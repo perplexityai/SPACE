@@ -606,6 +606,7 @@ fn build_sandbox_pod_direct_restore_keeps_artifact_kind_and_node_assignment() {
                 restore_node_shortlist: Vec::new(),
                 extra_tolerations: &[],
                 extra_required_affinity: None,
+                excluded_host_cpus: &[],
                 node_group_placement: None,
             },
         );
@@ -822,6 +823,7 @@ fn build_sandbox_pod_source_pinned_restore_skips_node_services_bias() {
             ],
             extra_tolerations: &[],
             extra_required_affinity: None,
+            excluded_host_cpus: &[],
             fork_disk_restore: None,
             node_group_placement: None,
         },
@@ -932,6 +934,7 @@ fn sandbox_pod_shapes_render_expected_yaml() {
             restore_node_shortlist: Vec::new(),
             extra_tolerations: &[],
             extra_required_affinity: None,
+            excluded_host_cpus: &[],
             node_group_placement: None,
         },
     );
@@ -955,6 +958,7 @@ fn sandbox_pod_shapes_render_expected_yaml() {
             restore_node_shortlist: Vec::new(),
             extra_tolerations: &[],
             extra_required_affinity: None,
+            excluded_host_cpus: &[],
             node_group_placement: None,
         },
     );
@@ -985,6 +989,7 @@ fn sandbox_pod_shapes_render_expected_yaml() {
             restore_node_shortlist: Vec::new(),
             extra_tolerations: &[],
             extra_required_affinity: None,
+            excluded_host_cpus: &[],
             node_group_placement: None,
         },
     );
@@ -1017,6 +1022,7 @@ fn sandbox_pod_shapes_render_expected_yaml() {
             ],
             extra_tolerations: &[],
             extra_required_affinity: None,
+            excluded_host_cpus: &[],
             node_group_placement: None,
         },
     );
@@ -1040,6 +1046,7 @@ fn sandbox_pod_shapes_render_expected_yaml() {
             restore_node_shortlist: Vec::new(),
             extra_tolerations: &[],
             extra_required_affinity: None,
+            excluded_host_cpus: &[],
             node_group_placement: None,
         },
     );
@@ -1075,6 +1082,7 @@ fn sandbox_pod_shapes_render_expected_yaml() {
             restore_node_shortlist: Vec::new(),
             extra_tolerations: std::slice::from_ref(&evacuation_toleration),
             extra_required_affinity: Some(("space.pplx.net/rollout-cohort", "test-2")),
+            excluded_host_cpus: &[],
             node_group_placement: None,
         },
     );
@@ -1102,6 +1110,7 @@ fn sandbox_pod_shapes_render_expected_yaml() {
             restore_node_shortlist: Vec::new(),
             extra_tolerations: &[],
             extra_required_affinity: None,
+            excluded_host_cpus: &[],
             node_group_placement: None,
         },
     );
@@ -1266,6 +1275,7 @@ fn sandbox_pod_shapes_render_expected_yaml() {
             preferred_node_name: Some("space-worker-a"),
             extra_tolerations: &[],
             extra_required_affinity: None,
+            excluded_host_cpus: &[],
         },
     );
     let pooled_placed = build_sandbox_pod(
@@ -1309,6 +1319,7 @@ fn sandbox_pod_shapes_render_expected_yaml() {
             preferred_node_name: None,
             extra_tolerations: &[],
             extra_required_affinity: None,
+            excluded_host_cpus: &[],
         },
     );
     let mismatched_placement = NodeGroupPlacement::for_caller(
@@ -1331,6 +1342,67 @@ fn sandbox_pod_shapes_render_expected_yaml() {
             runtime: shaped_runtime,
             node_group_placement: Some(&mismatched_placement),
             node_pool: None,
+        },
+    );
+
+    // A portable restore whose snapshot was captured on one CPU, in a fleet
+    // that also publishes another: the `host-cpu NotIn` exclusion of the
+    // other is repeated into every ORed shortlist term (terms OR, their
+    // contents AND), and also renders for the scheduler-placed storage-only
+    // shape, where it is the only required term besides the placement block.
+    let other_cpu = crate::types::HostCpu::parse("genuineintel-6-85-7").unwrap();
+    let restore_host_cpu_shortlist = build_sandbox_pod(
+        &SandboxPodConfig {
+            restore_source_node_hard_pin: true,
+            ..test_pod_config()
+        },
+        SandboxPodRequest::Restore {
+            artifact_kind: crate::types::ArtifactKind::Full,
+            common: common(
+                "space-sbx-019de67463d77ef0a5888e106a878093-g17",
+                TEST_SANDBOX_ID,
+                17,
+            ),
+            runtime,
+            node_group_placement: None,
+            suspend_restore_storage_uri: Some(
+                "s3://space-test/suspend-snapshots/current?region=us-east-1",
+            ),
+            suspend_restore_source_node: Some("space-worker-a"),
+            fork_disk_restore: None,
+            restore_node_shortlist: vec![
+                "space-worker-a".to_string(),
+                "space-worker-b".to_string(),
+            ],
+            direct_node_name: None,
+            preferred_node_name: Some("space-worker-a"),
+            extra_tolerations: &[],
+            extra_required_affinity: None,
+            excluded_host_cpus: std::slice::from_ref(&other_cpu),
+        },
+    );
+    let restore_host_cpu_storage_only = build_sandbox_pod(
+        &config,
+        SandboxPodRequest::Restore {
+            artifact_kind: crate::types::ArtifactKind::Full,
+            common: common(
+                "space-sbx-019de67463d77ef0a5888e106a878093-g18",
+                TEST_SANDBOX_ID,
+                18,
+            ),
+            runtime,
+            node_group_placement: None,
+            suspend_restore_storage_uri: Some(
+                "s3://space-test/suspend-snapshots/current?region=us-east-1",
+            ),
+            suspend_restore_source_node: None,
+            fork_disk_restore: None,
+            restore_node_shortlist: Vec::new(),
+            direct_node_name: None,
+            preferred_node_name: None,
+            extra_tolerations: &[],
+            extra_required_affinity: None,
+            excluded_host_cpus: std::slice::from_ref(&other_cpu),
         },
     );
 
@@ -1363,6 +1435,14 @@ fn sandbox_pod_shapes_render_expected_yaml() {
         ),
         ("sandbox_pod_pooled_placed", pooled_placed),
         ("sandbox_pod_restore_direct_placed", restore_direct_placed),
+        (
+            "sandbox_pod_restore_host_cpu_shortlist",
+            restore_host_cpu_shortlist,
+        ),
+        (
+            "sandbox_pod_restore_host_cpu_storage_only",
+            restore_host_cpu_storage_only,
+        ),
         ("sandbox_pod_on_demand_org_mismatch", on_demand_org_mismatch),
         ("sandbox_pod_generic_on_dedicated", generic_on_dedicated),
         (
@@ -1475,6 +1555,7 @@ fn every_sandbox_pod_shape_requests_one_network_slot() {
                 restore_node_shortlist: Vec::new(),
                 extra_tolerations: &[],
                 extra_required_affinity: None,
+                excluded_host_cpus: &[],
                 node_group_placement: None,
             },
         ),
@@ -1605,6 +1686,7 @@ fn portable_restore_prefers_source_node_and_carries_remote_fallback() {
             restore_node_shortlist: Vec::new(),
             extra_tolerations: &[],
             extra_required_affinity: None,
+            excluded_host_cpus: &[],
             node_group_placement: None,
         },
     );
@@ -1746,6 +1828,7 @@ fn build_sandbox_pod_hard_pins_portable_restore_to_source_node() {
             restore_node_shortlist: Vec::new(),
             extra_tolerations: &[],
             extra_required_affinity: None,
+            excluded_host_cpus: &[],
             node_group_placement: None,
         },
     );
@@ -1819,6 +1902,7 @@ fn build_sandbox_pod_source_annotation_without_pin_renders_no_source_affinity() 
             restore_node_shortlist: Vec::new(),
             extra_tolerations: &[],
             extra_required_affinity: None,
+            excluded_host_cpus: &[],
             node_group_placement: None,
         },
     );
@@ -1883,6 +1967,7 @@ fn build_sandbox_pod_shortlist_renders_or_terms_with_preferred_source() {
             ],
             extra_tolerations: &[],
             extra_required_affinity: None,
+            excluded_host_cpus: &[],
             node_group_placement: None,
         },
     );
@@ -1963,6 +2048,7 @@ fn build_sandbox_pod_hard_pin_without_ssd_affinity_omits_placement_block() {
             restore_node_shortlist: Vec::new(),
             extra_tolerations: &[],
             extra_required_affinity: None,
+            excluded_host_cpus: &[],
             node_group_placement: None,
         },
     );
@@ -2018,6 +2104,7 @@ fn restore_with_extra_tolerations_renders_pod_tolerations() {
             restore_node_shortlist: Vec::new(),
             extra_tolerations: &tolerations,
             extra_required_affinity: None,
+            excluded_host_cpus: &[],
             node_group_placement: None,
         },
     );
@@ -2133,6 +2220,7 @@ fn extra_required_affinity_renders_into_required_node_selector_term() {
             restore_node_shortlist: Vec::new(),
             extra_tolerations: std::slice::from_ref(&toleration),
             extra_required_affinity: Some(("space.pplx.net/rollout-cohort", "test-2")),
+            excluded_host_cpus: &[],
             node_group_placement: None,
         },
     );
@@ -2433,6 +2521,7 @@ fn node_group_placement_and_drain_cohort_are_anded_in_one_term() {
             preferred_node_name: None,
             extra_tolerations: std::slice::from_ref(&cohort_toleration),
             extra_required_affinity: Some(("space.pplx.net/rollout-cohort", "test-2")),
+            excluded_host_cpus: &[],
             fork_disk_restore: None,
             restore_node_shortlist: Vec::new(),
         },
@@ -2569,6 +2658,7 @@ fn local_only_restore_keeps_direct_node_assignment_under_placement() {
             preferred_node_name: None,
             extra_tolerations: &[],
             extra_required_affinity: None,
+            excluded_host_cpus: &[],
         },
     );
 
@@ -2751,6 +2841,7 @@ fn soft_pinned_restore_suppresses_the_dedicated_preference() {
             preferred_node_name: Some("space-worker-a"),
             extra_tolerations: &[],
             extra_required_affinity: None,
+            excluded_host_cpus: &[],
         },
     );
 
@@ -2951,6 +3042,7 @@ fn restore_shortlist_suppresses_dedicated_preference_but_keeps_toleration() {
             restore_node_shortlist: vec!["node-a".to_string(), "node-b".to_string()],
             extra_tolerations: &[],
             extra_required_affinity: None,
+            excluded_host_cpus: &[],
             fork_disk_restore: None,
         },
     );
@@ -3334,6 +3426,7 @@ fn an_empty_preferred_node_name_does_not_drop_the_required_shortlist() {
             preferred_node_name: Some(""),
             extra_tolerations: &[],
             extra_required_affinity: None,
+            excluded_host_cpus: &[],
         },
     );
 

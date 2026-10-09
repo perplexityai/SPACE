@@ -54,11 +54,12 @@ mod kubernetes_tests {
     };
     use pplx_space_common_core::sql;
     use pplx_space_common_core::types::{
-        ArtifactKind, ArtifactOrigin, ExecutionGeneration, NodeAddress, NodeGroup, NodeGroupName,
-        NodeGroupPolicy, NodeId, NodeManagedBy as SpaceNodeManagedBy, NodeRole as SpaceNodeRole,
-        OrgId, PodName, PodResourceVersion, PodUid, SandboxActivationAttemptId, SandboxLifecycle,
-        SandboxOwner, SandboxOwnerSource, SandboxTransitionTargetState, TemplateCompatSpec,
-        TemplateName, TemplateVisibility,
+        ArtifactKind, ArtifactOrigin, ExecutionGeneration, HostCpu, NodeAddress, NodeGroup,
+        NodeGroupName, NodeGroupPolicy, NodeId, NodeManagedBy as SpaceNodeManagedBy,
+        NodeRole as SpaceNodeRole, OrgId, PodName, PodResourceVersion, PodUid,
+        SandboxActivationAttemptId, SandboxLifecycle, SandboxOwner, SandboxOwnerSource,
+        SandboxTransitionTargetState, SnapshotExecutionMetadata, TemplateCompatSpec, TemplateName,
+        TemplateVisibility,
     };
     use pplx_space_common_svc::space_api_route_ed25519::{
         SPACE_API_ROUTE_ED25519_ISSUER_ENV, SPACE_API_ROUTE_ED25519_SIGNING_KEY_ID_ENV,
@@ -7015,6 +7016,7 @@ mod kubernetes_tests {
                     auto_lifecycle_json,
                     network_policy_json,
                     node_group_placement: Some(&placement),
+                    excluded_host_cpus: &[],
                 },
                 context,
             );
@@ -8915,7 +8917,8 @@ mod kubernetes_tests {
         ];
         let substrate = substrate_with_node_cache_and_config(&nodes, true, config);
 
-        let shortlist = substrate.restore_node_shortlist(SandboxId::new(), "source-node", None);
+        let shortlist =
+            substrate.restore_node_shortlist(SandboxId::new(), "source-node", None, &[]);
 
         assert_eq!(shortlist[0], "source-node", "the source stays pinned first");
         assert!(
@@ -8939,7 +8942,8 @@ mod kubernetes_tests {
         )];
         let substrate = substrate_with_node_cache_and_config(&nodes, true, config);
 
-        let shortlist = substrate.restore_node_shortlist(SandboxId::new(), "source-node", None);
+        let shortlist =
+            substrate.restore_node_shortlist(SandboxId::new(), "source-node", None, &[]);
 
         assert!(shortlist.iter().any(|node| node == "fallback-rolling"));
     }
@@ -9087,8 +9091,12 @@ mod kubernetes_tests {
         )
         .expect("a generic group admits a generic template");
 
-        let shortlist =
-            substrate.restore_node_shortlist(SandboxId::new(), "source-node", Some(&placement));
+        let shortlist = substrate.restore_node_shortlist(
+            SandboxId::new(),
+            "source-node",
+            Some(&placement),
+            &[],
+        );
 
         for name in ["in-set-a", "in-set-b", "in-set-c", "in-set-d"] {
             assert!(
@@ -9143,7 +9151,7 @@ mod kubernetes_tests {
 
         // Ungated, every fallback is a candidate — so the exclusions below are
         // this filter's doing and not some other narrowing in the chain.
-        let ungated = substrate.restore_node_shortlist(SandboxId::new(), "source-node", None);
+        let ungated = substrate.restore_node_shortlist(SandboxId::new(), "source-node", None, &[]);
         for name in [
             "fallback-in-set",
             "fallback-out-of-set",
@@ -9155,8 +9163,12 @@ mod kubernetes_tests {
             );
         }
 
-        let shortlist =
-            substrate.restore_node_shortlist(SandboxId::new(), "source-node", Some(&placement));
+        let shortlist = substrate.restore_node_shortlist(
+            SandboxId::new(),
+            "source-node",
+            Some(&placement),
+            &[],
+        );
 
         assert_eq!(shortlist[0], "source-node", "the source stays pinned first");
         assert!(
@@ -9175,6 +9187,1281 @@ mod kubernetes_tests {
             !shortlist.iter().any(|node| node == "fallback-unlabeled"),
             "an unlabeled fallback cannot satisfy the boundary: {shortlist:?}"
         );
+    }
+
+    fn node_with_host_cpu(
+        name: &str,
+        config: &SandboxPodConfigValues,
+        host_cpu: Option<&str>,
+        unschedulable: bool,
+    ) -> Arc<Node> {
+        let mut labels = config.base_node_selector().into_labels();
+        if let Some(host_cpu) = host_cpu {
+            labels.insert(
+                pplx_space_common_core::kubernetes::HOST_CPU_LABEL.to_string(),
+                host_cpu.to_string(),
+            );
+        }
+        created_at(
+            node_with_network_slots(name, labels, Some(8), None, true, unschedulable),
+            "2020-01-01T00:00:00Z",
+        )
+    }
+
+    /// `node` with its Node object's `creationTimestamp` set to `rfc3339`.
+    fn created_at(node: Arc<Node>, rfc3339: &str) -> Arc<Node> {
+        let mut node = (*node).clone();
+        node.metadata.creation_timestamp =
+            Some(k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
+                rfc3339.parse().expect("valid timestamp"),
+            ));
+        Arc::new(node)
+    }
+
+    /// The default pod config with host-CPU-aware restore placement enabled,
+    /// which every behavior these tests pin needs.
+    fn host_cpu_placement_on() -> SandboxPodConfigValues {
+        SandboxPodConfigValues {
+            restore_host_cpu_placement_enabled: true,
+            ..SandboxPodConfigValues::default()
+        }
+    }
+
+    /// The property: the API reads a node's CPU the way kube-scheduler matches
+    /// the `NotIn` term, by the raw label. A label that only matches after
+    /// normalization isn't one the term can exclude, so it reads as unlabeled.
+    #[test]
+    fn a_non_canonical_host_cpu_label_reads_as_unlabeled() {
+        let config = host_cpu_placement_on();
+        assert_eq!(
+            node_host_cpu(&node_with_host_cpu(
+                "canonical",
+                &config,
+                Some(SKYLAKE),
+                false
+            ))
+            .as_ref()
+            .map(HostCpu::as_str),
+            Some(SKYLAKE)
+        );
+        assert_eq!(
+            node_host_cpu(&node_with_host_cpu(
+                "uppercase",
+                &config,
+                Some("GenuineIntel-6-85-4"),
+                false
+            )),
+            None
+        );
+    }
+
+    const SKYLAKE: &str = "genuineintel-6-85-4";
+    const CASCADE_LAKE: &str = "genuineintel-6-85-7";
+
+    /// The property: a fallback known to have another CPU must not take one of
+    /// the shortlist's slots. The pod builder ANDs the `host-cpu NotIn`
+    /// exclusion into every ORed term, so such an entry is a term no node
+    /// satisfies, and a list of only those leaves a busy source
+    /// `Unschedulable` instead of re-placed.
+    #[tokio::test(flavor = "current_thread")]
+    async fn restore_shortlist_drops_fallbacks_on_another_cpu() {
+        let config = host_cpu_placement_on();
+        let substrate = substrate_with_node_cache_and_config(
+            &[
+                node_with_host_cpu("fallback-same-cpu", &config, Some(CASCADE_LAKE), false),
+                node_with_host_cpu("fallback-other-cpu", &config, Some(SKYLAKE), false),
+                node_with_host_cpu("fallback-unlabeled", &config, None, false),
+            ],
+            true,
+            config,
+        );
+        let excluded = [HostCpu::parse(SKYLAKE).unwrap()];
+
+        // Without a requirement every fallback is a candidate, so the
+        // exclusions below are the CPU filter's doing.
+        let unconstrained =
+            substrate.restore_node_shortlist(SandboxId::new(), "source-node", None, &[]);
+        for name in [
+            "fallback-same-cpu",
+            "fallback-other-cpu",
+            "fallback-unlabeled",
+        ] {
+            assert!(
+                unconstrained.iter().any(|node| node == name),
+                "{name} must be a candidate with no CPU requirement: {unconstrained:?}"
+            );
+        }
+
+        let shortlist =
+            substrate.restore_node_shortlist(SandboxId::new(), "source-node", None, &excluded);
+        assert_eq!(shortlist[0], "source-node", "the source stays pinned first");
+        assert!(shortlist.iter().any(|node| node == "fallback-same-cpu"));
+        assert!(
+            !shortlist.iter().any(|node| node == "fallback-other-cpu"),
+            "a host on another CPU can't load the snapshot: {shortlist:?}"
+        );
+        // `NotIn` passes a node without the label: one node-ctl hasn't
+        // labeled yet stays a fallback, as it was before the label existed.
+        assert!(
+            shortlist.iter().any(|node| node == "fallback-unlabeled"),
+            "an unlabeled host stays a fallback: {shortlist:?}"
+        );
+    }
+
+    /// When every host of the capture CPU reads services-not-ready, the
+    /// readiness filter would leave a CPU-constrained shortlist with only the
+    /// source; they stay as fallbacks instead, so the restore is slower but
+    /// still placeable.
+    #[tokio::test(flavor = "current_thread")]
+    async fn restore_shortlist_keeps_cpu_compatible_fallbacks_that_read_not_ready() {
+        let config = services_ready_config();
+        let with_cpu = |node: Arc<Node>, cpu: &str| {
+            let mut node = (*node).clone();
+            node.metadata
+                .labels
+                .get_or_insert_with(BTreeMap::new)
+                .insert(
+                    pplx_space_common_core::kubernetes::HOST_CPU_LABEL.to_string(),
+                    cpu.to_string(),
+                );
+            Arc::new(node)
+        };
+        let substrate = substrate_with_node_cache_and_config(
+            &[
+                with_cpu(
+                    node_with_services_ready("cascade-lake-a", &config, Some(false)),
+                    CASCADE_LAKE,
+                ),
+                with_cpu(
+                    node_with_services_ready("skylake-b", &config, Some(true)),
+                    SKYLAKE,
+                ),
+                with_cpu(
+                    node_with_services_ready("skylake-c", &config, Some(true)),
+                    SKYLAKE,
+                ),
+                with_cpu(
+                    node_with_services_ready("skylake-d", &config, Some(true)),
+                    SKYLAKE,
+                ),
+            ],
+            true,
+            config,
+        );
+        let excluded = [HostCpu::parse(SKYLAKE).unwrap()];
+
+        let shortlist =
+            substrate.restore_node_shortlist(SandboxId::new(), "source-node", None, &excluded);
+
+        assert!(
+            shortlist.iter().any(|node| node == "cascade-lake-a"),
+            "the only Cascade Lake host stays a fallback: {shortlist:?}"
+        );
+        assert!(!shortlist.iter().any(|node| node.starts_with("skylake")));
+    }
+
+    /// The exclusion lists every other identity the fleet publishes and
+    /// nothing else. An unlabeled node contributes nothing to it, and `NotIn`
+    /// passes a node without the label, so while node-ctl labels the fleet
+    /// gradually (or can't label some node) the unlabeled nodes keep taking
+    /// restores instead of funneling every one onto the few labeled so far.
+    #[tokio::test(flavor = "current_thread")]
+    async fn host_cpu_exclusions_name_only_other_published_cpus() {
+        let config = host_cpu_placement_on();
+        let substrate = substrate_with_node_cache_and_config(
+            &[
+                node_with_host_cpu("cascade-lake-a", &config, Some(CASCADE_LAKE), false),
+                node_with_host_cpu("unlabeled-b", &config, None, false),
+                node_with_host_cpu("skylake-c", &config, Some(SKYLAKE), false),
+                node_with_host_cpu("skylake-d", &config, Some(SKYLAKE), false),
+            ],
+            true,
+            config,
+        );
+        let cascade_lake = HostCpu::parse(CASCADE_LAKE).unwrap();
+
+        assert_eq!(
+            substrate.host_cpu_exclusions(Some(&cascade_lake)),
+            vec![HostCpu::parse(SKYLAKE).unwrap()]
+        );
+        assert_eq!(substrate.host_cpu_exclusions(None), Vec::<HostCpu>::new());
+    }
+
+    fn skylake_loads_on_cascade_lake() -> SandboxPodConfigValues {
+        SandboxPodConfigValues {
+            host_cpu_compatibility: pplx_space_common_core::types::HostCpuCompatibility::parse(
+                &format!("{SKYLAKE}=>{CASCADE_LAKE}"),
+            )
+            .expect("valid compatibility list"),
+            ..host_cpu_placement_on()
+        }
+    }
+
+    /// A listed one-way pair lets the newer CPU take the older one's
+    /// restores. In a fleet with no Skylake host, a Skylake snapshot is
+    /// constrained (Cascade Lake counts as a host that can take it) only
+    /// because of the pair; without it nothing can, and the term is withheld.
+    /// The exclusions follow the same direction: Cascade Lake isn't excluded
+    /// for a Skylake snapshot, while Skylake stays excluded for a Cascade Lake
+    /// one.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_listed_compatible_cpu_takes_the_restore() -> Result<(), BoxError> {
+        let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+        let skylake_snapshot = SandboxId::new();
+        insert_test_sandbox_row(&db.pool, skylake_snapshot, "suspended").await?;
+        let uri = "s3://space-test/suspend-snapshots/skylake-captured?region=us-east-1";
+        seed_full_snapshot_with_host_cpu(&db.pool, skylake_snapshot, uri, Some(SKYLAKE)).await?;
+        let mut sandbox = test_sandbox_with_lifecycle("suspended");
+        sandbox.id = skylake_snapshot;
+        const ICE_LAKE: &str = "genuineintel-6-106-6";
+        let substrate_with = |config: SandboxPodConfigValues, cpus: &[&str]| {
+            let nodes: Vec<Arc<Node>> = cpus
+                .iter()
+                .map(|cpu| node_with_host_cpu(cpu, &config, Some(cpu), false))
+                .collect();
+            KubernetesSubstrate {
+                store: K8sStore::new(db.pool.clone(), "space".to_string()),
+                ..substrate_with_node_cache_and_config(&nodes, true, config)
+            }
+        };
+
+        let cascade_only = [CASCADE_LAKE, ICE_LAKE];
+        assert_eq!(
+            substrate_with(skylake_loads_on_cascade_lake(), &cascade_only)
+                .restore_host_cpu_requirement(&sandbox, &portable_restore(uri), None)
+                .await?
+                .as_ref()
+                .map(HostCpu::as_str),
+            Some(SKYLAKE),
+            "with the pair, a Cascade Lake host can take a Skylake restore"
+        );
+        assert_eq!(
+            substrate_with(host_cpu_placement_on(), &cascade_only)
+                .restore_host_cpu_requirement(&sandbox, &portable_restore(uri), None)
+                .await?,
+            None,
+            "without it, no host can, so the term is withheld"
+        );
+
+        let mixed = substrate_with(
+            skylake_loads_on_cascade_lake(),
+            &[SKYLAKE, CASCADE_LAKE, ICE_LAKE],
+        );
+        assert_eq!(
+            mixed.host_cpu_exclusions(Some(&HostCpu::parse(SKYLAKE).unwrap())),
+            vec![HostCpu::parse(ICE_LAKE).unwrap()],
+            "a Skylake snapshot excludes the unlisted Ice Lake, not Cascade Lake"
+        );
+        assert_eq!(
+            mixed.host_cpu_exclusions(Some(&HostCpu::parse(CASCADE_LAKE).unwrap())),
+            vec![
+                HostCpu::parse(ICE_LAKE).unwrap(),
+                HostCpu::parse(SKYLAKE).unwrap()
+            ],
+            "the pair is one-way: a Cascade Lake snapshot still excludes Skylake"
+        );
+        Ok(())
+    }
+
+    /// A stranded restore whose pinned node can load the snapshot under the
+    /// compatibility list isn't stranded: it stays local. Without the pair the
+    /// same shape redirects.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_pinned_node_that_can_load_the_snapshot_keeps_the_local_plan() -> Result<(), BoxError>
+    {
+        let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+        let plan_with = |config: SandboxPodConfigValues, sandbox_id: SandboxId| {
+            let nodes = [
+                node_with_host_cpu("cascade-lake-a", &config, Some(CASCADE_LAKE), false),
+                node_with_host_cpu("skylake-b", &config, Some(SKYLAKE), false),
+            ];
+            let substrate = KubernetesSubstrate {
+                store: K8sStore::new(db.pool.clone(), "space".to_string()),
+                ..substrate_with_node_cache_and_config(&nodes, true, config)
+            };
+            let pool = db.pool.clone();
+            async move {
+                let sandbox = fetch_sandbox(&pool, sandbox_id)
+                    .await?
+                    .expect("seeded sandbox exists");
+                let plan = substrate.suspend_restore_plan(&sandbox, false).await?;
+                Ok::<_, BoxError>((plan.source_node_name, plan.storage_uri))
+            }
+        };
+
+        let listed =
+            seed_stranded_restore(&db.pool, "cascade-lake-a", "gone-node", Some(SKYLAKE)).await?;
+        assert_eq!(
+            plan_with(skylake_loads_on_cascade_lake(), listed.sandbox_id).await?,
+            (Some("cascade-lake-a".to_string()), None)
+        );
+        let unlisted =
+            seed_stranded_restore(&db.pool, "cascade-lake-a", "gone-node", Some(SKYLAKE)).await?;
+        assert_eq!(
+            plan_with(host_cpu_placement_on(), unlisted.sandbox_id).await?,
+            (None, Some(unlisted.uri.to_string()))
+        );
+        Ok(())
+    }
+
+    async fn seed_full_snapshot_with_host_cpu(
+        pool: &PgPool,
+        sandbox_id: SandboxId,
+        storage_uri: &str,
+        host_cpu: Option<&str>,
+    ) -> Result<(), BoxError> {
+        seed_full_snapshot(pool, sandbox_id, storage_uri, host_cpu, None, "NOW()").await
+    }
+
+    /// One ready full snapshot with a usable location. `timestamp_sql` is a
+    /// literal SQL expression so callers can order snapshots against the
+    /// sandbox's activity and placement clocks.
+    async fn seed_full_snapshot(
+        pool: &PgPool,
+        sandbox_id: SandboxId,
+        storage_uri: &str,
+        host_cpu: Option<&str>,
+        source_node_id: Option<NodeId>,
+        timestamp_sql: &str,
+    ) -> Result<(), BoxError> {
+        let snapshot_id = SnapshotId::new();
+        let mut execution_metadata = serde_json::to_value(SnapshotExecutionMetadata::new(
+            pplx_space_common_core::types::ExecutionMetadata::initial_firecracker(
+                pplx_space_common_core::types::Arch::X86_64,
+                vec![],
+            ),
+        )?)?;
+        if let Some(host_cpu) = host_cpu {
+            execution_metadata["host_cpu"] = host_cpu.into();
+        }
+        sqlx::query(sqlx::AssertSqlSafe(sql!(format!(
+            "INSERT INTO snapshots (id, sandbox_id, type, state, timestamp, org_id,
+                 execution_metadata, source_node_id)
+             VALUES ($1, $2, 'full', 'ready', {timestamp_sql},
+                 '00000000-0000-0000-0000-000000000001', $3, $4)"
+        ))))
+        .bind(snapshot_id)
+        .bind(sandbox_id)
+        .bind(execution_metadata)
+        .bind(source_node_id)
+        .execute(pool)
+        .await?;
+        sqlx::query(sql!(
+            "INSERT INTO snapshot_storage_locations (snapshot_id, storage_connection_string, org_id)
+             VALUES ($1, $2, '00000000-0000-0000-0000-000000000001')"
+        ))
+        .bind(snapshot_id)
+        .bind(storage_uri)
+        .execute(pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn seed_k8s_node(pool: &PgPool, k8s_node_name: &str) -> Result<NodeId, BoxError> {
+        let node_id = NodeId::new();
+        pplx_space_db_test_fixtures::insert_ready_worker_node(pool, node_id).await?;
+        sqlx::query(sql!(
+            "INSERT INTO node_k8s (node_id, k8s_node_name) VALUES ($1, $2)"
+        ))
+        .bind(node_id)
+        .bind(k8s_node_name)
+        .execute(pool)
+        .await?;
+        Ok(node_id)
+    }
+
+    fn portable_restore(storage_uri: &str) -> PodCreateContext<'_> {
+        PodCreateContext::Restore(RestoreContext::UserRestore {
+            suspend_restore_storage_uri: Some(storage_uri),
+            suspend_restore_source_node: Some("source-node"),
+            direct_node_name: None,
+            preferred_node_name: Some("source-node"),
+        })
+    }
+
+    /// Operator-visible property: a suspended sandbox whose snapshot was taken
+    /// on a Cascade Lake host stays off hosts labeled with another CPU when the
+    /// cluster has a Cascade Lake host to offer, and restores exactly as it did before this
+    /// change when it doesn't, rather than waiting `Unschedulable` for a host
+    /// that may never exist.
+    #[tokio::test(flavor = "current_thread")]
+    async fn restore_requires_the_capture_cpu_only_when_a_schedulable_host_has_it()
+    -> Result<(), BoxError> {
+        let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+        let sandbox_id = SandboxId::new();
+        insert_test_sandbox_row(&db.pool, sandbox_id, "suspended").await?;
+        let recorded_uri = "s3://space-test/suspend-snapshots/cascade-lake?region=us-east-1";
+        let legacy_uri = "s3://space-test/suspend-snapshots/legacy?region=us-east-1";
+        seed_full_snapshot_with_host_cpu(&db.pool, sandbox_id, recorded_uri, Some(CASCADE_LAKE))
+            .await?;
+        seed_full_snapshot_with_host_cpu(&db.pool, sandbox_id, legacy_uri, None).await?;
+        let mut sandbox = test_sandbox_with_lifecycle("suspended");
+        sandbox.id = sandbox_id;
+        let config = host_cpu_placement_on();
+        let substrate_with = |nodes: &[Arc<Node>], nodes_ready: bool| KubernetesSubstrate {
+            store: K8sStore::new(db.pool.clone(), "space".to_string()),
+            ..substrate_with_node_cache_and_config(nodes, nodes_ready, config.clone())
+        };
+        let mixed_fleet = [
+            node_with_host_cpu("skylake-a", &config, Some(SKYLAKE), false),
+            node_with_host_cpu("cascade-lake-a", &config, Some(CASCADE_LAKE), false),
+        ];
+
+        let required = substrate_with(&mixed_fleet, true)
+            .restore_host_cpu_requirement(&sandbox, &portable_restore(recorded_uri), None)
+            .await?;
+        assert_eq!(required.as_ref().map(HostCpu::as_str), Some(CASCADE_LAKE));
+
+        // The gate off renders no CPU constraint for the same inputs, so
+        // placement is exactly as it was before the label existed.
+        let gate_off = KubernetesSubstrate {
+            store: K8sStore::new(db.pool.clone(), "space".to_string()),
+            ..substrate_with_node_cache_and_config(
+                &mixed_fleet,
+                true,
+                SandboxPodConfigValues::default(),
+            )
+        };
+        assert_eq!(
+            gate_off
+                .restore_host_cpu_requirement(&sandbox, &portable_restore(recorded_uri), None)
+                .await?,
+            None,
+            "the gate is off by default"
+        );
+
+        // Each case below differs from the one above in one input only, so a
+        // `None` is that input's doing.
+        for (case, nodes, nodes_ready) in [
+            (
+                "no host has the CPU",
+                vec![node_with_host_cpu(
+                    "skylake-a",
+                    &config,
+                    Some(SKYLAKE),
+                    false,
+                )],
+                true,
+            ),
+            (
+                "the only such host is cordoned",
+                vec![
+                    node_with_host_cpu("skylake-a", &config, Some(SKYLAKE), false),
+                    node_with_host_cpu("cascade-lake-a", &config, Some(CASCADE_LAKE), true),
+                ],
+                true,
+            ),
+            ("the node cache is cold", mixed_fleet.to_vec(), false),
+        ] {
+            let required = substrate_with(&nodes, nodes_ready)
+                .restore_host_cpu_requirement(&sandbox, &portable_restore(recorded_uri), None)
+                .await?;
+            assert_eq!(required, None, "{case}");
+        }
+
+        let substrate = substrate_with(&mixed_fleet, true);
+        assert_eq!(
+            substrate
+                .restore_host_cpu_requirement(&sandbox, &portable_restore(legacy_uri), None)
+                .await?,
+            None,
+            "a snapshot with no recorded CPU and no capturing node stays unconstrained"
+        );
+        let local_only = PodCreateContext::Restore(RestoreContext::UserRestore {
+            suspend_restore_storage_uri: None,
+            suspend_restore_source_node: Some("cascade-lake-a"),
+            direct_node_name: Some("cascade-lake-a"),
+            preferred_node_name: None,
+        });
+        assert_eq!(
+            substrate
+                .restore_host_cpu_requirement(&sandbox, &local_only, None)
+                .await?,
+            None,
+            "a local-only restore has no remote snapshot to read the CPU from"
+        );
+        let stopped = Sandbox {
+            lifecycle: "stopped".to_string(),
+            ..sandbox.clone()
+        };
+        assert_eq!(
+            substrate
+                .restore_host_cpu_requirement(&stopped, &portable_restore(recorded_uri), None)
+                .await?,
+            None,
+            "a disk-only restore carries no vCPU state"
+        );
+        Ok(())
+    }
+
+    /// The node-group term and the CPU term are ANDed into the same required
+    /// terms, so a host with the capture CPU outside the sandbox's node group
+    /// can't take the pod. If that's the only such host, the CPU term must be
+    /// withheld rather than leave the restore `Unschedulable`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn restore_requirement_counts_only_hosts_inside_the_node_group() -> Result<(), BoxError> {
+        let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+        let sandbox_id = SandboxId::new();
+        insert_test_sandbox_row(&db.pool, sandbox_id, "suspended").await?;
+        let uri = "s3://space-test/suspend-snapshots/grouped?region=us-east-1";
+        seed_full_snapshot_with_host_cpu(&db.pool, sandbox_id, uri, Some(CASCADE_LAKE)).await?;
+        let mut sandbox = test_sandbox_with_lifecycle("suspended");
+        sandbox.id = sandbox_id;
+        let config = host_cpu_placement_on();
+        let grouped = |name: &str, group: &str, cpu: &str| {
+            let mut labels = config.base_node_selector().into_labels();
+            labels.insert(SANDBOX_NODE_GROUP_LABEL.to_string(), group.to_string());
+            labels.insert(
+                pplx_space_common_core::kubernetes::HOST_CPU_LABEL.to_string(),
+                cpu.to_string(),
+            );
+            node_with_network_slots(name, labels, Some(8), None, true, false)
+        };
+        let template = TemplateCompatSpec {
+            name: TemplateName::parse("seed").expect("valid template name"),
+            org_id: None,
+            visibility: TemplateVisibility::Generic,
+        };
+        let placement = NodeGroupPlacement::for_caller(
+            Some(OrgId::new()),
+            &template,
+            &[NodeGroup {
+                id: NodeGroupId::new(),
+                name: NodeGroupName::parse("workers").expect("valid group name"),
+                policy: NodeGroupPolicy::Generic { is_default: true },
+                template_allowlist: std::collections::BTreeSet::new(),
+            }],
+        )
+        .expect("a generic group admits a generic template");
+        let requirement = |nodes: Vec<Arc<Node>>| {
+            let substrate = KubernetesSubstrate {
+                store: K8sStore::new(db.pool.clone(), "space".to_string()),
+                ..substrate_with_node_cache_and_config(&nodes, true, config.clone())
+            };
+            let sandbox = sandbox.clone();
+            let placement = placement.clone();
+            async move {
+                substrate
+                    .restore_host_cpu_requirement(
+                        &sandbox,
+                        &portable_restore(uri),
+                        Some(&placement),
+                    )
+                    .await
+            }
+        };
+
+        assert_eq!(
+            requirement(vec![
+                grouped("skylake-in-set", "workers", SKYLAKE),
+                grouped("cascade-lake-out-of-set", "org-b-1", CASCADE_LAKE),
+            ])
+            .await?,
+            None,
+            "the only Cascade Lake host is outside the candidate set"
+        );
+        assert_eq!(
+            requirement(vec![
+                grouped("skylake-in-set", "workers", SKYLAKE),
+                grouped("cascade-lake-in-set", "workers", CASCADE_LAKE),
+            ])
+            .await?
+            .as_ref()
+            .map(HostCpu::as_str),
+            Some(CASCADE_LAKE)
+        );
+        Ok(())
+    }
+
+    /// A snapshot taken before the capture CPU was recorded is still kept on
+    /// compatible hosts while the node that captured it is in the cluster to
+    /// say what its CPU is.
+    #[tokio::test(flavor = "current_thread")]
+    async fn restore_requirement_falls_back_to_the_capturing_nodes_label() -> Result<(), BoxError> {
+        let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+        let sandbox_id = SandboxId::new();
+        insert_test_sandbox_row(&db.pool, sandbox_id, "suspended").await?;
+        let capturing_node = seed_k8s_node(&db.pool, "cascade-lake-a").await?;
+        let uri = "s3://space-test/suspend-snapshots/legacy-capture?region=us-east-1";
+        seed_full_snapshot(
+            &db.pool,
+            sandbox_id,
+            uri,
+            None,
+            Some(capturing_node),
+            "NOW()",
+        )
+        .await?;
+        let mut sandbox = test_sandbox_with_lifecycle("suspended");
+        sandbox.id = sandbox_id;
+        let config = host_cpu_placement_on();
+        let substrate_with = |nodes: &[Arc<Node>]| KubernetesSubstrate {
+            store: K8sStore::new(db.pool.clone(), "space".to_string()),
+            ..substrate_with_node_cache_and_config(nodes, true, config.clone())
+        };
+
+        let with_capturing_node = substrate_with(&[
+            node_with_host_cpu("skylake-a", &config, Some(SKYLAKE), false),
+            node_with_host_cpu("cascade-lake-a", &config, Some(CASCADE_LAKE), false),
+        ])
+        .restore_host_cpu_requirement(&sandbox, &portable_restore(uri), None)
+        .await?;
+        assert_eq!(
+            with_capturing_node.as_ref().map(HostCpu::as_str),
+            Some(CASCADE_LAKE)
+        );
+
+        // Once the capturing node has left the cluster nothing says what CPU
+        // the snapshot needs, so it isn't constrained.
+        let capturing_node_gone = substrate_with(&[
+            node_with_host_cpu("skylake-a", &config, Some(SKYLAKE), false),
+            node_with_host_cpu("cascade-lake-b", &config, Some(CASCADE_LAKE), false),
+        ])
+        .restore_host_cpu_requirement(&sandbox, &portable_restore(uri), None)
+        .await?;
+        assert_eq!(capturing_node_gone, None);
+
+        // A Node object newer than the snapshot is a replacement machine that
+        // reused the name, so its label says nothing about the capture.
+        let replaced_under_the_same_name = substrate_with(&[
+            node_with_host_cpu("skylake-a", &config, Some(SKYLAKE), false),
+            created_at(
+                node_with_host_cpu("cascade-lake-a", &config, Some(CASCADE_LAKE), false),
+                "2099-01-01T00:00:00Z",
+            ),
+            node_with_host_cpu("cascade-lake-b", &config, Some(CASCADE_LAKE), false),
+        ])
+        .restore_host_cpu_requirement(&sandbox, &portable_restore(uri), None)
+        .await?;
+        assert_eq!(replaced_under_the_same_name, None);
+        Ok(())
+    }
+
+    fn tainted(node: Arc<Node>, key: &str, value: &str, effect: &str) -> Arc<Node> {
+        let mut node = (*node).clone();
+        node.spec
+            .get_or_insert_with(Default::default)
+            .taints
+            .get_or_insert_with(Vec::new)
+            .push(Taint {
+                key: key.to_string(),
+                value: Some(value.to_string()),
+                effect: effect.to_string(),
+                ..Default::default()
+            });
+        Arc::new(node)
+    }
+
+    #[test]
+    fn taint_toleration_matching_follows_kubernetes_rules() {
+        let config = host_cpu_placement_on();
+        let node = tainted(
+            node_with_host_cpu("worker-a", &config, Some(SKYLAKE), false),
+            "space.pplx.net/rollout-cohort",
+            "target",
+            "NoSchedule",
+        );
+        let toleration = |key: Option<&str>, operator: &str, value: Option<&str>| PodToleration {
+            key: key.map(str::to_string),
+            operator: Some(operator.to_string()),
+            value: value.map(str::to_string),
+            effect: Some("NoSchedule".to_string()),
+            toleration_seconds: None,
+        };
+
+        assert!(!node_taints_tolerated(&node, &[]));
+        assert!(node_taints_tolerated(
+            &node,
+            &[toleration(
+                Some("space.pplx.net/rollout-cohort"),
+                "Equal",
+                Some("target")
+            )]
+        ));
+        assert!(!node_taints_tolerated(
+            &node,
+            &[toleration(
+                Some("space.pplx.net/rollout-cohort"),
+                "Equal",
+                Some("other")
+            )]
+        ));
+        assert!(node_taints_tolerated(
+            &node,
+            &[toleration(
+                Some("space.pplx.net/rollout-cohort"),
+                "Exists",
+                None
+            )]
+        ));
+        assert!(node_taints_tolerated(
+            &node,
+            &[toleration(None, "Exists", None)]
+        ));
+        // Only NoSchedule and NoExecute keep a pod off a node.
+        let soft = tainted(
+            node_with_host_cpu("worker-b", &config, Some(SKYLAKE), false),
+            "example.com/soft",
+            "x",
+            "PreferNoSchedule",
+        );
+        assert!(node_taints_tolerated(&soft, &[]));
+    }
+
+    /// A host with the capture CPU that the pod can't tolerate can't take it:
+    /// a user restore doesn't tolerate a rollout cohort's taint, so cohort
+    /// nodes don't count for it, while the evacuation that carries the
+    /// toleration does count them.
+    #[tokio::test(flavor = "current_thread")]
+    async fn restore_requirement_counts_only_hosts_whose_taints_the_pod_tolerates()
+    -> Result<(), BoxError> {
+        let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+        let sandbox_id = SandboxId::new();
+        insert_test_sandbox_row(&db.pool, sandbox_id, "suspended").await?;
+        let uri = "s3://space-test/suspend-snapshots/tainted?region=us-east-1";
+        seed_full_snapshot_with_host_cpu(&db.pool, sandbox_id, uri, Some(CASCADE_LAKE)).await?;
+        let mut sandbox = test_sandbox_with_lifecycle("suspended");
+        sandbox.id = sandbox_id;
+        let config = host_cpu_placement_on();
+        let substrate = KubernetesSubstrate {
+            store: K8sStore::new(db.pool.clone(), "space".to_string()),
+            ..substrate_with_node_cache_and_config(
+                &[
+                    node_with_host_cpu("skylake-a", &config, Some(SKYLAKE), false),
+                    tainted(
+                        node_with_host_cpu(
+                            "cascade-lake-cohort",
+                            &config,
+                            Some(CASCADE_LAKE),
+                            false,
+                        ),
+                        "space.pplx.net/rollout-cohort",
+                        "target",
+                        "NoSchedule",
+                    ),
+                ],
+                true,
+                config.clone(),
+            )
+        };
+
+        assert_eq!(
+            substrate
+                .restore_host_cpu_requirement(&sandbox, &portable_restore(uri), None)
+                .await?,
+            None,
+            "a user restore can't land on the only Cascade Lake host"
+        );
+        let tolerations = [PodToleration::equal_no_schedule(
+            "space.pplx.net/rollout-cohort",
+            "target".to_string(),
+        )];
+        let evacuation = PodCreateContext::Restore(RestoreContext::Evacuation {
+            suspend_restore_storage_uri: Some(uri),
+            extra_tolerations: &tolerations,
+            extra_required_affinity: None,
+        });
+        assert_eq!(
+            substrate
+                .restore_host_cpu_requirement(&sandbox, &evacuation, None)
+                .await?
+                .as_ref()
+                .map(HostCpu::as_str),
+            Some(CASCADE_LAKE),
+            "the evacuation tolerates the cohort taint"
+        );
+        Ok(())
+    }
+
+    /// The redirect hands the restore to scheduler placement inside the
+    /// sandbox's node-group set. With no capture-CPU host in that set it
+    /// would land on another incompatible host and be redirected again, so it
+    /// keeps the local-only plan; with one in the set, it redirects.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_stranded_restore_redirects_only_toward_an_in_set_compatible_host()
+    -> Result<(), BoxError> {
+        let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+        sqlx::query(sql!(
+            "INSERT INTO templates (id, name, org_id, visibility) VALUES ($1, 'seed', NULL, 'generic')"
+        ))
+        .bind(Uuid::now_v7())
+        .execute(&db.pool)
+        .await?;
+        sqlx::query(sql!(
+            "INSERT INTO node_groups (id, name, org_id, template_policy, is_default)
+             VALUES ($1, 'workers', NULL, 'default', TRUE)"
+        ))
+        .bind(Uuid::now_v7())
+        .execute(&db.pool)
+        .await?;
+        let config = host_cpu_placement_on();
+        let grouped = |name: &str, group: &str, cpu: &str| {
+            let node = node_with_host_cpu(name, &config, Some(cpu), false);
+            let mut node = (*node).clone();
+            node.metadata
+                .labels
+                .get_or_insert_with(BTreeMap::new)
+                .insert(SANDBOX_NODE_GROUP_LABEL.to_string(), group.to_string());
+            Arc::new(node)
+        };
+        let plan_with = |nodes: Vec<Arc<Node>>, sandbox_id: SandboxId| {
+            let substrate =
+                substrate_with_placement_gate_open(&nodes, config.clone(), db.pool.clone());
+            let pool = db.pool.clone();
+            async move {
+                let sandbox = fetch_sandbox(&pool, sandbox_id)
+                    .await?
+                    .expect("seeded sandbox exists");
+                let plan = substrate.suspend_restore_plan(&sandbox, false).await?;
+                Ok::<_, BoxError>((plan.source_node_name, plan.storage_uri))
+            }
+        };
+
+        let outside =
+            seed_stranded_restore(&db.pool, "skylake-a", "gone-node", Some(CASCADE_LAKE)).await?;
+        assert_eq!(
+            plan_with(
+                vec![
+                    grouped("skylake-a", "workers", SKYLAKE),
+                    grouped("cascade-lake-a", "org-b-1", CASCADE_LAKE),
+                ],
+                outside.sandbox_id,
+            )
+            .await?,
+            (Some("skylake-a".to_string()), None),
+            "the only Cascade Lake host is outside the sandbox's node-group set"
+        );
+        let inside =
+            seed_stranded_restore(&db.pool, "skylake-a", "gone-node", Some(CASCADE_LAKE)).await?;
+        assert_eq!(
+            plan_with(
+                vec![
+                    grouped("skylake-a", "workers", SKYLAKE),
+                    grouped("cascade-lake-a", "workers", CASCADE_LAKE),
+                ],
+                inside.sandbox_id,
+            )
+            .await?,
+            (None, Some(inside.uri.to_string()))
+        );
+        Ok(())
+    }
+
+    /// The only hosts with the capture CPU can be the sandbox org's dedicated
+    /// group, tainted for that org. The redirected pod tolerates that taint,
+    /// so the cheap pre-check must not rule those hosts out before the final
+    /// check can count them.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_stranded_restore_redirects_toward_its_orgs_dedicated_hosts() -> Result<(), BoxError>
+    {
+        let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+        let org_id = Uuid::parse_str("00000000-0000-0000-0000-000000000001")?;
+        sqlx::query(sql!(
+            "INSERT INTO templates (id, name, org_id, visibility) VALUES ($1, 'seed', NULL, 'generic')"
+        ))
+        .bind(Uuid::now_v7())
+        .execute(&db.pool)
+        .await?;
+        for (name, owner, is_default) in [("workers", None, true), ("org-own", Some(org_id), false)]
+        {
+            sqlx::query(sql!(
+                "INSERT INTO node_groups (id, name, org_id, template_policy, is_default)
+                 VALUES ($1, $2, $3, 'default', $4)"
+            ))
+            .bind(Uuid::now_v7())
+            .bind(name)
+            .bind(owner)
+            .bind(is_default)
+            .execute(&db.pool)
+            .await?;
+        }
+        let config = host_cpu_placement_on();
+        let grouped = |name: &str, group: &str, cpu: &str| {
+            let node = node_with_host_cpu(name, &config, Some(cpu), false);
+            let mut node = (*node).clone();
+            node.metadata
+                .labels
+                .get_or_insert_with(BTreeMap::new)
+                .insert(SANDBOX_NODE_GROUP_LABEL.to_string(), group.to_string());
+            Arc::new(node)
+        };
+        let nodes = vec![
+            grouped("skylake-a", "workers", SKYLAKE),
+            grouped("skylake-b", "workers", SKYLAKE),
+            tainted(
+                grouped("cascade-lake-dedicated", "org-own", CASCADE_LAKE),
+                pplx_space_common_core::kubernetes::placement::DEDICATED_NODE_TAINT_KEY,
+                &org_id.to_string(),
+                "NoSchedule",
+            ),
+        ];
+        let substrate = substrate_with_placement_gate_open(&nodes, config.clone(), db.pool.clone());
+        let stranded =
+            seed_stranded_restore(&db.pool, "skylake-a", "gone-node", Some(CASCADE_LAKE)).await?;
+        let sandbox = fetch_sandbox(&db.pool, stranded.sandbox_id)
+            .await?
+            .expect("seeded sandbox exists");
+
+        let plan = substrate.suspend_restore_plan(&sandbox, false).await?;
+
+        assert_eq!(
+            (plan.source_node_name, plan.storage_uri),
+            (None, Some(stranded.uri.to_string()))
+        );
+        Ok(())
+    }
+
+    /// An evacuation's cohort pin is ANDed with the CPU term, so only hosts in
+    /// the target cohort count: a drain into a cohort without the capture CPU
+    /// must not render a term no cohort node can satisfy.
+    #[tokio::test(flavor = "current_thread")]
+    async fn evacuation_requirement_counts_only_hosts_in_the_target_cohort() -> Result<(), BoxError>
+    {
+        let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+        let sandbox_id = SandboxId::new();
+        insert_test_sandbox_row(&db.pool, sandbox_id, "suspended").await?;
+        let uri = "s3://space-test/suspend-snapshots/evacuating?region=us-east-1";
+        seed_full_snapshot_with_host_cpu(&db.pool, sandbox_id, uri, Some(SKYLAKE)).await?;
+        let mut sandbox = test_sandbox_with_lifecycle("suspended");
+        sandbox.id = sandbox_id;
+        let config = host_cpu_placement_on();
+        let cohort = ("space.pplx.net/rollout-cohort", "target");
+        let in_cohort = |name: &str, cpu: &str| {
+            let node = node_with_host_cpu(name, &config, Some(cpu), false);
+            let mut node = (*node).clone();
+            node.metadata
+                .labels
+                .get_or_insert_with(BTreeMap::new)
+                .insert(cohort.0.to_string(), cohort.1.to_string());
+            Arc::new(node)
+        };
+        let evacuation = PodCreateContext::Restore(RestoreContext::Evacuation {
+            suspend_restore_storage_uri: Some(uri),
+            extra_tolerations: &[],
+            extra_required_affinity: Some(cohort),
+        });
+        let requirement = |nodes: Vec<Arc<Node>>| {
+            let substrate = KubernetesSubstrate {
+                store: K8sStore::new(db.pool.clone(), "space".to_string()),
+                ..substrate_with_node_cache_and_config(&nodes, true, config.clone())
+            };
+            let sandbox = sandbox.clone();
+            let evacuation = &evacuation;
+            async move {
+                substrate
+                    .restore_host_cpu_requirement(&sandbox, evacuation, None)
+                    .await
+            }
+        };
+
+        assert_eq!(
+            requirement(vec![
+                node_with_host_cpu("skylake-outside-cohort", &config, Some(SKYLAKE), false),
+                in_cohort("cascade-lake-in-cohort", CASCADE_LAKE),
+            ])
+            .await?,
+            None,
+            "the only Skylake host is outside the target cohort"
+        );
+        assert_eq!(
+            requirement(vec![
+                in_cohort("skylake-in-cohort", SKYLAKE),
+                in_cohort("cascade-lake-in-cohort", CASCADE_LAKE),
+            ])
+            .await?
+            .as_ref()
+            .map(HostCpu::as_str),
+            Some(SKYLAKE)
+        );
+        Ok(())
+    }
+
+    /// The state a failed cross-node restore leaves: the sandbox's placement
+    /// points at the target that couldn't load the snapshot, and that
+    /// placement postdates the snapshot, so the freshness gate rejects the
+    /// remote copy and every wake becomes a local-only restore on that node.
+    struct StrandedRestore {
+        sandbox_id: SandboxId,
+        uri: &'static str,
+    }
+
+    async fn seed_stranded_restore(
+        pool: &PgPool,
+        pointer_node: &str,
+        capturing_node: &str,
+        snapshot_host_cpu: Option<&str>,
+    ) -> Result<StrandedRestore, BoxError> {
+        let sandbox_id = SandboxId::new();
+        insert_test_sandbox_row(pool, sandbox_id, "suspended").await?;
+        let pointer_node_id = seed_k8s_node(pool, pointer_node).await?;
+        let capturing_node_id = seed_k8s_node(pool, capturing_node).await?;
+        let uri = "s3://space-test/suspend-snapshots/stranded?region=us-east-1";
+        seed_full_snapshot(
+            pool,
+            sandbox_id,
+            uri,
+            snapshot_host_cpu,
+            Some(capturing_node_id),
+            "NOW() - INTERVAL '2 hours'",
+        )
+        .await?;
+        sqlx::query(sql!(
+            "UPDATE sandboxes
+                SET target_node_id = $2,
+                    placement_changed_at = NOW() - INTERVAL '1 hour',
+                    last_command_at = NOW() - INTERVAL '3 hours',
+                    last_access_at = NOW() - INTERVAL '3 hours'
+              WHERE id = $1"
+        ))
+        .bind(sandbox_id)
+        .bind(pointer_node_id)
+        .execute(pool)
+        .await?;
+        Ok(StrandedRestore { sandbox_id, uri })
+    }
+
+    /// Operator-visible property: a suspended sandbox stranded on a host that
+    /// can't load its snapshot wakes on a host that can, from the snapshot's
+    /// durable copy, and only when that copy holds all of its recorded work.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_restore_stranded_on_an_incompatible_cpu_restores_from_its_snapshot()
+    -> Result<(), BoxError> {
+        let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+        let config = host_cpu_placement_on();
+        let fleet = [
+            node_with_host_cpu("skylake-a", &config, Some(SKYLAKE), false),
+            node_with_host_cpu("cascade-lake-a", &config, Some(CASCADE_LAKE), false),
+            node_with_host_cpu("unlabeled-a", &config, None, false),
+        ];
+        let substrate = KubernetesSubstrate {
+            store: K8sStore::new(db.pool.clone(), "space".to_string()),
+            ..substrate_with_node_cache_and_config(&fleet, true, config.clone())
+        };
+        let plan_for = |sandbox_id: SandboxId| {
+            let substrate = &substrate;
+            let pool = db.pool.clone();
+            async move {
+                let sandbox = fetch_sandbox(&pool, sandbox_id)
+                    .await?
+                    .expect("seeded sandbox exists");
+                let plan = substrate.suspend_restore_plan(&sandbox, false).await?;
+                Ok::<_, BoxError>((plan.source_node_name, plan.storage_uri))
+            }
+        };
+
+        // Legacy snapshot, CPU known only from the capturing node's label.
+        let stranded = seed_stranded_restore(&db.pool, "skylake-a", "cascade-lake-a", None).await?;
+        let gate_off = KubernetesSubstrate {
+            store: K8sStore::new(db.pool.clone(), "space".to_string()),
+            ..substrate_with_node_cache_and_config(&fleet, true, SandboxPodConfigValues::default())
+        };
+        let sandbox = fetch_sandbox(&db.pool, stranded.sandbox_id)
+            .await?
+            .expect("seeded sandbox exists");
+        let plan = gate_off.suspend_restore_plan(&sandbox, false).await?;
+        assert_eq!(
+            (plan.source_node_name, plan.storage_uri),
+            (Some("skylake-a".to_string()), None),
+            "with the gate off by default, the stranded restore keeps its local-only plan"
+        );
+        assert_eq!(
+            plan_for(stranded.sandbox_id).await?,
+            (None, Some(stranded.uri.to_string())),
+            "the stranded restore moves to the snapshot's storage URI"
+        );
+        let recorded =
+            seed_stranded_restore(&db.pool, "skylake-a", "gone-node", Some(CASCADE_LAKE)).await?;
+        assert_eq!(
+            plan_for(recorded.sandbox_id).await?,
+            (None, Some(recorded.uri.to_string())),
+            "a recorded capture CPU needs no capturing node"
+        );
+
+        // Each case below keeps the local-only plan; each differs from the
+        // first stranded shape in one input.
+        let same_cpu =
+            seed_stranded_restore(&db.pool, "skylake-a", "gone-node", Some(SKYLAKE)).await?;
+        let unlabeled_pointer =
+            seed_stranded_restore(&db.pool, "unlabeled-a", "cascade-lake-a", None).await?;
+        let unknown_capture =
+            seed_stranded_restore(&db.pool, "skylake-a", "gone-node", None).await?;
+        let no_compatible_host = seed_stranded_restore(
+            &db.pool,
+            "skylake-a",
+            "gone-node",
+            Some("genuineintel-6-106-6"),
+        )
+        .await?;
+        let activity_after_snapshot =
+            seed_stranded_restore(&db.pool, "skylake-a", "cascade-lake-a", None).await?;
+        sqlx::query(sql!(
+            "UPDATE sandboxes SET last_command_at = NOW() - INTERVAL '90 minutes' WHERE id = $1"
+        ))
+        .bind(activity_after_snapshot.sandbox_id)
+        .execute(&db.pool)
+        .await?;
+        // Wakes compute the plan after the restore lifecycle begins, so the
+        // row is `restoring` (the trigger stamps `lifecycle_changed_at`) and
+        // the retry selector rejects the snapshot as older than the failed
+        // placement. That's the shape the redirect has to handle.
+        let restoring =
+            seed_stranded_restore(&db.pool, "skylake-a", "cascade-lake-a", None).await?;
+        sqlx::query(sql!(
+            "UPDATE sandboxes SET lifecycle = 'restoring' WHERE id = $1"
+        ))
+        .bind(restoring.sandbox_id)
+        .execute(&db.pool)
+        .await?;
+        assert_eq!(
+            plan_for(restoring.sandbox_id).await?,
+            (None, Some(restoring.uri.to_string())),
+            "a restoring row, as a wake sees it, is redirected"
+        );
+        // A full snapshot newer than the restore's start may be the restore's
+        // own artifact, so the redirect stands aside.
+        let restoring_with_later =
+            seed_stranded_restore(&db.pool, "skylake-a", "cascade-lake-a", None).await?;
+        sqlx::query(sql!(
+            "UPDATE sandboxes SET lifecycle = 'restoring' WHERE id = $1"
+        ))
+        .bind(restoring_with_later.sandbox_id)
+        .execute(&db.pool)
+        .await?;
+        seed_full_snapshot(
+            &db.pool,
+            restoring_with_later.sandbox_id,
+            "s3://space-test/suspend-snapshots/during-restore?region=us-east-1",
+            // A known capture CPU, so only the restore-start bound can keep
+            // the redirect from picking this snapshot.
+            Some(CASCADE_LAKE),
+            None,
+            "NOW() + INTERVAL '1 minute'",
+        )
+        .await?;
+        assert_eq!(
+            plan_for(restoring_with_later.sandbox_id).await?,
+            (Some("skylake-a".to_string()), None),
+            "a snapshot published after the restore began keeps the local-only plan"
+        );
+        // A newer full snapshot that's still uploading may hold later state.
+        let uploading =
+            seed_stranded_restore(&db.pool, "skylake-a", "cascade-lake-a", None).await?;
+        sqlx::query(sql!(
+            "INSERT INTO snapshots (id, sandbox_id, type, state, timestamp, org_id)
+             VALUES ($1, $2, 'full', 'creating', NOW() - INTERVAL '30 minutes',
+                 '00000000-0000-0000-0000-000000000001')"
+        ))
+        .bind(SnapshotId::new())
+        .bind(uploading.sandbox_id)
+        .execute(&db.pool)
+        .await?;
+        let marked = seed_stranded_restore(&db.pool, "skylake-a", "cascade-lake-a", None).await?;
+        sqlx::query(sql!(
+            "UPDATE sandboxes
+                SET current_local_artifact_id = $2,
+                    current_local_artifact_kind = 'full',
+                    current_local_artifact_origin = 'suspend'
+              WHERE id = $1"
+        ))
+        .bind(marked.sandbox_id)
+        .bind(Uuid::now_v7())
+        .execute(&db.pool)
+        .await?;
+        for (case, sandbox_id, pointer) in [
+            (
+                "the pointer node has the capture CPU",
+                same_cpu.sandbox_id,
+                "skylake-a",
+            ),
+            (
+                "the pointer node's CPU is unknown",
+                unlabeled_pointer.sandbox_id,
+                "unlabeled-a",
+            ),
+            (
+                "the capture CPU is unknown",
+                unknown_capture.sandbox_id,
+                "skylake-a",
+            ),
+            (
+                "no host has the capture CPU",
+                no_compatible_host.sandbox_id,
+                "skylake-a",
+            ),
+            (
+                "work happened after the snapshot",
+                activity_after_snapshot.sandbox_id,
+                "skylake-a",
+            ),
+            (
+                "a local artifact marker names newer bytes",
+                marked.sandbox_id,
+                "skylake-a",
+            ),
+            (
+                "a newer full snapshot is still uploading",
+                uploading.sandbox_id,
+                "skylake-a",
+            ),
+        ] {
+            assert_eq!(
+                plan_for(sandbox_id).await?,
+                (Some(pointer.to_string()), None),
+                "{case}"
+            );
+        }
+
+        // A pod that could be hosting a live VM keeps the local-only plan; a
+        // `Pending` one, like a stranded pod no active execution owns any
+        // more, doesn't. The `Pending` case is the positive control on the
+        // same fixture, so a keep-local result can't come from the fixture
+        // alone.
+        for (phase, redirects) in [
+            (Some("Running"), false),
+            (Some("Unknown"), false),
+            (None, false),
+            (Some("Pending"), true),
+        ] {
+            let stranded =
+                seed_stranded_restore(&db.pool, "skylake-a", "cascade-lake-a", None).await?;
+            let pod = Pod {
+                metadata: k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta {
+                    name: Some(format!("space-sbx-{}-g1", stranded.sandbox_id)),
+                    namespace: Some("space".to_string()),
+                    annotations: Some(BTreeMap::from([(
+                        pplx_space_common_core::kubernetes::SANDBOX_ID_ANNOTATION.to_string(),
+                        stranded.sandbox_id.to_string(),
+                    )])),
+                    ..Default::default()
+                },
+                status: phase.map(|phase| PodStatus {
+                    phase: Some(phase.to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let mut with_pod = substrate_with_inventory_caches_and_pool(
+                vec![pod],
+                fleet.iter().map(|node| (**node).clone()).collect(),
+                db.pool.clone(),
+            );
+            with_pod.k8s.sandbox_pod_config = config.clone();
+            let sandbox = fetch_sandbox(&db.pool, stranded.sandbox_id)
+                .await?
+                .expect("seeded sandbox exists");
+            let plan = with_pod.suspend_restore_plan(&sandbox, false).await?;
+            let expected = if redirects {
+                (None, Some(stranded.uri.to_string()))
+            } else {
+                (Some("skylake-a".to_string()), None)
+            };
+            assert_eq!(
+                (plan.source_node_name, plan.storage_uri),
+                expected,
+                "{phase:?}"
+            );
+        }
+        Ok(())
     }
 
     fn node_with_group_and_services(
@@ -9227,7 +10514,8 @@ mod kubernetes_tests {
         ];
         let substrate = substrate_with_node_cache_and_config(&nodes, true, config);
 
-        let shortlist = substrate.restore_node_shortlist(SandboxId::new(), "source-node", None);
+        let shortlist =
+            substrate.restore_node_shortlist(SandboxId::new(), "source-node", None, &[]);
 
         assert_eq!(
             shortlist.len(),

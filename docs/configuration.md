@@ -81,6 +81,8 @@ because disabling it by mistake would leave every create queued forever.
 | `SPACE_ALLOW_SANDBOX_PLACEMENT` | off | |
 | `SPACE_SANDBOX_NODE_GROUP_PLACEMENT` | off | |
 | `SPACE_SANDBOX_RESTORE_SOURCE_NODE_HARD_PIN` | off | Pin a restore to the snapshot's source node with a required node-affinity term. |
+| `SPACE_SANDBOX_RESTORE_HOST_CPU_PLACEMENT_ENABLED` | off | Restore full snapshots only onto hosts whose `space.pplx.net/host-cpu` can load the capture CPU. Once some reachable node publishes such a CPU, a restore stays off nodes labeled with a CPU that can't (unlabeled nodes stay eligible), and a local-only restore stranded on such a node restores from the snapshot's storage copy instead. Off places restores without regard to CPU. |
+| `SPACE_SANDBOX_RESTORE_HOST_CPU_COMPATIBILITY` | empty | Comma-separated `capture=>loader` pairs of `space.pplx.net/host-cpu` identities, used while `SPACE_SANDBOX_RESTORE_HOST_CPU_PLACEMENT_ENABLED` is on; a listed pair lets snapshots captured on the first CPU also restore on the second. |
 | `SPACE_SANDBOX_NODE_SERVICES_READY_AFFINITY` | off | Prefer nodes whose node-local services are ready; useful only where `SPACE_NODE_SERVICE_READINESS_ENABLED` is on. |
 | `SPACE_SANDBOX_NODE_SELECTOR_KEY`, `SPACE_SANDBOX_NODE_SELECTOR_VALUE` | `node.kubernetes.io/space-enabled`, `true` | Base node selector for sandbox pods and for the node-sync, node-group mirror and warm-pool loops; set both together. |
 | `SPACE_SANDBOX_NODE_SELECTOR_LABELS` | empty | |
