@@ -39,6 +39,43 @@ subjects:
     name: {{ $name }}
     namespace: {{ .Release.Namespace }}
 ---
+# Every request must also come from the token's pod as it is now: the pod,
+# looked up in the authority's own namespace, must still have the token's UID,
+# be Running and list the connection's source address among its pod IPs. The
+# authority reads callers from a pod reflector over that namespace, which
+# lists and watches, and refuses every caller as unavailable until it has
+# synced (CredmgrTokenReviewer::new and resolve_token_identity,
+# crates/libs/credential/mgr/server/src/k8s_identity.rs).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $name }}-caller-pods
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: {{ $name }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $name }}-caller-pods
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: {{ $name }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ $name }}-caller-pods
+subjects:
+  - kind: ServiceAccount
+    name: {{ $name }}
+    namespace: {{ .Release.Namespace }}
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -147,8 +184,14 @@ spec:
             # Callers present projected tokens with the authority's default
             # audience (space-credential-manager) and are mapped to their
             # client service by ServiceAccount; the reviewed token must name
-            # its pod and node (k8s_identity.rs). With TokenReview on, the
-            # listener never accepts SPACE_INTERNAL_TOKEN (run.rs).
+            # its pod and node (k8s_identity.rs). The pod must be current (the
+            # Role above), and the node must be registered under that name
+            # and UID in node_k8s, read through the DATABASE_URL pool above
+            # (registered_node,
+            # crates/libs/common/svc/src/sql/node_registration.rs); without
+            # DATABASE_URL the listener refuses to start (run.rs). With
+            # TokenReview on, the listener never accepts SPACE_INTERNAL_TOKEN
+            # (run.rs).
             - name: SPACE_CREDMGR_K8S_AUTH_ENABLED
               value: "true"
             - name: SPACE_CREDMGR_K8S_AUTH_NAMESPACE

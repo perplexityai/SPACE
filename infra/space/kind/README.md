@@ -917,9 +917,13 @@ the control-plane database, the platform KEK and the optional `space-aws-creds`
 for its AWS integrations. It authenticates callers by TokenReview of their
 projected ServiceAccount tokens (audience `space-credential-manager`), maps each
 ServiceAccount to its client service, and never accepts the static internal
-token. Each node's credential-manager runs `--role=agent`: it holds the node's
-credential sockets under its service mutex and forwards every call upstream as
-the node credential agent, with no database, KEK or AWS credential. node-manager
+token. On every request it also requires the token's pod to be current and
+Running in its namespace, with the connection's source address among that
+pod's IPs, and the token's node to be registered under that name and UID; its
+Role lists and watches the namespace's pods for this. Each node's
+credential-manager runs `--role=agent`: it holds the node's credential sockets
+under its service mutex and forwards every call upstream as the node credential
+agent, with no database, KEK or AWS credential. node-manager
 calls the authority directly for sandbox volume DEKs, which the authority grants
 only to node-manager. The platform KEK takes the production provider path, the
 intermediate-key broker: the authority mints each org's intermediate key there
