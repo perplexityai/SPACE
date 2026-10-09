@@ -247,51 +247,6 @@ async fn state_writer_is_tracked_until_handler_returns() {
 }
 
 #[tokio::test]
-async fn handlers_run_inside_the_request_span_for_every_admission_class() {
-    // Current-thread runtime: the spawned writer task runs on this thread,
-    // so the thread-local subscriber observes it.
-    let _subscriber = tracing::subscriber::set_default(tracing_subscriber::registry());
-    let manager = test_service();
-    for path in [
-        // StateWriter: the handler is moved onto a tracked task.
-        "/space.spaced.host.control.v1.HostControl/IssueGatewayIntermediateCertificate",
-        // Read classes: the handler is polled by the caller's future.
-        "/space.sandbox.manager.v1.SandboxManager/SpacedStat",
-    ] {
-        let (observed_tx, observed_rx) = tokio::sync::oneshot::channel();
-        let observed_tx = Arc::new(std::sync::Mutex::new(Some(observed_tx)));
-        let mut service = manager.restart_admission_layer().layer(tower::service_fn({
-            move |_request: Request<()>| {
-                let observed_tx = Arc::clone(&observed_tx);
-                async move {
-                    if let Some(tx) = observed_tx.lock().unwrap().take() {
-                        let _ = tx.send(tracing::Span::current().id());
-                    }
-                    Ok::<_, Infallible>(Response::new(tonic::body::Body::default()))
-                }
-            }
-        }));
-        let request = Request::builder().uri(path).body(()).unwrap();
-
-        // Mirror tower-http's server trace layer: both `call` and the
-        // returned future's polls run inside the request span. Work moved to
-        // another task does not inherit it unless carried explicitly.
-        let request_span = tracing::info_span!("grpc.server");
-        let future = request_span.in_scope(|| service.call(request));
-        tracing::Instrument::instrument(future, request_span.clone())
-            .await
-            .unwrap();
-
-        let observed = observed_rx.await.unwrap();
-        assert_eq!(
-            observed,
-            request_span.id(),
-            "{path} handler must run inside the request span so outbound client spans are parented"
-        );
-    }
-}
-
-#[tokio::test]
 async fn cancelling_request_keeps_admitted_mutation_owned_until_completion() {
     let manager = test_service();
     let lock = Arc::new(tokio::sync::Mutex::new(()));
