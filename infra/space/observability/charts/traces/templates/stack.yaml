@@ -58,6 +58,7 @@ spec:
       containers:
         - name: {{ $name }}
           image: {{ include "traces.image" (dict "root" $ "name" $name) | quote }}
+          imagePullPolicy: IfNotPresent
           securityContext:
 {{ include "common.containerSecurityContext" . | indent 12 }}
           {{- if eq $name "collector" }}

@@ -62,6 +62,7 @@ spec:
       containers:
         - name: grafana
           image: {{ .Values.image | quote }}
+          imagePullPolicy: IfNotPresent
           securityContext:
 {{ include "common.containerSecurityContext" . | indent 12 }}
           env:

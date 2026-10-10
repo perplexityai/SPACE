@@ -32,6 +32,7 @@ spec:
       containers:
         - name: alloy
           image: {{ .Values.images.alloy | quote }}
+          imagePullPolicy: IfNotPresent
           args: [run, /etc/space/config.alloy, --storage.path=/var/lib/alloy, --server.http.listen-addr=0.0.0.0:12345, --disable-reporting]
           env:
             - {name: NODE_NAME, valueFrom: {fieldRef: {fieldPath: spec.nodeName}}}

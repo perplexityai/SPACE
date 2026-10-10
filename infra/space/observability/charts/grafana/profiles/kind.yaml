@@ -5,6 +5,11 @@ networkPolicy:
   enabled: false
 persistence:
   enabled: false
+# By tag, not by the digest values.yaml pins: install-observability.sh loads
+# that digest onto every Kind node under this tag, and a loaded image answers
+# to its tag only, so a digest reference would send the kubelet to the
+# registry anyway. Bump the tag with the pin in values.yaml.
+image: grafana/grafana:13.2.2
 datasources:
   prometheus:
     url: http://prometheus.space-metrics.svc.cluster.local:9090

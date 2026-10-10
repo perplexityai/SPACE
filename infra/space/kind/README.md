@@ -259,6 +259,12 @@ can be removed and reinstalled under a running stack. No manual Collector
 installation is needed on these default paths. Each helper is
 idempotent, so re-running bootstrap does not churn them.
 
+Before installing, `install-observability.sh` loads each backend image onto
+every node at the linux/amd64 digest `ci/mirrored-images.txt` lists for the
+charts' pin, under the tag the Kind profiles name, so the pods start without a
+registry pull. GitHub CI takes these images from the GHCR mirror; elsewhere
+they come from Docker Hub. A load that fails leaves the pull to the kubelet.
+
 The `off` and `datadog` modes install no local backends:
 
 ```bash
@@ -272,8 +278,8 @@ SPACE_KIND_TELEMETRY_MODE=datadog SPACE_KIND_DATADOG_MODE=fakeintake \
 
 `off` sets `SPACE_METRICS_SINK=off` and `SPACE_TRACE_EXPORTER=off` for every
 Rust service and the shim, with no OTLP endpoint or identity overrides. CI pins
-it for the Kind smoke shards: they test sandbox lifecycle, and the backends'
-images are not in `ci/mirrored-images.txt`.
+it for the Kind smoke shards, which test sandbox lifecycle rather than
+telemetry.
 
 To export to a receiver you run yourself, stay in `otel` mode, set
 `SPACE_KIND_SHIM_OTLP_ENDPOINT` for the shim and override the workload

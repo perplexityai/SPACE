@@ -59,3 +59,14 @@ redis:7-alpine           sha256:ca0acbb137c1dc3339c8b147a58fd6f42775d4599327b50e
 # Bump versitygw to the first release that contains versity/versitygw#2415
 # (see the space-object-store chart's values); Content-MD5 stays.
 ghcr.io/versity/versitygw:v1.8.0 sha256:97e7d5a35ab758eb1761a9e717644fafc614c5f6026c05482bd1fb77205193a1 ghcr.io/perplexityai/space-ci-mirror:versitygw-v1.8.0
+
+# Images the local observability backends run, pinned by their multi-platform
+# index in infra/space/observability/charts/*/values.yaml. The Kind profiles
+# name them by tag, and infra/space/kind/scripts/install-observability.sh loads
+# this digest into the cluster under that tag.
+otel/opentelemetry-collector-contrib:0.161.0@sha256:fd328de2552466ad78385e1b1289c3f2402b1c45f265b252aab1955b42845ac1 sha256:b5cf983651c32c3ca13f936deb51742015a54d121f388cac248923ddeb8cc9fc ghcr.io/perplexityai/space-ci-mirror:opentelemetry-collector-contrib-0.161.0
+prom/prometheus:v3.14.0@sha256:5ce7540c3c00ef4ab0c9d2c995c6a5b9c421f44b4a115d97a2c7af3b1c21cbb0 sha256:e906cef998316bbe319f98711e1b4d8613ad37e14b08ff831d7036e77b7464f9 ghcr.io/perplexityai/space-ci-mirror:prometheus-v3.14.0
+grafana/tempo:3.0.3@sha256:0296560ac66f8a3600d7fb3014a52c189d4d9c3549ad6ff441bf2409855d68d5 sha256:05321ebf1f191fde34282b3dc86e68f511d489133df7963cd1670a2e1e11b33c ghcr.io/perplexityai/space-ci-mirror:tempo-3.0.3
+grafana/loki:3.7.8@sha256:1107dd5274e0ada47e42472b7a7e71f3b2a2fe878878108f3e2f9e51528f0193 sha256:81a6802ec4bd1b88c564494f06376889ed022998a188826190d26d2754ac2aae ghcr.io/perplexityai/space-ci-mirror:loki-3.7.8
+grafana/alloy:v1.19.2@sha256:b8ec653c44235fbe910879145dac3597d66b0aaecf60bcbbe82580767771a839 sha256:1eeba15ef3193438c72f66efd3d76f769c523a4c661db0fae6eddde906004bc8 ghcr.io/perplexityai/space-ci-mirror:alloy-v1.19.2
+grafana/grafana:13.2.2@sha256:ac461fb352abc50da10a51c7d02462e9c05488f11f53f14b3ad79a8145f638a0 sha256:9924c7fe0effe4a5fea08b3451905de54f09fde9d1589463a5f2d02d9ec158bc ghcr.io/perplexityai/space-ci-mirror:grafana-13.2.2

@@ -14,7 +14,8 @@ installing them in a job.
 
 Every third-party image GitHub CI pulls or builds from is listed in
 `ci/mirrored-images.txt`, pinned by digest: the test containers, the M1 SDK
-check's generator, the Dockerfile bases, and the Kind charts' images. Main
+check's generator, the Dockerfile bases, the Kind charts' images, and the
+observability backends' images. Main
 pushes copy any new digest
 to `ghcr.io/perplexityai/space-ci-mirror`. Jobs take it from there through
 `ci/scripts/mirror-images.sh`: `pull` for images a tool runs, and

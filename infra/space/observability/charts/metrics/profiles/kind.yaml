@@ -3,6 +3,13 @@ storage:
   retain: false
 networkPolicy:
   enabled: false
+# By tag, not by the digest values.yaml pins: install-observability.sh loads
+# that digest onto every Kind node under this tag, and a loaded image answers
+# to its tag only, so a digest reference would send the kubelet to the
+# registry anyway. Bump the tag with the pin in values.yaml.
+images:
+  collector: otel/opentelemetry-collector-contrib:0.161.0
+  prometheus: prom/prometheus:v3.14.0
 collector:
   debug: true
   # The Kind node's shim has no cluster DNS, so it addresses this Collector

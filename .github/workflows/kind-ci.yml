@@ -117,10 +117,8 @@ jobs:
       SPACE_CI_IMAGE_MIRROR: ghcr
       SPACE_KIND_RUST_ARTIFACTS: prebuilt
       # These shards test sandbox lifecycle, not telemetry. `off` installs none
-      # of the local observability backends, whose twelve pods and six images
-      # ci/mirrored-images.txt does not carry, on runners whose shared egress is
-      # already rate limited, where a pull failure would surface as a
-      # Firecracker smoke failure. It also leaves nothing exporting to a
+      # of the local observability backends, whose twelve pods would compete
+      # with the scenarios for the runner, and leaves nothing exporting to a
       # receiver that is not there. Pinned rather than inherited so a default
       # change cannot add them silently.
       SPACE_KIND_TELEMETRY_MODE: "off"
