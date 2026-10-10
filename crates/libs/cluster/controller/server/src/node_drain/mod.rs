@@ -3237,7 +3237,7 @@ impl<S: NodeDrainSink, T: InstanceTerminator> Reconciler<S, T> {
                 // Same-name kube Node replacement detected. The
                 // inventory reflector will reset `drain_phase` on its
                 // next tick (see `upsert_k8s_node_role` in
-                // `crates/libs/api/src/controllers/substrate/kubernetes/store.rs`).
+                // `crates/libs/api/src/controllers/substrate/kubernetes/store/node_inventory.rs`).
                 // Skip this tick silently — no `drain_last_error`
                 // write, because the row is about to lose its drain
                 // state anyway and a stale error would survive past

@@ -136,7 +136,8 @@ spec:
     # (`network_slot_capacity_apply` emits `"capacity"` only), so freezing it
     # refuses nothing legitimate; the kubelet mirrors capacity into it under an
     # identity this policy does not match. And it is the field that matters:
-    # `node_network_slot_capacity` in `substrate/kubernetes/adapter.rs` gates on
+    # `node_network_slot_capacity` in
+    # `substrate/kubernetes/adapter/node_eligibility.rs` gates on
     # `capacity[network-slots] > 0` and then *returns*
     # `allocatable[network-slots]`, and kube-scheduler filters on `allocatable`
     # alone. Allowing the key in both maps would have left the direct write to

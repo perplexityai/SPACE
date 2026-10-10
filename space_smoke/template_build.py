@@ -13,13 +13,14 @@ The scenario verifies three cross-service contracts:
    accepted the job — `find_builder_node(job_id)` then
    `builder_client_for_node`, which resolves the accepting builder's own
    node-api directly (`controllers/template.rs`,
-   `substrate/kubernetes/adapter.rs`). The scenario submits with the Service
-   pinned to one builder, then, once a builder has accepted the alias and
-   committed the prepared rootfs, moves the Service to the *other* builder for
-   the rest of the build. A build that still completes shows the polls did not
-   depend on where the Service pointed, which is the owner-pinned routing
-   working; `service_routed_to` records where the Service pointed, not who
-   answered the polls (that is not observable from outside the API).
+   `substrate/kubernetes/adapter/substrate_adapter.rs`). The scenario submits
+   with the Service pinned to one builder, then, once a builder has accepted
+   the alias and committed the prepared rootfs, moves the Service to the
+   *other* builder for the rest of the build. A build that still completes
+   shows the polls did not depend on where the Service pointed, which is the
+   owner-pinned routing working; `service_routed_to` records where the Service
+   pointed, not who answered the polls (that is not observable from outside
+   the API).
 2. **Published artefacts.** On the accepting builder, the published template's
    `metadata.json` names the `spaced` bundle version actually installed in the
    rootfs (`/etc/spaced/bundle-version`, read with `debugfs`) and the

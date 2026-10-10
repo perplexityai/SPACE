@@ -493,8 +493,9 @@ _TEMPLATE_GC_DEFAULT_BUDGET_BYTES = 100 * 1024 * 1024 * 1024
 _TEMPLATE_PREFETCH_DEFAULT_LATEST_N = 5
 
 # The API's suspend-restore selector for a user restore (see
-# `selected_suspend_restore_storage_uri` in crates/libs/api/.../store.rs and the
-# legacy suite's `wait_for_restore_affinity_portable`): a durable remote
+# `selected_suspend_restore_storage_uri` in
+# crates/libs/api/.../store/restore_source.rs and the legacy suite's
+# `wait_for_restore_affinity_portable`): a durable remote
 # snapshot is selectable only when a `ready` full snapshot with a storage
 # location is newer than the last placement change. Until then the planner
 # has only a source node and pre-binds the pod with `spec.nodeName`, which
