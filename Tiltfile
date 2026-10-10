@@ -86,6 +86,15 @@ if INSTALL_OBSERVABILITY and not MINIMAL:
         "install-observability-backends",
         cmd = "SPACE_KIND_CLUSTER={} bash infra/space/kind/scripts/install-observability.sh".format(KIND_CLUSTER),
         deps = ["infra/space/kind/scripts/install-observability.sh", "infra/space/observability/charts"],
+        # Each install runs `helm dependency build` on its chart
+        # (release_init, infra/space/kind/lib/release.sh), which rewrites the
+        # vendored charts/<chart>/charts/*.tgz and stages tmpcharts-* beside
+        # them. Watching that output reran this resource after every run, so
+        # Tilt never went idle and the smoke bring-up's wait for it never ended.
+        ignore = [
+            "infra/space/observability/charts/*/charts",
+            "infra/space/observability/charts/*/tmpcharts-*",
+        ],
         labels = ["bootstrap"],
     )
 
