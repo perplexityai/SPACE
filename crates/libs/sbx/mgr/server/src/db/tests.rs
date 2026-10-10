@@ -8073,6 +8073,7 @@ const DB_MODULE_SOURCE: &str = concat!(
     include_str!("../db.rs"),
     include_str!("auto_lifecycle.rs"),
     include_str!("eviction.rs"),
+    include_str!("network_policy.rs"),
     include_str!("pool.rs")
 );
 
