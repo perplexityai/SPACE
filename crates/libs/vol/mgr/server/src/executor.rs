@@ -280,7 +280,12 @@ fn effective_materialization_mode(
 ) -> MaterializationMode {
     if matches!(
         artifact,
-        Some(SnapshotArtifact::Memory | SnapshotArtifact::Rootfs)
+        Some(
+            SnapshotArtifact::Memory
+                | SnapshotArtifact::Rootfs
+                | SnapshotArtifact::EncryptedSnapshotVolume
+                | SnapshotArtifact::EncryptedRootfsCow
+        )
     ) {
         requested
     } else {
@@ -292,7 +297,17 @@ fn execution_materialization_mode(
     artifact: Option<SnapshotArtifact>,
     requested: MaterializationMode,
 ) -> MaterializationMode {
-    let requested = if artifact == Some(SnapshotArtifact::Memory) {
+    // LUKS backings contain literal zero regions outside their written encrypted
+    // sectors. Exact-zero materialization preserves the ciphertext and logical
+    // length, including when retrying jobs persisted before sparse support.
+    let requested = if matches!(
+        artifact,
+        Some(
+            SnapshotArtifact::Memory
+                | SnapshotArtifact::EncryptedSnapshotVolume
+                | SnapshotArtifact::EncryptedRootfsCow
+        )
+    ) {
         MaterializationMode::Enabled
     } else {
         requested
@@ -1437,9 +1452,9 @@ fn should_ignore_chmod_permission_denied(
 
 /// Buffered writer size between the (optional) zstd decoder and the
 /// destination file when decrypt + decompress run back-to-back on the
-/// pull side. Same sizing rationale as
-/// [`ENCRYPT_PUSH_READ_BUF_BYTES`].
-const DECRYPT_PULL_WRITE_BUF_BYTES: usize = 64 * 1024;
+/// pull side. Match the decoder output window to batch file writes and their
+/// accounting. Both buffers remain bounded per admitted decoder.
+const DECRYPT_PULL_WRITE_BUF_BYTES: usize = 1024 * 1024;
 
 // Submit decoded output to the process-wide writeback worker in the same
 // increments used by ranged downloads. Writers share one byte budget, so
@@ -1935,6 +1950,16 @@ impl StreamWritebackCoordinator {
                         Ok(StreamWritebackCommand::Range(range)) if writeback_enabled => {
                             let activation_timing = Arc::clone(&range.timing);
                             queue_stream_writeback_range(&mut pending, range);
+                            // Overlap complete dirty windows with decoding even
+                            // below the pressure watermark. Keep their debt
+                            // charged until the existing completion/drain path.
+                            start_pending_stream_writeback_ranges(
+                                &mut pending,
+                                &worker_budget,
+                                page_cache_operations.as_ref(),
+                                &mut writeback_enabled,
+                                writeback_window_bytes,
+                            );
                             if pending_stream_writeback_debt(&pending) >= low_watermark_bytes {
                                 let newly_activated = !pressure_active;
                                 if !pressure_active {
@@ -2691,7 +2716,11 @@ where
                     std::io::BufWriter::with_capacity(DECRYPT_PULL_WRITE_BUF_BYTES, sink);
                 let raw_decoder = zstd::stream::raw::Decoder::new()
                     .map_err(|e| std::io::Error::other(format!("zstd decoder init: {e}")))?;
-                let mut decoder = zstd::stream::zio::Writer::new(buf_writer, raw_decoder);
+                let mut decoder = zstd::stream::zio::Writer::new_with_capacity(
+                    buf_writer,
+                    raw_decoder,
+                    DECRYPT_PULL_WRITE_BUF_BYTES,
+                );
                 decoder.write_all(&prefix)?;
                 if !suffix.is_empty() {
                     decoder.write_all(suffix)?;
@@ -4980,6 +5009,17 @@ impl TransferExecutor {
             return Ok(None);
         };
 
+        // Sparse LUKS is a write optimization, not a new replica contract.
+        // Keep verified dense backings from older downloads: fetching them
+        // again only to punch holes would add disk and network work on retry.
+        let requested_materialization = if matches!(
+            p.effective_snapshot_artifact(),
+            Some(SnapshotArtifact::EncryptedSnapshotVolume | SnapshotArtifact::EncryptedRootfsCow)
+        ) {
+            MaterializationMode::Disabled
+        } else {
+            requested_materialization
+        };
         if provenance.replica == file_replica_provenance(p, &object_meta, local_size)
             && materialization_is_compatible(
                 requested_materialization,

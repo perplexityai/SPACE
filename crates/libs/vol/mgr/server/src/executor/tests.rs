@@ -335,25 +335,33 @@ async fn streamed_pull_decodes_inline_and_never_double_decodes() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn memory_role_uses_sparse_output_regardless_of_persisted_mode() {
+async fn memory_and_luks_roles_use_sparse_output_regardless_of_persisted_mode() {
     const MEMORY_BYTES: usize = 8 * 1024 * 1024;
     let dir = tempfile::tempdir().unwrap();
     let mut expected = vec![0; MEMORY_BYTES];
     expected[31..34].copy_from_slice(b"ram");
     expected[MEMORY_BYTES / 2..MEMORY_BYTES / 2 + 4].copy_from_slice(b"live");
     let body = zstd::stream::encode_all(&expected[..], ZSTD_LEVEL).unwrap();
-    for (stream_decode_pulls, persisted_mode) in [true, false].into_iter().flat_map(|stream| {
-        [
-            MaterializationMode::Disabled,
-            MaterializationMode::Shadow,
-            MaterializationMode::Enabled,
-        ]
-        .into_iter()
-        .map(move |mode| (stream, mode))
+    for (artifact, stream_decode_pulls, persisted_mode) in [
+        SnapshotArtifact::Memory,
+        SnapshotArtifact::EncryptedSnapshotVolume,
+        SnapshotArtifact::EncryptedRootfsCow,
+    ]
+    .into_iter()
+    .flat_map(|artifact| {
+        [true, false].into_iter().flat_map(move |stream| {
+            [
+                MaterializationMode::Disabled,
+                MaterializationMode::Shadow,
+                MaterializationMode::Enabled,
+            ]
+            .into_iter()
+            .map(move |mode| (artifact, stream, mode))
+        })
     }) {
-        let local_path = dir
-            .path()
-            .join(format!("opaque-{stream_decode_pulls}-{persisted_mode}"));
+        let local_path = dir.path().join(format!(
+            "opaque-{artifact:?}-{stream_decode_pulls}-{persisted_mode}"
+        ));
         let meta = ObjectMeta {
             size: body.len() as u64,
             etag: Some(format!("\"memory-{stream_decode_pulls}-{persisted_mode}\"")),
@@ -376,7 +384,7 @@ async fn memory_role_uses_sparse_output_regardless_of_persisted_mode() {
             local_path: local_path.to_string_lossy().into_owned(),
             s3_uri: "s3://bucket/snapshots/a/memfile?region=us-east-2".to_string(),
             transfer_scope_id: None,
-            snapshot_artifact: Some(SnapshotArtifact::Memory),
+            snapshot_artifact: Some(artifact),
             materialization_mode: persisted_mode,
             rootfs_materialization_mode: None,
             staged_path: None,
@@ -405,7 +413,7 @@ async fn memory_role_uses_sparse_output_regardless_of_persisted_mode() {
         let physical_bytes = allocated_bytes(&local_path);
         assert!(
             physical_bytes < logical_bytes / 4,
-            "memory must use sparse output regardless of persisted mode: stream_decode={stream_decode_pulls} mode={persisted_mode} logical={logical_bytes} physical={physical_bytes}"
+            "{artifact:?} must use sparse output regardless of persisted mode: stream_decode={stream_decode_pulls} mode={persisted_mode} logical={logical_bytes} physical={physical_bytes}"
         );
     }
 }
@@ -2531,6 +2539,37 @@ fn dirty_debt_below_low_watermark_does_not_start_writeback() {
     assert_eq!(
         stream_writeback_outstanding_bytes(&coordinator.budget),
         3 * MIB
+    );
+}
+
+#[test]
+fn complete_writeback_window_starts_before_budget_pressure() {
+    let operations = Arc::new(RecordingPageCacheOperations::default());
+    let coordinator = StreamWritebackCoordinator::new_with_page_cache_operations(
+        4 * STREAM_WRITEBACK_WINDOW_BYTES,
+        None,
+        operations.clone(),
+    );
+    coordinator
+        .reserve(STREAM_WRITEBACK_WINDOW_BYTES, JobPriority::default())
+        .unwrap();
+    coordinator.submit(
+        Arc::new(tempfile::tempfile().unwrap()),
+        0,
+        STREAM_WRITEBACK_WINDOW_BYTES,
+        STREAM_WRITEBACK_WINDOW_BYTES,
+        Arc::new(StreamPullTiming::default()),
+    );
+    wait_until(|| operations.start_count() == 1);
+    assert_eq!(
+        operations.wait_count(),
+        0,
+        "starting IO must not force a synchronous drain"
+    );
+    assert_eq!(
+        stream_writeback_outstanding_bytes(&coordinator.budget),
+        STREAM_WRITEBACK_WINDOW_BYTES,
+        "starting IO must not release the dirty-byte reservation before completion"
     );
 }
 
