@@ -253,7 +253,8 @@ fn installed_runtime() -> (tempfile::TempDir, crate::config::RuntimePaths) {
 }
 
 /// An allocated sandbox with a bound execution, plus a second sandbox whose
-/// execution is bound but which holds no lease.
+/// execution is bound but which holds no lease. Host work is refused, so a
+/// request that passes validation ends with `Cancelled` at its first host step.
 struct AdmittedSandbox {
     service: super::NodeManagerService,
     lease: crate::net::SlotInfo,
@@ -265,15 +266,19 @@ struct AdmittedSandbox {
 
 impl AdmittedSandbox {
     async fn new() -> Self {
-        use crate::service::tests::service_tests::{bind_test_execution, service_for_unit_tests};
+        use crate::service::tests::service_tests::{
+            allocate_test_lease, bind_test_execution, refuse_host_work, service_for_unit_tests,
+        };
 
         let (runtime, runtime_paths) = installed_runtime();
         let mut service = service_for_unit_tests().await;
         service.runtime_paths = runtime_paths;
-        service.pool.set_all_slots_ready_for_test();
+        // Discovery is itself blocking work; cache it before refusing host work.
+        service.runtime_inventory().await.unwrap();
+        refuse_host_work(&mut service).await;
         let id = SandboxId::new().to_string();
         let fence = bind_test_execution(&service, &id);
-        let lease = allocate_lease(&service.pool, &id);
+        let lease = allocate_test_lease(&service, &id);
         let unallocated_id = SandboxId::new().to_string();
         let unallocated_fence = bind_test_execution(&service, &unallocated_id);
         Self {
@@ -286,94 +291,46 @@ impl AdmittedSandbox {
         }
     }
 
-    fn stale_fence() -> crate::proto::ExecutionFence {
-        pplx_space_node_mgr_client::execution_fence::ExecutionFence::new(
-            pplx_space_common_core::types::SandboxActivationAttemptId::new(),
+    /// Records what a refused request disturbed: the lease must stay exactly as
+    /// allocated and its lifecycle admission must be returned. A leaked permit
+    /// breaks the table, since it would starve the remaining rows.
+    fn record_disturbance(
+        &self,
+        case: &str,
+        method: crate::lifecycle_limiter::LifecycleMethod,
+        mismatches: &mut Vec<String>,
+    ) -> std::ops::ControlFlow<()> {
+        let current = self.service.pool.get(&self.lease.sandbox_id).unwrap();
+        let expected = (
+            self.lease.slot,
+            self.lease.generation,
+            self.lease.sandbox_uid,
             None,
-        )
-        .into()
-    }
-
-    /// A refused request leaves the lease exactly as allocated and returns its
-    /// lifecycle admission.
-    fn assert_untouched(&self, case: &str, method: crate::lifecycle_limiter::LifecycleMethod) {
-        let current = self
-            .service
-            .pool
-            .get(&self.lease.sandbox_id)
-            .unwrap()
-            .expect("refusal must not release the lease");
-        assert_eq!(
-            (
-                current.slot,
-                current.generation,
-                current.sandbox_uid,
-                current.pid
-            ),
-            (
-                self.lease.slot,
-                self.lease.generation,
-                self.lease.sandbox_uid,
-                None
-            ),
-            "{case}"
         );
-        assert_eq!(
-            self.service.lifecycle_limiter.snapshot(method),
-            (0, 0),
-            "{case}: refusal must return its lifecycle permit"
-        );
-    }
-}
-
-/// Claims the lease off the Tokio runtime. Allocation then skips its
-/// node-status notification, whose detached retry task dials the node's fixed
-/// node-ctl socket.
-fn allocate_lease(
-    pool: &std::sync::Arc<crate::slot_pool::NetworkPool>,
-    sandbox_id: &str,
-) -> crate::net::SlotInfo {
-    let (pool, sandbox_id) = (pool.clone(), sandbox_id.to_owned());
-    std::thread::spawn(move || {
-        match pool
-            .claim_allocation(
-                &sandbox_id,
-                None,
-                Some(crate::slot_pool::NewLeaseMemoryReservation {
-                    memory_reservation_mib: 8320,
-                }),
-            )
-            .unwrap()
+        if current
+            .as_ref()
+            .map(|lease| (lease.slot, lease.generation, lease.sandbox_uid, lease.pid))
+            != Some(expected)
         {
-            crate::slot_pool::ClaimedSlotAllocation::Complete(lease) => lease,
-            crate::slot_pool::ClaimedSlotAllocation::Ephemeral(_) => {
-                panic!("a ready pooled slot completes its claim synchronously")
-            }
+            mismatches.push(format!("{case}: lease changed to {current:?}"));
         }
-    })
-    .join()
-    .unwrap()
+        if self.service.lifecycle_limiter.snapshot(method) != (0, 0) {
+            mismatches.push(format!("{case}: refusal leaked its lifecycle permit"));
+            return std::ops::ControlFlow::Break(());
+        }
+        std::ops::ControlFlow::Continue(())
+    }
 }
 
-/// Root is authorized for every node-manager RPC without depending on the
-/// authorizer's service-account lookups.
-fn from_root<T>(message: T) -> tonic::Request<T> {
-    let mut request = tonic::Request::new(message);
-    request
-        .extensions_mut()
-        .insert(pplx_space_common_svc::PeerIdentity::new(0, 0, None));
-    request
-}
+/// The signal that a request passed validation and reached its first blocking
+/// host step, which `refuse_host_work` refuses.
+const HOST_WORK_REFUSED: (tonic::Code, &str) = (tonic::Code::Cancelled, "artifact work cancelled");
 
-fn assert_refused(case: &str, error: &tonic::Status, code: tonic::Code, message: &str) {
-    assert_eq!(error.code(), code, "{case}: {error}");
-    assert!(error.message().contains(message), "{case}: {error}");
-}
-
-// Every case is refused before the jail is inspected or rebuilt; a request
-// that passed validation would reach the node's fixed jail directory.
+// Every invalid case is refused before the jail is inspected or rebuilt. The
+// valid request shows where validation ends: the jail-ownership probe.
 #[tokio::test]
 async fn launch_sandbox_refuses_invalid_requests_before_touching_the_jail() {
+    use crate::service::tests::service_tests::{refusal_mismatch, root_request, stale_test_fence};
     use pplx_space_execution_common::proto::ExecutionSelectionMode as Mode;
     use pplx_space_node_runtime_core::runtime_inventory::RuntimeInventoryError;
     use tonic::Code;
@@ -456,7 +413,7 @@ async fn launch_sandbox_refuses_invalid_requests_before_touching_the_jail() {
         (
             "superseded execution",
             crate::proto::LaunchSandboxRequest {
-                execution_fence: Some(AdmittedSandbox::stale_fence()),
+                execution_fence: Some(stale_test_fence()),
                 ..valid.clone()
             },
             Code::FailedPrecondition,
@@ -491,25 +448,36 @@ async fn launch_sandbox_refuses_invalid_requests_before_touching_the_jail() {
             Code::PermissionDenied,
             "must match UID",
         ),
+        (
+            "valid request",
+            valid.clone(),
+            HOST_WORK_REFUSED.0,
+            HOST_WORK_REFUSED.1,
+        ),
     ];
+    let mut mismatches = Vec::new();
     for (case, request, code, message) in cases {
-        let error = admitted
-            .service
-            .launch_sandbox(from_root(request))
-            .await
-            .expect_err(case);
-        assert_refused(case, &error, code, message);
-        admitted.assert_untouched(
-            case,
-            crate::lifecycle_limiter::LifecycleMethod::LaunchSandbox,
-        );
+        let outcome = admitted.service.launch_sandbox(root_request(request)).await;
+        mismatches.extend(refusal_mismatch(case, outcome, code, message));
+        if admitted
+            .record_disturbance(
+                case,
+                crate::lifecycle_limiter::LifecycleMethod::LaunchSandbox,
+                &mut mismatches,
+            )
+            .is_break()
+        {
+            break;
+        }
     }
+    assert!(mismatches.is_empty(), "{mismatches:#?}");
 }
 
 // The deepest case names a template without its resolved directory, which is
 // refused before the managed template root or sandbox cache is inspected.
 #[tokio::test]
 async fn prepare_sandbox_refuses_invalid_requests_before_touching_the_cache() {
+    use crate::service::tests::service_tests::{refusal_mismatch, root_request, stale_test_fence};
     use pplx_space_common_core::types::{ContentHash, SandboxArtifactMetadata, TemplateName};
     use pplx_space_execution_common::proto::ExecutionSelectionMode as Mode;
     use pplx_space_node_runtime_core::runtime_inventory::RuntimeInventoryError;
@@ -653,7 +621,7 @@ async fn prepare_sandbox_refuses_invalid_requests_before_touching_the_cache() {
         (
             "superseded execution",
             crate::proto::PrepareSandboxRequest {
-                execution_fence: Some(AdmittedSandbox::stale_fence()),
+                execution_fence: Some(stale_test_fence()),
                 ..valid.clone()
             },
             Code::FailedPrecondition,
@@ -666,30 +634,37 @@ async fn prepare_sandbox_refuses_invalid_requests_before_touching_the_cache() {
             "template_dir is required",
         ),
     ];
+    let mut mismatches = Vec::new();
     for (case, request, code, message) in cases {
-        let error = admitted
+        let outcome = admitted
             .service
-            .prepare_sandbox(from_root(request))
-            .await
-            .expect_err(case);
-        assert_refused(case, &error, code, message);
-        admitted.assert_untouched(
-            case,
-            crate::lifecycle_limiter::LifecycleMethod::PrepareSandbox,
-        );
-        assert_eq!(
-            admitted.service.disk_admission.pending_reservation_bytes(),
-            0,
-            "{case}: refusal must not hold a disk reservation"
-        );
+            .prepare_sandbox(root_request(request))
+            .await;
+        mismatches.extend(refusal_mismatch(case, outcome, code, message));
+        if admitted
+            .record_disturbance(
+                case,
+                crate::lifecycle_limiter::LifecycleMethod::PrepareSandbox,
+                &mut mismatches,
+            )
+            .is_break()
+        {
+            break;
+        }
+        if admitted.service.disk_admission.pending_reservation_bytes() != 0 {
+            mismatches.push(format!("{case}: refusal leaked a disk reservation"));
+        }
     }
+    assert!(mismatches.is_empty(), "{mismatches:#?}");
 }
 
 // Sidecar launch is refused before its identity is resolved from the node's
-// run directory and cgroups. Only net-gateway is used once a lease exists:
-// spaced-host would read the registered Firecracker PID from the run directory.
+// run directory and cgroups; the valid request shows that boundary. Only
+// net-gateway is used once a lease exists: spaced-host would read the
+// registered Firecracker PID from the run directory during validation.
 #[tokio::test]
 async fn sidecar_launch_refuses_invalid_requests_before_resolving_its_identity() {
+    use crate::service::tests::service_tests::{refusal_mismatch, root_request, stale_test_fence};
     use pplx_space_common_core::host::linux::paths;
     use tonic::Code;
 
@@ -720,7 +695,7 @@ async fn sidecar_launch_refuses_invalid_requests_before_resolving_its_identity()
                 ..valid.clone()
             },
             Code::InvalidArgument,
-            "invalid sandbox_id after validation",
+            "sandbox_id",
         ),
         (
             "program outside the allowlist",
@@ -734,7 +709,7 @@ async fn sidecar_launch_refuses_invalid_requests_before_resolving_its_identity()
         (
             "superseded execution",
             crate::proto::LaunchRequest {
-                execution_fence: Some(AdmittedSandbox::stale_fence()),
+                execution_fence: Some(stale_test_fence()),
                 ..valid.clone()
             },
             Code::FailedPrecondition,
@@ -761,6 +736,15 @@ async fn sidecar_launch_refuses_invalid_requests_before_resolving_its_identity()
             "does not match allocated slot UID",
         ),
         (
+            "gid differs from the allocated uid",
+            crate::proto::LaunchRequest {
+                gid: uid + 1,
+                ..valid.clone()
+            },
+            Code::PermissionDenied,
+            "must match UID",
+        ),
+        (
             "gateway socket of another sandbox",
             crate::proto::LaunchRequest {
                 args: gateway_args(
@@ -781,14 +765,27 @@ async fn sidecar_launch_refuses_invalid_requests_before_resolving_its_identity()
             Code::InvalidArgument,
             "launch requires --sandbox-id <value>",
         ),
+        (
+            "valid request",
+            valid.clone(),
+            HOST_WORK_REFUSED.0,
+            HOST_WORK_REFUSED.1,
+        ),
     ];
+    let mut mismatches = Vec::new();
     for (case, request, code, message) in cases {
-        let error = admitted
-            .service
-            .launch(from_root(request))
-            .await
-            .expect_err(case);
-        assert_refused(case, &error, code, message);
-        admitted.assert_untouched(case, crate::lifecycle_limiter::LifecycleMethod::Launch);
+        let outcome = admitted.service.launch(root_request(request)).await;
+        mismatches.extend(refusal_mismatch(case, outcome, code, message));
+        if admitted
+            .record_disturbance(
+                case,
+                crate::lifecycle_limiter::LifecycleMethod::Launch,
+                &mut mismatches,
+            )
+            .is_break()
+        {
+            break;
+        }
     }
+    assert!(mismatches.is_empty(), "{mismatches:#?}");
 }

@@ -464,6 +464,91 @@ pub(super) mod service_tests {
         fence.into()
     }
 
+    /// An execution fence no sandbox is bound to.
+    pub(in crate::service) fn stale_test_fence() -> crate::proto::ExecutionFence {
+        pplx_space_node_mgr_client::execution_fence::ExecutionFence::new(
+            pplx_space_common_core::types::SandboxActivationAttemptId::new(),
+            None,
+        )
+        .into()
+    }
+
+    /// Claims a pooled lease off the Tokio runtime. Allocation then skips its
+    /// node-status notification, whose detached retry task dials the node's
+    /// fixed node-ctl socket.
+    pub(in crate::service) fn allocate_test_lease(
+        service: &NodeManagerService,
+        sandbox_id: &str,
+    ) -> crate::net::SlotInfo {
+        service.pool.set_all_slots_ready_for_test();
+        let (pool, sandbox_id) = (service.pool.clone(), sandbox_id.to_owned());
+        std::thread::spawn(move || {
+            match pool
+                .claim_allocation(
+                    &sandbox_id,
+                    None,
+                    Some(crate::slot_pool::NewLeaseMemoryReservation {
+                        memory_reservation_mib: 8320,
+                    }),
+                )
+                .unwrap()
+            {
+                crate::slot_pool::ClaimedSlotAllocation::Complete(lease) => lease,
+                crate::slot_pool::ClaimedSlotAllocation::Ephemeral(_) => {
+                    panic!("a ready pooled slot completes its claim synchronously")
+                }
+            }
+        })
+        .join()
+        .unwrap()
+    }
+
+    /// Root is authorized for every node-manager RPC without depending on the
+    /// authorizer's service-account lookups.
+    pub(in crate::service) fn root_request<T>(message: T) -> Request<T> {
+        let mut request = Request::new(message);
+        request
+            .extensions_mut()
+            .insert(PeerIdentity::new(0, 0, None));
+        request
+    }
+
+    /// How a table row's outcome differs from the expected refusal. Tables
+    /// collect every row's mismatch, so one regression reports each row it
+    /// opens rather than stopping at the first.
+    pub(in crate::service) fn refusal_mismatch<T>(
+        case: &str,
+        outcome: Result<T, Status>,
+        code: tonic::Code,
+        message: &str,
+    ) -> Option<String> {
+        match outcome {
+            Ok(_) => Some(format!("{case}: accepted")),
+            Err(error) if error.code() == code && error.message().contains(message) => None,
+            Err(error) => Some(format!("{case}: {error}")),
+        }
+    }
+
+    /// Makes every blocking host section of `service` refuse before it runs.
+    /// `off_runtime` checks the artifact-work owner first, and this owner's
+    /// cancellation fires when `run_artifact_mutation` returns. A request that
+    /// passes validation therefore stops with `Cancelled` at its first jail,
+    /// cache or run-directory step, whatever the test's privileges.
+    pub(in crate::service) async fn refuse_host_work(service: &mut NodeManagerService) {
+        let owner = service
+            .run_artifact_mutation(&SandboxId::new().to_string(), |service| async move {
+                Ok(service.artifact_work.clone().expect("artifact work owner"))
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            owner.check().unwrap_err().code(),
+            tonic::Code::Cancelled,
+            "the owner must already refuse"
+        );
+        service.artifact_work = Some(owner);
+    }
+
     pub(in crate::service) async fn service_for_unit_tests() -> NodeManagerService {
         NodeManagerService {
             pool: NetworkPool::open_in_memory_for_test(NetworkPoolConfig::new(1)),

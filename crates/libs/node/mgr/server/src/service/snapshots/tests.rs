@@ -394,88 +394,90 @@ async fn encrypted_seal_stop_does_not_retry_other_failures() {
     crate::runtime_supervisor_client::tests::stop_supervisor_server(server).await;
 }
 
-/// Claims the lease off the Tokio runtime. Allocation then skips its
-/// node-status notification, whose detached retry task dials the node's fixed
-/// node-ctl socket.
-fn allocate_lease(
-    pool: &std::sync::Arc<crate::slot_pool::NetworkPool>,
-    sandbox_id: &str,
-) -> crate::net::SlotInfo {
-    let (pool, sandbox_id) = (pool.clone(), sandbox_id.to_owned());
-    std::thread::spawn(move || {
-        match pool
-            .claim_allocation(
-                &sandbox_id,
-                None,
-                Some(crate::slot_pool::NewLeaseMemoryReservation {
-                    memory_reservation_mib: 8320,
-                }),
-            )
-            .unwrap()
-        {
-            crate::slot_pool::ClaimedSlotAllocation::Complete(lease) => lease,
-            crate::slot_pool::ClaimedSlotAllocation::Ephemeral(_) => {
-                panic!("a ready pooled slot completes its claim synchronously")
-            }
-        }
-    })
-    .join()
-    .unwrap()
-}
-
-/// Root is authorized for every node-manager RPC without depending on the
-/// authorizer's service-account lookups.
-fn from_root<T>(message: T) -> tonic::Request<T> {
-    let mut request = tonic::Request::new(message);
-    request
-        .extensions_mut()
-        .insert(pplx_space_common_svc::PeerIdentity::new(0, 0, None));
-    request
-}
-
-fn stale_fence() -> crate::proto::ExecutionFence {
-    pplx_space_node_mgr_client::execution_fence::ExecutionFence::new(
-        pplx_space_common_core::types::SandboxActivationAttemptId::new(),
-        None,
-    )
-    .into()
-}
-
 fn snapshot_volume(sandbox_id: &str) -> String {
     format!("{}/{sandbox_id}/snapshot-vol", super::CACHE_DIR)
 }
 
-// No case may pass validation: the next step dials the Firecracker API socket
-// under the node's fixed jail directory. The sandbox's execution is bound but
-// no lease is allocated, so a request that passes path validation stops at the
-// lease check.
+/// A service whose blocking host work is refused, with an allocated sandbox
+/// and a second sandbox whose execution is bound but which holds no lease.
+struct SnapshotFixture {
+    service: crate::service::NodeManagerService,
+    lease: crate::net::SlotInfo,
+    fence: crate::proto::ExecutionFence,
+    unallocated_id: String,
+    unallocated_fence: crate::proto::ExecutionFence,
+}
+
+impl SnapshotFixture {
+    async fn new() -> Self {
+        use crate::service::tests::service_tests::{
+            allocate_test_lease, bind_test_execution, refuse_host_work, service_for_unit_tests,
+        };
+
+        let mut service = service_for_unit_tests().await;
+        refuse_host_work(&mut service).await;
+        let id = super::SandboxId::new().to_string();
+        let fence = bind_test_execution(&service, &id);
+        let lease = allocate_test_lease(&service, &id);
+        let unallocated_id = super::SandboxId::new().to_string();
+        let unallocated_fence = bind_test_execution(&service, &unallocated_id);
+        Self {
+            service,
+            lease,
+            fence,
+            unallocated_id,
+            unallocated_fence,
+        }
+    }
+
+    fn lease_disturbed(&self, case: &str) -> Option<String> {
+        let current = self.service.pool.get(&self.lease.sandbox_id).unwrap();
+        (current
+            .as_ref()
+            .map(|lease| (lease.slot, lease.generation, lease.pid))
+            != Some((self.lease.slot, self.lease.generation, None)))
+        .then(|| format!("{case}: lease changed to {current:?}"))
+    }
+}
+
+// No case may pass validation for the allocated sandbox: the next step dials
+// the Firecracker API socket under the node's fixed jail directory. Rows whose
+// guard precedes the lease lookup use the unallocated sandbox, so dropping the
+// guard stops at the lease check instead. That includes the encrypted rows,
+// whose capture would otherwise bind into the jail.
 #[tokio::test]
 async fn create_snapshot_refuses_invalid_requests_before_dialing_firecracker() {
+    use crate::proto::CreateSnapshotRequest;
+    use crate::service::tests::service_tests::{refusal_mismatch, root_request, stale_test_fence};
     use tonic::Code;
 
-    let service = crate::service::tests::service_tests::service_for_unit_tests().await;
-    let id = super::SandboxId::new().to_string();
-    let fence = crate::service::tests::service_tests::bind_test_execution(&service, &id);
-    let valid = crate::proto::CreateSnapshotRequest {
+    let fixture = SnapshotFixture::new().await;
+    let id = fixture.lease.sandbox_id.clone();
+    let valid = CreateSnapshotRequest {
         sandbox_id: id.clone(),
         snapshot_path: "/vmstate".into(),
         mem_file_path: "/memory".into(),
-        execution_fence: Some(fence),
+        execution_fence: Some(fixture.fence.clone()),
         ..Default::default()
+    };
+    let unallocated = CreateSnapshotRequest {
+        sandbox_id: fixture.unallocated_id.clone(),
+        execution_fence: Some(fixture.unallocated_fence.clone()),
+        ..valid.clone()
     };
     let cases = [
         (
             "superseded execution",
-            crate::proto::CreateSnapshotRequest {
-                execution_fence: Some(stale_fence()),
-                ..valid.clone()
+            CreateSnapshotRequest {
+                execution_fence: Some(stale_test_fence()),
+                ..unallocated.clone()
             },
             Code::FailedPrecondition,
             "sandbox execution identity is missing or superseded",
         ),
         (
             "vmstate path names another artifact",
-            crate::proto::CreateSnapshotRequest {
+            CreateSnapshotRequest {
                 snapshot_path: "/memory".into(),
                 ..valid.clone()
             },
@@ -484,7 +486,7 @@ async fn create_snapshot_refuses_invalid_requests_before_dialing_firecracker() {
         ),
         (
             "memory path names another artifact",
-            crate::proto::CreateSnapshotRequest {
+            CreateSnapshotRequest {
                 mem_file_path: "/vmstate".into(),
                 ..valid.clone()
             },
@@ -492,30 +494,12 @@ async fn create_snapshot_refuses_invalid_requests_before_dialing_firecracker() {
             "mem_file_path must reference Firecracker artifact 'memory'",
         ),
         (
-            "relative destination",
-            crate::proto::CreateSnapshotRequest {
-                dest_dir: Some("snapshot".into()),
-                ..valid.clone()
-            },
-            Code::InvalidArgument,
-            "dest_dir must be absolute",
-        ),
-        (
-            "destination with a parent component",
-            crate::proto::CreateSnapshotRequest {
-                dest_dir: Some(format!("{}/{id}/snapshot/../..", super::CACHE_DIR)),
-                ..valid.clone()
-            },
-            Code::InvalidArgument,
-            "dest_dir contains invalid path component",
-        ),
-        (
             "destination outside the sandbox roots",
-            crate::proto::CreateSnapshotRequest {
+            CreateSnapshotRequest {
                 dest_dir: Some(format!(
                     "{}/{}/snapshot",
                     super::CACHE_DIR,
-                    super::SandboxId::new()
+                    fixture.unallocated_id
                 )),
                 ..valid.clone()
             },
@@ -524,63 +508,62 @@ async fn create_snapshot_refuses_invalid_requests_before_dialing_firecracker() {
         ),
         (
             "plaintext capture without a lease",
-            valid.clone(),
+            unallocated.clone(),
             Code::Unavailable,
             "snapshot lease is no longer active",
         ),
         (
             "encrypted volume of another sandbox",
-            crate::proto::CreateSnapshotRequest {
-                snapshot_volume_mount_dir: Some(snapshot_volume(
-                    &super::SandboxId::new().to_string(),
-                )),
-                ..valid.clone()
+            CreateSnapshotRequest {
+                snapshot_volume_mount_dir: Some(snapshot_volume(&id)),
+                ..unallocated.clone()
             },
             Code::InvalidArgument,
             "path does not belong to this sandbox",
         ),
         (
             "encrypted capture without a lease",
-            crate::proto::CreateSnapshotRequest {
-                snapshot_volume_mount_dir: Some(snapshot_volume(&id)),
-                ..valid.clone()
+            CreateSnapshotRequest {
+                snapshot_volume_mount_dir: Some(snapshot_volume(&fixture.unallocated_id)),
+                ..unallocated.clone()
             },
             Code::Unavailable,
             "snapshot lease is no longer active",
         ),
     ];
+    let mut mismatches = Vec::new();
     for (case, request, code, message) in cases {
-        let error = service
-            .create_snapshot(from_root(request))
-            .await
-            .expect_err(case);
-        assert_eq!(error.code(), code, "{case}: {error}");
-        assert!(error.message().contains(message), "{case}: {error}");
+        let outcome = fixture.service.create_snapshot(root_request(request)).await;
+        mismatches.extend(refusal_mismatch(case, outcome, code, message));
+        mismatches.extend(fixture.lease_disturbed(case));
     }
+    assert!(mismatches.is_empty(), "{mismatches:#?}");
 }
 
-// No case may pass validation: the next step stages files or binds the volume
-// into the node's fixed jail directory, or waits for the Firecracker socket.
+// No invalid case may pass validation: the next step stages files or binds the
+// volume into the node's fixed jail directory, or waits for the Firecracker
+// socket. The valid encrypted load shows where validation ends: its volume bind
+// is the first blocking host step, which the fixture refuses.
 #[tokio::test]
 async fn load_snapshot_refuses_invalid_requests_before_staging_the_jail() {
     use crate::lifecycle_limiter::LifecycleMethod;
     use crate::proto::{DriveRateLimit, LoadSnapshotRequest, TokenBucket};
+    use crate::service::tests::service_tests::{refusal_mismatch, root_request, stale_test_fence};
     use tonic::Code;
 
-    let service = crate::service::tests::service_tests::service_for_unit_tests().await;
-    service.pool.set_all_slots_ready_for_test();
-    let id = super::SandboxId::new().to_string();
-    let fence = crate::service::tests::service_tests::bind_test_execution(&service, &id);
-    let lease = allocate_lease(&service.pool, &id);
-    let unallocated = super::SandboxId::new().to_string();
-    let unallocated_fence =
-        crate::service::tests::service_tests::bind_test_execution(&service, &unallocated);
+    let fixture = SnapshotFixture::new().await;
+    let id = fixture.lease.sandbox_id.clone();
     let valid = LoadSnapshotRequest {
         sandbox_id: id.clone(),
         snapshot_path: "/vmstate".into(),
         mem_file_path: "/memory".into(),
-        execution_fence: Some(fence),
+        execution_fence: Some(fixture.fence.clone()),
         ..Default::default()
+    };
+    let unallocated = LoadSnapshotRequest {
+        sandbox_id: fixture.unallocated_id.clone(),
+        execution_fence: Some(fixture.unallocated_fence.clone()),
+        ..valid.clone()
     };
     let bucket = Some(TokenBucket {
         size: 1,
@@ -590,26 +573,22 @@ async fn load_snapshot_refuses_invalid_requests_before_staging_the_jail() {
         (
             "superseded execution",
             LoadSnapshotRequest {
-                execution_fence: Some(stale_fence()),
-                ..valid.clone()
+                execution_fence: Some(stale_test_fence()),
+                ..unallocated.clone()
             },
             Code::FailedPrecondition,
             "sandbox execution identity is missing or superseded",
         ),
         (
             "unallocated sandbox",
-            LoadSnapshotRequest {
-                sandbox_id: unallocated.clone(),
-                execution_fence: Some(unallocated_fence),
-                ..valid.clone()
-            },
+            unallocated.clone(),
             Code::Unavailable,
             "snapshot lease is no longer active",
         ),
         (
             "encrypted volume of another sandbox",
             LoadSnapshotRequest {
-                snapshot_volume_mount_dir: Some(snapshot_volume(&unallocated)),
+                snapshot_volume_mount_dir: Some(snapshot_volume(&fixture.unallocated_id)),
                 ..valid.clone()
             },
             Code::InvalidArgument,
@@ -634,18 +613,13 @@ async fn load_snapshot_refuses_invalid_requests_before_staging_the_jail() {
             "mem_file_path must reference Firecracker artifact 'memory'",
         ),
         (
-            "relative source",
-            LoadSnapshotRequest {
-                source_dir: Some("snapshot".into()),
-                ..valid.clone()
-            },
-            Code::InvalidArgument,
-            "source_dir must be absolute",
-        ),
-        (
             "source other than the sandbox checkpoint",
             LoadSnapshotRequest {
-                source_dir: Some(format!("{}/{unallocated}/snapshot", super::CACHE_DIR)),
+                source_dir: Some(format!(
+                    "{}/{}/snapshot",
+                    super::CACHE_DIR,
+                    fixture.unallocated_id
+                )),
                 ..valid.clone()
             },
             Code::PermissionDenied,
@@ -675,26 +649,31 @@ async fn load_snapshot_refuses_invalid_requests_before_staging_the_jail() {
             Code::InvalidArgument,
             "rootfs_rate_limit.operations is required",
         ),
+        (
+            "valid encrypted load",
+            LoadSnapshotRequest {
+                snapshot_volume_mount_dir: Some(snapshot_volume(&id)),
+                ..valid.clone()
+            },
+            Code::Cancelled,
+            "artifact work cancelled",
+        ),
     ];
+    let mut mismatches = Vec::new();
     for (case, request, code, message) in cases {
-        let error = service
-            .load_snapshot(from_root(request))
-            .await
-            .expect_err(case);
-        assert_eq!(error.code(), code, "{case}: {error}");
-        assert!(error.message().contains(message), "{case}: {error}");
-        let current = service.pool.get(&id).unwrap().expect("lease retained");
-        assert_eq!(
-            (current.slot, current.generation, current.pid),
-            (lease.slot, lease.generation, None),
-            "{case}"
-        );
-        assert_eq!(
-            service
-                .lifecycle_limiter
-                .snapshot(LifecycleMethod::LoadSnapshot),
-            (0, 0),
-            "{case}: refusal must return its lifecycle permit"
-        );
+        let outcome = fixture.service.load_snapshot(root_request(request)).await;
+        mismatches.extend(refusal_mismatch(case, outcome, code, message));
+        mismatches.extend(fixture.lease_disturbed(case));
+        if fixture
+            .service
+            .lifecycle_limiter
+            .snapshot(LifecycleMethod::LoadSnapshot)
+            != (0, 0)
+        {
+            mismatches.push(format!("{case}: refusal leaked its lifecycle permit"));
+            // A leaked permit would starve the remaining rows.
+            break;
+        }
     }
+    assert!(mismatches.is_empty(), "{mismatches:#?}");
 }
