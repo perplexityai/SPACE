@@ -544,42 +544,34 @@ fn cleanup_failure_is_recorded_only_against_the_current_requested_episode() {
 
 #[test]
 fn cleanup_failure_against_a_changed_intent_records_evidence_and_gates_state_on_completion() {
-    type ChangeIntent = fn(&Connection, &str, &CleanupEpisode);
+    type ChangeIntent = fn(&Connection, &str);
     let cases: [(&str, ChangeIntent, SandboxState); 3] = [
         (
             "intent cleared",
-            |conn, id, _| clear_cleanup_intent(conn, id).unwrap(),
+            |conn, id| clear_cleanup_intent(conn, id).unwrap(),
             SandboxState::CleanupRequired,
         ),
         (
             "completion changed",
-            |conn, id, _| change_intent_completion(conn, id),
+            change_intent_completion,
             SandboxState::CleanupRequired,
         ),
         // Unlike `request_cleanup_episode`, `quarantine_cleanup_episode` and
         // `cleanup_episode_current`, this writer's state predicate matches the
-        // episode's completion but not its keep-filesystem flag, so a generic
-        // writer that flipped only the flag still lets the row enter
-        // `cleanup_failed`. Unifying the predicates changes this outcome.
+        // episode's completion but not its keep-filesystem flag, so a row whose
+        // flag alone changed still enters `cleanup_failed`. Unifying the
+        // predicates changes this outcome. `mark_cleanup_required` can leave
+        // this shape, because it overwrites both intent columns.
         (
-            "keep-filesystem changed by a generic writer",
-            |conn, id, episode| {
-                mark_cleanup_required(
-                    conn,
-                    id,
-                    !episode.keep_filesystem,
-                    episode.completion,
-                    "observer",
-                )
-                .unwrap();
-            },
+            "keep-filesystem changed",
+            change_intent_keep_filesystem,
             SandboxState::CleanupFailed,
         ),
     ];
     for (case, change_intent, expected_state) in cases {
         let conn = test_conn();
         let episode = requested_start(&conn, "sandbox", "failint1");
-        change_intent(&conn, "sandbox", &episode);
+        change_intent(&conn, "sandbox");
 
         assert!(
             record_cleanup_episode_failure(&conn, "sandbox", episode.id, "cleanup failed").unwrap(),

@@ -8331,8 +8331,8 @@ fn the_writer_inventory_guard_recognizes_every_writer_spelling() {
 #[test]
 fn every_recovery_table_writer_is_fenced_or_explicitly_exempt() {
     /// How far past a write to look for the end of its statement. The longest
-    /// routed statement in db.rs is well under this; a larger window would start
-    /// borrowing the next statement's fence.
+    /// routed statement in the db module is well under this; a larger window
+    /// would start borrowing the next statement's fence.
     const STATEMENT_WINDOW_LINES: usize = 40;
     // Functions that write the quarantine table without the exact-claim fence,
     // each with the reason it does not need one. Adding a name here is a
@@ -8698,7 +8698,7 @@ fn every_fence_construction_site_is_in_the_statement_inventory() {
         registered,
         "every function building an ExactClaimFence must be registered in \
          FencedClaimStatement::ALL so the per-conjunct matrix exercises it; \
-         unregistered: {:?}, registered but not found in db.rs: {:?}",
+         unregistered: {:?}, registered but not found in the db module: {:?}",
         sites.difference(&registered).collect::<Vec<_>>(),
         registered.difference(&sites).collect::<Vec<_>>(),
     );
