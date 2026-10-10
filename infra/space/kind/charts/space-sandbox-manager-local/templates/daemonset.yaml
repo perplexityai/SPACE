@@ -62,7 +62,7 @@ spec:
             # unless SPACE_INTERNAL_TOKEN is set beside the endpoint, although
             # its ClusterApi client authenticates with the projected token
             # (reupload_precondition_for_cluster_api_env,
-            # crates/libs/sbx/mgr/server/src/service/grpc_lifecycle.rs).
+            # crates/libs/sbx/mgr/server/src/service/grpc_lifecycle/artifact_backup.rs).
             {{- include "space-node-service.env.internalToken" . | nindent 12 }}
             {{- include "space-node-service.env.routeVerification" . | nindent 12 }}
             {{- include "space-node-service.env.diskAdmission" . | nindent 12 }}
