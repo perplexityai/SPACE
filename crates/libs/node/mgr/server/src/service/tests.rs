@@ -533,7 +533,10 @@ pub(super) mod service_tests {
     /// `off_runtime` checks the artifact-work owner first, and this owner's
     /// cancellation fires when `run_artifact_mutation` returns. A request that
     /// passes validation therefore stops with `Cancelled` at its first jail,
-    /// cache or run-directory step, whatever the test's privileges.
+    /// cache or run-directory step, whatever the test's privileges. The probe
+    /// section proves the refusal comes before the section: `off_runtime`
+    /// checks the owner again afterwards with the same `Cancelled`, so the
+    /// outcome alone cannot show that a host step never ran.
     pub(in crate::service) async fn refuse_host_work(service: &mut NodeManagerService) {
         let owner = service
             .run_artifact_mutation(&SandboxId::new().to_string(), |service| async move {
@@ -547,6 +550,24 @@ pub(super) mod service_tests {
             "the owner must already refuse"
         );
         service.artifact_work = Some(owner);
+
+        let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let section_ran = std::sync::Arc::clone(&ran);
+        let outcome = service
+            .off_runtime("refuse_host_work probe", move || {
+                section_ran.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            })
+            .await;
+        assert_eq!(
+            outcome.unwrap_err().code(),
+            tonic::Code::Cancelled,
+            "a host section must refuse"
+        );
+        assert!(
+            !ran.load(std::sync::atomic::Ordering::SeqCst),
+            "a refused host section must not run"
+        );
     }
 
     pub(in crate::service) async fn service_for_unit_tests() -> NodeManagerService {
