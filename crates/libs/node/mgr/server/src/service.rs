@@ -636,6 +636,8 @@ mod btrfs_delegation;
 mod btrfs_send_source;
 mod btrfs_send_transport;
 pub mod cgroup_reclaim;
+#[cfg(test)]
+mod claim_contention_tests;
 mod cleanup_helpers;
 mod cleanup_inspect;
 mod control;

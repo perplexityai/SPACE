@@ -1984,6 +1984,8 @@ fn retire_stale_pod_namespace_lease(
     Ok(record.info.slot)
 }
 
+#[cfg(test)]
+mod claim_contention_tests;
 mod db;
 mod execution;
 mod liveness;
