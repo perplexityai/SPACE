@@ -18,6 +18,15 @@ node: {}
 # (crates/libs/vol/mgr/server/src/run.rs). The grace covers both plus exit.
 terminationGracePeriodSeconds: 120
 
+# Volume-manager's streaming snapshot upload part budget
+# (SPACE_VOLUME_STREAM_PUSH_BUFFER_BUDGET_BYTES). Null leaves the variable
+# unset, so Kind streams eligible uploads with the service default 1 GiB
+# budget, as a deployment that does not set it does: this pod has no memory
+# limit shared with other services. "0" uploads through temporary files
+# instead; another value must be whole MiB and at least 64 MiB. See
+# docs/snapshot-upload-streaming.md.
+streamPushBufferBudgetBytes: null
+
 # Kind sizing: requests only (see space-node-manager-local/values.yaml).
 resources:
   requests:

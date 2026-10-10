@@ -6,10 +6,13 @@ service, per role, and the control-plane credential-manager authority, and
 assert that the credential database, its password, the AWS credentials and the
 Secrets Manager reader role reach only the authority, and the static
 object-store credentials only volume-manager and build-manager (the services
-that transfer objects with them).
+that transfer objects with them). Volume-manager's streaming upload budget is
+unset by default, so the service default applies, and renders exactly as set.
 """
 
 import subprocess
+import tempfile
+from pathlib import Path
 
 import pytest
 from kind_chart_render import KIND_DIR, render
@@ -39,6 +42,8 @@ OBJECT_STORE_STATIC = {
     "SPACE_OBJECT_STORE_STATIC_SECRET_ACCESS_KEY",
 }
 OBJECT_STORE_CONSUMERS = {"volume-manager", "build-manager"}
+STREAM_BUDGET = "SPACE_VOLUME_STREAM_PUSH_BUFFER_BUDGET_BYTES"
+VOLUME_MANAGER_CHART = KIND_DIR / "charts/space-volume-manager-local"
 
 
 def _rendered_env(manifests: list[dict]) -> set[str]:
@@ -71,6 +76,35 @@ def test_static_object_store_credentials_reach_only_their_consumers(release, rol
         assert present == OBJECT_STORE_STATIC, f"{release} {service} renders {sorted(present)}"
     else:
         assert not present, f"{release} {service} renders {sorted(present)}"
+
+
+@pytest.mark.parametrize(("release", "role", "service"), NODE_RELEASES)
+def test_no_node_service_sets_a_stream_upload_budget_by_default(release, role, service):
+    assert STREAM_BUDGET not in _node_service_env(release, role, service)
+
+
+def _volume_manager_budget(*extra: str) -> str | None:
+    for document in render(VOLUME_MANAGER_CHART, "space", *extra):
+        for container in document.get("spec", {}).get("template", {}).get("spec", {}).get("containers", []):
+            for entry in container.get("env", []):
+                if entry["name"] == STREAM_BUDGET:
+                    return entry["value"]
+    return None
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [("0", "0"), ("134217728", "134217728")],
+)
+def test_volume_manager_renders_a_set_stream_upload_budget_exactly(value, expected):
+    # A numeric 0 must still select file uploads, and a number from a values
+    # file (parsed as a float) must not render in exponent form.
+    assert _volume_manager_budget("--set-string", f"streamPushBufferBudgetBytes={value}") == expected
+    assert _volume_manager_budget("--set", f"streamPushBufferBudgetBytes={value}") == expected
+    with tempfile.TemporaryDirectory() as directory:
+        values = Path(directory) / "values.yaml"
+        values.write_text(f"streamPushBufferBudgetBytes: {value}\n")
+        assert _volume_manager_budget("-f", str(values)) == expected
 
 
 def test_the_authority_reads_the_secrets_manager_role_from_the_optional_aws_secret():

@@ -60,6 +60,15 @@ spec:
             # token exchange (the local escape hatch,
             # crates/libs/vol/mgr/server/src/run.rs).
             {{- include "space-node-service.env.objectStoreCredentials" . | nindent 12 }}
+            {{- $budget := .Values.streamPushBufferBudgetBytes }}
+            {{- if not (kindIs "invalid" $budget) }}
+            # Streaming snapshot upload part budget; null keeps the service
+            # default (values.yaml). Rendered for any non-null value, so a
+            # numeric 0 still selects file uploads; a number read from a
+            # values file arrives as a float and is written out whole.
+            - name: SPACE_VOLUME_STREAM_PUSH_BUFFER_BUDGET_BYTES
+              value: {{ ternary (printf "%.0f" $budget) (toString $budget) (kindIs "float64" $budget) | quote }}
+            {{- end }}
           {{- include "space-node-service.probes" $ctx | nindent 10 }}
           volumeMounts:
             {{- include "space-node-service.mount.run" . | nindent 12 }}
