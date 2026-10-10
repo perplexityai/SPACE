@@ -1156,23 +1156,65 @@ async fn teardown_suspend_terminal_driver_failures_stop_polling_without_release_
     }
 }
 
-#[tokio::test]
-async fn teardown_suspend_keeps_polling_until_a_deleting_sandbox_commits_its_delete() {
-    use crate::service::tests::service_tests::{
-        insert_test_sandbox, prepare_teardown_suspend_request,
-    };
+/// A started sandbox whose generation-7 suspend job is running, moved to
+/// Deleting by the production transition, which closes that job.
+fn deleting_sandbox_with_closed_teardown_suspend(
+    conn: &rusqlite::Connection,
+) -> (String, pplx_space_common_core::types::ExecutionGeneration) {
+    use crate::service::tests::service_tests::insert_test_sandbox;
     use pplx_space_common_core::types::ExecutionGeneration;
-    let conn = crate::db::test_conn();
     let sandbox_id = SandboxId::new();
     let id = sandbox_id.to_string();
-    insert_test_sandbox(&conn, &id, SandboxState::Paused);
     let generation = ExecutionGeneration::new(7).unwrap();
-    crate::db::begin_teardown_suspend_operation(&conn, &id, generation).unwrap();
-    conn.execute(
-        "UPDATE sandboxes SET state = ?1 WHERE id = ?2",
-        rusqlite::params![SandboxState::Deleting.as_str(), id],
+    insert_test_sandbox(conn, &id, SandboxState::Started);
+    // The delete's receipt covers the row's route execution generation.
+    crate::db::update_space_api_route_identity(
+        conn,
+        sandbox_id,
+        &pplx_space_common_core::types::SpaceApiRouteIdentity {
+            execution_generation: Some(generation),
+            ..Default::default()
+        },
+        crate::auto_lifecycle_delete_receipts::RouteIdentityProvenance::Unfenced,
     )
     .unwrap();
+    crate::db::begin_teardown_suspend_operation(conn, &id, generation).unwrap();
+    assert_eq!(
+        crate::db::latest_teardown_suspend_operation(conn, &id)
+            .unwrap()
+            .unwrap()
+            .status,
+        crate::db::TeardownSuspendOperationStatus::Running
+    );
+    crate::db::update_state(conn, &id, SandboxState::Deleting)
+        .unwrap()
+        .require_applied()
+        .unwrap();
+    // The transition fails the job before any shim request arrives.
+    assert_eq!(
+        crate::db::latest_teardown_suspend_operation(conn, &id)
+            .unwrap()
+            .unwrap()
+            .status,
+        crate::db::TeardownSuspendOperationStatus::Failed
+    );
+    (id, generation)
+}
+
+/// The production delete: it commits the receipt and removes the row in one
+/// transaction.
+fn commit_sandbox_delete(conn: &rusqlite::Connection, id: &str) {
+    crate::db::set_cleanup_intent(conn, id, false, crate::db::CleanupCompletion::DeleteRow)
+        .unwrap();
+    crate::db::complete_row_intent_cleanup(conn, id, crate::db::CleanupCompletion::DeleteRow, None)
+        .unwrap();
+}
+
+#[tokio::test]
+async fn teardown_suspend_keeps_polling_until_a_deleting_sandbox_commits_its_delete() {
+    use crate::service::tests::service_tests::prepare_teardown_suspend_request;
+    let conn = crate::db::test_conn();
+    let (id, generation) = deleting_sandbox_with_closed_teardown_suspend(&conn);
     let service = SandboxManagerService::new(conn);
     let actions = [
         crate::proto::TeardownSuspendAction::BeginOrJoin,
@@ -1196,9 +1238,10 @@ async fn teardown_suspend_keeps_polling_until_a_deleting_sandbox_commits_its_del
             "{action:?}"
         );
     }
+    // The job stays closed, so no driver restarts for the deleting row.
+    assert!(service.teardown_suspend_drivers.is_empty());
     {
         let db = service.db.lock().unwrap();
-        // The job is still closed, so no driver restarts for the deleting row.
         assert_eq!(
             crate::db::latest_teardown_suspend_operation(&db, &id)
                 .unwrap()
@@ -1206,23 +1249,7 @@ async fn teardown_suspend_keeps_polling_until_a_deleting_sandbox_commits_its_del
                 .status,
             crate::db::TeardownSuspendOperationStatus::Failed
         );
-        // The delete commits its receipt and removes the row together.
-        let deleted_at = i64::try_from(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs(),
-        )
-        .unwrap();
-        db.execute(
-            "INSERT INTO sandbox_execution_delete_receipts (
-                 sandbox_id, execution_generation, deleted_at
-             ) VALUES (?1, ?2, ?3)",
-            rusqlite::params![id, generation.get(), deleted_at],
-        )
-        .unwrap();
-        db.execute("DELETE FROM sandboxes WHERE id = ?1", [&id])
-            .unwrap();
+        commit_sandbox_delete(&db, &id);
     }
 
     for action in actions {
@@ -1239,6 +1266,49 @@ async fn teardown_suspend_keeps_polling_until_a_deleting_sandbox_commits_its_del
             "{action:?}"
         );
     }
+}
+
+#[tokio::test]
+async fn teardown_suspend_terminal_decision_releases_a_delete_committed_after_the_first_snapshot() {
+    let conn = crate::db::test_conn();
+    let (id, generation) = deleting_sandbox_with_closed_teardown_suspend(&conn);
+    let service = SandboxManagerService::new(conn);
+    {
+        let db = service.db.lock().unwrap();
+        // The handler's first snapshot: the row is deleting and no receipt
+        // covers the execution, so it goes on to the terminal decision.
+        let evidence = crate::db::teardown_release_evidence(&db, &id, generation).unwrap();
+        assert_eq!(evidence.suspend.unwrap().state, SandboxState::Deleting);
+        assert!(!evidence.deleted);
+        // The delete commits before the terminal decision's snapshot. The
+        // failed job stays behind as history for the missing row.
+        commit_sandbox_delete(&db, &id);
+        assert!(crate::db::get_sandbox(&db, &id).unwrap().is_none());
+        assert!(
+            crate::db::latest_teardown_suspend_operation(&db, &id)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    // Refusing this missing row would strand the pod: the shim's exit-path
+    // release is not retried.
+    assert_eq!(
+        service
+            .close_terminal_teardown_suspend(&id, generation)
+            .unwrap(),
+        super::TerminalTeardownSuspend::Deleted
+    );
+    // The receipt is generation-fenced: it does not release a newer execution.
+    assert_eq!(
+        service
+            .close_terminal_teardown_suspend(
+                &id,
+                pplx_space_common_core::types::ExecutionGeneration::new(8).unwrap()
+            )
+            .unwrap(),
+        super::TerminalTeardownSuspend::Open
+    );
 }
 
 #[tokio::test]

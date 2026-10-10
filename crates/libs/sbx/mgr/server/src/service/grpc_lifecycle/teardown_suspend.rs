@@ -46,15 +46,37 @@ pub(in crate::service) enum TerminalTeardownSuspend {
     /// Deleting: the job is closed and the delete's receipt will release the
     /// execution.
     AwaitingDelete,
+    /// The delete committed since the request's first snapshot: its receipt
+    /// covers the execution and releases it.
+    Deleted,
 }
 
-fn awaiting_delete_response(
+impl TerminalTeardownSuspend {
+    /// The response that answers the request, or `None` to keep preparing it.
+    fn response(
+        self,
+        started_at: std::time::Instant,
+    ) -> Option<Response<PrepareTeardownSuspendResponse>> {
+        match self {
+            Self::Open => None,
+            Self::AwaitingDelete => Some(teardown_suspend_prepare_response(
+                TeardownSuspendOutcome::Pending,
+                Some("sandbox is deleting; its delete receipt releases this execution".to_string()),
+                pplx_space_metrics::sandbox::worker::TeardownSuspendPrepareOutcome::Pending,
+                started_at,
+            )),
+            Self::Deleted => Some(deleted_teardown_suspend_response(started_at)),
+        }
+    }
+}
+
+fn deleted_teardown_suspend_response(
     started_at: std::time::Instant,
 ) -> Response<PrepareTeardownSuspendResponse> {
     teardown_suspend_prepare_response(
-        TeardownSuspendOutcome::Pending,
-        Some("sandbox is deleting; its delete receipt releases this execution".to_string()),
-        pplx_space_metrics::sandbox::worker::TeardownSuspendPrepareOutcome::Pending,
+        TeardownSuspendOutcome::Deleted,
+        Some("a generation-fenced local delete covers this execution".to_string()),
+        pplx_space_metrics::sandbox::worker::TeardownSuspendPrepareOutcome::Deleted,
         started_at,
     )
 }
@@ -179,17 +201,13 @@ impl SandboxManagerService {
         };
         let Some(mut status) = evidence.suspend else {
             if evidence.deleted {
-                return Ok(teardown_suspend_prepare_response(
-                    TeardownSuspendOutcome::Deleted,
-                    Some("a generation-fenced local delete covers this execution".to_string()),
-                    pplx_space_metrics::sandbox::worker::TeardownSuspendPrepareOutcome::Deleted,
-                    metric_started_at,
-                ));
+                return Ok(deleted_teardown_suspend_response(metric_started_at));
             }
-            if self.close_terminal_teardown_suspend(&sandbox_id_string, execution_generation)?
-                == TerminalTeardownSuspend::AwaitingDelete
+            if let Some(response) = self
+                .close_terminal_teardown_suspend(&sandbox_id_string, execution_generation)?
+                .response(metric_started_at)
             {
-                return Ok(awaiting_delete_response(metric_started_at));
+                return Ok(response);
             }
             return Ok(teardown_suspend_prepare_response(
                 TeardownSuspendOutcome::Pending,
@@ -212,10 +230,11 @@ impl SandboxManagerService {
             Some(generation) => generation,
             None if status.state == SandboxState::Suspended => execution_generation,
             None => {
-                if self.close_terminal_teardown_suspend(&sandbox_id_string, execution_generation)?
-                    == TerminalTeardownSuspend::AwaitingDelete
+                if let Some(response) = self
+                    .close_terminal_teardown_suspend(&sandbox_id_string, execution_generation)?
+                    .response(metric_started_at)
                 {
-                    return Ok(awaiting_delete_response(metric_started_at));
+                    return Ok(response);
                 }
                 return Ok(teardown_suspend_prepare_response(
                     TeardownSuspendOutcome::Pending,
@@ -269,10 +288,11 @@ impl SandboxManagerService {
                 metric_started_at,
             ));
         }
-        if self.close_terminal_teardown_suspend(&sandbox_id_string, execution_generation)?
-            == TerminalTeardownSuspend::AwaitingDelete
+        if let Some(response) = self
+            .close_terminal_teardown_suspend(&sandbox_id_string, execution_generation)?
+            .response(metric_started_at)
         {
-            return Ok(awaiting_delete_response(metric_started_at));
+            return Ok(response);
         }
         if action == TeardownSuspendAction::BeginOrJoin
             && matches!(status.state, SandboxState::Started | SandboxState::Paused)
@@ -399,7 +419,10 @@ impl SandboxManagerService {
     /// sandbox's job is closed too, but its delete commits a receipt that
     /// releases this execution, so callers are told to keep polling. Refusing
     /// it instead raced the shim's single exit-path release, which containerd
-    /// does not retry, and left the generation's pod unreleased.
+    /// does not retry, and left the generation's pod unreleased. That delete
+    /// removes the row and commits the receipt together, possibly after the
+    /// request's first snapshot, so a missing row with a receipt covering this
+    /// execution is answered as deleted rather than refused.
     pub(super) fn close_terminal_teardown_suspend(
         &self,
         sandbox_id: &str,
@@ -418,6 +441,11 @@ impl SandboxManagerService {
         let reason = match state {
             Some(SandboxState::Quarantined) => Some(crate::db::TeardownSuspendFailure::Quarantined),
             Some(SandboxState::Deleting) => Some(crate::db::TeardownSuspendFailure::Deleting),
+            None if crate::db::execution_delete_receipt_covers(&db, sandbox_id, generation)
+                .map_err(|error| Status::internal(format!("db error: {error}")))? =>
+            {
+                return Ok(TerminalTeardownSuspend::Deleted);
+            }
             None if exact.is_some() => Some(crate::db::TeardownSuspendFailure::Missing),
             _ if exact.is_some_and(|operation| {
                 operation.status == crate::db::TeardownSuspendOperationStatus::Failed
