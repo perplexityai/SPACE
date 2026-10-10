@@ -18,23 +18,20 @@
 //! read afterwards, bounded by stalled-stream protection and the ranged
 //! download's own chunk retry.
 //!
-//! Defaults are sized from production measurements (2026-10):
+//! Each default is sized from how S3 serves its class:
 //!
-//! - A ranged `GetObject` chunk, request plus body: p75 0.7 s, p99 1.5 s,
-//!   max 25 s. Only the wait for the headers is under the attempt timeout, so
-//!   10 s is far above the p99 of the whole chunk.
-//! - A single `PutObject`: p99 4.6 s, max 8.4 s; p1 throughput 33 MiB/s at
-//!   8 MiB and up.
-//! - A whole multipart upload of up to 8.4 GiB in waves of 16 parts: p99
-//!   18.5 s, max 37 s, and one 15-part upload took 37 s in a single wave, so
-//!   one part can take about 37 s. 60 s is about 1.6 times that. That slow
-//!   tail clusters at 37.2–37.7 s across hosts and part counts, which looks
-//!   like one stalled attempt plus an SDK retry rather than a slow part, so
-//!   the margin is likely larger than it seems. Check
+//! - Request: S3 normally answers a metadata request, and sends a
+//!   `GetObject`'s response headers, within about a second, so 10 s leaves
+//!   wide margin. Only the wait for the headers is under the attempt
+//!   timeout; a ranged chunk's body is bounded as described above.
+//! - Body upload: an attempt must fit sending one 256 MiB multipart part on
+//!   a slow link. 60 s allows about 4.3 MiB/s per part, and the parts of
+//!   one upload share the link, 16 at a time by default. Check
 //!   `space.object_store.s3.attempt_failed` before tuning this bound.
-//!
-//! There are no measurements for `HeadObject`, create/abort/complete, or the
-//! copies; S3 normally answers them within seconds.
+//! - Server-side: S3 holds a `CopyObject` or `UploadPartCopy` request open
+//!   while it copies the data, and answers `CompleteMultipartUpload` only
+//!   once it has assembled the parts, so these wait on work proportional to
+//!   the object's size rather than on a metadata lookup.
 //!
 //! The body-upload bound assumes the default 256 MiB multipart part: a
 //! larger `SPACE_OBJECT_STORE_MULTIPART_PART_SIZE_BYTES` needs a
