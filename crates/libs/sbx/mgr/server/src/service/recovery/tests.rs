@@ -466,13 +466,7 @@ fn a_lost_claim_is_reported_without_a_durable_retry_write() {
 // ---------------------------------------------------------------------------
 
 fn recovery_test_service(conn: rusqlite::Connection) -> SandboxManagerService {
-    SandboxManagerService::new_with_options(
-        conn,
-        crate::service::SandboxManagerServiceOptions {
-            sandbox_runtime_live: Arc::new(|_| false),
-            ..Default::default()
-        },
-    )
+    crate::service::tests::service_tests::service_with_runtime_probe(conn, false)
 }
 
 /// Make the shipped orphan-restore driver return through its shutdown arm.
@@ -3524,6 +3518,13 @@ fn startup_cleanup_discovery_skips_rows_with_malformed_ids() {
         &sandbox_id.to_string(),
         SandboxState::Stopping,
     );
+    // Discovery lists rows by `created_at`; pin both so the malformed row is
+    // listed first regardless of the wall clock.
+    conn.execute(
+        "UPDATE sandboxes SET created_at = '1785456001' WHERE id = ?1",
+        [sandbox_id.to_string()],
+    )
+    .unwrap();
     let db = Arc::new(Mutex::new(conn));
 
     let [target] = discover_cleanup_targets(&db, CleanupRecoveryAuthority::Startup)

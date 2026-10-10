@@ -8512,6 +8512,21 @@ pub(crate) mod service_tests {
         }));
     }
 
+    /// A service whose runtime probe answers `runtime_live` for every sandbox
+    /// instead of reading the host's run directory.
+    pub(crate) fn service_with_runtime_probe(
+        conn: rusqlite::Connection,
+        runtime_live: bool,
+    ) -> SandboxManagerService {
+        SandboxManagerService::new_with_options(
+            conn,
+            SandboxManagerServiceOptions {
+                sandbox_runtime_live: Arc::new(move |_| runtime_live),
+                ..Default::default()
+            },
+        )
+    }
+
     pub(crate) fn service_for_teardown_test(conn: rusqlite::Connection) -> SandboxManagerService {
         SandboxManagerService::new_with_options(
             conn,
