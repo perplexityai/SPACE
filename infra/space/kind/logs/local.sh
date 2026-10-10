@@ -7,10 +7,14 @@ release_init logs
 case "$action" in
   up)
     # Fail rather than silently deploying a journal receiver at an absent path.
+    # kind reports a cluster with no nodes on stderr and exits 0, so an empty
+    # list fails too instead of checking nothing.
+    nodes=$(kind get nodes --name "$cluster")
+    [[ -n $nodes ]] || { echo "No kind nodes found for cluster \"$cluster\"" >&2; exit 1; }
     while IFS= read -r node; do
       docker exec "$node" test -d /run/log/journal
       docker exec "$node" test -d /var/log/pods
-    done < <(kind get nodes --name space-local)
+    done <<<"$nodes"
     helm_options "$@"
     # Do not advance source cursors while a brand-new Loki is still starting.
     if ! helm status "$release" --kube-context "$context" -n "$namespace" >/dev/null 2>&1; then

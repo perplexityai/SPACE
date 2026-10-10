@@ -22,8 +22,9 @@ bash infra/space/kind/traces/local.sh ui
 # Tempo query API: http://127.0.0.1:13200
 ```
 
-The helper requires context `kind-space-local` to match the loopback API port of
-the Docker Kind control plane and verifies namespace ownership. It applies the
+The helper requires context `kind-space-local` (`kind-$SPACE_KIND_CLUSTER` when
+that is set) to match the loopback API port of the Docker Kind control plane
+and verifies namespace ownership. It applies the
 chart's Kind overlay, which permits disposable storage and skips network
 policies. For shared clusters use the portable
 [observability charts and deployment runbook](../../observability/README.md),

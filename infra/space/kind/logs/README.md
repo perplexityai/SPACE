@@ -19,7 +19,8 @@ bash infra/space/kind/logs/local.sh ui
 ```
 
 The helper verifies that context `kind-space-local` addresses the loopback API
-port published by this Docker Kind cluster. Its deployments and cleanup affect
+port published by this Docker Kind cluster (`kind-$SPACE_KIND_CLUSTER` on a
+bench that sets `SPACE_KIND_CLUSTER`). Its deployments and cleanup affect
 only the owned namespace `space-logs`. On first install it waits for Loki
 before starting collection. It applies the chart's Kind overlay, which permits
 disposable storage, the diagnostic echo, and the volatile `/run/log/journal`.

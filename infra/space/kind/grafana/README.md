@@ -18,8 +18,9 @@ bash infra/space/kind/grafana/local.sh up
 bash infra/space/kind/grafana/local.sh ui
 ```
 
-The helper verifies Docker Kind `space-local`, its published loopback API, the
-explicit `kind-space-local` context and owned namespace `space-grafana`.
+The helper verifies Docker Kind `space-local` (or `$SPACE_KIND_CLUSTER`), its
+published loopback API, the explicit matching `kind-` context and owned
+namespace `space-grafana`.
 It applies the chart's Kind overlay, which is what permits anonymous access,
 disposable state and no network policies. For shared clusters use the portable
 [observability charts and deployment runbook](../../observability/README.md),

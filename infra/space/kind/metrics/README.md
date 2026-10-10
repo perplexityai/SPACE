@@ -1,7 +1,8 @@
 # Local metrics backend
 
 Install Collector Contrib and Prometheus on the verified `kind-space-local`
-bench. The helper checks cluster identity and namespace ownership. Shared
+bench (`kind-$SPACE_KIND_CLUSTER` when `SPACE_KIND_CLUSTER` is set). The
+helper checks cluster identity and namespace ownership. Shared
 installations use the [observability deployment runbook](../../observability/README.md).
 
 Default Kind bootstrap and full-stack Tilt install this backend automatically
