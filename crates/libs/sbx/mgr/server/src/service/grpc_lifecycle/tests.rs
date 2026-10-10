@@ -2156,7 +2156,7 @@ async fn suspend_completion_refuses_a_superseded_row_before_runtime_cleanup() {
 }
 
 #[tokio::test]
-async fn suspend_publication_failure_quarantines_or_leaves_the_row_suspending() {
+async fn suspend_publication_failure_persists_only_against_the_suspending_row() {
     use crate::service::tests::service_tests::insert_test_sandbox;
     use pplx_space_common_core::types::SandboxQuarantineReasonCode;
 
@@ -2169,24 +2169,35 @@ async fn suspend_publication_failure_quarantines_or_leaves_the_row_suspending() 
         .unwrap();
     };
     let sockets = tempfile::tempdir().unwrap();
-    for (case, runtime_live, rejected, quarantined) in [
+    for (case, runtime_live, state, rejected, expected_state) in [
+        (
+            "a live rollback that lost to another transition leaves that row alone",
+            true,
+            SandboxState::Paused,
+            None,
+            SandboxState::Paused,
+        ),
         (
             "a live runtime whose rollback cannot persist is quarantined",
             true,
-            SandboxState::Paused,
-            true,
+            SandboxState::Suspending,
+            Some(SandboxState::Paused),
+            SandboxState::Quarantined,
         ),
         (
             "a dead runtime whose quarantine cannot persist stays suspending",
             false,
-            SandboxState::Quarantined,
-            false,
+            SandboxState::Suspending,
+            Some(SandboxState::Quarantined),
+            SandboxState::Suspending,
         ),
     ] {
         let conn = crate::db::test_conn();
         let id = SandboxId::new().to_string();
-        insert_test_sandbox(&conn, &id, SandboxState::Suspending);
-        reject_state(&conn, rejected);
+        insert_test_sandbox(&conn, &id, state);
+        if let Some(rejected) = rejected {
+            reject_state(&conn, rejected);
+        }
         let service =
             service_with_runtime_liveness_and_absent_sockets(conn, runtime_live, sockets.path());
 
@@ -2197,8 +2208,8 @@ async fn suspend_publication_failure_quarantines_or_leaves_the_row_suspending() 
             let db = service.db.lock().unwrap();
             crate::db::current_quarantine_reason_wire_value(&db, &id).unwrap()
         };
-        if quarantined {
-            assert_eq!(row.state, SandboxState::Quarantined, "{case}");
+        assert_eq!(row.state, expected_state, "{case}");
+        if expected_state == SandboxState::Quarantined {
             assert_eq!(
                 row.failure_reason.as_deref(),
                 Some("capture failed"),
@@ -2210,8 +2221,8 @@ async fn suspend_publication_failure_quarantines_or_leaves_the_row_suspending() 
                 "{case}"
             );
         } else {
-            // Periodic publication recovery owns a row left suspending.
-            assert_eq!(row.state, SandboxState::Suspending, "{case}");
+            // Periodic publication recovery owns a row left suspending; a row
+            // another transition owns records nothing from this failure.
             assert_eq!(row.failure_reason, None, "{case}");
             assert_eq!(reason_code, None, "{case}");
         }
