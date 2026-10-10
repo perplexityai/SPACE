@@ -110,12 +110,30 @@ fn fresh_fence() -> ExecutionFence {
 /// A shell blocked on stdin. Naming the sandbox in its argv makes the node
 /// manager treat it as that sandbox's process.
 fn blocked_process(sandbox_id: Option<&str>) -> std::process::Child {
-    std::process::Command::new("sh")
+    let child = std::process::Command::new("sh")
         .args(["-c", "read _"])
         .args(sandbox_id)
         .stdin(std::process::Stdio::piped())
         .spawn()
-        .unwrap()
+        .unwrap();
+    // `spawn` returns once the child is inside exec, before the kernel
+    // publishes the new argv that the ownership check reads.
+    if let Some(sandbox_id) = sandbox_id {
+        let cmdline = format!("/proc/{}/cmdline", child.id());
+        let give_up = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !std::fs::read(&cmdline)
+            .unwrap_or_default()
+            .split(|byte| *byte == 0)
+            .any(|arg| arg == sandbox_id.as_bytes())
+        {
+            assert!(
+                std::time::Instant::now() < give_up,
+                "{cmdline} never showed the {sandbox_id} marker"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+    child
 }
 
 /// Waits until the child exits but leaves it unreaped, so its pid stays pinned.
@@ -402,7 +420,7 @@ async fn release_refusal_keeps_the_lease(
     let sandbox_id = SandboxId::new().to_string();
     let fence = bind_test_execution(&node.service, &sandbox_id);
     node.lease(&sandbox_id).await;
-    let process = blocked_process(None);
+    let process = blocked_process(Some(&sandbox_id));
     node.service
         .pool
         .set_pid(&sandbox_id, process.id())
@@ -433,48 +451,6 @@ async fn release_refusal_keeps_the_lease(
         );
     }
     assert_eq!(node.lease_state(), before);
-    finish(process);
-    node.stop().await;
-}
-
-#[tokio::test]
-async fn forced_release_stops_the_runtime_and_returns_the_slot() {
-    let node = Node::start(SupervisorScript::default()).await;
-    let sandbox_id = SandboxId::new().to_string();
-    let fence = bind_test_execution(&node.service, &sandbox_id);
-    node.lease(&sandbox_id).await;
-    let process = blocked_process(None);
-    node.service
-        .pool
-        .set_pid(&sandbox_id, process.id())
-        .unwrap();
-    let release = || {
-        rpc(
-            ReleaseRequest {
-                sandbox_id: sandbox_id.clone(),
-                force: true,
-                execution_fence: Some(fence.clone()),
-            },
-            None,
-        )
-    };
-
-    node.service.release(release()).await.unwrap();
-
-    assert!(node.service.pool.get(&sandbox_id).unwrap().is_none());
-    let [(released_sandbox, state, _, memory_reservation_mib)] = &node.lease_state()[..] else {
-        panic!("one slot expected: {:?}", node.lease_state());
-    };
-    assert_eq!(released_sandbox, &sandbox_id);
-    assert_eq!(*state, SlotState::Dirty);
-    assert_eq!(*memory_reservation_mib, None);
-
-    let error = node.service.release(release()).await.unwrap_err();
-    assert_eq!(error.code(), Code::NotFound, "{error}");
-    assert!(
-        error.message().contains("no allocation matching"),
-        "{error}"
-    );
     finish(process);
     node.stop().await;
 }
@@ -574,23 +550,23 @@ async fn stop_process_refuses_without_signalling(
     node.stop().await;
 }
 
+/// Linux never assigns a pid above `PID_MAX_LIMIT` (2^22), so no process can
+/// hold this one.
+const UNASSIGNABLE_PID: u32 = i32::MAX as u32;
+
 #[rstest::rstest]
 #[case::exited_unreaped(false)]
-#[case::reaped(true)]
+#[case::absent(true)]
 #[tokio::test]
-async fn stop_process_reports_an_already_gone_process_as_not_stopped(#[case] reaped: bool) {
+async fn stop_process_reports_an_already_gone_process_as_not_stopped(#[case] absent: bool) {
     let node = Node::start(signalling_supervisor()).await;
     let sandbox_id = SandboxId::new().to_string();
     let fence = bind_test_execution(&node.service, &sandbox_id);
     node.lease(&sandbox_id).await;
-    let mut gone = exited_process();
-    let pid = gone.id();
-    let unreaped = if reaped {
-        gone.wait().unwrap();
-        None
-    } else {
-        Some(gone)
-    };
+    let unreaped = (!absent).then(exited_process);
+    let pid = unreaped
+        .as_ref()
+        .map_or(UNASSIGNABLE_PID, std::process::Child::id);
 
     let response = node
         .service

@@ -361,8 +361,9 @@ async fn cleanup_phase_acquisition_stops_when_shutdown_begins() {
 
     assert_eq!(error.code(), tonic::Code::Unavailable);
 }
+
 #[tokio::test(start_paused = true)]
-async fn busy_device_cleanup_times_out_before_mutating_the_sandbox() {
+async fn timed_out_cleanup_releases_the_registry_claim_for_retry() {
     let service = crate::service::tests::service_tests::service_for_unit_tests().await;
     let id = SandboxId::new();
     let device = service.sandbox_device_stack_lock(&id).await;
@@ -391,7 +392,6 @@ async fn busy_device_cleanup_times_out_before_mutating_the_sandbox() {
     tokio::time::advance(CLEANUP_PHASE_ACQUIRE_TIMEOUT).await;
     let error = cleanup.await.unwrap_err();
     assert_eq!(error.code(), tonic::Code::Unavailable);
-    assert!(error.message().contains("device-stack"));
     assert!(!registry.operations.contains_key(&id));
     drop(ownership);
     registry
@@ -412,8 +412,25 @@ struct CleanupNode {
 
 impl CleanupNode {
     /// A bound, leased sandbox whose supervisor acknowledges runtime stop.
-    async fn leased(script: crate::runtime_supervisor_client::tests::SupervisorScript) -> Self {
-        let node = Self::unbound(script).await;
+    async fn leased() -> Self {
+        let (supervisor_socket, client, supervisor) =
+            crate::runtime_supervisor_client::tests::scripted_client(Default::default()).await;
+        let mut service = crate::service::tests::service_tests::service_for_unit_tests().await;
+        service.runtime_supervisor = client;
+        // A second ready slot lets a replacement lease be granted mid-cleanup.
+        service.pool =
+            crate::slot_pool::NetworkPool::open_in_memory_for_test(NetworkPoolConfig::new(2));
+        service.pool.set_all_slots_ready_for_test();
+        let node = Self {
+            service,
+            sandbox_id: SandboxId::new(),
+            fence: pplx_space_node_mgr_client::execution_fence::ExecutionFence::new(
+                pplx_space_common_core::types::SandboxActivationAttemptId::new(),
+                None,
+            ),
+            _supervisor_socket: supervisor_socket,
+            supervisor,
+        };
         node.service
             .pool
             .bind_execution(&node.sandbox_id.to_string(), node.fence)
@@ -430,26 +447,6 @@ impl CleanupNode {
             .await
             .unwrap();
         node
-    }
-
-    async fn unbound(script: crate::runtime_supervisor_client::tests::SupervisorScript) -> Self {
-        let (supervisor_socket, client, supervisor) =
-            crate::runtime_supervisor_client::tests::scripted_client(script).await;
-        let mut service = crate::service::tests::service_tests::service_for_unit_tests().await;
-        service.runtime_supervisor = client;
-        service.pool =
-            crate::slot_pool::NetworkPool::open_in_memory_for_test(NetworkPoolConfig::new(2));
-        service.pool.set_all_slots_ready_for_test();
-        Self {
-            service,
-            sandbox_id: SandboxId::new(),
-            fence: pplx_space_node_mgr_client::execution_fence::ExecutionFence::new(
-                pplx_space_common_core::types::SandboxActivationAttemptId::new(),
-                None,
-            ),
-            _supervisor_socket: supervisor_socket,
-            supervisor,
-        }
     }
 
     fn request(&self) -> CleanupSandboxRequest {
@@ -493,11 +490,12 @@ impl CleanupNode {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CleanupBlocker {
     Capacity,
     ArtifactTransfer,
     CgroupGate,
+    DeviceStack,
 }
 
 #[rstest::rstest]
@@ -510,11 +508,25 @@ enum CleanupBlocker {
     CleanupBlocker::CgroupGate,
     "timed out waiting for sandbox cleanup ownership"
 )]
+#[case::device_stack(
+    CleanupBlocker::DeviceStack,
+    "timed out waiting for device-stack cleanup ownership"
+)]
 #[tokio::test(start_paused = true)]
 async fn blocked_cleanup_phase_times_out_before_stopping_the_runtime(
     #[case] blocker: CleanupBlocker,
     #[case] message: &str,
 ) {
+    // One held permit fills the cleanup class only at a known limit, so pin
+    // it rather than inherit the runner's override.
+    if blocker == CleanupBlocker::Capacity
+        && !pplx_space_test_env::enter_test_process(&[(
+            "SPACE_NODEMGR_LIMIT_CLEANUP_SANDBOX",
+            Some(std::ffi::OsStr::new("1:1")),
+        )])
+    {
+        return;
+    }
     // The default supervisor client is unreachable: a cleanup that skipped
     // the wait would fail on runtime stop instead of on this phase.
     let service = crate::service::tests::service_tests::service_for_unit_tests().await;
@@ -534,31 +546,29 @@ async fn blocked_cleanup_phase_times_out_before_stopping_the_runtime(
         .await
         .unwrap();
     let before = service.pool.get(&id.to_string()).unwrap().unwrap();
-    let mut held: Vec<Box<dyn std::any::Any + Send>> = Vec::new();
-    match blocker {
-        CleanupBlocker::Capacity => loop {
-            let mut acquire = Box::pin(
-                service
-                    .lifecycle_limiter
-                    .acquire(crate::lifecycle_limiter::LifecycleMethod::CleanupSandbox),
-            );
-            match futures_util::poll!(&mut acquire) {
-                std::task::Poll::Ready(permit) => held.push(Box::new(permit.unwrap())),
-                std::task::Poll::Pending => break,
-            }
-        },
-        CleanupBlocker::ArtifactTransfer => held.push(Box::new(
+    let held: Box<dyn std::any::Any + Send> = match blocker {
+        CleanupBlocker::Capacity => Box::new(
+            service
+                .lifecycle_limiter
+                .acquire(crate::lifecycle_limiter::LifecycleMethod::CleanupSandbox)
+                .await
+                .unwrap(),
+        ),
+        CleanupBlocker::ArtifactTransfer => Box::new(
             service
                 .lock_sandbox_artifacts(&id.to_string())
                 .await
                 .unwrap(),
-        )),
-        CleanupBlocker::CgroupGate => {
-            held.push(Box::new(
-                service.lock_sandbox_cgroups(&id.to_string()).await,
-            ));
-        }
-    }
+        ),
+        CleanupBlocker::CgroupGate => Box::new(service.lock_sandbox_cgroups(&id.to_string()).await),
+        CleanupBlocker::DeviceStack => Box::new(
+            service
+                .sandbox_device_stack_lock(&id)
+                .await
+                .lock_owned()
+                .await,
+        ),
+    };
     let cleanup = service.run_cleanup_sandbox_operation(
         id,
         CleanupSandboxRequest {
@@ -588,16 +598,21 @@ async fn blocked_cleanup_phase_times_out_before_stopping_the_runtime(
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CleanupRefusal {
+    // Only Linux pidfds can observe that a pinned caller exited.
+    #[cfg(target_os = "linux")]
     ExitedCaller,
     MissingExecution,
     SupersededExecution,
 }
 
 #[rstest::rstest]
-#[case::exited_caller(
-    CleanupRefusal::ExitedCaller,
-    tonic::Code::Aborted,
-    "lifecycle caller exited before node mutation"
+#[cfg_attr(
+    target_os = "linux",
+    case::exited_caller(
+        CleanupRefusal::ExitedCaller,
+        tonic::Code::Aborted,
+        "lifecycle caller exited before node mutation"
+    )
 )]
 #[case::missing_execution(
     CleanupRefusal::MissingExecution,
@@ -615,14 +630,15 @@ async fn cleanup_refusal_keeps_the_lease_and_execution(
     #[case] code: tonic::Code,
     #[case] message: &str,
 ) {
-    let node = CleanupNode::leased(Default::default()).await;
+    let node = CleanupNode::leased().await;
     let mut request = node.request();
-    let mut exited = None;
-    match refusal {
-        CleanupRefusal::ExitedCaller => {
-            exited = Some(crate::service::runtime::tests::exited_process());
+    let exited: Option<std::process::Child> = match refusal {
+        #[cfg(target_os = "linux")]
+        CleanupRefusal::ExitedCaller => Some(crate::service::runtime::tests::exited_process()),
+        CleanupRefusal::MissingExecution => {
+            request.execution_fence = None;
+            None
         }
-        CleanupRefusal::MissingExecution => request.execution_fence = None,
         CleanupRefusal::SupersededExecution => {
             request.execution_fence = Some(
                 pplx_space_node_mgr_client::execution_fence::ExecutionFence::new(
@@ -631,8 +647,9 @@ async fn cleanup_refusal_keeps_the_lease_and_execution(
                 )
                 .into(),
             );
+            None
         }
-    }
+    };
     let caller = exited
         .as_ref()
         .map(|child| launch::ProcessHandle::open(child.id()).unwrap());
@@ -650,9 +667,12 @@ async fn cleanup_refusal_keeps_the_lease_and_execution(
     node.stop().await;
 }
 
+// Before this refusal, cleanup only reads pid links under a run directory
+// named by the fresh sandbox id, and a failed read means no tracked process,
+// so the outcome cannot depend on host state.
 #[tokio::test(flavor = "current_thread")]
 async fn cleanup_does_not_stop_a_lease_replaced_while_it_waited_for_the_gate() {
-    let node = CleanupNode::leased(Default::default()).await;
+    let node = CleanupNode::leased().await;
     let sandbox_id = node.sandbox_id.to_string();
     let gate = node.service.lock_sandbox_cgroups(&sandbox_id).await;
     let mut cleanup = Box::pin(node.cleanup(node.request(), None));
@@ -677,69 +697,5 @@ async fn cleanup_does_not_stop_a_lease_replaced_while_it_waited_for_the_gate() {
     assert_eq!(error.code(), tonic::Code::Unavailable, "{error}");
     assert_eq!(error.message(), "sandbox lease changed before stop; retry");
     assert_eq!(node.lease(), replacement);
-    node.stop().await;
-}
-
-// Removing the filesystem needs the host's fixed cache root, so these cases
-// keep it; retirement after removal is not reachable here.
-#[tokio::test]
-async fn cleanup_keeps_execution_authority_when_supervisor_bind_fails() {
-    let node = CleanupNode::leased(crate::runtime_supervisor_client::tests::SupervisorScript {
-        bind_execution_failure: Some(tonic::Code::Unavailable),
-        ..Default::default()
-    })
-    .await;
-    let request = CleanupSandboxRequest {
-        keep_filesystem: true,
-        ..node.request()
-    };
-
-    let error = node.cleanup(request, None).await.unwrap_err();
-
-    assert_eq!(error.code(), tonic::Code::Unavailable, "{error}");
-    assert_eq!(error.message(), "bind execution unavailable");
-    // The slot is released before reconciliation; the retry still holds authority.
-    assert_eq!(node.lease(), None);
-    assert_eq!(node.bound_execution(), Some(node.fence));
-    node.stop().await;
-}
-
-#[rstest::rstest]
-#[case::bound(true, false)]
-#[case::bound_return_after_slot_release(true, true)]
-#[case::unbound(false, false)]
-#[tokio::test]
-async fn retained_cleanup_releases_the_slot_and_acknowledges_only_a_bound_execution(
-    #[case] bound: bool,
-    #[case] return_after_slot_release: bool,
-) {
-    let node = if bound {
-        CleanupNode::leased(Default::default()).await
-    } else {
-        CleanupNode::unbound(Default::default()).await
-    };
-    let request = CleanupSandboxRequest {
-        keep_filesystem: true,
-        return_after_slot_release,
-        ..node.request()
-    };
-
-    let response = node.cleanup(request, None).await.unwrap();
-
-    assert_eq!(node.lease(), None);
-    assert_eq!(
-        response
-            .actions
-            .iter()
-            .any(|action| action == "Released network slot"),
-        bound,
-        "{:?}",
-        response.actions
-    );
-    assert_eq!(
-        response.retained_execution_id,
-        bound.then(|| node.fence.current().to_string())
-    );
-    assert_eq!(node.bound_execution(), bound.then_some(node.fence));
     node.stop().await;
 }

@@ -67,6 +67,7 @@ rtnetlink = { workspace = true }
 pplx-space-common-core = { workspace = true, features = ["test-hooks"] }
 insta = { workspace = true, features = ["json"] }
 rstest = { workspace = true }
+pplx-space-test-env = { workspace = true }
 # test-capture lets the encrypted-volume tests assert which BYOK counters a
 # code path emitted, so the attempted/failed pairing is enforced rather than
 # reviewed.

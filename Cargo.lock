@@ -6271,6 +6271,7 @@ dependencies = [
  "pplx-space-node-mgr-client",
  "pplx-space-node-runtime-core",
  "pplx-space-observability",
+ "pplx-space-test-env",
  "reqwest 0.13.5",
  "rstest",
  "rtnetlink",
