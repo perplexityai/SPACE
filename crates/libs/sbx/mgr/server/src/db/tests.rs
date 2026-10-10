@@ -8077,6 +8077,7 @@ const DB_MODULE_SOURCE: &str = concat!(
     include_str!("network_policy.rs"),
     include_str!("pool.rs"),
     include_str!("quarantine.rs"),
+    include_str!("quarantine_recovery.rs"),
     include_str!("restore_transfer_scopes.rs"),
     include_str!("teardown_suspend.rs")
 );
