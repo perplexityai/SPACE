@@ -1675,3 +1675,780 @@ async fn teardown_suspend_pause_failure_recovery_allows_same_generation_retry() 
         );
     }
 }
+
+/// A service whose host-facing collaborators are test-owned: runtime liveness
+/// is fixed, the host-control and credential sockets are absent paths under
+/// `sockets`, and the node identity is supplied instead of read from the host.
+fn suspend_test_service(
+    conn: rusqlite::Connection,
+    runtime_live: bool,
+    sockets: &std::path::Path,
+) -> SandboxManagerService {
+    SandboxManagerService::new_with_options(
+        conn,
+        crate::service::SandboxManagerServiceOptions {
+            host_control_socket_path: sockets.join("absent-host-control.sock"),
+            credential_manager_socket_path: sockets.join("absent-credential-manager.sock"),
+            sandbox_runtime_live: std::sync::Arc::new(move |_| runtime_live),
+            shutdown_token: tokio_util::sync::CancellationToken::new(),
+            task_tracker: tokio_util::task::TaskTracker::new(),
+            local_node_id: Some(pplx_space_common_core::types::NodeId::from_uuid(
+                uuid::Uuid::parse_str("019f8000-0000-7000-8000-0000000000fe").unwrap(),
+            )),
+            node_role: None,
+            node_managed_by: None,
+            route_ed25519_verification_bundle: None,
+        },
+    )
+}
+
+fn stored_sandbox(service: &SandboxManagerService, id: &str) -> Option<crate::db::SandboxRow> {
+    let db = service.db.lock().unwrap();
+    crate::db::get_sandbox(&db, id).unwrap()
+}
+
+/// Suspend admission skips its plaintext-COW probe, which inspects the host
+/// cache directory, for a sandbox with an encrypted volume.
+fn insert_encrypted_test_sandbox(conn: &rusqlite::Connection, id: &str, state: SandboxState) {
+    crate::service::tests::service_tests::insert_test_sandbox(conn, id, state);
+    conn.execute(
+        "UPDATE sandboxes SET volume_encryption = 1 WHERE id = ?1",
+        [id],
+    )
+    .unwrap();
+}
+
+async fn drain_service_tasks(service: &SandboxManagerService) {
+    service.shutdown_token.cancel();
+    service.task_tracker.close();
+    service.task_tracker.wait().await;
+}
+
+/// Node-manager peer that confirms every `PauseSandbox` call and records it.
+/// Any other node-manager method is refused, so the test fails instead of
+/// reaching unexpected node work.
+#[derive(Clone, Default)]
+struct PauseConfirmingNodeManager {
+    requests: std::sync::Arc<
+        std::sync::Mutex<Vec<pplx_space_node_mgr_client::proto::PauseSandboxRequest>>,
+    >,
+}
+
+impl tonic::server::NamedService for PauseConfirmingNodeManager {
+    const NAME: &'static str = "space.node.v1.NodeManager";
+}
+
+struct ConfirmPause(
+    std::sync::Arc<std::sync::Mutex<Vec<pplx_space_node_mgr_client::proto::PauseSandboxRequest>>>,
+);
+
+impl tonic::server::UnaryService<pplx_space_node_mgr_client::proto::PauseSandboxRequest>
+    for ConfirmPause
+{
+    type Response = pplx_space_node_mgr_client::proto::PauseSandboxResponse;
+    type Future = std::future::Ready<Result<tonic::Response<Self::Response>, Status>>;
+
+    fn call(
+        &mut self,
+        request: tonic::Request<pplx_space_node_mgr_client::proto::PauseSandboxRequest>,
+    ) -> Self::Future {
+        self.0.lock().unwrap().push(request.into_inner());
+        std::future::ready(Ok(tonic::Response::new(
+            pplx_space_node_mgr_client::proto::PauseSandboxResponse {},
+        )))
+    }
+}
+
+impl<B> tower::Service<http::Request<B>> for PauseConfirmingNodeManager
+where
+    B: http_body::Body + Send + 'static,
+    B::Error: Into<tonic::codegen::StdError> + Send + 'static,
+{
+    type Response = http::Response<tonic::body::Body>;
+    type Error = std::convert::Infallible;
+    type Future = futures_util::future::BoxFuture<'static, Result<Self::Response, Self::Error>>;
+
+    fn poll_ready(
+        &mut self,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, request: http::Request<B>) -> Self::Future {
+        if request.uri().path() != "/space.node.v1.NodeManager/PauseSandbox" {
+            let refused = Status::unimplemented(format!(
+                "unexpected node-manager call {}",
+                request.uri().path()
+            ));
+            return Box::pin(std::future::ready(Ok(refused.into_http())));
+        }
+        let requests = std::sync::Arc::clone(&self.requests);
+        Box::pin(async move {
+            let mut grpc = tonic::server::Grpc::new(tonic_prost::ProstCodec::default());
+            Ok(grpc.unary(ConfirmPause(requests), request).await)
+        })
+    }
+}
+
+#[tokio::test]
+async fn confirmed_node_pause_reports_paused_and_leaves_the_state_write_to_the_caller() {
+    use crate::service::tests::service_tests::insert_test_sandbox;
+    use pplx_space_node_mgr_client::proto::{ExecutionFence, PauseSandboxRequest};
+
+    let sandbox_id = SandboxId::new();
+    let id = sandbox_id.to_string();
+    let conn = crate::db::test_conn();
+    insert_test_sandbox(&conn, &id, SandboxState::Pausing);
+    let db = std::sync::Arc::new(std::sync::Mutex::new(conn));
+
+    let node_manager = PauseConfirmingNodeManager::default();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let stop = tokio_util::sync::CancellationToken::new();
+    let server = tokio::spawn(
+        tonic::transport::Server::builder()
+            .add_service(node_manager.clone())
+            .serve_with_incoming_shutdown(
+                tokio_stream::wrappers::TcpListenerStream::new(listener),
+                stop.clone().cancelled_owned(),
+            ),
+    );
+    let channel = tonic::transport::Endpoint::from_shared(format!("http://{address}"))
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+    let mut client = pplx_space_node_mgr_client::NodeManagerGrpcClient::new(
+        pplx_space_common_svc::bootstrap::wrap_grpc_client_channel(channel),
+    );
+    let fence = ExecutionFence {
+        execution_id: uuid::Uuid::now_v7().to_string(),
+        previous_id: None,
+    };
+
+    let state = super::pause_with_reconciliation(
+        &mut client,
+        Some(fence.clone()),
+        &db,
+        &sandbox_id,
+        "pause failed",
+        GuestSnapshotPreparationBudget::Standard,
+    )
+    .await;
+
+    stop.cancel();
+    server.await.unwrap().unwrap();
+    assert_eq!(state, SandboxState::Paused);
+    // The node call carries the caller's execution fence so node-manager can
+    // refuse a pause aimed at a replaced execution.
+    assert_eq!(
+        *node_manager.requests.lock().unwrap(),
+        [PauseSandboxRequest {
+            sandbox_id: id.clone(),
+            execution_fence: Some(fence),
+        }]
+    );
+    let db = db.lock().unwrap();
+    assert_eq!(
+        crate::db::get_sandbox(&db, &id).unwrap().unwrap().state,
+        SandboxState::Pausing,
+        "the caller persists Paused after the confirmed pause"
+    );
+}
+
+#[tokio::test]
+async fn pause_refuses_rows_that_cannot_enter_pausing_before_writing_state() {
+    use crate::service::activation_support::internal_request;
+    use crate::service::tests::service_tests::insert_test_sandbox;
+
+    let sockets = tempfile::tempdir().unwrap();
+    for state in SandboxState::all()
+        .into_iter()
+        .filter(|state| *state != SandboxState::Started)
+    {
+        let conn = crate::db::test_conn();
+        let id = SandboxId::new().to_string();
+        insert_test_sandbox(&conn, &id, state);
+        let service = suspend_test_service(conn, false, sockets.path());
+
+        let error = service
+            .pause(internal_request(
+                pplx_space_sbx_mgr_client::proto::PauseRequest {
+                    sandbox_id: id.clone(),
+                },
+            ))
+            .await
+            .expect_err("only a started sandbox can pause");
+
+        // A transient state is another operation in flight: retryable.
+        let expected = if state.is_transient() {
+            tonic::Code::Unavailable
+        } else {
+            tonic::Code::FailedPrecondition
+        };
+        assert_eq!(error.code(), expected, "{state:?}");
+        assert_eq!(
+            stored_sandbox(&service, &id).unwrap().state,
+            state,
+            "a refused pause must not write state ({state:?})"
+        );
+        drain_service_tasks(&service).await;
+    }
+}
+
+#[tokio::test]
+async fn suspend_refuses_rows_that_are_neither_started_nor_paused() {
+    use crate::service::activation_support::internal_request;
+    use pplx_space_common_core::node_drain_signals::SUSPEND_SANDBOX_FAILED_MARKER;
+
+    let sockets = tempfile::tempdir().unwrap();
+    for state in SandboxState::all()
+        .into_iter()
+        .filter(|state| !matches!(state, SandboxState::Started | SandboxState::Paused))
+    {
+        let conn = crate::db::test_conn();
+        let id = SandboxId::new().to_string();
+        insert_encrypted_test_sandbox(&conn, &id, state);
+        let service = suspend_test_service(conn, false, sockets.path());
+
+        let error = service
+            .suspend(internal_request(
+                pplx_space_sbx_mgr_client::proto::SuspendRequest {
+                    sandbox_id: id.clone(),
+                    blocking: true,
+                    format: SuspendSnapshotFormat::Unspecified as i32,
+                },
+            ))
+            .await
+            .expect_err("only a started or paused sandbox can suspend");
+
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition, "{state:?}");
+        // Node drain gives up on a failed sandbox only when it sees this marker.
+        assert_eq!(
+            error.message().contains(SUSPEND_SANDBOX_FAILED_MARKER),
+            state == SandboxState::Failed,
+            "{state:?}: {}",
+            error.message()
+        );
+        let row = stored_sandbox(&service, &id).unwrap();
+        assert_eq!(row.state, state, "a refused suspend must not write state");
+        assert!(matches!(
+            service.try_cleanup_fence(&id),
+            crate::service::cleanup_support::CleanupLockTryResult::Acquired(_)
+        ));
+        drain_service_tasks(&service).await;
+    }
+}
+
+#[tokio::test]
+async fn paused_suspend_admission_requires_a_free_row_and_the_owning_generation() {
+    use crate::service::cleanup_support::CleanupLockTryResult;
+    use pplx_space_common_core::types::ExecutionGeneration;
+
+    enum Admission {
+        NodeLocal,
+        Teardown(i64),
+    }
+    let running_generation = ExecutionGeneration::new(7).unwrap();
+    let sockets = tempfile::tempdir().unwrap();
+    for (case, admission, cleanup_intent, admitted) in [
+        (
+            "a persisted cleanup intent owns the row",
+            Admission::NodeLocal,
+            true,
+            false,
+        ),
+        (
+            "an older generation no longer owns the runtime",
+            Admission::Teardown(6),
+            false,
+            false,
+        ),
+        (
+            "the running generation suspends",
+            Admission::Teardown(7),
+            false,
+            true,
+        ),
+    ] {
+        let conn = crate::db::test_conn();
+        let id = SandboxId::new().to_string();
+        insert_encrypted_test_sandbox(&conn, &id, SandboxState::Paused);
+        if cleanup_intent {
+            assert!(
+                crate::db::set_cleanup_intent(
+                    &conn,
+                    &id,
+                    false,
+                    crate::db::CleanupCompletion::DeleteRow
+                )
+                .unwrap()
+            );
+        }
+        let context = match admission {
+            Admission::NodeLocal => SuspendRequestContext::new(id.clone(), true, 0, true, None),
+            Admission::Teardown(generation) => {
+                crate::db::begin_teardown_suspend_operation(&conn, &id, running_generation)
+                    .unwrap();
+                SuspendRequestContext::for_teardown(
+                    id.clone(),
+                    ExecutionGeneration::new(generation).unwrap(),
+                )
+            }
+        };
+        let service = suspend_test_service(conn, false, sockets.path());
+        let wake = service.auto_lifecycle.wake_lock(&id).lock_owned().await;
+        let artifact = service.auto_lifecycle.artifact_lock(&id).lock_owned().await;
+
+        let result = service
+            .prepare_suspend_snapshot_publication_after_locks(&context, &wake, &artifact)
+            .await;
+
+        let row = stored_sandbox(&service, &id).unwrap();
+        match result {
+            Ok((local_artifact_id, publication)) => {
+                assert!(admitted, "{case}");
+                local_artifact_id.parse::<LocalArtifactId>().unwrap();
+                assert_eq!(row.state, SandboxState::Suspending, "{case}");
+                let operation = {
+                    let db = service.db.lock().unwrap();
+                    crate::db::latest_teardown_suspend_operation(&db, &id)
+                        .unwrap()
+                        .unwrap()
+                };
+                assert_eq!(operation.execution_generation, running_generation);
+                assert_eq!(
+                    operation.status,
+                    crate::db::TeardownSuspendOperationStatus::Running,
+                    "{case}"
+                );
+                drop(publication);
+            }
+            Err(error) => {
+                assert!(!admitted, "{case}: {error:?}");
+                assert_eq!(error.code(), tonic::Code::Aborted, "{case}");
+                assert_eq!(row.state, SandboxState::Paused, "{case}");
+                assert_eq!(
+                    row.cleanup_completion,
+                    cleanup_intent.then_some(crate::db::CleanupCompletion::DeleteRow),
+                    "{case}"
+                );
+                assert!(matches!(
+                    service.try_cleanup_fence(&id),
+                    CleanupLockTryResult::Acquired(_)
+                ));
+            }
+        }
+        drop((wake, artifact));
+        drain_service_tasks(&service).await;
+    }
+}
+
+#[tokio::test]
+async fn suspend_completion_refuses_a_superseded_row_before_runtime_cleanup() {
+    use crate::service::cleanup_support::CleanupLockTryResult;
+    use crate::service::tests::service_tests::insert_test_sandbox;
+    use pplx_space_common_core::types::{ExecutionGeneration, SpaceApiRouteIdentity};
+
+    #[derive(Debug)]
+    enum Supersession {
+        CleanupActive,
+        Deleted,
+        RolledBackToPaused,
+        RecreatedRuntimeLabel,
+        NewerExecution,
+    }
+    let sockets = tempfile::tempdir().unwrap();
+    for (supersession, expected) in [
+        (Supersession::CleanupActive, tonic::Code::Unavailable),
+        (Supersession::Deleted, tonic::Code::NotFound),
+        (Supersession::RolledBackToPaused, tonic::Code::Aborted),
+        (Supersession::RecreatedRuntimeLabel, tonic::Code::Aborted),
+        (Supersession::NewerExecution, tonic::Code::Aborted),
+    ] {
+        let conn = crate::db::test_conn();
+        let sandbox_id = SandboxId::new();
+        let id = sandbox_id.to_string();
+        insert_test_sandbox(&conn, &id, SandboxState::Paused);
+        let route_identity = |generation| SpaceApiRouteIdentity {
+            execution_generation: Some(ExecutionGeneration::new(generation).unwrap()),
+            ..Default::default()
+        };
+        crate::db::update_space_api_route_identity(
+            &conn,
+            sandbox_id,
+            &route_identity(7),
+            crate::auto_lifecycle_delete_receipts::RouteIdentityProvenance::Unfenced,
+        )
+        .unwrap();
+        assert!(crate::db::begin_suspend(&conn, &id).unwrap());
+        let mut captured = crate::db::get_sandbox(&conn, &id).unwrap().unwrap();
+        match supersession {
+            Supersession::CleanupActive => {}
+            Supersession::Deleted => {
+                crate::db::update_state(&conn, &id, SandboxState::Deleting)
+                    .unwrap()
+                    .require_applied()
+                    .unwrap();
+                commit_sandbox_delete(&conn, &id);
+                assert!(crate::db::get_sandbox(&conn, &id).unwrap().is_none());
+            }
+            Supersession::RolledBackToPaused => {
+                assert!(crate::db::rollback_suspending_to_paused(&conn, &id).unwrap());
+            }
+            Supersession::RecreatedRuntimeLabel => {
+                captured.uuid8 = SandboxRuntimeLabel::parse("stale001").unwrap();
+            }
+            Supersession::NewerExecution => {
+                // A newer execution suspended again after this attempt rolled back.
+                assert!(crate::db::rollback_suspending_to_paused(&conn, &id).unwrap());
+                crate::db::update_space_api_route_identity(
+                    &conn,
+                    sandbox_id,
+                    &route_identity(8),
+                    crate::auto_lifecycle_delete_receipts::RouteIdentityProvenance::Unfenced,
+                )
+                .unwrap();
+                assert!(crate::db::begin_suspend(&conn, &id).unwrap());
+            }
+        }
+        let before = crate::db::get_sandbox(&conn, &id).unwrap();
+        let service = suspend_test_service(conn, false, sockets.path());
+        // Fail closed if a guard regresses: with shutdown begun, runtime
+        // cleanup is never dispatched to node-manager.
+        service.shutdown_token.cancel();
+        let held_fence = match supersession {
+            Supersession::CleanupActive => match service.try_cleanup_fence(&id) {
+                CleanupLockTryResult::Acquired(fence) => Some(fence),
+                CleanupLockTryResult::Busy => panic!("fence is free"),
+            },
+            _ => None,
+        };
+        let snapshot_dir = sockets.path().join(&id).join("snapshot");
+
+        let error = service
+            .finalize_suspended_runtime(
+                &captured,
+                LocalArtifactId::new(),
+                &snapshot_dir.to_string_lossy(),
+                None,
+                None,
+            )
+            .await
+            .expect_err("a superseded completion must not tear down the runtime");
+
+        assert_eq!(error.code(), expected, "{supersession:?}");
+        let after = stored_sandbox(&service, &id);
+        assert_eq!(
+            after
+                .as_ref()
+                .map(|row| (row.state, row.cleanup_completion)),
+            before
+                .as_ref()
+                .map(|row| (row.state, row.cleanup_completion)),
+            "a refused completion must not change the row ({supersession:?})"
+        );
+        drop(held_fence);
+        drain_service_tasks(&service).await;
+    }
+}
+
+#[tokio::test]
+async fn suspend_publication_failure_reports_how_it_persisted() {
+    use super::suspend_snapshot::SuspendSnapshotPublicationFailurePersistence as Persistence;
+    use crate::service::tests::service_tests::insert_test_sandbox;
+
+    let reject_state = |conn: &rusqlite::Connection, state: SandboxState| {
+        conn.execute_batch(&format!(
+            "CREATE TRIGGER reject_{state} BEFORE UPDATE OF state ON sandboxes
+             WHEN NEW.state = '{state}'
+             BEGIN SELECT RAISE(ABORT, 'synthetic storage failure'); END"
+        ))
+        .unwrap();
+    };
+    let sockets = tempfile::tempdir().unwrap();
+    for (case, runtime_live, state, rejected, expected, final_state) in [
+        (
+            "a live rollback lost to another transition",
+            true,
+            SandboxState::Paused,
+            &[][..],
+            Persistence::StateChanged,
+            SandboxState::Paused,
+        ),
+        (
+            "a live runtime whose rollback cannot persist is quarantined",
+            true,
+            SandboxState::Suspending,
+            &[SandboxState::Paused][..],
+            Persistence::Quarantined,
+            SandboxState::Quarantined,
+        ),
+        (
+            "a quarantine that cannot persist",
+            false,
+            SandboxState::Suspending,
+            &[SandboxState::Quarantined][..],
+            Persistence::PersistFailed,
+            SandboxState::Suspending,
+        ),
+        (
+            "neither rollback nor quarantine persists",
+            true,
+            SandboxState::Suspending,
+            &[SandboxState::Paused, SandboxState::Quarantined][..],
+            Persistence::PersistFailed,
+            SandboxState::Suspending,
+        ),
+    ] {
+        let conn = crate::db::test_conn();
+        let id = SandboxId::new().to_string();
+        insert_test_sandbox(&conn, &id, state);
+        for rejected in rejected {
+            reject_state(&conn, *rejected);
+        }
+        let service = suspend_test_service(conn, runtime_live, sockets.path());
+
+        let persisted =
+            service.record_suspend_snapshot_publication_failure_after_begin(&id, "capture failed");
+
+        assert_eq!(persisted, expected, "{case}");
+        assert_eq!(
+            stored_sandbox(&service, &id).unwrap().state,
+            final_state,
+            "{case}"
+        );
+        drain_service_tasks(&service).await;
+    }
+}
+
+#[tokio::test]
+async fn suspend_publication_failure_after_staging_preserves_only_owned_evidence() {
+    use super::SuspendSnapshotStagingDisposition as Disposition;
+    use crate::service::suspend_snapshot_publication::{
+        suspend_snapshot_staging_dir, suspend_snapshot_staging_parent_dir,
+    };
+    use crate::service::tests::service_tests::insert_test_sandbox;
+
+    #[derive(Debug)]
+    enum Row {
+        Absent,
+        At(SandboxState),
+        /// A row whose stored policy document this build cannot decode.
+        Undecodable,
+    }
+    #[derive(Debug)]
+    enum Disk {
+        Empty,
+        CompleteCurrentStaging,
+        /// The staging parent cannot be listed.
+        UnlistableStaging,
+    }
+    for (case, runtime_live, row, disk, unreadable_journal, expected, final_state) in [
+        (
+            "a live runtime rolls back to paused",
+            true,
+            Row::At(SandboxState::Suspending),
+            Disk::CompleteCurrentStaging,
+            false,
+            Disposition::Cleanup,
+            Some(SandboxState::Paused),
+        ),
+        (
+            "another transition already moved the row",
+            false,
+            Row::At(SandboxState::Paused),
+            Disk::CompleteCurrentStaging,
+            false,
+            Disposition::Cleanup,
+            Some(SandboxState::Paused),
+        ),
+        (
+            "the sandbox was deleted",
+            false,
+            Row::Absent,
+            Disk::CompleteCurrentStaging,
+            false,
+            Disposition::Cleanup,
+            None,
+        ),
+        (
+            "an unreadable row keeps existing staging",
+            false,
+            Row::Undecodable,
+            Disk::CompleteCurrentStaging,
+            false,
+            Disposition::Preserve,
+            None,
+        ),
+        (
+            "an unreadable row with no staging",
+            false,
+            Row::Undecodable,
+            Disk::Empty,
+            false,
+            Disposition::Cleanup,
+            None,
+        ),
+        (
+            "unlistable staging is quarantined",
+            false,
+            Row::At(SandboxState::Suspending),
+            Disk::UnlistableStaging,
+            false,
+            Disposition::Cleanup,
+            Some(SandboxState::Quarantined),
+        ),
+        (
+            "no usable artifact is quarantined",
+            false,
+            Row::At(SandboxState::Suspending),
+            Disk::Empty,
+            false,
+            Disposition::Cleanup,
+            Some(SandboxState::Quarantined),
+        ),
+        (
+            "an unprovable durability mode keeps the complete capture",
+            false,
+            Row::At(SandboxState::Suspending),
+            Disk::CompleteCurrentStaging,
+            true,
+            Disposition::Preserve,
+            Some(SandboxState::Suspending),
+        ),
+    ] {
+        let conn = crate::db::test_conn();
+        let id = SandboxId::new().to_string();
+        match row {
+            Row::Absent => {}
+            Row::At(state) => insert_test_sandbox(&conn, &id, state),
+            Row::Undecodable => {
+                insert_test_sandbox(&conn, &id, SandboxState::Suspending);
+                conn.execute(
+                    "UPDATE sandboxes SET auto_lifecycle_json = 'undecodable' WHERE id = ?1",
+                    [&id],
+                )
+                .unwrap();
+            }
+        }
+        if unreadable_journal {
+            conn.execute(
+                "INSERT INTO jobs (job_id, kind, subject_id, payload)
+                 VALUES (?1, 'teardown_suspend', ?2, 'malformed')",
+                rusqlite::params![uuid::Uuid::now_v7().to_string(), id],
+            )
+            .unwrap();
+        }
+        let cache = tempfile::tempdir().unwrap();
+        let sandbox_dir = cache.path().join(&id);
+        let local_artifact_id = LocalArtifactId::new();
+        let staging_dir = suspend_snapshot_staging_dir(&sandbox_dir, local_artifact_id);
+        match disk {
+            Disk::Empty => {}
+            Disk::CompleteCurrentStaging => {
+                write_full_suspend_artifact(&staging_dir, &id, local_artifact_id, b"capture");
+            }
+            Disk::UnlistableStaging => {
+                std::fs::create_dir_all(&sandbox_dir).unwrap();
+                std::fs::write(suspend_snapshot_staging_parent_dir(&sandbox_dir), b"").unwrap();
+            }
+        }
+        let service = suspend_test_service(conn, runtime_live, cache.path());
+
+        let disposition = service.record_suspend_snapshot_publication_failure_after_staging(
+            &id,
+            &sandbox_dir,
+            &staging_dir,
+            "publish failed",
+        );
+
+        assert_eq!(disposition, expected, "{case}");
+        if matches!(row, Row::Undecodable) {
+            let raw_state: String = service
+                .db
+                .lock()
+                .unwrap()
+                .query_row("SELECT state FROM sandboxes WHERE id = ?1", [&id], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(raw_state, SandboxState::Suspending.as_str(), "{case}");
+        } else {
+            assert_eq!(
+                stored_sandbox(&service, &id).map(|row| row.state),
+                final_state,
+                "{case}"
+            );
+        }
+        if matches!(disk, Disk::CompleteCurrentStaging) {
+            // Removal is the caller's job, on a Cleanup disposition.
+            assert!(staging_dir.exists(), "{case}");
+        }
+        drain_service_tasks(&service).await;
+    }
+}
+
+#[tokio::test]
+async fn teardown_suspend_driver_completes_a_generation_whose_artifact_is_already_durable() {
+    use crate::service::tests::service_tests::insert_test_sandbox;
+    use pplx_space_common_core::types::ExecutionGeneration;
+
+    let conn = crate::db::test_conn();
+    let sandbox_id = SandboxId::new();
+    let id = sandbox_id.to_string();
+    let generation = ExecutionGeneration::new(7).unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let snapshot_dir = cache.path().join(&id).join("snapshot");
+    let snapshot_dir = snapshot_dir.to_string_lossy();
+    let local_artifact_id = LocalArtifactId::new();
+    insert_test_sandbox(&conn, &id, SandboxState::Paused);
+    crate::db::begin_teardown_suspend(&conn, &id, generation).unwrap();
+    crate::db::stage_teardown_suspend_artifact(
+        &conn,
+        &id,
+        generation,
+        local_artifact_id,
+        &snapshot_dir,
+    )
+    .unwrap();
+    crate::db::mark_local_artifact_backup_completed(&conn, &local_artifact_id.to_string()).unwrap();
+    crate::db::complete_row_intent_cleanup(
+        &conn,
+        &id,
+        crate::db::CleanupCompletion::MarkSuspended,
+        Some((local_artifact_id, &snapshot_dir)),
+    )
+    .unwrap();
+    let service = suspend_test_service(conn, false, cache.path());
+
+    // The second pass observes the completed operation and changes nothing.
+    for pass in ["ready", "durable"] {
+        service
+            .drive_teardown_suspend(sandbox_id, generation, SandboxEventTrigger::System)
+            .await
+            .unwrap_or_else(|error| panic!("{pass}: {error:?}"));
+
+        let operation = {
+            let db = service.db.lock().unwrap();
+            crate::db::latest_teardown_suspend_operation(&db, &id)
+                .unwrap()
+                .unwrap()
+        };
+        assert_eq!(
+            operation.status,
+            crate::db::TeardownSuspendOperationStatus::Completed,
+            "{pass}"
+        );
+        assert_eq!(
+            operation.published_artifact_id,
+            Some(local_artifact_id),
+            "{pass}"
+        );
+        let row = stored_sandbox(&service, &id).unwrap();
+        assert_eq!(row.state, SandboxState::Suspended, "{pass}");
+        assert_eq!(row.current_local_artifact_id, Some(local_artifact_id));
+    }
+    drain_service_tasks(&service).await;
+}
