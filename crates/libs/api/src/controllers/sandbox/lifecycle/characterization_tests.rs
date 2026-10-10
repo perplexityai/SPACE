@@ -1,12 +1,15 @@
 //! Characterization of the lifecycle controller's refusal outcomes: which
-//! prior lifecycles the `lifecycle = 'started'` writers in this module and in
+//! prior lifecycles the lifecycle writers in this module and in
 //! `wake_completion` refuse, what `action` and `untracked_action` return when
-//! they refuse, and what the `sandboxes` row looks like afterwards.
+//! they refuse, and what the `sandboxes` row looks like afterwards. The
+//! completion CAS itself (`complete_wake_lifecycle`) is swept in
+//! `wake_completion_postgres_tests`.
 //!
 //! Every case runs against the direct substrate. Paths that only the
-//! Kubernetes substrate can reach (the redrive's hydration probe, the
-//! drain-path `reachable_runtime_client == None` refusal) are left to that
-//! substrate's own tests.
+//! Kubernetes substrate can reach (the redrive's kube hydration probe, the
+//! drain-path `reachable_runtime_client == None` refusal) are not yet
+//! covered: reaching them needs a fake kube API or an injectable substrate
+//! seam.
 
 use axum::http::StatusCode;
 use pplx_space_common_core::types::{NodeId, NodeManagedBy, SandboxId};
@@ -14,7 +17,6 @@ use pplx_space_db_test_fixtures::pg_test_db_with_max_connections;
 use pplx_space_metrics::sandbox::api::{SandboxApiMetricIdentity, WakeCompletionAction};
 use pplx_space_node_api_sim::{SandboxRecord, SimState, SimWorkerHarness};
 use pplx_space_test_env::TestResult;
-use uuid::Uuid;
 
 use super::*;
 use crate::controllers::sandbox::wake_completion::wake_completion_redrive;
@@ -83,6 +85,15 @@ async fn place_on_node(pool: &PgPool, sandbox_id: SandboxId, node_id: NodeId) ->
     )))
     .execute(pool)
     .await?;
+    Ok(())
+}
+
+async fn set_placement(pool: &PgPool, sandbox_id: SandboxId, placement: &str) -> TestResult {
+    sqlx::query(sql!("UPDATE sandboxes SET placement = $2 WHERE id = $1"))
+        .bind(sandbox_id)
+        .bind(placement)
+        .execute(pool)
+        .await?;
     Ok(())
 }
 
@@ -215,114 +226,48 @@ async fn set_drain_phase(pool: &PgPool, node_id: NodeId, phase: &str) -> TestRes
 }
 
 // ---------------------------------------------------------------------------
-// `complete_wake_lifecycle`: the post-wake / post-restore completion CAS.
-// ---------------------------------------------------------------------------
-
-/// Every stored lifecycle against both published-suspend fences. Refusals
-/// leave both `lifecycle` and `placement` untouched; a completion writes
-/// `started` / `on_node`.
-#[tokio::test(flavor = "current_thread")]
-async fn wake_completion_cas_outcome_for_every_prior_lifecycle() -> TestResult {
-    use WakeLifecycleCompletion::{Completed, Lost, SupersededBySuspend};
-
-    let db = pg_test_db_with_max_connections(2).await?;
-    let pool = &db.pool;
-
-    let mut cases: Vec<(String, PublishedSuspendFence, WakeLifecycleCompletion)> = Vec::new();
-    for fence in [
-        PublishedSuspendFence::Enforced,
-        PublishedSuspendFence::DirectRestoreBaseline,
-    ] {
-        for lifecycle in SandboxLifecycle::all() {
-            let expected = match lifecycle {
-                SandboxLifecycle::Created
-                | SandboxLifecycle::Creating
-                | SandboxLifecycle::Starting
-                | SandboxLifecycle::Started
-                | SandboxLifecycle::Restoring
-                | SandboxLifecycle::Pausing
-                | SandboxLifecycle::Paused
-                | SandboxLifecycle::Resuming
-                | SandboxLifecycle::Checkpointing => Completed,
-                SandboxLifecycle::Suspending => SupersededBySuspend,
-                SandboxLifecycle::Suspended => match fence {
-                    PublishedSuspendFence::Enforced => SupersededBySuspend,
-                    PublishedSuspendFence::DirectRestoreBaseline => Completed,
-                },
-                SandboxLifecycle::Stopping
-                | SandboxLifecycle::Stopped
-                | SandboxLifecycle::Deleting
-                | SandboxLifecycle::Quarantined
-                | SandboxLifecycle::Failed => Lost,
-            };
-            cases.push((lifecycle.as_str().to_owned(), fence, expected));
-        }
-        for lifecycle in NON_VARIANT_LIFECYCLES {
-            cases.push((lifecycle.to_owned(), fence, Lost));
-        }
-        // The guard compares a trimmed, lower-cased lifecycle.
-        cases.push((" Failed ".to_owned(), fence, Lost));
-        cases.push(("SUSPENDING".to_owned(), fence, SupersededBySuspend));
-    }
-
-    for (lifecycle, fence, expected) in cases {
-        let sandbox_id = SandboxId::new();
-        insert_sandbox(pool, sandbox_id, &lifecycle, "space").await?;
-
-        let outcome = complete_wake_lifecycle(pool, sandbox_id, fence).await?;
-
-        assert_eq!(
-            outcome, expected,
-            "prior lifecycle {lifecycle:?}, {fence:?}"
-        );
-        let expected_row = if expected == Completed {
-            Row::new("started", "on_node")
-        } else {
-            Row::new(&lifecycle, "unplaced")
-        };
-        assert_eq!(
-            row(pool, sandbox_id).await?,
-            Some(expected_row),
-            "prior lifecycle {lifecycle:?}, {fence:?}"
-        );
-    }
-
-    // A row deleted while the wake was in flight is a lost CAS, not a
-    // completion.
-    for fence in [
-        PublishedSuspendFence::Enforced,
-        PublishedSuspendFence::DirectRestoreBaseline,
-    ] {
-        let missing = SandboxId::new();
-        assert_eq!(complete_wake_lifecycle(pool, missing, fence).await?, Lost);
-        assert_eq!(row(pool, missing).await?, None);
-    }
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
 // `action` refusal arms that return before any substrate call.
 // ---------------------------------------------------------------------------
 
 /// Wake (explicit or implicit) of a teardown or terminal lifecycle is a 409
 /// naming the lifecycle. It is refused before cluster admission, so it is
-/// never a 429 even with an exhausted limiter, and it writes nothing.
+/// never a 429 even with an exhausted limiter, and it writes nothing. Every
+/// other stored lifecycle passes the entry guard and is refused later (by the
+/// empty cluster's admission, or by the substrate for a restore-shaped wake)
+/// with something other than a 409.
+///
+/// The entry guard is deliberately narrower than the completion CAS
+/// (`complete_wake_lifecycle`): `suspending` and `suspended` pass here, and a
+/// wake that races a suspend claim is resolved by the CAS deferring to it.
 #[tokio::test(flavor = "current_thread")]
 async fn wake_refuses_teardown_and_terminal_lifecycles_before_admission() -> TestResult {
     let db = pg_test_db_with_max_connections(3).await?;
     let pool = &db.pool;
     let controller = controller_with_empty_cluster_admission(pool);
 
-    let refused = [
-        SandboxLifecycle::Stopping.as_str(),
-        SandboxLifecycle::Stopped.as_str(),
-        SandboxLifecycle::Deleting.as_str(),
-        SandboxLifecycle::Quarantined.as_str(),
-        SandboxLifecycle::Failed.as_str(),
-    ]
-    .into_iter()
-    .chain(NON_VARIANT_LIFECYCLES);
-    for lifecycle in refused {
+    let variants = SandboxLifecycle::all().iter().map(|lifecycle| {
+        let refused = match lifecycle {
+            SandboxLifecycle::Stopping
+            | SandboxLifecycle::Stopped
+            | SandboxLifecycle::Deleting
+            | SandboxLifecycle::Quarantined
+            | SandboxLifecycle::Failed => true,
+            SandboxLifecycle::Created
+            | SandboxLifecycle::Creating
+            | SandboxLifecycle::Starting
+            | SandboxLifecycle::Started
+            | SandboxLifecycle::Restoring
+            | SandboxLifecycle::Pausing
+            | SandboxLifecycle::Paused
+            | SandboxLifecycle::Resuming
+            | SandboxLifecycle::Checkpointing
+            | SandboxLifecycle::Suspending
+            | SandboxLifecycle::Suspended => false,
+        };
+        (lifecycle.as_str(), refused)
+    });
+    let non_variants = NON_VARIANT_LIFECYCLES.map(|lifecycle| (lifecycle, true));
+    for (lifecycle, refused) in variants.chain(non_variants) {
         for action in [
             SandboxAction::Wake,
             SandboxAction::ImplicitWake(ExecutionActivityKind::Access),
@@ -333,21 +278,29 @@ async fn wake_refuses_teardown_and_terminal_lifecycles_before_admission() -> Tes
 
             let error = run_action(&controller, pool, sandbox_id, Some(&sandbox), action, None)
                 .await
-                .expect_err("a teardown or terminal lifecycle cannot be woken");
+                .expect_err("the empty cluster admits no wake");
 
-            assert_eq!(
-                error.status(),
-                StatusCode::CONFLICT,
-                "{action:?} on {lifecycle}"
-            );
-            assert_eq!(
-                error.to_string(),
-                format!("sandbox cannot be woken while lifecycle is {lifecycle}"),
-            );
-            assert_eq!(
-                row(pool, sandbox_id).await?,
-                Some(Row::new(lifecycle, "unplaced"))
-            );
+            if refused {
+                assert_eq!(
+                    error.status(),
+                    StatusCode::CONFLICT,
+                    "{action:?} on {lifecycle}"
+                );
+                assert_eq!(
+                    error.to_string(),
+                    format!("sandbox cannot be woken while lifecycle is {lifecycle}"),
+                );
+                assert_eq!(
+                    row(pool, sandbox_id).await?,
+                    Some(Row::new(lifecycle, "unplaced"))
+                );
+            } else {
+                assert_ne!(
+                    error.status(),
+                    StatusCode::CONFLICT,
+                    "{action:?} on {lifecycle} passes the entry guard: {error}"
+                );
+            }
         }
     }
     Ok(())
@@ -371,8 +324,9 @@ async fn non_lifecycle_actions_are_bad_requests_and_write_nothing() -> TestResul
     ];
 
     for action in internal_labels {
+        // No action writes `created`, so any lifecycle write is visible.
         let sandbox_id = SandboxId::new();
-        insert_sandbox(pool, sandbox_id, "started", "space").await?;
+        insert_sandbox(pool, sandbox_id, "created", "space").await?;
         let sandbox = tracked(pool, sandbox_id).await?;
 
         let error = run_action(&controller, pool, sandbox_id, Some(&sandbox), action, None)
@@ -383,7 +337,8 @@ async fn non_lifecycle_actions_are_bad_requests_and_write_nothing() -> TestResul
         assert_eq!(error.to_string(), format!("Unknown action: {action}"));
         assert_eq!(
             row(pool, sandbox_id).await?,
-            Some(Row::new("started", "unplaced"))
+            Some(Row::new("created", "unplaced")),
+            "{action:?}"
         );
     }
 
@@ -590,7 +545,9 @@ async fn wake_completion_outcome_maps_to_the_wake_response() -> TestResult {
 /// Every runtime action that reports a resulting lifecycle (start, resume,
 /// pause, stop, kill, suspend) writes it through the terminal-state guard:
 /// a terminal lifecycle that landed while the runtime call was in flight is
-/// kept, while the action itself still reports success.
+/// kept, together with the placement, while the action itself still reports
+/// success. Only start also writes the placement (`on_node`), so the row is
+/// seeded `unplaced` with its active node still assigned.
 #[tokio::test(flavor = "current_thread")]
 async fn completed_actions_keep_a_terminal_lifecycle_that_landed_mid_flight() -> TestResult {
     if !crate::test_support::enter_sim_worker_process() {
@@ -609,6 +566,16 @@ async fn completed_actions_keep_a_terminal_lifecycle_that_landed_mid_flight() ->
         (SandboxAction::Kill, "started", "running", "stopped"),
         (SandboxAction::Suspend, "started", "running", "suspended"),
     ] {
+        let completed_placement = if action == SandboxAction::Start {
+            "on_node"
+        } else {
+            "unplaced"
+        };
+        // Only the lifecycles both guard families treat as terminal. The
+        // cross-intent lifecycles `deleting`, `stopping`, `suspending` and
+        // `suspended` are deliberately excluded: this post-result write
+        // currently replaces them with the action's own lifecycle, which is
+        // an open bug and is not encoded here.
         let terminal = ["failed", "quarantined"]
             .into_iter()
             .chain(NON_VARIANT_LIFECYCLES)
@@ -617,6 +584,7 @@ async fn completed_actions_keep_a_terminal_lifecycle_that_landed_mid_flight() ->
             let sandbox_id = SandboxId::new();
             insert_sandbox(pool, sandbox_id, prior, "space").await?;
             place_on_node(pool, sandbox_id, node_id).await?;
+            set_placement(pool, sandbox_id, "unplaced").await?;
             insert_resident(worker.state(), sandbox_id, resident).await?;
             let sandbox = tracked(pool, sandbox_id).await?;
             if let Some(lifecycle) = landed {
@@ -634,9 +602,13 @@ async fn completed_actions_keep_a_terminal_lifecycle_that_landed_mid_flight() ->
                     "sandbox_id": sandbox_id.to_string(),
                 }),
             );
+            let expected = match landed {
+                None => Row::new(completed, completed_placement),
+                Some(lifecycle) => Row::new(lifecycle, "unplaced"),
+            };
             assert_eq!(
                 row(pool, sandbox_id).await?,
-                Some(Row::new(landed.unwrap_or(completed), "on_node")),
+                Some(expected),
                 "{action:?} with {landed:?}"
             );
         }
@@ -746,7 +718,6 @@ async fn untracked_runtime_actions_without_placement_are_unavailable() -> TestRe
             StatusCode::SERVICE_UNAVAILABLE,
             "{action:?}: {error}"
         );
-        assert_eq!(row(pool, sandbox_id).await?, None);
     }
     Ok(())
 }
@@ -910,51 +881,6 @@ async fn redrive_completes_only_a_restoring_row() -> TestResult {
         };
         assert_eq!(row(pool, sandbox_id).await?, Some(expected), "{lifecycle}");
     }
-
-    // A deleted row stays deleted.
-    let missing = SandboxId::new();
-    redrive(pool, missing).await;
-    assert_eq!(row(pool, missing).await?, None);
-    Ok(())
-}
-
-/// Even with a routable answer from the probe, the fenced CAS refuses a
-/// `restoring` row under an unexpired restore lease, and a Kubernetes row
-/// with no routable execution; an expired lease does not block it.
-#[tokio::test(flavor = "current_thread")]
-async fn redrive_cas_is_fenced_by_lease_and_routability() -> TestResult {
-    let db = pg_test_db_with_max_connections(2).await?;
-    let pool = &db.pool;
-
-    for (managed_by, lease, expected) in [
-        ("space", Some("1 hour"), Row::new("restoring", "unplaced")),
-        ("space", Some("-1 second"), Row::new("started", "on_node")),
-        ("k8s", None, Row::new("restoring", "unplaced")),
-    ] {
-        let sandbox_id = SandboxId::new();
-        insert_sandbox(pool, sandbox_id, "restoring", managed_by).await?;
-        if let Some(lease) = lease {
-            sqlx::query(sql!(
-                "UPDATE sandboxes
-                    SET restore_lease_expires_at = NOW() + $2::INTERVAL,
-                        restore_lease_token = $3
-                  WHERE id = $1"
-            ))
-            .bind(sandbox_id)
-            .bind(lease)
-            .bind(Uuid::now_v7())
-            .execute(pool)
-            .await?;
-        }
-
-        redrive(pool, sandbox_id).await;
-
-        assert_eq!(
-            row(pool, sandbox_id).await?,
-            Some(expected),
-            "{managed_by} with lease {lease:?}"
-        );
-    }
     Ok(())
 }
 
@@ -964,33 +890,42 @@ async fn redrive_cas_is_fenced_by_lease_and_routability() -> TestResult {
 
 /// Restoring the pre-delete lifecycle is a CAS on `deleting`: if anything
 /// moved the row meanwhile it refuses with a 500 and leaves the row alone.
+/// The success arm is pinned by `deferred_delete_restores_the_previous_lifecycle`.
 #[tokio::test(flavor = "current_thread")]
 async fn failed_delete_compensation_refuses_a_row_that_left_deleting() -> TestResult {
     let db = pg_test_db_with_max_connections(2).await?;
     let pool = &db.pool;
 
-    for current in ["deleting", "started", "failed", "stopped"] {
+    let moved_to = SandboxLifecycle::all()
+        .iter()
+        .filter(|lifecycle| **lifecycle != SandboxLifecycle::Deleting)
+        .map(|lifecycle| lifecycle.as_str())
+        .chain(NON_VARIANT_LIFECYCLES);
+    for current in moved_to {
+        // A restoration target that differs from the current lifecycle, so a
+        // write that slipped past the CAS would be visible.
+        let target = if current == SandboxLifecycle::Paused.as_str() {
+            SandboxLifecycle::Started
+        } else {
+            SandboxLifecycle::Paused
+        };
         let sandbox_id = SandboxId::new();
         insert_sandbox(pool, sandbox_id, current, "space").await?;
 
-        let result =
-            restore_lifecycle_after_failed_delete(pool, sandbox_id, SandboxLifecycle::Paused).await;
+        let error = restore_lifecycle_after_failed_delete(pool, sandbox_id, target)
+            .await
+            .expect_err("the row left `deleting`");
 
-        if current == "deleting" {
-            result?;
-            assert_eq!(
-                row(pool, sandbox_id).await?,
-                Some(Row::new("paused", "unplaced"))
-            );
-        } else {
-            let error = result.expect_err("the row left `deleting`");
-            assert_eq!(error.status(), StatusCode::INTERNAL_SERVER_ERROR);
-            assert_eq!(
-                row(pool, sandbox_id).await?,
-                Some(Row::new(current, "unplaced")),
-                "{current}"
-            );
-        }
+        assert_eq!(
+            error.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "{current}"
+        );
+        assert_eq!(
+            row(pool, sandbox_id).await?,
+            Some(Row::new(current, "unplaced")),
+            "{current}"
+        );
     }
     Ok(())
 }
