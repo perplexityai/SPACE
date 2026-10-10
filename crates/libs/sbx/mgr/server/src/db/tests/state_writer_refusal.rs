@@ -1,0 +1,874 @@
+//! Both outcomes of the guarded `sandboxes.state` writers in the activation,
+//! suspend, restore, publication and eviction paths: the row shape each
+//! compare-and-set accepts, and the neighbouring shapes it refuses.
+//!
+//! A refused write must leave every persisted row as it was, including the
+//! companion rows the writer would have inserted or deleted in the same
+//! transaction, so refusals compare a snapshot of the whole database.
+
+use std::collections::BTreeMap;
+
+use pplx_space_common_core::types::{
+    ArtifactKind, ArtifactOrigin, AutoLifecyclePolicy, ExecutionGeneration, LocalArtifactId,
+    SandboxCleanupEpisodeId, SandboxId, SandboxOwner, SandboxQuarantineNextAction,
+    SandboxQuarantineReasonCode, SandboxQuarantineSource, SandboxRuntimeLabel, TransferScopeId,
+};
+use rusqlite::{Connection, params, types::Value};
+
+use crate::db::{
+    ActivationKind, CleanupCompletion, CleanupEpisode, CleanupEpisodeSpec, InsertSandboxParams,
+    PauseFailedRecoveryTarget, PolicyAuthority, RollbackActivationEpisodeError, SandboxRow,
+    begin_activation, begin_suspend, begin_teardown_suspend, claim_stopped_sandbox_for_eviction,
+    claim_suspended_sandbox_for_eviction, cleanup_episode, complete_row_intent_cleanup,
+    get_local_artifact, get_sandbox, insert_restore_transfer_scope, insert_sandbox,
+    insert_sandbox_with_cleanup_episode_and_route_evidence, mark_cleanup_failed,
+    mark_cleanup_required, mark_quarantined_from_state, pin_suspended_artifact_for_cleanup,
+    publish_restored_disk_as_new, publish_restored_suspended_artifact,
+    publish_restored_suspended_without_artifact, publish_stopped_artifact,
+    rearm_prepared_clone_disposal, recover_interrupted_pause_state, restore_transfer_scope,
+    rollback_restoring, rollback_restoring_episode, rollback_starting, rollback_starting_episode,
+    rollback_suspending_to_paused, test_conn,
+};
+use crate::state::SandboxState;
+
+/// Every row of every table, order-insensitive.
+fn database_rows(conn: &Connection) -> BTreeMap<String, Vec<String>> {
+    let tables: Vec<String> = conn
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    tables
+        .into_iter()
+        .map(|table| {
+            let mut statement = conn.prepare(&format!("SELECT * FROM \"{table}\"")).unwrap();
+            let width = statement.column_count();
+            let mut rows: Vec<String> = statement
+                .query_map([], |row| {
+                    (0..width)
+                        .map(|column| row.get::<_, Value>(column))
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                        .map(|values| format!("{values:?}"))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            rows.sort();
+            (table, rows)
+        })
+        .collect()
+}
+
+fn assert_unchanged(conn: &Connection, before: &BTreeMap<String, Vec<String>>, case: &str) {
+    let after = database_rows(conn);
+    let changed: Vec<&String> = after
+        .iter()
+        .filter(|(table, rows)| before.get(*table) != Some(*rows))
+        .map(|(table, _)| table)
+        .collect();
+    assert!(
+        changed.is_empty(),
+        "{case}: a refused write must leave every row unchanged; changed tables: {changed:?}"
+    );
+}
+
+fn assert_no_rows(result: rusqlite::Result<()>, case: &str) {
+    assert!(
+        matches!(result, Err(rusqlite::Error::QueryReturnedNoRows)),
+        "{case}: expected the guarded write to refuse with QueryReturnedNoRows, got {result:?}"
+    );
+}
+
+fn row(conn: &Connection, id: &str) -> SandboxRow {
+    get_sandbox(conn, id).unwrap().unwrap()
+}
+
+fn episode(conn: &Connection, id: &str) -> Option<CleanupEpisode> {
+    cleanup_episode(conn, id).unwrap()
+}
+
+fn snapshot_path(id: &str) -> String {
+    format!("/cache/{id}/snapshot")
+}
+
+fn with_insert_params<T>(
+    state: SandboxState,
+    insert: impl FnOnce(InsertSandboxParams<'_>) -> T,
+) -> (String, T) {
+    let sandbox_id = SandboxId::new();
+    let id = sandbox_id.to_string();
+    let uuid8 = SandboxRuntimeLabel::from_sandbox_id(sandbox_id);
+    let user = SandboxOwner::parse("user").unwrap();
+    let process_env = BTreeMap::new();
+    let auto_lifecycle = AutoLifecyclePolicy::disabled();
+    let inserted = insert(InsertSandboxParams {
+        id: &id,
+        uuid8: &uuid8,
+        state,
+        template: "seed",
+        template_hash: Some("hash"),
+        user: &user,
+        runtime: "fc",
+        snapshots_enabled: false,
+        rootfs_size_mb: None,
+        disk_io_limits: Default::default(),
+        pool_template: None,
+        volume_encryption: false,
+        process_env: &process_env,
+        auto_lifecycle: &auto_lifecycle,
+        network_policy_override: None,
+        network_policy_generation: 0,
+        network_policy_authority: PolicyAuthority::Cluster,
+        auto_lifecycle_authority: PolicyAuthority::Cluster,
+    });
+    (id, inserted)
+}
+
+fn insert_row(conn: &Connection, state: SandboxState) -> String {
+    let (id, inserted) = with_insert_params(state, |params| insert_sandbox(conn, params));
+    inserted.unwrap();
+    id
+}
+
+/// A `creating` row whose create owns an armed cleanup episode.
+fn insert_creating_with_episode(
+    conn: &Connection,
+    completion: CleanupCompletion,
+) -> (String, SandboxCleanupEpisodeId) {
+    let cleanup_id = SandboxCleanupEpisodeId::new();
+    let (id, inserted) = with_insert_params(SandboxState::Creating, |params| {
+        insert_sandbox_with_cleanup_episode_and_route_evidence(
+            conn,
+            params,
+            CleanupEpisodeSpec {
+                id: cleanup_id,
+                completion,
+                keep_filesystem: false,
+                entered_from_state: None,
+                activation_state: SandboxState::Creating,
+                execution_generation: None,
+                activation_attempt_id: None,
+            },
+            None,
+            None,
+        )
+    });
+    inserted.unwrap();
+    (id, cleanup_id)
+}
+
+/// A `suspended` row pinning a published suspend artifact.
+fn insert_suspended_with_artifact(conn: &Connection) -> (String, LocalArtifactId) {
+    let id = insert_row(conn, SandboxState::Paused);
+    assert!(begin_suspend(conn, &id).unwrap());
+    let artifact = LocalArtifactId::new();
+    complete_row_intent_cleanup(
+        conn,
+        &id,
+        CleanupCompletion::MarkSuspended,
+        Some((artifact, &snapshot_path(&id))),
+    )
+    .unwrap();
+    assert_eq!(row(conn, &id).current_local_artifact_id, Some(artifact));
+    (id, artifact)
+}
+
+/// A local restore in flight: `restoring` and still pinning its artifact.
+fn insert_local_restore(conn: &Connection) -> (String, LocalArtifactId, CleanupEpisode) {
+    let (id, artifact) = insert_suspended_with_artifact(conn);
+    let episode = begin_activation(
+        conn,
+        &id,
+        SandboxState::Suspended,
+        ActivationKind::Restore,
+        None,
+        None,
+    )
+    .unwrap()
+    .unwrap();
+    let restoring = row(conn, &id);
+    assert_eq!(restoring.state, SandboxState::Restoring);
+    assert_eq!(restoring.current_local_artifact_id, Some(artifact));
+    (id, artifact, episode)
+}
+
+fn insert_cold_start(conn: &Connection) -> (String, CleanupEpisode) {
+    let id = insert_row(conn, SandboxState::Stopped);
+    let episode = begin_activation(
+        conn,
+        &id,
+        SandboxState::Stopped,
+        ActivationKind::ColdStart,
+        None,
+        None,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(row(conn, &id).state, SandboxState::Starting);
+    (id, episode)
+}
+
+fn add_transfer_scope(conn: &Connection, id: &str) {
+    assert!(
+        insert_restore_transfer_scope(
+            conn,
+            id,
+            TransferScopeId::new(),
+            None,
+            None,
+            &format!("/cache/restore-staging/{id}"),
+        )
+        .unwrap()
+    );
+}
+
+fn set_runtime_pid(conn: &Connection, id: &str) {
+    conn.execute("UPDATE sandboxes SET pid = 42 WHERE id = ?1", params![id])
+        .unwrap();
+}
+
+fn stale_version(row: &SandboxRow) -> String {
+    (row.updated_at.parse::<i64>().unwrap() - 1).to_string()
+}
+
+#[test]
+fn interrupted_pause_recovery_settles_only_a_pausing_row() {
+    let conn = test_conn();
+    for target in [
+        PauseFailedRecoveryTarget::Started,
+        PauseFailedRecoveryTarget::Paused,
+    ] {
+        let id = insert_row(&conn, SandboxState::Pausing);
+        conn.execute(
+            "UPDATE sandboxes SET failure_reason = 'pause interrupted' WHERE id = ?1",
+            params![id],
+        )
+        .unwrap();
+        assert!(recover_interrupted_pause_state(&conn, &id, target).unwrap());
+        let recovered = row(&conn, &id);
+        assert_eq!(recovered.state, target.sandbox_state());
+        assert_eq!(recovered.failure_reason, None);
+    }
+
+    for state in [
+        SandboxState::Started,
+        SandboxState::Paused,
+        SandboxState::Suspending,
+        SandboxState::Stopped,
+    ] {
+        let id = insert_row(&conn, state);
+        let before = database_rows(&conn);
+        assert!(
+            !recover_interrupted_pause_state(&conn, &id, PauseFailedRecoveryTarget::Started)
+                .unwrap()
+        );
+        assert_unchanged(&conn, &before, state.as_str());
+    }
+    let before = database_rows(&conn);
+    assert!(
+        !recover_interrupted_pause_state(
+            &conn,
+            &SandboxId::new().to_string(),
+            PauseFailedRecoveryTarget::Paused
+        )
+        .unwrap()
+    );
+    assert_unchanged(&conn, &before, "missing row");
+}
+
+#[test]
+fn prepared_clone_disposal_rearms_only_its_own_quarantined_pool_clone_episode() {
+    let conn = test_conn();
+    let quarantine = |id: &str| {
+        assert!(
+            mark_quarantined_from_state(
+                &conn,
+                id,
+                SandboxState::Creating,
+                SandboxQuarantineSource::SbxManager,
+                SandboxQuarantineReasonCode::CreateInterrupted,
+                "held clone disposal",
+                SandboxQuarantineNextAction::RequiresOperatorAttention,
+            )
+            .unwrap()
+        );
+    };
+
+    let (id, cleanup_id) = insert_creating_with_episode(&conn, CleanupCompletion::DeletePoolClone);
+    let before = database_rows(&conn);
+    assert!(!rearm_prepared_clone_disposal(&conn, &id, cleanup_id).unwrap());
+    assert_unchanged(&conn, &before, "row is not quarantined");
+
+    quarantine(&id);
+    let before = database_rows(&conn);
+    assert!(!rearm_prepared_clone_disposal(&conn, &id, SandboxCleanupEpisodeId::new()).unwrap());
+    assert_unchanged(&conn, &before, "another cleanup episode");
+
+    let (other_id, other_cleanup) =
+        insert_creating_with_episode(&conn, CleanupCompletion::DeleteRow);
+    quarantine(&other_id);
+    let before = database_rows(&conn);
+    assert!(!rearm_prepared_clone_disposal(&conn, &other_id, other_cleanup).unwrap());
+    assert_unchanged(&conn, &before, "episode does not dispose of a pool clone");
+
+    assert!(rearm_prepared_clone_disposal(&conn, &id, cleanup_id).unwrap());
+    let rearmed = row(&conn, &id);
+    assert_eq!(rearmed.state, SandboxState::CleanupRequired);
+    assert_eq!(
+        rearmed.cleanup_completion,
+        Some(CleanupCompletion::DeletePoolClone)
+    );
+    assert_eq!(rearmed.cleanup_keep_filesystem, Some(false));
+    let rearmed_episode = episode(&conn, &id).unwrap();
+    assert_eq!(rearmed_episode.id, cleanup_id);
+    assert!(rearmed_episode.requested_at.is_some());
+    assert_eq!(rearmed_episode.attempt_count, 0);
+    assert_eq!(rearmed_episode.last_cleanup_error, None);
+    assert_eq!(
+        rearmed_episode.quarantine_reason_code,
+        Some(SandboxQuarantineReasonCode::CreateInterrupted)
+    );
+
+    let before = database_rows(&conn);
+    assert!(!rearm_prepared_clone_disposal(&conn, &id, cleanup_id).unwrap());
+    assert_unchanged(&conn, &before, "already rearmed");
+}
+
+#[test]
+fn teardown_suspend_begins_only_from_paused_and_a_refusal_enqueues_nothing() {
+    let conn = test_conn();
+    let generation = ExecutionGeneration::new(7).unwrap();
+    for state in [
+        SandboxState::Started,
+        SandboxState::Stopped,
+        SandboxState::Suspended,
+    ] {
+        let id = insert_row(&conn, state);
+        let before = database_rows(&conn);
+        assert_no_rows(
+            begin_teardown_suspend(&conn, &id, generation).map(|_| ()),
+            state.as_str(),
+        );
+        assert_unchanged(&conn, &before, state.as_str());
+    }
+
+    let id = insert_row(&conn, SandboxState::Paused);
+    let before = database_rows(&conn);
+    begin_teardown_suspend(&conn, &id, generation).unwrap();
+    assert_eq!(row(&conn, &id).state, SandboxState::Suspending);
+    assert!(database_rows(&conn) != before);
+
+    let before = database_rows(&conn);
+    assert_no_rows(
+        begin_teardown_suspend(&conn, &id, generation).map(|_| ()),
+        "already suspending",
+    );
+    assert_unchanged(&conn, &before, "already suspending");
+}
+
+#[test]
+fn suspend_rollback_returns_only_a_suspending_row_to_paused() {
+    let conn = test_conn();
+    let resuspend = insert_row(&conn, SandboxState::Paused);
+    let predecessor = LocalArtifactId::new();
+    conn.execute(
+        "UPDATE sandboxes
+            SET current_local_artifact_id = ?1,
+                current_local_artifact_kind = 'full',
+                current_local_artifact_origin = 'suspend'
+          WHERE id = ?2",
+        params![predecessor.to_string(), resuspend],
+    )
+    .unwrap();
+    let first_suspend = insert_row(&conn, SandboxState::Paused);
+    for (id, restored) in [(&resuspend, Some(predecessor)), (&first_suspend, None)] {
+        assert!(begin_suspend(&conn, id).unwrap());
+        assert_eq!(row(&conn, id).current_local_artifact_id, None);
+        assert!(rollback_suspending_to_paused(&conn, id).unwrap());
+        let paused = row(&conn, id);
+        assert_eq!(paused.state, SandboxState::Paused);
+        assert_eq!(paused.current_local_artifact_id, restored);
+        assert_eq!(
+            paused.current_local_artifact_kind,
+            restored.map(|_| ArtifactKind::Full)
+        );
+        assert_eq!(
+            paused.current_local_artifact_origin,
+            restored.map(|_| ArtifactOrigin::Suspend)
+        );
+        assert_eq!(paused.cleanup_completion, None);
+        assert_eq!(paused.cleanup_keep_filesystem, None);
+        assert_eq!(paused.failure_reason, None);
+    }
+
+    let (suspended, _) = insert_suspended_with_artifact(&conn);
+    let started = insert_row(&conn, SandboxState::Started);
+    for (case, id) in [
+        ("already paused", &resuspend),
+        ("suspended", &suspended),
+        ("started", &started),
+    ] {
+        let before = database_rows(&conn);
+        assert!(!rollback_suspending_to_paused(&conn, id).unwrap());
+        assert_unchanged(&conn, &before, case);
+    }
+}
+
+#[test]
+fn activation_episode_rollback_requires_the_activation_state_and_its_armed_episode() {
+    let conn = test_conn();
+    let (starting, start_episode) = insert_cold_start(&conn);
+    let (restoring, restore_artifact, restore_episode) = insert_local_restore(&conn);
+
+    let refusals: [(&str, &str, SandboxState, SandboxCleanupEpisodeId, bool); 4] = [
+        (
+            "another episode",
+            &starting,
+            SandboxState::Stopped,
+            SandboxCleanupEpisodeId::new(),
+            false,
+        ),
+        (
+            "restoring rollback of a starting row",
+            &starting,
+            SandboxState::Stopped,
+            start_episode.id,
+            true,
+        ),
+        (
+            "starting rollback of a restoring row",
+            &restoring,
+            SandboxState::Suspended,
+            restore_episode.id,
+            false,
+        ),
+        (
+            "another episode",
+            &restoring,
+            SandboxState::Suspended,
+            SandboxCleanupEpisodeId::new(),
+            true,
+        ),
+    ];
+    for (case, id, target, cleanup_id, restoring_wrapper) in refusals {
+        let before = database_rows(&conn);
+        let changed = if restoring_wrapper {
+            rollback_restoring_episode(&conn, id, target, cleanup_id)
+        } else {
+            rollback_starting_episode(&conn, id, target, cleanup_id)
+        };
+        assert!(!changed.unwrap(), "{case}");
+        assert_unchanged(&conn, &before, case);
+    }
+
+    let before = database_rows(&conn);
+    assert!(matches!(
+        rollback_starting_episode(
+            &conn,
+            &starting,
+            SandboxState::Quarantined,
+            start_episode.id
+        ),
+        Err(RollbackActivationEpisodeError::QuarantinedTarget)
+    ));
+    assert!(matches!(
+        rollback_restoring_episode(
+            &conn,
+            &restoring,
+            SandboxState::Quarantined,
+            restore_episode.id
+        ),
+        Err(RollbackActivationEpisodeError::QuarantinedTarget)
+    ));
+    assert!(matches!(
+        rollback_starting_episode(&conn, &starting, SandboxState::Failed, start_episode.id),
+        Err(RollbackActivationEpisodeError::Db(
+            rusqlite::Error::InvalidQuery
+        ))
+    ));
+    assert_unchanged(&conn, &before, "rejected rollback target");
+
+    assert!(
+        rollback_starting_episode(&conn, &starting, SandboxState::Stopped, start_episode.id)
+            .unwrap()
+    );
+    let stopped = row(&conn, &starting);
+    assert_eq!(stopped.state, SandboxState::Stopped);
+    assert_eq!(stopped.cleanup_completion, None);
+    assert_eq!(stopped.cleanup_keep_filesystem, None);
+    assert_eq!(stopped.failure_reason, None);
+    assert!(episode(&conn, &starting).is_none());
+
+    assert!(
+        rollback_restoring_episode(
+            &conn,
+            &restoring,
+            SandboxState::Suspended,
+            restore_episode.id
+        )
+        .unwrap()
+    );
+    let suspended = row(&conn, &restoring);
+    assert_eq!(suspended.state, SandboxState::Suspended);
+    assert_eq!(suspended.restore_operation, None);
+    assert_eq!(suspended.cleanup_completion, None);
+    assert_eq!(suspended.cleanup_keep_filesystem, None);
+    assert_eq!(suspended.current_local_artifact_id, Some(restore_artifact));
+    assert!(episode(&conn, &restoring).is_none());
+
+    let before = database_rows(&conn);
+    assert!(
+        !rollback_starting_episode(&conn, &starting, SandboxState::Stopped, start_episode.id)
+            .unwrap()
+    );
+    assert!(
+        !rollback_restoring_episode(
+            &conn,
+            &restoring,
+            SandboxState::Suspended,
+            restore_episode.id
+        )
+        .unwrap()
+    );
+    assert_unchanged(&conn, &before, "already rolled back");
+}
+
+#[test]
+fn activation_state_rollback_requires_the_expected_activation_state() {
+    let conn = test_conn();
+    let (starting, _) = insert_cold_start(&conn);
+    let (restoring, _, _) = insert_local_restore(&conn);
+
+    let before = database_rows(&conn);
+    assert!(!rollback_restoring(&conn, &starting, SandboxState::Stopped).unwrap());
+    assert!(!rollback_starting(&conn, &restoring, SandboxState::Suspended).unwrap());
+    for target in [SandboxState::Quarantined, SandboxState::Failed] {
+        assert!(matches!(
+            rollback_starting(&conn, &starting, target),
+            Err(rusqlite::Error::InvalidQuery)
+        ));
+        assert!(matches!(
+            rollback_restoring(&conn, &restoring, target),
+            Err(rusqlite::Error::InvalidQuery)
+        ));
+    }
+    assert_unchanged(&conn, &before, "wrong activation state or target");
+
+    assert!(rollback_restoring(&conn, &restoring, SandboxState::Suspended).unwrap());
+    let suspended = row(&conn, &restoring);
+    assert_eq!(suspended.state, SandboxState::Suspended);
+    assert_eq!(suspended.restore_operation, None);
+    assert!(rollback_starting(&conn, &starting, SandboxState::Stopped).unwrap());
+    assert_eq!(row(&conn, &starting).state, SandboxState::Stopped);
+}
+
+#[test]
+fn suspended_cleanup_pin_requires_a_suspending_row_and_a_refusal_keeps_prior_artifacts() {
+    let conn = test_conn();
+    let (suspended, prior) = insert_suspended_with_artifact(&conn);
+    let paused = insert_row(&conn, SandboxState::Paused);
+    let started = insert_row(&conn, SandboxState::Started);
+    for (case, id) in [
+        ("suspended", &suspended),
+        ("paused", &paused),
+        ("started", &started),
+    ] {
+        let before = database_rows(&conn);
+        let artifact = LocalArtifactId::new();
+        assert_no_rows(
+            pin_suspended_artifact_for_cleanup(&conn, id, artifact, &snapshot_path(id)),
+            case,
+        );
+        assert_unchanged(&conn, &before, case);
+        assert!(get_local_artifact(&conn, artifact).unwrap().is_none());
+    }
+    assert!(get_local_artifact(&conn, prior).unwrap().is_some());
+
+    let id = insert_row(&conn, SandboxState::Paused);
+    assert!(begin_suspend(&conn, &id).unwrap());
+    let artifact = LocalArtifactId::new();
+    pin_suspended_artifact_for_cleanup(&conn, &id, artifact, &snapshot_path(&id)).unwrap();
+    let pinned = row(&conn, &id);
+    assert_eq!(pinned.state, SandboxState::CleanupRequired);
+    assert_eq!(pinned.current_local_artifact_id, Some(artifact));
+    assert_eq!(pinned.current_local_artifact_kind, Some(ArtifactKind::Full));
+    assert_eq!(
+        pinned.current_local_artifact_origin,
+        Some(ArtifactOrigin::Suspend)
+    );
+    assert_eq!(
+        pinned.cleanup_completion,
+        Some(CleanupCompletion::MarkSuspended)
+    );
+    assert_eq!(pinned.cleanup_keep_filesystem, Some(true));
+    assert_eq!(
+        get_local_artifact(&conn, artifact)
+            .unwrap()
+            .unwrap()
+            .local_path,
+        snapshot_path(&id)
+    );
+}
+
+#[derive(Clone, Copy, Debug)]
+enum RestoredSuspendedPublication {
+    WithArtifact,
+    WithoutArtifact,
+}
+
+impl RestoredSuspendedPublication {
+    fn publish(
+        self,
+        conn: &Connection,
+        id: &str,
+        artifact: LocalArtifactId,
+    ) -> rusqlite::Result<()> {
+        match self {
+            Self::WithArtifact => {
+                publish_restored_suspended_artifact(conn, id, artifact, &snapshot_path(id))
+            }
+            Self::WithoutArtifact => publish_restored_suspended_without_artifact(conn, id),
+        }
+    }
+}
+
+#[test]
+fn restored_suspended_publication_requires_an_unpinned_restoring_row() {
+    for publication in [
+        RestoredSuspendedPublication::WithArtifact,
+        RestoredSuspendedPublication::WithoutArtifact,
+    ] {
+        let conn = test_conn();
+        let (suspended, prior) = insert_suspended_with_artifact(&conn);
+        let (pinned_restore, _, _) = insert_local_restore(&conn);
+        let started = insert_row(&conn, SandboxState::Started);
+        for (case, id) in [
+            ("suspended", &suspended),
+            ("restoring with a pinned artifact", &pinned_restore),
+            ("started", &started),
+        ] {
+            add_transfer_scope(&conn, id);
+            let before = database_rows(&conn);
+            let artifact = LocalArtifactId::new();
+            let case = format!("{publication:?}: {case}");
+            assert_no_rows(publication.publish(&conn, id, artifact), &case);
+            assert_unchanged(&conn, &before, &case);
+        }
+        assert!(get_local_artifact(&conn, prior).unwrap().is_some());
+
+        let id = insert_row(&conn, SandboxState::Restoring);
+        add_transfer_scope(&conn, &id);
+        let artifact = LocalArtifactId::new();
+        publication.publish(&conn, &id, artifact).unwrap();
+        let published = row(&conn, &id);
+        assert_eq!(published.state, SandboxState::Suspended, "{publication:?}");
+        assert_eq!(published.restore_operation, None, "{publication:?}");
+        let expected = match publication {
+            RestoredSuspendedPublication::WithArtifact => Some(artifact),
+            RestoredSuspendedPublication::WithoutArtifact => None,
+        };
+        assert_eq!(
+            published.current_local_artifact_id, expected,
+            "{publication:?}"
+        );
+        assert_eq!(
+            get_local_artifact(&conn, artifact).unwrap().is_some(),
+            expected.is_some(),
+            "{publication:?}"
+        );
+        assert_eq!(
+            restore_transfer_scope(&conn, &id).unwrap(),
+            None,
+            "{publication:?}: publication retires the staging scope"
+        );
+    }
+}
+
+#[test]
+fn restored_disk_as_new_publication_requires_a_restoring_row() {
+    let conn = test_conn();
+    let (suspended, _) = insert_suspended_with_artifact(&conn);
+    let started = insert_row(&conn, SandboxState::Started);
+    set_runtime_pid(&conn, &started);
+    for (case, id) in [("suspended", &suspended), ("started", &started)] {
+        add_transfer_scope(&conn, id);
+        let before = database_rows(&conn);
+        assert_no_rows(publish_restored_disk_as_new(&conn, id), case);
+        assert_unchanged(&conn, &before, case);
+    }
+
+    let id = insert_row(&conn, SandboxState::Restoring);
+    set_runtime_pid(&conn, &id);
+    add_transfer_scope(&conn, &id);
+    publish_restored_disk_as_new(&conn, &id).unwrap();
+    let published = row(&conn, &id);
+    assert_eq!(published.state, SandboxState::Stopped);
+    assert_eq!(published.restore_operation, None);
+    assert_eq!(published.pid, None);
+    assert_eq!(restore_transfer_scope(&conn, &id).unwrap(), None);
+}
+
+#[test]
+fn stopped_artifact_publication_accepts_only_stop_completions_and_unpinned_stopped_rows() {
+    let conn = test_conn();
+    let cleanup = |state: SandboxState, completion: CleanupCompletion| {
+        let id = insert_row(&conn, SandboxState::Stopping);
+        match state {
+            SandboxState::CleanupRequired => {
+                mark_cleanup_required(&conn, &id, true, completion, "stop cleanup").unwrap();
+            }
+            SandboxState::CleanupFailed => {
+                assert!(mark_cleanup_failed(&conn, &id, true, completion, "stop cleanup").unwrap());
+            }
+            _ => unreachable!(),
+        }
+        let staged = row(&conn, &id);
+        assert_eq!(staged.state, state);
+        assert_eq!(staged.cleanup_completion, Some(completion));
+        id
+    };
+
+    let accepted = [
+        ("stopping", insert_row(&conn, SandboxState::Stopping)),
+        (
+            "cleanup_required to stopped",
+            cleanup(
+                SandboxState::CleanupRequired,
+                CleanupCompletion::MarkStopped,
+            ),
+        ),
+        (
+            "cleanup_failed to stopped",
+            cleanup(SandboxState::CleanupFailed, CleanupCompletion::MarkStopped),
+        ),
+        ("unpinned stopped", insert_row(&conn, SandboxState::Stopped)),
+    ];
+    for (case, id) in &accepted {
+        set_runtime_pid(&conn, id);
+        let artifact = LocalArtifactId::new();
+        publish_stopped_artifact(&conn, id, artifact, &format!("/cache/{id}/disk")).unwrap();
+        let published = row(&conn, id);
+        assert_eq!(published.state, SandboxState::Stopped, "{case}");
+        assert_eq!(
+            published.current_local_artifact_id,
+            Some(artifact),
+            "{case}"
+        );
+        assert_eq!(
+            published.current_local_artifact_kind,
+            Some(ArtifactKind::Disk),
+            "{case}"
+        );
+        assert_eq!(
+            published.current_local_artifact_origin,
+            Some(ArtifactOrigin::Stop),
+            "{case}"
+        );
+        assert_eq!(published.pid, None, "{case}");
+        assert_eq!(published.cleanup_completion, None, "{case}");
+        assert_eq!(published.cleanup_keep_filesystem, None, "{case}");
+        assert!(
+            get_local_artifact(&conn, artifact).unwrap().is_some(),
+            "{case}"
+        );
+    }
+
+    let started = insert_row(&conn, SandboxState::Started);
+    set_runtime_pid(&conn, &started);
+    let (suspended, _) = insert_suspended_with_artifact(&conn);
+    let refused = [
+        ("started", started),
+        ("suspended", suspended),
+        (
+            "cleanup_required to delete",
+            cleanup(SandboxState::CleanupRequired, CleanupCompletion::DeleteRow),
+        ),
+        (
+            "cleanup_failed to suspended",
+            cleanup(
+                SandboxState::CleanupFailed,
+                CleanupCompletion::MarkSuspended,
+            ),
+        ),
+        ("pinned stopped", accepted[0].1.clone()),
+    ];
+    for (case, id) in &refused {
+        let before = database_rows(&conn);
+        let artifact = LocalArtifactId::new();
+        assert_no_rows(
+            publish_stopped_artifact(&conn, id, artifact, &format!("/cache/{id}/disk")),
+            case,
+        );
+        assert_unchanged(&conn, &before, case);
+    }
+}
+
+#[test]
+fn stopped_eviction_claim_binds_the_state_and_the_observed_version() {
+    let conn = test_conn();
+    let id = insert_row(&conn, SandboxState::Stopped);
+    let observed = row(&conn, &id);
+    let (suspended, _) = insert_suspended_with_artifact(&conn);
+    let suspended_version = row(&conn, &suspended).updated_at;
+
+    for (case, id, version) in [
+        ("stale version", &id, stale_version(&observed)),
+        ("suspended row", &suspended, suspended_version),
+    ] {
+        let before = database_rows(&conn);
+        assert!(!claim_stopped_sandbox_for_eviction(&conn, id, &version).unwrap());
+        assert_unchanged(&conn, &before, case);
+    }
+
+    assert!(claim_stopped_sandbox_for_eviction(&conn, &id, &observed.updated_at).unwrap());
+    assert_eq!(row(&conn, &id).state, SandboxState::Deleting);
+
+    let before = database_rows(&conn);
+    assert!(!claim_stopped_sandbox_for_eviction(&conn, &id, &observed.updated_at).unwrap());
+    assert_unchanged(&conn, &before, "already claimed");
+}
+
+#[test]
+fn pinned_suspended_eviction_claim_with_a_version_requires_state_pin_and_version() {
+    let conn = test_conn();
+    let (id, pin) = insert_suspended_with_artifact(&conn);
+    let observed = row(&conn, &id);
+    let (restoring, restoring_pin, _) = insert_local_restore(&conn);
+    let restoring_version = row(&conn, &restoring).updated_at;
+    let pin = pin.to_string();
+    let other_pin = LocalArtifactId::new().to_string();
+    let restoring_pin = restoring_pin.to_string();
+
+    for (case, id, claim_pin, version) in [
+        ("stale version", &id, &pin, stale_version(&observed)),
+        ("another pin", &id, &other_pin, observed.updated_at.clone()),
+        (
+            "restoring row",
+            &restoring,
+            &restoring_pin,
+            restoring_version,
+        ),
+    ] {
+        let before = database_rows(&conn);
+        assert!(
+            !claim_suspended_sandbox_for_eviction(&conn, id, Some(claim_pin), Some(&version))
+                .unwrap()
+        );
+        assert_unchanged(&conn, &before, case);
+    }
+
+    assert!(
+        claim_suspended_sandbox_for_eviction(&conn, &id, Some(&pin), Some(&observed.updated_at))
+            .unwrap()
+    );
+    assert_eq!(row(&conn, &id).state, SandboxState::Deleting);
+
+    let before = database_rows(&conn);
+    assert!(
+        !claim_suspended_sandbox_for_eviction(&conn, &id, Some(&pin), Some(&observed.updated_at))
+            .unwrap()
+    );
+    assert_unchanged(&conn, &before, "already claimed");
+}

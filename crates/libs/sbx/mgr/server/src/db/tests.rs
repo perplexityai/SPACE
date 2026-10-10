@@ -1,3 +1,5 @@
+mod state_writer_refusal;
+
 use super::*;
 use crate::restore_operation::RestoreOperation;
 
