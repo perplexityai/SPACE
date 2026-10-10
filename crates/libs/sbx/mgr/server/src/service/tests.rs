@@ -10560,6 +10560,145 @@ pub(crate) mod service_tests {
     }
 
     #[tokio::test]
+    async fn observed_execution_cleanup_fails_closed_without_readable_generation_lineage() {
+        let conn = crate::db::test_conn();
+        let sandbox_id = SandboxId::new();
+        let sandbox_id_string = sandbox_id.to_string();
+        insert_test_sandbox(&conn, &sandbox_id_string, SandboxState::Started);
+        let service = service_for_teardown_test(conn);
+        let generation = ExecutionGeneration::new(1).unwrap();
+        service
+            .update_runtime_fields(sandbox_id, runtime_fields(generation, 7))
+            .unwrap();
+        service
+            .db
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE sandboxes SET space_api_route_execution_generation = 0 WHERE id = ?1",
+                [&sandbox_id_string],
+            )
+            .unwrap();
+
+        let error = service
+            .admit_lifecycle_cleanup_for_observed_execution(
+                sandbox_id,
+                SandboxState::Stopping,
+                true,
+                CleanupCompletion::MarkStopped,
+                true,
+                Some(Some(generation)),
+            )
+            .await
+            .err()
+            .expect("a generation fence needs readable lineage");
+        assert_eq!(error.into_status().code(), tonic::Code::Unavailable);
+        assert_eq!(
+            crate::db::current_state_label(&service.db.lock().unwrap(), &sandbox_id_string)
+                .unwrap()
+                .as_deref(),
+            Some(SandboxState::Started.as_str())
+        );
+
+        // Unfenced cleanup keeps its best-effort node cleanup fallback.
+        let admission = service
+            .admit_lifecycle_cleanup_for_observed_execution(
+                sandbox_id,
+                SandboxState::Stopping,
+                true,
+                CleanupCompletion::MarkStopped,
+                true,
+                None,
+            )
+            .await
+            .expect("unfenced cleanup falls back to unpersisted node cleanup");
+        assert!(admission.is_unpersisted_for_sandbox(sandbox_id).unwrap());
+    }
+
+    #[tokio::test]
+    async fn auto_lifecycle_delete_fails_closed_when_cleanup_intent_cannot_be_persisted() {
+        let conn = crate::db::test_conn();
+        let sandbox_id = SandboxId::new();
+        let sandbox_id_string = sandbox_id.to_string();
+        let policy = AutoLifecyclePolicy {
+            wake: Default::default(),
+            condition_sets: BTreeMap::from([(
+                AutoLifecycleConditionSetId::AccessIdle,
+                AutoLifecycleConditionSet::access_idle(),
+            )]),
+            stages: vec![AutoLifecycleStage {
+                condition_set: AutoLifecycleConditionSetId::AccessIdle,
+                at: 900,
+                action: AutoLifecycleIdleAction::Delete,
+            }],
+        }
+        .normalized();
+        insert_test_sandbox_with_policy(&conn, &sandbox_id_string, SandboxState::Started, &policy);
+        crate::db::update_space_api_route_identity(
+            &conn,
+            sandbox_id,
+            &SpaceApiRouteIdentity {
+                route_generation: Some(RouteGeneration::new(7).unwrap()),
+                current_node_id: Some(NodeId::new()),
+                execution_generation: Some(ExecutionGeneration::new(7).unwrap()),
+                activation_attempt_id: Some(SandboxActivationAttemptId::new()),
+                substrate_kind: Some(NodeManagedBy::Kubernetes),
+                pod_uid: Some(PodUid::parse("pod-uid-7").unwrap()),
+                ..SpaceApiRouteIdentity::default()
+            },
+            crate::auto_lifecycle_delete_receipts::RouteIdentityProvenance::ClusterFenced,
+        )
+        .unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER fail_auto_lifecycle_cleanup_intent
+             BEFORE UPDATE OF cleanup_completion ON sandboxes
+             BEGIN
+                 SELECT RAISE(FAIL, 'injected auto-lifecycle cleanup-intent failure');
+             END;",
+        )
+        .unwrap();
+        let service = SandboxManagerService::new_with_options(
+            conn,
+            SandboxManagerServiceOptions {
+                node_role: Some(NodeRole::Worker),
+                ..Default::default()
+            },
+        );
+
+        let error = service
+            .admit_auto_lifecycle_delete(
+                sandbox_id,
+                crate::auto_lifecycle_delete_receipts::AutoLifecycleDeleteExpectation {
+                    policy_fingerprint:
+                        pplx_space_common_svc::types::AutoLifecyclePolicyFingerprint::for_policy(
+                            &policy,
+                        ),
+                    authority: crate::db::PolicyAuthority::Cluster,
+                },
+            )
+            .await
+            .err()
+            .expect("auto-lifecycle delete must not run unpersisted");
+        assert_eq!(error.into_status().code(), tonic::Code::Unavailable);
+
+        let db = service.db.lock().unwrap();
+        assert_eq!(
+            crate::db::get_sandbox(&db, &sandbox_id_string)
+                .unwrap()
+                .unwrap()
+                .state,
+            SandboxState::Started
+        );
+        assert_eq!(
+            crate::auto_lifecycle_delete_receipts::db::pending_receipt_for_sandbox(
+                &db, sandbox_id,
+            )
+            .unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
     async fn fatal_kill_admission_keeps_replacement_out_of_node_dispatch() {
         let conn = crate::db::test_conn();
         let sandbox_id = SandboxId::new();
