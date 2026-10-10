@@ -14,9 +14,10 @@ The application's `clusterId` is a separate platform identity (`kind-local` by
 default); the telemetry selector sends the same platform ID to services and
 the node-hosted shim. Experiment environment, owner and phase do not rename it.
 
-In `otel` mode, metrics and traces use separate Collector Services over
-plaintext OTLP/gRPC. Install them with `infra/space/kind/metrics/local.sh up`
-and `infra/space/kind/traces/local.sh up`; no Datadog Agent is required.
+In `otel` mode, the Kind default, metrics and traces use separate Collector
+Services over plaintext OTLP/gRPC. Bootstrap and Tilt install them in that
+mode (`infra/space/kind/metrics/local.sh up` and
+`infra/space/kind/traces/local.sh up` by hand); no Datadog Agent is required.
 
 | Value | Default | Environment variable |
 | --- | --- | --- |
