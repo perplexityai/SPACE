@@ -8072,6 +8072,7 @@ fn acquiring_a_claim_refuses_every_changed_precondition() {
 const DB_MODULE_SOURCE: &str = concat!(
     include_str!("../db.rs"),
     include_str!("auto_lifecycle.rs"),
+    include_str!("cleanup_episodes.rs"),
     include_str!("eviction.rs"),
     include_str!("local_artifacts.rs"),
     include_str!("network_policy.rs"),
