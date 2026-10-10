@@ -461,7 +461,6 @@ fn try_acquire_state_writer(
         "/space.sandbox.manager.v1.SandboxManager/Delete"
             | "/space.sandbox.manager.v1.SandboxManager/Stop"
             | "/space.sandbox.manager.v1.SandboxManager/Kill"
-            | "/space.sandbox.manager.v1.SandboxManager/ReleaseExecution"
     );
     let capacity = MAX_ACTIVE_STATE_WRITERS
         + if teardown {

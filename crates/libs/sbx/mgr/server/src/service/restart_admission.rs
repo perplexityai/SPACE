@@ -194,7 +194,6 @@ restart_rpcs! {
     SandboxStop => ("/space.sandbox.manager.v1.SandboxManager/Stop", StateWriter),
     SandboxKill => ("/space.sandbox.manager.v1.SandboxManager/Kill", StateWriter),
     SandboxDelete => ("/space.sandbox.manager.v1.SandboxManager/Delete", StateWriter),
-    SandboxReleaseExecution => ("/space.sandbox.manager.v1.SandboxManager/ReleaseExecution", StateWriter),
     SandboxListAutoLifecycleDeleteReceipts => ("/space.sandbox.manager.v1.SandboxManager/ListAutoLifecycleDeleteReceipts", ReadOnlyWithNarrowStateWrites),
     SandboxAcknowledgeAutoLifecycleDeleteReceipts => ("/space.sandbox.manager.v1.SandboxManager/AcknowledgeAutoLifecycleDeleteReceipts", StateWriter),
     SandboxListPendingLocalBackups => ("/space.sandbox.manager.v1.SandboxManager/ListPendingLocalBackups", ReadOnly),

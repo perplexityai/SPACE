@@ -118,10 +118,9 @@ use crate::proto::{
     MissingDiskUsageId as SbxMissingDiskUsageId,
     MissingDiskUsageReason as SbxMissingDiskUsageReason, NetworkPolicyDetail, PauseRequest,
     PauseResponse, PendingLocalBackup as ProtoPendingLocalBackup, PrepareTeardownSuspendRequest,
-    PrepareTeardownSuspendResponse, ReleaseExecutionDisposition, ReleaseExecutionIntent,
-    ReleaseExecutionRequest, ReleaseExecutionResponse, ResolveSandboxMemoryRequest,
-    ResolveSandboxMemoryResponse, ResumeRequest, ResumeResponse, RollbackRequest, RollbackResponse,
-    SandboxInfo, SandboxListElement, SetAutoLifecyclePolicyRequest, SetAutoLifecyclePolicyResponse,
+    PrepareTeardownSuspendResponse, ResolveSandboxMemoryRequest, ResolveSandboxMemoryResponse,
+    ResumeRequest, ResumeResponse, RollbackRequest, RollbackResponse, SandboxInfo,
+    SandboxListElement, SetAutoLifecyclePolicyRequest, SetAutoLifecyclePolicyResponse,
     SetNetworkPolicyRequest, SetNetworkPolicyResponse, SnapshotDetail,
     SpacedCloseLoopbackBridgeRequest, SpacedCloseLoopbackBridgeResponse, SpacedCloseStdinRequest,
     SpacedCloseStdinResponse, SpacedConnectProcessRequest, SpacedCreateWatcherRequest,
@@ -265,10 +264,6 @@ const ALLOW_SANDBOX_OPERATOR_OR_TMPLMGR: &[UdsPeerPrincipal] = &[
     UdsPeerPrincipal::Service(user_names::SPACE_TMPLMGR),
     UdsPeerPrincipal::Service(user_names::SPACE_SBXMGR),
 ];
-// Runtime adapters execute as host root. Keep execution release narrower than
-// the ordinary operator API because possession of a generation authorizes
-// destructive cleanup of that exact local runtime.
-const ALLOW_SANDBOX_EXECUTION_RELEASE: &[UdsPeerPrincipal] = &[UdsPeerPrincipal::Root];
 const ALLOW_AUTO_LIFECYCLE_DELETE_RECEIPTS: &[UdsPeerPrincipal] = &[
     UdsPeerPrincipal::Root,
     UdsPeerPrincipal::Service(user_names::SPACE_NODECTL),

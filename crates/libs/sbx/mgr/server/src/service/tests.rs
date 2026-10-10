@@ -234,7 +234,7 @@ fn encrypted_restore_snapshot_error_preserves_invalid_key_status() {
 }
 
 #[cfg(test)]
-mod execution_release_tests;
+mod cancelled_cleanup_rpc_tests;
 
 #[cfg(test)]
 mod local_backup_inventory_tests;
@@ -4109,23 +4109,6 @@ pub(crate) mod service_tests {
             .expect_err(
                 "only node-ctl, root, or a local operator may evict cluster-deleted sandboxes",
             );
-        assert_eq!(error.code(), tonic::Code::PermissionDenied);
-    }
-
-    #[tokio::test]
-    async fn template_manager_cannot_release_runtime_executions() {
-        let conn = crate::db::test_conn();
-        let service = SandboxManagerService::new(conn);
-
-        let error = service
-            .release_execution(tmplmgr_request(ReleaseExecutionRequest {
-                sandbox_id: "not-a-sandbox-id".to_string(),
-                execution_generation: 1,
-                intent: ReleaseExecutionIntent::Delete as i32,
-            }))
-            .await
-            .expect_err("template-manager is not a node runtime adapter");
-
         assert_eq!(error.code(), tonic::Code::PermissionDenied);
     }
 

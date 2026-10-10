@@ -99,7 +99,6 @@ const (
 	SandboxManager_ExportSandbox_FullMethodName                          = "/space.sandbox.manager.v1.SandboxManager/ExportSandbox"
 	SandboxManager_ImportSandbox_FullMethodName                          = "/space.sandbox.manager.v1.SandboxManager/ImportSandbox"
 	SandboxManager_ResolveSandboxMemory_FullMethodName                   = "/space.sandbox.manager.v1.SandboxManager/ResolveSandboxMemory"
-	SandboxManager_ReleaseExecution_FullMethodName                       = "/space.sandbox.manager.v1.SandboxManager/ReleaseExecution"
 )
 
 // SandboxManagerClient is the client API for SandboxManager service.
@@ -284,12 +283,6 @@ type SandboxManagerClient interface {
 	ImportSandbox(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[ImportSandboxRequest, ImportSandboxResponse], error)
 	// Internal: resolve the effective sandbox memory policy for this node.
 	ResolveSandboxMemory(ctx context.Context, in *ResolveSandboxMemoryRequest, opts ...grpc.CallOption) (*ResolveSandboxMemoryResponse, error)
-	// Atomically release one runtime execution. An accepted response transfers
-	// teardown ownership to sandbox-manager: tracked rows are claimed durably
-	// and completed asynchronously, while a rowless local runtime is cleaned
-	// synchronously before the response. The caller detaches its task after
-	// either response disposition and performs no further sandbox teardown.
-	ReleaseExecution(ctx context.Context, in *ReleaseExecutionRequest, opts ...grpc.CallOption) (*ReleaseExecutionResponse, error)
 }
 
 type sandboxManagerClient struct {
@@ -1164,16 +1157,6 @@ func (c *sandboxManagerClient) ResolveSandboxMemory(ctx context.Context, in *Res
 	return out, nil
 }
 
-func (c *sandboxManagerClient) ReleaseExecution(ctx context.Context, in *ReleaseExecutionRequest, opts ...grpc.CallOption) (*ReleaseExecutionResponse, error) {
-	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(ReleaseExecutionResponse)
-	err := c.cc.Invoke(ctx, SandboxManager_ReleaseExecution_FullMethodName, in, out, cOpts...)
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
 // SandboxManagerServer is the server API for SandboxManager service.
 // All implementations must embed UnimplementedSandboxManagerServer
 // for forward compatibility.
@@ -1356,12 +1339,6 @@ type SandboxManagerServer interface {
 	ImportSandbox(grpc.ClientStreamingServer[ImportSandboxRequest, ImportSandboxResponse]) error
 	// Internal: resolve the effective sandbox memory policy for this node.
 	ResolveSandboxMemory(context.Context, *ResolveSandboxMemoryRequest) (*ResolveSandboxMemoryResponse, error)
-	// Atomically release one runtime execution. An accepted response transfers
-	// teardown ownership to sandbox-manager: tracked rows are claimed durably
-	// and completed asynchronously, while a rowless local runtime is cleaned
-	// synchronously before the response. The caller detaches its task after
-	// either response disposition and performs no further sandbox teardown.
-	ReleaseExecution(context.Context, *ReleaseExecutionRequest) (*ReleaseExecutionResponse, error)
 	mustEmbedUnimplementedSandboxManagerServer()
 }
 
@@ -1605,9 +1582,6 @@ func (UnimplementedSandboxManagerServer) ImportSandbox(grpc.ClientStreamingServe
 }
 func (UnimplementedSandboxManagerServer) ResolveSandboxMemory(context.Context, *ResolveSandboxMemoryRequest) (*ResolveSandboxMemoryResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ResolveSandboxMemory not implemented")
-}
-func (UnimplementedSandboxManagerServer) ReleaseExecution(context.Context, *ReleaseExecutionRequest) (*ReleaseExecutionResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "method ReleaseExecution not implemented")
 }
 func (UnimplementedSandboxManagerServer) mustEmbedUnimplementedSandboxManagerServer() {}
 func (UnimplementedSandboxManagerServer) testEmbeddedByValue()                        {}
@@ -2934,24 +2908,6 @@ func _SandboxManager_ResolveSandboxMemory_Handler(srv interface{}, ctx context.C
 	return interceptor(ctx, in, info, handler)
 }
 
-func _SandboxManager_ReleaseExecution_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(ReleaseExecutionRequest)
-	if err := dec(in); err != nil {
-		return nil, err
-	}
-	if interceptor == nil {
-		return srv.(SandboxManagerServer).ReleaseExecution(ctx, in)
-	}
-	info := &grpc.UnaryServerInfo{
-		Server:     srv,
-		FullMethod: SandboxManager_ReleaseExecution_FullMethodName,
-	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(SandboxManagerServer).ReleaseExecution(ctx, req.(*ReleaseExecutionRequest))
-	}
-	return interceptor(ctx, in, info, handler)
-}
-
 // SandboxManager_ServiceDesc is the grpc.ServiceDesc for SandboxManager service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -3222,10 +3178,6 @@ var SandboxManager_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ResolveSandboxMemory",
 			Handler:    _SandboxManager_ResolveSandboxMemory_Handler,
-		},
-		{
-			MethodName: "ReleaseExecution",
-			Handler:    _SandboxManager_ReleaseExecution_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{

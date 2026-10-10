@@ -2,12 +2,6 @@
 
 use super::*;
 
-pub(crate) struct ExecutionReleaseState {
-    pub(crate) state_label: String,
-    pub(crate) runtime_label: SandboxRuntimeLabel,
-    pub(crate) failure_reason: Option<String>,
-}
-
 /// Minimal lifecycle evidence that remains readable when optional metadata or
 /// a newer lifecycle label cannot be decoded by this binary.
 #[derive(Debug)]
@@ -124,28 +118,6 @@ pub(crate) fn current_state_label(conn: &Connection, id: &str) -> Result<Option<
         "SELECT state FROM sandboxes WHERE id = ?1",
         params![id],
         |row| row.get(0),
-    )
-    .optional()
-}
-
-pub(crate) fn execution_release_state(
-    conn: &Connection,
-    id: &str,
-) -> Result<Option<ExecutionReleaseState>> {
-    conn.query_row(
-        "SELECT state, uuid8, failure_reason FROM sandboxes WHERE id = ?1",
-        params![id],
-        |row| {
-            let runtime_label_raw = row.get::<_, String>(1)?;
-            let runtime_label = SandboxRuntimeLabel::parse(runtime_label_raw).map_err(|error| {
-                rusqlite::Error::FromSqlConversionFailure(1, Type::Text, Box::new(error))
-            })?;
-            Ok(ExecutionReleaseState {
-                state_label: row.get(0)?,
-                runtime_label,
-                failure_reason: row.get(2)?,
-            })
-        },
     )
     .optional()
 }

@@ -3,10 +3,7 @@ use super::activation_support::{
     space_api_route_identity_to_wire, wake_target_state_from_proto,
 };
 use super::cache_cleanup::{ReconcileSource, cleanup_orphaned_dirs};
-use super::cleanup::{
-    AsyncCleanupRequest, CleanupAdmissionDecision, ExecutionReleaseCleanup, ReleaseExecutionClaim,
-    SynchronousCleanupRequest,
-};
+use super::cleanup::{AsyncCleanupRequest, SynchronousCleanupRequest};
 use super::cleanup_support::{CleanupCompletion, CleanupLockTryResult};
 use super::create_support::*;
 use super::network_policy::template_network_policy_from_proto;
@@ -19,10 +16,8 @@ use super::validation::{
 };
 use super::*;
 
-use pplx_space_common_core::types::ExecutionReleaseIntent;
 use pplx_space_events::{
-    SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
-    emit_sandbox_event,
+    SandboxEventDetails, SandboxEventSource, SandboxEventType, emit_sandbox_event,
 };
 use pplx_space_node_mgr_client::proto::{
     GetDiskUsageRequest as NodeGetDiskUsageRequest,
@@ -154,221 +149,7 @@ pub(super) fn pool_adoption_request(
     }
 }
 
-fn execution_release_failed_status(
-    sandbox_id: &str,
-    intent: ExecutionReleaseIntent,
-    execution_generation: pplx_space_common_core::types::ExecutionGeneration,
-    status: Status,
-) -> Status {
-    emit_sandbox_event(
-        sandbox_id,
-        match intent {
-            ExecutionReleaseIntent::Stop => SandboxEventType::StopFailed,
-            ExecutionReleaseIntent::Delete => SandboxEventType::DeleteFailed,
-        },
-        SandboxEventSource::SbxManager,
-        SandboxEventDetails::default()
-            .trigger(SandboxEventTrigger::System)
-            .operation("release_execution")
-            .action(intent.to_string())
-            .execution_generation(execution_generation.to_string())
-            .reason("execution_release_failed")
-            .error(status.message().to_string()),
-    );
-    status
-}
-
 impl SandboxManagerService {
-    pub(super) async fn release_execution(
-        &self,
-        request: Request<ReleaseExecutionRequest>,
-    ) -> Result<Response<ReleaseExecutionResponse>, Status> {
-        self.authorize_peer(
-            &request,
-            "ReleaseExecution",
-            ALLOW_SANDBOX_EXECUTION_RELEASE,
-        )?;
-        let req = request.get_ref();
-        let sandbox_id = req
-            .sandbox_id
-            .parse::<SandboxId>()
-            .map_err(|error| Status::invalid_argument(format!("invalid sandbox id: {error}")))?;
-        let sandbox_id_string = sandbox_id.to_string();
-        if sandbox_id_string != req.sandbox_id {
-            return Err(Status::invalid_argument(
-                "sandbox_id must be a canonical full sandbox id",
-            ));
-        }
-        let execution_generation =
-            pplx_space_common_core::types::ExecutionGeneration::try_from(req.execution_generation)
-                .map_err(|error| Status::invalid_argument(error.to_string()))?;
-        let intent = match ReleaseExecutionIntent::try_from(req.intent) {
-            Ok(ReleaseExecutionIntent::Stop) => ExecutionReleaseIntent::Stop,
-            Ok(ReleaseExecutionIntent::Delete) => ExecutionReleaseIntent::Delete,
-            Ok(ReleaseExecutionIntent::Unspecified) => {
-                return Err(Status::invalid_argument("intent is required"));
-            }
-            Err(_) => {
-                return Err(Status::invalid_argument(format!(
-                    "unknown intent value {}",
-                    req.intent
-                )));
-            }
-        };
-        let cleanup = ExecutionReleaseCleanup::for_intent(intent);
-
-        let (admission, uuid8) = match self
-            .admit_execution_release(
-                sandbox_id,
-                ReleaseExecutionClaim::new(execution_generation, cleanup),
-            )
-            .await
-        {
-            Ok(CleanupAdmissionDecision::ExecutionReleaseAdmitted {
-                admission,
-                runtime_label,
-            }) => {
-                pplx_space_metrics::sandbox::worker::execution_release_decision(
-                    intent,
-                    pplx_space_metrics::sandbox::worker::ExecutionReleaseDecision::Accepted,
-                );
-                emit_sandbox_event(
-                    &sandbox_id_string,
-                    match intent {
-                        ExecutionReleaseIntent::Stop => SandboxEventType::StopRequested,
-                        ExecutionReleaseIntent::Delete => SandboxEventType::DeleteRequested,
-                    },
-                    SandboxEventSource::SbxManager,
-                    SandboxEventDetails::default()
-                        .trigger(SandboxEventTrigger::System)
-                        .operation("release_execution")
-                        .execution_generation(execution_generation.to_string()),
-                );
-                (admission, runtime_label)
-            }
-            Ok(CleanupAdmissionDecision::ExecutionReleaseDetached { reason }) => {
-                pplx_space_metrics::sandbox::worker::execution_release_decision(
-                    intent,
-                    pplx_space_metrics::sandbox::worker::ExecutionReleaseDecision::Detached(reason),
-                );
-                emit_sandbox_event(
-                    &sandbox_id_string,
-                    SandboxEventType::LifecycleTransitionCasLost,
-                    SandboxEventSource::SbxManager,
-                    SandboxEventDetails::default()
-                        .trigger(SandboxEventTrigger::System)
-                        .operation("release_execution")
-                        .action(intent.to_string())
-                        .execution_generation(execution_generation.to_string())
-                        .reason(reason.to_string()),
-                );
-                return Ok(Response::new(ReleaseExecutionResponse {
-                    disposition: ReleaseExecutionDisposition::Detach as i32,
-                }));
-            }
-            Ok(CleanupAdmissionDecision::Admitted(_)) => {
-                return Err(execution_release_failed_status(
-                    &sandbox_id_string,
-                    intent,
-                    execution_generation,
-                    Status::internal("execution release produced a non-release cleanup admission"),
-                ));
-            }
-            Err(error) => {
-                return Err(execution_release_failed_status(
-                    &sandbox_id_string,
-                    intent,
-                    execution_generation,
-                    error.into_status(),
-                ));
-            }
-        };
-
-        self.watchdog.remove_sandbox(&sandbox_id_string).await;
-        self.snapshot_scheduler
-            .remove_sandbox(&sandbox_id_string)
-            .await;
-        let unpersisted = admission
-            .is_unpersisted_for_sandbox(sandbox_id)
-            .map_err(|status| {
-                execution_release_failed_status(
-                    &sandbox_id_string,
-                    intent,
-                    execution_generation,
-                    status,
-                )
-            })?;
-        if unpersisted {
-            let persistence_error = self
-                .run_cleanup_after_persistence_failure(
-                    SynchronousCleanupRequest {
-                        sandbox_id: &sandbox_id_string,
-                        uuid8: uuid8.as_str(),
-                        keep_filesystem: cleanup.keep_filesystem,
-                        context: cleanup.context,
-                        completion: cleanup.completion,
-                        published_artifact: None,
-                        immediate_kill: Self::cleanup_immediate_kill(cleanup.completion),
-                        guest_flush: crate::db::cleanup_jobs::GuestFlush::Unrequested,
-                    },
-                    admission,
-                )
-                .await
-                .map_err(|status| {
-                    execution_release_failed_status(
-                        &sandbox_id_string,
-                        intent,
-                        execution_generation,
-                        status,
-                    )
-                })?;
-            if intent == ExecutionReleaseIntent::Delete {
-                self.finish_unpersisted_delete_cleanup(&sandbox_id_string, persistence_error)
-                    .map_err(|status| {
-                        execution_release_failed_status(
-                            &sandbox_id_string,
-                            intent,
-                            execution_generation,
-                            status,
-                        )
-                    })?;
-            } else if let Some(error) = persistence_error {
-                return Err(execution_release_failed_status(
-                    &sandbox_id_string,
-                    intent,
-                    execution_generation,
-                    Status::internal(format!(
-                        "runtime cleanup completed but execution release could not be persisted for sandbox {sandbox_id}: {error}"
-                    )),
-                ));
-            }
-        } else {
-            self.schedule_admitted_async_cleanup(
-                AsyncCleanupRequest {
-                    sandbox_id,
-                    uuid8,
-                    keep_filesystem: cleanup.keep_filesystem,
-                    context: cleanup.context,
-                    completion: cleanup.completion,
-                    immediate_kill: Self::cleanup_immediate_kill(cleanup.completion),
-                    guest_flush: crate::db::cleanup_jobs::GuestFlush::Unrequested,
-                    persist_intent: false,
-                    cleanup_id: None,
-                },
-                admission,
-            )
-            .await;
-        }
-        if intent == ExecutionReleaseIntent::Delete && !unpersisted {
-            self.auto_lifecycle.remove_sandbox(&sandbox_id_string);
-        }
-        mark_sandbox_dirty(&self.db, &sandbox_id_string);
-
-        Ok(Response::new(ReleaseExecutionResponse {
-            disposition: ReleaseExecutionDisposition::LifecycleMutationAccepted as i32,
-        }))
-    }
-
     pub(super) fn finish_unpersisted_delete_cleanup(
         &self,
         sandbox_id: &str,

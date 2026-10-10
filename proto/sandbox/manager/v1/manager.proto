@@ -244,13 +244,6 @@ service SandboxManager {
 
   // Internal: resolve the effective sandbox memory policy for this node.
   rpc ResolveSandboxMemory(ResolveSandboxMemoryRequest) returns (ResolveSandboxMemoryResponse);
-
-  // Atomically release one runtime execution. An accepted response transfers
-  // teardown ownership to sandbox-manager: tracked rows are claimed durably
-  // and completed asynchronously, while a rowless local runtime is cleaned
-  // synchronously before the response. The caller detaches its task after
-  // either response disposition and performs no further sandbox teardown.
-  rpc ReleaseExecution(ReleaseExecutionRequest) returns (ReleaseExecutionResponse);
 }
 
 enum BootMode {
@@ -1635,36 +1628,6 @@ message RestoreArtifactAsNewContext {
   // these fields, in which case the restored snapshot's assignment is kept.
   optional uint64 disk_io_max_operations_per_sec = 5;
   optional uint64 disk_io_max_bandwidth_mib_per_sec = 6;
-}
-
-enum ReleaseExecutionIntent {
-  RELEASE_EXECUTION_INTENT_UNSPECIFIED = 0;
-  RELEASE_EXECUTION_INTENT_STOP = 1;
-  RELEASE_EXECUTION_INTENT_DELETE = 2;
-}
-
-enum ReleaseExecutionDisposition {
-  RELEASE_EXECUTION_DISPOSITION_UNSPECIFIED = 0;
-  // Sandbox-manager accepted teardown ownership. A tracked lifecycle intent
-  // was durably claimed for asynchronous completion, or rowless local cleanup
-  // completed synchronously before the response. The caller must detach its
-  // task and perform no further sandbox teardown.
-  RELEASE_EXECUTION_DISPOSITION_LIFECYCLE_MUTATION_ACCEPTED = 1;
-  // Sandbox-manager already owns lifecycle or a newer execution superseded
-  // the caller. The caller must detach its task and perform no further
-  // sandbox teardown.
-  RELEASE_EXECUTION_DISPOSITION_DETACH = 2;
-}
-
-message ReleaseExecutionRequest {
-  string sandbox_id = 1;
-  // Exact generation owned by the runtime task being released.
-  int64 execution_generation = 2;
-  ReleaseExecutionIntent intent = 3;
-}
-
-message ReleaseExecutionResponse {
-  ReleaseExecutionDisposition disposition = 1;
 }
 
 message AutoLifecycleDeleteReceipt {

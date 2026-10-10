@@ -35,25 +35,6 @@ fn every_local_lifecycle_round_trips_through_typed_observations() {
     "future_state".parse::<super::SandboxState>().unwrap_err();
 }
 
-#[test]
-fn execution_release_admission_is_intent_specific() {
-    let stop_states = [Started, Paused];
-    let delete_states = [Started, Paused, Failed];
-
-    for state in super::SandboxState::all() {
-        assert_eq!(
-            state.accepts_execution_release_to(Stopping),
-            stop_states.contains(&state),
-            "unexpected STOP release admission for {state}"
-        );
-        assert_eq!(
-            state.accepts_execution_release_to(Deleting),
-            delete_states.contains(&state),
-            "unexpected DELETE release admission for {state}"
-        );
-    }
-}
-
 // ---- Bug: Deleting must NOT transition to other states ----
 
 #[test]
