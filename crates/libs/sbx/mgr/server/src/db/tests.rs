@@ -8076,7 +8076,8 @@ const DB_MODULE_SOURCE: &str = concat!(
     include_str!("local_artifacts.rs"),
     include_str!("network_policy.rs"),
     include_str!("pool.rs"),
-    include_str!("restore_transfer_scopes.rs")
+    include_str!("restore_transfer_scopes.rs"),
+    include_str!("teardown_suspend.rs")
 );
 
 /// Does this line begin a statement that writes `sandbox_quarantine_state`?
