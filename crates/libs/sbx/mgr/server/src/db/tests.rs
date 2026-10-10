@@ -8069,7 +8069,11 @@ fn acquiring_a_claim_refuses_every_changed_precondition() {
 
 /// The `db` module's source as one text, for the source-shape guards below:
 /// `db.rs` and every module it glob re-exports.
-const DB_MODULE_SOURCE: &str = concat!(include_str!("../db.rs"), include_str!("eviction.rs"));
+const DB_MODULE_SOURCE: &str = concat!(
+    include_str!("../db.rs"),
+    include_str!("eviction.rs"),
+    include_str!("pool.rs")
+);
 
 /// Does this line begin a statement that writes `sandbox_quarantine_state`?
 ///
