@@ -693,3 +693,242 @@ async fn restore_releases_artifact_lock_while_waiting_for_cleanup_completion() {
     service.task_tracker.close();
     service.task_tracker.wait().await;
 }
+
+fn insert_sandbox_without_template_hash(
+    conn: &rusqlite::Connection,
+    id: &str,
+    state: SandboxState,
+) {
+    use pplx_space_common_core::types::{AutoLifecyclePolicy, SandboxOwner, SandboxRuntimeLabel};
+    let sandbox_id: SandboxId = id.parse().unwrap();
+    crate::db::insert_sandbox(
+        conn,
+        crate::db::InsertSandboxParams {
+            id,
+            uuid8: &SandboxRuntimeLabel::from_sandbox_id(sandbox_id),
+            state,
+            template: "seed",
+            template_hash: None,
+            user: &SandboxOwner::parse("user").unwrap(),
+            runtime: "fc",
+            snapshots_enabled: false,
+            rootfs_size_mb: None,
+            disk_io_limits: Default::default(),
+            pool_template: None,
+            volume_encryption: false,
+            process_env: &std::collections::BTreeMap::new(),
+            auto_lifecycle: &AutoLifecyclePolicy::disabled(),
+            network_policy_override: None,
+            network_policy_generation: 0,
+            network_policy_authority: crate::db::PolicyAuthority::Cluster,
+            auto_lifecycle_authority: crate::db::PolicyAuthority::Cluster,
+        },
+    )
+    .unwrap();
+}
+
+// Each refusal happens before Start persists anything or contacts
+// node-manager, so the row keeps the state the caller observed. Rows that carry
+// a template hash would otherwise continue to template-manager, which has no
+// test double; only the hash-less row is meant to reach template resolution.
+#[tokio::test(start_paused = true)]
+async fn start_refusals_before_activation_leave_the_row_state_unchanged() {
+    use crate::service::tests::service_tests::insert_test_sandbox;
+
+    struct Case {
+        name: &'static str,
+        state: SandboxState,
+        template_hash: bool,
+        hugepages: bool,
+        restrict_to_template_manager_owned: bool,
+        code: tonic::Code,
+        message: &'static str,
+    }
+    let cases = [
+        Case {
+            name: "template-manager may start only its own sandboxes",
+            state: SandboxState::Stopped,
+            template_hash: true,
+            hugepages: false,
+            restrict_to_template_manager_owned: true,
+            code: tonic::Code::PermissionDenied,
+            message: "only call Start for template-owned sandboxes",
+        },
+        Case {
+            name: "failed row needs deletion before any start",
+            state: SandboxState::Failed,
+            template_hash: true,
+            hugepages: false,
+            restrict_to_template_manager_owned: false,
+            code: tonic::Code::FailedPrecondition,
+            message: "requires explicit deletion before cold start",
+        },
+        Case {
+            name: "warm start needs file-backed memory",
+            state: SandboxState::Stopped,
+            template_hash: true,
+            hugepages: true,
+            restrict_to_template_manager_owned: false,
+            code: tonic::Code::FailedPrecondition,
+            message: "file-backed memory",
+        },
+        Case {
+            name: "warm start never resolves a template by name alone",
+            state: SandboxState::Stopped,
+            template_hash: false,
+            hugepages: false,
+            restrict_to_template_manager_owned: false,
+            code: tonic::Code::FailedPrecondition,
+            message: "without its saved template hash",
+        },
+    ];
+    for case in cases {
+        let conn = crate::db::test_conn();
+        let id = SandboxId::new().to_string();
+        if case.template_hash {
+            insert_test_sandbox(&conn, &id, case.state);
+        } else {
+            insert_sandbox_without_template_hash(&conn, &id, case.state);
+        }
+        let service = SandboxManagerService::new_with_config(
+            conn,
+            Default::default(),
+            crate::config::SandboxConfig {
+                hugepages: case.hugepages,
+                ..Default::default()
+            },
+        );
+        let request = StartRequest {
+            sandbox_id: id.clone(),
+            from_warm: true,
+            ..Default::default()
+        };
+
+        let error = service
+            .start_sandbox(request, case.restrict_to_template_manager_owned)
+            .await
+            .expect_err(case.name);
+
+        assert_eq!(error.code(), case.code, "{}: {error:?}", case.name);
+        assert!(
+            error.message().contains(case.message),
+            "{}: {error:?}",
+            case.name
+        );
+        assert_eq!(
+            service.lookup_sandbox(&id).unwrap().state,
+            case.state,
+            "{}",
+            case.name
+        );
+    }
+}
+
+// Without a local row a suspend-checkpoint Start restores from the cluster's
+// latest ready backup. A node with no cluster API cannot have one, so the
+// caller gets the original not-found answer rather than a retryable error, and
+// no sandbox row appears. The child process pins the cluster API endpoint
+// variables so the result does not depend on the host environment.
+#[test]
+fn missing_row_restore_without_a_cluster_api_reports_the_sandbox_not_found() {
+    use pplx_space_node_api_client::cluster::{
+        CLUSTER_API_ENDPOINT_ENV, CLUSTER_API_ENDPOINT_ENV_LEGACY,
+    };
+    if !pplx_space_test_env::enter_test_process(&[
+        (CLUSTER_API_ENDPOINT_ENV, None),
+        (CLUSTER_API_ENDPOINT_ENV_LEGACY, None),
+    ]) {
+        return;
+    }
+
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let service = crate::service::tests::service_tests::service_for_teardown_test(
+                crate::db::test_conn(),
+            );
+            let id = SandboxId::new().to_string();
+            let request = StartRequest {
+                sandbox_id: id.clone(),
+                checkpoint: Some(SUSPEND_CHECKPOINT.to_owned()),
+                route_identity: Some(crate::proto::SpaceApiRouteIdentity {
+                    sandbox_id: Some(id.clone()),
+                    route_generation: Some(3),
+                    current_node_id: Some(service.local_node_id.unwrap().to_string()),
+                    substrate_kind: crate::proto::SandboxSubstrateKind::Direct as i32,
+                    execution_generation: Some(3),
+                    activation_attempt_id: Some(SandboxActivationAttemptId::new().to_string()),
+                    pod_uid: None,
+                }),
+                ..Default::default()
+            };
+
+            let error = service
+                .start_sandbox(request, false)
+                .await
+                .expect_err("no cluster API means no registered snapshot");
+
+            assert_eq!(error.code(), tonic::Code::NotFound, "{error:?}");
+            assert_eq!(error.message(), format!("sandbox not found: {id}"));
+            assert!(
+                crate::db::get_sandbox(&service.db_conn().unwrap(), &id)
+                    .unwrap()
+                    .is_none()
+            );
+        });
+}
+
+// An in-place restore first retires any previous transfer scope. When that
+// scope cannot be cancelled, the restore stops and keeps the previous scope row
+// as the record of work still to clean up; it opens no new scope. A recorded
+// staging path that does not match the sandbox and scope id is refused before
+// any volume-manager or filesystem work, which makes the cancel fail
+// deterministically here.
+#[tokio::test]
+async fn suspend_restore_dir_keeps_a_previous_scope_it_cannot_cancel() {
+    let conn = crate::db::test_conn();
+    let id = SandboxId::new().to_string();
+    crate::service::tests::service_tests::insert_test_sandbox(&conn, &id, SandboxState::Suspended);
+    let previous = crate::db::RestoreTransferScopeRow {
+        transfer_scope_id: pplx_space_common_core::types::TransferScopeId::new(),
+        execution_generation: Some(ExecutionGeneration::new(2).unwrap()),
+        activation_attempt_id: Some(SandboxActivationAttemptId::new()),
+        staging_dir: "/synthetic/foreign/staging".to_owned(),
+    };
+    assert!(
+        crate::db::insert_restore_transfer_scope(
+            &conn,
+            &id,
+            previous.transfer_scope_id,
+            previous.execution_generation,
+            previous.activation_attempt_id,
+            &previous.staging_dir,
+        )
+        .unwrap()
+    );
+    let service = SandboxManagerService::new(conn);
+
+    let error = prepare_suspend_restore_dir(
+        &service,
+        id.clone(),
+        Some("s3://snapshots/suspend/synthetic?region=us-east-1".to_owned()),
+        Some(ExecutionGeneration::new(3).unwrap()),
+        Some(SandboxActivationAttemptId::new()),
+    )
+    .await
+    .expect_err("an uncancelled previous scope must stop the restore");
+
+    let crate::snapshot_restore::RestoreError::Other(message) = &error else {
+        panic!("unexpected restore error: {error:?}");
+    };
+    assert!(
+        message.contains("cancel previous restore transfer scope"),
+        "{message}"
+    );
+    assert_eq!(
+        crate::db::restore_transfer_scope(&service.db_conn().unwrap(), &id).unwrap(),
+        Some(previous)
+    );
+}

@@ -1375,3 +1375,6 @@ pub(super) fn create_route_evidence_before_start(
     }
     crate::auto_lifecycle_delete_receipts::RouteEvidence::from_identity(identity, provenance)
 }
+
+#[cfg(test)]
+mod tests;
