@@ -232,6 +232,52 @@ Datadog collection, or metrics/traces settings. It includes local-only UI access
 an existing-process-fixture validation workflow, and scoped cleanup commands.
 The ingestion and visualization releases can still be managed independently.
 
+### Querying telemetry
+
+In `otel` mode both bring-up paths forward each backend to localhost, as they
+do the API (bootstrap unless `--no-port-forward`), and restart a forward
+whenever its pod restarts:
+
+| Backend | URL |
+| --- | --- |
+| Prometheus | <http://localhost:19090> |
+| Tempo | <http://localhost:13200> |
+| Loki | <http://localhost:13101> |
+| Grafana | <http://localhost:13000> |
+
+Each backend's own `local.sh ui` helper uses the same port, for a backend
+installed on its own. Every signal can be read with `curl`:
+
+```bash
+now=$(date +%s)
+
+# PromQL. OTLP resource attributes are labels: service_name, k8s_pod_name, ...
+curl -sG localhost:19090/api/v1/query \
+  --data-urlencode 'query=count by (service_name) ({__name__=~"space_.+"})'
+curl -sG localhost:19090/api/v1/query \
+  --data-urlencode 'query=histogram_quantile(0.9, sum by (op) (rate(space_sandbox_api_latency_milliseconds[15m])))'
+
+# TraceQL search, then the whole trace by an ID it returned.
+curl -sG localhost:13200/api/search \
+  --data-urlencode 'q={resource.service.name="space-api" && status=error}' \
+  -d start=$((now - 3600)) -d end=$now -d limit=20
+curl -s localhost:13200/api/v2/traces/TRACE_ID_FROM_THE_SEARCH
+
+# LogQL. Lines are JSON; `| json` exposes their fields, such as sandbox_id.
+curl -sG localhost:13101/loki/api/v1/query_range \
+  --data-urlencode 'query={namespace="space"} | json | sandbox_id="SANDBOX_ID"' \
+  -d start=$((now - 3600))000000000 -d end=${now}000000000 -d limit=100
+```
+
+Tempo search never returns the newest 30 seconds, whatever `end` says
+(`query_end_cutoff`), and rejects a window that the cutoff leaves empty, so
+poll for a trace you just caused; fetching a trace by ID has no such delay.
+For tag values use `/api/v2/search/tag/resource.service.name/values`: the v1
+route answers scoped names with an empty list. Span IDs in fetched traces are
+base64. Log lines carry `sandbox_id` where the service knows it, but no trace
+ID, so join logs to traces by sandbox ID and time. Grafana shows the same
+three datasources and the packaged dashboards.
+
 ### Datadog (optional)
 
 The Kind-only `datadog-agent-local` chart supports two explicit backends:
