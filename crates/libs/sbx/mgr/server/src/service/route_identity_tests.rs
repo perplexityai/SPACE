@@ -410,8 +410,9 @@ impl RouteSigningKey {
     }
 }
 
-/// What a refresh does to the installed verifier. `Unchanged`, `Absent`, and
-/// the rejection variants differ only in telemetry, so they are not split.
+/// What a refresh does to the installed verifier. Only the Ok/Err split of the
+/// private function's result is kept; the variants inside each side differ
+/// only in telemetry.
 #[derive(Debug, PartialEq, Eq)]
 enum RefreshOutcome {
     Installed(u64),
