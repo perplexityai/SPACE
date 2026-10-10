@@ -364,7 +364,10 @@ async fn cleanup_phase_acquisition_stops_when_shutdown_begins() {
 
 #[tokio::test(start_paused = true)]
 async fn timed_out_cleanup_releases_the_registry_claim_for_retry() {
-    let service = crate::service::tests::service_tests::service_for_unit_tests().await;
+    let (_supervisor_socket, client, supervisor) =
+        crate::runtime_supervisor_client::tests::scripted_client(Default::default()).await;
+    let mut service = crate::service::tests::service_tests::service_for_unit_tests().await;
+    service.runtime_supervisor = client;
     let id = SandboxId::new();
     let device = service.sandbox_device_stack_lock(&id).await;
     let ownership = device.lock_owned().await;
@@ -400,6 +403,7 @@ async fn timed_out_cleanup_releases_the_registry_claim_for_retry() {
         })
         .await
         .expect("timed-out cleanup must release the registry claim for retry");
+    crate::runtime_supervisor_client::tests::stop_supervisor_server(supervisor).await;
 }
 
 struct CleanupNode {
@@ -411,7 +415,9 @@ struct CleanupNode {
 }
 
 impl CleanupNode {
-    /// A bound, leased sandbox whose supervisor acknowledges runtime stop.
+    /// A bound, leased sandbox. Its test-owned supervisor refuses runtime
+    /// stop, so a cleanup refusal that regresses ends there instead of
+    /// touching host artifacts or a real supervisor.
     async fn leased() -> Self {
         let (supervisor_socket, client, supervisor) =
             crate::runtime_supervisor_client::tests::scripted_client(Default::default()).await;
@@ -527,25 +533,10 @@ async fn blocked_cleanup_phase_times_out_before_stopping_the_runtime(
     {
         return;
     }
-    // The default supervisor client is unreachable: a cleanup that skipped
-    // the wait would fail on runtime stop instead of on this phase.
-    let service = crate::service::tests::service_tests::service_for_unit_tests().await;
-    service.pool.set_all_slots_ready_for_test();
-    let id = SandboxId::new();
-    let execution_fence =
-        crate::service::tests::service_tests::bind_test_execution(&service, &id.to_string());
-    service
-        .pool
-        .allocate(
-            &id.to_string(),
-            None,
-            Some(crate::slot_pool::NewLeaseMemoryReservation {
-                memory_reservation_mib: 1024,
-            }),
-        )
-        .await
-        .unwrap();
-    let before = service.pool.get(&id.to_string()).unwrap().unwrap();
+    let node = CleanupNode::leased().await;
+    let service = &node.service;
+    let id = node.sandbox_id;
+    let before = node.lease();
     let held: Box<dyn std::any::Any + Send> = match blocker {
         CleanupBlocker::Capacity => Box::new(
             service
@@ -569,17 +560,7 @@ async fn blocked_cleanup_phase_times_out_before_stopping_the_runtime(
                 .await,
         ),
     };
-    let cleanup = service.run_cleanup_sandbox_operation(
-        id,
-        CleanupSandboxRequest {
-            execution_fence: Some(execution_fence),
-            sandbox_id: id.to_string(),
-            force: true,
-            ..Default::default()
-        },
-        None,
-    );
-    tokio::pin!(cleanup);
+    let mut cleanup = Box::pin(node.cleanup(node.request(), None));
     assert!(futures_util::poll!(&mut cleanup).is_pending());
     tokio::time::advance(CLEANUP_PHASE_ACQUIRE_TIMEOUT).await;
 
@@ -587,13 +568,9 @@ async fn blocked_cleanup_phase_times_out_before_stopping_the_runtime(
 
     assert_eq!(error.code(), tonic::Code::Unavailable, "{error}");
     assert_eq!(error.message(), message);
-    let after = service.pool.get_record(&id.to_string()).unwrap().unwrap();
-    assert_eq!(after.state, crate::slot_pool::SlotState::Leased);
-    assert_eq!(
-        (after.info.slot, after.info.generation),
-        (before.slot, before.generation)
-    );
+    assert_eq!(node.lease(), before);
     drop(held);
+    node.stop().await;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

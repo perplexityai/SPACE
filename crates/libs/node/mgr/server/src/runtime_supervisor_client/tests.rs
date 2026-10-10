@@ -251,8 +251,9 @@ pub(crate) type StopProcessReply = Arc<
     dyn Fn(proto::StopProcessRequest) -> Result<proto::StopProcessResponse, Status> + Send + Sync,
 >;
 
-/// Supervisor replies for node-manager RPC tests. Runtime stop is always
-/// acknowledged; `None` keeps the stub's default reply.
+/// Supervisor replies for node-manager RPC tests; `None` keeps the stub's
+/// default reply. Runtime stop always fails with `Unimplemented`, so a refusal
+/// that regresses past its check ends at the stop instead of host cleanup.
 #[derive(Clone, Default)]
 pub(crate) struct SupervisorScript {
     pub(crate) bind_execution_failure: Option<tonic::Code>,
@@ -268,7 +269,7 @@ pub(crate) async fn scripted_client(
 ) {
     let (root, path) = test_socket_path();
     let mut stub = StubRuntimeSupervisor::counting(Arc::new(AtomicUsize::new(0)));
-    stub.stop_failures = Some(Arc::new(AtomicUsize::new(0)));
+    stub.stop_status = tonic::Code::Unimplemented;
     stub.script = script;
     let server = spawn_supervisor_server(&path, stub).await;
     let client = supervisor_test_client(path, Arc::new(AtomicUsize::new(0)));

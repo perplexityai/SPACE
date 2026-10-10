@@ -278,9 +278,16 @@ async fn allocate_refusal_grants_no_lease(
             bind_test_execution(&node.service, &sandbox_id);
         }
         AllocateRefusal::SupervisorBindFailure => {}
-        AllocateRefusal::UnnamedPodNetns => request.netns_path = Some("/".to_string()),
+        // A pod netns sends allocation through slot setup, which rebuilds
+        // host networking. A draining pool refuses before that if the netns
+        // check regresses.
+        AllocateRefusal::UnnamedPodNetns => {
+            request.netns_path = Some("/".to_string());
+            node.service.pool.set_draining(true).unwrap();
+        }
         AllocateRefusal::MissingPodNetns => {
             request.netns_path = Some(format!("/var/run/netns/space-test-{sandbox_id}"));
+            node.service.pool.set_draining(true).unwrap();
         }
         AllocateRefusal::MissingMemoryDemand => request.sandbox_cgroup_memory_mib = 0,
         AllocateRefusal::ClosedLimiter => node.service.lifecycle_limiter.close(),
@@ -416,6 +423,8 @@ async fn release_refusal_keeps_the_lease(
     #[case] code: Code,
     #[case] message: &str,
 ) {
+    // The supervisor refuses runtime stop, so a refusal that regresses ends
+    // there, before slot release and root-namespace DNAT cleanup.
     let node = Node::start(SupervisorScript::default()).await;
     let sandbox_id = SandboxId::new().to_string();
     let fence = bind_test_execution(&node.service, &sandbox_id);
