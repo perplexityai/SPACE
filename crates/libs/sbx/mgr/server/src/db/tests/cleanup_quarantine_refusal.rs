@@ -271,8 +271,13 @@ fn generic_cleanup_writers_refuse_quarantined_and_missing_rows() {
         // `mark_cleanup_required` reports no outcome, so a missing row says
         // nothing about it.
         if refused.is_some() {
+            let before = persisted(&conn, "missing");
             assert_eq!(writer(&conn, "missing"), refused, "{writer_name}: missing");
-            assert_eq!(persisted(&conn, "missing").sandbox, None, "{writer_name}");
+            assert_eq!(
+                persisted(&conn, "missing"),
+                before,
+                "{writer_name} must not create a row"
+            );
         }
     }
 }
