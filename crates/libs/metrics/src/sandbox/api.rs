@@ -676,6 +676,17 @@ pub fn sandbox_created(tls_interception_on: bool) {
     );
 }
 
+/// One completed create, tagged with where its vCPU and memory came from.
+/// `shape_source:default` means the platform default shape applied.
+pub fn create_shape_source(shape_source: &str, runtime: &str, template: &str) {
+    let tags = [
+        tag("shape_source", shape_source),
+        tag("runtime", runtime),
+        tag("template", template),
+    ];
+    counter("sandbox.api.create.shape_source", 1, &tags);
+}
+
 pub fn create_step_latency(sandbox_id: SandboxId, sample: CreateStep<'_>) {
     api_step_latency(
         sandbox_id,

@@ -876,3 +876,15 @@ Retained traces are a diagnostic sample. Tail retention and missing spans can
 bias cohort shares and percentiles. Use independently counted caller requests
 for population latency, error and cancellation rates; restore counters and
 reconnect-attempt counters do not necessarily count one event per connect.
+
+## Sandbox create shape
+
+`create_completed` events carry the resolved `vcpu` and `memory_mib` and a
+`shape_source` naming where they came from: `request`, `pool_config` (an
+exact-release pool config or claimed warm slot), `policy` (a
+`retain_shape_on_miss` warm-pool policy), `build` (the release's build shape),
+or `default`. A partial request reports the fallback that filled the gap. The
+`space.sandbox.api.create.shape_source` counter is tagged `shape_source`,
+`runtime` and `template`. A non-zero `shape_source:default` count means creates
+fell back to the platform default shape; those events omit `vcpu` and
+`memory_mib`. Direct creates and forks omit `shape_source`.

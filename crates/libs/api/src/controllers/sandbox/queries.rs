@@ -563,6 +563,46 @@ fn pooled_prepare_failure_action(
 struct KubernetesPoolAssignment {
     resources: SandboxResources,
     disk_io_limits: DiskIoLimits,
+    source: CreateShapeSource,
+}
+
+/// Where a Kubernetes create's vCPU and memory came from, reported on
+/// `create_completed`. A partial request reports the fallback that filled the
+/// gap (`build` or `default`), not `request`. `default` means the node shim
+/// boots the unset fields at its fixed defaults.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CreateShapeSource {
+    Request,
+    PoolConfig,
+    Policy,
+    Build,
+    Default,
+}
+
+impl CreateShapeSource {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Request => "request",
+            Self::PoolConfig => "pool_config",
+            Self::Policy => "policy",
+            Self::Build => "build",
+            Self::Default => "default",
+        }
+    }
+}
+
+/// Stamps `shape_source` on a `create_completed` event and counts it.
+fn with_shape_source(
+    details: SandboxEventDetails,
+    source: Option<CreateShapeSource>,
+    runtime: &str,
+    template: &str,
+) -> SandboxEventDetails {
+    let Some(source) = source else {
+        return details;
+    };
+    pplx_space_metrics::sandbox::api::create_shape_source(source.as_str(), runtime, template);
+    details.shape_source(source.as_str())
 }
 
 struct ColdCreateShapeInput<'a> {
@@ -592,7 +632,7 @@ struct ColdCreateShapeInput<'a> {
 async fn resolve_cold_create_resources(
     pool: &PgPool,
     input: ColdCreateShapeInput<'_>,
-) -> Result<(SandboxResources, DiskIoLimits), ControllerError> {
+) -> Result<(SandboxResources, DiskIoLimits, Option<CreateShapeSource>), ControllerError> {
     let ColdCreateShapeInput {
         capabilities,
         runtime,
@@ -604,7 +644,7 @@ async fn resolve_cold_create_resources(
         restoring,
     } = input;
     if !capabilities.resolves_cold_create_shape || runtime != RuntimeKind::Firecracker {
-        return Ok((requested, DiskIoLimits::default()));
+        return Ok((requested, DiskIoLimits::default(), None));
     }
     if boot_mode == CreateBootMode::Fallthrough
         && let Some(pool_assignment) = resolve_kubernetes_pool_configured_resources(
@@ -622,17 +662,32 @@ async fn resolve_cold_create_resources(
             memory_mib = ?pool_assignment.resources.memory_mib,
             "using Kubernetes pool resources for cold fallthrough create"
         );
-        return Ok((pool_assignment.resources, pool_assignment.disk_io_limits));
+        return Ok((
+            pool_assignment.resources,
+            pool_assignment.disk_io_limits,
+            Some(pool_assignment.source),
+        ));
     }
-    if restoring || (requested.vcpu.is_some() && requested.memory_mib.is_some()) {
-        return Ok((requested, DiskIoLimits::default()));
+    if restoring {
+        return Ok((requested, DiskIoLimits::default(), None));
+    }
+    if requested.vcpu.is_some() && requested.memory_mib.is_some() {
+        return Ok((
+            requested,
+            DiskIoLimits::default(),
+            Some(CreateShapeSource::Request),
+        ));
     }
     let shape =
         crate::template_inventory_store::release_build_shape(pool, template, content_hash, runtime)
             .await
             .map_err(|err| db_contention_error("failed to load template build shape", &err))?;
     let Some(shape) = shape else {
-        return Ok((requested, DiskIoLimits::default()));
+        return Ok((
+            requested,
+            DiskIoLimits::default(),
+            Some(CreateShapeSource::Default),
+        ));
     };
     let resources = SandboxResources {
         vcpu: requested.vcpu.or(Some(shape.vcpu.get().get())),
@@ -648,7 +703,11 @@ async fn resolve_cold_create_resources(
         memory_mib = ?resources.memory_mib,
         "using the template's build shape for unset create resources"
     );
-    Ok((resources, DiskIoLimits::default()))
+    Ok((
+        resources,
+        DiskIoLimits::default(),
+        Some(CreateShapeSource::Build),
+    ))
 }
 
 fn validate_inherited_pool_disk(disk_mib: Option<u32>) -> Result<(), ControllerError> {
@@ -688,7 +747,7 @@ async fn resolve_kubernetes_pool_configured_resources(
     if let Some(assignment) = enabled_pool_assignment(pool, template_release_id).await? {
         return Ok(Some(assignment));
     }
-    parse_kubernetes_pool_assignment(policy_assignment).map(Some)
+    parse_kubernetes_pool_assignment(policy_assignment, CreateShapeSource::Policy).map(Some)
 }
 
 async fn enabled_pool_assignment(
@@ -699,12 +758,15 @@ async fn enabled_pool_assignment(
         .preferred_enabled_plaintext_assignment(template_release_id)
         .await
         .map_err(|err| pool_store_error("failed to load Kubernetes pool resources", &err))?
-        .map(parse_kubernetes_pool_assignment)
+        .map(|assignment| {
+            parse_kubernetes_pool_assignment(assignment, CreateShapeSource::PoolConfig)
+        })
         .transpose()
 }
 
 fn parse_kubernetes_pool_assignment(
     assignment: pplx_space_cluster_pool::PoolAssignment,
+    source: CreateShapeSource,
 ) -> Result<KubernetesPoolAssignment, ControllerError> {
     validate_inherited_pool_disk(assignment.disk_mib)?;
     let memory_mib = u32::try_from(assignment.memory.as_mib_floor())
@@ -716,6 +778,7 @@ fn parse_kubernetes_pool_assignment(
             disk_mib: assignment.disk_mib,
         },
         disk_io_limits: assignment.disk_io_limits,
+        source,
     })
 }
 
@@ -1313,7 +1376,7 @@ impl SandboxController {
                 "boot_mode=pool requested but no warm-pool sandbox is available",
             ));
         }
-        let (resources, disk_io_limits) = resolve_cold_create_resources(
+        let (resources, disk_io_limits, shape_source) = resolve_cold_create_resources(
             pool,
             ColdCreateShapeInput {
                 capabilities: self.substrate.capabilities(),
@@ -1803,18 +1866,16 @@ impl SandboxController {
         // record `create_pending` rather than `create_completed`. The client
         // gets the sandbox id and its data-plane retry reaches the runtime once
         // ready.
-        let create_event = if outcome.command_ready {
-            SandboxEventType::CreateCompleted
+        let details = create_event_details()
+            .lifecycle_state(&sandbox.lifecycle)
+            .placement(&sandbox.placement);
+        let (create_event, details) = if outcome.command_ready {
+            let details = with_shape_source(details, shape_source, &backend, template);
+            (SandboxEventType::CreateCompleted, details)
         } else {
-            SandboxEventType::CreatePending
+            (SandboxEventType::CreatePending, details)
         };
-        emit_create_sandbox_event(
-            sandbox.id,
-            create_event,
-            create_event_details()
-                .lifecycle_state(&sandbox.lifecycle)
-                .placement(&sandbox.placement),
-        );
+        emit_create_sandbox_event(sandbox.id, create_event, details);
 
         create_path.mark_request_succeeded();
         pplx_space_metrics::sandbox::api::sandbox_created(tls_interception_on);
@@ -2296,9 +2357,14 @@ impl SandboxController {
             emit_create_sandbox_event(
                 sandbox.id,
                 SandboxEventType::CreateCompleted,
-                create_event_details()
-                    .lifecycle_state(&sandbox.lifecycle)
-                    .placement(&sandbox.placement),
+                with_shape_source(
+                    create_event_details()
+                        .lifecycle_state(&sandbox.lifecycle)
+                        .placement(&sandbox.placement),
+                    Some(CreateShapeSource::PoolConfig),
+                    input.backend,
+                    input.template,
+                ),
             );
 
             if prepare_attempt > 1 {
@@ -2552,9 +2618,14 @@ impl SandboxController {
         emit_create_sandbox_event(
             sandbox.id,
             SandboxEventType::CreateCompleted,
-            create_event_details()
-                .lifecycle_state(&sandbox.lifecycle)
-                .placement(&sandbox.placement),
+            with_shape_source(
+                create_event_details()
+                    .lifecycle_state(&sandbox.lifecycle)
+                    .placement(&sandbox.placement),
+                Some(CreateShapeSource::PoolConfig),
+                input.backend,
+                input.template,
+            ),
         );
         pplx_space_metrics::warm_pool::acquire_duration(
             input.template,

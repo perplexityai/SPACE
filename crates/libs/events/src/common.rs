@@ -81,6 +81,7 @@ macro_rules! sandbox_event {
             vcpu = detail_str(&$details.vcpu),
             memory_mib = detail_str(&$details.memory_mib),
             disk_mib = detail_str(&$details.disk_mib),
+            shape_source = detail_str(&$details.shape_source),
             guest_cid = detail_str(&$details.guest_cid),
             guest_ip = detail_str(&$details.guest_ip),
             guest_gateway = detail_str(&$details.guest_gateway),

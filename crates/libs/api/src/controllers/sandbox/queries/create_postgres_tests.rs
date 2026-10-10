@@ -1792,14 +1792,15 @@ async fn postgres_kubernetes_create_fills_unset_resources_from_the_template_shap
     let shape =
         |resources: &SandboxResources| (resources.vcpu, resources.memory_mib, resources.disk_mib);
 
-    let (resources, _) = resolve(k8s, CreateBootMode::Fallthrough, unset()).await?;
+    let (resources, _, source) = resolve(k8s, CreateBootMode::Fallthrough, unset()).await?;
+    assert_eq!(source, Some(CreateShapeSource::Build));
     assert_eq!(
         shape(&resources),
         (Some(4), Some(4096), None),
         "an unshaped Kubernetes create must not boot at the shim's fixed defaults"
     );
 
-    let (resources, _) = resolve(
+    let (resources, _, source) = resolve(
         k8s,
         CreateBootMode::Cold,
         SandboxResources {
@@ -1814,15 +1815,21 @@ async fn postgres_kubernetes_create_fills_unset_resources_from_the_template_shap
         (Some(4), Some(2048), Some(8192)),
         "requested values win; only unset ones come from the template"
     );
+    assert_eq!(
+        source,
+        Some(CreateShapeSource::Build),
+        "a partial request reports the fill"
+    );
 
-    let (resources, _) = resolve(space, CreateBootMode::Fallthrough, unset()).await?;
+    let (resources, _, source) = resolve(space, CreateBootMode::Fallthrough, unset()).await?;
+    assert_eq!(source, None);
     assert_eq!(
         shape(&resources),
         (None, None, None),
         "direct creates keep the node's snapshot or metadata shape"
     );
 
-    let (resources, _) = resolve_with(k8s, CreateBootMode::Cold, unset(), true).await?;
+    let (resources, _, _) = resolve_with(k8s, CreateBootMode::Cold, unset(), true).await?;
     assert_eq!(
         shape(&resources),
         (None, None, None),
@@ -1840,12 +1847,31 @@ async fn postgres_kubernetes_create_fills_unset_resources_from_the_template_shap
     .bind(release_id)
     .execute(&db.pool)
     .await?;
-    let (resources, _) = resolve(k8s, CreateBootMode::Fallthrough, unset()).await?;
+    let (resources, _, source) = resolve(k8s, CreateBootMode::Fallthrough, unset()).await?;
     assert_eq!(
         shape(&resources),
         (Some(2), Some(8192), Some(32768)),
         "a configured pool shape still wins for a fallthrough create"
     );
+    assert_eq!(source, Some(CreateShapeSource::PoolConfig));
+
+    // A release with no build shape falls back to the shim default.
+    let (resources, _, source) = resolve_cold_create_resources(
+        &db.pool,
+        ColdCreateShapeInput {
+            capabilities: k8s,
+            runtime: RuntimeKind::Firecracker,
+            boot_mode: CreateBootMode::Cold,
+            template: &template,
+            content_hash: "sha256:unshaped",
+            template_release_id: release_id,
+            requested: unset(),
+            restoring: false,
+        },
+    )
+    .await?;
+    assert_eq!(shape(&resources), (None, None, None));
+    assert_eq!(source, Some(CreateShapeSource::Default));
     Ok(())
 }
 
@@ -1873,6 +1899,7 @@ async fn postgres_pool_miss_can_retain_rolling_policy_shape_before_materializati
     assert_eq!(assignment.resources.vcpu, Some(4));
     assert_eq!(assignment.resources.memory_mib, Some(8192));
     assert_eq!(assignment.resources.disk_mib, Some(32768));
+    assert_eq!(assignment.source, CreateShapeSource::Policy);
     assert_eq!(
         assignment.disk_io_limits,
         DiskIoLimits::try_new(2_000, 200).unwrap()
