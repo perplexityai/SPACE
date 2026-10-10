@@ -173,20 +173,33 @@ fn startup_leasing_reprobe_skips_claimed_sandboxes_and_keeps_the_obligation() {
 /// Only the deferred exit is pinned here. An admitted reset reaches host
 /// cleanup (node-ctl notification, cgroupfs, the fixed cache root and network
 /// teardown), so it stays out of this unit layer.
+#[cfg(unix)]
 #[tokio::test(flavor = "current_thread")]
 async fn reset_slot_defers_a_claimed_sandbox_and_requeues_itself() {
+    use std::os::unix::fs::MetadataExt;
     for holder in Holder::ALL {
         let sandbox_id = SandboxId::new().to_string();
-        let (pool, mut wakeups) = pool_with_wakeups(NetworkPoolConfig::new(1));
+        // Barrier for a regressed reset that ignores the claim: a cache file
+        // still owned by the lease UID fails the retained-cache check before
+        // network teardown. The deferred path never reaches it.
+        let cache_root = tempfile::tempdir().unwrap();
+        let sandbox_cache = cache_root.path().join(&sandbox_id);
+        std::fs::create_dir_all(&sandbox_cache).unwrap();
+        let retained_file = sandbox_cache.join("owned-by-lease-uid");
+        std::fs::write(&retained_file, b"retained cache").unwrap();
+        let lease_uid = std::fs::symlink_metadata(&retained_file).unwrap().uid();
+        let mut config = NetworkPoolConfig::new(1);
+        config.sandbox_cache_dir = cache_root.path().to_path_buf();
+        let (pool, mut wakeups) = pool_with_wakeups(config);
         pool.db
             .lock()
             .unwrap()
             .execute(
                 "UPDATE network_slots
                  SET generation = 1, state = 'dirty', health = 'unknown',
-                     sandbox_id = ?1, pid = NULL, lease_kind = ?2
+                     sandbox_id = ?1, sandbox_uid = ?2, pid = NULL, lease_kind = ?3
                  WHERE slot_id = 0",
-                params![sandbox_id, LeaseKind::Ephemeral.as_str()],
+                params![sandbox_id, lease_uid, LeaseKind::Ephemeral.as_str()],
             )
             .unwrap();
         drain(&mut wakeups);
@@ -194,10 +207,16 @@ async fn reset_slot_defers_a_claimed_sandbox_and_requeues_itself() {
         let claim = holder.claim(&pool, &sandbox_id);
         reset_slot(pool.clone(), 0).await;
         let deferred = slot(&pool, 0);
-        assert_eq!(deferred.state, SlotState::Dirty, "{holder:?}");
-        assert_eq!(deferred.info.generation, 1, "{holder:?}");
-        assert_eq!(deferred.health, SlotHealth::Unknown, "{holder:?}");
-        assert_eq!(deferred.last_error, None, "{holder:?}");
+        assert_eq!(
+            (
+                deferred.state,
+                deferred.info.generation,
+                deferred.health,
+                deferred.last_error.as_deref()
+            ),
+            (SlotState::Dirty, 1, SlotHealth::Unknown, None),
+            "{holder:?}"
+        );
         assert!(
             wakeups.try_recv().is_ok(),
             "{holder:?}: a deferred reset must schedule its own retry"

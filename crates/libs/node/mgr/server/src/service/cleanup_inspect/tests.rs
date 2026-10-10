@@ -401,3 +401,62 @@ async fn busy_device_cleanup_times_out_before_mutating_the_sandbox() {
         .await
         .expect("timed-out cleanup must release the registry claim for retry");
 }
+
+/// Cleanup owns the sandbox exclusively: it refuses while startup work,
+/// cleanup or reset holds the claim, and gives the claim back when it returns.
+/// `cleanup_sandbox` also inspects the fixed cache root on its way out, so the
+/// claim is exercised through the operation it runs.
+#[tokio::test(start_paused = true)]
+async fn cleanup_refuses_a_claimed_sandbox_and_keeps_no_claim() {
+    type Claim = fn(
+        &crate::slot_pool::NetworkPool,
+        &str,
+    ) -> Option<Arc<crate::slot_pool::SandboxMutationClaim>>;
+    let service = crate::service::tests::service_tests::service_for_unit_tests().await;
+    let id = SandboxId::new();
+    let sandbox_id = id.to_string();
+    // Barrier for a regressed cleanup that ignores the claim: the held cgroup
+    // gate stops it before any host phase, with a different timeout message.
+    let _gate = service
+        .sandbox_cgroup_gate_lock(&sandbox_id)
+        .await
+        .read_owned()
+        .await;
+    let holders: [(&str, Claim); 2] = [
+        (
+            "startup work",
+            crate::slot_pool::NetworkPool::try_claim_sandbox_work,
+        ),
+        (
+            "cleanup or reset",
+            crate::slot_pool::NetworkPool::try_claim_sandbox_mutation,
+        ),
+    ];
+    for (holder, claim) in holders {
+        let owner = claim(&service.pool, &sandbox_id).unwrap();
+        let error = service
+            .run_cleanup_sandbox_operation(
+                id,
+                CleanupSandboxRequest {
+                    sandbox_id: sandbox_id.clone(),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::Unavailable, "{holder}: {error}");
+        assert_eq!(
+            error.message(),
+            "sandbox host mutation or reset is in progress; retry",
+            "{holder}"
+        );
+        drop(owner);
+        drop(
+            service
+                .pool
+                .try_claim_sandbox_mutation(&sandbox_id)
+                .unwrap_or_else(|| panic!("{holder}: refused cleanup kept a claim")),
+        );
+    }
+}

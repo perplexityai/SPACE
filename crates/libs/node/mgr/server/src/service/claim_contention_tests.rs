@@ -7,8 +7,9 @@
 //!
 //! Requests carry no execution fence and no lease, so an admitted call stops
 //! at its first post-claim check, before any host access. That outcome is
-//! distinct from every claim refusal. Calls that reach fixed host paths
-//! whatever their outcome (CleanupSandbox) stay out of this unit layer.
+//! distinct from every claim refusal. The CleanupSandbox wrapper inspects the
+//! fixed cache root whatever its outcome, so cleanup_inspect::tests pins its
+//! claim through the cleanup operation instead.
 
 use super::tests::service_tests::service_for_unit_tests;
 use super::*;
@@ -481,6 +482,15 @@ async fn clone_refuses_either_owned_sandbox_without_retaining_the_other() {
     // the second claim from both clone directions.
     for (donor, target) in [(&low, &high), (&high, &low)] {
         for (owned, other) in [(donor, target), (target, donor)] {
+            // Holding the owned sandbox's cgroup gate stops any clone that
+            // gets past both claims before it opens the clone tree. That is
+            // the in-flight launch below, and a barrier for a regressed
+            // refusal here.
+            let launch_gate = service
+                .sandbox_cgroup_gate_lock(owned)
+                .await
+                .read_owned()
+                .await;
             let context = format!("clone {donor} -> {target} with {owned} in cleanup");
             let owner = Holder::CleanupOrReset.claim(&service, owned);
             assert_refused(clone(donor, target).await.map(drop), WORK_REFUSED, &context);
@@ -488,15 +498,8 @@ async fn clone_refuses_either_owned_sandbox_without_retaining_the_other() {
             drop(owner);
 
             // A donor or target with in-flight startup work may still clone.
-            // The in-flight launch's cgroup gate stops the admitted clone
-            // after both claims and before it opens the clone tree.
             let context = format!("clone {donor} -> {target} with {owned} launching");
             let startup = Holder::StartupWork.claim(&service, owned);
-            let launch_gate = service
-                .sandbox_cgroup_gate_lock(owned)
-                .await
-                .read_owned()
-                .await;
             let error = clone(donor, target).await.unwrap_err();
             assert_eq!(error.code(), tonic::Code::Unavailable, "{context}");
             assert_eq!(
