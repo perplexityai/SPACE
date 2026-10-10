@@ -1938,6 +1938,40 @@ fn orphan_plan(
     }
 }
 
+/// Fails to compile when a reason code is added, until the sweep below lists it.
+fn _all_reasons_listed(reason: pplx_space_common_core::types::SandboxQuarantineReasonCode) {
+    use pplx_space_common_core::types::SandboxQuarantineReasonCode as Reason;
+    match reason {
+        Reason::Unspecified
+        | Reason::RuntimeProbeInconsistent
+        | Reason::SuspendSnapshotPublicationFailed
+        | Reason::OrphanedSandboxRowMissing
+        | Reason::CreateInterrupted
+        | Reason::ColdActivationInterrupted
+        | Reason::RestoreActivationInterrupted
+        | Reason::ColdActivationPrepareFailed
+        | Reason::ColdActivationMetadataFailed
+        | Reason::ColdActivationEncryptedRootfsPrepareFailed
+        | Reason::ColdActivationFirecrackerLaunchFailed
+        | Reason::ColdActivationSidecarLaunchFailed
+        | Reason::RestorePrepareFailed
+        | Reason::RestoreMetadataFailed
+        | Reason::RestoreEncryptedDevicesPrepareFailed
+        | Reason::RestoreFirecrackerLaunchFailed
+        | Reason::RestoreNetGatewayLaunchFailed
+        | Reason::RestoreSnapshotLoadFailed
+        | Reason::RestoreSpacedHostLaunchFailed
+        | Reason::RestoreResumeFailed
+        | Reason::PauseFailed
+        | Reason::CheckpointResumeFailed
+        | Reason::ResidentResumeFailed
+        | Reason::SnapshotRollbackCleanupFailed
+        | Reason::NodePublishedQuarantined
+        | Reason::OrphanedExecutionMissingArtifact
+        | Reason::OrphanedExecutionLegacyDeletingState => {}
+    }
+}
+
 /// Only an orphaned-row plan may restore over a quarantined row; a plan for any
 /// other reason is declined without staging, even when the local episode is an
 /// orphan.
@@ -1948,9 +1982,9 @@ fn orphan_plan(
 #[tokio::test]
 async fn orphan_restore_declines_a_plan_for_a_different_quarantine_reason() {
     use pplx_space_common_core::types::SandboxQuarantineReasonCode as Reason;
-    // Written out like the db-layer reason-policy table: the enum has no `all()`.
-    // `OrphanedSandboxRowMissing` is excluded because it is the plan reason that
-    // proceeds.
+    // Written out because the enum has no `all()`; `_all_reasons_listed` keeps
+    // the list complete. `OrphanedSandboxRowMissing` is excluded because it is the
+    // plan reason that proceeds.
     let reasons = [
         Reason::Unspecified,
         Reason::RuntimeProbeInconsistent,
