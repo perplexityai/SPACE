@@ -548,12 +548,15 @@ async fn create_snapshot_refuses_invalid_requests_before_dialing_firecracker() {
 // No invalid case may pass validation: the next step stages files or binds the
 // volume into the node's fixed jail directory, or waits for the Firecracker
 // socket. The valid encrypted loads show where validation ends: their volume
-// bind is the first blocking host step, which the fixture refuses. A malformed
-// rate limit is refused before either path's host work: the checkpoint row
-// would otherwise inspect the sandbox's fresh checkpoint directory, which does
-// not exist, and the encrypted row would reach the refused bind. A valid
-// checkpoint load has no row because that inspection's outcome depends on the
-// host's cache root.
+// bind is the first blocking host step, which the fixture refuses. Rows whose
+// guard precedes the lease lookup and that stage nothing use the unallocated
+// sandbox, so dropping the guard stops at the lease check instead of polling
+// the jail's Firecracker socket. The encrypted rate-limit row shows the limit
+// is refused before the refused bind. The checkpoint row only shows it is
+// refused before the path checks: the source check first reads the sandbox's
+// checkpoint files under the fixed cache root, which do not exist, so no
+// plaintext row can reach the staging step, and a valid checkpoint load has no
+// row because that read's outcome depends on the host.
 #[tokio::test]
 async fn load_snapshot_refuses_invalid_requests_before_staging_the_jail() {
     use crate::lifecycle_limiter::LifecycleMethod;
@@ -642,7 +645,7 @@ async fn load_snapshot_refuses_invalid_requests_before_staging_the_jail() {
                     bandwidth: None,
                     operations: bucket,
                 }),
-                ..valid.clone()
+                ..unallocated.clone()
             },
             Code::InvalidArgument,
             "rootfs_rate_limit.bandwidth is required",
@@ -654,7 +657,7 @@ async fn load_snapshot_refuses_invalid_requests_before_staging_the_jail() {
                     bandwidth: bucket,
                     operations: None,
                 }),
-                ..valid.clone()
+                ..unallocated.clone()
             },
             Code::InvalidArgument,
             "rootfs_rate_limit.operations is required",
