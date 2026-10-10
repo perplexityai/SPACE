@@ -1211,3 +1211,6 @@ impl NodeManagerService {
         Ok(Response::new(StopProcessResponse { success }))
     }
 }
+
+#[cfg(test)]
+pub(super) mod tests;

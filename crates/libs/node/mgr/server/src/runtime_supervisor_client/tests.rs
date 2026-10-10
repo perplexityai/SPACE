@@ -246,6 +246,35 @@ pub(crate) async fn flaky_stop_client(
     (root, client, server)
 }
 
+/// Answers the stub's `stop_process` RPC with the request it received.
+pub(crate) type StopProcessReply = Arc<
+    dyn Fn(proto::StopProcessRequest) -> Result<proto::StopProcessResponse, Status> + Send + Sync,
+>;
+
+/// Supervisor replies for node-manager RPC tests. Runtime stop is always
+/// acknowledged; `None` keeps the stub's default reply.
+#[derive(Clone, Default)]
+pub(crate) struct SupervisorScript {
+    pub(crate) bind_execution_failure: Option<tonic::Code>,
+    pub(crate) stop_process: Option<StopProcessReply>,
+}
+
+pub(crate) async fn scripted_client(
+    script: SupervisorScript,
+) -> (
+    tempfile::TempDir,
+    RuntimeSupervisorLazyClient,
+    StubSupervisorServer,
+) {
+    let (root, path) = test_socket_path();
+    let mut stub = StubRuntimeSupervisor::counting(Arc::new(AtomicUsize::new(0)));
+    stub.stop_failures = Some(Arc::new(AtomicUsize::new(0)));
+    stub.script = script;
+    let server = spawn_supervisor_server(&path, stub).await;
+    let client = supervisor_test_client(path, Arc::new(AtomicUsize::new(0)));
+    (root, client, server)
+}
+
 #[derive(Clone)]
 struct StubRuntimeSupervisor {
     launch_firecracker_calls: Arc<AtomicUsize>,
@@ -254,6 +283,7 @@ struct StubRuntimeSupervisor {
     stop_status: tonic::Code,
     /// When set, stop fails with `stop_status` this many times, then succeeds.
     stop_failures: Option<Arc<AtomicUsize>>,
+    script: SupervisorScript,
 }
 
 impl StubRuntimeSupervisor {
@@ -264,6 +294,7 @@ impl StubRuntimeSupervisor {
             launch_gate: None,
             stop_status: tonic::Code::Unimplemented,
             stop_failures: None,
+            script: SupervisorScript::default(),
         }
     }
 
@@ -274,6 +305,7 @@ impl StubRuntimeSupervisor {
             launch_gate: None,
             stop_status: tonic::Code::Unimplemented,
             stop_failures: None,
+            script: SupervisorScript::default(),
         }
     }
 
@@ -286,6 +318,7 @@ impl StubRuntimeSupervisor {
             launch_gate: Some(gate),
             stop_status: tonic::Code::Unimplemented,
             stop_failures: None,
+            script: SupervisorScript::default(),
         }
     }
 }
@@ -296,6 +329,9 @@ impl proto::runtime_supervisor_server::RuntimeSupervisor for StubRuntimeSupervis
         &self,
         _request: Request<proto::BindExecutionRequest>,
     ) -> Result<Response<proto::BindExecutionResponse>, Status> {
+        if let Some(code) = self.script.bind_execution_failure {
+            return Err(Status::new(code, "bind execution unavailable"));
+        }
         Ok(Response::new(proto::BindExecutionResponse {}))
     }
     async fn retire_execution(
@@ -329,9 +365,12 @@ impl proto::runtime_supervisor_server::RuntimeSupervisor for StubRuntimeSupervis
 
     async fn stop_process(
         &self,
-        _request: Request<proto::StopProcessRequest>,
+        request: Request<proto::StopProcessRequest>,
     ) -> Result<Response<proto::StopProcessResponse>, Status> {
-        Err(Status::unimplemented("stop_process"))
+        match &self.script.stop_process {
+            Some(reply) => reply(request.into_inner()).map(Response::new),
+            None => Err(Status::unimplemented("stop_process")),
+        }
     }
 
     async fn stop_sandbox_runtime(
