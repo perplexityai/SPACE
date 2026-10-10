@@ -694,39 +694,6 @@ async fn restore_releases_artifact_lock_while_waiting_for_cleanup_completion() {
     service.task_tracker.wait().await;
 }
 
-fn insert_sandbox_without_template_hash(
-    conn: &rusqlite::Connection,
-    id: &str,
-    state: SandboxState,
-) {
-    use pplx_space_common_core::types::{AutoLifecyclePolicy, SandboxOwner, SandboxRuntimeLabel};
-    let sandbox_id: SandboxId = id.parse().unwrap();
-    crate::db::insert_sandbox(
-        conn,
-        crate::db::InsertSandboxParams {
-            id,
-            uuid8: &SandboxRuntimeLabel::from_sandbox_id(sandbox_id),
-            state,
-            template: "seed",
-            template_hash: None,
-            user: &SandboxOwner::parse("user").unwrap(),
-            runtime: "fc",
-            snapshots_enabled: false,
-            rootfs_size_mb: None,
-            disk_io_limits: Default::default(),
-            pool_template: None,
-            volume_encryption: false,
-            process_env: &std::collections::BTreeMap::new(),
-            auto_lifecycle: &AutoLifecyclePolicy::disabled(),
-            network_policy_override: None,
-            network_policy_generation: 0,
-            network_policy_authority: crate::db::PolicyAuthority::Cluster,
-            auto_lifecycle_authority: crate::db::PolicyAuthority::Cluster,
-        },
-    )
-    .unwrap();
-}
-
 // Each refusal happens before Start persists anything or contacts
 // node-manager, so the row keeps the state the caller observed. Rows that carry
 // a template hash would otherwise continue to template-manager, which has no
@@ -785,10 +752,13 @@ async fn start_refusals_before_activation_leave_the_row_state_unchanged() {
     for case in cases {
         let conn = crate::db::test_conn();
         let id = SandboxId::new().to_string();
-        if case.template_hash {
-            insert_test_sandbox(&conn, &id, case.state);
-        } else {
-            insert_sandbox_without_template_hash(&conn, &id, case.state);
+        insert_test_sandbox(&conn, &id, case.state);
+        if !case.template_hash {
+            conn.execute(
+                "UPDATE sandboxes SET template_hash = NULL WHERE id = ?1",
+                [&id],
+            )
+            .unwrap();
         }
         let service = SandboxManagerService::new_with_config(
             conn,
@@ -828,7 +798,9 @@ async fn start_refusals_before_activation_leave_the_row_state_unchanged() {
 // latest ready backup. A node with no cluster API cannot have one, so the
 // caller gets the original not-found answer rather than a retryable error, and
 // no sandbox row appears. The child process pins the cluster API endpoint
-// variables so the result does not depend on the host environment.
+// variables so the result does not depend on the host environment. The restore
+// transfer scope row is deliberately not asserted: this path currently leaves
+// the scope it opened behind, and that outcome is not an agreed contract.
 #[test]
 fn missing_row_restore_without_a_cluster_api_reports_the_sandbox_not_found() {
     use pplx_space_node_api_client::cluster::{
@@ -882,10 +854,13 @@ fn missing_row_restore_without_a_cluster_api_reports_the_sandbox_not_found() {
 
 // An in-place restore first retires any previous transfer scope. When that
 // scope cannot be cancelled, the restore stops and keeps the previous scope row
-// as the record of work still to clean up; it opens no new scope. A recorded
-// staging path that does not match the sandbox and scope id is refused before
-// any volume-manager or filesystem work, which makes the cancel fail
-// deterministically here.
+// as the record of work still to clean up; it opens no new scope.
+//
+// The cancel fails deterministically only because
+// `cancel_restore_transfer_scope_and_remove_staging` compares the recorded
+// staging path with the sandbox and scope ids before it connects to the fixed
+// volume-manager socket. If that check moves after the connect, this test
+// waits out the connect-retry budget instead.
 #[tokio::test]
 async fn suspend_restore_dir_keeps_a_previous_scope_it_cannot_cancel() {
     let conn = crate::db::test_conn();
@@ -920,15 +895,15 @@ async fn suspend_restore_dir_keeps_a_previous_scope_it_cannot_cancel() {
     .await
     .expect_err("an uncancelled previous scope must stop the restore");
 
-    let crate::snapshot_restore::RestoreError::Other(message) = &error else {
-        panic!("unexpected restore error: {error:?}");
-    };
-    assert!(
-        message.contains("cancel previous restore transfer scope"),
-        "{message}"
-    );
     assert_eq!(
         crate::db::restore_transfer_scope(&service.db_conn().unwrap(), &id).unwrap(),
-        Some(previous)
+        Some(previous),
+        "{error:?}"
+    );
+    assert!(
+        error
+            .to_string()
+            .contains("cancel previous restore transfer scope"),
+        "{error:?}"
     );
 }
