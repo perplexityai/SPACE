@@ -1,4 +1,5 @@
 name: Kind Pull CI
+# CI-only trigger for perplexityai/SPACE#238; do not merge.
 
 on:
   pull_request:
