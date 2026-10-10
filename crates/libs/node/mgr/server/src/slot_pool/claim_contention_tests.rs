@@ -179,15 +179,14 @@ async fn reset_slot_defers_a_claimed_sandbox_and_requeues_itself() {
     use std::os::unix::fs::MetadataExt;
     for holder in Holder::ALL {
         let sandbox_id = SandboxId::new().to_string();
-        // Barrier for a regressed reset that ignores the claim: a cache file
-        // still owned by the lease UID fails the retained-cache check before
-        // network teardown. The deferred path never reaches it.
+        // Barrier for a regressed reset that ignores the claim: a sandbox
+        // cache directory still owned by the lease UID fails the
+        // retained-cache check before network teardown. The deferred path
+        // never reaches it.
         let cache_root = tempfile::tempdir().unwrap();
         let sandbox_cache = cache_root.path().join(&sandbox_id);
-        std::fs::create_dir_all(&sandbox_cache).unwrap();
-        let retained_file = sandbox_cache.join("owned-by-lease-uid");
-        std::fs::write(&retained_file, b"retained cache").unwrap();
-        let lease_uid = std::fs::symlink_metadata(&retained_file).unwrap().uid();
+        std::fs::create_dir(&sandbox_cache).unwrap();
+        let lease_uid = std::fs::symlink_metadata(&sandbox_cache).unwrap().uid();
         let mut config = NetworkPoolConfig::new(1);
         config.sandbox_cache_dir = cache_root.path().to_path_buf();
         let (pool, mut wakeups) = pool_with_wakeups(config);
