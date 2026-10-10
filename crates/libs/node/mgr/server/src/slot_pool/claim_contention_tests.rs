@@ -3,7 +3,6 @@
 //! without mutating the lease and must keep its retry obligation.
 
 use super::*;
-use std::os::unix::fs::MetadataExt;
 
 /// The two claim kinds an RPC can hold: shared startup work (Prepare, Launch,
 /// LoadSnapshot) and exclusive cleanup/reset ownership.
@@ -171,66 +170,46 @@ fn startup_leasing_reprobe_skips_claimed_sandboxes_and_keeps_the_obligation() {
     }
 }
 
-#[cfg(unix)]
+/// Only the deferred exit is pinned here. An admitted reset reaches host
+/// cleanup (node-ctl notification, cgroupfs, the fixed cache root and network
+/// teardown), so it stays out of this unit layer.
 #[tokio::test(flavor = "current_thread")]
 async fn reset_slot_defers_a_claimed_sandbox_and_requeues_itself() {
     for holder in Holder::ALL {
-        // A retained cache file owned by the lease UID stops reset before any
-        // host networking, so an unclaimed reset has a deterministic outcome.
-        let sandbox_id = "sandbox-claimed-reset";
-        let cache_root = tempfile::tempdir().unwrap();
-        let sandbox_cache = cache_root.path().join(sandbox_id);
-        std::fs::create_dir_all(&sandbox_cache).unwrap();
-        let retained_file = sandbox_cache.join("owned-by-old-uid");
-        std::fs::write(&retained_file, b"stale cache").unwrap();
-        let lease_uid = std::fs::symlink_metadata(&retained_file).unwrap().uid();
-
-        let mut config = NetworkPoolConfig::new(1);
-        config.target_ready_slots = 0;
-        config.retained_ready_slots = 0;
-        config.min_ready_slots = 0;
-        config.sandbox_cache_dir = cache_root.path().to_path_buf();
-        let (pool, mut wakeups) = pool_with_wakeups(config);
+        let sandbox_id = SandboxId::new().to_string();
+        let (pool, mut wakeups) = pool_with_wakeups(NetworkPoolConfig::new(1));
         pool.db
             .lock()
             .unwrap()
             .execute(
                 "UPDATE network_slots
                  SET generation = 1, state = 'dirty', health = 'unknown',
-                     sandbox_id = ?1, sandbox_uid = ?2, pid = NULL, lease_kind = ?3
+                     sandbox_id = ?1, pid = NULL, lease_kind = ?2
                  WHERE slot_id = 0",
-                params![sandbox_id, lease_uid, LeaseKind::Ephemeral.as_str()],
+                params![sandbox_id, LeaseKind::Ephemeral.as_str()],
             )
             .unwrap();
         drain(&mut wakeups);
 
-        let claim = holder.claim(&pool, sandbox_id);
+        let claim = holder.claim(&pool, &sandbox_id);
         reset_slot(pool.clone(), 0).await;
         let deferred = slot(&pool, 0);
         assert_eq!(deferred.state, SlotState::Dirty, "{holder:?}");
+        assert_eq!(deferred.info.generation, 1, "{holder:?}");
         assert_eq!(deferred.health, SlotHealth::Unknown, "{holder:?}");
         assert_eq!(deferred.last_error, None, "{holder:?}");
         assert!(
             wakeups.try_recv().is_ok(),
             "{holder:?}: a deferred reset must schedule its own retry"
         );
-        assert!(pool.try_claim_sandbox_mutation(sandbox_id).is_none());
-        drop(claim);
-
-        reset_slot(pool.clone(), 0).await;
-        let attempted = slot(&pool, 0);
-        assert_eq!(attempted.state, SlotState::Dirty, "{holder:?}");
-        assert_eq!(attempted.health, SlotHealth::Degraded, "{holder:?}");
         assert!(
-            attempted.last_error.as_deref().is_some_and(
-                |error| error.contains("cleanup required before resetting slot 0 generation 1")
-            ),
-            "{holder:?}: {:?}",
-            attempted.last_error
+            pool.try_claim_sandbox_mutation(&sandbox_id).is_none(),
+            "{holder:?}: reset must not disturb the RPC's claim"
         );
+        drop(claim);
         drop(
-            pool.try_claim_sandbox_mutation(sandbox_id)
-                .expect("reset must release the sandbox claim"),
+            pool.try_claim_sandbox_mutation(&sandbox_id)
+                .expect("a deferred reset must not keep a sandbox claim"),
         );
     }
 }

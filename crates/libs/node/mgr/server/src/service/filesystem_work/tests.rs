@@ -92,14 +92,15 @@ async fn artifact_mutation_cancellation_retains_target_until_blocking_work_exits
                 super::super::CACHE_DIR
             ),
         });
-        assert_eq!(
-            service
-                .delete_cache_artifact(request)
-                .await
-                .unwrap_err()
-                .code(),
-            tonic::Code::Unavailable
-        );
+        let busy = |result: Result<(), tonic::Status>| {
+            let error = result.unwrap_err();
+            assert_eq!(error.code(), tonic::Code::Unavailable);
+            assert_eq!(
+                error.message(),
+                "sandbox host mutation or reset is in progress; retry"
+            );
+        };
+        busy(service.delete_cache_artifact(request).await.map(|_| ()));
         let snapshot_name = "d-1m-20260922T120000Z";
         let results = [
             service
@@ -147,9 +148,7 @@ async fn artifact_mutation_cancellation_retains_target_until_blocking_work_exits
                 .await
                 .map(|_| ()),
         ];
-        for result in results {
-            assert_eq!(result.unwrap_err().code(), tonic::Code::Unavailable);
-        }
+        results.into_iter().for_each(busy);
         drop(capture);
         drop(service.claim_sandbox_mutation(id).unwrap());
         drop(target.try_lock().unwrap());

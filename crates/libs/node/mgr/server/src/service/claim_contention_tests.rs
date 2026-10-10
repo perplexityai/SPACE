@@ -1,4 +1,4 @@
-//! Per-sandbox claim contention for every claiming node-manager RPC.
+//! Per-sandbox claim contention for the claiming node-manager RPCs.
 //!
 //! Startup work (Prepare, Launch, LoadSnapshot, device and port setup) shares
 //! a sandbox; cleanup, reset, Release and artifact deletion own it
@@ -6,8 +6,9 @@
 //! both the refusal and the overlap that must keep succeeding.
 //!
 //! Requests carry no execution fence and no lease, so an admitted call stops
-//! at its first post-claim check. That outcome is distinct from every claim
-//! refusal and proves the call got past ownership without touching the host.
+//! at its first post-claim check, before any host access. That outcome is
+//! distinct from every claim refusal. Calls that reach fixed host paths
+//! whatever their outcome (CleanupSandbox) stay out of this unit layer.
 
 use super::tests::service_tests::service_for_unit_tests;
 use super::*;
@@ -19,6 +20,10 @@ const WORK_REFUSED: &str = "sandbox cleanup or reset is in progress; retry";
 const MUTATION_REFUSED: &str = "sandbox host mutation or reset is in progress; retry";
 const WORK_WAIT_TIMED_OUT: &str = "timed out waiting for sandbox cleanup or reset; retry";
 const NO_EXECUTION: &str = "sandbox execution identity is missing or superseded";
+const NOT_ALLOCATED: &str = "sandbox not allocated";
+/// Prepare and LaunchSandbox parse the runtime only under their claim. A
+/// valid runtime would go on to discover the host runtime inventory.
+const UNSUPPORTED_RUNTIME: &str = "unsupported runtime 'invalid-runtime'";
 
 fn root<T>(message: T) -> Request<T> {
     let mut request = Request::new(message);
@@ -51,16 +56,14 @@ impl Holder {
 
 type Rpc = fn(NodeManagerService, String) -> BoxFuture<'static, Result<(), Status>>;
 
+/// The first post-claim refusal of a call that carries no execution or lease.
 #[derive(Clone, Copy)]
-enum Outcome {
-    Ok,
-    Err(tonic::Code, &'static str),
-}
+struct Admitted(tonic::Code, &'static str);
 
 struct Case {
     rpc: &'static str,
     call: Rpc,
-    admitted: Outcome,
+    admitted: Admitted,
 }
 
 impl Case {
@@ -68,12 +71,12 @@ impl Case {
         (self.call)(service.clone(), sandbox_id.to_owned()).await
     }
 
-    fn assert_admitted(&self, result: Result<(), Status>, context: &str) {
-        match (self.admitted, result) {
-            (Outcome::Ok, Ok(())) => {}
-            (Outcome::Err(code, prefix), Err(error))
-                if error.code() == code && error.message().starts_with(prefix) => {}
-            (_, result) => panic!(
+    fn assert_admitted(&self, result: Result<(), Status>, sandbox_id: &str, context: &str) {
+        let Admitted(code, message) = self.admitted;
+        let message = message.replace("{sandbox_id}", sandbox_id);
+        match result {
+            Err(error) if error.code() == code && error.message() == message => {}
+            result => panic!(
                 "{} {context}: unexpected admitted outcome {result:?}",
                 self.rpc
             ),
@@ -114,7 +117,7 @@ fn immediate_work_rpcs() -> [Case; 8] {
                         .map(drop)
                 })
             },
-            admitted: Outcome::Err(tonic::Code::NotFound, "sandbox not allocated"),
+            admitted: Admitted(tonic::Code::NotFound, NOT_ALLOCATED),
         },
         Case {
             rpc: "UnexposePort",
@@ -130,7 +133,7 @@ fn immediate_work_rpcs() -> [Case; 8] {
                         .map(drop)
                 })
             },
-            admitted: Outcome::Err(tonic::Code::NotFound, "sandbox not allocated"),
+            admitted: Admitted(tonic::Code::NotFound, NOT_ALLOCATED),
         },
         Case {
             rpc: "AllowPort",
@@ -146,7 +149,7 @@ fn immediate_work_rpcs() -> [Case; 8] {
                         .map(drop)
                 })
             },
-            admitted: Outcome::Err(tonic::Code::NotFound, "sandbox not allocated"),
+            admitted: Admitted(tonic::Code::NotFound, "sandbox not allocated: {sandbox_id}"),
         },
         Case {
             rpc: "DenyPort",
@@ -162,7 +165,7 @@ fn immediate_work_rpcs() -> [Case; 8] {
                         .map(drop)
                 })
             },
-            admitted: Outcome::Err(tonic::Code::NotFound, "sandbox not allocated"),
+            admitted: Admitted(tonic::Code::NotFound, NOT_ALLOCATED),
         },
         Case {
             rpc: "PrepareEncryptedRootfs",
@@ -177,7 +180,7 @@ fn immediate_work_rpcs() -> [Case; 8] {
                         .map(drop)
                 })
             },
-            admitted: Outcome::Err(tonic::Code::FailedPrecondition, NO_EXECUTION),
+            admitted: Admitted(tonic::Code::FailedPrecondition, NO_EXECUTION),
         },
         Case {
             rpc: "PrepareSnapshotRootfs",
@@ -192,7 +195,7 @@ fn immediate_work_rpcs() -> [Case; 8] {
                         .map(drop)
                 })
             },
-            admitted: Outcome::Err(tonic::Code::FailedPrecondition, NO_EXECUTION),
+            admitted: Admitted(tonic::Code::FailedPrecondition, NO_EXECUTION),
         },
         Case {
             rpc: "PrepareEncryptedVolume",
@@ -208,7 +211,7 @@ fn immediate_work_rpcs() -> [Case; 8] {
                         .map(drop)
                 })
             },
-            admitted: Outcome::Err(tonic::Code::FailedPrecondition, NO_EXECUTION),
+            admitted: Admitted(tonic::Code::FailedPrecondition, NO_EXECUTION),
         },
         Case {
             rpc: "ReleaseEncryptedVolume",
@@ -224,7 +227,7 @@ fn immediate_work_rpcs() -> [Case; 8] {
                         .map(drop)
                 })
             },
-            admitted: Outcome::Err(tonic::Code::FailedPrecondition, NO_EXECUTION),
+            admitted: Admitted(tonic::Code::FailedPrecondition, NO_EXECUTION),
         },
     ]
 }
@@ -245,7 +248,7 @@ fn waiting_work_rpcs() -> [Case; 9] {
                         .map(drop)
                 })
             },
-            admitted: Outcome::Err(
+            admitted: Admitted(
                 tonic::Code::FailedPrecondition,
                 "execution identity is required",
             ),
@@ -264,7 +267,7 @@ fn waiting_work_rpcs() -> [Case; 9] {
                         .map(drop)
                 })
             },
-            admitted: Outcome::Err(tonic::Code::InvalidArgument, ""),
+            admitted: Admitted(tonic::Code::InvalidArgument, UNSUPPORTED_RUNTIME),
         },
         Case {
             rpc: "LaunchSandbox",
@@ -280,7 +283,7 @@ fn waiting_work_rpcs() -> [Case; 9] {
                         .map(drop)
                 })
             },
-            admitted: Outcome::Err(tonic::Code::InvalidArgument, ""),
+            admitted: Admitted(tonic::Code::InvalidArgument, UNSUPPORTED_RUNTIME),
         },
         Case {
             rpc: "Launch",
@@ -289,17 +292,14 @@ fn waiting_work_rpcs() -> [Case; 9] {
                     service
                         .launch(root(LaunchRequest {
                             sandbox_id,
-                            program: "/bin/true".into(),
+                            program: NET_GATEWAY_SVC_BIN.into(),
                             ..Default::default()
                         }))
                         .await
                         .map(drop)
                 })
             },
-            admitted: Outcome::Err(
-                tonic::Code::PermissionDenied,
-                "program '/bin/true' not in allowed list",
-            ),
+            admitted: Admitted(tonic::Code::FailedPrecondition, NO_EXECUTION),
         },
         Case {
             rpc: "LoadSnapshot",
@@ -314,7 +314,7 @@ fn waiting_work_rpcs() -> [Case; 9] {
                         .map(drop)
                 })
             },
-            admitted: Outcome::Err(tonic::Code::FailedPrecondition, NO_EXECUTION),
+            admitted: Admitted(tonic::Code::FailedPrecondition, NO_EXECUTION),
         },
         Case {
             rpc: "CreateSnapshot",
@@ -329,7 +329,7 @@ fn waiting_work_rpcs() -> [Case; 9] {
                         .map(drop)
                 })
             },
-            admitted: Outcome::Err(tonic::Code::FailedPrecondition, NO_EXECUTION),
+            admitted: Admitted(tonic::Code::FailedPrecondition, NO_EXECUTION),
         },
         Case {
             rpc: "PauseSandbox",
@@ -344,7 +344,7 @@ fn waiting_work_rpcs() -> [Case; 9] {
                         .map(drop)
                 })
             },
-            admitted: Outcome::Err(tonic::Code::FailedPrecondition, NO_EXECUTION),
+            admitted: Admitted(tonic::Code::FailedPrecondition, NO_EXECUTION),
         },
         Case {
             rpc: "ResumeSandbox",
@@ -359,7 +359,7 @@ fn waiting_work_rpcs() -> [Case; 9] {
                         .map(drop)
                 })
             },
-            admitted: Outcome::Err(tonic::Code::FailedPrecondition, NO_EXECUTION),
+            admitted: Admitted(tonic::Code::FailedPrecondition, NO_EXECUTION),
         },
         Case {
             rpc: "StopProcess",
@@ -375,76 +375,57 @@ fn waiting_work_rpcs() -> [Case; 9] {
                         .map(drop)
                 })
             },
-            admitted: Outcome::Err(tonic::Code::FailedPrecondition, NO_EXECUTION),
+            admitted: Admitted(tonic::Code::FailedPrecondition, NO_EXECUTION),
         },
     ]
 }
 
-/// RPCs that own the sandbox exclusively and refuse any concurrent claim.
-fn exclusive_rpcs() -> [Case; 4] {
+/// Release owns the sandbox exclusively and refuses any concurrent claim.
+fn release() -> Case {
+    Case {
+        rpc: "Release",
+        call: |service, sandbox_id| {
+            Box::pin(async move {
+                service
+                    .release(root(ReleaseRequest {
+                        sandbox_id,
+                        ..Default::default()
+                    }))
+                    .await
+                    .map(drop)
+            })
+        },
+        admitted: Admitted(tonic::Code::FailedPrecondition, NO_EXECUTION),
+    }
+}
+
+/// Artifact deletion also owns the sandbox exclusively, but once admitted it
+/// stats paths under the fixed cache root, so only its refusal runs here.
+fn artifact_deletion_rpcs() -> [(&'static str, Rpc); 2] {
     [
-        Case {
-            rpc: "Release",
-            call: |service, sandbox_id| {
-                Box::pin(async move {
-                    service
-                        .release(root(ReleaseRequest {
-                            sandbox_id,
-                            ..Default::default()
-                        }))
-                        .await
-                        .map(drop)
-                })
-            },
-            admitted: Outcome::Err(tonic::Code::FailedPrecondition, NO_EXECUTION),
-        },
-        Case {
-            rpc: "CleanupSandbox",
-            call: |service, sandbox_id| {
-                Box::pin(async move {
-                    service
-                        .cleanup_sandbox(root(CleanupSandboxRequest {
-                            sandbox_id,
-                            ..Default::default()
-                        }))
-                        .await
-                        .map(drop)
-                })
-            },
-            admitted: Outcome::Err(tonic::Code::FailedPrecondition, NO_EXECUTION),
-        },
-        Case {
-            rpc: "DeleteBtrfsSnapshot",
-            call: |service, sandbox_id| {
-                Box::pin(async move {
-                    service
-                        .delete_btrfs_snapshot(root(DeleteBtrfsSnapshotRequest {
-                            sandbox_id,
-                            snapshot_name: "d-1m-20260922T120000Z".into(),
-                        }))
-                        .await
-                        .map(drop)
-                })
-            },
-            admitted: Outcome::Err(tonic::Code::NotFound, "snapshot not found"),
-        },
-        Case {
-            rpc: "DeleteCacheArtifact",
-            call: |service, sandbox_id| {
-                Box::pin(async move {
-                    let response = service
-                        .delete_cache_artifact(root(DeleteCacheArtifactRequest {
-                            local_path: format!(
-                                "{CACHE_DIR}/{sandbox_id}/snapshots/.suspend-gc-pending-{sandbox_id}"
-                            ),
-                        }))
-                        .await?;
-                    assert!(!response.into_inner().was_present);
-                    Ok(())
-                })
-            },
-            admitted: Outcome::Ok,
-        },
+        ("DeleteBtrfsSnapshot", |service, sandbox_id| {
+            Box::pin(async move {
+                service
+                    .delete_btrfs_snapshot(root(DeleteBtrfsSnapshotRequest {
+                        sandbox_id,
+                        snapshot_name: "d-1m-20260922T120000Z".into(),
+                    }))
+                    .await
+                    .map(drop)
+            })
+        }),
+        ("DeleteCacheArtifact", |service, sandbox_id| {
+            Box::pin(async move {
+                service
+                    .delete_cache_artifact(root(DeleteCacheArtifactRequest {
+                        local_path: format!(
+                            "{CACHE_DIR}/{sandbox_id}/snapshots/.suspend-gc-pending-{sandbox_id}"
+                        ),
+                    }))
+                    .await
+                    .map(drop)
+            })
+        }),
     ]
 }
 
@@ -466,7 +447,7 @@ async fn shared_work_rpcs_refuse_cleanup_or_reset_and_overlap_startup_work() {
 
         let startup = Holder::StartupWork.claim(&service, &sandbox_id);
         let context = format!("{} during startup work", case.rpc);
-        case.assert_admitted(case.run(&service, &sandbox_id).await, &context);
+        case.assert_admitted(case.run(&service, &sandbox_id).await, &sandbox_id, &context);
         assert!(
             service
                 .pool
@@ -479,7 +460,7 @@ async fn shared_work_rpcs_refuse_cleanup_or_reset_and_overlap_startup_work() {
     }
 }
 
-#[tokio::test(flavor = "current_thread")]
+#[tokio::test(start_paused = true)]
 async fn clone_refuses_either_owned_sandbox_without_retaining_the_other() {
     let service = service_for_unit_tests().await;
     let mut ids = [SandboxId::new().to_string(), SandboxId::new().to_string()];
@@ -507,11 +488,23 @@ async fn clone_refuses_either_owned_sandbox_without_retaining_the_other() {
             drop(owner);
 
             // A donor or target with in-flight startup work may still clone.
-            let context = format!("clone {donor} -> {target} with {owned} starting");
+            // The in-flight launch's cgroup gate stops the admitted clone
+            // after both claims and before it opens the clone tree.
+            let context = format!("clone {donor} -> {target} with {owned} launching");
             let startup = Holder::StartupWork.claim(&service, owned);
+            let launch_gate = service
+                .sandbox_cgroup_gate_lock(owned)
+                .await
+                .read_owned()
+                .await;
             let error = clone(donor, target).await.unwrap_err();
-            assert_eq!(error.code(), tonic::Code::FailedPrecondition, "{context}");
-            assert!(error.message().starts_with("open clone tree:"), "{context}");
+            assert_eq!(error.code(), tonic::Code::Unavailable, "{context}");
+            assert_eq!(
+                error.message(),
+                "clone lifecycle ownership is busy",
+                "{context}"
+            );
+            drop(launch_gate);
             assert!(service.pool.try_claim_sandbox_mutation(owned).is_none());
             assert_unowned(&service, other, &context);
             drop(startup);
@@ -522,22 +515,36 @@ async fn clone_refuses_either_owned_sandbox_without_retaining_the_other() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn exclusive_rpcs_refuse_any_claim_and_release_ownership_when_done() {
-    for case in exclusive_rpcs() {
+    let case = release();
+    let service = service_for_unit_tests().await;
+    let sandbox_id = SandboxId::new().to_string();
+    for holder in [Holder::StartupWork, Holder::CleanupOrReset] {
+        let context = format!("{} during {holder:?}", case.rpc);
+        let owner = holder.claim(&service, &sandbox_id);
+        assert_refused(
+            case.run(&service, &sandbox_id).await,
+            MUTATION_REFUSED,
+            &context,
+        );
+        drop(owner);
+        assert_unowned(&service, &sandbox_id, &context);
+    }
+    let context = format!("{} uncontended", case.rpc);
+    case.assert_admitted(case.run(&service, &sandbox_id).await, &sandbox_id, &context);
+    assert_unowned(&service, &sandbox_id, &context);
+
+    // filesystem_work::tests pins their refusal of shared host work.
+    for (rpc, call) in artifact_deletion_rpcs() {
         let service = service_for_unit_tests().await;
         let sandbox_id = SandboxId::new().to_string();
-        for holder in [Holder::StartupWork, Holder::CleanupOrReset] {
-            let context = format!("{} during {holder:?}", case.rpc);
-            let owner = holder.claim(&service, &sandbox_id);
-            assert_refused(
-                case.run(&service, &sandbox_id).await,
-                MUTATION_REFUSED,
-                &context,
-            );
-            drop(owner);
-            assert_unowned(&service, &sandbox_id, &context);
-        }
-        let context = format!("{} uncontended", case.rpc);
-        case.assert_admitted(case.run(&service, &sandbox_id).await, &context);
+        let context = format!("{rpc} during cleanup or reset");
+        let owner = Holder::CleanupOrReset.claim(&service, &sandbox_id);
+        assert_refused(
+            call(service.clone(), sandbox_id.clone()).await,
+            MUTATION_REFUSED,
+            &context,
+        );
+        drop(owner);
         assert_unowned(&service, &sandbox_id, &context);
     }
 }
@@ -561,13 +568,18 @@ async fn startup_rpcs_time_out_behind_cleanup_without_taking_ownership() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn startup_rpcs_overlap_startup_work_and_proceed_once_cleanup_releases() {
-    for case in waiting_work_rpcs() {
+    // startup_rpc_admission_shares_work_and_waits_for_cleanup pins both halves
+    // for PrepareSandbox and LoadSnapshot.
+    for case in waiting_work_rpcs()
+        .into_iter()
+        .filter(|case| !matches!(case.rpc, "PrepareSandbox" | "LoadSnapshot"))
+    {
         let service = service_for_unit_tests().await;
         let sandbox_id = SandboxId::new().to_string();
 
         let startup = Holder::StartupWork.claim(&service, &sandbox_id);
         let context = format!("{} during startup work", case.rpc);
-        case.assert_admitted(case.run(&service, &sandbox_id).await, &context);
+        case.assert_admitted(case.run(&service, &sandbox_id).await, &sandbox_id, &context);
         assert!(
             service
                 .pool
@@ -585,15 +597,25 @@ async fn startup_rpcs_overlap_startup_work_and_proceed_once_cleanup_releases() {
             "{context}: must wait rather than refuse"
         );
         drop(owner);
-        case.assert_admitted(call.await, &context);
+        case.assert_admitted(call.await, &sandbox_id, &context);
         assert_unowned(&service, &sandbox_id, &context);
     }
+}
+
+/// A regression that admits an overlapping RPC into the parked call's cgroup
+/// gate deadlocks instead of failing, so every call in that test is bounded.
+async fn returns<T>(call: impl std::future::Future<Output = T>, context: &str) -> T {
+    tokio::time::timeout(Duration::from_secs(5), call)
+        .await
+        .unwrap_or_else(|_| {
+            panic!("{context}: did not return within 5 s; deadlocked on the parked call?")
+        })
 }
 
 fn case(rpc: &str) -> Case {
     waiting_work_rpcs()
         .into_iter()
-        .chain(exclusive_rpcs())
+        .chain([release()])
         .find(|case| case.rpc == rpc)
         .unwrap_or_else(|| panic!("no case for {rpc}"))
 }
@@ -607,22 +629,8 @@ async fn in_flight_launch_or_snapshot_load_admits_concurrent_startup_rpcs() {
         Vm,
         Sidecar,
     }
-    let gateway = Case {
-        rpc: "Launch(net-gateway)",
-        call: |service, sandbox_id| {
-            Box::pin(async move {
-                service
-                    .launch(root(LaunchRequest {
-                        sandbox_id,
-                        program: NET_GATEWAY_SVC_BIN.into(),
-                        ..Default::default()
-                    }))
-                    .await
-                    .map(drop)
-            })
-        },
-        admitted: Outcome::Err(tonic::Code::FailedPrecondition, NO_EXECUTION),
-    };
+    // The table's Launch starts the network gateway sidecar.
+    let gateway = case("Launch");
     let spaced_host = Case {
         rpc: "Launch(spaced-host)",
         call: |service, sandbox_id| {
@@ -637,11 +645,11 @@ async fn in_flight_launch_or_snapshot_load_admits_concurrent_startup_rpcs() {
                     .map(drop)
             })
         },
-        admitted: Outcome::Err(tonic::Code::FailedPrecondition, NO_EXECUTION),
+        admitted: Admitted(tonic::Code::FailedPrecondition, NO_EXECUTION),
     };
     let prepare = case("PrepareSandbox");
     let load = case("LoadSnapshot");
-    let exclusive = [case("Release"), case("CleanupSandbox")];
+    let release = release();
 
     for (in_flight, family, overlapping) in [
         // Prepare and snapshot load overlap a gateway launch during activation.
@@ -668,16 +676,12 @@ async fn in_flight_launch_or_snapshot_load_admits_concurrent_startup_rpcs() {
 
         for case in overlapping {
             let context = format!("{} during {}", case.rpc, in_flight.rpc);
-            case.assert_admitted(case.run(&service, &sandbox_id).await, &context);
+            let result = returns(case.run(&service, &sandbox_id), &context).await;
+            case.assert_admitted(result, &sandbox_id, &context);
         }
-        for case in &exclusive {
-            let context = format!("{} during {}", case.rpc, in_flight.rpc);
-            assert_refused(
-                case.run(&service, &sandbox_id).await,
-                MUTATION_REFUSED,
-                &context,
-            );
-        }
+        let context = format!("Release during {}", in_flight.rpc);
+        let result = returns(release.run(&service, &sandbox_id), &context).await;
+        assert_refused(result, MUTATION_REFUSED, &context);
         assert!(
             futures_util::poll!(&mut first).is_pending(),
             "{}",
@@ -685,7 +689,8 @@ async fn in_flight_launch_or_snapshot_load_admits_concurrent_startup_rpcs() {
         );
 
         drop(parked);
-        in_flight.assert_admitted(first.await, "after its gate opened");
+        let context = format!("{} after its gate opened", in_flight.rpc);
+        in_flight.assert_admitted(returns(first, &context).await, &sandbox_id, &context);
         assert_unowned(&service, &sandbox_id, in_flight.rpc);
     }
 }
