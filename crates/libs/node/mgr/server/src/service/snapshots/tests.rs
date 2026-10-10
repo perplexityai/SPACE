@@ -434,8 +434,13 @@ impl SnapshotFixture {
         let current = self.service.pool.get(&self.lease.sandbox_id).unwrap();
         (current
             .as_ref()
-            .map(|lease| (lease.slot, lease.generation, lease.pid))
-            != Some((self.lease.slot, self.lease.generation, None)))
+            .map(|lease| (lease.slot, lease.generation, lease.sandbox_uid, lease.pid))
+            != Some((
+                self.lease.slot,
+                self.lease.generation,
+                self.lease.sandbox_uid,
+                None,
+            )))
         .then(|| format!("{case}: lease changed to {current:?}"))
     }
 }
