@@ -12273,20 +12273,51 @@ pub(crate) mod service_tests {
         drop(wake_guard);
     }
 
-    fn service_with_runtime_liveness(
+    pub(crate) fn service_with_runtime_liveness(
         conn: rusqlite::Connection,
         runtime_live: bool,
+    ) -> SandboxManagerService {
+        SandboxManagerService::new_with_options(conn, runtime_liveness_options(runtime_live))
+    }
+
+    /// [`service_with_runtime_liveness`] with the host-control and
+    /// credential-manager sockets at absent paths under `sockets`, so a path
+    /// that reaches either one fails to connect instead of contacting the host.
+    pub(crate) fn service_with_runtime_liveness_and_absent_sockets(
+        conn: rusqlite::Connection,
+        runtime_live: bool,
+        sockets: &std::path::Path,
     ) -> SandboxManagerService {
         SandboxManagerService::new_with_options(
             conn,
             SandboxManagerServiceOptions {
-                sandbox_runtime_live: Arc::new(move |_| runtime_live),
-                local_node_id: Some(NodeId::from_uuid(
-                    uuid::Uuid::parse_str("019f8000-0000-7000-8000-0000000000fe").unwrap(),
-                )),
-                ..Default::default()
+                host_control_socket_path: sockets.join("absent-host-control.sock"),
+                credential_manager_socket_path: sockets.join("absent-credential-manager.sock"),
+                ..runtime_liveness_options(runtime_live)
             },
         )
+    }
+
+    /// Every field is explicit: the `Default` options read the node identity
+    /// from the host.
+    fn runtime_liveness_options(runtime_live: bool) -> SandboxManagerServiceOptions {
+        SandboxManagerServiceOptions {
+            host_control_socket_path: std::path::PathBuf::from(
+                pplx_space_common_core::host::linux::paths::SANDBOX_HOST_CONTROL_SOCKET,
+            ),
+            credential_manager_socket_path: std::path::PathBuf::from(
+                pplx_space_credmgr_client::CREDMGR_SOCKET,
+            ),
+            sandbox_runtime_live: Arc::new(move |_| runtime_live),
+            shutdown_token: tokio_util::sync::CancellationToken::new(),
+            task_tracker: tokio_util::task::TaskTracker::new(),
+            local_node_id: Some(NodeId::from_uuid(
+                uuid::Uuid::parse_str("019f8000-0000-7000-8000-0000000000fe").unwrap(),
+            )),
+            node_role: None,
+            node_managed_by: None,
+            route_ed25519_verification_bundle: None,
+        }
     }
 
     fn insert_suspending_resuspend(conn: &rusqlite::Connection, id: &str) -> LocalArtifactId {

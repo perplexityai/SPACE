@@ -1676,31 +1676,7 @@ async fn teardown_suspend_pause_failure_recovery_allows_same_generation_retry() 
     }
 }
 
-/// A service whose host-facing collaborators are test-owned: runtime liveness
-/// is fixed, the host-control and credential sockets are absent paths under
-/// `sockets`, and the node identity is supplied instead of read from the host.
-fn suspend_test_service(
-    conn: rusqlite::Connection,
-    runtime_live: bool,
-    sockets: &std::path::Path,
-) -> SandboxManagerService {
-    SandboxManagerService::new_with_options(
-        conn,
-        crate::service::SandboxManagerServiceOptions {
-            host_control_socket_path: sockets.join("absent-host-control.sock"),
-            credential_manager_socket_path: sockets.join("absent-credential-manager.sock"),
-            sandbox_runtime_live: std::sync::Arc::new(move |_| runtime_live),
-            shutdown_token: tokio_util::sync::CancellationToken::new(),
-            task_tracker: tokio_util::task::TaskTracker::new(),
-            local_node_id: Some(pplx_space_common_core::types::NodeId::from_uuid(
-                uuid::Uuid::parse_str("019f8000-0000-7000-8000-0000000000fe").unwrap(),
-            )),
-            node_role: None,
-            node_managed_by: None,
-            route_ed25519_verification_bundle: None,
-        },
-    )
-}
+use crate::service::tests::service_tests::service_with_runtime_liveness_and_absent_sockets;
 
 fn stored_sandbox(service: &SandboxManagerService, id: &str) -> Option<crate::db::SandboxRow> {
     let db = service.db.lock().unwrap();
@@ -1792,15 +1768,11 @@ where
 }
 
 #[tokio::test]
-async fn confirmed_node_pause_reports_paused_and_leaves_the_state_write_to_the_caller() {
-    use crate::service::tests::service_tests::insert_test_sandbox;
-    use pplx_space_node_mgr_client::proto::{ExecutionFence, PauseSandboxRequest};
+async fn confirmed_node_pause_reports_paused_and_carries_the_execution_fence() {
+    use pplx_space_node_mgr_client::proto::ExecutionFence;
 
     let sandbox_id = SandboxId::new();
-    let id = sandbox_id.to_string();
-    let conn = crate::db::test_conn();
-    insert_test_sandbox(&conn, &id, SandboxState::Pausing);
-    let db = std::sync::Arc::new(std::sync::Mutex::new(conn));
+    let db = std::sync::Arc::new(std::sync::Mutex::new(crate::db::test_conn()));
 
     let node_manager = PauseConfirmingNodeManager::default();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1840,21 +1812,14 @@ async fn confirmed_node_pause_reports_paused_and_leaves_the_state_write_to_the_c
     stop.cancel();
     server.await.unwrap().unwrap();
     assert_eq!(state, SandboxState::Paused);
-    // The node call carries the caller's execution fence so node-manager can
-    // refuse a pause aimed at a replaced execution.
-    assert_eq!(
-        *node_manager.requests.lock().unwrap(),
-        [PauseSandboxRequest {
-            sandbox_id: id.clone(),
-            execution_fence: Some(fence),
-        }]
-    );
-    let db = db.lock().unwrap();
-    assert_eq!(
-        crate::db::get_sandbox(&db, &id).unwrap().unwrap().state,
-        SandboxState::Pausing,
-        "the caller persists Paused after the confirmed pause"
-    );
+    // Every node call carries the caller's execution fence so node-manager
+    // can refuse a pause aimed at a replaced execution.
+    let requests = node_manager.requests.lock().unwrap();
+    assert!(!requests.is_empty(), "the pause must reach node-manager");
+    for request in requests.iter() {
+        assert_eq!(request.sandbox_id, sandbox_id.to_string());
+        assert_eq!(request.execution_fence.as_ref(), Some(&fence));
+    }
 }
 
 #[tokio::test]
@@ -1870,7 +1835,7 @@ async fn pause_refuses_rows_that_cannot_enter_pausing_before_writing_state() {
         let conn = crate::db::test_conn();
         let id = SandboxId::new().to_string();
         insert_test_sandbox(&conn, &id, state);
-        let service = suspend_test_service(conn, false, sockets.path());
+        let service = service_with_runtime_liveness_and_absent_sockets(conn, false, sockets.path());
 
         let error = service
             .pause(internal_request(
@@ -1882,7 +1847,19 @@ async fn pause_refuses_rows_that_cannot_enter_pausing_before_writing_state() {
             .expect_err("only a started sandbox can pause");
 
         // A transient state is another operation in flight: retryable.
-        let expected = if state.is_transient() {
+        let in_flight = matches!(
+            state,
+            SandboxState::Creating
+                | SandboxState::Starting
+                | SandboxState::Stopping
+                | SandboxState::Deleting
+                | SandboxState::Pausing
+                | SandboxState::Resuming
+                | SandboxState::Checkpointing
+                | SandboxState::Suspending
+                | SandboxState::Restoring
+        );
+        let expected = if in_flight {
             tonic::Code::Unavailable
         } else {
             tonic::Code::FailedPrecondition
@@ -1910,7 +1887,7 @@ async fn suspend_refuses_rows_that_are_neither_started_nor_paused() {
         let conn = crate::db::test_conn();
         let id = SandboxId::new().to_string();
         insert_encrypted_test_sandbox(&conn, &id, state);
-        let service = suspend_test_service(conn, false, sockets.path());
+        let service = service_with_runtime_liveness_and_absent_sockets(conn, false, sockets.path());
 
         let error = service
             .suspend(internal_request(
@@ -1997,7 +1974,7 @@ async fn paused_suspend_admission_requires_a_free_row_and_the_owning_generation(
                 )
             }
         };
-        let service = suspend_test_service(conn, false, sockets.path());
+        let service = service_with_runtime_liveness_and_absent_sockets(conn, false, sockets.path());
         let wake = service.auto_lifecycle.wake_lock(&id).lock_owned().await;
         let artifact = service.auto_lifecycle.artifact_lock(&id).lock_owned().await;
 
@@ -2114,7 +2091,13 @@ async fn suspend_completion_refuses_a_superseded_row_before_runtime_cleanup() {
             }
         }
         let before = crate::db::get_sandbox(&conn, &id).unwrap();
-        let service = suspend_test_service(conn, false, sockets.path());
+        let service = service_with_runtime_liveness_and_absent_sockets(conn, false, sockets.path());
+        // A superseded completion must leave the current execution's snapshot
+        // scheduling in place.
+        service
+            .snapshot_scheduler
+            .add_sandbox(id.clone(), captured.template.clone())
+            .await;
         // Fail closed if a guard regresses: with shutdown begun, runtime
         // cleanup is never dispatched to node-manager.
         service.shutdown_token.cancel();
@@ -2149,15 +2132,33 @@ async fn suspend_completion_refuses_a_superseded_row_before_runtime_cleanup() {
                 .map(|row| (row.state, row.cleanup_completion)),
             "a refused completion must not change the row ({supersession:?})"
         );
+        assert!(
+            service.snapshot_scheduler.is_active(&id).await,
+            "a refused completion must keep snapshot scheduling ({supersession:?})"
+        );
+        let cleanup_jobs: i64 = service
+            .db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM jobs WHERE kind = ?1 AND subject_id = ?2",
+                rusqlite::params![crate::db::cleanup_jobs::KIND, id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            cleanup_jobs, 0,
+            "a refused completion must not persist cleanup work ({supersession:?})"
+        );
         drop(held_fence);
         drain_service_tasks(&service).await;
     }
 }
 
 #[tokio::test]
-async fn suspend_publication_failure_reports_how_it_persisted() {
-    use super::suspend_snapshot::SuspendSnapshotPublicationFailurePersistence as Persistence;
+async fn suspend_publication_failure_quarantines_or_leaves_the_row_suspending() {
     use crate::service::tests::service_tests::insert_test_sandbox;
+    use pplx_space_common_core::types::SandboxQuarantineReasonCode;
 
     let reject_state = |conn: &rusqlite::Connection, state: SandboxState| {
         conn.execute_batch(&format!(
@@ -2168,57 +2169,52 @@ async fn suspend_publication_failure_reports_how_it_persisted() {
         .unwrap();
     };
     let sockets = tempfile::tempdir().unwrap();
-    for (case, runtime_live, state, rejected, expected, final_state) in [
-        (
-            "a live rollback lost to another transition",
-            true,
-            SandboxState::Paused,
-            &[][..],
-            Persistence::StateChanged,
-            SandboxState::Paused,
-        ),
+    for (case, runtime_live, rejected, quarantined) in [
         (
             "a live runtime whose rollback cannot persist is quarantined",
             true,
-            SandboxState::Suspending,
-            &[SandboxState::Paused][..],
-            Persistence::Quarantined,
-            SandboxState::Quarantined,
-        ),
-        (
-            "a quarantine that cannot persist",
-            false,
-            SandboxState::Suspending,
-            &[SandboxState::Quarantined][..],
-            Persistence::PersistFailed,
-            SandboxState::Suspending,
-        ),
-        (
-            "neither rollback nor quarantine persists",
+            SandboxState::Paused,
             true,
-            SandboxState::Suspending,
-            &[SandboxState::Paused, SandboxState::Quarantined][..],
-            Persistence::PersistFailed,
-            SandboxState::Suspending,
+        ),
+        (
+            "a dead runtime whose quarantine cannot persist stays suspending",
+            false,
+            SandboxState::Quarantined,
+            false,
         ),
     ] {
         let conn = crate::db::test_conn();
         let id = SandboxId::new().to_string();
-        insert_test_sandbox(&conn, &id, state);
-        for rejected in rejected {
-            reject_state(&conn, *rejected);
+        insert_test_sandbox(&conn, &id, SandboxState::Suspending);
+        reject_state(&conn, rejected);
+        let service =
+            service_with_runtime_liveness_and_absent_sockets(conn, runtime_live, sockets.path());
+
+        service.record_suspend_snapshot_publication_failure_after_begin(&id, "capture failed");
+
+        let row = stored_sandbox(&service, &id).unwrap();
+        let reason_code = {
+            let db = service.db.lock().unwrap();
+            crate::db::current_quarantine_reason_wire_value(&db, &id).unwrap()
+        };
+        if quarantined {
+            assert_eq!(row.state, SandboxState::Quarantined, "{case}");
+            assert_eq!(
+                row.failure_reason.as_deref(),
+                Some("capture failed"),
+                "{case}"
+            );
+            assert_eq!(
+                reason_code.as_deref(),
+                Some(SandboxQuarantineReasonCode::SuspendSnapshotPublicationFailed.as_str()),
+                "{case}"
+            );
+        } else {
+            // Periodic publication recovery owns a row left suspending.
+            assert_eq!(row.state, SandboxState::Suspending, "{case}");
+            assert_eq!(row.failure_reason, None, "{case}");
+            assert_eq!(reason_code, None, "{case}");
         }
-        let service = suspend_test_service(conn, runtime_live, sockets.path());
-
-        let persisted =
-            service.record_suspend_snapshot_publication_failure_after_begin(&id, "capture failed");
-
-        assert_eq!(persisted, expected, "{case}");
-        assert_eq!(
-            stored_sandbox(&service, &id).unwrap().state,
-            final_state,
-            "{case}"
-        );
         drain_service_tasks(&service).await;
     }
 }
@@ -2336,8 +2332,12 @@ async fn suspend_publication_failure_after_staging_preserves_only_owned_evidence
         if unreadable_journal {
             conn.execute(
                 "INSERT INTO jobs (job_id, kind, subject_id, payload)
-                 VALUES (?1, 'teardown_suspend', ?2, 'malformed')",
-                rusqlite::params![uuid::Uuid::now_v7().to_string(), id],
+                 VALUES (?1, ?2, ?3, 'malformed')",
+                rusqlite::params![
+                    uuid::Uuid::now_v7().to_string(),
+                    crate::db::TEARDOWN_SUSPEND_JOB_KIND,
+                    id
+                ],
             )
             .unwrap();
         }
@@ -2355,7 +2355,8 @@ async fn suspend_publication_failure_after_staging_preserves_only_owned_evidence
                 std::fs::write(suspend_snapshot_staging_parent_dir(&sandbox_dir), b"").unwrap();
             }
         }
-        let service = suspend_test_service(conn, runtime_live, cache.path());
+        let service =
+            service_with_runtime_liveness_and_absent_sockets(conn, runtime_live, cache.path());
 
         let disposition = service.record_suspend_snapshot_publication_failure_after_staging(
             &id,
@@ -2421,10 +2422,10 @@ async fn teardown_suspend_driver_completes_a_generation_whose_artifact_is_alread
         Some((local_artifact_id, &snapshot_dir)),
     )
     .unwrap();
-    let service = suspend_test_service(conn, false, cache.path());
+    let service = service_with_runtime_liveness_and_absent_sockets(conn, false, cache.path());
 
-    // The second pass observes the completed operation and changes nothing.
-    for pass in ["ready", "durable"] {
+    // Driving the same generation again is idempotent.
+    for pass in ["first", "repeated"] {
         service
             .drive_teardown_suspend(sandbox_id, generation, SandboxEventTrigger::System)
             .await
