@@ -547,8 +547,13 @@ async fn create_snapshot_refuses_invalid_requests_before_dialing_firecracker() {
 
 // No invalid case may pass validation: the next step stages files or binds the
 // volume into the node's fixed jail directory, or waits for the Firecracker
-// socket. The valid encrypted load shows where validation ends: its volume bind
-// is the first blocking host step, which the fixture refuses.
+// socket. The valid encrypted loads show where validation ends: their volume
+// bind is the first blocking host step, which the fixture refuses. A malformed
+// rate limit is refused before either path's host work: the checkpoint row
+// would otherwise inspect the sandbox's fresh checkpoint directory, which does
+// not exist, and the encrypted row would reach the refused bind. A valid
+// checkpoint load has no row because that inspection's outcome depends on the
+// host's cache root.
 #[tokio::test]
 async fn load_snapshot_refuses_invalid_requests_before_staging_the_jail() {
     use crate::lifecycle_limiter::LifecycleMethod;
@@ -655,9 +660,48 @@ async fn load_snapshot_refuses_invalid_requests_before_staging_the_jail() {
             "rootfs_rate_limit.operations is required",
         ),
         (
+            "checkpoint load with a rate limit without bandwidth",
+            LoadSnapshotRequest {
+                source_dir: Some(format!("{}/{id}/snapshot", super::CACHE_DIR)),
+                rootfs_rate_limit: Some(DriveRateLimit {
+                    bandwidth: None,
+                    operations: bucket,
+                }),
+                ..valid.clone()
+            },
+            Code::InvalidArgument,
+            "rootfs_rate_limit.bandwidth is required",
+        ),
+        (
+            "encrypted load with a rate limit without operations",
+            LoadSnapshotRequest {
+                snapshot_volume_mount_dir: Some(snapshot_volume(&id)),
+                rootfs_rate_limit: Some(DriveRateLimit {
+                    bandwidth: bucket,
+                    operations: None,
+                }),
+                ..valid.clone()
+            },
+            Code::InvalidArgument,
+            "rootfs_rate_limit.operations is required",
+        ),
+        (
             "valid encrypted load",
             LoadSnapshotRequest {
                 snapshot_volume_mount_dir: Some(snapshot_volume(&id)),
+                ..valid.clone()
+            },
+            Code::Cancelled,
+            "artifact work cancelled",
+        ),
+        (
+            "valid encrypted load with a rate limit",
+            LoadSnapshotRequest {
+                snapshot_volume_mount_dir: Some(snapshot_volume(&id)),
+                rootfs_rate_limit: Some(DriveRateLimit {
+                    bandwidth: bucket,
+                    operations: bucket,
+                }),
                 ..valid.clone()
             },
             Code::Cancelled,
