@@ -110,7 +110,7 @@ jobs:
       # images come from the GHCR mirror; see ci/mirrored-images.txt.
       SPACE_CI_IMAGE_MIRROR: ghcr
       SPACE_KIND_RUST_ARTIFACTS: prebuilt
-      # The shards run what a devbox runs: the default `otel` mode, with the
+      # The shards explicitly select the devbox `otel` profile, with the
       # local metrics, traces and logs backends installed from the mirror and
       # every service exporting to them. The scenarios run with telemetry on,
       # and local.telemetry_reaches_local_backends proves it arrives. Pinned

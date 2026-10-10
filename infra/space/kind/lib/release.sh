@@ -26,7 +26,11 @@ guard_cluster() {
 # Creating from the manifest is atomic, so a race cannot adopt someone else's
 # namespace after the fact.
 guard_namespace() {
-  if ! "${kube[@]}" get namespace "$namespace" >/dev/null 2>&1; then
+  local found
+  found=$("${kube[@]}" get namespace "$namespace" --ignore-not-found -o name)
+  if [[ -z $found ]]; then
+    # Quiescing an optional collector must not create a namespace or a backend.
+    if [[ $action == pause || $action == preflight ]]; then namespace_absent=true; return; fi
     [[ $action == up ]] || { echo 'Task namespace does not exist' >&2; exit 1; }
     "${kube[@]}" create -f "$harness_dir/namespace.yaml"
   fi
@@ -61,6 +65,7 @@ release_init() {
   kube=(kubectl --context "$context")
   guard_cluster
   guard_namespace
+  [[ ${namespace_absent:-false} == false ]] || return 0
   # The chart consumes the common library chart; Helm needs it vendored
   # into charts/ before lint, template or upgrade. Cheap and idempotent.
   helm dependency build "$chart_dir" >/dev/null

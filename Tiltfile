@@ -74,37 +74,49 @@ TELEMETRY_SET = TELEMETRY_CONFIG["helm_set"]
 # report; see telemetry_config.py.
 KIND_GIT_SHA = TELEMETRY_CONFIG["commit"] or "unknown"
 watch_file("infra/space/kind/charts/space-kind-telemetry")
+# Reconcile before returning any changed producer manifests, including on a
+# watched profile transition. Resource startup dependencies alone do not gate
+# subsequent updates. This helper never deletes backend data.
+watch_file("infra/space/kind/lib/release.sh")
+watch_file("infra/space/kind/scripts/install-observability.sh")
+watch_file("ci/mirrored-images.txt")
+watch_file("ci/scripts/mirror-images.sh")
+watch_file("ci/scripts/lib/test-deps.sh")
+# Watch source inputs, not Helm's generated dependency archives. Watching the
+# whole chart tree would retrigger evaluation on every dependency build.
+for signal in ["metrics", "traces", "logs", "grafana", "common"]:
+    chart = "infra/space/observability/charts/" + signal
+    for source in ["Chart.yaml", "values.yaml", "templates"]:
+        watch_file(chart + "/" + source)
+    if signal != "common":
+        watch_file(chart + "/Chart.lock")
+        for source in ["config", "profiles"]:
+            watch_file(chart + "/" + source)
+        watch_file("infra/space/kind/" + signal + "/local.sh")
+        watch_file("infra/space/kind/" + signal + "/namespace.yaml")
+local(["bash", "infra/space/kind/scripts/install-observability.sh"], quiet = True)
 
-# The local backends otel mode exports to, installed as on the bootstrap path.
-# Nothing waits on them: the shim addresses the Collectors by fixed ClusterIPs,
-# and every exporter retries until a receiver answers.
 if TELEMETRY_MODE == "otel":
-    local_resource(
-        "install-observability-backends",
-        cmd = "SPACE_KIND_CLUSTER={} bash infra/space/kind/scripts/install-observability.sh".format(KIND_CLUSTER),
-        deps = ["infra/space/kind/scripts/install-observability.sh", "infra/space/observability/charts"],
-        # Each install runs `helm dependency build` on its chart
-        # (release_init, infra/space/kind/lib/release.sh), which rewrites the
-        # vendored charts/<chart>/charts/*.tgz and stages tmpcharts-* beside
-        # them. Watching that output reran this resource after every run, so
-        # Tilt never went idle and the smoke bring-up's wait for it never ended.
-        ignore = [
-            "infra/space/observability/charts/*/charts",
-            "infra/space/observability/charts/*/tmpcharts-*",
-        ],
-        labels = ["bootstrap"],
-    )
-
     # Each backend on the port its own `local.sh ui` helper uses; bootstrap.sh
     # forwards the same. Tilt does not deploy these releases, so it tracks no
     # pods for port_forwards to follow: port-forward.sh holds each forward
     # instead, restarting it whenever its pod does.
-    for name, namespace, mapping in [
-        ("prometheus", "space-metrics", "19090:9090"),
-        ("tempo", "space-traces", "13200:3200"),
-        ("loki", "space-logs", "13101:3100"),
-        ("grafana", "space-grafana", "13000:3000"),
+    for name, namespace, mapping, signal in [
+        ("prometheus", "space-metrics", "19090:9090", "metrics"),
+        ("tempo", "space-traces", "13200:3200", "traces"),
+        ("loki", "space-logs", "13101:3100", "logs"),
+        ("grafana", "space-grafana", "13000:3000", "grafana"),
     ]:
+        if signal in ["metrics", "traces"] and signal not in TELEMETRY_CONFIG["local_signals"]:
+            continue
+        # Reuse-only mode requires logs and implicit receivers, not Grafana.
+        if signal == "grafana" and not TELEMETRY_CONFIG["install_observability"]:
+            existing = str(local([
+                "kubectl", "--context", "kind-" + KIND_CLUSTER, "-n", namespace,
+                "get", "svc", name, "--ignore-not-found", "-o", "name",
+            ], quiet = True)).strip()
+            if not existing:
+                continue
         local_resource(
             "{}-port-forward".format(name),
             serve_cmd = [
@@ -113,7 +125,6 @@ if TELEMETRY_MODE == "otel":
             ],
             links = [link("http://127.0.0.1:" + mapping.split(":")[0], name)],
             labels = ["observability"],
-            resource_deps = ["install-observability-backends"],
         )
 
 # ── Image builds ──────────────────────────────────────────────────────────

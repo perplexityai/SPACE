@@ -42,7 +42,7 @@ def vendored_datadog_chart():
         ],
         ["helm", "dependency", "build", str(chart)],
     ):
-        result = subprocess.run(command, capture_output=True, text=True)
+        result = subprocess.run(command, capture_output=True, text=True, check=False)
         if result.returncode != 0:
             pytest.fail(
                 f"could not vendor the Datadog subchart: {' '.join(command)}\n"
@@ -62,8 +62,6 @@ def approved(tmp_path):
         "SPACE_KIND_VERSION": "a" * 40,
         "SPACE_KIND_PHASE": "after-otel",
         "SPACE_KIND_TELEMETRY_MODE": "otel",
-        # The shim defaults to the OSS Collector, so a SaaS experiment has to
-        # pin it back to the node-local Agent.
         "SPACE_KIND_SHIM_OTLP_ENDPOINT": "http://127.0.0.1:4317",
         "SPACE_KIND_DATADOG_DURATION_MINUTES": "5",
         "SPACE_KIND_DATADOG_ACKNOWLEDGE_SHARED_BACKEND": "yes",
@@ -91,9 +89,9 @@ def test_ambient_key_never_enables_saas():
     assert backend.render(backend.plan({})) == ""
 
 
-@pytest.mark.parametrize("mode", ["fakeintake", "saas"])
-def test_real_helm_render_and_running_pod_verification(mode, approved, monkeypatch):
-    env = {**approved, "SPACE_KIND_DATADOG_MODE": mode, "DD_API_KEY": "poison"}
+@pytest.mark.parametrize("mode,emitter", [("fakeintake", "datadog"), ("fakeintake", "otel"), ("saas", "otel")])
+def test_real_helm_render_and_running_pod_verification(mode, emitter, approved, monkeypatch):
+    env = {**approved, "SPACE_KIND_DATADOG_MODE": mode, "SPACE_KIND_TELEMETRY_MODE": emitter, "DD_API_KEY": "poison"}
     config = backend.plan(env)
     docs = documents(config)
     rendered = json.dumps(docs)
@@ -116,8 +114,8 @@ def test_real_helm_render_and_running_pod_verification(mode, approved, monkeypat
             )
             if container["name"] == "agent":
                 assert (
-                    envs["DD_CONTAINER_INCLUDE_LOGS"]["value"]
-                    == "kube_namespace:^space$"
+                    envs.get("DD_CONTAINER_INCLUDE_LOGS", {}).get("value", "")
+                    == ("kube_namespace:^space$" if config["log_route"] == "datadog" else "")
                 )
                 assert envs["DD_CONTAINER_EXCLUDE_LOGS"]["value"] == "kube_namespace:.*"
                 if mode == "saas":
@@ -128,6 +126,10 @@ def test_real_helm_render_and_running_pod_verification(mode, approved, monkeypat
         calls.append(args)
         if args[:2] == ("get", "secret"):
             return "present"
+        if args[:2] in (("get", "daemonset"), ("get", "deployment")):
+            resource = json.loads(json.dumps(next(doc for doc in docs if doc["metadata"]["name"] == args[2] and doc["kind"].lower() == args[1])))
+            resource["metadata"].setdefault("annotations", {})["kubectl.kubernetes.io/last-applied-configuration"] = json.dumps(resource)
+            return json.dumps(resource)
         return json.dumps({"items": pod_specs(docs)}) if args[0] == "get" else "ok"
 
     monkeypatch.setattr(backend, "kube", kube)
@@ -138,6 +140,22 @@ def test_real_helm_render_and_running_pod_verification(mode, approved, monkeypat
         with pytest.raises(ValueError, match="requires session"):
             backend.apply({**config, "unbounded": False})
     assert any(call[:2] == ("rollout", "status") for call in calls)
+    # Existing template/apply installs need no new owner marker. Missing or
+    # conflicting receipts must not authorize replacement of another Agent.
+    for mutation in ("receipt", "chart", "cluster"):
+        resource = json.loads(kube(config, "get", "daemonset", "datadog-agent"))
+        if mutation == "receipt":
+            resource["metadata"]["annotations"].clear()
+        elif mutation == "chart":
+            resource["metadata"]["labels"]["helm.sh/chart"] = "foreign-1.0.0"
+        else:
+            for container in resource["spec"]["template"]["spec"]["containers"]:
+                for entry in container["env"]:
+                    if entry["name"] == "DD_TAGS":
+                        entry["value"] = '["kind_cluster:another-bench"]'
+        monkeypatch.setattr(backend, "kube", lambda *_a, resource=resource, **_kw: json.dumps(resource))
+        with pytest.raises(ValueError, match="Refusing unowned"):
+            backend.guard_owner(config)
     # Verification inspects running pod specs, not merely desired Helm values.
     pods = pod_specs(docs)
     pods[0]["spec"]["containers"][0]["env"].append(
@@ -216,6 +234,8 @@ def test_stop_persists_local_intent_before_apply_even_if_apply_fails(
 
     def kube(config, *args, **kwargs):
         assert json.loads(path.read_text())["SPACE_KIND_DATADOG_MODE"] == "fakeintake"
+        if args[0] == "get":
+            return ""
         assert config["backend"] == "fakeintake"
         assert config["api_key_secret"] == backend.FAKE_SECRET
         assert "kind-dev-only-key" not in kwargs["input"]

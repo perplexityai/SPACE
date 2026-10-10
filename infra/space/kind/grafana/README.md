@@ -1,7 +1,7 @@
 # Local visualization: Grafana
 
 Independent visualization for the SPACE Kind metrics, logs and traces backends,
-installed automatically by default Kind bootstrap and full-stack Tilt in `otel`
+installed automatically by Kind bootstrap and Tilt in explicit `otel`
 mode. This chart owns Grafana, dashboards and datasource provisioning only.
 It does not install a backend or change application routing. The releases remain
 runtime-independent: for standalone installations, enable only the datasources

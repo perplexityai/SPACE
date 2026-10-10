@@ -1,7 +1,8 @@
 # Local traces: Collector → Tempo
 
 **Traces-only** ingestion for verified Docker Kind `space-local`, installed
-automatically by default Kind bootstrap and full-stack Tilt in `otel` mode.
+automatically by Kind bootstrap and Tilt in explicit `otel` mode unless an
+external traces receiver is supplied or backend installation is disabled.
 The release remains independent from metrics, logs and Grafana. Running this
 helper alone changes no application instrumentation, sampling policy, exporter
 selection or Datadog Agent settings. There is no tail sampling, span metrics,
@@ -34,7 +35,7 @@ tenant isolation. Never expose these ports publicly.
 
 The in-cluster receiver is
 `http://collector.space-traces.svc.cluster.local:4317` (plaintext OTLP/gRPC).
-The default Kind `otel` mode already points SPACE producers here and needs no
+The explicit Kind `otel` mode points SPACE producers here and needs no
 Datadog Agent. Installing this backend independently does not redirect producers
 or reconfigure an existing Agent. For a separate canary, if a selected process
 already uses OTLP traces, temporarily override only
@@ -72,7 +73,7 @@ Other useful TraceQL examples:
 {resource.service.name="space-cluster-api"}
 ```
 
-The default Kind bring-up also installs the independent `grafana` chart with
+The `otel` profile also installs the independent `grafana` chart with
 the Tempo datasource enabled at `http://tempo.space-traces.svc.cluster.local:3200`.
 For a standalone backend, that UI remains optional.
 Open `/d/space-traces` on its localhost UI; click a trace ID for the detail

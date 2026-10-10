@@ -31,6 +31,7 @@ spec:
   template:
     metadata:
       annotations:
+        {{- include "space-kind-telemetry.logAnnotations" . | nindent 8 }}
         ad.datadoghq.com/tags: '{"team":"{{ .Values.datadogTeam }}"}'
       labels:
         app.kubernetes.io/name: space-data-plane

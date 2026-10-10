@@ -146,6 +146,68 @@ def preflight(config):
             )
 
 
+def guard_owner(config):
+    """Never replace an Agent deployed outside this selected Kind profile."""
+    if config["backend"] == "off":
+        # Workload log-exclusion annotations do not reconfigure an Agent.
+        return
+    for kind, name in (("daemonset", "datadog-agent"), ("deployment", "datadog-agent-cluster-agent")):
+        raw = kube(config, "get", kind, name, "--ignore-not-found", "-o", "json")
+        if raw.strip():
+            resource = json.loads(raw)
+            # This helper templates then kubectl-applies; it does not create a
+            # Helm release. Recognize its existing chart/release labels and
+            # Kind-bound values in both live and last-applied configuration.
+            receipt = resource.get("metadata", {}).get("annotations", {}).get(
+                "kubectl.kubernetes.io/last-applied-configuration", "{}"
+            )
+            try:
+                applied = json.loads(receipt)
+            except (ValueError, TypeError):
+                applied = {}
+            component = "agent" if kind == "daemonset" else "cluster-agent"
+            if not all(owned_agent(item, name, component, config["kind_cluster"])
+                       for item in (resource, applied)):
+                raise ValueError(
+                    f"Refusing unowned {kind}/{name}; expected chart/release identity, "
+                    "Kind DD_TAGS and matching kubectl last-applied receipt. "
+                    "An owner must review an unproven existing Agent migration"
+                )
+
+
+def owned_agent(resource, name, component, cluster):
+    if not isinstance(resource, dict):
+        return False
+    metadata = resource.get("metadata", {})
+    labels = metadata.get("labels", {})
+    expected = {
+        "app.kubernetes.io/name": "datadog-agent",
+        "app.kubernetes.io/instance": f"datadog-agent-{component}",
+        "app.kubernetes.io/managed-by": "Helm",
+        "app.kubernetes.io/part-of": "kube--system-datadog--agent",
+        "app.kubernetes.io/component": component,
+    }
+    if (resource.get("kind") != ("DaemonSet" if component == "agent" else "Deployment")
+            or metadata.get("name") != name or metadata.get("namespace") != "kube-system"
+            or not re.fullmatch(r"datadog-3\.[0-9]+\.[0-9]+", labels.get("helm.sh/chart", ""))
+            or any(labels.get(key) != value for key, value in expected.items())):
+        return False
+    containers = resource.get("spec", {}).get("template", {}).get("spec", {}).get("containers", [])
+    if not containers or not any(container.get("name") == component for container in containers):
+        return False
+    for container in containers:
+        env = {item["name"]: item for item in container.get("env", [])}
+        try:
+            tags = json.loads(env.get("DD_TAGS", {}).get("value", "[]"))
+        except (ValueError, TypeError):
+            return False
+        if (not isinstance(tags, list)
+                or [tag for tag in tags if str(tag).startswith("kind_cluster:")] != [f"kind_cluster:{cluster}"]
+                or not env.get("DD_API_KEY", {}).get("valueFrom", {}).get("secretKeyRef", {}).get("name")):
+            return False
+    return True
+
+
 def agent_values(config):
     environment = config["environment"]
     tags = [f"env:{environment}", f"kind_cluster:{config['kind_cluster']}"]
@@ -173,7 +235,7 @@ def agent_values(config):
         "containerLifecycle": {"enabled": False},
         "collectEvents": False,
         "containerExcludeLogs": "kube_namespace:.*",
-        "containerIncludeLogs": "kube_namespace:^space$",
+        "containerIncludeLogs": "kube_namespace:^space$" if config["log_route"] == "datadog" else "",
     }
     if config["backend"] == "saas":
         datadog["env"] = [
@@ -313,6 +375,7 @@ def verify(config):
 def apply(config, action="apply"):
     _warn_unbounded(config, action)
     preflight(config)
+    guard_owner(config)
     if config["backend"] == "off":
         raise ValueError("off skips installation; use stop to stop SaaS export")
     manifest = render(config)
@@ -362,6 +425,7 @@ def stop(env):
         if os.path.exists(temporary):
             os.unlink(temporary)
     # Tilt watches the same file, so its next reconciliation also stays local.
+    guard_owner(config)
     kube(config, "apply", "-f", "-", input=manifest)
     return verify(config)
 
@@ -413,7 +477,7 @@ def session(env, config):
                 )
             else:
                 print(json.dumps(stop(current)), flush=True)
-        except Exception as rollback_error:  # noqa: BLE001 - preserve the original failure
+        except Exception as rollback_error:  # preserve the original failure
             if not failed:
                 raise
             print(f"rollback failed: {rollback_error}", file=sys.stderr, flush=True)
@@ -443,7 +507,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "command",
-        choices=("plan", "preflight", "render", "apply", "verify", "stop", "session"),
+        choices=("plan", "preflight", "guard-owner", "render", "apply", "verify", "stop", "session"),
     )
     parser.add_argument(
         "--for-deployment",
@@ -459,7 +523,9 @@ def main():
         config = plan(env)
         if args.for_deployment:
             _warn_unbounded(config, args.command)
-        if args.command == "render":
+        if args.command == "guard-owner":
+            guard_owner(config)
+        elif args.command == "render":
             print(render(config), end="")
         elif args.command == "preflight":
             preflight(config)

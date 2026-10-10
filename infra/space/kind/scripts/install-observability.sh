@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
-# Install the local observability backends for this Kind bench.
+# Reconcile the selected Kind profile without deleting backend data.
 #
-# Both supported bring-up paths call this in otel mode: bootstrap.sh, and the
-# Tiltfile's install-observability-backends resource. It may run before or
-# after the shim and workloads: they address the Collectors by fixed ClusterIPs
-# and retry exports until a receiver answers.
+# Both supported bring-up paths call this before producer changes: bootstrap.sh
+# and Tiltfile evaluation. The local node-side endpoints use fixed ClusterIPs,
+# so already-running exporters reconnect if a backend is later reinstalled.
 #
 # Each helper is idempotent and refuses any cluster but the selected bench.
 set -Eeuo pipefail
@@ -69,9 +68,62 @@ load_pinned_images() {
   done
 }
 
-load_pinned_images
-for signal in metrics traces logs grafana; do
-  log "installing the $signal backend"
-  bash "$kind_dir/$signal/local.sh" up
-done
-log "installed: metrics traces logs grafana"
+plan=$(python3 "$kind_dir/scripts/telemetry_config.py" json)
+field() { python3 -c 'import json,sys; print(json.load(sys.stdin)[sys.argv[1]])' "$1" <<<"$plan"; }
+source "$kind_dir/lib/release.sh"
+cluster=$(field kind_cluster)
+control_plane=$cluster-control-plane
+context=kind-$cluster
+kube=(kubectl --context "$context")
+guard_cluster
+python3 "$kind_dir/scripts/datadog_backend.py" guard-owner
+# Refuse an unrelated log namespace/release before installing any receiver.
+bash "$kind_dir/logs/local.sh" preflight
+
+if [[ $(field log_route) != alloy ]]; then
+  # A missing owned log namespace is a no-op, not permission to create one.
+  bash "$kind_dir/logs/local.sh" pause
+  log 'native profile: owned Alloy paused; backends and data retained'
+elif [[ $(field install_observability) == True ]]; then
+  load_pinned_images
+  signals=$(python3 -c 'import json,sys; print("\n".join(json.load(sys.stdin)["local_signals"]))' <<<"$plan")
+  grafana=(--set datasources.prometheus.enabled=false --set datasources.tempo.enabled=false)
+  while IFS= read -r signal; do
+    [[ -n $signal ]] || continue
+    bash "$kind_dir/$signal/local.sh" up
+    if [[ $signal == metrics ]]; then datasource=prometheus; else datasource=tempo; fi
+    grafana+=(--set "datasources.$datasource.enabled=true")
+  done <<<"$signals"
+  bash "$kind_dir/logs/local.sh" up
+  # External OTLP ingestion URLs are not Prometheus/Tempo query URLs.
+  bash "$kind_dir/grafana/local.sh" up "${grafana[@]}"
+  log 'OSS profile: required local receivers and local Alloy/Loki/Grafana ready'
+else
+  # External metrics/traces do not supply a log backend. Require the explicit
+  # owned local log route before allowing producers to change profile.
+  bash "$kind_dir/logs/local.sh" check
+  # Fixed node-side addresses no longer require endpoint discovery. Reuse-only
+  # mode still requires each implicit local receiver at its configured address;
+  # the legacy host-only override does not replace application receivers.
+  python3 - "$kind_dir/scripts" "$plan" <<'PY'
+import json, subprocess, sys
+sys.path.insert(0, sys.argv[1])
+from telemetry_config import NODE_COLLECTORS
+config = json.loads(sys.argv[2])
+scope = ["kubectl", "--context", f"kind-{config['kind_cluster']}"]
+for signal in config["local_signals"]:
+    namespace = f"space-{signal}"
+    owner = subprocess.check_output(
+        [*scope, "get", "namespace", namespace, "-o", "jsonpath={.metadata.labels.space-local-owner}"],
+        text=True,
+    ).strip()
+    address = subprocess.check_output(
+        [*scope, "-n", namespace, "get", "svc", "collector", "-o", "jsonpath={.spec.clusterIP}"],
+        text=True,
+    ).strip()
+    if owner != signal or address != NODE_COLLECTORS[signal]:
+        sys.exit(f"Refusing unowned or incorrectly addressed local {signal} receiver")
+PY
+  bash "$kind_dir/logs/local.sh" resume
+  log 'OSS profile: existing receivers and owned local Alloy/Loki reused'
+fi

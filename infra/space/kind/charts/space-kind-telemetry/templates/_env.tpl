@@ -45,3 +45,10 @@
   value: {{ . | quote }}
 {{- end }}
 {{- end -}}
+
+{{/* The profile owns only SPACE workload collection, not a foreign Agent. */}}
+{{- define "space-kind-telemetry.logAnnotations" -}}
+{{- if eq (toString .Values.telemetry.excludeDatadogLogs) "true" }}
+ad.datadoghq.com/logs_exclude: "true"
+{{- end }}
+{{- end -}}

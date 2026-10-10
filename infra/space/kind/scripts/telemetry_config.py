@@ -2,6 +2,7 @@
 """Shared, non-secret Kind telemetry configuration for Tilt, bootstrap and shims."""
 
 import argparse
+import ipaddress
 import json
 import os
 import re
@@ -26,6 +27,9 @@ OPTIONS = {
     "SPACE_KIND_OWNER",
     "SPACE_KIND_SHIM_ENV",
     "SPACE_KIND_SHIM_OTLP_ENDPOINT",
+    "SPACE_KIND_OTLP_METRICS_ENDPOINT",
+    "SPACE_KIND_OTLP_TRACES_ENDPOINT",
+    "SPACE_KIND_OBSERVABILITY",
 }
 PHASES = {"before-main", "after-datadog", "after-otel"}
 # Each mode's (SPACE_METRICS_SINK, SPACE_TRACE_EXPORTER), for the Rust
@@ -46,6 +50,8 @@ def otlp_endpoint_rejection(endpoint):
     shared module. Keep it in step with `otlp_endpoint_rejection` in
     `scripts/space-cluster-smoke.py`.
     """
+    if any(character.isspace() or character in ",\\{}" for character in endpoint):
+        return "must not contain whitespace or Helm value separators"
     if "?" in endpoint or "#" in endpoint:
         return "must not include a query or fragment"
     try:
@@ -58,7 +64,7 @@ def otlp_endpoint_rejection(endpoint):
         return "must not embed credentials"
     if not parsed.hostname:
         return "must include a host"
-    host, bracket, rest = parsed.netloc.rpartition("]")
+    _host, bracket, rest = parsed.netloc.rpartition("]")
     if bracket:
         port = rest[1:] if rest.startswith(":") else None
     else:
@@ -69,7 +75,7 @@ def otlp_endpoint_rejection(endpoint):
     ):
         return "must use a port between 1 and 65535"
     try:
-        parsed.port
+        _ = parsed.port
     except ValueError:
         return "must use a port between 1 and 65535"
     if parsed.path not in ("", "/"):
@@ -146,11 +152,8 @@ def configuration(env):
         raise ValueError(
             "SPACE_KIND_CLUSTER_ID must be a lowercase DNS label (max 63 characters)"
         )
-    # Kind defaults to otel: the local Collectors come up with the cluster, so
-    # metrics and traces land somewhere queryable without a vendor round trip.
-    # `datadog` stays available and pairs with SPACE_KIND_DATADOG_MODE=fakeintake
-    # to validate DogStatsD output locally.
-    mode = env.get("SPACE_KIND_TELEMETRY_MODE", "otel")
+    # Exporter selection does not authorize installation of a SaaS Agent.
+    mode = env.get("SPACE_KIND_TELEMETRY_MODE", "datadog")
     if mode not in MODES:
         raise ValueError("SPACE_KIND_TELEMETRY_MODE must be otel, datadog, or off")
     environment = token(
@@ -173,11 +176,47 @@ def configuration(env):
         rejection = otlp_endpoint_rejection(endpoint)
         if rejection:
             raise ValueError(f"SPACE_KIND_SHIM_OTLP_ENDPOINT {rejection}")
+    endpoints = {}
+    for signal in ("metrics", "traces"):
+        key = f"SPACE_KIND_OTLP_{signal.upper()}_ENDPOINT"
+        value = env.get(key)
+        if value is not None:
+            rejection = otlp_endpoint_rejection(value)
+            if rejection:
+                raise ValueError(f"{key} {rejection}")
+        legacy = env.get("SPACE_KIND_SHIM_OTLP_ENDPOINT")
+        if legacy is not None and value is not None:
+            raise ValueError(
+                f"{key} cannot be combined with node-only SPACE_KIND_SHIM_OTLP_ENDPOINT; "
+                "remove the legacy override to configure Pods and host processes together"
+            )
+        # Preserve the legacy node-reachable receiver, including node loopback.
+        # Only the new global options also change the Pod-DNS receiver route.
+        endpoints[signal] = value
+        if mode == "otel" and endpoints[signal]:
+            host = urllib.parse.urlsplit(endpoints[signal]).hostname
+            try:
+                loopback = ipaddress.ip_address(host).is_loopback
+            except ValueError:
+                loopback = host.lower() == "localhost"
+            if loopback:
+                raise ValueError(
+                    f"{key} must be reachable from both Pods and Kind nodes; "
+                    "a loopback receiver is not shared"
+                )
     version = f"{revision}-{phase}" if revision and phase else revision
     commit = checkout_commit()
     metrics, traces = MODES[mode]
+    observability = env.get("SPACE_KIND_OBSERVABILITY", "auto")
+    if observability not in {"auto", "off"}:
+        raise ValueError("SPACE_KIND_OBSERVABILITY must be auto or off")
     config = {
         "mode": mode,
+        "observability": observability,
+        "install_observability": observability == "auto" and mode == "otel",
+        "endpoints": endpoints,
+        "local_signals": [signal for signal, endpoint in endpoints.items() if not endpoint],
+        "log_route": "alloy" if mode == "otel" else "datadog",
         "kind_cluster": kind_cluster,
         "cluster_id": cluster_id,
         "environment": environment,
@@ -197,6 +236,11 @@ def configuration(env):
             # own running totals; delta stays the default for Datadog, whose
             # OTLP intake accepts only delta.
             f"telemetry.otlpMetricsTemporality={'cumulative' if mode == 'otel' else ''}",
+            f"telemetry.excludeDatadogLogs={'true' if mode == 'otel' else 'false'}",
+            *[
+                f"telemetry.otlp{signal.title()}Endpoint={value}"
+                for signal, value in endpoints.items() if value is not None
+            ],
             f"datadogEnvironment={environment}",
             f"telemetry.version={version or commit}",
             f"telemetry.phase={phase}",
@@ -206,7 +250,8 @@ def configuration(env):
         ],
     }
     # The host runtime-supervisor's node environment (space-node-manager-local)
-    # needs the Collectors at addresses the node reaches, as the shim does.
+    # and sandbox-manager's host sidecars need node-reachable Collectors, as
+    # the shim does.
     config["helm_set"] += [
         f"telemetry.nodeOtlpMetricsEndpoint={collector_endpoint(config, 'metrics')}",
         f"telemetry.nodeOtlpTracesEndpoint={collector_endpoint(config, 'traces')}",
@@ -226,6 +271,8 @@ NODE_COLLECTORS = {"metrics": "10.96.0.20", "traces": "10.96.0.21"}
 
 def collector_endpoint(config, signal):
     """A node-reachable OTLP endpoint for one signal's Collector."""
+    if config["endpoints"][signal] is not None:
+        return config["endpoints"][signal]
     if config["shim_endpoint"] is not None:
         return config["shim_endpoint"]
     return f"http://{NODE_COLLECTORS[signal]}:4317"

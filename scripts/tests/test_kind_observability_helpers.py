@@ -8,8 +8,8 @@ refusals can be exercised without a cluster.
 
 import os
 import subprocess
-import textwrap
 import tempfile
+import textwrap
 import unittest
 from pathlib import Path
 
@@ -17,13 +17,64 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 KIND_DIR = REPO_ROOT / "infra/space/kind"
 RELEASES = ("metrics", "logs", "traces", "grafana")
 
+HELM_STUB = r'''
+import json
+import os
+import sys
+
+args = sys.argv[1:]
+if os.getenv("STUB_LOG"):
+    with open(os.environ["STUB_LOG"], "a") as stream:
+        stream.write("helm " + " ".join(args) + "\n")
+service = "apiVersion: v1\nkind: Service\nmetadata:\n  name: loki\n"
+daemon = "apiVersion: apps/v1\nkind: DaemonSet\nmetadata:\n  name: alloy\nspec: {}\n"
+values = {"profile": "kind", "alloy": {"enabled": True}}
+def manifest(enabled):
+    return service + ("---\n" + daemon if enabled else "")
+
+if args[0] == "list":
+    state = os.getenv("STUB_LOG_RELEASE", "absent")
+    print(json.dumps([] if state == "absent" else [{
+        "name": "space-logs", "namespace": "space-logs", "status": "deployed",
+        "chart": "foreign-1.0.0" if state == "foreign" else "space-logs-0.2.0",
+        "revision": "1",
+    }]))
+elif args[:2] == ["get", "manifest"]:
+    print(manifest(True))
+elif args[:2] == ["get", "values"]:
+    print(json.dumps(values))
+elif args[0] == "template":
+    print(manifest(json.load(sys.stdin)["alloy"]["enabled"]))
+elif args[0] == "upgrade" and "--dry-run=client" in args:
+    enabled = "alloy.enabled=true" in args
+    values["alloy"]["enabled"] = enabled
+    proposed = manifest(enabled)
+    if os.getenv("STUB_NON_ALLOY_DELTA"):
+        proposed = proposed.replace("name: loki", "name: replaced-storage")
+    print(json.dumps({"manifest": proposed, "config": values}))
+'''
+
 STUBS = {
     "kubectl": """
         echo "kubectl $*" >> "$STUB_LOG"
         case "$*" in
           *"config view"*) echo "${STUB_SERVER:-https://127.0.0.1:6443}" ;;
-          *"get namespace"*"space-local-owner"*) echo "${STUB_OWNER}" ;;
-          *"get namespace"*) exit "${STUB_NS_EXISTS:-0}" ;;
+          *"get namespace"*"space-local-owner"*)
+            if [[ "${STUB_DYNAMIC_OWNER:-0}" == 1 ]]; then
+              for signal in metrics traces logs grafana; do
+                if [[ "$*" == *"get namespace space-$signal "* ]]; then
+                  echo "${STUB_OWNER_OVERRIDE:-$signal}"
+                fi
+              done
+            else echo "${STUB_OWNER}"; fi ;;
+          *"get namespace"*)
+            if [[ "${STUB_NS_EXISTS:-0}" == 0 ]]; then echo namespace/task;
+            elif [[ "${STUB_NS_EXISTS}" != 1 ]]; then exit "$STUB_NS_EXISTS"; fi ;;
+          *"get svc collector"*)
+            [[ "${STUB_RECEIVER_ABSENT:-0}" == 0 ]] || exit 1
+            if [[ "$*" == *"-n space-metrics "* ]]; then
+              echo "${STUB_RECEIVER_ADDRESS:-10.96.0.20}"
+            else echo "${STUB_RECEIVER_ADDRESS:-10.96.0.21}"; fi ;;
         esac
     """,
     "docker": """
@@ -33,7 +84,7 @@ STUBS = {
           *"port space-local-control-plane"*) echo "${STUB_PORT:-127.0.0.1:6443}" ;;
         esac
     """,
-    "helm": 'echo "helm $*" >> "$STUB_LOG"',
+    "helm": HELM_STUB,
     "kind": 'echo "kind $*" >> "$STUB_LOG"; echo space-local-control-plane',
 }
 
@@ -47,23 +98,34 @@ class HelperGuardTests(unittest.TestCase):
         self.bin.mkdir(parents=True, exist_ok=True)
         for name, body in STUBS.items():
             path = self.bin / name
-            path.write_text("#!/usr/bin/env bash\n" + textwrap.dedent(body))
+            interpreter = "python3" if name == "helm" else "bash"
+            path.write_text(f"#!/usr/bin/env {interpreter}\n" + textwrap.dedent(body))
             path.chmod(0o755)
         self.log = self.tmp / "commands.log"
 
     def run_helper(self, release, *args, **env):
+        return self.run_script(KIND_DIR / release / "local.sh", release, *args, **env)
+
+    def run_installer(self, **env):
+        return self.run_script(
+            KIND_DIR / "scripts/install-observability.sh", "logs",
+            STUB_DYNAMIC_OWNER="1", **env,
+        )
+
+    def run_script(self, script, owner, *args, **env):
         self.log.write_text("")
         environment = {
-            **os.environ,
+            **{key: value for key, value in os.environ.items() if not key.startswith("SPACE_KIND_")},
             "PATH": f"{self.bin}:{os.environ['PATH']}",
             "STUB_LOG": str(self.log),
             # The directory is the short name; the namespace ownership label
-            "STUB_OWNER": release,
+            "STUB_OWNER": owner,
+            "SPACE_KIND_DATADOG_MODE": "off",
             **env,
         }
         result = subprocess.run(
-            ["bash", str(KIND_DIR / release / "local.sh"), *args],
-            capture_output=True, text=True, env=environment,
+            ["bash", str(script), *args],
+            capture_output=True, text=True, env=environment, check=False,
         )
         return result, self.log.read_text()
 
@@ -109,6 +171,21 @@ class HelperGuardTests(unittest.TestCase):
                 self.assertNotIn("helm upgrade", log)
                 self.assertEqual(result.returncode, 1)
                 self.assertIn("Refusing unowned namespace", result.stderr)
+        # A correctly labelled namespace is not proof of release ownership.
+        # The second negative keeps that identity valid but changes a non-Alloy
+        # object in the proposed upgrade. Neither may reach a real mutation.
+        cases = [(action, {"STUB_LOG_RELEASE": "foreign"})
+                 for action in ("preflight", "up", "check", "pause", "resume")]
+        cases += [(action, {"STUB_LOG_RELEASE": "owned", "STUB_NON_ALLOY_DELTA": "1"})
+                  for action in ("pause", "resume")]
+        for action, extra in cases:
+            result, log = self.run_helper("logs", action, **extra)
+            self.assertNotEqual(result.returncode, 0, result.stdout)
+            self.assertIn("Logs profile guard", result.stderr)
+            self.assertFalse(any(line.startswith("helm upgrade") and "--dry-run" not in line
+                                 for line in log.splitlines()), log)
+            self.assertNotIn("helm install", log)
+            self.assertNotIn("apply -f", log)
 
     def test_refuses_an_absent_namespace_unless_creating(self):
         for release in RELEASES:
@@ -143,6 +220,102 @@ class HelperGuardTests(unittest.TestCase):
         _, log = self.run_helper("traces", "up", "--reuse-values")
         self.assertIn("--reset-then-reuse-values", log)
         self.assertNotIn(" --reuse-values", log)
+        for action in ("pause", "resume", "check"):
+            result, log = self.run_helper("logs", action, STUB_LOG_RELEASE="owned")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            actual = [line for line in log.splitlines()
+                      if line.startswith("helm upgrade") and "--dry-run" not in line]
+            self.assertEqual(len(actual), 0 if action == "check" else 1)
+
+    def test_native_profiles_do_not_create_missing_backends(self):
+        for mode in ("datadog", "off"):
+            with self.subTest(mode=mode):
+                result, log = self.run_installer(
+                    SPACE_KIND_TELEMETRY_MODE=mode, STUB_NS_EXISTS="1",
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                for mutation in ("helm upgrade", "helm install", "apply -f", "docker pull"):
+                    self.assertNotIn(mutation, log)
+
+    def test_otel_installs_only_selected_local_receivers(self):
+        for external in (False, True):
+            with self.subTest(external=external):
+                settings = {
+                    "SPACE_KIND_OTLP_METRICS_ENDPOINT": "http://192.0.2.10:4317",
+                    "SPACE_KIND_OTLP_TRACES_ENDPOINT": "http://192.0.2.11:4317",
+                } if external else {}
+                result, log = self.run_installer(SPACE_KIND_TELEMETRY_MODE="otel", **settings)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                for signal in ("metrics", "traces"):
+                    self.assertEqual(f"helm upgrade --install space-{signal}" in log, not external)
+                self.assertIn("helm install space-logs", log)
+                self.assertIn("helm upgrade --install space-grafana", log)
+                self.assertLess(log.index("helm install space-logs"), log.index("helm upgrade --install space-grafana"))
+                if external:
+                    self.assertIn("datasources.prometheus.enabled=false", log)
+                    self.assertIn("datasources.tempo.enabled=false", log)
+                else:
+                    self.assertLess(log.index("space-metrics "), log.index("helm install space-logs"))
+                    self.assertIn("datasources.prometheus.enabled=true", log)
+                    self.assertIn("datasources.tempo.enabled=true", log)
+                self.assertNotIn("delete namespace", log)
+
+    def test_reuse_only_checks_fixed_receivers_even_with_legacy_host_override(self):
+        result, log = self.run_installer(
+            SPACE_KIND_TELEMETRY_MODE="otel", SPACE_KIND_OBSERVABILITY="off",
+            SPACE_KIND_SHIM_OTLP_ENDPOINT="http://127.0.0.1:4317",
+            STUB_LOG_RELEASE="owned",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for signal in ("metrics", "traces"):
+            self.assertIn(f"-n space-{signal} get svc collector", log)
+        actual = [
+            line for line in log.splitlines()
+            if line.startswith("helm upgrade") and "--dry-run" not in line
+        ]
+        self.assertEqual(len(actual), 1)
+        self.assertIn("alloy.enabled=true", actual[0])
+        self.assertNotIn("--install", actual[0])
+        self.assertNotIn("apply -f", log)
+        self.assertNotIn("docker pull", log)
+
+    def test_reuse_only_refuses_absent_or_wrong_local_receiver(self):
+        for failure in (
+            {"STUB_RECEIVER_ABSENT": "1"},
+            {"STUB_RECEIVER_ADDRESS": "192.0.2.99"},
+            {"STUB_OWNER_OVERRIDE": "foreign"},
+            {"STUB_NS_EXISTS": "1"},
+        ):
+            with self.subTest(failure=failure):
+                result, log = self.run_installer(
+                    SPACE_KIND_TELEMETRY_MODE="otel", SPACE_KIND_OBSERVABILITY="off",
+                    STUB_LOG_RELEASE="owned", **failure,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse(any(
+                    line.startswith(("helm install", "helm upgrade")) and "--dry-run" not in line
+                    for line in log.splitlines()
+                ), log)
+
+    def test_external_reuse_requires_logs_but_no_local_metrics_or_traces(self):
+        result, log = self.run_installer(
+            SPACE_KIND_TELEMETRY_MODE="otel", SPACE_KIND_OBSERVABILITY="off",
+            SPACE_KIND_OTLP_METRICS_ENDPOINT="http://192.0.2.10:4317",
+            SPACE_KIND_OTLP_TRACES_ENDPOINT="http://192.0.2.11:4317",
+            STUB_LOG_RELEASE="owned",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("get svc collector", log)
+        self.assertNotIn("--install", log)
+        self.assertIn("alloy.enabled=true", log)
+
+    def test_foreign_logs_are_refused_before_image_loading_or_backend_installs(self):
+        result, log = self.run_installer(
+            SPACE_KIND_TELEMETRY_MODE="otel", STUB_LOG_RELEASE="foreign",
+        )
+        self.assertNotEqual(result.returncode, 0)
+        for mutation in ("helm install", "helm upgrade", "docker pull", "apply -f"):
+            self.assertNotIn(mutation, log)
 
 
 if __name__ == "__main__":

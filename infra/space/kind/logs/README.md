@@ -1,7 +1,7 @@
 # Local logs: Alloy → Loki
 
-Standalone logs ingestion, installed automatically by default Kind bootstrap
-and full-stack Tilt in `otel` mode. This chart deploys only Alloy and Loki;
+Standalone logs ingestion, installed automatically by Kind bootstrap and
+full-stack Tilt with the explicit `otel` profile. This chart deploys only Alloy and Loki;
 neither metrics nor Grafana is required. It neither changes SPACE
 images/environment nor removes or reconfigures Datadog. No application
 exporter, trace correlation, metrics pipeline, or production integration is added.
@@ -29,7 +29,7 @@ For shared clusters use the portable
 not this local test harness. Its Kind guard is intentionally unchanged.
 
 Keep `ui` running for the Loki HTTP API at <http://127.0.0.1:13101>.
-The default Kind bring-up also installs the independent `grafana` chart with
+The `otel` profile also installs the independent `grafana` chart with
 the Loki datasource enabled at `http://loki.space-logs.svc.cluster.local:3100`.
 For a standalone backend, visualization remains optional. Open its provisioned
 [SPACE logs dashboard](http://127.0.0.1:13000/d/space-main-health-logs).

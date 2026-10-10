@@ -5,8 +5,9 @@ bench (`kind-$SPACE_KIND_CLUSTER` when `SPACE_KIND_CLUSTER` is set). The
 helper checks cluster identity and namespace ownership. Shared
 installations use the [observability deployment runbook](../../observability/README.md).
 
-Default Kind bootstrap and full-stack Tilt install this backend automatically
-in `otel` mode. Use this helper to manage the release independently.
+Kind bootstrap and Tilt install this backend automatically
+in `otel` mode unless an explicit metrics receiver is supplied or backend
+installation is disabled. Use this helper to manage the release independently.
 
 ## Deploy and query
 
@@ -25,7 +26,7 @@ bash infra/space/kind/metrics/local.sh ui
 
 The release owns only the backend, configuration, storage and access policies.
 Installing it creates no producer Jobs and changes no SPACE sink. Grafana is an
-independent release, also installed by default but not required for ingestion.
+independent release, also installed by the `otel` profile but not required for ingestion.
 Kind uses disposable local storage and does not provide enforced network
 isolation, authentication or production sizing.
 

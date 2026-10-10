@@ -28,13 +28,15 @@
 #   SPACE_KIND_DATADOG_MODE  off (default), fakeintake, or explicit saas
 #   SPACE_KIND_OBSERVABILITY_CONFIG watched non-secret experiment JSON file;
 #                            required for SaaS. See the Kind README.
-#   SPACE_KIND_TELEMETRY_MODE otel (default), datadog, or off. The otel
-#                            mode installs the local metrics, traces, logs and
-#                            visualization backends and sends SPACE traces and
-#                            all metric types, the Go shim's included, to the
-#                            Collectors. datadog uses the native exporters; off
-#                            disables metrics and traces. Metrics sinks are
-#                            exclusive; logs stay on stdout in every mode.
+#   SPACE_KIND_OBSERVABILITY auto (default) installs the local metrics, traces,
+#                            logs and visualization backends when the telemetry
+#                            mode uses them; off reuses existing receivers.
+#   SPACE_KIND_TELEMETRY_MODE datadog (default), otel, or off. The otel
+#                            mode sends SPACE traces (including the Go shim)
+#                            and all Rust metric types to the Collectors,
+#                            and moves the Go shim's metrics there too. Rust
+#                            metrics sinks are exclusive; off disables metrics
+#                            and traces. Logs stay on stdout in every mode.
 #   SPACE_KIND_PRUNE_SUPERSEDED_IMAGES=0 keep superseded builds of SPACE's
 #                            images in the node stores (default: removed once
 #                            the stack is up; see prune-superseded-images.py)
@@ -271,13 +273,10 @@ done
 # every per-sandbox pod fails to start. install-shim.sh is idempotent: it
 # only builds the shim if needed and only edits containerd config.toml if
 # the runtime stanza isn't already present.
-# The local backends otel mode exports to come up early so start-up telemetry
-# has a receiver, but nothing depends on them: the shim addresses the
-# Collectors by fixed ClusterIPs, and every exporter retries until a receiver
-# answers. Each helper is idempotent and refuses any cluster but this bench.
-if [[ "$TELEMETRY_MODE" == otel ]]; then
-  bash "$KIND_DIR/scripts/install-observability.sh"
-fi
+# Reconcile receivers and owned log collection before changing producers.
+# Local node-side endpoints stay at the Kind profiles' fixed ClusterIPs, so
+# already-running exporters can also reconnect after a backend restart.
+bash "$KIND_DIR/scripts/install-observability.sh"
 
 log "installing containerd-shim-space-v2 on sandbox workers"
 bash "$KIND_DIR/scripts/install-shim.sh"
@@ -573,13 +572,20 @@ if (( PORT_FORWARD )); then
   if [[ "$DATADOG_MODE" == fakeintake ]]; then
     start_pf svc/datadog-fakeintake 8088:80 kube-system
   fi
-  # The local observability backends exist only in otel mode. Each takes the
-  # port its own `local.sh ui` helper uses; the Tiltfile forwards the same.
+  # Forward only the local signals selected by the profile; an external OTLP
+  # ingestion URL does not identify a local query service.
   if [[ "$TELEMETRY_MODE" == otel ]]; then
-    start_pf svc/prometheus 19090:9090 space-metrics
-    start_pf svc/tempo      13200:3200 space-traces
+    local_signals=$(python3 -c 'import json,sys; print(" ".join(json.load(sys.stdin)["local_signals"]))' <<<"$TELEMETRY_JSON")
+    if [[ " $local_signals " == *" metrics "* ]]; then
+      start_pf svc/prometheus 19090:9090 space-metrics
+    fi
+    if [[ " $local_signals " == *" traces "* ]]; then
+      start_pf svc/tempo 13200:3200 space-traces
+    fi
     start_pf svc/loki       13101:3100 space-logs
-    start_pf svc/grafana    13000:3000 space-grafana
+    if [[ -n $(kubectl --context "$KCTX" -n space-grafana get svc grafana --ignore-not-found -o name) ]]; then
+      start_pf svc/grafana 13000:3000 space-grafana
+    fi
   fi
 
   log "port-forward pids in $PF_PIDFILE (kill them with: xargs -a $PF_PIDFILE kill -- ; pkill -f \"space-kind-pf:$KCTX|--context $KCTX.*port-forward\")"

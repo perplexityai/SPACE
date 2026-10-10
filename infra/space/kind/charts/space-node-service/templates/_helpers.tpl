@@ -447,6 +447,7 @@ dnsPolicy: ClusterFirstWithHostNet
 
 {{- define "space-node-service.podAnnotations" -}}
 ad.datadoghq.com/tags: '{"team":"{{ .ctx.Values.node.datadogTeam }}"}'
+{{ include "space-kind-telemetry.logAnnotations" .ctx }}
 {{- end -}}
 
 {{- define "space-node-service.serviceAccount" -}}
