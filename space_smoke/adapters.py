@@ -362,6 +362,13 @@ TEMPLATE_RECOVERY_REGISTERED_MESSAGE = (
 TEMPLATE_RECOVERY_REJECTED_MESSAGE = "dropping invalid digest dir during startup recovery"
 TEMPLATE_RECOVERY_PRUNED_PREFIX = "[template-mgr] pruning stale build: "
 KIND_SANDBOX_NODE_SELECTOR = "space.pplx.net/node-pool=sandbox"
+# The query API of each local observability backend, on the localhost port
+# both bring-up paths forward to it in `otel` mode.
+KIND_TELEMETRY_BACKENDS = {
+    "prometheus": "http://127.0.0.1:19090",
+    "tempo": "http://127.0.0.1:13200",
+    "loki": "http://127.0.0.1:13101",
+}
 # The suspend codec facts sbx-manager seals into the published sidecar and
 # reports on its own `artifact_backup_queued` event.
 BACKUP_QUEUED_EVENT = "artifact_backup_queued"
@@ -4253,6 +4260,18 @@ ON CONFLICT (key_hash) DO NOTHING;
                 )
             )
         return ticks
+
+    def telemetry_query(self, backend: str, path: str, params: Mapping[str, str]) -> Any:
+        url = KIND_TELEMETRY_BACKENDS[backend] + path
+        if params:
+            url += "?" + urlencode(params)
+        try:
+            with urlopen(Request(url), timeout=30) as response:
+                return json.load(response)
+        except HTTPError as error:
+            raise RuntimeError(f"query {backend} {path} returned HTTP {error.code}") from None
+        except (URLError, OSError, ValueError) as error:
+            raise RuntimeError(f"query {backend} {path} at {url} failed: {error}") from None
 
 
 def _node_service_selector(component: str, *, role: str = KIND_WORKER_ROLE) -> str:

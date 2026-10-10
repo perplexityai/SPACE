@@ -277,9 +277,11 @@ SPACE_KIND_TELEMETRY_MODE=datadog SPACE_KIND_DATADOG_MODE=fakeintake \
 ```
 
 `off` sets `SPACE_METRICS_SINK=off` and `SPACE_TRACE_EXPORTER=off` for every
-Rust service and the shim, with no OTLP endpoint or identity overrides. CI pins
-it for the Kind smoke shards, which test sandbox lifecycle rather than
-telemetry.
+Rust service and the shim, with no OTLP endpoint or identity overrides, for a
+leaner bench. The Kind CI shards pin `otel`, so they run what a devbox runs;
+the typed `local.telemetry_reaches_local_backends` scenario, in their normal
+inventory, polls Tempo, Prometheus and Loki for its own sandbox's trace, shim
+metrics and log lines.
 
 To export to a receiver you run yourself, stay in `otel` mode, set
 `SPACE_KIND_SHIM_OTLP_ENDPOINT` for the shim and runtime-supervisor, and

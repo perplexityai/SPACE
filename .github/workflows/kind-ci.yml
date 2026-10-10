@@ -112,16 +112,17 @@ jobs:
       matrix:
         shard: [1, 2, 3, 4]
     env:
-      # Image builds and the charts' images come from the GHCR mirror; see
-      # ci/mirrored-images.txt.
+      # Image builds, the charts' images and the observability backends'
+      # images come from the GHCR mirror; see ci/mirrored-images.txt.
       SPACE_CI_IMAGE_MIRROR: ghcr
       SPACE_KIND_RUST_ARTIFACTS: prebuilt
-      # These shards test sandbox lifecycle, not telemetry. `off` installs none
-      # of the local observability backends, whose twelve pods would compete
-      # with the scenarios for the runner, and leaves nothing exporting to a
-      # receiver that is not there. Pinned rather than inherited so a default
-      # change cannot add them silently.
-      SPACE_KIND_TELEMETRY_MODE: "off"
+      # The shards run what a devbox runs: the default `otel` mode, with the
+      # local metrics, traces and logs backends installed from the mirror and
+      # every service exporting to them. The scenarios run with telemetry on,
+      # and local.telemetry_reaches_local_backends proves it arrives. Pinned
+      # rather than inherited so a default change cannot alter the shards
+      # silently.
+      SPACE_KIND_TELEMETRY_MODE: otel
       SPACE_KIND_PREBUILT_RUST_IMAGE_ID: ${{ needs.rust_artifacts.outputs.image_id }}
       SPACE_KIND_PREBUILT_RUST_SHA: ${{ needs.rust_artifacts.outputs.source_sha }}
     runs-on: ubuntu-24.04-16core
@@ -294,6 +295,14 @@ jobs:
           k() { timeout "$1" kubectl --context kind-space-local "${@:2}"; }
           k 30s get nodes -o wide || true
           k 30s get pods -A -o wide || true
+          # The local observability backends, whose own failures can surface as
+          # a missing signal rather than a failed step.
+          for namespace in space-metrics space-traces space-logs; do
+            k 30s -n "${namespace}" get pods,events -o wide || true
+            for pod in $(k 30s -n "${namespace}" get pods -o name); do
+              k 30s -n "${namespace}" logs "${pod}" --all-containers=true --tail=100 || true
+            done
+          done
           timeout 30s tilt get uiresources -o yaml || true
           timeout 30s tilt logs --tail=200 || true
           # One DaemonSet per node service: keep each pod's earlier attempt

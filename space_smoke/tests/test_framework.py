@@ -155,6 +155,7 @@ runpy.run_module("space_smoke", run_name="__main__")
                 "local.snapshot_reaper_reclaims_backed_fork_snapshot",
                 "local.suspend_restore_cross_node_from_object_storage",
                 "local.suspend_snapshot_rows_are_per_attempt",
+                "local.telemetry_reaches_local_backends",
                 "local.template_cache_lru_eviction_reclaims",
                 "local.template_startup_recovery_decision_table",
                 "native.aws_secret_network_credential_injection",

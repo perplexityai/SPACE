@@ -49,6 +49,7 @@ from space_smoke.capabilities import (
     StartupRecoveryControl,
     StartupRecoveryReport,
     SuspendCodecControl,
+    TelemetryBackendControl,
     LocalEviction,
     RestoreActivation,
     RestoreStateRead,
@@ -103,6 +104,7 @@ from space_smoke.pending_backup import PendingBackupAssertions
 from space_smoke.quarantine_recovery import QuarantineRecoveryAssertions
 from space_smoke.template_build import TemplateBuildAssertions
 from space_smoke.rate_limiters import RateLimiterAssertions
+from space_smoke.telemetry_delivery import TelemetryDeliveryAssertions
 from space_smoke.config import DEFAULT_SANDBOX_TIMEOUT_SECONDS
 from space_smoke.identity import EcwIdentityAssertions
 from space_smoke.invariants.lifecycle import prove_idle_deadline_reset
@@ -2841,6 +2843,27 @@ class KindEcw(Ecw):
                 self, self._suspend_codec_control, self._context.scope
             )
         return self._suspend_codec_assertions
+
+    _telemetry_control: TelemetryBackendControl | None = None
+    _telemetry_assertions: TelemetryDeliveryAssertions | None = None
+
+    @property
+    def telemetry(self) -> TelemetryDeliveryAssertions:
+        """Reads of the local Prometheus, Tempo and Loki that `otel` mode exports to."""
+
+        if self._telemetry_control is None:
+            raise SmokeConfigurationError(
+                "telemetry backend reads are only available on the kind backend"
+            )
+        if self._telemetry_assertions is None:
+            # The phases recorded so far, sandbox creation included, measure
+            # how long ago the scenario began.
+            phases = self._context.evidence.get("phases") or []
+            elapsed = sum(float(phase["duration_seconds"]) for phase in phases)
+            self._telemetry_assertions = TelemetryDeliveryAssertions(
+                self, self._telemetry_control, since=time.time() - elapsed
+            )
+        return self._telemetry_assertions
 
     _startup_recovery_control: StartupRecoveryControl | None = None
     _startup_recovery_assertions: StartupRecoveryAssertions | None = None

@@ -2113,3 +2113,16 @@ class SnapshotReaperControl(RestoreStateRead, Protocol):
     def reaper_loop_log(self, node_name: str, *, since_time: str) -> list[str]:
         """The reaper's tick/skip lines on that worker, for a timeout's evidence."""
         ...
+
+
+class TelemetryBackendControl(Protocol):
+    """Kind-only reads of the local backends `otel` mode installs.
+
+    Prometheus (`space-metrics`), Tempo (`space-traces`) and Loki
+    (`space-logs`) are read through their own HTTP query APIs, on the localhost
+    ports both bring-up paths forward to them.
+    """
+
+    def telemetry_query(self, backend: str, path: str, params: Mapping[str, str]) -> Any:
+        """The decoded JSON body of `GET <path>?<params>` on `prometheus`, `tempo` or `loki`."""
+        ...
