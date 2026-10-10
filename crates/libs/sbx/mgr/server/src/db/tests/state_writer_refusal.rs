@@ -144,9 +144,12 @@ fn insert_row(conn: &Connection, state: SandboxState) -> String {
     id
 }
 
-/// A `creating` row whose create owns an armed cleanup episode.
-fn insert_creating_with_episode(
+/// A row in `state` owning an armed cleanup episode. The episode table admits
+/// only activation states (`creating`, `starting`, `restoring`), so the row is
+/// inserted as a create's and other states are reached by moving it afterwards.
+fn insert_with_episode(
     conn: &Connection,
+    state: SandboxState,
     completion: CleanupCompletion,
 ) -> (String, SandboxCleanupEpisodeId) {
     let cleanup_id = SandboxCleanupEpisodeId::new();
@@ -168,6 +171,12 @@ fn insert_creating_with_episode(
         )
     });
     inserted.unwrap();
+    conn.execute(
+        "UPDATE sandboxes SET state = ?1 WHERE id = ?2",
+        params![state.as_str(), id],
+    )
+    .unwrap();
+    assert_eq!(row(conn, &id).state, state);
     (id, cleanup_id)
 }
 
@@ -325,84 +334,126 @@ fn interrupted_pause_recovery_settles_only_a_pausing_row() {
 #[test]
 fn prepared_clone_disposal_rearms_only_its_own_quarantined_pool_clone_episode() {
     let conn = test_conn();
-    let (id, cleanup_id) = insert_creating_with_episode(&conn, CleanupCompletion::DeletePoolClone);
-    let before = database_rows(&conn);
-    assert!(!rearm_prepared_clone_disposal(&conn, &id, cleanup_id).unwrap());
-    assert_unchanged(&conn, &before, "armed creating row");
+    for state in states_except(&[SandboxState::Quarantined]) {
+        let (id, cleanup_id) =
+            insert_with_episode(&conn, state, CleanupCompletion::DeletePoolClone);
+        let before = database_rows(&conn);
+        assert!(
+            !rearm_prepared_clone_disposal(&conn, &id, cleanup_id).unwrap(),
+            "{state}"
+        );
+        assert_unchanged(&conn, &before, state.as_str());
+    }
+    let quarantine_create = |id: &str| {
+        assert!(
+            mark_quarantined_from_state(
+                &conn,
+                id,
+                SandboxState::Creating,
+                SandboxQuarantineSource::SbxManager,
+                SandboxQuarantineReasonCode::CreateInterrupted,
+                "held create",
+                SandboxQuarantineNextAction::RequiresOperatorAttention,
+            )
+            .unwrap()
+        );
+    };
 
-    // Hold the disposal the way an exhausted clone deletion does: requested,
-    // charged, failed, then quarantined with its attempt history intact.
+    // A disposal held after its budget ran out: requested, charged, failed,
+    // then quarantined with its attempt history intact.
+    let (exhausted, exhausted_cleanup) = insert_with_episode(
+        &conn,
+        SandboxState::Creating,
+        CleanupCompletion::DeletePoolClone,
+    );
     assert_eq!(
         request_cleanup_episode(
             &conn,
-            &id,
-            cleanup_id,
+            &exhausted,
+            exhausted_cleanup,
             SandboxQuarantineReasonCode::CreateInterrupted,
             "interrupted clone",
         )
         .unwrap(),
         CleanupEpisodeRequestOutcome::Requested
     );
-    assert!(charge_prepared_clone_disposal_attempt(&conn, &id, cleanup_id).unwrap());
-    assert!(record_cleanup_episode_failure(&conn, &id, cleanup_id, "clone delete failed").unwrap());
-    assert_eq!(row(&conn, &id).state, SandboxState::CleanupFailed);
+    assert!(charge_prepared_clone_disposal_attempt(&conn, &exhausted, exhausted_cleanup).unwrap());
+    assert!(
+        record_cleanup_episode_failure(&conn, &exhausted, exhausted_cleanup, "clone delete failed")
+            .unwrap()
+    );
+    assert_eq!(row(&conn, &exhausted).state, SandboxState::CleanupFailed);
     let before = database_rows(&conn);
-    assert!(!rearm_prepared_clone_disposal(&conn, &id, cleanup_id).unwrap());
-    assert_unchanged(&conn, &before, "cleanup_failed row is not quarantined");
-
-    assert!(quarantine_cleanup_episode(&conn, &id, cleanup_id, "clone root busy").unwrap());
-    assert_eq!(row(&conn, &id).state, SandboxState::Quarantined);
-    let held = episode(&conn, &id).unwrap();
-    assert_eq!(held.id, cleanup_id);
+    assert!(!rearm_prepared_clone_disposal(&conn, &exhausted, exhausted_cleanup).unwrap());
+    assert_unchanged(&conn, &before, "requested disposal is not quarantined");
+    assert!(
+        quarantine_cleanup_episode(&conn, &exhausted, exhausted_cleanup, "clone root busy")
+            .unwrap()
+    );
+    assert_eq!(row(&conn, &exhausted).state, SandboxState::Quarantined);
+    let held = episode(&conn, &exhausted).unwrap();
     assert_eq!(held.attempt_count, 1);
     assert_eq!(
         held.last_cleanup_error.as_deref(),
         Some("clone delete failed")
     );
 
+    // A create quarantined independently while its disposal was still armed.
+    let (armed, armed_cleanup) = insert_with_episode(
+        &conn,
+        SandboxState::Creating,
+        CleanupCompletion::DeletePoolClone,
+    );
+    quarantine_create(&armed);
+    let held = episode(&conn, &armed).unwrap();
+    assert_eq!(held.requested_at, None);
+    assert_eq!(held.quarantine_reason_code, None);
+
     let before = database_rows(&conn);
-    assert!(!rearm_prepared_clone_disposal(&conn, &id, SandboxCleanupEpisodeId::new()).unwrap());
+    assert!(!rearm_prepared_clone_disposal(&conn, &armed, SandboxCleanupEpisodeId::new()).unwrap());
     assert_unchanged(&conn, &before, "another cleanup episode");
 
     let (other_id, other_cleanup) =
-        insert_creating_with_episode(&conn, CleanupCompletion::DeleteRow);
-    assert!(
-        mark_quarantined_from_state(
-            &conn,
-            &other_id,
-            SandboxState::Creating,
-            SandboxQuarantineSource::SbxManager,
-            SandboxQuarantineReasonCode::CreateInterrupted,
-            "held create",
-            SandboxQuarantineNextAction::RequiresOperatorAttention,
-        )
-        .unwrap()
-    );
+        insert_with_episode(&conn, SandboxState::Creating, CleanupCompletion::DeleteRow);
+    quarantine_create(&other_id);
     let before = database_rows(&conn);
     assert!(!rearm_prepared_clone_disposal(&conn, &other_id, other_cleanup).unwrap());
     assert_unchanged(&conn, &before, "episode does not dispose of a pool clone");
 
-    assert!(rearm_prepared_clone_disposal(&conn, &id, cleanup_id).unwrap());
-    let rearmed = row(&conn, &id);
-    assert_eq!(rearmed.state, SandboxState::CleanupRequired);
-    assert_eq!(
-        rearmed.cleanup_completion,
-        Some(CleanupCompletion::DeletePoolClone)
-    );
-    assert_eq!(rearmed.cleanup_keep_filesystem, Some(false));
-    let rearmed_episode = episode(&conn, &id).unwrap();
-    assert_eq!(rearmed_episode.id, cleanup_id);
-    assert!(rearmed_episode.requested_at.is_some());
-    assert_eq!(rearmed_episode.attempt_count, 0);
-    assert_eq!(rearmed_episode.last_cleanup_error, None);
-    assert_eq!(
-        rearmed_episode.quarantine_reason_code,
-        Some(SandboxQuarantineReasonCode::CreateInterrupted)
-    );
+    for (case, id, cleanup_id) in [
+        ("exhausted disposal", &exhausted, exhausted_cleanup),
+        ("armed disposal", &armed, armed_cleanup),
+    ] {
+        assert!(
+            rearm_prepared_clone_disposal(&conn, id, cleanup_id).unwrap(),
+            "{case}"
+        );
+        let rearmed = row(&conn, id);
+        assert_eq!(rearmed.state, SandboxState::CleanupRequired, "{case}");
+        assert_eq!(
+            rearmed.cleanup_completion,
+            Some(CleanupCompletion::DeletePoolClone),
+            "{case}"
+        );
+        assert_eq!(rearmed.cleanup_keep_filesystem, Some(false), "{case}");
+        let rearmed_episode = episode(&conn, id).unwrap();
+        assert_eq!(rearmed_episode.id, cleanup_id, "{case}");
+        assert!(rearmed_episode.requested_at.is_some(), "{case}");
+        assert_eq!(rearmed_episode.attempt_count, 0, "{case}");
+        assert_eq!(rearmed_episode.last_cleanup_error, None, "{case}");
+        assert_eq!(
+            rearmed_episode.quarantine_reason_code,
+            Some(SandboxQuarantineReasonCode::CreateInterrupted),
+            "{case}"
+        );
 
-    let before = database_rows(&conn);
-    assert!(!rearm_prepared_clone_disposal(&conn, &id, cleanup_id).unwrap());
-    assert_unchanged(&conn, &before, "already rearmed");
+        let before = database_rows(&conn);
+        assert!(
+            !rearm_prepared_clone_disposal(&conn, id, cleanup_id).unwrap(),
+            "{case}"
+        );
+        assert_unchanged(&conn, &before, &format!("{case}: already rearmed"));
+    }
 }
 
 #[test]
@@ -519,6 +570,25 @@ fn activation_episode_rollback_requires_the_activation_state_and_its_armed_episo
         };
         assert!(!changed.unwrap(), "{case}");
         assert_unchanged(&conn, &before, case);
+    }
+    for restoring_wrapper in [false, true] {
+        let activation_state = if restoring_wrapper {
+            SandboxState::Restoring
+        } else {
+            SandboxState::Starting
+        };
+        for state in states_except(&[activation_state]) {
+            let (id, cleanup_id) = insert_with_episode(&conn, state, CleanupCompletion::DeleteRow);
+            let before = database_rows(&conn);
+            let changed = if restoring_wrapper {
+                rollback_restoring_episode(&conn, &id, SandboxState::Suspended, cleanup_id)
+            } else {
+                rollback_starting_episode(&conn, &id, SandboxState::Stopped, cleanup_id)
+            };
+            let case = format!("{activation_state} rollback of an armed {state} row");
+            assert!(!changed.unwrap(), "{case}");
+            assert_unchanged(&conn, &before, &case);
+        }
     }
 
     let before = database_rows(&conn);
