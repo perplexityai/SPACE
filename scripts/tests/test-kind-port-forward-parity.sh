@@ -87,10 +87,10 @@ reap_patterns="$(
 [ -n "$reap_patterns" ] || fail "found no port-forward cleanup patterns to check targets against"
 
 # Each forward is two processes, and they look nothing alike: the kubectl child
-# carries `--context <ctx> … port-forward` on one line, while the supervisor's
-# command line is the loop's script text (context still an unexpanded `"$kctx"`)
-# plus its arguments. A pattern matching only the child kills it and leaves the
-# loop to respawn one, so both shapes are checked.
+# carries `--context <ctx> … port-forward`, while the supervisor's command line
+# is port-forward.sh and its arguments, ending in the label. A pattern matching
+# only the child kills it and leaves the loop to respawn one, so both shapes are
+# checked.
 kctx="kind-space-local"
 # The patterns reference the context through a variable; substitute the default
 # so they can be matched against a representative command line.
@@ -103,7 +103,7 @@ expand_ctx() {
 while IFS= read -r target; do
     [ -n "$target" ] || continue
     child="kubectl --context $kctx -n space port-forward --address=127.0.0.1 $target 1:1"
-    supervisor="bash -c while true; do kubectl --context \"\$kctx\" -n \"\$ns\" port-forward --address=127.0.0.1 \"\$target\" \"\$mapping\"; sleep 2; done _ $target 1:1 ${target#svc/} space $kctx space-kind-pf:$kctx"
+    supervisor="bash $repo_root/infra/space/kind/scripts/port-forward.sh $kctx space $target 1:1 space-kind-pf:$kctx"
     while IFS= read -r pattern; do
         [ -n "$pattern" ] || continue
         expanded="$(expand_ctx "$pattern")"

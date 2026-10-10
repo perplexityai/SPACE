@@ -567,7 +567,7 @@ bootstrap_kind_stack__kill_stale_tilt() {
 # Stop stale `kubectl port-forward` supervisors (and their kubectl children)
 # that a previous bring-up of THIS kind context left behind and no pidfile
 # names. bootstrap.sh starts each supervisor as
-# `setsid bash -c '<loop>' _ <target> <mapping> <name> <ns> <ctx> space-kind-pf:<ctx>`
+# `setsid bash port-forward.sh <ctx> <ns> <target> <mapping> space-kind-pf:<ctx>`
 # — the label is deliberately its LAST argument — and the loop's kubectl child
 # carries `--context <ctx> … port-forward`. Both are matched on the process's
 # own command line, anchored: the label at the end, `kubectl` as the command.

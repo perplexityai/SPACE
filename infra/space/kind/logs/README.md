@@ -14,6 +14,7 @@ and node directories `/var/log/pods` and `/run/log/journal`. Run from this repo:
 ```bash
 bash infra/space/kind/logs/local.sh up
 bash infra/space/kind/logs/local.sh status
+# Default bootstrap and full-stack Tilt already forward this port in otel mode.
 bash infra/space/kind/logs/local.sh ui
 ```
 

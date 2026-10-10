@@ -17,6 +17,7 @@ helm lint infra/space/observability/charts/metrics \
   -f infra/space/observability/charts/metrics/profiles/kind.yaml
 bash infra/space/kind/metrics/local.sh up
 bash infra/space/kind/metrics/local.sh status
+# Default bootstrap and full-stack Tilt already forward this port in otel mode.
 bash infra/space/kind/metrics/local.sh ui
 # Prometheus: http://127.0.0.1:19090; Ctrl-C closes the tunnel.
 ```

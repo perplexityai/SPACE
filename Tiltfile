@@ -91,6 +91,27 @@ if TELEMETRY_MODE == "otel":
         labels = ["bootstrap"],
     )
 
+    # Each backend on the port its own `local.sh ui` helper uses; bootstrap.sh
+    # forwards the same. Tilt does not deploy these releases, so it tracks no
+    # pods for port_forwards to follow: port-forward.sh holds each forward
+    # instead, restarting it whenever its pod does.
+    for name, namespace, mapping in [
+        ("prometheus", "space-metrics", "19090:9090"),
+        ("tempo", "space-traces", "13200:3200"),
+        ("loki", "space-logs", "13101:3100"),
+        ("grafana", "space-grafana", "13000:3000"),
+    ]:
+        local_resource(
+            "{}-port-forward".format(name),
+            serve_cmd = [
+                "bash", "infra/space/kind/scripts/port-forward.sh", "kind-" + KIND_CLUSTER,
+                namespace, "svc/" + name, mapping, "space-kind-pf:kind-" + KIND_CLUSTER,
+            ],
+            links = [link("http://127.0.0.1:" + mapping.split(":")[0], name)],
+            labels = ["observability"],
+            resource_deps = ["install-observability-backends"],
+        )
+
 # ── Image builds ──────────────────────────────────────────────────────────
 #
 # Each rust runtime image chains its FROM base build into the same

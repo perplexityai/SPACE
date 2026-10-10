@@ -17,6 +17,7 @@ helm lint infra/space/observability/charts/traces \
   -f infra/space/observability/charts/traces/profiles/kind.yaml
 bash infra/space/kind/traces/local.sh up
 bash infra/space/kind/traces/local.sh status
+# Default bootstrap and full-stack Tilt already forward this port in otel mode.
 bash infra/space/kind/traces/local.sh ui
 # Tempo query API: http://127.0.0.1:13200
 ```

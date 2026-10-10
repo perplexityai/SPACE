@@ -482,14 +482,11 @@ else
 fi
 
 # ── Step 9: optional port-forwards ───────────────────────────────────────────
-# kubectl port-forward dies on its own when:
-#   - the target pod restarts (e.g., during a chart redeploy)
-#   - the controlling tty/shell exits
-#   - some node-side gRPC keepalives time out
 # Without supervision the smoke tests can't be re-run later in the session
-# because their localhost:80{80,90} endpoints have silently gone away. Wrap
-# each port-forward in a self-restarting loop inside a `setsid` so it
-# survives our parent shell + emits a pid we can later kill via PF_PIDFILE.
+# because their localhost:80{80,90} endpoints have silently gone away: kubectl
+# port-forward dies on its own when its pod restarts. port-forward.sh restarts
+# each forward whenever kubectl exits, and `setsid` lets it survive our parent
+# shell and its tty and emits a pid we can later kill via PF_PIDFILE.
 start_pf() {
   # Note: assigning all three on one `local` line evaluates `${target##*/}`
   # before `target=$1` lands in the local scope, which trips `set -u`.
@@ -498,21 +495,11 @@ start_pf() {
   local namespace=${3:-$NAMESPACE}
   local name=${target##*/}
   log "port-forward $namespace/$target -> localhost:${mapping%%:*} (self-restarting)"
-  # The trailing `space-kind-pf:<ctx>` argument is a label, not input — the loop
-  # reads $1..$5. It gives the supervisor's own command line one expanded,
-  # cluster-scoped token, so a pattern-based reap can find the loop and not only
-  # its kubectl child, without depending on whether the matcher's `.` crosses the
-  # newlines in the script text below.
-  setsid bash -c '
-    target="$1" mapping="$2" name="$3" ns="$4" kctx="$5"
-    while true; do
-      kubectl --context "$kctx" -n "$ns" port-forward --address=127.0.0.1 \
-        "$target" "$mapping" >>/tmp/space-local-pf-"$name".log 2>&1
-      # kubectl exited (target rolled, conn dropped); back off then retry.
-      sleep 2
-    done
-  ' _ "$target" "$mapping" "$name" "$namespace" "$KCTX" "space-kind-pf:$KCTX" \
-    >/dev/null 2>&1 < /dev/null &
+  # The trailing `space-kind-pf:<ctx>` argument is a label, not input (see
+  # port-forward.sh).
+  setsid bash "$KIND_DIR/scripts/port-forward.sh" \
+    "$KCTX" "$namespace" "$target" "$mapping" "space-kind-pf:$KCTX" \
+    >>/tmp/space-local-pf-"$name".log 2>&1 < /dev/null &
   echo "$!" >>"$PF_PIDFILE"
 }
 
@@ -544,6 +531,14 @@ if (( PORT_FORWARD )); then
   start_pf svc/object-store     8333:8333
   if [[ "$DATADOG_MODE" == fakeintake ]]; then
     start_pf svc/datadog-fakeintake 8088:80 kube-system
+  fi
+  # The local observability backends exist only in otel mode. Each takes the
+  # port its own `local.sh ui` helper uses; the Tiltfile forwards the same.
+  if [[ "$TELEMETRY_MODE" == otel ]]; then
+    start_pf svc/prometheus 19090:9090 space-metrics
+    start_pf svc/tempo      13200:3200 space-traces
+    start_pf svc/loki       13101:3100 space-logs
+    start_pf svc/grafana    13000:3000 space-grafana
   fi
 
   # The forwards bind asynchronously; callers (e.g. the devbox kind command)

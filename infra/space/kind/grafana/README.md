@@ -14,6 +14,7 @@ helm dependency build infra/space/observability/charts/grafana
 helm lint infra/space/observability/charts/grafana -f infra/space/observability/charts/grafana/profiles/kind.yaml
 # The Kind profile enables Prometheus, Loki and Tempo.
 bash infra/space/kind/grafana/local.sh up
+# Default bootstrap and full-stack Tilt already forward this port in otel mode.
 bash infra/space/kind/grafana/local.sh ui
 ```
 
