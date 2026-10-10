@@ -1947,6 +1947,8 @@ mod ingress_protection;
 mod reconcile;
 mod recovery;
 mod recovery_cross_node;
+#[cfg(test)]
+mod route_identity_tests;
 mod spaced_bridge;
 mod spaced_bridge_policy;
 mod start;
