@@ -1424,3 +1424,495 @@ fn the_only_unfenced_staging_failure_write_is_the_no_claim_arm() {
         claimless.join("\n")
     );
 }
+
+// ---------------------------------------------------------------------------
+// `run_cross_node_restore_inner` refusal arms.
+//
+// Every case below is refused before the restore reads node paths or connects to
+// volume-manager, node-manager or cluster-api. Each asserts the caller-visible
+// outcome and what the refusal left in `sandboxes` and
+// `sandbox_restore_transfer_scopes`.
+// ---------------------------------------------------------------------------
+
+fn cross_node_test_service(conn: rusqlite::Connection) -> SandboxManagerService {
+    SandboxManagerService::new_with_options(
+        conn,
+        crate::service::SandboxManagerServiceOptions {
+            sandbox_runtime_live: Arc::new(|_| false),
+            ..Default::default()
+        },
+    )
+}
+
+fn attempt(sequence: u8) -> pplx_space_common_core::types::SandboxActivationAttemptId {
+    pplx_space_common_core::types::SandboxActivationAttemptId::from_uuid(
+        uuid::Uuid::parse_str(&format!("019c0000-0000-7000-8000-0000000000{sequence:02x}"))
+            .unwrap(),
+    )
+}
+
+fn generation(value: i64) -> pplx_space_common_core::types::ExecutionGeneration {
+    pplx_space_common_core::types::ExecutionGeneration::new(value).unwrap()
+}
+
+/// A staging path that `remote_restore_metadata_staging_dir` never produces, so
+/// scope cleanup refuses it before any volume-manager or node-manager call.
+const UNOWNED_STAGING_DIR: &str = "/space/cache/restore-staging/not-owned-by-this-scope";
+
+/// Persist the row an interrupted remote restore leaves behind: `restoring`,
+/// remote origin, metadata staging, no runtime fields and no artifact.
+fn insert_interrupted_remote_restore(conn: &rusqlite::Connection) -> (String, ExactStorageUri) {
+    let sandbox_id = SandboxId::new().to_string();
+    let (mut meta, _) = disk_artifact_meta();
+    meta.sandbox_id = sandbox_id.clone();
+    meta.local_artifact_id = None;
+    meta.artifact_kind = None;
+    meta.artifact_origin = None;
+    meta.artifact_snapshot_name = None;
+    let source = ExactStorageUri::parse(&format!(
+        "s3://snapshots/suspend/{sandbox_id}/attempt-1?region=us-east-1"
+    ))
+    .unwrap();
+    super::insert_restoring_sandbox_row_from_snapshot(conn, &sandbox_id, &meta, &source, None)
+        .unwrap();
+    let row = crate::db::get_sandbox(conn, &sandbox_id).unwrap().unwrap();
+    assert!(
+        crate::db::sandbox_is_retryable_interrupted_restore(&row),
+        "fixture must be a retryable interrupted restore"
+    );
+    (sandbox_id, source)
+}
+
+fn transfer_scope(
+    service: &SandboxManagerService,
+    sandbox_id: &str,
+) -> Option<crate::db::RestoreTransferScopeRow> {
+    crate::db::restore_transfer_scope(&service.db.lock().unwrap(), sandbox_id).unwrap()
+}
+
+fn restore_error(
+    result: Result<Option<CrossNodeRestoreProvenance>, crate::snapshot_restore::RestoreError>,
+) -> crate::snapshot_restore::RestoreError {
+    match result {
+        Err(error) => error,
+        Ok(provenance) => panic!(
+            "expected a refusal, got Ok({:?})",
+            provenance.map(|provenance| provenance.storage_uri)
+        ),
+    }
+}
+
+#[tokio::test]
+async fn cross_node_restore_rejects_malformed_identity_and_source_before_any_write() {
+    let service = cross_node_test_service(crate::db::test_conn());
+    let valid_id = SandboxId::new().to_string();
+
+    let error = restore_error(
+        service
+            .run_cross_node_restore(
+                "not-a-sandbox-id",
+                Some("s3://snapshots/suspend/x?region=us-east-1"),
+                None,
+                None,
+                None,
+                CrossNodeRestoreStagingAdmission::Foreground,
+            )
+            .await,
+    );
+    assert!(
+        matches!(
+            &error,
+            crate::snapshot_restore::RestoreError::InvalidSandboxId { value, .. }
+                if value == "not-a-sandbox-id"
+        ),
+        "got {error:?}"
+    );
+    assert!(transfer_scope(&service, "not-a-sandbox-id").is_none());
+
+    let error = restore_error(
+        service
+            .run_cross_node_restore(
+                &valid_id,
+                Some("not a storage uri"),
+                None,
+                None,
+                None,
+                CrossNodeRestoreStagingAdmission::Foreground,
+            )
+            .await,
+    );
+    assert!(
+        matches!(
+            &error,
+            crate::snapshot_restore::RestoreError::InvalidRestoreSource { uri, .. }
+                if uri == "not a storage uri"
+        ),
+        "got {error:?}"
+    );
+    assert!(
+        transfer_scope(&service, &valid_id).is_none(),
+        "a malformed source must be refused before a transfer scope is minted"
+    );
+    assert!(
+        crate::db::get_sandbox(&service.db.lock().unwrap(), &valid_id)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn cross_node_restore_declines_an_existing_row_that_is_not_an_interrupted_remote_restore() {
+    let conn = crate::db::test_conn();
+    let sandbox_id = SandboxId::new().to_string();
+    crate::service::tests::service_tests::insert_test_sandbox(
+        &conn,
+        &sandbox_id,
+        SandboxState::Suspended,
+    );
+    let before = crate::db::get_sandbox(&conn, &sandbox_id).unwrap().unwrap();
+    let service = cross_node_test_service(conn);
+
+    let outcome = service
+        .run_cross_node_restore(
+            &sandbox_id,
+            Some("s3://snapshots/suspend/x?region=us-east-1"),
+            Some(generation(7)),
+            Some(attempt(1)),
+            None,
+            CrossNodeRestoreStagingAdmission::Foreground,
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        outcome.is_none(),
+        "a local row that is not an interrupted remote restore owns the sandbox"
+    );
+    let after = crate::db::get_sandbox(&service.db.lock().unwrap(), &sandbox_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.state, SandboxState::Suspended);
+    assert_eq!(after.updated_at, before.updated_at);
+    assert!(after.restore_operation.is_none());
+    assert!(transfer_scope(&service, &sandbox_id).is_none());
+}
+
+/// A user-facing restore waits a bounded time for the per-sandbox staging lock,
+/// then refuses as a retryable `Unavailable` rather than queueing indefinitely.
+#[tokio::test(start_paused = true)]
+async fn foreground_cross_node_restore_refuses_while_staging_is_held() {
+    let service = cross_node_test_service(crate::db::test_conn());
+    let sandbox_id = SandboxId::new().to_string();
+    let _held = Arc::clone(&service.auto_lifecycle.staging_lock(&sandbox_id))
+        .lock_owned()
+        .await;
+
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(3600),
+        service.run_cross_node_restore(
+            &sandbox_id,
+            Some("s3://snapshots/suspend/x?region=us-east-1"),
+            Some(generation(7)),
+            Some(attempt(1)),
+            None,
+            CrossNodeRestoreStagingAdmission::Foreground,
+        ),
+    )
+    .await
+    .expect("foreground admission must be bounded");
+
+    let error = restore_error(result);
+    let crate::snapshot_restore::RestoreError::AdmissionRejected(status) = &error else {
+        panic!("expected an admission refusal, got {error:?}");
+    };
+    assert_eq!(status.code(), tonic::Code::Unavailable);
+    assert!(
+        status
+            .message()
+            .contains("activation admission is busy; retry"),
+        "{status:?}"
+    );
+    assert!(transfer_scope(&service, &sandbox_id).is_none());
+}
+
+/// Ownership of a retained interrupted-restore transfer scope.
+///
+/// The scope is the durable reference to the predecessor's physical staging, so
+/// only an attempt that is current or newer may take it over, and the takeover is
+/// persisted before cleanup runs. Cleanup here always refuses the unowned staging
+/// path before any remote call, so a takeover surfaces as that error.
+#[tokio::test]
+async fn retryable_scope_takeover_requires_a_current_or_newer_attempt() {
+    type Owner = (
+        Option<pplx_space_common_core::types::ExecutionGeneration>,
+        Option<pplx_space_common_core::types::SandboxActivationAttemptId>,
+    );
+    let owned = |g: i64, a: u8| -> Owner { (Some(generation(g)), Some(attempt(a))) };
+    // (case, scope owner, incoming generation and attempt, taken over)
+    let cases: [(&str, Owner, (i64, u8), bool); 7] = [
+        ("older attempt", owned(7, 2), (7, 1), false),
+        ("older generation", owned(7, 2), (6, 3), false),
+        (
+            "partially owned scope",
+            (Some(generation(7)), None),
+            (8, 3),
+            false,
+        ),
+        ("same attempt", owned(7, 2), (7, 2), true),
+        ("newer attempt", owned(7, 2), (7, 3), true),
+        ("newer generation", owned(7, 2), (8, 1), true),
+        ("legacy unowned scope", (None, None), (7, 3), true),
+    ];
+    for (name, scope_owner, (incoming_generation, incoming_attempt), taken_over) in cases {
+        let conn = crate::db::test_conn();
+        let (sandbox_id, _) = insert_interrupted_remote_restore(&conn);
+        let scope_id = pplx_space_common_core::types::TransferScopeId::new();
+        assert!(
+            crate::db::insert_restore_transfer_scope(
+                &conn,
+                &sandbox_id,
+                scope_id,
+                scope_owner.0,
+                scope_owner.1,
+                UNOWNED_STAGING_DIR,
+            )
+            .unwrap()
+        );
+        let service = cross_node_test_service(conn);
+        let observed = transfer_scope(&service, &sandbox_id).unwrap();
+
+        let result = service
+            .claim_and_clean_retryable_restore_transfer_scope(
+                &sandbox_id,
+                &observed,
+                generation(incoming_generation),
+                attempt(incoming_attempt),
+            )
+            .await;
+
+        let expected_owner = if taken_over {
+            assert!(
+                matches!(&result, Err(crate::snapshot_restore::RestoreError::Other(message))
+                    if message.contains("remove superseded restore transfer scope staging")),
+                "{name}: got {result:?}"
+            );
+            (
+                Some(generation(incoming_generation)),
+                Some(attempt(incoming_attempt)),
+            )
+        } else {
+            assert!(matches!(result, Ok(None)), "{name}: got {result:?}");
+            scope_owner
+        };
+        let scope = transfer_scope(&service, &sandbox_id).expect("scope is retained");
+        assert_eq!(scope.transfer_scope_id, scope_id, "{name}");
+        assert_eq!(scope.staging_dir, UNOWNED_STAGING_DIR, "{name}");
+        assert_eq!(
+            (scope.execution_generation, scope.activation_attempt_id),
+            expected_owner,
+            "{name}"
+        );
+        assert_eq!(
+            crate::db::get_sandbox(&service.db.lock().unwrap(), &sandbox_id)
+                .unwrap()
+                .unwrap()
+                .state,
+            SandboxState::Restoring,
+            "{name}"
+        );
+    }
+}
+
+/// The takeover CAS re-checks the row, so a row that gained runtime state after
+/// the caller read the scope is not cleaned underneath it.
+#[tokio::test]
+async fn retryable_scope_takeover_refuses_a_row_that_gained_runtime_state() {
+    let conn = crate::db::test_conn();
+    let (sandbox_id, _) = insert_interrupted_remote_restore(&conn);
+    let scope_id = pplx_space_common_core::types::TransferScopeId::new();
+    assert!(
+        crate::db::insert_restore_transfer_scope(
+            &conn,
+            &sandbox_id,
+            scope_id,
+            Some(generation(7)),
+            Some(attempt(2)),
+            UNOWNED_STAGING_DIR,
+        )
+        .unwrap()
+    );
+    let service = cross_node_test_service(conn);
+    let observed = transfer_scope(&service, &sandbox_id).unwrap();
+    service
+        .db
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE sandboxes SET uid = 1000 WHERE id = ?1",
+            [&sandbox_id],
+        )
+        .unwrap();
+
+    let claimed = service
+        .claim_and_clean_retryable_restore_transfer_scope(
+            &sandbox_id,
+            &observed,
+            generation(7),
+            attempt(3),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(claimed, None);
+    let scope = transfer_scope(&service, &sandbox_id).unwrap();
+    assert_eq!(scope.transfer_scope_id, scope_id);
+    assert_eq!(scope.activation_attempt_id, Some(attempt(2)));
+}
+
+/// A rowless scope owned by another attempt must be retired before a new one is
+/// minted; when its cleanup cannot be confirmed the old scope stays as the
+/// durable reference and the restore is refused.
+#[tokio::test]
+async fn rowless_restore_keeps_a_superseded_scope_it_cannot_retire() {
+    let conn = crate::db::test_conn();
+    let sandbox_id = SandboxId::new().to_string();
+    let scope_id = pplx_space_common_core::types::TransferScopeId::new();
+    assert!(
+        crate::db::insert_restore_transfer_scope(
+            &conn,
+            &sandbox_id,
+            scope_id,
+            Some(generation(7)),
+            Some(attempt(2)),
+            UNOWNED_STAGING_DIR,
+        )
+        .unwrap()
+    );
+    let service = cross_node_test_service(conn);
+
+    let error = restore_error(
+        service
+            .run_cross_node_restore(
+                &sandbox_id,
+                Some("s3://snapshots/suspend/x?region=us-east-1"),
+                Some(generation(7)),
+                Some(attempt(3)),
+                None,
+                CrossNodeRestoreStagingAdmission::Foreground,
+            )
+            .await,
+    );
+
+    assert!(
+        matches!(&error, crate::snapshot_restore::RestoreError::Other(message)
+            if message.contains("retire superseded restore transfer scope")),
+        "got {error:?}"
+    );
+    let scope = transfer_scope(&service, &sandbox_id).unwrap();
+    assert_eq!(scope.transfer_scope_id, scope_id);
+    assert_eq!(scope.activation_attempt_id, Some(attempt(2)));
+    assert!(
+        crate::db::get_sandbox(&service.db.lock().unwrap(), &sandbox_id)
+            .unwrap()
+            .is_none()
+    );
+}
+
+fn claim_orphan_episode(
+    conn: &rusqlite::Connection,
+) -> (SandboxId, crate::db::ClaimedQuarantineRecoveryCandidate) {
+    let sandbox_id = crate::db::tests::setup_quarantine_recovery_episode(
+        conn,
+        pplx_space_common_core::types::SandboxQuarantineReasonCode::OrphanedSandboxRowMissing,
+    );
+    let candidate = crate::db::scan_quarantine_recovery_candidates(conn)
+        .unwrap()
+        .candidates
+        .into_iter()
+        .find(|candidate| candidate.sandbox_id == sandbox_id)
+        .expect("the seeded episode should be admissible");
+    let claimed = crate::db::claim_quarantine_recovery_candidate(conn, &candidate)
+        .unwrap()
+        .expect("the claim should succeed");
+    (sandbox_id, claimed)
+}
+
+fn orphan_plan(
+    reason_code: pplx_space_common_core::types::SandboxQuarantineReasonCode,
+) -> crate::snapshot_restore::QuarantineRecoveryPlan {
+    crate::snapshot_restore::QuarantineRecoveryPlan {
+        recovery_id: pplx_space_common_core::types::SandboxCleanupEpisodeId::new(),
+        snapshot_id: SnapshotId::new(),
+        storage_uri: "s3://bucket/snapshots/orphan/vmstate?region=us-east-1".to_string(),
+        local_artifact_id: None,
+        execution_generation: generation(7),
+        reason_code,
+    }
+}
+
+/// Only an orphaned-row plan may restore over a quarantined row; any other plan
+/// is declined without staging, even when the local episode is an orphan.
+#[tokio::test]
+async fn orphan_restore_declines_a_plan_for_a_different_quarantine_reason() {
+    let conn = crate::db::test_conn();
+    let (sandbox_id, claimed) = claim_orphan_episode(&conn);
+    let before = crate::db::get_sandbox(&conn, &sandbox_id.to_string())
+        .unwrap()
+        .unwrap();
+    let service = cross_node_test_service(conn);
+
+    let outcome = service
+        .run_quarantined_orphan_restore(
+            &claimed,
+            &orphan_plan(
+                pplx_space_common_core::types::SandboxQuarantineReasonCode::RestorePrepareFailed,
+            ),
+        )
+        .await
+        .unwrap();
+
+    assert!(outcome.is_none());
+    let db = service.db.lock().unwrap();
+    let after = crate::db::get_sandbox(&db, &sandbox_id.to_string())
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.state, before.state);
+    assert_eq!(after.updated_at, before.updated_at);
+    assert!(
+        crate::db::restore_transfer_scope(&db, &sandbox_id.to_string())
+            .unwrap()
+            .is_none()
+    );
+    assert!(crate::db::quarantine_recovery_claim_is_current(&db, &claimed).unwrap());
+}
+
+/// A row that holds a local artifact is not an orphan, so the restore is declined
+/// rather than staged over it.
+#[tokio::test]
+async fn orphan_restore_declines_a_row_that_now_holds_a_local_artifact() {
+    let conn = crate::db::test_conn();
+    let (sandbox_id, claimed) = claim_orphan_episode(&conn);
+    conn.execute(
+        "UPDATE sandboxes
+            SET current_local_artifact_id = ?1,
+                current_local_artifact_kind = 'full',
+                current_local_artifact_origin = 'suspend'
+          WHERE id = ?2",
+        rusqlite::params![LocalArtifactId::new().to_string(), sandbox_id.to_string()],
+    )
+    .unwrap();
+    let service = cross_node_test_service(conn);
+
+    let outcome = service
+        .run_quarantined_orphan_restore(
+            &claimed,
+            &orphan_plan(
+                pplx_space_common_core::types::SandboxQuarantineReasonCode::OrphanedSandboxRowMissing,
+            ),
+        )
+        .await
+        .unwrap();
+
+    assert!(outcome.is_none());
+    assert!(transfer_scope(&service, &sandbox_id.to_string()).is_none());
+}

@@ -3331,3 +3331,255 @@ fn cross_node_restore_leaves_failed_synthetic_orphan_untouched() {
     assert_eq!(after.template, before.template);
     assert!(after.restore_operation.is_none());
 }
+
+// ---------------------------------------------------------------------------
+// Cleanup-target discovery.
+// ---------------------------------------------------------------------------
+
+fn discover_cleanup_targets(
+    db: &Arc<Mutex<rusqlite::Connection>>,
+    authority: CleanupRecoveryAuthority,
+) -> Vec<CleanupRecoveryTarget> {
+    SandboxManagerService::recover_required_cleanup_targets(db, authority).unwrap()
+}
+
+/// An activation that was interrupted before it requested its own cleanup is
+/// resumed by startup with the activation-specific quarantine reason.
+#[test]
+fn startup_requests_interrupted_activation_cleanup_with_the_activation_reason() {
+    for (kind, entered_from, completion, reason_code) in [
+        (
+            crate::db::ActivationKind::ColdStart,
+            SandboxState::Stopped,
+            CleanupCompletion::MarkStopped,
+            SandboxQuarantineReasonCode::ColdActivationInterrupted,
+        ),
+        (
+            crate::db::ActivationKind::Restore,
+            SandboxState::Suspended,
+            CleanupCompletion::MarkSuspended,
+            SandboxQuarantineReasonCode::RestoreActivationInterrupted,
+        ),
+    ] {
+        let conn = crate::db::test_conn();
+        let sandbox_id = SandboxId::new();
+        let id = sandbox_id.to_string();
+        super::super::tests::service_tests::insert_test_sandbox(&conn, &id, entered_from);
+        let episode = crate::db::begin_activation(&conn, &id, entered_from, kind, None, None)
+            .unwrap()
+            .expect("activation arms a cleanup episode");
+        let db = Arc::new(Mutex::new(conn));
+
+        let targets = discover_cleanup_targets(&db, CleanupRecoveryAuthority::Startup);
+
+        let [target] = targets.try_into().unwrap();
+        assert_eq!(target.sandbox_id, sandbox_id, "{kind:?}");
+        assert_eq!(target.cleanup_id, Some(episode.id), "{kind:?}");
+        assert_eq!(target.completion, completion, "{kind:?}");
+        assert!(target.keep_filesystem, "{kind:?}");
+        let db = db.lock().unwrap();
+        let requested = crate::db::cleanup_episode(&db, &id).unwrap().unwrap();
+        assert_eq!(requested.id, episode.id, "{kind:?}");
+        assert!(requested.requested_at.is_some(), "{kind:?}");
+        assert_eq!(
+            requested.quarantine_reason_code,
+            Some(reason_code),
+            "{kind:?}"
+        );
+        assert_eq!(
+            crate::db::get_sandbox(&db, &id).unwrap().unwrap().state,
+            SandboxState::CleanupRequired,
+            "{kind:?}"
+        );
+    }
+}
+
+/// An armed activation cleanup whose row has already left the activation state
+/// no longer describes the row; startup retires it instead of adopting it.
+#[test]
+fn startup_retires_an_armed_cleanup_whose_row_left_the_activation_state() {
+    let conn = crate::db::test_conn();
+    let id = SandboxId::new().to_string();
+    super::super::tests::service_tests::insert_test_sandbox(&conn, &id, SandboxState::Stopped);
+    crate::db::begin_activation(
+        &conn,
+        &id,
+        SandboxState::Stopped,
+        crate::db::ActivationKind::ColdStart,
+        None,
+        None,
+    )
+    .unwrap()
+    .expect("activation arms a cleanup episode");
+    // A writer that predates armed episodes settled the row without retiring it.
+    conn.execute(
+        "UPDATE sandboxes SET state = 'stopped' WHERE id = ?1",
+        [&id],
+    )
+    .unwrap();
+    let db = Arc::new(Mutex::new(conn));
+
+    assert!(discover_cleanup_targets(&db, CleanupRecoveryAuthority::Startup).is_empty());
+
+    let db = db.lock().unwrap();
+    assert!(crate::db::cleanup_episode(&db, &id).unwrap().is_none());
+    let row = crate::db::get_sandbox(&db, &id).unwrap().unwrap();
+    assert_eq!(row.state, SandboxState::Stopped);
+    assert_eq!(row.cleanup_completion, None);
+    assert_eq!(row.cleanup_keep_filesystem, None);
+}
+
+/// A start interrupted after it allocated runtime resources has no cleanup
+/// intent of its own; startup infers one and persists it before scheduling, so
+/// a second restart resumes the same cleanup.
+#[test]
+fn startup_persists_the_inferred_cleanup_intent_of_an_interrupted_start() {
+    let conn = crate::db::test_conn();
+    let sandbox_id = SandboxId::new();
+    let id = sandbox_id.to_string();
+    super::super::tests::service_tests::insert_test_sandbox(&conn, &id, SandboxState::Starting);
+    conn.execute(
+        "UPDATE sandboxes SET uid = 10000, slot = 0 WHERE id = ?1",
+        [&id],
+    )
+    .unwrap();
+    let db = Arc::new(Mutex::new(conn));
+
+    let [target] = discover_cleanup_targets(&db, CleanupRecoveryAuthority::Startup)
+        .try_into()
+        .unwrap();
+
+    assert_eq!(target.sandbox_id, sandbox_id);
+    assert_eq!(target.completion, CleanupCompletion::MarkStopped);
+    assert!(target.keep_filesystem);
+    assert_eq!(target.cleanup_id, None);
+    let row = crate::db::get_sandbox(&db.lock().unwrap(), &id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.state, SandboxState::CleanupRequired);
+    assert_eq!(row.cleanup_completion, Some(CleanupCompletion::MarkStopped));
+    assert_eq!(row.cleanup_keep_filesystem, Some(true));
+    assert_eq!(
+        row.failure_reason.as_deref(),
+        Some("cleanup reconciliation required")
+    );
+
+    let [again] = discover_cleanup_targets(&db, CleanupRecoveryAuthority::Startup)
+        .try_into()
+        .unwrap();
+    assert_eq!(again.completion, CleanupCompletion::MarkStopped);
+    assert!(again.keep_filesystem);
+}
+
+/// Periodic discovery persists an inferred intent only if the row still has
+/// none; an owner that recorded its own intent after the row was listed keeps it.
+#[test]
+fn requested_cleanup_discovery_yields_to_an_intent_recorded_after_listing() {
+    let conn = crate::db::test_conn();
+    let id = SandboxId::new().to_string();
+    super::super::tests::service_tests::insert_test_sandbox(
+        &conn,
+        &id,
+        SandboxState::CleanupFailed,
+    );
+    conn.execute(
+        "UPDATE sandboxes SET uid = 10000, slot = 0 WHERE id = ?1",
+        [&id],
+    )
+    .unwrap();
+    let listed = vec![crate::db::get_sandbox(&conn, &id).unwrap().unwrap()];
+    crate::db::set_cleanup_intent(&conn, &id, true, CleanupCompletion::MarkStopped).unwrap();
+    let db = Arc::new(Mutex::new(conn));
+
+    let targets = SandboxManagerService::recover_required_cleanup_targets_from_rows(
+        &db,
+        listed,
+        CleanupRecoveryAuthority::RequestedOnly,
+    )
+    .unwrap();
+
+    assert!(targets.is_empty());
+    let row = crate::db::get_sandbox(&db.lock().unwrap(), &id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.state, SandboxState::CleanupFailed);
+    assert_eq!(row.cleanup_completion, Some(CleanupCompletion::MarkStopped));
+    assert_eq!(row.cleanup_keep_filesystem, Some(true));
+}
+
+/// A legacy row whose id is not a sandbox id cannot be addressed by cleanup; it
+/// is skipped without hiding the rows discovered after it.
+#[test]
+fn startup_cleanup_discovery_skips_rows_with_malformed_ids() {
+    let conn = crate::db::test_conn();
+    conn.execute(
+        "INSERT INTO sandboxes (id, uuid8, state, template, user, created_at, updated_at)
+         VALUES ('legacy-row', 'legacy01', 'stopping', 'seed', 'user', '1785456000', '1785456000')",
+        [],
+    )
+    .unwrap();
+    let sandbox_id = SandboxId::new();
+    super::super::tests::service_tests::insert_test_sandbox(
+        &conn,
+        &sandbox_id.to_string(),
+        SandboxState::Stopping,
+    );
+    let db = Arc::new(Mutex::new(conn));
+
+    let [target] = discover_cleanup_targets(&db, CleanupRecoveryAuthority::Startup)
+        .try_into()
+        .unwrap();
+
+    assert_eq!(target.sandbox_id, sandbox_id);
+}
+
+// ---------------------------------------------------------------------------
+// Quarantine adoption: the cleanup-fence deferral.
+// ---------------------------------------------------------------------------
+
+/// A sandbox whose cleanup fence is held elsewhere is not adopted underneath its
+/// owner; the attempt is charged so the retry backs off.
+#[tokio::test]
+async fn a_held_cleanup_fence_defers_adoption_and_charges_the_attempt() {
+    let reason_code =
+        pplx_space_common_core::types::SandboxQuarantineReasonCode::RestoreFirecrackerLaunchFailed;
+    let conn = crate::db::test_conn();
+    let sandbox_id = crate::db::tests::setup_quarantine_recovery_episode(&conn, reason_code);
+    let service = recovery_test_service(conn);
+    let artifact_id = candidate_artifact_id(&service);
+    let cache_dir = tempfile::tempdir().unwrap();
+    let CleanupLockTryResult::Acquired(_fence) = service.try_cleanup_fence(&sandbox_id.to_string())
+    else {
+        panic!("the test must hold the cleanup fence");
+    };
+
+    service
+        .adopt_quarantine_recovery_episodes_with(
+            cache_dir.path(),
+            stub_plan(
+                crate::snapshot_restore::QuarantineRecoveryPlanResolution::Available(plan_for(
+                    Some(artifact_id),
+                    reason_code,
+                )),
+            ),
+        )
+        .await;
+
+    let (attempts, last_error) = retry_state(&service, sandbox_id);
+    assert_eq!(attempts, 1);
+    assert_eq!(last_error.as_deref(), Some("cleanup_fence_busy"));
+    let db = service.db.lock().unwrap();
+    assert_eq!(
+        crate::db::get_sandbox(&db, &sandbox_id.to_string())
+            .unwrap()
+            .unwrap()
+            .state,
+        SandboxState::Quarantined
+    );
+    assert!(
+        crate::db::cleanup_episode(&db, &sandbox_id.to_string())
+            .unwrap()
+            .is_none(),
+        "a deferred adoption must not open a cleanup episode"
+    );
+}
