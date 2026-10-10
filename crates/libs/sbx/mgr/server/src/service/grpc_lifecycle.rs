@@ -97,6 +97,27 @@ fn teardown_suspend_prepare_response(
     })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminalTeardownCheck {
+    Open,
+    DeleteInFlight,
+}
+
+fn delete_in_flight_teardown_suspend_prepare_response(
+    started_at: std::time::Instant,
+) -> Response<PrepareTeardownSuspendResponse> {
+    teardown_suspend_prepare_response(
+        TeardownSuspendOutcome::Pending,
+        Some(
+            crate::db::TeardownSuspendFailure::Deleting
+                .as_str()
+                .to_string(),
+        ),
+        pplx_space_metrics::sandbox::worker::TeardownSuspendPrepareOutcome::Pending,
+        started_at,
+    )
+}
+
 fn durable_teardown_suspend_prepare_response(
     status: &crate::db::TeardownSuspendStatus,
     started_at: std::time::Instant,
@@ -2623,7 +2644,14 @@ impl SandboxManagerService {
             Some(generation) => generation,
             None if status.state == SandboxState::Suspended => execution_generation,
             None => {
-                self.reject_terminal_teardown_suspend(&sandbox_id_string, execution_generation)?;
+                if self
+                    .reject_terminal_teardown_suspend(&sandbox_id_string, execution_generation)?
+                    == TerminalTeardownCheck::DeleteInFlight
+                {
+                    return Ok(delete_in_flight_teardown_suspend_prepare_response(
+                        metric_started_at,
+                    ));
+                }
                 return Ok(teardown_suspend_prepare_response(
                     TeardownSuspendOutcome::Pending,
                     Some("local runtime execution generation is not available".to_string()),
@@ -2676,7 +2704,13 @@ impl SandboxManagerService {
                 metric_started_at,
             ));
         }
-        self.reject_terminal_teardown_suspend(&sandbox_id_string, execution_generation)?;
+        if self.reject_terminal_teardown_suspend(&sandbox_id_string, execution_generation)?
+            == TerminalTeardownCheck::DeleteInFlight
+        {
+            return Ok(delete_in_flight_teardown_suspend_prepare_response(
+                metric_started_at,
+            ));
+        }
         if action == TeardownSuspendAction::BeginOrJoin
             && matches!(status.state, SandboxState::Started | SandboxState::Paused)
         {
@@ -2795,11 +2829,14 @@ impl SandboxManagerService {
         ))
     }
 
+    /// A deleting sandbox closes its suspend job but is not refused: the shim's
+    /// one-shot exit-path task Delete would otherwise wedge the pod, and the
+    /// delete's receipt becomes the `Deleted` release proof when the row goes.
     fn reject_terminal_teardown_suspend(
         &self,
         sandbox_id: &str,
         generation: pplx_space_common_core::types::ExecutionGeneration,
-    ) -> Result<(), Status> {
+    ) -> Result<TerminalTeardownCheck, Status> {
         let db = self.db_conn()?;
         let state = crate::db::get_sandbox(&db, sandbox_id)
             .map_err(|error| Status::internal(format!("db error: {error}")))?
@@ -2830,9 +2867,12 @@ impl SandboxManagerService {
                 .map_err(|error| {
                     Status::internal(format!("persist terminal teardown suspend: {error}"))
                 })?;
+            if reason == crate::db::TeardownSuspendFailure::Deleting {
+                return Ok(TerminalTeardownCheck::DeleteInFlight);
+            }
             return Err(Status::failed_precondition(reason.as_str()));
         }
-        Ok(())
+        Ok(TerminalTeardownCheck::Open)
     }
 
     pub(super) fn spawn_teardown_suspend_driver(

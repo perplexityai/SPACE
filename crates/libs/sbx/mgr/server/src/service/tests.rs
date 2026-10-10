@@ -11260,6 +11260,87 @@ pub(crate) mod service_tests {
     }
 
     #[tokio::test]
+    async fn teardown_during_in_flight_delete_waits_for_delete_receipt() {
+        // containerd calls the shim's task Delete once after the VM exits; an
+        // error during the deleting window left the pod Terminating forever.
+        let conn = crate::db::test_conn();
+        let sandbox_id = SandboxId::new().to_string();
+        let generation = ExecutionGeneration::new(3).unwrap();
+        insert_test_sandbox(&conn, &sandbox_id, SandboxState::Started);
+        crate::db::update_runtime_fields(
+            &conn,
+            sandbox_id.parse().unwrap(),
+            runtime_fields(generation, 7),
+        )
+        .unwrap();
+        crate::db::begin_teardown_suspend_operation(&conn, &sandbox_id, generation).unwrap();
+        crate::db::update_state(&conn, &sandbox_id, SandboxState::Deleting)
+            .unwrap()
+            .require_applied()
+            .unwrap();
+        crate::db::set_cleanup_intent(
+            &conn,
+            &sandbox_id,
+            false,
+            crate::db::CleanupCompletion::DeleteRow,
+        )
+        .unwrap();
+        let service = service_for_teardown_test(conn);
+
+        for action in [
+            TeardownSuspendAction::BeginOrJoin,
+            TeardownSuspendAction::ObserveOnly,
+        ] {
+            let response = service
+                .prepare_teardown_suspend(internal_request(prepare_teardown_suspend_request(
+                    sandbox_id.clone(),
+                    generation.get(),
+                    action,
+                )))
+                .await
+                .expect("an in-flight delete must not refuse the teardown poll")
+                .into_inner();
+            assert_eq!(
+                TeardownSuspendOutcome::try_from(response.outcome).unwrap(),
+                TeardownSuspendOutcome::Pending,
+                "{action:?}"
+            );
+        }
+        {
+            let db = service.db.lock().unwrap();
+            assert_eq!(
+                crate::db::latest_teardown_suspend_operation(&db, &sandbox_id)
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                crate::db::TeardownSuspendOperationStatus::Failed,
+                "a deleting sandbox still closes its suspend job"
+            );
+            crate::db::complete_row_intent_cleanup(
+                &db,
+                &sandbox_id,
+                crate::db::CleanupCompletion::DeleteRow,
+                None,
+            )
+            .unwrap();
+        }
+
+        let response = service
+            .prepare_teardown_suspend(internal_request(prepare_teardown_suspend_request(
+                sandbox_id,
+                generation.get(),
+                TeardownSuspendAction::BeginOrJoin,
+            )))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            TeardownSuspendOutcome::try_from(response.outcome).unwrap(),
+            TeardownSuspendOutcome::Deleted,
+        );
+    }
+
+    #[tokio::test]
     async fn delete_receipt_is_generation_fenced() {
         let conn = crate::db::test_conn();
         let sandbox_id = SandboxId::new().to_string();

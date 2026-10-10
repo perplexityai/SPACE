@@ -1147,13 +1147,27 @@ async fn teardown_suspend_terminal_driver_failures_stop_polling_without_release_
             crate::proto::TeardownSuspendAction::BeginOrJoin,
             crate::proto::TeardownSuspendAction::ObserveOnly,
         ] {
-            let error = service
+            let response = service
                 .prepare_teardown_suspend(crate::service::activation_support::internal_request(
                     prepare_teardown_suspend_request(id.clone(), generation.get(), action),
                 ))
-                .await
-                .unwrap_err();
-            assert_eq!(error.code(), tonic::Code::FailedPrecondition, "{state:?}");
+                .await;
+            // The delete's receipt, not a refusal, ends polling for a deleting row.
+            if state == Some(SandboxState::Deleting) {
+                assert_eq!(
+                    crate::proto::TeardownSuspendOutcome::try_from(
+                        response.unwrap().into_inner().outcome
+                    )
+                    .unwrap(),
+                    crate::proto::TeardownSuspendOutcome::Pending
+                );
+            } else {
+                assert_eq!(
+                    response.unwrap_err().code(),
+                    tonic::Code::FailedPrecondition,
+                    "{state:?}"
+                );
+            }
         }
     }
 }
