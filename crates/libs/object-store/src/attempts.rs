@@ -417,8 +417,11 @@ fn service_error_code(error: &Error) -> Option<&str> {
 /// is therefore a stall cut. A connection the peer closed before the
 /// response arrived is a transport failure too, although the HTTP client
 /// reports hyper's `IncompleteMessage` as a transient *other* connector
-/// error rather than an I/O one. Throttling is checked first and uses the
-/// same rule as the operation-level `s3_error` classification.
+/// error rather than an I/O one. A *user* connector error is a failure of
+/// the request's own body stream, whatever its cause, so it is never a
+/// transport failure; the HTTP client classifies it before I/O too.
+/// Throttling is checked first and uses the same rule as the
+/// operation-level `s3_error` classification.
 pub(crate) fn classify_attempt_failure<E>(
     error: &OrchestratorError<E>,
     http_status: Option<u16>,
@@ -434,7 +437,7 @@ pub(crate) fn classify_attempt_failure<E>(
             } else {
                 S3AttemptFailureKind::StalledStream
             }
-        } else if connector.is_io() || is_closed_by_peer(connector) {
+        } else if connector.is_io() || (!connector.is_user() && is_closed_by_peer(connector)) {
             S3AttemptFailureKind::Io
         } else {
             S3AttemptFailureKind::Other
@@ -470,24 +473,16 @@ fn has_timer_source(error: &(dyn std::error::Error + 'static)) -> bool {
     has_source::<TimedOutError>(error)
 }
 
-/// Whether the peer closed or reset the connection under the request: hyper
-/// saw the connection end before a complete response head
-/// (`IncompleteMessage`, the shape of reusing a pooled connection the server
-/// has just closed), or the socket failed with a reset or broken pipe.
+/// Whether hyper saw the connection end before a complete response head
+/// (`IncompleteMessage`), the shape of reusing a pooled connection the
+/// server has just closed. A reset or broken pipe needs no check here: the
+/// HTTP client reports any hyper error with an `io::Error` source as an I/O
+/// connector error already.
 fn is_closed_by_peer(error: &(dyn std::error::Error + 'static)) -> bool {
     any_source(error, |error| {
-        if let Some(error) = error.downcast_ref::<hyper::Error>() {
-            return error.is_incomplete_message();
-        }
-        error.downcast_ref::<std::io::Error>().is_some_and(|error| {
-            matches!(
-                error.kind(),
-                std::io::ErrorKind::ConnectionReset
-                    | std::io::ErrorKind::ConnectionAborted
-                    | std::io::ErrorKind::BrokenPipe
-                    | std::io::ErrorKind::UnexpectedEof
-            )
-        })
+        error
+            .downcast_ref::<hyper::Error>()
+            .is_some_and(hyper::Error::is_incomplete_message)
     })
 }
 

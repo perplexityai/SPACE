@@ -5185,7 +5185,6 @@ dependencies = [
  "anyhow",
  "async-trait",
  "aws-config",
- "aws-sdk-s3",
  "aws-smithy-types",
  "bytes",
  "dashmap",
@@ -6390,6 +6389,7 @@ dependencies = [
  "pplx-space-execution-common",
  "pplx-space-node-runtime-core",
  "pplx-space-node-runtime-manager-client",
+ "pplx-space-s3-http-client",
  "rusqlite",
  "rustix",
  "serde",
@@ -6455,7 +6455,6 @@ dependencies = [
  "aws-credential-types",
  "aws-sdk-s3",
  "aws-smithy-async",
- "aws-smithy-http-client",
  "aws-smithy-runtime-api",
  "aws-smithy-types",
  "axum",
@@ -6465,11 +6464,13 @@ dependencies = [
  "http 1.5.0",
  "http-body 1.1.0",
  "hyper",
+ "hyper-util",
  "jiff",
  "md-5 0.11.0",
  "percent-encoding",
  "pplx-space-common-core",
  "pplx-space-metrics",
+ "pplx-space-s3-http-client",
  "rand 0.10.2",
  "sha2 0.11.0",
  "tempfile",
@@ -6578,6 +6579,14 @@ dependencies = [
  "clap",
  "pplx-space-common-core",
  "pplx-space-node-runtime-supervisor",
+]
+
+[[package]]
+name = "pplx-space-s3-http-client"
+version = "0.8.0"
+dependencies = [
+ "aws-smithy-http-client",
+ "aws-smithy-runtime-api",
 ]
 
 [[package]]
@@ -6778,7 +6787,9 @@ version = "0.8.0"
 dependencies = [
  "aws-sdk-s3",
  "aws-smithy-types",
+ "aws-types",
  "pplx-space-common-core",
+ "pplx-space-s3-http-client",
  "thiserror 2.0.20",
  "tokio",
 ]

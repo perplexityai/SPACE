@@ -8,6 +8,7 @@
 use std::time::Duration;
 
 use pplx_space_common_core::types::{Arch, RuntimeKind, StorageUri};
+use pplx_space_s3_http_client::{DEFAULT_POOL_IDLE_TIMEOUT, s3_http_client};
 
 use super::source::{
     ByteChunks, ContentMd5, KernelSource, KernelVersion, RuntimeLine, SourceError, SourceKernel,
@@ -32,6 +33,7 @@ impl S3KernelSource {
         let mut builder = aws_sdk_s3::Config::builder()
             .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
             .region(aws_sdk_s3::config::Region::new(root.region.clone()))
+            .http_client(s3_http_client(DEFAULT_POOL_IDLE_TIMEOUT))
             .force_path_style(root.path_style)
             .timeout_config(
                 aws_sdk_s3::config::timeout::TimeoutConfig::builder()

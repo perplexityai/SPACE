@@ -13,7 +13,7 @@ workspace = true
 [features]
 default = []
 # Read published kernels from S3 or an S3-compatible store.
-s3 = ["dep:aws-sdk-s3"]
+s3 = ["dep:aws-sdk-s3", "dep:pplx-space-s3-http-client"]
 otel = ["pplx-space-common-svc/otel"]
 datadog = ["otel", "pplx-space-common-svc/datadog"]
 # Deprecated for one release; use otel and datadog.
@@ -48,6 +48,7 @@ pplx-space-common-svc = { workspace = true, features = ["sqlite"] }
 pplx-space-execution-common = { workspace = true }
 pplx-space-node-runtime-core = { workspace = true }
 pplx-space-node-runtime-manager-client = { workspace = true }
+pplx-space-s3-http-client = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

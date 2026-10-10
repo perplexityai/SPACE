@@ -4,10 +4,12 @@ use crate::test_support::{
 };
 use crate::{ObjectStore, ObjectStoreError};
 use aws_smithy_runtime_api::client::result::ConnectorError;
+use aws_smithy_types::retry::ErrorKind;
 use axum::Router;
 use axum::body::Bytes as BodyBytes;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
+use hyper_util::rt::TokioExecutor;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -65,16 +67,6 @@ fn attempt_failures_are_classified_by_cause() {
             connector(ConnectorError::io(Box::new(std::io::Error::from(
                 std::io::ErrorKind::ConnectionReset,
             )))),
-            None,
-            None,
-            S3AttemptFailureKind::Io,
-        ),
-        (
-            "broken pipe the HTTP client did not mark as I/O",
-            connector(ConnectorError::other(
-                Box::new(std::io::Error::from(std::io::ErrorKind::BrokenPipe)),
-                None,
-            )),
             None,
             None,
             S3AttemptFailureKind::Io,
@@ -142,6 +134,74 @@ fn attempt_failures_are_classified_by_cause() {
             classify_attempt_failure(&error, http_status, error_code),
             expected,
             "{case}"
+        );
+    }
+}
+
+/// The error hyper's legacy client, which the SDK's HTTP client wraps,
+/// returns when the server reads a request and closes the connection
+/// without answering: `IncompleteMessage`.
+async fn closed_before_response() -> BoxError {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind closing server");
+    let address = listener.local_addr().expect("closing server address");
+    tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.expect("accept connection");
+        let mut head = Vec::new();
+        while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+            let mut chunk = [0_u8; 1024];
+            match stream.read(&mut chunk).await {
+                Ok(0) | Err(_) => break,
+                Ok(read) => head.extend_from_slice(&chunk[..read]),
+            }
+        }
+    });
+    let client =
+        hyper_util::client::legacy::Client::builder(TokioExecutor::new()).build_http::<String>();
+    let uri = format!("http://{address}/")
+        .parse()
+        .expect("closing server URI");
+    let error = client
+        .get(uri)
+        .await
+        .expect_err("the server closes without answering");
+    Box::new(error)
+}
+
+#[tokio::test]
+async fn closed_connections_are_io_unless_the_request_body_failed() {
+    let connector = |error: ConnectorError| OrchestratorError::<Opaque>::connector(error);
+    let cases = [
+        (
+            // aws-smithy-http-client's `to_connector_error` maps hyper's
+            // `IncompleteMessage` to this transient *other* error.
+            "connection closed before the response head",
+            connector(ConnectorError::other(
+                closed_before_response().await,
+                Some(ErrorKind::TransientError),
+            )),
+            S3AttemptFailureKind::Io,
+        ),
+        (
+            "request body stream failed with an I/O cause",
+            connector(ConnectorError::user(Box::new(std::io::Error::from(
+                std::io::ErrorKind::UnexpectedEof,
+            )))),
+            S3AttemptFailureKind::Other,
+        ),
+        (
+            "request body stream failed because its own source's connection closed",
+            connector(ConnectorError::user(closed_before_response().await)),
+            S3AttemptFailureKind::Other,
+        ),
+    ];
+
+    for (case, error, expected) in cases {
+        assert_eq!(
+            classify_attempt_failure(&error, None, None),
+            expected,
+            "{case}: {error:?}"
         );
     }
 }

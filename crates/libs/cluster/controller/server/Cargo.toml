@@ -42,7 +42,6 @@ test-hooks = ["pplx-space-common-core/test-hooks"]
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 aws-config = { workspace = true, features = ["behavior-version-latest", "credentials-process", "default-https-client", "rt-tokio", "sso"] }
-aws-sdk-s3 = { workspace = true, features = ["behavior-version-latest", "default-https-client", "http-1x", "rt-tokio", "sigv4a"] }
 aws-smithy-types = { workspace = true }
 dashmap = { workspace = true }
 futures-util = { workspace = true }

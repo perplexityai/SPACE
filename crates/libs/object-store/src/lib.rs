@@ -18,9 +18,6 @@ use aws_sdk_s3::operation::head_object::HeadObjectError;
 use aws_sdk_s3::primitives::{ByteStream, ByteStreamError, Length};
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
 use aws_sdk_s3::{Client, Config};
-use aws_smithy_http_client::proxy::ProxyConfig;
-use aws_smithy_http_client::{ConnectorBuilder, tls};
-use aws_smithy_runtime_api::client::http::SharedHttpClient;
 use aws_smithy_types::error::display::DisplayErrorContext;
 use aws_smithy_types::error::metadata::ProvideErrorMetadata;
 use bytes::Bytes;
@@ -33,6 +30,7 @@ use tokio::task::JoinSet;
 use tracing::{Instrument, debug, info, warn};
 
 use pplx_space_common_core::types::{MULTIPART_CONCURRENCY, MULTIPART_PART_SIZE};
+use pplx_space_s3_http_client::{DEFAULT_POOL_IDLE_TIMEOUT, s3_http_client};
 
 mod attempts;
 mod content_md5;
@@ -44,7 +42,7 @@ mod timeouts;
 mod upload;
 
 use attempts::{AttemptObserver, AttemptTarget};
-use timeouts::S3Timeouts;
+use timeouts::{S3Timeouts, read_secs};
 
 pub use download::FinishingWrite;
 use download::{ReorderWindow, SequentialWriter, open_scratch};
@@ -438,15 +436,8 @@ const DEFAULT_DOWNLOAD_BUFFER_BUDGET: usize = 2 * 1024 * 1024 * 1024;
 const DOWNLOAD_BUFFER_BUDGET_MIN: usize = 256 * 1024 * 1024;
 const DOWNLOAD_BUFFER_BUDGET_MAX: usize = 8 * 1024 * 1024 * 1024;
 
-/// How long an idle pooled connection stays eligible for reuse. S3
-/// (us-east-1, measured 2026-10) closes an idle HTTPS keep-alive connection
-/// 6.0 s after its last response, with a TLS close_notify and a FIN; reuse
-/// after 5.8 s works and after 6.2 s fails. The SDK's default client keeps
-/// hyper's 90 s, so a request that takes a pooled connection as S3 closes it
-/// fails with "connection closed before message completed". Half the
-/// server's window leaves room for the time between S3 finishing a response
-/// and the client returning the connection to the pool.
-const DEFAULT_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(3);
+/// Bounds on `SPACE_OBJECT_STORE_POOL_IDLE_TIMEOUT_SECS`; unset, it is
+/// [`DEFAULT_POOL_IDLE_TIMEOUT`].
 const POOL_IDLE_TIMEOUT_SECS_MIN: u64 = 1;
 const POOL_IDLE_TIMEOUT_SECS_MAX: u64 = 90;
 
@@ -592,10 +583,12 @@ fn resolve_download_buffer_budget<F: FnOnce(&str) -> Option<String>>(read: F) ->
 }
 
 fn resolve_pool_idle_timeout<F: FnOnce(&str) -> Option<String>>(read: F) -> Duration {
-    read(POOL_IDLE_TIMEOUT_ENV)
-        .and_then(|v| v.parse::<u64>().ok())
-        .filter(|&n| (POOL_IDLE_TIMEOUT_SECS_MIN..=POOL_IDLE_TIMEOUT_SECS_MAX).contains(&n))
-        .map_or(DEFAULT_POOL_IDLE_TIMEOUT, Duration::from_secs)
+    read_secs(
+        read,
+        POOL_IDLE_TIMEOUT_ENV,
+        POOL_IDLE_TIMEOUT_SECS_MIN..=POOL_IDLE_TIMEOUT_SECS_MAX,
+    )
+    .unwrap_or(DEFAULT_POOL_IDLE_TIMEOUT)
 }
 
 /// Telemetry-safe endpoint label: host and optional port only, so a custom
@@ -731,29 +724,6 @@ where
     );
 }
 
-/// The SDK's default HTTPS client (aws-smithy-runtime
-/// `default_https_client`: rustls with aws-lc, proxy settings from the
-/// environment, the SDK's connect timeout) with `pool_idle_timeout` on its
-/// connection pool. The idle timeout has to be set on the connector builder:
-/// a connector function ignores the outer builder's pool settings.
-fn s3_http_client(pool_idle_timeout: Duration) -> SharedHttpClient {
-    aws_smithy_http_client::Builder::new().build_with_connector_fn(
-        move |settings, runtime_components| {
-            let mut connector = ConnectorBuilder::default()
-                .pool_idle_timeout(pool_idle_timeout)
-                .tls_provider(tls::Provider::Rustls(
-                    tls::rustls_provider::CryptoMode::AwsLc,
-                ));
-            connector.set_connector_settings(settings.cloned());
-            if let Some(components) = runtime_components {
-                connector.set_sleep_impl(components.sleep_impl());
-            }
-            connector.set_proxy_config(Some(ProxyConfig::from_env()));
-            connector.build()
-        },
-    )
-}
-
 fn s3_base_config(
     timeouts: S3Timeouts,
     pool_idle_timeout: Duration,
@@ -816,7 +786,7 @@ impl S3ObjectStore {
     /// - `SPACE_OBJECT_STORE_{REQUEST,BODY_UPLOAD,SERVER_SIDE}_ATTEMPT_TIMEOUT_SECS`:
     ///   5..=21600, defaults 10, 60, and 30. Bound each attempt of an
     ///   operation in that class; see `timeouts` for which operations each
-    ///   class holds and the measurements behind the defaults. The
+    ///   class holds and the reasoning behind the defaults. The
     ///   body-upload default fits one 256 MiB part, so raise it with the part
     ///   size.
     /// - `SPACE_OBJECT_STORE_{REQUEST,BODY_UPLOAD,SERVER_SIDE}_OPERATION_TIMEOUT_SECS`:

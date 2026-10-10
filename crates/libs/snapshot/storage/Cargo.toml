@@ -12,15 +12,17 @@ workspace = true
 
 [features]
 default = []
-s3 = ["dep:aws-sdk-s3", "dep:aws-smithy-types"]
+s3 = ["dep:aws-sdk-s3", "dep:aws-smithy-types", "dep:aws-types", "dep:pplx-space-s3-http-client"]
 
 [dependencies]
 aws-sdk-s3 = { workspace = true, optional = true, features = ["behavior-version-latest", "default-https-client", "http-1x", "rt-tokio", "sigv4a"] }
 aws-smithy-types = { workspace = true, optional = true }
+aws-types = { workspace = true, optional = true }
 thiserror = { workspace = true }
 
 # internal
 pplx-space-common-core = { workspace = true }
+pplx-space-s3-http-client = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt"] }
