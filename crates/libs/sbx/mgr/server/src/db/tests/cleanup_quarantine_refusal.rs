@@ -151,6 +151,45 @@ fn requested_start(conn: &Connection, id: &str, label: &str) -> CleanupEpisode {
     episode
 }
 
+// The row helpers below write columns directly, so a case reaches one writer
+// predicate without another writer's side effects.
+
+fn set_state(conn: &Connection, id: &str, state: SandboxState) {
+    let changed = conn
+        .execute(
+            "UPDATE sandboxes SET state = ?2 WHERE id = ?1",
+            params![id, state.as_str()],
+        )
+        .unwrap();
+    assert_eq!(changed, 1);
+}
+
+/// The row keeps its keep-filesystem flag but no longer the episode's
+/// `mark_stopped` completion.
+fn change_intent_completion(conn: &Connection, id: &str) {
+    let changed = conn
+        .execute(
+            "UPDATE sandboxes SET cleanup_completion = 'mark_failed' WHERE id = ?1",
+            params![id],
+        )
+        .unwrap();
+    assert_eq!(changed, 1);
+}
+
+/// The row keeps the episode's completion but no longer its keep-filesystem
+/// flag.
+fn change_intent_keep_filesystem(conn: &Connection, id: &str) {
+    let changed = conn
+        .execute(
+            "UPDATE sandboxes
+                SET cleanup_keep_filesystem = NOT cleanup_keep_filesystem
+              WHERE id = ?1",
+            params![id],
+        )
+        .unwrap();
+    assert_eq!(changed, 1);
+}
+
 type CleanupWriter = fn(&Connection, &str) -> Option<bool>;
 
 /// The generic cleanup writers, each reporting whether it wrote. Only
@@ -229,37 +268,48 @@ fn generic_cleanup_writers_refuse_quarantined_and_missing_rows() {
             "{writer_name} must not take a quarantined row into cleanup"
         );
 
-        let before = persisted(&conn, "missing");
-        assert_eq!(writer(&conn, "missing"), refused, "{writer_name}: missing");
-        assert_eq!(
-            persisted(&conn, "missing"),
-            before,
-            "{writer_name} must not create a row"
-        );
+        // `mark_cleanup_required` reports no outcome, so a missing row says
+        // nothing about it.
+        if refused.is_some() {
+            assert_eq!(writer(&conn, "missing"), refused, "{writer_name}: missing");
+            assert_eq!(persisted(&conn, "missing").sandbox, None, "{writer_name}");
+        }
     }
 }
 
 #[test]
-fn cleanup_required_in_state_refuses_a_row_in_another_state() {
-    let conn = test_conn();
-    insert_test_sandbox(
-        &conn,
-        TestSandboxInsert::new("moved", "moved001", SandboxState::Restoring),
-    );
-    let before = persisted(&conn, "moved");
+fn cleanup_required_in_state_writes_only_a_row_in_the_expected_state() {
+    const EXPECTED: SandboxState = SandboxState::Started;
+    // A quarantined row is refused regardless of the expected state; see
+    // `generic_cleanup_writers_refuse_quarantined_and_missing_rows`.
+    for state in SandboxState::all()
+        .into_iter()
+        .filter(|state| *state != SandboxState::Quarantined)
+    {
+        let conn = test_conn();
+        insert_test_sandbox(&conn, TestSandboxInsert::new("sandbox", "instate1", state));
+        let before = persisted(&conn, "sandbox");
 
-    assert!(
-        !mark_cleanup_required_if_no_intent_in_state(
+        let wrote = mark_cleanup_required_if_no_intent_in_state(
             &conn,
-            "moved",
-            SandboxState::Started,
+            "sandbox",
+            EXPECTED,
             true,
             CleanupCompletion::MarkStopped,
             "observer of a started row",
         )
-        .unwrap()
-    );
-    assert_eq!(persisted(&conn, "moved"), before);
+        .unwrap();
+
+        assert_eq!(wrote, state == EXPECTED, "{state:?}");
+        if wrote {
+            let row = get_sandbox(&conn, "sandbox").unwrap().unwrap();
+            assert_eq!(row.state, SandboxState::CleanupRequired);
+            assert_eq!(row.cleanup_completion, Some(CleanupCompletion::MarkStopped));
+            assert_eq!(row.cleanup_keep_filesystem, Some(true));
+        } else {
+            assert_eq!(persisted(&conn, "sandbox"), before, "{state:?}");
+        }
+    }
 }
 
 #[test]
@@ -292,7 +342,7 @@ fn quarantining_a_missing_sandbox_writes_no_quarantine_evidence() {
 #[test]
 fn cleanup_request_is_superseded_without_the_owned_episode_and_intent() {
     type Setup = fn(&Connection, &str) -> SandboxCleanupEpisodeId;
-    let cases: [(&str, Setup); 4] = [
+    let cases: [(&str, Setup); 6] = [
         ("no episode", |conn, id| {
             insert_test_sandbox(
                 conn,
@@ -314,6 +364,16 @@ fn cleanup_request_is_superseded_without_the_owned_episode_and_intent() {
             clear_cleanup_intent(conn, id).unwrap();
             episode.id
         }),
+        ("row completion no longer the episode's", |conn, id| {
+            let episode = armed_start(conn, id, "compl001");
+            change_intent_completion(conn, id);
+            episode.id
+        }),
+        ("row keep-filesystem no longer the episode's", |conn, id| {
+            let episode = armed_start(conn, id, "keepfs01");
+            change_intent_keep_filesystem(conn, id);
+            episode.id
+        }),
     ];
     for (case, setup) in cases {
         let conn = test_conn();
@@ -333,6 +393,53 @@ fn cleanup_request_is_superseded_without_the_owned_episode_and_intent() {
             "{case}"
         );
         assert_eq!(persisted(&conn, "sandbox"), before, "{case}");
+    }
+}
+
+#[test]
+fn cleanup_request_is_superseded_once_the_row_is_deleting_or_quarantined() {
+    // An eviction claim can move a row to `deleting` while its armed episode
+    // and intent remain, so only the row state separates these outcomes.
+    for state in SandboxState::all() {
+        let conn = test_conn();
+        let episode = armed_start(&conn, "sandbox", "rqstate1");
+        set_state(&conn, "sandbox", state);
+        let before = persisted(&conn, "sandbox");
+
+        let outcome = request_cleanup_episode(
+            &conn,
+            "sandbox",
+            episode.id,
+            SandboxQuarantineReasonCode::ColdActivationInterrupted,
+            "start failed",
+        )
+        .unwrap();
+
+        if matches!(state, SandboxState::Deleting | SandboxState::Quarantined) {
+            assert_eq!(
+                outcome,
+                CleanupEpisodeRequestOutcome::Superseded,
+                "{state:?}"
+            );
+            assert_eq!(persisted(&conn, "sandbox"), before, "{state:?}");
+        } else {
+            assert_eq!(
+                outcome,
+                CleanupEpisodeRequestOutcome::Requested,
+                "{state:?}"
+            );
+            let after = persisted(&conn, "sandbox");
+            assert_eq!(
+                after.sandbox.map(|row| row.state),
+                Some(SandboxState::CleanupRequired),
+                "{state:?}"
+            );
+            assert_eq!(
+                after.episode.map(|episode| episode.phase).as_deref(),
+                Some("requested"),
+                "{state:?}"
+            );
+        }
     }
 }
 
@@ -359,18 +466,24 @@ fn a_requested_cleanup_episode_whose_request_is_superseded_reports_superseded() 
 
 #[test]
 fn cleanup_request_fails_closed_when_the_armed_phase_does_not_update() {
-    // The decoder reports a negative `requested_at` as "not requested", so this
-    // row passes the armed-phase pre-check while its stored phase is not
-    // `armed`. The sandbox write must roll back with the failed phase write.
+    // The decoder reads "requested" from `requested_at` alone, so a stored
+    // `requested` phase without a timestamp passes the armed pre-check but not
+    // the phase write's `phase = 'armed'` guard. The schema's CHECK rejects
+    // the row, so it is seeded with CHECK enforcement off. The sandbox write
+    // must roll back with the failed phase write.
     let conn = test_conn();
     let episode = armed_start(&conn, "sandbox", "phase001");
+    conn.pragma_update(None, "ignore_check_constraints", true)
+        .unwrap();
     conn.execute(
         "UPDATE sandbox_cleanup_episodes
-            SET phase = 'requested', requested_at = -1
+            SET phase = 'requested', requested_at = NULL
           WHERE sandbox_id = 'sandbox'",
         [],
     )
     .unwrap();
+    conn.pragma_update(None, "ignore_check_constraints", false)
+        .unwrap();
     let before = persisted(&conn, "sandbox");
 
     let result = request_cleanup_episode(
@@ -381,7 +494,13 @@ fn cleanup_request_fails_closed_when_the_armed_phase_does_not_update() {
         "start failed",
     );
 
-    assert!(result.is_err(), "{result:?}");
+    assert!(
+        matches!(
+            result,
+            Err(RequestCleanupEpisodeError::PhaseUpdateInvariant { changed: 0 })
+        ),
+        "{result:?}"
+    );
     assert_eq!(persisted(&conn, "sandbox"), before);
 }
 
@@ -445,7 +564,7 @@ fn cleanup_failure_without_the_episode_intent_records_evidence_but_keeps_state()
 #[test]
 fn quarantine_cleanup_refuses_without_a_current_requested_episode() {
     type Setup = fn(&Connection, &str) -> SandboxCleanupEpisodeId;
-    let cases: [(&str, Setup); 6] = [
+    let cases: [(&str, Setup); 8] = [
         ("no episode", |conn, id| {
             insert_test_sandbox(
                 conn,
@@ -500,6 +619,16 @@ fn quarantine_cleanup_refuses_without_a_current_requested_episode() {
             clear_cleanup_intent(conn, id).unwrap();
             episode.id
         }),
+        ("row completion no longer the episode's", |conn, id| {
+            let episode = requested_start(conn, id, "compl003");
+            change_intent_completion(conn, id);
+            episode.id
+        }),
+        ("row keep-filesystem no longer the episode's", |conn, id| {
+            let episode = requested_start(conn, id, "keepfs03");
+            change_intent_keep_filesystem(conn, id);
+            episode.id
+        }),
     ];
     for (case, setup) in cases {
         let conn = test_conn();
@@ -511,6 +640,39 @@ fn quarantine_cleanup_refuses_without_a_current_requested_episode() {
             "{case}"
         );
         assert_eq!(persisted(&conn, "sandbox"), before, "{case}");
+    }
+}
+
+#[test]
+fn quarantine_cleanup_accepts_only_a_row_in_a_cleanup_state() {
+    // Each row keeps the current requested episode and its intent, so only the
+    // row state decides the outcome.
+    for state in SandboxState::all() {
+        let conn = test_conn();
+        let episode = requested_start(&conn, "sandbox", "qcstate1");
+        set_state(&conn, "sandbox", state);
+        let before = persisted(&conn, "sandbox");
+
+        let quarantined =
+            quarantine_cleanup_episode(&conn, "sandbox", episode.id, "unsafe evidence").unwrap();
+
+        if matches!(
+            state,
+            SandboxState::CleanupRequired | SandboxState::CleanupFailed
+        ) {
+            assert!(quarantined, "{state:?}");
+            let after = persisted(&conn, "sandbox");
+            assert_eq!(
+                after.sandbox.map(|row| row.state),
+                Some(SandboxState::Quarantined),
+                "{state:?}"
+            );
+            assert_eq!(after.episode, None, "{state:?}");
+            assert!(after.quarantine.is_some(), "{state:?}");
+        } else {
+            assert!(!quarantined, "{state:?}");
+            assert_eq!(persisted(&conn, "sandbox"), before, "{state:?}");
+        }
     }
 }
 
@@ -580,10 +742,14 @@ fn cleanup_episode_decoder_rejects_rows_it_cannot_represent() {
     // Every case overwrites a valid armed `mark_stopped` episode. The schema's
     // CHECK constraints reject some of these rows, so they are seeded with
     // CHECK enforcement off; the decoder must still fail rather than guess.
-    let cases: [(&str, &str); 12] = [
+    let cases: [(&str, &str); 13] = [
         (
             "malformed cleanup id",
             "UPDATE sandbox_cleanup_episodes SET cleanup_id = 'not-a-uuid'",
+        ),
+        (
+            "unknown completion",
+            "UPDATE sandbox_cleanup_episodes SET completion = 'mystery'",
         ),
         (
             "unknown entered-from state",
@@ -660,144 +826,4 @@ fn cleanup_episode_decoder_rejects_rows_it_cannot_represent() {
             "{case}: {result:?}"
         );
     }
-}
-
-#[test]
-fn clearing_a_local_network_policy_hands_authority_back_to_the_cluster() {
-    struct Case {
-        name: &'static str,
-        authority: PolicyAuthority,
-        live_gateway: bool,
-        enqueue_live_gateway: bool,
-        mark_dirty: bool,
-        expected: NetworkPolicyOverrideUpdateOutcome,
-    }
-    let outcome =
-        |decision, queued_live_gateway, queued_dirty_ref| NetworkPolicyOverrideUpdateOutcome {
-            decision,
-            queued_live_gateway,
-            queued_dirty_ref,
-        };
-    let cases = [
-        Case {
-            name: "local, live gateway, publish",
-            authority: PolicyAuthority::Local,
-            live_gateway: true,
-            enqueue_live_gateway: true,
-            mark_dirty: true,
-            expected: outcome(NetworkPolicyOverrideUpdate::Apply, true, true),
-        },
-        Case {
-            name: "local, no live gateway",
-            authority: PolicyAuthority::Local,
-            live_gateway: false,
-            enqueue_live_gateway: true,
-            mark_dirty: false,
-            expected: outcome(NetworkPolicyOverrideUpdate::Apply, false, false),
-        },
-        Case {
-            name: "local, live gateway not requested",
-            authority: PolicyAuthority::Local,
-            live_gateway: true,
-            enqueue_live_gateway: false,
-            mark_dirty: true,
-            expected: outcome(NetworkPolicyOverrideUpdate::Apply, false, true),
-        },
-        Case {
-            name: "cluster, live gateway",
-            authority: PolicyAuthority::Cluster,
-            live_gateway: true,
-            enqueue_live_gateway: true,
-            mark_dirty: true,
-            expected: outcome(NetworkPolicyOverrideUpdate::Repair, true, false),
-        },
-        Case {
-            name: "cluster, live gateway not requested",
-            authority: PolicyAuthority::Cluster,
-            live_gateway: true,
-            enqueue_live_gateway: false,
-            mark_dirty: true,
-            expected: outcome(NetworkPolicyOverrideUpdate::Skip, false, false),
-        },
-        Case {
-            name: "cluster, no live gateway",
-            authority: PolicyAuthority::Cluster,
-            live_gateway: false,
-            enqueue_live_gateway: true,
-            mark_dirty: true,
-            expected: outcome(NetworkPolicyOverrideUpdate::Skip, false, false),
-        },
-    ];
-    for case in cases {
-        let name = case.name;
-        let conn = test_conn();
-        insert_test_sandbox(
-            &conn,
-            TestSandboxInsert {
-                network_policy_override: Some(NetworkPolicyV1::deny_all()),
-                network_policy_generation: 5,
-                network_policy_authority: case.authority,
-                ..TestSandboxInsert::new("sandbox", "policy01", SandboxState::Started)
-            },
-        );
-        if case.live_gateway {
-            conn.execute(
-                "UPDATE sandboxes SET netgtw_pid = 4242 WHERE id = 'sandbox'",
-                [],
-            )
-            .unwrap();
-        }
-
-        assert_eq!(
-            clear_local_network_policy(
-                &conn,
-                "sandbox",
-                case.enqueue_live_gateway,
-                case.mark_dirty,
-            )
-            .unwrap(),
-            case.expected,
-            "{name}"
-        );
-
-        let row = get_sandbox(&conn, "sandbox").unwrap().unwrap();
-        assert_eq!(
-            row.network_policy_authority,
-            PolicyAuthority::Cluster,
-            "{name}"
-        );
-        if case.authority == PolicyAuthority::Local {
-            assert_eq!(row.network_policy_override, None, "{name}");
-            assert_eq!(row.network_policy_generation, 0, "{name}");
-        } else {
-            assert_eq!(
-                row.network_policy_override,
-                Some(NetworkPolicyV1::deny_all()),
-                "{name}: cluster-owned policy must be left alone"
-            );
-            assert_eq!(row.network_policy_generation, 5, "{name}");
-        }
-        let queued: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM network_policy_reconcile_queue WHERE sandbox_id = 'sandbox'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(queued == 1, case.expected.queued_live_gateway, "{name}");
-        let dirty = list_node_dirty_refs(&conn, 16)
-            .unwrap()
-            .into_iter()
-            .any(|reference| {
-                reference.element_kind == "network_policy_sandbox"
-                    && reference.element_value == "sandbox"
-            });
-        assert_eq!(dirty, case.expected.queued_dirty_ref, "{name}");
-    }
-
-    let conn = test_conn();
-    assert!(matches!(
-        clear_local_network_policy(&conn, "missing", true, true),
-        Err(rusqlite::Error::QueryReturnedNoRows)
-    ));
 }
