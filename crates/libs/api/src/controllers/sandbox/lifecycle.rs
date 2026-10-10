@@ -2366,6 +2366,9 @@ mod drain_guard_postgres_tests;
 #[cfg(test)]
 mod wake_completion_postgres_tests;
 
+#[cfg(test)]
+mod characterization_tests;
+
 // Coverage-gap acknowledgment: `SandboxController::control_runtime_client`'s
 // ordering invariant (drain check must run before any substrate call that can
 // implicit-recover a pod) is not unit-testable here because the `Substrate`
