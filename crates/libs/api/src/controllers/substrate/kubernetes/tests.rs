@@ -15174,4 +15174,174 @@ mod kubernetes_tests {
         );
         assert_eq!(classify_fenced_pod_delete_error(&api_error(500)), None);
     }
+
+    /// Serves a sandbox pod whose start keeps failing: `Pending` with no IP.
+    /// Records the delete's preconditions and signals once the wake has read
+    /// the pod.
+    fn unstarted_pod_kubernetes_client(
+        pod_name: String,
+        pod_read: Arc<tokio::sync::Notify>,
+        deletes: Arc<Mutex<Vec<serde_json::Value>>>,
+    ) -> Client {
+        let service = tower::service_fn(move |req: Request<Body>| {
+            let pod_name = pod_name.clone();
+            let pod_read = Arc::clone(&pod_read);
+            let deletes = Arc::clone(&deletes);
+            async move {
+                let method = req.method().clone();
+                let path = req.uri().path().to_string();
+                let pod_path = format!("/api/v1/namespaces/space/pods/{pod_name}");
+                let json = |status: StatusCode, body: serde_json::Value| {
+                    Ok::<_, BoxError>(
+                        Response::builder()
+                            .status(status)
+                            .header("content-type", "application/json")
+                            .body(Body::from(serde_json::to_vec(&body)?))?,
+                    )
+                };
+                match method {
+                    // The pod watch ends at once; the wait falls back to
+                    // polling for the pod IP.
+                    Method::GET if path == "/api/v1/namespaces/space/pods" => {
+                        pod_read.notify_one();
+                        Ok(Response::builder()
+                            .status(StatusCode::OK)
+                            .header("content-type", "application/json")
+                            .body(Body::empty())?)
+                    }
+                    Method::GET if path == pod_path => {
+                        pod_read.notify_one();
+                        json(
+                            StatusCode::OK,
+                            serde_json::json!({
+                                "apiVersion": "v1",
+                                "kind": "Pod",
+                                "metadata": {
+                                    "name": pod_name,
+                                    "namespace": "space",
+                                    "uid": format!("{pod_name}-uid"),
+                                    "resourceVersion": "7"
+                                },
+                                "status": { "phase": "Pending" }
+                            }),
+                        )
+                    }
+                    Method::DELETE if path == pod_path => {
+                        let body = req.into_body().collect().await?.to_bytes();
+                        deletes
+                            .lock()
+                            .expect("delete capture mutex poisoned")
+                            .push(serde_json::from_slice(&body)?);
+                        json(
+                            StatusCode::OK,
+                            serde_json::json!({
+                                "kind": "Status",
+                                "apiVersion": "v1",
+                                "status": "Success",
+                                "code": 200
+                            }),
+                        )
+                    }
+                    method => json(
+                        StatusCode::BAD_REQUEST,
+                        serde_json::json!({
+                            "kind": "Status",
+                            "apiVersion": "v1",
+                            "status": "Failure",
+                            "message": format!("unexpected mock Kubernetes request: {method} {path}"),
+                            "reason": "BadRequest",
+                            "code": 400
+                        }),
+                    ),
+                }
+            }
+        });
+        ClientBuilder::new(service, "space").build()
+    }
+
+    // A restore whose sandbox start fails never gets a pod IP, and kubelet
+    // retries the start forever. Once the node rolls the activation back, the
+    // wake stops waiting and deletes the pod nothing can adopt any more.
+    #[tokio::test]
+    async fn a_wake_stops_waiting_once_its_node_rolls_back_the_execution() -> Result<(), BoxError> {
+        let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+        let pool = db.pool.clone();
+        let sandbox_id = SandboxId::new();
+        let pod_name = pplx_space_common_core::kubernetes::sandbox_pod_name(sandbox_id, 1);
+        insert_test_sandbox_row(&pool, sandbox_id, "restoring").await?;
+        sqlx::query(
+            "INSERT INTO sandbox_k8s_executions
+                 (sandbox_id, generation, pod_name, pod_namespace, state, active)
+             VALUES ($1, 1, $2, 'space', 'creating', TRUE)",
+        )
+        .bind(sandbox_id)
+        .bind(&pod_name)
+        .execute(&pool)
+        .await?;
+
+        let pod_read = Arc::new(tokio::sync::Notify::new());
+        let deletes = Arc::new(Mutex::new(Vec::new()));
+        let mut substrate = substrate_with_store_and_client(
+            pool.clone(),
+            unstarted_pod_kubernetes_client(
+                pod_name.clone(),
+                Arc::clone(&pod_read),
+                Arc::clone(&deletes),
+            ),
+        );
+        // Long enough that only the rollback, not the readiness deadline, can
+        // end the wait.
+        substrate.k8s.create_data_plane_ready_timeout = Duration::from_secs(300);
+        let substrate = Arc::new(substrate);
+        let wake = tokio::spawn({
+            let substrate = Arc::clone(&substrate);
+            async move {
+                substrate
+                    .ensure_active_execution_pod_proxy_reachable(
+                        SandboxApiMetricIdentity::ecw("resume"),
+                        sandbox_id,
+                        Instant::now() + Duration::from_secs(300),
+                        true,
+                    )
+                    .await
+            }
+        });
+
+        // The node's activation rollback retires the execution under the wait
+        // and returns the sandbox to `suspended`.
+        pod_read.notified().await;
+        sqlx::query(
+            "UPDATE sandbox_k8s_executions
+                SET active = FALSE, state = 'suspended'
+              WHERE sandbox_id = $1",
+        )
+        .bind(sandbox_id)
+        .execute(&pool)
+        .await?;
+        sqlx::query(
+            "UPDATE sandboxes
+                SET lifecycle = 'suspended', placement = 'unplaced', active_node_id = NULL
+              WHERE id = $1",
+        )
+        .bind(sandbox_id)
+        .execute(&pool)
+        .await?;
+
+        let result = tokio::time::timeout(Duration::from_secs(30), wake).await??;
+        assert!(
+            matches!(result, Err(SubstrateError::Failed { .. })),
+            "{result:?}"
+        );
+        let deletes = deletes.lock().expect("delete capture mutex poisoned");
+        assert_eq!(deletes.len(), 1, "{deletes:?}");
+        assert_eq!(
+            deletes[0].pointer("/preconditions/uid"),
+            Some(&serde_json::json!(format!("{pod_name}-uid")))
+        );
+        assert_eq!(
+            deletes[0].pointer("/preconditions/resourceVersion"),
+            Some(&serde_json::json!("7"))
+        );
+        Ok(())
+    }
 }

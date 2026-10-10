@@ -718,7 +718,7 @@ impl NodeManagerService {
         client
             .load_snapshot(fc_snapshot_path, fc_mem_file_path)
             .await
-            .map_err(|e| Status::internal(format!("load snapshot failed: {e}")))?;
+            .map_err(load_snapshot_failed_status)?;
         // The loaded drive limiter is the one of the VM the snapshot was taken
         // from. Replace it with the sandbox's own while the VM is still
         // paused; a sandbox must not run under another VM's limits.
@@ -1224,6 +1224,26 @@ fn drive_rate_limiter(
 /// milliseconds; a VMM that does not answer must not keep the sandbox's VM
 /// gate, which termination also takes, held indefinitely.
 const VM_PAUSE_STATE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The status a failed Firecracker snapshot load answers with.
+///
+/// A load that Firecracker rejects while restoring the vCPUs is
+/// `FailedPrecondition`: KVM on this host refuses the vCPU state the snapshot
+/// carries (an MSR or XCR its CPU doesn't implement), so every retry on this
+/// node fails the same way. A snapshot captured on a different CPU generation
+/// is the known cause. Every other load failure stays `Internal`.
+fn load_snapshot_failed_status(error: crate::fc_api::FcApiError) -> Status {
+    let message = format!("load snapshot failed: {error}");
+    match &error {
+        crate::fc_api::FcApiError::Status { status, body, .. }
+            if *status == hyper::StatusCode::BAD_REQUEST
+                && body.contains("Failed to restore vCPUs") =>
+        {
+            Status::failed_precondition(message)
+        }
+        _ => Status::internal(message),
+    }
+}
 
 /// Pause or resume the VM behind `client`, failing once `timeout` passes.
 pub(super) async fn set_firecracker_paused(

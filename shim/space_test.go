@@ -41,10 +41,10 @@ func (fakeConn) SetDeadline(time.Time) error      { return nil }
 func (fakeConn) SetReadDeadline(time.Time) error  { return nil }
 func (fakeConn) SetWriteDeadline(time.Time) error { return nil }
 
-// Contract test: the SPACE API matches on "[space-err=<Code>]" in the shim's
-// error message to detect permanent sandbox creation failures. The gRPC
-// status code itself is lost at the containerd CRI boundary (see
-// annotateStatus comment in space.go), so the namespaced marker is the
+// Contract test: "[space-err=<Code>]" in the shim's error message is the
+// surface for telling permanent sandbox creation failures from transient
+// ones. The gRPC status code itself is lost at the containerd CRI boundary
+// (see annotateStatus comment in space.go), so the namespaced marker is the
 // contract surface.
 func TestAnnotateStatusSbxManagerContract(t *testing.T) {
 	tests := []struct {

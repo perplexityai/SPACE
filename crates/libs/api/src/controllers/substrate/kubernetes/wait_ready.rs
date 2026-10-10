@@ -263,7 +263,7 @@ impl KubernetesSubstrate {
             (Instant::now() + self.k8s.create_data_plane_ready_timeout).min(phase_deadline);
         let sandbox_id_string = sandbox_id.to_string();
 
-        let Some(pod_ip) = self
+        let assignment = self
             .wait_for_pod_ip_assignment(
                 metric_identity,
                 sandbox_id,
@@ -277,9 +277,31 @@ impl KubernetesSubstrate {
                 sandbox_id = %sandbox_id,
                 pod_name = %target.pod_name,
                 namespace = %self.k8s.sandbox_namespace,
-            ))
-            .await?
-        else {
+            ));
+        let assigned = if target.abandon_when_retired {
+            // A pod whose sandbox start fails never gets an IP, and kubelet
+            // retries the start forever: no CRI error is terminal. When the
+            // node gives up on the activation, its rollback retires this
+            // execution. Nothing can adopt the pod after that, so stop
+            // waiting and remove it instead of running out the window.
+            tokio::select! {
+                assigned = assignment => assigned?,
+                () = self.wait_for_execution_retired(sandbox_id, target.generation) => {
+                    self.delete_unstarted_retired_pod(sandbox_id, target.pod_name)
+                        .await;
+                    return Err(SubstrateError::Failed {
+                        message: format!(
+                            "execution generation {} was retired before its pod {} \
+                             started",
+                            target.generation, target.pod_name
+                        ),
+                    });
+                }
+            }
+        } else {
+            assignment.await?
+        };
+        let Some(pod_ip) = assigned else {
             record_pod_proxy_wait_timeout(metric_identity, sandbox_id, started_at);
             // Pod never reached scheduled / IP-assigned in the window. No
             // node-mgr probe ran on this path, so the message names only
@@ -754,6 +776,8 @@ impl KubernetesSubstrate {
         sandbox_id: SandboxId,
         // Forwarded to `wait_for_pod_proxy_reachable`; see its doc.
         phase_deadline: Instant,
+        // See `PodProxyWaitTarget::abandon_when_retired`.
+        abandon_when_retired: bool,
     ) -> Result<(), SubstrateError> {
         let execution = self
             .store
@@ -774,6 +798,7 @@ impl KubernetesSubstrate {
                 pod_name: &execution.pod_name,
                 pod_uid: None,
                 generation: execution.generation,
+                abandon_when_retired,
             },
             "wake",
             phase_deadline,
@@ -787,7 +812,112 @@ impl KubernetesSubstrate {
         .await?;
         Ok(())
     }
+
+    /// Resolves once `generation` is no longer the sandbox's active execution.
+    /// A failed read is retried at the next poll; the readiness deadline still
+    /// bounds the caller.
+    async fn wait_for_execution_retired(&self, sandbox_id: SandboxId, generation: i64) {
+        loop {
+            sleep(RETIRED_EXECUTION_POLL_INTERVAL).await;
+            match self
+                .store
+                .active_execution_is_generation(sandbox_id, generation)
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => return,
+                Err(error) => tracing::warn!(
+                    sandbox_id = %sandbox_id,
+                    generation,
+                    error = %error,
+                    "failed to check whether the awaited execution is still active"
+                ),
+            }
+        }
+    }
+
+    /// Delete a retired execution's pod if it never started.
+    ///
+    /// A new execution takes the next generation and a retired row is never
+    /// reactivated, so nothing can adopt this pod any more. (Retries and
+    /// re-drives that reuse a generation do so on its active row.) Only a `Pending`
+    /// pod without an IP is removed: its sandbox start never succeeded, so it
+    /// holds no runtime. The delete is preconditioned on the UID and
+    /// resourceVersion just read, so a pod that changes in between is left
+    /// alone. A pod left behind falls to the age-based sweeps: the
+    /// orphaned-restore-pod GC for a restore pod and the stuck-
+    /// `ContainerCreating` GC for any other, each where it's enabled.
+    async fn delete_unstarted_retired_pod(&self, sandbox_id: SandboxId, pod_name: &str) {
+        let Ok(name) = PodName::parse(pod_name) else {
+            tracing::warn!(
+                sandbox_id = %sandbox_id,
+                pod_name,
+                "retired execution's pod name is invalid; leaving it"
+            );
+            return;
+        };
+        let pod = match fetch_sandbox_pod_uncached(&self.k8s, pod_name).await {
+            Ok(Some(pod)) => pod,
+            Ok(None) => return,
+            Err(error) => {
+                tracing::warn!(
+                    sandbox_id = %sandbox_id,
+                    pod_name,
+                    error = %error,
+                    "failed to read the retired execution's pod"
+                );
+                return;
+            }
+        };
+        let unstarted = !pod.is_deleting()
+            && pod.phase() == Some("Pending")
+            && matches!(assigned_pod_ip(&pod), Ok(None));
+        if !unstarted {
+            tracing::warn!(
+                sandbox_id = %sandbox_id,
+                pod_name,
+                "retired execution's pod has started; leaving it"
+            );
+            return;
+        }
+        let (Some(pod_uid), Some(resource_version)) = (
+            pod.uid().and_then(|uid| PodUid::parse(uid).ok()),
+            pod.resource_version()
+                .and_then(|version| PodResourceVersion::parse(version).ok()),
+        ) else {
+            tracing::warn!(
+                sandbox_id = %sandbox_id,
+                pod_name,
+                "retired execution's pod has no UID or resourceVersion; leaving it"
+            );
+            return;
+        };
+        match delete_sandbox_pod_fenced(&self.k8s, &name, &pod_uid, Some(&resource_version)).await {
+            Ok(FencedPodDeleteOutcome::Deleted | FencedPodDeleteOutcome::NotFound) => {
+                tracing::info!(
+                    sandbox_id = %sandbox_id,
+                    pod_name,
+                    "deleted the unstarted pod of an execution its node rolled back"
+                );
+            }
+            Ok(FencedPodDeleteOutcome::PreconditionFailed) => tracing::warn!(
+                sandbox_id = %sandbox_id,
+                pod_name,
+                "retired execution's pod changed before its delete; leaving it"
+            ),
+            Err(error) => tracing::warn!(
+                sandbox_id = %sandbox_id,
+                pod_name,
+                error = %error,
+                "failed to delete the retired execution's pod"
+            ),
+        }
+    }
 }
+
+/// How often a wake waiting for its pod's IP rechecks that its execution is
+/// still active. Healthy wakes stop polling once the IP is assigned.
+const RETIRED_EXECUTION_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Identity of the execution pod a proxy-reachability wait targets. Groups
 /// the execution-row fields so `wait_for_pod_proxy_reachable`'s signature
@@ -798,4 +928,7 @@ pub(super) struct PodProxyWaitTarget<'a> {
     /// path passes `None` (the binding it produces is discarded).
     pub pod_uid: Option<&'a str>,
     pub generation: i64,
+    /// Stop waiting for the pod IP, and delete the pod if it never started,
+    /// once `generation` is no longer the active execution.
+    pub abandon_when_retired: bool,
 }

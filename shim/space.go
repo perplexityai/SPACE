@@ -262,8 +262,9 @@ func (m manager) Info(ctx context.Context, optionsR io.Reader) (*apitypes.Runtim
 //
 //	shim (ttrpc) → containerd errgrpc.ToNative [1] → fmt.Errorf wrapping [2] → CRI gRPC → kubelet event
 //
-// The "space-err=" prefix namespaces the marker so the SPACE API's classifier
-// won't false-match arbitrary bracketed text in upstream error messages.
+// The "space-err=" prefix namespaces the marker so a reader of the pod event
+// won't false-match arbitrary bracketed text in upstream error messages. No
+// SPACE service parses it yet; it's the surface a classifier would match.
 //
 // [1] https://github.com/containerd/errdefs/blob/main/pkg/errgrpc/grpc.go#L207
 // [2] https://github.com/containerd/containerd/blob/main/internal/cri/server/podsandbox/sandbox_run.go#L267

@@ -393,3 +393,56 @@ async fn encrypted_seal_stop_does_not_retry_other_failures() {
 
     crate::runtime_supervisor_client::tests::stop_supervisor_server(server).await;
 }
+
+// Firecracker answers a load whose vCPU state this host's KVM refuses with a
+// 400, which is permanent on this node; other load failures stay retryable.
+#[test]
+fn a_vcpu_restore_rejection_fails_the_snapshot_load_permanently() {
+    let fault = |message: &str| {
+        format!(
+            "{{\"fault_message\":\"Load snapshot error: Failed to restore from snapshot: \
+             Failed to build microVM from snapshot: {message}\"}}"
+        )
+    };
+    for (status, body, expected) in [
+        (
+            hyper::StatusCode::BAD_REQUEST,
+            fault(
+                "Failed to restore vCPUs: Failed to set all KVM MSRs for this vCPU. \
+                 Only a partial write was done.",
+            ),
+            tonic::Code::FailedPrecondition,
+        ),
+        (
+            hyper::StatusCode::BAD_REQUEST,
+            fault(
+                "Failed to restore vCPUs: Failed to run action on vcpu: \
+                 Failed to set KVM vcpu xcrs: Invalid argument (os error 22)",
+            ),
+            tonic::Code::FailedPrecondition,
+        ),
+        (
+            hyper::StatusCode::BAD_REQUEST,
+            fault("Failed to open memory file: No such file or directory (os error 2)"),
+            tonic::Code::Internal,
+        ),
+        (
+            hyper::StatusCode::INTERNAL_SERVER_ERROR,
+            fault("Failed to restore vCPUs: unexpected"),
+            tonic::Code::Internal,
+        ),
+    ] {
+        let status = super::load_snapshot_failed_status(crate::fc_api::FcApiError::Status {
+            method: "PUT".to_string(),
+            path: "/snapshot/load".to_string(),
+            status,
+            body: body.clone(),
+        });
+        assert_eq!(status.code(), expected, "{body}");
+        assert!(
+            status.message().starts_with("load snapshot failed: "),
+            "{}",
+            status.message()
+        );
+    }
+}

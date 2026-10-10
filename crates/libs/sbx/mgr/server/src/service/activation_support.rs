@@ -1738,9 +1738,12 @@ impl ActivationFailureStage {
     ///   CRI layer drops it, leaving only the shim's `[space-err=<Code>]`
     ///   message marker in the pod event, and nothing in the control plane
     ///   reads that marker yet. Kubelet keeps retrying `RunPodSandbox` on its
-    ///   own backoff whatever is returned here, and a wedged pod is still
-    ///   reaped by the age-based stuck-`ContainerCreating` sweep rather than
-    ///   failed at the first attempt.
+    ///   own backoff whatever is returned here. What ends the loop is the
+    ///   activation rollback this failure records: once it retires the
+    ///   execution, a user wake still waiting on the pod deletes it. Any other
+    ///   pod is left to the age-based sweeps: the orphaned-restore-pod GC for a
+    ///   restore pod and the stuck-`ContainerCreating` GC for a fresh one, each
+    ///   where it's enabled.
     ///
     /// So this is the classification, not the enforcement. Flattening every
     /// failure to `Internal` would destroy the verdict before any consumer

@@ -1531,10 +1531,15 @@ impl KubernetesSubstrate {
                 }) => (requested_attempt_id, Some(owner_attempt_id)),
                 Err(error) => return Err(error),
             };
+            // An evacuation restore holds no restore lease, so its failure
+            // revert below can't tell its own claim from a user restore that
+            // claimed the row after a node rollback. It keeps waiting out its
+            // window and leaves the pod to the drain's re-drive.
             self.ensure_active_execution_pod_proxy_reachable(
                 metric_identity,
                 sandbox_id,
                 phase_deadline,
+                evacuation_placement.is_none(),
             )
             .await?;
 
