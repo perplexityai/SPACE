@@ -218,3 +218,577 @@ fn runtime_request_rejects_partial_execution_metadata() {
 
     assert_eq!(error.code(), tonic::Code::InvalidArgument);
 }
+
+/// A Firecracker installation and guest kernel under temporary roots, so
+/// runtime discovery never reads the node's fixed installation paths.
+fn installed_runtime() -> (tempfile::TempDir, crate::config::RuntimePaths) {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    let root = tempfile::tempdir().unwrap();
+    let vendor = root.path().join("vendor");
+    let assets = root.path().join("assets");
+    let kernels = root.path().join("kernels");
+    let bin = vendor.join("v1.16.0/bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    for name in ["firecracker", "jailer"] {
+        let path = bin.join(name);
+        std::fs::write(&path, "#!/bin/sh\nexit 42\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    symlink("v1.16.0", vendor.join("default")).unwrap();
+    std::fs::create_dir_all(kernels.join("vmlinux-6.1.158")).unwrap();
+    std::fs::write(kernels.join("vmlinux-6.1.158/vmlinux.bin"), b"kernel").unwrap();
+    for marker in ["default", "legacy-default"] {
+        symlink("vmlinux-6.1.158", kernels.join(marker)).unwrap();
+    }
+    std::fs::create_dir(&assets).unwrap();
+    (
+        root,
+        crate::config::RuntimePaths {
+            vendor,
+            assets,
+            kernels,
+        },
+    )
+}
+
+/// An allocated sandbox with a bound execution, plus a second sandbox whose
+/// execution is bound but which holds no lease.
+struct AdmittedSandbox {
+    service: super::NodeManagerService,
+    lease: crate::net::SlotInfo,
+    fence: crate::proto::ExecutionFence,
+    unallocated_id: String,
+    unallocated_fence: crate::proto::ExecutionFence,
+    _runtime: tempfile::TempDir,
+}
+
+impl AdmittedSandbox {
+    async fn new() -> Self {
+        use crate::service::tests::service_tests::{bind_test_execution, service_for_unit_tests};
+
+        let (runtime, runtime_paths) = installed_runtime();
+        let mut service = service_for_unit_tests().await;
+        service.runtime_paths = runtime_paths;
+        service.pool.set_all_slots_ready_for_test();
+        let id = SandboxId::new().to_string();
+        let fence = bind_test_execution(&service, &id);
+        let lease = allocate_lease(&service.pool, &id);
+        let unallocated_id = SandboxId::new().to_string();
+        let unallocated_fence = bind_test_execution(&service, &unallocated_id);
+        Self {
+            service,
+            lease,
+            fence,
+            unallocated_id,
+            unallocated_fence,
+            _runtime: runtime,
+        }
+    }
+
+    fn stale_fence() -> crate::proto::ExecutionFence {
+        pplx_space_node_mgr_client::execution_fence::ExecutionFence::new(
+            pplx_space_common_core::types::SandboxActivationAttemptId::new(),
+            None,
+        )
+        .into()
+    }
+
+    /// A refused request leaves the lease exactly as allocated and returns its
+    /// lifecycle admission.
+    fn assert_untouched(&self, case: &str, method: crate::lifecycle_limiter::LifecycleMethod) {
+        let current = self
+            .service
+            .pool
+            .get(&self.lease.sandbox_id)
+            .unwrap()
+            .expect("refusal must not release the lease");
+        assert_eq!(
+            (
+                current.slot,
+                current.generation,
+                current.sandbox_uid,
+                current.pid
+            ),
+            (
+                self.lease.slot,
+                self.lease.generation,
+                self.lease.sandbox_uid,
+                None
+            ),
+            "{case}"
+        );
+        assert_eq!(
+            self.service.lifecycle_limiter.snapshot(method),
+            (0, 0),
+            "{case}: refusal must return its lifecycle permit"
+        );
+    }
+}
+
+/// Claims the lease off the Tokio runtime. Allocation then skips its
+/// node-status notification, whose detached retry task dials the node's fixed
+/// node-ctl socket.
+fn allocate_lease(
+    pool: &std::sync::Arc<crate::slot_pool::NetworkPool>,
+    sandbox_id: &str,
+) -> crate::net::SlotInfo {
+    let (pool, sandbox_id) = (pool.clone(), sandbox_id.to_owned());
+    std::thread::spawn(move || {
+        match pool
+            .claim_allocation(
+                &sandbox_id,
+                None,
+                Some(crate::slot_pool::NewLeaseMemoryReservation {
+                    memory_reservation_mib: 8320,
+                }),
+            )
+            .unwrap()
+        {
+            crate::slot_pool::ClaimedSlotAllocation::Complete(lease) => lease,
+            crate::slot_pool::ClaimedSlotAllocation::Ephemeral(_) => {
+                panic!("a ready pooled slot completes its claim synchronously")
+            }
+        }
+    })
+    .join()
+    .unwrap()
+}
+
+/// Root is authorized for every node-manager RPC without depending on the
+/// authorizer's service-account lookups.
+fn from_root<T>(message: T) -> tonic::Request<T> {
+    let mut request = tonic::Request::new(message);
+    request
+        .extensions_mut()
+        .insert(pplx_space_common_svc::PeerIdentity::new(0, 0, None));
+    request
+}
+
+fn assert_refused(case: &str, error: &tonic::Status, code: tonic::Code, message: &str) {
+    assert_eq!(error.code(), code, "{case}: {error}");
+    assert!(error.message().contains(message), "{case}: {error}");
+}
+
+// Every case is refused before the jail is inspected or rebuilt; a request
+// that passed validation would reach the node's fixed jail directory.
+#[tokio::test]
+async fn launch_sandbox_refuses_invalid_requests_before_touching_the_jail() {
+    use pplx_space_execution_common::proto::ExecutionSelectionMode as Mode;
+    use pplx_space_node_runtime_core::runtime_inventory::RuntimeInventoryError;
+    use tonic::Code;
+
+    let admitted = AdmittedSandbox::new().await;
+    let id = admitted.lease.sandbox_id.clone();
+    let uid = admitted.lease.sandbox_uid;
+    let valid = crate::proto::LaunchSandboxRequest {
+        sandbox_id: id.clone(),
+        uid,
+        gid: uid,
+        runtime: "firecracker".into(),
+        execution_selection_mode: Mode::NewColdBoot.into(),
+        execution_fence: Some(admitted.fence.clone()),
+        ..Default::default()
+    };
+    let unsupported_runtime = "unsupported-runtime"
+        .parse::<RuntimeKind>()
+        .unwrap_err()
+        .to_string();
+    let missing_execution = RuntimeInventoryError::MissingRequestedExecution(
+        pplx_space_node_runtime_core::runtime_inventory::ExecutionSelectionMode::ExistingColdBoot,
+    )
+    .to_string();
+    let cases = [
+        (
+            "rootfs device of another sandbox",
+            crate::proto::LaunchSandboxRequest {
+                rootfs_block_device_path: Some(format!("/dev/mapper/sbxroot-{}", SandboxId::new())),
+                ..valid.clone()
+            },
+            Code::InvalidArgument,
+            "path does not belong to this sandbox",
+        ),
+        (
+            "unsupported runtime",
+            crate::proto::LaunchSandboxRequest {
+                runtime: "unsupported-runtime".into(),
+                ..valid.clone()
+            },
+            Code::InvalidArgument,
+            unsupported_runtime.as_str(),
+        ),
+        (
+            "unspecified selection mode",
+            crate::proto::LaunchSandboxRequest {
+                execution_selection_mode: Mode::Unspecified.into(),
+                ..valid.clone()
+            },
+            Code::InvalidArgument,
+            "execution_selection_mode is required",
+        ),
+        (
+            "restore flag on a cold boot",
+            crate::proto::LaunchSandboxRequest {
+                snapshot_restore: true,
+                ..valid.clone()
+            },
+            Code::InvalidArgument,
+            "snapshot_restore and execution_selection_mode disagree",
+        ),
+        (
+            "restore mode without the restore flag",
+            crate::proto::LaunchSandboxRequest {
+                execution_selection_mode: Mode::PersistedStateRestore.into(),
+                ..valid.clone()
+            },
+            Code::InvalidArgument,
+            "snapshot_restore and execution_selection_mode disagree",
+        ),
+        (
+            "existing cold boot without its recorded execution",
+            crate::proto::LaunchSandboxRequest {
+                execution_selection_mode: Mode::ExistingColdBoot.into(),
+                ..valid.clone()
+            },
+            Code::FailedPrecondition,
+            missing_execution.as_str(),
+        ),
+        (
+            "superseded execution",
+            crate::proto::LaunchSandboxRequest {
+                execution_fence: Some(AdmittedSandbox::stale_fence()),
+                ..valid.clone()
+            },
+            Code::FailedPrecondition,
+            "sandbox execution identity is missing or superseded",
+        ),
+        (
+            "unallocated sandbox",
+            crate::proto::LaunchSandboxRequest {
+                sandbox_id: admitted.unallocated_id.clone(),
+                execution_fence: Some(admitted.unallocated_fence.clone()),
+                ..valid.clone()
+            },
+            Code::NotFound,
+            "sandbox not allocated",
+        ),
+        (
+            "uid of another slot",
+            crate::proto::LaunchSandboxRequest {
+                uid: uid + 1,
+                gid: uid + 1,
+                ..valid.clone()
+            },
+            Code::PermissionDenied,
+            "does not match allocated slot UID",
+        ),
+        (
+            "gid differs from uid",
+            crate::proto::LaunchSandboxRequest {
+                gid: uid + 1,
+                ..valid.clone()
+            },
+            Code::PermissionDenied,
+            "must match UID",
+        ),
+    ];
+    for (case, request, code, message) in cases {
+        let error = admitted
+            .service
+            .launch_sandbox(from_root(request))
+            .await
+            .expect_err(case);
+        assert_refused(case, &error, code, message);
+        admitted.assert_untouched(
+            case,
+            crate::lifecycle_limiter::LifecycleMethod::LaunchSandbox,
+        );
+    }
+}
+
+// The deepest case names a template without its resolved directory, which is
+// refused before the managed template root or sandbox cache is inspected.
+#[tokio::test]
+async fn prepare_sandbox_refuses_invalid_requests_before_touching_the_cache() {
+    use pplx_space_common_core::types::{ContentHash, SandboxArtifactMetadata, TemplateName};
+    use pplx_space_execution_common::proto::ExecutionSelectionMode as Mode;
+    use pplx_space_node_runtime_core::runtime_inventory::RuntimeInventoryError;
+    use std::str::FromStr;
+    use tonic::Code;
+
+    let admitted = AdmittedSandbox::new().await;
+    let id = admitted.lease.sandbox_id.clone();
+    let uid = admitted.lease.sandbox_uid;
+    let valid = crate::proto::PrepareSandboxRequest {
+        sandbox_id: id.clone(),
+        uid,
+        runtime: "firecracker".into(),
+        execution_selection_mode: Mode::NewColdBoot.into(),
+        template: Some("base".into()),
+        execution_fence: Some(admitted.fence.clone()),
+        ..Default::default()
+    };
+    let foreign_metadata = serde_json::to_string(&SandboxArtifactMetadata::new(
+        SandboxId::new(),
+        ExecutionMetadata::initial_firecracker(Arch::X86_64, vec![]),
+        TemplateName::parse("base").unwrap(),
+        None,
+    ))
+    .unwrap();
+    let rootfs_size = |mib| {
+        pplx_space_common_core::sandbox_storage::validate_rootfs_mib(mib)
+            .unwrap_err()
+            .to_string()
+    };
+    let (empty_rootfs, oversized_rootfs) = (rootfs_size(0), rootfs_size(128 * 1024 + 1));
+    let invalid_template = TemplateName::parse("../base").unwrap_err().to_string();
+    let invalid_hash = ContentHash::from_str("not-a-digest")
+        .unwrap_err()
+        .to_string();
+    let missing_execution = RuntimeInventoryError::MissingRequestedExecution(
+        pplx_space_node_runtime_core::runtime_inventory::ExecutionSelectionMode::ExistingColdBoot,
+    )
+    .to_string();
+    let cases = [
+        (
+            "empty rootfs",
+            crate::proto::PrepareSandboxRequest {
+                rootfs_size_mb: Some(0),
+                ..valid.clone()
+            },
+            Code::InvalidArgument,
+            empty_rootfs.as_str(),
+        ),
+        (
+            "oversized rootfs",
+            crate::proto::PrepareSandboxRequest {
+                rootfs_size_mb: Some(128 * 1024 + 1),
+                ..valid.clone()
+            },
+            Code::InvalidArgument,
+            oversized_rootfs.as_str(),
+        ),
+        (
+            "unspecified selection mode",
+            crate::proto::PrepareSandboxRequest {
+                execution_selection_mode: Mode::Unspecified.into(),
+                ..valid.clone()
+            },
+            Code::InvalidArgument,
+            "execution_selection_mode is required",
+        ),
+        (
+            "existing cold boot without its recorded execution",
+            crate::proto::PrepareSandboxRequest {
+                execution_selection_mode: Mode::ExistingColdBoot.into(),
+                ..valid.clone()
+            },
+            Code::FailedPrecondition,
+            missing_execution.as_str(),
+        ),
+        (
+            "malformed metadata",
+            crate::proto::PrepareSandboxRequest {
+                metadata_json: "{".into(),
+                ..valid.clone()
+            },
+            Code::InvalidArgument,
+            "invalid sandbox metadata: ",
+        ),
+        (
+            "metadata of another sandbox",
+            crate::proto::PrepareSandboxRequest {
+                metadata_json: foreign_metadata.clone(),
+                ..valid.clone()
+            },
+            Code::InvalidArgument,
+            "sandbox metadata id does not match request",
+        ),
+        (
+            "invalid artifact template",
+            crate::proto::PrepareSandboxRequest {
+                artifact_template: Some("../base".into()),
+                ..valid.clone()
+            },
+            Code::InvalidArgument,
+            invalid_template.as_str(),
+        ),
+        (
+            "invalid content hash",
+            crate::proto::PrepareSandboxRequest {
+                content_hash: Some("not-a-digest".into()),
+                ..valid.clone()
+            },
+            Code::InvalidArgument,
+            invalid_hash.as_str(),
+        ),
+        (
+            "unallocated sandbox",
+            crate::proto::PrepareSandboxRequest {
+                sandbox_id: admitted.unallocated_id.clone(),
+                execution_fence: Some(admitted.unallocated_fence.clone()),
+                ..valid.clone()
+            },
+            Code::NotFound,
+            "sandbox not allocated",
+        ),
+        (
+            "uid of another slot",
+            crate::proto::PrepareSandboxRequest {
+                uid: uid + 1,
+                ..valid.clone()
+            },
+            Code::PermissionDenied,
+            "does not match allocated slot UID",
+        ),
+        (
+            "uid outside the sandbox range",
+            crate::proto::PrepareSandboxRequest {
+                uid: 0,
+                ..valid.clone()
+            },
+            Code::PermissionDenied,
+            "must be >=",
+        ),
+        (
+            "superseded execution",
+            crate::proto::PrepareSandboxRequest {
+                execution_fence: Some(AdmittedSandbox::stale_fence()),
+                ..valid.clone()
+            },
+            Code::FailedPrecondition,
+            "sandbox execution identity is missing or superseded",
+        ),
+        (
+            "template without its resolved directory",
+            valid.clone(),
+            Code::InvalidArgument,
+            "template_dir is required",
+        ),
+    ];
+    for (case, request, code, message) in cases {
+        let error = admitted
+            .service
+            .prepare_sandbox(from_root(request))
+            .await
+            .expect_err(case);
+        assert_refused(case, &error, code, message);
+        admitted.assert_untouched(
+            case,
+            crate::lifecycle_limiter::LifecycleMethod::PrepareSandbox,
+        );
+        assert_eq!(
+            admitted.service.disk_admission.pending_reservation_bytes(),
+            0,
+            "{case}: refusal must not hold a disk reservation"
+        );
+    }
+}
+
+// Sidecar launch is refused before its identity is resolved from the node's
+// run directory and cgroups. Only net-gateway is used once a lease exists:
+// spaced-host would read the registered Firecracker PID from the run directory.
+#[tokio::test]
+async fn sidecar_launch_refuses_invalid_requests_before_resolving_its_identity() {
+    use pplx_space_common_core::host::linux::paths;
+    use tonic::Code;
+
+    let admitted = AdmittedSandbox::new().await;
+    let id = admitted.lease.sandbox_id.clone();
+    let uid = admitted.lease.sandbox_uid;
+    let gateway_args = |socket: String, sandbox_id: Option<&str>| {
+        let mut args = vec!["--socket".to_string(), socket];
+        if let Some(sandbox_id) = sandbox_id {
+            args.extend(["--sandbox-id".to_string(), sandbox_id.to_string()]);
+        }
+        args
+    };
+    let valid = crate::proto::LaunchRequest {
+        sandbox_id: id.clone(),
+        program: paths::NET_GATEWAY_SVC_BIN.into(),
+        args: gateway_args(paths::net_gateway_control_socket(&id), Some(&id)),
+        uid,
+        gid: uid,
+        execution_fence: Some(admitted.fence.clone()),
+        ..Default::default()
+    };
+    let cases = [
+        (
+            "hex sandbox id that is not a UUID",
+            crate::proto::LaunchRequest {
+                sandbox_id: "deadbeef".into(),
+                ..valid.clone()
+            },
+            Code::InvalidArgument,
+            "invalid sandbox_id after validation",
+        ),
+        (
+            "program outside the allowlist",
+            crate::proto::LaunchRequest {
+                program: "/bin/sh".into(),
+                ..valid.clone()
+            },
+            Code::PermissionDenied,
+            "program '/bin/sh' not in allowed list",
+        ),
+        (
+            "superseded execution",
+            crate::proto::LaunchRequest {
+                execution_fence: Some(AdmittedSandbox::stale_fence()),
+                ..valid.clone()
+            },
+            Code::FailedPrecondition,
+            "sandbox execution identity is missing or superseded",
+        ),
+        (
+            "unallocated sandbox",
+            crate::proto::LaunchRequest {
+                sandbox_id: admitted.unallocated_id.clone(),
+                execution_fence: Some(admitted.unallocated_fence.clone()),
+                ..valid.clone()
+            },
+            Code::NotFound,
+            "sandbox not allocated",
+        ),
+        (
+            "uid of another slot",
+            crate::proto::LaunchRequest {
+                uid: uid + 1,
+                gid: uid + 1,
+                ..valid.clone()
+            },
+            Code::PermissionDenied,
+            "does not match allocated slot UID",
+        ),
+        (
+            "gateway socket of another sandbox",
+            crate::proto::LaunchRequest {
+                args: gateway_args(
+                    paths::net_gateway_control_socket(&admitted.unallocated_id),
+                    Some(&id),
+                ),
+                ..valid.clone()
+            },
+            Code::PermissionDenied,
+            "launch --socket must be",
+        ),
+        (
+            "gateway without its sandbox id",
+            crate::proto::LaunchRequest {
+                args: gateway_args(paths::net_gateway_control_socket(&id), None),
+                ..valid.clone()
+            },
+            Code::InvalidArgument,
+            "launch requires --sandbox-id <value>",
+        ),
+    ];
+    for (case, request, code, message) in cases {
+        let error = admitted
+            .service
+            .launch(from_root(request))
+            .await
+            .expect_err(case);
+        assert_refused(case, &error, code, message);
+        admitted.assert_untouched(case, crate::lifecycle_limiter::LifecycleMethod::Launch);
+    }
+}
