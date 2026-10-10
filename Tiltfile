@@ -479,6 +479,7 @@ k8s_yaml(helm(
     "infra/space/kind/charts/space-internal-api-local",
     name = "space",
     namespace = NAMESPACE,
+    set = TELEMETRY_SET,
 ))
 k8s_resource(
     "space-internal-api",
