@@ -8069,24 +8069,80 @@ fn acquiring_a_claim_refuses_every_changed_precondition() {
 // a reason.
 // ---------------------------------------------------------------------------
 
-/// The `db` module's source as one text, for the source-shape guards below:
-/// `db.rs` and every module it glob re-exports.
-const DB_MODULE_SOURCE: &str = concat!(
-    include_str!("../db.rs"),
-    include_str!("auto_lifecycle.rs"),
-    include_str!("cleanup_episodes.rs"),
-    include_str!("eviction.rs"),
-    include_str!("local_artifacts.rs"),
-    include_str!("network_policy.rs"),
-    include_str!("pool.rs"),
-    include_str!("quarantine.rs"),
-    include_str!("quarantine_recovery.rs"),
-    include_str!("restore_transfer_scopes.rs"),
-    include_str!("sandboxes.rs"),
-    include_str!("startup_recovery.rs"),
-    include_str!("state_transitions.rs"),
-    include_str!("teardown_suspend.rs")
-);
+/// One non-test source file of the `db` module, named by its path under `src/`.
+struct DbModuleFile {
+    path: String,
+    source: String,
+}
+
+/// The `db` module's non-test source files, read from the crate at test time:
+/// `db.rs` and every `.rs` file under `db/` except test modules (`tests.rs`,
+/// `*_tests.rs`, `test_*.rs` and anything under a `tests/` directory). Listing
+/// the directory rather than naming the files means a new module is scanned by
+/// the source-shape guards below without anyone registering it.
+fn db_module_files() -> Vec<DbModuleFile> {
+    fn is_test_module(path: &std::path::Path) -> bool {
+        let stem = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or("");
+        stem == "tests" || stem.ends_with("_tests") || stem.starts_with("test_")
+    }
+    fn collect(dir: &std::path::Path, into: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).expect("read db module directory") {
+            let path = entry.expect("read db module directory entry").path();
+            if path.is_dir() {
+                if path.file_name().is_some_and(|name| name != "tests") {
+                    collect(&path, into);
+                }
+            } else if path.extension().is_some_and(|extension| extension == "rs")
+                && !is_test_module(&path)
+            {
+                into.push(path);
+            }
+        }
+    }
+
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut paths = Vec::new();
+    collect(&src.join("db"), &mut paths);
+    paths.sort();
+    paths.insert(0, src.join("db.rs"));
+    paths
+        .into_iter()
+        .map(|path| {
+            let mut source = std::fs::read_to_string(&path).expect("read db module source");
+            // Keep the last line of one file from running into the first of the next.
+            if !source.ends_with('\n') {
+                source.push('\n');
+            }
+            let path = path
+                .strip_prefix(&src)
+                .expect("db module under src")
+                .display()
+                .to_string();
+            DbModuleFile { path, source }
+        })
+        .collect()
+}
+
+/// The `db` module's source as one text, for guards that search across modules.
+fn db_module_source(files: &[DbModuleFile]) -> String {
+    files.iter().map(|file| file.source.as_str()).collect()
+}
+
+/// The file and line that a 1-based line of [`db_module_source`] came from.
+fn db_module_location(files: &[DbModuleFile], line: usize) -> String {
+    let mut first = 1;
+    for file in files {
+        let lines = file.source.lines().count();
+        if line < first + lines {
+            return format!("{}:{}", file.path, line - first + 1);
+        }
+        first += lines;
+    }
+    format!("<past the end of the db module source>:{line}")
+}
 
 /// Does this line begin a statement that writes `sandbox_quarantine_state`?
 ///
@@ -8324,7 +8380,8 @@ fn every_recovery_table_writer_is_fenced_or_explicitly_exempt() {
         ),
     ];
 
-    let source = DB_MODULE_SOURCE;
+    let files = db_module_files();
+    let source = db_module_source(&files);
     let mut current_fn: Option<&str> = None;
     // Statements are attributed to their enclosing function, and a function is
     // considered fenced if it constructs an ExactClaimFence anywhere in its body.
@@ -8418,14 +8475,15 @@ fn every_recovery_table_writer_is_fenced_or_explicitly_exempt() {
 
     let exempt_names: std::collections::HashSet<&str> =
         EXEMPT.iter().map(|(name, _)| *name).collect();
-    let unfenced_in_fenced_fn: Vec<&(&str, usize)> = unfenced_statements
+    let unfenced_in_fenced_fn: Vec<(&str, String)> = unfenced_statements
         .iter()
         .filter(|(name, _)| !exempt_names.contains(name))
+        .map(|(name, line)| (*name, db_module_location(&files, *line)))
         .collect();
     assert!(
         unfenced_in_fenced_fn.is_empty(),
         "these individual statements write sandbox_quarantine_state without \
-         interpolating the exact-claim fence, at db.rs:<line>: \
+         interpolating the exact-claim fence, at <file>:<line>: \
          {unfenced_in_fenced_fn:?}. A sibling statement in the same function \
          building a fence does not fence this one."
     );
@@ -8610,7 +8668,7 @@ fn a_cleanup_owner_arriving_after_the_claim_is_still_recorded() {
 /// which table they write, so a fenced statement against any table is covered.
 #[test]
 fn every_fence_construction_site_is_in_the_statement_inventory() {
-    let source = DB_MODULE_SOURCE;
+    let source = &db_module_source(&db_module_files());
     let mut enclosing = None;
     let mut sites: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for line in source.lines() {
@@ -8829,7 +8887,7 @@ fn every_clause_of_the_acquire_cas_blocks_a_claim_on_its_own() {
 /// together without either matrix having to know about the other.
 #[test]
 fn the_acquire_cas_pins_every_column_the_fence_pins() {
-    let source = DB_MODULE_SOURCE;
+    let source = &db_module_source(&db_module_files());
 
     // The fence's identity columns, read off the predicate builder.
     let predicate = {
@@ -8947,7 +9005,7 @@ fn the_contention_release_records_the_reason_it_was_given() {
 /// (`every_fence_construction_site_is_in_the_statement_inventory`).
 #[test]
 fn no_two_fenced_writers_share_a_column_set_under_different_guards() {
-    let source = DB_MODULE_SOURCE;
+    let source = &db_module_source(&db_module_files());
 
     /// The table written, the columns assigned, and the three relaxations, read out of
     /// one function's body.
