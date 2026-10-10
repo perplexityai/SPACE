@@ -1,15 +1,16 @@
 //! Route verification bundle refresh, authoritative route identity adoption,
 //! and resident resume admission up to the node-manager call.
 //!
-//! Every test runs in its own child process with route, node, and bundle
-//! environment removed or pointed at test-owned files. Services use temporary
-//! socket paths, an explicit node identity, and a shutdown token and task
-//! tracker that each test drains.
+//! Every test runs in its own child process with route, node, bundle, and
+//! feature-flag provider environment removed or pointed at test-owned files.
+//! Services use temporary socket paths, an explicit node identity, and a
+//! shutdown token and task tracker that each test drains.
 
 use super::{
-    RouteStreamFence, RouteVerificationBundleRefresh, RouteVerificationBundleRefreshError,
-    SandboxManagerService, SandboxManagerServiceOptions, SandboxState, SpacedRpc,
+    RouteVerificationBundleRefresh, RouteVerificationBundleRefreshError, SandboxManagerService,
+    SandboxManagerServiceOptions, SandboxState, SpacedRpc,
 };
+use crate::auto_lifecycle_delete_receipts::RouteIdentityProvenance;
 use aws_lc_rs::rand::SystemRandom;
 use aws_lc_rs::signature::Ed25519KeyPair;
 use base64::Engine as _;
@@ -37,7 +38,8 @@ use tonic::Code;
 const ROUTE_TEST_CLUSTER: &str = "route-test";
 const ROUTE_TEST_ISSUER: &str = "route-test-authority";
 
-/// Isolate bundle, cluster, node, and route-fence configuration from the host.
+/// Isolate bundle, cluster, node, and route-fence configuration from the host,
+/// and keep service construction from starting a feature-flag provider.
 fn enter_route_identity_test_process(bundle_path: Option<&OsStr>) -> bool {
     crate::service::tests::enter_route_test_process(&[
         (
@@ -46,6 +48,8 @@ fn enter_route_identity_test_process(bundle_path: Option<&OsStr>) -> bool {
         ),
         (SPACE_API_ROUTE_ED25519_VERIFICATION_BUNDLE_ENV, None),
         (CLUSTER_ID_ENV, Some(OsStr::new(ROUTE_TEST_CLUSTER))),
+        ("EPPO_SDK_KEY", None),
+        ("SPACE_FLAGD_ENABLED", None),
     ])
 }
 
@@ -185,28 +189,22 @@ fn started_unfenced_sandbox(conn: &rusqlite::Connection) -> (SandboxId, SpaceApi
         conn,
         sandbox_id,
         &identity,
-        crate::auto_lifecycle_delete_receipts::RouteIdentityProvenance::Unfenced,
+        RouteIdentityProvenance::Unfenced,
     )
     .unwrap();
     (sandbox_id, identity)
 }
 
-fn route_identity_provenance(service: &SandboxManagerService, sandbox_id: SandboxId) -> String {
-    service
-        .db_conn()
-        .unwrap()
-        .query_row(
-            "SELECT space_api_route_identity_provenance FROM sandboxes WHERE id = ?1",
-            [sandbox_id.to_string()],
-            |row| row.get(0),
-        )
-        .unwrap()
-}
-
-/// Attach a route stream to the sandbox's current persisted identity.
-fn open_route_stream(service: &SandboxManagerService, sandbox_id: SandboxId) -> RouteStreamFence {
-    let row = service.lookup_sandbox(&sandbox_id.to_string()).unwrap();
-    service.route_stream_identity_token(&row).unwrap()
+fn route_identity_provenance(
+    service: &SandboxManagerService,
+    sandbox_id: SandboxId,
+) -> Option<RouteIdentityProvenance> {
+    crate::auto_lifecycle_delete_receipts::db::route_identity_adoption_metadata(
+        &service.db_conn().unwrap(),
+        sandbox_id,
+    )
+    .unwrap()
+    .current_provenance
 }
 
 #[tokio::test]
@@ -217,7 +215,6 @@ async fn route_identity_adoption_without_an_identity_changes_nothing() {
     let conn = crate::db::test_conn();
     let (sandbox_id, identity) = started_unfenced_sandbox(&conn);
     let service = RouteTestService::new(conn);
-    let stream = open_route_stream(&service, sandbox_id);
 
     // A wake that carries no route identity has nothing to adopt, whether or
     // not the sandbox exists locally.
@@ -229,8 +226,10 @@ async fn route_identity_adoption_without_an_identity_changes_nothing() {
 
     let row = service.lookup_sandbox(&sandbox_id.to_string()).unwrap();
     assert_eq!(row.space_api_route_identity, identity);
-    assert_eq!(route_identity_provenance(&service, sandbox_id), "unfenced");
-    assert!(!stream.child_token().is_cancelled());
+    assert_eq!(
+        route_identity_provenance(&service, sandbox_id),
+        Some(RouteIdentityProvenance::Unfenced)
+    );
     service.shut_down().await;
 }
 
@@ -239,7 +238,12 @@ async fn route_identity_adoption_requires_a_readable_local_row() {
     if !enter_route_identity_test_process(None) {
         return;
     }
-    for (store_readable, expected) in [(true, Code::NotFound), (false, Code::Internal)] {
+    // Wake callers forward the NotFound message. The Internal message embeds
+    // the store's own diagnostic, so only its code is pinned.
+    for (store_readable, expected_code, expected_message) in [
+        (true, Code::NotFound, Some("sandbox not found")),
+        (false, Code::Internal, None),
+    ] {
         let service = RouteTestService::new(crate::db::test_conn());
         if !store_readable {
             service
@@ -254,14 +258,25 @@ async fn route_identity_adoption_requires_a_readable_local_row() {
             .adopt_authoritative_route_identity(sandbox_id, &kubernetes_identity(sandbox_id, 4))
             .expect_err("adoption needs the local row it would update");
 
-        assert_eq!(error.code(), expected, "store readable: {store_readable}");
+        assert_eq!(
+            error.code(),
+            expected_code,
+            "store readable: {store_readable}"
+        );
+        if let Some(expected_message) = expected_message {
+            assert_eq!(error.message(), expected_message);
+        }
         service.shut_down().await;
     }
 }
 
 #[derive(Clone, Copy, Debug)]
 enum ExecutionOwner {
-    Cleanup,
+    /// Cleanup intent armed on a still-started row.
+    CleanupIntent,
+    /// A lifecycle transition has moved the row out of started/paused.
+    LifecycleTransition,
+    /// A pending auto-lifecycle delete receipt for the same execution.
     PendingDeleteReceipt,
 }
 
@@ -270,47 +285,63 @@ async fn identity_equal_adoption_does_not_overwrite_an_owned_execution() {
     if !enter_route_identity_test_process(None) {
         return;
     }
-    for owner in [
-        ExecutionOwner::Cleanup,
-        ExecutionOwner::PendingDeleteReceipt,
+    for (owner, expected_message) in [
+        (
+            ExecutionOwner::CleanupIntent,
+            "sandbox lifecycle or cleanup owns the sandbox execution",
+        ),
+        (
+            ExecutionOwner::LifecycleTransition,
+            "sandbox lifecycle or cleanup owns the sandbox execution",
+        ),
+        (
+            ExecutionOwner::PendingDeleteReceipt,
+            "pending auto-lifecycle delete receipt owns the sandbox execution",
+        ),
     ] {
         let conn = crate::db::test_conn();
         let (sandbox_id, identity) = started_unfenced_sandbox(&conn);
-        let service = RouteTestService::new(conn);
-        let stream = open_route_stream(&service, sandbox_id);
-        {
-            let db = service.db_conn().unwrap();
-            match owner {
-                ExecutionOwner::Cleanup => {
-                    db.execute(
-                        "UPDATE sandboxes
-                            SET state = 'deleting',
-                                cleanup_completion = 'delete_row',
-                                cleanup_keep_filesystem = 0
-                          WHERE id = ?1",
-                        [sandbox_id.to_string()],
+        let id = sandbox_id.to_string();
+        let expected_state = match owner {
+            ExecutionOwner::CleanupIntent => {
+                assert!(
+                    crate::db::set_cleanup_intent(
+                        &conn,
+                        &id,
+                        false,
+                        crate::db::CleanupCompletion::DeleteRow,
                     )
-                    .unwrap();
-                }
-                ExecutionOwner::PendingDeleteReceipt => {
-                    crate::auto_lifecycle_delete_receipts::db::insert_pending_receipt(
-                        &db,
-                        crate::auto_lifecycle_delete_receipts::AutoLifecycleDeleteReceipt {
-                            receipt_id:
-                                pplx_space_common_core::types::AutoLifecycleDeleteReceiptId::generate(),
-                            sandbox_id,
-                            execution_generation: identity.execution_generation.unwrap(),
-                            route_activation_id: identity.activation_attempt_id.unwrap(),
-                            policy_fingerprint:
-                                pplx_space_common_svc::types::AutoLifecyclePolicyFingerprint::for_policy(
-                                    &AutoLifecyclePolicy::disabled(),
-                                ),
-                        },
-                    )
-                    .unwrap();
-                }
+                    .unwrap()
+                );
+                SandboxState::Started
             }
-        }
+            ExecutionOwner::LifecycleTransition => {
+                assert_eq!(
+                    crate::db::update_state(&conn, &id, SandboxState::Stopping).unwrap(),
+                    crate::db::SandboxStateWriteOutcome::Applied
+                );
+                SandboxState::Stopping
+            }
+            ExecutionOwner::PendingDeleteReceipt => {
+                crate::auto_lifecycle_delete_receipts::db::insert_pending_receipt(
+                    &conn,
+                    crate::auto_lifecycle_delete_receipts::AutoLifecycleDeleteReceipt {
+                        receipt_id:
+                            pplx_space_common_core::types::AutoLifecycleDeleteReceiptId::generate(),
+                        sandbox_id,
+                        execution_generation: identity.execution_generation.unwrap(),
+                        route_activation_id: identity.activation_attempt_id.unwrap(),
+                        policy_fingerprint:
+                            pplx_space_common_svc::types::AutoLifecyclePolicyFingerprint::for_policy(
+                                &AutoLifecyclePolicy::disabled(),
+                            ),
+                    },
+                )
+                .unwrap();
+                SandboxState::Started
+            }
+        };
+        let service = RouteTestService::new(conn);
 
         // The route fields already match, so only the provenance would be
         // promoted; the execution's current owner refuses even that write.
@@ -319,14 +350,15 @@ async fn identity_equal_adoption_does_not_overwrite_an_owned_execution() {
             .expect_err("an owned execution refuses route metadata promotion");
 
         assert_eq!(error.code(), Code::Aborted, "{owner:?}");
+        assert_eq!(error.message(), expected_message, "{owner:?}");
         assert_eq!(
             route_identity_provenance(&service, sandbox_id),
-            "unfenced",
+            Some(RouteIdentityProvenance::Unfenced),
             "{owner:?}"
         );
-        let row = service.lookup_sandbox(&sandbox_id.to_string()).unwrap();
+        let row = service.lookup_sandbox(&id).unwrap();
         assert_eq!(row.space_api_route_identity, identity, "{owner:?}");
-        assert!(!stream.child_token().is_cancelled(), "{owner:?}");
+        assert_eq!(row.state, expected_state, "{owner:?}");
         service.shut_down().await;
     }
 }
@@ -360,6 +392,10 @@ impl RouteSigningKey {
         .to_string()
     }
 
+    /// Claims are minted and verified against the wall clock (120 s lifetime,
+    /// 15 s skew); there is no controlled-clock mint/verify. Each request is
+    /// minted immediately before its verification, so a check can fail only
+    /// if that single step stalls for about two minutes.
     fn bridge_request(&self, identity: &SandboxRouteIdentity) -> tonic::Request<()> {
         let claims = SpaceApiRouteEd25519Claims::space_api_bridge(
             SpaceApiRouteEd25519Issuer::parse(ROUTE_TEST_ISSUER).unwrap(),
@@ -374,15 +410,13 @@ impl RouteSigningKey {
     }
 }
 
+/// What a refresh does to the installed verifier. `Unchanged`, `Absent`, and
+/// the rejection variants differ only in telemetry, so they are not split.
 #[derive(Debug, PartialEq, Eq)]
 enum RefreshOutcome {
-    Updated(u64),
-    Unchanged(u64),
-    Absent,
-    Invalid,
-    Missing(u64),
-    Stale { current: u64, incoming: u64 },
-    Conflict(u64),
+    Installed(u64),
+    NotInstalled,
+    Rejected,
 }
 
 fn refresh_outcome(
@@ -390,28 +424,15 @@ fn refresh_outcome(
 ) -> RefreshOutcome {
     match result {
         Ok(RouteVerificationBundleRefresh::Updated(generation)) => {
-            RefreshOutcome::Updated(generation.get())
+            RefreshOutcome::Installed(generation.get())
         }
-        Ok(RouteVerificationBundleRefresh::Unchanged(generation)) => {
-            RefreshOutcome::Unchanged(generation.get())
-        }
-        Ok(RouteVerificationBundleRefresh::Absent) => RefreshOutcome::Absent,
-        Err(RouteVerificationBundleRefreshError::Invalid(_)) => RefreshOutcome::Invalid,
-        Err(RouteVerificationBundleRefreshError::Missing { generation }) => {
-            RefreshOutcome::Missing(generation.get())
-        }
-        Err(RouteVerificationBundleRefreshError::Stale { current, incoming }) => {
-            RefreshOutcome::Stale {
-                current: current.get(),
-                incoming: incoming.get(),
-            }
-        }
-        Err(RouteVerificationBundleRefreshError::Conflict { generation }) => {
-            RefreshOutcome::Conflict(generation.get())
-        }
+        Ok(
+            RouteVerificationBundleRefresh::Unchanged(_) | RouteVerificationBundleRefresh::Absent,
+        ) => RefreshOutcome::NotInstalled,
         Err(RouteVerificationBundleRefreshError::Internal(message)) => {
             panic!("unexpected internal refresh failure: {message}")
         }
+        Err(_) => RefreshOutcome::Rejected,
     }
 }
 
@@ -452,47 +473,52 @@ async fn route_verification_bundle_refresh_installs_only_forward_updates() {
 
     // (bundle file contents, refresh outcome, route keys accepted afterwards)
     let steps: [(Option<String>, RefreshOutcome, [bool; 2]); 10] = [
-        (None, RefreshOutcome::Invalid, [false, false]),
-        (Some(String::new()), RefreshOutcome::Absent, [false, false]),
+        (None, RefreshOutcome::Rejected, [false, false]),
+        (
+            Some(String::new()),
+            RefreshOutcome::NotInstalled,
+            [false, false],
+        ),
         (
             Some(key_a.bundle_json(1)),
-            RefreshOutcome::Updated(1),
+            RefreshOutcome::Installed(1),
             [true, false],
         ),
         (
             Some(key_a.bundle_json(1)),
-            RefreshOutcome::Unchanged(1),
+            RefreshOutcome::NotInstalled,
             [true, false],
         ),
+        // Same generation, different keys.
         (
             Some(key_b.bundle_json(1)),
-            RefreshOutcome::Conflict(1),
+            RefreshOutcome::Rejected,
             [true, false],
         ),
         (
             Some(key_b.bundle_json(2)),
-            RefreshOutcome::Updated(2),
+            RefreshOutcome::Installed(2),
             [false, true],
         ),
+        // Older generation.
         (
             Some(key_a.bundle_json(1)),
-            RefreshOutcome::Stale {
-                current: 2,
-                incoming: 1,
-            },
+            RefreshOutcome::Rejected,
             [false, true],
         ),
         (
             Some("{not a bundle".to_string()),
-            RefreshOutcome::Invalid,
+            RefreshOutcome::Rejected,
             [false, true],
         ),
+        // Blank after a bundle was installed.
         (
             Some(" \n".to_string()),
-            RefreshOutcome::Missing(2),
+            RefreshOutcome::Rejected,
             [false, true],
         ),
-        (None, RefreshOutcome::Invalid, [false, true]),
+        // Unreadable after a bundle was installed.
+        (None, RefreshOutcome::Rejected, [false, true]),
     ];
     for (step, (contents, expected, accepted)) in steps.into_iter().enumerate() {
         match contents {
@@ -533,91 +559,162 @@ async fn route_verification_bundle_refresh_installs_only_forward_updates() {
     service.shut_down().await;
 }
 
-#[tokio::test]
-async fn resident_resume_refuses_rows_that_are_not_paused_before_any_work() {
-    if !enter_route_identity_test_process(None) {
-        return;
-    }
-    // Pool rows and an activation policy keep every case short of the
-    // node-manager connection even if this precheck regresses.
-    let policy = AutoLifecyclePolicy::disabled();
-    for (state, expected) in [
-        (None, Code::NotFound),
-        (Some(SandboxState::Started), Code::FailedPrecondition),
-        (Some(SandboxState::Stopped), Code::FailedPrecondition),
-        (Some(SandboxState::Suspended), Code::FailedPrecondition),
-        (Some(SandboxState::Failed), Code::FailedPrecondition),
-        (Some(SandboxState::Pausing), Code::Unavailable),
-        (Some(SandboxState::Resuming), Code::Unavailable),
-        (Some(SandboxState::Suspending), Code::Unavailable),
-    ] {
-        let conn = crate::db::test_conn();
-        let sandbox_id = SandboxId::new();
-        if let Some(state) = state {
-            insert_sandbox(&conn, sandbox_id, state, Some("route-test-pool"), &policy);
-        }
-        let service = RouteTestService::new(conn);
-
-        let error = service
-            .resume_after_wake_lock(&sandbox_id.to_string(), Some((&policy, None)), false, 1)
-            .await
-            .expect_err("only a paused sandbox can resume");
-
-        assert_eq!(error.code(), expected, "{state:?}");
-        if let Some(state) = state {
-            let row = service.lookup_sandbox(&sandbox_id.to_string()).unwrap();
-            assert_eq!(row.state, state);
-        }
-        service.shut_down().await;
+/// Status a policy-bearing resume returns for a row in `state` whose resident
+/// execution differs from the one the request names. Callers forward the
+/// message (Direct implicit wake turns `FailedPrecondition` into an HTTP 409
+/// body), so it is pinned with the code.
+fn expected_resume_refusal(state: SandboxState) -> (Code, &'static str) {
+    use SandboxState::*;
+    match state {
+        Paused => (
+            Code::FailedPrecondition,
+            "resident execution changed before resume",
+        ),
+        Created => (
+            Code::FailedPrecondition,
+            "cannot resume: sandbox is created, not paused",
+        ),
+        Started => (
+            Code::FailedPrecondition,
+            "cannot resume: sandbox is started, not paused",
+        ),
+        Stopped => (
+            Code::FailedPrecondition,
+            "cannot resume: sandbox is stopped, not paused",
+        ),
+        Suspended => (
+            Code::FailedPrecondition,
+            "cannot resume: sandbox is suspended, not paused",
+        ),
+        CleanupRequired => (
+            Code::FailedPrecondition,
+            "cannot resume: sandbox is cleanup_required, not paused",
+        ),
+        CleanupFailed => (
+            Code::FailedPrecondition,
+            "cannot resume: sandbox is cleanup_failed, not paused",
+        ),
+        Quarantined => (
+            Code::FailedPrecondition,
+            "cannot resume: sandbox is quarantined, not paused",
+        ),
+        Failed => (
+            Code::FailedPrecondition,
+            "cannot resume: sandbox is failed, not paused",
+        ),
+        Creating => (
+            Code::Unavailable,
+            "cannot resume: sandbox is creating — wait for creation to complete",
+        ),
+        Starting => (
+            Code::Unavailable,
+            "cannot resume: sandbox is starting — wait for start to complete",
+        ),
+        Stopping => (
+            Code::Unavailable,
+            "cannot resume: sandbox is stopping — wait for stop to complete",
+        ),
+        Deleting => (
+            Code::Unavailable,
+            "cannot resume: sandbox is deleting — wait for deletion to complete",
+        ),
+        Pausing => (
+            Code::Unavailable,
+            "cannot resume: sandbox is pausing — wait for pause to complete",
+        ),
+        Resuming => (
+            Code::Unavailable,
+            "cannot resume: sandbox is resuming — wait for resume to complete",
+        ),
+        Checkpointing => (
+            Code::Unavailable,
+            "cannot resume: sandbox is checkpointing — wait for checkpoint to complete",
+        ),
+        Suspending => (
+            Code::Unavailable,
+            "cannot resume: sandbox is suspending — wait for suspend to complete",
+        ),
+        Restoring => (
+            Code::Unavailable,
+            "cannot resume: sandbox is restoring — wait for restore to complete",
+        ),
     }
 }
 
 #[tokio::test]
-async fn resident_resume_refuses_a_replaced_execution_without_touching_the_row() {
+async fn resident_resume_refusal_status_for_every_state() {
     if !enter_route_identity_test_process(None) {
         return;
     }
-    let conn = crate::db::test_conn();
-    let sandbox_id = SandboxId::new();
     let resident_policy = AutoLifecyclePolicy::disabled();
-    // A warm-pool member has no network identity, so the pre-wake policy gate
-    // has nothing to confirm with a gateway.
-    insert_sandbox(
-        &conn,
-        sandbox_id,
-        SandboxState::Paused,
-        Some("route-test-pool"),
-        &resident_policy,
-    );
-    crate::db::update_space_api_route_identity(
-        &conn,
-        sandbox_id,
-        &SpaceApiRouteIdentity {
-            execution_generation: Some(ExecutionGeneration::new(4).unwrap()),
-            ..SpaceApiRouteIdentity::default()
-        },
-        crate::auto_lifecycle_delete_receipts::RouteIdentityProvenance::Unfenced,
-    )
-    .unwrap();
-    let service = RouteTestService::new(conn);
     let activation_policy = access_idle_policy();
+    let replaced_execution = ExecutionGeneration::new(3).unwrap();
 
+    let missing = SandboxId::new().to_string();
+    let service = RouteTestService::new(crate::db::test_conn());
     let error = service
         .resume_after_wake_lock(
-            &sandbox_id.to_string(),
-            Some((
-                &activation_policy,
-                Some(ExecutionGeneration::new(3).unwrap()),
-            )),
+            &missing,
+            Some((&activation_policy, Some(replaced_execution))),
             false,
             1,
         )
         .await
-        .expect_err("a resume admitted for another execution must not thaw this one");
-
-    assert_eq!(error.code(), Code::FailedPrecondition);
-    let row = service.lookup_sandbox(&sandbox_id.to_string()).unwrap();
-    assert_eq!(row.state, SandboxState::Paused);
-    assert_eq!(row.auto_lifecycle, resident_policy);
+        .expect_err("an unknown sandbox cannot resume");
+    assert_eq!(error.code(), Code::NotFound);
+    assert_eq!(error.message(), format!("sandbox not found: {missing}"));
     service.shut_down().await;
+
+    for state in SandboxState::all() {
+        let conn = crate::db::test_conn();
+        let sandbox_id = SandboxId::new();
+        // A warm-pool member has no network identity, so the pre-wake policy
+        // gate has nothing to confirm with a gateway. Every row names a
+        // different resident execution than the request, so the policy
+        // admission refuses even a paused row before the node-manager call.
+        insert_sandbox(
+            &conn,
+            sandbox_id,
+            SandboxState::Paused,
+            Some("route-test-pool"),
+            &resident_policy,
+        );
+        crate::db::update_space_api_route_identity(
+            &conn,
+            sandbox_id,
+            &SpaceApiRouteIdentity {
+                execution_generation: Some(ExecutionGeneration::new(4).unwrap()),
+                ..SpaceApiRouteIdentity::default()
+            },
+            RouteIdentityProvenance::Unfenced,
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE sandboxes SET state = ?1 WHERE id = ?2",
+            rusqlite::params![state.as_str(), sandbox_id.to_string()],
+        )
+        .unwrap();
+        let service = RouteTestService::new(conn);
+
+        let error = service
+            .resume_after_wake_lock(
+                &sandbox_id.to_string(),
+                Some((&activation_policy, Some(replaced_execution))),
+                false,
+                1,
+            )
+            .await
+            .expect_err("a resume for another execution never thaws this row");
+
+        let (expected_code, expected_message) = expected_resume_refusal(state);
+        assert_eq!(error.code(), expected_code, "{state}");
+        assert_eq!(error.message(), expected_message, "{state}");
+        // db::tests::resident_policy_resume_is_generation_fenced_and_arms_only_after_thaw
+        // owns the admission's row effects; this checks only that a refused
+        // resume leaves the row as it was.
+        let row = service.lookup_sandbox(&sandbox_id.to_string()).unwrap();
+        assert_eq!(row.state, state, "{state}");
+        assert_eq!(row.auto_lifecycle, resident_policy, "{state}");
+        service.shut_down().await;
+    }
 }
