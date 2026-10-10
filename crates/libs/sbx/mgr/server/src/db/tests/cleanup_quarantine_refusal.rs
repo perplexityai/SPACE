@@ -543,27 +543,59 @@ fn cleanup_failure_is_recorded_only_against_the_current_requested_episode() {
 }
 
 #[test]
-fn cleanup_failure_without_the_episode_intent_records_evidence_but_keeps_state() {
-    let conn = test_conn();
-    let episode = requested_start(&conn, "sandbox", "failint1");
-    clear_cleanup_intent(&conn, "sandbox").unwrap();
+fn cleanup_failure_against_a_changed_intent_records_evidence_and_gates_state_on_completion() {
+    type ChangeIntent = fn(&Connection, &str, &CleanupEpisode);
+    let cases: [(&str, ChangeIntent, SandboxState); 3] = [
+        (
+            "intent cleared",
+            |conn, id, _| clear_cleanup_intent(conn, id).unwrap(),
+            SandboxState::CleanupRequired,
+        ),
+        (
+            "completion changed",
+            |conn, id, _| change_intent_completion(conn, id),
+            SandboxState::CleanupRequired,
+        ),
+        // Unlike `request_cleanup_episode`, `quarantine_cleanup_episode` and
+        // `cleanup_episode_current`, this writer's state predicate matches the
+        // episode's completion but not its keep-filesystem flag, so a generic
+        // writer that flipped only the flag still lets the row enter
+        // `cleanup_failed`. Unifying the predicates changes this outcome.
+        (
+            "keep-filesystem changed by a generic writer",
+            |conn, id, episode| {
+                mark_cleanup_required(
+                    conn,
+                    id,
+                    !episode.keep_filesystem,
+                    episode.completion,
+                    "observer",
+                )
+                .unwrap();
+            },
+            SandboxState::CleanupFailed,
+        ),
+    ];
+    for (case, change_intent, expected_state) in cases {
+        let conn = test_conn();
+        let episode = requested_start(&conn, "sandbox", "failint1");
+        change_intent(&conn, "sandbox", &episode);
 
-    assert!(
-        record_cleanup_episode_failure(&conn, "sandbox", episode.id, "cleanup failed").unwrap()
-    );
+        assert!(
+            record_cleanup_episode_failure(&conn, "sandbox", episode.id, "cleanup failed").unwrap(),
+            "{case}"
+        );
 
-    let row = get_sandbox(&conn, "sandbox").unwrap().unwrap();
-    assert_eq!(
-        row.state,
-        SandboxState::CleanupRequired,
-        "a row without this episode's intent must not enter cleanup_failed"
-    );
-    let episode = cleanup_episode(&conn, "sandbox").unwrap().unwrap();
-    assert_eq!(
-        episode.last_cleanup_error.as_deref(),
-        Some("cleanup failed")
-    );
-    assert_eq!(episode.attempt_count, 1);
+        let row = get_sandbox(&conn, "sandbox").unwrap().unwrap();
+        assert_eq!(row.state, expected_state, "{case}");
+        let episode = cleanup_episode(&conn, "sandbox").unwrap().unwrap();
+        assert_eq!(
+            episode.last_cleanup_error.as_deref(),
+            Some("cleanup failed"),
+            "{case}"
+        );
+        assert_eq!(episode.attempt_count, 1, "{case}");
+    }
 }
 
 #[test]
