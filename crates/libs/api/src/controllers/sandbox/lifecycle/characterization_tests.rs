@@ -237,8 +237,9 @@ async fn set_drain_phase(pool: &PgPool, node_id: NodeId, phase: &str) -> TestRes
 /// with something other than a 409.
 ///
 /// The entry guard is deliberately narrower than the completion CAS
-/// (`complete_wake_lifecycle`): `suspending` and `suspended` pass here, and a
-/// wake that races a suspend claim is resolved by the CAS deferring to it.
+/// (`complete_wake_lifecycle`): `suspending` passes here and the CAS defers
+/// to it (as it does to `suspended` on Kubernetes); on direct, `suspended` is
+/// the restore baseline the CAS advances from.
 #[tokio::test(flavor = "current_thread")]
 async fn wake_refuses_teardown_and_terminal_lifecycles_before_admission() -> TestResult {
     let db = pg_test_db_with_max_connections(3).await?;
