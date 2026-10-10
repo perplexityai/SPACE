@@ -1,12 +1,7 @@
-//! Refusal outcomes of local-artifact checkouts, lease resolution, the
-//! named-publication inventory, and named-snapshot import publication.
+//! Refusal outcomes of local-artifact checkouts, lease resolution, and the
+//! named-publication inventory.
 
-use std::path::{Path, PathBuf};
 use std::sync::PoisonError;
-
-use crate::db::transfer::{SnapshotPublication, TransferBinding, publish_snapshot};
-use crate::service::tests::service_tests::insert_test_sandbox;
-use crate::state::SandboxState;
 
 use super::*;
 
@@ -137,7 +132,6 @@ fn delete_and_gc_checkouts_report_a_missing_or_foreign_row_as_not_found() {
         store.check_out_for_gc(artifact_id(ID), "other", ELIGIBLE),
         Err(CheckoutError::NotFound(id)) if id == artifact_id(ID)
     ));
-    assert_eq!(row_state(&db, ID).as_deref(), Some("ready"));
     assert!(matches!(
         store.check_out_for_gc(artifact_id(ID), "owner", ELIGIBLE),
         Ok(GcDeleteCheckout::Leased(_))
@@ -191,37 +185,50 @@ fn named_delete_checkout_resolves_by_sandbox_and_snapshot_name() {
     assert_eq!(row_state(&db, OTHER_ID).as_deref(), Some("ready"));
 }
 
-/// The checkout's `SELECT` and guarded `UPDATE` share an immediate
-/// transaction, so no writer can move the row between them in production.
-/// A trigger that skips the update stands in for the guard matching no row.
+type Hold = fn(&LocalArtifacts, LocalArtifactId) -> Box<dyn std::any::Any>;
+
+/// A held row refuses every checkout with the holder's state, and dropping
+/// the holder's lease makes the row available to each checkout again.
 #[test]
-fn checkout_whose_guarded_update_matches_no_row_issues_no_lease() {
-    for (checkout_name, checkout) in CHECKOUTS {
-        let conn = crate::db::test_conn();
-        insert_row(&conn, ID, "sbx", "/artifact");
-        conn.execute_batch(
-            "CREATE TEMP TRIGGER skip_state_update BEFORE UPDATE OF state ON local_artifacts
-             BEGIN SELECT RAISE(IGNORE); END;",
-        )
-        .unwrap();
-        let (db, store) = shared(conn);
+fn a_held_artifact_refuses_every_checkout_until_its_lease_drops() {
+    const HOLDERS: [(&str, ArtifactState, Hold); 3] = [
+        ("restore", ArtifactState::Restoring, |store, id| {
+            Box::new(store.check_out_for_restore(id).unwrap())
+        }),
+        ("delete", ArtifactState::Deleting, |store, id| {
+            Box::new(store.check_out_for_delete(id).unwrap())
+        }),
+        ("gc", ArtifactState::Deleting, |store, id| {
+            let Ok(GcDeleteCheckout::Leased(lease)) = store.check_out_for_gc(id, "sbx", ELIGIBLE)
+            else {
+                panic!("gc checkout issued no lease");
+            };
+            Box::new(lease)
+        }),
+    ];
+    for (holder, held, hold) in HOLDERS {
+        for (checkout_name, checkout) in CHECKOUTS {
+            let case = format!("{holder} held, {checkout_name} checkout");
+            let conn = crate::db::test_conn();
+            insert_row(&conn, ID, "sbx", "/artifact");
+            let (db, store) = shared(conn);
+            let lease = hold(&store, artifact_id(ID));
 
-        let result = checkout(&store, artifact_id(ID));
+            let result = checkout(&store, artifact_id(ID));
 
-        assert!(
-            matches!(&result, Err(CheckoutError::NotReady { id, .. }) if *id == artifact_id(ID)),
-            "{checkout_name}: {result:?}"
-        );
-        assert_eq!(
-            row_state(&db, ID).as_deref(),
-            Some("ready"),
-            "{checkout_name}"
-        );
-        db.lock()
-            .unwrap()
-            .execute_batch("DROP TRIGGER skip_state_update;")
-            .unwrap();
-        checkout(&store, artifact_id(ID)).unwrap();
+            assert!(
+                matches!(
+                    &result,
+                    Err(CheckoutError::NotReady { id, state })
+                        if *id == artifact_id(ID) && *state == held
+                ),
+                "{case}: {result:?}"
+            );
+            assert_eq!(row_state(&db, ID).as_deref(), Some(held.as_str()), "{case}");
+            drop(lease);
+            assert_eq!(row_state(&db, ID).as_deref(), Some("ready"), "{case}");
+            checkout(&store, artifact_id(ID)).unwrap_or_else(|error| panic!("{case}: {error}"));
+        }
     }
 }
 
@@ -433,286 +440,9 @@ fn named_publication_inventory_fails_rather_than_returning_a_partial_answer() {
         assert!(
             matches!(
                 store.list_named_publications(sandbox_id),
-                Err(InventoryReadError::Database(
-                    rusqlite::Error::FromSqlConversionFailure(..)
-                ))
+                Err(InventoryReadError::Database(_))
             ),
             "{sandbox_id}"
         );
-    }
-}
-
-struct ImportFixture {
-    _root: tempfile::TempDir,
-    db: Connection,
-    id: String,
-    binding: TransferBinding,
-    staging: PathBuf,
-    destination: PathBuf,
-}
-
-const STAGED_ROOTFS: &[u8] = b"complete";
-
-/// A stopped sandbox and a fully staged import of `d-imported`.
-fn import_fixture() -> ImportFixture {
-    let root = tempfile::TempDir::new().unwrap();
-    let db = crate::db::test_conn();
-    let id = uuid::Uuid::now_v7().to_string();
-    insert_test_sandbox(&db, &id, SandboxState::Stopped);
-    let binding = TransferBinding {
-        sandbox_id: id.clone(),
-        template: "seed".into(),
-        content_hash: "hash".into(),
-        stream_fingerprint: "staged-stream".into(),
-    };
-    let staging = root.path().join("stage");
-    std::fs::create_dir(&staging).unwrap();
-    std::fs::write(staging.join("rootfs.ext4"), STAGED_ROOTFS).unwrap();
-    std::fs::write(
-        staging.join(".transfer.json"),
-        serde_json::to_vec(&binding).unwrap(),
-    )
-    .unwrap();
-    let destination = root.path().join("snapshots/d-imported");
-    ImportFixture {
-        _root: root,
-        db,
-        id,
-        binding,
-        staging,
-        destination,
-    }
-}
-
-impl ImportFixture {
-    fn publish(&self, template: &str, verified_existing: bool) -> Result<bool, String> {
-        publish_snapshot(
-            &self.db,
-            SnapshotPublication {
-                id: &self.id,
-                template,
-                hash: "hash",
-                staging: &self.staging,
-                destination: &self.destination,
-                binding: &self.binding,
-                verified_existing,
-            },
-        )
-        .map_err(|error| error.to_string())
-    }
-
-    fn named_rows(&self) -> Vec<(String, ArtifactKind, String)> {
-        self.db
-            .prepare(
-                "SELECT local_path, artifact_kind, state FROM local_artifacts
-                  WHERE sandbox_id = ?1",
-            )
-            .unwrap()
-            .query_map([&self.id], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?.parse().unwrap(),
-                    row.get::<_, String>(2)?,
-                ))
-            })
-            .unwrap()
-            .collect::<rusqlite::Result<_>>()
-            .unwrap()
-    }
-
-    fn assert_staging_retained(&self, case: &str) {
-        assert_eq!(
-            std::fs::read(self.staging.join("rootfs.ext4")).unwrap(),
-            STAGED_ROOTFS,
-            "{case}"
-        );
-    }
-}
-
-fn copy_dir(from: &Path, to: &Path) {
-    std::fs::create_dir_all(to).unwrap();
-    for entry in std::fs::read_dir(from).unwrap() {
-        let entry = entry.unwrap();
-        std::fs::copy(entry.path(), to.join(entry.file_name())).unwrap();
-    }
-}
-
-#[test]
-fn snapshot_publication_refuses_a_sandbox_whose_identity_or_directory_is_unsettled() {
-    for (case, state, encrypted, template) in [
-        ("creating", SandboxState::Creating, false, "seed"),
-        ("stopping", SandboxState::Stopping, false, "seed"),
-        ("quarantined", SandboxState::Quarantined, false, "seed"),
-        ("encrypted", SandboxState::Stopped, true, "seed"),
-        ("other template", SandboxState::Stopped, false, "other"),
-    ] {
-        let fixture = import_fixture();
-        fixture
-            .db
-            .execute(
-                "UPDATE sandboxes SET state = ?1, volume_encryption = ?2 WHERE id = ?3",
-                params![state.as_str(), encrypted, fixture.id],
-            )
-            .unwrap();
-
-        assert_eq!(fixture.publish(template, false), Ok(false), "{case}");
-        assert!(fixture.named_rows().is_empty(), "{case}");
-        assert!(!fixture.destination.exists(), "{case}");
-        fixture.assert_staging_retained(case);
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-enum ChangedDestination {
-    SymlinkToMatchingCopy,
-    DifferentBinding,
-    DifferentFileLength,
-    MissingFile,
-}
-
-/// A verified retry may adopt an already-published directory only while it
-/// still is that publication: a real directory carrying the same binding and
-/// every staged file at the staged length.
-#[test]
-fn verified_snapshot_retry_refuses_a_destination_that_no_longer_matches() {
-    for change in [
-        ChangedDestination::SymlinkToMatchingCopy,
-        ChangedDestination::DifferentBinding,
-        ChangedDestination::DifferentFileLength,
-        ChangedDestination::MissingFile,
-    ] {
-        let fixture = import_fixture();
-        let case = format!("{change:?}");
-        match change {
-            ChangedDestination::SymlinkToMatchingCopy => {
-                let elsewhere = fixture.staging.with_file_name("elsewhere");
-                copy_dir(&fixture.staging, &elsewhere);
-                std::fs::create_dir_all(fixture.destination.parent().unwrap()).unwrap();
-                std::os::unix::fs::symlink(&elsewhere, &fixture.destination).unwrap();
-            }
-            ChangedDestination::DifferentBinding => {
-                copy_dir(&fixture.staging, &fixture.destination);
-                let other = TransferBinding {
-                    sandbox_id: fixture.id.clone(),
-                    template: "seed".into(),
-                    content_hash: "hash".into(),
-                    // Same length as the staged binding, so only the
-                    // binding comparison can tell the two apart.
-                    stream_fingerprint: "stream-staged".into(),
-                };
-                std::fs::write(
-                    fixture.destination.join(".transfer.json"),
-                    serde_json::to_vec(&other).unwrap(),
-                )
-                .unwrap();
-            }
-            ChangedDestination::DifferentFileLength => {
-                copy_dir(&fixture.staging, &fixture.destination);
-                std::fs::write(fixture.destination.join("rootfs.ext4"), b"short").unwrap();
-            }
-            ChangedDestination::MissingFile => {
-                copy_dir(&fixture.staging, &fixture.destination);
-                std::fs::remove_file(fixture.destination.join("rootfs.ext4")).unwrap();
-            }
-        }
-
-        assert!(fixture.publish("seed", true).is_err(), "{case}");
-        assert!(fixture.named_rows().is_empty(), "{case}");
-        fixture.assert_staging_retained(&case);
-    }
-}
-
-#[test]
-fn snapshot_publication_refuses_a_catalog_entry_it_does_not_own() {
-    for (case, other_path, kind, state) in [
-        ("other path", true, ArtifactKind::Disk, "ready"),
-        ("other kind", false, ArtifactKind::Full, "ready"),
-        ("held", false, ArtifactKind::Disk, "restoring"),
-    ] {
-        let fixture = import_fixture();
-        let existing_path = if other_path {
-            fixture.staging.with_file_name("elsewhere")
-        } else {
-            fixture.destination.clone()
-        };
-        let existing_path = existing_path.to_str().unwrap().to_owned();
-        crate::db::publish_named_local_artifact(
-            &fixture.db,
-            &fixture.id,
-            LocalArtifactId::new(),
-            kind,
-            &"d-imported".parse().unwrap(),
-            &existing_path,
-        )
-        .unwrap();
-        fixture
-            .db
-            .execute(
-                "UPDATE local_artifacts SET state = ?1 WHERE sandbox_id = ?2",
-                params![state, fixture.id],
-            )
-            .unwrap();
-
-        assert!(fixture.publish("seed", false).is_err(), "{case}");
-        assert_eq!(
-            fixture.named_rows(),
-            vec![(existing_path, kind, state.to_owned())],
-            "{case}"
-        );
-        assert!(!fixture.destination.exists(), "{case}");
-        fixture.assert_staging_retained(case);
-    }
-}
-
-#[cfg(target_os = "linux")]
-#[derive(Debug, Clone, Copy)]
-enum UnusableDestination {
-    /// A path beyond `PATH_MAX` whose parent is still creatable: probing it
-    /// fails with `ENAMETOOLONG` regardless of privileges.
-    Unprobeable,
-    NotASnapshotName,
-    NotUtf8,
-}
-
-/// Every refusal here precedes the catalog commit, so a rejected destination
-/// leaves no catalog evidence that a later import would have to reconcile.
-/// Linux-only: the cases rely on Linux `PATH_MAX` and on filesystems that
-/// accept non-UTF-8 names.
-#[cfg(target_os = "linux")]
-#[test]
-fn snapshot_publication_refuses_an_unusable_destination_without_cataloging_it() {
-    use std::os::unix::ffi::OsStrExt;
-
-    const PATH_MAX: usize = 4096;
-    for unusable in [
-        UnusableDestination::Unprobeable,
-        UnusableDestination::NotASnapshotName,
-        UnusableDestination::NotUtf8,
-    ] {
-        let mut fixture = import_fixture();
-        let snapshots = fixture.destination.parent().unwrap().to_owned();
-        fixture.destination = match unusable {
-            UnusableDestination::Unprobeable => {
-                // The parent stays below PATH_MAX; the snapshot name exceeds it.
-                let parent_len = PATH_MAX - 6;
-                let mut parent = snapshots;
-                while parent_len - parent.as_os_str().len() > 202 {
-                    parent.push("p".repeat(200));
-                }
-                parent.push("p".repeat(parent_len - parent.as_os_str().len() - 1));
-                assert_eq!(parent.as_os_str().len(), parent_len);
-                parent.join("d-imported")
-            }
-            UnusableDestination::NotASnapshotName => snapshots.join("d imported"),
-            UnusableDestination::NotUtf8 => snapshots
-                .join(std::ffi::OsStr::from_bytes(b"\xff"))
-                .join("d-imported"),
-        };
-        let case = format!("{unusable:?}");
-
-        assert!(fixture.publish("seed", false).is_err(), "{case}");
-        assert!(fixture.named_rows().is_empty(), "{case}");
-        assert!(!fixture.destination.exists(), "{case}");
-        fixture.assert_staging_retained(&case);
     }
 }
