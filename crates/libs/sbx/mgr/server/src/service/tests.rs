@@ -12280,9 +12280,8 @@ pub(crate) mod service_tests {
         SandboxManagerService::new_with_options(conn, runtime_liveness_options(runtime_live))
     }
 
-    /// [`service_with_runtime_liveness`] with the host-control and
-    /// credential-manager sockets at absent paths under `sockets`, so a path
-    /// that reaches either one fails to connect instead of contacting the host.
+    /// [`service_with_runtime_liveness`] with its absent host-control and
+    /// credential-manager socket paths under the caller's `sockets` directory.
     pub(crate) fn service_with_runtime_liveness_and_absent_sockets(
         conn: rusqlite::Connection,
         runtime_live: bool,
@@ -12299,15 +12298,15 @@ pub(crate) mod service_tests {
     }
 
     /// Every field is explicit: the `Default` options read the node identity
-    /// from the host.
+    /// from the host. The host-control and credential-manager sockets sit in a
+    /// directory nothing creates, so a path that reaches either one fails to
+    /// connect instead of contacting the host's services.
     fn runtime_liveness_options(runtime_live: bool) -> SandboxManagerServiceOptions {
+        let sockets =
+            std::env::temp_dir().join(format!("space-sbx-mgr-test-{}", uuid::Uuid::now_v7()));
         SandboxManagerServiceOptions {
-            host_control_socket_path: std::path::PathBuf::from(
-                pplx_space_common_core::host::linux::paths::SANDBOX_HOST_CONTROL_SOCKET,
-            ),
-            credential_manager_socket_path: std::path::PathBuf::from(
-                pplx_space_credmgr_client::CREDMGR_SOCKET,
-            ),
+            host_control_socket_path: sockets.join("absent-host-control.sock"),
+            credential_manager_socket_path: sockets.join("absent-credential-manager.sock"),
             sandbox_runtime_live: Arc::new(move |_| runtime_live),
             shutdown_token: tokio_util::sync::CancellationToken::new(),
             task_tracker: tokio_util::task::TaskTracker::new(),
