@@ -487,7 +487,7 @@ fn pooled_create_terminal_error(error: ControllerError, claim_released: bool) ->
     }
 }
 
-fn pooled_prepare_error_is_reclaimable(error: &ControllerError) -> bool {
+pub(crate) fn pooled_prepare_error_is_reclaimable(error: &ControllerError) -> bool {
     // Ahead of the fragment match, because a lost lock race is the most
     // retryable outcome on this path and would never match it. The fragment
     // list names transport signatures ("connection reset", "transport

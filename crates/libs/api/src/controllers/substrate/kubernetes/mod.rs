@@ -1185,11 +1185,15 @@ impl KubernetesSubstrate {
 }
 
 mod adapter;
+#[cfg(test)]
+mod adapter_characterization_tests;
 mod execution;
 mod node_sync;
 mod per_sandbox_setup;
 mod pod_ops;
 mod pool;
+#[cfg(test)]
+mod scripted_test_doubles;
 mod support;
 #[cfg(test)]
 pub(crate) mod tests;

@@ -12,11 +12,14 @@ use super::*;
 use k8s_openapi::api::core::v1::PodStatus;
 
 pub(crate) use kubernetes_tests::{
-    existing_then_created_running_pod_kubernetes_client,
-    insert_ready_full_snapshot_relative_to_lifecycle, mock_kubernetes_client,
+    SequencedWakeWorker, deleted_pod_kubernetes_client,
+    existing_then_created_running_pod_kubernetes_client, insert_k8s_execution,
+    insert_ready_full_snapshot_relative_to_lifecycle, insert_test_sandbox_row,
+    mock_kubernetes_client, node_api_pod_on_node, node_with_network_slots,
     running_pod_kubernetes_client, running_pod_kubernetes_client_with_create_barrier,
-    substrate_with_inventory_caches_and_pool, substrate_with_store,
+    sandbox_pod_on_node, substrate_with_inventory_caches_and_pool, substrate_with_store,
     substrate_with_store_and_client, substrate_with_store_client_proxy_port_and_pod,
+    substrate_with_unreachable_store,
 };
 
 mod kubernetes_tests {
@@ -123,7 +126,7 @@ mod kubernetes_tests {
         }
     }
 
-    fn node_api_pod_on_node(name: &str, node_name: &str) -> Pod {
+    pub(crate) fn node_api_pod_on_node(name: &str, node_name: &str) -> Pod {
         Pod {
             metadata: kube::api::ObjectMeta {
                 name: Some(name.to_string()),
@@ -503,7 +506,7 @@ mod kubernetes_tests {
         assert!(!SandboxPodView::from(pod_with_affinity(None)).has_required_source_pin());
     }
 
-    fn node_with_network_slots(
+    pub(crate) fn node_with_network_slots(
         name: &str,
         labels: BTreeMap<String, String>,
         capacity: Option<u64>,
@@ -540,7 +543,12 @@ mod kubernetes_tests {
         })
     }
 
-    fn sandbox_pod_on_node(name: &str, node_name: &str, slots: u64, phase: &str) -> Arc<Pod> {
+    pub(crate) fn sandbox_pod_on_node(
+        name: &str,
+        node_name: &str,
+        slots: u64,
+        phase: &str,
+    ) -> Arc<Pod> {
         Arc::new(Pod {
             metadata: kube::api::ObjectMeta {
                 name: Some(name.to_string()),
@@ -1756,7 +1764,7 @@ mod kubernetes_tests {
         ClientBuilder::new(service, "space").build()
     }
 
-    fn deleted_pod_kubernetes_client(
+    pub(crate) fn deleted_pod_kubernetes_client(
         pod_name: &'static str,
         pod_uid: &'static str,
         delete_attempts: Arc<AtomicUsize>,
@@ -1830,7 +1838,7 @@ mod kubernetes_tests {
         ClientBuilder::new(service, "space").build()
     }
 
-    fn substrate_with_unreachable_store() -> KubernetesSubstrate {
+    pub(crate) fn substrate_with_unreachable_store() -> KubernetesSubstrate {
         let pool = PgPoolOptions::new()
             .max_connections(1)
             .acquire_timeout(Duration::from_millis(1))
@@ -1949,10 +1957,10 @@ mod kubernetes_tests {
             .await?)
     }
 
-    struct SequencedWakeWorker {
-        wake_attempts: Arc<AtomicUsize>,
-        succeed_after_attempt: Option<usize>,
-        echo_route_identity: bool,
+    pub(crate) struct SequencedWakeWorker {
+        pub(crate) wake_attempts: Arc<AtomicUsize>,
+        pub(crate) succeed_after_attempt: Option<usize>,
+        pub(crate) echo_route_identity: bool,
     }
 
     #[tonic::async_trait]
@@ -2152,7 +2160,7 @@ mod kubernetes_tests {
         }
     }
 
-    async fn insert_test_sandbox_row(
+    pub(crate) async fn insert_test_sandbox_row(
         pool: &PgPool,
         sandbox_id: SandboxId,
         lifecycle: &str,
@@ -12889,7 +12897,7 @@ mod kubernetes_tests {
     /// Insert one `sandbox_k8s_executions` row. The fenced-retire tests differ
     /// only in these six values, so they share this rather than each carrying
     /// its own copy of the INSERT.
-    async fn insert_k8s_execution(
+    pub(crate) async fn insert_k8s_execution(
         pool: &PgPool,
         sandbox_id: SandboxId,
         generation: i64,
