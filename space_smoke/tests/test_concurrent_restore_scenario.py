@@ -11,7 +11,9 @@ draining, or raising rather than reading a listing failure as "no pod ran".
 
 from __future__ import annotations
 
+import json
 import unittest
+from unittest import mock
 
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -23,7 +25,7 @@ from space_smoke.concurrent_restore import RunningPodWatch
 from space_smoke.runtime import CommandResult
 
 
-class _ScriptedKubectl:  # only its refusal path is reached: no kubectl call is scripted
+class _ScriptedKubectl:  # replays scripted kubectl results in call order
     def __init__(self, results) -> None:
         self.results = list(results)
         self.calls: list[tuple[str, ...]] = []
@@ -81,6 +83,55 @@ class PodDeletionGuard(unittest.TestCase):
             harness.delete_sandbox_pod("space-sandbox-manager-abcde")
 
 
+
+
+def _ok(stdout: str) -> CommandResult:
+    return CommandResult(command=("kubectl",), returncode=0, stdout=stdout, stderr="")
+
+
+def _api_pods(*names: str, terminating: tuple[str, ...] = ()) -> CommandResult:
+    items = [
+        {"metadata": {"name": name, **({"deletionTimestamp": "t"} if name in terminating else {})}}
+        for name in names
+    ]
+    return _ok(json.dumps({"items": items}))
+
+
+class PublicApiScaleDownDrain(unittest.TestCase):
+    """`rollout status` returns on a scale-down while surplus pods still exit.
+
+    A localhost forward pinned to one of them drops when it does, so the
+    scale-back compensation must not return until only the desired pods remain.
+    """
+
+    _DEPLOYMENT = json.dumps(
+        {"spec": {"replicas": 1, "selector": {"matchLabels": {"app.kubernetes.io/name": "space-api"}}}}
+    )
+
+    def test_waits_until_terminating_pods_are_gone(self) -> None:
+        kubectl = _ScriptedKubectl(
+            [
+                _ok("space-api"),
+                _ok(self._DEPLOYMENT),
+                _api_pods("a", "b", "c", terminating=("b", "c")),
+                _api_pods("a", "b", terminating=("b",)),
+                _api_pods("a"),
+            ]
+        )
+        harness = KindHarness(kubectl, KindConfig())
+        with mock.patch("space_smoke.adapters.time.sleep") as sleep:
+            harness.wait_public_api_pods_drained(timeout=60)
+        self.assertEqual(sleep.call_count, 2)
+        self.assertEqual(kubectl.results, [])
+        self.assertIn("app.kubernetes.io/name=space-api", kubectl.calls[-1])
+
+    def test_raises_when_a_pod_is_still_terminating_at_the_deadline(self) -> None:
+        kubectl = _ScriptedKubectl(
+            [_ok("space-api"), _ok(self._DEPLOYMENT), _api_pods("a", "b", terminating=("b",))]
+        )
+        harness = KindHarness(kubectl, KindConfig())
+        with self.assertRaisesRegex(RuntimeError, "did not drain"):
+            harness.wait_public_api_pods_drained(timeout=0)
 
 
 def _pod(name: str, phase: str) -> SandboxPodView:

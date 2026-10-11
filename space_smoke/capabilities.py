@@ -1488,6 +1488,14 @@ class ConcurrentRestoreControl(Protocol):
         """Block until the public API Deployment's rollout is complete."""
         ...
 
+    def wait_public_api_pods_drained(self, *, timeout: float) -> None:
+        """Block until only the desired public API pods exist and none is Terminating."""
+        ...
+
+    def wait_public_api_ready(self, *, timeout: float) -> None:
+        """Block until the public API answers `/readyz` on the smoke's API URL."""
+        ...
+
     def pin_namespace_pod_count(self) -> int:
         """Create a ResourceQuota capping `pods` at the namespace's current usage.
 

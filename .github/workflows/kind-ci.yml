@@ -305,6 +305,11 @@ jobs:
             k 30s -n space logs "$pod" --all-containers --prefix --tail=100 || true
             echo "::endgroup::"
           done
+          # The smoke reaches the cluster through Tilt's localhost
+          # port-forwards, each pinned to one pod. Their status shows which
+          # pod a forward targeted and when it last dropped, which explains a
+          # localhost connection refusal.
+          timeout 30s tilt get portforwards -o yaml || true
 
       # A sandbox pod stuck Terminating is held on its node: the kubelet's
       # StopPodSandbox runs through containerd into the SPACE shim, which waits

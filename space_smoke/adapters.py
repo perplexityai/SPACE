@@ -2619,6 +2619,48 @@ ON CONFLICT (key_hash) DO NOTHING;
             f"await rollout of {name}",
         )
 
+    def wait_public_api_pods_drained(self, *, timeout: float) -> None:
+        """Block until only the Deployment's desired API pods exist, none Terminating.
+
+        `kubectl rollout status` completes a scale-down once the available
+        count matches the spec, while the surplus pods are still shutting
+        down. A localhost port-forward pinned to one of them (Tilt forwards
+        to the newest pod, the first a scale-down removes) drops when it
+        exits, so callers that need the route must wait for the drain too.
+        """
+
+        name = self._public_api_deployment()
+        deployment = json.loads(
+            _require_ok(
+                self.kubectl("get", "deploy", name, "-o", "json", timeout=15),
+                f"read {name}",
+            )
+        )
+        desired = int(deployment["spec"].get("replicas", 1))
+        match_labels = deployment["spec"]["selector"].get("matchLabels") or {}
+        if not match_labels:
+            raise SmokeConfigurationError(f"{name} has no matchLabels selector to list its pods by")
+        selector = ",".join(f"{key}={value}" for key, value in sorted(match_labels.items()))
+        deadline = time.monotonic() + timeout
+        while True:
+            pods = json.loads(
+                _require_ok(
+                    self.kubectl("get", "pods", "-l", selector, "-o", "json", timeout=15),
+                    f"list {name} pods",
+                )
+            ).get("items", [])
+            terminating = [
+                pod["metadata"]["name"] for pod in pods if pod["metadata"].get("deletionTimestamp")
+            ]
+            if not terminating and len(pods) == desired:
+                return
+            if time.monotonic() > deadline:
+                raise RuntimeError(
+                    f"{name} pods did not drain to {desired} within {timeout:g}s "
+                    f"(present={len(pods)}, terminating={terminating})"
+                )
+            time.sleep(1)
+
     # --- node groups ----------------------------------------------------------
 
     def set_native_operation_probe_budgets(self, expected: list[dict], desired: list[dict], *, expected_uid: str, remove: bool = False) -> None:
