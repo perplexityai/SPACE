@@ -1171,3 +1171,35 @@ fn ready_backup_returns_before_the_retained_source_is_inspected() {
     });
     drop(runtime);
 }
+
+/// The capture host CPU recorded in the artifact's metadata is what the cluster
+/// API persists for restore placement, so the Begin request must carry it
+/// verbatim, and carry nothing when the capture host was unknown.
+#[test]
+fn begin_request_carries_the_recorded_capture_host_cpu() {
+    use pplx_space_common_core::types::{
+        Arch, ArtifactKind, ArtifactOrigin, ExecutionMetadata, HostCpu, SnapshotExecutionMetadata,
+    };
+
+    let execution = SnapshotExecutionMetadata::new(ExecutionMetadata::initial_firecracker(
+        Arch::X86_64,
+        vec![],
+    ))
+    .unwrap();
+    for host_cpu in [None, Some("genuineintel-6-85-7")] {
+        let execution = execution
+            .clone()
+            .with_host_cpu(host_cpu.map(|value| HostCpu::parse(value).unwrap()));
+        let request = begin_artifact_backup_request(&BeginArtifactBackup {
+            sandbox_id: "01939e3e-eeee-7000-8000-000000000030",
+            local_artifact_id: "01939e3e-eeee-7000-8000-000000000031",
+            artifact_kind: ArtifactKind::Full,
+            artifact_origin: ArtifactOrigin::Suspend,
+            snapshot_name: None,
+            backup_attempt_id: "01939e3e-eeee-7000-8000-000000000032",
+            storage_uri: "s3://space-test/suspend-snapshots/attempt?region=us-east-1",
+            execution: &execution,
+        });
+        assert_eq!(request.capture_host_cpu.as_deref(), host_cpu);
+    }
+}

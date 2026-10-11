@@ -3,6 +3,7 @@ use pplx_space_common_core::kubernetes::SPACE_K8S_NODE_NAME_ENV;
 use pplx_space_node_mgr_client::NodeResourceStatusReader;
 use tokio_util::sync::CancellationToken;
 
+mod host_cpu;
 mod network_slots;
 mod node_watch;
 mod ssd_headroom_tier;
@@ -117,6 +118,15 @@ impl Controller {
             &self.node_name,
         )
         .await
+    }
+
+    pub async fn reconcile_host_cpu(&mut self) -> Result<(), host_cpu::HostCpuReconcileError> {
+        if self.node_cache.metadata().is_none() {
+            tracing::debug!(node_name = %self.node_name, "Kubernetes Node metadata cache is not ready; skipping host-cpu reconcile");
+            return Ok(());
+        }
+
+        host_cpu::reconcile_host_cpu(&self.kube, &self.node_cache, &self.node_name).await
     }
 
     pub async fn reconcile_ssd_headroom_tier(

@@ -144,8 +144,8 @@ mod published_state;
 pub use published_state::publish_sandbox_states;
 mod sandbox_quarantine_store;
 use published_state::{
-    project_ready_suspend_snapshot, prune_absent_node_templates, publish_execution_inventory,
-    publish_template_states, snapshot_execution_metadata,
+    capture_host_cpu, project_ready_suspend_snapshot, prune_absent_node_templates,
+    publish_execution_inventory, publish_template_states, snapshot_execution_metadata,
 };
 
 const SUPPORTED_TEMPLATE_RUNTIMES: &[RuntimeKind] = &[RuntimeKind::Firecracker];
@@ -911,7 +911,12 @@ impl ClusterApiService {
                  prefix the node uploads under"
             )));
         }
-        let execution_metadata = snapshot_execution_metadata(req.execution.as_ref())?;
+        let execution_metadata = snapshot_execution_metadata(req.execution.as_ref())?
+            .with_host_cpu(capture_host_cpu(
+                req.capture_host_cpu.as_deref(),
+                artifact_kind,
+                sandbox_id,
+            ));
         let sandbox = self.lookup_snapshot_sandbox(sandbox_id).await?;
         let snapshot = sandbox
             .new_snapshot(

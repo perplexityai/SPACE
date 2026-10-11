@@ -1151,7 +1151,14 @@ fn same_snapshot_identity(persisted: &SnapshotRecord, expected: &NewSnapshot) ->
         && persisted.kind() == expected.kind
         && persisted.org_id() == Some(expected.org_id)
         && persisted.artifact() == expected.artifact.as_ref()
-        && persisted.execution_metadata() == expected.execution_metadata.as_ref()
+        && match (
+            persisted.execution_metadata(),
+            expected.execution_metadata.as_ref(),
+        ) {
+            (Some(persisted), Some(expected)) => persisted.same_artifact_identity(expected),
+            (None, None) => true,
+            _ => false,
+        }
 }
 
 #[cfg(test)]

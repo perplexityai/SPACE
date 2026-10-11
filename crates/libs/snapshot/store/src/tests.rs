@@ -7,7 +7,7 @@ use jiff::Timestamp;
 use pplx_space_common_core::sql;
 use pplx_space_common_core::types::{
     Arch, ArtifactKind, ArtifactOrigin, Digest, ExactStorageUri, ExecutionGeneration,
-    ExecutionMetadata, LocalArtifactId, NodeId, OrgId, SandboxId,
+    ExecutionMetadata, HostCpu, LocalArtifactId, NodeId, OrgId, SandboxId,
     SnapshotArtifact as SnapshotArtifactFile, SnapshotContentHash, SnapshotExecutionMetadata,
     SnapshotId, SnapshotKind, SnapshotName, SnapshotState, TemplateArtifactDigest, TemplateName,
 };
@@ -213,6 +213,25 @@ async fn snapshot_catalog_store_contract() -> TestResult {
     let retried = insert(&mut retry_tx, &snapshot).await?;
     assert_eq!(retried, inserted);
     retry_tx.commit().await?;
+
+    // A replay that now carries the capture host CPU (the first registration
+    // went through a cluster API that dropped it) is the same attempt, and the
+    // persisted row is returned unchanged.
+    assert_eq!(
+        inserted
+            .execution_metadata()
+            .and_then(SnapshotExecutionMetadata::host_cpu),
+        None
+    );
+    let replay_with_host_cpu = make_snapshot(expected_uri.clone()).with_execution_metadata(
+        inserted_execution_metadata
+            .clone()
+            .with_host_cpu(Some(HostCpu::parse("genuineintel-6-85-7")?)),
+    );
+    let mut host_cpu_retry_tx = db.pool.begin().await?;
+    let retried = insert(&mut host_cpu_retry_tx, &replay_with_host_cpu).await?;
+    assert_eq!(retried, inserted);
+    host_cpu_retry_tx.commit().await?;
 
     let mut location_conflict_tx = db.pool.begin().await?;
     let error = insert(

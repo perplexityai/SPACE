@@ -4851,6 +4851,7 @@ async fn begin_artifact_backup_from_node(
                 artifact_origin: artifact_origin as i32,
                 snapshot_name: None,
                 execution: Some(test_snapshot_execution()),
+                capture_host_cpu: None,
             },
             node_ip,
         ))
@@ -4883,6 +4884,7 @@ async fn begin_artifact_backup_with_storage_uri(
                 artifact_origin: input.artifact_origin as i32,
                 snapshot_name: input.snapshot_name,
                 execution: Some(test_snapshot_execution()),
+                capture_host_cpu: None,
             },
             TEST_WORKER_IP,
         ))
@@ -5673,6 +5675,7 @@ async fn begin_artifact_backup_rejects_missing_execution_metadata() -> TestResul
             artifact_origin: pplx_space_sbx_mgr_client::proto::ArtifactOrigin::Stop as i32,
             snapshot_name: None,
             execution: None,
+            capture_host_cpu: None,
         }))
         .await
         .expect_err("begin without execution metadata must be rejected");
@@ -5683,6 +5686,90 @@ async fn begin_artifact_backup_rejects_missing_execution_metadata() -> TestResul
         .fetch_one(&fixture.service.pool)
         .await?;
     assert_eq!(inserted, 0, "rejected begin must not insert a snapshot row");
+    Ok(())
+}
+
+/// The begin handler carries the request's capture host CPU into the
+/// persisted `execution_metadata`, where restore placement is meant to read
+/// it. A value that couldn't be a node label is recorded as unknown, and the
+/// backup itself still succeeds.
+#[tokio::test(flavor = "current_thread")]
+async fn begin_artifact_backup_persists_capture_host_cpu() -> TestResult {
+    let Some(fixture) = cluster_fixture().await? else {
+        return Ok(());
+    };
+    let sandbox_id = seed_sandbox(&fixture.service.pool).await?;
+    let begin_kind = |backup_attempt_id: SnapshotId,
+                      artifact_kind: pplx_space_sbx_mgr_client::proto::ArtifactKind,
+                      artifact_origin: pplx_space_sbx_mgr_client::proto::ArtifactOrigin,
+                      capture_host_cpu: Option<&str>| {
+        fixture.service.begin_artifact_backup(request_from_node(
+            BeginArtifactBackupRequest {
+                sandbox_id: sandbox_id.to_string(),
+                local_artifact_id: LocalArtifactId::new().to_string(),
+                artifact_kind: artifact_kind as i32,
+                backup_attempt_id: backup_attempt_id.to_string(),
+                storage_uri: test_storage_uri(sandbox_id, backup_attempt_id),
+                artifact_origin: artifact_origin as i32,
+                snapshot_name: None,
+                execution: Some(test_snapshot_execution()),
+                capture_host_cpu: capture_host_cpu.map(str::to_owned),
+            },
+            TEST_WORKER_IP,
+        ))
+    };
+    let begin = |backup_attempt_id: SnapshotId, capture_host_cpu: Option<&str>| {
+        begin_kind(
+            backup_attempt_id,
+            pplx_space_sbx_mgr_client::proto::ArtifactKind::Full,
+            pplx_space_sbx_mgr_client::proto::ArtifactOrigin::Suspend,
+            capture_host_cpu,
+        )
+    };
+    let recorded_host_cpu = |backup_attempt_id: SnapshotId| {
+        sqlx::query_scalar::<_, Option<String>>(sql!(
+            "SELECT execution_metadata->>'host_cpu' FROM snapshots WHERE id = $1"
+        ))
+        .bind(backup_attempt_id)
+        .fetch_optional(&fixture.service.pool)
+    };
+
+    let recorded = SnapshotId::new();
+    begin(recorded, Some("genuineintel-6-85-7")).await?;
+    assert_eq!(
+        recorded_host_cpu(recorded).await?,
+        Some(Some("genuineintel-6-85-7".to_string()))
+    );
+
+    let padded = SnapshotId::new();
+    begin(padded, Some(" GenuineIntel-6-85-7\n")).await?;
+    assert_eq!(
+        recorded_host_cpu(padded).await?,
+        Some(Some("genuineintel-6-85-7".to_string()))
+    );
+
+    let unknown = SnapshotId::new();
+    begin(unknown, None).await?;
+    assert_eq!(recorded_host_cpu(unknown).await?, Some(None));
+
+    let empty = SnapshotId::new();
+    begin(empty, Some("  ")).await?;
+    assert_eq!(recorded_host_cpu(empty).await?, Some(None));
+
+    let invalid = SnapshotId::new();
+    begin(invalid, Some("Intel(R) Xeon(R) Platinum 8259CL")).await?;
+    assert_eq!(recorded_host_cpu(invalid).await?, Some(None));
+
+    // A disk artifact holds no vCPU state, so a sender's CPU isn't recorded.
+    let disk = SnapshotId::new();
+    begin_kind(
+        disk,
+        pplx_space_sbx_mgr_client::proto::ArtifactKind::Disk,
+        pplx_space_sbx_mgr_client::proto::ArtifactOrigin::Stop,
+        Some("genuineintel-6-85-7"),
+    )
+    .await?;
+    assert_eq!(recorded_host_cpu(disk).await?, Some(None));
     Ok(())
 }
 

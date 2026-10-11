@@ -1042,6 +1042,10 @@ message BeginArtifactBackupRequest {
   // Exact source environment encoded in the artifact metadata sidecar.
   // Required: the server rejects a request without it as INVALID_ARGUMENT.
   space.execution.v1.ExecutionMetadata execution = 8;
+  // CPU identity of the host that captured the artifact's VM state, as a
+  // Kubernetes label value. Absent when unknown. The cluster API records it
+  // in the snapshot's execution metadata as restore-placement evidence.
+  optional string capture_host_cpu = 9;
 }
 
 message BeginArtifactBackupResponse {

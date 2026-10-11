@@ -36,9 +36,10 @@ nodeFence:
   validationActions:
     - Deny
   allowedLabelKeys:
-    # SSD_HEADROOM_TIER_LABEL, SSD_PLACEMENT_BLOCKED_LABEL
+    # SSD_HEADROOM_TIER_LABEL, SSD_PLACEMENT_BLOCKED_LABEL, HOST_CPU_LABEL
     - space.pplx.net/ssd-headroom-tier
     - space.pplx.net/ssd-placement-blocked
+    - space.pplx.net/host-cpu
   allowedLabelKeyPrefixes:
     # TEMPLATE_BUILD_LABEL_KEY_PREFIX: one key per ready local template build.
     - space.pplx.net/template-build-

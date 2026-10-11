@@ -1085,7 +1085,20 @@ pub(crate) async fn begin_with_cluster_api(
         .await
         .map_err(BeginArtifactBackupError::Connect)?;
 
-    let req = pplx_space_node_api_client::proto::BeginArtifactBackupRequest {
+    client
+        .begin_artifact_backup(begin_artifact_backup_request(&request))
+        .await
+        .map(|_| ())
+        .map_err(|status| BeginArtifactBackupError::BeginArtifactBackup {
+            code: status.code(),
+            message: status.message().to_string(),
+        })
+}
+
+fn begin_artifact_backup_request(
+    request: &BeginArtifactBackup<'_>,
+) -> pplx_space_node_api_client::proto::BeginArtifactBackupRequest {
+    pplx_space_node_api_client::proto::BeginArtifactBackupRequest {
         sandbox_id: request.sandbox_id.to_string(),
         local_artifact_id: request.local_artifact_id.to_string(),
         artifact_kind: match request.artifact_kind {
@@ -1114,16 +1127,11 @@ pub(crate) async fn begin_with_cluster_api(
         },
         snapshot_name: request.snapshot_name.map(str::to_owned),
         execution: Some(request.execution.execution().into()),
-    };
-
-    client
-        .begin_artifact_backup(req)
-        .await
-        .map(|_| ())
-        .map_err(|status| BeginArtifactBackupError::BeginArtifactBackup {
-            code: status.code(),
-            message: status.message().to_string(),
-        })
+        capture_host_cpu: request
+            .execution
+            .host_cpu()
+            .map(|host_cpu| host_cpu.as_str().to_owned()),
+    }
 }
 
 /// Flip the backup row to `state='ready'`. This is the terminal step of the

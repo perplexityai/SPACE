@@ -593,6 +593,45 @@ pub(crate) fn snapshot_execution_metadata(
         .map_err(|error| Status::invalid_argument(error.to_string()))
 }
 
+/// Longest prefix of an invalid capture host CPU that reaches the log. The
+/// value is node-supplied and the begin request isn't authorized yet when it's
+/// parsed, so the log carries a bounded prefix, not the whole string.
+const MAX_LOGGED_CAPTURE_HOST_CPU_BYTES: usize = 64;
+
+/// Parses the capture host CPU of an artifact backup. The CPU is placement
+/// evidence, not part of the snapshot's identity, so a value that isn't a valid
+/// label is recorded as unknown rather than failing the backup it rides on.
+/// An empty value means unknown too, and isn't worth a warning. A disk artifact
+/// holds no vCPU state, so it has no capture CPU whatever the sender says.
+pub(crate) fn capture_host_cpu(
+    raw: Option<&str>,
+    artifact_kind: ArtifactKind,
+    sandbox_id: SandboxId,
+) -> Option<pplx_space_common_core::types::HostCpu> {
+    if artifact_kind == ArtifactKind::Disk {
+        return None;
+    }
+    let raw = raw?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    pplx_space_common_core::types::HostCpu::parse(raw)
+        .inspect_err(|error| {
+            let logged = pplx_space_common_svc::truncate_utf8_for_log(
+                raw,
+                MAX_LOGGED_CAPTURE_HOST_CPU_BYTES,
+            );
+            tracing::warn!(
+                %sandbox_id,
+                capture_host_cpu = ?logged.value,
+                truncated = logged.truncated,
+                %error,
+                "ignoring invalid capture host CPU on artifact backup"
+            );
+        })
+        .ok()
+}
+
 pub async fn publish_execution_inventory(
     conn: &mut sqlx::PgConnection,
     node_id: NodeId,

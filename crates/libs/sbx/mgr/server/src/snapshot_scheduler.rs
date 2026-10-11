@@ -132,6 +132,19 @@ fn write_snapshot_sidecar(
     }
 }
 
+/// The execution metadata a checkpoint records in its `runtime.json`,
+/// scheduled or requested. It's built on the host that just took the
+/// checkpoint, so this host's CPU is the checkpoint's capture CPU. It stays
+/// in the local sidecar: an artifact backup builds its metadata from
+/// `snapshot.json`, not `runtime.json`.
+fn checkpoint_sidecar_execution_metadata(
+    metadata: SandboxArtifactMetadata,
+) -> Result<SnapshotExecutionMetadata, pplx_space_common_core::types::ExecutionMetadataError> {
+    Ok(SnapshotExecutionMetadata::new(metadata.execution)?
+        .with_cpu_budget(metadata.cpu_budget)
+        .with_host_cpu(pplx_space_common_core::types::HostCpu::current().cloned()))
+}
+
 fn write_snapshot_execution_sidecar(snapshot_dir: &str, sandbox_id: &str, snapshot_name: &str) {
     let sandbox_metadata_path =
         pplx_space_common_core::host::linux::paths::sandbox_metadata_path(sandbox_id);
@@ -161,8 +174,8 @@ fn write_snapshot_execution_sidecar(snapshot_dir: &str, sandbox_id: &str, snapsh
             return;
         }
     };
-    let execution = match SnapshotExecutionMetadata::new(metadata.execution) {
-        Ok(execution) => execution.with_cpu_budget(metadata.cpu_budget),
+    let execution = match checkpoint_sidecar_execution_metadata(metadata) {
+        Ok(execution) => execution,
         Err(error) => {
             tracing::warn!(
                 sandbox_id,

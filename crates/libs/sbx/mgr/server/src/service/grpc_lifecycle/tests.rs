@@ -2,6 +2,10 @@ use pplx_space_common_core::types::JobId;
 
 use tonic::Status;
 
+use super::backup_submission::{
+    artifact_backup_execution, captured_suspend_snapshot_metadata, suspend_artifact_metadata,
+    suspend_snapshot_metadata,
+};
 use super::{
     ArtifactBackupSubmissionError, OrgSnapshotConfigResolution, SuspendRequestContext,
     artifact_backup_format, artifact_backup_lookup_error, current_instance_backup_precondition,
@@ -15,7 +19,7 @@ use crate::service::SandboxManagerService;
 use crate::service::suspend_snapshot_publication::write_full_suspend_artifact;
 use crate::state::SandboxState;
 use pplx_space_common_core::types::{
-    AutoLifecyclePolicy, LocalArtifactId, SandboxId, SandboxOwner, SandboxRuntimeLabel,
+    AutoLifecyclePolicy, HostCpu, LocalArtifactId, SandboxId, SandboxOwner, SandboxRuntimeLabel,
 };
 use pplx_space_events::SandboxEventTrigger;
 use pplx_space_node_runtime_core::fc_api::FirecrackerVmState;
@@ -753,6 +757,88 @@ fn insert_suspended_test_sandbox(conn: &rusqlite::Connection, sandbox_id: &str) 
         },
     )
     .unwrap();
+}
+
+/// A suspend this host captured records this host's CPU; metadata rebuilt for
+/// an artifact whose sidecar is missing records none, because the host
+/// rebuilding it may not be the one that captured it. Non-Linux hosts report
+/// no CPU, so the first comparison is only meaningful on Linux, where an
+/// unidentified CPU fails the test rather than letting it compare `None`
+/// with `None`.
+#[test]
+fn only_a_captured_suspend_records_this_hosts_cpu() {
+    #[cfg(target_os = "linux")]
+    assert!(
+        HostCpu::current().is_some(),
+        "this Linux host's CPU is unidentified"
+    );
+    let conn = crate::db::test_conn();
+    let sandbox_id = SandboxId::new().to_string();
+    insert_suspended_test_sandbox(&conn, &sandbox_id);
+    let row = crate::db::get_sandbox(&conn, &sandbox_id).unwrap().unwrap();
+
+    for format in [
+        SuspendSnapshotFormat::Full,
+        SuspendSnapshotFormat::BtrfsSend,
+    ] {
+        let host_cpu = |metadata: crate::snapshot_upload::SnapshotMeta| {
+            metadata
+                .execution
+                .and_then(|execution| execution.host_cpu().cloned())
+        };
+        assert_eq!(
+            host_cpu(captured_suspend_snapshot_metadata(&row, format).unwrap()),
+            HostCpu::current().cloned(),
+            "{format:?}"
+        );
+        for encrypted in [false, true] {
+            assert_eq!(
+                host_cpu(
+                    suspend_artifact_metadata(
+                        &row,
+                        format,
+                        LocalArtifactId::new(),
+                        encrypted,
+                        None
+                    )
+                    .unwrap()
+                ),
+                HostCpu::current().cloned(),
+                "{format:?}, encrypted: {encrypted}"
+            );
+        }
+        assert_eq!(
+            host_cpu(suspend_snapshot_metadata(&row, format).unwrap()),
+            None,
+            "{format:?}"
+        );
+    }
+}
+
+/// A disk artifact's backup reaches the cluster API without a capture CPU,
+/// whatever its metadata says; a full artifact keeps the CPU it recorded.
+#[test]
+fn artifact_backup_execution_keeps_a_capture_cpu_only_for_full_artifacts() {
+    use pplx_space_common_core::types::{
+        Arch, ArtifactKind, ExecutionMetadata, SnapshotExecutionMetadata,
+    };
+
+    let host_cpu = HostCpu::parse("genuineintel-6-85-7").unwrap();
+    let execution = SnapshotExecutionMetadata::new(ExecutionMetadata::initial_firecracker(
+        Arch::X86_64,
+        vec![],
+    ))
+    .unwrap()
+    .with_host_cpu(Some(host_cpu.clone()));
+
+    assert_eq!(
+        artifact_backup_execution(execution.clone(), ArtifactKind::Full).host_cpu(),
+        Some(&host_cpu)
+    );
+    assert_eq!(
+        artifact_backup_execution(execution, ArtifactKind::Disk).host_cpu(),
+        None
+    );
 }
 
 #[test]

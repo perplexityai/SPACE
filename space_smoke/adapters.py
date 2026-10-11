@@ -3366,9 +3366,7 @@ ON CONFLICT (key_hash) DO NOTHING;
     def apply_as(
         self, kubeconfig: str, manifest: str, *, field_manager: str, subresource: str | None = None
     ) -> SaWriteOutcome:
-        args = ["apply", "--server-side", "--force-conflicts", f"--field-manager={_field_manager(field_manager)}", "-f", "-"]
-        if subresource:
-            args.insert(3, f"--subresource={_subresource(subresource)}")
+        args = _server_side_apply_args(field_manager, subresource)
         result = self._as_sa(kubeconfig, *args, input_text=manifest)
         return SaWriteOutcome(result.returncode, (result.stdout + result.stderr).strip())
 
@@ -3385,6 +3383,13 @@ ON CONFLICT (key_hash) DO NOTHING;
         result = self.kubectl("annotate", "node", _kube_node_name(node_name), assignment, "--overwrite", timeout=30)
         if result.returncode != 0 and not (value is None and "not found" in result.stderr):
             raise RuntimeError(f"annotate node {node_name} {assignment}: {result.detail()}")
+
+    def admin_apply_node(self, node_name: str, manifest: str, *, field_manager: str) -> None:
+        self._require_isolated_kind("admin node apply")
+        _require_ok(
+            self.kubectl(*_server_side_apply_args(field_manager), input_text=manifest, timeout=30),
+            f"apply node {node_name} as {field_manager}",
+        )
 
     def admin_patch_node(self, node_name: str, patch: Mapping[str, object], *, subresource: str | None = None) -> None:
         self._require_isolated_kind("admin node patch")
@@ -3423,6 +3428,17 @@ ON CONFLICT (key_hash) DO NOTHING;
         for key in (nf.BOUNDARY_LABEL, nf.CRED_AUTHORITY_POOL_LABEL, nf.OWNED_LABEL, nf.BLOCKED_LABEL):
             self.admin_label_node(node, key, snap_labels.get(key))
         live_meta = live.get("metadata") or {}
+        # Keyed on the probe value, not on drift, and applied under node-ctl's
+        # field manager: a `kubectl label` would take the key away from that
+        # manager, and node-ctl's unknown-CPU apply could then no longer
+        # remove it.
+        if (live_meta.get("labels") or {}).get(nf.HOST_CPU_LABEL) == nf.PROBE_HOST_CPU:  # type: ignore[union-attr]
+            repairs.append("restoring the host-cpu label")
+            self.admin_apply_node(
+                node,
+                nf.host_cpu_manifest(node, snap_labels.get(nf.HOST_CPU_LABEL)),
+                field_manager=nf.HOST_CPU_FIELD_MANAGER,
+            )
         for key in sorted(set(live_meta.get("labels") or {}) | set(live_meta.get("annotations") or {})):
             if nf.PROBE_KEY_MARKER in key:
                 repairs.append(f"removing probe key {key}")
@@ -5573,6 +5589,13 @@ def _subresource(value: str) -> str:
     if value not in {"status"}:
         raise ValueError(f"refusing subresource {value!r}")
     return value
+
+
+def _server_side_apply_args(field_manager: str, subresource: str | None = None) -> list[str]:
+    args = ["apply", "--server-side", "--force-conflicts", f"--field-manager={_field_manager(field_manager)}", "-f", "-"]
+    if subresource:
+        args.insert(3, f"--subresource={_subresource(subresource)}")
+    return args
 
 
 def _field_manager(value: str) -> str:

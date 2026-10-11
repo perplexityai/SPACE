@@ -102,6 +102,15 @@ pub const MAX_SANDBOX_NETWORK_POLICY_ANNOTATION_BYTES: usize = 128 * 1024;
 /// request and limit are both `1` and the resource is never overcommitted.
 pub const SANDBOX_NETWORK_SLOTS_RESOURCE: &str = "space.pplx.net/network-slots";
 
+/// Node label carrying the node's [`HostCpu`](crate::types::HostCpu) identity,
+/// published by the node-local controller from `/proc/cpuinfo`.
+///
+/// It's the same derivation the sandbox manager records as a suspend
+/// snapshot's capture CPU, so a snapshot's recorded value can be compared with
+/// the label of any node that might load it. A node whose CPU can't be
+/// identified carries no label.
+pub const HOST_CPU_LABEL: &str = "space.pplx.net/host-cpu";
+
 /// Node label carrying the bucketed SSD-headroom signal for sandbox placement.
 ///
 /// Coarse `/space/cache` headroom tier `0..=3`, keyed off disk *usage* (see

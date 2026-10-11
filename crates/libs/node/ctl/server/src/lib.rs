@@ -1261,9 +1261,10 @@ impl NodeCtlWorker {
             return;
         }
         // The node-local Kubernetes object reconciles (template-presence node
-        // metadata and network-slot status capacity) share this cadence: the
-        // template-inventory facet is pushed on every periodic outbound tick,
-        // so gating on it runs both reconciles each tick and self-heals drift.
+        // metadata, network-slot status capacity, the SSD placement labels, and
+        // the host-CPU label) share this cadence: the template-inventory facet
+        // is pushed on every periodic outbound tick, so gating on it runs each
+        // of these reconciles every tick and self-heals drift.
         #[cfg(feature = "kubernetes")]
         if batch.facets().any(|(facet_name, _)| {
             facets::FacetKind::parse(facet_name) == Some(facets::FacetKind::TemplateInventory)
@@ -1277,6 +1278,9 @@ impl NodeCtlWorker {
             }
             if let Err(error) = controller.reconcile_ssd_headroom_tier().await {
                 tracing::warn!(%error, "local Kubernetes ssd-headroom-tier reconcile failed");
+            }
+            if let Err(error) = controller.reconcile_host_cpu().await {
+                tracing::warn!(%error, "local Kubernetes host-cpu reconcile failed");
             }
         }
 
