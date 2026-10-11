@@ -90,14 +90,13 @@ impl SubstrateAdapter for KubernetesSubstrate {
         //
         // Ahead of `begin_activation_execution_row`, and that ordering is the
         // point: this is the one create-path step that can fail on catalog
-        // state rather than on Kubernetes, and every failure exit *after* the
-        // activation row has to retire pod tracking and book an
-        // `execution_create` step error. A `?` here would do neither, leaving
-        // tracking bound on an attempt that never reached a pod and dropping
-        // the create out of the step funnel entirely. Resolving first means the
-        // failure happens while there is still nothing to unwind — and it also
-        // keeps the database read out of the `execution_create` latency, which
-        // measures the Kubernetes create.
+        // state rather than on Kubernetes, and resolving it first means the
+        // failure happens while there is still nothing to unwind — no claim for
+        // the guard below to give back. It also keeps the database read out of
+        // the `execution_create` latency, which measures the Kubernetes create.
+        // Of the exits after the claim, only the pod-create failure books an
+        // `execution_create` step error; the guard's early-failure arm releases
+        // the claim and books none.
         //
         // Everything it needs is in hand at function entry, so the hoist costs
         // nothing.
@@ -197,6 +196,9 @@ impl SubstrateAdapter for KubernetesSubstrate {
             }
             Err(error) => return Err(error),
         };
+        // Unreachable: the claim above always assigns an attempt. Without one
+        // there is no attempt to fence a release on, so this exit would leave
+        // the claim to reconciliation, like the unguarded window below.
         let activation_attempt_id =
             execution
                 .activation_attempt_id
@@ -211,7 +213,25 @@ impl SubstrateAdapter for KubernetesSubstrate {
             execution.generation,
             activation_attempt_id,
             Arc::clone(&self.cancel_tracker),
+            self.task_tracker.clone(),
         );
+        // The execution and its activation attempt are claimed from here on.
+        // Until the pod create is sent the guard releases that claim alone. The
+        // caller deletes its fresh sandbox row on any error, which drops the
+        // claim with it, so a leaked claim bites only when that delete fails or
+        // the request is cancelled: the sandbox row then survives with an
+        // activation that will never produce a pod, and a later data-plane
+        // access, start or wake joins that leaked attempt.
+        //
+        // One window stays unguarded: `begin_activation_execution_row` commits
+        // before it returns, so a cancellation after the server commits and
+        // before its reply arrives leaves a committed claim and no guard. It is
+        // one round trip wide and ends where every early exit ended before this
+        // guard existed: the pod-less `creating` claim waits for the
+        // orphaned-sandbox reconciler, which acts once the execution has been
+        // unmodified for `CREATE_AGE_THRESHOLD_SECS`, or for the
+        // transient-lifecycle sweeper's age-out.
+        cancel_guard.arm_claim(self.store.clone());
 
         // Resolve the per-sandbox setup once through the shared routine, then
         // encode it into the pod spec. Warm-pool adoption resolves the same
@@ -228,12 +248,38 @@ impl SubstrateAdapter for KubernetesSubstrate {
         } else {
             request.template_network_policy_generation
         };
-        let mut setup = PerSandboxSetup::from_create_request(&request);
-        setup.auto_lifecycle = self
-            .store
-            .auto_lifecycle_policy_after_claim(sandbox_id)
-            .await?;
-        let cold_metadata = setup.into_cold_pod_metadata(cold_network_policy_generation)?;
+        // Every fallible step between the claim and the pod create, so a
+        // failure gives the claim back before the error is returned.
+        let prepared = async {
+            let mut setup = PerSandboxSetup::from_create_request(&request);
+            setup.auto_lifecycle = self
+                .store
+                .auto_lifecycle_policy_after_claim(sandbox_id)
+                .await?;
+            let cold_metadata = setup.into_cold_pod_metadata(cold_network_policy_generation)?;
+            let fork_restore = request
+                .restore_from
+                .as_ref()
+                .map(|restore| {
+                    restore
+                        .storage_uri
+                        .map(|storage_uri| (restore, storage_uri))
+                        .ok_or_else(|| SubstrateError::Failed {
+                            message: "fork disk restore requires an exact artifact storage URI"
+                                .to_string(),
+                        })
+                })
+                .transpose()?;
+            Ok::<_, SubstrateError>((cold_metadata, fork_restore))
+        }
+        .await;
+        let (cold_metadata, fork_restore) = match prepared {
+            Ok(prepared) => prepared,
+            Err(err) => {
+                cancel_guard.release_claim().await;
+                return Err(err);
+            }
+        };
 
         let pod_create_started_at = Instant::now();
         let common = SandboxPodCommon {
@@ -248,11 +294,8 @@ impl SubstrateAdapter for KubernetesSubstrate {
         };
         let runtime = cold_metadata.runtime_metadata(request.resources);
         let restore_source_sandbox_id: String;
-        let pod_request = match request.restore_from.as_ref() {
-            Some(restore) => {
-                let storage_uri = restore.storage_uri.ok_or_else(|| SubstrateError::Failed {
-                    message: "fork disk restore requires an exact artifact storage URI".to_string(),
-                })?;
+        let pod_request = match fork_restore {
+            Some((restore, storage_uri)) => {
                 restore_source_sandbox_id = restore.source_sandbox_id.to_string();
                 SandboxPodRequest::Restore {
                     artifact_kind: pplx_space_common_core::types::ArtifactKind::Disk,
@@ -287,6 +330,9 @@ impl SubstrateAdapter for KubernetesSubstrate {
                 node_group_placement: node_group_placement.placement(),
             },
         };
+        // From here until the response, the apiserver may accept a pod this
+        // call never learns, so the guard keeps the claim that names it.
+        cancel_guard.begin_pod_create();
         let pod = match create_sandbox_pod(&self.k8s, pod_request)
             .instrument(tracing::info_span!(
                 "substrate.k8s.create_pod",
@@ -313,6 +359,10 @@ impl SubstrateAdapter for KubernetesSubstrate {
                     "kubernetes_api",
                     None,
                 );
+                // Retires the claim on every pod-create error, including an
+                // ambiguous one where the apiserver persisted the pod but the
+                // response failed — the same unseen-pod class the guard keeps
+                // claimed on a cancellation mid-create.
                 if let Err(forget_err) = self
                     .store
                     .forget_pod_tracking_if_generation_and_attempt(
@@ -329,6 +379,7 @@ impl SubstrateAdapter for KubernetesSubstrate {
                         "failed to forget Kubernetes pod tracking after pod create failure"
                     );
                 }
+                cancel_guard.defuse();
                 return Err(SubstrateError::Failed {
                     message: format!("failed to create sandbox pod: {err}"),
                 });

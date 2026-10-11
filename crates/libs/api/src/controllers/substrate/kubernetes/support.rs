@@ -1034,9 +1034,18 @@ pub(super) enum CancelCause {
     NodeMgrUnreachable,
 }
 
-/// Guard that cleans up the sandbox pod if the `create_execution` future is
-/// cancelled (dropped) before reaching a normal completion path — e.g. when
-/// the HTTP client disconnects and axum drops the handler.
+/// Guard that gives back what a `create_execution` call claimed when the call
+/// does not reach a normal completion path — a failure exit, or the future
+/// being cancelled (dropped), e.g. when the HTTP client disconnects and axum
+/// drops the handler. Its scope follows what the call can prove:
+///
+/// - claim armed, no pod create sent: no pod can exist, so it releases the
+///   claimed execution alone;
+/// - pod create in flight: the apiserver may have accepted a pod this call
+///   never learns, so it releases nothing and leaves the claim, which still
+///   names that pod, to reconciliation;
+/// - armed with the created pod: it retires the claim and deletes that pod by
+///   UID.
 pub(super) struct CancelGuard {
     sandbox_id: SandboxId,
     pod_name: String,
@@ -1045,7 +1054,13 @@ pub(super) struct CancelGuard {
     pod_uid: Option<PodUid>,
     k8s: Option<KubernetesState>,
     store: Option<K8sStore>,
+    /// Set once the pod create is sent and cleared once its pod arms the
+    /// guard; while set, nothing is released.
+    pod_create_in_flight: bool,
     cancel_tracker: Arc<CancelRateTracker>,
+    /// The substrate's tracker: graceful shutdown waits for the background
+    /// release or cleanup a dropped create leaves running.
+    task_tracker: TaskTracker,
     cause: CancelCause,
 }
 
@@ -1056,6 +1071,7 @@ impl CancelGuard {
         generation: i64,
         activation_attempt_id: SandboxActivationAttemptId,
         cancel_tracker: Arc<CancelRateTracker>,
+        task_tracker: TaskTracker,
     ) -> Self {
         Self {
             sandbox_id,
@@ -1065,17 +1081,66 @@ impl CancelGuard {
             pod_uid: None,
             k8s: None,
             store: None,
+            pod_create_in_flight: false,
             cancel_tracker,
+            task_tracker,
             cause: CancelCause::CallerDropped,
         }
     }
 
-    /// Arm the guard with cleanup resources. Called after the pod is created
-    /// so that cancellation before pod creation is a no-op.
+    /// Arm the guard for the execution claim alone. Called right after the
+    /// claim, so that every exit before the pod exists gives the claim back
+    /// without touching Kubernetes.
+    pub(super) fn arm_claim(&mut self, store: K8sStore) {
+        self.store = Some(store);
+    }
+
+    /// Called just before the pod create is sent. From here until its
+    /// response arrives, a pod this call cannot see may exist, and only the
+    /// claim's execution row still names it — so the guard stops releasing.
+    pub(super) fn begin_pod_create(&mut self) {
+        self.pod_create_in_flight = true;
+    }
+
+    /// Widen the guard to the pod. Called after the pod is created, so that
+    /// cancellation from here on also deletes the pod this call created.
     pub(super) fn arm(&mut self, k8s: KubernetesState, store: K8sStore, pod_uid: Option<PodUid>) {
         self.k8s = Some(k8s);
         self.store = Some(store);
         self.pod_uid = pod_uid;
+        self.pod_create_in_flight = false;
+    }
+
+    /// Give back the claim on a failure exit before the pod create is sent.
+    /// Awaited, so the caller's error is returned only after the claim is
+    /// released. The caller deletes its fresh sandbox row on that error; if the
+    /// delete fails or the request is cancelled, the row survives, and a later
+    /// data-plane access, start or wake must find it unclaimed rather than
+    /// join an activation that will never produce a pod. The guard keeps
+    /// ownership until the release has finished: if this await is cancelled,
+    /// its transaction rolls back and `Drop` runs the same fenced release in
+    /// the background instead.
+    ///
+    /// Only valid before `begin_pod_create()` and `arm()`: past them the
+    /// early return below drops the guard into the full `Drop` path.
+    pub(super) async fn release_claim(mut self) {
+        debug_assert!(
+            self.k8s.is_none() && !self.pod_create_in_flight,
+            "release_claim is only valid before the pod create is sent"
+        );
+        if self.k8s.is_some() || self.pod_create_in_flight {
+            return;
+        }
+        if let Some(store) = self.store.clone() {
+            release_claimed_execution(
+                store,
+                self.sandbox_id,
+                self.generation,
+                self.activation_attempt_id,
+            )
+            .await;
+        }
+        self.store = None;
     }
 
     /// Annotate the guard with the cause of the impending drop so `Drop`
@@ -1089,6 +1154,7 @@ impl CancelGuard {
     pub(super) fn defuse(mut self) {
         self.k8s = None;
         self.store = None;
+        self.pod_create_in_flight = false;
     }
 
     #[cfg(test)]
@@ -1100,6 +1166,43 @@ impl CancelGuard {
 impl Drop for CancelGuard {
     fn drop(&mut self) {
         let Some(k8s) = self.k8s.take() else {
+            let Some(store) = self.store.take() else {
+                return;
+            };
+            if self.pod_create_in_flight {
+                // The apiserver may have accepted the pod. Retiring the claim
+                // would drop the only record naming it, so leave the claim to
+                // the reconcilers that age out a `creating` sandbox.
+                tracing::warn!(
+                    sandbox_id = %self.sandbox_id,
+                    pod_name = %self.pod_name,
+                    "create_execution cancelled while its pod create was in flight — leaving \
+                     the claimed execution to reconciliation"
+                );
+                return;
+            }
+            // No pod create was sent, so there is nothing to delete and
+            // nothing that reaches node-mgr: release the claim alone, and leave
+            // the cancel-storm signal, which counts pod cleanups, untouched.
+            tracing::warn!(
+                sandbox_id = %self.sandbox_id,
+                pod_name = %self.pod_name,
+                "create_execution cancelled before its pod create was sent — releasing the \
+                 claimed execution"
+            );
+            self.task_tracker.spawn(
+                release_claimed_execution(
+                    store,
+                    self.sandbox_id,
+                    self.generation,
+                    self.activation_attempt_id,
+                )
+                .instrument(tracing::info_span!(
+                    "substrate.k8s.cancel_release_claim",
+                    sandbox_id = %self.sandbox_id,
+                    pod_name = %self.pod_name,
+                )),
+            );
             return;
         };
         let store = self.store.take();
@@ -1138,7 +1241,7 @@ impl Drop for CancelGuard {
             pod_name = %pod_name,
         );
 
-        tokio::spawn(
+        self.task_tracker.spawn(
             async move {
                 let Some(store) = store else {
                     return;
@@ -1193,6 +1296,36 @@ impl Drop for CancelGuard {
                 }
             }
             .instrument(cleanup_span),
+        );
+    }
+}
+
+/// Retire the execution a create claimed, fenced on its generation and
+/// activation attempt, when the create gives up before sending its pod
+/// create. This is the release the pod-create failure arm of
+/// `create_execution` runs, from the same database state. Fenced and
+/// idempotent: a repeat, or a release racing a newer execution, changes
+/// nothing.
+async fn release_claimed_execution(
+    store: K8sStore,
+    sandbox_id: SandboxId,
+    generation: i64,
+    activation_attempt_id: SandboxActivationAttemptId,
+) {
+    if let Err(error) = store
+        .forget_pod_tracking_if_generation_and_attempt(
+            sandbox_id,
+            generation,
+            activation_attempt_id,
+        )
+        .await
+    {
+        tracing::warn!(
+            sandbox_id = %sandbox_id,
+            generation,
+            error = %error,
+            "failed to release the Kubernetes execution claimed by a create that ended before \
+             its pod; leaving it to sandbox cleanup"
         );
     }
 }
