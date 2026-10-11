@@ -363,4 +363,6 @@ struct TeardownSuspendBackup<'a> {
 }
 
 #[cfg(test)]
+mod backup_policy_tests;
+#[cfg(test)]
 mod tests;

@@ -1262,3 +1262,152 @@ fn a_pin_owned_by_another_sandbox_is_not_evidence_of_this_sandbox_backup() {
         "the owner's own pin still resolves: {owner:?}"
     );
 }
+
+/// Environment of a node wired to a cluster API through the given endpoint and
+/// static token, with the token file pointing at a missing test-owned path, so
+/// any cluster-api connect stops at the token probe before dialing.
+fn cluster_api_env<'a>(
+    endpoint: &'a str,
+    token: &'a str,
+    token_path: &'a Path,
+) -> Vec<(&'static str, Option<&'a std::ffi::OsStr>)> {
+    vec![
+        (
+            pplx_space_node_api_client::cluster::CLUSTER_API_ENDPOINT_ENV,
+            Some(std::ffi::OsStr::new(endpoint)),
+        ),
+        (
+            pplx_space_node_api_client::cluster::CLUSTER_API_ENDPOINT_ENV_LEGACY,
+            None,
+        ),
+        (
+            pplx_space_common_svc::bearer_token::SPACE_INTERNAL_TOKEN_ENV,
+            Some(std::ffi::OsStr::new(token)),
+        ),
+        (
+            pplx_space_common_svc::bearer_token::SPACE_CLUSTER_API_TOKEN_PATH_ENV,
+            Some(token_path.as_os_str()),
+        ),
+    ]
+}
+
+/// Refusals produced by the real reupload handler, read through the real
+/// legacy-repair classifier: a sandbox that vanished or left `Suspended` is
+/// skipped, while a node that cannot restore snapshots is a retryable failure.
+#[tokio::test]
+async fn legacy_reupload_refusals_classify_as_state_skips_or_retryable_failures() {
+    let token_dir = tempfile::tempdir().unwrap();
+    let token_path = token_dir.path().join("cluster-api.token");
+    if !pplx_space_test_env::enter_test_process(&cluster_api_env(
+        "http://127.0.0.1:9",
+        "characterization-token",
+        &token_path,
+    )) {
+        return;
+    }
+    use crate::state::SandboxState;
+    use pplx_space_common_core::types::SandboxId;
+
+    let service = SandboxManagerService::new(open_test_db());
+    let unknown = service
+        .reupload_legacy_sandbox_for_eviction(&SandboxId::new().to_string())
+        .await
+        .unwrap_err();
+    assert_eq!(
+        classify_reupload_failure(&unknown),
+        Ok(LegacyRepairSkipReason::StateChanged),
+        "{unknown}"
+    );
+
+    // Not covered: a `Suspended` row passes state admission, and its artifact
+    // checks then read the fixed sandbox cache root, which this fixture cannot
+    // isolate.
+    for state in SandboxState::all() {
+        if state == SandboxState::Suspended {
+            continue;
+        }
+        let conn = open_test_db();
+        let id = SandboxId::new().to_string();
+        insert_sandbox(&conn, &id, state.as_str(), 0);
+        let service = SandboxManagerService::new(conn);
+
+        let refused = service
+            .reupload_legacy_sandbox_for_eviction(&id)
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            classify_reupload_failure(&refused),
+            Ok(LegacyRepairSkipReason::StateChanged),
+            "{state}: {refused}"
+        );
+    }
+
+    // The snapshot-restore support check precedes the state check, so even a
+    // non-suspended row is retried rather than skipped on such a node.
+    let conn = open_test_db();
+    let id = SandboxId::new().to_string();
+    insert_sandbox(&conn, &id, SandboxState::Restoring.as_str(), 0);
+    let service = SandboxManagerService::new_with_config(
+        conn,
+        Default::default(),
+        crate::config::SandboxConfig {
+            hugepages: true,
+            ..Default::default()
+        },
+    );
+    let refused = service
+        .reupload_legacy_sandbox_for_eviction(&id)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        classify_reupload_failure(&refused),
+        Err(LegacyRepairFailureReason::Submission),
+        "{refused}"
+    );
+}
+
+/// Empty cluster-api wiring is operator-fixable, so eviction retries the
+/// reupload instead of skipping the sandbox.
+async fn assert_missing_wiring_reupload_is_retried() {
+    let service = SandboxManagerService::new(open_test_db());
+    let refused = service
+        .reupload_legacy_sandbox_for_eviction(
+            &pplx_space_common_core::types::SandboxId::new().to_string(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        classify_reupload_failure(&refused),
+        Err(LegacyRepairFailureReason::Submission),
+        "{refused}"
+    );
+}
+
+#[tokio::test]
+async fn legacy_reupload_retries_when_the_cluster_api_token_is_empty() {
+    let token_dir = tempfile::tempdir().unwrap();
+    let token_path = token_dir.path().join("cluster-api.token");
+    if !pplx_space_test_env::enter_test_process(&cluster_api_env(
+        "http://127.0.0.1:9",
+        "",
+        &token_path,
+    )) {
+        return;
+    }
+    assert_missing_wiring_reupload_is_retried().await;
+}
+
+#[tokio::test]
+async fn legacy_reupload_retries_when_the_cluster_api_endpoint_is_empty() {
+    let token_dir = tempfile::tempdir().unwrap();
+    let token_path = token_dir.path().join("cluster-api.token");
+    if !pplx_space_test_env::enter_test_process(&cluster_api_env(
+        "",
+        "characterization-token",
+        &token_path,
+    )) {
+        return;
+    }
+    assert_missing_wiring_reupload_is_retried().await;
+}
