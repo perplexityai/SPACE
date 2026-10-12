@@ -246,6 +246,7 @@ mod kubernetes_tests {
             // snapshots; resolution by `node_group_placement`'s own tests.
             node_group_placement: NodeGroupPlacementResolver::new(pool, false),
             recovery_join_backoff: RecoveryJoinBackoffPolicy::default(),
+            budgets: SubstrateBudgets::default(),
             shutdown_token,
             task_tracker,
         }
@@ -1941,6 +1942,7 @@ mod kubernetes_tests {
             // snapshots; resolution by `node_group_placement`'s own tests.
             node_group_placement: NodeGroupPlacementResolver::new(pool, false),
             recovery_join_backoff: RecoveryJoinBackoffPolicy::default(),
+            budgets: SubstrateBudgets::default(),
             shutdown_token,
             task_tracker,
         }
@@ -8924,6 +8926,7 @@ mod kubernetes_tests {
             // snapshots; resolution by `node_group_placement`'s own tests.
             node_group_placement: NodeGroupPlacementResolver::new(pool, false),
             recovery_join_backoff: RecoveryJoinBackoffPolicy::default(),
+            budgets: SubstrateBudgets::default(),
             shutdown_token,
             task_tracker,
         }

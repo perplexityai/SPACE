@@ -135,7 +135,7 @@ impl SubstrateAdapter for KubernetesSubstrate {
                     )
                     .await?;
                 let execution = fence.execution;
-                let (_, phase_deadline) = ready_wait_bounds(super::super::CREATE_READY_BUDGET);
+                let (_, phase_deadline) = self.budgets.ready_wait_bounds(self.budgets.create_ready);
                 let (pod_ip, binding) = self
                     .wait_for_pod_proxy_reachable(
                         request.metric_identity,
@@ -444,7 +444,8 @@ impl SubstrateAdapter for KubernetesSubstrate {
         // The inner waits clamp to `phase_deadline` so their phase-tagged
         // timeouts fire first; the outer timeout is the backstop for the
         // stretches between them.
-        let (create_budget, phase_deadline) = ready_wait_bounds(super::super::CREATE_READY_BUDGET);
+        let (create_budget, phase_deadline) =
+            self.budgets.ready_wait_bounds(self.budgets.create_ready);
         let select_outcome = match tokio::time::timeout(create_budget, async {
             let (pod_ip, binding) = self
                 .wait_for_pod_proxy_reachable(
@@ -496,16 +497,7 @@ impl SubstrateAdapter for KubernetesSubstrate {
         .await
         {
             Ok(outcome) => outcome,
-            // Neutral message: whether the work is preserved (pod left running,
-            // retry the same sandbox) or torn down (pod never scheduled) is
-            // decided by the preserve check below, so don't promise either here.
-            Err(_elapsed) => Err(SubstrateError::Timeout {
-                message: format!(
-                    "sandbox create did not reach readiness within {}s",
-                    super::super::CREATE_READY_BUDGET.as_secs()
-                ),
-                phase: None,
-            }),
+            Err(_elapsed) => Err(create_ready_timeout_error(self.budgets.create_ready)),
         };
         let binding = match select_outcome {
             Ok(binding) => binding,
@@ -528,7 +520,7 @@ impl SubstrateAdapter for KubernetesSubstrate {
                 // the latency cliff.
                 if create_wait_should_preserve_node_work(&err)
                     && let Ok(Some(node_id)) = tokio::time::timeout(
-                        super::super::PRESERVE_DECISION_BUDGET,
+                        self.budgets.preserve_decision,
                         self.preservable_create_node(sandbox_uuid, &pod_name),
                     )
                     .await
@@ -1236,7 +1228,7 @@ impl SubstrateAdapter for KubernetesSubstrate {
         &self,
         sandbox_id: SandboxId,
     ) -> Result<Option<PublishedLocalArtifact>, SubstrateError> {
-        let suspend_deadline = Instant::now() + TEARDOWN_SUSPEND_DURABILITY_BUDGET;
+        let suspend_deadline = Instant::now() + self.budgets.suspend_durability;
         SandboxEvent::new(
             sandbox_id,
             SandboxEventType::SuspendRequested,
@@ -1384,6 +1376,7 @@ impl SubstrateAdapter for KubernetesSubstrate {
                 expected_generation,
                 &endpoint_addr,
                 suspend_deadline,
+                self.budgets.suspend_durability,
             )
             .await
             {
@@ -2621,7 +2614,7 @@ impl SubstrateAdapter for KubernetesSubstrate {
         let require_pooled_adoption_node_id = if wait_until_ready {
             wait_for_pooled_split_receipt_capability(
                 &mut node_api,
-                Instant::now() + WARM_POOL_SETUP_RPC_TIMEOUT,
+                Instant::now() + self.budgets.pooled_split_receipt_wait,
             )
             .await?;
             true
@@ -3091,5 +3084,19 @@ impl SubstrateAdapter for KubernetesSubstrate {
             });
         }
         Ok(Some(dedupe_inventory_entries(candidates)))
+    }
+}
+
+/// `create_execution`'s error when its outer readiness budget expires.
+///
+/// Neutral message: whether the work is preserved (pod left running, retry the
+/// same sandbox) or torn down (pod never scheduled) is decided by the preserve
+/// check after it, so don't promise either here. `Duration`'s `Debug` renders
+/// a whole-second budget such as the production default as `135s`, and keeps
+/// a test's sub-second budget legible.
+pub(super) fn create_ready_timeout_error(create_ready: Duration) -> SubstrateError {
+    SubstrateError::Timeout {
+        message: format!("sandbox create did not reach readiness within {create_ready:?}"),
+        phase: None,
     }
 }

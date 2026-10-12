@@ -1345,11 +1345,9 @@ async fn release_claimed_execution(
 /// before the node-RPC channel timeout severs the connection.
 pub(super) fn ready_wait_bounds(requested: Duration) -> (Duration, Instant) {
     // `READY_WAIT_PHASE_MARGIN < CREATE_READY_BUDGET` is statically
-    // asserted next to the constants, so neither expression can underflow
-    // or exceed the channel-safe budget.
-    let inner = requested.min(CREATE_READY_BUDGET - READY_WAIT_PHASE_MARGIN);
-    let outer = inner + READY_WAIT_PHASE_MARGIN;
-    (outer, Instant::now() + inner)
+    // asserted next to the constants, so neither bound can underflow or
+    // exceed the channel-safe budget.
+    SubstrateBudgets::DEFAULT.ready_wait_bounds(requested)
 }
 
 /// Time remaining until `phase_deadline`, zero once it has passed. Used to

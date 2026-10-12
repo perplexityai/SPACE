@@ -43,6 +43,7 @@ pub(super) async fn await_generation_suspend(
     execution_generation: ExecutionGeneration,
     endpoint_addr: &str,
     deadline: Instant,
+    durability_budget: Duration,
 ) -> Result<PublishedLocalArtifact, SubstrateError> {
     poll_generation_suspend(
         |request| {
@@ -53,6 +54,7 @@ pub(super) async fn await_generation_suspend(
         execution_generation,
         endpoint_addr,
         deadline,
+        durability_budget,
     )
     .await
 }
@@ -63,6 +65,8 @@ pub(super) async fn poll_generation_suspend<F, Fut>(
     execution_generation: ExecutionGeneration,
     endpoint_addr: &str,
     deadline: Instant,
+    // The budget `deadline` was derived from, named in the timeout error.
+    durability_budget: Duration,
 ) -> Result<PublishedLocalArtifact, SubstrateError>
 where
     F: FnMut(
@@ -106,8 +110,7 @@ where
             .await
             .map_err(|_| SubstrateError::Timeout {
                 message: format!(
-                    "generation-bound suspend for sandbox {sandbox_id} generation {execution_generation} did not become durable within {}s",
-                    TEARDOWN_SUSPEND_DURABILITY_BUDGET.as_secs(),
+                    "generation-bound suspend for sandbox {sandbox_id} generation {execution_generation} did not become durable within {durability_budget:?}",
                 ),
                 phase: None,
             })? {

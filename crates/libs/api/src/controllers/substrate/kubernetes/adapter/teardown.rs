@@ -358,7 +358,7 @@ impl KubernetesSubstrate {
             let client = Self::pod_worker_client(
                 pod_ip,
                 self.k8s.sandbox_proxy_port,
-                POD_WORKER_CONNECT_TIMEOUT,
+                self.budgets.teardown_worker_connect,
             )
             .await;
             if let Some(mut client) = client {

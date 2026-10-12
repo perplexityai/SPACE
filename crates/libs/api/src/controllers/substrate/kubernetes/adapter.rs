@@ -49,6 +49,8 @@ pub(super) use node_eligibility::{
 use pooled::pooled_metadata_update_error_is_reclaimable;
 pub(super) use pooled::pooled_route_identity_adoption_request;
 use pooled::{pooled_wake_request, wait_for_pooled_split_receipt_capability};
+#[cfg(test)]
+use substrate_adapter::create_ready_timeout_error;
 use suspend::await_generation_suspend;
 #[cfg(test)]
 use suspend::{await_suspend_continuation, poll_generation_suspend};
@@ -66,7 +68,7 @@ pub(super) const WARM_POOL_SETUP_RPC_TIMEOUT: Duration = Duration::from_secs(5);
 // Planned teardown waits for the exact snapshot upload to become remotely
 // durable before retiring the pod. Full-codec artifacts can outlive the
 // generic node-RPC budget, so this path needs its own outer deadline.
-const TEARDOWN_SUSPEND_DURABILITY_BUDGET: Duration = Duration::from_secs(300);
+pub(super) const TEARDOWN_SUSPEND_DURABILITY_BUDGET: Duration = Duration::from_secs(300);
 const MAX_LOGGED_SUSPEND_PENDING_REASON_BYTES: usize = 512;
 const MAX_SUSPEND_PENDING_REASON_LOGS: u8 = 3;
 const SUSPEND_PENDING_REASON_LOG_INTERVAL: Duration = Duration::from_secs(30);

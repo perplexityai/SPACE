@@ -145,6 +145,8 @@ type CallLog = Arc<Mutex<Vec<GrpcCall>>>;
 pub(super) enum ScriptedReply {
     Status(tonic::Status),
     Message(Bytes),
+    /// Never answer, for callers that bound the call with their own budget.
+    Hang,
     /// Answers the n-th call to its method with the n-th reply and every
     /// later call with the last one. An empty sequence scripts nothing.
     Sequence(Arc<[ScriptedReply]>),
@@ -235,6 +237,7 @@ where
             match reply.as_ref().map(|reply| reply.for_attempt(attempt)) {
                 Some(ScriptedReply::Status(status)) => Ok(status.clone().into_http()),
                 Some(ScriptedReply::Message(message)) => Ok(grpc_unary_ok(message.clone())),
+                Some(ScriptedReply::Hang) => std::future::pending().await,
                 Some(ScriptedReply::Sequence(_)) | None => {
                     let request = http::Request::from_parts(
                         parts,

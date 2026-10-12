@@ -176,7 +176,7 @@ enum TeardownCase {
 async fn teardown_keeps_execution_tracked_when_the_node_cannot_finish(
     #[case] case: TeardownCase,
 ) -> TestResult {
-    if !crate::test_support::enter_sim_worker_process() {
+    if !crate::test_support::enter_sim_worker_process_with_owned_token_files() {
         return Ok(());
     }
     let db = pplx_space_db_test_fixtures::pg_test_db().await?;
@@ -231,7 +231,7 @@ async fn teardown_keeps_execution_tracked_when_the_node_cannot_finish(
         .ensure_default_running(&sandbox_id.to_string())
         .await?;
     let (client, log) = teardown_kube_client();
-    let substrate = substrate_with_store_client_proxy_port_and_pod(
+    let mut substrate = substrate_with_store_client_proxy_port_and_pod(
         db.pool.clone(),
         client,
         worker.port,
@@ -244,7 +244,16 @@ async fn teardown_keeps_execution_tracked_when_the_node_cannot_finish(
             Some(pod_ip),
         )),
     );
+    if let TeardownCase::RetireWorkerUnreachable = case {
+        // The TEST-NET dial never connects. Where the host silently drops the
+        // SYN, this budget ends it, and the bound below proves the substrate's
+        // budget rather than the production constant is the one teardown
+        // uses. Where the host answers `ENETUNREACH`, the dial fails at once
+        // and the bound holds trivially.
+        substrate.budgets.teardown_worker_connect = Duration::from_millis(300);
+    }
 
+    let started = Instant::now();
     let outcome = match case {
         TeardownCase::RetireWorkerUnreachable
         | TeardownCase::RetireStopFails
@@ -271,6 +280,12 @@ async fn teardown_keeps_execution_tracked_when_the_node_cannot_finish(
             Err(SubstrateError::RetainedFilesystemOnlyCopy { .. }),
         ) => {}
         (case, outcome) => panic!("{case:?}: unexpected teardown outcome {outcome:?}"),
+    }
+    if let TeardownCase::RetireWorkerUnreachable = case {
+        assert!(
+            started.elapsed() < POD_WORKER_CONNECT_TIMEOUT,
+            "the substrate's teardown connect budget, not the production one, must end the dial"
+        );
     }
     assert!(
         requests_matching(&log, &Method::DELETE).is_empty(),

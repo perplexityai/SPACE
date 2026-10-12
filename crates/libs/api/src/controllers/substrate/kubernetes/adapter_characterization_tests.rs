@@ -10,6 +10,7 @@
 //! carries a TEST-NET address that nothing answers on.
 
 mod create_and_teardown;
+mod create_readiness;
 mod hydration_and_suspend;
 mod pooled_adoption;
 

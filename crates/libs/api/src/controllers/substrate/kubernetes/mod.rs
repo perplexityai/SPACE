@@ -44,6 +44,7 @@ use tonic::{Code, transport::Channel};
 use tracing::Instrument;
 use uuid::Uuid;
 
+mod budgets;
 mod caches;
 mod cancel_rate_tracker;
 mod pod_reflector;
@@ -51,6 +52,7 @@ mod restore_waiters;
 mod sandbox_pod_view;
 mod store;
 
+use budgets::SubstrateBudgets;
 pub use pod_reflector::ReflectorReady;
 use sandbox_pod_view::NodeNetworkSlots;
 pub use sandbox_pod_view::{
@@ -822,6 +824,9 @@ pub struct KubernetesSubstrate {
     /// directly so a join's re-check interval is settable in tests;
     /// production takes the default, which is those constants.
     recovery_join_backoff: execution::RecoveryJoinBackoffPolicy,
+    /// Readiness, preserve-decision, suspend and connect budgets. Production
+    /// takes the default, which is the constants each one names.
+    budgets: SubstrateBudgets,
     shutdown_token: CancellationToken,
     task_tracker: TaskTracker,
 }
@@ -871,6 +876,7 @@ impl KubernetesSubstrate {
                     node_group_placement,
                     cancel_tracker: CancelRateTracker::with_default_budget(),
                     recovery_join_backoff: execution::RecoveryJoinBackoffPolicy::default(),
+                    budgets: SubstrateBudgets::default(),
                     shutdown_token,
                     task_tracker,
                 }))

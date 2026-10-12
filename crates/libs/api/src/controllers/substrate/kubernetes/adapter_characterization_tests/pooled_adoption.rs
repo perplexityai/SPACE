@@ -527,7 +527,7 @@ fn substrate_with_claimed_pod_store(pool: &PgPool, worker: &ScriptedWorker) -> K
 /// not advertise split operation receipts before applying any setup.
 #[tokio::test(flavor = "current_thread")]
 async fn started_pooled_adoption_refuses_a_worker_without_split_receipts() -> TestResult {
-    if !crate::test_support::enter_sim_worker_process() {
+    if !crate::test_support::enter_sim_worker_process_with_owned_token_files() {
         return Ok(());
     }
     let inputs = PooledInputs::new();
@@ -537,9 +537,17 @@ async fn started_pooled_adoption_refuses_a_worker_without_split_receipts() -> Te
     })
     .await?;
 
-    let outcome = prepare(&substrate_without_store(&worker), &inputs, true).await;
+    let mut substrate = substrate_without_store(&worker);
+    substrate.budgets.pooled_split_receipt_wait = Duration::from_millis(300);
+
+    let started = Instant::now();
+    let outcome = prepare(&substrate, &inputs, true).await;
 
     assert!(outcome.is_err(), "an incapable worker must be refused");
+    assert!(
+        started.elapsed() < adapter::WARM_POOL_SETUP_RPC_TIMEOUT,
+        "the substrate's split-receipt budget, not the production one, must end the wait"
+    );
     let receipt_checks = worker
         .received("Health/Check")
         .into_iter()
