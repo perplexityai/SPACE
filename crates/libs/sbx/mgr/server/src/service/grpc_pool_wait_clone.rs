@@ -258,6 +258,7 @@ impl SandboxManagerService {
                 let resolved_template = if req.auto_lifecycle.is_none() {
                     Some(
                         resolve_template_paths(
+                            self.template_resolver.as_ref(),
                             pplx_space_template_mgr_client::proto::TemplateRef {
                                 name: sandbox.template.clone(),
                                 content_hash: sandbox.template_hash.clone(),
@@ -693,7 +694,8 @@ impl SandboxManagerService {
         let uuid8 = SandboxRuntimeLabel::from_sandbox_id(new_sandbox_id);
 
         // Resolve template and compute hash
-        let resolved_template = resolve_template_paths(template_ref).await?;
+        let resolved_template =
+            resolve_template_paths(self.template_resolver.as_ref(), template_ref).await?;
         reject_incompatible_template_arch(
             template,
             resolved_template

@@ -1005,13 +1005,15 @@ impl SandboxManagerService {
         }
 
         if inherit_template_default {
-            let resolved_template =
-                resolve_template_paths(pplx_space_template_mgr_client::proto::TemplateRef {
+            let resolved_template = resolve_template_paths(
+                self.template_resolver.as_ref(),
+                pplx_space_template_mgr_client::proto::TemplateRef {
                     name: sandbox.template.clone(),
                     content_hash: sandbox.template_hash.clone(),
                     tag: None,
-                })
-                .await?;
+                },
+            )
+            .await?;
             policy = resolved_template.default_auto_lifecycle;
         }
 

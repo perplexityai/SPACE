@@ -86,6 +86,7 @@ impl RouteTestService {
                 node_managed_by: None,
                 route_ed25519_verification_bundle: None,
                 node_manager: crate::node_manager_transport::NodeManagerConnector::host(),
+                template_resolver: Arc::new(crate::template_resolver::HostTemplateManager),
             },
         );
         Self {

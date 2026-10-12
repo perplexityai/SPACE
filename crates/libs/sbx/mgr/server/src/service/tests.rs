@@ -5409,10 +5409,14 @@ pub(crate) mod service_tests {
         let sandbox_id = SandboxId::new().to_string();
         insert_orphaned_test_sandbox(&conn, &sandbox_id, SandboxState::Failed);
         let row = crate::db::get_sandbox(&conn, &sandbox_id).unwrap().unwrap();
+        let templates = crate::template_resolver::fake::FakeTemplateResolver::refusing(
+            Status::not_found("orphaned sandboxes must not look up templates"),
+        );
 
-        let error = template_source_for_sandbox_prepare(&row)
+        let error = template_source_for_sandbox_prepare(&templates, &row)
             .await
             .expect_err("orphaned sandbox without rootfs is not startable");
+        assert!(templates.requests().is_empty());
 
         assert_eq!(error.code(), tonic::Code::FailedPrecondition);
         assert!(error.message().contains("cannot start orphaned sandbox"));
@@ -12402,6 +12406,7 @@ pub(crate) mod service_tests {
             node_managed_by: None,
             route_ed25519_verification_bundle: None,
             node_manager: crate::node_manager_transport::NodeManagerConnector::host(),
+            template_resolver: Arc::new(crate::template_resolver::HostTemplateManager),
         }
     }
 

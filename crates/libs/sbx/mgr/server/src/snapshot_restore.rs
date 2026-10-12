@@ -1257,6 +1257,7 @@ pub async fn prepare_restore_dir(
     execution_fence: pplx_space_node_mgr_client::execution_fence::ExecutionFence,
     transfer_scope_id: pplx_space_common_core::types::TransferScopeId,
     node_manager: &crate::node_manager_transport::NodeManagerConnector,
+    templates: &dyn crate::template_resolver::TemplateResolver,
 ) -> Result<RestorePrepared, RestoreError> {
     let latest = latest_ready_snapshot(sandbox_id).await?;
     let staged = restore_pull_metadata_from_source(
@@ -1265,7 +1266,7 @@ pub async fn prepare_restore_dir(
         RestoreMetadataDestination::InPlace(transfer_scope_id),
     )
     .await?;
-    restore_pull_rootfs(&staged, execution_fence, node_manager).await?;
+    restore_pull_rootfs(&staged, execution_fence, node_manager, templates).await?;
     Ok(RestorePrepared {
         snapshot_dir: staged.snapshot_dir,
         storage_uri: staged.storage_uri,
@@ -1280,6 +1281,7 @@ pub async fn prepare_restore_dir_from_uri(
     storage_uri: &str,
     transfer_scope_id: pplx_space_common_core::types::TransferScopeId,
     node_manager: &crate::node_manager_transport::NodeManagerConnector,
+    templates: &dyn crate::template_resolver::TemplateResolver,
 ) -> Result<RestorePrepared, RestoreError> {
     let config = SnapshotUploadConfig::from_uri(storage_uri)
         .map_err(|e| RestoreError::Other(format!("parse storage_uri: {e}")))?;
@@ -1292,7 +1294,7 @@ pub async fn prepare_restore_dir_from_uri(
         RestoreMetadataDestination::InPlace(transfer_scope_id),
     )
     .await?;
-    restore_pull_rootfs(&staged, execution_fence, node_manager).await?;
+    restore_pull_rootfs(&staged, execution_fence, node_manager, templates).await?;
     Ok(RestorePrepared {
         snapshot_dir: staged.snapshot_dir,
         storage_uri: staged.storage_uri,
@@ -1852,6 +1854,7 @@ pub async fn restore_pull_rootfs(
     stage: &RestoreMetadataStaged,
     execution_fence: pplx_space_node_mgr_client::execution_fence::ExecutionFence,
     node_manager: &crate::node_manager_transport::NodeManagerConnector,
+    templates: &dyn crate::template_resolver::TemplateResolver,
 ) -> Result<(), RestoreError> {
     use pplx_space_node_mgr_client::execution_fence::InstanceTarget;
     let target = stage.filesystem_scope_id.map_or(
@@ -1898,6 +1901,7 @@ pub async fn restore_pull_rootfs(
                 stage.transfer_scope_id,
                 target,
                 node_manager,
+                templates,
             )
             .await
         }
@@ -2506,7 +2510,7 @@ async fn stage_encrypted_restore(
 /// responsible for cleanup of the partial staging directory.
 #[expect(
     clippy::too_many_arguments,
-    reason = "each argument is an independent restore input; node-manager is the injected transport"
+    reason = "each argument is an independent restore input; the node-manager and template-manager clients are injected"
 )]
 async fn stage_btrfs_send_restore(
     identity: RestoreTransferIdentity<'_>,
@@ -2517,6 +2521,7 @@ async fn stage_btrfs_send_restore(
     transfer_scope_id: Option<pplx_space_common_core::types::TransferScopeId>,
     target: pplx_space_node_mgr_client::execution_fence::InstanceTarget,
     node_manager: &crate::node_manager_transport::NodeManagerConnector,
+    templates: &dyn crate::template_resolver::TemplateResolver,
 ) -> Result<(), RestoreError> {
     let sandbox_id = identity.sandbox_id;
     let sidecar_bytes = std::fs::read(sidecar_path).map_err(|e| {
@@ -2568,7 +2573,7 @@ async fn stage_btrfs_send_restore(
     }
     run_btrfs_staging(
         Box::pin(async {
-            ensure_local_template(sandbox_id, template_name, content_hash)
+            ensure_local_template(templates, sandbox_id, template_name, content_hash)
                 .await
                 .map(drop)
         }),
@@ -2654,31 +2659,35 @@ async fn run_btrfs_staging<'a>(
 /// tmplmgr — same RPC the sandbox-create path uses. Returns the local
 /// directory the template lives at.
 async fn ensure_local_template(
+    templates: &dyn crate::template_resolver::TemplateResolver,
     sandbox_id: &str,
     template_name: &str,
     content_hash: &str,
 ) -> Result<String, RestoreError> {
+    use crate::template_resolver::TemplateLookupError;
     async {
-        let mut client = pplx_space_template_mgr_client::connect()
+        let resp = templates
+            .get_template(tonic::Request::new(
+                pplx_space_template_mgr_client::proto::GetTemplateRequest {
+                    caller_org_id: None,
+                    template: Some(pplx_space_template_mgr_client::proto::TemplateRef {
+                        name: template_name.to_string(),
+                        content_hash: Some(content_hash.to_string()),
+                        tag: None,
+                    }),
+                    vcpu: None,
+                    memory_mib: None,
+                },
+            ))
             .await
-            .map_err(|e| {
-                RestoreError::Other(format!(
+            .map_err(|error| match error {
+                TemplateLookupError::Connect(e) => RestoreError::Other(format!(
                     "tmplmgr connect for GetTemplate({template_name}): {e}"
-                ))
-            })?;
-        let resp = client
-            .get_template(pplx_space_template_mgr_client::proto::GetTemplateRequest {
-                caller_org_id: None,
-                template: Some(pplx_space_template_mgr_client::proto::TemplateRef {
-                    name: template_name.to_string(),
-                    content_hash: Some(content_hash.to_string()),
-                    tag: None,
-                }),
-                vcpu: None,
-                memory_mib: None,
-            })
-            .await
-            .map_err(|error| template_pull_error(template_name, content_hash, error))?
+                )),
+                TemplateLookupError::Rpc(error) => {
+                    template_pull_error(template_name, content_hash, error)
+                }
+            })?
             .into_inner();
         if resp.template_dir.is_empty() {
             return Err(RestoreError::Other(format!(
