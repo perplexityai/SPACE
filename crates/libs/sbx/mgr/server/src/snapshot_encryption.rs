@@ -93,8 +93,9 @@ pub(crate) async fn prepare_encrypted_snapshot_volume(
     execution_fence: Option<pplx_space_node_mgr_client::proto::ExecutionFence>,
     fresh: bool,
     restore_source: Option<&str>,
+    node_manager: &crate::node_manager_transport::NodeManagerConnector,
 ) -> Result<PreparedEncryptedSnapshot, EncryptedSnapshotPrepareError> {
-    let mut node = pplx_space_node_mgr_client::connect().await?;
+    let mut node = node_manager.connect().await?;
     let prepared = node
         .prepare_encrypted_volume(
             pplx_space_node_mgr_client::proto::PrepareEncryptedVolumeRequest {
@@ -123,8 +124,10 @@ pub(crate) async fn release_encrypted_snapshot_volume(
     sandbox_id: &str,
     execution_fence: Option<pplx_space_node_mgr_client::proto::ExecutionFence>,
     stage_dir: &str,
+    node_manager: &crate::node_manager_transport::NodeManagerConnector,
 ) -> Result<(), String> {
-    let mut node = pplx_space_node_mgr_client::connect()
+    let mut node = node_manager
+        .connect()
         .await
         .map_err(|e| format!("node-manager connect for snapshot-volume release: {e}"))?;
     // The two sealed ciphertext artifacts a suspend publishes: the volume's own

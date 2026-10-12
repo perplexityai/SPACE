@@ -21,6 +21,8 @@ use pplx_space_node_mgr_client::proto::{
 use thiserror::Error;
 use tonic::Status;
 
+use crate::node_manager_transport::NodeManagerConnector;
+
 // `pub` only because `RestoreError::BtrfsReceive` carries it and `RestoreError`
 // is public; the module is `pub(crate)`, so the type is still not exported.
 #[derive(Debug, Error)]
@@ -134,12 +136,14 @@ pub(crate) async fn encode_rootfs_send(
     content_hash: &str,
     snapshot_dir: &str,
     execution_fence: ExecutionFence,
+    node_manager: &NodeManagerConnector,
 ) -> Result<CapturedRootfs, BtrfsViaNodemgrError> {
     const RPC: &str = "BtrfsEncodeRootfsSend";
-    let mut client = pplx_space_node_mgr_client::connect()
+    let mut client = node_manager
+        .connect()
         .await
         .map_err(|e| BtrfsViaNodemgrError::Connect(e.to_string()))?;
-    let defer = defer_send().await;
+    let defer = defer_send(node_manager).await;
     let response = client
         .btrfs_encode_rootfs_send(BtrfsEncodeRootfsSendRequest {
             sandbox_id: sandbox_id.to_string(),
@@ -173,8 +177,10 @@ pub(crate) async fn encode_snapshot_rootfs_send(
     content_hash: &str,
     snapshot_name: &str,
     dest_dir: &str,
+    node_manager: &NodeManagerConnector,
 ) -> Result<u64, BtrfsViaNodemgrError> {
-    let mut client = pplx_space_node_mgr_client::connect()
+    let mut client = node_manager
+        .connect()
         .await
         .map_err(|e| BtrfsViaNodemgrError::Connect(e.to_string()))?;
     let response = client
@@ -207,8 +213,10 @@ pub(crate) async fn receive_instance(
     template_name: &str,
     content_hash: &str,
     target: InstanceTarget,
+    node_manager: &NodeManagerConnector,
 ) -> Result<(), BtrfsViaNodemgrError> {
-    let mut client = pplx_space_node_mgr_client::connect()
+    let mut client = node_manager
+        .connect()
         .await
         .map_err(|e| BtrfsViaNodemgrError::Connect(e.to_string()))?;
     client
@@ -232,8 +240,10 @@ pub(crate) async fn receive_instance(
 pub(crate) async fn delete_sandbox_instance(
     sandbox_id: &str,
     target: InstanceTarget,
+    node_manager: &NodeManagerConnector,
 ) -> Result<(), BtrfsViaNodemgrError> {
-    let mut client = pplx_space_node_mgr_client::connect()
+    let mut client = node_manager
+        .connect()
         .await
         .map_err(|e| BtrfsViaNodemgrError::Connect(e.to_string()))?;
     client
@@ -262,8 +272,10 @@ pub(crate) async fn materialize_rootfs_send(
     sandbox_id: &str,
     artifact_dir: &std::path::Path,
     source_id: uuid::Uuid,
+    node_manager: &NodeManagerConnector,
 ) -> Result<u64, BtrfsViaNodemgrError> {
-    let mut client = pplx_space_node_mgr_client::connect()
+    let mut client = node_manager
+        .connect()
         .await
         .map_err(|e| BtrfsViaNodemgrError::Connect(e.to_string()))?;
     client
@@ -289,11 +301,13 @@ pub(crate) async fn inspect_send_source(
     sandbox_id: &str,
     artifact_dir: &std::path::Path,
     source_id: uuid::Uuid,
+    node_manager: &NodeManagerConnector,
 ) -> Result<u64, BtrfsViaNodemgrError> {
     // Inspections are frequent and bounded; they share node-manager's lazy,
     // reconnecting channel instead of dialing the socket per call. A dead
     // socket surfaces as an RPC status, which proves nothing about the source.
-    pplx_space_node_mgr_client::lazy()
+    node_manager
+        .lazy()
         .btrfs_inspect_send_source(BtrfsInspectSendSourceRequest {
             sandbox_id: sandbox_id.to_owned(),
             artifact_dir: artifact_dir.to_string_lossy().into_owned(),
@@ -361,7 +375,6 @@ impl CapabilityCache {
 }
 
 static VOLUME_MANAGER_STREAMS: CapabilityCache = CapabilityCache::new();
-static NODE_MANAGER_INSPECTS: CapabilityCache = CapabilityCache::new();
 
 /// Whether volume-manager can stream an upload from a retained source. Gates
 /// existing retained artifacts too: without it they materialize first.
@@ -395,15 +408,16 @@ async fn probe_volume_manager_streams_btrfs_send() -> bool {
 
 /// Whether node-manager can inspect retained sources and report their size.
 /// A deferred artifact is unverifiable without both.
-async fn node_manager_inspects_send_sources() -> bool {
-    NODE_MANAGER_INSPECTS
-        .get(probe_node_manager_inspects_send_sources())
+async fn node_manager_inspects_send_sources(node_manager: &NodeManagerConnector) -> bool {
+    node_manager
+        .inspects_send_sources_cache()
+        .get(probe_node_manager_inspects_send_sources(node_manager))
         .await
 }
 
-async fn probe_node_manager_inspects_send_sources() -> bool {
+async fn probe_node_manager_inspects_send_sources(node_manager: &NodeManagerConnector) -> bool {
     let probe = async {
-        let mut client = pplx_space_node_mgr_client::lazy();
+        let mut client = node_manager.lazy();
         client
             .get_btrfs_send_capabilities(GetBtrfsSendCapabilitiesRequest {})
             .await
@@ -421,16 +435,18 @@ async fn probe_node_manager_inspects_send_sources() -> bool {
     }
 }
 
-async fn defer_send() -> bool {
+async fn defer_send(node_manager: &NodeManagerConnector) -> bool {
     if !retain_send_sources() {
         return false;
     }
     let (streams, inspects) = tokio::join!(
         volume_manager_streams_btrfs_send(),
-        node_manager_inspects_send_sources()
+        node_manager_inspects_send_sources(node_manager)
     );
     streams && inspects
 }
 
+#[cfg(test)]
+mod capability_cache_tests;
 #[cfg(test)]
 mod tests;

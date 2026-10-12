@@ -96,6 +96,7 @@ pub use self::restart_admission::{
     SandboxManagerRestartAdmissionLayer, handoff_cancellable_response_stream_name,
 };
 use self::start_support::ActivationAdmissionLimiter;
+use crate::node_manager_transport::NodeManagerConnector;
 use crate::node_state_sync::{mark_sandbox_dirty, mark_sandboxes_dirty, should_skip_node_publish};
 use crate::proto::sandbox_manager_server::SandboxManager;
 use crate::proto::{
@@ -401,6 +402,7 @@ pub struct SandboxManagerService {
     credential_manager_client:
         Arc<tokio::sync::OnceCell<pplx_space_credmgr_client::CredentialManagerGrpcClient>>,
     network_credentials_enabled: bool,
+    node_manager: NodeManagerConnector,
     gateway_caller_client: pplx_space_node_mgr_client::NodeManagerGrpcClient,
     gateway_authority: gateway_authority::GatewayAuthority,
     /// S3 upload config for suspend snapshots. `None` means uploads are disabled.
@@ -970,6 +972,8 @@ pub struct SandboxManagerServiceOptions {
     pub route_ed25519_verification_bundle: Option<
         Arc<pplx_space_common_svc::space_api_route_ed25519::SpaceApiRouteEd25519VerificationBundle>,
     >,
+    /// Every node-manager client the service and its subsystems use.
+    pub node_manager: NodeManagerConnector,
 }
 
 impl Default for SandboxManagerServiceOptions {
@@ -988,6 +992,7 @@ impl Default for SandboxManagerServiceOptions {
             node_role: None,
             node_managed_by: None,
             route_ed25519_verification_bundle: None,
+            node_manager: NodeManagerConnector::host(),
         }
     }
 }
@@ -1621,6 +1626,7 @@ impl SandboxManagerService {
             db: db.clone(),
             auto_lifecycle: auto_lifecycle.clone(),
             health_lifecycle: health_lifecycle.clone(),
+            node_manager: options.node_manager.clone(),
         });
         let snapshot_scheduler = Arc::new(
             crate::snapshot_scheduler::SnapshotScheduler::new_with_ownership(
@@ -1640,12 +1646,16 @@ impl SandboxManagerService {
             options.shutdown_token.clone(),
             Arc::clone(&drain_state),
             &options.task_tracker,
+            options.node_manager.clone(),
         ));
         if let Some(generation) = expected_route_verification_key_generation {
             watchdog.set_expected_route_verification_key_generation(generation);
         }
-        let snapshot_upload_worker =
-            crate::snapshot_upload_jobs::build_worker(Arc::clone(&db), Arc::clone(&drain_state));
+        let snapshot_upload_worker = crate::snapshot_upload_jobs::build_worker(
+            Arc::clone(&db),
+            Arc::clone(&drain_state),
+            options.node_manager.clone(),
+        );
         let local_artifacts = crate::local_artifacts::LocalArtifacts::new(Arc::clone(&db));
         let teardown_suspend_driver_concurrency = TEARDOWN_SUSPEND_DRIVER_CONCURRENCY;
         pplx_space_metrics::sandbox::worker::teardown_suspend_driver_capacity(
@@ -1715,7 +1725,7 @@ impl SandboxManagerService {
                     .as_deref(),
                 false,
             ),
-            gateway_caller_client: pplx_space_node_mgr_client::lazy(),
+            gateway_caller_client: options.node_manager.lazy(),
             gateway_authority,
             snapshot_upload_config: {
                 let cfg = crate::snapshot_upload::SnapshotUploadConfig::from_env();
@@ -1729,7 +1739,10 @@ impl SandboxManagerService {
             },
             snapshot_upload_worker,
             sandbox_runtime_live: options.sandbox_runtime_live,
-            retained_source_inspector: Arc::new(crate::retained_source::NodeManagerSourceInspector),
+            retained_source_inspector: Arc::new(
+                crate::retained_source::NodeManagerSourceInspector(options.node_manager.clone()),
+            ),
+            node_manager: options.node_manager,
             drain_state,
             feature_flags,
             route_ed25519_verification_bundle: Arc::new(ArcSwapOption::from(
@@ -1809,6 +1822,7 @@ impl SandboxManagerService {
             coordinator: self.auto_lifecycle.clone(),
             drain: Arc::clone(&self.drain_state),
             shutdown: shutdown_token,
+            node_manager: self.node_manager.clone(),
         };
         task_tracker.spawn(async move {
             crate::snapshot_gc::run_loop(

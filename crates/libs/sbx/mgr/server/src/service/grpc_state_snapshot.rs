@@ -1174,6 +1174,7 @@ impl SandboxManagerService {
                 db: self.db.clone(),
                 auto_lifecycle: self.auto_lifecycle.clone(),
                 health_lifecycle: self.watchdog.lifecycle_epochs(),
+                node_manager: self.node_manager.clone(),
             };
 
             let completion = crate::snapshot_scheduler::do_checkpoint(&ctx, id, &snapshot_name)
@@ -1189,7 +1190,9 @@ impl SandboxManagerService {
             Some(completion)
         } else {
             // Disk snapshot: btrfs subvolume snapshot via node-manager
-            let mut node_client = pplx_space_node_mgr_client::connect()
+            let mut node_client = self
+                .node_manager
+                .connect()
                 .await
                 .map_err(|e| Status::internal(format!("connect to node-manager: {e}")))?;
             node_client
@@ -1249,7 +1252,7 @@ impl SandboxManagerService {
             )
         };
         if let Err(error) = publish_result {
-            match pplx_space_node_mgr_client::connect().await {
+            match self.node_manager.connect().await {
                 Ok(mut node_client) => {
                     if let Err(cleanup_error) = node_client
                         .delete_btrfs_snapshot(
@@ -1457,9 +1460,10 @@ impl SandboxManagerService {
                 })?;
         }
 
-        let mut node_client = pplx_space_node_mgr_client::connect()
-            .await
-            .map_err(|error| Status::unavailable(format!("connect to node-manager: {error}")))?;
+        let mut node_client =
+            self.node_manager.connect().await.map_err(|error| {
+                Status::unavailable(format!("connect to node-manager: {error}"))
+            })?;
         node_client
             .sync_guest(pplx_space_node_mgr_client::proto::SyncGuestRequest {
                 sandbox_id: sandbox_id.clone(),
@@ -1567,6 +1571,7 @@ impl SandboxManagerService {
                 content_hash,
                 snapshot_name.as_str(),
                 &paths.artifact,
+                &self.node_manager,
             )
             .await
             .map_err(crate::btrfs_via_nodemgr::BtrfsViaNodemgrError::into_status),
@@ -1809,7 +1814,7 @@ impl SandboxManagerService {
                 Status::internal(format!("create template snapshot staging dir: {e}"))
             })?;
 
-            let mut node_client = connect_node()
+            let mut node_client = connect_node(&self.node_manager)
                 .await
                 .map_err(|e| Status::internal(format!("cannot connect to node-manager: {e}")))?;
             let phase = Instant::now();

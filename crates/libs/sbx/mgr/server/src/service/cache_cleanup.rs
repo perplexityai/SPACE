@@ -1387,10 +1387,7 @@ impl SandboxManagerService {
     fn orphan_execution_observer(
         &self,
     ) -> impl Fn(SandboxId) -> Result<Option<ExecutionFence>, Status> + use<> {
-        orphan_execution_observer(
-            pplx_space_node_mgr_client::lazy(),
-            self.shutdown_token.clone(),
-        )
+        orphan_execution_observer(self.node_manager.lazy(), self.shutdown_token.clone())
     }
 
     pub(super) fn reconcile_sandbox_inventory(

@@ -13,6 +13,7 @@ fn test_ownership() -> GcOwnership {
         coordinator: crate::auto_lifecycle::AutoLifecycleCoordinator::default(),
         drain: Arc::new(crate::service::drain::DrainState::default()),
         shutdown: CancellationToken::new(),
+        node_manager: crate::node_manager_transport::NodeManagerConnector::host(),
     }
 }
 
@@ -645,6 +646,7 @@ async fn gc_defers_to_publication_staging_drain_and_shutdown_ownership() {
         coordinator: ownership.coordinator.clone(),
         drain: crate::service::tests::closed_drain_for_test(),
         shutdown: CancellationToken::new(),
+        node_manager: ownership.node_manager.clone(),
     };
     let report = gc_tick(
         artifacts.clone(),

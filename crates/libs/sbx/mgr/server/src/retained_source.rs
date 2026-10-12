@@ -162,7 +162,9 @@ pub(crate) trait RetainedSourceInspector: Send + Sync {
 }
 
 /// One node-manager call with a bounded deadline.
-pub(crate) struct NodeManagerSourceInspector;
+pub(crate) struct NodeManagerSourceInspector(
+    pub(crate) crate::node_manager_transport::NodeManagerConnector,
+);
 
 #[async_trait::async_trait]
 impl RetainedSourceInspector for NodeManagerSourceInspector {
@@ -171,6 +173,7 @@ impl RetainedSourceInspector for NodeManagerSourceInspector {
             &source.sandbox_id,
             &source.artifact_dir,
             source.source_id,
+            &self.0,
         );
         let (check, code) = match tokio::time::timeout(INSPECTION_DEADLINE, call).await {
             Ok(Ok(rootfs_bytes)) => (RetainedSourceCheck::Present { rootfs_bytes }, None),

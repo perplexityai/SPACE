@@ -331,7 +331,7 @@ impl SandboxManagerService {
         // Auto-pause if started
         if sandbox.state == SandboxState::Started {
             let pause_started_at = std::time::Instant::now();
-            let mut node_client = connect_node().await.map_err(|e| {
+            let mut node_client = connect_node(&self.node_manager).await.map_err(|e| {
                 pplx_space_metrics::snapshot::create_failed(
                     create_kind,
                     context.create_codec,
@@ -401,6 +401,7 @@ impl SandboxManagerService {
                 &sandbox_id,
                 "auto-pause failed",
                 guest_preparation_budget,
+                &self.node_manager,
             )
             .await;
             if pause_state != SandboxState::Paused {

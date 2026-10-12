@@ -738,9 +738,10 @@ impl SandboxManagerService {
                     (SandboxState::Stopped, None) => {
                         let id = LocalArtifactId::new();
                         let snapshot_name = format!("d-stop-{id}");
-                        let mut node_client = connect_node().await.map_err(|error| {
-                            Status::internal(format!("connect to node-manager: {error}"))
-                        })?;
+                        let mut node_client =
+                            connect_node(&self.node_manager).await.map_err(|error| {
+                                Status::internal(format!("connect to node-manager: {error}"))
+                            })?;
                         node_client
                             .create_btrfs_snapshot(
                                 pplx_space_node_mgr_client::proto::CreateBtrfsSnapshotRequest {

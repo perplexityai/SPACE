@@ -78,6 +78,7 @@ pub(crate) struct GcOwnership {
     pub coordinator: crate::auto_lifecycle::AutoLifecycleCoordinator,
     pub drain: Arc<crate::service::drain::DrainState>,
     pub shutdown: CancellationToken,
+    pub node_manager: crate::node_manager_transport::NodeManagerConnector,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -527,7 +528,12 @@ async fn gc_tick(
                 // until the next sbx-mgr startup sweep, which now
                 // also goes through this RPC.
                 if let Some(staging) = staging_to_clean {
-                    delete_cache_artifact_via_node_mgr(&staging, &candidate.key).await;
+                    delete_cache_artifact_via_node_mgr(
+                        &staging,
+                        &candidate.key,
+                        &ownership.node_manager,
+                    )
+                    .await;
                 }
             }
             Ok((skip, _)) => {
@@ -587,8 +593,12 @@ const FORK_COPY_ORPHAN_MIN_AGE_SECS: u64 = 60 * 60;
 /// failure rather than abort, because the parent operation has
 /// already committed (the row is gone, or this was orphan cleanup
 /// to begin with).
-async fn delete_cache_artifact_via_node_mgr(staging_path: &str, candidate_label: &str) {
-    let mut client = match pplx_space_node_mgr_client::connect().await {
+async fn delete_cache_artifact_via_node_mgr(
+    staging_path: &str,
+    candidate_label: &str,
+    node_manager: &crate::node_manager_transport::NodeManagerConnector,
+) {
+    let mut client = match node_manager.connect().await {
         Ok(c) => c,
         Err(err) => {
             warn!(
@@ -702,7 +712,12 @@ async fn sweep_orphans(
         };
         // Await the admitted mutation; caller cancellation stops the next
         // admission instead of dropping this mutation and its reservation.
-        delete_cache_artifact_via_node_mgr(&path.to_string_lossy(), "orphan-sweep").await;
+        delete_cache_artifact_via_node_mgr(
+            &path.to_string_lossy(),
+            "orphan-sweep",
+            &ownership.node_manager,
+        )
+        .await;
     }
 }
 

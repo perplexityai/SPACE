@@ -563,6 +563,8 @@ async fn immediate_reclaim_removes_ordinary_entries_and_leaves_the_rest_in_the_l
     // Read-only directory: unlinking its entries fails for a normal user, as
     // a retained subvolume's do.
     std::fs::set_permissions(&bundle, std::fs::Permissions::from_mode(0o555)).unwrap();
+    // Node-manager refuses the delete the stubborn entry falls back to.
+    let node_manager = crate::node_manager_transport::fake::FakeNodeManager::default().serve();
 
     // At capacity nothing is spawned; the entries join the backlog. The
     // slots here are held by the test rather than by workers, so no worker
@@ -581,19 +583,21 @@ async fn immediate_reclaim_removes_ordinary_entries_and_leaves_the_rest_in_the_l
         .map(|_| IMMEDIATE_RECLAIM_SLOTS.try_acquire().unwrap())
         .collect();
     for dir in &backlog {
-        assert!(reclaim_garbage_now("sandbox".into(), dir.clone()).is_none());
+        assert!(
+            reclaim_garbage_now("sandbox".into(), dir.clone(), node_manager.connector()).is_none()
+        );
         assert!(dir.exists());
     }
     drop(held);
 
-    reclaim_garbage_now("sandbox".into(), ordinary.clone())
+    reclaim_garbage_now("sandbox".into(), ordinary.clone(), node_manager.connector())
         .unwrap()
         .await
         .unwrap();
     for dir in &backlog {
         assert!(!dir.exists(), "backlog drained once a slot was free");
     }
-    reclaim_garbage_now("sandbox".into(), stubborn.clone())
+    reclaim_garbage_now("sandbox".into(), stubborn.clone(), node_manager.connector())
         .unwrap()
         .await
         .unwrap();
@@ -611,4 +615,70 @@ async fn immediate_reclaim_removes_ordinary_entries_and_leaves_the_rest_in_the_l
         std::fs::set_permissions(&bundle, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
     assert!(remaining.len() <= 1);
+}
+
+/// A backlogged entry falls back to node-manager through the connector that
+/// submitted it, not through the connector of whichever worker drains it.
+#[tokio::test]
+async fn immediate_reclaim_backlog_uses_each_entrys_own_node_manager() {
+    use pplx_space_node_mgr_client::proto::{
+        DeleteCacheArtifactRequest, DeleteCacheArtifactResponse,
+    };
+    use std::sync::{Arc, Mutex};
+
+    fn recording_node_manager(
+        deletes: &Arc<Mutex<Vec<String>>>,
+    ) -> crate::node_manager_transport::fake::ServedNodeManager {
+        let deletes = Arc::clone(deletes);
+        crate::node_manager_transport::fake::FakeNodeManager::default()
+            .unary(
+                "DeleteCacheArtifact",
+                move |request: DeleteCacheArtifactRequest| {
+                    deletes.lock().unwrap().push(request.local_path);
+                    Ok(DeleteCacheArtifactResponse::default())
+                },
+            )
+            .serve()
+    }
+
+    let cache = tempfile::tempdir().unwrap();
+    let lane = suspend_snapshot_publication::suspend_snapshot_staging_parent_dir(
+        &cache.path().join("sandbox"),
+    );
+    std::fs::create_dir_all(&lane).unwrap();
+    // A regular file is not a directory, so the local removal fails even for
+    // root and every entry falls back to node-manager.
+    let entry = |name: &str| {
+        let path = lane.join(format!("{RETIRED_PREFIX}{name}"));
+        std::fs::write(&path, b"retired").unwrap();
+        path
+    };
+    let (first, second, drainer) = (entry("first"), entry("second"), entry("drainer"));
+    let deletes = [(); 3].map(|()| Arc::new(Mutex::new(Vec::new())));
+    let node_managers = deletes.each_ref().map(recording_node_manager);
+
+    let held: Vec<_> = (0..IMMEDIATE_RECLAIM_CONCURRENCY)
+        .map(|_| IMMEDIATE_RECLAIM_SLOTS.try_acquire().unwrap())
+        .collect();
+    for (path, node_manager) in [(&first, &node_managers[0]), (&second, &node_managers[1])] {
+        assert!(
+            reclaim_garbage_now("sandbox".into(), path.clone(), node_manager.connector()).is_none(),
+            "both slots are held, so the entry is backlogged"
+        );
+    }
+    drop(held);
+    reclaim_garbage_now(
+        "sandbox".into(),
+        drainer.clone(),
+        node_managers[2].connector(),
+    )
+    .unwrap()
+    .await
+    .unwrap();
+
+    let deleted = deletes.map(|deletes| deletes.lock().unwrap().clone());
+    assert_eq!(
+        deleted,
+        [first, second, drainer].map(|path| vec![path.to_string_lossy().into_owned()])
+    );
 }

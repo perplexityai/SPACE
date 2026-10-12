@@ -411,6 +411,7 @@ impl SandboxManagerService {
                         crate::runtime_reconciliation::observe_firecracker_vm_state(
                             &sandbox_id,
                             "startup pause recovery",
+                            &self.node_manager,
                         )
                         .await
                     })
@@ -883,7 +884,11 @@ impl SandboxManagerService {
                 let error = match published {
                     Ok(garbage) => {
                         for path in garbage {
-                            drop(staging_cleanup::reclaim_garbage_now(row.id.clone(), path));
+                            drop(staging_cleanup::reclaim_garbage_now(
+                                row.id.clone(),
+                                path,
+                                self.node_manager.clone(),
+                            ));
                         }
                         None
                     }
@@ -2233,7 +2238,7 @@ impl SandboxManagerService {
             let _guard = guard;
             let mut recovery_cursor = crate::db::PeriodicLifecycleRecoveryScan::default();
             let mut staging_scan = staging_cleanup::StagingCleanupScan::default();
-            let mut node_client = pplx_space_node_mgr_client::lazy();
+            let mut node_client = service.node_manager.lazy();
             let mut inventory_scan = super::cache_cleanup::PeriodicInventoryScan::default();
             let mut quarantine_scan = crate::db::PeriodicQuarantineRecoveryScan::default();
             let mut transfer_scan = crate::db::inventory::RestoreTransferScopeScan::default();

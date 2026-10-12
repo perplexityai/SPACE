@@ -1303,13 +1303,11 @@ impl SandboxManagerService {
                     // This is intentionally whole-sandbox disposal, not partial
                     // restore cleanup. Keep teardown and recursive removal with
                     // the node-manager's lifecycle owner through completion.
-                    let mut node = pplx_space_node_mgr_client::connect().await.map_err(
-                        |error| {
-                            RestoreError::Other(format!(
-                                "connect node-manager for orphan cleanup {canonical_id}: {error}"
-                            ))
-                        },
-                    )?;
+                    let mut node = self.node_manager.connect().await.map_err(|error| {
+                        RestoreError::Other(format!(
+                            "connect node-manager for orphan cleanup {canonical_id}: {error}"
+                        ))
+                    })?;
                     super::cleanup_support::cleanup_sandbox_via_node(
                         &self.db,
                         &mut node,
@@ -1767,7 +1765,7 @@ impl SandboxManagerService {
                 .ok_or_else(|| {
                     RestoreError::Other("restore execution identity is missing".into())
                 })?;
-        let phase2_result = restore_pull_rootfs(&staged, execution_fence)
+        let phase2_result = restore_pull_rootfs(&staged, execution_fence, &self.node_manager)
             .instrument(phase2_span)
             .await;
         if let Err(ref e) = phase2_result {

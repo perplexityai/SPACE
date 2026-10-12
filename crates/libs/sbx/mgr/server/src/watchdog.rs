@@ -30,6 +30,7 @@ use pplx_space_metrics::sandbox::worker::{
 use pplx_space_node_runtime_core::fc_api::FirecrackerVmState;
 
 use crate::auto_lifecycle::AutoLifecycleCoordinator;
+use crate::node_manager_transport::NodeManagerConnector;
 use crate::node_state_sync::mark_sandbox_dirty;
 use crate::service::network_policy::NetworkPolicyReconcileQueue;
 use crate::sidecar::{sidecar_alive, sidecar_live_pid};
@@ -689,6 +690,7 @@ pub struct SandboxWatchdog {
     network_policy_reconcile_queue: NetworkPolicyReconcileQueue,
     expected_route_verification_key_generation: Arc<AtomicU64>,
     feature_flags: pplx_space_feature_flags::FeatureFlagClient,
+    node_manager: NodeManagerConnector,
 }
 
 #[derive(Clone, Default)]
@@ -730,6 +732,7 @@ impl SandboxWatchdog {
         shutdown_token: CancellationToken,
         drain_state: Arc<crate::service::drain::DrainState>,
         task_tracker: &TaskTracker,
+        node_manager: NodeManagerConnector,
     ) -> Self {
         let state = lifecycle_epochs.state.clone();
         let sidecars: Arc<Mutex<HashMap<String, SidecarInfo>>> =
@@ -743,6 +746,7 @@ impl SandboxWatchdog {
             Arc::clone(&expected_route_verification_key_generation);
         let task_feature_flags = feature_flags.clone();
         let task_snapshot_scheduler = snapshot_scheduler.clone();
+        let task_node_manager = node_manager.clone();
         let sidecar_shutdown = shutdown_token.child_token();
         let sidecar_guard = crate::service::drain::CriticalTaskGuard::new(
             "sidecar watchdog",
@@ -760,6 +764,7 @@ impl SandboxWatchdog {
                 task_expected_route_verification_key_generation,
                 task_feature_flags,
                 sidecar_shutdown,
+                task_node_manager,
             )
             .await;
         });
@@ -777,6 +782,7 @@ impl SandboxWatchdog {
             auto_lifecycle,
             lifecycle_epochs,
             shutdown_token.child_token(),
+            node_manager.clone(),
         );
         task_tracker.spawn(async move {
             let _guard = health_guard;
@@ -789,6 +795,7 @@ impl SandboxWatchdog {
             network_policy_reconcile_queue,
             expected_route_verification_key_generation,
             feature_flags,
+            node_manager,
         }
     }
 
@@ -806,6 +813,7 @@ impl SandboxWatchdog {
                 db: db.clone(),
                 auto_lifecycle: auto_lifecycle.clone(),
                 health_lifecycle: lifecycle_epochs.clone(),
+                node_manager: NodeManagerConnector::host(),
             },
         )));
         Self::new(
@@ -818,6 +826,7 @@ impl SandboxWatchdog {
             shutdown_token,
             Arc::new(crate::service::drain::DrainState::default()),
             task_tracker,
+            NodeManagerConnector::host(),
         )
     }
 
@@ -1008,6 +1017,7 @@ impl SandboxWatchdog {
             &self.network_policy_reconcile_queue,
             &self.state,
             &self.feature_flags,
+            &self.node_manager,
         )
         .await
     }
@@ -1228,6 +1238,10 @@ fn system_time_to_timestamp(value: SystemTime) -> Option<prost_types::Timestamp>
     })
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the loop receives each long-lived watchdog dependency from the constructor"
+)]
 async fn sidecar_loop(
     state: Arc<Mutex<HashMap<String, SandboxHealth>>>,
     sidecars: Arc<Mutex<HashMap<String, SidecarInfo>>>,
@@ -1236,6 +1250,7 @@ async fn sidecar_loop(
     expected_route_verification_key_generation: Arc<AtomicU64>,
     feature_flags: pplx_space_feature_flags::FeatureFlagClient,
     shutdown_token: CancellationToken,
+    node_manager: NodeManagerConnector,
 ) {
     let mut interval = tokio::time::interval(SIDECAR_CHECK_INTERVAL);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -1260,6 +1275,7 @@ async fn sidecar_loop(
                     &network_policy_reconcile_queue,
                     &state,
                     &feature_flags,
+                    &node_manager,
                 )
                 .await;
                 false
@@ -1383,6 +1399,7 @@ async fn sidecar_loop(
             &network_policy_reconcile_queue,
             &state,
             &feature_flags,
+            &node_manager,
         )
         .await;
 
@@ -1410,6 +1427,10 @@ async fn sidecar_loop(
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each restart task needs the sidecar loop's long-lived dependencies"
+)]
 async fn fill_sidecar_restart_slots(
     queue: &mut SidecarRestartQueue,
     futures: &mut FuturesUnordered<SidecarRestartFuture>,
@@ -1418,6 +1439,7 @@ async fn fill_sidecar_restart_slots(
     network_policy_reconcile_queue: &NetworkPolicyReconcileQueue,
     state: &Arc<Mutex<HashMap<String, SandboxHealth>>>,
     feature_flags: &pplx_space_feature_flags::FeatureFlagClient,
+    node_manager: &NodeManagerConnector,
 ) {
     while futures.len() < SIDECAR_RESTART_CONCURRENCY {
         let Some(request) = queue.pop_front() else {
@@ -1446,12 +1468,13 @@ async fn fill_sidecar_restart_slots(
         let network_policy_reconcile_queue = network_policy_reconcile_queue.clone();
         let state = Arc::clone(state);
         let feature_flags = feature_flags.clone();
+        let node_manager = node_manager.clone();
         let task = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
             match request {
                 SidecarRestartRequest::SpacedHost(info) => watchdog_timeout(
                     SIDECAR_RESTART_TIMEOUT,
                     operation,
-                    restart_spaced_host(&info, db, sidecars),
+                    restart_spaced_host(&info, db, sidecars, &node_manager),
                 )
                 .await
                 .map(|_| ())
@@ -1466,6 +1489,7 @@ async fn fill_sidecar_restart_slots(
                         network_policy_reconcile_queue,
                         &state,
                         &feature_flags,
+                        &node_manager,
                     ),
                 )
                 .await
@@ -2107,6 +2131,10 @@ async fn probe_net_gateway_stats(
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the loop receives each long-lived watchdog dependency from the constructor"
+)]
 async fn composed_health_loop(
     state: Arc<Mutex<HashMap<String, SandboxHealth>>>,
     sidecars: Arc<Mutex<HashMap<String, SidecarInfo>>>,
@@ -2115,6 +2143,7 @@ async fn composed_health_loop(
     auto_lifecycle: AutoLifecycleCoordinator,
     lifecycle_epochs: HealthLifecycleEpochs,
     shutdown_token: CancellationToken,
+    node_manager: NodeManagerConnector,
 ) {
     let mut interval = tokio::time::interval(HEALTH_SCHEDULER_TICK);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -2201,8 +2230,10 @@ async fn composed_health_loop(
             {
                 diagnostics::report_transition(&evidence_queue, &transition);
             }
+            let node_manager = node_manager.clone();
             pending.spawn(async move {
-                let result = probe_composed_health(&sandbox_id, &info, lifecycle).await;
+                let result =
+                    probe_composed_health(&sandbox_id, &info, lifecycle, &node_manager).await;
                 (sandbox_id, lifecycle, lifecycle_epoch, result)
             });
         }
@@ -2256,8 +2287,9 @@ async fn probe_composed_health(
     sandbox_id: &str,
     info: &SidecarInfo,
     lifecycle: Option<crate::state::SandboxState>,
+    node_manager: &NodeManagerConnector,
 ) -> ComposedProbeResult {
-    let firecracker = probe_firecracker_health(sandbox_id, lifecycle);
+    let firecracker = probe_firecracker_health(sandbox_id, lifecycle, node_manager);
     let spaced_host = probe_spaced_host_health(sandbox_id);
     let spaced_guest = probe_spaced_guest_health(info, lifecycle);
     let net_gateway = probe_net_gateway_health(sandbox_id);
@@ -2293,6 +2325,7 @@ async fn read_guest_status_via_spaced_host(
 async fn probe_firecracker_health(
     sandbox_id: &str,
     lifecycle: Option<crate::state::SandboxState>,
+    node_manager: &NodeManagerConnector,
 ) -> HealthObservation {
     let started = Instant::now();
     if !firecracker_alive(sandbox_id) {
@@ -2308,7 +2341,7 @@ async fn probe_firecracker_health(
             return health_observation(started, HealthProbeOutcome::Unavailable, error.to_string());
         }
     };
-    match crate::firecracker_via_nodemgr::get_firecracker_vm_state(sandbox_id).await {
+    match crate::firecracker_via_nodemgr::get_firecracker_vm_state(sandbox_id, node_manager).await {
         Err(crate::firecracker_via_nodemgr::FirecrackerStateReadError::Timeout { .. }) => {
             health_observation(
                 started,
@@ -2814,8 +2847,9 @@ async fn restart_spaced_host(
     info: &SidecarInfo,
     db: Arc<std::sync::Mutex<rusqlite::Connection>>,
     sidecars: Arc<Mutex<HashMap<String, SidecarInfo>>>,
+    node_manager: &NodeManagerConnector,
 ) -> Result<(), SpacedHostRestartError> {
-    let mut node_client = pplx_space_node_mgr_client::connect().await?;
+    let mut node_client = node_manager.connect().await?;
 
     let id = &info.sandbox_id;
     let uid = info.uid.ok_or(SpacedHostRestartError::MissingUid)?;
@@ -2914,6 +2948,7 @@ async fn restart_netgtw(
     network_policy_reconcile_queue: NetworkPolicyReconcileQueue,
     state: &Arc<Mutex<HashMap<String, SandboxHealth>>>,
     feature_flags: &pplx_space_feature_flags::FeatureFlagClient,
+    node_manager: &NodeManagerConnector,
 ) -> Result<(), String> {
     relaunch_netgtw(
         info,
@@ -2922,6 +2957,7 @@ async fn restart_netgtw(
         &network_policy_reconcile_queue,
         state,
         feature_flags,
+        node_manager,
     )
     .await?;
     Ok(())
@@ -2943,14 +2979,13 @@ async fn relaunch_netgtw(
     network_policy_reconcile_queue: &NetworkPolicyReconcileQueue,
     state: &Arc<Mutex<HashMap<String, SandboxHealth>>>,
     feature_flags: &pplx_space_feature_flags::FeatureFlagClient,
+    node_manager: &NodeManagerConnector,
 ) -> Result<u32, String> {
     let sandbox_id = &info.sandbox_id;
     let uid = info
         .uid
         .ok_or_else(|| "missing sandbox uid for net-gateway restart".to_string())?;
-    let mut node_client = pplx_space_node_mgr_client::connect()
-        .await
-        .map_err(|e| e.to_string())?;
+    let mut node_client = node_manager.connect().await.map_err(|e| e.to_string())?;
 
     let args = net_gateway_relaunch_args(db, sandbox_id, feature_flags)
         .map_err(|error| error.to_string())?;

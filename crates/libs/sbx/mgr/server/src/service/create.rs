@@ -71,6 +71,7 @@ async fn reconstruct_encrypted_restore_devices(
     sandbox_id: &str,
     execution_fence: pplx_space_node_mgr_client::execution_fence::ExecutionFence,
     snapshot_dir: &str,
+    node_manager: &crate::node_manager_transport::NodeManagerConnector,
 ) -> Result<(String, String), Status> {
     let restore_source_if_present = |file: &str| -> Option<String> {
         let path = format!("{snapshot_dir}/{file}");
@@ -83,6 +84,7 @@ async fn reconstruct_encrypted_restore_devices(
         sandbox_id,
         execution_fence,
         cow_source.as_deref(),
+        node_manager,
     )
     .await
     .map_err(encrypted_restore_rootfs_error_status)?;
@@ -91,6 +93,7 @@ async fn reconstruct_encrypted_restore_devices(
         Some(execution_fence.into()),
         false,
         snapshot_restore_source.as_deref(),
+        node_manager,
     )
     .await
     .map_err(encrypted_restore_snapshot_error_status)?
@@ -337,7 +340,7 @@ impl SandboxManagerService {
         };
 
         if req.autostart {
-            let mut node_client = connect_node()
+            let mut node_client = connect_node(&self.node_manager)
                 .await
                 .map_err(|e| Status::internal(format!("cannot connect to node-manager: {e}")))?;
             self.reject_autostart_create_without_ready_slot(&mut node_client)
@@ -451,7 +454,7 @@ impl SandboxManagerService {
             }
 
             let status = match base_snapshot_memory_file_mib(snapshot_dir_resolved) {
-                Ok(snapshot_memory_mib) => match connect_node().await {
+                Ok(snapshot_memory_mib) => match connect_node(&self.node_manager).await {
                     Ok(mut node_client) => {
                         match Self::node_sandbox_memory_policy(&mut node_client).await {
                             Ok(node_memory_policy) => ensure_snapshot_memory_allowed(
@@ -656,7 +659,7 @@ impl SandboxManagerService {
             START_NODE_METADATA_TIMEOUT,
             id,
             async {
-                connect_node()
+                connect_node(&self.node_manager)
                     .await
                     .map_err(|e| Status::internal(format!("cannot connect to node-manager: {e}")))
             },
@@ -931,12 +934,17 @@ impl SandboxManagerService {
         // `encrypted` marker, which equals it by invariant); plaintext
         // sandboxes take the plaintext path with no service round-trip.
         let (rootfs_block_device_path, snapshot_volume_mount_dir) = if sandbox.volume_encryption {
-            match reconstruct_encrypted_restore_devices(id, execution_fence, &snapshot_dir)
-                .instrument(tracing::info_span!(
-                    "sbxmgr.restore.encrypted_devices_prepare",
-                    sandbox_id = %id
-                ))
-                .await
+            match reconstruct_encrypted_restore_devices(
+                id,
+                execution_fence,
+                &snapshot_dir,
+                &self.node_manager,
+            )
+            .instrument(tracing::info_span!(
+                "sbxmgr.restore.encrypted_devices_prepare",
+                sandbox_id = %id
+            ))
+            .await
             {
                 Ok((device_path, mount_dir)) => (Some(device_path), Some(mount_dir)),
                 Err(status) => {
@@ -1168,7 +1176,7 @@ impl SandboxManagerService {
                         resume_err = Some(e);
                         if attempt < 2 {
                             // Reconnect to node-manager in case the connection was reset
-                            if let Ok(new_client) = connect_node().await {
+                            if let Ok(new_client) = connect_node(&self.node_manager).await {
                                 node_client = new_client;
                             }
                             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -1320,7 +1328,7 @@ impl SandboxManagerService {
                 return Err(activation_cleanup.failure(error));
             }
             if sandbox.pool_template.is_none() {
-                cleanup_restored_snapshot_dir_async(id, &snapshot_dir);
+                cleanup_restored_snapshot_dir_async(id, &snapshot_dir, &self.node_manager);
             }
             activation_cleanup.complete_success();
         } else {

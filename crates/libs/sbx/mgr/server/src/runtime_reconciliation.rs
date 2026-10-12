@@ -86,8 +86,10 @@ where
 pub(crate) async fn observe_firecracker_vm_state(
     sandbox_id: &SandboxId,
     probe_context: &'static str,
+    node_manager: &crate::node_manager_transport::NodeManagerConnector,
 ) -> FirecrackerVmStateObservation {
-    match crate::firecracker_via_nodemgr::get_firecracker_vm_state(*sandbox_id).await {
+    match crate::firecracker_via_nodemgr::get_firecracker_vm_state(*sandbox_id, node_manager).await
+    {
         Ok(state) => FirecrackerVmStateObservation::Observed(state),
         Err(error) => {
             let reason = format!("Firecracker state probe failed: {error}");

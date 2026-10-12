@@ -1103,6 +1103,7 @@ async fn pause_failed_recovery_fixture(
             db: db.clone(),
             auto_lifecycle: auto_lifecycle.clone(),
             health_lifecycle: lifecycle_epochs.clone(),
+            node_manager: crate::node_manager_transport::NodeManagerConnector::host(),
         },
     )));
     snapshot_scheduler

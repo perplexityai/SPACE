@@ -851,7 +851,7 @@ impl SandboxManagerService {
         let mut snapshots = Vec::new();
         let mut response_budget = InventoryBudget::new(MAX_ITEMS, MAX_ENCODED_BYTES);
 
-        let mut node_client = connect_node()
+        let mut node_client = connect_node(&self.node_manager)
             .await
             .map_err(|e| Status::internal(format!("cannot connect to node-manager: {e}")))?;
 
@@ -1240,7 +1240,7 @@ impl SandboxManagerService {
                 .map(|artifact| artifact.local_path)
         });
 
-        let mut node_client = connect_node()
+        let mut node_client = connect_node(&self.node_manager)
             .await
             .map_err(|e| Status::internal(format!("cannot connect to node-manager: {e}")))?;
 
@@ -1486,7 +1486,7 @@ impl SandboxManagerService {
             })
             .await?;
 
-        let mut node_client = connect_node()
+        let mut node_client = connect_node(&self.node_manager)
             .await
             .map_err(|e| Status::internal(format!("cannot connect to node-manager: {e}")))?;
 

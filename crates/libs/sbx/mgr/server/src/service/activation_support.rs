@@ -1619,6 +1619,7 @@ pub(super) fn spawn_restore_state_transition(
     cleanup_id: SandboxCleanupEpisodeId,
 ) -> Result<(), Status> {
     let db = Arc::clone(&service.db);
+    let node_manager = service.node_manager.clone();
     service.spawn_state_writer("RestoreFinalizer", async move {
         match complete_restore_and_mark_final(
             db.clone(),
@@ -1631,7 +1632,7 @@ pub(super) fn spawn_restore_state_transition(
         {
             Ok(()) => {
                 if let Some(snapshot_dir) = snapshot_dir {
-                    cleanup_restored_snapshot_dir_async(&sandbox_id, &snapshot_dir);
+                    cleanup_restored_snapshot_dir_async(&sandbox_id, &snapshot_dir, &node_manager);
                 }
                 cleanup_guard.complete_success();
             }

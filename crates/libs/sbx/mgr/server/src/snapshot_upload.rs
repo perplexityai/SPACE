@@ -950,6 +950,7 @@ pub(crate) fn prepare_suspend_snapshot(
 /// replay after a worker restart rejoins vol-mgr's persisted transfer jobs.
 pub async fn submit_prepared_snapshot(
     prepared: &SnapshotUploadJobs,
+    node_manager: &crate::node_manager_transport::NodeManagerConnector,
 ) -> Result<SnapshotUploadJobs, String> {
     let mut prepared = prepared.clone();
     if !prepared.deferred_metadata
@@ -963,6 +964,7 @@ pub async fn submit_prepared_snapshot(
                 &prepared.meta.sandbox_id,
                 &prepared.snapshot_dir,
                 source_id,
+                node_manager,
             )
             .await
             .map_err(|error| error.to_string())?;

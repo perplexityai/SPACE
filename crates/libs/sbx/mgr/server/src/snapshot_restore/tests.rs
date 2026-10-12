@@ -1009,7 +1009,13 @@ async fn admission_rejection_preserves_completed_restore_work_for_retry() {
             None,
         ),
     );
-    handle_restore_stage_failure(&stage, target, &error).await;
+    handle_restore_stage_failure(
+        &stage,
+        target,
+        &error,
+        &crate::node_manager_transport::NodeManagerConnector::host(),
+    )
+    .await;
 
     assert!(
         sandbox_dir.exists(),

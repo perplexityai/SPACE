@@ -230,6 +230,7 @@ pub struct CheckpointContext {
     pub db: Arc<std::sync::Mutex<rusqlite::Connection>>,
     pub auto_lifecycle: crate::auto_lifecycle::AutoLifecycleCoordinator,
     pub health_lifecycle: crate::watchdog::HealthLifecycleEpochs,
+    pub node_manager: crate::node_manager_transport::NodeManagerConnector,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -421,7 +422,9 @@ async fn process_tick(
     checkpoint_tier: Option<CheckpointTier>,
     ctx: &CheckpointContext,
 ) -> Result<CheckpointCompletion, String> {
-    let mut node_client = pplx_space_node_mgr_client::connect()
+    let mut node_client = ctx
+        .node_manager
+        .connect()
         .await
         .map_err(|e| e.to_string())?;
 
@@ -687,6 +690,7 @@ async fn rollback_checkpoint_failure(
         let observation = observe_firecracker_vm_state(
             &sandbox_id_typed,
             "checkpoint rollback resume reconciliation",
+            &ctx.node_manager,
         )
         .await;
         if let Some(probe_error) = observation.unobservable_reason()
@@ -840,7 +844,7 @@ pub async fn do_checkpoint(
     }
 
     // 2. Connect to node-manager
-    let mut node_client = match pplx_space_node_mgr_client::connect().await {
+    let mut node_client = match ctx.node_manager.connect().await {
         Ok(node_client) => node_client,
         Err(error) => {
             restore_checkpoint_state_best_effort(ctx, sandbox_id, previous_state);
@@ -976,6 +980,7 @@ pub async fn do_checkpoint(
             let observation = observe_firecracker_vm_state(
                 &sandbox_id_typed,
                 "completed checkpoint resume reconciliation",
+                &ctx.node_manager,
             )
             .await;
             let reason = match observation.unobservable_reason() {

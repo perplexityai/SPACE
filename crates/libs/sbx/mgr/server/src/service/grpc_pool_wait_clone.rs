@@ -640,7 +640,7 @@ impl SandboxManagerService {
         &self,
         request: Request<CloneFromDonorRequest>,
     ) -> Result<Response<CloneFromDonorResponse>, Status> {
-        self.clone_from_donor_with_node(request, connect_clone_node())
+        self.clone_from_donor_with_node(request, connect_clone_node(&self.node_manager))
             .await
     }
 
@@ -872,18 +872,18 @@ impl SandboxManagerService {
     }
 }
 
-async fn connect_clone_node() -> Result<pplx_space_node_mgr_client::NodeManagerGrpcClient, Status> {
-    pplx_space_node_mgr_client::connect()
-        .await
-        .map_err(|error| match error {
-            pplx_space_node_mgr_client::ConnectError::InvalidUri(_) => {
-                Status::internal("node-manager endpoint is invalid")
-            }
-            pplx_space_node_mgr_client::ConnectError::Transport(_)
-            | pplx_space_node_mgr_client::ConnectError::Connect(_) => {
-                Status::unavailable("cannot connect to node-manager")
-            }
-        })
+async fn connect_clone_node(
+    node_manager: &crate::node_manager_transport::NodeManagerConnector,
+) -> Result<pplx_space_node_mgr_client::NodeManagerGrpcClient, Status> {
+    node_manager.connect().await.map_err(|error| match error {
+        pplx_space_node_mgr_client::ConnectError::InvalidUri(_) => {
+            Status::internal("node-manager endpoint is invalid")
+        }
+        pplx_space_node_mgr_client::ConnectError::Transport(_)
+        | pplx_space_node_mgr_client::ConnectError::Connect(_) => {
+            Status::unavailable("cannot connect to node-manager")
+        }
+    })
 }
 
 pub(super) fn pool_adoption_rollback_failure(original: Status, rollback: Status) -> Status {

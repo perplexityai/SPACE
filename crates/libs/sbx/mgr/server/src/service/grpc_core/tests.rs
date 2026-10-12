@@ -33,8 +33,8 @@ fn enter_isolated_test_process() -> bool {
 /// A service built from explicit options. `Default` options read the node
 /// identity from a fixed host file and probe runtimes under the fixed run
 /// directory; here the node identity is fixed, runtime liveness reads
-/// `scratch`, and the host-control and credential-manager sockets are absent
-/// paths under `scratch`.
+/// `scratch`, and the host-control, credential-manager and node-manager
+/// sockets are absent paths under `scratch`.
 fn isolated_service(
     conn: rusqlite::Connection,
     scratch: &std::path::Path,
@@ -57,6 +57,9 @@ fn isolated_service(
             node_role,
             node_managed_by: None,
             route_ed25519_verification_bundle: None,
+            node_manager: crate::node_manager_transport::fake::unbound(
+                &scratch.join("absent-node-manager.sock"),
+            ),
         },
     )
 }

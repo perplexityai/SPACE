@@ -72,6 +72,7 @@ const TRANSFER_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 pub(crate) fn build_worker(
     db: std::sync::Arc<std::sync::Mutex<rusqlite::Connection>>,
     drain_state: std::sync::Arc<crate::service::drain::DrainState>,
+    node_manager: crate::node_manager_transport::NodeManagerConnector,
 ) -> BackgroundWorker<SnapshotUploadExecutor> {
     let config = WorkerConfig::new(DEFAULT_CONCURRENCY, JOB_TIMEOUT, MAX_ATTEMPTS)
         .with_kind_concurrency(SNAPSHOT_UPLOAD_JOB_KIND, DEFAULT_CONCURRENCY)
@@ -80,8 +81,9 @@ pub(crate) fn build_worker(
         db: std::sync::Arc::clone(&db),
         drain_state,
         retained_source_inspector: std::sync::Arc::new(
-            crate::retained_source::NodeManagerSourceInspector,
+            crate::retained_source::NodeManagerSourceInspector(node_manager.clone()),
         ),
+        node_manager,
     };
     BackgroundWorker::new(db, executor, config)
 }
@@ -109,6 +111,7 @@ pub struct SnapshotUploadExecutor {
     /// Sizes a retained source before its stream is reclaimed, so the local
     /// sidecar can switch to counting the image the artifact keeps.
     retained_source_inspector: std::sync::Arc<dyn crate::retained_source::RetainedSourceInspector>,
+    node_manager: crate::node_manager_transport::NodeManagerConnector,
 }
 
 #[async_trait::async_trait]
@@ -170,11 +173,12 @@ impl JobExecutor for SnapshotUploadExecutor {
         // jobs survive it. Persist the durable transfer handles before allowing
         // a teardown-gated caller to release the runtime.
         if payload.job_ids.is_empty() {
-            payload = crate::snapshot_upload::submit_prepared_snapshot(&payload)
-                .await
-                .map_err(|error| {
-                    JobError::retriable(format!("vol-mgr submit prepared snapshot: {error}"))
-                })?;
+            payload =
+                crate::snapshot_upload::submit_prepared_snapshot(&payload, &self.node_manager)
+                    .await
+                    .map_err(|error| {
+                        JobError::retriable(format!("vol-mgr submit prepared snapshot: {error}"))
+                    })?;
             persist_submitted_transfer_ids(&self.db, &job.job_id, &payload)?;
         }
 

@@ -314,6 +314,7 @@ impl SandboxManagerService {
 pub(in crate::service) fn reclaim_garbage_now(
     sandbox_id: String,
     garbage: PathBuf,
+    node_manager: crate::node_manager_transport::NodeManagerConnector,
 ) -> Option<tokio::task::JoinHandle<()>> {
     // Admission and enqueue happen under the backlog lock, and a worker gives
     // its slot back under the same lock only after seeing the backlog empty,
@@ -326,7 +327,7 @@ pub(in crate::service) fn reclaim_garbage_now(
             Ok(permit) => permit,
             Err(_) => {
                 if backlog.len() < IMMEDIATE_RECLAIM_BACKLOG {
-                    backlog.push_back((sandbox_id, garbage));
+                    backlog.push_back((sandbox_id, garbage, node_manager));
                 } else {
                     tracing::debug!(sandbox_id, path = %garbage.display(), "immediate reclaim backlog full; the staging sweep collects the entry");
                 }
@@ -336,9 +337,10 @@ pub(in crate::service) fn reclaim_garbage_now(
     };
     Some(tokio::spawn(async move {
         let mut permit = Some(permit);
-        let mut next = Some((sandbox_id, garbage));
-        while let Some((sandbox_id, garbage)) = next {
-            reclaim_one(&sandbox_id, &garbage).await;
+        let mut next = Some((sandbox_id, garbage, node_manager));
+        // Each entry is deleted through the connector that submitted it.
+        while let Some((sandbox_id, garbage, node_manager)) = next {
+            reclaim_one(&sandbox_id, &garbage, &node_manager).await;
             let mut backlog = immediate_reclaim_backlog();
             next = backlog.pop_front();
             if next.is_none() {
@@ -349,15 +351,25 @@ pub(in crate::service) fn reclaim_garbage_now(
     }))
 }
 
-fn immediate_reclaim_backlog() -> std::sync::MutexGuard<'static, VecDeque<(String, PathBuf)>> {
-    static BACKLOG: std::sync::Mutex<VecDeque<(String, PathBuf)>> =
+type ReclaimEntry = (
+    String,
+    PathBuf,
+    crate::node_manager_transport::NodeManagerConnector,
+);
+
+fn immediate_reclaim_backlog() -> std::sync::MutexGuard<'static, VecDeque<ReclaimEntry>> {
+    static BACKLOG: std::sync::Mutex<VecDeque<ReclaimEntry>> =
         std::sync::Mutex::new(VecDeque::new());
     BACKLOG
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-async fn reclaim_one(sandbox_id: &str, garbage: &Path) {
+async fn reclaim_one(
+    sandbox_id: &str,
+    garbage: &Path,
+    node_manager: &crate::node_manager_transport::NodeManagerConnector,
+) {
     let local = {
         let garbage = garbage.to_path_buf();
         tokio::task::spawn_blocking(move || std::fs::remove_dir_all(&garbage)).await
@@ -374,7 +386,7 @@ async fn reclaim_one(sandbox_id: &str, garbage: &Path) {
             return;
         }
     };
-    let mut client = pplx_space_node_mgr_client::lazy();
+    let mut client = node_manager.lazy();
     let request = pplx_space_node_mgr_client::proto::DeleteCacheArtifactRequest {
         local_path: garbage.to_string_lossy().into_owned(),
     };

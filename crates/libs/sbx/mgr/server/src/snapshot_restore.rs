@@ -1256,6 +1256,7 @@ pub async fn prepare_restore_dir(
     sandbox_id: &str,
     execution_fence: pplx_space_node_mgr_client::execution_fence::ExecutionFence,
     transfer_scope_id: pplx_space_common_core::types::TransferScopeId,
+    node_manager: &crate::node_manager_transport::NodeManagerConnector,
 ) -> Result<RestorePrepared, RestoreError> {
     let latest = latest_ready_snapshot(sandbox_id).await?;
     let staged = restore_pull_metadata_from_source(
@@ -1264,7 +1265,7 @@ pub async fn prepare_restore_dir(
         RestoreMetadataDestination::InPlace(transfer_scope_id),
     )
     .await?;
-    restore_pull_rootfs(&staged, execution_fence).await?;
+    restore_pull_rootfs(&staged, execution_fence, node_manager).await?;
     Ok(RestorePrepared {
         snapshot_dir: staged.snapshot_dir,
         storage_uri: staged.storage_uri,
@@ -1278,6 +1279,7 @@ pub async fn prepare_restore_dir_from_uri(
     execution_fence: pplx_space_node_mgr_client::execution_fence::ExecutionFence,
     storage_uri: &str,
     transfer_scope_id: pplx_space_common_core::types::TransferScopeId,
+    node_manager: &crate::node_manager_transport::NodeManagerConnector,
 ) -> Result<RestorePrepared, RestoreError> {
     let config = SnapshotUploadConfig::from_uri(storage_uri)
         .map_err(|e| RestoreError::Other(format!("parse storage_uri: {e}")))?;
@@ -1290,7 +1292,7 @@ pub async fn prepare_restore_dir_from_uri(
         RestoreMetadataDestination::InPlace(transfer_scope_id),
     )
     .await?;
-    restore_pull_rootfs(&staged, execution_fence).await?;
+    restore_pull_rootfs(&staged, execution_fence, node_manager).await?;
     Ok(RestorePrepared {
         snapshot_dir: staged.snapshot_dir,
         storage_uri: staged.storage_uri,
@@ -1849,6 +1851,7 @@ fn preserve_attributed_metadata_retry(
 pub async fn restore_pull_rootfs(
     stage: &RestoreMetadataStaged,
     execution_fence: pplx_space_node_mgr_client::execution_fence::ExecutionFence,
+    node_manager: &crate::node_manager_transport::NodeManagerConnector,
 ) -> Result<(), RestoreError> {
     use pplx_space_node_mgr_client::execution_fence::InstanceTarget;
     let target = stage.filesystem_scope_id.map_or(
@@ -1879,7 +1882,7 @@ pub async fn restore_pull_rootfs(
         )
         .await;
         if let Err(ref e) = stage_result {
-            handle_restore_stage_failure(stage, target, e).await;
+            handle_restore_stage_failure(stage, target, e, node_manager).await;
         }
         return stage_result;
     }
@@ -1894,6 +1897,7 @@ pub async fn restore_pull_rootfs(
                 crate::snapshot_upload::artifact_kind_from_meta(&stage.meta),
                 stage.transfer_scope_id,
                 target,
+                node_manager,
             )
             .await
         }
@@ -1919,7 +1923,7 @@ pub async fn restore_pull_rootfs(
     };
 
     if let Err(ref e) = stage_result {
-        handle_restore_stage_failure(stage, target, e).await;
+        handle_restore_stage_failure(stage, target, e, node_manager).await;
     }
     stage_result
 }
@@ -1928,6 +1932,7 @@ async fn handle_restore_stage_failure(
     stage: &RestoreMetadataStaged,
     target: pplx_space_node_mgr_client::execution_fence::InstanceTarget,
     error: &RestoreError,
+    node_manager: &crate::node_manager_transport::NodeManagerConnector,
 ) {
     if matches!(error, RestoreError::AdmissionRejected(_)) {
         preserve_completed_restore_artifacts(stage);
@@ -1944,7 +1949,13 @@ async fn handle_restore_stage_failure(
         snapshot_dir = %stage.snapshot_dir.display(),
         "cross-node restore staging failed; removing partial artifacts"
     );
-    cleanup_partial_restore_artifacts(&stage.sandbox_dir, &stage.meta.sandbox_id, target).await;
+    cleanup_partial_restore_artifacts(
+        &stage.sandbox_dir,
+        &stage.meta.sandbox_id,
+        target,
+        node_manager,
+    )
+    .await;
 }
 
 fn preserve_completed_restore_artifacts(stage: &RestoreMetadataStaged) {
@@ -1990,6 +2001,7 @@ async fn cleanup_partial_restore_artifacts(
     sandbox_dir: &Path,
     sandbox_id: &str,
     target: pplx_space_node_mgr_client::execution_fence::InstanceTarget,
+    node_manager: &crate::node_manager_transport::NodeManagerConnector,
 ) {
     use pplx_space_node_mgr_client::execution_fence::InstanceTarget;
     let scope = match target {
@@ -2000,7 +2012,7 @@ async fn cleanup_partial_restore_artifacts(
         sandbox_dir,
         sandbox_id,
         scope,
-        crate::btrfs_via_nodemgr::delete_sandbox_instance(sandbox_id, target),
+        crate::btrfs_via_nodemgr::delete_sandbox_instance(sandbox_id, target, node_manager),
     )
     .await;
 }
@@ -2492,6 +2504,10 @@ async fn stage_encrypted_restore(
 /// deterministic `received_uuid`. Failure on any of these surfaces as
 /// `RestoreError::Other` with a precise diagnostic — the caller is
 /// responsible for cleanup of the partial staging directory.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each argument is an independent restore input; node-manager is the injected transport"
+)]
 async fn stage_btrfs_send_restore(
     identity: RestoreTransferIdentity<'_>,
     config: &SnapshotUploadConfig,
@@ -2500,6 +2516,7 @@ async fn stage_btrfs_send_restore(
     artifact_kind: ArtifactKind,
     transfer_scope_id: Option<pplx_space_common_core::types::TransferScopeId>,
     target: pplx_space_node_mgr_client::execution_fence::InstanceTarget,
+    node_manager: &crate::node_manager_transport::NodeManagerConnector,
 ) -> Result<(), RestoreError> {
     let sandbox_id = identity.sandbox_id;
     let sidecar_bytes = std::fs::read(sidecar_path).map_err(|e| {
@@ -2564,6 +2581,7 @@ async fn stage_btrfs_send_restore(
                 template_name,
                 content_hash,
                 target,
+                node_manager,
             )
             .instrument(tracing::info_span!(
                 "sbxmgr.start.stage",

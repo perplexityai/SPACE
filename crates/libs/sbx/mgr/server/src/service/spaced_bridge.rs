@@ -77,7 +77,11 @@ pub(super) async fn launch_spaced_host_via_node(
     }
 }
 
-pub(super) fn cleanup_restored_snapshot_dir_async(sandbox_id: &str, snapshot_dir: &str) {
+pub(super) fn cleanup_restored_snapshot_dir_async(
+    sandbox_id: &str,
+    snapshot_dir: &str,
+    node_manager: &crate::node_manager_transport::NodeManagerConnector,
+) {
     // The consumed snapshot moves into the staging sweep's lane first, so a
     // deferred capture's read-only subvolumes, which this service cannot
     // delete, have an owner even if nothing below runs; then it is reclaimed
@@ -91,6 +95,7 @@ pub(super) fn cleanup_restored_snapshot_dir_async(sandbox_id: &str, snapshot_dir
             drop(super::recovery::staging_cleanup::reclaim_garbage_now(
                 sandbox_id.to_string(),
                 garbage,
+                node_manager.clone(),
             ));
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -137,7 +142,7 @@ impl SandboxManagerService {
         }
 
         let runtime = spaced_endpoint_runtime_identity(sandbox)?;
-        let mut node_client = pplx_space_node_mgr_client::lazy();
+        let mut node_client = self.node_manager.lazy();
         let proof = match sandbox.spaced_endpoint_proof.clone() {
             Some(proof) => proof,
             None => {

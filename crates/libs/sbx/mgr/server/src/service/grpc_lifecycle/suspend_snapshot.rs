@@ -407,7 +407,7 @@ impl SandboxManagerService {
         // the success path. Harmless no-op on paths that never unsubscribed.
         let mut monitoring_guard = SuspendMonitoringGuard::new(self, &sandbox);
         let create_kind = "suspend";
-        let mut node_client = connect_node().await.map_err(|e| {
+        let mut node_client = connect_node(&self.node_manager).await.map_err(|e| {
             pplx_space_metrics::snapshot::create_failed(
                 create_kind,
                 create_codec,
@@ -533,6 +533,7 @@ impl SandboxManagerService {
                     sandbox.node_execution_fence(),
                     fresh,
                     None,
+                    &self.node_manager,
                 )
                 .await
                 {
@@ -595,6 +596,7 @@ impl SandboxManagerService {
                             &sandbox.id,
                             sandbox.node_execution_fence(),
                             "",
+                            &self.node_manager,
                         )
                         .await
                 {
@@ -649,6 +651,7 @@ impl SandboxManagerService {
                     &sandbox.id,
                     sandbox.node_execution_fence(),
                     &staging_dir_string,
+                    &self.node_manager,
                 )
                 .await
                 {
@@ -857,6 +860,7 @@ impl SandboxManagerService {
                         drop(crate::service::recovery::staging_cleanup::reclaim_garbage_now(
                             sandbox.id.clone(),
                             path,
+                            self.node_manager.clone(),
                         ));
                     }
                     None
@@ -1167,6 +1171,7 @@ impl SandboxManagerService {
                 .as_ref()
                 .ok_or_else(|| Status::failed_precondition("execution identity is missing"))?
                 .try_into()?,
+            &self.node_manager,
         )
         .await
         .map_err(|e| e.into_status())?;

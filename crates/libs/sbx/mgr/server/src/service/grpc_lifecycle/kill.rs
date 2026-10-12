@@ -36,7 +36,7 @@ impl SandboxManagerService {
         // Non-fatal signals (e.g. SIGHUP, SIGUSR1) are just forwarded to the process.
         let is_fatal = signal == 9 || signal == 15;
         if !is_fatal {
-            let mut node_client = connect_node()
+            let mut node_client = connect_node(&self.node_manager)
                 .await
                 .map_err(|e| Status::internal(format!("cannot connect to node-manager: {e}")))?;
             node_client
@@ -73,7 +73,7 @@ impl SandboxManagerService {
         let execution_fence = sandbox.node_execution_fence();
         let dispatch_error = match self
             .dispatch_node_action_using_admission(sandbox_id, &admission, || async move {
-                let mut node_client = connect_node().await.map_err(|error| {
+                let mut node_client = connect_node(&self.node_manager).await.map_err(|error| {
                     Status::internal(format!("cannot connect to node-manager: {error}"))
                 })?;
                 node_client

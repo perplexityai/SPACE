@@ -1908,6 +1908,7 @@ async fn confirmed_node_pause_reports_paused_and_carries_the_execution_fence() {
         previous_id: None,
     };
 
+    let connector = crate::node_manager_transport::fake::fixed_client(client.clone());
     let state = super::pause_with_reconciliation(
         &mut client,
         Some(fence.clone()),
@@ -1915,6 +1916,7 @@ async fn confirmed_node_pause_reports_paused_and_carries_the_execution_fence() {
         &sandbox_id,
         "pause failed",
         GuestSnapshotPreparationBudget::Standard,
+        &connector,
     )
     .await;
 

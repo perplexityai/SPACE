@@ -85,6 +85,7 @@ impl RouteTestService {
                 node_role: None,
                 node_managed_by: None,
                 route_ed25519_verification_bundle: None,
+                node_manager: crate::node_manager_transport::NodeManagerConnector::host(),
             },
         );
         Self {

@@ -37,7 +37,12 @@ impl SandboxManagerService {
                         row,
                         Path::new(RUN_DIR),
                         |id| async move {
-                            observe_firecracker_vm_state(&id, "startup resident recovery").await
+                            observe_firecracker_vm_state(
+                                &id,
+                                "startup resident recovery",
+                                &self.node_manager,
+                            )
+                            .await
                         },
                         |target| self.prepare_startup_resident(&prepare_row, target),
                     )
@@ -89,7 +94,12 @@ impl SandboxManagerService {
                     row,
                     Path::new(RUN_DIR),
                     |id| async move {
-                        observe_firecracker_vm_state(&id, "periodic resident recovery").await
+                        observe_firecracker_vm_state(
+                            &id,
+                            "periodic resident recovery",
+                            &self.node_manager,
+                        )
+                        .await
                     },
                     |target| self.prepare_startup_resident(&prepare_row, target),
                 )

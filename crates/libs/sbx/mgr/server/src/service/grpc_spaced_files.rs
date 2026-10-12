@@ -40,7 +40,7 @@ impl SandboxManagerService {
             .slot
             .ok_or_else(|| Status::failed_precondition("sandbox has no allocated network slot"))?;
 
-        let mut node_client = connect_node()
+        let mut node_client = connect_node(&self.node_manager)
             .await
             .map_err(|e| Status::internal(format!("cannot connect to node-manager: {e}")))?;
 
@@ -204,7 +204,7 @@ impl SandboxManagerService {
         }
 
         if updates_resources {
-            let mut node_client = connect_node()
+            let mut node_client = connect_node(&self.node_manager)
                 .await
                 .map_err(|e| Status::unavailable(format!("cannot connect to node-manager: {e}")))?;
 

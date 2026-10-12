@@ -410,7 +410,9 @@ impl SandboxManagerService {
                 .map_err(ArtifactBackupSubmissionError::Begin)?;
         }
         if payload.job_ids.is_empty() {
-            match crate::snapshot_upload::submit_prepared_snapshot(&payload).await {
+            match crate::snapshot_upload::submit_prepared_snapshot(&payload, &self.node_manager)
+                .await
+            {
                 Ok(submitted) => {
                     match crate::snapshot_upload_jobs::persist_submitted_transfer_ids(
                         &self.db, job_id, &submitted,

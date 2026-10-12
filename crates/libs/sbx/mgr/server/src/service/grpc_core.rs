@@ -1010,7 +1010,7 @@ impl SandboxManagerService {
 
         let mut usage_bytes = std::collections::HashMap::new();
         if !resolved_ids.is_empty() {
-            let mut client = connect_node()
+            let mut client = connect_node(&self.node_manager)
                 .await
                 .map_err(|e| Status::unavailable(format!("cannot connect to node-manager: {e}")))?;
             let response = client

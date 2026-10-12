@@ -129,7 +129,7 @@ impl SandboxManagerService {
         // check and the signal. That is not a failure: skip further signaling
         // and fall through to the relaunch, which either forks a fresh
         // gateway or recovers the watchdog's already-live replacement.
-        let mut node_client = connect_node()
+        let mut node_client = connect_node(&self.node_manager)
             .await
             .map_err(|error| fail(format!("cannot connect to node-manager: {error}")))?;
         let term_signalled = node_client

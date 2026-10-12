@@ -563,6 +563,7 @@ impl SandboxManagerService {
             pplx_space_node_mgr_client::execution_fence::InstanceTarget::RestoreScope(
                 transfer_scope_id,
             ),
+            &self.node_manager,
         )
         .await
         .map_err(|error| {
@@ -2204,7 +2205,7 @@ impl SandboxManagerService {
             admission,
             cleanup_id,
             || async move {
-                connect_node().await.map_err(|error| {
+                connect_node(&self.node_manager).await.map_err(|error| {
                     Status::internal(format!(
                         "{context}: cannot connect to node-manager: {error}"
                     ))
@@ -2526,7 +2527,7 @@ impl SandboxManagerService {
             || async move {
                 self.flush_guest_before_termination(dispatch_sandbox_id, dispatch_guest_flush)
                     .await;
-                let mut node_client = connect_node().await.map_err(|error| {
+                let mut node_client = connect_node(&self.node_manager).await.map_err(|error| {
                     Status::internal(format!(
                         "{dispatch_context}: cannot connect to node-manager: {error}"
                     ))
@@ -2772,7 +2773,8 @@ impl SandboxManagerService {
     /// [`BeforeStopFlush`].
     async fn resume_paused_vm_before_flush(&self, sandbox_id: &str) -> Result<(), StopFlushError> {
         let id = SandboxId::from_str(sandbox_id).map_err(StopFlushError::SandboxId)?;
-        let state = crate::firecracker_via_nodemgr::get_firecracker_vm_state(id).await;
+        let state =
+            crate::firecracker_via_nodemgr::get_firecracker_vm_state(id, &self.node_manager).await;
         if let Err(error) = &state {
             tracing::debug!(%sandbox_id, %error, "VM state unreadable before the stop flush");
         }
@@ -2786,7 +2788,9 @@ impl SandboxManagerService {
                         .map_err(StopFlushError::Fence)?
                         .map(Into::into)
                 };
-                let mut node_client = connect_node().await.map_err(StopFlushError::NodeManager)?;
+                let mut node_client = connect_node(&self.node_manager)
+                    .await
+                    .map_err(StopFlushError::NodeManager)?;
                 node_client
                     .resume_sandbox(ResumeSandboxRequest {
                         execution_fence,
