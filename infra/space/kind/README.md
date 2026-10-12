@@ -246,7 +246,11 @@ whenever its pod restarts:
 | Grafana | <http://localhost:13000> |
 
 Each backend's own `local.sh ui` helper uses the same port, for a backend
-installed on its own. Every signal can be read with `curl`:
+installed on its own. The typed `local.telemetry_reaches_local_backends`
+scenario reads these forwards, so it needs them (`bootstrap.sh
+--no-port-forward` turns them off). The suite skips it on a bench running
+another mode, but fails if that is not the mode the runner's
+`SPACE_KIND_TELEMETRY_MODE` names. Every signal can be read with `curl`:
 
 ```bash
 now=$(date +%s)

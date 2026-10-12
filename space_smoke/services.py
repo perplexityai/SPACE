@@ -110,6 +110,15 @@ class SmokeServices:
         if self.kind is not None:
             self.kind.bootstrap()
 
+    def telemetry_mode(self) -> str:
+        """The telemetry mode of the Kind bench, read from the cluster."""
+
+        if self.kind is None:
+            raise SmokeConfigurationError(
+                "the telemetry mode is only readable on the kind backend"
+            )
+        return self.kind.telemetry_mode()
+
     def fixture(
         self,
         fixture_type: type[Fixture],

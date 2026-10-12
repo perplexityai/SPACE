@@ -52,6 +52,7 @@ class SmokeSuiteTests(unittest.TestCase):
         self,
     ) -> None:
         services = mock.Mock()
+        services.telemetry_mode.return_value = "otel"
         selected = tuple(
             scenario
             for scenario in REGISTRY
@@ -65,6 +66,11 @@ class SmokeSuiteTests(unittest.TestCase):
         )
 
         with (
+            mock.patch.dict(
+                "space_smoke.__main__.os.environ",
+                {"SPACE_SMOKE_BACKEND": "kind", "SPACE_SMOKE_API_SURFACE": "ecw"},
+                clear=True,
+            ),
             mock.patch(
                 "space_smoke.__main__.SmokeServices.from_environment",
                 return_value=services,
@@ -95,6 +101,7 @@ class SmokeSuiteTests(unittest.TestCase):
         # Quarantine a copy of a real scenario rather than reading the live
         # quarantine list, which is usually empty and would make this vacuous.
         services = mock.Mock()
+        services.telemetry_mode.return_value = "otel"
         live = tuple(
             scenario
             for scenario in REGISTRY
@@ -111,6 +118,11 @@ class SmokeSuiteTests(unittest.TestCase):
         )
         stdout = StringIO()
         with (
+            mock.patch.dict(
+                "space_smoke.__main__.os.environ",
+                {"SPACE_SMOKE_BACKEND": "kind", "SPACE_SMOKE_API_SURFACE": "ecw"},
+                clear=True,
+            ),
             mock.patch("space_smoke.__main__.REGISTRY", registry),
             mock.patch(
                 "space_smoke.__main__.SmokeServices.from_environment",

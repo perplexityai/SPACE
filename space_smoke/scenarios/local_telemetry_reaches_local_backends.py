@@ -7,7 +7,7 @@ MARKER = "space-smoke-telemetry-ok"
 
 # The reads poll for this scenario's own sandbox; Tempo's 30 s search cutoff
 # sets the floor (see space_smoke/telemetry_delivery.py).
-@smoke.scenario("local.telemetry_reaches_local_backends")
+@smoke.scenario("local.telemetry_reaches_local_backends", telemetry_mode="otel")
 def telemetry_reaches_local_backends(test: smoke.KindEcw) -> None:
     """Once a sandbox has run a command, Tempo returns one trace in which
     space-api created it and containerd-shim-space-v2 started it, Prometheus

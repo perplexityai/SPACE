@@ -2857,11 +2857,21 @@ class KindEcw(Ecw):
             )
         if self._telemetry_assertions is None:
             # The phases recorded so far, sandbox creation included, measure
-            # how long ago the scenario began.
+            # how long ago the scenario began. Taken before the mode read so
+            # its kubectl time does not shorten the window.
             phases = self._context.evidence.get("phases") or []
             elapsed = sum(float(phase["duration_seconds"]) for phase in phases)
+            since = time.time() - elapsed
+            # The suite skips this scenario only on a bench in another known
+            # mode. Wherever it runs, a bench not in otel mode is refused
+            # here, not left to read backends that are not installed.
+            mode = self._telemetry_control.telemetry_mode()
+            if mode != "otel":
+                raise SmokeConfigurationError(
+                    f"the local telemetry backends run only in otel mode; the bench runs {mode}"
+                )
             self._telemetry_assertions = TelemetryDeliveryAssertions(
-                self, self._telemetry_control, since=time.time() - elapsed
+                self, self._telemetry_control, since=since
             )
         return self._telemetry_assertions
 

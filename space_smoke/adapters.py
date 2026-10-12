@@ -140,6 +140,28 @@ def _require_ok(result: CommandResult, action: str) -> str:
     return result.stdout
 
 
+def _env_literals(
+    entries: Any, keys: Sequence[str], *, owner: str, value_from_refusal: str
+) -> dict[str, str | None]:
+    """The literal each key holds in a container's `env` entries, None if unset.
+
+    A `valueFrom` entry for a key is refused, naming `owner`, with the
+    caller's reason.
+    """
+
+    standing: dict[str, str | None] = {key: None for key in keys}
+    for entry in entries:
+        if not isinstance(entry, dict) or entry.get("name") not in standing:
+            continue
+        if "valueFrom" in entry:
+            raise SmokeConfigurationError(
+                f"{entry['name']} on {owner} is a valueFrom reference{value_from_refusal}"
+            )
+        value = entry.get("value")
+        standing[entry["name"]] = value if isinstance(value, str) else ""
+    return standing
+
+
 def _truthy_default(value: str | None, default: bool) -> bool:
     """Match cluster-controller's accepted boolean environment vocabulary."""
 
@@ -368,6 +390,13 @@ KIND_TELEMETRY_BACKENDS = {
     "prometheus": "http://127.0.0.1:19090",
     "tempo": "http://127.0.0.1:13200",
     "loki": "http://127.0.0.1:13101",
+}
+# Each Kind telemetry mode by the (SPACE_METRICS_SINK, SPACE_TRACE_EXPORTER) it
+# gives space-api; MODES in infra/space/kind/scripts/telemetry_config.py sets them.
+KIND_TELEMETRY_MODES = {
+    ("datadog", "datadog"): "datadog",
+    ("otlp", "otlp"): "otel",
+    ("off", "off"): "off",
 }
 # The suspend codec facts sbx-manager seals into the published sidecar and
 # reports on its own `artifact_backup_queued` event.
@@ -2687,19 +2716,10 @@ ON CONFLICT (key_hash) DO NOTHING;
             "jsonpath={.spec.template.spec.containers[0].env}", timeout=15,
         )
         _require_ok(result, f"read env of {name}")
-        wanted = set(keys)
-        standing: dict[str, str | None] = {key: None for key in keys}
-        for entry in json.loads(result.stdout or "[]"):
-            if not isinstance(entry, dict) or entry.get("name") not in wanted:
-                continue
-            if "valueFrom" in entry:
-                raise SmokeConfigurationError(
-                    f"{entry['name']} on {name} is a valueFrom reference; refusing to override "
-                    "what a literal restore could not put back"
-                )
-            value = entry.get("value")
-            standing[entry["name"]] = value if isinstance(value, str) else ""
-        return standing
+        return _env_literals(
+            json.loads(result.stdout or "[]"), keys, owner=name,
+            value_from_refusal="; refusing to override what a literal restore could not put back",
+        )
 
     def _set_deployment_env(self, name: str, values: Mapping[str, str | None], *, timeout: float) -> None:
         if self._set_deployment_env_only(name, values):
@@ -3624,26 +3644,7 @@ ON CONFLICT (key_hash) DO NOTHING;
         reference and the restore could not put it back.
         """
 
-        name = self._public_api_deployment()
-        result = self.kubectl(
-            "get", "deploy", name, "-o",
-            "jsonpath={.spec.template.spec.containers[0].env}", timeout=15,
-        )
-        _require_ok(result, f"read env of {name}")
-        entries = json.loads(result.stdout or "[]")
-        wanted = set(keys)
-        standing: dict[str, str | None] = {key: None for key in keys}
-        for entry in entries:
-            if not isinstance(entry, dict) or entry.get("name") not in wanted:
-                continue
-            if "valueFrom" in entry:
-                raise SmokeConfigurationError(
-                    f"{entry['name']} on {name} is a valueFrom reference; refusing to override "
-                    "what a literal restore could not put back"
-                )
-            value = entry.get("value")
-            standing[entry["name"]] = value if isinstance(value, str) else ""
-        return standing
+        return self._deployment_env_literals(self._public_api_deployment(), keys)
 
     def _apply_public_api_env(self, values: Mapping[str, str | None], action: str) -> None:
         from space_smoke.rate_limiters import LIMITER_ENV_KEYS
@@ -4262,16 +4263,53 @@ ON CONFLICT (key_hash) DO NOTHING;
         return ticks
 
     def telemetry_query(self, backend: str, path: str, params: Mapping[str, str]) -> Any:
-        url = KIND_TELEMETRY_BACKENDS[backend] + path
+        base = KIND_TELEMETRY_BACKENDS[backend]
+        url = base + path
         if params:
             url += "?" + urlencode(params)
         try:
             with urlopen(Request(url), timeout=30) as response:
                 return json.load(response)
         except HTTPError as error:
-            raise RuntimeError(f"query {backend} {path} returned HTTP {error.code}") from None
+            raise RuntimeError(f"query {backend} {path} at {base} returned HTTP {error.code}") from None
         except (URLError, OSError, ValueError) as error:
-            raise RuntimeError(f"query {backend} {path} at {url} failed: {error}") from None
+            # The URL a forward serves, not the long query string.
+            reason = error.reason if isinstance(error, URLError) else error
+            raise RuntimeError(f"query {backend} {path} at {base} failed: {reason}") from None
+
+    def telemetry_mode(self) -> str:
+        name = self._public_api_deployment()
+        exporters = self._read_deployment_env(name, ("SPACE_METRICS_SINK", "SPACE_TRACE_EXPORTER"))
+        metrics, traces = exporters["SPACE_METRICS_SINK"], exporters["SPACE_TRACE_EXPORTER"]
+        mode = KIND_TELEMETRY_MODES.get((metrics, traces))
+        if mode is None:
+            raise SmokeConfigurationError(
+                f"{name} runs no Kind telemetry mode: SPACE_METRICS_SINK={metrics or 'unset'}, "
+                f"SPACE_TRACE_EXPORTER={traces or 'unset'}"
+            )
+        return mode
+
+    def _read_deployment_env(self, name: str, keys: Sequence[str]) -> dict[str, str | None]:
+        """The literal each key holds on a Deployment's first container, None if unset.
+
+        Read-only. A value Kubernetes resolves at runtime, from a `valueFrom`
+        reference or an `envFrom` source, is refused rather than read as unset.
+        """
+
+        result = self.kubectl(
+            "get", "deploy", name, "-o", "jsonpath={.spec.template.spec.containers[0]}", timeout=15,
+        )
+        container = json.loads(_require_ok(result, f"read the container of {name}") or "{}")
+        values = _env_literals(
+            container.get("env") or [], keys, owner=name,
+            value_from_refusal=", not a literal to read",
+        )
+        unset = [key for key, value in values.items() if value is None]
+        if unset and container.get("envFrom"):
+            raise SmokeConfigurationError(
+                f"{', '.join(unset)} on {name} may come from its envFrom sources, which are not read"
+            )
+        return values
 
 
 def _node_service_selector(component: str, *, role: str = KIND_WORKER_ROLE) -> str:

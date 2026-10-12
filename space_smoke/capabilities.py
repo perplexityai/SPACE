@@ -1120,6 +1120,8 @@ class KindEnvironment(Protocol):
 
     def bootstrap(self) -> None: ...
 
+    def telemetry_mode(self) -> str: ...
+
     def admin_request(
         self, method: str, resource: str, body: dict[str, object] | None = None,
         *, expected: tuple[int, ...] = (200, 201, 202, 204),
@@ -2125,4 +2127,14 @@ class TelemetryBackendControl(Protocol):
 
     def telemetry_query(self, backend: str, path: str, params: Mapping[str, str]) -> Any:
         """The decoded JSON body of `GET <path>?<params>` on `prometheus`, `tempo` or `loki`."""
+        ...
+
+    def telemetry_mode(self) -> str:
+        """The Kind telemetry mode (`datadog`, `otel` or `off`) the bench runs.
+
+        Read from the space-api Deployment's metrics sink and trace exporter,
+        never from this runner's environment, which need not have brought the
+        bench up. Exporters that match no mode, or that are not literals, raise
+        `SmokeConfigurationError` naming what was found.
+        """
         ...
