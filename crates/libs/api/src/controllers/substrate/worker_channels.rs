@@ -92,9 +92,15 @@ impl WorkerChannels {
         Ok(RuntimeClient::new(result?))
     }
 
-    /// How long one dial may take: every attempt its retry policy allows.
+    /// How long one dial may take: every attempt its retry policy allows and
+    /// the internal-transport TLS handshake after them. A plaintext dial ends
+    /// sooner on its own.
     fn dial_budget(&self) -> Duration {
-        self.retry_policy.max_elapsed + self.connect_timeout
+        pplx_space_common_grpc::retrying_redial_bound(
+            self.retry_policy,
+            self.connect_timeout,
+            Some(pplx_space_common_grpc::internal_transport::CLIENT_TLS_HANDSHAKE_TIMEOUT),
+        )
     }
 
     fn dial(&self, addr: &str) -> BoxFuture<'static, Result<Channel, ControllerError>> {
@@ -108,10 +114,13 @@ impl WorkerChannels {
             let endpoint = super::node_api_endpoint(&addr, connect_timeout, request_timeout)
                 .map_err(ControllerError::from)?;
             let endpoint = super::node_api_transport(endpoint).await?;
+            let tls_handshake_timeout =
+                pplx_space_common_grpc::internal_transport::client_tls_handshake_timeout(&endpoint);
             pplx_space_common_grpc::connect_tcp_channel_with_retrying_redials(
                 "worker-node-api",
                 endpoint,
                 connect_timeout,
+                tls_handshake_timeout,
                 retry_policy,
             )
             .await

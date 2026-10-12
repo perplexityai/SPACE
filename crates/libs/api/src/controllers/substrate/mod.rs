@@ -3914,10 +3914,13 @@ pub(super) async fn require_activation_policy_support(
 
 pub async fn connect_worker(endpoint: Endpoint) -> Result<RuntimeClient, ControllerError> {
     let endpoint = node_api_transport(endpoint).await?;
+    let tls_handshake_timeout =
+        pplx_space_common_grpc::internal_transport::client_tls_handshake_timeout(&endpoint);
     let channel = pplx_space_common_grpc::connect_tcp_channel_with_retry(
         "worker-node-api",
         "worker-node-api",
         endpoint,
+        tls_handshake_timeout,
         pplx_space_common_grpc::DEFAULT_TCP_GRPC_CONNECT_RETRY_POLICY,
     )
     .await
@@ -3931,10 +3934,13 @@ pub async fn connect_worker_internal(
     endpoint: Endpoint,
 ) -> Result<RuntimeInternalClient, ControllerError> {
     let endpoint = node_api_transport(endpoint).await?;
+    let tls_handshake_timeout =
+        pplx_space_common_grpc::internal_transport::client_tls_handshake_timeout(&endpoint);
     let channel = pplx_space_common_grpc::connect_tcp_channel_with_retry(
         "worker-node-api-internal",
         "worker-node-api-internal",
         endpoint,
+        tls_handshake_timeout,
         pplx_space_common_grpc::DEFAULT_TCP_GRPC_CONNECT_RETRY_POLICY,
     )
     .await
@@ -3951,10 +3957,13 @@ pub async fn connect_worker_internal(
 
 pub async fn connect_builder(endpoint: Endpoint) -> Result<BuilderClient, ControllerError> {
     let endpoint = node_api_transport(endpoint).await?;
+    let tls_handshake_timeout =
+        pplx_space_common_grpc::internal_transport::client_tls_handshake_timeout(&endpoint);
     let channel = pplx_space_common_grpc::connect_tcp_channel_with_retry(
         "builder-node-api",
         "builder-node-api",
         endpoint,
+        tls_handshake_timeout,
         pplx_space_common_grpc::DEFAULT_TCP_GRPC_CONNECT_RETRY_POLICY,
     )
     .await

@@ -157,10 +157,13 @@ impl KubernetesSubstrate {
         )
         .map_err(ControllerError::from)?;
         let endpoint = crate::controllers::substrate::node_api_transport(endpoint).await?;
+        let tls_handshake_timeout =
+            pplx_space_common_grpc::internal_transport::client_tls_handshake_timeout(&endpoint);
         let channel = pplx_space_common_grpc::connect_tcp_channel_with_retry(
             "builder-node-api",
             addr,
             endpoint,
+            tls_handshake_timeout,
             pplx_space_common_grpc::DEFAULT_TCP_GRPC_CONNECT_RETRY_POLICY,
         )
         .await

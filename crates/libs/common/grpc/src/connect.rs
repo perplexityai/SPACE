@@ -39,22 +39,37 @@ pub enum TcpConnectError {
     },
 }
 
-/// Bound for a client TLS handshake. The internal-transport and
-/// credential-manager client TLS configs set it, so a peer that accepts TCP
-/// but never answers the ClientHello fails each dial of their channels,
-/// reconnects included, instead of holding it. It is also what a TCP connect
-/// attempt is allowed beyond its TCP dial, so a handshake within this bound
-/// always fits the attempt cap.
-pub const CLIENT_TLS_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+/// What a TCP connect attempt allows for name resolution, which runs before
+/// the TCP dial and which no tonic timeout bounds.
+const NAME_RESOLUTION_ALLOWANCE: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// The TCP dial bound assumed for an endpoint that sets no `connect_timeout`.
 const DEFAULT_TCP_DIAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
-/// How long one TCP connect attempt may run: its TCP dial, plus name
-/// resolution, the TLS handshake and the HTTP/2 preface, which tonic's
-/// `connect_timeout` does not bound.
-fn tcp_attempt_cap(dial_timeout: std::time::Duration) -> std::time::Duration {
-    dial_timeout + CLIENT_TLS_HANDSHAKE_TIMEOUT
+/// How long one TCP connect attempt may run: [`NAME_RESOLUTION_ALLOWANCE`],
+/// then its TCP dial, then the TLS handshake, if any, within its own bound.
+/// An attempt whose lookup, dial and handshake each finish within their share
+/// fits, so a handshake that reaches its TLS bound fails with that cause
+/// before the attempt is abandoned. The HTTP/2 preface only writes to a fresh
+/// socket and gets no share.
+fn tcp_attempt_cap(
+    dial_timeout: std::time::Duration,
+    tls_handshake_timeout: Option<std::time::Duration>,
+) -> std::time::Duration {
+    NAME_RESOLUTION_ALLOWANCE + dial_timeout + tls_handshake_timeout.unwrap_or_default()
+}
+
+/// [`tcp_attempt_cap`] for `endpoint`'s own dial bound.
+fn endpoint_attempt_cap(
+    endpoint: &tonic::transport::Endpoint,
+    tls_handshake_timeout: Option<std::time::Duration>,
+) -> std::time::Duration {
+    tcp_attempt_cap(
+        endpoint
+            .get_connect_timeout()
+            .unwrap_or(DEFAULT_TCP_DIAL_TIMEOUT),
+        tls_handshake_timeout,
+    )
 }
 
 /// Retry only initial Unix-socket channel establishment.
@@ -230,26 +245,30 @@ pub fn connect_uds_channel_lazy(
 /// [`crate::retry_grpc_status_with_context`] operation unless a separate
 /// connect-only retry budget is intentional.
 ///
-/// Each attempt (name resolution, the TCP dial the endpoint's
-/// `connect_timeout` bounds, TLS and the HTTP/2 preface) is abandoned after the
-/// endpoint's `connect_timeout` (3s when it sets none) plus
-/// [`CLIENT_TLS_HANDSHAKE_TIMEOUT`], and redialed while the policy's
-/// `max_elapsed` remains. That budget is checked between attempts, so the call
-/// takes at most `max_elapsed` plus one attempt cap: 16s for
-/// [`crate::DEFAULT_TCP_GRPC_CONNECT_RETRY_POLICY`] and a 3s `connect_timeout`.
-/// The returned channel's later reconnects are outside these bounds; a TLS
-/// config should set [`CLIENT_TLS_HANDSHAKE_TIMEOUT`] to bound their handshake.
+/// `tls_handshake_timeout` is the bound the endpoint's TLS config sets on its
+/// handshake (`ClientTlsConfig::timeout`), or `None` for a plaintext endpoint;
+/// tonic does not expose it, so the caller states it. Each attempt (name
+/// resolution, the TCP dial the endpoint's `connect_timeout` bounds, TLS and
+/// the HTTP/2 preface) is abandoned after a 3s name-resolution allowance plus
+/// the endpoint's `connect_timeout` (3s when it sets none) plus
+/// `tls_handshake_timeout`, and redialed while the policy's `max_elapsed`
+/// remains. An attempt whose lookup takes at most that allowance and whose
+/// dial stays within `connect_timeout` therefore fails with the handshake's
+/// own cause when the handshake reaches its bound. The budget is checked between attempts, so the call takes at
+/// most `max_elapsed` plus one attempt cap. With
+/// [`crate::DEFAULT_TCP_GRPC_CONNECT_RETRY_POLICY`] and a 3s
+/// `connect_timeout`: 31s with the 15s internal-transport handshake bound, 19s
+/// with a 3s one, 16s for plaintext. The returned channel's later reconnects
+/// are outside these bounds; only the TLS config's own timeout bounds their
+/// handshake.
 pub async fn connect_tcp_channel_with_retry(
     service_name: &'static str,
     target: impl AsRef<str>,
     endpoint: tonic::transport::Endpoint,
+    tls_handshake_timeout: Option<std::time::Duration>,
     retry_policy: GrpcRetryPolicy,
 ) -> Result<tonic::transport::Channel, TcpConnectError> {
-    let attempt_cap = tcp_attempt_cap(
-        endpoint
-            .get_connect_timeout()
-            .unwrap_or(DEFAULT_TCP_DIAL_TIMEOUT),
-    );
+    let attempt_cap = endpoint_attempt_cap(&endpoint, tls_handshake_timeout);
     retry_tcp_connect(
         service_name,
         target.as_ref(),
@@ -328,20 +347,26 @@ where
 /// channel retries every later redial, after a connection drops, with the same
 /// policy, spans and metrics: a call that arrives while the peer restarts
 /// waits for it, as a call on a freshly dialed channel would. Each TCP dial is
-/// bounded by `attempt_timeout`, and each attempt, name resolution included,
-/// by `attempt_timeout` plus [`CLIENT_TLS_HANDSHAKE_TIMEOUT`]. Only those
-/// attempts are retried: TLS, when the endpoint configures it, is layered on
-/// top by the channel once one succeeds, its handshake bounded by the TLS
-/// config's timeout when it sets one. The endpoint bounds each whole dial or redial, retries
-/// and TLS included, at `max_elapsed` plus `attempt_timeout`.
+/// bounded by `attempt_timeout`, and each attempt, by a 3s name-resolution
+/// allowance plus `attempt_timeout`. Only those attempts are retried: TLS,
+/// when the endpoint configures it, is layered on top by the channel once one
+/// succeeds, its handshake bounded by `tls_handshake_timeout`, which must be
+/// the bound the endpoint's TLS config sets (`None` for plaintext). Each whole
+/// dial or redial is bounded at [`retrying_redial_bound`].
 pub async fn connect_tcp_channel_with_retrying_redials(
     service_name: &'static str,
     endpoint: tonic::transport::Endpoint,
     attempt_timeout: std::time::Duration,
+    tls_handshake_timeout: Option<std::time::Duration>,
     retry_policy: GrpcRetryPolicy,
 ) -> Result<tonic::transport::Channel, tonic::transport::Error> {
-    // The connector bounds each dial; the endpoint's bound covers the retries.
-    let endpoint = endpoint.connect_timeout(retry_policy.max_elapsed + attempt_timeout);
+    // The connector bounds each attempt; the endpoint's bound covers the
+    // retries and the TLS handshake after them.
+    let endpoint = endpoint.connect_timeout(retrying_redial_bound(
+        retry_policy,
+        attempt_timeout,
+        tls_handshake_timeout,
+    ));
     let mut http = hyper_util::client::legacy::connect::HttpConnector::new();
     http.enforce_http(false);
     http.set_nodelay(true);
@@ -351,9 +376,25 @@ pub async fn connect_tcp_channel_with_retrying_redials(
             http,
             service_name,
             retry_policy,
-            attempt_cap: tcp_attempt_cap(attempt_timeout),
+            attempt_cap: tcp_attempt_cap(attempt_timeout, None),
         })
         .await
+}
+
+/// How long one whole dial or redial of a
+/// [`connect_tcp_channel_with_retrying_redials`] channel may take: every
+/// attempt the policy starts, the last one's cap, and the TLS handshake after
+/// it. With [`crate::DEFAULT_TCP_GRPC_CONNECT_RETRY_POLICY`] and a 3s
+/// `attempt_timeout`: 31s with the 15s internal-transport handshake bound,
+/// 16s for plaintext.
+pub fn retrying_redial_bound(
+    retry_policy: GrpcRetryPolicy,
+    attempt_timeout: std::time::Duration,
+    tls_handshake_timeout: Option<std::time::Duration>,
+) -> std::time::Duration {
+    retry_policy.max_elapsed
+        + tcp_attempt_cap(attempt_timeout, None)
+        + tls_handshake_timeout.unwrap_or_default()
 }
 
 #[derive(Clone)]

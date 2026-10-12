@@ -82,8 +82,14 @@ identity-free development listeners. Clients do not perform protocol fallback.
 Listeners admit at most 64 pending TLS handshakes, each with a ten-second
 deadline. Established channels do not consume that budget. Shutdown releases
 the listening socket even when handshake admission is saturated. Clients give
-each handshake, reconnects included, three seconds, so a listener that accepts
-TCP but never answers fails the dial instead of holding it.
+each handshake, reconnects included, fifteen seconds: the listener's ten-second
+deadline plus five seconds, because a listener takes a handshake slot before it
+accepts, so while every slot is busy a connected socket first waits in the
+kernel accept queue, and that wait counts against the client's timer but not the
+listener's. A listener that accepts TCP but never answers therefore fails the
+dial instead of holding it, while a briefly saturated one can still finish the
+handshake. No client bound can guarantee a handshake while a listener stays
+saturated.
 
 Migrate every caller and operational tool to TLS before deploying TLS-only
 listener images. Verify lifecycle, discovery, reconciliation, artifact transfers

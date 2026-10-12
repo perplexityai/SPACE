@@ -14,6 +14,22 @@ pub const CA_ENV: &str = "SPACE_INTERNAL_RPC_TLS_CA";
 pub const CERT_ENV: &str = "SPACE_INTERNAL_RPC_TLS_CERT";
 pub const KEY_ENV: &str = "SPACE_INTERNAL_RPC_TLS_KEY";
 
+/// How long a listener gives an accepted connection to finish its TLS
+/// handshake. TLS negotiation happens before bearer admission, so an idle peer
+/// must not retain a pre-authentication handshake forever.
+pub const SERVER_TLS_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Bound for an internal-RPC client's TLS handshake, every handshake of a
+/// channel included. It must exceed [`SERVER_TLS_HANDSHAKE_TIMEOUT`]: a
+/// listener takes one of its handshake slots before it accepts, so while every
+/// slot is busy a connected socket waits in the kernel accept queue, and that
+/// wait counts against the client's timer, which starts once TCP connects,
+/// but not against the server's, which starts at accept. The extra five
+/// seconds absorb a short queue; no client bound can guarantee a handshake
+/// while a listener stays saturated.
+pub const CLIENT_TLS_HANDSHAKE_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(SERVER_TLS_HANDSHAKE_TIMEOUT.as_secs() + 5);
+
 #[derive(Clone, Copy, Debug)]
 pub enum Service {
     ClusterApi,
@@ -172,7 +188,7 @@ impl ClientTransport {
                 let tls = ClientTlsConfig::new()
                     .ca_certificate(Certificate::from_pem(ca))
                     .domain_name(name)
-                    .timeout(crate::CLIENT_TLS_HANDSHAKE_TIMEOUT);
+                    .timeout(CLIENT_TLS_HANDSHAKE_TIMEOUT);
                 // Validate the fixed trust/name once before an endpoint discovery
                 // closure uses it for individual pod addresses.
                 Endpoint::from(uri.clone()).tls_config(tls.clone())?;
@@ -194,6 +210,13 @@ impl ClientTransport {
             _ => Err(TransportError::Scheme),
         }
     }
+}
+
+/// The TLS handshake bound [`ClientTransport::endpoint`] gives `endpoint`,
+/// which the TCP connect helpers need to size their attempt caps:
+/// [`CLIENT_TLS_HANDSHAKE_TIMEOUT`] for HTTPS, none for plaintext.
+pub fn client_tls_handshake_timeout(endpoint: &Endpoint) -> Option<std::time::Duration> {
+    (endpoint.uri().scheme_str() == Some("https")).then_some(CLIENT_TLS_HANDSHAKE_TIMEOUT)
 }
 
 pub async fn client_endpoint(
@@ -219,12 +242,10 @@ pub fn server_builder_from_environment(
         return Ok(builder);
     }
     let identity = Identity::from_pem(file(env, CERT_ENV)?, file(env, KEY_ENV)?);
-    // TLS negotiation happens before bearer admission, so an idle peer must
-    // not retain a pre-authentication handshake forever.
     Ok(builder.tls_config(
         ServerTlsConfig::new()
             .identity(identity)
-            .timeout(std::time::Duration::from_secs(10)),
+            .timeout(SERVER_TLS_HANDSHAKE_TIMEOUT),
     )?)
 }
 

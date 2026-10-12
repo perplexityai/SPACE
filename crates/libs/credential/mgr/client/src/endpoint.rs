@@ -31,9 +31,16 @@ const SERVICE_NAME: &str = "credential-manager";
 /// Bounds each TCP dial, so a SYN pinned to a stale conntrack entry (one sent
 /// to a ClusterIP before kube-proxy programmed it on the node) is redialed
 /// after this bound rather than at the connect helper's longer attempt cap.
-/// The TLS handshake has its own bound,
-/// [`pplx_space_common_grpc::CLIENT_TLS_HANDSHAKE_TIMEOUT`].
+/// The TLS handshake has its own bound, [`TLS_HANDSHAKE_TIMEOUT`].
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Bounds every TLS handshake of a credmgr channel, reconnects included, so a
+/// peer that accepts TCP but never answers the ClientHello fails the dial.
+/// The credential-manager listener hands each accepted socket straight to its
+/// handshake, without the internal-transport listeners' admission slots, so
+/// the client does not first wait in an accept queue behind other handshakes
+/// and needs no more than a normal handshake's ample margin.
+const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// PEM file location for the server-TLS client side: the CA bundle that
 /// signed the credmgr server certificate. With identity moved to the
@@ -161,6 +168,7 @@ impl CredmgrEndpoint {
                     SERVICE_NAME,
                     uri.to_string(),
                     endpoint,
+                    None,
                     pplx_space_common_grpc::DEFAULT_GRPC_CONNECT_RETRY_POLICY,
                 )
                 .await?;
@@ -175,6 +183,7 @@ impl CredmgrEndpoint {
                     SERVICE_NAME,
                     uri.to_string(),
                     endpoint,
+                    Some(TLS_HANDSHAKE_TIMEOUT),
                     pplx_space_common_grpc::DEFAULT_GRPC_CONNECT_RETRY_POLICY,
                 )
                 .await?;
@@ -204,7 +213,7 @@ async fn client_tls_config(files: &TlsFiles) -> Result<ClientTlsConfig, ConnectE
     };
     Ok(ClientTlsConfig::new()
         .ca_certificate(Certificate::from_pem(ca))
-        .timeout(pplx_space_common_grpc::CLIENT_TLS_HANDSHAKE_TIMEOUT))
+        .timeout(TLS_HANDSHAKE_TIMEOUT))
 }
 
 static CACHED_ENDPOINT: OnceLock<Result<CredmgrEndpoint, EndpointConfigError>> = OnceLock::new();

@@ -171,10 +171,12 @@ async fn connect_channel(endpoint: String) -> Result<Channel, ConnectError> {
         Endpoint::from_shared(endpoint.clone())?.tcp_nodelay(true),
     )
     .await?;
+    let tls_handshake_timeout = internal_transport::client_tls_handshake_timeout(&transport);
     Ok(connect_tcp_channel_with_retry(
         "build-manager",
         &endpoint,
         transport,
+        tls_handshake_timeout,
         DEFAULT_TCP_GRPC_CONNECT_RETRY_POLICY,
     )
     .await?)

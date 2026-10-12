@@ -144,6 +144,7 @@ async fn a_kept_tcp_channel_waits_for_its_peer_to_come_back() {
         "test-backend",
         endpoint,
         Duration::from_secs(1),
+        None,
         crate::DEFAULT_TCP_GRPC_CONNECT_RETRY_POLICY,
     )
     .await
@@ -243,15 +244,8 @@ impl pplx_space_common_core::env::Environment for TestEnvironment {
     }
 }
 
-// A peer that accepts TCP but never answers the ClientHello fails the connect
-// at the client TLS handshake bound, not at the attempt cap and not at once.
-// This waits out the real bound: a paused clock could fire the attempt cap
-// before the loopback dial's readiness is observed.
 #[cfg(feature = "internal-tls")]
-#[tokio::test]
-async fn a_tls_peer_that_never_answers_fails_the_connect_at_the_handshake_bound() {
-    use crate::internal_transport::{CA_ENV, ClientTransport, Service};
-
+fn install_crypto_provider() {
     if rustls::crypto::aws_lc_rs::default_provider()
         .install_default()
         .is_err()
@@ -259,6 +253,27 @@ async fn a_tls_peer_that_never_answers_fails_the_connect_at_the_handshake_bound(
         rustls::crypto::CryptoProvider::get_default()
             .expect("a rejected provider installation leaves an installed provider");
     }
+}
+
+/// A CA certificate PEM file in `dir`, trusted for `127.0.0.1`.
+#[cfg(feature = "internal-tls")]
+fn write_test_ca(dir: &Path) -> std::path::PathBuf {
+    let ca = dir.join("ca.pem");
+    let certificate = rcgen::generate_simple_self_signed(vec!["127.0.0.1".into()]).unwrap();
+    std::fs::write(&ca, certificate.cert.pem()).unwrap();
+    ca
+}
+
+// A peer that accepts TCP but never answers the ClientHello fails the connect
+// with the TLS handshake bound's own cause, not as an abandoned attempt and not
+// at once. The bound outlasts the dial and name-resolution shares of the cap,
+// so the cap leaves room for it only by counting it. This waits out the real
+// bound: a paused clock could fire the cap before the loopback dial's
+// readiness is observed.
+#[cfg(feature = "internal-tls")]
+#[tokio::test]
+async fn a_tls_peer_that_never_answers_fails_the_connect_at_its_handshake_bound() {
+    install_crypto_provider();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let silent_peer = tokio::spawn(async move {
@@ -268,27 +283,26 @@ async fn a_tls_peer_that_never_answers_fails_the_connect_at_the_handshake_bound(
         }
     });
     let dir = tempfile::tempdir().unwrap();
-    let ca = dir.path().join("ca.pem");
-    let certificate = rcgen::generate_simple_self_signed(vec!["127.0.0.1".into()]).unwrap();
-    std::fs::write(&ca, certificate.cert.pem()).unwrap();
-    let mut env = TestEnvironment::default();
-    env.0.insert(CA_ENV, ca.into_os_string());
-    let endpoint = tonic::transport::Endpoint::from_shared(format!("https://{address}")).unwrap();
-    let endpoint = ClientTransport::from_environment(Service::NodeApi, endpoint.uri(), &env)
-        .await
+    let ca = std::fs::read(write_test_ca(dir.path())).unwrap();
+    let handshake_bound = Duration::from_secs(4);
+    let endpoint = tonic::transport::Endpoint::from_shared(format!("https://{address}"))
         .unwrap()
-        .endpoint(endpoint)
-        .unwrap()
-        .connect_timeout(Duration::from_secs(1));
-    let attempt_cap = super::tcp_attempt_cap(Duration::from_secs(1));
+        .connect_timeout(Duration::from_millis(500))
+        .tls_config(
+            tonic::transport::ClientTlsConfig::new()
+                .ca_certificate(tonic::transport::Certificate::from_pem(ca))
+                .timeout(handshake_bound),
+        )
+        .unwrap();
 
     let started = tokio::time::Instant::now();
     let result = tokio::time::timeout(
-        attempt_cap * 2,
+        Duration::from_secs(60),
         super::connect_tcp_channel_with_retry(
             "silent-tls",
             address.to_string(),
             endpoint,
+            Some(handshake_bound),
             crate::GrpcRetryPolicy::none(),
         ),
     )
@@ -311,9 +325,44 @@ async fn a_tls_peer_that_never_answers_fails_the_connect_at_the_handshake_bound(
             .any(|message| message.contains("TLS handshake timeout")),
         "{chain:?}"
     );
-    assert!(
-        elapsed >= crate::CLIENT_TLS_HANDSHAKE_TIMEOUT && elapsed < attempt_cap,
-        "failed after {elapsed:?}"
-    );
+    assert!(elapsed >= handshake_bound, "failed after {elapsed:?}");
     silent_peer.abort();
+}
+
+// An internal-transport endpoint's attempt cap is sized from the handshake
+// bound its transport reports, with room left for name resolution and the
+// dial, so a handshake within its bound fits; a plaintext endpoint's is not.
+#[cfg(feature = "internal-tls")]
+#[tokio::test]
+async fn an_internal_tls_attempt_cap_leaves_room_for_its_handshake_bound() {
+    use crate::internal_transport::{
+        CA_ENV, ClientTransport, INSECURE_DEV_ENV, Service, client_tls_handshake_timeout,
+    };
+
+    install_crypto_provider();
+    let dir = tempfile::tempdir().unwrap();
+    let mut env = TestEnvironment::default();
+    env.0
+        .insert(CA_ENV, write_test_ca(dir.path()).into_os_string());
+    env.0.insert(INSECURE_DEV_ENV, "true".into());
+    for (uri, uses_tls) in [
+        ("https://127.0.0.1:9800", true),
+        ("http://127.0.0.1:9800", false),
+    ] {
+        let endpoint =
+            tonic::transport::Endpoint::from_static(uri).connect_timeout(Duration::from_secs(1));
+        let endpoint = ClientTransport::from_environment(Service::NodeApi, endpoint.uri(), &env)
+            .await
+            .unwrap()
+            .endpoint(endpoint)
+            .unwrap();
+        let handshake = client_tls_handshake_timeout(&endpoint);
+        assert_eq!(handshake.is_some(), uses_tls, "{uri}");
+        let cap = super::endpoint_attempt_cap(&endpoint, handshake);
+        let dial = endpoint.get_connect_timeout().unwrap();
+        assert!(
+            cap > dial + handshake.unwrap_or_default(),
+            "{uri}: cap {cap:?} leaves no room for name resolution"
+        );
+    }
 }
