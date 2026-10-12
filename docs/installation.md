@@ -383,9 +383,9 @@ mode.
 
 ### Go runtime metrics
 
-`SPACE_METRICS_SINK=otlp` also exports Go runtime metrics through the same
-provider and resource as the `space.shim.*` metrics, under OpenTelemetry's
-standard `go.*` names:
+`SPACE_METRICS_SINK=otlp` also exports Go runtime metrics, to the same endpoint
+and resource as the `space.shim.*` metrics, under OpenTelemetry's standard
+`go.*` names:
 
 | Instrument | Meaning |
 |---|---|
@@ -399,11 +399,23 @@ standard `go.*` names:
 | `go.config.gogc` | the configured heap growth percentage |
 | `go.schedule.duration` | time goroutines spent runnable before running |
 
-`go.memory.limit` appears only when `GOMEMLIMIT` is set. `go.schedule.duration`
-comes from the instrumentation's own producer, which bypasses the sink's
-temporality and aggregation selectors, so it arrives as a **cumulative
-explicit-bucket** histogram while the `space.shim.*` histograms are delta
-exponential.
+`go.memory.limit` appears only when `GOMEMLIMIT` is set. The runtime metrics
+are cumulative, and `go.schedule.duration`, which comes from the
+instrumentation's own producer, arrives as a **cumulative explicit-bucket**
+histogram, while the `space.shim.*` histograms are delta exponential.
+
+Every shim process reports under its own `service.instance.id`,
+`<node>:<pid>`, where the node is `SPACE_K8S_NODE_NAME`, then `KUBE_NODE_NAME`,
+then the host name. A Collector's delta-to-cumulative conversion needs one
+writer per stream, so concurrent shims must not share an identity; aggregate a
+node's shims in the query instead, for example with
+`sum without (service_instance_id)`. The runtime metrics leave on a separate
+provider with **cumulative** temporality, so the process's own state never
+passes through that conversion. Over OTLP, latency histograms drop the `_ms`
+their DogStatsD names carry, since the unit is declared
+(`space.shim.operation.latency`, unit `ms`), and the `service`, `env` and
+`version` tags are left to the resource. DogStatsD names and tags are
+unchanged.
 
 **This is narrower than Datadog's runtime metrics v2.** That route also reports
 GC cycle counts, GC pause distributions, CPU time split by class, and mutex

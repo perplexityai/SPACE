@@ -170,7 +170,7 @@ cannot make several processes claim the same identity:
 
 | Attribute | Source |
 |---|---|
-| `service.instance.id` | host name and process id |
+| `service.instance.id` | host name and process id; for the Go shim, the node name, else the host name, and process id |
 | `host.name` | the configured node name, else `HOSTNAME` outside Kubernetes |
 | `k8s.node.name` | `SPACE_K8S_NODE_NAME`, then `KUBE_NODE_NAME` |
 | `k8s.pod.name` | `SPACE_K8S_POD_NAME` |
@@ -303,9 +303,10 @@ than on an interval, so there is no cadence to configure.
 ## Go runtime metrics
 
 With `SPACE_METRICS_SINK=otlp`, the shim also exports Go runtime metrics under
-OpenTelemetry's standard `go.*` names, through the same provider and resource
-as its own metrics. [Select shim telemetry](installation.md#shim-telemetry-selectors)
-lists the instruments.
+OpenTelemetry's standard `go.*` names, to the same endpoint and resource as its
+own metrics but from a separate provider with cumulative temporality.
+[Select shim telemetry](installation.md#shim-telemetry-selectors) lists the
+instruments.
 
 That set is narrower than Datadog's runtime metrics v2, which also reports GC
 cycle counts, GC pause distributions, CPU time by class, and mutex wait time.
@@ -466,11 +467,10 @@ and **base-2 exponential histograms** (maximum 160 buckets, maximum scale 8),
 with a 2000-series attribute cardinality limit per instrument. Datadog's OTLP
 ingest accepts both as they arrive.
 
-That profile is the sinks', not the pipeline's. `go.schedule.duration` comes
-from the runtime instrumentation's own producer, which bypasses the sink's
-temporality and aggregation selectors, so it arrives as a **cumulative
-explicit-bucket** histogram. A Collector pipeline therefore sees both shapes on
-one connection and has to accept both.
+That profile is the sinks', not the pipeline's. The shim's Go runtime metrics
+are **cumulative**, and `go.schedule.duration`, from the runtime
+instrumentation's own producer, is an explicit-bucket histogram. A Collector
+pipeline therefore sees both shapes on one connection and has to accept both.
 
 A Prometheus-style backend does not. Convert in the Collector, not in SPACE:
 

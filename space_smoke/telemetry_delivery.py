@@ -127,7 +127,7 @@ class TelemetryDeliveryAssertions:
                 str(sample["metric"].get("service_instance_id", ""))
                 for sample in self._prometheus(
                     "group by (service_instance_id) "
-                    f"(space_shim_operation_latency_ms_milliseconds{shim_selector})",
+                    f"(space_shim_operation_latency_milliseconds{shim_selector})",
                     at,
                 )
             )
