@@ -191,6 +191,12 @@ def configuration(env):
             f"telemetry.metricsSink={metrics}",
             f"telemetry.traceExporter={traces}",
             f"telemetry.traceSampler={'always_on' if mode == 'otel' else ''}",
+            # The local Collector's delta-to-cumulative conversion forgets a
+            # stream after two idle minutes, so a rare counter would restart
+            # from its latest increment. Cumulative Rust exports carry their
+            # own running totals; delta stays the default for Datadog, whose
+            # OTLP intake accepts only delta.
+            f"telemetry.otlpMetricsTemporality={'cumulative' if mode == 'otel' else ''}",
             f"datadogEnvironment={environment}",
             f"telemetry.version={version or commit}",
             f"telemetry.phase={phase}",

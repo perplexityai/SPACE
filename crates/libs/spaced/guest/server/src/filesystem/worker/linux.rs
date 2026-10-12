@@ -76,6 +76,9 @@ const WORKER_ENV_ALLOWLIST: &[&str] = &[
     // chosen export cadence has to cross the re-exec with the endpoint it
     // applies to; the launcher's cadence does not reach the child.
     "OTEL_METRIC_EXPORT_INTERVAL",
+    // Its temporality likewise: unforwarded, the worker would fall back to
+    // delta under a launcher that selected cumulative.
+    "OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE",
     "OTEL_EXPORTER_OTLP_HEADERS",
     "OTEL_EXPORTER_OTLP_METRICS_HEADERS",
     "HOSTNAME",

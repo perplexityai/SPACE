@@ -240,6 +240,15 @@ positive whole number of milliseconds fails startup instead of exporting on a
 cadence nobody chose. Traces are batched by the OpenTelemetry SDK's own
 `OTEL_BSP_*` settings, and `OTEL_TRACES_SAMPLER` applies as usual.
 
+`OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE` selects the Rust services'
+metric temporality: `cumulative`, `delta` or `lowmemory`, in any case, with the
+per-instrument meaning the OpenTelemetry specification gives them. Unset or
+blank means **delta**, not the specification's cumulative default; see
+[Collector requirements](#collector-requirements). Any other value fails
+startup the same way a bad cadence does. sandbox-manager forwards the setting
+to the host sidecars it launches, and the guest filesystem worker inherits its
+launcher's. The Go shim does not read it: its own metrics are always delta.
+
 ## Trace filtering
 
 `SPACE_TRACE_FILTER` selects which spans are recorded, in `tracing`
@@ -463,23 +472,42 @@ settings, their precedence, and the endpoint rule every producer applies.
 ### Collector requirements
 
 SPACE's own metrics — the `space.*` families — export **delta** temporality
-and **base-2 exponential histograms** (maximum 160 buckets, maximum scale 8),
-with a 2000-series attribute cardinality limit per instrument. Datadog's OTLP
-ingest accepts both as they arrive.
+by default and **base-2 exponential histograms** (maximum 160 buckets, maximum
+scale 8), with a 2000-series attribute cardinality limit per instrument.
+Datadog's OTLP ingest accepts both as they arrive.
 
 That profile is the sinks', not the pipeline's. The shim's Go runtime metrics
 are **cumulative**, and `go.schedule.duration`, from the runtime
 instrumentation's own producer, is an explicit-bucket histogram. A Collector
 pipeline therefore sees both shapes on one connection and has to accept both.
 
-A Prometheus-style backend does not. Convert in the Collector, not in SPACE:
+A Prometheus-style backend does not. Convert in the Collector:
 
 - delta to cumulative, with the `deltatocumulative` processor;
 - exponential histograms to whatever the backend stores — Prometheus native
   histograms keep the resolution, and converting to explicit buckets loses it.
 
-Exporting cumulative sums from SPACE instead is not an option here: the sinks
-are shared with the DogStatsD path, which is delta by construction.
+The conversion is lossy for sparse series. `deltatocumulative` keeps each
+stream's running total in memory and forgets a stream that has been idle for
+its `max_stale`. The next increment then starts a new total from that
+increment alone, so a counter that ticks less often than `max_stale` reads
+1 → 1 across two events, or drops 2 → 1 like a counter reset, and rate
+queries undercount rare events.
+
+A pipeline that stores cumulative data can avoid that state by having the
+Rust services export cumulative, with
+`OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE=cumulative`. Each process
+then reports every stream's running total on every export, so a counter keeps
+its count however long it idles and the Collector passes it through
+unconverted. The cost is that a stream, gauges included, keeps being exported
+with its last value until the process restarts, instead of falling silent
+when nothing records it. The Kind `otel` profile selects cumulative for the
+Rust services.
+
+Delta stays the default because Datadog's OTLP intake accepts only delta
+sums, and drops the first point of each cumulative series it converts, which
+loses exactly the rare events cumulative is meant to keep. The Go shim's own
+metrics stay delta in every mode, Kind's included.
 
 ### Rejected configurations
 
@@ -514,6 +542,7 @@ instead.
 | nonblank OTLP headers | `OTLP exporter headers are not allowed with the plaintext internal metrics profile`; `OTLP traces do not allow OTEL_EXPORTER_OTLP_TRACES_HEADERS or OTEL_EXPORTER_OTLP_HEADERS on a plaintext endpoint`; in the shim, `OTEL_EXPORTER_OTLP_METRICS_HEADERS is not allowed with the plaintext OTLP metric profile` |
 | no metrics endpoint | `missing OTLP endpoint; set OTEL_EXPORTER_OTLP_METRICS_ENDPOINT or OTEL_EXPORTER_OTLP_ENDPOINT` |
 | a bad cadence | `OTEL_METRIC_EXPORT_INTERVAL must be a positive whole number of milliseconds` |
+| an unknown temporality | `OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE must be cumulative, delta, or lowmemory, got "monotonic"` |
 | an unknown selector | `invalid SPACE_METRICS_SINK="dogstatsd"; expected one of: auto, datadog, journald, otlp, off`; `invalid SPACE_TRACE_EXPORTER="dd"; expected auto, datadog, otlp, or off` |
 | a selector the build cannot serve | `SPACE_METRICS_SINK="datadog" requires the datadog feature`; `trace exporter otlp requires the otel feature` |
 | `journald` in the shim | `SPACE_METRICS_SINK=journald is not supported by the Go shim; use datadog, otlp, or off` |

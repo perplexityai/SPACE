@@ -74,6 +74,7 @@ spec:
                     DD_TRACE_ENABLED DD_AGENT_HOST DD_DOGSTATSD_PORT \
                     SPACE_METRICS_SINK SPACE_TRACE_EXPORTER \
                     OTEL_EXPORTER_OTLP_METRICS_PROTOCOL \
+                    OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE \
                     OTEL_EXPORTER_OTLP_TRACES_PROTOCOL OTEL_TRACES_SAMPLER; do
                   if [[ -v $name ]]; then printf '%s=%s\n' "$name" "${!name}"; fi
                 done

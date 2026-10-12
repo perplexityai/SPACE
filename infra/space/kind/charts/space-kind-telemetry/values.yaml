@@ -16,4 +16,9 @@ telemetry:
   nodeOtlpMetricsEndpoint: ""
   nodeOtlpTracesEndpoint: ""
   otlpProtocol: grpc
+  # OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE for the Rust services;
+  # empty keeps their delta default. Bring-up sets cumulative in otel mode
+  # (scripts/telemetry_config.py), because the local Collector forgets an idle
+  # delta stream; the shim stays delta.
+  otlpMetricsTemporality: ""
   traceSampler: ""

@@ -29,6 +29,10 @@
   value: {{ .Values.telemetry.otlpMetricsEndpoint | quote }}
 - name: OTEL_EXPORTER_OTLP_METRICS_PROTOCOL
   value: {{ .Values.telemetry.otlpProtocol | quote }}
+{{- with .Values.telemetry.otlpMetricsTemporality }}
+- name: OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE
+  value: {{ . | quote }}
+{{- end }}
 {{- end }}
 {{- if eq .Values.telemetry.traceExporter "otlp" }}
 - name: OTEL_EXPORTER_OTLP_TRACES_ENDPOINT

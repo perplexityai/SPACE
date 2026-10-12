@@ -12,7 +12,7 @@ scenario's own sandbox, never for whatever an earlier scenario left behind:
   started it, the shim's spans carrying the sandbox's `sandbox_id`;
 - Prometheus holds the shim's create latency from a shim process that started
   after the scenario did, on the node that trace names, and a space-api create
-  latency sample newer than the scenario's start;
+  count that grew after the scenario's start;
 - Loki holds a SPACE pod log line that names the sandbox.
 
 Each check records what it read, at the scenario's start and at its last poll
@@ -143,36 +143,46 @@ class TelemetryDeliveryAssertions:
             f"Prometheus holds no shim create latency on {node} from a shim started after the scenario",
         )
 
-        # The services export delta metrics, and the Collector accumulates a
-        # stream only while it is active: one idle past its max_stale restarts
-        # from its next delta, so a create count need not move across a
-        # scenario that made a create. A delta stream is exported only in a
-        # period it was updated, so a create latency sample newer than the
-        # scenario's start is this create's, whatever the count says.
-        # timestamp() reads sample times only straight off a selector, and
-        # drops the metric name, so this names one metric.
-        def newest(at: int) -> dict[str, float]:
+        # Kind exports the Rust services' metrics cumulative, so every stream
+        # re-exports its running count each interval, idle or not: a sample
+        # newer than the scenario's start proves nothing. The count itself is
+        # reliable instead, because no Collector state has to survive between
+        # creates, so this create must have moved some instance's count. An
+        # instance with no stream at the start counts from zero. The instance
+        # id is host and pid, so a container restarted in the same pod keeps
+        # it while its count starts over: a count below the start's is a reset,
+        # and moved if the new process has counted anything since.
+        def counts(at: int) -> dict[str, float]:
             return {
                 str(sample["metric"].get("service_instance_id", "")): float(sample["value"][1])
                 for sample in self._prometheus(
-                    "max by (service_instance_id) (timestamp("
+                    "sum by (service_instance_id) (histogram_count("
                     'space_sandbox_api_latency_milliseconds{op="create", surface="ecw", result="success"}))',
                     at,
                 )
             }
 
-        def fresh(samples: dict[str, float]) -> list[str]:
-            return sorted(instance for instance, at in samples.items() if at > self._since)
+        def increased(before: dict[str, float], now: dict[str, float]) -> list[str]:
+            def moved(count: float, start: float) -> bool:
+                return count > (start if count >= start else 0.0)
 
-        before = newest(self._since)
-        after = self._poll(lambda: newest(int(time.time())), lambda samples: bool(fresh(samples)))
+            return sorted(
+                instance
+                for instance, count in now.items()
+                if moved(count, before.get(instance, 0.0))
+            )
+
+        before = counts(self._since)
+        after = self._poll(
+            lambda: counts(int(time.time())), lambda now: bool(increased(before, now))
+        )
         self._fixture.record(
-            "prometheus_api_newest_create_samples",
-            {"before": before, "after": after, "fresh": fresh(after)},
+            "prometheus_api_create_counts",
+            {"before": before, "after": after, "increased": increased(before, after)},
         )
         self._fixture.verify(
-            bool(fresh(after)),
-            f"Prometheus holds no {API_SERVICE} create latency sample from after the scenario began",
+            bool(increased(before, after)),
+            f"Prometheus shows no {API_SERVICE} create counted after the scenario began",
         )
 
     def expect_logs(self) -> None:
