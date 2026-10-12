@@ -757,3 +757,31 @@ async fn sidecar_launch_refuses_invalid_requests_before_resolving_its_identity()
     }
     assert!(mismatches.is_empty(), "{mismatches:#?}");
 }
+
+#[test]
+fn instance_rootfs_opens_only_a_single_link_regular_file_without_following_links() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let elsewhere = root.join("elsewhere.ext4");
+    std::fs::write(&elsewhere, b"other").unwrap();
+
+    let instance = root.join("instance");
+    std::fs::create_dir(&instance).unwrap();
+    std::fs::write(instance.join("rootfs.ext4"), b"rootfs").unwrap();
+    let file = super::open_instance_rootfs(&instance).unwrap();
+    assert_eq!(file.metadata().unwrap().len(), 6);
+
+    let linked_file = root.join("linked-file");
+    std::fs::create_dir(&linked_file).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, linked_file.join("rootfs.ext4")).unwrap();
+    super::open_instance_rootfs(&linked_file).unwrap_err();
+
+    let linked_dir = root.join("linked-dir");
+    std::os::unix::fs::symlink(&instance, &linked_dir).unwrap();
+    super::open_instance_rootfs(&linked_dir).unwrap_err();
+
+    let hard_linked = root.join("hard-linked");
+    std::fs::create_dir(&hard_linked).unwrap();
+    std::fs::hard_link(&elsewhere, hard_linked.join("rootfs.ext4")).unwrap();
+    super::open_instance_rootfs(&hard_linked).unwrap_err();
+}
