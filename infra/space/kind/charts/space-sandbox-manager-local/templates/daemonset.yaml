@@ -1,4 +1,18 @@
 {{- $ctx := dict "ctx" . "component" "sandbox-manager" -}}
+{{- /*
+sandbox-manager forwards its OTLP endpoints to the net-gateway and spaced-host
+sidecars it launches (crates/libs/sbx/mgr/server/src/sidecar_env.rs), and those
+run on the Kind node in a sandbox network namespace, where cluster DNS does not
+resolve. Give it the node-reachable Collector addresses the shim and the
+runtime-supervisor use, the fixed ClusterIPs bring-up passes as
+telemetry.nodeOtlp*Endpoint; the host-network pod reaches them as well.
+*/ -}}
+{{- with .Values.telemetry.nodeOtlpMetricsEndpoint }}
+{{- $_ := set $.Values.telemetry "otlpMetricsEndpoint" . }}
+{{- end }}
+{{- with .Values.telemetry.nodeOtlpTracesEndpoint }}
+{{- $_ := set $.Values.telemetry "otlpTracesEndpoint" . }}
+{{- end }}
 {{- include "space-node-service.serviceAccount" $ctx }}
 ---
 apiVersion: apps/v1

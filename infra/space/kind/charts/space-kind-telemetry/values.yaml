@@ -11,8 +11,10 @@ telemetry:
   otlpTracesEndpoint: "http://collector.space-traces.svc.cluster.local:4317"
   # The same Collectors as a process on the Kind node reaches them, without
   # cluster DNS: the host runtime-supervisor's node environment, which
-  # space-node-manager-local writes. Bring-up sets both from
-  # scripts/telemetry_config.py; unset, that environment names no endpoint.
+  # space-node-manager-local writes, and sandbox-manager's own endpoints, which
+  # it forwards to the host sidecars it launches. Bring-up sets both from
+  # scripts/telemetry_config.py; unset, the supervisor's environment names no
+  # endpoint and sandbox-manager keeps the endpoints above.
   nodeOtlpMetricsEndpoint: ""
   nodeOtlpTracesEndpoint: ""
   otlpProtocol: grpc

@@ -38,4 +38,7 @@ node-hosted shim and runtime-supervisor cannot use pod DNS, so they address
 each Collector by the fixed ClusterIP that chart's Kind profile pins.
 `telemetry.nodeOtlpMetricsEndpoint` and `telemetry.nodeOtlpTracesEndpoint`
 carry those addresses to `space-node-manager-local`, which writes the
-supervisor's node environment; bring-up sets both, and no pod reads them.
+supervisor's node environment, and to `space-sandbox-manager-local`, which
+exports to them in place of the two endpoints above: sandbox-manager forwards
+its endpoints to the net-gateway and spaced-host processes it launches on the
+node, which cannot resolve cluster DNS either. Bring-up sets both.

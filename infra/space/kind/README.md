@@ -344,7 +344,9 @@ alongside it.
 Rust workloads send metrics to
 `http://collector.space-metrics.svc.cluster.local:4317` and traces to
 `http://collector.space-traces.svc.cluster.local:4317` over plaintext
-OTLP/gRPC. To use other receivers, override `telemetry.otlpMetricsEndpoint`
+OTLP/gRPC. sandbox-manager is the exception: it forwards its endpoints to the
+net-gateway and spaced-host processes it launches on the node, outside cluster
+DNS, so it uses the shim's node-reachable addresses instead. To use other receivers, override `telemetry.otlpMetricsEndpoint`
 and `telemetry.otlpTracesEndpoint` in the workload Helm values. Endpoint and
 protocol environment variables are per-signal and emitted only for OTLP
 exporters. Logs stay on stdout for Alloy to collect; no log endpoint is needed.

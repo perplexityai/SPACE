@@ -93,8 +93,11 @@ def test_chart_and_executed_shim_share_isolated_identity(mode, tmp_path):
         )
         if mode == "otel":
             assert env["OTEL_TRACES_SAMPLER"] == "always_on"
-            assert env["OTEL_EXPORTER_OTLP_METRICS_ENDPOINT"] == METRICS_ENDPOINT
-            assert env["OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"] == TRACES_ENDPOINT
+            # sandbox-manager takes the node-reachable Collectors instead, for
+            # the sidecars it launches on the node.
+            if chart.name != "space-sandbox-manager-local":
+                assert env["OTEL_EXPORTER_OTLP_METRICS_ENDPOINT"] == METRICS_ENDPOINT
+                assert env["OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"] == TRACES_ENDPOINT
             assert env["OTEL_EXPORTER_OTLP_METRICS_PROTOCOL"] == "grpc"
             assert env["OTEL_EXPORTER_OTLP_TRACES_PROTOCOL"] == "grpc"
         else:
