@@ -1009,6 +1009,10 @@ pub enum QuarantineRecoveryAttemptOutcome {
     /// A detached task panicked or was cancelled before it could classify and
     /// persist its result. The claim lease remains the liveness backstop.
     BackgroundTaskFailed,
+    /// The result completed the run of consecutive plan rejections that stops
+    /// automatic recovery, so no retry was scheduled: the episode is left to an
+    /// operator until it is re-armed.
+    AutomaticRecoveryStopped,
 }
 
 impl QuarantineRecoveryAttemptOutcome {
@@ -1019,6 +1023,7 @@ impl QuarantineRecoveryAttemptOutcome {
             Self::ClaimNotAcquired => "claim_not_acquired",
             Self::RetryWriteFailed => "retry_write_failed",
             Self::BackgroundTaskFailed => "background_task_failed",
+            Self::AutomaticRecoveryStopped => "automatic_recovery_stopped",
         }
     }
 }

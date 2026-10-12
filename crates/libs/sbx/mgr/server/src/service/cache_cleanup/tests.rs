@@ -938,3 +938,85 @@ fn rowless_restore_scope_defers_materialization_until_retired() {
         SandboxState::Quarantined
     );
 }
+
+#[test]
+fn inventory_keeps_a_quarantined_row_without_local_evidence() {
+    // A quarantine is held for operator or cluster disposition, so missing
+    // cache and runtime evidence is not proof that its row is stale.
+    let conn = crate::db::test_conn();
+    let sandbox_id = crate::db::tests::setup_quarantine_recovery_episode(
+        &conn,
+        SandboxQuarantineReasonCode::RestoreFirecrackerLaunchFailed,
+    );
+    let sandbox_id_string = sandbox_id.to_string();
+    let row = crate::db::get_sandbox(&conn, &sandbox_id_string)
+        .expect("read sandbox")
+        .expect("quarantined row");
+    assert_eq!(row.state, SandboxState::Quarantined);
+    assert!(row.current_local_artifact_id.is_some());
+    assert_eq!(
+        crate::db::current_quarantine_reason_wire_value(&conn, &sandbox_id_string)
+            .expect("read quarantine reason")
+            .as_deref(),
+        Some(SandboxQuarantineReasonCode::RestoreFirecrackerLaunchFailed.as_str())
+    );
+    let before = crate::db::tests::database_rows(&conn);
+    let cache_dir = tempfile::tempdir().expect("create cache directory");
+    let run_dir = tempfile::tempdir().expect("create run directory");
+    let paths = SandboxInventoryPaths::new(cache_dir.path(), run_dir.path());
+    // Every candidate takes its cleanup fence first, so the fence requests are
+    // the candidates: skipping the hold before the fence is what keeps a pass
+    // from contending for it.
+    let fenced = std::sync::Mutex::new(Vec::new());
+    let reconcile = |conn: &rusqlite::Connection| {
+        reconcile_sandbox_inventory_ids(
+            conn,
+            paths,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            ReconcileSource::Test,
+            InventoryOwnershipGuards::new(
+                |id: &str| {
+                    fenced.lock().unwrap().push(id.to_string());
+                    inventory_cleanup_guard_for_test(id)
+                },
+                |_: SandboxId| Some(()),
+                &inventory_execution_for_test,
+            ),
+        )
+        .expect("inventory reconcile")
+    };
+
+    let report = reconcile(&conn);
+
+    assert!(report.changed_ids().is_empty());
+    assert!(
+        fenced.lock().unwrap().is_empty(),
+        "inventory must not take the quarantined row's cleanup fence"
+    );
+    assert_eq!(
+        crate::db::tests::database_rows(&conn),
+        before,
+        "inventory must keep the quarantined row, its hold, history and artifact pin"
+    );
+    // The guarded delete refuses the row as well, so the hold does not depend
+    // on inventory's candidate selection.
+    assert_eq!(
+        crate::db::delete_sandbox_if_inventory_witness_matches(&conn, &row)
+            .expect("guarded inventory delete"),
+        crate::db::InventoryStaleRowMutation::Deferred(
+            crate::db::InventoryOwnershipReason::LifecycleOwned
+        )
+    );
+    assert_eq!(crate::db::tests::database_rows(&conn), before);
+    // The control: a stale row beside it is fenced and removed.
+    let stale = SandboxId::new();
+    crate::service::tests::service_tests::insert_test_sandbox(
+        &conn,
+        &stale.to_string(),
+        SandboxState::Stopped,
+    );
+    assert_eq!(reconcile(&conn).changed_ids(), vec![stale]);
+    assert_eq!(*fenced.lock().unwrap(), vec![stale.to_string()]);
+}

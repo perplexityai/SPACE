@@ -6569,6 +6569,7 @@ pub(crate) mod service_tests {
         assert!(sandbox_state_may_lack_cache_root(
             SandboxState::CleanupFailed
         ));
+        assert!(sandbox_state_may_lack_cache_root(SandboxState::Quarantined));
 
         assert!(!sandbox_state_may_lack_cache_root(SandboxState::Started));
         assert!(!sandbox_state_may_lack_cache_root(SandboxState::Stopped));
@@ -7245,6 +7246,26 @@ pub(crate) mod service_tests {
                 rusqlite::params![sandbox_id],
             )
             .unwrap();
+            if state == SandboxState::Quarantined {
+                // Inventory keeps a hold that has no local evidence; this
+                // eviction is one explicit disposition that releases it.
+                let cache_dir = tempfile::tempdir().unwrap();
+                let run_dir = tempfile::tempdir().unwrap();
+                let report = reconcile_sandbox_inventory_in(
+                    &conn,
+                    cache_dir.path(),
+                    run_dir.path(),
+                    ReconcileSource::Test,
+                )
+                .unwrap();
+                assert!(report.changed_ids().is_empty());
+                assert_eq!(
+                    crate::db::get_sandbox(&conn, &sandbox_id)
+                        .unwrap()
+                        .map(|row| row.state),
+                    Some(SandboxState::Quarantined)
+                );
+            }
             let service = service_with_runtime_liveness(conn, false);
 
             let dispatched = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -9160,9 +9181,13 @@ pub(crate) mod service_tests {
                 .into_iter()
                 .find(|candidate| candidate.sandbox_id == sandbox_id)
                 .unwrap();
-            let claimed = crate::db::claim_quarantine_recovery_candidate(&conn, &candidate)
-                .unwrap()
-                .unwrap();
+            let claimed = crate::db::claim_quarantine_recovery_candidate(
+                &conn,
+                &candidate,
+                crate::db::PlanRejectionRunEffect::Leaves,
+            )
+            .unwrap()
+            .unwrap();
             // The staging transfer has recreated the orphan's row. Exercise
             // the actual recovery writers before attempting runtime publication.
             conn.execute(

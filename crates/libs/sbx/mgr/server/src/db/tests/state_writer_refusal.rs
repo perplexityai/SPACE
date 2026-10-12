@@ -8,12 +8,14 @@
 
 use std::collections::BTreeMap;
 
+use super::database_rows;
+
 use pplx_space_common_core::types::{
     ArtifactKind, ArtifactOrigin, AutoLifecyclePolicy, ExactStorageUri, ExecutionGeneration,
     LocalArtifactId, SandboxCleanupEpisodeId, SandboxId, SandboxOwner, SandboxQuarantineNextAction,
     SandboxQuarantineReasonCode, SandboxQuarantineSource, SandboxRuntimeLabel, TransferScopeId,
 };
-use rusqlite::{Connection, params, types::Value};
+use rusqlite::{Connection, params};
 
 use crate::db::{
     ActivationKind, CleanupCompletion, CleanupEpisode, CleanupEpisodeRequestOutcome,
@@ -34,36 +36,6 @@ use crate::db::{
 };
 use crate::restore_operation::{RemoteRestoreOperation, RestoreOperation};
 use crate::state::SandboxState;
-
-/// Every row of every table, order-insensitive.
-fn database_rows(conn: &Connection) -> BTreeMap<String, Vec<String>> {
-    let tables: Vec<String> = conn
-        .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'")
-        .unwrap()
-        .query_map([], |row| row.get(0))
-        .unwrap()
-        .collect::<rusqlite::Result<_>>()
-        .unwrap();
-    tables
-        .into_iter()
-        .map(|table| {
-            let mut statement = conn.prepare(&format!("SELECT * FROM \"{table}\"")).unwrap();
-            let width = statement.column_count();
-            let mut rows: Vec<String> = statement
-                .query_map([], |row| {
-                    (0..width)
-                        .map(|column| row.get::<_, Value>(column))
-                        .collect::<rusqlite::Result<Vec<_>>>()
-                        .map(|values| format!("{values:?}"))
-                })
-                .unwrap()
-                .collect::<rusqlite::Result<_>>()
-                .unwrap();
-            rows.sort();
-            (table, rows)
-        })
-        .collect()
-}
 
 fn assert_unchanged(conn: &Connection, before: &BTreeMap<String, Vec<String>>, case: &str) {
     let after = database_rows(conn);

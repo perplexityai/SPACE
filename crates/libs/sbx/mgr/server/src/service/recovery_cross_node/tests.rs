@@ -1015,9 +1015,13 @@ fn a_superseded_recovery_claim_leaves_no_adopted_row() {
         .into_iter()
         .find(|candidate| candidate.sandbox_id == sandbox_id)
         .expect("the seeded episode should be admissible");
-    let stale = crate::db::claim_quarantine_recovery_candidate(&conn, &candidate)
-        .unwrap()
-        .expect("the first claim should succeed");
+    let stale = crate::db::claim_quarantine_recovery_candidate(
+        &conn,
+        &candidate,
+        crate::db::PlanRejectionRunEffect::Leaves,
+    )
+    .unwrap()
+    .expect("the first claim should succeed");
 
     // Supersede it the way production does: the lease lapses and the next pass
     // takes the episode, minting a fresh claim token.
@@ -1190,9 +1194,13 @@ fn a_sandbox_that_left_an_activatable_state_is_refused_before_adoption() {
         .into_iter()
         .find(|candidate| candidate.sandbox_id == sandbox_id)
         .expect("the seeded episode should be admissible");
-    let claim = crate::db::claim_quarantine_recovery_candidate(&conn, &candidate)
-        .unwrap()
-        .expect("claiming a fresh episode should succeed");
+    let claim = crate::db::claim_quarantine_recovery_candidate(
+        &conn,
+        &candidate,
+        crate::db::PlanRejectionRunEffect::Leaves,
+    )
+    .unwrap()
+    .expect("claiming a fresh episode should succeed");
 
     // A concurrent path fails the sandbox after the claim was taken.
     conn.execute(
@@ -1284,9 +1292,13 @@ fn the_renewal_budget_aborts_a_full_heartbeat_inside_the_lease() {
 fn a_superseded_claim_cannot_persist_a_canonical_publication_failure() {
     let conn = crate::db::test_conn();
     let (sandbox_id, candidate) = crate::db::tests::setup_quarantine_recovery_candidate(&conn);
-    let claimed = crate::db::claim_quarantine_recovery_candidate(&conn, &candidate)
-        .unwrap()
-        .expect("claiming a fresh episode should succeed");
+    let claimed = crate::db::claim_quarantine_recovery_candidate(
+        &conn,
+        &candidate,
+        crate::db::PlanRejectionRunEffect::Leaves,
+    )
+    .unwrap()
+    .expect("claiming a fresh episode should succeed");
     conn.execute(
         "UPDATE sandboxes SET state = 'restoring' WHERE id = ?1",
         rusqlite::params![sandbox_id.to_string()],
@@ -1919,9 +1931,13 @@ fn claim_orphan_episode(
         .into_iter()
         .find(|candidate| candidate.sandbox_id == sandbox_id)
         .expect("the seeded episode should be admissible");
-    let claimed = crate::db::claim_quarantine_recovery_candidate(conn, &candidate)
-        .unwrap()
-        .expect("the claim should succeed");
+    let claimed = crate::db::claim_quarantine_recovery_candidate(
+        conn,
+        &candidate,
+        crate::db::PlanRejectionRunEffect::Leaves,
+    )
+    .unwrap()
+    .expect("the claim should succeed");
     (sandbox_id, claimed)
 }
 

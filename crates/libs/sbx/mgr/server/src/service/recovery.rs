@@ -40,6 +40,9 @@ const SUSPEND_RECOVERY_KIND: &str = "suspend";
 /// A dedicated one-per-node permit bounds how much transfer and filesystem work
 /// that dispatch can put in flight at once.
 ///
+/// An episode whose recovery stopped at `QUARANTINE_RECOVERY_PLAN_REJECTION_BOUND`
+/// is never a candidate, so it takes no admission from one that can recover.
+///
 /// A capacity-deferred orphan is not charged an attempt. Per-pass outcomes
 /// describe only the returned batch. Backlog gauges are refreshed only when
 /// the whole sweep completes. Partial scans publish no census; failures
@@ -1486,11 +1489,25 @@ impl SandboxManagerService {
                 );
                 break;
             }
+            // The answer's effect on the run of plan rejections is written by the
+            // claim itself, so an accepted plan ends the run even if the work it
+            // dispatches never records an outcome.
+            let plan_run = match &plan_resolution {
+                Ok(crate::snapshot_restore::QuarantineRecoveryPlanResolution::Available(_)) => {
+                    crate::db::PlanRejectionRunEffect::Ends
+                }
+                Ok(crate::snapshot_restore::QuarantineRecoveryPlanResolution::NoProgress(
+                    reason,
+                )) => crate::db::PlanRejectionRunEffect::of(*reason),
+                Err(_) => crate::db::PlanRejectionRunEffect::of(
+                    crate::db::QuarantineRecoveryNoProgressReason::PlanLookupFailed,
+                ),
+            };
             let claimed = {
                 let Ok(db) = self.db_conn() else {
                     return;
                 };
-                match crate::db::claim_quarantine_recovery_candidate(&db, &candidate) {
+                match crate::db::claim_quarantine_recovery_candidate(&db, &candidate, plan_run) {
                     Ok(Some(claimed)) => claimed,
                     Ok(None) => {
                         // The acquire CAS pins nine conjuncts, so a miss means any
@@ -1856,8 +1873,31 @@ impl SandboxManagerService {
                         crate::db::QuarantineRecoveryNoProgressOutcome::RetryScheduled {
                             ..
                         } => QuarantineRecoveryAttemptOutcome::RetryScheduled,
+                        crate::db::QuarantineRecoveryNoProgressOutcome::AutomaticRecoveryStopped {
+                            ..
+                        } => QuarantineRecoveryAttemptOutcome::AutomaticRecoveryStopped,
                     },
                 );
+                // Once per arming: a stopped episode is never claimed again, so
+                // this cannot repeat until a re-arm grants another attempt.
+                if let crate::db::QuarantineRecoveryNoProgressOutcome::AutomaticRecoveryStopped {
+                    attempt_count,
+                    consecutive_plan_rejections,
+                } = outcome
+                {
+                    tracing::warn!(
+                        %sandbox_id,
+                        local_quarantine_id = %claimed.candidate.local_quarantine_id,
+                        reason_code = %claimed.candidate.reason_code,
+                        episode_age_secs,
+                        %reason,
+                        attempt_count,
+                        consecutive_plan_rejections,
+                        "stopped automatic quarantine recovery after consecutive plan \
+                         rejections; the hold needs operator attention"
+                    );
+                    return;
+                }
                 tracing::info!(
                     %sandbox_id,
                     local_quarantine_id = %claimed.candidate.local_quarantine_id,
@@ -1889,6 +1929,14 @@ impl SandboxManagerService {
                 );
             }
         }
+    }
+
+    /// Re-arm every stopped quarantine recovery, allowing one more plan rejection
+    /// before it stops again. Called once at startup; see
+    /// `crate::db::rearm_stopped_quarantine_recoveries`.
+    pub fn rearm_stopped_quarantine_recoveries(&self) -> Result<usize, StartupRecoveryError> {
+        let db = self.startup_recovery_db()?;
+        Ok(crate::db::rearm_stopped_quarantine_recoveries(&db)?)
     }
 
     fn schedule_recovered_cleanup(&self, target: CleanupRecoveryTarget) {

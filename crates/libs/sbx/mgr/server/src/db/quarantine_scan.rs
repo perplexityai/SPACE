@@ -93,7 +93,8 @@ impl PeriodicQuarantineRecoveryScan {
                     qs.rowid,
                     (s.state IN ('quarantined', 'restoring')
                      AND qs.source = ?3 AND cleanup.sandbox_id IS NULL
-                     AND (qs.next_action_owner IS NULL OR qs.next_action_owner = ?4)) IS TRUE
+                     AND (qs.next_action_owner IS NULL OR qs.next_action_owner = ?4)) IS TRUE,
+                    qs.last_error
                FROM sandbox_quarantine_state qs
                LEFT JOIN sandboxes s ON s.id = qs.sandbox_id
                LEFT JOIN sandbox_cleanup_episodes cleanup ON cleanup.sandbox_id = s.id
@@ -119,12 +120,11 @@ impl PeriodicQuarantineRecoveryScan {
                             self.summary.malformed_count.saturating_add(1);
                     }
                     QuarantineRecoveryRow::Ineligible => {}
+                    QuarantineRecoveryRow::RecoveryStopped { entered_at } => {
+                        self.count_pending(entered_at);
+                    }
                     QuarantineRecoveryRow::Eligible { candidate, due } => {
-                        self.summary.pending_count = self.summary.pending_count.saturating_add(1);
-                        self.oldest_entered =
-                            Some(self.oldest_entered.map_or(candidate.entered_at, |oldest| {
-                                oldest.min(candidate.entered_at)
-                            }));
+                        self.count_pending(candidate.entered_at);
                         if due {
                             batch.candidates.push(candidate);
                         }
@@ -143,6 +143,14 @@ impl PeriodicQuarantineRecoveryScan {
             }
         }
         Ok(batch)
+    }
+
+    fn count_pending(&mut self, entered_at: u64) {
+        self.summary.pending_count = self.summary.pending_count.saturating_add(1);
+        self.oldest_entered = Some(
+            self.oldest_entered
+                .map_or(entered_at, |oldest| oldest.min(entered_at)),
+        );
     }
 
     fn complete(&mut self, current_epoch: i64) -> Result<QuarantineRecoveryScan> {

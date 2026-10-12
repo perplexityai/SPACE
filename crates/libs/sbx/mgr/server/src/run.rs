@@ -978,6 +978,19 @@ pub async fn run(
         );
     }
     snapshot_upload_worker.recover_and_log("sandbox-mgr.snapshot_upload");
+    // Best effort: a hold that is not re-armed stays stopped, which is the state
+    // it was already in, and the next start tries again.
+    match service.rearm_stopped_quarantine_recoveries() {
+        Ok(0) => {}
+        Ok(rearmed) => tracing::info!(
+            rearmed,
+            "re-armed stopped quarantine recoveries; each stops again at its next plan rejection"
+        ),
+        Err(error) => tracing::warn!(
+            %error,
+            "failed to re-arm stopped quarantine recoveries; they stay stopped"
+        ),
+    }
     drop(startup_recovery_lease);
 
     service.start_auto_lifecycle_scheduler(shutdown_token.child_token(), &task_tracker);

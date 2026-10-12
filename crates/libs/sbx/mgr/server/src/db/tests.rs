@@ -615,6 +615,36 @@ pub(crate) fn setup_quarantine_recovery_candidate(
     (sandbox_id, candidate)
 }
 
+/// Every row of every table, order-insensitive.
+pub(crate) fn database_rows(conn: &Connection) -> std::collections::BTreeMap<String, Vec<String>> {
+    let tables: Vec<String> = conn
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    tables
+        .into_iter()
+        .map(|table| {
+            let mut statement = conn.prepare(&format!("SELECT * FROM \"{table}\"")).unwrap();
+            let width = statement.column_count();
+            let mut rows: Vec<String> = statement
+                .query_map([], |row| {
+                    (0..width)
+                        .map(|column| row.get::<_, rusqlite::types::Value>(column))
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                        .map(|values| format!("{values:?}"))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            rows.sort();
+            (table, rows)
+        })
+        .collect()
+}
+
 #[test]
 fn quarantine_recovery_candidates_follow_the_complete_reason_policy() {
     let reasons = [
@@ -703,9 +733,10 @@ fn a_claim_reports_the_count_it_wrote_not_the_one_it_read() {
         .find(|candidate| candidate.sandbox_id == sandbox_id)
         .expect("the seeded episode should be admissible");
     let scanned = candidate.attempt_count;
-    let claimed = claim_quarantine_recovery_candidate(&conn, &candidate)
-        .unwrap()
-        .expect("a due episode should be claimable");
+    let claimed =
+        claim_quarantine_recovery_candidate(&conn, &candidate, PlanRejectionRunEffect::Leaves)
+            .unwrap()
+            .expect("a due episode should be claimable");
 
     assert_eq!(
         claimed.candidate.attempt_count,
@@ -4219,9 +4250,10 @@ fn a_publishing_orphan_restore_never_becomes_an_adoption_candidate() {
         QuarantineRecoveryBranch::RestoreOrphanedStaging,
         "the seeded orphan must take the branch that reserves node-wide capacity"
     );
-    let claimed = claim_quarantine_recovery_candidate(&conn, &candidate)
-        .unwrap()
-        .unwrap();
+    let claimed =
+        claim_quarantine_recovery_candidate(&conn, &candidate, PlanRejectionRunEffect::Leaves)
+            .unwrap()
+            .unwrap();
 
     // What the restore's phase-1 row adoption leaves behind: `restoring`, still with
     // no artifact of its own.
@@ -4323,19 +4355,23 @@ fn quarantine_recovery_no_progress_remains_retryable_at_a_capped_rate() {
     let conn = crate::db::test_conn();
     let (sandbox_id, _) = setup_quarantine_recovery_candidate(&conn);
 
+    // A lookup that never answers is not a plan rejection, so it never stops
+    // recovery; `quarantine_recovery_stops_only_after_an_unbroken_run_of_plan_rejections`
+    // owns the bound.
     for expected_attempt in 1..=20 {
         let [candidate] = scan_quarantine_recovery_candidates(&conn)
             .unwrap()
             .candidates
             .try_into()
             .unwrap();
-        let claimed = claim_quarantine_recovery_candidate(&conn, &candidate)
-            .unwrap()
-            .expect("due episode should be claimable");
+        let claimed =
+            claim_quarantine_recovery_candidate(&conn, &candidate, PlanRejectionRunEffect::Leaves)
+                .unwrap()
+                .expect("due episode should be claimable");
         let outcome = record_quarantine_recovery_no_progress(
             &conn,
             &claimed,
-            QuarantineRecoveryNoProgressReason::PlanIneligible,
+            QuarantineRecoveryNoProgressReason::PlanLookupTimedOut,
         )
         .unwrap();
         let QuarantineRecoveryNoProgressOutcome::RetryScheduled {
@@ -4390,6 +4426,361 @@ fn quarantine_recovery_no_progress_remains_retryable_at_a_capped_rate() {
     );
 }
 
+/// Claim the episode's due candidate and record `reason` against the claim,
+/// as one recovery pass does: the claim carries the reason's effect on the run
+/// of plan rejections, and the no-progress write records the reason.
+pub(crate) fn record_quarantine_recovery_attempt(
+    conn: &Connection,
+    sandbox_id: SandboxId,
+    reason: QuarantineRecoveryNoProgressReason,
+) -> QuarantineRecoveryNoProgressOutcome {
+    conn.execute(
+        "UPDATE sandbox_quarantine_state SET next_action_after = NULL WHERE sandbox_id = ?1",
+        params![sandbox_id.to_string()],
+    )
+    .unwrap();
+    let [candidate] = scan_quarantine_recovery_candidates(conn)
+        .unwrap()
+        .candidates
+        .try_into()
+        .expect("a due episode is a candidate");
+    let claimed =
+        claim_quarantine_recovery_candidate(conn, &candidate, PlanRejectionRunEffect::of(reason))
+            .unwrap()
+            .expect("a due candidate is claimable");
+    record_quarantine_recovery_no_progress(conn, &claimed, reason).unwrap()
+}
+
+/// This test's own classification of every no-progress reason, with a distinct
+/// index per variant so `ALL_NO_PROGRESS_REASONS` is checked for completeness.
+/// Wildcard-free: a new reason does not compile until it is placed here.
+fn expected_run_effect(
+    reason: QuarantineRecoveryNoProgressReason,
+) -> (usize, PlanRejectionRunEffect) {
+    use PlanRejectionRunEffect::{Ends, Extends, Leaves};
+    use QuarantineRecoveryNoProgressReason as Reason;
+    match reason {
+        Reason::PlanNotFound => (0, Extends),
+        Reason::PlanIneligible => (1, Extends),
+        Reason::PlanRpcUnsupported => (2, Ends),
+        Reason::PlanMalformed => (3, Ends),
+        Reason::UnsupportedTargetState => (4, Ends),
+        Reason::PlanReasonIneligible => (5, Ends),
+        Reason::PlanLookupFailed => (6, Leaves),
+        Reason::PlanLookupTimedOut => (7, Leaves),
+        Reason::LocalReasonMismatch => (8, Ends),
+        Reason::LocalArtifactMismatch => (9, Ends),
+        Reason::PlanArtifactMismatch => (10, Ends),
+        Reason::ClaimRenewalFailed => (11, Ends),
+        Reason::NodeDatabaseFailure => (12, Ends),
+        Reason::NodeFilesystemFailure => (13, Ends),
+        Reason::RestoreEvidenceMismatch => (14, Ends),
+        Reason::ControlPlaneRefused => (15, Ends),
+        Reason::CleanupFenceBusy => (16, Ends),
+        Reason::LocalArtifactInspectionFailed => (17, Ends),
+        Reason::LocalAdoptionFenceChanged => (18, Ends),
+        Reason::LocalAdoptionFailed => (19, Ends),
+        Reason::OrphanRestoreLocalContention => (20, Ends),
+        Reason::OrphanRestoreTaskFailed => (21, Ends),
+        Reason::OrphanRestoreDeferred => (22, Ends),
+        Reason::OrphanRestoreTimedOut => (23, Ends),
+        Reason::ClaimSuperseded => (24, Ends),
+        Reason::ClaimPreconditionsChanged => (25, Ends),
+        Reason::ClaimAcquisitionFailed => (26, Ends),
+        Reason::AbandonedAtShutdown => (27, Ends),
+    }
+}
+
+const ALL_NO_PROGRESS_REASONS: [QuarantineRecoveryNoProgressReason; 28] = {
+    use QuarantineRecoveryNoProgressReason as Reason;
+    [
+        Reason::PlanNotFound,
+        Reason::PlanIneligible,
+        Reason::PlanRpcUnsupported,
+        Reason::PlanMalformed,
+        Reason::UnsupportedTargetState,
+        Reason::PlanReasonIneligible,
+        Reason::PlanLookupFailed,
+        Reason::PlanLookupTimedOut,
+        Reason::LocalReasonMismatch,
+        Reason::LocalArtifactMismatch,
+        Reason::PlanArtifactMismatch,
+        Reason::ClaimRenewalFailed,
+        Reason::NodeDatabaseFailure,
+        Reason::NodeFilesystemFailure,
+        Reason::RestoreEvidenceMismatch,
+        Reason::ControlPlaneRefused,
+        Reason::CleanupFenceBusy,
+        Reason::LocalArtifactInspectionFailed,
+        Reason::LocalAdoptionFenceChanged,
+        Reason::LocalAdoptionFailed,
+        Reason::OrphanRestoreLocalContention,
+        Reason::OrphanRestoreTaskFailed,
+        Reason::OrphanRestoreDeferred,
+        Reason::OrphanRestoreTimedOut,
+        Reason::ClaimSuperseded,
+        Reason::ClaimPreconditionsChanged,
+        Reason::ClaimAcquisitionFailed,
+        Reason::AbandonedAtShutdown,
+    ]
+};
+
+fn record_rejections(conn: &Connection, sandbox_id: SandboxId, count: u32) {
+    for run in 1..=count {
+        let reason = if run % 2 == 0 {
+            QuarantineRecoveryNoProgressReason::PlanNotFound
+        } else {
+            QuarantineRecoveryNoProgressReason::PlanIneligible
+        };
+        assert!(
+            matches!(
+                record_quarantine_recovery_attempt(conn, sandbox_id, reason),
+                QuarantineRecoveryNoProgressOutcome::RetryScheduled { .. }
+            ),
+            "rejection {run} of {count} must still retry"
+        );
+    }
+}
+
+#[test]
+fn every_no_progress_reason_extends_leaves_or_ends_the_plan_rejection_run() {
+    let mut indices = ALL_NO_PROGRESS_REASONS
+        .map(|reason| expected_run_effect(reason).0)
+        .to_vec();
+    indices.sort_unstable();
+    assert_eq!(
+        indices,
+        (0..ALL_NO_PROGRESS_REASONS.len()).collect::<Vec<_>>()
+    );
+
+    let below_bound = QUARANTINE_RECOVERY_PLAN_REJECTION_BOUND - 1;
+    for reason in ALL_NO_PROGRESS_REASONS {
+        let effect = expected_run_effect(reason).1;
+        assert_eq!(PlanRejectionRunEffect::of(reason), effect, "{reason}");
+        let conn = crate::db::test_conn();
+        let (sandbox_id, _) = setup_quarantine_recovery_candidate(&conn);
+        record_rejections(&conn, sandbox_id, below_bound);
+        let outcome = record_quarantine_recovery_attempt(&conn, sandbox_id, reason);
+        match effect {
+            PlanRejectionRunEffect::Extends => assert!(
+                matches!(
+                    outcome,
+                    QuarantineRecoveryNoProgressOutcome::AutomaticRecoveryStopped {
+                        consecutive_plan_rejections: 16,
+                        ..
+                    }
+                ),
+                "{reason} completes the run: {outcome:?}"
+            ),
+            // Neither extends the run nor restarts it: one more rejection stops.
+            PlanRejectionRunEffect::Leaves => {
+                assert!(
+                    matches!(
+                        outcome,
+                        QuarantineRecoveryNoProgressOutcome::RetryScheduled { .. }
+                    ),
+                    "{reason}: {outcome:?}"
+                );
+                assert!(
+                    matches!(
+                        record_quarantine_recovery_attempt(
+                            &conn,
+                            sandbox_id,
+                            QuarantineRecoveryNoProgressReason::PlanIneligible
+                        ),
+                        QuarantineRecoveryNoProgressOutcome::AutomaticRecoveryStopped { .. }
+                    ),
+                    "{reason} must leave the run at {below_bound}"
+                );
+            }
+            // A full run below the bound after it still retries.
+            PlanRejectionRunEffect::Ends => {
+                assert!(
+                    matches!(
+                        outcome,
+                        QuarantineRecoveryNoProgressOutcome::RetryScheduled { .. }
+                    ),
+                    "{reason}: {outcome:?}"
+                );
+                record_rejections(&conn, sandbox_id, below_bound);
+            }
+        }
+    }
+}
+
+#[test]
+fn quarantine_recovery_stops_only_after_an_unbroken_run_of_plan_rejections() {
+    let conn = crate::db::test_conn();
+    let (sandbox_id, _) = setup_quarantine_recovery_candidate(&conn);
+    record_rejections(
+        &conn,
+        sandbox_id,
+        QUARANTINE_RECOVERY_PLAN_REJECTION_BOUND - 1,
+    );
+    conn.execute(
+        "UPDATE sandbox_quarantine_state SET next_action_after = NULL WHERE sandbox_id = ?1",
+        params![sandbox_id.to_string()],
+    )
+    .unwrap();
+    let [last_candidate] = scan_quarantine_recovery_candidates(&conn)
+        .unwrap()
+        .candidates
+        .try_into()
+        .unwrap();
+    let claimed = claim_quarantine_recovery_candidate(
+        &conn,
+        &last_candidate,
+        PlanRejectionRunEffect::Extends,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        record_quarantine_recovery_no_progress(
+            &conn,
+            &claimed,
+            QuarantineRecoveryNoProgressReason::PlanNotFound
+        )
+        .unwrap(),
+        QuarantineRecoveryNoProgressOutcome::AutomaticRecoveryStopped {
+            attempt_count: QUARANTINE_RECOVERY_PLAN_REJECTION_BOUND,
+            consecutive_plan_rejections: QUARANTINE_RECOVERY_PLAN_REJECTION_BOUND,
+        }
+    );
+
+    let (owner, attempt_count, next_action_after, claim_token): (
+        String,
+        u32,
+        Option<String>,
+        Option<String>,
+    ) = conn
+        .query_row(
+            "SELECT next_action_owner, attempt_count, next_action_after, claim_token
+               FROM sandbox_quarantine_state
+              WHERE sandbox_id = ?1",
+            params![sandbox_id.to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(owner, QuarantineRecoveryOwner::LegacyRecovery.as_str());
+    assert_eq!(attempt_count, QUARANTINE_RECOVERY_PLAN_REJECTION_BOUND);
+    assert_eq!((next_action_after, claim_token), (None, None));
+    assert_eq!(
+        get_sandbox(&conn, &sandbox_id.to_string())
+            .unwrap()
+            .map(|row| row.state),
+        Some(SandboxState::Quarantined),
+        "stopping recovery keeps the hold"
+    );
+    let scan = scan_quarantine_recovery_candidates(&conn).unwrap();
+    assert!(scan.candidates.is_empty());
+    assert_eq!(
+        (scan.pending_count, scan.malformed_count),
+        (1, 0),
+        "a stopped hold stays in the pending census"
+    );
+    // The claim is the authority, not the scan: a candidate read before the
+    // stop, with the episode's current attempt count, still cannot claim it.
+    let stale = QuarantineRecoveryCandidate {
+        attempt_count: QUARANTINE_RECOVERY_PLAN_REJECTION_BOUND,
+        ..last_candidate
+    };
+    assert_eq!(
+        claim_quarantine_recovery_candidate(&conn, &stale, PlanRejectionRunEffect::Ends).unwrap(),
+        None
+    );
+}
+
+/// Stored `last_error` values the run parser must tolerate: legacy text from
+/// older binaries, operator edits and corruption in the node-local SQLite.
+#[test]
+fn stored_last_error_values_decide_admission_and_the_next_run() {
+    use rusqlite::types::Value;
+    let stopped = "plan_ineligible;consecutive_plan_rejections=16";
+    // (stored value, admitted, last_error after one more plan_ineligible)
+    let cases: [(Value, bool, Option<&str>); 10] = [
+        (Value::Null, true, Some("plan_ineligible")),
+        (Value::Text(String::new()), true, Some("plan_ineligible")),
+        (
+            Value::Text("plan_ineligible;consecutive_plan_rejections=abc".into()),
+            true,
+            Some("plan_ineligible"),
+        ),
+        (
+            Value::Text("plan_ineligible;consecutive_plan_rejections=99999999999999999999".into()),
+            true,
+            Some("plan_ineligible"),
+        ),
+        (
+            Value::Text("plan_lookup_failed;consecutive_plan_rejections=16".into()),
+            true,
+            Some("plan_ineligible"),
+        ),
+        (
+            Value::Text("still investigating".into()),
+            true,
+            Some("plan_ineligible"),
+        ),
+        // Only text carries a run: the column has TEXT affinity, so a blob is
+        // the one storage class that survives as non-text.
+        (
+            Value::Blob(b"plan_ineligible;consecutive_plan_rejections=16".to_vec()),
+            true,
+            Some("plan_ineligible"),
+        ),
+        // A bare reason from an older binary is a run of one.
+        (
+            Value::Text("plan_not_found".into()),
+            true,
+            Some("plan_ineligible;consecutive_plan_rejections=2"),
+        ),
+        (
+            Value::Text("plan_not_found;consecutive_plan_rejections=15".into()),
+            true,
+            Some(stopped),
+        ),
+        (Value::Text(stopped.into()), false, None),
+    ];
+    for (stored, admitted, after) in cases {
+        let conn = crate::db::test_conn();
+        // The candidate is read before the value is stored, so the claim is
+        // tested on its own and not only through the scan.
+        let (sandbox_id, candidate) = setup_quarantine_recovery_candidate(&conn);
+        conn.execute(
+            "UPDATE sandbox_quarantine_state SET last_error = ?1 WHERE sandbox_id = ?2",
+            params![stored, sandbox_id.to_string()],
+        )
+        .unwrap();
+        let scan = scan_quarantine_recovery_candidates(&conn).unwrap();
+        assert_eq!(scan.candidates.len(), usize::from(admitted), "{stored:?}");
+        assert_eq!(
+            (scan.pending_count, scan.malformed_count),
+            (1, 0),
+            "{stored:?}"
+        );
+        let claimed =
+            claim_quarantine_recovery_candidate(&conn, &candidate, PlanRejectionRunEffect::Extends)
+                .unwrap();
+        assert_eq!(claimed.is_some(), admitted, "{stored:?}");
+        let Some(claimed) = claimed else {
+            continue;
+        };
+        record_quarantine_recovery_no_progress(
+            &conn,
+            &claimed,
+            QuarantineRecoveryNoProgressReason::PlanIneligible,
+        )
+        .unwrap();
+        let last_error: Option<String> = conn
+            .query_row(
+                "SELECT last_error FROM sandbox_quarantine_state WHERE sandbox_id = ?1",
+                params![sandbox_id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(last_error.as_deref(), after, "{stored:?}");
+    }
+}
+
 #[test]
 fn quarantine_recovery_scan_excludes_cleanup_owned_episodes() {
     let conn = crate::db::test_conn();
@@ -4429,9 +4820,10 @@ fn quarantine_recovery_scan_excludes_cleanup_owned_episodes() {
 fn quarantine_recovery_dependency_failure_uses_the_same_backoff() {
     let conn = crate::db::test_conn();
     let (sandbox_id, candidate) = setup_quarantine_recovery_candidate(&conn);
-    let claimed = claim_quarantine_recovery_candidate(&conn, &candidate)
-        .unwrap()
-        .expect("due episode should be claimable");
+    let claimed =
+        claim_quarantine_recovery_candidate(&conn, &candidate, PlanRejectionRunEffect::Leaves)
+            .unwrap()
+            .expect("due episode should be claimable");
 
     let outcome = record_quarantine_recovery_no_progress(
         &conn,
@@ -4501,7 +4893,7 @@ fn quarantine_recovery_dependency_failure_uses_the_same_backoff() {
         .try_into()
         .unwrap();
     assert!(
-        claim_quarantine_recovery_candidate(&conn, &candidate)
+        claim_quarantine_recovery_candidate(&conn, &candidate, PlanRejectionRunEffect::Leaves)
             .unwrap()
             .is_some(),
         "the exact episode remains automatically retryable"
@@ -4511,9 +4903,10 @@ fn quarantine_recovery_dependency_failure_uses_the_same_backoff() {
 fn quarantine_recovery_observation_reads_control_state_for_inventory() {
     let conn = crate::db::test_conn();
     let (sandbox_id, candidate) = setup_quarantine_recovery_candidate(&conn);
-    let claimed = claim_quarantine_recovery_candidate(&conn, &candidate)
-        .unwrap()
-        .unwrap();
+    let claimed =
+        claim_quarantine_recovery_candidate(&conn, &candidate, PlanRejectionRunEffect::Leaves)
+            .unwrap()
+            .unwrap();
     let outcome = record_quarantine_recovery_no_progress(
         &conn,
         &claimed,
@@ -4590,9 +4983,10 @@ fn quarantine_recovery_observations_exclude_rows_outside_automatic_recovery() {
 fn quarantine_recovery_claim_renewal_extends_only_the_exact_claim() {
     let conn = crate::db::test_conn();
     let (sandbox_id, candidate) = setup_quarantine_recovery_candidate(&conn);
-    let claimed = claim_quarantine_recovery_candidate(&conn, &candidate)
-        .unwrap()
-        .expect("due episode should be claimable");
+    let claimed =
+        claim_quarantine_recovery_candidate(&conn, &candidate, PlanRejectionRunEffect::Leaves)
+            .unwrap()
+            .expect("due episode should be claimable");
     let (initial_expiry, initial_due, attempt_count): (i64, i64, i64) = conn
         .query_row(
             "SELECT CAST(claim_expires_at AS INTEGER),
@@ -4630,7 +5024,7 @@ fn quarantine_recovery_claim_renewal_extends_only_the_exact_claim() {
     assert!(renewed_due > renewed_expiry);
     assert!(quarantine_recovery_claim_is_current(&conn, &claimed).unwrap());
     assert!(
-        claim_quarantine_recovery_candidate(&conn, &candidate)
+        claim_quarantine_recovery_candidate(&conn, &candidate, PlanRejectionRunEffect::Leaves)
             .unwrap()
             .is_none(),
         "renewed claim must remain exclusive"
@@ -4735,9 +5129,10 @@ fn sustained_cleanup_contention_slows_down() {
             .candidates
             .try_into()
             .unwrap();
-        let claimed = claim_quarantine_recovery_candidate(&conn, &candidate)
-            .unwrap()
-            .expect("a released episode is claimable again");
+        let claimed =
+            claim_quarantine_recovery_candidate(&conn, &candidate, PlanRejectionRunEffect::Leaves)
+                .unwrap()
+                .expect("a released episode is claimable again");
         assert!(matches!(
             record_quarantine_recovery_no_progress(
                 &conn,
@@ -4768,9 +5163,10 @@ fn sustained_cleanup_contention_slows_down() {
 fn cleanup_contention_releases_the_claim_and_backs_off() {
     let conn = crate::db::test_conn();
     let (sandbox_id, candidate) = setup_quarantine_recovery_candidate(&conn);
-    let claimed = claim_quarantine_recovery_candidate(&conn, &candidate)
-        .unwrap()
-        .expect("due episode should be claimable");
+    let claimed =
+        claim_quarantine_recovery_candidate(&conn, &candidate, PlanRejectionRunEffect::Leaves)
+            .unwrap()
+            .expect("due episode should be claimable");
     conn.execute(
         "INSERT INTO sandbox_cleanup_episodes (
              sandbox_id, cleanup_id, completion, keep_filesystem, phase,
@@ -4852,9 +5248,10 @@ fn cleanup_contention_releases_the_claim_and_backs_off() {
 fn quarantine_recovery_reason_change_resets_episode_retry_state() {
     let conn = crate::db::test_conn();
     let (sandbox_id, candidate) = setup_quarantine_recovery_candidate(&conn);
-    let claimed = claim_quarantine_recovery_candidate(&conn, &candidate)
-        .unwrap()
-        .expect("due episode should be claimable");
+    let claimed =
+        claim_quarantine_recovery_candidate(&conn, &candidate, PlanRejectionRunEffect::Leaves)
+            .unwrap()
+            .expect("due episode should be claimable");
     record_quarantine_recovery_no_progress(
         &conn,
         &claimed,
@@ -4874,7 +5271,7 @@ fn quarantine_recovery_reason_change_resets_episode_retry_state() {
         .try_into()
         .unwrap();
     assert!(
-        claim_quarantine_recovery_candidate(&conn, &candidate)
+        claim_quarantine_recovery_candidate(&conn, &candidate, PlanRejectionRunEffect::Leaves)
             .unwrap()
             .is_some(),
         "test requires a legacy claim before reconfirmation"
@@ -4993,9 +5390,10 @@ fn quarantine_recovery_reason_change_resets_episode_retry_state() {
 fn quarantine_recovery_source_change_resets_episode_retry_state() {
     let conn = crate::db::test_conn();
     let (sandbox_id, candidate) = setup_quarantine_recovery_candidate(&conn);
-    let claimed = claim_quarantine_recovery_candidate(&conn, &candidate)
-        .unwrap()
-        .expect("due episode should be claimable");
+    let claimed =
+        claim_quarantine_recovery_candidate(&conn, &candidate, PlanRejectionRunEffect::Leaves)
+            .unwrap()
+            .expect("due episode should be claimable");
     record_quarantine_recovery_no_progress(
         &conn,
         &claimed,
@@ -5042,9 +5440,10 @@ fn quarantine_recovery_source_change_resets_episode_retry_state() {
 fn quarantine_recovery_reason_change_preserves_a_live_claim() {
     let conn = crate::db::test_conn();
     let (sandbox_id, candidate) = setup_quarantine_recovery_candidate(&conn);
-    let claimed = claim_quarantine_recovery_candidate(&conn, &candidate)
-        .unwrap()
-        .expect("due episode should be claimable");
+    let claimed =
+        claim_quarantine_recovery_candidate(&conn, &candidate, PlanRejectionRunEffect::Leaves)
+            .unwrap()
+            .expect("due episode should be claimable");
     let claim_state_before = quarantine_claim_state(&conn, sandbox_id);
 
     // A concurrent failure re-marks the sandbox while the claimed operation is
@@ -5124,9 +5523,10 @@ fn quarantine_recovery_new_episode_preserves_a_live_claim() {
         .candidates
         .try_into()
         .unwrap();
-    let claimed = claim_quarantine_recovery_candidate(&conn, &candidate)
-        .unwrap()
-        .expect("orphan episode should be claimable");
+    let claimed =
+        claim_quarantine_recovery_candidate(&conn, &candidate, PlanRejectionRunEffect::Leaves)
+            .unwrap()
+            .expect("orphan episode should be claimable");
     let (owner_before, attempts_before, _, token_before, expiry_before) =
         quarantine_claim_state(&conn, sandbox_id);
     assert_eq!(attempts_before, 1);
@@ -5190,7 +5590,7 @@ fn quarantine_recovery_new_episode_resets_a_dead_claim() {
         .candidates
         .try_into()
         .unwrap();
-    claim_quarantine_recovery_candidate(&conn, &candidate)
+    claim_quarantine_recovery_candidate(&conn, &candidate, PlanRejectionRunEffect::Leaves)
         .unwrap()
         .expect("orphan episode should be claimable");
     // The lease has lapsed, so nothing is acting on the episode any more. The
@@ -5236,9 +5636,10 @@ fn quarantine_recovery_new_episode_resets_a_dead_claim() {
 fn quarantine_recovery_new_episode_handles_a_released_claim() {
     let conn = crate::db::test_conn();
     let (sandbox_id, candidate) = setup_quarantine_recovery_candidate(&conn);
-    let claimed = claim_quarantine_recovery_candidate(&conn, &candidate)
-        .unwrap()
-        .expect("due episode should be claimable");
+    let claimed =
+        claim_quarantine_recovery_candidate(&conn, &candidate, PlanRejectionRunEffect::Leaves)
+            .unwrap()
+            .expect("due episode should be claimable");
     // A recorded no-progress result leaves `claim_expires_at` NULL while
     // `next_action_owner` stays `legacy_recovery`. The liveness probe has to read
     // that as "no live claim" rather than yielding SQL NULL, which would surface
@@ -5282,9 +5683,10 @@ fn quarantine_recovery_new_episode_handles_a_released_claim() {
 fn quarantine_recovery_stale_claim_cannot_mutate_replacement_episode() {
     let conn = crate::db::test_conn();
     let (sandbox_id, candidate) = setup_quarantine_recovery_candidate(&conn);
-    let claimed = claim_quarantine_recovery_candidate(&conn, &candidate)
-        .unwrap()
-        .unwrap();
+    let claimed =
+        claim_quarantine_recovery_candidate(&conn, &candidate, PlanRejectionRunEffect::Leaves)
+            .unwrap()
+            .unwrap();
     let replacement_quarantine_id = Uuid::now_v7();
     conn.execute(
         "UPDATE sandbox_quarantine_state
@@ -5369,9 +5771,10 @@ fn quarantine_adoption_completes_with_the_authority_receipt_id() {
         .candidates
         .try_into()
         .unwrap();
-    let claimed = claim_quarantine_recovery_candidate(&conn, &candidate)
-        .unwrap()
-        .unwrap();
+    let claimed =
+        claim_quarantine_recovery_candidate(&conn, &candidate, PlanRejectionRunEffect::Leaves)
+            .unwrap()
+            .unwrap();
     let recovery_id = SandboxCleanupEpisodeId::new();
     let execution = ExecutionMetadata::initial_firecracker(Arch::Aarch64, vec![]);
     assert_eq!(
@@ -5531,9 +5934,10 @@ fn orphan_quarantine_recovery_clears_staging_failure() {
         .candidates
         .try_into()
         .unwrap();
-    let claimed = claim_quarantine_recovery_candidate(&conn, &candidate)
-        .unwrap()
-        .unwrap();
+    let claimed =
+        claim_quarantine_recovery_candidate(&conn, &candidate, PlanRejectionRunEffect::Leaves)
+            .unwrap()
+            .unwrap();
 
     assert!(
         publish_orphan_quarantine_recovered_artifact(
@@ -5962,9 +6366,10 @@ fn orphan_quarantine_recovery_supports_legacy_snapshot_without_artifact_identity
         .candidates
         .try_into()
         .unwrap();
-    let claimed = claim_quarantine_recovery_candidate(&conn, &candidate)
-        .unwrap()
-        .unwrap();
+    let claimed =
+        claim_quarantine_recovery_candidate(&conn, &candidate, PlanRejectionRunEffect::Leaves)
+            .unwrap()
+            .unwrap();
 
     assert!(
         publish_orphan_quarantine_recovered_artifact(
@@ -7532,18 +7937,26 @@ impl FencedClaimStatement {
                     .candidates
                     .try_into()
                     .unwrap();
-                let claimed = claim_quarantine_recovery_candidate(conn, &candidate)
-                    .unwrap()
-                    .expect("orphan episode should be claimable");
+                let claimed = claim_quarantine_recovery_candidate(
+                    conn,
+                    &candidate,
+                    PlanRejectionRunEffect::Leaves,
+                )
+                .unwrap()
+                .expect("orphan episode should be claimable");
                 (sandbox_id, claimed)
             }
             // The rest work against a quarantined sandbox holding an exact
             // full-suspend artifact.
             _ => {
                 let (sandbox_id, candidate) = setup_quarantine_recovery_candidate(conn);
-                let claimed = claim_quarantine_recovery_candidate(conn, &candidate)
-                    .unwrap()
-                    .expect("artifact episode should be claimable");
+                let claimed = claim_quarantine_recovery_candidate(
+                    conn,
+                    &candidate,
+                    PlanRejectionRunEffect::Leaves,
+                )
+                .unwrap()
+                .expect("artifact episode should be claimable");
                 (sandbox_id, claimed)
             }
         }
@@ -8028,7 +8441,7 @@ fn acquiring_a_claim_refuses_every_changed_precondition() {
         let conn = crate::db::test_conn();
         let (_, candidate) = setup_quarantine_recovery_candidate(&conn);
         assert!(
-            claim_quarantine_recovery_candidate(&conn, &candidate)
+            claim_quarantine_recovery_candidate(&conn, &candidate, PlanRejectionRunEffect::Leaves)
                 .unwrap()
                 .is_some(),
             "an untouched due candidate must be claimable"
@@ -8041,7 +8454,7 @@ fn acquiring_a_claim_refuses_every_changed_precondition() {
         let (sandbox_id, candidate) = setup_quarantine_recovery_candidate(&conn);
         // The candidate was scanned; now the world moves before the claim lands.
         precondition.apply(&conn, sandbox_id);
-        if claim_quarantine_recovery_candidate(&conn, &candidate)
+        if claim_quarantine_recovery_candidate(&conn, &candidate, PlanRejectionRunEffect::Leaves)
             .unwrap()
             .is_some()
         {
@@ -8378,6 +8791,12 @@ fn every_recovery_table_writer_is_fenced_or_explicitly_exempt() {
             "runs after the cleanup episode carrying the recovery fence was \
              validated; fails typed on a row-count mismatch",
         ),
+        (
+            "rearm_stopped_quarantine_recoveries",
+            "re-arms only an episode recovery stopped, which holds no claim; runs \
+             at startup before the reconciler can take one, and pins the episode \
+             it read",
+        ),
     ];
 
     let files = db_module_files();
@@ -8463,8 +8882,8 @@ fn every_recovery_table_writer_is_fenced_or_explicitly_exempt() {
 
     assert_eq!(
         writers.len(),
-        11,
-        "the scan found {} writers of sandbox_quarantine_state, not 11. A floor \
+        12,
+        "the scan found {} writers of sandbox_quarantine_state, not 12. A floor \
          rather than an equality let a detection regression on up to three \
          writers pass green — a writer rewritten into a shape the predicate \
          misses simply leaves the list, and the stale-exemption check below only \
@@ -8528,9 +8947,10 @@ fn a_superseded_recovery_claim_cannot_persist_a_staging_failure() {
         .into_iter()
         .find(|candidate| candidate.sandbox_id == sandbox_id)
         .expect("the seeded episode should be admissible");
-    let claimed = claim_quarantine_recovery_candidate(&conn, &candidate)
-        .unwrap()
-        .expect("claiming a fresh episode should succeed");
+    let claimed =
+        claim_quarantine_recovery_candidate(&conn, &candidate, PlanRejectionRunEffect::Leaves)
+            .unwrap()
+            .expect("claiming a fresh episode should succeed");
     // The pull runs with the row in Restoring, which is where the staging-failure
     // write applies.
     conn.execute(
@@ -8592,9 +9012,10 @@ fn a_superseded_recovery_claim_cannot_persist_a_staging_failure() {
 fn a_cleanup_owner_arriving_after_the_claim_is_still_recorded() {
     let conn = crate::db::test_conn();
     let (sandbox_id, candidate) = setup_quarantine_recovery_candidate(&conn);
-    let claimed = claim_quarantine_recovery_candidate(&conn, &candidate)
-        .unwrap()
-        .expect("claiming a fresh episode should succeed");
+    let claimed =
+        claim_quarantine_recovery_candidate(&conn, &candidate, PlanRejectionRunEffect::Leaves)
+            .unwrap()
+            .expect("claiming a fresh episode should succeed");
 
     // The cleanup owner arrives after the claim, which is what invalidates the
     // adoption and leaves the recovery with an outcome it has to record.
@@ -8859,15 +9280,19 @@ fn every_clause_of_the_acquire_cas_blocks_a_claim_on_its_own() {
         let control = crate::db::test_conn();
         let (_, control_candidate) = setup_quarantine_recovery_candidate(&control);
         assert!(
-            claim_quarantine_recovery_candidate(&control, &control_candidate)
-                .unwrap()
-                .is_some(),
+            claim_quarantine_recovery_candidate(
+                &control,
+                &control_candidate,
+                PlanRejectionRunEffect::Leaves
+            )
+            .unwrap()
+            .is_some(),
             "{conjunct:?}: the unperturbed fixture must be claimable"
         );
 
         conjunct.perturb(&conn, sandbox_id);
         assert!(
-            claim_quarantine_recovery_candidate(&conn, &candidate)
+            claim_quarantine_recovery_candidate(&conn, &candidate, PlanRejectionRunEffect::Leaves)
                 .unwrap()
                 .is_none(),
             "{conjunct:?} moved and the claim was still granted; the acquire CAS must \
@@ -8959,9 +9384,10 @@ fn the_contention_release_records_the_reason_it_was_given() {
     ] {
         let conn = crate::db::test_conn();
         let (sandbox_id, candidate) = setup_quarantine_recovery_candidate(&conn);
-        let claimed = claim_quarantine_recovery_candidate(&conn, &candidate)
-            .unwrap()
-            .expect("claiming a fresh episode should succeed");
+        let claimed =
+            claim_quarantine_recovery_candidate(&conn, &candidate, PlanRejectionRunEffect::Leaves)
+                .unwrap()
+                .expect("claiming a fresh episode should succeed");
         assert!(matches!(
             record_quarantine_recovery_no_progress(&conn, &claimed, reason).unwrap(),
             QuarantineRecoveryNoProgressOutcome::RetryScheduled { .. }

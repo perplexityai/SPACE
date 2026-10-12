@@ -163,17 +163,25 @@ fn quarantine_deadline_claims_and_live_fences_reject_sqlite_numeric_prefixes() {
             conn.execute(sql, params![malformed, sandbox_id.to_string()])
                 .unwrap();
             assert!(
-                db::claim_quarantine_recovery_candidate(&conn, &candidate)
-                    .unwrap()
-                    .is_none(),
+                db::claim_quarantine_recovery_candidate(
+                    &conn,
+                    &candidate,
+                    crate::db::PlanRejectionRunEffect::Leaves
+                )
+                .unwrap()
+                .is_none(),
                 "{column}={malformed}"
             );
         }
         let conn = db::test_conn();
         let (sandbox_id, candidate) = db::tests::setup_quarantine_recovery_candidate(&conn);
-        let claimed = db::claim_quarantine_recovery_candidate(&conn, &candidate)
-            .unwrap()
-            .unwrap();
+        let claimed = db::claim_quarantine_recovery_candidate(
+            &conn,
+            &candidate,
+            crate::db::PlanRejectionRunEffect::Leaves,
+        )
+        .unwrap()
+        .unwrap();
         conn.execute(
             "UPDATE sandbox_quarantine_state SET claim_expires_at = ?1 WHERE sandbox_id = ?2",
             params![malformed, sandbox_id.to_string()],
@@ -194,9 +202,13 @@ fn legacy_iso_deadlines_remain_claimable_and_raw_lease_evidence_is_cas_fenced() 
         [sandbox_id.to_string()],
     )
     .unwrap();
-    let claimed = db::claim_quarantine_recovery_candidate(&conn, &candidate)
-        .unwrap()
-        .unwrap();
+    let claimed = db::claim_quarantine_recovery_candidate(
+        &conn,
+        &candidate,
+        crate::db::PlanRejectionRunEffect::Leaves,
+    )
+    .unwrap()
+    .unwrap();
     let now = db::now_epoch_i64().unwrap();
     let future = jiff::Timestamp::from_second(now + 900).unwrap().to_string();
     conn.execute(
@@ -239,9 +251,13 @@ fn malformed_expiry_cannot_clear_ownership_when_quarantine_is_reclassified() {
     for state in ["quarantined", "restoring"] {
         let conn = db::test_conn();
         let (sandbox_id, candidate) = db::tests::setup_quarantine_recovery_candidate(&conn);
-        let claimed = db::claim_quarantine_recovery_candidate(&conn, &candidate)
-            .unwrap()
-            .unwrap();
+        let claimed = db::claim_quarantine_recovery_candidate(
+            &conn,
+            &candidate,
+            crate::db::PlanRejectionRunEffect::Leaves,
+        )
+        .unwrap()
+        .unwrap();
         conn.execute(
             "UPDATE sandboxes SET state = ?1 WHERE id = ?2",
             params![state, sandbox_id.to_string()],

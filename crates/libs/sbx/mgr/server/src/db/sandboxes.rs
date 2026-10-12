@@ -1485,9 +1485,13 @@ pub(crate) fn delete_sandbox_if_inventory_witness_matches(
             ));
         }
     }
+    // A quarantine is held for operator or cluster disposition: missing local
+    // evidence is not staleness. Only an explicit disposition (cluster-deleted
+    // eviction, on-node Delete, or quarantine recovery) may release it;
+    // eviction also refuses non-platform owners such as orphan rows.
     if matches!(
         current.state,
-        SandboxState::Stopping | SandboxState::Deleting
+        SandboxState::Stopping | SandboxState::Deleting | SandboxState::Quarantined
     ) {
         return Ok(InventoryStaleRowMutation::Deferred(
             InventoryOwnershipReason::LifecycleOwned,

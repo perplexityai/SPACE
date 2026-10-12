@@ -913,23 +913,26 @@ async fn the_dispatch_path_supervises_the_task_it_spawns() {
         pplx_space_common_core::types::SandboxQuarantineReasonCode::OrphanedSandboxRowMissing;
     let conn = crate::db::test_conn();
     let sandbox_id = crate::db::tests::setup_quarantine_recovery_episode(&conn, reason_code);
-    let service = recovery_test_service(conn);
+    // One short of the bound, so the accepted plan below is all that keeps the
+    // next rejection from completing a run that the plan interrupted.
+    for _ in 1..crate::db::QUARANTINE_RECOVERY_PLAN_REJECTION_BOUND {
+        crate::db::tests::record_quarantine_recovery_attempt(
+            &conn,
+            sandbox_id,
+            crate::db::QuarantineRecoveryNoProgressReason::PlanIneligible,
+        );
+    }
+    conn.execute(
+        "UPDATE sandbox_quarantine_state SET next_action_after = NULL WHERE sandbox_id = ?1",
+        rusqlite::params![sandbox_id.to_string()],
+    )
+    .unwrap();
+    let service = bound_test_service(conn);
+    let cache = tempfile::tempdir().unwrap();
     // The panic this test injects fires at the probe, after the restore returns,
     // so how the restore returns is not part of the claim. Taking the shutdown
     // arm skips a ~9.5 s vol-manager connect budget that nothing here reads.
     cancel_orphan_restore_operation(&service);
-    let [candidate] = crate::db::scan_quarantine_recovery_candidates(&service.db.lock().unwrap())
-        .unwrap()
-        .candidates
-        .try_into()
-        .unwrap();
-    let claimed =
-        crate::db::claim_quarantine_recovery_candidate(&service.db.lock().unwrap(), &candidate)
-            .unwrap()
-            .unwrap();
-    let permit = Arc::clone(&service.quarantine_recovery_restore_sem)
-        .try_acquire_owned()
-        .unwrap();
 
     let capture = crate::service::tests::service_tests::SandboxEventCapture::default();
     let counters = pplx_space_metrics::test_capture::capture_counters_guard();
@@ -937,15 +940,25 @@ async fn the_dispatch_path_supervises_the_task_it_spawns() {
         use tracing_subscriber::layer::SubscriberExt;
         let subscriber = tracing_subscriber::registry().with(capture.clone());
         let _guard = tracing::subscriber::set_default(subscriber);
-        service.dispatch_quarantined_orphan_restore(
-            claimed,
-            plan_for(None, reason_code),
-            |_window| panic!("deliberate panic inside the dispatched restore task"),
-            permit,
-        );
-        // The supervisor is a second tracked task, so wait for the permit the
-        // panicking task held to come back before reading what it recorded.
-        wait_for_orphan_restore_capacity(&service, 1).await;
+        // The production pass accepts the plan, claims, and dispatches; the
+        // task panics before it can record an outcome. The pass waits for the
+        // permit the panicking task held to come back.
+        service
+            .adopt_quarantine_recovery_episodes_with_probe(
+                cache.path(),
+                stub_plan(
+                    crate::snapshot_restore::QuarantineRecoveryPlanResolution::Available(plan_for(
+                        None,
+                        reason_code,
+                    )),
+                ),
+                |window| {
+                    if window == crate::service::recovery::RecoveryPassWindow::RestoreCompleted {
+                        panic!("deliberate panic inside the dispatched restore task");
+                    }
+                },
+            )
+            .await;
         tokio::time::timeout(BACKGROUND_RESTORE_TEST_TIMEOUT, async {
             while capture.types.lock().unwrap().is_empty() {
                 tokio::task::yield_now().await;
@@ -994,6 +1007,38 @@ async fn the_dispatch_path_supervises_the_task_it_spawns() {
     assert_eq!(
         restore_failed.get("result").map(String::as_str),
         Some("task_panicked")
+    );
+
+    // Nothing recorded the outcome, so the lease is what lapses. The claim
+    // already ended the run, so the next rejection starts a new one.
+    service
+        .db
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE sandbox_quarantine_state
+                SET claim_expires_at = '1', next_action_after = NULL
+              WHERE sandbox_id = ?1",
+            rusqlite::params![sandbox_id.to_string()],
+        )
+        .unwrap();
+    service
+        .adopt_quarantine_recovery_episodes_with(
+            cache.path(),
+            stub_plan(
+                crate::snapshot_restore::QuarantineRecoveryPlanResolution::NoProgress(
+                    crate::db::QuarantineRecoveryNoProgressReason::PlanIneligible,
+                ),
+            ),
+        )
+        .await;
+    assert_eq!(
+        retry_state(&service, sandbox_id),
+        (
+            i64::from(crate::db::QUARANTINE_RECOVERY_PLAN_REJECTION_BOUND) + 1,
+            Some("plan_ineligible".to_string())
+        ),
+        "an accepted plan must break the run of rejections"
     );
 }
 
@@ -1818,9 +1863,13 @@ async fn a_deferred_orphan_restore_never_logs_the_storage_uri() {
         .into_iter()
         .find(|candidate| candidate.sandbox_id == sandbox_id)
         .expect("the seeded episode should be admissible");
-    let claimed = crate::db::claim_quarantine_recovery_candidate(&conn, &candidate)
-        .unwrap()
-        .expect("claiming a fresh episode should succeed");
+    let claimed = crate::db::claim_quarantine_recovery_candidate(
+        &conn,
+        &candidate,
+        crate::db::PlanRejectionRunEffect::Leaves,
+    )
+    .unwrap()
+    .expect("claiming a fresh episode should succeed");
     let service = recovery_test_service(conn);
     let plan = plan_for(None, reason_code);
 
@@ -1942,9 +1991,13 @@ async fn abandoning_at_shutdown_schedules_the_retry_one_backoff_away() {
         .into_iter()
         .find(|candidate| candidate.sandbox_id == sandbox_id)
         .expect("the seeded episode should be admissible");
-    let claimed = crate::db::claim_quarantine_recovery_candidate(&conn, &candidate)
-        .unwrap()
-        .expect("claiming a fresh episode should succeed");
+    let claimed = crate::db::claim_quarantine_recovery_candidate(
+        &conn,
+        &candidate,
+        crate::db::PlanRejectionRunEffect::Leaves,
+    )
+    .unwrap()
+    .expect("claiming a fresh episode should succeed");
     let (_, attempts_after_claim, scheduled_by_claim, claim_after_claim, _) =
         crate::db::tests::quarantine_claim_state(&conn, sandbox_id);
     assert_eq!(
@@ -2114,9 +2167,13 @@ async fn a_stale_claim_reaches_the_sandbox_event_timeline() {
         .into_iter()
         .find(|candidate| candidate.sandbox_id == sandbox_id)
         .expect("the seeded episode should be admissible");
-    let claimed = crate::db::claim_quarantine_recovery_candidate(&conn, &candidate)
-        .unwrap()
-        .expect("claiming a fresh episode should succeed");
+    let claimed = crate::db::claim_quarantine_recovery_candidate(
+        &conn,
+        &candidate,
+        crate::db::PlanRejectionRunEffect::Leaves,
+    )
+    .unwrap()
+    .expect("claiming a fresh episode should succeed");
     // Another claimant takes the episode, so this claim's write will miss.
     conn.execute(
         "UPDATE sandbox_quarantine_state SET claim_token = ?1 WHERE sandbox_id = ?2",
@@ -2930,9 +2987,13 @@ async fn the_cleanup_contention_release_reports_only_a_real_loss() {
             .into_iter()
             .find(|candidate| candidate.sandbox_id == sandbox_id)
             .expect("the seeded episode should be admissible");
-        let claimed = crate::db::claim_quarantine_recovery_candidate(&conn, &candidate)
-            .unwrap()
-            .expect("claiming a fresh episode should succeed");
+        let claimed = crate::db::claim_quarantine_recovery_candidate(
+            &conn,
+            &candidate,
+            crate::db::PlanRejectionRunEffect::Leaves,
+        )
+        .unwrap()
+        .expect("claiming a fresh episode should succeed");
         if supersede {
             conn.execute(
                 "UPDATE sandbox_quarantine_state SET claim_token = ?1 WHERE sandbox_id = ?2",
@@ -3582,5 +3643,224 @@ async fn a_held_cleanup_fence_defers_adoption_and_charges_the_attempt() {
             .unwrap()
             .is_none(),
         "a deferred adoption must not open a cleanup episode"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The plan-rejection bound, driven through the production pass. Episodes are
+// made due through the retry-time column, the same seam the other pass tests
+// use, so no test waits on a backoff.
+// ---------------------------------------------------------------------------
+
+type PlanLookup = std::pin::Pin<
+    Box<
+        dyn Future<
+                Output = Result<
+                    crate::snapshot_restore::QuarantineRecoveryPlanResolution,
+                    crate::snapshot_restore::RestoreError,
+                >,
+            > + Send,
+    >,
+>;
+
+/// A plan lookup that records every sandbox it is asked about and answers
+/// each with `answer`.
+fn recording_plan(
+    lookups: &Arc<std::sync::Mutex<Vec<String>>>,
+    answer: impl Fn() -> crate::snapshot_restore::QuarantineRecoveryPlanResolution
+    + Send
+    + Sync
+    + 'static,
+) -> impl Fn(String) -> PlanLookup {
+    let lookups = Arc::clone(lookups);
+    let answer = Arc::new(answer);
+    move |sandbox_id| {
+        lookups.lock().unwrap().push(sandbox_id);
+        let answer = Arc::clone(&answer);
+        Box::pin(async move { Ok(answer()) })
+    }
+}
+
+fn plan_rejected() -> crate::snapshot_restore::QuarantineRecoveryPlanResolution {
+    crate::snapshot_restore::QuarantineRecoveryPlanResolution::NoProgress(
+        crate::db::QuarantineRecoveryNoProgressReason::PlanIneligible,
+    )
+}
+
+/// One reconciler pass with every episode's retry time reached.
+async fn pass_with_every_episode_due(
+    service: &SandboxManagerService,
+    cache_dir: &Path,
+    resolve_plan: impl Fn(String) -> PlanLookup,
+) {
+    service
+        .db
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE sandbox_quarantine_state SET next_action_after = NULL",
+            [],
+        )
+        .unwrap();
+    service
+        .adopt_quarantine_recovery_episodes_with(cache_dir, resolve_plan)
+        .await;
+}
+
+/// Every field explicit, so no fixture reads the host's node identity.
+fn bound_test_service(conn: rusqlite::Connection) -> SandboxManagerService {
+    crate::service::tests::service_tests::service_with_runtime_liveness(conn, false)
+}
+
+fn bound() -> i64 {
+    i64::from(crate::db::QUARANTINE_RECOVERY_PLAN_REJECTION_BOUND)
+}
+
+#[tokio::test]
+async fn plan_rejections_stop_recovery_at_the_bound_and_later_passes_never_look_it_up() {
+    let conn = crate::db::test_conn();
+    let sandbox_id = crate::db::tests::setup_quarantine_recovery_episode(
+        &conn,
+        pplx_space_common_core::types::SandboxQuarantineReasonCode::RestoreFirecrackerLaunchFailed,
+    );
+    let service = bound_test_service(conn);
+    let cache = tempfile::tempdir().unwrap();
+    let lookups = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+    // The literal bound, so changing the constant is a reviewed change here.
+    for pass in 1..=19 {
+        pass_with_every_episode_due(
+            &service,
+            cache.path(),
+            recording_plan(&lookups, plan_rejected),
+        )
+        .await;
+        let expected = pass.min(16);
+        assert_eq!(
+            i64::try_from(lookups.lock().unwrap().len()).unwrap(),
+            expected,
+            "pass {pass}"
+        );
+        assert_eq!(retry_state(&service, sandbox_id).0, expected, "pass {pass}");
+    }
+    assert_eq!(
+        service
+            .lookup_sandbox(&sandbox_id.to_string())
+            .unwrap()
+            .state,
+        SandboxState::Quarantined,
+        "stopping recovery hands the hold over; it does not release it"
+    );
+}
+
+#[tokio::test]
+async fn stopped_holds_take_no_admission_from_a_recoverable_hold() {
+    let reason_code =
+        pplx_space_common_core::types::SandboxQuarantineReasonCode::RestoreFirecrackerLaunchFailed;
+    let conn = crate::db::test_conn();
+    // More stopped holds than a pass admits, all older than the recoverable one.
+    let stopped = (0..QUARANTINE_RECOVERY_ADMISSIONS_PER_PASS + 1)
+        .map(|_| crate::db::tests::setup_quarantine_recovery_episode(&conn, reason_code))
+        .collect::<Vec<_>>();
+    let service = bound_test_service(conn);
+    let cache = tempfile::tempdir().unwrap();
+    let lookups = Arc::new(std::sync::Mutex::new(Vec::new()));
+    // A pass admits the eight oldest, so the ninth runs its bound after them.
+    for _ in 0..2 * bound() {
+        pass_with_every_episode_due(
+            &service,
+            cache.path(),
+            recording_plan(&lookups, plan_rejected),
+        )
+        .await;
+    }
+    for sandbox_id in &stopped {
+        assert_eq!(retry_state(&service, *sandbox_id).0, bound());
+    }
+
+    let recoverable = crate::db::tests::setup_quarantine_recovery_episode(
+        &service.db.lock().unwrap(),
+        reason_code,
+    );
+    let lookups = Arc::new(std::sync::Mutex::new(Vec::new()));
+    pass_with_every_episode_due(
+        &service,
+        cache.path(),
+        recording_plan(&lookups, plan_rejected),
+    )
+    .await;
+
+    assert_eq!(*lookups.lock().unwrap(), vec![recoverable.to_string()]);
+    assert_eq!(retry_state(&service, recoverable).0, 1);
+    for sandbox_id in stopped {
+        assert_eq!(retry_state(&service, sandbox_id).0, bound());
+    }
+}
+
+#[tokio::test]
+async fn a_restart_allows_a_stopped_hold_one_more_rejection_and_a_plan_answer_resumes_recovery() {
+    let reason_code =
+        pplx_space_common_core::types::SandboxQuarantineReasonCode::RestoreFirecrackerLaunchFailed;
+    let conn = crate::db::test_conn();
+    let sandbox_id = crate::db::tests::setup_quarantine_recovery_episode(&conn, reason_code);
+    let service = bound_test_service(conn);
+    let cache = tempfile::tempdir().unwrap();
+    let lookups = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let lookup_count = || i64::try_from(lookups.lock().unwrap().len()).unwrap();
+    for _ in 0..bound() {
+        pass_with_every_episode_due(
+            &service,
+            cache.path(),
+            recording_plan(&lookups, plan_rejected),
+        )
+        .await;
+    }
+    assert_eq!(lookup_count(), bound());
+    let mut stopped = bound();
+
+    // Still rejected after the restart: one more rejection, then stopped again.
+    assert_eq!(service.rearm_stopped_quarantine_recoveries().unwrap(), 1);
+    for _ in 0..3 {
+        pass_with_every_episode_due(
+            &service,
+            cache.path(),
+            recording_plan(&lookups, plan_rejected),
+        )
+        .await;
+    }
+    stopped += 1;
+    assert_eq!(lookup_count(), stopped);
+
+    // The control plane answers with a plan after the next restart. That ends
+    // the run, so ordinary recovery resumes with a fresh run of rejections.
+    assert_eq!(service.rearm_stopped_quarantine_recoveries().unwrap(), 1);
+    pass_with_every_episode_due(
+        &service,
+        cache.path(),
+        recording_plan(&lookups, || {
+            crate::snapshot_restore::QuarantineRecoveryPlanResolution::Available(plan_for(
+                Some(LocalArtifactId::new()),
+                pplx_space_common_core::types::SandboxQuarantineReasonCode::RestoreFirecrackerLaunchFailed,
+            ))
+        }),
+    )
+    .await;
+    assert_eq!(
+        retry_state(&service, sandbox_id),
+        (stopped + 1, Some("plan_artifact_mismatch".to_string()))
+    );
+    for _ in 1..bound() {
+        pass_with_every_episode_due(
+            &service,
+            cache.path(),
+            recording_plan(&lookups, plan_rejected),
+        )
+        .await;
+    }
+    assert_eq!(lookup_count(), stopped + bound());
+    assert_eq!(
+        service.rearm_stopped_quarantine_recoveries().unwrap(),
+        0,
+        "a run below the bound is still being retried, not stopped"
     );
 }

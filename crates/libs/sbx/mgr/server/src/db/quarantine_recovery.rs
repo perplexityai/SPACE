@@ -153,6 +153,13 @@ pub enum QuarantineRecoveryNoProgressOutcome {
         /// Seconds since the epoch, matching how the column is stored.
         next_attempt_at: i64,
     },
+    /// This result completed `QUARANTINE_RECOVERY_PLAN_REJECTION_BOUND`
+    /// consecutive plan rejections, so no retry was scheduled and the episode
+    /// left the candidate set until it is re-armed.
+    AutomaticRecoveryStopped {
+        attempt_count: u32,
+        consecutive_plan_rejections: u32,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -327,6 +334,12 @@ pub fn quarantine_recovery_observations(
 pub(super) enum QuarantineRecoveryRow {
     Malformed,
     Ineligible,
+    /// Eligible by its evidence, but recovery stopped after consecutive plan
+    /// rejections. Still pending, so the backlog census keeps reporting the
+    /// hold, but never due: it is an operator's to dispose of.
+    RecoveryStopped {
+        entered_at: u64,
+    },
     Eligible {
         candidate: QuarantineRecoveryCandidate,
         /// The provisional retry time has arrived and no unexpired claim is held,
@@ -407,6 +420,10 @@ pub(super) fn decode_quarantine_recovery_row(
     row: &rusqlite::Row<'_>,
     current_epoch: i64,
 ) -> Result<QuarantineRecoveryRow> {
+    // Read beside the decoded columns rather than among them: `last_error` is
+    // diagnostic text with no validation, so a value it cannot parse only
+    // means no stop is recorded, never a malformed row.
+    let stopped = automatic_recovery_stopped(&row.get::<_, rusqlite::types::Value>(14)?);
     // Read the stored values without converting. These tables are not
     // `STRICT`, so any column can hold any storage class, and asking
     // rusqlite to convert would turn one mistyped value into a query
@@ -538,6 +555,9 @@ pub(super) fn decode_quarantine_recovery_row(
     ) else {
         return Ok(QuarantineRecoveryRow::Ineligible);
     };
+    if stopped {
+        return Ok(QuarantineRecoveryRow::RecoveryStopped { entered_at });
+    }
     // A detached orphan restore runs outside the serial inventory pass, so
     // this lease is also the single-dispatch guard on the next one. Its
     // heartbeat extends the guard; a lost lease admits a new claimant, and
@@ -564,6 +584,189 @@ pub(crate) const QUARANTINE_RECOVERY_CLAIM_LEASE: Duration = Duration::from_secs
 pub(crate) const QUARANTINE_RECOVERY_BACKOFF_BASE: Duration = Duration::from_secs(60);
 
 pub(super) const QUARANTINE_RECOVERY_BACKOFF_MAX: Duration = Duration::from_secs(15 * 60);
+
+/// Consecutive `plan_ineligible` or `plan_not_found` results after which legacy
+/// recovery stops scheduling an episode and leaves it to an operator.
+///
+/// The control plane answers a plan only for its own matching quarantine, so an
+/// episode it keeps rejecting, such as an orphan hold with no cluster
+/// quarantine, can never recover. Retrying it forever costs a plan lookup per
+/// backoff and takes a per-pass admission from episodes that can.
+///
+/// Sixteen results span the 15 intervals between them. From a fresh episode
+/// those follow the backoff: 48–60 s, 96–120 s, 192–240 s, 384–480 s, then
+/// eleven capped 720–900 s intervals, which is 2.4–3 h plus up to one 60 s tick
+/// each. An episode already at the cap needs 3–3.75 h. A rolling deploy of the
+/// API, or a node republishing its quarantine after an outage, resolves in
+/// minutes. The outage itself reports lookup failures or timeouts, which leave
+/// a run where it was instead of extending it.
+pub(crate) const QUARANTINE_RECOVERY_PLAN_REJECTION_BOUND: u32 = 16;
+
+/// How the node-local SQLite `sandbox_quarantine_state.last_error` carries a
+/// run of plan rejections. A first rejection records its bare reason, as every
+/// other result does; a repeat appends the run length. Older binaries write
+/// only the bare reason, which reads as a run of one.
+const PLAN_REJECTION_RUN_SEPARATOR: &str = ";consecutive_plan_rejections=";
+
+/// What one resolved plan lookup, or one recorded result, does to the run of
+/// consecutive plan rejections.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PlanRejectionRunEffect {
+    /// The control plane answered that it has no plan for this episode.
+    Extends,
+    /// The control plane did not answer, so the run stays where it was. An
+    /// outage therefore can neither extend a run nor restart one.
+    Leaves,
+    /// Anything else resolved the attempt: a plan, a refused or malformed one,
+    /// or a local outcome after a plan was accepted.
+    Ends,
+}
+
+impl PlanRejectionRunEffect {
+    /// Every reason is named, so a new one cannot compile until it is placed.
+    pub const fn of(reason: QuarantineRecoveryNoProgressReason) -> Self {
+        use QuarantineRecoveryNoProgressReason as Reason;
+        match reason {
+            Reason::PlanIneligible | Reason::PlanNotFound => Self::Extends,
+            Reason::PlanLookupFailed | Reason::PlanLookupTimedOut => Self::Leaves,
+            Reason::PlanRpcUnsupported
+            | Reason::PlanMalformed
+            | Reason::UnsupportedTargetState
+            | Reason::PlanReasonIneligible
+            | Reason::LocalReasonMismatch
+            | Reason::LocalArtifactMismatch
+            | Reason::PlanArtifactMismatch
+            | Reason::ClaimRenewalFailed
+            | Reason::NodeDatabaseFailure
+            | Reason::NodeFilesystemFailure
+            | Reason::RestoreEvidenceMismatch
+            | Reason::ControlPlaneRefused
+            | Reason::CleanupFenceBusy
+            | Reason::LocalArtifactInspectionFailed
+            | Reason::LocalAdoptionFenceChanged
+            | Reason::LocalAdoptionFailed
+            | Reason::OrphanRestoreLocalContention
+            | Reason::OrphanRestoreTaskFailed
+            | Reason::OrphanRestoreDeferred
+            | Reason::OrphanRestoreTimedOut
+            | Reason::ClaimSuperseded
+            | Reason::ClaimPreconditionsChanged
+            | Reason::ClaimAcquisitionFailed
+            | Reason::AbandonedAtShutdown => Self::Ends,
+        }
+    }
+}
+
+/// The run of consecutive plan rejections that ends in this `last_error`, and
+/// the reason that ended it. Any other result, an unparseable count, or a
+/// non-text value ends the run, so corrupt bookkeeping resumes retries rather
+/// than stopping them.
+///
+/// The run lives in `last_error` because that column already holds the latest
+/// resolved plan answer. A lookup failure or timeout inside a run leaves the
+/// rejection text in place, so it shows only in the metric and the log.
+/// `attempt_count` is the backoff curve's position and is deliberately
+/// never reset on a changed outcome: counting the run there would either reset
+/// the curve whenever outcomes alternate, or let one rejection after a long
+/// history of other failures stop a recoverable episode.
+fn plan_rejection_run(
+    last_error: &rusqlite::types::Value,
+) -> Option<(QuarantineRecoveryNoProgressReason, u32)> {
+    let rusqlite::types::Value::Text(last_error) = last_error else {
+        return None;
+    };
+    let (reason, run) = match last_error.split_once(PLAN_REJECTION_RUN_SEPARATOR) {
+        Some((reason, run)) => (reason, run.parse::<u32>().ok()?),
+        None => (last_error.as_str(), 1),
+    };
+    let reason = [
+        QuarantineRecoveryNoProgressReason::PlanIneligible,
+        QuarantineRecoveryNoProgressReason::PlanNotFound,
+    ]
+    .into_iter()
+    .find(|rejection| rejection.as_str() == reason)?;
+    (run > 0).then_some((reason, run))
+}
+
+fn plan_rejection_last_error(reason: QuarantineRecoveryNoProgressReason, run: u32) -> String {
+    if run <= 1 {
+        reason.as_str().to_owned()
+    } else {
+        format!("{reason}{PLAN_REJECTION_RUN_SEPARATOR}{run}")
+    }
+}
+
+/// The one place the bound is compared.
+const fn run_stops_recovery(run: u32) -> bool {
+    run >= QUARANTINE_RECOVERY_PLAN_REJECTION_BOUND
+}
+
+/// Whether legacy recovery stopped scheduling the episode with this `last_error`.
+pub(super) fn automatic_recovery_stopped(last_error: &rusqlite::types::Value) -> bool {
+    plan_rejection_run(last_error).is_some_and(|(_, run)| run_stops_recovery(run))
+}
+
+/// Re-arm every stopped episode in the node-local SQLite, allowing one more
+/// plan rejection before it stops again.
+///
+/// Called once at startup. A stopped episode never asks the control plane
+/// again, so a restart is when it learns whether a plan has appeared since: the
+/// run is set one short of the bound, so another rejection stops it again at
+/// once, any other resolved answer ends the run and resumes ordinary recovery,
+/// and lookup failures leave it one short and keep retrying at the capped
+/// backoff. An operator re-arms a node's holds by restarting its
+/// sandbox manager.
+pub fn rearm_stopped_quarantine_recoveries(conn: &Connection) -> Result<usize> {
+    let stopped = {
+        let mut statement = conn.prepare(
+            "SELECT sandbox_id, quarantine_id, last_error
+               FROM sandbox_quarantine_state
+              WHERE source = ?1
+                AND (next_action_owner IS NULL OR next_action_owner = ?2)
+                AND claim_token IS NULL
+                AND last_error LIKE ?3",
+        )?;
+        let rows = statement.query_map(
+            params![
+                SandboxQuarantineSource::SbxManager.as_str(),
+                QuarantineRecoveryOwner::LegacyRecovery.as_str(),
+                format!("%{PLAN_REJECTION_RUN_SEPARATOR}%"),
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, rusqlite::types::Value>(2)?,
+                ))
+            },
+        )?;
+        rows.collect::<Result<Vec<_>>>()?
+    };
+    let updated_at = now_epoch_i64()?;
+    let mut rearmed = 0;
+    for (sandbox_id, quarantine_id, last_error) in stopped {
+        let Some((reason, run)) = plan_rejection_run(&last_error) else {
+            continue;
+        };
+        if !run_stops_recovery(run) {
+            continue;
+        }
+        let probe = plan_rejection_last_error(
+            reason,
+            QUARANTINE_RECOVERY_PLAN_REJECTION_BOUND.saturating_sub(1),
+        );
+        rearmed += conn.execute(
+            "UPDATE sandbox_quarantine_state
+                SET last_error = ?1,
+                    updated_at = ?2
+              WHERE sandbox_id = ?3
+                AND quarantine_id = ?4
+                AND claim_token IS NULL",
+            params![probe, updated_at, sandbox_id, quarantine_id],
+        )?;
+    }
+    Ok(rearmed)
+}
 
 /// Seconds since the epoch, for the SQL boundary where quarantine timestamps
 /// are stored as decimal strings.
@@ -724,14 +927,22 @@ impl ExactClaimFence {
     }
 }
 
+/// Claim one due episode in the node-local SQLite `sandbox_quarantine_state`.
+///
+/// `plan` is what the attempt's plan lookup, which runs before the claim, did
+/// to the run of plan rejections. An answer that ends the run ends it here, in
+/// the claim's own statement: an accepted plan dispatches work whose outcome a
+/// panicking or cancelled task never records, and the rejections either side
+/// of it are not consecutive.
 pub fn claim_quarantine_recovery_candidate(
     conn: &Connection,
     candidate: &QuarantineRecoveryCandidate,
+    plan: PlanRejectionRunEffect,
 ) -> Result<Option<ClaimedQuarantineRecoveryCandidate>> {
     let current_epoch = now_epoch_i64()?;
     let deadlines = conn
         .query_row(
-            "SELECT next_action_after, claim_token, claim_expires_at
+            "SELECT next_action_after, claim_token, claim_expires_at, last_error
          FROM sandbox_quarantine_state WHERE sandbox_id = ?1",
             [candidate.sandbox_id.to_string()],
             |row| {
@@ -739,13 +950,27 @@ pub fn claim_quarantine_recovery_candidate(
                     row.get::<_, rusqlite::types::Value>(0)?,
                     row.get::<_, Option<String>>(1)?,
                     row.get::<_, rusqlite::types::Value>(2)?,
+                    row.get::<_, rusqlite::types::Value>(3)?,
                 ))
             },
         )
         .optional()?;
-    let Some((next_action, previous_token, previous_expiry)) = deadlines else {
+    let Some((next_action, previous_token, previous_expiry, last_error)) = deadlines else {
         return Ok(None);
     };
+    // A stopped episode has no retry time, which reads as due. Refusing it here
+    // keeps the claim authoritative rather than trusting the scan.
+    if automatic_recovery_stopped(&last_error) {
+        return Ok(None);
+    }
+    // Only the run is cleared; `attempt_count` and the backoff advance as for
+    // any claim, and a `last_error` that holds no run is kept.
+    let last_error =
+        if plan == PlanRejectionRunEffect::Ends && plan_rejection_run(&last_error).is_some() {
+            rusqlite::types::Value::Null
+        } else {
+            last_error
+        };
     let due = matches!(next_action, rusqlite::types::Value::Null)
         || timestamps::EpochSeconds::decode(&next_action)
             .is_ok_and(|value| value.get() <= current_epoch);
@@ -773,7 +998,8 @@ pub fn claim_quarantine_recovery_candidate(
                 claim_expires_at = ?3,
                 attempt_count = ?4,
                 next_action_after = ?5,
-                updated_at = ?6
+                updated_at = ?6,
+                last_error = ?15
           WHERE qs.sandbox_id = ?7
             AND qs.quarantine_id = ?8
             AND qs.source = ?9
@@ -807,6 +1033,7 @@ pub fn claim_quarantine_recovery_candidate(
             next_action,
             previous_expiry,
             previous_token,
+            last_error,
         ],
     )?;
     Ok((changed == 1).then(|| ClaimedQuarantineRecoveryCandidate {
@@ -908,6 +1135,30 @@ pub fn record_quarantine_recovery_no_progress(
     reason: QuarantineRecoveryNoProgressReason,
 ) -> Result<QuarantineRecoveryNoProgressOutcome> {
     let current_epoch = now_epoch_i64()?;
+    let previous_last_error = conn
+        .query_row(
+            "SELECT last_error FROM sandbox_quarantine_state WHERE sandbox_id = ?1",
+            [claimed.candidate.sandbox_id.to_string()],
+            |row| row.get::<_, rusqlite::types::Value>(0),
+        )
+        .optional()?
+        .unwrap_or(rusqlite::types::Value::Null);
+    let previous_run = plan_rejection_run(&previous_last_error);
+    let (last_error, plan_rejections) = match PlanRejectionRunEffect::of(reason) {
+        PlanRejectionRunEffect::Extends => {
+            let run = previous_run.map_or(0, |(_, run)| run).saturating_add(1);
+            (plan_rejection_last_error(reason, run), run)
+        }
+        // The run stays as it was; the metric and the log carry this reason.
+        PlanRejectionRunEffect::Leaves => match previous_run {
+            Some((rejection, run)) => (plan_rejection_last_error(rejection, run), run),
+            None => (reason.as_str().to_owned(), 0),
+        },
+        PlanRejectionRunEffect::Ends => (reason.as_str().to_owned(), 0),
+    };
+    // A run that reaches the bound only does so by extending: the claim refuses
+    // an episode that is already stopped.
+    let stops = run_stops_recovery(plan_rejections);
     let next_attempt_at = epoch_secs_after(
         current_epoch,
         quarantine_recovery_backoff(
@@ -939,8 +1190,10 @@ pub fn record_quarantine_recovery_no_progress(
         SandboxStateRequirement::AnyState,
         CleanupRequirement::MayExist,
     )?;
-    let next_attempt_at_text = next_attempt_at.to_string();
-    let last_error = reason.as_str();
+    // A stopped episode keeps no retry time: nothing is scheduled for it. The
+    // run read above needs no pin: the caller holds the node's one SQLite
+    // connection across both statements.
+    let next_attempt_at_text = (!stops).then(|| next_attempt_at.to_string());
     let sql = format!(
         "UPDATE sandbox_quarantine_state
             SET next_action_after = :next_attempt_at,
@@ -960,6 +1213,14 @@ pub fn record_quarantine_recovery_no_progress(
     let changed = conn.prepare_cached(&sql)?.execute(&binds[..])?;
     if changed != 1 {
         return Ok(QuarantineRecoveryNoProgressOutcome::StaleClaim);
+    }
+    if stops {
+        return Ok(
+            QuarantineRecoveryNoProgressOutcome::AutomaticRecoveryStopped {
+                attempt_count: claimed.candidate.attempt_count,
+                consecutive_plan_rejections: plan_rejections,
+            },
+        );
     }
     Ok(QuarantineRecoveryNoProgressOutcome::RetryScheduled {
         attempt_count: claimed.candidate.attempt_count,

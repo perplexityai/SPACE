@@ -1289,3 +1289,52 @@ fn template_catalog_rejects_invalid_owner_identity_before_reading_paths() {
         );
     }
 }
+
+#[tokio::test]
+async fn delete_removes_a_quarantine_whose_automatic_recovery_stopped() {
+    if !enter_isolated_test_process() {
+        return;
+    }
+    let conn = crate::db::test_conn();
+    let sandbox_id = crate::db::tests::setup_quarantine_recovery_episode(
+        &conn,
+        SandboxQuarantineReasonCode::OrphanedSandboxRowMissing,
+    );
+    let id = sandbox_id.to_string();
+    for _ in 0..crate::db::QUARANTINE_RECOVERY_PLAN_REJECTION_BOUND {
+        crate::db::tests::record_quarantine_recovery_attempt(
+            &conn,
+            sandbox_id,
+            crate::db::QuarantineRecoveryNoProgressReason::PlanIneligible,
+        );
+    }
+    // Due by its retry time and still not offered: recovery stopped.
+    conn.execute(
+        "UPDATE sandbox_quarantine_state SET next_action_after = NULL WHERE sandbox_id = ?1",
+        rusqlite::params![id],
+    )
+    .unwrap();
+    assert!(
+        crate::db::scan_quarantine_recovery_candidates(&conn)
+            .unwrap()
+            .candidates
+            .is_empty()
+    );
+    let fixture = CleanupFixture::new(conn, 1);
+
+    // Stopping automatic recovery hands the hold to an operator; this is the
+    // operator's disposition.
+    let deleted = CleanupRpc::Delete
+        .call(&fixture.service, Some(root_peer()), &id, None, true)
+        .await
+        .unwrap();
+
+    assert_eq!(deleted, vec![id.clone()]);
+    assert_eq!(fixture.state(&id), None);
+    assert_eq!(
+        crate::db::current_quarantine_reason_wire_value(&fixture.service.db_conn().unwrap(), &id)
+            .unwrap(),
+        None
+    );
+    fixture.shutdown().await;
+}
