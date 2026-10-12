@@ -145,11 +145,24 @@ type CallLog = Arc<Mutex<Vec<GrpcCall>>>;
 pub(super) enum ScriptedReply {
     Status(tonic::Status),
     Message(Bytes),
+    /// Answers the n-th call to its method with the n-th reply and every
+    /// later call with the last one. An empty sequence scripts nothing.
+    Sequence(Arc<[ScriptedReply]>),
 }
 
 impl ScriptedReply {
     pub(super) fn message(message: &impl prost::Message) -> Self {
         Self::Message(Bytes::from(message.encode_to_vec()))
+    }
+
+    /// The reply to the call numbered `attempt`, counting from zero.
+    fn for_attempt(&self, attempt: usize) -> &Self {
+        match self {
+            Self::Sequence(replies) => replies
+                .get(attempt.min(replies.len().saturating_sub(1)))
+                .map_or(self, |reply| reply.for_attempt(attempt)),
+            reply => reply,
+        }
     }
 }
 
@@ -206,18 +219,23 @@ where
                 .await
                 .map(|body| body.to_bytes())
                 .unwrap_or_default();
-            // Strip the 5-byte gRPC length-prefix frame header.
-            calls.lock().unwrap().push(GrpcCall {
-                method,
-                message: framed.slice(5.min(framed.len())..),
-            });
+            let attempt = {
+                let mut calls = calls.lock().unwrap();
+                let attempt = calls.iter().filter(|call| call.method == method).count();
+                // Strip the 5-byte gRPC length-prefix frame header.
+                calls.push(GrpcCall {
+                    method,
+                    message: framed.slice(5.min(framed.len())..),
+                });
+                attempt
+            };
             if let Some(observer) = observer {
                 observer().await;
             }
-            match reply {
-                Some(ScriptedReply::Status(status)) => Ok(status.into_http()),
-                Some(ScriptedReply::Message(message)) => Ok(grpc_unary_ok(message)),
-                None => {
+            match reply.as_ref().map(|reply| reply.for_attempt(attempt)) {
+                Some(ScriptedReply::Status(status)) => Ok(status.clone().into_http()),
+                Some(ScriptedReply::Message(message)) => Ok(grpc_unary_ok(message.clone())),
+                Some(ScriptedReply::Sequence(_)) | None => {
                     let request = http::Request::from_parts(
                         parts,
                         tonic::body::Body::new(http_body_util::Full::new(framed)),

@@ -31,6 +31,10 @@ const WAKE: &str = "WorkerApiInternal/WakeSandbox";
 /// The per-sandbox setup steps, in the order adoption applies them.
 const SETUP_STEPS: [&str; 3] = [UPDATE, SET_NETWORK_POLICY, SET_AUTO_LIFECYCLE];
 
+/// Zero-hint rate limits that spend the node-api client's whole retry count.
+const RATE_LIMITS: usize =
+    pplx_space_common_grpc::DEFAULT_TCP_GRPC_CONNECT_RETRY_POLICY.max_retries;
+
 /// The status the node-api client returns when its own budget for `command`
 /// runs out.
 fn client_deadline(command: &str) -> tonic::Status {
@@ -255,6 +259,9 @@ async fn pooled_adoption_applies_per_sandbox_setup_before_route_adoption() -> Te
 enum SetupFailure {
     Update(tonic::Status),
     NetworkPolicy(tonic::Status),
+    /// The node rate-limits the policy update with a zero retry hint until
+    /// the client's retry count is spent, then fails it with this status.
+    NetworkPolicyAfterRateLimits(tonic::Status),
     /// The gateway confirmed a policy other than the request-resolved one.
     NetworkPolicyMismatch,
     AutoLifecycle(tonic::Status),
@@ -275,8 +282,11 @@ enum SetupFailure {
     StatusCode::SERVICE_UNAVAILABLE,
     true
 )]
+// What node-api relays when its sandbox-manager connection closes under a
+// queued request. Without its local "transport error" source the retrying
+// client does not replay it.
 #[case::update_cancelled(
-    SetupFailure::Update(tonic::Status::cancelled("Timeout expired")),
+    SetupFailure::Update(tonic::Status::cancelled("operation was canceled")),
     StatusCode::REQUEST_TIMEOUT,
     false
 )]
@@ -294,6 +304,16 @@ enum SetupFailure {
     SetupFailure::NetworkPolicy(tonic::Status::invalid_argument("policy is invalid")),
     StatusCode::INTERNAL_SERVER_ERROR,
     false
+)]
+// Zero-hint rate limits replay immediately but count against the client's
+// retry limit, so the `Unavailable` that follows them comes back unreplayed
+// well inside the setup budget.
+#[case::policy_unavailable_after_rate_limits(
+    SetupFailure::NetworkPolicyAfterRateLimits(tonic::Status::unavailable(
+        "synchronous network policy update requires a live net-gateway"
+    )),
+    StatusCode::SERVICE_UNAVAILABLE,
+    true
 )]
 #[case::policy_mismatch(
     SetupFailure::NetworkPolicyMismatch,
@@ -325,6 +345,16 @@ async fn pooled_adoption_stops_at_a_failed_setup_step(
         SetupFailure::NetworkPolicy(status) => {
             (SET_NETWORK_POLICY, ScriptedReply::Status(status.clone()))
         }
+        SetupFailure::NetworkPolicyAfterRateLimits(status) => {
+            let rate_limited = pplx_space_common_grpc::rate_limited_status(
+                "UDS gRPC request-rate limit exceeded; retry_after_ms=0",
+                Some(std::time::Duration::ZERO),
+            );
+            let replies = std::iter::repeat_n(ScriptedReply::Status(rate_limited), RATE_LIMITS)
+                .chain([ScriptedReply::Status(status.clone())])
+                .collect();
+            (SET_NETWORK_POLICY, ScriptedReply::Sequence(replies))
+        }
         SetupFailure::NetworkPolicyMismatch => (
             SET_NETWORK_POLICY,
             network_policy_confirmed(&NetworkPolicyV1::allow_all()),
@@ -354,6 +384,13 @@ async fn pooled_adoption_stops_at_a_failed_setup_step(
         !worker.received(failed_step).is_empty(),
         "{failure:?}: the failing step must have been reached"
     );
+    if let SetupFailure::NetworkPolicyAfterRateLimits(_) = &failure {
+        assert_eq!(
+            worker.received(SET_NETWORK_POLICY).len(),
+            RATE_LIMITS + 1,
+            "every rate limit was replayed and the final status was not"
+        );
+    }
     let later_steps = SETUP_STEPS
         .iter()
         .skip_while(|step| **step != failed_step)
