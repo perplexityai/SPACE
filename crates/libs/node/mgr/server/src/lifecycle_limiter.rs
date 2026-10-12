@@ -397,4 +397,4 @@ fn parse_limits(raw: &str) -> Option<LifecycleLimits> {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

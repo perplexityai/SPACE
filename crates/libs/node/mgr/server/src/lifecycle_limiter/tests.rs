@@ -62,18 +62,30 @@ fn parse_limits_rejects_permits_above_tokio_cap() {
     assert!(parse_limits(&over_cap).is_none());
 }
 
-fn limiter_with(method: LifecycleMethod, permits: usize, max_queue: usize) -> LifecycleLimiter {
+/// The compiled-in limits, except `permits` and `max_queue` for `method`.
+/// Unlike `from_env`, it ignores the runner's `SPACE_NODEMGR_LIMIT_*`.
+pub(crate) fn limiter_with(
+    method: LifecycleMethod,
+    permits: usize,
+    max_queue: usize,
+) -> LifecycleLimiter {
     LifecycleLimiter::with_resolver(move |m| {
         if m == method {
             LifecycleLimits { permits, max_queue }
         } else {
-            let (default_permits, default_queue) = m.default_limits();
-            LifecycleLimits {
-                permits: default_permits,
-                max_queue: default_queue,
-            }
+            default_limits(m)
         }
     })
+}
+
+/// The compiled-in limits for every method, ignoring the environment.
+pub(crate) fn default_limiter() -> LifecycleLimiter {
+    LifecycleLimiter::with_resolver(default_limits)
+}
+
+fn default_limits(method: LifecycleMethod) -> LifecycleLimits {
+    let (permits, max_queue) = method.default_limits();
+    LifecycleLimits { permits, max_queue }
 }
 
 #[tokio::test]

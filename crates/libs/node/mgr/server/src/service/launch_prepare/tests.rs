@@ -219,39 +219,6 @@ fn runtime_request_rejects_partial_execution_metadata() {
     assert_eq!(error.code(), tonic::Code::InvalidArgument);
 }
 
-/// A Firecracker installation and guest kernel under temporary roots, so
-/// runtime discovery never reads the node's fixed installation paths.
-fn installed_runtime() -> (tempfile::TempDir, crate::config::RuntimePaths) {
-    use std::os::unix::fs::{PermissionsExt, symlink};
-
-    let root = tempfile::tempdir().unwrap();
-    let vendor = root.path().join("vendor");
-    let assets = root.path().join("assets");
-    let kernels = root.path().join("kernels");
-    let bin = vendor.join("v1.16.0/bin");
-    std::fs::create_dir_all(&bin).unwrap();
-    for name in ["firecracker", "jailer"] {
-        let path = bin.join(name);
-        std::fs::write(&path, "#!/bin/sh\nexit 42\n").unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
-    symlink("v1.16.0", vendor.join("default")).unwrap();
-    std::fs::create_dir_all(kernels.join("vmlinux-6.1.158")).unwrap();
-    std::fs::write(kernels.join("vmlinux-6.1.158/vmlinux.bin"), b"kernel").unwrap();
-    for marker in ["default", "legacy-default"] {
-        symlink("vmlinux-6.1.158", kernels.join(marker)).unwrap();
-    }
-    std::fs::create_dir(&assets).unwrap();
-    (
-        root,
-        crate::config::RuntimePaths {
-            vendor,
-            assets,
-            kernels,
-        },
-    )
-}
-
 /// An allocated sandbox with a bound execution, plus a second sandbox whose
 /// execution is bound but which holds no lease. Host work is refused, so a
 /// request that passes validation ends with `Cancelled` at its first host step.
@@ -267,7 +234,8 @@ struct AdmittedSandbox {
 impl AdmittedSandbox {
     async fn new() -> Self {
         use crate::service::tests::service_tests::{
-            allocate_test_lease, bind_test_execution, refuse_host_work, service_for_unit_tests,
+            allocate_test_lease, bind_test_execution, installed_runtime, refuse_host_work,
+            service_for_unit_tests,
         };
 
         let (runtime, runtime_paths) = installed_runtime();

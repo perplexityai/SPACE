@@ -477,66 +477,11 @@ pub(super) mod service_tests {
         let cgroup_base = root.path().join("cgroups");
         std::fs::create_dir(&cgroup_base).unwrap();
 
-        let pool = NetworkPool::open_in_memory_for_test(NetworkPoolConfig::new(2));
-        pool.set_all_slots_ready_for_test();
-        let service = NodeManagerService {
-            pool,
-            peer_authorizer: node_peer_authorizer(),
-            sandbox_cgroup_config: SandboxCgroupConfig::default(),
-            memory_admission_config: MemoryAdmissionConfig { reserve_mib: 1024 },
-            memory_admission_sources: MemoryAdmissionSources::new(meminfo_path, cgroup_base),
-            memory_admission_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
-            sandbox_cgroup_gate_locks: std::sync::Arc::new(tokio::sync::Mutex::new(
-                std::collections::HashMap::new(),
-            )),
-            sandbox_vm_cgroup_locks: std::sync::Arc::new(tokio::sync::Mutex::new(
-                std::collections::HashMap::new(),
-            )),
-            sandbox_sidecar_cgroup_locks: std::sync::Arc::new(tokio::sync::Mutex::new(
-                std::collections::HashMap::new(),
-            )),
-            sandbox_device_stack_locks: std::sync::Arc::new(tokio::sync::Mutex::new(
-                std::collections::HashMap::new(),
-            )),
-            sandbox_artifact_locks: Default::default(),
-            send_source_locks: Default::default(),
-            send_source_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(4)),
-            artifact_work: None,
-            device_op_tasks: tokio_util::task::TaskTracker::new(),
-            blocking_probe_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(
-                MAX_BLOCKING_PROBES,
-            )),
-            send_source_inspection_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(
-                MAX_SEND_SOURCE_INSPECTIONS,
-            )),
-            cache_artifact_delete_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(
-                MAX_CACHE_ARTIFACT_DELETES,
-            )),
-            runtime_supervisor: crate::runtime_supervisor_client::RuntimeSupervisorLazyClient::new(
-            ),
-            runtime_inventory: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
-            runtime_inventory_refresh_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
-            runtime_paths: crate::config::RuntimePaths::default(),
-            guest_console_logs: false,
-            lifecycle_limiter: std::sync::Arc::new(
-                crate::lifecycle_limiter::LifecycleLimiter::from_env(),
-            ),
-            disk_admission: std::sync::Arc::new(
-                crate::disk_admission::DiskAdmission::new(
-                    pplx_space_common_core::host::disk_admission::CacheDiskAdmissionConfig {
-                        enabled: false,
-                        ..Default::default()
-                    },
-                )
-                .await,
-            ),
-            prepared_rootfs_reservations:
-                super::prepared_rootfs::PreparedRootfsReservations::default(),
-            disk_usage_cache: node_disk_metrics::SandboxDiskUsageCache::default(),
-            cleanup_operations: CleanupOperationRegistry::default(),
-            orphan_inventory: orphan_inventory::OrphanInventory::default(),
-            snapshot_inventory: snapshot_inventory::SnapshotInventory::default(),
-        };
+        let mut service = service_for_unit_tests().await;
+        service.pool = NetworkPool::open_in_memory_for_test(NetworkPoolConfig::new(2));
+        service.pool.set_all_slots_ready_for_test();
+        service.memory_admission_config = MemoryAdmissionConfig { reserve_mib: 1024 };
+        service.memory_admission_sources = MemoryAdmissionSources::new(meminfo_path, cgroup_base);
         let first_id = SandboxId::from_str("019d84bd-280d-7331-99c6-b63377f3a3a2").unwrap();
         let second_id = SandboxId::from_str("019d84bd-280d-7331-99c6-b63377f3b4b5").unwrap();
 
@@ -683,13 +628,24 @@ pub(super) mod service_tests {
         );
     }
 
+    /// A node manager whose process-boundary dependencies belong to the test
+    /// and refuse until it installs its own. Runtime discovery and memory
+    /// admission read paths under a vacant temporary directory, so both fail
+    /// closed instead of reading the node's installation, `/proc/meminfo` or
+    /// its cgroups. Every runtime-supervisor RPC fails with `Unimplemented`
+    /// without contacting a supervisor. Lifecycle limits are the compiled-in
+    /// ones, whatever `SPACE_NODEMGR_LIMIT_*` the runner sets.
     pub(in crate::service) async fn service_for_unit_tests() -> NodeManagerService {
+        let vacant = vacant_test_root();
         NodeManagerService {
             pool: NetworkPool::open_in_memory_for_test(NetworkPoolConfig::new(1)),
             peer_authorizer: node_peer_authorizer(),
             sandbox_cgroup_config: SandboxCgroupConfig::default(),
             memory_admission_config: MemoryAdmissionConfig::default(),
-            memory_admission_sources: MemoryAdmissionSources::default(),
+            memory_admission_sources: MemoryAdmissionSources::new(
+                vacant.join("meminfo"),
+                vacant.join("firecracker-cgroups"),
+            ),
             memory_admission_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
             sandbox_cgroup_gate_locks: std::sync::Arc::new(tokio::sync::Mutex::new(
                 std::collections::HashMap::new(),
@@ -717,14 +673,17 @@ pub(super) mod service_tests {
             cache_artifact_delete_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(
                 MAX_CACHE_ARTIFACT_DELETES,
             )),
-            runtime_supervisor: crate::runtime_supervisor_client::RuntimeSupervisorLazyClient::new(
-            ),
+            runtime_supervisor: crate::runtime_supervisor_client::tests::refusing_client(),
             runtime_inventory: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             runtime_inventory_refresh_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
-            runtime_paths: crate::config::RuntimePaths::default(),
+            runtime_paths: crate::config::RuntimePaths {
+                vendor: vacant.join("vendor"),
+                assets: vacant.join("assets"),
+                kernels: vacant.join("kernels"),
+            },
             guest_console_logs: false,
             lifecycle_limiter: std::sync::Arc::new(
-                crate::lifecycle_limiter::LifecycleLimiter::from_env(),
+                crate::lifecycle_limiter::tests::default_limiter(),
             ),
             disk_admission: std::sync::Arc::new(
                 crate::disk_admission::DiskAdmission::new(
@@ -742,6 +701,52 @@ pub(super) mod service_tests {
             orphan_inventory: orphan_inventory::OrphanInventory::default(),
             snapshot_inventory: snapshot_inventory::SnapshotInventory::default(),
         }
+    }
+
+    /// A unique path under the system temporary directory that names nothing:
+    /// the directory is created only to reserve its name, then removed.
+    fn vacant_test_root() -> std::path::PathBuf {
+        let root = tempfile::Builder::new()
+            .prefix("space-node-mgr-unit-")
+            .tempdir()
+            .unwrap();
+        let path = root.path().to_path_buf();
+        root.close().unwrap();
+        path
+    }
+
+    /// A Firecracker installation and guest kernel under temporary roots, so
+    /// runtime discovery never reads the node's fixed installation paths.
+    pub(in crate::service) fn installed_runtime() -> (tempfile::TempDir, crate::config::RuntimePaths)
+    {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let root = tempfile::tempdir().unwrap();
+        let vendor = root.path().join("vendor");
+        let assets = root.path().join("assets");
+        let kernels = root.path().join("kernels");
+        let bin = vendor.join("v1.16.0/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        for name in ["firecracker", "jailer"] {
+            let path = bin.join(name);
+            std::fs::write(&path, "#!/bin/sh\nexit 42\n").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        symlink("v1.16.0", vendor.join("default")).unwrap();
+        std::fs::create_dir_all(kernels.join("vmlinux-6.1.158")).unwrap();
+        std::fs::write(kernels.join("vmlinux-6.1.158/vmlinux.bin"), b"kernel").unwrap();
+        for marker in ["default", "legacy-default"] {
+            symlink("vmlinux-6.1.158", kernels.join(marker)).unwrap();
+        }
+        std::fs::create_dir(&assets).unwrap();
+        (
+            root,
+            crate::config::RuntimePaths {
+                vendor,
+                assets,
+                kernels,
+            },
+        )
     }
 
     #[tokio::test]
@@ -1144,7 +1149,9 @@ pub(super) mod service_tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn cancelled_probe_retains_capacity_until_blocking_work_finishes() {
+        let (_runtime, runtime_paths) = installed_runtime();
         let mut service = service_for_unit_tests().await;
+        service.runtime_paths = runtime_paths;
         service.blocking_probe_slots = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
         let (started, running) = tokio::sync::oneshot::channel();
         let (finish, release) = std::sync::mpsc::channel();
@@ -1169,7 +1176,6 @@ pub(super) mod service_tests {
             .unwrap_err();
         assert_eq!(error.code(), tonic::Code::ResourceExhausted);
         // Prepare and Launch need cold discovery even while diagnostics are full.
-        // Missing host assets may fail discovery, but diagnostic admission must not.
         let inventory = service.runtime_inventory().await;
         service.device_op_tasks.close();
         assert!(!service.device_op_tasks.is_empty());
@@ -1178,9 +1184,7 @@ pub(super) mod service_tests {
             .await
             .unwrap();
         service.off_runtime_probe("retry", || Ok(())).await.unwrap();
-        if let Err(error) = inventory {
-            assert_ne!(error.code(), tonic::Code::ResourceExhausted);
-        }
+        inventory.expect("saturated diagnostics must not refuse cold runtime discovery");
     }
 
     #[tokio::test(flavor = "current_thread")]

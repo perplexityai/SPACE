@@ -328,7 +328,7 @@ impl NodeManagerService {
             peer_authorizer: node_peer_authorizer(),
             sandbox_cgroup_config,
             memory_admission_config,
-            memory_admission_sources: MemoryAdmissionSources::default(),
+            memory_admission_sources: settings.memory_admission_sources,
             memory_admission_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
             sandbox_cgroup_gate_locks: std::sync::Arc::new(tokio::sync::Mutex::new(
                 std::collections::HashMap::new(),
@@ -356,8 +356,7 @@ impl NodeManagerService {
             cache_artifact_delete_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(
                 MAX_CACHE_ARTIFACT_DELETES,
             )),
-            runtime_supervisor: crate::runtime_supervisor_client::RuntimeSupervisorLazyClient::new(
-            ),
+            runtime_supervisor: settings.runtime_supervisor,
             runtime_inventory: std::sync::Arc::new(ArcSwapOption::empty()),
             runtime_inventory_refresh_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
             runtime_paths: settings.runtime_paths,

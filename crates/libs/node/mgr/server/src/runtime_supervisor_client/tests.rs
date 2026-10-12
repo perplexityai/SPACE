@@ -251,6 +251,11 @@ pub(crate) type StopProcessReply = Arc<
     dyn Fn(proto::StopProcessRequest) -> Result<proto::StopProcessResponse, Status> + Send + Sync,
 >;
 
+/// Answers the stub's `update_cgroup` RPC with the request it received.
+pub(crate) type UpdateCgroupReply = Arc<
+    dyn Fn(proto::UpdateCgroupRequest) -> Result<proto::UpdateCgroupResponse, Status> + Send + Sync,
+>;
+
 /// Supervisor replies for node-manager RPC tests; `None` keeps the stub's
 /// default reply. Runtime stop always fails with `Unimplemented`, so a refusal
 /// that regresses past its check ends at the stop instead of host cleanup.
@@ -258,6 +263,7 @@ pub(crate) type StopProcessReply = Arc<
 pub(crate) struct SupervisorScript {
     pub(crate) bind_execution_failure: Option<tonic::Code>,
     pub(crate) stop_process: Option<StopProcessReply>,
+    pub(crate) update_cgroup: Option<UpdateCgroupReply>,
 }
 
 pub(crate) async fn scripted_client(
@@ -274,6 +280,116 @@ pub(crate) async fn scripted_client(
     let server = spawn_supervisor_server(&path, stub).await;
     let client = supervisor_test_client(path, Arc::new(AtomicUsize::new(0)));
     (root, client, server)
+}
+
+/// [`scripted_client`] served in process, with no socket to own.
+pub(crate) fn scripted_in_process_client(script: SupervisorScript) -> RuntimeSupervisorLazyClient {
+    let mut stub = StubRuntimeSupervisor::counting(Arc::new(AtomicUsize::new(0)));
+    stub.stop_status = tonic::Code::Unimplemented;
+    stub.script = script;
+    in_process_client(stub)
+}
+
+/// The unit-test service's default supervisor: every RPC fails with
+/// `Unimplemented` at once. It is not a connect failure, so the client does
+/// not spend its restart budget retrying, and no host process is contacted.
+pub(crate) fn refusing_client() -> RuntimeSupervisorLazyClient {
+    in_process_client(RefusingRuntimeSupervisor)
+}
+
+/// Each dial serves `service` over an in-memory stream and passes the
+/// production liveness check, as a dial to the supervisor socket does.
+fn in_process_client<T>(service: T) -> RuntimeSupervisorLazyClient
+where
+    T: proto::runtime_supervisor_server::RuntimeSupervisor + Clone,
+{
+    RuntimeSupervisorLazyClient::from_connect_fn(Box::new(move || {
+        let service = service.clone();
+        Box::pin(async move {
+            let channel = tonic::transport::Endpoint::try_from("http://runtime-supervisor.invalid")
+                .map_err(|error| Status::unavailable(format!("test endpoint: {error}")))?
+                .connect_with_connector(tower::service_fn(move |_| {
+                    let (client, server) = tokio::io::duplex(64 * 1024);
+                    let service = service.clone();
+                    tokio::spawn(async move {
+                        let (_, health_service) = pplx_space_common_svc::grpc_health_service();
+                        tonic::transport::Server::builder()
+                            .add_service(health_service)
+                            .add_service(
+                                proto::runtime_supervisor_server::RuntimeSupervisorServer::new(
+                                    service,
+                                ),
+                            )
+                            .serve_with_incoming(tokio_stream::once(Ok::<_, std::io::Error>(
+                                server,
+                            )))
+                            .await
+                            .unwrap();
+                    });
+                    async move { Ok::<_, std::io::Error>(hyper_util::rt::TokioIo::new(client)) }
+                }))
+                .await
+                .map_err(|error| {
+                    Status::unavailable(format!("connect to runtime-supervisor failed: {error}"))
+                })?;
+            prove_live_and_wrap(channel).await
+        })
+    }))
+}
+
+#[derive(Clone)]
+struct RefusingRuntimeSupervisor;
+
+fn refused(rpc: &str) -> Status {
+    Status::unimplemented(format!(
+        "unit-test runtime supervisor refuses {rpc}; inject a scripted supervisor"
+    ))
+}
+
+#[tonic::async_trait]
+impl proto::runtime_supervisor_server::RuntimeSupervisor for RefusingRuntimeSupervisor {
+    async fn bind_execution(
+        &self,
+        _request: Request<proto::BindExecutionRequest>,
+    ) -> Result<Response<proto::BindExecutionResponse>, Status> {
+        Err(refused("BindExecution"))
+    }
+    async fn retire_execution(
+        &self,
+        _request: Request<proto::RetireExecutionRequest>,
+    ) -> Result<Response<proto::RetireExecutionResponse>, Status> {
+        Err(refused("RetireExecution"))
+    }
+    async fn launch_firecracker(
+        &self,
+        _request: Request<proto::LaunchFirecrackerRequest>,
+    ) -> Result<Response<proto::LaunchFirecrackerResponse>, Status> {
+        Err(refused("LaunchFirecracker"))
+    }
+    async fn launch_sidecar(
+        &self,
+        _request: Request<proto::LaunchSidecarRequest>,
+    ) -> Result<Response<proto::LaunchSidecarResponse>, Status> {
+        Err(refused("LaunchSidecar"))
+    }
+    async fn stop_process(
+        &self,
+        _request: Request<proto::StopProcessRequest>,
+    ) -> Result<Response<proto::StopProcessResponse>, Status> {
+        Err(refused("StopProcess"))
+    }
+    async fn stop_sandbox_runtime(
+        &self,
+        _request: Request<proto::StopSandboxRuntimeRequest>,
+    ) -> Result<Response<proto::StopSandboxRuntimeResponse>, Status> {
+        Err(refused("StopSandboxRuntime"))
+    }
+    async fn update_cgroup(
+        &self,
+        _request: Request<proto::UpdateCgroupRequest>,
+    ) -> Result<Response<proto::UpdateCgroupResponse>, Status> {
+        Err(refused("UpdateCgroup"))
+    }
 }
 
 #[derive(Clone)]
@@ -397,9 +513,12 @@ impl proto::runtime_supervisor_server::RuntimeSupervisor for StubRuntimeSupervis
 
     async fn update_cgroup(
         &self,
-        _request: Request<proto::UpdateCgroupRequest>,
+        request: Request<proto::UpdateCgroupRequest>,
     ) -> Result<Response<proto::UpdateCgroupResponse>, Status> {
-        Err(Status::unimplemented("update_cgroup"))
+        match &self.script.update_cgroup {
+            Some(reply) => reply(request.into_inner()).map(Response::new),
+            None => Err(Status::unimplemented("update_cgroup")),
+        }
     }
 }
 

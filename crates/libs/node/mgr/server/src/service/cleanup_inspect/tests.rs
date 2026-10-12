@@ -417,7 +417,8 @@ struct CleanupNode {
 impl CleanupNode {
     /// A bound, leased sandbox. Its test-owned supervisor refuses runtime
     /// stop, so a cleanup refusal that regresses ends there instead of
-    /// touching host artifacts or a real supervisor.
+    /// touching host artifacts or a real supervisor. The lease is claimed off
+    /// the Tokio runtime, so allocation never dials the fixed node-ctl socket.
     async fn leased() -> Self {
         let (supervisor_socket, client, supervisor) =
             crate::runtime_supervisor_client::tests::scripted_client(Default::default()).await;
@@ -441,17 +442,10 @@ impl CleanupNode {
             .pool
             .bind_execution(&node.sandbox_id.to_string(), node.fence)
             .unwrap();
-        node.service
-            .pool
-            .allocate(
-                &node.sandbox_id.to_string(),
-                None,
-                Some(crate::slot_pool::NewLeaseMemoryReservation {
-                    memory_reservation_mib: 1024,
-                }),
-            )
-            .await
-            .unwrap();
+        crate::service::tests::service_tests::allocate_test_lease(
+            &node.service,
+            &node.sandbox_id.to_string(),
+        );
         node
     }
 
@@ -523,28 +517,30 @@ async fn blocked_cleanup_phase_times_out_before_stopping_the_runtime(
     #[case] blocker: CleanupBlocker,
     #[case] message: &str,
 ) {
-    // One held permit fills the cleanup class only at a known limit, so pin
-    // it rather than inherit the runner's override.
-    if blocker == CleanupBlocker::Capacity
-        && !pplx_space_test_env::enter_test_process(&[(
-            "SPACE_NODEMGR_LIMIT_CLEANUP_SANDBOX",
-            Some(std::ffi::OsStr::new("1:1")),
-        )])
-    {
-        return;
-    }
-    let node = CleanupNode::leased().await;
+    let mut node = CleanupNode::leased().await;
+    // One held permit fills the cleanup class only at a known limit.
+    node.service.lifecycle_limiter = Arc::new(crate::lifecycle_limiter::tests::limiter_with(
+        crate::lifecycle_limiter::LifecycleMethod::CleanupSandbox,
+        1,
+        1,
+    ));
     let service = &node.service;
     let id = node.sandbox_id;
     let before = node.lease();
     let held: Box<dyn std::any::Any + Send> = match blocker {
-        CleanupBlocker::Capacity => Box::new(
+        // The artifact lock guards the next phase, so a cleanup that ignores
+        // capacity stops there, before it reads the run directory.
+        CleanupBlocker::Capacity => Box::new((
             service
                 .lifecycle_limiter
                 .acquire(crate::lifecycle_limiter::LifecycleMethod::CleanupSandbox)
                 .await
                 .unwrap(),
-        ),
+            service
+                .lock_sandbox_artifacts(&id.to_string())
+                .await
+                .unwrap(),
+        )),
         CleanupBlocker::ArtifactTransfer => Box::new(
             service
                 .lock_sandbox_artifacts(&id.to_string())
