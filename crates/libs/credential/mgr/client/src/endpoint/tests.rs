@@ -118,9 +118,10 @@ fn host_is_required_for_tcp_schemes() {
 }
 
 // A dial whose SYN is never answered must not hold connect for the kernel's
-// SYN retransmits: each dial is bounded, so connect redials until the retry
-// budget is spent and then fails. Linux drops a SYN to a listener whose accept
-// queue is full, which stands in for a SYN pinned to a stale conntrack entry.
+// SYN retransmits: the dial hangs until its bound cuts it, and connect fails
+// within the retry budget plus one dial. Linux drops a SYN to a listener whose
+// accept queue is full, which stands in for a SYN pinned to a stale conntrack
+// entry.
 #[cfg(target_os = "linux")]
 #[tokio::test(start_paused = true)]
 async fn an_unanswered_dial_fails_within_the_connect_budget() {
@@ -154,7 +155,7 @@ async fn an_unanswered_dial_fails_within_the_connect_budget() {
         );
         let elapsed = started.elapsed();
         assert!(
-            elapsed >= budget && elapsed <= budget + CONNECT_TIMEOUT,
+            elapsed >= CONNECT_TIMEOUT && elapsed <= budget + CONNECT_TIMEOUT,
             "{endpoint:?}: connect gave up after {elapsed:?}"
         );
     }
