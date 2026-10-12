@@ -33,6 +33,14 @@ if ! command -v uv >/dev/null 2>&1; then
   exit 2
 fi
 
+# As in ci/scripts/run-python-tests.sh: CI checks that uv.lock still matches
+# pyproject.toml (--locked); local runs use the lock as committed (--frozen),
+# which a host uv with its own resolver settings would otherwise rewrite.
+UV_LOCK_MODE=--frozen
+if [[ -n "${CI:-}" ]]; then
+  UV_LOCK_MODE=--locked
+fi
+
 require_native_token() {
   if [[ -z "${SPACE_API_TOKEN:-}" && -n "${SPACE_SMOKE_KIND_ADMIN_TOKEN_FILE:-}" ]]; then
     SPACE_API_TOKEN="$(<"$SPACE_SMOKE_KIND_ADMIN_TOKEN_FILE")"
@@ -121,7 +129,7 @@ ensure_build_foreign_org() {
 run_surface() {
   local surface="$1"; shift
   echo "--- typed smoke on the ${surface} API surface"
-  SPACE_SMOKE_API_SURFACE="$surface" uv run --frozen --python 3.11 -m space_smoke run "$@" "${SHARD_ARGS[@]}"
+  SPACE_SMOKE_API_SURFACE="$surface" uv run "$UV_LOCK_MODE" --python 3.11 -m space_smoke run "$@" "${SHARD_ARGS[@]}"
 }
 
 cd "$REPO_ROOT"
@@ -160,13 +168,13 @@ case "$TARGET" in
     ;;
   native)
     prepare_native_kind
-    exec env SPACE_SMOKE_API_SURFACE=native uv run --frozen --python 3.11 -m space_smoke run --all "${SHARD_ARGS[@]}"
+    exec env SPACE_SMOKE_API_SURFACE=native uv run "$UV_LOCK_MODE" --python 3.11 -m space_smoke run --all "${SHARD_ARGS[@]}"
     ;;
   ecw|network_policy|local)
     if [[ "$TARGET" == local ]]; then
       ensure_build_foreign_org
     fi
-    exec env SPACE_SMOKE_API_SURFACE=ecw uv run --frozen --python 3.11 -m space_smoke run --category "$TARGET" "${SHARD_ARGS[@]}"
+    exec env SPACE_SMOKE_API_SURFACE=ecw uv run "$UV_LOCK_MODE" --python 3.11 -m space_smoke run --category "$TARGET" "${SHARD_ARGS[@]}"
     ;;
   *)
     echo "ERROR: unknown typed smoke target: $TARGET" >&2
