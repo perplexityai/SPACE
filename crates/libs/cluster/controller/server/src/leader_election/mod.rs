@@ -844,6 +844,9 @@ where
                 };
                 marker.set(false);
                 pplx_space_metrics::leader_election::acquire_failed(failure.as_str());
+                // Still campaigning, so certainly not the leader: say so, or a
+                // contender refused from its first attempt never has a series.
+                pplx_space_metrics::leader_election::is_leader(&config.identity, false);
                 // A failure only a human can clear is reported the first time
                 // it's seen, not after the grace window: for the categories that
                 // don't spend the budget there is no later escalation, and
