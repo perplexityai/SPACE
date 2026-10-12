@@ -141,6 +141,7 @@ fn ecw_route_metric(method: &Method, segments: &[&str]) -> Option<SandboxApiMetr
         (&Method::POST, ["sandboxes", _, "connect"]) => "connect",
         (&Method::POST, ["sandboxes", _, "timeout"]) => "timeout",
         (&Method::POST, ["sandboxes", _, "refreshes"]) => "refresh",
+        (&Method::POST, ["sandboxes", _, "fork"]) => "fork",
         _ => return None,
     };
 
