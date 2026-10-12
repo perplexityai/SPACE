@@ -398,7 +398,7 @@ async fn row_cleanup_retires_policy_only_after_identity_is_deleted() {
             .unwrap();
             episode.id
         });
-        let service = SandboxManagerService::new(conn);
+        let service = SandboxManagerService::for_test(conn);
         let queue = &service.network_policy_reconcile_queue;
         queue.enqueue(id.clone());
         let old_attempt = queue.take_pending(&Default::default(), 1).pop().unwrap();
@@ -455,7 +455,7 @@ async fn inventory_retires_registries_atomically_and_retries_busy_registrations(
     let conn = crate::db::test_conn();
     let id = SandboxId::new().to_string();
     insert_test_sandbox(&conn, &id, SandboxState::Stopped);
-    let service = SandboxManagerService::new(conn);
+    let service = SandboxManagerService::for_test(conn);
     let cache = tempfile::tempdir().unwrap();
     let run = tempfile::tempdir().unwrap();
     service.network_policy_reconcile_queue.enqueue(id.clone());

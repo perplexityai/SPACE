@@ -1066,7 +1066,7 @@ async fn a_momentarily_busy_staging_tree_does_not_charge_the_episode() {
         conn,
         crate::service::SandboxManagerServiceOptions {
             sandbox_runtime_live: Arc::new(|_| true),
-            ..Default::default()
+            ..crate::service::SandboxManagerServiceOptions::for_test()
         },
     );
     let staging_lock = service.auto_lifecycle.staging_lock(&sandbox_id.to_string());
@@ -3709,7 +3709,7 @@ async fn pass_with_every_episode_due(
 
 /// Every field explicit, so no fixture reads the host's node identity.
 fn bound_test_service(conn: rusqlite::Connection) -> SandboxManagerService {
-    crate::service::tests::service_tests::service_with_runtime_liveness(conn, false)
+    crate::service::tests::service_tests::service_with_runtime_probe(conn, false)
 }
 
 fn bound() -> i64 {

@@ -113,7 +113,7 @@ async fn teardown_reuses_ready_backup_but_waits_for_active_local_upload() {
                 )
                 .unwrap();
             }
-            let service = SandboxManagerService::new(conn);
+            let service = SandboxManagerService::for_test(conn);
             let pending = service.ensure_teardown_suspend_backup(
                 &row,
                 super::TeardownSuspendBackup {
@@ -178,7 +178,7 @@ async fn failed_teardown_defers_repeated_polls_without_holding_driver_capacity()
     let sandbox = SandboxId::new();
     let generation = ExecutionGeneration::new(7).unwrap();
     insert_stranded_teardown_suspend_sandbox(&conn, sandbox, generation);
-    let service = SandboxManagerService::new(conn);
+    let service = SandboxManagerService::for_test(conn);
     service
         .drive_teardown_suspend(sandbox, generation, SandboxEventTrigger::System)
         .await

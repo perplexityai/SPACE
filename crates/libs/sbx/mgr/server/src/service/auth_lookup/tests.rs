@@ -21,7 +21,7 @@ async fn gateway_identity_mapping_preserves_exact_pid_and_lifecycle_authority() 
     crate::db::update_netgtw_pid(&conn, &id, owner, 4242).unwrap();
     let service = SandboxManagerService::new_with_options(
         conn,
-        super::super::SandboxManagerServiceOptions::default(),
+        super::super::SandboxManagerServiceOptions::for_test(),
     );
     for (pid, uid, allowed) in [
         (4242, owner, true),

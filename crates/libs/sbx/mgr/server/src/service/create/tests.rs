@@ -57,7 +57,7 @@ async fn create_refusals_before_insert_persist_nothing() {
             crate::db::test_conn(),
             SandboxManagerServiceOptions {
                 local_node_id: Some(NodeId::new()),
-                ..Default::default()
+                ..SandboxManagerServiceOptions::for_test()
             },
         );
         let id = SandboxId::new().to_string();

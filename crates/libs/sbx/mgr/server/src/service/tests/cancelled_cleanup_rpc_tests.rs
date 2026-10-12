@@ -1,4 +1,4 @@
-use super::service_tests::{insert_test_sandbox, runtime_fields, service_for_teardown_test};
+use super::service_tests::{insert_test_sandbox, runtime_fields};
 use super::*;
 use crate::service::activation_support::internal_request;
 use pplx_space_common_core::types::ExecutionGeneration;
@@ -22,18 +22,20 @@ async fn cancelled_cleanup_rpcs_preserve_admitted_termination_strength() {
         let sandbox_id = SandboxId::new();
         let id = sandbox_id.to_string();
         insert_test_sandbox(&conn, &id, SandboxState::Started);
-        let service = service_for_teardown_test(conn);
+        let run_dir = tempfile::tempdir().unwrap();
+        let service = SandboxManagerService::new_with_options(
+            conn,
+            SandboxManagerServiceOptions::for_test_in(run_dir.path()),
+        );
         service
             .update_runtime_fields(
                 sandbox_id,
                 runtime_fields(ExecutionGeneration::new(1).unwrap(), 7),
             )
             .unwrap();
-        let run_dir = tempfile::tempdir().unwrap();
         let sandbox_dir = run_dir.path().join(&id);
         std::fs::create_dir(&sandbox_dir).unwrap();
         std::os::unix::fs::symlink(run_dir.path(), sandbox_dir.join("fc.pid")).unwrap();
-        *service.cleanup_executor.run_dir.lock().unwrap() = Some(run_dir.path().to_owned());
         let barrier = Arc::new(crate::service::cleanup_executor::TestAdmissionBarrier {
             entered: tokio::sync::Notify::new(),
             release: tokio::sync::Semaphore::new(0),

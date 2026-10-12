@@ -1,6 +1,7 @@
 //! A scripted template resolver for tests.
 
-use std::sync::{Mutex, PoisonError};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use pplx_space_template_mgr_client::proto::{GetTemplateRequest, GetTemplateResponse};
 
@@ -104,5 +105,56 @@ impl TemplateResolver for FakeTemplateResolver {
                     tonic::Status::unavailable(error.to_string())
                 }
             })
+    }
+}
+
+/// A resolver whose lookups all dial `socket`, a test-owned path nothing
+/// binds. As when template-manager is down, a dialed lookup fails with a
+/// connect error and a shared-channel lookup with `Unavailable`. The dial is
+/// made once, without the host client's connect-retry budget.
+pub(crate) fn unbound(socket: &Path) -> Arc<dyn TemplateResolver> {
+    Arc::new(Unbound(socket.to_owned()))
+}
+
+struct Unbound(PathBuf);
+
+fn endpoint() -> tonic::transport::Endpoint {
+    tonic::transport::Endpoint::from_static("http://[::]:50051")
+}
+
+fn client(
+    channel: tonic::transport::Channel,
+) -> pplx_space_template_mgr_client::TemplateManagerGrpcClient {
+    pplx_space_template_mgr_client::proto::template_manager_client::TemplateManagerClient::new(
+        pplx_space_common_grpc::trace_grpc_client_transport(channel),
+    )
+}
+
+#[async_trait::async_trait]
+impl TemplateResolver for Unbound {
+    async fn get_template(
+        &self,
+        request: tonic::Request<GetTemplateRequest>,
+    ) -> Result<tonic::Response<GetTemplateResponse>, TemplateLookupError> {
+        let channel = pplx_space_common_grpc::connect_uds_channel_with_endpoint(
+            "template-manager",
+            &self.0,
+            endpoint(),
+        )
+        .await
+        .map_err(pplx_space_template_mgr_client::ConnectError::from)?;
+        Ok(client(channel).get_template(request).await?)
+    }
+
+    async fn get_template_on_shared_channel(
+        &self,
+        request: tonic::Request<GetTemplateRequest>,
+    ) -> Result<tonic::Response<GetTemplateResponse>, tonic::Status> {
+        client(pplx_space_common_grpc::connect_uds_channel_lazy(
+            &self.0,
+            endpoint(),
+        ))
+        .get_template(request)
+        .await
     }
 }

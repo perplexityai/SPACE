@@ -247,7 +247,7 @@ async fn artifact_backup_admission_refuses_sources_it_cannot_back_up() {
                 );
             }
         }
-        let service = SandboxManagerService::new(conn);
+        let service = SandboxManagerService::for_test(conn);
         let requested_id = if case == "blank id" { "  " } else { &id };
 
         let error = service
@@ -272,7 +272,7 @@ async fn artifact_backup_admission_refuses_sources_it_cannot_back_up() {
 /// marker in the backup refusal. Eviction's reading of the matching reupload
 /// refusal is pinned against its classifier in `crate::sandbox_eviction`.
 async fn assert_refused_as_missing_wiring() {
-    let service = SandboxManagerService::new(crate::db::test_conn());
+    let service = SandboxManagerService::for_test(crate::db::test_conn());
     let unknown = SandboxId::new().to_string();
     let enqueue = service
         .enqueue_artifact_backup(artifact_backup_request(
@@ -425,7 +425,7 @@ async fn durable_artifact_backup_persists_the_submitted_artifact_identity() {
         let conn = crate::db::test_conn();
         let id = SandboxId::new().to_string();
         insert_test_sandbox(&conn, &id, SandboxState::Suspended);
-        let mut service = SandboxManagerService::new(conn);
+        let mut service = SandboxManagerService::for_test(conn);
         service.snapshot_upload_config = case.default_bucket.map(|b| Arc::new(upload_config(b)));
         let sandbox = service.lookup_sandbox(&id).unwrap();
         let root = tempfile::tempdir().unwrap();
@@ -663,7 +663,7 @@ async fn service_with_template_policy(
     egress: Egress,
     generation: u64,
 ) -> SandboxManagerService {
-    let service = SandboxManagerService::new(conn);
+    let service = SandboxManagerService::for_test(conn);
     let policy = EffectiveNetworkPolicy::new(
         stored_policy(egress),
         generation,
@@ -874,7 +874,7 @@ async fn set_network_policy_rejects_malformed_requests_without_mutation() {
     let conn = crate::db::test_conn();
     let id = SandboxId::new().to_string();
     insert_test_sandbox(&conn, &id, SandboxState::Stopped);
-    let service = SandboxManagerService::new(conn);
+    let service = SandboxManagerService::for_test(conn);
     for (name, request, expected) in [
         (
             "unknown sandbox",
@@ -1083,7 +1083,7 @@ async fn kill_refuses_signals_it_cannot_deliver_before_cleanup_admission() {
         if let Some(state) = state {
             insert_test_sandbox(&conn, &id, state);
         }
-        let service = SandboxManagerService::new(conn);
+        let service = SandboxManagerService::for_test(conn);
         service.begin_draining_for_restart();
         (service, id)
     };

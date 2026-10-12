@@ -351,7 +351,7 @@ async fn create_intent_preserves_immutables_independently_of_pool_occupancy() {
             )
             .unwrap();
         }
-        let service = SandboxManagerService::new(conn);
+        let service = SandboxManagerService::for_test(conn);
         for has_snapshot in [false, true] {
             let snapshot_dir = has_snapshot.then(|| snapshot.path().to_str().unwrap());
             for (field, request, incompatible_with_pool) in &cases {

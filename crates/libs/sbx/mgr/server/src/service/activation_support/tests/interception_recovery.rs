@@ -200,7 +200,7 @@ async fn exercise_recovery(restore: bool) {
         SandboxManagerServiceOptions {
             credential_manager_socket_path: node_socket,
             shutdown_token: shutdown.clone(),
-            ..Default::default()
+            ..SandboxManagerServiceOptions::for_test()
         },
     );
     let _gateway = super::super::super::gateway_identity::tests::GatewayNode::attach(&mut service);

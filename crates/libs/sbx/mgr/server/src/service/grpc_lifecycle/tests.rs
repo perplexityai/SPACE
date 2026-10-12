@@ -37,7 +37,7 @@ async fn set_network_policy_rejects_local_authority_from_forwarded_service_peer(
     let conn = crate::db::test_conn();
     let sandbox_id = SandboxId::new().to_string();
     insert_test_sandbox(&conn, &sandbox_id, SandboxState::Paused);
-    let service = SandboxManagerService::new(conn);
+    let service = SandboxManagerService::for_test(conn);
 
     let allow_all = pplx_space_net_common::NetworkPolicyV1::allow_all();
     let make_request = |uid: u32, gid: u32| {
@@ -108,7 +108,7 @@ async fn set_auto_lifecycle_policy_rejects_local_authority_from_forwarded_servic
     let conn = crate::db::test_conn();
     let sandbox_id = SandboxId::new().to_string();
     insert_test_sandbox(&conn, &sandbox_id, SandboxState::Paused);
-    let service = SandboxManagerService::new(conn);
+    let service = SandboxManagerService::for_test(conn);
 
     let make_request = |uid: u32, gid: u32| {
         let mut request = tonic::Request::new(SetAutoLifecyclePolicyRequest {
@@ -180,7 +180,7 @@ async fn template_notification_matches_inherited_sandboxes_of_both_authorities()
             .unwrap();
         }
     }
-    let service = crate::service::SandboxManagerService::new(conn);
+    let service = crate::service::SandboxManagerService::for_test(conn);
     let response = service
         .template_network_policy_updated(internal_request(
             crate::proto::TemplateNetworkPolicyUpdatedRequest {
@@ -715,7 +715,7 @@ fn current_instance_handler_refuses_incomplete_suspend_without_publishing_a_pin(
                         conn.execute("UPDATE sandboxes SET state = 'restoring' WHERE id = ?1", [&id])
                             .unwrap();
                     }
-                    let mut service = SandboxManagerService::new(conn);
+                    let mut service = SandboxManagerService::for_test(conn);
                     service.config.hugepages = case == "unsupported";
                     let error = service
                         .enqueue_artifact_backup(crate::service::activation_support::internal_request(
@@ -962,7 +962,7 @@ async fn suspended_artifact_adoption_race_uses_existing_artifact_id() {
     assert!(
         crate::db::adopt_suspended_local_artifact(&conn, sandbox_id, first, snapshot_dir).unwrap()
     );
-    let service = SandboxManagerService::new(conn);
+    let service = SandboxManagerService::for_test(conn);
 
     let resolved = service
         .adopt_or_get_suspended_local_artifact(sandbox_id, second, snapshot_dir)
@@ -1116,7 +1116,7 @@ async fn permanently_refused_teardown_backup_marks_the_suspending_row_terminal()
         let row = crate::db::get_sandbox(&conn, &sandbox_id_string)
             .unwrap()
             .unwrap();
-        let service = SandboxManagerService::new(conn);
+        let service = SandboxManagerService::for_test(conn);
         let artifact = crate::db::LocalArtifactRow {
             local_artifact_id: staged,
             sandbox_id: sandbox_id_string.clone(),
@@ -1234,7 +1234,7 @@ async fn teardown_suspend_terminal_driver_failures_stop_polling_without_release_
             conn.execute("DELETE FROM sandboxes WHERE id = ?1", [&id])
                 .unwrap();
         }
-        let service = SandboxManagerService::new(conn);
+        let service = SandboxManagerService::for_test(conn);
         service
             .drive_teardown_suspend(sandbox_id, generation, SandboxEventTrigger::System)
             .await
@@ -1324,7 +1324,7 @@ async fn teardown_suspend_keeps_polling_until_a_deleting_sandbox_commits_its_del
     use crate::service::tests::service_tests::prepare_teardown_suspend_request;
     let conn = crate::db::test_conn();
     let (id, generation) = deleting_sandbox_with_closed_teardown_suspend(&conn);
-    let service = SandboxManagerService::new(conn);
+    let service = SandboxManagerService::for_test(conn);
     let actions = [
         crate::proto::TeardownSuspendAction::BeginOrJoin,
         crate::proto::TeardownSuspendAction::ObserveOnly,
@@ -1381,7 +1381,7 @@ async fn teardown_suspend_keeps_polling_until_a_deleting_sandbox_commits_its_del
 async fn teardown_suspend_terminal_decision_releases_a_delete_committed_after_the_first_snapshot() {
     let conn = crate::db::test_conn();
     let (id, generation) = deleting_sandbox_with_closed_teardown_suspend(&conn);
-    let service = SandboxManagerService::new(conn);
+    let service = SandboxManagerService::for_test(conn);
     {
         let db = service.db.lock().unwrap();
         // The handler's first snapshot: the row is deleting and no receipt
@@ -1428,7 +1428,7 @@ async fn teardown_suspend_preserves_retryable_and_superseded_driver_work() {
     let sandbox_id = SandboxId::new();
     let generation = ExecutionGeneration::new(7).unwrap();
     insert_stranded_teardown_suspend_sandbox(&conn, sandbox_id, generation);
-    let service = SandboxManagerService::new(conn);
+    let service = SandboxManagerService::for_test(conn);
     for error in [
         Status::unavailable("retry later"),
         Status::internal("local IO failed"),
@@ -1496,7 +1496,7 @@ async fn teardown_suspend_registration_failure_closes_only_the_requested_generat
     let sandbox_id = SandboxId::new();
     let generation = ExecutionGeneration::new(7).unwrap();
     let failed_artifact = insert_stranded_teardown_suspend_sandbox(&conn, sandbox_id, generation);
-    let service = SandboxManagerService::new(conn);
+    let service = SandboxManagerService::for_test(conn);
     let missing = teardown_artifact_backup_status(
         ArtifactBackupSubmissionError::Begin(pplx_space_common_jobs::JobError::permanent(
             "registration refused",
@@ -1722,7 +1722,7 @@ async fn teardown_suspend_pause_failure_recovery_allows_same_generation_retry() 
             pplx_space_common_core::types::SandboxQuarantineNextAction::RequiresOperatorAttention,
         )
         .unwrap();
-        let service = SandboxManagerService::new(conn);
+        let service = SandboxManagerService::for_test(conn);
         assert_eq!(
             service
                 .close_terminal_teardown_suspend(&id, generation)

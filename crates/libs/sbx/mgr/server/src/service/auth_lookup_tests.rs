@@ -73,7 +73,7 @@ fn fixture_with_claims(
         rusqlite::Connection::open_in_memory().unwrap(),
         SandboxManagerServiceOptions {
             route_ed25519_verification_bundle: Some(Arc::new(bundle)),
-            ..Default::default()
+            ..SandboxManagerServiceOptions::for_test()
         },
     );
     let mut request = tonic::Request::new(());

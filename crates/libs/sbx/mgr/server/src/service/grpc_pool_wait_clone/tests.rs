@@ -45,7 +45,7 @@ fn armed_clone() -> (SandboxManagerService, SandboxId, SandboxCleanupEpisodeId) 
         None,
     )
     .unwrap();
-    (SandboxManagerService::new(conn), id, cleanup_id)
+    (SandboxManagerService::for_test(conn), id, cleanup_id)
 }
 
 #[tokio::test]
@@ -185,7 +185,7 @@ async fn pool_clone_restart_preserves_disposal_ownership() {
         .execute("VACUUM INTO ?1", [database.to_str().unwrap()])
         .unwrap();
     drop(service);
-    let service = SandboxManagerService::new(rusqlite::Connection::open(database).unwrap());
+    let service = SandboxManagerService::for_test(rusqlite::Connection::open(database).unwrap());
     let cache = tempfile::tempdir().unwrap();
     service
         .recover_prelaunch_startup_states_in(cache.path(), &Default::default())
@@ -640,7 +640,7 @@ async fn pool_clone_admission_precedes_all_durable_allocation() {
         (None, tonic::Code::Unavailable, tonic::Code::Unavailable),
         (Some(true), tonic::Code::Ok, tonic::Code::NotFound),
     ] {
-        let service = SandboxManagerService::new(crate::db::test_conn());
+        let service = SandboxManagerService::for_test(crate::db::test_conn());
         let methods = Arc::new(Mutex::new(Vec::new()));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();

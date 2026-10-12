@@ -6,7 +6,7 @@ use crate::service::tests::service_tests::insert_test_sandbox;
 async fn inventory_stream_cancels_while_waiting_for_storage_capacity() {
     use tokio_stream::StreamExt;
     for reason in ["deadline", "shutdown", "reader"] {
-        let service = SandboxManagerService::new(crate::db::test_conn());
+        let service = SandboxManagerService::for_test(crate::db::test_conn());
         let stream_capacity = service.cleanup_target_streams.available_permits();
         let cache = tempfile::tempdir().unwrap();
         let permits = service.cleanup_io.available_permits();
@@ -159,7 +159,7 @@ async fn streamed_inventory_includes_rowless_targets_and_preserves_bad_metadata(
         [&malformed],
     )
     .unwrap();
-    let service = SandboxManagerService::new(conn);
+    let service = SandboxManagerService::for_test(conn);
     let cache = tempfile::tempdir().unwrap();
     for id in [&persisted, &rowless] {
         std::fs::create_dir(cache.path().join(id)).unwrap();
@@ -191,7 +191,7 @@ async fn streamed_inventory_includes_rowless_targets_and_preserves_bad_metadata(
 #[tokio::test]
 async fn inventory_stream_owns_capacity_and_reports_failure_instead_of_clean_eof() {
     use tokio_stream::StreamExt;
-    let service = SandboxManagerService::new(crate::db::test_conn());
+    let service = SandboxManagerService::for_test(crate::db::test_conn());
     let cache = tempfile::tempdir().unwrap();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
     let capacity = service.cleanup_target_streams.available_permits();
@@ -217,7 +217,7 @@ async fn inventory_stream_owns_capacity_and_reports_failure_instead_of_clean_eof
     assert_eq!(service.cleanup_target_streams.available_permits(), capacity);
 
     for failure in ["deadline", "database"] {
-        let service = SandboxManagerService::new(crate::db::test_conn());
+        let service = SandboxManagerService::for_test(crate::db::test_conn());
         let deadline = if failure == "deadline" {
             tokio::time::Instant::now()
         } else {

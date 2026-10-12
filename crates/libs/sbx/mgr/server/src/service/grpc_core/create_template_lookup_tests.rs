@@ -118,20 +118,20 @@ async fn create_checks_auto_lifecycle_authority_before_template_lookup() {
     for case in cases {
         let templates = Arc::new((case.templates)());
         let node_manager = FakeNodeManager::default().serve();
-        let sockets = tempfile::tempdir().unwrap();
-        let service = crate::service::tests::node_manager_transport_tests::isolated_service(
+        let service = SandboxManagerService::new_with_options(
             crate::db::test_conn(),
-            node_manager.connector(),
-            Arc::clone(&templates) as Arc<dyn crate::template_resolver::TemplateResolver>,
-            sockets.path(),
+            SandboxManagerServiceOptions {
+                node_manager: node_manager.connector(),
+                template_resolver: Arc::clone(&templates) as _,
+                ..SandboxManagerServiceOptions::for_test()
+            },
         );
-        let sandbox_id = SandboxId::new().to_string();
         let mut request = Request::new(CreateRequest {
             template: "seed".into(),
             owner: "root@local".into(),
             runtime: pplx_space_common_core::types::RUNTIME_FIRECRACKER_ALIAS.into(),
             boot_mode: BootMode::Cold as i32,
-            sandbox_id: Some(sandbox_id.clone()),
+            sandbox_id: Some(SandboxId::new().to_string()),
             auto_lifecycle: Some(Default::default()),
             auto_lifecycle_authority: case.authority,
             ..Default::default()
@@ -169,10 +169,5 @@ async fn create_checks_auto_lifecycle_authority_before_template_lookup() {
             assert!(lookup.metadata.is_empty(), "{}", case.name);
         }
         assert!(node_manager.calls().is_empty(), "{}", case.name);
-        assert!(
-            !crate::db::sandbox_exists(&service.db_conn().unwrap(), &sandbox_id).unwrap(),
-            "{}",
-            case.name
-        );
     }
 }

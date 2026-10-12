@@ -30,48 +30,27 @@ fn enter_isolated_test_process() -> bool {
     ])
 }
 
-/// A service built from explicit options. `Default` options read the node
-/// identity from a fixed host file and probe runtimes under the fixed run
-/// directory; here the node identity is fixed, runtime liveness reads
-/// `scratch`, the host-control, credential-manager and node-manager sockets
-/// are absent paths under `scratch`, and every template lookup is refused.
+/// A service whose host dependencies all resolve under `scratch`; see
+/// [`SandboxManagerServiceOptions::for_test_in`].
 fn isolated_service(
     conn: rusqlite::Connection,
     scratch: &std::path::Path,
     node_role: Option<NodeRole>,
 ) -> SandboxManagerService {
-    let run_dir = scratch.to_owned();
     SandboxManagerService::new_with_options(
         conn,
         SandboxManagerServiceOptions {
-            host_control_socket_path: scratch.join("absent-host-control.sock"),
-            credential_manager_socket_path: scratch.join("absent-credential-manager.sock"),
-            sandbox_runtime_live: Arc::new(move |id| {
-                crate::service::cache_cleanup::is_sandbox_running_in(&run_dir, id)
-            }),
-            shutdown_token: tokio_util::sync::CancellationToken::new(),
-            task_tracker: tokio_util::task::TaskTracker::new(),
-            local_node_id: Some(pplx_space_common_core::types::NodeId::from_uuid(
-                uuid::Uuid::from_u128(0x019f_8000_0000_7000_8000_0000_0000_00fe),
-            )),
             node_role,
-            node_managed_by: None,
-            route_ed25519_verification_bundle: None,
-            node_manager: crate::node_manager_transport::fake::unbound(
-                &scratch.join("absent-node-manager.sock"),
-            ),
-            template_resolver: Arc::new(
-                crate::template_resolver::fake::FakeTemplateResolver::refusing(
-                    Status::unavailable("template-manager is outside this test"),
-                ),
-            ),
+            ..SandboxManagerServiceOptions::for_test_in(scratch)
         },
     )
 }
 
 /// An auto-lifecycle authority no proto value names. Create parses it last
-/// before template lookup, which would contact the fixed template-manager
-/// socket.
+/// before template lookup. A lookup past the barrier stops at the test
+/// service's template-manager fake, whose socket is unbound: the lookup fails
+/// to connect (`TemplateLookupError::Connect`), which create reports as
+/// `Internal` "cannot connect to template-manager".
 const BARRIER_AUTHORITY: i32 = 98;
 /// The barrier's refusal; no case expects this message for its own refusal.
 const BARRIER_REFUSAL: &str = "policy authority proto value 98 is unknown";
@@ -290,7 +269,6 @@ async fn forwarded_create_refuses_owner_and_network_policy_authority_before_temp
                 network_policy_authority: case.network_policy_authority.unwrap_or_default(),
                 ..create_refused_before_template_lookup()
             };
-            let sandbox_id = request.sandbox_id.clone().unwrap();
 
             let error = service
                 .create(peer_request(
@@ -301,10 +279,6 @@ async fn forwarded_create_refuses_owner_and_network_policy_authority_before_temp
                 .expect_err(case.name);
             assert_eq!(error.code(), case.code, "{context}: {error}");
             assert!(error.message().contains(case.message), "{context}: {error}");
-            assert!(
-                !crate::db::sandbox_exists(&service.db_conn().unwrap(), &sandbox_id).unwrap(),
-                "{context}"
-            );
         }
     }
 }
@@ -345,7 +319,6 @@ impl CleanupFixture {
     ) -> Self {
         let run_dir = tempfile::tempdir().unwrap();
         let service = isolated_service(conn, run_dir.path(), node_role);
-        *service.cleanup_executor.run_dir.lock().unwrap() = Some(run_dir.path().to_owned());
         let dispatch_permits = Arc::new(tokio::sync::Semaphore::new(dispatch_permits));
         let permits = Arc::clone(&dispatch_permits);
         *service.cleanup_executor.dispatch.lock().unwrap() = Some(Arc::new(move |_, _| {
@@ -685,7 +658,7 @@ async fn nonblocking_cleanup_returns_once_admitted_and_honors_skip_node_publish(
             let mut request = peer_request((), Some(root_peer()));
             if skip_node_publish {
                 request.metadata_mut().insert(
-                    "x-space-skip-cluster-sync",
+                    crate::node_state_sync::SKIP_NODE_PUBLISH_METADATA,
                     tonic::metadata::MetadataValue::from_static("true"),
                 );
             }
@@ -752,7 +725,7 @@ async fn nonblocking_cleanup_returns_once_admitted_and_honors_skip_node_publish(
             // completion marks the sandbox dirty just after the job settles.
             within_cleanup_wait(&context, async {
                 while !fixture.dirty_ids().contains(&id) {
-                    tokio::task::yield_now().await;
+                    tokio::time::sleep(Duration::from_millis(5)).await;
                 }
             })
             .await;
@@ -872,7 +845,9 @@ async fn auto_lifecycle_delete_requires_one_canonical_id_and_the_expected_policy
         uppercase_id: bool,
         template_filter: Option<&'static str>,
         expected_policy: &'a AutoLifecyclePolicy,
-        refusal: Option<tonic::Code>,
+        /// The refusal's code and part of its message; one code comes from
+        /// more than one branch.
+        refusal: Option<(tonic::Code, &'static str)>,
     }
     for case in [
         Case {
@@ -880,21 +855,27 @@ async fn auto_lifecycle_delete_requires_one_canonical_id_and_the_expected_policy
             uppercase_id: false,
             template_filter: Some("seed"),
             expected_policy: &policy,
-            refusal: Some(tonic::Code::Internal),
+            refusal: Some((
+                tonic::Code::Internal,
+                "auto-lifecycle delete requires one exact sandbox id",
+            )),
         },
         Case {
             name: "non-canonical id",
             uppercase_id: true,
             template_filter: None,
             expected_policy: &policy,
-            refusal: Some(tonic::Code::Internal),
+            refusal: Some((
+                tonic::Code::Internal,
+                "auto-lifecycle delete requires a canonical sandbox id",
+            )),
         },
         Case {
             name: "stale policy",
             uppercase_id: false,
             template_filter: None,
             expected_policy: &stale,
-            refusal: Some(tonic::Code::Aborted),
+            refusal: Some((tonic::Code::Aborted, "auto-lifecycle delete lost its")),
         },
         Case {
             name: "current policy",
@@ -950,9 +931,10 @@ async fn auto_lifecycle_delete_requires_one_canonical_id_and_the_expected_policy
         let result = within_cleanup_wait(case.name, delete).await;
 
         match case.refusal {
-            Some(code) => {
+            Some((code, message)) => {
                 let error = result.unwrap_err();
-                assert_eq!(error.code(), code, "{}", case.name);
+                assert_eq!(error.code(), code, "{}: {error}", case.name);
+                assert!(error.message().contains(message), "{}: {error}", case.name);
                 // The reconciler retries a lost policy comparison by this key.
                 assert_eq!(
                     error.metadata().contains_key(
@@ -1050,7 +1032,9 @@ async fn delete_of_a_pool_clone_disposal_requires_an_operator_after_quarantine()
         auto_lifecycle: bool,
         hold_cleanup_fence: bool,
         blocking: bool,
-        refusal: Option<tonic::Code>,
+        /// The refusal's code and part of its message; one code comes from
+        /// more than one branch.
+        refusal: Option<(tonic::Code, &'static str)>,
     }
     for case in [
         Case {
@@ -1061,7 +1045,10 @@ async fn delete_of_a_pool_clone_disposal_requires_an_operator_after_quarantine()
             auto_lifecycle: false,
             hold_cleanup_fence: false,
             blocking: false,
-            refusal: Some(tonic::Code::FailedPrecondition),
+            refusal: Some((
+                tonic::Code::FailedPrecondition,
+                "pool clone publication still owns this sandbox",
+            )),
         },
         Case {
             name: "template manager after quarantine",
@@ -1071,7 +1058,10 @@ async fn delete_of_a_pool_clone_disposal_requires_an_operator_after_quarantine()
             auto_lifecycle: false,
             hold_cleanup_fence: false,
             blocking: false,
-            refusal: Some(tonic::Code::FailedPrecondition),
+            refusal: Some((
+                tonic::Code::FailedPrecondition,
+                "clone disposal hold requires an explicit operator delete",
+            )),
         },
         Case {
             name: "auto-lifecycle after quarantine",
@@ -1081,7 +1071,10 @@ async fn delete_of_a_pool_clone_disposal_requires_an_operator_after_quarantine()
             auto_lifecycle: true,
             hold_cleanup_fence: false,
             blocking: false,
-            refusal: Some(tonic::Code::FailedPrecondition),
+            refusal: Some((
+                tonic::Code::FailedPrecondition,
+                "clone disposal hold requires an explicit operator delete",
+            )),
         },
         Case {
             name: "operator while cleanup is busy",
@@ -1091,7 +1084,7 @@ async fn delete_of_a_pool_clone_disposal_requires_an_operator_after_quarantine()
             auto_lifecycle: false,
             hold_cleanup_fence: true,
             blocking: false,
-            refusal: Some(tonic::Code::Unavailable),
+            refusal: Some((tonic::Code::Unavailable, "clone disposal is busy")),
         },
         Case {
             name: "operator after quarantine",
@@ -1170,10 +1163,12 @@ async fn delete_of_a_pool_clone_disposal_requires_an_operator_after_quarantine()
 
         let episode = crate::db::cleanup_episode(&fixture.service.db_conn().unwrap(), &id).unwrap();
         match case.refusal {
-            Some(code) => {
+            Some((code, message)) => {
                 let episode = episode.unwrap();
                 assert_eq!(episode.id, cleanup_id, "{}", case.name);
-                assert_eq!(result.unwrap_err().code(), code, "{}", case.name);
+                let error = result.unwrap_err();
+                assert_eq!(error.code(), code, "{}: {error}", case.name);
+                assert!(error.message().contains(message), "{}: {error}", case.name);
                 assert_eq!(fixture.state(&id), Some(held_state), "{}", case.name);
                 assert_eq!(episode.requested_at, None, "{}", case.name);
                 assert!(fixture.active_cleanup_job(&id).is_none(), "{}", case.name);

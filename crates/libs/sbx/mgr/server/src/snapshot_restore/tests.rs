@@ -1013,7 +1013,7 @@ async fn admission_rejection_preserves_completed_restore_work_for_retry() {
         &stage,
         target,
         &error,
-        &crate::node_manager_transport::NodeManagerConnector::host(),
+        &crate::node_manager_transport::fake::unbound_in_absent_dir(),
     )
     .await;
 

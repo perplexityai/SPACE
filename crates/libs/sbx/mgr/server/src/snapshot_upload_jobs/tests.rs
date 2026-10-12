@@ -37,7 +37,7 @@ async fn upload_executor_converges_unstaged_metadata_failure() {
     let executor = SnapshotUploadExecutor {
         db: std::sync::Arc::new(std::sync::Mutex::new(open_backfill_test_db())),
         drain_state: crate::service::tests::closed_drain_for_test(),
-        node_manager: crate::node_manager_transport::NodeManagerConnector::host(),
+        node_manager: crate::node_manager_transport::fake::unbound_in_absent_dir(),
         retained_source_inspector: std::sync::Arc::new(crate::retained_source::FakeInspector::new(
             crate::retained_source::RetainedSourceCheck::Absent,
         )),
@@ -185,7 +185,7 @@ async fn executor_rejects_non_snapshot_upload_job_kind() {
             rusqlite::Connection::open_in_memory().unwrap(),
         )),
         drain_state: std::sync::Arc::new(crate::service::drain::DrainState::default()),
-        node_manager: crate::node_manager_transport::NodeManagerConnector::host(),
+        node_manager: crate::node_manager_transport::fake::unbound_in_absent_dir(),
         retained_source_inspector: std::sync::Arc::new(crate::retained_source::FakeInspector::new(
             crate::retained_source::RetainedSourceCheck::Absent,
         )),
@@ -218,7 +218,7 @@ async fn executor_requires_begin_before_volume_staging() {
             rusqlite::Connection::open_in_memory().unwrap(),
         )),
         drain_state: std::sync::Arc::new(crate::service::drain::DrainState::default()),
-        node_manager: crate::node_manager_transport::NodeManagerConnector::host(),
+        node_manager: crate::node_manager_transport::fake::unbound_in_absent_dir(),
         retained_source_inspector: std::sync::Arc::new(crate::retained_source::FakeInspector::new(
             crate::retained_source::RetainedSourceCheck::Absent,
         )),
@@ -364,7 +364,7 @@ fn ready_backup_keeps_completed_evidence_when_bookkeeping_misses_execution_deadl
                 executor: SnapshotUploadExecutor {
                     db: std::sync::Arc::clone(&db),
                     drain_state: std::sync::Arc::new(crate::service::drain::DrainState::default()),
-                    node_manager: crate::node_manager_transport::NodeManagerConnector::host(),
+                    node_manager: crate::node_manager_transport::fake::unbound_in_absent_dir(),
                     retained_source_inspector: std::sync::Arc::new(
                         crate::retained_source::FakeInspector::new(
                             crate::retained_source::RetainedSourceCheck::Absent,
@@ -456,7 +456,7 @@ async fn maintenance_retries_failed_pruning_on_the_next_tick() {
     let worker = build_worker(
         std::sync::Arc::clone(&db),
         std::sync::Arc::clone(&drain),
-        crate::node_manager_transport::NodeManagerConnector::host(),
+        crate::node_manager_transport::fake::unbound_in_absent_dir(),
     );
     let shutdown = tokio_util::sync::CancellationToken::new();
     let maintenance = tokio::spawn(run_maintenance(
@@ -1137,7 +1137,7 @@ fn ready_backup_returns_before_the_retained_source_is_inspected() {
     let executor = SnapshotUploadExecutor {
         db: std::sync::Arc::clone(&db),
         drain_state: std::sync::Arc::new(crate::service::drain::DrainState::default()),
-        node_manager: crate::node_manager_transport::NodeManagerConnector::host(),
+        node_manager: crate::node_manager_transport::fake::unbound_in_absent_dir(),
         retained_source_inspector: std::sync::Arc::new(GatedInspector {
             gate: std::sync::Arc::clone(&gate),
         }),

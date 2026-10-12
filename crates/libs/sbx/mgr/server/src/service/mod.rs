@@ -404,6 +404,9 @@ pub struct SandboxManagerService {
     network_credentials_enabled: bool,
     node_manager: NodeManagerConnector,
     template_resolver: Arc<dyn crate::template_resolver::TemplateResolver>,
+    /// See [`SandboxManagerServiceOptions::cleanup_run_dir`].
+    #[cfg(test)]
+    cleanup_run_dir: Option<PathBuf>,
     gateway_caller_client: pplx_space_node_mgr_client::NodeManagerGrpcClient,
     gateway_authority: gateway_authority::GatewayAuthority,
     /// S3 upload config for suspend snapshots. `None` means uploads are disabled.
@@ -977,6 +980,10 @@ pub struct SandboxManagerServiceOptions {
     pub node_manager: NodeManagerConnector,
     /// Every template-manager `GetTemplate` the service and its subsystems ask.
     pub template_resolver: Arc<dyn crate::template_resolver::TemplateResolver>,
+    /// Run directory whose `fc.pid` links stop and delete target selection
+    /// reads in test builds. `None` reads the fixed sandbox run directory.
+    #[cfg(test)]
+    pub(crate) cleanup_run_dir: Option<PathBuf>,
 }
 
 impl Default for SandboxManagerServiceOptions {
@@ -997,6 +1004,8 @@ impl Default for SandboxManagerServiceOptions {
             route_ed25519_verification_bundle: None,
             node_manager: NodeManagerConnector::host(),
             template_resolver: Arc::new(crate::template_resolver::HostTemplateManager),
+            #[cfg(test)]
+            cleanup_run_dir: None,
         }
     }
 }
@@ -1578,10 +1587,6 @@ impl SandboxManagerService {
         Ok(value)
     }
 
-    pub fn new(conn: rusqlite::Connection) -> Self {
-        Self::new_with_options(conn, SandboxManagerServiceOptions::default())
-    }
-
     pub fn new_with_options(
         conn: rusqlite::Connection,
         options: SandboxManagerServiceOptions,
@@ -1749,6 +1754,8 @@ impl SandboxManagerService {
             ),
             node_manager: options.node_manager,
             template_resolver: options.template_resolver,
+            #[cfg(test)]
+            cleanup_run_dir: options.cleanup_run_dir,
             drain_state,
             feature_flags,
             route_ed25519_verification_bundle: Arc::new(ArcSwapOption::from(
@@ -1987,6 +1994,8 @@ mod startup_resident;
 mod storage;
 mod tail_support;
 mod template_snapshot_support;
+#[cfg(test)]
+pub(crate) mod test_options;
 #[cfg(test)]
 pub(crate) mod tests;
 mod validation;

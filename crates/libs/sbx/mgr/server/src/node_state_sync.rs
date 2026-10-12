@@ -15,7 +15,7 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use tonic::Request;
 
-const SKIP_NODE_PUBLISH_METADATA: &str = "x-space-skip-cluster-sync";
+pub(crate) const SKIP_NODE_PUBLISH_METADATA: &str = "x-space-skip-cluster-sync";
 const DIRTY_MARK_INITIAL_RETRY: std::time::Duration = std::time::Duration::from_secs(1);
 const DIRTY_MARK_MAX_RETRY: std::time::Duration = std::time::Duration::from_secs(300);
 const DIRTY_OUTBOX_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);

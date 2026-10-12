@@ -12,7 +12,7 @@ use pplx_space_common_core::types::ExecutionGeneration;
 async fn rootfs_rate_limiter_uses_the_assignment_and_configured_burst() {
     let service = SandboxManagerService::new_with_config(
         crate::db::test_conn(),
-        Default::default(),
+        crate::service::SandboxManagerServiceOptions::for_test(),
         crate::config::SandboxConfig {
             disk_io_burst_secs: std::num::NonZeroU32::new(3),
             ..Default::default()
@@ -696,8 +696,9 @@ async fn restore_releases_artifact_lock_while_waiting_for_cleanup_completion() {
 
 // Each refusal happens before Start persists anything or contacts
 // node-manager, so the row keeps the state the caller observed. Rows that carry
-// a template hash would otherwise continue to template-manager, which has no
-// test double; only the hash-less row is meant to reach template resolution.
+// a template hash would otherwise continue to template-manager, which every
+// test service fails to reach; only the hash-less row is meant to reach
+// template resolution.
 #[tokio::test(start_paused = true)]
 async fn start_refusals_before_activation_leave_the_row_state_unchanged() {
     use crate::service::tests::service_tests::insert_test_sandbox;
@@ -762,7 +763,7 @@ async fn start_refusals_before_activation_leave_the_row_state_unchanged() {
         }
         let service = SandboxManagerService::new_with_config(
             conn,
-            Default::default(),
+            crate::service::SandboxManagerServiceOptions::for_test(),
             crate::config::SandboxConfig {
                 hugepages: case.hugepages,
                 ..Default::default()
@@ -883,7 +884,7 @@ async fn suspend_restore_dir_keeps_a_previous_scope_it_cannot_cancel() {
         )
         .unwrap()
     );
-    let service = SandboxManagerService::new(conn);
+    let service = SandboxManagerService::for_test(conn);
 
     let error = prepare_suspend_restore_dir(
         &service,

@@ -13,7 +13,7 @@ fn test_ownership() -> GcOwnership {
         coordinator: crate::auto_lifecycle::AutoLifecycleCoordinator::default(),
         drain: Arc::new(crate::service::drain::DrainState::default()),
         shutdown: CancellationToken::new(),
-        node_manager: crate::node_manager_transport::NodeManagerConnector::host(),
+        node_manager: crate::node_manager_transport::fake::unbound_in_absent_dir(),
     }
 }
 
@@ -113,11 +113,10 @@ fn full_disk() -> crate::disk_usage::DiskUsage {
     }
 }
 
-/// Paused, like the sibling reaper tests: a reaped candidate's staging
-/// directory is removed through node-manager, and against an absent socket
-/// that connect spends its whole ~9.5 s retry budget on `tokio::time` backoff.
-/// Nothing here reads elapsed time — eligibility is decided from the `now_secs`
-/// this test passes in — so the clock only has to not be real.
+/// Paused, like the sibling reaper tests. A reaped candidate's staging
+/// directory is handed to node-manager, which here is an absent socket dialed
+/// once. Nothing here reads elapsed time — eligibility is decided from the
+/// `now_secs` this test passes in — so the clock only has to not be real.
 #[tokio::test(start_paused = true)]
 async fn malformed_artifact_times_are_retained_without_blocking_valid_siblings() {
     let conn = open_test_db();

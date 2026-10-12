@@ -4,7 +4,7 @@ use crate::service::activation_support::internal_request;
 
 fn test_service() -> SandboxManagerService {
     let connection = crate::db::test_conn();
-    SandboxManagerService::new(connection)
+    SandboxManagerService::for_test(connection)
 }
 
 fn expect_authorization_error<T>(result: Result<T, Status>) -> Status {

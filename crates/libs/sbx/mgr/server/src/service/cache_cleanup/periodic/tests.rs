@@ -16,7 +16,7 @@ async fn periodic_inventory_progresses_in_pages_without_treating_other_pages_as_
     }
     let stale = SandboxId::new();
     insert_test_sandbox(&conn, &stale.to_string(), SandboxState::Stopped);
-    let service = SandboxManagerService::new(conn);
+    let service = SandboxManagerService::for_test(conn);
     let mut scan = PeriodicInventoryScan::default();
     let shutdown = CancellationToken::new();
     let paths = SandboxInventoryPaths::new(cache.path(), runtime.path());
@@ -104,7 +104,7 @@ async fn periodic_inventory_names_only_rowless_cache_directories_for_inspection(
         std::fs::create_dir(cache.path().join(id.to_string())).unwrap();
     }
     insert_test_sandbox(&conn, &owned.to_string(), SandboxState::Suspended);
-    let service = SandboxManagerService::new(conn);
+    let service = SandboxManagerService::for_test(conn);
     let batch = service
         .discover_periodic_inventory_in(
             &mut PeriodicInventoryScan::default(),
@@ -190,7 +190,7 @@ async fn orphan_quarantine_survives_inventory_once_its_runtime_is_gone() {
         Some(SandboxQuarantineReasonCode::OrphanedSandboxRowMissing.as_str())
     );
     std::fs::remove_dir_all(&sandbox_run_dir).unwrap();
-    let service = crate::service::tests::service_tests::service_with_runtime_liveness(conn, false);
+    let service = crate::service::tests::service_tests::service_with_runtime_probe(conn, false);
     let before = database_rows(&service.db_conn().unwrap());
 
     reconcile_one_periodic_page(&service, paths);
@@ -267,8 +267,7 @@ async fn startup_and_periodic_inventory_remove_only_rows_whose_state_requires_lo
             .collect::<BTreeSet<_>>();
         assert!(!expected_removed.is_empty());
 
-        let service =
-            crate::service::tests::service_tests::service_with_runtime_liveness(conn, false);
+        let service = crate::service::tests::service_tests::service_with_runtime_probe(conn, false);
         let removed_or_published = if periodic {
             reconcile_one_periodic_page(&service, paths);
             crate::db::list_node_dirty_refs(&service.db_conn().unwrap(), 1024)

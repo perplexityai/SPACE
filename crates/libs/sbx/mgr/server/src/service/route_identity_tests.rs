@@ -30,7 +30,6 @@ use pplx_space_common_svc::space_api_route_ed25519::{
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::path::PathBuf;
-use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use tonic::Code;
@@ -54,9 +53,7 @@ fn enter_route_identity_test_process(bundle_path: Option<&OsStr>) -> bool {
 }
 
 fn local_node() -> NodeId {
-    NodeId::from_uuid(uuid::Uuid::from_u128(
-        0x019f_8000_0000_7000_8000_0000_0000_00fe,
-    ))
+    crate::service::test_options::test_node_id()
 }
 
 /// A service whose background tasks belong to the test and whose sockets live
@@ -76,17 +73,9 @@ impl RouteTestService {
         let service = SandboxManagerService::new_with_options(
             conn,
             SandboxManagerServiceOptions {
-                host_control_socket_path: sockets.path().join("host-control.sock"),
-                credential_manager_socket_path: sockets.path().join("credmgr.sock"),
-                sandbox_runtime_live: Arc::new(|_| false),
                 shutdown_token: shutdown.clone(),
                 task_tracker: tasks.clone(),
-                local_node_id: Some(local_node()),
-                node_role: None,
-                node_managed_by: None,
-                route_ed25519_verification_bundle: None,
-                node_manager: crate::node_manager_transport::NodeManagerConnector::host(),
-                template_resolver: Arc::new(crate::template_resolver::HostTemplateManager),
+                ..SandboxManagerServiceOptions::for_test_in(sockets.path())
             },
         );
         Self {

@@ -808,12 +808,14 @@ impl SandboxWatchdog {
     ) -> Self {
         let auto_lifecycle = AutoLifecycleCoordinator::default();
         let lifecycle_epochs = HealthLifecycleEpochs::default();
+        // The loops tick immediately; their node-manager is an absent socket.
+        let node_manager = crate::node_manager_transport::fake::unbound_in_absent_dir();
         let snapshot_scheduler = Arc::new(SnapshotScheduler::new(Arc::new(
             crate::snapshot_scheduler::CheckpointContext {
                 db: db.clone(),
                 auto_lifecycle: auto_lifecycle.clone(),
                 health_lifecycle: lifecycle_epochs.clone(),
-                node_manager: NodeManagerConnector::host(),
+                node_manager: node_manager.clone(),
             },
         )));
         Self::new(
@@ -826,7 +828,7 @@ impl SandboxWatchdog {
             shutdown_token,
             Arc::new(crate::service::drain::DrainState::default()),
             task_tracker,
-            NodeManagerConnector::host(),
+            node_manager,
         )
     }
 

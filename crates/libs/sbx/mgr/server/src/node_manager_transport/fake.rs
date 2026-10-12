@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 use std::marker::PhantomData;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use futures_util::future::BoxFuture;
@@ -131,19 +131,66 @@ pub(crate) fn fixed_client(client: NodeManagerGrpcClient) -> NodeManagerConnecto
 }
 
 /// A connector whose clients all dial `socket`, a test-owned path nothing
-/// binds, so every node-manager call fails before reaching any server.
+/// binds, so every node-manager call fails before reaching any server. As on a
+/// node whose node-manager is down, `connect` and `connect_once` fail to dial
+/// and a lazy client's calls fail with `Unavailable`. `connect` dials once
+/// rather than waiting out the host connector's retry budget.
 pub(crate) fn unbound(socket: &Path) -> NodeManagerConnector {
-    fixed_client(lazy_client(socket))
+    NodeManagerConnector::new(Arc::new(Unbound(socket.to_owned())))
+}
+
+/// [`unbound`] on a socket in a fresh directory that nothing creates, for
+/// tests that build a subsystem context rather than a service.
+pub(crate) fn unbound_in_absent_dir() -> NodeManagerConnector {
+    unbound(
+        &std::env::temp_dir()
+            .join(format!("space-sbx-mgr-test-{}", uuid::Uuid::now_v7()))
+            .join("absent-node-manager.sock"),
+    )
 }
 
 fn lazy_client(socket: &Path) -> NodeManagerGrpcClient {
-    let channel = pplx_space_common_grpc::connect_uds_channel_lazy(
-        socket,
-        tonic::transport::Endpoint::from_static("http://[::]:50051"),
-    );
+    let channel = pplx_space_common_grpc::connect_uds_channel_lazy(socket, endpoint());
+    client(channel)
+}
+
+fn endpoint() -> tonic::transport::Endpoint {
+    tonic::transport::Endpoint::from_static("http://[::]:50051")
+}
+
+fn client(channel: tonic::transport::Channel) -> NodeManagerGrpcClient {
     NodeManagerGrpcClient::new(pplx_space_common_svc::bootstrap::wrap_grpc_client_channel(
         channel,
     ))
+}
+
+struct Unbound(PathBuf);
+
+impl Unbound {
+    async fn dial(&self) -> Result<NodeManagerGrpcClient, ConnectError> {
+        let channel = pplx_space_common_grpc::connect_uds_channel_with_endpoint(
+            "node-manager",
+            &self.0,
+            endpoint(),
+        )
+        .await?;
+        Ok(client(channel))
+    }
+}
+
+#[async_trait::async_trait]
+impl NodeManagerTransport for Unbound {
+    async fn connect(&self) -> Result<NodeManagerGrpcClient, ConnectError> {
+        self.dial().await
+    }
+
+    async fn connect_once(&self) -> Result<NodeManagerGrpcClient, ConnectError> {
+        self.dial().await
+    }
+
+    fn lazy(&self) -> NodeManagerGrpcClient {
+        lazy_client(&self.0)
+    }
 }
 
 struct InProcess(NodeManagerGrpcClient);

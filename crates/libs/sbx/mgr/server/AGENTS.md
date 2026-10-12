@@ -24,10 +24,13 @@ Follow "Privileged tests and the CI host" in `docs/rust/space-conventions.md`.
   (`pplx_space_node_mgr_client::connect()`, `connect_once()`, `lazy()`); give
   the code under test a test-served node-manager. Cancelling `shutdown_token`
   first protects only code paths that check it before dialing.
-- `SandboxManagerServiceOptions::default()` reads `SPACE_NODE_ID` or the
-  host's node-id file, uses the production host-control and
-  credential-manager sockets, and probes `fc.pid` under `SANDBOX_RUN_DIR`. Set
-  every field where a test reaches them; constructors read env regardless.
+- Build test services from `SandboxManagerServiceOptions::for_test()` or
+  `for_test_in(dir)` and override only the fields a test exercises.
+  `SandboxManagerServiceOptions::default()` is production wiring: it reads
+  `SPACE_NODE_ID` or the host's node-id file, uses the production host-control
+  and credential-manager sockets, probes `fc.pid` under `SANDBOX_RUN_DIR`, and
+  dials the host's node-manager and template-manager. Constructors read env
+  regardless.
 - Never call `db::open()`; use `db::test_conn()`.
 
 Module moves change log targets: see "Log targets" in

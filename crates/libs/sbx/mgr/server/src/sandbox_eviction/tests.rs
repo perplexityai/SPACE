@@ -841,7 +841,7 @@ async fn evict_tick_below_engage_returns_before_candidate_scan() {
         [],
     )
     .unwrap();
-    let service = SandboxManagerService::new(conn);
+    let service = SandboxManagerService::for_test(conn);
     let cfg = EvictionConfig {
         enabled: true,
         engage_fraction: 0.50,
@@ -892,7 +892,7 @@ fn resident_rows_count_every_state() {
 async fn evict_tick_without_disk_usage_fails_without_scanning() {
     let conn = open_test_db();
     insert_sandbox(&conn, "sbx-cold", "suspended", 1_000);
-    let service = SandboxManagerService::new(conn);
+    let service = SandboxManagerService::for_test(conn);
     let cfg = EvictionConfig {
         enabled: true,
         engage_fraction: 0.0,
@@ -924,7 +924,7 @@ async fn evict_tick_does_not_connect_when_all_candidates_are_backed_off() {
     let conn = open_test_db();
     insert_sandbox(&conn, "sbx-backed-off", "suspended", 1_000);
     insert_pinned_artifact(&conn, "sbx-backed-off", &v7(1_000).to_string(), Some("123"));
-    let service = SandboxManagerService::new(conn);
+    let service = SandboxManagerService::for_test(conn);
     let cfg = EvictionConfig {
         enabled: true,
         engage_fraction: 0.50,
@@ -1308,7 +1308,7 @@ async fn legacy_reupload_refusals_classify_as_state_skips_or_retryable_failures(
     use crate::state::SandboxState;
     use pplx_space_common_core::types::SandboxId;
 
-    let service = SandboxManagerService::new(open_test_db());
+    let service = SandboxManagerService::for_test(open_test_db());
     let unknown = service
         .reupload_legacy_sandbox_for_eviction(&SandboxId::new().to_string())
         .await
@@ -1329,7 +1329,7 @@ async fn legacy_reupload_refusals_classify_as_state_skips_or_retryable_failures(
         let conn = open_test_db();
         let id = SandboxId::new().to_string();
         insert_sandbox(&conn, &id, state.as_str(), 0);
-        let service = SandboxManagerService::new(conn);
+        let service = SandboxManagerService::for_test(conn);
 
         let refused = service
             .reupload_legacy_sandbox_for_eviction(&id)
@@ -1350,7 +1350,7 @@ async fn legacy_reupload_refusals_classify_as_state_skips_or_retryable_failures(
     insert_sandbox(&conn, &id, SandboxState::Restoring.as_str(), 0);
     let service = SandboxManagerService::new_with_config(
         conn,
-        Default::default(),
+        crate::service::SandboxManagerServiceOptions::for_test(),
         crate::config::SandboxConfig {
             hugepages: true,
             ..Default::default()
@@ -1370,7 +1370,7 @@ async fn legacy_reupload_refusals_classify_as_state_skips_or_retryable_failures(
 /// Empty cluster-api wiring is operator-fixable, so eviction retries the
 /// reupload instead of skipping the sandbox.
 async fn assert_missing_wiring_reupload_is_retried() {
-    let service = SandboxManagerService::new(open_test_db());
+    let service = SandboxManagerService::for_test(open_test_db());
     let refused = service
         .reupload_legacy_sandbox_for_eviction(
             &pplx_space_common_core::types::SandboxId::new().to_string(),

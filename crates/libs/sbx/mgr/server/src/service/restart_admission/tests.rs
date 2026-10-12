@@ -14,7 +14,7 @@ const HOST_CONTROL_PROTO: &str = include_str!(concat!(
 
 fn test_service() -> SandboxManagerService {
     let connection = crate::db::test_conn();
-    SandboxManagerService::new(connection)
+    SandboxManagerService::for_test(connection)
 }
 
 #[tokio::test]
@@ -519,7 +519,7 @@ async fn blocking_wake_without_client_deadline_has_bounded_passive_wait() {
     let conn = crate::db::test_conn();
     let sandbox_id = SandboxId::new().to_string();
     insert_test_sandbox(&conn, &sandbox_id, SandboxState::Starting);
-    let manager = SandboxManagerService::new(conn);
+    let manager = SandboxManagerService::for_test(conn);
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(31),
         manager.wake_with_start_config(sandbox_id.clone(), None, Default::default(), true, None),

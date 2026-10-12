@@ -206,10 +206,7 @@ impl SandboxManagerService {
             .map_err(|_| Status::unavailable("cleanup storage is shutting down"))?;
         #[cfg(test)]
         let run_dir = self
-            .cleanup_executor
-            .run_dir
-            .lock()
-            .unwrap()
+            .cleanup_run_dir
             .clone()
             .unwrap_or_else(|| PathBuf::from(RUN_DIR));
         let cache_dir = self.sandbox_cache_root();

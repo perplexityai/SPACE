@@ -127,7 +127,7 @@ async fn snapshot_observer_refuses_tenant_pool_and_nonrunning_sandboxes() {
         crate::service::tests::service_tests::insert_test_sandbox(&conn, &id, state);
         crate::db::update_user(&conn, &id, &owner).unwrap();
         crate::db::set_pool_template(&conn, &id, pool).unwrap();
-        let service = SandboxManagerService::new(conn);
+        let service = SandboxManagerService::for_test(conn);
         let mut request = Request::new(crate::proto::WaitTemplateAppsRequest {
             sandbox_id: id.clone(),
         });

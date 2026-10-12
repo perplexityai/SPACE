@@ -74,7 +74,7 @@ async fn staging_cleanup_requires_stable_unowned_lifecycle() {
         LocalArtifactId::new(),
     );
     std::fs::create_dir_all(&unknown).unwrap();
-    let service = SandboxManagerService::new(conn);
+    let service = SandboxManagerService::for_test(conn);
     let (id, path) = paused.unwrap();
     for owner in 0..3 {
         let _wake = (owner == 0).then(|| {
@@ -130,7 +130,7 @@ async fn staging_cleanup_rediscovery_survives_rollback_failed_deletion_and_resta
             path.with_file_name(format!("{RETIRED_PREFIX}{artifact_id}"))
         })
         .collect();
-    let service = SandboxManagerService::new(conn);
+    let service = SandboxManagerService::for_test(conn);
     assert!(sweep(&service, cache.path()).is_empty());
     assert!(crate::db::rollback_suspending_to_paused(&service.db.lock().unwrap(), &id).unwrap());
     // Simulate an unacknowledged deletion by leaving the selected files in
@@ -208,7 +208,7 @@ async fn publication_retirement_is_owned_by_the_sweep_in_any_lifecycle_state() {
     suspend_snapshot_publication::write_full_suspend_artifact(&snapshot_dir, &id, old_id, b"old");
     let staging = suspend_snapshot_publication::suspend_snapshot_staging_dir(&sandbox_dir, new_id);
     suspend_snapshot_publication::write_full_suspend_artifact(&staging, &id, new_id, b"new");
-    let service = SandboxManagerService::new(conn);
+    let service = SandboxManagerService::for_test(conn);
     let _wake = service
         .auto_lifecycle
         .wake_lock(&id)
@@ -319,7 +319,7 @@ async fn sweep_owns_the_hold_of_a_rolled_back_publication() {
     let empty_canonical =
         suspend_snapshot_publication::canonical_suspend_snapshot_dir(&interrupted_dir);
     std::fs::create_dir_all(&empty_canonical).unwrap();
-    let service = SandboxManagerService::new(conn);
+    let service = SandboxManagerService::for_test(conn);
 
     let swept = sweep(&service, cache.path());
     assert!(
@@ -398,7 +398,7 @@ async fn sweep_keeps_holds_without_durable_supersession() {
         b,
         b"b",
     );
-    let service = SandboxManagerService::new(conn);
+    let service = SandboxManagerService::for_test(conn);
 
     let swept = sweep(&service, cache.path());
     assert!(swept.is_empty());
@@ -440,7 +440,7 @@ async fn sweep_leaves_holds_alone_while_a_publication_may_be_in_flight() {
     let garbage = suspend_snapshot_publication::suspend_snapshot_staging_parent_dir(&sandbox_dir)
         .join(format!("{RETIRED_PREFIX}{}", LocalArtifactId::new()));
     suspend_snapshot_publication::write_full_suspend_artifact(&garbage, &id, old_id, b"gc");
-    let service = SandboxManagerService::new(conn);
+    let service = SandboxManagerService::for_test(conn);
 
     let wake = service
         .auto_lifecycle
@@ -511,7 +511,7 @@ async fn sweep_releases_holds_once_a_canonical_snapshot_exists() {
     let in_flight_dir = cache.path().join(&in_flight);
     let kept = suspend_snapshot_publication::retired_suspend_snapshot_dir(&in_flight_dir, b);
     suspend_snapshot_publication::write_full_suspend_artifact(&kept, &in_flight, a, b"a");
-    let service = SandboxManagerService::new(conn);
+    let service = SandboxManagerService::for_test(conn);
 
     let swept = sweep(&service, cache.path());
     assert!(

@@ -1,9 +1,16 @@
 //! Lifecycle handlers driven against an in-process node-manager.
 //!
-//! The service is built with every host dependency redirected: the
-//! node-manager connector reaches a [`FakeNodeManager`], the host-control and
-//! credential-manager sockets are test-owned paths nothing binds, and no
-//! runtime is ever live.
+//! The service is built from [`SandboxManagerServiceOptions::for_test`], with
+//! every host dependency redirected:
+//!
+//! - the node-manager connector reaches a [`FakeNodeManager`];
+//! - every template lookup goes to a template-manager fake whose socket is
+//!   unbound, so a lookup fails to connect (`TemplateLookupError::Connect`,
+//!   which create reports as `Internal` "cannot connect to template-manager");
+//! - the credential-manager socket is a test-owned path nothing binds;
+//! - the host-control socket, which sandbox-manager only passes through to
+//!   node-manager's `Launch`, names no live host service;
+//! - no runtime is ever live.
 
 use super::service_tests::{insert_test_sandbox, runtime_fields};
 use super::*;
@@ -14,49 +21,17 @@ use pplx_space_node_mgr_client::proto::{
     CleanupSandboxRequest, CleanupSandboxResponse, StopProcessRequest, StopProcessResponse,
 };
 
-/// A service whose node-manager clients all come from `node_manager` and whose
-/// template lookups all go to `template_resolver`.
-pub(crate) fn isolated_service(
+/// A test service whose node-manager clients all come from `node_manager`.
+pub(crate) fn service_with_node_manager(
     conn: rusqlite::Connection,
     node_manager: NodeManagerConnector,
-    template_resolver: Arc<dyn crate::template_resolver::TemplateResolver>,
-    sockets: &Path,
 ) -> SandboxManagerService {
     SandboxManagerService::new_with_options(
         conn,
         SandboxManagerServiceOptions {
-            host_control_socket_path: sockets.join("absent-host-control.sock"),
-            credential_manager_socket_path: sockets.join("absent-credential-manager.sock"),
-            sandbox_runtime_live: Arc::new(|_| false),
-            shutdown_token: CancellationToken::new(),
-            task_tracker: TaskTracker::new(),
-            local_node_id: Some(NodeId::from_uuid(
-                uuid::Uuid::parse_str("019f8000-0000-7000-8000-0000000000fe").unwrap(),
-            )),
-            node_role: None,
-            node_managed_by: None,
-            route_ed25519_verification_bundle: None,
             node_manager,
-            template_resolver,
+            ..SandboxManagerServiceOptions::for_test()
         },
-    )
-}
-
-/// [`isolated_service`] whose template lookups are all refused.
-pub(crate) fn service_with_node_manager(
-    conn: rusqlite::Connection,
-    node_manager: NodeManagerConnector,
-    sockets: &Path,
-) -> SandboxManagerService {
-    isolated_service(
-        conn,
-        node_manager,
-        Arc::new(
-            crate::template_resolver::fake::FakeTemplateResolver::refusing(Status::unavailable(
-                "template-manager is outside this test",
-            )),
-        ),
-        sockets,
     )
 }
 
@@ -84,8 +59,7 @@ async fn fatal_kill_signal_failure_still_schedules_admitted_cleanup() {
     let sandbox_id = SandboxId::new();
     let sandbox_id_string = sandbox_id.to_string();
     insert_test_sandbox(&conn, &sandbox_id_string, SandboxState::Started);
-    let sockets = tempfile::tempdir().unwrap();
-    let service = service_with_node_manager(conn, node_manager.connector(), sockets.path());
+    let service = service_with_node_manager(conn, node_manager.connector());
     service
         .update_runtime_fields(
             sandbox_id,
