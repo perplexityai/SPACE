@@ -1359,6 +1359,7 @@ impl SandboxController {
                 SandboxEventDetails::default()
                     .action("delete")
                     .reason("in_flight_suspend_upload")
+                    .routine()
                     .trigger(SandboxEventTrigger::User),
             );
             tracing::info!(
@@ -1420,6 +1421,7 @@ impl SandboxController {
                         SandboxEventDetails::default()
                             .action("delete")
                             .reason("in_flight_suspend_upload_locked")
+                            .routine()
                             .trigger(SandboxEventTrigger::User),
                     );
                     tracing::info!(
@@ -1441,6 +1443,7 @@ impl SandboxController {
                             .action("delete")
                             .reason("db_delete_failed")
                             .error(err.to_string())
+                            .logged_by_caller()
                             .trigger(SandboxEventTrigger::User),
                     );
                     tracing::error!(

@@ -1368,7 +1368,9 @@ impl SubstrateActionSink {
                     sandbox_id,
                     SandboxEventType::CleanupFailed,
                     reason,
-                    details_for_guard(guard).result(outcome.as_str()),
+                    details_for_guard(guard)
+                        .result(outcome.as_str())
+                        .logged_by_caller(),
                 );
                 false
             }
@@ -1383,7 +1385,9 @@ impl SubstrateActionSink {
                     sandbox_id,
                     SandboxEventType::CleanupFailed,
                     reason,
-                    details_for_guard(guard).error(err.to_string()),
+                    details_for_guard(guard)
+                        .error(err.to_string())
+                        .logged_by_caller(),
                 );
                 false
             }

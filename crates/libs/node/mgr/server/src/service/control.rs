@@ -329,7 +329,8 @@ impl NodeManagerService {
                 SandboxEventSource::NodeManager,
                 base_details()
                     .reason("root_netns_expose_rejected")
-                    .error(message.clone()),
+                    .error(message.clone())
+                    .logged_by_caller(),
             );
             return Err(Status::failed_precondition(message));
         }

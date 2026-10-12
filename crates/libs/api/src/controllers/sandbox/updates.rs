@@ -428,7 +428,11 @@ impl SandboxController {
                 SandboxEventType::NetworkPolicyUpdateFailed,
                 SandboxEventSource::Api,
             )
-            .emit_with(base_details().error("network policy generation conflict"));
+            .emit_with(
+                base_details()
+                    .error("network policy generation conflict")
+                    .routine(),
+            );
             return Err(ControllerError::precondition_failed(
                 "sandbox network_policy_generation does not match If-Match",
             ));
@@ -468,7 +472,7 @@ impl SandboxController {
                     SandboxEventType::NetworkPolicyUpdateFailed,
                     SandboxEventSource::Api,
                 )
-                .emit_with(base_details().error(error.to_string()));
+                .emit_with(base_details().error(error.to_string()).logged_by_caller());
             }
             mapped
         })?;

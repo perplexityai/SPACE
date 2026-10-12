@@ -136,7 +136,9 @@ impl SandboxManagerService {
                 &sandbox.id,
                 SandboxEventType::NetworkPolicyUpdateFailed,
                 SandboxEventSource::SbxManager,
-                event_details().error("network policy generation conflict"),
+                event_details()
+                    .error("network policy generation conflict")
+                    .routine(),
             );
             return Err(Status::failed_precondition(
                 "network policy generation conflict",

@@ -910,6 +910,7 @@ impl SandboxManagerService {
                             .trigger(SandboxEventTrigger::System)
                             .reason(origin.event_reason())
                             .error(error.to_string())
+                            .logged_by_caller()
                             .with_from_state(row.state.to_string())
                             .local_artifact_id(staged.local_artifact_id.to_string())
                             .artifact_kind("full")

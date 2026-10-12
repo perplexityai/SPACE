@@ -1403,7 +1403,11 @@ impl SubstrateAdapter for KubernetesSubstrate {
                         SandboxEventType::SuspendFailed,
                         SandboxEventSource::Substrate,
                     )
-                    .emit_with(SandboxEventDetails::default().error(error.to_string()));
+                    .emit_with(
+                        SandboxEventDetails::default()
+                            .error(error.to_string())
+                            .logged_by_caller(),
+                    );
                     return Err(error);
                 }
             };

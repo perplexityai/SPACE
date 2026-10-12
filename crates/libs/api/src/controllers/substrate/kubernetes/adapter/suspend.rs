@@ -373,7 +373,8 @@ impl KubernetesSubstrate {
                 .emit_with(
                     SandboxEventDetails::default()
                         .pod_name(pod_name.clone())
-                        .error(error.to_string()),
+                        .error(error.to_string())
+                        .logged_by_caller(),
                 );
                 return Err(error);
             }

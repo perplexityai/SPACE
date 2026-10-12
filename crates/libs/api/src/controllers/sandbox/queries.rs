@@ -1775,7 +1775,9 @@ impl SandboxController {
             emit_create_sandbox_event(
                 outcome.sandbox_id,
                 SandboxEventType::CreateFailed,
-                create_event_details().error("lifecycle CAS lost during create"),
+                create_event_details()
+                    .error("lifecycle CAS lost during create")
+                    .logged_by_caller(),
             );
             self.rollback_created_sandbox(pool, outcome.sandbox_id)
                 .await;
@@ -2152,7 +2154,9 @@ impl SandboxController {
                     emit_create_sandbox_event(
                         sandbox_uuid,
                         SandboxEventType::CreateFailed,
-                        create_event_details().error(error.to_string()),
+                        create_event_details()
+                            .error(error.to_string())
+                            .logged_by_caller(),
                     );
                     let rollback_result = Self::rollback_failed_pooled_create_with_substrate(
                         substrate, input.pool, &claim,
@@ -2517,7 +2521,9 @@ impl SandboxController {
                 emit_create_sandbox_event(
                     sandbox_uuid,
                     SandboxEventType::CreateFailed,
-                    create_event_details().error(error.to_string()),
+                    create_event_details()
+                        .error(error.to_string())
+                        .logged_by_caller(),
                 );
                 let rollback = Self::rollback_failed_pooled_create_with_substrate(
                     substrate, input.pool, &claim,

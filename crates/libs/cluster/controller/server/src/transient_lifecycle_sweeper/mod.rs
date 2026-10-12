@@ -185,7 +185,9 @@ fn emit_transient_sweep_event(
         event_type,
         SandboxEventSource::ClusterController,
     )
-    .emit_with(details);
+    // Every failed-phase event emitted here follows the caller's WARN outcome
+    // log for the same failure.
+    .emit_with(details.logged_by_caller());
 }
 
 /// The state fields of a transient-sweep event, split out so a test can pin
@@ -249,7 +251,9 @@ fn emit_sandbox_failed_event(
         SandboxEventType::SandboxFailed,
         SandboxEventSource::ClusterController,
     )
-    .emit_with(details);
+    // Every failed-phase event emitted here follows the caller's WARN outcome
+    // log for the same failure.
+    .emit_with(details.logged_by_caller());
 }
 
 /// Emit a non-destructive verify-before-destroy outcome: a converge
@@ -405,7 +409,9 @@ fn emit_revert_cleanup_event(
         event_type,
         SandboxEventSource::ClusterController,
     )
-    .emit_with(details);
+    // Every failed-phase event emitted here follows the caller's WARN outcome
+    // log for the same failure.
+    .emit_with(details.logged_by_caller());
 }
 
 fn emit_failed_cleanup_event(
@@ -431,7 +437,9 @@ fn emit_failed_cleanup_event(
         event_type,
         SandboxEventSource::ClusterController,
     )
-    .emit_with(details);
+    // Every failed-phase event emitted here follows the caller's WARN outcome
+    // log for the same failure.
+    .emit_with(details.logged_by_caller());
 }
 
 fn emit_failed_active_repair_event(
@@ -456,7 +464,8 @@ fn emit_failed_active_repair_event(
         details = details.condition_set(format!("node_status={}", node_status.as_str()));
     }
     if let Some(error) = error {
-        details = details.error(error);
+        // The caller's outcome event already logs this failure at WARN.
+        details = details.error(error).logged_by_caller();
     }
 
     SandboxEvent::new(
@@ -562,7 +571,9 @@ fn emit_command_ready_pending_event(
         event_type,
         SandboxEventSource::ClusterController,
     )
-    .emit_with(details);
+    // Every failed-phase event emitted here follows the caller's WARN outcome
+    // log for the same failure.
+    .emit_with(details.logged_by_caller());
 }
 
 pub(crate) const DEFAULT_TICK: Duration = Duration::from_secs(60);

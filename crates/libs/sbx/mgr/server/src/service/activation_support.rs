@@ -1322,7 +1322,8 @@ where
                     .operation(phase)
                     .timeout_secs(ready_timeout_secs.to_string())
                     .elapsed_ms(ready_elapsed.as_millis().to_string())
-                    .error(error.to_string()),
+                    .error(error.to_string())
+                    .logged_by_caller(),
             );
             let reason = format!(
                 "guest did not become ready during {phase} within {ready_timeout_secs}s: {error}"
