@@ -1084,6 +1084,7 @@ func (s *spaceTaskService) waitForTaskTeardownRelease(
 	}
 	if current != expected {
 		s.mu.Unlock()
+		logShim("%s: task %s changed while preparing teardown; containerd will retry", operation, taskID)
 		return false, status.Error(codes.Aborted, "task changed while preparing teardown")
 	}
 	identity := current.teardownIdentity()
@@ -1166,7 +1167,18 @@ func (s *spaceTaskService) mutateTaskAfterTeardownRelease(
 			}
 		}()
 
-		detachSandbox, err = s.waitForTaskTeardownRelease(ctx, client, operation, taskID, expected)
+		s.mu.Lock()
+		sandboxID := expected.sandboxID
+		s.mu.Unlock()
+		// The wait for sbx-manager to release the task is what holds a pod in
+		// Terminating, so it is the span a slow or refused teardown shows up in.
+		releaseSpan, releaseCtx := startSpan(ctx, "shim.sbxmgr.teardown_release",
+			attribute.String("op", operation),
+			attribute.String("task_id", taskID),
+			attribute.String("sandbox_id", sandboxID),
+		)
+		detachSandbox, err = s.waitForTaskTeardownRelease(releaseCtx, client, operation, taskID, expected)
+		releaseSpan.End(err)
 		if err != nil {
 			emitShimStepError(operation, "prepare_teardown_suspend", "prepare_teardown_suspend", err)
 			return false, err
@@ -1180,6 +1192,7 @@ func (s *spaceTaskService) mutateTaskAfterTeardownRelease(
 		return false, nil
 	}
 	if current != expected {
+		logShim("%s: task %s changed after sbx-manager released it; containerd will retry", operation, taskID)
 		return false, status.Error(codes.Aborted, "task changed after teardown release")
 	}
 	if detachSandbox {
@@ -1192,7 +1205,7 @@ func (s *spaceTaskService) mutateTaskAfterTeardownRelease(
 	return true, nil
 }
 
-func (s *spaceTaskService) Delete(ctx context.Context, r *taskAPI.DeleteRequest) (*taskAPI.DeleteResponse, error) {
+func (s *spaceTaskService) Delete(ctx context.Context, r *taskAPI.DeleteRequest) (_ *taskAPI.DeleteResponse, retErr error) {
 	s.mu.Lock()
 	logShim("Delete: id=%s exec_id=%s", r.ID, r.ExecID)
 	startedAt := time.Now()
@@ -1221,7 +1234,20 @@ func (s *spaceTaskService) Delete(ctx context.Context, r *taskAPI.DeleteRequest)
 		}, nil
 	}
 	needsTeardown := t.sandboxID != "" && !t.sandboxDetached
+	sandboxID := t.sandboxID
 	s.mu.Unlock()
+
+	// Only a sandbox task is traced: starting a span initializes the exporter,
+	// which a container-share shim does not need.
+	if sandboxID != "" {
+		span, spanCtx := startSpan(ctx, "shim.delete",
+			attribute.String("task_id", r.ID),
+			attribute.String("sandbox_id", sandboxID),
+			attribute.Bool("needs_teardown", needsTeardown),
+		)
+		ctx = spanCtx
+		defer func() { span.End(retErr) }()
+	}
 
 	var response *taskAPI.DeleteResponse
 	found, err := s.mutateTaskAfterTeardownRelease(ctx, "delete", r.ID, t, needsTeardown, func(current *task) {
