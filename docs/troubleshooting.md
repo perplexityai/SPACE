@@ -34,6 +34,8 @@ tilt logs provision-local-console --tail 50
 
 For an individual pod, use `kubectl --context kind-space-local -n space describe pod <pod-name>` and `kubectl --context kind-space-local -n space logs <pod-name> -c <container-name>`. Use `--previous` to read the previous instance's logs after a container restart.
 
+Sandbox pods (`space-sbx-…`) run in their own namespace, `sandboxes`, not in `space`: list them and their events with `kubectl --context kind-space-local -n sandboxes get pods,events`.
+
 For an empty reply, inspect `/tmp/space-local-pf-<service>.log` for `lost connection to pod`, then wait for a new `Forwarding from 127.0.0.1:<port>` message before retrying:
 
 ```bash

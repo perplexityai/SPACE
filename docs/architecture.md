@@ -83,6 +83,8 @@ The separate command-stream path is **Application → Data plane ↔ Guest proce
 
 An operation's `state` describes the lifecycle request; the sandbox's `state` describes the environment. Neither is the exit status of a command.
 
+In Kind, sandbox pods run in their own namespace, `sandboxes`, apart from the control plane in `space`.
+
 ## Lifecycle and persistence
 
 [Snapshot upload streaming](snapshot-upload-streaming.md) describes the worker

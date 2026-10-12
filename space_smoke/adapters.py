@@ -110,6 +110,10 @@ from space_smoke.runtime import (
 )
 
 KIND_NAMESPACE = "space"
+# The API creates sandbox pods in their own namespace, apart from the control
+# plane (`k8s.sandboxNamespace` in the Kind charts). Everything else the
+# harness reads or mutates stays in KIND_NAMESPACE.
+KIND_SANDBOX_NAMESPACE = "sandboxes"
 KIND_BOOTSTRAP_POST_API_TIMEOUT_SECONDS = 2400
 # Longer than the 30-minute scenario budget plus a full controller rollout.
 # A crashed owner eventually expires, while a live scenario cannot be taken
@@ -659,14 +663,17 @@ class KindHarness:
         *args: str,
         input_text: str | None = None,
         timeout: float | None = None,
+        namespace: str = KIND_NAMESPACE,
     ) -> CommandResult:
+        if namespace not in (KIND_NAMESPACE, KIND_SANDBOX_NAMESPACE):
+            raise ValueError(f"refusing kubectl in namespace {namespace!r}")
         return self.executor.run(
             [
                 "kubectl",
                 "--context",
                 self.config.context,
                 "-n",
-                KIND_NAMESPACE,
+                namespace,
                 *args,
             ],
             input_text=input_text,
@@ -776,6 +783,7 @@ class KindHarness:
             "-o",
             "json",
             timeout=15,
+            namespace=KIND_SANDBOX_NAMESPACE,
         )
         _require_ok(result, "observe cold-create pod")
         pods = json.loads(result.stdout).get("items", [])
@@ -827,6 +835,7 @@ class KindHarness:
             "-o",
             "json",
             timeout=15,
+            namespace=KIND_SANDBOX_NAMESPACE,
         )
         _require_ok(result, "observe warm-pool pod")
         pods = [
@@ -1533,6 +1542,7 @@ ON CONFLICT (key_hash) DO NOTHING;
             "-o",
             "json",
             timeout=15,
+            namespace=KIND_SANDBOX_NAMESPACE,
         )
         _require_ok(result, "observe sandbox pod placement")
         pods = [
@@ -2021,6 +2031,7 @@ ON CONFLICT (key_hash) DO NOTHING;
                 "-o",
                 "json",
                 timeout=15,
+                namespace=KIND_SANDBOX_NAMESPACE,
             )
             payload = json.loads(_require_ok(result, "list completed sandbox pods"))
             items = payload.get("items") if isinstance(payload, dict) else None
@@ -2052,6 +2063,7 @@ ON CONFLICT (key_hash) DO NOTHING;
                     "--force",
                     "--wait=false",
                     timeout=15,
+                    namespace=KIND_SANDBOX_NAMESPACE,
                 ),
                 f"force-clear completed sandbox pod {name}",
             )
@@ -2179,6 +2191,7 @@ ON CONFLICT (key_hash) DO NOTHING;
             "get", "pods", "-l",
             f"space.pplx.net/sandbox-id={_sql_uuid(sandbox_id)}", "-o", "json",
             timeout=15,
+            namespace=KIND_SANDBOX_NAMESPACE,
         )
         document = json.loads(_require_ok(pods, "read active sandbox template build"))
         bound = [p for p in document.get("items", []) if p.get("spec", {}).get("nodeName")]
@@ -3162,12 +3175,16 @@ ON CONFLICT (key_hash) DO NOTHING;
     def sandbox_pod_render(self, sandbox_id: str) -> SandboxPodRender | None:
         result = self.kubectl(
             "get", "pods", "-l", f"space.pplx.net/sandbox-id={_sql_uuid(sandbox_id)}", "-o", "json", timeout=15,
+            namespace=KIND_SANDBOX_NAMESPACE,
         )
         _require_ok(result, "read the sandbox pod")
         return _newest_pod_render(result.stdout)
 
     def sandbox_pod_count(self) -> int:
-        result = self.kubectl("get", "pods", "-l", KIND_SANDBOX_POD_SELECTOR, "-o", "json", timeout=15)
+        result = self.kubectl(
+            "get", "pods", "-l", KIND_SANDBOX_POD_SELECTOR, "-o", "json", timeout=15,
+            namespace=KIND_SANDBOX_NAMESPACE,
+        )
         _require_ok(result, "count sandbox pods")
         items = json.loads(result.stdout or "{}").get("items", [])
         return sum(1 for item in items if not (item.get("metadata") or {}).get("deletionTimestamp"))
@@ -3279,6 +3296,7 @@ ON CONFLICT (key_hash) DO NOTHING;
     def _sandbox_pod_json(self, sandbox_id: str) -> dict[str, Any] | None:
         result = self.kubectl(
             "get", "pods", "-l", f"space.pplx.net/sandbox-id={_sql_uuid(sandbox_id)}", "-o", "json", timeout=15,
+            namespace=KIND_SANDBOX_NAMESPACE,
         )
         _require_ok(result, "read the sandbox pod")
         items = json.loads(result.stdout or "{}").get("items", [])
@@ -3924,18 +3942,21 @@ ON CONFLICT (key_hash) DO NOTHING;
     def pin_namespace_pod_count(self) -> int:
         self._require_isolated_kind("namespace pod-count quota")
         # `kubectl get pods` over-counts: the quota charges only non-terminal
-        # pods, and a bench carries Completed job pods (seed publish, migrate)
-        # that a naive count includes — the first attempt pinned 16 against a
-        # real usage of 14 and admitted the POST. Create the quota with a wide
+        # pods, and a naive count includes terminal ones (Completed seed-publish
+        # and migrate Jobs, when sandboxes shared the control-plane namespace —
+        # the first attempt pinned 16 against a real usage of 14 and admitted
+        # the POST — and finished sandbox pods here). Create the quota with a wide
         # cap, let the controller report what it actually charges, then pin the
         # cap to exactly that number.
         wide = (
             "apiVersion: v1\nkind: ResourceQuota\n"
-            f"metadata:\n  name: {POD_CAP_QUOTA_NAME}\n  namespace: {KIND_NAMESPACE}\n"
+            f"metadata:\n  name: {POD_CAP_QUOTA_NAME}\n  namespace: {KIND_SANDBOX_NAMESPACE}\n"
             'spec:\n  hard:\n    pods: "10000"\n'
         )
         _require_ok(
-            self.kubectl("apply", "-f", "-", input_text=wide, timeout=30),
+            self.kubectl(
+                "apply", "-f", "-", input_text=wide, timeout=30, namespace=KIND_SANDBOX_NAMESPACE
+            ),
             "apply the pod-count quota",
         )
         deadline = time.monotonic() + 60
@@ -3943,6 +3964,7 @@ ON CONFLICT (key_hash) DO NOTHING;
             used = self.kubectl(
                 "get", "resourcequota", POD_CAP_QUOTA_NAME,
                 "-o", "jsonpath={.status.used.pods}", timeout=15,
+                namespace=KIND_SANDBOX_NAMESPACE,
             )
             value = used.stdout.strip() if used.returncode == 0 else ""
             if value.isdigit():
@@ -3953,7 +3975,9 @@ ON CONFLICT (key_hash) DO NOTHING;
         count = int(value)
         pinned = wide.replace('pods: "10000"', f'pods: "{count}"')
         _require_ok(
-            self.kubectl("apply", "-f", "-", input_text=pinned, timeout=30),
+            self.kubectl(
+                "apply", "-f", "-", input_text=pinned, timeout=30, namespace=KIND_SANDBOX_NAMESPACE
+            ),
             "pin the pod-count quota",
         )
         # Admission reads the quota's status; wait until the pinned hard value
@@ -3963,6 +3987,7 @@ ON CONFLICT (key_hash) DO NOTHING;
             hard = self.kubectl(
                 "get", "resourcequota", POD_CAP_QUOTA_NAME,
                 "-o", "jsonpath={.status.hard.pods}", timeout=15,
+                namespace=KIND_SANDBOX_NAMESPACE,
             )
             if hard.returncode == 0 and hard.stdout.strip() == str(count):
                 return count
@@ -3972,7 +3997,8 @@ ON CONFLICT (key_hash) DO NOTHING;
 
     def lift_namespace_pod_cap(self) -> None:
         result = self.kubectl(
-            "delete", "resourcequota", POD_CAP_QUOTA_NAME, "--ignore-not-found", timeout=30
+            "delete", "resourcequota", POD_CAP_QUOTA_NAME, "--ignore-not-found", timeout=30,
+            namespace=KIND_SANDBOX_NAMESPACE,
         )
         _require_ok(result, "delete the pod-count quota")
 
@@ -4000,6 +4026,7 @@ ON CONFLICT (key_hash) DO NOTHING;
         result = self.kubectl(
             "get", "pods", "-l", f"{SANDBOX_ID_LABEL}={_sql_uuid(sandbox_id)}",
             "-o", "json", timeout=15,
+            namespace=KIND_SANDBOX_NAMESPACE,
         )
         _require_ok(result, "list sandbox pods")
         pods: list[SandboxPodView] = []
@@ -4026,7 +4053,9 @@ ON CONFLICT (key_hash) DO NOTHING;
         if not pod.startswith("space-sbx-"):
             raise ValueError(f"refusing to delete a pod that is not a sandbox execution pod: {pod}")
         _require_ok(
-            self.kubectl("delete", "pod", pod, "--wait=false", timeout=60),
+            self.kubectl(
+                "delete", "pod", pod, "--wait=false", timeout=60, namespace=KIND_SANDBOX_NAMESPACE
+            ),
             f"delete sandbox pod {pod}",
         )
 
@@ -4098,7 +4127,9 @@ ON CONFLICT (key_hash) DO NOTHING;
 
     def restore_pod_document(self, pod_name: str) -> dict[str, Any] | None:
         pod = _kube_pod_name(pod_name)
-        result = self.kubectl("get", "pod", pod, "-o", "json", timeout=15)
+        result = self.kubectl(
+            "get", "pod", pod, "-o", "json", timeout=15, namespace=KIND_SANDBOX_NAMESPACE
+        )
         if result.returncode != 0 and "notfound" in result.detail().lower().replace(" ", ""):
             return None
         document = json.loads(_require_ok(result, f"read pod {pod}") or "{}")
@@ -4122,7 +4153,8 @@ ON CONFLICT (key_hash) DO NOTHING;
             token=token,
         )
         created = self.kubectl(
-            "create", "-f", "-", "-o", "json", input_text=json.dumps(manifest), timeout=30
+            "create", "-f", "-", "-o", "json", input_text=json.dumps(manifest), timeout=30,
+            namespace=KIND_SANDBOX_NAMESPACE,
         )
         uid = (json.loads(_require_ok(created, f"create the planted orphan {name}") or "{}")
                .get("metadata", {}).get("uid"))
@@ -4139,6 +4171,7 @@ ON CONFLICT (key_hash) DO NOTHING;
             self.kubectl(
                 "delete", "pods", "-l", f"{PLANTED_ORPHAN_LABEL}={token}",
                 "--ignore-not-found", "--wait=false", timeout=30,
+                namespace=KIND_SANDBOX_NAMESPACE,
             ),
             f"remove planted orphan pods {token}",
         )

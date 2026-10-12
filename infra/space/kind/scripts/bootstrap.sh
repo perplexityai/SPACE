@@ -304,7 +304,10 @@ apply_node_labels
 # them as different revisions of the SAME release, which makes helm remove
 # the previous chart's resources on the next install. The Tilt setup
 # sidesteps this by using `helm template` + kubectl apply (no release
-# management), which is what we mirror here.
+# management), which is what we mirror here. Every rendered object names its
+# own namespace (`--namespace` sets the release's), so the apply takes no
+# `-n`: the API, cluster-controller and internal-api charts also render RBAC
+# into the sandbox namespace, which a `-n space` apply would refuse.
 helm_apply() {
   local release=$1 chart=$2; shift 2
   log "helm template + apply: $release ← $(basename "$chart")"
@@ -313,7 +316,7 @@ helm_apply() {
     --include-crds \
     ${TELEMETRY_HELM_ARGS[@]+"${TELEMETRY_HELM_ARGS[@]}"} \
     "$@" \
-    | kubectl --context "$KCTX" apply -n "$NAMESPACE" --validate=false -f -
+    | kubectl --context "$KCTX" apply --validate=false -f -
 }
 
 # ── Optional AWS creds for independent credmgr integrations ──────────────────

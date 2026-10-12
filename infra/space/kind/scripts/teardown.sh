@@ -5,7 +5,9 @@
 #   1. Stop the host-side Tilt watcher and scripted port-forwards.
 #   2. Delete the kubernetes resources bootstrap.sh applied (it uses
 #      `helm template | kubectl apply`, so there are no helm releases to
-#      uninstall — the namespace delete removes everything in one shot).
+#      uninstall — the namespace deletes remove everything: the sandbox
+#      namespace first, while the node services its pods' teardown needs
+#      still run, then the control plane's).
 #   3. `kind delete cluster` for the cluster bootstrap.sh created.
 #
 # Each step continues on failure so a partially-torn-down stack can always
@@ -26,6 +28,7 @@ set -euo pipefail
 
 KIND_CLUSTER="${SPACE_KIND_CLUSTER:-space-local}"
 NAMESPACE=space
+SANDBOX_NAMESPACE=sandboxes
 PF_PIDFILE="${SPACE_PORT_FORWARD_PIDFILE:-/tmp/space-local-pf.pids}"
 TILT_STATE_DIR="${SPACE_TILT_STATE_DIR:-$HOME/.space-devbox/kind}"
 TILT_PIDFILE="${SPACE_TILT_PIDFILE:-$TILT_STATE_DIR/tilt-${KIND_CLUSTER}.pid}"
@@ -107,6 +110,9 @@ fi
 # When the cluster is being deleted anyway, skip this — `kind delete
 # cluster` is faster than waiting for a graceful namespace drain.
 if (( KEEP_CLUSTER )) && kind get clusters 2>/dev/null | grep -qx "$KIND_CLUSTER"; then
+  log "deleting namespace $SANDBOX_NAMESPACE (sandbox pods, while the node services run)"
+  kubectl --context "$KCTX" delete namespace "$SANDBOX_NAMESPACE" \
+    --ignore-not-found --timeout=180s 2>/dev/null || true
   log "deleting namespace $NAMESPACE (removes all SPACE workloads)"
   kubectl --context "$KCTX" delete namespace "$NAMESPACE" \
     --ignore-not-found --timeout=180s 2>/dev/null || true

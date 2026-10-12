@@ -295,6 +295,8 @@ jobs:
           k() { timeout "$1" kubectl --context kind-space-local "${@:2}"; }
           k 30s get nodes -o wide || true
           k 30s get pods -A -o wide || true
+          # The sandbox pods live in their own namespace.
+          k 30s -n sandboxes get pods,events -o wide || true
           # The local observability backends, whose own failures can surface as
           # a missing signal rather than a failed step.
           for namespace in space-metrics space-traces space-logs; do
@@ -361,11 +363,11 @@ jobs:
             k 45s -n space logs "${pod}" --all-containers --prefix --timestamps \
               >"${dir}/${pod#pod/}.log" 2>&1 || true
           done
-          k 30s -n space get pods -l app.kubernetes.io/name=space-sandbox -o json \
+          k 30s -n sandboxes get pods -l app.kubernetes.io/name=space-sandbox -o json \
             | jq -r '.items[] | select(.metadata.deletionTimestamp) | .metadata.name' \
             | while IFS= read -r pod; do
                 echo "::group::Terminating sandbox pod ${pod}"
-                k 15s -n space describe pod "${pod}" || true
+                k 15s -n sandboxes describe pod "${pod}" || true
                 echo "::endgroup::"
               done || true
           echo "Teardown refusals recorded by the node journals (last 100):"

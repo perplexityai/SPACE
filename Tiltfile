@@ -309,7 +309,9 @@ custom_build(
 # Namespace + RuntimeClass live in infra/space/kind/manifests/ so the scripted
 # bootstrap (infra/space/kind/scripts/bootstrap.sh) and tilt up share one
 # source of truth. NAMESPACE above must stay "space" — the manifest file
-# hardcodes that name and the charts default to it.
+# hardcodes that name and the charts default to it. The same file creates
+# `sandboxes`, the charts' k8s.sandboxNamespace, where the API creates the
+# per-sandbox pods.
 k8s_yaml("infra/space/kind/manifests/namespace.yaml")
 k8s_yaml("infra/space/kind/manifests/runtimeclass.yaml")
 

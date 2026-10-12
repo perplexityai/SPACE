@@ -206,8 +206,8 @@ creates the kind cluster (if missing) with the SPACE Kind node image on the
 sandbox workers and builders (see [The node layer](#the-node-layer)), labels
 nodes, advertises the `space.pplx.net/network-slots` extended resource,
 installs the local observability backends in the default `otel` mode, installs
-the containerd shim on the sandbox workers, applies the `space` Namespace +
-`RuntimeClass`,
+the containerd shim on the sandbox workers, applies the `space` and
+`sandboxes` Namespaces + `RuntimeClass`,
 builds every image and `kind load`s it (first run is the long step; the
 incremental build reuses its target dir and the Docker build is
 cargo-chef-cached after that), applies every chart with
@@ -756,7 +756,7 @@ kind cluster: space-local (kind-cluster.yaml.tmpl — 6 nodes)
 │   │   ├── space-node-ctl            → internal-api    (space-nodectl)
 │   │   └── space-node-api            (hostNetwork, host_ip:9800, component=node-api) (space-nodeapi)
 │   ├── space-node-debug              (Kind-only operator shell, root)
-│   └── per-sandbox pods (pause:3.10 hijacked into Firecracker microVMs)
+│   └── per-sandbox pods in namespace `sandboxes` (pause:3.10 hijacked into Firecracker microVMs)
 ├── worker2 [pool=sandbox, space-enabled=true]
 │   └── identical to worker
 ├── worker3 [pool=infra,    space.pplx.net/infra=true]
@@ -784,6 +784,17 @@ Sandbox-scoped traffic (`CreateSandbox`, `Exec`, `SpacedWrite`, …) flows
 api-server → per-sandbox pod IP at `:9800`. Node-scoped traffic (`NodeInfo`,
 `ListNodeTemplates`, network ops) flows api-server → each node-api pod's
 `host_ip:9800`.
+
+## Sandbox namespace
+
+Sandbox pods run in their own namespace, `sandboxes`, and everything else in
+`space`, as in a deployment that confines sandboxes with namespace-scoped
+policy. `k8s.sandboxNamespace` in the api, cluster-controller and
+internal-api charts names it (`SPACE_SANDBOX_NAMESPACE`), their RBAC for sandbox
+pods is granted there, and `SPACE_NODE_API_NAMESPACE` keeps the node-api lookup
+in `space`: unset, the substrate would look for node-api pods in the sandbox
+namespace. `manifests/namespace.yaml` creates both namespaces; warm-pool
+configs are filed under the API's sandbox namespace whatever a request names.
 
 ## How the node registers itself
 

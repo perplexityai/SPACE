@@ -63,6 +63,10 @@ spec:
               value: "true"
             - name: SPACE_SANDBOX_NAMESPACE
               value: {{ .Values.k8s.sandboxNamespace | quote }}
+            # As on the API: node-api pods are in the release namespace, not
+            # the sandbox namespace the substrate would otherwise assume.
+            - name: SPACE_NODE_API_NAMESPACE
+              value: {{ .Release.Namespace | quote }}
             - name: SPACE_SANDBOX_POD_IMAGE
               value: {{ .Values.k8s.sandboxPodImage | quote }}
             - name: SPACE_SANDBOX_NODE_SELECTOR_KEY

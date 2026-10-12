@@ -42,7 +42,8 @@ serviceAccount:
 # requires SPACE_K8S_CONTROL_PLANE=true to even start, and shares the same
 # substrate plumbing for orphan-sweep + warm-pool reconcilers.
 k8s:
-  sandboxNamespace: space
+  # The API's sandbox namespace (space-api-local's k8s.sandboxNamespace).
+  sandboxNamespace: sandboxes
   # Must match space-api-local's value: both substrate instances (api-server
   # + cluster-controller) read SPACE_SANDBOX_POD_IMAGE from env at startup
   # and would otherwise create per-sandbox pods with different images, the

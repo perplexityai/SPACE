@@ -884,7 +884,7 @@ class NodeSelectorExtrasControl(Protocol):
         ...
 
     def sandbox_pod_count(self) -> int:
-        """Non-pool, non-terminating sandbox pods in the namespace."""
+        """Non-pool, non-terminating pods in the sandbox namespace."""
         ...
 
     def native_create_sandbox(self, *, template: str, metadata: Mapping[str, str]) -> str:
@@ -1503,11 +1503,11 @@ class ConcurrentRestoreControl(Protocol):
 
         Returns the cap. Every pod POST in the namespace is then rejected at
         admission with 403 until the cap is lifted. Blast radius: the quota
-        is namespaced to `space` and pins `pods` only, but every SPACE
-        component lives in that namespace, so any pod that restarts during
-        the seconds-long window is refused until the lift. The compensation
-        (`lift_namespace_pod_cap`, `--ignore-not-found`) is armed before the
-        apply.
+        is namespaced to the sandbox namespace and pins `pods` only, so any
+        sandbox or warm-pool pod created during the seconds-long window is
+        refused until the lift; the control plane in `space` is untouched.
+        The compensation (`lift_namespace_pod_cap`, `--ignore-not-found`) is
+        armed before the apply.
         """
         ...
 
@@ -2146,3 +2146,4 @@ class TelemetryBackendControl(Protocol):
         `SmokeConfigurationError` naming what was found.
         """
         ...
+

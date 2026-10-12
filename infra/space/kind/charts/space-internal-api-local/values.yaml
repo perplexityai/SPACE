@@ -107,7 +107,8 @@ visibilityCache:
 
 # Ingress activation must use the same substrate and pod configuration as the API.
 k8s:
-  sandboxNamespace: space
+  # The API's sandbox namespace (space-api-local's k8s.sandboxNamespace).
+  sandboxNamespace: sandboxes
   sandboxPodImage: registry.k8s.io/pause:3.10
   sandboxNodeSelectorKey: node.kubernetes.io/space-enabled
   sandboxNodeSelectorValue: "true"

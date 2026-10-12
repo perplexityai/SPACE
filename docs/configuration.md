@@ -84,7 +84,7 @@ because disabling it by mistake would leave every create queued forever.
 | `SPACE_SANDBOX_NODE_SERVICES_READY_AFFINITY` | off | Prefer nodes whose node-local services are ready; useful only where `SPACE_NODE_SERVICE_READINESS_ENABLED` is on. |
 | `SPACE_SANDBOX_NODE_SELECTOR_KEY`, `SPACE_SANDBOX_NODE_SELECTOR_VALUE` | `node.kubernetes.io/space-enabled`, `true` | Base node selector for sandbox pods and for the node-sync, node-group mirror and warm-pool loops; set both together. |
 | `SPACE_SANDBOX_NODE_SELECTOR_LABELS` | empty | |
-| `SPACE_SANDBOX_NAMESPACE` | `POD_NAMESPACE`, then `default` | |
+| `SPACE_SANDBOX_NAMESPACE` | `POD_NAMESPACE`, then `default` | Namespace of the sandbox pods. When it is not the node services' namespace, also set `SPACE_NODE_API_NAMESPACE`: without it and `POD_NAMESPACE`, the API looks for node-api pods here. |
 | `SPACE_SANDBOX_POD_IMAGE` | `registry.k8s.io/pause:3.10` | |
 | `SPACE_SANDBOX_FORK_ENABLED` | on | |
 | `SPACE_SANDBOX_FORK_HARD_DEADLINE_SECS` | 240 | Positive integer seconds. |
