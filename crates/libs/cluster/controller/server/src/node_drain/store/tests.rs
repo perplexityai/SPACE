@@ -291,9 +291,11 @@ async fn evacuation_reverts_claim_when_suspend_fails_before_commit()
     };
     let node_id = NodeId::new();
     let sandbox_id = SandboxId::new();
+    // Forced draining, so the claim lands and the suspend failure reaches the
+    // revert; any other node state refuses the claim before the suspend.
     sqlx::query(sql!(
-        "INSERT INTO nodes (id, address, role, managed_by, state)
-         VALUES ($1, '10.0.0.99'::inet, 'worker', 'k8s', 'registered')"
+        "INSERT INTO nodes (id, address, role, managed_by, state, drain_phase, drain_mode)
+         VALUES ($1, '10.0.0.99'::inet, 'worker', 'k8s', 'registered', 'draining', 'forced')"
     ))
     .bind(node_id)
     .execute(&db.pool)
@@ -322,15 +324,25 @@ async fn evacuation_reverts_claim_when_suspend_fails_before_commit()
     .bind(format!("space-sbx-{sandbox_id}-g1"))
     .execute(&db.pool)
     .await?;
-    let sink = SubstrateSink::with_suspend_execution(db.pool.clone(), |_requested_id| async move {
-        Err(SubstrateError::Unavailable {
-            message: "worker response was lost before artifact commit".to_string(),
-        })
+    let suspend_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let suspend_calls_for_fake = Arc::clone(&suspend_calls);
+    let sink = SubstrateSink::with_suspend_execution(db.pool.clone(), move |_requested_id| {
+        suspend_calls_for_fake.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        async move {
+            Err(SubstrateError::Unavailable {
+                message: "worker response was lost before artifact commit".to_string(),
+            })
+        }
     });
 
     NodeDrainSink::evacuate_sandbox(&sink, sandbox_id, node_id, SandboxLifecycle::Paused)
         .await
         .expect_err("a pre-commit suspend failure must remain retryable");
+    assert_eq!(
+        suspend_calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the claim must land, so the failure reaches the revert"
+    );
     let (lifecycle, marker, artifact_id): (String, Option<String>, Option<Uuid>) =
         sqlx::query_as(sql!(
             "SELECT lifecycle, evacuation_restore_target, current_local_artifact_id

@@ -3523,6 +3523,9 @@ pub(crate) async fn delete_terminating_node_and_record_tombstone(
 }
 
 #[cfg(test)]
+mod lifecycle_writer_tests;
+
+#[cfg(test)]
 mod tests;
 
 #[cfg(test)]

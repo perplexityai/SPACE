@@ -139,6 +139,8 @@ pub mod probe;
 pub mod store;
 
 #[cfg(test)]
+mod lifecycle_writer_tests;
+#[cfg(test)]
 mod tests;
 
 pub use classify::{ExecutionRoutability, ProbeObservation, ProbeVerdict, SweepAction};
