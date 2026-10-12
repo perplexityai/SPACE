@@ -21,13 +21,6 @@ impl EnvConfig<'_> {
         }
     }
 
-    pub(crate) fn test_positive_u32(&self, var: &str, default: u32) -> u32 {
-        match self.test_raw(var).and_then(|raw| raw.parse::<u32>().ok()) {
-            Some(value) if value > 0 => value,
-            _ => default,
-        }
-    }
-
     pub(crate) fn test_bounded_u32(&self, var: &str, default: u32, ceiling: u32) -> u32 {
         match self
             .test_raw(var)
@@ -72,6 +65,36 @@ impl EnvConfig<'_> {
             Some(secs) if secs > 0 => Duration::from_secs(secs),
             _ => default,
         }
+    }
+
+    /// Like [`Self::duration_secs`], clamped to `ceiling` the way
+    /// [`Self::bounded_u32`] clamps a count.
+    pub(crate) fn bounded_duration_secs(
+        &self,
+        var: &str,
+        default: Duration,
+        ceiling: Duration,
+    ) -> Duration {
+        match self
+            .0
+            .var(var)
+            .ok()
+            .and_then(|raw| parse_clamped(&raw, ceiling.as_secs()))
+        {
+            Some(secs) if secs > 0 => Duration::from_secs(secs),
+            _ => default,
+        }
+    }
+
+    /// Like [`Self::bounded_duration_secs`], typed so the result can't be zero.
+    pub(crate) fn bounded_positive_duration_secs(
+        &self,
+        var: &str,
+        default: PositiveDuration,
+        ceiling: Duration,
+    ) -> PositiveDuration {
+        PositiveDuration::new(self.bounded_duration_secs(var, default.get(), ceiling))
+            .unwrap_or(default)
     }
 
     /// Like [`Self::bounded_u32`], for a `usize` setting.

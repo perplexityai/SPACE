@@ -32,7 +32,15 @@ pub(crate) const DEFAULT_TEARDOWN_STUCK_AFTER: Duration = Duration::from_secs(5 
 /// rows are looked up in `ANY($1)` chunks of this size to bound a single query.
 pub(crate) const DEFAULT_BATCH_SIZE: u32 = 500;
 
-#[derive(Debug, Clone)]
+/// Ceilings on operator-set values; a larger value clamps to them. The counts
+/// bound apiserver and Postgres load, so a typo with extra digits mustn't lift
+/// them. The duration ceiling keeps deadline arithmetic (`now + tick_budget`)
+/// far from overflow.
+pub(crate) const MAX_DELETES_PER_MINUTE_CEILING: u32 = 10 * DEFAULT_MAX_DELETES_PER_MINUTE;
+pub(crate) const BATCH_SIZE_CEILING: u32 = 10 * DEFAULT_BATCH_SIZE;
+pub(crate) const DURATION_CEILING: Duration = Duration::from_secs(24 * 60 * 60);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReconcilerConfig {
     /// Master enable gate. Off by default everywhere; each environment opts in
     /// via `SPACE_ORPHANED_RESTORE_POD_GC_ENABLED=true`.
@@ -82,53 +90,50 @@ impl Default for ReconcilerConfig {
 
 impl ReconcilerConfig {
     /// Read config from env vars, falling back to defaults for any var that is
-    /// missing or unparseable.
+    /// missing or unparseable. Durations are whole seconds; a zero duration or
+    /// count keeps the default too, and a value above its ceiling clamps to it.
     pub fn from_env() -> Self {
+        Self::from_environment(&pplx_space_common_core::env::ProcessEnvironment)
+    }
+
+    pub(crate) fn from_environment(env: &dyn pplx_space_common_core::env::Environment) -> Self {
+        let config = env_config::EnvConfig(env);
         let default = Self::default();
         Self {
-            enabled: env_config::truthy_default(
-                "SPACE_ORPHANED_RESTORE_POD_GC_ENABLED",
-                default.enabled,
+            enabled: config
+                .truthy_default("SPACE_ORPHANED_RESTORE_POD_GC_ENABLED", default.enabled),
+            dry_run: config
+                .truthy_default("SPACE_ORPHANED_RESTORE_POD_GC_DRY_RUN", default.dry_run),
+            interval: config.bounded_duration_secs(
+                "SPACE_ORPHANED_RESTORE_POD_GC_INTERVAL_SECS",
+                default.interval,
+                DURATION_CEILING,
             ),
-            dry_run: env_config::EnvConfig(&pplx_space_common_core::env::ProcessEnvironment)
-                .test_truthy_default("SPACE_ORPHANED_RESTORE_POD_GC_DRY_RUN", default.dry_run),
-            interval: env_config::EnvConfig(&pplx_space_common_core::env::ProcessEnvironment)
-                .test_duration_secs(
-                    "SPACE_ORPHANED_RESTORE_POD_GC_INTERVAL_SECS",
-                    default.interval,
-                ),
-            threshold: test_positive_duration(
+            threshold: config.bounded_positive_duration_secs(
                 "SPACE_ORPHANED_RESTORE_POD_GC_THRESHOLD_SECS",
                 default.threshold,
+                DURATION_CEILING,
             ),
-            max_deletes_per_minute: env_config::EnvConfig(
-                &pplx_space_common_core::env::ProcessEnvironment,
-            )
-            .test_positive_u32(
+            max_deletes_per_minute: config.bounded_u32(
                 "SPACE_ORPHANED_RESTORE_POD_GC_MAX_DELETES_PER_MINUTE",
                 default.max_deletes_per_minute,
+                MAX_DELETES_PER_MINUTE_CEILING,
             ),
-            tick_budget: env_config::EnvConfig(&pplx_space_common_core::env::ProcessEnvironment)
-                .test_duration_secs(
-                    "SPACE_ORPHANED_RESTORE_POD_GC_TICK_BUDGET_SECS",
-                    default.tick_budget,
-                ),
-            batch_size: env_config::EnvConfig(&pplx_space_common_core::env::ProcessEnvironment)
-                .test_positive_u32(
-                    "SPACE_ORPHANED_RESTORE_POD_GC_BATCH_SIZE",
-                    default.batch_size,
-                ),
-            teardown_stuck_after: test_positive_duration(
+            tick_budget: config.bounded_duration_secs(
+                "SPACE_ORPHANED_RESTORE_POD_GC_TICK_BUDGET_SECS",
+                default.tick_budget,
+                DURATION_CEILING,
+            ),
+            batch_size: config.bounded_u32(
+                "SPACE_ORPHANED_RESTORE_POD_GC_BATCH_SIZE",
+                default.batch_size,
+                BATCH_SIZE_CEILING,
+            ),
+            teardown_stuck_after: config.bounded_positive_duration_secs(
                 "SPACE_ORPHANED_RESTORE_POD_GC_TEARDOWN_STUCK_AFTER_SECS",
                 default.teardown_stuck_after,
+                DURATION_CEILING,
             ),
         }
     }
-}
-
-fn test_positive_duration(name: &str, default: PositiveDuration) -> PositiveDuration {
-    pplx_space_common_core::env::test_hook_var(name)
-        .and_then(|raw| raw.parse::<u64>().ok())
-        .and_then(|value| PositiveDuration::new(Duration::from_secs(value)))
-        .unwrap_or(default)
 }

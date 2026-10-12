@@ -1040,7 +1040,9 @@ pub async fn run(
         interval_secs = config.interval.as_secs(),
         threshold_secs = config.threshold.get().as_secs(),
         max_deletes_per_minute = config.max_deletes_per_minute,
+        tick_budget_secs = config.tick_budget.as_secs(),
         batch_size = config.batch_size,
+        teardown_stuck_after_secs = config.teardown_stuck_after.get().as_secs(),
         dry_run = config.dry_run,
         "starting orphaned_restore_pod_gc"
     );

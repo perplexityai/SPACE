@@ -286,6 +286,127 @@ fn fixed_clock(base: Instant, offset: Duration) -> Clock {
 }
 
 // ---------------------------------------------------------------------------
+// Configuration
+//
+// This crate's tests compile `test-hooks` in, so a test-hook read would pass
+// these tests too. `scripts/source_guards/env_test_hook_boundary.py` keeps the
+// documented variables off test-hook readers in release code.
+// ---------------------------------------------------------------------------
+
+fn config_from(vars: &[(&str, &str)]) -> ReconcilerConfig {
+    let mut env = pplx_space_test_env::TestEnv::default();
+    for (name, value) in vars {
+        env.set(name, value);
+    }
+    ReconcilerConfig::from_environment(&env)
+}
+
+#[test]
+fn config_defaults_to_disabled_dry_run() {
+    let config = config_from(&[]);
+    assert!(!config.enabled);
+    assert!(config.dry_run);
+    assert_eq!(config, ReconcilerConfig::default());
+}
+
+#[test]
+fn config_reads_every_variable_from_the_environment() {
+    let config = config_from(&[
+        ("SPACE_ORPHANED_RESTORE_POD_GC_ENABLED", "true"),
+        ("SPACE_ORPHANED_RESTORE_POD_GC_DRY_RUN", "false"),
+        ("SPACE_ORPHANED_RESTORE_POD_GC_INTERVAL_SECS", "30"),
+        ("SPACE_ORPHANED_RESTORE_POD_GC_THRESHOLD_SECS", "600"),
+        ("SPACE_ORPHANED_RESTORE_POD_GC_MAX_DELETES_PER_MINUTE", "5"),
+        ("SPACE_ORPHANED_RESTORE_POD_GC_TICK_BUDGET_SECS", "20"),
+        ("SPACE_ORPHANED_RESTORE_POD_GC_BATCH_SIZE", "100"),
+        (
+            "SPACE_ORPHANED_RESTORE_POD_GC_TEARDOWN_STUCK_AFTER_SECS",
+            "120",
+        ),
+    ]);
+    assert_eq!(
+        config,
+        ReconcilerConfig {
+            enabled: true,
+            dry_run: false,
+            interval: Duration::from_secs(30),
+            threshold: PositiveDuration::new_panic(Duration::from_secs(600)),
+            max_deletes_per_minute: 5,
+            tick_budget: Duration::from_secs(20),
+            batch_size: 100,
+            teardown_stuck_after: PositiveDuration::new_panic(Duration::from_secs(120)),
+        }
+    );
+}
+
+#[test]
+fn config_keeps_defaults_for_zero_or_invalid_values() {
+    for value in ["0", "-1", "ten", ""] {
+        let config = config_from(&[
+            ("SPACE_ORPHANED_RESTORE_POD_GC_INTERVAL_SECS", value),
+            ("SPACE_ORPHANED_RESTORE_POD_GC_THRESHOLD_SECS", value),
+            (
+                "SPACE_ORPHANED_RESTORE_POD_GC_MAX_DELETES_PER_MINUTE",
+                value,
+            ),
+            ("SPACE_ORPHANED_RESTORE_POD_GC_TICK_BUDGET_SECS", value),
+            ("SPACE_ORPHANED_RESTORE_POD_GC_BATCH_SIZE", value),
+            (
+                "SPACE_ORPHANED_RESTORE_POD_GC_TEARDOWN_STUCK_AFTER_SECS",
+                value,
+            ),
+        ]);
+        assert_eq!(config, ReconcilerConfig::default(), "{value:?}");
+    }
+}
+
+#[test]
+fn config_clamps_values_above_their_ceilings() {
+    for value in ["999999", "99999999999999999999999"] {
+        let config = config_from(&[
+            ("SPACE_ORPHANED_RESTORE_POD_GC_INTERVAL_SECS", value),
+            ("SPACE_ORPHANED_RESTORE_POD_GC_THRESHOLD_SECS", value),
+            (
+                "SPACE_ORPHANED_RESTORE_POD_GC_MAX_DELETES_PER_MINUTE",
+                value,
+            ),
+            ("SPACE_ORPHANED_RESTORE_POD_GC_TICK_BUDGET_SECS", value),
+            ("SPACE_ORPHANED_RESTORE_POD_GC_BATCH_SIZE", value),
+            (
+                "SPACE_ORPHANED_RESTORE_POD_GC_TEARDOWN_STUCK_AFTER_SECS",
+                value,
+            ),
+        ]);
+        let day = Duration::from_secs(24 * 60 * 60);
+        assert_eq!(
+            config,
+            ReconcilerConfig {
+                interval: day,
+                threshold: PositiveDuration::new_panic(day),
+                max_deletes_per_minute: 600,
+                tick_budget: day,
+                batch_size: 5000,
+                teardown_stuck_after: PositiveDuration::new_panic(day),
+                ..ReconcilerConfig::default()
+            },
+            "{value:?}"
+        );
+    }
+}
+
+#[test]
+fn config_leaves_dry_run_only_on_an_explicit_false() {
+    for value in ["false", "0", "FALSE"] {
+        let config = config_from(&[("SPACE_ORPHANED_RESTORE_POD_GC_DRY_RUN", value)]);
+        assert!(!config.dry_run, "{value:?}");
+    }
+    for value in ["true", "fasle", "off", ""] {
+        let config = config_from(&[("SPACE_ORPHANED_RESTORE_POD_GC_DRY_RUN", value)]);
+        assert!(config.dry_run, "{value:?} should keep dry-run on");
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Pure supersession matrix
 // ---------------------------------------------------------------------------
 
