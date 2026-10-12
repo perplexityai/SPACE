@@ -445,22 +445,45 @@ pub fn prefetch_release_candidate(template: &str, content_hash: &str, outcome: &
     );
 }
 
+metric_vocabulary!(
+    /// Why a template-manager GC tick failed: the `reason` tag on its
+    /// `result:error` series. Every one skips the whole tick, evicting
+    /// nothing.
+    TemplateGcTickFailure {
+        /// sandbox-manager could not say which templates running sandboxes
+        /// use, so nothing is provably idle.
+        ActiveSetUnavailable => "active_set_unavailable",
+        /// The control plane could not say which templates warm pools need.
+        WarmPoolUnavailable => "warm_pool_unavailable",
+        /// Reading the eviction inputs from the template database failed.
+        PlanSnapshot => "plan_snapshot",
+        /// Composing the eviction plan from those inputs failed.
+        Plan => "plan",
+        /// The blocking task that reads or plans was lost.
+        Task => "task",
+    }
+);
+
 /// One per tick of the template-manager LRU eviction loop. Emits the
 /// `template.gc.tick` counter and the `template.gc.tick_duration_ms`
 /// timing under a single `result:ok|error` tag so dashboards can stay
-/// in sync. Monitor absence across both outcomes to detect a stuck loop; any
+/// in sync; an error adds its [`TemplateGcTickFailure`] as `reason`.
+/// Monitor absence across both outcomes to detect a stuck loop; any
 /// tag filters also need backend retention configuration. The
 /// `template.gc.bytes_before` gauge reports the last tick's disk footprint;
 /// `template.gc.bytes_freed` counts bytes released per tick, so
 /// budget headroom can be plotted alongside actual eviction work.
 pub fn gc_tick(
-    result: &str,
+    result: Result<(), TemplateGcTickFailure>,
     started_at: Instant,
     bytes_before: u64,
     bytes_freed: u64,
     candidates: u64,
 ) {
-    let tags = [tag("result", result)];
+    let tags = match result {
+        Ok(()) => vec![tag("result", "ok")],
+        Err(reason) => vec![tag("result", "error"), tag("reason", reason)],
+    };
     counter("template.gc.tick", 1, &tags);
     timing_ms(
         "template.gc.tick_duration_ms",
