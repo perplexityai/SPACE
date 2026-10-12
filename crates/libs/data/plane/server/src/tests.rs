@@ -2454,14 +2454,19 @@ fn data_plane_http_span_metadata_redacts_ecw_proxy_paths() {
     );
 
     assert_eq!(
-        metadata.span_path_and_route(&headers, "/customer/private/path", None),
+        metadata.span_path_and_route(
+            &axum::http::Method::GET,
+            &headers,
+            "/customer/private/path",
+            None
+        ),
         (
             Cow::Borrowed(pplx_space_common_svc::REDACTED_HTTP_PATH_VALUE),
             Cow::Borrowed(pplx_space_common_svc::REDACTED_HTTP_PATH_VALUE),
         ),
     );
     assert_eq!(
-        metadata.span_path_and_route(&headers, "/files", Some("/files")),
+        metadata.span_path_and_route(&axum::http::Method::GET, &headers, "/files", Some("/files")),
         (Cow::Borrowed("/files"), Cow::Borrowed("/files")),
     );
 }

@@ -658,6 +658,7 @@ impl DataPlaneHttpSpanMetadata {
 impl HttpSpanMetadata for DataPlaneHttpSpanMetadata {
     fn span_path_and_route<'a>(
         &self,
+        _method: &axum::http::Method,
         headers: &HeaderMap,
         raw_path: &'a str,
         matched_route: Option<&'a str>,

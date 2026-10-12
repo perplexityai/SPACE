@@ -6,7 +6,7 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use axum::extract::MatchedPath;
-use http::{HeaderMap, Request as HttpRequest, Response as HttpResponse};
+use http::{HeaderMap, Method, Request as HttpRequest, Response as HttpResponse};
 use tokio::net::UnixListener;
 use tokio_util::sync::CancellationToken;
 use tonic::Status;
@@ -588,6 +588,7 @@ pub const REDACTED_HTTP_PATH_VALUE: &str = "[REDACTED]";
 pub trait HttpSpanMetadata: Clone + Send + Sync + 'static {
     fn span_path_and_route<'a>(
         &self,
+        _method: &Method,
         _headers: &HeaderMap,
         raw_path: &'a str,
         matched_route: Option<&'a str>,
@@ -646,7 +647,7 @@ where
             .map(|matched| matched.as_str());
         let (path, route) =
             self.metadata
-                .span_path_and_route(request.headers(), raw_path, matched_route);
+                .span_path_and_route(method, request.headers(), raw_path, matched_route);
         let resource = format!("{method} {route}");
 
         let span = tracing::info_span!(
