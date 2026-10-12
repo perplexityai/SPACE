@@ -395,3 +395,57 @@ fn network_policy_refresh_readiness_reaches_the_emitted_event() {
         readiness.1
     );
 }
+
+#[test]
+fn create_tls_interception_mode_reaches_the_emitted_event() {
+    use pplx_space_common_core::types::SandboxId;
+    use std::sync::{Arc, Mutex};
+    use tracing_subscriber::layer::SubscriberExt;
+
+    type Fields = Arc<Mutex<Vec<(String, String)>>>;
+
+    struct Capture(Fields);
+
+    impl tracing::field::Visit for Capture {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.0
+                .lock()
+                .unwrap()
+                .push((field.name().to_string(), format!("{value:?}")));
+        }
+    }
+
+    struct CaptureLayer(Fields);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CaptureLayer {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            event.record(&mut Capture(Arc::clone(&self.0)));
+        }
+    }
+
+    let fields: Fields = Arc::new(Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::registry().with(CaptureLayer(Arc::clone(&fields)));
+    tracing::subscriber::with_default(subscriber, || {
+        SandboxEvent::new(
+            SandboxId::new(),
+            SandboxEventType::CreateCompleted,
+            SandboxEventSource::Api,
+        )
+        .emit_with(SandboxEventDetails::default().tls_interception("on"));
+    });
+
+    let captured = fields.lock().unwrap();
+    let mode = captured
+        .iter()
+        .find(|(name, _)| name == "tls_interception")
+        .unwrap_or_else(|| panic!("no tls_interception field in {captured:?}"));
+    assert!(
+        mode.1.contains("on"),
+        "tls_interception carried {:?}",
+        mode.1
+    );
+}

@@ -159,6 +159,7 @@ impl SandboxEvent {
             installed_network_policy_ref = detail_str(&details.installed_network_policy_ref),
             network_state = detail_str(&details.network_state),
             interception_readiness = detail_str(&details.interception_readiness),
+            tls_interception = detail_str(&details.tls_interception),
             artifact = detail_str(&details.artifact),
             local_artifact_id = detail_str(&details.local_artifact_id),
             artifact_kind = detail_str(&details.artifact_kind),

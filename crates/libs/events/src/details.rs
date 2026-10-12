@@ -128,6 +128,9 @@ pub struct SandboxEventDetails {
     /// moment of a network policy refresh (`ready`, `not_required`, or
     /// `dependencies_not_ready`). Orthogonal to `network_state`.
     pub(crate) interception_readiness: Option<String>,
+    /// The effective TLS interception mode (`on` or `off`) a sandbox create
+    /// resolved from its network policy override or template default.
+    pub(crate) tls_interception: Option<String>,
     pub(crate) artifact: Option<String>,
     pub(crate) local_artifact_id: Option<String>,
     pub(crate) artifact_kind: Option<String>,
@@ -239,6 +242,7 @@ impl SandboxEventDetails {
         installed_network_policy_ref,
         network_state,
         interception_readiness,
+        tls_interception,
         artifact,
         local_artifact_id,
         artifact_kind,
