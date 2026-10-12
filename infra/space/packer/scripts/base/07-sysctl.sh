@@ -218,22 +218,10 @@ chmod 0775 \
 # roots beneath them.
 chmod 1775 /space/cache /space/cache/firecracker
 
-# ── Runtime manager ──────────────────────────────────────────────────────────
-# 04-firecracker pre-installed the Firecracker releases and kernels into the
-# runtime manager's own roots, and /space/vendor/{firecracker,kernels} are
-# links to them. The runtime manager owns those roots and everything in them,
-# as it would had it installed them, so it can record the seeded kernels as its
-# own and later replace or remove them. Its parent directory, the seed manifest
-# (the image's evidence of what it baked), and the links stay root's. Its
-# persistent state sits beside them on the root volume, private to it;
-# /space/cache is reformatted at boot and /space/run is not durable.
-install -d -m 0755 -o root -g root /space/vendor/runtime-manager
-for root in /space/vendor/runtime-manager/firecracker /space/vendor/runtime-manager/kernels; do
-  [[ -d "$root" && ! -L "$root" ]] || continue
-  chown -R -h "$SPACE_RTMGR_USER":"$SPACE_RTMGR_GROUP" "$root"
-done
-install -d -m 0700 -o "$SPACE_RTMGR_USER" -g "$SPACE_RTMGR_GROUP" \
-  /space/vendor/runtime-manager/state
+# ── Runtime manager ────────────────────────────────────────────────────────
+# Node-manager creates a separate managed store at startup; do not relocate
+# execution artifacts or grant runtime-manager write access to them here.
+install -d -m 0750 -o "$SPACE_RTMGR_USER" -g space-rtmgrclients /space/run/runtime-manager
 
 # ── Sandbox config ──────────────────────────────────────────────────────────
 # Per-VM config. SANDBOX_RAM_GB sets memory cap.

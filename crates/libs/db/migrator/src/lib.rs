@@ -13,6 +13,7 @@
 //! carry that weight, and no long-running service links this.
 
 use pplx_space_common_svc::sql;
+use pplx_space_common_svc::sql::sqlite::runtime_manager::MIGRATOR as RUNTIME_MANAGER_MIGRATOR;
 use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -37,7 +38,6 @@ use pplx_space_sbxmgr_migrations::SANDBOX_MANAGER_MIGRATOR;
 static TEMPLATE_MANAGER_MIGRATOR: Migrator = sqlx::migrate!("../../../../db/template-manager");
 static NODE_MANAGER_MIGRATOR: Migrator = sqlx::migrate!("../../../../db/node-manager");
 static NODE_CTL_MIGRATOR: Migrator = sqlx::migrate!("../../../../db/node-ctl");
-static RUNTIME_MANAGER_MIGRATOR: Migrator = sqlx::migrate!("../../../../db/runtime-manager");
 static VOLUME_MANAGER_MIGRATOR: Migrator = sqlx::migrate!("../../../../db/volume-manager");
 static BUILD_MANAGER_MIGRATOR: Migrator = sqlx::migrate!("../../../../db/build-manager");
 static COMMON_SCHEMA_MIGRATOR: Migrator = sqlx::migrate!("../../../../db/common");
@@ -376,6 +376,16 @@ async fn run_sqlite(database: SqliteDatabase, args: SqliteArgs) -> Result<(), Ru
     let database_path = args
         .database_path
         .unwrap_or_else(|| PathBuf::from(database.default_path));
+
+    let database = if database.name == "runtime-manager" && !matches!(args.command, Command::Reset)
+    {
+        SqliteDatabase {
+            migrator: sqlite::runtime_manager::catalog(&database_path)?,
+            ..database
+        }
+    } else {
+        database
+    };
 
     match args.command {
         Command::Up => {

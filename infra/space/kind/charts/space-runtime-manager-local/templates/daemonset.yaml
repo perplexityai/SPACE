@@ -19,7 +19,7 @@ spec:
   # both probes target that one shared socket rather than an instance-local
   # health socket; and with kernel installs enabled the successor's installer
   # empties the shared staging directory, which it may only do "when nothing
-  # in staging is live" (kernels/staging.rs prepare, kernels/operations.rs).
+  # in staging is live" (installs/staging.rs prepare, installs/operations.rs).
   # Two instances therefore must not overlap on a node. Nothing waits on its
   # listings, so the brief gap during a replacement costs nothing.
   {{- include "space-node-service.updateStrategy" (dict "strategy" "deleteFirst") | nindent 2 }}
@@ -34,9 +34,8 @@ spec:
       serviceAccountName: {{ include "space-node-service.name" $ctx }}
       automountServiceAccountToken: false
       terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds | int }}
-      # space-rtmgr with only its socket group
-      # (SPACE_RUNTIME_MANAGER_GROUPS: it reads the world-readable vendor and
-      # cache layouts).
+      # space-rtmgr with its socket and node-manager client groups
+      # (SPACE_RUNTIME_MANAGER_GROUPS); vendor and cache mounts stay read-only.
       securityContext:
         {{- include "space-node-service.runAs" (dict "ctx" . "user" "SPACE_RTMGR" "groups" "SPACE_RUNTIME_MANAGER_GROUPS") | nindent 8 }}
       initContainers:
@@ -47,6 +46,7 @@ spec:
         - name: runtime-manager
           {{- include "space-node-service.image" . | nindent 10 }}
           command: ["/opt/space/bin/space-rtmgr-svc"]
+          args: ["--list-only"]
           {{- include "space-node-service.restrictedContainer" . | nindent 10 }}
           env:
             {{- include "space-node-service.env.identity" . | nindent 12 }}

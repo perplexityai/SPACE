@@ -1,6 +1,6 @@
-//! Private staging for kernel operations: writing and hashing an image,
-//! checking one already on disk, and publishing or removing a directory with
-//! a rename that never replaces anything.
+//! The runtime manager's private staging: writing and hashing an image,
+//! checking one already on disk, and preparing and clearing the directory
+//! node-manager publishes from.
 //!
 //! Everything here blocks; callers run it on the blocking pool.
 
@@ -19,7 +19,7 @@ use sha2::{Digest as _, Sha256};
 use super::source::ContentMd5;
 
 /// The image file inside a kernel's directory.
-pub(super) const KERNEL_IMAGE: &str = "vmlinux.bin";
+pub(super) use pplx_space_node_runtime_core::artifact_store::KERNEL_IMAGE;
 /// Bytes buffered before a write is handed to the blocking pool.
 pub(super) const WRITE_BATCH_BYTES: usize = 1024 * 1024;
 const HASH_CHUNK_BYTES: usize = 1024 * 1024;
@@ -41,11 +41,6 @@ impl StagingError {
             path: path.to_path_buf(),
             source,
         }
-    }
-
-    /// Whether the step failed because its target already exists.
-    pub(super) fn is_already_exists(&self) -> bool {
-        self.source.kind() == std::io::ErrorKind::AlreadyExists
     }
 }
 
@@ -88,7 +83,7 @@ pub(super) fn is_boot_image(path: &Path, architecture: Arch) -> Result<bool, Sta
             let mut header = [0u8; ARM64_IMAGE_MAGIC_OFFSET + 4];
             let mut file = std::fs::OpenOptions::new()
                 .read(true)
-                .custom_flags(libc::O_NONBLOCK)
+                .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
                 .open(path)
                 .map_err(inspect)?;
             match file.read_exact(&mut header) {
@@ -190,6 +185,15 @@ impl StagedImage {
     }
 }
 
+impl super::transfer::DownloadWriter for StagedImage {
+    fn written(&self) -> u64 {
+        self.written()
+    }
+    fn append(&mut self, bytes: &[u8], path: &Path) -> Result<(), StagingError> {
+        self.append(bytes, path)
+    }
+}
+
 /// The digests of the regular file at `path`, which must be `expected_size`
 /// bytes. Reads at most that much.
 pub(super) fn image_digests(
@@ -200,9 +204,9 @@ pub(super) fn image_digests(
         path: path.to_path_buf(),
         source,
     };
-    let mut file = std::fs::OpenOptions::new()
+    let file = std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NONBLOCK)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
         .open(path)
         .map_err(read)?;
     let metadata = file.metadata().map_err(read)?;
@@ -221,10 +225,20 @@ pub(super) fn image_digests(
     let mut md5 = Md5::new();
     let mut sha256 = Sha256::new();
     let mut buffer = vec![0u8; HASH_CHUNK_BYTES];
+    let mut file = file.take(expected_size.saturating_add(1));
+    let mut total = 0u64;
     loop {
         match file.read(&mut buffer) {
             Ok(0) => break,
             Ok(count) => {
+                total = total.saturating_add(count as u64);
+                if total > expected_size {
+                    return Err(ImageDigestError::WrongSize {
+                        path: path.to_path_buf(),
+                        found: total,
+                        expected: expected_size,
+                    });
+                }
                 let chunk = buffer.get(..count).unwrap_or_default();
                 md5.update(chunk);
                 sha256.update(chunk);
@@ -233,46 +247,54 @@ pub(super) fn image_digests(
             Err(error) => return Err(read(error)),
         }
     }
+    if total != expected_size {
+        return Err(ImageDigestError::WrongSize {
+            path: path.to_path_buf(),
+            found: total,
+            expected: expected_size,
+        });
+    }
     Ok(ImageDigests {
         md5: ContentMd5::new(md5.finalize().into()),
         sha256: Digest::sha256(sha256.finalize().into()),
     })
 }
 
-/// Why staging could not be prepared beside an install root.
+/// Why staging could not be prepared.
 #[derive(Debug, thiserror::Error)]
 pub enum PrepareStagingError {
     #[error(transparent)]
     Staging(#[from] StagingError),
     #[error("{} is not a directory", path.display())]
     NotADirectory { path: PathBuf },
-    #[error(
-        "kernel install root {} is on a different filesystem from staging {}; publishing could not be one rename",
-        root.display(),
-        staging.display()
-    )]
-    CrossDevice { root: PathBuf, staging: PathBuf },
 }
 
-/// Create staging private to this account, empty it, and confirm a rename
-/// from it can reach the install root. Run before any job, when nothing in
+/// Create the namespace directories above a job's staging directory,
+/// private like the staging root they are in.
+pub(super) fn create_namespace(staged_root: &Path) -> Result<(), StagingError> {
+    let Some(namespace) = staged_root.parent() else {
+        return Ok(());
+    };
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(namespace)
+        .map_err(|error| StagingError::new("create", namespace, error))
+}
+
+/// Make staging private to this account and empty it. Provisioning creates
+/// it where the runtime manager could not, as on the cache; a missing one is
+/// created when the parent allows it. Run before any job, when nothing in
 /// staging is live.
-pub(super) fn prepare(staging: &Path, kernels_root: &Path) -> Result<(), PrepareStagingError> {
+pub(super) fn prepare(staging: &Path) -> Result<(), PrepareStagingError> {
     match std::fs::DirBuilder::new().mode(0o700).create(staging) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
         Err(error) => return Err(StagingError::new("create", staging, error).into()),
     }
-    let staging_metadata = directory(staging)?;
+    directory(staging)?;
     std::fs::set_permissions(staging, std::fs::Permissions::from_mode(0o700))
         .map_err(|error| StagingError::new("chmod", staging, error))?;
-    let root_metadata = directory(kernels_root)?;
-    if root_metadata.dev() != staging_metadata.dev() {
-        return Err(PrepareStagingError::CrossDevice {
-            root: kernels_root.to_path_buf(),
-            staging: staging.to_path_buf(),
-        });
-    }
     clear_dir(staging)?;
     Ok(())
 }
@@ -326,19 +348,6 @@ fn clear_dir(dir: &Path) -> Result<(), StagingError> {
         removed.map_err(|error| StagingError::new("remove", &path, error))?;
     }
     Ok(())
-}
-
-/// Rename `from` to `to`, failing with `AlreadyExists` rather than replacing
-/// anything at `to`. A plain rename would replace an empty directory there.
-pub(super) fn rename_noreplace(from: &Path, to: &Path) -> Result<(), StagingError> {
-    rustix::fs::renameat_with(
-        rustix::fs::CWD,
-        from,
-        rustix::fs::CWD,
-        to,
-        rustix::fs::RenameFlags::NOREPLACE,
-    )
-    .map_err(|errno| StagingError::new("rename into", to, errno.into()))
 }
 
 #[cfg(test)]

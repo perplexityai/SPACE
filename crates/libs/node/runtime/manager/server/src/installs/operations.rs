@@ -1,31 +1,21 @@
-//! Kernel operations as callers see them: install and uninstall requests,
-//! queued as jobs on the shared background worker, and the operation each
-//! becomes.
-//!
-//! Both kinds are one job kind that runs one at a time, so they never
-//! overlap and later requests queue. Requests are refused up front only on
-//! cheap evidence (the listing, the install records, whether a directory
-//! exists); anything that needs the bytes, such as comparing an external
-//! kernel's image, is the job's work. See [`super::executor`] for what a job
-//! does and how a re-run after a restart resolves it.
+//! Durable requests and operation views for the shared install/delete worker.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use pplx_space_common_core::types::{Arch, Digest, JobId, RuntimeKind, StorageUri};
+use super::executor::{ExecutorParts, InstallExecutor};
+use super::release_source::VerifiableRelease;
+use super::source::{KernelVersion, RuntimeLine, SourceError, VerifiableKernel};
+use super::staging::{self, PrepareStagingError};
+use super::store::{self, JobOutcome, JobResult, StoreError};
+use pplx_space_common_core::types::{Digest, JobId, RuntimeIdentity};
 use pplx_space_common_jobs::{BackgroundWorker, Job, JobStatus, ParseJobStatusError, WorkerConfig};
+use pplx_space_node_runtime_core::catalog::CatalogError;
 use tokio_util::sync::CancellationToken;
 
-use super::executor::KernelExecutor;
-use super::seed::{SeedError, SeedReport};
-use super::source::{KernelSource, KernelVersion, RuntimeLine, SourceError, VerifiableKernel};
-use super::staging::{self, ImageDigestError, PrepareStagingError};
-use super::store::{self, JobOutcome, JobResult, KernelInstall, StoreError};
-
-pub(super) const KERNEL_JOB_KIND: &str = "kernel";
-const WORKER_LABEL: &str = "space-rtmgr.kernel";
-pub(super) const STAGING_DIR: &str = "staging";
+pub(super) const INSTALL_JOB_KIND: &str = "artifact-install";
+const WORKER_LABEL: &str = "space-rtmgr.install";
 /// One attempt's bound: a guest kernel at the slowest link a node should
 /// have, with room to spare.
 const JOB_TIMEOUT: Duration = Duration::from_secs(30 * 60);
@@ -37,7 +27,8 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 /// Bounds on kernel operations.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct InstallLimits {
-    /// The largest kernel an install downloads.
+    /// The largest kernel or release archive an install downloads, and the
+    /// largest binary a release archive may unpack.
     pub max_bytes: u64,
     /// How long a download may stall before the attempt fails.
     pub download_idle_timeout: Duration,
@@ -47,33 +38,89 @@ pub struct InstallLimits {
     pub max_attempts: i32,
 }
 
-/// A kernel job's request: the shared job's payload.
+/// An install job's request: the shared job's payload.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case")]
-pub(crate) enum KernelOperation {
-    Install { kernel: VerifiableKernel },
-    Uninstall { version: KernelVersion },
+pub(crate) enum InstallOperation {
+    InstallKernel {
+        kernel: VerifiableKernel,
+    },
+    UninstallKernel {
+        version: KernelVersion,
+        digest: Digest,
+    },
+    InstallRelease {
+        release: VerifiableRelease,
+        digest: Digest,
+    },
+    UninstallRelease {
+        release: RuntimeIdentity,
+        digest: Digest,
+    },
 }
 
-impl KernelOperation {
-    pub(crate) fn version(&self) -> &KernelVersion {
+impl InstallOperation {
+    pub(crate) fn artifact(&self) -> super::publisher::NodeArtifactRef {
+        use super::publisher::NodeArtifactRef;
         match self {
-            Self::Install { kernel } => &kernel.version,
-            Self::Uninstall { version } => version,
+            Self::InstallKernel { kernel } => {
+                NodeArtifactRef::Kernel(kernel.version.clone(), kernel.digest)
+            }
+            Self::UninstallKernel { version, digest } => {
+                NodeArtifactRef::Kernel(version.clone(), *digest)
+            }
+            Self::InstallRelease { release, digest } => {
+                NodeArtifactRef::Release(release.release.clone(), *digest)
+            }
+            Self::UninstallRelease { release, digest } => {
+                NodeArtifactRef::Release(release.clone(), *digest)
+            }
         }
     }
 
-    /// Repeats of one request join the active job rather than queueing a
-    /// second; the same version from another line is a different request.
-    fn dedup_key(&self) -> String {
+    /// What the operation is about, for job listings: a kernel version, or
+    /// a release as `<runtime>-<version>`.
+    pub(crate) fn subject(&self) -> String {
         match self {
-            Self::Install { kernel } => format!(
-                "install:{}:{}:{}",
-                kernel.line.runtime, kernel.line.release, kernel.version
-            ),
-            Self::Uninstall { version } => format!("uninstall:{version}"),
+            Self::InstallKernel { kernel } => kernel.version.to_string(),
+            Self::UninstallKernel { version, .. } => version.to_string(),
+            Self::InstallRelease { release, .. } => release_subject(&release.release),
+            Self::UninstallRelease { release, .. } => release_subject(release),
         }
     }
+
+    /// Whether the operation removes what it names.
+    pub(crate) const fn is_removal(&self) -> bool {
+        matches!(
+            self,
+            Self::UninstallKernel { .. } | Self::UninstallRelease { .. }
+        )
+    }
+
+    /// Repeats of one identity join the active job. A source location is
+    /// transfer evidence; it does not create a second component identity.
+    fn dedup_key(&self) -> String {
+        match self {
+            Self::InstallKernel { kernel } => format!(
+                "install-component:kernel:{}:{}",
+                kernel.version, kernel.digest
+            ),
+            Self::UninstallKernel { version, digest } => format!("uninstall:{version}:{digest}"),
+            Self::InstallRelease { release, digest } => {
+                format!(
+                    "install-release:{}:{digest}",
+                    release_subject(&release.release)
+                )
+            }
+            Self::UninstallRelease { release, digest } => {
+                format!("uninstall-release:{}:{digest}", release_subject(release))
+            }
+        }
+    }
+}
+
+fn release_subject(release: &RuntimeIdentity) -> String {
+    format!("{}-{}", release.kind, release.version)
 }
 
 /// Where an operation is, as the caller sees it.
@@ -117,9 +164,9 @@ impl std::fmt::Display for OperationState {
     }
 }
 
-/// A kernel directory an operation published, found, or removed.
+/// A kernel or release directory an operation published, found, or removed.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct KernelOnDisk {
+pub(crate) struct OnDisk {
     pub(crate) path: PathBuf,
     /// The image's SHA-256.
     pub(crate) digest: Digest,
@@ -129,168 +176,49 @@ pub(crate) struct KernelOnDisk {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Operation {
     pub(crate) job_id: JobId,
-    pub(crate) request: KernelOperation,
+    pub(crate) request: InstallOperation,
     pub(crate) state: OperationState,
-    /// Set once the operation reached a kernel directory.
-    pub(crate) kernel: Option<KernelOnDisk>,
+    /// Set once the operation reached a kernel or release directory.
+    pub(crate) on_disk: Option<OnDisk>,
     /// The last attempt's failure, as the worker recorded it.
     pub(crate) error: Option<String>,
     pub(crate) created_at: Option<jiff::Timestamp>,
     pub(crate) updated_at: Option<jiff::Timestamp>,
 }
 
-/// Why a kernel version is already taken by something else.
-#[derive(Debug, thiserror::Error)]
-pub(crate) enum KernelConflict {
-    #[error("kernel {version} is already installed by the runtime manager from {location}")]
-    InstalledFromElsewhere {
-        version: KernelVersion,
-        location: Box<StorageUri>,
-    },
-    #[error(
-        "kernel {version} is recorded as installed at {} but is missing; restoring it is maintenance work",
-        path.display()
-    )]
-    RecordedButMissing {
-        version: KernelVersion,
-        path: PathBuf,
-    },
-    #[error(
-        "kernel {version} is provided externally (provider unknown) at {} with different bytes",
-        path.display()
-    )]
-    ExternalDiffers {
-        version: KernelVersion,
-        path: PathBuf,
-    },
-    #[error("kernel {version} at {} cannot be compared", path.display())]
-    Unreadable {
-        version: KernelVersion,
-        path: PathBuf,
-        #[source]
-        source: ImageDigestError,
-    },
-    #[error(
-        "{} appeared while kernel {version} downloaded; nothing was replaced",
-        path.display()
-    )]
-    Appeared {
-        version: KernelVersion,
-        path: PathBuf,
-    },
-    #[error(
-        "an earlier attempt was publishing kernel {version} to {}, which now holds other bytes; left in place",
-        path.display()
-    )]
-    PublishedOtherBytes {
-        version: KernelVersion,
-        path: PathBuf,
-    },
-    #[error(
-        "kernel {version} at {} no longer holds the bytes the runtime manager installed; left in place",
-        path.display()
-    )]
-    Changed {
-        version: KernelVersion,
-        path: PathBuf,
-    },
-    #[error(
-        "kernel {version} is recorded at {}, outside the install root {}; restore the root it was installed under",
-        path.display(),
-        root.display()
-    )]
-    OutsideRoot {
-        version: KernelVersion,
-        path: PathBuf,
-        root: PathBuf,
-    },
-}
-
 #[derive(Debug, thiserror::Error)]
 pub enum OpenInstallerError {
-    #[error("kernel installs are unsupported on this architecture")]
+    #[error("unsupported node architecture")]
     UnsupportedArchitecture,
-    #[error("cannot prepare kernel staging")]
+    #[error("cannot prepare staging")]
     Staging(#[from] PrepareStagingError),
     #[error(transparent)]
     Store(#[from] StoreError),
-    #[error("kernel installer setup task failed")]
+    #[error("cannot load catalog")]
+    Catalog(#[from] CatalogError),
+    #[error("installer setup failed")]
     Task(#[from] tokio::task::JoinError),
 }
 
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum InstallKernelError {
-    #[error("the kernel source publishes kernels for {published}, not {}", line.runtime)]
-    RuntimeNotPublished {
-        line: RuntimeLine,
-        published: RuntimeKind,
-    },
-    #[error("{source_root} offers no kernel {version} for {line} on {architecture}")]
-    NotOffered {
-        version: KernelVersion,
-        line: RuntimeLine,
-        architecture: Arch,
-        source_root: Box<StorageUri>,
-    },
-    #[error("the source publishes no MD5 for {location}, so it cannot be verified")]
-    Unverifiable { location: Box<StorageUri> },
-    #[error("{location} is {size} bytes, over the {limit}-byte install limit")]
-    TooLarge {
-        location: Box<StorageUri>,
-        size: u64,
-        limit: u64,
-    },
+pub(crate) enum SubmitOperationError {
+    #[error("no enabled source for this artifact")]
+    Disabled,
+    #[error("artifact identity is not pinned for this node or source")]
+    NotPinned,
+    #[error("artifact is not offered by the configured source")]
+    NotOffered,
+    #[error("artifact exceeds the configured install limit")]
+    TooLarge,
     #[error(transparent)]
-    Conflict(#[from] KernelConflict),
+    Pins(#[from] CatalogError),
     #[error(transparent)]
     Source(#[from] SourceError),
-    #[error(transparent)]
-    Store(#[from] StoreError),
-    #[error("the worker refused the install")]
+    #[error("worker refused operation")]
     Submit(#[source] Box<tonic::Status>),
     #[error(transparent)]
     Lookup(#[from] LookupOperationError),
-    #[error("install check task failed")]
-    Task(#[from] tokio::task::JoinError),
-}
-
-#[derive(Debug, thiserror::Error)]
-pub(crate) enum UninstallKernelError {
-    #[error("kernel {version} is not installed")]
-    NotInstalled { version: KernelVersion },
-    #[error(
-        "kernel {version} at {} is external (provider unknown); the runtime manager never removes it",
-        path.display()
-    )]
-    External {
-        version: KernelVersion,
-        path: PathBuf,
-    },
-    #[error(
-        "kernel {version} is selected by {}; switch the alias away before uninstalling it",
-        alias.display()
-    )]
-    Selected {
-        version: KernelVersion,
-        alias: PathBuf,
-    },
-    #[error(
-        "kernel {version} is recorded at {}, outside the install root {}; restore the root it was installed under",
-        path.display(),
-        root.display()
-    )]
-    OutsideRoot {
-        version: KernelVersion,
-        path: PathBuf,
-        root: PathBuf,
-    },
-    #[error(transparent)]
-    Store(#[from] StoreError),
-    #[error("the worker refused the uninstall")]
-    Submit(#[source] Box<tonic::Status>),
-    #[error(transparent)]
-    Lookup(#[from] LookupOperationError),
-    #[error("uninstall check task failed")]
+    #[error("operation submission failed")]
     Task(#[from] tokio::task::JoinError),
 }
 
@@ -338,59 +266,50 @@ pub(crate) enum CancelOperationError {
 
 #[derive(Clone)]
 pub(crate) struct Installer {
-    worker: BackgroundWorker<KernelExecutor>,
-    executor: KernelExecutor,
+    worker: BackgroundWorker<InstallExecutor>,
+    pub(super) executor: InstallExecutor,
 }
 
 impl Installer {
     /// Open the store in `state_dir`, clear staging, and re-queue every job a
     /// restart interrupted.
     pub(crate) async fn open(
-        kernels_root: PathBuf,
+        parts: ExecutorParts,
         state_dir: &Path,
-        limits: InstallLimits,
-        source: Arc<dyn KernelSource>,
     ) -> Result<Self, OpenInstallerError> {
-        let host_arch =
-            super::source::host_arch().ok_or(OpenInstallerError::UnsupportedArchitecture)?;
-        let staging = state_dir.join(STAGING_DIR);
-        let (prepared_staging, prepared_root) = (staging.clone(), kernels_root.clone());
-        tokio::task::spawn_blocking(move || staging::prepare(&prepared_staging, &prepared_root))
-            .await??;
+        let limits = parts.limits;
+        let prepared = parts.staging.clone();
+        tokio::task::spawn_blocking(move || staging::prepare(&prepared)).await??;
+        // An unsafe catalog refuses to start installs at all, rather than
+        // failing each one later.
+        let pins = parts.pins.clone();
+        tokio::task::spawn_blocking(move || pins.catalog()).await??;
         let db = store::open(state_dir).await?;
         let orphaned = store::delete_orphaned_job_results(&db)?;
         if orphaned > 0 {
             tracing::info!(orphaned, "dropped results of pruned kernel jobs");
         }
         let db = Arc::new(Mutex::new(db));
-        let executor =
-            KernelExecutor::new(kernels_root, staging, limits, host_arch, source, db.clone());
-        // Before the worker starts, so no job runs meanwhile.
-        let finishing = executor.clone();
-        let finished = tokio::task::spawn_blocking(move || finishing.finish_ended_jobs()).await??;
-        if finished > 0 {
-            tracing::info!(finished, "finished renames of ended kernel jobs");
-        }
+        let executor = InstallExecutor::new(parts, db.clone());
         let config = WorkerConfig::new(1, JOB_TIMEOUT, limits.max_attempts)
-            .with_kind_concurrency(KERNEL_JOB_KIND, 1)
-            .with_recovery_job_kind(KERNEL_JOB_KIND);
+            .with_kind_concurrency(INSTALL_JOB_KIND, 1)
+            .with_recovery_job_kind(INSTALL_JOB_KIND);
         let worker = BackgroundWorker::new(db, executor.clone(), config);
         worker.recover_and_log(WORKER_LABEL);
         Ok(Self { worker, executor })
     }
 
-    /// Queue an install of `version` from the kernels the source offers for
-    /// `line`, refusing up front what the listing or the install records
-    /// already rule out.
+    /// Source resolution is bounded by the source's own deadline. The worker
+    /// owns all transfers and node-manager mutation calls.
     pub(crate) async fn install(
         &self,
         line: RuntimeLine,
         version: KernelVersion,
-    ) -> Result<Operation, InstallKernelError> {
+        expected_digest: Digest,
+    ) -> Result<Operation, SubmitOperationError> {
         let context = self.executor.context();
-        let published = context.source.runtime();
-        if line.runtime != published {
-            return Err(InstallKernelError::RuntimeNotPublished { line, published });
+        if context.source.runtime() != line.runtime {
+            return Err(SubmitOperationError::Disabled);
         }
         let listed = context
             .source
@@ -398,58 +317,122 @@ impl Installer {
             .await?
             .into_iter()
             .find(|kernel| kernel.version == version)
-            .ok_or_else(|| InstallKernelError::NotOffered {
-                version: version.clone(),
-                line,
-                architecture: context.host_arch,
-                source_root: Box::new(context.source.root().clone()),
-            })?;
-        let kernel = listed
-            .verifiable()
-            .ok_or_else(|| InstallKernelError::Unverifiable {
-                location: Box::new(listed.location.clone()),
-            })?;
+            .ok_or(SubmitOperationError::NotOffered)?;
+        let kernel = listed.download_request(expected_digest);
         if kernel.size > context.limits.max_bytes {
-            return Err(InstallKernelError::TooLarge {
-                location: Box::new(kernel.location),
-                size: kernel.size,
-                limit: context.limits.max_bytes,
-            });
+            return Err(SubmitOperationError::TooLarge);
         }
         let checking = self.executor.clone();
         let checked = kernel.clone();
-        if let Some(conflict) =
-            tokio::task::spawn_blocking(move || checking.recorded_conflict(&checked)).await??
-        {
-            return Err(conflict.into());
-        }
-        let job_id = self
-            .submit(&KernelOperation::Install { kernel })
-            .map_err(InstallKernelError::Submit)?;
-        Ok(self.lookup(job_id).await?)
+        tokio::task::spawn_blocking(move || {
+            let catalog = checking.context().pins.catalog()?;
+            catalog
+                .kernel(
+                    checked.version.artifact_version(),
+                    checking.context().host_arch,
+                )
+                .filter(|pin| {
+                    pin.sha256 == checked.digest
+                        && pin.size == checked.size
+                        && pin.runtime == checked.line.runtime
+                        && pin.runtime_line.as_str() == checked.line.release.to_string()
+                })
+                .ok_or(SubmitOperationError::NotPinned)?;
+            Ok::<_, SubmitOperationError>(())
+        })
+        .await??;
+        self.enqueue(InstallOperation::InstallKernel { kernel })
+            .await
     }
 
-    /// Queue removal of `version`, which the runtime manager must have
-    /// installed and no alias may select.
     pub(crate) async fn uninstall(
         &self,
         version: KernelVersion,
-    ) -> Result<Operation, UninstallKernelError> {
+        digest: Digest,
+    ) -> Result<Operation, SubmitOperationError> {
+        self.enqueue(InstallOperation::UninstallKernel { version, digest })
+            .await
+    }
+
+    pub(crate) async fn install_release(
+        &self,
+        release: RuntimeIdentity,
+        digest: Digest,
+    ) -> Result<Operation, SubmitOperationError> {
+        let context = self.executor.context();
+        let releases = context
+            .releases
+            .as_ref()
+            .ok_or(SubmitOperationError::Disabled)?;
+        if releases.source.runtime() != release.kind {
+            return Err(SubmitOperationError::Disabled);
+        }
+        let archive = releases.source.archive(&release, context.host_arch);
         let checking = self.executor.clone();
-        let checked = version.clone();
-        tokio::task::spawn_blocking(move || checking.removable(&checked)).await??;
-        let job_id = self
-            .submit(&KernelOperation::Uninstall { version })
-            .map_err(UninstallKernelError::Submit)?;
+        let release = tokio::task::spawn_blocking(move || {
+            let architecture = checking.context().host_arch;
+            let catalog = checking.context().pins.catalog()?;
+            let pin = catalog
+                .release(&release, architecture)
+                .filter(|pin| pin.digest() == digest)
+                .ok_or(SubmitOperationError::NotPinned)?;
+            Ok::<_, SubmitOperationError>(VerifiableRelease {
+                release,
+                architecture,
+                archive,
+                sha256: pin.archive_sha256,
+            })
+        })
+        .await??;
+        self.enqueue(InstallOperation::InstallRelease { release, digest })
+            .await
+    }
+
+    pub(crate) async fn uninstall_release(
+        &self,
+        release: RuntimeIdentity,
+        digest: Digest,
+    ) -> Result<Operation, SubmitOperationError> {
+        if self
+            .executor
+            .context()
+            .releases
+            .as_ref()
+            .is_none_or(|configured| configured.source.runtime() != release.kind)
+        {
+            return Err(SubmitOperationError::Disabled);
+        }
+        self.enqueue(InstallOperation::UninstallRelease { release, digest })
+            .await
+    }
+
+    async fn enqueue(&self, request: InstallOperation) -> Result<Operation, SubmitOperationError> {
+        let submitting = self.clone();
+        let job_id = tokio::task::spawn_blocking(move || submitting.submit(&request))
+            .await?
+            .map_err(SubmitOperationError::Submit)?;
         Ok(self.lookup(job_id).await?)
     }
 
-    fn submit(&self, operation: &KernelOperation) -> Result<JobId, Box<tonic::Status>> {
+    pub(crate) fn catalog(
+        &self,
+    ) -> Result<pplx_space_node_runtime_core::catalog::RuntimeCatalog, CatalogError> {
+        self.executor.context().pins.catalog()
+    }
+
+    pub(crate) fn releases_root(&self) -> Option<&Path> {
+        self.executor
+            .context()
+            .releases
+            .as_ref()
+            .map(|releases| releases.root.as_path())
+    }
+    fn submit(&self, operation: &InstallOperation) -> Result<JobId, Box<tonic::Status>> {
         self.worker
             .submit_json(
-                KERNEL_JOB_KIND,
+                INSTALL_JOB_KIND,
                 operation,
-                Some(operation.version().as_str()),
+                Some(&operation.subject()),
                 Some(&operation.dedup_key()),
             )
             .map_err(Box::new)
@@ -475,7 +458,7 @@ impl Installer {
             .worker
             .get_job(&job_id)
             .map_err(|status| LookupOperationError::Worker(Box::new(status)))?;
-        let Some(job) = job.filter(|job| job.kind == KERNEL_JOB_KIND) else {
+        let Some(job) = job.filter(|job| job.kind == INSTALL_JOB_KIND) else {
             return Ok(None);
         };
         let result = store::get_job_result(&self.executor.db(), &job_id)?;
@@ -488,7 +471,7 @@ impl Installer {
     /// The commit gate is held across the whole cancel, waiting for the job
     /// to stop included: the shared worker requests cancellation and waits
     /// in one call, and the decision to cancel must stay exclusive with a
-    /// job entering its rename until the job has seen the request. A job
+    /// job entering its publication or removal until the job has seen the request. A job
     /// waiting on the gate watches its cancellation, so this cannot deadlock.
     pub(crate) async fn cancel(&self, job_id: JobId) -> Result<Operation, CancelOperationError> {
         let _gate = self.executor.context().commit_gate.lock().await;
@@ -500,9 +483,8 @@ impl Installer {
             return Ok(current);
         }
         // Eligibility follows the durable commit step, not the worker's
-        // status: a job queued for a retry after its rename landed still has
-        // that rename to resolve, and cancelling it would strand the kernel
-        // without its install record; one whose outcome is recorded is done
+        // status: a job queued for a retry after its node-manager call landed still has
+        // that mutation to resolve, and cancellation cannot undo that mutation; one whose outcome is recorded is done
         // even while the worker has yet to mark it so.
         let reading = self.executor.clone();
         let committed =
@@ -523,35 +505,6 @@ impl Installer {
         Ok(self.lookup(job_id).await?)
     }
 
-    /// Kernels the runtime manager installed, for listings. Blocking.
-    pub(crate) fn kernel_installs(&self) -> Result<Vec<KernelInstall>, StoreError> {
-        store::list_kernel_installs(&self.executor.db())
-    }
-
-    pub(crate) fn kernels_root(&self) -> &Path {
-        &self.executor.context().kernels_root
-    }
-
-    /// Record the kernels `manifest` says the node image pre-installed in
-    /// the install root, holding the commit gate so no job publishes or
-    /// removes meanwhile.
-    pub(crate) async fn import_seed(&self, manifest: PathBuf) -> Result<SeedReport, SeedError> {
-        let context = self.executor.context();
-        let _gate = context.commit_gate.lock().await;
-        let importing = self.executor.clone();
-        tokio::task::spawn_blocking(move || {
-            let context = importing.context();
-            super::seed::import(
-                &importing.db(),
-                &context.kernels_root,
-                context.host_arch,
-                &manifest,
-                jiff::Timestamp::now(),
-            )
-        })
-        .await?
-    }
-
     /// Prune finished jobs on the worker's schedule until `shutdown`.
     pub(crate) async fn prune_finished_jobs(self, shutdown: CancellationToken) {
         self.worker
@@ -570,7 +523,7 @@ impl Installer {
 
 /// The caller's view of a job and what it did.
 fn operation(job: &Job, result: Option<JobResult>) -> Result<Operation, LookupOperationError> {
-    let request: KernelOperation =
+    let request: InstallOperation =
         serde_json::from_str(&job.payload).map_err(|source| LookupOperationError::Payload {
             job_id: job.job_id,
             source,
@@ -588,12 +541,11 @@ fn operation(job: &Job, result: Option<JobResult>) -> Result<Operation, LookupOp
     };
     let state = match status {
         JobStatus::Pending => OperationState::Queued,
-        JobStatus::Running => match (&request, in_progress) {
-            (_, Some(store::JobPhase::Publishing)) => OperationState::Publishing,
-            (_, Some(store::JobPhase::Removing)) | (KernelOperation::Uninstall { .. }, None) => {
-                OperationState::Removing
-            }
-            (KernelOperation::Install { .. }, None) => OperationState::Downloading,
+        JobStatus::Running => match in_progress {
+            Some(store::JobPhase::Publishing) => OperationState::Publishing,
+            Some(store::JobPhase::Removing) => OperationState::Removing,
+            None if request.is_removal() => OperationState::Removing,
+            None => OperationState::Downloading,
         },
         JobStatus::Cancelling => OperationState::Cancelling,
         JobStatus::Completed => match &result {
@@ -614,7 +566,7 @@ fn operation(job: &Job, result: Option<JobResult>) -> Result<Operation, LookupOp
         job_id: job.job_id,
         request,
         state,
-        kernel: result.map(|result| KernelOnDisk {
+        on_disk: result.map(|result| OnDisk {
             path: result.path().to_path_buf(),
             digest: result.digest(),
         }),

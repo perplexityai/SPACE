@@ -1,3 +1,5 @@
+pub mod runtime_manager;
+
 use super::migration_checksums::AcceptedChecksums;
 use pplx_space_common_core::sql;
 use std::collections::HashMap;

@@ -43,11 +43,8 @@ tee /etc/audit/rules.d/90-space.rules > /dev/null <<'EOF'
 ## ── 2. Binary integrity ────────────────────────────────────────────────────
 ## Detect writes to SPACE binaries (firecracker, jailer, services)
 -w /space/bin/ -p wa -k space-binary-tamper
-## The runtime manager's private state changes in normal operation and is
-## excluded; this rule must stay ahead of the vendor watch, as the first
-## matching exit rule decides.
--a never,exit -F dir=/space/vendor/runtime-manager/state -F perm=wa
-## Detect writes to Firecracker/jailer vendor binaries
+## Detect writes to Firecracker/jailer vendor binaries and the node's
+## artifact store, which only node-manager writes
 -w /space/vendor/ -p wa -k space-vendor-tamper
 
 ## ── 3. Config integrity ────────────────────────────────────────────────────
@@ -96,7 +93,9 @@ tee /etc/audit/rules.d/90-space.rules > /dev/null <<'EOF'
 -w /space/run/sandbox-host-control -p wa -k space-sbxmgr-host-control
 -w /space/run/credential-manager -p wa -k space-credmgr-socket
 -w /space/run/template-manager -p wa -k space-tmplmgr-socket
--w /space/run/runtime-manager -p wa -k space-rtmgr-socket
+## SQLite shares this directory; audit only socket objects, including a
+## socket created after rules load, rather than ordinary DB/WAL writes.
+-a always,exit -F dir=/space/run/runtime-manager -F filetype=socket -F perm=wa -k space-rtmgr-socket
 
 ## ── 9. Sandbox escape indicators ───────────────────────────────────────────
 ## Sandbox UIDs (10000+) accessing sensitive host paths outside their sandbox dir.

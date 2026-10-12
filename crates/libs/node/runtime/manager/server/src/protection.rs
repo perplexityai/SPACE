@@ -2,14 +2,15 @@
 //! local accounts.
 //!
 //! The runtime manager reads the releases and kernels a node image ships,
-//! installs into roots of its own, keeps its state beside them, and reads
+//! asks node-manager to publish into a separate store, keeps private job
+//! state, and reads
 //! kernels that are staged into the shared cache. Each is safe only if no other account can
 //! write it and no other account can rename it, or any directory above it,
 //! out of the way. Provisioning establishes that; this module checks it, so a
 //! node that was provisioned wrongly or not yet says so. It reports and never
 //! repairs.
 
-use std::os::unix::fs::MetadataExt as _;
+use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
 use std::path::{Component, Path, PathBuf};
 
 const STICKY: u32 = 0o1000;
@@ -27,17 +28,17 @@ const MAX_REPORTED_CONTENT_PROBLEMS: usize = 8;
 /// What a protected path is for, which decides who may write it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PathRole {
-    /// A root of releases or kernels: the image's, owned by root, or the
-    /// runtime manager's own. Writable by no other account; a root writable
-    /// by a group must be writable by the runtime manager's alone. A root
-    /// reached through a compatibility link, as the image's vendor paths link
-    /// to the runtime manager's roots, is audited where the link resolves.
+    /// A root of releases or kernels in the node store: root-owned and
+    /// writable by no other account, the runtime manager included, since
+    /// install candidates and execution artifacts must both be immutable to
+    /// unprivileged services. A compatibility link is audited at its target.
     InstallRoot,
     /// Staged into the shared cache by root-run node bootstrap: root-owned and
     /// writable by nobody else.
     RootManagedCache,
-    /// The runtime manager's own persistent state: owned by it and closed to
-    /// every other account.
+    /// The runtime manager's own state directory, which also holds its
+    /// socket: owned by it and writable by no other account, its files
+    /// private to it.
     StateDirectory,
 }
 
@@ -228,8 +229,7 @@ fn audit_contents(
     problems: &mut Vec<String>,
 ) {
     let owner_allowed = |uid: u32| match role {
-        // The image's entries are root's, the runtime manager's installs its own.
-        PathRole::InstallRoot => uid == identity.trusted_uid || uid == identity.service_uid,
+        PathRole::InstallRoot => uid == identity.trusted_uid,
         PathRole::RootManagedCache => uid == identity.trusted_uid,
         PathRole::StateDirectory => uid == identity.service_uid,
     };
@@ -277,7 +277,10 @@ fn audit_contents(
                 found.push(format!("{shown} is on another filesystem"));
                 continue;
             }
-            if !file_type.is_dir() && !file_type.is_file() {
+            // The runtime manager's socket lives beside its state; who may
+            // connect is the socket's mode and group, by design.
+            let socket = role == PathRole::StateDirectory && file_type.is_socket();
+            if !file_type.is_dir() && !file_type.is_file() && !socket {
                 found.push(format!("{shown} is not a regular file or directory"));
                 continue;
             }
@@ -287,9 +290,21 @@ fn audit_contents(
                     metadata.uid()
                 ));
             }
+            if socket {
+                continue;
+            }
             if metadata.mode() & GROUP_OR_OTHER_WRITE != 0 {
                 found.push(format!(
                     "{shown} has mode {:o}, writable by accounts other than its owner",
+                    metadata.mode() & 0o7777
+                ));
+            }
+            if role == PathRole::StateDirectory
+                && file_type.is_file()
+                && metadata.mode() & GROUP_OR_OTHER_ANY != 0
+            {
+                found.push(format!(
+                    "{shown} has mode {:o}; state must be private to the runtime manager",
                     metadata.mode() & 0o7777
                 ));
             }
@@ -324,15 +339,15 @@ fn audit_target(
     let mode = metadata.mode();
     match role {
         PathRole::InstallRoot => {
-            if metadata.uid() != identity.trusted_uid && metadata.uid() != identity.service_uid {
+            if metadata.uid() != identity.trusted_uid {
                 problems.push(format!(
-                    "{shown} is owned by uid {}, neither root nor the runtime manager",
+                    "{shown} is owned by uid {}, not root",
                     metadata.uid()
                 ));
             }
-            if mode & GROUP_WRITE != 0 && metadata.gid() != identity.service_gid {
+            if mode & GROUP_WRITE != 0 {
                 problems.push(format!(
-                    "{shown} is writable by group gid {}, not only by the runtime manager",
+                    "{shown} is writable by group gid {}; only root may write the node store",
                     metadata.gid()
                 ));
             }
@@ -359,9 +374,10 @@ fn audit_target(
                     identity.service_uid
                 ));
             }
-            if mode & GROUP_OR_OTHER_ANY != 0 {
+            // Clients traverse it to reach the socket; nobody else writes it.
+            if mode & GROUP_OR_OTHER_WRITE != 0 {
                 problems.push(format!(
-                    "{shown} has mode {:o}; state must be private to the runtime manager",
+                    "{shown} has mode {:o}, writable by accounts other than the runtime manager",
                     mode & 0o7777
                 ));
             }

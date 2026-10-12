@@ -48,18 +48,3 @@ fn each_architecture_accepts_only_its_own_boot_image_format() {
     }
     is_boot_image(&dir.path().join("missing"), Arch::Aarch64).unwrap_err();
 }
-
-#[test]
-fn a_no_replace_rename_never_replaces_an_empty_directory() {
-    let dir = tempfile::tempdir().unwrap();
-    let from = dir.path().join("from");
-    let to = dir.path().join("to");
-    std::fs::create_dir(&from).unwrap();
-    std::fs::create_dir(&to).unwrap();
-    let error = rename_noreplace(&from, &to).unwrap_err();
-    assert!(error.is_already_exists(), "{error}");
-    assert!(from.exists());
-    std::fs::remove_dir(&to).unwrap();
-    rename_noreplace(&from, &to).unwrap();
-    assert!(!from.exists() && to.exists());
-}

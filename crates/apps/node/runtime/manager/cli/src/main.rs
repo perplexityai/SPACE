@@ -4,23 +4,18 @@ use clap::{Parser, Subcommand, ValueEnum};
 use std::fmt::Write as _;
 
 use comfy_table::{Table, presets::NOTHING};
-use pplx_space_common_core::types::RuntimeKind as Runtime;
+use pplx_space_common_core::types::{
+    ArtifactComponentKind as ComponentKind, ArtifactVersion, Digest, JobId, RuntimeKind as Runtime,
+    RuntimeVersion,
+};
 use pplx_space_node_runtime_manager_client::execution::{ArtifactComponentKind, RuntimeKind};
 use pplx_space_node_runtime_manager_client::labels::label;
-use pplx_space_node_runtime_manager_client::proto::{
-    ArtifactLocation, ArtifactManagement, ArtifactProvenance, ArtifactProvider,
-    CancelOperationRequest, ExecutionArtifact, ExecutionArtifactKind, ExecutionArtifactStatus,
-    ExecutionArtifactVersionSource, GetOperationRequest, GetStatusRequest, GetStatusResponse,
-    InstallKernelRequest, KernelPresence, ListAvailableKernelsRequest,
-    ListAvailableKernelsResponse, ListExecutionArtifactsRequest, ListExecutionArtifactsResponse,
-    Operation, OperationKind, OperationOutcome, OperationState, PathProtection, ProtectedPathRole,
-    ScanIssueKind, ScanRootPresence, UninstallKernelRequest,
-};
+use pplx_space_node_runtime_manager_client::proto::{self, *};
 
 #[derive(Parser)]
 #[command(
     name = "space-rtmgr",
-    about = "Inspect the SPACE node runtime manager and manage its guest kernels",
+    about = "Inspect the SPACE node runtime manager and manage its runtime releases and guest kernels",
     version
 )]
 struct Cli {
@@ -56,22 +51,64 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// List, install, and uninstall guest kernels.
+    /// List and manage components by verified identity.
+    Components {
+        #[command(subcommand)]
+        command: ComponentsCommand,
+    },
+    /// Shorthand for kernel component operations using a version label.
     Kernels {
         #[command(subcommand)]
         command: KernelsCommand,
     },
+    /// List, install, and uninstall runtime releases. An install never
+    /// changes the release new sandboxes boot on: that is the release root's
+    /// `default` alias.
+    Runtimes {
+        #[command(subcommand)]
+        command: RuntimesCommand,
+    },
     /// Show one install or uninstall.
     Operation {
-        operation_id: String,
+        operation_id: JobId,
         /// Print the operation as JSON.
         #[arg(long)]
         json: bool,
     },
     /// Cancel an operation that is still queued or downloading.
     Cancel {
-        operation_id: String,
+        operation_id: JobId,
         /// Print the operation as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum ComponentsCommand {
+    Available {
+        #[arg(long)]
+        kind: ComponentKind,
+        #[arg(long, value_parser = parse_runtime)]
+        runtime: Option<RuntimeArg>,
+        #[arg(long)]
+        json: bool,
+    },
+    Install {
+        #[arg(long)]
+        kind: ComponentKind,
+        version: ArtifactVersion,
+        digest: Digest,
+        #[arg(long)]
+        no_wait: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    Uninstall {
+        #[arg(long)]
+        kind: ComponentKind,
+        version: ArtifactVersion,
+        digest: Digest,
         #[arg(long)]
         json: bool,
     },
@@ -83,9 +120,8 @@ enum KernelsCommand {
     /// each is on this node.
     Available {
         /// The runtime, optionally with a line (fc-1.15) or release
-        /// (fc-1.15.1). A runtime alone lists every line this node has a
-        /// release of it for; no flag means the runtime the kernel source
-        /// publishes for.
+        /// (fc-1.15.1). A runtime alone lists every pinned line; no flag means
+        /// the runtime the component adapter publishes for.
         #[arg(long, value_parser = parse_runtime)]
         runtime: Option<RuntimeArg>,
         /// Print the response as JSON.
@@ -110,7 +146,41 @@ enum KernelsCommand {
     /// Remove a kernel the runtime manager installed. Requires root or the
     /// local operator account.
     Uninstall {
-        version: String,
+        version: ArtifactVersion,
+        /// Print the operation as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum RuntimesCommand {
+    /// List the releases this build can install, and whether each is on
+    /// this node.
+    Available {
+        /// Print the response as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Download and install a runtime release. Requires root or the local
+    /// operator account.
+    Install {
+        /// The release, such as fc-1.16.2.
+        #[arg(value_parser = parse_release)]
+        release: ReleaseArg,
+        /// Return once the install is accepted instead of waiting for it.
+        #[arg(long)]
+        no_wait: bool,
+        /// Print the operation as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove a runtime release the runtime manager installed. Requires root
+    /// or the local operator account.
+    Uninstall {
+        /// The release, such as fc-1.16.2.
+        #[arg(value_parser = parse_release)]
+        release: ReleaseArg,
         /// Print the operation as JSON.
         #[arg(long)]
         json: bool,
@@ -154,6 +224,26 @@ fn parse_runtime(value: &str) -> Result<RuntimeArg, String> {
         .ok_or_else(|| {
             format!("'{value}' is not a runtime; expected fc, or fc-<version> such as fc-1.15")
         })
+}
+
+/// A runtime and one of its releases: `fc-1.16.2`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ReleaseArg {
+    kind: Runtime,
+    version: RuntimeVersion,
+}
+
+fn parse_release(value: &str) -> Result<ReleaseArg, String> {
+    let runtime = parse_runtime(value)?;
+    let version = runtime.version.ok_or_else(|| {
+        format!("'{value}' names no release; expected fc-<version> such as fc-1.16.2")
+    })?;
+    let version = RuntimeVersion::parse(version.strip_prefix('v').unwrap_or(&version))
+        .map_err(|error| format!("'{value}' names no release: {error}"))?;
+    Ok(ReleaseArg {
+        kind: runtime.kind,
+        version,
+    })
 }
 
 /// `fc-1.15.1`: a runtime's alias and a version of it. A kind this build
@@ -297,22 +387,14 @@ async fn run(cli: Cli) -> Result<(), String> {
         }
         Command::Kernels { command } => match command {
             KernelsCommand::Available { runtime, json } => {
-                let response = client
-                    .list_available_kernels(ListAvailableKernelsRequest {
-                        runtime_kind: runtime
-                            .as_ref()
-                            .map_or(RuntimeKind::Unspecified as i32, RuntimeArg::kind),
-                        runtime_version: runtime.and_then(|runtime| runtime.version),
-                    })
-                    .await
-                    .map_err(|status| format!("ERROR: {}", status.message()))?
-                    .into_inner();
-                if json {
-                    print_json(&response)?;
-                } else {
-                    print!("{}", render_available(&response));
-                }
-                Ok(())
+                let response = available(
+                    &mut client,
+                    false,
+                    Some(ComponentKind::Kernel),
+                    runtime.as_ref(),
+                )
+                .await?;
+                show_available(&response, json)
             }
             KernelsCommand::Install {
                 version,
@@ -320,46 +402,129 @@ async fn run(cli: Cli) -> Result<(), String> {
                 no_wait,
                 json,
             } => {
-                let runtime_kind = runtime.kind();
-                let runtime_version = runtime
-                    .version
-                    .ok_or("ERROR: name the line to install for, such as --runtime fc-1.15")?;
-                let mut operation = client
-                    .install_kernel(InstallKernelRequest {
-                        runtime_kind,
-                        runtime_version,
-                        version,
-                    })
-                    .await
-                    .map_err(mutation_error)?
-                    .into_inner()
-                    .operation
-                    .ok_or("ERROR: the runtime manager returned no operation")?;
-                if !no_wait && in_progress(&operation) {
-                    if !json {
-                        eprintln!(
-                            "Installing kernel {} (operation {}); interrupting this command does not stop it.",
-                            operation.kernel_version, operation.operation_id
-                        );
-                    }
-                    operation = wait_for(&mut client, operation).await?;
-                }
-                report(&operation, json)
+                let response = available(
+                    &mut client,
+                    false,
+                    Some(ComponentKind::Kernel),
+                    Some(&runtime),
+                )
+                .await?;
+                let identity = unique_artifact(
+                    response
+                        .artifacts
+                        .into_iter()
+                        .filter_map(|entry| entry.identity)
+                        .filter(|identity| artifact_version(identity) == Some(version.as_str())),
+                )?;
+                mutate(
+                    &mut client,
+                    identity,
+                    ArtifactAction::Install,
+                    no_wait,
+                    json,
+                )
+                .await
             }
             KernelsCommand::Uninstall { version, json } => {
-                let operation = client
-                    .uninstall_kernel(UninstallKernelRequest { version })
+                let response = client
+                    .list_execution_artifacts(list_request(&[KindArg::Kernel]))
                     .await
                     .map_err(mutation_error)?
-                    .into_inner()
-                    .operation
-                    .ok_or("ERROR: the runtime manager returned no operation")?;
-                report(&operation, json)
+                    .into_inner();
+                let identity = installed_identity(response, InstalledArtifact::Kernel(&version))?;
+                mutate(
+                    &mut client,
+                    identity,
+                    ArtifactAction::Uninstall,
+                    false,
+                    json,
+                )
+                .await
+            }
+        },
+        Command::Components { command } => match command {
+            ComponentsCommand::Available {
+                kind,
+                runtime,
+                json,
+            } => {
+                let response = available(&mut client, false, Some(kind), runtime.as_ref()).await?;
+                show_available(&response, json)
+            }
+            ComponentsCommand::Install {
+                kind,
+                version,
+                digest,
+                no_wait,
+                json,
+            } => {
+                mutate(
+                    &mut client,
+                    component_identity(kind, version, digest),
+                    ArtifactAction::Install,
+                    no_wait,
+                    json,
+                )
+                .await
+            }
+            ComponentsCommand::Uninstall {
+                kind,
+                version,
+                digest,
+                json,
+            } => {
+                mutate(
+                    &mut client,
+                    component_identity(kind, version, digest),
+                    ArtifactAction::Uninstall,
+                    false,
+                    json,
+                )
+                .await
+            }
+        },
+        Command::Runtimes { command } => match command {
+            RuntimesCommand::Available { json } => {
+                let response = available(&mut client, true, None, None).await?;
+                show_available(&response, json)
+            }
+            RuntimesCommand::Install {
+                release,
+                no_wait,
+                json,
+            } => {
+                let identity = resolve_release(&mut client, &release).await?;
+                mutate(
+                    &mut client,
+                    identity,
+                    ArtifactAction::Install,
+                    no_wait,
+                    json,
+                )
+                .await
+            }
+            RuntimesCommand::Uninstall { release, json } => {
+                let listing = client
+                    .list_execution_artifacts(list_request(&[KindArg::Runtime]))
+                    .await
+                    .map_err(mutation_error)?
+                    .into_inner();
+                let identity = installed_identity(listing, InstalledArtifact::Runtime(&release))?;
+                mutate(
+                    &mut client,
+                    identity,
+                    ArtifactAction::Uninstall,
+                    false,
+                    json,
+                )
+                .await
             }
         },
         Command::Operation { operation_id, json } => {
             let operation = client
-                .get_operation(GetOperationRequest { operation_id })
+                .get_operation(GetOperationRequest {
+                    operation_id: operation_id.to_string(),
+                })
                 .await
                 .map_err(|status| format!("ERROR: {}", status.message()))?
                 .into_inner()
@@ -374,7 +539,9 @@ async fn run(cli: Cli) -> Result<(), String> {
         }
         Command::Cancel { operation_id, json } => {
             let operation = client
-                .cancel_operation(CancelOperationRequest { operation_id })
+                .cancel_operation(CancelOperationRequest {
+                    operation_id: operation_id.to_string(),
+                })
                 .await
                 .map_err(mutation_error)?
                 .into_inner()
@@ -450,22 +617,36 @@ fn operation_outcome(operation: &Operation) -> Result<(), String> {
         _ if in_progress(operation) => Ok(()),
         _ => Err(format!(
             "ERROR: {} {}: {}",
-            label::<OperationKind>(operation.kind),
+            label::<ArtifactAction>(operation.action),
             label::<OperationState>(operation.state),
             operation.error.as_deref().unwrap_or("no reason recorded")
         )),
     }
 }
 
+fn artifact_label(identity: Option<&ArtifactIdentity>) -> String {
+    match identity.and_then(|identity| identity.artifact.as_ref()) {
+        Some(artifact_identity::Artifact::Runtime(runtime)) => format!(
+            "{} {}",
+            runtime_label(runtime.kind, &runtime.version),
+            runtime.digest
+        ),
+        Some(artifact_identity::Artifact::Component(component)) => format!(
+            "{} {} {}",
+            label::<ArtifactComponentKind>(component.kind),
+            component.version,
+            component.digest
+        ),
+        None => "unknown".into(),
+    }
+}
+
 fn render_operation(operation: &Operation) -> String {
     let mut fields = vec![
         ("Operation", operation.operation_id.clone()),
-        ("Kind", label::<OperationKind>(operation.kind)),
-        ("Kernel", operation.kernel_version.clone()),
+        ("Action", label::<ArtifactAction>(operation.action)),
+        ("Artifact", artifact_label(operation.identity.as_ref())),
     ];
-    if let Some(line) = &operation.runtime_line {
-        fields.push(("Runtime", runtime_label(operation.runtime_kind, line)));
-    }
     let state = label::<OperationState>(operation.state);
     fields.push((
         "State",
@@ -474,14 +655,14 @@ fn render_operation(operation: &Operation) -> String {
             Ok(_) => format!("{state} ({})", label::<OperationOutcome>(operation.outcome)),
         },
     ));
+    let on_disk = operation.on_disk.as_ref();
     for (name, value) in [
-        ("Error", &operation.error),
-        ("Path", &operation.path),
-        ("Digest", &operation.digest),
-        ("Source", &operation.source),
+        ("Error", operation.error.clone()),
+        ("Path", on_disk.map(|on_disk| on_disk.path.clone())),
+        ("Digest", on_disk.map(|on_disk| on_disk.digest.clone())),
     ] {
         if let Some(value) = value {
-            fields.push((name, value.clone()));
+            fields.push((name, value));
         }
     }
     let mut out = String::new();
@@ -497,50 +678,220 @@ fn megabytes(bytes: u64) -> String {
     format!("{}.{} MiB", tenths / 10, tenths % 10)
 }
 
-fn render_available(response: &ListAvailableKernelsResponse) -> String {
-    let mut out = String::new();
-    if response.runtime_lines.is_empty() {
-        let _ = writeln!(
-            out,
-            "No {} release is on this node; name a line with --runtime {} to list its kernels.",
-            label::<RuntimeKind>(response.runtime_kind),
-            runtime_label(response.runtime_kind, "<line>")
-        );
-        return out;
+fn component_identity(
+    kind: ComponentKind,
+    version: ArtifactVersion,
+    digest: Digest,
+) -> ArtifactIdentity {
+    ArtifactIdentity {
+        artifact: Some(artifact_identity::Artifact::Component(
+            proto::ComponentIdentity {
+                kind: ArtifactComponentKind::from(kind) as i32,
+                digest: digest.to_string(),
+                version: version.to_string(),
+            },
+        )),
     }
-    if response.kernels.is_empty() {
-        let lines: Vec<String> = response
-            .runtime_lines
-            .iter()
-            .map(|line| runtime_label(response.runtime_kind, line))
-            .collect();
-        let _ = writeln!(
-            out,
-            "{} publishes no kernels for {} on this architecture.",
-            response.source,
-            lines.join(", ")
-        );
-        return out;
+}
+
+fn artifact_version(identity: &ArtifactIdentity) -> Option<&str> {
+    match identity.artifact.as_ref()? {
+        artifact_identity::Artifact::Runtime(runtime) => Some(&runtime.version),
+        artifact_identity::Artifact::Component(component) => Some(&component.version),
     }
-    let mut table = plain_table(&["VERSION", "RUNTIME", "SIZE", "ON THIS NODE"]);
-    for kernel in &response.kernels {
-        // A kernel of this version is here, but not one installed from
-        // this entry; its bytes may or may not match.
-        let presence = if kernel.md5.is_none() {
-            "unverifiable".to_string()
-        } else {
-            label::<KernelPresence>(kernel.presence)
+}
+
+/// Labels are conveniences; immutable identity must be unambiguous.
+fn unique_artifact(
+    identities: impl IntoIterator<Item = ArtifactIdentity>,
+) -> Result<ArtifactIdentity, String> {
+    let mut unique = None;
+    for identity in identities {
+        match &unique {
+            Some(previous) if previous != &identity => {
+                return Err("ERROR: ambiguous version; supply an explicit identity".into());
+            }
+            Some(_) => {}
+            None => unique = Some(identity),
+        }
+    }
+    unique.ok_or_else(|| "ERROR: no matching artifact identity".into())
+}
+
+async fn available(
+    client: &mut pplx_space_node_runtime_manager_client::RuntimeManagerGrpcClient,
+    runtimes: bool,
+    component: Option<ComponentKind>,
+    runtime: Option<&RuntimeArg>,
+) -> Result<ListAvailableArtifactsResponse, String> {
+    client
+        .list_available_artifacts(ListAvailableArtifactsRequest {
+            kinds: vec![if runtimes {
+                ExecutionArtifactKind::Runtime
+            } else {
+                ExecutionArtifactKind::Component
+            } as i32],
+            component_kinds: component
+                .map(|kind| vec![ArtifactComponentKind::from(kind) as i32])
+                .unwrap_or_default(),
+            runtime_kind: runtime.map_or(RuntimeKind::Unspecified as i32, RuntimeArg::kind),
+            runtime_version: runtime.and_then(|runtime| runtime.version.clone()),
+        })
+        .await
+        .map_err(mutation_error)
+        .map(tonic::Response::into_inner)
+}
+
+enum InstalledArtifact<'a> {
+    Runtime(&'a ReleaseArg),
+    Kernel(&'a ArtifactVersion),
+}
+
+fn installed_identity(
+    listing: ListExecutionArtifactsResponse,
+    requested: InstalledArtifact<'_>,
+) -> Result<ArtifactIdentity, String> {
+    let (kind, runtime, component, version) = match requested {
+        InstalledArtifact::Runtime(release) => (
+            ExecutionArtifactKind::Runtime,
+            RuntimeKind::from(release.kind),
+            ArtifactComponentKind::Unspecified,
+            release.version.as_str(),
+        ),
+        InstalledArtifact::Kernel(version) => (
+            ExecutionArtifactKind::Component,
+            RuntimeKind::Unspecified,
+            ArtifactComponentKind::Kernel,
+            version.as_str(),
+        ),
+    };
+    let mut identities = Vec::new();
+    for entry in listing.artifacts.into_iter().filter(|entry| {
+        entry.kind == kind as i32
+            && entry.management == ArtifactManagement::SpaceManaged as i32
+            && entry.version.as_deref() == Some(version)
+            && match requested {
+                InstalledArtifact::Runtime(_) => entry.runtime_kind == runtime as i32,
+                InstalledArtifact::Kernel(_) => entry.component_kind == component as i32,
+            }
+    }) {
+        let digest = entry.digest.ok_or_else(|| {
+            format!(
+                "ERROR: managed artifact {} is present but its digest is unavailable: {}; inspect the listing and resolve missing evidence before uninstalling",
+                entry.path,
+                entry.detail.as_deref().unwrap_or("not measured"),
+            )
+        })?;
+        let artifact = match requested {
+            InstalledArtifact::Runtime(_) => {
+                artifact_identity::Artifact::Runtime(proto::RuntimeArtifactIdentity {
+                    kind: runtime as i32,
+                    version: version.to_string(),
+                    digest,
+                })
+            }
+            InstalledArtifact::Kernel(_) => {
+                artifact_identity::Artifact::Component(proto::ComponentIdentity {
+                    kind: component as i32,
+                    version: version.to_string(),
+                    digest,
+                })
+            }
         };
+        identities.push(ArtifactIdentity {
+            artifact: Some(artifact),
+        });
+    }
+    if identities.is_empty() && !listing.complete {
+        return Err("ERROR: incomplete scan; cannot establish whether the managed artifact is installed; inspect scan issues and resolve the limit or unreadable root".into());
+    }
+    // A limit elsewhere does not invalidate measured identity evidence. The
+    // node manager checks these bytes again under the store lock before removal.
+    unique_artifact(identities)
+}
+
+async fn resolve_release(
+    client: &mut pplx_space_node_runtime_manager_client::RuntimeManagerGrpcClient,
+    release: &ReleaseArg,
+) -> Result<ArtifactIdentity, String> {
+    let filter = RuntimeArg {
+        kind: release.kind,
+        version: Some(release.version.to_string()),
+    };
+    let response = available(client, true, None, Some(&filter)).await?;
+    unique_artifact(
+        response
+            .artifacts
+            .into_iter()
+            .filter_map(|entry| entry.identity)
+            .filter(|identity| artifact_version(identity) == Some(release.version.as_str())),
+    )
+}
+
+async fn mutate(
+    client: &mut pplx_space_node_runtime_manager_client::RuntimeManagerGrpcClient,
+    identity: ArtifactIdentity,
+    action: ArtifactAction,
+    no_wait: bool,
+    json: bool,
+) -> Result<(), String> {
+    let operation = match action {
+        ArtifactAction::Install => {
+            client
+                .install_artifact(InstallArtifactRequest {
+                    identity: Some(identity),
+                })
+                .await
+                .map_err(mutation_error)?
+                .into_inner()
+                .operation
+        }
+        ArtifactAction::Uninstall => {
+            client
+                .uninstall_artifact(UninstallArtifactRequest {
+                    identity: Some(identity),
+                })
+                .await
+                .map_err(mutation_error)?
+                .into_inner()
+                .operation
+        }
+        ArtifactAction::Unspecified => return Err("ERROR: an artifact action is required".into()),
+    }
+    .ok_or("ERROR: the runtime manager returned no operation")?;
+    let operation = if no_wait {
+        operation
+    } else {
+        wait_for(client, operation).await?
+    };
+    report(&operation, json)
+}
+
+fn show_available(response: &ListAvailableArtifactsResponse, json: bool) -> Result<(), String> {
+    if json {
+        print_json(response)
+    } else {
+        print!("{}", render_available(response));
+        Ok(())
+    }
+}
+
+fn render_available(response: &ListAvailableArtifactsResponse) -> String {
+    let mut table = plain_table(&["ARTIFACT", "COMPATIBLE RUNTIMES", "SIZE", "MANAGED STORE"]);
+    for artifact in &response.artifacts {
         table.add_row(vec![
-            kernel.version.clone(),
-            runtime_label(kernel.runtime_kind, &kernel.runtime_line),
-            megabytes(kernel.size),
-            presence,
+            artifact_label(artifact.identity.as_ref()),
+            artifact
+                .compatible_runtimes
+                .iter()
+                .map(|runtime| runtime_label(runtime.kind, &runtime.version))
+                .collect::<Vec<_>>()
+                .join(", "),
+            artifact.size.map_or_else(|| "—".into(), megabytes),
+            label::<ArtifactPresence>(artifact.presence),
         ]);
     }
-    let _ = writeln!(out, "{table}");
-    let _ = writeln!(out, "Source: {}", response.source);
-    out
+    format!("{table}\n")
 }
 
 /// Succeeds only when every path is protected, naming absent and unprotected
@@ -591,15 +942,6 @@ fn optional(value: Option<&str>) -> String {
 /// Marks a version the layout did not name.
 const DERIVED_VERSION_MARK: &str = "[*]";
 
-/// The runtime release a kernel ships with or was installed for, such as
-/// `fc-1.15.1`.
-fn for_runtime(artifact: &ExecutionArtifact) -> String {
-    artifact.for_runtime_version.as_deref().map_or_else(
-        || "-".to_string(),
-        |version| runtime_label(artifact.for_runtime_kind, version),
-    )
-}
-
 /// A borderless table, the columns separated by padding alone.
 fn plain_table(header: &[&str]) -> Table {
     let mut table = Table::new();
@@ -620,11 +962,10 @@ fn render_listing(response: &ListExecutionArtifactsResponse, wide: bool) -> Stri
     } else {
         let mut table = if wide {
             plain_table(&[
-                "KIND", "VERSION", "RUNTIME", "STATUS", "OWNER", "ARCH", "STATE", "DIGEST",
-                "FOUND IN", "PATH",
+                "KIND", "VERSION", "STATUS", "OWNER", "ARCH", "STATE", "DIGEST", "FOUND IN", "PATH",
             ])
         } else {
-            plain_table(&["KIND", "VERSION", "RUNTIME", "STATUS", "OWNER", "PATH"])
+            plain_table(&["KIND", "VERSION", "STATUS", "OWNER", "PATH"])
         };
         for artifact in &response.artifacts {
             let version = match artifact.version.as_deref() {
@@ -644,7 +985,6 @@ fn render_listing(response: &ListExecutionArtifactsResponse, wide: bool) -> Stri
                     artifact.component_kind,
                 ),
                 version,
-                for_runtime(artifact),
                 label::<ExecutionArtifactStatus>(artifact.status),
                 managed_by(artifact.management, artifact.provider, wide),
             ];

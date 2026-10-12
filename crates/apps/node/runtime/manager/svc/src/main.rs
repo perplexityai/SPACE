@@ -10,7 +10,8 @@ use pplx_space_node_runtime_core::runtime_inventory::RuntimeInstallationRoot;
 use pplx_space_node_runtime_core::runtime_inventory::diagnostic::{ScanLimits, ScanRoots};
 use pplx_space_node_runtime_manager::{
     DEFAULT_INSTALL_LIMITS, DEFAULT_LIST_ADMISSION_TIMEOUT, DEFAULT_SCAN_LIMITS,
-    FIRECRACKER_CI_KERNEL_SOURCE, InstallLimits, KernelSourceConfig, RuntimeManagerInstallConfig,
+    FIRECRACKER_CI_KERNEL_SOURCE, FIRECRACKER_RELEASE_SOURCE, InstallLimits, KernelSourceConfig,
+    ReleaseSourceConfig, ReleaseUrl, RuntimeManagerInstallConfig, RuntimeManagerReleaseConfig,
     RuntimeManagerRunConfig, SERVICE_NAME,
 };
 
@@ -51,7 +52,7 @@ struct Cli {
     #[arg(long, default_value = paths::FIRECRACKER_ASSET_DIR)]
     cache_legacy_assets_dir: PathBuf,
 
-    /// Persistent state directory, on the reboot-persistent vendor volume.
+    /// State directory, beside the socket: the SQLite store.
     #[arg(long, default_value = paths::RUNTIME_MANAGER_STATE_DIR)]
     state_dir: PathBuf,
 
@@ -75,21 +76,39 @@ struct Cli {
     #[arg(long, default_value_t = DEFAULT_LIST_ADMISSION_TIMEOUT.as_secs())]
     list_admission_timeout_secs: u64,
 
-    /// Enable kernel installs and uninstalls in this versioned kernel root
-    /// (`<version>/vmlinux.bin`), such as /space/vendor/runtime-manager/kernels.
-    /// It must exist on the state directory's filesystem. Unset, both are
-    /// refused. Deployments set it through the environment, which a build
-    /// without the setting ignores.
-    #[arg(long, env = "SPACE_RTMGR_INSTALL_KERNELS_DIR")]
-    install_kernels_dir: Option<PathBuf>,
+    /// Only list and report: refuse every install and uninstall. For hosts
+    /// whose node store has no node-manager to publish into it, such as Kind.
+    #[arg(long)]
+    list_only: bool,
 
-    /// The node image's manifest of kernels it pre-installed in the install
-    /// root, recorded as space-managed at startup when installs are enabled.
-    /// A missing file seeds nothing.
-    #[arg(long, default_value = paths::RUNTIME_MANAGER_SEED_MANIFEST)]
-    seed_manifest: PathBuf,
+    /// The node store's kernel root (`<version>/vmlinux.bin`). Read here;
+    /// node-manager publishes into it.
+    #[arg(long, default_value = paths::NODE_KERNELS_DIR)]
+    node_kernels_dir: PathBuf,
 
-    /// Largest kernel one install downloads, in bytes.
+    /// The node store's Firecracker release root
+    /// (`v<version>/bin/{firecracker,jailer}`). Execution never reads this
+    /// root. Read here; node-manager publishes into it.
+    #[arg(long, default_value = paths::NODE_FIRECRACKER_DIR)]
+    node_releases_dir: PathBuf,
+
+    /// Private staging that downloads unpack into and node-manager publishes
+    /// from. Provisioning creates it.
+    #[arg(long, default_value = paths::RUNTIME_MANAGER_STAGING_DIR)]
+    staging_dir: PathBuf,
+
+    /// Root-owned catalog files adding release and kernel pins to the
+    /// compiled ones.
+    #[arg(long, default_value = paths::RUNTIME_MANAGER_CATALOG_DIR)]
+    catalog_dir: PathBuf,
+
+    /// Where Firecracker release archives are downloaded from: an
+    /// `https://` base laid out as Firecracker's GitHub release downloads,
+    /// `<base>/v<version>/firecracker-v<version>-<arch>.tgz`.
+    #[arg(long, default_value = FIRECRACKER_RELEASE_SOURCE)]
+    release_source: ReleaseUrl,
+
+    /// Largest kernel or release archive one install downloads, in bytes.
     #[arg(long, default_value_t = DEFAULT_INSTALL_LIMITS.max_bytes)]
     max_install_bytes: u64,
 
@@ -97,7 +116,7 @@ struct Cli {
     #[arg(long, default_value_t = DEFAULT_INSTALL_LIMITS.download_idle_timeout.as_secs())]
     download_idle_timeout_secs: u64,
 
-    /// Attempts per kernel operation before a transfer failure is final.
+    /// Attempts per install or uninstall before a transfer failure is final.
     #[arg(long, default_value_t = DEFAULT_INSTALL_LIMITS.max_attempts)]
     install_max_attempts: i32,
 
@@ -142,17 +161,15 @@ impl TryFrom<Cli> for RuntimeManagerRunConfig {
     type Error = UnixSocketPathParseError;
 
     fn try_from(cli: Cli) -> Result<Self, Self::Error> {
-        let install = cli
-            .install_kernels_dir
-            .map(|kernels_root| RuntimeManagerInstallConfig {
-                kernels_root,
-                seed_manifest: Some(cli.seed_manifest),
-                limits: InstallLimits {
-                    max_bytes: cli.max_install_bytes,
-                    download_idle_timeout: Duration::from_secs(cli.download_idle_timeout_secs),
-                    max_attempts: cli.install_max_attempts,
-                },
-            });
+        let install = (!cli.list_only).then(|| RuntimeManagerInstallConfig {
+            kernels_root: cli.node_kernels_dir.clone(),
+            staging_dir: cli.staging_dir,
+            limits: InstallLimits {
+                max_bytes: cli.max_install_bytes,
+                download_idle_timeout: Duration::from_secs(cli.download_idle_timeout_secs),
+                max_attempts: cli.install_max_attempts,
+            },
+        });
         Ok(Self {
             socket_path: UnixSocketPath::parse(cli.socket)?,
             roots: ScanRoots {
@@ -162,7 +179,8 @@ impl TryFrom<Cli> for RuntimeManagerRunConfig {
                     .map(|root| root.0)
                     .collect(),
                 vendor_kernels: cli.vendor_kernels_dir,
-                managed_kernels: None,
+                managed_kernels: Some(cli.node_kernels_dir),
+                managed_releases: None,
                 cache_kernels: cli.cache_kernels_dir,
                 cache_legacy_assets: cli.cache_legacy_assets_dir,
                 runtime_aliases: cli.runtime_aliases,
@@ -175,6 +193,11 @@ impl TryFrom<Cli> for RuntimeManagerRunConfig {
             },
             list_admission_timeout: Duration::from_secs(cli.list_admission_timeout_secs),
             kernel_source: Some(KernelSourceConfig::S3(cli.kernel_source)),
+            catalog_dir: cli.catalog_dir,
+            releases: Some(RuntimeManagerReleaseConfig {
+                root: cli.node_releases_dir,
+                source: ReleaseSourceConfig::GitHub(cli.release_source),
+            }),
             install,
         })
     }

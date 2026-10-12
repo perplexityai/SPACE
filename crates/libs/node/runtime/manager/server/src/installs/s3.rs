@@ -1,5 +1,6 @@
-//! Published kernels read anonymously from a public S3 bucket laid out as
-//! Firecracker's CI bucket is: `<prefix>/v<line>/<arch>/vmlinux-<version>`.
+//! Published kernels read anonymously from S3. The public Firecracker source
+//! maps newer release lines to reviewed, dated artifact snapshots; custom
+//! sources retain `<prefix>/v<line>/<arch>/vmlinux-<version>`.
 //!
 //! The shared object-store crate signs every request and has no listing
 //! call, so this talks to the SDK directly; a signed source for SPACE's own
@@ -11,8 +12,8 @@ use pplx_space_common_core::types::{Arch, RuntimeKind, StorageUri};
 use pplx_space_s3_http_client::{DEFAULT_POOL_IDLE_TIMEOUT, s3_http_client};
 
 use super::source::{
-    ByteChunks, ContentMd5, KernelSource, KernelVersion, RuntimeLine, SourceError, SourceKernel,
-    VerifiableKernel,
+    ByteChunks, ContentMd5, KernelSource, KernelVersion, ReleaseLine, RuntimeLine, SourceError,
+    SourceKernel, VerifiableKernel,
 };
 
 const KERNEL_KEY_PREFIX: &str = "vmlinux-";
@@ -20,6 +21,9 @@ const KERNEL_KEY_PREFIX: &str = "vmlinux-";
 /// response. The body that follows is bounded per chunk by the caller.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Objects one line's listing may hold: Firecracker's CI bucket keeps a few
+/// dozen per line and architecture.
+const MAX_LISTED_OBJECTS: usize = 2000;
 
 pub(crate) struct S3KernelSource {
     root: StorageUri,
@@ -51,11 +55,23 @@ impl S3KernelSource {
     }
 
     fn line_prefix(&self, line: RuntimeLine, architecture: Arch) -> String {
-        let directory = format!(
-            "v{}/{}/{KERNEL_KEY_PREFIX}",
-            line.release,
-            architecture.as_str()
-        );
+        // Upstream stopped publishing v<line> directories after 1.15. Keep
+        // a reviewed snapshot per line, never a listing of whichever is newest.
+        // Mirrors with their own layout continue using v<line>.
+        let snapshot = if self.root.bucket == "spec.ccfc.min"
+            && self.root.key_prefix == "firecracker-ci"
+            && self.root.endpoint.is_none()
+        {
+            match line.release {
+                release if release == ReleaseLine::new(1, 16) => Some("20260603-e656faf58d6c-0"),
+                release if release == ReleaseLine::new(1, 17) => Some("20260909-a8e1c3830545-0"),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let release = snapshot.map_or_else(|| format!("v{}", line.release), str::to_owned);
+        let directory = format!("{release}/{}/{KERNEL_KEY_PREFIX}", architecture.as_str());
         if self.root.key_prefix.is_empty() {
             directory
         } else {
@@ -85,6 +101,7 @@ impl S3KernelSource {
         architecture: Arch,
     ) -> Result<Vec<SourceKernel>, SourceError> {
         let mut kernels = Vec::new();
+        let mut listed = 0usize;
         let mut pages = self
             .client
             .list_objects_v2()
@@ -97,6 +114,15 @@ impl S3KernelSource {
                 location: Box::new(self.object(prefix)),
                 source: Box::new(error),
             })?;
+            // A release line holds dozens of kernels; a listing far past that
+            // is not one, and is not followed further.
+            listed = listed.saturating_add(page.contents().len());
+            if listed > MAX_LISTED_OBJECTS {
+                return Err(SourceError::ListingTooLarge {
+                    location: Box::new(self.object(prefix)),
+                    limit: MAX_LISTED_OBJECTS,
+                });
+            }
             for object in page.contents() {
                 let (Some(key), Some(size)) = (object.key(), object.size()) else {
                     continue;

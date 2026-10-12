@@ -1,8 +1,8 @@
 const PACKAGE: &str = ".space.node.runtime.manager.v1";
 
-/// Enum-typed fields, which prost stores as `i32`. Each renders through the
-/// matching `crate::labels` serializer so JSON carries names, not numbers.
-const ENUM_FIELDS: &[(&str, &str)] = &[
+/// Fields needing a wire serializer, including shared execution identities.
+/// Enum values render as names in CLI JSON.
+const SERIALIZED_FIELDS: &[(&str, &str)] = &[
     ("ExecutionArtifact.kind", "execution_artifact_kind"),
     ("ExecutionArtifact.runtime_kind", "runtime_kind"),
     (
@@ -28,13 +28,15 @@ const ENUM_FIELDS: &[(&str, &str)] = &[
     ("ScanIssue.kind", "scan_issue_kind"),
     ("ProtectedPath.role", "protected_path_role"),
     ("ProtectedPath.protection", "path_protection"),
-    ("AvailableKernel.presence", "kernel_presence"),
-    ("AvailableKernel.runtime_kind", "runtime_kind"),
-    ("ListAvailableKernelsRequest.runtime_kind", "runtime_kind"),
-    ("ListAvailableKernelsResponse.runtime_kind", "runtime_kind"),
-    ("InstallKernelRequest.runtime_kind", "runtime_kind"),
-    ("Operation.runtime_kind", "runtime_kind"),
-    ("Operation.kind", "operation_kind"),
+    ("AvailableArtifact.presence", "artifact_presence"),
+    (
+        "AvailableArtifact.compatible_runtimes",
+        "runtime_identities",
+    ),
+    ("ComponentIdentity.kind", "artifact_component_kind"),
+    ("RuntimeArtifactIdentity.kind", "runtime_kind"),
+    ("ListAvailableArtifactsRequest.runtime_kind", "runtime_kind"),
+    ("Operation.action", "artifact_action"),
     ("Operation.state", "operation_state"),
     ("Operation.outcome", "operation_outcome"),
 ];
@@ -50,8 +52,13 @@ fn main() -> anyhow::Result<()> {
             ".space.execution.v1",
             "::pplx_space_execution_common::proto",
         )
-        .message_attribute(PACKAGE, "#[derive(serde::Serialize)]");
-    for (field, serializer) in ENUM_FIELDS {
+        .message_attribute(PACKAGE, "#[derive(serde::Serialize)]")
+        // Artifact identity preserves its runtime/component variant in JSON.
+        .enum_attribute(
+            format!("{PACKAGE}.ArtifactIdentity.artifact"),
+            "#[derive(serde::Serialize)] #[serde(rename_all = \"snake_case\")]",
+        );
+    for (field, serializer) in SERIALIZED_FIELDS {
         builder = builder.field_attribute(
             format!("{PACKAGE}.{field}"),
             format!("#[serde(serialize_with = \"crate::labels::serialize::{serializer}\")]"),

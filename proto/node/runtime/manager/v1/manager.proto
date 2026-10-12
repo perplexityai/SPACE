@@ -5,9 +5,11 @@ import "execution/v1/execution.proto";
 
 // Node-local runtime and kernel manager.
 //
-// It reports the runtime releases and guest kernels on the node and
-// installs and removes guest kernels. It does not own selection, and launches
-// do not depend on it: an install makes a kernel present, never selected.
+// It reports the runtime releases and guest kernels on the node and installs
+// and removes them. It does not own selection, and launches do not depend on
+// it: an install makes a release or kernel present, never selected. Existing
+// execution continues to use the existing image-provided roots. Managed
+// artifacts are excluded from launch, build, restore and placement discovery.
 service RuntimeManager {
   // Diagnostic listing of the configured vendor and cache layouts. Never
   // downloads, repairs aliases, adopts ownership, writes descriptors, or runs
@@ -18,29 +20,14 @@ service RuntimeManager {
   // local accounts. Reports provisioning; never repairs it.
   rpc GetStatus(GetStatusRequest) returns (GetStatusResponse);
 
-  // The guest kernels the kernel source offers for a runtime's release line
-  // and this node's architecture, with whether each is already here. Lists
-  // every line the node has a release of the runtime for when no line is
-  // named. A runtime the source publishes no kernels for fails with
-  // FAILED_PRECONDITION. Read-only; contacts the kernel source.
-  rpc ListAvailableKernels(ListAvailableKernelsRequest) returns (ListAvailableKernelsResponse);
-
-  // Download a kernel the source offers for a runtime line, verify it,
-  // and install it as space-managed. Returns the operation at once, queued
-  // behind any running one; the runtime manager owns the work from then on,
-  // so a caller that goes away changes nothing, and a restart resumes it. Installing a kernel already installed from the same
-  // source, or already present with the same bytes, succeeds without
-  // writing; a kernel of that version with different bytes fails with
-  // FAILED_PRECONDITION. Requires root or the local operator role. Disabled,
-  // with FAILED_PRECONDITION, unless the service was started with a kernel
-  // install root.
-  rpc InstallKernel(InstallKernelRequest) returns (InstallKernelResponse);
-
-  // Remove a kernel the runtime manager installed. Refuses external kernels
-  // and a kernel the root's default or legacy-default alias selects. Returns
-  // the operation at once, like an install. Requires root or the local
-  // operator role.
-  rpc UninstallKernel(UninstallKernelRequest) returns (UninstallKernelResponse);
+  // Catalog-authorized artifacts for this node. Does not affect execution.
+  rpc ListAvailableArtifacts(ListAvailableArtifactsRequest) returns (ListAvailableArtifactsResponse);
+  // Stage and verify bytes, then ask node-manager to publish them. Durable;
+  // disconnecting does not cancel the operation. Requires root/operator.
+  rpc InstallArtifact(InstallArtifactRequest) returns (InstallArtifactResponse);
+  // Delete this immutable identity from the managed store only. Existing
+  // execution/image artifacts cannot be addressed. Requires root/operator.
+  rpc UninstallArtifact(UninstallArtifactRequest) returns (UninstallArtifactResponse);
 
   rpc GetOperation(GetOperationRequest) returns (GetOperationResponse);
 
@@ -79,12 +66,11 @@ enum ArtifactProvenance {
   ARTIFACT_PROVENANCE_LEGACY_FLAT = 3;
 }
 
-// Who owns an artifact's bytes. Ownership comes from the runtime manager's
-// install records, not from the artifact's location.
+// Whether an artifact belongs to the separate managed store. This describes
+// its location, not installer provenance or permission to execute it.
 enum ArtifactManagement {
   ARTIFACT_MANAGEMENT_UNSPECIFIED = 0;
-  // Installed by the runtime manager, which may remove it under the
-  // uninstall rules.
+  // Located in the managed store; removal is subject to node-manager guards.
   ARTIFACT_MANAGEMENT_SPACE_MANAGED = 1;
   // Supplied by something else; listed, never modified, removed, or adopted.
   ARTIFACT_MANAGEMENT_EXTERNAL = 2;
@@ -184,7 +170,8 @@ message ExecutionArtifact {
   optional string architecture = 11;
   // From the known-release map; unset when the release is not in it.
   optional StateFormat state_format = 12;
-  // sha256:<hex> of a kernel image. Runtimes are not hashed.
+  // sha256:<hex> of a kernel image, or the aggregate release digest for a
+  // managed runtime's named binaries. Execution-root runtimes are not hashed.
   optional string digest = 13;
   ExecutionArtifactStatus status = 14;
   // Why the status is not valid, or why evidence is missing.
@@ -268,88 +255,72 @@ message ProtectedPath {
   repeated string problems = 4;
 }
 
-message ListAvailableKernelsRequest {
-  // The runtime whose kernels to list. Unspecified means the runtime the
-  // kernel source publishes for.
-  space.execution.v1.RuntimeKind runtime_kind = 1;
-  // A release line ("1.15") or release ("1.15.1") of the runtime.
-  optional string runtime_version = 2;
-}
-
-message ListAvailableKernelsResponse {
-  repeated AvailableKernel kernels = 1;
-  space.execution.v1.RuntimeKind runtime_kind = 2;
-  // The lines listed, as "1.15".
-  repeated string runtime_lines = 3;
-  // Where the kernels come from, such as s3://spec.ccfc.min/firecracker-ci.
-  string source = 4;
-}
-
-enum KernelPresence {
-  KERNEL_PRESENCE_UNSPECIFIED = 0;
-  KERNEL_PRESENCE_NOT_INSTALLED = 1;
-  // Installed by the runtime manager from this source entry.
-  KERNEL_PRESENCE_INSTALLED = 2;
-  // A kernel of this version is on the node but was not installed from this
-  // entry: external, or installed from another line.
-  KERNEL_PRESENCE_VERSION_PRESENT = 3;
-}
-
-message AvailableKernel {
-  // The kernel's version, which is also its install directory's name, such
-  // as 6.1.155 or 6.1.155-no-acpi.
-  string version = 1;
-  // The runtime line the source publishes the kernel for.
-  space.execution.v1.RuntimeKind runtime_kind = 2;
-  string runtime_line = 3;
-  string architecture = 4;
-  uint64 size = 5;
-  // The MD5 digest the source publishes. Kernels without one cannot be
-  // verified and are not installable.
-  optional string md5 = 6;
-  string source = 7;
-  KernelPresence presence = 8;
-}
-
-message InstallKernelRequest {
-  // The runtime, and its release line or release, whose kernels to install
-  // from.
-  space.execution.v1.RuntimeKind runtime_kind = 1;
-  string runtime_version = 2;
+// Identity of verified component bytes, independent of runtime compatibility
+// and source layout. A version alone never identifies bytes. Digest is sha256:<hex>.
+message ComponentIdentity {
+  space.execution.v1.ArtifactComponentKind kind = 1;
+  string digest = 2;
   string version = 3;
 }
 
-message InstallKernelResponse {
-  Operation operation = 1;
+// Lifecycle operations share an envelope; identity preserves the distinction
+// between a runtime release and a component usable by one or more runtimes.
+message RuntimeArtifactIdentity {
+  space.execution.v1.RuntimeKind kind = 1;
+  string version = 2;
+  // Digest over the release's pinned binaries, not its download archive.
+  string digest = 3;
 }
-
-message UninstallKernelRequest {
-  string version = 1;
+message ArtifactIdentity {
+  oneof artifact {
+    RuntimeArtifactIdentity runtime = 1;
+    ComponentIdentity component = 2;
+  }
 }
-
-message UninstallKernelResponse {
-  Operation operation = 1;
+message ListAvailableArtifactsRequest {
+  repeated ExecutionArtifactKind kinds = 1;
+  repeated space.execution.v1.ArtifactComponentKind component_kinds = 2;
+  // Optional runtime compatibility filter. A version may be a release line.
+  space.execution.v1.RuntimeKind runtime_kind = 3;
+  optional string runtime_version = 4;
 }
-
-enum OperationKind {
-  OPERATION_KIND_UNSPECIFIED = 0;
-  OPERATION_KIND_INSTALL_KERNEL = 1;
-  OPERATION_KIND_UNINSTALL_KERNEL = 2;
+message ListAvailableArtifactsResponse {
+  repeated AvailableArtifact artifacts = 1;
 }
+enum ArtifactPresence {
+  ARTIFACT_PRESENCE_UNSPECIFIED = 0;
+  ARTIFACT_PRESENCE_ABSENT = 1;
+  // The local slot exists. This is discovery evidence, not byte verification;
+  // install/delete recheck the immutable identity at the node-manager boundary.
+  ARTIFACT_PRESENCE_PRESENT = 2;
+  ARTIFACT_PRESENCE_UNREADABLE = 3;
+}
+message AvailableArtifact {
+  ArtifactIdentity identity = 1;
+  string architecture = 2;
+  optional uint64 size = 3;
+  string source = 4;
+  ArtifactPresence presence = 5;
+  repeated space.execution.v1.RuntimeIdentity compatible_runtimes = 6;
+}
+message InstallArtifactRequest { ArtifactIdentity identity = 1; }
+message InstallArtifactResponse { Operation operation = 1; }
+message UninstallArtifactRequest { ArtifactIdentity identity = 1; }
+message UninstallArtifactResponse { Operation operation = 1; }
 
 enum OperationState {
   OPERATION_STATE_UNSPECIFIED = 0;
   // Waiting for the operation ahead of it; one runs at a time.
   OPERATION_STATE_QUEUED = 1;
   OPERATION_STATE_DOWNLOADING = 2;
-  // Downloaded and verified; being published into the install root. Past
-  // cancelling.
+  // Downloaded and verified; node-manager is publishing it into the node's
+  // store. Past cancelling.
   OPERATION_STATE_PUBLISHING = 3;
   OPERATION_STATE_REMOVING = 4;
   OPERATION_STATE_CANCELLING = 5;
   OPERATION_STATE_SUCCEEDED = 6;
   // A transfer failure is retried a bounded number of times first; bytes
-  // that do not match what the source published are not.
+  // that do not match the pins are not.
   OPERATION_STATE_FAILED = 7;
   OPERATION_STATE_CANCELLED = 8;
 }
@@ -357,34 +328,43 @@ enum OperationState {
 enum OperationOutcome {
   OPERATION_OUTCOME_UNSPECIFIED = 0;
   OPERATION_OUTCOME_INSTALLED = 1;
-  // The runtime manager had already installed this kernel from this entry.
+  // The verified bytes were present when publication was retried or requested.
+  // This includes a retry after a successful publication lost its response.
   OPERATION_OUTCOME_ALREADY_INSTALLED = 2;
-  // An external kernel of this version already has these bytes. It stays
-  // external.
-  OPERATION_OUTCOME_PROVIDED_EXTERNALLY = 3;
+  // The managed copy is absent, including when it was already absent.
   OPERATION_OUTCOME_UNINSTALLED = 4;
 }
 
+// A kernel or runtime install or uninstall, tracked until it ends.
 message Operation {
   // UUIDv7.
   string operation_id = 1;
-  OperationKind kind = 2;
-  OperationState state = 3;
-  string kernel_version = 4;
-  // The runtime line an install is for; unset for uninstalls.
-  space.execution.v1.RuntimeKind runtime_kind = 5;
-  optional string runtime_line = 6;
-  optional string source = 7;
-  // Set once succeeded.
-  OperationOutcome outcome = 8;
-  // Why the operation failed or was cancelled.
-  optional string error = 9;
-  // The kernel's directory.
-  optional string path = 10;
-  // sha256:<hex> of the kernel image, once known.
-  optional string digest = 11;
-  int64 created_at_unix_ms = 12;
-  int64 updated_at_unix_ms = 13;
+  ArtifactIdentity identity = 2;
+  ArtifactAction action = 3;
+  OperationState state = 6;
+  // What a succeeded operation did; unspecified in every other state.
+  OperationOutcome outcome = 7;
+  // The last attempt's failure. A failed or cancelled operation's reason;
+  // also set while a transfer failure is retried.
+  optional string error = 8;
+  // Set once the operation reached the kernel's or release's directory.
+  OnDisk on_disk = 9;
+  int64 created_at_unix_ms = 10;
+  int64 updated_at_unix_ms = 11;
+}
+
+enum ArtifactAction {
+  ARTIFACT_ACTION_UNSPECIFIED = 0;
+  ARTIFACT_ACTION_INSTALL = 1;
+  ARTIFACT_ACTION_UNINSTALL = 2;
+}
+
+// A kernel or release directory an operation published, found, or removed.
+message OnDisk {
+  string path = 1;
+  // sha256:<hex> of a kernel image, or of a release's binaries as the
+  // runtime manager computes it.
+  string digest = 2;
 }
 
 message GetOperationRequest {

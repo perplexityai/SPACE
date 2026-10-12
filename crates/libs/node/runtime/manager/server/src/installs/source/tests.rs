@@ -1,5 +1,5 @@
 use super::*;
-use crate::kernels::test_support::fc_line;
+use crate::installs::test_support::fc_line;
 
 #[test]
 fn a_line_is_named_by_major_and_minor_with_or_without_patch_or_v() {
@@ -90,6 +90,7 @@ fn only_a_single_part_entity_tag_is_an_md5() {
 #[test]
 fn a_verifiable_kernel_round_trips_as_a_job_payload() {
     let kernel = VerifiableKernel {
+        digest: Digest::sha256([7; 32]),
         version: "6.1.155".parse().unwrap(),
         line: fc_line("1.15"),
         architecture: Arch::X86_64,
@@ -97,7 +98,7 @@ fn a_verifiable_kernel_round_trips_as_a_job_payload() {
             .parse()
             .unwrap(),
         size: 44_279_576,
-        md5: "44d1aea84475e5bed0dd4f27ddfca550".parse().unwrap(),
+        md5: Some("44d1aea84475e5bed0dd4f27ddfca550".parse().unwrap()),
     };
     let json = serde_json::to_value(&kernel).unwrap();
     assert_eq!(json["version"], "6.1.155");
@@ -116,22 +117,22 @@ fn a_verifiable_kernel_round_trips_as_a_job_payload() {
 }
 
 #[test]
-fn only_a_kernel_with_a_published_md5_is_verifiable() {
-    let listed = SourceKernel {
-        version: "6.1.155".parse().unwrap(),
-        line: fc_line("1.15"),
-        architecture: Arch::X86_64,
-        location: "s3://fake/k?region=us-east-1".parse().unwrap(),
-        size: 1,
-        md5: None,
-    };
-    assert_eq!(listed.verifiable(), None);
-    let md5 = ContentMd5::new([7; 16]);
-    let verifiable = SourceKernel {
-        md5: Some(md5),
-        ..listed
+fn a_download_request_preserves_optional_transfer_evidence() {
+    for md5 in [None, Some(ContentMd5::new([7; 16]))] {
+        let listed = SourceKernel {
+            version: "6.1.155".parse().unwrap(),
+            line: fc_line("1.15"),
+            architecture: Arch::X86_64,
+            location: "s3://fake/k?region=us-east-1".parse().unwrap(),
+            size: 1,
+            md5,
+        };
+        let request = listed.download_request(Digest::sha256([7; 32]));
+        let json = serde_json::to_value(&request).unwrap();
+        assert_eq!(request.md5, md5);
+        assert_eq!(
+            serde_json::from_value::<VerifiableKernel>(json).unwrap(),
+            request
+        );
     }
-    .verifiable()
-    .unwrap();
-    assert_eq!(verifiable.md5, md5);
 }

@@ -2,7 +2,6 @@
 
 use std::path::Path;
 
-use pplx_space_common_core::types::RuntimeVersionParseError;
 use pplx_space_execution_common::proto as execution;
 use pplx_space_node_runtime_core::runtime_inventory::diagnostic::{
     ArtifactKind, ArtifactLocation, ArtifactManagement, ArtifactOrigin, ArtifactProvenance,
@@ -11,39 +10,85 @@ use pplx_space_node_runtime_core::runtime_inventory::diagnostic::{
 };
 use pplx_space_node_runtime_manager_client::proto;
 
-use crate::kernels::{JobOutcome, KernelInstall, KernelOperation, Operation, OperationState};
+use crate::installs::{InstallOperation, JobOutcome, Operation, OperationState};
 use crate::protection::{AuditIdentity, PathReport, PathRole, Protection};
 
-/// Mark every scanned kernel an install record names as space-managed, and
-/// for the runtime line it was installed for: one found in the version
-/// directory the record installed. Copies elsewhere, such as a release's
-/// bundled kernel or a cache copy, stay external.
-pub(crate) fn mark_space_managed(
+pub(crate) fn mark_managed_store(
     scan: &mut ArtifactScan,
-    installs: &[KernelInstall],
-) -> Result<(), RuntimeVersionParseError> {
+    roots: &pplx_space_node_runtime_core::runtime_inventory::diagnostic::ScanRoots,
+) {
     for artifact in &mut scan.artifacts {
-        let installed = installs.iter().find(|install| {
-            matches!(artifact.origin.kind, ArtifactKind::Component(_))
-                && artifact.origin.provenance == ArtifactProvenance::VersionDirectory
-                && artifact.path.parent() == Some(install.path.as_path())
-        });
-        if let Some(install) = installed {
+        let in_store = match artifact.origin.kind {
+            ArtifactKind::Runtime(_) => roots
+                .managed_releases
+                .as_ref()
+                .is_some_and(|root| artifact.path.parent() == Some(root.path.as_path())),
+            ArtifactKind::Component(_) => roots.managed_kernels.as_ref().is_some_and(|root| {
+                artifact.path.parent().and_then(Path::parent) == Some(root.as_path())
+            }),
+        };
+        if in_store {
             artifact.management = ArtifactManagement::SpaceManaged;
-            artifact.for_runtime = Some(install.line.identity()?);
         }
     }
-    Ok(())
+}
+
+pub(crate) fn runtime_identity(
+    runtime: &pplx_space_common_core::types::RuntimeIdentity,
+    digest: pplx_space_common_core::types::Digest,
+) -> proto::ArtifactIdentity {
+    proto::ArtifactIdentity {
+        artifact: Some(proto::artifact_identity::Artifact::Runtime(
+            proto::RuntimeArtifactIdentity {
+                kind: execution::RuntimeKind::from(runtime.kind) as i32,
+                version: runtime.version.to_string(),
+                digest: digest.to_string(),
+            },
+        )),
+    }
+}
+pub(crate) fn component_identity(
+    identity: pplx_space_common_core::types::ComponentIdentity,
+) -> proto::ArtifactIdentity {
+    proto::ArtifactIdentity {
+        artifact: Some(proto::artifact_identity::Artifact::Component(component(
+            identity,
+        ))),
+    }
+}
+
+pub(crate) fn component(
+    identity: pplx_space_common_core::types::ComponentIdentity,
+) -> proto::ComponentIdentity {
+    proto::ComponentIdentity {
+        kind: execution::ArtifactComponentKind::from(identity.kind) as i32,
+        digest: identity.digest.to_string(),
+        version: identity.version.to_string(),
+    }
 }
 
 pub(crate) fn operation(operation: &Operation) -> proto::Operation {
-    let (kind, line, source) = match &operation.request {
-        KernelOperation::Install { kernel } => (
-            proto::OperationKind::InstallKernel,
-            Some(kernel.line),
-            Some(kernel.location.to_string()),
-        ),
-        KernelOperation::Uninstall { .. } => (proto::OperationKind::UninstallKernel, None, None),
+    let identity = match &operation.request {
+        InstallOperation::InstallKernel { kernel } => {
+            component_identity(pplx_space_common_core::types::ComponentIdentity {
+                kind: pplx_space_common_core::types::ArtifactComponentKind::Kernel,
+                version: kernel.version.artifact_version().clone(),
+                digest: kernel.digest,
+            })
+        }
+        InstallOperation::UninstallKernel { version, digest } => {
+            component_identity(pplx_space_common_core::types::ComponentIdentity {
+                kind: pplx_space_common_core::types::ArtifactComponentKind::Kernel,
+                version: version.artifact_version().clone(),
+                digest: *digest,
+            })
+        }
+        InstallOperation::InstallRelease { release, digest } => {
+            runtime_identity(&release.release, *digest)
+        }
+        InstallOperation::UninstallRelease { release, digest } => {
+            runtime_identity(release, *digest)
+        }
     };
     let (state, outcome) = match operation.state {
         OperationState::Queued => (proto::OperationState::Queued, None),
@@ -57,30 +102,24 @@ pub(crate) fn operation(operation: &Operation) -> proto::Operation {
     };
     proto::Operation {
         operation_id: operation.job_id.to_string(),
-        kind: kind as i32,
+        identity: Some(identity),
+        action: if operation.request.is_removal() {
+            proto::ArtifactAction::Uninstall
+        } else {
+            proto::ArtifactAction::Install
+        } as i32,
         state: state as i32,
-        kernel_version: operation.request.version().to_string(),
-        runtime_kind: line.map_or(execution::RuntimeKind::Unspecified, |line| {
-            execution::RuntimeKind::from(line.runtime)
-        }) as i32,
-        runtime_line: line.map(|line| line.release.to_string()),
-        source,
         outcome: match outcome {
             None => proto::OperationOutcome::Unspecified,
             Some(JobOutcome::Installed) => proto::OperationOutcome::Installed,
             Some(JobOutcome::AlreadyInstalled) => proto::OperationOutcome::AlreadyInstalled,
-            Some(JobOutcome::ProvidedExternally) => proto::OperationOutcome::ProvidedExternally,
             Some(JobOutcome::Uninstalled) => proto::OperationOutcome::Uninstalled,
         } as i32,
         error: operation.error.clone(),
-        path: operation
-            .kernel
-            .as_ref()
-            .map(|kernel| path_string(&kernel.path)),
-        digest: operation
-            .kernel
-            .as_ref()
-            .map(|kernel| kernel.digest.to_string()),
+        on_disk: operation.on_disk.as_ref().map(|on_disk| proto::OnDisk {
+            path: path_string(&on_disk.path),
+            digest: on_disk.digest.to_string(),
+        }),
         created_at_unix_ms: operation
             .created_at
             .map_or(0, jiff::Timestamp::as_millisecond),

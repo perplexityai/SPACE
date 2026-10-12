@@ -7,11 +7,9 @@
 //! public bucket. Callers name a runtime line and a kernel version; the
 //! runtime manager lists, downloads, and verifies.
 //!
-//! The source publishes no SHA-256. Each object's entity tag is its MD5 when
-//! it was uploaded in one part, which every kernel in the bucket is, so a
-//! download is checked against its listed size and MD5 and then identified by
-//! the SHA-256 the runtime manager computes. A kernel whose entity tag is not
-//! an MD5 cannot be verified and is not installable.
+//! Kernels are verified against the catalog's size and SHA-256 pins. An S3
+//! single-part entity tag additionally supplies an MD5 transfer checksum;
+//! multipart entity tags are not content digests and leave MD5 unset.
 
 use std::pin::Pin;
 use std::str::FromStr;
@@ -19,8 +17,8 @@ use std::time::Duration;
 
 use futures_util::Stream;
 use pplx_space_common_core::types::{
-    Arch, ArtifactVersion, RuntimeIdentity, RuntimeKind, RuntimeVersion, RuntimeVersionParseError,
-    StorageUri,
+    Arch, ArtifactVersion, Digest, RuntimeIdentity, RuntimeKind, RuntimeVersion,
+    RuntimeVersionParseError, StorageUri,
 };
 
 /// Firecracker's public CI artifact bucket. Path-style, because the bucket's
@@ -28,9 +26,8 @@ use pplx_space_common_core::types::{
 pub const FIRECRACKER_CI_KERNEL_SOURCE: &str =
     "s3://spec.ccfc.min/firecracker-ci?region=us-east-1&path_style=true";
 
-/// A release line of a runtime, `1.15`: kernel sources key kernels by major
-/// and minor version, so every patch release of a line boots the same
-/// kernels.
+/// A release line of a runtime, `1.15`: all patch releases in a line use
+/// the same catalog of guest kernels.
 #[derive(
     Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, serde::Serialize, serde::Deserialize,
 )]
@@ -213,6 +210,11 @@ impl KernelVersion {
         self.0.as_str()
     }
 
+    /// The version as the shared artifact vocabulary, and the catalog, name it.
+    pub fn artifact_version(&self) -> &ArtifactVersion {
+        &self.0
+    }
+
     /// The kernel release without the variant: `5.10.245` for
     /// `5.10.245-no-acpi`. What the image's own banner names.
     pub fn release(&self) -> &str {
@@ -309,17 +311,18 @@ pub struct SourceKernel {
 }
 
 impl SourceKernel {
-    /// The kernel as something that can be installed: only one whose MD5
-    /// the source published.
-    pub(crate) fn verifiable(&self) -> Option<VerifiableKernel> {
-        Some(VerifiableKernel {
+    /// Capture the authorized digest in the download request. Source transfer
+    /// metadata cannot change that identity on a retry.
+    pub(crate) fn download_request(&self, digest: Digest) -> VerifiableKernel {
+        VerifiableKernel {
+            digest,
             version: self.version.clone(),
             line: self.line,
             architecture: self.architecture,
             location: self.location.clone(),
             size: self.size,
-            md5: self.md5?,
-        })
+            md5: self.md5,
+        }
     }
 }
 
@@ -327,27 +330,29 @@ impl SourceKernel {
 /// and the request a kernel install job carries.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct VerifiableKernel {
+    /// Immutable catalog identity captured when the job is accepted.
+    pub digest: Digest,
     pub version: KernelVersion,
     pub line: RuntimeLine,
     pub architecture: Arch,
     #[serde(with = "storage_uri_text")]
     pub location: StorageUri,
     pub size: u64,
-    pub md5: ContentMd5,
+    pub md5: Option<ContentMd5>,
 }
 
 /// `StorageUri` in its `s3://` text form, which round-trips through parsing.
 pub(super) mod storage_uri_text {
     use pplx_space_common_core::types::StorageUri;
 
-    pub(in crate::kernels) fn serialize<S: serde::Serializer>(
+    pub(in crate::installs) fn serialize<S: serde::Serializer>(
         uri: &StorageUri,
         serializer: S,
     ) -> Result<S::Ok, S::Error> {
         serializer.collect_str(uri)
     }
 
-    pub(in crate::kernels) fn deserialize<'de, D: serde::Deserializer<'de>>(
+    pub(in crate::installs) fn deserialize<'de, D: serde::Deserializer<'de>>(
         deserializer: D,
     ) -> Result<StorageUri, D::Error> {
         let text = <String as serde::Deserialize>::deserialize(deserializer)?;
@@ -380,6 +385,12 @@ pub enum SourceError {
     },
     #[error("{location} is not an object in this source")]
     Foreign { location: Box<StorageUri> },
+    /// The listing ran past what a kernel line holds.
+    #[error("listing {location} passed {limit} entries; refusing a listing that large")]
+    ListingTooLarge {
+        location: Box<StorageUri>,
+        limit: usize,
+    },
 }
 
 pub type ByteChunks = Pin<Box<dyn Stream<Item = Result<bytes::Bytes, SourceError>> + Send>>;

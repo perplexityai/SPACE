@@ -26,6 +26,17 @@ macro_rules! proto_enum_labels {
 
         /// `serialize_with` targets named by the build script.
         pub(crate) mod serialize {
+            pub(crate) fn runtime_identities<S: serde::Serializer>(
+                values: &[crate::execution::RuntimeIdentity], serializer: S,
+            ) -> Result<S::Ok, S::Error> {
+                #[derive(serde::Serialize)]
+                struct Identity<'a> { kind: String, version: &'a str }
+                use serde::Serialize as _;
+                values.iter().map(|value| Identity {
+                    kind: super::label::<crate::execution::RuntimeKind>(value.kind),
+                    version: &value.version,
+                }).collect::<Vec<_>>().serialize(serializer)
+            }
             $(
                 pub(crate) fn $serializer<S: serde::Serializer>(
                     value: &i32,
@@ -50,8 +61,8 @@ proto_enum_labels! {
     crate::proto::ScanIssueKind => "SCAN_ISSUE_KIND_", scan_issue_kind;
     crate::proto::ProtectedPathRole => "PROTECTED_PATH_ROLE_", protected_path_role;
     crate::proto::PathProtection => "PATH_PROTECTION_", path_protection;
-    crate::proto::KernelPresence => "KERNEL_PRESENCE_", kernel_presence;
-    crate::proto::OperationKind => "OPERATION_KIND_", operation_kind;
+    crate::proto::ArtifactPresence => "ARTIFACT_PRESENCE_", artifact_presence;
+    crate::proto::ArtifactAction => "ARTIFACT_ACTION_", artifact_action;
     crate::proto::OperationState => "OPERATION_STATE_", operation_state;
     crate::proto::OperationOutcome => "OPERATION_OUTCOME_", operation_outcome;
     crate::execution::RuntimeKind => "RUNTIME_KIND_", runtime_kind;
