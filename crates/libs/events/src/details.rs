@@ -196,7 +196,6 @@ impl SandboxEventDetails {
         vcpu,
         memory_mib,
         disk_mib,
-        shape_source,
         guest_cid,
         guest_ip,
         guest_gateway,
@@ -316,6 +315,11 @@ impl SandboxEventDetails {
         self
     }
 
+    pub fn shape_source(mut self, value: CreateShapeSource) -> Self {
+        self.shape_source = Some(value.as_str().to_string());
+        self
+    }
+
     pub fn with_from_state(mut self, value: impl Into<String>) -> Self {
         self.from_state = Some(value.into());
         self
@@ -389,6 +393,31 @@ impl SandboxRestoreProvenance {
 impl std::fmt::Display for SandboxRestoreProvenance {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
+    }
+}
+
+/// Where a create's vCPU and memory came from, reported on `create_completed`.
+/// A partial request reports the fallback that filled the gap (`build` or
+/// `default`), not `request`. `default` means the node shim boots the unset
+/// fields at its fixed defaults.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CreateShapeSource {
+    Request,
+    PoolConfig,
+    Policy,
+    Build,
+    Default,
+}
+
+impl CreateShapeSource {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Request => "request",
+            Self::PoolConfig => "pool_config",
+            Self::Policy => "policy",
+            Self::Build => "build",
+            Self::Default => "default",
+        }
     }
 }
 

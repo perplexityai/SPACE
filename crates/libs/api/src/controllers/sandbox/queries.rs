@@ -15,7 +15,8 @@ use pplx_space_common_core::types::{DiskIoLimits, NodeId};
 use pplx_space_common_svc::space_api_route::wait_ready_lifecycle_request;
 use pplx_space_common_svc::types::ReconcileReason;
 use pplx_space_events::{
-    SandboxEvent, SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
+    CreateShapeSource, SandboxEvent, SandboxEventDetails, SandboxEventSource, SandboxEventTrigger,
+    SandboxEventType,
 };
 use pplx_space_net_common::TlsInterception;
 use pplx_space_public_api::OperationId;
@@ -566,31 +567,6 @@ struct KubernetesPoolAssignment {
     source: CreateShapeSource,
 }
 
-/// Where a Kubernetes create's vCPU and memory came from, reported on
-/// `create_completed`. A partial request reports the fallback that filled the
-/// gap (`build` or `default`), not `request`. `default` means the node shim
-/// boots the unset fields at its fixed defaults.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CreateShapeSource {
-    Request,
-    PoolConfig,
-    Policy,
-    Build,
-    Default,
-}
-
-impl CreateShapeSource {
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::Request => "request",
-            Self::PoolConfig => "pool_config",
-            Self::Policy => "policy",
-            Self::Build => "build",
-            Self::Default => "default",
-        }
-    }
-}
-
 /// Stamps `shape_source` on a `create_completed` event and counts it.
 fn with_shape_source(
     details: SandboxEventDetails,
@@ -602,7 +578,7 @@ fn with_shape_source(
         return details;
     };
     pplx_space_metrics::sandbox::api::create_shape_source(source.as_str(), runtime, template);
-    details.shape_source(source.as_str())
+    details.shape_source(source)
 }
 
 struct ColdCreateShapeInput<'a> {

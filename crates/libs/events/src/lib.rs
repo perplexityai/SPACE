@@ -10,7 +10,8 @@ pub use common::{
     SANDBOX_EVENT_SCHEMA_VERSION, SANDBOX_EVENT_STREAM, SandboxEvent, emit_sandbox_event,
 };
 pub use details::{
-    SandboxEventBoolField, SandboxEventDetails, SandboxEventTrigger, SandboxRestoreProvenance,
+    CreateShapeSource, SandboxEventBoolField, SandboxEventDetails, SandboxEventTrigger,
+    SandboxRestoreProvenance,
 };
 pub use event_type::{SANDBOX_EVENT_TYPES, SandboxEventType};
 pub use phase::SandboxEventPhase;
