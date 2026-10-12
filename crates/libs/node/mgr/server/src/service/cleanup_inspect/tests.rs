@@ -417,8 +417,8 @@ struct CleanupNode {
 impl CleanupNode {
     /// A bound, leased sandbox. Its test-owned supervisor refuses runtime
     /// stop, so a cleanup refusal that regresses ends there instead of
-    /// touching host artifacts or a real supervisor. The lease is claimed off
-    /// the Tokio runtime, so allocation never dials the fixed node-ctl socket.
+    /// touching host artifacts or a real supervisor. The pool records
+    /// node-status marks, so allocation never dials node-ctl.
     async fn leased() -> Self {
         let (supervisor_socket, client, supervisor) =
             crate::runtime_supervisor_client::tests::scripted_client(Default::default()).await;

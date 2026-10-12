@@ -28,7 +28,8 @@
 Follow "Privileged tests and the CI host" in `docs/rust/space-conventions.md`.
 
 - Never call `NetworkPool::open`; `NetworkPool::open_in_memory_for_test`
-  starts no host-networking worker.
+  starts no host-networking worker and records node-status marks instead of
+  notifying node-ctl. Never give a test pool `NodeCtlNodeStatusDirtySink`.
 - Unit-test services must not rely on host-reading defaults for runtime
   paths, memory admission, the lifecycle limiter or the supervisor client;
   inject test-owned ones.

@@ -1,4 +1,5 @@
 use super::*;
+use crate::node_state_sync::tests::RecordingNodeStatusDirtySink;
 use crate::runtime_supervisor_client::tests::{
     StubSupervisorServer, SupervisorScript, scripted_client, stop_supervisor_server,
 };
@@ -12,9 +13,10 @@ use tonic::Code;
 const AMPLE_NODE_MEMORY: &str = "MemTotal: 67108864 kB\nMemAvailable: 67108864 kB\n";
 
 /// A unit-test node manager with one ready slot, a measured node memory file,
-/// and a scripted runtime supervisor.
+/// a scripted runtime supervisor, and its pool's node-status marks recorded.
 struct Node {
     service: NodeManagerService,
+    node_status: Arc<RecordingNodeStatusDirtySink>,
     memory: tempfile::TempDir,
     _supervisor_socket: tempfile::TempDir,
     supervisor: StubSupervisorServer,
@@ -25,6 +27,11 @@ impl Node {
         let (supervisor_socket, client, supervisor) = scripted_client(script).await;
         let mut service = service_for_unit_tests().await;
         service.runtime_supervisor = client;
+        let node_status = Arc::new(RecordingNodeStatusDirtySink::default());
+        service.pool = NetworkPool::open_in_memory_with_node_status_sink_for_test(
+            NetworkPoolConfig::new(1),
+            node_status.clone(),
+        );
         service.pool.set_all_slots_ready_for_test();
         let memory = tempfile::tempdir().unwrap();
         std::fs::create_dir(memory.path().join("cgroups")).unwrap();
@@ -34,6 +41,7 @@ impl Node {
         );
         let node = Self {
             service,
+            node_status,
             memory,
             _supervisor_socket: supervisor_socket,
             supervisor,
@@ -300,7 +308,10 @@ async fn allocate_refusal_grants_no_lease(
         }
         AllocateRefusal::DrainingPool => node.service.pool.set_draining(true).unwrap(),
         AllocateRefusal::NoReadySlot => {
-            node.service.pool = NetworkPool::open_in_memory_for_test(NetworkPoolConfig::new(1));
+            node.service.pool = NetworkPool::open_in_memory_with_node_status_sink_for_test(
+                NetworkPoolConfig::new(1),
+                node.node_status.clone(),
+            );
         }
     }
 
@@ -343,6 +354,7 @@ async fn allocate_grants_a_lease_then_returns_it_without_new_admission() {
         )
     };
 
+    node.node_status.take();
     let granted = node
         .service
         .allocate(request(2048))
@@ -353,6 +365,10 @@ async fn allocate_grants_a_lease_then_returns_it_without_new_admission() {
     let lease = node.service.pool.get_record(&sandbox_id).unwrap().unwrap();
     assert_eq!(lease.state, SlotState::Leased);
     assert_eq!(lease.memory_reservation_mib, Some(2048));
+    assert!(
+        node.node_status.take() > 0,
+        "a granted lease must reach node-ctl's node status"
+    );
     assert_eq!(
         (
             granted.slot,
@@ -385,6 +401,11 @@ async fn allocate_grants_a_lease_then_returns_it_without_new_admission() {
         .unwrap()
         .into_inner();
     assert_eq!(retried, granted);
+    assert_eq!(
+        node.node_status.take(),
+        0,
+        "returning the existing lease changes no node status"
+    );
     node.stop().await;
 }
 

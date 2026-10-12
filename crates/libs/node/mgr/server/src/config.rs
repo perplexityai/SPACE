@@ -2,8 +2,9 @@
 //!
 //! Parsers stay with their domain owner; this is the single startup composition
 //! point. Loop-device sizing retains its separate live-pool policy. The service
-//! is handed its memory-admission sources and runtime-supervisor client from
-//! here rather than constructing them, so tests can substitute their own.
+//! is handed its memory-admission sources, runtime-supervisor client and
+//! node-status dirty sink from here rather than constructing them, so tests
+//! can substitute their own.
 
 use std::path::PathBuf;
 
@@ -17,6 +18,7 @@ pub(crate) struct ServiceSettings {
     pub guest_console_logs: bool,
     pub memory_admission_sources: crate::memory_admission::MemoryAdmissionSources,
     pub runtime_supervisor: crate::runtime_supervisor_client::RuntimeSupervisorLazyClient,
+    pub node_status_dirty: std::sync::Arc<dyn crate::node_state_sync::NodeStatusDirtySink>,
 }
 
 #[derive(Clone, Debug)]
@@ -77,6 +79,9 @@ impl ServiceSettings {
             ),
             memory_admission_sources: crate::memory_admission::MemoryAdmissionSources::default(),
             runtime_supervisor: crate::runtime_supervisor_client::RuntimeSupervisorLazyClient::new(
+            ),
+            node_status_dirty: std::sync::Arc::new(
+                crate::node_state_sync::NodeCtlNodeStatusDirtySink,
             ),
         };
         // Explicit non-secret fields, not a Debug dump of arbitrary config.

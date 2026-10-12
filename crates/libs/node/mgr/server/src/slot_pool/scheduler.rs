@@ -176,7 +176,7 @@ pub(super) fn recover_abandoned_work(
         )?;
         if changed != 0 {
             pool.startup_recovery_pending.store(true, Ordering::Relaxed);
-            crate::node_state_sync::mark_node_status_dirty();
+            pool.mark_node_status_dirty();
         }
     }
     Ok((next_cursor, destroying))

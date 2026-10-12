@@ -531,34 +531,28 @@ pub(super) mod service_tests {
         .into()
     }
 
-    /// Claims a pooled lease off the Tokio runtime. Allocation then skips its
-    /// node-status notification, whose detached retry task dials the node's
-    /// fixed node-ctl socket.
+    /// Claims a pooled lease without memory admission.
     pub(in crate::service) fn allocate_test_lease(
         service: &NodeManagerService,
         sandbox_id: &str,
     ) -> crate::net::SlotInfo {
         service.pool.set_all_slots_ready_for_test();
-        let (pool, sandbox_id) = (service.pool.clone(), sandbox_id.to_owned());
-        std::thread::spawn(move || {
-            match pool
-                .claim_allocation(
-                    &sandbox_id,
-                    None,
-                    Some(crate::slot_pool::NewLeaseMemoryReservation {
-                        memory_reservation_mib: 8320,
-                    }),
-                )
-                .unwrap()
-            {
-                crate::slot_pool::ClaimedSlotAllocation::Complete(lease) => lease,
-                crate::slot_pool::ClaimedSlotAllocation::Ephemeral(_) => {
-                    panic!("a ready pooled slot completes its claim synchronously")
-                }
+        match service
+            .pool
+            .claim_allocation(
+                sandbox_id,
+                None,
+                Some(crate::slot_pool::NewLeaseMemoryReservation {
+                    memory_reservation_mib: 8320,
+                }),
+            )
+            .unwrap()
+        {
+            crate::slot_pool::ClaimedSlotAllocation::Complete(lease) => lease,
+            crate::slot_pool::ClaimedSlotAllocation::Ephemeral(_) => {
+                panic!("a ready pooled slot completes its claim synchronously")
             }
-        })
-        .join()
-        .unwrap()
+        }
     }
 
     /// Root is authorized for every node-manager RPC without depending on the
@@ -633,7 +627,8 @@ pub(super) mod service_tests {
     /// admission read paths under a vacant temporary directory, so both fail
     /// closed instead of reading the node's installation, `/proc/meminfo` or
     /// its cgroups. Every runtime-supervisor RPC fails with `Unimplemented`
-    /// without contacting a supervisor. Lifecycle limits are the compiled-in
+    /// without contacting a supervisor. The pool records its node-status marks
+    /// instead of notifying node-ctl. Lifecycle limits are the compiled-in
     /// ones, whatever `SPACE_NODEMGR_LIMIT_*` the runner sets.
     pub(in crate::service) async fn service_for_unit_tests() -> NodeManagerService {
         let vacant = vacant_test_root();

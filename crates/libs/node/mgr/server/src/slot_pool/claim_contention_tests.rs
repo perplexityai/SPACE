@@ -171,8 +171,8 @@ fn startup_leasing_reprobe_skips_claimed_sandboxes_and_keeps_the_obligation() {
 }
 
 /// Only the deferred exit is pinned here. An admitted reset reaches host
-/// cleanup (node-ctl notification, cgroupfs, the fixed cache root and network
-/// teardown), so it stays out of this unit layer.
+/// cleanup (cgroupfs, the fixed cache root and network teardown), so it stays
+/// out of this unit layer.
 #[cfg(unix)]
 #[tokio::test(flavor = "current_thread")]
 async fn reset_slot_defers_a_claimed_sandbox_and_requeues_itself() {

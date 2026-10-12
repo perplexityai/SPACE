@@ -313,13 +313,20 @@ impl NodeManagerService {
         let pool_tracker = task_tracker.clone();
         let memory_mib = sandbox_cgroup_config.memory_mib_or_default();
         let span = tracing::Span::current();
+        let node_status_dirty = settings.node_status_dirty;
         // Startup host commands must not stall liveness. Track and await the
         // whole pass; shutdown cannot abandon namespace mutations under ownership.
         let pool = task_tracker
             .spawn_blocking(move || {
                 let _ownership = startup_ownership;
                 let _entered = span.enter();
-                NetworkPool::open(config, memory_mib, pool_tracker, shutdown_token)
+                NetworkPool::open(
+                    config,
+                    memory_mib,
+                    pool_tracker,
+                    shutdown_token,
+                    node_status_dirty,
+                )
             })
             .await
             .map_err(crate::slot_pool::PoolOpenError::StartupTask)??;

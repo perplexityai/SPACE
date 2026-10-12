@@ -3,7 +3,7 @@
 use std::path::Path;
 use std::time::Duration;
 
-use pplx_space_node_mgr::slot_pool::{NetworkPool, NetworkPoolConfig};
+use pplx_space_node_mgr::slot_pool::{NetworkPool, NetworkPoolConfig, NodeCtlNodeStatusDirtySink};
 use pplx_space_node_mgr::{firewall, net};
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
@@ -46,7 +46,13 @@ async fn recover_pool() -> Result<(), Box<dyn std::error::Error>> {
     NetworkPool::validate_startup(&config, db)?;
     let tracker = TaskTracker::new();
     let shutdown = CancellationToken::new();
-    let pool = NetworkPool::open(config, 128, tracker.clone(), shutdown.clone())?;
+    let pool = NetworkPool::open(
+        config,
+        128,
+        tracker.clone(),
+        shutdown.clone(),
+        std::sync::Arc::new(NodeCtlNodeStatusDirtySink),
+    )?;
     let recovered = tokio::time::timeout(Duration::from_secs(15), async {
         while pool.counts()?.ready != 3 {
             tokio::time::sleep(Duration::from_millis(20)).await;

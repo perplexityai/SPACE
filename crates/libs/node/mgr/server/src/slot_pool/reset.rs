@@ -244,7 +244,7 @@ pub(super) async fn reset_slot(pool: std::sync::Arc<NetworkPool>, slot_id: u32) 
     };
     clear_stale_cleanup_reset_db_failures_for_slot(&pool, slot_id, &reset_key);
     clear_stale_transient_reset_failures_for_slot(&pool, slot_id, &reset_key);
-    crate::node_state_sync::mark_node_status_dirty();
+    pool.mark_node_status_dirty();
 
     let reset_kind = if record.lease_kind == LeaseKind::Pooled && config.warm_pool_enabled() {
         LeaseKind::Pooled
@@ -412,7 +412,7 @@ pub(super) async fn reset_slot(pool: std::sync::Arc<NetworkPool>, slot_id: u32) 
                 elapsed_ms = reset_started.elapsed().as_millis() as u64,
                 "network slot reset completed"
             );
-            crate::node_state_sync::mark_node_status_dirty();
+            pool.mark_node_status_dirty();
             claim.disarm();
             pool.rebalance_ready_slots();
         }
@@ -451,7 +451,7 @@ pub(super) async fn reset_slot(pool: std::sync::Arc<NetworkPool>, slot_id: u32) 
                     ) {
                         Ok(changed) if changed > 0 => {
                             clear_cleanup_reset_db_failure(&pool, &reset_key);
-                            crate::node_state_sync::mark_node_status_dirty();
+                            pool.mark_node_status_dirty();
                         }
                         Ok(_) => {
                             clear_cleanup_reset_db_failure(&pool, &reset_key);
@@ -513,7 +513,7 @@ pub(super) async fn reset_slot(pool: std::sync::Arc<NetworkPool>, slot_id: u32) 
                                 ) {
                                     Ok(changed) if changed > 0 => {
                                         clear_cleanup_reset_db_failure(&pool, &reset_key);
-                                        crate::node_state_sync::mark_node_status_dirty();
+                                        pool.mark_node_status_dirty();
                                     }
                                     Ok(_) => {
                                         clear_cleanup_reset_db_failure(&pool, &reset_key);
@@ -560,7 +560,7 @@ pub(super) async fn reset_slot(pool: std::sync::Arc<NetworkPool>, slot_id: u32) 
                         ) {
                             Ok(changed) if changed > 0 => {
                                 clear_cleanup_reset_db_failure(&pool, &reset_key);
-                                crate::node_state_sync::mark_node_status_dirty();
+                                pool.mark_node_status_dirty();
                             }
                             Ok(_) => {
                                 clear_cleanup_reset_db_failure(&pool, &reset_key);
@@ -600,7 +600,7 @@ pub(super) async fn reset_slot(pool: std::sync::Arc<NetworkPool>, slot_id: u32) 
                         ],
                     ) {
                         Ok(changed) if changed > 0 => {
-                            crate::node_state_sync::mark_node_status_dirty();
+                            pool.mark_node_status_dirty();
                         }
                         Ok(_) => {
                             clear_cleanup_reset_db_failure(&pool, &reset_key);
@@ -638,7 +638,7 @@ pub(super) async fn reset_slot(pool: std::sync::Arc<NetworkPool>, slot_id: u32) 
                         ) {
                             Ok(changed) if changed > 0 => {
                                 clear_transient_reset_failure(&pool, &reset_key);
-                                crate::node_state_sync::mark_node_status_dirty();
+                                pool.mark_node_status_dirty();
                             }
                             Ok(_) => {
                                 clear_transient_reset_failure(&pool, &reset_key);
@@ -678,7 +678,7 @@ pub(super) async fn reset_slot(pool: std::sync::Arc<NetworkPool>, slot_id: u32) 
                         ],
                     ) {
                         Ok(changed) if changed > 0 => {
-                            crate::node_state_sync::mark_node_status_dirty();
+                            pool.mark_node_status_dirty();
                         }
                         Ok(_) => {
                             clear_cleanup_reset_db_failure(&pool, &reset_key);
@@ -701,7 +701,7 @@ pub(super) async fn reset_slot(pool: std::sync::Arc<NetworkPool>, slot_id: u32) 
                     match quarantine_resetting_slot(&conn, &reset_key, &error.to_string()) {
                         Ok(changed) if changed > 0 => {
                             clear_cleanup_reset_db_failure(&pool, &reset_key);
-                            crate::node_state_sync::mark_node_status_dirty();
+                            pool.mark_node_status_dirty();
                         }
                         Ok(_) => {
                             clear_cleanup_reset_db_failure(&pool, &reset_key);
