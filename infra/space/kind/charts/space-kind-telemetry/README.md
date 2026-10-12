@@ -29,5 +29,8 @@ exporter is `otlp`, so `off` mode renders `off` for both and no endpoints.
 `telemetry.otlpProtocol` defaults to `grpc` and supplies both per-signal
 protocol variables. The generic `OTEL_EXPORTER_OTLP_ENDPOINT` is not emitted.
 Logs stay on stdout for Alloy to collect; they need no endpoint. The
-node-hosted shim cannot use pod DNS, so it addresses each Collector by the
-fixed ClusterIP that chart's Kind profile pins.
+node-hosted shim and runtime-supervisor cannot use pod DNS, so they address
+each Collector by the fixed ClusterIP that chart's Kind profile pins.
+`telemetry.nodeOtlpMetricsEndpoint` and `telemetry.nodeOtlpTracesEndpoint`
+carry those addresses to `space-node-manager-local`, which writes the
+supervisor's node environment; bring-up sets both, and no pod reads them.

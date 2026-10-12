@@ -8,5 +8,11 @@ telemetry:
   traceExporter: auto
   otlpMetricsEndpoint: "http://collector.space-metrics.svc.cluster.local:4317"
   otlpTracesEndpoint: "http://collector.space-traces.svc.cluster.local:4317"
+  # The same Collectors as a process on the Kind node reaches them, without
+  # cluster DNS: the host runtime-supervisor's node environment, which
+  # space-node-manager-local writes. Bring-up sets both from
+  # scripts/telemetry_config.py; unset, that environment names no endpoint.
+  nodeOtlpMetricsEndpoint: ""
+  nodeOtlpTracesEndpoint: ""
   otlpProtocol: grpc
   traceSampler: ""

@@ -20,7 +20,8 @@
 #   SPACE_KIND_TELEMETRY_MODE otel (default), datadog, or off
 #   SPACE_KIND_SHIM_OTLP_ENDPOINT OTLP/gRPC trace endpoint visible from the
 #                         kind node (otel default: the traces Collector's fixed
-#                         ClusterIP; other modes retain http://127.0.0.1:4317)
+#                         ClusterIP; other modes retain http://127.0.0.1:4317);
+#                         the host runtime-supervisor follows it too
 #   SPACE_KIND_SHIM_ENV   trace environment identity (default: local-<hostname>)
 set -euo pipefail
 

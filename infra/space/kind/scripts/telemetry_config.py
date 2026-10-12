@@ -154,7 +154,7 @@ def configuration(env):
             raise ValueError(f"SPACE_KIND_SHIM_OTLP_ENDPOINT {rejection}")
     version = f"{revision}-{phase}" if revision and phase else revision
     metrics, traces = MODES[mode]
-    return {
+    config = {
         "mode": mode,
         "kind_cluster": kind_cluster,
         "cluster_id": cluster_id,
@@ -176,22 +176,30 @@ def configuration(env):
             f"clusterId={cluster_id}",
         ],
     }
+    # The host runtime-supervisor's node environment (space-node-manager-local)
+    # needs the Collectors at addresses the node reaches, as the shim does.
+    config["helm_set"] += [
+        f"telemetry.nodeOtlpMetricsEndpoint={collector_endpoint(config, 'metrics')}",
+        f"telemetry.nodeOtlpTracesEndpoint={collector_endpoint(config, 'traces')}",
+    ]
+    return config
 
 
-# Each signal has its own Collector Service; the shim needs both. containerd
-# runs the shim on the Kind node, which has no cluster DNS, so the wrapper names
-# each Service by the fixed ClusterIP that chart's profiles/kind.yaml pins as
-# collector.clusterIP; change the two together. Because it is fixed rather than
-# looked up, the wrapper can be written before the Collectors exist and stays
-# right when they are reinstalled.
-SHIM_COLLECTORS = {"metrics": "10.96.0.20", "traces": "10.96.0.21"}
+# Each signal has its own Collector Service. containerd runs the shim, and
+# systemd the runtime-supervisor, on the Kind node, which has no cluster DNS, so
+# both name each Service by the fixed ClusterIP that chart's profiles/kind.yaml
+# pins as collector.clusterIP; change the two together. Because it is fixed
+# rather than looked up, the shim wrapper and the supervisor's node environment
+# can be written before the Collectors exist and stay right when they are
+# reinstalled.
+NODE_COLLECTORS = {"metrics": "10.96.0.20", "traces": "10.96.0.21"}
 
 
 def collector_endpoint(config, signal):
     """A node-reachable OTLP endpoint for one signal's Collector."""
     if config["shim_endpoint"] is not None:
         return config["shim_endpoint"]
-    return f"http://{SHIM_COLLECTORS[signal]}:4317"
+    return f"http://{NODE_COLLECTORS[signal]}:4317"
 
 
 def shim_endpoint(config):

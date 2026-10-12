@@ -47,6 +47,81 @@ spec:
       hostPID: true
       terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds | int }}
       initContainers:
+        # Kind-only, ahead of the production init: the node's
+        # /space/config/space.env, the EnvironmentFile of the host
+        # space-runtime-supervisor.service (scripts/k8s/node-manager-init.sh).
+        # A production node's bootstrap writes that file. A Kind node has no
+        # bootstrap, so without this the supervisor ignores the telemetry
+        # selector and keeps exporting to a Datadog Agent that is not there.
+        # The file holds this pod's telemetry settings and nothing else, with
+        # each Collector at the address the node reaches without cluster DNS,
+        # as the shim's wrapper names it (scripts/telemetry_config.py). A
+        # changed file marks the restart node-manager already performs for a
+        # staged supervisor: the production init below defers it while the
+        # node's current node-manager runs, and this pod's node-manager makes
+        # it once it holds the service mutex. On a new node there is no
+        # supervisor yet, and the init below starts it with this file.
+        - name: kind-node-env
+          {{- include "space-node-service.image" . | nindent 10 }}
+          command:
+            - /bin/bash
+            - -ec
+            - |
+              env_file=/space/config/space.env
+              written=$(
+                for name in SPACE_CLUSTER_ID SPACE_K8S_NODE_NAME DD_ENV DD_VERSION \
+                    SPACE_ENV SPACE_VERSION DD_TAGS OTEL_RESOURCE_ATTRIBUTES \
+                    DD_TRACE_ENABLED DD_AGENT_HOST DD_DOGSTATSD_PORT \
+                    SPACE_METRICS_SINK SPACE_TRACE_EXPORTER \
+                    OTEL_EXPORTER_OTLP_METRICS_PROTOCOL \
+                    OTEL_EXPORTER_OTLP_TRACES_PROTOCOL OTEL_TRACES_SAMPLER; do
+                  if [[ -v $name ]]; then printf '%s=%s\n' "$name" "${!name}"; fi
+                done
+                # Present exactly when the mode exports that signal over OTLP.
+                if [[ -v OTEL_EXPORTER_OTLP_METRICS_ENDPOINT && -n $NODE_OTLP_METRICS_ENDPOINT ]]; then
+                  printf 'OTEL_EXPORTER_OTLP_METRICS_ENDPOINT=%s\n' "$NODE_OTLP_METRICS_ENDPOINT"
+                fi
+                if [[ -v OTEL_EXPORTER_OTLP_TRACES_ENDPOINT && -n $NODE_OTLP_TRACES_ENDPOINT ]]; then
+                  printf 'OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=%s\n' "$NODE_OTLP_TRACES_ENDPOINT"
+                fi
+              )
+              if [[ -f $env_file && "$(<"$env_file")" == "$written" ]]; then
+                echo "kind-node-env: $env_file unchanged"
+                exit 0
+              fi
+              printf '%s\n' "$written" >"$env_file.tmp"
+              chmod 0600 "$env_file.tmp"
+              mv -f "$env_file.tmp" "$env_file"
+              echo "kind-node-env: wrote $env_file"
+              if [[ -d /space/run/runtime-supervisor ]]; then
+                touch /space/run/runtime-supervisor/restart-required
+                echo "kind-node-env: marked runtime-supervisor for restart"
+              fi
+          # Root for the root-owned node paths it writes, and nothing more.
+          securityContext:
+            runAsUser: 0
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          env:
+            - name: SPACE_CLUSTER_ID
+              value: {{ .Values.clusterId | quote }}
+            # The resolver drops a node name inherited through
+            # OTEL_RESOURCE_ATTRIBUTES; it reads this setting instead.
+            - name: SPACE_K8S_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            {{- include "space-kind-telemetry.env" . | nindent 12 }}
+            - name: NODE_OTLP_METRICS_ENDPOINT
+              value: {{ .Values.telemetry.nodeOtlpMetricsEndpoint | quote }}
+            - name: NODE_OTLP_TRACES_ENDPOINT
+              value: {{ .Values.telemetry.nodeOtlpTracesEndpoint | quote }}
+          volumeMounts:
+            - name: space-config
+              mountPath: /space/config
+            {{- include "space-node-service.mount.run" . | nindent 12 }}
         # The production node-manager init path, unmodified: stages the host
         # binaries under /space/bin/releases/<tag>, prepares /space/run, stages
         # the guest kernel into /space/cache, and installs, starts or schedules
@@ -187,6 +262,10 @@ spec:
         - name: space-etc
           hostPath:
             path: /space/etc
+            type: DirectoryOrCreate
+        - name: space-config
+          hostPath:
+            path: /space/config
             type: DirectoryOrCreate
         - name: netns
           hostPath:

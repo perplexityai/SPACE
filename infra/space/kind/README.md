@@ -282,8 +282,9 @@ it for the Kind smoke shards, which test sandbox lifecycle rather than
 telemetry.
 
 To export to a receiver you run yourself, stay in `otel` mode, set
-`SPACE_KIND_SHIM_OTLP_ENDPOINT` for the shim and override the workload
-endpoints below. The local backends are still installed alongside it.
+`SPACE_KIND_SHIM_OTLP_ENDPOINT` for the shim and runtime-supervisor, and
+override the workload endpoints below. The local backends are still installed
+alongside it.
 
 Rust workloads send metrics to
 `http://collector.space-metrics.svc.cluster.local:4317` and traces to
@@ -454,6 +455,13 @@ allocation avoids. The shim can therefore be installed before the Collectors,
 and reinstalling them does not leave the wrapper with a stale address. Set
 `SPACE_KIND_SHIM_OTLP_ENDPOINT` to send both signals to another OTLP/gRPC
 receiver reachable from the Kind node instead.
+
+The host runtime-supervisor is the other SPACE process outside a pod. Its unit
+reads `/space/config/space.env`, which node-manager's Kind-only `kind-node-env`
+init container writes from the same selector: the pods' telemetry settings,
+with each OTLP endpoint replaced by the fixed address above, or by
+`SPACE_KIND_SHIM_OTLP_ENDPOINT` when that is set. Check it with
+`docker exec <node> cat /space/config/space.env`.
 
 A Collector installed before its address was pinned keeps the ClusterIP it was
 allocated, which Kubernetes will not change in place: `local.sh up` fails with
@@ -766,7 +774,7 @@ reflector use) and `app.kubernetes.io/part-of=space-node`.
 | Service | Identity | Pod shape | Why (public code) |
 |---|---|---|---|
 | node-manager | root | privileged, hostNetwork, hostPID; `/space/cache` and `/var/run/netns` Bidirectional; `/sys/fs/cgroup`, `/space/bin`, `/space/etc`, `/space/vendor`, `/dev/kvm`; projected token for the credential-manager authority | mounts jail rootfs and late snapshot-memory binds that must reach the host jailer, netns binds the host jailer and sidecar launcher open, loop and device-mapper devices, cgroup limits, root-namespace veth/nft/ip_forward, pidfds on host processes (`crates/libs/node/mgr/server`); init container `node-manager-init.sh` writes the node's systemd unit via `nsenter --target 1` |
-| runtime-supervisor | root | host systemd unit, no pod | `scripts/k8s/node-manager-init.sh`, `node-manager-runtime-supervisor.sh` |
+| runtime-supervisor | root | host systemd unit, no pod; environment from `/space/config/space.env`, which node-manager's Kind-only `kind-node-env` init container writes | `scripts/k8s/node-manager-init.sh`, `node-manager-runtime-supervisor.sh` |
 | runtime-manager | space-rtmgr + space-rtmgrclients | non-root, no capabilities, read-only rootfs; `/space/vendor`, `/space/bin`, `/space/cache` read-only | lists runtimes and kernels |
 | volume-manager | space-volmgr + SPACE_VOLUME_MANAGER_GROUPS | non-root, no capabilities, read-only rootfs; `/space/cache` HostToContainer | file transfers only (`crates/libs/vol/mgr/server`); the separate identity `docs/installation.md` describes: node-manager's btrfs send-lease RPCs authorize it and credential-manager serves it on the volume socket |
 | credential-manager | space-sbxmgr + SPACE_CREDENTIAL_MANAGER_GROUPS | non-root, no capabilities, read-only rootfs; `/space/run` only; projected token for the authority | the node credential agent (`--role=agent`): sockets only, forwarding to `space-credmgr-authority`; no database, KEK or AWS credential; its peer-process check (`SPACE_UDS_PEER_PROCESS_CHECK`) is off, so no host PID namespace |
@@ -852,7 +860,12 @@ holds its mutex (`SPACE_NODEMGR_ACTIVATE_RUNTIME_SUPERVISOR_ON_START=true`,
 directory by its image tag; every Kind build is tagged `local`, so the chart
 passes the digest of the staged binaries and the compatibility file as
 `SPACE_IMAGE_TAG`. Firecracker jails therefore live in the node's mount
-namespace and outlive every service pod. Inspect it with
+namespace and outlive every service pod. The unit reads
+`/space/config/space.env`, which a production node's bootstrap writes; on Kind
+the chart's `kind-node-env` init container writes it first (see the shim's
+telemetry below) and touches `restart-required` when it changes, so a new
+telemetry mode reaches a running supervisor through the same deferred restart.
+Inspect it with
 `docker exec <node> systemctl status space-runtime-supervisor` and
 `docker exec <node> journalctl -u space-runtime-supervisor`.
 
