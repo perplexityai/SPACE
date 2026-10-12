@@ -13,6 +13,7 @@ use crate::space_api_route::SPACE_API_BRIDGE_CALLER_POLICY_METADATA_KEY;
 
 pub mod build;
 pub mod template;
+pub mod template_transfer;
 
 #[cfg(all(feature = "k8s", any(test, feature = "test-support")))]
 pub mod test_support;
@@ -290,6 +291,7 @@ pub struct NodeApiAuthenticatedCaller {
     network_policy_authority: NetworkPolicyMutationAuthority,
     data_plane_session_refresh_authority: DataPlaneSessionRefreshAuthority,
     template_release_read_authority: TemplateReleaseReadAuthority,
+    template_transfer_authority: template_transfer::TemplateTransferAuthority,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -390,6 +392,15 @@ impl NodeApiAuthenticatedCaller {
             network_policy_authority,
             data_plane_session_refresh_authority,
             template_release_read_authority,
+            template_transfer_authority: match mode {
+                KubernetesAuthenticationMode::Disabled => {
+                    template_transfer::TemplateTransferAuthority::Granted
+                }
+                #[cfg(feature = "k8s")]
+                KubernetesAuthenticationMode::Configured => {
+                    template_transfer::TemplateTransferAuthority::Denied
+                }
+            },
         }
     }
 
@@ -404,6 +415,7 @@ impl NodeApiAuthenticatedCaller {
             network_policy_authority,
             data_plane_session_refresh_authority,
             template_release_read_authority: TemplateReleaseReadAuthority::NodeScoped,
+            template_transfer_authority: template_transfer::TemplateTransferAuthority::Denied,
         }
     }
 
@@ -416,6 +428,7 @@ impl NodeApiAuthenticatedCaller {
             network_policy_authority: NetworkPolicyMutationAuthority::Denied,
             data_plane_session_refresh_authority: DataPlaneSessionRefreshAuthority::Granted,
             template_release_read_authority: TemplateReleaseReadAuthority::NodeScoped,
+            template_transfer_authority: template_transfer::TemplateTransferAuthority::Denied,
         }
     }
 
@@ -427,6 +440,7 @@ impl NodeApiAuthenticatedCaller {
             network_policy_authority: NetworkPolicyMutationAuthority::Denied,
             data_plane_session_refresh_authority: DataPlaneSessionRefreshAuthority::Denied,
             template_release_read_authority: TemplateReleaseReadAuthority::NodeScoped,
+            template_transfer_authority: template_transfer::TemplateTransferAuthority::Denied,
         }
     }
 
@@ -440,6 +454,12 @@ impl NodeApiAuthenticatedCaller {
 
     pub const fn data_plane_session_refresh_authority(&self) -> DataPlaneSessionRefreshAuthority {
         self.data_plane_session_refresh_authority
+    }
+
+    pub const fn template_transfer_authority(
+        &self,
+    ) -> template_transfer::TemplateTransferAuthority {
+        self.template_transfer_authority
     }
 
     pub const fn template_release_read_authority(&self) -> TemplateReleaseReadAuthority {

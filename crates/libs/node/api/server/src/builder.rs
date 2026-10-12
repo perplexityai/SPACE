@@ -215,6 +215,8 @@ impl BuilderApi for BuilderApiService {
         &self,
         r: Request<pplx_space_template_mgr_client::proto::ExportTemplateRequest>,
     ) -> Result<Response<Self::NodeExportTemplateStream>, Status> {
+        let mut r = r;
+        pplx_space_common_svc::auth::template_transfer::prepare_template_export(&mut r)?;
         Ok(self.clients.tmpl().export_template(r).await?)
     }
 
@@ -222,6 +224,7 @@ impl BuilderApi for BuilderApiService {
         &self,
         r: Request<crate::proto::PullTemplateRequest>,
     ) -> Result<Response<crate::proto::PullTemplateResponse>, Status> {
+        pplx_space_common_svc::auth::template_transfer::require_template_transfer_authority(&r)?;
         let req = r.into_inner();
         let resp = crate::transfer::pull_template(&mut self.clients.tmpl(), &req).await?;
         Ok(Response::new(resp))

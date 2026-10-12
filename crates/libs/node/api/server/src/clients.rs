@@ -84,6 +84,9 @@ mod policy_auth_tests;
 #[cfg(all(test, feature = "k8s"))]
 mod template_auth_tests;
 
+#[cfg(all(test, feature = "k8s"))]
+mod template_transfer_auth_tests;
+
 #[cfg(test)]
 mod stream_tests;
 

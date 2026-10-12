@@ -25,6 +25,7 @@ fn test_k8s_config() -> K8sTokenAuthConfig {
         node_api_trusted_policy_usernames: BTreeSet::from([
             "system:serviceaccount:space:space-api".to_string(),
         ]),
+        template_transfer_usernames: BTreeSet::new(),
         node_api_internal_allowed_usernames: BTreeSet::from([
             "system:serviceaccount:space:space-sandbox-manager".to_string(),
         ]),

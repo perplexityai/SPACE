@@ -47,11 +47,11 @@ pub(super) fn auth_layer(
         ("SPACE_K8S_TOKEN_AUTH_STATIC_FALLBACK_ENABLED", "true"),
         (
             "SPACE_NODE_API_AUTH_ALLOWED_SERVICE_ACCOUNTS",
-            "space-api,workers,observer,space-data-plane",
+            "space-api,workers,observer,space-data-plane,policy-only",
         ),
         (
             "SPACE_NODE_API_INTERNAL_AUTH_ALLOWED_SERVICE_ACCOUNTS",
-            "space-api,workers,observer,space-data-plane",
+            "space-api,workers,observer,space-data-plane,policy-only",
         ),
         (
             "SPACE_NODE_API_AUTH_TRUSTED_WAIT_READY_SERVICE_ACCOUNTS",
@@ -59,7 +59,11 @@ pub(super) fn auth_layer(
         ),
         (
             "SPACE_NODE_API_AUTH_TRUSTED_POLICY_SERVICE_ACCOUNTS",
-            "space-api",
+            "space-api,policy-only",
+        ),
+        (
+            "SPACE_NODE_API_AUTH_TEMPLATE_TRANSFER_SERVICE_ACCOUNTS",
+            "space-api,workers,space-data-plane",
         ),
         (
             "SPACE_NODE_API_AUTH_GUEST_BRIDGE_SERVICE_ACCOUNTS",
@@ -300,14 +304,45 @@ pub(super) async fn backend() -> (
     let recorded_calls = calls.clone();
     // Acknowledging backend: success and the count prove a real handler forwarded
     // the request; denial must leave it untouched. No manager/database is needed.
-    let backend = Router::new().fallback(any(move || {
+    let backend = Router::new().fallback(any(move |request: http::Request<Body>| {
         let calls = recorded_calls.clone();
         async move {
+            if request.uri().path().ends_with("/ExportTemplate") {
+                assert_eq!(
+                    request
+                        .headers()
+                        .get("x-space-template-transfer-authority")
+                        .expect("authenticated transfer marker"),
+                    "granted"
+                );
+            }
             calls.fetch_add(1, Ordering::SeqCst);
+            let payload = if request.uri().path().ends_with("/GetTemplate") {
+                use prost::Message;
+                tmpl::GetTemplateResponse {
+                    template: Some(tmpl::TemplateRef {
+                        name: "example-template".into(),
+                        content_hash: Some(format!("sha256:{}", "a".repeat(64))),
+                        tag: None,
+                    }),
+                    state: "ready".into(),
+                    ..Default::default()
+                }
+                .encode_to_vec()
+            } else {
+                Vec::new()
+            };
+            let mut frame = vec![0];
+            frame.extend_from_slice(
+                &u32::try_from(payload.len())
+                    .expect("test payload fits gRPC frame")
+                    .to_be_bytes(),
+            );
+            frame.extend(payload);
             http::Response::builder()
                 .header("content-type", "application/grpc")
                 .header("grpc-status", "0")
-                .body(Body::from(vec![0u8; 5]))
+                .body(Body::from(frame))
                 .expect("valid gRPC acknowledgement")
         }
     }));

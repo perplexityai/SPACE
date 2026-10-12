@@ -258,6 +258,7 @@ calls.
 | `SPACE_K8S_TOKEN_AUTH_REVIEW_RATE_PER_SEC` | 50 | |
 | `SPACE_CLUSTER_API_AUTH_ALLOWED_SERVICE_ACCOUNTS`, `SPACE_NODE_API_AUTH_ALLOWED_SERVICE_ACCOUNTS`, `SPACE_NODE_API_INTERNAL_AUTH_ALLOWED_SERVICE_ACCOUNTS` | empty | With Kubernetes auth on, an empty list rejects every call. |
 | `SPACE_NODE_API_AUTH_GUEST_BRIDGE_SERVICE_ACCOUNTS`, `SPACE_NODE_API_AUTH_TEMPLATE_BUILD_SERVICE_ACCOUNTS`, `SPACE_NODE_API_AUTH_TRUSTED_POLICY_SERVICE_ACCOUNTS`, `SPACE_NODE_API_AUTH_TRUSTED_WAIT_READY_SERVICE_ACCOUNTS` | empty | |
+| `SPACE_NODE_API_AUTH_TEMPLATE_TRANSFER_SERVICE_ACCOUNTS` | empty | Explicit artifact-transfer accounts for `NodeExportTemplate` and `PullTemplate`; also require normal surface admission. Guest-bridge accounts are always excluded. |
 | `SPACE_NODE_API_NAMESPACE`, `SPACE_NODE_API_TLS_SERVER_NAME`, `SPACE_CLUSTER_API_TLS_SERVER_NAME` | namespace chain, from endpoint | |
 | `SPACE_API_ROUTE_ED25519_ISSUER`, `SPACE_API_ROUTE_ED25519_SIGNING_KEY_ID`, `SPACE_API_ROUTE_ED25519_SIGNING_KEY_PATH` | unset = no signing | Set all three. |
 | `SPACE_API_ROUTE_ED25519_VERIFICATION_BUNDLE_PATH` | required on sandbox managers | |
@@ -290,6 +291,28 @@ With Kubernetes authentication disabled, the shared internal token remains the
 operator trust boundary and retains mutation authority. When Kubernetes
 authentication is enabled, static fallback has no mutation authority. Missing
 authentication context is denied.
+
+### Template transfer authority
+
+`SPACE_NODE_API_AUTH_TEMPLATE_TRANSFER_SERVICE_ACCOUNTS` grants only artifact
+transfer, independently of mutation. Configure the controller and node accounts
+that perform transfers before upgrading. This is a cluster infrastructure role:
+it permits exporting cached private releases from any organization as well as
+system templates. Do not grant it to tenant-facing or general admitted services.
+Node-api replaces forwarded authority metadata, and template-manager requires
+that grant from its authenticated node-api Unix-socket peer. Upgrade node-api
+before template-manager; an old forwarder is denied by the new manager.
+
+With Kubernetes authentication disabled, the shared internal token remains the
+operator trust boundary and retains transfer authority. When Kubernetes
+authentication is enabled, static fallback has no transfer authority.
+Missing authentication context is denied. Local root/operator exports remain
+available through template-manager's Unix socket.
+
+Exact-digest export can use the local cache offline. An omitted digest resolves
+the requested catalog tag (default `latest`) and exports only that digest; a
+missing tag, unavailable catalog, or uncached resolved digest fails without
+falling back to a newer local build.
 
 ## Database
 

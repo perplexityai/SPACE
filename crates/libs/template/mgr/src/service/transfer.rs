@@ -27,7 +27,11 @@ impl TemplateManagerService {
         &self,
         request: Request<crate::proto::ExportTemplateRequest>,
     ) -> Result<Response<TemplateExportStream>, Status> {
-        self.authorize_peer(&request, "ExportTemplate", ALLOW_TEMPLATE_OPERATOR)?;
+        let peer = self.authorize_peer(&request, "ExportTemplate", ALLOW_TEMPLATE_OPERATOR)?;
+        pplx_space_common_svc::auth::template_transfer::authorize_forwarded_template_export(
+            &request,
+            peer.principal(),
+        )?;
         let req = request.into_inner();
         let tmpl_ref = req
             .template
@@ -36,24 +40,34 @@ impl TemplateManagerService {
         let template_id = &tmpl_ref.name;
         validate_template_name(template_id)?;
 
-        // Resolve content_hash: if empty, find the latest build
-        let content_hash = if tmpl_ref.content_hash.as_deref().unwrap_or("").is_empty() {
-            let db = Arc::clone(&self.db);
-            let name = template_id.clone();
-            tokio::task::spawn_blocking(move || {
-                let conn = db.lock().map_err(|_| {
-                    Status::internal("db mutex poisoned while resolving latest build")
-                })?;
-                let build = crate::db::get_latest_build(&conn, &name)
-                    .map_err(|e| Status::internal(format!("db get_latest_build: {e}")))?
-                    .ok_or_else(|| Status::not_found(format!("no builds found for '{name}'")))?;
-                Ok::<_, Status>(build.content_hash)
-            })
-            .await
-            .map_err(|e| Status::internal(format!("spawn_blocking: {e}")))?
-            .map_err(|e: Status| e)?
+        // A missing digest means a catalog tag, never the newest local build.
+        let content_hash = if let Some(hash) = tmpl_ref
+            .content_hash
+            .as_deref()
+            .filter(|hash| !hash.is_empty())
+        {
+            hash.to_string()
         } else {
-            tmpl_ref.content_hash.clone().unwrap_or_default()
+            crate::volume::find_release_inner(
+                template_id,
+                "",
+                tmpl_ref.tag.as_deref().unwrap_or(""),
+                None,
+            )
+            .await
+            .map_err(|error| match error {
+                crate::volume::FindReleaseError::NotFound => {
+                    Status::not_found("template release not found")
+                }
+                crate::volume::FindReleaseError::Unavailable => {
+                    Status::unavailable("cluster metadata unavailable")
+                }
+                crate::volume::FindReleaseError::InvalidResponse => {
+                    Status::failed_precondition("cluster did not return an exact release")
+                }
+                crate::volume::FindReleaseError::Status(status) => status,
+            })?
+            .hash
         };
         validate_content_hash(&content_hash)?;
 
