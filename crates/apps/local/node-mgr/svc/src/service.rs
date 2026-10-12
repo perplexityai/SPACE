@@ -1243,6 +1243,25 @@ impl NodeManager for LocalNodeManager {
         Ok(Response::new(DenyPortResponse {}))
     }
 
+    // The local node manager runs no runtime manager and has no node store.
+    async fn publish_artifact(
+        &self,
+        _request: Request<PublishArtifactRequest>,
+    ) -> Result<Response<PublishArtifactResponse>, Status> {
+        Err(Status::unimplemented(
+            "the local node manager has no artifact store",
+        ))
+    }
+
+    async fn remove_artifact(
+        &self,
+        _request: Request<RemoveArtifactRequest>,
+    ) -> Result<Response<RemoveArtifactResponse>, Status> {
+        Err(Status::unimplemented(
+            "the local node manager has no artifact store",
+        ))
+    }
+
     // ─── Btrfs delegation: force the Full ext4 codec ──────────────────────
 
     async fn btrfs_create_template_subvolume(

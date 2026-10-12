@@ -47,15 +47,17 @@ use crate::proto::{
     PrepareEncryptedRootfsRequest, PrepareEncryptedRootfsResponse, PrepareEncryptedVolumeRequest,
     PrepareEncryptedVolumeResponse, PrepareSandboxArtifactDirRequest,
     PrepareSandboxArtifactDirResponse, PrepareSandboxRequest, PrepareSandboxResponse,
-    PrepareSnapshotRootfsRequest, PrepareSnapshotRootfsResponse, ReleaseEncryptedVolumeRequest,
-    ReleaseEncryptedVolumeResponse, ReleaseRequest, ReleaseResponse, RepairNetworkPoolRequest,
-    RepairNetworkPoolResponse, ReservePreparedRootfsRequest, ReservePreparedRootfsResponse,
-    ResumeSandboxRequest, ResumeSandboxResponse, RollbackBtrfsSnapshotRequest,
-    RollbackBtrfsSnapshotResponse, SandboxEndpointProof, SetNetworkPoolConfigRequest,
-    SetNetworkPoolConfigResponse, SetNetworkPoolDrainRequest, SetNetworkPoolDrainResponse,
-    StopProcessRequest, StopProcessResponse, SyncGuestRequest, SyncGuestResponse,
-    UnexposePortRequest, UnexposePortResponse, UpdateCgroupRequest, UpdateCgroupResponse,
-    ValidateSandboxEndpointProofRequest, ValidateSandboxEndpointProofResponse,
+    PrepareSnapshotRootfsRequest, PrepareSnapshotRootfsResponse, PublishArtifactRequest,
+    PublishArtifactResponse, ReleaseEncryptedVolumeRequest, ReleaseEncryptedVolumeResponse,
+    ReleaseRequest, ReleaseResponse, RemoveArtifactRequest, RemoveArtifactResponse,
+    RepairNetworkPoolRequest, RepairNetworkPoolResponse, ReservePreparedRootfsRequest,
+    ReservePreparedRootfsResponse, ResumeSandboxRequest, ResumeSandboxResponse,
+    RollbackBtrfsSnapshotRequest, RollbackBtrfsSnapshotResponse, SandboxEndpointProof,
+    SetNetworkPoolConfigRequest, SetNetworkPoolConfigResponse, SetNetworkPoolDrainRequest,
+    SetNetworkPoolDrainResponse, StopProcessRequest, StopProcessResponse, SyncGuestRequest,
+    SyncGuestResponse, UnexposePortRequest, UnexposePortResponse, UpdateCgroupRequest,
+    UpdateCgroupResponse, ValidateSandboxEndpointProofRequest,
+    ValidateSandboxEndpointProofResponse,
 };
 use crate::slot_pool::{
     ActiveLeaseMemoryReservationError, AllocateSlotError, NETWORK_POOL_SCHEMA_VERSION, NetworkPool,
@@ -193,6 +195,10 @@ pub struct NodeManagerService {
     blocking_probe_slots: std::sync::Arc<tokio::sync::Semaphore>,
     send_source_inspection_slots: std::sync::Arc<tokio::sync::Semaphore>,
     cache_artifact_delete_slots: std::sync::Arc<tokio::sync::Semaphore>,
+    /// One artifact-store change at a time takes a blocking thread; the
+    /// store's own lock would otherwise leave queued calls holding threads
+    /// the rest of node-manager needs.
+    artifact_slots: std::sync::Arc<tokio::sync::Semaphore>,
     runtime_supervisor: crate::runtime_supervisor_client::RuntimeSupervisorLazyClient,
     runtime_inventory: std::sync::Arc<ArcSwapOption<RuntimeInventory>>,
     runtime_inventory_refresh_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
@@ -356,8 +362,9 @@ impl NodeManagerService {
             cache_artifact_delete_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(
                 MAX_CACHE_ARTIFACT_DELETES,
             )),
+            artifact_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
             runtime_supervisor: settings.runtime_supervisor,
-            runtime_inventory: std::sync::Arc::new(ArcSwapOption::empty()),
+            runtime_inventory: std::sync::Arc::default(),
             runtime_inventory_refresh_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
             runtime_paths: settings.runtime_paths,
             guest_console_logs: settings.guest_console_logs,
@@ -405,6 +412,7 @@ impl NodeManagerService {
             vendor: root,
             assets: asset_root,
             kernels: kernel_root,
+            store: _,
         } = self.runtime_paths.clone();
         // Prepare and Launch also require this cache; diagnostic pressure must
         // not reject cold discovery before lifecycle admission.
@@ -664,6 +672,7 @@ mod gateway_isolation;
 mod launch_prepare;
 mod network_helpers;
 pub mod network_pool_metrics;
+mod node_artifacts;
 pub mod node_disk_metrics;
 mod orphan_inventory;
 mod permission_tree;

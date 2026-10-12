@@ -675,11 +675,18 @@ pub(super) mod service_tests {
             )),
             runtime_supervisor: crate::runtime_supervisor_client::tests::refusing_client(),
             runtime_inventory: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
+            artifact_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
             runtime_inventory_refresh_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
             runtime_paths: crate::config::RuntimePaths {
                 vendor: vacant.join("vendor"),
                 assets: vacant.join("assets"),
                 kernels: vacant.join("kernels"),
+                store: crate::config::ArtifactStorePaths {
+                    releases: vacant.join("store/releases"),
+                    kernels: vacant.join("store/kernels"),
+                    staging: vacant.join("staging"),
+                    catalog: vacant.join("catalog"),
+                },
             },
             guest_console_logs: false,
             lifecycle_limiter: std::sync::Arc::new(
@@ -739,12 +746,19 @@ pub(super) mod service_tests {
             symlink("vmlinux-6.1.158", kernels.join(marker)).unwrap();
         }
         std::fs::create_dir(&assets).unwrap();
+        let store = crate::config::ArtifactStorePaths {
+            releases: root.path().join("store/releases"),
+            kernels: root.path().join("store/kernels"),
+            staging: root.path().join("staging"),
+            catalog: root.path().join("catalog"),
+        };
         (
             root,
             crate::config::RuntimePaths {
                 vendor,
                 assets,
                 kernels,
+                store,
             },
         )
     }

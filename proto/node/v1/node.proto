@@ -152,6 +152,31 @@ service NodeManager {
   // Deny inbound traffic to a guest port (remove from sandbox allowlist).
   rpc DenyPort(DenyPortRequest) returns (DenyPortResponse);
 
+  // ─── Node artifact store ─────────────────────────────────────────────
+  //
+  // The node's root-owned store of runtime releases and guest kernels. The
+  // runtime manager downloads and unpacks them unprivileged into its own
+  // staging directory; node-manager copies the staged files into the store
+  // only if every byte matches the catalog's pins, so the runtime manager
+  // cannot publish unverified bytes. Execution never reads this separate store.
+  // Root and the runtime manager only.
+
+  // Publish the artifact staged as
+  // `<staging>/<namespace>/<staging_name>/<directory>/`, where the namespace
+  // is `<runtime>/releases` and `<directory>` is `v<version>` for a runtime
+  // release, and `<runtime>/kernels` and `<version>` for a kernel. Changes
+  // to one store root are serialized. An artifact already in the store with the
+  // pinned bytes succeeds without writing. FAILED_PRECONDITION when the
+  // artifact has no pins for this node's architecture or the store root is
+  // unsafe; INVALID_ARGUMENT when the staged bytes are not the pinned ones.
+  // Publishing does not change execution roots, aliases, or kernel staging.
+  rpc PublishArtifact(PublishArtifactRequest) returns (PublishArtifactResponse);
+  // Remove a managed copy whose measured digest matches the request. Every
+  // managed copy is removable, including copies of image-provided versions.
+  // Missing or changed files require repair (FAILED_PRECONDITION); an absent
+  // artifact succeeds. Execution artifacts are outside this store.
+  rpc RemoveArtifact(RemoveArtifactRequest) returns (RemoveArtifactResponse);
+
   // ─── Btrfs delegation ────────────────────────────────────────────────
   //
   // Privileged btrfs operations the suspend codec depends on. All run
@@ -1242,4 +1267,52 @@ message GetBtrfsSendCapabilitiesResponse {
   // BtrfsInspectSendSource and the encode responses' rootfs_bytes are
   // available. Sandbox-manager defers a send only when both are.
   bool inspect_send_source = 2;
+}
+
+// An artifact in the node's store, named by what it is rather than where.
+message NodeArtifact {
+  oneof artifact {
+    RuntimeReleaseArtifact runtime_release = 1;
+    ComponentArtifact component = 2;
+  }
+}
+
+message RuntimeReleaseArtifact {
+  space.execution.v1.RuntimeKind runtime_kind = 1;
+  // The release, such as 1.16.2.
+  string version = 2;
+  string digest = 3;
+}
+
+message ComponentArtifact {
+  space.execution.v1.ArtifactComponentKind kind = 1;
+  // Adapter metadata used to locate the local slot. Never sufficient identity.
+  string version = 2;
+  // sha256:<hex>; publication requires independent catalog authorization,
+  // removal checks the stored bytes under the root lock.
+  string digest = 3;
+}
+
+message PublishArtifactRequest {
+  NodeArtifact artifact = 1;
+  // The staging directory the runtime manager prepared: one path component.
+  string staging_name = 2;
+}
+
+message PublishArtifactResponse {
+  // The artifact's directory in the store.
+  string path = 1;
+  // sha256:<hex> of a kernel image, or over a release's binaries.
+  string digest = 2;
+  // The pinned artifact was already in the store; nothing was written.
+  bool already_present = 3;
+}
+
+message RemoveArtifactRequest {
+  NodeArtifact artifact = 1;
+}
+
+message RemoveArtifactResponse {
+  // False when the artifact was not in the store.
+  bool removed = 1;
 }

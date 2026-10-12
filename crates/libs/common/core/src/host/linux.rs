@@ -77,6 +77,19 @@ pub mod paths {
     /// Root-owned deployment configuration naming what the runtime manager may
     /// install, with the files of locally sourced entries.
     pub const RUNTIME_MANAGER_CATALOG_DIR: &str = "/space/etc/runtime-manager/catalog";
+    /// Where the runtime manager downloads and unpacks what it installs,
+    /// private to it, one namespace per artifact kind
+    /// (`firecracker/releases`, `firecracker/kernels`); node-manager
+    /// publishes from here into the node store and creates it at startup,
+    /// since the cache is recreated at boot.
+    pub const RUNTIME_MANAGER_STAGING_DIR: &str = "/space/cache/.rtmgr-staging";
+    /// The node's root-owned store of runtime releases and guest kernels,
+    /// which only node-manager publishes into.
+    pub const NODE_ARTIFACTS_DIR: &str = "/space/vendor/artifacts";
+    /// Managed Firecracker releases. Execution never scans this root.
+    pub const NODE_FIRECRACKER_DIR: &str = "/space/vendor/artifacts/firecracker";
+    /// Managed guest kernels. Existing vendor/cache execution paths stay separate.
+    pub const NODE_KERNELS_DIR: &str = "/space/vendor/artifacts/kernels";
     pub const SANDBOX_MANAGER_SOCKET: &str = "/space/run/sandbox-manager/sandbox-manager.sock";
     pub const SANDBOX_MANAGER_DEPENDENCY_DRAIN_CAPABILITY: &str =
         "/space/run/dependency-drain/sandbox-manager/capability-v1.lock";

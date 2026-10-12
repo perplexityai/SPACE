@@ -772,6 +772,10 @@ pub async fn run(
         if shutdown_token.is_cancelled() {
             return Ok(());
         }
+        // Prepare only the separate managed store and staging root. Failure
+        // leaves execution unchanged; each mutation rechecks its own prerequisites.
+        // Leftover deletion runs separately from readiness.
+        service.prepare_artifact_store().await;
 
         let sandbox_cgroup_vcpu_count = sandbox_cgroup_config
             .vcpu_count

@@ -24,6 +24,30 @@ pub(crate) struct RuntimePaths {
     pub vendor: PathBuf,
     pub assets: PathBuf,
     pub kernels: PathBuf,
+    pub store: ArtifactStorePaths,
+}
+
+/// The node's artifact store, which node-manager alone publishes into, and
+/// where publications come from.
+#[derive(Clone, Debug)]
+pub(crate) struct ArtifactStorePaths {
+    pub releases: PathBuf,
+    pub kernels: PathBuf,
+    /// The runtime manager's staging directory, read and never written.
+    pub staging: PathBuf,
+    /// Root-owned catalog files adding pins to the compiled ones.
+    pub catalog: PathBuf,
+}
+
+impl Default for ArtifactStorePaths {
+    fn default() -> Self {
+        Self {
+            releases: paths::NODE_FIRECRACKER_DIR.into(),
+            kernels: paths::NODE_KERNELS_DIR.into(),
+            staging: paths::RUNTIME_MANAGER_STAGING_DIR.into(),
+            catalog: paths::RUNTIME_MANAGER_CATALOG_DIR.into(),
+        }
+    }
 }
 
 impl ServiceSettings {
@@ -41,6 +65,7 @@ impl ServiceSettings {
                     "SPACE_FIRECRACKER_KERNEL_ASSET_DIR",
                     paths::FIRECRACKER_KERNEL_ASSET_DIR,
                 ),
+                store: ArtifactStorePaths::default(),
             },
             guest_console_logs: std::env::var("SPACE_ENABLE_GUEST_CONSOLE_LOGS").is_ok_and(
                 |value| {
