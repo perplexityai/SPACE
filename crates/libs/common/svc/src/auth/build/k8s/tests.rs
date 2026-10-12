@@ -308,7 +308,7 @@ async fn publication_authority_is_method_scoped_and_comes_from_token_review() {
     ] {
         for method in ["RegisterTemplate", "RegisterTemplateRelease"] {
             let (mut reviewer, calls) = reviewer(
-                service_account_status(
+                bound_publisher_status(
                     "space-cluster-api",
                     &format!("system:serviceaccount:space:{account}"),
                 ),
@@ -361,6 +361,70 @@ async fn publication_authority_is_method_scoped_and_comes_from_token_review() {
                 .is_none()
             );
             assert_eq!(calls.load(Ordering::SeqCst), 1);
+        }
+    }
+}
+
+fn bound_publisher_status(audience: &str, username: &str) -> TokenReviewStatus {
+    let mut status = service_account_status(audience, username);
+    status.user.as_mut().unwrap().extra = Some(
+        [
+            (
+                "authentication.kubernetes.io/pod-name".into(),
+                vec!["builder-pod".into()],
+            ),
+            (
+                "authentication.kubernetes.io/pod-uid".into(),
+                vec!["builder-pod-uid".into()],
+            ),
+            (
+                "authentication.kubernetes.io/node-name".into(),
+                vec!["builder-node".into()],
+            ),
+            (
+                "authentication.kubernetes.io/node-uid".into(),
+                vec!["builder-node-uid".into()],
+            ),
+        ]
+        .into(),
+    );
+    status
+}
+
+#[tokio::test]
+async fn publication_requires_unambiguous_reviewed_pod_and_node() {
+    for values in [
+        None,
+        Some(vec![]),
+        Some(vec!["first".to_string(), "second".to_string()]),
+    ] {
+        for key in ["pod-name", "pod-uid", "node-name", "node-uid"] {
+            let mut status = bound_publisher_status(
+                "space-cluster-api",
+                "system:serviceaccount:space:space-build-manager",
+            );
+            let extra = status.user.as_mut().unwrap().extra.as_mut().unwrap();
+            let key = format!("authentication.kubernetes.io/{key}");
+            match &values {
+                Some(values) => {
+                    extra.insert(key, values.clone());
+                }
+                None => {
+                    extra.remove(&key);
+                }
+            }
+            let (mut reviewer, _) = reviewer(status, "space-cluster-api");
+            reviewer.policy = BuildPolicy::new(
+                BuildSurface::Publication,
+                "space-cluster-api".into(),
+                accounts(&["space-build-manager"]),
+                BTreeSet::new(),
+                accounts(&["space-build-manager"]),
+            );
+
+            let result = reviewer.authenticate(TOKEN).await;
+
+            assert_eq!(result.unwrap_err().code(), Code::PermissionDenied);
         }
     }
 }

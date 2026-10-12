@@ -784,3 +784,95 @@ async fn system_build_withdraws_its_publication_grant_when_dispatch_fails() -> T
     );
     Ok(())
 }
+
+#[derive(Clone, Copy)]
+enum AcceptanceFailure {
+    Pin,
+    DeletedBuilder,
+    MissingBuilder,
+    InvalidBuilder,
+    InvalidJob,
+}
+
+#[rstest]
+#[case::pin_failure(AcceptanceFailure::Pin)]
+#[case::deleted_builder(AcceptanceFailure::DeletedBuilder)]
+#[case::missing_builder(AcceptanceFailure::MissingBuilder)]
+#[case::invalid_builder(AcceptanceFailure::InvalidBuilder)]
+#[case::invalid_job(AcceptanceFailure::InvalidJob)]
+#[tokio::test]
+async fn failed_acceptance_revokes_only_its_publication_grant(
+    #[future] template_controller_fixture: TestDbResult<TemplateControllerFixture>,
+    #[case] failure: AcceptanceFailure,
+) -> TestDbResult<()> {
+    let fixture = template_controller_fixture.await?;
+    let pool = &fixture._db.pool;
+    let name = TemplateName::parse("tenant-build")?;
+    insert_org_specific_template(pool, name.as_str(), TEST_ORG.as_uuid()).await?;
+    let grant = fixture
+        .store
+        .record_tenant_publication_grant(TEST_ORG, &name)
+        .await?;
+    let other = fixture
+        .store
+        .record_tenant_publication_grant(TEST_ORG, &name)
+        .await?;
+    let (job_id, mut response) = accepted_build(Some(fixture.builder_node_id));
+    match failure {
+        AcceptanceFailure::Pin => {
+            sqlx::query(sql!(
+                "CREATE FUNCTION reject_publication_pin() RETURNS trigger LANGUAGE plpgsql AS $$
+                 BEGIN RAISE EXCEPTION 'synthetic grant pin failure'; END $$"
+            ))
+            .execute(pool)
+            .await?;
+            sqlx::query(sql!(
+                "CREATE TRIGGER reject_publication_pin BEFORE UPDATE
+                 ON template_tenant_publication_grants
+                 FOR EACH ROW EXECUTE FUNCTION reject_publication_pin()"
+            ))
+            .execute(pool)
+            .await?;
+        }
+        AcceptanceFailure::DeletedBuilder => {
+            sqlx::query(sql!("DELETE FROM nodes WHERE id = $1"))
+                .bind(fixture.builder_node_id.as_uuid())
+                .execute(pool)
+                .await?;
+        }
+        AcceptanceFailure::MissingBuilder => response.builder_node_id.clear(),
+        AcceptanceFailure::InvalidBuilder => response.builder_node_id = "not-a-node-id".into(),
+        AcceptanceFailure::InvalidJob => response.job_id = "not-a-job-id".into(),
+    }
+
+    let result = fixture
+        .controller
+        .record_template_build_response(
+            TEST_ORG,
+            name.clone(),
+            None,
+            response,
+            BuilderPinnedGrants {
+                base: None,
+                tenant_publication: Some(grant),
+            },
+        )
+        .await;
+
+    assert!(result.is_err(), "failed acceptance must not return a job");
+    assert_eq!(
+        fixture
+            .store
+            .lookup_build(TEST_ORG, &name, &job_id.to_string())
+            .await?,
+        None
+    );
+    let remaining: Vec<Uuid> = sqlx::query_scalar(sql!(
+        "SELECT id FROM template_tenant_publication_grants WHERE template_name = $1"
+    ))
+    .bind(name.as_str())
+    .fetch_all(pool)
+    .await?;
+    assert_eq!(remaining, vec![other.as_uuid()]);
+    Ok(())
+}

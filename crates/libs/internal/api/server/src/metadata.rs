@@ -1490,7 +1490,7 @@ async fn find_template_release_row(
     .bind(bare_hash)
     .fetch_optional(&mut **tx)
     .await
-    .map_err(|err| Status::internal(format!("query template_release: {err}")))
+    .map_err(|err| crate::template_publication::storage_status("query template_release", &err))
 }
 
 async fn insert_template_release_row(
@@ -1518,7 +1518,7 @@ async fn insert_template_release_row(
     .bind(execution_metadata)
     .fetch_optional(&mut **tx)
     .await
-    .map_err(|err| Status::internal(format!("insert template_release: {err}")))
+    .map_err(|err| crate::template_publication::storage_status("insert template_release", &err))
 }
 
 /// First-write-wins backfill: releases are immutable per `(template_name,
@@ -1542,9 +1542,10 @@ async fn backfill_template_release_execution_metadata(
     .execute(&mut **tx)
     .await
     .map_err(|err| {
-        Status::internal(format!(
-            "backfill template_release execution metadata: {err}"
-        ))
+        crate::template_publication::storage_status(
+            "backfill template_release execution metadata",
+            &err,
+        )
     })?;
     Ok(())
 }
@@ -1567,7 +1568,7 @@ pub(super) async fn ensure_template_release_tag(
     .bind(tag)
     .fetch_one(&mut **tx)
     .await
-    .map_err(|err| Status::internal(format!("insert tag: {err}")))
+    .map_err(|err| crate::template_publication::storage_status("insert tag", &err))
 }
 
 pub(super) async fn ensure_template_release_storage_location(
@@ -1617,7 +1618,9 @@ async fn find_template_release_storage_location_row(
     .bind(connection_string)
     .fetch_optional(&mut **tx)
     .await
-    .map_err(|err| Status::internal(format!("query storage_connection_string: {err}")))
+    .map_err(|err| {
+        crate::template_publication::storage_status("query storage_connection_string", &err)
+    })
 }
 
 async fn insert_template_release_storage_location_row(
@@ -1644,7 +1647,9 @@ async fn insert_template_release_storage_location_row(
     .bind(connection_string)
     .fetch_optional(&mut **tx)
     .await
-    .map_err(|err| Status::internal(format!("insert storage_connection_string: {err}")))
+    .map_err(|err| {
+        crate::template_publication::storage_status("insert storage_connection_string", &err)
+    })
 }
 
 async fn adopt_template_release_storage_location_org_id(
@@ -1663,9 +1668,10 @@ async fn adopt_template_release_storage_location_org_id(
     .execute(&mut **tx)
     .await
     .map_err(|err| {
-        Status::internal(format!(
-            "adopt template_release_storage_location org_id: {err}"
-        ))
+        crate::template_publication::storage_status(
+            "adopt template_release_storage_location org_id",
+            &err,
+        )
     })?;
     Ok(())
 }

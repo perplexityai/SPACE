@@ -2,7 +2,7 @@
 //! build and to the builder that took it, never selected from other
 //! submissions for the same template or organization.
 //!
-//! A grant covers a publisher connected from a registered builder node: the
+//! A grant covers a publisher authenticated as a registered builder node: the
 //! pinned builder for seven days, or, until the API records which builder
 //! accepted the build, any builder for one hour. These are the windows
 //! `template_build_base_grants` honours for the same submission.
@@ -17,8 +17,14 @@ use sqlx::PgExecutor;
 #[error("tenant publication grant storage failed: {0}")]
 pub(super) struct GrantStorageError(#[from] sqlx::Error);
 
+impl GrantStorageError {
+    pub(super) fn as_sql(&self) -> &sqlx::Error {
+        &self.0
+    }
+}
+
 /// One publication's claim: the build's grant, the target and owner it
-/// publishes, and the registered nodes the publisher connected from.
+/// publishes, and the publisher’s authenticated registered nodes.
 pub(super) struct TenantPublication<'a> {
     pub(super) grant: TenantPublicationGrantId,
     pub(super) template: &'a TemplateName,
@@ -27,7 +33,7 @@ pub(super) struct TenantPublication<'a> {
 }
 
 /// Whether this build's grant is fresh, names this target and owner, and
-/// is bound to a builder the publisher connected from.
+/// is bound to the authenticated builder.
 pub(super) async fn covers(
     executor: impl PgExecutor<'_>,
     publication: &TenantPublication<'_>,

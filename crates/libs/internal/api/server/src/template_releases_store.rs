@@ -130,6 +130,23 @@ impl TemplateReleasesStore {
         Ok(TemplateReadScope::NodeScoped { node_ids })
     }
 
+    /// Kubernetes publishers carry the reviewed pod's node name and UID, not its source IP.
+    pub(super) async fn publisher_nodes_for_identity(
+        &self,
+        node: &pplx_space_common_svc::auth::build::AuthenticatedBuildNode,
+    ) -> Result<Vec<NodeId>, sqlx::Error> {
+        sqlx::query_scalar(sql!(
+            "SELECT n.id FROM nodes n JOIN node_k8s k ON k.node_id = n.id
+             WHERE k.k8s_node_name = $1 AND k.k8s_node_uid = $2
+               AND n.role = 'builder' AND n.managed_by = 'k8s'
+               AND COALESCE(n.state, 'registered') != 'deleted'"
+        ))
+        .bind(node.name.as_str())
+        .bind(node.uid.as_str())
+        .fetch_all(&self.pool)
+        .await
+    }
+
     /// Unscoped lookups with no caller organization or generic-only requirement
     /// never touch `templates`:
     /// release resolution serves on-demand sandbox-create pulls and must keep

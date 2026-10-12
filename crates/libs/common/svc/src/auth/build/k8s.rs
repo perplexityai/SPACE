@@ -9,8 +9,8 @@ use kube::api::PostParams;
 use tonic::Status;
 
 use super::{
-    BuildAuthError, BuildAuthenticatedCaller, BuildSurface, SystemTemplateAuthority,
-    TenantTemplateAuthority,
+    AuthenticatedBuildNode, BuildAuthError, BuildAuthenticatedCaller, BuildSurface,
+    SystemTemplateAuthority, TenantTemplateAuthority,
 };
 use crate::auth::{is_jwt_shaped, k8s::K8sTokenAuthConfig};
 
@@ -202,29 +202,63 @@ impl BuildTokenReviewer {
         {
             return Err(Status::unauthenticated("invalid build token"));
         }
-        let username = status
+        let user = status
             .user
-            .and_then(|user| user.username)
             .ok_or_else(|| Status::unauthenticated("build token has no identity"))?;
-        if !policy.allowed.contains(&username) {
+        let username = user
+            .username
+            .as_deref()
+            .ok_or_else(|| Status::unauthenticated("build token has no identity"))?;
+        if !policy.allowed.contains(username) {
             return Err(Status::permission_denied("caller may not submit builds"));
         }
-        let system = if policy.system.contains(&username) {
+        let system = if policy.system.contains(username) {
             SystemTemplateAuthority::Unconditional
-        } else if policy.granted_system.contains(&username) {
+        } else if policy.granted_system.contains(username) {
             SystemTemplateAuthority::Granted
         } else {
             SystemTemplateAuthority::Denied
         };
-        let tenant = if !policy.tenant.contains(&username) {
+        let tenant = if !policy.tenant.contains(username) {
             TenantTemplateAuthority::Denied
         } else if policy.tenant_requires_grant {
             TenantTemplateAuthority::Granted
         } else {
             TenantTemplateAuthority::Unconditional
         };
-        Ok(BuildAuthenticatedCaller { tenant, system })
+        let node = if tenant == TenantTemplateAuthority::Granted {
+            Some(publication_node(&user)?)
+        } else {
+            None
+        };
+        Ok(BuildAuthenticatedCaller {
+            tenant,
+            system,
+            node,
+        })
     }
+}
+
+fn publication_node(
+    user: &k8s_openapi::api::authentication::v1::UserInfo,
+) -> Result<AuthenticatedBuildNode, Status> {
+    use pplx_space_common_core::types::{PodName, PodUid};
+    let denied = || Status::permission_denied("publication requires a pod-bound node identity");
+    let extra = user.extra.as_ref().ok_or_else(denied)?;
+    let claim = |key| match extra.get(key).map(Vec::as_slice) {
+        Some([value]) if !value.is_empty() => Ok(value.as_str()),
+        _ => Err(denied()),
+    };
+    PodName::parse(claim("authentication.kubernetes.io/pod-name")?).map_err(|_| denied())?;
+    PodUid::parse(claim("authentication.kubernetes.io/pod-uid")?).map_err(|_| denied())?;
+    Ok(AuthenticatedBuildNode {
+        name: claim("authentication.kubernetes.io/node-name")?
+            .parse()
+            .map_err(|_| denied())?,
+        uid: claim("authentication.kubernetes.io/node-uid")?
+            .parse()
+            .map_err(|_| denied())?,
+    })
 }
 
 #[cfg(test)]

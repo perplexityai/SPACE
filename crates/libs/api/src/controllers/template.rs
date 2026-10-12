@@ -405,16 +405,50 @@ impl TemplateController {
         response: BuildTemplateResponse,
         grants: BuilderPinnedGrants,
     ) -> Result<StartBuildResponse, ControllerError> {
+        let result = self
+            .persist_template_build_response(
+                org_id,
+                template_name,
+                client_build_id,
+                response,
+                grants,
+            )
+            .await;
+        // Job persistence and grant pinning share a transaction, but the
+        // pre-dispatch grant was committed earlier and needs separate cleanup.
+        if result.is_err()
+            && let Some(grant) = grants.tenant_publication
+            && let Err(error) = self.build_jobs.revoke_tenant_publication_grant(grant).await
+        {
+            tracing::warn!(
+                %error,
+                %grant,
+                "failed to revoke publication after build acceptance failed; grant remains until expiry"
+            );
+        }
+        result
+    }
+
+    async fn persist_template_build_response(
+        &self,
+        org_id: OrgId,
+        template_name: TemplateName,
+        client_build_id: Option<&str>,
+        response: BuildTemplateResponse,
+        grants: BuilderPinnedGrants,
+    ) -> Result<StartBuildResponse, ControllerError> {
         let job_id = response.job_id.parse::<BuildRunId>().map_err(|error| {
             ControllerError::internal(format!("builder returned an invalid build job ID: {error}"))
         })?;
         let builder_node_id = if response.builder_node_id.is_empty() {
-            pplx_space_metrics::template::build_routing_fallback_missing_identity();
-            tracing::warn!(
-                %job_id,
-                %template_name,
-                "builder response omitted node identity; using unpinned status routing"
-            );
+            if grants.tenant_publication.is_none() {
+                pplx_space_metrics::template::build_routing_fallback_missing_identity();
+                tracing::warn!(
+                    %job_id,
+                    %template_name,
+                    "builder response omitted node identity; using unpinned status routing"
+                );
+            }
             None
         } else {
             Some(

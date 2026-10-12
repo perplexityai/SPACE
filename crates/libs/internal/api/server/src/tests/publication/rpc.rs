@@ -162,10 +162,7 @@ impl PublicationServer {
                 .iter()
                 .find(|(token, _)| review.token.as_deref() == Some(token.as_str()))
             {
-                Some((_, name)) => service_account_status(
-                    "space-cluster-api",
-                    &format!("system:serviceaccount:space:{name}"),
-                ),
+                Some((_, name)) => reviewed_publisher(name),
                 None => TokenReviewStatus {
                     authenticated: Some(false),
                     ..Default::default()
@@ -173,7 +170,14 @@ impl PublicationServer {
             },
             shutdown.clone(),
         ));
-        let mut service = ClusterApiService::new(db.pool.clone());
+        let service_pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_with(
+                (*db.pool.connect_options())
+                    .clone()
+                    .options([("lock_timeout", "100ms")]),
+            )
+            .await?;
+        let mut service = ClusterApiService::new(service_pool);
         service.reserved_template_names =
             crate::template_publication::ReservedTemplateNames::from_env()?;
         let outer = auth::NodeApiAuthLayer::from_config(auth::NodeApiAuthConfig::from_env(
@@ -487,7 +491,7 @@ async fn run() -> TestResult {
     );
     // Tenant publication runs under the grant for the build the API
     // dispatched, from the builder that took it.
-    insert_k8s_node(&db.pool, std::net::Ipv4Addr::LOCALHOST, "builder").await?;
+    insert_publishing_builder(&db.pool).await?;
     let tenant_grant =
         grant_tenant_publication(&db.pool, "tenant-output", owner, None, "0 seconds").await?;
     client
@@ -798,6 +802,9 @@ enum InvalidGrant {
     Forged,
     Malformed,
     DeletedBuilder,
+    StaleNodeUid,
+    WrongNodeName,
+    DeletedNode,
 }
 
 #[rstest::rstest]
@@ -809,6 +816,9 @@ enum InvalidGrant {
 #[case::forged(InvalidGrant::Forged, Code::PermissionDenied)]
 #[case::malformed(InvalidGrant::Malformed, Code::InvalidArgument)]
 #[case::deleted_builder(InvalidGrant::DeletedBuilder, Code::PermissionDenied)]
+#[case::stale_node_uid(InvalidGrant::StaleNodeUid, Code::PermissionDenied)]
+#[case::wrong_node_name(InvalidGrant::WrongNodeName, Code::PermissionDenied)]
+#[case::deleted_node(InvalidGrant::DeletedNode, Code::PermissionDenied)]
 fn tenant_publication_rejects_invalid_grants(
     #[case] invalid: InvalidGrant,
     #[case] code: Code,
@@ -817,7 +827,7 @@ fn tenant_publication_rejects_invalid_grants(
         let mut fixture = PublicationServer::start().await?;
         let pool = &fixture.db.pool;
         let tenant = Uuid::from_u128(3);
-        let builder = insert_k8s_node(pool, std::net::Ipv4Addr::LOCALHOST, "builder").await?;
+        let builder = insert_publishing_builder(pool).await?;
         let (name, owner, pinned, age) = match invalid {
             InvalidGrant::WrongOrg => ("tenant-out", Uuid::from_u128(2), None, "0 seconds"),
             InvalidGrant::WrongTarget => ("other-target", tenant, None, "0 seconds"),
@@ -828,11 +838,46 @@ fn tenant_publication_rejects_invalid_grants(
                     insert_k8s_node(pool, std::net::Ipv4Addr::new(10, 0, 0, 41), "builder").await?;
                 ("tenant-out", tenant, Some(other), "0 seconds")
             }
-            InvalidGrant::Forged | InvalidGrant::Malformed => {
-                ("tenant-out", tenant, None, "0 seconds")
-            }
+            InvalidGrant::Forged
+            | InvalidGrant::Malformed
+            | InvalidGrant::StaleNodeUid
+            | InvalidGrant::WrongNodeName
+            | InvalidGrant::DeletedNode => ("tenant-out", tenant, None, "0 seconds"),
         };
         let grant = grant_tenant_publication(pool, name, owner, pinned, age).await?;
+        match invalid {
+            InvalidGrant::StaleNodeUid => {
+                sqlx::query(sql!(
+                    "UPDATE node_k8s SET k8s_node_uid = 'replacement-node-uid' WHERE node_id = $1"
+                ))
+                .bind(builder)
+                .execute(pool)
+                .await?;
+                // A matching transport address must not rescue stale reviewed identity.
+                sqlx::query(sql!(
+                    "UPDATE nodes SET address = '127.0.0.1'::INET WHERE id = $1"
+                ))
+                .bind(builder)
+                .execute(pool)
+                .await?;
+            }
+            InvalidGrant::WrongNodeName => {
+                sqlx::query(sql!(
+                    "UPDATE node_k8s SET k8s_node_name = 'other-builder' WHERE node_id = $1"
+                ))
+                .bind(builder)
+                .execute(pool)
+                .await?;
+            }
+            InvalidGrant::DeletedNode => {
+                sqlx::query(sql!("UPDATE nodes SET state = 'deleted' WHERE id = $1"))
+                    .bind(builder)
+                    .execute(pool)
+                    .await?;
+            }
+            _ => {}
+        }
+
         let control = if matches!(invalid, InvalidGrant::DeletedBuilder) {
             Some(
                 grant_tenant_publication(pool, "control-out", tenant, Some(builder), "0 seconds")
@@ -921,7 +966,7 @@ fn tenant_publication_consumes_the_grant_once(
         let mut fixture = PublicationServer::start().await?;
         let pool = &fixture.db.pool;
         let tenant = Uuid::from_u128(3);
-        let builder = insert_k8s_node(pool, std::net::Ipv4Addr::LOCALHOST, "builder").await?;
+        let builder = insert_publishing_builder(pool).await?;
         let grant =
             grant_tenant_publication(pool, "tenant-out", tenant, pinned.then_some(builder), age)
                 .await?;
@@ -969,7 +1014,7 @@ fn tenant_publication_rollback_preserves_grant_and_concurrent_release_consumes_o
         let pool = fixture.db.pool.clone();
         let client = &mut fixture.client;
         let tenant = Uuid::from_u128(3);
-        insert_k8s_node(&pool, std::net::Ipv4Addr::LOCALHOST, "builder").await?;
+        insert_publishing_builder(&pool).await?;
         let rollback =
             grant_tenant_publication(&pool, "rollback-tenant", tenant, None, "0 seconds").await?;
         assert_eq!(
@@ -1003,6 +1048,93 @@ fn tenant_publication_rollback_preserves_grant_and_concurrent_release_consumes_o
             Code::PermissionDenied
         );
         assert!(!tenant_publication_grant_exists(&pool, rollback).await?);
+        fixture.finish().await
+    })
+}
+
+fn reviewed_publisher(account: &str) -> TokenReviewStatus {
+    let mut status = service_account_status(
+        "space-cluster-api",
+        &format!("system:serviceaccount:space:{account}"),
+    );
+    status.user.as_mut().unwrap().extra = Some(
+        [
+            (
+                "authentication.kubernetes.io/pod-name".into(),
+                vec!["builder-pod".into()],
+            ),
+            (
+                "authentication.kubernetes.io/pod-uid".into(),
+                vec!["builder-pod-uid".into()],
+            ),
+            (
+                "authentication.kubernetes.io/node-name".into(),
+                vec!["publication-builder".into()],
+            ),
+            (
+                "authentication.kubernetes.io/node-uid".into(),
+                vec!["publication-node-uid".into()],
+            ),
+        ]
+        .into(),
+    );
+    status
+}
+
+async fn insert_publishing_builder(pool: &sqlx::PgPool) -> TestResult<Uuid> {
+    // Pod traffic reaches this server from loopback; inventory records a different node IP.
+    let id = insert_k8s_node(pool, std::net::Ipv4Addr::new(192, 0, 2, 40), "builder").await?;
+    sqlx::query(sql!(
+        "INSERT INTO node_k8s (node_id, k8s_node_name, k8s_node_uid)
+         VALUES ($1, 'publication-builder', 'publication-node-uid')"
+    ))
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(id)
+}
+
+#[rstest::rstest]
+#[case::publisher_lookup("LOCK TABLE nodes IN ACCESS EXCLUSIVE MODE")]
+#[case::grant_consumption("LOCK TABLE template_tenant_publication_grants IN ACCESS EXCLUSIVE MODE")]
+#[case::owner_lock("LOCK TABLE templates IN ACCESS EXCLUSIVE MODE")]
+#[case::tag_write("LOCK TABLE template_release_tags IN ACCESS EXCLUSIVE MODE")]
+fn publication_contention_is_retryable(#[case] lock: &'static str) -> TestResult {
+    in_publication_process(|| async move {
+        let mut fixture = PublicationServer::start().await?;
+        let pool = &fixture.db.pool;
+        let tenant = Uuid::from_u128(3);
+        let builder = insert_publishing_builder(pool).await?;
+        let grant =
+            grant_tenant_publication(pool, "contended-output", tenant, Some(builder), "0 seconds")
+                .await?;
+        fixture
+            .client
+            .register_template(request(
+                tenant_registration("contended-output", tenant, Some(grant.to_string())),
+                "space-build-manager",
+            ))
+            .await?;
+        let mut blocker = pool.begin().await?;
+        sqlx::query(sqlx::AssertSqlSafe(sql!(lock)))
+            .execute(&mut *blocker)
+            .await?;
+        let publication = tenant_release("contended-output", tenant, 'a', Some(grant.to_string()));
+
+        let result = fixture
+            .client
+            .register_template_release(request(publication.clone(), "space-build-manager"))
+            .await;
+
+        assert_eq!(status_code(result), Code::Unavailable);
+        blocker.rollback().await?;
+        assert!(tenant_publication_grant_exists(pool, grant).await?);
+        assert_eq!(latest_hash(pool, "contended-output").await?, None);
+        fixture
+            .client
+            .register_template_release(request(publication, "space-build-manager"))
+            .await?;
+        assert!(!tenant_publication_grant_exists(pool, grant).await?);
         fixture.finish().await
     })
 }

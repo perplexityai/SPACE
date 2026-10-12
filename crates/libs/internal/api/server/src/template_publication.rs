@@ -56,14 +56,21 @@ impl ReservedTemplateNames {
 }
 
 impl ClusterApiService {
-    /// The registered nodes a publisher connected from. A tenant publication
-    /// grant is bound to the builder that took its build, so the caller's
-    /// transport origin, never a request field, selects the builder.
+    /// Kubernetes uses the reviewed pod binding; standalone callers retain the
+    /// explicitly trusted deployment's transport-address identity.
     pub(super) async fn publisher_nodes(
         &self,
         remote_addr: Option<std::net::SocketAddr>,
+        node: Option<&pplx_space_common_svc::auth::build::AuthenticatedBuildNode>,
     ) -> Result<Vec<NodeId>, Status> {
         use super::template_releases_store::TemplateReadScope;
+        if let Some(node) = node {
+            return self
+                .template_releases_store
+                .publisher_nodes_for_identity(node)
+                .await
+                .map_err(|err| storage_status("resolve publisher node identity", &err));
+        }
         let Some(remote_addr) = remote_addr else {
             return Ok(Vec::new());
         };
@@ -71,7 +78,7 @@ impl ClusterApiService {
             .template_releases_store
             .node_scope_for_address(super::normalize_ip(remote_addr.ip()))
             .await
-            .map_err(|err| Status::internal(format!("resolve publisher nodes: {err}")))?
+            .map_err(|err| storage_status("resolve publisher nodes", &err))?
         {
             TemplateReadScope::NodeScoped { node_ids } => Ok(node_ids),
             TemplateReadScope::Unscoped => Ok(Vec::new()),
@@ -95,7 +102,7 @@ impl ClusterApiService {
             .bind(name.as_str())
             .fetch_optional(&mut **tx)
             .await
-            .map_err(|err| Status::internal(format!("lock publication owner: {err}")))?
+            .map_err(|err| storage_status("lock publication owner", &err))?
             .ok_or_else(|| Status::not_found("template does not exist"))?;
         let allowed = match publisher {
             TemplateOrg::Owned { org_id } => owner == Some(org_id),
@@ -167,4 +174,14 @@ pub(super) fn missing_tenant_publication_grant() -> Status {
     Status::permission_denied(
         "tenant template publication requires the dispatched build's publication grant",
     )
+}
+
+/// Contention aborts the transaction and permits retrying the publication.
+pub(super) fn storage_status(context: &str, error: &sqlx::Error) -> Status {
+    let message = format!("{context}: {error}");
+    if pplx_space_common_svc::sql::contention::is_lock_contention(error) {
+        Status::unavailable(message)
+    } else {
+        Status::internal(message)
+    }
 }

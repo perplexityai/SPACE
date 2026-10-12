@@ -7,7 +7,7 @@ use pplx_space_common_core::{
         TenantPublicationGrantId,
     },
 };
-use sqlx::PgPool;
+use sqlx::{PgExecutor, PgPool};
 
 #[derive(Clone)]
 pub struct TemplateBuildJobsStore {
@@ -53,6 +53,8 @@ pub enum TemplateBuildJobsStoreError {
     InvalidDaemonJobId(#[from] BuildRunIdParseError),
     #[error("template build inputs belong to another organization")]
     OwnershipConflict,
+    #[error("tenant publication requires the accepting builder identity")]
+    BuilderIdentityRequired,
 }
 
 impl TemplateBuildJobsStoreError {
@@ -68,7 +70,9 @@ impl TemplateBuildJobsStoreError {
     pub(crate) fn as_sql(&self) -> Option<&sqlx::Error> {
         match self {
             Self::Storage(error) => Some(error),
-            Self::InvalidDaemonJobId(_) | Self::OwnershipConflict => None,
+            Self::InvalidDaemonJobId(_)
+            | Self::OwnershipConflict
+            | Self::BuilderIdentityRequired => None,
         }
     }
 }
@@ -95,12 +99,16 @@ impl TemplateBuildJobsStore {
         builder_node_id: Option<NodeId>,
         grants: BuilderPinnedGrants,
     ) -> Result<(), TemplateBuildJobsStoreError> {
+        if grants.tenant_publication.is_some() && builder_node_id.is_none() {
+            return Err(TemplateBuildJobsStoreError::BuilderIdentityRequired);
+        }
         if !template_build_owner_matches(&self.pool, template_name, org_id).await? {
             return Err(TemplateBuildJobsStoreError::OwnershipConflict);
         }
         let daemon_job_id_text = daemon_job_id.to_string();
         let build_id = client_build_id.unwrap_or(&daemon_job_id_text);
 
+        let mut tx = self.pool.begin().await?;
         let result = sqlx::query(sql!(
             "INSERT INTO template_build_jobs (
                  template_id,
@@ -120,22 +128,22 @@ impl TemplateBuildJobsStore {
         .bind(&daemon_job_id_text)
         .bind(builder_node_id.map(NodeId::as_uuid))
         .bind(org_id.as_uuid())
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
 
         if result.rows_affected() == 0 {
             return Err(TemplateBuildJobsStoreError::OwnershipConflict);
         }
-        let Some(builder_node_id) = builder_node_id else {
-            return Ok(());
-        };
-        if let Some(base_grant) = grants.base {
-            self.pin_base_grant(base_grant, builder_node_id).await?;
+        if let Some(builder_node_id) = builder_node_id {
+            if let Some(base_grant) = grants.base {
+                Self::pin_base_grant(&mut *tx, base_grant, builder_node_id).await?;
+            }
+            if let Some(publication_grant) = grants.tenant_publication {
+                Self::pin_tenant_publication_grant(&mut *tx, publication_grant, builder_node_id)
+                    .await?;
+            }
         }
-        if let Some(publication_grant) = grants.tenant_publication {
-            self.pin_tenant_publication_grant(publication_grant, builder_node_id)
-                .await?;
-        }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -257,8 +265,8 @@ impl TemplateBuildJobsStore {
         Ok(grant)
     }
 
-    /// Withdraw the grant of a submission that was never dispatched. Other
-    /// submissions' grants are untouched.
+    /// Withdraw publication authority when dispatch or acceptance fails.
+    /// Other submissions' grants are untouched.
     pub(crate) async fn revoke_tenant_publication_grant(
         &self,
         grant: TenantPublicationGrantId,
@@ -276,7 +284,7 @@ impl TemplateBuildJobsStore {
     /// it, with the same lifetime as its base grant's pin. Other submissions'
     /// grants are untouched.
     async fn pin_tenant_publication_grant(
-        &self,
+        executor: impl PgExecutor<'_>,
         grant: TenantPublicationGrantId,
         builder_node_id: NodeId,
     ) -> Result<(), sqlx::Error> {
@@ -287,7 +295,7 @@ impl TemplateBuildJobsStore {
         ))
         .bind(grant.as_uuid())
         .bind(builder_node_id.as_uuid())
-        .execute(&self.pool)
+        .execute(executor)
         .await?;
         Ok(())
     }
@@ -297,7 +305,7 @@ impl TemplateBuildJobsStore {
     /// job can still be running, so a build that waits behind long jobs keeps
     /// its base authorization. Other submissions' grants are untouched.
     async fn pin_base_grant(
-        &self,
+        executor: impl PgExecutor<'_>,
         base_grant: BuildBaseGrantId,
         builder_node_id: NodeId,
     ) -> Result<(), sqlx::Error> {
@@ -308,7 +316,7 @@ impl TemplateBuildJobsStore {
         ))
         .bind(base_grant.as_uuid())
         .bind(builder_node_id.as_uuid())
-        .execute(&self.pool)
+        .execute(executor)
         .await?;
         Ok(())
     }

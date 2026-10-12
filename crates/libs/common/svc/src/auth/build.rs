@@ -224,13 +224,30 @@ enum TenantTemplateAuthority {
 
 #[derive(Clone, Debug)]
 pub struct BuildAuthenticatedCaller {
+    node: Option<AuthenticatedBuildNode>,
     tenant: TenantTemplateAuthority,
     system: SystemTemplateAuthority,
+}
+
+/// Node identity from a freshly reviewed pod-bound Kubernetes token.
+#[derive(Clone, Debug)]
+pub struct AuthenticatedBuildNode {
+    pub name: pplx_space_common_core::types::K8sNodeName,
+    pub uid: pplx_space_common_core::types::K8sNodeUid,
+}
+
+pub fn publication_node<T>(request: &Request<T>) -> Option<&AuthenticatedBuildNode> {
+    request
+        .extensions()
+        .get::<BuildAuthenticatedCaller>()?
+        .node
+        .as_ref()
 }
 
 impl BuildAuthenticatedCaller {
     const fn trusted_deployment() -> Self {
         Self {
+            node: None,
             tenant: TenantTemplateAuthority::Unconditional,
             system: SystemTemplateAuthority::Unconditional,
         }

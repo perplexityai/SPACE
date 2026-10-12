@@ -170,6 +170,8 @@ impl ClusterApi for ClusterApiService {
         let requires_tenant_grant =
             pplx_space_common_svc::auth::build::tenant_publication_requires_grant(&request);
         let publisher_addr = request.remote_addr();
+        let publisher_node =
+            pplx_space_common_svc::auth::build::publication_node(&request).cloned();
         let request = request.into_inner();
         let name = template_publication::parse_template_name(&request.name)?;
         let description = optional_trimmed(request.description.as_deref());
@@ -187,21 +189,24 @@ impl ClusterApi for ClusterApiService {
         self.reserved_template_names
             .authorize(&name, template_org)?;
         let publisher_nodes = match tenant_grant {
-            Some(_) => self.publisher_nodes(publisher_addr).await?,
+            Some(_) => {
+                self.publisher_nodes(publisher_addr, publisher_node.as_ref())
+                    .await?
+            }
             None => Vec::new(),
         };
 
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|err| Status::internal(format!("begin template registration: {err}")))?;
+        let mut tx = self.pool.begin().await.map_err(|err| {
+            template_publication::storage_status("begin template registration", &err)
+        })?;
 
         // Registration leaves the grant for the release that follows it.
         if let Some(grant) = system_grant
             && !template_system_publication_grants::covers(&mut *tx, &name, grant)
                 .await
-                .map_err(|err| Status::internal(format!("check system publication: {err}")))?
+                .map_err(|err| {
+                    template_publication::storage_status("check system publication", err.as_sql())
+                })?
         {
             return Err(template_publication::missing_system_publication_grant());
         }
@@ -216,7 +221,9 @@ impl ClusterApi for ClusterApiService {
                 },
             )
             .await
-            .map_err(|err| Status::internal(format!("check tenant publication: {err}")))?
+            .map_err(|err| {
+                template_publication::storage_status("check tenant publication", err.as_sql())
+            })?
         {
             return Err(template_publication::missing_tenant_publication_grant());
         }
@@ -228,7 +235,7 @@ impl ClusterApi for ClusterApiService {
             template_org.org_id(),
         )
         .await
-        .map_err(|err| Status::internal(format!("insert template: {err}")))?;
+        .map_err(|err| template_publication::storage_status("insert template", &err))?;
         let row = match inserted {
             Some(row) => row,
             None => {
@@ -240,13 +247,15 @@ impl ClusterApi for ClusterApiService {
                     description.as_deref(),
                 )
                 .await
-                .map_err(|err| Status::internal(format!("update template description: {err}")))?
+                .map_err(|err| {
+                    template_publication::storage_status("update template description", &err)
+                })?
             }
         };
 
-        tx.commit()
-            .await
-            .map_err(|err| Status::internal(format!("commit template registration: {err}")))?;
+        tx.commit().await.map_err(|err| {
+            template_publication::storage_status("commit template registration", &err)
+        })?;
 
         Ok(Response::new(RegisterTemplateResponse {
             template: Some(template_proto(row)),
@@ -266,6 +275,8 @@ impl ClusterApi for ClusterApiService {
         let requires_tenant_grant =
             pplx_space_common_svc::auth::build::tenant_publication_requires_grant(&request);
         let publisher_addr = request.remote_addr();
+        let publisher_node =
+            pplx_space_common_svc::auth::build::publication_node(&request).cloned();
         let request = request.into_inner();
         let template_name = template_publication::parse_template_name(&request.template_name)?;
         let runtime = validated_template_runtime(&request.runtime)?;
@@ -289,7 +300,10 @@ impl ClusterApi for ClusterApiService {
         self.reserved_template_names
             .authorize(&template_name, template_org)?;
         let publisher_nodes = match tenant_grant {
-            Some(_) => self.publisher_nodes(publisher_addr).await?,
+            Some(_) => {
+                self.publisher_nodes(publisher_addr, publisher_node.as_ref())
+                    .await?
+            }
             None => Vec::new(),
         };
         let execution_metadata = validated_execution_metadata(request.execution.as_ref())?;
@@ -298,14 +312,16 @@ impl ClusterApi for ClusterApiService {
             .pool
             .begin()
             .await
-            .map_err(|err| Status::internal(format!("begin tx: {err}")))?;
+            .map_err(|err| template_publication::storage_status("begin tx", &err))?;
 
         // Consumed with the release it authorizes: a rolled-back publication
         // keeps its grant, and a committed one cannot be repeated.
         if let Some(grant) = system_grant
             && !template_system_publication_grants::consume(&mut *tx, &template_name, grant)
                 .await
-                .map_err(|err| Status::internal(format!("consume system publication: {err}")))?
+                .map_err(|err| {
+                    template_publication::storage_status("consume system publication", err.as_sql())
+                })?
         {
             return Err(template_publication::missing_system_publication_grant());
         }
@@ -320,7 +336,9 @@ impl ClusterApi for ClusterApiService {
                 },
             )
             .await
-            .map_err(|err| Status::internal(format!("consume tenant publication: {err}")))?
+            .map_err(|err| {
+                template_publication::storage_status("consume tenant publication", err.as_sql())
+            })?
         {
             return Err(template_publication::missing_tenant_publication_grant());
         }
@@ -356,7 +374,7 @@ impl ClusterApi for ClusterApiService {
 
         tx.commit()
             .await
-            .map_err(|err| Status::internal(format!("commit tx: {err}")))?;
+            .map_err(|err| template_publication::storage_status("commit tx", &err))?;
 
         Ok(Response::new(RegisterTemplateReleaseResponse {
             release: Some(template_release_proto(release)),
