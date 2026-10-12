@@ -68,6 +68,75 @@ const BARRIER_AUTHORITY: i32 = 98;
 /// The barrier's refusal; no case expects this message for its own refusal.
 const BARRIER_REFUSAL: &str = "policy authority proto value 98 is unknown";
 
+#[tokio::test]
+async fn legacy_delete_after_durable_delete_does_not_dispatch_node_cleanup() {
+    if !enter_isolated_test_process() {
+        return;
+    }
+    let scratch = tempfile::tempdir().unwrap();
+    let conn = crate::db::test_conn();
+    let sandbox_id = SandboxId::new();
+    let id = sandbox_id.to_string();
+    insert_test_sandbox(&conn, &id, SandboxState::Started);
+    let service = isolated_service(conn, scratch.path(), None);
+
+    // The shim observed a live sandbox before durable deletion completed.
+    assert_eq!(
+        service.lookup_sandbox(&id).unwrap().state,
+        SandboxState::Started
+    );
+    {
+        let db = service.db.lock().unwrap();
+        crate::db::update_state(&db, &id, SandboxState::Deleting)
+            .unwrap()
+            .require_applied()
+            .unwrap();
+        crate::db::set_cleanup_intent(&db, &id, false, CleanupCompletion::DeleteRow).unwrap();
+        crate::db::complete_row_intent_cleanup(&db, &id, CleanupCompletion::DeleteRow, None)
+            .unwrap();
+        assert!(crate::db::get_sandbox(&db, &id).unwrap().is_none());
+    }
+
+    // Exercise Delete's missing-row admission and dispatch path. Injecting the
+    // dispatch keeps even a regression from dialing the host's node-manager.
+    let admission = service
+        .admit_selected_cleanup(
+            sandbox_id,
+            CleanupCompletion::DeleteRow,
+            false,
+            true,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+    service
+        .run_cleanup_after_persistence_failure_with_node_dispatch(
+            SynchronousCleanupRequest {
+                sandbox_id: &id,
+                uuid8: &id,
+                keep_filesystem: false,
+                context: "cleanup after unpersisted delete",
+                completion: CleanupCompletion::DeleteRow,
+                published_artifact: None,
+                immediate_kill: true,
+                guest_flush: crate::db::cleanup_jobs::GuestFlush::Unrequested,
+            },
+            &admission,
+            || async {
+                panic!("an already-deleted sandbox must not dispatch or acknowledge node cleanup")
+            },
+        )
+        .await
+        .unwrap();
+    service
+        .finish_unpersisted_delete_cleanup(
+            &id,
+            admission.into_unpersisted_error(sandbox_id).unwrap(),
+        )
+        .unwrap();
+}
+
 /// A create refused by the auto-lifecycle authority parse, the last check
 /// before template lookup. Every create case starts from it, so a regression
 /// that removes the refusal a case pins still stops here, with a refusal that

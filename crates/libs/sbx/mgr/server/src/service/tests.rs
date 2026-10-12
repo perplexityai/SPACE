@@ -10152,7 +10152,7 @@ pub(crate) mod service_tests {
     }
 
     #[tokio::test]
-    async fn untracked_cleanup_admission_preserves_the_node_escape_hatch() {
+    async fn untracked_cleanup_admission_has_no_persistence_error() {
         let conn = crate::db::test_conn();
         let service = service_for_teardown_test(conn);
 
@@ -10174,7 +10174,7 @@ pub(crate) mod service_tests {
                     ..
                 })
             ),
-            "an untracked disk sandbox must still reach node cleanup"
+            "a missing sandbox row is not a persistence error"
         );
     }
 

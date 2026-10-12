@@ -910,8 +910,8 @@ func sandboxStateWithRetry(ctx context.Context, client pb.SandboxManagerClient, 
 // the durable-teardown marker was rolled out. Their controller first
 // stops and backs up retirements, so the shim must not invoke the new suspend
 // protocol against an already-stopped row. It returns true when the observed
-// lifecycle proves this task belongs to a suspend/restore handoff and must not
-// issue a later destructive teardown against the sandbox.
+// lifecycle proves the sandbox is gone or this task belongs to a suspend/restore
+// handoff and must not issue a later destructive teardown against the sandbox.
 func releaseLegacyTaskTeardown(ctx context.Context, client pb.SandboxManagerClient, operation string, identity taskTeardownIdentity) (bool, error) {
 	if identity.sandboxDetached {
 		return true, nil
@@ -950,6 +950,10 @@ func releaseLegacyTaskTeardown(ctx context.Context, client pb.SandboxManagerClie
 		_, err = client.Stop(ctx, &pb.StopRequest{SandboxId: identity.sandboxID})
 	case "delete":
 		_, err = client.Delete(ctx, &pb.DeleteRequest{SandboxId: identity.sandboxID})
+		// Durable deletion may finish after State observed the live sandbox.
+		if status.Code(err) == codes.NotFound {
+			return true, nil
+		}
 	default:
 		return false, status.Errorf(codes.Internal, "unsupported legacy teardown operation %q", operation)
 	}
