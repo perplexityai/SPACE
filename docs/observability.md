@@ -331,7 +331,10 @@ native tracer — mixing the selectors has consequences worth knowing:
 Logs are not an OTLP signal here. Every producer writes to stdout or stderr
 and the collection path is whatever reads a container's output. Rust services
 emit structured records carrying the resolved service name and honor
-`SPACE_LOG_FORMAT`. The Go shim writes plain `[space-shim]` lines to stderr
+`SPACE_LOG_FORMAT`. A JSON record written inside any span with a valid trace
+context, sampled or not, also carries the W3C `trace_id` and `span_id` of the
+nearest such span as lowercase hex, under every trace exporter; the
+Datadog-reserved `dd.trace_id` and `dd.span_id` are not written. The Go shim writes plain `[space-shim]` lines to stderr
 and the smoke script writes plain lines too; neither attaches a service,
 environment, or version, so a log pipeline that needs those must add them from
 pod metadata.

@@ -1,6 +1,6 @@
 use std::fmt;
 use std::io::IsTerminal;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 #[cfg(feature = "otel")]
@@ -185,14 +185,40 @@ fn insert_string_if_missing(
 struct SpaceJsonFormat {
     context: JsonLogContext,
     timer: SystemTime,
+    dispatch: SubscriberDispatch,
 }
 
 impl SpaceJsonFormat {
     fn new(service_name: &str, context: LogContext) -> Self {
+        Self::with_context(JsonLogContext::new(service_name, context))
+    }
+
+    fn with_context(context: JsonLogContext) -> Self {
         Self {
-            context: JsonLogContext::new(service_name, context),
+            context,
             timer: SystemTime,
+            dispatch: SubscriberDispatch::default(),
         }
+    }
+}
+
+/// The dispatcher a formatter's subscriber was installed as, captured once
+/// after installation.
+///
+/// Reading a span's trace context needs it, and `dispatcher::get_default`
+/// cannot supply it while formatting: it yields the no-op dispatcher during
+/// event dispatch. The reference is weak because the dispatcher owns the
+/// formatter.
+#[derive(Clone, Debug, Default)]
+struct SubscriberDispatch(Arc<OnceLock<tracing::dispatcher::WeakDispatch>>);
+
+impl SubscriberDispatch {
+    /// Capture the current default dispatcher. Call it right after installing
+    /// the subscriber that holds the formatter.
+    fn capture_default(&self) {
+        let _ = self.0.set(tracing::dispatcher::get_default(|dispatch| {
+            dispatch.downgrade()
+        }));
     }
 }
 
@@ -232,6 +258,10 @@ where
 
         if let Some(span) = ctx.parent_span() {
             values.insert("span".to_string(), span_value::<S, N>(&span));
+        }
+        #[cfg(feature = "otel")]
+        if let Some(dispatch) = self.dispatch.0.get().and_then(|weak| weak.upgrade()) {
+            insert_trace_context(event, &dispatch, &mut values);
         }
 
         let line = serde_json::to_string(&values).map_err(|_| fmt::Error)?;
@@ -305,6 +335,52 @@ where
         serde_json::Value::String(span.metadata().name().to_string()),
     );
     serde_json::Value::Object(values)
+}
+
+/// Join a log line to its trace: the W3C `trace_id` and `span_id` of the
+/// nearest span, from the event's own parent outward, that carries an
+/// OpenTelemetry context.
+///
+/// The parent is resolved through the unfiltered registry rather than the
+/// formatter's context, whose log filter may hide the very span the trace
+/// filter exported. A span the trace layer did not record has no context, so
+/// the walk continues to its ancestors. Without a trace layer, or outside any
+/// traced span, nothing is added. The Datadog-reserved `dd.*` fields are not
+/// written.
+#[cfg(feature = "otel")]
+fn insert_trace_context(
+    event: &tracing::Event<'_>,
+    dispatch: &tracing::Dispatch,
+    values: &mut serde_json::Map<String, serde_json::Value>,
+) {
+    use opentelemetry::trace::TraceContextExt as _;
+    use tracing::Subscriber as _;
+
+    let Some(registry) = dispatch.downcast_ref::<tracing_subscriber::Registry>() else {
+        return;
+    };
+    let parent = if let Some(parent) = event.parent() {
+        Some(parent.clone())
+    } else if event.is_contextual() {
+        registry.current_span().id().cloned()
+    } else {
+        None
+    };
+    let Some(span) = parent.and_then(|id| registry.span(&id)) else {
+        return;
+    };
+    for span in span.scope() {
+        let Some(context) = tracing_opentelemetry::get_otel_context(&span.id(), dispatch) else {
+            continue;
+        };
+        let otel_span = context.span();
+        let span_context = otel_span.span_context();
+        if span_context.is_valid() {
+            insert_string_if_missing(values, "trace_id", &span_context.trace_id().to_string());
+            insert_string_if_missing(values, "span_id", &span_context.span_id().to_string());
+            return;
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -754,14 +830,22 @@ where
         ),
     };
     match log_format {
-        LogFormat::Json => subscriber
-            .with(
-                tracing_subscriber::fmt::layer()
-                    .event_format(SpaceJsonFormat::new(service_name, log_context))
-                    .fmt_fields(JsonFields::new())
-                    .with_filter(log_filter),
-            )
-            .try_init(),
+        LogFormat::Json => {
+            let format = SpaceJsonFormat::new(service_name, log_context);
+            let dispatch = format.dispatch.clone();
+            let installed = subscriber
+                .with(
+                    tracing_subscriber::fmt::layer()
+                        .event_format(format)
+                        .fmt_fields(JsonFields::new())
+                        .with_filter(log_filter),
+                )
+                .try_init();
+            if installed.is_ok() {
+                dispatch.capture_default();
+            }
+            installed
+        }
         LogFormat::Compact => subscriber
             .with(
                 tracing_subscriber::fmt::layer()

@@ -274,9 +274,12 @@ Tempo search never returns the newest 30 seconds, whatever `end` says
 poll for a trace you just caused; fetching a trace by ID has no such delay.
 For tag values use `/api/v2/search/tag/resource.service.name/values`: the v1
 route answers scoped names with an empty list. Span IDs in fetched traces are
-base64. Log lines carry `sandbox_id` where the service knows it, but no trace
-ID, so join logs to traces by sandbox ID and time. Grafana shows the same
-three datasources and the packaged dashboards.
+base64. A Rust service's log line written inside a traced span carries that
+span's `trace_id` and `span_id` in lowercase hex, so
+`{namespace="space"} | json | trace_id="TRACE_ID"` finds a trace's lines and the
+`trace_id` opens it in Tempo; lines also carry `sandbox_id` where the service
+knows it. Grafana shows the same three datasources and the packaged
+dashboards, and its Loki datasource links each `trace_id` to Tempo.
 
 ### Datadog (optional)
 
