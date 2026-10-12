@@ -755,9 +755,21 @@ pub(super) fn revocation_state_is_active(revocation: &DataPlaneRevocationState) 
     revocation.status == DataPlaneRevocationStatus::Active as i32
 }
 
+/// Path parameters shared by the bare proxy route and its `{*path}` subpath
+/// mount.
+///
+/// The subpath mount captures two parameters, so a scalar `Path<String>`
+/// extractor rejects every subpath request with axum's 500
+/// `WrongNumberOfParameters` before the handler runs. Naming the field lets
+/// both routes deserialize; the proxied tail is read from the request URI.
+#[derive(Debug, Deserialize)]
+pub(super) struct ProxySessionPath {
+    pub(super) session_id: String,
+}
+
 pub(super) async fn proxy_session(
     State(state): State<DataPlaneState>,
-    Path(session_id): Path<String>,
+    Path(ProxySessionPath { session_id }): Path<ProxySessionPath>,
     mut request: Request<Body>,
 ) -> Result<Response, ProxyError> {
     reject_query_tokens(request.uri().query())?;

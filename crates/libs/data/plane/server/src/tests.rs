@@ -94,6 +94,38 @@ async fn unsupported_envd_method_returns_explicit_ecw_error() {
     );
 }
 
+/// Both proxy routes must reach the handler through the router. The subpath
+/// mount captures `session_id` and `path`; a scalar extractor rejects it with a
+/// 500 before authentication, so an unauthenticated request must surface the
+/// handler's 401 on every route shape.
+#[tokio::test]
+async fn proxy_session_routes_extract_path_parameters() {
+    if !pplx_space_test_env::enter_test_process(&[(
+        "SPACE_INTERNAL_RPC_INSECURE_DEV",
+        Some(std::ffi::OsStr::new("true")),
+    )]) {
+        return;
+    }
+
+    let app = router(test_data_plane_state().await);
+    let session_id = DataPlaneSessionId::Port(Default::default());
+    for path in [
+        format!("/v1/sessions/{session_id}/proxy"),
+        format!("/v1/sessions/{session_id}/proxy/api/v1/healthz"),
+        format!("/v1/sessions/{session_id}/proxy/assets/app.js?v=1"),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(Request::get(&path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{path}");
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body = serde_json::from_slice::<serde_json::Value>(&body).unwrap();
+        assert_eq!(body["message"], "data-plane token is required", "{path}");
+    }
+}
+
 pub(crate) fn backend_endpoint(value: &str) -> BackendEndpoint {
     value.parse().expect("valid backend endpoint")
 }
@@ -4000,7 +4032,9 @@ async fn cached_ingress_refreshes_replaced_execution_but_not_denied_access() {
                 .unwrap();
             crate::native::proxy_session(
                 State(state.clone()),
-                Path(session_id.to_string()),
+                Path(crate::native::ProxySessionPath {
+                    session_id: session_id.to_string(),
+                }),
                 request,
             )
             .await
