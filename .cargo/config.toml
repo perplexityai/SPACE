@@ -1,5 +1,8 @@
 [alias]
 lint = "clippy --workspace --locked -- -D warnings"
+# Builds into the workspace target directory from any subdirectory. A caller that
+# must not wait on a concurrent workspace build sets CARGO_TARGET_DIR itself.
+arch = "run -q --locked -p pplx-space-archcheck --"
 
 [target.aarch64-unknown-linux-musl]
 linker = "aarch64-linux-musl-gcc"

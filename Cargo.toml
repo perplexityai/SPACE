@@ -110,6 +110,7 @@ members = [
     "crates/apps/vol/mgr/svc",
     "crates/libs/vol/mgr/client",
     "crates/libs/vol/mgr/server",
+    "crates/tools/archcheck",
 ]
 
 [workspace.package]

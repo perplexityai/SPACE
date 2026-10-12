@@ -24,10 +24,12 @@ jobs:
   rust_static:
     if: github.repository == 'perplexityai/SPACE'
     uses: ./.github/workflows/rust-static-ci.yml
-    # Reads the CI image from this repository's GHCR package.
+    # Reads the CI image from this repository's GHCR package. Callers must
+    # grant the pull-requests: read the called job asks for.
     permissions:
       contents: read
       packages: read
+      pull-requests: read
 
   common:
     if: github.repository == 'perplexityai/SPACE'

@@ -5016,6 +5016,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "pplx-space-archcheck"
+version = "0.8.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.20",
+ "toml",
+]
+
+[[package]]
 name = "pplx-space-aws-client"
 version = "0.8.0"
 dependencies = [
