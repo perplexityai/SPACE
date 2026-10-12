@@ -617,6 +617,191 @@ async fn completed_actions_keep_a_terminal_lifecycle_that_landed_mid_flight() ->
     Ok(())
 }
 
+/// A native start operation whose post-result writes find a `stopped` written
+/// while its runtime call was in flight write `started` over it: first
+/// `maybe_update_sandbox_state(.., "started", "on_node")`, then the shared
+/// `maybe_update_sandbox_lifecycle`. The lifecycle operation executor reports
+/// success, without a retry, with the sandbox running. This pins today's
+/// start write, which has no CAS on the lifecycle it read (only the terminal
+/// guard, pinned by `completed_actions_keep_a_terminal_lifecycle_that_landed_mid_flight`),
+/// not an invariant: the wake path makes the opposite choice for the same
+/// race, and its completion CAS refuses `started` over a mid-flight `stopped`
+/// (`wake_completion_outcome_maps_to_the_wake_response`). Unifying the two is
+/// a decision, not a refactor. What the overwrite relies on is node
+/// publication: it converges a row the node reports stopped back to
+/// `stopped`, and a node report of `started` never moves a `stopped` row
+/// (`node_publication_converges_only_from_its_source_lifecycles` in the
+/// internal API), so a refused write over a running sandbox would stay
+/// wrong. That is the cost of wake's opposite choice.
+///
+/// This drives `SandboxLifecycleOperationExecutor::execute` directly. The
+/// `stopped` is written by a trigger on the start's route-identity receipt,
+/// which the direct substrate persists after the node start returns and
+/// before the lifecycle write; it changes only the database row and fires for
+/// this test's sandbox only. The trigger counts its firings so the test can
+/// prove the injected `stopped` landed; it does not count node starts.
+#[tokio::test(flavor = "current_thread")]
+async fn native_start_overwrites_a_stopped_written_mid_flight_without_a_retry() -> TestResult {
+    use crate::public_operations::{ApiProduct, ClaimedPublicOperation};
+    use crate::public_sandbox_operations::{
+        SandboxLifecycleOperationExecutor, SandboxLifecycleOperationPayload,
+    };
+    use pplx_space_public_api::{
+        OperationId, OperationKind, OperationState, PublicOperationResult, PublicSandboxId,
+        SandboxLifecycleAction, SandboxLifecycleState,
+    };
+
+    if !crate::test_support::enter_sim_worker_process_with_owned_token_files() {
+        return Ok(());
+    }
+    let db = pg_test_db_with_max_connections(4).await?;
+    let pool = &db.pool;
+    let (worker, node_id) = start_sim_worker(pool).await?;
+    let sandbox_id = SandboxId::new();
+    insert_sandbox(pool, sandbox_id, "created", "space").await?;
+    place_on_node(pool, sandbox_id, node_id).await?;
+    set_placement(pool, sandbox_id, "unplaced").await?;
+    insert_resident(worker.state(), sandbox_id, "creating").await?;
+    sqlx::query(sql!(
+        "CREATE TABLE test_route_receipts (sandbox_id UUID PRIMARY KEY, receipts INT NOT NULL)"
+    ))
+    .execute(pool)
+    .await?;
+    sqlx::query(sql!(
+        "INSERT INTO test_route_receipts (sandbox_id, receipts) VALUES ($1, 0)"
+    ))
+    .bind(sandbox_id)
+    .execute(pool)
+    .await?;
+    sqlx::query(sql!(
+        "CREATE FUNCTION test_stop_after_first_route_receipt() RETURNS trigger
+         LANGUAGE plpgsql AS $$
+         DECLARE receipts INT;
+         BEGIN
+             UPDATE test_route_receipts r
+                SET receipts = r.receipts + 1
+              WHERE r.sandbox_id = NEW.sandbox_id
+             RETURNING r.receipts INTO receipts;
+             IF receipts = 1 THEN
+                 UPDATE sandboxes SET lifecycle = 'stopped' WHERE id = NEW.sandbox_id;
+             END IF;
+             RETURN NEW;
+         END $$"
+    ))
+    .execute(pool)
+    .await?;
+    sqlx::query(sql!(
+        "CREATE TRIGGER test_stop_after_first_route_receipt
+         AFTER INSERT OR UPDATE ON sandbox_direct_route_identities
+         FOR EACH ROW EXECUTE FUNCTION test_stop_after_first_route_receipt()"
+    ))
+    .execute(pool)
+    .await?;
+
+    let operation = ClaimedPublicOperation {
+        id: OperationId::new(),
+        org_id: "00000000-0000-0000-0000-000000000001".parse()?,
+        actor_user_id: Some("00000000-0000-0000-0000-000000000010".parse()?),
+        api_product: ApiProduct::Native,
+        kind: OperationKind::StartSandbox,
+        target_type: None,
+        target_id: Some(PublicSandboxId::from(sandbox_id).to_string()),
+        payload: SandboxLifecycleOperationPayload {
+            sandbox_id: PublicSandboxId::from(sandbox_id),
+            action: SandboxLifecycleAction::Start,
+            rollback: None,
+        }
+        .into_json(),
+        attempts: 1,
+        claim_generation: 1,
+    };
+    let executor = SandboxLifecycleOperationExecutor::new(pool.clone(), direct_controller(pool));
+
+    let result = executor.execute(&operation).await;
+
+    let receipts: i32 = sqlx::query_scalar(sql!(
+        "SELECT receipts FROM test_route_receipts WHERE sandbox_id = $1"
+    ))
+    .bind(sandbox_id)
+    .fetch_one(pool)
+    .await?;
+    assert!(receipts >= 1, "the mid-flight stopped was never written");
+    assert_eq!(result.state, OperationState::Succeeded, "{result:?}");
+    assert!(result.retry_after.is_none(), "{result:?}");
+    let reported = result
+        .result_json
+        .clone()
+        .ok_or("a succeeded operation reports a result")?;
+    let PublicOperationResult::Sandbox(reported) = serde_json::from_value(reported)? else {
+        return Err(format!("not a sandbox operation result: {result:?}").into());
+    };
+    assert_eq!(reported.state, SandboxLifecycleState::Running);
+    assert_eq!(
+        row(pool, sandbox_id).await?,
+        Some(Row::new("started", "on_node"))
+    );
+    Ok(())
+}
+
+/// A completed action does not wait behind the `FOR KEY SHARE` lock every
+/// foreign-key insert into a child table takes on the sandbox row; a node
+/// publication transaction can hold one for its whole duration. The open
+/// transaction stands in for that insert and holds its lock across the whole
+/// action.
+///
+/// Direct suspend is the documented exception, not a case: it persists its
+/// suspend artifact under `SELECT ... FOR UPDATE` on the sandbox row
+/// (`persist_optional_current_local_artifact`), which conflicts with
+/// `FOR KEY SHARE`, so it waits for the child insert to finish.
+#[tokio::test(flavor = "current_thread")]
+async fn completed_actions_do_not_wait_for_a_key_share_lock() -> TestResult {
+    if !crate::test_support::enter_sim_worker_process_with_owned_token_files() {
+        return Ok(());
+    }
+    // The open child-insert transaction holds one connection.
+    let db = pg_test_db_with_max_connections(4).await?;
+    let pool = &db.pool;
+    let controller = direct_controller(pool);
+    let (worker, node_id) = start_sim_worker(pool).await?;
+
+    for (action, prior, resident, completed) in [
+        (SandboxAction::Start, "stopped", "stopped", "started"),
+        (SandboxAction::Resume, "paused", "paused", "started"),
+        (SandboxAction::Pause, "started", "running", "paused"),
+        (SandboxAction::Stop, "started", "running", "stopped"),
+        (SandboxAction::Kill, "started", "running", "stopped"),
+    ] {
+        let sandbox_id = SandboxId::new();
+        insert_sandbox(pool, sandbox_id, prior, "space").await?;
+        place_on_node(pool, sandbox_id, node_id).await?;
+        insert_resident(worker.state(), sandbox_id, resident).await?;
+        let sandbox = tracked(pool, sandbox_id).await?;
+        let mut child_insert = pool.begin().await?;
+        sqlx::query(sql!("SELECT 1 FROM sandboxes WHERE id = $1 FOR KEY SHARE"))
+            .bind(sandbox_id)
+            .execute(&mut *child_insert)
+            .await?;
+
+        // The timeout only bounds the failure: an action that waits on the
+        // lock cannot finish while the transaction holds it.
+        let body = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            run_action(&controller, pool, sandbox_id, Some(&sandbox), action, None),
+        )
+        .await
+        .map_err(|_| format!("{action:?} waited behind a FOR KEY SHARE lock"))??;
+        child_insert.rollback().await?;
+
+        assert_eq!(body["ok"], true, "{action:?}");
+        assert_eq!(
+            row(pool, sandbox_id).await?.map(|row| row.lifecycle),
+            Some(completed.to_owned()),
+            "{action:?}"
+        );
+    }
+    Ok(())
+}
+
 /// Stop and kill are not drain-gated: on a draining node they still reach
 /// the worker and mark the sandbox stopped.
 #[tokio::test(flavor = "current_thread")]

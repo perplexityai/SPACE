@@ -565,6 +565,88 @@ async fn registered_inventory_does_not_require_cluster_singleton() -> TestResult
     Ok(())
 }
 
+/// Node publication moves a `space` row's lifecycle only out of its
+/// convergence sources, swept over every stored lifecycle and both reports.
+/// A `stopped` report converges `started`, `paused`, `suspended`, `stopping`
+/// and `restoring` to `stopped`; a `started` report (without an activation
+/// receipt) promotes only `restoring`, so it never moves a `stopped` row. A
+/// control-plane write of `started` over a sandbox that is in fact stopped is
+/// therefore corrected by the next publication, while a `stopped` row whose
+/// sandbox runs is not. `space` rows have no Kubernetes execution to route,
+/// so routability does not mask the lifecycle filter.
+#[tokio::test(flavor = "current_thread")]
+async fn node_publication_converges_only_from_its_source_lifecycles() -> TestResult {
+    use pplx_space_common_core::types::SandboxLifecycle as L;
+
+    /// What a `started` and a `stopped` report leave in a row stored as `stored`.
+    fn after_reports(stored: L) -> (L, L) {
+        match stored {
+            L::Restoring => (L::Started, L::Stopped),
+            L::Started | L::Paused | L::Suspended | L::Stopping => (stored, L::Stopped),
+            L::Created
+            | L::Creating
+            | L::Starting
+            | L::Pausing
+            | L::Resuming
+            | L::Suspending
+            | L::Stopped
+            | L::Deleting
+            | L::Checkpointing
+            | L::Quarantined
+            | L::Failed => (stored, stored),
+        }
+    }
+
+    let db = pg_test_db().await?;
+    let node_id = NodeId::new();
+    insert_ready_worker_node(&db.pool, node_id).await?;
+    let cases = L::all()
+        .iter()
+        .map(|&stored| {
+            let (after_started, after_stopped) = after_reports(stored);
+            (
+                stored.as_str(),
+                after_started.as_str(),
+                after_stopped.as_str(),
+            )
+        })
+        // Stored values that are not `SandboxLifecycle` variants; no report
+        // moves them.
+        .chain(["deleted", "cleanup_required"].map(|stored| (stored, stored, stored)));
+    let mut mismatches = Vec::new();
+    for (stored, after_started, after_stopped) in cases {
+        for (published, expected) in [("started", after_started), ("stopped", after_stopped)] {
+            let sandbox_id = SandboxId::new();
+            insert_active_sandbox_with_managed_by(&db.pool, sandbox_id, node_id, stored, "space")
+                .await?;
+
+            let mut conn = db.pool.acquire().await?;
+            let outcome = publish_sandbox_states(
+                &mut conn,
+                node_id,
+                &[published_sandbox_state(sandbox_id, published)],
+            )
+            .await?;
+            drop(conn);
+
+            let lifecycle: String =
+                sqlx::query_scalar(sql!("SELECT lifecycle FROM sandboxes WHERE id = $1"))
+                    .bind(sandbox_id)
+                    .fetch_one(&db.pool)
+                    .await?;
+            if (outcome.accepted, lifecycle.as_str()) != (1, expected) {
+                mismatches.push(format!(
+                    "{stored} published as {published}: expected {expected}, \
+                     observed {lifecycle} (accepted {})",
+                    outcome.accepted
+                ));
+            }
+        }
+    }
+    assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+    Ok(())
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn publishing_suspended_node_state_finalizes_driver_crashed_suspend() -> TestResult {
     let Some(db) = try_pg_test_db().await? else {
