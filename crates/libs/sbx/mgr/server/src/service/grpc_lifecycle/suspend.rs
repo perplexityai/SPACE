@@ -212,7 +212,7 @@ impl SandboxManagerService {
         if !context.blocking {
             let service = self.clone();
             let background_sandbox_id = publication.sandbox.id.clone();
-            self.spawn_state_writer("SuspendPublication", async move {
+            self.spawn_detached_state_writer("SuspendPublication", async move {
                 let _wake_guard = wake_guard;
                 let _artifact_guard = artifact_guard;
                 if let Err(error) = service
@@ -225,6 +225,7 @@ impl SandboxManagerService {
                         error = %error.message(),
                         "asynchronous suspend publication failed"
                     );
+                    super::super::drain::record_detached_failure(error.message());
                 }
             })?;
             return Ok(Response::new(SuspendResponse {

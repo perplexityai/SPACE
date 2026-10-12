@@ -2058,23 +2058,26 @@ impl SandboxManagerService {
         let netgtw_db = Arc::clone(&self.db);
         let netgtw_launch_config =
             net_gateway_launch_config(&self.feature_flags, &netgtw_sandbox_id);
-        let netgtw_task = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
-            register_net_gateway_launch(
-                &netgtw_db,
-                &netgtw_sandbox_id,
-                sbx_uid,
-                launch_net_gateway_via_node(
-                    &mut netgtw_client,
-                    execution_fence,
+        let netgtw_task = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(
+            async move {
+                register_net_gateway_launch(
+                    &netgtw_db,
                     &netgtw_sandbox_id,
                     sbx_uid,
-                    netgtw_no_identity,
-                    Some(&netgtw_route_identity),
-                    &netgtw_launch_config,
-                ),
-            )
-            .await
-        }));
+                    launch_net_gateway_via_node(
+                        &mut netgtw_client,
+                        execution_fence,
+                        &netgtw_sandbox_id,
+                        sbx_uid,
+                        netgtw_no_identity,
+                        Some(&netgtw_route_identity),
+                        &netgtw_launch_config,
+                    ),
+                )
+                .await
+            }
+            .in_current_span(),
+        ));
 
         let prepare_response = match prepare_sandbox.await {
             Ok(response) => response.into_inner(),
