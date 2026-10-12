@@ -349,6 +349,35 @@ pub fn restore_completed(kind: &str, codec: &str, encrypted: bool, started_at: I
     );
 }
 
+metric_vocabulary!(
+    /// What failed inside a cross-node restore's stage-in when no more
+    /// specific `reason` applies: the `error_kind` tag on
+    /// `snapshot.restore.failed{step:stage, reason:stage_failed}`.
+    RestoreStageErrorKind {
+        /// Another restore of the same sandbox holds the operation.
+        Busy => "busy",
+        /// The snapshot, its artifact or the sandbox row disagree about whose
+        /// snapshot this is, or what it was restored from.
+        SourceMismatch => "source_mismatch",
+        /// Creating, renaming or removing the staging paths failed.
+        Filesystem => "filesystem",
+        /// Reading or persisting the sandbox's local row failed.
+        SandboxDb => "sandbox_db",
+        /// A concurrent transition took the sandbox out of the restore.
+        TransitionLost => "transition_lost",
+        /// The quarantine-recovery claim or plan the restore runs under
+        /// failed or was superseded.
+        QuarantineRecovery => "quarantine_recovery",
+        /// That quarantine recovery ran out of time.
+        QuarantineRecoveryTimeout => "quarantine_recovery_timeout",
+        /// The snapshot's parent template could not be resolved locally.
+        ParentTemplate => "parent_template",
+        /// Receiving the snapshot's btrfs stream failed.
+        BtrfsReceive => "btrfs_receive",
+        Other => "other",
+    }
+);
+
 /// Emit when the restore flow fails. `step` shares the vocabulary of
 /// [`restore_step`]; `reason` is a short low-cardinality label.
 pub fn restore_failed(
@@ -359,13 +388,46 @@ pub fn restore_failed(
     reason: &str,
     started_at: Instant,
 ) {
-    let tags = [
+    restore_failed_tagged(kind, codec, encrypted, step, reason, None, started_at);
+}
+
+/// [`restore_failed`] for a stage-in failure no specific `reason` covers:
+/// `step:stage, reason:stage_failed`, plus what failed as `error_kind`.
+pub fn restore_stage_failed(
+    kind: &str,
+    codec: &str,
+    encrypted: bool,
+    error_kind: RestoreStageErrorKind,
+    started_at: Instant,
+) {
+    restore_failed_tagged(
+        kind,
+        codec,
+        encrypted,
+        "stage",
+        "stage_failed",
+        Some(error_kind),
+        started_at,
+    );
+}
+
+fn restore_failed_tagged(
+    kind: &str,
+    codec: &str,
+    encrypted: bool,
+    step: &str,
+    reason: &str,
+    error_kind: Option<RestoreStageErrorKind>,
+    started_at: Instant,
+) {
+    let mut tags = vec![
         restore_kind_tag(kind),
         codec_tag(codec),
         encrypted_tag(encrypted),
         tag("step", step),
         tag("reason", reason),
     ];
+    tags.extend(error_kind.map(|kind| tag("error_kind", kind)));
     counter("snapshot.restore.failed", 1, &tags);
     timing_ms(
         "snapshot.restore.duration_ms",

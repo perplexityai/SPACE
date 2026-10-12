@@ -310,6 +310,18 @@ changes the verdict a run reports — the suites decide that, and losing the
 run's metrics is not a suite failure. It exports **once**, at the end, rather
 than on an interval, so there is no cadence to configure.
 
+### Restricted tag configurations
+
+A Datadog organization can limit which tags it keeps or makes queryable for a
+metric, for example with an explicit per-metric tag configuration. A tag that
+configuration does not list is still sent but cannot be grouped or filtered
+on. That applies to tags added after the configuration was written, including
+the `reason` on `template.gc.tick` and `template.gc.tick_duration_ms` errors
+and the `error_kind` on `template.build.latency_ms`,
+`template.build.step.latency_ms` and `snapshot.restore.failed`. Add them to the
+metric's tag configuration before relying on them; series without them are
+unaffected.
+
 ## Go runtime metrics
 
 With `SPACE_METRICS_SINK=otlp`, the shim also exports Go runtime metrics under

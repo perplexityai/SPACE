@@ -1009,12 +1009,11 @@ impl SandboxManagerService {
                 let observed_encrypted =
                     super::recovery_cross_node::encrypted_from_staged_sidecar(sandbox_id);
                 cross_node_start.emit(observed_encrypted);
-                pplx_space_metrics::snapshot::restore_failed(
+                pplx_space_metrics::snapshot::restore_stage_failed(
                     "cross_node",
                     cross_node_codec_at_start,
                     observed_encrypted,
-                    "stage",
-                    "stage_failed",
+                    error.stage_error_kind(),
                     cross_node_started_at,
                 );
                 Err(Status::unavailable(format!(

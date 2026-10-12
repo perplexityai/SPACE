@@ -281,6 +281,48 @@ pub enum RestoreError {
 }
 
 impl RestoreError {
+    /// What failed, for a stage-in failure reported as `stage_failed`. Every
+    /// variant is listed so a new one is classified rather than defaulted.
+    /// The variants a restore reports under a reason of their own map to
+    /// `Other`: they never reach that label.
+    pub(crate) fn stage_error_kind(&self) -> pplx_space_metrics::snapshot::RestoreStageErrorKind {
+        use pplx_space_metrics::snapshot::RestoreStageErrorKind as Kind;
+        match self {
+            Self::RestoreOperationBusy { .. } => Kind::Busy,
+            Self::SnapshotIdentityMismatch { .. }
+            | Self::InvalidSandboxId { .. }
+            | Self::InvalidRestoreSource { .. }
+            | Self::ArtifactSnapshotUriMismatch { .. }
+            | Self::ArtifactSourceUriMismatch { .. }
+            | Self::MissingSandboxOwnershipMetadata => Kind::SourceMismatch,
+            Self::CreateDirectory { .. }
+            | Self::RemoveFile { .. }
+            | Self::RemoveDirectory { .. }
+            | Self::RenamePath { .. } => Kind::Filesystem,
+            Self::ReadSandboxRow { .. }
+            | Self::PersistRestoringRow { .. }
+            | Self::InvalidRecoveredSandboxRow { .. }
+            | Self::AdvanceRestorePhase { .. }
+            | Self::SandboxDatabaseMutexPoisoned => Kind::SandboxDb,
+            Self::RestorePhaseTransitionLost { .. } => Kind::TransitionLost,
+            Self::QuarantineRecoveryClaimSuperseded { .. }
+            | Self::ReadQuarantineRecoveryClaim { .. }
+            | Self::RenewQuarantineRecoveryClaim { .. }
+            | Self::PersistOrphanQuarantineRecovery { .. }
+            | Self::QuarantineRecoveryPlanRpc { .. }
+            | Self::QuarantineRecoveryAbandonedAtShutdown { .. } => Kind::QuarantineRecovery,
+            Self::QuarantineRecoveryTimedOut { .. } => Kind::QuarantineRecoveryTimeout,
+            Self::ParentTemplateLookup { .. } => Kind::ParentTemplate,
+            Self::BtrfsReceive { .. } => Kind::BtrfsReceive,
+            Self::ClusterApiUnconfigured(_)
+            | Self::SnapshotNotRegistered(_)
+            | Self::AdmissionRejected(_)
+            | Self::RootfsPolicy(_)
+            | Self::CanonicalRootConflict { .. }
+            | Self::Other(_) => Kind::Other,
+        }
+    }
+
     /// The error's own message, for the variants that carry no external text.
     ///
     /// Redact-by-default, because the alternative was tried and leaked. A
