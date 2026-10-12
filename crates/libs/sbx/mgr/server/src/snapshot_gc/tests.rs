@@ -168,33 +168,83 @@ async fn malformed_artifact_times_are_retained_without_blocking_valid_siblings()
     assert!(!Path::new(&valid).exists());
 }
 
-/// Backup-completed + idle + not pinned → reaped. Disk directory
-/// is gone after the tick; row is gone too.
+/// Bounds the reaper's served node-manager call on real time. The test's
+/// clock is paused and auto-advances while the call waits on its socket, so a
+/// tokio timeout would fire early.
+const NODE_MANAGER_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// `future`'s output, or a panic once [`NODE_MANAGER_WAIT`] of real time has
+/// passed. The watchdog thread exits as soon as `future` completes.
+async fn within_node_manager_wait<F: std::future::Future>(future: F) -> F::Output {
+    let (done, finished) = std::sync::mpsc::channel::<()>();
+    let (expired, timed_out) = tokio::sync::oneshot::channel::<()>();
+    std::thread::spawn(move || {
+        if let Err(std::sync::mpsc::RecvTimeoutError::Timeout) =
+            finished.recv_timeout(NODE_MANAGER_WAIT)
+        {
+            let _ = expired.send(());
+        }
+    });
+    let output = tokio::select! {
+        output = future => output,
+        _ = timed_out => panic!("waited longer than {NODE_MANAGER_WAIT:?} on node-manager"),
+    };
+    drop(done);
+    output
+}
+
+/// Backup-completed + idle + not pinned → reaped. The row is gone, and the
+/// artifact directory moves to its `.gc-pending-<id>` staging sibling, which
+/// node-manager is asked to delete.
 #[tokio::test(start_paused = true)]
 async fn reaps_idle_uploaded_unpinned_artifact() {
+    use pplx_space_node_mgr_client::proto::{
+        DeleteCacheArtifactRequest, DeleteCacheArtifactResponse,
+    };
+
     let conn = open_test_db();
     let tmp = TempDir::new().unwrap();
     let path = make_artifact_dir(&tmp, "art1", 4096);
     insert_artifact_row(&conn, TEST_ART_ID, "sbx1", &path, 0, 0, Some(0));
     insert_sandbox_row(&conn, "sbx1", None);
+    let deletions = Arc::new(Mutex::new(Vec::new()));
+    let node_manager = crate::node_manager_transport::fake::FakeNodeManager::default()
+        .unary("DeleteCacheArtifact", {
+            let deletions = Arc::clone(&deletions);
+            move |request: DeleteCacheArtifactRequest| {
+                deletions.lock().unwrap().push(request.local_path);
+                Ok(DeleteCacheArtifactResponse::default())
+            }
+        })
+        .serve();
 
     let db = Arc::new(Mutex::new(conn));
     let artifacts = LocalArtifacts::new(Arc::clone(&db));
-    let report = gc_tick(
+    let ownership = GcOwnership {
+        node_manager: node_manager.connector(),
+        ..test_ownership()
+    };
+    let mut scan = ArtifactScan::default();
+    let report = within_node_manager_wait(gc_tick(
         artifacts,
         Arc::clone(&db),
         test_cfg(),
         now_secs(),
         full_disk(),
-        &test_ownership(),
-        &mut ArtifactScan::default(),
-    )
+        &ownership,
+        &mut scan,
+    ))
     .await
     .unwrap();
     assert!(report.engaged);
     assert_eq!(report.deleted, 1);
     assert!(report.bytes_freed >= 4096);
     assert!(!std::path::Path::new(&path).exists());
+    let staging = format!("{path}.gc-pending-{TEST_ART_ID}");
+    // The fake acknowledges without deleting, so the staging directory stays.
+    assert!(std::path::Path::new(&staging).is_dir());
+    assert_eq!(*deletions.lock().unwrap(), vec![staging]);
+    assert_eq!(node_manager.calls(), vec!["DeleteCacheArtifact".to_owned()]);
     let conn = db.lock().expect("mutex poisoned");
     let count: i64 = conn
         .query_row("SELECT COUNT(*) FROM local_artifacts", [], |r| r.get(0))

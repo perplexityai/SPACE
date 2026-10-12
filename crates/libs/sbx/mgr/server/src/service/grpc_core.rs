@@ -1179,6 +1179,10 @@ fn project_template_catalog(
 }
 
 #[cfg(test)]
+mod create_after_lookup_tests;
+#[cfg(test)]
 mod create_template_lookup_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod unpersisted_cleanup_tests;

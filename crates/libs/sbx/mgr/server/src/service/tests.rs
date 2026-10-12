@@ -237,6 +237,8 @@ fn encrypted_restore_snapshot_error_preserves_invalid_key_status() {
 mod cancelled_cleanup_rpc_tests;
 
 #[cfg(test)]
+mod endpoint_capture_tests;
+#[cfg(test)]
 mod local_backup_inventory_tests;
 
 #[cfg(test)]
@@ -517,7 +519,7 @@ pub(crate) mod service_tests {
         request
     }
 
-    fn node_api_trusted_lifecycle_request<T>(message: T) -> Request<T> {
+    pub(crate) fn node_api_trusted_lifecycle_request<T>(message: T) -> Request<T> {
         let mut request = Request::new(message);
         request.extensions_mut().insert(PeerIdentity::new(
             users::SPACE_NODEAPI.uid,
@@ -4656,55 +4658,6 @@ pub(crate) mod service_tests {
         );
     }
 
-    // Exposure re-apply during a wake in flight: after a suspend, the
-    // cluster marks open port exposures pending and the node-ctl reconciler
-    // re-arms the in-guest loopback bridge once the sandbox is back. The
-    // guest is reachable as soon as the VM resumes — long before the wake's
-    // readiness contract and network-policy gates finish — so the bridge
-    // RPCs must not gate on `Started`. Gating on `Started` left exposed
-    // ports answering 502 for the full duration of a stalled wake even
-    // though the guest was already serving spaced RPCs.
-    #[tokio::test]
-    async fn spaced_open_loopback_bridge_passes_state_gate_while_restoring() {
-        if !crate::service::tests::enter_route_test_process(&[]) {
-            return;
-        }
-
-        let conn = crate::db::test_conn();
-        let sandbox_id = SandboxId::new().to_string();
-        insert_test_sandbox_with_runtime(&conn, &sandbox_id, SandboxState::Restoring);
-        complete_runtime_endpoint_identity(&conn, &sandbox_id);
-        let service = SandboxManagerService::for_test(conn);
-
-        let error = service
-            .spaced_open_loopback_bridge(node_ctl_request(SpacedOpenLoopbackBridgeRequest {
-                sandbox_id: sandbox_id.clone(),
-                operation: Some(
-                    pplx_space_sbx_mgr_client::operations::OpenLoopbackBridgeRequest {
-                        port: 9012,
-                        wait_timeout: None,
-                    },
-                ),
-            }))
-            .await
-            .expect_err("no spaced-host socket exists in unit tests");
-
-        // The state gate must let a restoring sandbox through; the endpoint
-        // attestation dependency is intentionally absent from this unit test.
-        assert_eq!(
-            error.code(),
-            tonic::Code::Unavailable,
-            "expected the endpoint connect failure, got: {error:?}"
-        );
-        assert!(
-            error
-                .message()
-                .contains("spaced endpoint proof is temporarily unavailable"),
-            "unexpected error message: {}",
-            error.message()
-        );
-    }
-
     #[tokio::test]
     async fn spaced_open_loopback_bridge_marks_non_reachable_states_terminal() {
         if !crate::service::tests::enter_route_test_process(&[]) {
@@ -4871,83 +4824,6 @@ pub(crate) mod service_tests {
     }
 
     #[tokio::test]
-    async fn spaced_open_loopback_bridge_exempts_node_ctl_without_route_token() {
-        if !crate::service::tests::enter_route_test_process(&[]) {
-            return;
-        }
-
-        let conn = crate::db::test_conn();
-        let sandbox_id = SandboxId::new().to_string();
-        insert_test_sandbox_with_runtime(&conn, &sandbox_id, SandboxState::Restoring);
-        complete_runtime_endpoint_identity(&conn, &sandbox_id);
-        let service = SandboxManagerService::for_test(conn);
-
-        let error = service
-            .spaced_open_loopback_bridge(node_ctl_request(SpacedOpenLoopbackBridgeRequest {
-                sandbox_id: sandbox_id.clone(),
-                operation: Some(
-                    pplx_space_sbx_mgr_client::operations::OpenLoopbackBridgeRequest {
-                        port: 9012,
-                        wait_timeout: None,
-                    },
-                ),
-            }))
-            .await
-            .expect_err("no spaced-host socket exists in unit tests");
-
-        assert_eq!(
-            error.code(),
-            tonic::Code::Unavailable,
-            "expected the endpoint connect failure, got: {error:?}"
-        );
-        assert!(
-            error
-                .message()
-                .contains("spaced endpoint proof is temporarily unavailable"),
-            "unexpected error message: {}",
-            error.message()
-        );
-    }
-
-    #[tokio::test]
-    async fn spaced_close_loopback_bridge_passes_state_gate_while_restoring() {
-        if !crate::service::tests::enter_route_test_process(&[]) {
-            return;
-        }
-
-        let conn = crate::db::test_conn();
-        let sandbox_id = SandboxId::new().to_string();
-        insert_test_sandbox_with_runtime(&conn, &sandbox_id, SandboxState::Restoring);
-        complete_runtime_endpoint_identity(&conn, &sandbox_id);
-        let service = SandboxManagerService::for_test(conn);
-
-        let error = service
-            .spaced_close_loopback_bridge(node_ctl_request(SpacedCloseLoopbackBridgeRequest {
-                sandbox_id: sandbox_id.clone(),
-                operation: Some(
-                    pplx_space_sbx_mgr_client::operations::CloseLoopbackBridgeRequest {
-                        port: 9012,
-                    },
-                ),
-            }))
-            .await
-            .expect_err("no spaced-host socket exists in unit tests");
-
-        assert_eq!(
-            error.code(),
-            tonic::Code::Unavailable,
-            "expected the endpoint connect failure, got: {error:?}"
-        );
-        assert!(
-            error
-                .message()
-                .contains("spaced endpoint proof is temporarily unavailable"),
-            "unexpected error message: {}",
-            error.message()
-        );
-    }
-
-    #[tokio::test]
     async fn spaced_close_loopback_bridge_rejects_invalid_route_token() {
         if !crate::service::tests::enter_route_test_process(&[]) {
             return;
@@ -5006,78 +4882,6 @@ pub(crate) mod service_tests {
         assert_eq!(error.code(), tonic::Code::PermissionDenied);
         assert!(
             error.message().contains("requires a SPACE API route token"),
-            "unexpected error message: {}",
-            error.message()
-        );
-    }
-
-    #[tokio::test]
-    async fn spaced_close_loopback_bridge_exempts_node_ctl_without_route_token() {
-        if !crate::service::tests::enter_route_test_process(&[]) {
-            return;
-        }
-
-        let conn = crate::db::test_conn();
-        let sandbox_id = SandboxId::new().to_string();
-        insert_test_sandbox_with_runtime(&conn, &sandbox_id, SandboxState::Restoring);
-        complete_runtime_endpoint_identity(&conn, &sandbox_id);
-        let service = SandboxManagerService::for_test(conn);
-
-        let error = service
-            .spaced_close_loopback_bridge(node_ctl_request(SpacedCloseLoopbackBridgeRequest {
-                sandbox_id: sandbox_id.clone(),
-                operation: Some(
-                    pplx_space_sbx_mgr_client::operations::CloseLoopbackBridgeRequest {
-                        port: 9012,
-                    },
-                ),
-            }))
-            .await
-            .expect_err("no spaced-host socket exists in unit tests");
-
-        assert_eq!(
-            error.code(),
-            tonic::Code::Unavailable,
-            "expected the endpoint connect failure, got: {error:?}"
-        );
-        assert!(
-            error
-                .message()
-                .contains("spaced endpoint proof is temporarily unavailable"),
-            "unexpected error message: {}",
-            error.message()
-        );
-    }
-
-    #[tokio::test]
-    async fn spaced_wait_ready_trusted_node_api_reaches_spaced_host_without_route_token() {
-        if !crate::service::tests::enter_route_test_process(&[]) {
-            return;
-        }
-
-        let conn = crate::db::test_conn();
-        let sandbox_id = SandboxId::new().to_string();
-        insert_test_sandbox_with_runtime(&conn, &sandbox_id, SandboxState::Started);
-        complete_runtime_endpoint_identity(&conn, &sandbox_id);
-        let service = SandboxManagerService::for_test(conn);
-
-        let error = service
-            .spaced_wait_ready(node_api_trusted_lifecycle_request(SpacedWaitReadyRequest {
-                sandbox_id,
-                timeout: None,
-            }))
-            .await
-            .expect_err("no spaced-host socket exists in unit tests");
-
-        assert_eq!(
-            error.code(),
-            tonic::Code::Unavailable,
-            "expected the endpoint connect failure, got: {error:?}"
-        );
-        assert!(
-            error
-                .message()
-                .contains("spaced endpoint proof is temporarily unavailable"),
             "unexpected error message: {}",
             error.message()
         );
@@ -6852,7 +6656,7 @@ pub(crate) mod service_tests {
         assert!(crate::db::record_remote_restore_artifact_staging(conn, id).unwrap());
     }
 
-    fn insert_test_sandbox_with_runtime(
+    pub(crate) fn insert_test_sandbox_with_runtime(
         conn: &rusqlite::Connection,
         id: &str,
         state: SandboxState,
@@ -6891,7 +6695,7 @@ pub(crate) mod service_tests {
         insert_test_sandbox_with_runtime(conn, id, SandboxState::Started);
     }
 
-    fn complete_runtime_endpoint_identity(conn: &rusqlite::Connection, id: &str) {
+    pub(crate) fn complete_runtime_endpoint_identity(conn: &rusqlite::Connection, id: &str) {
         conn.execute(
             "UPDATE sandboxes
                 SET space_api_route_execution_generation = 1,
