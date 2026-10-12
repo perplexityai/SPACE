@@ -13,6 +13,10 @@ FROM public.ecr.aws/docker/library/debian:bookworm-slim
 RUN groupadd --system --gid 65532 space-key-broker \
     && useradd --system --uid 65532 --gid 65532 --no-create-home --shell /usr/sbin/nologin space-key-broker
 
+ARG SPACE_GIT_SHA=unknown
+LABEL org.opencontainers.image.revision="${SPACE_GIT_SHA}"
+RUN mkdir -p /etc/space && printf '%s\n' "${SPACE_GIT_SHA}" > /etc/space/build-git-sha
+
 LABEL org.opencontainers.image.title="space-kind-key-broker"
 LABEL org.opencontainers.image.description="Local-only SPACE intermediate-key broker fixture for the kind stack."
 

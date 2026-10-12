@@ -570,7 +570,11 @@ The identity options are `SPACE_KIND_ENV`, `SPACE_KIND_OWNER`,
 (`before-main`, `after-datadog`, or `after-otel`). When
 revision and phase are supplied, the application version is `<revision>-<phase>`
 so even native trace/log clients can distinguish phases. Agent-side tags alone
-do not override an application's explicit environment/version.
+do not override an application's explicit environment/version. Without
+`SPACE_KIND_VERSION`, every Rust service and the shim report the checkout's
+commit (`git rev-parse --short=12 HEAD`) as their version, read when Tilt or
+bootstrap starts, and every image records that commit as its build SHA, which
+the startup banner's `git_sha` and the node's host sidecars report.
 
 These values align `DD_ENV`/`DD_VERSION`, neutral log identity, and OTel resource
 identity without changing service names. `SPACE_KIND_CLUSTER` names the Kind

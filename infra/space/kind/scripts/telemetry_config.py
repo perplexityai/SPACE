@@ -7,6 +7,7 @@ import os
 import re
 import shlex
 import socket
+import subprocess
 import urllib.parse
 from pathlib import Path
 
@@ -104,6 +105,26 @@ def default_environment():
     return f"local-{host}"[:128] if host else "local-unknown"
 
 
+def checkout_commit():
+    """The checkout's commit, Kind's one version source, or "" outside Git.
+
+    Workloads report it as service.version unless an experiment names its own
+    version, and every image built for the bench records it as its build SHA,
+    which host sidecars such as net-gateway inherit from the worker image.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(Path(__file__).resolve().parent)]
+            + ["rev-parse", "--short=12", "HEAD"],
+            capture_output=True,
+            check=True,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return ""
+    return result.stdout.strip()
+
+
 def token(value, name, *, empty=False):
     if empty and not value:
         return value
@@ -153,6 +174,7 @@ def configuration(env):
         if rejection:
             raise ValueError(f"SPACE_KIND_SHIM_OTLP_ENDPOINT {rejection}")
     version = f"{revision}-{phase}" if revision and phase else revision
+    commit = checkout_commit()
     metrics, traces = MODES[mode]
     config = {
         "mode": mode,
@@ -163,13 +185,14 @@ def configuration(env):
         "phase": phase,
         "owner": owner,
         "version": version,
+        "commit": commit,
         "shim_endpoint": endpoint,
         "helm_set": [
             f"telemetry.metricsSink={metrics}",
             f"telemetry.traceExporter={traces}",
             f"telemetry.traceSampler={'always_on' if mode == 'otel' else ''}",
             f"datadogEnvironment={environment}",
-            f"telemetry.version={version}",
+            f"telemetry.version={version or commit}",
             f"telemetry.phase={phase}",
             f"telemetry.owner={owner}",
             f"telemetry.cluster={kind_cluster}",
@@ -212,7 +235,7 @@ def exports_otlp(config):
 
 
 def shim_wrapper(config, binary, fallback_version):
-    version = config["version"] or fallback_version
+    version = config["version"] or config["commit"] or fallback_version
     metrics, traces = MODES[config["mode"]]
     values = {
         "SPACE_CLUSTER_ID": config["cluster_id"],
@@ -280,7 +303,7 @@ def shim_wrapper(config, binary, fallback_version):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("json", "helm-set", "shim-wrapper"))
+    parser.add_argument("command", choices=("json", "helm-set", "shim-wrapper", "commit"))
     parser.add_argument(
         "--binary", default="/usr/local/lib/space/containerd-shim-space-v2"
     )
@@ -292,6 +315,8 @@ def main():
             print(json.dumps(config))
         elif args.command == "helm-set":
             print("\n".join(config["helm_set"]))
+        elif args.command == "commit":
+            print(config["commit"])
         else:
             print(shim_wrapper(config, args.binary, args.version), end="")
     except (ValueError, OSError) as error:

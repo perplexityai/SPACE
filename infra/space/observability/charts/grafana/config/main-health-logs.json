@@ -62,14 +62,14 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum by (service, source) (count_over_time({source=~\"${transport:regex}\",namespace=~\"${namespace:regex}\",environment=~\"${environment:regex}\",cluster=~\"${cluster_id:regex}\",service=~\"${service:regex}\"}[$window]))",
+          "expr": "sum by (service, log_source) (count_over_time({log_source=~\"${transport:regex}\",namespace=~\"${namespace:regex}\",environment=~\"${environment:regex}\",cluster=~\"${cluster_id:regex}\",service=~\"${service:regex}\"}[$window]))",
           "datasource": {
             "type": "loki",
             "uid": "space-loki"
           },
           "queryType": "range",
           "editorMode": "code",
-          "legendFormat": "{{service}} {{source}}",
+          "legendFormat": "{{service}} {{log_source}}",
           "maxLines": 500
         }
       ],
@@ -111,7 +111,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum by (service, level) (count_over_time({source=~\"${transport:regex}\",namespace=~\"${namespace:regex}\",environment=~\"${environment:regex}\",cluster=~\"${cluster_id:regex}\",service=~\"${service:regex}\"} | json level=\"level\" | level=~\"WARN|ERROR\" | __error__=\"\" [$window]))",
+          "expr": "sum by (service, level) (count_over_time({log_source=~\"${transport:regex}\",namespace=~\"${namespace:regex}\",environment=~\"${environment:regex}\",cluster=~\"${cluster_id:regex}\",service=~\"${service:regex}\"} | json level=\"level\" | level=~\"WARN|ERROR\" | __error__=\"\" [$window]))",
           "datasource": {
             "type": "loki",
             "uid": "space-loki"
@@ -160,7 +160,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "{source=~\"${transport:regex}\",namespace=~\"${namespace:regex}\",environment=~\"${environment:regex}\",cluster=~\"${cluster_id:regex}\",service=~\"${service:regex}\"}",
+          "expr": "{log_source=~\"${transport:regex}\",namespace=~\"${namespace:regex}\",environment=~\"${environment:regex}\",cluster=~\"${cluster_id:regex}\",service=~\"${service:regex}\"}",
           "datasource": {
             "type": "loki",
             "uid": "space-loki"
@@ -209,7 +209,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum by (reason, error, service) (count_over_time({source=~\"${transport:regex}\",namespace=~\"${namespace:regex}\",environment=~\"${environment:regex}\",cluster=~\"${cluster_id:regex}\",service=~\"${service:regex}\"} | json event_type=\"event_type\", reason=\"reason\", error=\"error\" | event_type=\"sandbox_failed\" | __error__=\"\"[$window]))",
+          "expr": "sum by (reason, error, service) (count_over_time({log_source=~\"${transport:regex}\",namespace=~\"${namespace:regex}\",environment=~\"${environment:regex}\",cluster=~\"${cluster_id:regex}\",service=~\"${service:regex}\"} | json event_type=\"event_type\", reason=\"reason\", error=\"error\" | event_type=\"sandbox_failed\" | __error__=\"\"[$window]))",
           "datasource": {
             "type": "loki",
             "uid": "space-loki"
@@ -258,7 +258,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "topk(10, sum by (reason, error) (count_over_time({source=~\"${transport:regex}\",namespace=~\"${namespace:regex}\",environment=~\"${environment:regex}\",cluster=~\"${cluster_id:regex}\",service=~\"${service:regex}\"} | json event_type=\"event_type\", reason=\"reason\", error=\"error\" | event_type=\"sandbox_failed\" | __error__=\"\" | reason!=\"\" | error!=\"\" [$__range])))",
+          "expr": "topk(10, sum by (reason, error) (count_over_time({log_source=~\"${transport:regex}\",namespace=~\"${namespace:regex}\",environment=~\"${environment:regex}\",cluster=~\"${cluster_id:regex}\",service=~\"${service:regex}\"} | json event_type=\"event_type\", reason=\"reason\", error=\"error\" | event_type=\"sandbox_failed\" | __error__=\"\" | reason!=\"\" | error!=\"\" [$__range])))",
           "datasource": {
             "type": "loki",
             "uid": "space-loki"
@@ -310,7 +310,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "topk(10, sum by (sandbox_id) (count_over_time({source=~\"${transport:regex}\",namespace=~\"${namespace:regex}\",environment=~\"${environment:regex}\",cluster=~\"${cluster_id:regex}\",service=~\"${service:regex}\"} | json event_type=\"event_type\", sandbox_id=\"sandbox_id\", status=`[\"http.response.status_code\"]`, path=`[\"url.path\"]`, route=`span[\"http.route\"]` | event_type=\"ecw_sandbox_api_request\" | (route=\"/sandboxes/{sandboxID}/connect\" or path=~\"/sandboxes/[^/]+/connect\") | sandbox_id!=\"\" | status>=500 | __error__=\"\" [$__range])))",
+          "expr": "topk(10, sum by (sandbox_id) (count_over_time({log_source=~\"${transport:regex}\",namespace=~\"${namespace:regex}\",environment=~\"${environment:regex}\",cluster=~\"${cluster_id:regex}\",service=~\"${service:regex}\"} | json event_type=\"event_type\", sandbox_id=\"sandbox_id\", status=`[\"http.response.status_code\"]`, path=`[\"url.path\"]`, route=`span[\"http.route\"]` | event_type=\"ecw_sandbox_api_request\" | (route=\"/sandboxes/{sandboxID}/connect\" or path=~\"/sandboxes/[^/]+/connect\") | sandbox_id!=\"\" | status>=500 | __error__=\"\" [$__range])))",
           "datasource": {
             "type": "loki",
             "uid": "space-loki"
@@ -362,7 +362,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "count by (status) (sum by (status, sandbox_id) (count_over_time({source=~\"${transport:regex}\",namespace=~\"${namespace:regex}\",environment=~\"${environment:regex}\",cluster=~\"${cluster_id:regex}\",service=~\"${service:regex}\"} | json event_type=\"event_type\", sandbox_id=\"sandbox_id\", status=`[\"http.response.status_code\"]`, path=`[\"url.path\"]`, route=`span[\"http.route\"]` | event_type=\"ecw_sandbox_api_request\" | (route=\"/sandboxes/{sandboxID}/connect\" or path=~\"/sandboxes/[^/]+/connect\") | sandbox_id!=\"\" | status>=400 | __error__=\"\" [$window])))",
+          "expr": "count by (status) (sum by (status, sandbox_id) (count_over_time({log_source=~\"${transport:regex}\",namespace=~\"${namespace:regex}\",environment=~\"${environment:regex}\",cluster=~\"${cluster_id:regex}\",service=~\"${service:regex}\"} | json event_type=\"event_type\", sandbox_id=\"sandbox_id\", status=`[\"http.response.status_code\"]`, path=`[\"url.path\"]`, route=`span[\"http.route\"]` | event_type=\"ecw_sandbox_api_request\" | (route=\"/sandboxes/{sandboxID}/connect\" or path=~\"/sandboxes/[^/]+/connect\") | sandbox_id!=\"\" | status>=400 | __error__=\"\" [$window])))",
           "datasource": {
             "type": "loki",
             "uid": "space-loki"
@@ -407,11 +407,11 @@
         "w": 12,
         "h": 8
       },
-      "description": "Sandbox Activations by Boot Type.\nExtracts JSON source as event_source; source is already the container/journal transport label. Avoids confusing the two.",
+      "description": "Sandbox Activations by Boot Type.\nExtracts JSON source as event_source, beside the log_source transport label.",
       "targets": [
         {
           "refId": "A",
-          "expr": "sum by (boot_type) (count_over_time({source=~\"${transport:regex}\",namespace=~\"${namespace:regex}\",environment=~\"${environment:regex}\",cluster=~\"${cluster_id:regex}\",service=~\"${service:regex}\"} | json event_stream=\"event_stream\", event_type=\"event_type\", event_source=\"source\", boot_type=\"boot_type\", execution_generation=\"execution_generation\" | event_stream=\"space.sandbox\" | event_type=\"runtime_activated\" | event_source=\"sbx_manager\" | __error__=\"\" [$window]))",
+          "expr": "sum by (boot_type) (count_over_time({log_source=~\"${transport:regex}\",namespace=~\"${namespace:regex}\",environment=~\"${environment:regex}\",cluster=~\"${cluster_id:regex}\",service=~\"${service:regex}\"} | json event_stream=\"event_stream\", event_type=\"event_type\", event_source=\"source\", boot_type=\"boot_type\", execution_generation=\"execution_generation\" | event_stream=\"space.sandbox\" | event_type=\"runtime_activated\" | event_source=\"sbx_manager\" | __error__=\"\" [$window]))",
           "datasource": {
             "type": "loki",
             "uid": "space-loki"
@@ -460,7 +460,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum(count_over_time({source=~\"${transport:regex}\",namespace=~\"${namespace:regex}\",environment=~\"${environment:regex}\",cluster=~\"${cluster_id:regex}\",service=~\"${service:regex}\"} | json event_stream=\"event_stream\", event_type=\"event_type\", event_source=\"source\", boot_type=\"boot_type\", execution_generation=\"execution_generation\" | event_stream=\"space.sandbox\" | event_type=\"runtime_activated\" | event_source=\"sbx_manager\" | boot_type=\"fresh\" | execution_generation>1 | __error__=\"\" [$window]))",
+          "expr": "sum(count_over_time({log_source=~\"${transport:regex}\",namespace=~\"${namespace:regex}\",environment=~\"${environment:regex}\",cluster=~\"${cluster_id:regex}\",service=~\"${service:regex}\"} | json event_stream=\"event_stream\", event_type=\"event_type\", event_source=\"source\", boot_type=\"boot_type\", execution_generation=\"execution_generation\" | event_stream=\"space.sandbox\" | event_type=\"runtime_activated\" | event_source=\"sbx_manager\" | boot_type=\"fresh\" | execution_generation>1 | __error__=\"\" [$window]))",
           "datasource": {
             "type": "loki",
             "uid": "space-loki"

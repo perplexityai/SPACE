@@ -58,7 +58,7 @@ Example LogQL (select a time range that includes the workload):
 {namespace="space",service="space-node-manager"} | json
 {namespace="space"} | json | level="WARN"
 {namespace="space"} | json | sandbox_id="YOUR_SYNTHETIC_SANDBOX_ID"
-{source="journal",namespace="host"}
+{log_source="journal",namespace="host"}
 ```
 
 ```bash
@@ -93,7 +93,9 @@ curl -fsS http://127.0.0.1:13101/loki/api/v1/labels
   Journal `MESSAGE` follows the same processing. Non-JSON host output remains
   text. The original `env` field is not renamed to `environment` in the body.
 - Indexed labels are exactly `service`, `environment`, `cluster`, `namespace`,
-  `source`, and `node`. JSON `service`, `env`, `cluster_id` supply the first
+  `log_source` (`container` or `journal`), and `node`. The transport label is
+  not called `source`, which would shadow the JSON `source` field of sandbox
+  events. JSON `service`, `env`, `cluster_id` supply the first
   three; `cluster` falls back to `clusterLabel`, which this overlay sets to
   `kind-local`. Absent environment stays absent.
   `version`, sandbox/request IDs, and existing nested span fields remain in the

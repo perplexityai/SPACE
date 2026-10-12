@@ -69,6 +69,9 @@ TELEMETRY_CONFIG = decode_json(local(["python3", DATADOG_SCRIPT, "preflight", "-
 DATADOG_MODE = TELEMETRY_CONFIG["backend"]
 TELEMETRY_MODE = TELEMETRY_CONFIG["mode"]
 TELEMETRY_SET = TELEMETRY_CONFIG["helm_set"]
+# The build SHA every SPACE image records, matching the version the workloads
+# report; see telemetry_config.py.
+KIND_GIT_SHA = TELEMETRY_CONFIG["commit"] or "unknown"
 watch_file("infra/space/kind/charts/space-kind-telemetry")
 
 # The local backends otel mode exports to, installed as on the bootstrap path.
@@ -185,10 +188,12 @@ def rust_runtime_image(name, dockerfile, runtime_deps):
         pull_base_images(dockerfile),
         RUST_ARTIFACT_BUILD,
         ("docker build -t $EXPECTED_REF -f {dockerfile} {mirrored} " +
-         "--build-arg SPACE_RUST_BUILD_IMAGE={rust_image} .").format(
+         "--build-arg SPACE_RUST_BUILD_IMAGE={rust_image} " +
+         "--build-arg SPACE_GIT_SHA={git_sha} .").format(
             dockerfile = dockerfile,
             mirrored = mirrored_bases(dockerfile),
             rust_image = RUST_ARTIFACT_IMAGE,
+            git_sha = KIND_GIT_SHA,
         ),
     ])
     custom_build(
@@ -241,8 +246,8 @@ custom_build(
         # ("content digest ... not found").
         ("docker build --provenance=false --sbom=false -t $EXPECTED_REF " +
          "-f docker/Dockerfile.worker {} " +
-         "--build-arg SPACE_RUST_BUILD_IMAGE={} .").format(
-            mirrored_bases("docker/Dockerfile.worker"), RUST_ARTIFACT_IMAGE),
+         "--build-arg SPACE_RUST_BUILD_IMAGE={} --build-arg SPACE_GIT_SHA={} .").format(
+            mirrored_bases("docker/Dockerfile.worker"), RUST_ARTIFACT_IMAGE, KIND_GIT_SHA),
     ]),
     deps = RUST_ARTIFACT_DEPS + [
             "docker/Dockerfile.worker",

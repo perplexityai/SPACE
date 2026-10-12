@@ -1,5 +1,6 @@
 telemetry:
-  # Empty version retains the image tag; explicit experiments use revision-phase.
+  # Bring-up sets the checkout's commit, or revision-phase for an explicit
+  # experiment; empty retains the image tag.
   version: ""
   phase: ""
   owner: ""

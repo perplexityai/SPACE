@@ -41,6 +41,9 @@ kind_load() {
 }
 
 RUST_ARTIFACT_IMAGE="space-rust-build-kind:local"
+# The build SHA every SPACE image records, matching the version the workloads
+# report; see telemetry_config.py.
+KIND_GIT_SHA="$(python3 "$REPO_ROOT/infra/space/kind/scripts/telemetry_config.py" commit)"
 
 # The one Rust build every runtime image below copies from. Owned by
 # build-rust-artifacts.sh: an incremental cargo build (inside the CI builder
@@ -63,6 +66,7 @@ build_rust_runtime() {
   log "building runtime image: $runtime_ref ($dockerfile)"
   docker build --provenance=false --sbom=false -t "$runtime_ref" -f "$dockerfile" \
     --build-arg "SPACE_RUST_BUILD_IMAGE=${RUST_ARTIFACT_IMAGE}" \
+    --build-arg "SPACE_GIT_SHA=${KIND_GIT_SHA:-unknown}" \
     .
 
   kind_load "$runtime_ref"
