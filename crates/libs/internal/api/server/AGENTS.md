@@ -19,14 +19,15 @@ Every table named here is in the control-plane Postgres store.
   registration commits separately. Keep receipts last, so their fencing sees
   the final evidence.
 - A new `public.sandboxes` lifecycle write from a node report rechecks, in
-  the write or under a `FOR UPDATE` row lock taken in the same transaction,
-  that `active_node_id` is the authenticated publisher and that the current
-  lifecycle is one it may leave, as the restored, stopped and quarantined
-  projections (`src/published_state.rs`) do. Existing exceptions: the failed
-  projection checks in a CTE and updates by id; delete receipts for stopped
-  or suspended rows with no `active_node_id` are fenced by the latest
-  execution.
-- New restoring-to-started convergence leaves rows with
+  the write or under a `FOR UPDATE` or `FOR NO KEY UPDATE` row lock taken in
+  the same transaction, that `active_node_id` is the authenticated publisher
+  and that the current lifecycle is one it may leave, as the restored,
+  stopped, failed and quarantined projections (`src/published_state.rs`) do.
+  Existing exceptions: activation-completion receipts recheck only the
+  lifecycle and are fenced by the execution attempt they release
+  (generation, attempt, `active`); delete receipts for stopped or suspended
+  rows with no `active_node_id` are fenced by the latest execution.
+- New restoring-to-target convergence leaves rows with
   `evacuation_restore_target` set to the node-drain redrive.
 - New certification columns advance only on the server's own verdict.
   `node_status_snapshots.local_backup_inventory_reported_at` is also

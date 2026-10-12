@@ -2968,44 +2968,8 @@ pub async fn publish_sandbox_states(
         "stopped",
     );
 
-    let failed_sandboxes = sqlx::query_as::<_, (Uuid, String)>(sql!(
-        "WITH input AS (
-             SELECT *
-             FROM jsonb_to_recordset($2::jsonb) AS input(
-                 sandbox_id UUID,
-                 status TEXT
-             )
-         ),
-         claimed AS (
-             SELECT s.id, s.lifecycle
-             FROM sandboxes s
-             JOIN input ON input.sandbox_id = s.id
-             WHERE s.active_node_id = $1
-               AND s.managed_by = 'k8s'
-               AND LOWER(TRIM(input.status)) = 'failed'
-               AND LOWER(TRIM(s.lifecycle)) NOT IN (
-                   'failed',
-                   'quarantined',
-                   'deleted',
-                   'cleanup_required',
-                   'deleting'
-               )
-         )
-         UPDATE sandboxes s
-         SET lifecycle = 'failed'
-         FROM claimed
-         WHERE s.id = claimed.id
-         RETURNING s.id, claimed.lifecycle"
-    ))
-    .bind(node_id)
-    .bind(rows_json.clone())
-    .fetch_all(&mut *conn)
-    .await
-    .map_err(|err| Status::internal(format!("mark failed sandbox lifecycle: {err}")))?;
-    let failed_sandboxes = failed_sandboxes
-        .into_iter()
-        .map(|(sandbox_id, lifecycle)| (SandboxId::from_uuid(sandbox_id), lifecycle))
-        .collect::<Vec<_>>();
+    let failed_sandboxes =
+        project_node_published_failed_sandboxes(conn, node_id, rows_json.clone()).await?;
     emit_node_published_state_events(
         node_id,
         &failed_sandboxes,
@@ -3378,6 +3342,63 @@ pub async fn publish_sandbox_states(
         post_commit_state_convergence,
         state_only_sandbox_ids: state_only.into_keys().collect(),
     })
+}
+
+/// Moves the reporting node's `k8s` rows that it published `failed` to
+/// Postgres `public.sandboxes.lifecycle = 'failed'`, returning each moved row
+/// with the lifecycle it left.
+///
+/// The claim locks before it checks, as the suspended projection does. A row a
+/// concurrent writer holds is read again at its committed version once the lock
+/// is granted, so a `deleting` or `quarantined` committed meanwhile, or a row
+/// that left this node, is refused rather than overwritten, and the returned
+/// from-state is the lifecycle the update actually replaced. `FOR NO KEY UPDATE`
+/// is the mode the `UPDATE` itself takes on the same rows, so taking it in the
+/// claim moves the lock earlier in the statement without adding a conflict.
+async fn project_node_published_failed_sandboxes(
+    conn: &mut sqlx::PgConnection,
+    node_id: NodeId,
+    rows_json: Json<serde_json::Value>,
+) -> Result<Vec<(SandboxId, String)>, Status> {
+    let failed_sandboxes = sqlx::query_as::<_, (Uuid, String)>(sql!(
+        "WITH input AS (
+             SELECT *
+             FROM jsonb_to_recordset($2::jsonb) AS input(
+                 sandbox_id UUID,
+                 status TEXT
+             )
+         ),
+         claimed AS (
+             SELECT s.id, s.lifecycle
+             FROM sandboxes s
+             JOIN input ON input.sandbox_id = s.id
+             WHERE s.active_node_id = $1
+               AND s.managed_by = 'k8s'
+               AND LOWER(TRIM(input.status)) = 'failed'
+               AND LOWER(TRIM(s.lifecycle)) NOT IN (
+                   'failed',
+                   'quarantined',
+                   'deleted',
+                   'cleanup_required',
+                   'deleting'
+               )
+             FOR NO KEY UPDATE OF s
+         )
+         UPDATE sandboxes s
+         SET lifecycle = 'failed'
+         FROM claimed
+         WHERE s.id = claimed.id
+         RETURNING s.id, claimed.lifecycle"
+    ))
+    .bind(node_id)
+    .bind(rows_json)
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(|err| Status::internal(format!("mark failed sandbox lifecycle: {err}")))?;
+    Ok(failed_sandboxes
+        .into_iter()
+        .map(|(sandbox_id, lifecycle)| (SandboxId::from_uuid(sandbox_id), lifecycle))
+        .collect())
 }
 
 struct SuspendedProjectionOutcome {
@@ -3955,6 +3976,9 @@ fn snapshot_locations_json(snapshot: &SnapshotDetail) -> serde_json::Value {
     )
 }
 
+#[cfg(test)]
+#[path = "published_state_lifecycle_race_tests.rs"]
+mod published_state_lifecycle_race_tests;
 #[cfg(test)]
 #[path = "published_state_tests.rs"]
 mod published_state_tests;
