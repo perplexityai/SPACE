@@ -12,6 +12,29 @@ pub(super) enum OrphanKind {
     ForkCopy,
 }
 
+impl OrphanKind {
+    /// Whether the walk enters a directory that is not itself a candidate,
+    /// `depth` levels below the root. GC staging sits directly in a sandbox's
+    /// directory or in one of its snapshot directories, the only shapes
+    /// node-mgr's `DeleteCacheArtifact` accepts, so the rest of a sandbox's
+    /// directory, its jail `instance` among them, is never read.
+    fn descends_into(self, depth: usize, name: &std::ffi::OsStr) -> bool {
+        match self {
+            Self::GcPending => {
+                depth < 2
+                    || matches!(
+                        name.to_str(),
+                        Some(
+                            pplx_space_common_core::types::SNAPSHOT_DIR_NAME
+                                | "template-snapshot-staging"
+                        )
+                    )
+            }
+            Self::ForkCopy => true,
+        }
+    }
+}
+
 /// At most one directory handle per supported namespace depth, never a queue
 /// proportional to directory width. Iterator positions survive each page.
 #[derive(Default)]
@@ -85,7 +108,9 @@ impl OrphanScan {
             };
             if candidate {
                 found.push(path);
-            } else if self.directories.len() < max_depth {
+            } else if self.directories.len() < max_depth
+                && kind.descends_into(self.directories.len(), &entry.file_name())
+            {
                 match std::fs::read_dir(&path) {
                     Ok(entries) => self.directories.push(entries),
                     Err(error) => {

@@ -431,12 +431,17 @@ fn sweep_discovers_gc_pending_orphans_and_skips_unrelated() {
     let orphan = tmp.path().join("sbx-abc/snapshot.gc-pending-deadbeef");
     std::fs::create_dir_all(&orphan).unwrap();
     std::fs::write(orphan.join("memory"), b"stale").unwrap();
-    let unrelated = tmp.path().join("sbx-abc/keep-me");
+    let snapshots = tmp.path().join("sbx-abc/snapshots");
+    std::fs::create_dir_all(&snapshots).unwrap();
+    // Staging is only ever a sibling of an artifact: outside the shapes
+    // node-mgr can delete, nothing is a candidate or even read.
+    let unrelated = tmp.path().join("sbx-abc/instance");
     std::fs::create_dir_all(&unrelated).unwrap();
+    std::fs::create_dir(unrelated.join("stray.gc-pending-held")).unwrap();
 
     // A wide first directory spans pages without growing retained discovery.
     for index in 0..270 {
-        std::fs::create_dir(unrelated.join(format!("item.gc-pending-{index}"))).unwrap();
+        std::fs::create_dir(snapshots.join(format!("item.gc-pending-{index}"))).unwrap();
     }
     let outside = TempDir::new().unwrap();
     std::fs::create_dir(outside.path().join("outside.gc-pending-held")).unwrap();

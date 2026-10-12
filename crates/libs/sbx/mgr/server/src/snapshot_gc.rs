@@ -2,7 +2,8 @@
 //!
 //! Sandboxes that have been suspended (or stopped with a persisted
 //! disk artifact, or have a named user snapshot) leave per-sandbox
-//! directories under `/space/cache/sbx/snapshot/<shard>/<sandbox_id>/<snapshot_id>/`.
+//! directories under `/space/cache/firecracker/sandboxes/<sandbox_id>/`
+//! (`snapshot` and `snapshots/<name>`).
 //! These accumulate until the sandbox is deleted; nodes regularly
 //! run out of disk before that happens.
 //!
@@ -588,16 +589,23 @@ async fn gc_tick(
     Ok(report)
 }
 
-/// Root the reaper sweeps for `.gc-pending-*` orphans at startup.
-/// Production: `/space/cache`. Tests drive bounded discovery through a tempdir.
-const CACHE_ROOT_FOR_SWEEP: &str = "/space/cache";
+/// Root the reaper sweeps for `.gc-pending-*` orphans. Every staging
+/// directory it produces is a sibling of a sandbox's snapshot artifact, and
+/// node-mgr's `DeleteCacheArtifact` refuses any path outside this root, so the
+/// rest of `/space/cache` holds nothing it could reap. Walking it anyway read
+/// other services' private directories, such as node-mgr's root-only
+/// `.btrfs-send-staging`, and warned about each on every pass. Tests drive
+/// bounded discovery through a tempdir.
+const CACHE_ROOT_FOR_SWEEP: &str = pplx_space_common_core::host::linux::paths::SANDBOX_CACHE_DIR;
 
-/// Maximum directory-walk depth for the startup sweep. The on-disk
-/// shapes the reaper produces are at most a few levels deep
-/// (`/space/cache/<some>/<sandbox_id>/snapshot.gc-pending-<uuid>`),
-/// and a deep tree would slow startup; 6 levels is comfortably more
-/// than what the publisher path can produce.
-const SWEEP_MAX_DEPTH: usize = 6;
+/// Maximum directory-walk depth below [`CACHE_ROOT_FOR_SWEEP`]. Staging
+/// directories sit at `<sandbox_id>/snapshot.gc-pending-<id>` and
+/// `<sandbox_id>/{snapshots,template-snapshot-staging}/<name>.gc-pending-<id>`,
+/// the shapes node-mgr accepts. The walk reads no deeper, and inside a
+/// sandbox's directory it enters only those snapshot directories
+/// (`OrphanKind::descends_into`): the rest are artifact contents and the jail
+/// `instance`, which keep the sandbox's own owner and mode.
+const SWEEP_MAX_DEPTH: usize = 3;
 const FORK_COPY_ORPHAN_MIN_AGE_SECS: u64 = 60 * 60;
 
 /// Issue a `DeleteCacheArtifact` RPC against node-mgr. Best-effort;
