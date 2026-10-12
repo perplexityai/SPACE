@@ -62,8 +62,8 @@ k8s:
   # Namespace where per-sandbox pause pods are created and where the
   # KubernetesSubstrate's pod reflector watches: their own, apart from the
   # control plane, as a deployment that confines sandboxes with
-  # namespace-scoped policy runs them (manifests/namespace.yaml creates it).
-  # The node-api pods
+  # namespace-scoped policy runs them (manifests/namespace.yaml creates it;
+  # the space-sandbox-network-policy chart isolates it). The node-api pods
   # the reflector discovers nodes from stay in the release namespace
   # (SPACE_NODE_API_NAMESPACE in the Deployment).
   sandboxNamespace: sandboxes

@@ -207,7 +207,8 @@ sandbox workers and builders (see [The node layer](#the-node-layer)), labels
 nodes, advertises the `space.pplx.net/network-slots` extended resource,
 installs the local observability backends in the default `otel` mode, installs
 the containerd shim on the sandbox workers, applies the `space` and
-`sandboxes` Namespaces + `RuntimeClass`,
+`sandboxes` Namespaces + `RuntimeClass` and the sandbox namespace's
+NetworkPolicies,
 builds every image and `kind load`s it (first run is the long step; the
 incremental build reuses its target dir and the Docker build is
 cargo-chef-cached after that), applies every chart with
@@ -785,7 +786,7 @@ api-server → per-sandbox pod IP at `:9800`. Node-scoped traffic (`NodeInfo`,
 `ListNodeTemplates`, network ops) flows api-server → each node-api pod's
 `host_ip:9800`.
 
-## Sandbox namespace
+## Sandbox namespace and network policy
 
 Sandbox pods run in their own namespace, `sandboxes`, and everything else in
 `space`, as in a deployment that confines sandboxes with namespace-scoped
@@ -795,6 +796,35 @@ pods is granted there, and `SPACE_NODE_API_NAMESPACE` keeps the node-api lookup
 in `space`: unset, the substrate would look for node-api pods in the sandbox
 namespace. `manifests/namespace.yaml` creates both namespaces; warm-pool
 configs are filed under the API's sandbox namespace whatever a request names.
+
+Kind v0.30.0's kindnet enforces NetworkPolicy, and
+[`charts/space-sandbox-network-policy`](charts/space-sandbox-network-policy)
+confines the namespace with two of them, each rule commented with the code
+that needs it:
+
+- `space-sandbox-default-deny` isolates every pod in the namespace, ingress and
+  egress.
+- `space-sandbox-allow` gives sandbox pods (`app.kubernetes.io/name=space-sandbox`)
+  what they carry: ingress on TCP 9800 from the two components that dial a
+  sandbox pod IP, `space-api` and `space-cluster-controller`; egress to the IPv4
+  internet outside `10.0.0.0/8`, `100.64.0.0/10`, `172.16.0.0/12`,
+  `192.168.0.0/16` and `169.254.0.0/16`; and DNS to the cluster DNS pods only.
+  There is no IPv6 egress.
+
+The guest needs nothing more. Its traffic leaves the pod masqueraded to the
+pod IP, its DNS goes to public resolvers over that internet rule (the gateway
+answers the guest's reserved resolvers over DNS-over-TLS), and the shim's
+redirect of `<pod IP>:9800` to the node-local node-api is pod-to-own-node
+traffic, which NetworkPolicy always allows. internal-api and the data plane
+dial node-api at node addresses, never a sandbox pod. The policy sits beneath
+the per-sandbox net-gateway's tenant rules and holds for anything that reaches
+the pod's network namespace outside the VM.
+
+Because the allow policy selects sandbox pods for both directions, it isolates
+them on its own; the default-deny is what isolates any other pod placed in the
+namespace. The typed `local.sandbox_network_isolation_holds` scenario checks
+both against a live cluster from the `space-node-debug` shell, which enters a
+pod's network namespace by its netns handle under `/var/run/netns`.
 
 ## How the node registers itself
 
@@ -846,7 +876,7 @@ reflector use) and `app.kubernetes.io/part-of=space-node`.
 | node-ctl | space-nodectl + SPACE_NODECTL_GROUPS | non-root, no capabilities, read-only rootfs, hostNetwork; its own ServiceAccount with Node RBAC, fenced by `node-fence.yaml` | the Kubernetes node-local controller; host network for its node-bound ClusterApi RPCs |
 | node-api | space-nodeapi + worker/builder groups | non-root, no capabilities, read-only rootfs, hostNetwork, port `grpc` 9800 | the API dials `host_ip:9800` and reads the `grpc` port; on builders it reaches build-manager through the node-local `space-builder-build-manager` Service and sleeps 5 s in preStop (below) |
 | build-manager | root | privileged, hostPID, pod network behind the node-local `space-builder-build-manager` Service (`internalTrafficPolicy: Local`); `/var/run/netns` HostToContainer, `/space/cache` without propagation, the node's containerd | loop and bind mounts for OCI assembly, `nsenter --net` into build VMs through netns handles node-manager mounts after it starts, `ctr` against the node's containerd (`crates/libs/build/mgr/src`); host PID to watch the build VM's host Firecracker pid exit (`vm.rs`); no host network: SSH into build VMs runs inside `nsenter --net` |
-| space-node-debug (Kind only) | root | privileged; `/space/run`, `/space/cache` HostToContainer, `/space/bin`, `/space/vendor`, `/run/containerd` | the operator shell; see below |
+| space-node-debug (Kind only) | root | privileged; `/space/run`, `/space/cache` HostToContainer, `/space/bin`, `/space/vendor`, `/run/containerd`, `/var/run/netns` HostToContainer read-only | the operator shell; see below |
 
 internal-api binds every node-bound ClusterApi RPC — `PublishNodeState`, the
 node desired-state and reconcile calls (node-ctl), quarantine recovery plans and
@@ -934,8 +964,8 @@ Inspect it with
 
 **The operator shell.** The smoke harness's on-node checks and fault injection —
 the node-local CLIs (`space-sbxmgr`, `space-tmplmgr`, `space-rtmgr`,
-`space-volmgr`), `btrfs`, `dmsetup`, `cryptsetup`, `ctr` and files under
-`/space/cache` — run in the Kind-only `space-node-debug` DaemonSet on each
+`space-volmgr`), `btrfs`, `dmsetup`, `cryptsetup`, `ctr`, files under
+`/space/cache` and `nsenter --net` into a pod's network namespace — run in the Kind-only `space-node-debug` DaemonSet on each
 sandbox worker and builder, a root shell standing in for an operator's shell on
 the node host. Logs and environment are read from the pod of the service that
 owns them. This keeps every service container to the identity, tools and

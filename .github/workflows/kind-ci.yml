@@ -295,8 +295,10 @@ jobs:
           k() { timeout "$1" kubectl --context kind-space-local "${@:2}"; }
           k 30s get nodes -o wide || true
           k 30s get pods -A -o wide || true
-          # The sandbox pods live in their own namespace.
-          k 30s -n sandboxes get pods,events -o wide || true
+          # The sandbox pods' own namespace and the NetworkPolicies confining
+          # it: a pod the policies refuse shows up as a dial timeout in the
+          # API's log, not as a pod event.
+          k 30s -n sandboxes get pods,networkpolicies,events -o wide || true
           # The local observability backends, whose own failures can surface as
           # a missing signal rather than a failed step.
           for namespace in space-metrics space-traces space-logs; do

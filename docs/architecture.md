@@ -83,7 +83,7 @@ The separate command-stream path is **Application → Data plane ↔ Guest proce
 
 An operation's `state` describes the lifecycle request; the sandbox's `state` describes the environment. Neither is the exit status of a command.
 
-In Kind, sandbox pods run in their own namespace, `sandboxes`, apart from the control plane in `space`.
+In Kind, sandbox pods run in their own namespace, `sandboxes`, apart from the control plane in `space`. NetworkPolicies there admit only the API and cluster controller, on the port they dial, and limit sandbox egress to the public IPv4 internet and cluster DNS; the [Kind harness README](../infra/space/kind/README.md#sandbox-namespace-and-network-policy) lists each rule's source.
 
 ## Lifecycle and persistence
 

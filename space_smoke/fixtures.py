@@ -49,6 +49,7 @@ from space_smoke.capabilities import (
     StartupRecoveryControl,
     StartupRecoveryReport,
     SuspendCodecControl,
+    SandboxNetworkIsolationControl,
     TelemetryBackendControl,
     LocalEviction,
     RestoreActivation,
@@ -104,6 +105,7 @@ from space_smoke.pending_backup import PendingBackupAssertions
 from space_smoke.quarantine_recovery import QuarantineRecoveryAssertions
 from space_smoke.template_build import TemplateBuildAssertions
 from space_smoke.rate_limiters import RateLimiterAssertions
+from space_smoke.sandbox_network_isolation import SandboxNetworkIsolationAssertions
 from space_smoke.telemetry_delivery import TelemetryDeliveryAssertions
 from space_smoke.config import DEFAULT_SANDBOX_TIMEOUT_SECONDS
 from space_smoke.identity import EcwIdentityAssertions
@@ -2843,6 +2845,23 @@ class KindEcw(Ecw):
                 self, self._suspend_codec_control, self._context.scope
             )
         return self._suspend_codec_assertions
+
+    _sandbox_network_isolation_control: SandboxNetworkIsolationControl | None = None
+    _sandbox_network_isolation_assertions: SandboxNetworkIsolationAssertions | None = None
+
+    @property
+    def sandbox_network_isolation(self) -> SandboxNetworkIsolationAssertions:
+        """Probes of the sandbox namespace's NetworkPolicies from outside the VM."""
+
+        if self._sandbox_network_isolation_control is None:
+            raise SmokeConfigurationError(
+                "sandbox network isolation probes are only available on the kind backend"
+            )
+        if self._sandbox_network_isolation_assertions is None:
+            self._sandbox_network_isolation_assertions = SandboxNetworkIsolationAssertions(
+                self, self._sandbox_network_isolation_control, self._context.scope
+            )
+        return self._sandbox_network_isolation_assertions
 
     _telemetry_control: TelemetryBackendControl | None = None
     _telemetry_assertions: TelemetryDeliveryAssertions | None = None

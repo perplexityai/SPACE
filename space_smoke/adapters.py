@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import importlib
+import ipaddress
 import json
 import os
 import re
@@ -27,6 +28,9 @@ from urllib.request import Request, urlopen
 
 from space_smoke.capabilities import (
     LimiterProbeOutcome,
+    PodNetwork,
+    TcpProbe,
+    TcpTarget,
     AdminNodeGroupView,
     CensusPublication,
     FencePolicy,
@@ -111,8 +115,9 @@ from space_smoke.runtime import (
 
 KIND_NAMESPACE = "space"
 # The API creates sandbox pods in their own namespace, apart from the control
-# plane (`k8s.sandboxNamespace` in the Kind charts). Everything else the
-# harness reads or mutates stays in KIND_NAMESPACE.
+# plane (`k8s.sandboxNamespace` in the Kind charts), where the
+# space-sandbox-network-policy chart's NetworkPolicies confine them.
+# Everything else the harness reads or mutates stays in KIND_NAMESPACE.
 KIND_SANDBOX_NAMESPACE = "sandboxes"
 KIND_BOOTSTRAP_POST_API_TIMEOUT_SECONDS = 2400
 # Longer than the 30-minute scenario budget plus a full controller rollout.
@@ -342,6 +347,12 @@ SANDBOX_RESIDENCY_SQL = """\
 SELECT lifecycle, coalesce(active_node_id::text, '') FROM sandboxes WHERE id = '{sandbox_id}'::uuid;
 """
 POD_CAP_QUOTA_NAME = "space-smoke-pod-cap"
+# The sandbox-isolation smoke's pod that no allow rule selects: the sandbox
+# pods' own image (k8s.sandboxPodImage), already on every sandbox node, run by
+# the node's default runtime rather than the SPACE shim.
+UNSELECTED_POD_LABEL = "space.pplx.net/smoke-unselected"
+UNSELECTED_POD_IMAGE = "registry.k8s.io/pause:3.10"
+UNSELECTED_POD_READY_SECONDS = 120
 PUBLIC_API_DEPLOYMENT_SELECTOR = "app.kubernetes.io/name=space-api"
 KIND_REDIS_DEPLOYMENT = "space-redis"
 KIND_OBJECT_STORE_DEPLOYMENT = "space-object-store"
@@ -4364,6 +4375,140 @@ ON CONFLICT (key_hash) DO NOTHING;
             )
         return mode
 
+    # --- sandbox network isolation -------------------------------------------
+    #
+    # Probes of the sandbox namespace's NetworkPolicies, run in the node's
+    # operator shell: in its own network namespace (the control-plane
+    # namespace, under no policy), or in a pod's, entered by the netns handle
+    # whose eth0 carries the pod IP. A sandbox pod has no process of its own to
+    # name with a pid; the handle is what the node's runtime created for it.
+
+    def sandbox_pod_network(self, sandbox_id: str) -> PodNetwork | None:
+        result = self.kubectl(
+            "get", "pods", "-l", f"{SANDBOX_ID_LABEL}={_sql_uuid(sandbox_id)}", "-o", "json",
+            timeout=15, namespace=KIND_SANDBOX_NAMESPACE,
+        )
+        running = [
+            pod
+            for pod in json.loads(_require_ok(result, "read the sandbox pod") or "{}").get("items", [])
+            if not (pod.get("metadata") or {}).get("deletionTimestamp")
+            and (pod.get("status") or {}).get("phase") == "Running"
+            and (pod.get("spec") or {}).get("nodeName")
+            and (pod.get("status") or {}).get("podIP")
+        ]
+        if len(running) != 1:
+            return None
+        pod = running[0]
+        return PodNetwork(
+            pod_name=str(pod["metadata"]["name"]),
+            node_name=str(pod["spec"]["nodeName"]),
+            pod_ip=str(pod["status"]["podIP"]),
+        )
+
+    def control_plane_targets(self) -> list[TcpTarget]:
+        return [
+            self._service_target("postgres", "postgres", 5432),
+            self._raw_service_target("kubernetes-api", "default", "kubernetes", 443),
+            self._service_target("internal-api", "space-internal-api", 9800),
+            self._service_target("object-store", "object-store", 8333),
+        ]
+
+    def cluster_dns_target(self) -> TcpTarget:
+        return self._raw_service_target("cluster-dns", "kube-system", "kube-dns", 53)
+
+    def _service_target(self, name: str, service: str, port: int) -> TcpTarget:
+        result = self.kubectl("get", "service", service, "-o", "json", timeout=15)
+        return _service_tcp_target(
+            name, json.loads(_require_ok(result, f"read Service {service}") or "{}"), port
+        )
+
+    def _raw_service_target(self, name: str, namespace: str, service: str, port: int) -> TcpTarget:
+        # Outside the two namespaces the harness addresses; `--raw` takes the
+        # path verbatim and ignores `-n`.
+        path = f"/api/v1/namespaces/{namespace}/services/{service}"
+        result = self.kubectl("get", "--raw", path, timeout=15)
+        return _service_tcp_target(
+            name, json.loads(_require_ok(result, f"read Service {namespace}/{service}") or "{}"), port
+        )
+
+    def probe_from_node_shell(
+        self, node_name: str, targets: Sequence[TcpTarget], *, timeout: float
+    ) -> list[TcpProbe]:
+        script = _tcp_probe_script(targets, timeout=timeout, pod_ip=None)
+        result = self._node_shell_exec(node_name, script, timeout=60 + timeout * len(targets))
+        return _parse_tcp_probes(
+            _require_ok(result, f"probe from the operator shell on {node_name}"), targets
+        )
+
+    def probe_from_pod_netns(
+        self, pod: PodNetwork, targets: Sequence[TcpTarget], *, timeout: float
+    ) -> list[TcpProbe]:
+        script = _tcp_probe_script(targets, timeout=timeout, pod_ip=pod.pod_ip)
+        result = self._node_shell_exec(pod.node_name, script, timeout=60 + timeout * len(targets))
+        if result.returncode == 3 and "NETNS none" in result.stdout:
+            raise SmokeConfigurationError(
+                f"no network namespace on {pod.node_name} carries {pod.pod_name}'s IP {pod.pod_ip}"
+            )
+        output = _require_ok(result, f"probe from the network namespace of {pod.pod_name}")
+        return _parse_tcp_probes(output, targets)
+
+    def start_unselected_pod(self, node_name: str, token: str) -> PodNetwork:
+        self._require_isolated_kind("a pod in the sandbox namespace")
+        if not re.fullmatch(r"[a-f0-9]{8}", token):
+            raise ValueError(f"refusing unselected-pod token {token!r}")
+        name = f"space-smoke-unselected-{token}"
+        manifest = {
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": name, "labels": {UNSELECTED_POD_LABEL: token}},
+            "spec": {
+                # Bound directly: the probe needs it on the sandbox's node,
+                # and the scheduler has no say in what this proves.
+                "nodeName": _kube_node_name(node_name),
+                "automountServiceAccountToken": False,
+                "enableServiceLinks": False,
+                "terminationGracePeriodSeconds": 0,
+                "tolerations": [{"operator": "Exists"}],
+                "containers": [
+                    {"name": "pause", "image": UNSELECTED_POD_IMAGE, "imagePullPolicy": "IfNotPresent"}
+                ],
+            },
+        }
+        _require_ok(
+            self.kubectl(
+                "create", "-f", "-", input_text=json.dumps(manifest), timeout=30,
+                namespace=KIND_SANDBOX_NAMESPACE,
+            ),
+            f"create {name}",
+        )
+        deadline = time.monotonic() + UNSELECTED_POD_READY_SECONDS
+        while True:
+            result = self.kubectl(
+                "get", "pod", name, "-o", "json", timeout=15, namespace=KIND_SANDBOX_NAMESPACE
+            )
+            pod = json.loads(_require_ok(result, f"read {name}") or "{}")
+            status = pod.get("status") or {}
+            if status.get("phase") == "Running" and status.get("podIP"):
+                return PodNetwork(pod_name=name, node_name=node_name, pod_ip=str(status["podIP"]))
+            if time.monotonic() > deadline:
+                raise RuntimeError(
+                    f"{name} was not Running with a pod IP within {UNSELECTED_POD_READY_SECONDS}s: "
+                    f"phase {status.get('phase')!r}"
+                )
+            time.sleep(2)
+
+    def remove_unselected_pods(self, token: str) -> None:
+        if not re.fullmatch(r"[a-f0-9]{8}", token):
+            raise ValueError(f"refusing unselected-pod token {token!r}")
+        _require_ok(
+            self.kubectl(
+                "delete", "pods", "-l", f"{UNSELECTED_POD_LABEL}={token}",
+                "--ignore-not-found", "--wait=false", timeout=30,
+                namespace=KIND_SANDBOX_NAMESPACE,
+            ),
+            f"remove the unselected pod {token}",
+        )
+
     def _read_deployment_env(self, name: str, keys: Sequence[str]) -> dict[str, str | None]:
         """The literal each key holds on a Deployment's first container, None if unset.
 
@@ -5015,6 +5160,87 @@ def _completed_deleting_pod_name(pod: object) -> str | None:
         )
     )
     return name if completed else None
+
+
+_PROBE_NAME = re.compile(r"[a-z0-9][a-z0-9-]{0,62}")
+
+
+def _service_tcp_target(name: str, service: Mapping[str, Any], port: int) -> TcpTarget:
+    """A Service's ClusterIP on one of its declared ports."""
+
+    spec = service.get("spec") or {}
+    cluster_ip = str(spec.get("clusterIP") or "")
+    try:
+        ipaddress.IPv4Address(cluster_ip)
+    except ValueError as error:
+        raise SmokeConfigurationError(f"{name} has no IPv4 ClusterIP: {cluster_ip!r}") from error
+    if not any(
+        entry.get("port") == port and entry.get("protocol", "TCP") == "TCP"
+        for entry in spec.get("ports") or ()
+    ):
+        raise SmokeConfigurationError(f"{name}'s Service declares no TCP port {port}")
+    return TcpTarget(name=name, host=cluster_ip, port=port)
+
+
+def _tcp_probe_script(targets: Sequence[TcpTarget], *, timeout: float, pod_ip: str | None) -> str:
+    """Bash for the operator shell: one TCP connect per target, one result line each.
+
+    With `pod_ip`, the connects run in the network namespace whose interface
+    carries that address, found among the node's netns handles; without it,
+    in the shell's own.
+    """
+
+    if not targets:
+        raise ValueError("a probe needs at least one target")
+    if not 0 < timeout <= 30:
+        raise ValueError(f"refusing probe timeout {timeout!r}")
+    names = [target.name for target in targets]
+    if len(set(names)) != len(names):
+        raise ValueError(f"duplicate probe targets: {names}")
+    lines = ["set -u", 'enter=""']
+    if pod_ip is not None:
+        address = str(ipaddress.IPv4Address(pod_ip))
+        lines += [
+            'handle=""',
+            "for candidate in /var/run/netns/*; do",
+            '  [ -e "$candidate" ] || continue',
+            f'  if nsenter --net="$candidate" ip -4 -o addr show 2>/dev/null | grep -qF " inet {address}/"; then',
+            '    handle="$candidate"; break',
+            "  fi",
+            "done",
+            'if [ -z "$handle" ]; then echo "NETNS none"; exit 3; fi',
+            'echo "NETNS $handle"',
+            'enter="nsenter --net=$handle"',
+        ]
+    seconds = f"{timeout:g}"
+    for target in targets:
+        if not _PROBE_NAME.fullmatch(target.name) or not 0 < target.port < 65536:
+            raise ValueError(f"refusing probe target {target!r}")
+        host = str(ipaddress.IPv4Address(target.host))
+        lines += [
+            f"if $enter timeout {seconds} bash -c 'exec 3<>\"/dev/tcp/$0/$1\"' {host} {target.port} 2>/dev/null; then",
+            f"  echo 'PROBE {target.name} connected'",
+            "else",
+            "  rc=$?",
+            f"  if [ \"$rc\" = 124 ]; then echo 'PROBE {target.name} timed-out'; else echo \"PROBE {target.name} refused rc=$rc\"; fi",
+            "fi",
+        ]
+    return "\n".join(lines) + "\n"
+
+
+def _parse_tcp_probes(output: str, targets: Sequence[TcpTarget]) -> list[TcpProbe]:
+    results: dict[str, str] = {}
+    for line in output.splitlines():
+        if line.startswith("PROBE "):
+            _, name, detail = line.split(" ", 2)
+            results[name] = detail
+    missing = [target.name for target in targets if target.name not in results]
+    if missing:
+        raise RuntimeError(f"the probe reported nothing for {missing}: {output.strip()!r}")
+    return [
+        TcpProbe(target=target, connected=results[target.name] == "connected", detail=results[target.name])
+        for target in targets
+    ]
 
 
 def _kube_pod_name(value: str) -> str:

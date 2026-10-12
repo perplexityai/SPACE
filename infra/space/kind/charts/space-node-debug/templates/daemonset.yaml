@@ -62,6 +62,18 @@ spec:
               readOnly: true
             - name: containerd-run
               mountPath: /run/containerd
+            # The node's network-namespace handles, so the shell enters a
+            # pod's network namespace as an operator on the node host would
+            # (`nsenter --net=/var/run/netns/<handle>`); the sandbox-isolation
+            # smoke probes from a sandbox pod's namespace this way. The handle,
+            # not a pid, names a sandbox pod's namespace: the shim never starts
+            # the pause container, and the Firecracker VM and its gateway run in
+            # a separate per-sandbox namespace. HostToContainer: sees handles
+            # created after the shell started, mounts nothing back.
+            - name: netns
+              mountPath: /var/run/netns
+              mountPropagation: HostToContainer
+              readOnly: true
           {{- with .Values.resources }}
           resources:
             {{- toYaml . | nindent 12 }}
@@ -86,4 +98,8 @@ spec:
         - name: containerd-run
           hostPath:
             path: /run/containerd
+            type: Directory
+        - name: netns
+          hostPath:
+            path: /var/run/netns
             type: Directory
