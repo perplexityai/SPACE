@@ -51,6 +51,7 @@ mod sandbox_trace;
 mod server;
 pub use sandbox_trace::{
     SandboxTraceContext, record_guest_service_outcome, record_guest_service_status,
+    record_sandbox_id,
 };
 mod status;
 mod trace;

@@ -17,6 +17,7 @@ use pplx_space_common_jobs::{
 };
 use pplx_space_common_svc::core::host::linux::identities::{user_names, users};
 use pplx_space_common_svc::core::types::{KekProvider, MasterKeyIdentifier, OrgId};
+use pplx_space_common_svc::record_sandbox_id;
 use pplx_space_common_svc::{
     AuthorizedUdsPeer, UdsPeerAccount, UdsPeerAuthorizer, UdsPeerPrincipal,
 };
@@ -543,6 +544,17 @@ fn parse_subject(raw: &str) -> Result<SubjectId, Status> {
         .map_err(|e| Status::invalid_argument(format!("invalid subject_id: {e}")))
 }
 
+/// [`parse_subject`] for a request's subject, recording a sandbox subject's
+/// canonical `sandbox_id` on the request span so the RPC is found by the same
+/// value as the sandbox's other telemetry.
+fn parse_request_subject(raw: &str) -> Result<SubjectId, Status> {
+    let subject = parse_subject(raw)?;
+    if let SubjectId::Sandbox(sandbox_id) = &subject {
+        tracing::Span::current().record("sandbox_id", tracing::field::display(sandbox_id));
+    }
+    Ok(subject)
+}
+
 fn artifact_job_matches_subject_class(
     job: &pplx_space_common_jobs::Job,
     requested_subject: &SubjectId,
@@ -1028,6 +1040,7 @@ impl VolumeManager for VolumeManagerService {
             .volume
             .ok_or_else(|| Status::invalid_argument("volume spec required"))?;
         let attachment = proto_to_attachment(spec);
+        record_sandbox_id(&tracing::Span::current(), &req.sandbox_id);
         let sandbox_id = req
             .sandbox_id
             .parse::<db::AttachmentSandboxKey>()
@@ -1051,6 +1064,7 @@ impl VolumeManager for VolumeManagerService {
             .authorize_request(&request, "detach_volume", SANDBOX_MANAGER_PEERS)?;
         let _admission = self.transfer_admission.enter()?;
         let req = request.into_inner();
+        record_sandbox_id(&tracing::Span::current(), &req.sandbox_id);
         let sandbox_id = req
             .sandbox_id
             .parse::<db::AttachmentSandboxKey>()
@@ -1072,6 +1086,7 @@ impl VolumeManager for VolumeManagerService {
         self.peer_authorizer
             .authorize_request(&request, "list_volumes", SANDBOX_MANAGER_PEERS)?;
         let req = request.into_inner();
+        record_sandbox_id(&tracing::Span::current(), &req.sandbox_id);
         let sandbox_id = req
             .sandbox_id
             .parse::<db::AttachmentSandboxKey>()
@@ -1125,7 +1140,7 @@ impl VolumeManager for VolumeManagerService {
         )?;
         let admission = self.transfer_admission.enter()?;
         let req = request.into_inner();
-        let subject = parse_subject(&req.subject_id)?;
+        let subject = parse_request_subject(&req.subject_id)?;
         self.authorize_sandbox_subject(&peer, &subject, "push_file")?;
         parse_uri(&req.s3_uri)?;
         let job_id = submit_push(&self.worker, &self.staging, &req).await?;
@@ -1157,7 +1172,7 @@ impl VolumeManager for VolumeManagerService {
         )?;
         let admission = self.transfer_admission.enter()?;
         let req = request.into_inner();
-        let subject = parse_subject(&req.subject_id)?;
+        let subject = parse_request_subject(&req.subject_id)?;
         self.authorize_transfer_subject(&peer, &subject, "pull_file")?;
         parse_uri(&req.s3_uri)?;
         let artifact = effective_pull_snapshot_artifact(&req)?;
@@ -1188,7 +1203,7 @@ impl VolumeManager for VolumeManagerService {
         )?;
         let _admission = self.transfer_admission.enter()?;
         let req = request.into_inner();
-        let subject = parse_subject(&req.subject_id)?;
+        let subject = parse_request_subject(&req.subject_id)?;
         self.authorize_sandbox_subject(&peer, &subject, "submit_push_file")?;
         parse_uri(&req.s3_uri)?;
         let job_id = submit_push(&self.worker, &self.staging, &req).await?;
@@ -1241,7 +1256,7 @@ impl VolumeManager for VolumeManagerService {
         )?;
         let _admission = self.transfer_admission.enter()?;
         let req = request.into_inner();
-        let subject = parse_subject(&format!("sandbox:{}", req.sandbox_id))?;
+        let subject = parse_request_subject(&format!("sandbox:{}", req.sandbox_id))?;
         self.authorize_sandbox_subject(&peer, &subject, "submit_push_btrfs_send")?;
         parse_uri(&req.s3_uri)?;
         // Existing sources must remain recoverable after disabling new capture.
@@ -1259,7 +1274,7 @@ impl VolumeManager for VolumeManagerService {
         )?;
         let _admission = self.transfer_admission.enter()?;
         let req = request.into_inner();
-        let subject = parse_subject(&req.subject_id)?;
+        let subject = parse_request_subject(&req.subject_id)?;
         self.authorize_transfer_subject(&peer, &subject, "submit_pull_file")?;
         parse_uri(&req.s3_uri)?;
         let artifact = effective_pull_snapshot_artifact(&req)?;
@@ -1322,7 +1337,7 @@ impl VolumeManager for VolumeManagerService {
         let req = request.into_inner();
         match req.subject_id.as_deref() {
             Some(subject_id) => {
-                let subject = parse_subject(subject_id)?;
+                let subject = parse_request_subject(subject_id)?;
                 self.authorize_transfer_subject(&peer, &subject, "list_transfer_jobs")?;
             }
             None if !matches!(peer.principal(), UdsPeerPrincipal::Root) => {
@@ -1440,7 +1455,7 @@ impl VolumeManager for VolumeManagerService {
             return Err(Status::invalid_argument("files must not be empty"));
         }
         let artifact_id = parse_artifact_id(&req.artifact_id)?;
-        let subject = parse_subject(&req.subject_id)?;
+        let subject = parse_request_subject(&req.subject_id)?;
         self.authorize_sandbox_subject(&peer, &subject, "push_files_async")?;
         // Encrypted artifacts bind the wrap AAD to (org, sandbox), so they
         // require a sandbox subject; plaintext pushes accept any valid
@@ -1638,7 +1653,7 @@ impl VolumeManager for VolumeManagerService {
             return Err(Status::invalid_argument("files must not be empty"));
         }
         let artifact_id = parse_artifact_id(&req.artifact_id)?;
-        let subject = parse_subject(&req.subject_id)?;
+        let subject = parse_request_subject(&req.subject_id)?;
         self.authorize_transfer_subject(&peer, &subject, "pull_files_async")?;
         // Encrypted artifacts require a sandbox subject so the wrap AAD's
         // `(org, sandbox, artifact_id)` reproduces at execute time; plaintext

@@ -328,6 +328,31 @@ impl HttpSpanMetadata for ApiHttpSpanMetadata {
             native_action_route(method, route, raw_path).map_or(Cow::Borrowed(route), Cow::Owned);
         (Cow::Borrowed(raw_path), route)
     }
+
+    /// Records the sandbox a request's path names as the canonical
+    /// `sandbox_id`, its bare UUID: native routes spell it `sbx_<uuid>`.
+    fn record_extra_fields(
+        &self,
+        _headers: &HeaderMap,
+        raw_path: &str,
+        _matched_route: Option<&str>,
+        span: &tracing::Span,
+    ) {
+        if let Some(sandbox_id) = sandbox_path_segment(raw_path) {
+            pplx_space_common_svc::record_sandbox_id(span, sandbox_id);
+        }
+    }
+}
+
+/// The path segment after `/sandboxes/`, without a native `:action` suffix.
+fn sandbox_path_segment(raw_path: &str) -> Option<&str> {
+    let (_, rest) = raw_path.split_once("/sandboxes/")?;
+    let segment = rest.split('/').next()?;
+    Some(
+        segment
+            .split_once(':')
+            .map_or(segment, |(sandbox_id, _)| sandbox_id),
+    )
 }
 
 /// The declared route of a native `:action` request, such as

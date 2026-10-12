@@ -697,6 +697,9 @@ pub async fn run(
                         ),
                     )
                     .layer(pplx_space_common_svc::grpc_trace_layer())
+                    .layer(pplx_space_common_svc::SandboxSpanLayer::new(
+                        trusted_sandbox_id,
+                    ))
                     .add_service(NetGatewayControlServer::new(service))
                     .serve_with_incoming(incoming)
             })

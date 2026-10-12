@@ -389,6 +389,30 @@ that fallback, preserving the historical Datadog-default behavior while allowing
 later OTLP initialization. Legacy is a migration bridge for production Datadog
 continuity; remove it after native Datadog consumers migrate.
 
+## Sandbox identity
+
+Telemetry names a sandbox by one canonical value, its bare lowercase UUID
+(`019d84bd-280d-7331-99c6-b63377f3a3a2`), in the `sandbox_id` span attribute
+and JSON log field. A span for work on one sandbox carries it, in every
+service that does such work: space-api's request spans for a sandbox route
+and the cluster-controller's create operation, node-api's sandbox RPCs,
+sandbox-manager and node-manager operations, volume-manager jobs and RPCs for
+a sandbox subject, and every RPC a sandbox's net-gateway serves. A Rust
+service's JSON log line written inside such a span carries the same field,
+unless the event sets its own.
+
+Two other spellings remain where they are part of a contract, and convert by
+prefix:
+
+| Where | Spelling | To the canonical value |
+| --- | --- | --- |
+| Native API ids, public operations' `target_id` | `sbx_<uuid>` | drop `sbx_` |
+| Volume-manager `subject_id`, `job.subject_id` | `sandbox:<uuid>` | drop `sandbox:` |
+
+A fork operation's `target_id` is already the source sandbox's bare UUID. The
+reverse conversion prefixes `sbx_`; in a shell, `${id#sbx_}` gives the
+canonical value.
+
 ## Cargo features
 
 Service and library manifests forward these features to observability:

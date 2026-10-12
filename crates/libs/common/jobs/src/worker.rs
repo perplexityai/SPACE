@@ -1,4 +1,4 @@
-use pplx_space_common_core::types::JobId;
+use pplx_space_common_core::types::{JobId, SubjectId};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -276,6 +276,16 @@ fn priority_band_metric_label(min_priority: Option<JobPriority>) -> String {
         || "default".to_string(),
         |priority| priority.get().to_string(),
     )
+}
+
+/// The bare sandbox UUID a `sandbox:<uuid>` subject names: the canonical
+/// `sandbox_id` that every service's spans and logs carry, so a sandbox's
+/// jobs are found by the same value as the rest of its telemetry.
+fn subject_sandbox_id(subject_id: Option<&str>) -> Option<String> {
+    match subject_id?.parse::<SubjectId>().ok()? {
+        SubjectId::Sandbox(sandbox_id) => Some(sandbox_id.to_string()),
+        SubjectId::Template(_) => None,
+    }
 }
 
 /// How the lease claim treats jobs that share a `(kind, subject_id)`.
@@ -854,6 +864,7 @@ impl<E: JobExecutor> BackgroundWorker<E> {
             kind,
             priority = priority.get(),
             subject_id,
+            sandbox_id = subject_sandbox_id(subject_id),
             "job submitted"
         );
         self.spawn_job_for_mode(job_id, kind);
@@ -1377,6 +1388,7 @@ impl<E: JobExecutor> BackgroundWorker<E> {
             job.kind = %job.kind,
             job.priority = job.priority.get(),
             job.subject_id = job.subject_id.as_deref().unwrap_or(""),
+            sandbox_id = subject_sandbox_id(job.subject_id.as_deref()),
             job.attempt = job.attempts,
             job.max_attempts = job.max_attempts,
             otel.status_code = tracing::field::Empty,

@@ -73,7 +73,11 @@ mod document {
                 // `error` and a contention abort at `warn`, so this is context
                 // for someone who turned debug on, not the production record.
                 // Do not read it as replacing that log.
-                tracing::debug!(%error, %sandbox_id, "failed to load sandbox for network policy");
+                tracing::debug!(
+                    %error,
+                    sandbox_id = %pplx_space_common_core::types::SandboxId::from(sandbox_id),
+                    "failed to load sandbox for network policy"
+                );
                 PublicApiError::from(error)
             })?
             .ok_or_else(|| PublicApiError::not_found("sandbox not found"))?;
