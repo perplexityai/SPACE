@@ -123,10 +123,10 @@ impl TransferExecutor {
                 Err(error) => return Err(crate::btrfs_push::classify(error)),
             }
         };
-        let permit = tokio::select! {
+        let codec = tokio::select! {
             biased;
             _ = cancellation.cancelled() => return Err(JobError::Retriable("send admission cancelled".into())),
-            permit = self.acquire_codec_permit(job.priority) => permit?,
+            slot = self.acquire_codec_slot(job.priority) => slot?,
         };
         let input = RemoteReader {
             stream: Box::pin(stream),
@@ -139,9 +139,7 @@ impl TransferExecutor {
         let uses_streaming = streaming.is_some();
         let (logical, wire) = if let Some((config, uploader)) = streaming {
             let admission = ProducerAdmission {
-                executor: self.clone(),
-                priority: job.priority,
-                codec: Some(permit),
+                codec,
                 _producer: producer.expect("streaming acquired producer admission"),
             };
             let (reader, writer) = tokio::io::duplex(PIPE_BYTES);
@@ -198,7 +196,7 @@ impl TransferExecutor {
             let directory = self.shadow_staging_dir.clone();
             let compress = self.config.compress;
             let (temp, logical) = tokio::task::spawn_blocking(move || -> io::Result<_> {
-                let _permit = permit;
+                let _codec = codec;
                 let mut input = input;
                 let mut temp = tempfile::Builder::new()
                     .prefix("send-")

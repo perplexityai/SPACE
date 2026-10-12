@@ -17,6 +17,9 @@ use std::time::Instant;
 use std::os::unix::fs::PermissionsExt;
 
 use crate::artifact::ArtifactEntryRole;
+use crate::codec_admission::{
+    CodecAdmission, CodecAdmissionClosed, CodecPermit, CodecPriority, CodecSlot,
+};
 use crate::credentials::{StorageAccess, UnwrapDekError, exchange_credentials, unwrap_dek};
 use crate::crypto::{self, CryptoError, decrypted_sibling, encrypted_sibling};
 use dashmap::DashMap;
@@ -1007,7 +1010,7 @@ fn ensure_pull_failure_reason(error: JobError) -> JobError {
 /// burning CPU.
 async fn compress_to_temp(
     src: &Path,
-    codec_permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    codec_permit: Option<CodecPermit>,
 ) -> Result<(PathBuf, u64), JobError> {
     let original_size = tokio::fs::metadata(src)
         .await
@@ -1331,7 +1334,7 @@ async fn decompress_in_place(
     path: &Path,
     snapshot_artifact: Option<SnapshotArtifact>,
     requested_mode: MaterializationMode,
-    codec_permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    codec_permit: Option<CodecPermit>,
 ) -> Result<DecompressionReport, JobError> {
     let snapshot_artifact = snapshot_artifact.or_else(|| snapshot_artifact_from_local_path(path));
     let mode = effective_materialization_mode(snapshot_artifact, requested_mode);
@@ -3003,16 +3006,6 @@ impl pplx_space_object_store::FinishingWrite for StreamDecodeSink {
     }
 }
 
-/// The one way codec admission can fail: the executor-owned permit pool
-/// closed. Unreachable in practice (the pool lives for the process), typed
-/// so the failure crosses the object-store boundary as a source error
-/// rather than a string.
-#[derive(Debug, thiserror::Error)]
-enum CodecAdmitError {
-    #[error("codec permit pool closed")]
-    PoolClosed,
-}
-
 /// Codec admission bridge for streaming-decode pulls: one permit spans the
 /// whole overlapped download+decode. The streamed path only runs for
 /// ranged-size objects, whose decode cannot be proven small before the
@@ -3037,15 +3030,14 @@ impl pplx_space_object_store::DecodeAdmission for StreamedPullAdmission<'_> {
         pplx_space_object_store::DecodeAdmissionError,
     > {
         let wait_started = Instant::now();
+        // Typed so the failure crosses the object-store boundary as a source
+        // error rather than a string.
         let permit = self
             .executor
-            .acquire_codec_permit(self.priority)
+            .codec
+            .acquire(self.executor.codec_priority(self.priority))
             .await
-            .map_err(|_closed| {
-                pplx_space_object_store::DecodeAdmissionError::admission(
-                    CodecAdmitError::PoolClosed,
-                )
-            })?;
+            .map_err(pplx_space_object_store::DecodeAdmissionError::admission)?;
         emit_transfer_phase_duration(
             self.kind,
             self.artifact,
@@ -3083,7 +3075,7 @@ async fn stage_decrypted_temp(
     ciphertext_path: &Path,
     options: DecryptedPullOptions,
     resolved_dek: Option<&[u8]>,
-    codec_permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    codec_permit: Option<CodecPermit>,
 ) -> Result<(PathBuf, bool, DecompressionReport), (PathBuf, JobError)> {
     let DecryptedPullOptions {
         decompress_if_zstd,
@@ -3330,12 +3322,10 @@ pub struct TransferExecutor {
     store: Arc<dyn ObjectStore>,
     config: TransferExecutorConfig,
     destination_pull_locks: DestinationPullLocks,
-    /// Shared codec pool — every job may draw on it.
-    codec_permits: Arc<tokio::sync::Semaphore>,
-    /// Codec pool reserved for high-priority jobs; empty when priority-aware
-    /// admission is disabled.
-    codec_priority_permits: Arc<tokio::sync::Semaphore>,
-    /// Priority at or above which a job may draw on `codec_priority_permits`;
+    /// Admission for CPU-bound codec passes, with an optional reserve for
+    /// high-priority jobs.
+    codec: CodecAdmission,
+    /// Priority at or above which a job may draw on the codec reserve;
     /// `None` disables priority-aware admission.
     codec_priority_threshold: Option<JobPriority>,
     stream_writeback: Arc<StreamWritebackCoordinator>,
@@ -3415,7 +3405,7 @@ struct SparseShadowTask {
 
 struct SparseShadowAdmission {
     _shadow_permit: tokio::sync::OwnedSemaphorePermit,
-    _codec_permit: tokio::sync::OwnedSemaphorePermit,
+    _codec_permit: CodecPermit,
 }
 
 fn sparse_shadow_disk_floor_bytes(status: pplx_space_common_core::host::disk::DiskStatus) -> u64 {
@@ -3441,6 +3431,10 @@ async fn remove_sparse_shadow_snapshot(path: &Path, reason: &'static str) {
             "failed to remove sparse shadow snapshot"
         );
     }
+}
+
+fn codec_admission_closed(closed: CodecAdmissionClosed) -> JobError {
+    JobError::Retriable(closed.to_string())
 }
 
 /// Executor tuning resolved by the volume-manager binary and passed into the
@@ -3492,19 +3486,14 @@ impl TransferExecutor {
         shadow_staging_dir: PathBuf,
     ) -> Self {
         let total = resolved_codec_concurrency(config.codec_concurrency);
-        // Reserve from the total, never more than total-1 so the shared
-        // pool keeps at least one permit for low-priority work.
-        let reserve = config.codec_priority_reserve.min(total.saturating_sub(1));
-        let shared = total - reserve;
+        let codec = CodecAdmission::new(total, config.codec_priority_reserve);
         let stream_writeback_priority_threshold = config.codec_priority_threshold;
         // Priority-aware admission only engages when there is both a
         // threshold and a non-empty reserve; otherwise everything shares
         // one pool exactly as before.
-        let codec_priority_threshold = if reserve > 0 {
-            config.codec_priority_threshold
-        } else {
-            None
-        };
+        let codec_priority_threshold = config
+            .codec_priority_threshold
+            .filter(|_| codec.has_reserve());
         let stream_writeback_budget_bytes = if config.stream_writeback_budget_bytes == 0 {
             DEFAULT_STREAM_WRITEBACK_BUDGET_BYTES
         } else {
@@ -3517,8 +3506,7 @@ impl TransferExecutor {
             store,
             config,
             destination_pull_locks: Arc::new(DashMap::new()),
-            codec_permits: Arc::new(tokio::sync::Semaphore::new(shared)),
-            codec_priority_permits: Arc::new(tokio::sync::Semaphore::new(reserve)),
+            codec,
             codec_priority_threshold,
             stream_writeback: StreamWritebackCoordinator::new(
                 stream_writeback_budget_bytes,
@@ -3569,7 +3557,7 @@ impl TransferExecutor {
         &self,
         input_bytes: u64,
         priority: JobPriority,
-    ) -> Result<Option<tokio::sync::OwnedSemaphorePermit>, JobError> {
+    ) -> Result<Option<CodecPermit>, JobError> {
         if input_bytes < CODEC_ADMISSION_MIN_INPUT_BYTES {
             return Ok(None);
         }
@@ -3587,7 +3575,7 @@ impl TransferExecutor {
         &self,
         path: &Path,
         priority: JobPriority,
-    ) -> Result<Option<tokio::sync::OwnedSemaphorePermit>, JobError> {
+    ) -> Result<Option<CodecPermit>, JobError> {
         if frame_content_size(path)
             .await
             .is_some_and(|size| size < CODEC_ADMISSION_MIN_INPUT_BYTES)
@@ -3597,44 +3585,43 @@ impl TransferExecutor {
         self.acquire_codec_permit(priority).await.map(Some)
     }
 
-    /// Acquire one codec permit, respecting the priority reservation.
-    ///
-    /// High-priority jobs (`priority >= codec_priority_threshold`) race the
-    /// reserved and shared pools and take whichever frees first, so a
+    /// Map a job priority onto codec admission. Jobs at or above
+    /// `codec_priority_threshold` race the reserved and shared pools, so a
     /// protected restore never queues behind the low-priority codec backlog
-    /// on the shared pool. Low-priority jobs only ever draw on the shared
-    /// pool, which keeps the reservation honest. When priority-aware
-    /// admission is disabled the reserved pool is empty and every job uses
-    /// the shared pool.
-    async fn acquire_codec_permit(
-        &self,
-        priority: JobPriority,
-    ) -> Result<tokio::sync::OwnedSemaphorePermit, JobError> {
-        let closed = || JobError::Retriable("codec permit pool closed".to_string());
-        let is_high = self
+    /// on the shared pool; everything else draws on the shared pool only.
+    fn codec_priority(&self, priority: JobPriority) -> CodecPriority {
+        if self
             .codec_priority_threshold
-            .is_some_and(|threshold| priority >= threshold);
-        if is_high {
-            tokio::select! {
-                biased;
-                permit = self.codec_priority_permits.clone().acquire_owned() => permit,
-                permit = self.codec_permits.clone().acquire_owned() => permit,
-            }
-            .map_err(|_| closed())
+            .is_some_and(|threshold| priority >= threshold)
+        {
+            CodecPriority::High
         } else {
-            self.codec_permits
-                .clone()
-                .acquire_owned()
-                .await
-                .map_err(|_| closed())
+            CodecPriority::Normal
         }
+    }
+
+    /// Acquire one codec permit, respecting the priority reservation.
+    async fn acquire_codec_permit(&self, priority: JobPriority) -> Result<CodecPermit, JobError> {
+        self.codec
+            .acquire(self.codec_priority(priority))
+            .await
+            .map_err(codec_admission_closed)
+    }
+
+    /// [`Self::acquire_codec_permit`] for a pass that lends its permit while
+    /// it cannot run (see [`CodecSlot`]).
+    async fn acquire_codec_slot(&self, priority: JobPriority) -> Result<CodecSlot, JobError> {
+        self.codec
+            .acquire_slot(self.codec_priority(priority))
+            .await
+            .map_err(codec_admission_closed)
     }
 
     fn try_acquire_sparse_shadow_admission(&self) -> Option<SparseShadowAdmission> {
         let shadow_permit = Arc::clone(&self.shadow_comparison_permits)
             .try_acquire_owned()
             .ok()?;
-        let codec_permit = Arc::clone(&self.codec_permits).try_acquire_owned().ok()?;
+        let codec_permit = self.codec.try_acquire_shared()?;
         Some(SparseShadowAdmission {
             _shadow_permit: shadow_permit,
             _codec_permit: codec_permit,
@@ -4506,7 +4493,7 @@ async fn stage_encrypted_temp(
     src_path: &Path,
     compress: bool,
     resolved_dek: Option<&[u8]>,
-    codec_permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    codec_permit: Option<CodecPermit>,
 ) -> Result<PathBuf, (PathBuf, JobError)> {
     let enc_path = encrypted_sibling(src_path);
     let src_path_buf = src_path.to_path_buf();

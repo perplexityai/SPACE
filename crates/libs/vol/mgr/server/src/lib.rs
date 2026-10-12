@@ -2,6 +2,7 @@
 
 pub mod artifact;
 mod btrfs_push;
+mod codec_admission;
 pub mod credentials;
 pub mod crypto;
 pub mod db;

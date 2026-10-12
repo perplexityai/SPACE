@@ -382,7 +382,7 @@ async fn deterministic_stream_failures_are_permanent_and_join_the_producer() {
         assert!(matches!(error, JobError::Permanent(_)), "{error:?}");
         assert_eq!(std::fs::read(payload.upload_source()).unwrap(), bytes);
         assert_eq!(server.recorded.lock().unwrap().completes, 0);
-        assert_eq!(executor.codec_permits.available_permits(), 1);
+        assert_eq!(executor.codec.shared_available(), 1);
         assert_eq!(
             executor
                 .stream_push
@@ -446,13 +446,15 @@ async fn cancel_and_drop_under_backpressure_release_codec_and_abort_without_comp
             1,
             "the live producer remains bounded while its codec slot is lent"
         );
-        let borrowed_codec =
-            tokio::time::timeout(Duration::from_secs(5), executor.codec_permits.acquire())
-                .await
-                .expect("a backpressured encoder must lend its idle codec slot")
-                .unwrap();
+        let borrowed_codec = tokio::time::timeout(
+            Duration::from_secs(5),
+            executor.codec.acquire(CodecPriority::Normal),
+        )
+        .await
+        .expect("a backpressured encoder must lend its idle codec slot")
+        .unwrap();
         assert_eq!(
-            executor.codec_priority_permits.available_permits(),
+            executor.codec.reserve_available(),
             1,
             "protected restore admission is untouched"
         );
@@ -466,11 +468,13 @@ async fn cancel_and_drop_under_backpressure_release_codec_and_abort_without_comp
             .unwrap();
         assert!(outcome.is_err() || outcome.unwrap().is_err());
         drop(borrowed_codec);
-        let permit =
-            tokio::time::timeout(Duration::from_secs(10), executor.codec_permits.acquire())
-                .await
-                .unwrap()
-                .unwrap();
+        let permit = tokio::time::timeout(
+            Duration::from_secs(10),
+            executor.codec.acquire(CodecPriority::Normal),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         drop(permit);
         server.wait_for(|s| s.aborts > 0).await;
         assert_eq!(server.recorded.lock().unwrap().completes, 0);
@@ -493,25 +497,23 @@ async fn cancellation_while_reacquiring_codec_keeps_producer_bounded() {
         runtime: tokio::runtime::Handle::current(),
         cancellation: cancellation.clone(),
         admission: ProducerAdmission {
-            executor: executor.clone(),
-            priority: test_job("push").priority,
-            codec: Some(
-                executor
-                    .codec_permits
-                    .clone()
-                    .acquire_owned()
-                    .await
-                    .unwrap(),
-            ),
+            codec: executor
+                .codec
+                .acquire_slot(CodecPriority::Normal)
+                .await
+                .unwrap(),
             _producer: config.producers.clone().acquire_owned().await.unwrap(),
         },
         waited: Duration::ZERO,
     };
     let task = tokio::task::spawn_blocking(move || output.write(&[1]));
-    let borrowed = tokio::time::timeout(Duration::from_secs(5), executor.codec_permits.acquire())
-        .await
-        .expect("blocked writer must lend its codec slot")
-        .unwrap();
+    let borrowed = tokio::time::timeout(
+        Duration::from_secs(5),
+        executor.codec.acquire(CodecPriority::Normal),
+    )
+    .await
+    .expect("blocked writer must lend its codec slot")
+    .unwrap();
     assert_eq!(config.producers.available_permits(), 1);
     assert_eq!(reader.read_u8().await.unwrap(), 0);
     assert_eq!(reader.read_u8().await.unwrap(), 1);
@@ -525,7 +527,7 @@ async fn cancellation_while_reacquiring_codec_keeps_producer_bounded() {
         .expect_err("encoder must not resume without codec admission");
     assert_eq!(config.producers.available_permits(), 2);
     drop(borrowed);
-    assert_eq!(executor.codec_permits.available_permits(), 1);
+    assert_eq!(executor.codec.shared_available(), 1);
 }
 
 #[tokio::test]
@@ -535,14 +537,15 @@ async fn producer_error_after_eof_never_completes_an_object() {
     let path = dir.path().join("source");
     std::fs::write(&path, synthetic_bytes(6 * MIB)).unwrap();
     let executor = executor();
-    let slots = executor.codec_permits.clone();
     let source = compression_source(
         std::fs::File::open(path).unwrap(),
         7 * MIB as u64,
         ProducerAdmission {
-            executor: executor.clone(),
-            priority: test_job("push").priority,
-            codec: Some(slots.clone().acquire_owned().await.unwrap()),
+            codec: executor
+                .codec
+                .acquire_slot(CodecPriority::Normal)
+                .await
+                .unwrap(),
             _producer: executor
                 .stream_push
                 .as_ref()
@@ -568,7 +571,7 @@ async fn producer_error_after_eof_never_completes_an_object() {
         .await
         .unwrap_err();
     assert!(matches!(error, StreamingUploadError::Source(_)));
-    assert_eq!(slots.available_permits(), 1);
+    assert_eq!(executor.codec.shared_available(), 1);
     let state = server.recorded.lock().unwrap();
     assert_eq!(state.completes, 0);
     assert_eq!(state.aborts, 1);
@@ -634,12 +637,7 @@ async fn compatibility_paths_keep_file_uploads_and_small_sources_bypass_codec_qu
     // Small inputs must retain their file-path admission bypass even when
     // streaming is enabled and a large producer occupies the shared pool.
     let executor = self::executor();
-    let _busy = executor
-        .codec_permits
-        .clone()
-        .acquire_owned()
-        .await
-        .unwrap();
+    let _busy = executor.codec.acquire(CodecPriority::Normal).await.unwrap();
     let server = Server::start().await;
     let dir = tempfile::tempdir().unwrap();
     let bytes = vec![7; 2 * MIB];

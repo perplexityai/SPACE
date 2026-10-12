@@ -158,10 +158,10 @@ impl TransferExecutor {
             permit = config.producers.clone().acquire_owned() => permit
                 .map_err(|_| JobError::Retriable("stream producer admission closed".into()))?,
         };
-        let permit = tokio::select! {
+        let codec = tokio::select! {
             biased;
             _ = cancellation.cancelled() => return Err(JobError::Retriable("stream upload cancelled during admission".into())),
-            permit = self.acquire_codec_permit(job.priority) => permit?,
+            slot = self.acquire_codec_slot(job.priority) => slot?,
         };
         emit_transfer_phase_duration(
             &job.kind,
@@ -179,9 +179,7 @@ impl TransferExecutor {
             file,
             original_size,
             ProducerAdmission {
-                executor: self.clone(),
-                priority: job.priority,
-                codec: Some(permit),
+                codec,
                 _producer: producer,
             },
             cancellation,
@@ -237,9 +235,7 @@ impl TransferExecutor {
 }
 
 struct ProducerAdmission {
-    executor: TransferExecutor,
-    priority: JobPriority,
-    codec: Option<tokio::sync::OwnedSemaphorePermit>,
+    codec: CodecSlot,
     _producer: tokio::sync::OwnedSemaphorePermit,
 }
 
@@ -367,18 +363,18 @@ impl Write for PipeWriter {
                     if result.is_pending() {
                         // The synchronous encoder cannot run while Write is
                         // pending. Let queued codec work use this idle slot.
-                        self.admission.codec.take();
+                        self.admission.codec.lend();
                     }
                     result
                 }) => result,
             }?;
-            if self.admission.codec.is_none() {
-                self.admission.codec = Some(tokio::select! {
+            if self.admission.codec.is_lent() {
+                tokio::select! {
                     biased;
                     _ = self.cancellation.cancelled() => return Err(io::Error::other("snapshot compression cancelled")),
-                    permit = self.admission.executor.acquire_codec_permit(self.admission.priority) =>
-                        permit.map_err(io::Error::other)?,
-                });
+                    reacquired = self.admission.codec.reacquire() =>
+                        reacquired.map_err(codec_admission_closed).map_err(io::Error::other)?,
+                }
             }
             // Write must not return to zstd until CPU admission is restored.
             Ok(count)

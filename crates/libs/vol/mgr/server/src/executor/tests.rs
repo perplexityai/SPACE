@@ -318,7 +318,7 @@ async fn streamed_pull_decodes_inline_and_never_double_decodes() {
         "decoded exactly once despite nested magic"
     );
     assert_eq!(
-        executor.codec_permits.available_permits(),
+        executor.codec.shared_available(),
         2,
         "streamed decode permit must be released"
     );
@@ -2079,7 +2079,7 @@ async fn codec_admission_bypasses_small_inputs() {
         .expect("bypass admission must not fail");
     assert!(permit.is_none(), "small inputs must skip admission");
     assert_eq!(
-        executor.codec_permits.available_permits(),
+        executor.codec.shared_available(),
         1,
         "a bypassed input must not consume a permit"
     );
@@ -2137,7 +2137,7 @@ async fn codec_decode_admission_takes_permit_on_unknown_size() {
         "unknown-size streaming frame must take a permit"
     );
     assert_eq!(
-        executor.codec_permits.available_permits(),
+        executor.codec.shared_available(),
         0,
         "the held permit must be consumed while alive"
     );
@@ -2241,8 +2241,8 @@ async fn codec_priority_reserve_zero_shares_one_pool() {
         executor.codec_priority_threshold.is_none(),
         "zero reserve must disable priority-aware admission"
     );
-    assert_eq!(executor.codec_permits.available_permits(), 3);
-    assert_eq!(executor.codec_priority_permits.available_permits(), 0);
+    assert_eq!(executor.codec.shared_available(), 3);
+    assert_eq!(executor.codec.reserve_available(), 0);
 }
 #[cfg(target_os = "linux")]
 #[test]
@@ -3803,11 +3803,11 @@ async fn shadow_comparison_skips_before_reflink_when_worker_is_busy() {
 #[tokio::test]
 async fn shadow_comparison_skips_when_shared_codec_capacity_is_busy() {
     let executor = test_executor(Arc::new(MockObjectStore::default()));
-    let shared_capacity = executor.codec_permits.available_permits();
-    let _held_codec_permits = Arc::clone(&executor.codec_permits)
-        .acquire_many_owned(shared_capacity.try_into().unwrap())
-        .await
-        .unwrap();
+    let shared_capacity = executor.codec.shared_available();
+    let mut held_codec_permits = Vec::new();
+    for _ in 0..shared_capacity {
+        held_codec_permits.push(executor.codec.acquire(CodecPriority::Normal).await.unwrap());
+    }
 
     assert!(
         executor.try_acquire_sparse_shadow_admission().is_none(),
