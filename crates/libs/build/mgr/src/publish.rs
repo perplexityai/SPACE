@@ -346,6 +346,7 @@ async fn recorded_release_locations(
     template_org: Option<TemplateOrg>,
 ) -> Result<Option<Vec<String>>, PublishError> {
     let request = FindTemplateReleaseByHashRequest {
+        generic_only: false,
         template_name: template.as_str().to_string(),
         hash: content_hash.to_string(),
         caller_org_id: template_org.map(|org| org.org_id().as_uuid().to_string()),

@@ -191,6 +191,7 @@ async fn private_republication() -> TestResult {
 
     let mut client = pplx_space_node_api_client::cluster::connect(endpoint, "test-token").await?;
     let lookup = |name: &str| FindTemplateReleaseByHashRequest {
+        generic_only: false,
         template_name: name.to_owned(),
         hash: hash.to_string(),
         caller_org_id: Some(owner.to_string()),

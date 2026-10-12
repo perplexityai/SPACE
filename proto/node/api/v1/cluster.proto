@@ -339,6 +339,8 @@ message FindTemplateReleaseRequest {
   string tag = 3;
   // Tenant authorization is checked atomically with release resolution.
   optional string caller_org_id = 4;
+  // Restrict release and storage resolution to generic templates in one SQL snapshot.
+  bool generic_only = 5;
 }
 
 message FindTemplateReleaseResponse {
@@ -350,6 +352,9 @@ message FindTemplateReleaseResponse {
   TemplateVisibility template_visibility = 3;
   // Scoped callers must reject responses without this acknowledgement.
   optional string authorized_org_id = 4;
+  // True only when generic-only resolution succeeded. Prefetch must require this
+  // acknowledgement so older servers cannot silently ignore the restriction.
+  bool generic_authorized = 5;
 }
 
 message FindTemplateReleaseByHashRequest {
@@ -361,6 +366,7 @@ message FindTemplateReleaseByHashRequest {
   // `(template_name, hash)` uniquely identifies a release.
   string hash = 2;
   optional string caller_org_id = 3;
+  bool generic_only = 4;
 }
 
 message ListLatestTemplateReleasesRequest {

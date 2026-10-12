@@ -1,3 +1,4 @@
+mod prefetch_catalog;
 use pplx_space_common_core::types::{LocalArtifactId, NodeId, OrgId, SnapshotId, UserId};
 
 use super::metadata::*;
@@ -441,6 +442,7 @@ async fn scoped_release_lookup_hides_private_bases(
                     service
                         .find_template_release_by_hash(Request::new(
                             FindTemplateReleaseByHashRequest {
+                                generic_only: false,
                                 template_name: name,
                                 hash,
                                 caller_org_id: org,
@@ -450,6 +452,7 @@ async fn scoped_release_lookup_hides_private_bases(
                 } else {
                     service
                         .find_template_release(Request::new(FindTemplateReleaseRequest {
+                            generic_only: false,
                             template_name: name,
                             runtime: "firecracker".into(),
                             tag: "stable".into(),
@@ -872,6 +875,7 @@ async fn register_template_release_reuses_a_bare_hash_release() -> TestResult {
     let latest = fixture
         .service
         .find_template_release(Request::new(FindTemplateReleaseRequest {
+            generic_only: false,
             caller_org_id: None,
             template_name: "code-runtime".to_string(),
             runtime: "firecracker".to_string(),
@@ -938,6 +942,7 @@ async fn register_template_release_prefers_the_duplicate_that_owns_a_location() 
         let resolved = fixture
             .service
             .find_template_release(Request::new(FindTemplateReleaseRequest {
+                generic_only: false,
                 caller_org_id: None,
                 template_name: "code-runtime".to_string(),
                 runtime: "firecracker".to_string(),
@@ -991,6 +996,7 @@ async fn register_template_release_is_idempotent_by_hash() -> TestResult {
     let by_hash = fixture
         .service
         .find_template_release_by_hash(Request::new(FindTemplateReleaseByHashRequest {
+            generic_only: false,
             caller_org_id: None,
             template_name: "code-runtime".to_string(),
             hash: digest_a.to_string(),
@@ -1013,6 +1019,7 @@ async fn register_template_release_is_idempotent_by_hash() -> TestResult {
     let by_tag = fixture
         .service
         .find_template_release(Request::new(FindTemplateReleaseRequest {
+            generic_only: false,
             caller_org_id: None,
             template_name: "code-runtime".to_string(),
             runtime: "firecracker".to_string(),
@@ -1056,6 +1063,7 @@ async fn register_template_release_is_idempotent_by_hash() -> TestResult {
     let latest = fixture
         .service
         .find_template_release(Request::new(FindTemplateReleaseRequest {
+            generic_only: false,
             caller_org_id: None,
             template_name: "code-runtime".to_string(),
             runtime: "firecracker".to_string(),
@@ -1121,6 +1129,7 @@ async fn storage_policy_rejects_registration_without_changing_release_or_tags() 
         let latest = fixture
             .service
             .find_template_release(Request::new(FindTemplateReleaseRequest {
+                generic_only: false,
                 template_name: "code-runtime".into(),
                 runtime: "fc".into(),
                 tag: "latest".into(),
@@ -1159,6 +1168,7 @@ async fn register_template_release_allows_no_storage_locations() -> TestResult {
     let by_hash = fixture
         .service
         .find_template_release_by_hash(Request::new(FindTemplateReleaseByHashRequest {
+            generic_only: false,
             caller_org_id: None,
             template_name: "code-runtime".to_string(),
             hash: digest.to_string(),
@@ -1360,6 +1370,7 @@ async fn find_template_release_by_hash_resolves_bare_hash() -> TestResult {
     let by_bare = fixture
         .service
         .find_template_release_by_hash(Request::new(FindTemplateReleaseByHashRequest {
+            generic_only: false,
             caller_org_id: None,
             template_name: "code-runtime".to_string(),
             hash: bare.to_string(),
@@ -1376,6 +1387,7 @@ async fn find_template_release_by_hash_resolves_bare_hash() -> TestResult {
     let by_prefixed = fixture
         .service
         .find_template_release_by_hash(Request::new(FindTemplateReleaseByHashRequest {
+            generic_only: false,
             caller_org_id: None,
             template_name: "code-runtime".to_string(),
             hash: prefixed.clone(),
@@ -3432,6 +3444,7 @@ async fn release_visible_from(
             .service
             .find_template_release(node_scoped_request(
                 FindTemplateReleaseRequest {
+                    generic_only: false,
                     caller_org_id: caller_org_id.clone(),
                     template_name: template.to_string(),
                     runtime: "firecracker".to_string(),
@@ -3446,6 +3459,7 @@ async fn release_visible_from(
             .service
             .find_template_release_by_hash(node_scoped_request(
                 FindTemplateReleaseByHashRequest {
+                    generic_only: false,
                     caller_org_id,
                     template_name: template.to_string(),
                     hash: hash.to_string(),
@@ -3521,6 +3535,7 @@ async fn node_scoped_lookups_hide_unplaced_private_releases() -> TestResult {
     fixture
         .service
         .find_template_release(Request::new(FindTemplateReleaseRequest {
+            generic_only: false,
             caller_org_id: None,
             template_name: "private-base".to_string(),
             runtime: "firecracker".to_string(),
@@ -3566,6 +3581,7 @@ async fn placed_sandbox_unlocks_private_release_for_its_node_only() -> TestResul
         .service
         .find_template_release(node_scoped_request(
             FindTemplateReleaseRequest {
+                generic_only: false,
                 caller_org_id: None,
                 template_name: "private-base".to_string(),
                 runtime: "firecracker".to_string(),
@@ -6023,6 +6039,7 @@ async fn template_visibility_degrades_to_unspecified_without_column() -> TestRes
     let by_tag = fixture
         .service
         .find_template_release(Request::new(FindTemplateReleaseRequest {
+            generic_only: false,
             caller_org_id: None,
             template_name: "code-runtime".to_string(),
             runtime: "firecracker".to_string(),
@@ -6039,6 +6056,7 @@ async fn template_visibility_degrades_to_unspecified_without_column() -> TestRes
     let by_hash = fixture
         .service
         .find_template_release_by_hash(Request::new(FindTemplateReleaseByHashRequest {
+            generic_only: false,
             caller_org_id: None,
             template_name: "code-runtime".to_string(),
             hash: VISIBILITY_TEST_DIGEST.to_string(),
@@ -6123,6 +6141,7 @@ async fn visibility_lookup_reads_from_the_visibility_pool() -> TestResult {
         .with_visibility_pool(sideline.service.pool.clone());
     let response = service
         .find_template_release(Request::new(FindTemplateReleaseRequest {
+            generic_only: false,
             caller_org_id: None,
             template_name: "code-runtime".to_string(),
             runtime: "firecracker".to_string(),
@@ -6147,6 +6166,7 @@ async fn visibility_lookup_reads_from_the_visibility_pool() -> TestResult {
     // one of them back to the shared pool is its own distinct bug.
     let by_hash = service
         .find_template_release_by_hash(Request::new(FindTemplateReleaseByHashRequest {
+            generic_only: false,
             caller_org_id: None,
             template_name: "code-runtime".to_string(),
             hash: VISIBILITY_TEST_DIGEST.to_string(),
@@ -6204,6 +6224,7 @@ async fn template_visibility_unrecognized_value_is_unspecified() -> TestResult {
     let by_tag = fixture
         .service
         .find_template_release(Request::new(FindTemplateReleaseRequest {
+            generic_only: false,
             caller_org_id: None,
             template_name: "code-runtime".to_string(),
             runtime: "firecracker".to_string(),
@@ -6254,6 +6275,7 @@ async fn template_visibility_maps_column_values() -> TestResult {
         async move {
             service
                 .find_template_release(Request::new(FindTemplateReleaseRequest {
+                    generic_only: false,
                     caller_org_id: None,
                     template_name: "code-runtime".to_string(),
                     runtime: "firecracker".to_string(),
@@ -6291,6 +6313,7 @@ async fn template_visibility_maps_column_values() -> TestResult {
     let by_hash = fixture
         .service
         .find_template_release_by_hash(Request::new(FindTemplateReleaseByHashRequest {
+            generic_only: false,
             caller_org_id: None,
             template_name: "code-runtime".to_string(),
             hash: VISIBILITY_TEST_DIGEST.to_string(),
@@ -6398,6 +6421,7 @@ async fn visibility_of_find(fixture: &ClusterFixture) -> TestResult<TemplateVisi
     Ok(fixture
         .service
         .find_template_release(Request::new(FindTemplateReleaseRequest {
+            generic_only: false,
             caller_org_id: None,
             template_name: "code-runtime".to_string(),
             runtime: "firecracker".to_string(),

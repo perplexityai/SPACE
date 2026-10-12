@@ -142,6 +142,8 @@ because disabling it by mistake would leave every create queued forever.
 
 ## Templates and builds
 
+Prefetch requires the catalog to confirm generic-only release resolution from the same database snapshot as its storage locations. Cached visibility alone does not authorize a download. Upgrade the catalog before template-manager; an older catalog cannot acknowledge this restriction, so prefetch pauses until it is upgraded. On-demand pulls retain their existing authorization.
+
 | Variable | Default | Notes |
 | --- | --- | --- |
 | `SPACE_TEMPLATE_PREFETCH_ENABLED` | on | |

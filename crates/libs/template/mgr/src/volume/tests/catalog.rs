@@ -156,6 +156,7 @@ async fn assert_pull_outcome(visibility: TemplateVisibility, trigger: PullTrigge
         (PullTrigger::OnDemand, _) | (_, TemplateVisibility::Generic) => {
             PullFailure::NoStorageLocations
         }
+        (_, TemplateVisibility::OrgSpecific) => PullFailure::ClusterMetadataMissing,
         _ => PullFailure::TemplateNotGeneric,
     };
     assert!(

@@ -337,10 +337,18 @@ impl ClusterApi for ClusterApiService {
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
         let rows = self
             .template_releases_store
-            .find_by_tag(&template_name, runtime, &tag, caller_org, &scope)
+            .find_by_tag(
+                &template_name,
+                runtime,
+                &tag,
+                caller_org,
+                &scope,
+                request.generic_only,
+            )
             .await
             .map_err(|error| Status::internal(format!("query release: {error}")))?;
 
+        let generic_authorized = rows.first().is_some_and(|row| row.generic_authorized);
         let release = match rows.first() {
             Some(first) => TemplateRelease {
                 id: first.release_id.to_string(),
@@ -375,6 +383,7 @@ impl ClusterApi for ClusterApiService {
         )
         .await;
         Ok(Response::new(FindTemplateReleaseResponse {
+            generic_authorized,
             authorized_org_id: caller_org.map(|org| org.to_string()),
             release: Some(release),
             storage_locations,
@@ -412,10 +421,18 @@ impl ClusterApi for ClusterApiService {
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
         let rows = self
             .template_releases_store
-            .find_by_hash(&template_name, &hash, &bare_hash, caller_org, &scope)
+            .find_by_hash(
+                &template_name,
+                &hash,
+                &bare_hash,
+                caller_org,
+                &scope,
+                request.generic_only,
+            )
             .await
             .map_err(|error| Status::internal(format!("query release: {error}")))?;
 
+        let generic_authorized = rows.first().is_some_and(|row| row.generic_authorized);
         let release = match rows.first() {
             Some(first) => TemplateRelease {
                 id: first.release_id.to_string(),
@@ -450,6 +467,7 @@ impl ClusterApi for ClusterApiService {
         )
         .await;
         Ok(Response::new(FindTemplateReleaseResponse {
+            generic_authorized,
             authorized_org_id: caller_org.map(|org| org.to_string()),
             release: Some(release),
             storage_locations,

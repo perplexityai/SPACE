@@ -747,33 +747,29 @@ async fn pull_inner(
 ) -> PullOutcome {
     let name = spec.name;
     // 1. Resolve (release.hash, storage_uris) via ClusterApi.
-    let release = match find_release(name, spec.req_hash, spec.req_tag, base_tags).await {
-        Ok(found) => found,
-        Err(FindReleaseError::NotFound) => {
-            return PullOutcome::ClassifiedFailure(PullFailure::ClusterMetadataMissing);
-        }
-        Err(FindReleaseError::Unavailable) => {
-            return PullOutcome::ClassifiedFailure(PullFailure::ClusterMetadataUnavailable);
-        }
-        Err(FindReleaseError::InvalidResponse) => {
-            return PullOutcome::ClassifiedFailure(PullFailure::ClusterMetadataInvalid);
-        }
-        Err(FindReleaseError::Status(status)) => {
-            return PullOutcome::DownstreamFailure {
-                failure: PullFailure::ClusterMetadataUnavailable,
-                status,
-            };
-        }
-    };
+    let release =
+        match find_release(name, spec.req_hash, spec.req_tag, base_tags, spec.trigger).await {
+            Ok(found) => found,
+            Err(FindReleaseError::NotFound) => {
+                return PullOutcome::ClassifiedFailure(PullFailure::ClusterMetadataMissing);
+            }
+            Err(FindReleaseError::Unavailable) => {
+                return PullOutcome::ClassifiedFailure(PullFailure::ClusterMetadataUnavailable);
+            }
+            Err(FindReleaseError::InvalidResponse) => {
+                return PullOutcome::ClassifiedFailure(PullFailure::ClusterMetadataInvalid);
+            }
+            Err(FindReleaseError::Status(status)) => {
+                return PullOutcome::DownstreamFailure {
+                    failure: PullFailure::ClusterMetadataUnavailable,
+                    status,
+                };
+            }
+        };
 
-    // Final visibility gate for prefetch-triggered pulls. The prefetch
-    // tick's gate decided on a response one RPC ago; this re-resolve is
-    // the freshest visibility we'll see before bytes hit the disk, so a
-    // template that flipped away from Generic in between must abort
-    // here. On-demand pulls are exempt: they serve an already-authorized
-    // sandbox create (the API's create-time authz gate owns that
-    // decision), including org-specific templates on their own org's
-    // dedicated nodes.
+    // The catalog has enforced generic-only selection in the same SQL snapshot
+    // as the release and locations. Cached visibility is only an additional
+    // conservative gate; it cannot authorize the final prefetch resolution.
     if prefetch_pull_blocked(spec.trigger, release.visibility) {
         warn!(
             template = name,
@@ -927,9 +923,11 @@ async fn find_release(
     req_hash: &str,
     req_tag: &str,
     base_tags: &[String],
+    trigger: PullTrigger,
 ) -> Result<ResolvedRelease, FindReleaseError> {
     let started = Instant::now();
-    let result = find_release_inner(name, req_hash, req_tag, None).await;
+    let generic_only = trigger.is_prefetch();
+    let result = find_release_with_requirement(name, req_hash, req_tag, None, generic_only).await;
     let result_label = match &result {
         Ok(_) => "ok",
         Err(FindReleaseError::NotFound) => "not_found",
@@ -981,6 +979,16 @@ pub(crate) async fn find_release_inner(
     req_tag: &str,
     caller_org: Option<OrgId>,
 ) -> Result<ResolvedRelease, FindReleaseError> {
+    find_release_with_requirement(name, req_hash, req_tag, caller_org, false).await
+}
+
+async fn find_release_with_requirement(
+    name: &str,
+    req_hash: &str,
+    req_tag: &str,
+    caller_org: Option<OrgId>,
+    generic_only: bool,
+) -> Result<ResolvedRelease, FindReleaseError> {
     let mut client = connect_cluster_api_from_env().await.map_err(|error| {
         warn!(error = %error, "cluster api connect failed");
         FindReleaseError::Unavailable
@@ -997,6 +1005,7 @@ pub(crate) async fn find_release_inner(
         let hash = req_hash.to_string();
         match client
             .find_template_release_by_hash(FindTemplateReleaseByHashRequest {
+                generic_only,
                 caller_org_id: caller_org.map(|org| org.to_string()),
                 template_name: name.to_string(),
                 hash: hash.clone(),
@@ -1026,6 +1035,7 @@ pub(crate) async fn find_release_inner(
         let tag = lookup_tag(req_tag);
         match client
             .find_template_release(FindTemplateReleaseRequest {
+                generic_only,
                 caller_org_id: caller_org.map(|org| org.to_string()),
                 template_name: name.to_string(),
                 runtime: DEFAULT_RUNTIME.to_string(),
@@ -1045,19 +1055,22 @@ pub(crate) async fn find_release_inner(
         }
     };
 
-    parse_release_response(name, req_hash, caller_org, resp)
+    parse_release_response(name, req_hash, caller_org, generic_only, resp)
 }
 
 fn parse_release_response(
     name: &str,
     req_hash: &str,
     caller_org: Option<OrgId>,
+    generic_only: bool,
     resp: pplx_space_node_api_client::proto::FindTemplateReleaseResponse,
 ) -> Result<ResolvedRelease, FindReleaseError> {
     // Read the enum accessor before destructuring `resp.release` — taking
     // the release out of the struct is a partial move, after which `resp`
     // can no longer be borrowed as a whole.
-    if resp.authorized_org_id != caller_org.map(|org| org.to_string()) {
+    if (generic_only && !resp.generic_authorized)
+        || resp.authorized_org_id != caller_org.map(|org| org.to_string())
+    {
         return Err(FindReleaseError::InvalidResponse);
     }
     let visibility = resp.template_visibility();
