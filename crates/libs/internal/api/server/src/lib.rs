@@ -594,7 +594,12 @@ impl ClusterApiService {
             .await?
             .ok_or_else(|| Status::not_found(format!("snapshot {snapshot_id} not found")))?;
         let source_node = self
-            .authorize_backup_source_node(attempt.source_node_id(), remote_addr, "backup attempt")
+            .authorize_backup_source_node(
+                &self.pool,
+                attempt.source_node_id(),
+                remote_addr,
+                "backup attempt",
+            )
             .await?;
 
         // For READY, persist the uploaded bytes and clear any
@@ -861,6 +866,7 @@ impl ClusterApiService {
         // and a read before the transaction could see a row retention
         // deletes before the insert. A refusal rolls the insert back.
         self.authorize_backup_source_node(
+            &mut *tx,
             persisted.source_node_id(),
             remote_addr,
             "backup attempt",
@@ -1226,42 +1232,8 @@ impl ClusterApiService {
         remote_addr: Option<std::net::SocketAddr>,
     ) -> Result<OriginNode, Status> {
         let value = trimmed_required(value, "origin_node_id")?;
-        let role_hint_str = role_hint.map(SpaceNodeRole::as_str);
         if let Ok(node_id) = value.parse::<NodeId>() {
-            let row = sqlx::query_as::<_, OriginNodeRow>(sql!(
-                "SELECT n.id,
-                        host(n.address) AS address,
-                        n.role
-                 FROM nodes n
-                 WHERE n.id = $1
-                   AND ($2::TEXT IS NULL OR n.role = $2)
-                   AND n.managed_by IN ('space', 'k8s')
-                   AND COALESCE(n.state, 'registered') != 'deleted'
-                 LIMIT 1"
-            ))
-            .bind(node_id.as_uuid())
-            .bind(role_hint_str)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|err| Status::internal(format!("resolve origin node: {err}")))?;
-            if let Some(row) = row {
-                let role = SpaceNodeRole::parse(&row.role).map_err(|error| {
-                    Status::internal(format!(
-                        "registered node {} has unknown role {}: {error}",
-                        value, row.role
-                    ))
-                })?;
-                return Ok(OriginNode {
-                    id: row.id,
-                    display_id: value.to_string(),
-                    address: parse_origin_address(row.address.as_deref())?,
-                    role,
-                    bootstrapped: false,
-                });
-            }
-            return Err(Status::not_found(format!(
-                "origin_node_id {value} is not registered"
-            )));
+            return registered_origin_node(&self.pool, &value, node_id, role_hint).await;
         }
 
         let Some(role_hint) = role_hint else {
@@ -1439,6 +1411,7 @@ impl ClusterApiService {
     /// name a node. No source node fails closed. Returns the admitted node.
     async fn authorize_backup_source_node(
         &self,
+        executor: impl sqlx::PgExecutor<'_>,
         source_node_id: Option<NodeId>,
         remote_addr: Option<std::net::SocketAddr>,
         subject: &str,
@@ -1448,12 +1421,54 @@ impl ClusterApiService {
                 "{subject} has no source node that may publish a backup for it"
             ))
         })?;
-        let origin = self
-            .resolve_origin_node_id(&node_id.to_string(), None, None)
-            .await?;
+        let origin = registered_origin_node(executor, &node_id.to_string(), node_id, None).await?;
         validate_origin_remote_addr(&origin, remote_addr)?;
         Ok(node_id)
     }
+}
+
+/// Look up a registered node by ID on `executor`, so a caller holding a
+/// transaction does not need a second pooled connection.
+async fn registered_origin_node(
+    executor: impl sqlx::PgExecutor<'_>,
+    display_id: &str,
+    node_id: NodeId,
+    role_hint: Option<SpaceNodeRole>,
+) -> Result<OriginNode, Status> {
+    let row = sqlx::query_as::<_, OriginNodeRow>(sql!(
+        "SELECT n.id,
+                host(n.address) AS address,
+                n.role
+         FROM nodes n
+         WHERE n.id = $1
+           AND ($2::TEXT IS NULL OR n.role = $2)
+           AND n.managed_by IN ('space', 'k8s')
+           AND COALESCE(n.state, 'registered') != 'deleted'
+         LIMIT 1"
+    ))
+    .bind(node_id.as_uuid())
+    .bind(role_hint.map(SpaceNodeRole::as_str))
+    .fetch_optional(executor)
+    .await
+    .map_err(|err| Status::internal(format!("resolve origin node: {err}")))?;
+    let Some(row) = row else {
+        return Err(Status::not_found(format!(
+            "origin_node_id {display_id} is not registered"
+        )));
+    };
+    let role = SpaceNodeRole::parse(&row.role).map_err(|error| {
+        Status::internal(format!(
+            "registered node {display_id} has unknown role {}: {error}",
+            row.role
+        ))
+    })?;
+    Ok(OriginNode {
+        id: row.id,
+        display_id: display_id.to_string(),
+        address: parse_origin_address(row.address.as_deref())?,
+        role,
+        bootstrapped: false,
+    })
 }
 
 async fn read_node_k8s_tombstone(

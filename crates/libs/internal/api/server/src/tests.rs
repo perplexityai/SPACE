@@ -5215,6 +5215,27 @@ async fn concurrent_begin_artifact_backup_is_idempotent() -> TestResult {
     Ok(())
 }
 
+// The insert holds its transaction open while authorizing the source node.
+// Concurrent callers each hold a pooled connection, so the authorization
+// lookup must not need a second one; one connection makes that deterministic.
+#[tokio::test(flavor = "current_thread")]
+async fn begin_artifact_backup_completes_on_a_single_pooled_connection() -> TestResult {
+    let Some(fixture) = cluster_fixture_with_max_connections(1).await? else {
+        return Ok(());
+    };
+    let sandbox_id = seed_sandbox(&fixture.service.pool).await?;
+    begin_artifact_backup(
+        &fixture.service,
+        sandbox_id,
+        LocalArtifactId::new(),
+        SnapshotId::from_uuid(Uuid::now_v7()),
+        pplx_space_sbx_mgr_client::proto::ArtifactKind::Full,
+        pplx_space_sbx_mgr_client::proto::ArtifactOrigin::Suspend,
+    )
+    .await?;
+    Ok(())
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn begin_artifact_backup_rejects_missing_or_invalid_snapshot_name() -> TestResult {
     let Some(fixture) = cluster_fixture().await? else {
