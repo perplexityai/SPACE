@@ -79,6 +79,34 @@ fn run_test(name: &str, vars: &[(&str, Option<&OsStr>)]) {
     );
 }
 
+/// Set by GitHub CI: a test that needs root then fails without it instead of
+/// skipping, so a privileged test that drifts out of the `privileged` nextest
+/// group fails the unprivileged step. An empty value or `0` leaves it off.
+pub const REQUIRE_TEST_PRIVILEGE: &str = "SPACE_CI_REQUIRE_TEST_PRIVILEGE";
+
+/// Whether a test that needs root can run its root path. Returns true as root.
+/// Without root it fails the test when [`REQUIRE_TEST_PRIVILEGE`] has any value
+/// other than empty or `0`, and otherwise reports the skip on stderr and
+/// returns false. Return from the test when this returns false.
+#[cfg(unix)]
+#[must_use = "return from the test when this returns false"]
+pub fn root_or_skip(requirement: &str) -> bool {
+    if nix::unistd::geteuid().is_root() {
+        return true;
+    }
+    let required = std::env::var_os(REQUIRE_TEST_PRIVILEGE)
+        .is_some_and(|value| !value.is_empty() && value != "0");
+    assert!(
+        !required,
+        "requires root to {requirement}, and {REQUIRE_TEST_PRIVILEGE} is set to require it: \
+         list this test in the privileged nextest group"
+    );
+    eprintln!(
+        "SKIPPED: requires root to {requirement}; {REQUIRE_TEST_PRIVILEGE} is unset, empty or 0"
+    );
+    false
+}
+
 /// Run a test command with a deadline, returning its PID and captured output.
 /// Each returned output stream contains at most its final MiB. On Unix, timeout and
 /// unwinding terminate the owned process group; the direct child is reaped.

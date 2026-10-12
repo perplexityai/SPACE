@@ -456,6 +456,7 @@ jobs:
             --env SPACE_CI_COMMAND
             --env SPACE_CI_PER_COMMIT_MIGRATION_ISOLATION
             --env SPACE_CI_REQUIRE_TEST_DEPS=1
+            --env SPACE_CI_REQUIRE_TEST_PRIVILEGE=1
             --env SPACE_M1_GENERATOR_MIRROR=ghcr.io/perplexityai/space-ci-mirror
           )
 
@@ -509,7 +510,7 @@ jobs:
           docker run "${docker_args[@]}" "space-ci:${GITHUB_SHA}" \
             bash -c 'git config --global --add safe.directory /workspace && exec bash -c "$SPACE_CI_COMMAND"'
 
-      # The nextest group `privileged`: 41 tests that need root, CAP_SYS_ADMIN,
+      # The nextest group `privileged`: 39 tests that need root, CAP_SYS_ADMIN,
       # a seccomp profile allowing pidfd_getfd, or a Docker socket, or whose
       # root path differs, and 12 opt-in tests that return early because
       # neither step opts them in. Also the M1 generator check. They run the binaries the step above built, whatever its result,
@@ -537,6 +538,7 @@ jobs:
             --env GITHUB_ACTIONS=true
             --env NEXTEST_TEST_THREADS=30
             --env SPACE_CI_REQUIRE_TEST_DEPS=1
+            --env SPACE_CI_REQUIRE_TEST_PRIVILEGE=1
             --env SPACE_M1_GENERATOR_MIRROR=ghcr.io/perplexityai/space-ci-mirror
           )
           if [[ "${SPACE_CI_MAIN_ONLY_TESTS}" == true ]]; then

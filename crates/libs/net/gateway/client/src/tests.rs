@@ -1,17 +1,63 @@
+// Exercise the public connector's real path selection, rather than a helper
+// that could be passed a safe path while production still uses the alias.
+// Those are fixed node paths, and on a node `/space/run` holds the live
+// gateways, so the test runs on a thread whose private mount namespace has an
+// empty tmpfs as its root: nothing it creates reaches the host.
 #[cfg(target_os = "linux")]
-#[tokio::test]
-async fn sandbox_connections_ignore_replaced_alias_and_reject_legacy_only_gateway() {
+#[test]
+fn sandbox_connections_ignore_replaced_alias_and_reject_legacy_only_gateway() {
+    if !pplx_space_test_env::root_or_skip("mount a private root over the node's fixed paths") {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            enter_private_root(root.path());
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(connect_through_the_fixed_paths());
+        });
+    });
+}
+
+/// Unsharing the mount namespace also unshares this thread's root directory,
+/// so the chroot changes no other thread. Private propagation keeps the tmpfs
+/// out of the host's namespace, and it disappears with this thread.
+#[cfg(target_os = "linux")]
+fn enter_private_root(root: &std::path::Path) {
+    use nix::mount::{MsFlags, mount};
+    use nix::sched::{CloneFlags, unshare};
+
+    unshare(CloneFlags::CLONE_NEWNS).unwrap();
+    mount(
+        None::<&str>,
+        "/",
+        None::<&str>,
+        MsFlags::MS_REC | MsFlags::MS_PRIVATE,
+        None::<&str>,
+    )
+    .unwrap();
+    mount(
+        Some("tmpfs"),
+        root,
+        Some("tmpfs"),
+        MsFlags::MS_NOSUID | MsFlags::MS_NODEV,
+        Some("mode=0755"),
+    )
+    .unwrap();
+    nix::unistd::chroot(root).unwrap();
+    nix::unistd::chdir("/").unwrap();
+}
+
+#[cfg(target_os = "linux")]
+async fn connect_through_the_fixed_paths() {
     use pplx_space_common_core::host::linux::paths;
     use std::path::Path;
     use std::time::Duration;
     use tokio::net::UnixListener;
 
-    if !nix::unistd::geteuid().is_root() {
-        eprintln!("requires root; run in the Linux isolation test container");
-        return;
-    }
-    // Exercise the public connector's real path selection, rather than a helper
-    // that could be passed a safe path while production still uses the alias.
     std::fs::create_dir_all(paths::NET_GATEWAY_RUN_DIR).unwrap();
     let gateway_dir = tempfile::Builder::new()
         .prefix("control-endpoint-test-")
@@ -22,13 +68,6 @@ async fn sandbox_connections_ignore_replaced_alias_and_reject_legacy_only_gatewa
     let alias_dir = Path::new(&alias).parent().unwrap();
     std::fs::create_dir_all(alias_dir.parent().unwrap()).unwrap();
     std::fs::create_dir(alias_dir).unwrap();
-    struct AliasDirectory(std::path::PathBuf);
-    impl Drop for AliasDirectory {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-    let alias_cleanup = AliasDirectory(alias_dir.to_owned());
     let canonical = gateway_dir.path().join("control.sock");
     std::os::unix::fs::symlink(&canonical, &alias).unwrap();
     // A sandbox-UID process replaces its own directory entry after preparation.
@@ -65,5 +104,4 @@ async fn sandbox_connections_ignore_replaced_alias_and_reject_legacy_only_gatewa
         .await
         .expect_err("the substituted listener must receive no connection");
     drop(impostor);
-    drop(alias_cleanup);
 }

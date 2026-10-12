@@ -72,6 +72,7 @@ rstest = { workspace = true }
 # reviewed.
 pplx-space-metrics = { workspace = true, features = ["test-capture"] }
 hyper-util = { workspace = true, features = ["tokio"] }
+pplx-space-test-env = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 tower = { workspace = true }

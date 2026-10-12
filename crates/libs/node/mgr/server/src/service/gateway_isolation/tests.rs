@@ -49,8 +49,7 @@ fn isolated_gateway_cannot_access_vm_resources() {
         drop(listener);
         return;
     }
-    if !nix::unistd::geteuid().is_root() {
-        eprintln!("requires root; run in the Linux isolation test container");
+    if !pplx_space_test_env::root_or_skip("run probes as the gateway and sandbox uids") {
         return;
     }
     let root = tempfile::tempdir().unwrap();

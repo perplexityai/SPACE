@@ -1,8 +1,24 @@
 use super::*;
 use uuid::Uuid;
 
+/// Root reads the copy across the uploader's actual DAC boundary, as uid 65534
+/// in the copy's group, without changing this test process's credentials.
 #[test]
 fn ciphertext_publication_is_readable_without_exposing_private_backings() {
+    if !pplx_space_test_env::root_or_skip("publish to another group and read as another uid") {
+        return;
+    }
+    assert_ciphertext_staging(65534, Some(65534));
+}
+
+/// The unprivileged path: the copy can only be published to this process's
+/// own group, and no other uid can be borrowed to read it.
+#[test]
+fn repeated_ciphertext_staging_replaces_the_copy_without_loosening_the_backing() {
+    assert_ciphertext_staging(nix::unistd::getegid().as_raw(), None);
+}
+
+fn assert_ciphertext_staging(reader_gid: u32, reader_uid: Option<u32>) {
     use std::io::Write;
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::os::unix::process::CommandExt;
@@ -14,11 +30,6 @@ fn ciphertext_publication_is_readable_without_exposing_private_backings() {
     let published = root.join("published");
     std::fs::create_dir(&instance).unwrap();
     std::fs::create_dir(&published).unwrap();
-    let reader_gid = if nix::unistd::geteuid().is_root() {
-        65534
-    } else {
-        nix::unistd::getegid().as_raw()
-    };
     for dir in [&instance, &published] {
         std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
@@ -30,13 +41,11 @@ fn ciphertext_publication_is_readable_without_exposing_private_backings() {
         // Repeated staging must replace the copy, not loosen the live backing.
         for _ in 0..2 {
             stage_ciphertext(&root, &src, &dst, reader_gid).unwrap();
-            if nix::unistd::geteuid().is_root() {
-                // Exercise the uploader's actual DAC boundary on root-run Linux
-                // tests, without changing this test process's credentials.
+            if let Some(reader_uid) = reader_uid {
                 let read_as_peer = |file: &Path| {
                     std::process::Command::new("/bin/cat")
                         .arg(file)
-                        .uid(65534)
+                        .uid(reader_uid)
                         .gid(reader_gid)
                         .output()
                         .unwrap()

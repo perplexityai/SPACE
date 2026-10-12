@@ -15,4 +15,4 @@ tempfile.workspace = true
 pplx-space-common-core.workspace = true
 
 [target.'cfg(unix)'.dependencies]
-nix = { workspace = true, features = ["signal", "process"] }
+nix = { workspace = true, features = ["signal", "process", "user"] }

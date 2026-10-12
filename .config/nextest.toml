@@ -70,7 +70,7 @@ priority = 10
 max-threads = 8
 
 [[profile.default.overrides]]
-# 53 tests: 41 that exercise privilege in CI, and 12 opt-in tests that return
+# 51 tests: 39 that exercise privilege in CI, and 12 opt-in tests that return
 # early there because neither CI step opts them in.
 #
 # Root alone: identity_handoff, clone_tree, transfer_directory, the credmgr
@@ -80,14 +80,14 @@ max-threads = 8
 # which Docker's default seccomp profile allows only with CAP_SYS_PTRACE. The
 # bootstrap-role tests each start a virgin Postgres container.
 #
-# Root path differs from the unprivileged one: encrypted_volumes reads as uid
-# 65534 only as root; permission_tree rewrites ownership between distinct uids
-# and covers the private shelter only as root; the credmgr binary-check test
-# pins root's short-circuit as root. gateway_isolation and the
-# net-gateway-client test return early when not root.
+# Root halves of split tests, whose unprivileged halves run outside the group:
+# encrypted_volumes reads the published copy as uid 65534; permission_tree
+# rewrites ownership between distinct uids and covers the private shelter.
+# gateway_isolation and the net-gateway-client test (which mounts a private
+# root over the node's fixed paths) skip when not root, and fail instead when
+# CI sets SPACE_CI_REQUIRE_TEST_PRIVILEGE, as the root halves do.
 #
-# Root only for an incidental step, until the test loses it: the build-mgr
-# copy test escalates through sudo when not root, and the net-gateway
+# Root only for an incidental step, until the test loses it: the net-gateway
 # exemption test's relay sets SO_MARK (CAP_NET_RAW).
 #
 # The 12 opt-in tests assert root, need kernel capabilities, or escalate once
@@ -112,12 +112,10 @@ or (package(pplx-space-node-mgr) and test(/::startup_containment::tests::linux::
 or (package(pplx-space-sbx-mgr) and test(=transfer_directory::tests::distinct_service_uids_can_exchange_downloads))
 or (package(pplx-space-credmgr) and test(=run::tests::volume_socket::real_peers_obey_volume_listener_policy))
 or (package(pplx-space-credmgr) and test(=run::volume_socket::tests::preflight_checks_real_permissions_without_replacing_live_socket))
-or (package(pplx-space-credmgr) and test(=auth::tests::uds_peer_binary_check_is_reached_when_uids_match))
 or binary_id(pplx-space-spaced-guest-server::worker_subprocess)
 or binary_id(pplx-space-spaced-guest-server::worker_telemetry)
 or (package(pplx-space-spaced-guest-server) and test(=filesystem::router::tests::a_read_streams_from_the_workers_descriptor_without_relaying_through_it))
 or (package(pplx-space-spaced-guest-server) and test(=filesystem::router::tests::a_read_through_a_workers_descriptor_ends_with_the_worker))
-or (package(pplx-space-build-mgr) and test(=oci::assembly::tests::extraction_failure_is_not_masked_by_archive_sigpipe))
 or (package(pplx-space-build-mgr) and test(=oci::assembly::tests::real_oci_image_assembles_with_the_space_guest_bundle))
 or (package(pplx-space-build-mgr) and test(/^oci::containerd::tests::real_containerd_exposes_a_flattened_read_only_rootfs::/))
 or (package(pplx-space-net-gateway) and test(=tcp_proxy::tests::tls_interception::interception_exemptions_relay_original_tls_only_after_admission))

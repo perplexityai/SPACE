@@ -3,8 +3,53 @@ use crate::cache_ownership::RETAINED_SOURCE_MODE;
 use nix::fcntl::AtFlags;
 use std::os::unix::fs::{PermissionsExt, symlink};
 
+/// Root rewrites a retired uid distinct from the new owner, and only root can
+/// build the private shelter: a root-owned bundle in the cache group.
 #[test]
 fn owned_walk_prunes_snapshots_and_never_mutates_link_targets() {
+    if !pplx_space_test_env::root_or_skip("chown between distinct uids") {
+        return;
+    }
+    let old_uid = 100_042;
+    assert_owned_walk(OwnedWalk {
+        old_uid,
+        cache_gid: pplx_space_common_core::host::linux::identities::gids::SPACE_CACHE_RW,
+        // Keep the bundle's owner distinct from the retired UID so
+        // verification must descend to find that UID, rather than return at
+        // the boundary.
+        other_uid: old_uid + 1,
+        private_shelter: true,
+    });
+}
+
+/// The unprivileged path: every file already belongs to this process's uid
+/// and group, which is all an ordinary user can chown to.
+#[test]
+fn owned_walk_over_the_current_uid_prunes_snapshots_and_never_mutates_link_targets() {
+    let uid = nix::unistd::getuid().as_raw();
+    assert_owned_walk(OwnedWalk {
+        old_uid: uid,
+        cache_gid: nix::unistd::getgid().as_raw(),
+        other_uid: uid,
+        private_shelter: false,
+    });
+}
+
+struct OwnedWalk {
+    old_uid: u32,
+    cache_gid: u32,
+    other_uid: u32,
+    private_shelter: bool,
+}
+
+fn assert_owned_walk(
+    OwnedWalk {
+        old_uid,
+        cache_gid,
+        other_uid,
+        private_shelter,
+    }: OwnedWalk,
+) {
     let temp = tempfile::tempdir().unwrap();
     let base = temp.path().canonicalize().unwrap();
     let root = base.join("cache");
@@ -37,7 +82,6 @@ fn owned_walk_prunes_snapshots_and_never_mutates_link_targets() {
     };
     let uid = nix::unistd::getuid().as_raw();
     let gid = nix::unistd::getgid().as_raw();
-    let old_uid = if uid == 0 { 100_042 } else { uid };
     let base_fd = File::open(&base).unwrap();
     for path in [
         &root,
@@ -84,14 +128,6 @@ fn owned_walk_prunes_snapshots_and_never_mutates_link_targets() {
     assert_eq!(std::fs::metadata(&kept).unwrap().mode() & 0o7777, 0o660);
     // A private-looking name alone cannot shelter sandbox-owned files from
     // retirement: writable, wrong-owner, and wrong-group directories are ordinary cache.
-    let cache_gid = if uid == 0 {
-        pplx_space_common_core::host::linux::identities::gids::SPACE_CACHE_RW
-    } else {
-        gid
-    };
-    // As root, keep the bundle's owner distinct from the retired UID so verification
-    // must descend to find that UID, rather than return at the boundary.
-    let other_uid = if uid == 0 { old_uid + 1 } else { uid };
     for (name, owner, group, mode, private) in [
         ("writable", uid, cache_gid, 0o770, false),
         (
@@ -104,7 +140,7 @@ fn owned_walk_prunes_snapshots_and_never_mutates_link_targets() {
         ("wrong-group", uid, gid, RETAINED_SOURCE_MODE, false),
     ]
     .into_iter()
-    .chain((uid == 0).then_some(("private", 0, cache_gid, RETAINED_SOURCE_MODE, true)))
+    .chain(private_shelter.then_some(("private", 0, cache_gid, RETAINED_SOURCE_MODE, true)))
     {
         let bundle = root.join(name).join("rootfs.btrfs-source");
         std::fs::create_dir_all(&bundle).unwrap();
