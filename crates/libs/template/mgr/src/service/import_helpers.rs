@@ -323,7 +323,8 @@ impl TemplateManagerService {
         header: &crate::proto::ImportTemplateHeader,
         stream: &mut tonic::Streaming<crate::proto::ImportTemplateRequest>,
     ) -> Result<Response<crate::proto::ImportTemplateResponse>, Status> {
-        let digest_dir = build_dir(template_id, content_hash);
+        let digest_dir = build_artifacts_dir(&self.artifact_store.root, template_id, content_hash);
+        let digest_dir = digest_dir.to_string_lossy().into_owned();
         let staging_dir = format!("{digest_dir}.importing.{}", Uuid::now_v7());
 
         if std::path::Path::new(&digest_dir).exists() {
@@ -427,7 +428,7 @@ impl TemplateManagerService {
         staging_dir: &str,
     ) -> Result<Response<crate::proto::ImportTemplateResponse>, Status> {
         // Ensure the name dir exists
-        let name_dir = template_name_dir(template_id);
+        let name_dir = template_artifacts_dir(&self.artifact_store.root, template_id);
         std::fs::create_dir_all(&name_dir)
             .map_err(|e| Status::internal(format!("create name dir: {e}")))?;
         set_template_cache_permissions(Path::new(&name_dir), TEMPLATE_CACHE_DIR_MODE)?;
