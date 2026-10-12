@@ -32,3 +32,11 @@ allow = ["CDLA-Permissive-2.0"]
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+
+# RUSTSEC-2024-0449 is informational: unsafe-libyaml is unmaintained, with no
+# known vulnerability. Keep this exception to that one advisory; other
+# advisories keep the default policy. Remove it once #303 drops the crate.
+[advisories]
+ignore = [
+    { id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml is unmaintained; it enters only via datadog-opentelemetry -> libdd-library-config -> serde_yaml 0.9.34+deprecated -> unsafe-libyaml. Removal is tracked in #303." },
+]
