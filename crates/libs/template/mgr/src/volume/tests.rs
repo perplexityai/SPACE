@@ -1,3 +1,5 @@
+mod catalog;
+
 use super::*;
 use pplx_space_node_api_client::proto::{FindTemplateReleaseResponse, TemplateRelease};
 

@@ -208,28 +208,6 @@ fn accumulated_verdict_overrides_skewed_generic_read() {
     assert_eq!(hardened_visibility(false, OrgSpecific), OrgSpecific);
 }
 
-/// The dispatch path re-resolves the release by hash right before
-/// downloading, and that re-resolve is the freshest visibility
-/// available, so a prefetch-triggered pull fails closed on anything
-/// but a confirmed `Generic` there: otherwise a visibility flip
-/// between the tick's gate and the download would still materialize
-/// a private rootfs. On-demand pulls stay exempt — already
-/// authorized by the API's create-time gate. The gate takes no setting:
-/// an absent or invalid configuration cannot open it.
-#[test]
-fn prefetch_pull_fails_closed_on_final_resolve() {
-    use crate::volume::prefetch_pull_blocked;
-    use TemplateVisibility::{Generic, OrgSpecific, Unspecified};
-    for trigger in [PullTrigger::PrefetchTag, PullTrigger::PrefetchLatestRelease] {
-        assert!(prefetch_pull_blocked(trigger, OrgSpecific));
-        assert!(prefetch_pull_blocked(trigger, Unspecified));
-        assert!(!prefetch_pull_blocked(trigger, Generic));
-    }
-    for visibility in [Generic, Unspecified, OrgSpecific] {
-        assert!(!prefetch_pull_blocked(PullTrigger::OnDemand, visibility));
-    }
-}
-
 /// The template-level verdict survives an empty latest-releases
 /// list: the response-level visibility field stands alone when there
 /// are no entries to fold. An org-specific template whose releases
