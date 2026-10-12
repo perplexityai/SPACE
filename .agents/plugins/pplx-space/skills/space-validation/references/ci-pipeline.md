@@ -49,7 +49,15 @@ container with the Docker socket but still no host network, from the first
 step's binaries through nextest's `--binaries-metadata` and
 `--cargo-metadata`, so it compiles nothing. It first confirms it selects the
 tests the first step listed, runs the M1 generator check, and returns any
-file it created to the runner user. Add a test to the group when it needs
+file it created to the runner user on every exit, including one during its
+toolchain preflight. The split keeps ordinary tests from mutating the host by
+accident; it is not a trust boundary. The unprivileged step mounts the whole
+checkout read-write, so it can write everything the root step runs from: the
+target directory (the test binaries, the `nextest-*.json` metadata and
+`nextest-privileged.txt`) and the scripts and configuration the root step
+executes (`ci/scripts/run-rust-checks.sh`, `.config/nextest.toml` and the
+nextest setup scripts). A hostile test or build script in the first step
+therefore still runs as root on the runner. Add a test to the group when it needs
 root, kernel capabilities, devices or its own containers, or when its root
 path differs from its unprivileged one (or split it in two); keep such tests
 asserting what they need, so a missing one fails the unprivileged step.

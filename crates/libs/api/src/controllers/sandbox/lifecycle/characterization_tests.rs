@@ -631,8 +631,12 @@ async fn completed_actions_keep_a_terminal_lifecycle_that_landed_mid_flight() ->
 /// publication: it converges a row the node reports stopped back to
 /// `stopped`, and a node report of `started` never moves a `stopped` row
 /// (`node_publication_converges_only_from_its_source_lifecycles` in the
-/// internal API), so a refused write over a running sandbox would stay
-/// wrong. That is the cost of wake's opposite choice.
+/// internal API). So outside the Kubernetes activation-receipt path, a
+/// refused write over a running sandbox would stay wrong; that is the cost of
+/// wake's opposite choice. On that path, an activation-completion receipt
+/// whose attempt fence still matches sets the receipt's target lifecycle over
+/// any row its excluded list omits, `stopped` included
+/// (`consume_activation_completion_receipts` in the internal API).
 ///
 /// This drives `SandboxLifecycleOperationExecutor::execute` directly. The
 /// `stopped` is written by a trigger on the start's route-identity receipt,
@@ -747,45 +751,67 @@ async fn native_start_overwrites_a_stopped_written_mid_flight_without_a_retry() 
 /// foreign-key insert into a child table takes on the sandbox row; a node
 /// publication transaction can hold one for its whole duration. The open
 /// transaction stands in for that insert and holds its lock across the whole
-/// action.
+/// action. Start is seeded unplaced so its lifecycle-and-placement write is
+/// pinned under the lock as well.
 ///
-/// Direct suspend is the documented exception, not a case: it persists its
-/// suspend artifact under `SELECT ... FOR UPDATE` on the sandbox row
+/// Direct suspend is the exception: it persists its suspend artifact under
+/// `SELECT ... FOR UPDATE` on the sandbox row
 /// (`persist_optional_current_local_artifact`), which conflicts with
-/// `FOR KEY SHARE`, so it waits for the child insert to finish.
+/// `FOR KEY SHARE`. It waits on that lock while the child insert is open and
+/// completes once the insert ends.
 #[tokio::test(flavor = "current_thread")]
 async fn completed_actions_do_not_wait_for_a_key_share_lock() -> TestResult {
+    use std::time::Duration;
+
     if !crate::test_support::enter_sim_worker_process_with_owned_token_files() {
         return Ok(());
     }
-    // The open child-insert transaction holds one connection.
-    let db = pg_test_db_with_max_connections(4).await?;
+    // The open child-insert transaction holds one connection, and the
+    // lock-wait probe below takes another while suspend waits on its own.
+    let db = pg_test_db_with_max_connections(5).await?;
     let pool = &db.pool;
     let controller = direct_controller(pool);
     let (worker, node_id) = start_sim_worker(pool).await?;
-
-    for (action, prior, resident, completed) in [
-        (SandboxAction::Start, "stopped", "stopped", "started"),
-        (SandboxAction::Resume, "paused", "paused", "started"),
-        (SandboxAction::Pause, "started", "running", "paused"),
-        (SandboxAction::Stop, "started", "running", "stopped"),
-        (SandboxAction::Kill, "started", "running", "stopped"),
-    ] {
-        let sandbox_id = SandboxId::new();
+    let seed = async |sandbox_id: SandboxId, prior: &str, placement: &str, resident: &str| {
         insert_sandbox(pool, sandbox_id, prior, "space").await?;
         place_on_node(pool, sandbox_id, node_id).await?;
+        set_placement(pool, sandbox_id, placement).await?;
         insert_resident(worker.state(), sandbox_id, resident).await?;
-        let sandbox = tracked(pool, sandbox_id).await?;
+        tracked(pool, sandbox_id).await
+    };
+    let hold_key_share = async |sandbox_id: SandboxId| -> TestResult<_> {
         let mut child_insert = pool.begin().await?;
         sqlx::query(sql!("SELECT 1 FROM sandboxes WHERE id = $1 FOR KEY SHARE"))
             .bind(sandbox_id)
             .execute(&mut *child_insert)
             .await?;
+        let holder: i32 = sqlx::query_scalar(sql!("SELECT pg_backend_pid()"))
+            .fetch_one(&mut *child_insert)
+            .await?;
+        Ok((child_insert, holder))
+    };
+
+    for (action, prior, resident, completed) in [
+        (SandboxAction::Start, "stopped", "stopped", "started"),
+        (SandboxAction::Wake, "paused", "paused", "started"),
+        (SandboxAction::Resume, "paused", "paused", "started"),
+        (SandboxAction::Pause, "started", "running", "paused"),
+        (SandboxAction::Stop, "started", "running", "stopped"),
+        (SandboxAction::Kill, "started", "running", "stopped"),
+    ] {
+        let placement = if action == SandboxAction::Start {
+            "unplaced"
+        } else {
+            "on_node"
+        };
+        let sandbox_id = SandboxId::new();
+        let sandbox = seed(sandbox_id, prior, placement, resident).await?;
+        let (child_insert, _) = hold_key_share(sandbox_id).await?;
 
         // The timeout only bounds the failure: an action that waits on the
         // lock cannot finish while the transaction holds it.
         let body = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
+            Duration::from_secs(10),
             run_action(&controller, pool, sandbox_id, Some(&sandbox), action, None),
         )
         .await
@@ -794,11 +820,69 @@ async fn completed_actions_do_not_wait_for_a_key_share_lock() -> TestResult {
 
         assert_eq!(body["ok"], true, "{action:?}");
         assert_eq!(
-            row(pool, sandbox_id).await?.map(|row| row.lifecycle),
-            Some(completed.to_owned()),
+            row(pool, sandbox_id).await?,
+            Some(Row::new(completed, "on_node")),
             "{action:?}"
         );
     }
+
+    let sandbox_id = SandboxId::new();
+    let sandbox = seed(sandbox_id, "started", "on_node", "running").await?;
+    let (child_insert, holder) = hold_key_share(sandbox_id).await?;
+    let suspend = run_action(
+        &controller,
+        pool,
+        sandbox_id,
+        Some(&sandbox),
+        SandboxAction::Suspend,
+        None,
+    );
+    tokio::pin!(suspend);
+    // Only the artifact lock itself, located by its `sql!` module, and only
+    // while this test's child insert is what blocks it: other api statements
+    // end in the same `FOR UPDATE` text.
+    let artifact_lock_wait = async {
+        loop {
+            let waiting: bool = sqlx::query_scalar(sql!(
+                r"SELECT EXISTS (
+                     SELECT 1
+                       FROM pg_stat_activity
+                      WHERE datname = current_database()
+                        AND wait_event_type = 'Lock'
+                        AND $1 = ANY(pg_blocking_pids(pid))
+                        AND query ~ '^/\*pplx_space_api::controllers::substrate:[0-9]+\*/ SELECT id FROM sandboxes WHERE id = \$1 FOR UPDATE$'
+                 )"
+            ))
+            .bind(holder)
+            .fetch_one(pool)
+            .await?;
+            if waiting {
+                return Ok::<_, sqlx::Error>(());
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    };
+    // Both arms are bounded: suspend must neither finish under the lock nor
+    // fail to reach it.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::select! {
+            result = &mut suspend => {
+                Err(format!("suspend finished under a FOR KEY SHARE lock: {result:?}"))
+            }
+            waited = artifact_lock_wait => waited.map_err(|error| error.to_string()),
+        }
+    })
+    .await
+    .map_err(|_| "suspend never waited on its artifact lock")??;
+    child_insert.rollback().await?;
+    let body = tokio::time::timeout(Duration::from_secs(10), suspend)
+        .await
+        .map_err(|_| "suspend did not complete after the lock was released")??;
+    assert_eq!(body["ok"], true);
+    assert_eq!(
+        row(pool, sandbox_id).await?,
+        Some(Row::new("suspended", "on_node"))
+    );
     Ok(())
 }
 

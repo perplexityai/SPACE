@@ -393,6 +393,14 @@ a rename or typo fails CI rather than moving a test to the unprivileged half.
 The check cannot find a privileged test that no clause names; only that test's
 own assertion can.
 
+The split keeps ordinary tests from mutating the host by accident. It is not a
+trust boundary: the unprivileged half has the whole checkout read-write, so it
+can write everything the root half runs from. That is the target directory
+(the test binaries, nextest's metadata and the privileged test list) and the
+scripts and configuration the root half executes (`ci/scripts/run-rust-checks.sh`,
+`.config/nextest.toml` and the nextest setup scripts). A hostile test or build
+script in the unprivileged half still reaches root.
+
 The privileged half can reach whatever its host offers, and the unprivileged
 half can still reach the network, so tests must not touch host state they do
 not own: fixed SPACE paths, production sockets, firewall or network-namespace

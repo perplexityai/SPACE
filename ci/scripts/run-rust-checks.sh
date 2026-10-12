@@ -501,11 +501,13 @@ require_unprivileged_user() {
 
 # The privileged step runs as root in the runner's workspace. Hand anything it
 # created back to the workspace owner so later steps and caches can use it.
+# Its caller runs it on the left of `||`, where errexit is off, so each step
+# returns its own failure.
 restore_workspace_ownership() {
     local owner
-    owner="$(stat -c '%u:%g' .)"
+    owner="$(stat -c '%u:%g' .)" || return $?
     local count
-    count="$(find . -xdev ! -user "${owner%%:*}" -print | wc -l | tr -d '[:space:]')"
+    count="$(find . -xdev ! -user "${owner%%:*}" -print | wc -l | tr -d '[:space:]')" || return $?
     if [ "${count}" -gt 0 ]; then
         echo "Returning ${count} file(s) created as root to ${owner}"
         find . -xdev ! -user "${owner%%:*}" -exec chown -h "${owner}" {} +
@@ -728,6 +730,29 @@ esac
 needs_build_dependencies=false
 needs_nextest=false
 needs_docker=false
+restore_ownership_on_exit=false
+sccache_active=false
+sccache_cleanup=false
+# Registered before any preflight can exit: the privileged step's root-owned
+# files must go back to the workspace owner however it ends, or the runner's
+# cache-save steps cannot read them.
+on_exit() {
+    local status=$?
+    if [ "${sccache_cleanup}" = true ]; then
+        cleanup
+    fi
+    if [ "${restore_ownership_on_exit}" = true ]; then
+        restore_workspace_ownership || {
+            local restore_status=$?
+            echo "Could not return root-owned workspace files to their owner (status ${restore_status})." >&2
+            if [ "${status}" -eq 0 ]; then
+                status="${restore_status}"
+            fi
+        }
+    fi
+    exit "${status}"
+}
+trap on_exit EXIT
 case "${validation_mode}" in
     clippy)
         needs_build_dependencies=true
@@ -752,6 +777,7 @@ case "${validation_mode}" in
         fi
         needs_nextest=true
         needs_docker=true
+        restore_ownership_on_exit=true
         ;;
 esac
 
@@ -844,7 +870,6 @@ if [ "${needs_docker}" = true ]; then
     echo "✅ Docker daemon is available"
 fi
 
-sccache_active=false
 cleanup() {
     if [ "${sccache_active}" = true ]; then
         echo "--- :bar_chart: sccache statistics"
@@ -859,7 +884,7 @@ cleanup() {
         echo "--- :warning: sccache was unavailable; statistics skipped"
     fi
 }
-trap cleanup EXIT
+sccache_cleanup=true
 if [ "${needs_build_dependencies}" != true ]; then
     unset RUSTC_WRAPPER
 fi
@@ -894,12 +919,7 @@ case "${validation_mode}" in
         run_test_checks
         ;;
     tests-privileged)
-        privileged_status=0
-        run_privileged_test_checks || privileged_status=$?
-        restore_workspace_ownership
-        if [ "${privileged_status}" -ne 0 ]; then
-            exit "${privileged_status}"
-        fi
+        run_privileged_test_checks
         ;;
     all)
         run_fmt_check
