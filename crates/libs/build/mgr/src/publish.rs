@@ -555,31 +555,13 @@ impl RegisterRequest {
         }
     }
 
-    /// Whether replaying this request after the given failure cannot change
-    /// the outcome the cluster already committed.
-    ///
-    /// Only `UNAUTHENTICATED` qualifies: it is produced by the server's auth
-    /// layer before the handler runs, so nothing was mutated and replay is
-    /// always safe — and worth doing, because the builder's credential is a
-    /// short-TTL kubelet-projected token whose expiry heals on kubelet's next
-    /// volume sync (the bearer interceptor re-reads the token file on every
-    /// RPC).
-    ///
-    /// `UNAVAILABLE` is never replayed, even though the server maps
-    /// pre-handler TokenReview outages there: a transport-level failure can
-    /// also surface as `UNAVAILABLE` *after* the server committed, and
-    /// release registration is not idempotent in its tag side effects.
-    /// `RegisterTemplateRelease` tag writes are last-writer-wins, so a replay
-    /// can move a mutable tag (e.g. `latest`) back to this build after a
-    /// concurrent build on another node advanced it. `RegisterTemplate`
-    /// rechecks ownership and lifecycle and only fills a missing description;
-    /// it does not revive deleted templates. Both calls conservatively retry
-    /// only known pre-handler authentication failures. Retrying release
-    /// registration after an ambiguous commit requires server-side tag fencing.
+    /// Authentication refusal and the server's explicit no-commit marker are
+    /// safe to replay. Generic Unavailable can follow a committed tag write;
+    /// retrying it could overwrite a newer build's tag.
     fn retry_is_safe(&self, status: &tonic::Status) -> bool {
-        match self {
-            Self::Template(_) | Self::Release(_) => status.code() == Code::Unauthenticated,
-        }
+        status.code() == Code::Unauthenticated
+            || pplx_space_node_api_client::cluster::PublicationNotCommitted::from_status(status)
+                .is_some()
     }
 }
 
@@ -588,7 +570,15 @@ async fn register_with_transient_retry(
     template: &TemplateName,
     request: RegisterRequest,
 ) -> Result<(), tonic::Status> {
-    let mut schedule = RegisterRetrySchedule::new();
+    register_with_retry_schedule(cluster_api, template, request, RegisterRetrySchedule::new()).await
+}
+
+async fn register_with_retry_schedule(
+    cluster_api: &mut AuthenticatedClusterApiClient,
+    template: &TemplateName,
+    request: RegisterRequest,
+    mut schedule: RegisterRetrySchedule,
+) -> Result<(), tonic::Status> {
     loop {
         let result = match &request {
             RegisterRequest::Template(inner) => cluster_api

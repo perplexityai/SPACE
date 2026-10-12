@@ -201,8 +201,16 @@ dispatch fails and pins it to the accepting builder node from the response.
 Build-manager forwards the grant to template and release registration.
 ClusterApi accepts a tenant-list account's publication only with a grant that
 names the requested template and organization and that covers the builder node
-registered at the caller's address: any registered builder for one hour while
-unpinned, then only the pinned builder for seven days. Release registration
+identified by freshly reviewed pod-bound node name and UID, matched against
+live Kubernetes builder inventory. A bootstrapped node with no inventory UID
+cannot publish yet; build-manager retries until inventory synchronization
+completes, within its bounded registration backoff. Updated build-managers also
+retry publication failures explicitly marked as uncommitted database
+contention; transport failures with an unknown commit outcome remain terminal.
+Both build-manager and ClusterApi must be upgraded for these retries.
+Standalone trusted deployments retain transport-address identity. A grant
+covers any registered builder for one hour while unpinned, then only the pinned
+builder for seven days. Release registration
 consumes the grant in its transaction. Direct `space-buildmgr build --org-id`
 submissions carry no grant, so their builds cannot publish to a cluster through
 a tenant-list account; submit organization builds through the API.

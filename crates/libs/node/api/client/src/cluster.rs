@@ -386,5 +386,32 @@ fn required_env(name: &str) -> Option<String> {
     }
 }
 
+/// The publication transaction definitely did not commit. This marker is never
+/// attached to transport failures, whose commit outcome is unknown.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PublicationNotCommitted;
+
+impl PublicationNotCommitted {
+    const KEY: &'static str = "space-publication-not-committed";
+
+    pub fn into_status(self, message: impl Into<String>) -> tonic::Status {
+        let mut status = tonic::Status::unavailable(message.into());
+        status
+            .metadata_mut()
+            .insert(Self::KEY, tonic::metadata::MetadataValue::from_static("1"));
+        status
+    }
+
+    pub fn from_status(status: &tonic::Status) -> Option<Self> {
+        (status.code() == tonic::Code::Unavailable
+            && status
+                .metadata()
+                .get(Self::KEY)
+                .and_then(|value| value.to_str().ok())
+                == Some("1"))
+        .then_some(Self)
+    }
+}
+
 #[cfg(test)]
 mod tests;

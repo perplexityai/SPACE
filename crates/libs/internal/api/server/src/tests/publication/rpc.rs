@@ -1126,13 +1126,83 @@ fn publication_contention_is_retryable(#[case] lock: &'static str) -> TestResult
             .register_template_release(request(publication.clone(), "space-build-manager"))
             .await;
 
-        assert_eq!(status_code(result), Code::Unavailable);
+        let status = result.expect_err("the held lock must abort publication");
+        assert!(
+            pplx_space_node_api_client::cluster::PublicationNotCommitted::from_status(&status)
+                .is_some()
+        );
         blocker.rollback().await?;
         assert!(tenant_publication_grant_exists(pool, grant).await?);
         assert_eq!(latest_hash(pool, "contended-output").await?, None);
         fixture
             .client
             .register_template_release(request(publication, "space-build-manager"))
+            .await?;
+        assert!(!tenant_publication_grant_exists(pool, grant).await?);
+        fixture.finish().await
+    })
+}
+
+#[test]
+fn bootstrapped_publisher_waits_for_verified_inventory_uid() -> TestResult {
+    in_publication_process(|| async move {
+        let mut fixture = PublicationServer::start().await?;
+        let pool = &fixture.db.pool;
+        let tenant = Uuid::from_u128(3);
+        let service = ClusterApiService::new(pool.clone());
+        service
+            .bootstrap_k8s_origin_node(
+                "publication-builder",
+                SpaceNodeRole::Builder,
+                "192.0.2.40".parse()?,
+            )
+            .await?;
+        let builder = space_k8s_node_id("publication-builder", "builder");
+        let grant = grant_tenant_publication(
+            pool,
+            "bootstrap-output",
+            tenant,
+            Some(builder.as_uuid()),
+            "0 seconds",
+        )
+        .await?;
+        let publication = tenant_registration("bootstrap-output", tenant, Some(grant.to_string()));
+
+        let status = fixture
+            .client
+            .register_template(request(publication.clone(), "space-build-manager"))
+            .await
+            .expect_err("a NULL UID cannot authorize publication");
+        assert!(
+            pplx_space_node_api_client::cluster::PublicationNotCommitted::from_status(&status)
+                .is_some()
+        );
+        assert!(tenant_publication_grant_exists(pool, grant).await?);
+        let exists: bool = sqlx::query_scalar(sql!(
+            "SELECT EXISTS (SELECT 1 FROM templates WHERE name = 'bootstrap-output')"
+        ))
+        .fetch_one(pool)
+        .await?;
+        assert!(!exists);
+        sqlx::query(sql!(
+            "INSERT INTO node_k8s (node_id, k8s_node_name, k8s_node_uid)
+            VALUES ($1, 'publication-builder', 'publication-node-uid')
+            ON CONFLICT (node_id) DO UPDATE SET k8s_node_uid = EXCLUDED.k8s_node_uid"
+        ))
+        .bind(builder)
+        .execute(pool)
+        .await?;
+
+        fixture
+            .client
+            .register_template(request(publication, "space-build-manager"))
+            .await?;
+        fixture
+            .client
+            .register_template_release(request(
+                tenant_release("bootstrap-output", tenant, 'a', Some(grant.to_string())),
+                "space-build-manager",
+            ))
             .await?;
         assert!(!tenant_publication_grant_exists(pool, grant).await?);
         fixture.finish().await

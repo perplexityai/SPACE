@@ -5,6 +5,8 @@ use pplx_space_common_core::types::{
 
 #[cfg(unix)]
 mod republication;
+#[cfg(unix)]
+mod retry;
 
 fn block_on<F: std::future::Future>(future: F) -> F::Output {
     tokio::runtime::Builder::new_current_thread()
@@ -501,4 +503,32 @@ fn storage_uri_keeps_explicit_path_style_override() {
 
     assert_eq!(parsed.endpoint.as_deref(), Some("https://minio.internal"));
     assert!(!parsed.path_style);
+}
+
+#[test]
+fn publication_retry_requires_explicit_no_commit_proof() {
+    for request in [sample_template_request(), sample_release_request()] {
+        for (code, marker, retry) in [
+            (Code::Unavailable, Some("1"), true),
+            (Code::Unavailable, None, false),
+            (Code::Unavailable, Some("unknown"), false),
+            (Code::Internal, Some("1"), false),
+            (Code::DeadlineExceeded, Some("1"), false),
+        ] {
+            let mut status = tonic::Status::new(code, "publication outcome");
+            if let Some(marker) = marker {
+                status
+                    .metadata_mut()
+                    .insert("space-publication-not-committed", marker.parse().unwrap());
+            }
+            let mut schedule = RegisterRetrySchedule::new();
+            assert_eq!(schedule.next_delay(&request, &status).is_some(), retry);
+            if retry {
+                for _ in 1..REGISTER_RETRY_BACKOFF.len() {
+                    assert!(schedule.next_delay(&request, &status).is_some());
+                }
+                assert!(schedule.next_delay(&request, &status).is_none());
+            }
+        }
+    }
 }

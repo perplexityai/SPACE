@@ -65,11 +65,20 @@ impl ClusterApiService {
     ) -> Result<Vec<NodeId>, Status> {
         use super::template_releases_store::TemplateReadScope;
         if let Some(node) = node {
-            return self
+            use super::template_releases_store::PublicationNode;
+            return match self
                 .template_releases_store
-                .publisher_nodes_for_identity(node)
+                .publisher_node_for_identity(node)
                 .await
-                .map_err(|err| storage_status("resolve publisher node identity", &err));
+                .map_err(|err| storage_status("resolve publisher node identity", &err))?
+            {
+                PublicationNode::Registered(id) => Ok(vec![id]),
+                PublicationNode::PendingInventory => {
+                    Err(pplx_space_node_api_client::cluster::PublicationNotCommitted
+                        .into_status("publisher node UID is awaiting inventory synchronization"))
+                }
+                PublicationNode::Denied => Ok(Vec::new()),
+            };
         }
         let Some(remote_addr) = remote_addr else {
             return Ok(Vec::new());
@@ -180,7 +189,7 @@ pub(super) fn missing_tenant_publication_grant() -> Status {
 pub(super) fn storage_status(context: &str, error: &sqlx::Error) -> Status {
     let message = format!("{context}: {error}");
     if pplx_space_common_svc::sql::contention::is_lock_contention(error) {
-        Status::unavailable(message)
+        pplx_space_node_api_client::cluster::PublicationNotCommitted.into_status(message)
     } else {
         Status::internal(message)
     }

@@ -22,7 +22,7 @@ use super::{
 };
 use crate::models::{ClusterPoolConfigRequest, ClusterPoolConfigResponse};
 use crate::template_build_jobs_store::{
-    BuilderPinnedGrants, TemplateBuildJobsStore, TemplateBuildJobsStoreError,
+    BuildBaseGrantId, BuilderPinnedGrants, TemplateBuildJobsStore, TemplateBuildJobsStoreError,
 };
 
 /// The build-jobs store's errors at the controller boundary.
@@ -366,15 +366,7 @@ impl TemplateController {
                 // An undispatched submission authorizes no publication. If an
                 // ambiguous failure did start the build, its publication is
                 // denied and the build must be resubmitted.
-                let revoked = match publication_grant {
-                    PublicationGrant::System(grant) => {
-                        self.build_jobs.revoke_system_publication_grant(grant).await
-                    }
-                    PublicationGrant::Tenant(grant) => {
-                        self.build_jobs.revoke_tenant_publication_grant(grant).await
-                    }
-                };
-                if let Err(revoke_error) = revoked {
+                if let Err(revoke_error) = self.revoke_publication_grant(publication_grant).await {
                     tracing::warn!(
                         error = %revoke_error,
                         %template_name,
@@ -389,10 +381,8 @@ impl TemplateController {
             template_name,
             client_build_id.as_deref(),
             response,
-            BuilderPinnedGrants {
-                base: base_grant,
-                tenant_publication: publication_grant.tenant(),
-            },
+            base_grant,
+            Some(publication_grant),
         )
         .await
     }
@@ -403,8 +393,13 @@ impl TemplateController {
         template_name: TemplateName,
         client_build_id: Option<&str>,
         response: BuildTemplateResponse,
-        grants: BuilderPinnedGrants,
+        base_grant: Option<BuildBaseGrantId>,
+        publication_grant: Option<PublicationGrant>,
     ) -> Result<StartBuildResponse, ControllerError> {
+        let grants = BuilderPinnedGrants {
+            base: base_grant,
+            tenant_publication: publication_grant.and_then(PublicationGrant::tenant),
+        };
         let result = self
             .persist_template_build_response(
                 org_id,
@@ -417,16 +412,30 @@ impl TemplateController {
         // Job persistence and grant pinning share a transaction, but the
         // pre-dispatch grant was committed earlier and needs separate cleanup.
         if result.is_err()
-            && let Some(grant) = grants.tenant_publication
-            && let Err(error) = self.build_jobs.revoke_tenant_publication_grant(grant).await
+            && let Some(grant) = publication_grant
+            && let Err(error) = self.revoke_publication_grant(grant).await
         {
             tracing::warn!(
                 %error,
-                %grant,
+                ?grant,
                 "failed to revoke publication after build acceptance failed; grant remains until expiry"
             );
         }
         result
+    }
+
+    async fn revoke_publication_grant(
+        &self,
+        grant: PublicationGrant,
+    ) -> Result<(), TemplateBuildJobsStoreError> {
+        match grant {
+            PublicationGrant::System(grant) => {
+                self.build_jobs.revoke_system_publication_grant(grant).await
+            }
+            PublicationGrant::Tenant(grant) => {
+                self.build_jobs.revoke_tenant_publication_grant(grant).await
+            }
+        }
     }
 
     async fn persist_template_build_response(
