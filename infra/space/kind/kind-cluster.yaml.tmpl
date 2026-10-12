@@ -92,10 +92,27 @@ nodes:
   # Infra node — runs Postgres, space-api, and space-cluster-controller.
   # Never labeled space-enabled so sandbox pods never land here, and
   # never targeted by the drain reconciler.
+  #
+  # extraPortMappings: the load-balanced entry. The host's 127.0.0.1:8080 and
+  # :8090 reach the space-api-entry and space-data-plane-entry NodePort
+  # Services, and kube-proxy spreads each connection across the replicas, as
+  # a deployment's load balancer does; a `kubectl port-forward` pins every
+  # request to one pod. On this node because it is never drained. Docker
+  # fixes port mappings when it creates the node container, so a cluster
+  # created without them is recreated (scripts/check-node-layout.sh).
   - role: worker
     image: ${SPACE_KIND_BASE_NODE_IMAGE}
     labels:
       space.pplx.net/node-pool: infra
+    extraPortMappings:
+      - containerPort: 30080
+        hostPort: 8080
+        listenAddress: 127.0.0.1
+        protocol: TCP
+      - containerPort: 30090
+        hostPort: 8090
+        listenAddress: 127.0.0.1
+        protocol: TCP
     extraMounts:
       - hostPath: ${SPACE_KIND_DATA_ROOT}/worker3/containerd
         containerPath: /var/lib/containerd

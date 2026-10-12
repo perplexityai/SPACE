@@ -20,3 +20,46 @@ spec:
       port: {{ .Values.service.port }}
       targetPort: http
       protocol: TCP
+---
+# The public entry: HTTP only, on a fixed node port the Kind cluster config
+# maps to the host (values.yaml, `entry`).
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Values.entry.name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: space-api
+    app.kubernetes.io/instance: {{ .Release.Name }}
+spec:
+  type: NodePort
+  selector:
+    app.kubernetes.io/name: space-api
+    app.kubernetes.io/instance: {{ .Release.Name }}
+  ports:
+    - name: http
+      port: {{ .Values.service.port }}
+      targetPort: http
+      nodePort: {{ .Values.entry.nodePort }}
+      protocol: TCP
+{{- if .Values.admin.enabled }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Values.admin.serviceName }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: space-admin-api
+    app.kubernetes.io/instance: {{ .Release.Name }}
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: space-admin-api
+    app.kubernetes.io/instance: {{ .Release.Name }}
+  ports:
+    - name: http
+      port: {{ .Values.service.port }}
+      targetPort: http
+      protocol: TCP
+{{- end }}

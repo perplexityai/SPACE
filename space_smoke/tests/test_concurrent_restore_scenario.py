@@ -178,3 +178,79 @@ class RunningPodWatchSpan(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class _AutoscalerKubectl:
+    """A public API Deployment, optionally autoscaled, answering by subcommand."""
+
+    def __init__(self, *, autoscaled: bool) -> None:
+        self.calls: list[tuple[str, ...]] = []
+        self.hpa = {
+            "metadata": {"name": "space-api", "uid": "hpa-uid"},
+            "spec": {
+                "scaleTargetRef": {"kind": "Deployment", "name": "space-api"},
+                "minReplicas": 2,
+                "maxReplicas": 3,
+            },
+        }
+        self.autoscaled = autoscaled
+
+    def run(self, command, **_options) -> CommandResult:
+        argv = tuple(command)
+        self.calls.append(argv)
+        verb, rest = argv[5], argv[6:]
+        if verb == "get" and rest[:1] == ("namespace",):
+            return _ok("uid")
+        if verb == "get" and rest[:2] == ("deploy", "-l"):
+            return _ok("space-api")
+        if verb == "get" and rest[:1] == ("deploy",):
+            return _ok("2")
+        if verb == "get" and rest == ("hpa", "-o", "json"):
+            return _ok(json.dumps({"items": [self.hpa] if self.autoscaled else []}))
+        if verb == "get" and rest[:2] == ("hpa", "space-api"):
+            return _ok(json.dumps(self.hpa))
+        if verb == "patch" and rest[:2] == ("hpa", "space-api"):
+            for op in json.loads(rest[-1]):
+                if op["op"] == "replace":
+                    self.hpa["spec"][op["path"].rsplit("/", 1)[-1]] = op["value"]
+            return _ok("")
+        return _ok("")
+
+
+class PublicApiAutoscaler(unittest.TestCase):
+    """An autoscaler reconciles a manual scale away, so its bounds carry the count."""
+
+    def _harness(self, kubectl: _AutoscalerKubectl) -> KindHarness:
+        harness = KindHarness(kubectl, KindConfig())
+        harness._require_isolated_kind = lambda _action: None  # type: ignore[method-assign]
+        return harness
+
+    def test_an_autoscaled_api_is_pinned_and_its_bounds_restored(self) -> None:
+        kubectl = _AutoscalerKubectl(autoscaled=True)
+        harness = self._harness(kubectl)
+        self.assertEqual(harness.scale_public_api(3), 2)
+        self.assertEqual((kubectl.hpa["spec"]["minReplicas"], kubectl.hpa["spec"]["maxReplicas"]), (3, 3))
+        # The scale-back pins the standing count; the original bounds survive it.
+        harness.scale_public_api(2)
+        self.assertEqual((kubectl.hpa["spec"]["minReplicas"], kubectl.hpa["spec"]["maxReplicas"]), (2, 2))
+        harness.restore_public_api_autoscaler()
+        self.assertEqual((kubectl.hpa["spec"]["minReplicas"], kubectl.hpa["spec"]["maxReplicas"]), (2, 3))
+        harness.restore_public_api_autoscaler()  # idempotent
+        self.assertTrue(any(call[5:7] == ("scale", "deploy/space-api") for call in kubectl.calls))
+
+    def test_a_replaced_autoscaler_is_not_overwritten(self) -> None:
+        kubectl = _AutoscalerKubectl(autoscaled=True)
+        harness = self._harness(kubectl)
+        harness.scale_public_api(3)
+        kubectl.hpa["metadata"]["uid"] = "another-uid"
+        from space_smoke.runtime import SmokeConfigurationError
+
+        with self.assertRaisesRegex(SmokeConfigurationError, "replaced autoscaler"):
+            harness.restore_public_api_autoscaler()
+
+    def test_without_an_autoscaler_only_the_deployment_is_scaled(self) -> None:
+        kubectl = _AutoscalerKubectl(autoscaled=False)
+        harness = self._harness(kubectl)
+        harness.scale_public_api(3)
+        harness.restore_public_api_autoscaler()
+        self.assertFalse(any(call[5] == "patch" for call in kubectl.calls))

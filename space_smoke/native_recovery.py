@@ -1,6 +1,9 @@
 """Explicitly owned Kind faults for native recovery scenarios.
 
 Faults temporarily change captured replica counts; restarts delete captured pods.
+An autoscaler on a target Deployment is pinned to that Deployment's current
+replica count for the faults' duration, so a replica count the scenario waits
+for cannot move under it, and its captured bounds are restored afterwards.
 The invalid-create probe may shorten three operation/readiness budgets under a
 separate exact-restore guard. Images and database sizing stay unchanged.
 The existing cluster-visible controller mutation Lease serializes cooperating
@@ -38,6 +41,11 @@ RECOVERY_ENVIRONMENT = (
     "SPACE_SMOKE_NATIVE_RECOVERY_CLUSTER_UID",
 )
 ROLLOUT_TIMEOUT = 90.0
+# The cluster-controller's leader-election kill switch: on unless one of these
+# values turns it off (truthy_default in
+# crates/libs/cluster/controller/server/src/env_config.rs).
+LEADER_ELECTION_ENV = "SPACE_CLUSTER_CONTROLLER_LEADER_ELECTION_ENABLED"
+FALSE_VALUES = frozenset({"0", "false", "False", "FALSE"})
 
 
 @dataclass(frozen=True)
@@ -46,6 +54,14 @@ class DeploymentCapture:
     replicas: int
     selector: str
     spec_digest: str
+
+
+@dataclass(frozen=True)
+class AutoscalerCapture:
+    uid: str
+    target: str
+    min_replicas: int
+    max_replicas: int
 
 
 def _digest(spec: Mapping[str, object]) -> str:
@@ -96,6 +112,7 @@ class NativeRecoveryControl:
             environment=self.environment,
         )
         self._captures: dict[str, DeploymentCapture] = {}
+        self._autoscalers: dict[str, AutoscalerCapture] = {}
         self._release = None
 
     def _json(self, *args: str) -> dict:
@@ -189,6 +206,41 @@ class NativeRecoveryControl:
             time.sleep(0.5)
         raise TimeoutError(f"{name} did not reach {count} ready replacement pods")
 
+    def _patch_autoscaler(self, name: str, *, uid: str, minimum: int, maximum: int) -> None:
+        autoscaler = self._json("get", "hpa", name, "-o", "json")
+        if autoscaler["metadata"]["uid"] != uid:
+            raise SmokeConfigurationError(f"refusing replaced autoscaler {name}")
+        patch = [
+            {"op": "test", "path": "/metadata/resourceVersion", "value": autoscaler["metadata"]["resourceVersion"]},
+            {"op": "replace", "path": "/spec/minReplicas", "value": minimum},
+            {"op": "replace", "path": "/spec/maxReplicas", "value": maximum},
+        ]
+        result = self.harness.kubectl(
+            "patch", "hpa", name, "--type=json", "--patch", json.dumps(patch), timeout=15
+        )
+        if result.returncode:
+            raise SmokeConfigurationError(f"bounds update failed for autoscaler {name}; concurrent changes are not overwritten")
+
+    def _pin_autoscalers(self, targets: tuple[str, ...]) -> None:
+        """Hold each target's autoscaler at the Deployment's current replica count."""
+        for item in self._json("get", "hpa", "-o", "json").get("items", []):
+            target = item.get("spec", {}).get("scaleTargetRef", {})
+            if target.get("kind") != "Deployment" or target.get("name") not in targets:
+                continue
+            name, spec = item["metadata"]["name"], item["spec"]
+            capture = AutoscalerCapture(
+                item["metadata"]["uid"], target["name"], int(spec.get("minReplicas", 1)), int(spec["maxReplicas"]),
+            )
+            self._fence()
+            replicas = int(self._deployment(capture.target)["spec"].get("replicas", 1))
+            # Captured before the write: a pin that lands but times out is still undone.
+            self._autoscalers[name] = capture
+            self._patch_autoscaler(name, uid=capture.uid, minimum=replicas, maximum=replicas)
+        self.context.record("native_recovery_pinned_autoscalers", {
+            name: {"target": value.target, "min": value.min_replicas, "max": value.max_replicas}
+            for name, value in self._autoscalers.items()
+        })
+
     def _scale(self, name: str, replicas: int) -> None:
         self._fence()
         deployment = self._deployment(name)
@@ -219,14 +271,23 @@ class NativeRecoveryControl:
         self._scale(STORAGE_DEPLOYMENT, self._captures[STORAGE_DEPLOYMENT].replicas)
 
     def require_dispatcher_capacity(self) -> None:
-        """Fairness needs an idle execution slot on the same dispatcher."""
+        """Fairness needs an idle execution slot on the same dispatcher.
+
+        Only the cluster-controller that holds the leader Lease runs the
+        dispatcher, so any replica count has one dispatcher while election is
+        on; with it switched off every replica would run one.
+        """
         name = "space-cluster-controller"
-        if self._captures[name].replicas != 1:
-            raise SmokeConfigurationError("dispatcher fairness requires exactly one controller")
         env = self.harness._deployment_env_literals(
             name, ("SPACE_PUBLIC_OPERATION_DISPATCHER_EXECUTION_CONCURRENCY",
-                   "SPACE_PUBLIC_OPERATION_DISPATCHER_TICK_SECS")
+                   "SPACE_PUBLIC_OPERATION_DISPATCHER_TICK_SECS",
+                   LEADER_ELECTION_ENV)
         )
+        election = env[LEADER_ELECTION_ENV]
+        if self._captures[name].replicas != 1 and election in FALSE_VALUES:
+            raise SmokeConfigurationError(
+                "dispatcher fairness requires one controller, or leader election to choose one"
+            )
         concurrency = env["SPACE_PUBLIC_OPERATION_DISPATCHER_EXECUTION_CONCURRENCY"]
         tick = env["SPACE_PUBLIC_OPERATION_DISPATCHER_TICK_SECS"]
         if (concurrency is not None and (not concurrency.isdigit() or int(concurrency) < 2)
@@ -361,6 +422,17 @@ class NativeRecoveryControl:
                     raise SmokeConfigurationError(f"{name} configuration changed during recovery")
             except Exception as error:
                 failures.append(f"{name}: {type(error).__name__}: {error}")
+        # Unpinned only after every Deployment is back at its captured count.
+        for name, autoscaler in list(self._autoscalers.items()):
+            try:
+                self._fence()
+                self._patch_autoscaler(
+                    name, uid=autoscaler.uid,
+                    minimum=autoscaler.min_replicas, maximum=autoscaler.max_replicas,
+                )
+                del self._autoscalers[name]
+            except Exception as error:
+                failures.append(f"autoscaler {name}: {type(error).__name__}: {error}")
         if failures:
             self.context.record("native_recovery_restore_failures", failures)
             raise RuntimeError("; ".join(failures))
@@ -372,13 +444,11 @@ class NativeRecoveryControl:
     def owned_faults(self, *, object_storage: bool = False) -> Iterator[NativeRecoveryControl]:
         targets = (*DEPLOYMENTS, STORAGE_DEPLOYMENT) if object_storage else DEPLOYMENTS
         uid = self._identity()
-        autoscalers = self._json("get", "hpa", "-o", "json").get("items", [])
-        if any(item.get("spec", {}).get("scaleTargetRef", {}).get("name") in targets for item in autoscalers):
-            raise SmokeConfigurationError("native recovery refuses autoscaled target deployments")
         self._release = self.harness.acquire_retention_sweeper_mutation()
         fallback = self.context.scope.defer("restore native recovery deployments", self.restore, critical=True)
         primary = None
         try:
+            self._pin_autoscalers(targets)
             for name in targets:
                 deployment = self._deployment(name)
                 spec = deployment["spec"]

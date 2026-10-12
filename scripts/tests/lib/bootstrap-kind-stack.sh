@@ -830,7 +830,8 @@ bootstrap_kind_stack__load_mirrored_chart_images() {
     local chart image images=() present=() nodes="" attempt
     # Each chart's top-level `image:` block, plus the object store's
     # `bucketInitImage:` (its bucket-init Job runs the aws CLI image).
-    for chart in space-postgres space-redis-local space-object-store; do
+    # metrics-server is pinned to the infra node for the same reason.
+    for chart in space-postgres space-redis-local space-object-store space-metrics-server; do
         while IFS= read -r image; do
             [[ -n "$image" ]] && images+=("$image")
         done < <(awk '

@@ -13,6 +13,40 @@ service:
   port: 8080
   type: ClusterIP
 
+# Load-balanced entry, as a deployment's load balancer gives the public API: a
+# NodePort Service carrying only the HTTP port, which kind-cluster.yaml.tmpl
+# maps to 127.0.0.1:8080 on the host, so clients reach every replica rather
+# than the one pod a `kubectl port-forward` pins. kube-proxy balances per
+# connection. In-cluster callers keep the ClusterIP Service above, which also
+# carries the ingress activation port.
+entry:
+  name: space-api-entry
+  nodePort: 30080
+
+# Replicas follow load, as production's do. Two at least, so every request
+# path runs against more than one replica; three at most, so the worst case
+# (3 x the 1-CPU / 512 MiB limits below) still fits the shared infra node of a
+# 16-core Kind CI runner alongside the data plane's three. CPU is judged
+# against the 50m request; memory by absolute use, since the 128 MiB request
+# is a scheduling floor an idle replica already approaches.
+autoscaling:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 3
+  targetCPUUtilizationPercentage: 80
+  targetMemoryAverageValue: 384Mi
+
+# The dedicated admin API (`--surface admin`) in its own Deployment, as a
+# deployment that separates the admin surface from the public one runs it.
+# The harness and the admin CLI keep using the shared surface's
+# /admin/api/v1 on localhost:8080; this process is reached in-cluster at the
+# space-admin-api Service (`kubectl port-forward svc/space-admin-api
+# 8081:8080` from the host). One replica: operator traffic only.
+admin:
+  enabled: true
+  replicas: 1
+  serviceName: space-admin-api
+
 internal:
   secretName: space-internal
   internalToken: "dev-internal-token"

@@ -9,7 +9,10 @@
 # assertion queried localhost:8333, which Tilt forwarded and the scripted
 # bootstrap did not.
 #
-# So: every localhost port a suite talks to must be forwarded by both. The
+# So: every localhost port a suite talks to must be forwarded by both, or be one
+# of the cluster's host port mappings (the API and data plane entries in
+# kind-cluster.yaml.tmpl), which both bring-ups create the cluster from. A
+# mapped port must not also be forwarded: the forward could not bind it. The
 # reverse is deliberately not required — a bring-up may expose extras (the UI on
 # 3000) that no suite drives.
 set -euo pipefail
@@ -17,6 +20,7 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 bootstrap="${repo_root}/infra/space/kind/scripts/bootstrap.sh"
 tiltfile="${repo_root}/Tiltfile"
+cluster_template="${repo_root}/infra/space/kind/kind-cluster.yaml.tmpl"
 
 status=0
 fail() {
@@ -55,8 +59,23 @@ tilt_ports="$(
 )"
 [ -n "$tilt_ports" ] || fail "found no port_forwards in Tiltfile"
 
+mapped_ports="$(
+    grep -oE '^[[:space:]]*hostPort: *[0-9]+' "$cluster_template" | awk '{print $2}' | sort -u
+)"
+[ -n "$mapped_ports" ] || fail "found no host port mappings in ${cluster_template#"${repo_root}"/}"
+
 while IFS= read -r port; do
     [ -n "$port" ] || continue
+    for forwarded in "bootstrap.sh:$scripted_ports" "the Tiltfile:$tilt_ports"; do
+        has_match "$port" "${forwarded#*:}" -x \
+            && fail "localhost:$port is a host port mapping of the cluster, but ${forwarded%%:*} also" \
+                "      forwards it; the forward cannot bind a port Docker already holds."
+    done
+done <<<"$mapped_ports"
+
+while IFS= read -r port; do
+    [ -n "$port" ] || continue
+    has_match "$port" "$mapped_ports" -x && continue
     has_match "$port" "$scripted_ports" -x \
         || fail "the suites use localhost:$port but ${bootstrap#"${repo_root}"/} does not forward it." \
             "      That suite fails under the scripted bring-up for a reason that has" \
@@ -180,6 +199,7 @@ fi
 
 if [ "$status" -eq 0 ]; then
     echo "ok: every localhost port the kind suites use ($(printf '%s' "$suite_ports" | tr '\n' ' ')) is" \
-        "forwarded by both bring-up paths, and every forward is reaped by the cleanup patterns"
+        "mapped onto the cluster's host ports or forwarded by both bring-up paths, and every" \
+        "forward is reaped by the cleanup patterns"
 fi
 exit "$status"

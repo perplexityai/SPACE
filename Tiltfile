@@ -50,7 +50,8 @@ allow_k8s_contexts("kind-" + KIND_CLUSTER)
 local(["bash", "infra/space/kind/scripts/check-object-store-transition.sh", KIND_CLUSTER], quiet = True)
 
 # A cluster from before the per-service node DaemonSets still runs the single
-# node-stack pod per node; refuse it rather than run both layouts at once. See
+# node-stack pod per node, and one created before the load-balanced entry has
+# no host port mappings for it; refuse either rather than run on it. See
 # "Upgrading from the node-stack layout" in infra/space/kind/README.md.
 local(["bash", "infra/space/kind/scripts/check-node-layout.sh", KIND_CLUSTER], quiet = True)
 
@@ -491,12 +492,29 @@ k8s_resource(
 SPACE_API_DEPS = ["space-postgres", "label-kind-workers", "label-kind-infra",
                   "advertise-kind-worker-network-slots", "install-space-shim",
                   "internal-rpc-tls", "space-sandbox-network-policy"]
+# No port_forward: localhost:8080 is the cluster's host port mapping onto the
+# space-api-entry NodePort (kind-cluster.yaml.tmpl), which spreads connections
+# across the autoscaled replicas as a deployment's load balancer does.
 k8s_yaml(helm_release("space", "infra/space/kind/charts/space-api-local"))
 k8s_resource(
     "space-api",
-    port_forwards = ["8080:8080"],
     labels = ["control-plane"],
     resource_deps = SPACE_API_DEPS,
+)
+# The dedicated admin API, its own process (--surface admin).
+k8s_resource(
+    "space-admin-api",
+    labels = ["control-plane"],
+    resource_deps = ["space-api"],
+)
+
+# The resource metrics API the API and data-plane HorizontalPodAutoscalers
+# read, in kube-system as a managed cluster's add-on is.
+k8s_yaml(helm("infra/space/kind/charts/space-metrics-server", name = "space", namespace = "kube-system"))
+k8s_resource(
+    "metrics-server",
+    labels = ["control-plane"],
+    resource_deps = ["label-kind-infra"],
 )
 
 # The Kind user stays locked in shared migrations. Provision only after the
@@ -546,9 +564,10 @@ k8s_resource(
 
 # Public data-plane service for native sessions and ECW wildcard hosts.
 k8s_yaml(helm_release("space", "infra/space/kind/charts/space-data-plane-local"))
+# localhost:8090 is the host port mapping onto space-data-plane-entry, as for
+# the API above.
 k8s_resource(
     "space-data-plane",
-    port_forwards = ["8090:8090"],
     labels = ["control-plane"],
     resource_deps = ["space-api", "space-internal-api", "label-kind-infra"],
 )

@@ -219,18 +219,18 @@ export SPACE_KIND_CLUSTER=space-local
 )
 ```
 
-Each timed command prints its elapsed duration as `real`. Bootstrap builds and publishes the seed template, deploys the cluster workloads, and starts loopback-only port forwards:
+Each timed command prints its elapsed duration as `real`. Bootstrap builds and publishes the seed template and deploys the cluster workloads. The API and data plane are reachable on loopback through the cluster's own port mappings, which spread connections across their replicas as a load balancer does; the UI and object storage get loopback-only port forwards:
 
-| Service | Local port |
-|---|---|
-| API | `8080` |
-| Data plane | `8090` |
-| UI | `3000` |
-| Object storage | `8333` |
+| Service | Local port | Reached through |
+|---|---|---|
+| API | `8080` | cluster port mapping |
+| Data plane | `8090` | cluster port mapping |
+| UI | `3000` | port forward |
+| Object storage | `8333` | port forward |
 
-If either API or data-plane port refuses connections, confirm bootstrap reached its final summary. The [local installation troubleshooting steps](troubleshooting.md#local-installation) show how to restart a missing port forward without redeploying the cluster.
+If either API or data-plane port refuses connections, confirm bootstrap reached its final summary; the [local installation troubleshooting steps](troubleshooting.md#local-installation) cover what to check.
 
-Tilt is optional for this API walkthrough, but some smoke tests start it automatically in the background. Starting Tilt can replace pods and briefly interrupt their local port forwards; see [Troubleshoot setup](#troubleshoot-setup) before interpreting an empty reply as an authentication problem.
+Tilt is optional for this API walkthrough, but some smoke tests start it automatically in the background. Starting Tilt can replace pods and briefly interrupt the UI and object-storage port forwards; see [Troubleshoot setup](#troubleshoot-setup) before interpreting an empty reply as an authentication problem.
 
 <a id="configuration"></a>
 
@@ -247,7 +247,7 @@ Keep installation settings consistent across steps. The guide explicitly sets th
 | `SPACE_KIND_DATA_ROOT` | Defaults to `$HOME/.kind-data` when not already set | Host-side backing storage for node containerd data. This guide does not override it. |
 | `SPACE_BOOTSTRAP_TIMEOUT` | Defaults to `600` seconds when not already set | Bootstrap's per-release wait, not a sandbox or command timeout. |
 
-The examples use the following client settings. Changing a client URL does not change the server listener or its port forward.
+The examples use the following client settings. Changing a client URL does not change the server listener or the port that reaches it.
 
 | Client setting | Local value | Purpose |
 |---|---|---|
@@ -428,7 +428,7 @@ Two configurations are worth knowing about:
 
 Stop at the first failed command. [Local installation troubleshooting](troubleshooting.md#local-installation) covers missing tools, pod logs, authentication, and port forwards.
 
-An empty reply can mean a port forward is reconnecting, not that the credentials are wrong. Before retrying a mutation, inspect its outcome and keep the original request body and idempotency key.
+An empty reply can mean a replica was replaced mid-request or a port forward is reconnecting, not that the credentials are wrong. Before retrying a mutation, inspect its outcome and keep the original request body and idempotency key.
 
 ## Remove the local deployment
 

@@ -59,6 +59,7 @@ redis:7-alpine           sha256:ca0acbb137c1dc3339c8b147a58fd6f42775d4599327b50e
 # Bump versitygw to the first release that contains versity/versitygw#2415
 # (see the space-object-store chart's values); Content-MD5 stays.
 ghcr.io/versity/versitygw:v1.8.0 sha256:97e7d5a35ab758eb1761a9e717644fafc614c5f6026c05482bd1fb77205193a1 ghcr.io/perplexityai/space-ci-mirror:versitygw-v1.8.0
+registry.k8s.io/metrics-server/metrics-server:v0.9.0 sha256:25d291fde59974547bac6f07fa9d6cf6f5bedd1f19d60c893311c5e741e0a42f ghcr.io/perplexityai/space-ci-mirror:metrics-server-v0.9.0
 
 # Images the local observability backends run, pinned by their multi-platform
 # index in infra/space/observability/charts/*/values.yaml. The Kind profiles

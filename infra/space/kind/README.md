@@ -236,8 +236,8 @@ The ingestion and visualization releases can still be managed independently.
 ### Querying telemetry
 
 In `otel` mode both bring-up paths forward each backend to localhost, as they
-do the API (bootstrap unless `--no-port-forward`), and restart a forward
-whenever its pod restarts:
+do the UI and the object store (bootstrap unless `--no-port-forward`), and
+restart a forward whenever its pod restarts:
 
 | Backend | URL |
 | --- | --- |
@@ -656,15 +656,18 @@ commands. Point `SPACE_VENDOR_ROOT` at a tree you staged elsewhere and
 `install-fc-vendor.sh`, the existence check, and the mount all follow it
 together.
 
-Once the script returns, a tile of background `kubectl port-forward`s exposes:
+Once the script returns, the API and data plane answer on the cluster's own
+host port mappings (see [Load-balanced entry and replicas](#load-balanced-entry-and-replicas)),
+and a tile of background `kubectl port-forward`s exposes the single-replica
+rest:
 
-| Service     | URL                       |
-|-------------|---------------------------|
-| API         | http://localhost:8080     |
-| Data-plane  | http://localhost:8090     |
-| UI          | http://localhost:3000     |
-| Object store (S3) | http://localhost:8333 |
-| Fake Intake (when enabled) | http://localhost:8088 |
+| Service     | URL                       | Through |
+|-------------|---------------------------|---------|
+| API         | http://localhost:8080     | host port mapping → `space-api-entry` NodePort |
+| Data-plane  | http://localhost:8090     | host port mapping → `space-data-plane-entry` NodePort |
+| UI          | http://localhost:3000     | port-forward |
+| Object store (S3) | http://localhost:8333 | port-forward |
+| Fake Intake (when enabled) | http://localhost:8088 | port-forward |
 
 Log in as `root@local` with the initial password (`password` by default). Set `SPACE_CONSOLE_PASSWORD` before running bootstrap or Tilt to choose a custom password. Neither path prints or retains it in a Kubernetes Secret. It is set only while the seeded account is locked; rerunning does not reset an existing password.
 
@@ -763,12 +766,14 @@ kind cluster: space-local (kind-cluster.yaml.tmpl — 6 nodes)
 ├── worker3 [pool=infra,    space.pplx.net/infra=true]
 │   ├── space-postgres        (StatefulSet)
 │   ├── space-object-store    (versitygw S3 gateway + bucket-init Job)
-│   ├── space-api             (Deployment; SPACE_K8S_CONTROL_PLANE=true)
+│   ├── space-api             (Deployment, 2–3 replicas by HPA; SPACE_K8S_CONTROL_PLANE=true)
+│   ├── space-admin-api       (Deployment; the same binary on the dedicated admin surface)
 │   ├── space-internal-api    (Deployment; ClusterApi — node registration + template releases)
 │   ├── space-credmgr-authority (Deployment, 2 replicas; credential-manager authority — credential tables + platform KEK)
 │   ├── space-kind-key-broker (Deployment; Kind-only intermediate-key broker fixture behind the platform KEK)
-│   ├── space-data-plane      (Deployment)
-│   ├── space-cluster-controller (Deployment; materializes per-sandbox pods)
+│   ├── space-data-plane      (Deployment, 2–3 replicas by HPA)
+│   ├── space-cluster-controller (Deployment, 2 replicas, one leader; materializes per-sandbox pods)
+│   ├── metrics-server        (Deployment in kube-system; resource metrics for the HPAs)
 │   ├── space-seed-publish    (Job; publishes the locally built seed)
 │   └── space-ui              (Deployment)
 ├── worker4 [pool=builder]
@@ -825,6 +830,52 @@ them on its own; the default-deny is what isolates any other pod placed in the
 namespace. The typed `local.sandbox_network_isolation_holds` scenario checks
 both against a live cluster from the `space-node-debug` shell, which enters a
 pod's network namespace by its netns handle under `/var/run/netns`.
+## Load-balanced entry and replicas
+
+The control plane runs as a deployment's does: several replicas behind
+load-balanced entry, scaled on load.
+
+- **Entry.** `localhost:8080` and `:8090` are `extraPortMappings` of the infra
+  node (`kind-cluster.yaml.tmpl`, listening on 127.0.0.1) onto the
+  `space-api-entry` and `space-data-plane-entry` NodePort Services (30080,
+  30090). kube-proxy picks a ready replica for each new connection, so clients
+  reach every replica, where a `kubectl port-forward` pins every request to one
+  pod; requests on one kept-alive connection stay on its replica. The entry
+  Services carry the public HTTP port only; in-cluster callers keep the
+  `space-api` and `space-data-plane` ClusterIP Services, and the API's ingress
+  activation port stays off the nodes. No restart loop keeps these forwards
+  alive any more; the UI, object store and Fake Intake are still forwarded.
+- **Autoscaling.** metrics-server (`charts/space-metrics-server`, the upstream
+  release manifest with `--kubelet-insecure-tls` for Kind's self-signed
+  kubelets, in kube-system) serves the resource metrics API. space-api and
+  space-data-plane each have a HorizontalPodAutoscaler between 2 and 3
+  replicas, on CPU (80% of the request) and memory (384 MiB per replica). Two
+  so every path runs against more than one replica; three so the worst case of
+  both tiers at their 1 CPU / 512 MiB limits stays within a 16-core runner's
+  infra node. Their Deployments roll one replica at a time rather than
+  `Recreate`. The UI chart pins one replica, so it has no autoscaler. Each API
+  replica still runs the migration init containers, so a fresh cluster's two
+  replicas run them side by side; a deployment runs them once, as a
+  provisioning Job.
+- **cluster-controller** runs two replicas with leader election on: the Lease
+  holder runs every reconciler and the other stands by, Ready, to take over.
+  `smoke-kind-leader-election-brownout.sh` exercises the handoff.
+- **Admin API.** `space-admin-api` runs the same binary with
+  `--surface admin`, the dedicated admin surface, in its own Deployment and
+  ClusterIP Service. Clients and the harness keep using the shared surface's
+  `/admin/api/v1` on `localhost:8080`; reach the dedicated one with
+  `kubectl --context kind-space-local -n space port-forward svc/space-admin-api 8081:8080`.
+
+Harness operations that need a fixed replica count take it from the
+autoscaler rather than fight it: the concurrent-restore scenario pins the API
+autoscaler's bounds to its contention count and restores them, and the native
+recovery faults pin every target's autoscaler at its current count until the
+Deployments are restored.
+
+A cluster created before the port mappings cannot gain them, since Docker fixes
+a node container's ports when it creates it. `check-node-layout.sh` refuses it
+with the commands to recreate it (see
+[Upgrading from the node-stack layout](#upgrading-from-the-node-stack-layout)).
 
 ## How the node registers itself
 
@@ -987,7 +1038,10 @@ on one node, so such a cluster is recreated once rather than upgraded.
 and the `Tiltfile` run `infra/space/kind/scripts/check-node-layout.sh` against
 an existing cluster before they apply anything; when it still has resources of
 the old `space-node-stack` chart, they list them and stop without changing
-anything (the scripts exit 1; Tilt reports a Tiltfile load error). Recreating
+anything (the scripts exit 1; Tilt reports a Tiltfile load error). The same
+check refuses a cluster whose node containers do not publish every host port
+mapping `kind-cluster.yaml.tmpl` declares, the load-balanced entry's among
+them, naming each missing one. Recreating
 deletes the cluster's sandboxes, snapshots and templates and keeps the
 containerd image caches:
 
@@ -1117,7 +1171,7 @@ asks of the hosting deployment.
 | Loop devices from the AMI's `max_loop=10000` on a real devtmpfs | The node's tmpfs `/dev` starts with 8 nodes; `space-loop-nodes.service` mknods the rest before kubelet, pods copy the node's `/dev`, and node-manager raises its pod's pool further. The cache device has autoclear set, so a node stop releases it (`scripts/lib/space-loop-devices.sh`) |
 | vhost-vsock jail nodes provided by the AMI                | the Kind-only `space-kind-vsock-jails.service` mknods them into each jail under `/space/cache/firecracker/jails` as it appears (kind-only) |
 | Sandbox SSH key generated by Packer per AMI               | generated per host by `build-seed.sh` under `~/.space-devbox/kind/ssh` |
-| ALB ingress in front of api / data-plane / ui             | NodePort + `kubectl port-forward` (started in background by bootstrap.sh)     |
+| ALB ingress in front of api / data-plane / ui             | NodePort entry Services behind the cluster's host port mappings for api and data-plane (kube-proxy balances per connection); `kubectl port-forward` for the single-replica ui |
 | The runtime manager installs releases and kernels, which node-manager publishes into the root-owned store `/space/vendor/artifacts` | `/space/vendor` is a read-only host bind, so the runtime manager runs `--list-only`: listing and cache checks work, installs are off |
 | Operators run node-local CLIs from the node host's shell   | the same CLIs run in the Kind-only `space-node-debug` root shell DaemonSet     |
 | Build sizing, concurrency, and multipart sizes are configurable | 20 GiB default build disk, one concurrent build, and smaller multipart parts fit the 40 GiB local btrfs cache |
@@ -1285,7 +1339,7 @@ SKIP_BOOTSTRAP=1 scripts/tests/smoke-kind-e2e.sh
 # 3. Full native API surface: + metadata, identity boundary, command SSE,
 #    data-plane WS, pause/resume, suspend/restore. Set
 #    SPACE_SMOKE_SKIP_INTERACTIVE=1 to skip the interactive WS helper
-#    (which is finicky behind kubectl port-forward) and reach the
+#    (which was finicky behind kubectl port-forward) and reach the
 #    lifecycle stages.
 TOKEN=$(SPACE_CONSOLE_PASSWORD="${SPACE_CONSOLE_PASSWORD:-password}" \
   jq -nc '{email:"root@local",password:env.SPACE_CONSOLE_PASSWORD}' | \

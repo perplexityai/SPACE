@@ -1,0 +1,19 @@
+# Kind-only. The upstream metrics-server release manifest (v0.9.0,
+# components.yaml), rendered into kube-system, so the space-api and data-plane
+# HorizontalPodAutoscalers have the resource metrics API a managed cluster
+# provides as an add-on. Two changes from upstream, both for Kind: the
+# kubelets serve self-signed certificates, so it does not verify them
+# (`--kubelet-insecure-tls`), and it runs on the infra node, where the
+# bring-up loads its image from the CI mirror (ci/mirrored-images.txt).
+image:
+  repository: registry.k8s.io/metrics-server/metrics-server
+  tag: v0.9.0
+  pullPolicy: IfNotPresent
+
+nodeSelector:
+  space.pplx.net/infra: "true"
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 200Mi

@@ -63,7 +63,7 @@ roleRef:
 ---
 # Leader-election lease: the cluster-controller holds a coordination.k8s.io
 # Lease in its own namespace and runs the singleton reconcilers only while it
-# holds it. Single-replica here, but the acquire/renew/release path still runs.
+# holds it; the other replica stands by.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:

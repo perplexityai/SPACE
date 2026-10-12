@@ -317,10 +317,14 @@ jobs:
             k 30s -n space logs "$pod" --all-containers --prefix --tail=100 || true
             echo "::endgroup::"
           done
-          # The smoke reaches the cluster through Tilt's localhost
-          # port-forwards, each pinned to one pod. Their status shows which
-          # pod a forward targeted and when it last dropped, which explains a
-          # localhost connection refusal.
+          # The smoke reaches the API and data plane through the infra node's
+          # host port mappings onto their NodePort entry Services, which reach
+          # every ready replica; the autoscalers and endpoints show how many
+          # there were. The object store is still a Tilt port-forward, pinned
+          # to one pod: its status shows when it last dropped.
+          k 30s -n space get hpa,endpoints -o wide || true
+          timeout 15s docker port "$(timeout 15s kubectl --context kind-space-local get nodes \
+            -l space.pplx.net/node-pool=infra -o jsonpath='{.items[0].metadata.name}')" || true
           timeout 30s tilt get portforwards -o yaml || true
 
       # A sandbox pod stuck Terminating is held on its node: the kubelet's
@@ -339,9 +343,12 @@ jobs:
           dir="${RUNNER_TEMP}/kind-node-diagnostics"
           mkdir -p "${dir}"
           k() { timeout "$1" kubectl --context kind-space-local "${@:2}"; }
-          # Preserve the first admission/recovery error, not only its final retry.
-          k 45s -n space logs deployment/space-api --all-containers=true --timestamps \
-            >"${dir}/space-api.log" 2>&1 || true
+          # Preserve the first admission/recovery error, not only its final retry,
+          # from every API replica: `logs deployment/...` reads only one.
+          for pod in $(k 30s -n space get pods -l app.kubernetes.io/name=space-api -o name); do
+            k 45s -n space logs "${pod}" --all-containers=true --timestamps \
+              >"${dir}/${pod#pod/}.log" 2>&1 || true
+          done
           # The credential-manager authority every node agent forwards to.
           k 45s -n space logs deployment/space-credmgr-authority --all-containers=true --timestamps \
             >"${dir}/space-credmgr-authority.log" 2>&1 || true

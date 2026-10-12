@@ -668,6 +668,9 @@ class KindHarness:
         self.environment = dict(environment or os.environ)
         self._retention_lease_ownership: _LeaseOwnership | None = None
         self._cordon_lease_ownership: _LeaseOwnership | None = None
+        # The public API autoscaler's bounds before `scale_public_api` pinned
+        # them: (name, uid, minReplicas, maxReplicas).
+        self._public_api_autoscaler_bounds: tuple[str, str, int, int] | None = None
 
     def kubectl(
         self,
@@ -2663,11 +2666,65 @@ ON CONFLICT (key_hash) DO NOTHING;
             self.kubectl("get", "deploy", name, "-o", "jsonpath={.spec.replicas}", timeout=15),
             f"read replicas of {name}",
         ).strip()
+        autoscaler = self._public_api_autoscaler(name)
+        if autoscaler is not None:
+            # An autoscaler owns the replica count and reconciles a manual
+            # scale away once its scale-down window passes, so the count is
+            # set through its bounds; `restore_public_api_autoscaler` puts the
+            # captured bounds back.
+            metadata, spec = autoscaler["metadata"], autoscaler["spec"]
+            if self._public_api_autoscaler_bounds is None:
+                self._public_api_autoscaler_bounds = (
+                    str(metadata["name"]), str(metadata["uid"]),
+                    int(spec.get("minReplicas", 1)), int(spec["maxReplicas"]),
+                )
+            self._patch_public_api_autoscaler(replicas, replicas)
         _require_ok(
             self.kubectl("scale", f"deploy/{name}", f"--replicas={replicas}", timeout=30),
             f"scale {name} to {replicas}",
         )
         return int(previous) if previous.isdigit() else 1
+
+    def restore_public_api_autoscaler(self) -> None:
+        if self._public_api_autoscaler_bounds is None:
+            return
+        _, _, minimum, maximum = self._public_api_autoscaler_bounds
+        self._patch_public_api_autoscaler(minimum, maximum)
+        self._public_api_autoscaler_bounds = None
+
+    def _public_api_autoscaler(self, deployment: str) -> dict[str, Any] | None:
+        listing = json.loads(
+            _require_ok(self.kubectl("get", "hpa", "-o", "json", timeout=15), "list autoscalers")
+            or "{}"
+        )
+        matches = [
+            item
+            for item in listing.get("items", [])
+            if (item.get("spec") or {}).get("scaleTargetRef", {}).get("kind") == "Deployment"
+            and item["spec"]["scaleTargetRef"].get("name") == deployment
+        ]
+        if len(matches) > 1:
+            raise SmokeConfigurationError(f"more than one autoscaler targets {deployment}")
+        return matches[0] if matches else None
+
+    def _patch_public_api_autoscaler(self, minimum: int, maximum: int) -> None:
+        assert self._public_api_autoscaler_bounds is not None
+        name, uid, _, _ = self._public_api_autoscaler_bounds
+        current = json.loads(
+            _require_ok(self.kubectl("get", "hpa", name, "-o", "json", timeout=15), f"read {name}")
+            or "{}"
+        )
+        if current.get("metadata", {}).get("uid") != uid:
+            raise SmokeConfigurationError(f"refusing replaced autoscaler {name}")
+        patch = [
+            {"op": "test", "path": "/metadata/uid", "value": uid},
+            {"op": "replace", "path": "/spec/minReplicas", "value": minimum},
+            {"op": "replace", "path": "/spec/maxReplicas", "value": maximum},
+        ]
+        _require_ok(
+            self.kubectl("patch", "hpa", name, "--type=json", "--patch", json.dumps(patch), timeout=15),
+            f"set {name} bounds to {minimum}..{maximum}",
+        )
 
     def wait_public_api_rollout(self, *, timeout: float) -> None:
         name = self._public_api_deployment()
@@ -2684,9 +2741,8 @@ ON CONFLICT (key_hash) DO NOTHING;
 
         `kubectl rollout status` completes a scale-down once the available
         count matches the spec, while the surplus pods are still shutting
-        down. A localhost port-forward pinned to one of them (Tilt forwards
-        to the newest pod, the first a scale-down removes) drops when it
-        exits, so callers that need the route must wait for the drain too.
+        down and draining their connections, so callers that need every
+        route served by a live replica must wait for the drain too.
         """
 
         name = self._public_api_deployment()

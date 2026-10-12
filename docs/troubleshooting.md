@@ -19,8 +19,8 @@ This section covers the [Kind installation](installation.md). Use the explicit `
 | Pods remain pending or restart | Run the commands below and inspect the first failing pod's events and container logs. Confirm the host supports the required privileged containers and storage operations. |
 | `seed:latest` cannot be resolved | Check `space-seed-publish` logs and completion. The seed must be built and published before sandbox creation. |
 | Login rejects `root@local` | Use the password selected during bootstrap (`password` by default). Confirm bootstrap completed or Tilt's `provision-local-console` resource succeeded; rerunning does not reset an existing password. |
-| API or data plane refuses connections | Check service readiness and the corresponding loopback port forward. API reachability does not prove data-plane reachability. |
-| `curl: (52) Empty reply from server` | A port forward may be reconnecting after its target pod was replaced, including after a smoke test starts Tilt. Check the forwarding logs before changing credentials. |
+| API or data plane refuses connections | Check service readiness: `kubectl --context kind-space-local -n space get pods,endpoints,svc` should show ready pods behind `space-api-entry` and `space-data-plane-entry`. localhost reaches them through the cluster's port mappings (`docker port space-local-worker3`); a cluster created before those mappings is refused by bootstrap with the command to recreate it. API reachability does not prove data-plane reachability. |
+| `curl: (52) Empty reply from server` | A replica may have been replaced mid-request, or, for the UI and object storage, a port forward may be reconnecting after its target pod was replaced, including after a smoke test starts Tilt. Check the forwarding logs before changing credentials. |
 
 ```bash
 kubectl --context kind-space-local -n space get pods
@@ -52,12 +52,12 @@ If a port forward is absent, start the one you need in a separate terminal and l
 
 ```bash
 kubectl --context kind-space-local -n space \
-  port-forward --address=127.0.0.1 svc/space-api 8080:8080
+  port-forward --address=127.0.0.1 svc/space-ui 3000:3000
 ```
 
 ```bash
 kubectl --context kind-space-local -n space \
-  port-forward --address=127.0.0.1 svc/space-data-plane 8090:8090
+  port-forward --address=127.0.0.1 svc/object-store 8333:8333
 ```
 
 ## Sandbox and command failures

@@ -13,6 +13,25 @@ service:
   port: 8090
   type: ClusterIP
 
+# Load-balanced entry, as a deployment's load balancer gives the public data
+# plane: a NodePort Service that kind-cluster.yaml.tmpl maps to
+# 127.0.0.1:8090 on the host, so command streams and ECW wildcard hosts reach
+# every replica rather than the one pod a `kubectl port-forward` pins.
+# kube-proxy balances per connection.
+entry:
+  name: space-data-plane-entry
+  nodePort: 30090
+
+# As the API's (space-api-local values.yaml): two replicas at least, three at
+# most so both tiers' worst case fits the shared infra node of a 16-core
+# runner, on CPU against the request and memory by absolute use.
+autoscaling:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 3
+  targetCPUUtilizationPercentage: 80
+  targetMemoryAverageValue: 384Mi
+
 internal:
   secretName: space-internal
   apiEndpoint: https://space-internal-api:9800

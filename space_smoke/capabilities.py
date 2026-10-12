@@ -1483,7 +1483,16 @@ class ConcurrentRestoreControl(Protocol):
     """
 
     def scale_public_api(self, replicas: int) -> int:
-        """Set the kind public API Deployment's replica count; returns the previous count."""
+        """Set the kind public API Deployment's replica count; returns the previous count.
+
+        An autoscaler on the Deployment is pinned to `replicas` (both bounds)
+        so it cannot reconcile the count away; its first captured bounds are
+        restored by `restore_public_api_autoscaler`.
+        """
+        ...
+
+    def restore_public_api_autoscaler(self) -> None:
+        """Put back the autoscaler bounds `scale_public_api` pinned; a no-op when none was."""
         ...
 
     def wait_public_api_rollout(self, *, timeout: float) -> None:

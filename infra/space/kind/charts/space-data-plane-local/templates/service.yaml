@@ -16,3 +16,25 @@ spec:
       port: {{ .Values.service.port }}
       targetPort: http
       protocol: TCP
+---
+# The public entry, on a fixed node port the Kind cluster config maps to the
+# host (values.yaml, `entry`).
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Values.entry.name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: space-data-plane
+    app.kubernetes.io/instance: {{ .Release.Name }}
+spec:
+  type: NodePort
+  selector:
+    app.kubernetes.io/name: space-data-plane
+    app.kubernetes.io/instance: {{ .Release.Name }}
+  ports:
+    - name: http
+      port: {{ .Values.service.port }}
+      targetPort: http
+      nodePort: {{ .Values.entry.nodePort }}
+      protocol: TCP
