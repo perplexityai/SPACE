@@ -282,7 +282,10 @@ jobs:
             echo "::error::The Kind data plane at 127.0.0.1:8090 never became healthy"
             exit 1
           fi
-          bash scripts/tests/smoke-kind-typed.sh all "${SMOKE_SHARD}"
+          # Kept for the failure-telemetry step, which reads the failed
+          # scenarios' sandbox ids from it.
+          bash scripts/tests/smoke-kind-typed.sh all "${SMOKE_SHARD}" 2>&1 \
+            | tee "${RUNNER_TEMP}/kind-typed-smoke.log"
 
       # Every command below is bounded, and each step has a deadline: a wedged
       # apiserver, Tilt, or node must not hold the job until its own deadline and
@@ -371,6 +374,21 @@ jobs:
           echo "Teardown refusals recorded by the node journals (last 100):"
           grep -hE 'StopPodSandbox.*failed|KillPodSandbox|\[space-shim\] (kill|delete): task .* keeps running' \
             "${dir}"/*.journal.log 2>/dev/null | tail -n 100 || true
+
+      # The local Tempo, Loki and Prometheus die with the runner. Save what they
+      # hold for each failed scenario's sandboxes (its traces, its log lines)
+      # and the run's space_* series into the uploaded evidence. The script is
+      # bounded in time and size and exits 0; continue-on-error keeps a
+      # surprise here from failing the job or skipping the upload.
+      - name: Collect failed-scenario telemetry
+        if: failure()
+        timeout-minutes: 5
+        continue-on-error: true
+        run: |
+          python3 infra/space/kind/scripts/collect-failure-telemetry.py \
+            --out "${RUNNER_TEMP}/kind-node-diagnostics/telemetry" \
+            --log "${RUNNER_TEMP}/kind-typed-smoke.log" \
+            --budget 240
 
       - name: Upload Kind node teardown evidence
         if: failure()
