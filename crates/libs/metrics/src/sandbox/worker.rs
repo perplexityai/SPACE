@@ -11,7 +11,7 @@ use std::{fmt, str::FromStr, time::Instant};
 
 use pplx_space_common_core::types::{
     AutoLifecycleIdleAction, ExecutionReleaseDetachReason, ExecutionReleaseIntent,
-    QuarantineRecoveryNoProgressReason,
+    QuarantineRecoveryNoProgressReason, SandboxQuarantineReasonCode,
 };
 
 use crate::emit::{counter, distribution, elapsed_ms, gauge, tag, timing_ms};
@@ -1049,6 +1049,21 @@ impl fmt::Display for QuarantineRecoveryOutcome {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(self.as_str())
     }
+}
+
+/// A sandbox entered `quarantined`, counted once per entry after the
+/// transition commits, beside its `sandbox_quarantined` event. `reason` is
+/// the quarantine's reason code; `operation` names the sandbox-manager path
+/// that quarantined it, the event's own `operation` (`mark_quarantined`,
+/// `insert_quarantined_sandbox`, `startup_resident_recovery`,
+/// `complete_cleanup_episode`, `complete_row_intent_cleanup`,
+/// `quarantine_cleanup_episode`). A re-confirmed quarantine is not an entry.
+pub fn quarantine_entered(reason: SandboxQuarantineReasonCode, operation: &'static str) {
+    counter(
+        "sandbox.worker.quarantine.entered",
+        1,
+        &[tag("reason", reason.as_str()), tag("operation", operation)],
+    );
 }
 
 pub fn quarantine_recovery_no_progress(

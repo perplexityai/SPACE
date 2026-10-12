@@ -140,19 +140,28 @@ pub(crate) fn settle_startup_resident(
         )?;
     }
     tx.commit()?;
-    emit_sandbox_state_event(
-        &observed.id,
-        if target == SandboxState::Quarantined {
-            SandboxEventType::SandboxQuarantined
-        } else {
-            SandboxEventType::LifecycleConverged
-        },
-        Some(observed.state.as_str()),
-        reason,
-        "startup_resident_recovery",
-        target,
-        error,
-    );
+    match settlement {
+        StartupResidentSettlement::Quarantined { reason_code, .. } => {
+            emit_sandbox_quarantined_event(
+                &observed.id,
+                Some(observed.state.as_str()),
+                reason_code,
+                "startup_resident_recovery",
+                error,
+            );
+        }
+        StartupResidentSettlement::Started | StartupResidentSettlement::Paused => {
+            emit_sandbox_state_event(
+                &observed.id,
+                SandboxEventType::LifecycleConverged,
+                Some(observed.state.as_str()),
+                reason,
+                "startup_resident_recovery",
+                target,
+                error,
+            );
+        }
+    }
     Ok(true)
 }
 

@@ -1042,16 +1042,13 @@ pub(crate) fn complete_cleanup_episode_for_job(
     cleanup_jobs::finish_in_transaction(&tx, job_id, &cleanup_jobs::CleanupOutcome::Applied)?;
     tx.commit()?;
     if episode.completion == CleanupCompletion::Quarantine {
-        emit_sandbox_state_event(
+        emit_sandbox_quarantined_event(
             sandbox_id,
-            SandboxEventType::SandboxQuarantined,
             previous_state.as_deref(),
             episode
                 .quarantine_reason_code
-                .unwrap_or(SandboxQuarantineReasonCode::RuntimeProbeInconsistent)
-                .as_str(),
+                .unwrap_or(SandboxQuarantineReasonCode::RuntimeProbeInconsistent),
             "complete_cleanup_episode",
-            SandboxState::Quarantined,
             // Retain historical failure evidence in storage, but do not
             // republish potentially guest-controlled text in a new event.
             None,
@@ -1408,13 +1405,11 @@ pub(crate) fn complete_row_intent_cleanup_for_job(
     tx.commit()?;
 
     if missing_suspend_artifact || quarantine_completion {
-        emit_sandbox_state_event(
+        emit_sandbox_quarantined_event(
             sandbox_id,
-            SandboxEventType::SandboxQuarantined,
             Some(row.state.as_str()),
-            quarantine_reason.as_str(),
+            quarantine_reason,
             "complete_row_intent_cleanup",
-            SandboxState::Quarantined,
             None,
         );
     }
@@ -1527,13 +1522,11 @@ pub(crate) fn quarantine_cleanup_episode_for_job(
     }
     tx.commit()?;
     if changed == 1 {
-        emit_sandbox_state_event(
+        emit_sandbox_quarantined_event(
             sandbox_id,
-            SandboxEventType::SandboxQuarantined,
             Some(row.state.as_str()),
-            reason_code.as_str(),
+            reason_code,
             "quarantine_cleanup_episode",
-            SandboxState::Quarantined,
             Some(&reason),
         );
     }

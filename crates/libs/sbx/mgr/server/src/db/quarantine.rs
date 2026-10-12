@@ -501,13 +501,11 @@ pub(crate) fn emit_insert_quarantined_sandbox_event(
     sandbox_id: &str,
     reason_code: SandboxQuarantineReasonCode,
 ) {
-    emit_sandbox_state_event(
+    emit_sandbox_quarantined_event(
         sandbox_id,
-        SandboxEventType::SandboxQuarantined,
         None,
-        reason_code.as_str(),
+        reason_code,
         "insert_quarantined_sandbox",
-        SandboxState::Quarantined,
         None,
     );
 }
@@ -1008,13 +1006,11 @@ fn mark_quarantined_inner(
     tx.commit()?;
 
     if changed != 0 && previous_state.as_deref() != Some(SandboxState::Quarantined.as_str()) {
-        emit_sandbox_state_event(
+        emit_sandbox_quarantined_event(
             id,
-            SandboxEventType::SandboxQuarantined,
             previous_state.as_deref(),
-            reason_code.as_str(),
+            reason_code,
             "mark_quarantined",
-            SandboxState::Quarantined,
             None,
         );
     }

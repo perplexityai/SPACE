@@ -282,6 +282,27 @@ fn emit_sandbox_state_event(
     emit_sandbox_event(id, event_type, SandboxEventSource::SbxManager, details);
 }
 
+/// The sandbox entered `quarantined`: its `sandbox_quarantined` event and
+/// the entry counter, emitted together after the transition commits.
+fn emit_sandbox_quarantined_event(
+    id: &str,
+    from_state: Option<&str>,
+    reason_code: SandboxQuarantineReasonCode,
+    operation: &'static str,
+    error: Option<&str>,
+) {
+    emit_sandbox_state_event(
+        id,
+        SandboxEventType::SandboxQuarantined,
+        from_state,
+        reason_code.as_str(),
+        operation,
+        SandboxState::Quarantined,
+        error,
+    );
+    pplx_space_metrics::sandbox::worker::quarantine_entered(reason_code, operation);
+}
+
 fn emit_auto_lifecycle_delete_receipt_superseded(
     sandbox_id: SandboxId,
     superseded_receipt: crate::auto_lifecycle_delete_receipts::db::SupersededPendingReceipt,
