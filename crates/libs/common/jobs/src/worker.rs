@@ -1449,6 +1449,7 @@ impl<E: JobExecutor> BackgroundWorker<E> {
                         );
                         pplx_space_metrics::jobs::completed(
                             &job.kind,
+                            self.executor.completed_result(&job),
                             db::nonnegative_i64_to_u64(bytes),
                             started_at,
                         );

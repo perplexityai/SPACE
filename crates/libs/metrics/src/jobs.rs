@@ -85,8 +85,20 @@ pub fn started(kind: &str, attempt: i32) {
     );
 }
 
-pub fn completed(kind: &str, bytes: u64, started_at: Instant) {
-    let tags = [tag("kind", kind), tag("result", "success")];
+metric_vocabulary!(
+    /// Whether a job its executor finished reached the job's goal: the
+    /// `result` tag on `jobs.completed` and its `jobs.duration_ms` series.
+    /// Failures the executor returns are `jobs.failed` instead.
+    JobCompletedResult {
+        Success => "success",
+        /// The executor completed the job but recorded a domain failure for
+        /// its caller to read, as a template build that failed does.
+        Failed => "failed",
+    }
+);
+
+pub fn completed(kind: &str, result: JobCompletedResult, bytes: u64, started_at: Instant) {
+    let tags = [tag("kind", kind), tag("result", result)];
     counter("jobs.completed", 1, &tags);
     counter("jobs.bytes", bytes, &[tag("kind", kind)]);
     timing_ms("jobs.duration_ms", elapsed_ms(started_at), &tags);

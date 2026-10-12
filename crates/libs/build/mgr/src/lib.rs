@@ -30,6 +30,7 @@ use pplx_space_common_core::{
     },
 };
 use pplx_space_common_svc::page_cache;
+pub use pplx_space_metrics::template::TemplateBuildErrorKind;
 use pplx_space_net_common::NetworkPolicyV1;
 use pplx_space_net_common::proto::NetworkPolicyV1 as NetworkPolicyV1Proto;
 use pplx_space_node_mgr_client::proto::{
@@ -194,6 +195,8 @@ pub enum BuildError {
     TemplateRef(#[from] pplx_space_template_mgr_client::TemplateRefFromReferenceError),
     #[error("{0}")]
     Message(String),
+    #[error("cannot reserve prepared rootfs capacity: {0}")]
+    RootfsReservation(#[source] Box<tonic::Status>),
     #[error("{operation} failed to start: {source}")]
     Io {
         operation: &'static str,
@@ -215,11 +218,45 @@ impl BuildError {
     pub(crate) fn message(message: impl Into<String>) -> Self {
         Self::Message(message.into())
     }
+
+    /// The bounded cause metrics report for this failure, decided by the
+    /// error's type alone: its message can carry recipe or image content.
+    pub fn error_kind(&self) -> TemplateBuildErrorKind {
+        match self {
+            Self::Environment(_) | Self::Recipe(_) | Self::TemplateRef(_) => {
+                TemplateBuildErrorKind::Recipe
+            }
+            Self::Ssh(error) => error.error_kind(),
+            Self::Step { source, .. } => source.recipe_step_error_kind(),
+            Self::OciImageAssembly(error) => error.error_kind(),
+            Self::RootfsReservation(status) if status.code() == tonic::Code::ResourceExhausted => {
+                TemplateBuildErrorKind::StorageAdmission
+            }
+            Self::RootfsReservation(_)
+            | Self::InvalidSpacedVersion { .. }
+            | Self::InvalidSandboxId(_)
+            | Self::Message(_)
+            | Self::Io { .. }
+            | Self::CommandFailed { .. } => TemplateBuildErrorKind::Other,
+        }
+    }
+}
+
+/// A build failure whose bounded cause is known from its type, for the
+/// `error_kind` of the failed step's metric.
+trait BuildFailureKind {
+    fn error_kind(&self) -> TemplateBuildErrorKind;
+}
+
+impl BuildFailureKind for BuildError {
+    fn error_kind(&self) -> TemplateBuildErrorKind {
+        BuildError::error_kind(self)
+    }
 }
 
 async fn build_phase<T, E, F>(template_id: &str, phase: BuildPhase, future: F) -> Result<T, E>
 where
-    E: fmt::Display,
+    E: fmt::Display + BuildFailureKind,
     F: Future<Output = Result<T, E>>,
 {
     let started_at = Instant::now();
@@ -246,6 +283,7 @@ where
             template_id,
             phase.as_str(),
             step_result,
+            result.as_ref().err().map(BuildFailureKind::error_kind),
             started_at,
         );
         let duration_ms = started_at.elapsed().as_millis() as u64;
@@ -741,11 +779,7 @@ impl TemplateBuilder {
                         rootfs_size_mb: build_rootfs_size_mib,
                     })
                     .await
-                    .map_err(|error| {
-                        BuildError::message(format!(
-                            "cannot reserve prepared rootfs capacity: {error}"
-                        ))
-                    })?
+                    .map_err(|error| BuildError::RootfsReservation(Box::new(error)))?
                     .into_inner()
                     .rootfs_path;
                 let assembly_result = oci::assemble_from_image(oci::OciImageAssemblyRequest {
@@ -885,6 +919,10 @@ impl TemplateBuilder {
                 template_id,
                 BuildPhase::RecipeStep.as_str(),
                 step_metric_result,
+                step_result
+                    .as_ref()
+                    .err()
+                    .map(SshError::recipe_step_error_kind),
                 started_at,
             );
             let duration_ms = started_at.elapsed().as_millis() as u64;

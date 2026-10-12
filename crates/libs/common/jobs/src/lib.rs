@@ -389,6 +389,15 @@ pub trait JobExecutor: Clone + Send + Sync + 'static {
     /// terminal failed state. Executors use this to converge external state
     /// that must not remain pending after the local retry budget is exhausted.
     async fn retries_exhausted(&self, _job: &Job, _message: &str) {}
+
+    /// Whether a job that [`Self::execute`] completed reached its goal, read
+    /// after the worker has persisted the completion. An executor that
+    /// completes a job with a domain failure recorded for its caller, rather
+    /// than failing the job, reports it here, so the job is not counted as a
+    /// success.
+    fn completed_result(&self, _job: &Job) -> pplx_space_metrics::jobs::JobCompletedResult {
+        pplx_space_metrics::jobs::JobCompletedResult::Success
+    }
 }
 
 #[cfg(test)]

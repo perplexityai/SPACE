@@ -39,6 +39,40 @@ pub enum SshError {
     CopyPayload(String),
 }
 
+impl SshError {
+    /// The bounded cause metrics report for a guest operation's failure.
+    pub fn error_kind(&self) -> crate::TemplateBuildErrorKind {
+        match self {
+            Self::NotReady { .. } | Self::BoundedOperation => {
+                crate::TemplateBuildErrorKind::Timeout
+            }
+            Self::MissingKey { .. }
+            | Self::CommandStatus(_)
+            | Self::CommandStart(_)
+            | Self::CommandWait(_)
+            | Self::CommandInput(_)
+            | Self::CommandRetries
+            | Self::CopyIo(_)
+            | Self::CopyPayload(_) => crate::TemplateBuildErrorKind::Other,
+        }
+    }
+
+    /// The same, for a recipe step: there a command that ran and failed, or a
+    /// payload it could not copy, is the recipe's own failure.
+    pub fn recipe_step_error_kind(&self) -> crate::TemplateBuildErrorKind {
+        match self {
+            Self::CommandStatus(_) | Self::CopyPayload(_) => crate::TemplateBuildErrorKind::Recipe,
+            error => error.error_kind(),
+        }
+    }
+}
+
+impl crate::BuildFailureKind for SshError {
+    fn error_kind(&self) -> crate::TemplateBuildErrorKind {
+        SshError::error_kind(self)
+    }
+}
+
 pub(crate) struct SshSession {
     host: String,
     ns: String,
