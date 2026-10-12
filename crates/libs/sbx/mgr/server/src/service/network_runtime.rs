@@ -740,6 +740,7 @@ pub(super) fn spawn_network_policy_refresh(
     expected_policy_ref: EffectiveNetworkPolicyRef,
     reason: &'static str,
 ) {
+    let span_sandbox_id = sandbox_id.clone();
     tokio::spawn(
         async move {
             if let Err(error) =
@@ -754,7 +755,10 @@ pub(super) fn spawn_network_policy_refresh(
                 super::drain::record_detached_failure(&error.to_string());
             }
         }
-        .instrument(super::drain::detached_trace_span("NetworkPolicyRefresh")),
+        .instrument(super::drain::detached_trace_span(
+            "NetworkPolicyRefresh",
+            &span_sandbox_id,
+        )),
     );
 }
 

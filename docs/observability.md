@@ -413,6 +413,23 @@ A fork operation's `target_id` is already the source sandbox's bare UUID. The
 reverse conversion prefixes `sbx_`; in a shell, `${id#sbx_}` gives the
 canonical value.
 
+## Request identity
+
+Every HTTP server span, `http.server`, in space-api and the data plane carries
+the request's `request_id` when it has one. A caller-supplied id is the first
+non-blank of `x-request-id` and `x-correlation-id`, accepted only as at most
+128 bytes of `[A-Za-z0-9._:-]`; anything else is dropped. The native API
+returns that id in `x-request-id`, or, when the caller sent none or one that
+was dropped, a fresh `req_<uuid>` it records instead. gRPC server spans apply
+the same rule to their `request_id`. A JSON log line written inside the
+request inherits it, as it does `sandbox_id`.
+
+Each HTTP response also carries a W3C `traceparent` header naming its
+`http.server` span, so a client can report the trace ID of any request it
+made. The header holds only the version, trace ID, span ID and sampled flag;
+it is absent when traces are off, and a proxied sandbox service's own
+`traceparent` is passed through unchanged.
+
 ## Cargo features
 
 Service and library manifests forward these features to observability:

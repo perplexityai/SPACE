@@ -341,33 +341,44 @@ where
 }
 
 /// The span fields a JSON log line inherits when the event does not set them:
-/// the identifiers a reader filters one sandbox's lines by.
-const CORRELATION_FIELDS: [&str; 1] = ["sandbox_id"];
+/// the identifiers a reader filters one sandbox's or one request's lines by.
+const CORRELATION_FIELDS: [&str; 2] = ["sandbox_id", "request_id"];
 
 /// [`CORRELATION_FIELDS`] values a span carries, kept in its extensions by
 /// [`SpanCorrelationLayer`].
 #[derive(Clone, Debug, Default)]
 struct SpanCorrelation {
     sandbox_id: Option<String>,
+    request_id: Option<String>,
 }
 
 impl SpanCorrelation {
     fn slot(&mut self, field: &str) -> Option<&mut Option<String>> {
         match field {
             "sandbox_id" => Some(&mut self.sandbox_id),
+            "request_id" => Some(&mut self.request_id),
             _ => None,
         }
     }
 
     fn values(&self) -> [(&'static str, Option<&str>); CORRELATION_FIELDS.len()] {
-        [("sandbox_id", self.sandbox_id.as_deref())]
+        [
+            ("sandbox_id", self.sandbox_id.as_deref()),
+            ("request_id", self.request_id.as_deref()),
+        ]
     }
 
     /// Take each value `recorded` sets; keep the rest.
     fn update(&mut self, recorded: Self) {
-        let Self { sandbox_id } = recorded;
+        let Self {
+            sandbox_id,
+            request_id,
+        } = recorded;
         if sandbox_id.is_some() {
             self.sandbox_id = sandbox_id;
+        }
+        if request_id.is_some() {
+            self.request_id = request_id;
         }
     }
 
@@ -476,9 +487,28 @@ where
     }
 }
 
+/// The `request_id` of the nearest current span that carries one, for work
+/// that leaves the request's span tree but should still name the request,
+/// such as a detached span linked to it. `None` outside such a span or
+/// before telemetry is initialized.
+pub fn current_request_id() -> Option<String> {
+    use tracing::Subscriber as _;
+
+    tracing::dispatcher::get_default(|dispatch| {
+        let registry = dispatch.downcast_ref::<tracing_subscriber::Registry>()?;
+        let id = registry.current_span().id()?.clone();
+        let span = registry.span(&id)?;
+        span.scope().find_map(|span| {
+            span.extensions()
+                .get::<SpanCorrelation>()
+                .and_then(|correlation| correlation.request_id.clone())
+        })
+    })
+}
+
 /// Give a log line each [`CORRELATION_FIELDS`] value the event does not set,
 /// from the nearest span that carries it, so a line written inside a
-/// sandbox's span is found by the same field as the span.
+/// sandbox's or a request's span is found by the same field as the span.
 ///
 /// Spans are resolved through the unfiltered registry, as for the trace
 /// context: the log filter may hide the very span that carries the value.

@@ -149,14 +149,24 @@ pub struct StartupRecoveryLease {
 /// work's duration as its own latency. A trace-context parent looks remote to
 /// the Datadog span processor, which then miscounts the request's still-open
 /// trace and flushes it in fragments. The link names the request instead.
-pub(super) fn detached_trace_span(work: &'static str) -> tracing::Span {
+///
+/// A link carries no attributes and log lines do not follow it, so the root
+/// records the sandbox's canonical `sandbox_id` and the request's
+/// `request_id` itself; the sandbox's telemetry queries find it by them.
+pub(super) fn detached_trace_span(work: &'static str, sandbox_id: &str) -> tracing::Span {
     let span = tracing::info_span!(
         parent: None,
         "sbxmgr.detached",
         otel.name = work,
         otel.status_code = tracing::field::Empty,
         otel.status_description = tracing::field::Empty,
+        sandbox_id = tracing::field::Empty,
+        request_id = tracing::field::Empty,
     );
+    pplx_space_common_svc::record_sandbox_id(&span, sandbox_id);
+    if let Some(request_id) = pplx_space_observability::current_request_id() {
+        span.record("request_id", request_id.as_str());
+    }
     if let Some(traceparent) =
         pplx_space_observability::trace_propagation::traceparent_for_span(&tracing::Span::current())
     {
@@ -429,12 +439,13 @@ impl SandboxManagerService {
     pub(super) fn spawn_detached_state_writer<T: Send + 'static>(
         &self,
         method: &'static str,
+        sandbox_id: &str,
         future: impl Future<Output = T> + Send + 'static,
     ) -> Result<tokio::task::JoinHandle<T>, Status> {
         let writer = self.state_writer_lease(method)?;
-        Ok(self
-            .task_tracker
-            .spawn(with_state_writer(writer, future).instrument(detached_trace_span(method))))
+        Ok(self.task_tracker.spawn(
+            with_state_writer(writer, future).instrument(detached_trace_span(method, sandbox_id)),
+        ))
     }
 
     pub(super) fn critical_task_guard(

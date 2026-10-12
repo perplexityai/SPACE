@@ -212,7 +212,8 @@ impl SandboxManagerService {
         if !context.blocking {
             let service = self.clone();
             let background_sandbox_id = publication.sandbox.id.clone();
-            self.spawn_detached_state_writer("SuspendPublication", async move {
+            let span_sandbox_id = background_sandbox_id.clone();
+            self.spawn_detached_state_writer("SuspendPublication", &span_sandbox_id, async move {
                 let _wake_guard = wake_guard;
                 let _artifact_guard = artifact_guard;
                 if let Err(error) = service

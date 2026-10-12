@@ -58,7 +58,7 @@ tokio-util = { workspace = true }
 toml = { workspace = true, optional = true }
 tonic = { workspace = true }
 tonic-health = { workspace = true }
-tower = { workspace = true }
+tower = { workspace = true, features = ["util"] }
 tower-http = { workspace = true, features = ["trace"] }
 tracing = { workspace = true }
 uuid = { workspace = true, features = ["v5", "v7"] }

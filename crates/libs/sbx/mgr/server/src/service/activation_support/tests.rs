@@ -642,7 +642,7 @@ async fn cold_finalizer_retains_cleanup_until_state_persistence_succeeds() {
         },
     );
 
-    spawn_guarded_start_state_transition(&service, cleanup_guard, async {
+    spawn_guarded_start_state_transition(&service, "runtime1", cleanup_guard, async {
         Err(Status::internal("failed to persist final start state"))
     })
     .unwrap();
@@ -666,7 +666,8 @@ async fn cold_finalizer_disarms_cleanup_after_state_persistence_succeeds() {
         },
     );
 
-    spawn_guarded_start_state_transition(&service, cleanup_guard, async { Ok(()) }).unwrap();
+    spawn_guarded_start_state_transition(&service, "runtime1", cleanup_guard, async { Ok(()) })
+        .unwrap();
 
     assert!(cleanup_rx.await.is_err());
 }

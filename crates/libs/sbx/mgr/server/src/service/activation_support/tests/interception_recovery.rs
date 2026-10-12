@@ -283,7 +283,7 @@ async fn exercise_recovery(restore: bool) {
             let _ = cleanup_tx.send(());
         },
     );
-    spawn_guarded_start_state_transition(&service, cleanup, {
+    spawn_guarded_start_state_transition(&service, &id, cleanup, {
         let db = service.db.clone();
         let id = id.clone();
         async move {
