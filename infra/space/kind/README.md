@@ -285,6 +285,52 @@ span's `trace_id` and `span_id` in lowercase hex, so
 knows it. Grafana shows the same three datasources and the packaged
 dashboards, and its Loki datasource links each `trace_id` to Tempo.
 
+#### Following one sandbox
+
+Every service names a sandbox by its bare UUID in the `sandbox_id` span
+attribute and log field; the native API's `sbx_` id is the same UUID with a
+prefix (see [Sandbox identity](../../../docs/observability.md#sandbox-identity)).
+From a create response, or the `sandbox_id` a failed smoke scenario prints:
+
+```bash
+sbx=sbx_01a1324d-32be-7235-a41c-1586423506c8   # as the API returned it
+id=${sbx#sbx_}
+now=$(date +%s)
+
+# 1. Logs: every SPACE pod line for the sandbox, oldest first. A line written
+#    inside a sandbox's span carries its sandbox_id even when the message
+#    does not name it.
+curl -sG localhost:13101/loki/api/v1/query_range \
+  --data-urlencode "query={namespace=\"space\"} | json | sandbox_id=\"$id\"" \
+  -d start=$((now - 3600))000000000 -d end=${now}000000000 \
+  -d direction=forward -d limit=1000 \
+  | jq -r '.data.result[] | .stream.service as $s | .values[] | "\($s) \(.[1])"'
+
+# 2. Traces: every trace with a span for the sandbox, in any service. A line
+#    from step 1 also names its trace_id, which you can fetch directly.
+curl -sG localhost:13200/api/search \
+  --data-urlencode "q={span.sandbox_id=\"$id\"}" \
+  -d start=$((now - 3600)) -d end=$now -d limit=50 \
+  | jq -r '.traces[] | [.traceID, .rootServiceName, .rootTraceName] | @tsv'
+curl -s localhost:13200/api/v2/traces/TRACE_ID_FROM_THE_SEARCH
+
+# 3. Metrics carry no sandbox_id (it would be unbounded cardinality): read the
+#    node and services the trace names over its time range, e.g. the shim
+#    operations on that node (`k8s.node.name` on its spans). Each sandbox has
+#    its own shim process, so read its series' last value, not a rate.
+curl -sG localhost:19090/api/v1/query \
+  --data-urlencode 'query=histogram_count(sum by (op, result) (last_over_time(space_shim_operation_latency_milliseconds{k8s_node_name="NODE"}[15m])))'
+```
+
+Each sandbox's net-gateway runs on the node and logs to its journal without a
+systemd unit, which the local log collection does not keep; read those lines
+with `docker exec NODE journalctl | grep "$id"`. Its spans reach Tempo.
+
+For a native API request, the `x-request-id` response header (`req_...`) is
+the `request_id` attribute of its `http.server` span and a field of the log
+lines it wrote, and the `traceparent` response header names that span:
+its second field is the trace ID to fetch.
+
 ### Datadog (optional)
 
 The Kind-only `datadog-agent-local` chart supports two explicit backends:
