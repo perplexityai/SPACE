@@ -280,6 +280,7 @@ fn otlp_resource_query_identity(
         .into_iter()
         .filter_map(|(key, value)| match key.as_str() {
             "deployment.environment.name" => Some(("env".to_string(), value)),
+            "service.name" => Some(("service".to_string(), value)),
             "service.version" => Some(("version".to_string(), value)),
             _ => None,
         })
@@ -293,13 +294,6 @@ fn otlp_series(
 ) -> Series {
     let attributes = otlp_attributes(point_attributes);
     assert!(attributes.iter().all(|(key, _)| key != "version"));
-    if attributes.iter().any(|(key, _)| key == "service.role") {
-        assert!(
-            attributes.iter().any(|(key, value)| {
-                key == "service" && value == "space-sandbox-manager-canary"
-            })
-        );
-    }
     series(
         name,
         attributes

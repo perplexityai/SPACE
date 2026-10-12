@@ -411,12 +411,6 @@ async fn otlp_wire_types_temporality_precision_and_identity_are_explicit() {
         Some(&AttributeValue::StringValue("create".to_string()))
     );
     assert_eq!(
-        attribute(&sum.data_points[0].attributes, "service"),
-        Some(&AttributeValue::StringValue(
-            "space-sandbox-manager-canary".to_string()
-        ))
-    );
-    assert_eq!(
         attribute(&sum.data_points[0].attributes, "cluster_id"),
         Some(&AttributeValue::StringValue("test-cluster".to_string()))
     );

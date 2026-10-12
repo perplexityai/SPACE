@@ -586,10 +586,13 @@ fn tag_attribute(tag: &str) -> KeyValue {
 
 fn metric_point_attribute(tag: &str) -> Option<KeyValue> {
     let key = tag.split_once(':').map_or(tag, |(key, _)| key);
-    // The canonical OTel resource owns these two universal identity fields.
-    // Keeping point-level copies makes receivers such as the Datadog Agent
-    // surface duplicate `env` and `version` tags with ambiguous precedence.
-    if matches!(key, "env" | "version") {
+    // The canonical OTel resource owns these universal identity fields, the
+    // service as `service.name`. Keeping point-level copies makes receivers
+    // such as the Datadog Agent surface duplicate `env`, `service` and
+    // `version` tags with ambiguous precedence, and gives Prometheus a
+    // `service` label beside `service_name` that says the same thing. A
+    // metric's own `service` tag is a different field, `service.role`.
+    if matches!(key, "env" | "service" | "version") {
         return None;
     }
     Some(tag_attribute(tag))

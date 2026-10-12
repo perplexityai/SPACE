@@ -133,8 +133,9 @@ Rust metric helpers also use a per-measurement `service` tag for a logical
 RPC or socket service: the destination of gRPC clients, the served interface
 of gRPC rate limiters, and the socket service performing UDS peer-process
 authentication checks. The OTLP sink exports that dimension as `service.role`;
-the constant `service` point attribute and resource `service.name` identify
-the emitting process. This keeps different peers or interfaces in separate
+resource `service.name` alone identifies the emitting process, because OTLP
+points carry no constant `service`, `env` or `version` copy of the resource's
+identity. This keeps different peers or interfaces in separate
 series even when they share one producer. OTLP queries grouping or filtering
 that logical dimension must use `service.role`. Native DogStatsD retains its
 existing wire tags, including both `service` values; its queries do not change.
