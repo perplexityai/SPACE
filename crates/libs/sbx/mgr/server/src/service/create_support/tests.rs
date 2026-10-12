@@ -476,6 +476,14 @@ fn restore_provenance_classifies_legacy_remote_metadata() {
 
 #[tokio::test]
 async fn existing_sandbox_cannot_resolve_a_missing_artifact_by_latest_alias() {
+    let conn = crate::db::test_conn();
+    let id = SandboxId::new().to_string();
+    crate::service::tests::service_tests::insert_test_sandbox(
+        &conn,
+        &id,
+        crate::state::SandboxState::Stopped,
+    );
+    let sandbox = crate::db::get_sandbox(&conn, &id).unwrap().unwrap();
     // This must reject locally rather than asking template-manager to pick
     // the newest build after the sandbox lost its identity.
     let templates = crate::template_resolver::fake::FakeTemplateResolver::refusing(
@@ -488,6 +496,7 @@ async fn existing_sandbox_cannot_resolve_a_missing_artifact_by_latest_alias() {
             content_hash: None,
             tag: None,
         },
+        &sandbox,
     )
     .await
     .err()
