@@ -41,7 +41,11 @@ const FIRECRACKER_STATE_FORMAT_RELEASES: &[FirecrackerStateFormatRelease] = &[
     },
     FirecrackerStateFormatRelease {
         runtime_version: "1.16.2",
-        state_format_version: "10.0.0",
+        state_format_version: "11.0.0",
+    },
+    FirecrackerStateFormatRelease {
+        runtime_version: "1.17.0",
+        state_format_version: "12.0.0",
     },
 ];
 
@@ -129,6 +133,9 @@ impl ResolvedExecutionEnvironment {
 pub struct RuntimeInventory {
     runtimes: Vec<RuntimeInstallation>,
     components: Vec<ArtifactComponentInstallation>,
+    /// The release each runtime root's `default` alias names. New cold boots
+    /// use it, so installing another release never changes what they boot.
+    defaults: Vec<RuntimeIdentity>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -216,6 +223,10 @@ pub enum RuntimeInventoryError {
     },
     #[error("no installed {runtime} runtime can execute the requested artifact")]
     NoCompatibleRuntime { runtime: RuntimeKind },
+    /// The alias exists but does not name a listed release. Without an alias
+    /// the newest release is used; a broken one is not silently replaced.
+    #[error("{} does not name an installed runtime release", alias.display())]
+    InvalidDefaultRelease { alias: PathBuf },
     #[error("persisted-state restore metadata is missing a state format")]
     MissingStateFormat,
     #[error("{0:?} selection requires requested execution metadata")]
@@ -268,6 +279,7 @@ impl RuntimeInventoryError {
             | Self::NoCompatibleComponent(_)
             | Self::NoDefaultComponent { .. }
             | Self::NoCompatibleRuntime { .. }
+            | Self::InvalidDefaultRelease { .. }
             | Self::MissingStateFormat
             | Self::MissingRequestedExecution(_)
             | Self::UnsupportedRuntime(_)
@@ -409,6 +421,11 @@ trait RuntimeDriver: Send + Sync {
         &self,
         root: &Path,
     ) -> Result<Vec<RuntimeInstallation>, RuntimeInventoryError>;
+    /// The release the root's `default` alias names, or `None` when the root
+    /// has no alias. An alias that exists but does not resolve to a release
+    /// directory is an error.
+    fn default_release(&self, root: &Path)
+    -> Result<Option<RuntimeVersion>, RuntimeInventoryError>;
     fn compare_versions(
         &self,
         left: &RuntimeVersion,
@@ -587,6 +604,34 @@ impl RuntimeDriver for FirecrackerDriver {
         Ok(runtimes)
     }
 
+    fn default_release(
+        &self,
+        root: &Path,
+    ) -> Result<Option<RuntimeVersion>, RuntimeInventoryError> {
+        let alias = root.join("default");
+        let probe = |source| RuntimeInventoryError::ProbeInventoryPath {
+            path: alias.clone(),
+            source,
+        };
+        match std::fs::symlink_metadata(&alias) {
+            Ok(_) => {}
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(source) => return Err(probe(source)),
+        }
+        let invalid = || RuntimeInventoryError::InvalidDefaultRelease {
+            alias: alias.clone(),
+        };
+        let resolved = match std::fs::canonicalize(&alias) {
+            Ok(resolved) => resolved,
+            // A dangling alias.
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                return Err(invalid());
+            }
+            Err(source) => return Err(probe(source)),
+        };
+        version_from_dir(&resolved).map(Some).ok_or_else(invalid)
+    }
+
     fn compare_versions(
         &self,
         left: &RuntimeVersion,
@@ -677,11 +722,28 @@ impl RuntimeInventory {
             discover_legacy_kernels(asset_root)?
         };
         let mut runtimes = Vec::new();
+        let mut defaults = Vec::new();
         let mut searched_roots = Vec::new();
         for root in runtime_roots {
             let driver = DRIVERS.get(root.kind)?;
             searched_roots.push(root.path.clone());
-            runtimes.extend(driver.discover_installations(&root.path)?);
+            let installations = driver.discover_installations(&root.path)?;
+            if let Some(version) = driver.default_release(&root.path)? {
+                let default = RuntimeIdentity {
+                    kind: root.kind,
+                    version,
+                };
+                if !installations
+                    .iter()
+                    .any(|installation| installation.runtime == default)
+                {
+                    return Err(RuntimeInventoryError::InvalidDefaultRelease {
+                        alias: root.path.join("default"),
+                    });
+                }
+                defaults.push(default);
+            }
+            runtimes.extend(installations);
         }
         if runtimes.is_empty() {
             return Err(RuntimeInventoryError::Empty(
@@ -706,7 +768,37 @@ impl RuntimeInventory {
         Ok(Self {
             runtimes,
             components: kernels,
+            defaults,
         })
+    }
+
+    /// The installed release a runtime's `default` alias names.
+    fn default_installation(&self, runtime: RuntimeKind) -> Option<&RuntimeInstallation> {
+        let default = self
+            .defaults
+            .iter()
+            .find(|default| default.kind == runtime)?;
+        self.runtimes
+            .iter()
+            .find(|installation| installation.runtime == *default)
+    }
+
+    /// The default release when it can serve `requested`, otherwise the
+    /// newest that can. A node without a default alias falls back to the
+    /// newest, as before defaults were honoured.
+    fn default_or_first_compatible<'a>(
+        &'a self,
+        driver: &dyn RuntimeDriver,
+        runtime: RuntimeKind,
+        requested: &ExecutionMetadata,
+        mode: ExecutionSelectionMode,
+    ) -> Result<Option<&'a RuntimeInstallation>, RuntimeInventoryError> {
+        if let Some(default) = self.default_installation(runtime)
+            && driver.can_execute(default, requested, mode)?
+        {
+            return Ok(Some(default));
+        }
+        self.first_compatible(driver, requested, mode)
     }
 
     pub fn resolve(
@@ -726,9 +818,12 @@ impl RuntimeInventory {
         }
         let selected_runtime = match requested {
             None => self
-                .runtimes
-                .iter()
-                .find(|installation| installation.runtime.kind == runtime)
+                .default_installation(runtime)
+                .or_else(|| {
+                    self.runtimes
+                        .iter()
+                        .find(|installation| installation.runtime.kind == runtime)
+                })
                 .ok_or(RuntimeInventoryError::NoInstalledRuntime(runtime))?,
             Some(requested) => {
                 if requested.runtime().kind != runtime {
@@ -736,7 +831,7 @@ impl RuntimeInventory {
                 }
                 match mode {
                     ExecutionSelectionMode::NewColdBoot => self
-                        .first_compatible(driver, requested, mode)?
+                        .default_or_first_compatible(driver, runtime, requested, mode)?
                         .ok_or(RuntimeInventoryError::NoCompatibleRuntime { runtime })?,
                     ExecutionSelectionMode::ExistingColdBoot => {
                         let installation = self
@@ -759,7 +854,7 @@ impl RuntimeInventory {
                         {
                             installation
                         } else {
-                            self.first_compatible(driver, requested, mode)?
+                            self.default_or_first_compatible(driver, runtime, requested, mode)?
                                 .ok_or(RuntimeInventoryError::NoCompatibleRuntime { runtime })?
                         }
                     }

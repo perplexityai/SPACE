@@ -217,8 +217,8 @@ for version in "${FIRECRACKER_VERSIONS[@]}"; do
     "/space/cache/firecracker/assets/${version}/kernel/vmlinux.bin"
 done
 
-# The default symlink is used by operators and legacy callers. Runtime-aware
-# sandbox launches select a compatible version from the complete inventory.
+# New cold boots use the default release. Restores prefer their recorded
+# release, then a compatible default, then another compatible installed release.
 ln -sfn "${FIRECRACKER_DEFAULT_VERSION}" "${FIRECRACKER_ROOT}/default"
 ln -sfn "${FIRECRACKER_DEFAULT_VERSION}" /space/cache/firecracker/assets/default
 
