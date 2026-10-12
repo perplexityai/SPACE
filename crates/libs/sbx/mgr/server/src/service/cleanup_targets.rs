@@ -183,6 +183,16 @@ impl SandboxManagerService {
 }
 
 impl SandboxManagerService {
+    /// The root holding each sandbox's canonical cache directory. Tests may
+    /// redirect it so rowless disk state is observable without host paths.
+    pub(super) fn sandbox_cache_root(&self) -> PathBuf {
+        #[cfg(test)]
+        if let Some(cache_dir) = self.cleanup_executor.cache_dir.lock().unwrap().clone() {
+            return cache_dir;
+        }
+        PathBuf::from(CACHE_DIR)
+    }
+
     pub(super) async fn resolve_lifecycle_target(
         &self,
         sandbox_id: SandboxId,
@@ -202,6 +212,7 @@ impl SandboxManagerService {
             .unwrap()
             .clone()
             .unwrap_or_else(|| PathBuf::from(RUN_DIR));
+        let cache_dir = self.sandbox_cache_root();
         let db = Arc::clone(&self.db);
         let template = template.map(str::to_owned);
         tokio::task::spawn_blocking(move || {
@@ -212,7 +223,7 @@ impl SandboxManagerService {
             let is_running = is_sandbox_running;
             resolve_lifecycle_target_blocking(
                 &db,
-                Path::new(CACHE_DIR),
+                &cache_dir,
                 sandbox_id,
                 template.as_deref(),
                 template_manager,

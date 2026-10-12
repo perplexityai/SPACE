@@ -79,6 +79,9 @@ async fn legacy_delete_after_durable_delete_does_not_dispatch_node_cleanup() {
     let id = sandbox_id.to_string();
     insert_test_sandbox(&conn, &id, SandboxState::Started);
     let service = isolated_service(conn, scratch.path(), None);
+    // Completed durable deletion leaves no canonical cache directory.
+    let cache_root = tempfile::tempdir().unwrap();
+    *service.cleanup_executor.cache_dir.lock().unwrap() = Some(cache_root.path().to_owned());
 
     // The shim observed a live sandbox before durable deletion completed.
     assert_eq!(
@@ -135,6 +138,41 @@ async fn legacy_delete_after_durable_delete_does_not_dispatch_node_cleanup() {
             admission.into_unpersisted_error(sandbox_id).unwrap(),
         )
         .unwrap();
+}
+
+#[tokio::test]
+async fn delete_of_rowless_disk_sandbox_is_not_reported_deleted() {
+    if !enter_isolated_test_process() {
+        return;
+    }
+    let scratch = tempfile::tempdir().unwrap();
+    let cache_root = tempfile::tempdir().unwrap();
+    let service = isolated_service(crate::db::test_conn(), scratch.path(), None);
+    *service.cleanup_executor.cache_dir.lock().unwrap() = Some(cache_root.path().to_owned());
+    // No row, but the canonical cache directory selects it for cleanup.
+    let id = SandboxId::new().to_string();
+    let cache_dir = cache_root.path().join(&id);
+    std::fs::create_dir_all(cache_dir.join("instance")).unwrap();
+
+    for blocking in [true, false] {
+        let error = service
+            .delete(peer_request(
+                DeleteRequest {
+                    sandbox_id: id.clone(),
+                    template_filter: None,
+                    blocking,
+                },
+                Some(root_peer()),
+            ))
+            .await
+            .expect_err("a rowless sandbox with remaining disk state is not deleted");
+        assert_eq!(error.code(), tonic::Code::Unavailable, "{error}");
+        assert!(
+            cache_dir.is_dir(),
+            "the selected cache directory must remain"
+        );
+    }
+    assert!(service.lookup_sandbox(&id).is_err());
 }
 
 /// A create refused by the auto-lifecycle authority parse, the last check

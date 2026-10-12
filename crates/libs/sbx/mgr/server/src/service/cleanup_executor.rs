@@ -43,6 +43,8 @@ pub(super) struct CleanupExecutor {
     waiter_read_barrier: Mutex<Option<Arc<TestAdmissionBarrier>>>,
     #[cfg(test)]
     pub(super) run_dir: Mutex<Option<PathBuf>>,
+    #[cfg(test)]
+    pub(super) cache_dir: Mutex<Option<PathBuf>>,
     wake: tokio::sync::Notify,
     pub(super) active: dashmap::DashMap<String, bool>,
     waiters: Mutex<CompletionWaiters>,
@@ -68,6 +70,8 @@ impl Default for CleanupExecutor {
             waiter_read_barrier: Mutex::new(None),
             #[cfg(test)]
             run_dir: Mutex::new(None),
+            #[cfg(test)]
+            cache_dir: Mutex::new(None),
             wake: tokio::sync::Notify::new(),
             active: dashmap::DashMap::new(),
             waiters: Mutex::new(BTreeMap::new()),
