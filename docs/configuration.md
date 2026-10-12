@@ -235,6 +235,19 @@ retain their existing publication authority.
 | `SPACE_BYOK_VOLUME_ENCRYPTION` | off | |
 | `SPACE_FALCON_US2_EGRESS_DESTINATIONS`, `SPACE_NET_GATEWAY_KNOWN_EGRESS_DOMAINS` | unset / empty | |
 
+### Template mutation authority
+
+On worker and builder node-api, `DeleteTemplate`, `DeleteTemplateBuild`,
+`CreatePool`, and `DeletePool` require the trusted policy service-account
+capability. Template-manager's local roles and deletion dependency guards still
+apply. Pool target counts have no capacity-based upper bound yet; operators
+must budget pool sizes even after caller authorization succeeds.
+
+With Kubernetes authentication disabled, the shared internal token remains the
+operator trust boundary and retains mutation authority. When Kubernetes
+authentication is enabled, static fallback has no mutation authority. Missing
+authentication context is denied.
+
 ## Database
 
 | Variable | Notes |

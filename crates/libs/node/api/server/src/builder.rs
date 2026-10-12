@@ -107,6 +107,7 @@ impl BuilderApi for BuilderApiService {
         r: Request<pplx_space_template_mgr_client::proto::DeleteTemplateRequest>,
     ) -> Result<Response<pplx_space_template_mgr_client::proto::DeleteTemplateResponse>, Status>
     {
+        pplx_space_common_svc::auth::template::require_template_mutation_authority(&r)?;
         fwd!(self.clients.tmpl(), delete_template, r)
     }
 
@@ -115,6 +116,7 @@ impl BuilderApi for BuilderApiService {
         r: Request<pplx_space_template_mgr_client::proto::DeleteTemplateBuildRequest>,
     ) -> Result<Response<pplx_space_template_mgr_client::proto::DeleteTemplateBuildResponse>, Status>
     {
+        pplx_space_common_svc::auth::template::require_template_mutation_authority(&r)?;
         fwd!(self.clients.tmpl(), delete_template_build, r)
     }
 
@@ -167,6 +169,7 @@ impl BuilderApi for BuilderApiService {
         &self,
         r: Request<pplx_space_template_mgr_client::proto::CreatePoolRequest>,
     ) -> Result<Response<pplx_space_template_mgr_client::proto::CreatePoolResponse>, Status> {
+        pplx_space_common_svc::auth::template::require_template_mutation_authority(&r)?;
         fwd!(self.clients.tmpl(), create_pool, r)
     }
 
@@ -174,6 +177,7 @@ impl BuilderApi for BuilderApiService {
         &self,
         r: Request<pplx_space_template_mgr_client::proto::DeletePoolRequest>,
     ) -> Result<Response<pplx_space_template_mgr_client::proto::DeletePoolResponse>, Status> {
+        pplx_space_common_svc::auth::template::require_template_mutation_authority(&r)?;
         fwd!(self.clients.tmpl(), delete_pool, r)
     }
 

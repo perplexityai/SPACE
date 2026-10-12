@@ -12,6 +12,7 @@ use tower::{Layer, Service};
 use crate::space_api_route::SPACE_API_BRIDGE_CALLER_POLICY_METADATA_KEY;
 
 pub mod build;
+pub mod template;
 
 #[cfg(all(feature = "k8s", any(test, feature = "test-support")))]
 pub mod test_support;

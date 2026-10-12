@@ -61,6 +61,7 @@ pplx-space-sbx-mgr-client = { workspace = true }
 pplx-space-template-mgr-client = { workspace = true }
 
 [dev-dependencies]
+rstest = { workspace = true }
 axum = { workspace = true }
 pplx-space-test-env = { workspace = true }
 pplx-space-common-svc = { workspace = true, features = ["test-support", "test-hooks"] }

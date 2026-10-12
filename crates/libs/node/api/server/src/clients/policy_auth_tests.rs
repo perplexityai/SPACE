@@ -28,10 +28,10 @@ use pplx_space_template_mgr_client::proto as tmpl;
 use tonic::{Code, Request};
 use tower::Layer;
 
-const PROJECTED_TOKEN: &str = "e30.e30.signature";
-const STATIC_TOKEN: &str = "shared-token";
+pub(super) const PROJECTED_TOKEN: &str = "e30.e30.signature";
+pub(super) const STATIC_TOKEN: &str = "shared-token";
 
-fn auth_layer(
+pub(super) fn auth_layer(
     role: NodeRole,
     k8s: bool,
     username: &'static str,
@@ -47,11 +47,11 @@ fn auth_layer(
         ("SPACE_K8S_TOKEN_AUTH_STATIC_FALLBACK_ENABLED", "true"),
         (
             "SPACE_NODE_API_AUTH_ALLOWED_SERVICE_ACCOUNTS",
-            "space-api,workers",
+            "space-api,workers,observer,space-data-plane",
         ),
         (
             "SPACE_NODE_API_INTERNAL_AUTH_ALLOWED_SERVICE_ACCOUNTS",
-            "space-api,workers",
+            "space-api,workers,observer,space-data-plane",
         ),
         (
             "SPACE_NODE_API_AUTH_TRUSTED_WAIT_READY_SERVICE_ACCOUNTS",
@@ -112,7 +112,7 @@ fn auth_layer(
     )
 }
 
-fn bearer<T>(body: T, token: &str) -> Request<T> {
+pub(super) fn bearer<T>(body: T, token: &str) -> Request<T> {
     let mut request = Request::new(body);
     request.metadata_mut().insert(
         "authorization",
@@ -135,43 +135,7 @@ enum Rpc {
 
 #[tokio::test]
 async fn policy_rpc_authentication_reaches_handlers() {
-    let calls = Arc::new(AtomicUsize::new(0));
-    let recorded_calls = calls.clone();
-    // Acknowledging backend: success and the count prove a real handler forwarded
-    // the request; denial must leave it untouched. No manager/database is needed.
-    let backend = Router::new().fallback(any(move || {
-        let calls = recorded_calls.clone();
-        async move {
-            calls.fetch_add(1, Ordering::SeqCst);
-            http::Response::builder()
-                .header("content-type", "application/grpc")
-                .header("grpc-status", "0")
-                .body(Body::from(vec![0u8; 5]))
-                .unwrap()
-        }
-    }));
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    let shutdown = tokio_util::sync::CancellationToken::new();
-    let stopped = shutdown.clone();
-    let mut servers = tokio::task::JoinSet::new();
-    servers.spawn(async move {
-        axum::serve(listener, backend)
-            .with_graceful_shutdown(stopped.cancelled_owned())
-            .await
-            .unwrap();
-    });
-    let channel = tonic::transport::Endpoint::from_shared(format!("http://{address}"))
-        .unwrap()
-        .connect()
-        .await
-        .unwrap();
-    let clients = BackendClients {
-        sbx: SandboxManagerGrpcClient::new(wrap_grpc_client_channel(channel.clone())),
-        node: NodeManagerGrpcClient::new(wrap_grpc_client_channel(channel.clone())),
-        tmpl: TemplateManagerGrpcClient::new(wrap_grpc_client_channel(channel.clone())),
-        build_mgr: pplx_space_build_mgr_client::client_with_token(channel, STATIC_TOKEN).unwrap(),
-    };
+    let (clients, calls, shutdown, mut servers) = backend().await;
     for (k8s, username, token, trusted) in [
         (true, "space-api", PROJECTED_TOKEN, true),
         (true, "workers", PROJECTED_TOKEN, false),
@@ -324,4 +288,53 @@ async fn policy_rpc_authentication_reaches_handlers() {
     while let Some(result) = servers.join_next().await {
         result.unwrap();
     }
+}
+
+pub(super) async fn backend() -> (
+    BackendClients,
+    Arc<AtomicUsize>,
+    tokio_util::sync::CancellationToken,
+    tokio::task::JoinSet<()>,
+) {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let recorded_calls = calls.clone();
+    // Acknowledging backend: success and the count prove a real handler forwarded
+    // the request; denial must leave it untouched. No manager/database is needed.
+    let backend = Router::new().fallback(any(move || {
+        let calls = recorded_calls.clone();
+        async move {
+            calls.fetch_add(1, Ordering::SeqCst);
+            http::Response::builder()
+                .header("content-type", "application/grpc")
+                .header("grpc-status", "0")
+                .body(Body::from(vec![0u8; 5]))
+                .expect("valid gRPC acknowledgement")
+        }
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind backend");
+    let address = listener.local_addr().expect("backend address");
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let stopped = shutdown.clone();
+    let mut servers = tokio::task::JoinSet::new();
+    servers.spawn(async move {
+        axum::serve(listener, backend)
+            .with_graceful_shutdown(stopped.cancelled_owned())
+            .await
+            .expect("backend server");
+    });
+    let channel = tonic::transport::Endpoint::from_shared(format!("http://{address}"))
+        .expect("backend endpoint")
+        .connect()
+        .await
+        .expect("connect backend");
+    let clients = BackendClients {
+        sbx: SandboxManagerGrpcClient::new(wrap_grpc_client_channel(channel.clone())),
+        node: NodeManagerGrpcClient::new(wrap_grpc_client_channel(channel.clone())),
+        tmpl: TemplateManagerGrpcClient::new(wrap_grpc_client_channel(channel.clone())),
+        build_mgr: pplx_space_build_mgr_client::client_with_token(channel, STATIC_TOKEN)
+            .expect("backend bearer"),
+    };
+    (clients, calls, shutdown, servers)
 }

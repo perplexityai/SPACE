@@ -6109,6 +6109,7 @@ dependencies = [
  "pplx-space-sbx-mgr-client",
  "pplx-space-template-mgr-client",
  "pplx-space-test-env",
+ "rstest",
  "serde",
  "serde_json",
  "socket2",
