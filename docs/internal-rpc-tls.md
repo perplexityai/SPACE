@@ -40,19 +40,23 @@ acceptable; never distribute a server private key to clients.
 
 On EKS, the `space` Terraform module
 (`infra/space/aws/eks/modules/space/internal_rpc_tls.tf`) provisions a
-per-cluster CA and one leaf certificate each for ClusterApi, NodeApi and
-BuildManager. `app_deploy.tf` syncs them into the `space-internal-rpc-ca`,
-`space-cluster-api-tls`, `space-node-api-tls` and `space-build-manager-tls`
-Secrets.
+per-cluster CA and one leaf certificate each for ClusterApi, NodeApi,
+BuildManager and the API's ingress activation listener. `app_deploy.tf` syncs
+them into the `space-internal-rpc-ca`, `space-cluster-api-tls`,
+`space-node-api-tls`, `space-build-manager-tls` and
+`space-ingress-activation-tls` Secrets.
 
 The leaves carry only short service names (ClusterApi: `space-internal-api` and
 `space-cluster-api`; NodeApi: `space-node-api`; BuildManager:
-`space-builder-build-manager`) and no IP SANs. A caller whose configured
+`space-builder-build-manager`; ingress activation: `space-ingress-activation`)
+and no IP SANs. A caller whose configured
 endpoint host isn't one of those names, such as a node IP, a loopback address, a
 fully qualified service name or another short name, sets the matching
 `*_TLS_SERVER_NAME`. Every NodeApi listener on a cluster shares the one
 `space-node-api` key: that's the shared worker identity described above, not a
-per-node identity.
+per-node identity. Ingress activation callers that dial the API's activation
+Service by another name set
+`SPACE_INGRESS_ACTIVATION_TLS_SERVER_NAME=space-ingress-activation`.
 
 An apply reissues a leaf once it's within 60 days of its one-year expiry, or
 past it; the module doesn't schedule applies. Listeners load their identity only

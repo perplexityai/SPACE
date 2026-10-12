@@ -30,7 +30,7 @@ module "app_deploy" {
   chart_path                 = "${var.charts_dir}/space-secrets-bootstrap"
   external_secrets = concat([
     {
-      # This and the three listener identities below come from
+      # This and the four listener identities below come from
       # internal_rpc_tls.tf. They change only on a Terraform renewal or
       # rotation, and processes load them at startup, so the chart-default 5m
       # refresh would re-fetch constants.
@@ -92,6 +92,23 @@ module "app_deploy" {
         {
           secret_key = "tls.key"
           remote_key = aws_secretsmanager_secret.node_api_tls.name
+          property   = "tls_key"
+        }
+      ]
+    },
+    {
+      name               = "space-ingress-activation-tls"
+      target_secret_name = "space-ingress-activation-tls"
+      refresh_interval   = "1h"
+      data = [
+        {
+          secret_key = "tls.crt"
+          remote_key = aws_secretsmanager_secret.ingress_activation_tls.name
+          property   = "tls_crt"
+        },
+        {
+          secret_key = "tls.key"
+          remote_key = aws_secretsmanager_secret.ingress_activation_tls.name
           property   = "tls_key"
         }
       ]

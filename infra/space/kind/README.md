@@ -1040,8 +1040,8 @@ one-year leaves reissued within 60 days of expiry for internal-api
 node-api (`space-node-api-tls`: `space-node-api`), build-manager
 (`space-build-manager-tls`: `space-builder-build-manager`) and the api's
 ingress activation listener (`space-ingress-activation-tls`: `space-api`, the
-Service internal-api dials; the EKS module names no Secret for it, so this
-name is Kind's own), each mounted only by
+Service internal-api dials; the EKS module issues this Secret's leaf for
+`space-ingress-activation` instead), each mounted only by
 its listener at `/etc/space-rpc-tls` with the key readable by the listener's own
 identity, and the authority's self-signed end-entity certificate
 (`space-credmgr-authority-tls`, trusted by its clients through
@@ -1069,7 +1069,7 @@ asks of the hosting deployment.
 | Postgres on RDS, secrets via ExternalSecrets / AWS Secrets Manager | In-cluster `space-postgres` StatefulSet, static Kubernetes Secrets             |
 | S3 for snapshots + template artifacts                     | In-cluster versitygw (real S3 protocol, sigv4, path-style)                    |
 | `space-credmgr-authority` Deployment whose platform KEK comes from an external intermediate-key broker, with TLS from its own certificate (`credmgr_authority_tls.tf`; the direct KMS backend is gone, `credmgr_authority_kms.tf`) | two replicas on the same broker path against the in-repo broker fixture (`space-kind-key-broker`), which derives keys instead of protecting them; TLS from a self-signed certificate `internal-rpc-tls.sh` issues per cluster |
-| Internal RPC CA and listener leaves issued by Terraform and synced by External Secrets (`internal_rpc_tls.tf`) | the same Secrets issued per cluster by `scripts/internal-rpc-tls.sh` |
+| Internal RPC CA and listener leaves issued by Terraform and synced by External Secrets (`internal_rpc_tls.tf`) | the same Secrets issued per cluster by `scripts/internal-rpc-tls.sh`; the ingress activation leaf names `space-api` rather than `space-ingress-activation` |
 | volume-manager credentials via credmgr STS/IRSA           | static `SPACE_OBJECT_STORE_STATIC_*` creds (the documented local escape hatch) |
 | build-manager gets S3 credentials via credential-manager backed by cloud identity | the same directly injected static object-store credentials; credential-manager's storage exchange endpoint is explicitly disabled |
 | `/dev/kvm` access via the AMI's kvm group                 | `space-kind-devices.service` makes `/dev/kvm`, `/dev/vhost-vsock` and `/dev/vhost-net` mode 0666 on the node (kind-only; never replicate on a worker) |
