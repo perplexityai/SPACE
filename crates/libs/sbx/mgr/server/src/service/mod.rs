@@ -403,6 +403,7 @@ pub struct SandboxManagerService {
         Arc<tokio::sync::OnceCell<pplx_space_credmgr_client::CredentialManagerGrpcClient>>,
     network_credentials_enabled: bool,
     node_manager: NodeManagerConnector,
+    template_resolver: Arc<dyn crate::template_resolver::TemplateResolver>,
     gateway_caller_client: pplx_space_node_mgr_client::NodeManagerGrpcClient,
     gateway_authority: gateway_authority::GatewayAuthority,
     /// S3 upload config for suspend snapshots. `None` means uploads are disabled.
@@ -974,6 +975,8 @@ pub struct SandboxManagerServiceOptions {
     >,
     /// Every node-manager client the service and its subsystems use.
     pub node_manager: NodeManagerConnector,
+    /// Every template-manager `GetTemplate` the service and its subsystems ask.
+    pub template_resolver: Arc<dyn crate::template_resolver::TemplateResolver>,
 }
 
 impl Default for SandboxManagerServiceOptions {
@@ -993,6 +996,7 @@ impl Default for SandboxManagerServiceOptions {
             node_managed_by: None,
             route_ed25519_verification_bundle: None,
             node_manager: NodeManagerConnector::host(),
+            template_resolver: Arc::new(crate::template_resolver::HostTemplateManager),
         }
     }
 }
@@ -1678,6 +1682,7 @@ impl SandboxManagerService {
             template_network_policies: TemplateNetworkPolicyCache::new(
                 options.shutdown_token.clone(),
                 options.task_tracker.clone(),
+                Arc::clone(&options.template_resolver),
             ),
             network_policy_reconcile_queue,
             network_policy_reconciler_started: Arc::new(AtomicBool::new(false)),
@@ -1743,6 +1748,7 @@ impl SandboxManagerService {
                 crate::retained_source::NodeManagerSourceInspector(options.node_manager.clone()),
             ),
             node_manager: options.node_manager,
+            template_resolver: options.template_resolver,
             drain_state,
             feature_flags,
             route_ed25519_verification_bundle: Arc::new(ArcSwapOption::from(

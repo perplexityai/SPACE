@@ -514,6 +514,7 @@ async fn prepare_suspend_restore_dir(
                 storage_uri,
                 transfer_scope_id,
                 &service.node_manager,
+                service.template_resolver.as_ref(),
             )
             .await
         }
@@ -523,6 +524,7 @@ async fn prepare_suspend_restore_dir(
                 execution_fence,
                 transfer_scope_id,
                 &service.node_manager,
+                service.template_resolver.as_ref(),
             )
             .await
         }
@@ -1363,6 +1365,7 @@ impl SandboxManagerService {
 
         if !vmstate_path.exists() {
             let resolved_template = resolve_template_paths_for_start(
+                self.template_resolver.as_ref(),
                 pplx_space_template_mgr_client::proto::TemplateRef {
                     name: sandbox.template.clone(),
                     content_hash: sandbox.template_hash.clone(),
@@ -1645,7 +1648,7 @@ impl SandboxManagerService {
             "fresh.template_prepare_source",
             START_TEMPLATE_RESOLUTION_TIMEOUT,
             &sandbox.id,
-            template_source_for_sandbox_prepare(&sandbox),
+            template_source_for_sandbox_prepare(self.template_resolver.as_ref(), &sandbox),
         )
         .await?;
         let selection_mode = if prepare_source.existing_artifact {
@@ -1661,7 +1664,11 @@ impl SandboxManagerService {
             START_TEMPLATE_RESOLUTION_TIMEOUT,
             &sandbox.id,
             TemplateRuntimeDefaults::default(),
-            template_runtime_defaults_for_sandbox_start(&sandbox, prepare_template_dir.as_deref()),
+            template_runtime_defaults_for_sandbox_start(
+                self.template_resolver.as_ref(),
+                &sandbox,
+                prepare_template_dir.as_deref(),
+            ),
         )
         .await;
 

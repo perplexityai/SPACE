@@ -1,4 +1,19 @@
 use super::*;
+use crate::template_resolver::fake::FakeTemplateResolver;
+
+/// A cache whose owner lookups are refused, with the resolver that refuses
+/// them. Tests that supply their own fetch never reach it.
+fn refusing_cache() -> (TemplateNetworkPolicyCache, Arc<FakeTemplateResolver>) {
+    let templates = Arc::new(FakeTemplateResolver::refusing(Status::unavailable(
+        "template-manager is outside this test",
+    )));
+    let cache = TemplateNetworkPolicyCache::new(
+        tokio_util::sync::CancellationToken::new(),
+        tokio_util::task::TaskTracker::new(),
+        Arc::clone(&templates) as Arc<dyn crate::template_resolver::TemplateResolver>,
+    );
+    (cache, templates)
+}
 
 #[test]
 fn legacy_policy_hash_is_stable() {
@@ -27,7 +42,7 @@ async fn template_policy_refresh_uses_current_owner_across_local_changes_and_rec
         (Local, 0, Local, 0),   // Old template-manager local updates reuse zero.
         (Local, 9, Cluster, 1), // Delete/recreate legitimately changes authority.
     ] {
-        let cache = TemplateNetworkPolicyCache::default();
+        let cache = refusing_cache().0;
         cache
             .get_or_fetch_with("seed", move |_| async move {
                 Ok(EffectiveNetworkPolicy::new(
@@ -111,7 +126,7 @@ async fn template_policy_hints_are_admission_requirements_not_cache_authority() 
             Some(tonic::Code::FailedPrecondition),
         ),
     ] {
-        let cache = TemplateNetworkPolicyCache::default();
+        let (cache, templates) = refusing_cache();
         cache
             .get_or_fetch_with("seed", move |_| async move {
                 Ok(EffectiveNetworkPolicy::new(
@@ -134,6 +149,8 @@ async fn template_policy_hints_are_admission_requirements_not_cache_authority() 
             true,
         );
         let admission_error = cache.require_hint("seed", &hint, true).await.err();
+        // The hint is checked against the cached owner answer, not a new lookup.
+        assert!(templates.lookups().is_empty());
         assert_eq!(admission_error.as_ref().map(|error| error.code()), expected);
         if let Some(error) = &admission_error {
             assert!(pplx_space_sbx_mgr_client::is_template_policy_dependency(
@@ -173,7 +190,7 @@ async fn template_policy_hints_are_admission_requirements_not_cache_authority() 
 
 #[tokio::test(start_paused = true)]
 async fn custom_policy_override_does_not_require_template_owner_progress() {
-    let cache = TemplateNetworkPolicyCache::default();
+    let (cache, templates) = refusing_cache();
     let hint = EffectiveNetworkPolicy::new(
         NetworkPolicyV1::deny_all(),
         50,
@@ -190,11 +207,12 @@ async fn custom_policy_override_does_not_require_template_owner_progress() {
             inherits_template.then_some(tonic::Code::DeadlineExceeded)
         );
     }
+    assert!(templates.lookups().is_empty());
 }
 
 #[tokio::test(start_paused = true)]
 async fn template_policy_invalidation_fences_fetch_callers_and_successor_claims() {
-    let cache = TemplateNetworkPolicyCache::default();
+    let cache = refusing_cache().0;
     let mut old = Box::pin(cache.get_or_fetch_with("seed", |_| std::future::pending()));
     assert!(futures_util::poll!(&mut old).is_pending());
     let old_claim = Arc::clone(&cache.inner.lock().await.pending_fetches["seed"].claim);
@@ -258,7 +276,7 @@ async fn template_policy_invalidation_fences_fetch_callers_and_successor_claims(
 #[tokio::test(start_paused = true)]
 async fn template_policy_wait_deadline_includes_cache_admission() {
     for release_midway in [false, true] {
-        let cache = TemplateNetworkPolicyCache::default();
+        let cache = refusing_cache().0;
         let guard = cache.inner.lock().await;
         let mut waiting = Box::pin(cache.get_or_fetch_with("seed", |_| std::future::pending()));
         assert!(futures_util::poll!(&mut waiting).is_pending());
@@ -280,7 +298,7 @@ async fn template_policy_wait_deadline_includes_cache_admission() {
 
 #[tokio::test(start_paused = true)]
 async fn template_policy_fetch_progress_survives_foreground_timeouts_and_cancellation() {
-    let cache = TemplateNetworkPolicyCache::default();
+    let cache = refusing_cache().0;
     let (alive, cancelled) = tokio::sync::oneshot::channel::<()>();
     let (release, released) = tokio::sync::oneshot::channel::<()>();
     let mut first = Box::pin(cache.get_or_fetch_with("seed", |_| async move {
@@ -324,7 +342,7 @@ async fn template_policy_fetch_progress_survives_foreground_timeouts_and_cancell
 #[tokio::test(start_paused = true)]
 async fn template_policy_fetch_capacity_and_deadline_release_claims() {
     for shutdown in [false, true] {
-        let cache = TemplateNetworkPolicyCache::default();
+        let cache = refusing_cache().0;
         let names: Vec<_> = (0..TEMPLATE_NETWORK_POLICY_FETCH_CAPACITY)
             .map(|i| format!("template-{i}"))
             .collect();
@@ -391,7 +409,7 @@ async fn template_policy_fetch_capacity_and_deadline_release_claims() {
 
     // A ready Shared can be completed by its caller before its tracked owner
     // is scheduled. Those queued owner tasks still consume the same hard cap.
-    let cache = TemplateNetworkPolicyCache::default();
+    let cache = refusing_cache().0;
     for i in 0..TEMPLATE_NETWORK_POLICY_FETCH_CAPACITY {
         let name = format!("ready-{i}");
         let mut caller = Box::pin(tokio::task::unconstrained(cache.get_or_fetch_with(
@@ -426,7 +444,7 @@ async fn template_policy_fetch_capacity_and_deadline_release_claims() {
 
 #[tokio::test(start_paused = true)]
 async fn template_policy_cache_bounds_churn_without_retiring_pending_claims() {
-    let cache = TemplateNetworkPolicyCache::default();
+    let cache = refusing_cache().0;
     let mut waiting = Box::pin(cache.get_or_fetch_with("pending", |_| std::future::pending()));
     assert!(futures_util::poll!(&mut waiting).is_pending());
     let claim = Arc::clone(&cache.inner.lock().await.pending_fetches["pending"].claim);

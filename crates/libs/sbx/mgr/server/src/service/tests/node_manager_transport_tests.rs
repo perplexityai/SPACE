@@ -14,10 +14,12 @@ use pplx_space_node_mgr_client::proto::{
     CleanupSandboxRequest, CleanupSandboxResponse, StopProcessRequest, StopProcessResponse,
 };
 
-/// A service whose node-manager clients all come from `node_manager`.
-pub(crate) fn service_with_node_manager(
+/// A service whose node-manager clients all come from `node_manager` and whose
+/// template lookups all go to `template_resolver`.
+pub(crate) fn isolated_service(
     conn: rusqlite::Connection,
     node_manager: NodeManagerConnector,
+    template_resolver: Arc<dyn crate::template_resolver::TemplateResolver>,
     sockets: &Path,
 ) -> SandboxManagerService {
     SandboxManagerService::new_with_options(
@@ -35,7 +37,26 @@ pub(crate) fn service_with_node_manager(
             node_managed_by: None,
             route_ed25519_verification_bundle: None,
             node_manager,
+            template_resolver,
         },
+    )
+}
+
+/// [`isolated_service`] whose template lookups are all refused.
+pub(crate) fn service_with_node_manager(
+    conn: rusqlite::Connection,
+    node_manager: NodeManagerConnector,
+    sockets: &Path,
+) -> SandboxManagerService {
+    isolated_service(
+        conn,
+        node_manager,
+        Arc::new(
+            crate::template_resolver::fake::FakeTemplateResolver::refusing(Status::unavailable(
+                "template-manager is outside this test",
+            )),
+        ),
+        sockets,
     )
 }
 
