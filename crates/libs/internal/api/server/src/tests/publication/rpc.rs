@@ -833,6 +833,14 @@ fn tenant_publication_rejects_invalid_grants(
             }
         };
         let grant = grant_tenant_publication(pool, name, owner, pinned, age).await?;
+        let control = if matches!(invalid, InvalidGrant::DeletedBuilder) {
+            Some(
+                grant_tenant_publication(pool, "control-out", tenant, Some(builder), "0 seconds")
+                    .await?,
+            )
+        } else {
+            None
+        };
         let proof = match invalid {
             InvalidGrant::Forged => Uuid::now_v7().to_string(),
             InvalidGrant::Malformed => "invalid".into(),
@@ -859,6 +867,20 @@ fn tenant_publication_rejects_invalid_grants(
         .fetch_one(pool)
         .await?;
         assert_eq!(created, 0);
+        if let Some(control) = control {
+            assert!(tenant_publication_grant_exists(pool, control).await?);
+            assert_eq!(
+                publish_as_build_manager(
+                    &mut fixture.client,
+                    "control-out",
+                    tenant,
+                    'b',
+                    Some(control.to_string())
+                )
+                .await,
+                (Code::Ok, Code::Ok)
+            );
+        }
         fixture.finish().await
     })
 }
