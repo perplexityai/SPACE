@@ -36,8 +36,6 @@ if [ -z "${NEXTEST_ENV:-}" ] || [ -z "${NEXTEST_RUN_ID:-}" ]; then
     exit 1
 fi
 
-nextest_pid="${PPID}"
-redis_image="$(space_test_dependency_redis_image)"
 container_id=""
 
 fail_open() {
@@ -50,6 +48,19 @@ fail_open() {
     exit 0
 }
 
+# The caller already runs a server for this nextest run, as GitHub CI's
+# unprivileged Rust job does (ci/scripts/ci-test-services.sh): there is no
+# Docker daemon to start one, and the caller removes it.
+if [ -n "${SPACE_NEXTEST_REDIS_ADDRESS:-}" ]; then
+    if ! timeout 5 bash -c "exec 3<>/dev/tcp/${SPACE_NEXTEST_REDIS_ADDRESS%:*}/${SPACE_NEXTEST_REDIS_ADDRESS##*:}" 2>/dev/null; then
+        fail_open "Redis at ${SPACE_NEXTEST_REDIS_ADDRESS} is not accepting connections"
+    fi
+    printf 'SPACE_TEST_REDIS_URL=redis://%s\n' "${SPACE_NEXTEST_REDIS_ADDRESS}" >>"${NEXTEST_ENV}"
+    exit 0
+fi
+
+nextest_pid="${PPID}"
+redis_image="$(space_test_dependency_redis_image)"
 space_pull_docker_image "${redis_image}" || fail_open "failed to pull Redis image"
 container_id="$(docker run --detach --rm \
     --pull=never \
@@ -77,9 +88,25 @@ fi
 if [ -z "${redis_port}" ]; then
     fail_open "Redis container exposed no host port for 6379/tcp"
 fi
-redis_host="${TESTCONTAINERS_HOST_OVERRIDE:-127.0.0.1}"
+redis_address="${TESTCONTAINERS_HOST_OVERRIDE:-127.0.0.1}:${redis_port}"
 
-printf 'SPACE_TEST_REDIS_URL=redis://%s:%s\n' "${redis_host}" "${redis_port}" >>"${NEXTEST_ENV}"
+# The published port is bound to the Docker host's loopback, which a test
+# process in another container's network namespace cannot reach. Where this
+# process can route to the container's bridge address, connect there instead,
+# as the Postgres setup does; elsewhere, such as Docker Desktop, the probe fails
+# within a second and the published port stays. An explicit host override
+# always wins.
+if [ -z "${TESTCONTAINERS_HOST_OVERRIDE:-}" ] && command -v timeout >/dev/null 2>&1; then
+    container_ip="$(docker inspect \
+        --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' \
+        "${container_id}" 2>/dev/null)" || container_ip=""
+    if [ -n "${container_ip}" ] &&
+        timeout 1 bash -c "exec 3<>/dev/tcp/${container_ip}/6379" 2>/dev/null; then
+        redis_address="${container_ip}:6379"
+    fi
+fi
+
+printf 'SPACE_TEST_REDIS_URL=redis://%s\n' "${redis_address}" >>"${NEXTEST_ENV}"
 
 # Setup scripts finish before tests begin. A detached watcher provides the
 # missing teardown hook without holding nextest's stdout/stderr pipes open.

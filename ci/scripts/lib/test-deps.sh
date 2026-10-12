@@ -42,3 +42,56 @@ space_pull_docker_image() {
         delay_seconds=$((delay_seconds * 2))
     done
 }
+
+# Start the test Postgres server detached and print its container ID. Callers
+# add their own `docker run` options (labels, network, published port, --rm),
+# then optionally `--` and extra server settings (`-c name=value`).
+#
+# The server lives for one nextest run and is deleted with its data, so it
+# gives up crash durability: every DROP DATABASE forces a checkpoint, and with
+# fsync on each one flushed and fsynced the dirty pages of every concurrently
+# running test's database. The testcontainers module this replaces already
+# starts Postgres with fsync=off; synchronous_commit and full_page_writes only
+# matter for surviving a crash as well. For the same reason the data directory
+# is a tmpfs: each test's database is a copy of the template's files, created
+# and deleted a file at a time, and that is cheaper in memory than on the
+# runner's disk. CI runs 30 tests at once. Most hold two or three connections,
+# but a few hold eight or ten, so the default limit of 100 is raised.
+space_start_test_postgres() {
+    local docker_options=()
+    while [ "$#" -gt 0 ] && [ "$1" != -- ]; do
+        docker_options+=("$1")
+        shift
+    done
+    [ "$#" -eq 0 ] || shift
+    docker run --detach \
+        --pull=never \
+        "${docker_options[@]}" \
+        --env POSTGRES_HOST_AUTH_METHOD=trust \
+        --env PGDATA=/var/lib/postgresql/data \
+        --tmpfs /var/lib/postgresql/data \
+        "$(space_test_dependency_postgres_image)" \
+        -c fsync=off \
+        -c synchronous_commit=off \
+        -c full_page_writes=off \
+        -c max_connections=200 \
+        "$@"
+}
+
+# The image's entrypoint first runs initdb under a temporary server that
+# listens only on the Unix socket, then stops it and starts the real one. A
+# socket probe can therefore succeed against the temporary server and the
+# next one fail while it shuts down. Probe over TCP, which only the real
+# server answers, and poll finely: the server is usually up in about a second.
+space_wait_for_test_postgres() {
+    local container_id="$1"
+    local ready_deadline=$((SECONDS + 30))
+    until docker exec "${container_id}" pg_isready --host 127.0.0.1 --username postgres >/dev/null 2>&1; do
+        if [ "${SECONDS}" -ge "${ready_deadline}" ]; then
+            echo "Postgres did not become ready within 30 seconds" >&2
+            docker logs "${container_id}" >&2 || true
+            return 1
+        fi
+        sleep 0.1
+    done
+}

@@ -18,7 +18,7 @@
 
 ## Tests
 
-Follow "Tests run as root on the CI host" in `docs/rust/space-conventions.md`.
+Follow "Privileged tests and the CI host" in `docs/rust/space-conventions.md`.
 
 - Tests must not dial node-manager's fixed socket
   (`pplx_space_node_mgr_client::connect()`, `connect_once()`, `lazy()`); give

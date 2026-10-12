@@ -365,13 +365,37 @@ needs an attribute to say what `mod tests;` says for free, and it puts test
 files in the same directory listing as production ones. Don't propagate it; new
 test modules use the plain `#[cfg(test)] mod <name>;` + `<host>/<name>.rs` form.
 
-## Tests run as root on the CI host
+## Privileged tests and the CI host
 
 The GitHub Rust test job runs the whole workspace, ignored tests included
-(`ci/scripts/run-rust-checks.sh`), as root in a `--privileged`,
-`--network host` container (`.github/workflows/common-ci.yml`). A test can
-reach whatever its host offers, so tests must not touch host state they do not
-own: fixed SPACE paths, production sockets, firewall or network-namespace
+(`ci/scripts/run-rust-checks.sh`), in two containers on one runner
+(`.github/workflows/common-ci.yml`). Everything outside the nextest test group
+`privileged` (`.config/nextest.toml`) runs as an unprivileged user with no
+capabilities, no Docker socket and no host network; the runner starts its
+Postgres and Redis. The group then runs from the same build as root in a
+`--privileged` container with the host's Docker socket.
+
+A test belongs in that group when it needs root, CAP_SYS_ADMIN, loop devices,
+a relaxed seccomp profile, or its own containers. So does a test whose root
+path differs from its unprivileged path, for example one that switches to
+another uid only when it can: in the unprivileged half it would pass without
+exercising its root assertions. Either list it in the group or split it into a
+root test there and an unprivileged test outside it. Make a privileged test
+assert its requirement rather than return early: an assertion fails the
+unprivileged half if the test is missing from the group, while an early
+return passes there without testing anything. Keep the group small; a test
+that needs privilege only for an incidental step should lose that step
+instead.
+
+The group's filter has one clause per line. The job checks that each clause
+matches at least one test and that every test it matches is in the group, so
+a rename or typo fails CI rather than moving a test to the unprivileged half.
+The check cannot find a privileged test that no clause names; only that test's
+own assertion can.
+
+The privileged half can reach whatever its host offers, and the unprivileged
+half can still reach the network, so tests must not touch host state they do
+not own: fixed SPACE paths, production sockets, firewall or network-namespace
 state, or processes they did not spawn. Test-owned temporary directories and
 child processes are fine.
 

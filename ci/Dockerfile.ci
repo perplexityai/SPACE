@@ -168,6 +168,17 @@ RUN set -eux; \
     install -m 0755 "/tmp/${package}/uv" "/tmp/${package}/uvx" /usr/local/bin/; \
     rm -rf /tmp/uv.tar.gz "/tmp/${package}"
 
+# GitHub CI's Rust test job runs as this account rather than root. Its uid is
+# the GitHub runner user's, which owns the mounted workspace and caches. Cargo
+# writes its package-cache lock and global cache tracking at the top of
+# CARGO_HOME, so those entries are the account's; the toolchain and the tools
+# installed above stay root's. The image's default user stays root for the
+# other jobs and for the privileged test step.
+ARG SPACE_CI_UID=1001
+RUN groupadd --gid "${SPACE_CI_UID}" space-ci \
+    && useradd --uid "${SPACE_CI_UID}" --gid space-ci --create-home --shell /bin/bash space-ci \
+    && find "${CARGO_HOME}" -mindepth 0 -maxdepth 1 ! -name bin -exec chown space-ci:space-ci {} +
+
 RUN cargo nextest --version \
     && cargo deny --version \
     && cargo vet --version \

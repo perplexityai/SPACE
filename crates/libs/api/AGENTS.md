@@ -20,7 +20,7 @@ Before changing the substrate, read `src/controllers/substrate/AGENTS.md`.
 
 ## Tests
 
-Follow "Tests run as root on the CI host" in `docs/rust/space-conventions.md`.
+Follow "Privileged tests and the CI host" in `docs/rust/space-conventions.md`.
 
 - `AppState::from_pool` and the `from_env` constructors read process env.
   Test a parser through its explicit-input form where one exists

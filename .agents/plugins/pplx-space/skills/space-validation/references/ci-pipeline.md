@@ -31,6 +31,30 @@ runner's complete workspace test inventory, including ignored tests and doc
 tests. Do not narrow CI selectors because local checks were sufficient for a
 focused change.
 
+GitHub's Rust tests job runs that inventory in two containers on one runner,
+from one build. `run-rust-checks.sh tests-unprivileged` runs as the CI image's
+`space-ci` user (the runner user's uid) with `--cap-drop=ALL`,
+`no-new-privileges`, no host network and no Docker socket, on a bridge network
+where the runner started Postgres and Redis (`ci/scripts/ci-test-services.sh`);
+the nextest setup scripts take those servers' addresses from
+`SPACE_NEXTEST_POSTGRES_ADDRESS` and `SPACE_NEXTEST_REDIS_ADDRESS` instead of
+starting their own. It builds everything, checks the `privileged` group in
+`.config/nextest.toml`, and runs `not group(privileged)`. The check requires
+every clause of the group's filter to match at least one test, all of them in
+the group; it catches a renamed test, a typo, or another override taking the
+test first, each of which would otherwise move a test to the unprivileged half
+silently. It cannot find a privileged test that no clause names.
+`tests-privileged` then runs `group(privileged)` as root in a `--privileged`
+container with the Docker socket but still no host network, from the first
+step's binaries through nextest's `--binaries-metadata` and
+`--cargo-metadata`, so it compiles nothing. It first confirms it selects the
+tests the first step listed, runs the M1 generator check, and returns any
+file it created to the runner user. Add a test to the group when it needs
+root, kernel capabilities, devices or its own containers, or when its root
+path differs from its unprivileged one (or split it in two); keep such tests
+asserting what they need, so a missing one fails the unprivileged step.
+`tests` and `all` still run the whole inventory in one process.
+
 Pull-request and merge-queue Rust tests reuse the Cargo target directory that
 main's cold build saved, and `ci/scripts/rust-target-cache.sh` stamps source
 mtimes so Cargo rebuilds only what changed since. That makes every compile-time

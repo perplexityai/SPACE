@@ -25,7 +25,7 @@
 
 ## Tests
 
-Follow "Tests run as root on the CI host" in `docs/rust/space-conventions.md`.
+Follow "Privileged tests and the CI host" in `docs/rust/space-conventions.md`.
 
 - Never call `NetworkPool::open`; `NetworkPool::open_in_memory_for_test`
   starts no host-networking worker.

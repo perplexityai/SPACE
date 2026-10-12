@@ -156,14 +156,22 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # The build and every test outside the nextest group `privileged`
+          # run as the image's unprivileged user, with no Docker socket and no
+          # host network; the runner starts their Postgres and Redis. The
+          # privileged group then runs as root from the same build, in the
+          # "Run the privileged Rust tests" step. See .config/nextest.toml.
           - name: Rust tests
-            command: bash ci/scripts/run-rust-checks.sh tests
+            command: bash ci/scripts/run-rust-checks.sh tests-unprivileged
             # The full all-targets/all-features graph exhausts the standard
             # runner's 14 GB disk before linking the workspace test binaries.
             runner: ubuntu-24.04-16core
-            docker_access: true
-            host_network: true
-            privileged: true
+            docker_access: false
+            host_network: false
+            privileged: false
+            unprivileged_user: true
+            test_services: true
+            privileged_tests: true
             rust_cache: true
             rust_cache_key: tests
             rust_cache_size: 4G
@@ -268,7 +276,7 @@ jobs:
       # back to the source and never fails the job. Like the CI image, the pull
       # overlaps the cache restores below and is waited for before the run.
       - name: Start pulling the test containers' images
-        if: matrix.docker_access == true
+        if: matrix.docker_access == true || matrix.test_services == true
         env:
           GHCR_TOKEN: ${{ github.token }}
         run: |
@@ -388,14 +396,28 @@ jobs:
           echo "::warning::The runner could not fetch the Rust dependencies; the job container fetches them itself"
 
       - name: Wait for the test containers' images
-        if: matrix.docker_access == true
+        if: matrix.docker_access == true || matrix.test_services == true
         run: bash ci/scripts/background-step.sh wait test-images
+
+      # The job container has no Docker socket, so its nextest setup scripts
+      # take these servers instead of starting their own. The owner label is
+      # this job's, so the stop step removes only what this step created.
+      - name: Start the test services
+        id: test-services
+        if: matrix.test_services == true
+        env:
+          SPACE_CI_TEST_SERVICES_OWNER: ${{ github.run_id }}-${{ github.run_attempt }}-${{ strategy.job-index }}
+        run: |
+          set -euo pipefail
+          services="$(bash ci/scripts/ci-test-services.sh start space-ci-tests "${SPACE_CI_TEST_SERVICES_OWNER}")"
+          printf 'env<<EOF\n%s\nEOF\n' "${services}" >>"${GITHUB_OUTPUT}"
 
       - name: Wait for the M1 SDK generator's image
         if: matrix.name == 'Rust tests'
         run: bash ci/scripts/background-step.sh wait m1-generator
 
       - name: Run ${{ matrix.name }}
+        id: run
         env:
           SPACE_CI_COMMAND: ${{ matrix.command }}
           SPACE_CI_BASE_SHA: ${{ inputs.base_sha }}
@@ -405,6 +427,8 @@ jobs:
           SPACE_CI_DOCKER_ACCESS: ${{ matrix.docker_access }}
           SPACE_CI_HOST_NETWORK: ${{ matrix.host_network }}
           SPACE_CI_PRIVILEGED: ${{ matrix.privileged }}
+          SPACE_CI_UNPRIVILEGED_USER: ${{ matrix.unprivileged_user == true }}
+          SPACE_CI_TEST_SERVICES: ${{ steps.test-services.outputs.env }}
           SPACE_CI_RUST_CACHE: ${{ matrix.rust_cache == true }}
           SPACE_CI_SCCACHE_DIR: ${{ runner.temp }}/space-sccache
           SPACE_CI_SCCACHE_RUN_DIR: ${{ runner.temp }}/space-sccache-run
@@ -449,6 +473,24 @@ jobs:
           if [[ "${SPACE_CI_PRIVILEGED}" == true ]]; then
             docker_args+=(--privileged)
           fi
+          # The image's space-ci account has the runner user's uid, so the
+          # container writes the workspace and caches as their owner. It needs
+          # no capabilities, and the image's setuid binaries must not grant
+          # any.
+          if [[ "${SPACE_CI_UNPRIVILEGED_USER}" == true ]]; then
+            image_uid="$(docker run --rm --entrypoint id "space-ci:${GITHUB_SHA}" -u space-ci)"
+            if [[ "${image_uid}" != "$(id -u)" ]]; then
+              echo "::error::The runner user's uid is $(id -u), but the CI image's space-ci account has uid ${image_uid}; set SPACE_CI_UID in ci/Dockerfile.ci to match."
+              exit 1
+            fi
+            docker_args+=(--user "$(id -u)" --cap-drop=ALL --security-opt=no-new-privileges)
+          fi
+          if [[ -n "${SPACE_CI_TEST_SERVICES}" ]]; then
+            docker_args+=(--network space-ci-tests)
+            while IFS= read -r assignment; do
+              docker_args+=(--env "${assignment}")
+            done <<<"${SPACE_CI_TEST_SERVICES}"
+          fi
           if [[ "${SPACE_CI_RUST_CACHE}" == true ]]; then
             # The command writes its sccache statistics to SPACE_CI_SCCACHE_STATS.
             # The marker dates the run for trimming the cache before a save.
@@ -466,6 +508,54 @@ jobs:
 
           docker run "${docker_args[@]}" "space-ci:${GITHUB_SHA}" \
             bash -c 'git config --global --add safe.directory /workspace && exec bash -c "$SPACE_CI_COMMAND"'
+
+      # The nextest group `privileged`: 41 tests that need root, CAP_SYS_ADMIN,
+      # a seccomp profile allowing pidfd_getfd, or a Docker socket, or whose
+      # root path differs, and 12 opt-in tests that return early because
+      # neither step opts them in. Also the M1 generator check. They run the binaries the step above built, whatever its result,
+      # without compiling; the script returns anything it creates as root to
+      # the runner user. No host network: the setup scripts and testcontainers
+      # reach their containers on the bridge network.
+      - name: Run the privileged Rust tests
+        if: >-
+          !cancelled() && matrix.privileged_tests == true &&
+          (steps.run.outcome == 'success' || steps.run.outcome == 'failure')
+        env:
+          SPACE_CI_MAIN_ONLY_TESTS: ${{ inputs.main_only_tests }}
+          SPACE_CI_CARGO_REGISTRY: ${{ runner.temp }}/cargo-home/registry
+        run: |
+          set -euo pipefail
+          docker_args=(
+            --rm
+            --user root
+            --privileged
+            --volume /var/run/docker.sock:/var/run/docker.sock
+            --volume "${GITHUB_WORKSPACE}:/workspace"
+            --volume "${SPACE_CI_CARGO_REGISTRY}:/usr/local/cargo/registry"
+            --workdir /workspace
+            --env CI=true
+            --env GITHUB_ACTIONS=true
+            --env NEXTEST_TEST_THREADS=30
+            --env SPACE_CI_REQUIRE_TEST_DEPS=1
+            --env SPACE_M1_GENERATOR_MIRROR=ghcr.io/perplexityai/space-ci-mirror
+          )
+          if [[ "${SPACE_CI_MAIN_ONLY_TESTS}" == true ]]; then
+            docker_args+=(--env SPACE_CI_MAIN_ONLY_TESTS=1)
+          fi
+          docker run "${docker_args[@]}" "space-ci:${GITHUB_SHA}" \
+            bash -c 'git config --global --add safe.directory /workspace && exec bash ci/scripts/run-rust-checks.sh tests-privileged'
+
+      # Their logs print on every run: a test that fails and then passes on
+      # nextest's retry leaves the job green.
+      - name: Stop the test services
+        if: always() && matrix.test_services == true
+        env:
+          SPACE_CI_TEST_SERVICES_OWNER: ${{ github.run_id }}-${{ github.run_attempt }}-${{ strategy.job-index }}
+        run: |
+          echo "::group::Test service logs"
+          bash ci/scripts/ci-test-services.sh logs "${SPACE_CI_TEST_SERVICES_OWNER}"
+          echo "::endgroup::"
+          bash ci/scripts/ci-test-services.sh stop "${SPACE_CI_TEST_SERVICES_OWNER}"
 
       # Keep the full test-build report: later nextest and doctest invocations
       # reuse its artifacts and would otherwise hide the expensive compilation.

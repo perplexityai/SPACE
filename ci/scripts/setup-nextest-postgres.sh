@@ -27,8 +27,27 @@ if [ -z "${NEXTEST_ENV:-}" ] || [ -z "${NEXTEST_RUN_ID:-}" ]; then
     exit 1
 fi
 
+# Migrate the template on the given server and publish it to the tests.
+publish_postgres() {
+    local admin_database_url="$1"
+    local setup_binary="${CARGO_TARGET_DIR:-target}/debug/space-nextest-postgres-setup"
+    if [ ! -x "${setup_binary}" ]; then
+        echo "Nextest did not build ${setup_binary}" >&2
+        exit 1
+    fi
+    "${setup_binary}" "${admin_database_url}"
+    printf 'SPACE_TEST_POSTGRES_ADMIN_URL=%s\n' "${admin_database_url}" >>"${NEXTEST_ENV}"
+}
+
+# The caller already runs a server for this nextest run, as GitHub CI's
+# unprivileged Rust job does (ci/scripts/ci-test-services.sh): there is no
+# Docker daemon to start one, and the caller removes it.
+if [ -n "${SPACE_NEXTEST_POSTGRES_ADDRESS:-}" ]; then
+    publish_postgres "postgres://postgres@${SPACE_NEXTEST_POSTGRES_ADDRESS}/postgres?sslmode=disable"
+    exit 0
+fi
+
 nextest_pid="${PPID}"
-postgres_image="$(space_test_dependency_postgres_image)"
 container_id=""
 
 cleanup_on_error() {
@@ -38,45 +57,12 @@ cleanup_on_error() {
 }
 trap cleanup_on_error EXIT
 
-# The server lives for one nextest run and is deleted with its data, so it
-# gives up crash durability: every DROP DATABASE forces a checkpoint, and with
-# fsync on each one flushed and fsynced the dirty pages of every concurrently
-# running test's database. The testcontainers module this replaces already
-# starts Postgres with fsync=off; synchronous_commit and full_page_writes only
-# matter for surviving a crash as well. For the same reason the data directory
-# is a tmpfs: each test's database is a copy of the template's files, created
-# and deleted a file at a time, and that is cheaper in memory than on the
-# runner's disk. CI runs 30 tests at once. Most hold two or three connections,
-# but a few hold eight or ten, so the default limit of 100 is raised.
-space_pull_docker_image "${postgres_image}"
-container_id="$(docker run --detach --rm \
-    --pull=never \
+space_pull_docker_image "$(space_test_dependency_postgres_image)"
+container_id="$(space_start_test_postgres --rm \
     --label "space.nextest.run-id=${NEXTEST_RUN_ID}" \
     --label "space.nextest.cleanup-id=${SPACE_NEXTEST_POSTGRES_CLEANUP_ID:-${NEXTEST_RUN_ID}}" \
-    --env POSTGRES_HOST_AUTH_METHOD=trust \
-    --env PGDATA=/var/lib/postgresql/data \
-    --tmpfs /var/lib/postgresql/data \
-    --publish 127.0.0.1::5432 \
-    "${postgres_image}" \
-    -c fsync=off \
-    -c synchronous_commit=off \
-    -c full_page_writes=off \
-    -c max_connections=200)"
-
-# The image's entrypoint first runs initdb under a temporary server that
-# listens only on the Unix socket, then stops it and starts the real one. A
-# socket probe can therefore succeed against the temporary server and the
-# next one fail while it shuts down. Probe over TCP, which only the real
-# server answers, and poll finely: the server is usually up in about a second.
-ready_deadline=$((SECONDS + 30))
-until docker exec "${container_id}" pg_isready --host 127.0.0.1 --username postgres >/dev/null 2>&1; do
-    if [ "${SECONDS}" -ge "${ready_deadline}" ]; then
-        echo "Postgres did not become ready within 30 seconds" >&2
-        docker logs "${container_id}" >&2 || true
-        exit 1
-    fi
-    sleep 0.1
-done
+    --publish 127.0.0.1::5432)"
+space_wait_for_test_postgres "${container_id}"
 
 postgres_port="$(docker inspect \
     --format '{{(index (index .NetworkSettings.Ports "5432/tcp") 0).HostPort}}' \
@@ -99,14 +85,7 @@ if [ -z "${TESTCONTAINERS_HOST_OVERRIDE:-}" ] && command -v timeout >/dev/null 2
     fi
 fi
 
-setup_binary="${CARGO_TARGET_DIR:-target}/debug/space-nextest-postgres-setup"
-if [ ! -x "${setup_binary}" ]; then
-    echo "Nextest did not build ${setup_binary}" >&2
-    exit 1
-fi
-"${setup_binary}" "${admin_database_url}"
-
-printf 'SPACE_TEST_POSTGRES_ADMIN_URL=%s\n' "${admin_database_url}" >>"${NEXTEST_ENV}"
+publish_postgres "${admin_database_url}"
 
 # Setup scripts finish before tests begin. A detached watcher provides the
 # missing teardown hook without holding nextest's stdout/stderr pipes open.
