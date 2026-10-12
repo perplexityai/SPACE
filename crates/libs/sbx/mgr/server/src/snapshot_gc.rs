@@ -65,7 +65,7 @@ use pplx_space_common_core::types::LocalArtifactId;
 use pplx_space_common_lru_reaper::{self as lru_reaper, EvictionInput};
 use rusqlite::Connection;
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use self::orphans::{OrphanKind, OrphanScan};
 use crate::auto_lifecycle::now_secs;
@@ -558,14 +558,26 @@ async fn gc_tick(
     }
 
     if report.bytes_freed < need_to_free {
-        warn!(
-            disk_usage_fraction = disk.fraction(),
-            target_fraction = cfg.target_fraction,
-            need_to_free,
-            bytes_freed = report.bytes_freed,
-            raw_rows_examined,
-            "snapshot reaper: sampled page did not meet reclaim target; later ticks continue the bounded sweep",
-        );
+        // A zero target is always-on reclaim: it asks to free every idle
+        // artifact, so no page meets it and the shortfall is routine.
+        if cfg.target_fraction > 0.0 {
+            warn!(
+                disk_usage_fraction = disk.fraction(),
+                target_fraction = cfg.target_fraction,
+                need_to_free,
+                bytes_freed = report.bytes_freed,
+                raw_rows_examined,
+                "snapshot reaper: sampled page did not meet reclaim target; later ticks continue the bounded sweep",
+            );
+        } else {
+            debug!(
+                disk_usage_fraction = disk.fraction(),
+                need_to_free,
+                bytes_freed = report.bytes_freed,
+                raw_rows_examined,
+                "snapshot reaper: sampled page did not meet reclaim target; later ticks continue the bounded sweep",
+            );
+        }
     }
     Ok(report)
 }

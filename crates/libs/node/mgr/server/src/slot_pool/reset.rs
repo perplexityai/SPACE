@@ -251,7 +251,7 @@ pub(super) async fn reset_slot(pool: std::sync::Arc<NetworkPool>, slot_id: u32) 
     } else {
         LeaseKind::Ephemeral
     };
-    tracing::warn!(
+    tracing::info!(
         slot_id,
         generation = reset_key.generation,
         sandbox_id = ?reset_key.sandbox_id,
@@ -405,7 +405,7 @@ pub(super) async fn reset_slot(pool: std::sync::Arc<NetworkPool>, slot_id: u32) 
                 );
                 return;
             }
-            tracing::warn!(
+            tracing::info!(
                 slot_id,
                 generation = reset_key.generation,
                 sandbox_id = ?reset_key.sandbox_id,
