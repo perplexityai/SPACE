@@ -6722,6 +6722,7 @@ dependencies = [
  "prost",
  "prost-types",
  "rcgen",
+ "rstest",
  "rusqlite",
  "rustix",
  "rustls",

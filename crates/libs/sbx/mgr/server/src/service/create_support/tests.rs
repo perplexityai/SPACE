@@ -751,3 +751,59 @@ async fn retained_instance_permission_recovery_and_repair_preserve_disk() {
         }
     }
 }
+
+#[rstest::rstest]
+#[tokio::test]
+async fn template_resolver_requires_scope_acknowledgement(
+    #[values(false, true)] acknowledged: bool,
+) {
+    use crate::template_resolver::fake::FakeTemplateResolver;
+    use pplx_space_template_mgr_client::proto::{GetTemplateResponse, TemplateRef};
+
+    let directory = tempfile::tempdir().unwrap();
+    let template_dir = directory.path().to_str().unwrap().to_owned();
+    let scope = TemplateLookupScope::Sandbox {
+        id: SandboxId::new(),
+        caller_node: None,
+    };
+    let response_dir = template_dir.clone();
+    let templates = FakeTemplateResolver::new(move || {
+        let mut response = tonic::Response::new(GetTemplateResponse {
+            template_dir: response_dir.clone(),
+            arch: "x86_64".into(),
+            network_policy_authority: pplx_space_net_common::proto::PolicyAuthority::Local as i32,
+            auto_lifecycle_authority: pplx_space_net_common::proto::PolicyAuthority::Local as i32,
+            ..Default::default()
+        });
+        if acknowledged {
+            scope.acknowledge(&mut response);
+        }
+        Ok(response)
+    });
+
+    let result = resolve_template_paths(
+        &templates,
+        TemplateRef {
+            name: "app-runtime".into(),
+            ..Default::default()
+        },
+        scope,
+    )
+    .await;
+
+    if acknowledged {
+        assert_eq!(result.unwrap().template_dir, template_dir);
+    } else {
+        let error = result.err().expect("unacknowledged scope must be rejected");
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(error.message().contains("scope was not acknowledged"));
+    }
+    let lookups = templates.lookups();
+    assert_eq!(lookups.len(), 1);
+    let mut request = tonic::Request::new(lookups[0].request.clone());
+    *request.metadata_mut() = lookups[0].metadata.clone();
+    assert_eq!(
+        TemplateLookupScope::from_request(&request).unwrap(),
+        Some(scope)
+    );
+}
