@@ -286,6 +286,7 @@ pub(crate) fn recover_interrupted_pause_state(
 /// Transfer lifecycle ownership from an armed activation to an explicit
 /// stop/delete teardown. The caller is responsible for completing that
 /// teardown; the activation guard becomes a superseded no-op.
+#[cfg(test)]
 fn update_state_superseding_activation(
     conn: &Connection,
     id: &str,
@@ -336,6 +337,7 @@ pub(crate) fn update_state_superseding_activation_in_transaction(
     Ok(())
 }
 
+#[cfg(test)]
 pub fn mark_stopping_superseding_activation(
     conn: &Connection,
     id: &str,
@@ -343,6 +345,7 @@ pub fn mark_stopping_superseding_activation(
     update_state_superseding_activation(conn, id, SandboxState::Stopping)
 }
 
+#[cfg(test)]
 pub fn mark_deleting_superseding_activation(
     conn: &Connection,
     id: &str,
@@ -1086,6 +1089,7 @@ pub fn mark_suspending_quarantined(
     )
 }
 
+#[cfg(test)]
 pub fn mark_starting_quarantined(
     conn: &Connection,
     id: &str,
@@ -1103,6 +1107,7 @@ pub fn mark_starting_quarantined(
     )
 }
 
+#[cfg(test)]
 pub fn mark_restoring_quarantined(
     conn: &Connection,
     id: &str,
@@ -1120,10 +1125,12 @@ pub fn mark_restoring_quarantined(
     )
 }
 
+#[cfg(test)]
 pub fn rollback_starting(conn: &Connection, id: &str, state: SandboxState) -> Result<bool> {
     rollback_activation_state(conn, id, SandboxState::Starting, state)
 }
 
+#[cfg(test)]
 pub fn rollback_restoring(conn: &Connection, id: &str, state: SandboxState) -> Result<bool> {
     rollback_activation_state(conn, id, SandboxState::Restoring, state)
 }

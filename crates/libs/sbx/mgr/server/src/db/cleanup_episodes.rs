@@ -477,14 +477,13 @@ pub fn request_cleanup_episode(
     }
     let previous_state = get_sandbox(&tx, sandbox_id)?.map(|row| row.state);
     let requested_at = now_epoch_i64()?;
-    let preserve_restore_operation = episode.quarantine_recovery.is_some();
     let changed = tx.execute(
         "UPDATE sandboxes
             SET state = 'cleanup_required',
                 failure_reason = ?1,
-                restore_origin = CASE WHEN ?6 THEN restore_origin ELSE NULL END,
-                restore_phase = CASE WHEN ?6 THEN restore_phase ELSE NULL END,
-                restore_storage_uri = CASE WHEN ?6 THEN restore_storage_uri ELSE NULL END,
+                restore_origin = NULL,
+                restore_phase = NULL,
+                restore_storage_uri = NULL,
                 state_changed_at = CASE
                     WHEN state != 'cleanup_required' THEN ?2
                     ELSE state_changed_at
@@ -500,7 +499,6 @@ pub fn request_cleanup_episode(
             sandbox_id,
             episode.completion.as_str(),
             episode.keep_filesystem,
-            preserve_restore_operation,
         ],
     )?;
     if changed != 1 {
@@ -1747,6 +1745,7 @@ pub fn mark_cleanup_failed(
     Ok(changed != 0)
 }
 
+#[cfg(test)]
 pub fn clear_cleanup_intent(conn: &Connection, id: &str) -> Result<()> {
     conn.execute(
         "UPDATE sandboxes

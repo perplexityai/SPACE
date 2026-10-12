@@ -512,6 +512,7 @@ pub(crate) fn emit_insert_quarantined_sandbox_event(
     );
 }
 
+#[cfg(test)]
 pub fn mark_quarantined(
     conn: &Connection,
     id: &str,
