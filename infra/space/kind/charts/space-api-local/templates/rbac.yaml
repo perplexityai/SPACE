@@ -42,6 +42,41 @@ roleRef:
   kind: Role
   name: {{ .Release.Name }}-api-pods
 ---
+# The node-api pods the substrate's reflector discovers nodes from (and
+# cluster-controller's node-service readiness lists) run in the release
+# namespace, not the sandbox namespace the Role above covers: read-only there
+# (K8sCaches in crates/libs/api/src/controllers/substrate/kubernetes/caches.rs;
+# node_service_readiness/backend.rs in crates/libs/cluster/controller/server).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ .Release.Name }}-api-node-service-pods
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: space-api
+    app.kubernetes.io/instance: {{ .Release.Name }}
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ .Release.Name }}-api-node-service-pods
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: space-api
+    app.kubernetes.io/instance: {{ .Release.Name }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ .Values.serviceAccount.name }}
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ .Release.Name }}-api-node-service-pods
+---
 # Cluster-scope: the substrate watches Nodes to map sandbox pod placement
 # back to a SPACE node row (and to address worker node-api pods by their
 # K8s node name).
@@ -76,3 +111,33 @@ roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
   name: {{ .Release.Name }}-api-nodes
+---
+# The ingress activation listener reviews its callers' projected tokens
+# (NodeApiAuthLayer with Kubernetes token auth).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ .Release.Name }}-api-token-review
+  labels:
+    app.kubernetes.io/name: space-api
+    app.kubernetes.io/instance: {{ .Release.Name }}
+rules:
+  - apiGroups: ["authentication.k8s.io"]
+    resources: ["tokenreviews"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ .Release.Name }}-api-token-review
+  labels:
+    app.kubernetes.io/name: space-api
+    app.kubernetes.io/instance: {{ .Release.Name }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ .Release.Name }}-api-token-review
+subjects:
+  - kind: ServiceAccount
+    name: {{ .Values.serviceAccount.name }}
+    namespace: {{ .Release.Namespace }}

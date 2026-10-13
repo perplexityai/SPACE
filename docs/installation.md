@@ -219,18 +219,18 @@ export SPACE_KIND_CLUSTER=space-local
 )
 ```
 
-Each timed command prints its elapsed duration as `real`. Bootstrap builds and publishes the seed template, deploys the cluster workloads, and starts loopback-only port forwards:
+Each timed command prints its elapsed duration as `real`. Bootstrap builds and publishes the seed template and deploys the cluster workloads. The API and data plane are reachable on loopback through the cluster's own port mappings, which spread connections across their replicas as a load balancer does; the UI and object storage get loopback-only port forwards:
 
-| Service | Local port |
-|---|---|
-| API | `8080` |
-| Data plane | `8090` |
-| UI | `3000` |
-| Object storage | `8333` |
+| Service | Local port | Reached through |
+|---|---|---|
+| API | `8080` | cluster port mapping |
+| Data plane | `8090` | cluster port mapping |
+| UI | `3000` | port forward |
+| Object storage | `8333` | port forward |
 
-If either API or data-plane port refuses connections, confirm bootstrap reached its final summary. The [local installation troubleshooting steps](troubleshooting.md#local-installation) show how to restart a missing port forward without redeploying the cluster.
+If either API or data-plane port refuses connections, confirm bootstrap reached its final summary; the [local installation troubleshooting steps](troubleshooting.md#local-installation) cover what to check.
 
-Tilt is optional for this API walkthrough, but some smoke tests start it automatically in the background. Starting Tilt can replace pods and briefly interrupt their local port forwards; see [Troubleshoot setup](#troubleshoot-setup) before interpreting an empty reply as an authentication problem.
+Tilt is optional for this API walkthrough, but some smoke tests start it automatically in the background. Starting Tilt can replace pods and briefly interrupt the UI and object-storage port forwards; see [Troubleshoot setup](#troubleshoot-setup) before interpreting an empty reply as an authentication problem.
 
 <a id="configuration"></a>
 
@@ -247,7 +247,7 @@ Keep installation settings consistent across steps. The guide explicitly sets th
 | `SPACE_KIND_DATA_ROOT` | Defaults to `$HOME/.kind-data` when not already set | Host-side backing storage for node containerd data. This guide does not override it. |
 | `SPACE_BOOTSTRAP_TIMEOUT` | Defaults to `600` seconds when not already set | Bootstrap's per-release wait, not a sandbox or command timeout. |
 
-The examples use the following client settings. Changing a client URL does not change the server listener or its port forward.
+The examples use the following client settings. Changing a client URL does not change the server listener or the port that reaches it.
 
 | Client setting | Local value | Purpose |
 |---|---|---|
@@ -260,7 +260,7 @@ If you change the cluster name, update the explicit Kubernetes contexts in these
 
 ## Verify the installation
 
-Running pods alone do not mean that `seed:latest` is available. Wait for the seed publication job and node-stack rollout before creating a sandbox.
+Running pods alone do not mean that `seed:latest` is available. Wait for the seed publication job and the rollout of every node-service DaemonSet before creating a sandbox. Each node service (node-manager, sandbox-manager, template-manager and the rest) runs as its own DaemonSet, as in production; `infra/space/kind/lib/node-services.sh` lists them.
 
 ```bash
 export SPACE_API_URL=http://127.0.0.1:8080
@@ -275,8 +275,10 @@ export SPACE_DATA_PLANE_URL=http://127.0.0.1:8090
     wait --for=condition=complete \
     job/space-seed-publish --timeout=300s
 
-  kubectl --context kind-space-local -n space \
-    rollout status ds/space-node-stack --timeout=300s
+  for ds in $(bash infra/space/kind/lib/node-services.sh daemonsets); do
+    kubectl --context kind-space-local -n space \
+      rollout status "ds/$ds" --timeout=300s
+  done
 
   curl --noproxy '*' --fail-with-body --silent --show-error \
     --max-time 15 \
@@ -381,9 +383,9 @@ mode.
 
 ### Go runtime metrics
 
-`SPACE_METRICS_SINK=otlp` also exports Go runtime metrics through the same
-provider and resource as the `space.shim.*` metrics, under OpenTelemetry's
-standard `go.*` names:
+`SPACE_METRICS_SINK=otlp` also exports Go runtime metrics, to the same endpoint
+and resource as the `space.shim.*` metrics, under OpenTelemetry's standard
+`go.*` names:
 
 | Instrument | Meaning |
 |---|---|
@@ -397,11 +399,23 @@ standard `go.*` names:
 | `go.config.gogc` | the configured heap growth percentage |
 | `go.schedule.duration` | time goroutines spent runnable before running |
 
-`go.memory.limit` appears only when `GOMEMLIMIT` is set. `go.schedule.duration`
-comes from the instrumentation's own producer, which bypasses the sink's
-temporality and aggregation selectors, so it arrives as a **cumulative
-explicit-bucket** histogram while the `space.shim.*` histograms are delta
-exponential.
+`go.memory.limit` appears only when `GOMEMLIMIT` is set. The runtime metrics
+are cumulative, and `go.schedule.duration`, which comes from the
+instrumentation's own producer, arrives as a **cumulative explicit-bucket**
+histogram, while the `space.shim.*` histograms are delta exponential.
+
+Every shim process reports under its own `service.instance.id`,
+`<node>:<pid>`, where the node is `SPACE_K8S_NODE_NAME`, then `KUBE_NODE_NAME`,
+then the host name. A Collector's delta-to-cumulative conversion needs one
+writer per stream, so concurrent shims must not share an identity; aggregate a
+node's shims in the query instead, for example with
+`sum without (service_instance_id)`. The runtime metrics leave on a separate
+provider with **cumulative** temporality, so the process's own state never
+passes through that conversion. Over OTLP, latency histograms drop the `_ms`
+their DogStatsD names carry, since the unit is declared
+(`space.shim.operation.latency`, unit `ms`), and the `service`, `env` and
+`version` tags are left to the resource. DogStatsD names and tags are
+unchanged.
 
 **This is narrower than Datadog's runtime metrics v2.** That route also reports
 GC cycle counts, GC pause distributions, CPU time split by class, and mutex
@@ -426,7 +440,7 @@ Two configurations are worth knowing about:
 
 Stop at the first failed command. [Local installation troubleshooting](troubleshooting.md#local-installation) covers missing tools, pod logs, authentication, and port forwards.
 
-An empty reply can mean a port forward is reconnecting, not that the credentials are wrong. Before retrying a mutation, inspect its outcome and keep the original request body and idempotency key.
+An empty reply can mean a replica was replaced mid-request or a port forward is reconnecting, not that the credentials are wrong. Before retrying a mutation, inspect its outcome and keep the original request body and idempotency key.
 
 ## Remove the local deployment
 
@@ -444,10 +458,12 @@ SPACE_KIND_CLUSTER=space-local \
 ## Separating volume-manager's credential identity
 
 The worker image provides a separate `space-volmgr` account (UID/GID 964) and
-credential-client group `space-volcredclients` (GID 965). The local launcher
-continues to run volume-manager as `space-sbxmgr` (UID 950), using the standard
-credential socket. Adding these accounts does not change the running identity
-or migrate retained files.
+credential-client group `space-volcredclients` (GID 965). The Kind
+volume-manager DaemonSet runs volume-manager as `space-volmgr` with
+credential-manager's volume socket, the production shape; node-manager's btrfs
+send-lease RPCs authorize only that identity, so deferred btrfs-send capture
+depends on it. Adding these accounts to an existing direct node does not change
+the running identity or migrate retained files.
 
 Credential-manager supports an optional `--volume-socket
 /space/run/volume-credentials/credmgr.sock` listener. It admits only the

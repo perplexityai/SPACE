@@ -137,7 +137,8 @@ impl SandboxManagerService {
                         "task_panicked"
                     } else {
                         "task_cancelled"
-                    }),
+                    })
+                    .logged_by_caller(),
             );
             tracing::error!(
                 %sandbox_id,

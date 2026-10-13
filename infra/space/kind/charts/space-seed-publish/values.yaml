@@ -13,7 +13,7 @@ internal:
   secretName: space-internal
 
 # Object store the seed artifacts are uploaded to. Same object store the
-# node-stack's volume-manager pulls from; the storage URI registered with the
+# workers' volume-manager pulls from; the storage URI registered with the
 # release carries the endpoint + path-style so the pull path needs no extra
 # config.
 s3:

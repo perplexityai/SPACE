@@ -3,5 +3,19 @@ storage:
   retain: false
 networkPolicy:
   enabled: false
+# By tag, not by the digest values.yaml pins: install-observability.sh loads
+# that digest onto every Kind node under this tag, and a loaded image answers
+# to its tag only, so a digest reference would send the kubelet to the
+# registry anyway. Bump the tag with the pin in values.yaml.
+images:
+  collector: otel/opentelemetry-collector-contrib:0.161.0
+  prometheus: prom/prometheus:v3.14.0
 collector:
   debug: true
+  # The shim and runtime-supervisor on a Kind node have no cluster DNS, so
+  # they address this Collector here; NODE_COLLECTORS in
+  # infra/space/kind/scripts/telemetry_config.py must match. Kind's IPv4
+  # Service range is 10.96.0.0/16; dynamic allocation avoids its first 256
+  # addresses, which are left for fixed ones like this (kubernetes is .1,
+  # kube-dns .10).
+  clusterIP: 10.96.0.20

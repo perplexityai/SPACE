@@ -1,0 +1,7 @@
+# Builders host build VMs, not user sandboxes: no network gateways to
+# credential, and no suspended sandboxes or snapshot artifacts for the
+# worker-sized eviction and reaper loops.
+networkCredentials:
+  enabled: false
+sandboxEviction: null
+snapshotReaper: null

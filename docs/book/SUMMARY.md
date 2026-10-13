@@ -9,6 +9,8 @@
   - [Install and configure locally](installation.md)
   - [Observability](observability.md)
   - [Troubleshooting](troubleshooting.md)
+  - [Warm pools](warm-pools.md)
+  - [Base snapshots](base-snapshots.md)
 
 - [Development](development-overview.md)
   - [Architecture](architecture.md)

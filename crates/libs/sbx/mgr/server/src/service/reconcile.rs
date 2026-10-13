@@ -216,7 +216,8 @@ impl SandboxManagerService {
                     SandboxEventDetails::default()
                         .trigger(SandboxEventTrigger::AutoLifecycle)
                         .operation("auto_lifecycle_delete")
-                        .reason("receipt_conflict"),
+                        .reason("receipt_conflict")
+                        .logged_by_caller(),
                 ),
                 Ok(false) => {}
                 Err(persist_error) => {

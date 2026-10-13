@@ -582,8 +582,15 @@ impl NodeManagerService {
     ) -> Result<Response<LoadSnapshotResponse>, Status> {
         let req = request.get_ref();
         validate_sandbox_id(&req.sandbox_id)?;
+        // Validate before either path stages the jail or re-owns the snapshot
+        // files, and so before the load, which cannot be undone short of
+        // killing the VM.
+        let rootfs_limiter = req
+            .rootfs_rate_limit
+            .as_ref()
+            .map(drive_rate_limiter)
+            .transpose()?;
         let jail_root = format!("{JAIL_DIR}/firecracker/{}/root", req.sandbox_id);
-        let api_socket = format!("{jail_root}/firecracker.sock");
         let _lifecycle_permit = self
             .lifecycle_limiter
             .acquire(crate::lifecycle_limiter::LifecycleMethod::LoadSnapshot)
@@ -624,9 +631,9 @@ impl NodeManagerService {
                 format!("/{ENC_SNAPSHOT_JAIL_SUBDIR}/{ENC_SNAPSHOT_MEMORY_NAME}");
             self.finish_load_snapshot(
                 &lease,
-                req,
+                &req.sandbox_id,
+                rootfs_limiter.as_ref(),
                 &jail_root,
-                &api_socket,
                 &fc_snapshot_path,
                 &fc_mem_file_path,
             )
@@ -673,9 +680,9 @@ impl NodeManagerService {
 
         self.finish_load_snapshot(
             &lease,
-            req,
+            &req.sandbox_id,
+            rootfs_limiter.as_ref(),
             &jail_root,
-            &api_socket,
             &fc_snapshot_path,
             &fc_mem_file_path,
         )
@@ -685,29 +692,22 @@ impl NodeManagerService {
 
     /// Shared tail of the load-snapshot paths (plaintext source_dir and BYOK
     /// encrypted volume): wait for the FC API socket, load the snapshot with the
-    /// given memory file, apply the sandbox's rootfs rate limit, then fix
-    /// v.sock permissions.
+    /// given memory file, apply the sandbox's validated rootfs rate limit, then
+    /// fix v.sock permissions.
     async fn finish_load_snapshot(
         &self,
         lease: &SlotInfo,
-        request: &LoadSnapshotRequest,
+        sandbox_id: &str,
+        rootfs_limiter: Option<&pplx_space_common_core::types::RateLimiter>,
         jail_root: &str,
-        api_socket: &str,
         fc_snapshot_path: &str,
         fc_mem_file_path: &str,
     ) -> Result<(), Status> {
-        let sandbox_id = request.sandbox_id.as_str();
-        // Validate before the load, which cannot be undone short of killing
-        // the VM.
-        let rootfs_limiter = request
-            .rootfs_rate_limit
-            .as_ref()
-            .map(drive_rate_limiter)
-            .transpose()?;
+        let api_socket = format!("{jail_root}/firecracker.sock");
         // Wait for the API socket to appear (FC needs time to create it after launch)
         let api_socket_wait_started = Instant::now();
         loop {
-            if std::path::Path::new(api_socket).exists() {
+            if std::path::Path::new(&api_socket).exists() {
                 break;
             }
             if api_socket_wait_started.elapsed() >= FIRECRACKER_API_SOCKET_TIMEOUT {
@@ -724,7 +724,7 @@ impl NodeManagerService {
             "firecracker api socket observed"
         );
 
-        let client = crate::fc_api::FcApiClient::new(api_socket.to_string());
+        let client = crate::fc_api::FcApiClient::new(api_socket);
         client
             .load_snapshot(fc_snapshot_path, fc_mem_file_path)
             .await
@@ -732,7 +732,7 @@ impl NodeManagerService {
         // The loaded drive limiter is the one of the VM the snapshot was taken
         // from. Replace it with the sandbox's own while the VM is still
         // paused; a sandbox must not run under another VM's limits.
-        if let Some(limiter) = &rootfs_limiter
+        if let Some(limiter) = rootfs_limiter
             && let Err(error) = client.update_drive_rate_limiter("rootfs", limiter).await
         {
             let status = Status::internal(format!(
@@ -913,6 +913,17 @@ impl NodeManagerService {
             .and_then(|path| path.components().next())
             .and_then(|part| part.as_os_str().to_str())
             .filter(|id| id.parse::<SandboxId>().is_ok());
+        // Deletion capacity is bounded where the work runs, and taken before
+        // any sandbox ownership so a queued deletion never holds a healthy
+        // sandbox's artifact lock while it waits. A caller that stops waiting
+        // releases nothing here: the slot is held by the blocking closure
+        // until the filesystem work is done.
+        let permit = self
+            .cache_artifact_delete_slots
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| Status::unavailable("cache artifact deletion lane closed"))?;
         let guard = match sandbox_id {
             Some(id) => Some(self.lock_sandbox_artifacts(id).await?),
             None => None,
@@ -924,6 +935,7 @@ impl NodeManagerService {
             .transpose()?;
 
         self.off_runtime("delete cache artifact", move || {
+            let _permit = permit;
             let _guard = guard;
             let _claim = claim;
             if !std::path::Path::new(&local_path).exists() {
@@ -1375,8 +1387,8 @@ pub(super) async fn set_firecracker_paused(
 
 /// Stops the runtime before the encrypted seal, re-issuing the idempotent stop
 /// while it fails server-side because the killed Firecracker is still exiting.
-/// Any server-side `Internal` is retried, so a persistent cgroup error surfaces
-/// only after the bounded attempts.
+/// New supervisors report drain timeouts as `Unavailable`. Keep `Internal`
+/// handling while older supervisors still report busy cgroups that way.
 async fn stop_runtime_for_encrypted_seal(
     service: &NodeManagerService,
     sandbox_id: &str,
@@ -1386,7 +1398,10 @@ async fn stop_runtime_for_encrypted_seal(
         match stop_sandbox_runtime_with_supervisor(service, sandbox_id, true, None).await {
             Ok(_) => return Ok(()),
             Err(error)
-                if error.code() == tonic::Code::Internal && attempt < ENC_CAPTURE_STOP_ATTEMPTS =>
+                if matches!(
+                    error.code(),
+                    tonic::Code::Internal | tonic::Code::Unavailable
+                ) && attempt < ENC_CAPTURE_STOP_ATTEMPTS =>
             {
                 tracing::warn!(
                     sandbox_id,

@@ -6,17 +6,11 @@
 use crate::emit::{counter, tag, timing_ms};
 
 /// Every Kubernetes caller pod authorization check, outside the TokenReview cache.
-/// `check`: pod_uid, pod_running, node_identity, peer_ip.
-/// `result`: allow, deny, would_deny. `mode`: observe, enforce.
-pub fn pod_authorization(check: &str, result: &str, mode: &str) {
+pub fn pod_authorization(check: &str, result: &str) {
     counter(
         "credmgr.pod_authorization",
         1,
-        &[
-            tag("check", check),
-            tag("result", result),
-            tag("mode", mode),
-        ],
+        &[tag("check", check), tag("result", result)],
     );
 }
 

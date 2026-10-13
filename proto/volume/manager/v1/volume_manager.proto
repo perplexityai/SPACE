@@ -44,6 +44,10 @@ service VolumeManager {
     // runs in the background with bounded concurrency.
     rpc SubmitPushFile(PushFileRequest) returns (SubmitTransferResponse);
 
+    // New producers negotiate before omitting the materialized send file.
+    rpc GetPushCapabilities(GetPushCapabilitiesRequest) returns (GetPushCapabilitiesResponse);
+    rpc SubmitPushBtrfsSend(PushBtrfsSendRequest) returns (SubmitTransferResponse);
+
     // Submit a download job. Returns immediately with a job_id.
     rpc SubmitPullFile(PullFileRequest) returns (SubmitTransferResponse);
 
@@ -455,4 +459,13 @@ message CancelTransferRequest {
 
 message CancelTransferResponse {
     repeated TransferJob jobs = 1;
+}
+
+message GetPushCapabilitiesRequest {}
+message GetPushCapabilitiesResponse { bool btrfs_send = 1; }
+message PushBtrfsSendRequest {
+    string sandbox_id = 1;
+    string artifact_dir = 2;
+    string source_id = 3;
+    string s3_uri = 4;
 }

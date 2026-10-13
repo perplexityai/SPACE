@@ -3,19 +3,16 @@
 Status: implemented contract
 
 `CredentialManager.ExchangeToken` is the storage-lease boundary for SPACE
-host-side consumers. Its scoped path implements the RFC 8693 request/response
-shape with one deliberately narrow profile: short-lived AWS credentials for
-one S3 object or one canonical SPACE artifact prefix. Rollout modes temporarily
-support the preceding role-wide contract without ever returning the authority's
+host-side consumers. It implements the RFC 8693 request/response shape with
+one deliberately narrow profile: short-lived AWS credentials for one S3 object
+or one canonical SPACE artifact prefix. It never returns the authority's
 ambient or statically configured AWS credentials.
 
 ## Request contract
 
-Every scoped request must provide all of the following. Missing, malformed,
+Every request must provide all of the following. Missing, malformed,
 unknown, or duplicated values are rejected; an authorization or validation
-failure never falls back to broader credentials. The rollout modes described
-below separately recognize pre-scoping wire shapes while mixed versions are
-deployed.
+failure never falls back to broader credentials.
 
 | Field | Required value |
 | --- | --- |
@@ -124,45 +121,26 @@ the requested snapshot; otherwise it, an unsupported vend provider, or an
 invalid role ARN is a failed configuration precondition rather than an
 `INTERNAL` error. Unknown subjects, cross-node writes, actor spoofing,
 cross-subject resources, and privilege escalation are authorization denials.
-Malformed or unsupported scoped wire values are client errors. A request
-selected for scoped authorization never falls back to the legacy path.
+Malformed or unsupported wire values are client errors.
 
-## Rollout modes
+## Authority configuration
 
-`SPACE_CREDMGR_SCOPED_EXCHANGE_TOKEN_MODE` is an authority-side mode with four
-accepted values. When unset it is `legacy` if `SPACE_CREDMGR_S3_VEND_ROLE_ARN`
-is set, so deploying the new authority binary does not require callers or node
-agents to roll first, and `disabled` if it is not, so a deployment without a
-storage-vend role issues no storage credentials. Unknown,
-mixed-case, or whitespace-padded values fail authority startup.
+`SPACE_CREDMGR_S3_VEND_ROLE_ARN` enables storage credential exchange. The
+authority parses it once at startup; a whitespace-corrupted or otherwise
+invalid ARN, or a set role without `DATABASE_URL`, prevents the authority
+becoming ready. When it is unset the authority wires no storage authorization
+store and every request fails with `FAILED_PRECONDITION`, so a deployment
+without a storage-vend role issues no storage credentials. Leaving the role
+unset is also the emergency stop for all storage credential issuance.
+The retired `SPACE_CREDMGR_SCOPED_EXCHANGE_TOKEN_MODE` no longer selects
+behavior. A retained `disabled` value alongside a vend role fails startup so an
+upgrade cannot reverse that emergency stop; other retained values only log a
+warning.
 
-| Mode | Request behavior | Operational use |
-| --- | --- | --- |
-| `legacy` | Every authenticated request assumes `SPACE_CREDMGR_S3_VEND_ROLE_ARN` without an inline policy or `DurationSeconds`; STS therefore preserves its one-hour default. | Initial deployment and rapid rollback of scoped issuance. |
-| `mixed` | A marked request uses the scoped path when the authority has both caller identity and its authorization store; otherwise it uses legacy. Unmarked requests use legacy. | Independent caller, node-agent, transport, and authority rollforwards or rollbacks. |
-| `enforce` | Every request uses the scoped path; old request shapes are rejected. | Final hardening after the rollback window closes. |
-| `disabled` | Every request fails with `FAILED_PRECONDITION`. | Emergency stop for all storage credential issuance. |
-
-`requested_expires_in` is the rollout marker because it was added with the
-scoped contract. Old callers omit it, and an old protobuf node agent drops the
-unknown field while decoding and re-encoding a modern request. In `mixed`, a
-static-token TCP authority resolves the transport as `Plaintext`, and a keyless
-authority has no storage authorization store; both deliberately route to
-legacy even for a marked request. This makes mixed mode compatible in every
-service-version direction without inventing an identity the transport cannot
-prove. A request selected for the scoped path is never retried through legacy
-after a validation, authorization, store, policy, or STS error.
-
-The legacy path is intentionally broader and emits a warning-level
-`credential_security_audit` event for every issuance. It still never returns
-the authority's ambient or static credentials: the dedicated, validated
-storage-vending role is mandatory in every mode except `disabled`, is parsed
-once at authority startup, and a missing, whitespace-corrupted, or invalid ARN
-prevents the authority becoming ready. Use `mixed` for as long as independent
-service populations may roll forward or back, and set `legacy` for an immediate
-issuance rollback. `enforce` requires `DATABASE_URL` at startup and requires a
-JWT or UDS caller identity at request time; use it only when static-token
-transports and service rollback compatibility are no longer requirements.
+Every request needs a JWT or UDS caller identity. A static-token TCP transport
+resolves as `Plaintext`, which is never authorized. Callers that omit
+`requested_expires_in`, including older node agents that drop the field when
+re-encoding a request, are rejected with `INVALID_ARGUMENT`.
 
 ## Deployment prerequisites
 
@@ -171,10 +149,6 @@ and recorded storage URI through the authority's existing `space_creds` pool.
 Role bootstrap grants that login read/write DML on every application table, so
 no additional database grant or migration is required.
 
-Deployment does not require ordering caller, node-agent, and authority
-populations. Preconfigure the validated storage-vend role, deploy binaries
-with the default `legacy` mode, and then select `mixed`. Any individual service
-can subsequently roll backward or forward; unmarked or
-capability-incompatible requests keep using the legacy contract. Returning the
-authority to `legacy` is an immediate rollback and retains the one-hour lease.
-Do not select `enforce` while this rollback property is required.
+Callers and node agents must send the scoped request contract before they
+reach an authority. Rolling a caller back to a build that predates the
+contract makes its storage exchanges fail.

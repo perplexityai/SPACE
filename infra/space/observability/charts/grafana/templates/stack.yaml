@@ -1,3 +1,31 @@
+{{- define "grafana.datasources" -}}
+apiVersion: 1
+prune: true
+datasources:
+  {{- range $name := list "prometheus" "loki" "tempo" }}
+  {{- $source := index $.Values.datasources $name }}
+  {{- if $source.enabled }}
+  - name: {{ title $name }}
+    uid: space-{{ $name }}
+    type: {{ $name }}
+    access: proxy
+    url: {{ $source.url | quote }}
+    isDefault: {{ eq $name "prometheus" }}
+    editable: false
+    {{- if and (eq $name "loki") $.Values.datasources.tempo.enabled }}
+    # SPACE JSON log lines carry the W3C trace_id of their enclosing span;
+    # link it to that trace.
+    jsonData:
+      derivedFields:
+        - name: trace_id
+          matcherType: regex
+          matcherRegex: '"trace_id":"([0-9a-f]{32})"'
+          datasourceUid: space-tempo
+          url: '$${__value.raw}'
+    {{- end }}
+  {{- end }}
+  {{- end }}
+{{- end }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -5,21 +33,7 @@ metadata:
 data:
 {{ (.Files.Glob "config/*").AsConfig | indent 2 }}
   datasources.yaml: |
-    apiVersion: 1
-    prune: true
-    datasources:
-      {{- range $name := list "prometheus" "loki" "tempo" }}
-      {{- $source := index $.Values.datasources $name }}
-      {{- if $source.enabled }}
-      - name: {{ title $name }}
-        uid: space-{{ $name }}
-        type: {{ $name }}
-        access: proxy
-        url: {{ $source.url | quote }}
-        isDefault: {{ eq $name "prometheus" }}
-        editable: false
-      {{- end }}
-      {{- end }}
+{{ include "grafana.datasources" . | indent 4 }}
 ---
 {{- if and .Values.persistence.enabled (not .Values.persistence.existingClaim) }}
 {{ include "common.pvc" (dict "name" "grafana-data" "storage" .Values.persistence) }}
@@ -49,7 +63,7 @@ spec:
       labels:
 {{ include "common.podLabels" (dict "app" "grafana" "profile" .Values.profile "owner" "grafana") | indent 8 }}
       annotations:
-        checksum/config: {{ printf "%s%s" ((.Files.Glob "config/*").AsConfig) (toJson .Values.datasources) | sha256sum }}
+        checksum/config: {{ printf "%s%s" ((.Files.Glob "config/*").AsConfig) (include "grafana.datasources" .) | sha256sum }}
     spec:
 {{- include "common.scheduling" .Values.scheduling | nindent 6 }}
       automountServiceAccountToken: false
@@ -62,6 +76,7 @@ spec:
       containers:
         - name: grafana
           image: {{ .Values.image | quote }}
+          imagePullPolicy: IfNotPresent
           securityContext:
 {{ include "common.containerSecurityContext" . | indent 12 }}
           env:

@@ -2,6 +2,7 @@ use pplx_space_common_core::types::{JobId, OrgId};
 
 pub mod blob;
 mod blob_storage;
+mod environment;
 pub mod object_store;
 pub mod oci;
 pub mod publish;
@@ -11,7 +12,6 @@ mod ssh;
 mod storage;
 mod vm;
 
-use std::collections::HashMap;
 use std::fmt;
 use std::fs;
 use std::future::Future;
@@ -30,6 +30,7 @@ use pplx_space_common_core::{
     },
 };
 use pplx_space_common_svc::page_cache;
+pub use pplx_space_metrics::template::TemplateBuildErrorKind;
 use pplx_space_net_common::NetworkPolicyV1;
 use pplx_space_net_common::proto::NetworkPolicyV1 as NetworkPolicyV1Proto;
 use pplx_space_node_mgr_client::proto::{
@@ -43,6 +44,8 @@ use pplx_space_template_mgr_client::proto::{
 use tempfile::TempDir;
 use tracing::Instrument as _;
 
+use environment::StepEnvironment;
+pub use environment::{BuildEnvironmentError, PreparedRecipe};
 pub use pplx_space_common_core::types::SystemPublicationGrantId;
 pub use publish::{
     PublishError, TemplateOrg, TemplatePublication, publish_build, register_build_template,
@@ -173,6 +176,8 @@ struct GuestRuntimeMetadata {
 #[derive(Debug, thiserror::Error)]
 pub enum BuildError {
     #[error(transparent)]
+    Environment(#[from] BuildEnvironmentError),
+    #[error(transparent)]
     Recipe(#[from] RecipeError),
     #[error(transparent)]
     Ssh(#[from] SshError),
@@ -190,6 +195,8 @@ pub enum BuildError {
     TemplateRef(#[from] pplx_space_template_mgr_client::TemplateRefFromReferenceError),
     #[error("{0}")]
     Message(String),
+    #[error("cannot reserve prepared rootfs capacity: {0}")]
+    RootfsReservation(#[source] Box<tonic::Status>),
     #[error("{operation} failed to start: {source}")]
     Io {
         operation: &'static str,
@@ -211,11 +218,45 @@ impl BuildError {
     pub(crate) fn message(message: impl Into<String>) -> Self {
         Self::Message(message.into())
     }
+
+    /// The bounded cause metrics report for this failure, decided by the
+    /// error's type alone: its message can carry recipe or image content.
+    pub fn error_kind(&self) -> TemplateBuildErrorKind {
+        match self {
+            Self::Environment(_) | Self::Recipe(_) | Self::TemplateRef(_) => {
+                TemplateBuildErrorKind::Recipe
+            }
+            Self::Ssh(error) => error.error_kind(),
+            Self::Step { source, .. } => source.recipe_step_error_kind(),
+            Self::OciImageAssembly(error) => error.error_kind(),
+            Self::RootfsReservation(status) if status.code() == tonic::Code::ResourceExhausted => {
+                TemplateBuildErrorKind::StorageAdmission
+            }
+            Self::RootfsReservation(_)
+            | Self::InvalidSpacedVersion { .. }
+            | Self::InvalidSandboxId(_)
+            | Self::Message(_)
+            | Self::Io { .. }
+            | Self::CommandFailed { .. } => TemplateBuildErrorKind::Other,
+        }
+    }
+}
+
+/// A build failure whose bounded cause is known from its type, for the
+/// `error_kind` of the failed step's metric.
+trait BuildFailureKind {
+    fn error_kind(&self) -> TemplateBuildErrorKind;
+}
+
+impl BuildFailureKind for BuildError {
+    fn error_kind(&self) -> TemplateBuildErrorKind {
+        BuildError::error_kind(self)
+    }
 }
 
 async fn build_phase<T, E, F>(template_id: &str, phase: BuildPhase, future: F) -> Result<T, E>
 where
-    E: fmt::Display,
+    E: fmt::Display + BuildFailureKind,
     F: Future<Output = Result<T, E>>,
 {
     let started_at = Instant::now();
@@ -242,6 +283,7 @@ where
             template_id,
             phase.as_str(),
             step_result,
+            result.as_ref().err().map(BuildFailureKind::error_kind),
             started_at,
         );
         let duration_ms = started_at.elapsed().as_millis() as u64;
@@ -541,15 +583,32 @@ impl TemplateBuilder {
         template_id: &str,
         job_id: &JobId,
     ) -> Result<BuildOutcome, BuildError> {
+        self.build_prepared(
+            recipe_label,
+            PreparedRecipe::new(recipe)?,
+            template_id,
+            job_id,
+        )
+        .await
+    }
+
+    pub async fn build_prepared(
+        &self,
+        recipe_label: &str,
+        prepared: PreparedRecipe,
+        template_id: &str,
+        job_id: &JobId,
+    ) -> Result<BuildOutcome, BuildError> {
+        let recipe = prepared.recipe();
         let (base, base_raw, oci_image) = match &recipe.origin {
             Origin::FromScratch { .. } => {
                 build_phase(template_id, BuildPhase::ValidateRecipe, async {
-                    validate_scratch_recipe(&recipe)?;
+                    validate_scratch_recipe(recipe)?;
                     Ok::<(), BuildError>(())
                 })
                 .await?;
                 return self
-                    .build_from_scratch(recipe_label, template_id, job_id, &recipe)
+                    .build_from_scratch(recipe_label, template_id, job_id, recipe)
                     .await;
             }
             Origin::FromTemplate { base, base_raw } => (base.clone(), base_raw.clone(), None),
@@ -727,11 +786,7 @@ impl TemplateBuilder {
                         rootfs_size_mb: build_rootfs_size_mib,
                     })
                     .await
-                    .map_err(|error| {
-                        BuildError::message(format!(
-                            "cannot reserve prepared rootfs capacity: {error}"
-                        ))
-                    })?
+                    .map_err(|error| BuildError::RootfsReservation(Box::new(error)))?
                     .into_inner()
                     .rootfs_path;
                 let assembly_result = oci::assemble_from_image(oci::OciImageAssemblyRequest {
@@ -823,7 +878,7 @@ impl TemplateBuilder {
         }
 
         let runtime_build = match build_phase(template_id, BuildPhase::ConfigureGuest, async {
-            let runtime = runtime::RuntimeBuild::prepare(&ssh, &recipe).await?;
+            let runtime = runtime::RuntimeBuild::prepare(&ssh, recipe).await?;
             configure_guest_apt_mirror(&ssh)?;
             Ok::<_, BuildError>(runtime)
         })
@@ -839,8 +894,9 @@ impl TemplateBuilder {
         };
 
         // Execute steps
-        let mut env_acc: HashMap<String, String> = HashMap::new();
-        for (i, named_step) in recipe.steps.iter().enumerate() {
+        for (i, (named_step, step_env)) in
+            recipe.steps.iter().zip(prepared.environments()).enumerate()
+        {
             let step_num = i + 1;
             let step_count = recipe.steps.len();
             println!("\n=== Step {step_num}/{}: {} ===", step_count, named_step);
@@ -860,7 +916,7 @@ impl TemplateBuilder {
             } else {
                 step_span.in_scope(|| {
                     tracing::info!("build recipe step started");
-                    execute_step(named_step, &ssh, &mut env_acc)
+                    execute_step(named_step, &ssh, &step_env)
                 })
             };
             let step_metric_result =
@@ -870,6 +926,10 @@ impl TemplateBuilder {
                 template_id,
                 BuildPhase::RecipeStep.as_str(),
                 step_metric_result,
+                step_result
+                    .as_ref()
+                    .err()
+                    .map(SshError::recipe_step_error_kind),
                 started_at,
             );
             let duration_ms = started_at.elapsed().as_millis() as u64;
@@ -921,32 +981,16 @@ impl TemplateBuilder {
             // see GUEST_FLUSH_CMD. Best-effort: if the flush call fails we still
             // attempt the exit, but log it since a failed flush is exactly the
             // condition that can drop the last write.
-            if let Err(e) = ssh.exec(GUEST_FLUSH_CMD, "root", &HashMap::new()) {
+            if let Err(e) = ssh.exec(GUEST_FLUSH_CMD, "root", &StepEnvironment::default()) {
                 tracing::warn!(error = %e, "guest pre-shutdown sync failed; last write may not be durable");
                 eprintln!("Guest pre-shutdown sync failed: {e}");
             }
-            if let Err(e) = ssh.exec(GUEST_EXIT_CMD, "root", &HashMap::new()) {
+            if let Err(e) = ssh.exec(GUEST_EXIT_CMD, "root", &StepEnvironment::default()) {
                 tracing::warn!(error = %e, "guest exit request failed; force cleanup may be needed");
                 eprintln!("Guest exit request failed, force cleaning: {e}");
             }
-            let pid = start_resp.pid;
-            let deadline = std::time::Instant::now() + SHUTDOWN_TIMEOUT;
-            loop {
-                if !vm::is_process_alive(pid) {
-                    break;
-                }
-                if std::time::Instant::now() >= deadline {
-                    tracing::warn!(
-                        shutdown_timeout_secs = SHUTDOWN_TIMEOUT.as_secs(),
-                        "build VM did not exit before shutdown timeout"
-                    );
-                    eprintln!(
-                        "Build VM did not exit within {}s, force cleaning...",
-                        SHUTDOWN_TIMEOUT.as_secs()
-                    );
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            if let Err(error) = vm::wait_for_exit(&sandbox_id, start_resp.pid, SHUTDOWN_TIMEOUT).await {
+                tracing::warn!(%error, shutdown_timeout_secs = SHUTDOWN_TIMEOUT.as_secs(), "build VM graceful exit unconfirmed; requesting runtime cleanup");
             }
             Ok::<(), BuildError>(())
         })
@@ -978,13 +1022,8 @@ impl TemplateBuilder {
             );
         }
 
-        if runtime_build.requires_durable_stop() && vm::is_process_alive(start_resp.pid) {
-            delete_sandbox_best_effort(&mut sbx, &sandbox_id, "runtime VM still alive").await;
-            return Err(BuildError::message(
-                "cannot seal runtime while build VM is alive",
-            ));
-        }
-
+        // For runtime-bearing images, confirmed Stop proves the runtime cgroups
+        // are gone; no container-local /proc check can strengthen that barrier.
         // Copy the modified rootfs out BEFORE delete removes it.
         let cache_rootfs =
             pplx_space_common_core::host::linux::paths::sandbox_rootfs_path(&sandbox_id);
@@ -1768,33 +1807,20 @@ fn configure_guest_apt_mirror(ssh: &SshSession) -> Result<(), SshError> {
            fi\n\
          fi"
     );
-    ssh.exec(&cmd, "root", &HashMap::new())
+    ssh.exec(&cmd, "root", &StepEnvironment::default())
 }
 
 /// Execute a single build step.
 fn execute_step(
     named_step: &recipe::NamedStep,
     ssh: &SshSession,
-    env_acc: &mut HashMap<String, String>,
+    step_env: &StepEnvironment<'_>,
 ) -> Result<(), SshError> {
-    let step_env = if named_step.env_refs.is_empty() {
-        env_acc.clone()
-    } else {
-        let mut step_env = env_acc.clone();
-        inject_env_refs(&mut step_env, &named_step.env_refs);
-        step_env
-    };
-
     match &named_step.step {
         Step::SetRuntime(_) | Step::ClearRuntime => Err(SshError::CopyPayload(
             "runtime steps require the finalization owner".into(),
         )),
-        Step::Env { vars } => {
-            for (k, v) in vars {
-                env_acc.insert(k.clone(), v.clone());
-            }
-            Ok(())
-        }
+        Step::Env { .. } => Ok(()),
         Step::PackageInstall {
             manager: PackageManager::Apt,
             packages,
@@ -1815,7 +1841,7 @@ fn execute_step(
                  || (echo 'apt retry 1...' && sleep 10 && {clean} && apt-get update && {install}) \
                  || (echo 'apt retry 2...' && sleep 30 && {clean} && apt-get update && {install})"
             );
-            ssh.exec(&cmd, "root", &step_env)
+            ssh.exec(&cmd, "root", step_env)
         }
         Step::PackageInstall {
             manager: PackageManager::Pip,
@@ -1824,7 +1850,7 @@ fn execute_step(
         } => {
             let resolved_extra: Vec<String> = extra_args
                 .iter()
-                .map(|a| resolve_env_var_in_string(a, &step_env))
+                .map(|a| resolve_env_var_in_string(a, step_env))
                 .collect();
 
             let extra = if resolved_extra.is_empty() {
@@ -1840,7 +1866,7 @@ fn execute_step(
             let cmd = format!(
                 "python3 -m pip install --quiet --break-system-packages --root-user-action=ignore{extra} {pkgs}"
             );
-            ssh.exec(&cmd, "root", &step_env)
+            ssh.exec(&cmd, "root", step_env)
         }
         Step::PackageInstall {
             manager: PackageManager::Npm,
@@ -1856,7 +1882,7 @@ fn execute_step(
                  || (echo 'npm retry 1...' && sleep 15 && {clean} && {install}) \
                  || (echo 'npm retry 2...' && sleep 30 && {clean} && {install})"
             );
-            ssh.exec(&cmd, DEFAULT_GUEST_USER, &step_env)
+            ssh.exec(&cmd, DEFAULT_GUEST_USER, step_env)
         }
         Step::PackageInstall {
             manager: PackageManager::NpmGlobal,
@@ -1871,11 +1897,11 @@ fn execute_step(
                  || (echo 'npm retry 1...' && sleep 15 && {clean} && {install}) \
                  || (echo 'npm retry 2...' && sleep 30 && {clean} && {install})"
             );
-            ssh.exec(&cmd, "root", &step_env)
+            ssh.exec(&cmd, "root", step_env)
         }
         Step::Run { command, user } => {
             let user = user.as_deref().unwrap_or("root");
-            ssh.exec(command, user, &step_env)
+            ssh.exec(command, user, step_env)
         }
         Step::Copy {
             payload,
@@ -1888,10 +1914,10 @@ fn execute_step(
         Step::PlaywrightInstall { browsers } => {
             let browsers_str = browsers.join(" ");
             let cmd_deps = format!("npx playwright install-deps {browsers_str}");
-            ssh.exec(&cmd_deps, "root", &step_env)?;
+            ssh.exec(&cmd_deps, "root", step_env)?;
             let cmd_install =
                 format!("HOME=/home/{DEFAULT_GUEST_USER} npx playwright install {browsers_str}");
-            ssh.exec(&cmd_install, DEFAULT_GUEST_USER, &step_env)
+            ssh.exec(&cmd_install, DEFAULT_GUEST_USER, step_env)
         }
     }
 }
@@ -1927,17 +1953,17 @@ fn copy_staged_payload_to_guest(
             dir = shell_quote(&remote_stage_dir)
         ),
         "root",
-        &HashMap::new(),
+        &StepEnvironment::default(),
     )?;
     let remote_source = guest_path_join(&remote_stage_dir, source_name);
     let finalize = guest_copy_finalize_command(&remote_source, dest);
     let result = ssh
         .copy(source, &remote_stage_dir, "root")
-        .and_then(|()| ssh.exec(&finalize, "root", &HashMap::new()));
+        .and_then(|()| ssh.exec(&finalize, "root", &StepEnvironment::default()));
     let cleanup = ssh.exec(
         &format!("rm -rf {}", shell_quote(&remote_stage_dir)),
         "root",
-        &HashMap::new(),
+        &StepEnvironment::default(),
     );
     result.and(cleanup)
 }
@@ -2283,17 +2309,8 @@ fn validate_tar_symlink_target(link_path: &Path, target: &Path) -> Result<(), Ss
     Ok(())
 }
 
-/// Read env var names from host environment and inject into the map.
-fn inject_env_refs(env: &mut HashMap<String, String>, refs: &[String]) {
-    for name in refs {
-        if let Ok(val) = std::env::var(name) {
-            env.insert(name.clone(), val);
-        }
-    }
-}
-
 /// Resolve `$VAR` references using a provided env map.
-fn resolve_env_var_in_string(s: &str, env: &HashMap<String, String>) -> String {
+fn resolve_env_var_in_string(s: &str, env: &StepEnvironment<'_>) -> String {
     let mut resolved = String::with_capacity(s.len());
     let mut rest = s;
     while let Some(pos) = rest.find('$') {
@@ -2313,8 +2330,11 @@ fn resolve_env_var_in_string(s: &str, env: &HashMap<String, String>) -> String {
             rest = after_dollar;
             continue;
         }
-        let val = env.get(var_name).cloned().unwrap_or_default();
-        resolved.push_str(&val);
+        let val = env
+            .get(var_name)
+            .map(|value| value.expose())
+            .unwrap_or_default();
+        resolved.push_str(val);
         rest = after_var;
     }
     resolved.push_str(rest);

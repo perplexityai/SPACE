@@ -12,7 +12,9 @@ use crate::attempts::{
     AttemptObserver, AttemptReporter, AttemptTarget, FailedAttempt, RecoveredOperation,
 };
 use crate::timeouts::{ClassTimeouts, S3Timeouts};
-use crate::{ObjectCredentials, ObjectTarget, S3ObjectStore, s3_base_config};
+use crate::{
+    DEFAULT_POOL_IDLE_TIMEOUT, ObjectCredentials, ObjectTarget, S3ObjectStore, s3_base_config,
+};
 
 /// Records attempt reports instead of logging them.
 #[derive(Debug, Default)]
@@ -86,8 +88,18 @@ pub(crate) fn store(
     stall_grace: Duration,
     recorder: &Arc<Recorder>,
 ) -> S3ObjectStore {
+    store_with_pool_idle(timeouts, stall_grace, DEFAULT_POOL_IDLE_TIMEOUT, recorder)
+}
+
+/// [`store`] with the connection pool's idle timeout under test too.
+pub(crate) fn store_with_pool_idle(
+    timeouts: S3Timeouts,
+    stall_grace: Duration,
+    pool_idle_timeout: Duration,
+    recorder: &Arc<Recorder>,
+) -> S3ObjectStore {
     let attempts = AttemptObserver::new(recorder.clone());
-    let conf = s3_base_config(timeouts, attempts.clone())
+    let conf = s3_base_config(timeouts, pool_idle_timeout, attempts.clone())
         .retry_config(RetryConfig::standard().with_initial_backoff(Duration::from_millis(10)))
         .stalled_stream_protection(
             StalledStreamProtectionConfig::enabled()
@@ -95,7 +107,7 @@ pub(crate) fn store(
                 .build(),
         )
         .build();
-    S3ObjectStore::with_base_config(conf, timeouts, attempts)
+    S3ObjectStore::with_base_config(conf, timeouts, pool_idle_timeout, attempts)
 }
 
 pub(crate) fn credentials() -> ObjectCredentials {

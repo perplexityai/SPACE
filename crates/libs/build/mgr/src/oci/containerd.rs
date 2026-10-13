@@ -289,6 +289,41 @@ pub enum OciBuildError {
     },
 }
 
+impl OciBuildError {
+    /// The bounded cause metrics report for a failed containerd step.
+    pub fn error_kind(&self) -> crate::TemplateBuildErrorKind {
+        use crate::TemplateBuildErrorKind as Kind;
+        match self {
+            Self::Registry { .. }
+            | Self::UnsupportedArch(_)
+            | Self::Command {
+                operation: OciOperation::PullImage,
+                ..
+            } => Kind::ImagePull,
+            Self::Storage(_) => Kind::StorageAdmission,
+            Self::Command {
+                operation:
+                    OciOperation::TagImage
+                    | OciOperation::CreateSnapshotView
+                    | OciOperation::MountSnapshot
+                    | OciOperation::UnmountSnapshot
+                    | OciOperation::RemoveSnapshotView
+                    | OciOperation::RemoveImage,
+                ..
+            }
+            | Self::File { .. }
+            | Self::InvalidMountPath { .. }
+            | Self::MissingChainId
+            | Self::InvalidChainId { .. }
+            | Self::InvalidSnapshotMount { .. } => Kind::Unpack,
+            Self::Command {
+                operation: OciOperation::CheckContainerd,
+                ..
+            } => Kind::Other,
+        }
+    }
+}
+
 impl From<registry::RegistryError> for OciBuildError {
     fn from(source: registry::RegistryError) -> Self {
         Self::Registry {

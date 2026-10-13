@@ -1,0 +1,17 @@
+apiVersion: v2
+name: space-credmgr-authority-local
+description: Kind Deployment for the SPACE credential-manager authority (control plane)
+type: application
+version: 0.1.0
+appVersion: "0.8.0"
+dependencies:
+  - name: space-kind-telemetry
+    version: 0.1.0
+    repository: "file://../space-kind-telemetry"
+    import-values:
+      - child: telemetry
+        parent: telemetry
+  # Only for its identity helpers, which read identity/node-identities.sh.
+  - name: space-node-service
+    version: 0.1.0
+    repository: "file://../space-node-service"

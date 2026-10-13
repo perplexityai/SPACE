@@ -63,12 +63,257 @@ fn fixture_meta(rootfs_diff_format: Option<&str>) -> SnapshotMeta {
         },
         sandbox: None,
         rootfs_diff_format: rootfs_diff_format.map(str::to_string),
+        rootfs_send_source_id: None,
         encrypted: false,
         local_artifact_id: None,
         artifact_kind: None,
         artifact_origin: None,
         artifact_snapshot_name: None,
     }
+}
+
+/// A deferred artifact as sandbox-manager sees it: VM state and a retained
+/// bundle it cannot traverse. Access is restored on drop for cleanup.
+struct DeferredArtifact {
+    _temp: tempfile::TempDir,
+    dir: std::path::PathBuf,
+    source_id: uuid::Uuid,
+}
+
+impl DeferredArtifact {
+    fn new() -> Self {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("snapshot");
+        let bundle = dir.join(crate::retained_source::BUNDLE_DIRECTORY);
+        std::fs::create_dir_all(bundle.join("source")).unwrap();
+        std::fs::write(bundle.join("source/rootfs.ext4"), b"jail-owned rootfs").unwrap();
+        std::fs::set_permissions(&bundle, std::fs::Permissions::from_mode(0o000)).unwrap();
+        std::fs::write(dir.join("memory"), b"memory").unwrap();
+        std::fs::write(dir.join("vmstate"), b"state").unwrap();
+        Self {
+            _temp: temp,
+            dir,
+            source_id: uuid::Uuid::now_v7(),
+        }
+    }
+
+    fn meta(&self) -> SnapshotMeta {
+        let mut meta = fixture_meta(Some(ROOTFS_DIFF_FORMAT_BTRFS_SEND_V1));
+        meta.artifact_kind = Some(ArtifactKind::Full);
+        meta.rootfs_send_source_id = Some(self.source_id);
+        meta
+    }
+
+    /// Node-manager's answer for this artifact's retained source.
+    fn retained(&self, rootfs_bytes: u64, stream: bool) -> RetainedUpload {
+        RetainedUpload {
+            source: crate::retained_source::RetainedSource {
+                sandbox_id: self.meta().sandbox_id,
+                artifact_dir: self.dir.clone(),
+                source_id: self.source_id,
+            },
+            rootfs_bytes,
+            stream,
+        }
+    }
+
+    fn prepare(&self, retained: Option<RetainedUpload>) -> Result<SnapshotUploadJobs, String> {
+        prepare_suspend_snapshot(
+            &self.meta(),
+            &uuid::Uuid::now_v7().to_string(),
+            &self.dir,
+            &fixture_config(),
+            ArtifactKind::Full,
+            SuspendSnapshotFormat::BtrfsSend,
+            retained,
+        )
+    }
+}
+
+impl DeferredArtifact {
+    /// A materialized stream beside the retained source.
+    fn with_stream(self, stream: &[u8]) -> Self {
+        std::fs::write(self.dir.join(ROOTFS_BTRFS_SEND_FILENAME), stream).unwrap();
+        self
+    }
+
+    fn staged_metadata(prepared: &SnapshotUploadJobs) -> serde_json::Value {
+        let path = prepared
+            .metadata_staging_dir
+            .as_ref()
+            .expect("retained artifacts stage their uploaded metadata separately")
+            .join(SNAPSHOT_METADATA_FILENAME);
+        serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+    }
+
+    fn remove_artifact_dir(&self) {
+        self.restore_access();
+        std::fs::remove_dir_all(&self.dir).unwrap();
+    }
+
+    fn restore_access(&self) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(
+            self.dir.join(crate::retained_source::BUNDLE_DIRECTORY),
+            std::fs::Permissions::from_mode(0o750),
+        );
+    }
+}
+
+impl Drop for DeferredArtifact {
+    fn drop(&mut self) {
+        self.restore_access();
+    }
+}
+
+#[test]
+fn deferred_send_prepares_from_the_inspected_size_and_keeps_metadata_outside_the_artifact() {
+    let artifact = DeferredArtifact::new();
+    let prepared = artifact
+        .prepare(Some(artifact.retained(1000, true)))
+        .unwrap();
+    assert!(prepared.deferred_metadata);
+    assert_eq!(
+        prepared.meta.rootfs_send_source_id,
+        Some(artifact.source_id)
+    );
+    assert_eq!(
+        prepared.meta.size_bytes,
+        1000 + b"memory".len() as u64 + b"state".len() as u64
+    );
+    assert!(prepared.job_ids.is_empty());
+    let metadata = prepared.metadata_staging_dir.as_ref().unwrap();
+    assert!(!metadata.starts_with(&artifact.dir));
+    assert!(metadata.join(SNAPSHOT_METADATA_FILENAME).is_file());
+    assert!(!artifact.dir.join(ROOTFS_BTRFS_SEND_FILENAME).exists());
+    // Teardown can remove the artifact after VM staging. The metadata
+    // worker must have a surviving, separately owned directory.
+    artifact.remove_artifact_dir();
+    assert!(metadata.is_dir());
+    cleanup_metadata_staging_dir(&prepared);
+    assert!(!metadata.exists());
+}
+
+#[test]
+fn evidence_for_another_source_does_not_prepare_this_artifact() {
+    let artifact = DeferredArtifact::new();
+    let other = DeferredArtifact::new();
+    let error = artifact
+        .prepare(Some(other.retained(1000, true)))
+        .unwrap_err();
+    assert!(error.contains("was inspected as"), "{error}");
+}
+
+#[test]
+fn retained_source_without_streaming_prepares_for_materialization() {
+    let artifact = DeferredArtifact::new();
+    let prepared = artifact
+        .prepare(Some(artifact.retained(1000, false)))
+        .unwrap();
+    // The worker regenerates rootfs.btrfs-send from this exact source and
+    // uploads the file. The payload keeps the identity it needs for that;
+    // the staged copy, rewritten after materialization, never carries it.
+    assert!(!prepared.deferred_metadata);
+    assert_eq!(
+        prepared.meta.rootfs_send_source_id,
+        Some(artifact.source_id)
+    );
+    let staged = DeferredArtifact::staged_metadata(&prepared);
+    assert!(staged.get("rootfs_send_source_id").is_none(), "{staged}");
+    cleanup_metadata_staging_dir(&prepared);
+}
+
+#[test]
+fn retained_artifact_with_a_stream_uploads_the_file_and_strips_its_identity_remotely() {
+    let artifact = DeferredArtifact::new().with_stream(&[0u8; 333]);
+    let prepared = artifact
+        .prepare(Some(artifact.retained(1000, true)))
+        .unwrap();
+    // A stream already on disk has a known length: no deferral.
+    assert!(!prepared.deferred_metadata);
+    assert_eq!(
+        prepared.meta.rootfs_send_source_id,
+        Some(artifact.source_id)
+    );
+    let vm = (b"memory".len() + b"state".len()) as u64;
+    let staged = DeferredArtifact::staged_metadata(&prepared);
+    assert_eq!(staged["size_bytes"], 333 + vm);
+    assert!(staged.get("rootfs_send_source_id").is_none(), "{staged}");
+    // The artifact's own sidecar counts the stream while it exists and keeps
+    // the identity; reclaim switches it to the image when the stream goes.
+    let local = write_snapshot_metadata(
+        &artifact.meta(),
+        &artifact.dir,
+        &vm_artifacts_for_format(SuspendSnapshotFormat::BtrfsSend),
+        None,
+    )
+    .unwrap();
+    assert_eq!(local.size_bytes, 333 + vm);
+    let written: SnapshotMeta = serde_json::from_slice(
+        &std::fs::read(artifact.dir.join(SNAPSHOT_METADATA_FILENAME)).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(written.rootfs_send_source_id, Some(artifact.source_id));
+    cleanup_metadata_staging_dir(&prepared);
+}
+
+#[test]
+fn retained_source_must_be_inspected_before_preparation() {
+    let artifact = DeferredArtifact::new();
+    let error = artifact.prepare(None).unwrap_err();
+    assert!(error.contains(&artifact.source_id.to_string()), "{error}");
+    assert!(error.contains("not inspected"), "{error}");
+}
+
+#[test]
+fn btrfs_send_without_stream_or_identity_is_missing_its_stream() {
+    let artifact = DeferredArtifact::new();
+    let mut meta = artifact.meta();
+    meta.rootfs_send_source_id = None;
+    let error = prepare_suspend_snapshot(
+        &meta,
+        &uuid::Uuid::now_v7().to_string(),
+        &artifact.dir,
+        &fixture_config(),
+        ArtifactKind::Full,
+        SuspendSnapshotFormat::BtrfsSend,
+        Some(artifact.retained(1, true)),
+    )
+    .unwrap_err();
+    assert!(error.contains(ROOTFS_BTRFS_SEND_FILENAME), "{error}");
+}
+
+#[test]
+fn metadata_sizing_names_the_path_it_could_not_stat() {
+    let artifact = DeferredArtifact::new();
+    std::fs::remove_file(artifact.dir.join("memory")).unwrap();
+    let error = write_snapshot_metadata(
+        &artifact.meta(),
+        &artifact.dir,
+        &vm_artifacts_for_format(SuspendSnapshotFormat::BtrfsSend),
+        Some(1),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        error.contains(&artifact.dir.join("memory").display().to_string()),
+        "{error}"
+    );
+    // A retained source without node-manager's size cannot be sized here.
+    std::fs::write(artifact.dir.join("memory"), b"memory").unwrap();
+    let error = write_snapshot_metadata(
+        &artifact.meta(),
+        &artifact.dir,
+        &vm_artifacts_for_format(SuspendSnapshotFormat::BtrfsSend),
+        None,
+    )
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        SnapshotMetadataWriteError::UnsizedRetainedSource { source_id, .. }
+            if source_id == artifact.source_id
+    ));
 }
 
 #[test]
@@ -136,7 +381,18 @@ fn write_snapshot_metadata_sizes_from_local_artifacts_at_submit_time() {
     std::fs::write(dir.join("rootfs.ext4"), vec![0u8; 30]).unwrap();
 
     let meta = fixture_meta(None);
-    let out = write_snapshot_metadata(&meta, dir, &vm).unwrap();
+    let metadata_path = dir.join(SNAPSHOT_METADATA_FILENAME);
+    std::fs::write(&metadata_path, b"previous metadata").unwrap();
+    // Restored metadata can be readable but not writable by this service.
+    // A reader that already opened it must retain the previous complete bytes.
+    use std::io::Read;
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&metadata_path, std::fs::Permissions::from_mode(0o444)).unwrap();
+    let mut previous = std::fs::File::open(&metadata_path).unwrap();
+    let out = write_snapshot_metadata(&meta, dir, &vm, None).unwrap();
+    let mut previous_bytes = Vec::new();
+    previous.read_to_end(&mut previous_bytes).unwrap();
+    assert_eq!(previous_bytes, b"previous metadata");
     assert_eq!(out.size_bytes, 60, "size is the sum of local VM artifacts");
 
     let written = std::fs::read_to_string(dir.join(SNAPSHOT_METADATA_FILENAME)).unwrap();
@@ -154,7 +410,7 @@ fn write_snapshot_metadata_errors_when_an_artifact_is_missing() {
     let vm = vm_artifacts_for_format(SuspendSnapshotFormat::Full);
     std::fs::write(dir.join("vmstate"), vec![0u8; 10]).unwrap();
     // memory + rootfs.ext4 intentionally absent.
-    let err = write_snapshot_metadata(&fixture_meta(None), dir, &vm).unwrap_err();
+    let err = write_snapshot_metadata(&fixture_meta(None), dir, &vm, None).unwrap_err();
     let err = err.to_string();
     assert!(
         err.contains("memory"),
@@ -183,6 +439,7 @@ fn prepare_persists_exact_artifact_intent_without_remote_transfer_handles() {
         &fixture_config(),
         ArtifactKind::Full,
         SuspendSnapshotFormat::Full,
+        None,
     )
     .unwrap();
 
@@ -276,6 +533,7 @@ fn new_payload_round_trips_metadata_job_flag() {
             "/space/cache/sbx/.artifact-metadata-snap-1",
         )),
         includes_metadata_job: true,
+        deferred_metadata: false,
     };
     let round: SnapshotUploadJobs =
         serde_json::from_str(&serde_json::to_string(&jobs).unwrap()).unwrap();
@@ -301,6 +559,7 @@ fn cleanup_metadata_staging_dir_removes_only_owned_staging_dir() {
         job_ids: Vec::new(),
         metadata_staging_dir: Some(staging_dir.clone()),
         includes_metadata_job: true,
+        deferred_metadata: false,
     };
 
     cleanup_metadata_staging_dir(&jobs);

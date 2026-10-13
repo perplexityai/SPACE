@@ -133,8 +133,9 @@ Rust metric helpers also use a per-measurement `service` tag for a logical
 RPC or socket service: the destination of gRPC clients, the served interface
 of gRPC rate limiters, and the socket service performing UDS peer-process
 authentication checks. The OTLP sink exports that dimension as `service.role`;
-the constant `service` point attribute and resource `service.name` identify
-the emitting process. This keeps different peers or interfaces in separate
+resource `service.name` alone identifies the emitting process, because OTLP
+points carry no constant `service`, `env` or `version` copy of the resource's
+identity. This keeps different peers or interfaces in separate
 series even when they share one producer. OTLP queries grouping or filtering
 that logical dimension must use `service.role`. Native DogStatsD retains its
 existing wire tags, including both `service` values; its queries do not change.
@@ -170,7 +171,7 @@ cannot make several processes claim the same identity:
 
 | Attribute | Source |
 |---|---|
-| `service.instance.id` | host name and process id |
+| `service.instance.id` | host name and process id; for the Go shim, the node name, else the host name, and process id |
 | `host.name` | the configured node name, else `HOSTNAME` outside Kubernetes |
 | `k8s.node.name` | `SPACE_K8S_NODE_NAME`, then `KUBE_NODE_NAME` |
 | `k8s.pod.name` | `SPACE_K8S_POD_NAME` |
@@ -240,6 +241,15 @@ positive whole number of milliseconds fails startup instead of exporting on a
 cadence nobody chose. Traces are batched by the OpenTelemetry SDK's own
 `OTEL_BSP_*` settings, and `OTEL_TRACES_SAMPLER` applies as usual.
 
+`OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE` selects the Rust services'
+metric temporality: `cumulative`, `delta` or `lowmemory`, in any case, with the
+per-instrument meaning the OpenTelemetry specification gives them. Unset or
+blank means **delta**, not the specification's cumulative default; see
+[Collector requirements](#collector-requirements). Any other value fails
+startup the same way a bad cadence does. sandbox-manager forwards the setting
+to the host sidecars it launches, and the guest filesystem worker inherits its
+launcher's. The Go shim does not read it: its own metrics are always delta.
+
 ## Trace filtering
 
 `SPACE_TRACE_FILTER` selects which spans are recorded, in `tracing`
@@ -300,12 +310,25 @@ changes the verdict a run reports — the suites decide that, and losing the
 run's metrics is not a suite failure. It exports **once**, at the end, rather
 than on an interval, so there is no cadence to configure.
 
+### Restricted tag configurations
+
+A Datadog organization can limit which tags it keeps or makes queryable for a
+metric, for example with an explicit per-metric tag configuration. A tag that
+configuration does not list is still sent but cannot be grouped or filtered
+on. That applies to tags added after the configuration was written, including
+the `reason` on `template.gc.tick` and `template.gc.tick_duration_ms` errors
+and the `error_kind` on `template.build.latency_ms`,
+`template.build.step.latency_ms` and `snapshot.restore.failed`. Add them to the
+metric's tag configuration before relying on them; series without them are
+unaffected.
+
 ## Go runtime metrics
 
 With `SPACE_METRICS_SINK=otlp`, the shim also exports Go runtime metrics under
-OpenTelemetry's standard `go.*` names, through the same provider and resource
-as its own metrics. [Select shim telemetry](installation.md#shim-telemetry-selectors)
-lists the instruments.
+OpenTelemetry's standard `go.*` names, to the same endpoint and resource as its
+own metrics but from a separate provider with cumulative temporality.
+[Select shim telemetry](installation.md#shim-telemetry-selectors) lists the
+instruments.
 
 That set is narrower than Datadog's runtime metrics v2, which also reports GC
 cycle counts, GC pause distributions, CPU time by class, and mutex wait time.
@@ -331,7 +354,10 @@ native tracer — mixing the selectors has consequences worth knowing:
 Logs are not an OTLP signal here. Every producer writes to stdout or stderr
 and the collection path is whatever reads a container's output. Rust services
 emit structured records carrying the resolved service name and honor
-`SPACE_LOG_FORMAT`. The Go shim writes plain `[space-shim]` lines to stderr
+`SPACE_LOG_FORMAT`. A JSON record written inside any span with a valid trace
+context, sampled or not, also carries the W3C `trace_id` and `span_id` of the
+nearest such span as lowercase hex, under every trace exporter; the
+Datadog-reserved `dd.trace_id` and `dd.span_id` are not written. The Go shim writes plain `[space-shim]` lines to stderr
 and the smoke script writes plain lines too; neither attaches a service,
 environment, or version, so a log pipeline that needs those must add them from
 pod metadata.
@@ -362,6 +388,47 @@ Before shared initialization, caller-owned logging uses Legacy without caching
 that fallback, preserving the historical Datadog-default behavior while allowing
 later OTLP initialization. Legacy is a migration bridge for production Datadog
 continuity; remove it after native Datadog consumers migrate.
+
+## Sandbox identity
+
+Telemetry names a sandbox by one canonical value, its bare lowercase UUID
+(`019d84bd-280d-7331-99c6-b63377f3a3a2`), in the `sandbox_id` span attribute
+and JSON log field. A span for work on one sandbox carries it, in every
+service that does such work: space-api's request spans for a sandbox route
+and the cluster-controller's create operation, node-api's sandbox RPCs,
+sandbox-manager and node-manager operations, volume-manager jobs and RPCs for
+a sandbox subject, and every RPC a sandbox's net-gateway serves. A Rust
+service's JSON log line written inside such a span carries the same field,
+unless the event sets its own.
+
+Two other spellings remain where they are part of a contract, and convert by
+prefix:
+
+| Where | Spelling | To the canonical value |
+| --- | --- | --- |
+| Native API ids, public operations' `target_id` | `sbx_<uuid>` | drop `sbx_` |
+| Volume-manager `subject_id`, `job.subject_id` | `sandbox:<uuid>` | drop `sandbox:` |
+
+A fork operation's `target_id` is already the source sandbox's bare UUID. The
+reverse conversion prefixes `sbx_`; in a shell, `${id#sbx_}` gives the
+canonical value.
+
+## Request identity
+
+Every HTTP server span, `http.server`, in space-api and the data plane carries
+the request's `request_id` when it has one. A caller-supplied id is the first
+non-blank of `x-request-id` and `x-correlation-id`, accepted only as at most
+128 bytes of `[A-Za-z0-9._:-]`; anything else is dropped. The native API
+returns that id in `x-request-id`, or, when the caller sent none or one that
+was dropped, a fresh `req_<uuid>` it records instead. gRPC server spans apply
+the same rule to their `request_id`. A JSON log line written inside the
+request inherits it, as it does `sandbox_id`.
+
+Each HTTP response also carries a W3C `traceparent` header naming its
+`http.server` span, so a client can report the trace ID of any request it
+made. The header holds only the version, trace ID, span ID and sampled flag;
+it is absent when traces are off, and a proxied sandbox service's own
+`traceparent` is passed through unchanged.
 
 ## Cargo features
 
@@ -459,24 +526,42 @@ settings, their precedence, and the endpoint rule every producer applies.
 ### Collector requirements
 
 SPACE's own metrics — the `space.*` families — export **delta** temporality
-and **base-2 exponential histograms** (maximum 160 buckets, maximum scale 8),
-with a 2000-series attribute cardinality limit per instrument. Datadog's OTLP
-ingest accepts both as they arrive.
+by default and **base-2 exponential histograms** (maximum 160 buckets, maximum
+scale 8), with a 2000-series attribute cardinality limit per instrument.
+Datadog's OTLP ingest accepts both as they arrive.
 
-That profile is the sinks', not the pipeline's. `go.schedule.duration` comes
-from the runtime instrumentation's own producer, which bypasses the sink's
-temporality and aggregation selectors, so it arrives as a **cumulative
-explicit-bucket** histogram. A Collector pipeline therefore sees both shapes on
-one connection and has to accept both.
+That profile is the sinks', not the pipeline's. The shim's Go runtime metrics
+are **cumulative**, and `go.schedule.duration`, from the runtime
+instrumentation's own producer, is an explicit-bucket histogram. A Collector
+pipeline therefore sees both shapes on one connection and has to accept both.
 
-A Prometheus-style backend does not. Convert in the Collector, not in SPACE:
+A Prometheus-style backend does not. Convert in the Collector:
 
 - delta to cumulative, with the `deltatocumulative` processor;
 - exponential histograms to whatever the backend stores — Prometheus native
   histograms keep the resolution, and converting to explicit buckets loses it.
 
-Exporting cumulative sums from SPACE instead is not an option here: the sinks
-are shared with the DogStatsD path, which is delta by construction.
+The conversion is lossy for sparse series. `deltatocumulative` keeps each
+stream's running total in memory and forgets a stream that has been idle for
+its `max_stale`. The next increment then starts a new total from that
+increment alone, so a counter that ticks less often than `max_stale` reads
+1 → 1 across two events, or drops 2 → 1 like a counter reset, and rate
+queries undercount rare events.
+
+A pipeline that stores cumulative data can avoid that state by having the
+Rust services export cumulative, with
+`OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE=cumulative`. Each process
+then reports every stream's running total on every export, so a counter keeps
+its count however long it idles and the Collector passes it through
+unconverted. The cost is that a stream, gauges included, keeps being exported
+with its last value until the process restarts, instead of falling silent
+when nothing records it. The Kind `otel` profile selects cumulative for the
+Rust services.
+
+Delta stays the default because Datadog's OTLP intake accepts only delta
+sums, and drops the first point of each cumulative series it converts, which
+loses exactly the rare events cumulative is meant to keep. The Go shim's own
+metrics stay delta in every mode, Kind's included.
 
 ### Rejected configurations
 
@@ -511,6 +596,7 @@ instead.
 | nonblank OTLP headers | `OTLP exporter headers are not allowed with the plaintext internal metrics profile`; `OTLP traces do not allow OTEL_EXPORTER_OTLP_TRACES_HEADERS or OTEL_EXPORTER_OTLP_HEADERS on a plaintext endpoint`; in the shim, `OTEL_EXPORTER_OTLP_METRICS_HEADERS is not allowed with the plaintext OTLP metric profile` |
 | no metrics endpoint | `missing OTLP endpoint; set OTEL_EXPORTER_OTLP_METRICS_ENDPOINT or OTEL_EXPORTER_OTLP_ENDPOINT` |
 | a bad cadence | `OTEL_METRIC_EXPORT_INTERVAL must be a positive whole number of milliseconds` |
+| an unknown temporality | `OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE must be cumulative, delta, or lowmemory, got "monotonic"` |
 | an unknown selector | `invalid SPACE_METRICS_SINK="dogstatsd"; expected one of: auto, datadog, journald, otlp, off`; `invalid SPACE_TRACE_EXPORTER="dd"; expected auto, datadog, otlp, or off` |
 | a selector the build cannot serve | `SPACE_METRICS_SINK="datadog" requires the datadog feature`; `trace exporter otlp requires the otel feature` |
 | `journald` in the shim | `SPACE_METRICS_SINK=journald is not supported by the Go shim; use datadog, otlp, or off` |

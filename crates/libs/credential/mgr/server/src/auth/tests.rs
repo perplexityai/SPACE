@@ -213,6 +213,24 @@ fn uds_peer_process_checks_reject_when_enforcing() {
     assert_eq!(err.code(), tonic::Code::Unauthenticated, "{err:?}");
 }
 
+/// Root classifies ahead of any account match, so a root-owned test process
+/// can never reach a per-account check through the resolver. The
+/// allowlist-reaching half runs in common-svc against the snapshot's own uid,
+/// which root cannot divert. Classification reads only the presented uid, so
+/// this needs no root.
+#[test]
+fn uds_peer_root_classifies_before_the_binary_check() {
+    let resolver = resolver_with_armed_binary_check();
+    let mut request = Request::new(());
+    request
+        .extensions_mut()
+        .insert(PeerIdentity::new(0, 0, Some(std::process::id() as i32)));
+    let caller = resolver.resolve(&request).expect("root peer resolves");
+    resolver
+        .authorize_caller(&caller, "IssueDek", &[UdsPeerPrincipal::Root], &[])
+        .expect("root classifies before account matching; no account checks run");
+}
+
 #[test]
 fn uds_peer_binary_check_is_reached_when_uids_match() {
     // The uid-drift guard fires before the binary comparison whenever the
@@ -224,20 +242,10 @@ fn uds_peer_binary_check_is_reached_when_uids_match() {
     let pid = Some(std::process::id() as i32);
 
     if euid == 0 {
-        // Root classifies ahead of any account match, so a root-owned test
-        // process can never reach a per-account check through the resolver.
-        // Pin that short-circuit instead of silently skipping; the
-        // allowlist-reaching half runs in common-svc against the snapshot's
-        // own uid, which root cannot divert.
-        let resolver = resolver_with_armed_binary_check();
-        let mut request = Request::new(());
-        request
-            .extensions_mut()
-            .insert(PeerIdentity::new(0, 0, pid));
-        let caller = resolver.resolve(&request).expect("root peer resolves");
-        resolver
-            .authorize_caller(&caller, "IssueDek", &[UdsPeerPrincipal::Root], &[])
-            .expect("root classifies before account matching; no account checks run");
+        eprintln!(
+            "SKIPPED: root classifies before any account match; \
+             uds_peer_root_classifies_before_the_binary_check covers root"
+        );
         return;
     }
 

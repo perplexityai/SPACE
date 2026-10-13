@@ -1947,6 +1947,37 @@ func TestLegacyKillThenDeleteStillCallsManagerDelete(t *testing.T) {
 	}
 }
 
+func TestLegacyDeleteAfterLiveStateHandlesManagerError(t *testing.T) {
+	for _, code := range []codes.Code{codes.NotFound, codes.Unavailable} {
+		t.Run(code.String(), func(t *testing.T) {
+			client := &fakeSandboxManagerClient{
+				results: []sandboxStateResult{
+					{resp: &pb.StateResponse{Sandboxes: []*pb.SandboxInfo{{Lifecycle: pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_STARTED.Enum()}}}},
+				},
+				deleteError: status.Error(code, "delete raced with teardown"),
+			}
+			service := &spaceTaskService{
+				tasks: map[string]*task{"task": {id: "task", sandboxID: "sbx", status: tasktypes.Status_RUNNING}},
+				sandboxManagerClientFactory: func() (pb.SandboxManagerClient, io.Closer, error) {
+					return client, fakeConn{}, nil
+				},
+			}
+			_, err := service.Delete(context.Background(), &taskAPI.DeleteRequest{ID: "task"})
+			_, retained := service.tasks["task"]
+			if code == codes.NotFound {
+				if err != nil || retained {
+					t.Fatalf("already-deleted task was not released: retained=%v err=%v", retained, err)
+				}
+			} else if err == nil || !retained {
+				t.Fatalf("unavailable manager must retain task: retained=%v err=%v", retained, err)
+			}
+			if client.calls != 1 || client.deleteCalls != 1 {
+				t.Fatalf("manager calls = state:%d delete:%d, want one each", client.calls, client.deleteCalls)
+			}
+		})
+	}
+}
+
 func TestLegacyKillAndDeleteSerializeManagerTeardown(t *testing.T) {
 	podTask := &task{
 		id:        "task",
@@ -2158,6 +2189,7 @@ type fakeSandboxManagerClient struct {
 	onTeardownCall   func()
 	stopCalls        int
 	deleteCalls      int
+	deleteError      error
 }
 
 func TestStoppedRestartCheckpoint(t *testing.T) {
@@ -2371,7 +2403,7 @@ func (f *fakeSandboxManagerClient) Stop(ctx context.Context, in *pb.StopRequest,
 
 func (f *fakeSandboxManagerClient) Delete(ctx context.Context, in *pb.DeleteRequest, opts ...grpc.CallOption) (*pb.DeleteResponse, error) {
 	f.deleteCalls++
-	return &pb.DeleteResponse{}, nil
+	return &pb.DeleteResponse{}, f.deleteError
 }
 
 // The Rust renderer verifies this same pod contract. CRI forwards annotations

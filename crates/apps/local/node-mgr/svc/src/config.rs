@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use pplx_space_common_svc::core::host::linux::paths::NODE_MANAGER_SOCKET;
 
 /// Fallback seed rootfs image used when `PrepareSandbox` does not carry a usable
-/// `template_dir`. Baked into the node-stack image at build time.
+/// `template_dir`. Baked into the runtime's image at build time.
 pub const DEFAULT_SEED_ROOTFS: &str = "/space/templates/seed/rootfs.ext4";
 
 /// Effective configuration resolved from CLI args + environment.

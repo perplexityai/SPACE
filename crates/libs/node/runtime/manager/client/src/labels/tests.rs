@@ -72,3 +72,40 @@ fn listing_json_names_enum_values() {
     assert_eq!(json["roots"][0]["presence"], "present");
     assert_eq!(json["complete"], true);
 }
+
+#[test]
+fn operation_json_names_its_request_and_enum_values() {
+    let operation = proto::Operation {
+        operation_id: "01a0f799-a8d6-70df-bdc9-be151f12112a".to_string(),
+        identity: Some(proto::ArtifactIdentity {
+            artifact: Some(proto::artifact_identity::Artifact::Runtime(
+                proto::RuntimeArtifactIdentity {
+                    kind: execution::RuntimeKind::Firecracker as i32,
+                    version: "1.16.2".into(),
+                    digest: "sha256:4a".into(),
+                },
+            )),
+        }),
+        action: proto::ArtifactAction::Install as i32,
+        state: proto::OperationState::Succeeded as i32,
+        outcome: proto::OperationOutcome::Installed as i32,
+        error: None,
+        on_disk: Some(proto::OnDisk {
+            path: "/space/vendor/artifacts/firecracker/v1.16.2".to_string(),
+            digest: "sha256:4a".to_string(),
+        }),
+        created_at_unix_ms: 0,
+        updated_at_unix_ms: 0,
+    };
+    let json = serde_json::to_value(&operation).unwrap();
+
+    let request = &json["identity"]["artifact"]["runtime"];
+    assert_eq!(request["kind"], "firecracker");
+    assert_eq!(request["version"], "1.16.2");
+    assert_eq!(json["state"], "succeeded");
+    assert_eq!(json["outcome"], "installed");
+    assert_eq!(
+        json["on_disk"]["path"],
+        "/space/vendor/artifacts/firecracker/v1.16.2"
+    );
+}

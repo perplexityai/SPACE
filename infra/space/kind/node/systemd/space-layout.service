@@ -1,0 +1,14 @@
+# Baked into the Kind node image (infra/space/kind/node/Dockerfile) and enabled
+# there. See infra/space/kind/node/space-kind-node.sh.
+[Unit]
+Description=SPACE /space/run directory skeleton
+Before=kubelet.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+EnvironmentFile=-/etc/space/kind-node.env
+ExecStart=/usr/local/lib/space/kind-node/space-kind-node.sh layout
+
+[Install]
+WantedBy=multi-user.target

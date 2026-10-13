@@ -1,0 +1,122 @@
+{{- $ctx := dict "ctx" . "component" "node-api" -}}
+{{- $role := include "space-node-service.role" . -}}
+{{- if and (eq $role "builder") (not .Values.buildManagerEndpoint) -}}
+{{- fail "buildManagerEndpoint is required for the builder role" -}}
+{{- end -}}
+{{- include "space-node-service.serviceAccount" $ctx }}
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "space-node-service.name" $ctx }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "space-node-service.labels" $ctx | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "space-node-service.selectorLabels" $ctx | nindent 6 }}
+  # Delete first. node-api has no service mutex and its listener sets
+  # SO_REUSEPORT (crates/libs/node/api/server/src/run.rs), but the port it
+  # declares on the host network is a host port, and the scheduler will not
+  # place a second pod with the same host port on the node. The port must stay
+  # declared: the API's pod reflector reads the container port named `grpc`
+  # (crates/libs/api/src/controllers/substrate/kubernetes/caches.rs).
+  {{- include "space-node-service.updateStrategy" (dict "strategy" "deleteFirst") | nindent 2 }}
+  template:
+    metadata:
+      annotations:
+        {{- include "space-node-service.podAnnotations" $ctx | nindent 8 }}
+      labels:
+        {{- include "space-node-service.labels" $ctx | nindent 8 }}
+    spec:
+      {{- include "space-node-service.nodeSelector" $ctx | nindent 6 }}
+      serviceAccountName: {{ include "space-node-service.name" $ctx }}
+      # The ClusterApi token is projected below; no Kubernetes API access.
+      automountServiceAccountToken: false
+      # Host network: the API dials each node's node-api at host_ip:9800.
+      # ClusterFirstWithHostNet keeps in-cluster DNS for ClusterApi and, on
+      # builders, build-manager's node-local Service.
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds | int }}
+      securityContext:
+        {{- if eq $role "builder" }}
+        {{- include "space-node-service.runAs" (dict "ctx" . "user" "SPACE_NODEAPI" "groups" "SPACE_NODEAPI_BUILDER_GROUPS") | nindent 8 }}
+        {{- else }}
+        {{- include "space-node-service.runAs" (dict "ctx" . "user" "SPACE_NODEAPI" "groups" "SPACE_NODEAPI_WORKER_GROUPS") | nindent 8 }}
+        {{- end }}
+        # space-nodeapi's own group owns the mounted TLS key, which is
+        # readable by that group only (volume.rpcIdentity).
+        fsGroup: {{ include "space-node-service.identityNumber" (dict "ctx" . "name" "SPACE_NODEAPI_GID") }}
+      containers:
+        - name: node-api
+          {{- include "space-node-service.image" . | nindent 10 }}
+          command:
+            - /opt/space/bin/space-node-api-svc
+            - --role={{ $role }}
+            - --listen=0.0.0.0:9800
+            - --health-socket={{ include "space-node-service.healthSocket" $ctx }}
+          {{- include "space-node-service.restrictedContainer" . | nindent 10 }}
+          ports:
+            - name: grpc
+              containerPort: 9800
+          env:
+            {{- include "space-node-service.env.identity" . | nindent 12 }}
+            {{- include "space-node-service.env.clusterApi" . | nindent 12 }}
+            # The NodeApi listener's TLS identity, the leaf every node-api on
+            # the cluster shares (space-node-api, docs/internal-rpc-tls.md).
+            {{- include "space-node-service.env.rpcIdentity" . | nindent 12 }}
+            # Static bearer tokens node-api's listeners require
+            # (crates/libs/node/api/server/src/run.rs); the worker role also
+            # protects WorkerApiInternal with the control token.
+            {{- include "space-node-service.env.internalToken" . | nindent 12 }}
+            {{- if eq $role "worker" }}
+            - name: SPACE_INTERNAL_CONTROL_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.node.internalSecretName }}
+                  key: SPACE_INTERNAL_CONTROL_TOKEN
+            {{- else }}
+            - name: SPACE_BUILD_MANAGER_ENDPOINT
+              value: {{ .Values.buildManagerEndpoint | quote }}
+            {{- end }}
+          {{- if eq $role "builder" }}
+          # Leave the builder Service's endpoints before draining (values.yaml).
+          lifecycle:
+            preStop:
+              sleep:
+                seconds: {{ .Values.builderPreStopSleepSeconds | int }}
+          {{- end }}
+          {{- include "space-node-service.probes" $ctx | nindent 10 }}
+          volumeMounts:
+            {{- include "space-node-service.mount.run" . | nindent 12 }}
+            {{- include "space-node-service.mount.clusterApiToken" . | nindent 12 }}
+            {{- include "space-node-service.mount.rpcCa" . | nindent 12 }}
+            {{- include "space-node-service.mount.rpcIdentity" . | nindent 12 }}
+            {{- include "space-node-service.mount.private" . | nindent 12 }}
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+      volumes:
+        {{- include "space-node-service.volume.run" . | nindent 8 }}
+        {{- include "space-node-service.volume.clusterApiToken" . | nindent 8 }}
+        {{- include "space-node-service.volume.rpcCa" . | nindent 8 }}
+        {{- include "space-node-service.volume.rpcIdentity" (dict "secret" "space-node-api-tls") | nindent 8 }}
+        {{- include "space-node-service.volume.private" . | nindent 8 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Values.serviceName }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "space-node-service.labels" $ctx | nindent 4 }}
+spec:
+  selector:
+    {{- include "space-node-service.selectorLabels" $ctx | nindent 4 }}
+  ports:
+    - name: grpc
+      port: 9800
+      targetPort: 9800

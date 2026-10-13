@@ -2,30 +2,24 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use pplx_space_common_core::types::{JobId, RuntimeKind};
+use crate::installs::{
+    CancelOperationError, Installer, KernelSource, LookupOperationError, ReleaseLine,
+    ReleaseLineParseError, RuntimeLine, SubmitOperationError, describe,
+};
+use crate::protection::{self, AuditIdentity, PathRole};
+use crate::run::SERVICE_NAME;
+use pplx_space_common_core::types::{
+    ComponentIdentity, Digest, JobId, RuntimeIdentity, RuntimeKind, RuntimeVersion,
+};
 use pplx_space_common_svc::{LocalRole, UdsPeerAuthorizer, UdsPeerPrincipal};
 use pplx_space_execution_common::proto::{self as execution, ArtifactComponentKind};
 use pplx_space_node_runtime_core::runtime_inventory::diagnostic::{
     self, ArtifactKinds, ArtifactScan, DigestCache, ScanLimits, ScanRoots, SystemScanClock,
 };
 use pplx_space_node_runtime_manager_client::proto::runtime_manager_server::RuntimeManager;
-use pplx_space_node_runtime_manager_client::proto::{
-    AvailableKernel, CancelOperationRequest, CancelOperationResponse, ExecutionArtifactKind,
-    GetOperationRequest, GetOperationResponse, GetStatusRequest, GetStatusResponse,
-    InstallKernelRequest, InstallKernelResponse, KernelPresence, ListAvailableKernelsRequest,
-    ListAvailableKernelsResponse, ListExecutionArtifactsRequest, ListExecutionArtifactsResponse,
-    UninstallKernelRequest, UninstallKernelResponse,
-};
+use pplx_space_node_runtime_manager_client::proto::{self, *};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tonic::{Request, Response, Status};
-
-use crate::kernels::{
-    CancelOperationError, InstallKernelError, Installer, KernelInstall, KernelSource,
-    KernelVersion, KernelVersionParseError, LookupOperationError, ReleaseLine,
-    ReleaseLineParseError, RuntimeLine, SourceKernel, UninstallKernelError, describe,
-};
-use crate::protection::{self, AuditIdentity, PathRole};
-use crate::run::SERVICE_NAME;
 
 /// Listing, status, and operation lookups are read-only: root and any local
 /// role may call them.
@@ -49,13 +43,18 @@ pub struct RuntimeManagerService {
     /// moves into the blocking walk, so a caller that disconnects cannot start
     /// another walk while its first one is still spending the work budget.
     scan_slot: Arc<Semaphore>,
+    /// One source listing at a time: each walks a remote bucket, so readers
+    /// cannot multiply that work.
+    listing_slot: Arc<Semaphore>,
     digests: Arc<Mutex<DigestCache>>,
     state_dir: PathBuf,
     audit_identity: AuditIdentity,
     peer_authorizer: UdsPeerAuthorizer,
     /// Where available kernels are listed from and installs download from.
     kernel_source: Option<Arc<dyn KernelSource>>,
-    /// Present only when the service was started with a kernel install root.
+    pins: Option<Arc<dyn crate::installs::PinSource>>,
+    releases: Option<crate::installs::ReleaseContext>,
+    /// Present unless the service runs list-only.
     installer: Option<Installer>,
 }
 
@@ -71,6 +70,7 @@ impl RuntimeManagerService {
             limits,
             admission_timeout,
             scan_slot: Arc::new(Semaphore::new(1)),
+            listing_slot: Arc::new(Semaphore::new(1)),
             digests: Arc::new(Mutex::new(DigestCache::default())),
             state_dir,
             audit_identity: AuditIdentity::of_this_process(),
@@ -80,12 +80,25 @@ impl RuntimeManagerService {
             ),
             kernel_source: None,
             installer: None,
+            pins: None,
+            releases: None,
         }
     }
 
     /// List available kernels from `source`.
     pub(crate) fn with_kernel_source(mut self, source: Arc<dyn KernelSource>) -> Self {
         self.kernel_source = Some(source);
+        self
+    }
+
+    /// Read-only catalog and source access is independent of mutation readiness.
+    pub(crate) fn with_catalog(
+        mut self,
+        pins: Arc<dyn crate::installs::PinSource>,
+        releases: Option<crate::installs::ReleaseContext>,
+    ) -> Self {
+        self.pins = Some(pins);
+        self.releases = releases;
         self
     }
 
@@ -98,7 +111,7 @@ impl RuntimeManagerService {
     fn installer(&self) -> Result<&Installer, Status> {
         self.installer.as_ref().ok_or_else(|| {
             Status::failed_precondition(
-                "kernel installs are disabled: the runtime manager was started without a kernel install root",
+                "artifact management is disabled; inspect status and service logs",
             )
         })
     }
@@ -107,68 +120,6 @@ impl RuntimeManagerService {
         self.kernel_source.as_ref().ok_or_else(|| {
             Status::failed_precondition("the runtime manager has no kernel source configured")
         })
-    }
-
-    /// The lines of `runtime` to list kernels for: the named one, or every
-    /// line the node has a release directory for. `runtime` must be the
-    /// one `source` publishes kernels for.
-    async fn runtime_lines(
-        &self,
-        source: &dyn KernelSource,
-        runtime: RuntimeKind,
-        requested: Option<&str>,
-    ) -> Result<Vec<RuntimeLine>, Status> {
-        if runtime != source.runtime() {
-            return Err(Status::failed_precondition(format!(
-                "the kernel source publishes kernels for {}, not {runtime}",
-                source.runtime()
-            )));
-        }
-        if let Some(requested) = requested {
-            return parse_line(runtime, requested).map(|line| vec![line]);
-        }
-        let Some(releases) = self.release_root(runtime) else {
-            return Ok(Vec::new());
-        };
-        tokio::task::spawn_blocking(move || release_lines(runtime, &releases))
-            .await
-            .map_err(|error| Status::internal(describe(&error)))?
-    }
-
-    /// Where `runtime`'s release directories are, if it has a configured
-    /// release root.
-    fn release_root(&self, runtime: RuntimeKind) -> Option<PathBuf> {
-        self.roots
-            .runtime_releases
-            .iter()
-            .find(|root| root.kind == runtime)
-            .map(|root| root.path.clone())
-    }
-
-    /// Whether `kernel` is on the node. Blocking: reads the install records.
-    fn presence(&self, kernel: &SourceKernel, installs: &[KernelInstall]) -> KernelPresence {
-        match installs
-            .iter()
-            .find(|install| install.version == kernel.version)
-        {
-            Some(install)
-                if install.location == kernel.location && kernel.md5 == Some(install.md5) =>
-            {
-                KernelPresence::Installed
-            }
-            Some(_) => KernelPresence::VersionPresent,
-            None => {
-                let root = self
-                    .installer
-                    .as_ref()
-                    .map_or(self.roots.vendor_kernels.as_path(), Installer::kernels_root);
-                if std::fs::symlink_metadata(root.join(kernel.version.as_str())).is_ok() {
-                    KernelPresence::VersionPresent
-                } else {
-                    KernelPresence::NotInstalled
-                }
-            }
-        }
     }
 }
 
@@ -195,40 +146,72 @@ fn parse_line(runtime: RuntimeKind, value: &str) -> Result<RuntimeLine, Status> 
         .map_err(|error: ReleaseLineParseError| Status::invalid_argument(error.to_string()))
 }
 
-fn parse_kernel_version(value: &str) -> Result<KernelVersion, Status> {
-    value
-        .parse()
-        .map_err(|error: KernelVersionParseError| Status::invalid_argument(error.to_string()))
+/// The release a runtime request names. The runtime must be named.
+fn parse_release(runtime_kind: i32, version: &str) -> Result<RuntimeIdentity, Status> {
+    let kind = parse_runtime(runtime_kind, None)?;
+    let version = RuntimeVersion::parse(version.strip_prefix('v').unwrap_or(version))
+        .map_err(|error| Status::invalid_argument(error.to_string()))?;
+    Ok(RuntimeIdentity { kind, version })
 }
 
-/// The lines of `runtime`'s release directories under `releases`. Blocking.
-fn release_lines(
-    runtime: RuntimeKind,
-    releases: &std::path::Path,
-) -> Result<Vec<RuntimeLine>, Status> {
-    let entries = match std::fs::read_dir(releases) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => {
-            return Err(Status::internal(format!(
-                "list {}: {error}",
-                releases.display()
-            )));
+fn require_kernel(kind: i32) -> Result<(), Status> {
+    match ArtifactComponentKind::try_from(kind) {
+        Ok(ArtifactComponentKind::Kernel) => Ok(()),
+        Ok(ArtifactComponentKind::Unspecified) | Err(_) => {
+            Err(Status::invalid_argument("a component kind is required"))
         }
-    };
-    let mut lines: Vec<RuntimeLine> = entries
-        .filter_map(Result::ok)
-        .filter_map(|entry| {
-            entry
-                .file_name()
-                .to_str()
-                .and_then(|name| name.parse::<ReleaseLine>().ok())
-                .map(|release| RuntimeLine::new(runtime, release))
-        })
-        .collect();
-    lines.sort();
-    lines.dedup();
-    Ok(lines)
+        Ok(_) => Err(Status::failed_precondition(
+            "this build only installs kernel components",
+        )),
+    }
+}
+
+fn parse_component(
+    value: Option<&pplx_space_node_runtime_manager_client::proto::ComponentIdentity>,
+) -> Result<ComponentIdentity, Status> {
+    let value =
+        value.ok_or_else(|| Status::invalid_argument("a component identity is required"))?;
+    require_kernel(value.kind)?;
+    Ok(ComponentIdentity {
+        kind: pplx_space_common_core::types::ArtifactComponentKind::Kernel,
+        version: value
+            .version
+            .parse()
+            .map_err(|_| Status::invalid_argument("invalid component version"))?,
+        digest: value
+            .digest
+            .parse()
+            .map_err(|_| Status::invalid_argument("invalid component digest"))?,
+    })
+}
+
+enum RequestedArtifact {
+    Runtime(RuntimeIdentity, Digest),
+    Component(ComponentIdentity),
+}
+fn parse_identity(value: Option<&ArtifactIdentity>) -> Result<RequestedArtifact, Status> {
+    match value.and_then(|value| value.artifact.as_ref()) {
+        Some(proto::artifact_identity::Artifact::Runtime(runtime)) => {
+            Ok(RequestedArtifact::Runtime(
+                parse_release(runtime.kind, &runtime.version)?,
+                runtime
+                    .digest
+                    .parse()
+                    .map_err(|_| Status::invalid_argument("invalid runtime digest"))?,
+            ))
+        }
+        Some(proto::artifact_identity::Artifact::Component(component)) => {
+            parse_component(Some(component)).map(RequestedArtifact::Component)
+        }
+        None => Err(Status::invalid_argument("artifact identity is required")),
+    }
+}
+fn presence(path: &std::path::Path) -> ArtifactPresence {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => ArtifactPresence::Present,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => ArtifactPresence::Absent,
+        Err(_) => ArtifactPresence::Unreadable,
+    }
 }
 
 fn lookup_status(error: LookupOperationError) -> Status {
@@ -243,33 +226,17 @@ fn lookup_status(error: LookupOperationError) -> Status {
     }
 }
 
-fn install_status(error: InstallKernelError) -> Status {
+fn submit_status(error: SubmitOperationError) -> Status {
     match error {
-        InstallKernelError::NotOffered { .. } => Status::not_found(describe(&error)),
-        InstallKernelError::RuntimeNotPublished { .. }
-        | InstallKernelError::Unverifiable { .. }
-        | InstallKernelError::TooLarge { .. }
-        | InstallKernelError::Conflict(_) => Status::failed_precondition(describe(&error)),
-        InstallKernelError::Source(_) => Status::unavailable(describe(&error)),
-        InstallKernelError::Submit(status) => *status,
-        InstallKernelError::Lookup(error) => lookup_status(error),
-        InstallKernelError::Store(_) | InstallKernelError::Task(_) => {
-            Status::internal(describe(&error))
-        }
-    }
-}
-
-fn uninstall_status(error: UninstallKernelError) -> Status {
-    match error {
-        UninstallKernelError::NotInstalled { .. } => Status::not_found(describe(&error)),
-        UninstallKernelError::External { .. }
-        | UninstallKernelError::Selected { .. }
-        | UninstallKernelError::OutsideRoot { .. } => Status::failed_precondition(describe(&error)),
-        UninstallKernelError::Submit(status) => *status,
-        UninstallKernelError::Lookup(error) => lookup_status(error),
-        UninstallKernelError::Store(_) | UninstallKernelError::Task(_) => {
-            Status::internal(describe(&error))
-        }
+        SubmitOperationError::Disabled
+        | SubmitOperationError::NotPinned
+        | SubmitOperationError::TooLarge
+        | SubmitOperationError::Pins(_) => Status::failed_precondition(describe(&error)),
+        SubmitOperationError::NotOffered => Status::not_found(describe(&error)),
+        SubmitOperationError::Source(_) => Status::unavailable(describe(&error)),
+        SubmitOperationError::Submit(status) => *status,
+        SubmitOperationError::Lookup(error) => lookup_status(error),
+        SubmitOperationError::Task(_) => Status::internal(describe(&error)),
     }
 }
 
@@ -322,14 +289,12 @@ impl RuntimeManagerService {
     /// Listings and status audits both walk the artifact trees on a blocking
     /// thread. One runs at a time; a caller that cannot get the slot within the
     /// admission timeout is told to retry rather than queued behind it.
-    /// Walk the configured roots for `kinds`, marking what the install
-    /// records name as space-managed.
+    /// Walk the configured roots for `kinds`, including the separate managed store.
     async fn scan(&self, kinds: ArtifactKinds) -> Result<ArtifactScan, Status> {
         let permit = self.admit_walk().await?;
         let roots = self.roots.clone();
         let limits = self.limits;
         let digests = self.digests.clone();
-        let installer = self.installer.clone();
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
             // The cache is a memo of digests, never partially updated in a
@@ -338,64 +303,11 @@ impl RuntimeManagerService {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let mut scan = diagnostic::scan(&roots, limits, kinds, &SystemScanClock, &mut digests);
-            // Ownership comes only from install records, never from where an
-            // artifact sits.
-            if let Some(installer) = installer {
-                let installs = installer
-                    .kernel_installs()
-                    .map_err(|error| Status::internal(format!("read install records: {error}")))?;
-                crate::convert::mark_space_managed(&mut scan, &installs).map_err(|error| {
-                    Status::internal(format!("describe an install record's runtime: {error}"))
-                })?;
-            }
+            crate::convert::mark_managed_store(&mut scan, &roots);
             Ok::<_, Status>(scan)
         })
         .await
         .map_err(|error| Status::internal(format!("artifact scan failed: {error}")))?
-    }
-
-    /// Why `version` cannot be uninstalled when the runtime manager has no
-    /// install of it: no kernel of that version is on the node, or every
-    /// copy is one it did not install and never removes.
-    async fn not_installed(&self, version: &KernelVersion) -> Status {
-        let scan = match self
-            .scan(ArtifactKinds {
-                runtimes: false,
-                kernels: true,
-            })
-            .await
-        {
-            Ok(scan) => scan,
-            Err(status) => {
-                tracing::warn!(%version, %status, "could not list kernels for an uninstall refusal");
-                return Status::not_found(format!(
-                    "the runtime manager installed no kernel {version}"
-                ));
-            }
-        };
-        let copies: Vec<String> = scan
-            .artifacts
-            .iter()
-            .filter(|artifact| {
-                artifact
-                    .version
-                    .as_ref()
-                    .is_some_and(|found| found.to_string() == version.as_str())
-            })
-            .map(|artifact| artifact.path.display().to_string())
-            .collect();
-        if copies.is_empty() {
-            let incomplete = if scan.is_complete() {
-                ""
-            } else {
-                " (the kernel listing was incomplete)"
-            };
-            return Status::not_found(format!("no kernel {version} on this node{incomplete}"));
-        }
-        Status::failed_precondition(format!(
-            "kernel {version} is present only where the runtime manager did not install it, and it never removes those: {}",
-            copies.join(", ")
-        ))
     }
 
     async fn admit_walk(&self) -> Result<OwnedSemaphorePermit, Status> {
@@ -434,14 +346,18 @@ impl RuntimeManager for RuntimeManagerService {
     ) -> Result<Response<GetStatusResponse>, Status> {
         self.peer_authorizer
             .authorize_request(&request, "GetStatus", ALLOW_READ)?;
-        // The image-populated install roots are where the runtime manager
-        // installs; the cache kernel roots stay root-staged until the runtime
-        // manager takes over kernel staging.
+        // Execution roots are diagnostic only. Managed roots are separate.
         let releases = self
             .roots
             .runtime_releases
             .iter()
             .map(|root| root.path.clone())
+            .chain(
+                self.roots
+                    .managed_releases
+                    .as_ref()
+                    .map(|root| root.path.clone()),
+            )
             .chain(self.roots.managed_kernels.clone())
             .map(|path| (path, PathRole::InstallRoot));
         let paths: Vec<_> = releases
@@ -472,102 +388,223 @@ impl RuntimeManager for RuntimeManagerService {
         )))
     }
 
-    async fn list_available_kernels(
+    async fn list_available_artifacts(
         &self,
-        request: Request<ListAvailableKernelsRequest>,
-    ) -> Result<Response<ListAvailableKernelsResponse>, Status> {
+        request: Request<ListAvailableArtifactsRequest>,
+    ) -> Result<Response<ListAvailableArtifactsResponse>, Status> {
         self.peer_authorizer
-            .authorize_request(&request, "ListAvailableKernels", ALLOW_READ)?;
-        let source = self.kernel_source()?.clone();
-        let architecture = crate::kernels::host_arch()
-            .ok_or_else(|| Status::failed_precondition("unsupported node architecture"))?;
-        let runtime = parse_runtime(request.get_ref().runtime_kind, Some(source.runtime()))?;
-        let lines = self
-            .runtime_lines(
-                source.as_ref(),
-                runtime,
-                request.get_ref().runtime_version.as_deref(),
-            )
-            .await?;
+            .authorize_request(&request, "ListAvailableArtifacts", ALLOW_READ)?;
+        let filter = request.into_inner();
+        let kinds = parse_kinds(&ListExecutionArtifactsRequest {
+            kinds: filter.kinds,
+            component_kinds: filter.component_kinds,
+        })?;
+        let runtime = parse_runtime(filter.runtime_kind, Some(RuntimeKind::Firecracker))?;
+        let line = filter
+            .runtime_version
+            .as_deref()
+            .map(|version| parse_line(runtime, version))
+            .transpose()?;
+        let architecture = crate::installs::host_arch()
+            .ok_or_else(|| Status::failed_precondition("unsupported architecture"))?;
+        let pins = self
+            .pins
+            .clone()
+            .ok_or_else(|| Status::failed_precondition("no artifact catalog configured"))?;
+        let releases = self.releases.clone();
+        let kernels_root = self.roots.managed_kernels.clone();
+        let permit = tokio::time::timeout(
+            self.admission_timeout,
+            self.listing_slot.clone().acquire_owned(),
+        )
+        .await
+        .map_err(|_| Status::resource_exhausted("another catalog listing is running; retry"))?
+        .map_err(|_| Status::unavailable("runtime manager is shutting down"))?;
+        let catalog = tokio::task::spawn_blocking(move || pins.catalog())
+            .await
+            .map_err(|error| Status::internal(describe(&error)))?
+            .map_err(|error| Status::failed_precondition(describe(&error)))?;
         let mut offered = Vec::new();
-        for line in &lines {
-            offered.extend(
-                source
-                    .list(*line, architecture)
-                    .await
-                    .map_err(|error| Status::unavailable(describe(&error)))?,
-            );
-        }
-        let service = self.clone();
-        let kernels = tokio::task::spawn_blocking(move || {
-            let installs = match &service.installer {
-                Some(installer) => installer
-                    .kernel_installs()
-                    .map_err(|error| Status::internal(format!("read install records: {error}")))?,
-                None => Vec::new(),
+        if kinds.kernels {
+            let source = self.kernel_source()?;
+            if source.runtime() != runtime {
+                return Err(Status::failed_precondition(
+                    "no component adapter for this runtime",
+                ));
+            }
+            let mut lines = match line {
+                Some(line) => vec![line],
+                None => catalog
+                    .all_kernels(architecture)
+                    .filter(|pin| pin.runtime == runtime)
+                    .map(|pin| parse_line(runtime, pin.runtime_line.as_str()))
+                    .collect::<Result<Vec<_>, _>>()?,
             };
-            Ok::<_, Status>(
-                offered
-                    .iter()
-                    .map(|kernel| AvailableKernel {
-                        version: kernel.version.to_string(),
-                        runtime_kind: execution::RuntimeKind::from(kernel.line.runtime) as i32,
-                        runtime_line: kernel.line.release.to_string(),
-                        architecture: kernel.architecture.as_str().to_string(),
-                        size: kernel.size,
-                        md5: kernel.md5.map(|md5| md5.to_string()),
-                        source: kernel.location.to_string(),
-                        presence: service.presence(kernel, &installs) as i32,
+            lines.sort();
+            lines.dedup();
+            for line in lines {
+                offered.extend(
+                    source
+                        .list(line, architecture)
+                        .await
+                        .map_err(|error| Status::unavailable(describe(&error)))?,
+                );
+            }
+        }
+        let artifacts = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            let mut artifacts = Vec::new();
+            if kinds.runtimes
+                && let Some(releases) = releases
+            {
+                for pin in catalog.releases(runtime, architecture) {
+                    if line.is_some_and(|line| {
+                        pin.release.version.as_str().parse::<ReleaseLine>().ok()
+                            != Some(line.release)
+                    }) {
+                        continue;
+                    }
+                    artifacts.push(AvailableArtifact {
+                        identity: Some(crate::convert::runtime_identity(
+                            &pin.release,
+                            pin.digest(),
+                        )),
+                        architecture: architecture.as_str().to_string(),
+                        size: None,
+                        source: releases.source.root().to_string(),
+                        presence: presence(
+                            &releases
+                                .root
+                                .join(crate::installs::release_directory(&pin.release)),
+                        ) as i32,
+                        compatible_runtimes: Vec::new(),
+                    });
+                }
+            }
+            for kernel in offered {
+                let Some(pin) = catalog
+                    .kernel(kernel.version.artifact_version(), architecture)
+                    .filter(|pin| {
+                        pin.size == kernel.size
+                            && pin.runtime == kernel.line.runtime
+                            && pin.runtime_line.as_str() == kernel.line.release.to_string()
                     })
-                    .collect(),
-            )
+                else {
+                    continue;
+                };
+                let identity = crate::convert::component_identity(ComponentIdentity {
+                    kind: pplx_space_common_core::types::ArtifactComponentKind::Kernel,
+                    version: pin.version.clone(),
+                    digest: pin.sha256,
+                });
+                if artifacts
+                    .iter()
+                    .any(|entry| entry.identity.as_ref() == Some(&identity))
+                {
+                    continue;
+                }
+                artifacts.push(AvailableArtifact {
+                    identity: Some(identity),
+                    architecture: architecture.as_str().to_string(),
+                    size: Some(pin.size),
+                    source: kernel.location.to_string(),
+                    presence: kernels_root
+                        .as_ref()
+                        .map_or(ArtifactPresence::Unspecified, |root| {
+                            presence(&root.join(kernel.version.as_str()))
+                        }) as i32,
+                    compatible_runtimes: catalog
+                        .releases(runtime, architecture)
+                        .filter(|release| {
+                            release.release.version.as_str().parse::<ReleaseLine>().ok()
+                                == Some(kernel.line.release)
+                        })
+                        .map(|release| execution::RuntimeIdentity {
+                            kind: execution::RuntimeKind::from(release.release.kind) as i32,
+                            version: release.release.version.to_string(),
+                        })
+                        .collect(),
+                });
+            }
+            artifacts
         })
         .await
-        .map_err(|error| Status::internal(format!("kernel listing failed: {error}")))??;
-        Ok(Response::new(ListAvailableKernelsResponse {
-            kernels,
-            runtime_kind: execution::RuntimeKind::from(runtime) as i32,
-            runtime_lines: lines.iter().map(|line| line.release.to_string()).collect(),
-            source: source.root().to_string(),
-        }))
+        .map_err(|error| Status::internal(describe(&error)))?;
+        Ok(Response::new(ListAvailableArtifactsResponse { artifacts }))
     }
 
-    async fn install_kernel(
+    async fn install_artifact(
         &self,
-        request: Request<InstallKernelRequest>,
-    ) -> Result<Response<InstallKernelResponse>, Status> {
+        request: Request<InstallArtifactRequest>,
+    ) -> Result<Response<InstallArtifactResponse>, Status> {
         self.peer_authorizer
-            .authorize_request(&request, "InstallKernel", ALLOW_MUTATE)?;
-        let runtime = parse_runtime(request.get_ref().runtime_kind, None)?;
-        let line = parse_line(runtime, &request.get_ref().runtime_version)?;
-        let version = parse_kernel_version(&request.get_ref().version)?;
-        let operation = self
-            .installer()?
-            .install(line, version)
-            .await
-            .map_err(install_status)?;
-        Ok(Response::new(InstallKernelResponse {
+            .authorize_request(&request, "InstallArtifact", ALLOW_MUTATE)?;
+        let identity = parse_identity(request.get_ref().identity.as_ref())?;
+        let installer = self.installer()?.clone();
+        let operation = match identity {
+            RequestedArtifact::Runtime(release, digest) => installer
+                .install_release(release, digest)
+                .await
+                .map_err(submit_status)?,
+            RequestedArtifact::Component(component) => {
+                let checking = installer.clone();
+                let requested = component.clone();
+                let architecture = crate::installs::host_arch()
+                    .ok_or_else(|| Status::failed_precondition("unsupported architecture"))?;
+                let pin = tokio::task::spawn_blocking(move || {
+                    checking.catalog().map(|catalog| {
+                        catalog
+                            .kernel(&requested.version, architecture)
+                            .filter(|pin| pin.sha256 == requested.digest)
+                            .cloned()
+                    })
+                })
+                .await
+                .map_err(|error| Status::internal(describe(&error)))?
+                .map_err(|error| Status::failed_precondition(describe(&error)))?
+                .ok_or_else(|| {
+                    Status::failed_precondition("component is not pinned for this node")
+                })?;
+                let line = parse_line(pin.runtime, pin.runtime_line.as_str())?;
+                let version = pin
+                    .version
+                    .as_str()
+                    .parse()
+                    .map_err(|_| Status::invalid_argument("unsupported kernel version"))?;
+                installer
+                    .install(line, version, component.digest)
+                    .await
+                    .map_err(submit_status)?
+            }
+        };
+        Ok(Response::new(InstallArtifactResponse {
             operation: Some(crate::convert::operation(&operation)),
         }))
     }
 
-    async fn uninstall_kernel(
+    async fn uninstall_artifact(
         &self,
-        request: Request<UninstallKernelRequest>,
-    ) -> Result<Response<UninstallKernelResponse>, Status> {
+        request: Request<UninstallArtifactRequest>,
+    ) -> Result<Response<UninstallArtifactResponse>, Status> {
         self.peer_authorizer
-            .authorize_request(&request, "UninstallKernel", ALLOW_MUTATE)?;
-        let version = parse_kernel_version(&request.get_ref().version)?;
-        // Removes the runtime manager's own install of the version; copies
-        // it did not install, such as a release's bundled kernel, stay.
-        let operation = match self.installer()?.uninstall(version).await {
-            Ok(operation) => operation,
-            Err(UninstallKernelError::NotInstalled { version }) => {
-                return Err(self.not_installed(&version).await);
+            .authorize_request(&request, "UninstallArtifact", ALLOW_MUTATE)?;
+        let identity = parse_identity(request.get_ref().identity.as_ref())?;
+        let installer = self.installer()?;
+        let operation = match identity {
+            RequestedArtifact::Runtime(release, digest) => {
+                installer.uninstall_release(release, digest).await
             }
-            Err(error) => return Err(uninstall_status(error)),
-        };
-        Ok(Response::new(UninstallKernelResponse {
+            RequestedArtifact::Component(component) => {
+                let version = component
+                    .version
+                    .as_str()
+                    .parse()
+                    .map_err(|_| Status::invalid_argument("unsupported kernel version"))?;
+                installer.uninstall(version, component.digest).await
+            }
+        }
+        .map_err(submit_status)?;
+        Ok(Response::new(UninstallArtifactResponse {
             operation: Some(crate::convert::operation(&operation)),
         }))
     }

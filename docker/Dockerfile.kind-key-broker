@@ -1,0 +1,28 @@
+# Kind-only: the in-repo intermediate-key broker fixture
+# (crates/apps/mock/branching-key-provider), which the Kind credential-manager
+# authority uses as its external key provider
+# (infra/space/kind/charts/space-kind-key-broker). It derives deterministic key
+# material from the tenant reference and is a connectivity fixture, not a key
+# authority (proto/credential/provider/v2/README.md); never deploy it outside
+# a local cluster.
+ARG SPACE_RUST_BUILD_IMAGE=space-rust-build-kind:local
+FROM ${SPACE_RUST_BUILD_IMAGE} AS rust-build
+
+FROM public.ecr.aws/docker/library/debian:bookworm-slim
+
+RUN groupadd --system --gid 65532 space-key-broker \
+    && useradd --system --uid 65532 --gid 65532 --no-create-home --shell /usr/sbin/nologin space-key-broker
+
+ARG SPACE_GIT_SHA=unknown
+LABEL org.opencontainers.image.revision="${SPACE_GIT_SHA}"
+RUN mkdir -p /etc/space && printf '%s\n' "${SPACE_GIT_SHA}" > /etc/space/build-git-sha
+
+LABEL org.opencontainers.image.title="space-kind-key-broker"
+LABEL org.opencontainers.image.description="Local-only SPACE intermediate-key broker fixture for the kind stack."
+
+COPY --from=rust-build /artifacts/bin/space-mock-branching-key-provider-svc /usr/local/bin/space-mock-branching-key-provider-svc
+
+USER space-key-broker
+
+EXPOSE 50051
+ENTRYPOINT ["/usr/local/bin/space-mock-branching-key-provider-svc"]

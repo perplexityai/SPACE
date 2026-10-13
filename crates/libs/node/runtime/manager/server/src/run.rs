@@ -14,8 +14,11 @@ use std::sync::Arc;
 #[cfg(feature = "s3")]
 use pplx_space_common_core::types::StorageUri;
 
-use crate::kernels::{
-    InstallLimits, Installer, KernelSource, OpenInstallerError, SeedError, SeedReport,
+use pplx_space_node_runtime_core::runtime_inventory::RuntimeInstallationRoot;
+
+use crate::installs::{
+    DirectoryCatalog, ExecutorParts, InstallLimits, Installer, KernelSource, NodeManagerPublisher,
+    OpenInstallerError, ReleaseContext, ReleaseSource,
 };
 use crate::service::RuntimeManagerService;
 
@@ -77,24 +80,72 @@ impl KernelSourceConfig {
     fn into_source(self) -> Arc<dyn KernelSource> {
         match self {
             #[cfg(feature = "s3")]
-            Self::S3(root) => Arc::new(crate::kernels::S3KernelSource::new(root)),
+            Self::S3(root) => Arc::new(crate::installs::S3KernelSource::new(root)),
             Self::Custom(source) => source,
         }
     }
 }
 
-/// Where and within what bounds the service installs kernels. Absent,
-/// installs and uninstalls are refused.
+/// Where runtime releases come from.
+#[derive(Clone)]
+pub enum ReleaseSourceConfig {
+    /// Firecracker's GitHub releases, under a download base laid out as
+    /// [`crate::FIRECRACKER_RELEASE_SOURCE`] is.
+    #[cfg(feature = "github")]
+    GitHub(crate::ReleaseUrl),
+    /// A source the deployment supplies.
+    Custom(Arc<dyn ReleaseSource>),
+}
+
+impl std::fmt::Debug for ReleaseSourceConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            #[cfg(feature = "github")]
+            Self::GitHub(base) => formatter.debug_tuple("GitHub").field(base).finish(),
+            Self::Custom(source) => formatter
+                .debug_tuple("Custom")
+                .field(source.root())
+                .finish(),
+        }
+    }
+}
+
+impl ReleaseSourceConfig {
+    fn into_source(self) -> Result<Arc<dyn ReleaseSource>, RunRuntimeManagerError> {
+        match self {
+            #[cfg(feature = "github")]
+            Self::GitHub(base) => Ok(Arc::new(
+                crate::installs::GitHubReleaseSource::new(base)
+                    .map_err(RunRuntimeManagerError::ReleaseSource)?,
+            )),
+            Self::Custom(source) => Ok(source),
+        }
+    }
+}
+
+/// Which runtime's releases the service installs, where they live in the
+/// node store, and where they come from.
+#[derive(Clone, Debug)]
+pub struct RuntimeManagerReleaseConfig {
+    /// The managed release root, read here and published into by node-manager.
+    /// Diagnostic listings include it; execution never scans it.
+    pub root: PathBuf,
+    pub source: ReleaseSourceConfig,
+}
+
+/// Where and within what bounds the service installs. Absent, installs and
+/// uninstalls are refused. The runtime manager downloads into its own
+/// staging and node-manager publishes into the node's root-owned store, so
+/// nothing here is a directory the runtime manager writes but staging.
 #[derive(Clone, Debug)]
 pub struct RuntimeManagerInstallConfig {
-    /// Versioned kernel root (`<version>/vmlinux.bin`) to install into. Must
-    /// exist, on the state directory's filesystem. Listings always scan it.
+    /// The node store's kernel root (`<version>/vmlinux.bin`): read here,
+    /// published into by node-manager. Listings always scan it.
     pub kernels_root: PathBuf,
+    /// The runtime manager's private staging, which node-manager publishes
+    /// from. Provisioning creates it.
+    pub staging_dir: PathBuf,
     pub limits: InstallLimits,
-    /// The node image's manifest of kernels it pre-installed in
-    /// `kernels_root`, recorded as space-managed at startup. A missing file
-    /// seeds nothing.
-    pub seed_manifest: Option<PathBuf>,
 }
 
 /// Everything [`run`] needs from the process that hosts it.
@@ -102,16 +153,17 @@ pub struct RuntimeManagerInstallConfig {
 pub struct RuntimeManagerRunConfig {
     pub socket_path: UnixSocketPath,
     pub roots: ScanRoots,
-    /// The runtime manager's persistent state directory. Provisioning
-    /// creates it; this service only checks its protection for now.
+    /// The runtime manager's state directory, beside its socket.
+    /// Provisioning creates it; installs require it to be protected.
     pub state_dir: PathBuf,
     pub limits: ScanLimits,
     pub list_admission_timeout: Duration,
-    /// Where available kernels are listed from and installs download from.
     /// Where published kernels are listed and downloaded from.
     pub kernel_source: Option<KernelSourceConfig>,
-    /// Installs stay disabled until a deployment hands the runtime manager
-    /// an install root's writes.
+    /// Read-only catalog access remains available without an installer.
+    pub catalog_dir: PathBuf,
+    pub releases: Option<RuntimeManagerReleaseConfig>,
+    /// Installs, or none when the service runs list-only.
     pub install: Option<RuntimeManagerInstallConfig>,
 }
 
@@ -129,34 +181,16 @@ pub enum RunRuntimeManagerError {
     Installer(#[source] OpenInstallerError),
     #[error("kernel installs need a kernel source")]
     NoKernelSource,
-}
-
-/// A seed import that fails leaves the pre-installed kernels external; it is
-/// reported, and the service runs on.
-fn log_seed(manifest: &std::path::Path, imported: Result<SeedReport, SeedError>) {
-    match imported {
-        Ok(report) => {
-            for refusal in &report.refused {
-                tracing::warn!(error = %crate::kernels::describe(refusal), "pre-installed kernel left external");
-            }
-            if !report.seeded.is_empty()
-                || !report.recorded.is_empty()
-                || !report.refused.is_empty()
-            {
-                tracing::info!(
-                    manifest = %manifest.display(),
-                    seeded = ?report.seeded.iter().map(ToString::to_string).collect::<Vec<_>>(),
-                    already_recorded = report.recorded.len(),
-                    refused = report.refused.len(),
-                    "imported pre-installed kernels"
-                );
-            }
-        }
-        Err(error) => tracing::warn!(
-            error = %crate::kernels::describe(&error),
-            "pre-installed kernels not imported; they stay external"
-        ),
-    }
+    #[error(
+        "the runtime-manager state directory {} is not protected ({protection}); installs need it private",
+        path.display()
+    )]
+    UnprotectedState { path: PathBuf, protection: String },
+    #[error("runtime-manager startup task failed")]
+    Startup(#[source] tokio::task::JoinError),
+    #[cfg(feature = "github")]
+    #[error("failed to enable release installs: {0}")]
+    ReleaseSource(#[source] crate::GitHubReleaseSourceError),
 }
 
 /// Serve the runtime manager until `shutdown_token` is cancelled.
@@ -176,24 +210,104 @@ pub async fn run(
     let (_, health_service) = pplx_space_common_svc::grpc_health_service();
     let kernel_source = config.kernel_source.map(KernelSourceConfig::into_source);
     let mut roots = config.roots;
+    let pins = Arc::new(DirectoryCatalog(config.catalog_dir));
+    let releases = match config.releases {
+        Some(releases) => {
+            let source = releases.source.into_source()?;
+            roots.managed_releases = Some(RuntimeInstallationRoot::new(
+                source.runtime(),
+                releases.root.clone(),
+            ));
+            Some(ReleaseContext {
+                root: releases.root,
+                source,
+            })
+        }
+        None => None,
+    };
     let installer = match config.install {
         Some(install) => {
             let source = kernel_source
                 .clone()
                 .ok_or(RunRuntimeManagerError::NoKernelSource)?;
-            roots.managed_kernels = Some(install.kernels_root.clone());
-            let installer = Installer::open(
-                install.kernels_root,
-                &config.state_dir,
-                install.limits,
-                source,
-            )
+            let audited = config.state_dir.clone();
+            let report = tokio::task::spawn_blocking(move || {
+                crate::protection::audit(
+                    &audited,
+                    crate::protection::PathRole::StateDirectory,
+                    &crate::protection::AuditIdentity::of_this_process(),
+                )
+            })
             .await
-            .map_err(RunRuntimeManagerError::Installer)?;
-            if let Some(manifest) = install.seed_manifest {
-                log_seed(&manifest, installer.import_seed(manifest.clone()).await);
+            .map_err(RunRuntimeManagerError::Startup)?;
+            if report.protection != crate::protection::Protection::Protected {
+                return Err(RunRuntimeManagerError::UnprotectedState {
+                    path: config.state_dir.clone(),
+                    protection: format!("{:?}", report.protection),
+                });
             }
-            Some(installer)
+            roots.managed_kernels = Some(install.kernels_root.clone());
+            let host_arch = crate::installs::host_arch().ok_or(
+                RunRuntimeManagerError::Installer(OpenInstallerError::UnsupportedArchitecture),
+            )?;
+            // A previous prototype image may have granted this account write
+            // access to execution artifacts. Downloads must not run with that
+            // authority. Leave execution alone and serve diagnostics only.
+            let execution_roots: Vec<_> = roots
+                .runtime_releases
+                .iter()
+                .map(|root| root.path.clone())
+                .chain([
+                    roots.vendor_kernels.clone(),
+                    roots.cache_kernels.clone(),
+                    roots.cache_legacy_assets.clone(),
+                ])
+                .collect();
+            let unsafe_roots = tokio::task::spawn_blocking(move || {
+                let identity = crate::protection::AuditIdentity::of_this_process();
+                execution_roots
+                    .into_iter()
+                    .map(|path| {
+                        crate::protection::audit(
+                            &path,
+                            crate::protection::PathRole::InstallRoot,
+                            &identity,
+                        )
+                    })
+                    .filter(|report| {
+                        matches!(
+                            report.protection,
+                            crate::protection::Protection::Unprotected(_)
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .await
+            .map_err(RunRuntimeManagerError::Startup)?;
+            if !unsafe_roots.is_empty() {
+                tracing::error!(
+                    ?unsafe_roots,
+                    "artifact management disabled: execution paths are writable or cannot be audited; repair provisioning then restart runtime-manager"
+                );
+                None
+            } else {
+                let installer = Installer::open(
+                    ExecutorParts {
+                        kernels_root: install.kernels_root,
+                        staging: install.staging_dir,
+                        limits: install.limits,
+                        host_arch,
+                        source,
+                        releases: releases.clone(),
+                        publisher: NodeManagerPublisher::connect_lazily(),
+                        pins: pins.clone(),
+                    },
+                    &config.state_dir,
+                )
+                .await
+                .map_err(RunRuntimeManagerError::Installer)?;
+                Some(installer)
+            }
         }
         None => None,
     };
@@ -202,7 +316,8 @@ pub async fn run(
         config.state_dir,
         config.limits,
         config.list_admission_timeout,
-    );
+    )
+    .with_catalog(pins, releases);
     if let Some(source) = kernel_source {
         service = service.with_kernel_source(source);
     }
@@ -216,6 +331,9 @@ pub async fn run(
     tracing::info!(
         socket_path = %config.socket_path.as_path().display(),
         kernel_installs = installer.is_some(),
+        release_installs = installer
+            .as_ref()
+            .is_some_and(|installer| installer.releases_root().is_some()),
         "space-rtmgr listening"
     );
     let shutdown = async move {

@@ -997,7 +997,6 @@ export default function TemplatesPage() {
       refill_per_tick: policy?.refill_per_tick ?? 5,
       max_warming_slots: policy?.max_warming_slots ?? 10,
       retain_releases: policy?.retain_releases ?? 2,
-      retain_shape_on_miss: policy?.retain_shape_on_miss ?? false,
       disk_io_max_operations_per_sec: policy?.disk_io_max_operations_per_sec,
       disk_io_max_bandwidth_mib_per_sec: policy?.disk_io_max_bandwidth_mib_per_sec,
       enabled: policy?.enabled ?? true,
@@ -1020,7 +1019,6 @@ export default function TemplatesPage() {
     refill_per_tick: number;
     max_warming_slots: number;
     retain_releases: number;
-    retain_shape_on_miss?: boolean;
     disk_io_max_operations_per_sec?: number | null;
     disk_io_max_bandwidth_mib_per_sec?: number | null;
     enabled?: boolean;
@@ -1040,9 +1038,6 @@ export default function TemplatesPage() {
       refill_per_tick: values.refill_per_tick,
       max_warming_slots: values.max_warming_slots,
       retain_releases: values.retain_releases,
-      ...(warmPoolPolicyCapabilities.retain_shape_on_miss ? {
-        retain_shape_on_miss: values.retain_shape_on_miss ?? false,
-      } : {}),
       ...(hasDiskIoLimits ? {
         disk_io_max_operations_per_sec: values.disk_io_max_operations_per_sec,
         disk_io_max_bandwidth_mib_per_sec: values.disk_io_max_bandwidth_mib_per_sec,
@@ -1068,7 +1063,6 @@ export default function TemplatesPage() {
     refill_per_tick: number;
     max_warming_slots: number;
     retain_releases: number;
-    retain_shape_on_miss?: boolean;
     disk_io_max_operations_per_sec?: number | null;
     disk_io_max_bandwidth_mib_per_sec?: number | null;
     enabled?: boolean;
@@ -1106,7 +1100,6 @@ export default function TemplatesPage() {
         refill_per_tick: policy.refill_per_tick,
         max_warming_slots: policy.max_warming_slots,
         retain_releases: policy.retain_releases,
-        retain_shape_on_miss: policy.retain_shape_on_miss,
         enabled: false,
       });
     } catch (err: unknown) {
@@ -2149,16 +2142,6 @@ export default function TemplatesPage() {
           <Form.Item name="retain_releases" label="Retained Releases" rules={[{ required: true }]}>
             <InputNumber min={1} max={50} style={{ width: '100%' }} />
           </Form.Item>
-          {warmPoolPolicyCapabilities.retain_shape_on_miss ? (
-            <Form.Item
-              name="retain_shape_on_miss"
-              label="Retain shape on pool miss"
-              valuePropName="checked"
-              extra="When a release has no ready or materialized pool yet, its cold fallback uses this policy's CPU, memory, and disk I/O limits."
-            >
-              <Switch />
-            </Form.Item>
-          ) : null}
           {warmPoolPolicyCapabilities.disk_io ? (
             <>
               <Space.Compact block>

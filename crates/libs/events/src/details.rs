@@ -128,6 +128,9 @@ pub struct SandboxEventDetails {
     /// moment of a network policy refresh (`ready`, `not_required`, or
     /// `dependencies_not_ready`). Orthogonal to `network_state`.
     pub(crate) interception_readiness: Option<String>,
+    /// The effective TLS interception mode (`on` or `off`) a sandbox create
+    /// resolved from its network policy override or template default.
+    pub(crate) tls_interception: Option<String>,
     pub(crate) artifact: Option<String>,
     pub(crate) local_artifact_id: Option<String>,
     pub(crate) artifact_kind: Option<String>,
@@ -142,6 +145,10 @@ pub struct SandboxEventDetails {
     pub(crate) upstream_issuer: Option<String>,
     pub(crate) upstream_org_id: Option<String>,
     pub(crate) upstream_subject_id: Option<String>,
+    /// Not an event field: keeps a failed-phase event at INFO; see
+    /// [`SandboxEventDetails::logged_by_caller`] and
+    /// [`SandboxEventDetails::routine`].
+    pub(crate) stays_at_info: bool,
 }
 
 impl SandboxEventDetails {
@@ -239,6 +246,7 @@ impl SandboxEventDetails {
         installed_network_policy_ref,
         network_state,
         interception_readiness,
+        tls_interception,
         artifact,
         local_artifact_id,
         artifact_kind,
@@ -282,6 +290,22 @@ impl SandboxEventDetails {
             self.kernel_version = kernel.version.as_ref().map(ToString::to_string);
             self.kernel_digest = kernel.digest.map(|digest| digest.to_string());
         }
+        self
+    }
+
+    /// Mark a failure the caller already logs at WARN or ERROR. A failed-phase
+    /// event otherwise logs at WARN itself; marked, it stays at INFO, so level
+    /// filters see the failure once.
+    pub fn logged_by_caller(mut self) -> Self {
+        self.stays_at_info = true;
+        self
+    }
+
+    /// Mark an expected failed-phase outcome, such as a rejection the caller
+    /// answers with a conflict or a capacity refusal, that is part of normal
+    /// operation rather than an anomaly. It stays at INFO.
+    pub fn routine(mut self) -> Self {
+        self.stays_at_info = true;
         self
     }
 

@@ -15,6 +15,7 @@ use tokio::task::JoinSet;
 
 use crate::memory_admission::ActiveLeaseMemoryReservation;
 use crate::net::{self, NetId, SlotInfo};
+pub use crate::node_state_sync::{NodeCtlNodeStatusDirtySink, NodeStatusDirtySink};
 
 pub const NETWORK_POOL_SCHEMA_VERSION: u32 = 4;
 pub const DEFAULT_NETWORK_POOL_TARGET: u32 = 100;
@@ -304,6 +305,10 @@ pub enum SlotStoreError {
 
 #[derive(Debug, thiserror::Error)]
 pub enum PoolOpenError {
+    #[error("network pool startup was cancelled")]
+    StartupCancelled,
+    #[error("network pool startup task failed: {0}")]
+    StartupTask(#[source] tokio::task::JoinError),
     #[error("invalid network pool configuration: {0}")]
     Configuration(String),
     #[error("cannot create network pool database directory {}: {source}", path.display())]
@@ -580,9 +585,14 @@ pub struct NetworkPool {
     transient_setup_failures: DashMap<SetupRetryKey, u32>,
     transient_reset_failures: DashMap<ResetKey, u32>,
     validation_transient_failures: DashMap<ValidationRetryKey, u32>,
+    node_status_dirty: std::sync::Arc<dyn NodeStatusDirtySink>,
 }
 
 impl NetworkPool {
+    fn mark_node_status_dirty(&self) {
+        self.node_status_dirty.mark_node_status_dirty();
+    }
+
     pub(crate) fn try_claim_sandbox_mutation(
         &self,
         sandbox_id: &str,
@@ -683,6 +693,7 @@ impl NetworkPool {
         legacy_active_memory_reservation_mib: u64,
         task_tracker: tokio_util::task::TaskTracker,
         shutdown_token: tokio_util::sync::CancellationToken,
+        node_status_dirty: std::sync::Arc<dyn NodeStatusDirtySink>,
     ) -> Result<std::sync::Arc<Self>, PoolOpenError> {
         config.pod_netns_path = config.pod_netns_path.as_deref().map(normalize_netns_name);
         validate_config(&config).map_err(PoolOpenError::Configuration)?;
@@ -705,50 +716,17 @@ impl NetworkPool {
         // Existing durable TAP namespaces must carry both containments before
         // the node admits work: guest L2 ingress filtering and the constrained
         // direct inbound reply path. Probe each TAP once and apply both.
-        let mut containment_error = None;
-        for record in query_records(&conn, None).map_err(SlotStoreError::from)? {
-            let namespace = record.info.ns_name();
-            if !net::ns_exists(&namespace) {
-                continue;
-            }
-            let tap_exists = match net::try_link_exists_in(net::TAP_DEVICE, Some(&namespace)) {
-                Ok(tap_exists) => tap_exists,
-                Err(source) => {
-                    let error = PoolOpenError::ExistingTapProbe {
-                        namespace: namespace.clone(),
-                        source,
-                    };
-                    tracing::error!(%error, "cannot inspect existing TAP containment");
-                    containment_error.get_or_insert(error);
-                    continue;
-                }
-            };
-            if !tap_exists {
-                continue;
-            }
-            if let Err(source) = crate::firewall::ensure_guest_l2_ingress_policy(&namespace) {
-                let error = PoolOpenError::GuestL2Ingress {
-                    namespace: namespace.clone(),
-                    source,
-                };
-                tracing::error!(%error, "cannot install existing TAP containment");
-                containment_error.get_or_insert(error);
-            }
-            if let Err(source) = crate::firewall::constrain_direct_inbound_reply_path(&namespace) {
-                let error = PoolOpenError::DirectInboundReplyPath {
-                    namespace: namespace.clone(),
-                    source,
-                };
-                tracing::error!(%error, "cannot constrain existing direct inbound reply path");
-                containment_error.get_or_insert(error);
-            }
-        }
-        // Attempt every existing TAP before failing activation. Quarantining and
-        // continuing would leave an active leased VM reachable, while repair only
-        // rebuilds quarantined rows after the lease is cleared.
-        if let Some(error) = containment_error {
-            return Err(error);
-        }
+        let namespaces: Vec<_> = query_records(&conn, None)
+            .map_err(SlotStoreError::from)?
+            .into_iter()
+            .map(|record| record.info.ns_name())
+            .collect();
+        startup_containment::contain_namespaces(
+            &namespaces,
+            startup_containment::CONCURRENCY,
+            &shutdown_token,
+            startup_containment::contain_namespace,
+        )?;
         let startup_leasing = query_startup_leasing(&conn)?;
         let startup_leases = query_startup_leases(&conn)?;
         backfill_active_memory_reservations(&conn, legacy_active_memory_reservation_mib)
@@ -774,6 +752,7 @@ impl NetworkPool {
             transient_setup_failures: DashMap::new(),
             transient_reset_failures: DashMap::new(),
             validation_transient_failures: DashMap::new(),
+            node_status_dirty,
         });
         pool.enqueue_pending_resets()?;
         spawn_worker(pool.clone(), job_rx);
@@ -781,8 +760,27 @@ impl NetworkPool {
         Ok(pool)
     }
 
+    /// An in-memory pool with no host-networking worker, whose node-status
+    /// marks are recorded in the process.
     #[cfg(test)]
-    pub(crate) fn open_in_memory_for_test(mut config: NetworkPoolConfig) -> std::sync::Arc<Self> {
+    pub(crate) fn open_in_memory_for_test(config: NetworkPoolConfig) -> std::sync::Arc<Self> {
+        Self::open_in_memory_with_node_status_sink_for_test(
+            config,
+            std::sync::Arc::new(
+                crate::node_state_sync::tests::RecordingNodeStatusDirtySink::default(),
+            ),
+        )
+    }
+
+    /// Takes the recorder itself, not any sink, so a test pool cannot be
+    /// handed the production node-ctl sink.
+    #[cfg(test)]
+    pub(crate) fn open_in_memory_with_node_status_sink_for_test(
+        mut config: NetworkPoolConfig,
+        node_status_dirty: std::sync::Arc<
+            crate::node_state_sync::tests::RecordingNodeStatusDirtySink,
+        >,
+    ) -> std::sync::Arc<Self> {
         config.pod_netns_path = config.pod_netns_path.as_deref().map(normalize_netns_name);
         validate_config(&config).unwrap();
         let mut conn = Connection::open_in_memory().unwrap();
@@ -808,6 +806,7 @@ impl NetworkPool {
             transient_setup_failures: DashMap::new(),
             transient_reset_failures: DashMap::new(),
             validation_transient_failures: DashMap::new(),
+            node_status_dirty,
         })
     }
 
@@ -898,7 +897,7 @@ impl NetworkPool {
             self.nudge_prune();
         }
         self.nudge_topup();
-        crate::node_state_sync::mark_node_status_dirty();
+        self.mark_node_status_dirty();
         Ok(next)
     }
 
@@ -1006,7 +1005,7 @@ impl NetworkPool {
             drop(conn);
             if let Some(slot_id) = stale_slot_to_reset {
                 self.enqueue_reset(slot_id);
-                crate::node_state_sync::mark_node_status_dirty();
+                self.mark_node_status_dirty();
             }
             self.nudge_topup();
             return Err(AllocateSlotError::ResourceExhausted(
@@ -1046,7 +1045,7 @@ impl NetworkPool {
         if let Some(slot_id) = stale_slot_to_reset {
             self.enqueue_reset(slot_id);
         }
-        crate::node_state_sync::mark_node_status_dirty();
+        self.mark_node_status_dirty();
         Ok(SlotInfo {
             sandbox_id: sandbox_id.to_string(),
             slot: slot_id,
@@ -1212,7 +1211,7 @@ impl NetworkPool {
             tx.commit().map_err(SlotStoreError::from)?;
             if let Some(slot_id) = stale_slot_to_reset {
                 self.enqueue_reset(slot_id);
-                crate::node_state_sync::mark_node_status_dirty();
+                self.mark_node_status_dirty();
             }
             return Err(AllocateSlotError::ResourceExhausted(
                 "no idle network slots".to_string(),
@@ -1277,7 +1276,7 @@ impl NetworkPool {
         if let Some(slot_id) = stale_slot_to_reset {
             self.enqueue_reset(slot_id);
         }
-        crate::node_state_sync::mark_node_status_dirty();
+        self.mark_node_status_dirty();
         Ok(EphemeralSlotClaimResult::Claimed(EphemeralSlotClaim {
             info: SlotInfo {
                 sandbox_id: sandbox_id.to_string(),
@@ -1371,7 +1370,7 @@ impl NetworkPool {
             )
             .map_err(SlotStoreError::from)?;
         if changed == 1 {
-            crate::node_state_sync::mark_node_status_dirty();
+            self.mark_node_status_dirty();
             Ok(())
         } else {
             Err(AllocateSlotError::Internal(format!(
@@ -1492,7 +1491,7 @@ impl NetworkPool {
         ) {
             Ok(changed) => {
                 if changed > 0 {
-                    crate::node_state_sync::mark_node_status_dirty();
+                    self.mark_node_status_dirty();
                 }
                 Ok(())
             }
@@ -1544,7 +1543,7 @@ impl NetworkPool {
                 LeaseKind::Ephemeral.as_str()
             ],
         )?;
-        crate::node_state_sync::mark_node_status_dirty();
+        self.mark_node_status_dirty();
         Ok(())
     }
 
@@ -1575,7 +1574,7 @@ impl NetworkPool {
                         )
                         .map_err(|e| e.to_string())?;
                         tx.commit().map_err(|e| e.to_string())?;
-                        crate::node_state_sync::mark_node_status_dirty();
+                        self.mark_node_status_dirty();
                         return Ok(Some(record.info));
                     };
                     let changed = tx
@@ -1610,7 +1609,7 @@ impl NetworkPool {
             }
         };
         self.enqueue_reset(slot_id);
-        crate::node_state_sync::mark_node_status_dirty();
+        self.mark_node_status_dirty();
         Ok(Some(info))
     }
 
@@ -1804,7 +1803,7 @@ impl NetworkPool {
         if !draining {
             self.nudge_topup();
         }
-        crate::node_state_sync::mark_node_status_dirty();
+        self.mark_node_status_dirty();
         Ok(())
     }
 
@@ -1833,7 +1832,7 @@ impl NetworkPool {
             .enqueue_pending_resets()
             .map_err(|error| error.to_string())?;
         self.nudge_topup();
-        crate::node_state_sync::mark_node_status_dirty();
+        self.mark_node_status_dirty();
         Ok(PoolRepairResult {
             reset_enqueued,
             topup_requested: true,
@@ -2013,11 +2012,16 @@ fn retire_stale_pod_namespace_lease(
     Ok(record.info.slot)
 }
 
+#[cfg(test)]
+mod claim_contention_tests;
 mod db;
 mod execution;
 mod liveness;
+#[cfg(test)]
+mod node_status_tests;
 mod reset;
 mod scheduler;
+mod startup_containment;
 use liveness::{LeaseLiveness, lease_liveness, lease_may_be_live};
 #[cfg(test)]
 mod tests;

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -22,6 +22,15 @@ pub fn start_network_pool_metrics(
     task_tracker.spawn(run_loop(pool, shutdown_token, probe_firewall_counters));
 }
 
+/// One lease's identity. A reject is logged once per lease so operators can
+/// attribute `node_mgr.guest_udp443_packets{action:reject}` to a sandbox.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct RejectingLease {
+    sandbox_id: String,
+    slot: u32,
+    generation: u64,
+}
+
 struct GuestFirewallCounters {
     namespace: String,
     udp443: Option<(u64, GuestUdp443Action)>,
@@ -36,6 +45,7 @@ where
     let mut interval = tokio::time::interval(EMIT_INTERVAL);
     interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut previous_vlan_packets = HashMap::<String, u64>::new();
+    let mut reported_udp443_rejects = HashSet::<RejectingLease>::new();
     loop {
         tokio::select! {
             biased;
@@ -59,22 +69,42 @@ where
                     return;
                 }
             };
-            let samples = stream::iter(
-                records
-                    .into_iter()
-                    .filter(|r| matches!(r.state, SlotState::Leasing | SlotState::Leased)),
-            )
-            .map(|record| {
-                probe(
-                    crate::net::NetId::from_slot(record.info.slot).ns(),
-                    shutdown_token.clone(),
-                )
-            })
-            .buffer_unordered(PROBE_CONCURRENCY);
+            let active: Vec<RejectingLease> = records
+                .into_iter()
+                .filter(|r| matches!(r.state, SlotState::Leasing | SlotState::Leased))
+                .map(|record| RejectingLease {
+                    sandbox_id: record.info.sandbox_id,
+                    slot: record.info.slot,
+                    generation: record.info.generation,
+                })
+                .collect();
+            // Forget leases that ended so a reused slot reports its new owner.
+            reported_udp443_rejects.retain(|lease| active.contains(lease));
+            let samples = stream::iter(active)
+                .map(|lease| {
+                    let sample = probe(
+                        crate::net::NetId::from_slot(lease.slot).ns(),
+                        shutdown_token.clone(),
+                    );
+                    async move { (lease, sample.await) }
+                })
+                .buffer_unordered(PROBE_CONCURRENCY);
             futures_util::pin_mut!(samples);
             let (mut observed, mut rejected, mut vlan_packets) = (0_u64, 0_u64, 0_u64);
-            while let Some(sample) = samples.next().await {
+            while let Some((lease, sample)) = samples.next().await {
                 let Some(sample) = sample else { continue };
+                if let Some(packets) =
+                    first_udp443_reject(&mut reported_udp443_rejects, &lease, sample.udp443)
+                {
+                    tracing::warn!(
+                        sandbox_id = lease.sandbox_id,
+                        slot = lease.slot,
+                        slot_generation = lease.generation,
+                        namespace = sample.namespace,
+                        packets,
+                        "guest UDP/443 rejected; client must fall back to TCP"
+                    );
+                }
                 if let Some(packets) = sample.vlan_packets {
                     let previous = previous_vlan_packets
                         .insert(sample.namespace.clone(), packets)
@@ -111,6 +141,20 @@ where
             _ = pass => {},
         }
     }
+}
+
+/// Returns the reject count the first time a lease's UDP/443 reject counter is
+/// nonzero, and `None` on every later sample for that lease.
+fn first_udp443_reject(
+    reported: &mut HashSet<RejectingLease>,
+    lease: &RejectingLease,
+    udp443: Option<(u64, GuestUdp443Action)>,
+) -> Option<u64> {
+    let (packets, GuestUdp443Action::Reject) = udp443? else {
+        return None;
+    };
+    (packets > 0 && !lease.sandbox_id.is_empty() && reported.insert(lease.clone()))
+        .then_some(packets)
 }
 
 async fn probe_firewall_counters(
@@ -218,4 +262,39 @@ async fn shutdown_stops_a_bounded_pass_of_wedged_probes() {
         .unwrap()
         .unwrap();
     assert_eq!(started.load(Ordering::SeqCst), PROBE_CONCURRENCY);
+}
+
+#[cfg(test)]
+#[test]
+fn udp443_reject_is_reported_once_per_lease() {
+    let lease = |sandbox_id: &str, generation| RejectingLease {
+        sandbox_id: sandbox_id.to_owned(),
+        slot: 7,
+        generation,
+    };
+    let reject = |packets| Some((packets, GuestUdp443Action::Reject));
+    let mut reported = HashSet::new();
+    let first = lease("sbx-a", 1);
+
+    assert_eq!(first_udp443_reject(&mut reported, &first, None), None);
+    assert_eq!(first_udp443_reject(&mut reported, &first, reject(0)), None);
+    assert_eq!(
+        first_udp443_reject(&mut reported, &first, Some((5, GuestUdp443Action::Observe))),
+        None
+    );
+    assert_eq!(
+        first_udp443_reject(&mut reported, &first, reject(3)),
+        Some(3)
+    );
+    assert_eq!(first_udp443_reject(&mut reported, &first, reject(9)), None);
+    // A reused slot is a new lease and reports its own first reject.
+    let reused = lease("sbx-b", 2);
+    assert_eq!(
+        first_udp443_reject(&mut reported, &reused, reject(1)),
+        Some(1)
+    );
+    assert_eq!(
+        first_udp443_reject(&mut reported, &lease("", 3), reject(1)),
+        None
+    );
 }

@@ -4,6 +4,8 @@ use std::{fmt, str::FromStr};
 
 #[cfg(feature = "otel")]
 mod operation_names;
+#[cfg(feature = "otel")]
+mod status_messages;
 
 #[derive(Debug, thiserror::Error)]
 pub enum TraceInitError {
@@ -196,7 +198,9 @@ fn build_otlp_provider(
         .map_err(TraceInitError::Exporter)?;
     // The upstream builder honors OTEL_TRACES_SAMPLER and OTEL_BSP_*.
     Ok(SdkTracerProvider::builder()
-        .with_batch_exporter(operation_names::OperationNames::new(exporter))
+        .with_batch_exporter(status_messages::StatusMessages::new(
+            operation_names::OperationNames::new(exporter),
+        ))
         .with_resource(identity.trace_resource())
         .build())
 }

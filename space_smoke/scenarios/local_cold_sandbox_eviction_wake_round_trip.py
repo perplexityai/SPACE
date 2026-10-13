@@ -64,7 +64,7 @@ def cold_sandbox_eviction_wake_round_trip(test: smoke.KindEcw) -> None:
             command_stderr=written.stderr,
         )
         source = eviction.sandbox_placement()
-        worker = eviction.worker_pod(source)
+        worker = eviction.worker_node(source)
 
     with test.phase("that worker's sandbox-manager runs a smoke-sized eviction loop"):
         config = eviction.require_smoke_sized_loop(worker)

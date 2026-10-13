@@ -89,7 +89,7 @@ fn common_object_parent_stays_within_one_artifact_directory() {
 }
 
 #[derive(Default)]
-struct MockObjectStore {
+pub(super) struct MockObjectStore {
     heads: Mutex<VecDeque<Option<ObjectMeta>>>,
     body: Vec<u8>,
     head_calls: AtomicUsize,
@@ -98,7 +98,10 @@ struct MockObjectStore {
 }
 
 impl MockObjectStore {
-    fn new(heads: impl IntoIterator<Item = Option<ObjectMeta>>, body: impl Into<Vec<u8>>) -> Self {
+    pub(super) fn new(
+        heads: impl IntoIterator<Item = Option<ObjectMeta>>,
+        body: impl Into<Vec<u8>>,
+    ) -> Self {
         Self {
             heads: Mutex::new(heads.into_iter().collect()),
             body: body.into(),
@@ -116,7 +119,7 @@ impl MockObjectStore {
         self.head_calls.load(Ordering::SeqCst)
     }
 
-    fn put_calls(&self) -> usize {
+    pub(super) fn put_calls(&self) -> usize {
         self.put_calls.load(Ordering::SeqCst)
     }
 }
@@ -315,7 +318,7 @@ async fn streamed_pull_decodes_inline_and_never_double_decodes() {
         "decoded exactly once despite nested magic"
     );
     assert_eq!(
-        executor.codec_permits.available_permits(),
+        executor.codec.shared_available(),
         2,
         "streamed decode permit must be released"
     );
@@ -332,25 +335,33 @@ async fn streamed_pull_decodes_inline_and_never_double_decodes() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn memory_role_uses_sparse_output_regardless_of_persisted_mode() {
+async fn memory_and_luks_roles_use_sparse_output_regardless_of_persisted_mode() {
     const MEMORY_BYTES: usize = 8 * 1024 * 1024;
     let dir = tempfile::tempdir().unwrap();
     let mut expected = vec![0; MEMORY_BYTES];
     expected[31..34].copy_from_slice(b"ram");
     expected[MEMORY_BYTES / 2..MEMORY_BYTES / 2 + 4].copy_from_slice(b"live");
     let body = zstd::stream::encode_all(&expected[..], ZSTD_LEVEL).unwrap();
-    for (stream_decode_pulls, persisted_mode) in [true, false].into_iter().flat_map(|stream| {
-        [
-            MaterializationMode::Disabled,
-            MaterializationMode::Shadow,
-            MaterializationMode::Enabled,
-        ]
-        .into_iter()
-        .map(move |mode| (stream, mode))
+    for (artifact, stream_decode_pulls, persisted_mode) in [
+        SnapshotArtifact::Memory,
+        SnapshotArtifact::EncryptedSnapshotVolume,
+        SnapshotArtifact::EncryptedRootfsCow,
+    ]
+    .into_iter()
+    .flat_map(|artifact| {
+        [true, false].into_iter().flat_map(move |stream| {
+            [
+                MaterializationMode::Disabled,
+                MaterializationMode::Shadow,
+                MaterializationMode::Enabled,
+            ]
+            .into_iter()
+            .map(move |mode| (artifact, stream, mode))
+        })
     }) {
-        let local_path = dir
-            .path()
-            .join(format!("opaque-{stream_decode_pulls}-{persisted_mode}"));
+        let local_path = dir.path().join(format!(
+            "opaque-{artifact:?}-{stream_decode_pulls}-{persisted_mode}"
+        ));
         let meta = ObjectMeta {
             size: body.len() as u64,
             etag: Some(format!("\"memory-{stream_decode_pulls}-{persisted_mode}\"")),
@@ -373,7 +384,7 @@ async fn memory_role_uses_sparse_output_regardless_of_persisted_mode() {
             local_path: local_path.to_string_lossy().into_owned(),
             s3_uri: "s3://bucket/snapshots/a/memfile?region=us-east-2".to_string(),
             transfer_scope_id: None,
-            snapshot_artifact: Some(SnapshotArtifact::Memory),
+            snapshot_artifact: Some(artifact),
             materialization_mode: persisted_mode,
             rootfs_materialization_mode: None,
             staged_path: None,
@@ -402,7 +413,7 @@ async fn memory_role_uses_sparse_output_regardless_of_persisted_mode() {
         let physical_bytes = allocated_bytes(&local_path);
         assert!(
             physical_bytes < logical_bytes / 4,
-            "memory must use sparse output regardless of persisted mode: stream_decode={stream_decode_pulls} mode={persisted_mode} logical={logical_bytes} physical={physical_bytes}"
+            "{artifact:?} must use sparse output regardless of persisted mode: stream_decode={stream_decode_pulls} mode={persisted_mode} logical={logical_bytes} physical={physical_bytes}"
         );
     }
 }
@@ -684,7 +695,7 @@ async fn raw_pull_bypasses_streaming_and_keeps_wire_bytes() {
     assert_eq!(store.inner.get_calls(), 1, "raw pulls use the plain path");
 }
 
-fn test_creds() -> ObjectCredentials {
+pub(super) fn test_creds() -> ObjectCredentials {
     ObjectCredentials {
         access_key_id: "akid".to_string(),
         secret_access_key: "secret".to_string(),
@@ -903,7 +914,7 @@ fn rootfs_payload_requires_a_scoped_assignment() {
     );
 }
 
-fn test_target() -> ObjectTarget<'static> {
+pub(super) fn test_target() -> ObjectTarget<'static> {
     ObjectTarget {
         bucket: "bucket",
         key: "snapshots/a/snapshot.luks",
@@ -925,7 +936,7 @@ fn test_executor(store: Arc<dyn ObjectStore>) -> TransferExecutor {
     )
 }
 
-fn test_job(kind: &str) -> Job {
+pub(super) fn test_job(kind: &str) -> Job {
     Job {
         job_id: "019d84bd-280d-7331-99c6-b63377f3a3a2".parse().unwrap(),
         kind: kind.to_string(),
@@ -1063,7 +1074,7 @@ fn verified_payload(local_path: &Path) -> TransferPayload {
     }
 }
 
-fn push_payload(local_path: &Path) -> TransferPayload {
+pub(super) fn push_payload(local_path: &Path) -> TransferPayload {
     TransferPayload {
         subject_id: "sandbox:019d84bd-280d-7331-99c6-b63377f3a3a2".to_string(),
         local_path: local_path.to_string_lossy().into_owned(),
@@ -1113,6 +1124,7 @@ async fn push_rejects_truncated_durable_object() {
             &test_creds(),
             test_target(),
             None,
+            CancellationToken::new(),
         )
         .await;
 
@@ -1150,6 +1162,7 @@ async fn push_accepts_fully_durable_object() {
             &test_creds(),
             test_target(),
             None,
+            CancellationToken::new(),
         )
         .await
         .expect("a fully durable object must finalize successfully");
@@ -2074,7 +2087,7 @@ async fn codec_admission_bypasses_small_inputs() {
         .expect("bypass admission must not fail");
     assert!(permit.is_none(), "small inputs must skip admission");
     assert_eq!(
-        executor.codec_permits.available_permits(),
+        executor.codec.shared_available(),
         1,
         "a bypassed input must not consume a permit"
     );
@@ -2132,7 +2145,7 @@ async fn codec_decode_admission_takes_permit_on_unknown_size() {
         "unknown-size streaming frame must take a permit"
     );
     assert_eq!(
-        executor.codec_permits.available_permits(),
+        executor.codec.shared_available(),
         0,
         "the held permit must be consumed while alive"
     );
@@ -2236,8 +2249,8 @@ async fn codec_priority_reserve_zero_shares_one_pool() {
         executor.codec_priority_threshold.is_none(),
         "zero reserve must disable priority-aware admission"
     );
-    assert_eq!(executor.codec_permits.available_permits(), 3);
-    assert_eq!(executor.codec_priority_permits.available_permits(), 0);
+    assert_eq!(executor.codec.shared_available(), 3);
+    assert_eq!(executor.codec.reserve_available(), 0);
 }
 #[cfg(target_os = "linux")]
 #[test]
@@ -2526,6 +2539,37 @@ fn dirty_debt_below_low_watermark_does_not_start_writeback() {
     assert_eq!(
         stream_writeback_outstanding_bytes(&coordinator.budget),
         3 * MIB
+    );
+}
+
+#[test]
+fn complete_writeback_window_starts_before_budget_pressure() {
+    let operations = Arc::new(RecordingPageCacheOperations::default());
+    let coordinator = StreamWritebackCoordinator::new_with_page_cache_operations(
+        4 * STREAM_WRITEBACK_WINDOW_BYTES,
+        None,
+        operations.clone(),
+    );
+    coordinator
+        .reserve(STREAM_WRITEBACK_WINDOW_BYTES, JobPriority::default())
+        .unwrap();
+    coordinator.submit(
+        Arc::new(tempfile::tempfile().unwrap()),
+        0,
+        STREAM_WRITEBACK_WINDOW_BYTES,
+        STREAM_WRITEBACK_WINDOW_BYTES,
+        Arc::new(StreamPullTiming::default()),
+    );
+    wait_until(|| operations.start_count() == 1);
+    assert_eq!(
+        operations.wait_count(),
+        0,
+        "starting IO must not force a synchronous drain"
+    );
+    assert_eq!(
+        stream_writeback_outstanding_bytes(&coordinator.budget),
+        STREAM_WRITEBACK_WINDOW_BYTES,
+        "starting IO must not release the dirty-byte reservation before completion"
     );
 }
 
@@ -3798,11 +3842,11 @@ async fn shadow_comparison_skips_before_reflink_when_worker_is_busy() {
 #[tokio::test]
 async fn shadow_comparison_skips_when_shared_codec_capacity_is_busy() {
     let executor = test_executor(Arc::new(MockObjectStore::default()));
-    let shared_capacity = executor.codec_permits.available_permits();
-    let _held_codec_permits = Arc::clone(&executor.codec_permits)
-        .acquire_many_owned(shared_capacity.try_into().unwrap())
-        .await
-        .unwrap();
+    let shared_capacity = executor.codec.shared_available();
+    let mut held_codec_permits = Vec::new();
+    for _ in 0..shared_capacity {
+        held_codec_permits.push(executor.codec.acquire(CodecPriority::Normal).await.unwrap());
+    }
 
     assert!(
         executor.try_acquire_sparse_shadow_admission().is_none(),

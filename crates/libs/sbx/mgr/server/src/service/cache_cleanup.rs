@@ -104,6 +104,10 @@ pub(super) fn ensure_sandbox_cache_root_in(
     })
 }
 
+/// States whose row is not stale merely because it has no cache root or
+/// runtime directory. `Quarantined` is a hold whose local evidence may be
+/// gone; skipping it here also keeps every pass from taking its cleanup fence
+/// and a write transaction. The guarded delete refuses it independently.
 pub(super) fn sandbox_state_may_lack_cache_root(state: SandboxState) -> bool {
     matches!(
         state,
@@ -113,6 +117,7 @@ pub(super) fn sandbox_state_may_lack_cache_root(state: SandboxState) -> bool {
             | SandboxState::Restoring
             | SandboxState::CleanupRequired
             | SandboxState::CleanupFailed
+            | SandboxState::Quarantined
     )
 }
 
@@ -343,9 +348,12 @@ pub(super) enum CanonicalSuspendArtifactInspection {
     },
 }
 
+/// An unverified retained source is an error, so the orphan waits for a later
+/// pass instead of being classified.
 pub(super) fn inspect_canonical_suspend_artifact(
     cache_dir: &Path,
     sandbox_id: SandboxId,
+    verdicts: &crate::retained_source::RetainedSourceVerdicts,
 ) -> Result<CanonicalSuspendArtifactInspection, OrphanedSandboxRowMaterializationError> {
     let sandbox_id_string = sandbox_id.to_string();
     let sandbox_dir = cache_dir.join(&sandbox_id_string);
@@ -374,8 +382,7 @@ pub(super) fn inspect_canonical_suspend_artifact(
         }
         Err(error) => return Err(error.into()),
     };
-    match super::suspend_snapshot_publication::validate_suspend_snapshot_artifact_files(&metadata)
-    {
+    match metadata.validate_artifact_files(verdicts) {
         Ok(()) => match inspect_remote_restore_provenance(&snapshot_dir, sandbox_id)? {
             RemoteRestoreProvenanceInspection::Confirmed(restore_source) => {
                 Ok(CanonicalSuspendArtifactInspection::InterruptedRestore {
@@ -760,6 +767,9 @@ pub(super) struct InventoryOwnershipGuards<
     try_restore_staging_guard: StagingGuard,
     try_retirement: Retirement,
     observe_execution: &'a dyn Fn(SandboxId) -> Result<Option<ExecutionFence>, Status>,
+    /// Node-manager verdicts gathered before this pass. Without them, orphans
+    /// with retained sources wait for a pass that has them.
+    retained_sources: Option<&'a crate::retained_source::RetainedSourceVerdicts>,
 }
 
 impl<'a, CleanupGuard, StagingGuard> InventoryOwnershipGuards<'a, CleanupGuard, StagingGuard> {
@@ -773,6 +783,7 @@ impl<'a, CleanupGuard, StagingGuard> InventoryOwnershipGuards<'a, CleanupGuard, 
             try_restore_staging_guard,
             try_retirement: |_| Some(|| {}),
             observe_execution,
+            retained_sources: None,
         }
     }
 
@@ -785,7 +796,20 @@ impl<'a, CleanupGuard, StagingGuard> InventoryOwnershipGuards<'a, CleanupGuard, 
             try_restore_staging_guard: self.try_restore_staging_guard,
             try_retirement,
             observe_execution: self.observe_execution,
+            retained_sources: self.retained_sources,
         }
+    }
+}
+
+impl<'a, CleanupGuard, StagingGuard, Retirement>
+    InventoryOwnershipGuards<'a, CleanupGuard, StagingGuard, Retirement>
+{
+    pub(super) fn with_retained_sources(
+        mut self,
+        verdicts: &'a crate::retained_source::RetainedSourceVerdicts,
+    ) -> Self {
+        self.retained_sources = Some(verdicts);
+        self
     }
 }
 
@@ -1137,8 +1161,30 @@ where
         let has_live_runtime = observed_presence.has_live_runtime;
         let rootfs_size = rootfs_size_mb(paths.cache_dir, &sandbox_id.to_string());
         let cache_inspection = if has_cache_root && !has_live_runtime {
-            match inspect_canonical_suspend_artifact(paths.cache_dir, *sandbox_id) {
+            match inspect_canonical_suspend_artifact(
+                paths.cache_dir,
+                *sandbox_id,
+                guards.retained_sources.unwrap_or(&Default::default()),
+            ) {
                 Ok(inspection) => Some(inspection),
+                // Startup and cleanup reconciles carry no verdicts; periodic
+                // inventory inspects this orphan before its own pass.
+                Err(OrphanedSandboxRowMaterializationError::Validation(error))
+                    if error.is_pending() =>
+                {
+                    inventory_reconcile(
+                        InventoryReconcileOperation::OrphanMaterialization,
+                        InventoryReconcileOutcome::Deferred,
+                        InventoryReconcileReason::RetainedSourcePending,
+                    );
+                    tracing::debug!(
+                        source = %source,
+                        sandbox_id = %sandbox_id,
+                        %error,
+                        "deferring orphan materialization until its retained source is inspected"
+                    );
+                    continue;
+                }
                 Err(error) => {
                     inventory_reconcile(
                         InventoryReconcileOperation::OrphanMaterialization,
@@ -1346,10 +1392,7 @@ impl SandboxManagerService {
     fn orphan_execution_observer(
         &self,
     ) -> impl Fn(SandboxId) -> Result<Option<ExecutionFence>, Status> + use<> {
-        orphan_execution_observer(
-            pplx_space_node_mgr_client::lazy(),
-            self.shutdown_token.clone(),
-        )
+        orphan_execution_observer(self.node_manager.lazy(), self.shutdown_token.clone())
     }
 
     pub(super) fn reconcile_sandbox_inventory(

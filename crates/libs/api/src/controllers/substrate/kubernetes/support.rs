@@ -622,8 +622,8 @@ impl fmt::Display for StalePodReason {
     }
 }
 
-pub(super) fn terminal_pod_phase(status: Option<&PodStatus>) -> Option<TerminalPodPhase> {
-    match status.and_then(|status| status.phase.as_deref()) {
+pub(super) fn terminal_pod_phase(pod: &SandboxPodView) -> Option<TerminalPodPhase> {
+    match pod.phase() {
         Some("Succeeded") => Some(TerminalPodPhase::Succeeded),
         Some("Failed") => Some(TerminalPodPhase::Failed),
         _ => None,
@@ -636,11 +636,10 @@ pub(super) fn terminal_pod_phase(status: Option<&PodStatus>) -> Option<TerminalP
 /// pre-binding `Pending` with no IP) is treated as cache-stale so the
 /// reflector watch lag cannot stall callers that are already past the
 /// per-pod watch.
-pub(super) fn pod_status_is_settled(pod: &Pod) -> bool {
-    let status = pod.status.as_ref();
-    assigned_pod_ip(status).ok().flatten().is_some()
-        || terminal_pod_phase(status).is_some()
-        || pod_unschedulable_message(status).is_some()
+pub(super) fn pod_status_is_settled(pod: &SandboxPodView) -> bool {
+    assigned_pod_ip(pod).ok().flatten().is_some()
+        || terminal_pod_phase(pod).is_some()
+        || pod.unschedulable_message().is_some()
 }
 
 pub(super) fn execution_pod_create_in_flight(state: ActiveExecutionState) -> bool {
@@ -688,11 +687,11 @@ pub(super) enum PooledPodNodeGroup {
     Unreadable,
 }
 
-pub(super) fn pooled_pod_node_group(caches: &K8sCaches, pod: Option<&Pod>) -> PooledPodNodeGroup {
-    let Some(node_name) = pod
-        .and_then(|pod| pod.spec.as_ref())
-        .and_then(|spec| spec.node_name.as_deref())
-    else {
+pub(super) fn pooled_pod_node_group(
+    caches: &K8sCaches,
+    pod: Option<&SandboxPodView>,
+) -> PooledPodNodeGroup {
+    let Some(node_name) = pod.and_then(SandboxPodView::node_name) else {
         return PooledPodNodeGroup::Unreadable;
     };
     let Some(node) = caches.node_by_name(node_name) else {
@@ -762,7 +761,7 @@ pub(super) enum PooledPodAdmission {
 pub(super) fn pooled_pod_node_admission(
     caches: &K8sCaches,
     placement: &NodeGroupPlacement,
-    pod: Option<&Pod>,
+    pod: Option<&SandboxPodView>,
 ) -> PooledPodAdmission {
     // Defensive: the usability gate makes this unreachable from the only
     // production caller. `spec.nodeName` is written by the binding and kubelet
@@ -771,10 +770,7 @@ pub(super) fn pooled_pod_node_admission(
     // implies a bound node — and both sources here hand over one whole object,
     // so there is no torn read to produce the pair. Kept because it costs
     // nothing and the alternative is an `expect`.
-    let Some(node_name) = pod
-        .and_then(|pod| pod.spec.as_ref())
-        .and_then(|spec| spec.node_name.as_deref())
-    else {
+    let Some(node_name) = pod.and_then(SandboxPodView::node_name) else {
         return PooledPodAdmission::Unknown;
     };
     // Readiness is deliberately not consulted at all: a miss is `Unknown`
@@ -808,52 +804,44 @@ pub(super) fn pooled_pod_node_admission(
     }
 }
 
-pub(super) fn pooled_claim_pod_is_usable(claim: &PooledExecutionClaim, pod: Option<&Pod>) -> bool {
+pub(super) fn pooled_claim_pod_is_usable(
+    claim: &PooledExecutionClaim,
+    pod: Option<&SandboxPodView>,
+) -> bool {
     let Some(pod) = pod else {
         return false;
     };
-    let Some(status) = pod.status.as_ref() else {
-        return false;
-    };
 
-    pod.metadata.deletion_timestamp.is_none()
-        && status.phase.as_deref() == Some("Running")
+    !pod.is_deleting()
+        && pod.phase() == Some("Running")
         && claim.pod_uid.is_some()
-        && pod.metadata.uid.as_deref() == claim.pod_uid.as_ref().map(|uid| uid.as_str())
-        && status.pod_ip.as_deref() == Some(claim.pod_ip.as_str())
+        && pod.uid() == claim.pod_uid.as_ref().map(|uid| uid.as_str())
+        && pod.pod_ip() == Some(claim.pod_ip.as_str())
 }
 
 pub(super) fn stale_existing_pod_reason(
     sandbox: &Sandbox,
-    pod: &Pod,
+    pod: &SandboxPodView,
     suspend_restore_storage_uri: Option<&str>,
 ) -> Option<StalePodReason> {
-    let annotations = pod.metadata.annotations.as_ref();
     // Restore flips the DB lifecycle after the pod is created, so a restore
     // pod can be valid while the sandbox row still reads suspended.
-    let pod_is_restore_in_progress = annotations.is_some_and(|annotations| {
-        annotations.contains_key(SANDBOX_SUSPEND_RESTORE_STORAGE_URI_ANNOTATION)
-            || annotations.contains_key(SANDBOX_SUSPEND_RESTORE_SOURCE_NODE_ANNOTATION)
-    });
+    let pod_is_restore_in_progress = pod.has_annotation(SandboxPodKey::SuspendRestoreStorageUri)
+        || pod.has_annotation(SandboxPodKey::SuspendRestoreSourceNode);
     if is_suspended_lifecycle(&sandbox.lifecycle) && !pod_is_restore_in_progress {
         return Some(StalePodReason::SandboxSuspended);
     }
     let is_pending_local_only_restore = suspend_restore_storage_uri.is_some()
-        && annotations.is_some_and(|annotations| {
-            annotations.contains_key(SANDBOX_SUSPEND_RESTORE_SOURCE_NODE_ANNOTATION)
-                && !annotations.contains_key(SANDBOX_SUSPEND_RESTORE_STORAGE_URI_ANNOTATION)
-        })
-        && assigned_pod_ip(pod.status.as_ref())
-            .ok()
-            .flatten()
-            .is_none();
+        && pod.has_annotation(SandboxPodKey::SuspendRestoreSourceNode)
+        && !pod.has_annotation(SandboxPodKey::SuspendRestoreStorageUri)
+        && assigned_pod_ip(pod).ok().flatten().is_none();
     if is_pending_local_only_restore {
         return Some(StalePodReason::LocalOnlyRestoreNowPortable);
     }
-    if pod.metadata.deletion_timestamp.is_some() {
+    if pod.is_deleting() {
         return Some(StalePodReason::PodDeleting);
     }
-    terminal_pod_phase(pod.status.as_ref()).map(StalePodReason::TerminalPhase)
+    terminal_pod_phase(pod).map(StalePodReason::TerminalPhase)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -996,18 +984,6 @@ pub(super) fn retire_can_skip_backup_enqueue_error(err: &SubstrateError) -> bool
     }
 }
 
-pub(super) fn pod_unschedulable_message(status: Option<&PodStatus>) -> Option<&str> {
-    status
-        .and_then(|status| status.conditions.as_ref())?
-        .iter()
-        .find(|condition| {
-            condition.type_ == "PodScheduled"
-                && condition.status == "False"
-                && condition.reason.as_deref() == Some("Unschedulable")
-        })
-        .and_then(|condition| condition.message.as_deref().or(condition.reason.as_deref()))
-}
-
 /// The scheduler's first placement decision for a freshly-created pod.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum SchedulingOutcome {
@@ -1027,41 +1003,16 @@ pub(super) enum SchedulingOutcome {
 /// condition, and classifying that pod as unschedulable would let the re-drive
 /// path delete a pod that is no longer inert. The reverse misread cannot
 /// happen: `nodeName` is never set on an unbound pod.
-pub(super) fn scheduling_outcome_of(pod: &Pod) -> Option<SchedulingOutcome> {
+pub(super) fn scheduling_outcome_of(pod: &SandboxPodView) -> Option<SchedulingOutcome> {
     if let Some(node_name) = assigned_pod_node_name(pod) {
         return Some(SchedulingOutcome::Scheduled {
             node_name: node_name.to_string(),
         });
     }
-    if pod_unschedulable_message(pod.status.as_ref()).is_some() {
+    if pod.unschedulable_message().is_some() {
         return Some(SchedulingOutcome::Unschedulable);
     }
     None
-}
-
-/// Whether `pod` carries a **required** source-node pin — a
-/// `nodeAffinity.matchFields: metadata.name` term (the source-aware hard pin).
-/// Read from the live pod so a retry can tell a still-pinned restore pod (must
-/// re-drive) from one already re-driven cross-node (pin dropped, leave alone).
-pub(super) fn pod_has_required_source_pin(pod: &Pod) -> bool {
-    pod.spec
-        .as_ref()
-        .and_then(|spec| spec.affinity.as_ref())
-        .and_then(|affinity| affinity.node_affinity.as_ref())
-        .and_then(|node_affinity| {
-            node_affinity
-                .required_during_scheduling_ignored_during_execution
-                .as_ref()
-        })
-        .is_some_and(|selector| {
-            selector.node_selector_terms.iter().any(|term| {
-                term.match_fields.as_ref().is_some_and(|fields| {
-                    fields.iter().any(|field| {
-                        field.key == pplx_space_common_core::kubernetes::NODE_NAME_MATCH_FIELD
-                    })
-                })
-            })
-        })
 }
 
 /// Why is `CancelGuard` running its cleanup path? Lets `Drop` choose
@@ -1083,9 +1034,18 @@ pub(super) enum CancelCause {
     NodeMgrUnreachable,
 }
 
-/// Guard that cleans up the sandbox pod if the `create_execution` future is
-/// cancelled (dropped) before reaching a normal completion path — e.g. when
-/// the HTTP client disconnects and axum drops the handler.
+/// Guard that gives back what a `create_execution` call claimed when the call
+/// does not reach a normal completion path — a failure exit, or the future
+/// being cancelled (dropped), e.g. when the HTTP client disconnects and axum
+/// drops the handler. Its scope follows what the call can prove:
+///
+/// - claim armed, no pod create sent: no pod can exist, so it releases the
+///   claimed execution alone;
+/// - pod create in flight: the apiserver may have accepted a pod this call
+///   never learns, so it releases nothing and leaves the claim, which still
+///   names that pod, to reconciliation;
+/// - armed with the created pod: it retires the claim and deletes that pod by
+///   UID.
 pub(super) struct CancelGuard {
     sandbox_id: SandboxId,
     pod_name: String,
@@ -1094,7 +1054,13 @@ pub(super) struct CancelGuard {
     pod_uid: Option<PodUid>,
     k8s: Option<KubernetesState>,
     store: Option<K8sStore>,
+    /// Set once the pod create is sent and cleared once its pod arms the
+    /// guard; while set, nothing is released.
+    pod_create_in_flight: bool,
     cancel_tracker: Arc<CancelRateTracker>,
+    /// The substrate's tracker: graceful shutdown waits for the background
+    /// release or cleanup a dropped create leaves running.
+    task_tracker: TaskTracker,
     cause: CancelCause,
 }
 
@@ -1105,6 +1071,7 @@ impl CancelGuard {
         generation: i64,
         activation_attempt_id: SandboxActivationAttemptId,
         cancel_tracker: Arc<CancelRateTracker>,
+        task_tracker: TaskTracker,
     ) -> Self {
         Self {
             sandbox_id,
@@ -1114,17 +1081,66 @@ impl CancelGuard {
             pod_uid: None,
             k8s: None,
             store: None,
+            pod_create_in_flight: false,
             cancel_tracker,
+            task_tracker,
             cause: CancelCause::CallerDropped,
         }
     }
 
-    /// Arm the guard with cleanup resources. Called after the pod is created
-    /// so that cancellation before pod creation is a no-op.
+    /// Arm the guard for the execution claim alone. Called right after the
+    /// claim, so that every exit before the pod exists gives the claim back
+    /// without touching Kubernetes.
+    pub(super) fn arm_claim(&mut self, store: K8sStore) {
+        self.store = Some(store);
+    }
+
+    /// Called just before the pod create is sent. From here until its
+    /// response arrives, a pod this call cannot see may exist, and only the
+    /// claim's execution row still names it — so the guard stops releasing.
+    pub(super) fn begin_pod_create(&mut self) {
+        self.pod_create_in_flight = true;
+    }
+
+    /// Widen the guard to the pod. Called after the pod is created, so that
+    /// cancellation from here on also deletes the pod this call created.
     pub(super) fn arm(&mut self, k8s: KubernetesState, store: K8sStore, pod_uid: Option<PodUid>) {
         self.k8s = Some(k8s);
         self.store = Some(store);
         self.pod_uid = pod_uid;
+        self.pod_create_in_flight = false;
+    }
+
+    /// Give back the claim on a failure exit before the pod create is sent.
+    /// Awaited, so the caller's error is returned only after the claim is
+    /// released. The caller deletes its fresh sandbox row on that error; if the
+    /// delete fails or the request is cancelled, the row survives, and a later
+    /// data-plane access, start or wake must find it unclaimed rather than
+    /// join an activation that will never produce a pod. The guard keeps
+    /// ownership until the release has finished: if this await is cancelled,
+    /// its transaction rolls back and `Drop` runs the same fenced release in
+    /// the background instead.
+    ///
+    /// Only valid before `begin_pod_create()` and `arm()`: past them the
+    /// early return below drops the guard into the full `Drop` path.
+    pub(super) async fn release_claim(mut self) {
+        debug_assert!(
+            self.k8s.is_none() && !self.pod_create_in_flight,
+            "release_claim is only valid before the pod create is sent"
+        );
+        if self.k8s.is_some() || self.pod_create_in_flight {
+            return;
+        }
+        if let Some(store) = self.store.clone() {
+            release_claimed_execution(
+                store,
+                self.sandbox_id,
+                self.generation,
+                self.activation_attempt_id,
+            )
+            .await;
+        }
+        self.store = None;
     }
 
     /// Annotate the guard with the cause of the impending drop so `Drop`
@@ -1138,6 +1154,7 @@ impl CancelGuard {
     pub(super) fn defuse(mut self) {
         self.k8s = None;
         self.store = None;
+        self.pod_create_in_flight = false;
     }
 
     #[cfg(test)]
@@ -1149,6 +1166,43 @@ impl CancelGuard {
 impl Drop for CancelGuard {
     fn drop(&mut self) {
         let Some(k8s) = self.k8s.take() else {
+            let Some(store) = self.store.take() else {
+                return;
+            };
+            if self.pod_create_in_flight {
+                // The apiserver may have accepted the pod. Retiring the claim
+                // would drop the only record naming it, so leave the claim to
+                // the reconcilers that age out a `creating` sandbox.
+                tracing::warn!(
+                    sandbox_id = %self.sandbox_id,
+                    pod_name = %self.pod_name,
+                    "create_execution cancelled while its pod create was in flight — leaving \
+                     the claimed execution to reconciliation"
+                );
+                return;
+            }
+            // No pod create was sent, so there is nothing to delete and
+            // nothing that reaches node-mgr: release the claim alone, and leave
+            // the cancel-storm signal, which counts pod cleanups, untouched.
+            tracing::warn!(
+                sandbox_id = %self.sandbox_id,
+                pod_name = %self.pod_name,
+                "create_execution cancelled before its pod create was sent — releasing the \
+                 claimed execution"
+            );
+            self.task_tracker.spawn(
+                release_claimed_execution(
+                    store,
+                    self.sandbox_id,
+                    self.generation,
+                    self.activation_attempt_id,
+                )
+                .instrument(tracing::info_span!(
+                    "substrate.k8s.cancel_release_claim",
+                    sandbox_id = %self.sandbox_id,
+                    pod_name = %self.pod_name,
+                )),
+            );
             return;
         };
         let store = self.store.take();
@@ -1187,7 +1241,7 @@ impl Drop for CancelGuard {
             pod_name = %pod_name,
         );
 
-        tokio::spawn(
+        self.task_tracker.spawn(
             async move {
                 let Some(store) = store else {
                     return;
@@ -1246,6 +1300,36 @@ impl Drop for CancelGuard {
     }
 }
 
+/// Retire the execution a create claimed, fenced on its generation and
+/// activation attempt, when the create gives up before sending its pod
+/// create. This is the release the pod-create failure arm of
+/// `create_execution` runs, from the same database state. Fenced and
+/// idempotent: a repeat, or a release racing a newer execution, changes
+/// nothing.
+async fn release_claimed_execution(
+    store: K8sStore,
+    sandbox_id: SandboxId,
+    generation: i64,
+    activation_attempt_id: SandboxActivationAttemptId,
+) {
+    if let Err(error) = store
+        .forget_pod_tracking_if_generation_and_attempt(
+            sandbox_id,
+            generation,
+            activation_attempt_id,
+        )
+        .await
+    {
+        tracing::warn!(
+            sandbox_id = %sandbox_id,
+            generation,
+            error = %error,
+            "failed to release the Kubernetes execution claimed by a create that ended before \
+             its pod; leaving it to sandbox cleanup"
+        );
+    }
+}
+
 /// Split a requested readiness timeout into the outer backstop budget and
 /// the phase-aware inner deadline.
 ///
@@ -1261,11 +1345,9 @@ impl Drop for CancelGuard {
 /// before the node-RPC channel timeout severs the connection.
 pub(super) fn ready_wait_bounds(requested: Duration) -> (Duration, Instant) {
     // `READY_WAIT_PHASE_MARGIN < CREATE_READY_BUDGET` is statically
-    // asserted next to the constants, so neither expression can underflow
-    // or exceed the channel-safe budget.
-    let inner = requested.min(CREATE_READY_BUDGET - READY_WAIT_PHASE_MARGIN);
-    let outer = inner + READY_WAIT_PHASE_MARGIN;
-    (outer, Instant::now() + inner)
+    // asserted next to the constants, so neither bound can underflow or
+    // exceed the channel-safe budget.
+    SubstrateBudgets::DEFAULT.ready_wait_bounds(requested)
 }
 
 /// Time remaining until `phase_deadline`, zero once it has passed. Used to
@@ -1335,16 +1417,10 @@ pub(super) fn is_nodemgr_unreachable(err: &SubstrateError) -> bool {
         || m.contains("connection refused")
 }
 
-pub(super) fn assigned_pod_ip(status: Option<&PodStatus>) -> Result<Option<PodIp>, SubstrateError> {
-    status
-        .and_then(|status| status.pod_ip.as_deref())
-        .map(PodIp::parse)
-        .transpose()
+pub(super) fn assigned_pod_ip(pod: &SandboxPodView) -> Result<Option<PodIp>, SubstrateError> {
+    pod.pod_ip().map(PodIp::parse).transpose()
 }
 
-pub(super) fn assigned_pod_node_name(pod: &Pod) -> Option<&str> {
-    pod.spec
-        .as_ref()
-        .and_then(|spec| spec.node_name.as_deref())
-        .filter(|node_name| !node_name.is_empty())
+pub(super) fn assigned_pod_node_name(pod: &SandboxPodView) -> Option<&str> {
+    pod.node_name().filter(|node_name| !node_name.is_empty())
 }

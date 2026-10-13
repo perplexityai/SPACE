@@ -4,6 +4,8 @@
 
 use std::time::Instant;
 
+use pplx_space_common_core::types::NodeDrainMode;
+
 use crate::emit::{counter, elapsed_ms, gauge, tag, timing_ms};
 
 /// Transition between two `nodes.drain_phase` values (driven by the reconciler).
@@ -12,6 +14,17 @@ pub fn transition(from: &str, to: &str) {
         "node_drain.transitions",
         1,
         &[tag("from", from), tag("to", to)],
+    );
+}
+
+/// A draining node finished draining: [`transition`] from `draining` to
+/// `drained`, tagged with the drain's `mode` (`forced` evacuates residents,
+/// `gentle` waits for them to leave), which only this transition knows.
+pub fn drained(from: &str, to: &str, mode: NodeDrainMode) {
+    counter(
+        "node_drain.transitions",
+        1,
+        &[tag("from", from), tag("to", to), tag("mode", mode.as_str())],
     );
 }
 
@@ -160,11 +173,14 @@ pub fn clear_node_gauges(node_id: &str) {
 /// lifecycle the sandbox was in at evacuation start (`started` or
 /// `paused`), so the lifecycle-preserving paused path can be charted
 /// separately from the normal started path.
-pub fn sandbox_suspend_duration(started_at: Instant, pre_lifecycle: &str) {
+///
+/// `node` is the node being evacuated. Only forced drains evacuate, so the
+/// series needs no `mode`.
+pub fn sandbox_suspend_duration(started_at: Instant, node: &str, pre_lifecycle: &str) {
     timing_ms(
         "node_drain.sandbox_suspend_duration_ms",
         elapsed_ms(started_at),
-        &[tag("pre_lifecycle", pre_lifecycle)],
+        &[tag("node", node), tag("pre_lifecycle", pre_lifecycle)],
     );
 }
 

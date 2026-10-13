@@ -160,9 +160,8 @@ Persistence is handled where the sandbox's lifecycle changes, not per write.
   flush already running in the guest may predate the latest writes, so a busy
   guest is retried until this attempt's own flush runs. If the attempt fails
   or times out, the stop proceeds and records the `stop_guest_flush_failed`
-  event and the `sandbox.worker.stop.guest_flush` metric. A stop that comes
-  through the execution-release interface flushes the same way; a delete
-  never does.
+  event and the `sandbox.worker.stop.guest_flush` metric. A delete never
+  flushes; it discards the disk.
 - **Pause and suspend** prepare the guest for a VM snapshot, flushing its
   filesystems first, and fail rather than proceed without it. A successful
   suspend persists what the guest had written, with the snapshot.

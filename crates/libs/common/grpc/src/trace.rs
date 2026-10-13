@@ -71,7 +71,9 @@ impl MakeClassifier for GrpcClientMakeClassifier {
 
     fn make_classifier<B>(&self, request: &Request<B>) -> Self::Classifier {
         let path = request.uri().path();
-        let inner = if grpc_client_application_statuses_are_expected(path) {
+        let inner = if grpc_client_is_readiness_poll(path) {
+            GrpcErrorsAsFailures::new().with_success(GrpcCode::FailedPrecondition)
+        } else if grpc_client_application_statuses_are_expected(path) {
             grpc_application_status_classifier()
         } else if grpc_client_not_found_is_expected(path) {
             GrpcErrorsAsFailures::new().with_success(GrpcCode::NotFound)
@@ -184,6 +186,17 @@ impl ClassifyEos for GrpcClientEosClassifier {
     fn classify_error<E: std::fmt::Display + 'static>(self, error: &E) -> Self::FailureClass {
         GrpcClientFailureClass::new(self.inner.classify_error(error), self.service_port_ingress)
     }
+}
+
+/// A readiness poll answers FAILED_PRECONDITION until the sandbox has booted.
+/// That "not ready yet" is the expected answer, not a failed call, so it is
+/// classified as success in the response and in the trailers alike.
+fn grpc_client_is_readiness_poll(path: &str) -> bool {
+    matches!(
+        path,
+        "/space.node.api.v1.WorkerApi/SpacedWaitReady"
+            | "/space.sandbox.manager.v1.SandboxManager/SpacedWaitReady"
+    )
 }
 
 fn grpc_client_not_found_is_expected(path: &str) -> bool {
@@ -318,6 +331,10 @@ impl OnFailure<GrpcClientFailureClass> for GrpcClientOnFailure {
                 let tonic_code = tonic::Code::from_i32(numeric);
                 let name = tonic_code.description();
                 span.record("rpc.grpc.status_code", numeric);
+                // Every status that reaches here marks the client span ERROR,
+                // application statuses included. The code goes first: recording
+                // it after the description would clear the message.
+                span.record("otel.status_code", "ERROR");
                 span.record("otel.status_description", name);
                 if !failure.is_error {
                     tracing::debug!(
@@ -332,7 +349,6 @@ impl OnFailure<GrpcClientFailureClass> for GrpcClientOnFailure {
                     return;
                 }
 
-                span.record("otel.status_code", "ERROR");
                 tracing::error!(
                     target: "grpc.client",
                     rpc_log_side = "client",

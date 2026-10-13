@@ -1426,6 +1426,8 @@ use responses::*;
 pub(crate) use org::sandbox_matches_federated_owner;
 pub use org::{SandboxAccessScope, SandboxPageCursor};
 pub(crate) use queries::org_byok_enabled;
+#[cfg(test)]
+pub(crate) use queries::pooled_prepare_error_is_reclaimable;
 pub use queries::{FederatedSandboxCreateContext, RestoreForkDiskAsNewContext};
 pub use responses::{
     fetch_sandbox, sandbox_query, sandbox_to_response, update_and_fetch_post_wake_sandbox,

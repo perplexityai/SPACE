@@ -1,6 +1,7 @@
 use pplx_space_common_core::types::SandboxId;
 
 use k8s_openapi::api::core::v1::Pod;
+use pplx_space_api::controllers::substrate::kubernetes::SandboxPodView;
 use pplx_space_cluster_pool::PoolSlot;
 use pplx_space_common_core::kubernetes::{
     NodeGroupPlacement, SandboxPodCommon, SandboxPodConfigValues, SandboxPodRequest,
@@ -62,23 +63,15 @@ pub fn build_pool_pod(
     )
 }
 
-pub fn ready_pod_metadata(pod: &Pod) -> Option<ReadyPodMetadata> {
-    if pod.metadata.deletion_timestamp.is_some() {
-        return None;
-    }
-
-    let status = pod.status.as_ref()?;
-    if status.phase.as_deref() != Some("Running") {
-        return None;
-    }
-    if !pod_ready(status.conditions.as_deref()) {
+pub fn ready_pod_metadata(pod: &SandboxPodView) -> Option<ReadyPodMetadata> {
+    if pod.is_deleting() || pod.phase() != Some("Running") || !pod.is_ready() {
         return None;
     }
 
     Some(ReadyPodMetadata {
-        uid: pod.metadata.uid.clone()?,
-        pod_ip: status.pod_ip.clone()?,
-        node_name: pod.spec.as_ref()?.node_name.clone()?,
+        uid: pod.uid()?.to_owned(),
+        pod_ip: pod.pod_ip()?.to_owned(),
+        node_name: pod.node_name()?.to_owned(),
     })
 }
 

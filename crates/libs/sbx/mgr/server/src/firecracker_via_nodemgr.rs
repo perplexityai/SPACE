@@ -5,6 +5,8 @@ use pplx_space_node_mgr_client::proto::{
 use pplx_space_node_runtime_core::fc_api::FirecrackerVmState;
 use std::time::Duration;
 
+use crate::node_manager_transport::NodeManagerConnector;
+
 const FIRECRACKER_VM_STATE_RPC_TIMEOUT: Duration = Duration::from_millis(500);
 
 #[derive(Debug, thiserror::Error)]
@@ -20,10 +22,11 @@ pub(crate) enum FirecrackerStateReadError {
 
 async fn get_firecracker_vm_state_inner(
     sandbox_id: SandboxId,
+    node_manager: &NodeManagerConnector,
 ) -> Result<FirecrackerVmState, FirecrackerStateReadError> {
     // Reuse the reconnecting channel; the outer read deadline also covers
     // channel readiness after a node-manager restart.
-    let mut client = pplx_space_node_mgr_client::lazy();
+    let mut client = node_manager.lazy();
     let response = client
         .get_firecracker_vm_state(GetFirecrackerVmStateRequest {
             sandbox_id: sandbox_id.to_string(),
@@ -54,9 +57,10 @@ where
 
 pub(crate) async fn get_firecracker_vm_state(
     sandbox_id: SandboxId,
+    node_manager: &NodeManagerConnector,
 ) -> Result<FirecrackerVmState, FirecrackerStateReadError> {
     bounded_firecracker_vm_state_read(
-        get_firecracker_vm_state_inner(sandbox_id),
+        get_firecracker_vm_state_inner(sandbox_id, node_manager),
         FIRECRACKER_VM_STATE_RPC_TIMEOUT,
     )
     .await

@@ -1,0 +1,213 @@
+{{- $ctx := dict "ctx" . "component" "build-manager" -}}
+{{- if ne (include "space-node-service.role" .) "builder" -}}
+{{- fail "build-manager runs on builder nodes only: set node.role=builder" -}}
+{{- end -}}
+{{- if le (int .Values.terminationGracePeriodSeconds) (int .Values.drainTimeoutSeconds) -}}
+{{- fail "terminationGracePeriodSeconds must exceed drainTimeoutSeconds" -}}
+{{- end -}}
+{{- /* build-manager's own trace exporter override, on a copy of the values
+       the shared telemetry environment reads. */ -}}
+{{- $envCtx := dict "Values" (mergeOverwrite (deepCopy .Values) (dict "telemetry" (dict "traceExporter" (.Values.traceExporter | default .Values.telemetry.traceExporter)))) -}}
+{{- $db := "/space/run/build-manager/build-manager.db" -}}
+{{- include "space-node-service.serviceAccount" $ctx }}
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "space-node-service.name" $ctx }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "space-node-service.labels" $ctx | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "space-node-service.selectorLabels" $ctx | nindent 6 }}
+  # Delete first. build-manager has no service mutex: it recovers the node's
+  # jobs from its SQLite database under /space/run and starts its queue
+  # before binding its listener (crates/libs/build/mgr/server/src/run.rs), so
+  # a second instance on the node, binding its own pod address, would run
+  # the same jobs beside the first.
+  {{- include "space-node-service.updateStrategy" (dict "strategy" "deleteFirst") | nindent 2 }}
+  template:
+    metadata:
+      annotations:
+        {{- include "space-node-service.podAnnotations" $ctx | nindent 8 }}
+        # build-manager logs the build VM's command output, which can carry
+        # user secrets even when step descriptions are safe. Keep this
+        # container out of the local Datadog Agent's container-collect-all.
+        ad.datadoghq.com/build-manager.logs_exclude: "true"
+      labels:
+        {{- include "space-node-service.labels" $ctx | nindent 8 }}
+    spec:
+      {{- include "space-node-service.nodeSelector" $ctx | nindent 6 }}
+      serviceAccountName: {{ include "space-node-service.name" $ctx }}
+      # The ClusterApi token is projected below; no Kubernetes API access.
+      automountServiceAccountToken: false
+      # Pod network: build-manager needs nothing from the node's network
+      # namespace. SSH into build VMs runs inside `nsenter --net` on the VM's
+      # namespace handle (crates/libs/build/mgr/src/ssh.rs); its other peers
+      # are Unix sockets, ClusterApi, the object store and registries. Its
+      # one ClusterApi read that internal-api scopes by source address
+      # (FindTemplateReleaseByHash, publish.rs) only checks for an existing
+      # upload, and an org-private base is resolved by template-manager, not
+      # by build-manager. node-api reaches it through the node-local Service
+      # below.
+      # Host PID: after asking the guest to exit, build-manager waits for the
+      # Firecracker pid sandbox-manager reports, a host-namespace pid, by
+      # checking /proc/<pid> (is_process_alive, crates/libs/build/mgr/src/vm.rs;
+      # the shutdown wait in lib.rs). In its own PID namespace the pid is
+      # never there and the wait ends at once.
+      hostPID: true
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds | int }}
+      initContainers:
+        # build-manager does not migrate its SQLite database itself
+        # (crates/libs/build/mgr/server/src/lib.rs), so its schema is applied
+        # here, as root like the service, in its root-only state directory.
+        - name: migrate-sqlite
+          {{- include "space-node-service.image" . | nindent 10 }}
+          command:
+            - /bin/sh
+            - -ec
+            - |
+              install -d -m 0750 -o 0 -g 0 /space/run/build-manager
+              exec /opt/space/bin/space-db-migrator build-manager --database-path {{ $db }} up
+          securityContext:
+            runAsUser: 0
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            {{- include "space-node-service.mount.run" . | nindent 12 }}
+      containers:
+        - name: build-manager
+          {{- include "space-node-service.image" . | nindent 10 }}
+          command:
+            - /opt/space/bin/space-buildmgr-svc
+            - --max-concurrent-builds={{ .Values.maxConcurrentBuilds }}
+            - --db={{ $db }}
+            - --drain-timeout-seconds={{ .Values.drainTimeoutSeconds }}
+            - --listen={{ .Values.listen }}
+          # Privileged root: build-manager loop-mounts the seed and target
+          # images and bind-mounts containerd snapshots to assemble OCI
+          # rootfs (crates/libs/build/mgr/src/oci/{assembly,containerd}.rs),
+          # drives the node's containerd, and enters build VMs' network
+          # namespaces to SSH in (crates/libs/build/mgr/src/ssh.rs).
+          securityContext:
+            privileged: true
+          env:
+            {{- include "space-node-service.env.identity" $envCtx | nindent 12 }}
+            {{- include "space-node-service.env.clusterApi" . | nindent 12 }}
+            # The BuildManager listener's TLS identity
+            # (space-builder-build-manager, docs/internal-rpc-tls.md).
+            {{- include "space-node-service.env.rpcIdentity" . | nindent 12 }}
+            {{- include "space-node-service.env.internalToken" . | nindent 12 }}
+            {{- include "space-node-service.env.diskAdmission" . | nindent 12 }}
+            {{- include "space-node-service.env.objectStoreCredentials" . | nindent 12 }}
+            - name: SPACE_OBJECT_STORE_BUCKET
+              value: {{ .Values.objectStore.bucket | quote }}
+            - name: SPACE_OBJECT_STORE_REGION
+              value: {{ .Values.node.objectStore.region | quote }}
+            - name: SPACE_OBJECT_STORE_ENDPOINT
+              value: {{ .Values.node.objectStore.endpoint | quote }}
+            - name: SPACE_OBJECT_STORE_MULTIPART_CONCURRENCY
+              value: {{ .Values.objectStore.multipartConcurrency | quote }}
+            - name: SPACE_OBJECT_STORE_MULTIPART_PART_SIZE_BYTES
+              value: {{ .Values.objectStore.multipartPartSizeBytes | int64 | quote }}
+            - name: SPACE_BUILDER_BLOB_MIN_AVAILABLE_BYTES
+              value: {{ .Values.blob.minAvailableBytes | quote }}
+          startupProbe:
+            exec:
+              command: ["/opt/space/bin/grpc_health_probe", "-addr={{ .Values.probeAddr }}", "-tls", "-tls-ca-cert=/etc/space-rpc-ca/ca.crt", "-tls-server-name=space-builder-build-manager", "-service=build.manager.v1.BuildManager", "-connect-timeout=2s"]
+            periodSeconds: 5
+            failureThreshold: 60
+          # NOT_SERVING once the drain starts.
+          readinessProbe:
+            exec:
+              command: ["/opt/space/bin/grpc_health_probe", "-addr={{ .Values.probeAddr }}", "-tls", "-tls-ca-cert=/etc/space-rpc-ca/ca.crt", "-tls-server-name=space-builder-build-manager", "-service=build.manager.v1.BuildManager", "-connect-timeout=2s"]
+            periodSeconds: 5
+            failureThreshold: 6
+          livenessProbe:
+            exec:
+              command: ["/opt/space/bin/grpc_health_probe", "-addr={{ .Values.probeAddr }}", "-tls", "-tls-ca-cert=/etc/space-rpc-ca/ca.crt", "-tls-server-name=space-builder-build-manager", "-connect-timeout=3s"]
+            periodSeconds: 20
+            failureThreshold: 3
+          volumeMounts:
+            {{- include "space-node-service.mount.run" . | nindent 12 }}
+            # Registers each built template and release through ClusterApi
+            # (crates/libs/build/mgr/src/publish.rs).
+            {{- include "space-node-service.mount.clusterApiToken" . | nindent 12 }}
+            {{- include "space-node-service.mount.rpcCa" . | nindent 12 }}
+            {{- include "space-node-service.mount.rpcIdentity" . | nindent 12 }}
+            # No propagation: build-manager reads only plain files and
+            # subvolumes under /space/cache (the build sandbox's rootfs, its
+            # own work dirs), none of them mounted by someone else after it
+            # starts, and its OCI-rootfs, assembly and snapshot-view mounts
+            # under /space/cache/firecracker/builds must stay in this pod's
+            # mount namespace, never in the node's mount table
+            # (crates/libs/build/mgr/src/oci/{assembly,containerd}.rs).
+            {{- include "space-node-service.mount.cache" (dict "propagation" "None") | nindent 12 }}
+            # HostToContainer: each build VM's network-namespace handle is a
+            # bind mount node-manager makes on the node after build-manager
+            # started (crates/libs/node/mgr/server/src/net/linux.rs); without
+            # propagation the pod would see only the empty placeholder file and
+            # `nsenter --net` into the VM would fail (build/mgr/src/ssh.rs).
+            - name: netns
+              mountPath: /var/run/netns
+              mountPropagation: HostToContainer
+            # The node's containerd: image pulls and snapshot views for OCI
+            # builds, and the scratch-build container (crates/libs/build/mgr/src/oci/containerd.rs).
+            - name: containerd-run
+              mountPath: /run/containerd
+            - name: containerd-lib
+              mountPath: /var/lib/containerd
+            - name: sandbox-ssh
+              mountPath: /root/.ssh
+              readOnly: true
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+      volumes:
+        {{- include "space-node-service.volume.run" . | nindent 8 }}
+        {{- include "space-node-service.volume.cache" . | nindent 8 }}
+        {{- include "space-node-service.volume.clusterApiToken" . | nindent 8 }}
+        {{- include "space-node-service.volume.rpcCa" . | nindent 8 }}
+        {{- include "space-node-service.volume.rpcIdentity" (dict "secret" "space-build-manager-tls") | nindent 8 }}
+        - name: netns
+          hostPath:
+            path: /var/run/netns
+            type: DirectoryOrCreate
+        - name: containerd-run
+          hostPath:
+            path: /run/containerd
+            type: Directory
+        - name: containerd-lib
+          hostPath:
+            path: /var/lib/containerd
+            type: Directory
+        - name: sandbox-ssh
+          secret:
+            secretName: {{ .Values.sandboxSsh.secretName }}
+            defaultMode: 0400
+---
+# node-api reaches its own node's build-manager by the name its TLS leaf
+# carries (space-builder-build-manager, internal-rpc-tls.sh). Local: jobs live
+# in the node's SQLite under /space/run, and node-api stamps its own node as
+# the builder, so a call must never reach another node's build-manager
+# (crates/libs/node/api/server/src/builder.rs).
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Values.serviceName }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "space-node-service.labels" $ctx | nindent 4 }}
+spec:
+  internalTrafficPolicy: Local
+  selector:
+    {{- include "space-node-service.selectorLabels" $ctx | nindent 4 }}
+  ports:
+    - name: grpc
+      port: 9900
+      targetPort: 9900

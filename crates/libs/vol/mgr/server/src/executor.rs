@@ -1,3 +1,9 @@
+mod stream_push;
+use stream_push::StreamPushConfig;
+pub use stream_push::{
+    DEFAULT_STREAM_PUSH_BUFFER_BUDGET_BYTES, SnapshotUploadMode, StreamingPushBudget,
+};
+
 use pplx_space_common_core::types::JobId;
 
 use std::collections::HashMap;
@@ -11,6 +17,9 @@ use std::time::Instant;
 use std::os::unix::fs::PermissionsExt;
 
 use crate::artifact::ArtifactEntryRole;
+use crate::codec_admission::{
+    CodecAdmission, CodecAdmissionClosed, CodecPermit, CodecPriority, CodecSlot,
+};
 use crate::credentials::{StorageAccess, UnwrapDekError, exchange_credentials, unwrap_dek};
 use crate::crypto::{self, CryptoError, decrypted_sibling, encrypted_sibling};
 use dashmap::DashMap;
@@ -274,7 +283,12 @@ fn effective_materialization_mode(
 ) -> MaterializationMode {
     if matches!(
         artifact,
-        Some(SnapshotArtifact::Memory | SnapshotArtifact::Rootfs)
+        Some(
+            SnapshotArtifact::Memory
+                | SnapshotArtifact::Rootfs
+                | SnapshotArtifact::EncryptedSnapshotVolume
+                | SnapshotArtifact::EncryptedRootfsCow
+        )
     ) {
         requested
     } else {
@@ -286,7 +300,17 @@ fn execution_materialization_mode(
     artifact: Option<SnapshotArtifact>,
     requested: MaterializationMode,
 ) -> MaterializationMode {
-    let requested = if artifact == Some(SnapshotArtifact::Memory) {
+    // LUKS backings contain literal zero regions outside their written encrypted
+    // sectors. Exact-zero materialization preserves the ciphertext and logical
+    // length, including when retrying jobs persisted before sparse support.
+    let requested = if matches!(
+        artifact,
+        Some(
+            SnapshotArtifact::Memory
+                | SnapshotArtifact::EncryptedSnapshotVolume
+                | SnapshotArtifact::EncryptedRootfsCow
+        )
+    ) {
         MaterializationMode::Enabled
     } else {
         requested
@@ -1001,7 +1025,7 @@ fn ensure_pull_failure_reason(error: JobError) -> JobError {
 /// burning CPU.
 async fn compress_to_temp(
     src: &Path,
-    codec_permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    codec_permit: Option<CodecPermit>,
 ) -> Result<(PathBuf, u64), JobError> {
     let original_size = tokio::fs::metadata(src)
         .await
@@ -1325,7 +1349,7 @@ async fn decompress_in_place(
     path: &Path,
     snapshot_artifact: Option<SnapshotArtifact>,
     requested_mode: MaterializationMode,
-    codec_permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    codec_permit: Option<CodecPermit>,
 ) -> Result<DecompressionReport, JobError> {
     let snapshot_artifact = snapshot_artifact.or_else(|| snapshot_artifact_from_local_path(path));
     let mode = effective_materialization_mode(snapshot_artifact, requested_mode);
@@ -1431,9 +1455,9 @@ fn should_ignore_chmod_permission_denied(
 
 /// Buffered writer size between the (optional) zstd decoder and the
 /// destination file when decrypt + decompress run back-to-back on the
-/// pull side. Same sizing rationale as
-/// [`ENCRYPT_PUSH_READ_BUF_BYTES`].
-const DECRYPT_PULL_WRITE_BUF_BYTES: usize = 64 * 1024;
+/// pull side. Match the decoder output window to batch file writes and their
+/// accounting. Both buffers remain bounded per admitted decoder.
+const DECRYPT_PULL_WRITE_BUF_BYTES: usize = 1024 * 1024;
 
 // Submit decoded output to the process-wide writeback worker in the same
 // increments used by ranged downloads. Writers share one byte budget, so
@@ -1929,6 +1953,16 @@ impl StreamWritebackCoordinator {
                         Ok(StreamWritebackCommand::Range(range)) if writeback_enabled => {
                             let activation_timing = Arc::clone(&range.timing);
                             queue_stream_writeback_range(&mut pending, range);
+                            // Overlap complete dirty windows with decoding even
+                            // below the pressure watermark. Keep their debt
+                            // charged until the existing completion/drain path.
+                            start_pending_stream_writeback_ranges(
+                                &mut pending,
+                                &worker_budget,
+                                page_cache_operations.as_ref(),
+                                &mut writeback_enabled,
+                                writeback_window_bytes,
+                            );
                             if pending_stream_writeback_debt(&pending) >= low_watermark_bytes {
                                 let newly_activated = !pressure_active;
                                 if !pressure_active {
@@ -2685,7 +2719,11 @@ where
                     std::io::BufWriter::with_capacity(DECRYPT_PULL_WRITE_BUF_BYTES, sink);
                 let raw_decoder = zstd::stream::raw::Decoder::new()
                     .map_err(|e| std::io::Error::other(format!("zstd decoder init: {e}")))?;
-                let mut decoder = zstd::stream::zio::Writer::new(buf_writer, raw_decoder);
+                let mut decoder = zstd::stream::zio::Writer::new_with_capacity(
+                    buf_writer,
+                    raw_decoder,
+                    DECRYPT_PULL_WRITE_BUF_BYTES,
+                );
                 decoder.write_all(&prefix)?;
                 if !suffix.is_empty() {
                     decoder.write_all(suffix)?;
@@ -2997,16 +3035,6 @@ impl pplx_space_object_store::FinishingWrite for StreamDecodeSink {
     }
 }
 
-/// The one way codec admission can fail: the executor-owned permit pool
-/// closed. Unreachable in practice (the pool lives for the process), typed
-/// so the failure crosses the object-store boundary as a source error
-/// rather than a string.
-#[derive(Debug, thiserror::Error)]
-enum CodecAdmitError {
-    #[error("codec permit pool closed")]
-    PoolClosed,
-}
-
 /// Codec admission bridge for streaming-decode pulls: one permit spans the
 /// whole overlapped download+decode. The streamed path only runs for
 /// ranged-size objects, whose decode cannot be proven small before the
@@ -3031,15 +3059,14 @@ impl pplx_space_object_store::DecodeAdmission for StreamedPullAdmission<'_> {
         pplx_space_object_store::DecodeAdmissionError,
     > {
         let wait_started = Instant::now();
+        // Typed so the failure crosses the object-store boundary as a source
+        // error rather than a string.
         let permit = self
             .executor
-            .acquire_codec_permit(self.priority)
+            .codec
+            .acquire(self.executor.codec_priority(self.priority))
             .await
-            .map_err(|_closed| {
-                pplx_space_object_store::DecodeAdmissionError::admission(
-                    CodecAdmitError::PoolClosed,
-                )
-            })?;
+            .map_err(pplx_space_object_store::DecodeAdmissionError::admission)?;
         emit_transfer_phase_duration(
             self.kind,
             self.artifact,
@@ -3077,7 +3104,7 @@ async fn stage_decrypted_temp(
     ciphertext_path: &Path,
     options: DecryptedPullOptions,
     resolved_dek: Option<&[u8]>,
-    codec_permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    codec_permit: Option<CodecPermit>,
 ) -> Result<(PathBuf, bool, DecompressionReport), (PathBuf, JobError)> {
     let DecryptedPullOptions {
         decompress_if_zstd,
@@ -3308,9 +3335,9 @@ async fn apply_file_mode(
 /// with zstd before upload and transparently decompressing on download.
 ///
 /// **Push with compression:**
-/// The file is compressed to a sibling `.zst.tmp` file before upload. The
-/// S3 key is unchanged — the object's bytes are compressed, but the key path
-/// stays the same. The temp file is always deleted after the upload attempt.
+/// Eligible staged snapshots can stream compression directly to S3; other
+/// sources use a sibling `.zst.tmp` file, removed after the upload attempt.
+/// Either path preserves the S3 key and compressed-object format.
 ///
 /// **Pull with compression awareness:**
 /// After download the first 4 bytes are checked for the zstd frame magic. If
@@ -3320,18 +3347,18 @@ async fn apply_file_mode(
 /// `Clone` is cheap — `S3ObjectStore` is internally `Arc`-wrapped.
 #[derive(Clone)]
 pub struct TransferExecutor {
+    node_manager: Option<pplx_space_node_mgr_client::NodeManagerGrpcClient>,
     store: Arc<dyn ObjectStore>,
     config: TransferExecutorConfig,
     destination_pull_locks: DestinationPullLocks,
-    /// Shared codec pool — every job may draw on it.
-    codec_permits: Arc<tokio::sync::Semaphore>,
-    /// Codec pool reserved for high-priority jobs; empty when priority-aware
-    /// admission is disabled.
-    codec_priority_permits: Arc<tokio::sync::Semaphore>,
-    /// Priority at or above which a job may draw on `codec_priority_permits`;
+    /// Admission for CPU-bound codec passes, with an optional reserve for
+    /// high-priority jobs.
+    codec: CodecAdmission,
+    /// Priority at or above which a job may draw on the codec reserve;
     /// `None` disables priority-aware admission.
     codec_priority_threshold: Option<JobPriority>,
     stream_writeback: Arc<StreamWritebackCoordinator>,
+    stream_push: Option<StreamPushConfig>,
     shadow_staging_dir: PathBuf,
     shadow_comparison_permits: Arc<tokio::sync::Semaphore>,
     shadow_comparisons: ShadowComparisonController,
@@ -3407,7 +3434,7 @@ struct SparseShadowTask {
 
 struct SparseShadowAdmission {
     _shadow_permit: tokio::sync::OwnedSemaphorePermit,
-    _codec_permit: tokio::sync::OwnedSemaphorePermit,
+    _codec_permit: CodecPermit,
 }
 
 fn sparse_shadow_disk_floor_bytes(status: pplx_space_common_core::host::disk::DiskStatus) -> u64 {
@@ -3435,6 +3462,10 @@ async fn remove_sparse_shadow_snapshot(path: &Path, reason: &'static str) {
     }
 }
 
+fn codec_admission_closed(closed: CodecAdmissionClosed) -> JobError {
+    JobError::Retriable(closed.to_string())
+}
+
 /// Executor tuning resolved by the volume-manager binary and passed into the
 /// service. Groups the knobs that the transfer executor needs so the service
 /// constructor stays narrow.
@@ -3442,6 +3473,8 @@ async fn remove_sparse_shadow_snapshot(path: &Path, reason: &'static str) {
 pub struct TransferExecutorConfig {
     /// Compress snapshot files with zstd before uploading to S3.
     pub compress: bool,
+    /// Deployment upload policy with one shared streaming-buffer budget.
+    pub snapshot_upload_mode: SnapshotUploadMode,
     /// Maximum concurrent CPU-bound zstd passes (compress or decompress).
     /// `0` auto-sizes to the CPU quota. See [`resolved_codec_concurrency`].
     pub codec_concurrency: usize,
@@ -3482,19 +3515,14 @@ impl TransferExecutor {
         shadow_staging_dir: PathBuf,
     ) -> Self {
         let total = resolved_codec_concurrency(config.codec_concurrency);
-        // Reserve from the total, never more than total-1 so the shared
-        // pool keeps at least one permit for low-priority work.
-        let reserve = config.codec_priority_reserve.min(total.saturating_sub(1));
-        let shared = total - reserve;
+        let codec = CodecAdmission::new(total, config.codec_priority_reserve);
         let stream_writeback_priority_threshold = config.codec_priority_threshold;
         // Priority-aware admission only engages when there is both a
         // threshold and a non-empty reserve; otherwise everything shares
         // one pool exactly as before.
-        let codec_priority_threshold = if reserve > 0 {
-            config.codec_priority_threshold
-        } else {
-            None
-        };
+        let codec_priority_threshold = config
+            .codec_priority_threshold
+            .filter(|_| codec.has_reserve());
         let stream_writeback_budget_bytes = if config.stream_writeback_budget_bytes == 0 {
             DEFAULT_STREAM_WRITEBACK_BUDGET_BYTES
         } else {
@@ -3502,11 +3530,12 @@ impl TransferExecutor {
         };
         let shadow_comparisons = ShadowComparisonController::new();
         Self {
+            node_manager: None,
+            stream_push: StreamPushConfig::new(&config.snapshot_upload_mode, total),
             store,
             config,
             destination_pull_locks: Arc::new(DashMap::new()),
-            codec_permits: Arc::new(tokio::sync::Semaphore::new(shared)),
-            codec_priority_permits: Arc::new(tokio::sync::Semaphore::new(reserve)),
+            codec,
             codec_priority_threshold,
             stream_writeback: StreamWritebackCoordinator::new(
                 stream_writeback_budget_bytes,
@@ -3518,6 +3547,16 @@ impl TransferExecutor {
             )),
             shadow_comparisons,
         }
+    }
+
+    /// Supply the privileged source service while retaining the executor's
+    /// shared admission and upload budget. Normal deployments use the local UDS.
+    pub fn with_node_manager(
+        mut self,
+        client: pplx_space_node_mgr_client::NodeManagerGrpcClient,
+    ) -> Self {
+        self.node_manager = Some(client);
+        self
     }
 
     pub fn shadow_comparison_controller(&self) -> ShadowComparisonController {
@@ -3547,7 +3586,7 @@ impl TransferExecutor {
         &self,
         input_bytes: u64,
         priority: JobPriority,
-    ) -> Result<Option<tokio::sync::OwnedSemaphorePermit>, JobError> {
+    ) -> Result<Option<CodecPermit>, JobError> {
         if input_bytes < CODEC_ADMISSION_MIN_INPUT_BYTES {
             return Ok(None);
         }
@@ -3565,7 +3604,7 @@ impl TransferExecutor {
         &self,
         path: &Path,
         priority: JobPriority,
-    ) -> Result<Option<tokio::sync::OwnedSemaphorePermit>, JobError> {
+    ) -> Result<Option<CodecPermit>, JobError> {
         if frame_content_size(path)
             .await
             .is_some_and(|size| size < CODEC_ADMISSION_MIN_INPUT_BYTES)
@@ -3575,44 +3614,43 @@ impl TransferExecutor {
         self.acquire_codec_permit(priority).await.map(Some)
     }
 
-    /// Acquire one codec permit, respecting the priority reservation.
-    ///
-    /// High-priority jobs (`priority >= codec_priority_threshold`) race the
-    /// reserved and shared pools and take whichever frees first, so a
+    /// Map a job priority onto codec admission. Jobs at or above
+    /// `codec_priority_threshold` race the reserved and shared pools, so a
     /// protected restore never queues behind the low-priority codec backlog
-    /// on the shared pool. Low-priority jobs only ever draw on the shared
-    /// pool, which keeps the reservation honest. When priority-aware
-    /// admission is disabled the reserved pool is empty and every job uses
-    /// the shared pool.
-    async fn acquire_codec_permit(
-        &self,
-        priority: JobPriority,
-    ) -> Result<tokio::sync::OwnedSemaphorePermit, JobError> {
-        let closed = || JobError::Retriable("codec permit pool closed".to_string());
-        let is_high = self
+    /// on the shared pool; everything else draws on the shared pool only.
+    fn codec_priority(&self, priority: JobPriority) -> CodecPriority {
+        if self
             .codec_priority_threshold
-            .is_some_and(|threshold| priority >= threshold);
-        if is_high {
-            tokio::select! {
-                biased;
-                permit = self.codec_priority_permits.clone().acquire_owned() => permit,
-                permit = self.codec_permits.clone().acquire_owned() => permit,
-            }
-            .map_err(|_| closed())
+            .is_some_and(|threshold| priority >= threshold)
+        {
+            CodecPriority::High
         } else {
-            self.codec_permits
-                .clone()
-                .acquire_owned()
-                .await
-                .map_err(|_| closed())
+            CodecPriority::Normal
         }
+    }
+
+    /// Acquire one codec permit, respecting the priority reservation.
+    async fn acquire_codec_permit(&self, priority: JobPriority) -> Result<CodecPermit, JobError> {
+        self.codec
+            .acquire(self.codec_priority(priority))
+            .await
+            .map_err(codec_admission_closed)
+    }
+
+    /// [`Self::acquire_codec_permit`] for a pass that lends its permit while
+    /// it cannot run (see [`CodecSlot`]).
+    async fn acquire_codec_slot(&self, priority: JobPriority) -> Result<CodecSlot, JobError> {
+        self.codec
+            .acquire_slot(self.codec_priority(priority))
+            .await
+            .map_err(codec_admission_closed)
     }
 
     fn try_acquire_sparse_shadow_admission(&self) -> Option<SparseShadowAdmission> {
         let shadow_permit = Arc::clone(&self.shadow_comparison_permits)
             .try_acquire_owned()
             .ok()?;
-        let codec_permit = Arc::clone(&self.codec_permits).try_acquire_owned().ok()?;
+        let codec_permit = self.codec.try_acquire_shared()?;
         Some(SparseShadowAdmission {
             _shadow_permit: shadow_permit,
             _codec_permit: codec_permit,
@@ -3876,6 +3914,7 @@ impl JobExecutor for TransferExecutor {
             // Single-file transfers (template raw pulls, single uploads):
             // one TransferPayload, always plaintext.
             "push" | "pull" => self.execute_single(job, cancellation).await,
+            "push_btrfs_send" => self.execute_single(job, cancellation).await,
             // Artifact transfers: one ArtifactPayload covering N entries,
             // optionally envelope-encrypted under one per-artifact DEK.
             "push_artifact" => {
@@ -3892,6 +3931,20 @@ impl JobExecutor for TransferExecutor {
 
     async fn cleanup_cancelled(&self, job: &Job) -> Result<(), JobError> {
         match job.kind.as_str() {
+            "push_btrfs_send" => {
+                let payload: crate::btrfs_push::Payload = job.payload_as()?;
+                let mut client = self
+                    .node_manager
+                    .clone()
+                    .unwrap_or_else(pplx_space_node_mgr_client::lazy);
+                client
+                    .btrfs_delete_send_source(pplx_space_node_mgr_client::proto::BtrfsSendLease {
+                        lease_id: payload.send_lease.to_string(),
+                    })
+                    .await
+                    .map(|_| ())
+                    .map_err(crate::btrfs_push::classify)
+            }
             "pull" => {
                 let payload = TransferPayload::from_json(&job.payload)?;
                 self.cleanup_cancelled_pull_path(Path::new(&payload.local_path))
@@ -4058,7 +4111,7 @@ impl TransferExecutor {
         let access = match job.kind.as_str() {
             // Push completion is verified with HeadObject before the job is
             // committed, so the exact object lease needs read as well as write.
-            "push" => StorageAccess::ReadWrite,
+            "push" | "push_btrfs_send" => StorageAccess::ReadWrite,
             "pull" => StorageAccess::Read,
             other => return Err(JobError::Permanent(format!("unknown kind: {other}"))),
         };
@@ -4080,7 +4133,24 @@ impl TransferExecutor {
         // Single-file transfers are always plaintext (`resolved_dek = None`)
         // and own their staged source cleanup (`cleanup_staged = true`).
         let result = match job.kind.as_str() {
-            "push" => self.execute_push(job, &p, &creds, target, true, None).await,
+            "push_btrfs_send" => {
+                self.execute_btrfs_push(job, &creds, target, cancellation)
+                    .await
+            }
+            "push" => {
+                self.execute_push(
+                    job,
+                    &p,
+                    &creds,
+                    target,
+                    PushExecutionOptions {
+                        cleanup_staged: true,
+                        resolved_dek: None,
+                        cancellation,
+                    },
+                )
+                .await
+            }
             "pull" => self
                 .execute_pull_cancellable(
                     job,
@@ -4269,8 +4339,18 @@ impl TransferExecutor {
                     // after the fan-out (a per-entry success is not terminal
                     // for the artifact).
                     ArtifactKind::Push => {
-                        self.execute_push(job, &synthetic, creds, target, false, resolved_dek)
-                            .await
+                        self.execute_push(
+                            job,
+                            &synthetic,
+                            creds,
+                            target,
+                            PushExecutionOptions {
+                                cleanup_staged: false,
+                                resolved_dek,
+                                cancellation,
+                            },
+                        )
+                        .await
                     }
                     ArtifactKind::Pull => self
                         .execute_pull_cancellable(
@@ -4442,7 +4522,7 @@ async fn stage_encrypted_temp(
     src_path: &Path,
     compress: bool,
     resolved_dek: Option<&[u8]>,
-    codec_permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    codec_permit: Option<CodecPermit>,
 ) -> Result<PathBuf, (PathBuf, JobError)> {
     let enc_path = encrypted_sibling(src_path);
     let src_path_buf = src_path.to_path_buf();
@@ -4517,6 +4597,12 @@ async fn stage_encrypted_temp(
     }
 }
 
+struct PushExecutionOptions<'a> {
+    cleanup_staged: bool,
+    resolved_dek: Option<&'a [u8]>,
+    cancellation: CancellationToken,
+}
+
 impl TransferExecutor {
     async fn execute_push(
         &self,
@@ -4524,18 +4610,24 @@ impl TransferExecutor {
         p: &TransferPayload,
         creds: &pplx_space_object_store::ObjectCredentials,
         target: ObjectTarget<'_>,
-        cleanup_staged: bool,
-        resolved_dek: Option<&[u8]>,
+        options: PushExecutionOptions<'_>,
     ) -> Result<i64, JobError> {
         let result = self
-            .execute_push_inner(job, p, creds, target, resolved_dek)
+            .execute_push_inner(
+                job,
+                p,
+                creds,
+                target,
+                options.resolved_dek,
+                options.cancellation,
+            )
             .await;
         // Single-file pushes clean their staged source here. Artifact entries
         // pass `cleanup_staged = false`: a per-entry success is NOT terminal
         // for the artifact (a sibling may force a retry that must re-read this
         // entry's staged bytes), so `execute_artifact` runs one artifact-level
         // cleanup after the whole fan-out instead.
-        if cleanup_staged {
+        if options.cleanup_staged {
             self.cleanup_staged_on_terminal(job, p, &result).await;
         }
         result
@@ -4548,6 +4640,7 @@ impl TransferExecutor {
         creds: &pplx_space_object_store::ObjectCredentials,
         target: ObjectTarget<'_>,
         resolved_dek: Option<&[u8]>,
+        cancellation: CancellationToken,
     ) -> Result<i64, JobError> {
         // Prefer the staged copy when set: bytes there are immune to a later
         // unlink of the caller's original path between submit and execute.
@@ -4592,6 +4685,28 @@ impl TransferExecutor {
             .map(|m| m.len())
             .map_err(|e| JobError::Permanent(format!("stat source file for size: {e}")))?;
 
+        if let Some(config) = &self.stream_push
+            && self.config.compress
+            && let Some(options) = config.options(p, original_size)
+            && let Some(uploader) = self.store.streaming_upload()
+        {
+            return self
+                .execute_stream_push(
+                    job,
+                    p,
+                    creds,
+                    target,
+                    stream_push::StreamPushAttempt {
+                        uploader,
+                        config,
+                        options,
+                        original_size,
+                        cancellation,
+                    },
+                )
+                .await;
+        }
+
         // Build the upload pipeline: source → [zstd?] → [AES-GCM?] → S3.
         //
         // On the encrypted path the two transforms run back-to-back inside
@@ -4602,9 +4717,8 @@ impl TransferExecutor {
         // compressed-bytes write + read per artifact (gigabytes per upload
         // for large artifacts).
         //
-        // The plaintext + compress-only path still uses `compress_to_temp`
-        // because there's no downstream consumer to pipe into; the
-        // resulting `.zst.tmp` is itself the upload source.
+        // Ineligible sources and stores without streaming support retain the
+        // file-backed transform and upload path.
         let mut transient_temps: Vec<PathBuf> = Vec::new();
 
         let put_source: PathBuf = match &p.encryption {
@@ -4882,6 +4996,17 @@ impl TransferExecutor {
             return Ok(None);
         };
 
+        // Sparse LUKS is a write optimization, not a new replica contract.
+        // Keep verified dense backings from older downloads: fetching them
+        // again only to punch holes would add disk and network work on retry.
+        let requested_materialization = if matches!(
+            p.effective_snapshot_artifact(),
+            Some(SnapshotArtifact::EncryptedSnapshotVolume | SnapshotArtifact::EncryptedRootfsCow)
+        ) {
+            MaterializationMode::Disabled
+        } else {
+            requested_materialization
+        };
         if provenance.replica == file_replica_provenance(p, &object_meta, local_size)
             && materialization_is_compatible(
                 requested_materialization,

@@ -1,6 +1,6 @@
 use std::fmt;
 use std::io::IsTerminal;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 #[cfg(feature = "otel")]
@@ -185,14 +185,40 @@ fn insert_string_if_missing(
 struct SpaceJsonFormat {
     context: JsonLogContext,
     timer: SystemTime,
+    dispatch: SubscriberDispatch,
 }
 
 impl SpaceJsonFormat {
     fn new(service_name: &str, context: LogContext) -> Self {
+        Self::with_context(JsonLogContext::new(service_name, context))
+    }
+
+    fn with_context(context: JsonLogContext) -> Self {
         Self {
-            context: JsonLogContext::new(service_name, context),
+            context,
             timer: SystemTime,
+            dispatch: SubscriberDispatch::default(),
         }
+    }
+}
+
+/// The dispatcher a formatter's subscriber was installed as, captured once
+/// after installation.
+///
+/// Reading a span's trace context needs it, and `dispatcher::get_default`
+/// cannot supply it while formatting: it yields the no-op dispatcher during
+/// event dispatch. The reference is weak because the dispatcher owns the
+/// formatter.
+#[derive(Clone, Debug, Default)]
+struct SubscriberDispatch(Arc<OnceLock<tracing::dispatcher::WeakDispatch>>);
+
+impl SubscriberDispatch {
+    /// Capture the current default dispatcher. Call it right after installing
+    /// the subscriber that holds the formatter.
+    fn capture_default(&self) {
+        let _ = self.0.set(tracing::dispatcher::get_default(|dispatch| {
+            dispatch.downgrade()
+        }));
     }
 }
 
@@ -227,11 +253,18 @@ where
         event.record(&mut JsonEventVisitor {
             values: &mut values,
         });
+        if let Some(dispatch) = self.dispatch.0.get().and_then(|weak| weak.upgrade()) {
+            insert_span_correlation(event, &dispatch, &mut values);
+        }
         self.context.insert_into(&mut values);
         insert_string_if_missing(&mut values, "target", metadata.target());
 
         if let Some(span) = ctx.parent_span() {
             values.insert("span".to_string(), span_value::<S, N>(&span));
+        }
+        #[cfg(feature = "otel")]
+        if let Some(dispatch) = self.dispatch.0.get().and_then(|weak| weak.upgrade()) {
+            insert_trace_context(event, &dispatch, &mut values);
         }
 
         let line = serde_json::to_string(&values).map_err(|_| fmt::Error)?;
@@ -305,6 +338,264 @@ where
         serde_json::Value::String(span.metadata().name().to_string()),
     );
     serde_json::Value::Object(values)
+}
+
+/// The span fields a JSON log line inherits when the event does not set them:
+/// the identifiers a reader filters one sandbox's or one request's lines by.
+const CORRELATION_FIELDS: [&str; 2] = ["sandbox_id", "request_id"];
+
+/// [`CORRELATION_FIELDS`] values a span carries, kept in its extensions by
+/// [`SpanCorrelationLayer`].
+#[derive(Clone, Debug, Default)]
+struct SpanCorrelation {
+    sandbox_id: Option<String>,
+    request_id: Option<String>,
+}
+
+impl SpanCorrelation {
+    fn slot(&mut self, field: &str) -> Option<&mut Option<String>> {
+        match field {
+            "sandbox_id" => Some(&mut self.sandbox_id),
+            "request_id" => Some(&mut self.request_id),
+            _ => None,
+        }
+    }
+
+    fn values(&self) -> [(&'static str, Option<&str>); CORRELATION_FIELDS.len()] {
+        [
+            ("sandbox_id", self.sandbox_id.as_deref()),
+            ("request_id", self.request_id.as_deref()),
+        ]
+    }
+
+    /// Take each value `recorded` sets; keep the rest.
+    fn update(&mut self, recorded: Self) {
+        let Self {
+            sandbox_id,
+            request_id,
+        } = recorded;
+        if sandbox_id.is_some() {
+            self.sandbox_id = sandbox_id;
+        }
+        if request_id.is_some() {
+            self.request_id = request_id;
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.values().iter().all(|(_, value)| value.is_none())
+    }
+}
+
+impl tracing::field::Visit for SpanCorrelation {
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        if let Some(slot) = self.slot(field.name())
+            && !value.is_empty()
+        {
+            *slot = Some(value.to_string());
+        }
+    }
+
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn fmt::Debug) {
+        if let Some(slot) = self.slot(field.name()) {
+            let value = format!("{value:?}");
+            if !value.is_empty() {
+                *slot = Some(value);
+            }
+        }
+    }
+}
+
+/// Keeps each span's [`CORRELATION_FIELDS`] where the JSON formatter can read
+/// them, including values recorded after the span was created. Only these
+/// fields are retained, so a line need not parse its spans' formatted fields.
+struct SpanCorrelationLayer;
+
+impl<S> tracing_subscriber::Layer<S> for SpanCorrelationLayer
+where
+    S: tracing::Subscriber + for<'lookup> LookupSpan<'lookup>,
+{
+    fn on_new_span(
+        &self,
+        attrs: &tracing::span::Attributes<'_>,
+        id: &tracing::span::Id,
+        ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        if !CORRELATION_FIELDS
+            .iter()
+            .any(|name| attrs.metadata().fields().field(name).is_some())
+        {
+            return;
+        }
+        let mut correlation = SpanCorrelation::default();
+        attrs.record(&mut correlation);
+        if let Some(span) = ctx.span(id) {
+            span.extensions_mut().insert(correlation);
+        }
+    }
+
+    fn on_record(
+        &self,
+        id: &tracing::span::Id,
+        values: &tracing::span::Record<'_>,
+        ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        let mut recorded = SpanCorrelation::default();
+        values.record(&mut recorded);
+        if recorded.is_empty() {
+            return;
+        }
+        let Some(span) = ctx.span(id) else {
+            return;
+        };
+        let mut extensions = span.extensions_mut();
+        match extensions.get_mut::<SpanCorrelation>() {
+            Some(correlation) => correlation.update(recorded),
+            None => extensions.insert(recorded),
+        }
+    }
+}
+
+/// What [`SpanCorrelationLayer`] sees: spans, never events. With per-layer
+/// selection, only the spans the log or trace filter admits; the shared
+/// layout's registry-level filter already decides admission.
+///
+/// The filter has no field predicate. Rejecting spans without a
+/// [`CORRELATION_FIELDS`] field would hide them from the admission filters'
+/// span callbacks, and a span-scoped directive such as
+/// `[sbxmgr.detached]=info` would stop tracking the scope it enables. The
+/// span predicate comes first, so events are rejected before any per-event
+/// filter work; `And` and `Or` still pass every span's lifecycle to both
+/// sides. The layer itself stores only spans that declare a field.
+fn correlation_filter<S>(
+    log_filter: Option<tracing_subscriber::EnvFilter>,
+    trace_filter: Option<tracing_subscriber::EnvFilter>,
+) -> Box<dyn tracing_subscriber::layer::Filter<S> + Send + Sync>
+where
+    S: tracing::Subscriber + for<'lookup> LookupSpan<'lookup>,
+{
+    // A static per-callsite predicate. The explicit TRACE hint lets a
+    // combination keep the admission filters' bound.
+    let spans = tracing_subscriber::filter::filter_fn(|metadata| metadata.is_span())
+        .with_max_level_hint(tracing::level_filters::LevelFilter::TRACE);
+    match (log_filter, trace_filter) {
+        (Some(log_filter), Some(trace_filter)) => spans
+            .and(layer_filter::<S>(log_filter).or(layer_filter::<S>(trace_filter)))
+            .boxed(),
+        (Some(filter), None) | (None, Some(filter)) => spans.and(layer_filter::<S>(filter)).boxed(),
+        (None, None) => tracing_subscriber::filter::FilterExt::boxed(spans),
+    }
+}
+
+/// The `request_id` of the nearest current span that carries one, for work
+/// that leaves the request's span tree but should still name the request,
+/// such as a detached span linked to it. `None` outside such a span or
+/// before telemetry is initialized.
+pub fn current_request_id() -> Option<String> {
+    use tracing::Subscriber as _;
+
+    tracing::dispatcher::get_default(|dispatch| {
+        let registry = dispatch.downcast_ref::<tracing_subscriber::Registry>()?;
+        let id = registry.current_span().id()?.clone();
+        let span = registry.span(&id)?;
+        span.scope().find_map(|span| {
+            span.extensions()
+                .get::<SpanCorrelation>()
+                .and_then(|correlation| correlation.request_id.clone())
+        })
+    })
+}
+
+/// Give a log line each [`CORRELATION_FIELDS`] value the event does not set,
+/// from the nearest span that carries it, so a line written inside a
+/// sandbox's or a request's span is found by the same field as the span.
+///
+/// Spans are resolved through the unfiltered registry, as for the trace
+/// context: the log filter may hide the very span that carries the value.
+fn insert_span_correlation(
+    event: &tracing::Event<'_>,
+    dispatch: &tracing::Dispatch,
+    values: &mut serde_json::Map<String, serde_json::Value>,
+) {
+    use tracing::Subscriber as _;
+
+    let Some(registry) = dispatch.downcast_ref::<tracing_subscriber::Registry>() else {
+        return;
+    };
+    let parent = if let Some(parent) = event.parent() {
+        Some(parent.clone())
+    } else if event.is_contextual() {
+        registry.current_span().id().cloned()
+    } else {
+        None
+    };
+    let Some(span) = parent.and_then(|id| registry.span(&id)) else {
+        return;
+    };
+    for span in span.scope() {
+        if CORRELATION_FIELDS
+            .iter()
+            .all(|name| values.contains_key(*name))
+        {
+            return;
+        }
+        let extensions = span.extensions();
+        let Some(correlation) = extensions.get::<SpanCorrelation>() else {
+            continue;
+        };
+        // Nearest first: a value an inner span inserted is kept.
+        for (name, value) in correlation.values() {
+            if let Some(value) = value {
+                insert_string_if_missing(values, name, value);
+            }
+        }
+    }
+}
+
+/// Join a log line to its trace: the W3C `trace_id` and `span_id` of the
+/// nearest span, from the event's own parent outward, that carries an
+/// OpenTelemetry context.
+///
+/// The parent is resolved through the unfiltered registry rather than the
+/// formatter's context, whose log filter may hide the very span the trace
+/// filter exported. A span the trace layer did not record has no context, so
+/// the walk continues to its ancestors. Without a trace layer, or outside any
+/// traced span, nothing is added. The Datadog-reserved `dd.*` fields are not
+/// written.
+#[cfg(feature = "otel")]
+fn insert_trace_context(
+    event: &tracing::Event<'_>,
+    dispatch: &tracing::Dispatch,
+    values: &mut serde_json::Map<String, serde_json::Value>,
+) {
+    use opentelemetry::trace::TraceContextExt as _;
+    use tracing::Subscriber as _;
+
+    let Some(registry) = dispatch.downcast_ref::<tracing_subscriber::Registry>() else {
+        return;
+    };
+    let parent = if let Some(parent) = event.parent() {
+        Some(parent.clone())
+    } else if event.is_contextual() {
+        registry.current_span().id().cloned()
+    } else {
+        None
+    };
+    let Some(span) = parent.and_then(|id| registry.span(&id)) else {
+        return;
+    };
+    for span in span.scope() {
+        let Some(context) = tracing_opentelemetry::get_otel_context(&span.id(), dispatch) else {
+            continue;
+        };
+        let otel_span = context.span();
+        let span_context = otel_span.span_context();
+        if span_context.is_valid() {
+            insert_string_if_missing(values, "trace_id", &span_context.trace_id().to_string());
+            insert_string_if_missing(values, "span_id", &span_context.span_id().to_string());
+            return;
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -482,6 +773,7 @@ pub fn init_with_log_context(
         match trace_filter {
             // Per-layer selection, which only a configured trace filter needs.
             Some(trace_filter) => {
+                let span_admission = trace_filter.clone();
                 init_tracing_subscriber(
                     tracing_subscriber::registry()
                         .with(
@@ -506,6 +798,7 @@ pub fn init_with_log_context(
                     // saturated pool, so it reaches logs at any RUST_LOG. The
                     // shared layout gets this from its registry-level filter.
                     Some(log_filter_from_env().add_directive(acquire_directive()?)),
+                    Some(span_admission),
                 )?
             }
             // The shared layout keeps its single subscriber-level filter, which
@@ -523,6 +816,7 @@ pub fn init_with_log_context(
                 log_format,
                 use_ansi,
                 None,
+                None,
             )?,
         }
         Some(Box::new(move || {
@@ -536,6 +830,7 @@ pub fn init_with_log_context(
     } else {
         match trace_filter {
             Some(trace_filter) => {
+                let span_admission = trace_filter.clone();
                 init_tracing_subscriber(
                     tracing_subscriber::registry()
                         // The SQL bridge also records pool-acquire metrics.
@@ -554,6 +849,7 @@ pub fn init_with_log_context(
                     log_format,
                     use_ansi,
                     Some(log_filter_from_env().add_directive(acquire_directive()?)),
+                    Some(span_admission),
                 )?
             }
             None => init_tracing_subscriber(
@@ -564,6 +860,7 @@ pub fn init_with_log_context(
                 log_context,
                 log_format,
                 use_ansi,
+                None,
                 None,
             )?,
         }
@@ -584,6 +881,7 @@ pub fn init_with_log_context(
             log_context,
             log_format,
             use_ansi,
+            None,
             None,
         )?;
         None
@@ -727,6 +1025,7 @@ fn init_tracing_subscriber<S>(
     log_format: LogFormat,
     use_ansi: bool,
     log_filter: Option<tracing_subscriber::EnvFilter>,
+    trace_filter: Option<tracing_subscriber::EnvFilter>,
 ) -> Result<(), ObservabilityError>
 where
     S: tracing_subscriber::layer::SubscriberExt
@@ -735,6 +1034,11 @@ where
         + Sync
         + 'static,
 {
+    // Installed for every format so the formatter's filter has one subscriber
+    // type; only the JSON format reads what it keeps.
+    let subscriber = subscriber.with(
+        SpanCorrelationLayer.with_filter(correlation_filter(log_filter.clone(), trace_filter)),
+    );
     // We rely on tracing-subscriber's default writer (stdout). The caller
     // computed `use_ansi` against stdout's TTY status so the fd we write and
     // the fd we test agree.
@@ -754,14 +1058,22 @@ where
         ),
     };
     match log_format {
-        LogFormat::Json => subscriber
-            .with(
-                tracing_subscriber::fmt::layer()
-                    .event_format(SpaceJsonFormat::new(service_name, log_context))
-                    .fmt_fields(JsonFields::new())
-                    .with_filter(log_filter),
-            )
-            .try_init(),
+        LogFormat::Json => {
+            let format = SpaceJsonFormat::new(service_name, log_context);
+            let dispatch = format.dispatch.clone();
+            let installed = subscriber
+                .with(
+                    tracing_subscriber::fmt::layer()
+                        .event_format(format)
+                        .fmt_fields(JsonFields::new())
+                        .with_filter(log_filter),
+                )
+                .try_init();
+            if installed.is_ok() {
+                dispatch.capture_default();
+            }
+            installed
+        }
         LogFormat::Compact => subscriber
             .with(
                 tracing_subscriber::fmt::layer()

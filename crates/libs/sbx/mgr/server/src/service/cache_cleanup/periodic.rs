@@ -159,29 +159,65 @@ impl PeriodicInventoryScan {
     }
 }
 
+/// One discovered inventory page and its cache directories without a database
+/// row. Those can become orphan rows, so the periodic loop inspects their
+/// retained sources before reconciling this same page.
+pub(in crate::service) struct PeriodicInventoryBatch<'a> {
+    paths: SandboxInventoryPaths<'a>,
+    discovery: InventoryDiscovery,
+    pub(in crate::service) orphan_candidates: Vec<std::path::PathBuf>,
+}
+
 impl SandboxManagerService {
-    pub(in crate::service) fn reconcile_periodic_inventory(
+    pub(in crate::service) fn discover_periodic_inventory(
         &self,
         scan: &mut PeriodicInventoryScan,
         shutdown: &CancellationToken,
-    ) -> Result<(), Status> {
-        self.reconcile_periodic_inventory_in(
+    ) -> Result<PeriodicInventoryBatch<'static>, Status> {
+        self.discover_periodic_inventory_in(
             scan,
             SandboxInventoryPaths::new(Path::new(CACHE_DIR), Path::new(RUN_DIR)),
             shutdown,
         )
     }
 
-    fn reconcile_periodic_inventory_in(
+    fn discover_periodic_inventory_in<'a>(
         &self,
         scan: &mut PeriodicInventoryScan,
-        paths: SandboxInventoryPaths<'_>,
+        paths: SandboxInventoryPaths<'a>,
         shutdown: &CancellationToken,
-    ) -> Result<(), Status> {
+    ) -> Result<PeriodicInventoryBatch<'a>, Status> {
         let discovery = scan.discover(self, paths, shutdown)?;
-        if shutdown.is_cancelled() {
-            return Ok(());
-        }
+        let listed: BTreeSet<&str> = discovery.rows.iter().map(|row| row.id.as_str()).collect();
+        let orphan_candidates = {
+            let db = self.db_conn()?;
+            discovery
+                .disk_ids
+                .iter()
+                .map(ToString::to_string)
+                .filter(|id| !listed.contains(id.as_str()))
+                // An unreadable row counts: reconciliation rechecks it.
+                .filter(|id| !crate::db::sandbox_exists(&db, id).unwrap_or(false))
+                .map(|id| paths.cache_dir.join(id))
+                .collect()
+        };
+        Ok(PeriodicInventoryBatch {
+            paths,
+            discovery,
+            orphan_candidates,
+        })
+    }
+
+    /// `retained_sources` must come from inspecting this batch's orphan
+    /// candidates; answers for another page resolve nothing here.
+    pub(in crate::service) fn reconcile_periodic_inventory_batch(
+        &self,
+        batch: PeriodicInventoryBatch<'_>,
+        retained_sources: &crate::retained_source::RetainedSourceVerdicts,
+    ) -> Result<(), Status> {
+        let PeriodicInventoryBatch {
+            paths, discovery, ..
+        } = batch;
         let report = self.apply_route_identity_mutations("periodic_inventory_reconcile", || {
             let observe_execution = self.orphan_execution_observer();
             let report = reconcile_inventory_batch(
@@ -194,7 +230,8 @@ impl SandboxManagerService {
                     |id: SandboxId| self.auto_lifecycle.try_staging_guard(&id.to_string()),
                     &observe_execution,
                 )
-                .with_retirement(|id: &str| self.try_registration_retirement(id)),
+                .with_retirement(|id: &str| self.try_registration_retirement(id))
+                .with_retained_sources(retained_sources),
             )
             .map_err(|error| {
                 if matches!(error, InventoryError::DatabaseMutexPoisoned) {

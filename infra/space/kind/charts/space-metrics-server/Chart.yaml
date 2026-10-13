@@ -1,0 +1,6 @@
+apiVersion: v2
+name: space-metrics-server
+description: Kind-only metrics-server, the resource metrics API the KinD SPACE HorizontalPodAutoscalers read
+type: application
+version: 0.1.0
+appVersion: "0.9.0"

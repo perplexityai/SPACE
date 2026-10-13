@@ -398,7 +398,7 @@ def main():
             input="\n".join(emitted) + "\n",
         )
         for source in ("container", "journal"):
-            expression = '{cluster="fixture-cluster",source=' + json.dumps(source) + "}"
+            expression = '{cluster="fixture-cluster",log_source=' + json.dumps(source) + "}"
             result = collect(expression, start, emitted)
             save(args.output / f"{case}-{source}-loki.json", result)
             matched = Counter(line for line in lines(result) if line in emitted)
@@ -474,7 +474,7 @@ def main():
     try:
         until(
             lambda: lines(
-                query('{source="journal",service="space-oss-restart"}', restart_start)
+                query('{log_source="journal",service="space-oss-restart"}', restart_start)
             )
         )
         event = {"requested": time.time()}
@@ -503,7 +503,7 @@ def main():
     emitted = records(output)
     for source in ("container", "journal"):
         # Explicit event-service overrides intentionally use another stream label.
-        expression = '{cluster="fixture-cluster",source=' + json.dumps(source) + "}"
+        expression = '{cluster="fixture-cluster",log_source=' + json.dumps(source) + "}"
         result = collect(expression, restart_start, emitted)
         save(args.output / f"restart-{source}-loki.json", result)
         matched = Counter(line for line in lines(result) if line in emitted)

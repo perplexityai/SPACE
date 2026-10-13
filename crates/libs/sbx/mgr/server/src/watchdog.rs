@@ -30,10 +30,17 @@ use pplx_space_metrics::sandbox::worker::{
 use pplx_space_node_runtime_core::fc_api::FirecrackerVmState;
 
 use crate::auto_lifecycle::AutoLifecycleCoordinator;
+use crate::node_manager_transport::NodeManagerConnector;
 use crate::node_state_sync::mark_sandbox_dirty;
 use crate::service::network_policy::NetworkPolicyReconcileQueue;
 use crate::sidecar::{sidecar_alive, sidecar_live_pid};
 use crate::snapshot_scheduler::SnapshotScheduler;
+
+mod diagnostics;
+
+/// Health transition lines keep the watchdog's target, which log searches
+/// already select on, though `diagnostics` writes them.
+const LOG_TARGET: &str = module_path!();
 
 const SIDECAR_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 // Background observations tolerate a slower reply than foreground Stats,
@@ -434,6 +441,10 @@ pub struct SandboxHealth {
     lifecycle_epoch: u64,
     next_health_probe_at: Instant,
     health_probe_sequence: u64,
+    /// When a degraded transition last carried console tails, so a flapping
+    /// sandbox cannot repeat them more often than
+    /// `diagnostics::CONSOLE_TAIL_MIN_INTERVAL`.
+    last_console_tail_at: Option<Instant>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -612,10 +623,27 @@ struct ComposedProbeResult {
 struct ComponentHealth {
     observations: VecDeque<HealthObservation>,
     degraded: bool,
+    /// Failed probes since the last success or not-applicable probe. Unlike
+    /// the bounded history, this keeps counting for as long as the outage
+    /// lasts.
+    consecutive_failures: u32,
+    last_success_at: Option<SystemTime>,
 }
 
 impl ComponentHealth {
     fn push(&mut self, observation: HealthObservation) {
+        match observation.outcome {
+            HealthProbeOutcome::Success => {
+                self.consecutive_failures = 0;
+                self.last_success_at = Some(observation.observed_at);
+            }
+            HealthProbeOutcome::NotApplicable => self.consecutive_failures = 0,
+            HealthProbeOutcome::Timeout
+            | HealthProbeOutcome::Unavailable
+            | HealthProbeOutcome::UnexpectedState => {
+                self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+            }
+        }
         if self.observations.len() == HEALTH_HISTORY_CAPACITY {
             self.observations.pop_front();
         }
@@ -662,6 +690,7 @@ pub struct SandboxWatchdog {
     network_policy_reconcile_queue: NetworkPolicyReconcileQueue,
     expected_route_verification_key_generation: Arc<AtomicU64>,
     feature_flags: pplx_space_feature_flags::FeatureFlagClient,
+    node_manager: NodeManagerConnector,
 }
 
 #[derive(Clone, Default)]
@@ -677,6 +706,12 @@ impl HealthLifecycleEpochs {
         };
         health.lifecycle_epoch = health.lifecycle_epoch.wrapping_add(1);
         health.consecutive_guest_probe_failures = 0;
+        for component in HealthComponent::ALL {
+            health
+                .health_components
+                .get_mut(component)
+                .consecutive_failures = 0;
+        }
     }
 }
 
@@ -697,6 +732,7 @@ impl SandboxWatchdog {
         shutdown_token: CancellationToken,
         drain_state: Arc<crate::service::drain::DrainState>,
         task_tracker: &TaskTracker,
+        node_manager: NodeManagerConnector,
     ) -> Self {
         let state = lifecycle_epochs.state.clone();
         let sidecars: Arc<Mutex<HashMap<String, SidecarInfo>>> =
@@ -710,6 +746,7 @@ impl SandboxWatchdog {
             Arc::clone(&expected_route_verification_key_generation);
         let task_feature_flags = feature_flags.clone();
         let task_snapshot_scheduler = snapshot_scheduler.clone();
+        let task_node_manager = node_manager.clone();
         let sidecar_shutdown = shutdown_token.child_token();
         let sidecar_guard = crate::service::drain::CriticalTaskGuard::new(
             "sidecar watchdog",
@@ -727,6 +764,7 @@ impl SandboxWatchdog {
                 task_expected_route_verification_key_generation,
                 task_feature_flags,
                 sidecar_shutdown,
+                task_node_manager,
             )
             .await;
         });
@@ -744,6 +782,7 @@ impl SandboxWatchdog {
             auto_lifecycle,
             lifecycle_epochs,
             shutdown_token.child_token(),
+            node_manager.clone(),
         );
         task_tracker.spawn(async move {
             let _guard = health_guard;
@@ -756,6 +795,7 @@ impl SandboxWatchdog {
             network_policy_reconcile_queue,
             expected_route_verification_key_generation,
             feature_flags,
+            node_manager,
         }
     }
 
@@ -768,11 +808,14 @@ impl SandboxWatchdog {
     ) -> Self {
         let auto_lifecycle = AutoLifecycleCoordinator::default();
         let lifecycle_epochs = HealthLifecycleEpochs::default();
+        // The loops tick immediately; their node-manager is an absent socket.
+        let node_manager = crate::node_manager_transport::fake::unbound_in_absent_dir();
         let snapshot_scheduler = Arc::new(SnapshotScheduler::new(Arc::new(
             crate::snapshot_scheduler::CheckpointContext {
                 db: db.clone(),
                 auto_lifecycle: auto_lifecycle.clone(),
                 health_lifecycle: lifecycle_epochs.clone(),
+                node_manager: node_manager.clone(),
             },
         )));
         Self::new(
@@ -785,6 +828,7 @@ impl SandboxWatchdog {
             shutdown_token,
             Arc::new(crate::service::drain::DrainState::default()),
             task_tracker,
+            node_manager,
         )
     }
 
@@ -830,6 +874,7 @@ impl SandboxWatchdog {
             lifecycle_epoch: 0,
             next_health_probe_at: now + initial_health_probe_delay(&id),
             health_probe_sequence: 0,
+            last_console_tail_at: None,
         });
     }
 
@@ -974,6 +1019,7 @@ impl SandboxWatchdog {
             &self.network_policy_reconcile_queue,
             &self.state,
             &self.feature_flags,
+            &self.node_manager,
         )
         .await
     }
@@ -1194,6 +1240,10 @@ fn system_time_to_timestamp(value: SystemTime) -> Option<prost_types::Timestamp>
     })
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the loop receives each long-lived watchdog dependency from the constructor"
+)]
 async fn sidecar_loop(
     state: Arc<Mutex<HashMap<String, SandboxHealth>>>,
     sidecars: Arc<Mutex<HashMap<String, SidecarInfo>>>,
@@ -1202,6 +1252,7 @@ async fn sidecar_loop(
     expected_route_verification_key_generation: Arc<AtomicU64>,
     feature_flags: pplx_space_feature_flags::FeatureFlagClient,
     shutdown_token: CancellationToken,
+    node_manager: NodeManagerConnector,
 ) {
     let mut interval = tokio::time::interval(SIDECAR_CHECK_INTERVAL);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -1226,6 +1277,7 @@ async fn sidecar_loop(
                     &network_policy_reconcile_queue,
                     &state,
                     &feature_flags,
+                    &node_manager,
                 )
                 .await;
                 false
@@ -1349,6 +1401,7 @@ async fn sidecar_loop(
             &network_policy_reconcile_queue,
             &state,
             &feature_flags,
+            &node_manager,
         )
         .await;
 
@@ -1376,6 +1429,10 @@ async fn sidecar_loop(
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each restart task needs the sidecar loop's long-lived dependencies"
+)]
 async fn fill_sidecar_restart_slots(
     queue: &mut SidecarRestartQueue,
     futures: &mut FuturesUnordered<SidecarRestartFuture>,
@@ -1384,6 +1441,7 @@ async fn fill_sidecar_restart_slots(
     network_policy_reconcile_queue: &NetworkPolicyReconcileQueue,
     state: &Arc<Mutex<HashMap<String, SandboxHealth>>>,
     feature_flags: &pplx_space_feature_flags::FeatureFlagClient,
+    node_manager: &NodeManagerConnector,
 ) {
     while futures.len() < SIDECAR_RESTART_CONCURRENCY {
         let Some(request) = queue.pop_front() else {
@@ -1412,12 +1470,13 @@ async fn fill_sidecar_restart_slots(
         let network_policy_reconcile_queue = network_policy_reconcile_queue.clone();
         let state = Arc::clone(state);
         let feature_flags = feature_flags.clone();
+        let node_manager = node_manager.clone();
         let task = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
             match request {
                 SidecarRestartRequest::SpacedHost(info) => watchdog_timeout(
                     SIDECAR_RESTART_TIMEOUT,
                     operation,
-                    restart_spaced_host(&info, db, sidecars),
+                    restart_spaced_host(&info, db, sidecars, &node_manager),
                 )
                 .await
                 .map(|_| ())
@@ -1432,6 +1491,7 @@ async fn fill_sidecar_restart_slots(
                         network_policy_reconcile_queue,
                         &state,
                         &feature_flags,
+                        &node_manager,
                     ),
                 )
                 .await
@@ -2073,6 +2133,10 @@ async fn probe_net_gateway_stats(
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the loop receives each long-lived watchdog dependency from the constructor"
+)]
 async fn composed_health_loop(
     state: Arc<Mutex<HashMap<String, SandboxHealth>>>,
     sidecars: Arc<Mutex<HashMap<String, SidecarInfo>>>,
@@ -2081,9 +2145,26 @@ async fn composed_health_loop(
     auto_lifecycle: AutoLifecycleCoordinator,
     lifecycle_epochs: HealthLifecycleEpochs,
     shutdown_token: CancellationToken,
+    node_manager: NodeManagerConnector,
 ) {
     let mut interval = tokio::time::interval(HEALTH_SCHEDULER_TICK);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Evidence for degrading transitions is gathered off the probe path by a
+    // fixed set of collectors, so a burst of them can delay neither the next
+    // sweep nor the transition lines. Dropping the set on return aborts them.
+    let evidence_queue = Arc::new(diagnostics::admission::EvidenceQueue::new(
+        diagnostics::admission::EVIDENCE_QUEUE_CAPACITY,
+    ));
+    let host_reads = diagnostics::host_reads();
+    let mut evidence_collectors = tokio::task::JoinSet::new();
+    for _ in 0..diagnostics::admission::EVIDENCE_COLLECTORS {
+        evidence_collectors.spawn(diagnostics::run_evidence_collector(
+            Arc::clone(&evidence_queue),
+            Arc::clone(&sidecars),
+            host_reads.clone(),
+            shutdown_token.clone(),
+        ));
+    }
     loop {
         tokio::select! {
             _ = shutdown_token.cancelled() => return,
@@ -2138,8 +2219,8 @@ async fn composed_health_loop(
             if !health_probe_lifecycle_is_eligible(lifecycle) {
                 continue;
             }
-            if pending.len() >= HEALTH_PROBE_CONCURRENCY {
-                apply_and_reconcile_composed_health_result(
+            if pending.len() >= HEALTH_PROBE_CONCURRENCY
+                && let Some(transition) = apply_and_reconcile_composed_health_result(
                     &state,
                     &db,
                     snapshot_scheduler.as_ref(),
@@ -2147,15 +2228,19 @@ async fn composed_health_loop(
                     &lifecycle_epochs,
                     pending.join_next().await,
                 )
-                .await;
+                .await
+            {
+                diagnostics::report_transition(&evidence_queue, &transition);
             }
+            let node_manager = node_manager.clone();
             pending.spawn(async move {
-                let result = probe_composed_health(&sandbox_id, &info, lifecycle).await;
+                let result =
+                    probe_composed_health(&sandbox_id, &info, lifecycle, &node_manager).await;
                 (sandbox_id, lifecycle, lifecycle_epoch, result)
             });
         }
         while !pending.is_empty() {
-            apply_and_reconcile_composed_health_result(
+            if let Some(transition) = apply_and_reconcile_composed_health_result(
                 &state,
                 &db,
                 snapshot_scheduler.as_ref(),
@@ -2163,7 +2248,10 @@ async fn composed_health_loop(
                 &lifecycle_epochs,
                 pending.join_next().await,
             )
-            .await;
+            .await
+            {
+                diagnostics::report_transition(&evidence_queue, &transition);
+            }
         }
     }
 }
@@ -2201,8 +2289,9 @@ async fn probe_composed_health(
     sandbox_id: &str,
     info: &SidecarInfo,
     lifecycle: Option<crate::state::SandboxState>,
+    node_manager: &NodeManagerConnector,
 ) -> ComposedProbeResult {
-    let firecracker = probe_firecracker_health(sandbox_id, lifecycle);
+    let firecracker = probe_firecracker_health(sandbox_id, lifecycle, node_manager);
     let spaced_host = probe_spaced_host_health(sandbox_id);
     let spaced_guest = probe_spaced_guest_health(info, lifecycle);
     let net_gateway = probe_net_gateway_health(sandbox_id);
@@ -2238,6 +2327,7 @@ async fn read_guest_status_via_spaced_host(
 async fn probe_firecracker_health(
     sandbox_id: &str,
     lifecycle: Option<crate::state::SandboxState>,
+    node_manager: &NodeManagerConnector,
 ) -> HealthObservation {
     let started = Instant::now();
     if !firecracker_alive(sandbox_id) {
@@ -2253,7 +2343,7 @@ async fn probe_firecracker_health(
             return health_observation(started, HealthProbeOutcome::Unavailable, error.to_string());
         }
     };
-    match crate::firecracker_via_nodemgr::get_firecracker_vm_state(sandbox_id).await {
+    match crate::firecracker_via_nodemgr::get_firecracker_vm_state(sandbox_id, node_manager).await {
         Err(crate::firecracker_via_nodemgr::FirecrackerStateReadError::Timeout { .. }) => {
             health_observation(
                 started,
@@ -2472,7 +2562,7 @@ async fn apply_and_reconcile_composed_health_result(
     auto_lifecycle: &AutoLifecycleCoordinator,
     lifecycle_epochs: &HealthLifecycleEpochs,
     result: Option<CompletedHealthProbe>,
-) {
+) -> Option<diagnostics::HealthTransition> {
     let pause_failed_recovery = match result.as_ref() {
         Some(Ok((
             sandbox_id,
@@ -2485,37 +2575,35 @@ async fn apply_and_reconcile_composed_health_result(
             .map(|id| (id, *lifecycle_epoch)),
         _ => None,
     };
-    apply_composed_health_result(state, db, result).await;
-    let Some((sandbox_id, lifecycle_epoch)) = pause_failed_recovery else {
-        return;
-    };
-    reconcile_pause_failed_quarantine(
-        db,
-        snapshot_scheduler,
-        auto_lifecycle,
-        lifecycle_epochs,
-        &sandbox_id,
-        lifecycle_epoch,
-    )
-    .await;
+    let transition = apply_composed_health_result(state, db, result).await;
+    if let Some((sandbox_id, lifecycle_epoch)) = pause_failed_recovery {
+        reconcile_pause_failed_quarantine(
+            db,
+            snapshot_scheduler,
+            auto_lifecycle,
+            lifecycle_epochs,
+            &sandbox_id,
+            lifecycle_epoch,
+        )
+        .await;
+    }
+    transition
 }
 
 async fn apply_composed_health_result(
     state: &Arc<Mutex<HashMap<String, SandboxHealth>>>,
     db: &Arc<std::sync::Mutex<rusqlite::Connection>>,
     result: Option<CompletedHealthProbe>,
-) {
+) -> Option<diagnostics::HealthTransition> {
     let Some(Ok((sandbox_id, lifecycle, lifecycle_epoch, result))) = result else {
-        return;
+        return None;
     };
     let ComposedProbeResult {
         observations,
         guest_status,
     } = result;
     let mut map = state.lock().await;
-    let Some(health) = map.get_mut(&sandbox_id) else {
-        return;
-    };
+    let health = map.get_mut(&sandbox_id)?;
     if health.lifecycle_epoch != lifecycle_epoch {
         tracing::debug!(
             sandbox_id,
@@ -2523,9 +2611,10 @@ async fn apply_composed_health_result(
             current_epoch = health.lifecycle_epoch,
             "discarded health result from an older lifecycle epoch"
         );
-        return;
+        return None;
     }
     let previous_status = health.health_status;
+    let previous_guest_health = classify_guest_health(GuestHealthProbe::from(&*health));
     for (component, mut observation) in HealthComponent::ALL.into_iter().zip(observations) {
         observation.lifecycle_epoch = lifecycle_epoch;
         let outcome = observation.outcome;
@@ -2566,13 +2655,15 @@ async fn apply_composed_health_result(
         pplx_space_metrics::sandbox::worker::sandbox_health_transition(
             health.health_status.as_metric(),
         );
-        tracing::info!(
-            sandbox_id,
-            previous = ?previous_status,
-            current = ?health.health_status,
-            "sandbox composed health changed"
-        );
     }
+    let transition = diagnostics::HealthTransition::observe(
+        &sandbox_id,
+        lifecycle,
+        previous_status,
+        previous_guest_health,
+        health,
+        Instant::now(),
+    );
     drop(map);
     if let Some(uptime_secs) = guest_uptime {
         match db.lock() {
@@ -2586,6 +2677,7 @@ async fn apply_composed_health_result(
             }
         }
     }
+    transition
 }
 
 async fn reconcile_pause_failed_quarantine(
@@ -2757,8 +2849,9 @@ async fn restart_spaced_host(
     info: &SidecarInfo,
     db: Arc<std::sync::Mutex<rusqlite::Connection>>,
     sidecars: Arc<Mutex<HashMap<String, SidecarInfo>>>,
+    node_manager: &NodeManagerConnector,
 ) -> Result<(), SpacedHostRestartError> {
-    let mut node_client = pplx_space_node_mgr_client::connect().await?;
+    let mut node_client = node_manager.connect().await?;
 
     let id = &info.sandbox_id;
     let uid = info.uid.ok_or(SpacedHostRestartError::MissingUid)?;
@@ -2857,6 +2950,7 @@ async fn restart_netgtw(
     network_policy_reconcile_queue: NetworkPolicyReconcileQueue,
     state: &Arc<Mutex<HashMap<String, SandboxHealth>>>,
     feature_flags: &pplx_space_feature_flags::FeatureFlagClient,
+    node_manager: &NodeManagerConnector,
 ) -> Result<(), String> {
     relaunch_netgtw(
         info,
@@ -2865,6 +2959,7 @@ async fn restart_netgtw(
         &network_policy_reconcile_queue,
         state,
         feature_flags,
+        node_manager,
     )
     .await?;
     Ok(())
@@ -2886,14 +2981,13 @@ async fn relaunch_netgtw(
     network_policy_reconcile_queue: &NetworkPolicyReconcileQueue,
     state: &Arc<Mutex<HashMap<String, SandboxHealth>>>,
     feature_flags: &pplx_space_feature_flags::FeatureFlagClient,
+    node_manager: &NodeManagerConnector,
 ) -> Result<u32, String> {
     let sandbox_id = &info.sandbox_id;
     let uid = info
         .uid
         .ok_or_else(|| "missing sandbox uid for net-gateway restart".to_string())?;
-    let mut node_client = pplx_space_node_mgr_client::connect()
-        .await
-        .map_err(|e| e.to_string())?;
+    let mut node_client = node_manager.connect().await.map_err(|e| e.to_string())?;
 
     let args = net_gateway_relaunch_args(db, sandbox_id, feature_flags)
         .map_err(|error| error.to_string())?;

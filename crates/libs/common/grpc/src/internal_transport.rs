@@ -14,6 +14,22 @@ pub const CA_ENV: &str = "SPACE_INTERNAL_RPC_TLS_CA";
 pub const CERT_ENV: &str = "SPACE_INTERNAL_RPC_TLS_CERT";
 pub const KEY_ENV: &str = "SPACE_INTERNAL_RPC_TLS_KEY";
 
+/// How long a listener gives an accepted connection to finish its TLS
+/// handshake. TLS negotiation happens before bearer admission, so an idle peer
+/// must not retain a pre-authentication handshake forever.
+pub const SERVER_TLS_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Bound for an internal-RPC client's TLS handshake, every handshake of a
+/// channel included. It must exceed [`SERVER_TLS_HANDSHAKE_TIMEOUT`]: a
+/// listener takes one of its handshake slots before it accepts, so while every
+/// slot is busy a connected socket waits in the kernel accept queue, and that
+/// wait counts against the client's timer, which starts once TCP connects,
+/// but not against the server's, which starts at accept. The extra five
+/// seconds absorb a short queue; no client bound can guarantee a handshake
+/// while a listener stays saturated.
+pub const CLIENT_TLS_HANDSHAKE_TIMEOUT: std::time::Duration =
+    SERVER_TLS_HANDSHAKE_TIMEOUT.saturating_add(std::time::Duration::from_secs(5));
+
 #[derive(Clone, Copy, Debug)]
 pub enum Service {
     ClusterApi,
@@ -103,8 +119,29 @@ fn file(env: &dyn Environment, name: &'static str) -> Result<Vec<u8>, TransportE
 #[derive(Clone, Debug)]
 pub struct ClientTransport {
     allow_plaintext: bool,
-    tls: Option<ClientTlsConfig>,
+    tls: Option<ClientTls>,
 }
+
+/// A client TLS config together with the handshake bound it sets, so the
+/// bound the connect helpers size their attempt caps from is the one applied.
+#[derive(Clone, Debug)]
+struct ClientTls {
+    config: ClientTlsConfig,
+    handshake_timeout: std::time::Duration,
+}
+
+impl ClientTls {
+    fn new(ca: Vec<u8>, name: String, handshake_timeout: std::time::Duration) -> Self {
+        Self {
+            config: ClientTlsConfig::new()
+                .ca_certificate(Certificate::from_pem(ca))
+                .domain_name(name)
+                .timeout(handshake_timeout),
+            handshake_timeout,
+        }
+    }
+}
+
 impl ClientTransport {
     pub async fn from_env(service: Service, uri: &Uri) -> Result<Self, TransportError> {
         Self::from_environment(service, uri, &ProcessEnvironment).await
@@ -113,6 +150,23 @@ impl ClientTransport {
         service: Service,
         uri: &Uri,
         env: &(dyn Environment + Sync),
+    ) -> Result<Self, TransportError> {
+        Self::from_environment_with_tls_handshake_timeout(
+            service,
+            uri,
+            env,
+            CLIENT_TLS_HANDSHAKE_TIMEOUT,
+        )
+        .await
+    }
+
+    /// [`Self::from_environment`] with a TLS handshake bound other than
+    /// [`CLIENT_TLS_HANDSHAKE_TIMEOUT`].
+    pub(crate) async fn from_environment_with_tls_handshake_timeout(
+        service: Service,
+        uri: &Uri,
+        env: &(dyn Environment + Sync),
+        tls_handshake_timeout: std::time::Duration,
     ) -> Result<Self, TransportError> {
         let ca = if uri.scheme_str() == Some("https") {
             let path = file_path(env, CA_ENV)?;
@@ -124,7 +178,7 @@ impl ClientTransport {
         } else {
             None
         };
-        Self::with_ca(service, uri, env, ca)
+        Self::with_ca(service, uri, env, ca, tls_handshake_timeout)
     }
 
     /// Load trust during synchronous client initialization, without opening a connection.
@@ -136,7 +190,7 @@ impl ClientTransport {
         } else {
             None
         };
-        Self::with_ca(service, uri, env, ca)
+        Self::with_ca(service, uri, env, ca, CLIENT_TLS_HANDSHAKE_TIMEOUT)
     }
 
     fn with_ca(
@@ -144,6 +198,7 @@ impl ClientTransport {
         uri: &Uri,
         env: &dyn Environment,
         ca: Option<Vec<u8>>,
+        tls_handshake_timeout: std::time::Duration,
     ) -> Result<Self, TransportError> {
         let allow_plaintext = insecure(env);
         match uri.scheme_str() {
@@ -169,12 +224,10 @@ impl ClientTransport {
                     })
                     .ok_or(TransportError::Missing(service.name_env()))?;
                 let ca = ca.ok_or(TransportError::Missing(CA_ENV))?;
-                let tls = ClientTlsConfig::new()
-                    .ca_certificate(Certificate::from_pem(ca))
-                    .domain_name(name);
+                let tls = ClientTls::new(ca, name, tls_handshake_timeout);
                 // Validate the fixed trust/name once before an endpoint discovery
                 // closure uses it for individual pod addresses.
-                Endpoint::from(uri.clone()).tls_config(tls.clone())?;
+                Endpoint::from(uri.clone()).tls_config(tls.config.clone())?;
                 Ok(Self {
                     allow_plaintext,
                     tls: Some(tls),
@@ -184,14 +237,86 @@ impl ClientTransport {
         }
     }
     pub fn endpoint(&self, endpoint: Endpoint) -> Result<Endpoint, TransportError> {
+        Ok(self.connect_endpoint(endpoint)?.endpoint)
+    }
+
+    /// Apply this transport to `endpoint` for the TCP connect helpers: the
+    /// result carries the handshake bound of the TLS config it applies.
+    pub fn connect_endpoint(&self, endpoint: Endpoint) -> Result<ConnectEndpoint, TransportError> {
         match endpoint.uri().scheme_str() {
-            Some("https") => Ok(
-                endpoint.tls_config(self.tls.clone().ok_or(TransportError::Missing(CA_ENV))?)?
-            ),
-            Some("http") if self.allow_plaintext => Ok(endpoint),
+            Some("https") => {
+                let tls = self.tls.as_ref().ok_or(TransportError::Missing(CA_ENV))?;
+                Ok(ConnectEndpoint {
+                    endpoint: endpoint.tls_config(tls.config.clone())?,
+                    tls_handshake_timeout: Some(tls.handshake_timeout),
+                })
+            }
+            Some("http") if self.allow_plaintext => Ok(ConnectEndpoint {
+                endpoint,
+                tls_handshake_timeout: None,
+            }),
             Some("http") => Err(TransportError::Plaintext),
             _ => Err(TransportError::Scheme),
         }
+    }
+}
+
+/// An endpoint with a [`ClientTransport`] applied, and the handshake bound of
+/// the TLS config it set (none for plaintext). Internal-RPC callers connect
+/// through it so the TCP connect helpers size their attempt caps from the
+/// bound actually applied.
+#[derive(Clone, Debug)]
+pub struct ConnectEndpoint {
+    endpoint: Endpoint,
+    tls_handshake_timeout: Option<std::time::Duration>,
+}
+
+impl ConnectEndpoint {
+    /// [`crate::connect_tcp_channel_with_retry`] with this endpoint's
+    /// handshake bound.
+    pub async fn connect_with_retry(
+        self,
+        service_name: &'static str,
+        target: impl AsRef<str>,
+        retry_policy: crate::GrpcRetryPolicy,
+    ) -> Result<tonic::transport::Channel, crate::TcpConnectError> {
+        crate::connect_tcp_channel_with_retry(
+            service_name,
+            target,
+            self.endpoint,
+            self.tls_handshake_timeout,
+            retry_policy,
+        )
+        .await
+    }
+
+    /// [`crate::connect_tcp_channel_with_retrying_redials`] with this
+    /// endpoint's handshake bound.
+    pub async fn connect_with_retrying_redials(
+        self,
+        service_name: &'static str,
+        attempt_timeout: std::time::Duration,
+        retry_policy: crate::GrpcRetryPolicy,
+    ) -> Result<tonic::transport::Channel, tonic::transport::Error> {
+        crate::connect_tcp_channel_with_retrying_redials(
+            service_name,
+            self.endpoint,
+            attempt_timeout,
+            self.tls_handshake_timeout,
+            retry_policy,
+        )
+        .await
+    }
+
+    /// The longest a [`Self::connect_with_retrying_redials`] dial or redial
+    /// with these arguments may take: [`crate::retrying_redial_bound`] with
+    /// this endpoint's handshake bound.
+    pub fn retrying_redial_bound(
+        &self,
+        retry_policy: crate::GrpcRetryPolicy,
+        attempt_timeout: std::time::Duration,
+    ) -> std::time::Duration {
+        crate::retrying_redial_bound(retry_policy, attempt_timeout, self.tls_handshake_timeout)
     }
 }
 
@@ -202,6 +327,17 @@ pub async fn client_endpoint(
     ClientTransport::from_env(service, endpoint.uri())
         .await?
         .endpoint(endpoint)
+}
+
+/// [`client_endpoint`] for the TCP connect helpers: see
+/// [`ClientTransport::connect_endpoint`].
+pub async fn client_connect_endpoint(
+    service: Service,
+    endpoint: Endpoint,
+) -> Result<ConnectEndpoint, TransportError> {
+    ClientTransport::from_env(service, endpoint.uri())
+        .await?
+        .connect_endpoint(endpoint)
 }
 
 pub fn server_builder() -> Result<crate::GrpcServer, TransportError> {
@@ -218,12 +354,10 @@ pub fn server_builder_from_environment(
         return Ok(builder);
     }
     let identity = Identity::from_pem(file(env, CERT_ENV)?, file(env, KEY_ENV)?);
-    // TLS negotiation happens before bearer admission, so an idle peer must
-    // not retain a pre-authentication handshake forever.
     Ok(builder.tls_config(
         ServerTlsConfig::new()
             .identity(identity)
-            .timeout(std::time::Duration::from_secs(10)),
+            .timeout(SERVER_TLS_HANDSHAKE_TIMEOUT),
     )?)
 }
 

@@ -76,7 +76,8 @@ RUN cargo chef cook --locked --release --recipe-path recipe.json \
       --bin space-api-svc \
       --bin space-template-publish \
       --bin space-data-plane-svc \
-      --bin space-cluster-controller
+      --bin space-cluster-controller \
+      --bin space-mock-branching-key-provider-svc
 
 FROM cook AS build
 
@@ -140,7 +141,8 @@ RUN cargo build --locked --release \
       --bin space-api-svc \
       --bin space-template-publish \
       --bin space-data-plane-svc \
-      --bin space-cluster-controller
+      --bin space-cluster-controller \
+      --bin space-mock-branching-key-provider-svc
 
 RUN bash scripts/build-runtime-supervisor.sh \
       target/release/space-runtime-supervisor-svc \
@@ -187,3 +189,7 @@ COPY --from=build /workspace/target/release/space-template-publish /artifacts/bi
 # data-plane and cluster-controller sets
 COPY --from=build /workspace/target/release/space-data-plane-svc /artifacts/bin/space-data-plane-svc
 COPY --from=build /workspace/target/release/space-cluster-controller /artifacts/bin/space-cluster-controller
+# Kind-only fixture: the in-repo intermediate-key broker the Kind
+# credential-manager authority uses (space-kind-key-broker); no production
+# image copies it.
+COPY --from=build /workspace/target/release/space-mock-branching-key-provider-svc /artifacts/bin/space-mock-branching-key-provider-svc

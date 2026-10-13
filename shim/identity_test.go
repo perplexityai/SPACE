@@ -147,18 +147,6 @@ func TestTelemetryIdentityPrecedence(t *testing.T) {
 				t.Errorf("resource service.version=%q, want %q", got, test.version)
 			}
 
-			// One identity per process: the metric point service must agree
-			// with the resource, whichever source won.
-			var pointService string
-			for _, attr := range constantPointAttributes(telemetryTags()) {
-				if string(attr.Key) == "service" {
-					pointService = attr.Value.AsString()
-				}
-			}
-			if pointService != test.service {
-				t.Errorf("metric point service=%q, want resource %q", pointService, test.service)
-			}
-
 			if got := strings.Join(telemetryTags(), ","); got != strings.Join(test.tags, ",") {
 				t.Errorf("DogStatsD tags=%q, want %q", got, test.tags)
 			}

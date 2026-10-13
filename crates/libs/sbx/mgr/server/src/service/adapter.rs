@@ -38,13 +38,6 @@ impl SandboxManager for SandboxManagerService {
         SandboxManagerService::delete(self, request).await
     }
 
-    async fn release_execution(
-        &self,
-        request: Request<ReleaseExecutionRequest>,
-    ) -> Result<Response<ReleaseExecutionResponse>, Status> {
-        SandboxManagerService::release_execution(self, request).await
-    }
-
     async fn list_auto_lifecycle_delete_receipts(
         &self,
         request: Request<ListAutoLifecycleDeleteReceiptsRequest>,

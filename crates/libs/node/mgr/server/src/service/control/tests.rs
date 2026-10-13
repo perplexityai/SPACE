@@ -84,3 +84,93 @@ fn other_ingress_iface_failures_stay_retryable_internal() {
         "resolve_ingress_iface_failed"
     );
 }
+
+/// UpdateCgroup forwards the sandbox's current execution and the requested
+/// limits, with memory clamped to the node's per-sandbox cap. A stale
+/// execution is refused before the runtime supervisor sees it.
+#[tokio::test]
+async fn update_cgroup_forwards_current_execution_with_clamped_memory() {
+    use crate::runtime_supervisor_client::tests::{SupervisorScript, scripted_in_process_client};
+    use crate::service::tests::service_tests::{
+        bind_test_execution, root_request, service_for_unit_tests, stale_test_fence,
+    };
+    use pplx_space_node_runtime_core::proto as supervisor;
+
+    let forwarded = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorder = std::sync::Arc::clone(&forwarded);
+    let mut service = service_for_unit_tests().await;
+    service.sandbox_cgroup_config = SandboxCgroupConfig {
+        vcpu_count: Some(2),
+        memory_mib: Some(4096),
+    };
+    service.runtime_supervisor = scripted_in_process_client(SupervisorScript {
+        update_cgroup: Some(std::sync::Arc::new(move |request| {
+            recorder.lock().unwrap().push(request);
+            Ok(supervisor::UpdateCgroupResponse {})
+        })),
+        ..Default::default()
+    });
+    let sandbox_id = pplx_space_common_core::types::SandboxId::new().to_string();
+    let fence = bind_test_execution(&service, &sandbox_id);
+    let request = |execution_fence| UpdateCgroupRequest {
+        sandbox_id: sandbox_id.clone(),
+        vcpu_count: Some(1),
+        memory_mib: Some(8192),
+        pids_max: Some(64),
+        execution_fence: Some(execution_fence),
+    };
+
+    let stale = service
+        .update_cgroup(root_request(request(stale_test_fence())))
+        .await
+        .unwrap_err();
+    assert_eq!(stale.code(), tonic::Code::FailedPrecondition, "{stale}");
+    assert!(forwarded.lock().unwrap().is_empty());
+
+    service
+        .update_cgroup(root_request(request(fence.clone())))
+        .await
+        .unwrap();
+    assert_eq!(
+        *forwarded.lock().unwrap(),
+        [supervisor::UpdateCgroupRequest {
+            execution_id: fence.execution_id,
+            sandbox_id: sandbox_id.clone(),
+            cgroup_limits: Some(supervisor::CgroupLimits {
+                vcpu_count: Some(1),
+                memory_mib: Some(4096),
+                pids_max: Some(64),
+            }),
+        }]
+    );
+}
+
+/// A supervisor refusal keeps its code; the message names the operation.
+#[tokio::test]
+async fn update_cgroup_reports_a_supervisor_refusal_with_its_code() {
+    use crate::service::tests::service_tests::{
+        bind_test_execution, root_request, service_for_unit_tests,
+    };
+
+    // The unit-test service's own supervisor refuses every RPC.
+    let service = service_for_unit_tests().await;
+    let sandbox_id = pplx_space_common_core::types::SandboxId::new().to_string();
+    let fence = bind_test_execution(&service, &sandbox_id);
+
+    let error = service
+        .update_cgroup(root_request(UpdateCgroupRequest {
+            sandbox_id,
+            execution_fence: Some(fence),
+            ..Default::default()
+        }))
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.code(), tonic::Code::Unimplemented, "{error}");
+    assert!(
+        error
+            .message()
+            .starts_with("runtime-supervisor update cgroup failed: "),
+        "{error}"
+    );
+}

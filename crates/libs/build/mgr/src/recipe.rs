@@ -4,8 +4,9 @@ use std::str::FromStr;
 use oci_spec::distribution::{ParseError as OciReferenceParseError, Reference as OciReference};
 use pplx_space_build_mgr_client::proto as build_proto;
 use pplx_space_common_core::types::{
-    ArtifactVersion, ArtifactVersionParseError, Digest, DigestParseError, TemplateReference,
-    TemplateReferenceParseError, TemplateRuntime, TemplateRuntimeError, TemplateSelector,
+    ArtifactVersion, ArtifactVersionParseError, Digest, DigestParseError, EnvKey, EnvMap,
+    EnvParseError, TemplateReference, TemplateReferenceParseError, TemplateRuntime,
+    TemplateRuntimeError, TemplateSelector,
 };
 use serde::Deserialize;
 
@@ -65,6 +66,13 @@ pub enum RecipeProtoError {
     RuntimePlacement,
     #[error("invalid runtime declaration: {0}")]
     Runtime(#[from] TemplateRuntimeError),
+    #[error("recipe step {index} {field}: {source}")]
+    Environment {
+        index: usize,
+        field: &'static str,
+        #[source]
+        source: EnvParseError,
+    },
     #[error("recipe metadata is required")]
     MissingMetadata,
     #[error("recipe build_config balloon mode is required")]
@@ -200,8 +208,8 @@ pub struct SourceConfig {
 pub struct NamedStep {
     /// User-supplied step name, retained as recipe data but omitted from diagnostics.
     pub display_name: Option<String>,
-    /// Host environment variable names to inject into this step.
-    pub env_refs: Vec<String>,
+    /// Guest names resolved from the operator's SPACE_BUILD_EXPORT_<NAME> values.
+    pub env_refs: Vec<EnvKey>,
     pub step: Step,
 }
 
@@ -219,7 +227,7 @@ pub enum Step {
         user: Option<String>,
     },
     Env {
-        vars: HashMap<String, String>,
+        vars: EnvMap,
     },
     Copy {
         payload: CopyPayload,
@@ -908,13 +916,23 @@ trait ProtoStepExt {
 
 impl ProtoStepExt for build_proto::recipe::Step {
     fn try_into_named_step(self, index: usize) -> Result<NamedStep, RecipeProtoError> {
+        let env_refs = self
+            .env_refs
+            .into_iter()
+            .map(EnvKey::try_from)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|source| RecipeProtoError::Environment {
+                index,
+                field: "env_refs",
+                source,
+            })?;
         let step = self
             .body
             .ok_or(RecipeProtoError::MissingStep { index })?
             .try_into_step(index)?;
         Ok(NamedStep {
             display_name: empty_to_none(self.display_name),
-            env_refs: self.env_refs,
+            env_refs,
             step,
         })
     }
@@ -962,7 +980,16 @@ impl ProtoStepBodyExt for build_proto::recipe::step::Body {
                     user: empty_to_none(step.user),
                 })
             }
-            build_proto::recipe::step::Body::Env(step) => Ok(Step::Env { vars: step.vars }),
+            build_proto::recipe::step::Body::Env(step) => {
+                let vars = EnvMap::try_from(step.vars).map_err(|source| {
+                    RecipeProtoError::Environment {
+                        index,
+                        field: "env",
+                        source,
+                    }
+                })?;
+                Ok(Step::Env { vars })
+            }
             build_proto::recipe::step::Body::Copy(step) => {
                 if step.dest.is_empty() {
                     return Err(RecipeProtoError::EmptyCopyDest { index });
@@ -1065,7 +1092,7 @@ impl std::fmt::Display for Step {
             Step::SetRuntime(_) => write!(f, "set runtime"),
             Step::ClearRuntime => write!(f, "clear runtime"),
             Step::Run { .. } => write!(f, "run"),
-            Step::Env { vars } => write!(f, "env ({} vars)", vars.len()),
+            Step::Env { vars } => write!(f, "env ({} vars)", vars.as_map().len()),
             Step::Copy { .. } => write!(f, "copy payload"),
             Step::PlaywrightInstall { browsers } => {
                 write!(f, "playwright-install ({} browsers)", browsers.len())

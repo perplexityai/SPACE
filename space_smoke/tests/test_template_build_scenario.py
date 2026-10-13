@@ -127,33 +127,33 @@ class _Builder:
 class _Control:
     def __init__(self, calls: list[str]) -> None:
         self.calls = calls
-        self.pods = ["space-builder-node-stack-a", "space-builder-node-stack-b"]
-        self.accepts_on = {"space-builder-node-stack-a"}
+        self.nodes = ["space-local-builder-a", "space-local-builder-b"]
+        self.accepts_on = {"space-local-builder-a"}
         self.handoff: str | None = None
         self.metadata = GuestMetadata("0.3.1", "0.3", "0.3.1")
         self.residue: list[str] = []
         self.delete_returns: str | None = "op-del"
         self.op_state = "succeeded"
 
-    def builder_node_stack_pods(self):
-        return list(self.pods)
+    def builder_nodes(self):
+        return list(self.nodes)
 
-    def route_builder_service(self, route, pod_name, *, timeout=30):
-        self.calls.append(f"route:{route}:{pod_name[-1]}")
+    def route_builder_service(self, route, node_name, *, timeout=30):
+        self.calls.append(f"route:{route}:{node_name[-1]}")
 
     def clear_builder_service_route(self):
         self.calls.append("route:clear")
 
-    def builder_logged_alias(self, pod_name, alias):
-        return pod_name in self.accepts_on
+    def builder_logged_alias(self, node_name, alias):
+        return node_name in self.accepts_on
 
-    def prepared_rootfs_handoff(self, pod_name, *, window_seconds=60):
+    def prepared_rootfs_handoff(self, node_name, *, window_seconds=60):
         return self.handoff
 
-    def published_guest_metadata(self, pod_name, alias):
+    def published_guest_metadata(self, node_name, alias):
         return self.metadata
 
-    def containerd_residue(self, pod_name, image):
+    def containerd_residue(self, node_name, image):
         return list(self.residue)
 
     def delete_template_as_admin(self, alias):
@@ -178,32 +178,32 @@ class Handoff(unittest.TestCase):
         build.pin_builders()
         build.build_through_sdk(accept_timeout=5, build_timeout=30)
         self.assertEqual(calls, ["route:clear", "route:submit:a", "build", "route:poll-peer:b", "route:clear"])
-        self.assertEqual(fixture.records["service_routed_to"], "space-builder-node-stack-b")
+        self.assertEqual(fixture.records["service_routed_to"], "space-local-builder-b")
         self.assertEqual(builder.built_with["alias"], build.alias)
         self.assertEqual(builder.built_with["tags"], ("latest", "kind-smoke"))
 
     def test_a_build_the_peer_accepted_hands_status_to_the_pinned_builder_and_inspects_the_peer(self) -> None:
         calls: list[str] = []
         control, builder = _Control(calls), _Builder(calls)
-        control.accepts_on = {"space-builder-node-stack-b"}
+        control.accepts_on = {"space-local-builder-b"}
         inspected: list[str] = []
-        control.published_guest_metadata = lambda pod, alias: (inspected.append(pod), control.metadata)[1]  # type: ignore[method-assign]
+        control.published_guest_metadata = lambda node, alias: (inspected.append(node), control.metadata)[1]  # type: ignore[method-assign]
         fixture, build, _ = _assertions(control, builder)
         build.pin_builders()
         build.build_through_sdk(accept_timeout=5, build_timeout=30)
-        self.assertEqual(fixture.records["accepted_by"], "space-builder-node-stack-b")
-        self.assertEqual(fixture.records["service_routed_to"], "space-builder-node-stack-a")
+        self.assertEqual(fixture.records["accepted_by"], "space-local-builder-b")
+        self.assertEqual(fixture.records["service_routed_to"], "space-local-builder-a")
         self.assertFalse(fixture.records["pinned_submit_honoured"])
         self.assertIn("route:poll-peer:a", calls)
         build.expect_guest_metadata_matches_bundle()
-        self.assertEqual(inspected, ["space-builder-node-stack-b"])
+        self.assertEqual(inspected, ["space-local-builder-b"])
 
     def test_one_builder_is_refused(self) -> None:
         calls: list[str] = []
         control = _Control(calls)
-        control.pods = ["space-builder-node-stack-a"]
+        control.nodes = ["space-local-builder-a"]
         _, build, _ = _assertions(control, _Builder(calls))
-        with self.assertRaisesRegex(InvariantViolation, "exactly two Ready builder"):
+        with self.assertRaisesRegex(InvariantViolation, "exactly two builders with a Ready node-api"):
             build.pin_builders()
 
     def test_a_build_never_accepted_fails_inside_the_budget(self) -> None:
@@ -388,6 +388,10 @@ class _ScriptedKubectl:
 
 
 ARGV = ("kubectl",)
+# The pod lookups on-node operations start with: the operator shell, and the
+# builder's node-api pod the Service is routed to.
+SHELL = CommandResult(ARGV, 0, "space-node-debug-a", "")
+NODE_API = CommandResult(ARGV, 0, "space-builder-node-api-a", "")
 
 
 def _harness(*results: CommandResult) -> tuple[KindHarness, _ScriptedKubectl]:
@@ -402,20 +406,26 @@ def _endpoints(*pods: str) -> str:
 class HarnessOps(unittest.TestCase):
     def test_routing_labels_patches_and_waits_for_the_single_endpoint(self) -> None:
         harness, kubectl = _harness(
+            NODE_API,
             CommandResult(ARGV, 0, "", ""),
             CommandResult(ARGV, 0, "", ""),
-            CommandResult(ARGV, 0, _endpoints("space-builder-node-stack-a", "space-builder-node-stack-b"), ""),
-            CommandResult(ARGV, 0, _endpoints("space-builder-node-stack-a"), ""),
+            CommandResult(ARGV, 0, _endpoints("space-builder-node-api-a", "space-builder-node-api-b"), ""),
+            CommandResult(ARGV, 0, _endpoints("space-builder-node-api-a"), ""),
         )
-        harness.route_builder_service("submit", "space-builder-node-stack-a", timeout=5)
-        self.assertIn("space.pplx.net/routing-smoke=submit", kubectl.calls[0])
-        self.assertIn("patch", kubectl.calls[1])
-        self.assertEqual(len(kubectl.calls), 4)
+        harness.route_builder_service("submit", "space-local-builder-a", timeout=5)
+        self.assertIn(
+            "app.kubernetes.io/name=space-builder,app.kubernetes.io/component=node-api",
+            kubectl.calls[0],
+        )
+        self.assertIn("space-builder-node-api-a", kubectl.calls[1])
+        self.assertIn("space.pplx.net/routing-smoke=submit", kubectl.calls[1])
+        self.assertIn("patch", kubectl.calls[2])
+        self.assertEqual(len(kubectl.calls), 5)
 
     def test_routing_refuses_an_unsafe_label_value(self) -> None:
         harness, _ = _harness()
         with self.assertRaises(ValueError):
-            harness.route_builder_service("submit; rm -rf /", "space-builder-node-stack-a")
+            harness.route_builder_service("submit; rm -rf /", "space-local-builder-a")
 
     def test_endpoint_parsing(self) -> None:
         self.assertEqual(_endpoint_target_pods(_endpoints("b", "a")), ["a", "b"])
@@ -423,25 +433,26 @@ class HarnessOps(unittest.TestCase):
         self.assertEqual(_endpoint_target_pods("not json"), [])
 
     def test_guest_metadata_reads_three_lines_and_refuses_a_foreign_alias(self) -> None:
-        harness, kubectl = _harness(CommandResult(ARGV, 0, "0.3.1+g12\n0.3.1+g12\n0.3\n", ""))
-        metadata = harness.published_guest_metadata("space-builder-node-stack-a", "space-smoke-oci-0123abcd")
+        harness, kubectl = _harness(SHELL, CommandResult(ARGV, 0, "0.3.1+g12\n0.3.1+g12\n0.3\n", ""))
+        metadata = harness.published_guest_metadata("space-local-builder-a", "space-smoke-oci-0123abcd")
         self.assertEqual(metadata, GuestMetadata("0.3.1+g12", "0.3", "0.3.1+g12"))
-        self.assertIn("/space/cache/firecracker/templates/space-smoke-oci-0123abcd", kubectl.calls[0][-1])
+        self.assertIn("/space/cache/firecracker/templates/space-smoke-oci-0123abcd", kubectl.calls[1][-1])
         with self.assertRaises(ValueError):
-            harness.published_guest_metadata("space-builder-node-stack-a", "seed")
+            harness.published_guest_metadata("space-local-builder-a", "seed")
 
     def test_containerd_residue_is_the_non_empty_lines(self) -> None:
-        harness, _ = _harness(CommandResult(ARGV, 0, "\ntemp-path: /x\n\n", ""))
-        self.assertEqual(harness.containerd_residue("space-builder-node-stack-a", OCI_IMAGE), ["temp-path: /x"])
+        harness, _ = _harness(SHELL, CommandResult(ARGV, 0, "\ntemp-path: /x\n\n", ""))
+        self.assertEqual(harness.containerd_residue("space-local-builder-a", OCI_IMAGE), ["temp-path: /x"])
 
     def test_a_failing_ctr_listing_is_an_inspection_failure_not_a_clean_result(self) -> None:
         # `|| true` on the listing would have turned an
         # unavailable containerd into an empty, passing residue list.
         harness, _ = _harness(
+            SHELL,
             CommandResult(ARGV, 3, "", "ctr: failed to dial /run/containerd/containerd.sock\nctr images list failed in the space-builds namespace")
         )
         with self.assertRaisesRegex(Exception, "inspect containerd build residue"):
-            harness.containerd_residue("space-builder-node-stack-a", OCI_IMAGE)
+            harness.containerd_residue("space-local-builder-a", OCI_IMAGE)
 
     @unittest.skipUnless(shutil.which("bash"), "needs bash")
     def test_the_residue_script_exits_non_zero_when_ctr_is_unavailable(self) -> None:
@@ -457,11 +468,13 @@ class HarnessOps(unittest.TestCase):
 
     def test_handoff_failure_text_comes_from_the_script(self) -> None:
         harness, _ = _harness(
+            SHELL,
             CommandResult(ARGV, 0, "", ""),
+            SHELL,
             CommandResult(ARGV, 1, "", "committed prepared rootfs was not observed"),
         )
-        self.assertIsNone(harness.prepared_rootfs_handoff("space-builder-node-stack-a"))
-        self.assertIn("not observed", harness.prepared_rootfs_handoff("space-builder-node-stack-a") or "")
+        self.assertIsNone(harness.prepared_rootfs_handoff("space-local-builder-a"))
+        self.assertIn("not observed", harness.prepared_rootfs_handoff("space-local-builder-a") or "")
 
 
 class GuestMetadataScript(unittest.TestCase):

@@ -1564,6 +1564,18 @@ impl EcwProxyError {
         )
     }
 
+    /// Never 503: 503 invites immediate retries, so only a 429 with a
+    /// jittered `Retry-After` spreads an upload burst out.
+    pub(super) fn too_many_uploads(retry_after: Duration) -> Self {
+        Self::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "Too many in-flight uploads; retry later",
+            ResponseOrigin::DataPlane,
+            ResponseKind::Admission,
+        )
+        .with_retry_after(retry_after)
+    }
+
     pub(super) fn internal(message: impl Into<String>) -> Self {
         Self::new(
             StatusCode::INTERNAL_SERVER_ERROR,

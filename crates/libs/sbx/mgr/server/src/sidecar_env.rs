@@ -55,6 +55,9 @@ const TELEMETRY_ENV_KEYS: &[&str] = &[
     // cadence has to cross the launch boundary with the endpoint it applies
     // to; the manager's interval never reaches the child.
     "OTEL_METRIC_EXPORT_INTERVAL",
+    // Likewise the temporality: a child left on the delta default would feed
+    // a cumulative-only pipeline the stream state its manager was moved off.
+    "OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE",
     "OTEL_EXPORTER_OTLP_HEADERS",
     "OTEL_EXPORTER_OTLP_METRICS_HEADERS",
 ];

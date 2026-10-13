@@ -1243,6 +1243,25 @@ impl NodeManager for LocalNodeManager {
         Ok(Response::new(DenyPortResponse {}))
     }
 
+    // The local node manager runs no runtime manager and has no node store.
+    async fn publish_artifact(
+        &self,
+        _request: Request<PublishArtifactRequest>,
+    ) -> Result<Response<PublishArtifactResponse>, Status> {
+        Err(Status::unimplemented(
+            "the local node manager has no artifact store",
+        ))
+    }
+
+    async fn remove_artifact(
+        &self,
+        _request: Request<RemoveArtifactRequest>,
+    ) -> Result<Response<RemoveArtifactResponse>, Status> {
+        Err(Status::unimplemented(
+            "the local node manager has no artifact store",
+        ))
+    }
+
     // ─── Btrfs delegation: force the Full ext4 codec ──────────────────────
 
     async fn btrfs_create_template_subvolume(
@@ -1277,6 +1296,62 @@ impl NodeManager for LocalNodeManager {
         &self,
         _request: Request<BtrfsEncodeSnapshotRootfsSendRequest>,
     ) -> Result<Response<BtrfsEncodeSnapshotRootfsSendResponse>, Status> {
+        Err(not_btrfs())
+    }
+
+    async fn btrfs_materialize_rootfs_send(
+        &self,
+        _request: Request<BtrfsMaterializeRootfsSendRequest>,
+    ) -> Result<Response<BtrfsEncodeRootfsSendResponse>, Status> {
+        Err(not_btrfs())
+    }
+
+    async fn btrfs_inspect_send_source(
+        &self,
+        _request: Request<BtrfsInspectSendSourceRequest>,
+    ) -> Result<Response<BtrfsInspectSendSourceResponse>, Status> {
+        // This runtime never retains send sources, so there is nothing to
+        // find. Unimplemented keeps callers from reading that as an absence.
+        Err(Status::unimplemented(
+            "local runtime does not retain btrfs send sources",
+        ))
+    }
+
+    async fn get_btrfs_send_capabilities(
+        &self,
+        _request: Request<GetBtrfsSendCapabilitiesRequest>,
+    ) -> Result<Response<GetBtrfsSendCapabilitiesResponse>, Status> {
+        Ok(Response::new(GetBtrfsSendCapabilitiesResponse {
+            supported: false,
+            inspect_send_source: false,
+        }))
+    }
+
+    type BtrfsReadSendSourceStream =
+        std::pin::Pin<Box<dyn tokio_stream::Stream<Item = Result<BtrfsSendChunk, Status>> + Send>>;
+
+    async fn btrfs_stage_send_source(
+        &self,
+        _request: Request<BtrfsStageSendSourceRequest>,
+    ) -> Result<Response<BtrfsSendLease>, Status> {
+        Err(not_btrfs())
+    }
+    async fn btrfs_read_send_source(
+        &self,
+        _request: Request<BtrfsSendLease>,
+    ) -> Result<Response<Self::BtrfsReadSendSourceStream>, Status> {
+        Err(not_btrfs())
+    }
+    async fn btrfs_delete_send_source(
+        &self,
+        _request: Request<BtrfsSendLease>,
+    ) -> Result<Response<BtrfsDeleteSendSourceResponse>, Status> {
+        Err(not_btrfs())
+    }
+    async fn btrfs_list_send_sources(
+        &self,
+        _request: Request<BtrfsListSendSourcesRequest>,
+    ) -> Result<Response<BtrfsListSendSourcesResponse>, Status> {
         Err(not_btrfs())
     }
 

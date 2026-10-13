@@ -13,7 +13,9 @@ workspace = true
 [features]
 default = []
 # Read published kernels from S3 or an S3-compatible store.
-s3 = ["dep:aws-sdk-s3"]
+s3 = ["dep:aws-sdk-s3", "dep:pplx-space-s3-http-client"]
+# Read Firecracker release archives from GitHub releases.
+github = ["dep:reqwest"]
 otel = ["pplx-space-common-svc/otel"]
 datadog = ["otel", "pplx-space-common-svc/datadog"]
 # Deprecated for one release; use otel and datadog.
@@ -23,11 +25,14 @@ datadog-otel = ["otel", "datadog"]
 async-trait = { workspace = true }
 aws-sdk-s3 = { workspace = true, optional = true, features = ["behavior-version-latest", "default-https-client", "http-1x", "rt-tokio"] }
 bytes = { workspace = true }
+flate2 = { workspace = true }
+http = { workspace = true }
 futures-util = { workspace = true }
 jiff = { workspace = true }
 libc = { workspace = true }
 md-5 = { workspace = true }
 nix = { workspace = true, features = ["user"] }
+reqwest = { workspace = true, optional = true }
 rusqlite = { workspace = true }
 rustix = { workspace = true, features = ["fs"] }
 serde = { workspace = true, features = ["derive"] }
@@ -35,6 +40,7 @@ serde_json = { workspace = true }
 sha2 = { workspace = true }
 sqlx = { workspace = true, features = ["macros", "migrate"] }
 thiserror = { workspace = true }
+tar = { workspace = true }
 tokio = { workspace = true, features = ["macros", "net", "rt", "sync", "time"] }
 tokio-stream = { workspace = true, features = ["net"] }
 tokio-util = { workspace = true, features = ["rt"] }
@@ -46,8 +52,10 @@ pplx-space-common-core = { workspace = true, features = ["rusqlite", "serde"] }
 pplx-space-common-jobs = { workspace = true }
 pplx-space-common-svc = { workspace = true, features = ["sqlite"] }
 pplx-space-execution-common = { workspace = true }
-pplx-space-node-runtime-core = { workspace = true }
+pplx-space-node-mgr-client = { workspace = true }
+pplx-space-node-runtime-core = { workspace = true, features = ["artifact-store"] }
 pplx-space-node-runtime-manager-client = { workspace = true }
+pplx-space-s3-http-client = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

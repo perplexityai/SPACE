@@ -145,7 +145,7 @@ async fn recovery_wait_does_not_hold_the_dependency_work_gate() {
     for path in [&capability, &admission, &work] {
         std::fs::File::create(path).unwrap();
     }
-    let service = SandboxManagerService::new(crate::db::test_conn());
+    let service = SandboxManagerService::for_test(crate::db::test_conn());
     service
         .enable_dependency_restart_drain(&capability, &admission, &work)
         .unwrap();
@@ -774,7 +774,7 @@ async fn grpc_writer_during_pre_handoff_drain_returns_retry_on_successor() {
     let listener =
         pplx_space_common_svc::bind_unix_socket(&socket_path, UnixSocketOptions::new(0o600))
             .unwrap();
-    let service = SandboxManagerService::new(rusqlite::Connection::open_in_memory().unwrap());
+    let service = SandboxManagerService::for_test(rusqlite::Connection::open_in_memory().unwrap());
     let rpc_drain_token = CancellationToken::new();
     let shutdown_token = CancellationToken::new();
     let server_shutdown = shutdown_token.clone();
@@ -821,7 +821,7 @@ async fn grpc_in_flight_request_interrupted_at_handoff_is_not_marked_replayable(
     let listener =
         pplx_space_common_svc::bind_unix_socket(&socket_path, UnixSocketOptions::new(0o600))
             .unwrap();
-    let service = SandboxManagerService::new(rusqlite::Connection::open_in_memory().unwrap());
+    let service = SandboxManagerService::for_test(rusqlite::Connection::open_in_memory().unwrap());
     let rpc_drain_token = CancellationToken::new();
     let shutdown_token = CancellationToken::new();
     let server_shutdown = shutdown_token.clone();

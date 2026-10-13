@@ -1271,6 +1271,7 @@ async fn k8s_store_postgres_behaviors() -> TestResult {
     finish_suspended_execution_clears_active_node_but_preserves_target_node(&fixture).await?;
     finish_suspended_execution_deletes_bound_claimed_pool_slot(&fixture).await?;
     committed_suspend_artifact_belongs_to_the_active_execution(&fixture).await?;
+    durable_suspend_snapshot_artifact_requires_this_suspends_snapshot(&fixture).await?;
     finish_suspended_execution_keeps_fresh_snapshot_portable(&fixture).await?;
     creating_snapshot_does_not_select_stale_remote_uri_until_ready(&fixture).await?;
     suspend_restore_selector_ignores_orphaned_storage_locations(&fixture).await?;
@@ -6356,6 +6357,163 @@ async fn suspend_commit_finishes_after_exact_execution_is_forgotten(
         .store
         .finish_suspended_execution(sandbox_id, generation, &pod_uid, published_artifact)
         .await?;
+    Ok(())
+}
+
+async fn durable_suspend_snapshot_artifact_requires_this_suspends_snapshot(
+    fixture: &PostgresStore,
+) -> TestResult {
+    let node = NodeId::new();
+    let other_node = NodeId::new();
+    for (id, name) in [(node, "suspend-node"), (other_node, "other-node")] {
+        sqlx::query(sql!(
+            "INSERT INTO nodes (id, address, role, managed_by, state)
+             VALUES ($1, '10.0.0.30', 'worker', 'k8s', 'ready')"
+        ))
+        .bind(id)
+        .execute(&fixture.pool)
+        .await?;
+        sqlx::query(sql!(
+            "INSERT INTO node_k8s (node_id, k8s_node_name) VALUES ($1, $2)"
+        ))
+        .bind(id)
+        .bind(name)
+        .execute(&fixture.pool)
+        .await?;
+    }
+    // (case, snapshot node, taken before the suspend began, live location, accepted)
+    let cases = [
+        ("this suspend's snapshot", node, false, true, true),
+        ("an earlier suspend's snapshot", node, true, true, false),
+        ("another node's snapshot", other_node, false, true, false),
+        ("an orphaned snapshot", node, false, false, false),
+    ];
+    for (case, source_node, before_suspend, live_location, accepted) in cases {
+        let sandbox_id = SandboxId::new();
+        let artifact = super::super::super::PublishedLocalArtifact {
+            id: LocalArtifactId::new(),
+            kind: ArtifactKind::Full,
+        };
+        insert_sandbox(&fixture.pool, sandbox_id, "suspending").await?;
+        sqlx::query(sql!(
+            "UPDATE sandboxes SET placement = 'on_node', active_node_id = $2 WHERE id = $1"
+        ))
+        .bind(sandbox_id)
+        .bind(node)
+        .execute(&fixture.pool)
+        .await?;
+        let execution = fixture
+            .store
+            .ensure_active_execution_row(sandbox_id)
+            .await?;
+        let generation = ExecutionGeneration::new(execution.generation)?;
+        let pod_uid = PodUid::parse("suspend-pod-uid")?;
+        fixture
+            .store
+            .persist_pod_metadata(
+                sandbox_id,
+                execution.generation,
+                Some(pod_uid.as_str()),
+                Some("100.64.101.30"),
+            )
+            .await?;
+        let snapshot_id = Uuid::now_v7();
+        sqlx::query(sql!(
+            "INSERT INTO snapshots
+                 (id, sandbox_id, type, state, timestamp, source_node_id, org_id,
+                  local_artifact_id, artifact_kind, artifact_origin)
+             VALUES ($1, $2, 'full', 'ready',
+                     CASE WHEN $5 THEN NOW() - INTERVAL '1 hour' ELSE NOW() + INTERVAL '1 second' END,
+                     $3, '00000000-0000-0000-0000-000000000001', $4, 'full', 'suspend')"
+        ))
+        .bind(snapshot_id)
+        .bind(sandbox_id)
+        .bind(source_node)
+        .bind(artifact.id.as_uuid())
+        .bind(before_suspend)
+        .execute(&fixture.pool)
+        .await?;
+        sqlx::query(sql!(
+            "INSERT INTO snapshot_storage_locations
+                 (snapshot_id, storage_connection_string, org_id, orphaned_at)
+             VALUES ($1, 's3://space-test/suspend?region=us-east-1',
+                     '00000000-0000-0000-0000-000000000001',
+                     CASE WHEN $2 THEN NULL ELSE NOW() END)"
+        ))
+        .bind(snapshot_id)
+        .bind(live_location)
+        .execute(&fixture.pool)
+        .await?;
+
+        let found = fixture
+            .store
+            .durable_suspend_snapshot_artifact(sandbox_id, generation, &pod_uid)
+            .await?;
+        assert_eq!(found, accepted.then_some(artifact), "{case}");
+        if accepted {
+            // The handoff then runs as for the node's published identity:
+            // nothing is committed yet, the commit takes the recovered
+            // artifact, and finishing leaves the sandbox suspended.
+            assert_eq!(
+                fixture
+                    .store
+                    .committed_suspend_artifact(sandbox_id, generation, &pod_uid)
+                    .await?,
+                None,
+                "{case}"
+            );
+            fixture
+                .store
+                .persist_or_accept_suspend_commit(sandbox_id, generation, &pod_uid, artifact)
+                .await?;
+            assert_eq!(
+                fixture
+                    .store
+                    .committed_suspend_artifact(sandbox_id, generation, &pod_uid)
+                    .await?,
+                Some(artifact),
+                "{case}"
+            );
+            fixture
+                .store
+                .finish_suspended_execution(sandbox_id, generation, &pod_uid, artifact)
+                .await?;
+            let (lifecycle, placement, marker, execution_active, execution_state): (
+                String,
+                String,
+                Option<Uuid>,
+                bool,
+                String,
+            ) = sqlx::query_as(sql!(
+                "SELECT s.lifecycle, s.placement, s.current_local_artifact_id, e.active, e.state
+                   FROM sandboxes s
+                   JOIN sandbox_k8s_executions e
+                     ON e.sandbox_id = s.id AND e.generation = $2
+                  WHERE s.id = $1"
+            ))
+            .bind(sandbox_id)
+            .bind(generation.get())
+            .fetch_one(&fixture.pool)
+            .await?;
+            assert_eq!(
+                (
+                    lifecycle.as_str(),
+                    placement.as_str(),
+                    marker,
+                    execution_active,
+                    execution_state.as_str()
+                ),
+                (
+                    "suspended",
+                    "unplaced",
+                    Some(artifact.id.as_uuid()),
+                    false,
+                    "suspended"
+                ),
+                "{case}"
+            );
+        }
+    }
     Ok(())
 }
 

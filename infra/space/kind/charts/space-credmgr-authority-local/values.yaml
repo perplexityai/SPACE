@@ -1,0 +1,83 @@
+# The credential-manager authority as a control-plane Deployment, named
+# space-credmgr-authority as in the EKS module
+# (infra/space/aws/eks/modules/space/credmgr_authority_kms.tf). It owns the
+# control-plane database's credential tables and the platform KEK. Every
+# node's credential-manager runs as its agent and forwards to it
+# (space-credential-manager-local); node-manager calls it directly for sandbox
+# volume DEKs.
+
+image:
+  repository: space-worker
+  tag: local
+  pullPolicy: IfNotPresent
+
+datadogEnvironment: kind-local
+datadogTeam: team-space
+clusterId: kind-local
+telemetry: {}
+
+nodeSelector:
+  space.pplx.net/infra: "true"
+
+# TCP listener. The port is the binary's documented example
+# (`--tcp-listen 0.0.0.0:9810`, crates/apps/credential/mgr/svc/src/main.rs);
+# no public source fixes a production port.
+service:
+  name: space-credmgr-authority
+  port: 9810
+
+postgres:
+  secretName: space-postgres
+  secretKey: POSTGRES_CONNECTION_STRING
+  # credential-manager's pool connects as space_creds; the role is
+  # provisioned by the api chart's bootstrap-roles initContainer.
+  managedCredentialsPassword: space-dev-creds
+
+# Callers the authority admits, by ServiceAccount, as the client service each
+# one is (`account=service`, crates/libs/credential/mgr/server/src/k8s_identity.rs).
+# Each node's credential-manager agent forwards its node services' calls;
+# node-manager fetches sandbox volume DEKs directly (GetOrIssueSandboxVolumeDek
+# admits only node-manager, crates/libs/credential/mgr/server/src/service.rs).
+allowedServiceAccounts:
+  - space-credential-manager
+  - space-builder-credential-manager=space-credential-manager
+  - space-node-manager
+  - space-builder-node-manager=space-node-manager
+
+# Credentials for the authority's own AWS integrations (AWS Secrets Manager
+# network-credential references, resolved only where the database pool lives,
+# crates/libs/credential/mgr/server/src/run.rs): the optional
+# `space-aws-creds` Secret bootstrap creates from private.env.
+awsRegion: us-east-1
+
+# The external key provider behind the platform KEK: the Kind-only broker
+# fixture (space-kind-key-broker). The tenant namespace is the durable
+# cryptographic tenant binding the broker sees with every org id, so it must
+# never change while data protected by those keys is kept
+# (proto/credential/provider/v2/README.md); the grant scheme names evidence
+# only federated orgs send. Both are Kind values of the URN shape the code's
+# tests use; no public source fixes production ones.
+keyBroker:
+  url: http://space-kind-key-broker:50051
+  tokenSecretName: space-kind-key-broker-token
+  tenantNamespace: urn:space:kind-local:org
+  grantScheme: urn:space:kind-local:grant:v1
+
+# Two replicas, as the EKS module runs on clusters with live authority traffic
+# (infra/space/aws/eks/modules/space/variables.tf). They share no process
+# state: keys come from the broker, and key provisioning and volume DEK
+# writes are first-writer-wins in Postgres (kek_provisioning.rs,
+# volume_wrap_store.rs). Kind has one infra node, so both run there.
+replicas: 2
+
+# The TCP-only authority has no service mutex or drain budget of its own: on
+# SIGTERM tonic's serve_with_shutdown stops accepting and finishes in-flight
+# unary RPCs (serve_tcp_until, crates/libs/credential/mgr/server/src/run.rs).
+# The Kubernetes default grace covers that.
+terminationGracePeriodSeconds: 30
+
+# Kind sizing: requests only (see space-node-manager-local/values.yaml).
+resources:
+  requests:
+    cpu: 20m
+    memory: 64Mi

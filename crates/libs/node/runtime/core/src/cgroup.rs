@@ -7,15 +7,10 @@
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use pplx_space_common_core::types::{SandboxId, VcpuCount};
 
 use crate::cgroup_paths::{CGROUP_BASE, jailer_cgroup_path};
-const REMOVE_ATTEMPTS: usize = 55;
-const REMOVE_FAST_RETRY_ATTEMPTS: usize = 50;
-const REMOVE_FAST_RETRY_DELAY: Duration = Duration::from_millis(5);
-const REMOVE_RETRY_DELAY: Duration = Duration::from_millis(50);
 pub const DEFAULT_VCPU_COUNT: u32 = 2;
 pub const DEFAULT_SANDBOX_GUEST_MEMORY_MAX_MIB: u64 = 8192;
 pub const DEFAULT_SANDBOX_MEMORY_HEADROOM_MIB: u64 = 128;
@@ -25,7 +20,7 @@ pub const DEFAULT_PARENT_CPU_RESERVED_COUNT: u32 = 2;
 const MIB_BYTES: u64 = 1024 * 1024;
 const CGROUP_CPU_PERIOD_US: u64 = 100_000;
 
-#[derive(Default)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct CgroupCleanupReport {
     pub paths_present: usize,
     pub paths_removed: usize,
@@ -36,12 +31,128 @@ pub struct CgroupCleanupReport {
 }
 
 #[derive(Debug, thiserror::Error)]
-#[error("failed to remove cgroup {path} after {attempts} attempts: {source}")]
-struct CgroupRemovalError {
+#[error("failed to remove cgroup {path}: {source}")]
+pub struct CgroupRemovalError {
     path: PathBuf,
-    attempts: usize,
     #[source]
     source: std::io::Error,
+}
+
+#[derive(Clone, Copy)]
+pub enum CgroupScope {
+    Sandbox,
+    Firecracker,
+}
+
+impl CgroupScope {
+    fn paths(self, sandbox_id: SandboxId) -> Vec<PathBuf> {
+        match self {
+            Self::Sandbox => sandbox_cgroup_paths(&sandbox_id.to_string()).to_vec(),
+            Self::Firecracker => vec![jailer_cgroup_path(&sandbox_id.to_string())],
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum CgroupRemovalOutcome {
+    Removed(CgroupCleanupReport),
+    Busy {
+        path: PathBuf,
+        observation: CgroupBusyObservation,
+    },
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum CgroupBusyObservation {
+    #[error(
+        "still populated (direct processes={processes:?}, threads={threads:?}, children={children:?})"
+    )]
+    Populated {
+        processes: Option<usize>,
+        threads: Option<usize>,
+        children: Option<usize>,
+    },
+    #[error("removal pending: {0}")]
+    Removal(std::io::Error),
+}
+
+/// One termination attempt under the caller's execution fence. The async
+/// supervisor owns the deadline and waits between attempts without retaining
+/// a blocking thread or blocking-work permit.
+pub fn try_terminate_sandbox_cgroups(
+    sandbox_id: SandboxId,
+    scope: CgroupScope,
+) -> Result<CgroupRemovalOutcome, CgroupRemovalError> {
+    try_terminate_cgroup_paths(&scope.paths(sandbox_id))
+}
+
+fn try_terminate_cgroup_paths(
+    paths: &[PathBuf],
+) -> Result<CgroupRemovalOutcome, CgroupRemovalError> {
+    let mut report = CgroupCleanupReport::default();
+    // Signal every selected tree before observing any. SIGKILL delivery is not
+    // proof of exit: teardown can outlive the last cgroup.procs entry.
+    for path in paths {
+        if request_cgroup_kill(path) {
+            report.cgroup_kill_requests += 1;
+        } else {
+            report.killed_pids += kill_cgroup_processes(path);
+        }
+    }
+    let mut pending = None;
+    for path in paths {
+        let quiet = cgroup_is_quiescent(path).map_err(|source| CgroupRemovalError {
+            path: path.clone(),
+            source,
+        })?;
+        if !quiet {
+            pending = Some(CgroupRemovalOutcome::Busy {
+                path: path.clone(),
+                // These racy diagnostics never substitute for cgroup.events.
+                observation: CgroupBusyObservation::Populated {
+                    processes: cgroup_task_ids_result(path, "cgroup.procs")
+                        .ok()
+                        .map(|ids| ids.len()),
+                    threads: cgroup_task_ids_result(path, "cgroup.threads")
+                        .ok()
+                        .map(|ids| ids.len()),
+                    children: fs::read_dir(path)
+                        .and_then(|mut entries| {
+                            entries.try_fold(0, |count, entry| {
+                                Ok(count + usize::from(entry?.file_type()?.is_dir()))
+                            })
+                        })
+                        .ok(),
+                },
+            });
+            continue;
+        }
+        match remove_cgroup_path(path) {
+            Ok(path_report) => report.include(path_report),
+            Err(error)
+                if error.source.raw_os_error() == Some(libc::EBUSY)
+                    || error.source.kind() == std::io::ErrorKind::Interrupted =>
+            {
+                pending = Some(CgroupRemovalOutcome::Busy {
+                    path: error.path,
+                    observation: CgroupBusyObservation::Removal(error.source),
+                });
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(pending.unwrap_or(CgroupRemovalOutcome::Removed(report)))
+}
+
+impl CgroupCleanupReport {
+    fn include(&mut self, path: CgroupPathCleanupReport) {
+        self.paths_present += usize::from(path.present);
+        self.paths_removed += usize::from(path.removed);
+        self.attempts += path.attempts;
+        self.cgroup_kill_requests += path.cgroup_kill_requests;
+        self.killed_pids += path.killed_pids;
+        self.child_cgroups_removed += path.child_cgroups_removed;
+    }
 }
 
 #[derive(Default)]
@@ -595,84 +706,9 @@ pub fn reclaim_unpopulated_cgroup(cgroup_path: &Path) -> Result<OrphanReclaimOut
     if cgroup_populated(cgroup_path) {
         return Ok(OrphanReclaimOutcome::Populated);
     }
-    remove_child_cgroups(cgroup_path);
-    match fs::remove_dir(cgroup_path) {
-        Ok(()) => Ok(OrphanReclaimOutcome::Reclaimed),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            Ok(OrphanReclaimOutcome::Reclaimed)
-        }
-        Err(error) => Err(format!(
-            "failed to reclaim orphan cgroup {}: {error}",
-            cgroup_path.display()
-        )),
-    }
-}
-
-/// Remove all cgroups owned by a sandbox.
-///
-/// SPACE creates two cgroup families per Firecracker sandbox:
-/// - `sbx-{sandbox_id}` for sidecar processes launched by node-manager.
-/// - `{sandbox_id}` for the Firecracker/jailer cgroup created by jailer.
-///
-/// Process exit and cgroup unpopulation can lag behind SIGKILL under high delete
-/// fanout, so removal is retried briefly instead of doing a single best-effort
-/// `rmdir` that can leave empty cgroups behind forever.
-pub fn remove_sandbox_cgroups(sandbox_id: &str) -> Result<(), Vec<String>> {
-    remove_sandbox_cgroups_with_report(sandbox_id).map(|_| ())
-}
-
-pub fn remove_sandbox_cgroups_with_report(
-    sandbox_id: &str,
-) -> Result<CgroupCleanupReport, Vec<String>> {
-    remove_sandbox_cgroups_with_report_attempts(sandbox_id, REMOVE_ATTEMPTS)
-}
-
-fn remove_sandbox_cgroups_with_report_attempts(
-    sandbox_id: &str,
-    remove_attempts: usize,
-) -> Result<CgroupCleanupReport, Vec<String>> {
-    let typed_sandbox_id = sandbox_id
-        .parse::<SandboxId>()
-        .map_err(|error| vec![format!("invalid sandbox id {sandbox_id:?}: {error}")])?;
-    let mut errors = Vec::new();
-    let mut report = CgroupCleanupReport::default();
-
-    for cgroup_path in sandbox_cgroup_paths(sandbox_id) {
-        match remove_cgroup_path(typed_sandbox_id, &cgroup_path, remove_attempts) {
-            Ok(path_report) => {
-                if path_report.present {
-                    report.paths_present += 1;
-                }
-                if path_report.removed {
-                    report.paths_removed += 1;
-                }
-                report.attempts += path_report.attempts;
-                report.cgroup_kill_requests += path_report.cgroup_kill_requests;
-                report.killed_pids += path_report.killed_pids;
-                report.child_cgroups_removed += path_report.child_cgroups_removed;
-            }
-            Err(error) => {
-                errors.push(error.to_string());
-            }
-        }
-    }
-
-    if errors.is_empty() {
-        Ok(report)
-    } else {
-        Err(errors)
-    }
-}
-
-/// Remove the sidecar cgroup for a sandbox.
-///
-/// Kept for callers that intentionally only manage node-manager-launched
-/// sidecars. Most sandbox cleanup paths should use `remove_sandbox_cgroups`.
-pub fn remove_cgroup(sandbox_id: SandboxId) {
-    let cgroup_path = PathBuf::from(sidecar_cgroup_path(&sandbox_id));
-    if let Err(error) = remove_cgroup_path(sandbox_id, &cgroup_path, REMOVE_ATTEMPTS) {
-        tracing::warn!(%sandbox_id, %error, "failed to remove sandbox sidecar cgroup");
-    }
+    remove_cgroup_path(cgroup_path)
+        .map(|_| OrphanReclaimOutcome::Reclaimed)
+        .map_err(|error| error.to_string())
 }
 
 fn sandbox_cgroup_paths(sandbox_id: &str) -> [PathBuf; 2] {
@@ -696,105 +732,31 @@ fn sidecar_cgroup_path_buf(sandbox_id: &str) -> PathBuf {
     PathBuf::from(sidecar_cgroup_path_str(sandbox_id))
 }
 
-fn remove_cgroup_path(
-    sandbox_id: SandboxId,
-    cgroup_path: &Path,
-    remove_attempts: usize,
-) -> Result<CgroupPathCleanupReport, CgroupRemovalError> {
-    if !cgroup_path.exists() {
-        return Ok(CgroupPathCleanupReport::default());
-    }
-
-    let mut last_error = None;
-    let mut report = CgroupPathCleanupReport {
-        present: true,
-        ..Default::default()
+fn remove_cgroup_path(cgroup_path: &Path) -> Result<CgroupPathCleanupReport, CgroupRemovalError> {
+    let fail = |source| CgroupRemovalError {
+        path: cgroup_path.to_owned(),
+        source,
     };
-
-    let cgroup_kill_supported = request_cgroup_kill(cgroup_path);
-    if cgroup_kill_supported {
-        report.cgroup_kill_requests += 1;
-    }
-
-    for attempt in 0..remove_attempts {
-        report.attempts += 1;
-        let killed_pids = if cgroup_kill_supported {
-            0
-        } else {
-            kill_cgroup_processes(cgroup_path)
-        };
-        report.killed_pids += killed_pids;
-
-        // `cgroup.kill` reaps the subtree's processes, but the child cgroup
-        // directories themselves (e.g. a jailer-created nested cgroup) are not
-        // removed by it, and `rmdir` of a parent that still has descendants
-        // returns EBUSY. Remove any descendant cgroups bottom-up first.
-        let child_cgroups_removed = remove_child_cgroups(cgroup_path);
-        report.child_cgroups_removed += child_cgroups_removed;
-
-        match fs::remove_dir(cgroup_path) {
-            Ok(()) => {
-                report.removed = true;
-                return Ok(report);
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                report.removed = true;
-                return Ok(report);
-            }
-            Err(error) => {
-                if error.raw_os_error() == Some(libc::EBUSY) {
-                    let retry_delay =
-                        (attempt + 1 < remove_attempts).then(|| remove_retry_delay(attempt));
-                    let populated = read_cgroup_populated(cgroup_path);
-                    let direct_processes = cgroup_process_ids_result(cgroup_path);
-                    let direct_threads = cgroup_task_ids_result(cgroup_path, "cgroup.threads");
-                    let direct_children = fs::read_dir(cgroup_path).map(|entries| {
-                        entries
-                            .flatten()
-                            .filter_map(|entry| entry.file_type().ok())
-                            .filter(std::fs::FileType::is_dir)
-                            .count()
-                    });
-                    tracing::info!(
-                        %sandbox_id,
-                        cgroup_path = %cgroup_path.display(),
-                        cgroup_remove_attempt = attempt + 1,
-                        cgroup_remove_max_attempts = remove_attempts,
-                        cgroup_retry_will_continue = retry_delay.is_some(),
-                        cgroup_retry_delay_ms = retry_delay.map_or(0, |delay| delay.as_millis() as u64),
-                        cgroup_kill_requested = cgroup_kill_supported,
-                        cgroup_populated = populated.as_ref().copied().unwrap_or(false),
-                        cgroup_population_known = populated.is_ok(),
-                        cgroup_direct_process_count = direct_processes.as_ref().map_or(0, Vec::len),
-                        cgroup_direct_process_count_known = direct_processes.is_ok(),
-                        cgroup_direct_thread_count = direct_threads.as_ref().map_or(0, Vec::len),
-                        cgroup_direct_thread_count_known = direct_threads.is_ok(),
-                        cgroup_direct_child_count = direct_children.as_ref().copied().unwrap_or(0),
-                        cgroup_direct_child_count_known = direct_children.is_ok(),
-                        cgroup_pids_killed_this_attempt = killed_pids,
-                        cgroup_child_dirs_removed_this_attempt = child_cgroups_removed,
-                        cgroup_population_error = ?populated.as_ref().err(),
-                        cgroup_process_read_error = ?direct_processes.as_ref().err(),
-                        cgroup_thread_read_error = ?direct_threads.as_ref().err(),
-                        cgroup_children_read_error = ?direct_children.as_ref().err(),
-                        %error,
-                        "cgroup removal returned EBUSY"
-                    );
-                }
-                last_error = Some(error);
-            }
+    match fs::symlink_metadata(cgroup_path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(CgroupPathCleanupReport::default());
         }
-
-        if attempt + 1 < remove_attempts {
-            std::thread::sleep(remove_retry_delay(attempt));
-        }
+        Err(error) => return Err(fail(error)),
+        Ok(_) => {}
     }
-
-    Err(CgroupRemovalError {
-        path: cgroup_path.to_path_buf(),
-        attempts: report.attempts,
-        source: last_error
-            .unwrap_or_else(|| std::io::Error::other("cgroup removal was not attempted")),
+    // Killing tasks does not remove descendant cgroup directories.
+    let child_cgroups_removed = remove_child_cgroups(cgroup_path);
+    match fs::remove_dir(cgroup_path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(fail(error)),
+    }
+    Ok(CgroupPathCleanupReport {
+        present: true,
+        removed: true,
+        attempts: 1,
+        child_cgroups_removed,
+        ..Default::default()
     })
 }
 
@@ -808,14 +770,6 @@ fn request_cgroup_kill(cgroup_path: &Path) -> bool {
         Err(_) => return false,
     };
     file.write_all(b"1").is_ok()
-}
-
-fn remove_retry_delay(attempt: usize) -> Duration {
-    if attempt < REMOVE_FAST_RETRY_ATTEMPTS {
-        REMOVE_FAST_RETRY_DELAY
-    } else {
-        REMOVE_RETRY_DELAY
-    }
 }
 
 /// Recursively removes descendant cgroup directories bottom-up, returning the

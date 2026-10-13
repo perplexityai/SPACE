@@ -13,10 +13,9 @@ import space_smoke as smoke
 #
 # One restart proves the whole table. The scenario plants five small throwaway
 # builds on the sandbox-pool worker that is *not* running its sandbox, puts
-# each into the state one branch handles, deletes that worker's node-stack pod
-# once (the supervisor's contract makes any single-service restart a pod
-# restart anyway), and reads the verdicts from the new pod's log — then checks
-# each against disk and `space-tmplmgr get`. The plants have no cluster
+# each into the state one branch handles, deletes that worker's
+# template-manager pod once, and reads the verdicts from the new pod's log —
+# then checks each against disk and `space-tmplmgr get`. The plants have no cluster
 # release, so a miss there cannot re-pull and the negative checks mean
 # something.
 #
@@ -27,8 +26,8 @@ import space_smoke as smoke
 # kind-only twice over: by fixture type and by the adapter's isolation guard.
 @smoke.scenario(
     "local.template_startup_recovery_decision_table",
-    # Five 4 MiB registrations, a node-stack pod replacement (a few minutes on
-    # kind), and recovery hashing one small artifact; the sandbox is idle.
+    # Five 4 MiB registrations, a template-manager pod replacement, and
+    # recovery hashing one small artifact; the sandbox is idle.
     sandbox=smoke.SandboxConfig(timeout=1500),
 )
 def template_startup_recovery_decision_table(test: smoke.KindEcw) -> None:
@@ -55,7 +54,7 @@ def template_startup_recovery_decision_table(test: smoke.KindEcw) -> None:
         drift = recovery.plant("drift")
         recovery.drift(drift)
 
-    with test.phase("restart that worker's node stack and wait for recovery to finish"):
+    with test.phase("restart that worker's template-manager and wait for recovery to finish"):
         report = recovery.restart_and_wait_for_recovery()
 
     with test.phase("a row with intact bytes is confirmed without hashing"):

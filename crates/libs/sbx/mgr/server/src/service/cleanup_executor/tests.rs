@@ -28,6 +28,157 @@ fn work(conn: &rusqlite::Connection, kill: bool) -> (JobId, CleanupWork) {
 }
 
 #[tokio::test]
+async fn blocking_stop_follows_a_retryable_attempt_to_durable_completion() {
+    use pplx_space_node_mgr_client::proto::{CleanupSandboxRequest, CleanupSandboxResponse};
+
+    let cleanups = Arc::new(Mutex::new(Vec::new()));
+    let node_manager = crate::node_manager_transport::fake::FakeNodeManager::default()
+        .unary("CleanupSandbox", {
+            let cleanups = Arc::clone(&cleanups);
+            move |request: CleanupSandboxRequest| {
+                let mut cleanups = cleanups.lock().unwrap();
+                cleanups.push(request);
+                if cleanups.len() == 1 {
+                    Err(Status::unavailable("runtime still exiting"))
+                } else {
+                    Ok(CleanupSandboxResponse::default())
+                }
+            }
+        })
+        .serve();
+    let conn = crate::db::test_conn();
+    let sandbox_id = SandboxId::new();
+    let subject = sandbox_id.to_string();
+    insert_test_sandbox(&conn, &subject, SandboxState::Stopping);
+    let service = crate::service::tests::node_manager_transport_tests::service_with_node_manager(
+        conn,
+        node_manager.connector(),
+    );
+    let execution_fence =
+        crate::db::node_execution_fence(&service.db.lock().unwrap(), &subject).unwrap();
+    assert!(execution_fence.is_some());
+    let label = SandboxRuntimeLabel::from_sandbox_id(sandbox_id);
+    let request = SynchronousCleanupRequest {
+        sandbox_id: &subject,
+        uuid8: label.as_str(),
+        keep_filesystem: true,
+        context: "blocking stop regression",
+        completion: CleanupCompletion::MarkStopped,
+        immediate_kill: true,
+        guest_flush: crate::db::cleanup_jobs::GuestFlush::Unrequested,
+        published_artifact: None,
+    };
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        service.run_cleanup_to_completion_using_admission(request, None, None, CleanupWait::Stop),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    // Each attempt asks node-manager for the stop the caller requested.
+    let requested = CleanupSandboxRequest {
+        execution_fence: execution_fence.map(Into::into),
+        sandbox_id: subject.clone(),
+        force: true,
+        keep_filesystem: true,
+        return_after_slot_release: true,
+        immediate_kill: true,
+    };
+    assert_eq!(*cleanups.lock().unwrap(), [requested.clone(), requested]);
+    assert_eq!(node_manager.calls(), ["CleanupSandbox", "CleanupSandbox"]);
+    assert_eq!(
+        crate::db::get_sandbox(&service.db.lock().unwrap(), &subject)
+            .unwrap()
+            .unwrap()
+            .state,
+        SandboxState::Stopped
+    );
+    service.shutdown_token.cancel();
+    service.task_tracker.close();
+    service.task_tracker.wait().await;
+}
+
+#[tokio::test]
+async fn stop_waiter_bounds_retries_without_losing_the_durable_job() {
+    use tonic::Code;
+    for (state, code, expected) in [
+        (
+            JobStatus::Pending,
+            Code::Unavailable,
+            Code::DeadlineExceeded,
+        ),
+        (
+            JobStatus::Pending,
+            Code::ResourceExhausted,
+            Code::DeadlineExceeded,
+        ),
+        (
+            JobStatus::Pending,
+            Code::DeadlineExceeded,
+            Code::DeadlineExceeded,
+        ),
+        (
+            JobStatus::Pending,
+            Code::PermissionDenied,
+            Code::PermissionDenied,
+        ),
+        (JobStatus::Pending, Code::Internal, Code::Internal),
+        (JobStatus::Pending, Code::Unknown, Code::Unavailable),
+        (JobStatus::Failed, Code::Unavailable, Code::Unavailable),
+        (JobStatus::Cancelled, Code::Unavailable, Code::Aborted),
+    ] {
+        let conn = crate::db::test_conn();
+        let (id, _) = work(&conn, true);
+        jobs::mark_job_running(&conn, &id).unwrap();
+        let failure = if code == Code::Unknown {
+            "legacy cleanup failure".to_owned()
+        } else {
+            serde_json::to_string(&CleanupFailure {
+                code: code as i32,
+                message: "test failure".into(),
+            })
+            .unwrap()
+        };
+        match state {
+            JobStatus::Pending => {
+                jobs::retry_running_job(&conn, &id, &failure, 30).unwrap();
+            }
+            JobStatus::Failed => {
+                jobs::fail_job_permanent(&conn, &id, &failure, None).unwrap();
+            }
+            JobStatus::Cancelled => {
+                jobs::request_job_cancellation(&conn, &id).unwrap();
+                jobs::mark_job_cancelled(&conn, &id).unwrap();
+            }
+            _ => unreachable!(),
+        }
+        let service = service_for_teardown_test(conn);
+        let budget = if expected == Code::DeadlineExceeded {
+            Duration::from_millis(50)
+        } else {
+            Duration::from_secs(5)
+        };
+        let result = service.wait_stop_cleanup_job(id, budget).await;
+        let error = result.unwrap_err();
+        assert_eq!(error.code(), expected, "{state:?} {code:?}");
+        if code == Code::Unknown {
+            assert_eq!(error.message(), failure);
+            let original = service.wait_cleanup_job(id).await.unwrap_err();
+            assert_eq!(original.code(), Code::Unavailable);
+            assert_eq!(original.message(), failure);
+        }
+        assert_eq!(
+            jobs::get_job(&service.db.lock().unwrap(), &id)
+                .unwrap()
+                .unwrap()
+                .status,
+            state.as_str()
+        );
+        assert!(service.cleanup_executor.waiters.lock().unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
 async fn burst_is_bounded_fair_coalesced_and_independent_of_waiter_cancellation() {
     let conn = crate::db::test_conn();
     let jobs: Vec<_> = (0..64).map(|n| work(&conn, n % 2 == 0)).collect();
@@ -412,14 +563,12 @@ async fn lifecycle_and_job_completion_commit_together_and_recover(
     );
     // Virtual time from here on. A case that registered an activation episode
     // also registered the sandbox with the snapshot scheduler, whose first tick
-    // opens a node-manager connection; that connect does not watch shutdown, so
-    // the drain below has to wait out its whole `tokio::time` retry budget
-    // (~9.5 s against an absent socket) before the task can observe the
-    // cancellation. Pausing collapses the backoff without changing what the
-    // drain observes: the connects still run and still fail, and every
-    // assertion after this point reads state the drain is required to have
-    // settled. Only the wait is virtual, so everything above runs on the real
-    // clock exactly as the executor's own timers need.
+    // opens a node-manager connection; that connect does not watch shutdown.
+    // The test service's node-manager is an absent socket dialed once, so the
+    // connect fails at once, and pausing only keeps any later scheduler timer
+    // from holding the drain on the real clock. Every assertion after this
+    // point reads state the drain is required to have settled. Everything
+    // above runs on the real clock exactly as the executor's own timers need.
     tokio::time::pause();
     service.shutdown_token.cancel();
     service.task_tracker.close();

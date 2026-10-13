@@ -200,7 +200,7 @@ async fn exercise_recovery(restore: bool) {
         SandboxManagerServiceOptions {
             credential_manager_socket_path: node_socket,
             shutdown_token: shutdown.clone(),
-            ..Default::default()
+            ..SandboxManagerServiceOptions::for_test()
         },
     );
     let _gateway = super::super::super::gateway_identity::tests::GatewayNode::attach(&mut service);
@@ -283,7 +283,7 @@ async fn exercise_recovery(restore: bool) {
             let _ = cleanup_tx.send(());
         },
     );
-    spawn_guarded_start_state_transition(&service, cleanup, {
+    spawn_guarded_start_state_transition(&service, &id, cleanup, {
         let db = service.db.clone();
         let id = id.clone();
         async move {

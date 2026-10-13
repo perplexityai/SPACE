@@ -24,7 +24,6 @@ struct FailedExtractionFixture {
 }
 
 #[cfg(target_os = "linux")]
-#[fixture]
 fn failed_extraction_fixture() -> FailedExtractionFixture {
     let tempdir = tempfile::tempdir().expect("create copy-tree test directory");
     let source = tempdir.path().join("source");
@@ -153,23 +152,42 @@ async fn real_oci_image_assembles_with_the_space_guest_bundle(
     .expect("inspect assembled rootfs");
 }
 
+// `copy_tree` escalates through sudo when not root. The pipe-status handling
+// under test needs no privilege, so the test runs in a child process whose
+// PATH holds only a pass-through `sudo` and the host's `tar`. The host's sudo
+// is unreachable: a shim that cannot execute fails the copy instead.
 #[cfg(target_os = "linux")]
-#[rstest]
-fn extraction_failure_is_not_masked_by_archive_sigpipe(
-    failed_extraction_fixture: FailedExtractionFixture,
-) {
-    let error = copy_tree(
-        &failed_extraction_fixture.source,
-        &failed_extraction_fixture.target,
-    )
-    .expect_err("extraction into a regular file must fail");
+#[test]
+fn extraction_failure_is_not_masked_by_archive_sigpipe() {
+    use std::os::unix::fs::PermissionsExt as _;
 
+    let bin = tempfile::tempdir().expect("create test PATH directory");
+    let tar = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+        .map(|dir| dir.join("tar"))
+        .find(|path| path.is_file())
+        .expect("tar on PATH");
+    std::os::unix::fs::symlink(&tar, bin.path().join("tar")).expect("link tar");
+    let sudo = bin.path().join("sudo");
+    // `exec` lets the archive die of SIGPIPE as it would under sudo; a
+    // shell parent would instead exit 141, an ordinary failure status.
+    fs::write(&sudo, "#!/bin/sh\nexec \"$@\"\n").expect("write sudo shim");
+    fs::set_permissions(&sudo, fs::Permissions::from_mode(0o755))
+        .expect("make sudo shim executable");
+    if !pplx_space_test_env::enter_test_process(&[("PATH", Some(bin.path().as_os_str()))]) {
+        return;
+    }
+    let fixture = failed_extraction_fixture();
+    let error = copy_tree(&fixture.source, &fixture.target)
+        .expect_err("extraction into a regular file must fail");
+
+    // GNU tar's fatal-error status, not the archive's SIGPIPE or a missing
+    // program's 127.
     assert!(
         matches!(
             error,
             RootfsAssemblyError::Command {
                 operation: RootfsAssemblyOperation::CopyOciRootfs,
-                code: Some(_),
+                code: Some(2),
             }
         ),
         "unexpected copy error: {error:?}"

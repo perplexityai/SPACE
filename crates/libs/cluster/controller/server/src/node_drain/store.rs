@@ -2345,7 +2345,8 @@ impl NodeDrainSink for SubstrateSink {
                         "drain_abandon_stale",
                         SandboxEventDetails::default()
                             .source_node_id(node_label.clone())
-                            .error(err.to_string()),
+                            .error(err.to_string())
+                            .logged_by_caller(),
                     );
                     tracing::warn!(
                         node_id = %node_id,
@@ -2676,7 +2677,8 @@ impl NodeDrainSink for SubstrateSink {
                     "drain_sandbox_failed_on_node",
                     SandboxEventDetails::default()
                         .source_node_id(node_label.clone())
-                        .error(err.to_string()),
+                        .error(err.to_string())
+                        .logged_by_caller(),
                 );
                 tracing::warn!(
                     node_id = %source_node_id,
@@ -3521,6 +3523,9 @@ pub(crate) async fn delete_terminating_node_and_record_tombstone(
     tx.commit().await?;
     Ok(true)
 }
+
+#[cfg(test)]
+mod lifecycle_writer_tests;
 
 #[cfg(test)]
 mod tests;

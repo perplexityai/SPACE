@@ -1,19 +1,14 @@
 #!/usr/bin/env bash
 # Download and install Firecracker + Jailer from GitHub Releases.
 #
-# Releases and kernels are pre-installed into the runtime manager's own roots,
-# in the layout its installs use, and listed in its seed manifest so it records
-# the kernels as its own at startup (07-sysctl.sh hands it the roots once its
-# account exists). The historical vendor paths are links to those roots, so
-# every reader keeps its path.
+# Bake the fixed execution pair into the vendor/cache paths used by launches.
+# Runtime-manager candidates live in a separate managed store, initially empty.
+# No execution path links into that store.
 #
 # Layout:
-#   /space/vendor/runtime-manager/firecracker/{version}/bin/{firecracker,jailer}
-#   /space/vendor/runtime-manager/kernels/{kernel-version}/vmlinux.bin
-#   /space/vendor/runtime-manager/kernels/{default,legacy-default} -> {kernel-version}
-#   /space/vendor/runtime-manager/seed.json   (the kernels pre-installed above)
-#   /space/vendor/firecracker -> runtime-manager/firecracker
-#   /space/vendor/kernels -> runtime-manager/kernels
+#   /space/vendor/firecracker/{version}/bin/{firecracker,jailer}
+#   /space/vendor/kernels/{kernel-version}/vmlinux.bin
+#   /space/vendor/kernels/{default,legacy-default} -> {kernel-version}
 #   /space/cache/firecracker/kernels/{kernel-version}/vmlinux.bin
 #   /space/cache/firecracker/kernels/default -> {kernel-version}
 #   /space/cache/firecracker/kernels/legacy-default -> {kernel-version}
@@ -63,30 +58,17 @@ normalize_version() {
   printf 'v%s\n' "${1#v}"
 }
 
-RTMGR_ROOT=/space/vendor/runtime-manager
-FIRECRACKER_ROOT="${RTMGR_ROOT}/firecracker"
-KERNEL_ROOT="${RTMGR_ROOT}/kernels"
-SEED_MANIFEST="${RTMGR_ROOT}/seed.json"
-# Where the runtime manager's S3 source records a kernel's object, so a seeded
-# kernel's record matches the one an install from the same object writes.
-KERNEL_SOURCE_BUCKET_URI="s3://spec.ccfc.min"
-KERNEL_SOURCE_QUERY="region=us-east-1&path_style=true"
-SEED_KERNELS=()
-
-# Point a historical vendor path at the runtime manager's root. `ln -sfn`
-# against an existing directory would create the link inside it instead.
-link_vendor_root() {
-  local link="$1" target="$2"
-  if [[ -e "$link" && ! -L "$link" ]]; then
-    echo "ERROR: ${link} exists and is not a link; the image would have two vendor roots" >&2
+FIRECRACKER_ROOT=/space/vendor/firecracker
+KERNEL_ROOT=/space/vendor/kernels
+# Baking is not a live-layout migration. Never follow a prior prototype's
+# redirection of execution paths into a mutable store.
+for root in "$FIRECRACKER_ROOT" "$KERNEL_ROOT"; do
+  if [[ -L "$root" ]]; then
+    echo "ERROR: rebuild from a clean base; $root is a symlink" >&2
     exit 1
   fi
-  ln -sfn "$target" "$link"
-}
-
-install -d -m 0755 -o root -g root "$RTMGR_ROOT" "$FIRECRACKER_ROOT" "$KERNEL_ROOT"
-link_vendor_root /space/vendor/firecracker runtime-manager/firecracker
-link_vendor_root /space/vendor/kernels runtime-manager/kernels
+  install -d -m 0755 -o root -g root "$root"
+done
 
 install_firecracker_release() {
   local version="$1"
@@ -135,9 +117,7 @@ install_guest_kernel() {
     exit 1
   fi
 
-  # The runtime manager names a kernel by its version alone, as its installs
-  # from this bucket do (`6.1.155` for `vmlinux-6.1.155`), and refuses a seed
-  # manifest naming one any other way.
+  # Keep version labels consistent across vendor and cache copies.
   kernel_version="$(basename "$kernel_key")"
   kernel_version="${kernel_version#vmlinux-}"
   if [[ ! "$kernel_version" =~ ^[0-9]+(\.[0-9]+)*(-[a-z0-9]+)*$ ]]; then
@@ -156,10 +136,6 @@ install_guest_kernel() {
   mkdir -p "$vendor_dir" "$asset_dir"
   install -o root -g root -m 0644 "$kernel_image" "${vendor_dir}/vmlinux.bin"
   install -o root -g root -m 0644 "$kernel_image" "${asset_dir}/vmlinux.bin"
-  SEED_KERNELS+=("$(printf '{"version":"%s","line":{"runtime":"firecracker","release":"%s"},"source":"%s/%s?%s","size":%s,"md5":"%s","sha256":"sha256:%s"}' \
-    "$kernel_version" "${ci_version#v}" "$KERNEL_SOURCE_BUCKET_URI" "$kernel_key" "$KERNEL_SOURCE_QUERY" \
-    "$(stat -c %s "$kernel_image")" "$(md5sum "$kernel_image" | awk '{print $1}')" \
-    "$(sha256sum "$kernel_image" | awk '{print $1}')")")
   rm -rf "$tmpdir"
   FIRECRACKER_KERNEL_VERSIONS+=("$kernel_version")
   echo "Installed guest kernel: ${kernel_version} ($(sha256sum "${asset_dir}/vmlinux.bin" | awk '{print $1}'))"
@@ -217,21 +193,10 @@ for version in "${FIRECRACKER_VERSIONS[@]}"; do
     "/space/cache/firecracker/assets/${version}/kernel/vmlinux.bin"
 done
 
-# The default symlink is used by operators and legacy callers. Runtime-aware
-# sandbox launches select a compatible version from the complete inventory.
+# New cold boots use the default release. Restores prefer their recorded
+# release, then a compatible default, then another compatible installed release.
 ln -sfn "${FIRECRACKER_DEFAULT_VERSION}" "${FIRECRACKER_ROOT}/default"
 ln -sfn "${FIRECRACKER_DEFAULT_VERSION}" /space/cache/firecracker/assets/default
-
-# The runtime manager reads this at startup and records each listed kernel
-# whose bytes match as its own. It is the image's evidence, so it stays
-# root-owned.
-{
-  printf '{"schema":1,"kernels":['
-  (IFS=,; printf '%s' "${SEED_KERNELS[*]}")
-  printf ']}\n'
-} > "${SEED_MANIFEST}.tmp"
-chmod 0644 "${SEED_MANIFEST}.tmp"
-mv -f "${SEED_MANIFEST}.tmp" "$SEED_MANIFEST"
 
 mkdir -p /space/bin
 ln -sf ../vendor/firecracker/default/bin/firecracker /space/bin/firecracker
@@ -248,7 +213,6 @@ echo "  Kernel default: /space/cache/firecracker/kernels/default -> ${FIRECRACKE
 echo "  Legacy kernel:  /space/cache/firecracker/kernels/legacy-default -> ${FIRECRACKER_LEGACY_KERNEL_VERSION}"
 echo "  Asset default: /space/cache/firecracker/assets/default -> ${FIRECRACKER_DEFAULT_VERSION}"
 echo "  Default:       ${FIRECRACKER_ROOT}/default -> ${FIRECRACKER_DEFAULT_VERSION}"
-echo "  Seed manifest: ${SEED_MANIFEST}"
 /space/bin/firecracker --version
 /space/bin/firecracker --snapshot-version
 /space/bin/jailer --version

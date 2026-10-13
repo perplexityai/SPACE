@@ -47,11 +47,13 @@ pplx-space-credmgr-client = { workspace = true }
 pplx-space-metrics = { workspace = true }
 pplx-space-object-store = { workspace = true }
 pplx-space-volmgr-client = { workspace = true }
+pplx-space-node-mgr-client = { workspace = true }
+tempfile = { workspace = true }
 
 [dev-dependencies]
+axum = { workspace = true }
 bytes = { workspace = true }
 pplx-space-common-grpc = { workspace = true }
-tempfile = { workspace = true }
 tonic-health = { workspace = true }
 tracing-subscriber = { workspace = true }
 # `test-util` enables `#[tokio::test(start_paused = true)]` so the codec

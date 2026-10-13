@@ -501,6 +501,8 @@ fn configure_pre_exec_socket(
 ///
 /// Jailer runs as root and drops to the specified UID/GID.
 /// Returns the jailer's child PID (which is the Firecracker PID).
+/// The supervisor owns cleanup after a partial launch, outside this blocking
+/// call, so waiting for cgroup drain does not occupy a blocking-work slot.
 pub fn launch_via_jailer(config: JailerLaunch<'_>) -> Result<u32, String> {
     let JailerLaunch {
         sandbox_id,
@@ -545,18 +547,8 @@ pub fn launch_via_jailer(config: JailerLaunch<'_>) -> Result<u32, String> {
         Ok(pid)
     });
 
-    let pid = match pid_result {
-        Ok(pid) => pid,
-        Err(error) => {
-            cleanup_failed_jailer_launch(sandbox_id);
-            return Err(error);
-        }
-    };
-
-    if let Err(error) = wait_for_firecracker_api_socket(sandbox_id, chroot_base_dir) {
-        cleanup_failed_jailer_launch(sandbox_id);
-        return Err(error);
-    }
+    let pid = pid_result?;
+    wait_for_firecracker_api_socket(sandbox_id, chroot_base_dir)?;
 
     Ok(pid)
 }
@@ -799,16 +791,6 @@ fn run_jailer_command(
             "{label} exited with {}; see console log {console_path}",
             status.code().unwrap_or(-1)
         ))
-    }
-}
-
-fn cleanup_failed_jailer_launch(sandbox_id: &str) {
-    if let Err(errors) = crate::cgroup::remove_sandbox_cgroups(sandbox_id) {
-        tracing::warn!(
-            sandbox_id,
-            errors = ?errors,
-            "failed to clean up sandbox cgroups after jailer launch failure"
-        );
     }
 }
 

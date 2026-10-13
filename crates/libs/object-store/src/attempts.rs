@@ -414,8 +414,14 @@ fn service_error_code(error: &Error) -> Option<&str> {
 /// [`TimedOutError`] in their source chain, so they are transport failures.
 /// The other producer is upload stalled-stream protection, whose error type
 /// is private to aws-smithy-runtime; a connector timeout without that marker
-/// is therefore a stall cut. Throttling is checked first and uses the same
-/// rule as the operation-level `s3_error` classification.
+/// is therefore a stall cut. A connection the peer closed before the
+/// response arrived is a transport failure too, although the HTTP client
+/// reports hyper's `IncompleteMessage` as a transient *other* connector
+/// error rather than an I/O one. A *user* connector error is a failure of
+/// the request's own body stream, whatever its cause, so it is never a
+/// transport failure; the HTTP client classifies it before I/O too.
+/// Throttling is checked first and uses the same rule as the
+/// operation-level `s3_error` classification.
 pub(crate) fn classify_attempt_failure<E>(
     error: &OrchestratorError<E>,
     http_status: Option<u16>,
@@ -431,7 +437,7 @@ pub(crate) fn classify_attempt_failure<E>(
             } else {
                 S3AttemptFailureKind::StalledStream
             }
-        } else if connector.is_io() {
+        } else if connector.is_io() || (!connector.is_user() && is_closed_by_peer(connector)) {
             S3AttemptFailureKind::Io
         } else {
             S3AttemptFailureKind::Other
@@ -467,10 +473,30 @@ fn has_timer_source(error: &(dyn std::error::Error + 'static)) -> bool {
     has_source::<TimedOutError>(error)
 }
 
+/// Whether hyper saw the connection end before a complete response head
+/// (`IncompleteMessage`), the shape of reusing a pooled connection the
+/// server has just closed. A reset or broken pipe needs no check here: the
+/// HTTP client reports any hyper error with an `io::Error` source as an I/O
+/// connector error already.
+fn is_closed_by_peer(error: &(dyn std::error::Error + 'static)) -> bool {
+    any_source(error, |error| {
+        error
+            .downcast_ref::<hyper::Error>()
+            .is_some_and(hyper::Error::is_incomplete_message)
+    })
+}
+
 fn has_source<T: std::error::Error + 'static>(error: &(dyn std::error::Error + 'static)) -> bool {
+    any_source(error, |error| error.is::<T>())
+}
+
+fn any_source(
+    error: &(dyn std::error::Error + 'static),
+    matches: impl Fn(&(dyn std::error::Error + 'static)) -> bool,
+) -> bool {
     let mut next = Some(error);
     while let Some(error) = next {
-        if error.is::<T>() {
+        if matches(error) {
             return true;
         }
         next = error.source();

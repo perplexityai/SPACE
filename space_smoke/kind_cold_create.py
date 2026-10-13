@@ -96,7 +96,9 @@ class KindColdCreateSetup:
             "content_hash": digest,
             "vcpu": config.vcpu,
             "memory_mib": config.memory_mib,
-            "namespace": "space",
+            # The API files the config under its own sandbox namespace
+            # (k8s.sandboxNamespace) whatever this says; named to match it.
+            "namespace": "sandboxes",
             "target_ready_slots": 0,
             "refill_per_tick": 1,
             "max_warming_slots": 1,

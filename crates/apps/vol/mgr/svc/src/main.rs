@@ -10,13 +10,15 @@ use clap::Parser;
 use pplx_space_common_core::host::linux::paths::{
     VOLUME_MANAGER_DB, VOLUME_MANAGER_SOCKET, VOLUME_MANAGER_STAGING_DIR,
 };
-use pplx_space_volmgr::executor::DEFAULT_STREAM_WRITEBACK_BUDGET_BYTES;
+use pplx_space_volmgr::executor::{
+    DEFAULT_STREAM_PUSH_BUFFER_BUDGET_BYTES, DEFAULT_STREAM_WRITEBACK_BUDGET_BYTES,
+};
 use pplx_space_volmgr::{
     DEFAULT_CODEC_CONCURRENCY, DEFAULT_CODEC_PRIORITY_RESERVE, DEFAULT_PULL_CONCURRENCY,
     DEFAULT_PUSH_CONCURRENCY, DEFAULT_SERVER_DRAIN_TIMEOUT_SECS,
     DEFAULT_SERVICE_MUTEX_TIMEOUT_SECS, DEFAULT_TRANSFER_DRAIN_TIMEOUT_SECS,
     DEFAULT_TRANSFER_MAX_ATTEMPTS, DEFAULT_TRANSFER_TIMEOUT_SECS, PullPriorityBand, SERVICE_NAME,
-    VolmgrRunConfig,
+    SnapshotUploadMode, VolmgrRunConfig,
 };
 
 #[derive(Parser)]
@@ -155,9 +157,14 @@ struct Cli {
     stream_decode_pulls: bool,
 }
 
-impl From<Cli> for VolmgrRunConfig {
-    fn from(cli: Cli) -> Self {
-        Self {
+impl TryFrom<Cli> for VolmgrRunConfig {
+    type Error = anyhow::Error;
+
+    fn try_from(cli: Cli) -> Result<Self, Self::Error> {
+        let snapshot_upload_mode = snapshot_upload_mode(std::env::var(
+            "SPACE_VOLUME_STREAM_PUSH_BUFFER_BUDGET_BYTES",
+        ))?;
+        Ok(Self {
             socket_path: cli.socket,
             health_socket_path: cli.health_socket,
             service_mutex_timeout: Duration::from_secs(cli.service_mutex_timeout_secs),
@@ -174,9 +181,28 @@ impl From<Cli> for VolmgrRunConfig {
             server_drain_timeout: Duration::from_secs(cli.server_drain_timeout_secs),
             transfer_drain_timeout: Duration::from_secs(cli.drain_timeout_secs),
             compress: cli.compress,
+            snapshot_upload_mode,
             stream_decode_pulls: cli.stream_decode_pulls,
-        }
+        })
     }
+}
+
+/// Unset streams snapshot uploads with the default part budget; `0` selects
+/// file uploads.
+fn snapshot_upload_mode(
+    value: Result<String, std::env::VarError>,
+) -> anyhow::Result<SnapshotUploadMode> {
+    let buffer_budget_bytes = match value {
+        Ok(value) => value.parse::<usize>().context(
+            "SPACE_VOLUME_STREAM_PUSH_BUFFER_BUDGET_BYTES must be a nonnegative byte count",
+        )?,
+        Err(std::env::VarError::NotPresent) => DEFAULT_STREAM_PUSH_BUFFER_BUDGET_BYTES,
+        Err(error) => {
+            return Err(error).context("read SPACE_VOLUME_STREAM_PUSH_BUFFER_BUDGET_BYTES");
+        }
+    };
+    SnapshotUploadMode::from_buffer_budget_bytes(buffer_budget_bytes)
+        .context("invalid SPACE_VOLUME_STREAM_PUSH_BUFFER_BUDGET_BYTES")
 }
 
 fn main() -> anyhow::Result<()> {
@@ -198,9 +224,10 @@ fn main() -> anyhow::Result<()> {
                     .await
                     .context("credential probe timed out")?;
             }
+            let config = cli.try_into()?;
             let telemetry = pplx_space_common_svc::init_service(SERVICE_NAME)?;
             let shutdown_token = pplx_space_common_svc::shutdown_token();
-            let result = pplx_space_volmgr::run(cli.into(), shutdown_token).await;
+            let result = pplx_space_volmgr::run(config, shutdown_token).await;
             pplx_space_common_svc::shutdown_telemetry(telemetry).await;
             Ok(result?)
         })

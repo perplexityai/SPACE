@@ -416,16 +416,6 @@ Conflicts=shutdown.target
 TasksMax=80%
 SESSIONSSLICE
 
-# Compatibility for templates still emitted by an older ECW translator during
-# rolling upgrades. These drop-ins do not define or enable an application.
-for legacy_unit in e2b-template-start.service space-start-cmd.service; do
-  mkdir -p \"/etc/systemd/system/\${legacy_unit}.d\"
-  cat > \"/etc/systemd/system/\${legacy_unit}.d/00-space-sessions.conf\" <<'STARTSLICE'
-[Service]
-Slice=space-sessions.slice
-TasksMax=infinity
-STARTSLICE
-done
 mkdir -p /etc/systemd/system/ssh.service.d
 cat > /etc/systemd/system/ssh.service.d/00-space-sessions.conf <<'SSHSLICE'
 [Service]

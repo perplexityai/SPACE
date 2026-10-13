@@ -69,3 +69,13 @@ fn handoff_rejects_service_path_overrides() {
         assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
 }
+
+#[test]
+fn unset_stream_push_budget_streams_and_zero_selects_file_uploads() {
+    let unset = snapshot_upload_mode(Err(std::env::VarError::NotPresent)).unwrap();
+    assert!(matches!(unset, SnapshotUploadMode::Streaming(_)));
+    let zero = snapshot_upload_mode(Ok("0".to_owned())).unwrap();
+    assert!(matches!(zero, SnapshotUploadMode::File));
+    // Budget validation belongs to SnapshotUploadMode; this layer owns parsing.
+    snapshot_upload_mode(Ok("1Gi".to_owned())).unwrap_err();
+}

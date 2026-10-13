@@ -1359,6 +1359,7 @@ impl SandboxController {
                 SandboxEventDetails::default()
                     .action("delete")
                     .reason("in_flight_suspend_upload")
+                    .routine()
                     .trigger(SandboxEventTrigger::User),
             );
             tracing::info!(
@@ -1420,6 +1421,7 @@ impl SandboxController {
                         SandboxEventDetails::default()
                             .action("delete")
                             .reason("in_flight_suspend_upload_locked")
+                            .routine()
                             .trigger(SandboxEventTrigger::User),
                     );
                     tracing::info!(
@@ -1441,6 +1443,7 @@ impl SandboxController {
                             .action("delete")
                             .reason("db_delete_failed")
                             .error(err.to_string())
+                            .logged_by_caller()
                             .trigger(SandboxEventTrigger::User),
                     );
                     tracing::error!(
@@ -2365,6 +2368,9 @@ mod drain_guard_postgres_tests;
 
 #[cfg(test)]
 mod wake_completion_postgres_tests;
+
+#[cfg(test)]
+mod characterization_tests;
 
 // Coverage-gap acknowledgment: `SandboxController::control_runtime_client`'s
 // ordering invariant (drain check must run before any substrate call that can

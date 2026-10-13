@@ -55,7 +55,7 @@ pplx-space-metrics = { workspace = true }
 pplx-space-net-common = { workspace = true }
 pplx-space-node-ctl-client = { workspace = true }
 pplx-space-node-mgr-client = { workspace = true }
-pplx-space-node-runtime-core = { workspace = true, features = ["host-runtime"] }
+pplx-space-node-runtime-core = { workspace = true, features = ["artifact-store", "host-runtime"] }
 pplx-space-observability = { workspace = true, default-features = false }
 sqlx = { workspace = true, features = ["macros", "migrate"] }
 uuid = { workspace = true }
@@ -72,6 +72,7 @@ rstest = { workspace = true }
 # reviewed.
 pplx-space-metrics = { workspace = true, features = ["test-capture"] }
 hyper-util = { workspace = true, features = ["tokio"] }
+pplx-space-test-env = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 tower = { workspace = true }

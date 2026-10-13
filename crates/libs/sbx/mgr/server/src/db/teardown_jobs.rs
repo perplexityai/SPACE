@@ -194,3 +194,48 @@ pub(crate) fn reconcile_terminal_teardown_suspend_jobs(conn: &Connection) -> Res
     tx.commit()?;
     Ok(jobs.len())
 }
+
+const TEARDOWN_SUSPEND_RETRY_DELAY_SECS: i64 = 30;
+
+/// Persist retry pacing on the generation's existing job, so daemon restarts
+/// and frequent shim polls cannot turn a blocked backup into a tight loop.
+pub(crate) fn defer_teardown_suspend_retry(
+    conn: &Connection,
+    id: &str,
+    generation: ExecutionGeneration,
+    error: &str,
+) -> Result<()> {
+    if let Some(operation) = active_teardown_suspend_operation(conn, id)?
+        && operation.execution_generation == generation
+    {
+        conn.execute(
+            sql!(
+                "UPDATE jobs SET next_attempt_at = datetime('now', '+' || ?3 || ' seconds'), error = ?2
+              WHERE job_id = ?1 AND status IN ('pending', 'running')"
+            ),
+            params![operation.job_id, error, TEARDOWN_SUSPEND_RETRY_DELAY_SECS],
+        )?;
+    }
+    Ok(())
+}
+
+pub(crate) fn teardown_suspend_retry_due(
+    conn: &Connection,
+    id: &str,
+    generation: ExecutionGeneration,
+) -> Result<bool> {
+    let Some(operation) = active_teardown_suspend_operation(conn, id)? else {
+        return Ok(true);
+    };
+    if operation.execution_generation != generation {
+        return Ok(true);
+    }
+    conn.query_row(
+        sql!(
+            "SELECT next_attempt_at IS NULL OR next_attempt_at <= datetime('now')
+           FROM jobs WHERE job_id = ?1"
+        ),
+        params![operation.job_id],
+        |row| row.get(0),
+    )
+}

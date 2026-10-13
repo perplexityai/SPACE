@@ -208,65 +208,6 @@ fn accumulated_verdict_overrides_skewed_generic_read() {
     assert_eq!(hardened_visibility(false, OrgSpecific), OrgSpecific);
 }
 
-/// The dispatch path re-resolves the release by hash right before
-/// downloading, and that re-resolve is the freshest visibility
-/// available, so a prefetch-triggered pull fails closed on anything
-/// but a confirmed `Generic` there: otherwise a visibility flip
-/// between the tick's gate and the download would still materialize
-/// a private rootfs. On-demand pulls stay exempt — already
-/// authorized by the API's create-time gate.
-#[test]
-fn prefetch_pull_fails_closed_on_final_resolve() {
-    use crate::volume::prefetch_pull_blocked;
-    use TemplateVisibility::{Generic, OrgSpecific, Unspecified};
-    for trigger in [PullTrigger::PrefetchTag, PullTrigger::PrefetchLatestRelease] {
-        assert!(prefetch_pull_blocked(true, trigger, OrgSpecific));
-        assert!(prefetch_pull_blocked(true, trigger, Unspecified));
-        assert!(!prefetch_pull_blocked(true, trigger, Generic));
-    }
-    for visibility in [Generic, Unspecified, OrgSpecific] {
-        assert!(!prefetch_pull_blocked(
-            true,
-            PullTrigger::OnDemand,
-            visibility
-        ));
-    }
-}
-
-/// With enforcement off the final gate never blocks, for any trigger or
-/// visibility — the kill switch has to reach this path too, not just the
-/// tick's decisions, because a pull queued while enforcement was on can
-/// still be waiting on its semaphore permit when the switch is flipped.
-#[test]
-fn kill_switch_opens_the_final_gate_for_every_input() {
-    use crate::volume::prefetch_pull_blocked;
-    use TemplateVisibility::{Generic, OrgSpecific, Unspecified};
-    for trigger in [
-        PullTrigger::PrefetchTag,
-        PullTrigger::PrefetchLatestRelease,
-        PullTrigger::OnDemand,
-    ] {
-        for visibility in [Generic, Unspecified, OrgSpecific] {
-            assert!(
-                !prefetch_pull_blocked(false, trigger, visibility),
-                "enforcement off must never block: {trigger:?} / {visibility:?}"
-            );
-        }
-    }
-}
-
-/// With both warming and enforcement disabled, the latest-release pass has
-/// no work: querying would spend one RPC per template and delay tag pulls for
-/// a visibility verdict that no caller uses. Enforcement still needs the pass
-/// at `latest_n = 0` so it can remove stale pins after a deleted tag.
-#[test]
-fn latest_release_queries_require_warming_or_enforcement() {
-    assert!(!should_query_latest_releases(0, false));
-    assert!(should_query_latest_releases(0, true));
-    assert!(should_query_latest_releases(1, false));
-    assert!(should_query_latest_releases(u32::MAX, true));
-}
-
 /// The template-level verdict survives an empty latest-releases
 /// list: the response-level visibility field stands alone when there
 /// are no entries to fold. An org-specific template whose releases

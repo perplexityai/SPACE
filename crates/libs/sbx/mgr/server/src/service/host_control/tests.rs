@@ -187,7 +187,7 @@ async fn with_agent_gate<F, Fut>(
         conn,
         SandboxManagerServiceOptions {
             credential_manager_socket_path: socket,
-            ..Default::default()
+            ..SandboxManagerServiceOptions::for_test()
         },
     );
     service.network_credentials_enabled = network_credentials_enabled;

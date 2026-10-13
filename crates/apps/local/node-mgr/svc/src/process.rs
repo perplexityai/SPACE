@@ -2,8 +2,8 @@
 //! `systemd-nspawn`, launching `spaced-host` in UDS-bridge mode, and
 //! best-effort freeze/thaw + termination.
 //!
-//! Spawned children are reaped by a detached task so the node-stack container's
-//! non-reaping PID 1 (`tail -F`) does not accumulate zombies; lifecycle control
+//! Spawned children are reaped by a detached task so a container whose PID 1
+//! does not reap does not accumulate zombies; lifecycle control
 //! (freeze/kill) goes through the recorded PID via `libc`.
 
 use std::collections::HashMap;
@@ -72,7 +72,7 @@ fn spawn_reaped(mut command: Command, what: &'static str) -> std::io::Result<u32
 /// We boot `--directory` (not `--image`): `--image` requires udev + the host
 /// `/run` hierarchy to attach a loop device, which kind worker pods don't
 /// provide. `--register=no` avoids a `systemd-machined` dependency (the
-/// node-stack container's PID 1 is not systemd), and the bridge dir is
+/// container's PID 1 is not systemd), and the bridge dir is
 /// bind-mounted to the well-known guest mount point so the spaced bridge sockets
 /// are shared across the container boundary.
 pub fn spawn_nspawn(
@@ -184,9 +184,9 @@ fn inherit_base_env() -> HashMap<String, String> {
 /// Pause/resume the guest. Intentionally a **no-op** on the local runtime.
 ///
 /// We launch nspawn with `--keep-unit` + `--register=no`, so the supervisor PID
-/// lives in the node-stack pod's own cgroup rather than a dedicated guest scope.
+/// lives in the node-manager pod's own cgroup rather than a dedicated guest scope.
 /// Writing `cgroup.freeze` on that cgroup would freeze the node-manager handling
-/// the RPC (and the rest of the node stack), hanging the worker instead of
+/// the RPC (and anything else in its pod), hanging the worker instead of
 /// pausing just the guest. The design permits no-op pause/resume here:
 /// sandbox-manager tracks the logical paused state, and pause/resume state
 /// survival holds trivially because the guest keeps running. (A real

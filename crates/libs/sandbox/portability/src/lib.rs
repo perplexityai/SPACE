@@ -1565,12 +1565,13 @@ const OPEN_PORT_EXPOSURE_ASSIGNMENTS: &str = "apply_state = 'pending',\n\
 /// **Faithfulness to the restore selector.** After the marker is cleared, the
 /// markerless suspend-restore selector picks the newest `type='full'
 /// state='ready'` snapshot **with no `artifact_origin` filter** (`ORDER BY
-/// sn.timestamp DESC LIMIT 1` in `kubernetes/store.rs`). So this predicate must
-/// vouch for *that* snapshot, not merely for the existence of some current
-/// suspend snapshot: it requires a current suspend/null-origin snapshot that no
-/// concretely-non-suspend full-ready snapshot ties or beats by timestamp. If a
-/// newer (or equal-timestamp) `stop`/`checkpoint`/other-origin full snapshot
-/// exists, restore would load that instead, so recovery must refuse.
+/// sn.timestamp DESC LIMIT 1` in `kubernetes/store/restore_source.rs`). So
+/// this predicate must vouch for *that* snapshot, not merely for the existence
+/// of some current suspend snapshot: it requires a current suspend/null-origin
+/// snapshot that no concretely-non-suspend full-ready snapshot ties or beats by
+/// timestamp. If a newer (or equal-timestamp) `stop`/`checkpoint`/other-origin
+/// full snapshot exists, restore would load that instead, so recovery must
+/// refuse.
 ///
 /// The `timestamp >= GREATEST(lifecycle_changed_at, last_command_at,
 /// last_access_at)` guard proves the snapshot post-dates this lifecycle cycle and

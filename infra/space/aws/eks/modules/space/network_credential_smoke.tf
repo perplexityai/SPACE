@@ -15,7 +15,19 @@ resource "aws_secretsmanager_secret" "network_credential_smoke" {
   name        = "${local.name}-network-credential-smoke"
   description = "Fixed dummy Authorization value for testing network credential injection"
 
-  tags = var.common_tags
+  # Credential Authority reads the fixture only through the reader role, which
+  # reads only secrets tagged for the requesting organization.
+  tags = merge(
+    var.common_tags,
+    var.network_credential_smoke_org_id == null ? {} : { "space-org-id" = var.network_credential_smoke_org_id },
+  )
+
+  lifecycle {
+    precondition {
+      condition     = var.network_credential_smoke_org_id != null
+      error_message = "network_credential_smoke_org_id is required: an untagged fixture is unreadable through the reader role (credmgr_secrets_reader.tf)."
+    }
+  }
 }
 
 resource "aws_secretsmanager_secret_version" "network_credential_smoke" {
@@ -25,32 +37,13 @@ resource "aws_secretsmanager_secret_version" "network_credential_smoke" {
   secret_string = "Bearer space-network-credential-smoke"
 }
 
-data "aws_iam_policy_document" "credmgr_authority_secrets_manager_read" {
-  count = local.network_credential_smoke_count
-
-  # Scoped to the smoke fixture only. Credential Authority's own role must not
-  # read arbitrary secrets in the account.
-  statement {
-    sid       = "ReadNetworkCredentialSmokeSecret"
-    actions   = ["secretsmanager:GetSecretValue"]
-    resources = [aws_secretsmanager_secret.network_credential_smoke[0].arn]
-  }
-}
-
-resource "aws_iam_role_policy" "credmgr_authority_secrets_manager_read" {
-  count = local.network_credential_smoke_count
-
-  name   = "${local.name}-credmgr-authority-secrets-manager-read"
-  role   = aws_iam_role.credmgr_authority.name
-  policy = data.aws_iam_policy_document.credmgr_authority_secrets_manager_read[0].json
-}
-
 data "aws_iam_policy_document" "ci_smoke_test_network_credential_describe" {
   count = local.network_credential_smoke_ci_count
 
   # The runner needs the generated ARN to register a reference, but it must
-  # never read the credential value. Credential Authority remains the only
-  # principal in this flow with secretsmanager:GetSecretValue.
+  # never read the credential value. The reader role, assumed by Credential
+  # Authority per organization, is the only principal in this flow with
+  # secretsmanager:GetSecretValue.
   statement {
     sid       = "DescribeNetworkCredentialSmokeSecret"
     actions   = ["secretsmanager:DescribeSecret"]

@@ -78,12 +78,17 @@ class LiteralGuards(unittest.TestCase):
 
 
 class _ExecKubectl:
+    """Scripted execs; the operator-shell pod lookup each one starts with is answered."""
+
     def __init__(self, results) -> None:
         self.results = list(results)
         self.calls: list[tuple[str, ...]] = []
 
     def run(self, command, **_options) -> CommandResult:
-        self.calls.append(tuple(command))
+        argv = tuple(command)
+        self.calls.append(argv)
+        if "get" in argv and "pods" in argv:
+            return CommandResult(argv, 0, "space-node-debug-x", "")
         return self.results.pop(0)
 
 

@@ -61,22 +61,27 @@ pub mod paths {
         "/space/run/runtime-supervisor/runtime-supervisor.sock";
     pub const RUNTIME_SUPERVISOR_STATE_DIR: &str = "/space/run/runtime-supervisor";
     pub const RUNTIME_MANAGER_SOCKET: &str = "/space/run/runtime-manager/runtime-manager.sock";
-    /// The runtime manager's persistent state, on the reboot-persistent vendor
-    /// volume rather than the recreatable cache or `/space/run`.
-    pub const RUNTIME_MANAGER_STATE_DIR: &str = "/space/vendor/runtime-manager/state";
+    /// The runtime manager's state: its SQLite store beside its socket, as
+    /// for the other node services.
+    pub const RUNTIME_MANAGER_STATE_DIR: &str = "/space/run/runtime-manager";
     /// The runtime manager's SQLite store, inside its state directory.
-    pub const RUNTIME_MANAGER_DB: &str = "/space/vendor/runtime-manager/state/runtime-manager.db";
-    /// The runtime manager's own kernel install root, `<version>/vmlinux.bin`.
-    pub const RUNTIME_MANAGER_KERNELS_DIR: &str = "/space/vendor/runtime-manager/kernels";
-    /// The runtime manager's own Firecracker release root,
-    /// `<version>/bin/{firecracker,jailer}`.
-    pub const RUNTIME_MANAGER_FIRECRACKER_DIR: &str = "/space/vendor/runtime-manager/firecracker";
-    /// The root-owned manifest of what the node image pre-installed in the
-    /// runtime manager's roots.
-    pub const RUNTIME_MANAGER_SEED_MANIFEST: &str = "/space/vendor/runtime-manager/seed.json";
-    /// Root-owned deployment configuration naming what the runtime manager may
-    /// install, with the files of locally sourced entries.
+    pub const RUNTIME_MANAGER_DB: &str = "/space/run/runtime-manager/runtime-manager.db";
+    /// Where the runtime manager downloads and unpacks what it installs,
+    /// private to it, one namespace per artifact kind
+    /// (`firecracker/releases`, `firecracker/kernels`); node-manager
+    /// publishes from here into the node store and creates it at startup,
+    /// since the cache is recreated at boot.
+    pub const RUNTIME_MANAGER_STAGING_DIR: &str = "/space/cache/.rtmgr-staging";
+    /// Root-owned catalog files adding release and kernel pins to the
+    /// compiled ones.
     pub const RUNTIME_MANAGER_CATALOG_DIR: &str = "/space/etc/runtime-manager/catalog";
+    /// The node's root-owned store of runtime releases and guest kernels,
+    /// which only node-manager publishes into.
+    pub const NODE_ARTIFACTS_DIR: &str = "/space/vendor/artifacts";
+    /// Managed Firecracker releases. Execution never scans this root.
+    pub const NODE_FIRECRACKER_DIR: &str = "/space/vendor/artifacts/firecracker";
+    /// Managed guest kernels. Existing vendor/cache execution paths stay separate.
+    pub const NODE_KERNELS_DIR: &str = "/space/vendor/artifacts/kernels";
     pub const SANDBOX_MANAGER_SOCKET: &str = "/space/run/sandbox-manager/sandbox-manager.sock";
     pub const SANDBOX_MANAGER_DEPENDENCY_DRAIN_CAPABILITY: &str =
         "/space/run/dependency-drain/sandbox-manager/capability-v1.lock";

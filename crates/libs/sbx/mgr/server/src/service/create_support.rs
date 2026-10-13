@@ -564,21 +564,29 @@ pub(super) fn checkpoint_start_response_for_existing_started_sandbox(
 }
 
 pub(super) async fn resolve_template_paths(
+    templates: &dyn crate::template_resolver::TemplateResolver,
     template_ref: pplx_space_template_mgr_client::proto::TemplateRef,
 ) -> Result<ResolvedTemplatePaths, tonic::Status> {
-    let mut tmpl_client = pplx_space_template_mgr_client::connect()
+    use crate::template_resolver::TemplateLookupError;
+    let inner = templates
+        .get_template(tonic::Request::new(
+            pplx_space_template_mgr_client::proto::GetTemplateRequest {
+                caller_org_id: None,
+                template: Some(template_ref),
+                vcpu: None,
+                memory_mib: None,
+            },
+        ))
         .await
-        .map_err(|e| tonic::Status::internal(format!("cannot connect to template-manager: {e}")))?;
-    let resp = tmpl_client
-        .get_template(pplx_space_template_mgr_client::proto::GetTemplateRequest {
-            caller_org_id: None,
-            template: Some(template_ref),
-            vcpu: None,
-            memory_mib: None,
-        })
-        .await
-        .map_err(|e| tonic::Status::new(e.code(), format!("GetTemplate failed: {e}")))?;
-    let inner = resp.into_inner();
+        .map_err(|error| match error {
+            TemplateLookupError::Connect(e) => {
+                tonic::Status::internal(format!("cannot connect to template-manager: {e}"))
+            }
+            TemplateLookupError::Rpc(e) => {
+                tonic::Status::new(e.code(), format!("GetTemplate failed: {e}"))
+            }
+        })?
+        .into_inner();
     let tmpl = inner.template.unwrap_or_default();
     let arch = template_metadata_arch(&inner.template_dir).unwrap_or(inner.arch);
     let spaced_compatibility = template_metadata_spaced_compatibility(&inner.template_dir);
@@ -670,6 +678,7 @@ pub(super) fn stage_base_snapshot_runtime_metadata(
 }
 
 pub(super) async fn resolve_template_paths_for_start(
+    templates: &dyn crate::template_resolver::TemplateResolver,
     template_ref: pplx_space_template_mgr_client::proto::TemplateRef,
 ) -> Result<ResolvedTemplatePaths, Status> {
     // Start restores an existing sandbox's identity. A name-only lookup could
@@ -683,7 +692,7 @@ pub(super) async fn resolve_template_paths_for_start(
             "cannot recover sandbox artifact without its saved template hash",
         ));
     }
-    resolve_template_paths(template_ref)
+    resolve_template_paths(templates, template_ref)
         .await
         .map_err(start_template_resolution_failed_status)
 }
@@ -701,6 +710,7 @@ fn start_template_resolution_failed_status(error: Status) -> Status {
 }
 
 pub(super) async fn template_runtime_defaults_for_sandbox_start(
+    templates: &dyn crate::template_resolver::TemplateResolver,
     sandbox: &crate::db::SandboxRow,
     prepared_template_dir: Option<&str>,
 ) -> TemplateRuntimeDefaults {
@@ -708,11 +718,14 @@ pub(super) async fn template_runtime_defaults_for_sandbox_start(
         return template_runtime_defaults(template_dir);
     }
 
-    match resolve_template_paths(pplx_space_template_mgr_client::proto::TemplateRef {
-        name: sandbox.template.clone(),
-        content_hash: sandbox.template_hash.clone(),
-        tag: None,
-    })
+    match resolve_template_paths(
+        templates,
+        pplx_space_template_mgr_client::proto::TemplateRef {
+            name: sandbox.template.clone(),
+            content_hash: sandbox.template_hash.clone(),
+            tag: None,
+        },
+    )
     .await
     {
         Ok(resolved) => resolved.runtime_defaults,
@@ -742,6 +755,7 @@ pub(super) fn sandbox_rootfs_exists_in(cache_dir: &std::path::Path, sandbox_id: 
 }
 
 pub(super) async fn template_source_for_sandbox_prepare(
+    templates: &dyn crate::template_resolver::TemplateResolver,
     sandbox: &crate::db::SandboxRow,
 ) -> Result<SandboxPrepareSource, Status> {
     if sandbox_rootfs_exists(&sandbox.id) {
@@ -764,13 +778,15 @@ pub(super) async fn template_source_for_sandbox_prepare(
         )));
     }
 
-    let resolved_template =
-        resolve_template_paths_for_start(pplx_space_template_mgr_client::proto::TemplateRef {
+    let resolved_template = resolve_template_paths_for_start(
+        templates,
+        pplx_space_template_mgr_client::proto::TemplateRef {
             name: sandbox.template.clone(),
             content_hash: sandbox.template_hash.clone(),
             tag: None,
-        })
-        .await?;
+        },
+    )
+    .await?;
     reject_incompatible_template_arch(
         &sandbox.template,
         resolved_template

@@ -99,6 +99,23 @@ pub(crate) fn info(directory: &File) -> io::Result<(u64, SubvolumeInfo)> {
     }
 }
 
+pub(crate) fn is_readonly(directory: &File) -> io::Result<bool> {
+    #[cfg(target_os = "linux")]
+    {
+        let mut flags: u64 = 0;
+        // SAFETY: GETFLAGS writes one u64 into this live buffer.
+        ioctl_result(unsafe {
+            libc::ioctl(directory.as_raw_fd(), 0x8008_9419u32 as _, &mut flags)
+        })?;
+        Ok(flags & 2 != 0)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = directory;
+        Err(io::ErrorKind::Unsupported.into())
+    }
+}
+
 pub(crate) fn set_readonly(directory: &File, readonly: bool) -> io::Result<()> {
     #[cfg(target_os = "linux")]
     {

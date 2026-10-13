@@ -1,13 +1,13 @@
 'use client';
 
-import { useEffect } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useRouter, usePathname } from 'next/navigation';
 import Link from 'next/link';
 import { useAuth } from '@/lib/auth';
 import { useTheme, useAntAlgorithm } from '@/lib/theme';
 import { UserRole } from '@/lib/types';
 import { isManagingOrgAdmin } from '@/lib/userRoles';
-import { Layout, Menu, Typography, Button, ConfigProvider, Avatar, Space, Segmented } from 'antd';
+import { Layout, Menu, Typography, Button, ConfigProvider, Avatar, Space, Segmented, Modal } from 'antd';
 import {
   DashboardOutlined,
   TeamOutlined,
@@ -47,6 +47,22 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
   const algorithm = useAntAlgorithm();
   const router = useRouter();
   const pathname = usePathname();
+  const [logoutConfirmationOpen, setLogoutConfirmationOpen] = useState(false);
+  const [isLoggingOut, setIsLoggingOut] = useState(false);
+  const logoutPending = useRef(false);
+
+  const handleLogout = async () => {
+    if (logoutPending.current) return;
+    logoutPending.current = true;
+    setIsLoggingOut(true);
+    try {
+      await logout();
+    } finally {
+      logoutPending.current = false;
+      setIsLoggingOut(false);
+      setLogoutConfirmationOpen(false);
+    }
+  };
 
   useEffect(() => {
     if (!loading && !user) {
@@ -125,7 +141,7 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
                   <Text type="secondary" style={{ fontSize: 11 }}>{user.role}</Text>
                 </div>
               </Space>
-              <Button type="text" icon={<LogoutOutlined />} onClick={logout} size="small" block>
+              <Button type="text" icon={<LogoutOutlined />} onClick={() => setLogoutConfirmationOpen(true)} size="small" block>
                 Log out
               </Button>
             </Space>
@@ -133,6 +149,23 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
         </Sider>
         <Content style={{ padding: 24, background: contentBg }}>{children}</Content>
       </Layout>
+      <Modal
+        title="Log out?"
+        open={logoutConfirmationOpen}
+        onOk={handleLogout}
+        onCancel={() => {
+          if (!logoutPending.current) setLogoutConfirmationOpen(false);
+        }}
+        okText="Log out"
+        cancelText="Cancel"
+        confirmLoading={isLoggingOut}
+        cancelButtonProps={{ disabled: isLoggingOut }}
+        closable={!isLoggingOut}
+        keyboard={!isLoggingOut}
+        mask={{ closable: !isLoggingOut }}
+      >
+        Are you sure you want to log out of SPACE?
+      </Modal>
     </ConfigProvider>
   );
 }

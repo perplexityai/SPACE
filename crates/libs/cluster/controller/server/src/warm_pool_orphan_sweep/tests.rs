@@ -190,8 +190,12 @@ fn from_pod_extracts_orphan_candidate() {
     let slot = Uuid::now_v7();
     let sandbox = SandboxId::new();
     let finished = secs_before_now(600);
-    let snap =
-        WarmPodSnapshot::from_pod(&warm_pod_object(slot, sandbox, "Succeeded", Some(finished)));
+    let snap = WarmPodSnapshot::from_pod(&SandboxPodView::from(warm_pod_object(
+        slot,
+        sandbox,
+        "Succeeded",
+        Some(finished),
+    )));
 
     assert!(snap.is_warm_pool);
     assert!(snap.phase_terminal);
@@ -219,12 +223,18 @@ fn from_pod_flags_restore_and_running() {
         SANDBOX_CHECKPOINT_ANNOTATION.to_string(),
         "snap".to_string(),
     );
-    assert!(WarmPodSnapshot::from_pod(&restore).is_restore);
-    assert!(!WarmPodSnapshot::from_pod(&restore).is_orphan_candidate_shaped());
+    assert!(WarmPodSnapshot::from_pod(&SandboxPodView::from(restore.clone())).is_restore);
+    assert!(
+        !WarmPodSnapshot::from_pod(&SandboxPodView::from(restore.clone()))
+            .is_orphan_candidate_shaped()
+    );
 
     let running = warm_pod_object(Uuid::now_v7(), SandboxId::new(), "Running", None);
-    assert!(!WarmPodSnapshot::from_pod(&running).phase_terminal);
-    assert!(!WarmPodSnapshot::from_pod(&running).is_orphan_candidate_shaped());
+    assert!(!WarmPodSnapshot::from_pod(&SandboxPodView::from(running.clone())).phase_terminal);
+    assert!(
+        !WarmPodSnapshot::from_pod(&SandboxPodView::from(running.clone()))
+            .is_orphan_candidate_shaped()
+    );
 }
 
 #[test]
@@ -236,7 +246,7 @@ fn admission_failed_pod_without_containers_ages_from_creation() {
     let mut pod = warm_pod_object(Uuid::now_v7(), SandboxId::new(), "Failed", None);
     let created = secs_before_now(600);
     pod.metadata.creation_timestamp = Some(Time(created));
-    let snap = WarmPodSnapshot::from_pod(&pod);
+    let snap = WarmPodSnapshot::from_pod(&SandboxPodView::from(pod.clone()));
 
     assert!(snap.is_orphan_candidate_shaped());
     assert_eq!(snap.terminal_since, Some(created));
@@ -262,7 +272,7 @@ fn ran_pod_without_finished_at_is_unageable() {
         }),
         ..Default::default()
     }]);
-    let snap = WarmPodSnapshot::from_pod(&pod);
+    let snap = WarmPodSnapshot::from_pod(&SandboxPodView::from(pod.clone()));
 
     assert!(snap.is_orphan_candidate_shaped());
     assert_eq!(snap.terminal_since, None);

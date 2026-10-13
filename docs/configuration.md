@@ -84,7 +84,7 @@ because disabling it by mistake would leave every create queued forever.
 | `SPACE_SANDBOX_NODE_SERVICES_READY_AFFINITY` | off | Prefer nodes whose node-local services are ready; useful only where `SPACE_NODE_SERVICE_READINESS_ENABLED` is on. |
 | `SPACE_SANDBOX_NODE_SELECTOR_KEY`, `SPACE_SANDBOX_NODE_SELECTOR_VALUE` | `node.kubernetes.io/space-enabled`, `true` | Base node selector for sandbox pods and for the node-sync, node-group mirror and warm-pool loops; set both together. |
 | `SPACE_SANDBOX_NODE_SELECTOR_LABELS` | empty | |
-| `SPACE_SANDBOX_NAMESPACE` | `POD_NAMESPACE`, then `default` | |
+| `SPACE_SANDBOX_NAMESPACE` | `POD_NAMESPACE`, then `default` | Namespace of the sandbox pods. When it is not the node services' namespace, also set `SPACE_NODE_API_NAMESPACE`: without it and `POD_NAMESPACE`, the API looks for node-api pods here. |
 | `SPACE_SANDBOX_POD_IMAGE` | `registry.k8s.io/pause:3.10` | |
 | `SPACE_SANDBOX_FORK_ENABLED` | on | |
 | `SPACE_SANDBOX_FORK_HARD_DEADLINE_SECS` | 240 | Positive integer seconds. |
@@ -112,7 +112,6 @@ because disabling it by mistake would leave every create queued forever.
 | `SPACE_FIRECRACKER_VENDOR_DIR`, `SPACE_FIRECRACKER_ASSET_DIR`, `SPACE_FIRECRACKER_KERNEL_ASSET_DIR` | built-in paths | Node-manager runtime asset locations. |
 | `SPACE_SUSPEND_WAKE_ARBITRATION` | on | Kill switch: off lets a suspend that queued behind a concurrent wake through instead of rejecting it as superseded. |
 | `SPACE_SUSPEND_DEFAULT_FORMAT` | `btrfs-send` | Set `full` to roll the suspend codec default back. |
-| `SPACE_SANDBOX_BALLOON_HINT_TIMEOUT_MS` | unset | Kubernetes node stack only; written to `/space/etc/sandbox.toml` as `balloon_hint_timeout_ms` (at most 30000). Before each suspend snapshot, a VM whose balloon has free-page hinting runs one hinting pass bounded by this time; timeouts and errors are logged and the snapshot proceeds. Unset, suspend makes no balloon calls. See [Template balloon device](#template-balloon-device). |
 | `SPACE_CLUSTER_CONTROLLER_LEADER_ELECTION_ENABLED` | on | Kill switch; off runs the reconcilers without a lease, which is only safe with one replica. |
 
 ## API, admission and limits
@@ -125,7 +124,7 @@ because disabling it by mistake would leave every create queued forever.
 | `SPACE_API_CLIENT_CLASSES` | empty | JSON map; invalid JSON fails startup. |
 | `SPACE_CLUSTER_ACTIVATION_ADMISSION_ENABLED` | on | Fails open (with a warning) when `SPACE_REDIS_URL` is unset. |
 | `SPACE_CLUSTER_ACTIVATION_ADMISSION_REFILL_RPS` | 60 | |
-| `SPACE_PUBLIC_OPERATION_DISPATCHER_EXECUTION_CONCURRENCY` | 16 | Operations the dispatcher runs at once. A larger value clamps to 128; `0` or a non-number keeps the default without a warning. Each execution holds its slot for the whole operation, and freed slots refill on the next 200 ms claim tick, at most 64 per tick. So throughput is roughly this divided by mean execution time, up to 320 operations a second. Executions draw on the cluster controller's `space_user` Postgres pool, which most other reconcilers share (`POSTGRES_POOL_MAX_CONNECTIONS`, default 25). Raising this adds contention for that pool, and an execution whose claim renewal or final status write can't get a connection within the pool's acquire timeout is abandoned and runs again once its claim goes stale, repeating any work it had already done. |
+| `SPACE_PUBLIC_OPERATION_DISPATCHER_EXECUTION_CONCURRENCY` | 16 | Operations the dispatcher runs at once. A larger value clamps to 128; `0` or a non-number keeps the default without a warning. Each execution holds its slot for the whole operation, and freed slots refill on the next 25 ms claim tick, at most 64 per tick. So throughput is roughly this divided by mean execution time, up to 2,560 operations a second. Executions draw on the cluster controller's `space_user` Postgres pool, which most other reconcilers share (`POSTGRES_POOL_MAX_CONNECTIONS`, default 25). Raising this adds contention for that pool, and an execution whose claim renewal or final status write can't get a connection within the pool's acquire timeout is abandoned and runs again once its claim goes stale, repeating any work it had already done. |
 | `SPACE_NATIVE_CREATE_POOL_CLAIM_ENABLED` | off | Env master for claiming a ready warm-pool slot when `POST /v1/sandboxes` admits a create, under the `space-native-create-pool-claim` flag (falls back off). Every `space-cluster-controller` replica must understand claim-carrying create payloads before this is turned on. |
 | `SPACE_REDIS_URL` | unset | |
 | `SPACE_SHARED_VALKEY_URL` | unset | Unset disables the consumer. |
@@ -137,14 +136,19 @@ because disabling it by mistake would leave every create queued forever.
 | `SPACE_E2B_HOME_WORKDIR_TEMPLATES`, `SPACE_ECW_HOSTS` | `code-runtime`, none | E2B routes return 404 without hosts. |
 | `SPACE_CLUSTER_ID` | unset | Required for route signing. |
 | `SPACE_CREATE_COMMAND_READY_TIMEOUT_SECS`, `SPACE_CREATE_DATA_PLANE_READY_TIMEOUT_SECS` | built-in | Create-path waits for command and data-plane readiness. |
+| `SPACE_DATA_PLANE_UPLOAD_ADMISSION` | off | Data plane: admit ECW `POST /files` uploads under the per-replica limits below; rejected uploads get 429 with a jittered `Retry-After`. Accepts `true`/`1`/`yes`/`on` and their negations. |
+| `SPACE_DATA_PLANE_MAX_CONCURRENT_UPLOADS`, `SPACE_DATA_PLANE_MAX_IN_FLIGHT_UPLOAD_BYTES` | 64, 1 GiB | Per-replica upload slots and byte budget. Each upload reserves its declared `Content-Length` rounded up to a KiB, or its path's body limit (256 MiB, or 1 MiB for JSON) when none is declared, so the 1 GiB default fits four undeclared-length uploads at a time. A reservation is capped at the whole budget: a budget smaller than one upload admits uploads one at a time and is exceeded by that upload. Both must be non-zero. |
+| `SPACE_DATA_PLANE_UPLOAD_ADMISSION_WAIT_MS` | 2000 | How long an upload waits for a slot and its bytes before the 429. |
 
 ## Templates and builds
+
+Prefetch requires the catalog to confirm generic-only release resolution from the same database snapshot as its storage locations. Cached visibility alone does not authorize a download. Upgrade the catalog before template-manager; an older catalog cannot acknowledge this restriction, so prefetch pauses until it is upgraded. On-demand pulls retain their existing authorization.
 
 | Variable | Default | Notes |
 | --- | --- | --- |
 | `SPACE_TEMPLATE_PREFETCH_ENABLED` | on | |
 | `SPACE_TEMPLATE_PREFETCH_TAGS` | `seed:latest`, `code-runtime:latest` | |
-| `SPACE_TEMPLATE_PREFETCH_VISIBILITY_ENFORCEMENT` | off | |
+| `SPACE_TEMPLATE_PREFETCH_VISIBILITY_ENFORCEMENT` | retired | Ignored; prefetch requires confirmed generic visibility. |
 | `SPACE_TEMPLATE_CACHE_BUDGET_BYTES` | 100 GiB | 0 or an invalid value disables cache GC. |
 | `SPACE_TEMPLATE_BUILD_DISK_MIB` | build-manager default | JSON. |
 | `SPACE_TRUSTED_TEMPLATE_STORAGE_BUCKETS` | empty = any bucket | |
@@ -153,6 +157,7 @@ because disabling it by mistake would leave every create queued forever.
 | `SPACE_BUILD_MANAGER_ENDPOINT` | `127.0.0.1:9900` | |
 | `SPACE_BUILD_MANAGER_TLS_SERVER_NAME` | from endpoint | |
 | `SPACE_BUILD_MANAGER_AUTH_ALLOWED_SERVICE_ACCOUNTS` | empty | |
+| `SPACE_BUILD_EXPORT_<NAME>` | unset = not exported | Opt a value into recipe `env_refs` as guest variable `NAME`; see [build environment exports](../templates/firecracker/seed/README.md#build-environment-exports). |
 | `SPACE_BUILDER_ECR_REPOSITORIES` | unset | JSON. |
 | `SPACE_UBUNTU_APT_MIRROR` | `https://archive.ubuntu.com/ubuntu` | |
 
@@ -205,9 +210,14 @@ fields are rejected. Without `balloon`, the VM configuration is unchanged.
 The device is rendered only when a sandbox cold-boots from the template build,
 which includes creating the template's base snapshot. Sandboxes restored from a
 snapshot keep the device that snapshot captured, so changing the setting takes
-effect only after rebuilding the template and its base snapshot. Hint mode
-also needs `SPACE_SANDBOX_BALLOON_HINT_TIMEOUT_MS` on the node; the REST build
+effect only after rebuilding the template and its base snapshot. The REST build
 API does not accept the setting yet.
+
+Hint mode also needs `balloon_hint_timeout_ms` (at most 30000) in the node's
+`/space/etc/sandbox.toml`. Before each suspend snapshot, a VM whose balloon has
+free-page hinting then runs one hinting pass bounded by this time; timeouts and
+errors are logged and the snapshot proceeds. Unset, suspend makes no balloon
+calls.
 
 ## Object storage and snapshots
 
@@ -221,8 +231,10 @@ API does not accept the setting yet.
 | `SPACE_OBJECT_STORE_DOWNLOAD_READER_CONCURRENCY`, `SPACE_OBJECT_STORE_DOWNLOAD_CHUNK_SIZE_BYTES`, `SPACE_OBJECT_STORE_DOWNLOAD_BUFFER_BUDGET_BYTES` | 8, 32 MiB, 2 GiB | Peak buffered memory is bounded by the budget; size it below the service's memory limit. |
 | `SPACE_OBJECT_STORE_REQUEST_ATTEMPT_TIMEOUT_SECS`, `SPACE_OBJECT_STORE_BODY_UPLOAD_ATTEMPT_TIMEOUT_SECS`, `SPACE_OBJECT_STORE_SERVER_SIDE_ATTEMPT_TIMEOUT_SECS` | 10, 60, 30 | 5 to 21600. Bound one attempt of a get, head, or create/abort multipart call; of a put or part upload; and of a complete or copy. Raise the body-upload value with the part size. |
 | `SPACE_OBJECT_STORE_REQUEST_OPERATION_TIMEOUT_SECS`, `SPACE_OBJECT_STORE_BODY_UPLOAD_OPERATION_TIMEOUT_SECS`, `SPACE_OBJECT_STORE_SERVER_SIDE_OPERATION_TIMEOUT_SECS` | 3 × attempt + 5 s | 5 to 86400. Bound the same calls across all three SDK attempts. |
+| `SPACE_OBJECT_STORE_POOL_IDLE_TIMEOUT_SECS` | 3 | 1 to 90. How long an idle pooled connection stays eligible for reuse. Keep it below the endpoint's idle close; AWS S3 closes idle HTTPS connections after about 6 s. Applies to object-store transfers; the snapshot-storage sweepers and the kernel fetcher use the 3 s default. |
 | `SPACE_OBJECT_STORE_STATIC_SESSION_TOKEN` | unset | Session token for temporary static credentials. |
-| `SPACE_SNAPSHOT_BUCKET`, `SPACE_SNAPSHOT_REGION`, `SPACE_SNAPSHOT_ENDPOINT` | unset | Unset disables snapshot upload. |
+| `SPACE_SNAPSHOT_BUCKET`, `SPACE_SNAPSHOT_REGION`, `SPACE_SNAPSHOT_ENDPOINT` | unset | Unset disables snapshot upload. Give the bucket an abort-incomplete-multipart lifecycle rule; uploads interrupted by process death otherwise keep their parts. |
+| `SPACE_VOLUME_STREAM_PUSH_BUFFER_BUDGET_BYTES` | 1 GiB | Volume-manager streams eligible snapshot uploads with this shared part budget; `0` uploads through temporary files. Whole MiB, at least 64 MiB. See [snapshot upload streaming](snapshot-upload-streaming.md). |
 
 ## Authentication, TLS and credentials
 
@@ -250,8 +262,7 @@ API does not accept the setting yet.
 | `SPACE_CREDMGR_AUTH_AUDIENCE` | `space-credential-manager` | Token audience credmgr validates. |
 | `SPACE_CREDMGR_AUTH_ALLOWED_SERVICE_ACCOUNTS` | every credmgr client service | Comma-separated allowlist; narrows which ServiceAccounts are admitted. |
 | `SPACE_CREDMGR_FAIL_ON_KEYLESS_AUTHORITY` | off | Crash instead of serving Ready-but-broken when a node-local authority has no key. |
-| `SPACE_CREDMGR_S3_VEND_ROLE_ARN` | unset = no storage exchange | |
-| `SPACE_CREDMGR_SCOPED_EXCHANGE_TOKEN_MODE` | `legacy` when the role ARN is set, else `disabled` | `legacy`, `mixed`, `enforce` or `disabled`; see `docs/space/design/credential-token-exchange.md`. |
+| `SPACE_CREDMGR_S3_VEND_ROLE_ARN` | unset = no storage exchange | Requires `DATABASE_URL`; a malformed ARN fails startup. See `docs/space/design/credential-token-exchange.md`. |
 | `SPACE_CREDMGR_SECRETS_MANAGER_ROLE_ARN` | unset = credential references are not resolvable | IAM role assumed per organization for every Secrets Manager read, with session tag `space-org-id=<organization>` and a session policy that allows `GetSecretValue` only on secrets tagged with that organization and `kms:Decrypt` only through Secrets Manager; a malformed ARN fails startup. The role's trust policy admits only the authority's identity, with `sts:AssumeRole` and `sts:TagSession`, and requires the `space-org-id` request tag. Its policy allows `GetSecretValue` only when `secretsmanager:ResourceTag/space-org-id` equals `${aws:PrincipalTag/space-org-id}`, allows `kms:Decrypt` only with `kms:ViaService` `secretsmanager.*.amazonaws.com`, and explicitly denies secrets whose `space-org-id` tag is missing or differs from the session's, sessions without the tag, and any KMS use outside Secrets Manager; the explicit denials also hold against same-account resource and key policies. Tag each referenced secret `space-org-id=<owning organization ID>`. A secret in another account also needs a resource policy allowing the role, and a secret under a customer-managed KMS key (required across accounts) needs the key policy to allow the role `kms:Decrypt` with `kms:ViaService` `secretsmanager.<region>.amazonaws.com`. |
 | `SPACE_CREDMGR_INTERMEDIATE_CA_ARN` | unset | |
 | `SPACE_CREDMGR_INTERMEDIATE_KEY_BROKER_URL`, `SPACE_CREDMGR_INTERMEDIATE_KEY_BROKER_TOKEN_FILE`, `SPACE_CREDMGR_INTERMEDIATE_KEY_BROKER_TLS_CA`, `SPACE_CREDMGR_INTERMEDIATE_KEY_BROKER_GRANT_SCHEME`, `SPACE_CREDMGR_INTERMEDIATE_KEY_BROKER_TENANT_NAMESPACE` | unset | Configure as a group. |

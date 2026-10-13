@@ -1,0 +1,164 @@
+# sandbox-manager on every SPACE Kind node: sandbox lifecycle, snapshots and
+# the containerd shim's endpoint. One release per role: `space` and
+# `space-builder` (`--set node.role=builder -f values-builder.yaml`).
+
+image:
+  repository: space-worker
+  tag: local
+  pullPolicy: IfNotPresent
+
+datadogEnvironment: kind-local
+clusterId: kind-local
+telemetry: {}
+node: {}
+
+# Suspend snapshots are backed up here (SnapshotUploadConfig::from_env);
+# without it suspend keeps snapshots local-only. volume-manager performs the
+# transfer with its own object-store credentials.
+snapshots:
+  bucket: snapshots
+  region: us-east-1
+  endpoint: http://object-store:8333
+
+# Deferred btrfs-send capture (SPACE_SNAPSHOT_STREAM_BTRFS_SEND): a suspend
+# retains its source as read-only btrfs snapshots and volume-manager streams
+# the upload from them instead of the node writing `rootfs.btrfs-send`. Kind
+# runs it so CI exercises the production shape: volume-manager's own
+# identity, node-manager's lease RPCs and source inspection
+# (docs/snapshot-upload-streaming.md).
+snapshotStreamBtrfsSend: true
+
+# Enables sandbox-manager's network-credential reconciliation; the node's
+# credential-manager resolves references through its AWS SDK chain.
+networkCredentials:
+  enabled: true
+
+# Dynamic feature-flag provider. Empty is the supported provider-free
+# deployment, not a missing setting: with no secret named, `knownEgress` below
+# is the only control over the one flag this binary reads. That flag is
+# JSON-typed and so declares no fallback — nothing resolves, and local
+# configuration is the whole answer.
+eppo:
+  secretName: ""
+  secretKey: EPPO_SDK_KEY
+  baseUrl: ""
+
+# Diagnostic logging for failed egress from the sandbox network gateway. These
+# domains decide which failed DNS or TCP connections net-gateway reports; they
+# neither permit nor deny egress, so this is not a network control.
+#
+# A `space-net-gateway-known-egress-domains` assignment replaces `domains` for
+# the sandboxes it targets.
+#
+# `domains` is the list a deployment with no provider uses, as a comma-separated
+# string and not a YAML list: the template refuses to render any other shape
+# rather than let it reach the node as the text "[a b]", which sandbox-manager
+# would reject whole.
+#
+# This is a launch argument: an existing gateway picks a change up only when
+# its sandbox cycles.
+#
+# A bench is provider-free unless someone pastes an Eppo key in, so `domains` is
+# the only way to get these diagnostics here at all. Empty is the default rather
+# than the recommendation: set it to the hosts you want reported, e.g.
+# "egress-proxy.example.test,git-proxy.example.test".
+knownEgress:
+  domains: ""
+
+# Keep cluster-deletion cleanup on the normal reconciler, with a short local
+# grace period in disposable Kind clusters. The worker default is 600 seconds.
+clusterDeletedEvictionQuiescenceSecs: "10"
+
+# Cold-sandbox eviction — sandbox-manager's loop that removes a parked,
+# suspended sandbox's entire local presence (cache dir, instance subvolume,
+# node-local rows) once its state is provably restorable from a ready remote
+# snapshot. `EvictionConfig::from_env` reads these once at sandbox-manager
+# start, and without them the loop is off.
+#
+# Smoke-sized, and deliberately shaped for a bench:
+# - `engageFraction: "0"` always runs the loop, independent of local disk
+#   pressure. Target 0 keeps the pair valid (target < engage is only enforced
+#   when engage > 0).
+# - `minIdleSecs: "120"` makes the idle boundary reachable within a smoke.
+#   "Idle" is the loop's activity witness (`IDLE_WITNESS_SQL`): the newest of
+#   the sandbox's guest-activity clocks (`last_access_at` / `last_command_at`,
+#   touched only by data-plane traffic) when one exists, else the local row's
+#   `updated_at`, which every suspend bumps. So on a bench a sandbox becomes a
+#   candidate two minutes after its last command (or, with no clock, after its
+#   last suspend), once its upload is ready. Every scenario on the bench shares
+#   this floor, so it has two lower bounds. It must stay well above the longest
+#   time any other scenario leaves a suspended, backed sandbox idle before a
+#   reconnect that expects a local restore: about 20 s on a devbox, in
+#   `ecw.access_idle_reconnect_preserves_workspace`, which waits for the
+#   access-idle pause and its durable finalization; retention and restore
+#   cycles reconnect within about 8 s. It must also stay well above the
+#   eviction scenario's own last command → upload ready → presence probe
+#   (about 7 s), or the loop evicts before that positive probe. Both gaps grow
+#   on a slow CI runner; 30 s would leave no margin, two minutes keeps several
+#   times the measured gaps. Keep new scenarios' suspended idle gaps well under
+#   a minute, or expect a cold wake. The eviction scenario waits the floor out
+#   honestly instead of aging rows in the daemon's private DB the way the
+#   retired compose suites did.
+# - What it means for the bench: any sandbox left suspended for more than
+#   two minutes with a ready remote snapshot loses its local copy and restores
+#   from the Kind object store on the next wake — exactly what prod does under disk
+#   pressure, on a short clock.
+#
+# WORKERS ONLY; the builder release sets this to null. A change here rolls
+# sandbox-manager, which hands its sockets to the successor; sandboxes keep
+# running under the host runtime-supervisor.
+sandboxEviction:
+  enabled: true
+  engageFraction: "0"
+  targetFraction: "0"
+  minIdleSecs: "120"
+  intervalSecs: "15"
+  # The legacy-repair reupload pass runs whenever the gate is engaged — here,
+  # every tick. Nothing on a fresh bench qualifies (it needs an unpinned
+  # suspended row with no upload job), so keep its per-tick RPC budget minimal.
+  reuploadMaxPerTick: "1"
+
+# On-node snapshot artifact reaper — sandbox-manager's LRU loop that deletes
+# local snapshot artifacts (named user snapshots, stopped disk artifacts,
+# retired suspend snapshots) once they are backed up (`backup_completed_at`),
+# not pinned by any sandbox's `current_local_artifact_id`, idle, and past
+# grace, through node-mgr's `DeleteCacheArtifact` (which handles btrfs
+# subvolume roots as well as plain directories). Read once at sandbox-manager
+# start.
+#
+# Smoke-sized like the two loops above: `engageFraction: "0"` is the
+# documented always-on gate; `idleSecs: "120"` and `graceSecs: "60"` let
+# `local.snapshot_reaper_reclaims_backed_fork_snapshot` wait out a candidate.
+# "Idle" is `local_artifacts.last_touched_at`,
+# set at insert and moved only by a suspend re-stage or a restore lease
+# commit; a fork's source snapshot gets neither, so it is reapable two minutes
+# after the fork. Grace counts from the newer of insert and last touch, so the
+# delay can never drop below 60 s; two minutes leaves the scenario's positive
+# probe, which runs right after the fork returns, a wide margin on a slow
+# runner. What else this reaches on a bench: nothing unbacked, nothing
+# younger than two minutes, and nothing pinned — a suspended or restored
+# sandbox pins its current artifact (the pin is cleared only while a
+# re-suspend is in flight, and that re-suspend deletes the previous rows
+# when it publishes) — i.e. only cold named snapshots that already have a
+# durable copy. With target 0 the loop also logs "disk still over target
+# after tick" every tick; that is the always-on gate talking, not a fault.
+# Builder: null.
+snapshotReaper:
+  enabled: true
+  engageFraction: "0"
+  targetFraction: "0"
+  intervalSecs: "15"
+  graceSecs: "60"
+  idleSecs: "120"
+
+# On SIGTERM sandbox-manager drains for up to 25 s before handing its mutex to
+# the successor, then spends up to another 25 s on in-flight RPCs
+# (crates/libs/sbx/mgr/server/src/run.rs): about 50 s, inside the shared
+# lifecycle default grace (crates/libs/common/svc/src/lifecycle.rs).
+terminationGracePeriodSeconds: 60
+
+# Kind sizing: requests only (see space-node-manager-local/values.yaml).
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi

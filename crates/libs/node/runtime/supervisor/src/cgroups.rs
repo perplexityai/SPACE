@@ -1,9 +1,12 @@
-use std::fs;
+use std::{fs, sync::Arc, time::Duration};
 
 use pplx_space_common_core::types::SandboxId;
 use pplx_space_node_runtime_core::cgroup;
-use tokio::sync::OwnedSemaphorePermit;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tonic::Status;
+
+const CGROUP_TERMINATION_TIMEOUT: Duration = Duration::from_secs(3);
+const CGROUP_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 pub(crate) async fn apply_firecracker_cgroup_fixups(
     sandbox_id: SandboxId,
@@ -42,34 +45,59 @@ pub(crate) async fn apply_firecracker_cgroup_fixups(
     }
 }
 
-pub(crate) async fn remove_sandbox_cgroups_blocking(
+pub(crate) async fn terminate_sandbox_cgroups(
     sandbox_id: SandboxId,
-    blocking_slot: OwnedSemaphorePermit,
+    blocking_slots: Arc<Semaphore>,
+    scope: cgroup::CgroupScope,
 ) -> Result<Vec<String>, Status> {
-    let sandbox_id = sandbox_id.to_string();
-    let report = tokio::task::spawn_blocking({
-        let sandbox_id = sandbox_id.clone();
-        move || {
-            let _blocking_slot = blocking_slot;
-            cgroup::remove_sandbox_cgroups_with_report(&sandbox_id)
+    let deadline = tokio::time::Instant::now() + CGROUP_TERMINATION_TIMEOUT;
+    let started = tokio::time::Instant::now();
+    let mut polls = 0;
+    let report = loop {
+        let permit = tokio::time::timeout_at(deadline, blocking_slots.clone().acquire_owned())
+            .await
+            .map_err(|_| {
+                Status::unavailable("cgroup termination deadline expired awaiting capacity")
+            })?
+            .map_err(|_| Status::unavailable("cgroup cleanup admission closed"))?;
+        // The owned caller retains its runtime/launch guards while this work
+        // runs. Never abandon a blocking poll on timeout and release those guards.
+        polls += 1;
+        let result = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            cgroup::try_terminate_sandbox_cgroups(sandbox_id, scope)
+        })
+        .await
+        .map_err(|error| Status::internal(format!("cgroup cleanup task failed: {error}")))?;
+        match result {
+            Ok(cgroup::CgroupRemovalOutcome::Removed(report)) => break report,
+            Ok(cgroup::CgroupRemovalOutcome::Busy { path, observation }) => {
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(Status::unavailable(format!(
+                        "cgroup termination deadline: {}: {observation}",
+                        path.display()
+                    )));
+                }
+                // No blocking-work permit or blocking thread is held here.
+                tokio::time::sleep_until(
+                    deadline.min(tokio::time::Instant::now() + CGROUP_POLL_INTERVAL),
+                )
+                .await;
+            }
+            Err(error) => return Err(Status::internal(error.to_string())),
         }
-    })
-    .await
-    .map_err(|error| Status::internal(format!("cgroup cleanup task failed: {error}")))?
-    .map_err(|errors| Status::internal(format!("remove sandbox cgroups: {}", errors.join("; "))))?;
+    };
 
     if report.paths_present == 0 && report.killed_pids == 0 {
         return Ok(Vec::new());
     }
 
     tracing::info!(
-        sandbox_id,
-        cgroup_paths_present = report.paths_present,
-        cgroup_paths_removed = report.paths_removed,
-        cgroup_remove_attempts = report.attempts,
-        cgroup_kill_requests = report.cgroup_kill_requests,
-        cgroup_killed_pids = report.killed_pids,
-        "runtime supervisor cgroup cleanup summary"
+        %sandbox_id,
+        polls,
+        final_poll_report = ?report,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "runtime supervisor cgroup termination complete"
     );
     Ok(vec!["Removed sandbox cgroups".to_string()])
 }

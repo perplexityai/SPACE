@@ -4,6 +4,13 @@ storage:
   retain: false
 networkPolicy:
   enabled: false
+# By tag, not by the digest values.yaml pins: install-observability.sh loads
+# that digest onto every Kind node under this tag, and a loaded image answers
+# to its tag only, so a digest reference would send the kubelet to the
+# registry anyway. Bump the tag with the pin in values.yaml.
+images:
+  alloy: grafana/alloy:v1.19.2
+  loki: grafana/loki:3.7.8
 alloy:
   tolerations:
     - {key: node-role.kubernetes.io/control-plane, operator: Exists, effect: NoSchedule}

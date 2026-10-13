@@ -12,6 +12,13 @@ on:
       - Tiltfile
       - docker/Dockerfile.rust-build-kind
       - crates/libs/sbx/mgr/server/src/service/activation_support.rs
+      - infra/space/observability/**
+      - crates/libs/observability/**
+      - shim/otlp.go
+      - shim/identity.go
+      - shim/telemetry*.go
+      - shim/tracing*.go
+      - ci/mirrored-images.txt
 
 # Includes same-repository PRs: no package write token. The read token reaches
 # the third-party image mirror and the main-produced layer cache; once both

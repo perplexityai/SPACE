@@ -641,23 +641,23 @@ class QuarantineRecoveryControl(Protocol):
 
     The fault is a planted `snapshots/.suspend-publish-*` staging directory under
     a sandbox cache directory with no metadata row, on the worker running the
-    fixture sandbox; the observables are the sandbox-manager log inside that
-    node-stack pod (pod-local, hence the uid pin).
+    fixture sandbox; the observables are that worker's sandbox-manager log,
+    which lives and dies with its pod (hence the uid pin).
     """
 
-    def node_stack_pod_for_sandbox(self, sandbox_id: str) -> tuple[str, str]:
-        """The node-stack pod on the sandbox's worker and its uid."""
+    def sandbox_manager_for_sandbox(self, sandbox_id: str) -> tuple[str, str, str]:
+        """The sandbox's worker node, its sandbox-manager pod and that pod's uid."""
         ...
 
-    def node_stack_pod_uid(self, pod_name: str) -> str | None: ...
+    def pod_uid(self, pod_name: str) -> str | None: ...
 
-    def plant_orphan_staging(self, pod_name: str, sandbox_id: str) -> None: ...
+    def plant_orphan_staging(self, node_name: str, sandbox_id: str) -> None: ...
 
-    def remove_orphan_sandbox(self, pod_name: str, sandbox_id: str) -> None:
+    def remove_orphan_sandbox(self, node_name: str, sandbox_id: str) -> None:
         """`space-sbxmgr delete` the induced row, then remove its directory."""
         ...
 
-    def orphan_absent(self, pod_name: str, sandbox_id: str) -> bool: ...
+    def orphan_absent(self, node_name: str, sandbox_id: str) -> bool: ...
 
     def orphan_quarantined(self, pod_name: str, sandbox_id: str) -> bool:
         """The log names the sandbox with reason `orphaned_sandbox_row_missing`."""
@@ -792,31 +792,33 @@ class GuestMetadata:
 class TemplateBuildControl(Protocol):
     """Kind-only operations for the template-build scenario.
 
-    The two builder node stacks sit behind one Service; pinning it to a pod by a
-    routing label is what makes the handoff observable. Artefact reads exec into
-    the accepting builder's `node-stack` container.
+    The two builders' node-apis sit behind one Service; pinning it to one
+    builder's node-api pod by a routing label is what makes the handoff
+    observable. A builder is named by its node: build-manager's log there says
+    whether it accepted the build, and artefact reads run in that node's
+    operator shell.
     """
 
-    def builder_node_stack_pods(self) -> list[str]:
-        """Ready builder node-stack pods, stable order."""
+    def builder_nodes(self) -> list[str]:
+        """Builder nodes with a Ready node-api, stable order."""
         ...
 
-    def route_builder_service(self, route: str, pod_name: str, *, timeout: float = 30) -> None:
-        """Label the pod and point the Service selector at it; wait until it is the only endpoint."""
+    def route_builder_service(self, route: str, node_name: str, *, timeout: float = 30) -> None:
+        """Label the builder's node-api pod and point the Service selector at it; wait until it is the only endpoint."""
         ...
 
     def clear_builder_service_route(self) -> None: ...
 
-    def builder_logged_alias(self, pod_name: str, alias: str) -> bool: ...
+    def builder_logged_alias(self, node_name: str, alias: str) -> bool: ...
 
-    def prepared_rootfs_handoff(self, pod_name: str, *, window_seconds: int = 60) -> str | None:
+    def prepared_rootfs_handoff(self, node_name: str, *, window_seconds: int = 60) -> str | None:
         """None once the builder committed a prepared rootfs for its build; else, after
         `window_seconds` without one, the failure text."""
         ...
 
-    def published_guest_metadata(self, pod_name: str, alias: str) -> GuestMetadata: ...
+    def published_guest_metadata(self, node_name: str, alias: str) -> GuestMetadata: ...
 
-    def containerd_residue(self, pod_name: str, image: str) -> list[str]:
+    def containerd_residue(self, node_name: str, image: str) -> list[str]:
         """Source-image records, temporary image records and temporary paths left behind; empty when clean."""
         ...
 
@@ -882,7 +884,7 @@ class NodeSelectorExtrasControl(Protocol):
         ...
 
     def sandbox_pod_count(self) -> int:
-        """Non-pool, non-terminating sandbox pods in the namespace."""
+        """Non-pool, non-terminating pods in the sandbox namespace."""
         ...
 
     def native_create_sandbox(self, *, template: str, metadata: Mapping[str, str]) -> str:
@@ -891,8 +893,8 @@ class NodeSelectorExtrasControl(Protocol):
 
 
 @dataclass(frozen=True)
-class NodeStackIdentity:
-    """The node-stack pod on a worker, its uid and the ServiceAccount its token names."""
+class NodeCtlIdentity:
+    """The node-ctl pod on a worker, its uid and the ServiceAccount its token names."""
 
     pod_name: str
     pod_uid: str
@@ -935,7 +937,7 @@ class NodeFenceControl(Protocol):
 
     def acquire_worker_cordon_mutation(self) -> Callable[[], None]: ...
 
-    def node_stack_identity_for_sandbox(self, sandbox_id: str) -> NodeStackIdentity: ...
+    def node_ctl_identity_for_sandbox(self, sandbox_id: str) -> NodeCtlIdentity: ...
 
     def kube_node_names(self) -> list[str]: ...
 
@@ -945,7 +947,7 @@ class NodeFenceControl(Protocol):
 
     def pod_file(self, pod_name: str, path: str) -> str: ...
 
-    def bound_token(self, identity: NodeStackIdentity) -> str:
+    def bound_token(self, identity: NodeCtlIdentity) -> str:
         """A `TokenRequest` bound to the pod; the documented fallback when the mount is absent."""
         ...
 
@@ -987,7 +989,7 @@ class NodeFenceControl(Protocol):
         """Restore every field a probe can touch, keyed on markers; returns the repairs it had to make."""
         ...
 
-    def node_stack_log_tail(self, pod_name: str, lines: int) -> list[str]: ...
+    def node_ctl_log_tail(self, pod_name: str, lines: int) -> list[str]: ...
 
 
 class ForkableSandbox(Protocol):
@@ -1117,6 +1119,8 @@ class KindEnvironment(Protocol):
     ) -> ColdCreateSelection: ...
 
     def bootstrap(self) -> None: ...
+
+    def telemetry_mode(self) -> str: ...
 
     def admin_request(
         self, method: str, resource: str, body: dict[str, object] | None = None,
@@ -1255,7 +1259,7 @@ class SandboxPodPlacement:
 
 @dataclass(frozen=True)
 class RestoreActivation:
-    """One `runtime_activated` sandbox event, read from the node stack.
+    """One `runtime_activated` sandbox event, read from sandbox-manager's log.
 
     `restore_provenance` is sbx-manager's own classification of where the
     restored bytes came from (`local_only`, `remote_matches_local`,
@@ -1411,19 +1415,19 @@ class EncryptedResuspendControl(RestoreStateRead, Protocol):
 
 
 class SandboxEventRead(Protocol):
-    """Read sbx-manager's structured sandbox events from node-stack logs."""
+    """Read sbx-manager's structured sandbox events from its pods' logs."""
 
     def restore_activations(
         self,
         sandbox_id: str,
         *,
-        pod_names: Collection[str] | None = None,
+        node_names: Collection[str] | None = None,
         since_time: str | None = None,
     ) -> list[RestoreActivation]:
         """`runtime_activated` events for the sandbox.
 
-        `pod_names` restricts the read to specific worker node-stack pods; the
-        default reads every worker. `since_time` is an RFC 3339 lower bound
+        `node_names` restricts the read to specific workers' sandbox-managers;
+        the default reads every worker. `since_time` is an RFC 3339 lower bound
         passed to the log read so a long-lived bench does not scan history.
         """
         ...
@@ -1479,11 +1483,28 @@ class ConcurrentRestoreControl(Protocol):
     """
 
     def scale_public_api(self, replicas: int) -> int:
-        """Set the kind public API Deployment's replica count; returns the previous count."""
+        """Set the kind public API Deployment's replica count; returns the previous count.
+
+        An autoscaler on the Deployment is pinned to `replicas` (both bounds)
+        so it cannot reconcile the count away; its first captured bounds are
+        restored by `restore_public_api_autoscaler`.
+        """
+        ...
+
+    def restore_public_api_autoscaler(self) -> None:
+        """Put back the autoscaler bounds `scale_public_api` pinned; a no-op when none was."""
         ...
 
     def wait_public_api_rollout(self, *, timeout: float) -> None:
         """Block until the public API Deployment's rollout is complete."""
+        ...
+
+    def wait_public_api_pods_drained(self, *, timeout: float) -> None:
+        """Block until only the desired public API pods exist and none is Terminating."""
+        ...
+
+    def wait_public_api_ready(self, *, timeout: float) -> None:
+        """Block until the public API answers `/readyz` on the smoke's API URL."""
         ...
 
     def pin_namespace_pod_count(self) -> int:
@@ -1491,11 +1512,11 @@ class ConcurrentRestoreControl(Protocol):
 
         Returns the cap. Every pod POST in the namespace is then rejected at
         admission with 403 until the cap is lifted. Blast radius: the quota
-        is namespaced to `space` and pins `pods` only, but every SPACE
-        component lives in that namespace, so any pod that restarts during
-        the seconds-long window is refused until the lift. The compensation
-        (`lift_namespace_pod_cap`, `--ignore-not-found`) is armed before the
-        apply.
+        is namespaced to the sandbox namespace and pins `pods` only, so any
+        sandbox or warm-pool pod created during the seconds-long window is
+        refused until the lift; the control plane in `space` is untouched.
+        The compensation (`lift_namespace_pod_cap`, `--ignore-not-found`) is
+        armed before the apply.
         """
         ...
 
@@ -1550,15 +1571,16 @@ class TemplateGcTick:
 class TemplateCacheControl(RestoreStateRead, Protocol):
     """Privileged on-node template-cache operations for the eviction scenario.
 
-    Everything here runs inside one worker's node-stack pod through named
-    operations. There is deliberately no SQLite surface: the node-stack image
-    ships no `sqlite3`, and the point is to prove the loop through the same
-    interfaces an operator has — the `space-tmplmgr` CLI and the daemon's own
-    structured log line.
+    Everything here acts on one worker node through named operations: the
+    commands run in that node's operator shell, the knobs and log lines come
+    from its template-manager pod. There is deliberately no SQLite surface: the
+    worker image ships no `sqlite3`, and the point is to prove the loop through
+    the same interfaces an operator has — the `space-tmplmgr` CLI and the
+    daemon's own structured log line.
     """
 
-    def template_cache_gc_config(self, pod_name: str) -> TemplateCacheGcConfig:
-        """The eviction knobs on the node-stack pod the scenario will exec into.
+    def template_cache_gc_config(self, node_name: str) -> TemplateCacheGcConfig:
+        """The eviction knobs of the template-manager pod on that node.
 
         Read from the running pod, not the DaemonSet spec: the knobs are read
         once at daemon start, and mid-rollout the spec describes a pod that
@@ -1566,12 +1588,8 @@ class TemplateCacheControl(RestoreStateRead, Protocol):
         """
         ...
 
-    def worker_node_stack_pod(self, node_name: str) -> str:
-        """The worker node-stack pod name scheduled on `node_name`."""
-        ...
-
     def register_unpinned_template(
-        self, pod_name: str, template: str, size_bytes: int
+        self, node_name: str, template: str, size_bytes: int
     ) -> None:
         """Plant a throwaway build of `size_bytes` real bytes and register it.
 
@@ -1582,18 +1600,18 @@ class TemplateCacheControl(RestoreStateRead, Protocol):
         """
         ...
 
-    def delete_template(self, pod_name: str, template: str) -> None:
+    def delete_template(self, node_name: str, template: str) -> None:
         """Remove the throwaway build and its on-disk residue; idempotent."""
         ...
 
     def protected_template_builds(
-        self, pod_name: str, sandbox_id: str, template_selector: str
+        self, node_name: str, sandbox_id: str, template_selector: str
     ) -> tuple[str, ...]:
         """Full active-sandbox and selected-release digests, read before planting."""
         ...
 
     def template_build_state(
-        self, pod_name: str, template: str, content_hash: str
+        self, node_name: str, template: str, content_hash: str
     ) -> str | None:
         """State of the `template` build with `content_hash`; None once it no longer resolves.
 
@@ -1611,7 +1629,7 @@ class TemplateCacheControl(RestoreStateRead, Protocol):
         """
         ...
 
-    def template_digest_dirs(self, pod_name: str, template: str) -> tuple[str, ...]:
+    def template_digest_dirs(self, node_name: str, template: str) -> tuple[str, ...]:
         """Names of the `sha256:*` digest directories under the template, from disk.
 
         Fails closed: an exec that could not run raises rather than reading as
@@ -1620,7 +1638,7 @@ class TemplateCacheControl(RestoreStateRead, Protocol):
         ...
 
     def template_gc_ticks(
-        self, pod_name: str, *, since_time: str
+        self, node_name: str, *, since_time: str
     ) -> list[TemplateGcTick]:
         """Completed eviction ticks logged by that worker since `since_time`."""
         ...
@@ -1664,7 +1682,7 @@ class StartupRecoveryControl(RestoreStateRead, Protocol):
     Everything on-node runs through the same named operations as the eviction
     scenario (no SQLite: rows are dropped through `space-tmplmgr
     delete-template` after the digest directory is stashed aside). The one
-    new privilege is restarting a worker's node-stack pod, which is what
+    new privilege is restarting a worker's template-manager pod, which is what
     makes recovery run at all; it is kind-only by fixture type and by the
     adapter's own isolation guard, and the scenario points it at the
     sandbox-pool worker that is *not* running its sandbox.
@@ -1674,16 +1692,12 @@ class StartupRecoveryControl(RestoreStateRead, Protocol):
         """A sandbox-pool kube node other than `excluding_node`, or a configuration error."""
         ...
 
-    def worker_node_stack_pod(self, node_name: str) -> str:
-        """The worker node-stack pod name scheduled on `node_name`."""
-        ...
-
-    def ready_worker_node_stack_pod(self, node_name: str) -> str | None:
-        """The single Ready worker node-stack pod on `node_name`, or None right now."""
+    def ready_node_service_pod(self, node_name: str, component: str) -> str | None:
+        """The single Ready pod of that worker node service on `node_name`, or None right now."""
         ...
 
     def register_unpinned_template(
-        self, pod_name: str, template: str, size_bytes: int
+        self, node_name: str, template: str, size_bytes: int
     ) -> None:
         """Plant a throwaway build of `size_bytes` real bytes and register it.
 
@@ -1693,25 +1707,25 @@ class StartupRecoveryControl(RestoreStateRead, Protocol):
         """
         ...
 
-    def delete_template(self, pod_name: str, template: str) -> None:
+    def delete_template(self, node_name: str, template: str) -> None:
         """Remove the throwaway build, its on-disk residue and any stash; idempotent."""
         ...
 
     def template_build_state(
-        self, pod_name: str, template: str, content_hash: str
+        self, node_name: str, template: str, content_hash: str
     ) -> str | None:
         """State of the `template` build with `content_hash`; None once it no longer resolves."""
         ...
 
-    def template_digest_dirs(self, pod_name: str, template: str) -> tuple[str, ...]:
+    def template_digest_dirs(self, node_name: str, template: str) -> tuple[str, ...]:
         """Names of the `sha256:*` digest directories under the template, from disk."""
         ...
 
-    def remove_template_digest_dir(self, pod_name: str, template: str, digest: str) -> None:
+    def remove_template_digest_dir(self, node_name: str, template: str, digest: str) -> None:
         """Delete the digest directory, leaving the catalog row behind (stale row)."""
         ...
 
-    def orphan_template_digest_dir(self, pod_name: str, template: str, digest: str) -> None:
+    def orphan_template_digest_dir(self, node_name: str, template: str, digest: str) -> None:
         """Drop the catalog row while keeping the digest directory's bytes intact.
 
         Stashes the directory beside the cache, runs the daemon's own
@@ -1721,31 +1735,29 @@ class StartupRecoveryControl(RestoreStateRead, Protocol):
         """
         ...
 
-    def corrupt_template_rootfs(self, pod_name: str, template: str, digest: str) -> None:
+    def corrupt_template_rootfs(self, node_name: str, template: str, digest: str) -> None:
         """Overwrite the head of the bootable artifact in place; size unchanged, hash not."""
         ...
 
     def truncate_template_rootfs(
-        self, pod_name: str, template: str, digest: str, *, bytes_removed: int
+        self, node_name: str, template: str, digest: str, *, bytes_removed: int
     ) -> None:
         """Shorten the bootable artifact so its on-disk size disagrees with the manifest."""
         ...
 
-    def restart_worker_node_stack(self, pod_name: str, *, timeout: float) -> str:
-        """Delete the worker node-stack pod and wait for its replacement on the same node.
+    def restart_node_service(self, node_name: str, component: str, *, timeout: float) -> str:
+        """Delete that node service's pod and wait for its Ready replacement on the same node.
 
-        Returns the replacement's name. Every sandbox on that worker dies with
-        the pod, which is why the scenario never points this at the worker
-        running its own sandbox.
+        Returns the replacement's name. Only that service restarts; the node's
+        sandboxes keep running under its host runtime-supervisor.
         """
         ...
 
-    def startup_recovery_report(self, pod_name: str) -> StartupRecoveryReport:
-        """template-manager's startup recovery verdicts from its own log file on that pod.
+    def startup_recovery_report(self, node_name: str) -> StartupRecoveryReport:
+        """template-manager's startup recovery verdicts from its pod's log on that node.
 
-        Read from `/space/logs/tmplmgr.log` (truncated at every pod start),
-        not the pod's stdout, which only carries what the supervisor's tail
-        saw after node-api came up.
+        The pod's own log, a restarted container's previous attempt first, so
+        the first recovery pass is read even if a later attempt ran another.
         """
         ...
 
@@ -1762,6 +1774,35 @@ class BackupQueued:
     snapshot_id: str
     rootfs_diff_format: str
     object_uri: str
+
+
+@dataclass(frozen=True)
+class BtrfsSendCapture:
+    """One btrfs-send capture, from sandbox-manager's encode line.
+
+    `deferred` is true when the capture retained its source for a streamed
+    upload instead of writing `rootfs.btrfs-send`; `stream_bytes` is then 0.
+    """
+
+    node_name: str
+    sandbox_id: str
+    stream_bytes: int
+    deferred: bool
+
+
+@dataclass(frozen=True)
+class CompletedTransfer:
+    """One volume-manager transfer job that completed, from its log line.
+
+    `kind` is the job kind: `push_btrfs_send` streams a rootfs from a retained
+    btrfs source, while a materialized send file uploads under another kind
+    with the same `local_path`.
+    """
+
+    node_name: str
+    kind: str
+    local_path: str
+    bytes: int
 
 
 @dataclass(frozen=True)
@@ -1830,12 +1871,24 @@ class SuspendCodecControl(CrossNodeRestoreControl, Protocol):
     named operation with its compensation owned by the fixture.
     """
 
-    def worker_node_stack_pod(self, node_name: str) -> str:
-        """The worker node-stack pod name scheduled on `node_name`."""
-        ...
-
     def other_sandbox_worker_node(self, excluding_node: str) -> str:
         """A sandbox-pool kube node other than `excluding_node`, or a configuration error."""
+        ...
+
+    def btrfs_send_captures(
+        self, sandbox_id: str, node_name: str, *, since_time: str
+    ) -> list[BtrfsSendCapture]:
+        """sandbox-manager's btrfs-send encode lines for the sandbox on `node_name` since `since_time`."""
+        ...
+
+    def sandbox_canonical_snapshot_entries(self, node_name: str, sandbox_id: str) -> tuple[str, ...]:
+        """Entries of the sandbox's canonical suspend snapshot directory on `node_name`."""
+        ...
+
+    def completed_transfers(
+        self, sandbox_id: str, node_name: str, *, since_time: str
+    ) -> list[CompletedTransfer]:
+        """volume-manager's completed transfer jobs under the sandbox's cache directory on `node_name` since `since_time`."""
         ...
 
     def backup_queued_events(self, sandbox_id: str, *, since_time: str) -> list[BackupQueued]:
@@ -1846,11 +1899,11 @@ class SuspendCodecControl(CrossNodeRestoreControl, Protocol):
         """The parent build's digest recorded on the sandbox's newest ready full snapshot row."""
         ...
 
-    def template_digest_dirs(self, pod_name: str, template: str) -> tuple[str, ...]:
+    def template_digest_dirs(self, node_name: str, template: str) -> tuple[str, ...]:
         """Names of the `sha256:*` digest directories under the template, from disk."""
         ...
 
-    def evict_template_from_worker(self, pod_name: str, template: str) -> list[str]:
+    def evict_template_from_worker(self, node_name: str, template: str) -> list[str]:
         """Remove a template's builds from one worker through `delete-template`.
 
         A cache-miss forcing device: the next restore of a btrfs-send
@@ -1863,7 +1916,7 @@ class SuspendCodecControl(CrossNodeRestoreControl, Protocol):
         """
         ...
 
-    def reclaim_cluster_deleted_local_sandbox(self, pod_name: str, sandbox_id: str) -> None:
+    def reclaim_cluster_deleted_local_sandbox(self, node_name: str, sandbox_id: str) -> None:
         """Remove one worker's local row for a sandbox the cluster no longer has.
 
         Refuses (configuration error) when the cluster row still exists or a
@@ -1896,22 +1949,22 @@ class SuspendCodecControl(CrossNodeRestoreControl, Protocol):
         ...
 
     def template_pulls(
-        self, pod_name: str, template: str, *, since_time: str
+        self, node_name: str, template: str, *, since_time: str
     ) -> list[TemplatePullLine]:
         """template-manager lines inside pull spans for the template since `since_time`."""
         ...
 
     def template_subvolume_received_uuid(
-        self, pod_name: str, template: str, digest: str
+        self, node_name: str, template: str, digest: str
     ) -> str | None:
         """The digest dir's btrfs `Received UUID`; None when it is not a subvolume."""
         ...
 
-    def sandbox_instance_entries(self, pod_name: str, sandbox_id: str) -> tuple[str, ...]:
+    def sandbox_instance_entries(self, node_name: str, sandbox_id: str) -> tuple[str, ...]:
         """`instance*` entries under the sandbox's cache dir on that worker; fails closed."""
         ...
 
-    def sandbox_instance_is_subvolume(self, pod_name: str, sandbox_id: str) -> bool:
+    def sandbox_instance_is_subvolume(self, node_name: str, sandbox_id: str) -> bool:
         """Whether the sandbox's `instance` on that worker is a btrfs subvolume."""
         ...
 
@@ -1973,7 +2026,7 @@ class ColdEvictionControl(RestoreStateRead, SandboxEventRead, Protocol):
     """Privileged reads for the cold-sandbox eviction scenario.
 
     Nothing here mutates anything: the loop's knobs are chart values read
-    once at daemon start (see `sandboxEviction` in the kind node-stack
+    once at daemon start (see `sandboxEviction` in the kind sandbox-manager
     chart), and the scenario's only forcing device is time. The reads are the
     knobs on the very pod that will do the evicting, the on-disk cache
     directory, and sbx-manager's own eviction event.
@@ -1983,15 +2036,11 @@ class ColdEvictionControl(RestoreStateRead, SandboxEventRead, Protocol):
         """Execution pods, including terminal predecessors retained by Kubernetes."""
         ...
 
-    def worker_node_stack_pod(self, node_name: str) -> str:
-        """The worker node-stack pod name scheduled on `node_name`."""
+    def cold_eviction_config(self, node_name: str) -> ColdEvictionConfig:
+        """The eviction knobs of the sandbox-manager pod on the sandbox's worker."""
         ...
 
-    def cold_eviction_config(self, pod_name: str) -> ColdEvictionConfig:
-        """The eviction knobs on the node-stack pod the sandbox lives on."""
-        ...
-
-    def sandbox_cache_dir_present(self, pod_name: str, sandbox_id: str) -> bool:
+    def sandbox_cache_dir_present(self, node_name: str, sandbox_id: str) -> bool:
         """Whether `/space/cache/firecracker/sandboxes/<id>` exists on that node.
 
         Fails closed: an exec that could not run raises rather than reading
@@ -2003,13 +2052,13 @@ class ColdEvictionControl(RestoreStateRead, SandboxEventRead, Protocol):
         self,
         sandbox_id: str,
         *,
-        pod_names: Collection[str] | None = None,
+        node_names: Collection[str] | None = None,
         since_time: str | None = None,
     ) -> list[LocalEviction]:
-        """`local_eviction_completed` events for the sandbox, from node-stack logs."""
+        """`local_eviction_completed` events for the sandbox, from sandbox-manager logs."""
         ...
 
-    def eviction_loop_log(self, pod_name: str, *, since_time: str) -> list[str]:
+    def eviction_loop_log(self, node_name: str, *, since_time: str) -> list[str]:
         """sbx-manager's own eviction tick/skip lines on that worker, for diagnosis.
 
         A candidate the loop could not prove is backed off for 30 minutes —
@@ -2053,11 +2102,9 @@ class SnapshotReaperControl(RestoreStateRead, Protocol):
     had a ready remote copy.
     """
 
-    def worker_node_stack_pod(self, node_name: str) -> str: ...
+    def snapshot_reaper_config(self, node_name: str) -> SnapshotReaperConfig: ...
 
-    def snapshot_reaper_config(self, pod_name: str) -> SnapshotReaperConfig: ...
-
-    def sandbox_snapshot_dirs(self, pod_name: str, sandbox_id: str) -> tuple[str, ...]:
+    def sandbox_snapshot_dirs(self, node_name: str, sandbox_id: str) -> tuple[str, ...]:
         """Entry names under `<cache>/<sandbox>/snapshots/` on that worker.
 
         Fails closed: an exec that could not run raises rather than reading
@@ -2066,7 +2113,7 @@ class SnapshotReaperControl(RestoreStateRead, Protocol):
         ...
 
     def reaped_artifacts(
-        self, pod_name: str, sandbox_id: str, *, since_time: str
+        self, node_name: str, sandbox_id: str, *, since_time: str
     ) -> list[ReapedArtifact]:
         """The reaper's per-candidate deletion lines for artifacts under this
         sandbox's snapshots directory on that worker, since `since_time`.
@@ -2082,6 +2129,103 @@ class SnapshotReaperControl(RestoreStateRead, Protocol):
         read from the control plane after the fact."""
         ...
 
-    def reaper_loop_log(self, pod_name: str, *, since_time: str) -> list[str]:
+    def reaper_loop_log(self, node_name: str, *, since_time: str) -> list[str]:
         """The reaper's tick/skip lines on that worker, for a timeout's evidence."""
+        ...
+
+
+class TelemetryBackendControl(Protocol):
+    """Kind-only reads of the local backends `otel` mode installs.
+
+    Prometheus (`space-metrics`), Tempo (`space-traces`) and Loki
+    (`space-logs`) are read through their own HTTP query APIs, on the localhost
+    ports both bring-up paths forward to them.
+    """
+
+    def telemetry_query(self, backend: str, path: str, params: Mapping[str, str]) -> Any:
+        """The decoded JSON body of `GET <path>?<params>` on `prometheus`, `tempo` or `loki`."""
+        ...
+
+    def telemetry_mode(self) -> str:
+        """The Kind telemetry mode (`datadog`, `otel` or `off`) the bench runs.
+
+        Read from the space-api Deployment's metrics sink and trace exporter,
+        never from this runner's environment, which need not have brought the
+        bench up. Exporters that match no mode, or that are not literals, raise
+        `SmokeConfigurationError` naming what was found.
+        """
+        ...
+
+
+@dataclass(frozen=True)
+class TcpTarget:
+    """One address a network-isolation probe opens a TCP connection to."""
+
+    name: str
+    host: str
+    port: int
+
+
+@dataclass(frozen=True)
+class TcpProbe:
+    """Whether a TCP connect from one network namespace completed.
+
+    `connected` is a completed handshake; anything else (a refusal, a reset,
+    a policy drop timing out) is not, and `detail` says which the probe saw.
+    """
+
+    target: TcpTarget
+    connected: bool
+    detail: str
+
+
+@dataclass(frozen=True)
+class PodNetwork:
+    """A pod's name, bound node and pod IP."""
+
+    pod_name: str
+    node_name: str
+    pod_ip: str
+
+
+class SandboxNetworkIsolationControl(Protocol):
+    """Kind-only probes of the sandbox namespace's NetworkPolicies.
+
+    Every probe runs in the node's operator shell (`space-node-debug`), either
+    in the shell's own network namespace, which sits in the control-plane
+    namespace with no policy, or in another pod's network namespace entered by
+    its netns handle (`nsenter --net`). Nothing runs inside a sandbox VM, so
+    the per-sandbox net-gateway's own rules are not on the path.
+    """
+
+    def sandbox_pod_network(self, sandbox_id: str) -> PodNetwork | None:
+        """The sandbox's bound, running execution pod in the sandbox namespace."""
+        ...
+
+    def control_plane_targets(self) -> list[TcpTarget]:
+        """Postgres, the Kubernetes API, internal-api and the object store, by Service ClusterIP."""
+        ...
+
+    def cluster_dns_target(self) -> TcpTarget:
+        """The cluster DNS Service on TCP 53, which the allow policy admits."""
+        ...
+
+    def probe_from_node_shell(
+        self, node_name: str, targets: Sequence[TcpTarget], *, timeout: float
+    ) -> list[TcpProbe]:
+        """TCP connects from the operator shell's own network namespace on that node."""
+        ...
+
+    def probe_from_pod_netns(
+        self, pod: PodNetwork, targets: Sequence[TcpTarget], *, timeout: float
+    ) -> list[TcpProbe]:
+        """TCP connects from the pod's network namespace, outside any VM it runs."""
+        ...
+
+    def start_unselected_pod(self, node_name: str, token: str) -> PodNetwork:
+        """A pause pod in the sandbox namespace that no allow rule selects, bound to the node."""
+        ...
+
+    def remove_unselected_pods(self, token: str) -> None:
+        """Delete the pods `start_unselected_pod` created under this token; idempotent."""
         ...

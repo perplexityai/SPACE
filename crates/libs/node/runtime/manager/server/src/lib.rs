@@ -1,32 +1,29 @@
-//! `space-rtmgr-svc`: the node-local runtime and kernel manager.
+//! Node-local diagnostic listing and a durable artifact install/delete API.
 //!
-//! It serves its RPCs over the node's Unix socket. `ListExecutionArtifacts`
-//! lists the runtime releases and guest kernels on the node, and
-//! `GetStatus` reports whether the paths the runtime manager relies on are
-//! protected from other accounts. `ListAvailableKernels`, `InstallKernel`,
-//! and `UninstallKernel` list, install, and remove guest kernels a kernel
-//! source publishes for a runtime line (Firecracker's by default), each
-//! install or uninstall tracked as a
-//! durable operation; mutations stay disabled unless the service is given a
-//! kernel install root. It owns no selection: node-manager keeps resolving
-//! launches from its own inventory, so this service being down or restarting
-//! does not affect any launch.
+//! Runtime-manager writes only private staging and operation state. Node-manager
+//! verifies and publishes bytes into a separate root-owned managed store.
+//! Execution never discovers that store: its image-provided roots, aliases,
+//! default pair and restore behavior remain independent of this service.
 
 mod convert;
-mod kernels;
+mod installs;
 mod protection;
 mod run;
 mod service;
 
-pub use kernels::{
+#[cfg(feature = "github")]
+pub use installs::GitHubReleaseSourceError;
+pub use installs::{
     BoxError, ByteChunks, ContentMd5, ContentMd5ParseError, FIRECRACKER_CI_KERNEL_SOURCE,
-    InstallLimits, KernelSource, KernelVersion, KernelVersionParseError, OpenInstallerError,
-    PrepareStagingError, ReleaseLine, ReleaseLineParseError, RuntimeLine, SourceError,
-    SourceKernel, StagingError, StoreError, VerifiableKernel,
+    FIRECRACKER_RELEASE_SOURCE, InstallLimits, KernelSource, KernelVersion,
+    KernelVersionParseError, OpenInstallerError, PrepareStagingError, ReleaseChunks, ReleaseLine,
+    ReleaseLineParseError, ReleaseSource, ReleaseSourceError, ReleaseUrl, ReleaseUrlParseError,
+    RuntimeLine, SourceError, SourceKernel, StagingError, StoreError, VerifiableKernel,
+    VerifiableRelease,
 };
 pub use run::{
     DEFAULT_INSTALL_LIMITS, DEFAULT_LIST_ADMISSION_TIMEOUT, DEFAULT_SCAN_LIMITS,
-    KernelSourceConfig, RunRuntimeManagerError, RuntimeManagerInstallConfig,
-    RuntimeManagerRunConfig, SERVICE_NAME, run,
+    KernelSourceConfig, ReleaseSourceConfig, RunRuntimeManagerError, RuntimeManagerInstallConfig,
+    RuntimeManagerReleaseConfig, RuntimeManagerRunConfig, SERVICE_NAME, run,
 };
 pub use service::RuntimeManagerService;

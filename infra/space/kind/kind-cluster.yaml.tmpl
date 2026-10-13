@@ -18,6 +18,19 @@
 # "/home/you/.kind-data default ~/.kind-data".
 #   SPACE_KIND_DATA_ROOT  default ~/.kind-data
 #   SPACE_VENDOR_ROOT     default ~/.space-devbox/space/vendor
+#   SPACE_KIND_NODE_IMAGE default: the content-addressed SPACE node image
+#                         (scripts/kind-node-image.sh ref)
+#   SPACE_KIND_BASE_NODE_IMAGE the kindest/node that image is built FROM
+#                         (scripts/kind-node-image.sh base)
+#
+# Node images: sandbox workers and builders run the SPACE Kind node image
+# (node/Dockerfile), which bakes in the node layer a production worker's or
+# builder's node image provides — btrfs /space/cache, cgroup subtree, loop
+# devices, device permissions, /space skeleton — as units that run before
+# kubelet on every boot. The control-plane and infra nodes run its pinned base
+# unchanged, as production's non-SPACE nodes have no SPACE node layer. One base,
+# so every node runs the same Kubernetes version. Bring-up runs
+# `kind-node-image.sh ensure` before `kind create`.
 #
 # Both defaults reproduce the paths this file used to hardcode when $HOME is
 # /home/dev, so a devbox renders byte-identical mounts.
@@ -26,6 +39,7 @@ apiVersion: kind.x-k8s.io/v1alpha4
 name: space-local
 nodes:
   - role: control-plane
+    image: ${SPACE_KIND_BASE_NODE_IMAGE}
     # /var/lib/containerd is where the kind worker's containerd stores image
     # blobs + snapshotter state. The image set can exhaust the per-container
     # overlay during `kind load`. Mount it from a per-node host directory so
@@ -44,14 +58,15 @@ nodes:
   # extraMounts on sandbox workers:
   #   - SPACE_VENDOR_ROOT : where install-fc-vendor.sh stages
   #     Firecracker v1.15.1 (binary, jailer,
-  #     vmlinux). The node-stack pod hostPath-mounts /space/vendor through,
-  #     matching production where /space/vendor is populated by Packer on
-  #     the AMI. Without this the node-stack image would have to bake the
-  #     FC tree itself.
+  #     vmlinux). The host runtime-supervisor and the node services read
+  #     /space/vendor from the node, matching production where
+  #     /space/vendor is populated by Packer on the AMI. Without this the
+  #     worker image would have to bake the FC tree itself.
   #   - /dev/kvm : Firecracker needs the host KVM character device. kind
   #     nodes run as privileged docker containers; bind-mounting the device
   #     file lets the container's /dev/kvm work.
   - role: worker
+    image: ${SPACE_KIND_NODE_IMAGE}
     labels:
       space.pplx.net/node-pool: sandbox
     extraMounts:
@@ -63,6 +78,7 @@ nodes:
       - hostPath: /dev/kvm
         containerPath: /dev/kvm
   - role: worker
+    image: ${SPACE_KIND_NODE_IMAGE}
     labels:
       space.pplx.net/node-pool: sandbox
     extraMounts:
@@ -76,9 +92,27 @@ nodes:
   # Infra node — runs Postgres, space-api, and space-cluster-controller.
   # Never labeled space-enabled so sandbox pods never land here, and
   # never targeted by the drain reconciler.
+  #
+  # extraPortMappings: the load-balanced entry. The host's 127.0.0.1:8080 and
+  # :8090 reach the space-api-entry and space-data-plane-entry NodePort
+  # Services, and kube-proxy spreads each connection across the replicas, as
+  # a deployment's load balancer does; a `kubectl port-forward` pins every
+  # request to one pod. On this node because it is never drained. Docker
+  # fixes port mappings when it creates the node container, so a cluster
+  # created without them is recreated (scripts/check-node-layout.sh).
   - role: worker
+    image: ${SPACE_KIND_BASE_NODE_IMAGE}
     labels:
       space.pplx.net/node-pool: infra
+    extraPortMappings:
+      - containerPort: 30080
+        hostPort: 8080
+        listenAddress: 127.0.0.1
+        protocol: TCP
+      - containerPort: 30090
+        hostPort: 8090
+        listenAddress: 127.0.0.1
+        protocol: TCP
     extraMounts:
       - hostPath: ${SPACE_KIND_DATA_ROOT}/worker3/containerd
         containerPath: /var/lib/containerd
@@ -87,6 +121,7 @@ nodes:
   # builders' node-api/build-manager pairs, while user sandbox pods continue to
   # land only on the sandbox workers above.
   - role: worker
+    image: ${SPACE_KIND_NODE_IMAGE}
     labels:
       space.pplx.net/node-pool: builder
     extraMounts:
@@ -98,6 +133,7 @@ nodes:
       - hostPath: /dev/kvm
         containerPath: /dev/kvm
   - role: worker
+    image: ${SPACE_KIND_NODE_IMAGE}
     labels:
       space.pplx.net/node-pool: builder
     extraMounts:

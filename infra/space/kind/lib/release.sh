@@ -15,11 +15,11 @@ guard_cluster() {
   server=$("${kube[@]}" config view --minify -o jsonpath='{.clusters[0].cluster.server}')
   [[ $server =~ ^https://127\.0\.0\.1:[0-9]+$ ]] ||
     { echo 'Refusing non-loopback cluster' >&2; exit 1; }
-  [[ $(docker inspect space-local-control-plane \
-    --format '{{index .Config.Labels "io.x-k8s.kind.cluster"}}') == space-local ]]
-  [[ https://$(docker port space-local-control-plane 6443/tcp) == "$server" ]] ||
+  [[ $(docker inspect "$control_plane" \
+    --format '{{index .Config.Labels "io.x-k8s.kind.cluster"}}') == "$cluster" ]]
+  [[ https://$(docker port "$control_plane" 6443/tcp) == "$server" ]] ||
     { echo 'Context does not address this Docker Kind cluster' >&2; exit 1; }
-  "${kube[@]}" get node space-local-control-plane >/dev/null
+  "${kube[@]}" get node "$control_plane" >/dev/null
 }
 
 # Create the task namespace on `up`, or refuse one this release does not own.
@@ -45,10 +45,15 @@ guard_namespace() {
 release_init() {
   local name=$1
   # The chart directory, namespace and release are all the short signal name.
-  # SHIM_COLLECTORS and the space-kind-telemetry OTLP endpoints resolve these
-  # namespaces by name; they move in the same commit as this.
+  # The space-kind-telemetry OTLP endpoints resolve these namespaces by name;
+  # they move in the same commit as this.
   owner=$name
-  context=kind-space-local
+  # bootstrap.sh and the Tiltfile both support a non-default bench through
+  # SPACE_KIND_CLUSTER, and they now invoke these helpers automatically. The
+  # identity checks follow that selection instead of assuming space-local.
+  cluster=${SPACE_KIND_CLUSTER:-space-local}
+  control_plane=$cluster-control-plane
+  context=kind-$cluster
   namespace=space-$owner
   release=space-$owner
   harness_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[1]}")" && pwd)

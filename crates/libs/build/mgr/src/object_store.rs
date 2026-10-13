@@ -93,7 +93,8 @@ impl CredentialExchangeError {
         match self {
             Self::Connect(error) => match error {
                 pplx_space_credmgr_client::ConnectError::Transport(_)
-                | pplx_space_credmgr_client::ConnectError::Connect(_) => true,
+                | pplx_space_credmgr_client::ConnectError::Connect(_)
+                | pplx_space_credmgr_client::ConnectError::TcpConnect(_) => true,
                 pplx_space_credmgr_client::ConnectError::TlsRead { source, .. } => matches!(
                     source.kind(),
                     std::io::ErrorKind::Interrupted

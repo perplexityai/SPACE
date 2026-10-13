@@ -55,65 +55,43 @@ fn problems(protection: Protection) -> Vec<String> {
 }
 
 #[test]
-fn a_sticky_group_writable_install_root_is_protected() {
+fn an_install_root_is_roots_alone() {
     let tree = Tree::new();
     tree.dir("vendor", 0o755);
-    let root = tree.dir("vendor/firecracker", 0o1775);
-
+    // Read-only to everyone but root.
+    let store = tree.dir("vendor/firecracker", 0o755);
     assert_eq!(
-        tree.audit(&root, PathRole::InstallRoot),
-        Protection::Protected
-    );
-}
-
-#[test]
-fn an_install_root_may_be_the_images_or_the_runtime_managers() {
-    let tree = Tree::new();
-    tree.dir("vendor", 0o755);
-    // The image's, read-only to everyone but root.
-    let image = tree.dir("vendor/firecracker", 0o755);
-    assert_eq!(
-        tree.audit(&image, PathRole::InstallRoot),
+        tree.audit(&store, PathRole::InstallRoot),
         Protection::Protected
     );
 
-    // The runtime manager's own: the test user plays it here.
-    let own = tree.dir("vendor/kernels", 0o755);
+    // The runtime manager's, as earlier layouts had it: what is in the store
+    // runs as root, so no other account may own it.
     let mut identity = tree.identity();
     identity.trusted_uid += 1;
-    let found = problems(audit(&own, PathRole::InstallRoot, &identity).protection);
+    let found = problems(audit(&store, PathRole::InstallRoot, &identity).protection);
     assert!(
-        found
-            .iter()
-            .all(|problem| !problem.contains("neither root nor the runtime manager")),
-        "{found:?}"
-    );
-
-    // Anyone else's.
-    identity.service_uid += 1;
-    let found = problems(audit(&own, PathRole::InstallRoot, &identity).protection);
-    assert!(
-        found
-            .iter()
-            .any(|problem| problem.contains("neither root nor the runtime manager")),
+        found.iter().any(|problem| problem.contains("not root")),
         "{found:?}"
     );
 }
 
 #[test]
-fn an_install_root_writable_by_another_group_or_everyone_is_unprotected() {
+fn an_install_root_writable_by_a_group_or_everyone_is_unprotected() {
     let tree = Tree::new();
     tree.dir("vendor", 0o755);
-    let root = tree.dir("vendor/firecracker", 0o775);
-    let mut identity = tree.identity();
-    identity.service_gid += 1;
-    let found = problems(audit(&root, PathRole::InstallRoot, &identity).protection);
-    assert!(
-        found
-            .iter()
-            .any(|problem| problem.contains("not only by the runtime manager")),
-        "{found:?}"
-    );
+    // Group-writable, sticky or not, as the runtime manager's group once
+    // was allowed.
+    for mode in [0o775, 0o1775] {
+        let root = tree.dir("vendor/firecracker", mode);
+        let found = problems(tree.audit(&root, PathRole::InstallRoot));
+        assert!(
+            found
+                .iter()
+                .any(|problem| problem.contains("only root may write")),
+            "{mode:o}: {found:?}"
+        );
+    }
 
     let open = tree.dir("vendor/kernels", 0o757);
     let found = problems(tree.audit(&open, PathRole::InstallRoot));
@@ -220,11 +198,29 @@ fn state_must_be_private_to_the_runtime_manager() {
         tree.audit(&state, PathRole::StateDirectory),
         Protection::Protected
     );
-
+    // Clients traverse it to reach the socket beside the store.
     std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o750)).unwrap();
+    let database = state.join("runtime-manager.db");
+    std::fs::write(&database, b"").unwrap();
+    std::fs::set_permissions(&database, std::fs::Permissions::from_mode(0o600)).unwrap();
+    assert_eq!(
+        tree.audit(&state, PathRole::StateDirectory),
+        Protection::Protected
+    );
+
+    std::fs::set_permissions(&database, std::fs::Permissions::from_mode(0o640)).unwrap();
     let found = problems(tree.audit(&state, PathRole::StateDirectory));
     assert!(
         found.iter().any(|problem| problem.contains("private")),
+        "{found:?}"
+    );
+    std::fs::set_permissions(&database, std::fs::Permissions::from_mode(0o600)).unwrap();
+    std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o770)).unwrap();
+    let found = problems(tree.audit(&state, PathRole::StateDirectory));
+    assert!(
+        found
+            .iter()
+            .any(|problem| problem.contains("writable by accounts other")),
         "{found:?}"
     );
 }
@@ -341,16 +337,20 @@ fn a_kernel_image_another_account_can_write_is_unprotected() {
 }
 
 #[test]
-fn install_root_entries_may_belong_to_root_or_the_runtime_manager() {
+fn install_root_entries_must_be_roots() {
     let tree = Tree::new();
     tree.dir("vendor", 0o755);
-    let root = tree.dir("vendor/firecracker", 0o1775);
+    let root = tree.dir("vendor/firecracker", 0o755);
     tree.dir("vendor/firecracker/v1.15.1/bin", 0o755);
     std::fs::write(
         tree.path("vendor/firecracker/v1.15.1/bin/firecracker"),
         b"fc",
     )
     .unwrap();
+    assert_eq!(
+        tree.audit(&root, PathRole::InstallRoot),
+        Protection::Protected
+    );
     let mut identity = tree.identity();
     identity.trusted_uid += 1; // the test user plays the runtime manager here
     let report = audit(&root, PathRole::InstallRoot, &identity).protection;
@@ -358,8 +358,8 @@ fn install_root_entries_may_belong_to_root_or_the_runtime_manager() {
     assert!(
         found
             .iter()
-            .all(|problem| !problem.contains("which can rewrite it")),
-        "entries the runtime manager owns are allowed: {found:?}"
+            .any(|problem| problem.contains("which can rewrite it")),
+        "entries another account owns are not allowed: {found:?}"
     );
 }
 

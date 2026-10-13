@@ -13,6 +13,7 @@ use super::SandboxManagerService;
 use super::drain::{DrainState, acquire_state_writer, with_state_writer};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
+use tracing::Instrument;
 
 tokio::task_local! {
     static CALLER_CANCELLED: CancellationToken;
@@ -193,7 +194,6 @@ restart_rpcs! {
     SandboxStop => ("/space.sandbox.manager.v1.SandboxManager/Stop", StateWriter),
     SandboxKill => ("/space.sandbox.manager.v1.SandboxManager/Kill", StateWriter),
     SandboxDelete => ("/space.sandbox.manager.v1.SandboxManager/Delete", StateWriter),
-    SandboxReleaseExecution => ("/space.sandbox.manager.v1.SandboxManager/ReleaseExecution", StateWriter),
     SandboxListAutoLifecycleDeleteReceipts => ("/space.sandbox.manager.v1.SandboxManager/ListAutoLifecycleDeleteReceipts", ReadOnlyWithNarrowStateWrites),
     SandboxAcknowledgeAutoLifecycleDeleteReceipts => ("/space.sandbox.manager.v1.SandboxManager/AcknowledgeAutoLifecycleDeleteReceipts", StateWriter),
     SandboxListPendingLocalBackups => ("/space.sandbox.manager.v1.SandboxManager/ListPendingLocalBackups", ReadOnly),
@@ -367,10 +367,14 @@ where
                 // dropped by the transport still cancels its queued admission.
                 let cancelled = CancellationToken::new();
                 let cancel_on_drop = cancelled.clone().drop_guard();
-                let task = self.task_tracker.spawn(with_state_writer(
-                    writer,
-                    CALLER_CANCELLED.scope(cancelled, response),
-                ));
+                // The outer trace layer enters the request span only while it
+                // polls its own future. The handler now runs on a spawned task,
+                // so carry the request span explicitly; otherwise outbound
+                // client spans from state-writer handlers start new root traces.
+                let task = self.task_tracker.spawn(
+                    with_state_writer(writer, CALLER_CANCELLED.scope(cancelled, response))
+                        .in_current_span(),
+                );
                 Box::pin(async move {
                     let _cancel_on_drop = cancel_on_drop;
                     task.await.map_err(BoxError::from)?

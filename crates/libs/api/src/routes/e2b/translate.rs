@@ -105,7 +105,8 @@ pub(super) fn translate_create_request(
         .cloned()
         .collect::<Vec<_>>();
     if !ignored_metadata.is_empty() {
-        tracing::warn!(
+        // Routine: native metadata carries any key, and the fields are kept.
+        tracing::debug!(
             fields = %ignored_metadata.join(", "),
             "forwarding unrecognized E2B metadata fields as native metadata",
         );

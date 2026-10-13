@@ -740,18 +740,26 @@ pub(super) fn spawn_network_policy_refresh(
     expected_policy_ref: EffectiveNetworkPolicyRef,
     reason: &'static str,
 ) {
-    tokio::spawn(async move {
-        if let Err(error) =
-            refresh_network_policy(&db, &sandbox_id, Some(&expected_policy_ref), reason).await
-        {
-            tracing::warn!(
-                sandbox_id,
-                reason,
-                %error,
-                "background net-gateway policy push failed"
-            );
+    let span_sandbox_id = sandbox_id.clone();
+    tokio::spawn(
+        async move {
+            if let Err(error) =
+                refresh_network_policy(&db, &sandbox_id, Some(&expected_policy_ref), reason).await
+            {
+                tracing::warn!(
+                    sandbox_id,
+                    reason,
+                    %error,
+                    "background net-gateway policy push failed"
+                );
+                super::drain::record_detached_failure(&error.to_string());
+            }
         }
-    });
+        .instrument(super::drain::detached_trace_span(
+            "NetworkPolicyRefresh",
+            &span_sandbox_id,
+        )),
+    );
 }
 
 pub(super) async fn push_route_identity(

@@ -12,6 +12,7 @@ use pplx_space_common_svc::{
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use tonic::Status;
+use tracing::Instrument;
 
 use super::SandboxManagerService;
 
@@ -136,6 +137,54 @@ pub(super) async fn with_state_writer<T>(
 /// it is the only supported way to finish recovery admission.
 pub struct StartupRecoveryLease {
     _state_writer: StateWriterLease,
+}
+
+/// A root span for spawned work that can outlive the request that started
+/// it, such as a start finalizer or a suspend publication, linked to the
+/// current span.
+///
+/// It is neither a child of the request's span, which `in_current_span` or a
+/// contextual child would make it, nor parented to it by trace context. A
+/// child would hold the request's span open, so the request would report the
+/// work's duration as its own latency. A trace-context parent looks remote to
+/// the Datadog span processor, which then miscounts the request's still-open
+/// trace and flushes it in fragments. The link names the request instead.
+///
+/// A link carries no attributes and log lines do not follow it, so the root
+/// records the sandbox's canonical `sandbox_id` and the request's
+/// `request_id` itself; the sandbox's telemetry queries find it by them.
+pub(super) fn detached_trace_span(work: &'static str, sandbox_id: &str) -> tracing::Span {
+    let span = tracing::info_span!(
+        parent: None,
+        "sbxmgr.detached",
+        otel.name = work,
+        otel.status_code = tracing::field::Empty,
+        otel.status_description = tracing::field::Empty,
+        sandbox_id = tracing::field::Empty,
+        request_id = tracing::field::Empty,
+    );
+    pplx_space_common_svc::record_sandbox_id(&span, sandbox_id);
+    if let Some(request_id) = pplx_space_observability::current_request_id() {
+        span.record("request_id", request_id.as_str());
+    }
+    if let Some(traceparent) =
+        pplx_space_observability::trace_propagation::traceparent_for_span(&tracing::Span::current())
+    {
+        pplx_space_observability::trace_propagation::link_span_from_traceparent(
+            &span,
+            &traceparent,
+        );
+    }
+    span
+}
+
+/// Mark the current [`detached_trace_span`] failed. The work runs after its
+/// request has returned, so its own span is the only one that can carry the
+/// failure, and a search for a sandbox's failed traces needs it there.
+pub(super) fn record_detached_failure(description: &str) {
+    let span = tracing::Span::current();
+    span.record("otel.status_code", "ERROR");
+    span.record("otel.status_description", description);
 }
 
 impl SandboxManagerService {
@@ -370,13 +419,33 @@ impl SandboxManagerService {
     /// Child mutations inherit the admitted request's ownership even if drain
     /// closed admission meanwhile. The lease survives caller cancellation and
     /// is released only when the tracked mutation actually finishes.
+    ///
+    /// For work the request awaits: the child runs in the caller's span.
+    /// Work that outlives the request uses [`Self::spawn_detached_state_writer`].
     pub(super) fn spawn_state_writer<T: Send + 'static>(
         &self,
         method: &'static str,
         future: impl Future<Output = T> + Send + 'static,
     ) -> Result<tokio::task::JoinHandle<T>, Status> {
         let writer = self.state_writer_lease(method)?;
-        Ok(self.task_tracker.spawn(with_state_writer(writer, future)))
+        Ok(self
+            .task_tracker
+            .spawn(with_state_writer(writer, future).in_current_span()))
+    }
+
+    /// [`Self::spawn_state_writer`] for work that outlives the request, which
+    /// runs in its own trace linked to the request's (see
+    /// [`detached_trace_span`]).
+    pub(super) fn spawn_detached_state_writer<T: Send + 'static>(
+        &self,
+        method: &'static str,
+        sandbox_id: &str,
+        future: impl Future<Output = T> + Send + 'static,
+    ) -> Result<tokio::task::JoinHandle<T>, Status> {
+        let writer = self.state_writer_lease(method)?;
+        Ok(self.task_tracker.spawn(
+            with_state_writer(writer, future).instrument(detached_trace_span(method, sandbox_id)),
+        ))
     }
 
     pub(super) fn critical_task_guard(
@@ -461,7 +530,6 @@ fn try_acquire_state_writer(
         "/space.sandbox.manager.v1.SandboxManager/Delete"
             | "/space.sandbox.manager.v1.SandboxManager/Stop"
             | "/space.sandbox.manager.v1.SandboxManager/Kill"
-            | "/space.sandbox.manager.v1.SandboxManager/ReleaseExecution"
     );
     let capacity = MAX_ACTIVE_STATE_WRITERS
         + if teardown {

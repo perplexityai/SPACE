@@ -18,7 +18,7 @@ from typing import Any, cast
 from space_smoke import adapters
 from space_smoke.adapters import (
     CORDONED_NODE_ANNOTATION,
-    KIND_NODE_STACK_SELECTOR,
+    NODE_SANDBOX_MANAGER,
     KindConfig,
     KindHarness,
 )
@@ -116,7 +116,7 @@ class _Control:
     def uncordon_kube_node(self, node_name: str) -> None:
         self.calls.append(f"uncordon:{node_name}")
 
-    def restore_activations(self, sandbox_id: str, *, pod_names=None, since_time=None):
+    def restore_activations(self, sandbox_id: str, *, node_names=None, since_time=None):
         self.calls.append("activations")
         return list(self.activations)
 
@@ -356,22 +356,28 @@ class OrphanedCordonRecovery(unittest.TestCase):
         self.assertIn(f"{CORDONED_NODE_ANNOTATION}=space-local-worker", annotate)
 
 
-class NodeStackSelectorMatchesTheKindChart(unittest.TestCase):
-    """Worker node-stack pods are labelled by ROLE, not by DaemonSet name.
+class SandboxManagerSelectorMatchesTheKindCharts(unittest.TestCase):
+    """Sandbox events are read from the worker sandbox-manager pods.
 
-    Selecting on the DaemonSet name (`space-node-stack`) matches nothing and the
-    scenario then fails with "no runtime_activated event", which reads like a
-    product bug. Pin the constant to what the chart actually renders.
+    A selector the charts do not render matches nothing, and the scenario then
+    fails with "no runtime_activated event", which reads like a product bug.
+    Pin the selector and container to what the node-service library renders.
     """
 
-    def test_selector_is_the_worker_role_label(self) -> None:
-        template = Path(__file__).resolve().parents[2] / (
-            "infra/space/kind/charts/space-node-stack/templates/daemonset.yaml"
+    def test_selector_is_the_worker_role_and_component(self) -> None:
+        charts = Path(__file__).resolve().parents[2] / "infra/space/kind/charts"
+        helpers = (charts / "space-node-service/templates/_helpers.tpl").read_text()
+        self.assertIn(
+            'app.kubernetes.io/name: space-{{ include "space-node-service.role" .ctx }}', helpers
         )
-        text = template.read_text()
-        self.assertIn('has $nodeRole (list "worker" "builder")', text)
-        self.assertIn("app.kubernetes.io/name: space-{{ $nodeRole }}", text)
-        self.assertEqual(KIND_NODE_STACK_SELECTOR, "app.kubernetes.io/name=space-worker")
+        self.assertIn("app.kubernetes.io/component: {{ .component }}", helpers)
+        daemonset = (charts / "space-sandbox-manager-local/templates/daemonset.yaml").read_text()
+        self.assertIn('"component" "sandbox-manager"', daemonset)
+        self.assertIn("- name: sandbox-manager", daemonset)
+        self.assertEqual(
+            adapters._node_service_selector(NODE_SANDBOX_MANAGER),
+            "app.kubernetes.io/name=space-worker,app.kubernetes.io/component=sandbox-manager",
+        )
 
 
 if __name__ == "__main__":

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Revert the projected-token wiring applied by 01-apply-auth.sh: drop the
-# TokenReview RBAC, the node-stack k8sAuth env, and the space-api projected
+# TokenReview RBAC, the node-api k8sAuth env, and the space-api projected
 # token volume/env. Returns node-api to static-only auth.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib.sh
@@ -9,11 +9,11 @@ require kubectl
 assert_local_context
 
 log "remove TokenReview RBAC"
-kubectl --context "$KCTX" delete clusterrole space-node-stack-tokenreview --ignore-not-found
-kubectl --context "$KCTX" delete clusterrolebinding space-node-stack-tokenreview --ignore-not-found
+kubectl --context "$KCTX" delete clusterrole space-node-api-tokenreview --ignore-not-found
+kubectl --context "$KCTX" delete clusterrolebinding space-node-api-tokenreview --ignore-not-found
 
-log "remove k8sAuth env from node-stack"
-k set env "daemonset/${NODE_STACK_DS}" -c "${NODE_STACK_CONTAINER}" \
+log "remove k8sAuth env from node-api"
+k set env "daemonset/${NODE_API_DS}" -c "${NODE_API_CONTAINER}" \
   SPACE_K8S_TOKEN_AUTH_ENABLED- \
   SPACE_K8S_TOKEN_AUTH_NAMESPACE- \
   SPACE_K8S_TOKEN_AUTH_STATIC_FALLBACK_ENABLED- \
@@ -45,4 +45,4 @@ spec:
 EOF
 )" || warn "couldn't remove the space-auth volume/mount; check the ${SPACE_API_DEPLOY} spec by hand"
 
-log "done (note: the node-stack image is still k8s-built until you revert the Dockerfile + rebuild)."
+log "done."

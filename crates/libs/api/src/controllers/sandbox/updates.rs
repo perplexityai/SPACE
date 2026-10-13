@@ -1,10 +1,12 @@
 use super::*;
 use crate::controllers::db_contention_error;
+use crate::controllers::substrate::RuntimeRpcError;
 use pplx_space_common_core::sql;
 use pplx_space_common_core::types::{ExecutionGeneration, SandboxId};
 use pplx_space_common_svc::types::ReconcileReason;
 use pplx_space_events::{SandboxEvent, SandboxEventDetails, SandboxEventSource, SandboxEventType};
 use pplx_space_sandbox_store::{self as sandbox_store, FieldPatch};
+use pplx_space_sbx_mgr_client::proto::access_idle_update::Operation as AccessIdleOperation;
 
 /// `UpdateSandboxRequest` has no spelling for "clear this override and
 /// inherit the template default", so an absent field means *unchanged*.
@@ -130,6 +132,98 @@ fn classify_deadline_execution(
         ) => Ok(DeadlineExecutionReadiness::Pending),
         _ => Err(unavailable()),
     }
+}
+
+/// Where a failed deadline RPC leaves the worker's state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum AccessIdleSendFailure {
+    /// The dial failed locally, so no request bytes reached the worker.
+    Untransmitted,
+    /// The transport broke after the worker may have applied the update.
+    Ambiguous,
+    /// The worker answered; its status is the outcome.
+    Rejected,
+}
+
+/// Uses the plain touch path's temporary-transport predicate so both access
+/// paths agree on which failures are outages rather than worker verdicts.
+pub(super) fn classify_access_idle_send_failure(status: &tonic::Status) -> AccessIdleSendFailure {
+    if pplx_space_common_grpc::is_client_connect_failure(status) {
+        AccessIdleSendFailure::Untransmitted
+    } else if pplx_space_common_grpc::is_temporary_tcp_failure(status) {
+        AccessIdleSendFailure::Ambiguous
+    } else {
+        AccessIdleSendFailure::Rejected
+    }
+}
+
+pub(super) fn unconfirmed_access_idle_update() -> ControllerError {
+    ControllerError::service_unavailable("sandbox deadline update was not confirmed")
+        .with_retry_after_header(Duration::from_secs(1))
+}
+
+/// Whether a State read proves an ambiguous update's effect on the fenced
+/// execution. An extension is a monotonic floor, so it is proven once no
+/// auto-lifecycle event is due before that floor, whoever moved it there.
+/// A reset is never proven: a restarted idle clock looks the same as an
+/// earlier reset or later activity.
+pub(super) fn access_idle_update_observed(
+    sandbox_id: SandboxId,
+    generation: i64,
+    operation: &AccessIdleOperation,
+    response: pplx_space_sbx_mgr_client::proto::StateResponse,
+) -> Result<bool, ControllerError> {
+    // Unlike activation readiness, proof needs the generation itself:
+    // a replacement's deadline says nothing about this execution's update.
+    let next_auto_event_at = response
+        .sandboxes
+        .first()
+        .filter(|observed| observed.execution_generation == Some(generation))
+        .and_then(|observed| observed.auto_lifecycle_status.as_ref())
+        .and_then(|status| status.next_auto_event_at);
+    match classify_deadline_execution(sandbox_id, generation, response)? {
+        DeadlineExecutionReadiness::Pending => Ok(false),
+        DeadlineExecutionReadiness::Ready => Ok(match operation {
+            // The worker keeps deadlines at whole-second precision.
+            AccessIdleOperation::ExtendUntil(until) => {
+                next_auto_event_at.is_some_and(|next| next.seconds >= until.seconds)
+            }
+            AccessIdleOperation::ResetPolicy(_) => false,
+        }),
+    }
+}
+
+fn access_idle_deadline_request(
+    sandbox_id: SandboxId,
+    generation: i64,
+    observed_at: prost_types::Timestamp,
+    deadline: tokio::time::Instant,
+    operation: AccessIdleOperation,
+) -> Result<tonic::Request<TouchAutoLifecycleRequest>, ControllerError> {
+    // Observation consumes the same operation budget as the mutation.
+    let budget = deadline.saturating_duration_since(tokio::time::Instant::now());
+    if budget.is_zero() {
+        return Err(ControllerError::service_unavailable(
+            "sandbox deadline update expired",
+        ));
+    }
+    let expires = jiff::Timestamp::now() + jiff::SignedDuration::from_secs(budget.as_secs() as i64);
+    let expires_at = prost_types::Timestamp {
+        seconds: expires.as_second(),
+        nanos: expires.subsec_nanosecond(),
+    };
+    let mut request = tonic::Request::new(TouchAutoLifecycleRequest {
+        sandbox_id: sandbox_id.to_string(),
+        source: pplx_space_sbx_mgr_client::proto::AutoLifecycleActivitySource::Access as i32,
+        observed_at: Some(observed_at),
+        access_idle_update: Some(pplx_space_sbx_mgr_client::proto::AccessIdleUpdate {
+            execution_generation: generation,
+            expires_at: Some(expires_at),
+            operation: Some(operation),
+        }),
+    });
+    request.set_timeout(budget);
+    Ok(request)
 }
 
 impl SandboxController {
@@ -334,7 +428,11 @@ impl SandboxController {
                 SandboxEventType::NetworkPolicyUpdateFailed,
                 SandboxEventSource::Api,
             )
-            .emit_with(base_details().error("network policy generation conflict"));
+            .emit_with(
+                base_details()
+                    .error("network policy generation conflict")
+                    .routine(),
+            );
             return Err(ControllerError::precondition_failed(
                 "sandbox network_policy_generation does not match If-Match",
             ));
@@ -374,7 +472,7 @@ impl SandboxController {
                     SandboxEventType::NetworkPolicyUpdateFailed,
                     SandboxEventSource::Api,
                 )
-                .emit_with(base_details().error(error.to_string()));
+                .emit_with(base_details().error(error.to_string()).logged_by_caller());
             }
             mapped
         })?;
@@ -587,13 +685,13 @@ impl SandboxController {
                         .await?
                 }
             };
-            Self::send_access_idle_deadline(
+            self.send_access_idle_deadline(
                 client,
                 sandbox.id,
                 generation,
                 observed_at,
                 deadline,
-                pplx_space_sbx_mgr_client::proto::access_idle_update::Operation::ResetPolicy(
+                AccessIdleOperation::ResetPolicy(
                     crate::controllers::auto_lifecycle::policy_to_proto(&policy),
                 ),
             )
@@ -609,7 +707,7 @@ impl SandboxController {
         sandbox: &Sandbox,
         observed_at: prost_types::Timestamp,
         deadline: tokio::time::Instant,
-        operation: pplx_space_sbx_mgr_client::proto::access_idle_update::Operation,
+        operation: AccessIdleOperation,
     ) -> Result<(), ControllerError> {
         tokio::time::timeout_at(deadline, async {
             let (client, generation) = self
@@ -619,7 +717,7 @@ impl SandboxController {
                     deadline,
                 )
                 .await?;
-            Self::send_access_idle_deadline(
+            self.send_access_idle_deadline(
                 client,
                 sandbox.id,
                 generation,
@@ -648,13 +746,18 @@ impl SandboxController {
                 // Missing published identity does not prove the runtime is absent.
                 // Read its current generation; the mutation's generation fence
                 // rejects a replacement between this read and the write.
-                let mut request =
-                    tonic::Request::new(pplx_space_sbx_mgr_client::proto::StateRequest {
-                        sandbox_ids: vec![sandbox_id.to_string()],
-                    });
-                request
-                    .set_timeout(deadline.saturating_duration_since(tokio::time::Instant::now()));
-                let response = client.sandbox_state(request).await?;
+                let request = tonic::Request::new(pplx_space_sbx_mgr_client::proto::StateRequest {
+                    sandbox_ids: vec![sandbox_id.to_string()],
+                });
+                let response = client
+                    .call(
+                        &self.substrate,
+                        sandbox_id,
+                        deadline,
+                        request,
+                        |mut client, request| async move { client.sandbox_state(request).await },
+                    )
+                    .await?;
                 observed_access_idle_generation(sandbox_id, response.into_inner())?.get()
             }
         };
@@ -662,39 +765,109 @@ impl SandboxController {
     }
 
     async fn send_access_idle_deadline(
+        &self,
         mut client: RuntimeClient,
         sandbox_id: SandboxId,
         generation: i64,
         observed_at: prost_types::Timestamp,
         deadline: tokio::time::Instant,
-        operation: pplx_space_sbx_mgr_client::proto::access_idle_update::Operation,
+        operation: AccessIdleOperation,
     ) -> Result<(), ControllerError> {
-        // Observation consumes the same operation budget as the mutation.
-        let budget = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if budget.is_zero() {
-            return Err(ControllerError::service_unavailable(
-                "sandbox deadline update expired",
-            ));
-        }
-        let expires =
-            jiff::Timestamp::now() + jiff::SignedDuration::from_secs(budget.as_secs() as i64);
-        let expires_at = prost_types::Timestamp {
-            seconds: expires.as_second(),
-            nanos: expires.subsec_nanosecond(),
+        let request = access_idle_deadline_request(
+            sandbox_id,
+            generation,
+            observed_at,
+            deadline,
+            operation.clone(),
+        )?;
+        let response =
+            client
+                .call(
+                    &self.substrate,
+                    sandbox_id,
+                    deadline,
+                    request,
+                    |mut client, request| async move {
+                        client.touch_sandbox_auto_lifecycle(request).await
+                    },
+                )
+                .await;
+        let status = match response {
+            Ok(response) => return require_access_idle_update_acknowledgement(response),
+            Err(RuntimeRpcError::Rpc(status)) => status,
+            Err(RuntimeRpcError::Client(error)) => return Err(error),
         };
-        let mut request = tonic::Request::new(TouchAutoLifecycleRequest {
-            sandbox_id: sandbox_id.to_string(),
-            source: pplx_space_sbx_mgr_client::proto::AutoLifecycleActivitySource::Access as i32,
-            observed_at: Some(observed_at),
-            access_idle_update: Some(pplx_space_sbx_mgr_client::proto::AccessIdleUpdate {
-                execution_generation: generation,
-                expires_at: Some(expires_at),
-                operation: Some(operation),
-            }),
+        match classify_access_idle_send_failure(&status) {
+            AccessIdleSendFailure::Rejected => Err(status.into()),
+            AccessIdleSendFailure::Untransmitted => Err(unconfirmed_access_idle_update()),
+            AccessIdleSendFailure::Ambiguous => {
+                tracing::warn!(
+                    sandbox_id = %sandbox_id,
+                    error = %status,
+                    "access deadline update transport failed mid-request; observing its outcome"
+                );
+                if self
+                    .observe_access_idle_update(sandbox_id, generation, &operation, deadline)
+                    .await?
+                {
+                    Ok(())
+                } else {
+                    Err(unconfirmed_access_idle_update())
+                }
+            }
+        }
+    }
+
+    /// The update may already have applied, so this only reads: resending a
+    /// ResetPolicy would restart its idle clock. One observation, not a wait:
+    /// a worker that is still restarting leaves the outcome unconfirmed.
+    async fn observe_access_idle_update(
+        &self,
+        sandbox_id: SandboxId,
+        generation: i64,
+        operation: &AccessIdleOperation,
+        deadline: tokio::time::Instant,
+    ) -> Result<bool, ControllerError> {
+        let mut client = match self.substrate.probe_runtime_client(sandbox_id).await {
+            Ok(Some(client)) => client,
+            Ok(None) => return Ok(false),
+            Err(error) => {
+                tracing::debug!(
+                    sandbox_id = %sandbox_id,
+                    %error,
+                    "could not reach runtime to observe access deadline update"
+                );
+                return Ok(false);
+            }
+        };
+        let request = tonic::Request::new(pplx_space_sbx_mgr_client::proto::StateRequest {
+            sandbox_ids: vec![sandbox_id.to_string()],
         });
-        request.set_timeout(budget);
-        let response = client.touch_sandbox_auto_lifecycle(request).await?;
-        require_access_idle_update_acknowledgement(response)
+        match client
+            .call(
+                &self.substrate,
+                sandbox_id,
+                deadline,
+                request,
+                |mut client, request| async move { client.sandbox_state(request).await },
+            )
+            .await
+        {
+            Ok(response) => access_idle_update_observed(
+                sandbox_id,
+                generation,
+                operation,
+                response.into_inner(),
+            ),
+            Err(status) => {
+                tracing::debug!(
+                    sandbox_id = %sandbox_id,
+                    error = %status,
+                    "could not observe access deadline update outcome"
+                );
+                Ok(false)
+            }
+        }
     }
 
     /// Observe only: retrying a possibly applied ResetPolicy would start its
@@ -934,6 +1107,8 @@ fn snapshots_response_json(
 
 #[cfg(test)]
 mod postgres_tests;
+#[cfg(test)]
+mod transport_tests;
 
 pub(super) fn require_access_idle_update_acknowledgement(
     response: tonic::Response<TouchAutoLifecycleResponse>,

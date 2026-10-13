@@ -420,6 +420,8 @@ fn project_disk_metadata(
     validate_disk_projection_source(&metadata)?;
     metadata.sandbox_id = destination_sandbox_id.to_string();
     metadata.size_bytes = rootfs_bytes;
+    // The copy has the stream, never the source's node-local bundle.
+    metadata.rootfs_send_source_id = None;
     metadata.local_artifact_id = None;
     metadata.artifact_kind = Some(ArtifactKind::Disk);
     metadata.artifact_origin = Some(destination_origin);

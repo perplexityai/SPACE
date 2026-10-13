@@ -130,20 +130,22 @@ pub(crate) fn network_policy_override_from_set_request(
 }
 
 pub(crate) async fn fetch_template_default_network_policy(
+    templates: &dyn crate::template_resolver::TemplateResolver,
     template: &str,
 ) -> Result<EffectiveNetworkPolicy, Status> {
-    let mut client = pplx_space_template_mgr_client::lazy();
-    let response = match client
-        .get_template(pplx_space_template_mgr_client::proto::GetTemplateRequest {
-            caller_org_id: None,
-            template: Some(pplx_space_template_mgr_client::proto::TemplateRef {
-                name: template.to_string(),
-                content_hash: None,
-                tag: None,
-            }),
-            vcpu: None,
-            memory_mib: None,
-        })
+    let response = match templates
+        .get_template_on_shared_channel(tonic::Request::new(
+            pplx_space_template_mgr_client::proto::GetTemplateRequest {
+                caller_org_id: None,
+                template: Some(pplx_space_template_mgr_client::proto::TemplateRef {
+                    name: template.to_string(),
+                    content_hash: None,
+                    tag: None,
+                }),
+                vcpu: None,
+                memory_mib: None,
+            },
+        ))
         .await
     {
         Ok(response) => response.into_inner(),
@@ -175,15 +177,7 @@ pub(crate) struct TemplateNetworkPolicyCache {
     fetch_slots: Arc<tokio::sync::Semaphore>,
     shutdown_token: tokio_util::sync::CancellationToken,
     task_tracker: tokio_util::task::TaskTracker,
-}
-
-impl Default for TemplateNetworkPolicyCache {
-    fn default() -> Self {
-        Self::new(
-            tokio_util::sync::CancellationToken::new(),
-            tokio_util::task::TaskTracker::new(),
-        )
-    }
+    templates: Arc<dyn crate::template_resolver::TemplateResolver>,
 }
 
 #[derive(Default)]
@@ -216,6 +210,7 @@ impl TemplateNetworkPolicyCache {
     pub(crate) fn new(
         shutdown_token: tokio_util::sync::CancellationToken,
         task_tracker: tokio_util::task::TaskTracker,
+        templates: Arc<dyn crate::template_resolver::TemplateResolver>,
     ) -> Self {
         Self {
             inner: Arc::default(),
@@ -224,6 +219,7 @@ impl TemplateNetworkPolicyCache {
             )),
             shutdown_token,
             task_tracker,
+            templates,
         }
     }
 
@@ -233,8 +229,9 @@ impl TemplateNetworkPolicyCache {
         &self,
         template: &str,
     ) -> Result<EffectiveNetworkPolicy, Status> {
+        let templates = Arc::clone(&self.templates);
         self.get_or_fetch_with(template, |template| async move {
-            fetch_template_default_network_policy(&template).await
+            fetch_template_default_network_policy(templates.as_ref(), &template).await
         })
         .await
     }

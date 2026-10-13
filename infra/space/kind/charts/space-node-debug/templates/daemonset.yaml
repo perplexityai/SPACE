@@ -1,0 +1,105 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ .Release.Name }}-node-debug
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: space-node-debug
+    app.kubernetes.io/instance: {{ .Release.Name }}
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: space-node-debug
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 100%
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: space-node-debug
+        app.kubernetes.io/instance: {{ .Release.Name }}
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: space.pplx.net/node-pool
+                    operator: In
+                    values: {{ toJson .Values.pools }}
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      terminationGracePeriodSeconds: 5
+      containers:
+        - name: shell
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command:
+            - /bin/bash
+            - -c
+            - trap 'exit 0' TERM; while :; do sleep 3600 & wait; done
+          # Privileged root, as an operator's root shell on the node is:
+          # `btrfs subvolume show` and `dmsetup targets` need CAP_SYS_ADMIN
+          # and the node's device nodes; the CLIs connect as the Root peer the
+          # services admit for local operators.
+          securityContext:
+            privileged: true
+          volumeMounts:
+            - name: run
+              mountPath: /space/run
+            # HostToContainer: sees the node's cache and the jail mounts
+            # node-manager propagates there; mounts nothing back.
+            - name: cache
+              mountPath: /space/cache
+              mountPropagation: HostToContainer
+            - name: space-bin
+              mountPath: /space/bin
+              readOnly: true
+            - name: vendor
+              mountPath: /space/vendor
+              readOnly: true
+            - name: containerd-run
+              mountPath: /run/containerd
+            # The node's network-namespace handles, so the shell enters a
+            # pod's network namespace as an operator on the node host would
+            # (`nsenter --net=/var/run/netns/<handle>`); the sandbox-isolation
+            # smoke probes from a sandbox pod's namespace this way. The handle,
+            # not a pid, names a sandbox pod's namespace: the shim never starts
+            # the pause container, and the Firecracker VM and its gateway run in
+            # a separate per-sandbox namespace. HostToContainer: sees handles
+            # created after the shell started, mounts nothing back.
+            - name: netns
+              mountPath: /var/run/netns
+              mountPropagation: HostToContainer
+              readOnly: true
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+      volumes:
+        - name: run
+          hostPath:
+            path: /space/run
+            type: Directory
+        - name: cache
+          hostPath:
+            path: /space/cache
+            type: Directory
+        - name: space-bin
+          hostPath:
+            path: /space/bin
+            type: Directory
+        - name: vendor
+          hostPath:
+            path: /space/vendor
+            type: Directory
+        - name: containerd-run
+          hostPath:
+            path: /run/containerd
+            type: Directory
+        - name: netns
+          hostPath:
+            path: /var/run/netns
+            type: Directory

@@ -33,6 +33,7 @@ fn snapshot_meta_with_sandbox(
         },
         sandbox,
         rootfs_diff_format: None,
+        rootfs_send_source_id: None,
         encrypted: false,
         local_artifact_id: None,
         artifact_kind: None,
@@ -465,13 +466,7 @@ fn a_lost_claim_is_reported_without_a_durable_retry_write() {
 // ---------------------------------------------------------------------------
 
 fn recovery_test_service(conn: rusqlite::Connection) -> SandboxManagerService {
-    SandboxManagerService::new_with_options(
-        conn,
-        crate::service::SandboxManagerServiceOptions {
-            sandbox_runtime_live: Arc::new(|_| false),
-            ..Default::default()
-        },
-    )
+    crate::service::tests::service_tests::service_with_runtime_probe(conn, false)
 }
 
 /// Make the shipped orphan-restore driver return through its shutdown arm.
@@ -918,23 +913,26 @@ async fn the_dispatch_path_supervises_the_task_it_spawns() {
         pplx_space_common_core::types::SandboxQuarantineReasonCode::OrphanedSandboxRowMissing;
     let conn = crate::db::test_conn();
     let sandbox_id = crate::db::tests::setup_quarantine_recovery_episode(&conn, reason_code);
-    let service = recovery_test_service(conn);
+    // One short of the bound, so the accepted plan below is all that keeps the
+    // next rejection from completing a run that the plan interrupted.
+    for _ in 1..crate::db::QUARANTINE_RECOVERY_PLAN_REJECTION_BOUND {
+        crate::db::tests::record_quarantine_recovery_attempt(
+            &conn,
+            sandbox_id,
+            crate::db::QuarantineRecoveryNoProgressReason::PlanIneligible,
+        );
+    }
+    conn.execute(
+        "UPDATE sandbox_quarantine_state SET next_action_after = NULL WHERE sandbox_id = ?1",
+        rusqlite::params![sandbox_id.to_string()],
+    )
+    .unwrap();
+    let service = bound_test_service(conn);
+    let cache = tempfile::tempdir().unwrap();
     // The panic this test injects fires at the probe, after the restore returns,
     // so how the restore returns is not part of the claim. Taking the shutdown
     // arm skips a ~9.5 s vol-manager connect budget that nothing here reads.
     cancel_orphan_restore_operation(&service);
-    let [candidate] = crate::db::scan_quarantine_recovery_candidates(&service.db.lock().unwrap())
-        .unwrap()
-        .candidates
-        .try_into()
-        .unwrap();
-    let claimed =
-        crate::db::claim_quarantine_recovery_candidate(&service.db.lock().unwrap(), &candidate)
-            .unwrap()
-            .unwrap();
-    let permit = Arc::clone(&service.quarantine_recovery_restore_sem)
-        .try_acquire_owned()
-        .unwrap();
 
     let capture = crate::service::tests::service_tests::SandboxEventCapture::default();
     let counters = pplx_space_metrics::test_capture::capture_counters_guard();
@@ -942,15 +940,25 @@ async fn the_dispatch_path_supervises_the_task_it_spawns() {
         use tracing_subscriber::layer::SubscriberExt;
         let subscriber = tracing_subscriber::registry().with(capture.clone());
         let _guard = tracing::subscriber::set_default(subscriber);
-        service.dispatch_quarantined_orphan_restore(
-            claimed,
-            plan_for(None, reason_code),
-            |_window| panic!("deliberate panic inside the dispatched restore task"),
-            permit,
-        );
-        // The supervisor is a second tracked task, so wait for the permit the
-        // panicking task held to come back before reading what it recorded.
-        wait_for_orphan_restore_capacity(&service, 1).await;
+        // The production pass accepts the plan, claims, and dispatches; the
+        // task panics before it can record an outcome. The pass waits for the
+        // permit the panicking task held to come back.
+        service
+            .adopt_quarantine_recovery_episodes_with_probe(
+                cache.path(),
+                stub_plan(
+                    crate::snapshot_restore::QuarantineRecoveryPlanResolution::Available(plan_for(
+                        None,
+                        reason_code,
+                    )),
+                ),
+                |window| {
+                    if window == crate::service::recovery::RecoveryPassWindow::RestoreCompleted {
+                        panic!("deliberate panic inside the dispatched restore task");
+                    }
+                },
+            )
+            .await;
         tokio::time::timeout(BACKGROUND_RESTORE_TEST_TIMEOUT, async {
             while capture.types.lock().unwrap().is_empty() {
                 tokio::task::yield_now().await;
@@ -1000,6 +1008,38 @@ async fn the_dispatch_path_supervises_the_task_it_spawns() {
         restore_failed.get("result").map(String::as_str),
         Some("task_panicked")
     );
+
+    // Nothing recorded the outcome, so the lease is what lapses. The claim
+    // already ended the run, so the next rejection starts a new one.
+    service
+        .db
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE sandbox_quarantine_state
+                SET claim_expires_at = '1', next_action_after = NULL
+              WHERE sandbox_id = ?1",
+            rusqlite::params![sandbox_id.to_string()],
+        )
+        .unwrap();
+    service
+        .adopt_quarantine_recovery_episodes_with(
+            cache.path(),
+            stub_plan(
+                crate::snapshot_restore::QuarantineRecoveryPlanResolution::NoProgress(
+                    crate::db::QuarantineRecoveryNoProgressReason::PlanIneligible,
+                ),
+            ),
+        )
+        .await;
+    assert_eq!(
+        retry_state(&service, sandbox_id),
+        (
+            i64::from(crate::db::QUARANTINE_RECOVERY_PLAN_REJECTION_BOUND) + 1,
+            Some("plan_ineligible".to_string())
+        ),
+        "an accepted plan must break the run of rejections"
+    );
 }
 
 /// A staging lock released while the attempt waits is acquired, not refused.
@@ -1026,7 +1066,7 @@ async fn a_momentarily_busy_staging_tree_does_not_charge_the_episode() {
         conn,
         crate::service::SandboxManagerServiceOptions {
             sandbox_runtime_live: Arc::new(|_| true),
-            ..Default::default()
+            ..crate::service::SandboxManagerServiceOptions::for_test()
         },
     );
     let staging_lock = service.auto_lifecycle.staging_lock(&sandbox_id.to_string());
@@ -1823,9 +1863,13 @@ async fn a_deferred_orphan_restore_never_logs_the_storage_uri() {
         .into_iter()
         .find(|candidate| candidate.sandbox_id == sandbox_id)
         .expect("the seeded episode should be admissible");
-    let claimed = crate::db::claim_quarantine_recovery_candidate(&conn, &candidate)
-        .unwrap()
-        .expect("claiming a fresh episode should succeed");
+    let claimed = crate::db::claim_quarantine_recovery_candidate(
+        &conn,
+        &candidate,
+        crate::db::PlanRejectionRunEffect::Leaves,
+    )
+    .unwrap()
+    .expect("claiming a fresh episode should succeed");
     let service = recovery_test_service(conn);
     let plan = plan_for(None, reason_code);
 
@@ -1947,9 +1991,13 @@ async fn abandoning_at_shutdown_schedules_the_retry_one_backoff_away() {
         .into_iter()
         .find(|candidate| candidate.sandbox_id == sandbox_id)
         .expect("the seeded episode should be admissible");
-    let claimed = crate::db::claim_quarantine_recovery_candidate(&conn, &candidate)
-        .unwrap()
-        .expect("claiming a fresh episode should succeed");
+    let claimed = crate::db::claim_quarantine_recovery_candidate(
+        &conn,
+        &candidate,
+        crate::db::PlanRejectionRunEffect::Leaves,
+    )
+    .unwrap()
+    .expect("claiming a fresh episode should succeed");
     let (_, attempts_after_claim, scheduled_by_claim, claim_after_claim, _) =
         crate::db::tests::quarantine_claim_state(&conn, sandbox_id);
     assert_eq!(
@@ -2119,9 +2167,13 @@ async fn a_stale_claim_reaches_the_sandbox_event_timeline() {
         .into_iter()
         .find(|candidate| candidate.sandbox_id == sandbox_id)
         .expect("the seeded episode should be admissible");
-    let claimed = crate::db::claim_quarantine_recovery_candidate(&conn, &candidate)
-        .unwrap()
-        .expect("claiming a fresh episode should succeed");
+    let claimed = crate::db::claim_quarantine_recovery_candidate(
+        &conn,
+        &candidate,
+        crate::db::PlanRejectionRunEffect::Leaves,
+    )
+    .unwrap()
+    .expect("claiming a fresh episode should succeed");
     // Another claimant takes the episode, so this claim's write will miss.
     conn.execute(
         "UPDATE sandbox_quarantine_state SET claim_token = ?1 WHERE sandbox_id = ?2",
@@ -2935,9 +2987,13 @@ async fn the_cleanup_contention_release_reports_only_a_real_loss() {
             .into_iter()
             .find(|candidate| candidate.sandbox_id == sandbox_id)
             .expect("the seeded episode should be admissible");
-        let claimed = crate::db::claim_quarantine_recovery_candidate(&conn, &candidate)
-            .unwrap()
-            .expect("claiming a fresh episode should succeed");
+        let claimed = crate::db::claim_quarantine_recovery_candidate(
+            &conn,
+            &candidate,
+            crate::db::PlanRejectionRunEffect::Leaves,
+        )
+        .unwrap()
+        .expect("claiming a fresh episode should succeed");
         if supersede {
             conn.execute(
                 "UPDATE sandbox_quarantine_state SET claim_token = ?1 WHERE sandbox_id = ?2",
@@ -3329,4 +3385,482 @@ fn cross_node_restore_leaves_failed_synthetic_orphan_untouched() {
     assert_eq!(after.updated_at, before.updated_at);
     assert_eq!(after.template, before.template);
     assert!(after.restore_operation.is_none());
+}
+
+// ---------------------------------------------------------------------------
+// Cleanup-target discovery.
+// ---------------------------------------------------------------------------
+
+fn discover_cleanup_targets(
+    db: &Arc<Mutex<rusqlite::Connection>>,
+    authority: CleanupRecoveryAuthority,
+) -> Vec<CleanupRecoveryTarget> {
+    SandboxManagerService::recover_required_cleanup_targets(db, authority).unwrap()
+}
+
+/// An activation that was interrupted before it requested its own cleanup is
+/// resumed by startup with the activation-specific quarantine reason.
+#[test]
+fn startup_requests_interrupted_activation_cleanup_with_the_activation_reason() {
+    for (kind, entered_from, completion, reason_code) in [
+        (
+            crate::db::ActivationKind::ColdStart,
+            SandboxState::Stopped,
+            CleanupCompletion::MarkStopped,
+            SandboxQuarantineReasonCode::ColdActivationInterrupted,
+        ),
+        (
+            crate::db::ActivationKind::Restore,
+            SandboxState::Suspended,
+            CleanupCompletion::MarkSuspended,
+            SandboxQuarantineReasonCode::RestoreActivationInterrupted,
+        ),
+    ] {
+        let conn = crate::db::test_conn();
+        let sandbox_id = SandboxId::new();
+        let id = sandbox_id.to_string();
+        super::super::tests::service_tests::insert_test_sandbox(&conn, &id, entered_from);
+        let episode = crate::db::begin_activation(&conn, &id, entered_from, kind, None, None)
+            .unwrap()
+            .expect("activation arms a cleanup episode");
+        let db = Arc::new(Mutex::new(conn));
+
+        let targets = discover_cleanup_targets(&db, CleanupRecoveryAuthority::Startup);
+
+        let [target] = targets.try_into().unwrap();
+        assert_eq!(target.sandbox_id, sandbox_id, "{kind:?}");
+        assert_eq!(target.cleanup_id, Some(episode.id), "{kind:?}");
+        assert_eq!(target.completion, completion, "{kind:?}");
+        assert!(target.keep_filesystem, "{kind:?}");
+        let db = db.lock().unwrap();
+        let requested = crate::db::cleanup_episode(&db, &id).unwrap().unwrap();
+        assert_eq!(requested.id, episode.id, "{kind:?}");
+        assert!(requested.requested_at.is_some(), "{kind:?}");
+        assert_eq!(
+            requested.quarantine_reason_code,
+            Some(reason_code),
+            "{kind:?}"
+        );
+        assert_eq!(
+            crate::db::get_sandbox(&db, &id).unwrap().unwrap().state,
+            SandboxState::CleanupRequired,
+            "{kind:?}"
+        );
+    }
+}
+
+/// An armed activation cleanup whose row has already left the activation state
+/// no longer describes the row; startup retires it instead of adopting it.
+#[test]
+fn startup_retires_an_armed_cleanup_whose_row_left_the_activation_state() {
+    let conn = crate::db::test_conn();
+    let id = SandboxId::new().to_string();
+    super::super::tests::service_tests::insert_test_sandbox(&conn, &id, SandboxState::Stopped);
+    crate::db::begin_activation(
+        &conn,
+        &id,
+        SandboxState::Stopped,
+        crate::db::ActivationKind::ColdStart,
+        None,
+        None,
+    )
+    .unwrap()
+    .expect("activation arms a cleanup episode");
+    // A writer that predates armed episodes settled the row without retiring it.
+    conn.execute(
+        "UPDATE sandboxes SET state = 'stopped' WHERE id = ?1",
+        [&id],
+    )
+    .unwrap();
+    let db = Arc::new(Mutex::new(conn));
+
+    assert!(discover_cleanup_targets(&db, CleanupRecoveryAuthority::Startup).is_empty());
+
+    let db = db.lock().unwrap();
+    assert!(crate::db::cleanup_episode(&db, &id).unwrap().is_none());
+    let row = crate::db::get_sandbox(&db, &id).unwrap().unwrap();
+    assert_eq!(row.state, SandboxState::Stopped);
+    assert_eq!(row.cleanup_completion, None);
+    assert_eq!(row.cleanup_keep_filesystem, None);
+}
+
+/// A start interrupted after it allocated runtime resources has no cleanup
+/// intent of its own; startup infers one and persists it before scheduling, so
+/// a second restart resumes the same cleanup.
+#[test]
+fn startup_persists_the_inferred_cleanup_intent_of_an_interrupted_start() {
+    let conn = crate::db::test_conn();
+    let sandbox_id = SandboxId::new();
+    let id = sandbox_id.to_string();
+    super::super::tests::service_tests::insert_test_sandbox(&conn, &id, SandboxState::Starting);
+    conn.execute(
+        "UPDATE sandboxes SET uid = 10000, slot = 0 WHERE id = ?1",
+        [&id],
+    )
+    .unwrap();
+    let db = Arc::new(Mutex::new(conn));
+
+    let [target] = discover_cleanup_targets(&db, CleanupRecoveryAuthority::Startup)
+        .try_into()
+        .unwrap();
+
+    assert_eq!(target.sandbox_id, sandbox_id);
+    assert_eq!(target.completion, CleanupCompletion::MarkStopped);
+    assert!(target.keep_filesystem);
+    assert_eq!(target.cleanup_id, None);
+    let row = crate::db::get_sandbox(&db.lock().unwrap(), &id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.state, SandboxState::CleanupRequired);
+    assert_eq!(row.cleanup_completion, Some(CleanupCompletion::MarkStopped));
+    assert_eq!(row.cleanup_keep_filesystem, Some(true));
+    assert_eq!(
+        row.failure_reason.as_deref(),
+        Some("cleanup reconciliation required")
+    );
+
+    let [again] = discover_cleanup_targets(&db, CleanupRecoveryAuthority::Startup)
+        .try_into()
+        .unwrap();
+    assert_eq!(again.completion, CleanupCompletion::MarkStopped);
+    assert!(again.keep_filesystem);
+}
+
+/// Periodic discovery persists an inferred intent only if the row still has
+/// none; an owner that recorded its own intent after the row was listed keeps it.
+#[test]
+fn requested_cleanup_discovery_yields_to_an_intent_recorded_after_listing() {
+    let conn = crate::db::test_conn();
+    let id = SandboxId::new().to_string();
+    super::super::tests::service_tests::insert_test_sandbox(
+        &conn,
+        &id,
+        SandboxState::CleanupFailed,
+    );
+    conn.execute(
+        "UPDATE sandboxes SET uid = 10000, slot = 0 WHERE id = ?1",
+        [&id],
+    )
+    .unwrap();
+    let listed = vec![crate::db::get_sandbox(&conn, &id).unwrap().unwrap()];
+    crate::db::set_cleanup_intent(&conn, &id, true, CleanupCompletion::MarkStopped).unwrap();
+    let db = Arc::new(Mutex::new(conn));
+
+    let targets = SandboxManagerService::recover_required_cleanup_targets_from_rows(
+        &db,
+        listed,
+        CleanupRecoveryAuthority::RequestedOnly,
+    )
+    .unwrap();
+
+    assert!(targets.is_empty());
+    let row = crate::db::get_sandbox(&db.lock().unwrap(), &id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.state, SandboxState::CleanupFailed);
+    assert_eq!(row.cleanup_completion, Some(CleanupCompletion::MarkStopped));
+    assert_eq!(row.cleanup_keep_filesystem, Some(true));
+}
+
+/// A legacy row whose id is not a sandbox id cannot be addressed by cleanup; it
+/// is skipped without hiding the rows discovered after it.
+#[test]
+fn startup_cleanup_discovery_skips_rows_with_malformed_ids() {
+    let conn = crate::db::test_conn();
+    conn.execute(
+        "INSERT INTO sandboxes (id, uuid8, state, template, user, created_at, updated_at)
+         VALUES ('legacy-row', 'legacy01', 'stopping', 'seed', 'user', '1785456000', '1785456000')",
+        [],
+    )
+    .unwrap();
+    let sandbox_id = SandboxId::new();
+    super::super::tests::service_tests::insert_test_sandbox(
+        &conn,
+        &sandbox_id.to_string(),
+        SandboxState::Stopping,
+    );
+    // Discovery lists rows by `created_at`; pin both so the malformed row is
+    // listed first regardless of the wall clock.
+    conn.execute(
+        "UPDATE sandboxes SET created_at = '1785456001' WHERE id = ?1",
+        [sandbox_id.to_string()],
+    )
+    .unwrap();
+    let db = Arc::new(Mutex::new(conn));
+
+    let [target] = discover_cleanup_targets(&db, CleanupRecoveryAuthority::Startup)
+        .try_into()
+        .unwrap();
+
+    assert_eq!(target.sandbox_id, sandbox_id);
+}
+
+// ---------------------------------------------------------------------------
+// Quarantine adoption: the cleanup-fence deferral.
+// ---------------------------------------------------------------------------
+
+/// A sandbox whose cleanup fence is held elsewhere is not adopted underneath its
+/// owner; the attempt is charged so the retry backs off.
+#[tokio::test]
+async fn a_held_cleanup_fence_defers_adoption_and_charges_the_attempt() {
+    let reason_code =
+        pplx_space_common_core::types::SandboxQuarantineReasonCode::RestoreFirecrackerLaunchFailed;
+    let conn = crate::db::test_conn();
+    let sandbox_id = crate::db::tests::setup_quarantine_recovery_episode(&conn, reason_code);
+    let service = recovery_test_service(conn);
+    let artifact_id = candidate_artifact_id(&service);
+    let cache_dir = tempfile::tempdir().unwrap();
+    let CleanupLockTryResult::Acquired(_fence) = service.try_cleanup_fence(&sandbox_id.to_string())
+    else {
+        panic!("the test must hold the cleanup fence");
+    };
+
+    service
+        .adopt_quarantine_recovery_episodes_with(
+            cache_dir.path(),
+            stub_plan(
+                crate::snapshot_restore::QuarantineRecoveryPlanResolution::Available(plan_for(
+                    Some(artifact_id),
+                    reason_code,
+                )),
+            ),
+        )
+        .await;
+
+    let (attempts, last_error) = retry_state(&service, sandbox_id);
+    assert_eq!(attempts, 1);
+    assert_eq!(last_error.as_deref(), Some("cleanup_fence_busy"));
+    let db = service.db.lock().unwrap();
+    assert_eq!(
+        crate::db::get_sandbox(&db, &sandbox_id.to_string())
+            .unwrap()
+            .unwrap()
+            .state,
+        SandboxState::Quarantined
+    );
+    assert!(
+        crate::db::cleanup_episode(&db, &sandbox_id.to_string())
+            .unwrap()
+            .is_none(),
+        "a deferred adoption must not open a cleanup episode"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The plan-rejection bound, driven through the production pass. Episodes are
+// made due through the retry-time column, the same seam the other pass tests
+// use, so no test waits on a backoff.
+// ---------------------------------------------------------------------------
+
+type PlanLookup = std::pin::Pin<
+    Box<
+        dyn Future<
+                Output = Result<
+                    crate::snapshot_restore::QuarantineRecoveryPlanResolution,
+                    crate::snapshot_restore::RestoreError,
+                >,
+            > + Send,
+    >,
+>;
+
+/// A plan lookup that records every sandbox it is asked about and answers
+/// each with `answer`.
+fn recording_plan(
+    lookups: &Arc<std::sync::Mutex<Vec<String>>>,
+    answer: impl Fn() -> crate::snapshot_restore::QuarantineRecoveryPlanResolution
+    + Send
+    + Sync
+    + 'static,
+) -> impl Fn(String) -> PlanLookup {
+    let lookups = Arc::clone(lookups);
+    let answer = Arc::new(answer);
+    move |sandbox_id| {
+        lookups.lock().unwrap().push(sandbox_id);
+        let answer = Arc::clone(&answer);
+        Box::pin(async move { Ok(answer()) })
+    }
+}
+
+fn plan_rejected() -> crate::snapshot_restore::QuarantineRecoveryPlanResolution {
+    crate::snapshot_restore::QuarantineRecoveryPlanResolution::NoProgress(
+        crate::db::QuarantineRecoveryNoProgressReason::PlanIneligible,
+    )
+}
+
+/// One reconciler pass with every episode's retry time reached.
+async fn pass_with_every_episode_due(
+    service: &SandboxManagerService,
+    cache_dir: &Path,
+    resolve_plan: impl Fn(String) -> PlanLookup,
+) {
+    service
+        .db
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE sandbox_quarantine_state SET next_action_after = NULL",
+            [],
+        )
+        .unwrap();
+    service
+        .adopt_quarantine_recovery_episodes_with(cache_dir, resolve_plan)
+        .await;
+}
+
+/// Every field explicit, so no fixture reads the host's node identity.
+fn bound_test_service(conn: rusqlite::Connection) -> SandboxManagerService {
+    crate::service::tests::service_tests::service_with_runtime_probe(conn, false)
+}
+
+fn bound() -> i64 {
+    i64::from(crate::db::QUARANTINE_RECOVERY_PLAN_REJECTION_BOUND)
+}
+
+#[tokio::test]
+async fn plan_rejections_stop_recovery_at_the_bound_and_later_passes_never_look_it_up() {
+    let conn = crate::db::test_conn();
+    let sandbox_id = crate::db::tests::setup_quarantine_recovery_episode(
+        &conn,
+        pplx_space_common_core::types::SandboxQuarantineReasonCode::RestoreFirecrackerLaunchFailed,
+    );
+    let service = bound_test_service(conn);
+    let cache = tempfile::tempdir().unwrap();
+    let lookups = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+    // The literal bound, so changing the constant is a reviewed change here.
+    for pass in 1..=19 {
+        pass_with_every_episode_due(
+            &service,
+            cache.path(),
+            recording_plan(&lookups, plan_rejected),
+        )
+        .await;
+        let expected = pass.min(16);
+        assert_eq!(
+            i64::try_from(lookups.lock().unwrap().len()).unwrap(),
+            expected,
+            "pass {pass}"
+        );
+        assert_eq!(retry_state(&service, sandbox_id).0, expected, "pass {pass}");
+    }
+    assert_eq!(
+        service
+            .lookup_sandbox(&sandbox_id.to_string())
+            .unwrap()
+            .state,
+        SandboxState::Quarantined,
+        "stopping recovery hands the hold over; it does not release it"
+    );
+}
+
+#[tokio::test]
+async fn stopped_holds_take_no_admission_from_a_recoverable_hold() {
+    let reason_code =
+        pplx_space_common_core::types::SandboxQuarantineReasonCode::RestoreFirecrackerLaunchFailed;
+    let conn = crate::db::test_conn();
+    // More stopped holds than a pass admits, all older than the recoverable one.
+    let stopped = (0..QUARANTINE_RECOVERY_ADMISSIONS_PER_PASS + 1)
+        .map(|_| crate::db::tests::setup_quarantine_recovery_episode(&conn, reason_code))
+        .collect::<Vec<_>>();
+    let service = bound_test_service(conn);
+    let cache = tempfile::tempdir().unwrap();
+    let lookups = Arc::new(std::sync::Mutex::new(Vec::new()));
+    // A pass admits the eight oldest, so the ninth runs its bound after them.
+    for _ in 0..2 * bound() {
+        pass_with_every_episode_due(
+            &service,
+            cache.path(),
+            recording_plan(&lookups, plan_rejected),
+        )
+        .await;
+    }
+    for sandbox_id in &stopped {
+        assert_eq!(retry_state(&service, *sandbox_id).0, bound());
+    }
+
+    let recoverable = crate::db::tests::setup_quarantine_recovery_episode(
+        &service.db.lock().unwrap(),
+        reason_code,
+    );
+    let lookups = Arc::new(std::sync::Mutex::new(Vec::new()));
+    pass_with_every_episode_due(
+        &service,
+        cache.path(),
+        recording_plan(&lookups, plan_rejected),
+    )
+    .await;
+
+    assert_eq!(*lookups.lock().unwrap(), vec![recoverable.to_string()]);
+    assert_eq!(retry_state(&service, recoverable).0, 1);
+    for sandbox_id in stopped {
+        assert_eq!(retry_state(&service, sandbox_id).0, bound());
+    }
+}
+
+#[tokio::test]
+async fn a_restart_allows_a_stopped_hold_one_more_rejection_and_a_plan_answer_resumes_recovery() {
+    let reason_code =
+        pplx_space_common_core::types::SandboxQuarantineReasonCode::RestoreFirecrackerLaunchFailed;
+    let conn = crate::db::test_conn();
+    let sandbox_id = crate::db::tests::setup_quarantine_recovery_episode(&conn, reason_code);
+    let service = bound_test_service(conn);
+    let cache = tempfile::tempdir().unwrap();
+    let lookups = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let lookup_count = || i64::try_from(lookups.lock().unwrap().len()).unwrap();
+    for _ in 0..bound() {
+        pass_with_every_episode_due(
+            &service,
+            cache.path(),
+            recording_plan(&lookups, plan_rejected),
+        )
+        .await;
+    }
+    assert_eq!(lookup_count(), bound());
+    let mut stopped = bound();
+
+    // Still rejected after the restart: one more rejection, then stopped again.
+    assert_eq!(service.rearm_stopped_quarantine_recoveries().unwrap(), 1);
+    for _ in 0..3 {
+        pass_with_every_episode_due(
+            &service,
+            cache.path(),
+            recording_plan(&lookups, plan_rejected),
+        )
+        .await;
+    }
+    stopped += 1;
+    assert_eq!(lookup_count(), stopped);
+
+    // The control plane answers with a plan after the next restart. That ends
+    // the run, so ordinary recovery resumes with a fresh run of rejections.
+    assert_eq!(service.rearm_stopped_quarantine_recoveries().unwrap(), 1);
+    pass_with_every_episode_due(
+        &service,
+        cache.path(),
+        recording_plan(&lookups, || {
+            crate::snapshot_restore::QuarantineRecoveryPlanResolution::Available(plan_for(
+                Some(LocalArtifactId::new()),
+                pplx_space_common_core::types::SandboxQuarantineReasonCode::RestoreFirecrackerLaunchFailed,
+            ))
+        }),
+    )
+    .await;
+    assert_eq!(
+        retry_state(&service, sandbox_id),
+        (stopped + 1, Some("plan_artifact_mismatch".to_string()))
+    );
+    for _ in 1..bound() {
+        pass_with_every_episode_due(
+            &service,
+            cache.path(),
+            recording_plan(&lookups, plan_rejected),
+        )
+        .await;
+    }
+    assert_eq!(lookup_count(), stopped + bound());
+    assert_eq!(
+        service.rearm_stopped_quarantine_recoveries().unwrap(),
+        0,
+        "a run below the bound is still being retried, not stopped"
+    );
 }

@@ -19,7 +19,7 @@ use tokio_util::sync::CancellationToken;
 use tonic::{Request, Response, Status};
 
 use crate::cgroups::{
-    apply_firecracker_cgroup_fixups, cgroup_update_error_to_status, remove_sandbox_cgroups_blocking,
+    apply_firecracker_cgroup_fixups, cgroup_update_error_to_status, terminate_sandbox_cgroups,
 };
 use crate::inventory::{
     live_firecracker_pidfile, live_runtime_pid, live_sidecar_pid_from_cgroup, sandbox_runtime_pids,
@@ -256,13 +256,34 @@ impl RuntimeSupervisorService {
             .await
             .map_err(Status::internal)?;
         let cgroup_result = create_cgroup()?;
-        let launcher = prepared_launcher.spawn().map_err(|error| {
-            if cgroup_result.created {
-                cgroup::remove_cgroup(sandbox_id);
+        match prepared_launcher.spawn() {
+            Ok(launcher) => Ok(launcher),
+            Err(error) => {
+                if cgroup_result.created {
+                    // Another sidecar launch may already be using this shared
+                    // group. Reclaim an empty group only; never kill its users.
+                    if let Err(cleanup_error) = self.reclaim_failed_sidecar_cgroup(sandbox_id).await
+                    {
+                        tracing::warn!(%sandbox_id, %cleanup_error, "failed to reclaim sidecar cgroup after spawn failure");
+                    }
+                }
+                Err(Status::internal(error))
             }
-            Status::internal(error)
-        })?;
-        Ok(launcher)
+        }
+    }
+
+    async fn reclaim_failed_sidecar_cgroup(&self, sandbox_id: SandboxId) -> Result<(), Status> {
+        let permit = self.acquire_blocking_slot().await?;
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            cgroup::reclaim_unpopulated_cgroup(std::path::Path::new(&cgroup::sidecar_cgroup_path(
+                &sandbox_id,
+            )))
+        })
+        .await
+        .map_err(|error| Status::internal(format!("sidecar cgroup cleanup task failed: {error}")))?
+        .map(|_| ())
+        .map_err(Status::internal)
     }
 
     async fn apply_firecracker_cgroup_fixups(&self, sandbox_id: SandboxId, pid: u32) {
@@ -591,7 +612,7 @@ impl RuntimeSupervisorService {
                     .map_err(|error| Status::failed_precondition(format!("record CPU launch budget: {error}")))
             }).await?;
             let blocking_slot = self.acquire_blocking_slot().await?;
-            let pid = tokio::task::spawn_blocking(move || {
+            let launch_result = tokio::task::spawn_blocking(move || {
                 let _blocking_slot = blocking_slot;
                 launch::launch_via_jailer(launch::JailerLaunch {
                     sandbox_id: &launch_sandbox_id.to_string(),
@@ -608,8 +629,21 @@ impl RuntimeSupervisorService {
                 })
             })
             .await
-            .map_err(|error| Status::internal(format!("firecracker launch task failed: {error}")))?
-            .map_err(Status::internal)?;
+            .map_err(|error| Status::internal(format!("firecracker launch task failed: {error}")))
+            .and_then(|result| result.map_err(Status::internal));
+            let pid = match launch_result {
+                Ok(pid) => pid,
+                Err(error) => {
+                    // The owned launch still holds its execution/launch guards;
+                    // its blocking permit has been released before drain polling.
+                    if let Err(cleanup_error) = terminate_sandbox_cgroups(
+                        sandbox_id, Arc::clone(&self.blocking_slots), cgroup::CgroupScope::Firecracker,
+                    ).await {
+                        tracing::warn!(%sandbox_id, %cleanup_error, "failed to clean up Firecracker launch");
+                    }
+                    return Err(error);
+                }
+            };
             if let Err(error) = write_pid_symlink(&sandbox_id, "fc.pid", pid) {
                 match launch::ProcessHandle::open(pid) {
                     Ok(handle) => {
@@ -907,13 +941,16 @@ impl RuntimeSupervisorService {
             };
             signal_sandbox_pids(&sandbox_id, &still_alive, libc::SIGKILL, &mut actions);
         }
-        let blocking_slot = self.acquire_blocking_slot().await?;
-        remove_sandbox_cgroups_blocking(sandbox_id, blocking_slot)
-            .await
-            .map(|cgroup_actions| {
-                actions.extend(cgroup_actions);
-                Response::new(StopSandboxRuntimeResponse { actions })
-            })
+        terminate_sandbox_cgroups(
+            sandbox_id,
+            Arc::clone(&self.blocking_slots),
+            cgroup::CgroupScope::Sandbox,
+        )
+        .await
+        .map(|cgroup_actions| {
+            actions.extend(cgroup_actions);
+            Response::new(StopSandboxRuntimeResponse { actions })
+        })
     }
 
     async fn update_cgroup_owned(

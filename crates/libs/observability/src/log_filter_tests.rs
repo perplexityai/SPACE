@@ -212,8 +212,8 @@ fn slow_acquire_warnings_stay_in_logs() {
 fn json_logs_include_service_and_sandbox_context() {
     let output = CapturedLogs::default();
     let layer = tracing_subscriber::fmt::layer()
-        .event_format(super::SpaceJsonFormat {
-            context: super::JsonLogContext {
+        .event_format(super::SpaceJsonFormat::with_context(
+            super::JsonLogContext {
                 service: "space-spaced-host".to_string(),
                 environment: None,
                 version: None,
@@ -221,8 +221,7 @@ fn json_logs_include_service_and_sandbox_context() {
                 sandbox_id: Some("019eee45-9e12-7823-aef0-3ab147b88b6b".to_string()),
                 boot_type: Some("snapshot".to_string()),
             },
-            timer: tracing_subscriber::fmt::time::SystemTime,
-        })
+        ))
         .fmt_fields(tracing_subscriber::fmt::format::JsonFields::new())
         .with_writer(output.clone());
     let subscriber = tracing_subscriber::registry().with(layer);

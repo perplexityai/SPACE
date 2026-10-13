@@ -803,6 +803,29 @@ pub(crate) struct GcTickReport {
     pub(crate) bytes_freed: u64,
 }
 
+/// Why one GC tick failed as a whole. Per-candidate failures are counted in
+/// its report instead.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum GcTickError {
+    #[error("plan spawn_blocking: {0}")]
+    Task(#[source] tokio::task::JoinError),
+    #[error("read_plan_db_snapshot: {0}")]
+    PlanSnapshot(#[source] rusqlite::Error),
+    #[error("plan_from_snapshot: {0}")]
+    Plan(#[source] rusqlite::Error),
+}
+
+impl GcTickError {
+    fn metric_reason(&self) -> pplx_space_metrics::template::TemplateGcTickFailure {
+        use pplx_space_metrics::template::TemplateGcTickFailure as Failure;
+        match self {
+            Self::Task(_) => Failure::Task,
+            Self::PlanSnapshot(_) => Failure::PlanSnapshot,
+            Self::Plan(_) => Failure::Plan,
+        }
+    }
+}
+
 /// Run one tick of the GC loop. Pure with respect to its callbacks —
 /// the only external side effects are whatever `disk_size_for` and
 /// `delete_disk_for` perform. The DB connection is shared via
@@ -830,7 +853,7 @@ pub(crate) async fn gc_tick(
     disk_size_for: DiskSizeFn,
     delete_disk_for: DeleteDiskFn,
     reaper_probe: ReaperDiskProbeFn,
-) -> Result<GcTickReport, String> {
+) -> Result<GcTickReport, GcTickError> {
     let now_secs = jiff::Timestamp::now().as_second().max(0).cast_unsigned();
     let evict_cfg = EvictionConfig {
         budget_bytes: cfg.budget_bytes,
@@ -863,8 +886,8 @@ pub(crate) async fn gc_tick(
         read_plan_db_snapshot(&conn)
     })
     .await
-    .map_err(|e| format!("plan spawn_blocking: {e}"))?
-    .map_err(|e| format!("read_plan_db_snapshot: {e}"))?;
+    .map_err(GcTickError::Task)?
+    .map_err(GcTickError::PlanSnapshot)?;
 
     // Step 2: compose the plan from the snapshot. `disk_size_for`
     // hits the filesystem (and may take the DB lock itself in
@@ -885,8 +908,8 @@ pub(crate) async fn gc_tick(
         )
     })
     .await
-    .map_err(|e| format!("plan spawn_blocking: {e}"))?
-    .map_err(|e| format!("plan_from_snapshot: {e}"))?;
+    .map_err(GcTickError::Task)?
+    .map_err(GcTickError::Plan)?;
 
     let mut report = GcTickReport {
         candidates_planned: plan.candidates.len(),
@@ -1043,7 +1066,13 @@ pub async fn run_loop(
                         error = %err,
                         "template GC: skipping tick because active-sandbox snapshot is unavailable",
                     );
-                    pplx_space_metrics::template::gc_tick("error", tick_started, 0, 0, 0);
+                    pplx_space_metrics::template::gc_tick(
+                        Err(pplx_space_metrics::template::TemplateGcTickFailure::ActiveSetUnavailable),
+                        tick_started,
+                        0,
+                        0,
+                        0,
+                    );
                     if wait_or_shutdown(cfg.interval, &shutdown).await {
                         return;
                     }
@@ -1068,7 +1097,13 @@ pub async fn run_loop(
                         error = %err,
                         "template GC: skipping tick because warm-pool protected set is unavailable",
                     );
-                    pplx_space_metrics::template::gc_tick("error", tick_started, 0, 0, 0);
+                    pplx_space_metrics::template::gc_tick(
+                        Err(pplx_space_metrics::template::TemplateGcTickFailure::WarmPoolUnavailable),
+                        tick_started,
+                        0,
+                        0,
+                        0,
+                    );
                     if wait_or_shutdown(cfg.interval, &shutdown).await {
                         return;
                     }
@@ -1111,7 +1146,7 @@ pub async fn run_loop(
                     "template GC tick complete",
                 );
                 pplx_space_metrics::template::gc_tick(
-                    "ok",
+                    Ok(()),
                     tick_started,
                     report.bytes_before,
                     report.bytes_freed,
@@ -1120,7 +1155,13 @@ pub async fn run_loop(
             }
             Err(err) => {
                 warn!(error = %err, "template GC tick failed");
-                pplx_space_metrics::template::gc_tick("error", tick_started, 0, 0, 0);
+                pplx_space_metrics::template::gc_tick(
+                    Err(err.metric_reason()),
+                    tick_started,
+                    0,
+                    0,
+                    0,
+                );
             }
         }
 

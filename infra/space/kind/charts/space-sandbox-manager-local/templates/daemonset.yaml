@@ -1,0 +1,193 @@
+{{- $ctx := dict "ctx" . "component" "sandbox-manager" -}}
+{{- /*
+sandbox-manager forwards its OTLP endpoints to the net-gateway and spaced-host
+sidecars it launches (crates/libs/sbx/mgr/server/src/sidecar_env.rs), and those
+run on the Kind node in a sandbox network namespace, where cluster DNS does not
+resolve. Give it the node-reachable Collector addresses the shim and the
+runtime-supervisor use, the fixed ClusterIPs bring-up passes as
+telemetry.nodeOtlp*Endpoint; the host-network pod reaches them as well.
+*/ -}}
+{{- with .Values.telemetry.nodeOtlpMetricsEndpoint }}
+{{- $_ := set $.Values.telemetry "otlpMetricsEndpoint" . }}
+{{- end }}
+{{- with .Values.telemetry.nodeOtlpTracesEndpoint }}
+{{- $_ := set $.Values.telemetry "otlpTracesEndpoint" . }}
+{{- end }}
+{{- include "space-node-service.serviceAccount" $ctx }}
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "space-node-service.name" $ctx }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "space-node-service.labels" $ctx | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "space-node-service.selectorLabels" $ctx | nindent 6 }}
+  # Surge: sandbox-manager holds /space/run/sandbox-manager/service.mutex; the
+  # successor waits passively and the predecessor hands over its sockets after
+  # its pre-handoff drain (crates/libs/sbx/mgr/server/src/run.rs). Sandboxes
+  # keep running throughout: their VMs belong to the host runtime-supervisor.
+  {{- include "space-node-service.updateStrategy" (dict "strategy" "surge") | nindent 2 }}
+  template:
+    metadata:
+      annotations:
+        {{- include "space-node-service.podAnnotations" $ctx | nindent 8 }}
+      labels:
+        {{- include "space-node-service.labels" $ctx | nindent 8 }}
+    spec:
+      {{- include "space-node-service.nodeSelector" $ctx | nindent 6 }}
+      serviceAccountName: {{ include "space-node-service.name" $ctx }}
+      # The ClusterApi token is projected below; no Kubernetes API access.
+      automountServiceAccountToken: false
+      # Host network: sandbox-manager fetches quarantine recovery plans and
+      # begins and finalizes artifact backups, node-bound ClusterApi RPCs
+      # (snapshot_restore.rs, snapshot_upload_jobs.rs; see
+      # space-node-service.nodeBoundNetwork).
+      {{- include "space-node-service.nodeBoundNetwork" . | nindent 6 }}
+      # Host PID: sandbox-manager authorizes each sandbox's net-gateway by the
+      # SO_PEERCRED pid of its host-control connection, validated against
+      # node-manager's launch record (service/gateway_identity.rs,
+      # service/network_runtime.rs), and reports Firecracker pids the
+      # containerd shim checks on the node (shim/space.go). The gateways and
+      # Firecracker run on the node under the host runtime-supervisor, so those
+      # pids are only meaningful in the node's PID namespace.
+      hostPID: true
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds | int }}
+      # space-sbxmgr with SPACE_SANDBOX_MANAGER_GROUPS; btrfs work goes
+      # through node-manager (crates/libs/sbx/mgr/server/src/btrfs_via_nodemgr.rs).
+      securityContext:
+        {{- include "space-node-service.runAs" (dict "ctx" . "user" "SPACE_SBXMGR" "groups" "SPACE_SANDBOX_MANAGER_GROUPS") | nindent 8 }}
+      containers:
+        - name: sandbox-manager
+          {{- include "space-node-service.image" . | nindent 10 }}
+          # The production launcher, which execs the absolute binary path the
+          # credential-manager peer allowlist names (scripts/k8s/sandbox-manager-start.sh).
+          command:
+            - /opt/space/bin/sandbox-manager-start.sh
+            - --health-socket={{ include "space-node-service.healthSocket" $ctx }}
+          {{- include "space-node-service.restrictedContainer" . | nindent 10 }}
+          env:
+            {{- include "space-node-service.env.identity" . | nindent 12 }}
+            {{- include "space-node-service.env.clusterApi" . | nindent 12 }}
+            # Snapshot reupload (fork and promotion backups) refuses to start
+            # unless SPACE_INTERNAL_TOKEN is set beside the endpoint, although
+            # its ClusterApi client authenticates with the projected token
+            # (reupload_precondition_for_cluster_api_env,
+            # crates/libs/sbx/mgr/server/src/service/grpc_lifecycle/artifact_backup.rs).
+            {{- include "space-node-service.env.internalToken" . | nindent 12 }}
+            {{- include "space-node-service.env.routeVerification" . | nindent 12 }}
+            {{- include "space-node-service.env.diskAdmission" . | nindent 12 }}
+            - name: SPACE_NODE_MANAGED_BY
+              value: k8s
+            - name: SPACE_SBXMGR_NETWORK_CREDENTIALS_ENABLED
+              value: {{ .Values.networkCredentials.enabled | quote }}
+            # Snapshot upload destination (SnapshotUploadConfig::from_env, the
+            # suspend artifact-backup path). volume-manager performs the transfer
+            # with the static object-store credentials, which only volume-manager
+            # and build-manager receive; sandbox-manager gets none.
+            - name: SPACE_SNAPSHOT_BUCKET
+              value: {{ .Values.snapshots.bucket | quote }}
+            - name: SPACE_SNAPSHOT_REGION
+              value: {{ .Values.snapshots.region | quote }}
+            - name: SPACE_SNAPSHOT_ENDPOINT
+              value: {{ .Values.snapshots.endpoint | quote }}
+            {{- if .Values.snapshotStreamBtrfsSend }}
+            # Deferred btrfs-send capture (values.yaml).
+            - name: SPACE_SNAPSHOT_STREAM_BTRFS_SEND
+              value: "true"
+            {{- end }}
+            {{- with .Values.clusterDeletedEvictionQuiescenceSecs }}
+            - name: SPACE_SBX_CLUSTER_DELETED_QUIESCENCE_SECS
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.sandboxEviction }}
+            {{- if .enabled }}
+            - name: SPACE_SBX_EVICT_ENABLED
+              value: "1"
+            - name: SPACE_SBX_EVICT_ENGAGE_FRACTION
+              value: {{ .engageFraction | quote }}
+            - name: SPACE_SBX_EVICT_TARGET_FRACTION
+              value: {{ .targetFraction | quote }}
+            - name: SPACE_SBX_EVICT_MIN_IDLE_SECS
+              value: {{ .minIdleSecs | quote }}
+            - name: SPACE_SBX_EVICT_INTERVAL_SECS
+              value: {{ .intervalSecs | quote }}
+            - name: SPACE_SBX_EVICT_REUPLOAD_MAX_PER_TICK
+              value: {{ .reuploadMaxPerTick | quote }}
+            {{- end }}
+            {{- end }}
+            {{- with .Values.snapshotReaper }}
+            {{- if .enabled }}
+            - name: SPACE_SBX_GC_ENABLED
+              value: "1"
+            - name: SPACE_SBX_GC_ENGAGE_FRACTION
+              value: {{ .engageFraction | quote }}
+            - name: SPACE_SBX_GC_TARGET_FRACTION
+              value: {{ .targetFraction | quote }}
+            - name: SPACE_SBX_GC_INTERVAL_SECS
+              value: {{ .intervalSecs | quote }}
+            - name: SPACE_SBX_GC_GRACE_SECS
+              value: {{ .graceSecs | quote }}
+            - name: SPACE_SBX_GC_IDLE_SECS
+              value: {{ .idleSecs | quote }}
+            {{- end }}
+            {{- end }}
+            {{- if .Values.eppo.secretName }}
+            - name: EPPO_SDK_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.eppo.secretName }}
+                  key: {{ required "eppo.secretKey is required when eppo.secretName is set" .Values.eppo.secretKey }}
+                  optional: false
+            {{- end }}
+            {{- if .Values.eppo.baseUrl }}
+            - name: EPPO_BASE_URL
+              value: {{ .Values.eppo.baseUrl | quote }}
+            {{- end }}
+            {{- /* Only nil is "unset". `default dict` would swallow false, 0 and
+                   "" as empty, so a non-map value would be silently ignored. */}}
+            {{- $knownEgress := .Values.knownEgress }}
+            {{- if kindIs "invalid" $knownEgress }}
+            {{- $knownEgress = dict }}
+            {{- else if not (kindIs "map" $knownEgress) }}
+            {{- fail (printf "knownEgress must be a map with optional `enabled` and `domains` keys, got %s" (kindOf $knownEgress)) }}
+            {{- end }}
+            {{- $knownEgressDomains := $knownEgress.domains }}
+            {{- if and (not (kindIs "invalid" $knownEgressDomains)) (not (kindIs "string" $knownEgressDomains)) }}
+            {{- fail (printf "knownEgress.domains must be a comma-separated string, got %s; sandbox-manager parses it as one and rejects any other shape whole" (kindOf $knownEgressDomains)) }}
+            {{- end }}
+            {{- with $knownEgressDomains }}
+            - name: SPACE_NET_GATEWAY_KNOWN_EGRESS_DOMAINS
+              value: {{ . | quote }}
+            {{- end }}
+          {{- include "space-node-service.probes" $ctx | nindent 10 }}
+          volumeMounts:
+            {{- include "space-node-service.mount.run" . | nindent 12 }}
+            {{- include "space-node-service.mount.cache" (dict) | nindent 12 }}
+            # Per-VM defaults (/space/etc/sandbox.toml), which the node image
+            # provides (packer 07-sysctl.sh; the Kind node's space-layout unit).
+            - name: space-etc
+              mountPath: /space/etc
+              readOnly: true
+            {{- include "space-node-service.mount.routeVerification" . | nindent 12 }}
+            {{- include "space-node-service.mount.clusterApiToken" . | nindent 12 }}
+            {{- include "space-node-service.mount.rpcCa" . | nindent 12 }}
+            {{- include "space-node-service.mount.private" . | nindent 12 }}
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+      volumes:
+        {{- include "space-node-service.volume.run" . | nindent 8 }}
+        {{- include "space-node-service.volume.cache" . | nindent 8 }}
+        - name: space-etc
+          hostPath:
+            path: /space/etc
+            type: DirectoryOrCreate
+        {{- include "space-node-service.volume.routeVerification" . | nindent 8 }}
+        {{- include "space-node-service.volume.clusterApiToken" . | nindent 8 }}
+        {{- include "space-node-service.volume.rpcCa" . | nindent 8 }}
+        {{- include "space-node-service.volume.private" . | nindent 8 }}

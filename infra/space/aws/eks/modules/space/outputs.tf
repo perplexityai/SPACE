@@ -232,3 +232,8 @@ output "credmgr_s3_vend_role_arn" {
   description = "ARN of the S3-only role the credmgr authority assumes to vend S3 credentials; the chart's s3VendRoleArn. Null when credmgr_authority_s3_access_enabled is false."
   value       = one(aws_iam_role.credmgr_s3_vend[*].arn)
 }
+
+output "credmgr_secrets_reader_role_arn" {
+  description = "ARN of the role the credmgr authority assumes per organization to read that organization's tagged Secrets Manager secrets; the authority's SPACE_CREDMGR_SECRETS_MANAGER_ROLE_ARN."
+  value       = aws_iam_role.credmgr_secrets_reader.arn
+}

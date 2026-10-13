@@ -76,6 +76,10 @@ validated it. Include your self-assessed severity and a brief reason, or say
 when severity does not apply. Disclose whether an AI agent drafted the pull
 request description or contributed to the change, and identify those parts.
 
+Run `cargo arch` to check the repository structure rules in
+[ARCHITECTURE.toml](ARCHITECTURE.toml); [archcheck](crates/tools/archcheck/README.md)
+explains each rule and its baseline.
+
 For larger work, consider using `gh stack` to split it into a patch stack.
 Keep each pull request small enough for a human reviewer to reason about, but
 complete in scope so it can be understood and validated on its own. Explain

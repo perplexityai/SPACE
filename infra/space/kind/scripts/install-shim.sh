@@ -17,10 +17,11 @@
 #   SPACE_KIND_CLUSTER   kind cluster name (default: space-local)
 #   SPACE_SHIM_BIN       prebuilt shim path (default: build from ./shim with go)
 #   GO_BIN               go binary to use when building (default: PATH or /usr/local/go/bin/go)
-#   SPACE_KIND_TELEMETRY_MODE datadog, otel, or journald (default: datadog)
+#   SPACE_KIND_TELEMETRY_MODE otel (default), datadog, or off
 #   SPACE_KIND_SHIM_OTLP_ENDPOINT OTLP/gRPC trace endpoint visible from the
-#                         kind node (otel default: traces Collector ClusterIP;
-#                         other modes retain http://127.0.0.1:4317)
+#                         kind node (otel default: the traces Collector's fixed
+#                         ClusterIP; other modes retain http://127.0.0.1:4317);
+#                         the host runtime-supervisor follows it too
 #   SPACE_KIND_SHIM_ENV   trace environment identity (default: local-<hostname>)
 set -euo pipefail
 
@@ -79,8 +80,8 @@ build_shim() {
 # do not reach it. Keep the expected binary name as a small wrapper and install
 # the compiled shim separately. This mirrors the production worker layout and
 # makes the Kind telemetry selector apply to both Rust services and the Go shim.
-# In otel mode, resolve space-traces/collector through kubectl when rendering
-# the wrapper; the node can reach its ClusterIP but cannot resolve cluster DNS.
+# In otel mode the wrapper names each Collector by the fixed ClusterIP its Kind
+# profile pins: the node can reach a ClusterIP but cannot resolve cluster DNS.
 render_wrapper() {
   local output=$1 shim_version=$2
   python3 "$TELEMETRY_SCRIPT" shim-wrapper --version "$shim_version" \

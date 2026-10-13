@@ -127,3 +127,11 @@ pub fn get_attachment(
 
 #[cfg(test)]
 mod tests;
+
+/// Complete keep-set for the node's privileged send leases. Cancelling work
+/// retains ownership until the executor's cleanup barrier has completed.
+pub(crate) fn active_btrfs_upload_payloads(conn: &Connection) -> rusqlite::Result<Vec<String>> {
+    use pplx_space_common_core::sql;
+    let mut query = conn.prepare(sql!("SELECT payload FROM jobs WHERE kind = 'push_btrfs_send' AND status IN ('pending', 'running', 'cancelling')"))?;
+    query.query_map([], |row| row.get(0))?.collect()
+}

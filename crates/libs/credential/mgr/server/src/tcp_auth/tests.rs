@@ -9,53 +9,51 @@ async fn every_service_rechecks_transport_peer_on_cached_tokens() {
     use tower::ServiceExt;
     let (db, _) = registered_node_db().await.unwrap();
     for service in ClientService::ALL {
-        for (mode, enforce) in [("observe", false), ("enforce", true)] {
-            let (reviewer, reviews) = caller_reviewer(service, db.pool.clone(), Some(mode));
-            let layer = CredmgrTcpAuthLayer {
-                authenticator: Arc::new(Authenticator::ProjectedToken(Box::new(reviewer))),
-            };
-            let inner = tower::service_fn(move |req: http::Request<()>| async move {
-                assert_eq!(
-                    req.extensions().get::<TcpCallerIdentity>(),
-                    Some(&TcpCallerIdentity::K8sJwt(test_identity(service)))
-                );
-                let body = http_body_util::Empty::<bytes::Bytes>::new();
-                Ok::<_, std::convert::Infallible>(http::Response::new(body))
+        let (reviewer, reviews) = caller_reviewer(service, db.pool.clone());
+        let layer = CredmgrTcpAuthLayer {
+            authenticator: Arc::new(Authenticator::ProjectedToken(Box::new(reviewer))),
+        };
+        let inner = tower::service_fn(move |req: http::Request<()>| async move {
+            assert_eq!(
+                req.extensions().get::<TcpCallerIdentity>(),
+                Some(&TcpCallerIdentity::K8sJwt(test_identity(service)))
+            );
+            let body = http_body_util::Empty::<bytes::Bytes>::new();
+            Ok::<_, std::convert::Infallible>(http::Response::new(body))
+        });
+        let authenticated = layer.layer(inner);
+        for (peer, failure) in [
+            (Some("10.0.0.2:1234"), None),
+            (Some("[::ffff:10.0.0.2]:4567"), None),
+            (Some("[2001:db8::2]:1234"), None),
+            (Some("10.0.0.99:1234"), Some("peer_ip_mismatch")),
+            (None, Some("peer_address_missing")),
+        ] {
+            let mut request = http::Request::builder()
+                .uri(crate::intermediate_ca::ISSUE_INTERMEDIATE_METHOD_PATH)
+                .header("authorization", "Bearer header.payload.signature")
+                .header("x-forwarded-for", "10.0.0.2")
+                .body(())
+                .unwrap();
+            request.extensions_mut().insert(TcpConnectInfo {
+                local_addr: None,
+                remote_addr: peer.map(|peer| peer.parse().unwrap()),
             });
-            let authenticated = layer.layer(inner);
-            for (peer, failure) in [
-                (Some("10.0.0.2:1234"), None),
-                (Some("[::ffff:10.0.0.2]:4567"), None),
-                (Some("[2001:db8::2]:1234"), None),
-                (Some("10.0.0.99:1234"), Some("peer_ip_mismatch")),
-                (None, Some("peer_address_missing")),
-            ] {
-                let mut request = http::Request::builder()
-                    .uri(crate::intermediate_ca::ISSUE_INTERMEDIATE_METHOD_PATH)
-                    .header("authorization", "Bearer header.payload.signature")
-                    .header("x-forwarded-for", "10.0.0.2")
-                    .body(())
-                    .unwrap();
-                request.extensions_mut().insert(TcpConnectInfo {
-                    local_addr: None,
-                    remote_addr: peer.map(|peer| peer.parse().unwrap()),
-                });
-                let result = authenticated.clone().oneshot(request).await;
-                match failure.filter(|_| enforce) {
-                    None => assert!(result.is_ok(), "{service}: {peer:?}"),
-                    Some(reason) => {
-                        let error = Status::from_error(result.unwrap_err());
-                        assert_eq!(error.code(), tonic::Code::PermissionDenied, "{service}");
-                        assert_eq!(error.message(), reason, "{service}");
-                    }
+            let result = authenticated.clone().oneshot(request).await;
+            match failure {
+                None => assert!(result.is_ok(), "{service}: {peer:?}"),
+                Some(reason) => {
+                    let error = Status::from_error(result.unwrap_err());
+                    assert_eq!(error.code(), tonic::Code::PermissionDenied, "{service}");
+                    assert_eq!(error.message(), reason, "{service}");
                 }
             }
-            assert_eq!(
-                reviews.load(Ordering::SeqCst),
-                1,
-                "{service}: one cached TokenReview"
-            );
         }
+        assert_eq!(
+            reviews.load(Ordering::SeqCst),
+            1,
+            "{service}: one cached TokenReview"
+        );
     }
 }
 

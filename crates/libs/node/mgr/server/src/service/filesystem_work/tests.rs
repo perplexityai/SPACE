@@ -5,16 +5,19 @@ use std::sync::atomic::{AtomicBool, Ordering};
 async fn artifact_mutation_cancellation_retains_target_until_blocking_work_exits() {
     for cancelled in [false, true] {
         let service = super::super::tests::service_tests::service_for_unit_tests().await;
-        let id = "018f03b0-1832-7000-8000-000000000001";
+        // A fresh id keeps a regressed artifact delete away from any real path.
+        let sandbox_id = super::super::SandboxId::new().to_string();
+        let id = sandbox_id.as_str();
         let published = Arc::new(AtomicBool::new(false));
         let (started, running) = tokio::sync::oneshot::channel();
         let (finish, finished) = std::sync::mpsc::channel();
         let caller = tokio::spawn({
             let service = service.clone();
             let published = published.clone();
+            let id = sandbox_id.clone();
             async move {
                 service
-                    .run_artifact_mutation(id, |worker| async move {
+                    .run_artifact_mutation(&id, |worker| async move {
                         worker
                             .off_runtime("transfer fixture", move || {
                                 started.send(()).unwrap();
@@ -59,7 +62,8 @@ async fn artifact_mutation_cancellation_retains_target_until_blocking_work_exits
             .unwrap();
         let waiter = tokio::spawn({
             let service = service.clone();
-            async move { service.lock_sandbox_artifacts(id).await.unwrap() }
+            let id = sandbox_id.clone();
+            async move { service.lock_sandbox_artifacts(&id).await.unwrap() }
         });
         if cancelled {
             assert!(caller.await.unwrap_err().is_cancelled());
@@ -92,14 +96,15 @@ async fn artifact_mutation_cancellation_retains_target_until_blocking_work_exits
                 super::super::CACHE_DIR
             ),
         });
-        assert_eq!(
-            service
-                .delete_cache_artifact(request)
-                .await
-                .unwrap_err()
-                .code(),
-            tonic::Code::Unavailable
-        );
+        let busy = |result: Result<(), tonic::Status>| {
+            let error = result.unwrap_err();
+            assert_eq!(error.code(), tonic::Code::Unavailable);
+            assert_eq!(
+                error.message(),
+                "sandbox host mutation or reset is in progress; retry"
+            );
+        };
+        busy(service.delete_cache_artifact(request).await.map(|_| ()));
         let snapshot_name = "d-1m-20260922T120000Z";
         let results = [
             service
@@ -147,9 +152,7 @@ async fn artifact_mutation_cancellation_retains_target_until_blocking_work_exits
                 .await
                 .map(|_| ()),
         ];
-        for result in results {
-            assert_eq!(result.unwrap_err().code(), tonic::Code::Unavailable);
-        }
+        results.into_iter().for_each(busy);
         drop(capture);
         drop(service.claim_sandbox_mutation(id).unwrap());
         drop(target.try_lock().unwrap());

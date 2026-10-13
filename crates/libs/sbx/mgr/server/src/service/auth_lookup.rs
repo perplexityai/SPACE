@@ -816,7 +816,7 @@ impl SandboxManagerService {
         }
         self.watchdog.record_lifecycle_edge(&sandbox.id).await;
 
-        let mut node_client = connect_node()
+        let mut node_client = connect_node(&self.node_manager)
             .await
             .map_err(|error| resident_resume_connect_error(&self.db, &sandbox.id, error))?;
 
@@ -869,6 +869,7 @@ impl SandboxManagerService {
             let observation = observe_firecracker_vm_state(
                 &sandbox_id_typed,
                 "resident resume response reconciliation",
+                &self.node_manager,
             )
             .await;
             let reason = match observation.unobservable_reason() {
@@ -927,6 +928,7 @@ impl SandboxManagerService {
                         let observation = observe_firecracker_vm_state(
                             &sandbox_id_typed,
                             "resident resume guest setup rollback",
+                            &self.node_manager,
                         )
                         .await;
                         let probe_detail = observation
@@ -1004,13 +1006,15 @@ impl SandboxManagerService {
         }
 
         if inherit_template_default {
-            let resolved_template =
-                resolve_template_paths(pplx_space_template_mgr_client::proto::TemplateRef {
+            let resolved_template = resolve_template_paths(
+                self.template_resolver.as_ref(),
+                pplx_space_template_mgr_client::proto::TemplateRef {
                     name: sandbox.template.clone(),
                     content_hash: sandbox.template_hash.clone(),
                     tag: None,
-                })
-                .await?;
+                },
+            )
+            .await?;
             policy = resolved_template.default_auto_lifecycle;
         }
 

@@ -763,7 +763,7 @@ pub(super) fn apply_startup_lease_updates(
     for key in reset {
         pool.enqueue_reset(key.slot_id);
     }
-    crate::node_state_sync::mark_node_status_dirty();
+    pool.mark_node_status_dirty();
     Ok(())
 }
 

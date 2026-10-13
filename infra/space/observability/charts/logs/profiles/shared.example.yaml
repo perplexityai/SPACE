@@ -17,9 +17,9 @@ networkPolicy:
 collection:
   podTargets: [] # Verify the real CRI namespace_pod directory names first.
   # Replace with all excluded builder containers for this deployment. This
-  # example is the local node-stack topology, not a shared-cluster inventory.
+  # example is the local Kind topology, not a shared-cluster inventory.
   excludedPodSources:
-    - {namespace: space, podNamePrefix: space-builder-node-stack-, container: node-stack}
+    - {namespace: space, podNamePrefix: space-builder-build-manager-, container: build-manager}
   journal:
     path: /var/log/journal # Verify the host actually has a persistent journal.
     dropRegex: "" # Set for excluded builder unit;identifier pairs, if collected.

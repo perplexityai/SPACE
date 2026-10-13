@@ -6,7 +6,7 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use axum::extract::MatchedPath;
-use http::{HeaderMap, Request as HttpRequest, Response as HttpResponse};
+use http::{HeaderMap, Method, Request as HttpRequest, Response as HttpResponse};
 use tokio::net::UnixListener;
 use tokio_util::sync::CancellationToken;
 use tonic::Status;
@@ -588,6 +588,7 @@ pub const REDACTED_HTTP_PATH_VALUE: &str = "[REDACTED]";
 pub trait HttpSpanMetadata: Clone + Send + Sync + 'static {
     fn span_path_and_route<'a>(
         &self,
+        _method: &Method,
         _headers: &HeaderMap,
         raw_path: &'a str,
         matched_route: Option<&'a str>,
@@ -646,7 +647,7 @@ where
             .map(|matched| matched.as_str());
         let (path, route) =
             self.metadata
-                .span_path_and_route(request.headers(), raw_path, matched_route);
+                .span_path_and_route(method, request.headers(), raw_path, matched_route);
         let resource = format!("{method} {route}");
 
         let span = tracing::info_span!(
@@ -665,6 +666,7 @@ where
             http.route = %route,
             url.path = %path,
             http.target = %path,
+            request_id = tracing::field::Empty,
             sandbox_id = tracing::field::Empty,
             client_class = tracing::field::Empty,
             session_id = tracing::field::Empty,
@@ -687,6 +689,10 @@ where
             http.status_code = tracing::field::Empty,
         );
 
+        // A caller-supplied id; a surface that issues its own records it later.
+        if let Some(request_id) = request_id_from_headers(request.headers()) {
+            span.record("request_id", request_id.as_str());
+        }
         self.metadata
             .record_extra_fields(request.headers(), raw_path, matched_route, &span);
         pplx_space_observability::trace_propagation::set_span_parent_from_headers(
@@ -728,9 +734,13 @@ impl OnFailure<ServerErrorsFailureClass> for HttpServerOnFailure {
     }
 }
 
-pub fn http_trace_layer<M>(
-    make_span: HttpServerMakeSpan<M>,
-) -> TraceLayer<
+/// Adds a response's `traceparent` header inside [`http_trace_layer`].
+pub type TraceparentResponseLayer = tower::util::MapResponseLayer<
+    fn(HttpResponse<axum::body::Body>) -> HttpResponse<axum::body::Body>,
+>;
+
+/// The tower-http layer that creates and completes the `http.server` span.
+pub type HttpServerTraceLayer<M> = TraceLayer<
     SharedClassifier<ServerErrorsAsFailures>,
     HttpServerMakeSpan<M>,
     DefaultOnRequest,
@@ -738,15 +748,50 @@ pub fn http_trace_layer<M>(
     DefaultOnBodyChunk,
     DefaultOnEos,
     HttpServerOnFailure,
->
+>;
+
+/// The `http.server` trace layer, which also returns the server span's W3C
+/// `traceparent` on every response so a client can hand over the trace of a
+/// request it made.
+pub fn http_trace_layer<M>(
+    make_span: HttpServerMakeSpan<M>,
+) -> tower::layer::util::Stack<TraceparentResponseLayer, HttpServerTraceLayer<M>>
 where
     M: HttpSpanMetadata,
 {
-    TraceLayer::new_for_http()
-        .make_span_with(make_span)
-        .on_response(HttpServerOnResponse)
-        .on_failure(HttpServerOnFailure)
+    tower::layer::util::Stack::new(
+        tower::util::MapResponseLayer::new(insert_traceparent_header as fn(_) -> _),
+        TraceLayer::new_for_http()
+            .make_span_with(make_span)
+            .on_response(HttpServerOnResponse)
+            .on_failure(HttpServerOnFailure),
+    )
 }
+
+/// Name the request's `http.server` span in a `traceparent` response header.
+///
+/// The trace layer enters that span while it polls the response future this
+/// runs in, so it is the current span. The header carries only the W3C
+/// version, trace ID, span ID and sampled flag; trace state and baggage are
+/// not returned. Nothing is added when the span has no valid trace context,
+/// as with traces off, or when the response already names one, such as a
+/// proxied sandbox service's own.
+fn insert_traceparent_header(
+    mut response: HttpResponse<axum::body::Body>,
+) -> HttpResponse<axum::body::Body> {
+    if response.headers().contains_key(TRACEPARENT_HEADER) {
+        return response;
+    }
+    if let Some(traceparent) =
+        pplx_space_observability::trace_propagation::traceparent_for_span(&tracing::Span::current())
+        && let Ok(value) = http::HeaderValue::try_from(traceparent)
+    {
+        response.headers_mut().insert(TRACEPARENT_HEADER, value);
+    }
+    response
+}
+
+const TRACEPARENT_HEADER: http::HeaderName = http::HeaderName::from_static("traceparent");
 
 /// gRPC trace layer used by every SPACE node-local gRPC server.
 ///
@@ -786,6 +831,59 @@ pub fn grpc_trace_layer() -> TraceLayer<
         .on_response(GrpcOnResponse)
         .on_eos(GrpcOnEos)
         .on_failure(GrpcOnFailure)
+}
+
+/// Records one sandbox's id on every request span of a server that serves only
+/// that sandbox, such as its net-gateway, so `{span.sandbox_id=...}` finds its
+/// RPCs. Add it after [`grpc_trace_layer`], which makes the request span
+/// current while it calls the services inside it.
+#[derive(Clone, Copy, Debug)]
+pub struct SandboxSpanLayer {
+    sandbox_id: pplx_space_common_core::types::SandboxId,
+}
+
+impl SandboxSpanLayer {
+    pub fn new(sandbox_id: pplx_space_common_core::types::SandboxId) -> Self {
+        Self { sandbox_id }
+    }
+}
+
+impl<S> tower::Layer<S> for SandboxSpanLayer {
+    type Service = SandboxSpanService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        SandboxSpanService {
+            inner,
+            sandbox_id: self.sandbox_id,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct SandboxSpanService<S> {
+    inner: S,
+    sandbox_id: pplx_space_common_core::types::SandboxId,
+}
+
+impl<S, Request> tower::Service<Request> for SandboxSpanService<S>
+where
+    S: tower::Service<Request>,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = S::Future;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, request: Request) -> Self::Future {
+        tracing::Span::current().record("sandbox_id", tracing::field::display(self.sandbox_id));
+        self.inner.call(request)
+    }
 }
 
 fn grpc_server_status_classifier() -> GrpcErrorsAsFailures {
@@ -1062,17 +1160,32 @@ fn parse_grpc_path(path: &str) -> (&str, &str) {
     }
 }
 
-/// Extract a caller-supplied request id from common header names, in order of
-/// preference. We accept both the `x-request-id` and `x-correlation-id`
-/// conventions; whichever is present wins. Empty values are ignored.
-fn request_id_from_headers(headers: &HeaderMap) -> Option<String> {
+/// The longest caller-supplied request id a span or log line accepts.
+const MAX_REQUEST_ID_BYTES: usize = 128;
+
+/// A caller-supplied request id: `x-request-id`, or `x-correlation-id` when
+/// that is absent or blank. The first non-blank header decides.
+///
+/// The id lands on the request's span and on every log line written inside
+/// it, from callers that may be unauthenticated, so it is accepted only as at
+/// most 128 bytes of `[A-Za-z0-9._:-]`; anything else yields `None`.
+pub fn request_id_from_headers(headers: &HeaderMap) -> Option<String> {
     for name in ["x-request-id", "x-correlation-id"] {
-        if let Some(value) = headers.get(name).and_then(|v| v.to_str().ok()) {
-            let trimmed = value.trim();
-            if !trimmed.is_empty() {
-                return Some(trimmed.to_owned());
-            }
+        let Some(value) = headers.get(name) else {
+            continue;
+        };
+        let Ok(value) = value.to_str() else {
+            return None;
+        };
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            continue;
         }
+        let valid = trimmed.len() <= MAX_REQUEST_ID_BYTES
+            && trimmed.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-')
+            });
+        return valid.then(|| trimmed.to_owned());
     }
     None
 }

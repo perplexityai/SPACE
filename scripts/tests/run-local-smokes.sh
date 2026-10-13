@@ -297,19 +297,23 @@ run_ecw_identity() {
 }
 
 # Direct check of the real snapshot-storage path: drive the real volume-manager
-# (on the node-stack DaemonSet) to push a payload to the object store and pull it back,
+# (its node DaemonSet, through the node's operator shell) to push a payload to the
+# object store and pull it back,
 # asserting the bytes round-trip. This exercises the production object-store S3
 # code against the local object-store endpoint — independent of the sandbox guest.
 run_s3_roundtrip() {
   local code=0 logf="$RESULTS_DIR/s3-roundtrip.log"
   log "verifying real vol-mgr → object-store S3 round-trip"
   ensure_snapshot_bucket
-  local pod
+  local node pod
+  node="$(kubectl --context "$KCTX" -n "$NS" get pods \
+    -l app.kubernetes.io/name=space-worker,app.kubernetes.io/component=volume-manager \
+    -o jsonpath='{.items[0].spec.nodeName}' 2>/dev/null || true)"
   pod="$(kubectl --context "$KCTX" -n "$NS" get pods \
-    -l space.pplx.net/chart=space-node-stack \
+    -l app.kubernetes.io/name=space-node-debug --field-selector "spec.nodeName=${node}" \
     -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
-  if [[ -z "$pod" ]]; then
-    printf 'FAIL  %-14s :: no space-node-stack pod (is the node-stack DaemonSet up?)\n' "s3-roundtrip"
+  if [[ -z "$node" || -z "$pod" ]]; then
+    printf 'FAIL  %-14s :: no worker volume-manager with an operator shell (are the node DaemonSets up?)\n' "s3-roundtrip"
     FAILURES=$((FAILURES + 1))
     return
   fi
@@ -319,7 +323,7 @@ run_s3_roundtrip() {
   # prior run's object (stale bytes) instead of a fresh round-trip.
   local uniq; uniq="$(date +%s)-$$"
   local uri="s3://snapshots/local-smoke/rt-$uniq.bin?region=us-east-1&endpoint=http://object-store:8333&path_style=true"
-  kubectl --context "$KCTX" -n "$NS" exec "$pod" -- bash -c "
+  kubectl --context "$KCTX" -n "$NS" exec "$pod" -c shell -- bash -c "
     set -e
     src=/space/cache/rt-$uniq.bin
     out=/space/cache/rt-$uniq.out

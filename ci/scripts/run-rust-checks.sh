@@ -10,6 +10,14 @@
 # clippy lints every feature of workspace libraries and binaries while every
 # target is compiled in the same Cargo graph.
 #
+# GitHub CI splits `tests` across two containers on one runner, built once:
+# `tests-unprivileged` builds everything and runs the nextest inventory outside
+# the `privileged` test group (.config/nextest.toml) as an ordinary user, with
+# no Docker socket and its Postgres and Redis started beside it by the runner;
+# `tests-privileged` then runs that group as root from the same build, together
+# with the M1 generator check that needs Docker. `tests` and `all` still run the
+# whole inventory in one process.
+#
 # Designed to run inside a K8s pod. Installs gcc via apt if no C compiler is
 # found (required by Rust's `cc` crate for build scripts). Buildkite runs fmt,
 # clippy, and the complete nextest suite on separate agents.
@@ -35,6 +43,16 @@ CARGO_NEXTEST_VERSION="${CARGO_NEXTEST_VERSION:-0.9.133}"
 LOCAL_BIN_DIR="${REPO_ROOT}/ci/bin"
 TRANSIENT_NETWORK_EXIT_STATUS=75
 TEST_PROFILE_ARGS=()
+# The two halves of the inventory GitHub CI runs in separate containers. They
+# are complements by definition; check_privileged_group checks that the group
+# selects what its filter's clauses name.
+PRIVILEGED_TESTS_FILTERSET='group(privileged)'
+UNPRIVILEGED_TESTS_FILTERSET="not ${PRIVILEGED_TESTS_FILTERSET}"
+# Set by main for tests-unprivileged: the nextest arguments that select its
+# half, and whether the M1 generator check waits for the privileged step.
+NEXTEST_PARTITION_ARGS=()
+test_partition="all"
+m1_generator_check="here"
 
 curl_with_retries() {
     local status=0
@@ -353,6 +371,149 @@ prepare_test_dep_skip_log() {
     rm -f "${log}"
 }
 
+# The test build's binary list and Cargo metadata, which let the privileged
+# step run the same test binaries without invoking a build.
+test_reuse_metadata() {
+    local target_dir="$1"
+    printf '%s\n' \
+        --binaries-metadata "${target_dir}/nextest-binaries.json" \
+        --cargo-metadata "${target_dir}/nextest-cargo-metadata.json"
+}
+
+write_test_reuse_metadata() {
+    local target_dir="$1"
+    CARGO_TARGET_DIR="${target_dir}" cargo nextest list \
+        ${TEST_PROFILE_ARGS[@]+"${TEST_PROFILE_ARGS[@]}"} \
+        --workspace \
+        --locked \
+        --all-targets \
+        --all-features \
+        --list-type binaries-only \
+        --message-format json >"${target_dir}/nextest-binaries.json"
+    cargo metadata --format-version 1 --locked --all-features \
+        >"${target_dir}/nextest-cargo-metadata.json"
+}
+
+# Every test in the inventory, one per line as `<binary-id> <test-name>`,
+# narrowed by any filterset arguments given.
+list_inventory() {
+    local target_dir="$1"
+    shift
+    local reuse=()
+    mapfile -t reuse < <(test_reuse_metadata "${target_dir}")
+    # nextest's notices go to the log only when the listing fails.
+    local errors="${target_dir}/nextest-list.err"
+    if ! CARGO_TARGET_DIR="${target_dir}" cargo nextest list "${reuse[@]}" \
+        --run-ignored all \
+        --ignore-default-filter \
+        --message-format oneline \
+        "$@" 2>"${errors}" | LC_ALL=C sort; then
+        cat "${errors}" >&2
+        return 1
+    fi
+}
+
+# The privileged group's filter clauses from .config/nextest.toml, one per
+# line, as written there.
+privileged_group_clauses() {
+    python3 - "${REPO_ROOT}/.config/nextest.toml" <<'PY'
+import sys
+import tomllib
+
+with open(sys.argv[1], "rb") as config_file:
+    config = tomllib.load(config_file)
+overrides = config.get("profile", {}).get("default", {}).get("overrides", [])
+filters = [o["filter"] for o in overrides if o.get("test-group") == "privileged"]
+if len(filters) != 1:
+    sys.exit(f"expected one override assigning test-group privileged, found {len(filters)}")
+for line in filters[0].splitlines():
+    clause = line.strip()
+    if clause.startswith("or "):
+        clause = clause[3:]
+    if clause:
+        print(clause)
+PY
+}
+
+# `not group(privileged)` is the complement of the group by definition, so a
+# mistake in the group's filter never drops a test: it moves the test to the
+# unprivileged half. Catch the mistakes that do that silently. Every clause
+# must match at least one test, so a renamed test or a typo fails. And every
+# test a clause matches must be in the group, so an earlier override that
+# assigns another group fails. A privileged test that no clause names is not
+# detectable here; it fails the unprivileged half only if it asserts what it
+# needs. The group's list is kept for the privileged step to compare against.
+check_privileged_group() {
+    local target_dir="$1"
+    local privileged="${target_dir}/nextest-privileged.txt"
+    local total
+    echo "--- :scales: Checking the privileged test group"
+    total="$(list_inventory "${target_dir}" | wc -l | tr -d '[:space:]')"
+    list_inventory "${target_dir}" -E "${PRIVILEGED_TESTS_FILTERSET}" >"${privileged}"
+    local clauses=()
+    mapfile -t clauses < <(privileged_group_clauses)
+    if [ "${#clauses[@]}" -eq 0 ]; then
+        echo "::error::The privileged test group has no filter clauses." >&2
+        return 1
+    fi
+    local failures=0
+    local clause matched outside
+    for clause in "${clauses[@]}"; do
+        if ! matched="$(list_inventory "${target_dir}" -E "${clause}")"; then
+            echo "::error::Privileged test clause does not parse on its own: ${clause}" >&2
+            failures=$((failures + 1))
+            continue
+        fi
+        if [ -z "${matched}" ]; then
+            echo "::error::Privileged test clause matches no test: ${clause}" >&2
+            failures=$((failures + 1))
+            continue
+        fi
+        outside="$(LC_ALL=C comm -23 <(printf '%s\n' "${matched}") "${privileged}")"
+        if [ -n "${outside}" ]; then
+            echo "::error::Privileged test clause matches tests outside the group, which an earlier override assigns elsewhere: ${clause}" >&2
+            printf '  %s\n' "${outside}" >&2
+            failures=$((failures + 1))
+        fi
+    done
+    echo "${total} tests; ${#clauses[@]} privileged clauses select $(wc -l <"${privileged}" | tr -d '[:space:]') of them:"
+    sed 's/^/  /' "${privileged}"
+    if [ "${failures}" -ne 0 ]; then
+        echo "${failures} privileged test clause(s) are wrong; see .config/nextest.toml." >&2
+        return 1
+    fi
+}
+
+# tests-unprivileged must not run as root: a test needing privilege that is
+# missing from the privileged group would then pass here instead of failing.
+# The test user needs a passwd entry, since the spaced tests resolve the
+# current user's name and groups.
+require_unprivileged_user() {
+    if [ "$(id -u)" -eq 0 ]; then
+        echo "tests-unprivileged must not run as root; use tests or tests-privileged." >&2
+        return 1
+    fi
+    if ! getent passwd "$(id -u)" >/dev/null; then
+        echo "uid $(id -u) has no passwd entry; run as the CI image's space-ci user." >&2
+        return 1
+    fi
+}
+
+# The privileged step runs as root in the runner's workspace. Hand anything it
+# created back to the workspace owner so later steps and caches can use it.
+# Its caller runs it on the left of `||`, where errexit is off, so each step
+# returns its own failure.
+restore_workspace_ownership() {
+    local owner
+    owner="$(stat -c '%u:%g' .)" || return $?
+    local count
+    count="$(find . -xdev ! -user "${owner%%:*}" -print | wc -l | tr -d '[:space:]')" || return $?
+    if [ "${count}" -gt 0 ]; then
+        echo "Returning ${count} file(s) created as root to ${owner}"
+        find . -xdev ! -user "${owner%%:*}" -exec chown -h "${owner}" {} +
+    fi
+}
+
 run_test_checks() {
     local target_dir="target/buildkite-tests"
     local test_threads
@@ -373,12 +534,15 @@ run_test_checks() {
     # The nextest setup scripts pull these images before any test starts.
     # Pulling now overlaps the downloads with the test build; the setup scripts
     # skip an image that is already present and retry one that failed here.
+    # Without Docker (tests-unprivileged), the runner already started both.
     local image_pulls=()
     local image
-    for image in "$(space_test_dependency_postgres_image)" "$(space_test_dependency_redis_image)"; do
-        space_pull_docker_image "${image}" >/dev/null 2>&1 &
-        image_pulls+=("$!")
-    done
+    if [ "${test_partition}" = all ]; then
+        for image in "$(space_test_dependency_postgres_image)" "$(space_test_dependency_redis_image)"; do
+            space_pull_docker_image "${image}" >/dev/null 2>&1 &
+            image_pulls+=("$!")
+        done
+    fi
 
     # Build with nextest's Cargo arguments first so the doctests, the M1 gate
     # and the feature-isolation checks can run beside the test run; nextest's
@@ -394,6 +558,11 @@ run_test_checks() {
         --all-features \
         --timings \
         --no-run
+
+    if [ "${test_partition}" = unprivileged ]; then
+        write_test_reuse_metadata "${target_dir}"
+        check_privileged_group "${target_dir}"
+    fi
 
     local side_log="${target_dir}/side-checks.log"
     local side_status=0
@@ -411,11 +580,14 @@ run_test_checks() {
         --ignore-default-filter \
         --retries 1 \
         --no-fail-fast \
-        --test-threads "${test_threads}" || nextest_status=$?
-    wait "${image_pulls[@]}" || true
+        --test-threads "${test_threads}" \
+        ${NEXTEST_PARTITION_ARGS[@]+"${NEXTEST_PARTITION_ARGS[@]}"} || nextest_status=$?
 
-    cleanup_nextest_postgres "${SPACE_NEXTEST_POSTGRES_CLEANUP_ID}"
-    cleanup_nextest_redis "${SPACE_NEXTEST_REDIS_CLEANUP_ID}"
+    if [ "${test_partition}" = all ]; then
+        wait "${image_pulls[@]}" || true
+        cleanup_nextest_postgres "${SPACE_NEXTEST_POSTGRES_CLEANUP_ID}"
+        cleanup_nextest_redis "${SPACE_NEXTEST_REDIS_CLEANUP_ID}"
+    fi
     report_test_dep_skips
 
     wait "${side_checks}" || side_status=$?
@@ -424,6 +596,61 @@ run_test_checks() {
         return "${nextest_status}"
     fi
     return "${side_status}"
+}
+
+# The privileged half, from the build tests-unprivileged left in the target
+# directory: nextest runs those binaries without invoking Cargo's build, so this
+# root container compiles nothing into the runner's target directory.
+run_privileged_test_checks() {
+    local target_dir="target/buildkite-tests"
+    local test_threads
+    local nextest_status=0
+    local m1_status=0
+    test_threads="$(nextest_test_threads)"
+    local file
+    for file in nextest-binaries.json nextest-cargo-metadata.json nextest-privileged.txt; do
+        if [ ! -s "${target_dir}/${file}" ]; then
+            echo "${target_dir}/${file} is missing; tests-unprivileged writes it after the test build." >&2
+            return 1
+        fi
+    done
+    SPACE_NEXTEST_POSTGRES_CLEANUP_ID="${BUILDKITE_JOB_ID:-local-$$}-privileged"
+    export SPACE_NEXTEST_POSTGRES_CLEANUP_ID
+    SPACE_NEXTEST_REDIS_CLEANUP_ID="${SPACE_NEXTEST_POSTGRES_CLEANUP_ID}"
+    export SPACE_NEXTEST_REDIS_CLEANUP_ID
+    SPACE_TEST_DEP_SKIP_LOG="$(pwd)/${target_dir}/space-test-dep-skips-privileged.log"
+    export SPACE_TEST_DEP_SKIP_LOG
+    prepare_test_dep_skip_log "${target_dir}" "${SPACE_TEST_DEP_SKIP_LOG}"
+
+    # Run exactly the tests the unprivileged step's group check listed.
+    list_inventory "${target_dir}" -E "${PRIVILEGED_TESTS_FILTERSET}" \
+        >"${target_dir}/nextest-privileged-here.txt"
+    if ! cmp -s "${target_dir}/nextest-privileged.txt" "${target_dir}/nextest-privileged-here.txt"; then
+        echo "The privileged tests differ from the ones the unprivileged step checked:" >&2
+        diff "${target_dir}/nextest-privileged.txt" "${target_dir}/nextest-privileged-here.txt" >&2 || true
+        return 1
+    fi
+
+    local reuse=()
+    mapfile -t reuse < <(test_reuse_metadata "${target_dir}")
+    echo "--- :rust: Running the privileged workspace tests"
+    CARGO_TARGET_DIR="${target_dir}" cargo nextest run "${reuse[@]}" \
+        --run-ignored all \
+        --ignore-default-filter \
+        --retries 1 \
+        --no-fail-fast \
+        --test-threads "${test_threads}" \
+        -E "${PRIVILEGED_TESTS_FILTERSET}" || nextest_status=$?
+
+    cleanup_nextest_postgres "${SPACE_NEXTEST_POSTGRES_CLEANUP_ID}"
+    cleanup_nextest_redis "${SPACE_NEXTEST_REDIS_CLEANUP_ID}"
+    report_test_dep_skips
+
+    check_m1_document "${target_dir}" || m1_status=$?
+    if [ "${nextest_status}" -ne 0 ]; then
+        return "${nextest_status}"
+    fi
+    return "${m1_status}"
 }
 
 # nextest executes Cargo's binary test targets but intentionally does not
@@ -449,11 +676,22 @@ run_workspace_doctests() {
 # the test profile's package overrides and would rebuild the API crate.
 # `--examples` only adds the stable example path, which `--all-targets` builds
 # but does not link. `tests` mode also already requires the Docker daemon the
-# pinned generator needs. Stay workspace-wide, without package selectors.
+# pinned generator needs; tests-unprivileged has none, so it only writes the
+# document and tests-privileged checks it. Stay workspace-wide, without package
+# selectors.
 run_m1_sdk_check() {
     local target_dir="$1"
-    local m1_document="${target_dir}/m1-openapi.json"
-    echo "--- :snake: Checking M1 generated-SDK conformance"
+    generate_m1_document "${target_dir}"
+    if [ "${m1_generator_check}" = deferred ]; then
+        echo "The M1 generator check runs in tests-privileged, which has Docker."
+        return 0
+    fi
+    check_m1_document "${target_dir}"
+}
+
+generate_m1_document() {
+    local target_dir="$1"
+    echo "--- :snake: Generating the M1 OpenAPI document"
     CARGO_TARGET_DIR="${target_dir}" cargo build \
         ${TEST_PROFILE_ARGS[@]+"${TEST_PROFILE_ARGS[@]}"} \
         --profile test \
@@ -461,8 +699,13 @@ run_m1_sdk_check() {
         --locked \
         --all-features \
         --examples
-    "${target_dir}/debug/examples/m1_openapi" >"${m1_document}"
-    bash "${REPO_ROOT}/scripts/check-m1-sdk-generation.sh" "${m1_document}"
+    "${target_dir}/debug/examples/m1_openapi" >"${target_dir}/m1-openapi.json"
+}
+
+check_m1_document() {
+    local target_dir="$1"
+    echo "--- :snake: Checking M1 generated-SDK conformance"
+    bash "${REPO_ROOT}/scripts/check-m1-sdk-generation.sh" "${target_dir}/m1-openapi.json"
 }
 
 # ── Main ────────────────────────────────────────────────────────────────────
@@ -471,14 +714,15 @@ main() {
 cd "$REPO_ROOT"
 
 validation_mode="${1:-all}"
+usage="Usage: $0 [fmt|clippy|tests|tests-unprivileged|tests-privileged|all]"
 if [ "$#" -gt 1 ]; then
-    echo "Usage: $0 [fmt|clippy|tests|all]" >&2
+    echo "${usage}" >&2
     exit 2
 fi
 case "${validation_mode}" in
-    fmt | clippy | tests | all) ;;
+    fmt | clippy | tests | tests-unprivileged | tests-privileged | all) ;;
     *)
-        echo "Usage: $0 [fmt|clippy|tests|all]" >&2
+        echo "${usage}" >&2
         exit 2
         ;;
 esac
@@ -486,6 +730,29 @@ esac
 needs_build_dependencies=false
 needs_nextest=false
 needs_docker=false
+restore_ownership_on_exit=false
+sccache_active=false
+sccache_cleanup=false
+# Registered before any preflight can exit: the privileged step's root-owned
+# files must go back to the workspace owner however it ends, or the runner's
+# cache-save steps cannot read them.
+on_exit() {
+    local status=$?
+    if [ "${sccache_cleanup}" = true ]; then
+        cleanup
+    fi
+    if [ "${restore_ownership_on_exit}" = true ]; then
+        restore_workspace_ownership || {
+            local restore_status=$?
+            echo "Could not return root-owned workspace files to their owner (status ${restore_status})." >&2
+            if [ "${status}" -eq 0 ]; then
+                status="${restore_status}"
+            fi
+        }
+    fi
+    exit "${status}"
+}
+trap on_exit EXIT
 case "${validation_mode}" in
     clippy)
         needs_build_dependencies=true
@@ -494,6 +761,23 @@ case "${validation_mode}" in
         needs_build_dependencies=true
         needs_nextest=true
         needs_docker=true
+        ;;
+    tests-unprivileged)
+        require_unprivileged_user
+        needs_build_dependencies=true
+        needs_nextest=true
+        test_partition="unprivileged"
+        NEXTEST_PARTITION_ARGS=(-E "${UNPRIVILEGED_TESTS_FILTERSET}")
+        m1_generator_check="deferred"
+        ;;
+    tests-privileged)
+        if [ "$(id -u)" -ne 0 ]; then
+            echo "tests-privileged runs the tests that need root; run it as root." >&2
+            exit 1
+        fi
+        needs_nextest=true
+        needs_docker=true
+        restore_ownership_on_exit=true
         ;;
 esac
 
@@ -586,7 +870,6 @@ if [ "${needs_docker}" = true ]; then
     echo "✅ Docker daemon is available"
 fi
 
-sccache_active=false
 cleanup() {
     if [ "${sccache_active}" = true ]; then
         echo "--- :bar_chart: sccache statistics"
@@ -601,7 +884,7 @@ cleanup() {
         echo "--- :warning: sccache was unavailable; statistics skipped"
     fi
 }
-trap cleanup EXIT
+sccache_cleanup=true
 if [ "${needs_build_dependencies}" != true ]; then
     unset RUSTC_WRAPPER
 fi
@@ -632,8 +915,11 @@ case "${validation_mode}" in
     clippy)
         run_clippy_checks
         ;;
-    tests)
+    tests | tests-unprivileged)
         run_test_checks
+        ;;
+    tests-privileged)
+        run_privileged_test_checks
         ;;
     all)
         run_fmt_check

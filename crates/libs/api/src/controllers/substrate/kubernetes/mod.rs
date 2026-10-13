@@ -8,7 +8,7 @@ use std::{
 use time::OffsetDateTime;
 
 use futures_util::{TryStreamExt, pin_mut};
-use k8s_openapi::api::core::v1::{Node, Pod, PodStatus};
+use k8s_openapi::api::core::v1::{Node, Pod};
 use kube::{
     Api, Client, Error as KubeError,
     api::{DeleteParams, PostParams, WatchEvent, WatchParams},
@@ -20,10 +20,8 @@ use pplx_space_common_core::{
         MAX_SANDBOX_NETWORK_POLICY_ANNOTATION_BYTES, NodeGroupPlacement,
         NodeSelectorLabelsParseError, SANDBOX_NETWORK_POLICY_ANNOTATION,
         SANDBOX_NETWORK_POLICY_AUTHORITY_ANNOTATION, SANDBOX_NETWORK_POLICY_GENERATION_ANNOTATION,
-        SANDBOX_SUSPEND_RESTORE_SOURCE_NODE_ANNOTATION,
-        SANDBOX_SUSPEND_RESTORE_STORAGE_URI_ANNOTATION, SandboxPodCommon, SandboxPodConfig,
-        SandboxPodConfigValues, SandboxPodRequest, SandboxRuntimePodMetadata, build_sandbox_pod,
-        node_group_label,
+        SandboxPodCommon, SandboxPodConfig, SandboxPodConfigValues, SandboxPodRequest,
+        SandboxRuntimePodMetadata, build_sandbox_pod, node_group_label,
     },
     types::{
         NodeRole as SpaceNodeRole, PodName, PodResourceVersion, PodUid, SandboxId, StorageUri,
@@ -46,13 +44,21 @@ use tonic::{Code, transport::Channel};
 use tracing::Instrument;
 use uuid::Uuid;
 
+mod budgets;
 mod caches;
 mod cancel_rate_tracker;
 mod pod_reflector;
 mod restore_waiters;
+mod sandbox_pod_view;
 mod store;
 
+use budgets::SubstrateBudgets;
 pub use pod_reflector::ReflectorReady;
+use sandbox_pod_view::NodeNetworkSlots;
+pub use sandbox_pod_view::{
+    SandboxContainerState, SandboxContainerStatuses, SandboxContainerTerminated,
+    SandboxContainerWaiting, SandboxPodKey, SandboxPodView,
+};
 // Nameable so out-of-crate reconcilers can hold the cache bundle and consult
 // `nodes_ready()`, not just read `caches.nodes`. Without this the type is
 // reachable (the field is public) but not writable in a struct or signature,
@@ -561,7 +567,7 @@ fn is_wake_recovery_lifecycle(lifecycle: &str) -> bool {
 async fn create_sandbox_pod(
     k8s: &KubernetesState,
     mut request: SandboxPodRequest<'_>,
-) -> Result<Pod, KubeError> {
+) -> Result<SandboxPodView, KubeError> {
     let common = match &mut request {
         SandboxPodRequest::OnDemand { common, .. }
         | SandboxPodRequest::Restore { common, .. }
@@ -592,7 +598,8 @@ async fn create_sandbox_pod(
         span.record("otel.status_code", "ERROR");
         span.record("otel.status_description", tracing::field::display(error));
     }
-    result
+    // Callers read the create response through the same view the cache holds.
+    result.map(SandboxPodView::from)
 }
 
 async fn delete_sandbox_pod(k8s: &KubernetesState, pod_name: &str) -> Result<(), KubeError> {
@@ -725,13 +732,18 @@ impl K8sBlockingDeleteError {
 /// Direct kube-apiserver `GET /pods/{name}` fallback. Used only on rare paths
 /// (e.g. the post-409 conflict recovery in `ensure_pod_exists`) where the
 /// reflector cache has not yet seen a freshly-created pod. The hot read path
-/// goes through [`KubernetesSubstrate::lookup_sandbox_pod`].
+/// goes through [`KubernetesSubstrate::lookup_sandbox_pod`]. Returns the same
+/// [`SandboxPodView`] the cache holds, so cached and uncached callers read the
+/// same fields.
 async fn fetch_sandbox_pod_uncached(
     k8s: &KubernetesState,
     pod_name: &str,
-) -> Result<Option<Pod>, KubeError> {
+) -> Result<Option<Arc<SandboxPodView>>, KubeError> {
     let pods: Api<Pod> = Api::namespaced(k8s.client.clone(), &k8s.sandbox_namespace);
-    pods.get_opt(pod_name).await
+    Ok(pods
+        .get_opt(pod_name)
+        .await?
+        .map(|pod| Arc::new(SandboxPodView::from(pod))))
 }
 
 fn is_not_found_error(err: &KubeError) -> bool {
@@ -770,7 +782,11 @@ pub struct KubernetesSubstrate {
     /// watcher filtered on `space.pplx.net/managed-by=space-api`. Reads are
     /// synchronous and do not hit the kube apiserver, eliminating the
     /// per-request `GET /pods/{name}` traffic that previously saturated APF.
-    pod_store: Store<Pod>,
+    /// Holds the slim [`SandboxPodView`], not the full `Pod`.
+    pod_store: Store<SandboxPodView>,
+    /// Per-node active network-slot totals, written from the same reflector
+    /// events as `pod_store`. Read by the create-path capacity preflight.
+    pod_network_slots: NodeNetworkSlots,
     /// Per-pod-name event signaller fed by the same reflector watch. Lets
     /// `read_sandbox_pod` wait briefly for the next reflector update before
     /// falling through to a direct `GET` during the brief window between pod
@@ -808,6 +824,9 @@ pub struct KubernetesSubstrate {
     /// directly so a join's re-check interval is settable in tests;
     /// production takes the default, which is those constants.
     recovery_join_backoff: execution::RecoveryJoinBackoffPolicy,
+    /// Readiness, preserve-decision, suspend and connect budgets. Production
+    /// takes the default, which is the constants each one names.
+    budgets: SubstrateBudgets,
     shutdown_token: CancellationToken,
     task_tracker: TaskTracker,
 }
@@ -829,7 +848,7 @@ impl KubernetesSubstrate {
     ) -> Result<Option<Self>, SubstrateError> {
         match KubernetesState::try_from_env().await {
             Ok(Some(k8s)) => {
-                let (pod_store, pod_events, pod_reflector_ready) =
+                let (pod_store, pod_network_slots, pod_events, pod_reflector_ready) =
                     pod_reflector::start(k8s.client.clone(), k8s.sandbox_namespace.clone());
                 let store = K8sStore::new(pool.clone(), k8s.sandbox_namespace.clone());
                 // Read before `k8s` is moved into the struct below.
@@ -850,12 +869,14 @@ impl KubernetesSubstrate {
                     ),
                     store,
                     pod_store,
+                    pod_network_slots,
                     pod_events,
                     pod_reflector_ready,
                     k8s,
                     node_group_placement,
                     cancel_tracker: CancelRateTracker::with_default_budget(),
                     recovery_join_backoff: execution::RecoveryJoinBackoffPolicy::default(),
+                    budgets: SubstrateBudgets::default(),
                     shutdown_token,
                     task_tracker,
                 }))
@@ -893,7 +914,7 @@ impl KubernetesSubstrate {
         self
     }
 
-    pub fn sandbox_pod_store(&self) -> Store<Pod> {
+    pub fn sandbox_pod_store(&self) -> Store<SandboxPodView> {
         self.pod_store.clone()
     }
 
@@ -1170,11 +1191,15 @@ impl KubernetesSubstrate {
 }
 
 mod adapter;
+#[cfg(test)]
+mod adapter_characterization_tests;
 mod execution;
 mod node_sync;
 mod per_sandbox_setup;
 mod pod_ops;
 mod pool;
+#[cfg(test)]
+mod scripted_test_doubles;
 mod support;
 #[cfg(test)]
 pub(crate) mod tests;

@@ -3,7 +3,7 @@ use pplx_space_common_core::types::{NodeId, SnapshotId};
 use super::*;
 use k8s_openapi::api::core::v1::{
     ContainerState, ContainerStateRunning, ContainerStateTerminated, ContainerStateWaiting,
-    ContainerStatus, PodStatus,
+    ContainerStatus, Pod, PodStatus,
 };
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use pplx_space_common_core::types::{
@@ -1805,7 +1805,7 @@ async fn classify_legacy_deleting_finalizes_delete() -> TestResult {
 fn pod_presence_classifies_running_pod_with_ip_as_present() {
     let pod = pod_with_phase("Running", Some("10.90.0.8"));
 
-    let status = classify_pod_presence(&pod);
+    let status = classify_pod_presence(&SandboxPodView::from(pod));
 
     assert_eq!(status, PodPresenceStatus::Present);
 }
@@ -1814,7 +1814,7 @@ fn pod_presence_classifies_running_pod_with_ip_as_present() {
 fn pod_presence_classifies_pending_pod_as_unready() {
     let pod = pod_with_phase("Pending", None);
 
-    let status = classify_pod_presence(&pod);
+    let status = classify_pod_presence(&SandboxPodView::from(pod));
 
     assert_eq!(status, PodPresenceStatus::Unready);
 }
@@ -1823,7 +1823,7 @@ fn pod_presence_classifies_pending_pod_as_unready() {
 fn pod_presence_classifies_succeeded_pod_with_terminated_containers() {
     let pod = pod_with_phase_and_container_state("Succeeded", terminated_container_state());
 
-    let status = classify_pod_presence(&pod);
+    let status = classify_pod_presence(&SandboxPodView::from(pod));
 
     assert_eq!(status, PodPresenceStatus::TerminalSucceeded);
 }
@@ -1832,7 +1832,7 @@ fn pod_presence_classifies_succeeded_pod_with_terminated_containers() {
 fn pod_presence_classifies_failed_pod_with_terminated_containers() {
     let pod = pod_with_phase_and_container_state("Failed", terminated_container_state());
 
-    let status = classify_pod_presence(&pod);
+    let status = classify_pod_presence(&SandboxPodView::from(pod));
 
     assert_eq!(status, PodPresenceStatus::TerminalFailed);
 }
@@ -1841,7 +1841,7 @@ fn pod_presence_classifies_failed_pod_with_terminated_containers() {
 fn pod_presence_requires_container_statuses_for_terminal_phase() {
     let pod = pod_with_phase("Succeeded", None);
 
-    let status = classify_pod_presence(&pod);
+    let status = classify_pod_presence(&SandboxPodView::from(pod));
 
     assert_eq!(status, PodPresenceStatus::Unready);
 }
@@ -1851,8 +1851,14 @@ fn pod_presence_rejects_terminal_phase_with_live_container_state() {
     let running = pod_with_phase_and_container_state("Succeeded", running_container_state());
     let waiting = pod_with_phase_and_container_state("Succeeded", waiting_container_state());
 
-    assert_eq!(classify_pod_presence(&running), PodPresenceStatus::Unready);
-    assert_eq!(classify_pod_presence(&waiting), PodPresenceStatus::Unready);
+    assert_eq!(
+        classify_pod_presence(&SandboxPodView::from(running)),
+        PodPresenceStatus::Unready
+    );
+    assert_eq!(
+        classify_pod_presence(&SandboxPodView::from(waiting)),
+        PodPresenceStatus::Unready
+    );
 }
 
 #[tokio::test]

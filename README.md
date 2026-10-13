@@ -47,6 +47,8 @@ Read the hosted [Guide](https://space.docs.perplexity.ai/guide/index.html) and [
 | [Troubleshooting](docs/troubleshooting.md) | Local setup, authentication, lifecycle operations, command streams, and safe retries. |
 | [Optional Falcon egress](docs/falcon-egress.md) | Configure the destination bundle for federated creates and upgrade existing deployments. |
 | [Observability](docs/observability.md) | Telemetry build features, the Rust/Go selector contract, and unchanged image defaults. |
+| [Warm pools](docs/warm-pools.md) | Keep booted sandboxes ready on Kubernetes so creates skip a cold boot. |
+| [Base snapshots](docs/base-snapshots.md) | Restore sandboxes from a snapshot on a single node, optionally with a node warm pool. |
 
 ### Build documentation locally
 

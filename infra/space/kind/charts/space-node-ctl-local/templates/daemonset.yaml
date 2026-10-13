@@ -1,0 +1,66 @@
+{{- $ctx := dict "ctx" . "component" "node-ctl" -}}
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "space-node-service.name" $ctx }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "space-node-service.labels" $ctx | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "space-node-service.selectorLabels" $ctx | nindent 6 }}
+  # Surge: node-ctl holds /space/run/node-ctl/service.mutex with its health
+  # socket bound from start, so the successor waits passively
+  # (crates/libs/node/ctl/server/src/lib.rs).
+  {{- include "space-node-service.updateStrategy" (dict "strategy" "surge") | nindent 2 }}
+  template:
+    metadata:
+      annotations:
+        {{- include "space-node-service.podAnnotations" $ctx | nindent 8 }}
+      labels:
+        {{- include "space-node-service.labels" $ctx | nindent 8 }}
+    spec:
+      {{- include "space-node-service.nodeSelector" $ctx | nindent 6 }}
+      # The Kubernetes node-local controller authenticates with this
+      # ServiceAccount's token (rbac.yaml, fenced by node-fence.yaml); it
+      # activates because SPACE_K8S_NODE_NAME is set
+      # (crates/libs/node/ctl/server/src/kubernetes_controller/mod.rs).
+      serviceAccountName: {{ include "space-node-service.name" $ctx }}
+      # Host network: node-ctl publishes node state, a node-bound ClusterApi
+      # RPC (see space-node-service.nodeBoundNetwork).
+      {{- include "space-node-service.nodeBoundNetwork" . | nindent 6 }}
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds | int }}
+      securityContext:
+        {{- include "space-node-service.runAs" (dict "ctx" . "user" "SPACE_NODECTL" "groups" "SPACE_NODECTL_GROUPS") | nindent 8 }}
+      initContainers:
+        # node-api, sandbox-manager and template-manager reach the socket
+        # through space-nodectlclients (crates/libs/node/ctl/server/src/lib.rs).
+        {{- include "space-node-service.prepareRunDir" (dict "ctx" . "path" "/space/run/node-ctl" "mode" "0750"
+            "uid" (include "space-node-service.identityNumber" (dict "ctx" . "name" "SPACE_NODECTL_UID"))
+            "gid" (include "space-node-service.groupId" (dict "ctx" . "name" "space-nodectlclients"))) | nindent 8 }}
+      containers:
+        - name: node-ctl
+          {{- include "space-node-service.image" . | nindent 10 }}
+          command:
+            - /opt/space/bin/space-nodectl-svc
+            - --health-socket={{ include "space-node-service.healthSocket" $ctx }}
+          {{- include "space-node-service.restrictedContainer" . | nindent 10 }}
+          env:
+            {{- include "space-node-service.env.identity" . | nindent 12 }}
+            {{- include "space-node-service.env.clusterApi" . | nindent 12 }}
+          {{- include "space-node-service.probes" $ctx | nindent 10 }}
+          volumeMounts:
+            {{- include "space-node-service.mount.run" . | nindent 12 }}
+            {{- include "space-node-service.mount.clusterApiToken" . | nindent 12 }}
+            {{- include "space-node-service.mount.rpcCa" . | nindent 12 }}
+            {{- include "space-node-service.mount.private" . | nindent 12 }}
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+      volumes:
+        {{- include "space-node-service.volume.run" . | nindent 8 }}
+        {{- include "space-node-service.volume.clusterApiToken" . | nindent 8 }}
+        {{- include "space-node-service.volume.rpcCa" . | nindent 8 }}
+        {{- include "space-node-service.volume.private" . | nindent 8 }}

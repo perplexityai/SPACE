@@ -46,10 +46,18 @@ pub(super) fn write_atomic(
     write: impl FnOnce(&File) -> Result<(), Status>,
 ) -> Result<File, Status> {
     let (parent, name) = parent(path)?;
+    write_atomic_at(&parent, name, write)
+}
+
+pub(super) fn write_atomic_at(
+    parent: &File,
+    name: &OsStr,
+    write: impl FnOnce(&File) -> Result<(), Status>,
+) -> Result<File, Status> {
     let temporary = format!(".artifact-{}.tmp", uuid::Uuid::now_v7());
     let output = File::from(
         openat(
-            &parent,
+            parent,
             temporary.as_str(),
             OFlag::O_RDWR | OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
             Mode::from_bits_truncate(0o600),
@@ -59,11 +67,11 @@ pub(super) fn write_atomic(
     let result = (|| {
         write(&output)?;
         output.sync_all().map_err(error)?;
-        nix::fcntl::renameat(&parent, temporary.as_str(), &parent, name).map_err(error)?;
+        nix::fcntl::renameat(parent, temporary.as_str(), parent, name).map_err(error)?;
         parent.sync_all().map_err(error)
     })();
     if let Err(error) = result {
-        let _ = unlinkat(&parent, temporary.as_str(), UnlinkatFlags::NoRemoveDir);
+        let _ = unlinkat(parent, temporary.as_str(), UnlinkatFlags::NoRemoveDir);
         return Err(error);
     }
     Ok(output)

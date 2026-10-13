@@ -47,12 +47,12 @@ def btrfs_send_restore_pulls_parent_template(test: smoke.KindEcw) -> None:
         written = test.run_command_when_ready(f"printf %s {shlex.quote(marker)} > {shlex.quote(PATH)}")
         test.verify(written.exit_code == 0, "failed to write state before suspending", command_stderr=written.stderr)
         source = restore.current_placement()
-        source_pod = codec.worker_pod(source.node_name)
-        target_node, target_pod = codec.other_sandbox_worker(source.node_name)
+        source_worker = source.node_name
+        target_node = codec.other_sandbox_worker(source.node_name)
         test.record("target_node", target_node)
 
     with test.phase("the worker resolves an omitted suspend format to the stream codec"):
-        codec.require_btrfs_send_default(source_pod)
+        codec.require_btrfs_send_default(source_worker)
 
     with test.phase("suspend without naming a format"):
         suspended_at = codec.mark_since()
@@ -69,7 +69,7 @@ def btrfs_send_restore_pulls_parent_template(test: smoke.KindEcw) -> None:
 
     with restore.cordoned(source.node_name):
         with test.phase("remove the parent template from the target worker"):
-            codec.evict_template(target_pod, template)
+            codec.evict_template(target_node, template)
             since = codec.mark_since()
 
         with test.phase("restore while only the cold worker is schedulable"):
@@ -86,11 +86,11 @@ def btrfs_send_restore_pulls_parent_template(test: smoke.KindEcw) -> None:
             )
 
     with test.phase("the target pulled the parent on demand and installed it as a portable subvolume"):
-        codec.expect_pulled_on_demand(target_pod, template, since_time=since)
-        codec.expect_template_is_portable_subvolume(target_pod, template, digest)
+        codec.expect_pulled_on_demand(target_node, template, since_time=since)
+        codec.expect_template_is_portable_subvolume(target_node, template, digest)
 
     with test.phase("the instance was reconstructed by btrfs receive"):
-        codec.expect_instance_is_subvolume(target_pod)
+        codec.expect_instance_is_subvolume(target_node)
 
     with test.phase("state and execution survive"):
         observed = test.run_command_when_ready(f"cat {shlex.quote(PATH)}")

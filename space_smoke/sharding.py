@@ -68,6 +68,8 @@ _DURATION_SECONDS = {
         "local.snapshot_reaper_reclaims_backed_fork_snapshot": 147,
         "local.suspend_restore_cross_node_from_object_storage": 14,
         "local.suspend_snapshot_rows_are_per_attempt": 21,
+        # Measured 37-38 s; Tempo's 30 s search cutoff is most of it.
+        "local.telemetry_reaches_local_backends": 40,
         # Three Kind runs measured 101-120 s with the rendered 1.5 GiB budget.
         "local.template_cache_lru_eviction_reclaims": 120,
         "local.template_startup_recovery_decision_table": 45,

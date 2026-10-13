@@ -87,9 +87,16 @@ register_control_plane() {
 }
 
 # ── Step 2: stage artifacts onto each worker (kind-only) ──────────────────
+# One line per sandbox worker: its operator shell pod (space-node-debug), where
+# the staging and `space-tmplmgr register` run as root, and the node.
 worker_pods() {
-  kubectl -n space get pods -l app.kubernetes.io/name=space-worker \
-    -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.spec.nodeName}{"\n"}{end}'
+  local node
+  for node in $(kubectl -n space get pods \
+      -l app.kubernetes.io/name=space-worker,app.kubernetes.io/component=template-manager \
+      -o jsonpath='{.items[*].spec.nodeName}'); do
+    printf '%s %s\n' "$(kubectl -n space get pods -l app.kubernetes.io/name=space-node-debug \
+      --field-selector "spec.nodeName=$node" -o jsonpath='{.items[0].metadata.name}')" "$node"
+  done
 }
 
 stage_artifacts_on_workers() {
@@ -134,7 +141,7 @@ SQL
     # the bare prefix (post-`sha256:`).
     local hex_prefix="${hash#sha256:}"
     hex_prefix="${hex_prefix:0:12}"
-    if kubectl -n space exec "$pod" -c node-stack -- bash -c "space-tmplmgr list 2>/dev/null | grep -q $hex_prefix" 2>/dev/null; then
+    if kubectl -n space exec "$pod" -c shell -- bash -c "space-tmplmgr list 2>/dev/null | grep -q $hex_prefix" 2>/dev/null; then
       log "    $name@${hash:0:24}… already staged locally; skip"
       continue
     fi
@@ -149,17 +156,17 @@ SQL
     aws s3 cp "$s3_path/metadata.json"   "$tmp/metadata.json"   >/dev/null
 
     log "    copying into pod + decompressing + registering"
-    # apt-install zstd in the pod if missing (the node-stack image doesn't bake it).
-    kubectl -n space exec "$pod" -c node-stack -- bash -c '
+    # apt-install zstd in the shell if missing (the worker image doesn't bake it).
+    kubectl -n space exec "$pod" -c shell -- bash -c '
       command -v zstd >/dev/null 2>&1 && exit 0
       apt-get update >/dev/null 2>&1
       apt-get install -y zstd >/dev/null 2>&1
     '
-    kubectl -n space cp "$tmp/rootfs.ext4.zst" "space/${pod}:/tmp/${name}-rootfs.ext4.zst" -c node-stack
-    kubectl -n space cp "$tmp/manifest.json"   "space/${pod}:/tmp/${name}-manifest.json"   -c node-stack
-    kubectl -n space cp "$tmp/metadata.json"   "space/${pod}:/tmp/${name}-metadata.json"   -c node-stack
+    kubectl -n space cp "$tmp/rootfs.ext4.zst" "space/${pod}:/tmp/${name}-rootfs.ext4.zst" -c shell
+    kubectl -n space cp "$tmp/manifest.json"   "space/${pod}:/tmp/${name}-manifest.json"   -c shell
+    kubectl -n space cp "$tmp/metadata.json"   "space/${pod}:/tmp/${name}-metadata.json"   -c shell
 
-    kubectl -n space exec "$pod" -c node-stack -- bash -c "
+    kubectl -n space exec "$pod" -c shell -- bash -c "
       set -e
       stage=/space/cache/firecracker/templates/${name}
       install -d -m 0755 \$stage

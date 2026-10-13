@@ -1,5 +1,7 @@
 # A library chart installs nothing on its own. Shared pinned images live here
 # so a version bump is a single edit rather than one per consuming chart.
 images:
-  # Versions verified 2026-09-23. Multi-platform manifest lists.
+  # Versions verified 2026-09-23. Multi-platform manifest lists. A bump also
+  # moves the tag in the metrics and traces profiles/kind.yaml and the entry in
+  # ci/mirrored-images.txt.
   collector: otel/opentelemetry-collector-contrib:0.161.0@sha256:fd328de2552466ad78385e1b1289c3f2402b1c45f265b252aab1955b42845ac1

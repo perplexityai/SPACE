@@ -52,8 +52,9 @@ pub(crate) async fn prepare_encrypted_rootfs(
     sandbox_id: &str,
     execution_fence: pplx_space_node_mgr_client::execution_fence::ExecutionFence,
     restore_cow_source: Option<&str>,
+    node_manager: &crate::node_manager_transport::NodeManagerConnector,
 ) -> Result<String, EncryptedRootfsPrepareError> {
-    let mut node = pplx_space_node_mgr_client::connect().await?;
+    let mut node = node_manager.connect().await?;
     let prepared = node
         .prepare_encrypted_rootfs(
             pplx_space_node_mgr_client::proto::PrepareEncryptedRootfsRequest {
@@ -176,8 +177,9 @@ impl PoolRootfsPrepareError {
 pub(crate) async fn prepare_snapshot_rootfs(
     sandbox_id: &str,
     execution_fence: pplx_space_node_mgr_client::execution_fence::ExecutionFence,
+    node_manager: &crate::node_manager_transport::NodeManagerConnector,
 ) -> Result<String, PoolRootfsPrepareError> {
-    let mut node = pplx_space_node_mgr_client::connect().await?;
+    let mut node = node_manager.connect().await?;
     let prepared = node
         .prepare_snapshot_rootfs(
             pplx_space_node_mgr_client::proto::PrepareSnapshotRootfsRequest {

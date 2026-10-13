@@ -58,6 +58,9 @@ pplx-space-template-mgr-client = { workspace = true }
 pplx-space-volmgr-client = { workspace = true }
 
 [dev-dependencies]
+pplx-space-internal-api-server = { workspace = true }
+pplx-space-db-test-fixtures = { workspace = true }
+pplx-space-common-svc = { workspace = true, features = ["test-support"] }
 pplx-space-common-core = { workspace = true, features = ["serde", "test-hooks"] }
 nix = { workspace = true, features = ["user"] }
 pplx-space-observability = { workspace = true, features = ["test-capture"] }

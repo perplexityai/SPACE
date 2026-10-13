@@ -23,6 +23,7 @@ fn roots(base: &std::path::Path) -> ScanRoots {
         )],
         vendor_kernels: base.join("vendor/kernels"),
         managed_kernels: None,
+        managed_releases: None,
         cache_kernels: base.join("cache/firecracker/kernels"),
         cache_legacy_assets: base.join("cache/firecracker/assets"),
         runtime_aliases: Vec::new(),
@@ -125,7 +126,7 @@ async fn the_listing_reports_each_entry_with_its_status() {
         &roots.runtime_releases[0].path.join("v1.17.0/bin/jailer"),
         b"jailer",
     );
-    write(&roots.cache_kernels.join("6.1.155/vmlinux.bin"), b"kernel");
+    write(&roots.cache_kernels.join("6.1.158/vmlinux.bin"), b"kernel");
 
     let response = service(dir.path())
         .list_execution_artifacts(request(vec![ExecutionArtifactKind::Runtime as i32], 0))
@@ -192,7 +193,7 @@ async fn a_kernel_over_the_digest_limit_makes_the_listing_incomplete() {
     let dir = tempfile::tempdir().unwrap();
     let roots = roots(dir.path());
     let image = vec![0u8; usize::try_from(LIMITS.max_digest_bytes).unwrap() + 1];
-    write(&roots.cache_kernels.join("6.1.155/vmlinux.bin"), &image);
+    write(&roots.cache_kernels.join("6.1.158/vmlinux.bin"), &image);
 
     let response = service(dir.path())
         .list_execution_artifacts(request(vec![ExecutionArtifactKind::Component as i32], 0))
@@ -230,7 +231,7 @@ async fn component_kinds_narrow_the_components_listed() {
             .join("v1.15.1/bin/firecracker"),
     );
     unnamed_machine_executable(&roots.runtime_releases[0].path.join("v1.15.1/bin/jailer"));
-    write(&roots.cache_kernels.join("6.1.155/vmlinux.bin"), b"kernel");
+    write(&roots.cache_kernels.join("6.1.158/vmlinux.bin"), b"kernel");
     let service = service(dir.path());
     let list = |kinds: Vec<i32>, component_kinds: Vec<i32>| {
         service.list_execution_artifacts(peer_request(
@@ -347,10 +348,14 @@ async fn status_reports_every_protected_path_of_a_provisioned_node() {
     use pplx_space_node_runtime_manager_client::proto::{PathProtection, ProtectedPathRole};
 
     let dir = tempfile::tempdir().unwrap();
-    let base = dir.path();
+    // Resolved, as the audit resolves the links into the store.
+    let base = &dir.path().canonicalize().unwrap();
     mkdir(&base.join("vendor"), 0o755);
-    mkdir(&base.join("vendor/firecracker"), 0o1775);
-    mkdir(&base.join("vendor/kernels"), 0o1775);
+    // The node's store, root-only, behind the links the image keeps.
+    mkdir(&base.join("vendor/node/firecracker"), 0o755);
+    mkdir(&base.join("vendor/node/kernels"), 0o755);
+    std::os::unix::fs::symlink("node/firecracker", base.join("vendor/firecracker")).unwrap();
+    std::os::unix::fs::symlink("node/kernels", base.join("vendor/kernels")).unwrap();
     mkdir(&base.join("vendor/runtime-manager"), 0o755);
     mkdir(&base.join("vendor/runtime-manager/state"), 0o700);
     mkdir(&base.join("cache"), 0o1775);
@@ -477,365 +482,76 @@ async fn a_status_audit_waits_boundedly_for_a_running_scan() {
         .unwrap();
 }
 
-mod kernels {
-    use std::sync::Arc;
+#[tokio::test]
+async fn artifact_mutations_require_an_operator_and_an_enabled_installer() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut service = service(dir.path());
+    service.peer_authorizer = UdsPeerAuthorizer::new(
+        "runtime-manager-test",
+        [
+            pplx_space_common_svc::UdsPeerAccount::role_with_fallback_uid(
+                "rtmgr-test-observer",
+                LocalRole::Observer,
+                40_001,
+            ),
+        ],
+    );
+    let identity =
+        crate::convert::component_identity(pplx_space_common_core::types::ComponentIdentity {
+            kind: pplx_space_common_core::types::ArtifactComponentKind::Kernel,
+            version: "6.1.158".parse().unwrap(),
+            digest: Digest::sha256([7; 32]),
+        });
+    for uid in [0, 40_001] {
+        let expected = if uid == 0 {
+            tonic::Code::FailedPrecondition
+        } else {
+            tonic::Code::PermissionDenied
+        };
+        let error = service
+            .install_artifact(peer_request(
+                InstallArtifactRequest {
+                    identity: Some(identity.clone()),
+                },
+                uid,
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), expected);
+        let error = service
+            .uninstall_artifact(peer_request(
+                UninstallArtifactRequest {
+                    identity: Some(identity.clone()),
+                },
+                uid,
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), expected);
+    }
+}
 
-    use pplx_space_node_runtime_manager_client::proto::{
-        ArtifactManagement, InstallKernelRequest, KernelPresence, ListAvailableKernelsRequest,
-        OperationOutcome, OperationState, UninstallKernelRequest,
-    };
-
-    use super::*;
-    use crate::kernels::test_support::{FakeSource, boot_kernel};
-    use crate::kernels::{InstallLimits, Installer};
-
-    const INSTALL_LIMITS: InstallLimits = InstallLimits {
-        max_bytes: 1 << 20,
-        download_idle_timeout: Duration::from_secs(30),
-        max_attempts: 1,
-    };
-
-    /// A service whose kernel install root is the vendor kernel root it
-    /// lists, as a node handed over to the runtime manager would have.
-    async fn installing_service(
-        base: &std::path::Path,
-    ) -> (RuntimeManagerService, Arc<FakeSource>) {
-        let source = Arc::new(FakeSource::default());
-        std::fs::create_dir_all(base.join("vendor/kernels")).unwrap();
-        std::fs::create_dir_all(base.join("vendor/runtime-manager/state")).unwrap();
-        let installer = Installer::open(
-            base.join("vendor/kernels"),
-            &base.join("vendor/runtime-manager/state"),
-            INSTALL_LIMITS,
-            source.clone(),
-        )
+#[tokio::test]
+async fn catalog_listing_does_not_require_a_mutation_worker() {
+    use crate::installs::test_support::{FakeReleaseSource, FakeSource, TestPins, release_pin};
+    let dir = tempfile::tempdir().unwrap();
+    let source = Arc::new(FakeSource::default());
+    source.offer("1.16", "6.1.158", b"synthetic kernel");
+    let pins = TestPins::new(source.clone());
+    pins.pin_release(release_pin("1.16.2", 1));
+    let service = service(dir.path()).with_kernel_source(source).with_catalog(
+        pins,
+        Some(crate::installs::ReleaseContext {
+            root: dir.path().join("managed/releases"),
+            source: Arc::new(FakeReleaseSource::default()),
+        }),
+    );
+    let response = service
+        .list_available_artifacts(peer_request(ListAvailableArtifactsRequest::default(), 0))
         .await
-        .unwrap();
-        let service = service(base)
-            .with_kernel_source(source.clone())
-            .with_installer(installer);
-        (service, source)
-    }
-
-    fn install_request(version: &str, uid: u32) -> Request<InstallKernelRequest> {
-        peer_request(
-            InstallKernelRequest {
-                runtime_kind: RuntimeKind::Firecracker as i32,
-                runtime_version: "1.15.1".to_string(),
-                version: version.to_string(),
-            },
-            uid,
-        )
-    }
-
-    async fn settle(service: &RuntimeManagerService, operation_id: &str) -> i32 {
-        for _ in 0..500 {
-            let operation = service
-                .get_operation(peer_request(
-                    GetOperationRequest {
-                        operation_id: operation_id.to_string(),
-                    },
-                    0,
-                ))
-                .await
-                .unwrap()
-                .into_inner()
-                .operation
-                .unwrap();
-            if matches!(
-                OperationState::try_from(operation.state),
-                Ok(OperationState::Succeeded | OperationState::Failed | OperationState::Cancelled)
-            ) {
-                return operation.state;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        panic!("operation {operation_id} did not settle");
-    }
-
-    #[tokio::test]
-    async fn kernels_install_list_as_space_managed_and_uninstall() {
-        let dir = tempfile::tempdir().unwrap();
-        let (service, source) = installing_service(dir.path()).await;
-        source.offer("1.15", "6.1.155", &boot_kernel(4096, 7));
-        source.offer("1.15", "5.10.245", &boot_kernel(4096, 8));
-        // An external kernel of another version stays external.
-        write(
-            &dir.path().join("vendor/kernels/5.10.245/vmlinux.bin"),
-            b"baked",
-        );
-
-        let available = |service: RuntimeManagerService| async move {
-            service
-                .list_available_kernels(peer_request(
-                    ListAvailableKernelsRequest {
-                        runtime_kind: RuntimeKind::Firecracker as i32,
-                        runtime_version: Some("1.15".to_string()),
-                    },
-                    0,
-                ))
-                .await
-        };
-        let listed = available(service.clone()).await.unwrap().into_inner();
-        let presence = |listed: &ListAvailableKernelsResponse, version: &str| {
-            listed
-                .kernels
-                .iter()
-                .find(|kernel| kernel.version == version)
-                .map(|kernel| kernel.presence)
-        };
-        assert_eq!(listed.runtime_kind, RuntimeKind::Firecracker as i32);
-        assert_eq!(listed.runtime_lines, vec!["1.15".to_string()]);
-        assert_eq!(
-            presence(&listed, "6.1.155"),
-            Some(KernelPresence::NotInstalled as i32)
-        );
-        assert_eq!(
-            presence(&listed, "5.10.245"),
-            Some(KernelPresence::VersionPresent as i32)
-        );
-
-        let accepted = service
-            .install_kernel(install_request("6.1.155", 0))
-            .await
-            .unwrap()
-            .into_inner()
-            .operation
-            .unwrap();
-        assert_eq!(
-            settle(&service, &accepted.operation_id).await,
-            OperationState::Succeeded as i32
-        );
-
-        let listed = available(service.clone()).await.unwrap().into_inner();
-        assert_eq!(
-            presence(&listed, "6.1.155"),
-            Some(KernelPresence::Installed as i32)
-        );
-        let inventory = service
-            .list_execution_artifacts(request(Vec::new(), 0))
-            .await
-            .unwrap()
-            .into_inner();
-        let management = |version: &str| {
-            inventory
-                .artifacts
-                .iter()
-                .find(|artifact| artifact.version.as_deref() == Some(version))
-                .map(|artifact| {
-                    (
-                        artifact.management,
-                        artifact.for_runtime_kind,
-                        artifact.for_runtime_version.as_deref(),
-                    )
-                })
-        };
-        assert_eq!(
-            management("6.1.155"),
-            Some((
-                ArtifactManagement::SpaceManaged as i32,
-                RuntimeKind::Firecracker as i32,
-                Some("1.15")
-            ))
-        );
-        assert_eq!(
-            management("5.10.245"),
-            Some((
-                ArtifactManagement::External as i32,
-                RuntimeKind::Unspecified as i32,
-                None
-            ))
-        );
-
-        let removed = service
-            .uninstall_kernel(peer_request(
-                UninstallKernelRequest {
-                    version: "6.1.155".to_string(),
-                },
-                0,
-            ))
-            .await
-            .unwrap()
-            .into_inner()
-            .operation
-            .unwrap();
-        assert_eq!(
-            settle(&service, &removed.operation_id).await,
-            OperationState::Succeeded as i32
-        );
-        let removed = service
-            .get_operation(peer_request(
-                GetOperationRequest {
-                    operation_id: removed.operation_id,
-                },
-                0,
-            ))
-            .await
-            .unwrap()
-            .into_inner()
-            .operation
-            .unwrap();
-        assert_eq!(removed.outcome, OperationOutcome::Uninstalled as i32);
-        let status = service
-            .uninstall_kernel(peer_request(
-                UninstallKernelRequest {
-                    version: "5.10.245".to_string(),
-                },
-                0,
-            ))
-            .await
-            .unwrap_err();
-        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
-    }
-
-    /// Uninstalling a version removes the runtime manager's own install of
-    /// it and leaves other copies; with no install of it, the refusal says
-    /// whether the version is absent or only present read-only.
-    #[tokio::test]
-    async fn uninstall_by_version_removes_only_the_installed_copy() {
-        let dir = tempfile::tempdir().unwrap();
-        let (service, source) = installing_service(dir.path()).await;
-        let image = crate::kernels::test_support::banner_kernel(4096, "6.1.155+");
-        source.offer("1.15", "6.1.155", &image);
-        let bundled = dir
-            .path()
-            .join("vendor/firecracker/v1.15.1/kernel/vmlinux.bin");
-        write(&bundled, &image);
-        let uninstall = |version: &str| {
-            service.uninstall_kernel(peer_request(
-                UninstallKernelRequest {
-                    version: version.to_string(),
-                },
-                0,
-            ))
-        };
-
-        let installed = service
-            .install_kernel(install_request("6.1.155", 0))
-            .await
-            .unwrap()
-            .into_inner()
-            .operation
-            .unwrap();
-        assert_eq!(
-            settle(&service, &installed.operation_id).await,
-            OperationState::Succeeded as i32
-        );
-        let removed = uninstall("6.1.155")
-            .await
-            .unwrap()
-            .into_inner()
-            .operation
-            .unwrap();
-        assert_eq!(
-            settle(&service, &removed.operation_id).await,
-            OperationState::Succeeded as i32
-        );
-        assert!(!dir.path().join("vendor/kernels/6.1.155").exists());
-        assert!(bundled.exists());
-
-        let read_only = uninstall("6.1.155").await.unwrap_err();
-        assert_eq!(read_only.code(), tonic::Code::FailedPrecondition);
-        assert!(
-            read_only.message().contains(&bundled.display().to_string()),
-            "{read_only:?}"
-        );
-        let absent = uninstall("6.1.1").await.unwrap_err();
-        assert_eq!(absent.code(), tonic::Code::NotFound, "{absent:?}");
-    }
-
-    /// Kernels are listed and installed only for the runtime the source
-    /// publishes for, and an install names its runtime.
-    #[tokio::test]
-    async fn kernels_are_only_for_the_sources_runtime() {
-        let dir = tempfile::tempdir().unwrap();
-        let (service, _) = installing_service(dir.path()).await;
-        let status = service
-            .list_available_kernels(peer_request(
-                ListAvailableKernelsRequest {
-                    runtime_kind: RuntimeKind::CloudHypervisor as i32,
-                    runtime_version: None,
-                },
-                0,
-            ))
-            .await
-            .unwrap_err();
-        assert_eq!(status.code(), tonic::Code::FailedPrecondition, "{status:?}");
-        assert!(status.message().contains("cloud-hypervisor"), "{status:?}");
-
-        let install = |runtime_kind: RuntimeKind| {
-            service.install_kernel(peer_request(
-                InstallKernelRequest {
-                    runtime_kind: runtime_kind as i32,
-                    runtime_version: "48.0".to_string(),
-                    version: "6.1.155".to_string(),
-                },
-                0,
-            ))
-        };
-        let status = install(RuntimeKind::CloudHypervisor).await.unwrap_err();
-        assert_eq!(status.code(), tonic::Code::FailedPrecondition, "{status:?}");
-        let status = install(RuntimeKind::Unspecified).await.unwrap_err();
-        assert_eq!(status.code(), tonic::Code::InvalidArgument, "{status:?}");
-    }
-
-    #[tokio::test]
-    async fn only_privileged_peers_mutate_and_only_with_an_install_root() {
-        let dir = tempfile::tempdir().unwrap();
-        let (installing, _) = installing_service(dir.path()).await;
-        let status = installing
-            .install_kernel(install_request("6.1.155", 4_000_000_001))
-            .await
-            .unwrap_err();
-        assert_eq!(status.code(), tonic::Code::PermissionDenied);
-
-        let disabled = service(dir.path()).with_kernel_source(Arc::new(FakeSource::default()));
-        let status = disabled
-            .install_kernel(install_request("6.1.155", 0))
-            .await
-            .unwrap_err();
-        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
-
-        let status = installing
-            .install_kernel(install_request("not a version", 0))
-            .await
-            .unwrap_err();
-        assert_eq!(status.code(), tonic::Code::InvalidArgument);
-    }
-
-    #[tokio::test]
-    async fn available_kernels_default_to_the_lines_the_node_has() {
-        let dir = tempfile::tempdir().unwrap();
-        let source = Arc::new(FakeSource::default());
-        source.offer("1.15", "6.1.155", &boot_kernel(4096, 7));
-        source.offer("1.14", "6.1.141", &boot_kernel(4096, 7));
-        source.offer("1.13", "6.1.130", &boot_kernel(4096, 7));
-        for release in ["v1.15.1", "v1.15.0", "v1.14.2", "default"] {
-            std::fs::create_dir_all(dir.path().join("vendor/firecracker").join(release)).unwrap();
-        }
-        let listed = service(dir.path())
-            .with_kernel_source(source)
-            .list_available_kernels(peer_request(
-                // No runtime named: the source's.
-                ListAvailableKernelsRequest {
-                    runtime_kind: RuntimeKind::Unspecified as i32,
-                    runtime_version: None,
-                },
-                0,
-            ))
-            .await
-            .unwrap()
-            .into_inner();
-        assert_eq!(
-            listed.runtime_lines,
-            vec!["1.14".to_string(), "1.15".to_string()]
-        );
-        let mut versions: Vec<_> = listed
-            .kernels
-            .iter()
-            .map(|kernel| kernel.version.clone())
-            .collect();
-        versions.sort();
-        assert_eq!(versions, vec!["6.1.141".to_string(), "6.1.155".to_string()]);
-    }
+        .unwrap()
+        .into_inner();
+    assert_eq!(response.artifacts.len(), 2);
+    assert!(!dir.path().join("vendor/runtime-manager/state").exists());
+    assert!(service.installer().is_err());
 }

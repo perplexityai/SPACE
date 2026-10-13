@@ -59,16 +59,22 @@ bootstrap_kind_stack
 
 # This is test coverage, not node readiness: rt-mgr may restart independently
 # of the execution services, but a green smoke must prove its own RPC works.
+# The CLI runs as root in the node's operator shell (space-node-debug), the
+# local operator the runtime manager admits for reads.
 check_runtime_manager() {
-  local role="$1" deadline=$((SECONDS + 90)) pod="" listing="" pods=""
+  local role="$1" deadline=$((SECONDS + 90)) node="" shell="" listing="" pods=""
   while (( SECONDS < deadline )); do
     if pods=$(kubectl --context "kind-${KIND_CLUSTER}" --request-timeout=10s -n space get pods \
-        -l "space.pplx.net/chart=space-node-stack,app.kubernetes.io/name=space-${role}" \
+        -l "app.kubernetes.io/name=space-${role},app.kubernetes.io/component=runtime-manager" \
         --field-selector=status.phase=Running -o json) && \
-      pod=$(jq -r '[.items[] | select(.metadata.deletionTimestamp == null)][0].metadata.name // empty' <<<"$pods") && \
-      [[ -n "$pod" ]] && \
+      node=$(jq -r '[.items[] | select(.metadata.deletionTimestamp == null)][0].spec.nodeName // empty' <<<"$pods") && \
+      [[ -n "$node" ]] && \
+      shell=$(kubectl --context "kind-${KIND_CLUSTER}" --request-timeout=10s -n space get pods \
+        -l app.kubernetes.io/name=space-node-debug --field-selector="spec.nodeName=${node}" \
+        -o jsonpath='{.items[0].metadata.name}') && \
+      [[ -n "$shell" ]] && \
       listing=$(timeout 30s kubectl --context "kind-${KIND_CLUSTER}" --request-timeout=10s -n space \
-        exec "$pod" -c node-stack -- timeout 25s space-rtmgr list --json) && \
+        exec "$shell" -c shell -- timeout 25s space-rtmgr list --json) && \
       jq -e '
         .complete == true
         and any(.artifacts[];

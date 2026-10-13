@@ -279,44 +279,30 @@ pub(super) async fn write_file(
         .and_then(|value| value.to_str().ok())
         .unwrap_or("application/json");
     let user = extract_write_user(query.username.as_deref(), &headers)?;
-    if is_octet_stream_content_type(content_type) {
-        reject_oversized_content_length(
+    // Reject what the headers and query alone can before admission, so a
+    // malformed request never waits for or holds an upload permit.
+    let (write_body, declared_len) = if is_octet_stream_content_type(content_type) {
+        let declared_len = reject_oversized_content_length(
             &headers,
             E2B_FILE_CONTENT_LIMIT_BYTES,
             file_too_large_error,
         )?;
-        let Some(path) = query.path else {
+        let Some(path) = query.path.as_deref() else {
             return Err(EcwProxyError::bad_request(
                 "path query parameter is required for octet-stream uploads",
             ));
         };
-        let path = e2b_request_root(&path, user.as_ref())?;
-        // Create the parent before reading the body, so a destination whose
-        // parent can't be created fails without spooling the upload. Other
-        // write failures still surface after spooling.
-        let route = ensure_parent_dir(&state, route, &path, user.clone()).await?;
-        let mut spool = SpoolFiles::default();
-        let upload = spool_body_upload(body, &mut spool).await?;
-        spaced_write_spooled(&state, route, path.clone(), &upload, user).await?;
-        return Ok(Json(vec![file_write_info(path)]));
-    }
-
-    if is_json_content_type(content_type) {
-        let request = read_json_file_write_request(&headers, body).await?;
-        let path = e2b_request_root(&request.path, user.as_ref())?;
-        spaced_write_bytes(
-            &state,
-            route,
-            path.clone(),
-            file_write_content_to_bytes(request.content)?,
-            user,
-        )
-        .await?;
-        return Ok(Json(vec![file_write_info(path)]));
-    }
-
-    if content_type.starts_with("multipart/form-data") {
-        reject_oversized_content_length(
+        let path = e2b_request_root(path, user.as_ref())?;
+        (WriteBody::OctetStream(path), declared_len)
+    } else if is_json_content_type(content_type) {
+        let declared_len = reject_oversized_content_length(
+            &headers,
+            E2B_JSON_FILE_WRITE_BODY_LIMIT_BYTES,
+            json_file_write_body_too_large_error,
+        )?;
+        (WriteBody::Json, declared_len)
+    } else if content_type.starts_with("multipart/form-data") {
+        let declared_len = reject_oversized_content_length(
             &headers,
             E2B_FILE_CONTENT_LIMIT_BYTES,
             file_too_large_error,
@@ -331,25 +317,87 @@ pub(super) async fn write_file(
                 "multipart/form-data boundary of 1 to 70 characters is required",
             )
         })?;
-        // Owns every staged file until the request ends, however it ends.
-        let mut spool = SpoolFiles::default();
-        let uploads =
-            spool_multipart_uploads(body, boundary, query.path.is_none(), &mut spool).await?;
-        let writes = resolve_multipart_uploads(uploads, query.path, user.as_ref())?;
-        let mut written = Vec::with_capacity(writes.len());
-        let mut route = route;
-        for (path, upload) in writes {
-            route = ensure_parent_dir(&state, route, &path, user.clone()).await?;
-            route =
-                spaced_write_spooled(&state, route, path.clone(), &upload, user.clone()).await?;
-            written.push(file_write_info(path));
+        (WriteBody::Multipart(boundary), declared_len)
+    } else {
+        return Err(EcwProxyError::bad_request(
+            "Unsupported Content-Type for file write",
+        ));
+    };
+    // Admit after authentication so unauthenticated requests can't queue for
+    // upload slots, and before the body is read so a rejected upload costs
+    // the pod no body bytes.
+    let _upload_permit = match &state.uploads {
+        Some(uploads) => {
+            // Every write path stops reading at its limit, so an undeclared
+            // length reserves the whole of it.
+            let reserve = declared_len.unwrap_or_else(|| write_body.body_limit());
+            Some(uploads.admit(reserve as u64).await?)
         }
-        return Ok(Json(written));
-    }
+        None => None,
+    };
 
-    Err(EcwProxyError::bad_request(
-        "Unsupported Content-Type for file write",
-    ))
+    match write_body {
+        WriteBody::OctetStream(path) => {
+            // Create the parent before reading the body, so a destination whose
+            // parent can't be created fails without spooling the upload. Other
+            // write failures still surface after spooling.
+            let route = ensure_parent_dir(&state, route, &path, user.clone()).await?;
+            let mut spool = SpoolFiles::default();
+            let upload = spool_body_upload(body, &mut spool).await?;
+            spaced_write_spooled(&state, route, path.clone(), &upload, user).await?;
+            Ok(Json(vec![file_write_info(path)]))
+        }
+        WriteBody::Json => {
+            let request = read_json_file_write_request(&headers, body).await?;
+            let path = e2b_request_root(&request.path, user.as_ref())?;
+            spaced_write_bytes(
+                &state,
+                route,
+                path.clone(),
+                file_write_content_to_bytes(request.content)?,
+                user,
+            )
+            .await?;
+            Ok(Json(vec![file_write_info(path)]))
+        }
+        WriteBody::Multipart(boundary) => {
+            // Owns every staged file until the request ends, however it ends.
+            let mut spool = SpoolFiles::default();
+            let uploads =
+                spool_multipart_uploads(body, boundary, query.path.is_none(), &mut spool).await?;
+            let writes = resolve_multipart_uploads(uploads, query.path, user.as_ref())?;
+            let mut written = Vec::with_capacity(writes.len());
+            let mut route = route;
+            for (path, upload) in writes {
+                route = ensure_parent_dir(&state, route, &path, user.clone()).await?;
+                route = spaced_write_spooled(&state, route, path.clone(), &upload, user.clone())
+                    .await?;
+                written.push(file_write_info(path));
+            }
+            Ok(Json(written))
+        }
+    }
+}
+
+/// How a `POST /files` body is carried, decided from headers alone.
+enum WriteBody<'a> {
+    /// Spooled to disk, then streamed to the guest; carries the validated
+    /// destination path.
+    OctetStream(String),
+    /// Buffered in memory, up to the JSON write limit.
+    Json,
+    /// Spooled to disk part by part; carries the boundary.
+    Multipart(&'a str),
+}
+
+impl WriteBody<'_> {
+    /// The most body this write path reads.
+    fn body_limit(&self) -> usize {
+        match self {
+            Self::OctetStream(_) | Self::Multipart(_) => E2B_FILE_CONTENT_LIMIT_BYTES,
+            Self::Json => E2B_JSON_FILE_WRITE_BODY_LIMIT_BYTES,
+        }
+    }
 }
 
 fn file_write_info(path: String) -> FileWriteInfoE2b {
@@ -360,18 +408,20 @@ fn file_write_info(path: String) -> FileWriteInfoE2b {
     }
 }
 
+/// Rejects a declared `Content-Length` that is unparsable or over `limit`, and
+/// returns the declared length, if any.
 fn reject_oversized_content_length(
     headers: &HeaderMap,
     limit: usize,
     too_large: fn() -> EcwProxyError,
-) -> Result<(), EcwProxyError> {
+) -> Result<Option<usize>, EcwProxyError> {
     let Some(content_length) = headers
         .get(header::CONTENT_LENGTH)
         .and_then(|value| value.to_str().ok())
         .map(str::trim)
         .filter(|value| !value.is_empty())
     else {
-        return Ok(());
+        return Ok(None);
     };
     let content_length = content_length
         .parse::<usize>()
@@ -379,7 +429,7 @@ fn reject_oversized_content_length(
     if content_length > limit {
         return Err(too_large());
     }
-    Ok(())
+    Ok(Some(content_length))
 }
 
 fn extract_write_user(

@@ -1,0 +1,84 @@
+{{- $ctx := dict "ctx" . "component" "credential-manager" -}}
+{{- include "space-node-service.serviceAccount" $ctx }}
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "space-node-service.name" $ctx }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "space-node-service.labels" $ctx | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "space-node-service.selectorLabels" $ctx | nindent 6 }}
+  # Surge: credential-manager holds /space/run/credential-manager/service.mutex
+  # and its successor waits passively for it
+  # (crates/libs/credential/mgr/server/src/run.rs).
+  {{- include "space-node-service.updateStrategy" (dict "strategy" "surge") | nindent 2 }}
+  template:
+    metadata:
+      annotations:
+        {{- include "space-node-service.podAnnotations" $ctx | nindent 8 }}
+      labels:
+        {{- include "space-node-service.labels" $ctx | nindent 8 }}
+    spec:
+      {{- include "space-node-service.nodeSelector" $ctx | nindent 6 }}
+      serviceAccountName: {{ include "space-node-service.name" $ctx }}
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds | int }}
+      # space-sbxmgr (UID 950) with SPACE_CREDENTIAL_MANAGER_GROUPS, the
+      # identity its volume-socket preflight pins
+      # (crates/libs/credential/mgr/server/src/run/volume_socket.rs). No host
+      # PID namespace: its optional peer-process check
+      # (SPACE_UDS_PEER_PROCESS_CHECK) defaults to off.
+      securityContext:
+        {{- include "space-node-service.runAs" (dict "ctx" . "user" "SPACE_SBXMGR" "groups" "SPACE_CREDENTIAL_MANAGER_GROUPS") | nindent 8 }}
+      initContainers:
+        # The volume-socket directory: owned by credential-manager's identity,
+        # group space-volcredclients, mode 0750, exactly what the listener's
+        # preflight requires before it binds there
+        # (crates/libs/credential/mgr/server/src/run/volume_socket.rs).
+        # volume-manager, which runs as space-volmgr, reaches the socket
+        # through that group (docs/installation.md).
+        {{- include "space-node-service.prepareRunDir" (dict "ctx" . "path" "/space/run/volume-credentials" "mode" "0750"
+            "uid" (include "space-node-service.identityNumber" (dict "ctx" . "name" "SPACE_SBXMGR_UID"))
+            "gid" (include "space-node-service.groupId" (dict "ctx" . "name" "space-volcredclients"))) | nindent 8 }}
+      containers:
+        - name: credential-manager
+          {{- include "space-node-service.image" . | nindent 10 }}
+          # The node credential agent: it binds the node-local sockets under
+          # the service mutex and forwards every RPC to the control-plane
+          # authority, holding no database, KEK or AWS credential itself
+          # (run_agent, crates/libs/credential/mgr/server/src/run.rs;
+          # node_service.rs).
+          command:
+            - /opt/space/bin/space-credmgr-svc
+            - --role=agent
+            - --health-socket={{ include "space-node-service.healthSocket" $ctx }}
+            # The listener for the volume-manager identity: ExchangeToken,
+            # IssueDek and UnwrapDek only; the standard socket keeps serving
+            # sandbox-manager and template-manager.
+            - --volume-socket=/space/run/volume-credentials/credmgr.sock
+          {{- include "space-node-service.restrictedContainer" . | nindent 10 }}
+          env:
+            {{- include "space-node-service.env.identity" . | nindent 12 }}
+            {{- include "space-node-service.env.credmgrAuthority" . | nindent 12 }}
+            # A node credential-manager started without --role=agent would be
+            # a keyless authority that reports Ready and fails every crypto
+            # call; this makes that misconfiguration exit instead (run.rs).
+            - name: SPACE_CREDMGR_FAIL_ON_KEYLESS_AUTHORITY
+              value: "true"
+          {{- include "space-node-service.probes" $ctx | nindent 10 }}
+          volumeMounts:
+            {{- include "space-node-service.mount.run" . | nindent 12 }}
+            {{- include "space-node-service.mount.private" . | nindent 12 }}
+            {{- include "space-node-service.mount.credmgrToken" . | nindent 12 }}
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+      volumes:
+        {{- include "space-node-service.volume.run" . | nindent 8 }}
+        {{- include "space-node-service.volume.private" . | nindent 8 }}
+        {{- include "space-node-service.volume.credmgrToken" . | nindent 8 }}

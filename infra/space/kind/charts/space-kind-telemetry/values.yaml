@@ -1,5 +1,6 @@
 telemetry:
-  # Empty version retains the image tag; explicit experiments use revision-phase.
+  # Bring-up sets the checkout's commit, or revision-phase for an explicit
+  # experiment; empty retains the image tag.
   version: ""
   phase: ""
   owner: ""
@@ -8,5 +9,18 @@ telemetry:
   traceExporter: auto
   otlpMetricsEndpoint: "http://collector.space-metrics.svc.cluster.local:4317"
   otlpTracesEndpoint: "http://collector.space-traces.svc.cluster.local:4317"
+  # The same Collectors as a process on the Kind node reaches them, without
+  # cluster DNS: the host runtime-supervisor's node environment, which
+  # space-node-manager-local writes, and sandbox-manager's own endpoints, which
+  # it forwards to the host sidecars it launches. Bring-up sets both from
+  # scripts/telemetry_config.py; unset, the supervisor's environment names no
+  # endpoint and sandbox-manager keeps the endpoints above.
+  nodeOtlpMetricsEndpoint: ""
+  nodeOtlpTracesEndpoint: ""
   otlpProtocol: grpc
+  # OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE for the Rust services;
+  # empty keeps their delta default. Bring-up sets cumulative in otel mode
+  # (scripts/telemetry_config.py), because the local Collector forgets an idle
+  # delta stream; the shim stays delta.
+  otlpMetricsTemporality: ""
   traceSampler: ""

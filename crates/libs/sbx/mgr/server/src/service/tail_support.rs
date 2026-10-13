@@ -189,9 +189,11 @@ pub(super) enum NodeManagerConnectError {
     Client(String),
 }
 
-pub(super) async fn connect_node()
--> Result<pplx_space_node_mgr_client::NodeManagerGrpcClient, NodeManagerConnectError> {
-    pplx_space_node_mgr_client::connect()
+pub(super) async fn connect_node(
+    node_manager: &crate::node_manager_transport::NodeManagerConnector,
+) -> Result<pplx_space_node_mgr_client::NodeManagerGrpcClient, NodeManagerConnectError> {
+    node_manager
+        .connect()
         .await
         .map_err(|e| NodeManagerConnectError::Client(e.to_string()))
 }

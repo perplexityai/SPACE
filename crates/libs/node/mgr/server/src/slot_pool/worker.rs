@@ -279,7 +279,7 @@ where
 
     if !updates.is_empty() {
         apply_updates(&pool, &updates)?;
-        crate::node_state_sync::mark_node_status_dirty();
+        pool.mark_node_status_dirty();
     }
     Ok(retry)
 }
@@ -574,7 +574,7 @@ pub(super) fn claim_missing_for_create(pool: &NetworkPool, repair: bool) -> Opti
         slot_id,
         Some(SetupRetryKey::pooled(slot_id, generation)),
     );
-    crate::node_state_sync::mark_node_status_dirty();
+    pool.mark_node_status_dirty();
     Some((slot_id, generation))
 }
 
@@ -623,7 +623,7 @@ pub(super) fn claim_ready_for_destroy(pool: &NetworkPool) -> Result<Option<u32>,
         params![SqliteU64(now_secs()), slot_id],
     )?;
     tx.commit()?;
-    crate::node_state_sync::mark_node_status_dirty();
+    pool.mark_node_status_dirty();
     Ok(Some(slot_id))
 }
 
@@ -843,7 +843,7 @@ pub(super) async fn create_slot(
     };
     if status_changed {
         claim.disarm();
-        crate::node_state_sync::mark_node_status_dirty();
+        pool.mark_node_status_dirty();
     }
     success
 }
@@ -960,7 +960,7 @@ pub(super) async fn destroy_slot_with(
     };
     if status_changed {
         claim.disarm();
-        crate::node_state_sync::mark_node_status_dirty();
+        pool.mark_node_status_dirty();
     } else {
         schedule_topup_retry(pool.clone());
     }
@@ -1082,7 +1082,7 @@ pub(super) fn reprobe_startup_leasing_with(
                 pool.lease_health_recovery_pending
                     .store(true, Ordering::Relaxed);
             }
-            crate::node_state_sync::mark_node_status_dirty();
+            pool.mark_node_status_dirty();
         }
         pending.swap_remove(index);
     }

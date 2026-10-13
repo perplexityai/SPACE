@@ -34,7 +34,7 @@ resource "tls_self_signed_cert" "internal_rpc_ca" {
 }
 
 resource "tls_private_key" "internal_rpc_server" {
-  for_each    = toset(["build-manager", "cluster-api", "node-api"])
+  for_each    = toset(["build-manager", "cluster-api", "ingress-activation", "node-api"])
   algorithm   = "ECDSA"
   ecdsa_curve = "P256"
 }
@@ -46,9 +46,10 @@ resource "tls_cert_request" "internal_rpc_server" {
     common_name = "space-${each.key}"
   }
   dns_names = {
-    build-manager = ["space-builder-build-manager"]
-    cluster-api   = ["space-internal-api", "space-cluster-api"]
-    node-api      = ["space-node-api"]
+    build-manager      = ["space-builder-build-manager"]
+    cluster-api        = ["space-internal-api", "space-cluster-api"]
+    node-api           = ["space-node-api"]
+    ingress-activation = ["space-ingress-activation"]
   }[each.key]
 }
 
@@ -111,5 +112,18 @@ resource "aws_secretsmanager_secret_version" "node_api_tls" {
   secret_string = jsonencode({
     tls_crt = tls_locally_signed_cert.internal_rpc_server["node-api"].cert_pem
     tls_key = tls_private_key.internal_rpc_server["node-api"].private_key_pem
+  })
+}
+
+resource "aws_secretsmanager_secret" "ingress_activation_tls" {
+  name = "${local.name}-ingress-activation-tls"
+  tags = var.common_tags
+}
+
+resource "aws_secretsmanager_secret_version" "ingress_activation_tls" {
+  secret_id = aws_secretsmanager_secret.ingress_activation_tls.id
+  secret_string = jsonencode({
+    tls_crt = tls_locally_signed_cert.internal_rpc_server["ingress-activation"].cert_pem
+    tls_key = tls_private_key.internal_rpc_server["ingress-activation"].private_key_pem
   })
 }

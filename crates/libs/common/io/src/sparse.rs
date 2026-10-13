@@ -14,6 +14,11 @@ const DATA_BUFFER_BYTES: usize = 4 * 1024 * 1024;
 
 fn is_all_zero(bytes: &[u8]) -> bool {
     let (words, suffix) = bytes.as_chunks::<8>();
+    // Written ciphertext and other dense data usually fail immediately. Keep
+    // the vectorizable reduction for zero runs and blocks with a zero prefix.
+    if words.first().is_some_and(|word| *word != [0; 8]) {
+        return false;
+    }
     let word_bits = words
         .iter()
         .fold(0_u64, |bits, word| bits | u64::from_ne_bytes(*word));

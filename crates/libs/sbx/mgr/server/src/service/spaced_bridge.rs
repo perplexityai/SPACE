@@ -77,30 +77,26 @@ pub(super) async fn launch_spaced_host_via_node(
     }
 }
 
-pub(super) fn cleanup_restored_snapshot_dir_async(sandbox_id: &str, snapshot_dir: &str) {
-    let cleanup_dir = format!(
-        "{CACHE_DIR}/{sandbox_id}/snapshot.cleanup.{}",
-        Uuid::now_v7()
-    );
-    match std::fs::rename(snapshot_dir, &cleanup_dir) {
+pub(super) fn cleanup_restored_snapshot_dir_async(
+    sandbox_id: &str,
+    snapshot_dir: &str,
+    node_manager: &crate::node_manager_transport::NodeManagerConnector,
+) {
+    // The consumed snapshot moves into the staging sweep's lane first, so a
+    // deferred capture's read-only subvolumes, which this service cannot
+    // delete, have an owner even if nothing below runs; then it is reclaimed
+    // at once, locally or through node-manager.
+    let sandbox_dir = std::path::PathBuf::from(format!("{CACHE_DIR}/{sandbox_id}"));
+    let lane =
+        super::suspend_snapshot_publication::suspend_snapshot_staging_parent_dir(&sandbox_dir);
+    let garbage = super::suspend_snapshot_publication::garbage_suspend_snapshot_dir(&sandbox_dir);
+    match std::fs::create_dir_all(&lane).and_then(|()| std::fs::rename(snapshot_dir, &garbage)) {
         Ok(()) => {
-            let sandbox_id = sandbox_id.to_string();
-            tokio::task::spawn_blocking(move || {
-                let started = std::time::Instant::now();
-                match std::fs::remove_dir_all(&cleanup_dir) {
-                    Ok(()) => tracing::debug!(
-                        sandbox_id,
-                        elapsed_ms = started.elapsed().as_millis() as u64,
-                        "removed restored snapshot directory"
-                    ),
-                    Err(error) => tracing::warn!(
-                        sandbox_id,
-                        path = cleanup_dir,
-                        %error,
-                        "failed to remove restored snapshot directory"
-                    ),
-                }
-            });
+            drop(super::recovery::staging_cleanup::reclaim_garbage_now(
+                sandbox_id.to_string(),
+                garbage,
+                node_manager.clone(),
+            ));
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => tracing::warn!(
@@ -146,7 +142,7 @@ impl SandboxManagerService {
         }
 
         let runtime = spaced_endpoint_runtime_identity(sandbox)?;
-        let mut node_client = pplx_space_node_mgr_client::lazy();
+        let mut node_client = self.node_manager.lazy();
         let proof = match sandbox.spaced_endpoint_proof.clone() {
             Some(proof) => proof,
             None => {

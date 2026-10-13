@@ -12,7 +12,10 @@ workspace = true
 
 [features]
 default = []
-host-runtime = ["dep:aws-lc-rs", "dep:nix", "dep:rustix", "dep:serde", "dep:subtle", "dep:zeroize", "dep:pplx-space-net-common"]
+host-runtime = ["dep:aws-lc-rs", "dep:nix", "dep:rustix", "dep:subtle", "dep:zeroize", "dep:pplx-space-net-common"]
+# The node's root-owned store of runtime releases and guest kernels, which
+# node-manager publishes into.
+artifact-store = ["dep:rustix", "rustix/fs"]
 
 [dependencies]
 aws-lc-rs = { workspace = true, optional = true }
@@ -21,7 +24,7 @@ zeroize = { workspace = true, optional = true }
 libc = { workspace = true }
 rustix = { workspace = true, features = ["process", "thread"], optional = true }
 nix = { workspace = true, features = ["fs", "sched", "process", "resource", "signal", "user", "poll"], optional = true }
-serde = { workspace = true, features = ["derive"], optional = true }
+serde = { workspace = true, features = ["derive"] }
 hyper-util = { workspace = true, features = ["tokio"] }
 http-body-util = { workspace = true }
 hyper = { workspace = true, features = ["client", "http1"] }

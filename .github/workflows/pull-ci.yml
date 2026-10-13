@@ -23,9 +23,11 @@ jobs:
   rust_static:
     if: github.repository == 'perplexityai/SPACE'
     uses: ./.github/workflows/rust-static-ci.yml
+    # pull-requests: read is for archcheck's reviewdog annotations.
     permissions:
       contents: read
       packages: read
+      pull-requests: read
 
   common:
     if: github.repository == 'perplexityai/SPACE'

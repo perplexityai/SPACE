@@ -9,7 +9,7 @@ async fn dirty_outbox_poison_requests_fatal_service_drain_without_unwinding_call
         SandboxManagerServiceOptions {
             shutdown_token: shutdown.clone(),
             task_tracker: tracker.clone(),
-            ..Default::default()
+            ..SandboxManagerServiceOptions::for_test()
         },
     );
     let db = Arc::clone(&service.db);
@@ -134,7 +134,7 @@ async fn wait_for_state(
 #[tokio::test(start_paused = true)]
 async fn auto_lifecycle_scheduler_refreshes_due_work_before_backlog_drains() {
     let conn = crate::db::test_conn();
-    let service = SandboxManagerService::new(conn);
+    let service = SandboxManagerService::for_test(conn);
     let old_ids = (0..12).map(|_| SandboxId::new()).collect::<Vec<_>>();
     for (index, sandbox_id) in old_ids.iter().enumerate() {
         insert_due_suspended_sandbox(&service, &sandbox_id.to_string(), 20 - index as u64);
@@ -209,7 +209,7 @@ async fn auto_lifecycle_scheduler_preserves_storage_keys_and_drains_admitted_wor
         format!("urn:uuid:{id}"),
     ] {
         let conn = crate::db::test_conn();
-        let service = SandboxManagerService::new(conn);
+        let service = SandboxManagerService::for_test(conn);
         insert_due_suspended_sandbox(&service, &storage_id, 10);
         let lock = service.auto_lifecycle.wake_lock(&storage_id);
         let held = Arc::clone(&lock).lock_owned().await;
@@ -248,7 +248,7 @@ async fn auto_lifecycle_error_takes_the_storage_keyed_wake_lock() {
     let id = SandboxId::new();
     let storage_id = id.to_string().to_uppercase();
     let conn = crate::db::test_conn();
-    let service = SandboxManagerService::new(conn);
+    let service = SandboxManagerService::for_test(conn);
     insert_due_suspended_sandbox(&service, &storage_id, 10);
 
     let lock = service.auto_lifecycle.wake_lock(&storage_id);
@@ -302,7 +302,7 @@ async fn auto_lifecycle_error_after_row_removal_does_not_scan_inventory() {
             SandboxState::Suspended,
         );
     }
-    let service = SandboxManagerService::new(conn);
+    let service = SandboxManagerService::for_test(conn);
     let removed_id = SandboxId::new();
     service
         .db

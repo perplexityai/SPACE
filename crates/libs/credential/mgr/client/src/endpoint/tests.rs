@@ -116,3 +116,68 @@ fn host_is_required_for_tcp_schemes() {
         EndpointConfigError::InvalidUri { .. } | EndpointConfigError::MissingHost { .. }
     ));
 }
+
+// A dial whose SYN is never answered must not hold connect for the kernel's
+// SYN retransmits: the dial hangs until its bound cuts it, and connect fails
+// within the retry budget plus one dial. The error must carry the bound's
+// `TimedOut`: under the paused clock the kernel cannot time a dial out first,
+// and a dial that fails fast would carry its own error however long the
+// policy kept redialing. Linux drops a SYN to a listener whose accept queue
+// is full, which stands in for a SYN pinned to a stale conntrack entry.
+#[cfg(target_os = "linux")]
+#[tokio::test(start_paused = true)]
+async fn an_unanswered_dial_fails_within_the_connect_budget() {
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let listener = socket.listen(2).unwrap();
+    let address = listener.local_addr().unwrap();
+    // Linux counts the accept queue full only once it holds more than the
+    // backlog, so three unaccepted connections fill it. Dialing them one at a
+    // time keeps at most one handshake pending, so the SYN queue never counts
+    // as full and the setup does not depend on SYN cookies.
+    let mut queued = Vec::new();
+    for _ in 0..3 {
+        queued.push(tokio::net::TcpStream::connect(address).await.unwrap());
+    }
+    // The dial never completes, so the empty CA is never consulted.
+    let dir = tempfile::tempdir().unwrap();
+    let ca = dir.path().join("ca.pem");
+    std::fs::write(&ca, "").unwrap();
+
+    for endpoint in [
+        CredmgrEndpoint::Tcp(format!("http://{address}").parse().unwrap()),
+        CredmgrEndpoint::Tls {
+            uri: format!("https://{address}").parse().unwrap(),
+            files: TlsFiles::new(ca.clone()),
+        },
+    ] {
+        let budget = pplx_space_common_grpc::DEFAULT_GRPC_CONNECT_RETRY_POLICY.max_elapsed;
+        let started = tokio::time::Instant::now();
+        let result = tokio::time::timeout(budget * 6, endpoint.connect())
+            .await
+            .unwrap_or_else(|_| panic!("{endpoint:?}: an unanswered dial must be bounded"));
+        let elapsed = started.elapsed();
+        let error = match result {
+            Err(error @ ConnectError::Transport(_)) => error,
+            other => panic!("{endpoint:?}: {:?}", other.map(|_| ())),
+        };
+        let timed_out = std::iter::successors(
+            Some(&error as &(dyn std::error::Error + 'static)),
+            |error| error.source(),
+        )
+        .any(|error| {
+            error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::TimedOut)
+        });
+        assert!(
+            timed_out,
+            "{endpoint:?}: the dial bound did not fire: {error:?}"
+        );
+        assert!(
+            elapsed <= budget + CONNECT_TIMEOUT,
+            "{endpoint:?}: connect gave up after {elapsed:?}"
+        );
+    }
+    drop(queued);
+}

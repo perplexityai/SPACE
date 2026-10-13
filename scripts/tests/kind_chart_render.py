@@ -1,6 +1,6 @@
 """Render kind charts for the repository guards that read them.
 
-Used by `test_kind_known_egress_chart.py`, which asserts the node-stack
+Used by `test_kind_known_egress_chart.py`, which asserts the sandbox-manager
 DaemonSet's rendered env. Not a test module: nothing here asserts a chart
 value.
 """
@@ -17,7 +17,7 @@ import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 KIND_DIR = REPO_ROOT / "infra/space/kind"
-NODE_STACK_CHART = KIND_DIR / "charts/space-node-stack"
+SANDBOX_MANAGER_CHART = KIND_DIR / "charts/space-sandbox-manager-local"
 API_CHART = KIND_DIR / "charts/space-api-local"
 CLUSTER_CONTROLLER_CHART = KIND_DIR / "charts/space-cluster-controller-local"
 HELM_BIN = shutil.which("helm")
@@ -26,11 +26,23 @@ TELEMETRY_CHARTS = tuple(
     for name in (
         "space-api-local",
         "space-internal-api-local",
+        "space-credmgr-authority-local",
         "space-data-plane-local",
         "space-cluster-controller-local",
-        "space-node-stack",
+        "space-node-manager-local",
+        "space-runtime-manager-local",
+        "space-volume-manager-local",
+        "space-credential-manager-local",
+        "space-template-manager-local",
+        "space-sandbox-manager-local",
+        "space-node-ctl-local",
+        "space-node-api-local",
+        # Not space-build-manager-local: its traces are deliberately off in
+        # every mode (`traceExporter` in its values.yaml), which
+        # test_kind_telemetry_config.py checks separately.
     )
 )
+BUILD_MANAGER_CHART = KIND_DIR / "charts/space-build-manager-local"
 
 
 def render(chart: Path, release: str, *extra: str) -> list[dict]:

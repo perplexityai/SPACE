@@ -1,0 +1,45 @@
+flowchart LR
+    API[(kube-apiserver<br/>sandbox pods)]
+
+    subgraph Entry["Every point where a Pod enters"]
+        W["watcher<br/>managed-by=space-api"]
+        G["uncached GET<br/>fetch_sandbox_pod_uncached"]
+        C["create response<br/>create_sandbox_pod"]
+        PW["per-pod readiness watch"]
+    end
+
+    CONV{{"SandboxPodView::from(Pod)<br/>keeps identity, node, phase, IP,<br/>SandboxPodKey annotations/labels,<br/>derived: slots, source pin,<br/>Ready, Unschedulable message<br/>drops: managedFields, env,<br/>probes, volumes, tolerations"}}
+
+    subgraph Loop["reflect_sandbox_pods (one task)"]
+        IDX["NodeNetworkSlots<br/>per-node active slot totals<br/>(written first)"]
+        ST["Store&lt;SandboxPodView&gt;<br/>re-list buffered until InitDone"]
+        EV["PodEvents broadcast<br/>Apply / InitApply / Delete"]
+    end
+
+    subgraph Readers["Readers"]
+        PRE["create preflight +<br/>restore source-node check<br/>O(1) per node"]
+        LK["lookup_sandbox_pod / read_sandbox_pod<br/>Arc, no deep clone"]
+        REC["cluster-controller reconcilers<br/>warm pool, GCs, reaper"]
+        WAIT["absence / scheduling waits"]
+    end
+
+    API --> W & G & C & PW
+    W --> CONV
+    G --> CONV
+    C --> CONV
+    PW --> CONV
+    CONV -->|"watch events"| IDX --> ST --> EV
+    CONV -->|"fallbacks return the same view"| LK
+    IDX --> PRE
+    ST --> LK
+    ST --> REC
+    EV --> WAIT
+
+    classDef src fill:#e8eef9,stroke:#4a6fa5,color:#1b2a41
+    classDef conv fill:#fff4d6,stroke:#b8860b,color:#3d2c00
+    classDef cache fill:#e3f4e8,stroke:#2e7d4f,color:#123a22
+    classDef read fill:#f3e8f9,stroke:#7b4fa5,color:#2e1b41
+    class API,W,G,C,PW src
+    class CONV conv
+    class IDX,ST,EV cache
+    class PRE,LK,REC,WAIT read

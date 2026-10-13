@@ -8,25 +8,9 @@
 //! reconciler's in-memory observation clock (keyed on pod UID), not a pod
 //! timestamp — see the reconciler's `first_seen_orphan` doc.
 
-use k8s_openapi::api::core::v1::Pod;
-use pplx_space_common_core::kubernetes::{
-    SANDBOX_CHECKPOINT_ANNOTATION, SANDBOX_EXECUTION_GENERATION_ANNOTATION, SANDBOX_ID_ANNOTATION,
-    SANDBOX_SUSPEND_RESTORE_SOURCE_NODE_ANNOTATION, SANDBOX_SUSPEND_RESTORE_STORAGE_URI_ANNOTATION,
-};
+use pplx_space_api::controllers::substrate::kubernetes::{SandboxPodKey, SandboxPodView};
 use pplx_space_common_core::types::{PodUid, SandboxId, SandboxLifecycle};
 use uuid::Uuid;
-
-/// Annotations `build_sandbox_pod` stamps only on restore pods (never on a
-/// fresh create). A remote (S3-backed) restore carries the storage-URI; a
-/// node-local restore carries the source-node and/or checkpoint instead, so all
-/// three must be checked. The annotations persist after a restore completes, so
-/// a running restored sandbox's pod still matches — the sandbox-row disposition
-/// (not this flag) decides whether it is an orphan.
-const RESTORE_ANNOTATIONS: &[&str] = &[
-    SANDBOX_CHECKPOINT_ANNOTATION,
-    SANDBOX_SUSPEND_RESTORE_STORAGE_URI_ANNOTATION,
-    SANDBOX_SUSPEND_RESTORE_SOURCE_NODE_ANNOTATION,
-];
 
 /// Flattened, time-library-agnostic view of the parts of a `Pod` the reaper
 /// reasons about. Extracted once from the reflector object so the classifier
@@ -54,68 +38,44 @@ pub struct RestorePodSnapshot {
     pub node_name: Option<String>,
     /// `metadata.deletionTimestamp` is set — the pod is already terminating.
     pub terminating: bool,
-    /// The pod carries a restore annotation (see [`pod_is_restore`]). Always
+    /// The pod carries a restore annotation (see
+    /// [`SandboxPodView::has_restore_annotation`]). Always
     /// true on the cached scan (the backend filters on it); re-checked on the
     /// fresh read so a pod whose annotations changed isn't deleted.
     pub is_restore: bool,
 }
 
 impl RestorePodSnapshot {
-    pub(crate) fn from_pod(pod: &Pod) -> Self {
-        let meta = &pod.metadata;
+    pub(crate) fn from_pod(pod: &SandboxPodView) -> Self {
         // The shared pod builder stamps the sandbox id into both the annotation
         // and a same-keyed label; read the annotation first and fall back to
         // the label (same convention as the stuck-ContainerCreating GC).
-        let sandbox_id = annotation_or_label(pod, SANDBOX_ID_ANNOTATION)
+        let sandbox_id = pod
+            .annotation_or_label(SandboxPodKey::SandboxId)
             .and_then(|raw| Uuid::parse_str(raw).ok())
             .map(SandboxId::from_uuid);
         // Execution generations start at 1. A zero or negative value is
         // malformed and would compare as strictly older than any active
         // execution, so it leaves the pod ineligible, like a missing one.
-        let generation = annotation_or_label(pod, SANDBOX_EXECUTION_GENERATION_ANNOTATION)
+        let generation = pod
+            .annotation_or_label(SandboxPodKey::ExecutionGeneration)
             .and_then(|raw| raw.parse::<i64>().ok())
             .filter(|generation| *generation > 0);
         let node_name = pod
-            .spec
-            .as_ref()
-            .and_then(|spec| spec.node_name.clone())
-            .filter(|name| !name.is_empty());
+            .node_name()
+            .filter(|name| !name.is_empty())
+            .map(str::to_owned);
         Self {
-            pod_name: meta.name.clone().unwrap_or_default(),
-            pod_uid: meta.uid.as_deref().and_then(|uid| uid.parse().ok()),
-            resource_version: meta.resource_version.clone(),
+            pod_name: pod.name().to_owned(),
+            pod_uid: pod.uid().and_then(|uid| uid.parse().ok()),
+            resource_version: pod.resource_version().map(str::to_owned),
             sandbox_id,
             generation,
             node_name,
-            terminating: meta.deletion_timestamp.is_some(),
-            is_restore: pod_is_restore(pod),
+            terminating: pod.is_deleting(),
+            is_restore: pod.has_restore_annotation(),
         }
     }
-}
-
-/// Whether a pod carries a restore annotation — created by a restore or the
-/// started-recovery access path. Cheap (annotation-key presence, no
-/// allocation), so the backend filters on this *before* building the full
-/// [`RestorePodSnapshot`], keeping the per-tick allocation cost proportional to
-/// the restore-pod subset rather than every sandbox pod in the cache.
-pub(crate) fn pod_is_restore(pod: &Pod) -> bool {
-    pod.metadata
-        .annotations
-        .as_ref()
-        .is_some_and(|annotations| {
-            RESTORE_ANNOTATIONS
-                .iter()
-                .any(|key| annotations.contains_key(*key))
-        })
-}
-
-fn annotation_or_label<'a>(pod: &'a Pod, key: &str) -> Option<&'a str> {
-    let meta = &pod.metadata;
-    meta.annotations
-        .as_ref()
-        .and_then(|annotations| annotations.get(key))
-        .or_else(|| meta.labels.as_ref().and_then(|labels| labels.get(key)))
-        .map(String::as_str)
 }
 
 /// The owning `sandboxes` row as the classifier needs it: the lifecycle plus

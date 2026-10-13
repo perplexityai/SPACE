@@ -110,6 +110,15 @@ class SmokeServices:
         if self.kind is not None:
             self.kind.bootstrap()
 
+    def telemetry_mode(self) -> str:
+        """The telemetry mode of the Kind bench, read from the cluster."""
+
+        if self.kind is None:
+            raise SmokeConfigurationError(
+                "the telemetry mode is only readable on the kind backend"
+            )
+        return self.kind.telemetry_mode()
+
     def fixture(
         self,
         fixture_type: type[Fixture],
@@ -311,6 +320,8 @@ class SmokeServices:
             fixture._snapshot_reaper_control = cast(Any, kind)
             fixture._startup_recovery_control = cast(Any, kind)
             fixture._suspend_codec_control = cast(Any, kind)
+            fixture._telemetry_control = cast(Any, kind)
+            fixture._sandbox_network_isolation_control = cast(Any, kind)
             fixture._template_selector = template
             fixture._warm_pool_observer = cast(Any, kind)
             fixture._warm_pool_candidate = warm_pool_candidate

@@ -15,8 +15,9 @@ use tonic_health::pb::health_client::HealthClient;
 
 use super::{
     JobPriority, PriorityBand, PullPriorityBand, UNEXPECTED_SERVER_EXIT_CODE,
-    acquire_service_mutex, build_static_credentials, stop_production_server_or_hard_exit,
-    validate_pull_priority_bands, wait_for_shutdown_or_hard_exit,
+    acquire_service_mutex, build_static_credentials, static_credentials_from,
+    stop_production_server_or_hard_exit, validate_pull_priority_bands,
+    wait_for_shutdown_or_hard_exit,
 };
 
 const TEST_SERVICE_NAME: &str = "volume-manager-handoff-test";
@@ -687,5 +688,25 @@ fn rejects_duplicate_pull_priority_band_minimums() {
     assert_eq!(
         error.to_string(),
         "duplicate pull priority band minimum 100"
+    );
+}
+
+#[test]
+fn static_credentials_carry_the_documented_session_token() {
+    let env = |name: &str| match name {
+        "SPACE_OBJECT_STORE_STATIC_ACCESS_KEY_ID" => Some("ASIAEXAMPLE".to_string()),
+        "SPACE_OBJECT_STORE_STATIC_SECRET_ACCESS_KEY" => Some("secret".to_string()),
+        "SPACE_OBJECT_STORE_STATIC_SESSION_TOKEN" => Some("session".to_string()),
+        _ => None,
+    };
+    let creds = static_credentials_from(env).unwrap();
+    assert_eq!(creds.session_token.as_deref(), Some("session"));
+    let without = |name: &str| match name {
+        "SPACE_OBJECT_STORE_STATIC_SESSION_TOKEN" => None,
+        other => env(other),
+    };
+    assert_eq!(
+        static_credentials_from(without).unwrap().session_token,
+        None
     );
 }

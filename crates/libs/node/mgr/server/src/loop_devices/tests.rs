@@ -136,12 +136,21 @@ fn ensure_capacity_is_a_no_op_when_the_target_is_already_met() {
 ///
 /// Ignored by default because it needs root and mutates host state. It leaves
 /// the devices it creates in place — `LOOP_CTL_REMOVE` blocks on block-device
-/// teardown for ~100ms each, and a spare loop device costs one `gendisk`.
+/// teardown for ~100ms each, and a spare loop device costs one `gendisk` — so
+/// it runs only on a disposable host that opts in:
 ///
-///   cargo test -p pplx-space-node-mgr --lib loop_devices -- --ignored
+///   SPACE_NODEMGR_TEST_LOOP_DEVICES=1 \
+///     cargo test -p pplx-space-node-mgr --lib loop_devices -- --ignored
 #[test]
-#[ignore = "requires root and adds loop devices to the running kernel"]
+#[ignore = "requires root and an explicit opt-in on a disposable host; adds loop devices to the running kernel"]
 fn ensure_capacity_creates_attachable_devices_past_max_loop() {
+    // CI includes ignored tests; host mutation still requires explicit opt-in.
+    if std::env::var_os("SPACE_NODEMGR_TEST_LOOP_DEVICES").is_none() {
+        eprintln!(
+            "not opted in: set SPACE_NODEMGR_TEST_LOOP_DEVICES=1 on a disposable host that may keep the loop devices this test adds"
+        );
+        return;
+    }
     let max_loop: u32 = std::fs::read_to_string("/sys/module/loop/parameters/max_loop")
         .expect("loop module parameters")
         .trim()

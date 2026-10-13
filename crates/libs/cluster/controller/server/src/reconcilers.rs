@@ -308,8 +308,8 @@ pub async fn run_reconcilers(
         );
     } else {
         let aws_config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
-        let s3_client = aws_sdk_s3::Client::new(&aws_config);
-        let backend = pplx_space_snapshot_storage::s3::S3StorageBackend::new(Arc::new(s3_client));
+        let backend =
+            pplx_space_snapshot_storage::s3::S3StorageBackend::from_sdk_config(&aws_config);
         // The sweeper's candidate scan joins the credential-fenced
         // snapshot_storage_location_encrypted_fields sidecar, so its store
         // runs on the credentials lane rather than the rollout-default pool.
@@ -337,8 +337,8 @@ pub async fn run_reconcilers(
         let mut registry = snapshot_retention_sweeper::backend::StorageBackendRegistry::new();
         if let Some(bucket) = retention_config.scoped_bucket.clone() {
             let aws_config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
-            let s3_client = aws_sdk_s3::Client::new(&aws_config);
-            let s3 = pplx_space_snapshot_storage::s3::S3StorageBackend::new(Arc::new(s3_client));
+            let s3 =
+                pplx_space_snapshot_storage::s3::S3StorageBackend::from_sdk_config(&aws_config);
             registry.register(Arc::new(
                 snapshot_retention_sweeper::backend::S3Backend::new(s3, Some(bucket)),
             ));

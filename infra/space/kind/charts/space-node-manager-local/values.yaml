@@ -1,0 +1,43 @@
+# node-manager on every SPACE Kind node, and through its init container the
+# host runtime-supervisor unit. One release per role: `space` (sandbox
+# workers) and `space-builder` (`--set node.role=builder`).
+
+# The production worker image (docker/Dockerfile.worker), unchanged.
+image:
+  repository: space-worker
+  tag: local
+  pullPolicy: IfNotPresent
+
+# Direct-render environment fallback. Bootstrap and Tilt always supply the
+# selected experiment environment or the per-host local environment.
+datadogEnvironment: kind-local
+clusterId: kind-local
+
+# Telemetry defaults come from the space-kind-telemetry library; shared node
+# settings from the space-node-service library (`node.*`).
+telemetry: {}
+node: {}
+
+# node-manager drains for DEFAULT_DRAIN_TIMEOUT (25 s) and then keeps waiting
+# for tracked tasks while it holds its service mutex
+# (crates/libs/node/mgr/server/src/run.rs); the kubelet's SIGKILL ends that
+# wait. 60 s is the grace the shared lifecycle defaults are sized against
+# (crates/libs/common/svc/src/lifecycle.rs) and stays inside the successor's
+# 180 s mutex wait (--service-mutex-timeout-secs default).
+terminationGracePeriodSeconds: 60
+
+# The loop-device pool node-manager raises its node to at startup
+# (crates/libs/node/mgr/server/src/loop_devices.rs). Empty means that
+# module's floor of 64, which the node image's space-loop-nodes.service also
+# stages before kubelet. Both bring-up paths map SPACE_LOOP_DEVICE_TARGET onto
+# this value.
+loopDeviceTarget: ""
+
+# Kind sizing, not production's: small requests so the scheduler accounts for
+# the pod, and no limits, so a bench never OOM-kills a node service at a bound
+# nobody measured. Firecracker and its sidecars run under the host
+# runtime-supervisor's cgroup, not in this pod.
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi

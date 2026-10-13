@@ -19,6 +19,9 @@ metadata:
   name: {{ $name }}
 spec:
   type: ClusterIP
+  {{- if and (eq $name "collector") $.Values.collector.clusterIP }}
+  clusterIP: {{ $.Values.collector.clusterIP | quote }}
+  {{- end }}
   selector: {app: {{ $name }}}
   ports:
     - {name: otlp-grpc, port: 4317, targetPort: 4317}
@@ -55,6 +58,7 @@ spec:
       containers:
         - name: {{ $name }}
           image: {{ include "traces.image" (dict "root" $ "name" $name) | quote }}
+          imagePullPolicy: IfNotPresent
           securityContext:
 {{ include "common.containerSecurityContext" . | indent 12 }}
           {{- if eq $name "collector" }}

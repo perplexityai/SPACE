@@ -79,6 +79,67 @@ pub fn push_payload(
     counter("volume_manager.push.wire_bytes", wire_bytes, tags);
 }
 
+/// Streaming uses separate counters so the existing file `prepared` wire
+/// counter continues to size temporary files. `uploaded` means the producer
+/// finalized and S3 accepted completion; `verified` additionally passed HEAD.
+/// These are per-attempt lengths, excluding failed/partial uploads and part
+/// retransmissions. Never sum phases or interpret them as disk/network I/O.
+#[derive(Clone, Copy)]
+pub enum StreamPushPhase {
+    Uploaded,
+    Verified,
+}
+
+impl StreamPushPhase {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Uploaded => "uploaded",
+            Self::Verified => "verified",
+        }
+    }
+}
+
+pub fn stream_push_payload(
+    artifact: &str,
+    phase: StreamPushPhase,
+    logical_bytes: u64,
+    wire_bytes: u64,
+) {
+    let tags = &[tag("artifact", artifact), tag("phase", phase.as_str())];
+    counter("volume_manager.push.stream.payloads", 1, tags);
+    counter(
+        "volume_manager.push.stream.logical_bytes",
+        logical_bytes,
+        tags,
+    );
+    counter("volume_manager.push.stream.wire_bytes", wire_bytes, tags);
+}
+
+/// Producer lifetime includes codec lending during backpressure. Pipe-write time
+/// includes bridge, downstream and codec-reacquisition waits, not CPU time. Trailing uploads are outside
+/// this duration. Both successful and failed producers contribute observations.
+pub fn stream_push_producer(
+    artifact: &str,
+    started: Instant,
+    pipe_wait: std::time::Duration,
+    success: bool,
+) {
+    let tags = &[
+        tag("artifact", artifact),
+        tag("outcome", if success { "success" } else { "error" }),
+    ];
+    timing_ms(
+        "volume_manager.push.stream.producer_ms",
+        elapsed_ms(started),
+        tags,
+    );
+    timing_ms(
+        "volume_manager.push.stream.pipe_write_ms",
+        pipe_wait.as_secs_f64() * 1000.0,
+        tags,
+    );
+}
+
 pub fn transfer_phase_duration(
     kind: &str,
     artifact: &str,

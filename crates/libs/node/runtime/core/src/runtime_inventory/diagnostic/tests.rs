@@ -107,6 +107,7 @@ fn roots(base: &Path) -> ScanRoots {
         )],
         vendor_kernels: base.join("vendor/kernels"),
         managed_kernels: None,
+        managed_releases: None,
         cache_kernels: base.join("cache/firecracker/kernels"),
         cache_legacy_assets: base.join("cache/firecracker/assets"),
         runtime_aliases: vec![base.join("bin/firecracker"), base.join("bin/jailer")],
@@ -1089,7 +1090,7 @@ fn each_runtime_root_is_scanned_with_its_own_layout() {
 fn the_runtime_managers_kernel_root_is_scanned_once_beside_the_images() {
     let dir = tempfile::tempdir().unwrap();
     let mut roots = roots(dir.path());
-    let managed = dir.path().join("vendor/runtime-manager/kernels");
+    let managed = dir.path().join("vendor/node/kernels");
     write(
         &roots.vendor_kernels.join("5.10.245/vmlinux.bin"),
         &kernel_image(b"baked"),
@@ -1129,4 +1130,130 @@ fn the_runtime_managers_kernel_root_is_scanned_once_beside_the_images() {
         .map(|artifact| artifact.path.clone())
         .collect();
     assert_eq!(listed, [managed.join("6.1.155/vmlinux.bin")]);
+}
+
+#[test]
+fn the_runtime_managers_release_root_is_scanned_once_beside_the_images() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut roots = roots(dir.path());
+    release(&roots, "v1.15.1");
+    let managed = dir.path().join("vendor/node/firecracker");
+    let bin = managed.join("v1.16.2/bin");
+    write_mode(
+        &bin.join("firecracker"),
+        &elf_header(ELF_MACHINE_X86_64),
+        0o755,
+    );
+    write_mode(&bin.join("jailer"), &elf_header(ELF_MACHINE_X86_64), 0o755);
+    roots.managed_releases = Some(RuntimeInstallationRoot::new(
+        RuntimeKind::Firecracker,
+        &managed,
+    ));
+
+    let listed = |scan: &ArtifactScan| {
+        let mut paths: Vec<_> = scan
+            .artifacts
+            .iter()
+            .filter(|artifact| artifact.origin == FC_RELEASE)
+            .map(|artifact| artifact.path.clone())
+            .collect();
+        paths.sort();
+        paths
+    };
+    // Separate roots: both are listed.
+    assert_eq!(
+        listed(&run(&roots)),
+        [fc_releases(&roots).join("v1.15.1"), managed.join("v1.16.2")]
+    );
+
+    // The image root a link to the runtime manager's: listed once, under
+    // the path the runtime manager's records name.
+    std::fs::remove_dir_all(fc_releases(&roots)).unwrap();
+    symlink(&managed, fc_releases(&roots)).unwrap();
+    assert_eq!(listed(&run(&roots)), [managed.join("v1.16.2")]);
+}
+
+#[test]
+fn the_known_releases_are_the_ones_with_a_state_format() {
+    let layout = ReleaseLayout::of(RuntimeKind::Firecracker).unwrap();
+    let known = (layout.known_releases)();
+    assert!(known.contains(&"1.15.1"), "{known:?}");
+    for release in known {
+        (layout.state_format)(&RuntimeVersion::parse(release).unwrap()).unwrap();
+    }
+    assert!(ReleaseLayout::of(RuntimeKind::CloudHypervisor).is_none());
+}
+
+#[test]
+fn managed_release_identity_is_measured_without_catalog_pins_and_respects_limits() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut roots = roots(dir.path());
+    release(&roots, "v9.9.9");
+    let external = run(&roots);
+    assert_eq!(find(&external, FC_RELEASE, "v9.9.9").digest, None);
+    roots.managed_releases = Some(roots.runtime_releases[0].clone());
+    let expected = crate::catalog::release_digest([
+        ("bin/firecracker", sha256(&elf_header(ELF_MACHINE_X86_64))),
+        ("bin/jailer", sha256(&elf_header(ELF_MACHINE_X86_64))),
+    ]);
+    let listing = run(&roots);
+    assert_eq!(find(&listing, FC_RELEASE, "v9.9.9").digest, Some(expected));
+    assert!(listing.is_complete());
+    let limited = scan(
+        &roots,
+        ScanLimits {
+            max_digest_bytes: 1,
+            ..LIMITS
+        },
+        ArtifactKinds::ALL,
+        &SystemScanClock,
+        &mut DigestCache::default(),
+    );
+    assert!(!limited.is_complete());
+    assert_eq!(find(&limited, FC_RELEASE, "v9.9.9").digest, None);
+    std::fs::remove_file(fc_releases(&roots).join("v9.9.9/bin/jailer")).unwrap();
+    assert_eq!(find(&run(&roots), FC_RELEASE, "v9.9.9").digest, None);
+}
+
+#[test]
+fn filtered_listings_retain_the_other_kinds_bounded_digest_cache() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut roots = roots(dir.path());
+    release(&roots, "v1.16.2");
+    roots.managed_releases = Some(roots.runtime_releases[0].clone());
+    write(
+        &roots.cache_kernels.join("6.1.155/vmlinux.bin"),
+        &kernel_image(b"kernel"),
+    );
+    let mut cache = DigestCache::default();
+    scan(
+        &roots,
+        LIMITS,
+        ArtifactKinds::ALL,
+        &SettledClock,
+        &mut cache,
+    );
+    assert_eq!(cache.len(), 3);
+    let cached_only = ScanLimits {
+        max_digest_bytes: 0,
+        ..LIMITS
+    };
+    for kinds in [
+        ArtifactKinds {
+            runtimes: true,
+            kernels: false,
+        },
+        KERNELS_ONLY,
+        ArtifactKinds::ALL,
+    ] {
+        let listing = scan(&roots, cached_only, kinds, &SettledClock, &mut cache);
+        assert!(listing.is_complete(), "{:?}", listing.issues);
+        assert!(
+            listing
+                .artifacts
+                .iter()
+                .all(|artifact| artifact.digest.is_some())
+        );
+        assert_eq!(cache.len(), 3);
+    }
 }

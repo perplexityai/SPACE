@@ -1,5 +1,6 @@
+# The production worker image carries space-internal-api-svc.
 image:
-  repository: space-node-stack
+  repository: space-worker
   tag: local
   pullPolicy: IfNotPresent
 
@@ -7,6 +8,32 @@ datadogTeam: team-space
 
 # Telemetry defaults come from the space-kind-telemetry library.
 telemetry: {}
+
+# ServiceAccounts ClusterApi admits (TokenReview with audience
+# space-cluster-api; static fallback is disabled). The node services that call
+# it each run under their own DaemonSet's account, worker (`space-*`) and
+# builder (`space-builder-*`).
+clusterApiAuth:
+  nodeServiceAccounts:
+    - space-node-ctl
+    - space-template-manager
+    - space-sandbox-manager
+    - space-node-api
+    - space-builder-node-ctl
+    - space-builder-template-manager
+    - space-builder-sandbox-manager
+    - space-builder-node-api
+    - space-builder-build-manager
+  controlPlaneServiceAccounts:
+    - space-api
+    - space-cluster-controller
+    - space-data-plane
+    - space-template-publish
+  systemPublishers:
+    - space-builder-build-manager
+    - space-template-publish
+  tenantPublishers:
+    - space-builder-build-manager
 
 service:
   name: space-internal-api
@@ -79,10 +106,9 @@ visibilityCache:
   staleCeilingSeconds: ""
 
 # Ingress activation must use the same substrate and pod configuration as the API.
-# The minimal Tilt harness overrides this to use DirectSubstrate.
 k8s:
-  enabled: true
-  sandboxNamespace: space
+  # The API's sandbox namespace (space-api-local's k8s.sandboxNamespace).
+  sandboxNamespace: sandboxes
   sandboxPodImage: registry.k8s.io/pause:3.10
   sandboxNodeSelectorKey: node.kubernetes.io/space-enabled
   sandboxNodeSelectorValue: "true"
@@ -92,4 +118,4 @@ serviceAccount:
 apiReleaseName: space
 
 # Lifecycle API owns activation and the Kubernetes caches.
-activationEndpoint: "http://space-api:9801"
+activationEndpoint: "https://space-api:9801"

@@ -40,6 +40,9 @@ const SUSPEND_RECOVERY_KIND: &str = "suspend";
 /// A dedicated one-per-node permit bounds how much transfer and filesystem work
 /// that dispatch can put in flight at once.
 ///
+/// An episode whose recovery stopped at `QUARANTINE_RECOVERY_PLAN_REJECTION_BOUND`
+/// is never a candidate, so it takes no admission from one that can recover.
+///
 /// A capacity-deferred orphan is not charged an attempt. Per-pass outcomes
 /// describe only the returned batch. Backlog gauges are refreshed only when
 /// the whole sweep completes. Partial scans publish no census; failures
@@ -358,7 +361,16 @@ impl SandboxManagerService {
     ) -> Result<Vec<crate::db::StartupRecoveryRecord>, StartupRecoveryError> {
         let mut records = self.recover_interrupted_pauses().await?;
         records.extend(self.recover_interrupted_resident_operations().await?);
-        records.extend(self.recover_prelaunch_startup_states_in(Path::new(CACHE_DIR))?);
+        // One listing feeds both the inspection of interrupted publications
+        // and the prelaunch classification that consumes its answers.
+        let rows = {
+            let db = self.startup_recovery_db()?;
+            crate::db::list_sandboxes_for_recovery(&db)?
+        };
+        let verdicts = self
+            .suspending_retained_source_verdicts(Path::new(CACHE_DIR), &rows)
+            .await;
+        records.extend(self.recover_prelaunch_rows(Path::new(CACHE_DIR), &verdicts, rows)?);
         let db_records = {
             let db = self.startup_recovery_db()?;
             crate::db::recover_interrupted_startup_states(&db)?
@@ -402,6 +414,7 @@ impl SandboxManagerService {
                         crate::runtime_reconciliation::observe_firecracker_vm_state(
                             &sandbox_id,
                             "startup pause recovery",
+                            &self.node_manager,
                         )
                         .await
                     })
@@ -529,14 +542,131 @@ impl SandboxManagerService {
         })
     }
 
+    /// Node-manager's answers, then the blocking validation that consumes them.
+    /// The caller holds the cleanup fence across both, so no cleanup owner can
+    /// replace the artifact in between. Each node-manager call has its own
+    /// deadline; the blocking validation is not cancellable.
+    async fn inspect_canonical_artifact_for_adoption(
+        &self,
+        cache_dir: std::path::PathBuf,
+        sandbox_id: SandboxId,
+    ) -> Result<
+        Result<
+            suspend_snapshot_publication::ValidatedSuspendSnapshotArtifact,
+            suspend_snapshot_publication::CanonicalSuspendSnapshotRecoveryError,
+        >,
+        tokio::task::JoinError,
+    > {
+        // Only the canonical artifact is validated here; staging directories
+        // are the sweep's, so their sources are not discovered or inspected.
+        let sandbox_dir = cache_dir.join(sandbox_id.to_string());
+        let sources = match tokio::task::spawn_blocking(move || {
+            suspend_snapshot_publication::retained_sources_in_canonical_snapshot(&sandbox_dir)
+        })
+        .await
+        {
+            Ok(sources) => sources,
+            Err(error) => {
+                tracing::warn!(%error, "retained source discovery task failed");
+                Vec::new()
+            }
+        };
+        let verdicts = self
+            .inspect_retained_sources(sources, &mut Default::default())
+            .await;
+        tokio::task::spawn_blocking(move || {
+            suspend_snapshot_publication::validate_canonical_suspend_snapshot_for_recovery(
+                &cache_dir, sandbox_id, &verdicts,
+            )
+        })
+        .await
+    }
+
+    /// Startup classifies interrupted publications synchronously, so inspect
+    /// their retained sources first. No other owner runs before startup
+    /// recovery finishes; classification still rechecks each identity.
+    async fn suspending_retained_source_verdicts(
+        &self,
+        cache_dir: &Path,
+        rows: &[crate::db::SandboxRow],
+    ) -> crate::retained_source::RetainedSourceVerdicts {
+        let sandbox_dirs: Vec<_> = rows
+            .iter()
+            .filter(|row| row.state == SandboxState::Suspending)
+            .map(|row| cache_dir.join(&row.id))
+            .collect();
+        if sandbox_dirs.is_empty() {
+            return Default::default();
+        }
+        self.inspect_retained_sources_in(sandbox_dirs, &mut Default::default())
+            .await
+    }
+
+    /// Node-manager verdicts for the retained sources that suspend artifacts
+    /// in `sandbox_dirs` name. Quarantine adoption and cleanup completion hold
+    /// their artifact fences across this and the validation that consumes it.
+    /// Periodic batches take fences only during validation, so an answer can
+    /// be one budget old by then. It still applies only to the same artifact
+    /// directory and source identity, and the cleanup owners that delete
+    /// bundles hold the fences validation then waits for.
+    pub(super) async fn inspect_retained_sources_in(
+        &self,
+        sandbox_dirs: Vec<std::path::PathBuf>,
+        schedule: &mut crate::retained_source::InspectionSchedule,
+    ) -> crate::retained_source::RetainedSourceVerdicts {
+        let sources = match tokio::task::spawn_blocking(move || {
+            sandbox_dirs
+                .iter()
+                .flat_map(|sandbox_dir| {
+                    suspend_snapshot_publication::retained_sources_in_sandbox_dir(sandbox_dir)
+                })
+                .collect::<Vec<_>>()
+        })
+        .await
+        {
+            Ok(sources) => sources,
+            Err(error) => {
+                tracing::warn!(%error, "retained source discovery task failed");
+                Vec::new()
+            }
+        };
+        self.inspect_retained_sources(sources, schedule).await
+    }
+
+    async fn inspect_retained_sources(
+        &self,
+        sources: Vec<crate::retained_source::RetainedSource>,
+        schedule: &mut crate::retained_source::InspectionSchedule,
+    ) -> crate::retained_source::RetainedSourceVerdicts {
+        crate::retained_source::inspect_in_background(
+            self.retained_source_inspector.as_ref(),
+            sources,
+            crate::retained_source::BACKGROUND_INSPECTION_BUDGET,
+            schedule,
+        )
+        .await
+    }
+
+    /// Prelaunch recovery over a fresh listing, for tests of one state.
+    #[cfg(test)]
     pub(super) fn recover_prelaunch_startup_states_in(
         &self,
         cache_dir: &Path,
+        verdicts: &crate::retained_source::RetainedSourceVerdicts,
     ) -> Result<Vec<crate::db::StartupRecoveryRecord>, StartupRecoveryError> {
         let rows = {
             let db = self.startup_recovery_db()?;
             crate::db::list_sandboxes_for_recovery(&db)?
         };
+        self.recover_prelaunch_rows(cache_dir, verdicts, rows)
+    }
+
+    fn recover_prelaunch_rows(
+        &self,
+        cache_dir: &Path,
+        verdicts: &crate::retained_source::RetainedSourceVerdicts,
+        rows: Vec<crate::db::SandboxRow>,
+    ) -> Result<Vec<crate::db::StartupRecoveryRecord>, StartupRecoveryError> {
         let mut records = Vec::new();
         for row in rows {
             match row.state {
@@ -553,6 +683,7 @@ impl SandboxManagerService {
                         cache_dir,
                         row,
                         SuspendSnapshotPublicationRecoveryOrigin::StartupRecovery,
+                        verdicts,
                     ) {
                         Ok(record) => records.push(record),
                         Err(error) => {
@@ -579,6 +710,45 @@ impl SandboxManagerService {
         Ok(records)
     }
 
+    /// One periodic pass over a discovered batch of rows: inspect the retained
+    /// sources of its unowned publications, then recover exactly that batch.
+    /// Answers are not carried to another batch. `hold` is released after the
+    /// blocking recovery returns.
+    pub(super) async fn recover_deferred_suspend_publication_batch(
+        &self,
+        cache_dir: &Path,
+        rows: Vec<crate::db::SandboxRow>,
+        shutdown: &CancellationToken,
+        schedule: &mut crate::retained_source::InspectionSchedule,
+        hold: impl Send + 'static,
+    ) -> crate::retained_source::RetainedSourceVerdicts {
+        let verdicts = self
+            .inspect_retained_sources_in(
+                rows.iter()
+                    .filter(|row| unowned_publication(row))
+                    .map(|row| cache_dir.join(&row.id))
+                    .collect(),
+                schedule,
+            )
+            .await;
+        let (service, cache_dir, shutdown) =
+            (self.clone(), cache_dir.to_path_buf(), shutdown.clone());
+        let recovered = tokio::task::spawn_blocking(move || {
+            let _hold = hold;
+            if let Err(error) = service
+                .recover_deferred_suspend_publications_in(&cache_dir, rows, &shutdown, &verdicts)
+            {
+                tracing::warn!(%error, "periodic suspend publication recovery failed; will retry");
+            }
+            verdicts
+        })
+        .await;
+        recovered.unwrap_or_else(|error| {
+            tracing::warn!(%error, "periodic suspend publication recovery task failed");
+            Default::default()
+        })
+    }
+
     /// Retry only unowned publications. Startup's broader recovery is unsafe
     /// here: Creating/Starting and teardown-owned captures can still be live.
     pub(super) fn recover_deferred_suspend_publications_in(
@@ -586,10 +756,9 @@ impl SandboxManagerService {
         cache_dir: &Path,
         rows: Vec<crate::db::SandboxRow>,
         shutdown: &CancellationToken,
+        verdicts: &crate::retained_source::RetainedSourceVerdicts,
     ) -> Result<(), StartupRecoveryError> {
-        for row in rows.into_iter().filter(|row| {
-            row.state == SandboxState::Suspending && row.current_local_artifact_id.is_none()
-        }) {
+        for row in rows.into_iter().filter(unowned_publication) {
             if shutdown.is_cancelled() {
                 break;
             }
@@ -621,6 +790,7 @@ impl SandboxManagerService {
                     cache_dir,
                     row,
                     SuspendSnapshotPublicationRecoveryOrigin::PeriodicRecovery,
+                    verdicts,
                 )?;
                 Ok(())
             })();
@@ -636,6 +806,7 @@ impl SandboxManagerService {
         cache_dir: &Path,
         row: crate::db::SandboxRow,
         origin: SuspendSnapshotPublicationRecoveryOrigin,
+        verdicts: &crate::retained_source::RetainedSourceVerdicts,
     ) -> Result<crate::db::StartupRecoveryRecord, StartupRecoveryError> {
         let teardown_status = {
             let db = self.startup_recovery_db()?;
@@ -666,6 +837,7 @@ impl SandboxManagerService {
             &sandbox_dir,
             row.current_local_artifact_id,
             runtime_live,
+            verdicts,
         )?;
         self.apply_suspend_snapshot_publication_recovery_decision(
             row,
@@ -673,6 +845,7 @@ impl SandboxManagerService {
             decision,
             origin,
             teardown_generation,
+            verdicts,
         )
     }
 
@@ -683,6 +856,7 @@ impl SandboxManagerService {
         decision: SuspendSnapshotPublicationDecision,
         origin: SuspendSnapshotPublicationRecoveryOrigin,
         teardown_generation: Option<pplx_space_common_core::types::ExecutionGeneration>,
+        verdicts: &crate::retained_source::RetainedSourceVerdicts,
     ) -> Result<crate::db::StartupRecoveryRecord, StartupRecoveryError> {
         match decision {
             SuspendSnapshotPublicationDecision::CanonicalReady(artifact) => {
@@ -704,11 +878,26 @@ impl SandboxManagerService {
             }
             SuspendSnapshotPublicationDecision::StagedComplete(staged) => {
                 let snapshot_dir = canonical_suspend_snapshot_dir(&sandbox_dir);
-                if let Err(error) = suspend_snapshot_publication::publish_suspend_snapshot_dir(
+                let published = suspend_snapshot_publication::publish_suspend_snapshot_dir(
                     &staged.staging_dir,
                     &snapshot_dir,
                     staged.local_artifact_id,
-                ) {
+                    verdicts,
+                );
+                let error = match published {
+                    Ok(garbage) => {
+                        for path in garbage {
+                            drop(staging_cleanup::reclaim_garbage_now(
+                                row.id.clone(),
+                                path,
+                                self.node_manager.clone(),
+                            ));
+                        }
+                        None
+                    }
+                    Err(error) => Some(error),
+                };
+                if let Some(error) = error {
                     tracing::warn!(
                         sandbox_id = %row.id,
                         local_artifact_id = %staged.local_artifact_id,
@@ -729,6 +918,7 @@ impl SandboxManagerService {
                             .trigger(SandboxEventTrigger::System)
                             .reason(origin.event_reason())
                             .error(error.to_string())
+                            .logged_by_caller()
                             .with_from_state(row.state.to_string())
                             .local_artifact_id(staged.local_artifact_id.to_string())
                             .artifact_kind("full")
@@ -1300,11 +1490,25 @@ impl SandboxManagerService {
                 );
                 break;
             }
+            // The answer's effect on the run of plan rejections is written by the
+            // claim itself, so an accepted plan ends the run even if the work it
+            // dispatches never records an outcome.
+            let plan_run = match &plan_resolution {
+                Ok(crate::snapshot_restore::QuarantineRecoveryPlanResolution::Available(_)) => {
+                    crate::db::PlanRejectionRunEffect::Ends
+                }
+                Ok(crate::snapshot_restore::QuarantineRecoveryPlanResolution::NoProgress(
+                    reason,
+                )) => crate::db::PlanRejectionRunEffect::of(*reason),
+                Err(_) => crate::db::PlanRejectionRunEffect::of(
+                    crate::db::QuarantineRecoveryNoProgressReason::PlanLookupFailed,
+                ),
+            };
             let claimed = {
                 let Ok(db) = self.db_conn() else {
                     return;
                 };
-                match crate::db::claim_quarantine_recovery_candidate(&db, &candidate) {
+                match crate::db::claim_quarantine_recovery_candidate(&db, &candidate, plan_run) {
                     Ok(Some(claimed)) => claimed,
                     Ok(None) => {
                         // The acquire CAS pins nine conjuncts, so a miss means any
@@ -1436,18 +1640,13 @@ impl SandboxManagerService {
                 continue;
             };
             probe(RecoveryPassWindow::CleanupFenceHeld);
-            let cache_dir = cache_dir.to_path_buf();
             // Deliberately not timed out either. `spawn_blocking` cannot be
             // cancelled, so returning early here meant dropping
             // `operation_fence` while the inspection was still walking the
             // snapshot directory — releasing the cleanup lock under a live
             // reader and letting a cleanup owner delete the tree beneath it.
-            let inspected = tokio::task::spawn_blocking(move || {
-                    super::suspend_snapshot_publication::validate_canonical_suspend_snapshot_for_recovery(
-                        &cache_dir,
-                        sandbox_id,
-                    )
-                })
+            let inspected = self
+                .inspect_canonical_artifact_for_adoption(cache_dir.to_path_buf(), sandbox_id)
                 .await;
             probe(RecoveryPassWindow::ArtifactInspected);
             let artifact = match inspected {
@@ -1675,8 +1874,31 @@ impl SandboxManagerService {
                         crate::db::QuarantineRecoveryNoProgressOutcome::RetryScheduled {
                             ..
                         } => QuarantineRecoveryAttemptOutcome::RetryScheduled,
+                        crate::db::QuarantineRecoveryNoProgressOutcome::AutomaticRecoveryStopped {
+                            ..
+                        } => QuarantineRecoveryAttemptOutcome::AutomaticRecoveryStopped,
                     },
                 );
+                // Once per arming: a stopped episode is never claimed again, so
+                // this cannot repeat until a re-arm grants another attempt.
+                if let crate::db::QuarantineRecoveryNoProgressOutcome::AutomaticRecoveryStopped {
+                    attempt_count,
+                    consecutive_plan_rejections,
+                } = outcome
+                {
+                    tracing::warn!(
+                        %sandbox_id,
+                        local_quarantine_id = %claimed.candidate.local_quarantine_id,
+                        reason_code = %claimed.candidate.reason_code,
+                        episode_age_secs,
+                        %reason,
+                        attempt_count,
+                        consecutive_plan_rejections,
+                        "stopped automatic quarantine recovery after consecutive plan \
+                         rejections; the hold needs operator attention"
+                    );
+                    return;
+                }
                 tracing::info!(
                     %sandbox_id,
                     local_quarantine_id = %claimed.candidate.local_quarantine_id,
@@ -1708,6 +1930,14 @@ impl SandboxManagerService {
                 );
             }
         }
+    }
+
+    /// Re-arm every stopped quarantine recovery, allowing one more plan rejection
+    /// before it stops again. Called once at startup; see
+    /// `crate::db::rearm_stopped_quarantine_recoveries`.
+    pub fn rearm_stopped_quarantine_recoveries(&self) -> Result<usize, StartupRecoveryError> {
+        let db = self.startup_recovery_db()?;
+        Ok(crate::db::rearm_stopped_quarantine_recoveries(&db)?)
     }
 
     fn schedule_recovered_cleanup(&self, target: CleanupRecoveryTarget) {
@@ -2057,10 +2287,12 @@ impl SandboxManagerService {
             let _guard = guard;
             let mut recovery_cursor = crate::db::PeriodicLifecycleRecoveryScan::default();
             let mut staging_scan = staging_cleanup::StagingCleanupScan::default();
-            let mut node_client = pplx_space_node_mgr_client::lazy();
+            let mut node_client = service.node_manager.lazy();
             let mut inventory_scan = super::cache_cleanup::PeriodicInventoryScan::default();
             let mut quarantine_scan = crate::db::PeriodicQuarantineRecoveryScan::default();
             let mut transfer_scan = crate::db::inventory::RestoreTransferScopeScan::default();
+            let mut retained_pending = crate::retained_source::PendingRetainedSources::default();
+            let mut retained_schedule = crate::retained_source::InspectionSchedule::default();
             loop {
             tokio::select! {
                 _ = shutdown_token.cancelled() => {
@@ -2102,19 +2334,61 @@ impl SandboxManagerService {
             let (publications, residents) = candidates.into_iter()
                 .partition(|row| row.state == SandboxState::Suspending);
             service.recover_periodic_resident_operations(residents, &shutdown_token).await;
+            // Each batch is inspected and then validated as one unit, so
+            // synchronous validation never waits on node-manager and every
+            // answer reaches the rows it was asked for.
+            let publication_verdicts = service
+                .recover_deferred_suspend_publication_batch(
+                    Path::new(CACHE_DIR), publications, &shutdown_token, &mut retained_schedule, state_writer.clone(),
+                )
+                .await;
+            let reconcile_service = service.clone();
+            let reconcile_shutdown = shutdown_token.clone();
+            let blocking_writer = state_writer.clone();
+            let discovered = tokio::task::spawn_blocking(move || {
+                let _state_writer = blocking_writer;
+                let batch = (!reconcile_shutdown.is_cancelled()).then(|| {
+                    reconcile_service.discover_periodic_inventory(&mut inventory_scan, &reconcile_shutdown)
+                });
+                (inventory_scan, batch)
+            })
+            .await;
+            let batch = match discovered {
+                Ok((scan, batch)) => {
+                    inventory_scan = scan;
+                    match batch {
+                        Some(Ok(batch)) => Some(batch),
+                        Some(Err(error)) => {
+                            tracing::warn!(%error, "periodic inventory discovery failed; will retry");
+                            None
+                        }
+                        None => None,
+                    }
+                }
+                Err(error) => {
+                    inventory_scan = super::cache_cleanup::PeriodicInventoryScan::default();
+                    tracing::warn!(%error, "sandbox inventory discovery task failed");
+                    None
+                }
+            };
+            let inventory_verdicts = match &batch {
+                Some(batch) => {
+                    service
+                        .inspect_retained_sources_in(batch.orphan_candidates.clone(), &mut retained_schedule)
+                        .await
+                }
+                None => Default::default(),
+            };
             let reconcile_service = service.clone();
             let reconcile_shutdown = shutdown_token.clone();
             let blocking_writer = state_writer.clone();
             let inventory_result = tokio::task::spawn_blocking(move || {
                 let _state_writer = blocking_writer;
-                if let Err(error) = reconcile_service.recover_deferred_suspend_publications_in(
-                    Path::new(CACHE_DIR), publications, &reconcile_shutdown,
-                ) {
-                    tracing::warn!(%error, "periodic suspend publication recovery failed; will retry");
-                }
                 let mut paths = Vec::new();
                 if !reconcile_shutdown.is_cancelled() {
-                    if let Err(error) = reconcile_service.reconcile_periodic_inventory(&mut inventory_scan, &reconcile_shutdown) {
+                    if let Some(batch) = batch
+                        && let Err(error) = reconcile_service.reconcile_periodic_inventory_batch(batch, &inventory_verdicts)
+                    {
                         tracing::warn!(%error, "periodic inventory reconciliation failed; will retry");
                     }
                     if !reconcile_shutdown.is_cancelled() {
@@ -2124,18 +2398,20 @@ impl SandboxManagerService {
                         }
                     }
                 }
-                (inventory_scan, staging_scan, paths)
+                (staging_scan, paths, inventory_verdicts)
             })
             .await;
             match inventory_result {
-                Ok((inventory, staging, paths)) => {
-                    inventory_scan = inventory;
+                Ok((staging, paths, inventory_verdicts)) => {
+                    retained_pending.observe(
+                        &[&publication_verdicts, &inventory_verdicts],
+                        std::time::Instant::now(),
+                    );
                     staging_scan = staging;
                     staging_cleanup::delete_batch(&mut node_client, paths, &shutdown_token).await;
                 }
                 Err(error) => {
                     staging_scan = staging_cleanup::StagingCleanupScan::default();
-                    inventory_scan = super::cache_cleanup::PeriodicInventoryScan::default();
                     tracing::warn!(%error, "sandbox inventory reconciler blocking task failed");
                 }
             }
@@ -2150,6 +2426,10 @@ impl SandboxManagerService {
     }
 }
 
+fn unowned_publication(row: &crate::db::SandboxRow) -> bool {
+    row.state == SandboxState::Suspending && row.current_local_artifact_id.is_none()
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum CleanupRecoveryAuthority {
     Startup,
@@ -2157,7 +2437,7 @@ pub(super) enum CleanupRecoveryAuthority {
 }
 
 mod orphan_dispatch;
-mod staging_cleanup;
+pub(in crate::service) mod staging_cleanup;
 
 #[cfg(test)]
 mod tests;

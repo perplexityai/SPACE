@@ -26,6 +26,25 @@ roleRef:
   kind: Role
   name: {{ .Values.apiReleaseName }}-api-pods
 ---
+# The node-api and node-service pods it watches in the release namespace
+# (the api chart's read-only Role there).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ .Release.Name }}-cluster-controller-node-service-pods
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: space-cluster-controller
+    app.kubernetes.io/instance: {{ .Release.Name }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ .Values.serviceAccount.name }}
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ .Values.apiReleaseName }}-api-node-service-pods
+---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
@@ -44,7 +63,7 @@ roleRef:
 ---
 # Leader-election lease: the cluster-controller holds a coordination.k8s.io
 # Lease in its own namespace and runs the singleton reconcilers only while it
-# holds it. Single-replica here, but the acquire/renew/release path still runs.
+# holds it; the other replica stands by.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:

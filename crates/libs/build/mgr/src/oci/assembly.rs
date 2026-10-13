@@ -71,6 +71,17 @@ pub enum OciImageAssemblyError {
     Task(#[source] tokio::task::JoinError),
 }
 
+impl OciImageAssemblyError {
+    /// The bounded cause metrics report for a failed image assembly.
+    pub fn error_kind(&self) -> crate::TemplateBuildErrorKind {
+        match self {
+            Self::Containerd(error) => error.error_kind(),
+            Self::Rootfs(_) => crate::TemplateBuildErrorKind::Unpack,
+            Self::Task(_) => crate::TemplateBuildErrorKind::Other,
+        }
+    }
+}
+
 pub struct OciImageAssemblyRequest {
     pub seed_rootfs: PathBuf,
     pub target_rootfs: PathBuf,

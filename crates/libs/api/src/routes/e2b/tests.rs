@@ -93,11 +93,12 @@ fn configure_test_ecw_credential_keyring(state: &mut AppState) {
 }
 
 async fn test_state() -> AppState {
-    // Nothing listens here. A route that reaches the database should fail at
-    // once, not wait out sqlx's 30 s default acquire timeout.
+    // Port 1 is closed, so this never reaches a Postgres the host happens to
+    // serve. A route that reaches the database should fail at once, not wait
+    // out sqlx's 30 s default acquire timeout.
     let pool = PgPoolOptions::new()
         .acquire_timeout(Duration::from_millis(100))
-        .connect_lazy("postgresql://postgres:postgres@localhost/space")
+        .connect_lazy("postgresql://127.0.0.1:1/unused")
         .unwrap();
 
     AppState::from_pool(pool).await.unwrap()

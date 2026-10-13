@@ -1,0 +1,292 @@
+{{- $ctx := dict "ctx" . "component" "node-manager" -}}
+{{- include "space-node-service.serviceAccount" $ctx }}
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "space-node-service.name" $ctx }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "space-node-service.labels" $ctx | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "space-node-service.selectorLabels" $ctx | nindent 6 }}
+  # Surge: node-manager holds /space/run/node-manager/service.mutex, and a
+  # successor binds its health socket, reports ready while passive and takes
+  # over when the predecessor releases the lock
+  # (crates/libs/node/mgr/server/src/run.rs). The runtime-supervisor upgrade
+  # is built around that overlap: the successor's init container stages the
+  # new supervisor while the old node-manager still runs and defers the
+  # restart, which the successor performs once it holds the mutex
+  # (scripts/k8s/node-manager-runtime-supervisor.sh).
+  {{- include "space-node-service.updateStrategy" (dict "strategy" "surge") | nindent 2 }}
+  template:
+    metadata:
+      annotations:
+        {{- include "space-node-service.podAnnotations" $ctx | nindent 8 }}
+      labels:
+        {{- include "space-node-service.labels" $ctx | nindent 8 }}
+    spec:
+      {{- include "space-node-service.nodeSelector" $ctx | nindent 6 }}
+      serviceAccountName: {{ include "space-node-service.name" $ctx }}
+      # node-manager makes no Kubernetes API calls.
+      automountServiceAccountToken: false
+      # Host network: node-manager builds each sandbox's veth/tap pair, routes
+      # and nftables in the node's root network namespace and sets
+      # net.ipv4.ip_forward there (crates/libs/node/mgr/server/src/net.rs,
+      # firewall.rs). ClusterFirstWithHostNet keeps in-cluster DNS.
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      # Host PID: node-manager opens pidfds on the Firecracker and sidecar
+      # processes the host runtime-supervisor reports, and reads the
+      # /proc/<pid> links it records under /space/run/firecracker/sandboxes
+      # (crates/libs/node/runtime/supervisor/src/inventory.rs). The init
+      # container's `nsenter --target 1` reaches the node's systemd through it
+      # (scripts/k8s/node-manager-init.sh).
+      hostPID: true
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds | int }}
+      initContainers:
+        # Kind-only, ahead of the production init: the node's
+        # /space/config/space.env, the EnvironmentFile of the host
+        # space-runtime-supervisor.service (scripts/k8s/node-manager-init.sh).
+        # A production node's bootstrap writes that file. A Kind node has no
+        # bootstrap, so without this the supervisor ignores the telemetry
+        # selector and keeps exporting to a Datadog Agent that is not there.
+        # The file holds this pod's telemetry settings and nothing else, with
+        # each Collector at the address the node reaches without cluster DNS,
+        # as the shim's wrapper names it (scripts/telemetry_config.py). A
+        # changed file marks the restart node-manager already performs for a
+        # staged supervisor: the production init below defers it while the
+        # node's current node-manager runs, and this pod's node-manager makes
+        # it once it holds the service mutex. On a new node there is no
+        # supervisor yet, and the init below starts it with this file.
+        - name: kind-node-env
+          {{- include "space-node-service.image" . | nindent 10 }}
+          command:
+            - /bin/bash
+            - -ec
+            - |
+              env_file=/space/config/space.env
+              written=$(
+                for name in SPACE_CLUSTER_ID SPACE_K8S_NODE_NAME DD_ENV DD_VERSION \
+                    SPACE_ENV SPACE_VERSION DD_TAGS OTEL_RESOURCE_ATTRIBUTES \
+                    DD_TRACE_ENABLED DD_AGENT_HOST DD_DOGSTATSD_PORT \
+                    SPACE_METRICS_SINK SPACE_TRACE_EXPORTER \
+                    OTEL_EXPORTER_OTLP_METRICS_PROTOCOL \
+                    OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE \
+                    OTEL_EXPORTER_OTLP_TRACES_PROTOCOL OTEL_TRACES_SAMPLER; do
+                  if [[ -v $name ]]; then printf '%s=%s\n' "$name" "${!name}"; fi
+                done
+                # Present exactly when the mode exports that signal over OTLP.
+                if [[ -v OTEL_EXPORTER_OTLP_METRICS_ENDPOINT && -n $NODE_OTLP_METRICS_ENDPOINT ]]; then
+                  printf 'OTEL_EXPORTER_OTLP_METRICS_ENDPOINT=%s\n' "$NODE_OTLP_METRICS_ENDPOINT"
+                fi
+                if [[ -v OTEL_EXPORTER_OTLP_TRACES_ENDPOINT && -n $NODE_OTLP_TRACES_ENDPOINT ]]; then
+                  printf 'OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=%s\n' "$NODE_OTLP_TRACES_ENDPOINT"
+                fi
+              )
+              if [[ -f $env_file && "$(<"$env_file")" == "$written" ]]; then
+                echo "kind-node-env: $env_file unchanged"
+                exit 0
+              fi
+              printf '%s\n' "$written" >"$env_file.tmp"
+              chmod 0600 "$env_file.tmp"
+              mv -f "$env_file.tmp" "$env_file"
+              echo "kind-node-env: wrote $env_file"
+              if [[ -d /space/run/runtime-supervisor ]]; then
+                touch /space/run/runtime-supervisor/restart-required
+                echo "kind-node-env: marked runtime-supervisor for restart"
+              fi
+          # Root for the root-owned node paths it writes, and nothing more.
+          securityContext:
+            runAsUser: 0
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          env:
+            - name: SPACE_CLUSTER_ID
+              value: {{ .Values.clusterId | quote }}
+            # The resolver drops a node name inherited through
+            # OTEL_RESOURCE_ATTRIBUTES; it reads this setting instead.
+            - name: SPACE_K8S_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            {{- include "space-kind-telemetry.env" . | nindent 12 }}
+            - name: NODE_OTLP_METRICS_ENDPOINT
+              value: {{ .Values.telemetry.nodeOtlpMetricsEndpoint | quote }}
+            - name: NODE_OTLP_TRACES_ENDPOINT
+              value: {{ .Values.telemetry.nodeOtlpTracesEndpoint | quote }}
+          volumeMounts:
+            - name: space-config
+              mountPath: /space/config
+            {{- include "space-node-service.mount.run" . | nindent 12 }}
+        # The production node-manager init path, unmodified: stages the host
+        # binaries under /space/bin/releases/<tag>, prepares /space/run, stages
+        # the guest kernel into /space/cache, and installs, starts or schedules
+        # the restart of the host's space-runtime-supervisor.service through
+        # `nsenter --target 1` and systemctl.
+        - name: node-manager-init
+          {{- include "space-node-service.image" . | nindent 10 }}
+          # SPACE_IMAGE_TAG keys the release directory the binaries are staged
+          # under. Production passes its image tag; every Kind build is tagged
+          # `local`, so the tag here is the digest of what the script stages,
+          # which changes exactly when a staged binary or the supervisor
+          # compatibility identity does.
+          command:
+            - /bin/bash
+            - -ec
+            - |
+              SPACE_IMAGE_TAG="kind-$(cat \
+                /opt/space/bin/space-runtime-supervisor-svc \
+                /opt/space/bin/space-nodemgr-svc \
+                /opt/space/bin/space-sbxmgr-svc \
+                /opt/space/bin/space-spaced-host-svc \
+                /opt/space/bin/space-netgtw-svc \
+                /opt/space/bin/space-sbxmgr \
+                /opt/space/etc/space-runtime-supervisor-compatibility \
+                | sha256sum | cut -c1-16)"
+              export SPACE_IMAGE_TAG
+              exec /opt/space/bin/node-manager-init.sh
+          # Privileged: it writes the node's systemd unit and runs systemctl in
+          # the node's mount, PID and other namespaces via nsenter, and stages
+          # root-owned files on the host paths below.
+          securityContext:
+            privileged: true
+          volumeMounts:
+            # /space/bin/releases/<tag> and the /space/bin/<binary> links the
+            # host supervisor's unit and sidecar launches use.
+            - name: space-bin
+              mountPath: /space/bin
+            - name: space-etc
+              mountPath: /space/etc
+            {{- include "space-node-service.mount.run" . | nindent 12 }}
+            # Guest-kernel staging writes files, not mounts, so the node's view
+            # is enough.
+            {{- include "space-node-service.mount.cache" (dict) | nindent 12 }}
+            - name: vendor
+              mountPath: /space/vendor
+              readOnly: true
+      containers:
+        - name: node-manager
+          {{- include "space-node-service.image" . | nindent 10 }}
+          command:
+            - /opt/space/bin/space-nodemgr-svc
+            - --health-socket={{ include "space-node-service.healthSocket" $ctx }}
+          # Privileged: node-manager mounts (jail rootfs and snapshot-memory
+          # binds, btrfs on loop and device-mapper devices), creates loop and
+          # device-mapper devices, unshares and bind-mounts network namespaces,
+          # writes /sys/fs/cgroup/space, and programs nftables and links
+          # (crates/libs/node/mgr/server/src/{launch_prepare,snapshots,
+          # loop_devices,rootfs_dmcrypt,net}.rs). Bidirectional mount
+          # propagation below also requires it.
+          securityContext:
+            privileged: true
+          env:
+            {{- include "space-node-service.env.identity" . | nindent 12 }}
+            {{- include "space-node-service.env.diskAdmission" . | nindent 12 }}
+            # Sandbox volume DEKs come straight from the authority, which
+            # admits GetOrIssueSandboxVolumeDek only from node-manager, never
+            # through the node agent
+            # (crates/libs/node/mgr/server/src/service/encrypted_volumes.rs,
+            # crates/libs/credential/mgr/server/src/service.rs).
+            {{- include "space-node-service.env.credmgrAuthority" . | nindent 12 }}
+            # The successor activates a supervisor restart its init container
+            # staged, once it holds the service mutex
+            # (crates/libs/node/mgr/server/src/run.rs).
+            - name: SPACE_NODEMGR_ACTIVATE_RUNTIME_SUPERVISOR_ON_START
+              value: "true"
+            # Sandbox pods own their network namespaces (KubernetesSubstrate).
+            - name: SPACE_NODEMGR_SERVICE_PORT_INGRESS_ISOLATION
+              value: shared_host
+            {{- if ne (toString .Values.loopDeviceTarget) "" }}
+            - name: SPACE_LOOP_DEVICE_TARGET
+              value: {{ .Values.loopDeviceTarget | quote }}
+            {{- end }}
+          {{- include "space-node-service.probes" $ctx | nindent 10 }}
+          volumeMounts:
+            {{- include "space-node-service.mount.run" . | nindent 12 }}
+            {{- include "space-node-service.mount.credmgrToken" . | nindent 12 }}
+            # Bidirectional: the jailer runs on the node under the host
+            # runtime-supervisor, in a mount namespace that is a slave of the
+            # node's. node-manager bind-mounts each instance's rootfs into its
+            # jail before launch and the snapshot memory file after Firecracker
+            # is already running on restore
+            # (crates/libs/node/mgr/server/src/service/snapshots.rs); those
+            # mounts reach the jail only if they propagate from this pod to the
+            # node's shared /space/cache. Without it Firecracker opens the
+            # zero-byte bind target and restore fails ("Total sum of memory
+            # regions exceeds largest possible file offset").
+            {{- include "space-node-service.mount.cache" (dict "propagation" "Bidirectional") | nindent 12 }}
+            # Bidirectional: node-manager bind-mounts each sandbox network
+            # namespace at /run/netns/<ns> (crates/libs/node/mgr/server/src/net/linux.rs);
+            # the host jailer (`--netns`) and the supervisor's sidecar launcher
+            # (setns) open those paths on the node. Kubelet's CNI namespaces
+            # for sandbox pods arrive the other way.
+            - name: netns
+              mountPath: /var/run/netns
+              mountPropagation: Bidirectional
+            # The sandbox cgroup parent's cpu/memory/io limits and per-sandbox
+            # children (crates/libs/node/runtime/core/src/cgroup.rs).
+            - name: cgroup
+              mountPath: /sys/fs/cgroup
+            # The runtime inventory resolves /space/bin/{firecracker,jailer}
+            # and the vendor releases they link to.
+            - name: space-bin
+              mountPath: /space/bin
+              readOnly: true
+            - name: vendor
+              mountPath: /space/vendor
+              readOnly: true
+            - name: space-etc
+              mountPath: /space/etc
+              readOnly: true
+            # Fail fast on a node without KVM rather than at the first launch.
+            - name: kvm
+              mountPath: /dev/kvm
+            - name: health
+              mountPath: /run/health
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+      volumes:
+        {{- include "space-node-service.volume.run" . | nindent 8 }}
+        {{- include "space-node-service.volume.credmgrToken" . | nindent 8 }}
+        {{- include "space-node-service.volume.cache" . | nindent 8 }}
+        - name: space-bin
+          hostPath:
+            path: /space/bin
+            type: DirectoryOrCreate
+        - name: space-etc
+          hostPath:
+            path: /space/etc
+            type: DirectoryOrCreate
+        - name: space-config
+          hostPath:
+            path: /space/config
+            type: DirectoryOrCreate
+        - name: netns
+          hostPath:
+            path: /var/run/netns
+            type: DirectoryOrCreate
+        - name: cgroup
+          hostPath:
+            path: /sys/fs/cgroup
+            type: Directory
+        # The Firecracker vendor tree, bind-mounted into the kind node from
+        # $SPACE_VENDOR_ROOT by kind-cluster.yaml.tmpl's extraMounts.
+        - name: vendor
+          hostPath:
+            path: /space/vendor
+            type: Directory
+        - name: kvm
+          hostPath:
+            path: /dev/kvm
+            type: CharDevice
+        - name: health
+          emptyDir:
+            medium: Memory
+            sizeLimit: 1Mi

@@ -8,6 +8,7 @@ use serde_json::json;
 use uuid::Uuid;
 
 use super::*;
+use pplx_space_api::controllers::substrate::kubernetes::SandboxPodView;
 
 const THRESHOLD_SECS: u64 = 600;
 
@@ -1081,7 +1082,7 @@ fn from_pod_flags_restore_pods() {
             "status": { "phase": "Pending" }
         }))
         .unwrap();
-        PodSnapshot::from_pod(&pod)
+        PodSnapshot::from_pod(&SandboxPodView::from(pod.clone()))
     };
 
     assert!(
@@ -1161,7 +1162,7 @@ fn from_pod_extracts_stuck_container_creating() {
     }))
     .unwrap();
 
-    let snapshot = PodSnapshot::from_pod(&pod);
+    let snapshot = PodSnapshot::from_pod(&SandboxPodView::from(pod.clone()));
     assert_eq!(snapshot.pod_name, "space-sbx-abc-g1");
     assert_eq!(
         snapshot.pod_uid.as_ref().map(PodUid::as_str),
@@ -1204,7 +1205,7 @@ fn from_pod_detects_container_creating_on_init_container() {
     }))
     .unwrap();
 
-    let snapshot = PodSnapshot::from_pod(&pod);
+    let snapshot = PodSnapshot::from_pod(&SandboxPodView::from(pod.clone()));
     assert!(snapshot.has_container_creating);
     assert!(!snapshot.any_container_running);
     assert!(is_stuck_shaped(&snapshot));
@@ -1235,7 +1236,7 @@ fn from_pod_running_init_container_is_progressing() {
     }))
     .unwrap();
 
-    let snapshot = PodSnapshot::from_pod(&pod);
+    let snapshot = PodSnapshot::from_pod(&SandboxPodView::from(pod.clone()));
     assert!(snapshot.any_container_running);
     assert!(!is_stuck_shaped(&snapshot));
 }
@@ -1263,7 +1264,7 @@ fn from_pod_marks_running_container_as_progressing() {
     }))
     .unwrap();
 
-    let snapshot = PodSnapshot::from_pod(&pod);
+    let snapshot = PodSnapshot::from_pod(&SandboxPodView::from(pod.clone()));
     assert!(snapshot.any_container_running);
     assert!(!snapshot.has_container_creating);
     assert!(!is_stuck_shaped(&snapshot));
@@ -1286,7 +1287,7 @@ fn from_pod_reads_sandbox_id_from_annotation_when_label_absent() {
     }))
     .unwrap();
 
-    let snapshot = PodSnapshot::from_pod(&pod);
+    let snapshot = PodSnapshot::from_pod(&SandboxPodView::from(pod.clone()));
     assert_eq!(snapshot.sandbox_id, Some(sandbox_id));
 }
 
@@ -1303,7 +1304,7 @@ fn from_pod_detects_terminating_and_missing_labels() {
     }))
     .unwrap();
 
-    let snapshot = PodSnapshot::from_pod(&pod);
+    let snapshot = PodSnapshot::from_pod(&SandboxPodView::from(pod.clone()));
     assert!(snapshot.terminating);
     assert_eq!(snapshot.sandbox_id, None);
     assert_eq!(snapshot.node_name, None);

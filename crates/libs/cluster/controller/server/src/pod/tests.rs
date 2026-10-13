@@ -386,7 +386,7 @@ fn ready_pod_metadata_requires_running_pod_with_network() {
         }),
     };
 
-    let metadata = ready_pod_metadata(&pod).unwrap();
+    let metadata = ready_pod_metadata(&SandboxPodView::from(pod.clone())).unwrap();
 
     assert_eq!(
         metadata,
@@ -398,16 +398,16 @@ fn ready_pod_metadata_requires_running_pod_with_network() {
     );
 
     pod.status.as_mut().unwrap().phase = Some("Pending".to_string());
-    assert_eq!(ready_pod_metadata(&pod), None);
+    assert_eq!(ready_pod_metadata(&SandboxPodView::from(pod.clone())), None);
 
     pod.status.as_mut().unwrap().phase = Some("Running".to_string());
     pod.status.as_mut().unwrap().conditions = Some(vec![ready_condition("False")]);
-    assert_eq!(ready_pod_metadata(&pod), None);
+    assert_eq!(ready_pod_metadata(&SandboxPodView::from(pod.clone())), None);
 
     pod.status.as_mut().unwrap().conditions = Some(vec![ready_condition("True")]);
     pod.metadata.deletion_timestamp =
         Some(serde_json::from_str("\"2026-05-28T00:00:00Z\"").unwrap());
-    assert_eq!(ready_pod_metadata(&pod), None);
+    assert_eq!(ready_pod_metadata(&SandboxPodView::from(pod.clone())), None);
 }
 
 fn ready_condition(status: &str) -> PodCondition {

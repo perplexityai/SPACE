@@ -89,6 +89,7 @@ members = [
     "crates/libs/db-test-fixtures",
     "crates/libs/db/migrator",
     "crates/libs/aws/client",
+    "crates/libs/aws/s3-http-client",
     "crates/libs/feature-flags",
     "crates/libs/events",
     "crates/libs/metrics",
@@ -109,6 +110,7 @@ members = [
     "crates/apps/vol/mgr/svc",
     "crates/libs/vol/mgr/client",
     "crates/libs/vol/mgr/server",
+    "crates/tools/archcheck",
 ]
 
 [workspace.package]
@@ -145,6 +147,7 @@ aws-sdk-s3 = { version = "1", default-features = false }
 aws-sdk-secretsmanager = { version = "1", default-features = false }
 aws-sigv4 = { version = "1", default-features = false }
 aws-smithy-async = "1"
+aws-smithy-http-client = { version = "1", default-features = false }
 aws-smithy-runtime-api = "1"
 # aws-config 1.12 still uses aws-smithy-json 0.63, which does not compile with
 # aws-smithy-types 1.7. Keep the AWS SDK graph on its latest coherent line.
@@ -275,6 +278,7 @@ zstd = { version = "0.14", features = ["zstdmt"] }
 # internal
 pplx-space-api = { path = "crates/libs/api" }
 pplx-space-aws-client = { path = "crates/libs/aws/client" }
+pplx-space-s3-http-client = { path = "crates/libs/aws/s3-http-client" }
 pplx-space-build-mgr = { path = "crates/libs/build/mgr" }
 pplx-space-build-mgr-client = { path = "crates/libs/build/mgr/client" }
 pplx-space-build-mgr-server = { path = "crates/libs/build/mgr/server" }

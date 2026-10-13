@@ -38,6 +38,7 @@ spec:
       containers:
         - name: loki
           image: {{ .Values.images.loki | quote }}
+          imagePullPolicy: IfNotPresent
           securityContext:
 {{ include "common.containerSecurityContext" . | indent 12 }}
           args: [-config.file=/etc/space/loki.yaml, -target=all]

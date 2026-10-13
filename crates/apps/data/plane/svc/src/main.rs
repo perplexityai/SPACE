@@ -1,11 +1,14 @@
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::time::Duration;
 
 use clap::Parser;
 use pplx_space_data_plane_server::{
     DEFAULT_ATTACH_DEADLINE_MS, DEFAULT_BACKEND_CHANNEL_POOL_SIZE, DEFAULT_LISTEN,
     DEFAULT_MAX_ATTACHED_STREAMS, DEFAULT_MAX_ATTACHED_STREAMS_PER_ORG,
-    DEFAULT_MAX_ATTACHED_STREAMS_PER_SANDBOX, DEFAULT_REVOCATION_CHECK_INTERVAL_MS,
-    DEFAULT_ROUTE_CACHE_TTL_MS, DEFAULT_UNAUTHENTICATED_UPGRADE_CAP_PER_IP, DataPlaneConfig,
+    DEFAULT_MAX_ATTACHED_STREAMS_PER_SANDBOX, DEFAULT_MAX_CONCURRENT_UPLOADS,
+    DEFAULT_MAX_IN_FLIGHT_UPLOAD_BYTES, DEFAULT_REVOCATION_CHECK_INTERVAL_MS,
+    DEFAULT_ROUTE_CACHE_TTL_MS, DEFAULT_UNAUTHENTICATED_UPGRADE_CAP_PER_IP,
+    DEFAULT_UPLOAD_ADMISSION_WAIT, DataPlaneConfig, UploadAdmissionConfig,
 };
 
 // Same allocator choice as space-api-svc: glibc arenas keep the peak of an
@@ -81,6 +84,45 @@ struct Cli {
     /// Short-lived TTL for token-scoped route resolution cache entries.
     #[arg(long, default_value_t = DEFAULT_ROUTE_CACHE_TTL_MS)]
     route_cache_ttl_ms: u64,
+
+    /// Admit `POST /files` uploads under the per-replica concurrency and
+    /// in-flight byte budget below; rejected uploads get 429. Accepts the
+    /// usual boolean spellings (`true`/`1`/`yes`/`on` and their negations).
+    #[arg(
+        long,
+        env = "SPACE_DATA_PLANE_UPLOAD_ADMISSION",
+        action = clap::ArgAction::Set,
+        value_parser = clap::builder::BoolishValueParser::new(),
+        num_args = 0..=1,
+        default_value_t = false,
+        default_missing_value = "true"
+    )]
+    upload_admission: bool,
+
+    /// Maximum concurrent `POST /files` uploads per replica.
+    #[arg(
+        long,
+        env = "SPACE_DATA_PLANE_MAX_CONCURRENT_UPLOADS",
+        default_value_t = DEFAULT_MAX_CONCURRENT_UPLOADS
+    )]
+    max_concurrent_uploads: NonZeroUsize,
+
+    /// In-flight upload bytes per replica, reserved from `Content-Length`
+    /// (the write path's body limit when absent: 256 MiB, or 1 MiB for JSON).
+    #[arg(
+        long,
+        env = "SPACE_DATA_PLANE_MAX_IN_FLIGHT_UPLOAD_BYTES",
+        default_value_t = DEFAULT_MAX_IN_FLIGHT_UPLOAD_BYTES
+    )]
+    max_in_flight_upload_bytes: NonZeroU64,
+
+    /// How long an upload waits for admission before it's rejected.
+    #[arg(
+        long,
+        env = "SPACE_DATA_PLANE_UPLOAD_ADMISSION_WAIT_MS",
+        default_value_t = DEFAULT_UPLOAD_ADMISSION_WAIT.as_millis() as u64
+    )]
+    upload_admission_wait_ms: u64,
 }
 
 impl From<Cli> for DataPlaneConfig {
@@ -97,6 +139,11 @@ impl From<Cli> for DataPlaneConfig {
                 cli.revocation_check_interval_ms.max(1),
             ),
             route_cache_ttl: Duration::from_millis(cli.route_cache_ttl_ms.max(1)),
+            upload_admission: cli.upload_admission.then(|| UploadAdmissionConfig {
+                max_concurrent_uploads: cli.max_concurrent_uploads,
+                max_in_flight_bytes: cli.max_in_flight_upload_bytes,
+                wait: Duration::from_millis(cli.upload_admission_wait_ms),
+            }),
         }
     }
 }
@@ -111,3 +158,6 @@ async fn main() -> anyhow::Result<()> {
     pplx_space_common_svc::shutdown_telemetry(telemetry).await;
     Ok(result?)
 }
+
+#[cfg(test)]
+mod tests;

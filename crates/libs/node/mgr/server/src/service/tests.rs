@@ -265,6 +265,147 @@ pub(super) mod service_tests {
         assert_eq!(error.code(), tonic::Code::PermissionDenied);
     }
 
+    #[tokio::test]
+    async fn sandbox_manager_can_negotiate_and_inspect_send_sources_without_lease_access() {
+        let service = service_for_unit_tests().await;
+        for (user, allowed) in [
+            (users::SPACE_SBXMGR, true),
+            (users::SPACE_VOLMGR, true),
+            (users::SPACE_NODEAPI, false),
+        ] {
+            let mut request = Request::new(crate::proto::GetBtrfsSendCapabilitiesRequest {});
+            request.extensions_mut().insert(PeerIdentity::new(
+                user.uid,
+                user.primary_group.gid,
+                None,
+            ));
+            let result = service.get_btrfs_send_capabilities(request).await;
+            assert_eq!(result.is_ok(), allowed, "{}", user.name);
+        }
+        for (user, expected) in [
+            (users::SPACE_SBXMGR, tonic::Code::InvalidArgument),
+            (users::SPACE_VOLMGR, tonic::Code::PermissionDenied),
+            (users::SPACE_NODEAPI, tonic::Code::PermissionDenied),
+        ] {
+            let mut request = Request::new(crate::proto::BtrfsInspectSendSourceRequest {
+                sandbox_id: "invalid".into(),
+                artifact_dir: String::new(),
+                source_id: String::new(),
+            });
+            request.extensions_mut().insert(PeerIdentity::new(
+                user.uid,
+                user.primary_group.gid,
+                None,
+            ));
+            let error = service
+                .btrfs_inspect_send_source(request)
+                .await
+                .unwrap_err();
+            assert_eq!(error.code(), expected, "{}", user.name);
+        }
+        // Negotiation does not grant the lease operations.
+        let mut request = Request::new(crate::proto::BtrfsListSendSourcesRequest {});
+        request.extensions_mut().insert(PeerIdentity::new(
+            users::SPACE_SBXMGR.uid,
+            users::SPACE_SBXMGR.primary_group.gid,
+            None,
+        ));
+        assert_eq!(
+            service
+                .btrfs_list_send_sources(request)
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::PermissionDenied
+        );
+    }
+
+    #[tokio::test]
+    async fn send_source_inspection_has_its_own_lane() {
+        let service = service_for_unit_tests().await;
+        let id = SandboxId::new();
+        let inspect = |service: NodeManagerService| async move {
+            let mut request = Request::new(crate::proto::BtrfsInspectSendSourceRequest {
+                sandbox_id: id.to_string(),
+                artifact_dir: format!(
+                    "{}/{id}/snapshot",
+                    pplx_space_common_core::host::linux::paths::SANDBOX_CACHE_DIR
+                ),
+                source_id: uuid::Uuid::now_v7().to_string(),
+            });
+            request.extensions_mut().insert(PeerIdentity::new(
+                users::SPACE_SBXMGR.uid,
+                users::SPACE_SBXMGR.primary_group.gid,
+                None,
+            ));
+            service
+                .btrfs_inspect_send_source(request)
+                .await
+                .unwrap_err()
+                .code()
+        };
+        // A saturated diagnostic lane does not block inspection.
+        let probes = service
+            .blocking_probe_slots
+            .clone()
+            .try_acquire_many_owned(MAX_BLOCKING_PROBES as u32)
+            .unwrap();
+        assert_ne!(
+            inspect(service.clone()).await,
+            tonic::Code::ResourceExhausted
+        );
+        drop(probes);
+        // Stuck inspections exhaust only their own lane.
+        let inspections = service
+            .send_source_inspection_slots
+            .clone()
+            .try_acquire_many_owned(MAX_SEND_SOURCE_INSPECTIONS as u32)
+            .unwrap();
+        assert_eq!(
+            inspect(service.clone()).await,
+            tonic::Code::ResourceExhausted
+        );
+        assert_eq!(
+            service.blocking_probe_slots.available_permits(),
+            MAX_BLOCKING_PROBES
+        );
+        drop(inspections);
+    }
+
+    #[tokio::test]
+    async fn volume_manager_can_read_send_sources_without_general_node_authority() {
+        let service = service_for_unit_tests().await;
+        for (user, expected) in [
+            (users::SPACE_VOLMGR, tonic::Code::InvalidArgument),
+            (users::SPACE_SBXMGR, tonic::Code::PermissionDenied),
+            (users::SPACE_NODEAPI, tonic::Code::PermissionDenied),
+        ] {
+            let mut request = Request::new(crate::proto::BtrfsSendLease {
+                lease_id: "invalid".into(),
+            });
+            request.extensions_mut().insert(PeerIdentity::new(
+                user.uid,
+                user.primary_group.gid,
+                None,
+            ));
+            let error = service
+                .btrfs_read_send_source(request)
+                .await
+                .map(|_| ())
+                .unwrap_err();
+            assert_eq!(error.code(), expected, "{}", user.name);
+        }
+        let peer = PeerIdentity::new(
+            users::SPACE_VOLMGR.uid,
+            users::SPACE_VOLMGR.primary_group.gid,
+            None,
+        );
+        let error = node_peer_authorizer()
+            .authorize_identity(peer, "SetNetworkPoolDrain", ALLOW_NODE_ADMIN)
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::PermissionDenied);
+    }
+
     #[test]
     fn node_ctl_can_manage_per_sandbox_port_rpcs() {
         // SPACE_NODECTL is permitted to call the per-sandbox port RPCs
@@ -336,58 +477,11 @@ pub(super) mod service_tests {
         let cgroup_base = root.path().join("cgroups");
         std::fs::create_dir(&cgroup_base).unwrap();
 
-        let pool = NetworkPool::open_in_memory_for_test(NetworkPoolConfig::new(2));
-        pool.set_all_slots_ready_for_test();
-        let service = NodeManagerService {
-            pool,
-            peer_authorizer: node_peer_authorizer(),
-            sandbox_cgroup_config: SandboxCgroupConfig::default(),
-            memory_admission_config: MemoryAdmissionConfig { reserve_mib: 1024 },
-            memory_admission_sources: MemoryAdmissionSources::new(meminfo_path, cgroup_base),
-            memory_admission_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
-            sandbox_cgroup_gate_locks: std::sync::Arc::new(tokio::sync::Mutex::new(
-                std::collections::HashMap::new(),
-            )),
-            sandbox_vm_cgroup_locks: std::sync::Arc::new(tokio::sync::Mutex::new(
-                std::collections::HashMap::new(),
-            )),
-            sandbox_sidecar_cgroup_locks: std::sync::Arc::new(tokio::sync::Mutex::new(
-                std::collections::HashMap::new(),
-            )),
-            sandbox_device_stack_locks: std::sync::Arc::new(tokio::sync::Mutex::new(
-                std::collections::HashMap::new(),
-            )),
-            sandbox_artifact_locks: Default::default(),
-            artifact_work: None,
-            device_op_tasks: tokio_util::task::TaskTracker::new(),
-            blocking_probe_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(
-                MAX_BLOCKING_PROBES,
-            )),
-            runtime_supervisor: crate::runtime_supervisor_client::RuntimeSupervisorLazyClient::new(
-            ),
-            runtime_inventory: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
-            runtime_inventory_refresh_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
-            runtime_paths: crate::config::RuntimePaths::default(),
-            guest_console_logs: false,
-            lifecycle_limiter: std::sync::Arc::new(
-                crate::lifecycle_limiter::LifecycleLimiter::from_env(),
-            ),
-            disk_admission: std::sync::Arc::new(
-                crate::disk_admission::DiskAdmission::new(
-                    pplx_space_common_core::host::disk_admission::CacheDiskAdmissionConfig {
-                        enabled: false,
-                        ..Default::default()
-                    },
-                )
-                .await,
-            ),
-            prepared_rootfs_reservations:
-                super::prepared_rootfs::PreparedRootfsReservations::default(),
-            disk_usage_cache: node_disk_metrics::SandboxDiskUsageCache::default(),
-            cleanup_operations: CleanupOperationRegistry::default(),
-            orphan_inventory: orphan_inventory::OrphanInventory::default(),
-            snapshot_inventory: snapshot_inventory::SnapshotInventory::default(),
-        };
+        let mut service = service_for_unit_tests().await;
+        service.pool = NetworkPool::open_in_memory_for_test(NetworkPoolConfig::new(2));
+        service.pool.set_all_slots_ready_for_test();
+        service.memory_admission_config = MemoryAdmissionConfig { reserve_mib: 1024 };
+        service.memory_admission_sources = MemoryAdmissionSources::new(meminfo_path, cgroup_base);
         let first_id = SandboxId::from_str("019d84bd-280d-7331-99c6-b63377f3a3a2").unwrap();
         let second_id = SandboxId::from_str("019d84bd-280d-7331-99c6-b63377f3b4b5").unwrap();
 
@@ -428,13 +522,125 @@ pub(super) mod service_tests {
         fence.into()
     }
 
+    /// An execution fence no sandbox is bound to.
+    pub(in crate::service) fn stale_test_fence() -> crate::proto::ExecutionFence {
+        pplx_space_node_mgr_client::execution_fence::ExecutionFence::new(
+            pplx_space_common_core::types::SandboxActivationAttemptId::new(),
+            None,
+        )
+        .into()
+    }
+
+    /// Claims a pooled lease without memory admission.
+    pub(in crate::service) fn allocate_test_lease(
+        service: &NodeManagerService,
+        sandbox_id: &str,
+    ) -> crate::net::SlotInfo {
+        service.pool.set_all_slots_ready_for_test();
+        match service
+            .pool
+            .claim_allocation(
+                sandbox_id,
+                None,
+                Some(crate::slot_pool::NewLeaseMemoryReservation {
+                    memory_reservation_mib: 8320,
+                }),
+            )
+            .unwrap()
+        {
+            crate::slot_pool::ClaimedSlotAllocation::Complete(lease) => lease,
+            crate::slot_pool::ClaimedSlotAllocation::Ephemeral(_) => {
+                panic!("a ready pooled slot completes its claim synchronously")
+            }
+        }
+    }
+
+    /// Root is authorized for every node-manager RPC without depending on the
+    /// authorizer's service-account lookups.
+    pub(in crate::service) fn root_request<T>(message: T) -> Request<T> {
+        let mut request = Request::new(message);
+        request
+            .extensions_mut()
+            .insert(PeerIdentity::new(0, 0, None));
+        request
+    }
+
+    /// How a table row's outcome differs from the expected refusal. Tables
+    /// collect every row's mismatch, so one regression reports each row it
+    /// opens rather than stopping at the first.
+    pub(in crate::service) fn refusal_mismatch<T>(
+        case: &str,
+        outcome: Result<T, Status>,
+        code: tonic::Code,
+        message: &str,
+    ) -> Option<String> {
+        match outcome {
+            Ok(_) => Some(format!("{case}: accepted")),
+            Err(error) if error.code() == code && error.message().contains(message) => None,
+            Err(error) => Some(format!("{case}: {error}")),
+        }
+    }
+
+    /// Makes every blocking host section of `service` refuse before it runs.
+    /// `off_runtime` checks the artifact-work owner first, and this owner's
+    /// cancellation fires when `run_artifact_mutation` returns. A request that
+    /// passes validation therefore stops with `Cancelled` at its first jail,
+    /// cache or run-directory step, whatever the test's privileges. The probe
+    /// section proves the refusal comes before the section: `off_runtime`
+    /// checks the owner again afterwards with the same `Cancelled`, so the
+    /// outcome alone cannot show that a host step never ran.
+    pub(in crate::service) async fn refuse_host_work(service: &mut NodeManagerService) {
+        let owner = service
+            .run_artifact_mutation(&SandboxId::new().to_string(), |service| async move {
+                Ok(service.artifact_work.clone().expect("artifact work owner"))
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            owner.check().unwrap_err().code(),
+            tonic::Code::Cancelled,
+            "the owner must already refuse"
+        );
+        service.artifact_work = Some(owner);
+
+        let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let section_ran = std::sync::Arc::clone(&ran);
+        let outcome = service
+            .off_runtime("refuse_host_work probe", move || {
+                section_ran.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            })
+            .await;
+        assert_eq!(
+            outcome.unwrap_err().code(),
+            tonic::Code::Cancelled,
+            "a host section must refuse"
+        );
+        assert!(
+            !ran.load(std::sync::atomic::Ordering::SeqCst),
+            "a refused host section must not run"
+        );
+    }
+
+    /// A node manager whose process-boundary dependencies belong to the test
+    /// and refuse until it installs its own. Runtime discovery and memory
+    /// admission read paths under a vacant temporary directory, so both fail
+    /// closed instead of reading the node's installation, `/proc/meminfo` or
+    /// its cgroups. Every runtime-supervisor RPC fails with `Unimplemented`
+    /// without contacting a supervisor. The pool records its node-status marks
+    /// instead of notifying node-ctl. Lifecycle limits are the compiled-in
+    /// ones, whatever `SPACE_NODEMGR_LIMIT_*` the runner sets.
     pub(in crate::service) async fn service_for_unit_tests() -> NodeManagerService {
+        let vacant = vacant_test_root();
         NodeManagerService {
             pool: NetworkPool::open_in_memory_for_test(NetworkPoolConfig::new(1)),
             peer_authorizer: node_peer_authorizer(),
             sandbox_cgroup_config: SandboxCgroupConfig::default(),
             memory_admission_config: MemoryAdmissionConfig::default(),
-            memory_admission_sources: MemoryAdmissionSources::default(),
+            memory_admission_sources: MemoryAdmissionSources::new(
+                vacant.join("meminfo"),
+                vacant.join("firecracker-cgroups"),
+            ),
             memory_admission_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
             sandbox_cgroup_gate_locks: std::sync::Arc::new(tokio::sync::Mutex::new(
                 std::collections::HashMap::new(),
@@ -449,19 +655,37 @@ pub(super) mod service_tests {
                 std::collections::HashMap::new(),
             )),
             sandbox_artifact_locks: Default::default(),
+            send_source_locks: Default::default(),
+            send_source_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(4)),
             artifact_work: None,
             device_op_tasks: tokio_util::task::TaskTracker::new(),
             blocking_probe_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(
                 MAX_BLOCKING_PROBES,
             )),
-            runtime_supervisor: crate::runtime_supervisor_client::RuntimeSupervisorLazyClient::new(
-            ),
+            send_source_inspection_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                MAX_SEND_SOURCE_INSPECTIONS,
+            )),
+            cache_artifact_delete_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                MAX_CACHE_ARTIFACT_DELETES,
+            )),
+            runtime_supervisor: crate::runtime_supervisor_client::tests::refusing_client(),
             runtime_inventory: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
+            artifact_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
             runtime_inventory_refresh_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
-            runtime_paths: crate::config::RuntimePaths::default(),
+            runtime_paths: crate::config::RuntimePaths {
+                vendor: vacant.join("vendor"),
+                assets: vacant.join("assets"),
+                kernels: vacant.join("kernels"),
+                store: crate::config::ArtifactStorePaths {
+                    releases: vacant.join("store/releases"),
+                    kernels: vacant.join("store/kernels"),
+                    staging: vacant.join("staging"),
+                    catalog: vacant.join("catalog"),
+                },
+            },
             guest_console_logs: false,
             lifecycle_limiter: std::sync::Arc::new(
-                crate::lifecycle_limiter::LifecycleLimiter::from_env(),
+                crate::lifecycle_limiter::tests::default_limiter(),
             ),
             disk_admission: std::sync::Arc::new(
                 crate::disk_admission::DiskAdmission::new(
@@ -479,6 +703,59 @@ pub(super) mod service_tests {
             orphan_inventory: orphan_inventory::OrphanInventory::default(),
             snapshot_inventory: snapshot_inventory::SnapshotInventory::default(),
         }
+    }
+
+    /// A unique path under the system temporary directory that names nothing:
+    /// the directory is created only to reserve its name, then removed.
+    fn vacant_test_root() -> std::path::PathBuf {
+        let root = tempfile::Builder::new()
+            .prefix("space-node-mgr-unit-")
+            .tempdir()
+            .unwrap();
+        let path = root.path().to_path_buf();
+        root.close().unwrap();
+        path
+    }
+
+    /// A Firecracker installation and guest kernel under temporary roots, so
+    /// runtime discovery never reads the node's fixed installation paths.
+    pub(in crate::service) fn installed_runtime() -> (tempfile::TempDir, crate::config::RuntimePaths)
+    {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let root = tempfile::tempdir().unwrap();
+        let vendor = root.path().join("vendor");
+        let assets = root.path().join("assets");
+        let kernels = root.path().join("kernels");
+        let bin = vendor.join("v1.16.0/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        for name in ["firecracker", "jailer"] {
+            let path = bin.join(name);
+            std::fs::write(&path, "#!/bin/sh\nexit 42\n").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        symlink("v1.16.0", vendor.join("default")).unwrap();
+        std::fs::create_dir_all(kernels.join("vmlinux-6.1.158")).unwrap();
+        std::fs::write(kernels.join("vmlinux-6.1.158/vmlinux.bin"), b"kernel").unwrap();
+        for marker in ["default", "legacy-default"] {
+            symlink("vmlinux-6.1.158", kernels.join(marker)).unwrap();
+        }
+        std::fs::create_dir(&assets).unwrap();
+        let store = crate::config::ArtifactStorePaths {
+            releases: root.path().join("store/releases"),
+            kernels: root.path().join("store/kernels"),
+            staging: root.path().join("staging"),
+            catalog: root.path().join("catalog"),
+        };
+        (
+            root,
+            crate::config::RuntimePaths {
+                vendor,
+                assets,
+                kernels,
+                store,
+            },
+        )
     }
 
     #[tokio::test]
@@ -881,7 +1158,9 @@ pub(super) mod service_tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn cancelled_probe_retains_capacity_until_blocking_work_finishes() {
+        let (_runtime, runtime_paths) = installed_runtime();
         let mut service = service_for_unit_tests().await;
+        service.runtime_paths = runtime_paths;
         service.blocking_probe_slots = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
         let (started, running) = tokio::sync::oneshot::channel();
         let (finish, release) = std::sync::mpsc::channel();
@@ -906,7 +1185,6 @@ pub(super) mod service_tests {
             .unwrap_err();
         assert_eq!(error.code(), tonic::Code::ResourceExhausted);
         // Prepare and Launch need cold discovery even while diagnostics are full.
-        // Missing host assets may fail discovery, but diagnostic admission must not.
         let inventory = service.runtime_inventory().await;
         service.device_op_tasks.close();
         assert!(!service.device_op_tasks.is_empty());
@@ -915,9 +1193,7 @@ pub(super) mod service_tests {
             .await
             .unwrap();
         service.off_runtime_probe("retry", || Ok(())).await.unwrap();
-        if let Err(error) = inventory {
-            assert_ne!(error.code(), tonic::Code::ResourceExhausted);
-        }
+        inventory.expect("saturated diagnostics must not refuse cold runtime discovery");
     }
 
     #[tokio::test(flavor = "current_thread")]

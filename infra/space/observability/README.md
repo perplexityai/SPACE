@@ -201,17 +201,17 @@ Set these for the target cluster, after verifying each on a real node:
   `namespace` label.
 - `collection.excludedPodSources`: literal namespace, pod-name prefix, and
   container identities removed from every matched file target before tailing.
-  The default excludes `node-stack` in `space-builder-node-stack-*` pods in
-  namespace `space`, including rotated log filenames and recreated pod UIDs.
+  The default excludes `build-manager` in `space-builder-build-manager-*` pods
+  in namespace `space`, including rotated log filenames and recreated pod UIDs.
   For a builder release named `build-farm` in `builds`, set
-  `{namespace: builds, podNamePrefix: build-farm-node-stack-, container: node-stack}`.
+  `{namespace: builds, podNamePrefix: build-farm-build-manager-, container: build-manager}`.
   Lists replace defaults: include every builder release, including old names
-  whose files remain on nodes after a rename. Worker containers and the
-  builder's `format-cache-image` init container remain eligible.
+  whose files remain on nodes after a rename. Worker containers remain
+  eligible.
   Alloy reads no Kubernetes metadata and does not honor Datadog exclusion
   annotations. Audit source eligibility before deployment: shared deployments
-  with separate builder-service pods need their actual pod/container identities,
-  not the local node-stack example. This is source exclusion, not message
+  with differently named builder-service pods need their actual pod/container
+  identities, not the local Kind example. This is source exclusion, not message
   redaction; other collected sources must also be safe to retain.
   Updating exclusions does not remove records already stored in Loki.
 - `collection.journal.path`: Kind keeps a **volatile** journal at

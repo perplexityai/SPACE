@@ -26,7 +26,9 @@ use aws_sdk_s3::Client;
 use aws_sdk_s3::config::Region;
 use aws_sdk_s3::types::{Delete, ObjectIdentifier};
 use aws_smithy_types::error::display::DisplayErrorContext;
+use aws_types::SdkConfig;
 use pplx_space_common_core::types::StorageUri;
+use pplx_space_s3_http_client::{DEFAULT_POOL_IDLE_TIMEOUT, s3_http_client};
 
 use super::{DeletePrefixError, DeletePrefixOutcome, StorageBackend};
 
@@ -90,6 +92,16 @@ pub struct S3StorageBackend {
 impl S3StorageBackend {
     pub fn new(client: Arc<dyn S3Client>) -> Self {
         Self { client }
+    }
+
+    /// Backend on an SDK client built from `sdk_config` with the shared S3
+    /// HTTP client, whose pool drops idle connections before S3 closes them.
+    /// Per-request overrides keep the base client's HTTP client.
+    pub fn from_sdk_config(sdk_config: &SdkConfig) -> Self {
+        let config = aws_sdk_s3::config::Builder::from(sdk_config)
+            .http_client(s3_http_client(DEFAULT_POOL_IDLE_TIMEOUT))
+            .build();
+        Self::new(Arc::new(Client::from_conf(config)))
     }
 }
 

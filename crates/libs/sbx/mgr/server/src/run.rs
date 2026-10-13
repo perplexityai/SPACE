@@ -779,12 +779,9 @@ pub async fn run(
             .map_err(RunSbxMgrError::RouteVerificationBundle)?,
     ));
 
-    let health_server = start_takeover_health(
-        &config,
-        &shutdown_token,
-        pplx_space_node_mgr_client::connect_once,
-    )
-    .await?;
+    let node_manager = crate::node_manager_transport::NodeManagerConnector::host();
+    let health_server =
+        start_takeover_health(&config, &shutdown_token, || node_manager.connect_once()).await?;
     let health_socket = config
         .health_socket_path
         .as_ref()
@@ -851,6 +848,7 @@ pub async fn run(
             node_role,
             node_managed_by,
             route_ed25519_verification_bundle,
+            node_manager: node_manager.clone(),
             ..Default::default()
         },
         service_config,
@@ -864,23 +862,20 @@ pub async fn run(
         )
         .map_err(RunSbxMgrError::EnableDependencyRestartDrain)
         .inspect_err(report_active_failure)?;
-    let startup_recovery_lease = match admit_startup_recovery(
-        &service,
-        &shutdown_token,
-        pplx_space_node_mgr_client::connect_once,
-    )
-    .await
-    .inspect_err(report_active_failure)?
-    {
-        Some(lease) => lease,
-        None => {
-            tracing::warn!("terminated while waiting for startup recovery");
-            health_server.join().await;
-            active_ownership.exit_without_quiescence(
-                "sandbox-manager cancelled after construction without a drain proof",
-            );
-        }
-    };
+    let startup_recovery_lease =
+        match admit_startup_recovery(&service, &shutdown_token, || node_manager.connect_once())
+            .await
+            .inspect_err(report_active_failure)?
+        {
+            Some(lease) => lease,
+            None => {
+                tracing::warn!("terminated while waiting for startup recovery");
+                health_server.join().await;
+                active_ownership.exit_without_quiescence(
+                    "sandbox-manager cancelled after construction without a drain proof",
+                );
+            }
+        };
     service
         .prepare_execution_authority()
         .await
@@ -983,6 +978,19 @@ pub async fn run(
         );
     }
     snapshot_upload_worker.recover_and_log("sandbox-mgr.snapshot_upload");
+    // Best effort: a hold that is not re-armed stays stopped, which is the state
+    // it was already in, and the next start tries again.
+    match service.rearm_stopped_quarantine_recoveries() {
+        Ok(0) => {}
+        Ok(rearmed) => tracing::info!(
+            rearmed,
+            "re-armed stopped quarantine recoveries; each stops again at its next plan rejection"
+        ),
+        Err(error) => tracing::warn!(
+            %error,
+            "failed to re-arm stopped quarantine recoveries; they stay stopped"
+        ),
+    }
     drop(startup_recovery_lease);
 
     service.start_auto_lifecycle_scheduler(shutdown_token.child_token(), &task_tracker);

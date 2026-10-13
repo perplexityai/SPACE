@@ -1591,7 +1591,8 @@ async fn evict_tick(
                     pplx_space_events::SandboxEventType::LocalEvictionFailed,
                     pplx_space_events::SandboxEventDetails::default()
                         .reason(reason.as_str())
-                        .error(status.message().to_string()),
+                        .error(status.message().to_string())
+                        .logged_by_caller(),
                 );
             }
         }

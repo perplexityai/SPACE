@@ -1,3 +1,5 @@
+mod catalog;
+
 use super::*;
 use pplx_space_node_api_client::proto::{FindTemplateReleaseResponse, TemplateRelease};
 
@@ -38,7 +40,7 @@ fn scoped_release_response_must_acknowledge_the_org_and_exact_release(
         response: valid,
     } = authorized_release_fixture;
     assert_eq!(
-        parse_release_response("base", &hash, Some(org), valid.clone())
+        parse_release_response("base", &hash, Some(org), false, valid.clone())
             .unwrap()
             .hash,
         hash
@@ -46,10 +48,21 @@ fn scoped_release_response_must_acknowledge_the_org_and_exact_release(
     let mut legacy_response = valid.clone();
     legacy_response.authorized_org_id = None;
     for requested_hash in ["", hash.as_str()] {
-        let release = parse_release_response("base", requested_hash, None, legacy_response.clone())
-            .expect("unscoped callers accept releases from an older ClusterApi");
+        let release =
+            parse_release_response("base", requested_hash, None, false, legacy_response.clone())
+                .expect("unscoped callers accept releases from an older ClusterApi");
         assert_eq!(release.hash, hash);
     }
+
+    let mut generic = legacy_response.clone();
+    generic.template_visibility = TemplateVisibility::Generic.into();
+    assert!(matches!(
+        parse_release_response("base", &hash, None, true, generic.clone()),
+        Err(FindReleaseError::InvalidResponse)
+    ));
+    generic.generic_authorized = true;
+    parse_release_response("base", &hash, None, true, generic)
+        .expect("generic-only catalog acknowledgement permits prefetch");
 
     for mutation in 0..6 {
         let mut response = valid.clone();
@@ -63,29 +76,12 @@ fn scoped_release_response_must_acknowledge_the_org_and_exact_release(
             _ => unreachable!(),
         }
         assert!(matches!(
-            parse_release_response("base", &hash, Some(org), response),
+            parse_release_response("base", &hash, Some(org), false, response),
             Err(FindReleaseError::InvalidResponse)
         ));
     }
 }
 use pplx_space_common_core::types::TEMPLATE_ROOTFS_ZSTD_FILE;
-
-#[test]
-fn visibility_enforcement_requires_an_explicit_opt_in_value() {
-    for value in [
-        None,
-        Some(""),
-        Some("0"),
-        Some("false"),
-        Some("False"),
-        Some("yes"),
-    ] {
-        assert!(!visibility_enforcement_value_enabled(value), "{value:?}");
-    }
-    for value in [Some("1"), Some("true"), Some("TRUE")] {
-        assert!(visibility_enforcement_value_enabled(value), "{value:?}");
-    }
-}
 
 #[test]
 fn volmgr_admission_rejection_is_retryable() {

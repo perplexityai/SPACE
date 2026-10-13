@@ -47,15 +47,17 @@ use crate::proto::{
     PrepareEncryptedRootfsRequest, PrepareEncryptedRootfsResponse, PrepareEncryptedVolumeRequest,
     PrepareEncryptedVolumeResponse, PrepareSandboxArtifactDirRequest,
     PrepareSandboxArtifactDirResponse, PrepareSandboxRequest, PrepareSandboxResponse,
-    PrepareSnapshotRootfsRequest, PrepareSnapshotRootfsResponse, ReleaseEncryptedVolumeRequest,
-    ReleaseEncryptedVolumeResponse, ReleaseRequest, ReleaseResponse, RepairNetworkPoolRequest,
-    RepairNetworkPoolResponse, ReservePreparedRootfsRequest, ReservePreparedRootfsResponse,
-    ResumeSandboxRequest, ResumeSandboxResponse, RollbackBtrfsSnapshotRequest,
-    RollbackBtrfsSnapshotResponse, SandboxEndpointProof, SetNetworkPoolConfigRequest,
-    SetNetworkPoolConfigResponse, SetNetworkPoolDrainRequest, SetNetworkPoolDrainResponse,
-    StopProcessRequest, StopProcessResponse, SyncGuestRequest, SyncGuestResponse,
-    UnexposePortRequest, UnexposePortResponse, UpdateCgroupRequest, UpdateCgroupResponse,
-    ValidateSandboxEndpointProofRequest, ValidateSandboxEndpointProofResponse,
+    PrepareSnapshotRootfsRequest, PrepareSnapshotRootfsResponse, PublishArtifactRequest,
+    PublishArtifactResponse, ReleaseEncryptedVolumeRequest, ReleaseEncryptedVolumeResponse,
+    ReleaseRequest, ReleaseResponse, RemoveArtifactRequest, RemoveArtifactResponse,
+    RepairNetworkPoolRequest, RepairNetworkPoolResponse, ReservePreparedRootfsRequest,
+    ReservePreparedRootfsResponse, ResumeSandboxRequest, ResumeSandboxResponse,
+    RollbackBtrfsSnapshotRequest, RollbackBtrfsSnapshotResponse, SandboxEndpointProof,
+    SetNetworkPoolConfigRequest, SetNetworkPoolConfigResponse, SetNetworkPoolDrainRequest,
+    SetNetworkPoolDrainResponse, StopProcessRequest, StopProcessResponse, SyncGuestRequest,
+    SyncGuestResponse, UnexposePortRequest, UnexposePortResponse, UpdateCgroupRequest,
+    UpdateCgroupResponse, ValidateSandboxEndpointProofRequest,
+    ValidateSandboxEndpointProofResponse,
 };
 use crate::slot_pool::{
     ActiveLeaseMemoryReservationError, AllocateSlotError, NETWORK_POOL_SCHEMA_VERSION, NetworkPool,
@@ -163,6 +165,14 @@ const RESERVED_EXPOSE_PORTS: &[(u16, &str)] = &[
 ];
 
 const MAX_BLOCKING_PROBES: usize = 4;
+/// Retained-source inspections keep their slot until a stuck filesystem call
+/// returns, even after the caller's deadline. A separate pool keeps them from
+/// exhausting the diagnostic lane that orphan evidence and size probes use.
+const MAX_SEND_SOURCE_INSPECTIONS: usize = 4;
+/// Concurrent cache artifact deletions. Deletion runs as blocking filesystem
+/// work that outlives a cancelled caller, so the bound belongs here, held by
+/// the closure that does the work, not with any one caller's admission.
+const MAX_CACHE_ARTIFACT_DELETES: usize = 4;
 
 #[derive(Clone)]
 pub struct NodeManagerService {
@@ -177,10 +187,18 @@ pub struct NodeManagerService {
     sandbox_sidecar_cgroup_locks: SandboxCgroupFamilyLocks,
     sandbox_device_stack_locks: SandboxCgroupFamilyLocks,
     sandbox_artifact_locks: SandboxCgroupFamilyLocks,
+    send_source_locks: SandboxCgroupFamilyLocks,
+    send_source_slots: std::sync::Arc<tokio::sync::Semaphore>,
     artifact_work: Option<std::sync::Arc<filesystem_work::ArtifactWork>>,
     /// Shared drain ownership for detached mutations and lifecycle permits.
     device_op_tasks: tokio_util::task::TaskTracker,
     blocking_probe_slots: std::sync::Arc<tokio::sync::Semaphore>,
+    send_source_inspection_slots: std::sync::Arc<tokio::sync::Semaphore>,
+    cache_artifact_delete_slots: std::sync::Arc<tokio::sync::Semaphore>,
+    /// One artifact-store change at a time takes a blocking thread; the
+    /// store's own lock would otherwise leave queued calls holding threads
+    /// the rest of node-manager needs.
+    artifact_slots: std::sync::Arc<tokio::sync::Semaphore>,
     runtime_supervisor: crate::runtime_supervisor_client::RuntimeSupervisorLazyClient,
     runtime_inventory: std::sync::Arc<ArcSwapOption<RuntimeInventory>>,
     runtime_inventory_refresh_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
@@ -290,13 +308,28 @@ impl NodeManagerService {
         settings: crate::config::ServiceSettings,
         task_tracker: tokio_util::task::TaskTracker,
         shutdown_token: tokio_util::sync::CancellationToken,
+        startup_ownership: std::sync::Arc<pplx_space_common_svc::service_mutex::ServiceMutex>,
     ) -> Result<Self, crate::slot_pool::PoolOpenError> {
-        let pool = NetworkPool::open(
-            config,
-            sandbox_cgroup_config.memory_mib_or_default(),
-            task_tracker.clone(),
-            shutdown_token,
-        )?;
+        let pool_tracker = task_tracker.clone();
+        let memory_mib = sandbox_cgroup_config.memory_mib_or_default();
+        let span = tracing::Span::current();
+        let node_status_dirty = settings.node_status_dirty;
+        // Startup host commands must not stall liveness. Track and await the
+        // whole pass; shutdown cannot abandon namespace mutations under ownership.
+        let pool = task_tracker
+            .spawn_blocking(move || {
+                let _ownership = startup_ownership;
+                let _entered = span.enter();
+                NetworkPool::open(
+                    config,
+                    memory_mib,
+                    pool_tracker,
+                    shutdown_token,
+                    node_status_dirty,
+                )
+            })
+            .await
+            .map_err(crate::slot_pool::PoolOpenError::StartupTask)??;
         let disk_admission = std::sync::Arc::new(DiskAdmission::new(settings.disk_admission).await);
         let prepared_rootfs_reservations = prepared_rootfs::PreparedRootfsReservations::recover(
             &disk_admission,
@@ -308,7 +341,7 @@ impl NodeManagerService {
             peer_authorizer: node_peer_authorizer(),
             sandbox_cgroup_config,
             memory_admission_config,
-            memory_admission_sources: MemoryAdmissionSources::default(),
+            memory_admission_sources: settings.memory_admission_sources,
             memory_admission_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
             sandbox_cgroup_gate_locks: std::sync::Arc::new(tokio::sync::Mutex::new(
                 std::collections::HashMap::new(),
@@ -324,13 +357,21 @@ impl NodeManagerService {
             )),
             device_op_tasks: task_tracker.clone(),
             sandbox_artifact_locks: Default::default(),
+            send_source_locks: Default::default(),
+            send_source_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(4)),
             artifact_work: None,
             blocking_probe_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(
                 MAX_BLOCKING_PROBES,
             )),
-            runtime_supervisor: crate::runtime_supervisor_client::RuntimeSupervisorLazyClient::new(
-            ),
-            runtime_inventory: std::sync::Arc::new(ArcSwapOption::empty()),
+            send_source_inspection_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                MAX_SEND_SOURCE_INSPECTIONS,
+            )),
+            cache_artifact_delete_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                MAX_CACHE_ARTIFACT_DELETES,
+            )),
+            artifact_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+            runtime_supervisor: settings.runtime_supervisor,
+            runtime_inventory: std::sync::Arc::default(),
             runtime_inventory_refresh_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
             runtime_paths: settings.runtime_paths,
             guest_console_logs: settings.guest_console_logs,
@@ -378,6 +419,7 @@ impl NodeManagerService {
             vendor: root,
             assets: asset_root,
             kernels: kernel_root,
+            store: _,
         } = self.runtime_paths.clone();
         // Prepare and Launch also require this cache; diagnostic pressure must
         // not reject cold discovery before lifecycle admission.
@@ -621,7 +663,11 @@ mod adapter;
 mod artifact_fs;
 pub mod btrfs_balance;
 mod btrfs_delegation;
+mod btrfs_send_source;
+mod btrfs_send_transport;
 pub mod cgroup_reclaim;
+#[cfg(test)]
+mod claim_contention_tests;
 mod cleanup_helpers;
 mod cleanup_inspect;
 mod control;
@@ -633,6 +679,7 @@ mod gateway_isolation;
 mod launch_prepare;
 mod network_helpers;
 pub mod network_pool_metrics;
+mod node_artifacts;
 pub mod node_disk_metrics;
 mod orphan_inventory;
 mod permission_tree;

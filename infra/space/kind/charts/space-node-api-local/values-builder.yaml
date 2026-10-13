@@ -1,0 +1,2 @@
+serviceName: space-builder-node-api
+buildManagerEndpoint: https://space-builder-build-manager:9900

@@ -609,7 +609,6 @@ export interface WarmPoolPolicy {
   refill_per_tick: number;
   max_warming_slots: number;
   retain_releases: number;
-  retain_shape_on_miss?: boolean;
   disk_io_max_operations_per_sec?: number;
   disk_io_max_bandwidth_mib_per_sec?: number;
   disk_io_source?: 'warm_pool';
@@ -619,7 +618,6 @@ export interface WarmPoolPolicy {
 }
 
 export interface WarmPoolPolicyCapabilities {
-  retain_shape_on_miss?: boolean;
   disk_capacity?: boolean;
   disk_io?: {
     max_operations_per_sec: number;

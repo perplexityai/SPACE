@@ -1,6 +1,46 @@
 use super::*;
 
 #[tokio::test]
+async fn send_source_census_keeps_all_unfinished_jobs_including_cancellation() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("volume-manager.sqlite");
+    crate::run::migrate_volume_manager_db(&path).await.unwrap();
+    let conn = Connection::open(&path).unwrap();
+    let mut expected = Vec::new();
+    // Exceed the ordinary jobs-list page size: dropping the second page would
+    // delete live inputs. Unknown kinds and terminal rows own no send leases.
+    for index in 0..120 {
+        for (status, retained) in [
+            ("pending", true),
+            ("running", true),
+            ("cancelling", true),
+            ("cancelled", false),
+            ("failed", false),
+            ("completed", false),
+        ] {
+            let key = format!("{status}-{index}");
+            conn.execute(
+                "INSERT INTO jobs (job_id,kind,status,payload) VALUES (?1,'push_btrfs_send',?2,?1)",
+                params![key, status],
+            )
+            .unwrap();
+            if retained {
+                expected.push(key);
+            }
+        }
+    }
+    conn.execute(
+        "INSERT INTO jobs (job_id,kind,payload) VALUES ('unrelated','push','not-a-lease')",
+        [],
+    )
+    .unwrap();
+    let mut actual = active_btrfs_upload_payloads(&conn).unwrap();
+    actual.sort();
+    expected.sort();
+    assert_eq!(actual, expected);
+}
+
+#[tokio::test]
 async fn historical_attachment_keys_remain_addressable_without_merging_aliases() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("volume-manager.sqlite");

@@ -264,6 +264,52 @@ async fn redrive_cas_refuses_unroutable_execution_at_flip_time() -> TestResult {
     Ok(())
 }
 
+/// The CAS re-checks `restoring` at flip time, not only the loop's read: a
+/// row another actor moved to `deleting` while hydration was in flight must
+/// keep that lifecycle even though hydration answered routable, and the
+/// redrive then observes the move and resolves.
+#[tokio::test(flavor = "current_thread")]
+async fn redrive_cas_refuses_a_row_that_left_restoring_during_hydration() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let pool = &db.pool;
+    let sandbox_id = SandboxId::new();
+    insert_k8s_sandbox(pool, sandbox_id, "restoring").await?;
+    insert_execution(pool, sandbox_id, "running", Some("10.90.0.23")).await?;
+
+    let hydrate = {
+        let pool = pool.clone();
+        move || {
+            let pool = pool.clone();
+            async move {
+                sqlx::query(sql!(
+                    "UPDATE sandboxes SET lifecycle = 'deleting' WHERE id = $1"
+                ))
+                .bind(sandbox_id)
+                .execute(&pool)
+                .await
+                .map_err(|err| err.to_string())?;
+                Ok(true)
+            }
+        }
+    };
+
+    let outcome = redrive_wake_completion(
+        pool,
+        sandbox_id,
+        WakeCompletionAction::Wake,
+        Duration::from_secs(30),
+        Duration::from_millis(20),
+        REDRIVE_HYDRATE_BUDGET,
+        hydrate,
+    )
+    .await;
+    assert_eq!(outcome, WakeCompletionRedriveOutcome::AlreadyResolved);
+    assert_eq!(lifecycle_of(pool, sandbox_id).await?, "deleting");
+    Ok(())
+}
+
 /// Lease parity with the other `restoring -> started` writers: an
 /// unexpired restore lease means a restore attempt (most likely a client
 /// retry that fired after our caller hung up) is actively driving the

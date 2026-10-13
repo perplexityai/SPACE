@@ -13,6 +13,11 @@ jobs:
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: ${{ matrix.timeout }}
+    # pull-requests: read lets reviewdog and gh read a pull request's files.
+    permissions:
+      contents: read
+      packages: read
+      pull-requests: read
     strategy:
       fail-fast: false
       matrix:
@@ -30,6 +35,7 @@ jobs:
             rust_cache_size: 2G
             rust_cache_refresh_misses: 20
             timeout: 45
+            archcheck: true
 
     steps:
       - name: Check out SPACE
@@ -39,6 +45,7 @@ jobs:
           persist-credentials: false
 
       - name: Get the CI image
+        id: ci-image
         env:
           GHCR_TOKEN: ${{ github.token }}
         run: bash ci/scripts/ci-image.sh ensure "space-ci:${GITHUB_SHA}"
@@ -76,16 +83,22 @@ jobs:
         env:
           SPACE_CI_COMMAND: ${{ matrix.command }}
           SPACE_CI_RUST_CACHE: ${{ matrix.rust_cache }}
+          SPACE_CI_CARGO_DIR: ${{ runner.temp }}/space-cargo
           SPACE_CI_SCCACHE_DIR: ${{ runner.temp }}/space-sccache
           SPACE_CI_SCCACHE_RUN_DIR: ${{ runner.temp }}/space-sccache-run
           SPACE_CI_SCCACHE_SIZE: ${{ matrix.rust_cache_size }}
         run: |
           set -euo pipefail
 
+          # The Cargo registry lives on the runner, so later steps in this job
+          # build from the crates this step fetches.
+          mkdir -p "${SPACE_CI_CARGO_DIR}/registry" "${SPACE_CI_CARGO_DIR}/git"
           docker_args=(
             --rm
             --volume "${GITHUB_WORKSPACE}:/workspace"
             --workdir /workspace
+            --volume "${SPACE_CI_CARGO_DIR}/registry:/usr/local/cargo/registry"
+            --volume "${SPACE_CI_CARGO_DIR}/git:/usr/local/cargo/git"
             --env CI=true
             --env CARGO_INCREMENTAL=0
             --env GITHUB_ACTIONS=true
@@ -107,6 +120,85 @@ jobs:
 
           docker run "${docker_args[@]}" "space-ci:${GITHUB_SHA}" \
             bash -c 'git config --global --add safe.directory /workspace && exec bash -c "$SPACE_CI_COMMAND"'
+
+      # Pull requests only: archcheck writes its findings as rdjson, offline
+      # from the clippy step's caches, even when clippy failed. Exit 1 means
+      # required findings, which reviewdog decides on; anything else fails.
+      # no_new_entries and no_raised_caps compare with the baseline of the
+      # base: the first parent of the synthetic merge (fetch-depth 0 above),
+      # once resolve-migration-base.sh has checked the second is this pull
+      # request. If the base has no baseline, an empty one; if it can't be
+      # resolved, a warning and no comparison.
+      - name: Check repository structure
+        id: archcheck
+        if: >-
+          ${{ !cancelled() && steps.ci-image.outcome == 'success' && matrix.archcheck == true &&
+          github.event_name == 'pull_request' }}
+        env:
+          CARGO_DIR: ${{ runner.temp }}/space-cargo
+          SCCACHE_DIR: ${{ runner.temp }}/space-sccache
+          SCCACHE_SIZE: ${{ matrix.rust_cache_size }}
+          PULL_REQUEST_HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          status=0
+          docker run --rm --volume "${GITHUB_WORKSPACE}:/workspace" --workdir /workspace \
+            --volume "${CARGO_DIR}/registry:/usr/local/cargo/registry" --volume "${CARGO_DIR}/git:/usr/local/cargo/git" \
+            --volume "${SCCACHE_DIR}:/sccache" --env SCCACHE_DIR=/sccache --env SCCACHE_CACHE_SIZE="${SCCACHE_SIZE}" \
+            --env SCCACHE_BASEDIRS=/workspace --env CARGO_INCREMENTAL=0 --env CARGO_NET_OFFLINE=true \
+            --env CARGO_TARGET_DIR=target/buildkite-lint --env PULL_REQUEST_HEAD "space-ci:${GITHUB_SHA}" bash -c '
+              sccache --start-server >/dev/null 2>&1 && export RUSTC_WRAPPER=sccache
+              mkdir -p target && git config --global --add safe.directory /workspace
+              base_file=target/archcheck-base-baseline.toml base_args=()
+              if base="$(bash ci/scripts/resolve-migration-base.sh "" "${PULL_REQUEST_HEAD}")"; then
+                if ! git cat-file -e "${base}:architecture-baseline.toml" 2>/dev/null; then
+                  echo "archcheck: ${base} has no architecture-baseline.toml; comparing with an empty one"
+                  : >"${base_file}" && base_args=(--base-baseline "${base_file}")
+                elif git show "${base}:architecture-baseline.toml" >"${base_file}"; then
+                  echo "archcheck: comparing with architecture-baseline.toml from ${base}"
+                  base_args=(--base-baseline "${base_file}")
+                fi
+              fi
+              if ((${#base_args[@]} == 0)); then
+                echo "::warning title=archcheck::Could not resolve the base baseline; no_new_entries and no_raised_caps are skipped."
+              fi
+              exec cargo arch --format rdjson "${base_args[@]}" >target/archcheck.rdjson' || status=$?
+          if ((status > 1)); then echo "::error title=archcheck::cargo arch exited ${status}; see above."; exit 1; fi
+
+      - name: Set up reviewdog
+        if: ${{ !cancelled() && steps.archcheck.outcome == 'success' }}
+        uses: reviewdog/action-setup@d8a7baabd7f3e8544ee4dbde3ee41d0011c3a93f # v1.5.0
+        with:
+          reviewdog_version: v0.21.2
+
+      # Only findings in changed files, unless the pull request changes the
+      # rules or archcheck itself (old or new names), or its file list can't
+      # be read in full.
+      # reviewdog fails after 10 annotations of any severity, so advisory
+      # findings get a run of their own that never fails the step.
+      - name: Annotate repository structure findings
+        if: ${{ !cancelled() && steps.archcheck.outcome == 'success' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REVIEWDOG_GITHUB_API_TOKEN: ${{ github.token }}
+          PULL_REQUEST: ${{ github.event.pull_request.number }}
+          CHANGED_FILES: ${{ github.event.pull_request.changed_files }}
+        run: |
+          set -euo pipefail
+          mode="nofilter"
+          if pages="$(gh api --paginate "repos/${GITHUB_REPOSITORY}/pulls/${PULL_REQUEST}/files?per_page=100" --jq \
+            '"\(length) \(any(.[] | .filename, .previous_filename // empty;
+              IN("ARCHITECTURE.toml", "architecture-baseline.toml", "Cargo.toml") or startswith("crates/tools/archcheck/")))"')" &&
+            awk -v n="${CHANGED_FILES}" '{ l += $1; r = r || $2 == "true" } END { exit r || l != n }' <<<"${pages}"; then
+            mode="file"
+          fi
+          echo "archcheck: -filter-mode=${mode}"
+          annotate() {
+            jq ".diagnostics |= map(select($1))" target/archcheck.rdjson |
+              reviewdog -f=rdjson -name=archcheck -reporter=github-pr-annotations -filter-mode="${mode}" -fail-level="$2"
+          }
+          annotate '.severity != "ERROR"' none ||
+            echo "::warning title=archcheck::Not every advisory finding was annotated; run cargo arch."
+          annotate '.severity == "ERROR"' error
 
       - name: Decide whether to refresh the Rust compiler cache
         id: refresh-rust-cache

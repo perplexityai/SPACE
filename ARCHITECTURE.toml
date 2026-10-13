@@ -1,0 +1,19 @@
+# Repository structure rules, checked by `cargo arch` (crates/tools/archcheck).
+
+[rules.file_size]
+limit = 1000                          # code lines per production Rust file
+
+[rules.file_size.no_crossing]         # no file outside the baseline may exceed the limit
+mode = "advisory"
+
+[rules.file_size.no_new_entries]      # a pull request may not add entries to the baseline
+mode = "advisory"
+
+[rules.file_size.no_raised_caps]      # a pull request may not raise a cap in the baseline
+mode = "advisory"
+
+[rules.file_size.listed_no_growth]    # files in the baseline may not gain code lines
+mode = "advisory"
+
+[rules.file_size.stale_entries]       # entries whose file shrank, fell under the limit, or is gone
+mode = "advisory"

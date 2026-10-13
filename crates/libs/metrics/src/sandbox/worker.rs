@@ -11,7 +11,7 @@ use std::{fmt, str::FromStr, time::Instant};
 
 use pplx_space_common_core::types::{
     AutoLifecycleIdleAction, ExecutionReleaseDetachReason, ExecutionReleaseIntent,
-    QuarantineRecoveryNoProgressReason,
+    QuarantineRecoveryNoProgressReason, SandboxQuarantineReasonCode,
 };
 
 use crate::emit::{counter, distribution, elapsed_ms, gauge, tag, timing_ms};
@@ -1009,6 +1009,10 @@ pub enum QuarantineRecoveryAttemptOutcome {
     /// A detached task panicked or was cancelled before it could classify and
     /// persist its result. The claim lease remains the liveness backstop.
     BackgroundTaskFailed,
+    /// The result completed the run of consecutive plan rejections that stops
+    /// automatic recovery, so no retry was scheduled: the episode is left to an
+    /// operator until it is re-armed.
+    AutomaticRecoveryStopped,
 }
 
 impl QuarantineRecoveryAttemptOutcome {
@@ -1019,6 +1023,7 @@ impl QuarantineRecoveryAttemptOutcome {
             Self::ClaimNotAcquired => "claim_not_acquired",
             Self::RetryWriteFailed => "retry_write_failed",
             Self::BackgroundTaskFailed => "background_task_failed",
+            Self::AutomaticRecoveryStopped => "automatic_recovery_stopped",
         }
     }
 }
@@ -1049,6 +1054,21 @@ impl fmt::Display for QuarantineRecoveryOutcome {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(self.as_str())
     }
+}
+
+/// A sandbox entered `quarantined`, counted once per entry after the
+/// transition commits, beside its `sandbox_quarantined` event. `reason` is
+/// the quarantine's reason code; `operation` names the sandbox-manager path
+/// that quarantined it, the event's own `operation` (`mark_quarantined`,
+/// `insert_quarantined_sandbox`, `startup_resident_recovery`,
+/// `complete_cleanup_episode`, `complete_row_intent_cleanup`,
+/// `quarantine_cleanup_episode`). A re-confirmed quarantine is not an entry.
+pub fn quarantine_entered(reason: SandboxQuarantineReasonCode, operation: &'static str) {
+    counter(
+        "sandbox.worker.quarantine.entered",
+        1,
+        &[tag("reason", reason.as_str()), tag("operation", operation)],
+    );
 }
 
 pub fn quarantine_recovery_no_progress(
@@ -1312,6 +1332,8 @@ pub enum InventoryReconcileReason {
     MaterializationError,
     MalformedCleanupIntent,
     FilesystemInspectionFailed,
+    /// A retained send source has no node-manager answer in this pass.
+    RetainedSourcePending,
 }
 
 impl InventoryReconcileReason {
@@ -1334,6 +1356,7 @@ impl InventoryReconcileReason {
             Self::MaterializationError => "materialization_error",
             Self::MalformedCleanupIntent => "malformed_cleanup_intent",
             Self::FilesystemInspectionFailed => "filesystem_inspection_failed",
+            Self::RetainedSourcePending => "retained_source_pending",
         }
     }
 }
@@ -1477,6 +1500,102 @@ pub fn sandbox_health_transition(status: SandboxHealthStatus) {
         "sandbox.health.transition",
         1,
         &[tag("status", status.as_str())],
+    );
+}
+
+/// Result of the bare `CONNECT` handshake the sandbox manager sends to a VM's
+/// spaced-guest vsock port once per degrading health transition. It separates
+/// a guest kernel that still services vsock (`accepted`, `refused`) from one
+/// that does not (`timeout`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SandboxRawVsockCheckOutcome {
+    /// Firecracker relayed the guest kernel's acceptance (`OK <port>`).
+    Accepted,
+    /// The connection closed before an acknowledgement: the guest kernel
+    /// reset it, so nothing accepts on the port or its backlog is full.
+    Refused,
+    /// Firecracker answered with something other than an acknowledgement.
+    UnexpectedReply,
+    /// No answer within the check's deadline.
+    Timeout,
+    /// The VM's host-side vsock socket could not be connected.
+    HostSocketUnavailable,
+    /// The sandbox has no recorded vsock socket to check.
+    NotAttempted,
+}
+
+impl SandboxRawVsockCheckOutcome {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Accepted => "accepted",
+            Self::Refused => "refused",
+            Self::UnexpectedReply => "unexpected_reply",
+            Self::Timeout => "timeout",
+            Self::HostSocketUnavailable => "host_socket_unavailable",
+            Self::NotAttempted => "not_attempted",
+        }
+    }
+}
+
+impl fmt::Display for SandboxRawVsockCheckOutcome {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// One raw vsock check run for a sandbox whose composed or guest health just
+/// degraded, tagged only by its outcome. Per-sandbox detail is in the
+/// sandbox manager's health-transition log line, never in tags.
+pub fn sandbox_health_raw_vsock_check(outcome: SandboxRawVsockCheckOutcome) {
+    counter(
+        "sandbox.health.raw_vsock_check",
+        1,
+        &[tag("outcome", outcome.as_str())],
+    );
+}
+
+/// What became of the evidence report a degrading health transition asks the
+/// sandbox manager for. Each such transition counts exactly once: when its
+/// report is merged or dropped at admission, or when an admitted report is
+/// logged.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SandboxHealthEvidenceOutcome {
+    /// The sandbox already had a report waiting for a collector, which now
+    /// also covers this transition.
+    Merged,
+    /// The evidence queue was full; only the transition line was logged.
+    Dropped,
+    /// Collected in full before the collection deadline.
+    Complete,
+    /// The collection deadline expired; what was gathered was logged.
+    Partial,
+}
+
+impl SandboxHealthEvidenceOutcome {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Merged => "merged",
+            Self::Dropped => "dropped",
+            Self::Complete => "complete",
+            Self::Partial => "partial",
+        }
+    }
+}
+
+impl fmt::Display for SandboxHealthEvidenceOutcome {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// One degrading health transition's evidence report, tagged only by its
+/// outcome. A rising `dropped` or `partial` share means evidence is being
+/// shed under correlated failures or slow host reads.
+pub fn sandbox_health_evidence_report(outcome: SandboxHealthEvidenceOutcome) {
+    counter(
+        "sandbox.health.evidence_report",
+        1,
+        &[tag("outcome", outcome.as_str())],
     );
 }
 

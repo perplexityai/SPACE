@@ -47,6 +47,7 @@ class Scenario(Generic[Fixture]):
     backends: frozenset[str]
     quarantined: str | None
     ignored: str | None
+    telemetry_mode: str | None
     verify: Callable[[Fixture], None]
     source_module: str
 
@@ -81,6 +82,7 @@ def scenario(
     api_surfaces: Iterable[str] = ("ecw",),
     quarantined: str | None = None,
     ignored: str | None = None,
+    telemetry_mode: str | None = None,
 ) -> Callable[[Callable[[Fixture], None]], Scenario[Fixture]]:
     """Declare a smoke; its typed parameter selects the prepared fixture.
 
@@ -89,6 +91,9 @@ def scenario(
     runs when named explicitly, so it can be fixed and re-proven in place.
     `ignored` withholds a proposed contract that is not yet agreed. It stays
     explicitly runnable and visible in suite logs, outside the defect backlog.
+    `telemetry_mode` names the Kind telemetry mode whose backends the scenario
+    reads; implicit selection skips it, visibly, on a bench running another
+    known mode that the runner did not ask for.
     """
 
     if not id or any(part == "" for part in id.split(".")):
@@ -127,6 +132,9 @@ def scenario(
         raise ValueError("ignored smoke must state its reason")
     if ignored is not None and quarantined is not None:
         raise ValueError("smoke cannot be both ignored and quarantined")
+    # Only otel installs backends a scenario can read.
+    if telemetry_mode not in (None, "otel"):
+        raise ValueError("smoke telemetry mode must be 'otel'")
     supported_surfaces = frozenset(api_surfaces)
     if not supported_surfaces or not supported_surfaces <= {"ecw", "native"}:
         raise ValueError("smoke API surfaces must contain 'ecw' and/or 'native'")
@@ -154,6 +162,8 @@ def scenario(
             )
         if fixture_type in (NativeHardeningFixture, KindNativeHardeningFixture) and supported_surfaces != {"native"}:
             raise TypeError("NativeHardeningFixture requires only the native API surface")
+        if telemetry_mode is not None and fixture_type is not KindEcw:
+            raise TypeError("a telemetry mode requires the KindEcw fixture")
         return Scenario(
             id=id,
             category=id.split(".", 1)[0],
@@ -171,6 +181,7 @@ def scenario(
             backends=FIXTURE_BACKENDS[fixture_type],
             quarantined=quarantined,
             ignored=ignored,
+            telemetry_mode=telemetry_mode,
             verify=verify,
             source_module=verify.__module__,
         )

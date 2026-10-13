@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Wire the projected-token (TokenReview) auth path onto a running local stack:
-#   - server (node-stack): a tokenreviews/create ClusterRole bound to its SA,
+#   - server (node-api DaemonSet): a tokenreviews/create ClusterRole bound to its SA,
 #     plus the SPACE_K8S_TOKEN_AUTH_* env that flips node-api into
 #     k8s_token_review mode (static fallback kept on).
 #   - client (space-api): projected ServiceAccount tokens for the normal and
@@ -9,9 +9,9 @@
 # Idempotent: safe to re-run, including after a `tilt up` reconcile re-applies
 # the charts and drops the env/volume patches.
 #
-# Prerequisite: node-stack must be built WITH the `k8s` Cargo feature (see
-# README + ./00-enable-node-stack-k8s-build.sh), otherwise node-api fails loud
-# at startup with KubernetesAuthFeatureDisabled instead of booting k8s mode.
+# The Kind node-api is built with the `k8s` Cargo feature
+# (docker/Dockerfile.rust-build-kind); without it node-api fails loud at startup
+# with KubernetesAuthFeatureDisabled instead of booting k8s mode.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib.sh
 source "${SCRIPT_DIR}/lib.sh"
@@ -19,12 +19,12 @@ source "${SCRIPT_DIR}/lib.sh"
 require kubectl
 assert_local_context
 
-log "1/3 apply TokenReview RBAC (ClusterRole + binding -> ${NS}/${NODE_STACK_SA})"
+log "1/3 apply TokenReview RBAC (ClusterRole + binding -> ${NS}/${NODE_API_SA})"
 kubectl --context "$KCTX" apply -f - <<YAML
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: space-node-stack-tokenreview
+  name: space-node-api-tokenreview
 rules:
   - apiGroups: ["authentication.k8s.io"]
     resources: ["tokenreviews"]
@@ -33,19 +33,19 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: space-node-stack-tokenreview
+  name: space-node-api-tokenreview
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
-  name: space-node-stack-tokenreview
+  name: space-node-api-tokenreview
 subjects:
   - kind: ServiceAccount
-    name: ${NODE_STACK_SA}
+    name: ${NODE_API_SA}
     namespace: ${NS}
 YAML
 
-log "2/3 enable k8sAuth on node-stack (rolls the DaemonSet)"
-k set env "daemonset/${NODE_STACK_DS}" -c "${NODE_STACK_CONTAINER}" \
+log "2/3 enable k8sAuth on node-api (rolls the DaemonSet)"
+k set env "daemonset/${NODE_API_DS}" -c "${NODE_API_CONTAINER}" \
   SPACE_K8S_TOKEN_AUTH_ENABLED=true \
   SPACE_K8S_TOKEN_AUTH_NAMESPACE="${NS}" \
   SPACE_K8S_TOKEN_AUTH_STATIC_FALLBACK_ENABLED=true \
@@ -83,9 +83,9 @@ k set env "deploy/${SPACE_API_DEPLOY}" -c "${SPACE_API_CONTAINER}" \
   SPACE_NODE_API_INTERNAL_TOKEN_PATH="${INTERNAL_TOKEN_PATH}"
 
 log "waiting for rollouts..."
-k rollout status "daemonset/${NODE_STACK_DS}" --timeout=200s
+k rollout status "daemonset/${NODE_API_DS}" --timeout=300s
 k rollout status "deploy/${SPACE_API_DEPLOY}" --timeout=120s
 
 log "done. node-api auth mode:"
-k logs "$(node_stack_pod)" 2>/dev/null | grep -E '"node-api auth initialized"' | tail -1 \
-  || warn "no auth-init line yet; check 'kubectl -n ${NS} logs <node-stack-pod>'"
+k logs "$(node_api_pod)" -c "${NODE_API_CONTAINER}" 2>/dev/null | grep -E '"node-api auth initialized"' | tail -1 \
+  || warn "no auth-init line yet; check 'kubectl -n ${NS} logs <node-api-pod>'"

@@ -17,7 +17,12 @@ uv_bin="$(bash "${repo_root}/ci/scripts/ensure-uv.sh")"
 tmp_dir="$(mktemp -d)"
 trap 'rm -rf "${tmp_dir}"' EXIT
 
-"${uv_bin}" run --with pglast==7.10 "${partial_index_checker_test}"
+# Run from the repository, uv would otherwise re-lock its project first. As in
+# ci/scripts/run-python-tests.sh, CI checks the lock is current (--locked) and
+# local runs use it as committed (--frozen).
+uv_lock_mode=--frozen
+if [ -n "${CI:-}" ]; then uv_lock_mode=--locked; fi
+"${uv_bin}" run "${uv_lock_mode}" --with pglast==7.10 "${partial_index_checker_test}"
 
 write_migration_pair() {
   local repo="$1"

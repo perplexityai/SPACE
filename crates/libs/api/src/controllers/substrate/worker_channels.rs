@@ -76,27 +76,16 @@ impl WorkerChannels {
         let Some(dial) = self.entry(addr, Instant::now()) else {
             return Ok(RuntimeClient::new(self.dial(addr).await?));
         };
-        // A caller that joins a dial late waits only for its remainder; the
-        // bound covers a dial that outlives its own budget.
-        let budget = self.dial_budget();
-        let result = tokio::time::timeout(budget, dial.clone())
-            .await
-            .unwrap_or_else(|_| {
-                Err(ControllerError::service_unavailable(format!(
-                    "node-api not reachable within {budget:?}"
-                )))
-            });
+        // A caller that joins a dial late waits only for its remainder.
+        let result = dial.clone().await;
         if result.is_err() {
             self.forget(addr, &dial);
         }
         Ok(RuntimeClient::new(result?))
     }
 
-    /// How long one dial may take: every attempt its retry policy allows.
-    fn dial_budget(&self) -> Duration {
-        self.retry_policy.max_elapsed + self.connect_timeout
-    }
-
+    /// Dial `addr` within one dial's budget: every attempt its retry policy
+    /// allows and the TLS handshake its transport applies after them.
     fn dial(&self, addr: &str) -> BoxFuture<'static, Result<Channel, ControllerError>> {
         let addr = addr.to_string();
         let (connect_timeout, request_timeout, retry_policy) = (
@@ -107,14 +96,23 @@ impl WorkerChannels {
         async move {
             let endpoint = super::node_api_endpoint(&addr, connect_timeout, request_timeout)
                 .map_err(ControllerError::from)?;
-            let endpoint = super::node_api_transport(endpoint).await?;
-            pplx_space_common_grpc::connect_tcp_channel_with_retrying_redials(
-                "worker-node-api",
-                endpoint,
-                connect_timeout,
-                retry_policy,
+            let endpoint = super::node_api_connect_endpoint(endpoint).await?;
+            // The bound covers a dial that outlives its own budget.
+            let budget = endpoint.retrying_redial_bound(retry_policy, connect_timeout);
+            tokio::time::timeout(
+                budget,
+                endpoint.connect_with_retrying_redials(
+                    "worker-node-api",
+                    connect_timeout,
+                    retry_policy,
+                ),
             )
             .await
+            .map_err(|_| {
+                ControllerError::service_unavailable(format!(
+                    "node-api not reachable within {budget:?}"
+                ))
+            })?
             .map_err(|err| {
                 ControllerError::service_unavailable(format!("node-api not reachable: {err}"))
             })

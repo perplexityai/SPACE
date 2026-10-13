@@ -13,6 +13,7 @@ use opentelemetry_proto::tonic::common::v1::any_value::Value as AttributeValue;
 use opentelemetry_proto::tonic::metrics::v1::metric::Data;
 use opentelemetry_proto::tonic::metrics::v1::number_data_point::Value;
 use opentelemetry_proto::tonic::metrics::v1::{AggregationTemporality, Metric as WireMetric};
+use opentelemetry_sdk::metrics::Temporality;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio_stream::wrappers::TcpListenerStream;
@@ -21,8 +22,8 @@ use tonic::{Request, Response, Status};
 use super::{
     EXPORT_INTERVAL, EXPORT_TIMEOUT, HISTOGRAM_MAX_SCALE, Metric, MetricKind, MetricSink,
     MetricUnit, MetricValue, OtlpMetricsConfig, OtlpMetricsInitError, OtlpSink, SHUTDOWN_TIMEOUT,
-    endpoint_from_values, export_interval_from_value, validate_plaintext_header_values,
-    validate_protocol_values,
+    endpoint_from_values, export_interval_from_value, temporality_from_value,
+    validate_plaintext_header_values, validate_protocol_values,
 };
 
 #[derive(Clone, Debug, Default)]
@@ -159,6 +160,7 @@ fn test_config(
             "cluster_id:test-cluster".to_string(),
         ],
         export_interval: Duration::from_secs(3_600),
+        temporality: Temporality::Delta,
         export_timeout: Duration::from_millis(500),
         attribute_cardinality_limit,
         instrument_name_limit,
@@ -336,6 +338,34 @@ fn signal_specific_otlp_configuration_has_defined_precedence() {
             "{raw} must be rejected"
         );
     }
+
+    // Delta unless a deployment asks otherwise: the SDK's own default,
+    // cumulative, is what the native Datadog intake cannot take.
+    assert_eq!(temporality_from_value(None).unwrap(), Temporality::Delta);
+    assert_eq!(
+        temporality_from_value(Some(" ".to_string())).unwrap(),
+        Temporality::Delta
+    );
+    for (raw, expected) in [
+        ("cumulative", Temporality::Cumulative),
+        (" Delta ", Temporality::Delta),
+        ("LOWMEMORY", Temporality::LowMemory),
+    ] {
+        assert_eq!(
+            temporality_from_value(Some(raw.to_string())).unwrap(),
+            expected,
+            "{raw}"
+        );
+    }
+    for raw in ["low_memory", "cumulative,delta", "0"] {
+        assert!(
+            matches!(
+                temporality_from_value(Some(raw.to_string())),
+                Err(OtlpMetricsInitError::InvalidTemporality { .. })
+            ),
+            "{raw} must be rejected"
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -379,12 +409,6 @@ async fn otlp_wire_types_temporality_precision_and_identity_are_explicit() {
     assert_eq!(
         attribute(&sum.data_points[0].attributes, "method"),
         Some(&AttributeValue::StringValue("create".to_string()))
-    );
-    assert_eq!(
-        attribute(&sum.data_points[0].attributes, "service"),
-        Some(&AttributeValue::StringValue(
-            "space-sandbox-manager-canary".to_string()
-        ))
     );
     assert_eq!(
         attribute(&sum.data_points[0].attributes, "cluster_id"),

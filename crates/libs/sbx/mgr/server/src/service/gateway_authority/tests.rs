@@ -12,7 +12,7 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
-        Self::with_options(SandboxManagerServiceOptions::default())
+        Self::with_options(SandboxManagerServiceOptions::for_test())
     }
 
     fn with_options(options: SandboxManagerServiceOptions) -> Self {
@@ -202,7 +202,7 @@ async fn gateway_authority_uses_the_configured_node_socket() {
     let listener = tokio::net::UnixListener::bind(&socket).unwrap();
     let fixture = Fixture::with_options(SandboxManagerServiceOptions {
         credential_manager_socket_path: socket,
-        ..Default::default()
+        ..SandboxManagerServiceOptions::for_test()
     });
     let expected = fixture.request.csr.clone();
     let issue = tower::service_fn(move |request: Request<NodeRequest>| {

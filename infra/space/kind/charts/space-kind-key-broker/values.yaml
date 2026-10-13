@@ -1,0 +1,41 @@
+# The in-repo intermediate-key broker fixture
+# (crates/apps/mock/branching-key-provider), standing in for the external key
+# authority behind the credential-manager authority's intermediate-key-broker
+# backend, as versitygw stands in for S3. It derives every key from the tenant
+# reference (SHA-256 of fixed labels), holds no state and needs no secret
+# material: keys survive restarts of the broker and the authority, and every
+# authority replica unwraps every other's keys. That also means the Kind keys
+# protect nothing; the fixture exercises the provider path only
+# (proto/credential/provider/v2/README.md: "a connectivity fixture, not a
+# conformance suite or production key authority").
+
+image:
+  repository: space-kind-key-broker
+  tag: local
+  pullPolicy: IfNotPresent
+
+datadogTeam: team-space
+
+nodeSelector:
+  space.pplx.net/infra: "true"
+
+# The fixture's default listen port (`--listen 0.0.0.0:50051`).
+service:
+  name: space-kind-key-broker
+  port: 50051
+
+# Bearer token the authority presents and the broker requires. The broker
+# accepts only this value; the authority reads it from the Secret's file
+# (SPACE_CREDMGR_INTERMEDIATE_KEY_BROKER_TOKEN_FILE). The fixture's own
+# default token: the keys behind it are derivable anyway (above).
+token:
+  secretName: space-kind-key-broker-token
+  value: local-branching-provider-token
+
+# Stateless; one replica, replaced at will.
+replicas: 1
+
+resources:
+  requests:
+    cpu: 10m
+    memory: 16Mi

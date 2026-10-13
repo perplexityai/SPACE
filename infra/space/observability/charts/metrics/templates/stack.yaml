@@ -19,6 +19,9 @@ metadata:
   name: {{ $name }}
 spec:
   type: ClusterIP
+  {{- if and (eq $name "collector") $.Values.collector.clusterIP }}
+  clusterIP: {{ $.Values.collector.clusterIP | quote }}
+  {{- end }}
   selector:
     app: {{ $name }}
   ports:
@@ -58,6 +61,7 @@ spec:
       containers:
         - name: {{ $name }}
           image: {{ include "metrics.image" (dict "root" $ "name" $name) | quote }}
+          imagePullPolicy: IfNotPresent
           securityContext:
 {{ include "common.containerSecurityContext" . | indent 12 }}
           {{- if eq $name "collector" }}

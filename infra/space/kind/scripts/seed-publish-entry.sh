@@ -21,7 +21,9 @@
 # when the objects already exist with the right sizes.
 #
 # Required env:
-#   SPACE_INTERNAL_API_GRPC_ADDR   host:port of space-internal-api (plaintext gRPC)
+#   SPACE_INTERNAL_API_GRPC_ADDR   host:port of space-internal-api (gRPC over TLS)
+#   SPACE_INTERNAL_RPC_TLS_CA      the cluster's internal RPC CA bundle, which
+#                                  verifies internal-api's certificate
 #   SPACE_CLUSTER_API_TOKEN_PATH   projected bearer token file for ClusterApi
 #   SPACE_OBJECT_STORE_ENDPOINT    e.g. http://object-store:8333
 #   SPACE_OBJECT_STORE_BUCKET      e.g. templates
@@ -42,7 +44,7 @@ require_env() {
     [[ -n "${!name:-}" ]] || die "required env var not set: $name"
   done
 }
-require_env SPACE_INTERNAL_API_GRPC_ADDR SPACE_CLUSTER_API_TOKEN_PATH \
+require_env SPACE_INTERNAL_API_GRPC_ADDR SPACE_INTERNAL_RPC_TLS_CA SPACE_CLUSTER_API_TOKEN_PATH \
   SPACE_OBJECT_STORE_ENDPOINT SPACE_OBJECT_STORE_BUCKET SPACE_OBJECT_STORE_REGION \
   SPACE_OBJECT_STORE_STATIC_ACCESS_KEY_ID SPACE_OBJECT_STORE_STATIC_SECRET_ACCESS_KEY
 
@@ -73,7 +75,7 @@ cluster_api() {
   local rpc=$1 body=$2 token
   token=$(<"$SPACE_CLUSTER_API_TOKEN_PATH")
   [[ -n "$token" ]] || die "projected ClusterApi token is empty"
-  grpcurl -plaintext \
+  grpcurl -cacert "$SPACE_INTERNAL_RPC_TLS_CA" \
     -import-path "$PROTO_DIR" -proto "$CLUSTER_PROTO" \
     -H "authorization: Bearer ${token}" \
     -d "$body" \

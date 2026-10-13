@@ -108,11 +108,18 @@ class ConcurrentRestoreAssertions:
         previous_holder: list[int] = []
 
         def scale_back() -> None:
-            # Scale back and wait for the rollout: compensations registered
-            # earlier (the sandbox kill, the API key delete) run after this one
-            # and must not hit a replica that is being terminated.
+            # Scale back and wait until the route is usable again: compensations
+            # registered earlier (the sandbox kill, the API key delete) run
+            # after this one and must not hit a replica that is being
+            # terminated. `rollout status` returns on a scale-down while the
+            # surplus pods are still Terminating; wait for the drain, then for
+            # `/readyz` through the same URL the compensations use, and only
+            # then hand the replica count back to an autoscaler.
             self._control.scale_public_api(previous_holder[0] if previous_holder else 1)
             self._control.wait_public_api_rollout(timeout=rollout_timeout)
+            self._control.wait_public_api_pods_drained(timeout=rollout_timeout)
+            self._control.wait_public_api_ready(timeout=rollout_timeout)
+            self._control.restore_public_api_autoscaler()
 
         self._scale_back = self._scope.defer("scale the public API back", scale_back, critical=True)
         previous_holder.append(self._control.scale_public_api(replicas))

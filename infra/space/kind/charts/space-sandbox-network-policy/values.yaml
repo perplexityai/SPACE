@@ -1,0 +1,17 @@
+# The namespace the API creates sandbox pods in: `k8s.sandboxNamespace` in the
+# space-api-local, space-cluster-controller-local and space-internal-api-local
+# charts, created by manifests/namespace.yaml. The policies are rendered
+# there; the release namespace is the control plane's, whose components are
+# the only ones allowed to dial a sandbox pod.
+sandboxNamespace: sandboxes
+
+# Sandbox egress is the guest's IPv4 internet and nothing local to the cluster
+# or the host. On Kind these cover the pod (10.244.0.0/16) and Service
+# (10.96.0.0/16) ranges, the nodes' Docker network (inside 172.16.0.0/12),
+# carrier-grade NAT and link-local, including the instance-metadata address.
+internetExcept:
+  - 10.0.0.0/8
+  - 100.64.0.0/10
+  - 172.16.0.0/12
+  - 192.168.0.0/16
+  - 169.254.0.0/16

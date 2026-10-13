@@ -26,11 +26,13 @@ telemetry: {}
 apiReleaseName: space
 apiServiceAccount: space-api
 
-# One replica by default: every other kind suite reads
-# `logs deploy/space-cluster-controller` and expects one pod's log to be the
-# whole story, which stops being true the moment a standby exists. The
-# leader-election suite scales this up for its own scenarios and scales it back.
-replicaCount: 1
+# Two replicas, as deployed: the Lease holder runs the reconcilers and the
+# other waits as a warm standby, so losing the leader's pod does not stop
+# reconciliation for longer than the lease takes to change hands. The harness
+# reads controller logs from every pod (controller_log_records in
+# space_smoke/adapters.py); the leader-election suite scales to two and back
+# to whatever it found.
+replicaCount: 2
 
 nodeSelector:
   space.pplx.net/infra: "true"
@@ -42,7 +44,8 @@ serviceAccount:
 # requires SPACE_K8S_CONTROL_PLANE=true to even start, and shares the same
 # substrate plumbing for orphan-sweep + warm-pool reconcilers.
 k8s:
-  sandboxNamespace: space
+  # The API's sandbox namespace (space-api-local's k8s.sandboxNamespace).
+  sandboxNamespace: sandboxes
   # Must match space-api-local's value: both substrate instances (api-server
   # + cluster-controller) read SPACE_SANDBOX_POD_IMAGE from env at startup
   # and would otherwise create per-sandbox pods with different images, the

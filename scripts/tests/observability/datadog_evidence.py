@@ -15,13 +15,22 @@ sys.path.insert(
 from datadog_backend import ROOT, kube, plan, verify
 from telemetry_config import options
 
+# The control-plane Deployments plus every node-service DaemonSet, from the
+# list bootstrap and Tilt deploy (the Kind-only operator shell emits nothing).
 WORKLOADS = {
     "space-api",
     "space-internal-api",
     "space-data-plane",
     "space-cluster-controller",
-    "space-node-stack",
-    "space-builder-node-stack",
+} | {
+    name
+    for name in subprocess.run(
+        ["bash", str(ROOT / "infra/space/kind/lib/node-services.sh"), "daemonsets"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.split()
+    if name != "space-node-debug"
 }
 # Every telemetry setting worth recording alongside a capture. A name absent
 # from a pod is simply absent from the evidence, so this errs toward listing
@@ -74,7 +83,7 @@ def snapshot(config):
     )["items"]
     workloads = [w for w in workloads if w["metadata"]["name"] in WORKLOADS]
     if {w["metadata"]["name"] for w in workloads} != WORKLOADS:
-        raise ValueError("Evidence requires the complete six-workload Kind harness")
+        raise ValueError("Evidence requires every Kind harness workload")
     for workload in workloads:
         kube(
             config,

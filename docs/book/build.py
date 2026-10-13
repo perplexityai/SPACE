@@ -22,6 +22,8 @@ CHAPTERS = (
     "installation.md",
     "observability.md",
     "troubleshooting.md",
+    "warm-pools.md",
+    "base-snapshots.md",
     "development-overview.md",
     "architecture.md",
     "versioning.md",

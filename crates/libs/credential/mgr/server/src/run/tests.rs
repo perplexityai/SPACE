@@ -4,37 +4,36 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tempfile::tempdir;
 
 #[test]
-fn storage_vend_role_is_a_startup_precondition_except_when_disabled() {
+fn storage_vend_role_is_optional_but_must_be_valid_when_set() {
+    assert!(
+        resolve_storage_vend_role(Err(std::env::VarError::NotPresent))
+            .unwrap()
+            .is_none()
+    );
     assert!(matches!(
-        resolve_storage_vend_role(
-            ExchangeTokenMode::Legacy,
-            Err(std::env::VarError::NotPresent)
-        ),
-        Err(RunCredmgrError::MissingStorageVendRole)
-    ));
-    assert!(matches!(
-        resolve_storage_vend_role(
-            ExchangeTokenMode::Mixed,
-            Ok("arn:aws:iam::123456789012:role/storage\n".to_string()),
-        ),
+        resolve_storage_vend_role(Ok("arn:aws:iam::123456789012:role/storage\n".to_string())),
         Err(RunCredmgrError::InvalidStorageVendRole)
     ));
     assert!(
-        resolve_storage_vend_role(
-            ExchangeTokenMode::Enforce,
-            Ok("arn:aws:iam::123456789012:role/storage".to_string()),
-        )
-        .unwrap()
-        .is_some()
+        resolve_storage_vend_role(Ok("arn:aws:iam::123456789012:role/storage".to_string()))
+            .unwrap()
+            .is_some()
     );
-    assert!(
-        resolve_storage_vend_role(
-            ExchangeTokenMode::Disabled,
-            Err(std::env::VarError::NotPresent),
-        )
-        .unwrap()
-        .is_none()
-    );
+}
+
+/// Upgrading an authority that kept the retired `disabled` emergency stop must
+/// not silently start issuing; every other retained or absent value is inert.
+#[test]
+fn retired_disabled_mode_with_a_vend_role_fails_startup() {
+    assert!(matches!(
+        check_retired_exchange_token_mode(Ok("disabled".to_string()), true),
+        Err(RunCredmgrError::RetiredExchangeDisabled)
+    ));
+    check_retired_exchange_token_mode(Ok("disabled".to_string()), false).unwrap();
+    for retained in ["legacy", "mixed", "enforce"] {
+        check_retired_exchange_token_mode(Ok(retained.to_string()), true).unwrap();
+    }
+    check_retired_exchange_token_mode(Err(std::env::VarError::NotPresent), true).unwrap();
 }
 
 /// A node-local run configuration with the binary's defaults, so each test
@@ -208,41 +207,6 @@ fn control_plane_authority_is_allowed() {
     // node-local-socket guard.
     validate_startup_config(CredmgrRole::Authority, true, true, true).unwrap();
     validate_startup_config(CredmgrRole::Authority, true, false, true).unwrap();
-}
-
-#[tokio::test]
-async fn kubernetes_auth_requires_database_even_in_observe_mode() {
-    use std::ffi::OsStr;
-
-    if !pplx_space_test_env::enter_test_process(&[
-        ("SPACE_CREDMGR_K8S_AUTH_ENABLED", Some(OsStr::new("true"))),
-        (
-            "SPACE_CREDMGR_K8S_AUTH_NAMESPACE",
-            Some(OsStr::new("space")),
-        ),
-        ("SPACE_CREDMGR_POD_AUTHORIZATION_MODE", None),
-        ("SPACE_CREDMGR_AUTH_ALLOWED_SERVICE_ACCOUNTS", None),
-        ("KUBERNETES_SERVICE_HOST", Some(OsStr::new("127.0.0.1"))),
-    ]) {
-        return;
-    }
-
-    let service = CredentialManagerService::new(
-        Arc::new(crate::in_memory::InMemoryKeyWrapper::new()),
-        PeerProcessCheckMode::Off,
-    );
-    let error = serve_tcp_until(
-        "127.0.0.1:0".parse().unwrap(),
-        TcpSecurity::Plaintext,
-        service,
-        CancellationToken::new(),
-    )
-    .await
-    .unwrap_err();
-    assert!(
-        matches!(error, ServeError::K8sAuthMissingDatabase),
-        "{error}"
-    );
 }
 
 #[tokio::test]

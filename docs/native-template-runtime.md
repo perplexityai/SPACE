@@ -239,14 +239,18 @@ Older protobuf readers drop unknown runtime step bodies; the builder rejects the
 missing body instead of silently ignoring startup intent. ECW maps its single
 `startCmd` to app `app`. Legacy-only output remains valid during rolling deployment.
 Native edits on legacy startup parents and mixed native/legacy output are rejected:
-rebuild those lineages from recipes. Resource-only legacy drop-ins remain; they
-neither define nor enable applications.
+rebuild those lineages from recipes. New seeds omit legacy startup drop-ins;
+native app units set their own slice and task settings. Previously published
+images retain their compatibility drop-ins.
 
 Roll out without rewriting existing sandbox images:
 
 1. Deploy both changes through the normal pipelines, including the builder-boot
    mask on sandbox managers. Complete that host rollout before building native
-   templates. The readiness protocol is unchanged for both guest generations.
+   templates. Complete the ECW translator rollout before publishing seeds without
+   legacy startup drop-ins: older translators rely on those drop-ins to place
+   their apps in the user-work slice. The readiness protocol is unchanged for
+   both guest generations.
 2. Check the exact bases selected for new template builds. ECW `startCmd` and native
    SetRuntime/ClearRuntime builds fail against bases without the resource envelope
    until those bases are rebuilt. This can leave a build-availability window between

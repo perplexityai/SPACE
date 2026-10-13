@@ -1,6 +1,55 @@
 use super::*;
 
 #[test]
+fn termination_waits_for_known_quiescence_and_removal() {
+    // Synthetic filesystem observations: the async supervisor owns timing.
+    let root = tempfile::tempdir().unwrap();
+    let paths = [root.path().join("sidecar"), root.path().join("vm")];
+    for path in &paths {
+        fs::create_dir(path).unwrap();
+        fs::write(path.join("cgroup.kill"), "").unwrap();
+        fs::write(path.join("cgroup.events"), "populated 1\n").unwrap();
+    }
+    for _ in 0..60 {
+        assert!(matches!(
+            try_terminate_cgroup_paths(&paths).unwrap(),
+            CgroupRemovalOutcome::Busy {
+                observation: CgroupBusyObservation::Populated { .. },
+                ..
+            }
+        ));
+    }
+    for path in &paths {
+        assert_eq!(fs::read_to_string(path.join("cgroup.kill")).unwrap(), "1");
+    }
+    fs::remove_dir_all(&paths[0]).unwrap();
+    assert!(matches!(
+        try_terminate_cgroup_paths(&paths).unwrap(),
+        CgroupRemovalOutcome::Busy { .. }
+    ));
+    fs::remove_dir_all(&paths[1]).unwrap();
+    assert!(
+        matches!(
+            try_terminate_cgroup_paths(&paths).unwrap(),
+            CgroupRemovalOutcome::Removed(_)
+        ),
+        "repeated Stop is idempotent"
+    );
+}
+
+#[test]
+fn termination_never_treats_unknown_population_as_empty() {
+    for events in [Some("populated unknown\n"), None] {
+        let root = tempfile::tempdir().unwrap();
+        if let Some(events) = events {
+            fs::write(root.path().join("cgroup.events"), events).unwrap();
+        }
+        try_terminate_cgroup_paths(&[root.path().to_owned()]).unwrap_err();
+        assert!(root.path().exists());
+    }
+}
+
+#[test]
 fn cgroup_kill_request_writes_kernel_trigger_when_available() {
     let root = tempfile::tempdir().unwrap();
     let kill_file = root.path().join("cgroup.kill");
@@ -18,31 +67,12 @@ fn cgroup_kill_request_falls_back_when_kernel_trigger_is_absent() {
 }
 
 #[test]
-fn remove_retry_delay_polls_fast_without_reducing_worst_case_budget() {
-    assert_eq!(remove_retry_delay(0), REMOVE_FAST_RETRY_DELAY);
-    assert_eq!(
-        remove_retry_delay(REMOVE_FAST_RETRY_ATTEMPTS - 1),
-        REMOVE_FAST_RETRY_DELAY
-    );
-    assert_eq!(
-        remove_retry_delay(REMOVE_FAST_RETRY_ATTEMPTS),
-        REMOVE_RETRY_DELAY
-    );
-
-    let total_sleep = (0..REMOVE_ATTEMPTS - 1)
-        .map(remove_retry_delay)
-        .fold(Duration::ZERO, |total, delay| total + delay);
-    assert_eq!(total_sleep, Duration::from_millis(450));
-}
-
-#[test]
 fn empty_cgroup_removal_completes_without_retry() {
-    let sandbox_id = SandboxId::new();
     let root = tempfile::tempdir().unwrap();
     let cgroup_path = root.path().join("sandbox");
     fs::create_dir(&cgroup_path).unwrap();
 
-    let report = remove_cgroup_path(sandbox_id, &cgroup_path, REMOVE_ATTEMPTS).unwrap();
+    let report = remove_cgroup_path(&cgroup_path).unwrap();
 
     assert!(report.present);
     assert!(report.removed);
@@ -54,7 +84,6 @@ fn empty_cgroup_removal_completes_without_retry() {
 
 #[test]
 fn removal_recurses_into_child_cgroups() {
-    let sandbox_id = SandboxId::new();
     // A jailer-created nested cgroup leaves child directories under the
     // sandbox cgroup. A flat rmdir of the parent fails while children exist;
     // removal must descend and remove them bottom-up first.
@@ -65,7 +94,7 @@ fn removal_recurses_into_child_cgroups() {
     fs::create_dir(&child).unwrap();
     fs::create_dir(child.join("grandchild")).unwrap();
 
-    let report = remove_cgroup_path(sandbox_id, &cgroup_path, 3)
+    let report = remove_cgroup_path(&cgroup_path)
         .expect("removal should recurse into child cgroups and succeed");
 
     assert!(report.removed);
@@ -118,6 +147,7 @@ fn reclaim_never_removes_a_populated_cgroup() {
     let root = tempfile::tempdir().unwrap();
     let cgroup_path = root.path().join("019efbf4-975e-7673-a2a4-4a7b9ad2e63a");
     fs::create_dir(&cgroup_path).unwrap();
+    fs::write(cgroup_path.join("cgroup.kill"), "").unwrap();
     fs::write(cgroup_path.join("cgroup.events"), "populated 1\nfrozen 0\n").unwrap();
 
     assert_eq!(
@@ -125,6 +155,11 @@ fn reclaim_never_removes_a_populated_cgroup() {
         OrphanReclaimOutcome::Populated
     );
     assert!(cgroup_path.exists(), "populated cgroup must not be removed");
+    assert_eq!(
+        fs::read_to_string(cgroup_path.join("cgroup.kill")).unwrap(),
+        "",
+        "a shared live cgroup must not be signalled"
+    );
 }
 
 #[test]

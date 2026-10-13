@@ -34,6 +34,7 @@ def _describe(scenario_id: str) -> int:
         "api_surfaces": sorted(scenario.api_surfaces),
         "quarantined": scenario.quarantined,
         "ignored": scenario.ignored,
+        "telemetry_mode": scenario.telemetry_mode,
         "selected_api_surface": os.environ.get("SPACE_SMOKE_API_SURFACE", "ecw"),
         "sandbox": {
             "count": scenario.sandbox_count,
@@ -319,8 +320,8 @@ def _run_all(
             scenarios, index=index, count=count, api_surface=api_surface
         )
         print(f"SHARD {index}/{count}: {len(scenarios)} scenarios ({api_surface})")
+    selection = f"category {category!r}" if category is not None else "this run"
     if not scenarios:
-        selection = f"category {category!r}" if category is not None else "this run"
         print(
             f"ERROR: no smoke scenarios apply to {selection} on the "
             f"{backend!r} backend.",
@@ -348,6 +349,15 @@ def _run_all(
         print(f"ERROR: {type(error).__name__}: {error}", file=sys.stderr)
         return 2
 
+    scenarios, telemetry_error = _apply_telemetry_mode(scenarios, services)
+    if not scenarios:
+        print(
+            f"ERROR: no smoke scenarios apply to {selection} on a bench in this "
+            "telemetry mode.",
+            file=sys.stderr,
+        )
+        return 2
+
     environment = dict(os.environ)
     if environment.get("SPACE_SMOKE_BACKEND", "kind") == "kind":
         environment["SKIP_BOOTSTRAP"] = "1"
@@ -371,7 +381,57 @@ def _run_all(
         f"{incomplete} inconclusive or infrastructure errors"
     )
     _print_not_passed(results, scenarios, api_surface=api_surface)
-    return suite_exit_code(results)
+    exit_code = suite_exit_code(results)
+    if telemetry_error is not None:
+        print(f"ERROR: {telemetry_error}", file=sys.stderr)
+        if exit_code in (0, 42):
+            exit_code = 2
+    return exit_code
+
+
+def _apply_telemetry_mode(
+    scenarios: tuple[Scenario, ...], services: SmokeServices
+) -> tuple[tuple[Scenario, ...], str | None]:
+    """Skip the scenarios that read another telemetry mode's backends.
+
+    Returns the scenarios to run and, when the bench does not run the mode
+    SPACE_KIND_TELEMETRY_MODE asked for, the error that must fail the suite.
+    """
+
+    declared = tuple(scenario for scenario in scenarios if scenario.telemetry_mode is not None)
+    if not declared:
+        return scenarios, None
+    # Read from the bench, not this runner's environment, so a SKIP_BOOTSTRAP
+    # run is classified by what the bench actually runs. Only a known mode
+    # skips: a bench the probe cannot classify keeps these scenarios, whose own
+    # reads then report it, and the rest of the selection runs regardless.
+    try:
+        bench_mode = services.telemetry_mode()
+    except Exception as error:  # noqa: BLE001 - the scenarios report their own reads
+        names = ", ".join(scenario.id for scenario in declared)
+        print(
+            f"WARN: could not read the bench's telemetry mode, so {names} will run: "
+            f"{type(error).__name__}: {error}",
+            file=sys.stderr,
+        )
+        return scenarios, None
+    # A runner that names a mode, as CI does, relies on these scenarios to prove
+    # it; a bench in another mode is an error, never a skip.
+    requested = os.environ.get("SPACE_KIND_TELEMETRY_MODE") or None
+    if requested is not None and requested != bench_mode:
+        return scenarios, (
+            f"SPACE_KIND_TELEMETRY_MODE={requested}, but the bench runs telemetry mode {bench_mode}"
+        )
+    runnable = tuple(
+        scenario for scenario in scenarios if scenario.telemetry_mode in (None, bench_mode)
+    )
+    for skipped in declared:
+        if skipped not in runnable:
+            print(
+                f"SKIPPED {skipped.id}: needs telemetry mode {skipped.telemetry_mode}; "
+                f"the bench runs {bench_mode}"
+            )
+    return runnable, None
 
 
 def _parse_shard(value: str) -> tuple[int, int]:

@@ -150,8 +150,23 @@ OTel span names (`crates/libs/observability/src/sqlx_otel.rs`), so Datadog APM
 resource names keep grouping by query shape, not by call site.
 
 SQL kept in a `const` or a `fn() -> &'static str` helper gets wrapped at the
-definition, where the SQL text lives. Node-local `rusqlite` call sites are not
-annotated today.
+definition, where the SQL text lives. Don't route a caller's SQL through a
+wrapper that applies `sql!` for it: every statement would carry the wrapper's
+locator. The `execute` helper in
+`crates/libs/db/migrator/src/bootstrap_roles.rs` is the known exception, not a
+precedent. Node-local `rusqlite` call sites are not annotated today.
+
+## Log targets: pin the ones searches select on
+
+A `tracing` event without `target:` takes `module_path!()` as its target, as
+the `sql!` locator above does. Moving or renaming a module therefore changes
+the target of everything it logs. Datadog attribute queries accept wildcards,
+but an exact-value `@target` filter silently stops matching, so list renamed
+targets in the PR description.
+An event whose target searches depend on takes a literal `target: "..."`, as
+`space.admin.audit` does (`crates/libs/api/src/routes/admin/audit.rs`). A
+`const LOG_TARGET: &str = module_path!()` keeps a target when code moves into a
+child module, but not when the module that defines it is moved or renamed.
 
 ## Statement reuse and no-op writes
 
@@ -349,6 +364,64 @@ Three files keep their test body as a *flat* sibling named
 needs an attribute to say what `mod tests;` says for free, and it puts test
 files in the same directory listing as production ones. Don't propagate it; new
 test modules use the plain `#[cfg(test)] mod <name>;` + `<host>/<name>.rs` form.
+
+## Privileged tests and the CI host
+
+The GitHub Rust test job runs the whole workspace, ignored tests included
+(`ci/scripts/run-rust-checks.sh`), in two containers on one runner
+(`.github/workflows/common-ci.yml`). Everything outside the nextest test group
+`privileged` (`.config/nextest.toml`) runs as an unprivileged user with no
+capabilities, no Docker socket and no host network; the runner starts its
+Postgres and Redis. The group then runs from the same build as root in a
+`--privileged` container with the host's Docker socket.
+
+A test belongs in that group when it needs root, CAP_SYS_ADMIN, loop devices,
+a relaxed seccomp profile, or its own containers. So does a test whose root
+path differs from its unprivileged path, for example one that switches to
+another uid only when it can: in the unprivileged half it would pass without
+exercising its root assertions. Either list it in the group or split it into a
+root test there and an unprivileged test outside it. Make a privileged test
+assert its requirement rather than return early. For root, call
+`pplx_space_test_env::root_or_skip(...)` and return when it returns false:
+run locally without root, it prints a SKIPPED line, and when CI sets
+`SPACE_CI_REQUIRE_TEST_PRIVILEGE` to anything but empty or `0` it fails, so a
+test missing from the group fails the unprivileged half instead of passing
+there without testing anything. Keep the group small; a test that needs
+privilege only for an incidental step should lose that step instead.
+
+The group's filter has one clause per line. The job checks that each clause
+matches at least one test and that every test it matches is in the group, so
+a rename or typo fails CI rather than moving a test to the unprivileged half.
+The check cannot find a privileged test that no clause names; only that test's
+own assertion can.
+
+The split keeps ordinary tests from mutating the host by accident. It is not a
+trust boundary: the unprivileged half has the whole checkout read-write, so it
+can write everything the root half runs from. That is the target directory
+(the test binaries, nextest's metadata and the privileged test list) and the
+scripts and configuration the root half executes (`ci/scripts/run-rust-checks.sh`,
+`.config/nextest.toml` and the nextest setup scripts). A hostile test or build
+script in the unprivileged half still reaches root.
+
+The privileged half can reach whatever its host offers, and the unprivileged
+half can still reach the network, so tests must not touch host state they do
+not own: fixed SPACE paths, production sockets, firewall or network-namespace
+state, or processes they did not spawn. Test-owned temporary directories and
+child processes are fine.
+
+Make destructive host operations unreachable even on a regression path. When a
+guard regresses, the fixture's next step must refuse. A stub whose stop fails,
+a draining pool, a client on a closed port such as `127.0.0.1:1`, or an
+already-cancelled work token all refuse that way. A test that must mutate the
+host needs an environment opt-in naming a disposable target; `#[ignore]` does
+not keep it out of CI.
+
+When a test depends on a value read from the environment, follow
+"Environment-dependent tests" in `docs/rust/unsafe.md`. Give the parser
+explicit inputs, such as a `pplx_space_test_env::TestEnv` passed as its
+`Environment`. Only a test of real startup-environment behavior runs in a child
+test process: call `pplx_space_test_env::enter_test_process` first and return
+when it returns false. Never call `std::env::set_var`.
 
 ## Service binaries: a thin `main.rs` over a library crate
 

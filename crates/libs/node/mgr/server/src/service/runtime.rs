@@ -274,7 +274,8 @@ impl NodeManagerService {
                 .emit_with(
                     SandboxEventDetails::default()
                         .reason("memory_admission_unavailable")
-                        .error(status.message().to_string()),
+                        .error(status.message().to_string())
+                        .logged_by_caller(),
                 );
                 return Err(status);
             }
@@ -297,7 +298,8 @@ impl NodeManagerService {
                 .emit_with(
                     SandboxEventDetails::default()
                         .reason("memory_admission_unavailable")
-                        .error(status.message().to_string()),
+                        .error(status.message().to_string())
+                        .logged_by_caller(),
                 );
                 return Err(status);
             }
@@ -340,16 +342,21 @@ impl NodeManagerService {
                         );
                     }
                 }
+                let details = SandboxEventDetails::default()
+                    .reason("memory_admission_resource_exhausted")
+                    .error(error.to_string());
+                // A capacity refusal is normal operation. An overflow means the
+                // reservation state is corrupt or saturated, so it stays a WARN.
+                let details = match &error {
+                    MemoryAdmissionError::InsufficientCapacity { .. } => details.routine(),
+                    MemoryAdmissionError::RequirementOverflow { .. } => details,
+                };
                 SandboxEvent::new(
                     typed_sandbox_id,
                     SandboxEventType::MemoryAdmissionFailed,
                     SandboxEventSource::NodeManager,
                 )
-                .emit_with(
-                    SandboxEventDetails::default()
-                        .reason("memory_admission_resource_exhausted")
-                        .error(error.to_string()),
-                );
+                .emit_with(details);
                 return Err(Status::resource_exhausted(error.to_string()));
             }
             Err(AllocateNewLeaseError::Slot(error)) => {
@@ -727,7 +734,8 @@ impl NodeManagerService {
                 SandboxEventDetails::default()
                     .pid(pid.to_string())
                     .program(req.program.clone())
-                    .error(error.to_string()),
+                    .error(error.to_string())
+                    .logged_by_caller(),
             );
             kill_launched_process_after_pid_persist_failure(self, &req.sandbox_id, pid).await;
             return Err(Status::internal(format!(
@@ -878,7 +886,11 @@ impl NodeManagerService {
                             SandboxEventType::PortExposureRemoveFailed,
                             SandboxEventSource::NodeManager,
                         )
-                        .emit_with(dnat_cleanup_details().error(error.to_string()));
+                        .emit_with(
+                            dnat_cleanup_details()
+                                .error(error.to_string())
+                                .logged_by_caller(),
+                        );
                     }
                 }
                 SandboxEvent::new(
@@ -1211,3 +1223,8 @@ impl NodeManagerService {
         Ok(Response::new(StopProcessResponse { success }))
     }
 }
+
+// Every case pins processes through Linux pidfds or reads /proc.
+#[cfg(test)]
+#[cfg(target_os = "linux")]
+pub(super) mod tests;

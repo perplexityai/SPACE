@@ -14,7 +14,8 @@ installing them in a job.
 
 Every third-party image GitHub CI pulls or builds from is listed in
 `ci/mirrored-images.txt`, pinned by digest: the test containers, the M1 SDK
-check's generator, the Dockerfile bases, and the Kind charts' images. Main
+check's generator, the Dockerfile bases, the Kind charts' images, and the
+observability backends' images. Main
 pushes copy any new digest
 to `ghcr.io/perplexityai/space-ci-mirror`. Jobs take it from there through
 `ci/scripts/mirror-images.sh`: `pull` for images a tool runs, and
@@ -29,6 +30,38 @@ all targets/features, and the common-svc feature-isolation check. Preserve the
 runner's complete workspace test inventory, including ignored tests and doc
 tests. Do not narrow CI selectors because local checks were sufficient for a
 focused change.
+
+GitHub's Rust tests job runs that inventory in two containers on one runner,
+from one build. `run-rust-checks.sh tests-unprivileged` runs as the CI image's
+`space-ci` user (the runner user's uid) with `--cap-drop=ALL`,
+`no-new-privileges`, no host network and no Docker socket, on a bridge network
+where the runner started Postgres and Redis (`ci/scripts/ci-test-services.sh`);
+the nextest setup scripts take those servers' addresses from
+`SPACE_NEXTEST_POSTGRES_ADDRESS` and `SPACE_NEXTEST_REDIS_ADDRESS` instead of
+starting their own. It builds everything, checks the `privileged` group in
+`.config/nextest.toml`, and runs `not group(privileged)`. The check requires
+every clause of the group's filter to match at least one test, all of them in
+the group; it catches a renamed test, a typo, or another override taking the
+test first, each of which would otherwise move a test to the unprivileged half
+silently. It cannot find a privileged test that no clause names.
+`tests-privileged` then runs `group(privileged)` as root in a `--privileged`
+container with the Docker socket but still no host network, from the first
+step's binaries through nextest's `--binaries-metadata` and
+`--cargo-metadata`, so it compiles nothing. It first confirms it selects the
+tests the first step listed, runs the M1 generator check, and returns any
+file it created to the runner user on every exit, including one during its
+toolchain preflight. The split keeps ordinary tests from mutating the host by
+accident; it is not a trust boundary. The unprivileged step mounts the whole
+checkout read-write, so it can write everything the root step runs from: the
+target directory (the test binaries, the `nextest-*.json` metadata and
+`nextest-privileged.txt`) and the scripts and configuration the root step
+executes (`ci/scripts/run-rust-checks.sh`, `.config/nextest.toml` and the
+nextest setup scripts). A hostile test or build script in the first step
+therefore still runs as root on the runner. Add a test to the group when it needs
+root, kernel capabilities, devices or its own containers, or when its root
+path differs from its unprivileged one (or split it in two); keep such tests
+asserting what they need, so a missing one fails the unprivileged step.
+`tests` and `all` still run the whole inventory in one process.
 
 Pull-request and merge-queue Rust tests reuse the Cargo target directory that
 main's cold build saved, and `ci/scripts/rust-target-cache.sh` stamps source

@@ -1,6 +1,8 @@
 #![forbid(unsafe_code)]
 
 pub mod artifact;
+mod btrfs_push;
+mod codec_admission;
 pub mod credentials;
 pub mod crypto;
 pub mod db;
@@ -8,6 +10,8 @@ pub mod executor;
 pub mod run;
 pub mod service;
 pub mod staging;
+
+pub use executor::{SnapshotUploadMode, StreamingPushBudget};
 
 pub use run::{
     DEFAULT_CODEC_CONCURRENCY, DEFAULT_CODEC_PRIORITY_RESERVE, DEFAULT_PULL_CONCURRENCY,

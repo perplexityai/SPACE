@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import importlib
+import ipaddress
 import json
 import os
 import re
@@ -27,11 +28,14 @@ from urllib.request import Request, urlopen
 
 from space_smoke.capabilities import (
     LimiterProbeOutcome,
+    PodNetwork,
+    TcpProbe,
+    TcpTarget,
     AdminNodeGroupView,
     CensusPublication,
     FencePolicy,
     NodeSnapshot,
-    NodeStackIdentity,
+    NodeCtlIdentity,
     PendingBackupRow,
     SaWriteOutcome,
     WhoAmI,
@@ -80,6 +84,8 @@ from space_smoke.capabilities import (
     SandboxPodPlacement,
     SnapshotRecord,
     BackupQueued,
+    BtrfsSendCapture,
+    CompletedTransfer,
     ReleaseStorageRow,
     RestoreFailure,
     TemplatePullLine,
@@ -108,6 +114,11 @@ from space_smoke.runtime import (
 )
 
 KIND_NAMESPACE = "space"
+# The API creates sandbox pods in their own namespace, apart from the control
+# plane (`k8s.sandboxNamespace` in the Kind charts), where the
+# space-sandbox-network-policy chart's NetworkPolicies confine them.
+# Everything else the harness reads or mutates stays in KIND_NAMESPACE.
+KIND_SANDBOX_NAMESPACE = "sandboxes"
 KIND_BOOTSTRAP_POST_API_TIMEOUT_SECONDS = 2400
 # Longer than the 30-minute scenario budget plus a full controller rollout.
 # A crashed owner eventually expires, while a live scenario cannot be taken
@@ -136,6 +147,28 @@ def _require_ok(result: CommandResult, action: str) -> str:
             f"{action} failed ({result.returncode}): {result.detail() or '<no output>'}"
         )
     return result.stdout
+
+
+def _env_literals(
+    entries: Any, keys: Sequence[str], *, owner: str, value_from_refusal: str
+) -> dict[str, str | None]:
+    """The literal each key holds in a container's `env` entries, None if unset.
+
+    A `valueFrom` entry for a key is refused, naming `owner`, with the
+    caller's reason.
+    """
+
+    standing: dict[str, str | None] = {key: None for key in keys}
+    for entry in entries:
+        if not isinstance(entry, dict) or entry.get("name") not in standing:
+            continue
+        if "valueFrom" in entry:
+            raise SmokeConfigurationError(
+                f"{entry['name']} on {owner} is a valueFrom reference{value_from_refusal}"
+            )
+        value = entry.get("value")
+        standing[entry["name"]] = value if isinstance(value, str) else ""
+    return standing
 
 
 def _truthy_default(value: str | None, default: bool) -> bool:
@@ -270,19 +303,28 @@ SELECT id FROM snapshots
 """
 
 KIND_CONTROLLER_SELECTOR = "app.kubernetes.io/name=space-cluster-controller"
-# Worker node stacks only. The kind chart labels node-stack pods by ROLE, not by
-# DaemonSet name: `app.kubernetes.io/name: space-{{ $nodeRole }}` with
-# `$nodeRole` in {worker, builder} (infra/space/kind/charts/space-node-stack/
-# templates/daemonset.yaml). So the worker pods named `space-node-stack-*` carry
-# the label value `space-worker`, and builders are excluded by construction.
-# Selecting on the DaemonSet name (`space-node-stack`) matches nothing.
-KIND_NODE_STACK_SELECTOR = "app.kubernetes.io/name=space-worker"
-KIND_NODE_STACK_CONTAINER = "node-stack"
-# The builder node stacks: same chart, role `builder`, the same `node-stack`
-# container; two of them sit behind one Service on kind.
-KIND_BUILDER_NODE_STACK_SELECTOR = (
-    "app.kubernetes.io/name=space-builder,app.kubernetes.io/instance=space-builder"
-)
+# Node services run one DaemonSet per service per role, as production's do
+# (infra/space/kind/lib/node-services.sh). Every pod carries its node role as
+# `app.kubernetes.io/name` (space-worker or space-builder) and its service as
+# `app.kubernetes.io/component`, and its container is named after the service
+# (infra/space/kind/charts/space-node-service). Logs and environment are read
+# from the service that owns them.
+KIND_WORKER_ROLE = "space-worker"
+KIND_BUILDER_ROLE = "space-builder"
+NODE_SANDBOX_MANAGER = "sandbox-manager"
+NODE_TEMPLATE_MANAGER = "template-manager"
+NODE_VOLUME_MANAGER = "volume-manager"
+NODE_CTL = "node-ctl"
+NODE_API = "node-api"
+NODE_BUILD_MANAGER = "build-manager"
+# The Kind-only operator shell on every sandbox worker and builder
+# (infra/space/kind/charts/space-node-debug): the stand-in for the node host's
+# root shell, where the on-node CLIs, btrfs, dmsetup, cryptsetup and ctr run
+# against the node's /space and containerd. No service container is given a
+# tool, an identity or a privilege for the harness's sake.
+KIND_NODE_SHELL_SELECTOR = "app.kubernetes.io/name=space-node-debug"
+KIND_NODE_SHELL_CONTAINER = "shell"
+# Two builder node-apis sit behind one Service on kind.
 KIND_BUILDER_SERVICE = "space-builder-node-api"
 BUILDER_ROUTING_LABEL = "space.pplx.net/routing-smoke"
 OCI_BUILD_CACHE_DIR = "/space/cache/firecracker/builds/oci"
@@ -305,6 +347,12 @@ SANDBOX_RESIDENCY_SQL = """\
 SELECT lifecycle, coalesce(active_node_id::text, '') FROM sandboxes WHERE id = '{sandbox_id}'::uuid;
 """
 POD_CAP_QUOTA_NAME = "space-smoke-pod-cap"
+# The sandbox-isolation smoke's pod that no allow rule selects: the sandbox
+# pods' own image (k8s.sandboxPodImage), already on every sandbox node, run by
+# the node's default runtime rather than the SPACE shim.
+UNSELECTED_POD_LABEL = "space.pplx.net/smoke-unselected"
+UNSELECTED_POD_IMAGE = "registry.k8s.io/pause:3.10"
+UNSELECTED_POD_READY_SECONDS = 120
 PUBLIC_API_DEPLOYMENT_SELECTOR = "app.kubernetes.io/name=space-api"
 KIND_REDIS_DEPLOYMENT = "space-redis"
 KIND_OBJECT_STORE_DEPLOYMENT = "space-object-store"
@@ -329,18 +377,18 @@ SELECT generation, state, active, pod_name
  ORDER BY generation ASC;
 """
 EXECUTION_GENERATION_ANNOTATION = "space.pplx.net/execution-generation"
-# template-manager's on-node cache layout and unix identities, as the kind
-# node-stack entrypoint (scripts/k8s/node-stack-start.sh) creates them. The
-# CLI we exec runs as root (an allowed operator peer), but the DAEMON runs as
-# the tmplmgr user and is what stages, reads and removes the planted files —
-# so the plant must be owned like a real build or register cannot touch it.
+# template-manager's on-node cache layout and unix identities, as the node
+# layer and the service's identity create them. The CLI the operator shell
+# runs is root (an allowed operator peer), but the DAEMON runs as the tmplmgr
+# user and is what stages, reads and removes the planted files — so the plant
+# must be owned like a real build or register cannot touch it.
 TEMPLATE_CACHE_ROOT = "/space/cache/firecracker/templates"
 TEMPLATE_CACHE_OWNER = "space-tmplmgr"
 TEMPLATE_CACHE_GROUP = "space-cache-rw"
 TEMPLATE_GC_TICK_MESSAGE = "template GC tick complete"
 # template-manager's startup recovery pass (`service/startup_recovery.rs`).
 # The four structured lines are tracing events; the prune is an `eprintln!`
-# breadcrumb the node-stack supervisor tails into the pod log as raw text.
+# breadcrumb that reaches the container log as raw text.
 TEMPLATE_RECOVERY_FINISHED_MESSAGE = "template-manager startup recovery finished"
 TEMPLATE_RECOVERY_CONFIRMED_MESSAGE = (
     "digest dir confirmed against existing catalog row during startup recovery"
@@ -350,9 +398,21 @@ TEMPLATE_RECOVERY_REGISTERED_MESSAGE = (
 )
 TEMPLATE_RECOVERY_REJECTED_MESSAGE = "dropping invalid digest dir during startup recovery"
 TEMPLATE_RECOVERY_PRUNED_PREFIX = "[template-mgr] pruning stale build: "
-TEMPLATE_MANAGER_LOG = "/space/logs/tmplmgr.log"
-SANDBOX_MANAGER_LOG = "/space/logs/sbxmgr.log"
 KIND_SANDBOX_NODE_SELECTOR = "space.pplx.net/node-pool=sandbox"
+# The query API of each local observability backend, on the localhost port
+# both bring-up paths forward to it in `otel` mode.
+KIND_TELEMETRY_BACKENDS = {
+    "prometheus": "http://127.0.0.1:19090",
+    "tempo": "http://127.0.0.1:13200",
+    "loki": "http://127.0.0.1:13101",
+}
+# Each Kind telemetry mode by the (SPACE_METRICS_SINK, SPACE_TRACE_EXPORTER) it
+# gives space-api; MODES in infra/space/kind/scripts/telemetry_config.py sets them.
+KIND_TELEMETRY_MODES = {
+    ("datadog", "datadog"): "datadog",
+    ("otlp", "otlp"): "otel",
+    ("off", "off"): "off",
+}
 # The suspend codec facts sbx-manager seals into the published sidecar and
 # reports on its own `artifact_backup_queued` event.
 BACKUP_QUEUED_EVENT = "artifact_backup_queued"
@@ -398,6 +458,15 @@ SELECT content_hash
 """
 _TEMPLATE_IN_USE_MARKER = "sandbox(es) were created from"
 BTRFS_SEND_V1 = "btrfs-send-v1"
+# sandbox-manager's encode line for the stream codec; `deferred=true` means
+# the capture retained its source and wrote no `rootfs.btrfs-send`
+# (crates/libs/sbx/mgr/server/src/service/grpc_lifecycle/suspend_snapshot.rs).
+BTRFS_SEND_ENCODED_MESSAGE = "btrfs-send codec: rootfs encoded as btrfs send -p stream (via nodemgr)"
+RETAINED_SOURCE_BUNDLE = "rootfs.btrfs-source"
+ROOTFS_SEND_FILE = "rootfs.btrfs-send"
+# volume-manager's line for every single-file transfer job, the streamed
+# `push_btrfs_send` included (crates/libs/vol/mgr/server/src/executor.rs).
+TRANSFER_JOB_COMPLETED_MESSAGE = "transfer job completed"
 # `SPACE_TEMPLATE_RECEIVED_UUID_NS` (crates/libs/common/core/src/host/btrfs.rs):
 # a template installed from `(name, content_hash)` is stamped with
 # `UUIDv5(NS, "name@content_hash")` so a btrfs-send stream produced against
@@ -493,8 +562,9 @@ _TEMPLATE_GC_DEFAULT_BUDGET_BYTES = 100 * 1024 * 1024 * 1024
 _TEMPLATE_PREFETCH_DEFAULT_LATEST_N = 5
 
 # The API's suspend-restore selector for a user restore (see
-# `selected_suspend_restore_storage_uri` in crates/libs/api/.../store.rs and the
-# legacy suite's `wait_for_restore_affinity_portable`): a durable remote
+# `selected_suspend_restore_storage_uri` in
+# crates/libs/api/.../store/restore_source.rs and the legacy suite's
+# `wait_for_restore_affinity_portable`): a durable remote
 # snapshot is selectable only when a `ready` full snapshot with a storage
 # location is newer than the last placement change. Until then the planner
 # has only a source node and pre-binds the pod with `spec.nodeName`, which
@@ -598,20 +668,26 @@ class KindHarness:
         self.environment = dict(environment or os.environ)
         self._retention_lease_ownership: _LeaseOwnership | None = None
         self._cordon_lease_ownership: _LeaseOwnership | None = None
+        # The public API autoscaler's bounds before `scale_public_api` pinned
+        # them: (name, uid, minReplicas, maxReplicas).
+        self._public_api_autoscaler_bounds: tuple[str, str, int, int] | None = None
 
     def kubectl(
         self,
         *args: str,
         input_text: str | None = None,
         timeout: float | None = None,
+        namespace: str = KIND_NAMESPACE,
     ) -> CommandResult:
+        if namespace not in (KIND_NAMESPACE, KIND_SANDBOX_NAMESPACE):
+            raise ValueError(f"refusing kubectl in namespace {namespace!r}")
         return self.executor.run(
             [
                 "kubectl",
                 "--context",
                 self.config.context,
                 "-n",
-                KIND_NAMESPACE,
+                namespace,
                 *args,
             ],
             input_text=input_text,
@@ -721,6 +797,7 @@ class KindHarness:
             "-o",
             "json",
             timeout=15,
+            namespace=KIND_SANDBOX_NAMESPACE,
         )
         _require_ok(result, "observe cold-create pod")
         pods = json.loads(result.stdout).get("items", [])
@@ -772,6 +849,7 @@ class KindHarness:
             "-o",
             "json",
             timeout=15,
+            namespace=KIND_SANDBOX_NAMESPACE,
         )
         _require_ok(result, "observe warm-pool pod")
         pods = [
@@ -797,12 +875,11 @@ class KindHarness:
             (sandbox_id, config_id, slot_id, pod_name, pod_uid, node_name)
         ):
             raise SmokeConfigurationError("warm-pool pod identity is incomplete")
-        node_stack = self.worker_node_stack_pod(node_name)
         doctor = self.kubectl(
             "exec",
-            node_stack,
+            self._node_shell_pod(node_name),
             "-c",
-            KIND_NODE_STACK_CONTAINER,
+            KIND_NODE_SHELL_CONTAINER,
             "--",
             "/space/bin/space-sbxmgr",
             "doctor",
@@ -1479,6 +1556,7 @@ ON CONFLICT (key_hash) DO NOTHING;
             "-o",
             "json",
             timeout=15,
+            namespace=KIND_SANDBOX_NAMESPACE,
         )
         _require_ok(result, "observe sandbox pod placement")
         pods = [
@@ -1519,31 +1597,32 @@ ON CONFLICT (key_hash) DO NOTHING;
         canonical_sandbox_id: str,
         event_type: str,
         *,
-        pod_names: Collection[str] | None,
+        node_names: Collection[str] | None,
         since_time: str | None,
     ) -> list[tuple[str, dict[str, Any]]]:
         """(node, event) for every structured sandbox event of one type.
 
-        Read from worker node-stack logs; `since_time` bounds the read so a
-        long-lived bench does not scan history.
+        Read from the worker sandbox-managers' logs; `since_time` bounds the
+        read so a long-lived bench does not scan history.
         """
 
         listing = self.kubectl(
-            "get", "pods", "-l", KIND_NODE_STACK_SELECTOR, "-o", "json", timeout=15
+            "get", "pods", "-l", _node_service_selector(NODE_SANDBOX_MANAGER),
+            "-o", "json", timeout=15,
         )
-        _require_ok(listing, "list worker node-stack pods")
-        wanted = set(pod_names) if pod_names is not None else None
+        _require_ok(listing, "list worker sandbox-manager pods")
+        wanted = set(node_names) if node_names is not None else None
         needle = f'"{event_type}"'
         events: list[tuple[str, dict[str, Any]]] = []
         for pod in json.loads(listing.stdout or "{}").get("items", []):
             pod_name = pod.get("metadata", {}).get("name", "")
             node_name = pod.get("spec", {}).get("nodeName", "")
-            if not pod_name or (wanted is not None and pod_name not in wanted):
+            if not pod_name or (wanted is not None and node_name not in wanted):
                 continue
-            args = ["logs", pod_name, "-c", KIND_NODE_STACK_CONTAINER]
+            args = ["logs", pod_name, "-c", NODE_SANDBOX_MANAGER]
             args += ["--since-time", since_time] if since_time else ["--tail=50000"]
             logs = self.kubectl(*args, timeout=60)
-            _require_ok(logs, f"read node-stack logs on {node_name or pod_name}")
+            _require_ok(logs, f"read sandbox-manager logs on {node_name or pod_name}")
             for line in logs.stdout.splitlines():
                 if needle not in line or canonical_sandbox_id not in line:
                     continue
@@ -1563,10 +1642,10 @@ ON CONFLICT (key_hash) DO NOTHING;
         self,
         sandbox_id: str,
         *,
-        pod_names: Collection[str] | None = None,
+        node_names: Collection[str] | None = None,
         since_time: str | None = None,
     ) -> list[RestoreActivation]:
-        """Parse `runtime_activated` sandbox events from worker node-stack logs."""
+        """Parse `runtime_activated` sandbox events from worker sandbox-manager logs."""
 
         canonical = _sql_uuid(sandbox_id)
         return [
@@ -1581,96 +1660,211 @@ ON CONFLICT (key_hash) DO NOTHING;
                 execution_generation=str(event.get("execution_generation", "")),
             )
             for node_name, event in self._sandbox_events(
-                canonical, "runtime_activated", pod_names=pod_names, since_time=since_time
+                canonical, "runtime_activated", node_names=node_names, since_time=since_time
             )
         ]
 
     # ----- Template cache eviction: named on-node operations ------------------
-    # All of these run inside one worker's node-stack pod. The eviction knobs
-    # are read once at daemon start, so nothing here mutates them: the scenario
-    # reads what the DaemonSet rendered and plants a build the loop must
-    # reclaim.
+    # Each of these acts on one worker node: the operator shell runs the
+    # commands, and the owning service's pod supplies the logs and the knobs.
+    # The eviction knobs are read once at daemon start, so nothing here
+    # mutates them: the scenario reads what the DaemonSet rendered and plants a
+    # build the loop must reclaim.
 
-    def _node_stack_pod_env(self, pod_name: str) -> dict[str, str | None]:
-        """Literal env of the node-stack container on one running pod.
+    def _node_service_pod(
+        self, node_name: str, component: str, *, role: str = KIND_WORKER_ROLE
+    ) -> str:
+        """The one pod of a node service on a node."""
+
+        result = self.kubectl(
+            "get",
+            "pods",
+            "-l",
+            _node_service_selector(component, role=role),
+            "--field-selector",
+            f"spec.nodeName={_kube_node_name(node_name)}",
+            "-o",
+            "jsonpath={.items[*].metadata.name}",
+            timeout=15,
+        )
+        names = _require_ok(result, f"find the {component} pod on {node_name}").split()
+        if len(names) != 1:
+            raise SmokeConfigurationError(
+                f"expected one {component} pod on {node_name}, found {names}"
+            )
+        return names[0]
+
+    def ready_node_service_pod(
+        self, node_name: str, component: str, *, role: str = KIND_WORKER_ROLE
+    ) -> str | None:
+        """The node service's pod on a node, if exactly one is Ready."""
+
+        result = self.kubectl(
+            "get",
+            "pods",
+            "-l",
+            _node_service_selector(component, role=role),
+            "--field-selector",
+            f"spec.nodeName={_kube_node_name(node_name)}",
+            "-o",
+            "json",
+            timeout=15,
+        )
+        ready = _ready_pod_names(
+            _require_ok(result, f"list {component} pods on {node_name}"), excluding=""
+        )
+        return ready[0] if len(ready) == 1 else None
+
+    def _node_shell_pod(self, node_name: str) -> str:
+        result = self.kubectl(
+            "get",
+            "pods",
+            "-l",
+            KIND_NODE_SHELL_SELECTOR,
+            "--field-selector",
+            f"spec.nodeName={_kube_node_name(node_name)}",
+            "-o",
+            "jsonpath={.items[*].metadata.name}",
+            timeout=15,
+        )
+        names = _require_ok(result, f"find the operator shell on {node_name}").split()
+        if len(names) != 1:
+            raise SmokeConfigurationError(
+                f"expected one space-node-debug pod on {node_name}, found {names}"
+            )
+        return names[0]
+
+    def _node_service_logs(
+        self,
+        node_name: str,
+        component: str,
+        *,
+        role: str = KIND_WORKER_ROLE,
+        since_time: str | None = None,
+        tail: int | None = None,
+    ) -> str:
+        pod = self._node_service_pod(node_name, component, role=role)
+        args = ["logs", pod, "-c", component]
+        if since_time:
+            args += ["--since-time", since_time]
+        if tail is not None:
+            args.append(f"--tail={int(tail)}")
+        logs = self.kubectl(*args, timeout=60)
+        return _require_ok(logs, f"read {component} logs on {node_name}")
+
+    def _node_service_env(
+        self, node_name: str, component: str
+    ) -> dict[str, str | None]:
+        """Literal env of a node service's container on one running pod.
 
         The pod, not the DaemonSet spec: daemons read their knobs once at
         start, and mid-rollout the spec describes a pod that does not exist
         yet on this node.
         """
 
-        pod = _kube_pod_name(pod_name)
+        pod = self._node_service_pod(node_name, component)
         result = self.kubectl("get", "pod", pod, "-o", "json", timeout=15)
-        _require_ok(result, f"read node-stack pod {pod}")
+        _require_ok(result, f"read {component} pod {pod}")
         containers = json.loads(result.stdout or "{}").get("spec", {}).get(
             "containers", []
         )
         return {
             entry["name"]: entry.get("value")
             for container in containers
-            if container.get("name") == KIND_NODE_STACK_CONTAINER
+            if container.get("name") == component
             for entry in container.get("env", [])
             if isinstance(entry, dict) and isinstance(entry.get("name"), str)
         }
 
-    def template_cache_gc_config(self, pod_name: str) -> TemplateCacheGcConfig:
-        return _template_cache_gc_config_from_env(self._node_stack_pod_env(pod_name))
+    def template_cache_gc_config(self, node_name: str) -> TemplateCacheGcConfig:
+        return _template_cache_gc_config_from_env(
+            self._node_service_env(node_name, NODE_TEMPLATE_MANAGER)
+        )
 
-    def cold_eviction_config(self, pod_name: str) -> ColdEvictionConfig:
-        return _cold_eviction_config_from_env(self._node_stack_pod_env(pod_name))
+    def cold_eviction_config(self, node_name: str) -> ColdEvictionConfig:
+        return _cold_eviction_config_from_env(
+            self._node_service_env(node_name, NODE_SANDBOX_MANAGER)
+        )
 
-    def sandbox_cache_dir_present(self, pod_name: str, sandbox_id: str) -> bool:
+    def sandbox_cache_dir_present(self, node_name: str, sandbox_id: str) -> bool:
         path = f"{SANDBOX_CACHE_ROOT}/{_sql_uuid(sandbox_id)}"
         # `test -e` exits 1 for "absent" and 0 for "present"; anything else is
         # the exec itself failing and must not read as "gone".
-        result = self._node_stack_exec(
-            pod_name, f"test -e {path}; echo $?", timeout=30
+        result = self._node_shell_exec(
+            node_name, f"test -e {path}; echo $?", timeout=30
         )
         if result.returncode != 0 or result.stdout.strip() not in ("0", "1"):
             raise RuntimeError(
-                f"could not probe {path} on {pod_name} ({result.returncode}): "
+                f"could not probe {path} on {node_name} ({result.returncode}): "
                 f"{result.detail() or '<no output>'}"
             )
         return result.stdout.strip() == "0"
 
-    def snapshot_reaper_config(self, pod_name: str) -> SnapshotReaperConfig:
-        return _snapshot_reaper_config_from_env(self._node_stack_pod_env(pod_name))
+    def snapshot_reaper_config(self, node_name: str) -> SnapshotReaperConfig:
+        return _snapshot_reaper_config_from_env(
+            self._node_service_env(node_name, NODE_SANDBOX_MANAGER)
+        )
 
-    def sandbox_snapshot_dirs(self, pod_name: str, sandbox_id: str) -> tuple[str, ...]:
+    def sandbox_canonical_snapshot_entries(self, node_name: str, sandbox_id: str) -> tuple[str, ...]:
+        """Entries of the sandbox's canonical suspend snapshot directory, dotfiles included."""
+
+        path = f"{SANDBOX_CACHE_ROOT}/{_sql_uuid(sandbox_id)}/snapshot"
+        result = self._node_shell_exec(
+            node_name,
+            f"if [ ! -e {path} ]; then exit 0; fi; ls -1A {path}",
+            timeout=30,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"could not list {path} on {node_name} ({result.returncode}): "
+                f"{result.detail() or '<no output>'}"
+            )
+        return tuple(line.strip() for line in result.stdout.splitlines() if line.strip())
+
+    def btrfs_send_captures(
+        self, sandbox_id: str, node_name: str, *, since_time: str
+    ) -> list[BtrfsSendCapture]:
+        logs = self._node_service_logs(node_name, NODE_SANDBOX_MANAGER, since_time=since_time)
+        return _btrfs_send_captures_from_logs(logs, _sql_uuid(sandbox_id), node_name)
+
+    def completed_transfers(
+        self, sandbox_id: str, node_name: str, *, since_time: str
+    ) -> list[CompletedTransfer]:
+        logs = self._node_service_logs(node_name, NODE_VOLUME_MANAGER, since_time=since_time)
+        return _completed_transfers_from_logs(
+            logs, f"{SANDBOX_CACHE_ROOT}/{_sql_uuid(sandbox_id)}/", node_name
+        )
+
+    def sandbox_snapshot_dirs(self, node_name: str, sandbox_id: str) -> tuple[str, ...]:
         path = f"{SANDBOX_CACHE_ROOT}/{_sql_uuid(sandbox_id)}/snapshots"
         # A snapshots dir that does not exist is a legitimate "none". Any
         # other `ls` failure (it exits 2 for unreadable paths too) or an exec
         # failure must propagate rather than read as "reaped".
-        result = self._node_stack_exec(
-            pod_name,
+        result = self._node_shell_exec(
+            node_name,
             f"if [ ! -e {path} ]; then exit 0; fi; ls -1 {path}",
             timeout=30,
         )
         if result.returncode != 0:
             raise RuntimeError(
-                f"could not list {path} on {pod_name} ({result.returncode}): "
+                f"could not list {path} on {node_name} ({result.returncode}): "
                 f"{result.detail() or '<no output>'}"
             )
         return tuple(line.strip() for line in result.stdout.splitlines() if line.strip())
 
     def reaped_artifacts(
-        self, pod_name: str, sandbox_id: str, *, since_time: str
+        self, node_name: str, sandbox_id: str, *, since_time: str
     ) -> list[ReapedArtifact]:
         # The staging-path convention (`<cache>/<canonical uuid>/snapshots/…`)
         # is the adapter's to know; the caller hands over whatever id form the
         # SDK gave it and the join uses the same canonical form the reaper
         # itself writes.
         prefix = f"{SANDBOX_CACHE_ROOT}/{_sql_uuid(sandbox_id)}/snapshots/"
-        pod = _kube_pod_name(pod_name)
-        node = self.kubectl("get", "pod", pod, "-o", "jsonpath={.spec.nodeName}")
-        node_name = _require_ok(node, f"resolve node for {pod}").strip()
-        logs = self.kubectl(
-            "logs", pod, "-c", KIND_NODE_STACK_CONTAINER, "--since-time", since_time,
-            timeout=60,
+        logs = self._node_service_logs(
+            node_name, NODE_SANDBOX_MANAGER, since_time=since_time
         )
-        _require_ok(logs, f"read node-stack logs on {node_name or pod}")
         reaped: list[ReapedArtifact] = []
-        for line in logs.stdout.splitlines():
+        for line in logs.splitlines():
             if REAPER_DELETED_MESSAGE not in line:
                 continue
             fields = _tracing_fields(line)
@@ -1707,25 +1901,19 @@ ON CONFLICT (key_hash) DO NOTHING;
             raise SmokeConfigurationError(f"unexpected artifact backup query result: {value!r}")
         return value == "t"
 
-    def reaper_loop_log(self, pod_name: str, *, since_time: str) -> list[str]:
-        pod = _kube_pod_name(pod_name)
-        logs = self.kubectl(
-            "logs", pod, "-c", KIND_NODE_STACK_CONTAINER, "--since-time", since_time,
-            timeout=60,
+    def reaper_loop_log(self, node_name: str, *, since_time: str) -> list[str]:
+        logs = self._node_service_logs(
+            node_name, NODE_SANDBOX_MANAGER, since_time=since_time
         )
-        _require_ok(logs, f"read node-stack logs on {pod}")
-        return [line[:400] for line in logs.stdout.splitlines() if "snapshot reaper" in line][-40:]
+        return [line[:400] for line in logs.splitlines() if "snapshot reaper" in line][-40:]
 
-    def eviction_loop_log(self, pod_name: str, *, since_time: str) -> list[str]:
-        pod = _kube_pod_name(pod_name)
-        logs = self.kubectl(
-            "logs", pod, "-c", KIND_NODE_STACK_CONTAINER, "--since-time", since_time,
-            timeout=60,
+    def eviction_loop_log(self, node_name: str, *, since_time: str) -> list[str]:
+        logs = self._node_service_logs(
+            node_name, NODE_SANDBOX_MANAGER, since_time=since_time
         )
-        _require_ok(logs, f"read node-stack logs on {pod}")
         return [
             line[:400]
-            for line in logs.stdout.splitlines()
+            for line in logs.splitlines()
             if "sandbox eviction" in line and "tick complete" not in line
         ][-40:]
 
@@ -1733,7 +1921,7 @@ ON CONFLICT (key_hash) DO NOTHING;
         self,
         sandbox_id: str,
         *,
-        pod_names: Collection[str] | None = None,
+        node_names: Collection[str] | None = None,
         since_time: str | None = None,
     ) -> list[LocalEviction]:
         canonical = _sql_uuid(sandbox_id)
@@ -1747,39 +1935,17 @@ ON CONFLICT (key_hash) DO NOTHING;
             for node_name, event in self._sandbox_events(
                 canonical,
                 "local_eviction_completed",
-                pod_names=pod_names,
+                node_names=node_names,
                 since_time=since_time,
             )
         ]
-
-    def worker_node_stack_pod(self, node_name: str) -> str:
-        result = self.kubectl(
-            "get",
-            "pods",
-            "-l",
-            KIND_NODE_STACK_SELECTOR,
-            "--field-selector",
-            f"spec.nodeName={_kube_node_name(node_name)}",
-            "-o",
-            "jsonpath={.items[*].metadata.name}",
-            timeout=15,
-        )
-        names = _require_ok(
-            result, f"find the worker node-stack pod on {node_name}"
-        ).split()
-        if len(names) != 1:
-            raise SmokeConfigurationError(
-                f"expected one worker node-stack pod on {node_name}, found {names}"
-            )
-        return names[0]
 
     def require_encrypted_volume_support(self) -> None:
         """Reject missing host targets before creating an owned BYOK identity."""
         self._require_isolated_kind("encrypted volume preflight")
         for node in self.sandbox_pool_nodes():
-            pod = self.worker_node_stack_pod(node)
             result = self.kubectl(
-                "exec", pod, "-c", KIND_NODE_STACK_CONTAINER,
+                "exec", self._node_shell_pod(node), "-c", KIND_NODE_SHELL_CONTAINER,
                 "--", "dmsetup", "targets", timeout=15,
             )
             targets = {
@@ -1804,14 +1970,14 @@ ON CONFLICT (key_hash) DO NOTHING;
 
         self._require_isolated_kind("encrypted snapshot observation")
         canonical = _sql_uuid(sandbox_id)
-        pod = self.worker_node_stack_pod(node_name)
+        pod = self._node_shell_pod(node_name)
         path = f"/space/cache/firecracker/sandboxes/{canonical}/instance/snapshot.luks"
         luks_uuid = _require_ok(
             self.kubectl(
                 "exec",
                 pod,
                 "-c",
-                KIND_NODE_STACK_CONTAINER,
+                KIND_NODE_SHELL_CONTAINER,
                 "--",
                 "cryptsetup",
                 "luksUUID",
@@ -1832,7 +1998,7 @@ ON CONFLICT (key_hash) DO NOTHING;
                 "exec",
                 pod,
                 "-c",
-                KIND_NODE_STACK_CONTAINER,
+                KIND_NODE_SHELL_CONTAINER,
                 "--",
                 "stat",
                 "-c",
@@ -1879,6 +2045,7 @@ ON CONFLICT (key_hash) DO NOTHING;
                 "-o",
                 "json",
                 timeout=15,
+                namespace=KIND_SANDBOX_NAMESPACE,
             )
             payload = json.loads(_require_ok(result, "list completed sandbox pods"))
             items = payload.get("items") if isinstance(payload, dict) else None
@@ -1910,6 +2077,7 @@ ON CONFLICT (key_hash) DO NOTHING;
                     "--force",
                     "--wait=false",
                     timeout=15,
+                    namespace=KIND_SANDBOX_NAMESPACE,
                 ),
                 f"force-clear completed sandbox pod {name}",
             )
@@ -1936,15 +2104,17 @@ ON CONFLICT (key_hash) DO NOTHING;
         if result.stdout.strip() != expected_uid:
             raise SmokeConfigurationError(f"{action} refused a changed Kind cluster identity")
 
-    def _node_stack_exec(
-        self, pod_name: str, script: str, *, timeout: float = 120
+    def _node_shell_exec(
+        self, node_name: str, script: str, *, timeout: float = 120
     ) -> CommandResult:
-        self._require_isolated_kind("on-node template operations")
+        """Run a script in the node's operator shell, as root on the node."""
+
+        self._require_isolated_kind("on-node operations")
         return self.kubectl(
             "exec",
-            _kube_pod_name(pod_name),
+            self._node_shell_pod(node_name),
             "-c",
-            KIND_NODE_STACK_CONTAINER,
+            KIND_NODE_SHELL_CONTAINER,
             "--",
             "bash",
             "-c",
@@ -1953,7 +2123,7 @@ ON CONFLICT (key_hash) DO NOTHING;
         )
 
     def register_unpinned_template(
-        self, pod_name: str, template: str, size_bytes: int
+        self, node_name: str, template: str, size_bytes: int
     ) -> None:
         name = _smoke_template_name(template)
         if size_bytes <= 0 or size_bytes > 8 * 1024**3:
@@ -1992,11 +2162,11 @@ ON CONFLICT (key_hash) DO NOTHING;
             ]
         )
         _require_ok(
-            self._node_stack_exec(pod_name, script, timeout=900),
-            f"register throwaway template {name} on {pod_name}",
+            self._node_shell_exec(node_name, script, timeout=900),
+            f"register throwaway template {name} on {node_name}",
         )
 
-    def delete_template(self, pod_name: str, template: str) -> None:
+    def delete_template(self, node_name: str, template: str) -> None:
         name = _smoke_template_name(template)
         directory = shlex.quote(f"{TEMPLATE_CACHE_ROOT}/{name}")
         stash = shlex.quote(_template_stash_dir(name))
@@ -2013,12 +2183,12 @@ ON CONFLICT (key_hash) DO NOTHING;
             f"rm -rf {directory} {stash}"
         )
         _require_ok(
-            self._node_stack_exec(pod_name, script, timeout=120),
-            f"delete throwaway template {name} on {pod_name}",
+            self._node_shell_exec(node_name, script, timeout=120),
+            f"delete throwaway template {name} on {node_name}",
         )
 
     def protected_template_builds(
-        self, pod_name: str, sandbox_id: str, template_selector: str
+        self, node_name: str, sandbox_id: str, template_selector: str
     ) -> tuple[str, ...]:
         """The active sandbox build and selected release, resolved before planting."""
         name_and_tag, separator, digest = template_selector.partition("@")
@@ -2035,6 +2205,7 @@ ON CONFLICT (key_hash) DO NOTHING;
             "get", "pods", "-l",
             f"space.pplx.net/sandbox-id={_sql_uuid(sandbox_id)}", "-o", "json",
             timeout=15,
+            namespace=KIND_SANDBOX_NAMESPACE,
         )
         document = json.loads(_require_ok(pods, "read active sandbox template build"))
         bound = [p for p in document.get("items", []) if p.get("spec", {}).get("nodeName")]
@@ -2044,8 +2215,8 @@ ON CONFLICT (key_hash) DO NOTHING;
         if annotations.get("space.pplx.net/template") != name:
             raise RuntimeError("sandbox pod template does not match the selected template")
         active = _template_digest(str(annotations.get("space.pplx.net/content-hash", "")))
-        resolved = self._node_stack_exec(
-            pod_name, f"space-tmplmgr get --template {name} {selector_arg}", timeout=60
+        resolved = self._node_shell_exec(
+            node_name, f"space-tmplmgr get --template {name} {selector_arg}", timeout=60
         )
         output = _require_ok(resolved, "resolve the selected protected template before planting")
         hashes = re.findall(r"^content_hash:\s*(sha256:[0-9a-f]{64})\s*$", output, re.MULTILINE)
@@ -2054,7 +2225,7 @@ ON CONFLICT (key_hash) DO NOTHING;
         return tuple(sorted({active, hashes[0]}))
 
     def template_build_state(
-        self, pod_name: str, template: str, content_hash: str
+        self, node_name: str, template: str, content_hash: str
     ) -> str | None:
         # By exact content hash. A bare name always resolves through the
         # cluster (a tenant must authorize even a cache hit), which has no
@@ -2062,8 +2233,8 @@ ON CONFLICT (key_hash) DO NOTHING;
         # with no caller organization resolves from this node's cache. Either
         # way a successful resolution touches the build's LRU clock.
         name = _template_name(template)
-        result = self._node_stack_exec(
-            pod_name,
+        result = self._node_shell_exec(
+            node_name,
             f"space-tmplmgr get --template {name} --content-hash {shlex.quote(content_hash)}",
             timeout=60,
         )
@@ -2081,12 +2252,12 @@ ON CONFLICT (key_hash) DO NOTHING;
                 return value.strip() or None
         raise RuntimeError(f"space-tmplmgr get {name} printed no state line")
 
-    def template_digest_dirs(self, pod_name: str, template: str) -> tuple[str, ...]:
+    def template_digest_dirs(self, node_name: str, template: str) -> tuple[str, ...]:
         name = _template_name(template)
         # `ls -d` exits 2 with no match, which is a legitimate "none"; anything
         # else (no shell, pod gone, exec refused) must not read as "gone".
-        result = self._node_stack_exec(
-            pod_name,
+        result = self._node_shell_exec(
+            node_name,
             f"out=$(ls -d {TEMPLATE_CACHE_ROOT}/{name}/sha256:* 2>/dev/null); "
             'rc=$?; if [ "$rc" -ne 0 ] && [ "$rc" -ne 2 ]; then exit "$rc"; fi; '
             'printf "%s\n" "$out"',
@@ -2094,7 +2265,7 @@ ON CONFLICT (key_hash) DO NOTHING;
         )
         if result.returncode != 0:
             raise RuntimeError(
-                f"could not list digest directories for {name} on {pod_name} "
+                f"could not list digest directories for {name} on {node_name} "
                 f"({result.returncode}): {result.detail() or '<no output>'}"
             )
         return tuple(
@@ -2113,7 +2284,7 @@ ON CONFLICT (key_hash) DO NOTHING;
                 object_uri=str(event.get("object_uri", "")),
             )
             for node, event in self._sandbox_events(
-                canonical, BACKUP_QUEUED_EVENT, pod_names=None, since_time=since_time
+                canonical, BACKUP_QUEUED_EVENT, node_names=None, since_time=since_time
             )
         ]
 
@@ -2126,21 +2297,21 @@ ON CONFLICT (key_hash) DO NOTHING;
             raise RuntimeError(f"sandbox {sandbox_id} has no ready full snapshot row")
         return _template_digest(digest)
 
-    def evict_template_from_worker(self, pod_name: str, template: str) -> list[str]:
+    def evict_template_from_worker(self, node_name: str, template: str) -> list[str]:
         name = _template_name(template)
         # The daemon's own removal: rows, files (subvolume-aware) and
         # settings. Prefetch will re-pull a pinned template on its next tick,
         # which is why callers act within the same breath. The daemon refuses
         # while any local sandbox row was created from the template — that
         # includes a `restoring` row a failed cross-node restore retained.
-        result = self._node_stack_exec(
-            pod_name, f"space-tmplmgr delete-template --template {name}", timeout=300
+        result = self._node_shell_exec(
+            node_name, f"space-tmplmgr delete-template --template {name}", timeout=300
         )
         if result.returncode != 0 and _TEMPLATE_IN_USE_MARKER in result.detail():
             ids = _UUID_RE.findall(result.detail())
             if not ids:
                 raise RuntimeError(
-                    f"template-manager refused to remove {name} on {pod_name} for in-use "
+                    f"template-manager refused to remove {name} on {node_name} for in-use "
                     f"sandboxes but named none: {result.detail()[:400]}"
                 )
             return ids
@@ -2151,23 +2322,23 @@ ON CONFLICT (key_hash) DO NOTHING;
             # and prefetch has not re-pulled it yet. The caller wants it gone,
             # and proves that from the worker's filesystem afterwards.
             return []
-        _require_ok(result, f"remove template {name} from {pod_name}")
+        _require_ok(result, f"remove template {name} from {node_name}")
         return []
 
-    def reclaim_cluster_deleted_local_sandbox(self, pod_name: str, sandbox_id: str) -> None:
+    def reclaim_cluster_deleted_local_sandbox(self, node_name: str, sandbox_id: str) -> None:
         canonical = _sql_uuid(sandbox_id)
         if self._psql(
             SANDBOX_LIVE_SQL.format(sandbox_id=canonical), action="probe sandbox liveness"
         ).strip():
             raise SmokeConfigurationError(
                 f"sandbox {canonical} still exists on the cluster or is a reserved pool "
-                f"slot; its local row on {pod_name} is live state, not residue"
+                f"slot; its local row on {node_name} is live state, not residue"
             )
         # An unknown id is a no-op exit 0 ("No sandboxes deleted."), so a
         # row that vanished between the refusal and here is harmless.
         _require_ok(
-            self._node_stack_exec(pod_name, f"space-sbxmgr delete {canonical}", timeout=180),
-            f"reclaim cluster-deleted local sandbox {canonical} on {pod_name}",
+            self._node_shell_exec(node_name, f"space-sbxmgr delete {canonical}", timeout=180),
+            f"reclaim cluster-deleted local sandbox {canonical} on {node_name}",
         )
 
     def reclaim_local_sandbox_everywhere(
@@ -2220,18 +2391,17 @@ ON CONFLICT (key_hash) DO NOTHING;
     def _reclaim_local_sandbox_on(self, node: str, canonical: str, deadline: float) -> str | None:
         while True:
             remaining = deadline - time.monotonic()
-            # A scenario may have just restarted this worker's stack.
-            pod = self.ready_worker_node_stack_pod(node)
-            if pod is None:
+            # A scenario may have just restarted this worker's sandbox-manager.
+            if self.ready_node_service_pod(node, NODE_SANDBOX_MANAGER) is None:
                 if remaining <= 0:
-                    return f"no ready node-stack pod on {node}"
+                    return f"no ready sandbox-manager pod on {node}"
                 time.sleep(min(2.0, remaining))
                 continue
             # An unknown id is a no-op exit 0, as above; `--blocking` returns
             # once the row is gone rather than once it is admitted. The exec is
             # bounded by what is left of the delete budget.
-            result = self._node_stack_exec(
-                pod, f"space-sbxmgr delete --blocking {canonical}", timeout=max(5.0, remaining)
+            result = self._node_shell_exec(
+                node, f"space-sbxmgr delete --blocking {canonical}", timeout=max(5.0, remaining)
             )
             if result.returncode == 0:
                 return None
@@ -2266,26 +2436,19 @@ ON CONFLICT (key_hash) DO NOTHING;
         return nodes
 
     def template_pulls(
-        self, pod_name: str, template: str, *, since_time: str
+        self, node_name: str, template: str, *, since_time: str
     ) -> list[TemplatePullLine]:
         name = _template_name(template)
-        logs = self.kubectl(
-            "logs",
-            _kube_pod_name(pod_name),
-            "-c",
-            KIND_NODE_STACK_CONTAINER,
-            "--since-time",
-            since_time,
-            timeout=60,
+        logs = self._node_service_logs(
+            node_name, NODE_TEMPLATE_MANAGER, since_time=since_time
         )
-        _require_ok(logs, f"read node-stack logs on {pod_name}")
         # The pull-span `trigger` rides on the lines template-manager writes
         # inside the span ("starting pull", "already present", "joining
         # in-flight"); the vol-mgr plan line runs in a task outside it and
         # carries none. Keep both: the trigger says which lookup initiated a
         # pull, the plan line says bytes actually came in.
         lines: list[TemplatePullLine] = []
-        for line in logs.stdout.splitlines():
+        for line in logs.splitlines():
             if name not in line or "pull" not in line:
                 continue
             fields = _tracing_fields(line)
@@ -2298,14 +2461,14 @@ ON CONFLICT (key_hash) DO NOTHING;
         return lines
 
     def template_subvolume_received_uuid(
-        self, pod_name: str, template: str, digest: str
+        self, node_name: str, template: str, digest: str
     ) -> str | None:
         path = shlex.quote(
             f"{TEMPLATE_CACHE_ROOT}/{_template_name(template)}/{_template_digest(digest)}"
         )
         # 0: subvolume (output parsed); 3: a plain directory; 4: absent.
-        result = self._node_stack_exec(
-            pod_name,
+        result = self._node_shell_exec(
+            node_name,
             f"if [ ! -e {path} ]; then exit 4; fi; "
             f"if btrfs subvolume show {path} 2>/dev/null; then exit 0; fi; exit 3",
             timeout=60,
@@ -2313,8 +2476,8 @@ ON CONFLICT (key_hash) DO NOTHING;
         if result.returncode == 3:
             return None
         if result.returncode == 4:
-            raise RuntimeError(f"no digest dir {digest} for {template} on {pod_name}")
-        stdout = _require_ok(result, f"inspect template subvolume on {pod_name}")
+            raise RuntimeError(f"no digest dir {digest} for {template} on {node_name}")
+        stdout = _require_ok(result, f"inspect template subvolume on {node_name}")
         for line in stdout.splitlines():
             key, _, value = line.partition(":")
             if key.strip() == "Received UUID":
@@ -2322,27 +2485,27 @@ ON CONFLICT (key_hash) DO NOTHING;
                 return "" if value == "-" else value
         raise RuntimeError("btrfs subvolume show printed no Received UUID line")
 
-    def sandbox_instance_entries(self, pod_name: str, sandbox_id: str) -> tuple[str, ...]:
+    def sandbox_instance_entries(self, node_name: str, sandbox_id: str) -> tuple[str, ...]:
         root = shlex.quote(f"{SANDBOX_CACHE_ROOT}/{_sql_uuid(sandbox_id)}")
-        result = self._node_stack_exec(
-            pod_name, f"if [ ! -e {root} ]; then exit 0; fi; ls -1 {root}", timeout=30
+        result = self._node_shell_exec(
+            node_name, f"if [ ! -e {root} ]; then exit 0; fi; ls -1 {root}", timeout=30
         )
-        stdout = _require_ok(result, f"list sandbox cache dir on {pod_name}")
+        stdout = _require_ok(result, f"list sandbox cache dir on {node_name}")
         return tuple(
             e.strip() for e in stdout.splitlines() if e.strip().startswith("instance")
         )
 
-    def sandbox_instance_is_subvolume(self, pod_name: str, sandbox_id: str) -> bool:
+    def sandbox_instance_is_subvolume(self, node_name: str, sandbox_id: str) -> bool:
         path = shlex.quote(f"{SANDBOX_CACHE_ROOT}/{_sql_uuid(sandbox_id)}/instance")
-        result = self._node_stack_exec(
-            pod_name,
+        result = self._node_shell_exec(
+            node_name,
             f"if [ ! -e {path} ]; then exit 4; fi; "
             f"btrfs subvolume show {path} >/dev/null 2>&1 && echo yes || echo no",
             timeout=60,
         )
         if result.returncode == 4:
-            raise RuntimeError(f"sandbox {sandbox_id} has no instance on {pod_name}")
-        return _require_ok(result, f"inspect instance on {pod_name}").strip() == "yes"
+            raise RuntimeError(f"sandbox {sandbox_id} has no instance on {node_name}")
+        return _require_ok(result, f"inspect instance on {node_name}").strip() == "yes"
 
     def restore_failures(self, sandbox_id: str, *, since_time: str) -> list[RestoreFailure]:
         canonical = _sql_uuid(sandbox_id)
@@ -2356,7 +2519,7 @@ ON CONFLICT (key_hash) DO NOTHING;
                 restore_codec=str(event.get("restore_codec", "")),
             )
             for node, event in self._sandbox_events(
-                canonical, RESTORE_FAILED_EVENT, pod_names=None, since_time=since_time
+                canonical, RESTORE_FAILED_EVENT, node_names=None, since_time=since_time
             )
         ]
 
@@ -2503,11 +2666,65 @@ ON CONFLICT (key_hash) DO NOTHING;
             self.kubectl("get", "deploy", name, "-o", "jsonpath={.spec.replicas}", timeout=15),
             f"read replicas of {name}",
         ).strip()
+        autoscaler = self._public_api_autoscaler(name)
+        if autoscaler is not None:
+            # An autoscaler owns the replica count and reconciles a manual
+            # scale away once its scale-down window passes, so the count is
+            # set through its bounds; `restore_public_api_autoscaler` puts the
+            # captured bounds back.
+            metadata, spec = autoscaler["metadata"], autoscaler["spec"]
+            if self._public_api_autoscaler_bounds is None:
+                self._public_api_autoscaler_bounds = (
+                    str(metadata["name"]), str(metadata["uid"]),
+                    int(spec.get("minReplicas", 1)), int(spec["maxReplicas"]),
+                )
+            self._patch_public_api_autoscaler(replicas, replicas)
         _require_ok(
             self.kubectl("scale", f"deploy/{name}", f"--replicas={replicas}", timeout=30),
             f"scale {name} to {replicas}",
         )
         return int(previous) if previous.isdigit() else 1
+
+    def restore_public_api_autoscaler(self) -> None:
+        if self._public_api_autoscaler_bounds is None:
+            return
+        _, _, minimum, maximum = self._public_api_autoscaler_bounds
+        self._patch_public_api_autoscaler(minimum, maximum)
+        self._public_api_autoscaler_bounds = None
+
+    def _public_api_autoscaler(self, deployment: str) -> dict[str, Any] | None:
+        listing = json.loads(
+            _require_ok(self.kubectl("get", "hpa", "-o", "json", timeout=15), "list autoscalers")
+            or "{}"
+        )
+        matches = [
+            item
+            for item in listing.get("items", [])
+            if (item.get("spec") or {}).get("scaleTargetRef", {}).get("kind") == "Deployment"
+            and item["spec"]["scaleTargetRef"].get("name") == deployment
+        ]
+        if len(matches) > 1:
+            raise SmokeConfigurationError(f"more than one autoscaler targets {deployment}")
+        return matches[0] if matches else None
+
+    def _patch_public_api_autoscaler(self, minimum: int, maximum: int) -> None:
+        assert self._public_api_autoscaler_bounds is not None
+        name, uid, _, _ = self._public_api_autoscaler_bounds
+        current = json.loads(
+            _require_ok(self.kubectl("get", "hpa", name, "-o", "json", timeout=15), f"read {name}")
+            or "{}"
+        )
+        if current.get("metadata", {}).get("uid") != uid:
+            raise SmokeConfigurationError(f"refusing replaced autoscaler {name}")
+        patch = [
+            {"op": "test", "path": "/metadata/uid", "value": uid},
+            {"op": "replace", "path": "/spec/minReplicas", "value": minimum},
+            {"op": "replace", "path": "/spec/maxReplicas", "value": maximum},
+        ]
+        _require_ok(
+            self.kubectl("patch", "hpa", name, "--type=json", "--patch", json.dumps(patch), timeout=15),
+            f"set {name} bounds to {minimum}..{maximum}",
+        )
 
     def wait_public_api_rollout(self, *, timeout: float) -> None:
         name = self._public_api_deployment()
@@ -2518,6 +2735,56 @@ ON CONFLICT (key_hash) DO NOTHING;
             ),
             f"await rollout of {name}",
         )
+        self._wait_deployment_pods_drained(name, timeout=timeout)
+
+    def wait_public_api_pods_drained(self, *, timeout: float) -> None:
+        """Block until only the Deployment's desired API pods exist, none Terminating."""
+
+        self._wait_deployment_pods_drained(self._public_api_deployment(), timeout=timeout)
+
+    def _wait_deployment_pods_drained(self, name: str, *, timeout: float) -> None:
+        """Block until only the Deployment's desired pods exist, none Terminating.
+
+        `kubectl rollout status` completes a rolling update, or a scale-down,
+        once the available count matches the spec, while the replaced pods are
+        still shutting down. A client that holds a pooled connection to one of
+        them (the load-balanced entry hands each connection to one replica)
+        has it reset when that pod exits, so a caller about to reuse its
+        client waits for the old pods to be gone, which closes those
+        connections first.
+        """
+
+        deadline = time.monotonic() + timeout
+        while True:
+            # Re-read each poll: an autoscaler may move the desired count.
+            deployment = json.loads(
+                _require_ok(
+                    self.kubectl("get", "deploy", name, "-o", "json", timeout=15),
+                    f"read {name}",
+                )
+            )
+            desired = int(deployment["spec"].get("replicas", 1))
+            match_labels = deployment["spec"]["selector"].get("matchLabels") or {}
+            if not match_labels:
+                raise SmokeConfigurationError(f"{name} has no matchLabels selector to list its pods by")
+            selector = ",".join(f"{key}={value}" for key, value in sorted(match_labels.items()))
+            pods = json.loads(
+                _require_ok(
+                    self.kubectl("get", "pods", "-l", selector, "-o", "json", timeout=15),
+                    f"list {name} pods",
+                )
+            ).get("items", [])
+            terminating = [
+                pod["metadata"]["name"] for pod in pods if pod["metadata"].get("deletionTimestamp")
+            ]
+            if not terminating and len(pods) == desired:
+                return
+            if time.monotonic() > deadline:
+                raise RuntimeError(
+                    f"{name} pods did not drain to {desired} within {timeout:g}s "
+                    f"(present={len(pods)}, terminating={terminating})"
+                )
+            time.sleep(1)
 
     # --- node groups ----------------------------------------------------------
 
@@ -2580,19 +2847,10 @@ ON CONFLICT (key_hash) DO NOTHING;
             "jsonpath={.spec.template.spec.containers[0].env}", timeout=15,
         )
         _require_ok(result, f"read env of {name}")
-        wanted = set(keys)
-        standing: dict[str, str | None] = {key: None for key in keys}
-        for entry in json.loads(result.stdout or "[]"):
-            if not isinstance(entry, dict) or entry.get("name") not in wanted:
-                continue
-            if "valueFrom" in entry:
-                raise SmokeConfigurationError(
-                    f"{entry['name']} on {name} is a valueFrom reference; refusing to override "
-                    "what a literal restore could not put back"
-                )
-            value = entry.get("value")
-            standing[entry["name"]] = value if isinstance(value, str) else ""
-        return standing
+        return _env_literals(
+            json.loads(result.stdout or "[]"), keys, owner=name,
+            value_from_refusal="; refusing to override what a literal restore could not put back",
+        )
 
     def _set_deployment_env(self, name: str, values: Mapping[str, str | None], *, timeout: float) -> None:
         if self._set_deployment_env_only(name, values):
@@ -2616,6 +2874,7 @@ ON CONFLICT (key_hash) DO NOTHING;
             self.kubectl("rollout", "status", f"deploy/{name}", f"--timeout={int(timeout)}s", timeout=timeout + 30),
             f"await rollout of {name}",
         )
+        self._wait_deployment_pods_drained(name, timeout=timeout)
 
     def node_group_env(self) -> dict[str, str | None]:
         """`api:<key>` / `controller:<key>` literals for the gate and the labeler."""
@@ -2706,18 +2965,18 @@ ON CONFLICT (key_hash) DO NOTHING;
     def namespace(self) -> str:
         return KIND_NAMESPACE
 
-    def node_stack_identity_for_sandbox(self, sandbox_id: str) -> NodeStackIdentity:
+    def node_ctl_identity_for_sandbox(self, sandbox_id: str) -> NodeCtlIdentity:
         placement = self.sandbox_pod_placement(sandbox_id)
         if placement is None:
             raise SmokeConfigurationError(f"sandbox {sandbox_id} has no execution pod; cannot pick its worker")
-        pod = self.worker_node_stack_pod(placement.node_name)
+        pod = self._node_service_pod(placement.node_name, NODE_CTL)
         result = self.kubectl("get", "pod", _kube_pod_name(pod), "-o", "json", timeout=15)
-        document = json.loads(_require_ok(result, f"read node-stack pod {pod}") or "{}")
+        document = json.loads(_require_ok(result, f"read node-ctl pod {pod}") or "{}")
         metadata, spec = document.get("metadata") or {}, document.get("spec") or {}
         uid, sa = str(metadata.get("uid", "")), str(spec.get("serviceAccountName", ""))
         if not uid or not sa:
-            raise SmokeConfigurationError(f"node-stack pod {pod} has no uid or serviceAccountName")
-        return NodeStackIdentity(pod, uid, _kube_node_name(placement.node_name), sa)
+            raise SmokeConfigurationError(f"node-ctl pod {pod} has no uid or serviceAccountName")
+        return NodeCtlIdentity(pod, uid, _kube_node_name(placement.node_name), sa)
 
     def kube_node_names(self) -> list[str]:
         result = self.kubectl("get", "nodes", "-o", "jsonpath={.items[*].metadata.name}", timeout=15)
@@ -2748,14 +3007,23 @@ ON CONFLICT (key_hash) DO NOTHING;
                 actions = [str(a) for a in spec.get("validationActions") or []]
         return FencePolicy(name, actions, warnings)
 
+    def _node_ctl_exec(self, pod_name: str, script: str) -> CommandResult:
+        # Inside node-ctl's own container: the token under test is the one
+        # kubelet projects there, and only there.
+        self._require_isolated_kind("node-ctl credential reads")
+        return self.kubectl(
+            "exec", _kube_pod_name(pod_name), "-c", NODE_CTL, "--", "sh", "-c", script,
+            timeout=30,
+        )
+
     def pod_file_readable(self, pod_name: str, path: str) -> bool:
-        return self._node_stack_exec(pod_name, f"test -r {shlex.quote(_pod_path(path))}", timeout=30).returncode == 0
+        return self._node_ctl_exec(pod_name, f"test -r {shlex.quote(_pod_path(path))}").returncode == 0
 
     def pod_file(self, pod_name: str, path: str) -> str:
-        result = self._node_stack_exec(pod_name, f"cat {shlex.quote(_pod_path(path))}", timeout=30)
+        result = self._node_ctl_exec(pod_name, f"cat {shlex.quote(_pod_path(path))}")
         return _require_ok(result, f"read {path} from {pod_name}")
 
-    def bound_token(self, identity: NodeStackIdentity) -> str:
+    def bound_token(self, identity: NodeCtlIdentity) -> str:
         result = self.kubectl(
             "create", "token", identity.service_account, "--bound-object-kind", "Pod",
             "--bound-object-name", _kube_pod_name(identity.pod_name), "--bound-object-uid", identity.pod_uid,
@@ -2913,8 +3181,8 @@ ON CONFLICT (key_hash) DO NOTHING;
                 self.kubectl("patch", "node", node, "--subresource=status", "--type=json", "-p", json.dumps([{"op": "remove", "path": path}]), timeout=30)
         return repairs
 
-    def node_stack_log_tail(self, pod_name: str, lines: int) -> list[str]:
-        result = self.kubectl("logs", _kube_pod_name(pod_name), "-c", KIND_NODE_STACK_CONTAINER, f"--tail={int(lines)}", timeout=30)
+    def node_ctl_log_tail(self, pod_name: str, lines: int) -> list[str]:
+        result = self.kubectl("logs", _kube_pod_name(pod_name), "-c", NODE_CTL, f"--tail={int(lines)}", timeout=30)
         if result.returncode != 0:
             return []
         return [line for line in result.stdout.splitlines() if any(w in line.lower() for w in ("denied", "forbidden", "ssd", "network", "capacity"))]
@@ -2984,12 +3252,16 @@ ON CONFLICT (key_hash) DO NOTHING;
     def sandbox_pod_render(self, sandbox_id: str) -> SandboxPodRender | None:
         result = self.kubectl(
             "get", "pods", "-l", f"space.pplx.net/sandbox-id={_sql_uuid(sandbox_id)}", "-o", "json", timeout=15,
+            namespace=KIND_SANDBOX_NAMESPACE,
         )
         _require_ok(result, "read the sandbox pod")
         return _newest_pod_render(result.stdout)
 
     def sandbox_pod_count(self) -> int:
-        result = self.kubectl("get", "pods", "-l", KIND_SANDBOX_POD_SELECTOR, "-o", "json", timeout=15)
+        result = self.kubectl(
+            "get", "pods", "-l", KIND_SANDBOX_POD_SELECTOR, "-o", "json", timeout=15,
+            namespace=KIND_SANDBOX_NAMESPACE,
+        )
         _require_ok(result, "count sandbox pods")
         items = json.loads(result.stdout or "{}").get("items", [])
         return sum(1 for item in items if not (item.get("metadata") or {}).get("deletionTimestamp"))
@@ -3101,6 +3373,7 @@ ON CONFLICT (key_hash) DO NOTHING;
     def _sandbox_pod_json(self, sandbox_id: str) -> dict[str, Any] | None:
         result = self.kubectl(
             "get", "pods", "-l", f"space.pplx.net/sandbox-id={_sql_uuid(sandbox_id)}", "-o", "json", timeout=15,
+            namespace=KIND_SANDBOX_NAMESPACE,
         )
         _require_ok(result, "read the sandbox pod")
         items = json.loads(result.stdout or "{}").get("items", [])
@@ -3279,19 +3552,21 @@ ON CONFLICT (key_hash) DO NOTHING;
 
     # --- quarantine recovery ----------------------------------------------
 
-    def node_stack_pod_for_sandbox(self, sandbox_id: str) -> tuple[str, str]:
+    def sandbox_manager_for_sandbox(self, sandbox_id: str) -> tuple[str, str, str]:
+        """(node, sandbox-manager pod, pod uid) of the sandbox's worker."""
+
         placement = self.sandbox_pod_placement(sandbox_id)
         if placement is None:
             raise SmokeConfigurationError(
                 f"sandbox {sandbox_id} has no execution pod; cannot pick its worker"
             )
-        pod = self.worker_node_stack_pod(placement.node_name)
-        uid = self.node_stack_pod_uid(pod)
+        pod = self._node_service_pod(placement.node_name, NODE_SANDBOX_MANAGER)
+        uid = self.pod_uid(pod)
         if not uid:
-            raise SmokeConfigurationError(f"node-stack pod {pod} has no uid")
-        return pod, uid
+            raise SmokeConfigurationError(f"sandbox-manager pod {pod} has no uid")
+        return placement.node_name, pod, uid
 
-    def node_stack_pod_uid(self, pod_name: str) -> str | None:
+    def pod_uid(self, pod_name: str) -> str | None:
         result = self.kubectl(
             "get", "pod", _kube_pod_name(pod_name), "-o", "jsonpath={.metadata.uid}", timeout=15,
         )
@@ -3302,17 +3577,17 @@ ON CONFLICT (key_hash) DO NOTHING;
     def _orphan_root(self, sandbox_id: str) -> str:
         return f"{SANDBOX_CACHE_ROOT}/{_sql_uuid(sandbox_id)}"
 
-    def plant_orphan_staging(self, pod_name: str, sandbox_id: str) -> None:
+    def plant_orphan_staging(self, node_name: str, sandbox_id: str) -> None:
         self._require_isolated_kind("orphan staging plant")
         staging = shlex.quote(
             f"{self._orphan_root(sandbox_id)}/snapshots/.suspend-publish-{uuid.uuid4()}"
         )
         _require_ok(
-            self._node_stack_exec(pod_name, f"mkdir -p {staging} && ls -d {staging}", timeout=60),
-            f"plant an interrupted suspend publication for {sandbox_id} on {pod_name}",
+            self._node_shell_exec(node_name, f"mkdir -p {staging} && ls -d {staging}", timeout=60),
+            f"plant an interrupted suspend publication for {sandbox_id} on {node_name}",
         )
 
-    def remove_orphan_sandbox(self, pod_name: str, sandbox_id: str) -> None:
+    def remove_orphan_sandbox(self, node_name: str, sandbox_id: str) -> None:
         self._require_isolated_kind("orphan retirement")
         canonical = _sql_uuid(sandbox_id)
         root = shlex.quote(self._orphan_root(sandbox_id))
@@ -3320,26 +3595,26 @@ ON CONFLICT (key_hash) DO NOTHING;
         # exist yet if the reconciler never adopted the plant), then the
         # directory; leaving either would quarantine-poison the next smoke.
         _require_ok(
-            self._node_stack_exec(
-                pod_name,
+            self._node_shell_exec(
+                node_name,
                 f"space-sbxmgr delete {canonical} >/dev/null 2>&1 || true; rm -rf {root}",
                 timeout=180,
             ),
-            f"retire the induced orphan {sandbox_id} on {pod_name}",
+            f"retire the induced orphan {sandbox_id} on {node_name}",
         )
 
-    def orphan_absent(self, pod_name: str, sandbox_id: str) -> bool:
+    def orphan_absent(self, node_name: str, sandbox_id: str) -> bool:
         root = shlex.quote(self._orphan_root(sandbox_id))
-        result = self._node_stack_exec(pod_name, f"! ls -d {root} >/dev/null 2>&1", timeout=60)
+        result = self._node_shell_exec(node_name, f"! ls -d {root} >/dev/null 2>&1", timeout=60)
         return result.returncode == 0
 
     def _sandbox_manager_lines(self, pod_name: str, sandbox_id: str) -> list[str]:
-        canonical = shlex.quote(_sql_uuid(sandbox_id))
-        result = self._node_stack_exec(
-            pod_name, f"grep -a -F -- {canonical} {SANDBOX_MANAGER_LOG} || true", timeout=60
+        canonical = _sql_uuid(sandbox_id)
+        result = self.kubectl(
+            "logs", _kube_pod_name(pod_name), "-c", NODE_SANDBOX_MANAGER, timeout=60
         )
-        _require_ok(result, f"read the sandbox-manager log on {pod_name}")
-        return result.stdout.splitlines()
+        logs = _require_ok(result, f"read the sandbox-manager log of {pod_name}")
+        return [line for line in logs.splitlines() if canonical in line]
 
     def orphan_quarantined(self, pod_name: str, sandbox_id: str) -> bool:
         return any(
@@ -3353,16 +3628,23 @@ ON CONFLICT (key_hash) DO NOTHING;
         )
     # --- template build (builders) ------------------------------------------
 
-    def builder_node_stack_pods(self) -> list[str]:
+    def builder_nodes(self) -> list[str]:
         result = self.kubectl(
-            "get", "pods", "-l", KIND_BUILDER_NODE_STACK_SELECTOR, "-o", "json", timeout=15
+            "get", "pods", "-l", _node_service_selector(NODE_API, role=KIND_BUILDER_ROLE),
+            "-o", "json", timeout=15,
         )
-        return sorted(_ready_pod_names(_require_ok(result, "list builder node stacks"), excluding=""))
+        document = json.loads(_require_ok(result, "list builder node-api pods") or "{}")
+        ready = set(_ready_pod_names(result.stdout, excluding=""))
+        return sorted(
+            str(item.get("spec", {}).get("nodeName", ""))
+            for item in document.get("items", [])
+            if item.get("metadata", {}).get("name") in ready
+        )
 
-    def route_builder_service(self, route: str, pod_name: str, *, timeout: float = 30) -> None:
+    def route_builder_service(self, route: str, node_name: str, *, timeout: float = 30) -> None:
         self._require_isolated_kind("builder Service routing")
         route = _routing_value(route)
-        pod = _kube_pod_name(pod_name)
+        pod = self._node_service_pod(node_name, NODE_API, role=KIND_BUILDER_ROLE)
         _require_ok(
             self.kubectl(
                 "label", "pod", pod, f"{BUILDER_ROUTING_LABEL}={route}", "--overwrite", timeout=30
@@ -3398,7 +3680,7 @@ ON CONFLICT (key_hash) DO NOTHING;
         )
         _require_ok(
             self.kubectl(
-                "label", "pods", "-l", KIND_BUILDER_NODE_STACK_SELECTOR,
+                "label", "pods", "-l", _node_service_selector(NODE_API, role=KIND_BUILDER_ROLE),
                 f"{BUILDER_ROUTING_LABEL}-", timeout=30,
             ),
             "remove the routing label from the builders",
@@ -3410,26 +3692,26 @@ ON CONFLICT (key_hash) DO NOTHING;
             return []
         return _endpoint_target_pods(result.stdout)
 
-    def builder_logged_alias(self, pod_name: str, alias: str) -> bool:
+    def builder_logged_alias(self, node_name: str, alias: str) -> bool:
+        pod = self._node_service_pod(node_name, NODE_BUILD_MANAGER, role=KIND_BUILDER_ROLE)
         result = self.kubectl(
-            "logs", _kube_pod_name(pod_name), "-c", KIND_NODE_STACK_CONTAINER,
-            "--since=5m", "--tail=-1", timeout=60,
+            "logs", pod, "-c", NODE_BUILD_MANAGER, "--since=5m", "--tail=-1", timeout=60,
         )
         return result.returncode == 0 and _template_alias(alias) in result.stdout
 
-    def prepared_rootfs_handoff(self, pod_name: str, *, window_seconds: int = 60) -> str | None:
+    def prepared_rootfs_handoff(self, node_name: str, *, window_seconds: int = 60) -> str | None:
         if window_seconds <= 0:
             raise ValueError(f"refusing handoff window {window_seconds!r}")
         script = _PREPARED_ROOTFS_HANDOFF_SCRIPT.replace("__WINDOW_SECONDS__", str(int(window_seconds)))
-        result = self._node_stack_exec(pod_name, script, timeout=window_seconds + 60)
+        result = self._node_shell_exec(node_name, script, timeout=window_seconds + 60)
         return None if result.returncode == 0 else (result.detail() or f"exit {result.returncode}")
 
-    def published_guest_metadata(self, pod_name: str, alias: str) -> GuestMetadata:
+    def published_guest_metadata(self, node_name: str, alias: str) -> GuestMetadata:
         template_dir = shlex.quote(f"{TEMPLATE_CACHE_ROOT}/{_template_alias(alias)}")
-        result = self._node_stack_exec(
-            pod_name, _GUEST_METADATA_SCRIPT.replace("__TEMPLATE_DIR__", template_dir), timeout=120
+        result = self._node_shell_exec(
+            node_name, _GUEST_METADATA_SCRIPT.replace("__TEMPLATE_DIR__", template_dir), timeout=120
         )
-        _require_ok(result, f"read the published guest metadata of {alias} on {pod_name}")
+        _require_ok(result, f"read the published guest metadata of {alias} on {node_name}")
         lines = (result.stdout.splitlines() + ["", "", ""])[:3]
         return GuestMetadata(
             bundle_version=lines[0].strip(),
@@ -3437,12 +3719,12 @@ ON CONFLICT (key_hash) DO NOTHING;
             compatibility_family=lines[2].strip(),
         )
 
-    def containerd_residue(self, pod_name: str, image: str) -> list[str]:
-        result = self._node_stack_exec(
-            pod_name, _CONTAINERD_RESIDUE_SCRIPT.replace("__IMAGE__", shlex.quote(image)), timeout=120
+    def containerd_residue(self, node_name: str, image: str) -> list[str]:
+        result = self._node_shell_exec(
+            node_name, _CONTAINERD_RESIDUE_SCRIPT.replace("__IMAGE__", shlex.quote(image)), timeout=120
         )
         # A failed listing is an inspection failure, not a clean result.
-        _require_ok(result, f"inspect containerd build residue on {pod_name}")
+        _require_ok(result, f"inspect containerd build residue on {node_name}")
         return [line for line in result.stdout.splitlines() if line.strip()]
 
     def delete_template_as_admin(self, alias: str) -> str | None:
@@ -3499,26 +3781,7 @@ ON CONFLICT (key_hash) DO NOTHING;
         reference and the restore could not put it back.
         """
 
-        name = self._public_api_deployment()
-        result = self.kubectl(
-            "get", "deploy", name, "-o",
-            "jsonpath={.spec.template.spec.containers[0].env}", timeout=15,
-        )
-        _require_ok(result, f"read env of {name}")
-        entries = json.loads(result.stdout or "[]")
-        wanted = set(keys)
-        standing: dict[str, str | None] = {key: None for key in keys}
-        for entry in entries:
-            if not isinstance(entry, dict) or entry.get("name") not in wanted:
-                continue
-            if "valueFrom" in entry:
-                raise SmokeConfigurationError(
-                    f"{entry['name']} on {name} is a valueFrom reference; refusing to override "
-                    "what a literal restore could not put back"
-                )
-            value = entry.get("value")
-            standing[entry["name"]] = value if isinstance(value, str) else ""
-        return standing
+        return self._deployment_env_literals(self._public_api_deployment(), keys)
 
     def _apply_public_api_env(self, values: Mapping[str, str | None], action: str) -> None:
         from space_smoke.rate_limiters import LIMITER_ENV_KEYS
@@ -3756,18 +4019,21 @@ ON CONFLICT (key_hash) DO NOTHING;
     def pin_namespace_pod_count(self) -> int:
         self._require_isolated_kind("namespace pod-count quota")
         # `kubectl get pods` over-counts: the quota charges only non-terminal
-        # pods, and a bench carries Completed job pods (seed publish, migrate)
-        # that a naive count includes — the first attempt pinned 16 against a
-        # real usage of 14 and admitted the POST. Create the quota with a wide
+        # pods, and a naive count includes terminal ones (Completed seed-publish
+        # and migrate Jobs, when sandboxes shared the control-plane namespace —
+        # the first attempt pinned 16 against a real usage of 14 and admitted
+        # the POST — and finished sandbox pods here). Create the quota with a wide
         # cap, let the controller report what it actually charges, then pin the
         # cap to exactly that number.
         wide = (
             "apiVersion: v1\nkind: ResourceQuota\n"
-            f"metadata:\n  name: {POD_CAP_QUOTA_NAME}\n  namespace: {KIND_NAMESPACE}\n"
+            f"metadata:\n  name: {POD_CAP_QUOTA_NAME}\n  namespace: {KIND_SANDBOX_NAMESPACE}\n"
             'spec:\n  hard:\n    pods: "10000"\n'
         )
         _require_ok(
-            self.kubectl("apply", "-f", "-", input_text=wide, timeout=30),
+            self.kubectl(
+                "apply", "-f", "-", input_text=wide, timeout=30, namespace=KIND_SANDBOX_NAMESPACE
+            ),
             "apply the pod-count quota",
         )
         deadline = time.monotonic() + 60
@@ -3775,6 +4041,7 @@ ON CONFLICT (key_hash) DO NOTHING;
             used = self.kubectl(
                 "get", "resourcequota", POD_CAP_QUOTA_NAME,
                 "-o", "jsonpath={.status.used.pods}", timeout=15,
+                namespace=KIND_SANDBOX_NAMESPACE,
             )
             value = used.stdout.strip() if used.returncode == 0 else ""
             if value.isdigit():
@@ -3785,7 +4052,9 @@ ON CONFLICT (key_hash) DO NOTHING;
         count = int(value)
         pinned = wide.replace('pods: "10000"', f'pods: "{count}"')
         _require_ok(
-            self.kubectl("apply", "-f", "-", input_text=pinned, timeout=30),
+            self.kubectl(
+                "apply", "-f", "-", input_text=pinned, timeout=30, namespace=KIND_SANDBOX_NAMESPACE
+            ),
             "pin the pod-count quota",
         )
         # Admission reads the quota's status; wait until the pinned hard value
@@ -3795,6 +4064,7 @@ ON CONFLICT (key_hash) DO NOTHING;
             hard = self.kubectl(
                 "get", "resourcequota", POD_CAP_QUOTA_NAME,
                 "-o", "jsonpath={.status.hard.pods}", timeout=15,
+                namespace=KIND_SANDBOX_NAMESPACE,
             )
             if hard.returncode == 0 and hard.stdout.strip() == str(count):
                 return count
@@ -3804,7 +4074,8 @@ ON CONFLICT (key_hash) DO NOTHING;
 
     def lift_namespace_pod_cap(self) -> None:
         result = self.kubectl(
-            "delete", "resourcequota", POD_CAP_QUOTA_NAME, "--ignore-not-found", timeout=30
+            "delete", "resourcequota", POD_CAP_QUOTA_NAME, "--ignore-not-found", timeout=30,
+            namespace=KIND_SANDBOX_NAMESPACE,
         )
         _require_ok(result, "delete the pod-count quota")
 
@@ -3832,6 +4103,7 @@ ON CONFLICT (key_hash) DO NOTHING;
         result = self.kubectl(
             "get", "pods", "-l", f"{SANDBOX_ID_LABEL}={_sql_uuid(sandbox_id)}",
             "-o", "json", timeout=15,
+            namespace=KIND_SANDBOX_NAMESPACE,
         )
         _require_ok(result, "list sandbox pods")
         pods: list[SandboxPodView] = []
@@ -3858,7 +4130,9 @@ ON CONFLICT (key_hash) DO NOTHING;
         if not pod.startswith("space-sbx-"):
             raise ValueError(f"refusing to delete a pod that is not a sandbox execution pod: {pod}")
         _require_ok(
-            self.kubectl("delete", "pod", pod, "--wait=false", timeout=60),
+            self.kubectl(
+                "delete", "pod", pod, "--wait=false", timeout=60, namespace=KIND_SANDBOX_NAMESPACE
+            ),
             f"delete sandbox pod {pod}",
         )
 
@@ -3930,7 +4204,9 @@ ON CONFLICT (key_hash) DO NOTHING;
 
     def restore_pod_document(self, pod_name: str) -> dict[str, Any] | None:
         pod = _kube_pod_name(pod_name)
-        result = self.kubectl("get", "pod", pod, "-o", "json", timeout=15)
+        result = self.kubectl(
+            "get", "pod", pod, "-o", "json", timeout=15, namespace=KIND_SANDBOX_NAMESPACE
+        )
         if result.returncode != 0 and "notfound" in result.detail().lower().replace(" ", ""):
             return None
         document = json.loads(_require_ok(result, f"read pod {pod}") or "{}")
@@ -3954,7 +4230,8 @@ ON CONFLICT (key_hash) DO NOTHING;
             token=token,
         )
         created = self.kubectl(
-            "create", "-f", "-", "-o", "json", input_text=json.dumps(manifest), timeout=30
+            "create", "-f", "-", "-o", "json", input_text=json.dumps(manifest), timeout=30,
+            namespace=KIND_SANDBOX_NAMESPACE,
         )
         uid = (json.loads(_require_ok(created, f"create the planted orphan {name}") or "{}")
                .get("metadata", {}).get("uid"))
@@ -3971,6 +4248,7 @@ ON CONFLICT (key_hash) DO NOTHING;
             self.kubectl(
                 "delete", "pods", "-l", f"{PLANTED_ORPHAN_LABEL}={token}",
                 "--ignore-not-found", "--wait=false", timeout=30,
+                namespace=KIND_SANDBOX_NAMESPACE,
             ),
             f"remove planted orphan pods {token}",
         )
@@ -3986,34 +4264,17 @@ ON CONFLICT (key_hash) DO NOTHING;
             )
         return nodes[0]
 
-    def ready_worker_node_stack_pod(self, node_name: str) -> str | None:
-        result = self.kubectl(
-            "get",
-            "pods",
-            "-l",
-            KIND_NODE_STACK_SELECTOR,
-            "--field-selector",
-            f"spec.nodeName={_kube_node_name(node_name)}",
-            "-o",
-            "json",
-            timeout=15,
-        )
-        ready = _ready_pod_names(
-            _require_ok(result, f"list node-stack pods on {node_name}"), excluding=""
-        )
-        return ready[0] if len(ready) == 1 else None
-
     def _template_digest_path(self, template: str, digest: str) -> str:
         return f"{TEMPLATE_CACHE_ROOT}/{_smoke_template_name(template)}/{_template_digest(digest)}"
 
-    def remove_template_digest_dir(self, pod_name: str, template: str, digest: str) -> None:
+    def remove_template_digest_dir(self, node_name: str, template: str, digest: str) -> None:
         path = shlex.quote(self._template_digest_path(template, digest))
         _require_ok(
-            self._node_stack_exec(pod_name, f"rm -rf {path}", timeout=60),
-            f"remove digest dir {digest} of {template} on {pod_name}",
+            self._node_shell_exec(node_name, f"rm -rf {path}", timeout=60),
+            f"remove digest dir {digest} of {template} on {node_name}",
         )
 
-    def orphan_template_digest_dir(self, pod_name: str, template: str, digest: str) -> None:
+    def orphan_template_digest_dir(self, node_name: str, template: str, digest: str) -> None:
         name = _smoke_template_name(template)
         digest = _template_digest(digest)
         name_dir = f"{TEMPLATE_CACHE_ROOT}/{name}"
@@ -4037,11 +4298,11 @@ ON CONFLICT (key_hash) DO NOTHING;
             ]
         )
         _require_ok(
-            self._node_stack_exec(pod_name, script, timeout=120),
-            f"orphan digest dir {digest} of {template} on {pod_name}",
+            self._node_shell_exec(node_name, script, timeout=120),
+            f"orphan digest dir {digest} of {template} on {node_name}",
         )
 
-    def corrupt_template_rootfs(self, pod_name: str, template: str, digest: str) -> None:
+    def corrupt_template_rootfs(self, node_name: str, template: str, digest: str) -> None:
         rootfs = shlex.quote(f"{self._template_digest_path(template, digest)}/rootfs.ext4")
         script = " && ".join(
             [
@@ -4052,12 +4313,12 @@ ON CONFLICT (key_hash) DO NOTHING;
             ]
         )
         _require_ok(
-            self._node_stack_exec(pod_name, script, timeout=60),
-            f"corrupt rootfs of {template}/{digest} on {pod_name}",
+            self._node_shell_exec(node_name, script, timeout=60),
+            f"corrupt rootfs of {template}/{digest} on {node_name}",
         )
 
     def truncate_template_rootfs(
-        self, pod_name: str, template: str, digest: str, *, bytes_removed: int
+        self, node_name: str, template: str, digest: str, *, bytes_removed: int
     ) -> None:
         if bytes_removed <= 0 or bytes_removed > 1024**2:
             raise ValueError(f"refusing to truncate by {bytes_removed} bytes")
@@ -4072,20 +4333,22 @@ ON CONFLICT (key_hash) DO NOTHING;
             ]
         )
         _require_ok(
-            self._node_stack_exec(pod_name, script, timeout=60),
-            f"truncate rootfs of {template}/{digest} on {pod_name}",
+            self._node_shell_exec(node_name, script, timeout=60),
+            f"truncate rootfs of {template}/{digest} on {node_name}",
         )
 
-    def restart_worker_node_stack(self, pod_name: str, *, timeout: float) -> str:
-        self._require_isolated_kind("node-stack restarts")
-        pod = _kube_pod_name(pod_name)
-        node = _require_ok(
-            self.kubectl("get", "pod", pod, "-o", "jsonpath={.spec.nodeName}", timeout=15),
-            f"resolve node for {pod}",
-        ).strip()
+    def restart_node_service(self, node_name: str, component: str, *, timeout: float) -> str:
+        """Delete one node service's pod and wait for its Ready replacement.
+
+        Only that service restarts: the node's sandboxes keep running under the
+        host runtime-supervisor, and its other services keep serving.
+        """
+
+        self._require_isolated_kind("node-service restarts")
+        pod = self._node_service_pod(node_name, component)
         _require_ok(
             self.kubectl("delete", "pod", pod, "--wait=true", timeout=timeout),
-            f"delete worker node-stack pod {pod}",
+            f"delete {component} pod {pod}",
         )
         deadline = time.monotonic() + timeout
         while True:
@@ -4093,63 +4356,48 @@ ON CONFLICT (key_hash) DO NOTHING;
                 "get",
                 "pods",
                 "-l",
-                KIND_NODE_STACK_SELECTOR,
+                _node_service_selector(component),
                 "--field-selector",
-                f"spec.nodeName={_kube_node_name(node)}",
+                f"spec.nodeName={_kube_node_name(node_name)}",
                 "-o",
                 "json",
                 timeout=15,
             )
             ready = _ready_pod_names(
-                _require_ok(result, f"list node-stack pods on {node}"), excluding=pod
+                _require_ok(result, f"list {component} pods on {node_name}"), excluding=pod
             )
             if len(ready) == 1:
                 return ready[0]
             if time.monotonic() > deadline:
                 raise RuntimeError(
-                    f"no Ready replacement node-stack pod on {node} within {timeout:.0f}s "
-                    f"after deleting {pod} (ready: {ready})"
+                    f"no Ready replacement {component} pod on {node_name} within "
+                    f"{timeout:.0f}s after deleting {pod} (ready: {ready})"
                 )
             time.sleep(5)
 
-    def startup_recovery_report(self, pod_name: str) -> StartupRecoveryReport:
-        pod = _kube_pod_name(pod_name)
-        node = _require_ok(
-            self.kubectl("get", "pod", pod, "-o", "jsonpath={.spec.nodeName}", timeout=15),
-            f"resolve node for {pod}",
-        ).strip()
-        # Read the service files directly: a failed startup can exit before
-        # the supervisor starts forwarding them to pod stdout. The pod-scoped
-        # emptyDir retains earlier container attempts in numbered directories;
-        # a new pod cannot inherit the old pod's recovery verdicts.
-        script = (
-            "set -eu; export LC_ALL=C; "
-            f"test -f {TEMPLATE_MANAGER_LOG}; "
-            f"for log in /space/logs/previous-*/tmplmgr.log {TEMPLATE_MANAGER_LOG}; do "
-            'if [ -f "$log" ]; then cat "$log"; fi; done'
+    def startup_recovery_report(self, node_name: str) -> StartupRecoveryReport:
+        pod = self._node_service_pod(node_name, NODE_TEMPLATE_MANAGER)
+        # The pod's whole log, oldest attempt first: a failed startup restarts
+        # the container, and its first recovery pass is then only in the
+        # previous attempt's log. A new pod cannot inherit an old pod's
+        # recovery verdicts.
+        previous = self.kubectl(
+            "logs", pod, "-c", NODE_TEMPLATE_MANAGER, "--previous", timeout=60
         )
-        log = self._node_stack_exec(pod, script, timeout=60)
-        _require_ok(log, f"read template-manager log on {node or pod}")
-        return _parse_startup_recovery(node, pod, log.stdout)
+        current = self.kubectl("logs", pod, "-c", NODE_TEMPLATE_MANAGER, timeout=60)
+        log = _require_ok(current, f"read template-manager log on {node_name}")
+        if previous.returncode == 0:
+            log = previous.stdout + log
+        return _parse_startup_recovery(node_name, pod, log)
 
     def template_gc_ticks(
-        self, pod_name: str, *, since_time: str
+        self, node_name: str, *, since_time: str
     ) -> list[TemplateGcTick]:
-        pod = _kube_pod_name(pod_name)
-        node = self.kubectl("get", "pod", pod, "-o", "jsonpath={.spec.nodeName}")
-        node_name = _require_ok(node, f"resolve node for {pod}").strip()
-        logs = self.kubectl(
-            "logs",
-            pod,
-            "-c",
-            KIND_NODE_STACK_CONTAINER,
-            "--since-time",
-            since_time,
-            timeout=60,
+        logs = self._node_service_logs(
+            node_name, NODE_TEMPLATE_MANAGER, since_time=since_time
         )
-        _require_ok(logs, f"read node-stack logs on {node_name or pod_name}")
         ticks: list[TemplateGcTick] = []
-        for line in logs.stdout.splitlines():
+        for line in logs.splitlines():
             if TEMPLATE_GC_TICK_MESSAGE not in line:
                 continue
             fields = _tracing_fields(line)
@@ -4165,6 +4413,195 @@ ON CONFLICT (key_hash) DO NOTHING;
                 )
             )
         return ticks
+
+    def telemetry_query(self, backend: str, path: str, params: Mapping[str, str]) -> Any:
+        base = KIND_TELEMETRY_BACKENDS[backend]
+        url = base + path
+        if params:
+            url += "?" + urlencode(params)
+        try:
+            with urlopen(Request(url), timeout=30) as response:
+                return json.load(response)
+        except HTTPError as error:
+            raise RuntimeError(f"query {backend} {path} at {base} returned HTTP {error.code}") from None
+        except (URLError, OSError, ValueError) as error:
+            # The URL a forward serves, not the long query string.
+            reason = error.reason if isinstance(error, URLError) else error
+            raise RuntimeError(f"query {backend} {path} at {base} failed: {reason}") from None
+
+    def telemetry_mode(self) -> str:
+        name = self._public_api_deployment()
+        exporters = self._read_deployment_env(name, ("SPACE_METRICS_SINK", "SPACE_TRACE_EXPORTER"))
+        metrics, traces = exporters["SPACE_METRICS_SINK"], exporters["SPACE_TRACE_EXPORTER"]
+        mode = KIND_TELEMETRY_MODES.get((metrics, traces))
+        if mode is None:
+            raise SmokeConfigurationError(
+                f"{name} runs no Kind telemetry mode: SPACE_METRICS_SINK={metrics or 'unset'}, "
+                f"SPACE_TRACE_EXPORTER={traces or 'unset'}"
+            )
+        return mode
+
+    # --- sandbox network isolation -------------------------------------------
+    #
+    # Probes of the sandbox namespace's NetworkPolicies, run in the node's
+    # operator shell: in its own network namespace (the control-plane
+    # namespace, under no policy), or in a pod's, entered by the netns handle
+    # whose eth0 carries the pod IP. A sandbox pod has no process of its own to
+    # name with a pid; the handle is what the node's runtime created for it.
+
+    def sandbox_pod_network(self, sandbox_id: str) -> PodNetwork | None:
+        result = self.kubectl(
+            "get", "pods", "-l", f"{SANDBOX_ID_LABEL}={_sql_uuid(sandbox_id)}", "-o", "json",
+            timeout=15, namespace=KIND_SANDBOX_NAMESPACE,
+        )
+        running = [
+            pod
+            for pod in json.loads(_require_ok(result, "read the sandbox pod") or "{}").get("items", [])
+            if not (pod.get("metadata") or {}).get("deletionTimestamp")
+            and (pod.get("status") or {}).get("phase") == "Running"
+            and (pod.get("spec") or {}).get("nodeName")
+            and (pod.get("status") or {}).get("podIP")
+        ]
+        if len(running) != 1:
+            return None
+        pod = running[0]
+        return PodNetwork(
+            pod_name=str(pod["metadata"]["name"]),
+            node_name=str(pod["spec"]["nodeName"]),
+            pod_ip=str(pod["status"]["podIP"]),
+        )
+
+    def control_plane_targets(self) -> list[TcpTarget]:
+        return [
+            self._service_target("postgres", "postgres", 5432),
+            self._raw_service_target("kubernetes-api", "default", "kubernetes", 443),
+            self._service_target("internal-api", "space-internal-api", 9800),
+            self._service_target("object-store", "object-store", 8333),
+        ]
+
+    def cluster_dns_target(self) -> TcpTarget:
+        return self._raw_service_target("cluster-dns", "kube-system", "kube-dns", 53)
+
+    def _service_target(self, name: str, service: str, port: int) -> TcpTarget:
+        result = self.kubectl("get", "service", service, "-o", "json", timeout=15)
+        return _service_tcp_target(
+            name, json.loads(_require_ok(result, f"read Service {service}") or "{}"), port
+        )
+
+    def _raw_service_target(self, name: str, namespace: str, service: str, port: int) -> TcpTarget:
+        # Outside the two namespaces the harness addresses; `--raw` takes the
+        # path verbatim and ignores `-n`.
+        path = f"/api/v1/namespaces/{namespace}/services/{service}"
+        result = self.kubectl("get", "--raw", path, timeout=15)
+        return _service_tcp_target(
+            name, json.loads(_require_ok(result, f"read Service {namespace}/{service}") or "{}"), port
+        )
+
+    def probe_from_node_shell(
+        self, node_name: str, targets: Sequence[TcpTarget], *, timeout: float
+    ) -> list[TcpProbe]:
+        script = _tcp_probe_script(targets, timeout=timeout, pod_ip=None)
+        result = self._node_shell_exec(node_name, script, timeout=60 + timeout * len(targets))
+        return _parse_tcp_probes(
+            _require_ok(result, f"probe from the operator shell on {node_name}"), targets
+        )
+
+    def probe_from_pod_netns(
+        self, pod: PodNetwork, targets: Sequence[TcpTarget], *, timeout: float
+    ) -> list[TcpProbe]:
+        script = _tcp_probe_script(targets, timeout=timeout, pod_ip=pod.pod_ip)
+        result = self._node_shell_exec(pod.node_name, script, timeout=60 + timeout * len(targets))
+        if result.returncode == 3 and "NETNS none" in result.stdout:
+            raise SmokeConfigurationError(
+                f"no network namespace on {pod.node_name} carries {pod.pod_name}'s IP {pod.pod_ip}"
+            )
+        output = _require_ok(result, f"probe from the network namespace of {pod.pod_name}")
+        return _parse_tcp_probes(output, targets)
+
+    def start_unselected_pod(self, node_name: str, token: str) -> PodNetwork:
+        self._require_isolated_kind("a pod in the sandbox namespace")
+        if not re.fullmatch(r"[a-f0-9]{8}", token):
+            raise ValueError(f"refusing unselected-pod token {token!r}")
+        name = f"space-smoke-unselected-{token}"
+        manifest = {
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": name, "labels": {UNSELECTED_POD_LABEL: token}},
+            "spec": {
+                # Bound directly: the probe needs it on the sandbox's node,
+                # and the scheduler has no say in what this proves.
+                "nodeName": _kube_node_name(node_name),
+                "automountServiceAccountToken": False,
+                "enableServiceLinks": False,
+                "terminationGracePeriodSeconds": 0,
+                "tolerations": [{"operator": "Exists"}],
+                "containers": [
+                    {"name": "pause", "image": UNSELECTED_POD_IMAGE, "imagePullPolicy": "IfNotPresent"}
+                ],
+            },
+        }
+        _require_ok(
+            self.kubectl(
+                "create", "-f", "-", input_text=json.dumps(manifest), timeout=30,
+                namespace=KIND_SANDBOX_NAMESPACE,
+            ),
+            f"create {name}",
+        )
+        deadline = time.monotonic() + UNSELECTED_POD_READY_SECONDS
+        while True:
+            result = self.kubectl(
+                "get", "pod", name, "-o", "json", timeout=15, namespace=KIND_SANDBOX_NAMESPACE
+            )
+            pod = json.loads(_require_ok(result, f"read {name}") or "{}")
+            status = pod.get("status") or {}
+            if status.get("phase") == "Running" and status.get("podIP"):
+                return PodNetwork(pod_name=name, node_name=node_name, pod_ip=str(status["podIP"]))
+            if time.monotonic() > deadline:
+                raise RuntimeError(
+                    f"{name} was not Running with a pod IP within {UNSELECTED_POD_READY_SECONDS}s: "
+                    f"phase {status.get('phase')!r}"
+                )
+            time.sleep(2)
+
+    def remove_unselected_pods(self, token: str) -> None:
+        if not re.fullmatch(r"[a-f0-9]{8}", token):
+            raise ValueError(f"refusing unselected-pod token {token!r}")
+        _require_ok(
+            self.kubectl(
+                "delete", "pods", "-l", f"{UNSELECTED_POD_LABEL}={token}",
+                "--ignore-not-found", "--wait=false", timeout=30,
+                namespace=KIND_SANDBOX_NAMESPACE,
+            ),
+            f"remove the unselected pod {token}",
+        )
+
+    def _read_deployment_env(self, name: str, keys: Sequence[str]) -> dict[str, str | None]:
+        """The literal each key holds on a Deployment's first container, None if unset.
+
+        Read-only. A value Kubernetes resolves at runtime, from a `valueFrom`
+        reference or an `envFrom` source, is refused rather than read as unset.
+        """
+
+        result = self.kubectl(
+            "get", "deploy", name, "-o", "jsonpath={.spec.template.spec.containers[0]}", timeout=15,
+        )
+        container = json.loads(_require_ok(result, f"read the container of {name}") or "{}")
+        values = _env_literals(
+            container.get("env") or [], keys, owner=name,
+            value_from_refusal=", not a literal to read",
+        )
+        unset = [key for key, value in values.items() if value is None]
+        if unset and container.get("envFrom"):
+            raise SmokeConfigurationError(
+                f"{', '.join(unset)} on {name} may come from its envFrom sources, which are not read"
+            )
+        return values
+
+
+def _node_service_selector(component: str, *, role: str = KIND_WORKER_ROLE) -> str:
+    """Label selector for one node service's pods of one role."""
+
+    return f"app.kubernetes.io/name={role},app.kubernetes.io/component={component}"
 
 
 def _ready_pod_names(pod_list_json: str, *, excluding: str) -> list[str]:
@@ -4249,7 +4686,7 @@ def _template_stash_dir(name: str) -> str:
 
 
 def _parse_startup_recovery(node: str, pod: str, log: str) -> StartupRecoveryReport:
-    """Read the first recovery pass from one node-stack pod's retained log.
+    """Read the first recovery pass from one template-manager pod's log.
 
     Structured verdicts are tracing events keyed on `template` and
     `content_hash`; the stale-row prune is a raw `eprintln!` breadcrumb, so
@@ -4411,6 +4848,66 @@ def _snapshot_reaper_config_from_env(env: Mapping[str, str | None]) -> SnapshotR
         grace_seconds=seconds("SPACE_SBX_GC_GRACE_SECS", _REAPER_DEFAULT_GRACE_SECONDS),
         idle_seconds=seconds("SPACE_SBX_GC_IDLE_SECS", _REAPER_DEFAULT_IDLE_SECONDS),
     )
+
+
+def _btrfs_send_captures_from_logs(
+    logs: str, canonical_sandbox_id: str, node_name: str
+) -> list[BtrfsSendCapture]:
+    """The sandbox's btrfs-send captures in `logs`, in log order."""
+
+    captures: list[BtrfsSendCapture] = []
+    for line in logs.splitlines():
+        if BTRFS_SEND_ENCODED_MESSAGE not in line:
+            continue
+        fields = _tracing_fields(line)
+        if fields is None or fields.get("message") != BTRFS_SEND_ENCODED_MESSAGE:
+            continue
+        if str(fields.get("sandbox_id", "")) != canonical_sandbox_id:
+            continue
+        deferred = str(fields.get("deferred", "false")).lower() == "true"
+        try:
+            stream_bytes = int(fields.get("stream_bytes", 0) or 0)
+        except (TypeError, ValueError):
+            stream_bytes = 0
+        captures.append(
+            BtrfsSendCapture(
+                node_name=node_name,
+                sandbox_id=canonical_sandbox_id,
+                stream_bytes=stream_bytes,
+                deferred=deferred,
+            )
+        )
+    return captures
+
+
+def _completed_transfers_from_logs(
+    logs: str, path_prefix: str, node_name: str
+) -> list[CompletedTransfer]:
+    """Completed transfer jobs in `logs` whose local path is under `path_prefix`."""
+
+    transfers: list[CompletedTransfer] = []
+    for line in logs.splitlines():
+        if TRANSFER_JOB_COMPLETED_MESSAGE not in line:
+            continue
+        fields = _tracing_fields(line)
+        if fields is None or fields.get("message") != TRANSFER_JOB_COMPLETED_MESSAGE:
+            continue
+        local_path = str(fields.get("local_path", ""))
+        if not local_path.startswith(path_prefix):
+            continue
+        try:
+            transferred = int(fields.get("bytes", 0) or 0)
+        except (TypeError, ValueError):
+            transferred = 0
+        transfers.append(
+            CompletedTransfer(
+                node_name=node_name,
+                kind=str(fields.get("kind", "")),
+                local_path=local_path,
+                bytes=transferred,
+            )
+        )
+    return transfers
 
 
 def _tracing_fields(line: str) -> dict[str, Any] | None:
@@ -4729,6 +5226,87 @@ def _completed_deleting_pod_name(pod: object) -> str | None:
         )
     )
     return name if completed else None
+
+
+_PROBE_NAME = re.compile(r"[a-z0-9][a-z0-9-]{0,62}")
+
+
+def _service_tcp_target(name: str, service: Mapping[str, Any], port: int) -> TcpTarget:
+    """A Service's ClusterIP on one of its declared ports."""
+
+    spec = service.get("spec") or {}
+    cluster_ip = str(spec.get("clusterIP") or "")
+    try:
+        ipaddress.IPv4Address(cluster_ip)
+    except ValueError as error:
+        raise SmokeConfigurationError(f"{name} has no IPv4 ClusterIP: {cluster_ip!r}") from error
+    if not any(
+        entry.get("port") == port and entry.get("protocol", "TCP") == "TCP"
+        for entry in spec.get("ports") or ()
+    ):
+        raise SmokeConfigurationError(f"{name}'s Service declares no TCP port {port}")
+    return TcpTarget(name=name, host=cluster_ip, port=port)
+
+
+def _tcp_probe_script(targets: Sequence[TcpTarget], *, timeout: float, pod_ip: str | None) -> str:
+    """Bash for the operator shell: one TCP connect per target, one result line each.
+
+    With `pod_ip`, the connects run in the network namespace whose interface
+    carries that address, found among the node's netns handles; without it,
+    in the shell's own.
+    """
+
+    if not targets:
+        raise ValueError("a probe needs at least one target")
+    if not 0 < timeout <= 30:
+        raise ValueError(f"refusing probe timeout {timeout!r}")
+    names = [target.name for target in targets]
+    if len(set(names)) != len(names):
+        raise ValueError(f"duplicate probe targets: {names}")
+    lines = ["set -u", 'enter=""']
+    if pod_ip is not None:
+        address = str(ipaddress.IPv4Address(pod_ip))
+        lines += [
+            'handle=""',
+            "for candidate in /var/run/netns/*; do",
+            '  [ -e "$candidate" ] || continue',
+            f'  if nsenter --net="$candidate" ip -4 -o addr show 2>/dev/null | grep -qF " inet {address}/"; then',
+            '    handle="$candidate"; break',
+            "  fi",
+            "done",
+            'if [ -z "$handle" ]; then echo "NETNS none"; exit 3; fi',
+            'echo "NETNS $handle"',
+            'enter="nsenter --net=$handle"',
+        ]
+    seconds = f"{timeout:g}"
+    for target in targets:
+        if not _PROBE_NAME.fullmatch(target.name) or not 0 < target.port < 65536:
+            raise ValueError(f"refusing probe target {target!r}")
+        host = str(ipaddress.IPv4Address(target.host))
+        lines += [
+            f"if $enter timeout {seconds} bash -c 'exec 3<>\"/dev/tcp/$0/$1\"' {host} {target.port} 2>/dev/null; then",
+            f"  echo 'PROBE {target.name} connected'",
+            "else",
+            "  rc=$?",
+            f"  if [ \"$rc\" = 124 ]; then echo 'PROBE {target.name} timed-out'; else echo \"PROBE {target.name} refused rc=$rc\"; fi",
+            "fi",
+        ]
+    return "\n".join(lines) + "\n"
+
+
+def _parse_tcp_probes(output: str, targets: Sequence[TcpTarget]) -> list[TcpProbe]:
+    results: dict[str, str] = {}
+    for line in output.splitlines():
+        if line.startswith("PROBE "):
+            _, name, detail = line.split(" ", 2)
+            results[name] = detail
+    missing = [target.name for target in targets if target.name not in results]
+    if missing:
+        raise RuntimeError(f"the probe reported nothing for {missing}: {output.strip()!r}")
+    return [
+        TcpProbe(target=target, connected=results[target.name] == "connected", detail=results[target.name])
+        for target in targets
+    ]
 
 
 def _kube_pod_name(value: str) -> str:

@@ -46,7 +46,7 @@ use crate::key_wrapper::CompositeKeyWrapper;
 use crate::node_ca::NodeCa;
 use crate::node_service::NodeCredentialManager;
 use crate::proto::credential_manager_server::{CredentialManager, CredentialManagerServer};
-use crate::service::{CredentialManagerService, ExchangeTokenMode, ParseExchangeTokenModeError};
+use crate::service::CredentialManagerService;
 use crate::storage_exchange::VendRoleArn;
 use crate::storage_vend_store::{PgStorageVendStore, StorageVendStore};
 use crate::volume_wrap_store::{PgVolumeWrapStore, VolumeWrapStore};
@@ -58,8 +58,10 @@ const SOCKET_GROUP: &str = group_names::SPACE_SBXCLIENTS;
 /// rate-limit surfaces with, and authorizes its Unix-socket peers under.
 pub const SERVICE_NAME: &str = "space-credential-manager";
 const IN_MEMORY_KEK_ENABLED_ENV: &str = "SPACE_CREDMGR_IN_MEMORY_KEK_ENABLED";
-const EXCHANGE_TOKEN_MODE_ENV: &str = "SPACE_CREDMGR_SCOPED_EXCHANGE_TOKEN_MODE";
 const STORAGE_VEND_ROLE_ENV: &str = "SPACE_CREDMGR_S3_VEND_ROLE_ARN";
+/// Retired rollout switch. Read only so a retained `disabled` emergency stop
+/// cannot be silently reversed by upgrading to a build without modes.
+const RETIRED_EXCHANGE_TOKEN_MODE_ENV: &str = "SPACE_CREDMGR_SCOPED_EXCHANGE_TOKEN_MODE";
 const PLATFORM_KEK_IDENTIFIER_ENV: &str = "SPACE_PLATFORM_KEK_IDENTIFIER";
 // Hard-coded so two instances on the same host cannot be configured to use
 // different mutex files and both acquire concurrently.
@@ -127,18 +129,18 @@ pub enum RunCredmgrError {
     InvalidVolumeSocket,
     #[error("invalid peer-process check mode: {0}")]
     PeerProcessCheck(#[source] pplx_space_common_svc::PeerProcessCheckModeEnvError),
-    #[error("invalid {EXCHANGE_TOKEN_MODE_ENV}: {0}")]
-    ExchangeTokenMode(#[source] ParseExchangeTokenModeError),
-    #[error("{EXCHANGE_TOKEN_MODE_ENV} must be valid UTF-8")]
-    ExchangeTokenModeNotUnicode,
-    #[error("{STORAGE_VEND_ROLE_ENV} is required unless storage exchange is disabled")]
-    MissingStorageVendRole,
     #[error("{STORAGE_VEND_ROLE_ENV} must be valid UTF-8")]
     StorageVendRoleNotUnicode,
     #[error("{STORAGE_VEND_ROLE_ENV} is not a valid IAM role ARN")]
     InvalidStorageVendRole,
-    #[error("{EXCHANGE_TOKEN_MODE_ENV}=enforce requires DATABASE_URL")]
-    ScopedExchangeMissingDatabase,
+    #[error("{STORAGE_VEND_ROLE_ENV} requires DATABASE_URL")]
+    StorageVendRoleMissingDatabase,
+    #[error(
+        "{RETIRED_EXCHANGE_TOKEN_MODE_ENV}=disabled is no longer supported and would not stop \
+         issuance; unset {STORAGE_VEND_ROLE_ENV} to keep storage credential exchange off, \
+         then remove {RETIRED_EXCHANGE_TOKEN_MODE_ENV}"
+    )]
+    RetiredExchangeDisabled,
     #[error("--tls-cert/--tls-key require --tcp-listen")]
     TlsWithoutTcpListen,
     #[error("--tls-cert and --tls-key must be set together")]
@@ -514,27 +516,11 @@ pub async fn run(
 async fn initialize_authority_service(
     peer_process_check_mode: PeerProcessCheckMode,
 ) -> Result<CredentialManagerService, RunCredmgrError> {
-    // Unset: `legacy` when a vend role is configured, otherwise `disabled`.
-    let exchange_token_mode = match std::env::var(EXCHANGE_TOKEN_MODE_ENV) {
-        Ok(raw) => raw.parse().map_err(RunCredmgrError::ExchangeTokenMode)?,
-        Err(std::env::VarError::NotPresent) => {
-            if std::env::var_os(STORAGE_VEND_ROLE_ENV).is_some() {
-                ExchangeTokenMode::Legacy
-            } else {
-                ExchangeTokenMode::Disabled
-            }
-        }
-        Err(std::env::VarError::NotUnicode(_)) => {
-            return Err(RunCredmgrError::ExchangeTokenModeNotUnicode);
-        }
-    };
-    tracing::info!(
-        env = EXCHANGE_TOKEN_MODE_ENV,
-        mode = %exchange_token_mode,
-        "storage credential exchange rollout mode resolved"
-    );
-    let storage_vend_role =
-        resolve_storage_vend_role(exchange_token_mode, std::env::var(STORAGE_VEND_ROLE_ENV))?;
+    let storage_vend_role = resolve_storage_vend_role(std::env::var(STORAGE_VEND_ROLE_ENV))?;
+    check_retired_exchange_token_mode(
+        std::env::var(RETIRED_EXCHANGE_TOKEN_MODE_ENV),
+        storage_vend_role.is_some(),
+    )?;
     // Database access is what enables the Encrypt/Decrypt RPCs (cmk_id →
     // KEK row resolution) and, below, the intermediate-key-broker blob store.
     // The control-plane deployment sets DATABASE_URL; node-local deployments
@@ -551,8 +537,10 @@ async fn initialize_authority_service(
         }
         _ => None,
     };
-    if exchange_token_mode == ExchangeTokenMode::Enforce && pool.is_none() {
-        return Err(RunCredmgrError::ScopedExchangeMissingDatabase);
+    // Every exchange is authorized against durable tenant and placement
+    // state, so a vend role without the database could never issue.
+    if storage_vend_role.is_some() && pool.is_none() {
+        return Err(RunCredmgrError::StorageVendRoleMissingDatabase);
     }
 
     let private_ca_config =
@@ -690,11 +678,13 @@ async fn initialize_authority_service(
     // `Arc<dyn KeyWrapper>` automatically at the call site below.
     let key_wrapper = Arc::new(composite);
 
-    let mut service = CredentialManagerService::new(key_wrapper, peer_process_check_mode)
-        .with_exchange_token_mode(exchange_token_mode);
+    let mut service = CredentialManagerService::new(key_wrapper, peer_process_check_mode);
     service.database_pool = pool.clone();
+    let storage_exchange_enabled = storage_vend_role.is_some();
     if let Some(role) = storage_vend_role {
         service = service.with_storage_vend_role(role);
+    } else {
+        tracing::info!("no {STORAGE_VEND_ROLE_ENV}; storage credential exchange is disabled");
     }
     if let Some(issuer) = private_ca_issuer {
         service = service.with_intermediate_ca_issuer(issuer);
@@ -710,26 +700,28 @@ async fn initialize_authority_service(
             let kek_store: Arc<dyn KekStore> = Arc::new(PgKekStore::new(pool.clone()));
             let credential_store: Arc<dyn CredentialStore> =
                 Arc::new(PgCredentialStore::new(pool.clone()));
-            let storage_vend_store: Arc<dyn StorageVendStore> =
-                Arc::new(PgStorageVendStore::new(pool.clone()));
             let credential_injection_authority = CredentialInjectionAuthority::new(
                 pool.clone(),
                 CredentialInjectionBundleMaterializer::new(providers),
             );
+            if storage_exchange_enabled {
+                let storage_vend_store: Arc<dyn StorageVendStore> =
+                    Arc::new(PgStorageVendStore::new(pool.clone()));
+                service = service.with_storage_vend_store(storage_vend_store);
+            }
             let volume_wrap_store: Arc<dyn VolumeWrapStore> =
                 Arc::new(PgVolumeWrapStore::new(pool));
             service = service
                 .with_kek_store(kek_store)
                 .with_credential_store(credential_store)
-                .with_storage_vend_store(storage_vend_store)
                 .with_credential_injection_authority(credential_injection_authority)
                 .with_volume_wrap_store(volume_wrap_store);
             if let Some(provisioner) = kek_provisioner {
                 service = service.with_kek_provisioner(provisioner);
             }
             tracing::info!(
-                "database configured; ExchangeToken, Encrypt/Decrypt, \
-                 ResolveNetworkCredentials, and GetOrIssueSandboxVolumeDek enabled"
+                "database configured; Encrypt/Decrypt, ResolveNetworkCredentials, \
+                 and GetOrIssueSandboxVolumeDek enabled"
             );
         }
         None => {
@@ -743,18 +735,35 @@ async fn initialize_authority_service(
     Ok(service)
 }
 
+/// The retired mode switch no longer selects behavior. A retained `disabled`
+/// alongside a vend role was an emergency stop that this build would reverse,
+/// so it fails startup; any other retained value only warns.
+fn check_retired_exchange_token_mode(
+    configured: Result<String, std::env::VarError>,
+    storage_vend_role_configured: bool,
+) -> Result<(), RunCredmgrError> {
+    let Ok(raw) = configured else {
+        return Ok(());
+    };
+    if raw == "disabled" && storage_vend_role_configured {
+        return Err(RunCredmgrError::RetiredExchangeDisabled);
+    }
+    tracing::warn!(
+        env = RETIRED_EXCHANGE_TOKEN_MODE_ENV,
+        value = %raw,
+        "retired storage exchange mode is ignored; every exchange uses the scoped contract"
+    );
+    Ok(())
+}
+
+/// An unset role leaves storage credential exchange off; a set role must be
+/// valid so a Ready authority never discovers a malformed ARN on request.
 fn resolve_storage_vend_role(
-    mode: ExchangeTokenMode,
     configured: Result<String, std::env::VarError>,
 ) -> Result<Option<VendRoleArn>, RunCredmgrError> {
-    if mode == ExchangeTokenMode::Disabled {
-        return Ok(None);
-    }
     let raw = match configured {
         Ok(raw) => raw,
-        Err(std::env::VarError::NotPresent) => {
-            return Err(RunCredmgrError::MissingStorageVendRole);
-        }
+        Err(std::env::VarError::NotPresent) => return Ok(None),
         Err(std::env::VarError::NotUnicode(_)) => {
             return Err(RunCredmgrError::StorageVendRoleNotUnicode);
         }

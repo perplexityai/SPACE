@@ -14,8 +14,9 @@ def prepare_byok_identity(
 ) -> tuple[str, str]:
     """Enroll an owned organization through the admin API; never toggle Local.
 
-    Kind's development credential authority lazily provisions its in-memory
-    KEK. Production credentials and master-key tables are not fixture inputs.
+    Kind's credential authority lazily provisions the org's KEK through its
+    key broker. Production credentials and master-key tables are not fixture
+    inputs.
     The caller registers key and sandbox cleanup after this identity cleanup,
     so resource teardown finishes before its ownership records are removed.
     """

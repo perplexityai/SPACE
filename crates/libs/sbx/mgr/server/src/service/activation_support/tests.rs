@@ -590,7 +590,7 @@ async fn restore_finalizer_retains_cleanup_until_state_persistence_succeeds() {
                 SandboxCleanupEpisodeId::new(),
             )
         };
-        let service = SandboxManagerService::new(conn);
+        let service = SandboxManagerService::for_test(conn);
         let temp = tempfile::tempdir().unwrap();
         let snapshot_dir = temp.path().join("snapshot");
         std::fs::create_dir(&snapshot_dir).unwrap();
@@ -631,7 +631,7 @@ async fn restore_finalizer_retains_cleanup_until_state_persistence_succeeds() {
 
 #[tokio::test]
 async fn cold_finalizer_retains_cleanup_until_state_persistence_succeeds() {
-    let service = SandboxManagerService::new(crate::db::test_conn());
+    let service = SandboxManagerService::for_test(crate::db::test_conn());
     let (cleanup_tx, cleanup_rx) = tokio::sync::oneshot::channel();
     let cleanup_guard = ActivationCleanupGuard::with_interruption_reason(
         SandboxRuntimeLabel::parse("runtime1").unwrap(),
@@ -642,7 +642,7 @@ async fn cold_finalizer_retains_cleanup_until_state_persistence_succeeds() {
         },
     );
 
-    spawn_guarded_start_state_transition(&service, cleanup_guard, async {
+    spawn_guarded_start_state_transition(&service, "runtime1", cleanup_guard, async {
         Err(Status::internal("failed to persist final start state"))
     })
     .unwrap();
@@ -655,7 +655,7 @@ async fn cold_finalizer_retains_cleanup_until_state_persistence_succeeds() {
 
 #[tokio::test]
 async fn cold_finalizer_disarms_cleanup_after_state_persistence_succeeds() {
-    let service = SandboxManagerService::new(crate::db::test_conn());
+    let service = SandboxManagerService::for_test(crate::db::test_conn());
     let (cleanup_tx, cleanup_rx) = tokio::sync::oneshot::channel();
     let cleanup_guard = ActivationCleanupGuard::with_interruption_reason(
         SandboxRuntimeLabel::parse("runtime1").unwrap(),
@@ -666,7 +666,8 @@ async fn cold_finalizer_disarms_cleanup_after_state_persistence_succeeds() {
         },
     );
 
-    spawn_guarded_start_state_transition(&service, cleanup_guard, async { Ok(()) }).unwrap();
+    spawn_guarded_start_state_transition(&service, "runtime1", cleanup_guard, async { Ok(()) })
+        .unwrap();
 
     assert!(cleanup_rx.await.is_err());
 }

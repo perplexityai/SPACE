@@ -8,7 +8,7 @@ import time
 from datetime import UTC, datetime, timedelta
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager, contextmanager
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from enum import StrEnum
 from http.client import IncompleteRead
 from pathlib import PurePosixPath
@@ -41,12 +41,16 @@ from space_smoke.capabilities import (
     SnapshotReaperConfig,
     SnapshotReaperControl,
     BackupQueued,
+    BtrfsSendCapture,
+    CompletedTransfer,
     ReleaseStorageRow,
     RestoreFailure,
     SnapshotRowFacts,
     StartupRecoveryControl,
     StartupRecoveryReport,
     SuspendCodecControl,
+    SandboxNetworkIsolationControl,
+    TelemetryBackendControl,
     LocalEviction,
     RestoreActivation,
     RestoreStateRead,
@@ -101,6 +105,8 @@ from space_smoke.pending_backup import PendingBackupAssertions
 from space_smoke.quarantine_recovery import QuarantineRecoveryAssertions
 from space_smoke.template_build import TemplateBuildAssertions
 from space_smoke.rate_limiters import RateLimiterAssertions
+from space_smoke.sandbox_network_isolation import SandboxNetworkIsolationAssertions
+from space_smoke.telemetry_delivery import TelemetryDeliveryAssertions
 from space_smoke.config import DEFAULT_SANDBOX_TIMEOUT_SECONDS
 from space_smoke.identity import EcwIdentityAssertions
 from space_smoke.invariants.lifecycle import prove_idle_deadline_reset
@@ -1169,7 +1175,7 @@ class CommandSandboxFixture:
         placement = control.sandbox_pod_placement(self.sandbox.sandbox_id.removeprefix("sbx_"))
         self.verify(placement is not None, "cannot locate the fixture sandbox worker")
         assert placement is not None
-        return control.worker_node_stack_pod(placement.node_name)
+        return placement.node_name
 
     def delete_stopped_and_wait_for_local_cleanup(self, worker: str | None) -> None:
         """Exercise deletion after the runtime route is gone, then observe reconciliation."""
@@ -1203,7 +1209,7 @@ class CommandSandboxFixture:
         deadline = time.monotonic() + 180
         while True:
             evictions = control.local_evictions(
-                sandbox_id, pod_names=[worker], since_time=since_time
+                sandbox_id, node_names=[worker], since_time=since_time
             )
             if any(event.reason == "cluster_row_absent" for event in evictions):
                 break
@@ -2840,6 +2846,54 @@ class KindEcw(Ecw):
             )
         return self._suspend_codec_assertions
 
+    _sandbox_network_isolation_control: SandboxNetworkIsolationControl | None = None
+    _sandbox_network_isolation_assertions: SandboxNetworkIsolationAssertions | None = None
+
+    @property
+    def sandbox_network_isolation(self) -> SandboxNetworkIsolationAssertions:
+        """Probes of the sandbox namespace's NetworkPolicies from outside the VM."""
+
+        if self._sandbox_network_isolation_control is None:
+            raise SmokeConfigurationError(
+                "sandbox network isolation probes are only available on the kind backend"
+            )
+        if self._sandbox_network_isolation_assertions is None:
+            self._sandbox_network_isolation_assertions = SandboxNetworkIsolationAssertions(
+                self, self._sandbox_network_isolation_control, self._context.scope
+            )
+        return self._sandbox_network_isolation_assertions
+
+    _telemetry_control: TelemetryBackendControl | None = None
+    _telemetry_assertions: TelemetryDeliveryAssertions | None = None
+
+    @property
+    def telemetry(self) -> TelemetryDeliveryAssertions:
+        """Reads of the local Prometheus, Tempo and Loki that `otel` mode exports to."""
+
+        if self._telemetry_control is None:
+            raise SmokeConfigurationError(
+                "telemetry backend reads are only available on the kind backend"
+            )
+        if self._telemetry_assertions is None:
+            # The phases recorded so far, sandbox creation included, measure
+            # how long ago the scenario began. Taken before the mode read so
+            # its kubectl time does not shorten the window.
+            phases = self._context.evidence.get("phases") or []
+            elapsed = sum(float(phase["duration_seconds"]) for phase in phases)
+            since = time.time() - elapsed
+            # The suite skips this scenario only on a bench in another known
+            # mode. Wherever it runs, a bench not in otel mode is refused
+            # here, not left to read backends that are not installed.
+            mode = self._telemetry_control.telemetry_mode()
+            if mode != "otel":
+                raise SmokeConfigurationError(
+                    f"the local telemetry backends run only in otel mode; the bench runs {mode}"
+                )
+            self._telemetry_assertions = TelemetryDeliveryAssertions(
+                self, self._telemetry_control, since=since
+            )
+        return self._telemetry_assertions
+
     _startup_recovery_control: StartupRecoveryControl | None = None
     _startup_recovery_assertions: StartupRecoveryAssertions | None = None
 
@@ -2959,7 +3013,7 @@ class TemplateCacheAssertions:
 
     def require_smoke_sized_gc(
         self,
-        pod_name: str,
+        node_name: str,
         *,
         max_interval_seconds: int = 60,
         max_grace_seconds: int = 120,
@@ -2977,10 +3031,10 @@ class TemplateCacheAssertions:
         adapter.
         """
 
-        config = self._control.template_cache_gc_config(pod_name)
+        config = self._control.template_cache_gc_config(node_name)
         if not config.enabled:
             raise SmokeConfigurationError(
-                f"node-stack pod {pod_name} sets "
+                f"the template-manager on {node_name} sets "
                 "SPACE_TEMPLATE_CACHE_BUDGET_BYTES=0; the template eviction loop "
                 "is off on this worker (see templateCache in the kind chart)"
             )
@@ -3001,7 +3055,7 @@ class TemplateCacheAssertions:
         return config
 
     def sandbox_worker(self) -> str:
-        """The worker node-stack pod on the node running the fixture sandbox.
+        """The worker node running the fixture sandbox.
 
         Planting on that node is what makes the protected-template check mean
         something: the seed there is protected twice over (prefetch pin and
@@ -3018,21 +3072,21 @@ class TemplateCacheAssertions:
             sandbox_id=self._fixture.sandbox.sandbox_id,
         )
         assert placement is not None
-        return self._control.worker_node_stack_pod(placement.node_name)
+        return placement.node_name
 
-    def protected_template_digests(self, pod_name: str, template: str) -> tuple[str, ...]:
+    def protected_template_digests(self, node_name: str, template: str) -> tuple[str, ...]:
         """Capture the exact active and selected builds that must survive GC.
 
         Older cached siblings may be unpinned and are valid LRU candidates.
         Read disk membership before resolving, so a preflight resolve cannot
         re-pull a missing protected build and hide its absence.
         """
-        digests = self._control.template_digest_dirs(pod_name, template)
+        digests = self._control.template_digest_dirs(node_name, template)
         selector = self._fixture._template_selector
         if not selector:
             raise SmokeConfigurationError("the fixture sandbox template is unknown")
         protected = self._control.protected_template_builds(
-            pod_name, self._fixture.sandbox.sandbox_id, selector
+            node_name, self._fixture.sandbox.sandbox_id, selector
         )
         self._fixture.verify(
             bool(protected) and set(protected).issubset(digests),
@@ -3043,7 +3097,7 @@ class TemplateCacheAssertions:
         )
         return protected
 
-    def plant_unpinned_build(self, pod_name: str, *, size_bytes: int) -> str:
+    def plant_unpinned_build(self, node_name: str, *, size_bytes: int) -> str:
         """Register a throwaway build on the worker; returns its template name.
 
         The delete compensation is armed before the register is dispatched, so
@@ -3054,14 +3108,14 @@ class TemplateCacheAssertions:
         name = f"smoke-lru-{hashlib.sha256(self._fixture.sandbox.sandbox_id.encode()).hexdigest()[:8]}"
         self._scope.defer(
             f"delete throwaway template {name}",
-            lambda: self._control.delete_template(pod_name, name),
+            lambda: self._control.delete_template(node_name, name),
             critical=True,
         )
         self._planted_bytes[name] = size_bytes
-        self._control.register_unpinned_template(pod_name, name, size_bytes)
-        digests = self._control.template_digest_dirs(pod_name, name)
+        self._control.register_unpinned_template(node_name, name, size_bytes)
+        digests = self._control.template_digest_dirs(node_name, name)
         state = (
-            self._control.template_build_state(pod_name, name, digests[0])
+            self._control.template_build_state(node_name, name, digests[0])
             if len(digests) == 1
             else None
         )
@@ -3083,7 +3137,7 @@ class TemplateCacheAssertions:
         return name
 
     def wait_until_evicted(
-        self, pod_name: str, name: str, *, timeout: float | None = None
+        self, node_name: str, name: str, *, timeout: float | None = None
     ) -> None:
         """Block until the planted build's digest directory is gone.
 
@@ -3107,7 +3161,7 @@ class TemplateCacheAssertions:
         if timeout is None:
             timeout = config.grace_seconds + 4 * config.interval_seconds + 120
         deadline = time.monotonic() + timeout
-        while self._control.template_digest_dirs(pod_name, name):
+        while self._control.template_digest_dirs(node_name, name):
             self._fixture.verify(
                 time.monotonic() <= deadline,
                 "the eviction loop did not reclaim the unpinned over-budget build",
@@ -3120,7 +3174,7 @@ class TemplateCacheAssertions:
             self._fixture.wait(5)
 
     def expect_reclaimed(
-        self, pod_name: str, name: str, *, timeout: float | None = None
+        self, node_name: str, name: str, *, timeout: float | None = None
     ) -> None:
         """Wait for the GC tick to finish, then verify catalog and disk absence."""
 
@@ -3141,7 +3195,7 @@ class TemplateCacheAssertions:
         # attribution; the exact plant's catalog and disk absence remain required.
         while True:
             ticks = self._control.template_gc_ticks(
-                pod_name, since_time=self._planted_since[name]
+                node_name, since_time=self._planted_since[name]
             )
             if any(t.deleted >= 1 and t.bytes_freed >= planted for t in ticks):
                 break
@@ -3164,7 +3218,7 @@ class TemplateCacheAssertions:
         # touch its LRU clock. This local-only plant has no cluster release, so
         # a genuine miss cannot silently re-pull the bytes.
         state = self._control.template_build_state(
-            pod_name, name, self._planted_digests[name]
+            node_name, name, self._planted_digests[name]
         )
         self._fixture.verify(
             state is None,
@@ -3172,7 +3226,7 @@ class TemplateCacheAssertions:
             template=name,
             build_state=state,
         )
-        digests = self._control.template_digest_dirs(pod_name, name)
+        digests = self._control.template_digest_dirs(node_name, name)
         self._fixture.verify(
             not digests,
             "the planted template's digest directory remained after GC completion",
@@ -3181,7 +3235,7 @@ class TemplateCacheAssertions:
         )
 
     def expect_protected_template_intact(
-        self, pod_name: str, template: str, *, before: tuple[str, ...]
+        self, node_name: str, template: str, *, before: tuple[str, ...]
     ) -> None:
         """Every captured active or selected template digest is still on disk.
 
@@ -3191,7 +3245,7 @@ class TemplateCacheAssertions:
         storage, so `get` would answer `ready` either way.
         """
 
-        after = self._control.template_digest_dirs(pod_name, template)
+        after = self._control.template_digest_dirs(node_name, template)
         missing = sorted(set(before) - set(after))
         self._fixture.verify(
             not missing,
@@ -3237,16 +3291,116 @@ class SuspendCodecAssertions:
 
         return _log_since_time()
 
-    def worker_pod(self, node_name: str) -> str:
-        return self._control.worker_node_stack_pod(node_name)
+    def other_sandbox_worker(self, node_name: str) -> str:
+        """A sandbox-pool worker node other than `node_name`."""
 
-    def other_sandbox_worker(self, node_name: str) -> tuple[str, str]:
-        """(node, pod) of a sandbox-pool worker other than `node_name`."""
+        return self._control.other_sandbox_worker_node(node_name)
 
-        node = self._control.other_sandbox_worker_node(node_name)
-        return node, self._control.worker_node_stack_pod(node)
+    def expect_deferred_capture(
+        self, node_name: str, *, since_time: str, visibility_timeout: float = 60
+    ) -> BtrfsSendCapture:
+        """The capture taken after `since_time` on `node_name` retained its source.
 
-    def require_btrfs_send_default(self, pod_name: str) -> str:
+        sandbox-manager's encode line is the record: `deferred=true` with no
+        stream bytes means the source stayed a retained btrfs snapshot and no
+        `rootfs.btrfs-send` was written. Polls because the line reaches the
+        pod log a beat after the public state settles.
+        """
+
+        deadline = time.monotonic() + visibility_timeout
+        while True:
+            captures = self._control.btrfs_send_captures(
+                self._fixture.sandbox.sandbox_id, node_name, since_time=since_time
+            )
+            if captures or time.monotonic() >= deadline:
+                break
+            time.sleep(2)
+        self._fixture.verify(
+            len(captures) >= 1,
+            "sandbox-manager logged no btrfs-send capture for the suspend",
+            sandbox_id=self._fixture.sandbox.sandbox_id,
+            worker_node=node_name,
+            since_time=since_time,
+        )
+        capture = captures[-1]
+        self._fixture.verify(
+            capture.deferred and capture.stream_bytes == 0,
+            "the suspend materialized a send file instead of retaining its source",
+            sandbox_id=self._fixture.sandbox.sandbox_id,
+            worker_node=node_name,
+            deferred=capture.deferred,
+            stream_bytes=capture.stream_bytes,
+        )
+        self._fixture.record("deferred_capture", asdict(capture))
+        return capture
+
+    def expect_streamed_upload(
+        self, node_name: str, *, since_time: str, visibility_timeout: float = 60
+    ) -> CompletedTransfer:
+        """volume-manager streamed the backup's rootfs from the retained source.
+
+        A completed `push_btrfs_send` job for the sandbox's send stream is the
+        record. The snapshot directory cannot tell: a fallback that
+        materializes `rootfs.btrfs-send`, uploads it as a file, and lets
+        bookkeeping reclaim it once the backup is durable leaves the same
+        entries behind.
+        """
+
+        from space_smoke.adapters import ROOTFS_SEND_FILE
+
+        def streamed() -> list[CompletedTransfer]:
+            return [
+                transfer
+                for transfer in self._control.completed_transfers(
+                    self._fixture.sandbox.sandbox_id, node_name, since_time=since_time
+                )
+                if transfer.kind == "push_btrfs_send"
+                and PurePosixPath(transfer.local_path).name == ROOTFS_SEND_FILE
+            ]
+
+        deadline = time.monotonic() + visibility_timeout
+        while True:
+            transfers = streamed()
+            if transfers or time.monotonic() >= deadline:
+                break
+            time.sleep(2)
+        self._fixture.verify(
+            len(transfers) >= 1,
+            "volume-manager completed no push_btrfs_send for the snapshot; the "
+            "backup did not stream from the retained source",
+            sandbox_id=self._fixture.sandbox.sandbox_id,
+            worker_node=node_name,
+            since_time=since_time,
+        )
+        transfer = transfers[-1]
+        self._fixture.record("streamed_upload", asdict(transfer))
+        return transfer
+
+    def expect_retained_source_without_send_file(self, node_name: str) -> tuple[str, ...]:
+        """The canonical snapshot holds the retained bundle and no send file."""
+
+        from space_smoke.adapters import RETAINED_SOURCE_BUNDLE, ROOTFS_SEND_FILE
+
+        entries = self._control.sandbox_canonical_snapshot_entries(
+            node_name, self._fixture.sandbox.sandbox_id
+        )
+        self._fixture.verify(
+            RETAINED_SOURCE_BUNDLE in entries,
+            "the suspend snapshot has no retained source bundle",
+            sandbox_id=self._fixture.sandbox.sandbox_id,
+            worker_node=node_name,
+            entries=entries,
+        )
+        self._fixture.verify(
+            ROOTFS_SEND_FILE not in entries,
+            "a rootfs.btrfs-send file exists beside the retained source",
+            sandbox_id=self._fixture.sandbox.sandbox_id,
+            worker_node=node_name,
+            entries=entries,
+        )
+        return entries
+
+    def require_btrfs_send_default(self, node_name: str) -> str:
         """The worker resolves an omitted suspend format to the stream codec, or refuse.
 
         Require `suspendDefaultFormat: btrfs-send`; otherwise the bench would
@@ -3313,7 +3467,7 @@ class SuspendCodecAssertions:
         self._fixture.record("parent_template", f"{template}@{digest}")
         return digest
 
-    def evict_template(self, pod_name: str, template: str) -> None:
+    def evict_template(self, node_name: str, template: str) -> None:
         """Remove the fixture sandbox's own template from a worker that is not running it."""
 
         self._fixture.verify(
@@ -3333,18 +3487,18 @@ class SuspendCodecAssertions:
         # five ids each, so four rounds clear up to sixty rows before giving
         # up.
         for _ in range(4):
-            referencing = self._control.evict_template_from_worker(pod_name, template)
+            referencing = self._control.evict_template_from_worker(node_name, template)
             if not referencing:
                 break
-            self._fixture.record(f"reclaimed_local_rows_{pod_name}", sorted(referencing))
+            self._fixture.record(f"reclaimed_local_rows_{node_name}", sorted(referencing))
             for sandbox_id in referencing:
-                self._control.reclaim_cluster_deleted_local_sandbox(pod_name, sandbox_id)
+                self._control.reclaim_cluster_deleted_local_sandbox(node_name, sandbox_id)
         else:
             raise SmokeConfigurationError(
-                f"worker pod {pod_name} kept reporting local sandbox rows created from "
+                f"worker {node_name} kept reporting local sandbox rows created from "
                 f"{template} after reclaiming cluster-deleted ones: {sorted(referencing)}"
             )
-        remaining = self._control.template_digest_dirs(pod_name, template)
+        remaining = self._control.template_digest_dirs(node_name, template)
         self._fixture.verify(
             remaining == (),
             "the template still has digest directories on the worker after removal",
@@ -3352,8 +3506,8 @@ class SuspendCodecAssertions:
             digest_dirs=list(remaining),
         )
 
-    def expect_template_absent(self, pod_name: str, template: str) -> None:
-        remaining = self._control.template_digest_dirs(pod_name, template)
+    def expect_template_absent(self, node_name: str, template: str) -> None:
+        remaining = self._control.template_digest_dirs(node_name, template)
         self._fixture.verify(
             remaining == (),
             "the template was materialized on the worker although no source existed",
@@ -3361,7 +3515,7 @@ class SuspendCodecAssertions:
             digest_dirs=list(remaining),
         )
 
-    def expect_pulled_on_demand(self, pod_name: str, template: str, *, since_time: str) -> None:
+    def expect_pulled_on_demand(self, node_name: str, template: str, *, since_time: str) -> None:
         """The restore's own GetTemplate missed locally and initiated a pull, and bytes came in.
 
         Two lines, both since the removal: template-manager's "resolved
@@ -3377,7 +3531,7 @@ class SuspendCodecAssertions:
         materialized for it before the receive.
         """
 
-        pulls = self._control.template_pulls(pod_name, template, since_time=since_time)
+        pulls = self._control.template_pulls(node_name, template, since_time=since_time)
         started_on_demand = [
             p for p in pulls if p.trigger == "on_demand" and p.message == TEMPLATE_PULL_START_MESSAGE
         ]
@@ -3393,11 +3547,11 @@ class SuspendCodecAssertions:
         self._fixture.record("template_pull_triggers", sorted({p.trigger for p in pulls if p.trigger}))
 
     def expect_template_is_portable_subvolume(
-        self, pod_name: str, template: str, digest: str
+        self, node_name: str, template: str, digest: str
     ) -> None:
         """The installed parent is a btrfs subvolume stamped with the deterministic received UUID."""
 
-        received = self._control.template_subvolume_received_uuid(pod_name, template, digest)
+        received = self._control.template_subvolume_received_uuid(node_name, template, digest)
         expected = template_received_uuid(template, digest)
         self._fixture.verify(
             received is not None,
@@ -3415,17 +3569,17 @@ class SuspendCodecAssertions:
         )
         self._fixture.record("parent_received_uuid", received)
 
-    def expect_instance_is_subvolume(self, pod_name: str) -> None:
+    def expect_instance_is_subvolume(self, node_name: str) -> None:
         self._fixture.verify(
-            self._control.sandbox_instance_is_subvolume(pod_name, self._fixture.sandbox.sandbox_id),
+            self._control.sandbox_instance_is_subvolume(node_name, self._fixture.sandbox.sandbox_id),
             "the restored instance is not a btrfs subvolume; btrfs receive did not land it",
             sandbox_id=self._fixture.sandbox.sandbox_id,
         )
 
-    def expect_no_instance(self, pod_name: str) -> None:
+    def expect_no_instance(self, node_name: str) -> None:
         """Nothing was materialized: no `instance`, no half-received `instance.ro`."""
 
-        entries = self._control.sandbox_instance_entries(pod_name, self._fixture.sandbox.sandbox_id)
+        entries = self._control.sandbox_instance_entries(node_name, self._fixture.sandbox.sandbox_id)
         self._fixture.verify(
             entries == (),
             "the failed restore left instance bytes on the target worker",
@@ -3606,16 +3760,16 @@ class StartupRecoveryAssertions:
     the node. So the scenario plants one throwaway build per branch of the
     table on the sandbox-pool worker that is *not* running its sandbox, puts
     each into the on-disk/catalog state that branch handles, restarts that
-    worker's node stack once, and reads the five verdicts from the new pod's
-    log — then checks each verdict against disk (`sha256:*` directories) and
+    worker's template-manager once, and reads the five verdicts from the new
+    pod's log — then checks each verdict against disk (`sha256:*` directories) and
     the daemon (`space-tmplmgr get`, safe here because the plants have no
     cluster release and so a miss cannot re-pull).
 
     No SQLite anywhere: "no row" states are made by stashing the digest
     directory aside, running the daemon's own `delete-template`, and putting
-    the bytes back. The delete compensations resolve the worker's *current*
-    pod at cleanup time, because the restart replaces the pod they were armed
-    against.
+    the bytes back. The delete compensations wait for the worker's *current*
+    template-manager at cleanup time, because the restart replaces the pod
+    that was serving when they were armed.
     """
 
     def __init__(
@@ -3631,7 +3785,7 @@ class StartupRecoveryAssertions:
         self._pod: str | None = None
 
     def spare_worker(self) -> str:
-        """The node-stack pod on a sandbox-pool node not running the fixture sandbox."""
+        """A sandbox-pool node not running the fixture sandbox."""
 
         placement = self._control.sandbox_pod_placement(self._fixture.sandbox.sandbox_id)
         self._fixture.verify(
@@ -3641,57 +3795,56 @@ class StartupRecoveryAssertions:
         )
         assert placement is not None
         self._node = self._control.other_sandbox_worker_node(placement.node_name)
-        self._pod = self._control.worker_node_stack_pod(self._node)
         self._fixture.record("sandbox_node", placement.node_name)
         self._fixture.record("recovery_node", self._node)
-        return self._pod
+        return self._node
 
-    def _current_pod(self) -> str:
-        if self._pod is None:
+    def _current_node(self) -> str:
+        if self._node is None:
             raise SmokeConfigurationError("spare_worker must run before planting")
-        return self._pod
+        return self._node
 
-    def _cleanup_pod(self) -> str:
-        """The spare worker's node-stack pod as it exists at cleanup time.
+    def _cleanup_node(self) -> str:
+        """The spare worker, once its template-manager serves at cleanup time.
 
         Cleanup can run while the replacement pod is still coming up; give it
         the same window the restart itself gets before declaring the worker
         unreachable.
         """
 
-        assert self._node is not None
+        node = self._current_node()
         deadline = time.monotonic() + 300
         last_error: Exception | None = None
         while True:
             try:
-                pod = self._control.ready_worker_node_stack_pod(self._node)
+                pod = self._control.ready_node_service_pod(node, "template-manager")
             except (SmokeConfigurationError, RuntimeError) as error:
                 pod, last_error = None, error
             if pod is not None:
-                return pod
+                return node
             if time.monotonic() > deadline:
                 raise RuntimeError(
-                    f"no Ready node-stack pod on {self._node} within 300 s for cleanup"
+                    f"no Ready template-manager pod on {node} within 300 s for cleanup"
                 ) from last_error
             time.sleep(5)
 
     def plant(self, case: str) -> PlantedBuild:
         """Register a small throwaway build for one branch; deleted at scope end."""
 
-        pod = self._current_pod()
+        node = self._current_node()
         name = (
             f"smoke-rec-{hashlib.sha256(self._fixture.sandbox.sandbox_id.encode()).hexdigest()[:8]}"
             f"-{case}"
         )
         self._scope.defer(
             f"delete throwaway template {name}",
-            lambda: self._control.delete_template(self._cleanup_pod(), name),
+            lambda: self._control.delete_template(self._cleanup_node(), name),
             critical=True,
         )
-        self._control.register_unpinned_template(pod, name, RECOVERY_PLANT_BYTES)
-        digests = self._control.template_digest_dirs(pod, name)
+        self._control.register_unpinned_template(node, name, RECOVERY_PLANT_BYTES)
+        digests = self._control.template_digest_dirs(node, name)
         state = (
-            self._control.template_build_state(pod, name, digests[0])
+            self._control.template_build_state(node, name, digests[0])
             if len(digests) == 1
             else None
         )
@@ -3709,10 +3862,10 @@ class StartupRecoveryAssertions:
     def make_row_stale(self, planted: PlantedBuild) -> None:
         """Row kept, bytes gone — what an interrupted eviction or a lost disk leaves."""
 
-        pod = self._current_pod()
-        self._control.remove_template_digest_dir(pod, planted.name, planted.digest)
+        node = self._current_node()
+        self._control.remove_template_digest_dir(node, planted.name, planted.digest)
         self._fixture.verify(
-            self._control.template_digest_dirs(pod, planted.name) == (),
+            self._control.template_digest_dirs(node, planted.name) == (),
             "the digest directory is still on disk after removal",
             template=planted.name,
         )
@@ -3720,10 +3873,10 @@ class StartupRecoveryAssertions:
     def orphan(self, planted: PlantedBuild) -> None:
         """Bytes kept, row gone — the state a crash between rename and DB commit leaves."""
 
-        pod = self._current_pod()
-        self._control.orphan_template_digest_dir(pod, planted.name, planted.digest)
+        node = self._current_node()
+        self._control.orphan_template_digest_dir(node, planted.name, planted.digest)
         self._fixture.verify(
-            self._control.template_digest_dirs(pod, planted.name) == (planted.digest,),
+            self._control.template_digest_dirs(node, planted.name) == (planted.digest,),
             "the digest directory did not survive being orphaned",
             template=planted.name,
         )
@@ -3732,29 +3885,32 @@ class StartupRecoveryAssertions:
         """No row, and the bootable artifact's bytes changed under an unchanged size."""
 
         self.orphan(planted)
-        self._control.corrupt_template_rootfs(self._current_pod(), planted.name, planted.digest)
+        self._control.corrupt_template_rootfs(self._current_node(), planted.name, planted.digest)
 
     def drift(self, planted: PlantedBuild, *, bytes_removed: int = 4096) -> None:
         """Row kept, but the artifact on disk is shorter than the manifest declares."""
 
         self._control.truncate_template_rootfs(
-            self._current_pod(), planted.name, planted.digest, bytes_removed=bytes_removed
+            self._current_node(), planted.name, planted.digest, bytes_removed=bytes_removed
         )
 
     def restart_and_wait_for_recovery(
         self, *, restart_timeout: float = 600, recovery_timeout: float = 300
     ) -> StartupRecoveryReport:
-        """Replace the spare worker's node-stack pod and wait for recovery to finish."""
+        """Replace the spare worker's template-manager pod and wait for recovery to finish."""
 
-        old_pod = self._current_pod()
+        node = self._current_node()
         started = time.monotonic()
-        self._pod = self._control.restart_worker_node_stack(old_pod, timeout=restart_timeout)
-        self._fixture.record("recovery_pod_before", old_pod)
+        self._pod = self._control.restart_node_service(
+            node, "template-manager", timeout=restart_timeout
+        )
         self._fixture.record("recovery_pod_after", self._pod)
-        self._fixture.record("node_stack_restart_seconds", round(time.monotonic() - started, 1))
+        self._fixture.record(
+            "template_manager_restart_seconds", round(time.monotonic() - started, 1)
+        )
         deadline = time.monotonic() + recovery_timeout
         while True:
-            report = self._control.startup_recovery_report(self._pod)
+            report = self._control.startup_recovery_report(node)
             if report.finished:
                 break
             self._fixture.verify(
@@ -3784,9 +3940,9 @@ class StartupRecoveryAssertions:
         # release to pull, gets NotFound, and cannot re-materialize the build
         # (nor adopt an orphaned directory: the pull asks the cluster for the
         # release before it touches the disk).
-        pod = self._current_pod()
-        digests = self._control.template_digest_dirs(pod, planted.name)
-        state = self._control.template_build_state(pod, planted.name, planted.digest)
+        node = self._current_node()
+        digests = self._control.template_digest_dirs(node, planted.name)
+        state = self._control.template_build_state(node, planted.name, planted.digest)
         if present:
             ok = digests == (planted.digest,) and state == "ready"
             message = "the build should have survived recovery with its bytes and a ready row"
@@ -3862,7 +4018,7 @@ REMOTE_RESTORE_PROVENANCE = frozenset({"remote_matches_local", "remote_only"})
 
 
 def _log_since_time() -> str:
-    """Lower bound for a node-stack log read; a minute of slack covers skew."""
+    """Lower bound for a node-service log read; a minute of slack covers skew."""
 
     return (datetime.now(UTC) - timedelta(minutes=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -3923,7 +4079,7 @@ def _expect_snapshot_restore_from_object_storage(
         activations = [
             activation
             for activation in control.restore_activations(
-                fixture.sandbox.sandbox_id, pod_names=None, since_time=since_time
+                fixture.sandbox.sandbox_id, node_names=None, since_time=since_time
             )
             if activation.execution_generation == landed.execution_generation
         ]
@@ -4008,20 +4164,20 @@ class SnapshotReaperAssertions:
             sandbox_id=self._fixture.sandbox.sandbox_id,
         )
         assert placement is not None
-        return self._control.worker_node_stack_pod(placement.node_name)
+        return placement.node_name
 
     def require_smoke_sized_reaper(
         self,
-        pod_name: str,
+        node_name: str,
         *,
         max_idle_seconds: int = 900,
         max_grace_seconds: int = 120,
         max_interval_seconds: int = 60,
     ) -> SnapshotReaperConfig:
-        config = self._control.snapshot_reaper_config(pod_name)
+        config = self._control.snapshot_reaper_config(node_name)
         if not config.enabled:
             raise SmokeConfigurationError(
-                f"node-stack pod {pod_name} does not enable SPACE_SBX_GC_ENABLED; the "
+                f"the sandbox-manager on {node_name} does not enable SPACE_SBX_GC_ENABLED; the "
                 "snapshot reaper is off on this worker (see snapshotReaper in the kind chart)"
             )
         if (
@@ -4064,19 +4220,19 @@ class SnapshotReaperAssertions:
         self._fixture.record("fork_child_sandbox_id", child)
         return child
 
-    def expect_source_snapshot_present(self, pod_name: str) -> tuple[str, ...]:
+    def expect_source_snapshot_present(self, node_name: str) -> tuple[str, ...]:
         """The fork left a named snapshot under the source's snapshots dir."""
 
-        entries = self._control.sandbox_snapshot_dirs(pod_name, self._fixture.sandbox.sandbox_id)
+        entries = self._control.sandbox_snapshot_dirs(node_name, self._fixture.sandbox.sandbox_id)
         self._fixture.verify(
             len(entries) >= 1,
             "the fork left no snapshot directory on the source's worker",
             sandbox_id=self._fixture.sandbox.sandbox_id,
-            worker_pod=pod_name,
+            worker_node=node_name,
         )
         return entries
 
-    def wait_until_reaped(self, pod_name: str, *, timeout: float | None = None) -> ReapedArtifact:
+    def wait_until_reaped(self, node_name: str, *, timeout: float | None = None) -> ReapedArtifact:
         """Block until the reaper reports deleting an artifact under the source's snapshots."""
 
         config = self._config
@@ -4092,7 +4248,7 @@ class SnapshotReaperAssertions:
         deadline = time.monotonic() + timeout
         while True:
             matches = self._control.reaped_artifacts(
-                pod_name, self._fixture.sandbox.sandbox_id, since_time=self._since_time
+                node_name, self._fixture.sandbox.sandbox_id, since_time=self._since_time
             )
             if matches:
                 return matches[-1]
@@ -4106,13 +4262,13 @@ class SnapshotReaperAssertions:
                     "the snapshot reaper did not reclaim the source's backed named snapshot "
                     "(see reaper_loop_log for a failed node-mgr delete or a skip reason)",
                     sandbox_id=self._fixture.sandbox.sandbox_id,
-                    worker_pod=pod_name,
+                    worker_node=node_name,
                     reap_timeout_seconds=timeout,
                     idle_seconds=config.idle_seconds,
                     grace_seconds=config.grace_seconds,
                     interval_seconds=config.interval_seconds,
                     reaper_loop_log=self._control.reaper_loop_log(
-                        pod_name, since_time=self._since_time
+                        node_name, since_time=self._since_time
                     ),
                 )
             self._fixture.wait(15)
@@ -4132,7 +4288,7 @@ class SnapshotReaperAssertions:
             local_artifact_id=reaped.local_artifact_id,
         )
 
-    def expect_snapshot_gone(self, pod_name: str, *, before: tuple[str, ...]) -> None:
+    def expect_snapshot_gone(self, node_name: str, *, before: tuple[str, ...]) -> None:
         """No trace of the reaped entry remains — not the name, not a `.gc-pending` sibling.
 
         The reaper renames the directory to `<name>.gc-pending-<artifact>`
@@ -4141,7 +4297,7 @@ class SnapshotReaperAssertions:
         original name alone would pass over exactly that residue.
         """
 
-        after = self._control.sandbox_snapshot_dirs(pod_name, self._fixture.sandbox.sandbox_id)
+        after = self._control.sandbox_snapshot_dirs(node_name, self._fixture.sandbox.sandbox_id)
         residue = sorted(
             entry for entry in after if any(entry.startswith(name) for name in before)
         )
@@ -4159,7 +4315,7 @@ class ColdEvictionAssertions:
     """Prove sbx-manager's cold-sandbox eviction against a real worker.
 
     The loop's knobs are chart values read once at daemon start (see
-    `sandboxEviction` in the kind node-stack chart); nothing here changes
+    `sandboxEviction` in the kind sandbox-manager chart); nothing here changes
     them, and the only forcing device is time — the scenario waits out the
     rendered minimum idle instead of aging rows in the daemon's private DB
     the way the retired compose suites did. The proof is sbx-manager's own
@@ -4191,12 +4347,12 @@ class ColdEvictionAssertions:
         assert placement is not None
         return placement
 
-    def worker_pod(self, placement: SandboxPodPlacement) -> str:
-        return self._control.worker_node_stack_pod(placement.node_name)
+    def worker_node(self, placement: SandboxPodPlacement) -> str:
+        return placement.node_name
 
     def require_smoke_sized_loop(
         self,
-        pod_name: str,
+        node_name: str,
         *,
         max_min_idle_seconds: int = 900,
         max_interval_seconds: int = 60,
@@ -4209,10 +4365,10 @@ class ColdEvictionAssertions:
         passed vacuously.
         """
 
-        config = self._control.cold_eviction_config(pod_name)
+        config = self._control.cold_eviction_config(node_name)
         if not config.enabled:
             raise SmokeConfigurationError(
-                f"node-stack pod {pod_name} does not enable SPACE_SBX_EVICT_ENABLED; "
+                f"the sandbox-manager on {node_name} does not enable SPACE_SBX_EVICT_ENABLED; "
                 "cold-sandbox eviction is off on this worker (see sandboxEviction "
                 "in the kind chart)"
             )
@@ -4235,7 +4391,7 @@ class ColdEvictionAssertions:
 
         _wait_until_restore_portable(self._fixture, self._control, timeout=timeout)
 
-    def expect_local_presence_present(self, pod_name: str) -> None:
+    def expect_local_presence_present(self, node_name: str) -> None:
         """The cache directory is on the worker before eviction.
 
         Without this the later "gone" check could pass forever against a wrong
@@ -4244,16 +4400,16 @@ class ColdEvictionAssertions:
 
         self._fixture.verify(
             self._control.sandbox_cache_dir_present(
-                pod_name, self._fixture.sandbox.sandbox_id
+                node_name, self._fixture.sandbox.sandbox_id
             ),
             "the suspended sandbox has no cache directory on its worker before "
             "eviction — the probe's path or id form does not match the daemon's",
             sandbox_id=self._fixture.sandbox.sandbox_id,
-            worker_pod=pod_name,
+            worker_node=node_name,
         )
 
     def wait_until_evicted(
-        self, pod_name: str, *, timeout: float | None = None
+        self, node_name: str, *, timeout: float | None = None
     ) -> LocalEviction:
         """Block until the eviction LOOP reports it evicted this sandbox on that worker.
 
@@ -4276,7 +4432,7 @@ class ColdEvictionAssertions:
         while True:
             evictions = self._control.local_evictions(
                 self._fixture.sandbox.sandbox_id,
-                pod_names=[pod_name],
+                node_names=[node_name],
                 since_time=self._since_time,
             )
             if evictions:
@@ -4297,24 +4453,24 @@ class ColdEvictionAssertions:
                     False,
                     "sbx-manager did not evict the provably backed idle sandbox",
                     sandbox_id=self._fixture.sandbox.sandbox_id,
-                    worker_pod=pod_name,
+                    worker_node=node_name,
                     eviction_timeout_seconds=timeout,
                     min_idle_seconds=config.min_idle_seconds,
                     interval_seconds=config.interval_seconds,
                     eviction_loop_log=self._control.eviction_loop_log(
-                        pod_name, since_time=self._since_time
+                        node_name, since_time=self._since_time
                     ),
                 )
             self._fixture.wait(15)
 
-    def expect_local_presence_gone(self, pod_name: str) -> None:
+    def expect_local_presence_gone(self, node_name: str) -> None:
         self._fixture.verify(
             not self._control.sandbox_cache_dir_present(
-                pod_name, self._fixture.sandbox.sandbox_id
+                node_name, self._fixture.sandbox.sandbox_id
             ),
             "eviction was reported but the sandbox cache directory is still on disk",
             sandbox_id=self._fixture.sandbox.sandbox_id,
-            worker_pod=pod_name,
+            worker_node=node_name,
         )
 
     def expect_woken_from_object_storage(
@@ -4376,7 +4532,7 @@ class CrossNodeRestoreAssertions:
         self._scope = scope
         self._mutation_lock: Compensation | None = None
         self._uncordon: Compensation | None = None
-        # Lower bound for the node-stack log read. A minute of slack covers
+        # Lower bound for the sandbox-manager log read. A minute of slack covers
         # clock skew between this process and the kind nodes.
         self._since_time = (datetime.now(UTC) - timedelta(minutes=1)).strftime(
             "%Y-%m-%dT%H:%M:%SZ"

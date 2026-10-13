@@ -131,16 +131,19 @@ pub fn install_default_rustls_crypto_provider() {
 
 pub use bootstrap::{
     CLIENT_SERVICE_METADATA_KEY, GRPC_HTTP2_KEEPALIVE_INTERVAL, GRPC_HTTP2_KEEPALIVE_TIMEOUT,
-    GRPC_REQUEST_TIMEOUT, HttpServerMakeSpan, HttpSpanMetadata, REDACTED_HTTP_PATH_VALUE,
-    SocketGroup, UnixSocketOptions, apply_unix_socket_permissions, bind_unix_socket,
+    GRPC_REQUEST_TIMEOUT, HttpServerMakeSpan, HttpServerTraceLayer, HttpSpanMetadata,
+    REDACTED_HTTP_PATH_VALUE, SandboxSpanLayer, SandboxSpanService, SocketGroup,
+    TraceparentResponseLayer, UnixSocketOptions, apply_unix_socket_permissions, bind_unix_socket,
     current_service_name, format_grpc_request_params, grpc_health_service, grpc_server_builder,
     grpc_server_builder_with_request_timeout, grpc_trace_layer, http_trace_layer,
-    log_failed_grpc_request_params, record_safe_grpc_request_params, set_current_service_name,
-    shutdown_token, shutdown_token_with_drain, sigterm_shutdown, truncate_utf8_for_log,
-    unix_group_exists, wait_for_sigterm,
+    log_failed_grpc_request_params, record_safe_grpc_request_params, request_id_from_headers,
+    set_current_service_name, shutdown_token, shutdown_token_with_drain, sigterm_shutdown,
+    truncate_utf8_for_log, unix_group_exists, wait_for_sigterm,
 };
 
 pub use lifecycle::{DrainSignal, drain_server};
+
+pub use pplx_space_common_grpc::record_sandbox_id;
 
 pub use rate_limiter::{
     GrpcRateLimitBucket, GrpcRateLimiterConfig, GrpcRateLimiterLayer, GrpcRateLimiterLimits,

@@ -1167,3 +1167,6 @@ fn lock_db(db: &Arc<Mutex<Connection>>) -> rusqlite::Result<MutexGuard<'_, Conne
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod refusal_tests;

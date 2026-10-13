@@ -1,6 +1,8 @@
 //! Ingress preparation emits outcome/count and duration before forwarding; waiter
 //! rejection and completion inactivity timeouts have separate counters. Established
 //! stream lifetime is excluded from preparation latency. No sandbox ID labels.
+//! `data_plane.upload.rejected{reason}` counts `POST /files` requests the
+//! per-pod upload admission limiter answered with 429.
 use std::{fmt, time::Instant};
 
 use crate::emit::{counter, elapsed_ms, gauge, tag, timing_ms};
@@ -267,6 +269,24 @@ impl fmt::Display for SpaceApiRouteTokenDropReason {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
     }
+}
+
+metric_vocabulary!(
+    /// Which per-pod upload admission budget a rejected upload waited on.
+    UploadRejectReason {
+        /// No concurrent-upload slot freed within the admission wait.
+        Concurrency => "concurrency",
+        /// The in-flight byte budget couldn't cover the reservation in time.
+        Bytes => "bytes",
+    }
+);
+
+pub fn upload_rejected(reason: UploadRejectReason) {
+    counter(
+        "data_plane.upload.rejected",
+        1,
+        &[tag("reason", reason.as_str())],
+    );
 }
 
 pub fn attach(kind: &str, result: &str) {

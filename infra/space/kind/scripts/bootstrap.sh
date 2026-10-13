@@ -5,8 +5,9 @@
 # Targets the multi-worker `space-local` kind cluster (config rendered from
 # infra/space/kind/kind-cluster.yaml.tmpl), brings up the production-shaped
 # topology: api-server on KubernetesSubstrate, cluster-controller materializing
-# per-sandbox pods, the real worker DaemonSet on both sandbox workers, a
-# production-shaped builder DaemonSet on its dedicated node, the versitygw object store for S3,
+# per-sandbox pods, one DaemonSet per node service on both sandbox workers and
+# on the dedicated builder nodes (plus build-manager there), runtime-supervisor
+# as a systemd unit on each of those nodes, the versitygw object store for S3,
 # and the seed template published through the real ClusterApi + object-store
 # path (space-seed-publish Job).
 #
@@ -27,11 +28,13 @@
 #   SPACE_KIND_DATADOG_MODE  off (default), fakeintake, or explicit saas
 #   SPACE_KIND_OBSERVABILITY_CONFIG watched non-secret experiment JSON file;
 #                            required for SaaS. See the Kind README.
-#   SPACE_KIND_TELEMETRY_MODE datadog (default), otel, or journald. The otel
-#                            mode sends SPACE traces (including the Go shim)
-#                            and all Rust metric types to the Collectors,
-#                            and moves the Go shim's metrics there too. Rust
-#                            metrics sinks are exclusive; logs stay on stdout.
+#   SPACE_KIND_TELEMETRY_MODE otel (default), datadog, or off. The otel
+#                            mode installs the local metrics, traces, logs and
+#                            visualization backends and sends SPACE traces and
+#                            all metric types, the Go shim's included, to the
+#                            Collectors. datadog uses the native exporters; off
+#                            disables metrics and traces. Metrics sinks are
+#                            exclusive; logs stay on stdout in every mode.
 #
 # Host-path knobs, shared with the rendered cluster config and documented in
 # infra/space/kind/scripts/lib/kind-host-paths.sh:
@@ -87,9 +90,6 @@ TELEMETRY_HELM_ARGS=()
 while IFS= read -r value; do
   TELEMETRY_HELM_ARGS+=(--set-string "$value")
 done <<<"$telemetry_values"
-if [[ "$TELEMETRY_MODE" == otel ]]; then
-  log "OTLP uses the Collectors, not the Agent; install infra/space/kind/metrics/local.sh up and infra/space/kind/traces/local.sh up before shim installation."
-fi
 
 # ── Step 0: prereqs ──────────────────────────────────────────────────────────
 require_bin() {
@@ -134,8 +134,9 @@ log "rendering kind cluster config → $kind_config_published"
 kind_render_cluster_config "$KIND_DIR/kind-cluster.yaml.tmpl"
 
 # ── Step 0b: stage the Firecracker vendor tree ───────────────────────────────
-# The sandbox and builder kind nodes hostPath-mount $SPACE_VENDOR_ROOT into
-# the node-stack pod at /space/vendor. Reuse an already staged vendor tree
+# The sandbox and builder kind nodes bind-mount $SPACE_VENDOR_ROOT at
+# /space/vendor, where the host runtime-supervisor and the node services read
+# it. Reuse an already staged vendor tree
 # or run the artifact installer here. The root is
 # named at the call site even though sourcing the library already exported it:
 # one resolved value reaching both the mount and the writer is the whole point
@@ -175,7 +176,22 @@ if kind get clusters 2>/dev/null | grep -qx "$KIND_CLUSTER"; then
   # A cluster from before the versitygw object store keeps its objects in
   # SeaweedFS; stop before applying anything rather than half-switch it.
   bash "$KIND_DIR/scripts/check-object-store-transition.sh" "$KIND_CLUSTER" || exit 1
+  # Sandbox workers and builders get their node layer from the image they were
+  # created from, so a cluster from before the SPACE Kind node image, or from
+  # an older build of it, has to be recreated rather than patched.
+  bash "$KIND_DIR/scripts/check-kind-node-image.sh" "$KIND_CLUSTER"
+  # A cluster from before the per-service node DaemonSets runs every node
+  # service, and its sandboxes, in one pod per node; stop rather than run both
+  # layouts on a node.
+  bash "$KIND_DIR/scripts/check-node-layout.sh" "$KIND_CLUSTER" || exit 1
 else
+  # The sandbox workers and builders boot the SPACE Kind node image, which
+  # bakes in the node layer a production node image provides (btrfs
+  # /space/cache, cgroup subtree, loop devices, /space skeleton). The config
+  # names its content-addressed tag; make it present: local, else GHCR, else a
+  # local build.
+  log "providing the SPACE Kind node image"
+  bash "$KIND_DIR/scripts/kind-node-image.sh" ensure >/dev/null
   log "creating kind cluster '$KIND_CLUSTER' from $SPACE_KIND_CONFIG"
   kind create cluster --name "$KIND_CLUSTER" --config "$SPACE_KIND_CONFIG"
 fi
@@ -245,6 +261,14 @@ done
 # every per-sandbox pod fails to start. install-shim.sh is idempotent: it
 # only builds the shim if needed and only edits containerd config.toml if
 # the runtime stanza isn't already present.
+# The local backends otel mode exports to come up early so start-up telemetry
+# has a receiver, but nothing depends on them: the shim addresses the
+# Collectors by fixed ClusterIPs, and every exporter retries until a receiver
+# answers. Each helper is idempotent and refuses any cluster but this bench.
+if [[ "$TELEMETRY_MODE" == otel ]]; then
+  bash "$KIND_DIR/scripts/install-observability.sh"
+fi
+
 log "installing containerd-shim-space-v2 on sandbox workers"
 bash "$KIND_DIR/scripts/install-shim.sh"
 
@@ -253,9 +277,13 @@ log "applying namespace + RuntimeClass"
 kubectl --context "$KCTX" apply -f "$KIND_DIR/manifests/namespace.yaml" >/dev/null
 kubectl --context "$KCTX" apply -f "$KIND_DIR/manifests/runtimeclass.yaml" >/dev/null
 
+# Internal RPC TLS: the cluster's CA and the listeners' identities as Secrets,
+# before any workload that mounts them (docs/internal-rpc-tls.md).
+SPACE_KIND_CLUSTER="$KIND_CLUSTER" bash "$KIND_DIR/scripts/internal-rpc-tls.sh"
+
 # ── Step 5: images ───────────────────────────────────────────────────────────
 if (( SKIP_IMAGES )); then
-  log "--skip-images given; assuming all 7 images are already loaded"
+  log "--skip-images given; assuming every build-images.sh image is already loaded"
 else
   log "building + loading SPACE images (this is the long step on a cold cache)"
   SPACE_KIND_CLUSTER="$KIND_CLUSTER" \
@@ -276,7 +304,10 @@ apply_node_labels
 # them as different revisions of the SAME release, which makes helm remove
 # the previous chart's resources on the next install. The Tilt setup
 # sidesteps this by using `helm template` + kubectl apply (no release
-# management), which is what we mirror here.
+# management), which is what we mirror here. Every rendered object names its
+# own namespace (`--namespace` sets the release's), so the apply takes no
+# `-n`: the API, cluster-controller and internal-api charts also render RBAC
+# into the sandbox namespace, which a `-n space` apply would refuse.
 helm_apply() {
   local release=$1 chart=$2; shift 2
   log "helm template + apply: $release ← $(basename "$chart")"
@@ -285,14 +316,14 @@ helm_apply() {
     --include-crds \
     ${TELEMETRY_HELM_ARGS[@]+"${TELEMETRY_HELM_ARGS[@]}"} \
     "$@" \
-    | kubectl --context "$KCTX" apply -n "$NAMESPACE" --validate=false -f -
+    | kubectl --context "$KCTX" apply --validate=false -f -
 }
 
 # ── Optional AWS creds for independent credmgr integrations ──────────────────
 # When AWS_ACCESS_KEY_ID is set (typically sourced from
 # infra/space/kind/private.env — SANDBOX ACCOUNT ONLY), create the
-# `space-aws-creds` Secret the node-stack chart maps into credmgr-scoped env
-# for features such as Private CA. KEK wrapping remains in-memory in Kind.
+# `space-aws-creds` Secret the credential-manager authority chart maps into its
+# env for features such as Private CA. KEK wrapping uses the Kind key broker.
 # These are short-lived STS creds — re-run bootstrap after refreshing
 # private.env to rotate them.
 if [[ -n "${AWS_ACCESS_KEY_ID:-}" && -n "${AWS_SECRET_ACCESS_KEY:-}" ]]; then
@@ -308,7 +339,7 @@ else
   log "AWS creds unset — optional credmgr AWS integrations stay disabled."
 fi
 
-# Postgres first; the api-server's migrate initContainer blocks on it. Wait
+# Postgres first; the space-db-migrate Job blocks on it. Wait
 # for it to be ready BEFORE installing other charts that try to talk to it,
 # so initContainer / Job retries don't waste backoff slots.
 helm_apply space "$KIND_DIR/charts/space-postgres"
@@ -335,22 +366,34 @@ helm_apply space "$KIND_DIR/charts/space-redis-local"
 log "waiting for redis Deployment to be ready"
 kubectl --context "$KCTX" -n "$NAMESPACE" rollout status deploy/space-redis --timeout="${TIMEOUT}s"
 
-# api-server. The initContainer runs the control-plane migrator against the
-# now-ready postgres. The main container is gated on /readyz, which only
-# turns 200 after the K8s pod reflector's initial LIST completes (empty list
-# is fine at this stage — no node-api pods yet).
+# The sandbox namespace's NetworkPolicies, before the API can create the first
+# sandbox pod there.
+helm_apply space "$KIND_DIR/charts/space-sandbox-network-policy"
+
+# The control-plane migrations run once, as the api chart's space-db-migrate
+# Job, against the now-ready postgres before any API replica starts. A Job's
+# pod template is immutable, so the previous run's Job is replaced.
+kubectl --context "$KCTX" -n "$NAMESPACE" delete job space-db-migrate --ignore-not-found >/dev/null
+helm template space "$KIND_DIR/charts/space-api-local" --namespace "$NAMESPACE" \
+  ${TELEMETRY_HELM_ARGS[@]+"${TELEMETRY_HELM_ARGS[@]}"} --show-only templates/migrate-job.yaml \
+  | kubectl --context "$KCTX" apply -n "$NAMESPACE" --validate=false -f -
+log "waiting for the space-db-migrate Job (control-plane migrations)"
+kubectl --context "$KCTX" -n "$NAMESPACE" wait --for=condition=complete \
+  job/space-db-migrate --timeout="${TIMEOUT}s" >/dev/null
+
+# api-server. The main container is gated on /readyz, which only turns 200
+# after the K8s pod reflector's initial LIST completes (empty list is fine at
+# this stage — no node-api pods yet).
 helm_apply space "$KIND_DIR/charts/space-api-local"
-log "waiting for space-api Deployment to be ready (initContainer runs migrations)"
+log "waiting for space-api Deployment to be ready"
 kubectl --context "$KCTX" -n "$NAMESPACE" rollout status deploy/space-api --timeout="${TIMEOUT}s"
 
 SPACE_CONSOLE_PASSWORD="$CONSOLE_PASSWORD" bash "$KIND_DIR/scripts/provision-local-console.sh"
-unset CONSOLE_PASSWORD
 
 # ── Sandbox SSH keypair Secret ────────────────────────────────────────────────
 # Generated once per devbox by build-seed.sh (the local stand-in for the
-# AMI's Packer-generated /space/etc/ssh). The public half is baked into the
-# seed rootfs; the private half is mounted into the node-stack pods so
-# `space-ssh` reaches local sandboxes exactly like on a real worker.
+# AMI's Packer-generated key). The public half is baked into the seed rootfs;
+# the private half is mounted into build-manager, which SSHes into build VMs.
 if [[ -f "$SSH_KEY_DIR/sandbox_ed25519" ]]; then
   log "creating/refreshing space-sandbox-ssh Secret from $SSH_KEY_DIR"
   kubectl --context "$KCTX" -n "$NAMESPACE" create secret generic space-sandbox-ssh \
@@ -361,25 +404,44 @@ else
   log "WARNING: $SSH_KEY_DIR/sandbox_ed25519 missing (build-seed.sh not run?); space-ssh will not work"
 fi
 
+# The resource metrics API the API and data-plane HorizontalPodAutoscalers
+# read, in kube-system as a managed cluster's add-on is (so not through
+# helm_apply, whose apply is pinned to $NAMESPACE).
+log "helm template + apply: space ← space-metrics-server (kube-system)"
+helm template space "$KIND_DIR/charts/space-metrics-server" --namespace kube-system \
+  | kubectl --context "$KCTX" apply -n kube-system --validate=false -f -
+
 # Once api-server has the control-plane schema, drive everything else.
 helm_apply space "$KIND_DIR/charts/space-internal-api-local"
+helm_apply space "$KIND_DIR/charts/space-kind-key-broker"
+helm_apply space "$KIND_DIR/charts/space-credmgr-authority-local"
 helm_apply space "$KIND_DIR/charts/space-data-plane-local"
 helm_apply space "$KIND_DIR/charts/space-cluster-controller-local"
 helm_apply space "$KIND_DIR/charts/space-ui-local"
-# SPACE_LOOP_DEVICE_TARGET is the one knob for the loop-device pool: the
-# entrypoint stages nodes from it before it mounts /space/cache, and node-manager
-# reads the same variable once it is up. Inherited so setting it for a bring-up
-# reaches both renders; unset passes nothing and the library's default applies.
-LOOP_TARGET_ARGS=()
-if [[ -n "${SPACE_LOOP_DEVICE_TARGET:-}" ]]; then
-  LOOP_TARGET_ARGS=(--set "loopDeviceTarget=$SPACE_LOOP_DEVICE_TARGET")
-  log "passing loopDeviceTarget=$SPACE_LOOP_DEVICE_TARGET to both node-stack renders"
-fi
-helm_apply space "$KIND_DIR/charts/space-node-stack" \
-  ${LOOP_TARGET_ARGS[@]+"${LOOP_TARGET_ARGS[@]}"}
-helm_apply space-builder "$KIND_DIR/charts/space-node-stack" \
-  -f "$KIND_DIR/charts/space-node-stack/values-builder.yaml" \
-  ${LOOP_TARGET_ARGS[@]+"${LOOP_TARGET_ARGS[@]}"}
+# Node services: one release of each per role (lib/node-services.sh) —
+# `space` on the sandbox workers, `space-builder` with node.role=builder and
+# the chart's values-builder.yaml on the builders — mirroring production's
+# per-service DaemonSets. They need no order: each service tolerates peers that
+# are not ready yet and restarts on its own.
+# SPACE_LOOP_DEVICE_TARGET sets the loop-device pool node-manager raises each
+# node to once it is up; the node image stages the library's floor of 64 before
+# that. Inherited so setting it for a bring-up reaches both node-manager
+# renders; unset passes nothing and the default applies.
+# shellcheck source=../lib/node-services.sh
+. "$KIND_DIR/lib/node-services.sh"
+while read -r release role service; do
+  chart="$KIND_DIR/charts/space-$service-local"
+  node_args=(--set "node.role=$role")
+  if [[ "$role" == builder && -f "$chart/values-builder.yaml" ]]; then
+    node_args+=(-f "$chart/values-builder.yaml")
+  fi
+  if [[ "$service" == node-manager && -n "${SPACE_LOOP_DEVICE_TARGET:-}" ]]; then
+    node_args+=(--set "loopDeviceTarget=$SPACE_LOOP_DEVICE_TARGET")
+  fi
+  helm_apply "$release" "$chart" "${node_args[@]}"
+done < <(space_kind_node_releases)
+# Kind-only operator shell on the sandbox workers and builders.
+helm_apply space "$KIND_DIR/charts/space-node-debug"
 
 # Seed publish: one-shot Job that uploads the locally built production seed
 # to the versitygw object store and registers the release through the real ClusterApi RPCs.
@@ -389,8 +451,20 @@ kubectl --context "$KCTX" -n "$NAMESPACE" delete job space-seed-publish --ignore
 helm_apply space "$KIND_DIR/charts/space-seed-publish"
 
 # ── Step 8: readiness gates ──────────────────────────────────────────────────
+log "waiting for space-admin-api Deployment"
+kubectl --context "$KCTX" -n "$NAMESPACE" rollout status deploy/space-admin-api --timeout="${TIMEOUT}s"
+
+log "waiting for metrics-server Deployment"
+kubectl --context "$KCTX" -n kube-system rollout status deploy/metrics-server --timeout="${TIMEOUT}s"
+
 log "waiting for space-internal-api Deployment"
 kubectl --context "$KCTX" -n "$NAMESPACE" rollout status deploy/space-internal-api --timeout="${TIMEOUT}s"
+
+log "waiting for space-kind-key-broker Deployment"
+kubectl --context "$KCTX" -n "$NAMESPACE" rollout status deploy/space-kind-key-broker --timeout="${TIMEOUT}s"
+
+log "waiting for space-credmgr-authority Deployment"
+kubectl --context "$KCTX" -n "$NAMESPACE" rollout status deploy/space-credmgr-authority --timeout="${TIMEOUT}s"
 
 log "waiting for space-data-plane Deployment"
 kubectl --context "$KCTX" -n "$NAMESPACE" rollout status deploy/space-data-plane --timeout="${TIMEOUT}s"
@@ -409,13 +483,18 @@ log "waiting for space-seed-publish Job (uploads seed + registers the release)"
 kubectl --context "$KCTX" -n "$NAMESPACE" wait --for=condition=complete \
   job/space-seed-publish --timeout="${TIMEOUT}s" >/dev/null
 
-log "waiting for space-node-stack DaemonSet to roll out on all sandbox workers"
-kubectl --context "$KCTX" -n "$NAMESPACE" rollout status \
-  ds/space-node-stack --timeout="${TIMEOUT}s" >/dev/null
+while read -r daemonset; do
+  log "waiting for $daemonset DaemonSet to roll out"
+  kubectl --context "$KCTX" -n "$NAMESPACE" rollout status \
+    "ds/$daemonset" --timeout="${TIMEOUT}s" >/dev/null
+done < <(space_kind_node_daemonsets)
 
-log "waiting for space-builder-node-stack DaemonSet (node-api + build-manager)"
-kubectl --context "$KCTX" -n "$NAMESPACE" rollout status \
-  ds/space-builder-node-stack --timeout="${TIMEOUT}s" >/dev/null
+# Ready pods are not a registered node: wait until each node's node-ctl has
+# published it through ClusterApi and the API reports it schedulable.
+log "waiting for every SPACE node to be published and ready"
+SPACE_KIND_CLUSTER="$KIND_CLUSTER" SPACE_CONSOLE_PASSWORD="$CONSOLE_PASSWORD" \
+  bash "$KIND_DIR/scripts/wait-node-publication.sh" "$TIMEOUT"
+unset CONSOLE_PASSWORD
 
 # SPACE is ready before optional telemetry is reconciled. Comparison commands
 # still require successful Agent verification and never accept missing capture.
@@ -433,14 +512,14 @@ else
 fi
 
 # ── Step 9: optional port-forwards ───────────────────────────────────────────
-# kubectl port-forward dies on its own when:
-#   - the target pod restarts (e.g., during a chart redeploy)
-#   - the controlling tty/shell exits
-#   - some node-side gRPC keepalives time out
-# Without supervision the smoke tests can't be re-run later in the session
-# because their localhost:80{80,90} endpoints have silently gone away. Wrap
-# each port-forward in a self-restarting loop inside a `setsid` so it
-# survives our parent shell + emits a pid we can later kill via PF_PIDFILE.
+# The API and data plane need none: localhost:8080 and :8090 are the cluster's
+# host port mappings onto their NodePort entry Services (kind-cluster.yaml.tmpl),
+# which reach every replica and outlive any pod. The single-replica services
+# below are still forwarded. Without supervision the smoke tests can't be
+# re-run later in the session because those endpoints have silently gone away:
+# kubectl port-forward dies on its own when its pod restarts. port-forward.sh
+# restarts each forward whenever kubectl exits, and `setsid` lets it survive
+# our parent shell and its tty and emits a pid we can later kill via PF_PIDFILE.
 start_pf() {
   # Note: assigning all three on one `local` line evaluates `${target##*/}`
   # before `target=$1` lands in the local scope, which trips `set -u`.
@@ -449,21 +528,11 @@ start_pf() {
   local namespace=${3:-$NAMESPACE}
   local name=${target##*/}
   log "port-forward $namespace/$target -> localhost:${mapping%%:*} (self-restarting)"
-  # The trailing `space-kind-pf:<ctx>` argument is a label, not input — the loop
-  # reads $1..$5. It gives the supervisor's own command line one expanded,
-  # cluster-scoped token, so a pattern-based reap can find the loop and not only
-  # its kubectl child, without depending on whether the matcher's `.` crosses the
-  # newlines in the script text below.
-  setsid bash -c '
-    target="$1" mapping="$2" name="$3" ns="$4" kctx="$5"
-    while true; do
-      kubectl --context "$kctx" -n "$ns" port-forward --address=127.0.0.1 \
-        "$target" "$mapping" >>/tmp/space-local-pf-"$name".log 2>&1
-      # kubectl exited (target rolled, conn dropped); back off then retry.
-      sleep 2
-    done
-  ' _ "$target" "$mapping" "$name" "$namespace" "$KCTX" "space-kind-pf:$KCTX" \
-    >/dev/null 2>&1 < /dev/null &
+  # The trailing `space-kind-pf:<ctx>` argument is a label, not input (see
+  # port-forward.sh).
+  setsid bash "$KIND_DIR/scripts/port-forward.sh" \
+    "$KCTX" "$namespace" "$target" "$mapping" "space-kind-pf:$KCTX" \
+    >>/tmp/space-local-pf-"$name".log 2>&1 < /dev/null &
   echo "$!" >>"$PF_PIDFILE"
 }
 
@@ -483,8 +552,6 @@ if (( PORT_FORWARD )); then
     done <"$PF_PIDFILE"
   fi
   : >"$PF_PIDFILE"
-  start_pf svc/space-api        8080:8080
-  start_pf svc/space-data-plane 8090:8090
   start_pf svc/space-ui         3000:3000
   # The object store's S3 API: the node-drain smoke asserts the evacuation's snapshot
   # artifacts through it, so a stack brought up this way has to expose it just
@@ -496,22 +563,31 @@ if (( PORT_FORWARD )); then
   if [[ "$DATADOG_MODE" == fakeintake ]]; then
     start_pf svc/datadog-fakeintake 8088:80 kube-system
   fi
+  # The local observability backends exist only in otel mode. Each takes the
+  # port its own `local.sh ui` helper uses; the Tiltfile forwards the same.
+  if [[ "$TELEMETRY_MODE" == otel ]]; then
+    start_pf svc/prometheus 19090:9090 space-metrics
+    start_pf svc/tempo      13200:3200 space-traces
+    start_pf svc/loki       13101:3100 space-logs
+    start_pf svc/grafana    13000:3000 space-grafana
+  fi
 
-  # The forwards bind asynchronously; callers (e.g. the devbox kind command)
-  # run smokes against localhost:8080 immediately after we return. Wait for
-  # the API listener so that race cannot fail a fresh bring-up.
-  log "waiting for the API port-forward on localhost:8080"
-  pf_ready=0
-  for ((i = 1; i <= 60; i++)); do
-    if curl -fsS -m 2 http://localhost:8080/healthz >/dev/null 2>&1; then
-      pf_ready=1
-      break
-    fi
-    sleep 1
-  done
-  (( pf_ready )) || { log "ERROR: API port-forward did not become ready on localhost:8080"; exit 1; }
   log "port-forward pids in $PF_PIDFILE (kill them with: xargs -a $PF_PIDFILE kill -- ; pkill -f \"space-kind-pf:$KCTX|--context $KCTX.*port-forward\")"
 fi
+
+# Callers (e.g. the devbox kind command) run smokes against localhost:8080
+# immediately after we return. Wait for the API through its entry, which
+# serves whatever the port-forward choice.
+log "waiting for the API entry on localhost:8080"
+entry_ready=0
+for ((i = 1; i <= 60; i++)); do
+  if curl -fsS -m 2 http://localhost:8080/healthz >/dev/null 2>&1; then
+    entry_ready=1
+    break
+  fi
+  sleep 1
+done
+(( entry_ready )) || { log "ERROR: the API did not answer on localhost:8080 (its entry NodePort)"; exit 1; }
 
 # ── Summary ──────────────────────────────────────────────────────────────────
 cat <<MSG

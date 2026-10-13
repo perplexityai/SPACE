@@ -185,7 +185,7 @@ impl BuildBackend for MockBuildBackend {
     async fn build(
         &self,
         _recipe_label: &str,
-        _recipe: Recipe,
+        _recipe: pplx_space_build_mgr::PreparedRecipe,
         template_id: &str,
         _job_id: &pplx_space_common_jobs::JobId,
         template_org: Option<TemplateOrg>,
@@ -244,7 +244,7 @@ impl BuildBackend for BlockingBuildBackend {
     async fn build(
         &self,
         _recipe_label: &str,
-        _recipe: Recipe,
+        _recipe: pplx_space_build_mgr::PreparedRecipe,
         _template_id: &str,
         _job_id: &pplx_space_common_jobs::JobId,
         _template_org: Option<TemplateOrg>,
@@ -1344,5 +1344,51 @@ async fn missing_listener_identity_prevents_durable_build_work() -> TestResult {
         ))
     ));
     assert!(!db_path.parent().unwrap().exists());
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn environment_preflight_precedes_blob_and_publication_effects() -> TestResult {
+    let export = "SPACE_BUILD_EXPORT_REVIEW_MISSING_EXPORT";
+    if !pplx_space_test_env::enter_test_process(&[(export, None)]) {
+        return Ok(());
+    }
+    for with_blob in [true, false] {
+        let backend = MockBuildBackend::with_build_result(Ok(BuildOutcome { content_hash: None }));
+        let service = BuildManagerDaemonService::with_backend(1, backend.clone())?;
+        let mut recipe = test_recipe();
+        recipe.steps.push(recipe::Step {
+            env_refs: vec!["REVIEW_MISSING_EXPORT".into()],
+            body: Some(recipe::step::Body::Run(recipe::Run {
+                command: "true".into(),
+                user: None,
+            })),
+            ..Default::default()
+        });
+        if with_blob {
+            recipe.steps.push(recipe::Step {
+                display_name: None,
+                env_refs: vec![],
+                body: Some(recipe::step::Body::Copy(recipe::Copy {
+                    payload: Some(recipe::copy::Payload::BlobSha256("e".repeat(64))),
+                    dest: "/tmp/input".into(),
+                    source_path: None,
+                })),
+            });
+        }
+        let response = service
+            .start_build(authorized_request(start_build_request(
+                Some(recipe),
+                "preflight",
+                vec![],
+            )))
+            .await?
+            .into_inner();
+        let status = wait_for_terminal_status(&service, &response.job_id).await?;
+        assert!(status.error.contains("REVIEW_MISSING_EXPORT"), "{status:?}");
+        assert!(backend.cluster_template_calls.lock().unwrap().is_empty());
+        assert!(backend.build_calls.lock().unwrap().is_empty());
+        assert!(backend.publish_calls.lock().unwrap().is_empty());
+    }
     Ok(())
 }

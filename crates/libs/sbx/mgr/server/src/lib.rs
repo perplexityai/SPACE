@@ -16,8 +16,10 @@ mod guest_filesystem_flush;
 mod inventory_budget;
 mod lifecycle_metrics;
 pub mod local_artifacts;
+pub mod node_manager_transport;
 mod node_state_sync;
 pub mod restore_operation;
+pub(crate) mod retained_source;
 pub(crate) mod rootfs_encryption;
 pub(crate) mod route_activation_claims;
 pub mod run;
@@ -33,6 +35,7 @@ pub mod snapshot_scheduler;
 pub mod snapshot_upload;
 pub mod snapshot_upload_jobs;
 pub mod state;
+pub mod template_resolver;
 mod transfer_directory;
 pub mod watchdog;
 

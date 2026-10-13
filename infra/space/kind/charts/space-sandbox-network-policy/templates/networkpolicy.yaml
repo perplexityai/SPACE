@@ -1,0 +1,119 @@
+# Every pod in the sandbox namespace starts isolated in both directions. A pod
+# a NetworkPolicy selects accepts only what some selecting policy allows, so
+# sandbox pods take their allowances from the policy below, and any other pod
+# created here (by hand, or by a renderer that lost the sandbox label) reaches
+# nothing and nothing reaches it.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ .Release.Name }}-sandbox-default-deny
+  namespace: {{ .Values.sandboxNamespace }}
+  labels:
+    app.kubernetes.io/name: space-sandbox-network-policy
+    app.kubernetes.io/instance: {{ .Release.Name }}
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+---
+# The traffic a sandbox pod's own network namespace carries, from the public
+# code. Inside the VM, the per-sandbox net-gateway applies the tenant's egress
+# policy; this is the layer beneath it, which holds for any process that
+# reaches the pod's network namespace.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ .Release.Name }}-sandbox-allow
+  namespace: {{ .Values.sandboxNamespace }}
+  labels:
+    app.kubernetes.io/name: space-sandbox-network-policy
+    app.kubernetes.io/instance: {{ .Release.Name }}
+spec:
+  podSelector:
+    matchLabels:
+      # Every sandbox pod, on-demand or warm-pool, carries this label
+      # (crates/libs/common/core/src/k8s.rs).
+      app.kubernetes.io/name: space-sandbox
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # space-api dials <pod IP>:9800 (DEFAULT_SANDBOX_PROXY_PORT,
+    # crates/libs/common/core/src/k8s.rs) for every sandbox-scoped call:
+    # endpoint_for_pod_ip, pod_worker_channel and pod_proxy_accepts_tcp in
+    # crates/libs/api/src/controllers/substrate/kubernetes/pod_ops/worker_clients.rs,
+    # used by create readiness (wait_ready.rs), wake (pod_ops/wake.rs),
+    # restore (execution.rs), teardown (adapter/teardown.rs) and the runtime
+    # client behind the public routes (adapter/substrate_adapter.rs).
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Release.Namespace }}
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: space-api
+      ports:
+        - protocol: TCP
+          port: 9800
+    # cluster-controller probes warm slots at <pod IP>:9800
+    # (warm_slot_runtime_endpoint in
+    # crates/libs/cluster/controller/server/src/warm_pool.rs) and runs the same
+    # KubernetesSubstrate for its teardown and repair reconcilers
+    # (crates/libs/cluster/controller/server/src/reconcilers.rs).
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Release.Namespace }}
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: space-cluster-controller
+      ports:
+        - protocol: TCP
+          port: 9800
+    # The dedicated admin API (space-admin-api, `--surface admin`) needs no
+    # rule: its sandbox actions only enqueue an operation
+    # (enqueue_admin_lifecycle_operation in
+    # crates/libs/api/src/routes/admin/sandboxes.rs), which the elected
+    # cluster-controller's dispatcher executes, and its reads come from the
+    # database (tracked_response, crates/libs/api/src/controllers/sandbox/queries.rs).
+    # Nothing else dials a sandbox pod. internal-api and the data plane reach
+    # the node's host-network node-api at the node's address
+    # (node_api_backend_endpoint in
+    # crates/libs/internal/api/server/src/data_plane_sessions.rs, which the
+    # data plane's crates/libs/data/plane/server/src/runtime_route.rs dials),
+    # and service-port ingress rides node-api's ServicePortIngress stream to
+    # the gateway's socket (crates/libs/node/api/server/src/worker.rs).
+  egress:
+    # The guest's IPv4 internet. The pod's network namespace masquerades the
+    # gateway's upstream connections to the pod IP on eth0 (the `space`
+    # table's postrouting rule in crates/libs/node/mgr/server/src/firewall.rs),
+    # so guest traffic leaves as this pod. Guest DNS takes this route too: the
+    # gateway answers the guest's reserved resolvers over DNS-over-TLS to the
+    # public resolvers (crates/libs/net/gateway/server/src/reserved_dns.rs),
+    # and a public resolver the guest names itself is ordinary egress. There
+    # is no IPv6 rule, so the default-deny refuses IPv6 egress.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              {{- toYaml .Values.internetExcept | nindent 14 }}
+    # Cluster DNS only, for a resolver in the pod's own network namespace
+    # (dnsPolicy ClusterFirst); the guest never uses it, so nothing else on
+    # port 53 needs to be reachable outside the internet rule above.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # No rule for the hop to node-api: the shim DNATs <pod IP>:9800 to the
+    # pod's own node (shim/data_plane_proxy.go), and traffic between a pod and
+    # the node it runs on is always allowed, whatever the policy (Kubernetes
+    # NetworkPolicy documentation, "IP blocks").

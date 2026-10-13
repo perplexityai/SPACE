@@ -1,0 +1,66 @@
+# node-ctl on every SPACE Kind node: publishes the node's state to ClusterApi
+# (node registration) and runs the Kubernetes node-local controller. One
+# release per role: `space` and `space-builder` (`--set node.role=builder`).
+
+image:
+  repository: space-worker
+  tag: local
+  pullPolicy: IfNotPresent
+
+datadogEnvironment: kind-local
+clusterId: kind-local
+telemetry: {}
+node: {}
+
+# node-ctl waits up to 25 s for its worker on SIGTERM, then exits holding its
+# service mutex if it overran (crates/libs/node/ctl/server/src/lib.rs); the
+# shared lifecycle default grace (crates/libs/common/svc/src/lifecycle.rs).
+terminationGracePeriodSeconds: 60
+
+# Kind sizing: requests only (see space-node-manager-local/values.yaml).
+resources:
+  requests:
+    cpu: 10m
+    memory: 32Mi
+
+# Admission fence over this chart's `patch nodes` grant; see
+# templates/node-fence.yaml. Mirrors the prod space-node-ctl chart's
+# `nodeFence` block, including the allowlists.
+# `local.node_ctl_fence_refuses_and_reconciles` proves them against the live
+# binary's writes.
+nodeFence:
+  enabled: true
+  # `["Audit", "Warn"]` evaluates the policy and records violations without
+  # refusing them — the staged form for a cluster whose node-ctl writes have
+  # not been observed against the allowlists yet.
+  validationActions:
+    - Deny
+  allowedLabelKeys:
+    # SSD_HEADROOM_TIER_LABEL, SSD_PLACEMENT_BLOCKED_LABEL
+    - space.pplx.net/ssd-headroom-tier
+    - space.pplx.net/ssd-placement-blocked
+  allowedLabelKeyPrefixes:
+    # TEMPLATE_BUILD_LABEL_KEY_PREFIX: one key per ready local template build.
+    - space.pplx.net/template-build-
+  allowedAnnotationKeys: []
+  allowedAnnotationKeyPrefixes:
+    # Template presence mirrors each build label with a same-key annotation
+    # carrying the full content hash.
+    - space.pplx.net/template-build-
+  # Removable but not writable. node-ctl only ever *clears* a satisfied
+  # template-write key; an added one is a pull request it then honors, and that
+  # pull is classified on-demand, which skips the template-visibility gate. Both
+  # forms are listed because `is_template_write_annotation_key` accepts the bare
+  # key as well as the per-reference `-<digest>` variants — and a plain
+  # `template-write` prefix would additionally permit `template-writer`.
+  removalOnlyAnnotationKeys:
+    - space.pplx.net/template-write
+  removalOnlyAnnotationKeyPrefixes:
+    - space.pplx.net/template-write-
+  # Governs `status.capacity` only. `status.allocatable` is not carved out of
+  # the status freeze at all, because node-ctl never writes it and it is the
+  # value the scheduler and the substrate actually read.
+  allowedStatusResourceKeys:
+    # SANDBOX_NETWORK_SLOTS_RESOURCE. The only extended resource node-ctl
+    # advertises, and the only Node status write from this identity at all.
+    - space.pplx.net/network-slots

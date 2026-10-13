@@ -1,0 +1,51 @@
+# Settings every Kind node-service release shares. Each service chart imports
+# this block as its own `node` value (Chart.yaml `import-values`), so a
+# release overrides it with `--set node.<key>=...` like any other value.
+node:
+  # worker or builder. Selects the node pool the DaemonSet runs on and the
+  # role the services report. A builder release is the same chart rendered
+  # with role=builder (see the `space-builder` releases in bootstrap.sh and the
+  # Tiltfile).
+  role: worker
+  # Node pool label each role's DaemonSets select, from kind-cluster.yaml.tmpl.
+  # The builder pool is deliberately not space-enabled, so user sandbox pods
+  # never land there.
+  pools:
+    worker: sandbox
+    builder: builder
+  # Cluster API (space-internal-api). node-ctl publishes node state here
+  # (node registration), template-manager resolves releases, sandbox-manager
+  # reports snapshot state, build-manager publishes builds.
+  internalApiEndpoint: https://space-internal-api:9800
+  # The control-plane credential-manager authority
+  # (space-credmgr-authority-local): each node's credential-manager agent
+  # forwards to it, and node-manager fetches sandbox volume DEKs from it.
+  credmgrAuthorityEndpoint: https://space-credmgr-authority:9810
+  # Secret carrying the static inter-service bearer tokens (rendered by the
+  # api chart).
+  internalSecretName: space-internal
+  # Ed25519 route-token verification bundle (rendered by the api chart);
+  # sandbox-manager and node-api verify sandbox route tokens with it.
+  routeVerification:
+    secretName: space-route-verification
+    bundleKey: verification-bundle.json
+    generationFenceEnabled: "true"
+  # Static credentials for the in-cluster object store (rendered by the
+  # space-object-store chart): the documented local escape hatch in place of
+  # credential-manager's cloud token exchange.
+  objectStore:
+    credentialsSecretName: space-object-store
+    endpoint: http://object-store:8333
+    region: us-east-1
+  # Disk-admission sizing for /space/cache. Production defaults assume NVMe
+  # (50 GiB min-available floor, 8 GiB per-sandbox allocation reservation);
+  # the Kind cache is a 40 GiB sparse loopback btrfs image, so both byte knobs
+  # scale to 1 GiB through the same production config surface. Without this
+  # every node publishes scheduling_status=full and sandbox-manager rejects
+  # prepare_sandbox with disk_available_below_threshold. Read by the services
+  # that admit cache allocations: node-manager, sandbox-manager,
+  # volume-manager and build-manager.
+  diskAdmission:
+    minAvailableBytes: "1073741824"
+    allocationReservationBytes: "1073741824"
+  datadogTeam: team-space

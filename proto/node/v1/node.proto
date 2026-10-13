@@ -152,6 +152,31 @@ service NodeManager {
   // Deny inbound traffic to a guest port (remove from sandbox allowlist).
   rpc DenyPort(DenyPortRequest) returns (DenyPortResponse);
 
+  // ─── Node artifact store ─────────────────────────────────────────────
+  //
+  // The node's root-owned store of runtime releases and guest kernels. The
+  // runtime manager downloads and unpacks them unprivileged into its own
+  // staging directory; node-manager copies the staged files into the store
+  // only if every byte matches the catalog's pins, so the runtime manager
+  // cannot publish unverified bytes. Execution never reads this separate store.
+  // Root and the runtime manager only.
+
+  // Publish the artifact staged as
+  // `<staging>/<namespace>/<staging_name>/<directory>/`, where the namespace
+  // is `<runtime>/releases` and `<directory>` is `v<version>` for a runtime
+  // release, and `<runtime>/kernels` and `<version>` for a kernel. Changes
+  // to one store root are serialized. An artifact already in the store with the
+  // pinned bytes succeeds without writing. FAILED_PRECONDITION when the
+  // artifact has no pins for this node's architecture or the store root is
+  // unsafe; INVALID_ARGUMENT when the staged bytes are not the pinned ones.
+  // Publishing does not change execution roots, aliases, or kernel staging.
+  rpc PublishArtifact(PublishArtifactRequest) returns (PublishArtifactResponse);
+  // Remove a managed copy whose measured digest matches the request. Every
+  // managed copy is removable, including copies of image-provided versions.
+  // Missing or changed files require repair (FAILED_PRECONDITION); an absent
+  // artifact succeeds. Execution artifacts are outside this store.
+  rpc RemoveArtifact(RemoveArtifactRequest) returns (RemoveArtifactResponse);
+
   // ─── Btrfs delegation ────────────────────────────────────────────────
   //
   // Privileged btrfs operations the suspend codec depends on. All run
@@ -212,6 +237,29 @@ service NodeManager {
   // directory under the same sandbox cache root.
   rpc BtrfsEncodeSnapshotRootfsSend(BtrfsEncodeSnapshotRootfsSendRequest)
       returns (BtrfsEncodeSnapshotRootfsSendResponse);
+
+  // Regenerate a missing send file from a retained immutable source bundle.
+  // The expected source identity fences replacement of an artifact directory.
+  rpc BtrfsMaterializeRootfsSend(BtrfsMaterializeRootfsSendRequest)
+      returns (BtrfsEncodeRootfsSendResponse);
+
+  // Read-only check that a retained source bundle still exists and matches
+  // the expected identity, lineage, and read-only state. NOT_FOUND: the
+  // artifact, the bundle, or its manifest is absent. Capture writes and syncs
+  // the manifest last, before reporting the identity, so a bundle without one
+  // never held a source. FAILED_PRECONDITION: it exists but is unusable. Any other
+  // status, including UNIMPLEMENTED and RESOURCE_EXHAUSTED, proves nothing
+  // about the artifact. The bundle stays owned by its artifact; callers that
+  // act on the result must hold their own artifact fence.
+  rpc BtrfsInspectSendSource(BtrfsInspectSendSourceRequest)
+      returns (BtrfsInspectSendSourceResponse);
+
+  // Volume-manager owns an independent private copy before accepting a job.
+  rpc GetBtrfsSendCapabilities(GetBtrfsSendCapabilitiesRequest) returns (GetBtrfsSendCapabilitiesResponse);
+  rpc BtrfsStageSendSource(BtrfsStageSendSourceRequest) returns (BtrfsSendLease);
+  rpc BtrfsReadSendSource(BtrfsSendLease) returns (stream BtrfsSendChunk);
+  rpc BtrfsDeleteSendSource(BtrfsSendLease) returns (BtrfsDeleteSendSourceResponse);
+  rpc BtrfsListSendSources(BtrfsListSendSourcesRequest) returns (BtrfsListSendSourcesResponse);
 
   // Consume a `rootfs.btrfs-send` stream pulled to the sandbox's
   // local snapshot dir and reconstruct the sandbox's `instance/`
@@ -690,6 +738,10 @@ message InspectSandboxResponse {
   string cgroup_memory_current = 33;
   string cgroup_pids_max = 34;
   string cgroup_pids_current = 35;
+  // The cgroup's raw cpu.stat; empty when the cgroup does not exist.
+  // Sandbox-manager reports CPU time from it: it has no view of the host
+  // cgroup tree.
+  string cgroup_cpu_stat = 36;
 
   // Filesystem
   bool cache_dir_exists = 40;
@@ -1040,11 +1092,22 @@ message BtrfsEncodeRootfsSendRequest {
   // sandbox's snapshot roots; absent uses the canonical local restore dir.
   optional string dest_dir = 4;
   ExecutionFence execution_fence = 5;
+  // Retain a private COW source and parent for regeneration. Old servers
+  // ignore this hint and return no source identity.
+  bool retain_source = 6;
+  // Requires retain_source. The response's source_id acknowledges support;
+  // old servers still materialize the file. stream_bytes is zero when deferred.
+  bool defer_send = 7;
 }
 message BtrfsEncodeRootfsSendResponse {
   // Size of the produced rootfs.btrfs-send stream, returned so the
   // caller can record / log it without having to stat the file.
   uint64 stream_bytes = 1;
+  optional string source_id = 2;
+  // Length of the retained source's rootfs image, present when the send was
+  // deferred. Callers cannot read the retained bundle, and a deferred capture
+  // has no stream to measure. This is never a send-stream length.
+  optional uint64 rootfs_bytes = 3;
 }
 
 message BtrfsEncodeSnapshotRootfsSendRequest {
@@ -1057,9 +1120,33 @@ message BtrfsEncodeSnapshotRootfsSendRequest {
   // Host-absolute artifact destination. Restricted to this sandbox's
   // snapshot roots and required to be separate from the read-only source.
   string dest_dir = 5;
+  bool retain_source = 6;
+  // Requires retain_source. The response's source_id acknowledges support;
+  // old servers still materialize the file. stream_bytes is zero when deferred.
+  bool defer_send = 7;
 }
 message BtrfsEncodeSnapshotRootfsSendResponse {
   uint64 stream_bytes = 1;
+  optional string source_id = 2;
+  // As in BtrfsEncodeRootfsSendResponse.
+  optional uint64 rootfs_bytes = 3;
+}
+
+message BtrfsMaterializeRootfsSendRequest {
+  string sandbox_id = 1;
+  string artifact_dir = 2;
+  string source_id = 3;
+}
+
+message BtrfsInspectSendSourceRequest {
+  string sandbox_id = 1;
+  // Restricted to this sandbox's snapshot roots, as for materialization.
+  string artifact_dir = 2;
+  string source_id = 3;
+}
+message BtrfsInspectSendSourceResponse {
+  // Length of the retained rootfs image, not of any send stream.
+  uint64 rootfs_bytes = 1;
 }
 
 // A canonical instance belongs to an execution; restore staging belongs to a
@@ -1162,3 +1249,77 @@ message BtrfsDeleteSandboxInstanceRequest {
   InstanceTarget target = 2;
 }
 message BtrfsDeleteSandboxInstanceResponse {}
+
+// These node-local capabilities are restricted to volume-manager and operators.
+message BtrfsStageSendSourceRequest {
+  string sandbox_id = 1;
+  string artifact_dir = 2;
+  string source_id = 3;
+  string lease_id = 4;
+}
+message BtrfsSendLease { string lease_id = 1; }
+message BtrfsSendChunk {
+  bytes data = 1;
+  // A terminal frame is required, even for an empty stream. EOF alone is not
+  // successful kernel-send completion. Nonterminal frames leave this absent.
+  optional uint64 completed_bytes = 2;
+}
+message BtrfsDeleteSendSourceResponse {}
+message BtrfsListSendSourcesRequest {}
+message BtrfsListSendSourcesResponse { repeated string lease_ids = 1; }
+
+message GetBtrfsSendCapabilitiesRequest {}
+message GetBtrfsSendCapabilitiesResponse {
+  bool supported = 1;
+  // BtrfsInspectSendSource and the encode responses' rootfs_bytes are
+  // available. Sandbox-manager defers a send only when both are.
+  bool inspect_send_source = 2;
+}
+
+// An artifact in the node's store, named by what it is rather than where.
+message NodeArtifact {
+  oneof artifact {
+    RuntimeReleaseArtifact runtime_release = 1;
+    ComponentArtifact component = 2;
+  }
+}
+
+message RuntimeReleaseArtifact {
+  space.execution.v1.RuntimeKind runtime_kind = 1;
+  // The release, such as 1.16.2.
+  string version = 2;
+  string digest = 3;
+}
+
+message ComponentArtifact {
+  space.execution.v1.ArtifactComponentKind kind = 1;
+  // Adapter metadata used to locate the local slot. Never sufficient identity.
+  string version = 2;
+  // sha256:<hex>; publication requires independent catalog authorization,
+  // removal checks the stored bytes under the root lock.
+  string digest = 3;
+}
+
+message PublishArtifactRequest {
+  NodeArtifact artifact = 1;
+  // The staging directory the runtime manager prepared: one path component.
+  string staging_name = 2;
+}
+
+message PublishArtifactResponse {
+  // The artifact's directory in the store.
+  string path = 1;
+  // sha256:<hex> of a kernel image, or over a release's binaries.
+  string digest = 2;
+  // The pinned artifact was already in the store; nothing was written.
+  bool already_present = 3;
+}
+
+message RemoveArtifactRequest {
+  NodeArtifact artifact = 1;
+}
+
+message RemoveArtifactResponse {
+  // False when the artifact was not in the store.
+  bool removed = 1;
+}

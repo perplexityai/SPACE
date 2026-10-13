@@ -40,19 +40,23 @@ acceptable; never distribute a server private key to clients.
 
 On EKS, the `space` Terraform module
 (`infra/space/aws/eks/modules/space/internal_rpc_tls.tf`) provisions a
-per-cluster CA and one leaf certificate each for ClusterApi, NodeApi and
-BuildManager. `app_deploy.tf` syncs them into the `space-internal-rpc-ca`,
-`space-cluster-api-tls`, `space-node-api-tls` and `space-build-manager-tls`
-Secrets.
+per-cluster CA and one leaf certificate each for ClusterApi, NodeApi,
+BuildManager and the API's ingress activation listener. `app_deploy.tf` syncs
+them into the `space-internal-rpc-ca`, `space-cluster-api-tls`,
+`space-node-api-tls`, `space-build-manager-tls` and
+`space-ingress-activation-tls` Secrets.
 
 The leaves carry only short service names (ClusterApi: `space-internal-api` and
 `space-cluster-api`; NodeApi: `space-node-api`; BuildManager:
-`space-builder-build-manager`) and no IP SANs. A caller whose configured
+`space-builder-build-manager`; ingress activation: `space-ingress-activation`)
+and no IP SANs. A caller whose configured
 endpoint host isn't one of those names, such as a node IP, a loopback address, a
 fully qualified service name or another short name, sets the matching
 `*_TLS_SERVER_NAME`. Every NodeApi listener on a cluster shares the one
 `space-node-api` key: that's the shared worker identity described above, not a
-per-node identity.
+per-node identity. Ingress activation callers that dial the API's activation
+Service by another name set
+`SPACE_INGRESS_ACTIVATION_TLS_SERVER_NAME=space-ingress-activation`.
 
 An apply reissues a leaf once it's within 60 days of its one-year expiry, or
 past it; the module doesn't schedule applies. Listeners load their identity only
@@ -61,7 +65,8 @@ listeners after the Secret has refreshed.
 
 `SPACE_INTERNAL_RPC_INSECURE_DEV=true` explicitly permits HTTP for local test
 and development deployments and permits a listener without certificate files.
-The checked-in Kind charts set this exception. A partially configured listener
+The checked-in Kind charts don't set it: `infra/space/kind/scripts/internal-rpc-tls.sh`
+provisions a per-cluster CA and the same listener Secrets locally. A partially configured listener
 certificate/key pair still fails startup; explicitly configured HTTPS still
 requires trust even with the exception. Steady-state production deployments must leave this
 exception unset/false. Plaintext Rust fixtures opt in explicitly in isolated
@@ -80,7 +85,15 @@ Discovery advertises HTTPS for TLS-configured listeners and HTTP only for explic
 identity-free development listeners. Clients do not perform protocol fallback.
 Listeners admit at most 64 pending TLS handshakes, each with a ten-second
 deadline. Established channels do not consume that budget. Shutdown releases
-the listening socket even when handshake admission is saturated.
+the listening socket even when handshake admission is saturated. Clients give
+each handshake, reconnects included, fifteen seconds: the listener's ten-second
+deadline plus five seconds, because a listener takes a handshake slot before it
+accepts, so while every slot is busy a connected socket first waits in the
+kernel accept queue, and that wait counts against the client's timer but not the
+listener's. A listener that accepts TCP but never answers therefore fails the
+dial instead of holding it, while a briefly saturated one can still finish the
+handshake. No client bound can guarantee a handshake while a listener stays
+saturated.
 
 Migrate every caller and operational tool to TLS before deploying TLS-only
 listener images. Verify lifecycle, discovery, reconciliation, artifact transfers

@@ -46,6 +46,21 @@ impl SandboxTraceContext {
     }
 }
 
+/// Record one sandbox's canonical identity, its bare UUID, as `sandbox_id` on
+/// `span`. The public `sbx_<uuid>` spelling is accepted and recorded without
+/// its prefix, so every service's spans agree on one value. A value that is
+/// not a sandbox UUID is not recorded: a malformed request cannot put an
+/// arbitrary string on the span.
+pub fn record_sandbox_id(span: &tracing::Span, sandbox_id: &str) -> Option<SandboxId> {
+    let canonical = sandbox_id
+        .strip_prefix("sbx_")
+        .unwrap_or(sandbox_id)
+        .parse::<SandboxId>()
+        .ok()?;
+    span.record("sandbox_id", tracing::field::display(canonical));
+    Some(canonical)
+}
+
 /// Record a typed guest outcome without changing the enclosing span's status.
 /// Public HTTP spans still classify their legitimate 502 as an HTTP error.
 pub fn record_guest_service_outcome(status: &tonic::Status, span: &tracing::Span) -> bool {

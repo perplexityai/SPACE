@@ -1,0 +1,6 @@
+apiVersion: v2
+name: space-sandbox-network-policy
+description: NetworkPolicies that confine the KinD SPACE sandbox namespace to the traffic its pods carry
+type: application
+version: 0.1.0
+appVersion: "0.8.0"

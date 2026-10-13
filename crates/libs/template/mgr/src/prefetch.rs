@@ -26,13 +26,10 @@
 //!       and an org-scoped one drop their pin. See "Visibility gate".
 //!
 //! 2. **Latest-N release pass.** For each unique template name
-//!    extracted from `SPACE_TEMPLATE_PREFETCH_TAGS`, when there is either
-//!    warming to do or a verdict to learn — the pass doubles as the
-//!    template-visibility resolver, so `latest_n > 0` gates the warming
-//!    while the enforcement switch gates the resolve
-//!    ([`should_query_latest_releases`]). With enforcement off, the
-//!    default, `latest_n = 0` skips the pass entirely. See "Visibility
-//!    gate" below.
+//!    extracted from `SPACE_TEMPLATE_PREFETCH_TAGS`, on every tick — the
+//!    pass doubles as the template-visibility resolver, so `latest_n > 0`
+//!    gates only the warming, never the resolve. See "Visibility gate"
+//!    below.
 //!    1. Call `ClusterApi.ListLatestTemplateReleases(name, fc,
 //!       max(latest_n, 1))` — the `max` keeps the response carrying a
 //!       template-level visibility even when nothing will be warmed.
@@ -143,7 +140,7 @@
 //!   saturated control-plane pool — not just a rolling deploy that
 //!   lands new template-mgr before cluster-api has the field — can make
 //!   prefetch candidates skip on every node at once, generic
-//!   `seed`/`code-runtime` included: no pull is dispatched and prefetch
+//!   templates included: no pull is dispatched and prefetch
 //!   warming stops fleet-wide for as long as the read keeps failing.
 //!   (Under saturation the *release* lookup can fail first instead,
 //!   which surfaces as `resolve_error` rather than
@@ -213,24 +210,23 @@
 //! [`dispatch_pull`] spawns, nothing recalls the task: the verdict has
 //! to land while the pull is still a queued decision.
 //!
-//! ### Rollout: the gate ships disabled
+//! ### No switch opens the gate
 //!
-//! Everything above is inert unless
-//! `SPACE_TEMPLATE_PREFETCH_VISIBILITY_ENFORCEMENT` opts the node in
-//! (see [`crate::volume::visibility_enforcement_enabled`]). Off is the default, and
-//! deliberately so, because of the `Unspecified` path: a failing
-//! cluster-side `templates.visibility` read makes candidates skip on
-//! every node at once. The internal-api visibility cache is also opt-in;
-//! enable it before enforcement so a database failure cannot suppress all
-//! prefetches until the image is rolled back.
+//! The gate is unconditional. An earlier opt-in switch,
+//! `SPACE_TEMPLATE_PREFETCH_VISIBILITY_ENFORCEMENT`, defaulted off and
+//! then treated every template as generic; it is retired, and startup
+//! only warns when it is still set. The node-scoped template catalog in
+//! the internal API keeps an unrelated node from resolving another
+//! organization's release when Kubernetes service-account authentication
+//! is configured, but a static-only deployment reads the catalog
+//! unscoped, so this gate is the boundary there and defense in depth
+//! everywhere else.
 //!
-//! When the flag is off nothing marks a template org-specific, and the
-//! downstream goes inert for free: the prune keep-sets, the release-pin
-//! flush, and the drain's suppression filter all read an empty verdict
-//! set, so behavior is exactly what it was before the gate existed. No
-//! visibility outcomes are emitted either — absence of
-//! `skipped_org_specific` and `visibility_unknown` is how you tell a
-//! node is not enforcing.
+//! The price is the `Unspecified` path above: a failing cluster-side
+//! `templates.visibility` read stops prefetch warming on every node at
+//! once, while on-demand pulls continue cold. The internal-api visibility
+//! cache (`SPACE_INTERNAL_API_VISIBILITY_CACHE_*`) carries the read
+//! through such a failure; enable it wherever prefetch is configured.
 //!
 //! On-demand pulls are deliberately not gated here: they serve an
 //! already-authorized sandbox create (the API's create-time authz gate
@@ -272,11 +268,8 @@
 //!   to `seed:latest` and `code-runtime:latest`; `[]` disables all tag pins.
 //! - `SPACE_TEMPLATE_PREFETCH_ENABLED` — set to `"0"` or `"false"` to
 //!   disable. Default: enabled.
-//! - `SPACE_TEMPLATE_PREFETCH_VISIBILITY_ENFORCEMENT` — set to `"1"` or
-//!   `"true"` to arm the visibility gate. **Default: disabled**, unlike
-//!   every other knob here; see the rollout note under "Visibility
-//!   gate". Read at each enforcement decision rather than captured at
-//!   startup, so flipping it stops enforcement without a new binary.
+//! - `SPACE_TEMPLATE_PREFETCH_VISIBILITY_ENFORCEMENT` — retired and ignored;
+//!   prefetch always requires confirmed generic visibility.
 //! - `SPACE_TEMPLATE_PREFETCH_LATEST_N` — test hook only (ignored by
 //!   release builds): number of latest releases to warm per template
 //!   (default: 5; `0` disables latest-N *warming* and keeps only tag
@@ -376,14 +369,10 @@ pub struct PrefetchConfig {
     pub concurrency: usize,
     /// Number of latest releases to *warm* per template.
     ///
-    /// Zero disables the warming. Whether it also disables the pass
-    /// depends on the enforcement switch, because the pass doubles as
-    /// the template-visibility resolver — see
-    /// [`should_query_latest_releases`]. With enforcement armed, zero
-    /// still issues one `ListLatestTemplateReleases` per template per
-    /// tick (`limit = 1`) to learn each verdict; with enforcement off,
-    /// the default, there is no verdict to learn and the pass is
-    /// skipped entirely. See the "Visibility gate" module docs.
+    /// Zero disables the warming but not the pass, which doubles as the
+    /// template-visibility resolver: it still issues one
+    /// `ListLatestTemplateReleases` per template per tick (`limit = 1`)
+    /// to learn each verdict. See the "Visibility gate" module docs.
     pub latest_n: u32,
 }
 
@@ -424,6 +413,13 @@ impl PrefetchConfig {
 /// cooperative shutdown via `CancellationToken` is intentionally
 /// deferred to a follow-up PR.
 pub async fn run_loop(pins: PinnedDigestsStore, volume_puller: VolumePuller, cfg: PrefetchConfig) {
+    if std::env::var_os(crate::volume::RETIRED_ENV_VISIBILITY_ENFORCEMENT).is_some() {
+        warn!(
+            env = crate::volume::RETIRED_ENV_VISIBILITY_ENFORCEMENT,
+            "retired setting is ignored: prefetch always refuses templates not confirmed generic",
+        );
+    }
+
     if !cfg.enabled {
         info!("template prefetch disabled (SPACE_TEMPLATE_PREFETCH_ENABLED=0)");
         return;
@@ -503,14 +499,6 @@ fn unique_prefetch_templates(tag_tuples: &[(TemplateName, TemplateTag)]) -> Vec<
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect()
-}
-
-/// Whether the latest-release pass has work this tick. A positive
-/// `latest_n` needs releases to warm; enforcement needs a template-level
-/// verdict even when warming is disabled. With neither, issuing one RPC per
-/// template would change the disabled gate's pre-existing RPC footprint.
-fn should_query_latest_releases(latest_n: u32, enforcing: bool) -> bool {
-    latest_n > 0 || enforcing
 }
 
 /// Decision the latest-N release pass makes for one resolved
@@ -608,20 +596,6 @@ async fn tick(
     let mut org_specific_templates: BTreeSet<String> = BTreeSet::new();
     let db = pins.conn();
 
-    // Resolved once per tick, not per template: a flip landing mid-tick
-    // would otherwise let one pass enforce while the other doesn't,
-    // which can drop one pin kind and keep the other. The tick is the
-    // enforcement cycle, so it is the right granularity — the next tick
-    // picks up the new value 60 seconds later.
-    let enforcing = crate::volume::visibility_enforcement_enabled();
-    if !enforcing {
-        debug!(
-            env = crate::volume::ENV_VISIBILITY_ENFORCEMENT,
-            "prefetch: template-visibility enforcement is off; warming every template \
-             regardless of visibility",
-        );
-    }
-
     // ── Pass 1: tag pins ───────────────────────────────────────────────
     for (name, tag) in tag_tuples {
         let (name, tag) = (name.as_str(), tag.as_str());
@@ -646,20 +620,9 @@ async fn tick(
                 // dispatch a template this tick already confirmed
                 // private. The final by-hash gate would have to catch it,
                 // and only if that resolve disagreed too.
-                //
                 let reported_visibility = visibility;
-                // Not enforcing → treat every template as warmable, which
-                // is exactly the pre-gate behavior. Short-circuiting the
-                // verdict here rather than wrapping the match keeps a
-                // single code path for the enforcing case, and leaves the
-                // downstream inert for free: nothing is ever marked, so
-                // the prune keep-sets and the drain's suppression filter
-                // all see an empty verdict set.
-                let visibility = if enforcing {
-                    hardened_visibility(org_specific_templates.contains(name), visibility)
-                } else {
-                    TemplateVisibility::Generic
-                };
+                let visibility =
+                    hardened_visibility(org_specific_templates.contains(name), visibility);
                 match visibility {
                     TemplateVisibility::Generic => {}
                     TemplateVisibility::OrgSpecific => {
@@ -798,23 +761,16 @@ async fn tick(
     // flush GC protection for everything cached on this node.
     let mut prunable_templates: Vec<String> = Vec::new();
     let mut release_pins_keep: Vec<(String, String)> = Vec::new();
-    // Runs when there is either warming to do or a verdict to learn.
+    // Runs on every tick, whatever `latest_n` says.
     //
     // `latest_n == 0` disables the *warming*, but the pass is also the
     // template-visibility resolver: if a formerly-generic template flips
     // to org-specific after its configured tag is deleted, the tag pass
     // sees only `Unresolved` and this is the sole path that can learn the
-    // verdict and unpin the now-private rootfs. So with enforcement armed
-    // it runs regardless of `latest_n`, querying at least one release so
-    // the response carries the template-level visibility even when
-    // nothing will be warmed.
-    //
-    // With enforcement off there is no verdict to learn, so
-    // `latest_n == 0` skips the pass entirely rather than spending one
-    // RPC per template on an answer nobody reads. That also keeps the
-    // disabled switch honest: off means the loop behaves exactly as it
-    // did before the gate existed, including its RPC footprint.
-    if should_query_latest_releases(latest_n, enforcing) {
+    // verdict and unpin the now-private rootfs. So it queries at least one
+    // release, which keeps the template-level visibility on the response
+    // even when nothing will be warmed.
+    {
         let query_limit = latest_n.max(1);
         for template_name in unique_prefetch_templates(tag_tuples) {
             let (visibility, releases) =
@@ -851,12 +807,7 @@ async fn tick(
             // purpose that needs marking to be loud.
             let tag_pass_marked_org_specific = org_specific_templates.contains(&template_name);
             let reported_visibility = visibility;
-            // Same short-circuit as the tag pass; see there.
-            let visibility = if enforcing {
-                hardened_visibility(tag_pass_marked_org_specific, visibility)
-            } else {
-                TemplateVisibility::Generic
-            };
+            let visibility = hardened_visibility(tag_pass_marked_org_specific, visibility);
 
             // Visibility gate (template-level; see module docs). The
             // verdict applies regardless of whether any releases came

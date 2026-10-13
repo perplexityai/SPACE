@@ -318,15 +318,70 @@ impl HttpSpanMetadata for ApiHttpSpanMetadata {
     /// Returns the `(url.path, http.route)` to record on the `http.server` span.
     fn span_path_and_route<'a>(
         &self,
+        method: &axum::http::Method,
         _headers: &HeaderMap,
         raw_path: &'a str,
         matched_route: Option<&'a str>,
     ) -> (Cow<'a, str>, Cow<'a, str>) {
-        (
-            Cow::Borrowed(raw_path),
-            Cow::Borrowed(matched_route.unwrap_or(raw_path)),
-        )
+        let route = matched_route.unwrap_or(raw_path);
+        let route =
+            native_action_route(method, route, raw_path).map_or(Cow::Borrowed(route), Cow::Owned);
+        (Cow::Borrowed(raw_path), route)
     }
+
+    /// Records the sandbox a request's path names as the canonical
+    /// `sandbox_id`, its bare UUID: native routes spell it `sbx_<uuid>`.
+    fn record_extra_fields(
+        &self,
+        _headers: &HeaderMap,
+        raw_path: &str,
+        _matched_route: Option<&str>,
+        span: &tracing::Span,
+    ) {
+        if let Some(sandbox_id) = sandbox_path_segment(raw_path) {
+            pplx_space_common_svc::record_sandbox_id(span, sandbox_id);
+        }
+    }
+}
+
+/// The path segment after `/sandboxes/`, without a native `:action` suffix.
+fn sandbox_path_segment(raw_path: &str) -> Option<&str> {
+    let (_, rest) = raw_path.split_once("/sandboxes/")?;
+    let segment = rest.split('/').next()?;
+    Some(
+        segment
+            .split_once(':')
+            .map_or(segment, |(sandbox_id, _)| sandbox_id),
+    )
+}
+
+/// The declared route of a native `:action` request, such as
+/// `/v1/sandboxes/{sandbox_id}:stop`.
+///
+/// Axum cannot match an `:action` suffix inside a path segment, so every
+/// action on a resource is mounted at the resource's own path and dispatched
+/// on the suffix. Left alone, stop, start, suspend, wake and pause would share
+/// one span name and `http.route`. A request whose method or action the
+/// manifest does not declare keeps the mounted route, so the set of names
+/// stays bounded and never names a route that does not exist.
+fn native_action_route(
+    method: &axum::http::Method,
+    matched_route: &str,
+    raw_path: &str,
+) -> Option<String> {
+    let (_, action) = raw_path.rsplit_once('/')?.1.rsplit_once(':')?;
+    pplx_space_public_api::routes::NATIVE_V1_OPERATIONS
+        .iter()
+        .find_map(|operation| {
+            let prefix = matched_route.strip_suffix(operation.relative_runtime_path())?;
+            (prefix.ends_with("/v1")
+                && method
+                    .as_str()
+                    .eq_ignore_ascii_case(operation.method().openapi_name())
+                && operation.path() != operation.runtime_path()
+                && operation.path().strip_suffix(action)?.ends_with(':'))
+            .then(|| format!("{prefix}{}", operation.relative_path()))
+        })
 }
 
 #[cfg(test)]

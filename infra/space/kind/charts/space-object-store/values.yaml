@@ -3,7 +3,7 @@
 # Versity S3 Gateway (versitygw, Apache-2.0) serving its POSIX backend from a
 # node-local hostPath: each bucket is a directory and each object a file, with
 # object metadata (ETag, content type, user metadata) in extended attributes.
-# volume-manager (real, on the node-stack DaemonSet) uploads/pulls
+# volume-manager (real, on its node DaemonSet) uploads/pulls
 # suspend-restore snapshot artifacts here via the production object-store
 # crate with an S3 endpoint override + path-style addressing, and the
 # space-seed-publish Job publishes template releases with the aws CLI. Nothing

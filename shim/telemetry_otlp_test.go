@@ -85,8 +85,8 @@ func TestOTLPMetricsResourceIdentity(t *testing.T) {
 		{"standalone host", map[string]string{"HOSTNAME": " worker ", "SPACE_NODE_ID": "fallback"}, "worker", map[string]string{"host.name": "worker"}},
 		{"node ID fallback", map[string]string{"HOSTNAME": " \t", "SPACE_NODE_ID": " node-id "}, "node-id", nil},
 		{"pod hostname is not a host", map[string]string{"HOSTNAME": "pod", "KUBERNETES_SERVICE_HOST": ""}, "pod", nil},
-		{"explicit node and pod", map[string]string{"HOSTNAME": "pod", "SPACE_K8S_NODE_NAME": " node ", "KUBE_NODE_NAME": "fallback", "SPACE_K8S_POD_NAME": " pod-name "}, "pod", map[string]string{"host.name": "node", "k8s.node.name": "node", "k8s.pod.name": "pod-name"}},
-		{"Kubernetes node fallback", map[string]string{"HOSTNAME": "pod", "SPACE_K8S_NODE_NAME": " ", "KUBE_NODE_NAME": " kube-node "}, "pod", map[string]string{"host.name": "kube-node", "k8s.node.name": "kube-node"}},
+		{"explicit node and pod", map[string]string{"HOSTNAME": "pod", "SPACE_K8S_NODE_NAME": " node ", "KUBE_NODE_NAME": "fallback", "SPACE_K8S_POD_NAME": " pod-name "}, "node", map[string]string{"host.name": "node", "k8s.node.name": "node", "k8s.pod.name": "pod-name"}},
+		{"Kubernetes node fallback", map[string]string{"HOSTNAME": "pod", "SPACE_K8S_NODE_NAME": " ", "KUBE_NODE_NAME": " kube-node "}, "kube-node", map[string]string{"host.name": "kube-node", "k8s.node.name": "kube-node"}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			for _, key := range []string{"HOSTNAME", "SPACE_NODE_ID", "SPACE_K8S_NODE_NAME", "KUBE_NODE_NAME", "SPACE_K8S_POD_NAME", "KUBERNETES_SERVICE_HOST"} {
@@ -133,12 +133,35 @@ func startMetricsReceiver(t *testing.T) (*metricsRecordingReceiver, string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	receiver := &metricsRecordingReceiver{requests: make(chan *collector.ExportMetricsServiceRequest, 4)}
+	receiver := &metricsRecordingReceiver{requests: make(chan *collector.ExportMetricsServiceRequest, 16)}
 	server := grpc.NewServer()
 	collector.RegisterMetricsServiceServer(server, receiver)
 	go func() { _ = server.Serve(listener) }()
 	t.Cleanup(server.Stop)
 	return receiver, "http://" + listener.Addr().String()
+}
+
+// receiveScope returns the next export carrying instruments under scope. The
+// shim's own metrics and the Go runtime metrics leave on separate providers,
+// so a flush of both arrives as separate requests in either order.
+func receiveScope(t *testing.T, receiver *metricsRecordingReceiver, scope string) *collector.ExportMetricsServiceRequest {
+	t.Helper()
+	deadline := time.After(2 * time.Second)
+	for {
+		select {
+		case request := <-receiver.requests:
+			for _, rm := range request.ResourceMetrics {
+				for _, scoped := range rm.ScopeMetrics {
+					if scoped.Scope.GetName() == scope {
+						return request
+					}
+				}
+			}
+		case <-deadline:
+			t.Fatalf("no OTLP export under scope %q received", scope)
+			return nil
+		}
+	}
 }
 
 func TestOTLPMetricsProcessIdentity(t *testing.T) {
@@ -171,8 +194,8 @@ func TestOTLPMetricsProcessIdentity(t *testing.T) {
 		if output, err := cmd.CombinedOutput(); err != nil {
 			t.Fatalf("%v\n%s", err, output)
 		}
-		select {
-		case request := <-receiver.requests:
+		{
+			request := receiveScope(t, receiver, shimMeterScope)
 			if len(request.ResourceMetrics) != 1 {
 				t.Fatalf("resource metrics: %v", request)
 			}
@@ -189,8 +212,6 @@ func TestOTLPMetricsProcessIdentity(t *testing.T) {
 			if metric.Name != "space.shim.operation.error" || metric.GetSum().GetAggregationTemporality() != metricspb.AggregationTemporality_AGGREGATION_TEMPORALITY_DELTA {
 				t.Fatalf("expected identical delta streams distinguished by resource: %v", metric)
 			}
-		case <-time.After(time.Second):
-			t.Fatal("no child metric export received")
 		}
 	}
 }
@@ -260,12 +281,7 @@ func TestOTLPMetricsWireProfileAndShutdown(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		var request *collector.ExportMetricsServiceRequest
-		select {
-		case request = <-receiver.requests:
-		case <-time.After(time.Second):
-			t.Fatal("no OTLP export received")
-		}
+		request := receiveScope(t, receiver, shimMeterScope)
 		if len(request.ResourceMetrics) != 1 {
 			t.Fatalf("resource metrics: %v", request)
 		}
@@ -287,7 +303,8 @@ func TestOTLPMetricsWireProfileAndShutdown(t *testing.T) {
 				}
 				attrs = sum.DataPoints[0].Attributes
 				assertMetricAttributes(t, attrs, map[string]string{"result": "error", "reason": "grpc:unavailable", "grpc_code": "Unavailable"})
-			case "space.shim.operation.latency_ms", "space.shim.operation.step.latency_ms":
+			// OTLP declares the unit, so the name drops the DogStatsD `_ms`.
+			case "space.shim.operation.latency", "space.shim.operation.step.latency":
 				hist := m.GetExponentialHistogram()
 				if m.Unit != "ms" || hist == nil || hist.AggregationTemporality != metricspb.AggregationTemporality_AGGREGATION_TEMPORALITY_DELTA || len(hist.DataPoints) != 1 {
 					t.Fatalf("latency did not preserve exponential delta histogram: %v", m)
@@ -301,10 +318,7 @@ func TestOTLPMetricsWireProfileAndShutdown(t *testing.T) {
 			default:
 				t.Fatalf("unexpected metric name: %s", m.Name)
 			}
-			// One identity per process: the point service must agree with the
-			// resource service.name asserted above, which OTEL_SERVICE_NAME
-			// now governs for both instead of only the resource.
-			assertMetricAttributes(t, attrs, map[string]string{"op": "create", "service": "explicit-service", "cluster_id": "test-cluster"})
+			assertMetricAttributes(t, attrs, map[string]string{"op": "create", "cluster_id": "test-cluster"})
 			// env and version belong to the resource asserted above; duplicating
 			// them here would give the Agent two ambiguous identity sources.
 			assertAttributesAbsent(t, attrs, "env", "version")
@@ -404,7 +418,7 @@ func configureOTLPMetricsEnv(t *testing.T, endpoint string) {
 	t.Setenv("OTEL_EXPORTER_OTLP_METRICS_HEADERS", "")
 }
 
-// Runtime metrics must reach the collector through the shim's existing
+// Runtime metrics must reach the collector through the shim's runtime
 // provider, so an all-OTLP deployment gets the standard go.* set rather than
 // nothing. It is narrower than Datadog's runtime metrics v2; see
 // docs/installation.md.
@@ -428,17 +442,10 @@ func TestOTLPMetricsExportGoRuntimeInstruments(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	if err := otlp.provider.ForceFlush(ctx); err != nil {
+	if err := otlp.runtime.ForceFlush(ctx); err != nil {
 		t.Fatal(err)
 	}
-	var request *collector.ExportMetricsServiceRequest
-	select {
-	case request = <-receiver.requests:
-	case <-time.After(time.Second):
-		t.Fatal("no OTLP export received")
-	}
-	// A single ResourceMetrics proves runtime and custom metrics share one
-	// resource; a second pipeline would arrive as its own resource.
+	request := receiveScope(t, receiver, runtimeScopeName)
 	if len(request.ResourceMetrics) != 1 {
 		t.Fatalf("runtime metrics must share the shim resource: %v", request)
 	}
@@ -459,19 +466,8 @@ func TestOTLPMetricsExportGoRuntimeInstruments(t *testing.T) {
 			t.Errorf("runtime metric %q scope=%q, want %q", name, got, runtimeScopeName)
 		}
 	}
-	if got := scopeByMetric["space.shim.operation.error"]; got != shimMeterScope {
-		t.Errorf("custom metric scope=%q, want %q", got, shimMeterScope)
-	}
-	if len(shimScopeMetrics(t, rm)) != 1 {
-		t.Errorf("runtime instrumentation must not add streams to %q: %v", shimMeterScope, rm)
-	}
-	// Pin the wire shapes the exporter profile actually produces. The callback
-	// instruments follow the sink's delta selector even though they report
-	// runtime state, while the scheduler histogram comes from a Producer, which
-	// bypasses the temporality and exponential-aggregation selectors entirely.
-	if sum := metricByName["go.goroutine.count"].GetSum(); sum == nil || sum.AggregationTemporality != metricspb.AggregationTemporality_AGGREGATION_TEMPORALITY_DELTA {
-		t.Errorf("go.goroutine.count is not a delta sum: %v", metricByName["go.goroutine.count"])
-	}
+	// The scheduler histogram comes from a Producer, which bypasses the
+	// temporality and exponential-aggregation selectors entirely.
 	schedule := metricByName["go.schedule.duration"]
 	if hist := schedule.GetHistogram(); hist == nil || hist.AggregationTemporality != metricspb.AggregationTemporality_AGGREGATION_TEMPORALITY_CUMULATIVE {
 		t.Errorf("go.schedule.duration is not a cumulative explicit histogram: %v", schedule)
@@ -538,14 +534,10 @@ func TestOTLPMetricsShutdownReleasesRuntimeObservers(t *testing.T) {
 	otlp := sink.(*otlpMetricsSink)
 	flush, cancelFlush := context.WithTimeout(context.Background(), time.Second)
 	defer cancelFlush()
-	if err := otlp.provider.ForceFlush(flush); err != nil {
+	if err := otlp.runtime.ForceFlush(flush); err != nil {
 		t.Fatal(err)
 	}
-	select {
-	case <-receiver.requests:
-	case <-time.After(time.Second):
-		t.Fatal("no OTLP export received")
-	}
+	receiveScope(t, receiver, runtimeScopeName)
 	ctx, cancel := context.WithTimeout(context.Background(), telemetryShutdownBudget)
 	defer cancel()
 	started := time.Now()
@@ -557,11 +549,14 @@ func TestOTLPMetricsShutdownReleasesRuntimeObservers(t *testing.T) {
 	}
 	// Shutdown exports whatever was pending; drain that before proving the
 	// observers are released rather than merely idle.
-	select {
-	case <-receiver.requests:
-	default:
+	for drained := false; !drained; {
+		select {
+		case <-receiver.requests:
+		default:
+			drained = true
+		}
 	}
-	if err := otlp.provider.ForceFlush(context.Background()); err == nil {
+	if err := otlp.runtime.ForceFlush(context.Background()); err == nil {
 		t.Error("provider still collects after shutdown")
 	}
 	// A refused flush is the deterministic proof; the channel is checked rather

@@ -115,7 +115,8 @@ pub use validate::{
 pub use vsock::{
     BRIDGE_GUEST_VSOCK_PORT, BRIDGE_HOST_VSOCK_PORT, FirecrackerVsockConnectError,
     VsockConnectError, bind_vsock, connect_firecracker_vsock_channel_with_expected_peer,
-    connect_vsock_channel, connect_vsock_channel_with_retry, firecracker_vsock_port_path,
+    connect_vsock_channel, connect_vsock_channel_with_retry, firecracker_vsock_handshake,
+    firecracker_vsock_port_path,
 };
 pub use wire::{
     duration_to_proto, parse_env, parse_globs, proto_duration, proto_env, proto_globs,

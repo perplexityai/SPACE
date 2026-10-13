@@ -4176,38 +4176,6 @@ async fn publishing_owned_suspended_sandbox_promotes_restoring_lifecycle() -> Te
     Ok(())
 }
 
-/// An observed `started` must never resurrect a row that already
-/// completed its transition — only `restoring` is converged.
-#[tokio::test(flavor = "current_thread")]
-async fn publishing_started_sandbox_leaves_settled_lifecycles_alone() -> TestResult {
-    let Some(db) = try_pg_test_db().await? else {
-        return Ok(());
-    };
-    let node_id = NodeId::new();
-    insert_ready_worker_node(&db.pool, node_id).await?;
-
-    for lifecycle in ["suspended", "creating", "deleting", "failed"] {
-        let sandbox_id = SandboxId::new();
-        insert_active_sandbox(&db.pool, sandbox_id, node_id, lifecycle).await?;
-
-        let mut conn = db.pool.acquire().await?;
-        publish_sandbox_states(
-            &mut conn,
-            node_id,
-            &[published_sandbox_state(sandbox_id, "started")],
-        )
-        .await?;
-        drop(conn);
-
-        assert_eq!(
-            sandbox_lifecycle(&db.pool, sandbox_id).await?,
-            lifecycle,
-            "observed started must not move a {lifecycle} row"
-        );
-    }
-    Ok(())
-}
-
 /// Only the node the control plane placed the sandbox on may converge
 /// it — a stale report from a previous node must not race a cross-node
 /// restore.

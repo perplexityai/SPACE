@@ -1,25 +1,26 @@
 # Local visualization: Grafana
 
-Independent, optional visualization for the SPACE Kind metrics, logs and traces
-backends. This chart owns Grafana, dashboards and datasource provisioning only.
-It does not install a backend or change application routing. This is the final
-PR in the review stack, after metrics, logs and traces. The releases remain
-runtime-independent: enable only the datasources you have. All Grafana and
-dashboard changes belong here, not in the ingestion PRs.
+Independent visualization for the SPACE Kind metrics, logs and traces backends,
+installed automatically by default Kind bootstrap and full-stack Tilt in `otel`
+mode. This chart owns Grafana, dashboards and datasource provisioning only.
+It does not install a backend or change application routing. The releases remain
+runtime-independent: for standalone installations, enable only the datasources
+you have.
 
 ## Install and open
 
 ```bash
 helm dependency build infra/space/observability/charts/grafana
 helm lint infra/space/observability/charts/grafana -f infra/space/observability/charts/grafana/profiles/kind.yaml
-# Default: Prometheus only. Add Loki and Tempo when installed independently.
-bash infra/space/kind/grafana/local.sh up \
-  --set datasources.loki.enabled=true --set datasources.tempo.enabled=true
+# The Kind profile enables Prometheus, Loki and Tempo.
+bash infra/space/kind/grafana/local.sh up
+# Default bootstrap and full-stack Tilt already forward this port in otel mode.
 bash infra/space/kind/grafana/local.sh ui
 ```
 
-The helper verifies Docker Kind `space-local`, its published loopback API, the
-explicit `kind-space-local` context and owned namespace `space-grafana`.
+The helper verifies Docker Kind `space-local` (or `$SPACE_KIND_CLUSTER`), its
+published loopback API, the explicit matching `kind-` context and owned
+namespace `space-grafana`.
 It applies the chart's Kind overlay, which is what permits anonymous access,
 disposable state and no network policies. For shared clusters use the portable
 [observability charts and deployment runbook](../../observability/README.md),
@@ -41,10 +42,11 @@ another Helm release. For a logs-only installation:
 
 ```bash
 bash infra/space/kind/grafana/local.sh up \
-  --set datasources.prometheus.enabled=false --set datasources.loki.enabled=true
+  --set datasources.prometheus.enabled=false --set datasources.tempo.enabled=false
 ```
 
-For traces-only, disable Prometheus and enable `datasources.tempo.enabled`.
+For traces-only, disable Prometheus and Loki; Tempo is already enabled in the
+Kind profile. The shared chart defaults still leave Loki and Tempo disabled.
 Only enabled sources' dashboards are mounted. A future authenticated datasource
 must use secret-backed provisioning, not plaintext `--set` credentials.
 
@@ -69,7 +71,8 @@ Installing Grafana does **not** route SPACE telemetry to these backends.
 Select a time range containing a test and clear stale version filters. The
 real API metric selector is promoted `service_name`, not optional `service`.
 The synthetic helper workload does not emit real create/reconnect metrics.
-After temporary application routing is restored, fresh metrics/traces stop.
+After a temporary canary is routed back to a different backend, fresh
+metrics/traces stop arriving here.
 Metrics retention is six hours in the companion local stack: this is not a
 durable test-results archive. Preserve query JSON/reports separately.
 

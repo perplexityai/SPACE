@@ -4,14 +4,11 @@
 //! its own statement on every release resolution, and degrades every failure
 //! to `UNSPECIFIED`.
 //!
-//! No consumer reads the field yet — the visibility-aware prefetch gate is a
-//! separate, not-yet-merged change, and nothing under `crates/libs/template/`
-//! looks at visibility today. That gate is specified to read `UNSPECIFIED` as
-//! "not known to be generic" and fail closed, which is the correct orientation
-//! and also why the degradation matters: once it lands, one control-plane
-//! database problem would suppress prefetch warming on every node for every
-//! template, for as long as the read kept failing. This cache shrinks that
-//! trigger ahead of the gate, instead of weakening the gate.
+//! Prefetch uses this field to skip candidates not known to be generic. It is
+//! advisory: final prefetch resolution also requires generic-only selection in
+//! the same SQL snapshot as the release and storage locations, independent of
+//! this cache. A cached Generic value cannot authorize private artifacts after
+//! a visibility transition.
 //!
 //! ## Not the same thing as `visibility_pool`
 //!

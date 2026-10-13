@@ -13,7 +13,7 @@ import space_smoke as smoke
     sandbox=smoke.SandboxConfig(timeout=900),
 )
 def node_ctl_fence_refuses_and_reconciles(test: smoke.KindEcw) -> None:
-    """With the token kubelet projects into the node-stack pod on this sandbox's
+    """With the token kubelet projects into the node-ctl pod on this sandbox's
     worker, every forbidden Node write (taints, cordon, finalizers, the
     node-group boundary and cred-authority labels, foreign or inflated status
     resources, forged conditions, a template-write pull request, and anything
@@ -26,7 +26,7 @@ def node_ctl_fence_refuses_and_reconciles(test: smoke.KindEcw) -> None:
 
     fence = test.node_ctl_fence
 
-    with test.phase("locate the worker's node-stack pod and a second node"):
+    with test.phase("locate the worker's node-ctl pod and a second node"):
         fence.locate()
 
     with test.phase("the fence is installed, bound Deny, and type-checks clean"):

@@ -94,7 +94,39 @@ async fn unsupported_envd_method_returns_explicit_ecw_error() {
     );
 }
 
-fn backend_endpoint(value: &str) -> BackendEndpoint {
+/// Both proxy routes must reach the handler through the router. The subpath
+/// mount captures `session_id` and `path`; a scalar extractor rejects it with a
+/// 500 before authentication, so an unauthenticated request must surface the
+/// handler's 401 on every route shape.
+#[tokio::test]
+async fn proxy_session_routes_extract_path_parameters() {
+    if !pplx_space_test_env::enter_test_process(&[(
+        "SPACE_INTERNAL_RPC_INSECURE_DEV",
+        Some(std::ffi::OsStr::new("true")),
+    )]) {
+        return;
+    }
+
+    let app = router(test_data_plane_state().await);
+    let session_id = DataPlaneSessionId::Port(Default::default());
+    for path in [
+        format!("/v1/sessions/{session_id}/proxy"),
+        format!("/v1/sessions/{session_id}/proxy/api/v1/healthz"),
+        format!("/v1/sessions/{session_id}/proxy/assets/app.js?v=1"),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(Request::get(&path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{path}");
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body = serde_json::from_slice::<serde_json::Value>(&body).unwrap();
+        assert_eq!(body["message"], "data-plane token is required", "{path}");
+    }
+}
+
+pub(crate) fn backend_endpoint(value: &str) -> BackendEndpoint {
     value.parse().expect("valid backend endpoint")
 }
 
@@ -111,7 +143,7 @@ fn origin_for_target(
     }
 }
 
-fn test_ecw_route_origin(sandbox_id: SandboxId) -> EcwRouteOrigin {
+pub(crate) fn test_ecw_route_origin(sandbox_id: SandboxId) -> EcwRouteOrigin {
     EcwRouteOrigin {
         target: EcwSandboxHost {
             port: ECW_ENVD_PORT,
@@ -124,7 +156,7 @@ fn test_ecw_route_origin(sandbox_id: SandboxId) -> EcwRouteOrigin {
     }
 }
 
-fn ecw_resolved_route(
+pub(crate) fn ecw_resolved_route(
     sandbox_id: SandboxId,
     route_generation: u64,
     backend_endpoint: BackendEndpoint,
@@ -837,7 +869,7 @@ async fn spawn_cluster_api_stub() -> std::net::SocketAddr {
     addr
 }
 
-async fn test_data_plane_state() -> DataPlaneState {
+pub(crate) async fn test_data_plane_state() -> DataPlaneState {
     let addr = spawn_cluster_api_stub().await;
     let cluster_api =
         pplx_space_node_api_client::cluster::connect(format!("http://{addr}"), "test")
@@ -848,6 +880,7 @@ async fn test_data_plane_state() -> DataPlaneState {
         attach_deadline: Duration::from_secs(1),
         unauthenticated: Arc::new(UnauthenticatedUpgradeLimiter::new(1)),
         attached_streams: Arc::new(AttachedStreamLimiter::new(4, 4, 4)),
+        uploads: None,
         native_sessions: Arc::new(NativeSessionAttachLimiter::default()),
         backend_channels: Arc::new(BackendChannelPool::new(1)),
         revocation_cache: Arc::new(RevocationCache::default()),
@@ -2421,14 +2454,19 @@ fn data_plane_http_span_metadata_redacts_ecw_proxy_paths() {
     );
 
     assert_eq!(
-        metadata.span_path_and_route(&headers, "/customer/private/path", None),
+        metadata.span_path_and_route(
+            &axum::http::Method::GET,
+            &headers,
+            "/customer/private/path",
+            None
+        ),
         (
             Cow::Borrowed(pplx_space_common_svc::REDACTED_HTTP_PATH_VALUE),
             Cow::Borrowed(pplx_space_common_svc::REDACTED_HTTP_PATH_VALUE),
         ),
     );
     assert_eq!(
-        metadata.span_path_and_route(&headers, "/files", Some("/files")),
+        metadata.span_path_and_route(&axum::http::Method::GET, &headers, "/files", Some("/files")),
         (Cow::Borrowed("/files"), Cow::Borrowed("/files")),
     );
 }
@@ -3999,7 +4037,9 @@ async fn cached_ingress_refreshes_replaced_execution_but_not_denied_access() {
                 .unwrap();
             crate::native::proxy_session(
                 State(state.clone()),
-                Path(session_id.to_string()),
+                Path(crate::native::ProxySessionPath {
+                    session_id: session_id.to_string(),
+                }),
                 request,
             )
             .await

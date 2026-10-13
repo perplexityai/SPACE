@@ -56,6 +56,7 @@ pplx-space-spaced-common = { workspace = true }
 pplx-space-template-mgr-client = { workspace = true }
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 pplx-space-common-svc = { workspace = true, features = ["test-support"] }
 pplx-space-credmgr = { workspace = true, features = ["test-hooks"] }
 pplx-space-db-test-fixtures = { workspace = true }

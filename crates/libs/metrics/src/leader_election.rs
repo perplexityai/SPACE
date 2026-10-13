@@ -9,13 +9,15 @@ use crate::emit::{counter, gauge, tag};
 /// Per-pod leadership state. `identity` is the pod name (or the configured
 /// election identity). Sum across identities should be `1`.
 ///
-/// Emitted on every acquire or renewal the Lease API *answers*, holder and
-/// standby alike: a standby told that a peer holds emits `0`, which is what
-/// keeps its series alive. What emits no sample is a call that errors or times
-/// out, and a *renewal* answered with a peer holding the lease: both increment a
-/// counter, and the second starts a resignation rather than reporting `0`. So
-/// this gauge is not a liveness heartbeat. Monitor absence separately from a
-/// reported zero.
+/// Emitted on every acquisition attempt, holder and standby alike: a standby
+/// told that a peer holds emits `0`, and so does a contender whose attempt
+/// errors or times out, beside `acquire_failed{reason}`, because a replica
+/// still campaigning is not the leader whatever the cause. On renewal a holder
+/// emits `1`; a renewal that errors, times out, or is answered with a peer
+/// holding the lease emits no sample but increments a counter, and the last
+/// starts a resignation rather than reporting `0`. So this gauge is not a
+/// liveness heartbeat: a wedged process emits nothing. Monitor absence
+/// separately from a reported zero.
 pub fn is_leader(identity: &str, leader: bool) {
     gauge(
         "cluster_controller.leader_election.is_leader",

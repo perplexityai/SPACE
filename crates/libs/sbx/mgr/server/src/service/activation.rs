@@ -322,18 +322,26 @@ impl SandboxManagerService {
         let service = self.clone();
         let sandbox_id = sandbox_id.to_owned();
         self.task_tracker
-            .spawn(super::drain::with_state_writer(state_writer, async move {
-                service
-                    .ensure_active_with_start(
-                        &sandbox_id,
-                        implicit,
-                        wait_budget,
-                        Some(activity),
-                        WakeStartConfig::default(),
-                        route_auth.as_ref(),
-                    )
-                    .await
-            }))
+            .spawn(super::drain::with_state_writer(
+                state_writer,
+                async move {
+                    service
+                        .ensure_active_with_start(
+                            &sandbox_id,
+                            implicit,
+                            wait_budget,
+                            Some(activity),
+                            WakeStartConfig::default(),
+                            route_auth.as_ref(),
+                        )
+                        .await
+                }
+                // The request normally awaits this wake, so it stays in the
+                // request's trace. A request dropped mid-wake leaves its span
+                // open until the wake ends, so that span then reports the
+                // wake's duration rather than the request's.
+                .in_current_span(),
+            ))
             .await
             .map_err(|error| Status::internal(format!("guest wake task failed: {error}")))?
     }

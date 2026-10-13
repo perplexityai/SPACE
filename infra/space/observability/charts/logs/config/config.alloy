@@ -30,8 +30,10 @@ loki.source.file "pods" {
 }
 loki.process "cri" {
   stage.cri {}
+  // The transport is `log_source`, not `source`: SPACE JSON lines carry their
+  // own `source` field, which a stream label of that name would shadow.
   stage.static_labels {
-    values = {source = "container", node = sys.env("NODE_NAME"), cluster = {{ .Values.clusterLabel | quote }}}
+    values = {log_source = "container", node = sys.env("NODE_NAME"), cluster = {{ .Values.clusterLabel | quote }}}
   }
   // Transport identity is searchable metadata, not an indexed stream label.
   stage.structured_metadata {
@@ -69,7 +71,7 @@ loki.source.journal "host" {
   max_age = {{ .Values.collection.journal.maxAge | quote }}
   format_as_json = false
   relabel_rules = loki.relabel.journal.rules
-  labels = {source = "journal", namespace = "host", node = sys.env("NODE_NAME"), cluster = {{ .Values.clusterLabel | quote }}}
+  labels = {log_source = "journal", namespace = "host", node = sys.env("NODE_NAME"), cluster = {{ .Values.clusterLabel | quote }}}
   forward_to = [loki.process.space.receiver]
 }
 {{- end }}
@@ -92,7 +94,7 @@ loki.process "space" {
   }
   // No pod IDs, sandbox/request IDs, versions, filenames or arbitrary JSON labels.
   stage.label_keep {
-    values = ["service", "environment", "cluster", "namespace", "source", "node"]
+    values = ["service", "environment", "cluster", "namespace", "log_source", "node"]
   }
   forward_to = [loki.write.local.receiver{{ if .Values.validationEcho }}, loki.echo.validation.receiver{{ end }}]
 }

@@ -412,35 +412,25 @@ impl NodeManagerService {
         // mapper), and the `chown -Rh sandbox_uid jail_root` below chowns the
         // bind-mount target (the mapper device) so the unprivileged jailed
         // Firecracker can open it.
-        let rootfs_src = match req
+        //
+        // Both ends are opened first and the mount uses those open files, so
+        // the bind lands on exactly the files opened here even if a path
+        // component changes between the open and the mount.
+        let rootfs_device = req
             .rootfs_block_device_path
-            .as_deref()
-            .filter(|s| !s.is_empty())
-        {
-            Some(dev) => dev.to_string(),
-            None => format!("{CACHE_DIR}/{sandbox_id}/instance/rootfs.ext4"),
-        };
-        let rootfs_dst = format!("{jail_root}/rootfs.ext4");
-        if !std::path::Path::new(&rootfs_dst).exists() {
-            let rootfs_dst_b = rootfs_dst.clone();
-            spawn_lifecycle_blocking(&_lifecycle_permit, move || {
-                std::fs::File::create(&rootfs_dst_b)
-            })
-            .await
-            .map_err(|e| Status::internal(format!("create bind mount target task failed: {e}")))?
-            .map_err(|e| Status::internal(format!("cannot create bind mount target: {e}")))?;
-        }
-        let encrypted = req
-            .rootfs_block_device_path
-            .as_deref()
-            .is_some_and(|p| !p.is_empty());
+            .clone()
+            .filter(|s| !s.is_empty());
+        let instance_dir = format!("{CACHE_DIR}/{sandbox_id}/instance");
+        let jail_dir = jail_root.clone();
         spawn_lifecycle_blocking(&_lifecycle_permit, move || {
-            if encrypted {
-                let source = super::trusted_paths::open_rootfs_device(Path::new(&rootfs_src))?;
-                super::trusted_paths::bind_pinned(&source, Path::new(&rootfs_dst))
-            } else {
-                super::snapshots::bind_mount_file(Path::new(&rootfs_src), Path::new(&rootfs_dst))
-            }
+            let source = match &rootfs_device {
+                Some(device) => super::trusted_paths::open_rootfs_device(Path::new(device))?,
+                None => open_instance_rootfs(Path::new(&instance_dir))?,
+            };
+            let jail = super::trusted_paths::open_directory(Path::new(&jail_dir))?;
+            let target =
+                super::trusted_paths::open_bind_target(&jail, std::ffi::OsStr::new("rootfs.ext4"))?;
+            super::trusted_paths::bind_pinned_files(&source, &target)
         })
         .await
         .map_err(|e| Status::internal(format!("bind rootfs task failed: {e}")))??;
@@ -960,6 +950,13 @@ pub(super) fn validate_materialized_rootfs(rootfs_path: &std::path::Path) -> Res
     validate_rootfs_bytes(metadata.len())
         .map_err(|error| Status::failed_precondition(error.to_string()))?;
     Ok(())
+}
+
+/// Open the plaintext launch source, `<instance_dir>/rootfs.ext4`, without
+/// following links at any component; it must be a single-link regular file.
+fn open_instance_rootfs(instance_dir: &Path) -> Result<std::fs::File, Status> {
+    let instance = super::trusted_paths::open_directory(instance_dir)?;
+    super::trusted_paths::open_regular_file(&instance, std::ffi::OsStr::new("rootfs.ext4"))
 }
 
 fn run_rootfs_resize_command(

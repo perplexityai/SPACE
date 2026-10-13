@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"os"
@@ -24,7 +25,10 @@ import (
 const defaultExportInterval = 10 * time.Second
 
 type otlpMetricsSink struct {
-	provider   *sdkmetric.MeterProvider
+	provider *sdkmetric.MeterProvider
+	// runtime carries the cumulative Go runtime metrics; see
+	// newOTLPMetricsSink.
+	runtime    *sdkmetric.MeterProvider
 	meter      metric.Meter
 	attributes []attribute.KeyValue
 	mu         sync.Mutex
@@ -32,20 +36,39 @@ type otlpMetricsSink struct {
 	histograms map[string]metric.Float64Histogram
 }
 
-// shimMeterScope names the shim's own instrumentation scope. Runtime
-// instrumentation shares the provider under its own scope, so consumers must
-// select by scope rather than assume the export carries only one.
+// shimMeterScope names the shim's own instrumentation scope. The Go runtime
+// instrumentation reports under its own scope, on its own provider.
 const shimMeterScope = "pplx-space-shim"
 
 func metricsEndpoint() (string, error) {
 	return otlpEndpoint("metric", "METRICS", "")
 }
 
+// metricResourceAttributes is the identity of every metric a shim exports:
+// one per process, `<node>:<pid>`. The Collector's delta-to-cumulative
+// conversion needs one writer per stream; it drops a point older than the
+// stream's last as out of order, so concurrent shims sharing a node identity
+// would undercount silently. Queries aggregate across a node's shims instead
+// (`sum without (service_instance_id)`). A true per-node stream needs a single
+// long-lived writer on the node, which the shim is not.
 func metricResourceAttributes() []attribute.KeyValue {
-	// Match Rust: PID keeps same-host shim processes in distinct delta streams.
-	instanceHost := otlpSetting("HOSTNAME", "SPACE_NODE_ID", "unknown-host")
-	attrs := []attribute.KeyValue{attribute.String("service.instance.id", fmt.Sprintf("%s:%d", instanceHost, os.Getpid()))}
-	if node := otlpSetting("SPACE_K8S_NODE_NAME", "KUBE_NODE_NAME", ""); node != "" {
+	instance, attrs := shimHostIdentity()
+	return append([]attribute.KeyValue{
+		attribute.String("service.instance.id", fmt.Sprintf("%s:%d", instance, os.Getpid())),
+	}, attrs...)
+}
+
+// shimHostIdentity names where the shim runs: the node, else the host, and the
+// host and Kubernetes attributes that go with it. Neither HOSTNAME nor
+// SPACE_NODE_ID reaches a shim under containerd, so the node name comes first.
+func shimHostIdentity() (string, []attribute.KeyValue) {
+	node := otlpSetting("SPACE_K8S_NODE_NAME", "KUBE_NODE_NAME", "")
+	instance := node
+	if instance == "" {
+		instance = otlpSetting("HOSTNAME", "SPACE_NODE_ID", "unknown-host")
+	}
+	var attrs []attribute.KeyValue
+	if node != "" {
 		attrs = append(attrs, attribute.String("host.name", node), attribute.String("k8s.node.name", node))
 	} else if _, inKubernetes := os.LookupEnv("KUBERNETES_SERVICE_HOST"); !inKubernetes {
 		// Kubernetes HOSTNAME identifies a pod, not its underlying host.
@@ -56,7 +79,7 @@ func metricResourceAttributes() []attribute.KeyValue {
 	if pod := strings.TrimSpace(os.Getenv("SPACE_K8S_POD_NAME")); pod != "" {
 		attrs = append(attrs, attribute.String("k8s.pod.name", pod))
 	}
-	return attrs
+	return instance, attrs
 }
 
 func newOTLPMetricsSink() (metricsSink, error) {
@@ -73,13 +96,15 @@ func newOTLPMetricsSink() (metricsSink, error) {
 		return nil, fmt.Errorf("OTel metrics resource: %w", err)
 	}
 	initOTelErrorHandler()
-	// Match the Rust sink's wire profile and collection bounds so one Collector
-	// pipeline can convert both producers the same way. Converting these delta
-	// exponential histograms to cumulative native histograms is a Collector
-	// responsibility, not something this exporter does.
-	exporter, err := otlpmetricgrpc.New(context.Background(),
-		otlpmetricgrpc.WithEndpointURL(endpoint), otlpmetricgrpc.WithInsecure(),
-		otlpmetricgrpc.WithTimeout(3*time.Second),
+	// Two providers on one resource, because the two families need different
+	// temporalities. The shim's own counters and histograms are delta, the
+	// profile the Rust sink exports. The Go runtime metrics are cumulative:
+	// their state is the process's own, so it never needs the Collector's
+	// delta-to-cumulative conversion or a slot among its streams. A reader
+	// serves every instrument of its provider, so each temporality has its own
+	// provider, reader and exporter. Both export to the same endpoint at the
+	// same cadence, and shutdown flushes both.
+	exporter, err := newOTLPMetricsExporter(endpoint,
 		otlpmetricgrpc.WithTemporalitySelector(func(sdkmetric.InstrumentKind) metricdata.Temporality {
 			return metricdata.DeltaTemporality
 		}),
@@ -91,27 +116,53 @@ func newOTLPMetricsSink() (metricsSink, error) {
 		}),
 	)
 	if err != nil {
-		return nil, fmt.Errorf("OTLP metrics exporter: %w", err)
+		return nil, err
 	}
-	// otelruntime.Start registers the memory, goroutine and GC instruments, but
-	// the scheduler histogram only comes from its Producer. Both ride this one
-	// reader, so runtime metrics reuse the sink's resource, exporter and
-	// configured cadence instead of standing up a second pipeline.
+	runtimeExporter, err := newOTLPMetricsExporter(endpoint,
+		otlpmetricgrpc.WithTemporalitySelector(sdkmetric.DefaultTemporalitySelector),
+		otlpmetricgrpc.WithAggregationSelector(sdkmetric.DefaultAggregationSelector),
+	)
+	if err != nil {
+		return nil, err
+	}
 	reader := sdkmetric.NewPeriodicReader(exporter,
+		sdkmetric.WithInterval(interval), sdkmetric.WithTimeout(3*time.Second),
+	)
+	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader), sdkmetric.WithResource(res), sdkmetric.WithCardinalityLimit(2000))
+	// otelruntime.Start registers the memory, goroutine and GC instruments, but
+	// the scheduler histogram only comes from its Producer. Both ride the
+	// runtime reader, so they share its exporter and cadence.
+	runtimeReader := sdkmetric.NewPeriodicReader(runtimeExporter,
 		sdkmetric.WithInterval(interval), sdkmetric.WithTimeout(3*time.Second),
 		sdkmetric.WithProducer(otelruntime.NewProducer()),
 	)
-	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader), sdkmetric.WithResource(res), sdkmetric.WithCardinalityLimit(2000))
+	runtimeProvider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(runtimeReader), sdkmetric.WithResource(res))
 	// Runtime visibility is supplementary to space.shim.*: report a failure
 	// through the OTel error handler and keep the custom metrics flowing.
-	if err := otelruntime.Start(otelruntime.WithMeterProvider(provider)); err != nil {
+	if err := otelruntime.Start(otelruntime.WithMeterProvider(runtimeProvider)); err != nil {
 		otel.Handle(fmt.Errorf("Go runtime metrics instrumentation: %w", err))
 	}
 	return &otlpMetricsSink{
-		provider: provider, meter: provider.Meter(shimMeterScope),
+		provider: provider, runtime: runtimeProvider, meter: provider.Meter(shimMeterScope),
 		attributes: constantPointAttributes(telemetryTags()),
 		counters:   make(map[string]metric.Int64Counter), histograms: make(map[string]metric.Float64Histogram),
 	}, nil
+}
+
+// newOTLPMetricsExporter builds a plaintext OTLP/gRPC metrics exporter with the
+// given temporality and aggregation profile. Converting delta exponential
+// histograms to cumulative native histograms is a Collector responsibility,
+// not something this exporter does.
+func newOTLPMetricsExporter(endpoint string, profile ...otlpmetricgrpc.Option) (*otlpmetricgrpc.Exporter, error) {
+	options := append([]otlpmetricgrpc.Option{
+		otlpmetricgrpc.WithEndpointURL(endpoint), otlpmetricgrpc.WithInsecure(),
+		otlpmetricgrpc.WithTimeout(3 * time.Second),
+	}, profile...)
+	exporter, err := otlpmetricgrpc.New(context.Background(), options...)
+	if err != nil {
+		return nil, fmt.Errorf("OTLP metrics exporter: %w", err)
+	}
+	return exporter, nil
 }
 
 // Read the metric export interval in milliseconds, defaulting to
@@ -131,14 +182,16 @@ func metricExportInterval() (time.Duration, error) {
 	return time.Duration(millis) * time.Millisecond, nil
 }
 
-// The OTel resource owns env and version. Point-level copies make receivers
-// such as the Datadog Agent surface duplicate identity tags with ambiguous
-// precedence, so the Rust sink drops them from metric points as well; the
-// DogStatsD sink keeps them because it has no resource to carry them.
+// The OTel resource owns service, env and version: service.name,
+// deployment.environment.name and service.version. Point-level copies make
+// receivers such as the Datadog Agent surface duplicate identity tags with
+// ambiguous precedence, and a Prometheus-style backend a `service` label beside
+// `service_name`. The DogStatsD sink keeps them because it has no resource to
+// carry them.
 func constantPointAttributes(tags []string) []attribute.KeyValue {
 	kept := make([]string, 0, len(tags))
 	for _, tag := range tags {
-		if key, _, _ := strings.Cut(tag, ":"); key == "env" || key == "version" {
+		if key, _, _ := strings.Cut(tag, ":"); key == "service" || key == "env" || key == "version" {
 			continue
 		}
 		kept = append(kept, tag)
@@ -191,7 +244,7 @@ func (s *otlpMetricsSink) distribution(name string, value float64, tags []string
 	histogram, ok := s.histograms[name]
 	if !ok {
 		var err error
-		histogram, err = s.meter.Float64Histogram(name, metric.WithUnit("ms"))
+		histogram, err = s.meter.Float64Histogram(otlpHistogramName(name), metric.WithUnit("ms"))
 		if err != nil {
 			s.mu.Unlock()
 			return err
@@ -203,7 +256,24 @@ func (s *otlpMetricsSink) distribution(name string, value float64, tags []string
 	return nil
 }
 
+// otlpHistogramName drops the `_ms` that DogStatsD names carry for want of a
+// unit field. OTLP declares the unit instead, and a Prometheus-style backend
+// appends its full word, so `space.shim.operation.latency_ms` would arrive as
+// `..._latency_ms_milliseconds`. The Rust sink applies the same rule. The
+// DogStatsD names are unchanged.
+func otlpHistogramName(name string) string {
+	if stripped := strings.TrimSuffix(name, "_ms"); stripped != "" && !strings.HasSuffix(stripped, ".") {
+		return stripped
+	}
+	return name
+}
+
 func (s *otlpMetricsSink) shutdown(ctx context.Context) error {
 	// PeriodicReader.Shutdown exports pending measurements before closing gRPC.
-	return s.provider.Shutdown(ctx)
+	// The providers flush concurrently under the caller's one deadline, so a
+	// slow runtime export cannot consume the custom metrics' window.
+	runtimeDone := make(chan error, 1)
+	go func() { runtimeDone <- s.runtime.Shutdown(ctx) }()
+	err := s.provider.Shutdown(ctx)
+	return errors.Join(err, <-runtimeDone)
 }

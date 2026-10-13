@@ -1,0 +1,60 @@
+# build-manager on every SPACE Kind builder node: runs ECW template recipes in
+# build VMs and publishes the results. Builder role only: one release,
+# `space-builder` (`--set node.role=builder`).
+
+image:
+  repository: space-worker
+  tag: local
+  pullPolicy: IfNotPresent
+
+datadogEnvironment: kind-local
+clusterId: kind-local
+telemetry: {}
+node:
+  role: builder
+
+# Listener on the pod's own address, which node-api dials through the
+# node-local Service (SPACE_BUILD_MANAGER_ENDPOINT); every call is TLS with a
+# bearer token (crates/libs/build/mgr/server/src/run.rs). The probes reach
+# it on loopback inside the pod.
+listen: 0.0.0.0:9900
+probeAddr: 127.0.0.1:9900
+# The node-local Service, named as build-manager's TLS leaf.
+serviceName: space-builder-build-manager
+# Kind sizing: one build at a time fits the 40 GiB local btrfs cache with the
+# 20 GiB default build disk.
+maxConcurrentBuilds: 1
+# On SIGTERM build-manager stops claiming work and waits up to this long for
+# running builds before it exits (--drain-timeout-seconds, the binary's
+# default; crates/libs/build/mgr/server/src/run.rs).
+drainTimeoutSeconds: 7200
+# The grace must outlast that drain, or the kubelet kills a build the drain
+# was still waiting for.
+terminationGracePeriodSeconds: 7500
+
+# Overrides SPACE_TRACE_EXPORTER for build-manager. Kept off on the local
+# bench: recipe descriptions omit user inputs, but other build failures can
+# still contain guest output. Empty leaves the normal resolution in place.
+traceExporter: "off"
+
+blob:
+  minAvailableBytes: "1073741824"
+
+# Publication target: the Kind object store's templates bucket, with smaller
+# multipart parts for the local store.
+objectStore:
+  bucket: templates
+  multipartConcurrency: 2
+  multipartPartSizeBytes: 67108864
+
+# Per-devbox sandbox SSH keypair Secret, created by bootstrap from
+# ~/.space-devbox/kind/ssh (the local stand-in for the node image's
+# Packer-generated key). build-manager SSHes into each build VM as root.
+sandboxSsh:
+  secretName: space-sandbox-ssh
+
+# Kind sizing: requests only (see space-node-manager-local/values.yaml).
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi

@@ -27,6 +27,8 @@ const OTLP_HEADERS_ENV: &str = "OTEL_EXPORTER_OTLP_HEADERS";
 const OTLP_METRICS_HEADERS_ENV: &str = "OTEL_EXPORTER_OTLP_METRICS_HEADERS";
 /// OpenTelemetry's standard metric export interval, in milliseconds.
 const METRIC_EXPORT_INTERVAL_ENV: &str = "OTEL_METRIC_EXPORT_INTERVAL";
+/// OpenTelemetry's standard temporality selector for OTLP metric exporters.
+const METRICS_TEMPORALITY_ENV: &str = "OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE";
 
 pub(super) const EXPORT_INTERVAL: Duration = Duration::from_secs(10);
 pub(super) const EXPORT_TIMEOUT: Duration = Duration::from_secs(3);
@@ -63,6 +65,10 @@ pub(super) enum OtlpMetricsInitError {
         "OTEL_METRIC_EXPORT_INTERVAL must be a positive whole number of milliseconds, got {raw:?}"
     )]
     InvalidExportInterval { raw: String },
+    #[error(
+        "OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE must be cumulative, delta, or lowmemory, got {raw:?}"
+    )]
+    InvalidTemporality { raw: String },
     #[error("invalid fixed OTLP metrics stream configuration: {0}")]
     Stream(String),
     #[error("failed to build OTLP metrics exporter: {0}")]
@@ -162,6 +168,7 @@ where
 pub(super) struct OtlpEnvConfig {
     endpoint: String,
     export_interval: Duration,
+    temporality: Temporality,
 }
 
 impl OtlpEnvConfig {
@@ -170,9 +177,11 @@ impl OtlpEnvConfig {
         validate_grpc_protocol()?;
         validate_plaintext_headers()?;
         let export_interval = configured_export_interval()?;
+        let temporality = configured_temporality()?;
         Ok(Self {
             endpoint,
             export_interval,
+            temporality,
         })
     }
 }
@@ -188,6 +197,7 @@ impl OtlpSink {
             identity: identity.clone(),
             constant_tags,
             export_interval: env.export_interval,
+            temporality: env.temporality,
             export_timeout: EXPORT_TIMEOUT,
             attribute_cardinality_limit: ATTRIBUTE_CARDINALITY_LIMIT,
             instrument_name_limit: INSTRUMENT_NAME_LIMIT,
@@ -204,7 +214,7 @@ impl OtlpSink {
             .with_protocol(Protocol::Grpc)
             .with_endpoint(config.endpoint)
             .with_timeout(config.export_timeout)
-            .with_temporality(Temporality::Delta)
+            .with_temporality(config.temporality)
             .build()?;
         let reader = PeriodicReader::builder(DiagnosingExporter::new(exporter))
             .with_interval(config.export_interval)
@@ -243,7 +253,7 @@ impl OtlpSink {
 
         tracing::info!(
             protocol = "grpc",
-            temporality = "delta",
+            temporality = temporality_name(config.temporality),
             export_interval_ms = config.export_interval.as_millis(),
             export_timeout_ms = config.export_timeout.as_millis(),
             histogram = "base2_exponential",
@@ -405,6 +415,7 @@ struct OtlpMetricsConfig {
     identity: Identity,
     constant_tags: Vec<String>,
     export_interval: Duration,
+    temporality: Temporality,
     export_timeout: Duration,
     attribute_cardinality_limit: usize,
     instrument_name_limit: usize,
@@ -457,6 +468,42 @@ fn export_interval_from_value(raw: Option<String>) -> Result<Duration, OtlpMetri
         .filter(|millis| *millis > 0)
         .ok_or(OtlpMetricsInitError::InvalidExportInterval { raw })?;
     Ok(Duration::from_millis(millis))
+}
+
+fn configured_temporality() -> Result<Temporality, OtlpMetricsInitError> {
+    temporality_from_value(optional_env(METRICS_TEMPORALITY_ENV)?)
+}
+
+/// Read OpenTelemetry's standard temporality preference, defaulting to delta.
+///
+/// The SDK's own default is cumulative, but delta is what Datadog's OTLP
+/// intake accepts, and Datadog drops the first point of every cumulative
+/// series, so production keeps delta unless a deployment opts out. A
+/// Prometheus-style pipeline can select `cumulative`: its Collector then has
+/// no delta-to-cumulative state to lose, so a counter that stays idle past the
+/// Collector's stale window keeps its running total instead of restarting from
+/// its latest increment. The values and their per-instrument meaning are the
+/// OpenTelemetry specification's. Blank keeps the default, and anything else
+/// is rejected for the same reason an unusable export interval is.
+fn temporality_from_value(raw: Option<String>) -> Result<Temporality, OtlpMetricsInitError> {
+    let Some(raw) = raw.filter(|value| !value.trim().is_empty()) else {
+        return Ok(Temporality::Delta);
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "cumulative" => Ok(Temporality::Cumulative),
+        "delta" => Ok(Temporality::Delta),
+        "lowmemory" => Ok(Temporality::LowMemory),
+        _ => Err(OtlpMetricsInitError::InvalidTemporality { raw }),
+    }
+}
+
+fn temporality_name(temporality: Temporality) -> &'static str {
+    match temporality {
+        Temporality::Cumulative => "cumulative",
+        Temporality::Delta => "delta",
+        Temporality::LowMemory => "lowmemory",
+        _ => "unknown",
+    }
 }
 
 fn validate_plaintext_headers() -> Result<(), OtlpMetricsInitError> {
@@ -539,10 +586,13 @@ fn tag_attribute(tag: &str) -> KeyValue {
 
 fn metric_point_attribute(tag: &str) -> Option<KeyValue> {
     let key = tag.split_once(':').map_or(tag, |(key, _)| key);
-    // The canonical OTel resource owns these two universal identity fields.
-    // Keeping point-level copies makes receivers such as the Datadog Agent
-    // surface duplicate `env` and `version` tags with ambiguous precedence.
-    if matches!(key, "env" | "version") {
+    // The canonical OTel resource owns these universal identity fields, the
+    // service as `service.name`. Keeping point-level copies makes receivers
+    // such as the Datadog Agent surface duplicate `env`, `service` and
+    // `version` tags with ambiguous precedence, and gives Prometheus a
+    // `service` label beside `service_name` that says the same thing. A
+    // metric's own `service` tag is a different field, `service.role`.
+    if matches!(key, "env" | "service" | "version") {
         return None;
     }
     Some(tag_attribute(tag))

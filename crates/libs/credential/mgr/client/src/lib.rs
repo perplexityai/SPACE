@@ -106,6 +106,19 @@ pub enum ConnectError {
     Transport(#[from] tonic::transport::Error),
     #[error("credential-manager connect failed: {0}")]
     Connect(#[from] pplx_space_common_grpc::UdsConnectError),
+    #[error("credential-manager connect failed: {0}")]
+    TcpConnect(#[source] pplx_space_common_grpc::TcpConnectError),
+}
+
+impl From<pplx_space_common_grpc::TcpConnectError> for ConnectError {
+    /// A TCP connect's transport failure stays [`ConnectError::Transport`]; only an
+    /// abandoned attempt is [`ConnectError::TcpConnect`].
+    fn from(error: pplx_space_common_grpc::TcpConnectError) -> Self {
+        match error {
+            pplx_space_common_grpc::TcpConnectError::Transport(error) => Self::Transport(error),
+            error => Self::TcpConnect(error),
+        }
+    }
 }
 
 /// Connect to credmgr at the endpoint configured by the

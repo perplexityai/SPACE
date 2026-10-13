@@ -143,6 +143,7 @@ fn checkpoint_context(state: SandboxState) -> (CheckpointContext, String) {
             db: Arc::new(std::sync::Mutex::new(conn)),
             auto_lifecycle: crate::auto_lifecycle::AutoLifecycleCoordinator::default(),
             health_lifecycle: crate::watchdog::HealthLifecycleEpochs::default(),
+            node_manager: crate::node_manager_transport::fake::unbound_in_absent_dir(),
         },
         sandbox_id,
     )

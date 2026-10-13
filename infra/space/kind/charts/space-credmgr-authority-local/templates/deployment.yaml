@@ -1,0 +1,277 @@
+{{- $name := .Values.service.name -}}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: {{ $name }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+---
+# The authority authenticates each caller's projected token by TokenReview
+# (crates/libs/credential/mgr/server/src/k8s_identity.rs), so its own
+# ServiceAccount may create TokenReviews, and its pod mounts the API token.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ $name }}-token-review
+  labels:
+    app.kubernetes.io/name: {{ $name }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+rules:
+  - apiGroups: ["authentication.k8s.io"]
+    resources: ["tokenreviews"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ $name }}-token-review
+  labels:
+    app.kubernetes.io/name: {{ $name }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ $name }}-token-review
+subjects:
+  - kind: ServiceAccount
+    name: {{ $name }}
+    namespace: {{ .Release.Namespace }}
+---
+# Every request must also come from the token's pod as it is now: the pod,
+# looked up in the authority's own namespace, must still have the token's UID,
+# be Running and list the connection's source address among its pod IPs. The
+# authority reads callers from a pod reflector over that namespace, which
+# lists and watches, and refuses every caller as unavailable until it has
+# synced (CredmgrTokenReviewer::new and resolve_token_identity,
+# crates/libs/credential/mgr/server/src/k8s_identity.rs).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $name }}-caller-pods
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: {{ $name }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $name }}-caller-pods
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: {{ $name }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ $name }}-caller-pods
+subjects:
+  - kind: ServiceAccount
+    name: {{ $name }}
+    namespace: {{ .Release.Namespace }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: {{ $name }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    team: {{ .Values.datadogTeam | quote }}
+spec:
+  replicas: {{ .Values.replicas }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ $name }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  # Replicas share every key through the broker and coordinate through the
+  # database alone (values.yaml), so a rollout replaces one at a time while
+  # the other keeps serving.
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      annotations:
+        ad.datadoghq.com/tags: '{"team":"{{ .Values.datadogTeam }}"}'
+      labels:
+        app.kubernetes.io/name: {{ $name }}
+        app.kubernetes.io/instance: {{ .Release.Name }}
+        team: {{ .Values.datadogTeam | quote }}
+    spec:
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ $name }}
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds | int }}
+      # space-sbxmgr's UID and GID, the account credential-manager runs as on
+      # a node (infra/space/identity/node-identities.sh). The TCP-only
+      # authority owns no socket, so it needs no supplementary group, host
+      # access, capability or writable root filesystem.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: {{ include "space-node-service.identityNumber" (dict "ctx" . "name" "SPACE_SBXMGR_UID") }}
+        runAsGroup: {{ include "space-node-service.identityNumber" (dict "ctx" . "name" "SPACE_SBXMGR_GID") }}
+        # That group owns the mounted TLS key, readable by it only.
+        fsGroup: {{ include "space-node-service.identityNumber" (dict "ctx" . "name" "SPACE_SBXMGR_GID") }}
+      containers:
+        - name: credmgr-authority
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          # The authority role over TCP only (`--no-uds` skips the node-local
+          # sockets and service mutex, crates/libs/credential/mgr/server/src/run.rs),
+          # serving TLS with its self-signed end-entity certificate, mounted
+          # where the EKS module mounts it (credmgr_authority_tls.tf;
+          # internal-rpc-tls.sh issues it). TLS is server-side only.
+          command:
+            - /opt/space/bin/space-credmgr-svc
+            - --role=authority
+            - --no-uds
+            - --tcp-listen=0.0.0.0:{{ .Values.service.port }}
+            - --tls-cert=/etc/space-credmgr-tls/tls.crt
+            - --tls-key=/etc/space-credmgr-tls/tls.key
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          env:
+            - name: SPACE_CLUSTER_ID
+              value: {{ .Values.clusterId | quote }}
+            {{- include "space-kind-telemetry.env" . | nindent 12 }}
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.postgres.secretName }}
+                  key: {{ .Values.postgres.secretKey }}
+            - name: SPACE_DB_CREDS_PASSWORD
+              value: {{ .Values.postgres.managedCredentialsPassword | quote }}
+            # The platform KEK comes from the intermediate-key broker, the
+            # production provider path (crates/libs/credential/mgr/server/src/run.rs):
+            # the authority mints each org's intermediate key there on its
+            # first Encrypt or volume DEK, stores the opaque wrapped key in
+            # Postgres, and unwraps it through the broker, so keys survive
+            # restarts and every replica serves every org. Kind's broker is
+            # the in-repo fixture (space-kind-key-broker), reached over
+            # plaintext, which the code allows for local development only:
+            # the fixture has no TLS listener. Credential exchange stays
+            # disabled because no vending role (SPACE_CREDMGR_S3_VEND_ROLE_ARN)
+            # is configured.
+            - name: SPACE_PLATFORM_KEK_PROVIDER
+              value: intermediate-key-broker
+            - name: SPACE_CREDMGR_INTERMEDIATE_KEY_BROKER_URL
+              value: {{ .Values.keyBroker.url | quote }}
+            - name: SPACE_CREDMGR_INTERMEDIATE_KEY_BROKER_TOKEN_FILE
+              value: /var/run/space-key-broker/token
+            # The durable tenant binding sent with every key request, and the
+            # scheme of the authorization evidence a federated org's request
+            # would carry; Kind's orgs are local and send none
+            # (intermediate_key_identity.rs). Kind values, see values.yaml.
+            - name: SPACE_CREDMGR_INTERMEDIATE_KEY_BROKER_TENANT_NAMESPACE
+              value: {{ .Values.keyBroker.tenantNamespace | quote }}
+            - name: SPACE_CREDMGR_INTERMEDIATE_KEY_BROKER_GRANT_SCHEME
+              value: {{ .Values.keyBroker.grantScheme | quote }}
+            # Callers present projected tokens with the authority's default
+            # audience (space-credential-manager) and are mapped to their
+            # client service by ServiceAccount; the reviewed token must name
+            # its pod and node (k8s_identity.rs). The pod must be current (the
+            # Role above), and the node must be registered under that name
+            # and UID in node_k8s, read through the DATABASE_URL pool above
+            # (registered_node,
+            # crates/libs/common/svc/src/sql/node_registration.rs); without
+            # DATABASE_URL the listener refuses to start (run.rs). With
+            # TokenReview on, the listener never accepts SPACE_INTERNAL_TOKEN
+            # (run.rs).
+            - name: SPACE_CREDMGR_K8S_AUTH_ENABLED
+              value: "true"
+            - name: SPACE_CREDMGR_K8S_AUTH_NAMESPACE
+              value: {{ .Release.Namespace | quote }}
+            - name: SPACE_CREDMGR_AUTH_ALLOWED_SERVICE_ACCOUNTS
+              value: {{ join "," .Values.allowedServiceAccounts | quote }}
+            - name: AWS_REGION
+              value: {{ .Values.awsRegion | quote }}
+            {{- range list "AWS_ACCESS_KEY_ID" "AWS_SECRET_ACCESS_KEY" "AWS_SESSION_TOKEN" }}
+            - name: {{ . }}
+              valueFrom:
+                secretKeyRef:
+                  name: space-aws-creds
+                  key: {{ . }}
+                  optional: true
+            {{- end }}
+            # The reader role every AWS Secrets Manager read assumes, with a
+            # session scoped to the sandbox owner's organization; without it the
+            # Secrets Manager provider is not installed
+            # (crates/libs/credential/mgr/server/src/aws_secrets_manager.rs).
+            # Resolution runs here, where the database pool is, never on a node
+            # agent (run.rs). Optional, from the same Secret as the credentials.
+            - name: SPACE_CREDMGR_SECRETS_MANAGER_ROLE_ARN
+              valueFrom:
+                secretKeyRef:
+                  name: space-aws-creds
+                  key: SPACE_CREDMGR_SECRETS_MANAGER_ROLE_ARN
+                  optional: true
+          ports:
+            - name: grpc
+              containerPort: {{ .Values.service.port }}
+          # The gRPC health service is exempt from caller authentication
+          # (crates/libs/credential/mgr/server/src/tcp_auth.rs).
+          readinessProbe:
+            exec:
+              command: ["/opt/space/bin/grpc_health_probe", "-addr=127.0.0.1:{{ .Values.service.port }}", "-tls", "-tls-ca-cert=/etc/space-credmgr-tls/tls.crt", "-tls-server-name=space-credmgr-authority", "-connect-timeout=2s", "-rpc-timeout=2s"]
+            periodSeconds: 5
+          livenessProbe:
+            exec:
+              command: ["/opt/space/bin/grpc_health_probe", "-addr=127.0.0.1:{{ .Values.service.port }}", "-tls", "-tls-ca-cert=/etc/space-credmgr-tls/tls.crt", "-tls-server-name=space-credmgr-authority", "-connect-timeout=3s", "-rpc-timeout=3s"]
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: tls
+              mountPath: /etc/space-credmgr-tls
+              readOnly: true
+            - name: key-broker-token
+              mountPath: /var/run/space-key-broker
+              readOnly: true
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        - name: tls
+          secret:
+            secretName: space-credmgr-authority-tls
+            defaultMode: 0440
+        - name: key-broker-token
+          secret:
+            secretName: {{ .Values.keyBroker.tokenSecretName }}
+            defaultMode: 0440
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: {{ $name }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+spec:
+  selector:
+    app.kubernetes.io/name: {{ $name }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+  ports:
+    - name: grpc
+      port: {{ .Values.service.port }}
+      targetPort: grpc

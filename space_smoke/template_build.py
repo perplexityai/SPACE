@@ -13,13 +13,14 @@ The scenario verifies three cross-service contracts:
    accepted the job — `find_builder_node(job_id)` then
    `builder_client_for_node`, which resolves the accepting builder's own
    node-api directly (`controllers/template.rs`,
-   `substrate/kubernetes/adapter.rs`). The scenario submits with the Service
-   pinned to one builder, then, once a builder has accepted the alias and
-   committed the prepared rootfs, moves the Service to the *other* builder for
-   the rest of the build. A build that still completes shows the polls did not
-   depend on where the Service pointed, which is the owner-pinned routing
-   working; `service_routed_to` records where the Service pointed, not who
-   answered the polls (that is not observable from outside the API).
+   `substrate/kubernetes/adapter/substrate_adapter.rs`). The scenario submits
+   with the Service pinned to one builder, then, once a builder has accepted
+   the alias and committed the prepared rootfs, moves the Service to the
+   *other* builder for the rest of the build. A build that still completes
+   shows the polls did not depend on where the Service pointed, which is the
+   owner-pinned routing working; `service_routed_to` records where the Service
+   pointed, not who answered the polls (that is not observable from outside
+   the API).
 2. **Published artefacts.** On the accepting builder, the published template's
    `metadata.json` names the `spaced` bundle version actually installed in the
    rootfs (`/etc/spaced/bundle-version`, read with `debugfs`) and the
@@ -255,20 +256,20 @@ class TemplateBuildAssertions:
     def pin_builders(self) -> tuple[str, str]:
         """Two Ready builders; the Service is routed to the first (the route clear is armed first)."""
 
-        pods = self._control.builder_node_stack_pods()
+        builders = self._control.builder_nodes()
         self._fixture.verify(
-            len(pods) == 2,
-            "the handoff proof needs exactly two Ready builder node stacks",
-            builder_pods=pods,
+            len(builders) == 2,
+            "the handoff proof needs exactly two builders with a Ready node-api",
+            builder_nodes=builders,
         )
-        self._submit, self._peer = pods[0], pods[1]
+        self._submit, self._peer = builders[0], builders[1]
         self._route_clear = self._scope.defer(
             "clear the builder Service route", self._control.clear_builder_service_route, critical=True
         )
         self._control.clear_builder_service_route()
         self._control.route_builder_service("submit", self._submit)
         self._fixture.record("pinned_submit_builder", self._submit)
-        self._fixture.record("builder_pods", list(pods))
+        self._fixture.record("builder_nodes", list(builders))
         return self._submit, self._peer
 
     # --- the build ------------------------------------------------------------
@@ -334,7 +335,7 @@ class TemplateBuildAssertions:
                 time.monotonic() < deadline,
                 "no builder accepted the build within the budget",
                 pinned_submit_builder=submit,
-                builder_pods=[submit, peer],
+                builder_nodes=[submit, peer],
                 alias=self.alias,
             )
             self._fixture.wait(0.5)

@@ -30,11 +30,17 @@
 #                         (default: $HOME/.kind-data)
 #   SPACE_KIND_CONFIG     where the rendered cluster config is written
 #                         (default: $HOME/.space-devbox/kind/kind-cluster.yaml)
+#   SPACE_KIND_NODE_IMAGE / SPACE_KIND_BASE_NODE_IMAGE
+#                         node images the config names (default: what
+#                         ../kind-node-image.sh prints for `ref` / `base`)
 
 # The binary a sandbox worker executes through /space/vendor. The staging
-# check in bootstrap.sh and the node probe in stage-fc-vendor.sh gate on this
-# same path; this is the one definition.
+# check in bootstrap.sh gates on this same path; this is the one definition.
 KIND_HOST_PATHS_VENDOR_PROBE="firecracker/default/bin/firecracker"
+
+# The node image script, found from this file so every caller resolves the same
+# references (the render also runs from tests with a scrubbed environment).
+KIND_HOST_PATHS_NODE_IMAGE_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/kind-node-image.sh"
 
 # Two spaces, and every comparison in this library belongs to exactly one.
 # Mixing them is what each spelling-related defect here has been, so they are
@@ -321,16 +327,25 @@ kind_render_cluster_config() {
   unknown="$(sed 's/[[:space:]]*#.*$//' "$template" \
     | grep -oE '\$\{[A-Za-z_][A-Za-z0-9_]*\}' \
     | sort -u \
-    | grep -vxE '\$\{SPACE_KIND_DATA_ROOT\}|\$\{SPACE_VENDOR_ROOT\}' || true)"
+    | grep -vxE '\$\{SPACE_KIND_DATA_ROOT\}|\$\{SPACE_VENDOR_ROOT\}|\$\{SPACE_KIND_NODE_IMAGE\}|\$\{SPACE_KIND_BASE_NODE_IMAGE\}' || true)"
   if [[ -n "$unknown" ]]; then
     kind_host_paths__die "unknown placeholder(s) in $template: $(printf '%s' "$unknown" | tr '\n' ' ')— add them to kind_render_cluster_config"
   fi
 
   # A state dir can be root-owned, and a bare redirection failure
   # here would report a path with no way to act on it.
-  local data_root vendor_root
+  local data_root vendor_root node_image base_image name value
   data_root="$(kind_host_paths__sed_escape "$SPACE_KIND_DATA_ROOT")"
   vendor_root="$(kind_host_paths__sed_escape "$SPACE_VENDOR_ROOT")"
+  # Image references, not paths: resolved here rather than at source time so
+  # sourcing stays free of a subprocess, and validated as one YAML scalar.
+  node_image="${SPACE_KIND_NODE_IMAGE:-$(bash "$KIND_HOST_PATHS_NODE_IMAGE_SCRIPT" ref)}"
+  base_image="${SPACE_KIND_BASE_NODE_IMAGE:-$(bash "$KIND_HOST_PATHS_NODE_IMAGE_SCRIPT" base)}"
+  for name in node_image base_image; do
+    value="${!name}"
+    [[ "$value" =~ ^[A-Za-z0-9][A-Za-z0-9._/:@-]*$ ]] \
+      || kind_host_paths__die "$name is not an image reference: '$value'"
+  done
   # PID-suffixed: $SPACE_KIND_CONFIG defaults to a per-user path, not a
   # per-worktree one, so two bring-ups in sibling worktrees would otherwise
   # write the same temp file. The `mv` below is atomic, so the loser of that
@@ -339,6 +354,8 @@ kind_render_cluster_config() {
   sed \
     -e "s|\${SPACE_KIND_DATA_ROOT}|$data_root|g" \
     -e "s|\${SPACE_VENDOR_ROOT}|$vendor_root|g" \
+    -e "s|\${SPACE_KIND_NODE_IMAGE}|$node_image|g" \
+    -e "s|\${SPACE_KIND_BASE_NODE_IMAGE}|$base_image|g" \
     "$template" >"$partial" \
     || kind_host_paths__die "cannot write $partial; if $(dirname "$dest") is root-owned, chown it to $(id -un)"
   mv "$partial" "$dest"
@@ -421,7 +438,7 @@ kind_assert_live_cluster_mounts() {
   # makes a wholly missing mount visible, and it covers every destination the
   # config declares, so adding a mount to the template extends this
   # automatically. Hardcoding the pair silently exempted /dev/kvm: a cluster
-  # built without it passed, bootstrap skipped creation, and the node-stack
+  # built without it passed, bootstrap skipped creation, and the node-manager
   # pods could not start because the chart requires that path as a CharDevice.
   #
   # What a count does not catch: the right number of mounts distributed over
@@ -430,7 +447,7 @@ kind_assert_live_cluster_mounts() {
   # key off `worker3` for infra; a per-node comparison is therefore possible
   # and would be stricter. It isn't done here, so a pre-existing cluster whose
   # node order differs from the template's passes this check and fails later
-  # at the node-stack rollout instead.
+  # at the node-service rollout instead.
   local dest_expected dest_live
   while read -r dest; do
     [[ -n "$dest" ]] || continue
@@ -481,8 +498,8 @@ kind_prepare_host_mounts() {
         # source by creating a *directory* — the behaviour this whole library
         # exists to defend against — so a bring-up on a host without KVM is
         # itself how /dev/kvm becomes a directory. That directory then passes
-        # an existence test forever, while the node-stack chart's
-        # `type: CharDevice` (charts/space-node-stack/templates/daemonset.yaml)
+        # an existence test forever, while the node-manager chart's
+        # `type: CharDevice` (charts/space-node-manager-local/templates/daemonset.yaml)
         # makes kubelet refuse the volume and the pod never starts.
         if [[ ! -e "$host" ]]; then
           missing+=("$host")

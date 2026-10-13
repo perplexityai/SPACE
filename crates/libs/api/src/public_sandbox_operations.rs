@@ -300,6 +300,19 @@ impl UpdateSandboxOperationExecutor {
     }
 }
 
+/// The canonical `sandbox_id` telemetry value, the bare UUID, of the sandbox
+/// an operation targets. Public operations name it by its `sbx_<uuid>` target
+/// id; a target that names no sandbox yields `None`, which leaves the field
+/// off the span or log line.
+fn operation_sandbox_id(operation: &ClaimedPublicOperation) -> Option<String> {
+    let target_id = operation.target_id.as_deref()?;
+    let sandbox_id = match target_id.parse::<PublicSandboxId>() {
+        Ok(public_id) => SandboxId::from(public_id),
+        Err(_) => target_id.parse::<SandboxId>().ok()?,
+    };
+    Some(sandbox_id.to_string())
+}
+
 #[derive(Clone)]
 pub struct CreateSandboxOperationExecutor {
     pool: PgPool,
@@ -321,6 +334,7 @@ impl CreateSandboxOperationExecutor {
             claim_generation = operation.claim_generation,
             operation_kind = operation.kind.as_str(),
             target_id = operation.target_id.as_deref().unwrap_or("none"),
+            sandbox_id = operation_sandbox_id(operation),
         );
         match self.execute_inner(operation).instrument(span).await {
             Ok(result) => result,
@@ -874,6 +888,7 @@ impl UpdateSandboxExecutionError {
             Self::Sql(error) => {
                 tracing::warn!(
                     operation_id = %operation.id,
+                    sandbox_id = operation_sandbox_id(operation),
                     error = %error,
                     "retrying update_sandbox operation after database error"
                 );
@@ -947,6 +962,7 @@ impl SandboxLifecycleExecutionError {
             Self::Sql(error) => {
                 tracing::warn!(
                     operation_id = %operation.id,
+                    sandbox_id = operation_sandbox_id(operation),
                     error = %error,
                     "retrying sandbox lifecycle operation after database error"
                 );
@@ -1011,6 +1027,7 @@ impl CreateSandboxExecutionError {
             Self::ExistingRowNotCreateSuccess(lifecycle) => {
                 tracing::warn!(
                     operation_id = %operation.id,
+                    sandbox_id = operation_sandbox_id(operation),
                     lifecycle = %lifecycle,
                     "existing sandbox row does not confirm create success; retrying create \
                      instead of reporting it as success"
@@ -1023,6 +1040,7 @@ impl CreateSandboxExecutionError {
             Self::Sql(error) => {
                 tracing::warn!(
                     operation_id = %operation.id,
+                    sandbox_id = operation_sandbox_id(operation),
                     error = %error,
                     "retrying create_sandbox operation after database error"
                 );
@@ -1098,6 +1116,7 @@ fn controller_error_result(
         status if status.is_server_error() => {
             tracing::warn!(
                 operation_id = %operation.id,
+                sandbox_id = operation_sandbox_id(operation),
                 status = status.as_u16(),
                 error = %error,
                 "retrying create_sandbox operation after controller error"

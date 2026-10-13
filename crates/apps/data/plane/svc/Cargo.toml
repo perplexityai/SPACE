@@ -31,7 +31,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = { workspace = true }
-clap = { workspace = true, features = ["derive"] }
+clap = { workspace = true, features = ["derive", "env"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 # internal
@@ -42,3 +42,6 @@ pplx-space-data-plane-server = { workspace = true }
 # bodies, and glibc arenas keep the peak of each upload burst resident.
 [target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
 tikv-jemallocator = { workspace = true }
+
+[dev-dependencies]
+pplx-space-test-env = { workspace = true }

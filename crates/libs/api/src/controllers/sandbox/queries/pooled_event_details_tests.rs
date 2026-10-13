@@ -23,6 +23,7 @@ fn pool_event_details(
         resources: &resources,
         federated_owner: None,
         volume_encryption: false,
+        tls_interception: TlsInterception::Off,
     };
     match event_type {
         SandboxEventType::PoolSlotMissed => context.details().result("miss"),
@@ -91,6 +92,7 @@ fn pool_slot_claimed_event_details_preserve_federated_owner() {
         resources: &resources,
         federated_owner: Some(&owner),
         volume_encryption: false,
+        tls_interception: TlsInterception::Off,
     };
 
     let details = pool_slot_claimed_event_details(&claim, &create_event_context);
@@ -193,6 +195,7 @@ fn create_event_details_carry_volume_encryption_stamp() {
                 resources: &resources,
                 federated_owner: None,
                 volume_encryption,
+                tls_interception: TlsInterception::Off,
             }
             .details()
         );
@@ -201,4 +204,58 @@ fn create_event_details_carry_volume_encryption_stamp() {
             "{details}"
         );
     }
+}
+
+#[test]
+fn create_event_details_carry_effective_tls_interception_mode() {
+    let requested_template = TemplateReference::latest(TemplateName::parse("seed").unwrap());
+    let resources = SandboxResources {
+        vcpu: Some(2),
+        memory_mib: Some(4096),
+        disk_mib: None,
+    };
+
+    for (tls_interception, expected) in [(TlsInterception::On, "on"), (TlsInterception::Off, "off")]
+    {
+        let details = format!(
+            "{:?}",
+            SandboxCreateEventContext {
+                requested_template: &requested_template,
+                template: "seed",
+                content_hash: "sha256:cold",
+                runtime: "fc",
+                boot_mode: CreateBootMode::Fallthrough,
+                resources: &resources,
+                federated_owner: None,
+                volume_encryption: false,
+                tls_interception,
+            }
+            .details()
+        );
+        assert!(
+            details.contains(&format!("tls_interception: Some(\"{expected}\")")),
+            "{details}"
+        );
+    }
+}
+
+#[test]
+fn effective_tls_interception_prefers_sandbox_override_over_template_default() {
+    let template = NetworkPolicyV1 {
+        tls_interception: TlsInterception::Off,
+        ..Default::default()
+    };
+    let override_on = NetworkPolicyV1 {
+        tls_interception: TlsInterception::On,
+        ..Default::default()
+    };
+
+    assert_eq!(
+        effective_tls_interception(None, &template),
+        TlsInterception::Off
+    );
+    assert_eq!(
+        effective_tls_interception(Some(&override_on), &template),
+        TlsInterception::On
+    );
 }

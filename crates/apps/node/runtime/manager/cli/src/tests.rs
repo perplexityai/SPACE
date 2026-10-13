@@ -161,10 +161,7 @@ fn the_default_listing_fits_a_terminal() {
     let rendered = render_listing(&flat_node_listing(), false);
     let lines: Vec<&str> = rendered.lines().collect();
     let header: Vec<&str> = lines[0].split_whitespace().collect();
-    assert_eq!(
-        header,
-        ["KIND", "VERSION", "RUNTIME", "STATUS", "OWNER", "PATH"]
-    );
+    assert_eq!(header, ["KIND", "VERSION", "STATUS", "OWNER", "PATH"]);
     let widest = lines.iter().map(|line| line.chars().count()).max().unwrap();
     assert!(widest <= 120, "{widest} columns:\n{rendered}");
     for absent in [
@@ -188,7 +185,7 @@ fn the_default_listing_fits_a_terminal() {
     let columns: Vec<&str> = bundled.split_whitespace().collect();
     assert_eq!(
         columns[..4],
-        ["kernel", "6.1.155", "[*]", "fc-1.15.1"],
+        ["kernel", "6.1.155", "[*]", "valid"],
         "{rendered}"
     );
     // A problem is listed below the table rather than widening its row.
@@ -216,8 +213,7 @@ fn the_wide_listing_adds_the_evidence() {
     assert_eq!(
         header,
         [
-            "KIND", "VERSION", "RUNTIME", "STATUS", "OWNER", "ARCH", "STATE", "DIGEST", "FOUND",
-            "IN", "PATH"
+            "KIND", "VERSION", "STATUS", "OWNER", "ARCH", "STATE", "DIGEST", "FOUND", "IN", "PATH"
         ]
     );
     for present in [
@@ -264,104 +260,70 @@ fn status_names_absent_and_unprotected_paths_separately() {
     );
 }
 
-fn available(
-    version: &str,
-    presence: KernelPresence,
-    md5: Option<&str>,
-) -> pplx_space_node_runtime_manager_client::proto::AvailableKernel {
-    pplx_space_node_runtime_manager_client::proto::AvailableKernel {
-        version: version.to_string(),
-        runtime_kind: RuntimeKind::Firecracker as i32,
-        runtime_line: "1.15".to_string(),
-        architecture: "x86_64".to_string(),
-        size: 44_279_576,
-        md5: md5.map(str::to_string),
-        source: format!("s3://spec.ccfc.min/firecracker-ci/v1.15/x86_64/vmlinux-{version}"),
-        presence: presence as i32,
-    }
-}
-
 #[test]
-fn available_kernels_render_one_row_each_with_presence() {
-    let response = ListAvailableKernelsResponse {
-        kernels: vec![
-            available("5.10.245", KernelPresence::NotInstalled, Some("a2")),
-            available("6.1.155", KernelPresence::Installed, Some("44")),
-            available("6.1.156", KernelPresence::VersionPresent, None),
-        ],
-        runtime_kind: RuntimeKind::Firecracker as i32,
-        runtime_lines: vec!["1.15".to_string()],
-        source: "s3://spec.ccfc.min/firecracker-ci".to_string(),
-    };
-    let rendered = render_available(&response);
-    let rows: Vec<Vec<&str>> = rendered
-        .lines()
-        .map(|line| line.split_whitespace().collect())
-        .collect();
-    assert_eq!(
-        rows[0],
-        ["VERSION", "RUNTIME", "SIZE", "ON", "THIS", "NODE"]
+fn version_shorthand_refuses_ambiguous_bytes() {
+    let first = component_identity(
+        ComponentKind::Kernel,
+        "6.1.158".parse().unwrap(),
+        Digest::sha256([1; 32]),
+    );
+    let second = component_identity(
+        ComponentKind::Kernel,
+        "6.1.158".parse().unwrap(),
+        Digest::sha256([2; 32]),
     );
     assert_eq!(
-        rows[1],
-        ["5.10.245", "fc-1.15", "42.2", "MiB", "not-installed"]
+        unique_artifact([first.clone(), first.clone()]).unwrap(),
+        first
     );
-    assert_eq!(rows[2], ["6.1.155", "fc-1.15", "42.2", "MiB", "installed"]);
-    assert_eq!(
-        rows[3],
-        ["6.1.156", "fc-1.15", "42.2", "MiB", "unverifiable"]
-    );
-    assert!(
-        rendered.ends_with("Source: s3://spec.ccfc.min/firecracker-ci\n"),
-        "{rendered}"
-    );
-
-    let none_here = ListAvailableKernelsResponse {
-        runtime_kind: RuntimeKind::Firecracker as i32,
-        ..Default::default()
-    };
-    let rendered = render_available(&none_here);
-    assert!(
-        rendered.starts_with(
-            "No firecracker release is on this node; name a line with --runtime fc-<line>"
-        ),
-        "{rendered}"
-    );
+    unique_artifact([first, second]).unwrap_err();
 }
 
 fn operation(state: OperationState, outcome: OperationOutcome) -> Operation {
     Operation {
-        operation_id: "01a0f799-a8d6-70df-bdc9-be151f12112a".to_string(),
-        kind: OperationKind::InstallKernel as i32,
+        operation_id: "operation-id".into(),
+        identity: Some(component_identity(
+            ComponentKind::Kernel,
+            "6.1.158".parse().unwrap(),
+            Digest::sha256([7; 32]),
+        )),
+        action: ArtifactAction::Install as i32,
         state: state as i32,
-        kernel_version: "6.1.155".to_string(),
-        runtime_kind: RuntimeKind::Firecracker as i32,
-        runtime_line: Some("1.15".to_string()),
-        source: Some("s3://spec.ccfc.min/firecracker-ci/v1.15/x86_64/vmlinux-6.1.155".to_string()),
         outcome: outcome as i32,
+        on_disk: None,
         error: None,
-        path: Some("/space/vendor/kernels/6.1.155".to_string()),
-        digest: None,
         created_at_unix_ms: 0,
         updated_at_unix_ms: 0,
     }
 }
 
 #[test]
-fn operations_render_their_state_and_outcome() {
+fn a_release_argument_names_a_version() {
+    assert_eq!(
+        parse_release("fc-1.16.2"),
+        Ok(ReleaseArg {
+            kind: Runtime::Firecracker,
+            version: RuntimeVersion::parse("1.16.2").unwrap(),
+        })
+    );
+    assert_eq!(
+        parse_release("fc-v1.16.2").unwrap(),
+        ReleaseArg {
+            kind: Runtime::Firecracker,
+            version: RuntimeVersion::parse("1.16.2").unwrap()
+        }
+    );
+    parse_release("fc").expect_err("a runtime alone");
+}
+
+#[test]
+fn operations_render_identity_state_and_outcome() {
     let rendered = render_operation(&operation(
         OperationState::Succeeded,
-        OperationOutcome::ProvidedExternally,
+        OperationOutcome::Installed,
     ));
-    assert!(
-        rendered.contains("State:       succeeded (provided-externally)\n"),
-        "{rendered}"
-    );
-    assert!(
-        rendered.contains("Path:        /space/vendor/kernels/6.1.155\n"),
-        "{rendered}"
-    );
-    assert!(rendered.contains("Runtime:     fc-1.15\n"), "{rendered}");
+    assert!(rendered.contains("succeeded (installed)"), "{rendered}");
+    assert!(rendered.contains("kernel 6.1.158 sha256:"), "{rendered}");
     assert!(!rendered.contains("Error:"), "{rendered}");
 }
 
@@ -381,7 +343,7 @@ fn only_a_failed_or_cancelled_operation_fails_the_command() {
     failed.error = Some("the download's MD5 does not match".to_string());
     assert_eq!(
         operation_outcome(&failed).unwrap_err(),
-        "ERROR: install-kernel failed: the download's MD5 does not match"
+        "ERROR: install failed: the download's MD5 does not match"
     );
     operation_outcome(&operation(
         OperationState::Cancelled,
@@ -400,7 +362,7 @@ fn sizes_read_in_mebibytes() {
 #[test]
 fn a_refused_mutation_says_it_needs_root() {
     let denied = mutation_error(tonic::Status::permission_denied(
-        "local peer operator is not authorized for UninstallKernel",
+        "local peer operator is not authorized for UninstallComponent",
     ));
     assert!(denied.starts_with("ERROR: local peer operator"), "{denied}");
     assert!(
@@ -451,4 +413,94 @@ fn runtimes_are_named_by_alias_or_full_name_with_an_optional_version() {
         "ch-48.0"
     );
     assert_eq!(runtime_label(99, "1.0"), "unknown-99-1.0");
+}
+
+#[test]
+fn uninstall_resolves_measured_managed_identity_despite_unrelated_scan_issues() {
+    let release = parse_release("fc-9.9.9").unwrap();
+    let version: ArtifactVersion = "9.9.9".parse().unwrap();
+    let digest = "sha256:0000000000000000000000000000000000000000000000000000000000000001";
+    for runtime in [false, true] {
+        let requested = || {
+            if runtime {
+                InstalledArtifact::Runtime(&release)
+            } else {
+                InstalledArtifact::Kernel(&version)
+            }
+        };
+        let entry = ExecutionArtifact {
+            kind: if runtime {
+                ExecutionArtifactKind::Runtime
+            } else {
+                ExecutionArtifactKind::Component
+            } as i32,
+            runtime_kind: if runtime {
+                RuntimeKind::Firecracker
+            } else {
+                RuntimeKind::Unspecified
+            } as i32,
+            component_kind: if runtime {
+                ArtifactComponentKind::Unspecified
+            } else {
+                ArtifactComponentKind::Kernel
+            } as i32,
+            management: ArtifactManagement::SpaceManaged as i32,
+            version: Some("9.9.9".into()),
+            digest: Some(digest.into()),
+            ..Default::default()
+        };
+        let listing = |complete, artifacts| ListExecutionArtifactsResponse {
+            complete,
+            artifacts,
+            ..Default::default()
+        };
+        for complete in [false, true] {
+            let identity =
+                installed_identity(listing(complete, vec![entry.clone()]), requested()).unwrap();
+            let found = match identity.artifact.unwrap() {
+                artifact_identity::Artifact::Runtime(identity) => identity.digest,
+                artifact_identity::Artifact::Component(identity) => identity.digest,
+            };
+            assert_eq!(found, digest);
+            let error = installed_identity(listing(complete, vec![]), requested()).unwrap_err();
+            assert!(
+                error.contains(if complete {
+                    "no matching"
+                } else {
+                    "cannot establish"
+                }),
+                "{error}"
+            );
+            let external = ExecutionArtifact {
+                management: ArtifactManagement::External as i32,
+                ..entry.clone()
+            };
+            installed_identity(listing(complete, vec![external]), requested()).unwrap_err();
+            let unmeasured = ExecutionArtifact {
+                digest: None,
+                detail: Some("image changed".into()),
+                ..entry.clone()
+            };
+            let error =
+                installed_identity(listing(complete, vec![unmeasured]), requested()).unwrap_err();
+            assert!(
+                error.contains("present but its digest is unavailable")
+                    && error.contains("image changed"),
+                "{error}"
+            );
+            let conflicting = ExecutionArtifact {
+                digest: Some(
+                    "sha256:0000000000000000000000000000000000000000000000000000000000000002"
+                        .into(),
+                ),
+                ..entry.clone()
+            };
+            let error = installed_identity(
+                listing(complete, vec![entry.clone(), conflicting]),
+                requested(),
+            )
+            .unwrap_err();
+            assert!(error.contains("ambiguous"), "{error}");
+        }
+    }
 }

@@ -14,6 +14,9 @@ networkPolicy:
   queryPeers: []
   additionalEgress: []
 collector:
+  # Fixed Service ClusterIP. Empty lets Kubernetes allocate one; only the Kind
+  # profile sets it, for the node-hosted shim, which has no cluster DNS.
+  clusterIP: ""
   debug: false
   maxStreams: 10000
   maxStale: 2m
@@ -27,6 +30,8 @@ prometheus:
     requests: {cpu: 100m, memory: 256Mi}
     limits: {cpu: "1", memory: 1Gi, ephemeral-storage: 256Mi}
 # Pinned multi-platform digests; versions verified 2026-09-23.
+# A bump also moves the tag in profiles/kind.yaml and the entry in
+# ci/mirrored-images.txt.
 images:
   # Shared with the traces chart: the digest lives in charts/common so a
   # version bump is one edit. Set this to pin a different Collector here only.

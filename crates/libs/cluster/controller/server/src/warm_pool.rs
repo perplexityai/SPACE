@@ -17,6 +17,7 @@ use kube::{
     api::{DeleteParams, ListParams, Patch, PatchParams, PostParams},
     runtime::reflector::Store,
 };
+use pplx_space_api::controllers::substrate::kubernetes::{SandboxPodKey, SandboxPodView};
 use pplx_space_api::controllers::substrate::{
     ReflectorReady, Substrate, SubstrateAdapter, connect_worker,
 };
@@ -30,9 +31,9 @@ use pplx_space_cluster_pool::{
 use pplx_space_common_core::kubernetes::NodeGroupPlacement;
 use pplx_space_common_core::{
     kubernetes::{
-        DEFAULT_SANDBOX_PROXY_PORT, SANDBOX_POOL_CONFIG_ID_KEY, SANDBOX_POOL_ROLE_KEY,
-        SANDBOX_POOL_ROLE_WARM, SandboxPodConfigValues, TEMPLATE_PRESENT_LABEL_VALUE,
-        template_build_presence_label_key, template_write_annotation_key_for,
+        DEFAULT_SANDBOX_PROXY_PORT, SANDBOX_POOL_ROLE_WARM, SandboxPodConfigValues,
+        TEMPLATE_PRESENT_LABEL_VALUE, template_build_presence_label_key,
+        template_write_annotation_key_for,
     },
     types::{SandboxId, TemplateArtifactDigest, TemplateReference},
 };
@@ -407,7 +408,7 @@ struct ReconcilerTuning {
 }
 
 pub(crate) struct PodCache {
-    pub(crate) store: Store<Pod>,
+    pub(crate) store: Store<SandboxPodView>,
     pub(crate) ready: ReflectorReady,
 }
 
@@ -2287,28 +2288,22 @@ fn template_write_node_list_params(config: &SandboxPodConfigValues) -> ListParam
 }
 
 fn cached_warm_pods_by_name(
-    pod_store: &Store<Pod>,
+    pod_store: &Store<SandboxPodView>,
     config: &PoolConfig,
-) -> HashMap<String, Arc<Pod>> {
+) -> HashMap<String, Arc<SandboxPodView>> {
     let config_id = config.id.to_string();
     pod_store
         .state()
         .into_iter()
         .filter(|pod| warm_pool_pod_matches_config(pod, &config_id))
-        .filter_map(|pod| pod.metadata.name.clone().map(|name| (name, pod)))
+        .filter(|pod| !pod.name().is_empty())
+        .map(|pod| (pod.name().to_string(), pod))
         .collect()
 }
 
-fn warm_pool_pod_matches_config(pod: &Pod, config_id: &str) -> bool {
-    let labels = pod.metadata.labels.as_ref();
-    labels
-        .and_then(|labels| labels.get(SANDBOX_POOL_ROLE_KEY))
-        .map(String::as_str)
-        == Some(SANDBOX_POOL_ROLE_WARM)
-        && labels
-            .and_then(|labels| labels.get(SANDBOX_POOL_CONFIG_ID_KEY))
-            .map(String::as_str)
-            == Some(config_id)
+fn warm_pool_pod_matches_config(pod: &SandboxPodView, config_id: &str) -> bool {
+    pod.label(SandboxPodKey::PoolRole) == Some(SANDBOX_POOL_ROLE_WARM)
+        && pod.label(SandboxPodKey::PoolConfigId) == Some(config_id)
 }
 
 fn needs_template_write_annotation(
@@ -2514,7 +2509,7 @@ enum ClaimableSlotMetadata {
 
 async fn claimable_slot_metadata<P>(
     slot: &PoolSlot,
-    pod: &Pod,
+    pod: &SandboxPodView,
     ready_probe: &P,
     content_hash: &str,
 ) -> ClaimableSlotMetadata
@@ -2557,11 +2552,8 @@ fn emit_promote_attempt(content_hash: &str, outcome: PromoteOutcome) {
     pplx_space_metrics::warm_pool::promote_attempt(content_hash, outcome);
 }
 
-fn pod_ip_for_log(pod: &Pod) -> &str {
-    pod.status
-        .as_ref()
-        .and_then(|status| status.pod_ip.as_deref())
-        .unwrap_or("<none>")
+fn pod_ip_for_log(pod: &SandboxPodView) -> &str {
+    pod.pod_ip().unwrap_or("<none>")
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -2603,7 +2595,7 @@ fn warm_slot_runtime_endpoint(
     .map_err(WarmSlotRuntimeEndpointError::InvalidEndpoint)
 }
 
-fn ready_slot_matches_pod(slot: &PoolSlot, pod: &Pod) -> bool {
+fn ready_slot_matches_pod(slot: &PoolSlot, pod: &SandboxPodView) -> bool {
     ready_pod_metadata(pod).is_some_and(|metadata| {
         slot.pod_uid.as_deref() == Some(metadata.uid.as_str())
             && slot.pod_ip.as_deref() == Some(metadata.pod_ip.as_str())
@@ -2783,16 +2775,16 @@ fn node_is_cordoned(node: &Node) -> bool {
         .unwrap_or(false)
 }
 
-fn should_delete_unready_warming_pod(pod: &Pod, slot: &PoolSlot, timeout: Duration) -> bool {
-    if matches!(pod_phase(pod), Some("Failed" | "Succeeded")) {
+fn should_delete_unready_warming_pod(
+    pod: &SandboxPodView,
+    slot: &PoolSlot,
+    timeout: Duration,
+) -> bool {
+    if pod.is_terminal() {
         return true;
     }
 
     warming_slot_timed_out(slot.created_at, timeout)
-}
-
-fn pod_phase(pod: &Pod) -> Option<&str> {
-    pod.status.as_ref()?.phase.as_deref()
 }
 
 fn warming_slot_timed_out(created_at: OffsetDateTime, timeout: Duration) -> bool {

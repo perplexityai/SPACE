@@ -7,6 +7,9 @@ pub mod gateway_launch;
 #[cfg(feature = "host-runtime")]
 pub mod launch;
 
+#[cfg(feature = "artifact-store")]
+pub mod artifact_store;
+pub mod catalog;
 pub mod file_delta;
 
 pub mod runtime_inventory;

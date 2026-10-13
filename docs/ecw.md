@@ -247,6 +247,14 @@ A successful reconnect or timeout update for a running execution requires
 `AlreadyCurrent` outcome from the sandbox manager. Ordinary access touches are
 not sufficient acknowledgement of a deadline operation.
 
+If the worker connection fails before a deadline update is sent, for example
+while the node service restarts, the API retries it once on a fresh connection
+within the same operation deadline. If the connection breaks after the update
+may have reached the worker, the API does not resend it. A reconnect extension
+succeeds only if the worker's state then shows the extended deadline; otherwise,
+and always for a timeout reset, the request fails with a retryable `503` and
+`Retry-After`.
+
 When execution identity has not reached the API, it queries the current worker
 identity before sending the generation-fenced deadline update. This lookup is
 required during normal operation as well as upgrades; missing API identity does

@@ -1,8 +1,12 @@
 # Local metrics backend
 
 Install Collector Contrib and Prometheus on the verified `kind-space-local`
-bench. The helper checks cluster identity and namespace ownership. Shared
+bench (`kind-$SPACE_KIND_CLUSTER` when `SPACE_KIND_CLUSTER` is set). The
+helper checks cluster identity and namespace ownership. Shared
 installations use the [observability deployment runbook](../../observability/README.md).
+
+Default Kind bootstrap and full-stack Tilt install this backend automatically
+in `otel` mode. Use this helper to manage the release independently.
 
 ## Deploy and query
 
@@ -14,14 +18,16 @@ helm lint infra/space/observability/charts/metrics \
   -f infra/space/observability/charts/metrics/profiles/kind.yaml
 bash infra/space/kind/metrics/local.sh up
 bash infra/space/kind/metrics/local.sh status
+# Default bootstrap and full-stack Tilt already forward this port in otel mode.
 bash infra/space/kind/metrics/local.sh ui
 # Prometheus: http://127.0.0.1:19090; Ctrl-C closes the tunnel.
 ```
 
 The release owns only the backend, configuration, storage and access policies.
 Installing it creates no producer Jobs and changes no SPACE sink. Grafana is an
-independent optional release. Kind uses disposable local storage and does not
-provide enforced network isolation, authentication or production sizing.
+independent release, also installed by default but not required for ingestion.
+Kind uses disposable local storage and does not provide enforced network
+isolation, authentication or production sizing.
 
 ## Validate
 

@@ -170,6 +170,9 @@ pub(super) fn node_peer_authorizer() -> UdsPeerAuthorizer {
             UdsPeerAccount::with_linux_user(users::SPACE_NODEAPI),
             UdsPeerAccount::with_linux_user(users::SPACE_NODECTL),
             UdsPeerAccount::with_linux_user(users::SPACE_TMPLMGR),
+            UdsPeerAccount::with_linux_user(users::SPACE_VOLMGR),
+            // Publishes into and removes from the node's artifact store only.
+            UdsPeerAccount::with_linux_user(users::SPACE_RTMGR),
         ],
     )
 }

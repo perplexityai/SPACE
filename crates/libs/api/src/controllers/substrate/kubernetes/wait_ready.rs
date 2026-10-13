@@ -79,7 +79,7 @@ impl KubernetesSubstrate {
             };
 
             let pod = match event {
-                WatchEvent::Added(pod) | WatchEvent::Modified(pod) => pod,
+                WatchEvent::Added(pod) | WatchEvent::Modified(pod) => SandboxPodView::from(pod),
                 WatchEvent::Deleted(_) => return Ok(None),
                 WatchEvent::Bookmark(_) => continue,
                 WatchEvent::Error(status) => {
@@ -94,14 +94,14 @@ impl KubernetesSubstrate {
                 }
             };
 
-            if let Some(message) = pod_unschedulable_message(pod.status.as_ref()) {
+            if let Some(message) = pod.unschedulable_message() {
                 return Err(SubstrateError::Unavailable {
                     message: format!("sandbox pod is unschedulable: {message}"),
                 });
             }
 
-            let pod_uid = pod.metadata.uid.clone();
-            let pod_ip = assigned_pod_ip(pod.status.as_ref())?;
+            let pod_uid = pod.uid().map(str::to_owned);
+            let pod_ip = assigned_pod_ip(&pod)?;
             let _ = self
                 .remember_pod_node_placement(
                     sandbox_uuid,

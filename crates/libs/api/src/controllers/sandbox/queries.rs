@@ -17,6 +17,7 @@ use pplx_space_common_svc::types::ReconcileReason;
 use pplx_space_events::{
     SandboxEvent, SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
 };
+use pplx_space_net_common::TlsInterception;
 use pplx_space_public_api::OperationId;
 use std::collections::BTreeMap;
 use std::sync::{
@@ -487,7 +488,7 @@ fn pooled_create_terminal_error(error: ControllerError, claim_released: bool) ->
     }
 }
 
-fn pooled_prepare_error_is_reclaimable(error: &ControllerError) -> bool {
+pub(crate) fn pooled_prepare_error_is_reclaimable(error: &ControllerError) -> bool {
     // Ahead of the fragment match, because a lost lock race is the most
     // retryable outcome on this path and would never match it. The fragment
     // list names transport signatures ("connection reset", "transport
@@ -578,7 +579,9 @@ struct ColdCreateShapeInput<'a> {
 
 /// Resources for a create that did not adopt a warm-pool sandbox.
 ///
-/// A Kubernetes fallthrough create takes a configured pool's shape. Otherwise
+/// A Kubernetes fallthrough create takes a configured pool's shape, or the
+/// shape of the template's preferred enabled warm-pool policy when the release
+/// has no materialized pool config. Otherwise
 /// a Kubernetes create fills the vCPU and memory the request left unset from
 /// the template's build shape: the node shim boots a pod without those
 /// annotations at fixed defaults (2 vCPU, 1024 MiB), whatever the template
@@ -661,8 +664,9 @@ fn validate_inherited_pool_disk(disk_mib: Option<u32>) -> Result<(), ControllerE
 
 // The policy fallback deliberately mirrors the zero-demand policy priority in
 // `pplx-space-cluster-pool`. `retain_releases` controls which releases receive
-// warm slots; it must not limit `retain_shape_on_miss`, which applies the
-// template policy to any cold fallthrough create.
+// warm slots; it must not limit miss sizing. Any enabled template policy
+// supplies the shape for every cold fallthrough create so the persisted shape
+// counts as demand for that policy.
 async fn resolve_kubernetes_pool_configured_resources(
     pool: &PgPool,
     template_name: &str,
@@ -715,6 +719,23 @@ fn parse_kubernetes_pool_assignment(
     })
 }
 
+/// The TLS interception mode a create resolves to: a sandbox override takes
+/// precedence over the resolved template default.
+fn effective_tls_interception(
+    network_policy_override: Option<&NetworkPolicyV1>,
+    template_network_policy: &NetworkPolicyV1,
+) -> TlsInterception {
+    network_policy_override
+        .unwrap_or(template_network_policy)
+        .tls_interception
+}
+
+impl PooledCreateInput<'_> {
+    fn tls_interception(&self) -> TlsInterception {
+        effective_tls_interception(self.network_policy_override, self.template_network_policy)
+    }
+}
+
 fn emit_create_sandbox_event(
     sandbox_id: SandboxId,
     event_type: SandboxEventType,
@@ -732,6 +753,7 @@ struct SandboxCreateEventContext<'a> {
     resources: &'a SandboxResources,
     federated_owner: Option<&'a crate::federated_identity::FederatedOwner>,
     volume_encryption: bool,
+    tls_interception: TlsInterception,
 }
 
 impl SandboxCreateEventContext<'_> {
@@ -754,7 +776,8 @@ impl SandboxCreateEventContext<'_> {
             .template_id(self.template)
             .template_content_hash(self.content_hash)
             .runtime(self.runtime)
-            .boot_type(self.boot_mode.as_str());
+            .boot_type(self.boot_mode.as_str())
+            .tls_interception(self.tls_interception.as_str());
 
         if let Some(owner) = self.federated_owner {
             details = details
@@ -1181,12 +1204,9 @@ impl SandboxController {
             network_policy_override,
             Some(&template_network_policy),
         );
-        // A sandbox override takes precedence over the resolved template default.
-        let tls_interception_on = !network_policy_override
-            .as_ref()
-            .unwrap_or(&template_network_policy)
-            .tls_interception
-            .is_off();
+        let tls_interception =
+            effective_tls_interception(network_policy_override.as_ref(), &template_network_policy);
+        let tls_interception_on = !tls_interception.is_off();
         let network_policy_override_json = network_policy_override
             .as_ref()
             .map(serde_json::to_value)
@@ -1467,6 +1487,7 @@ impl SandboxController {
             resources: &resources,
             federated_owner,
             volume_encryption,
+            tls_interception,
         };
         let create_event_details = || create_event_context.details();
         emit_create_sandbox_event(
@@ -1754,7 +1775,9 @@ impl SandboxController {
             emit_create_sandbox_event(
                 outcome.sandbox_id,
                 SandboxEventType::CreateFailed,
-                create_event_details().error("lifecycle CAS lost during create"),
+                create_event_details()
+                    .error("lifecycle CAS lost during create")
+                    .logged_by_caller(),
             );
             self.rollback_created_sandbox(pool, outcome.sandbox_id)
                 .await;
@@ -1989,6 +2012,7 @@ impl SandboxController {
                             resources: &pool_attempt_resources(claim_attempt.pool_shape),
                             federated_owner: input.federated_owner,
                             volume_encryption: input.volume_encryption,
+                            tls_interception: input.tls_interception(),
                         }
                         .details()
                         .result("miss"),
@@ -2078,6 +2102,7 @@ impl SandboxController {
                 resources: &resources,
                 federated_owner: input.federated_owner,
                 volume_encryption: input.volume_encryption,
+                tls_interception: input.tls_interception(),
             };
             let create_event_details = || create_event_context.details();
             emit_create_sandbox_event(
@@ -2129,7 +2154,9 @@ impl SandboxController {
                     emit_create_sandbox_event(
                         sandbox_uuid,
                         SandboxEventType::CreateFailed,
-                        create_event_details().error(error.to_string()),
+                        create_event_details()
+                            .error(error.to_string())
+                            .logged_by_caller(),
                     );
                     let rollback_result = Self::rollback_failed_pooled_create_with_substrate(
                         substrate, input.pool, &claim,
@@ -2454,6 +2481,7 @@ impl SandboxController {
             resources: &resources,
             federated_owner: input.federated_owner,
             volume_encryption: input.volume_encryption,
+            tls_interception: input.tls_interception(),
         };
         let create_event_details = || create_event_context.details();
         emit_create_sandbox_event(
@@ -2493,7 +2521,9 @@ impl SandboxController {
                 emit_create_sandbox_event(
                     sandbox_uuid,
                     SandboxEventType::CreateFailed,
-                    create_event_details().error(error.to_string()),
+                    create_event_details()
+                        .error(error.to_string())
+                        .logged_by_caller(),
                 );
                 let rollback = Self::rollback_failed_pooled_create_with_substrate(
                     substrate, input.pool, &claim,

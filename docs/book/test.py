@@ -144,7 +144,13 @@ class GuideTests(unittest.TestCase):
     def test_section_landing_links(self):
         for page, targets in {
             "using-api.html": ["first-sandbox.html", "installation.html"],
-            "running-space.html": ["installation.html", "observability.html", "troubleshooting.html"],
+            "running-space.html": [
+                "installation.html",
+                "observability.html",
+                "troubleshooting.html",
+                "warm-pools.html",
+                "base-snapshots.html",
+            ],
             "development-overview.html": ["architecture.html", "development.html", "contributing.html"],
         }.items():
             for target in targets:

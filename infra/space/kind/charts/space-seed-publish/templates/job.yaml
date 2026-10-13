@@ -32,9 +32,10 @@ spec:
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           env:
-            # Local Kind only; deployed services require authenticated internal RPC TLS.
-            - name: SPACE_INTERNAL_RPC_INSECURE_DEV
-              value: "true"
+            # Authenticated internal RPC TLS (docs/internal-rpc-tls.md): the
+            # cluster's internal RPC CA, which verifies internal-api.
+            - name: SPACE_INTERNAL_RPC_TLS_CA
+              value: /etc/space-rpc-ca/ca.crt
             - name: SPACE_CLUSTER_API_TOKEN_PATH
               value: "/var/run/space-publication/cluster-api.token"
             - name: SPACE_INTERNAL_API_GRPC_ADDR
@@ -60,10 +61,17 @@ spec:
             {{- toYaml . | nindent 12 }}
           {{- end }}
           volumeMounts:
+            - name: rpc-ca
+              mountPath: /etc/space-rpc-ca
+              readOnly: true
             - name: publication-token
               mountPath: /var/run/space-publication
               readOnly: true
       volumes:
+        - name: rpc-ca
+          secret:
+            secretName: space-internal-rpc-ca
+            defaultMode: 0444
         - name: publication-token
           projected:
             defaultMode: 0444

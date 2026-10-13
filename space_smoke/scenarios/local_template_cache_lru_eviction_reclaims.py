@@ -7,8 +7,8 @@ import space_smoke as smoke
 # exercises LRU eviction. The knobs are read once at daemon start; this scenario
 # never changes them. It reads what the DaemonSet rendered and refuses to run against a
 # bench whose loop is off or too slow to prove anything within the budget,
-# rather than passing vacuously or silently patching a DaemonSet (a node-stack
-# rollout restarts every sandbox on every worker).
+# rather than passing vacuously or silently patching a DaemonSet (a
+# template-manager rollout on a shared bench is not this scenario's to make).
 #
 # The forcing device is a real build, not a fault: a throwaway template of
 # `budget_bytes` random bytes, registered on the worker that runs this
@@ -22,7 +22,7 @@ import space_smoke as smoke
 # bytes do not compress, so the plant weighs about twice its size on disk —
 # which only makes the over-budget condition more certain.)
 #
-# Proof is through operator-visible surfaces only. The node-stack image ships no
+# Proof is through operator-visible surfaces only. The worker image ships no
 # `sqlite3`, and the compose harness's habit of asserting on the daemon's
 # private DB was one of the things worth retiring. Here: the plant's digest
 # directory is gone from disk, `space-tmplmgr get` no longer resolves it (it

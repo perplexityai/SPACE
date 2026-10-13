@@ -30,6 +30,7 @@ pplx-space-common-proto-build = { workspace = true }
 tonic-prost-build = { workspace = true }
 
 [dev-dependencies]
-nix = { workspace = true, features = ["user"] }
+nix = { workspace = true, features = ["fs", "mount", "sched", "user"] }
+pplx-space-test-env = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt", "time"] }

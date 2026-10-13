@@ -224,6 +224,8 @@ fn accepts_paths_strictly_inside_the_cache_root() {
     for suffix in [
         format!("{id}/snapshot"),
         format!("{id}/snapshots/name.gc-pending-x"),
+        // Sandbox-manager retires superseded snapshots here for the sweep.
+        format!("{id}/snapshots/.suspend-gc-pending-{id}"),
         format!(".fork-copies/{id}"),
     ] {
         validate_cache_artifact_path(&format!("{root}/{suffix}")).unwrap();
@@ -359,13 +361,13 @@ async fn service_with_stop(
 
 #[tokio::test]
 async fn encrypted_seal_stop_retries_while_the_runtime_is_still_exiting() {
-    let (service, id, _socket, server) = service_with_stop(tonic::Code::Internal, 2).await;
-
-    super::stop_runtime_for_encrypted_seal(&service, &id.to_string())
-        .await
-        .expect("stop succeeds once the runtime finishes exiting");
-
-    crate::runtime_supervisor_client::tests::stop_supervisor_server(server).await;
+    for code in [tonic::Code::Internal, tonic::Code::Unavailable] {
+        let (service, id, _socket, server) = service_with_stop(code, 2).await;
+        super::stop_runtime_for_encrypted_seal(&service, &id.to_string())
+            .await
+            .expect("stop succeeds once the runtime finishes exiting");
+        crate::runtime_supervisor_client::tests::stop_supervisor_server(server).await;
+    }
 }
 
 #[tokio::test]
@@ -392,4 +394,340 @@ async fn encrypted_seal_stop_does_not_retry_other_failures() {
     assert_eq!(error.code(), tonic::Code::FailedPrecondition);
 
     crate::runtime_supervisor_client::tests::stop_supervisor_server(server).await;
+}
+
+fn snapshot_volume(sandbox_id: &str) -> String {
+    format!("{}/{sandbox_id}/snapshot-vol", super::CACHE_DIR)
+}
+
+/// A service whose blocking host work is refused, with an allocated sandbox
+/// and a second sandbox whose execution is bound but which holds no lease.
+struct SnapshotFixture {
+    service: crate::service::NodeManagerService,
+    lease: crate::net::SlotInfo,
+    fence: crate::proto::ExecutionFence,
+    unallocated_id: String,
+    unallocated_fence: crate::proto::ExecutionFence,
+}
+
+impl SnapshotFixture {
+    async fn new() -> Self {
+        use crate::service::tests::service_tests::{
+            allocate_test_lease, bind_test_execution, refuse_host_work, service_for_unit_tests,
+        };
+
+        let mut service = service_for_unit_tests().await;
+        refuse_host_work(&mut service).await;
+        let id = super::SandboxId::new().to_string();
+        let fence = bind_test_execution(&service, &id);
+        let lease = allocate_test_lease(&service, &id);
+        let unallocated_id = super::SandboxId::new().to_string();
+        let unallocated_fence = bind_test_execution(&service, &unallocated_id);
+        Self {
+            service,
+            lease,
+            fence,
+            unallocated_id,
+            unallocated_fence,
+        }
+    }
+
+    fn lease_disturbed(&self, case: &str) -> Option<String> {
+        let current = self.service.pool.get(&self.lease.sandbox_id).unwrap();
+        (current
+            .as_ref()
+            .map(|lease| (lease.slot, lease.generation, lease.sandbox_uid, lease.pid))
+            != Some((
+                self.lease.slot,
+                self.lease.generation,
+                self.lease.sandbox_uid,
+                None,
+            )))
+        .then(|| format!("{case}: lease changed to {current:?}"))
+    }
+}
+
+// No case may pass validation for the allocated sandbox: the next step dials
+// the Firecracker API socket under the node's fixed jail directory. Rows whose
+// guard precedes the lease lookup use the unallocated sandbox, so dropping the
+// guard stops at the lease check instead. That includes the encrypted rows,
+// whose capture would otherwise bind into the jail.
+#[tokio::test]
+async fn create_snapshot_refuses_invalid_requests_before_dialing_firecracker() {
+    use crate::proto::CreateSnapshotRequest;
+    use crate::service::tests::service_tests::{refusal_mismatch, root_request, stale_test_fence};
+    use tonic::Code;
+
+    let fixture = SnapshotFixture::new().await;
+    let id = fixture.lease.sandbox_id.clone();
+    let valid = CreateSnapshotRequest {
+        sandbox_id: id.clone(),
+        snapshot_path: "/vmstate".into(),
+        mem_file_path: "/memory".into(),
+        execution_fence: Some(fixture.fence.clone()),
+        ..Default::default()
+    };
+    let unallocated = CreateSnapshotRequest {
+        sandbox_id: fixture.unallocated_id.clone(),
+        execution_fence: Some(fixture.unallocated_fence.clone()),
+        ..valid.clone()
+    };
+    let cases = [
+        (
+            "superseded execution",
+            CreateSnapshotRequest {
+                execution_fence: Some(stale_test_fence()),
+                ..unallocated.clone()
+            },
+            Code::FailedPrecondition,
+            "sandbox execution identity is missing or superseded",
+        ),
+        (
+            "vmstate path names another artifact",
+            CreateSnapshotRequest {
+                snapshot_path: "/memory".into(),
+                ..valid.clone()
+            },
+            Code::InvalidArgument,
+            "snapshot_path must reference Firecracker artifact 'vmstate'",
+        ),
+        (
+            "memory path names another artifact",
+            CreateSnapshotRequest {
+                mem_file_path: "/vmstate".into(),
+                ..valid.clone()
+            },
+            Code::InvalidArgument,
+            "mem_file_path must reference Firecracker artifact 'memory'",
+        ),
+        (
+            "destination outside the sandbox roots",
+            CreateSnapshotRequest {
+                dest_dir: Some(format!(
+                    "{}/{}/snapshot",
+                    super::CACHE_DIR,
+                    fixture.unallocated_id
+                )),
+                ..valid.clone()
+            },
+            Code::PermissionDenied,
+            "dest_dir is outside allowed runtime roots",
+        ),
+        (
+            "plaintext capture without a lease",
+            unallocated.clone(),
+            Code::Unavailable,
+            "snapshot lease is no longer active",
+        ),
+        (
+            "encrypted volume of another sandbox",
+            CreateSnapshotRequest {
+                snapshot_volume_mount_dir: Some(snapshot_volume(&id)),
+                ..unallocated.clone()
+            },
+            Code::InvalidArgument,
+            "path does not belong to this sandbox",
+        ),
+        (
+            "encrypted capture without a lease",
+            CreateSnapshotRequest {
+                snapshot_volume_mount_dir: Some(snapshot_volume(&fixture.unallocated_id)),
+                ..unallocated.clone()
+            },
+            Code::Unavailable,
+            "snapshot lease is no longer active",
+        ),
+    ];
+    let mut mismatches = Vec::new();
+    for (case, request, code, message) in cases {
+        let outcome = fixture.service.create_snapshot(root_request(request)).await;
+        mismatches.extend(refusal_mismatch(case, outcome, code, message));
+        mismatches.extend(fixture.lease_disturbed(case));
+    }
+    assert!(mismatches.is_empty(), "{mismatches:#?}");
+}
+
+// No invalid case may pass validation: the next step stages files or binds the
+// volume into the node's fixed jail directory, or waits for the Firecracker
+// socket. The valid encrypted loads show where validation ends: their volume
+// bind is the first blocking host step, which the fixture refuses. Rows whose
+// guard precedes the lease lookup and that stage nothing use the unallocated
+// sandbox, so dropping the guard stops at the lease check instead of polling
+// the jail's Firecracker socket. The encrypted rate-limit row shows the limit
+// is refused before the refused bind. The checkpoint row only shows it is
+// refused before the path checks: the source check first reads the sandbox's
+// checkpoint files under the fixed cache root, which do not exist, so no
+// plaintext row can reach the staging step, and a valid checkpoint load has no
+// row because that read's outcome depends on the host.
+#[tokio::test]
+async fn load_snapshot_refuses_invalid_requests_before_staging_the_jail() {
+    use crate::lifecycle_limiter::LifecycleMethod;
+    use crate::proto::{DriveRateLimit, LoadSnapshotRequest, TokenBucket};
+    use crate::service::tests::service_tests::{refusal_mismatch, root_request, stale_test_fence};
+    use tonic::Code;
+
+    let fixture = SnapshotFixture::new().await;
+    let id = fixture.lease.sandbox_id.clone();
+    let valid = LoadSnapshotRequest {
+        sandbox_id: id.clone(),
+        snapshot_path: "/vmstate".into(),
+        mem_file_path: "/memory".into(),
+        execution_fence: Some(fixture.fence.clone()),
+        ..Default::default()
+    };
+    let unallocated = LoadSnapshotRequest {
+        sandbox_id: fixture.unallocated_id.clone(),
+        execution_fence: Some(fixture.unallocated_fence.clone()),
+        ..valid.clone()
+    };
+    let bucket = Some(TokenBucket {
+        size: 1,
+        refill_time_ms: 1,
+    });
+    let cases = [
+        (
+            "superseded execution",
+            LoadSnapshotRequest {
+                execution_fence: Some(stale_test_fence()),
+                ..unallocated.clone()
+            },
+            Code::FailedPrecondition,
+            "sandbox execution identity is missing or superseded",
+        ),
+        (
+            "unallocated sandbox",
+            unallocated.clone(),
+            Code::Unavailable,
+            "snapshot lease is no longer active",
+        ),
+        (
+            "encrypted volume of another sandbox",
+            LoadSnapshotRequest {
+                snapshot_volume_mount_dir: Some(snapshot_volume(&fixture.unallocated_id)),
+                ..valid.clone()
+            },
+            Code::InvalidArgument,
+            "path does not belong to this sandbox",
+        ),
+        (
+            "vmstate path names another artifact",
+            LoadSnapshotRequest {
+                snapshot_path: "/memory".into(),
+                ..valid.clone()
+            },
+            Code::InvalidArgument,
+            "snapshot_path must reference Firecracker artifact 'vmstate'",
+        ),
+        (
+            "memory path names another artifact",
+            LoadSnapshotRequest {
+                mem_file_path: "/vmstate".into(),
+                ..valid.clone()
+            },
+            Code::InvalidArgument,
+            "mem_file_path must reference Firecracker artifact 'memory'",
+        ),
+        (
+            "source other than the sandbox checkpoint",
+            LoadSnapshotRequest {
+                source_dir: Some(format!(
+                    "{}/{}/snapshot",
+                    super::CACHE_DIR,
+                    fixture.unallocated_id
+                )),
+                ..valid.clone()
+            },
+            Code::PermissionDenied,
+            "source_dir must be the sandbox checkpoint directory",
+        ),
+        (
+            "rate limit without bandwidth",
+            LoadSnapshotRequest {
+                rootfs_rate_limit: Some(DriveRateLimit {
+                    bandwidth: None,
+                    operations: bucket,
+                }),
+                ..unallocated.clone()
+            },
+            Code::InvalidArgument,
+            "rootfs_rate_limit.bandwidth is required",
+        ),
+        (
+            "rate limit without operations",
+            LoadSnapshotRequest {
+                rootfs_rate_limit: Some(DriveRateLimit {
+                    bandwidth: bucket,
+                    operations: None,
+                }),
+                ..unallocated.clone()
+            },
+            Code::InvalidArgument,
+            "rootfs_rate_limit.operations is required",
+        ),
+        (
+            "checkpoint load with a rate limit without bandwidth",
+            LoadSnapshotRequest {
+                source_dir: Some(format!("{}/{id}/snapshot", super::CACHE_DIR)),
+                rootfs_rate_limit: Some(DriveRateLimit {
+                    bandwidth: None,
+                    operations: bucket,
+                }),
+                ..valid.clone()
+            },
+            Code::InvalidArgument,
+            "rootfs_rate_limit.bandwidth is required",
+        ),
+        (
+            "encrypted load with a rate limit without operations",
+            LoadSnapshotRequest {
+                snapshot_volume_mount_dir: Some(snapshot_volume(&id)),
+                rootfs_rate_limit: Some(DriveRateLimit {
+                    bandwidth: bucket,
+                    operations: None,
+                }),
+                ..valid.clone()
+            },
+            Code::InvalidArgument,
+            "rootfs_rate_limit.operations is required",
+        ),
+        (
+            "valid encrypted load",
+            LoadSnapshotRequest {
+                snapshot_volume_mount_dir: Some(snapshot_volume(&id)),
+                ..valid.clone()
+            },
+            Code::Cancelled,
+            "artifact work cancelled",
+        ),
+        (
+            "valid encrypted load with a rate limit",
+            LoadSnapshotRequest {
+                snapshot_volume_mount_dir: Some(snapshot_volume(&id)),
+                rootfs_rate_limit: Some(DriveRateLimit {
+                    bandwidth: bucket,
+                    operations: bucket,
+                }),
+                ..valid.clone()
+            },
+            Code::Cancelled,
+            "artifact work cancelled",
+        ),
+    ];
+    let mut mismatches = Vec::new();
+    for (case, request, code, message) in cases {
+        let outcome = fixture.service.load_snapshot(root_request(request)).await;
+        mismatches.extend(refusal_mismatch(case, outcome, code, message));
+        mismatches.extend(fixture.lease_disturbed(case));
+        if fixture
+            .service
+            .lifecycle_limiter
+            .snapshot(LifecycleMethod::LoadSnapshot)
+            != (0, 0)
+        {
+            mismatches.push(format!("{case}: refusal leaked its lifecycle permit"));
+            // A leaked permit would starve the remaining rows.
+            break;
+        }
+    }
+    assert!(mismatches.is_empty(), "{mismatches:#?}");
 }

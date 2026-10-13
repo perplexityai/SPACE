@@ -2,7 +2,8 @@
 //!
 //! Sandboxes that have been suspended (or stopped with a persisted
 //! disk artifact, or have a named user snapshot) leave per-sandbox
-//! directories under `/space/cache/sbx/snapshot/<shard>/<sandbox_id>/<snapshot_id>/`.
+//! directories under `/space/cache/firecracker/sandboxes/<sandbox_id>/`
+//! (`snapshot` and `snapshots/<name>`).
 //! These accumulate until the sandbox is deleted; nodes regularly
 //! run out of disk before that happens.
 //!
@@ -65,7 +66,7 @@ use pplx_space_common_core::types::LocalArtifactId;
 use pplx_space_common_lru_reaper::{self as lru_reaper, EvictionInput};
 use rusqlite::Connection;
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use self::orphans::{OrphanKind, OrphanScan};
 use crate::auto_lifecycle::now_secs;
@@ -78,6 +79,7 @@ pub(crate) struct GcOwnership {
     pub coordinator: crate::auto_lifecycle::AutoLifecycleCoordinator,
     pub drain: Arc<crate::service::drain::DrainState>,
     pub shutdown: CancellationToken,
+    pub node_manager: crate::node_manager_transport::NodeManagerConnector,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -527,7 +529,12 @@ async fn gc_tick(
                 // until the next sbx-mgr startup sweep, which now
                 // also goes through this RPC.
                 if let Some(staging) = staging_to_clean {
-                    delete_cache_artifact_via_node_mgr(&staging, &candidate.key).await;
+                    delete_cache_artifact_via_node_mgr(
+                        &staging,
+                        &candidate.key,
+                        &ownership.node_manager,
+                    )
+                    .await;
                 }
             }
             Ok((skip, _)) => {
@@ -558,28 +565,47 @@ async fn gc_tick(
     }
 
     if report.bytes_freed < need_to_free {
-        warn!(
-            disk_usage_fraction = disk.fraction(),
-            target_fraction = cfg.target_fraction,
-            need_to_free,
-            bytes_freed = report.bytes_freed,
-            raw_rows_examined,
-            "snapshot reaper: sampled page did not meet reclaim target; later ticks continue the bounded sweep",
-        );
+        // A zero target is always-on reclaim: it asks to free every idle
+        // artifact, so no page meets it and the shortfall is routine.
+        if cfg.target_fraction > 0.0 {
+            warn!(
+                disk_usage_fraction = disk.fraction(),
+                target_fraction = cfg.target_fraction,
+                need_to_free,
+                bytes_freed = report.bytes_freed,
+                raw_rows_examined,
+                "snapshot reaper: sampled page did not meet reclaim target; later ticks continue the bounded sweep",
+            );
+        } else {
+            debug!(
+                disk_usage_fraction = disk.fraction(),
+                need_to_free,
+                bytes_freed = report.bytes_freed,
+                raw_rows_examined,
+                "snapshot reaper: sampled page did not meet reclaim target; later ticks continue the bounded sweep",
+            );
+        }
     }
     Ok(report)
 }
 
-/// Root the reaper sweeps for `.gc-pending-*` orphans at startup.
-/// Production: `/space/cache`. Tests drive bounded discovery through a tempdir.
-const CACHE_ROOT_FOR_SWEEP: &str = "/space/cache";
+/// Root the reaper sweeps for `.gc-pending-*` orphans. Every staging
+/// directory it produces is a sibling of a sandbox's snapshot artifact, and
+/// node-mgr's `DeleteCacheArtifact` refuses any path outside this root, so the
+/// rest of `/space/cache` holds nothing it could reap. Walking it anyway read
+/// other services' private directories, such as node-mgr's root-only
+/// `.btrfs-send-staging`, and warned about each on every pass. Tests drive
+/// bounded discovery through a tempdir.
+const CACHE_ROOT_FOR_SWEEP: &str = pplx_space_common_core::host::linux::paths::SANDBOX_CACHE_DIR;
 
-/// Maximum directory-walk depth for the startup sweep. The on-disk
-/// shapes the reaper produces are at most a few levels deep
-/// (`/space/cache/<some>/<sandbox_id>/snapshot.gc-pending-<uuid>`),
-/// and a deep tree would slow startup; 6 levels is comfortably more
-/// than what the publisher path can produce.
-const SWEEP_MAX_DEPTH: usize = 6;
+/// Maximum directory-walk depth below [`CACHE_ROOT_FOR_SWEEP`]. Staging
+/// directories sit at `<sandbox_id>/snapshot.gc-pending-<id>` and
+/// `<sandbox_id>/{snapshots,template-snapshot-staging}/<name>.gc-pending-<id>`,
+/// the shapes node-mgr accepts. The walk reads no deeper, and inside a
+/// sandbox's directory it enters only those snapshot directories
+/// (`OrphanKind::descends_into`): the rest are artifact contents and the jail
+/// `instance`, which keep the sandbox's own owner and mode.
+const SWEEP_MAX_DEPTH: usize = 3;
 const FORK_COPY_ORPHAN_MIN_AGE_SECS: u64 = 60 * 60;
 
 /// Issue a `DeleteCacheArtifact` RPC against node-mgr. Best-effort;
@@ -587,8 +613,12 @@ const FORK_COPY_ORPHAN_MIN_AGE_SECS: u64 = 60 * 60;
 /// failure rather than abort, because the parent operation has
 /// already committed (the row is gone, or this was orphan cleanup
 /// to begin with).
-async fn delete_cache_artifact_via_node_mgr(staging_path: &str, candidate_label: &str) {
-    let mut client = match pplx_space_node_mgr_client::connect().await {
+async fn delete_cache_artifact_via_node_mgr(
+    staging_path: &str,
+    candidate_label: &str,
+    node_manager: &crate::node_manager_transport::NodeManagerConnector,
+) {
+    let mut client = match node_manager.connect().await {
         Ok(c) => c,
         Err(err) => {
             warn!(
@@ -702,7 +732,12 @@ async fn sweep_orphans(
         };
         // Await the admitted mutation; caller cancellation stops the next
         // admission instead of dropping this mutation and its reservation.
-        delete_cache_artifact_via_node_mgr(&path.to_string_lossy(), "orphan-sweep").await;
+        delete_cache_artifact_via_node_mgr(
+            &path.to_string_lossy(),
+            "orphan-sweep",
+            &ownership.node_manager,
+        )
+        .await;
     }
 }
 

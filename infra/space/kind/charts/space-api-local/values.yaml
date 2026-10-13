@@ -13,6 +13,40 @@ service:
   port: 8080
   type: ClusterIP
 
+# Load-balanced entry, as a deployment's load balancer gives the public API: a
+# NodePort Service carrying only the HTTP port, which kind-cluster.yaml.tmpl
+# maps to 127.0.0.1:8080 on the host, so clients reach every replica rather
+# than the one pod a `kubectl port-forward` pins. kube-proxy balances per
+# connection. In-cluster callers keep the ClusterIP Service above, which also
+# carries the ingress activation port.
+entry:
+  name: space-api-entry
+  nodePort: 30080
+
+# Replicas follow load, as production's do. Two at least, so every request
+# path runs against more than one replica; three at most, so the worst case
+# (3 x the 1-CPU / 512 MiB limits below) still fits the shared infra node of a
+# 16-core Kind CI runner alongside the data plane's three. CPU is judged
+# against the 50m request; memory by absolute use, since the 128 MiB request
+# is a scheduling floor an idle replica already approaches.
+autoscaling:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 3
+  targetCPUUtilizationPercentage: 80
+  targetMemoryAverageValue: 384Mi
+
+# The dedicated admin API (`--surface admin`) in its own Deployment, as a
+# deployment that separates the admin surface from the public one runs it.
+# The harness and the admin CLI keep using the shared surface's
+# /admin/api/v1 on localhost:8080; this process is reached in-cluster at the
+# space-admin-api Service (`kubectl port-forward svc/space-admin-api
+# 8081:8080` from the host). One replica: operator traffic only.
+admin:
+  enabled: true
+  replicas: 1
+  serviceName: space-admin-api
+
 internal:
   secretName: space-internal
   internalToken: "dev-internal-token"
@@ -36,13 +70,14 @@ spaceApiRouteToken:
 
 clusterId: "kind-local"
 
-# Migrator runs as an initContainer before the api-server starts. It reuses
-# the same image (the api bundle ships space-db-migrator + space-api-svc).
+# The migrator runs once, as the space-db-migrate Job (templates/migrate-job.yaml),
+# before the api-server starts. It reuses the same image (the api bundle ships
+# space-db-migrator + space-api-svc).
 migrate:
   enabled: true
 
 postgres:
-  # Dev-default managed-login passwords. bootstrap-roles (initContainer)
+  # Dev-default managed-login passwords. bootstrap-roles (the migrate Job)
   # provisions the roles with these; the services connect as space_user and
   # space_creds using the same values.
   managedUserPassword: space-dev-user
@@ -51,29 +86,22 @@ postgres:
   bootstrapReadOnlyPassword: space-dev-ro
   bootstrapMigratorPassword: space-dev-migrator
 
-# K8s control-plane substrate. Setting SPACE_K8S_CONTROL_PLANE=true switches
-# the api-server from DirectSubstrate to KubernetesSubstrate so it discovers
-# workers via the Pod reflector (watching pods with label
-# app.kubernetes.io/component=node-api) and so cluster-controller can run
-# alongside materializing per-sandbox pods.
-#
-# Enabled by default. The space-node-stack DaemonSet
-# carries the component=node-api label so the reflector finds each worker;
-# per-sandbox pods are pause containers hijacked by containerd-shim-space-v2
-# into real Firecracker sandboxes (install-shim.sh wires the shim into each
-# sandbox worker's containerd).
-#
-# DirectSubstrate (`enabled: false`) is the single-worker / no-cluster-controller
-# bench used by the space-local-3486 cluster + Tilt MINIMAL mode. In that
-# path the api-server dials the worker node-api directly via the
-# space-worker-node-api Service, placement flows through the Postgres node
-# tables (nodes/node_direct/node_status_snapshots/node_template_inventory),
-# and no per-sandbox pods are created.
+# K8s control-plane substrate. SPACE_K8S_CONTROL_PLANE=true runs the
+# api-server on the KubernetesSubstrate: it discovers nodes through the Pod
+# reflector (watching pods with label app.kubernetes.io/component=node-api, the
+# space-node-api-local DaemonSets), and cluster-controller materializes
+# per-sandbox pods, pause containers hijacked by containerd-shim-space-v2 into
+# real Firecracker sandboxes (install-shim.sh wires the shim into each sandbox
+# worker's containerd).
 k8s:
-  enabled: true
   # Namespace where per-sandbox pause pods are created and where the
-  # KubernetesSubstrate's pod reflector watches.
-  sandboxNamespace: space
+  # KubernetesSubstrate's pod reflector watches: their own, apart from the
+  # control plane, as a deployment that confines sandboxes with
+  # namespace-scoped policy runs them (manifests/namespace.yaml creates it;
+  # the space-sandbox-network-policy chart isolates it). The node-api pods
+  # the reflector discovers nodes from stay in the release namespace
+  # (SPACE_NODE_API_NAMESPACE in the Deployment).
+  sandboxNamespace: sandboxes
   # The shim never runs the pause container; it reads pod annotations
   # (space.pplx.net/sandbox-id, vcpu, memory, template, …) and calls
   # sandbox-manager to bring up the real sandbox. KinD's containerd pulls
@@ -131,6 +159,12 @@ eppo:
 
 serviceAccount:
   name: space-api
+
+# ServiceAccounts the ingress activation listener admits: internal-api, the
+# only route resolver that delegates cold wakes (RemoteIngressActivation).
+ingressActivation:
+  allowedServiceAccounts:
+    - space-internal-api
 
 resources:
   requests:

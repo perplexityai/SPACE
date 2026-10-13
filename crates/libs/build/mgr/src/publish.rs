@@ -133,6 +133,32 @@ pub enum PublishError {
     FindTemplateRelease(#[source] tonic::Status),
 }
 
+impl PublishError {
+    /// The bounded cause metrics report for a failed registration or
+    /// publish.
+    pub fn error_kind(&self) -> crate::TemplateBuildErrorKind {
+        match self {
+            Self::CompressedRootfsNotReady { .. } => crate::TemplateBuildErrorKind::Timeout,
+            Self::AuthorizeSystemBuild(_)
+            | Self::InvalidSystemGrant(_)
+            | Self::InvalidTemplateName(_)
+            | Self::InvalidContentHash(_)
+            | Self::ObjectStoreConfig(_)
+            | Self::MissingArtifact { .. }
+            | Self::ReadArtifact { .. }
+            | Self::InvalidArtifact { .. }
+            | Self::ManifestExecutionMetadata { .. }
+            | Self::MissingExecutionMetadata { .. }
+            | Self::CredentialExchange(_)
+            | Self::ObjectStore { .. }
+            | Self::ClusterApiConnect(_)
+            | Self::RegisterTemplate(_)
+            | Self::RegisterTemplateRelease(_)
+            | Self::FindTemplateRelease(_) => crate::TemplateBuildErrorKind::Publish,
+        }
+    }
+}
+
 /// Called by the direct operator CLI using its own ClusterApi credential,
 /// before submitting to build-manager. Only an unconfigured cluster is local-only;
 /// missing or insufficient operator authority fails before the build is queued.
@@ -346,6 +372,7 @@ async fn recorded_release_locations(
     template_org: Option<TemplateOrg>,
 ) -> Result<Option<Vec<String>>, PublishError> {
     let request = FindTemplateReleaseByHashRequest {
+        generic_only: false,
         template_name: template.as_str().to_string(),
         hash: content_hash.to_string(),
         caller_org_id: template_org.map(|org| org.org_id().as_uuid().to_string()),

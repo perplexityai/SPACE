@@ -221,7 +221,7 @@ impl SandboxController {
                     SandboxEventType::PortExposureOpenFailed,
                     SandboxEventSource::Api,
                 )
-                .emit_with(event_details().error(error.to_string()));
+                .emit_with(event_details().error(error.to_string()).logged_by_caller());
             }
             mapped
         })?;
@@ -876,7 +876,7 @@ impl SandboxController {
                     SandboxEventType::PortExposureCloseFailed,
                     SandboxEventSource::Api,
                 )
-                .emit_with(event_details().error(error.to_string()));
+                .emit_with(event_details().error(error.to_string()).logged_by_caller());
             }
             mapped
         })?;

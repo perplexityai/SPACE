@@ -36,17 +36,6 @@ impl SandboxState {
         )
     }
 
-    /// Whether a runtime adapter may atomically claim this exact lifecycle
-    /// transition. In-flight manager operations and cleanup states retain
-    /// ownership even when the caller still holds the current generation.
-    pub(crate) const fn accepts_execution_release_to(self, target: Self) -> bool {
-        matches!(
-            (self, target),
-            (Self::Started | Self::Paused, Self::Stopping)
-                | (Self::Started | Self::Paused | Self::Failed, Self::Deleting)
-        )
-    }
-
     pub fn can_transition_to(&self, target: SandboxState) -> bool {
         if target == SandboxState::Quarantined {
             return *self != SandboxState::Failed;

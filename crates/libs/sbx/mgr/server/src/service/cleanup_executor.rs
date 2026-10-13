@@ -15,6 +15,12 @@ type AttemptResult = Result<(), Status>;
 type CleanupResult = Result<CleanupOutcome, Status>;
 type CompletionWaiters = BTreeMap<JobId, (tokio::sync::watch::Sender<()>, usize)>;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum CleanupWait {
+    Attempt,
+    Stop,
+}
+
 impl CleanupOutcome {
     fn into_caller_result(self) -> AttemptResult {
         match self {
@@ -36,7 +42,7 @@ pub(super) struct CleanupExecutor {
     #[cfg(test)]
     waiter_read_barrier: Mutex<Option<Arc<TestAdmissionBarrier>>>,
     #[cfg(test)]
-    pub(super) run_dir: Mutex<Option<PathBuf>>,
+    pub(super) cache_dir: Mutex<Option<PathBuf>>,
     wake: tokio::sync::Notify,
     pub(super) active: dashmap::DashMap<String, bool>,
     waiters: Mutex<CompletionWaiters>,
@@ -61,7 +67,7 @@ impl Default for CleanupExecutor {
             #[cfg(test)]
             waiter_read_barrier: Mutex::new(None),
             #[cfg(test)]
-            run_dir: Mutex::new(None),
+            cache_dir: Mutex::new(None),
             wake: tokio::sync::Notify::new(),
             active: dashmap::DashMap::new(),
             waiters: Mutex::new(BTreeMap::new()),
@@ -168,6 +174,7 @@ impl SandboxManagerService {
         request: SynchronousCleanupRequest<'_>,
         admission: Option<CleanupAdmission>,
         cleanup_id: Option<SandboxCleanupEpisodeId>,
+        wait: CleanupWait,
     ) -> AttemptResult {
         let sandbox_id: SandboxId = request
             .sandbox_id
@@ -234,7 +241,13 @@ impl SandboxManagerService {
             return Ok(());
         };
         self.ensure_cleanup_executor();
-        self.wait_cleanup_job(job).await
+        match wait {
+            CleanupWait::Attempt => self.wait_cleanup_job(job).await,
+            CleanupWait::Stop => {
+                self.wait_stop_cleanup_job(job, Duration::from_secs(30))
+                    .await
+            }
+        }
     }
 
     pub(super) async fn cleanup_request_permit(
@@ -592,6 +605,24 @@ impl SandboxManagerService {
     }
 
     pub(super) async fn wait_cleanup_job(&self, id: JobId) -> AttemptResult {
+        self.wait_cleanup_job_with_policy(id, CleanupWait::Attempt)
+            .await
+    }
+
+    async fn wait_stop_cleanup_job(&self, id: JobId, budget: Duration) -> AttemptResult {
+        // Timeout drops only the subscriber. The persisted, execution-fenced
+        // job keeps its retry schedule and ownership until cleanup completes.
+        tokio::time::timeout(
+            budget,
+            self.wait_cleanup_job_with_policy(id, CleanupWait::Stop),
+        )
+        .await
+        .map_err(|_| {
+            Status::deadline_exceeded(format!("Stop is not confirmed; cleanup job {id} continues"))
+        })?
+    }
+
+    async fn wait_cleanup_job_with_policy(&self, id: JobId, wait: CleanupWait) -> AttemptResult {
         let _permit = tokio::select! {
             biased;
             _ = self.shutdown_token.cancelled() => return Err(Status::unavailable("cleanup waiter admission closed")),
@@ -654,15 +685,25 @@ impl SandboxManagerService {
                     return Err(Status::aborted("cleanup superseded"));
                 }
                 JobStatus::Pending | JobStatus::Running | JobStatus::Failed => {
-                    // Failure survives a retry claim so current subscribers do
-                    // not lose the attempted failure when the dispatcher wakes.
                     if let Some(error) = stored.error {
-                        return Err(match serde_json::from_str::<CleanupFailure>(&error) {
-                            Ok(failure) => {
-                                Status::new(tonic::Code::from_i32(failure.code), failure.message)
-                            }
-                            Err(_) => Status::unavailable(error),
-                        });
+                        let failure = match serde_json::from_str::<CleanupFailure>(&error) {
+                            Ok(failure) => failure,
+                            // Preserve legacy plain-string failures, including their
+                            // message. Unknown provenance cannot justify retrying.
+                            Err(_) => return Err(Status::unavailable(error)),
+                        };
+                        let error =
+                            Status::new(tonic::Code::from_i32(failure.code), failure.message);
+                        let retryable = matches!(
+                            error.code(),
+                            tonic::Code::Unavailable
+                                | tonic::Code::ResourceExhausted
+                                | tonic::Code::DeadlineExceeded
+                        );
+                        if wait == CleanupWait::Attempt || status == JobStatus::Failed || !retryable
+                        {
+                            return Err(error);
+                        }
                     }
                     if status == JobStatus::Failed {
                         return Err(Status::failed_precondition(

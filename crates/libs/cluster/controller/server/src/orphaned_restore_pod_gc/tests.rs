@@ -10,6 +10,7 @@ use pplx_space_common_core::types::{PodUid, PositiveDuration, SandboxId, Sandbox
 use uuid::Uuid;
 
 use super::*;
+use pplx_space_api::controllers::substrate::kubernetes::SandboxPodView;
 
 /// Every `restore_pod` fixture carries this execution generation; store states
 /// set `active_generation` relative to it to drive the supersession fence.
@@ -484,12 +485,12 @@ fn from_pod_rejects_non_positive_generation() {
         );
         pod
     };
-    let snap = RestorePodSnapshot::from_pod(&pod_with("3"));
+    let snap = RestorePodSnapshot::from_pod(&SandboxPodView::from(pod_with("3")));
     assert_eq!(snap.generation, Some(3));
     assert!(snap.is_restore);
     for bad in ["0", "-1", "x"] {
         assert_eq!(
-            RestorePodSnapshot::from_pod(&pod_with(bad)).generation,
+            RestorePodSnapshot::from_pod(&SandboxPodView::from(pod_with(bad))).generation,
             None,
             "{bad}"
         );

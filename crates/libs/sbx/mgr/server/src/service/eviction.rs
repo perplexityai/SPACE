@@ -626,7 +626,8 @@ impl SandboxManagerService {
                         pplx_space_events::SandboxEventDetails::default()
                             .reason(reason.as_str())
                             .with_from_state(state_before.as_str())
-                            .error(status.message().to_string()),
+                            .error(status.message().to_string())
+                            .logged_by_caller(),
                     );
                 }
             }

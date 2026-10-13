@@ -130,7 +130,8 @@ impl TemplateReleasesStore {
         Ok(TemplateReadScope::NodeScoped { node_ids })
     }
 
-    /// Unscoped lookups with no caller organization never touch `templates`:
+    /// Unscoped lookups with no caller organization or generic-only requirement
+    /// never touch `templates`:
     /// release resolution serves on-demand sandbox-create pulls and must keep
     /// working against a schema that predates `086_templates_visibility`
     /// (see `template_visibility_degrades_to_unspecified_without_column`).
@@ -141,7 +142,8 @@ impl TemplateReleasesStore {
     /// (`NULL` leaves the lookup unfiltered by organization) and `$5` the
     /// caller's node ids (`NULL` for an unscoped caller). A node-scoped caller
     /// passes both predicates, so asserting the owner's organization grants
-    /// nothing its placements do not already justify.
+    /// nothing its placements do not already justify. `$6` adds the prefetch
+    /// generic-only requirement in the same snapshot as the selected release.
     pub(super) async fn find_by_tag(
         &self,
         name: &str,
@@ -149,10 +151,12 @@ impl TemplateReleasesStore {
         tag: &str,
         caller_org: Option<OrgId>,
         scope: &TemplateReadScope,
+        generic_only: bool,
     ) -> Result<Vec<super::metadata::FindTemplateReleaseRow>, sqlx::Error> {
-        if caller_org.is_none() && scope.node_ids().is_none() {
+        if !generic_only && caller_org.is_none() && scope.node_ids().is_none() {
             return sqlx::query_as(sql!(
-                "SELECT r.id              AS release_id,
+                "SELECT FALSE AS generic_authorized,
+                    r.id              AS release_id,
                     r.template_name   AS release_template_name,
                     r.type            AS release_type,
                     r.hash            AS release_hash,
@@ -178,7 +182,8 @@ impl TemplateReleasesStore {
             .await;
         }
         sqlx::query_as(sql!(
-            "SELECT r.id              AS release_id,
+            "SELECT ($6 AND tpl.visibility = 'generic') AS generic_authorized,
+                    r.id              AS release_id,
                     r.template_name   AS release_template_name,
                     r.type            AS release_type,
                     r.hash            AS release_hash,
@@ -196,6 +201,7 @@ impl TemplateReleasesStore {
              WHERE t.template_name = $1
                AND t.tag = $2
                AND r.type = $3
+               AND (NOT $6 OR tpl.visibility = 'generic')
                AND ($4::UUID IS NULL OR (
                        tpl.desired_state = 'present'
                        AND (tpl.visibility = 'generic'
@@ -233,6 +239,7 @@ impl TemplateReleasesStore {
         .bind(runtime)
         .bind(caller_org.map(|org| org.as_uuid()))
         .bind(scope.node_ids())
+        .bind(generic_only)
         .fetch_all(&self.pool)
         .await
     }
@@ -246,10 +253,12 @@ impl TemplateReleasesStore {
         bare_hash: &str,
         caller_org: Option<OrgId>,
         scope: &TemplateReadScope,
+        generic_only: bool,
     ) -> Result<Vec<super::metadata::FindTemplateReleaseRow>, sqlx::Error> {
-        if caller_org.is_none() && scope.node_ids().is_none() {
+        if !generic_only && caller_org.is_none() && scope.node_ids().is_none() {
             return sqlx::query_as(sql!(
-                "SELECT r.id              AS release_id,
+                "SELECT FALSE AS generic_authorized,
+                    r.id              AS release_id,
                     r.template_name   AS release_template_name,
                     r.type            AS release_type,
                     r.hash            AS release_hash,
@@ -271,7 +280,8 @@ impl TemplateReleasesStore {
             .await;
         }
         sqlx::query_as(sql!(
-            "SELECT r.id              AS release_id,
+            "SELECT ($6 AND tpl.visibility = 'generic') AS generic_authorized,
+                    r.id              AS release_id,
                     r.template_name   AS release_template_name,
                     r.type            AS release_type,
                     r.hash            AS release_hash,
@@ -285,6 +295,7 @@ impl TemplateReleasesStore {
                ON s.template_release_id = r.id
              WHERE r.template_name = $1
                AND r.hash IN ($2, $3)
+               AND (NOT $6 OR tpl.visibility = 'generic')
                AND ($4::UUID IS NULL OR (
                        tpl.desired_state = 'present'
                        AND (tpl.visibility = 'generic'
@@ -322,6 +333,7 @@ impl TemplateReleasesStore {
         .bind(bare_hash)
         .bind(caller_org.map(|org| org.as_uuid()))
         .bind(scope.node_ids())
+        .bind(generic_only)
         .fetch_all(&self.pool)
         .await
     }

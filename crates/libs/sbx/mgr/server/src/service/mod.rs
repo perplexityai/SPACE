@@ -96,6 +96,7 @@ pub use self::restart_admission::{
     SandboxManagerRestartAdmissionLayer, handoff_cancellable_response_stream_name,
 };
 use self::start_support::ActivationAdmissionLimiter;
+use crate::node_manager_transport::NodeManagerConnector;
 use crate::node_state_sync::{mark_sandbox_dirty, mark_sandboxes_dirty, should_skip_node_publish};
 use crate::proto::sandbox_manager_server::SandboxManager;
 use crate::proto::{
@@ -118,10 +119,9 @@ use crate::proto::{
     MissingDiskUsageId as SbxMissingDiskUsageId,
     MissingDiskUsageReason as SbxMissingDiskUsageReason, NetworkPolicyDetail, PauseRequest,
     PauseResponse, PendingLocalBackup as ProtoPendingLocalBackup, PrepareTeardownSuspendRequest,
-    PrepareTeardownSuspendResponse, ReleaseExecutionDisposition, ReleaseExecutionIntent,
-    ReleaseExecutionRequest, ReleaseExecutionResponse, ResolveSandboxMemoryRequest,
-    ResolveSandboxMemoryResponse, ResumeRequest, ResumeResponse, RollbackRequest, RollbackResponse,
-    SandboxInfo, SandboxListElement, SetAutoLifecyclePolicyRequest, SetAutoLifecyclePolicyResponse,
+    PrepareTeardownSuspendResponse, ResolveSandboxMemoryRequest, ResolveSandboxMemoryResponse,
+    ResumeRequest, ResumeResponse, RollbackRequest, RollbackResponse, SandboxInfo,
+    SandboxListElement, SetAutoLifecyclePolicyRequest, SetAutoLifecyclePolicyResponse,
     SetNetworkPolicyRequest, SetNetworkPolicyResponse, SnapshotDetail,
     SpacedCloseLoopbackBridgeRequest, SpacedCloseLoopbackBridgeResponse, SpacedCloseStdinRequest,
     SpacedCloseStdinResponse, SpacedConnectProcessRequest, SpacedCreateWatcherRequest,
@@ -265,10 +265,6 @@ const ALLOW_SANDBOX_OPERATOR_OR_TMPLMGR: &[UdsPeerPrincipal] = &[
     UdsPeerPrincipal::Service(user_names::SPACE_TMPLMGR),
     UdsPeerPrincipal::Service(user_names::SPACE_SBXMGR),
 ];
-// Runtime adapters execute as host root. Keep execution release narrower than
-// the ordinary operator API because possession of a generation authorizes
-// destructive cleanup of that exact local runtime.
-const ALLOW_SANDBOX_EXECUTION_RELEASE: &[UdsPeerPrincipal] = &[UdsPeerPrincipal::Root];
 const ALLOW_AUTO_LIFECYCLE_DELETE_RECEIPTS: &[UdsPeerPrincipal] = &[
     UdsPeerPrincipal::Root,
     UdsPeerPrincipal::Service(user_names::SPACE_NODECTL),
@@ -315,6 +311,7 @@ type SbxExportSandboxStream =
 type TeardownSuspendDrivers = Arc<dashmap::DashMap<SandboxId, tokio::sync::OwnedSemaphorePermit>>;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TeardownSuspendDriverAdmission {
+    Deferred,
     Started,
     Existing,
     Saturated,
@@ -323,6 +320,7 @@ enum TeardownSuspendDriverAdmission {
 impl TeardownSuspendDriverAdmission {
     const fn as_str(self) -> &'static str {
         match self {
+            Self::Deferred => "deferred",
             Self::Started => "started",
             Self::Existing => "existing",
             Self::Saturated => "saturated",
@@ -404,6 +402,11 @@ pub struct SandboxManagerService {
     credential_manager_client:
         Arc<tokio::sync::OnceCell<pplx_space_credmgr_client::CredentialManagerGrpcClient>>,
     network_credentials_enabled: bool,
+    node_manager: NodeManagerConnector,
+    template_resolver: Arc<dyn crate::template_resolver::TemplateResolver>,
+    /// See [`SandboxManagerServiceOptions::cleanup_run_dir`].
+    #[cfg(test)]
+    cleanup_run_dir: Option<PathBuf>,
     gateway_caller_client: pplx_space_node_mgr_client::NodeManagerGrpcClient,
     gateway_authority: gateway_authority::GatewayAuthority,
     /// S3 upload config for suspend snapshots. `None` means uploads are disabled.
@@ -419,6 +422,9 @@ pub struct SandboxManagerService {
     /// reattach path without a real `fc.pid` symlink on disk. Production uses
     /// [`is_sandbox_running`].
     sandbox_runtime_live: Arc<dyn Fn(&str) -> bool + Send + Sync>,
+    /// Node-manager's answers about retained btrfs send sources. Injected so
+    /// tests can drive recovery without a btrfs node-manager.
+    retained_source_inspector: Arc<dyn crate::retained_source::RetainedSourceInspector>,
     drain_state: Arc<DrainState>,
     /// Eppo client for capability rollout. Disabled (every flag
     /// resolves to its default) when `EPPO_SDK_KEY` is unset.
@@ -970,6 +976,14 @@ pub struct SandboxManagerServiceOptions {
     pub route_ed25519_verification_bundle: Option<
         Arc<pplx_space_common_svc::space_api_route_ed25519::SpaceApiRouteEd25519VerificationBundle>,
     >,
+    /// Every node-manager client the service and its subsystems use.
+    pub node_manager: NodeManagerConnector,
+    /// Every template-manager `GetTemplate` the service and its subsystems ask.
+    pub template_resolver: Arc<dyn crate::template_resolver::TemplateResolver>,
+    /// Run directory whose `fc.pid` links stop and delete target selection
+    /// reads in test builds. `None` reads the fixed sandbox run directory.
+    #[cfg(test)]
+    pub(crate) cleanup_run_dir: Option<PathBuf>,
 }
 
 impl Default for SandboxManagerServiceOptions {
@@ -988,6 +1002,10 @@ impl Default for SandboxManagerServiceOptions {
             node_role: None,
             node_managed_by: None,
             route_ed25519_verification_bundle: None,
+            node_manager: NodeManagerConnector::host(),
+            template_resolver: Arc::new(crate::template_resolver::HostTemplateManager),
+            #[cfg(test)]
+            cleanup_run_dir: None,
         }
     }
 }
@@ -1101,6 +1119,15 @@ impl SandboxManagerService {
                 false
             }
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_retained_source_inspector(
+        mut self,
+        inspector: Arc<dyn crate::retained_source::RetainedSourceInspector>,
+    ) -> Self {
+        self.retained_source_inspector = inspector;
+        self
     }
 
     #[cfg(test)]
@@ -1560,10 +1587,6 @@ impl SandboxManagerService {
         Ok(value)
     }
 
-    pub fn new(conn: rusqlite::Connection) -> Self {
-        Self::new_with_options(conn, SandboxManagerServiceOptions::default())
-    }
-
     pub fn new_with_options(
         conn: rusqlite::Connection,
         options: SandboxManagerServiceOptions,
@@ -1612,6 +1635,7 @@ impl SandboxManagerService {
             db: db.clone(),
             auto_lifecycle: auto_lifecycle.clone(),
             health_lifecycle: health_lifecycle.clone(),
+            node_manager: options.node_manager.clone(),
         });
         let snapshot_scheduler = Arc::new(
             crate::snapshot_scheduler::SnapshotScheduler::new_with_ownership(
@@ -1631,12 +1655,16 @@ impl SandboxManagerService {
             options.shutdown_token.clone(),
             Arc::clone(&drain_state),
             &options.task_tracker,
+            options.node_manager.clone(),
         ));
         if let Some(generation) = expected_route_verification_key_generation {
             watchdog.set_expected_route_verification_key_generation(generation);
         }
-        let snapshot_upload_worker =
-            crate::snapshot_upload_jobs::build_worker(Arc::clone(&db), Arc::clone(&drain_state));
+        let snapshot_upload_worker = crate::snapshot_upload_jobs::build_worker(
+            Arc::clone(&db),
+            Arc::clone(&drain_state),
+            options.node_manager.clone(),
+        );
         let local_artifacts = crate::local_artifacts::LocalArtifacts::new(Arc::clone(&db));
         let teardown_suspend_driver_concurrency = TEARDOWN_SUSPEND_DRIVER_CONCURRENCY;
         pplx_space_metrics::sandbox::worker::teardown_suspend_driver_capacity(
@@ -1659,6 +1687,7 @@ impl SandboxManagerService {
             template_network_policies: TemplateNetworkPolicyCache::new(
                 options.shutdown_token.clone(),
                 options.task_tracker.clone(),
+                Arc::clone(&options.template_resolver),
             ),
             network_policy_reconcile_queue,
             network_policy_reconciler_started: Arc::new(AtomicBool::new(false)),
@@ -1706,7 +1735,7 @@ impl SandboxManagerService {
                     .as_deref(),
                 false,
             ),
-            gateway_caller_client: pplx_space_node_mgr_client::lazy(),
+            gateway_caller_client: options.node_manager.lazy(),
             gateway_authority,
             snapshot_upload_config: {
                 let cfg = crate::snapshot_upload::SnapshotUploadConfig::from_env();
@@ -1720,6 +1749,13 @@ impl SandboxManagerService {
             },
             snapshot_upload_worker,
             sandbox_runtime_live: options.sandbox_runtime_live,
+            retained_source_inspector: Arc::new(
+                crate::retained_source::NodeManagerSourceInspector(options.node_manager.clone()),
+            ),
+            node_manager: options.node_manager,
+            template_resolver: options.template_resolver,
+            #[cfg(test)]
+            cleanup_run_dir: options.cleanup_run_dir,
             drain_state,
             feature_flags,
             route_ed25519_verification_bundle: Arc::new(ArcSwapOption::from(
@@ -1799,6 +1835,7 @@ impl SandboxManagerService {
             coordinator: self.auto_lifecycle.clone(),
             drain: Arc::clone(&self.drain_state),
             shutdown: shutdown_token,
+            node_manager: self.node_manager.clone(),
         };
         task_tracker.spawn(async move {
             crate::snapshot_gc::run_loop(
@@ -1947,6 +1984,8 @@ mod ingress_protection;
 mod reconcile;
 mod recovery;
 mod recovery_cross_node;
+#[cfg(test)]
+mod route_identity_tests;
 mod spaced_bridge;
 mod spaced_bridge_policy;
 mod start;
@@ -1955,6 +1994,8 @@ mod startup_resident;
 mod storage;
 mod tail_support;
 mod template_snapshot_support;
+#[cfg(test)]
+pub(crate) mod test_options;
 #[cfg(test)]
 pub(crate) mod tests;
 mod validation;

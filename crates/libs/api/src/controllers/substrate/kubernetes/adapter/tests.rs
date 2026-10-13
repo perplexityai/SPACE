@@ -41,7 +41,7 @@ async fn poll_suspend_responses(
     responses: Vec<Result<PrepareTeardownSuspendResponse, tonic::Status>>,
     budget: Duration,
 ) -> (
-    Result<PublishedLocalArtifact, SubstrateError>,
+    Result<super::suspend::GenerationSuspendOutcome, SubstrateError>,
     Vec<BTreeMap<String, String>>,
 ) {
     let sandbox_id = SandboxId::new();
@@ -66,6 +66,7 @@ async fn poll_suspend_responses(
         generation,
         "http://node-api",
         Instant::now() + budget,
+        budget,
     )
     .await;
     let summaries: Vec<_> = capture
@@ -181,6 +182,75 @@ async fn generation_suspend_bounds_retained_reason_on_a_utf8_boundary() {
     assert!(!result.unwrap_err().to_string().contains('界'));
 }
 
+// The budget-derived timeout messages print the budget with `Duration`'s
+// `Debug`. For each production default that is byte-identical to the earlier
+// `{}s` of `as_secs()`; a test's sub-second budget no longer reads `0s`.
+#[test]
+fn create_ready_timeout_message_names_the_budget() {
+    let default = SubstrateBudgets::DEFAULT.create_ready;
+    for (budget, expected) in [
+        (
+            default,
+            format!(
+                "sandbox create did not reach readiness within {}s",
+                default.as_secs()
+            ),
+        ),
+        (
+            Duration::from_millis(500),
+            "sandbox create did not reach readiness within 500ms".to_string(),
+        ),
+    ] {
+        match create_ready_timeout_error(budget) {
+            SubstrateError::Timeout {
+                message,
+                phase: None,
+            } => assert_eq!(message, expected),
+            other => panic!("unexpected create timeout error {other:?}"),
+        }
+    }
+    assert_eq!(
+        format!("{default:?}"),
+        "135s",
+        "the production create budget's rendering"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn generation_suspend_timeout_message_names_the_budget() {
+    let default = SubstrateBudgets::DEFAULT.suspend_durability;
+    let sandbox_id = SandboxId::new();
+    let prefix = format!(
+        "generation-bound suspend for sandbox {sandbox_id} generation 1 did not become durable within"
+    );
+    for (budget, expected) in [
+        (default, format!("{prefix} {}s", default.as_secs())),
+        (Duration::from_millis(600), format!("{prefix} 600ms")),
+    ] {
+        let result = poll_generation_suspend(
+            |_request| std::future::pending(),
+            sandbox_id,
+            ExecutionGeneration::new(1).unwrap(),
+            "http://node-api",
+            Instant::now() + budget,
+            budget,
+        )
+        .await;
+        match result {
+            Err(SubstrateError::Timeout {
+                message,
+                phase: None,
+            }) => assert_eq!(message, expected),
+            other => panic!("unexpected suspend timeout result {other:?}"),
+        }
+    }
+    assert_eq!(
+        format!("{default:?}"),
+        "300s",
+        "the production suspend budget's rendering"
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn generation_suspend_polling_preserves_success_and_terminal_failure() {
     let artifact_id = LocalArtifactId::new();
@@ -203,7 +273,33 @@ async fn generation_suspend_polling_preserves_success_and_terminal_failure() {
         Duration::from_secs(2),
     )
     .await;
-    assert_eq!(result.unwrap().id, artifact_id);
+    assert_eq!(
+        result.unwrap(),
+        super::suspend::GenerationSuspendOutcome::Durable(PublishedLocalArtifact {
+            id: artifact_id,
+            kind: ArtifactKind::Full,
+        })
+    );
+    assert!(summaries.is_empty());
+
+    // A generation-fenced node delete is an outcome for the caller to resolve
+    // against the control plane's snapshot record, not a poll failure.
+    let (result, summaries) = poll_suspend_responses(
+        vec![
+            pending_suspend(Some(PENDING_REASON)),
+            Ok(PrepareTeardownSuspendResponse {
+                outcome: TeardownSuspendOutcome::Deleted as i32,
+                reason: None,
+                published_artifact: None,
+            }),
+        ],
+        Duration::from_secs(2),
+    )
+    .await;
+    assert_eq!(
+        result.unwrap(),
+        super::suspend::GenerationSuspendOutcome::NodeDeleted
+    );
     assert!(summaries.is_empty());
 
     let mut terminal_responses = vec![
@@ -213,7 +309,6 @@ async fn generation_suspend_polling_preserves_success_and_terminal_failure() {
     terminal_responses.extend(
         [
             TeardownSuspendOutcome::Superseded,
-            TeardownSuspendOutcome::Deleted,
             TeardownSuspendOutcome::Unspecified,
             TeardownSuspendOutcome::Durable, // Missing artifact must still fail.
         ]
@@ -235,7 +330,7 @@ async fn generation_suspend_polling_preserves_success_and_terminal_failure() {
             Duration::from_secs(2),
         )
         .await;
-        if index < 4 {
+        if index < 3 {
             assert!(matches!(result, Err(SubstrateError::Unavailable { .. })));
         } else {
             assert!(matches!(result, Err(SubstrateError::Failed { .. })));
@@ -280,6 +375,7 @@ async fn generation_suspend_reason_change_logs_are_rate_limited_and_capped() {
             ExecutionGeneration::new(1).unwrap(),
             "http://node-api",
             Instant::now() + Duration::from_secs(120),
+            Duration::from_secs(120),
         )
         .await;
         assert!(matches!(result, Err(SubstrateError::Timeout { .. })));

@@ -21,7 +21,10 @@ fn step_descriptions_do_not_disclose_recipe_inputs() {
         ),
         (
             Step::Env {
-                vars: [(secret.into(), secret.into())].into(),
+                vars: pplx_space_common_core::types::EnvMap::try_from(
+                    std::collections::BTreeMap::from([(secret.into(), secret.into())]),
+                )
+                .unwrap(),
             },
             "env (1 vars)",
         ),
@@ -52,7 +55,7 @@ fn step_descriptions_do_not_disclose_recipe_inputs() {
         assert_eq!(step.to_string(), expected);
         let named = super::NamedStep {
             display_name: Some(secret.into()),
-            env_refs: vec![secret.into()],
+            env_refs: vec![pplx_space_common_core::types::EnvKey::parse(secret).unwrap()],
             step,
         };
         assert_eq!(named.to_string(), expected);
@@ -991,7 +994,10 @@ fn package_install_uses_single_structural_step() {
             extra_args
         } if packages == &["foo"] && extra_args == &["--extra-index-url"]
     ));
-    assert_eq!(recipe.steps[0].env_refs, vec!["TOKEN".to_string()]);
+    assert_eq!(
+        recipe.steps[0].env_refs,
+        vec![pplx_space_common_core::types::EnvKey::parse("TOKEN").unwrap()]
+    );
 }
 
 #[test]
@@ -1208,4 +1214,37 @@ fn balloon_round_trips_from_toml_through_the_wire() {
         Recipe::try_from(proto),
         Err(RecipeProtoError::BalloonStatsIntervalOutOfRange { value: 65_536 })
     ));
+}
+
+#[test]
+fn proto_steps_validate_environment_names_before_execution() {
+    use super::ProtoStepExt;
+
+    for step in [
+        recipe::Step {
+            env_refs: vec!["TOKEN; echo injected".into()],
+            body: Some(recipe::step::Body::Run(recipe::Run {
+                command: "true".into(),
+                user: None,
+            })),
+            ..Default::default()
+        },
+        recipe::Step {
+            body: Some(recipe::step::Body::Env(recipe::Env {
+                vars: [("TOKEN'".into(), "secret-value".into())].into(),
+            })),
+            ..Default::default()
+        },
+    ] {
+        let result = step.try_into_named_step(1);
+
+        let error = result.unwrap_err();
+        assert!(matches!(
+            error,
+            RecipeProtoError::Environment { index: 1, .. }
+        ));
+        assert!(error.to_string().contains("recipe step 1 env"));
+        assert!(!format!("{error:?}").contains("secret-value"));
+        assert!(!format!("{error:?}").contains("TOKEN"));
+    }
 }

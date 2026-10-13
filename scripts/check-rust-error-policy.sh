@@ -39,10 +39,10 @@ report_matches \
 report_matches \
     'derive thiserror::Error instead of implementing std::error::Error manually' \
     'impl[[:space:]]+(std::error::Error|Error)[[:space:]]+for[[:space:]]' \
-    crates/apps crates/libs
+    crates/apps crates/libs crates/tools
 
 derive_without_debug="$(
-    production_rust_files crates/apps crates/libs \
+    production_rust_files crates/apps crates/libs crates/tools \
         | xargs -0 grep -nE '#\[derive\([^]]*(thiserror::Error|Error)' \
         | grep -v 'Debug' \
         || true

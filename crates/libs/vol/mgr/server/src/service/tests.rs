@@ -106,6 +106,83 @@ async fn test_service(temp: &tempfile::TempDir) -> VolumeManagerService {
     .expect("create volume-manager service")
 }
 
+#[tokio::test]
+async fn btrfs_resubmission_reuses_live_or_completed_jobs_but_restages_terminal_failures() {
+    use pplx_space_common_jobs::{JobStatus, db as jobs};
+
+    for status in [
+        JobStatus::Pending,
+        JobStatus::Running,
+        JobStatus::Cancelling,
+        JobStatus::Completed,
+        JobStatus::Failed,
+        JobStatus::Cancelled,
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let service = test_service(&temp).await;
+        let request = crate::proto::PushBtrfsSendRequest {
+            sandbox_id: uuid::Uuid::now_v7().to_string(),
+            source_id: uuid::Uuid::now_v7().to_string(),
+            artifact_dir: temp.path().join("artifact").to_string_lossy().into_owned(),
+            s3_uri: "s3://bucket/snapshot/rootfs.btrfs-send".into(),
+        };
+        let mut staged = Vec::new();
+        // Exercise real submission and SQLite ownership, replacing only the
+        // privileged COW operation. The worker is not polled between these
+        // ready submissions and the explicit durable state transitions.
+        let mut stage =
+            |request: pplx_space_node_mgr_client::proto::BtrfsStageSendSourceRequest| {
+                staged.push(request.lease_id.parse::<uuid::Uuid>().unwrap());
+                std::future::ready(Ok(()))
+            };
+        let first = service
+            .submit_btrfs_push_with_stager(request.clone(), &mut stage)
+            .await
+            .unwrap();
+        let first_id: JobId = first.job_id.parse().unwrap();
+        let should_reuse = {
+            let conn = service.lock_db().unwrap();
+            match status {
+                JobStatus::Pending => true,
+                JobStatus::Running => {
+                    assert!(jobs::mark_job_running(&conn, &first_id).unwrap());
+                    true
+                }
+                JobStatus::Cancelling | JobStatus::Cancelled => {
+                    jobs::request_job_cancellation(&conn, &first_id).unwrap();
+                    if status == JobStatus::Cancelled {
+                        assert!(jobs::mark_job_cancelled(&conn, &first_id).unwrap());
+                    }
+                    status == JobStatus::Cancelling
+                }
+                JobStatus::Completed => {
+                    assert!(jobs::mark_job_running(&conn, &first_id).unwrap());
+                    assert!(jobs::complete_job(&conn, &first_id, 42).unwrap());
+                    true
+                }
+                JobStatus::Failed => {
+                    jobs::fail_job_permanent(&conn, &first_id, "upload failed", None).unwrap();
+                    false
+                }
+            }
+        };
+        let retry = service
+            .submit_btrfs_push_with_stager(request, &mut stage)
+            .await
+            .unwrap();
+        assert_eq!(first.job_id == retry.job_id, should_reuse, "{status:?}");
+        assert_eq!(staged.len(), if should_reuse { 1 } else { 2 }, "{status:?}");
+        let retry_id: JobId = retry.job_id.parse().unwrap();
+        let job = service.worker.get_job(&retry_id).unwrap().unwrap();
+        let payload: crate::btrfs_push::Payload = serde_json::from_str(&job.payload).unwrap();
+        assert_eq!(payload.send_lease, *staged.last().unwrap());
+        if !should_reuse {
+            assert_ne!(staged[0], staged[1]);
+            assert_eq!(job.status, "pending");
+        }
+    }
+}
+
 fn plaintext_pull_artifact_request(subject_id: &str, artifact_id: &str) -> PullFilesAsyncRequest {
     PullFilesAsyncRequest {
         subject_id: subject_id.to_string(),

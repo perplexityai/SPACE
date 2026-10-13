@@ -39,8 +39,11 @@ use super::{
 };
 
 const KERNEL_IMAGE: &str = "vmlinux.bin";
-const DEFAULT_MARKER: &str = "default";
-const LEGACY_DEFAULT_MARKER: &str = "legacy-default";
+/// The alias in a release or kernel root that names its default: what new
+/// cold boots use.
+pub const DEFAULT_MARKER: &str = "default";
+/// The alias in a kernel root that names the kernel legacy launches use.
+pub const LEGACY_DEFAULT_MARKER: &str = "legacy-default";
 const HASH_CHUNK_BYTES: usize = 1024 * 1024;
 const ELF_HEADER_PROBE_BYTES: usize = 64;
 const ELF_MACHINE_X86_64: u16 = 62;
@@ -62,6 +65,9 @@ pub struct ScanRoots {
     /// The runtime manager's own kernel install root, in the same layout.
     /// Scanned beside `vendor_kernels`, once when both name one directory.
     pub managed_kernels: Option<PathBuf>,
+    /// The runtime manager's own release install root. Scanned beside
+    /// `runtime_releases`, once when it is the same directory as one of them.
+    pub managed_releases: Option<RuntimeInstallationRoot>,
     /// Versioned cache kernels the execution inventory resolves boots from.
     pub cache_kernels: PathBuf,
     /// Legacy flat cache layout, `default/kernel/vmlinux.bin`.
@@ -79,6 +85,7 @@ impl Default for ScanRoots {
             )],
             vendor_kernels: paths::FIRECRACKER_KERNEL_VENDOR_DIR.into(),
             managed_kernels: None,
+            managed_releases: None,
             cache_kernels: paths::FIRECRACKER_KERNEL_ASSET_DIR.into(),
             cache_legacy_assets: paths::FIRECRACKER_ASSET_DIR.into(),
             runtime_aliases: vec![paths::FIRECRACKER_BIN.into(), paths::JAILER_BIN.into()],
@@ -355,8 +362,8 @@ pub struct ScannedArtifact {
     pub architecture: Option<Arch>,
     /// From the known-release map; `None` when the release is not in it.
     pub state_format: Option<StateFormatIdentity>,
-    /// SHA-256 of the kernel image. Runtimes are identified by version and
-    /// are not hashed.
+    /// SHA-256 of the kernel image, or the aggregate release digest of a managed
+    /// runtime's named binaries. Execution-root runtimes are not hashed.
     pub digest: Option<Digest>,
     /// For a kernel, the runtime it ships with or was published for. `None`
     /// when nothing on disk ties it to one.
@@ -514,12 +521,12 @@ impl FileFingerprint {
     }
 }
 
-/// Kernel digests and releases from earlier scans, so a repeated listing
-/// does not re-read unchanged images. Each kernel scan keeps only the images it saw, so the
-/// cache is bounded by the scan's own entry limits.
+/// Managed binary and kernel digests from earlier scans, so a repeated listing
+/// does not re-read unchanged files. Each kind retains only files seen in its
+/// last scan, bounded by the scan's entry limits.
 #[derive(Debug, Default)]
 pub struct DigestCache {
-    entries: HashMap<PathBuf, (FileFingerprint, ImageMeasure)>,
+    entries: HashMap<(ArtifactKind, PathBuf), (FileFingerprint, ImageMeasure)>,
 }
 
 /// What one read of a kernel image yields.
@@ -550,6 +557,34 @@ fn vendor_kernel_roots(roots: &ScanRoots) -> Vec<&Path> {
     if !duplicate {
         found.push(&roots.vendor_kernels);
     }
+    found
+}
+
+/// The release roots to scan: the configured ones, then the runtime manager's
+/// own. A configured root that is the same directory as the runtime
+/// manager's is scanned once, under the runtime manager's path, which its
+/// install records name, as the kernel roots are.
+fn release_roots(roots: &ScanRoots) -> Vec<&RuntimeInstallationRoot> {
+    let Some(managed) = &roots.managed_releases else {
+        return roots.runtime_releases.iter().collect();
+    };
+    let mut replaced = false;
+    let mut found: Vec<&RuntimeInstallationRoot> = roots
+        .runtime_releases
+        .iter()
+        .map(|root| {
+            if root.kind == managed.kind && same_directory(&root.path, &managed.path) {
+                replaced = true;
+                managed
+            } else {
+                root
+            }
+        })
+        .collect();
+    if !replaced {
+        found.push(managed);
+    }
+    found.dedup_by(|left, right| std::ptr::eq(*left, *right));
     found
 }
 
@@ -584,7 +619,7 @@ pub fn scan(
     };
 
     if kinds.runtimes {
-        for root in &roots.runtime_releases {
+        for root in release_roots(roots) {
             scanner.observe_alias(&root.path.join(DEFAULT_MARKER));
         }
         for alias in &roots.runtime_aliases {
@@ -602,8 +637,15 @@ pub fn scan(
     }
 
     if kinds.runtimes || kinds.kernels {
-        for root in &roots.runtime_releases {
-            scanner.scan_runtime_releases(root, kinds);
+        for root in release_roots(roots) {
+            scanner.scan_runtime_releases(
+                root,
+                kinds,
+                roots
+                    .managed_releases
+                    .as_ref()
+                    .is_some_and(|managed| managed == root),
+            );
         }
     }
     if kinds.kernels {
@@ -614,11 +656,14 @@ pub fn scan(
         scanner.scan_legacy_assets(&roots.cache_legacy_assets);
     }
 
-    cache.entries = if kinds.kernels {
-        scanner.seen
-    } else {
-        scanner.previous
-    };
+    // A filtered scan evicts only its own kind; the untouched partition is
+    // still bounded by the last scan that visited it.
+    scanner.previous.retain(|(kind, _), _| match kind {
+        ArtifactKind::Runtime(_) => !kinds.runtimes,
+        ArtifactKind::Component(_) => !kinds.kernels,
+    });
+    scanner.previous.extend(scanner.seen);
+    cache.entries = scanner.previous;
     scanner.scan
 }
 
@@ -627,8 +672,8 @@ struct Scanner<'a> {
     clock: &'a dyn ScanClock,
     deadline: Instant,
     deadline_reported: bool,
-    previous: HashMap<PathBuf, (FileFingerprint, ImageMeasure)>,
-    seen: HashMap<PathBuf, (FileFingerprint, ImageMeasure)>,
+    previous: HashMap<(ArtifactKind, PathBuf), (FileFingerprint, ImageMeasure)>,
+    seen: HashMap<(ArtifactKind, PathBuf), (FileFingerprint, ImageMeasure)>,
     scan: ArtifactScan,
 }
 
@@ -761,7 +806,12 @@ impl Scanner<'_> {
         });
     }
 
-    fn scan_runtime_releases(&mut self, releases: &RuntimeInstallationRoot, kinds: ArtifactKinds) {
+    fn scan_runtime_releases(
+        &mut self,
+        releases: &RuntimeInstallationRoot,
+        kinds: ArtifactKinds,
+        managed: bool,
+    ) {
         let runtime = releases.kind;
         let origin = ArtifactOrigin::runtime_release(runtime);
         let Some(names) = self.list_root(origin, &releases.path) else {
@@ -794,7 +844,40 @@ impl Scanner<'_> {
                 }
             }
             if kinds.runtimes {
-                let artifact = inspect_runtime_release(runtime, display_name.clone(), path.clone());
+                let mut artifact =
+                    inspect_runtime_release(runtime, display_name.clone(), path.clone());
+                // Uninstall identifies installed bytes, even if their catalog
+                // pin has since been removed. Execution roots stay probe-only.
+                if managed
+                    && matches!(
+                        artifact.status,
+                        ArtifactStatus::Valid | ArtifactStatus::Unsupported
+                    )
+                    && let Some(layout) = ReleaseLayout::of(runtime)
+                {
+                    let mut binaries = Vec::new();
+                    for binary in layout.binaries {
+                        let image = path.join(binary);
+                        let measured = match open_nonblocking(&image)
+                            .and_then(|file| file.metadata().map(|metadata| (file, metadata)))
+                        {
+                            Ok((mut file, metadata)) if metadata.is_file() => {
+                                self.digest(origin.kind, &image, &mut file, &metadata)
+                            }
+                            Ok(_) => DigestOutcome::Unreadable(std::io::Error::other(
+                                "not a regular file",
+                            )),
+                            Err(error) => DigestOutcome::Unreadable(error),
+                        };
+                        let Some(measure) = self.measured(measured, &image, &mut artifact) else {
+                            break;
+                        };
+                        binaries.push((*binary, measure.digest));
+                    }
+                    if binaries.len() == layout.binaries.len() {
+                        artifact.digest = Some(crate::catalog::release_digest(binaries));
+                    }
+                }
                 self.scan.artifacts.push(artifact);
             }
             if kinds.kernels {
@@ -1001,42 +1084,14 @@ impl Scanner<'_> {
             }
         }
 
-        match self.digest(&image, &mut file, &metadata) {
-            DigestOutcome::Measured(measure) => {
-                artifact.digest = Some(measure.digest);
-                if version.is_none()
-                    && let Some(release) = measure.release
-                {
-                    artifact.version = Some(ScannedVersion::Component(release));
-                    artifact.version_source = Some(VersionSource::ImageBanner);
-                }
-            }
-            DigestOutcome::TooLarge(len) => {
-                let detail = format!(
-                    "image of at least {len} bytes exceeds the {}-byte digest limit; digest not computed",
-                    self.limits.max_digest_bytes
-                );
-                self.scan.issues.push(ScanIssue {
-                    kind: ScanIssueKind::DigestLimit,
-                    path: image.clone(),
-                    detail: detail.clone(),
-                });
-                artifact.detail = Some(detail);
-            }
-            DigestOutcome::Changed => {
-                artifact.detail = Some(
-                    "image changed while it was being hashed; digest not computed".to_string(),
-                );
-            }
-            DigestOutcome::DeadlineExpired => {
-                artifact.detail =
-                    Some("scan deadline expired before the digest completed".to_string());
-            }
-            DigestOutcome::Unreadable(error) => {
-                artifact.status = ArtifactStatus::Unreadable;
-                artifact.detail = Some(format!("read {KERNEL_IMAGE}: {error}"));
-                self.scan.artifacts.push(artifact);
-                return;
+        let measured = self.digest(origin.kind, &image, &mut file, &metadata);
+        if let Some(measure) = self.measured(measured, &image, &mut artifact) {
+            artifact.digest = Some(measure.digest);
+            if version.is_none()
+                && let Some(release) = measure.release
+            {
+                artifact.version = Some(ScannedVersion::Component(release));
+                artifact.version_source = Some(VersionSource::ImageBanner);
             }
         }
 
@@ -1053,19 +1108,57 @@ impl Scanner<'_> {
         self.scan.artifacts.push(artifact);
     }
 
+    fn measured(
+        &mut self,
+        outcome: DigestOutcome,
+        image: &Path,
+        artifact: &mut ScannedArtifact,
+    ) -> Option<ImageMeasure> {
+        match outcome {
+            DigestOutcome::Measured(measure) => return Some(measure),
+            DigestOutcome::TooLarge(len) => {
+                let detail = format!(
+                    "image of at least {len} bytes exceeds the {}-byte digest limit; digest not computed",
+                    self.limits.max_digest_bytes
+                );
+                self.scan.issues.push(ScanIssue {
+                    kind: ScanIssueKind::DigestLimit,
+                    path: image.to_path_buf(),
+                    detail: detail.clone(),
+                });
+                artifact.detail = Some(detail);
+            }
+            DigestOutcome::Changed => {
+                artifact.detail = Some(
+                    "image changed while it was being hashed; digest not computed".to_string(),
+                );
+            }
+            DigestOutcome::DeadlineExpired => {
+                artifact.detail =
+                    Some("scan deadline expired before the digest completed".to_string());
+            }
+            DigestOutcome::Unreadable(error) => {
+                artifact.status = ArtifactStatus::Unreadable;
+                artifact.detail = Some(format!("read {}: {error}", image.display()));
+            }
+        }
+        None
+    }
+
     fn digest(
         &mut self,
+        kind: ArtifactKind,
         image: &Path,
         file: &mut std::fs::File,
         metadata: &std::fs::Metadata,
     ) -> DigestOutcome {
         let fingerprint = FileFingerprint::of(metadata);
-        if let Some((cached, measure)) = self.previous.get(image)
+        let key = (kind, image.to_path_buf());
+        if let Some((cached, measure)) = self.previous.get(&key)
             && *cached == fingerprint
         {
             let measure = measure.clone();
-            self.seen
-                .insert(image.to_path_buf(), (fingerprint, measure.clone()));
+            self.seen.insert(key, (fingerprint, measure.clone()));
             return DigestOutcome::Measured(measure);
         }
         if metadata.len() > self.limits.max_digest_bytes {
@@ -1119,8 +1212,7 @@ impl Scanner<'_> {
             release: release.finish(),
         };
         if !changed_recently(metadata, self.clock.wall_time()) {
-            self.seen
-                .insert(image.to_path_buf(), (fingerprint, measure.clone()));
+            self.seen.insert(key, (fingerprint, measure.clone()));
         }
         DigestOutcome::Measured(measure)
     }
@@ -1178,6 +1270,10 @@ pub struct ReleaseLayout {
     /// The persisted-state format a release writes, or why it has none the
     /// scan knows.
     pub state_format: fn(&RuntimeVersion) -> Result<StateFormatIdentity, String>,
+    /// Every release this build has a state-format mapping for. The execution
+    /// inventory refuses a node carrying any other, so these are the only
+    /// releases that may be installed.
+    pub known_releases: fn() -> Vec<&'static str>,
 }
 
 impl ReleaseLayout {
@@ -1195,7 +1291,15 @@ impl ReleaseLayout {
 const FIRECRACKER_RELEASE_LAYOUT: ReleaseLayout = ReleaseLayout {
     binaries: &["bin/firecracker", "bin/jailer"],
     state_format: firecracker_state_format,
+    known_releases: firecracker_known_releases,
 };
+
+fn firecracker_known_releases() -> Vec<&'static str> {
+    super::FIRECRACKER_STATE_FORMAT_RELEASES
+        .iter()
+        .map(|release| release.runtime_version)
+        .collect()
+}
 
 fn firecracker_state_format(version: &RuntimeVersion) -> Result<StateFormatIdentity, String> {
     let driver = FirecrackerDriver;

@@ -14,15 +14,15 @@
 #                     verifies after download)
 #
 # The guest binaries (spaced, spaced-svc) come out of the worker Rust build
-# image so the seed's guest daemon is byte-identical to the one the node-stack
+# image so the seed's guest daemon is byte-identical to the one the node
 # services were built against (spaced compatibility gating keys off the
 # workspace version).
 #
 # The sandbox SSH public key is baked into the seed like the Packer AMI build
 # does. On a devbox there is no Packer, so we generate a per-devbox keypair
-# once under ~/.space-devbox/kind/ssh/ — bootstrap.sh ships the private
-# key to the node-stack pods (Secret mounted at /space/etc/ssh) so `space-ssh`
-# works against local sandboxes exactly like it does on a real worker.
+# once under ~/.space-devbox/kind/ssh/ — bootstrap.sh ships the key pair to
+# build-manager (Secret mounted at /root/.ssh), which SSHes into build VMs as
+# a builder does with its node image's key.
 #
 # Idempotent: skips the (slow, privileged) rootfs build when the inputs
 # (guest binaries, builder script, seed recipe source, pubkey) are unchanged.

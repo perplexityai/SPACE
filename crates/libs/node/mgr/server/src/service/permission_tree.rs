@@ -4,6 +4,7 @@ use std::fs::File;
 use std::io;
 #[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
+use std::os::unix::ffi::OsStrExt;
 #[cfg(target_os = "linux")]
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
@@ -38,7 +39,11 @@ pub(super) fn rewrite(
         .file_name()
         .ok_or_else(|| io::Error::other("ownership root has no name"))?;
     let root = open_inode(&parent, name)?;
-    if root.metadata()?.is_dir() {
+    let metadata = root.metadata()?;
+    if crate::cache_ownership::is_private_send_source(name, &metadata) {
+        return Ok(());
+    }
+    if metadata.is_dir() {
         Policy { old_uid, uid, gid }.directory(&root, prune_snapshots, false, 0)
     } else {
         permissions(&root, old_uid, uid, gid)
@@ -84,6 +89,12 @@ impl Policy {
                 }
                 let child = open_inode(root, name)?;
                 let metadata = child.metadata()?;
+                if crate::cache_ownership::is_private_send_source(
+                    std::ffi::OsStr::from_bytes(name.to_bytes()),
+                    &metadata,
+                ) {
+                    continue;
+                }
                 if metadata.is_dir() {
                     self.directory(
                         &child,

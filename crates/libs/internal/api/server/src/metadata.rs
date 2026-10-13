@@ -1013,6 +1013,7 @@ pub(super) async fn template_visibility(
 /// `NULL` when a release exists but has no storage locations yet.
 #[derive(Debug, FromRow)]
 pub(super) struct FindTemplateReleaseRow {
+    pub(super) generic_authorized: bool,
     pub(super) release_id: Uuid,
     pub(super) release_template_name: String,
     pub(super) release_type: String,

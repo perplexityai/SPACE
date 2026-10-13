@@ -83,7 +83,12 @@ The separate command-stream path is **Application → Data plane ↔ Guest proce
 
 An operation's `state` describes the lifecycle request; the sandbox's `state` describes the environment. Neither is the exit status of a command.
 
+In Kind, sandbox pods run in their own namespace, `sandboxes`, apart from the control plane in `space`. NetworkPolicies there admit only the API and cluster controller, on the port they dial, and limit sandbox egress to the public IPv4 internet and cluster DNS; the [Kind harness README](../infra/space/kind/README.md#sandbox-namespace-and-network-policy) lists each rule's source.
+
 ## Lifecycle and persistence
+
+[Snapshot upload streaming](snapshot-upload-streaming.md) describes the worker
+transfer pipeline, memory bounds, failure ownership, and rollout behavior.
 
 Pause and suspend both stop execution, but retain state differently. Use wake to return a paused or suspended sandbox to running, and wait for its operation and readiness before issuing another command.
 
@@ -198,6 +203,21 @@ probes must distinguish liveness from readiness; external startup deadlines stil
 apply. Local execution-authority validation remains under recovery admission.
 These availability checks do not guarantee that node-manager will stay available
 through recovery, and do not extend any caller's request deadline.
+
+Existing namespace containment runs with at most four workers, preserving the
+order of checks within each namespace. All checks finish before admission;
+any failure prevents activation. Shutdown stops scheduling new namespaces and
+waits for in-flight host commands before releasing service ownership. The pool
+opens on tracked blocking work so its host commands do not stall local liveness.
+
+An opt-in Linux benchmark exercises production containment against synthetic
+network namespaces and nftables rules, comparing sequential and bounded parallel
+passes. Run only inside a disposable container with network namespace capabilities:
+
+```sh
+SPACE_RUN_CONTAINMENT_BENCHMARK=1 cargo test -p pplx-space-node-mgr --lib \
+  linux_containment_benchmark -- --ignored --nocapture
+```
 
 ## Security boundaries
 

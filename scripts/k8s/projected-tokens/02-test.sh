@@ -9,8 +9,8 @@
 #      WorkerApiInternal accepts it (nodeApiInternal allowlist), while a SA that
 #      is not on that allowlist is denied (the cluster-controller warm-pool edge).
 #
-# Requires `grpcurl` (brew install grpcurl) and a node-stack built with the
-# `k8s` feature + ./01-apply-auth.sh already applied.
+# Requires `grpcurl` (brew install grpcurl) and ./01-apply-auth.sh already
+# applied.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib.sh
 source "${SCRIPT_DIR}/lib.sh"
@@ -20,11 +20,17 @@ require kubectl
 require grpcurl
 assert_local_context
 
-POD="$(node_stack_pod)"; [[ -n "$POD" ]] || die "node-stack pod not found"
+POD="$(node_api_pod)"; [[ -n "$POD" ]] || die "node-api pod not found"
 APIPOD="$(k get pod -l app.kubernetes.io/name="${SPACE_API_DEPLOY}" -o jsonpath='{.items[0].metadata.name}')"
 [[ -n "$APIPOD" ]] || die "space-api pod not found"
 
-TOK="$(mktemp)"; trap 'rm -f "$TOK"; [[ -n "${PF_PID:-}" ]] && kill "$PF_PID" 2>/dev/null || true' EXIT
+TOK="$(mktemp)"; CA="$(mktemp)"
+trap 'rm -f "$TOK" "$CA"; [[ -n "${PF_PID:-}" ]] && kill "$PF_PID" 2>/dev/null || true' EXIT
+# node-api serves authenticated TLS with the cluster's shared space-node-api
+# identity (infra/space/kind/scripts/internal-rpc-tls.sh); verify it against
+# the cluster CA under that name, since the dial address is a port-forward.
+k get secret space-internal-rpc-ca -o jsonpath='{.data.ca\.crt}' | base64 -d >"$CA"
+[[ -s "$CA" ]] || die "no space-internal-rpc-ca Secret (run infra/space/kind/scripts/internal-rpc-tls.sh)"
 log "reading space-api projected token"
 k exec "$APIPOD" -c "${SPACE_API_CONTAINER}" -- cat "${TOKEN_PATH}" > "$TOK" 2>/dev/null
 [[ -s "$TOK" ]] || die "no projected token at ${TOKEN_PATH} on ${APIPOD} (run ./01-apply-auth.sh first)"
@@ -34,7 +40,7 @@ kubectl --context "$KCTX" -n "$NS" port-forward "$POD" "${LOCAL_NODE_API_PORT}:$
 PF_PID=$!
 for _ in $(seq 1 15); do nc -z localhost "${LOCAL_NODE_API_PORT}" 2>/dev/null && break; sleep 1; done
 
-GRPC=(grpcurl -plaintext -import-path "${REPO_ROOT}/proto" -proto node/api/v1/worker.proto)
+GRPC=(grpcurl -cacert "$CA" -servername space-node-api -import-path "${REPO_ROOT}/proto" -proto node/api/v1/worker.proto)
 ADDR="localhost:${LOCAL_NODE_API_PORT}"
 WAPI="space.node.api.v1.WorkerApi"
 

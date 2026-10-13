@@ -6,10 +6,8 @@ pub mod proto {
 
 use std::path::Path;
 
+use pplx_space_common_grpc::DEFAULT_TCP_GRPC_CONNECT_RETRY_POLICY;
 use pplx_space_common_grpc::internal_transport::{self, ClientTransport, Service};
-use pplx_space_common_grpc::{
-    DEFAULT_TCP_GRPC_CONNECT_RETRY_POLICY, connect_tcp_channel_with_retry,
-};
 use pplx_space_common_svc::auth::{SPACE_INTERNAL_TOKEN_ENV, SpaceBearerInterceptor};
 use pplx_space_common_svc::bearer_token::SpaceBearerToken;
 use pplx_space_common_svc::bootstrap::{GrpcClientTrace, wrap_grpc_client_channel};
@@ -136,6 +134,19 @@ pub enum ConnectError {
     InvalidBearer(#[source] tonic::metadata::errors::InvalidMetadataValue),
     #[error("build manager transport failed: {0}")]
     Transport(#[from] tonic::transport::Error),
+    #[error("build manager connect failed: {0}")]
+    TcpConnect(#[source] pplx_space_common_grpc::TcpConnectError),
+}
+
+impl From<pplx_space_common_grpc::TcpConnectError> for ConnectError {
+    /// A connect's transport failure stays [`ConnectError::Transport`]; only an
+    /// abandoned attempt is [`ConnectError::TcpConnect`].
+    fn from(error: pplx_space_common_grpc::TcpConnectError) -> Self {
+        match error {
+            pplx_space_common_grpc::TcpConnectError::Transport(error) => Self::Transport(error),
+            error => Self::TcpConnect(error),
+        }
+    }
 }
 
 pub async fn connect() -> Result<BuildManagerGrpcClient, ConnectError> {
@@ -153,18 +164,18 @@ pub async fn connect_with_token(
 
 async fn connect_channel(endpoint: String) -> Result<Channel, ConnectError> {
     let endpoint = internal_transport::qualify_endpoint(&endpoint);
-    let transport = internal_transport::client_endpoint(
+    let transport = internal_transport::client_connect_endpoint(
         Service::BuildManager,
         Endpoint::from_shared(endpoint.clone())?.tcp_nodelay(true),
     )
     .await?;
-    Ok(connect_tcp_channel_with_retry(
-        "build-manager",
-        &endpoint,
-        transport,
-        DEFAULT_TCP_GRPC_CONNECT_RETRY_POLICY,
-    )
-    .await?)
+    Ok(transport
+        .connect_with_retry(
+            "build-manager",
+            &endpoint,
+            DEFAULT_TCP_GRPC_CONNECT_RETRY_POLICY,
+        )
+        .await?)
 }
 
 pub fn connect_lazy() -> Result<BuildManagerGrpcClient, ConnectError> {

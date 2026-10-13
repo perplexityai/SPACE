@@ -1,0 +1,16 @@
+# Baked into the Kind node image (infra/space/kind/node/Dockerfile) and enabled
+# there. See infra/space/kind/node/space-kind-node.sh.
+[Unit]
+Description=SPACE btrfs /space/cache on a loopback image
+Wants=space-loop-nodes.service
+After=local-fs.target space-loop-nodes.service
+Before=kubelet.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+EnvironmentFile=-/etc/space/kind-node.env
+ExecStart=/usr/local/lib/space/kind-node/space-kind-node.sh cache
+
+[Install]
+WantedBy=multi-user.target

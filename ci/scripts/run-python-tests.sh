@@ -59,8 +59,21 @@ if space_test_deps_required; then
     fi
 fi
 
+# Never re-lock implicitly: a uv older than the lock's writer, or a host
+# uv.toml with its own resolver settings (exclude-newer), would rewrite the
+# committed uv.lock. CI uses --locked, which fails when uv.lock no longer
+# matches pyproject.toml, so a dependency change cannot pass on a stale lock.
+# Local runs use --frozen, the lock as committed, which such a host uv would
+# otherwise refuse.
+if [ -n "${CI:-}" ]; then
+    uv_lock_mode=--locked
+else
+    uv_lock_mode=--frozen
+fi
+
 echo "--- :python: Running every discovered Python test"
 "${uv_bin}" run \
+    "${uv_lock_mode}" \
     --project "${REPO_ROOT}" \
     --python 3.11 \
     --with boto3 \

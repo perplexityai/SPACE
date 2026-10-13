@@ -565,6 +565,98 @@ async fn registered_inventory_does_not_require_cluster_singleton() -> TestResult
     Ok(())
 }
 
+/// Node publication moves a row's lifecycle only out of its convergence
+/// sources, swept over every stored lifecycle, both reports and both
+/// substrates. A `stopped` report converges `started`, `paused`, `suspended`,
+/// `stopping` and `restoring` to `stopped`; a `started` report (without an
+/// activation receipt) promotes only `restoring`, so it never moves a
+/// `stopped` row. A control-plane write of `started` over a sandbox that is
+/// in fact stopped is therefore corrected by the next publication, while a
+/// `stopped` row whose sandbox runs is not. `space` rows have no Kubernetes
+/// execution to route; `k8s` rows carry a routable one, so routability does
+/// not mask the lifecycle filter for either.
+#[tokio::test(flavor = "current_thread")]
+async fn node_publication_converges_only_from_its_source_lifecycles() -> TestResult {
+    use pplx_space_common_core::types::SandboxLifecycle as L;
+
+    /// What a `started` and a `stopped` report leave in a row stored as `stored`.
+    fn after_reports(stored: L) -> (L, L) {
+        match stored {
+            L::Restoring => (L::Started, L::Stopped),
+            L::Started | L::Paused | L::Suspended | L::Stopping => (stored, L::Stopped),
+            L::Created
+            | L::Creating
+            | L::Starting
+            | L::Pausing
+            | L::Resuming
+            | L::Suspending
+            | L::Stopped
+            | L::Deleting
+            | L::Checkpointing
+            | L::Quarantined
+            | L::Failed => (stored, stored),
+        }
+    }
+
+    let db = pg_test_db().await?;
+    let node_id = NodeId::new();
+    insert_ready_worker_node(&db.pool, node_id).await?;
+    let cases = L::all()
+        .iter()
+        .map(|&stored| {
+            let (after_started, after_stopped) = after_reports(stored);
+            (
+                stored.as_str(),
+                after_started.as_str(),
+                after_stopped.as_str(),
+            )
+        })
+        // Stored values that are not `SandboxLifecycle` variants; no report
+        // moves them.
+        .chain(["deleted", "cleanup_required"].map(|stored| (stored, stored, stored)));
+    let cases = ["space", "k8s"]
+        .into_iter()
+        .flat_map(|managed_by| cases.clone().map(move |case| (managed_by, case)));
+    let mut mismatches = Vec::new();
+    for (managed_by, (stored, after_started, after_stopped)) in cases {
+        for (published, expected) in [("started", after_started), ("stopped", after_stopped)] {
+            let sandbox_id = SandboxId::new();
+            insert_active_sandbox_with_managed_by(
+                &db.pool, sandbox_id, node_id, stored, managed_by,
+            )
+            .await?;
+            if managed_by == "k8s" {
+                insert_k8s_execution(&db.pool, sandbox_id, 1, "running", Some("100.64.0.1"))
+                    .await?;
+            }
+
+            let mut tx = db.pool.begin().await?;
+            let outcome = publish_sandbox_states(
+                &mut tx,
+                node_id,
+                &[published_sandbox_state(sandbox_id, published)],
+            )
+            .await?;
+            tx.commit().await?;
+
+            let lifecycle: String =
+                sqlx::query_scalar(sql!("SELECT lifecycle FROM sandboxes WHERE id = $1"))
+                    .bind(sandbox_id)
+                    .fetch_one(&db.pool)
+                    .await?;
+            if (outcome.accepted, lifecycle.as_str()) != (1, expected) {
+                mismatches.push(format!(
+                    "{managed_by} {stored} published as {published}: expected {expected}, \
+                     observed {lifecycle} (accepted {})",
+                    outcome.accepted
+                ));
+            }
+        }
+    }
+    assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+    Ok(())
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn publishing_suspended_node_state_finalizes_driver_crashed_suspend() -> TestResult {
     let Some(db) = try_pg_test_db().await? else {
@@ -670,3 +762,8 @@ async fn post_selection_execution_identity_change_blocks_exact_finalization() ->
     insta::assert_yaml_snapshot!(sandbox_execution_row(&db.pool, sandbox_id).await?);
     Ok(())
 }
+
+// This file is loaded through `#[path]`, so a bare `mod` would resolve beside
+// it in `src/` rather than under `published_state_tests/`.
+#[path = "published_state_tests/lifecycle_writers.rs"]
+mod lifecycle_writers;

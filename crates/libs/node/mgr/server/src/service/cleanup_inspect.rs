@@ -368,7 +368,7 @@ impl NodeManagerService {
         let return_after_slot_release = req.keep_filesystem && req.return_after_slot_release;
         let mut actions = Vec::new();
         let mut cleanup_errors = Vec::new();
-        tracing::warn!(
+        tracing::info!(
             sandbox_id,
             force,
             immediate_kill,
@@ -648,7 +648,7 @@ impl NodeManagerService {
             .filter(|_| req.keep_filesystem)
             .map(|fence| fence.current().to_string());
 
-        tracing::warn!(
+        tracing::info!(
             sandbox_id,
             elapsed_ms = cleanup_started.elapsed().as_millis() as u64,
             action_count = actions.len(),
@@ -850,6 +850,11 @@ impl NodeManagerService {
             },
             cgroup_pids_current: if cgroup_exists {
                 read_cgroup("pids.current")
+            } else {
+                String::new()
+            },
+            cgroup_cpu_stat: if cgroup_exists {
+                read_cgroup("cpu.stat")
             } else {
                 String::new()
             },

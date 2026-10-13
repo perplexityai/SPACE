@@ -30,7 +30,6 @@ use std::net::IpAddr;
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use std::{fmt, str::FromStr};
 
 use base64::{Engine, engine::general_purpose};
 use futures_util::FutureExt;
@@ -124,7 +123,6 @@ pub struct K8sAuthConfig {
     max_inflight_reviews: usize,
     review_rate_per_sec: u64,
     review_timeout: Duration,
-    pod_authorization_mode: PodAuthorizationMode,
 }
 
 impl K8sAuthConfig {
@@ -160,7 +158,6 @@ impl K8sAuthConfig {
             max_inflight_reviews: DEFAULT_MAX_INFLIGHT,
             review_rate_per_sec: DEFAULT_REVIEW_RATE_PER_SEC,
             review_timeout: Duration::from_secs(DEFAULT_REVIEW_TIMEOUT_SECS),
-            pod_authorization_mode: PodAuthorizationMode::from_env(),
         }))
     }
 
@@ -170,54 +167,6 @@ impl K8sAuthConfig {
 
     pub fn audience(&self) -> &str {
         &self.audience
-    }
-}
-
-const MODE_ENV: &str = "SPACE_CREDMGR_POD_AUTHORIZATION_MODE";
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-enum PodAuthorizationMode {
-    #[default]
-    Observe,
-    Enforce,
-}
-
-impl PodAuthorizationMode {
-    fn from_env() -> Self {
-        Self::configured(std::env::var(MODE_ENV).ok().as_deref())
-    }
-
-    fn configured(raw: Option<&str>) -> Self {
-        raw.and_then(|raw| raw.parse().ok()).unwrap_or_default()
-    }
-
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::Observe => "observe",
-            Self::Enforce => "enforce",
-        }
-    }
-}
-
-#[derive(Debug, thiserror::Error)]
-#[error("pod authorization mode must be observe or enforce")]
-struct InvalidMode;
-
-impl FromStr for PodAuthorizationMode {
-    type Err = InvalidMode;
-
-    fn from_str(raw: &str) -> Result<Self, Self::Err> {
-        match raw {
-            "observe" => Ok(Self::Observe),
-            "enforce" => Ok(Self::Enforce),
-            _ => Err(InvalidMode),
-        }
-    }
-}
-
-impl fmt::Display for PodAuthorizationMode {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
     }
 }
 
@@ -338,8 +287,8 @@ impl CredmgrTokenReviewer {
     }
 
     /// Authenticate a projected token and check its caller's pod, registered
-    /// node, and connection IP, including on TokenReview cache hits. Observe
-    /// mode reports pod-check failures; enforce mode rejects them.
+    /// node, and connection IP, including on TokenReview cache hits. Every
+    /// check must pass before the caller can reach a handler.
     pub async fn resolve_token_identity(
         &self,
         token: &str,
@@ -348,8 +297,8 @@ impl CredmgrTokenReviewer {
         let caller = self.review_token_identity(token).await?;
         let pod = self.pod(caller.pod().pod_name());
         let pod = pod.as_deref().map_err(Clone::clone);
-        // These checks run even on TokenReview cache hits. Evaluate all four
-        // so observe mode reports every condition that would block enforcement.
+        // Evaluate every check on TokenReview cache hits too, so diagnostics
+        // include all failures and dependency errors remain retryable.
         let checks = [
             (
                 "pod_uid",
@@ -373,9 +322,9 @@ impl CredmgrTokenReviewer {
                 }
             }
         }
-        match (self.config.pod_authorization_mode, failure) {
-            (PodAuthorizationMode::Enforce, Some(error)) => Err(error),
-            _ => Ok(caller),
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(caller),
         }
     }
 
@@ -407,15 +356,10 @@ impl CredmgrTokenReviewer {
         caller: &K8sIdentity,
         peer: Option<IpAddr>,
     ) {
-        let mode = self.config.pod_authorization_mode;
-        let result_tag = match (result, mode) {
-            (Ok(()), _) => "allow",
-            (Err(_), PodAuthorizationMode::Observe) => "would_deny",
-            (Err(_), PodAuthorizationMode::Enforce) => "deny",
-        };
-        pplx_space_metrics::credmgr::pod_authorization(check, result_tag, mode.as_str());
+        let result_tag = if result.is_ok() { "allow" } else { "deny" };
+        pplx_space_metrics::credmgr::pod_authorization(check, result_tag);
         if let Err(error) = result {
-            tracing::warn!(check, result = result_tag, %mode,
+            tracing::warn!(check, result = result_tag,
                 reason = error.message(), pod_uid = %caller.pod().pod_uid(),
                 node_name = %caller.node().node_name(), peer_ip = ?peer,
                 "credential pod authorization check failed");

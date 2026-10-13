@@ -1,9 +1,9 @@
 # Local logs: Alloy → Loki
 
-Opt-in, standalone logs ingestion for the existing SPACE Kind environment.
-This chart deploys only Alloy and Loki; neither metrics nor Grafana is required.
-It neither changes
-SPACE images/environment nor removes or reconfigures Datadog. No application
+Standalone logs ingestion, installed automatically by default Kind bootstrap
+and full-stack Tilt in `otel` mode. This chart deploys only Alloy and Loki;
+neither metrics nor Grafana is required. It neither changes SPACE
+images/environment nor removes or reconfigures Datadog. No application
 exporter, trace correlation, metrics pipeline, or production integration is added.
 
 ## Start and query
@@ -14,11 +14,13 @@ and node directories `/var/log/pods` and `/run/log/journal`. Run from this repo:
 ```bash
 bash infra/space/kind/logs/local.sh up
 bash infra/space/kind/logs/local.sh status
+# Default bootstrap and full-stack Tilt already forward this port in otel mode.
 bash infra/space/kind/logs/local.sh ui
 ```
 
 The helper verifies that context `kind-space-local` addresses the loopback API
-port published by this Docker Kind cluster. Its deployments and cleanup affect
+port published by this Docker Kind cluster (`kind-$SPACE_KIND_CLUSTER` on a
+bench that sets `SPACE_KIND_CLUSTER`). Its deployments and cleanup affect
 only the owned namespace `space-logs`. On first install it waits for Loki
 before starting collection. It applies the chart's Kind overlay, which permits
 disposable storage, the diagnostic echo, and the volatile `/run/log/journal`.
@@ -27,9 +29,9 @@ For shared clusters use the portable
 not this local test harness. Its Kind guard is intentionally unchanged.
 
 Keep `ui` running for the Loki HTTP API at <http://127.0.0.1:13101>.
-For optional visualization, independently install the `grafana` chart
-when that PR is available, with `datasources.loki.enabled=true`. Its datasource
-URL is `http://loki.space-logs.svc.cluster.local:3100`. Open its provisioned
+The default Kind bring-up also installs the independent `grafana` chart with
+the Loki datasource enabled at `http://loki.space-logs.svc.cluster.local:3100`.
+For a standalone backend, visualization remains optional. Open its provisioned
 [SPACE logs dashboard](http://127.0.0.1:13000/d/space-main-health-logs).
 It works with anonymous Viewer; **Explore is not permitted for this role**.
 Select namespace `space` for real services, `space-logs` for fixture
@@ -56,7 +58,7 @@ Example LogQL (select a time range that includes the workload):
 {namespace="space",service="space-node-manager"} | json
 {namespace="space"} | json | level="WARN"
 {namespace="space"} | json | sandbox_id="YOUR_SYNTHETIC_SANDBOX_ID"
-{source="journal",namespace="host"}
+{log_source="journal",namespace="host"}
 ```
 
 ```bash
@@ -72,24 +74,28 @@ curl -fsS http://127.0.0.1:13101/loki/api/v1/labels
   CRI files under `/var/log/pods/space_*/*/*.log` and, under the Kind overlay,
   the actual volatile node journal `/run/log/journal`. Fixture pod globs are enabled only by the separate test overlay; it never
   collects its own logs. No Kubernetes API credentials or RBAC are needed.
-- Before tailing, `collection.excludedPodSources` removes the builder's
-  `node-stack` container, whose combined stdout includes recipe command output.
+- Before tailing, `collection.excludedPodSources` removes the builders'
+  `build-manager` container, whose stdout includes recipe command output.
   The default matches release `space-builder` in namespace `space`; configure
   literal namespace/pod-name-prefix/container entries for renamed or additional
-  releases. Worker logs and `format-cache-image` init logs remain eligible.
+  releases. Worker logs remain eligible.
   These file-source exclusions are independent of Datadog annotations.
-- This Kind node-stack writes individual service logs into `/space/logs` and
-  tails them to pod stdout. Sidecars inherit the supervisor's output. They are
-  not separate Kubernetes container log files. No SPACE systemd service was
-  present on the tested Kind nodes. Journal collection allows `space-*.service`,
-  and `containerd.service`. The synthetic journal identifier is test-only.
+- Each node service runs in its own DaemonSet pod and logs to that pod's
+  stdout, a separate Kubernetes container log file per service. The SPACE
+  systemd services on Kind sandbox and builder nodes are the node layer the
+  SPACE Kind node image bakes in (`space-cache.service` and its siblings) and
+  `space-runtime-supervisor.service`, which node-manager's init container
+  installs; the per-sandbox sidecars it launches inherit its output. Journal
+  collection allows `space-*.service`, and `containerd.service`. The synthetic journal identifier is test-only.
   Guest journals and the devbox's journal are not mounted or forwarded here.
 - The collector removes the CRI envelope, then extracts fields for labels and
   the event timestamp. It does **not** rewrite the original message JSON.
   Journal `MESSAGE` follows the same processing. Non-JSON host output remains
   text. The original `env` field is not renamed to `environment` in the body.
 - Indexed labels are exactly `service`, `environment`, `cluster`, `namespace`,
-  `source`, and `node`. JSON `service`, `env`, `cluster_id` supply the first
+  `log_source` (`container` or `journal`), and `node`. The transport label is
+  not called `source`, which would shadow the JSON `source` field of sandbox
+  events. JSON `service`, `env`, `cluster_id` supply the first
   three; `cluster` falls back to `clusterLabel`, which this overlay sets to
   `kind-local`. Absent environment stays absent.
   `version`, sandbox/request IDs, and existing nested span fields remain in the

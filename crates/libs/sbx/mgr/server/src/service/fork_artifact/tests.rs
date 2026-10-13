@@ -58,6 +58,7 @@ fn suspended_metadata(sandbox_id: SandboxId) -> crate::snapshot_upload::Snapshot
         },
         sandbox: None,
         rootfs_diff_format: None,
+        rootfs_send_source_id: None,
         encrypted: false,
         local_artifact_id: Some(LocalArtifactId::new()),
         artifact_kind: Some(ArtifactKind::Full),

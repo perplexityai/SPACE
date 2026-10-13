@@ -1,0 +1,92 @@
+{{- $ctx := dict "ctx" . "component" "template-manager" -}}
+{{- include "space-node-service.serviceAccount" $ctx }}
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "space-node-service.name" $ctx }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "space-node-service.labels" $ctx | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "space-node-service.selectorLabels" $ctx | nindent 6 }}
+  # Surge: template-manager holds /space/run/template-manager/service.mutex
+  # and its successor waits passively for it
+  # (crates/libs/template/mgr/src/run.rs).
+  {{- include "space-node-service.updateStrategy" (dict "strategy" "surge") | nindent 2 }}
+  template:
+    metadata:
+      annotations:
+        {{- include "space-node-service.podAnnotations" $ctx | nindent 8 }}
+      labels:
+        {{- include "space-node-service.labels" $ctx | nindent 8 }}
+    spec:
+      {{- include "space-node-service.nodeSelector" $ctx | nindent 6 }}
+      serviceAccountName: {{ include "space-node-service.name" $ctx }}
+      # The ClusterApi token is projected below; no Kubernetes API access.
+      automountServiceAccountToken: false
+      # Host network: template-manager makes no node-bound ClusterApi call,
+      # but its template-release reads (FindTemplateRelease,
+      # FindTemplateReleaseByHash, ListLatestTemplateReleases,
+      # crates/libs/template/mgr/src/volume.rs) are scoped to the node whose
+      # registered address is the caller's source address once ClusterApi
+      # authenticates by TokenReview (template_read_scope,
+      # crates/libs/internal/api/server/src/adapter.rs). From a pod IP only
+      # generic releases would resolve, never an org's private ones.
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds | int }}
+      # space-tmplmgr with SPACE_TEMPLATE_MANAGER_GROUPS. Privileged btrfs
+      # work is delegated to node-manager over its socket
+      # (crates/libs/template/mgr/src/btrfs_via_nodemgr.rs).
+      securityContext:
+        {{- include "space-node-service.runAs" (dict "ctx" . "user" "SPACE_TMPLMGR" "groups" "SPACE_TEMPLATE_MANAGER_GROUPS") | nindent 8 }}
+      containers:
+        - name: template-manager
+          {{- include "space-node-service.image" . | nindent 10 }}
+          command:
+            - /opt/space/bin/space-tmplmgr-svc
+            - --health-socket={{ include "space-node-service.healthSocket" $ctx }}
+          {{- include "space-node-service.restrictedContainer" . | nindent 10 }}
+          env:
+            {{- include "space-node-service.env.identity" . | nindent 12 }}
+            {{- include "space-node-service.env.clusterApi" . | nindent 12 }}
+            {{- with .Values.templateCache }}
+            {{- with .budgetBytes }}
+            - name: SPACE_TEMPLATE_CACHE_BUDGET_BYTES
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .gcIntervalSecs }}
+            - name: SPACE_TEMPLATE_GC_INTERVAL_SECS
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .gcGraceSecs }}
+            - name: SPACE_TEMPLATE_GC_GRACE_SECS
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .prefetchLatestN }}
+            # How many release digests per warmed template prefetch pins;
+            # pinned bytes count toward the budget and are never reclaimed.
+            - name: SPACE_TEMPLATE_PREFETCH_LATEST_N
+              value: {{ . | quote }}
+            {{- end }}
+            {{- end }}
+          {{- include "space-node-service.probes" $ctx | nindent 10 }}
+          volumeMounts:
+            {{- include "space-node-service.mount.run" . | nindent 12 }}
+            {{- include "space-node-service.mount.cache" (dict) | nindent 12 }}
+            {{- include "space-node-service.mount.clusterApiToken" . | nindent 12 }}
+            {{- include "space-node-service.mount.rpcCa" . | nindent 12 }}
+            {{- include "space-node-service.mount.private" . | nindent 12 }}
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+      volumes:
+        {{- include "space-node-service.volume.run" . | nindent 8 }}
+        {{- include "space-node-service.volume.cache" . | nindent 8 }}
+        {{- include "space-node-service.volume.clusterApiToken" . | nindent 8 }}
+        {{- include "space-node-service.volume.rpcCa" . | nindent 8 }}
+        {{- include "space-node-service.volume.private" . | nindent 8 }}
