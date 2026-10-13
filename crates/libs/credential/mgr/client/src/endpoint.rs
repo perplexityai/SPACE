@@ -175,7 +175,7 @@ impl CredmgrEndpoint {
                 (channel, CredmgrBearerInterceptor::TokenSource)
             }
             Self::Tls { uri, files } => {
-                let tls = client_tls_config(files).await?;
+                let (tls, tls_handshake_timeout) = client_tls_config(files).await?;
                 let endpoint = tonic::transport::Endpoint::from(uri.clone())
                     .connect_timeout(CONNECT_TIMEOUT)
                     .tls_config(tls)?;
@@ -183,7 +183,7 @@ impl CredmgrEndpoint {
                     SERVICE_NAME,
                     uri.to_string(),
                     endpoint,
-                    Some(TLS_HANDSHAKE_TIMEOUT),
+                    Some(tls_handshake_timeout),
                     pplx_space_common_grpc::DEFAULT_GRPC_CONNECT_RETRY_POLICY,
                 )
                 .await?;
@@ -203,7 +203,9 @@ fn ensure_crypto_provider() {
 /// Build the rustls client config, re-reading the CA PEM so renewed server
 /// certificates are picked up at the next connect. Server-auth only: the
 /// client verifies the credmgr server cert and presents none of its own.
-async fn client_tls_config(files: &TlsFiles) -> Result<ClientTlsConfig, ConnectError> {
+/// Also returns the handshake bound the config sets, for the connect helper's
+/// attempt cap.
+async fn client_tls_config(files: &TlsFiles) -> Result<(ClientTlsConfig, Duration), ConnectError> {
     ensure_crypto_provider();
     let ca = {
         let path = files.ca().to_path_buf();
@@ -211,9 +213,12 @@ async fn client_tls_config(files: &TlsFiles) -> Result<ClientTlsConfig, ConnectE
             .await
             .map_err(|source| ConnectError::TlsRead { path, source })?
     };
-    Ok(ClientTlsConfig::new()
-        .ca_certificate(Certificate::from_pem(ca))
-        .timeout(TLS_HANDSHAKE_TIMEOUT))
+    Ok((
+        ClientTlsConfig::new()
+            .ca_certificate(Certificate::from_pem(ca))
+            .timeout(TLS_HANDSHAKE_TIMEOUT),
+        TLS_HANDSHAKE_TIMEOUT,
+    ))
 }
 
 static CACHED_ENDPOINT: OnceLock<Result<CredmgrEndpoint, EndpointConfigError>> = OnceLock::new();

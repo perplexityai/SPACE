@@ -156,20 +156,19 @@ impl KubernetesSubstrate {
             crate::controllers::substrate::NODE_RPC_TIMEOUT,
         )
         .map_err(ControllerError::from)?;
-        let endpoint = crate::controllers::substrate::node_api_transport(endpoint).await?;
-        let tls_handshake_timeout =
-            pplx_space_common_grpc::internal_transport::client_tls_handshake_timeout(&endpoint);
-        let channel = pplx_space_common_grpc::connect_tcp_channel_with_retry(
-            "builder-node-api",
-            addr,
-            endpoint,
-            tls_handshake_timeout,
-            pplx_space_common_grpc::DEFAULT_TCP_GRPC_CONNECT_RETRY_POLICY,
-        )
-        .await
-        .map_err(|err| {
-            ControllerError::service_unavailable(format!("builder node-api not available: {err}"))
-        })?;
+        let channel = crate::controllers::substrate::node_api_connect_endpoint(endpoint)
+            .await?
+            .connect_with_retry(
+                "builder-node-api",
+                addr,
+                pplx_space_common_grpc::DEFAULT_TCP_GRPC_CONNECT_RETRY_POLICY,
+            )
+            .await
+            .map_err(|err| {
+                ControllerError::service_unavailable(format!(
+                    "builder node-api not available: {err}"
+                ))
+            })?;
         Ok(BuilderClient::new(
             crate::controllers::substrate::node_api_channel(
                 channel,

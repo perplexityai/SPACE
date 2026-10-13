@@ -3875,6 +3875,19 @@ pub fn node_api_channel(
     ))
 }
 
+/// [`node_api_transport`] for the TCP connect helpers, carrying the TLS
+/// handshake bound the transport applies.
+async fn node_api_connect_endpoint(
+    endpoint: Endpoint,
+) -> Result<pplx_space_common_grpc::internal_transport::ConnectEndpoint, ControllerError> {
+    pplx_space_common_grpc::internal_transport::client_connect_endpoint(
+        pplx_space_common_grpc::internal_transport::Service::NodeApi,
+        endpoint,
+    )
+    .await
+    .map_err(ControllerError::node_api_transport)
+}
+
 async fn node_api_transport(endpoint: Endpoint) -> Result<Endpoint, ControllerError> {
     pplx_space_common_grpc::internal_transport::client_endpoint(
         pplx_space_common_grpc::internal_transport::Service::NodeApi,
@@ -3913,40 +3926,34 @@ pub(super) async fn require_activation_policy_support(
 }
 
 pub async fn connect_worker(endpoint: Endpoint) -> Result<RuntimeClient, ControllerError> {
-    let endpoint = node_api_transport(endpoint).await?;
-    let tls_handshake_timeout =
-        pplx_space_common_grpc::internal_transport::client_tls_handshake_timeout(&endpoint);
-    let channel = pplx_space_common_grpc::connect_tcp_channel_with_retry(
-        "worker-node-api",
-        "worker-node-api",
-        endpoint,
-        tls_handshake_timeout,
-        pplx_space_common_grpc::DEFAULT_TCP_GRPC_CONNECT_RETRY_POLICY,
-    )
-    .await
-    .map_err(|err| {
-        ControllerError::service_unavailable(format!("node-api not reachable: {err}"))
-    })?;
+    let channel = node_api_connect_endpoint(endpoint)
+        .await?
+        .connect_with_retry(
+            "worker-node-api",
+            "worker-node-api",
+            pplx_space_common_grpc::DEFAULT_TCP_GRPC_CONNECT_RETRY_POLICY,
+        )
+        .await
+        .map_err(|err| {
+            ControllerError::service_unavailable(format!("node-api not reachable: {err}"))
+        })?;
     Ok(RuntimeClient::new(channel))
 }
 
 pub async fn connect_worker_internal(
     endpoint: Endpoint,
 ) -> Result<RuntimeInternalClient, ControllerError> {
-    let endpoint = node_api_transport(endpoint).await?;
-    let tls_handshake_timeout =
-        pplx_space_common_grpc::internal_transport::client_tls_handshake_timeout(&endpoint);
-    let channel = pplx_space_common_grpc::connect_tcp_channel_with_retry(
-        "worker-node-api-internal",
-        "worker-node-api-internal",
-        endpoint,
-        tls_handshake_timeout,
-        pplx_space_common_grpc::DEFAULT_TCP_GRPC_CONNECT_RETRY_POLICY,
-    )
-    .await
-    .map_err(|err| {
-        ControllerError::service_unavailable(format!("node-api not reachable: {err}"))
-    })?;
+    let channel = node_api_connect_endpoint(endpoint)
+        .await?
+        .connect_with_retry(
+            "worker-node-api-internal",
+            "worker-node-api-internal",
+            pplx_space_common_grpc::DEFAULT_TCP_GRPC_CONNECT_RETRY_POLICY,
+        )
+        .await
+        .map_err(|err| {
+            ControllerError::service_unavailable(format!("node-api not reachable: {err}"))
+        })?;
     Ok(WorkerApiInternalClient::new(wrap_grpc_client_channel(
         InterceptedService::new(
             channel,
@@ -3956,20 +3963,17 @@ pub async fn connect_worker_internal(
 }
 
 pub async fn connect_builder(endpoint: Endpoint) -> Result<BuilderClient, ControllerError> {
-    let endpoint = node_api_transport(endpoint).await?;
-    let tls_handshake_timeout =
-        pplx_space_common_grpc::internal_transport::client_tls_handshake_timeout(&endpoint);
-    let channel = pplx_space_common_grpc::connect_tcp_channel_with_retry(
-        "builder-node-api",
-        "builder-node-api",
-        endpoint,
-        tls_handshake_timeout,
-        pplx_space_common_grpc::DEFAULT_TCP_GRPC_CONNECT_RETRY_POLICY,
-    )
-    .await
-    .map_err(|err| {
-        ControllerError::service_unavailable(format!("node-api not reachable: {err}"))
-    })?;
+    let channel = node_api_connect_endpoint(endpoint)
+        .await?
+        .connect_with_retry(
+            "builder-node-api",
+            "builder-node-api",
+            pplx_space_common_grpc::DEFAULT_TCP_GRPC_CONNECT_RETRY_POLICY,
+        )
+        .await
+        .map_err(|err| {
+            ControllerError::service_unavailable(format!("node-api not reachable: {err}"))
+        })?;
     Ok(BuilderApiClient::new(wrap_grpc_client_channel(
         InterceptedService::new(
             channel,

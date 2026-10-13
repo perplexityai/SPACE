@@ -264,6 +264,48 @@ fn write_test_ca(dir: &Path) -> std::path::PathBuf {
     ca
 }
 
+/// A loopback peer that accepts every TCP connection and never answers, and
+/// its address.
+#[cfg(feature = "internal-tls")]
+async fn silent_tls_peer() -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let peer = tokio::spawn(async move {
+        let mut held = Vec::new();
+        loop {
+            held.push(listener.accept().await.unwrap().0);
+        }
+    });
+    (address, peer)
+}
+
+/// Assert that a connect to a silent peer failed with the TLS handshake bound's
+/// own cause, not as an abandoned attempt, and not before `handshake_bound`.
+#[cfg(feature = "internal-tls")]
+fn assert_failed_at_handshake_bound(
+    result: Result<tonic::transport::Channel, super::TcpConnectError>,
+    elapsed: Duration,
+    handshake_bound: Duration,
+) {
+    let error = match result {
+        Err(error @ super::TcpConnectError::Transport(_)) => error,
+        other => panic!("expected the TLS handshake bound to fail the dial: {other:?}"),
+    };
+    let chain = std::iter::successors(
+        Some(&error as &(dyn std::error::Error + 'static)),
+        |error| error.source(),
+    )
+    .map(ToString::to_string)
+    .collect::<Vec<_>>();
+    assert!(
+        chain
+            .iter()
+            .any(|message| message.contains("TLS handshake timeout")),
+        "{chain:?}"
+    );
+    assert!(elapsed >= handshake_bound, "failed after {elapsed:?}");
+}
+
 // A peer that accepts TCP but never answers the ClientHello fails the connect
 // with the TLS handshake bound's own cause, not as an abandoned attempt and not
 // at once. The bound outlasts the dial and name-resolution shares of the cap,
@@ -274,14 +316,7 @@ fn write_test_ca(dir: &Path) -> std::path::PathBuf {
 #[tokio::test]
 async fn a_tls_peer_that_never_answers_fails_the_connect_at_its_handshake_bound() {
     install_crypto_provider();
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    let silent_peer = tokio::spawn(async move {
-        let mut held = Vec::new();
-        loop {
-            held.push(listener.accept().await.unwrap().0);
-        }
-    });
+    let (address, silent_peer) = silent_tls_peer().await;
     let dir = tempfile::tempdir().unwrap();
     let ca = std::fs::read(write_test_ca(dir.path())).unwrap();
     let handshake_bound = Duration::from_secs(4);
@@ -308,61 +343,51 @@ async fn a_tls_peer_that_never_answers_fails_the_connect_at_its_handshake_bound(
     )
     .await
     .expect("an unanswered TLS handshake must be bounded");
-    let elapsed = started.elapsed();
-    let error = match result {
-        Err(error @ super::TcpConnectError::Transport(_)) => error,
-        other => panic!("expected the TLS handshake bound to fail the dial: {other:?}"),
-    };
-    let chain = std::iter::successors(
-        Some(&error as &(dyn std::error::Error + 'static)),
-        |error| error.source(),
-    )
-    .map(ToString::to_string)
-    .collect::<Vec<_>>();
-    assert!(
-        chain
-            .iter()
-            .any(|message| message.contains("TLS handshake timeout")),
-        "{chain:?}"
-    );
-    assert!(elapsed >= handshake_bound, "failed after {elapsed:?}");
+    assert_failed_at_handshake_bound(result, started.elapsed(), handshake_bound);
     silent_peer.abort();
 }
 
-// An internal-transport endpoint's attempt cap is sized from the handshake
-// bound its transport reports, with room left for name resolution and the
-// dial, so a handshake within its bound fits; a plaintext endpoint's is not.
+// An internal-RPC connect to a peer that never answers the ClientHello fails
+// with the handshake bound the transport's own TLS config applies, which is
+// the bound the attempt cap is sized from: here it outlasts the dial and
+// name-resolution shares, so the cap must count it for its cause to surface.
 #[cfg(feature = "internal-tls")]
 #[tokio::test]
-async fn an_internal_tls_attempt_cap_leaves_room_for_its_handshake_bound() {
-    use crate::internal_transport::{
-        CA_ENV, ClientTransport, INSECURE_DEV_ENV, Service, client_tls_handshake_timeout,
-    };
+async fn an_internal_rpc_connect_fails_at_its_transports_handshake_bound() {
+    use crate::internal_transport::{CA_ENV, ClientTransport, Service};
 
     install_crypto_provider();
+    let (address, silent_peer) = silent_tls_peer().await;
     let dir = tempfile::tempdir().unwrap();
     let mut env = TestEnvironment::default();
     env.0
         .insert(CA_ENV, write_test_ca(dir.path()).into_os_string());
-    env.0.insert(INSECURE_DEV_ENV, "true".into());
-    for (uri, uses_tls) in [
-        ("https://127.0.0.1:9800", true),
-        ("http://127.0.0.1:9800", false),
-    ] {
-        let endpoint =
-            tonic::transport::Endpoint::from_static(uri).connect_timeout(Duration::from_secs(1));
-        let endpoint = ClientTransport::from_environment(Service::NodeApi, endpoint.uri(), &env)
-            .await
-            .unwrap()
-            .endpoint(endpoint)
-            .unwrap();
-        let handshake = client_tls_handshake_timeout(&endpoint);
-        assert_eq!(handshake.is_some(), uses_tls, "{uri}");
-        let cap = super::endpoint_attempt_cap(&endpoint, handshake);
-        let dial = endpoint.get_connect_timeout().unwrap();
-        assert!(
-            cap > dial + handshake.unwrap_or_default(),
-            "{uri}: cap {cap:?} leaves no room for name resolution"
-        );
-    }
+    let handshake_bound = Duration::from_secs(4);
+    let endpoint = tonic::transport::Endpoint::from_shared(format!("https://{address}"))
+        .unwrap()
+        .connect_timeout(Duration::from_millis(500));
+    let endpoint = ClientTransport::from_environment_with_tls_handshake_timeout(
+        Service::NodeApi,
+        endpoint.uri(),
+        &env,
+        handshake_bound,
+    )
+    .await
+    .unwrap()
+    .connect_endpoint(endpoint)
+    .unwrap();
+
+    let started = tokio::time::Instant::now();
+    let result = tokio::time::timeout(
+        Duration::from_secs(60),
+        endpoint.connect_with_retry(
+            "silent-internal-rpc",
+            address.to_string(),
+            crate::GrpcRetryPolicy::none(),
+        ),
+    )
+    .await
+    .expect("an unanswered TLS handshake must be bounded");
+    assert_failed_at_handshake_bound(result, started.elapsed(), handshake_bound);
+    silent_peer.abort();
 }

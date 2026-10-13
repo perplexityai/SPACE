@@ -6,10 +6,8 @@ pub mod proto {
 
 use std::path::Path;
 
+use pplx_space_common_grpc::DEFAULT_TCP_GRPC_CONNECT_RETRY_POLICY;
 use pplx_space_common_grpc::internal_transport::{self, ClientTransport, Service};
-use pplx_space_common_grpc::{
-    DEFAULT_TCP_GRPC_CONNECT_RETRY_POLICY, connect_tcp_channel_with_retry,
-};
 use pplx_space_common_svc::auth::{SPACE_INTERNAL_TOKEN_ENV, SpaceBearerInterceptor};
 use pplx_space_common_svc::bearer_token::SpaceBearerToken;
 use pplx_space_common_svc::bootstrap::{GrpcClientTrace, wrap_grpc_client_channel};
@@ -166,20 +164,18 @@ pub async fn connect_with_token(
 
 async fn connect_channel(endpoint: String) -> Result<Channel, ConnectError> {
     let endpoint = internal_transport::qualify_endpoint(&endpoint);
-    let transport = internal_transport::client_endpoint(
+    let transport = internal_transport::client_connect_endpoint(
         Service::BuildManager,
         Endpoint::from_shared(endpoint.clone())?.tcp_nodelay(true),
     )
     .await?;
-    let tls_handshake_timeout = internal_transport::client_tls_handshake_timeout(&transport);
-    Ok(connect_tcp_channel_with_retry(
-        "build-manager",
-        &endpoint,
-        transport,
-        tls_handshake_timeout,
-        DEFAULT_TCP_GRPC_CONNECT_RETRY_POLICY,
-    )
-    .await?)
+    Ok(transport
+        .connect_with_retry(
+            "build-manager",
+            &endpoint,
+            DEFAULT_TCP_GRPC_CONNECT_RETRY_POLICY,
+        )
+        .await?)
 }
 
 pub fn connect_lazy() -> Result<BuildManagerGrpcClient, ConnectError> {

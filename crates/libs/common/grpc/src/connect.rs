@@ -247,7 +247,9 @@ pub fn connect_uds_channel_lazy(
 ///
 /// `tls_handshake_timeout` is the bound the endpoint's TLS config sets on its
 /// handshake (`ClientTlsConfig::timeout`), or `None` for a plaintext endpoint;
-/// tonic does not expose it, so the caller states it. Each attempt (name
+/// tonic does not expose it, so the caller states it. Internal-RPC callers
+/// must connect through `internal_transport::ConnectEndpoint::connect_with_retry`
+/// instead, which passes the bound its transport applied. Each attempt (name
 /// resolution, the TCP dial the endpoint's `connect_timeout` bounds, TLS and
 /// the HTTP/2 preface) is abandoned after a 3s name-resolution allowance plus
 /// the endpoint's `connect_timeout` (3s when it sets none) plus
@@ -351,8 +353,11 @@ where
 /// allowance plus `attempt_timeout`. Only those attempts are retried: TLS,
 /// when the endpoint configures it, is layered on top by the channel once one
 /// succeeds, its handshake bounded by `tls_handshake_timeout`, which must be
-/// the bound the endpoint's TLS config sets (`None` for plaintext). Each whole
-/// dial or redial is bounded at [`retrying_redial_bound`].
+/// the bound the endpoint's TLS config sets (`None` for plaintext).
+/// Internal-RPC callers must connect through
+/// `internal_transport::ConnectEndpoint::connect_with_retrying_redials`
+/// instead, which passes the bound its transport applied. Each whole dial or
+/// redial is bounded at [`retrying_redial_bound`].
 pub async fn connect_tcp_channel_with_retrying_redials(
     service_name: &'static str,
     endpoint: tonic::transport::Endpoint,
