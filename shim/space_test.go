@@ -1071,6 +1071,60 @@ func TestSandboxNetworkPolicyTLSInterception(t *testing.T) {
 	}
 }
 
+func TestSandboxNetworkPolicyTLSInterceptionExemptions(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		exemptions string
+		valid      bool
+	}{
+		{"all destinations", `[{"ip":"192.0.2.10"},{"cidr":"198.51.100.0/24"},{"domain":"sensor.example.test"},{"wildcard_domain":"example.test"}]`, true},
+		{"empty destination", `[{}]`, false},
+		{"ambiguous destination", `[{"ip":"192.0.2.10","domain":"sensor.example.test"}]`, false},
+		{"wrong shape", `"sensor.example.test"`, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			spec := &ociSpec{Annotations: map[string]string{
+				sandboxNetworkPolicyAnnotation:           `{"version":"v1","egress":{"default_action":"deny","allow":[{"domain":"sensor.example.test"}],"deny":[{"ip":"192.0.2.20"}]},"tls_interception":"on","tls_interception_exemptions":` + test.exemptions + `}`,
+				sandboxNetworkPolicyGenerationAnnotation: "1",
+			}}
+			config, err := spec.sandboxNetworkPolicy()
+			if !test.valid {
+				if err == nil || !strings.Contains(err.Error(), "tls_interception_exemptions") {
+					t.Fatalf("error = %v, want invalid tls_interception_exemptions", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			wire, err := proto.Marshal(config.Policy)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var received netpb.NetworkPolicyV1
+			if err := proto.Unmarshal(wire, &received); err != nil {
+				t.Fatal(err)
+			}
+			want := &netpb.NetworkPolicyV1{
+				Version:             netpb.NetworkPolicyVersion_NETWORK_POLICY_VERSION_V1,
+				EgressDefaultAction: netpb.EgressDefaultAction_EGRESS_DEFAULT_ACTION_DENY,
+				TlsInterception:     netpb.TlsInterception_TLS_INTERCEPTION_ON,
+				Allow:               []*netpb.EgressDestinationV1{{Destination: &netpb.EgressDestinationV1_Domain{Domain: "sensor.example.test"}}},
+				Deny:                []*netpb.EgressDestinationV1{{Destination: &netpb.EgressDestinationV1_Ip{Ip: "192.0.2.20"}}},
+				TlsInterceptionExemptions: []*netpb.EgressDestinationV1{
+					{Destination: &netpb.EgressDestinationV1_Ip{Ip: "192.0.2.10"}},
+					{Destination: &netpb.EgressDestinationV1_Cidr{Cidr: "198.51.100.0/24"}},
+					{Destination: &netpb.EgressDestinationV1_Domain{Domain: "sensor.example.test"}},
+					{Destination: &netpb.EgressDestinationV1_WildcardDomain{WildcardDomain: "example.test"}},
+				},
+			}
+			if !proto.Equal(&received, want) {
+				t.Fatalf("received policy = %v, want %v", &received, want)
+			}
+		})
+	}
+}
+
 func TestSandboxNetworkPolicyRequiresGeneration(t *testing.T) {
 	spec := &ociSpec{
 		Annotations: map[string]string{

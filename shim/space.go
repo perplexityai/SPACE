@@ -1994,9 +1994,10 @@ type autoLifecycleStageJSON struct {
 }
 
 type networkPolicyJSON struct {
-	Version         *string           `json:"version"`
-	Egress          *egressPolicyJSON `json:"egress"`
-	TLSInterception json.RawMessage   `json:"tls_interception"`
+	Version                   *string                 `json:"version"`
+	Egress                    *egressPolicyJSON       `json:"egress"`
+	TLSInterception           json.RawMessage         `json:"tls_interception"`
+	TLSInterceptionExemptions []egressDestinationJSON `json:"tls_interception_exemptions"`
 }
 
 type sandboxNetworkPolicyConfig struct {
@@ -2405,20 +2406,25 @@ func parseNetworkPolicyJSON(raw string) (*netpb.NetworkPolicyV1, error) {
 	if err != nil {
 		return nil, err
 	}
-	allow, err := parseEgressDestinations(decoded.Egress.Allow, "allow")
+	allow, err := parseEgressDestinations(decoded.Egress.Allow, "egress allow")
 	if err != nil {
 		return nil, err
 	}
-	deny, err := parseEgressDestinations(decoded.Egress.Deny, "deny")
+	deny, err := parseEgressDestinations(decoded.Egress.Deny, "egress deny")
+	if err != nil {
+		return nil, err
+	}
+	exemptions, err := parseEgressDestinations(decoded.TLSInterceptionExemptions, "tls_interception_exemptions")
 	if err != nil {
 		return nil, err
 	}
 	return &netpb.NetworkPolicyV1{
-		Version:             netpb.NetworkPolicyVersion_NETWORK_POLICY_VERSION_V1,
-		EgressDefaultAction: action,
-		Allow:               allow,
-		Deny:                deny,
-		TlsInterception:     tlsInterception,
+		Version:                   netpb.NetworkPolicyVersion_NETWORK_POLICY_VERSION_V1,
+		EgressDefaultAction:       action,
+		Allow:                     allow,
+		Deny:                      deny,
+		TlsInterception:           tlsInterception,
+		TlsInterceptionExemptions: exemptions,
 	}, nil
 }
 
@@ -2438,7 +2444,7 @@ func parseEgressDestinations(raw []egressDestinationJSON, field string) ([]*netp
 	for index, destination := range raw {
 		parsed, err := parseEgressDestination(destination)
 		if err != nil {
-			return nil, fmt.Errorf("network policy egress %s[%d]: %w", field, index, err)
+			return nil, fmt.Errorf("network policy %s[%d]: %w", field, index, err)
 		}
 		out = append(out, parsed)
 	}
