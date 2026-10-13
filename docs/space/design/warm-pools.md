@@ -383,18 +383,3 @@ are draining during a rollover.
 - Coordinating retained releases across clusters, template renames or release
   deletion.
 - A first-class operation to return a detached config to policy control.
-
-## History
-
-This design merges two RFCs:
-
-- Cluster-wide sandbox pool (May 2026) proposed the single-config MVP: slot
-  contract, claim path and controller loop.
-- Warm-pool release preparation (May 2026) added rolling policies, release
-  retention and detaching.
-
-Since those RFCs, the slot lifecycle has gained `bound` and `cleanup_pending`,
-the controller runs under leader election, configs carry encryption and disk
-settings, native creates can claim at admission, retained releases are
-protected from artifact cleanup, and the `warm_pool.*` metrics replace the
-proposed `sandbox.pool.*` names.
