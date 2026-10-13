@@ -24,8 +24,8 @@ probes, from four pods on the worker node:
 | --- | --- |
 | pod in `space` | reaches its node's node-local OTLP, APM and DogStatsD ports |
 | root host-network pod (as node-manager, the worker shim) | same |
-| non-root host-network pod (as node-api) | same, once node addresses are host peers |
-| pod in `sandboxes` labelled as a SPACE sandbox | reaches nothing |
+| non-root host-network pod (node-api's UID) | same, once node addresses are host peers |
+| pod in `space-sandboxes` labelled as a SPACE sandbox | reaches nothing |
 
 Targets: every node's InternalIP at the node-local OTLP port (4317/TCP), the
 Agent's APM (8126/TCP) and DogStatsD (8125/UDP) host ports, the gateway
@@ -34,7 +34,9 @@ each UDP datagram carries a unique metric name looked up in the Agent's
 `dogstatsd-stats`.
 
 Phases: the receivers' NetworkPolicies alone; then with the sandbox
-namespace's egress policy from `infra/space/kind/charts/space-sandbox-network-policy`;
+namespace's egress policy, rendered from the `space` chart's
+`sandbox.networkPolicy` (`infra/space/charts/space`), or from
+`infra/space/kind/charts/space-sandbox-network-policy` on trees without it;
 then with every node address in `nodeLocal.hostPeers` and `datadog.hostPeers`.
 The exit status is non-zero if any asserted expectation fails; reachability
 the test does not assert is printed as `not asserted`.

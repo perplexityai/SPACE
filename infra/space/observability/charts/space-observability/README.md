@@ -108,11 +108,8 @@ What you get, and what to change:
   The port is plaintext and unauthenticated: keep it closed to anything
   outside the cluster with the node firewall or security group. Its
   NetworkPolicy admits pods in `spaceNamespaces` and `nodeLocal.hostPeers`
-  only. Whether host-network processes count as the pod's own node, and so
-  bypass the policy, depends on the CNI: kindnet exempts only processes
-  running as root, so a non-root host-network service such as node-api is
-  refused until its node addresses are in `nodeLocal.hostPeers`. See
-  [Sandbox isolation](#sandbox-isolation) before adding them.
+  only. See [Host-network producers](#host-network-producers) for the SPACE
+  node services that send from the node's own address.
 - **Dropping a signal.** `metrics.enabled`, `traces.enabled`, `logs.enabled`
   and `grafana.enabled` remove one chart; disable its Grafana datasource with it.
 
@@ -154,6 +151,39 @@ kubelet certificate does not cover the node IP (Kind) need
 worker and builder nodes send to the Agent on their own node; narrow it to
 your nodes' taints if needed.
 
+## Host-network producers
+
+The SPACE node charts (`infra/space/charts`, installed through `space-worker`)
+point every producer at `http://$(NODE_IP):<nodeLocalPort>` in otlp mode, with
+`NODE_IP` from `status.hostIP`; install this release first, from the same
+values file, so the port matches. Pod-network node services
+(`space-runtime-manager`, `space-volume-manager`) run in the release namespace,
+which must be in `spaceNamespaces`. The rest send from the node's own address:
+
+| Producer | Runs as | Admitted by default |
+| --- | --- | --- |
+| `space-node-manager`, its host runtime-supervisor (`/space/config/space.env`) | root | where the CNI exempts traffic from a pod's own node |
+| containerd shim (wrapper written by `space-shim-installer`) | root (containerd) | same |
+| `space-node-api`, `space-node-ctl`, `space-sandbox-manager`, `space-template-manager` | non-root UIDs | where the CNI exempts all of a pod's own node, not only root |
+
+kindnet (Kind's default CNI) exempts only root processes, so on Kind the four
+non-root services are refused until their nodes' addresses are host peers.
+Other CNIs differ; test with a non-root host-network pod before relying on the
+exemption. To admit them, list the node addresses, and only those, in
+`nodeLocal.hostPeers` (and `datadog.hostPeers` in datadog mode):
+
+```yaml
+nodeLocal:
+  hostPeers:
+    # The nodes' subnet. It must not contain the pod or sandbox ranges: an
+    # ipBlock that covers pod addresses admits those pods.
+    - ipBlock: {cidr: 172.18.0.0/16}   # Kind: docker network inspect kind
+```
+
+Read [Sandbox isolation](#sandbox-isolation) first: host peers are safe only
+where the sandbox egress policy denies the node range, which the `space`
+chart's `sandbox.networkPolicy` does for private node addresses.
+
 ## Sandbox isolation
 
 A guest must never reach a Collector or Agent port. A guest's traffic leaves
@@ -163,9 +193,10 @@ its microVM through its sandbox pod's network namespace, so two layers apply:
    the gateway and the Datadog Agent admit only `spaceNamespaces` and the
    configured host peers. The sandbox namespace must not be in
    `spaceNamespaces`.
-2. **The sandbox namespace's egress policy** (the SPACE services charts),
-   which must deny the pod, Service and node address ranges. The Kind
-   `space-sandbox-network-policy` chart does.
+2. **The sandbox namespace's egress policy**, which must deny the pod,
+   Service and node address ranges: `sandbox.networkPolicy` in the `space`
+   chart (private ranges by default; add node or Service CIDRs that are not
+   private), or the Kind `space-sandbox-network-policy` chart.
 
 Host peers weaken layer 1: a CNI that source-NATs pod traffic to node
 addresses (kindnet does, for destinations outside the pod range) delivers a
