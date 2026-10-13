@@ -1,0 +1,113 @@
+{{- if and (eq (include "space-observability.mode" .) "otlp") .Values.nodeLocal.enabled }}
+{{- /*
+The node-local Collector: one per node, listening on the node's addresses at
+global.observability.otlp.nodeLocalPort through a hostPort. SPACE producers
+send to status.hostIP:<port>, which works the same from ordinary pods,
+host-network pods and host processes such as the worker shim. It relays to the
+gateway and holds no state of its own.
+*/}}
+{{- $port := int .Values.global.observability.otlp.nodeLocalPort }}
+{{- $config := tpl (.Files.Get "config/node-collector.yaml") . }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: node-collector-config
+  labels:
+    {{- include "space-observability.labels" . | nindent 4 }}
+data:
+  collector.yaml: |
+{{ $config | indent 4 }}
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: node-collector
+  labels:
+    {{- include "space-observability.labels" . | nindent 4 }}
+    app.kubernetes.io/component: node-collector
+spec:
+  selector:
+    matchLabels: {app: node-collector}
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate: {maxUnavailable: 1}
+  template:
+    metadata:
+      labels:
+        app: node-collector
+        app.kubernetes.io/part-of: space-observability
+        app.kubernetes.io/component: node-collector
+      annotations:
+        checksum/config: {{ $config | sha256sum }}
+    spec:
+      {{- with .Values.nodeLocal.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.nodeLocal.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.nodeLocal.priorityClassName }}
+      priorityClassName: {{ . | quote }}
+      {{- end }}
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 10
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: collector
+          image: {{ .Values.nodeLocal.image | default .Values.common.images.collector | quote }}
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            {{- include "common.containerSecurityContext" . | nindent 12 }}
+            readOnlyRootFilesystem: true
+          args: ["--config=/etc/space/collector.yaml"]
+          env:
+            - {name: GOMEMLIMIT, value: 100MiB}
+          ports:
+            - {name: otlp-grpc, containerPort: 4317, hostPort: {{ $port }}, protocol: TCP}
+          resources:
+            {{- toYaml .Values.nodeLocal.resources | nindent 12 }}
+          readinessProbe:
+            httpGet: {path: /, port: 13133}
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: {path: /, port: 13133}
+            initialDelaySeconds: 15
+          volumeMounts:
+            - {name: config, mountPath: /etc/space, readOnly: true}
+      volumes:
+        - name: config
+          configMap: {name: node-collector-config}
+---
+# Accepts OTLP only from pods in SPACE namespaces and the configured host
+# peers. Sandbox pods are in no SPACE namespace, so a guest that reaches a
+# node address is refused here. Host-network producers bypass this only where
+# the CNI exempts a pod's own node (kindnet: root processes only); see the
+# README's sandbox isolation section before adding node addresses to
+# nodeLocal.hostPeers.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: node-collector
+  labels:
+    {{- include "space-observability.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels: {app: node-collector}
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - ports: [{protocol: TCP, port: 4317}]
+      from:
+        - {{- include "space-observability.spaceNamespaceSelector" . | nindent 10 }}
+        {{- with .Values.nodeLocal.hostPeers }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+  egress:
+    - to: [{podSelector: {matchLabels: {app: collector}}}]
+      ports: [{protocol: TCP, port: 4317}]
+    {{- include "common.dnsEgress" . | nindent 4 }}
+{{- end }}

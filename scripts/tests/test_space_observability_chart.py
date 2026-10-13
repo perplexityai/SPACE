@@ -32,6 +32,7 @@ def vendored_dependencies() -> None:
             ["helm", "dependency", "build", str(CHARTS / chart)],
             capture_output=True,
             text=True,
+            check=False,
         )
         if result.returncode != 0:
             pytest.fail(f"helm dependency build {chart} failed:\n{result.stderr}")
@@ -42,6 +43,7 @@ def render(*args: str, chart: Path = UMBRELLA, namespace: str = NAMESPACE) -> su
         ["helm", "template", "so", str(chart), "--namespace", namespace, *args],
         capture_output=True,
         text=True,
+        check=False,
     )
 
 
@@ -103,7 +105,7 @@ def test_datadog_requires_an_api_key_secret() -> None:
 
 def test_datadog_renders_only_the_agent() -> None:
     docs = by_kind(documents(*DATADOG, "--set", "global.observability.cluster=test-cluster"))
-    assert set(kind for kind, _ in docs) == {
+    assert {kind for kind, _ in docs} == {
         "ServiceAccount",
         "ClusterRole",
         "ClusterRoleBinding",
@@ -207,11 +209,21 @@ def test_otlp_existing_grafana_secret_is_not_generated() -> None:
 
 
 def test_otlp_gateway_accepts_only_space_namespaces() -> None:
-    docs = by_kind(documents(*OTLP, "--set", "spaceNamespaces={space,space-builder}",
-                             "--set", "logs.collection.podTargets[0].path=/var/log/pods/space_*/*/*.log",
-                             "--set", "logs.collection.podTargets[0].namespace=space",
-                             "--set", "logs.collection.podTargets[1].path=/var/log/pods/space-builder_*/*/*.log",
-                             "--set", "logs.collection.podTargets[1].namespace=space-builder"))
+    docs = by_kind(
+        documents(
+            *OTLP,
+            "--set",
+            "spaceNamespaces={space,space-builder}",
+            "--set",
+            "logs.collection.podTargets[0].path=/var/log/pods/space_*/*/*.log",
+            "--set",
+            "logs.collection.podTargets[0].namespace=space",
+            "--set",
+            "logs.collection.podTargets[1].path=/var/log/pods/space-builder_*/*/*.log",
+            "--set",
+            "logs.collection.podTargets[1].namespace=space-builder",
+        )
+    )
     policy = docs[("NetworkPolicy", "gateway-collector")]["spec"]
     receiver = next(rule for rule in policy["ingress"] if rule["ports"][0]["port"] == 4317)
     assert receiver["from"] == [
@@ -221,10 +233,12 @@ def test_otlp_gateway_accepts_only_space_namespaces() -> None:
                     {"key": "kubernetes.io/metadata.name", "operator": "In", "values": ["space", "space-builder"]}
                 ]
             }
-        }
+        },
+        {"podSelector": {"matchLabels": {"app": "node-collector"}}},
     ]
     assert {name for kind, name in docs if kind == "NetworkPolicy"} == {
         "gateway-collector",
+        "node-collector",
         "metrics-prometheus",
         "traces-tempo",
         "loki",
@@ -246,7 +260,9 @@ def test_otlp_rejects_datasource_without_backend() -> None:
 
 
 def test_otlp_backend_can_be_dropped() -> None:
-    docs = by_kind(documents(*OTLP, "--set", "traces.enabled=false", "--set", "grafana.datasources.tempo.enabled=false"))
+    docs = by_kind(
+        documents(*OTLP, "--set", "traces.enabled=false", "--set", "grafana.datasources.tempo.enabled=false")
+    )
     assert ("Deployment", "tempo") not in docs
     config = yaml.safe_load(docs[("ConfigMap", "gateway-config")]["data"]["collector.yaml"])
     assert set(config["service"]["pipelines"]) == {"metrics", "logs"}
@@ -262,9 +278,7 @@ def test_signal_charts_keep_their_collector_standalone(chart: str) -> None:
 
 @pytest.mark.parametrize("mode", ["off", "datadog"])
 def test_signal_charts_render_nothing_outside_otlp_mode(mode: str) -> None:
-    docs = documents(
-        "--set", f"global.observability.mode={mode}", chart=CHARTS / "metrics", namespace="obs-metrics"
-    )
+    docs = documents("--set", f"global.observability.mode={mode}", chart=CHARTS / "metrics", namespace="obs-metrics")
     assert docs == []
 
 
@@ -337,3 +351,55 @@ def test_dns_egress_rejects_a_non_list() -> None:
     result = render(*OTLP, "--set", "global.networkPolicy.dns.peers=kube-dns")
     assert result.returncode != 0
     assert "global.networkPolicy.dns.peers must be a list" in result.stderr
+
+
+def test_node_local_collector_listens_on_the_shared_host_port() -> None:
+    docs = by_kind(documents(*OTLP, "--set", "global.observability.otlp.nodeLocalPort=14317"))
+    daemonset = docs[("DaemonSet", "node-collector")]["spec"]["template"]["spec"]
+    (container,) = daemonset["containers"]
+    assert container["ports"] == [{"name": "otlp-grpc", "containerPort": 4317, "hostPort": 14317, "protocol": "TCP"}]
+    assert "hostNetwork" not in daemonset
+    # Workers are often tainted; every producer's node needs a receiver.
+    assert {"operator": "Exists"} in daemonset["tolerations"]
+    config = yaml.safe_load(docs[("ConfigMap", "node-collector-config")]["data"]["collector.yaml"])
+    assert config["exporters"]["otlp_grpc/gateway"]["endpoint"] == f"collector.{NAMESPACE}.svc:4317"
+    assert set(config["service"]["pipelines"]) == {"metrics", "traces", "logs"}
+    # Delta conversion belongs to the single gateway, never a per-node hop.
+    assert "delta_to_cumulative" not in config.get("processors", {})
+
+
+def test_node_local_collector_admits_only_space_namespaces() -> None:
+    docs = by_kind(documents(*OTLP))
+    policy = docs[("NetworkPolicy", "node-collector")]["spec"]
+    (rule,) = policy["ingress"]
+    assert rule["ports"] == [{"protocol": "TCP", "port": 4317}]
+    assert rule["from"] == [
+        {
+            "namespaceSelector": {
+                "matchExpressions": [{"key": "kubernetes.io/metadata.name", "operator": "In", "values": ["space"]}]
+            }
+        }
+    ]
+    assert policy["egress"][0] == {
+        "to": [{"podSelector": {"matchLabels": {"app": "collector"}}}],
+        "ports": [{"protocol": "TCP", "port": 4317}],
+    }
+
+
+def test_node_local_collector_can_be_disabled() -> None:
+    docs = by_kind(documents(*OTLP, "--set", "nodeLocal.enabled=false"))
+    assert ("DaemonSet", "node-collector") not in docs
+    assert ("NetworkPolicy", "node-collector") not in docs
+
+
+@pytest.mark.parametrize("port", ["0", "65536", "abc"])
+def test_node_local_port_must_be_a_port(port: str) -> None:
+    result = render(*OTLP, "--set", f"global.observability.otlp.nodeLocalPort={port}")
+    assert result.returncode != 0
+    assert "nodeLocalPort must be a port number" in result.stderr
+
+
+@pytest.mark.parametrize("mode", ["off", "datadog"])
+def test_node_local_collector_is_otlp_only(mode: str) -> None:
+    docs = by_kind(documents("--set", f"global.observability.mode={mode}", *DATADOG[2:]))
+    assert ("DaemonSet", "node-collector") not in docs

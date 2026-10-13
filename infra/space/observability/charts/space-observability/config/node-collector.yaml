@@ -1,0 +1,49 @@
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+        max_recv_msg_size_mib: 4
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 96
+    spike_limit_mib: 24
+  batch:
+    timeout: 1s
+    send_batch_size: 256
+    send_batch_max_size: 512
+exporters:
+  # Delta-to-cumulative conversion stays in the single gateway, which sees
+  # every stream; this hop only relays.
+  otlp_grpc/gateway:
+    endpoint: collector.{{ .Release.Namespace }}.svc:4317
+    tls:
+      insecure: true
+    timeout: 3s
+    sending_queue:
+      enabled: true
+      num_consumers: 1
+      queue_size: 128
+    retry_on_failure:
+      enabled: true
+      initial_interval: 1s
+      max_interval: 5s
+      max_elapsed_time: 30s
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+service:
+  extensions: [health_check]
+  telemetry:
+    metrics:
+      level: none
+  pipelines:
+    {{- range $signal := list "metrics" "traces" "logs" }}
+    {{- if (index $.Values $signal).enabled }}
+    {{ $signal }}:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [otlp_grpc/gateway]
+    {{- end }}
+    {{- end }}

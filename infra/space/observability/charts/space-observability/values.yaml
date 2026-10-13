@@ -59,10 +59,8 @@ datadog:
   # needed.
   tolerations: [{operator: Exists}]
   # Extra NetworkPolicy peers, beyond spaceNamespaces, allowed to send to
-  # DogStatsD and APM, for host-network producers the CNI does not exempt
-  # (kindnet exempts root processes only). Node addresses here admit anything
-  # the CNI source-NATs to a node address, so add them only where the sandbox
-  # egress policy denies the node range. Never add sandbox ranges.
+  # DogStatsD and APM; same rules as nodeLocal.hostPeers. Never add sandbox
+  # ranges.
   hostPeers: []
   resources:
     requests: {cpu: 200m, memory: 256Mi}
@@ -88,6 +86,31 @@ gateway:
   resources:
     requests: {cpu: 100m, memory: 128Mi}
     limits: {cpu: 500m, memory: 512Mi, ephemeral-storage: 256Mi}
+  # Empty uses the Collector pinned in charts/common.
+  image: ""
+
+# The node-local Collector DaemonSet: OTLP/gRPC on every node's addresses at
+# global.observability.otlp.nodeLocalPort (a hostPort), relayed to the gateway.
+# SPACE producers send to status.hostIP:<nodeLocalPort>, including host-network
+# services and the worker shim. Keep the port closed to anything outside the
+# cluster (node firewall or security group): the receiver is plaintext and
+# unauthenticated.
+nodeLocal:
+  enabled: true
+  # Every node that runs a SPACE producer needs one, tainted workers included.
+  tolerations:
+    - operator: Exists
+  nodeSelector: {kubernetes.io/os: linux}
+  priorityClassName: ""
+  # Extra NetworkPolicy peers, beyond spaceNamespaces, allowed to send, for
+  # host-network producers the CNI does not exempt (kindnet exempts root
+  # processes only). Node addresses here admit anything the CNI source-NATs to
+  # a node address, so add them only where the sandbox egress policy denies
+  # the node range (README, "Sandbox isolation"). Never add sandbox ranges.
+  hostPeers: []
+  resources:
+    requests: {cpu: 50m, memory: 64Mi}
+    limits: {cpu: 250m, memory: 128Mi, ephemeral-storage: 64Mi}
   # Empty uses the Collector pinned in charts/common.
   image: ""
 

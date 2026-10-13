@@ -100,6 +100,9 @@ spec:
     - ports: [{protocol: TCP, port: 4317}]
       from:
         - {{- include "space-observability.spaceNamespaceSelector" . | nindent 10 }}
+        {{- if .Values.nodeLocal.enabled }}
+        - podSelector: {matchLabels: {app: node-collector}}
+        {{- end }}
         {{- with .Values.gateway.receiverPeers }}
         {{- toYaml . | nindent 8 }}
         {{- end }}

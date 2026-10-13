@@ -7,7 +7,7 @@ to, selected by a single value:
 | --- | --- |
 | `off` (default) | Nothing. |
 | `datadog` | A Datadog Agent DaemonSet: DogStatsD on host port 8125/UDP, APM on 8126/TCP, pod log collection from SPACE namespaces. Uses an API key Secret you create. |
-| `otlp` | One gateway OTLP Collector, Prometheus, Tempo, Alloy and Loki, and Grafana with generated admin credentials and its datasources wired. |
+| `otlp` | A node-local OTLP Collector on every node, one gateway Collector, Prometheus, Tempo, Alloy and Loki, and Grafana with generated admin credentials and its datasources wired. |
 
 Any other value fails the render. The `global.observability` keys are the same
 ones the SPACE services charts read, so one values file can drive both.
@@ -43,13 +43,13 @@ helm upgrade --install space-observability "$charts/space-observability" \
 SPACE producers do not send to the gateway Service. In otlp mode every
 producer (pods, host-network services, the runtime supervisor and the worker
 shim) sends OTLP/gRPC to the node it runs on, `http://$(NODE_IP):<nodeLocalPort>`
-(default 4317, `NODE_IP` from the pod's `status.hostIP`), and a node-local
-Collector there forwards to the gateway at
-`collector.<release-namespace>.svc:4317`. **otlp mode therefore requires the
-node-local Collector.** This chart does not install it yet: nothing listens on
-the node port, and producers switched to otlp fail to export until the
-node-local Collector DaemonSet is added to this chart. Install the two
-together.
+(`global.observability.otlp.nodeLocalPort`, default 4317; `NODE_IP` is the
+pod's `status.hostIP`). The node-local Collector (`nodeLocal`, on by default)
+listens there on every node and relays to the gateway at
+`collector.<release-namespace>.svc:4317`. **otlp mode requires the node-local
+Collector**: with `nodeLocal.enabled=false` nothing listens on the node port
+unless you run your own Collector there. The gateway is reachable directly
+from SPACE pods too.
 
 What you get, and what to change:
 
@@ -100,6 +100,19 @@ What you get, and what to change:
   the chart fails if it does not. The gateway also forwards OTLP logs to Loki.
   Host journal collection is off by default because a node without a persistent
   journal at `logs.collection.journal.path` would leave Alloy pending.
+- **Node-local Collector.** A DaemonSet (`nodeLocal`) that tolerates every
+  taint and publishes OTLP/gRPC on each node's addresses through a host port,
+  so ordinary pods, host-network services (node-api, node-manager) and host
+  processes such as the worker shim all use the same `NODE_IP:4317` endpoint.
+  It only relays; delta-to-cumulative conversion stays in the single gateway.
+  The port is plaintext and unauthenticated: keep it closed to anything
+  outside the cluster with the node firewall or security group. Its
+  NetworkPolicy admits pods in `spaceNamespaces` and `nodeLocal.hostPeers`
+  only. Whether host-network processes count as the pod's own node, and so
+  bypass the policy, depends on the CNI: kindnet exempts only processes
+  running as root, so a non-root host-network service such as node-api is
+  refused until its node addresses are in `nodeLocal.hostPeers`. See
+  [Sandbox isolation](#sandbox-isolation) before adding them.
 - **Dropping a signal.** `metrics.enabled`, `traces.enabled`, `logs.enabled`
   and `grafana.enabled` remove one chart; disable its Grafana datasource with it.
 
@@ -130,8 +143,8 @@ ports; host processes can also use the Unix sockets under `/var/run/datadog`.
 A NetworkPolicy admits DogStatsD and APM traffic only from pods in
 `spaceNamespaces` and `datadog.hostPeers`. Host-network services reach it as
 the pod's own node where the CNI exempts that traffic (kindnet: root processes
-only); otherwise list node addresses in `datadog.hostPeers`, and only where the
-sandbox egress policy denies the node range. Logs are
+only); otherwise list node addresses in `datadog.hostPeers`, subject to
+[Sandbox isolation](#sandbox-isolation). Logs are
 collected from `spaceNamespaces` only. A SPACE container whose output
 must not be collected opts out with an `ad.datadoghq.com/<container>.logs_exclude`
 annotation, which outranks the namespace inclusion. Local clusters whose
@@ -140,6 +153,34 @@ kubelet certificate does not cover the node IP (Kind) need
 (`datadog.tolerations: [{operator: Exists}]`) because producers on tainted
 worker and builder nodes send to the Agent on their own node; narrow it to
 your nodes' taints if needed.
+
+## Sandbox isolation
+
+A guest must never reach a Collector or Agent port. A guest's traffic leaves
+its microVM through its sandbox pod's network namespace, so two layers apply:
+
+1. **The receivers' NetworkPolicies** (this chart). The node-local Collector,
+   the gateway and the Datadog Agent admit only `spaceNamespaces` and the
+   configured host peers. The sandbox namespace must not be in
+   `spaceNamespaces`.
+2. **The sandbox namespace's egress policy** (the SPACE services charts),
+   which must deny the pod, Service and node address ranges. The Kind
+   `space-sandbox-network-policy` chart does.
+
+Host peers weaken layer 1: a CNI that source-NATs pod traffic to node
+addresses (kindnet does, for destinations outside the pod range) delivers a
+pod's connection to another node's host port from that node's address, which
+a node-address host peer admits. With host peers set, layer 2 is what keeps
+guests out, so set them only where the sandbox egress policy denies the node
+range.
+
+`scripts/tests/observability/collector-isolation/run.py` checks both layers on
+a disposable Kind cluster: it probes every node address at the node-local and
+Agent host ports, the gateway Service, and every Collector and Agent pod, from
+a SPACE pod, root and non-root host-network pods, and a stand-in sandbox pod,
+with and without the sandbox egress policy and with host peers. It uses a pod
+in the sandbox namespace, not a Firecracker guest, so the per-sandbox egress
+gateway is not exercised.
 
 ## Switching modes
 
