@@ -202,6 +202,57 @@ impl ImportFixture {
         }
     }
 
+    fn seed_snapshot(&self) -> PathBuf {
+        let hash = self.template.content_hash.as_deref().unwrap();
+        let path = snapshot_artifacts_dir(
+            &self.service.artifact_store.root,
+            &self.template.name,
+            hash,
+            1,
+            512,
+        );
+        std::fs::create_dir_all(&path).unwrap();
+        for file in [
+            "snapshot.base",
+            "vmstate.base",
+            "metadata.json",
+            "snapshot_hash",
+        ] {
+            std::fs::write(path.join(file), b"original").unwrap();
+        }
+        crate::db::upsert_snapshot(
+            &self.service.db.lock().unwrap(),
+            &self.template.name,
+            hash,
+            1,
+            512,
+            "original",
+        )
+        .unwrap();
+        path
+    }
+
+    fn snapshot_state(&self, path: &Path) -> (Vec<Vec<u8>>, String, String) {
+        let row = crate::db::get_snapshot(
+            &self.service.db.lock().unwrap(),
+            &self.template.name,
+            self.template.content_hash.as_deref().unwrap(),
+            1,
+            512,
+        )
+        .unwrap()
+        .unwrap();
+        let files = [
+            "snapshot.base",
+            "vmstate.base",
+            "metadata.json",
+            "snapshot_hash",
+        ]
+        .map(|file| std::fs::read(path.join(file)).unwrap())
+        .into();
+        (files, row.snapshot_hash, row.built_at)
+    }
+
     fn state(&self) -> BuildState {
         let build = crate::db::get_build(
             &self.service.db.lock().unwrap(),
@@ -229,4 +280,154 @@ impl Drop for ImportFixture {
     fn drop(&mut self) {
         self.server.abort();
     }
+}
+
+#[rstest]
+#[case::corrupt_rootfs(Change::Corruption, Code::FailedPrecondition)]
+#[case::invalid_metadata(Change::Disk, Code::AlreadyExists)]
+#[case::valid_snapshot(Change::Unchanged, Code::Ok)]
+#[tokio::test]
+async fn existing_import_verifies_build_before_snapshot(
+    #[case] change: Change,
+    #[case] expected: Code,
+) {
+    let mut fixture = ImportFixture::new().await;
+    let mut header = fixture.changed_header(change);
+    if matches!(change, Change::Corruption | Change::Unchanged) {
+        header.manifest_json = std::fs::read(fixture.directory.join("manifest.json")).unwrap();
+        header.metadata_json = std::fs::read(fixture.directory.join("metadata.json")).unwrap();
+    }
+    header.include_snapshot = true;
+    header.snapshot_vcpu = Some(1);
+    header.snapshot_memory_mib = Some(512);
+    let snapshot = fixture.seed_snapshot();
+    let before = fixture.snapshot_state(&snapshot);
+    let mut requests = vec![ImportTemplateRequest {
+        payload: Some(Payload::Header(header)),
+    }];
+    for file in ["snapshot.base", "vmstate.base", "snapshot-metadata.json"] {
+        requests.push(ImportTemplateRequest {
+            payload: Some(Payload::Chunk(crate::proto::FileChunk {
+                file_name: file.into(),
+                data: b"replacement".to_vec(),
+                ..Default::default()
+            })),
+        });
+    }
+
+    let response = fixture
+        .client
+        .import_template(tokio_stream::iter(requests))
+        .await;
+
+    assert_eq!(
+        response.as_ref().err().map_or(Code::Ok, Status::code),
+        expected,
+        "{response:?}"
+    );
+    if expected == Code::Ok {
+        assert_eq!(
+            std::fs::read(snapshot.join("snapshot.base")).unwrap(),
+            b"replacement"
+        );
+        assert_ne!(fixture.snapshot_state(&snapshot).1, "original");
+    } else {
+        assert_eq!(
+            fixture.snapshot_state(&snapshot),
+            before,
+            "refused build must not replace snapshots or their registration"
+        );
+    }
+}
+
+#[tokio::test]
+async fn descriptive_refresh_preserves_raw_manifest_fields() {
+    let mut fixture = ImportFixture::new().await;
+    let path = fixture.directory.join("manifest.json");
+    let mut original: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    original.as_object_mut().unwrap().remove("runtime");
+    original.as_object_mut().unwrap().remove("arch");
+    original["extension"] = json!({"opaque": [1, 2]});
+    original["files"]["rootfs.ext4"]["extension"] = json!("retain");
+    original["files"]["rootfs.ext4"]
+        .as_object_mut()
+        .unwrap()
+        .remove("size");
+    original["files"]["rootfs.ext4.zst"] = json!({"digest": "old", "size": 1, "extension": "retain", "compression": {"codec": "zstd", "level": 1, "extension": true}});
+    std::fs::write(&path, serde_json::to_vec(&original).unwrap()).unwrap();
+    let header = fixture.changed_header(Change::Description);
+    let mut expected: Value = serde_json::from_slice(&header.manifest_json).unwrap();
+
+    fixture
+        .client
+        .import_template(tokio_stream::iter([ImportTemplateRequest {
+            payload: Some(Payload::Header(header)),
+        }]))
+        .await
+        .unwrap();
+
+    let actual: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    for key in ["digest", "size"] {
+        expected["files"]["rootfs.ext4.zst"][key] = actual["files"]["rootfs.ext4.zst"][key].clone();
+    }
+    for key in ["codec", "level"] {
+        expected["files"]["rootfs.ext4.zst"]["compression"][key] =
+            actual["files"]["rootfs.ext4.zst"]["compression"][key].clone();
+    }
+    assert_eq!(
+        actual, expected,
+        "refresh must preserve unknown fields and omitted defaults"
+    );
+    let stored = fixture.state().registration["manifest"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(serde_json::from_str::<Value>(&stored).unwrap(), actual);
+}
+
+#[rstest]
+#[case::missing_dimensions(false)]
+#[case::invalid_chunk_offset(true)]
+#[tokio::test]
+async fn rejected_snapshot_stream_discards_prepared_refresh(#[case] valid_dimensions: bool) {
+    let mut fixture = ImportFixture::new().await;
+    let mut header = fixture.changed_header(Change::Description);
+    header.include_snapshot = true;
+    header.snapshot_vcpu = valid_dimensions.then_some(1);
+    header.snapshot_memory_mib = valid_dimensions.then_some(512);
+    let before = fixture.state();
+    let requests = [
+        ImportTemplateRequest {
+            payload: Some(Payload::Header(header)),
+        },
+        ImportTemplateRequest {
+            payload: Some(Payload::Chunk(crate::proto::FileChunk {
+                file_name: "snapshot.base".into(),
+                offset: 1,
+                data: b"invalid offset".to_vec(),
+                ..Default::default()
+            })),
+        },
+    ];
+
+    let response = fixture
+        .client
+        .import_template(tokio_stream::iter(requests))
+        .await;
+
+    assert_eq!(response.unwrap_err().code(), Code::InvalidArgument);
+    assert_eq!(
+        fixture.state(),
+        before,
+        "incomplete snapshot must not publish build refresh"
+    );
+    assert!(
+        std::fs::read_dir(fixture.directory.parent().unwrap())
+            .unwrap()
+            .all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains(".republishing."))
+    );
 }

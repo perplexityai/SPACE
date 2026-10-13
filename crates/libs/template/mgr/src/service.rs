@@ -2048,117 +2048,154 @@ impl TemplateManagerService {
     /// defaults. Omitted metadata preserves the existing document. Changing
     /// execution metadata requires the separate authorized registration path;
     /// an import's rootfs digest does not authenticate those fields.
-    async fn refresh_existing_build_from_sources(
+    async fn prepare_existing_build_refresh(
         &self,
         template_id: &str,
         content_hash: &str,
         digest_dir: &str,
         manifest_json: Option<&[u8]>,
         metadata_json: Option<&[u8]>,
-        trigger: &'static str,
-    ) -> Result<(), Status> {
+    ) -> Result<Option<ImportStagingGuard>, Status> {
         let digest_path = Path::new(digest_dir);
-        let replacements_unchanged = template_file_replacement_is_unchanged(
+        let unchanged = template_file_replacement_is_unchanged(
             &digest_path.join("manifest.json"),
             manifest_json,
         )? && template_file_replacement_is_unchanged(
             &digest_path.join("metadata.json"),
             metadata_json,
         )?;
-        if replacements_unchanged {
-            match crate::rootfs_cache::verify_rootfs_from_metadata(digest_path) {
-                Ok(()) => {
-                    return self
-                        .upsert_build_from_digest_dir(
-                            template_id,
-                            content_hash,
-                            digest_dir,
-                            RootfsHashVerification::Verify,
-                        )
-                        .await;
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        template = %template_id,
-                        content_hash,
-                        %error,
-                        "existing template rootfs failed verification; refreshing from sources"
-                    );
-                }
+        let staging = if unchanged {
+            None
+        } else {
+            let path = PathBuf::from(format!("{digest_dir}.republishing.{}", Uuid::now_v7()));
+            std::fs::create_dir(&path).map_err(|error| {
+                Status::internal(format!("create republish staging dir: {error}"))
+            })?;
+            let guard = ImportStagingGuard::new(path);
+            set_template_cache_permissions(&guard.path, TEMPLATE_CACHE_DIR_MODE)?;
+            for (file, replacement, required) in [
+                (TEMPLATE_ROOTFS_FILE, None, true),
+                ("manifest.json", manifest_json, true),
+                ("metadata.json", metadata_json, false),
+            ] {
+                write_or_copy_template_file(
+                    &digest_path.join(file),
+                    &guard.path.join(file),
+                    replacement,
+                    required,
+                )?;
             }
-        }
-        let staging_dir = format!("{digest_dir}.republishing.{}", Uuid::now_v7());
-        let staging_path = Path::new(&staging_dir);
-        std::fs::create_dir(staging_path)
-            .map_err(|e| Status::internal(format!("create republish staging dir: {e}")))?;
-        let mut staging_guard = ImportStagingGuard::new(&staging_dir);
-        set_template_cache_permissions(staging_path, TEMPLATE_CACHE_DIR_MODE)?;
-
-        write_or_copy_template_file(
-            &digest_path.join(TEMPLATE_ROOTFS_FILE),
-            &staging_path.join(TEMPLATE_ROOTFS_FILE),
-            None,
-            true,
-        )?;
-        write_or_copy_template_file(
-            &digest_path.join("manifest.json"),
-            &staging_path.join("manifest.json"),
-            manifest_json,
-            true,
-        )?;
-        write_or_copy_template_file(
-            &digest_path.join("metadata.json"),
-            &staging_path.join("metadata.json"),
-            metadata_json,
-            false,
-        )?;
-
-        import_helpers::validate_existing_refresh_metadata(digest_path, staging_path)?;
-        crate::rootfs_cache::verify_rootfs_from_metadata(staging_path).map_err(|error| {
-            Status::failed_precondition(format!("verify staged rootfs: {error}"))
+            import_helpers::validate_existing_refresh_metadata(digest_path, &guard.path)?;
+            Some(guard)
+        };
+        let prepared_path = staging
+            .as_ref()
+            .map_or(digest_path, |guard| guard.path.as_path());
+        crate::rootfs_cache::verify_rootfs_from_metadata(prepared_path).map_err(|error| {
+            Status::failed_precondition(format!("verify existing rootfs: {error}"))
         })?;
         let observed_hash = compute_template_file_hash(
-            staging_path.join(TEMPLATE_ROOTFS_FILE),
-            "hash staged rootfs",
+            prepared_path.join(TEMPLATE_ROOTFS_FILE),
+            "hash existing rootfs",
         )
         .await?;
         if observed_hash != content_hash {
             return Err(Status::failed_precondition(format!(
-                "staged rootfs has hash {observed_hash} but expected {content_hash}"
+                "existing rootfs has hash {observed_hash} but expected {content_hash}"
             )));
         }
-        let stats =
-            generate_template_compressed_rootfs(template_id, content_hash, &staging_dir, trigger)
-                .await?;
-        let manifest = import_helpers::parse_template_manifest(
-            "staged manifest",
-            &std::fs::read(staging_path.join("manifest.json"))
-                .map_err(|error| Status::internal(format!("read staged manifest: {error}")))?,
-        )?;
-        let metadata = match std::fs::read(staging_path.join("metadata.json")) {
+        let manifest_bytes = std::fs::read(prepared_path.join("manifest.json"))
+            .map_err(|error| Status::internal(format!("read prepared manifest: {error}")))?;
+        let manifest =
+            import_helpers::parse_template_manifest("prepared manifest", &manifest_bytes)?;
+        let metadata = match std::fs::read(prepared_path.join("metadata.json")) {
             Ok(bytes) => serde_json::from_slice(&bytes).map_err(|error| {
-                Status::invalid_argument(format!("parse staged metadata: {error}"))
+                Status::invalid_argument(format!("parse prepared metadata: {error}"))
             })?,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Default::default(),
-            Err(error) => return Err(Status::internal(format!("read staged metadata: {error}"))),
+            Err(error) => return Err(Status::internal(format!("read prepared metadata: {error}"))),
         };
-        let manifest = normalize_template_manifest(
+        // Validate the typed schema without serializing its defaults over the raw manifest.
+        let rootfs_size = std::fs::metadata(prepared_path.join(TEMPLATE_ROOTFS_FILE))
+            .map_err(|error| Status::internal(format!("stat existing rootfs: {error}")))?
+            .len();
+        normalize_template_manifest(
             manifest,
             template_id,
             content_hash,
             &metadata,
-            stats.rootfs_size,
-            Some((&stats.compressed_hash, stats.compressed_size)),
+            rootfs_size,
+            None,
         )
         .map_err(|error| Status::invalid_argument(error.to_string()))?;
-        write_template_manifest_atomic(
-            &staging_path.join("manifest.json"),
-            serde_json::to_vec_pretty(&manifest)
-                .map_err(|error| Status::internal(format!("serialize staged manifest: {error}")))?,
-        )?;
-        normalize_template_cache_tree(staging_path)?;
+        if staging.is_some() {
+            let stats = generate_template_compressed_rootfs(
+                template_id,
+                content_hash,
+                &prepared_path.to_string_lossy(),
+                "local_import",
+            )
+            .await?;
+            let object = |value: Option<serde_json::Value>| {
+                serde_json::from_value::<serde_json::Map<String, serde_json::Value>>(
+                    value
+                        .filter(|value| !value.is_null())
+                        .unwrap_or_else(|| serde_json::json!({})),
+                )
+                .map_err(|error| {
+                    Status::invalid_argument(format!("parse manifest object: {error}"))
+                })
+            };
+            let mut manifest: serde_json::Map<String, serde_json::Value> =
+                serde_json::from_slice(&manifest_bytes).map_err(|error| {
+                    Status::invalid_argument(format!("parse prepared manifest: {error}"))
+                })?;
+            let mut files = object(manifest.remove("files"))?;
+            let mut compressed = object(files.remove(TEMPLATE_ROOTFS_ZSTD_FILE))?;
+            let mut compression = object(compressed.remove("compression"))?;
+            compression.insert(
+                "codec".into(),
+                serde_json::json!(TEMPLATE_ROOTFS_ZSTD_CODEC),
+            );
+            compression.insert(
+                "level".into(),
+                serde_json::json!(TEMPLATE_ROOTFS_ZSTD_LEVEL),
+            );
+            compressed.insert("digest".into(), serde_json::json!(stats.compressed_hash));
+            compressed.insert("size".into(), serde_json::json!(stats.compressed_size));
+            compressed.insert("compression".into(), compression.into());
+            files.insert(TEMPLATE_ROOTFS_ZSTD_FILE.into(), compressed.into());
+            manifest.insert("files".into(), files.into());
+            write_template_manifest_atomic(
+                &prepared_path.join("manifest.json"),
+                serde_json::to_vec_pretty(&manifest).map_err(|error| {
+                    Status::internal(format!("serialize prepared manifest: {error}"))
+                })?,
+            )?;
+            normalize_template_cache_tree(prepared_path)?;
+        }
+        Ok(staging)
+    }
 
-        let replaced_path = replace_template_build_dir(staging_path, digest_path)?;
+    async fn publish_existing_build_refresh(
+        &self,
+        template_id: &str,
+        content_hash: &str,
+        digest_dir: &str,
+        prepared: Option<ImportStagingGuard>,
+    ) -> Result<(), Status> {
+        let Some(mut staging_guard) = prepared else {
+            return self
+                .upsert_build_from_digest_dir(
+                    template_id,
+                    content_hash,
+                    digest_dir,
+                    RootfsHashVerification::AlreadyVerified,
+                )
+                .await;
+        };
+        let digest_path = Path::new(digest_dir);
+        let replaced_path = replace_template_build_dir(&staging_guard.path, digest_path)?;
         staging_guard.disarm();
         if let Err(error) = self
             .upsert_build_from_digest_dir(

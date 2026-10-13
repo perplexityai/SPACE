@@ -359,9 +359,26 @@ impl TemplateManagerService {
             (!header.manifest_json.is_empty()).then_some(header.manifest_json.as_slice());
         let metadata_json =
             (!header.metadata_json.is_empty()).then_some(header.metadata_json.as_slice());
+        let prepared = self
+            .prepare_existing_build_refresh(
+                template_id,
+                content_hash,
+                digest_dir,
+                manifest_json,
+                metadata_json,
+            )
+            .await?;
         if header.include_snapshot {
             let dimensions = required_snapshot_dimensions(header)?;
-            let snap_dir = snapshot_dir(template_id, content_hash, dimensions.0, dimensions.1);
+            let snap_dir = snapshot_artifacts_dir(
+                &self.artifact_store.root,
+                template_id,
+                content_hash,
+                dimensions.0,
+                dimensions.1,
+            )
+            .to_string_lossy()
+            .into_owned();
             std::fs::create_dir_all(&snap_dir)
                 .map_err(|e| Status::internal(format!("create snapshot dir: {e}")))?;
             self.receive_snapshot_chunks(stream, &snap_dir).await?;
@@ -373,15 +390,8 @@ impl TemplateManagerService {
             }
         }
 
-        self.refresh_existing_build_from_sources(
-            template_id,
-            content_hash,
-            digest_dir,
-            manifest_json,
-            metadata_json,
-            "local_import",
-        )
-        .await?;
+        self.publish_existing_build_refresh(template_id, content_hash, digest_dir, prepared)
+            .await?;
 
         crate::node_state_sync::mark_template_dirty(&self.db, template_id);
         Ok(import_template_response(template_id, content_hash))
