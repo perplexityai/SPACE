@@ -100,7 +100,7 @@ def _api_pods(*names: str, terminating: tuple[str, ...] = ()) -> CommandResult:
 class PublicApiScaleDownDrain(unittest.TestCase):
     """`rollout status` returns on a scale-down while surplus pods still exit.
 
-    A localhost forward pinned to one of them drops when it does, so the
+    A pooled connection to one of them is reset when it does, so the
     scale-back compensation must not return until only the desired pods remain.
     """
 
@@ -114,7 +114,9 @@ class PublicApiScaleDownDrain(unittest.TestCase):
                 _ok("space-api"),
                 _ok(self._DEPLOYMENT),
                 _api_pods("a", "b", "c", terminating=("b", "c")),
+                _ok(self._DEPLOYMENT),
                 _api_pods("a", "b", terminating=("b",)),
+                _ok(self._DEPLOYMENT),
                 _api_pods("a"),
             ]
         )
@@ -254,3 +256,44 @@ class PublicApiAutoscaler(unittest.TestCase):
         harness.scale_public_api(3)
         harness.restore_public_api_autoscaler()
         self.assertFalse(any(call[5] == "patch" for call in kubectl.calls))
+
+
+class RolloutDrain(unittest.TestCase):
+    """A rolling update's `rollout status` returns while the replaced pods still exit."""
+
+    _DEPLOYMENT = json.dumps(
+        {"spec": {"replicas": 2, "selector": {"matchLabels": {"app.kubernetes.io/name": "space-api"}}}}
+    )
+
+    def test_an_env_rollout_waits_for_the_replaced_pods_to_exit(self) -> None:
+        kubectl = _ScriptedKubectl(
+            [
+                _ok("rolled out"),
+                _ok(self._DEPLOYMENT),
+                _api_pods("new-a", "new-b", "old-a", terminating=("old-a",)),
+                _ok(self._DEPLOYMENT),
+                _api_pods("new-a", "new-b"),
+            ]
+        )
+        harness = KindHarness(kubectl, KindConfig())
+        with mock.patch("space_smoke.adapters.time.sleep") as sleep:
+            harness._await_deployment_rollout("space-api", timeout=60)
+        self.assertEqual(sleep.call_count, 1)
+        self.assertEqual(kubectl.results, [])
+
+    def test_the_desired_count_is_reread_while_an_autoscaler_moves_it(self) -> None:
+        three = json.dumps(
+            {"spec": {"replicas": 3, "selector": {"matchLabels": {"app.kubernetes.io/name": "space-api"}}}}
+        )
+        kubectl = _ScriptedKubectl(
+            [
+                _ok(self._DEPLOYMENT),
+                _api_pods("a", "b", "c"),
+                _ok(three),
+                _api_pods("a", "b", "c"),
+            ]
+        )
+        harness = KindHarness(kubectl, KindConfig())
+        with mock.patch("space_smoke.adapters.time.sleep"):
+            harness._wait_deployment_pods_drained("space-api", timeout=60)
+        self.assertEqual(kubectl.results, [])

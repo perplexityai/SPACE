@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import unittest
 import time
+import json
 import threading
 from types import SimpleNamespace
 from typing import Any, cast
@@ -234,6 +235,12 @@ class _ScriptedKubectl:
         if "get" in argv and "deploy" in argv and "-l" in argv:
             selector = argv[argv.index("-l") + 1]
             return CommandResult(argv, 0, "space-cluster-controller" if "controller" in selector else "space-api", "")
+        if "get" in argv and "deploy" in argv and argv[-1] == "json":
+            # The post-rollout drain: one desired pod, one present.
+            deployment = {"spec": {"replicas": 1, "selector": {"matchLabels": {"app": "x"}}}}
+            return CommandResult(argv, 0, json.dumps(deployment), "")
+        if "get" in argv and "pods" in argv:
+            return CommandResult(argv, 0, json.dumps({"items": [{"metadata": {"name": "p"}}]}), "")
         if "get" in argv and "deploy" in argv:
             return CommandResult(argv, 0, "main", "")
         if "rollout" in argv:

@@ -222,6 +222,9 @@ class EnvOverride(unittest.TestCase):
                 _ok("cluster-controller"),
                 _ok(),
                 _ok(),
+                # The post-rollout drain: the Deployment, then its one pod.
+                _ok(json.dumps({"spec": {"replicas": 1, "selector": {"matchLabels": {"app": "x"}}}})),
+                _ok(json.dumps({"items": [{"metadata": {"name": "p"}}]})),
             ]
         )
         harness = KindHarness(kubectl, KindConfig())

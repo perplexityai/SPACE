@@ -2735,30 +2735,39 @@ ON CONFLICT (key_hash) DO NOTHING;
             ),
             f"await rollout of {name}",
         )
+        self._wait_deployment_pods_drained(name, timeout=timeout)
 
     def wait_public_api_pods_drained(self, *, timeout: float) -> None:
-        """Block until only the Deployment's desired API pods exist, none Terminating.
+        """Block until only the Deployment's desired API pods exist, none Terminating."""
 
-        `kubectl rollout status` completes a scale-down once the available
-        count matches the spec, while the surplus pods are still shutting
-        down and draining their connections, so callers that need every
-        route served by a live replica must wait for the drain too.
+        self._wait_deployment_pods_drained(self._public_api_deployment(), timeout=timeout)
+
+    def _wait_deployment_pods_drained(self, name: str, *, timeout: float) -> None:
+        """Block until only the Deployment's desired pods exist, none Terminating.
+
+        `kubectl rollout status` completes a rolling update, or a scale-down,
+        once the available count matches the spec, while the replaced pods are
+        still shutting down. A client that holds a pooled connection to one of
+        them (the load-balanced entry hands each connection to one replica)
+        has it reset when that pod exits, so a caller about to reuse its
+        client waits for the old pods to be gone, which closes those
+        connections first.
         """
 
-        name = self._public_api_deployment()
-        deployment = json.loads(
-            _require_ok(
-                self.kubectl("get", "deploy", name, "-o", "json", timeout=15),
-                f"read {name}",
-            )
-        )
-        desired = int(deployment["spec"].get("replicas", 1))
-        match_labels = deployment["spec"]["selector"].get("matchLabels") or {}
-        if not match_labels:
-            raise SmokeConfigurationError(f"{name} has no matchLabels selector to list its pods by")
-        selector = ",".join(f"{key}={value}" for key, value in sorted(match_labels.items()))
         deadline = time.monotonic() + timeout
         while True:
+            # Re-read each poll: an autoscaler may move the desired count.
+            deployment = json.loads(
+                _require_ok(
+                    self.kubectl("get", "deploy", name, "-o", "json", timeout=15),
+                    f"read {name}",
+                )
+            )
+            desired = int(deployment["spec"].get("replicas", 1))
+            match_labels = deployment["spec"]["selector"].get("matchLabels") or {}
+            if not match_labels:
+                raise SmokeConfigurationError(f"{name} has no matchLabels selector to list its pods by")
+            selector = ",".join(f"{key}={value}" for key, value in sorted(match_labels.items()))
             pods = json.loads(
                 _require_ok(
                     self.kubectl("get", "pods", "-l", selector, "-o", "json", timeout=15),
@@ -2865,6 +2874,7 @@ ON CONFLICT (key_hash) DO NOTHING;
             self.kubectl("rollout", "status", f"deploy/{name}", f"--timeout={int(timeout)}s", timeout=timeout + 30),
             f"await rollout of {name}",
         )
+        self._wait_deployment_pods_drained(name, timeout=timeout)
 
     def node_group_env(self) -> dict[str, str | None]:
         """`api:<key>` / `controller:<key>` literals for the gate and the labeler."""
