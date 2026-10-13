@@ -23,6 +23,77 @@ Both kinds are optional. When nothing ready matches, a create still succeeds:
 it falls back to a cold boot. Measure latency with the matching option configured;
 otherwise every create takes the cold path.
 
+## Template releases
+
+Warm pools and base snapshots are keyed to a **template release**. Every
+successful template build publishes one immutable release, identified by its
+content hash (`sha256:...`). Tags such as `latest` are movable names that point
+at one release of a template. A create that names `my-template` or
+`my-template:latest` resolves the tag to the exact release at create time. A
+create that names `my-template@sha256:...` always uses that release.
+
+A build creates a new release, and moves a tag only when you ask it to:
+
+- **System templates** (`seed`, `code-runtime`):
+  `space-admin-cli template build seed --publish-tag latest` builds and
+  publishes a release, then prints JSON with its `content_hash`. Without
+  `--publish-tag latest`, only the immutable digest release is published. See
+  the [system-template release procedure](../templates/firecracker/seed/README.md#build-and-publish-system-templates).
+- **E2B SDK builds** through [ECW](ecw.md): an untagged build moves `latest`;
+  a build with explicit tags moves only those tags.
+- **Custom templates through the Admin API**: create the template once, then
+  submit a recipe build with the tags to publish:
+
+```bash
+curl -sS -X POST "$SPACE_API_URL/admin/api/v1/templates" \
+  -H "Authorization: Bearer $SPACE_API_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"name": "my-template", "description": "Benchmark template"}'
+
+curl -sS -X POST "$SPACE_API_URL/admin/api/v1/templates/my-template/builds" \
+  -H "Authorization: Bearer $SPACE_API_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "recipe": {
+      "metadata": {"description": "Benchmark template"},
+      "origin": {"from_template": {"base": "seed:latest"}},
+      "steps": [
+        {"display_name": "tools", "package_install": {"manager": "apt", "packages": ["curl"]}},
+        {"display_name": "setup", "run": {"command": "echo ready > /etc/benchmark"}}
+      ]
+    },
+    "publish_tags": ["latest"]
+  }'
+```
+
+The build response contains a `job_id`. Poll
+`GET /admin/api/v1/templates/my-template/builds/{job_id}` until `state` is
+`succeeded`; the response then carries the new release's `content_hash`.
+`failed` and `publish_failed` are terminal failures.
+
+To list releases or move a tag after the fact, including back to an
+earlier release for rollback:
+
+```bash
+curl -sS "$SPACE_API_URL/admin/api/v1/template-releases" \
+  -H "Authorization: Bearer $SPACE_API_TOKEN"
+
+curl -sS -X PUT "$SPACE_API_URL/admin/api/v1/template-releases/<release-id>/tag" \
+  -H "Authorization: Bearer $SPACE_API_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"tag": "latest"}'
+```
+
+The UI's **Template Releases** table shows the same releases with their tags,
+content hashes and warm pools.
+
+Existing sandboxes keep the release they were created from. A manual warm pool
+also keeps its release: after a new build moves `latest`, creates for `latest`
+miss that pool until you create a pool for the new release or use a
+[rolling policy](#rolling-policies-for-frequently-published-templates). A base
+snapshot is also built from one specific release, so after a new build, check
+`BASE SNAP` again before you measure snapshot restores.
+
 ## Cluster warm pools on Kubernetes
 
 A cluster warm pool is a config row that names one immutable template release
@@ -318,3 +389,9 @@ The lifecycle benchmark in `scripts/benchmarks/bench-sbx-lifecycle.sh` detects
 the template's base snapshot and pool through `space-tmplmgr list`. It runs the
 base-snapshot and pool cases only when they exist, and otherwise reports them
 as skipped.
+
+## Design background
+
+The original design, its slot contract and its fallback rules are recorded in
+the [cluster-wide sandbox pool RFC](space/design/cluster-wide-sandbox-pool-rfc.md).
+The guide above describes current behavior where the two differ.
