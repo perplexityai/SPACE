@@ -39,13 +39,40 @@ fn lock_db(ctx: &CheckpointContext) -> Result<MutexGuard<'_, rusqlite::Connectio
         .map_err(|error| format!("database mutex poisoned: {error}"))
 }
 
-fn require_state_write(
-    result: rusqlite::Result<crate::db::SandboxStateWriteOutcome>,
-) -> Result<(), String> {
-    result
+/// `do_checkpoint`'s admission to the node-local SQLite `sandboxes.state`:
+/// `started` or `paused` to `checkpointing`, under the connection guard that
+/// read the state. Guard refusals and a missing row keep `update_state`'s
+/// message, and a from-state refusal reports the state found; this module's
+/// errors are strings, so it cannot use the service's status mapping.
+fn begin_checkpoint_state(db: &rusqlite::Connection, sandbox_id: &str) -> Result<(), String> {
+    use crate::db::{
+        SandboxStateWriteNotApplied, SandboxStateWriteOutcome as Legacy, StateWriteOutcome,
+        StateWriteRefusal,
+    };
+    let edge = &crate::db::edges::CHECKPOINT_BEGIN;
+    let outcome = match crate::db::update_state_from(db, sandbox_id, edge)
         .map_err(|error| format!("db error: {error}"))?
-        .require_applied()
-        .map_err(|error| error.to_string())
+    {
+        StateWriteOutcome::Applied { .. } => return Ok(()),
+        StateWriteOutcome::Refused {
+            found,
+            refusal: StateWriteRefusal::FromState,
+        } => {
+            return Err(format!(
+                "sandbox state write was superseded: sandbox is {found}"
+            ));
+        }
+        StateWriteOutcome::Refused {
+            refusal: StateWriteRefusal::Quarantined,
+            ..
+        } => Legacy::BlockedByQuarantine,
+        StateWriteOutcome::Refused {
+            refusal: StateWriteRefusal::CleanupOwned,
+            ..
+        } => Legacy::SupersededByCleanupEpisode,
+        StateWriteOutcome::Missing => Legacy::Missing,
+    };
+    Err(SandboxStateWriteNotApplied { outcome }.to_string())
 }
 
 pub(crate) fn write_file_atomic(
@@ -832,11 +859,7 @@ pub async fn do_checkpoint(
         let previous_state = sandbox.state;
 
         // Transition to Checkpointing while still holding the lock
-        require_state_write(crate::db::update_state(
-            &db,
-            sandbox_id,
-            SandboxState::Checkpointing,
-        ))?;
+        begin_checkpoint_state(&db, sandbox_id)?;
         (previous_state, sandbox.node_execution_fence())
     };
     if previous_state == SandboxState::Started {

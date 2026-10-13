@@ -6,7 +6,7 @@ use super::cleanup::{
     CleanupCompletionDisposition, CleanupDispatchDisposition, ObservedCleanupClaim,
 };
 use super::cleanup_support::{
-    CleanupCompletion, cleanup_sandbox_via_node, read_node_execution_fence, require_state_write,
+    CleanupCompletion, cleanup_sandbox_via_node, read_node_execution_fence,
 };
 use super::create::StartFromCheckpointLaunch;
 use super::create_support::*;
@@ -20,6 +20,7 @@ use pplx_space_events::{
     emit_sandbox_event,
 };
 use pplx_space_sbx_mgr_client::operations as spaced_ops;
+use rollback_state::restage_rolled_back_full_snapshot;
 use std::str::FromStr;
 use tracing::Instrument;
 
@@ -1687,14 +1688,7 @@ impl SandboxManagerService {
                             "snapshot.json",
                         )?;
 
-                        // Set state to Suspended so start_from_checkpoint can proceed
-                        {
-                            let db = service.db_conn()?;
-                            require_state_write(
-                                crate::db::update_state(&db, &copy_id, SandboxState::Suspended),
-                                "complete process snapshot suspension",
-                            )?;
-                        }
+                        restage_rolled_back_full_snapshot(&*service.db_conn()?, &copy_id)?;
                         Ok(artifact_guard)
                     })
                     .await?;
@@ -1780,6 +1774,8 @@ fn start_process_options(
             .map_err(|error| invalid(format_args!("{error}")))?,
     })
 }
+
+mod rollback_state;
 
 #[cfg(test)]
 mod start_process_options_tests;

@@ -331,10 +331,6 @@ impl StateWriteRejected {
 /// or an error is logged and leaves the row as it is, and only an applied
 /// write marks the sandbox dirty. `None` is a poisoned connection or a
 /// database error.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the update_state_from conversions adopt it")
-)]
 pub(super) fn update_state_from_best_effort(
     db: &Arc<Mutex<rusqlite::Connection>>,
     sandbox_id: &str,

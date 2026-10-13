@@ -149,6 +149,59 @@ fn checkpoint_context(state: SandboxState) -> (CheckpointContext, String) {
     )
 }
 
+/// `do_checkpoint` reads `started` or `paused` and writes `checkpointing` under
+/// the same connection guard, so its admission writes only from those states.
+/// Every other row keeps every table unchanged and reports why.
+#[test]
+fn checkpoint_admission_writes_only_over_a_started_or_paused_row() {
+    for state in SandboxState::all() {
+        let expected_error = match state {
+            SandboxState::Started | SandboxState::Paused => None,
+            // The generic guards: a stopping or cleanup row is never revived,
+            // and a deleting row owns its `delete_row` cleanup.
+            SandboxState::Stopping
+            | SandboxState::Deleting
+            | SandboxState::CleanupRequired
+            | SandboxState::CleanupFailed => Some(
+                "sandbox state write was not applied: superseded_by_cleanup_episode".to_string(),
+            ),
+            SandboxState::Quarantined => {
+                Some("sandbox state write was not applied: blocked_by_quarantine".to_string())
+            }
+            SandboxState::Creating
+            | SandboxState::Created
+            | SandboxState::Starting
+            | SandboxState::Stopped
+            | SandboxState::Pausing
+            | SandboxState::Resuming
+            | SandboxState::Checkpointing
+            | SandboxState::Suspending
+            | SandboxState::Suspended
+            | SandboxState::Restoring
+            | SandboxState::Failed => Some(format!(
+                "sandbox state write was superseded: sandbox is {state}"
+            )),
+        };
+        let (ctx, sandbox_id) = checkpoint_context(state);
+        let db = ctx.db.lock().unwrap();
+        let before = crate::db::tests::database_rows(&db);
+
+        let result = begin_checkpoint_state(&db, &sandbox_id);
+
+        match expected_error {
+            None => {
+                result.unwrap();
+                let row = crate::db::get_sandbox(&db, &sandbox_id).unwrap().unwrap();
+                assert_eq!(row.state, SandboxState::Checkpointing, "{state}");
+            }
+            Some(message) => {
+                assert_eq!(result.unwrap_err(), message, "{state}");
+                assert_eq!(crate::db::tests::database_rows(&db), before, "{state}");
+            }
+        }
+    }
+}
+
 #[tokio::test]
 async fn skipped_checkpoint_never_publishes_an_artifact() {
     let cases = SandboxState::all()

@@ -1,3 +1,4 @@
+use super::cleanup_support::{require_state_write_from, update_state_from_best_effort};
 use super::*;
 
 pub(super) fn compute_partial_sha256(path: &std::path::Path) -> std::io::Result<String> {
@@ -135,4 +136,50 @@ pub(super) fn publish_template_base_snapshot_dir(
     }
 
     Ok(())
+}
+
+/// Template base-snapshot admission moves the node-local SQLite
+/// `sandboxes.state` from `paused` to `checkpointing`. The caller checks the
+/// row under the same connection guard.
+pub(super) fn begin_template_base_snapshot_state(
+    db: &rusqlite::Connection,
+    sandbox_id: &str,
+) -> Result<(), Status> {
+    require_state_write_from(
+        crate::db::update_state_from(db, sandbox_id, &crate::db::edges::TEMPLATE_SNAPSHOT_BEGIN),
+        "begin template checkpoint",
+    )
+}
+
+/// Template base-snapshot completion returns `checkpointing` to `paused`. The
+/// wake lock excludes neither Stop nor Start, so a Stop that completed during
+/// capture or hashing leaves `stopped`, or whatever a later Start or Pause
+/// moved it to; the completion reports that it was superseded instead of
+/// overwriting the row.
+pub(super) fn complete_template_base_snapshot_state(
+    db: &rusqlite::Connection,
+    sandbox_id: &str,
+) -> Result<(), Status> {
+    require_state_write_from(
+        crate::db::update_state_from(
+            db,
+            sandbox_id,
+            &crate::db::edges::CHECKPOINT_COMPLETE_PAUSED,
+        ),
+        "complete template checkpoint",
+    )
+}
+
+/// After a failed template base snapshot, return `checkpointing` to `paused`
+/// on a best-effort basis. A row another transition moved, such as a Stop,
+/// keeps its state.
+pub(super) fn rollback_template_base_snapshot_state(
+    db: &Arc<Mutex<rusqlite::Connection>>,
+    sandbox_id: &str,
+) {
+    update_state_from_best_effort(
+        db,
+        sandbox_id,
+        &crate::db::edges::CHECKPOINT_ROLLBACK_PAUSED,
+    );
 }

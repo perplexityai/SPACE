@@ -355,14 +355,14 @@ fn best_effort_refusals_change_nothing() {
 
 #[test]
 fn best_effort_database_error_is_none_and_changes_nothing() {
-    let edge: &'static Edge = &edges::TEMPLATE_SNAPSHOT_COMPLETE_AFTER_STOP;
+    let edge: &'static Edge = &edges::ORPHAN_SUSPENDED_INSERT;
     let db = Arc::new(Mutex::new(crate::db::test_conn()));
     let id = SandboxId::new().to_string();
     insert_test_sandbox(&db.lock().unwrap(), &id, SandboxState::Stopped);
     let before = snapshot(&db.lock().unwrap());
 
     assert_eq!(update_state_from_best_effort(&db, &id, edge), None);
-    assert_unchanged("known-race edge", &before, &db.lock().unwrap());
+    assert_unchanged("insert edge", &before, &db.lock().unwrap());
 }
 
 /// A poisoned connection is `None`, changes nothing and signals the failure:

@@ -251,18 +251,22 @@ edge_table! {
 
     // Checkpoints and template base snapshots.
 
-    /// `do_checkpoint` and `create_template_base_snapshot` (from `paused`):
-    /// `update_state(Checkpointing)` checked and written under one guard.
+    /// `begin_checkpoint_state` from `do_checkpoint`, checked and written under
+    /// one guard.
     CHECKPOINT_BEGIN: Request, of(&[Started, Paused]) => Checkpointing;
+    /// `begin_template_base_snapshot_state` from
+    /// `create_template_base_snapshot`, checked and written under one guard.
+    TEMPLATE_SNAPSHOT_BEGIN: Request, of(&[Paused]) => Checkpointing;
     /// `restore_checkpoint_state` from `finish_checkpoint_success`.
     CHECKPOINT_COMPLETE_STARTED: Completion, of(&[Checkpointing]) => Started;
     /// `restore_checkpoint_state` from `finish_checkpoint_success`, and
-    /// `create_template_base_snapshot`'s `update_state(Paused)`.
+    /// `complete_template_base_snapshot_state`.
     CHECKPOINT_COMPLETE_PAUSED: Completion, of(&[Checkpointing]) => Paused;
     /// `restore_checkpoint_state_best_effort` after a failed checkpoint.
     CHECKPOINT_ROLLBACK_STARTED: Compensation, of(&[Checkpointing]) => Started;
     /// `restore_checkpoint_state_best_effort`, and
-    /// `create_template_base_snapshot`'s `update_state_best_effort(Paused)`.
+    /// `rollback_template_base_snapshot_state` after a failed template base
+    /// snapshot.
     CHECKPOINT_ROLLBACK_PAUSED: Compensation, of(&[Checkpointing]) => Paused;
 
     // Suspend.
@@ -274,9 +278,9 @@ edge_table! {
     SUSPEND_COMPLETE: Completion, of(&[Suspending]) => Suspended;
     /// `rollback_suspending_to_paused` from the suspend snapshot path.
     SUSPEND_ROLLBACK: Compensation, of(&[Suspending]) => Paused;
-    /// The full process-snapshot rollback in `grpc_spaced_process_snapshots`:
-    /// `update_state(Suspended)` after its own stop, so `start_from_checkpoint`
-    /// can restore the snapshot.
+    /// `restage_rolled_back_full_snapshot`: the full process-snapshot rollback
+    /// restages its stopped row, so `start_from_checkpoint` can restore the
+    /// snapshot. A row that is already `suspended` is left as it is.
     PROCESS_SNAPSHOT_ROLLBACK_RESTAGE: Completion, of(&[Stopped]) => Suspended;
 
     // Stop and delete.
@@ -429,14 +433,6 @@ edge_table! {
     PAUSE_ROLLBACK_AFTER_STOP: KnownRace, of(&[Stopped]) => Started;
     /// Pause completion (`update_state(Paused)`) after a concurrent Stop.
     PAUSE_COMPLETE_AFTER_STOP: KnownRace, of(&[Stopped]) => Paused;
-    /// The full process-snapshot rollback's `update_state(Suspended)` after a
-    /// Stop admitted while it restaged the snapshot. Its own stop leaves no
-    /// runtime, so the second Stop is reached only in the window between
-    /// Stop's runtime gate and the cleanup fence, or with a leaked runtime.
-    PROCESS_SNAPSHOT_ROLLBACK_AFTER_STOP: KnownRace, of(&[Stopping]) => Suspended;
-    /// `create_template_base_snapshot`'s `update_state(Paused)` after a Stop
-    /// completed during capture.
-    TEMPLATE_SNAPSHOT_COMPLETE_AFTER_STOP: KnownRace, of(&[Stopped]) => Paused;
 }
 
 pub use edges::EDGES;

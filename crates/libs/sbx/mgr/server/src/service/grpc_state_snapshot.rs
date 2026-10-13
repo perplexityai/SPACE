@@ -1,12 +1,12 @@
 use pplx_space_common_core::types::LocalArtifactId;
 
-use super::activation_support::update_state_best_effort;
 use super::cache_cleanup::is_sandbox_running;
-use super::cleanup_support::require_state_write;
 use super::create_support::*;
 use super::tail_support::*;
 use super::template_snapshot_support::{
+    begin_template_base_snapshot_state, complete_template_base_snapshot_state,
     compute_template_base_snapshot_hash, publish_template_base_snapshot_dir,
+    rollback_template_base_snapshot_state,
 };
 use super::validation::{canonical_batched_sandbox_ids, snapshot_type_from_proto};
 use super::*;
@@ -1785,10 +1785,7 @@ impl SandboxManagerService {
                 .state
                 .transition(SandboxState::Checkpointing)
                 .map_err(Status::from)?;
-            require_state_write(
-                crate::db::update_state(&db, &sandbox.id, SandboxState::Checkpointing),
-                "begin template checkpoint",
-            )?;
+            begin_template_base_snapshot_state(&db, &sandbox.id)?;
             (sandbox, content_hash)
         };
 
@@ -1900,13 +1897,7 @@ impl SandboxManagerService {
 
         match snapshot_result {
             Ok((snapshot_hash, snapshot_memory_mib)) => {
-                {
-                    let db = self.db_conn()?;
-                    require_state_write(
-                        crate::db::update_state(&db, &sandbox.id, SandboxState::Paused),
-                        "complete template checkpoint",
-                    )?;
-                }
+                complete_template_base_snapshot_state(&*self.db_conn()?, &sandbox.id)?;
                 tracing::debug!(
                     sandbox_id = %sandbox.id,
                     template = %sandbox.template,
@@ -1936,7 +1927,7 @@ impl SandboxManagerService {
                     "template base snapshot checkpoint failed"
                 );
                 let _ = std::fs::remove_dir_all(&staging_dir);
-                update_state_best_effort(&self.db, &sandbox.id, SandboxState::Paused);
+                rollback_template_base_snapshot_state(&self.db, &sandbox.id);
                 Err(status)
             }
         }

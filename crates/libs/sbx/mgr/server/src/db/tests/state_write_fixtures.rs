@@ -658,7 +658,7 @@ pub(super) fn insert_suspended_with_artifact(conn: &Connection) -> (String, Loca
     (id, artifact)
 }
 
-pub(super) fn decorate(conn: &Connection, id: &str, receipt: SandboxState) {
+pub(crate) fn decorate(conn: &Connection, id: &str, receipt: SandboxState) {
     set_failure_reason(conn, id, "seeded failure");
     seed_receipt(conn, id, receipt);
     backdate(conn, id);

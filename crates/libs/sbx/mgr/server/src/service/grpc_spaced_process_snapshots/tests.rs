@@ -343,3 +343,136 @@ fn rollback_replaces_optional_sidecars_or_reports_unremovable_stale_evidence() {
         }
     }
 }
+
+fn sandbox_state(conn: &rusqlite::Connection, id: &str) -> SandboxState {
+    crate::db::get_sandbox(conn, id).unwrap().unwrap().state
+}
+
+/// Stop admission as the cleanup fence runs it, with a non-blocking Stop's
+/// persisted intent.
+fn admit_stop(conn: &rusqlite::Connection, id: &str) {
+    let tx = crate::db::immediate_transaction(conn).unwrap();
+    crate::db::update_state_superseding_activation_in_transaction(&tx, id, SandboxState::Stopping)
+        .unwrap();
+    assert!(crate::db::set_cleanup_intent(&tx, id, true, CleanupCompletion::MarkStopped).unwrap());
+    tx.commit().unwrap();
+}
+
+fn complete_stop(conn: &rusqlite::Connection, id: &str) {
+    crate::db::complete_row_intent_cleanup_for_job(
+        conn,
+        id,
+        CleanupCompletion::MarkStopped,
+        None,
+        None,
+        None,
+    )
+    .unwrap();
+}
+
+/// The full rollback holds the artifact lock, which Stop does not take, while
+/// it rolls the disk back and copies the snapshot. A Stop admitted in that
+/// window must not be overwritten by the restage to `suspended`: it keeps its
+/// `stopping` row and its completion still settles it.
+#[test]
+fn full_rollback_restage_leaves_a_stop_admitted_after_its_own_stop() {
+    let conn = crate::db::test_conn();
+    let id = SandboxId::new().to_string();
+    crate::service::tests::service_tests::insert_test_sandbox_with_runtime(
+        &conn,
+        &id,
+        SandboxState::Started,
+    );
+    // The rollback's own stop.
+    admit_stop(&conn, &id);
+    complete_stop(&conn, &id);
+    assert_eq!(sandbox_state(&conn, &id), SandboxState::Stopped);
+    admit_stop(&conn, &id);
+    let before = crate::db::tests::database_rows(&conn);
+
+    let error = restage_rolled_back_full_snapshot(&conn, &id)
+        .expect_err("the restage must not overwrite a concurrent Stop");
+
+    assert_eq!(error.code(), tonic::Code::Aborted);
+    assert_eq!(
+        error.message(),
+        "complete process snapshot suspension: sandbox state write was superseded: sandbox is stopping"
+    );
+    assert_eq!(crate::db::tests::database_rows(&conn), before);
+    complete_stop(&conn, &id);
+    let row = crate::db::get_sandbox(&conn, &id).unwrap().unwrap();
+    assert_eq!(row.state, SandboxState::Stopped);
+    assert_eq!(row.cleanup_completion, None);
+}
+
+/// The restage writes only over a `stopped` row and accepts one that is
+/// already `suspended` without a write. Every other row keeps every table
+/// unchanged and the rollback reports why. Rows carry a failure reason, a
+/// receipt for another target and backdated timestamps, which an in-place
+/// rewrite of a `suspended` row would clear or restamp.
+#[test]
+fn full_rollback_restage_writes_only_over_a_stopped_row() {
+    enum Expected {
+        Restaged,
+        AlreadySuspended,
+        Refused(String),
+    }
+    for state in SandboxState::all() {
+        let expected = match state {
+            SandboxState::Stopped => Expected::Restaged,
+            SandboxState::Suspended => Expected::AlreadySuspended,
+            // The generic guard: a deleting row owns its `delete_row` cleanup.
+            SandboxState::Deleting => Expected::Refused(
+                "complete process snapshot suspension: sandbox state write was not applied: \
+                 superseded_by_cleanup_episode"
+                    .to_string(),
+            ),
+            SandboxState::Quarantined => Expected::Refused(
+                "complete process snapshot suspension: sandbox state write was not applied: \
+                 blocked_by_quarantine"
+                    .to_string(),
+            ),
+            SandboxState::Creating
+            | SandboxState::Created
+            | SandboxState::Starting
+            | SandboxState::Started
+            | SandboxState::Stopping
+            | SandboxState::Pausing
+            | SandboxState::Paused
+            | SandboxState::Resuming
+            | SandboxState::Checkpointing
+            | SandboxState::Suspending
+            | SandboxState::Restoring
+            | SandboxState::CleanupRequired
+            | SandboxState::CleanupFailed
+            | SandboxState::Failed => Expected::Refused(format!(
+                "complete process snapshot suspension: sandbox state write was superseded: \
+                 sandbox is {state}"
+            )),
+        };
+        let conn = crate::db::test_conn();
+        let id = SandboxId::new().to_string();
+        crate::service::tests::service_tests::insert_test_sandbox_with_runtime(&conn, &id, state);
+        crate::db::tests::state_write_fixtures::decorate(&conn, &id, SandboxState::Started);
+        let before = crate::db::tests::database_rows(&conn);
+
+        let result = restage_rolled_back_full_snapshot(&conn, &id);
+
+        match expected {
+            Expected::Restaged => {
+                result.unwrap();
+                assert_eq!(sandbox_state(&conn, &id), SandboxState::Suspended);
+            }
+            Expected::AlreadySuspended => {
+                result.unwrap();
+                assert_eq!(crate::db::tests::database_rows(&conn), before, "{state}");
+            }
+            Expected::Refused(message) => {
+                let error = result.expect_err("a refused restage must fail");
+                assert_eq!(error.code(), tonic::Code::Aborted, "{state}");
+                assert_eq!(error.message(), message, "{state}");
+                assert_eq!(crate::db::tests::database_rows(&conn), before, "{state}");
+            }
+        }
+    }
+}

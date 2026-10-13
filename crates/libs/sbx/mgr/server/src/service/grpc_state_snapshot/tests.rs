@@ -133,3 +133,224 @@ async fn full_snapshot_capture_serializes_resume_on_wake_lock() {
         .unwrap();
     resume_task.await.unwrap();
 }
+
+fn sandbox_state(conn: &rusqlite::Connection, id: &str) -> SandboxState {
+    crate::db::get_sandbox(conn, id).unwrap().unwrap().state
+}
+
+fn sandbox_inventory_dirty(conn: &rusqlite::Connection, id: &str) -> bool {
+    crate::db::list_node_dirty_refs(conn, 1000)
+        .unwrap()
+        .iter()
+        .any(|reference| {
+            reference.element_kind == "sandbox_inventory" && reference.element_value == id
+        })
+}
+
+/// Stop admission as the cleanup fence runs it, with a non-blocking Stop's
+/// persisted intent, then Stop's row-intent completion.
+fn stop_sandbox(conn: &rusqlite::Connection, id: &str) {
+    let tx = crate::db::immediate_transaction(conn).unwrap();
+    crate::db::update_state_superseding_activation_in_transaction(&tx, id, SandboxState::Stopping)
+        .unwrap();
+    assert!(
+        crate::db::set_cleanup_intent(&tx, id, true, crate::db::CleanupCompletion::MarkStopped)
+            .unwrap()
+    );
+    tx.commit().unwrap();
+    crate::db::complete_row_intent_cleanup_for_job(
+        conn,
+        id,
+        crate::db::CleanupCompletion::MarkStopped,
+        None,
+        None,
+        None,
+    )
+    .unwrap();
+}
+
+/// The template base-snapshot completion and its failure rollback hold only
+/// the wake lock, which Stop does not take. A Stop that completes while the
+/// snapshot is captured or hashed leaves `stopped`, and neither write may
+/// revive the row as `paused`.
+#[test]
+fn template_base_snapshot_writes_leave_a_stop_that_completed_during_capture_stopped() {
+    for completion in [true, false] {
+        let conn = crate::db::test_conn();
+        let id = SandboxId::new().to_string();
+        crate::service::tests::service_tests::insert_test_sandbox_with_runtime(
+            &conn,
+            &id,
+            SandboxState::Paused,
+        );
+        begin_template_base_snapshot_state(&conn, &id).unwrap();
+        assert_eq!(sandbox_state(&conn, &id), SandboxState::Checkpointing);
+        stop_sandbox(&conn, &id);
+        assert_eq!(sandbox_state(&conn, &id), SandboxState::Stopped);
+        let before = crate::db::tests::database_rows(&conn);
+        let db = Arc::new(Mutex::new(conn));
+
+        if completion {
+            let error = complete_template_base_snapshot_state(&db.lock().unwrap(), &id)
+                .expect_err("completion must not revive a stopped row");
+            assert_eq!(error.code(), tonic::Code::Aborted);
+            assert_eq!(
+                error.message(),
+                "complete template checkpoint: sandbox state write was superseded: sandbox is stopped"
+            );
+        } else {
+            rollback_template_base_snapshot_state(&db, &id);
+        }
+
+        assert_eq!(
+            crate::db::tests::database_rows(&db.lock().unwrap()),
+            before,
+            "completion={completion}"
+        );
+    }
+}
+
+/// Both writes return only a `checkpointing` row to `paused`. Every other row
+/// keeps every table unchanged; the completion reports why to its caller. Only
+/// the best-effort rollback marks the inventory dirty, and only when it writes.
+/// Rows carry a failure reason, a receipt and backdated timestamps, so a write
+/// is visible in every column it touches.
+#[test]
+fn template_base_snapshot_writes_return_only_a_checkpointing_row_to_paused() {
+    for state in SandboxState::all() {
+        let expected_error = match state {
+            SandboxState::Checkpointing => None,
+            // The generic guards: a stopping or cleanup row is never revived,
+            // and a deleting row owns its `delete_row` cleanup.
+            SandboxState::Stopping
+            | SandboxState::Deleting
+            | SandboxState::CleanupRequired
+            | SandboxState::CleanupFailed => Some(
+                "complete template checkpoint: sandbox state write was not applied: \
+                 superseded_by_cleanup_episode"
+                    .to_string(),
+            ),
+            SandboxState::Quarantined => Some(
+                "complete template checkpoint: sandbox state write was not applied: \
+                 blocked_by_quarantine"
+                    .to_string(),
+            ),
+            SandboxState::Creating
+            | SandboxState::Created
+            | SandboxState::Starting
+            | SandboxState::Started
+            | SandboxState::Stopped
+            | SandboxState::Pausing
+            | SandboxState::Paused
+            | SandboxState::Resuming
+            | SandboxState::Suspending
+            | SandboxState::Suspended
+            | SandboxState::Restoring
+            | SandboxState::Failed => Some(format!(
+                "complete template checkpoint: sandbox state write was superseded: sandbox is {state}"
+            )),
+        };
+        for completion in [true, false] {
+            let conn = crate::db::test_conn();
+            let id = SandboxId::new().to_string();
+            crate::service::tests::service_tests::insert_test_sandbox_with_runtime(
+                &conn, &id, state,
+            );
+            crate::db::tests::state_write_fixtures::decorate(&conn, &id, SandboxState::Started);
+            let before = crate::db::tests::database_rows(&conn);
+            let db = Arc::new(Mutex::new(conn));
+
+            let result = if completion {
+                complete_template_base_snapshot_state(&db.lock().unwrap(), &id)
+            } else {
+                rollback_template_base_snapshot_state(&db, &id);
+                Ok(())
+            };
+
+            let conn = db.lock().unwrap();
+            match &expected_error {
+                None => {
+                    result.unwrap();
+                    assert_eq!(sandbox_state(&conn, &id), SandboxState::Paused);
+                    assert_eq!(
+                        sandbox_inventory_dirty(&conn, &id),
+                        !completion,
+                        "completion={completion}"
+                    );
+                }
+                Some(message) => {
+                    if completion {
+                        let error = result.expect_err("refused completion must fail");
+                        assert_eq!(error.code(), tonic::Code::Aborted, "{state}");
+                        assert_eq!(error.message(), message, "{state}");
+                    }
+                    assert_eq!(
+                        crate::db::tests::database_rows(&conn),
+                        before,
+                        "{state}, completion={completion}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Template base-snapshot admission reads `paused` and writes `checkpointing`
+/// under the same connection guard, so it writes only over a `paused` row.
+/// Every other row keeps every table unchanged and reports why.
+#[test]
+fn template_base_snapshot_admission_writes_only_over_a_paused_row() {
+    for state in SandboxState::all() {
+        let expected_error = match state {
+            SandboxState::Paused => None,
+            // The generic guards: a stopping or cleanup row is never revived,
+            // and a deleting row owns its `delete_row` cleanup.
+            SandboxState::Stopping
+            | SandboxState::Deleting
+            | SandboxState::CleanupRequired
+            | SandboxState::CleanupFailed => Some(
+                "begin template checkpoint: sandbox state write was not applied: \
+                 superseded_by_cleanup_episode"
+                    .to_string(),
+            ),
+            SandboxState::Quarantined => Some(
+                "begin template checkpoint: sandbox state write was not applied: \
+                 blocked_by_quarantine"
+                    .to_string(),
+            ),
+            SandboxState::Creating
+            | SandboxState::Created
+            | SandboxState::Starting
+            | SandboxState::Started
+            | SandboxState::Stopped
+            | SandboxState::Pausing
+            | SandboxState::Resuming
+            | SandboxState::Checkpointing
+            | SandboxState::Suspending
+            | SandboxState::Suspended
+            | SandboxState::Restoring
+            | SandboxState::Failed => Some(format!(
+                "begin template checkpoint: sandbox state write was superseded: sandbox is {state}"
+            )),
+        };
+        let conn = crate::db::test_conn();
+        let id = SandboxId::new().to_string();
+        crate::service::tests::service_tests::insert_test_sandbox_with_runtime(&conn, &id, state);
+        let before = crate::db::tests::database_rows(&conn);
+
+        let result = begin_template_base_snapshot_state(&conn, &id);
+
+        match expected_error {
+            None => {
+                result.unwrap();
+                assert_eq!(sandbox_state(&conn, &id), SandboxState::Checkpointing);
+            }
+            Some(message) => {
+                let error = result.expect_err("a refused admission must fail");
+                assert_eq!(error.code(), tonic::Code::Aborted, "{state}");
+                assert_eq!(error.message(), message, "{state}");
+                assert_eq!(crate::db::tests::database_rows(&conn), before, "{state}");
+            }
+        }
+    }
+}
