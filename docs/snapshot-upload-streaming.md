@@ -275,8 +275,8 @@ takes the same path.
 `BtrfsInspectSendSource` is node-manager's read-only check of one source. It
 verifies the manifest identity, the subvolume lineage, and the read-only state,
 then returns the rootfs length. It runs in its own four-slot lane, separate from
-both the filesystem permits that suspend and restore receive share and the
-diagnostic lane. `NOT_FOUND` means the artifact or bundle is absent.
+the general filesystem, restore-receive, and diagnostic lanes. `NOT_FOUND`
+means the artifact or bundle is absent.
 `FAILED_PRECONDITION` means it is unusable, including a bundle without its
 manifest: capture syncs the manifest before it reports the identity a caller
 inspects, so that manifest was lost and no later inspection will find it. Any
@@ -314,6 +314,119 @@ counts outcomes by `outcome` and, when unanswered, gRPC `code`.
 recovery could not resolve, from their first unresolved pass until an answer. A
 persistent `unimplemented` or `permission_denied` code indicates a version or
 socket-identity mismatch, not a missing artifact.
+
+### Streamed pull scheduling
+
+Streamed pulls reserve bounded decoder state before fetching body buffers.
+They acquire CPU only for each blocking decode call, releasing it between input
+chunks and lending it while waiting for output writeback. Retaining CPU across
+download-buffer admission would let a new pull prevent the buffer owner from
+resuming. Cancellation interrupts both output admission and CPU reacquisition.
+
+`--codec-concurrency` uses at most 128 CPU permits, including when automatic
+sizing selects a larger CPU quota. Live streamed decoder states are capped at
+twice that resolved concurrency and at 128. Their protected priority reserve
+keeps the same proportion as the codec reserve, with shared capacity always
+remaining. Together with the existing streaming-upload producer bound, these
+ceilings leave headroom in the executable's default 512-thread Tokio blocking
+pool. Embedding the executor in a smaller custom runtime requires a compatible
+worker-capacity budget.
+
+The writeback worker retires enough debt for blocked reservations to proceed
+and first favors their queued ranges. Every out-of-order retirement gives the
+oldest range the next turn, including across separate drains, so completed
+streams release their debt and file descriptors under sustained load.
+When priority admission is configured, 128 MiB of writeback capacity is
+protected from lower-priority pulls, clipped to half the aggregate budget.
+Writeback still uses 32 MiB windows, so the reserve can admit several restore
+windows while other pulls are blocked without changing the node-wide cap.
+
+### Restore stream cache handoff
+
+Volume-manager can leave a bounded prefix of a downloaded `rootfs.btrfs-send`
+in page cache for node-manager's subsequent receive. This is opt-in and applies
+to plain, non-raw pulls using the ranged streaming decoder. Other artifacts,
+encrypted pulls, two-pass fallback downloads, and already-present replicas
+keep their existing policy. It changes cache advice, not the stream format,
+download publication, durability, or receive protocol.
+
+The volume-manager executable accepts these startup options:
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `--receive-cache-budget-bytes` | `0` (disabled) | Aggregate reserved prefixes across the node's volume-manager executor and its clones. |
+| `--receive-cache-per-pull-bytes` | `268435456` (256 MiB) | Maximum prefix reserved by one pull. |
+
+Both caps round down to 4 KiB units. Admission reserves the full per-pull cap
+without waiting; a disabled, oversized, or saturated reservation uses ordinary
+eviction. For example, a 1 GiB aggregate budget with 256 MiB prefixes admits
+four concurrent reservations. Dirty output still goes through the existing
+bounded writeback coordinator; retention only suppresses eviction within the
+admitted prefix after writeback. Output beyond that prefix is advised away.
+
+| Outcome | Cache ownership |
+| --- | --- |
+| Successful download | Retain the prefix for up to 30 seconds after publication. Node-manager advises away the pinned input after receive finishes, including a failed or cancelled receive. Volume-manager conservatively holds the budget until expiry because there is no consume acknowledgement. |
+| Download failure, cancellation, or timeout | Expire retention and advise away the pinned prefix. Surviving writers retain their budget references until they finish; queued writeback ranges hold only weak references and cannot prevent budget reuse after expiry. Subsequent ranges use ordinary eviction. |
+| Retry or destination replacement | Each new download needs admission. Existing-file retries do not extend retention. Expiry uses the original descriptor, so it cannot evict a replacement inode through a reused pathname. |
+| Orderly shutdown or last cache-controller handle dropped | Stop retention and expire admitted prefixes. Service shutdown drains expiry tasks alongside transfer work. |
+| Process death | No durable cache lease needs recovery. Clean pages remain normally reclaimable; recovered transfers use fresh admission. |
+
+This is a bound on intentionally retained prefixes during one service lifetime,
+not on physical page-cache residency or cgroup memory. Pages are never pinned;
+memory pressure can reclaim them before receive, and cache advice can fail or
+leave dirty pages resident. Keep retention disabled unless device-read savings
+and restore latency justify its extra file-cache occupancy under representative
+concurrency. The retention descriptor delays physical reclamation of an
+unlinked stream until expiry. Independently, the existing writeback queue owns
+descriptors until its ranges retire, which can take longer under idle traffic
+below its low watermark. There is no 30-second bound on whole-inode disk
+reclamation; ordinary free-space admission still counts allocated blocks.
+
+Node-manager admits restore receive separately from suspend capture/send:
+defaults permit four general filesystem operations plus four receives, eight
+operations in total, preserving the previous uncontended receive capacity.
+Configure the latter with `SPACE_NODEMGR_LIMIT_RECEIVE_INSTANCE=4:16`
+(active:queued). Existing `SPACE_NODEMGR_LIMIT_FILESYSTEM` overrides no longer
+limit receives.
+The sandbox artifact lock and mutation claim still serialize work on one
+sandbox. This protects restore progress without claiming a shared I/O ceiling.
+
+### Streamed pull measurement
+
+An isolated Linux/btrfs comparison against the pre-scheduling implementation
+used the real transfer executor and S3 SDK with synthetic objects served over
+loopback. Each process had a 12 GiB memory limit, six codec permits (three
+reserved for priority 100), and a 2 GiB writeback budget. Three repetitions
+verified every output hash; no run hit its memory limit or deadline.
+
+The mixed workload downloaded four 2 GiB memory images with 25% nonzero data
+at priority 100 alongside four dense 1 GiB images at priority 0. With the
+128 MiB writeback reserve, median completion of the slowest high-priority pull
+fell from 3.17 s to 1.83 s, while completion of the entire batch rose from
+3.52 s to 3.86 s. Peak sampled memory increased from 3.36 GiB to 3.67 GiB.
+This favors restore latency; it does not establish a general throughput gain.
+
+A separate alternating comparison under a 512 MiB writeback budget isolated
+reserve width: 32 MiB versus 128 MiB produced 2.20 s versus 2.03 s for the
+slowest high-priority pull, and 5.49 s versus 5.51 s for the entire batch.
+The writeback window remained 32 MiB in both variants.
+
+For a 512 MiB incremental send stream, three order-balanced runs per cache
+policy measured the following receive costs after download:
+
+| Retained input | SSD input reads | Median receive time |
+| --- | --- | --- |
+| None | 512 MiB | 0.318 s |
+| 256 MiB prefix | 256 MiB | 0.304 s |
+| Entire stream, within a 1 GiB cap | 0 | 0.318 s |
+
+Retention eliminated the expected reads but did not materially improve receive
+latency on this device. Clean cached bytes still consume memory headroom, so
+retention remains disabled by default. These are subsystem measurements, not
+S3 network, encrypted-volume usability, template lifecycle, or end-to-end wake
+measurements. A deployment canary still needs concurrent suspend/restore load,
+queue latency, memory pressure, restart, and rollback evidence.
 
 ### Isolated btrfs transfer measurement
 

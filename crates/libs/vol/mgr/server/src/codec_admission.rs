@@ -12,8 +12,10 @@
 //! also when the async caller is cancelled. The exceptions: a sparse-shadow
 //! comparison holds its permit in the async task around its `spawn_blocking`,
 //! a streaming producer's slot is lent while the producer is blocked on its
-//! output, and a streamed pull's decode guard is held by the object-store
-//! download path.
+//! output. Streamed pulls acquire a CPU slot for each blocking decoder call
+//! and lend it while output writeback blocks. A separate admission instance
+//! bounds live decoder state through the last blocking call; those permits
+//! stay charged while CPU is lent and while input buffers are awaited.
 
 use std::sync::Arc;
 
@@ -35,7 +37,7 @@ pub enum CodecPriority {
 pub struct CodecAdmissionClosed;
 
 /// Shared and reserved codec permit pools. `Clone` shares the pools.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct CodecAdmission {
     shared: Arc<Semaphore>,
     reserve: Arc<Semaphore>,
@@ -107,6 +109,12 @@ impl CodecAdmission {
     }
 
     #[cfg(test)]
+    pub fn close(&self) {
+        self.shared.close();
+        self.reserve.close();
+    }
+
+    #[cfg(test)]
     pub fn shared_available(&self) -> usize {
         self.shared.available_permits()
     }
@@ -119,6 +127,7 @@ impl CodecAdmission {
 
 /// One admitted codec pass. Dropping it releases the permit.
 #[must_use = "dropping a codec permit releases its admission"]
+#[derive(Debug)]
 pub struct CodecPermit {
     _permit: OwnedSemaphorePermit,
 }
@@ -126,6 +135,7 @@ pub struct CodecPermit {
 /// A codec permit its holder can lend while it cannot run and must
 /// reacquire before running again.
 #[must_use = "dropping a codec slot releases its admission"]
+#[derive(Debug)]
 pub struct CodecSlot {
     admission: CodecAdmission,
     priority: CodecPriority,

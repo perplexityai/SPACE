@@ -10,6 +10,20 @@ pub(in crate::service) struct ReceiveRoot {
     directory: File,
 }
 
+/// The blocking receive owner keeps this descriptor until the child is reaped,
+/// including failure/cancellation. Evict the consumed inode, never a pathname
+/// that another restore could have replaced.
+struct ConsumedStream(File);
+
+impl Drop for ConsumedStream {
+    fn drop(&mut self) {
+        if let Err(error) = pplx_space_common_svc::page_cache::advise_range_dontneed(&self.0, 0, 0)
+        {
+            tracing::warn!(%error, "failed to release received stream page cache");
+        }
+    }
+}
+
 impl ReceiveRoot {
     pub(in crate::service) fn open(path: &Path) -> Result<Self, Status> {
         Ok(Self {
@@ -27,6 +41,13 @@ impl ReceiveRoot {
         stream: File,
         cancel: Option<&CancellationToken>,
     ) -> Result<(), Status> {
+        let _consumed = match stream.try_clone() {
+            Ok(file) => Some(ConsumedStream(file)),
+            Err(error) => {
+                tracing::warn!(%error, "cannot retain descriptor for receive cache eviction");
+                None
+            }
+        };
         if cancel.is_some_and(CancellationToken::is_cancelled) {
             return Err(Status::cancelled("btrfs receive cancelled before scrub"));
         }

@@ -95,7 +95,8 @@ struct Cli {
     /// Maximum concurrent CPU-bound zstd passes (compress or decompress)
     /// across all transfer jobs. Each pass is single-threaded, so running
     /// more of them than the pod's CPU quota just time-slices every job
-    /// slower. 0 auto-sizes to the CPU quota.
+    /// slower. 0 auto-sizes to the CPU quota. Both explicit and automatic
+    /// values are capped at 128 to preserve blocking-worker headroom.
     #[arg(long, default_value_t = DEFAULT_CODEC_CONCURRENCY)]
     codec_concurrency: usize,
 
@@ -108,9 +109,19 @@ struct Cli {
     codec_priority_reserve: usize,
 
     /// Process-wide high watermark for streamed output awaiting writeback.
-    /// Producers resume after the background reaper drains half this amount.
+    /// The reaper retires enough debt for blocked producers to resume.
     #[arg(long, default_value_t = DEFAULT_STREAM_WRITEBACK_BUDGET_BYTES)]
     stream_writeback_budget_bytes: u64,
+
+    /// Best-effort page-cache retention for streamed btrfs restore inputs.
+    /// Zero disables it. The budget is shared by all pulls on this node.
+    #[arg(long, default_value_t = 0)]
+    receive_cache_budget_bytes: u64,
+
+    /// Maximum stream prefix retained per pull, for at most 30 seconds after
+    /// download. Saturated admission falls back to ordinary cache eviction.
+    #[arg(long, default_value_t = 256 * 1024 * 1024)]
+    receive_cache_per_pull_bytes: u64,
 
     /// Protected pull capacity as MIN_PRIORITY:CONCURRENCY:ACTIVE_JOBS. Repeat for more bands.
     #[arg(
@@ -175,6 +186,8 @@ impl TryFrom<Cli> for VolmgrRunConfig {
             codec_concurrency: cli.codec_concurrency,
             codec_priority_reserve: cli.codec_priority_reserve,
             stream_writeback_budget_bytes: cli.stream_writeback_budget_bytes,
+            receive_cache_budget_bytes: cli.receive_cache_budget_bytes,
+            receive_cache_per_pull_bytes: cli.receive_cache_per_pull_bytes,
             pull_priority_bands: cli.pull_priority_bands,
             transfer_timeout: Duration::from_secs(cli.transfer_timeout_secs),
             transfer_max_attempts: cli.transfer_max_attempts,

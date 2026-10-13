@@ -135,6 +135,18 @@ fn load_snapshot_defaults_retain_restore_burst_queue_headroom() {
     assert_eq!(LifecycleMethod::LoadSnapshot.default_limits(), (8, 56));
 }
 
+#[tokio::test]
+async fn receive_admission_remains_available_when_filesystem_lane_is_full() {
+    let limiter = limiter_with(LifecycleMethod::Filesystem, 1, 0);
+    let _filesystem = limiter.acquire(LifecycleMethod::Filesystem).await.unwrap();
+    assert!(limiter.acquire(LifecycleMethod::Filesystem).await.is_err());
+    let _receive = limiter
+        .acquire(LifecycleMethod::ReceiveInstance)
+        .await
+        .unwrap();
+    assert_eq!(LifecycleMethod::ReceiveInstance.default_limits(), (4, 16));
+}
+
 /// Tonic drops the handler future on client
 /// cancellation/disconnect. If `acquire` increments `enqueued` and then
 /// awaits the semaphore, dropping the future mid-await must not leak the

@@ -71,6 +71,22 @@ Before enabling a service caller, verify incomplete-multipart lifecycle cleanup
 on its bucket/backend. Retain the file-backed selection for rollout and rollback.
 This API adds no persisted state, protobuf fields or database migration.
 
+## Download contract
+
+With multiple readers, the first GET requests a 1 MiB prefix. Its validated
+`Content-Range` supplies the total size and its ETag pins subsequent GETs and
+body retries. The prefix is consumed as payload, avoiding a discarded size-probe
+GET. Later ranges use the configured chunk size and every response must match
+its requested range, total size, length and ETag before publication.
+
+The prefix consumes one ordinary buffer permit; decode admission precedes body
+consumption. A complete prefix needs no further GET. Empty objects, endpoints
+without usable range/ETag evidence, and single-reader configurations use a whole
+response without combining versions. Ranged output retains the existing scratch
+file, sequential writer and atomic publication contract. The shorter prefix
+reduces bytes required before decoding can begin; latency gains require a
+service-level benchmark.
+
 ## Validation
 
 `cargo test -p pplx-space-object-store` runs the real AWS SDK against local HTTP

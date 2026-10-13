@@ -1,5 +1,16 @@
 # Node-manager execution authority
 
+Btrfs restore receive has a separate lifecycle admission lane from general
+filesystem work, including suspend capture/send. Defaults allow four general
+filesystem operations plus four receives concurrently, eight operations in
+total. Receive keeps its previous uncontended capacity while gaining independent
+admission. Tune receive admission
+with `SPACE_NODEMGR_LIMIT_RECEIVE_INSTANCE=<permits>:<max_queue>` (default
+`4:16`); existing `SPACE_NODEMGR_LIMIT_FILESYSTEM` overrides no longer limit
+receives. The two lanes do not enforce a shared disk-throughput ceiling.
+Both lanes retain the same sandbox artifact lock, mutation claim and
+blocking-work ownership, so operations on one sandbox remain serialized.
+
 Lifecycle mutations require the sandbox owner's persisted execution identity.
 Node-manager, runtime-supervisor and sandbox-manager retain that authority across
 process restarts; lease absence alone does not authorize cleanup of a live VM.

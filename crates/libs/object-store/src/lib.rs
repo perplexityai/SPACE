@@ -251,6 +251,7 @@ struct RangedDownloadPlan<'a> {
     size: u64,
     etag: String,
     ranges: Vec<MultipartPartRange>,
+    first_response: GetObjectOutput,
     /// Optional transform wrapped around the scratch file (streaming
     /// decode). `None` writes wire bytes untouched.
     wrap_writer: Option<&'a WrapWriter>,
@@ -1161,50 +1162,20 @@ impl ObjectStore for S3ObjectStore {
         target: ObjectTarget<'_>,
         dst: &Path,
     ) -> Result<u64, ObjectStoreError> {
-        let resp = self
-            .base
-            .get_object()
-            .bucket(target.bucket)
-            .key(target.key)
-            .customize()
-            .config_override(self.op_config(creds, &target, S3Operation::GetObject))
-            .send()
-            .await
-            .map_err(|err| classify_get_error(err, target.bucket, target.key))?;
-        let size = get_object_content_length(target.key, resp.content_length())?;
-
-        if let Some(chunk_ranges) = single_writer_download_ranges(
-            size,
-            self.download_chunk_size,
-            self.download_reader_concurrency,
-        ) {
-            // Pin every ranged GET to the version the size came from so an
-            // object overwritten mid-download yields 412s (job-level retry)
-            // instead of a file stitched from two versions. An endpoint that
-            // returns no ETag cannot be pinned, and unpinned ranged GETs
-            // could assemble equal-length ranges from different object
-            // versions — stream the already-open response instead.
-            if let Some(etag) = resp.e_tag().map(str::to_string) {
-                drop(resp);
-                let plan = RangedDownloadPlan {
-                    size,
-                    etag,
-                    ranges: chunk_ranges,
-                    wrap_writer: None,
-                    decode_guard: None,
-                };
-                let (total, _transformed) = self
-                    .download_ranged_single_writer(creds, &target, dst, plan)
-                    .await?;
-                return Ok(total);
-            }
-            warn!(
-                bucket = target.bucket,
-                key = target.key,
-                size_bytes = size,
-                "object has no ETag; falling back to a single-stream download \
-                 instead of unpinnable ranged GETs"
-            );
+        let (resp, size, etag) = self.start_download(creds, &target).await?;
+        if let Some(etag) = etag {
+            let plan = RangedDownloadPlan {
+                size,
+                etag,
+                ranges: download_chunk_ranges(size, self.download_chunk_size),
+                first_response: resp,
+                wrap_writer: None,
+                decode_guard: None,
+            };
+            let (total, _transformed) = self
+                .download_ranged_single_writer(creds, &target, dst, plan)
+                .await?;
+            return Ok(total);
         }
 
         self.write_single_get_response(target, dst, size, resp)
@@ -1218,25 +1189,8 @@ impl ObjectStore for S3ObjectStore {
         dst: &Path,
         stream: StreamDecode<'_>,
     ) -> Result<StreamedGetFile, ObjectStoreError> {
-        let resp = self
-            .base
-            .get_object()
-            .bucket(target.bucket)
-            .key(target.key)
-            .customize()
-            .config_override(self.op_config(creds, &target, S3Operation::GetObject))
-            .send()
-            .await
-            .map_err(|err| classify_get_error(err, target.bucket, target.key))?;
-        let size = get_object_content_length(target.key, resp.content_length())?;
-
-        if let Some(chunk_ranges) = single_writer_download_ranges(
-            size,
-            self.download_chunk_size,
-            self.download_reader_concurrency,
-        ) && let Some(etag) = resp.e_tag().map(str::to_string)
-        {
-            drop(resp);
+        let (resp, size, etag) = self.start_download(creds, &target).await?;
+        if let Some(etag) = etag {
             // Admission before any body chunk is fetched: a stream that
             // holds no decode guard holds no buffer-budget permits either,
             // so the two semaphores cannot deadlock against each other. The
@@ -1248,7 +1202,8 @@ impl ObjectStore for S3ObjectStore {
             let plan = RangedDownloadPlan {
                 size,
                 etag,
-                ranges: chunk_ranges,
+                ranges: download_chunk_ranges(size, self.download_chunk_size),
+                first_response: resp,
                 wrap_writer: Some(stream.wrap_writer),
                 decode_guard,
             };
@@ -1271,6 +1226,75 @@ impl ObjectStore for S3ObjectStore {
 }
 
 impl S3ObjectStore {
+    /// The first range supplies both object identity and payload. Its body
+    /// stays unread until decode admission and a download-buffer permit are
+    /// held, just like every later chunk. Unpinnable endpoints use one whole
+    /// response rather than stitching object versions together.
+    async fn start_download(
+        &self,
+        creds: &ObjectCredentials,
+        target: &ObjectTarget<'_>,
+    ) -> Result<(GetObjectOutput, u64, Option<String>), ObjectStoreError> {
+        let prefix_length = first_download_chunk_size(self.download_chunk_size) as u64;
+        let mut range = (self.download_reader_concurrency > 1)
+            .then(|| format!("bytes=0-{}", prefix_length - 1));
+        loop {
+            let response = self
+                .base
+                .get_object()
+                .bucket(target.bucket)
+                .key(target.key)
+                .set_range(range.clone())
+                .customize()
+                .config_override(self.op_config(creds, target, S3Operation::GetObject))
+                .send()
+                .await;
+            let resp = match response {
+                Ok(resp) => resp,
+                // Empty objects have no satisfiable byte range. Re-read as a
+                // whole object; never infer emptiness from a failed request.
+                Err(err)
+                    if range.is_some()
+                        && err
+                            .raw_response()
+                            .is_some_and(|r| r.status().as_u16() == 416) =>
+                {
+                    range = None;
+                    continue;
+                }
+                Err(err) => return Err(classify_get_error(err, target.bucket, target.key)),
+            };
+            let length = get_object_content_length(target.key, resp.content_length())?;
+            if range.is_none() {
+                if resp.content_range().is_some() {
+                    return Err(ObjectStoreError::Get(
+                        "whole-object GET returned a partial response".into(),
+                    ));
+                }
+                return Ok((resp, length, None));
+            }
+            if let Some(content_range) = resp.content_range() {
+                let size = validate_content_range(content_range, 0, prefix_length, length)?;
+                if size == length {
+                    return Ok((resp, size, None));
+                }
+                if let Some(etag) = resp
+                    .e_tag()
+                    .filter(|tag| !tag.is_empty())
+                    .map(str::to_owned)
+                {
+                    return Ok((resp, size, Some(etag)));
+                }
+            }
+            // Missing range evidence or identity cannot prove that this body
+            // can be combined with other responses. A fresh whole GET also
+            // supports endpoints that ignore Range without trusting a partial
+            // response whose Content-Range was stripped by a proxy.
+            drop(resp);
+            range = None;
+        }
+    }
+
     async fn write_single_get_response(
         &self,
         target: ObjectTarget<'_>,
@@ -1341,9 +1365,11 @@ impl S3ObjectStore {
             size,
             etag,
             ranges,
+            first_response,
             wrap_writer,
             decode_guard,
         } = plan;
+        let mut first_response = Some(first_response);
         let chunk_count = ranges.len();
         let reader_concurrency = self.download_reader_concurrency.max(1);
         let chunk_size = self.download_chunk_size;
@@ -1447,7 +1473,8 @@ impl S3ObjectStore {
                     etag: etag.clone(),
                     chunk_index,
                     range_header: byte_range_header(range),
-                    length: range.length,
+                    range,
+                    size,
                     timeouts: self.timeouts.for_operation(S3Operation::GetObject),
                     attempts: self.attempts.clone(),
                 };
@@ -1481,10 +1508,11 @@ impl S3ObjectStore {
                     s3.chunk_index = chunk_index,
                     s3.endpoint = %endpoint_span_label(fetch.endpoint.as_deref()),
                 );
+                let response = first_response.take();
                 tasks.spawn(
                     async move {
                         let started_at = Instant::now();
-                        let outcome = fetch.fetch().await.map(|bytes| {
+                        let outcome = fetch.fetch(response).await.map(|bytes| {
                             (chunk_index, bytes, permit, started_at.elapsed().as_millis())
                         });
                         // External-client spans must record an outcome on
@@ -1553,6 +1581,10 @@ impl S3ObjectStore {
             while let Some((chunk, permit)) = window.pop_ready() {
                 let write_started_at = Instant::now();
                 writer = tokio::task::spawn_blocking(move || {
+                    // Cancellation cannot release budget while this detached
+                    // worker still owns input. Drop bytes before their charge.
+                    let _permit = permit;
+                    let chunk = chunk;
                     writer.write_chunk(&chunk)?;
                     Ok::<_, std::io::Error>(writer)
                 })
@@ -1561,10 +1593,6 @@ impl S3ObjectStore {
                 sequential_writer_ms = sequential_writer_ms.saturating_add(
                     u64::try_from(write_started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
                 );
-                // The chunk's bytes are on disk (or in page cache in the
-                // buffered fallback); return its share of the process-wide
-                // buffer budget.
-                drop(permit);
             }
         }
 
@@ -1722,7 +1750,8 @@ struct ChunkFetch {
     etag: String,
     chunk_index: usize,
     range_header: String,
-    length: u64,
+    range: MultipartPartRange,
+    size: u64,
     timeouts: TimeoutConfig,
     attempts: AttemptObserver,
 }
@@ -1751,12 +1780,15 @@ impl ChunkFetch {
     /// future. The caller's buffer permit stays held across retries, and a
     /// failed attempt's partial buffer is dropped before the next starts, so
     /// a retry never takes more than its one chunk of the buffer budget.
-    async fn fetch(&self) -> Result<Bytes, ObjectStoreError> {
+    async fn fetch(
+        &self,
+        mut first_response: Option<GetObjectOutput>,
+    ) -> Result<Bytes, ObjectStoreError> {
         let started_at = Instant::now();
         let mut attempt = 1;
         loop {
             let attempt_started_at = Instant::now();
-            let error = match self.fetch_once().await {
+            let error = match self.fetch_once(first_response.take()).await {
                 Ok(bytes) => {
                     if attempt > 1 {
                         self.attempts.body_read_recovered(
@@ -1789,7 +1821,10 @@ impl ChunkFetch {
         }
     }
 
-    async fn fetch_once(&self) -> Result<Bytes, ChunkFailure> {
+    async fn fetch_once(
+        &self,
+        first_response: Option<GetObjectOutput>,
+    ) -> Result<Bytes, ChunkFailure> {
         let started_at = Instant::now();
         let target = ObjectTarget {
             bucket: &self.bucket,
@@ -1798,38 +1833,57 @@ impl ChunkFetch {
             endpoint: self.endpoint.as_deref(),
             path_style: self.path_style,
         };
-        let resp = match self
-            .client
-            .get_object()
-            .bucket(&self.bucket)
-            .key(&self.key)
-            .range(&self.range_header)
-            .if_match(&self.etag)
-            .customize()
-            .config_override(S3ObjectStore::op_config_with(
-                &self.creds,
-                &target,
-                self.timeouts.clone(),
-            ))
-            .send()
-            .await
-        {
-            Ok(resp) => resp,
-            Err(err) => {
-                let error = classify_get_error(err, &self.bucket, &self.key);
-                warn!(
-                    key = self.key,
-                    chunk_index = self.chunk_index,
-                    range = self.range_header,
-                    elapsed_ms = started_at.elapsed().as_millis(),
-                    error = %error,
-                    "ranged download chunk failed"
-                );
-                return Err(ChunkFailure::Fatal(error));
+        let resp = if let Some(resp) = first_response {
+            resp
+        } else {
+            match self
+                .client
+                .get_object()
+                .bucket(&self.bucket)
+                .key(&self.key)
+                .range(&self.range_header)
+                .if_match(&self.etag)
+                .customize()
+                .config_override(S3ObjectStore::op_config_with(
+                    &self.creds,
+                    &target,
+                    self.timeouts.clone(),
+                ))
+                .send()
+                .await
+            {
+                Ok(resp) => resp,
+                Err(err) => {
+                    let error = classify_get_error(err, &self.bucket, &self.key);
+                    warn!(
+                        key = self.key,
+                        chunk_index = self.chunk_index,
+                        range = self.range_header,
+                        elapsed_ms = started_at.elapsed().as_millis(),
+                        error = %error,
+                        "ranged download chunk failed"
+                    );
+                    return Err(ChunkFailure::Fatal(error));
+                }
             }
         };
-
-        let length = self.length;
+        let length = self.range.length;
+        let advertised = get_object_content_length(&self.key, resp.content_length())
+            .map_err(ChunkFailure::Fatal)?;
+        let size = validate_content_range(
+            resp.content_range().ok_or_else(|| {
+                ChunkFailure::Fatal(ObjectStoreError::MissingField("content_range"))
+            })?,
+            self.range.offset,
+            length,
+            advertised,
+        )
+        .map_err(ChunkFailure::Fatal)?;
+        if size != self.size || resp.e_tag() != Some(self.etag.as_str()) {
+            return Err(ChunkFailure::Fatal(ObjectStoreError::Get(
+                "ranged response changed object size or ETag".into(),
+            )));
+        }
         let mismatch = |got: usize| {
             ChunkFailure::Fatal(ObjectStoreError::RangeLengthMismatch {
                 range: self.range_header.clone(),
@@ -1842,11 +1896,6 @@ impl ChunkFetch {
         // chunk permit and bypass the buffer budget. Reject an oversized
         // advertised length up front and cap the streamed read at the
         // requested range.
-        if let Some(advertised) = resp.content_length()
-            && u64::try_from(advertised).ok() != Some(length)
-        {
-            return Err(mismatch(usize::try_from(advertised).unwrap_or(usize::MAX)));
-        }
         let mut body = resp.body;
         let mut buf = bytes::BytesMut::with_capacity(length as usize);
         while let Some(part) = body.try_next().await.map_err(ChunkFailure::Body)? {
@@ -2021,21 +2070,23 @@ fn byte_range_header(range: MultipartPartRange) -> String {
     format!("bytes={}-{}", range.offset, end)
 }
 
-/// Splits `size` into fixed `chunk_size` ranges plus at most one short tail.
-///
-/// Unlike [`multipart_part_ranges`] this never rebalances: fixed-size
-/// chunks keep range math trivial, and a short tail (down to one byte) is
-/// fine for a ranged GET — S3's minimum-part rule applies to uploads only.
+/// A short prefix starts the sequential decoder before a full network chunk
+/// arrives. It consumes one ordinary buffer permit, so the configured memory
+/// bound still holds; subsequent chunks retain the configured size.
+fn first_download_chunk_size(chunk_size: usize) -> usize {
+    chunk_size.min(1024 * 1024)
+}
+
 fn download_chunk_ranges(size: u64, chunk_size: usize) -> Vec<MultipartPartRange> {
-    if size == 0 {
-        return Vec::new();
-    }
-    let chunk = chunk_size as u64;
-    let count = size.div_ceil(chunk);
-    let mut ranges = Vec::with_capacity(count as usize);
+    let mut ranges = Vec::new();
     let mut offset = 0;
     while offset < size {
-        let length = chunk.min(size - offset);
+        let limit = if offset == 0 {
+            first_download_chunk_size(chunk_size)
+        } else {
+            chunk_size
+        };
+        let length = (limit as u64).min(size - offset);
         ranges.push(MultipartPartRange {
             part_number: (ranges.len() + 1) as i32,
             offset,
@@ -2046,21 +2097,35 @@ fn download_chunk_ranges(size: u64, chunk_size: usize) -> Vec<MultipartPartRange
     ranges
 }
 
-/// Decides whether a download of `size` bytes should fan out over ranged
-/// readers. `None` keeps the caller's already-open streaming GET, which is
-/// itself a sequential single writer — the right shape for small objects and
-/// for `reader_concurrency == 1`, where chunking would only add per-request
-/// overhead.
-fn single_writer_download_ranges(
-    size: u64,
-    chunk_size: usize,
-    reader_concurrency: usize,
-) -> Option<Vec<MultipartPartRange>> {
-    if reader_concurrency <= 1 {
-        return None;
+/// Validate the exact requested range, allowing only the EOF-shortened tail.
+/// The total is mandatory: `*` cannot establish download completion.
+fn validate_content_range(
+    header: &str,
+    offset: u64,
+    requested: u64,
+    content_length: u64,
+) -> Result<u64, ObjectStoreError> {
+    let parsed = (|| {
+        let (span, total) = header.strip_prefix("bytes ")?.split_once('/')?;
+        let (start, end) = span.split_once('-')?;
+        Some((
+            start.parse::<u64>().ok()?,
+            end.parse::<u64>().ok()?,
+            total.parse::<u64>().ok()?,
+        ))
+    })();
+    if let Some((start, end, total)) = parsed
+        && start == offset
+        && start <= end
+        && end < total
+        && end - start + 1 == requested.min(total - start)
+        && content_length == end - start + 1
+    {
+        return Ok(total);
     }
-    let ranges = download_chunk_ranges(size, chunk_size);
-    if ranges.len() > 1 { Some(ranges) } else { None }
+    Err(ObjectStoreError::Get(format!(
+        "invalid content-range {header:?} for offset {offset}, length {requested}, content-length {content_length}"
+    )))
 }
 
 fn get_object_content_length(

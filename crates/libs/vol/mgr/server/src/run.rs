@@ -247,6 +247,10 @@ pub struct VolmgrRunConfig {
     pub codec_priority_reserve: usize,
     /// Process-wide high watermark for streamed output awaiting writeback.
     pub stream_writeback_budget_bytes: u64,
+    /// Maximum intentionally retained receive-stream cache across this node.
+    pub receive_cache_budget_bytes: u64,
+    /// Maximum retained stream prefix per pull; zero disables retention.
+    pub receive_cache_per_pull_bytes: u64,
     /// Protected pull capacity bands. Duplicate minimums are rejected by [`run`].
     pub pull_priority_bands: Vec<PullPriorityBand>,
     /// Per-attempt timeout for a single transfer.
@@ -511,6 +515,8 @@ pub async fn run(
                 codec_priority_reserve: config.codec_priority_reserve,
                 codec_priority_threshold,
                 stream_writeback_budget_bytes: config.stream_writeback_budget_bytes,
+                receive_cache_budget_bytes: config.receive_cache_budget_bytes,
+                receive_cache_per_pull_bytes: config.receive_cache_per_pull_bytes,
                 static_credentials,
             },
         },
@@ -530,6 +536,7 @@ pub async fn run(
 
     let worker = service.worker();
     let shadow_comparisons = service.shadow_comparison_controller();
+    let receive_cache = service.receive_cache();
     let transfer_admission = service.transfer_admission();
     let service_for_drain = service.clone();
     worker.recover_and_log("vol-mgr.transfer");
@@ -570,6 +577,8 @@ pub async fn run(
         codec_priority_reserve = config.codec_priority_reserve,
         codec_priority_threshold = ?codec_priority_threshold.map(JobPriority::get),
         stream_writeback_budget_bytes = config.stream_writeback_budget_bytes,
+        receive_cache_budget_bytes = config.receive_cache_budget_bytes,
+        receive_cache_per_pull_bytes = config.receive_cache_per_pull_bytes,
         pull_priority_bands = ?config.pull_priority_bands,
         transfer_timeout_secs = config.transfer_timeout.as_secs(),
         grpc_request_timeout_secs = VOLMGR_GRPC_REQUEST_TIMEOUT.as_secs(),
@@ -653,10 +662,14 @@ pub async fn run(
     tracing::info!("draining outstanding transfer jobs while gRPC remains available");
     let drain_timeout =
         transfer_drain_deadline.saturating_duration_since(tokio::time::Instant::now());
-    let (transfer_tasks_drained, shadow_comparisons_drained) = tokio::join!(
+    let (transfer_tasks_drained, shadow_comparisons_drained, receive_cache_drained) = tokio::join!(
         worker.shutdown(drain_timeout),
         shadow_comparisons.shutdown(drain_timeout),
+        receive_cache.shutdown(drain_timeout),
     );
+    if !receive_cache_drained {
+        tracing::warn!("receive stream cache expiry exceeded the service drain deadline");
+    }
     if !shadow_comparisons_drained {
         tracing::warn!(
             drain_timeout_secs = config.transfer_drain_timeout.as_secs(),

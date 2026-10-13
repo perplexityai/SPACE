@@ -246,16 +246,20 @@ impl ObjectStore for StreamingMockStore {
         let size = self.inner.body.len() as u64;
         // Held across the writes and the trailing finish, like the real
         // sequential writer owning the guard.
-        let _guard = stream.admission.admit(size).await?;
+        let guard = stream.admission.admit(size).await?;
         let file = std::fs::File::create(dst).map_err(|e| ObjectStoreError::Get(e.to_string()))?;
         let mut sink = (stream.wrap_writer)(file);
-        for chunk in self.inner.body.chunks(3) {
-            sink.write_all(chunk)
-                .map_err(|e| ObjectStoreError::Get(e.to_string()))?;
-        }
-        let decoded = sink
-            .finish()
-            .map_err(|e| ObjectStoreError::Get(e.to_string()))?;
+        let body = self.inner.body.clone();
+        let decoded = tokio::task::spawn_blocking(move || {
+            let _guard = guard;
+            for chunk in body.chunks(3) {
+                sink.write_all(chunk)?;
+            }
+            sink.finish()
+        })
+        .await
+        .map_err(|e| ObjectStoreError::Get(e.to_string()))?
+        .map_err(|e| ObjectStoreError::Get(e.to_string()))?;
         Ok(pplx_space_object_store::StreamedGetFile::Streamed {
             bytes: size,
             decoded,
@@ -2019,6 +2023,12 @@ fn codec_test_executor(codec_concurrency: usize) -> TransferExecutor {
     )
 }
 
+impl StreamWritebackCoordinator {
+    fn reserve(&self, bytes: u64, priority: JobPriority) -> std::io::Result<()> {
+        self.reserve_cancellable(bytes, priority, None, None)
+    }
+}
+
 fn codec_priority_executor(
     codec_concurrency: usize,
     reserve: usize,
@@ -2037,13 +2047,263 @@ fn codec_priority_executor(
     )
 }
 
+fn stream_codec_fixture(
+    executor: &TransferExecutor,
+    priority: JobPriority,
+    cancellation: CancellationToken,
+) -> Arc<StreamCodecLease> {
+    Arc::new(StreamCodecLease {
+        admission: executor.codec.clone(),
+        priority: executor.codec_priority(priority),
+        permits: std::sync::Mutex::new(StreamCodecPermits::default()),
+        cancellation,
+        runtime: tokio::runtime::Handle::current(),
+        timing: Arc::new(StreamPullTiming::default()),
+    })
+}
+
+async fn admit_stream_codec_fixture(
+    executor: &TransferExecutor,
+    priority: JobPriority,
+    codec: &Arc<StreamCodecLease>,
+) -> Result<
+    Option<pplx_space_object_store::DecodeGuard>,
+    pplx_space_object_store::DecodeAdmissionError,
+> {
+    pplx_space_object_store::DecodeAdmission::admit(
+        &StreamedPullAdmission {
+            executor,
+            kind: "test",
+            artifact: "memory",
+            mode: MaterializationMode::Disabled,
+            priority,
+            codec: Arc::clone(codec),
+        },
+        1024,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn streamed_decoder_states_stay_bounded_when_cpu_is_lent() {
+    let executor = codec_priority_executor(2, 1, 100);
+    let low = JobPriority::new(0);
+    let high = JobPriority::new(100);
+    let mut admitted = Vec::new();
+    for _ in 0..2 {
+        let codec = stream_codec_fixture(&executor, low, CancellationToken::new());
+        let guard = admit_stream_codec_fixture(&executor, low, &codec)
+            .await
+            .unwrap();
+        assert!(
+            codec.permits.lock().unwrap().cpu.is_none(),
+            "waiting for input must not hold CPU"
+        );
+        admitted.push((codec, guard));
+    }
+    assert_eq!(executor.codec.shared_available(), 1);
+    assert_eq!(executor.decoder_admission.shared_available(), 0);
+    let cancellation = CancellationToken::new();
+    let waiting = stream_codec_fixture(&executor, low, cancellation.clone());
+    let future = admit_stream_codec_fixture(&executor, low, &waiting);
+    tokio::pin!(future);
+    assert!(
+        std::future::poll_fn(|context| std::task::Poll::Ready(
+            std::future::Future::poll(future.as_mut(), context).is_pending()
+        ))
+        .await,
+        "CPU availability must not unbound decoder state"
+    );
+
+    let priority = stream_codec_fixture(&executor, high, CancellationToken::new());
+    let high_guard = tokio::time::timeout(
+        Duration::from_millis(500),
+        admit_stream_codec_fixture(&executor, high, &priority),
+    )
+    .await
+    .expect("restore state and CPU reserve must remain usable")
+    .unwrap();
+    cancellation.cancel();
+    future
+        .await
+        .expect_err("cancelled live-state admission must fail");
+    drop((admitted, priority, high_guard));
+    assert_eq!(executor.decoder_admission.shared_available(), 2);
+    assert_eq!(executor.decoder_admission.reserve_available(), 2);
+}
+
+#[tokio::test]
+async fn streamed_codec_loan_reacquires_or_releases_credit_on_failure() {
+    for outcome in ["resume", "cancel", "closed"] {
+        let executor = codec_test_executor(1);
+        let cancellation = CancellationToken::new();
+        let codec = stream_codec_fixture(&executor, JobPriority::default(), cancellation.clone());
+        let guard = admit_stream_codec_fixture(&executor, JobPriority::default(), &codec)
+            .await
+            .unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let coordinator = Arc::new(StreamWritebackCoordinator {
+            sender,
+            budget: Arc::new(StreamWritebackBudget::default()),
+            high_watermark_bytes: 8,
+            priority_threshold: None,
+            priority_reserve_bytes: 0,
+        });
+        coordinator.reserve(8, JobPriority::default()).unwrap();
+        let blocked_coordinator = Arc::clone(&coordinator);
+        let writer_codec = Arc::clone(&codec);
+        let writer = tokio::task::spawn_blocking(move || {
+            let mut writeback =
+                StreamWriteback::new(Some(blocked_coordinator), None, JobPriority::default());
+            writeback.codec = Some(Arc::clone(&writer_codec));
+            writer_codec.run_decode(|| {
+                let result = writeback.reserve(1);
+                if result.is_ok() {
+                    assert!(writer_codec.permits.lock().unwrap().cpu.is_some());
+                }
+                result
+            })
+        });
+        tokio::task::spawn_blocking(move || {
+            assert!(matches!(
+                receiver.recv_timeout(Duration::from_secs(1)).unwrap(),
+                StreamWritebackCommand::ProducerBlocked
+            ));
+        })
+        .await
+        .unwrap();
+        let competing_cpu = executor
+            .codec
+            .try_acquire_shared()
+            .expect("writeback-blocked decoder must lend CPU");
+        assert_eq!(
+            executor.decoder_admission.shared_available(),
+            1,
+            "parked decoder still owns its state slot"
+        );
+        coordinator.release(8);
+        // Wait for ownership of the new credit, so failures exercise CPU
+        // reacquisition rather than only cancellation of the condvar wait.
+        let observer = Arc::clone(&coordinator);
+        tokio::task::spawn_blocking(move || {
+            wait_until(|| stream_writeback_outstanding_bytes(&observer.budget) != 0)
+        })
+        .await
+        .unwrap();
+        match outcome {
+            "resume" => drop(competing_cpu),
+            "cancel" => {
+                cancellation.cancel();
+                drop(competing_cpu);
+            }
+            "closed" => {
+                executor.codec.close();
+                drop(competing_cpu);
+            }
+            _ => unreachable!(),
+        }
+        let result = tokio::time::timeout(Duration::from_secs(1), writer)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.is_ok(), outcome == "resume");
+        assert_eq!(stream_writeback_outstanding_bytes(&coordinator.budget), 0);
+        drop((codec, guard));
+        assert_eq!(executor.decoder_admission.shared_available(), 2);
+    }
+}
+
+#[tokio::test]
+async fn streamed_codec_loan_cannot_cycle_with_download_buffer_admission() {
+    let executor = codec_test_executor(1);
+    let priority = JobPriority::default();
+    let codec = stream_codec_fixture(&executor, priority, CancellationToken::new());
+    let guard = admit_stream_codec_fixture(&executor, priority, &codec)
+        .await
+        .unwrap();
+    let buffers = Arc::new(tokio::sync::Semaphore::new(1));
+    let input = buffers.clone().acquire_owned().await.unwrap();
+    let (parked_tx, parked_rx) = tokio::sync::oneshot::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+    let decoder = Arc::clone(&codec);
+    let writer = tokio::task::spawn_blocking(move || {
+        let _input = input;
+        decoder.run_decode(|| {
+            decoder.lend_while(|| {
+                parked_tx.send(()).unwrap();
+                resume_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+                Ok(())
+            })
+        })
+    });
+    parked_rx.await.unwrap();
+    let newcomer = stream_codec_fixture(&executor, priority, CancellationToken::new());
+    let newcomer_guard = admit_stream_codec_fixture(&executor, priority, &newcomer)
+        .await
+        .unwrap();
+    let next_input = buffers.clone().acquire_owned();
+    tokio::pin!(next_input);
+    assert!(
+        std::future::poll_fn(|context| std::task::Poll::Ready(
+            std::future::Future::poll(next_input.as_mut(), context).is_pending()
+        ))
+        .await
+    );
+    resume_tx.send(()).unwrap();
+    let received = tokio::time::timeout(Duration::from_millis(500), next_input).await;
+    if received.is_err() {
+        codec.cancellation.cancel();
+    }
+    writer.await.unwrap().unwrap();
+    let _next_input = received
+        .expect("a buffer-starved newcomer must not pin CPU needed by the buffer owner")
+        .unwrap();
+    assert_eq!(
+        executor.codec.shared_available(),
+        1,
+        "CPU is released between input chunks"
+    );
+    drop((guard, newcomer_guard));
+}
+
 #[test]
 fn codec_concurrency_resolves_explicit_and_auto() {
-    assert_eq!(resolved_codec_concurrency(7), 7);
+    for (configured, expected) in [(7, 7), (128, 128), (129, 128), (usize::MAX, 128)] {
+        assert_eq!(resolved_codec_concurrency(configured), expected);
+    }
     assert!(
-        resolved_codec_concurrency(0) >= 1,
-        "auto sizing must grant at least one permit"
+        (1..=128).contains(&resolved_codec_concurrency(0)),
+        "auto sizing must preserve blocking-pool headroom"
     );
+}
+
+#[test]
+fn decoder_state_ceiling_preserves_shared_and_priority_capacity() {
+    for (configured, reserve, cpu, states, priority_states) in [
+        (1, 1, 1, 2, 0),
+        (6, 3, 6, 12, 6),
+        (64, 1, 64, 128, 2),
+        (65, 1, 65, 128, 1),
+        (128, 127, 128, 128, 127),
+        (usize::MAX, usize::MAX, 128, 128, 127),
+    ] {
+        let executor = codec_priority_executor(configured, reserve, 100);
+        assert_eq!(
+            executor.codec.shared_available() + executor.codec.reserve_available(),
+            cpu
+        );
+        assert_eq!(
+            executor.decoder_admission.shared_available()
+                + executor.decoder_admission.reserve_available(),
+            states
+        );
+        assert_eq!(
+            executor.decoder_admission.reserve_available(),
+            priority_states
+        );
+        assert!(executor.codec.shared_available() > 0);
+        assert!(executor.decoder_admission.shared_available() > 0);
+    }
 }
 
 #[test]
@@ -2298,7 +2558,7 @@ fn dense_stream_charges_and_queues_every_written_byte() {
                 queued_debt += range.debt_bytes;
                 assert_eq!(range.length, range.debt_bytes);
             }
-            StreamWritebackCommand::ReapToLowWatermark => {
+            StreamWritebackCommand::ProducerBlocked => {
                 panic!("completion must not request a global reap")
             }
         }
@@ -2365,7 +2625,7 @@ fn scattered_sparse_runs_are_batched_before_coordinator_submission() {
         .try_iter()
         .filter_map(|command| match command {
             StreamWritebackCommand::Range(range) => Some(range),
-            StreamWritebackCommand::ReapToLowWatermark => None,
+            StreamWritebackCommand::ProducerBlocked => None,
         })
         .collect::<Vec<_>>();
     assert_eq!(
@@ -2476,7 +2736,7 @@ fn mixed_sparse_stream_charges_only_written_data_and_preserves_holes() {
     // assert
     let range = match receiver.recv().expect("receive data writeback range") {
         StreamWritebackCommand::Range(range) => range,
-        StreamWritebackCommand::ReapToLowWatermark => {
+        StreamWritebackCommand::ProducerBlocked => {
             panic!("completion must not request a global reap")
         }
     };
@@ -2527,6 +2787,7 @@ fn dirty_debt_below_low_watermark_does_not_start_writeback() {
         3 * MIB,
         3 * MIB,
         Arc::new(StreamPullTiming::default()),
+        None,
     );
     std::thread::sleep(STREAM_WRITEBACK_IDLE_DRAIN + Duration::from_millis(25));
 
@@ -2559,6 +2820,7 @@ fn complete_writeback_window_starts_before_budget_pressure() {
         STREAM_WRITEBACK_WINDOW_BYTES,
         STREAM_WRITEBACK_WINDOW_BYTES,
         Arc::new(StreamPullTiming::default()),
+        None,
     );
     wait_until(|| operations.start_count() == 1);
     assert_eq!(
@@ -2597,6 +2859,7 @@ fn crossing_low_watermark_starts_coalesced_writeback() {
             2 * MIB,
             2 * MIB,
             Arc::clone(&timing),
+            None,
         );
     }
     wait_until(|| operations.start_count() == 1);
@@ -2636,6 +2899,7 @@ fn coordinator_coalescing_never_skips_a_newer_range_for_the_same_stream() {
                 length: debt_bytes * MIB,
                 debt_bytes: debt_bytes * MIB,
                 started: false,
+                receive_cache: None,
                 timing: Arc::clone(&timing),
             },
         );
@@ -2693,6 +2957,7 @@ fn dense_ranges_keep_rolling_writeback_window_granularity() {
             MIB,
             MIB,
             Arc::clone(&timing),
+            None,
         );
     }
     wait_until(|| operations.start_count() == 2);
@@ -2727,6 +2992,7 @@ fn first_pressure_activation_preserves_writeback_window_granularity() {
             MIB,
             MIB,
             Arc::clone(&timing),
+            None,
         );
     }
     wait_until(|| operations.start_count() > 0);
@@ -2745,13 +3011,14 @@ fn range_retirement_releases_dirty_debt_not_filesystem_span() {
     const MIB: u64 = 1024 * 1024;
     let operations = RecordingPageCacheOperations::default();
     let budget = StreamWritebackBudget::default();
-    *budget.outstanding_bytes.lock().unwrap() = MIB;
+    budget.state.lock().unwrap().outstanding_bytes = MIB;
     let range = StreamWritebackRange {
         file: Arc::new(tempfile::tempfile().unwrap()),
         offset: 4 * MIB,
         length: 4 * MIB,
         debt_bytes: MIB,
         started: true,
+        receive_cache: None,
         timing: Arc::new(StreamPullTiming::default()),
     };
     let mut writeback_enabled = true;
@@ -2770,6 +3037,156 @@ fn range_retirement_releases_dirty_debt_not_filesystem_span() {
     assert_eq!(stream_writeback_outstanding_bytes(&budget), 0);
     assert_eq!(*operations.waits.lock().unwrap(), vec![(4 * MIB, 4 * MIB)]);
     assert_eq!(*operations.advice.lock().unwrap(), vec![(4 * MIB, 4 * MIB)]);
+}
+
+#[test]
+fn writeback_retirement_prefers_blocked_producers_without_starving_old_debt() {
+    let operations = RecordingPageCacheOperations::default();
+    let budget = StreamWritebackBudget::default();
+    let blocked_file = Arc::new(tempfile::tempfile().unwrap());
+    let range = |file, offset| StreamWritebackRange {
+        file,
+        offset,
+        length: 1,
+        debt_bytes: 1,
+        started: true,
+        timing: Arc::new(StreamPullTiming::default()),
+        receive_cache: None,
+    };
+    let idle_file = Arc::new(tempfile::tempfile().unwrap());
+    let mut pending: std::collections::VecDeque<_> = (0..4)
+        .map(|offset| range(Arc::clone(&idle_file), offset))
+        .collect();
+    {
+        let mut state = budget.state.lock().unwrap();
+        state.outstanding_bytes = 4;
+        state.blocked.push(StreamWritebackDemand {
+            target_bytes: 4,
+            file: Some(Arc::clone(&blocked_file)),
+        });
+    }
+    // Each new window blocks the same busy producer again. Retiring only one
+    // window per call must still give every older completed range a turn.
+    for offset in 100..108 {
+        pending.push_back(range(Arc::clone(&blocked_file), offset));
+        budget.state.lock().unwrap().outstanding_bytes += 1;
+        assert!(drain_stream_writeback_ranges_to(
+            &mut pending,
+            &budget,
+            None,
+            &operations,
+            &mut true,
+            &mut true,
+        ));
+    }
+    assert_eq!(
+        *operations.waits.lock().unwrap(),
+        vec![
+            (100, 1),
+            (0, 1),
+            (101, 1),
+            (1, 1),
+            (102, 1),
+            (2, 1),
+            (103, 1),
+            (3, 1)
+        ],
+        "blocked producers get preference while oldest debt advances across drain calls"
+    );
+    assert!(
+        pending
+            .iter()
+            .all(|range| Arc::ptr_eq(&range.file, &blocked_file))
+    );
+}
+
+#[tokio::test]
+async fn receive_retention_keeps_only_its_prefix_without_holding_dirty_debt() {
+    const MIB: u64 = 1024 * 1024;
+    let cache = crate::receive_cache::ReceiveCache::new(2 * MIB, 2 * MIB);
+    let attempt = cache.try_reserve().unwrap();
+    let file = Arc::new(tempfile::tempfile().unwrap());
+    attempt.0.attach(&file);
+    for (offset, length, expected) in [
+        (0, MIB, vec![]),
+        (MIB, 2 * MIB, vec![(2 * MIB, MIB)]),
+        (3 * MIB, MIB, vec![(3 * MIB, MIB)]),
+    ] {
+        let operations = RecordingPageCacheOperations::default();
+        let budget = StreamWritebackBudget::default();
+        budget.state.lock().unwrap().outstanding_bytes = length;
+        let range = StreamWritebackRange {
+            file: file.clone(),
+            offset,
+            length,
+            debt_bytes: length,
+            started: true,
+            timing: Arc::new(StreamPullTiming::default()),
+            receive_cache: Some(Arc::downgrade(&attempt.0)),
+        };
+        retire_stream_writeback_range(range, &budget, &operations, &mut true, &mut true);
+        assert_eq!(stream_writeback_outstanding_bytes(&budget), 0);
+        assert_eq!(*operations.waits.lock().unwrap(), vec![(offset, length)]);
+        assert_eq!(*operations.advice.lock().unwrap(), expected);
+    }
+    drop(attempt);
+    assert!(cache.shutdown(std::time::Duration::from_secs(5)).await);
+}
+
+#[tokio::test(start_paused = true)]
+async fn completed_low_debt_output_does_not_pin_expired_receive_budget() {
+    use pplx_space_object_store::FinishingWrite;
+
+    const MIB: u64 = 1024 * 1024;
+    let cache = crate::receive_cache::ReceiveCache::new(MIB, MIB);
+    let attempt = cache.try_reserve().unwrap();
+    let operations = Arc::new(RecordingPageCacheOperations::default());
+    let coordinator = StreamWritebackCoordinator::new_with_page_cache_operations(
+        8 * MIB,
+        None,
+        operations.clone(),
+    );
+    let mut sink = Box::new(
+        StreamDecodeSink::new(
+            tempfile::tempfile().unwrap(),
+            MaterializationMode::Disabled,
+            ROOTFS_SPARSE_BLOCK_BYTES,
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            coordinator.clone(),
+            Arc::new(StreamPullTiming::default()),
+            JobPriority::default(),
+        )
+        .with_receive_cache(Some(attempt.0.clone())),
+    );
+    sink.write_all(&[0xa5; 4096]).unwrap();
+    assert!(!sink.finish().unwrap());
+    attempt.0.mark_success();
+    drop(attempt);
+    tokio::task::yield_now().await;
+    assert!(cache.try_reserve().is_none());
+    // A completed small pull leaves debt below the real coordinator's low
+    // watermark. Expiry must release its cache budget without another pull
+    // arriving to force writeback retirement.
+    tokio::time::advance(Duration::from_secs(30)).await;
+    tokio::time::resume();
+    let retry = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(attempt) = cache.try_reserve() {
+                break attempt;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("idle completed ranges must not retain an expired cache reservation");
+    assert_eq!(operations.start_count(), 0);
+    assert_eq!(
+        stream_writeback_outstanding_bytes(&coordinator.budget),
+        4096
+    );
+    drop(retry);
+    drop(coordinator);
+    assert!(cache.shutdown(Duration::from_secs(5)).await);
 }
 
 #[test]
@@ -2792,6 +3209,7 @@ fn high_watermark_drains_partial_ranges_and_unblocks_admission() {
             2 * MIB,
             2 * MIB,
             Arc::new(StreamPullTiming::default()),
+            None,
         );
     }
     wait_until(|| operations.start_count() == 2);
@@ -2820,6 +3238,89 @@ fn high_watermark_drains_partial_ranges_and_unblocks_admission() {
 }
 
 #[test]
+fn blocked_writeback_retires_only_the_debt_needed_for_admission() {
+    const MIB: u64 = 1024 * 1024;
+    let high = JobPriority::new(100);
+    for (threshold, initial, requested, retired) in [
+        (None, 8, 1, 1),
+        // Shared admission is the low watermark here. Reaping only to that
+        // watermark would leave this producer blocked despite queued debt.
+        (Some(high), 4, 2, 2),
+    ] {
+        let operations = Arc::new(RecordingPageCacheOperations::default());
+        let coordinator = StreamWritebackCoordinator::new_with_page_cache_operations(
+            8 * MIB,
+            threshold,
+            operations.clone(),
+        );
+        coordinator
+            .reserve(initial * MIB, JobPriority::default())
+            .unwrap();
+        for _ in 0..initial {
+            coordinator.submit(
+                Arc::new(tempfile::tempfile().unwrap()),
+                0,
+                MIB,
+                MIB,
+                Arc::new(StreamPullTiming::default()),
+                None,
+            );
+        }
+        let blocked = Arc::clone(&coordinator);
+        let (admitted_tx, admitted_rx) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            let result = blocked.reserve(requested * MIB, JobPriority::default());
+            let _ = admitted_tx.send(result);
+        });
+        let result = admitted_rx.recv_timeout(Duration::from_millis(500));
+        if result.is_err() {
+            coordinator.release(initial * MIB);
+        }
+        waiter.join().unwrap();
+        result
+            .expect("queued debt must unblock shared and high admission")
+            .unwrap();
+        assert_eq!(operations.wait_count(), retired);
+        assert_eq!(
+            stream_writeback_outstanding_bytes(&coordinator.budget),
+            (initial + requested - retired as u64) * MIB
+        );
+        coordinator.release(requested * MIB);
+    }
+}
+
+#[test]
+fn cancelling_blocked_writeback_removes_its_drain_request() {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let coordinator = Arc::new(StreamWritebackCoordinator {
+        sender,
+        budget: Arc::new(StreamWritebackBudget::default()),
+        high_watermark_bytes: 8,
+        priority_threshold: None,
+        priority_reserve_bytes: 0,
+    });
+    coordinator.reserve(8, JobPriority::default()).unwrap();
+    let cancellation = CancellationToken::new();
+    let blocked = Arc::clone(&coordinator);
+    let blocked_cancellation = cancellation.clone();
+    let waiter = std::thread::spawn(move || {
+        blocked.reserve_cancellable(1, JobPriority::default(), Some(&blocked_cancellation), None)
+    });
+    assert!(matches!(
+        receiver.recv_timeout(Duration::from_secs(1)).unwrap(),
+        StreamWritebackCommand::ProducerBlocked
+    ));
+    cancellation.cancel();
+    assert_eq!(
+        waiter.join().unwrap().unwrap_err().kind(),
+        std::io::ErrorKind::Other
+    );
+    let state = coordinator.budget.state.lock().unwrap();
+    assert!(state.blocked.is_empty());
+    assert_eq!(state.outstanding_bytes, 8);
+}
+
+#[test]
 fn active_high_watermark_drain_starts_new_partial_ranges_before_retiring_them() {
     // arrange
     const MIB: u64 = 1024 * 1024;
@@ -2834,7 +3335,14 @@ fn active_high_watermark_drain_starts_new_partial_ranges_before_retiring_them() 
     coordinator
         .reserve(8 * MIB, JobPriority::default())
         .unwrap();
-    coordinator.submit(Arc::clone(&file), 0, 2 * MIB, 2 * MIB, Arc::clone(&timing));
+    coordinator.submit(
+        Arc::clone(&file),
+        0,
+        2 * MIB,
+        2 * MIB,
+        Arc::clone(&timing),
+        None,
+    );
     let blocked_coordinator = Arc::clone(&coordinator);
     let (admitted_tx, admitted_rx) = std::sync::mpsc::channel();
     let waiter = std::thread::spawn(move || {
@@ -2846,7 +3354,7 @@ fn active_high_watermark_drain_starts_new_partial_ranges_before_retiring_them() 
     wait_until(|| operations.wait_count() == 1);
 
     // act
-    coordinator.submit(file, 2 * MIB, 2 * MIB, 2 * MIB, timing);
+    coordinator.submit(file, 2 * MIB, 2 * MIB, 2 * MIB, timing, None);
 
     // assert
     admitted_rx
@@ -3188,46 +3696,63 @@ fn finishing_one_stream_does_not_reap_another_streams_ranges() {
 
 #[test]
 fn writeback_budget_reserves_capacity_for_high_priority_streams() {
-    // arrange
-    let low = JobPriority::new(0);
-    let high = JobPriority::new(100);
-    let coordinator =
-        StreamWritebackCoordinator::new(2 * STREAM_WRITEBACK_WINDOW_BYTES, Some(high));
-    coordinator
-        .reserve(STREAM_WRITEBACK_WINDOW_BYTES, low)
-        .expect("reserve first low-priority range");
+    for (budget_mib, reserved_mib) in [(64, 32), (512, 128)] {
+        // arrange
+        let budget_bytes = budget_mib * 1024 * 1024;
+        let reserved_bytes = reserved_mib * 1024 * 1024;
+        let low = JobPriority::new(0);
+        let high = JobPriority::new(100);
+        let coordinator = StreamWritebackCoordinator::new(budget_bytes, Some(high));
+        assert_eq!(coordinator.priority_reserve_bytes, reserved_bytes);
+        coordinator
+            .reserve(budget_bytes - reserved_bytes, low)
+            .expect("fill shared writeback capacity");
 
-    let low_coordinator = Arc::clone(&coordinator);
-    let low_waiter = std::thread::spawn(move || {
-        low_coordinator
-            .reserve(STREAM_WRITEBACK_WINDOW_BYTES, low)
-            .expect("reserve second low-priority range");
-    });
-    std::thread::sleep(Duration::from_millis(20));
+        let low_coordinator = Arc::clone(&coordinator);
+        let low_waiter = std::thread::spawn(move || {
+            low_coordinator
+                .reserve(STREAM_WRITEBACK_WINDOW_BYTES, low)
+                .expect("reserve next low-priority range");
+        });
+        wait_until(|| {
+            !coordinator
+                .budget
+                .state
+                .lock()
+                .expect("budget lock")
+                .blocked
+                .is_empty()
+        });
 
-    // act
-    let high_coordinator = Arc::clone(&coordinator);
-    let (high_admitted_tx, high_admitted_rx) = std::sync::mpsc::channel();
-    let high_waiter = std::thread::spawn(move || {
-        high_coordinator
-            .reserve(STREAM_WRITEBACK_WINDOW_BYTES, high)
-            .expect("reserve high-priority range");
-        high_admitted_tx.send(()).expect("report high admission");
-    });
+        // act
+        let high_coordinator = Arc::clone(&coordinator);
+        let (high_admitted_tx, high_admitted_rx) = std::sync::mpsc::channel();
+        let high_waiter = std::thread::spawn(move || {
+            for _ in 0..reserved_bytes / STREAM_WRITEBACK_WINDOW_BYTES {
+                high_coordinator
+                    .reserve(STREAM_WRITEBACK_WINDOW_BYTES, high)
+                    .expect("reserve high-priority range");
+            }
+            high_admitted_tx.send(()).expect("report high admission");
+        });
 
-    // assert
-    high_admitted_rx
-        .recv_timeout(Duration::from_millis(100))
-        .expect("high-priority stream must use capacity protected from low-priority backlog");
-    assert!(
-        stream_writeback_outstanding_bytes(&coordinator.budget)
-            <= 2 * STREAM_WRITEBACK_WINDOW_BYTES,
-        "aggregate reservations must not exceed the high watermark"
-    );
-    high_waiter.join().expect("join high-priority waiter");
-    coordinator.release(2 * STREAM_WRITEBACK_WINDOW_BYTES);
-    low_waiter.join().expect("join low-priority waiter");
-    coordinator.release(STREAM_WRITEBACK_WINDOW_BYTES);
+        // assert
+        high_admitted_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("high-priority streams must use capacity protected from low-priority backlog");
+        assert_eq!(
+            stream_writeback_outstanding_bytes(&coordinator.budget),
+            budget_bytes
+        );
+        assert!(
+            !low_waiter.is_finished(),
+            "low-priority backlog must remain blocked"
+        );
+        high_waiter.join().expect("join high-priority waiter");
+        coordinator.release(budget_bytes);
+        low_waiter.join().expect("join low-priority waiter");
+        coordinator.release(STREAM_WRITEBACK_WINDOW_BYTES);
+    }
 }
 
 #[test]
@@ -3319,6 +3844,7 @@ fn writeback_syscall_failure_closes_future_admission() {
         STREAM_WRITEBACK_WINDOW_BYTES,
         STREAM_WRITEBACK_WINDOW_BYTES,
         Arc::new(StreamPullTiming::default()),
+        None,
     );
     for _ in 0..100 {
         if coordinator

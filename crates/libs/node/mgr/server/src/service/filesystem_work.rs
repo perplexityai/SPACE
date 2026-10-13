@@ -60,13 +60,29 @@ impl NodeManagerService {
         F: FnOnce(Self) -> Fut + Send + 'static,
         Fut: std::future::Future<Output = Result<T, Status>> + Send + 'static,
     {
+        self.run_artifact_mutation_with_admission(
+            sandbox_id,
+            crate::lifecycle_limiter::LifecycleMethod::Filesystem,
+            work,
+        )
+        .await
+    }
+
+    pub(super) async fn run_artifact_mutation_with_admission<T, F, Fut>(
+        &self,
+        sandbox_id: &str,
+        method: crate::lifecycle_limiter::LifecycleMethod,
+        work: F,
+    ) -> Result<T, Status>
+    where
+        T: Send + 'static,
+        F: FnOnce(Self) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = Result<T, Status>> + Send + 'static,
+    {
         super::validation::validate_sandbox_id(sandbox_id)?;
         let cancel = self.pool.shutdown_token.child_token();
         let _cancel_on_disconnect = cancel.clone().drop_guard();
-        let permit = self
-            .lifecycle_limiter
-            .acquire(crate::lifecycle_limiter::LifecycleMethod::Filesystem)
-            .await?;
+        let permit = self.lifecycle_limiter.acquire(method).await?;
         let target = self
             .sandbox_artifact_lock(sandbox_id)
             .await?

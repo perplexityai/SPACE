@@ -60,6 +60,11 @@ const ROOTFS_SPARSE_BLOCK_BYTES: usize = 64 * 1024;
 // (streaming zstd, all ciphertext) are never proven small, so they always
 // take a permit regardless of compressed length.
 const CODEC_ADMISSION_MIN_INPUT_BYTES: u64 = 256 * 1024 * 1024;
+// CPU owners, parked streaming uploads, and parked decoders share Tokio's
+// default 512-thread blocking pool. Bound each class to leave worker capacity
+// for queued codec owners and filesystem operations during permit lending.
+const MAX_CODEC_CONCURRENCY: usize = 128;
+const MAX_STREAMED_DECODERS: usize = 128;
 const SHADOW_COMPARISON_CONCURRENCY: usize = 1;
 
 /// Best-effort decompressed size from the zstd frame header. Streaming
@@ -90,7 +95,7 @@ async fn frame_content_size(path: &Path) -> Option<u64> {
 
 /// How many CPU-bound zstd passes (compress or decompress) may run at
 /// once. `0` means auto-size to the CPU quota, or to the deployed CPU
-/// request when the pod has no CPU limit.
+/// request when the pod has no CPU limit. Both paths have a 128-pass ceiling.
 ///
 /// Each zstd pass is single-threaded, and `spawn_blocking`'s pool is ~512
 /// threads, so without admission a pull storm runs every decode
@@ -100,7 +105,7 @@ async fn frame_content_size(path: &Path) -> Option<u64> {
 /// per-job completion latency is made of.
 fn resolved_codec_concurrency(configured: usize) -> usize {
     if configured > 0 {
-        return configured;
+        return configured.min(MAX_CODEC_CONCURRENCY);
     }
     // Kubernetes enforces CPU *limits* through the cgroup CFS quota, which
     // `available_parallelism` (scheduler-affinity based) does not observe
@@ -118,7 +123,7 @@ fn resolved_codec_concurrency(configured: usize) -> usize {
                 .map(std::num::NonZeroUsize::get)
         })
         .unwrap_or(2)
-        .max(1)
+        .clamp(1, MAX_CODEC_CONCURRENCY)
 }
 
 /// The whole-core CPU request the deployment stamped into `WORKER_THREADS`,
@@ -1463,6 +1468,7 @@ const DECRYPT_PULL_WRITE_BUF_BYTES: usize = 1024 * 1024;
 // increments used by ranged downloads. Writers share one byte budget, so
 // aggregate dirty output stays bounded independently of pull concurrency.
 const STREAM_WRITEBACK_WINDOW_BYTES: u64 = 32 * 1024 * 1024;
+const STREAM_WRITEBACK_PRIORITY_RESERVE_BYTES: u64 = 128 * 1024 * 1024;
 pub const DEFAULT_STREAM_WRITEBACK_BUDGET_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const STREAM_WRITEBACK_IDLE_DRAIN: std::time::Duration = std::time::Duration::from_secs(1);
 const STREAM_WRITEBACK_METRIC_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
@@ -1477,6 +1483,9 @@ struct StreamPullTiming {
     output_writer_cpu_us: std::sync::atomic::AtomicU64,
     writeback_reserve_us: std::sync::atomic::AtomicU64,
     writeback_reserve_cpu_us: std::sync::atomic::AtomicU64,
+    codec_lends: std::sync::atomic::AtomicU64,
+    codec_turn_wait_us: std::sync::atomic::AtomicU64,
+    codec_reacquire_us: std::sync::atomic::AtomicU64,
     writeback_start_us: std::sync::atomic::AtomicU64,
     writeback_start_cpu_us: std::sync::atomic::AtomicU64,
     writeback_wait_us: std::sync::atomic::AtomicU64,
@@ -1560,6 +1569,7 @@ fn log_streamed_pull_pipeline_timing(
         decode_stream_processing_ms = decode_writer_us
             .saturating_sub(output_writer_us)
             .saturating_sub(writeback_reserve_us)
+            .saturating_sub(StreamPullTiming::load(&timing.codec_turn_wait_us))
             / 1_000,
         decode_stream_processing_cpu_ms = decode_writer_cpu_us
             .saturating_sub(output_writer_cpu_us)
@@ -1569,6 +1579,9 @@ fn log_streamed_pull_pipeline_timing(
         output_writer_cpu_ms = output_writer_cpu_us / 1_000,
         writeback_reserve_ms = writeback_reserve_us / 1_000,
         writeback_reserve_cpu_ms = writeback_reserve_cpu_us / 1_000,
+        codec_lends = StreamPullTiming::load(&timing.codec_lends),
+        codec_turn_wait_ms = StreamPullTiming::load(&timing.codec_turn_wait_us) / 1_000,
+        codec_reacquire_ms = StreamPullTiming::load(&timing.codec_reacquire_us) / 1_000,
         writeback_start_ms = StreamPullTiming::load(&timing.writeback_start_us) / 1_000,
         writeback_start_cpu_ms = StreamPullTiming::load(&timing.writeback_start_cpu_us) / 1_000,
         writeback_wait_observed_ms = StreamPullTiming::load(&timing.writeback_wait_us) / 1_000,
@@ -1593,12 +1606,15 @@ struct StreamWritebackRange {
     debt_bytes: u64,
     started: bool,
     timing: Arc<StreamPullTiming>,
+    // Idle ranges can remain queued below the writeback low watermark. They
+    // observe retention policy without extending the cache reservation's TTL.
+    receive_cache: Option<std::sync::Weak<crate::receive_cache::ReceiveCacheLease>>,
 }
 
 #[derive(Debug)]
 enum StreamWritebackCommand {
     Range(StreamWritebackRange),
-    ReapToLowWatermark,
+    ProducerBlocked,
 }
 
 trait StreamPageCacheOperations: std::fmt::Debug + Send + Sync {
@@ -1635,8 +1651,26 @@ impl StreamPageCacheOperations for SystemStreamPageCacheOperations {
 }
 
 #[derive(Debug, Default)]
+struct StreamWritebackDemand {
+    target_bytes: u64,
+    file: Option<Arc<std::fs::File>>,
+}
+
+#[derive(Debug, Default)]
+struct StreamWritebackBudgetState {
+    outstanding_bytes: u64,
+    // Maximum outstanding debt at which each blocked reservation can proceed.
+    // Entries live only across the producer's condvar wait.
+    blocked: Vec<StreamWritebackDemand>,
+    reap_requested: bool,
+    // An out-of-order retirement gives the oldest debt the next turn, even
+    // across separate drains, so completed streams cannot retain FDs forever.
+    retire_oldest_next: bool,
+}
+
+#[derive(Debug, Default)]
 struct StreamWritebackBudget {
-    outstanding_bytes: std::sync::Mutex<u64>,
+    state: std::sync::Mutex<StreamWritebackBudgetState>,
     available: std::sync::Condvar,
     failed: std::sync::atomic::AtomicBool,
 }
@@ -1710,11 +1744,11 @@ fn fail_stream_writeback_budget(
 }
 
 fn release_stream_writeback_budget(budget: &StreamWritebackBudget, bytes: u64) {
-    let mut outstanding = budget
-        .outstanding_bytes
+    let mut state = budget
+        .state
         .lock()
         .expect("stream writeback budget lock poisoned");
-    *outstanding = outstanding.saturating_sub(bytes);
+    state.outstanding_bytes = state.outstanding_bytes.saturating_sub(bytes);
     budget.available.notify_all();
 }
 
@@ -1757,11 +1791,22 @@ fn retire_stream_writeback_range(
             fail_stream_writeback_budget(budget, StreamWritebackFailureOperation::Wait);
         }
     }
-    if *writeback_enabled
+    let retained = range
+        .receive_cache
+        .as_ref()
+        .and_then(std::sync::Weak::upgrade)
+        .map_or(0, |lease| lease.retained_bytes());
+    let advice_offset = range.offset.max(retained);
+    let advice_length = range
+        .offset
+        .saturating_add(range.length)
+        .saturating_sub(advice_offset);
+    if advice_length > 0
+        && *writeback_enabled
         && range.started
         && *cache_advice_enabled
         && let Err(error) =
-            page_cache_operations.advise_dontneed(&range.file, range.offset, range.length)
+            page_cache_operations.advise_dontneed(&range.file, advice_offset, advice_length)
     {
         tracing::warn!(
             %error,
@@ -1778,10 +1823,28 @@ fn retire_stream_writeback_range(
 }
 
 fn stream_writeback_outstanding_bytes(budget: &StreamWritebackBudget) -> u64 {
-    *budget
-        .outstanding_bytes
+    budget
+        .state
         .lock()
         .expect("stream writeback budget lock poisoned")
+        .outstanding_bytes
+}
+
+fn stream_writeback_needs_retirement(
+    budget: &StreamWritebackBudget,
+    idle_target: Option<u64>,
+) -> bool {
+    let state = budget
+        .state
+        .lock()
+        .expect("stream writeback budget lock poisoned");
+    state
+        .blocked
+        .iter()
+        .map(|demand| demand.target_bytes)
+        .chain(idle_target)
+        .min()
+        .is_some_and(|target| state.outstanding_bytes > target)
 }
 
 fn pending_stream_writeback_debt(
@@ -1795,14 +1858,38 @@ fn pending_stream_writeback_debt(
 fn drain_stream_writeback_ranges_to(
     pending: &mut std::collections::VecDeque<StreamWritebackRange>,
     budget: &StreamWritebackBudget,
-    target_bytes: u64,
+    target_bytes: Option<u64>,
     page_cache_operations: &dyn StreamPageCacheOperations,
     writeback_enabled: &mut bool,
     cache_advice_enabled: &mut bool,
 ) -> bool {
-    while stream_writeback_outstanding_bytes(budget) > target_bytes {
-        let Some(range) = pending.pop_front() else {
-            return false;
+    while stream_writeback_needs_retirement(budget, target_bytes) {
+        let range = {
+            let mut state = budget
+                .state
+                .lock()
+                .expect("stream writeback budget lock poisoned");
+            let index = if state.retire_oldest_next {
+                0
+            } else {
+                pending
+                    .iter()
+                    .position(|range| {
+                        state.blocked.iter().any(|demand| {
+                            state.outstanding_bytes > demand.target_bytes
+                                && demand
+                                    .file
+                                    .as_ref()
+                                    .is_some_and(|file| Arc::ptr_eq(file, &range.file))
+                        })
+                    })
+                    .unwrap_or(0)
+            };
+            let Some(range) = pending.remove(index) else {
+                return false;
+            };
+            state.retire_oldest_next = index != 0;
+            range
         };
         retire_stream_writeback_range(
             range,
@@ -1989,16 +2076,13 @@ impl StreamWritebackCoordinator {
                         Ok(StreamWritebackCommand::Range(range)) => {
                             release_stream_writeback_budget(&worker_budget, range.debt_bytes);
                         }
-                        Ok(StreamWritebackCommand::ReapToLowWatermark) => {
+                        Ok(StreamWritebackCommand::ProducerBlocked) => {
+                            worker_budget
+                                .state
+                                .lock()
+                                .expect("stream writeback budget lock poisoned")
+                                .reap_requested = false;
                             force_outstanding_metric = true;
-                            drain_target = Some(low_watermark_bytes);
-                            start_pending_stream_writeback_ranges(
-                                &mut pending,
-                                &worker_budget,
-                                page_cache_operations.as_ref(),
-                                &mut writeback_enabled,
-                                0,
-                            );
                         }
                         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                             if pending_stream_writeback_debt(&pending) >= low_watermark_bytes {
@@ -2036,7 +2120,9 @@ impl StreamWritebackCoordinator {
                         }
                     }
 
-                    if drain_target.is_some() {
+                    if drain_target.is_some()
+                        || stream_writeback_needs_retirement(&worker_budget, None)
+                    {
                         start_pending_stream_writeback_ranges(
                             &mut pending,
                             &worker_budget,
@@ -2044,21 +2130,19 @@ impl StreamWritebackCoordinator {
                             &mut writeback_enabled,
                             0,
                         );
-                    }
-                    if drain_target.is_some_and(|target| {
-                        drain_stream_writeback_ranges_to(
+                        if drain_stream_writeback_ranges_to(
                             &mut pending,
                             &worker_budget,
-                            target,
+                            drain_target,
                             page_cache_operations.as_ref(),
                             &mut writeback_enabled,
                             &mut cache_advice_enabled,
-                        )
-                    }) {
-                        drain_target = None;
-                        pressure_active = stream_writeback_outstanding_bytes(&worker_budget)
-                            > low_watermark_bytes;
-                        force_outstanding_metric = true;
+                        ) {
+                            drain_target = None;
+                            pressure_active = stream_writeback_outstanding_bytes(&worker_budget)
+                                > low_watermark_bytes;
+                            force_outstanding_metric = true;
+                        }
                     }
                     if !writeback_enabled {
                         drain_all_stream_writeback_ranges(
@@ -2086,7 +2170,7 @@ impl StreamWritebackCoordinator {
             high_watermark_bytes,
             priority_threshold,
             priority_reserve_bytes: if priority_threshold.is_some() {
-                STREAM_WRITEBACK_WINDOW_BYTES.min(high_watermark_bytes / 2)
+                STREAM_WRITEBACK_PRIORITY_RESERVE_BYTES.min(high_watermark_bytes / 2)
             } else {
                 0
             },
@@ -2113,9 +2197,9 @@ impl StreamWritebackCoordinator {
         {
             return Err(std::io::Error::other("stream writeback coordinator failed"));
         }
-        let mut outstanding = self
+        let mut state = self
             .budget
-            .outstanding_bytes
+            .state
             .lock()
             .map_err(|_| std::io::Error::other("stream writeback budget lock poisoned"))?;
         if self
@@ -2126,21 +2210,32 @@ impl StreamWritebackCoordinator {
             return Err(std::io::Error::other("stream writeback coordinator failed"));
         }
         let admission_limit = self.admission_limit(priority);
-        if *outstanding != 0 && outstanding.saturating_add(bytes) > admission_limit {
+        if state.outstanding_bytes != 0
+            && state.outstanding_bytes.saturating_add(bytes) > admission_limit
+        {
             return Ok(false);
         }
-        *outstanding = outstanding.saturating_add(bytes);
+        state.outstanding_bytes = state.outstanding_bytes.saturating_add(bytes);
         Ok(true)
     }
 
-    fn reserve(&self, bytes: u64, priority: JobPriority) -> std::io::Result<()> {
+    fn reserve_cancellable(
+        &self,
+        bytes: u64,
+        priority: JobPriority,
+        cancellation: Option<&CancellationToken>,
+        file: Option<&Arc<std::fs::File>>,
+    ) -> std::io::Result<()> {
         let reserve_started_at = Instant::now();
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return Err(std::io::Error::other(CodecAdmitError::Cancelled));
+        }
         if self.try_reserve(bytes, priority)? {
             return Ok(());
         }
-        let mut outstanding = self
+        let mut state = self
             .budget
-            .outstanding_bytes
+            .state
             .lock()
             .map_err(|_| std::io::Error::other("stream writeback budget lock poisoned"))?;
         if self
@@ -2156,30 +2251,74 @@ impl StreamWritebackCoordinator {
         } else {
             StreamWritebackPriorityClass::Shared
         };
-        while *outstanding != 0 && outstanding.saturating_add(bytes) > admission_limit {
-            if self
-                .sender
-                .send(StreamWritebackCommand::ReapToLowWatermark)
-                .is_err()
-            {
-                tracing::warn!(
-                    "stream writeback worker stopped while a producer was blocked; closing streamed pull admission"
-                );
-                fail_stream_writeback_budget(&self.budget, StreamWritebackFailureOperation::Queue);
-                return Err(std::io::Error::other("stream writeback worker stopped"));
+        let target = admission_limit.saturating_sub(bytes);
+        state.blocked.push(StreamWritebackDemand {
+            target_bytes: target,
+            file: file.cloned(),
+        });
+        let result = loop {
+            if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                break Err(std::io::Error::other(CodecAdmitError::Cancelled));
             }
-            outstanding = self.budget.available.wait(outstanding).map_err(|_| {
-                std::io::Error::other("stream writeback budget lock poisoned while waiting")
-            })?;
             if self
                 .budget
                 .failed
                 .load(std::sync::atomic::Ordering::Acquire)
             {
-                return Err(std::io::Error::other("stream writeback coordinator failed"));
+                break Err(std::io::Error::other("stream writeback coordinator failed"));
             }
-        }
-        *outstanding = outstanding.saturating_add(bytes);
+            if state.outstanding_bytes == 0
+                || state.outstanding_bytes.saturating_add(bytes) <= admission_limit
+            {
+                state.outstanding_bytes = state.outstanding_bytes.saturating_add(bytes);
+                break Ok(());
+            }
+            if !state.reap_requested {
+                if self
+                    .sender
+                    .send(StreamWritebackCommand::ProducerBlocked)
+                    .is_err()
+                {
+                    tracing::warn!(
+                        "stream writeback worker stopped while a producer was blocked; closing streamed pull admission"
+                    );
+                    fail_stream_writeback_budget(
+                        &self.budget,
+                        StreamWritebackFailureOperation::Queue,
+                    );
+                    break Err(std::io::Error::other("stream writeback worker stopped"));
+                }
+                state.reap_requested = true;
+            }
+            state = if cancellation.is_some() {
+                self.budget
+                    .available
+                    .wait_timeout(state, std::time::Duration::from_millis(100))
+                    .map(|(state, _)| state)
+                    .map_err(|_| {
+                        std::io::Error::other("stream writeback budget lock poisoned while waiting")
+                    })
+            } else {
+                self.budget.available.wait(state).map_err(|_| {
+                    std::io::Error::other("stream writeback budget lock poisoned while waiting")
+                })
+            }?;
+        };
+        let index = state
+            .blocked
+            .iter()
+            .position(|blocked| {
+                blocked.target_bytes == target
+                    && match (&blocked.file, file) {
+                        (None, None) => true,
+                        (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+                        _ => false,
+                    }
+            })
+            .expect("blocked reservation registered above");
+        state.blocked.swap_remove(index);
+        drop(state);
+        result?;
         pplx_space_metrics::volume_manager::stream_writeback_producer_blocked_ms(
             reserve_started_at.elapsed().as_secs_f64() * 1000.0,
             priority_class.as_str(),
@@ -2188,13 +2327,7 @@ impl StreamWritebackCoordinator {
     }
 
     fn release(&self, bytes: u64) {
-        let mut outstanding = self
-            .budget
-            .outstanding_bytes
-            .lock()
-            .expect("stream writeback budget lock poisoned");
-        *outstanding = outstanding.saturating_sub(bytes);
-        self.budget.available.notify_all();
+        release_stream_writeback_budget(&self.budget, bytes);
     }
 
     fn submit(
@@ -2204,6 +2337,7 @@ impl StreamWritebackCoordinator {
         length: u64,
         debt_bytes: u64,
         timing: Arc<StreamPullTiming>,
+        receive_cache: Option<Arc<crate::receive_cache::ReceiveCacheLease>>,
     ) {
         let result = self
             .sender
@@ -2214,6 +2348,7 @@ impl StreamWritebackCoordinator {
                 debt_bytes,
                 started: false,
                 timing,
+                receive_cache: receive_cache.as_ref().map(Arc::downgrade),
             }))
             .map_err(|_| std::io::Error::other("stream writeback worker stopped"));
         if let Err(error) = result {
@@ -2240,6 +2375,7 @@ struct StreamWritebackAccumulator {
 #[derive(Debug)]
 struct StreamWriteback {
     coordinator: Option<Arc<StreamWritebackCoordinator>>,
+    codec: Option<Arc<StreamCodecLease>>,
     timing: Option<Arc<StreamPullTiming>>,
     priority: JobPriority,
     writeback_file: Option<Arc<std::fs::File>>,
@@ -2247,6 +2383,7 @@ struct StreamWriteback {
     reserved_bytes: u64,
     deferred_hole_bytes: u64,
     pending: Option<StreamWritebackAccumulator>,
+    receive_cache: Option<Arc<crate::receive_cache::ReceiveCacheLease>>,
 }
 
 impl StreamWriteback {
@@ -2257,6 +2394,7 @@ impl StreamWriteback {
     ) -> Self {
         Self {
             coordinator,
+            codec: None,
             timing,
             priority,
             writeback_file: None,
@@ -2264,6 +2402,7 @@ impl StreamWriteback {
             reserved_bytes: 0,
             deferred_hole_bytes: 0,
             pending: None,
+            receive_cache: None,
         }
     }
 
@@ -2306,7 +2445,30 @@ impl StreamWriteback {
                     .expect("coordinator checked above");
                 let reserve_started_at = Instant::now();
                 let reserve_cpu_started_at = current_thread_cpu_us();
-                coordinator.reserve(additional, self.priority)?;
+                if coordinator.try_reserve(additional, self.priority)? {
+                    self.reserved_bytes = self.reserved_bytes.saturating_add(additional);
+                } else if let Some(codec) = &self.codec {
+                    codec.lend_while(|| {
+                        coordinator.reserve_cancellable(
+                            additional,
+                            self.priority,
+                            Some(&codec.cancellation),
+                            self.writeback_file.as_ref(),
+                        )?;
+                        // Charge the producer before reacquisition, so an
+                        // interrupted CPU wait releases this credit on Drop.
+                        self.reserved_bytes = self.reserved_bytes.saturating_add(additional);
+                        Ok(())
+                    })?;
+                } else {
+                    coordinator.reserve_cancellable(
+                        additional,
+                        self.priority,
+                        None,
+                        self.writeback_file.as_ref(),
+                    )?;
+                    self.reserved_bytes = self.reserved_bytes.saturating_add(additional);
+                }
                 if let Some(timing) = &self.timing {
                     StreamPullTiming::add_wall_and_thread_cpu(
                         &timing.writeback_reserve_us,
@@ -2315,7 +2477,6 @@ impl StreamWriteback {
                         reserve_cpu_started_at,
                     );
                 }
-                self.reserved_bytes = self.reserved_bytes.saturating_add(additional);
             }
         }
         Ok(())
@@ -2424,6 +2585,7 @@ impl StreamWriteback {
             pending.length,
             pending.debt_bytes,
             timing,
+            self.receive_cache.clone(),
         );
         Ok(())
     }
@@ -2952,9 +3114,46 @@ type StreamSinkSelector =
 struct StreamDecodeSink {
     inner: MaybeZstdDecodingWriter<std::fs::File, DecryptedFileSink, StreamSinkSelector>,
     timing: Arc<StreamPullTiming>,
+    codec: Option<Arc<StreamCodecLease>>,
 }
 
 impl StreamDecodeSink {
+    fn with_receive_cache(
+        mut self,
+        lease: Option<Arc<crate::receive_cache::ReceiveCacheLease>>,
+    ) -> Self {
+        let Some(lease) = lease else {
+            return self;
+        };
+        let select = self
+            .inner
+            .select_sink
+            .take()
+            .expect("unstarted stream selector");
+        self.inner.select_sink = Some(Box::new(move |file, decompressing| {
+            lease.attach(&file);
+            let mut sink = select(file, decompressing)?;
+            sink.writeback.receive_cache = Some(lease);
+            Ok(sink)
+        }));
+        self
+    }
+
+    fn with_codec_lease(mut self, codec: Arc<StreamCodecLease>) -> Self {
+        self.codec = Some(Arc::clone(&codec));
+        let select = self
+            .inner
+            .select_sink
+            .take()
+            .expect("sink not selected yet");
+        self.inner.select_sink = Some(Box::new(move |file, decompressing| {
+            let mut sink = select(file, decompressing)?;
+            sink.writeback.codec = Some(codec);
+            Ok(sink)
+        }));
+        self
+    }
+
     fn new(
         file: std::fs::File,
         mode_if_decompressed: MaterializationMode,
@@ -2984,6 +3183,7 @@ impl StreamDecodeSink {
         Self {
             inner: MaybeZstdDecodingWriter::with_sink_selector(file, true, select_sink),
             timing,
+            codec: None,
         }
     }
 }
@@ -2992,7 +3192,11 @@ impl Write for StreamDecodeSink {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         let write_started_at = Instant::now();
         let write_cpu_started_at = current_thread_cpu_us();
-        let result = self.inner.write(buf);
+        let result = if let Some(codec) = &self.codec {
+            codec.run_decode(|| self.inner.write(buf))
+        } else {
+            self.inner.write(buf)
+        };
         StreamPullTiming::add_wall_and_thread_cpu(
             &self.timing.decode_writer_us,
             &self.timing.decode_writer_cpu_us,
@@ -3008,7 +3212,11 @@ impl Write for StreamDecodeSink {
     fn flush(&mut self) -> std::io::Result<()> {
         let flush_started_at = Instant::now();
         let flush_cpu_started_at = current_thread_cpu_us();
-        let result = self.inner.flush();
+        let result = if let Some(codec) = &self.codec {
+            codec.run_decode(|| self.inner.flush())
+        } else {
+            self.inner.flush()
+        };
         StreamPullTiming::add_wall_and_thread_cpu(
             &self.timing.decode_writer_us,
             &self.timing.decode_writer_cpu_us,
@@ -3021,10 +3229,18 @@ impl Write for StreamDecodeSink {
 
 impl pplx_space_object_store::FinishingWrite for StreamDecodeSink {
     fn finish(self: Box<Self>) -> std::io::Result<bool> {
-        let StreamDecodeSink { inner, timing } = *self;
+        let StreamDecodeSink {
+            inner,
+            timing,
+            codec,
+        } = *self;
         let finish_started_at = Instant::now();
         let finish_cpu_started_at = current_thread_cpu_us();
-        let result = inner.finish();
+        let result = if let Some(codec) = codec {
+            codec.run_decode(|| inner.finish())
+        } else {
+            inner.finish()
+        };
         StreamPullTiming::add_wall_and_thread_cpu(
             &timing.decode_writer_us,
             &timing.decode_writer_cpu_us,
@@ -3035,18 +3251,112 @@ impl pplx_space_object_store::FinishingWrite for StreamDecodeSink {
     }
 }
 
-/// Codec admission bridge for streaming-decode pulls: one permit spans the
-/// whole overlapped download+decode. The streamed path only runs for
-/// ranged-size objects, whose decode cannot be proven small before the
-/// bytes arrive (the frame header is not on disk yet), so admission is
-/// unconditional — the conservative direction, and exactly what keeps the
-/// highly-compressible multi-GiB snapshot class bounded.
+/// Typed admission failures cross the object-store boundary as source errors.
+#[derive(Debug, thiserror::Error)]
+enum CodecAdmitError {
+    #[error("codec permit pool closed")]
+    PoolClosed,
+    #[error("streamed pull cancelled")]
+    Cancelled,
+}
+
+#[derive(Debug, Default)]
+struct StreamCodecPermits {
+    cpu: Option<CodecSlot>,
+    _decoder: Option<CodecPermit>,
+}
+
+/// CPU may be lent while writeback blocks, but the bounded live-decoder slot
+/// stays charged through the last blocking write, including cancellation.
+#[derive(Debug)]
+struct StreamCodecLease {
+    admission: CodecAdmission,
+    priority: CodecPriority,
+    permits: std::sync::Mutex<StreamCodecPermits>,
+    cancellation: CancellationToken,
+    runtime: tokio::runtime::Handle,
+    timing: Arc<StreamPullTiming>,
+}
+
+impl StreamCodecLease {
+    /// CPU is held only inside a blocking writer call. Keeping it between
+    /// chunks would deadlock a resumed decoder against a new stream waiting
+    /// for download buffers still owned by that decoder.
+    fn run_decode<T>(&self, operation: impl FnOnce() -> std::io::Result<T>) -> std::io::Result<T> {
+        let started = Instant::now();
+        let permit = self.runtime.block_on(self.acquire_cpu());
+        StreamPullTiming::add_elapsed(&self.timing.codec_turn_wait_us, started);
+        self.permits
+            .lock()
+            .map_err(|_| std::io::Error::other("stream codec permits poisoned"))?
+            .cpu = Some(permit.map_err(std::io::Error::other)?);
+        let _turn = StreamCodecTurn(self);
+        operation()
+    }
+
+    async fn acquire_cpu(&self) -> Result<CodecSlot, CodecAdmitError> {
+        tokio::select! {
+            biased;
+            _ = self.cancellation.cancelled() => Err(CodecAdmitError::Cancelled),
+            permit = self.admission.acquire_slot(self.priority) => {
+                permit.map_err(|_| CodecAdmitError::PoolClosed)
+            }
+        }
+    }
+
+    // Called only by the blocking decoder. Never retain the budget or permit
+    // mutex while waiting for disk credit or reacquiring CPU admission.
+    fn lend_while(&self, operation: impl FnOnce() -> std::io::Result<()>) -> std::io::Result<()> {
+        let mut slot = self
+            .permits
+            .lock()
+            .map_err(|_| std::io::Error::other("stream codec permits poisoned"))?
+            .cpu
+            .take()
+            .ok_or_else(|| std::io::Error::other("stream codec CPU slot missing"))?;
+        slot.lend();
+        StreamPullTiming::add(&self.timing.codec_lends, 1);
+        operation()?;
+        let started = Instant::now();
+        let reacquired = self.runtime.block_on(async {
+            tokio::select! {
+                biased;
+                _ = self.cancellation.cancelled() => Err(CodecAdmitError::Cancelled),
+                result = slot.reacquire() => result.map_err(|_| CodecAdmitError::PoolClosed),
+            }
+        });
+        StreamPullTiming::add_elapsed(&self.timing.codec_reacquire_us, started);
+        reacquired.map_err(std::io::Error::other)?;
+        self.permits
+            .lock()
+            .map_err(|_| std::io::Error::other("stream codec permits poisoned"))?
+            .cpu = Some(slot);
+        Ok(())
+    }
+}
+
+struct StreamCodecTurn<'a>(&'a StreamCodecLease);
+
+impl Drop for StreamCodecTurn<'_> {
+    fn drop(&mut self) {
+        self.0
+            .permits
+            .lock()
+            .expect("stream codec permits poisoned")
+            .cpu
+            .take();
+    }
+}
+
+/// Admit bounded live decoder state before download buffers. CPU is acquired
+/// only once input is ready, and can be lent while output backpressure waits.
 struct StreamedPullAdmission<'a> {
     executor: &'a TransferExecutor,
     kind: &'a str,
     artifact: &'static str,
     mode: MaterializationMode,
     priority: JobPriority,
+    codec: Arc<StreamCodecLease>,
 }
 
 #[async_trait::async_trait]
@@ -3059,14 +3369,22 @@ impl pplx_space_object_store::DecodeAdmission for StreamedPullAdmission<'_> {
         pplx_space_object_store::DecodeAdmissionError,
     > {
         let wait_started = Instant::now();
-        // Typed so the failure crosses the object-store boundary as a source
-        // error rather than a string.
-        let permit = self
-            .executor
+        let decoder = tokio::select! {
+            biased;
+            _ = self.codec.cancellation.cancelled() => Err(CodecAdmitError::Cancelled),
+            permit = self.executor.decoder_admission.acquire(self.executor.codec_priority(self.priority)) => {
+                permit.map_err(|_| CodecAdmitError::PoolClosed)
+            }
+        }
+        .map_err(pplx_space_object_store::DecodeAdmissionError::admission)?;
+        *self
             .codec
-            .acquire(self.executor.codec_priority(self.priority))
-            .await
-            .map_err(pplx_space_object_store::DecodeAdmissionError::admission)?;
+            .permits
+            .lock()
+            .expect("stream codec permits poisoned") = StreamCodecPermits {
+            cpu: None,
+            _decoder: Some(decoder),
+        };
         emit_transfer_phase_duration(
             self.kind,
             self.artifact,
@@ -3074,7 +3392,7 @@ impl pplx_space_object_store::DecodeAdmission for StreamedPullAdmission<'_> {
             self.mode,
             wait_started,
         );
-        Ok(Some(Box::new(permit)))
+        Ok(Some(Box::new(Arc::clone(&self.codec))))
     }
 }
 
@@ -3354,6 +3672,8 @@ pub struct TransferExecutor {
     /// Admission for CPU-bound codec passes, with an optional reserve for
     /// high-priority jobs.
     codec: CodecAdmission,
+    // Separate live state bound: lending CPU never admits unbounded decoders.
+    decoder_admission: CodecAdmission,
     /// Priority at or above which a job may draw on the codec reserve;
     /// `None` disables priority-aware admission.
     codec_priority_threshold: Option<JobPriority>,
@@ -3362,6 +3682,7 @@ pub struct TransferExecutor {
     shadow_staging_dir: PathBuf,
     shadow_comparison_permits: Arc<tokio::sync::Semaphore>,
     shadow_comparisons: ShadowComparisonController,
+    receive_cache: crate::receive_cache::ReceiveCache,
 }
 
 struct ShadowComparisonLifecycle {
@@ -3476,7 +3797,8 @@ pub struct TransferExecutorConfig {
     /// Deployment upload policy with one shared streaming-buffer budget.
     pub snapshot_upload_mode: SnapshotUploadMode,
     /// Maximum concurrent CPU-bound zstd passes (compress or decompress).
-    /// `0` auto-sizes to the CPU quota. See [`resolved_codec_concurrency`].
+    /// `0` auto-sizes to the CPU quota. Explicit and automatic sizes are capped
+    /// at 128 to retain blocking-pool headroom. See [`resolved_codec_concurrency`].
     pub codec_concurrency: usize,
     /// Decode zstd pulls inline with the ranged download (one pass) instead
     /// of a separate read-back decompress step. Kill switch for rollout;
@@ -3496,6 +3818,11 @@ pub struct TransferExecutorConfig {
     /// writeback and cache eviction. `0` uses
     /// [`DEFAULT_STREAM_WRITEBACK_BUDGET_BYTES`].
     pub stream_writeback_budget_bytes: u64,
+    /// Best-effort receive-stream cache budget shared by all pulls on this node.
+    /// Zero disables retention; pages remain reclaimable even when enabled.
+    pub receive_cache_budget_bytes: u64,
+    /// Maximum prefix retained by one streamed btrfs-send pull.
+    pub receive_cache_per_pull_bytes: u64,
     /// Optional caller-supplied S3 credentials. When set, they are used
     /// directly instead of exchanging a SPACE subject for short-lived AWS
     /// credentials via credmgr. The volume-manager binary resolves these from
@@ -3515,7 +3842,11 @@ impl TransferExecutor {
         shadow_staging_dir: PathBuf,
     ) -> Self {
         let total = resolved_codec_concurrency(config.codec_concurrency);
-        let codec = CodecAdmission::new(total, config.codec_priority_reserve);
+        let reserve = config.codec_priority_reserve.min(total.saturating_sub(1));
+        let codec = CodecAdmission::new(total, reserve);
+        let decoder_total = (total * 2).min(MAX_STREAMED_DECODERS);
+        let decoder_reserve = decoder_total * reserve / total;
+        let decoder_admission = CodecAdmission::new(decoder_total, decoder_reserve);
         let stream_writeback_priority_threshold = config.codec_priority_threshold;
         // Priority-aware admission only engages when there is both a
         // threshold and a non-empty reserve; otherwise everything shares
@@ -3529,6 +3860,10 @@ impl TransferExecutor {
             config.stream_writeback_budget_bytes
         };
         let shadow_comparisons = ShadowComparisonController::new();
+        let receive_cache = crate::receive_cache::ReceiveCache::new(
+            config.receive_cache_budget_bytes,
+            config.receive_cache_per_pull_bytes,
+        );
         Self {
             node_manager: None,
             stream_push: StreamPushConfig::new(&config.snapshot_upload_mode, total),
@@ -3536,6 +3871,7 @@ impl TransferExecutor {
             config,
             destination_pull_locks: Arc::new(DashMap::new()),
             codec,
+            decoder_admission,
             codec_priority_threshold,
             stream_writeback: StreamWritebackCoordinator::new(
                 stream_writeback_budget_bytes,
@@ -3546,6 +3882,7 @@ impl TransferExecutor {
                 SHADOW_COMPARISON_CONCURRENCY,
             )),
             shadow_comparisons,
+            receive_cache,
         }
     }
 
@@ -3561,6 +3898,10 @@ impl TransferExecutor {
 
     pub fn shadow_comparison_controller(&self) -> ShadowComparisonController {
         self.shadow_comparisons.clone()
+    }
+
+    pub(crate) fn receive_cache(&self) -> crate::receive_cache::ReceiveCache {
+        self.receive_cache.clone()
     }
 
     #[cfg(test)]
@@ -4884,7 +5225,14 @@ impl TransferExecutor {
         // applied uniformly to whichever staging file actually got read
         // (the staged source, the compressed temp, or the encrypted temp).
         if upload_result.is_ok() {
-            page_cache::advise_path_dontneed(&put_source, "upload volume input");
+            let advice_source = put_source.clone();
+            if let Err(error) = tokio::task::spawn_blocking(move || {
+                page_cache::advise_path_dontneed(&advice_source, "upload volume input");
+            })
+            .await
+            {
+                tracing::warn!(%error, "upload page-cache advice task failed");
+            }
         }
 
         // Best-effort cleanup of every transient artifact. Failures here
@@ -5239,14 +5587,34 @@ impl TransferExecutor {
         // raw pulls must land wire bytes untouched.
         let download_started_at = Instant::now();
         let stream_decode = self.config.stream_decode_pulls && p.encryption.is_none() && !p.raw;
+        let receive_cache =
+            if stream_decode && snapshot_artifact == Some(SnapshotArtifact::RootfsBtrfsSend) {
+                self.receive_cache.try_reserve()
+            } else {
+                None
+            };
+        let receive_lease = receive_cache.as_ref().map(|attempt| attempt.0.clone());
         let stream_pull_timing = Arc::new(StreamPullTiming::default());
         let (bytes, streamed, streamed_decoded, streamed_decompression_report) = if stream_decode {
+            let codec_cancellation = cancellation.child_token();
+            // Dropping the async transfer also interrupts a detached decoder
+            // waiting to regain CPU, without cancelling sibling artifact pulls.
+            let _cancel_codec_on_drop = codec_cancellation.clone().drop_guard();
+            let codec = Arc::new(StreamCodecLease {
+                admission: self.codec.clone(),
+                priority: self.codec_priority(job.priority),
+                permits: std::sync::Mutex::new(StreamCodecPermits::default()),
+                cancellation: codec_cancellation,
+                runtime: tokio::runtime::Handle::current(),
+                timing: Arc::clone(&stream_pull_timing),
+            });
             let admission = StreamedPullAdmission {
                 executor: self,
                 kind: &job.kind,
                 artifact,
                 mode: execution_materialization_mode,
                 priority: job.priority,
+                codec: Arc::clone(&codec),
             };
             let mode_if_decompressed =
                 effective_materialization_mode(snapshot_artifact, execution_materialization_mode);
@@ -5256,16 +5624,21 @@ impl TransferExecutor {
             let writeback_coordinator = Arc::clone(&self.stream_writeback);
             let timing_for_sink = Arc::clone(&stream_pull_timing);
             let stream_priority = job.priority;
+            let cache_for_sink = receive_lease.clone();
             let wrap: &pplx_space_object_store::WrapWriter = &move |file| {
-                Box::new(StreamDecodeSink::new(
-                    file,
-                    mode_if_decompressed,
-                    block_bytes,
-                    Arc::clone(&observer_for_sink),
-                    Arc::clone(&writeback_coordinator),
-                    Arc::clone(&timing_for_sink),
-                    stream_priority,
-                ))
+                Box::new(
+                    StreamDecodeSink::new(
+                        file,
+                        mode_if_decompressed,
+                        block_bytes,
+                        Arc::clone(&observer_for_sink),
+                        Arc::clone(&writeback_coordinator),
+                        Arc::clone(&timing_for_sink),
+                        stream_priority,
+                    )
+                    .with_codec_lease(Arc::clone(&codec))
+                    .with_receive_cache(cache_for_sink.clone()),
+                )
             };
             let streamed_result = tokio::select! {
                 result = self.store.get_file_streamed(
@@ -5678,7 +6051,7 @@ impl TransferExecutor {
             }
         }
         apply_file_mode(local_path, p.file_mode, FileModeApplyPolicy::Required).await?;
-        page_cache::advise_path_dontneed(local_path, "download volume output");
+        crate::receive_cache::finish_output(local_path, receive_lease.clone()).await;
         // For any encrypted pull — chained decrypt+decompress *or*
         // straight decrypt — the on-disk file is the decrypted plaintext
         // payload, not the downloaded ciphertext: AEAD stripped the
@@ -5759,7 +6132,11 @@ impl TransferExecutor {
         } else {
             "pull download size"
         };
-        bytes_len_to_job_i64(output_size, size_context)
+        let result = bytes_len_to_job_i64(output_size, size_context)?;
+        if let Some(lease) = receive_lease {
+            lease.mark_success();
+        }
+        Ok(result)
     }
 }
 

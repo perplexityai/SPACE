@@ -1,5 +1,7 @@
 use super::*;
 use std::io::Write;
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::FileExt;
 use std::os::unix::fs::{MetadataExt, symlink};
 use std::path::PathBuf;
 
@@ -22,6 +24,7 @@ fn receive_keeps_destination_identity_through_scrub_and_publication() {
     std::fs::write(fixture.join("template/rootfs.ext4"), b"template").unwrap();
     btrfs::set_readonly(&template, true).unwrap();
     let result = std::panic::catch_unwind(|| {
+        let restored = vec![0xa5; 128 * 1024];
         for replacement in [
             "unchanged",
             "symlink",
@@ -34,7 +37,7 @@ fn receive_keeps_destination_identity_through_scrub_and_publication() {
             std::fs::create_dir(&case).unwrap();
             let case_fd = trusted_paths::open_directory(&case).unwrap();
             btrfs::snapshot(&template, &case_fd, "source".as_ref(), false).unwrap();
-            std::fs::write(case.join("source/rootfs.ext4"), b"restored data").unwrap();
+            std::fs::write(case.join("source/rootfs.ext4"), &restored).unwrap();
             let source = directory(&case_fd, "source".as_ref()).unwrap();
             btrfs::snapshot(&source, &case_fd, "instance.ro".as_ref(), true).unwrap();
             let snapshot = directory(&case_fd, "instance.ro".as_ref()).unwrap();
@@ -51,8 +54,7 @@ fn receive_keeps_destination_identity_through_scrub_and_publication() {
             let cancelled = CancellationToken::new();
             cancelled.cancel();
             assert_eq!(
-                receive
-                    .receive(File::open(case.join("stream")).unwrap(), Some(&cancelled))
+                receive_and_check_cache(&receive, &case.join("stream"), Some(&cancelled))
                     .unwrap_err()
                     .code(),
                 tonic::Code::Cancelled,
@@ -63,9 +65,7 @@ fn receive_keeps_destination_identity_through_scrub_and_publication() {
             // Retrying against the same pinned root scrubs that debt first.
             let bytes = std::fs::read(case.join("stream")).unwrap();
             std::fs::write(case.join("partial"), &bytes[..bytes.len() / 2]).unwrap();
-            receive
-                .receive(File::open(case.join("partial")).unwrap(), None)
-                .unwrap_err();
+            receive_and_check_cache(&receive, &case.join("partial"), None).unwrap_err();
             assert!(!destination.join("instance").exists());
             remove_at(&receive.directory, "instance.ro".as_ref()).unwrap();
             let mut original = destination.clone();
@@ -110,7 +110,7 @@ fn receive_keeps_destination_identity_through_scrub_and_publication() {
                 if replacement != "unchanged" {
                     original = replace_destination(&destination, replacement == "symlink").unwrap();
                 }
-                receive.receive(File::open(case.join("stream")).unwrap(), None)
+                receive_and_check_cache(&receive, &case.join("stream"), None)
             };
             if replacement.ends_with("symlink") || replacement.ends_with("directory") {
                 assert!(
@@ -121,15 +121,13 @@ fn receive_keeps_destination_identity_through_scrub_and_publication() {
             if replacement == "cancel" {
                 result.unwrap_err();
                 assert!(!original.join("instance").exists());
-                receive
-                    .receive(File::open(case.join("stream")).unwrap(), None)
-                    .unwrap();
+                receive_and_check_cache(&receive, &case.join("stream"), None).unwrap();
             } else {
                 result.unwrap();
             }
             assert_eq!(
                 std::fs::read(original.join("instance/rootfs.ext4")).unwrap(),
-                b"restored data"
+                restored
             );
             assert!(!original.join("instance/stale").exists());
             assert!(!original.join("instance.ro").exists());
@@ -144,6 +142,61 @@ fn receive_keeps_destination_identity_through_scrub_and_publication() {
     if let Err(panic) = result {
         std::panic::resume_unwind(panic);
     }
+}
+
+/// Observe actual clean-page eviction after the real child exits. Keeping a
+/// second descriptor open must not prevent eviction, and PROT_NONE below
+/// measures residency without faulting the page back in.
+fn receive_and_check_cache(
+    receive: &ReceiveRoot,
+    stream: &Path,
+    cancel: Option<&CancellationToken>,
+) -> Result<(), Status> {
+    let input = File::open(stream)
+        .map_err(|error| Status::internal(format!("open test stream: {error}")))?;
+    input
+        .sync_all()
+        .map_err(|error| Status::internal(format!("sync test stream: {error}")))?;
+    input
+        .read_exact_at(&mut [0u8; 1], 0)
+        .map_err(|error| Status::internal(format!("warm test stream: {error}")))?;
+    let observed = input
+        .try_clone()
+        .map_err(|error| Status::internal(format!("clone test stream: {error}")))?;
+    assert!(first_page_cached(&observed), "stream input must start warm");
+    let result = receive.receive(input, cancel);
+    assert!(
+        !first_page_cached(&observed),
+        "finished receive retained its input page"
+    );
+    result
+}
+
+fn first_page_cached(file: &File) -> bool {
+    // SAFETY: mmap borrows an open descriptor; a one-byte mapping is rounded
+    // to one page by Linux. The mapping is never dereferenced and is unmapped
+    // below before returning, including when mincore reports an error.
+    let mapping = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            1,
+            libc::PROT_NONE,
+            libc::MAP_SHARED,
+            file.as_raw_fd(),
+            0,
+        )
+    };
+    assert_ne!(mapping, libc::MAP_FAILED);
+    let mut resident = 0u8;
+    // SAFETY: the mapping remains live, and one byte of output describes the
+    // single mapped page. mincore retains neither pointer after the call.
+    let result = unsafe { libc::mincore(mapping, 1, &mut resident) };
+    // SAFETY: this is exactly the live mapping returned above; no references
+    // or other owners exist, and this helper never accesses it again.
+    let unmapped = unsafe { libc::munmap(mapping, 1) };
+    assert_eq!(result, 0, "mincore failed");
+    assert_eq!(unmapped, 0, "munmap failed");
+    resident & 1 != 0
 }
 
 fn replace_destination(destination: &Path, link: bool) -> std::io::Result<PathBuf> {

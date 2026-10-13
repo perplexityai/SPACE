@@ -44,6 +44,7 @@ pub enum LifecycleMethod {
     CleanupSandbox,
     Release,
     Filesystem,
+    ReceiveInstance,
 }
 
 impl LifecycleMethod {
@@ -56,6 +57,7 @@ impl LifecycleMethod {
         LifecycleMethod::CleanupSandbox,
         LifecycleMethod::Release,
         LifecycleMethod::Filesystem,
+        LifecycleMethod::ReceiveInstance,
     ];
 
     pub const fn as_metric_tag(self) -> &'static str {
@@ -68,6 +70,7 @@ impl LifecycleMethod {
             LifecycleMethod::CleanupSandbox => "CleanupSandbox",
             LifecycleMethod::Release => "Release",
             LifecycleMethod::Filesystem => "Filesystem",
+            LifecycleMethod::ReceiveInstance => "ReceiveInstance",
         }
     }
 
@@ -81,6 +84,7 @@ impl LifecycleMethod {
             LifecycleMethod::CleanupSandbox => "CLEANUP_SANDBOX",
             LifecycleMethod::Release => "RELEASE",
             LifecycleMethod::Filesystem => "FILESYSTEM",
+            LifecycleMethod::ReceiveInstance => "RECEIVE_INSTANCE",
         }
     }
 
@@ -100,6 +104,10 @@ impl LifecycleMethod {
             LifecycleMethod::CleanupSandbox => (8, 24),
             LifecycleMethod::Release => (32, 96),
             LifecycleMethod::Filesystem => (4, 16),
+            // Restore receive has independent, bounded progress while suspend
+            // capture/send work occupies the general filesystem lane. Keep
+            // the uncontended receive capacity of the shared lane.
+            LifecycleMethod::ReceiveInstance => (4, 16),
         }
     }
 }
@@ -131,7 +139,7 @@ struct MethodSlot {
 #[derive(Debug)]
 pub struct LifecycleLimiter {
     task_tracker: tokio_util::task::TaskTracker,
-    slots: [MethodSlot; 8],
+    slots: [MethodSlot; 9],
 }
 
 impl Default for LifecycleLimiter {
@@ -163,7 +171,7 @@ impl LifecycleLimiter {
                 in_flight: Arc::new(AtomicUsize::new(0)),
             });
         }
-        let slots: [MethodSlot; 8] = slots
+        let slots: [MethodSlot; 9] = slots
             .try_into()
             .expect("LifecycleMethod::ALL length must match");
         Self {

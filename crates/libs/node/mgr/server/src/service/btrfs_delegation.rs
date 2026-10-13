@@ -872,9 +872,11 @@ impl NodeManagerService {
             ALLOW_NODEMGR_ADMIN_OR_SBXMGR,
         )?;
         let sandbox_id = request.get_ref().sandbox_id.clone();
-        self.run_artifact_mutation(&sandbox_id, |service| async move {
-            service.btrfs_receive_instance_inner(request).await
-        })
+        self.run_artifact_mutation_with_admission(
+            &sandbox_id,
+            crate::lifecycle_limiter::LifecycleMethod::ReceiveInstance,
+            |service| async move { service.btrfs_receive_instance_inner(request).await },
+        )
         .await
     }
 

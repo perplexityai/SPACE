@@ -85,6 +85,7 @@ pub struct VolumeManagerService {
     pub(crate) btrfs_submission: Arc<tokio::sync::Mutex<()>>,
     pub(crate) btrfs_push_enabled: bool,
     shadow_comparisons: ShadowComparisonController,
+    receive_cache: crate::receive_cache::ReceiveCache,
     staging: StagingDir,
     transfer_admission: TransferAdmission,
     peer_authorizer: UdsPeerAuthorizer,
@@ -216,11 +217,13 @@ impl VolumeManagerService {
             && config.executor.snapshot_upload_mode.buffer_budget_bytes() > 0;
         let executor = TransferExecutor::new(config.executor, staging.root().to_path_buf());
         let shadow_comparisons = executor.shadow_comparison_controller();
+        let receive_cache = executor.receive_cache();
         let worker = BackgroundWorker::new(Arc::clone(&db), executor, worker_config);
         Ok(Self {
             db,
             worker,
             shadow_comparisons,
+            receive_cache,
             btrfs_submission: Default::default(),
             btrfs_push_enabled,
             staging,
@@ -363,6 +366,10 @@ impl VolumeManagerService {
 
     pub fn shadow_comparison_controller(&self) -> ShadowComparisonController {
         self.shadow_comparisons.clone()
+    }
+
+    pub(crate) fn receive_cache(&self) -> crate::receive_cache::ReceiveCache {
+        self.receive_cache.clone()
     }
 
     pub fn transfer_admission(&self) -> TransferAdmission {

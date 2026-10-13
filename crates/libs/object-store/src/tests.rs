@@ -152,58 +152,50 @@ fn part_size_uses_const_default_when_unset() {
 }
 
 #[test]
-fn ranged_download_uses_single_get_when_object_fits_one_chunk() {
-    for size in [1, 1024, DEFAULT_DOWNLOAD_CHUNK_SIZE as u64] {
-        assert_eq!(
-            single_writer_download_ranges(
-                size,
-                DEFAULT_DOWNLOAD_CHUNK_SIZE,
-                DEFAULT_DOWNLOAD_READER_CONCURRENCY
-            ),
-            None,
-            "size {size} should keep the already-open streaming GET"
-        );
-    }
-}
-
-#[test]
-fn ranged_download_is_disabled_when_reader_concurrency_is_one() {
-    let size = 4 * DEFAULT_DOWNLOAD_CHUNK_SIZE as u64;
-
-    assert_eq!(
-        single_writer_download_ranges(size, DEFAULT_DOWNLOAD_CHUNK_SIZE, 1),
-        None,
-        "one reader should keep the already-open streaming GET"
-    );
-
-    let ranges = single_writer_download_ranges(size, DEFAULT_DOWNLOAD_CHUNK_SIZE, 2)
-        .expect("multiple readers should allow ranged fanout");
-    assert_eq!(ranges.len(), 4);
-}
-
-#[test]
-fn download_chunks_are_fixed_size_with_short_tail() {
+fn download_chunks_start_small_and_cover_the_object_once() {
     let chunk = DEFAULT_DOWNLOAD_CHUNK_SIZE as u64;
-    let size = 3 * chunk + 5;
-    let ranges = download_chunk_ranges(size, DEFAULT_DOWNLOAD_CHUNK_SIZE);
+    let prefix = first_download_chunk_size(DEFAULT_DOWNLOAD_CHUNK_SIZE) as u64;
+    for size in [0, 1, prefix, prefix + 1, chunk, 3 * chunk + prefix + 5] {
+        let ranges = download_chunk_ranges(size, DEFAULT_DOWNLOAD_CHUNK_SIZE);
+        assert_contiguous_cover(&ranges, size);
+        for (index, range) in ranges.iter().enumerate() {
+            let limit = if index == 0 { prefix } else { chunk };
+            assert_eq!(range.length, limit.min(size - range.offset));
+            assert_eq!(
+                byte_range_header(*range),
+                format!("bytes={}-{}", range.offset, range.offset + range.length - 1)
+            );
+        }
+    }
+}
 
-    assert_eq!(ranges.len(), 4);
-    assert_contiguous_cover(&ranges, size);
-    for range in &ranges[..3] {
-        assert_eq!(
-            range.length, chunk,
-            "non-final chunks are exactly chunk_size"
+#[test]
+fn content_range_must_prove_exact_requested_bytes_and_total() {
+    assert_eq!(
+        validate_content_range("bytes 0-9/100", 0, 10, 10).unwrap(),
+        100
+    );
+    assert_eq!(
+        validate_content_range("bytes 90-99/100", 90, 20, 10).unwrap(),
+        100
+    );
+    for header in [
+        "bytes 1-10/100",
+        "bytes 0-8/100",
+        "bytes 0-10/100",
+        "bytes 0-9/*",
+        "bytes 0-9/9",
+        "bytes 9-0/100",
+        "bytes */100",
+        "items 0-9/100",
+        "bytes 0-18446744073709551615/18446744073709551615",
+    ] {
+        assert!(
+            validate_content_range(header, 0, 10, 10).is_err(),
+            "{header}"
         );
     }
-    assert_eq!(ranges[3].length, 5, "tail keeps its natural short length");
-    for range in &ranges {
-        let end = range.offset + range.length - 1;
-        assert_eq!(
-            byte_range_header(*range),
-            format!("bytes={}-{}", range.offset, end)
-        );
-        assert!(end < size);
-    }
+    validate_content_range("bytes 0-9/100", 0, 10, 9).unwrap_err();
 }
 
 #[test]
@@ -702,11 +694,6 @@ fn ranged_stand_in(
             let Some(range) = headers.get(header::RANGE).and_then(|v| v.to_str().ok()) else {
                 return (StatusCode::OK, etag, object).into_response();
             };
-            assert_eq!(
-                headers.get(header::IF_MATCH).and_then(|v| v.to_str().ok()),
-                Some(CHUNK_TEST_ETAG),
-                "every ranged GET must be pinned",
-            );
             let (start, end) = range
                 .strip_prefix("bytes=")
                 .and_then(|span| span.split_once('-'))
@@ -717,6 +704,14 @@ fn ranged_stand_in(
                     )
                 })
                 .expect("range header");
+            if start != 0 || headers.contains_key(header::IF_MATCH) {
+                assert_eq!(
+                    headers.get(header::IF_MATCH).and_then(|v| v.to_str().ok()),
+                    Some(CHUNK_TEST_ETAG),
+                    "later ranges and retries must be pinned",
+                );
+            }
+            let end = end.min(object.len() - 1);
             let chunk = object.slice(start..=end);
             let head = [
                 (header::ETAG, CHUNK_TEST_ETAG.to_string()),
@@ -758,6 +753,272 @@ fn ranged_stand_in(
     })
 }
 
+struct Admission(std::sync::atomic::AtomicU64);
+#[async_trait]
+impl DecodeAdmission for Admission {
+    async fn admit(&self, size: u64) -> Result<Option<DecodeGuard>, DecodeAdmissionError> {
+        self.0.store(size, std::sync::atomic::Ordering::Relaxed);
+        Ok(None)
+    }
+}
+
+#[tokio::test]
+async fn cancelled_download_keeps_its_chunk_charged_until_the_writer_exits() {
+    use crate::test_support::{Recorder, credentials, serve, store, target};
+    use std::io::Write;
+
+    struct BlockingSink {
+        file: std::fs::File,
+        entered: Option<tokio::sync::oneshot::Sender<()>>,
+        release: std::sync::mpsc::Receiver<()>,
+        exited: Option<tokio::sync::oneshot::Sender<()>>,
+    }
+    impl Write for BlockingSink {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if let Some(entered) = self.entered.take() {
+                let _ = entered.send(());
+                self.release
+                    .recv_timeout(Duration::from_secs(5))
+                    .map_err(std::io::Error::other)?;
+            }
+            self.file.write(bytes)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.file.flush()
+        }
+    }
+    impl FinishingWrite for BlockingSink {
+        fn finish(mut self: Box<Self>) -> std::io::Result<bool> {
+            self.flush()?;
+            Ok(false)
+        }
+    }
+    impl Drop for BlockingSink {
+        fn drop(&mut self) {
+            if let Some(exited) = self.exited.take() {
+                let _ = exited.send(());
+            }
+        }
+    }
+
+    const CHUNK: usize = 256 * 1024;
+    let endpoint = serve(ranged_stand_in(
+        Bytes::from(vec![42; 2 * CHUNK]),
+        String::new(),
+        BodyFault::Truncate,
+        0,
+        Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+    ))
+    .await;
+    let mut store = store(
+        S3Timeouts::resolve(|_| None),
+        Duration::from_secs(1),
+        &Arc::new(Recorder::default()),
+    );
+    store.download_chunk_size = CHUNK;
+    let budget = Arc::new(Semaphore::new(1));
+    store.download_buffer_permits = budget.clone();
+    let directory = tempfile::tempdir().unwrap();
+    let destination = directory.path().join("download");
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let (exited_tx, exited_rx) = tokio::sync::oneshot::channel();
+    let channels = std::sync::Mutex::new(Some((entered_tx, release_rx, exited_tx)));
+    let download = tokio::spawn(async move {
+        let wrap = move |file| -> Box<dyn FinishingWrite> {
+            let (entered, release, exited) = channels.lock().unwrap().take().unwrap();
+            Box::new(BlockingSink {
+                file,
+                entered: Some(entered),
+                release,
+                exited: Some(exited),
+            })
+        };
+        store
+            .get_file_streamed(
+                &credentials(),
+                target(&endpoint),
+                &destination,
+                StreamDecode {
+                    admission: &Admission(std::sync::atomic::AtomicU64::new(0)),
+                    wrap_writer: &wrap,
+                },
+            )
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), entered_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    download.abort();
+    assert!(matches!(download.await, Err(error) if error.is_cancelled()));
+    let released_early = budget.available_permits() != 0;
+    release_tx.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), exited_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        !released_early,
+        "detached writer still owns the buffered input bytes"
+    );
+    assert_eq!(budget.available_permits(), 1);
+    assert!(!directory.path().join("download").exists());
+}
+
+#[tokio::test]
+async fn initial_range_is_payload_and_only_verified_ranges_are_combined() {
+    use crate::test_support::{Recorder, credentials, serve, store, target};
+    use axum::http::{HeaderMap, StatusCode, header};
+    use axum::response::IntoResponse;
+
+    #[derive(Clone, Copy, Debug)]
+    enum Reply {
+        Ranged,
+        NoTag,
+        MissingRange,
+        WrongRange,
+        ChangedTag,
+    }
+    let prefix = first_download_chunk_size(DEFAULT_DOWNLOAD_CHUNK_SIZE);
+    for (size, readers, reply) in [
+        (0, 2, Reply::Ranged),
+        (17, 2, Reply::Ranged),
+        (prefix * 2, 1, Reply::Ranged),
+        (prefix * 2, 2, Reply::Ranged),
+        (prefix * 2, 2, Reply::NoTag),
+        (prefix * 2, 2, Reply::MissingRange),
+        (prefix * 2, 2, Reply::WrongRange),
+        (prefix * 2, 2, Reply::ChangedTag),
+    ] {
+        let object: Bytes = (0..size).map(|i| (i % 251) as u8).collect();
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = requests.clone();
+        let expected = object.clone();
+        let endpoint = serve(axum::Router::new().fallback(move |headers: HeaderMap| {
+            let object = object.clone();
+            observed.lock().unwrap().push((
+                headers
+                    .get(header::RANGE)
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_owned),
+                headers
+                    .get(header::IF_MATCH)
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_owned),
+            ));
+            async move {
+                let Some(range) = headers.get(header::RANGE) else {
+                    return (StatusCode::OK, object).into_response();
+                };
+                if object.is_empty() {
+                    return (
+                        StatusCode::RANGE_NOT_SATISFIABLE,
+                        "<Error><Code>InvalidRange</Code></Error>",
+                    )
+                        .into_response();
+                }
+                let (start, end) = range
+                    .to_str()
+                    .unwrap()
+                    .strip_prefix("bytes=")
+                    .unwrap()
+                    .split_once('-')
+                    .unwrap();
+                let start = start.parse::<usize>().unwrap();
+                let end = end.parse::<usize>().unwrap().min(object.len() - 1);
+                let mut response =
+                    (StatusCode::PARTIAL_CONTENT, object.slice(start..=end)).into_response();
+                if !matches!(reply, Reply::MissingRange) {
+                    let start = start + usize::from(matches!(reply, Reply::WrongRange));
+                    response.headers_mut().insert(
+                        header::CONTENT_RANGE,
+                        format!("bytes {start}-{end}/{}", object.len())
+                            .parse()
+                            .unwrap(),
+                    );
+                }
+                if !matches!(reply, Reply::NoTag) {
+                    let etag = if start > 0 && matches!(reply, Reply::ChangedTag) {
+                        "\"changed\""
+                    } else {
+                        CHUNK_TEST_ETAG
+                    };
+                    response
+                        .headers_mut()
+                        .insert(header::ETAG, etag.parse().unwrap());
+                }
+                response
+            }
+        }))
+        .await;
+        let recorder = Arc::new(Recorder::default());
+        let mut store = store(
+            S3Timeouts::resolve(|_| None),
+            Duration::from_secs(1),
+            &recorder,
+        );
+        store.download_reader_concurrency = readers;
+        let dir = tempfile::tempdir().unwrap();
+        let dst = dir.path().join("artifact");
+        let admission = Admission(std::sync::atomic::AtomicU64::new(0));
+        let result = store
+            .get_file_streamed(
+                &credentials(),
+                target(&endpoint),
+                &dst,
+                StreamDecode {
+                    admission: &admission,
+                    wrap_writer: &|file| Box::new(file),
+                },
+            )
+            .await
+            .map(|outcome| match outcome {
+                StreamedGetFile::Fallback { bytes } => {
+                    assert_eq!(admission.0.load(std::sync::atomic::Ordering::Relaxed), 0);
+                    bytes
+                }
+                StreamedGetFile::Streamed { bytes, .. } => {
+                    assert_eq!(
+                        admission.0.load(std::sync::atomic::Ordering::Relaxed),
+                        size as u64
+                    );
+                    bytes
+                }
+            });
+        if matches!(reply, Reply::WrongRange | Reply::ChangedTag) {
+            assert!(result.is_err(), "{reply:?}");
+            assert!(!dst.exists(), "unverified bytes must not be published");
+            continue;
+        }
+        assert_eq!(result.unwrap(), size as u64, "{reply:?}");
+        assert_eq!(std::fs::read(&dst).unwrap(), expected, "{reply:?}");
+        let requests = requests.lock().unwrap();
+        let fallback = size == 0 || matches!(reply, Reply::NoTag | Reply::MissingRange);
+        let count = if readers == 1 {
+            1
+        } else if fallback {
+            2
+        } else {
+            download_chunk_ranges(size as u64, DEFAULT_DOWNLOAD_CHUNK_SIZE).len()
+        };
+        assert_eq!(
+            requests.len(),
+            count,
+            "{reply:?}: no discarded size-probe GET"
+        );
+        assert_eq!(requests[0].1, None);
+        if readers > 1 && !fallback {
+            for (index, (range, etag)) in requests.iter().enumerate() {
+                assert!(range.is_some());
+                if index > 0 {
+                    assert_eq!(etag.as_deref(), Some(CHUNK_TEST_ETAG));
+                }
+            }
+        }
+    }
+}
+
 struct RangedDownload {
     result: Result<u64, ObjectStoreError>,
     expected: Bytes,
@@ -767,13 +1028,17 @@ struct RangedDownload {
 }
 
 /// Downloads a four-chunk object through [`ranged_stand_in`] with the
-/// second chunk faulty.
-async fn ranged_download(fault: BodyFault, faults: usize) -> RangedDownload {
+/// selected chunk faulty.
+async fn ranged_download(fault: BodyFault, faults: usize, faulty_chunk: usize) -> RangedDownload {
     use crate::test_support::{Recorder, credentials, serve, store};
 
     const CHUNK: usize = 256 * 1024;
     let object: Bytes = (0..4 * CHUNK).map(|i| (i % 251) as u8).collect();
-    let faulty_range = format!("bytes={}-{}", CHUNK, 2 * CHUNK - 1);
+    let faulty_range = format!(
+        "bytes={}-{}",
+        faulty_chunk * CHUNK,
+        (faulty_chunk + 1) * CHUNK - 1
+    );
     let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let endpoint = serve(ranged_stand_in(
         object.clone(),
@@ -807,11 +1072,12 @@ async fn ranged_download(fault: BodyFault, faults: usize) -> RangedDownload {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ranged_download_retries_a_chunk_whose_body_fails_once() {
-    for (fault, kind) in [
-        (BodyFault::Truncate, S3AttemptFailureKind::Io),
-        (BodyFault::Stall, S3AttemptFailureKind::StalledStream),
+    for (fault, kind, faulty_chunk) in [
+        (BodyFault::Truncate, S3AttemptFailureKind::Io, 0),
+        (BodyFault::Truncate, S3AttemptFailureKind::Io, 1),
+        (BodyFault::Stall, S3AttemptFailureKind::StalledStream, 1),
     ] {
-        let download = ranged_download(fault, 1).await;
+        let download = ranged_download(fault, 1, faulty_chunk).await;
 
         assert_eq!(
             download.result.as_ref().ok(),
@@ -832,7 +1098,7 @@ async fn ranged_download_retries_a_chunk_whose_body_fails_once() {
             (1, kind, true),
             "{fault:?}",
         );
-        assert_eq!(target.chunk_index, Some(1), "{fault:?}");
+        assert_eq!(target.chunk_index, Some(faulty_chunk), "{fault:?}");
         let recoveries = download.recorder.recoveries();
         assert_eq!(recoveries.len(), 1, "{fault:?}");
         assert_eq!(recoveries[0].1.attempts, 2, "{fault:?}");
@@ -841,7 +1107,7 @@ async fn ranged_download_retries_a_chunk_whose_body_fails_once() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ranged_download_fails_after_three_chunk_body_failures() {
-    let download = ranged_download(BodyFault::Truncate, usize::MAX).await;
+    let download = ranged_download(BodyFault::Truncate, usize::MAX, 1).await;
 
     assert!(
         matches!(download.result, Err(ObjectStoreError::RangeBodyRead { .. })),
@@ -862,7 +1128,7 @@ async fn ranged_download_fails_after_three_chunk_body_failures() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ranged_download_does_not_retry_a_changed_object() {
-    let download = ranged_download(BodyFault::PreconditionFailed, usize::MAX).await;
+    let download = ranged_download(BodyFault::PreconditionFailed, usize::MAX, 1).await;
 
     assert!(
         matches!(download.result, Err(ObjectStoreError::Get(_))),
