@@ -521,6 +521,76 @@ impl K8sStore {
         }
     }
 
+    /// The durable suspend artifact of this execution's in-flight suspend, as
+    /// recorded by the control plane, for when the node can no longer publish
+    /// it: a node that tears the sandbox down after its suspend backup has
+    /// finalized answers the suspend poll with a generation-fenced delete.
+    ///
+    /// Accepts only the newest full suspend snapshot of a `suspending` row,
+    /// taken by the active execution's node after the suspend began, ready and
+    /// with a live storage location, so a stale or foreign artifact cannot
+    /// finalize this suspend.
+    pub(in crate::controllers::substrate::kubernetes) async fn durable_suspend_snapshot_artifact(
+        &self,
+        sandbox_id: SandboxId,
+        generation: ExecutionGeneration,
+        expected_pod_uid: &PodUid,
+    ) -> Result<Option<super::super::super::PublishedLocalArtifact>, SubstrateError> {
+        let row: Option<(Uuid, String)> = sqlx::query_as(sql!(
+            "SELECT sn.local_artifact_id, sn.artifact_kind
+               FROM sandboxes s
+               JOIN sandbox_k8s_executions e
+                 ON e.sandbox_id = s.id
+                AND e.generation = $2
+                AND e.pod_uid = $3
+                AND e.active
+               JOIN snapshots sn
+                 ON sn.sandbox_id = s.id
+              WHERE s.id = $1
+                AND s.lifecycle = 'suspending'
+                AND sn.type = 'full'
+                AND sn.state = 'ready'
+                AND sn.artifact_origin = 'suspend'
+                AND sn.artifact_kind IS NOT NULL
+                AND sn.local_artifact_id IS NOT NULL
+                AND sn.source_node_id = s.active_node_id
+                AND sn.timestamp >= s.lifecycle_changed_at
+                AND EXISTS (
+                    SELECT 1
+                      FROM snapshot_storage_locations l
+                     WHERE l.snapshot_id = sn.id
+                       AND l.orphaned_at IS NULL
+                )
+                AND NOT EXISTS (
+                    SELECT 1
+                      FROM snapshots newer
+                     WHERE newer.sandbox_id = s.id
+                       AND newer.id <> sn.id
+                       AND newer.timestamp >= sn.timestamp
+                       AND (newer.state = 'creating' OR newer.type = 'full')
+                )"
+        ))
+        .bind(sandbox_id.as_uuid())
+        .bind(generation.get())
+        .bind(expected_pod_uid.as_str())
+        .fetch_optional(&self.pool)
+        .await
+        .db_context("failed to load durable Kubernetes suspend snapshot")?;
+        row.map(|(artifact_id, artifact_kind)| {
+            let kind =
+                ArtifactKind::try_from(artifact_kind).map_err(|error| SubstrateError::Failed {
+                    message: format!(
+                        "durable suspend snapshot has an invalid artifact kind: {error}"
+                    ),
+                })?;
+            Ok(super::super::super::PublishedLocalArtifact {
+                id: LocalArtifactId::from_uuid(artifact_id),
+                kind,
+            })
+        })
+        .transpose()
+    }
+
     /// A pod that dies while its sandbox is `suspending` belongs to the
     /// suspend flow: finalization retires the execution as `suspended`, and
     /// the transient-lifecycle sweeper ages out suspends that never finish.

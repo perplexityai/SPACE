@@ -37,6 +37,17 @@ impl KubernetesSubstrate {
     }
 }
 
+/// How the node answered a generation-bound suspend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum GenerationSuspendOutcome {
+    /// The node published this durable suspend artifact.
+    Durable(PublishedLocalArtifact),
+    /// A generation-fenced local delete covers the execution, so the node has
+    /// no artifact to publish. The suspend may still have become durable
+    /// before that delete; only the control plane's snapshot record can say.
+    NodeDeleted,
+}
+
 pub(super) async fn await_generation_suspend(
     client: &mut RuntimeClient,
     sandbox_id: SandboxId,
@@ -44,7 +55,7 @@ pub(super) async fn await_generation_suspend(
     endpoint_addr: &str,
     deadline: Instant,
     durability_budget: Duration,
-) -> Result<PublishedLocalArtifact, SubstrateError> {
+) -> Result<GenerationSuspendOutcome, SubstrateError> {
     poll_generation_suspend(
         |request| {
             let mut client = client.clone();
@@ -67,7 +78,7 @@ pub(super) async fn poll_generation_suspend<F, Fut>(
     deadline: Instant,
     // The budget `deadline` was derived from, named in the timeout error.
     durability_budget: Duration,
-) -> Result<PublishedLocalArtifact, SubstrateError>
+) -> Result<GenerationSuspendOutcome, SubstrateError>
 where
     F: FnMut(
         tonic::Request<pplx_space_sbx_mgr_client::proto::PrepareTeardownSuspendRequest>,
@@ -145,7 +156,8 @@ where
                     .unwrap_or(pplx_space_sbx_mgr_client::proto::TeardownSuspendOutcome::Unspecified);
             match outcome {
                 pplx_space_sbx_mgr_client::proto::TeardownSuspendOutcome::Durable => {
-                    return published_generation_suspend_artifact(response, endpoint_addr);
+                    return published_generation_suspend_artifact(response, endpoint_addr)
+                        .map(GenerationSuspendOutcome::Durable);
                 }
                 pplx_space_sbx_mgr_client::proto::TeardownSuspendOutcome::Pending => {
                     pending_responses += 1;
@@ -197,11 +209,7 @@ where
                     });
                 }
                 pplx_space_sbx_mgr_client::proto::TeardownSuspendOutcome::Deleted => {
-                    return Err(SubstrateError::Unavailable {
-                        message: response.reason.unwrap_or_else(|| {
-                            format!("sandbox {sandbox_id} was deleted before suspend completed")
-                        }),
-                    });
+                    return Ok(GenerationSuspendOutcome::NodeDeleted);
                 }
                 pplx_space_sbx_mgr_client::proto::TeardownSuspendOutcome::Unspecified => {
                     return Err(SubstrateError::Failed {

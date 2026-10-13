@@ -41,7 +41,7 @@ async fn poll_suspend_responses(
     responses: Vec<Result<PrepareTeardownSuspendResponse, tonic::Status>>,
     budget: Duration,
 ) -> (
-    Result<PublishedLocalArtifact, SubstrateError>,
+    Result<super::suspend::GenerationSuspendOutcome, SubstrateError>,
     Vec<BTreeMap<String, String>>,
 ) {
     let sandbox_id = SandboxId::new();
@@ -273,7 +273,33 @@ async fn generation_suspend_polling_preserves_success_and_terminal_failure() {
         Duration::from_secs(2),
     )
     .await;
-    assert_eq!(result.unwrap().id, artifact_id);
+    assert_eq!(
+        result.unwrap(),
+        super::suspend::GenerationSuspendOutcome::Durable(PublishedLocalArtifact {
+            id: artifact_id,
+            kind: ArtifactKind::Full,
+        })
+    );
+    assert!(summaries.is_empty());
+
+    // A generation-fenced node delete is an outcome for the caller to resolve
+    // against the control plane's snapshot record, not a poll failure.
+    let (result, summaries) = poll_suspend_responses(
+        vec![
+            pending_suspend(Some(PENDING_REASON)),
+            Ok(PrepareTeardownSuspendResponse {
+                outcome: TeardownSuspendOutcome::Deleted as i32,
+                reason: None,
+                published_artifact: None,
+            }),
+        ],
+        Duration::from_secs(2),
+    )
+    .await;
+    assert_eq!(
+        result.unwrap(),
+        super::suspend::GenerationSuspendOutcome::NodeDeleted
+    );
     assert!(summaries.is_empty());
 
     let mut terminal_responses = vec![
@@ -283,7 +309,6 @@ async fn generation_suspend_polling_preserves_success_and_terminal_failure() {
     terminal_responses.extend(
         [
             TeardownSuspendOutcome::Superseded,
-            TeardownSuspendOutcome::Deleted,
             TeardownSuspendOutcome::Unspecified,
             TeardownSuspendOutcome::Durable, // Missing artifact must still fail.
         ]
@@ -305,7 +330,7 @@ async fn generation_suspend_polling_preserves_success_and_terminal_failure() {
             Duration::from_secs(2),
         )
         .await;
-        if index < 4 {
+        if index < 3 {
             assert!(matches!(result, Err(SubstrateError::Unavailable { .. })));
         } else {
             assert!(matches!(result, Err(SubstrateError::Failed { .. })));

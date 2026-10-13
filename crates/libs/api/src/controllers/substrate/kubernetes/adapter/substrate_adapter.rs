@@ -1380,6 +1380,28 @@ impl SubstrateAdapter for KubernetesSubstrate {
             )
             .await
             {
+                Ok(GenerationSuspendOutcome::Durable(published_artifact)) => Ok(published_artifact),
+                // The node can delete the sandbox after its suspend backup
+                // finalized (a failed post-suspend cleanup takes the delete
+                // path), and then has no artifact to publish. The ready
+                // snapshot still proves the suspend durable; without it the
+                // suspend did not complete and the caller may retry.
+                Ok(GenerationSuspendOutcome::NodeDeleted) => self
+                    .store
+                    .durable_suspend_snapshot_artifact(
+                        sandbox_id,
+                        expected_generation,
+                        &expected_pod_uid,
+                    )
+                    .await?
+                    .ok_or_else(|| SubstrateError::Unavailable {
+                        message: format!(
+                            "sandbox {sandbox_id} was deleted on its node before suspend completed"
+                        ),
+                    }),
+                Err(error) => Err(error),
+            };
+            let published_artifact = match published_artifact {
                 Ok(published_artifact) => published_artifact,
                 Err(error) => {
                     tracing::warn!(
