@@ -345,6 +345,12 @@ jobs:
         run: |
           dir="${RUNNER_TEMP}/kind-node-diagnostics"
           mkdir -p "${dir}"
+          # Keep startup/evaluation output even when Tilt has not registered a
+          # cluster or any application resources yet.
+          tilt_log="${SPACE_TILT_LOG:-$HOME/.space-devbox/kind/tilt-${SPACE_KIND_CLUSTER:-space-local}.log}"
+          if [[ -f "$tilt_log" ]]; then
+            tail -c 2097152 "$tilt_log" >"${dir}/tilt-startup.log"
+          fi
           k() { timeout "$1" kubectl --context kind-space-local "${@:2}"; }
           # Preserve the first admission/recovery error, not only its final retry,
           # from every API replica: `logs deployment/...` reads only one.

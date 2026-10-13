@@ -388,6 +388,14 @@ No external Grafana datasource or external Loki provisioning is inferred.
 The fixed node-side Collector addresses keep exporter configuration renderable
 without a cluster, and exporters retry if a receiver is later restarted.
 
+On a cold OTLP start, image loading and receiver installation happen during
+Tiltfile evaluation, before Tilt registers its cluster context. The smoke
+bring-up allows its existing `BOOTSTRAP_TIMEOUT` budget (1800 seconds by
+default) for that initialization, while still requiring the selected context.
+An exited Tilt process or failed evaluation ends the wait early with a log
+tail. Detached bring-up also waits for this initialization, but not application
+builds or rollouts; the timeout is per stage, not a whole-bring-up deadline.
+
 Before installing, `install-observability.sh` loads each backend image onto
 every node at the linux/amd64 digest `ci/mirrored-images.txt` lists for the
 charts' pin, under the tag the Kind profiles name, so the pods start without a

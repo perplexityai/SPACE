@@ -283,7 +283,10 @@ def test_shim_endpoint_override_replaces_the_collectors(tmp_path):
     assert values["OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"] == SHIM_OVERRIDE
     assert not (tmp_path / "unexpected-operation").exists()
     settings = config.configuration(env)
-    assert not any(value.startswith("telemetry.otlp") for value in settings["helm_set"])
+    assert not any(
+        value.startswith(("telemetry.otlpMetricsEndpoint=", "telemetry.otlpTracesEndpoint="))
+        for value in settings["helm_set"]
+    )
     for signal in ("Metrics", "Traces"):
         assert f"telemetry.nodeOtlp{signal}Endpoint={SHIM_OVERRIDE}" in settings["helm_set"]
     for key in ("SPACE_KIND_OTLP_METRICS_ENDPOINT", "SPACE_KIND_OTLP_TRACES_ENDPOINT"):

@@ -33,13 +33,12 @@
 #   DATA_PLANE_URL    — optional data-plane health-check URL (e.g. http://localhost:8090)
 #   KIND_CLUSTER      — kind cluster name (e.g. space-local)
 #   SKIP_BOOTSTRAP=1  — skip everything; caller asserts stack is up
-#   BOOTSTRAP_TIMEOUT — seconds to wait for api-server `/healthz`
+#   BOOTSTRAP_TIMEOUT — per-stage seconds for Tilt initialization and API readiness
 #   KIND_STACK_DETACH=1 — return as soon as the cluster exists and Tilt is
-#                       serving :10350; do not wait for the api-server, the
-#                       seed Job, or any rollout. For callers that must return
-#                       quickly (devbox setup steps are SIGKILLed at 5 min)
-#                       and leave the build running. `kind_stack_start_detached`
-#                       is the entry point for that mode.
+#                       serving its selected context on :10350; do not wait
+#                       for the api-server, seed Job, or application rollouts.
+#                       Initial profile/backend setup still happens first.
+#                       `kind_stack_start_detached` is the entry point.
 #
 # Globals expected to be set by the caller before sourcing:
 #   REPO_ROOT — absolute path to the repo root
@@ -480,14 +479,19 @@ bootstrap_kind_stack__wait_for_api() {
 }
 
 bootstrap_kind_stack__start_tilt() {
-    local state_dir log pidfile
+    local state_dir log pidfile tilt_pid
+    local startup_timeout="${BOOTSTRAP_TIMEOUT:-1800}"
+    [[ "$startup_timeout" =~ ^[1-9][0-9]*$ ]] || {
+        echo "ERROR: BOOTSTRAP_TIMEOUT must be a positive integer number of seconds" >&2
+        return 2
+    }
     state_dir="${SPACE_TILT_STATE_DIR:-$HOME/.space-devbox/kind}"
     log="${SPACE_TILT_LOG:-$state_dir/tilt-${KIND_CLUSTER}.log}"
     pidfile="${SPACE_TILT_PIDFILE:-$state_dir/tilt-${KIND_CLUSTER}.pid}"
     mkdir -p "$state_dir"
     echo "[bootstrap] starting tilt in background; logs → $log"
     echo "[bootstrap] tilt UI: http://localhost:10350 (per-resource build progress)"
-    (
+    tilt_pid=$(
         cd "$REPO_ROOT" || exit
         # The smokes drive the full production-shaped harness on the
         # multi-worker cluster: KubernetesSubstrate + shim + cluster-controller.
@@ -503,17 +507,43 @@ bootstrap_kind_stack__start_tilt() {
         # 300s). A new session puts Tilt in its own process group.
         TILT_BROWSER_DISABLED=1 SPACE_KIND_CLUSTER="$KIND_CLUSTER" \
             setsid nohup tilt up >"$log" 2>&1 </dev/null &
-        echo $! >"$pidfile"
+        pid=$!
+        printf '%s\n' "$pid" >"$pidfile"
+        printf '%s\n' "$pid"
     )
 
-    local tilt_deadline=$(( $(date +%s) + 60 ))
+    # Cluster registration follows Tiltfile evaluation. The selected profile
+    # reconciles receivers before returning producer manifests, including image
+    # loading and bounded Helm waits on a cold start. This is initialization,
+    # not a 60-second daemon-listen handshake; use the existing bootstrap budget.
+    local tilt_deadline=$(( $(date +%s) + startup_timeout ))
+    local error="" evaluation_error now last_log_at=0
     while [[ $(date +%s) -lt $tilt_deadline ]]; do
+        if ! kill -0 "$tilt_pid" 2>/dev/null; then
+            error="Tilt exited before registering context kind-${KIND_CLUSTER}"
+            break
+        fi
         if bootstrap_kind_stack__tilt_running; then
             return 0
         fi
+        # A failed evaluation leaves the Tilt server alive but cannot register
+        # its cluster. Do not consume the entire budget on that terminal result.
+        evaluation_error="$(timeout 5s tilt get tiltfile '(Tiltfile)' --port 10350 \
+            -o 'jsonpath={.status.terminated.error}' 2>/dev/null)" || evaluation_error=""
+        if [[ -n "$evaluation_error" ]]; then
+            error="Tiltfile initialization failed: $evaluation_error"
+            break
+        fi
+        now=$(date +%s)
+        if (( now - last_log_at >= 30 )); then
+            echo "[bootstrap] waiting for Tiltfile initialization and context kind-${KIND_CLUSTER}" \
+                "(timeout in $(( tilt_deadline - now ))s)"
+            last_log_at=$now
+        fi
         sleep 2
     done
-    echo "ERROR: tilt did not report context kind-${KIND_CLUSTER} on :10350 within 60s" >&2
+    echo "ERROR: ${error:-tilt did not report context kind-${KIND_CLUSTER} on :10350 within ${startup_timeout}s}" >&2
+    tail -n 60 "$log" >&2 || true
     echo "  inspect: $log" >&2
     return 1
 }
@@ -794,8 +824,10 @@ kind_stack_assert_cluster_mounts() {
     rm -f "$expected"
 }
 
-# Non-blocking bring-up: cluster created, Tilt started in its own session,
-# return. Everything `bootstrap_kind_stack` additionally guarantees (api-server,
+# Detached application bring-up: cluster created, Tilt started in its own
+# session and its selected context verified, then return. Initial profile
+# reconciliation still completes before that context is registered. Everything
+# `bootstrap_kind_stack` additionally guarantees (api-server,
 # seed Job, rollouts) is left for Tilt to finish in the background; a later
 # `bootstrap_kind_stack` (any kind smoke) finds Tilt running and waits then.
 #

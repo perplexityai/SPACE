@@ -40,6 +40,10 @@
 #      started — is restarted from this one; one whose directory cannot be read
 #      is reused. Reusing the former made `kind` from a fresh worktree pass in
 #      8 s against the previous run's code (2026-09-23 reuse bench).
+#   9. Initial Tiltfile evaluation may install observability receivers before
+#      registering the cluster. It gets the bounded bootstrap budget, while a
+#      dead process or failed evaluation stops early and a wrong context never
+#      satisfies readiness.
 #
 # Hermetic by construction: every case that reaches a real `kill` runs with a
 # `pgrep` that reports ONLY the fake processes the case started. The first
@@ -82,6 +86,13 @@ run_bring_up() {
     (
         for knob in "$@"; do export "$knob"; done
         mkdir -p "$work/bin"
+        # Layout-check subprocesses must not discover this machine's real
+        # clusters. The parent shell's kind() below models the fixture cluster;
+        # child guards see no cluster, and unknown cluster calls fail closed.
+        printf '#!/usr/bin/env bash\nexit 0\n' >"$work/bin/kind"
+        printf '#!/usr/bin/env bash\nexit 99\n' >"$work/bin/kubectl"
+        printf '#!/usr/bin/env bash\nexit 99\n' >"$work/bin/docker"
+        chmod +x "$work/bin/kind" "$work/bin/kubectl" "$work/bin/docker"
         cat >"$work/bin/tilt" <<'TILT'
 #!/usr/bin/env bash
 case "$*" in
@@ -394,6 +405,107 @@ else
         && fail "pending/in_progress must not trip the failed-build check" "$(cat "$work/result")"
 fi
 rm -rf "$work"
+
+# Initial startup, against the real start/liveness helpers. Only the process,
+# clock and CLI boundaries are stubbed: no real Tilt, cluster or signal.
+run_startup() {
+    local work="$1"
+    shift
+    (
+        for knob in "$@"; do export "$knob"; done
+        REPO_ROOT="$repo_root"
+        KIND_CLUSTER=space-local
+        BOOTSTRAP_TIMEOUT="${TEST_STARTUP_TIMEOUT:-120}"
+        SPACE_TILT_STATE_DIR="$work/state"
+        SPACE_TILT_LOG="$work/tilt.log"
+        SPACE_TILT_PIDFILE="$work/tilt.pid"
+        source "$repo_root/scripts/tests/lib/bootstrap-kind-stack.sh"
+        clock=0
+        # The detached command produces only this fixture's log/marker.
+        setsid() { echo "synthetic startup log"; touch "$work/spawned"; }
+        pgrep() { return 0; }
+        curl() { return 0; }
+        timeout() { shift; "$@"; }
+        date() {
+            [[ "$*" == +%s ]] || return 99
+            # Let the background stub write its log before a failure tails it.
+            local attempt
+            for ((attempt = 0; attempt < 100; attempt++)); do
+                [[ -e "$work/spawned" ]] && break
+                command sleep 0.01
+            done
+            printf '%s\n' "$clock"
+        }
+        sleep() { clock=$((clock + 20)); }
+        kill() {
+            [[ "$1" == -0 ]] || { touch "$work/unexpected-signal"; return 99; }
+            [[ "${TEST_PROCESS_DEAD:-0}" == 0 ]]
+        }
+        tilt() {
+            case "$*" in
+                *'jsonpath={.status.connection.kubernetes.context}'*)
+                    if (( clock >= ${TEST_CONTEXT_AFTER:-80} )); then
+                        printf '%s' "${TEST_CONTEXT:-kind-space-local}"
+                    fi ;;
+                *'jsonpath={.status.terminated.error}'*)
+                    printf '%s' "${TEST_EVALUATION_ERROR:-}" ;;
+                *) return 99 ;;
+            esac
+        }
+        result=0
+        bootstrap_kind_stack__start_tilt || result=$?
+        printf '%s\n' "$clock" >"$work/elapsed"
+        exit "$result"
+    ) >"$work/result" 2>&1
+}
+
+work="$(mktemp -d)"
+if run_startup "$work" TEST_CONTEXT_AFTER=80 TEST_STARTUP_TIMEOUT=120; then
+    [[ "$(cat "$work/elapsed")" == 80 ]] \
+        || fail "startup must wait past the old 60s handshake for the selected context" "$(cat "$work/result")"
+else
+    fail "slow successful Tiltfile initialization must use the bootstrap budget" "$(cat "$work/result")"
+fi
+[[ ! -e "$work/unexpected-signal" ]] || fail "startup must not signal a process"
+rm -rf "$work"
+
+for reason in dead evaluation; do
+    work="$(mktemp -d)"
+    knobs=(TEST_CONTEXT_AFTER=200 TEST_STARTUP_TIMEOUT=120)
+    if [[ "$reason" == dead ]]; then
+        knobs+=(TEST_PROCESS_DEAD=1)
+    else
+        knobs+=(TEST_EVALUATION_ERROR=synthetic-evaluation-failure)
+    fi
+    if run_startup "$work" "${knobs[@]}"; then
+        fail "$reason startup must fail rather than wait for readiness"
+    fi
+    [[ "$(cat "$work/elapsed")" == 0 ]] \
+        || fail "$reason startup must fail before consuming the budget" "$(cat "$work/result")"
+    grep -q "synthetic startup log" "$work/result" \
+        || fail "$reason startup must include its diagnostic log tail" "$(cat "$work/result")"
+    [[ ! -e "$work/unexpected-signal" ]] || fail "startup must not signal a process"
+    rm -rf "$work"
+done
+
+work="$(mktemp -d)"
+if run_startup "$work" TEST_CONTEXT_AFTER=0 TEST_CONTEXT=kind-another-bench TEST_STARTUP_TIMEOUT=100; then
+    fail "a responsive Tilt with another context must never satisfy startup"
+fi
+[[ "$(cat "$work/elapsed")" == 100 ]] \
+    || fail "wrong-context startup must stop at the configured budget" "$(cat "$work/result")"
+grep -q "within 100s" "$work/result" \
+    || fail "a timed-out startup must report its actual bound" "$(cat "$work/result")"
+rm -rf "$work"
+
+for invalid in 0 -1 abc; do
+    work="$(mktemp -d)"
+    if run_startup "$work" TEST_CONTEXT_AFTER=0 TEST_STARTUP_TIMEOUT="$invalid"; then
+        fail "invalid startup budget $invalid must be refused"
+    fi
+    [[ ! -e "$work/spawned" ]] || fail "invalid startup budget must fail before starting Tilt"
+    rm -rf "$work"
+done
 
 # Case 5: teardown stops a pidfile-less `tilt up` serving this cluster's
 # context, and leaves one serving another context alone. A real process stands
