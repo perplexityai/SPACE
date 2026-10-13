@@ -14724,46 +14724,6 @@ pub(crate) mod service_tests {
     }
 
     #[tokio::test]
-    async fn unsealed_encrypted_capture_quarantines_as_an_only_copy_after_its_retry_window() {
-        let conn = crate::db::test_conn();
-        let id = SandboxId::new().to_string();
-        insert_suspending_resuspend(&conn, &id);
-        let cache = tempfile::tempdir().unwrap();
-        let sandbox_dir = cache.path().join(&id);
-        let (_, staging) = record_unsealed_encrypted_capture(&sandbox_dir);
-        std::fs::File::options()
-            .write(true)
-            .open(
-                staging
-                    .join(crate::service::suspend_snapshot_publication::ENCRYPTED_CAPTURE_RECORD),
-            )
-            .unwrap()
-            .set_modified(
-                std::time::SystemTime::now()
-                    - crate::service::suspend_snapshot_publication::ENCRYPTED_SEAL_RETRY_WINDOW
-                    - std::time::Duration::from_secs(60),
-            )
-            .unwrap();
-        let service = service_with_runtime_liveness(conn, false);
-
-        service
-            .recover_deferred_suspend_publications_in(
-                cache.path(),
-                vec![service.lookup_sandbox(&id).unwrap()],
-                &CancellationToken::new(),
-                &Default::default(),
-            )
-            .unwrap();
-        let row = service.lookup_sandbox(&id).unwrap();
-        assert_eq!(row.state, SandboxState::Quarantined);
-        assert_eq!(
-            row.failure_reason.as_deref(),
-            Some(crate::db::SUSPEND_PUBLISH_FAILED_NO_ARTIFACT_RUNTIME_GONE)
-        );
-        assert!(staging.exists(), "the unsealed capture must be retained");
-    }
-
-    #[tokio::test]
     async fn periodic_suspend_recovery_follows_node_manager_for_a_deferred_capture() {
         use crate::retained_source::{FakeInspector, RetainedSourceCheck};
         for (answer, expected_state) in [

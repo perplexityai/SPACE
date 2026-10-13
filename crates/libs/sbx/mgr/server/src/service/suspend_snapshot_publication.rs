@@ -91,7 +91,9 @@ pub(super) fn remove_encrypted_capture_record(staging_dir: &Path) -> std::io::Re
 }
 
 /// Staging directories of `sandbox_dir` holding a finished encrypted capture
-/// whose volume has not sealed yet, in name order.
+/// whose volume has not sealed yet and may still be sealed, in name order.
+/// Every seal retry selects through this, so a record past its retry window is
+/// never sealed: classification quarantines it instead.
 pub(super) fn encrypted_captures_awaiting_seal(
     sandbox_dir: &Path,
 ) -> Result<Vec<StagedSuspendSnapshotArtifact>, SuspendSnapshotPublicationError> {
@@ -106,6 +108,7 @@ pub(super) fn encrypted_captures_awaiting_seal(
             });
         }
     };
+    let now = std::time::SystemTime::now();
     let mut pending = entries
         .filter_map(|entry| entry.ok().map(|entry| entry.path()))
         .filter_map(|path| {
@@ -115,12 +118,10 @@ pub(super) fn encrypted_captures_awaiting_seal(
                 .strip_prefix(SUSPEND_STAGING_PREFIX)?
                 .parse()
                 .ok()?;
-            path.join(ENCRYPTED_CAPTURE_RECORD)
-                .exists()
-                .then_some(StagedSuspendSnapshotArtifact {
-                    local_artifact_id,
-                    staging_dir: path,
-                })
+            encrypted_seal_pending(&path, now).then_some(StagedSuspendSnapshotArtifact {
+                local_artifact_id,
+                staging_dir: path,
+            })
         })
         .collect::<Vec<_>>();
     pending.sort_by(|left, right| left.staging_dir.cmp(&right.staging_dir));
