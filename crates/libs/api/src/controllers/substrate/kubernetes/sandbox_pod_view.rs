@@ -63,6 +63,7 @@ macro_rules! sandbox_pod_keys {
 
 sandbox_pod_keys! {
     SandboxId => SANDBOX_ID_ANNOTATION,
+    MaterializationId => pplx_space_common_core::kubernetes::SANDBOX_MATERIALIZATION_ID_ANNOTATION,
     ExecutionGeneration => SANDBOX_EXECUTION_GENERATION_ANNOTATION,
     SuspendRestoreStorageUri => SANDBOX_SUSPEND_RESTORE_STORAGE_URI_ANNOTATION,
     SuspendRestoreSourceNode => SANDBOX_SUSPEND_RESTORE_SOURCE_NODE_ANNOTATION,
@@ -173,6 +174,20 @@ impl SandboxPodView {
 
     pub fn namespace(&self) -> Option<&str> {
         self.namespace.as_deref()
+    }
+
+    pub fn materialization_id(
+        &self,
+    ) -> Result<
+        Option<pplx_space_common_core::types::PodMaterializationId>,
+        super::super::SubstrateError,
+    > {
+        self.annotation(SandboxPodKey::MaterializationId)
+            .map(str::parse)
+            .transpose()
+            .map_err(|error| super::super::SubstrateError::Failed {
+                message: format!("invalid pod materialization identity: {error}"),
+            })
     }
 
     pub fn uid(&self) -> Option<&str> {

@@ -870,7 +870,7 @@ async fn observe_warming_slots_retries_not_started_probe_and_promotes_slot() -> 
     pod_writer.apply_watcher_event(&Event::Init);
     pod_writer.apply_watcher_event(&Event::InitApply(SandboxPodView::from(pod)));
     pod_writer.apply_watcher_event(&Event::InitDone);
-    let (node_store, _) = reflector::store();
+    let (node_store, mut node_writer) = reflector::store();
     let reconciler = Reconciler {
         kube,
         pod_cache: PodCache {
@@ -910,11 +910,29 @@ async fn observe_warming_slots_retries_not_started_probe_and_promotes_slot() -> 
         .find(|config| config.id == config_id)
         .expect("seeded pool config is reconcilable");
 
-    // act
+    // A ready pod alone cannot bind its node incarnation.
+    let pending = reconciler.observe_warming_slots(&config).await?;
+    assert_eq!(pending.marked_ready_slots, 0);
+    assert_eq!(worker.calls(SPACED_WAIT_READY), 0);
+    node_writer.apply_watcher_event(&Event::Apply(Node {
+        metadata: ObjectMeta {
+            name: Some("worker-1".to_string()),
+            uid: Some("original-worker-uid".to_string()),
+            ..Default::default()
+        },
+        ..Default::default()
+    }));
     let summary = reconciler.observe_warming_slots(&config).await?;
 
     // assert
     assert_eq!(summary.marked_ready_slots, 1);
+    let recorded: Option<String> = sqlx::query_scalar(sql!(
+        "SELECT k8s_node_uid FROM kubernetes_pool_slots WHERE id=$1"
+    ))
+    .bind(slot.id)
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(recorded.as_deref(), Some("original-worker-uid"));
     assert_eq!(worker.calls(SPACED_WAIT_READY), 2);
     let counts = store.slot_counts(config_id).await?;
     assert_eq!(counts.warming, 0);
@@ -1036,7 +1054,13 @@ async fn reconcile_config_refills_after_observation_failure() -> TestResult {
         })
         .await?;
     store
-        .mark_slot_ready(ready_slot.id, "pod-uid", "127.0.0.1", "worker-1")
+        .mark_slot_ready(
+            ready_slot.id,
+            "pod-uid",
+            "127.0.0.1",
+            "worker-1",
+            &pplx_space_common_core::types::K8sNodeUid::parse("original-worker-uid")?,
+        )
         .await?;
     let observation_failure = Arc::new(AtomicBool::new(true));
     let reconciler = reconcile_test_reconciler(
@@ -2476,4 +2500,77 @@ async fn receipt_backstops_are_noops_inside_the_cadence_interval() {
         state.dead_claimed_lap.is_some(),
         "a gated tick must not move the sweep lap"
     );
+}
+
+#[tokio::test]
+async fn warming_slots_without_node_identity_still_timeout() -> TestResult {
+    let db = pg_test_db().await?;
+    let store = WarmPoolStore::new(db.pool.clone());
+    let template = TemplateName::parse("warming-timeout")?;
+    let release = Uuid::now_v7();
+    let config_id = Uuid::now_v7();
+    let content_hash = ContentHash::new(Digest::sha256([0x51; 32]));
+    seed_pool_config(&db.pool, &template, release, config_id, content_hash).await?;
+    let deletes = Arc::new(AtomicUsize::new(0));
+    let count = deletes.clone();
+    let kube = ClientBuilder::new(
+        tower::service_fn(move |request: Request<KubeBody>| {
+            let count = count.clone();
+            async move {
+                assert_eq!(request.method(), Method::DELETE);
+                count.fetch_add(1, Ordering::SeqCst);
+                kubernetes_json_response(
+                    StatusCode::OK,
+                    &serde_json::json!({"kind":"Status","apiVersion":"v1","status":"Success"}),
+                )
+            }
+        }),
+        "space",
+    )
+    .build();
+    let mut reconciler = reconcile_test_reconciler(kube, store.clone(), db.pool.clone());
+    let (pods, mut writer) = reflector::store();
+    for (name, node_name) in [
+        ("warming-unscheduled", None),
+        ("warming-cache-miss", Some("missing-node")),
+    ] {
+        let slot = store
+            .insert_warming_slot(NewPoolSlot {
+                config_id,
+                template_release_id: release,
+                reserved_sandbox_id: SandboxId::new(),
+                template_name: &template,
+                content_hash,
+                vcpu: VcpuCount::try_from_u32(2)?,
+                memory: MemorySize::mib(1024)?,
+                pod_name: name,
+                pod_namespace: "space",
+            })
+            .await?;
+        sqlx::query(sql!(
+            "UPDATE kubernetes_pool_slots SET created_at=NOW()-INTERVAL '1 hour' WHERE id=$1"
+        ))
+        .bind(slot.id)
+        .execute(&db.pool)
+        .await?;
+        let pod: Pod = serde_json::from_value(serde_json::json!({
+            "metadata": {"name":name,"namespace":"space","uid":format!("uid-{name}"),"labels": {
+                SANDBOX_POOL_ROLE_KEY: SANDBOX_POOL_ROLE_WARM, SANDBOX_POOL_CONFIG_ID_KEY:config_id.to_string()
+            }}, "spec":{"nodeName":node_name,"containers":[]}, "status":{"phase":"Pending"}
+        }))?;
+        writer.apply_watcher_event(&Event::Apply(SandboxPodView::from(pod)));
+    }
+    reconciler.pod_cache.store = pods;
+    let config = store
+        .reconcilable_configs()
+        .await?
+        .into_iter()
+        .find(|c| c.id == config_id)
+        .expect("config");
+    let summary = reconciler.observe_warming_slots(&config).await?;
+    assert_eq!(summary.deleted_unready_pods, 2);
+    assert_eq!(summary.marked_ready_slots, 0);
+    assert_eq!(deletes.load(Ordering::SeqCst), 2);
+    assert_eq!(store.slot_counts(config_id).await?.warming, 0);
+    Ok(())
 }

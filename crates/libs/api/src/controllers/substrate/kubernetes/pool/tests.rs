@@ -735,7 +735,11 @@ async fn postgres_invalidate_claimed_pool_slot_keeps_slot_unclaimable() -> TestR
 async fn upsert_pool_config_uses_store_namespace() -> TestResult {
     let db = pg_test_db().await?;
     let slot = insert_ready_pool_slot(&db.pool).await?;
-    let store = K8sStore::new(db.pool.clone(), "sandboxes".to_string());
+    let store = K8sStore::new(
+        db.pool.clone(),
+        "sandboxes".to_string(),
+        crate::controllers::substrate::kubernetes::store::MaterializationMode::Fenced,
+    );
 
     let config = upsert_pool_config(
         &store,
@@ -776,7 +780,11 @@ async fn upsert_pool_config_uses_store_namespace() -> TestResult {
 async fn upsert_pool_config_rejects_encryptable_configs() -> TestResult {
     let db = pg_test_db().await?;
     let slot = insert_ready_pool_slot(&db.pool).await?;
-    let store = K8sStore::new(db.pool.clone(), "sandboxes".to_string());
+    let store = K8sStore::new(
+        db.pool.clone(),
+        "sandboxes".to_string(),
+        crate::controllers::substrate::kubernetes::store::MaterializationMode::Fenced,
+    );
     let request = |enabled| ClusterPoolConfigRequest {
         template_name: "seed".to_string(),
         content_hash: Some(slot.content_hash.clone()),
@@ -819,7 +827,11 @@ async fn upsert_pool_config_rejects_encryptable_configs() -> TestResult {
 async fn upsert_pool_config_preserves_and_explicitly_resets_disk_capacity() -> TestResult {
     let db = pg_test_db().await?;
     let slot = insert_ready_pool_slot(&db.pool).await?;
-    let store = K8sStore::new(db.pool.clone(), "sandboxes".to_string());
+    let store = K8sStore::new(
+        db.pool.clone(),
+        "sandboxes".to_string(),
+        crate::controllers::substrate::kubernetes::store::MaterializationMode::Fenced,
+    );
     let request = |disk_mib, reset_disk_to_template_default| ClusterPoolConfigRequest {
         template_name: "seed".to_string(),
         content_hash: Some(slot.content_hash.clone()),
@@ -867,7 +879,11 @@ async fn disable_pool_config_preserves_autoscaler_ownership() -> TestResult {
     // arrange
     let db = pg_test_db().await?;
     let slot = insert_ready_pool_slot(&db.pool).await?;
-    let store = K8sStore::new(db.pool.clone(), "sandboxes".to_string());
+    let store = K8sStore::new(
+        db.pool.clone(),
+        "sandboxes".to_string(),
+        crate::controllers::substrate::kubernetes::store::MaterializationMode::Fenced,
+    );
     let config_id: Uuid = sqlx::query_scalar(sql!(
         "UPDATE kubernetes_pool_configs
          SET managed_by = 'autoscaler'
@@ -899,7 +915,11 @@ async fn upsert_pool_config_takes_manual_ownership_from_autoscaler() -> TestResu
     // arrange
     let db = pg_test_db().await?;
     let slot = insert_ready_pool_slot(&db.pool).await?;
-    let store = K8sStore::new(db.pool.clone(), "sandboxes".to_string());
+    let store = K8sStore::new(
+        db.pool.clone(),
+        "sandboxes".to_string(),
+        crate::controllers::substrate::kubernetes::store::MaterializationMode::Fenced,
+    );
     sqlx::query(sql!(
         "UPDATE kubernetes_pool_configs
          SET managed_by = 'autoscaler'

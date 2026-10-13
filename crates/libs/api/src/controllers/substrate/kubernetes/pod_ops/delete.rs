@@ -50,12 +50,145 @@ where
     }
 }
 
-pub(super) async fn delete_sandbox_pod_with_throttle_retry(
+/// Only for a successful POST response owned by this request. Its UID is the
+/// cleanup authority even for a legacy token-less creation. Never pass a pod
+/// obtained by a name lookup or a 409 adoption to this function.
+pub(super) async fn delete_created_materialization_pod(
     k8s: &KubernetesState,
+    pod: &SandboxPodView,
+    expected: Option<pplx_space_common_core::types::PodMaterializationId>,
+) -> Result<(), SubstrateError> {
+    if pod.materialization_id().is_ok_and(|id| id != expected) {
+        return Err(SubstrateError::Unavailable {
+            message: "pod cleanup materialization changed".into(),
+        });
+    }
+    delete_observed_pod(k8s, pod).await
+}
+
+/// Only after the lease/attempt-fenced retirement succeeded. The retired
+/// generation cannot be adopted again; a name lookup must still match its
+/// sandbox, generation, and name before UID-preconditioned deletion. A malformed
+/// annotation cannot undo the already-authorized retirement; a different valid
+/// token remains conflicting evidence.
+pub(super) async fn delete_retired_materialization_pod(
+    k8s: &KubernetesState,
+    pod: &SandboxPodView,
+    sandbox: SandboxId,
+    generation: i64,
     pod_name: &str,
-    operation: &'static str,
-) -> Result<(), KubeError> {
-    retry_kube_delete_throttling(operation, || delete_sandbox_pod(k8s, pod_name)).await
+    expected: Option<pplx_space_common_core::types::PodMaterializationId>,
+) -> Result<(), SubstrateError> {
+    if !retired_materialization_matches(pod, sandbox, generation, pod_name, expected)? {
+        return Err(SubstrateError::Unavailable {
+            message: "retired-pod cleanup observed a different execution".into(),
+        });
+    }
+    delete_observed_pod(k8s, pod).await
+}
+
+pub(super) fn retired_materialization_matches(
+    pod: &SandboxPodView,
+    sandbox: SandboxId,
+    generation: i64,
+    pod_name: &str,
+    expected: Option<pplx_space_common_core::types::PodMaterializationId>,
+) -> Result<bool, SubstrateError> {
+    Ok(pod.name() == pod_name
+        && super::restore::pod_matches_execution_generation(pod, sandbox, generation)
+        && pod.materialization_id().map_or(true, |id| id == expected))
+}
+
+pub(super) async fn delete_execution_pod(
+    store: &crate::controllers::substrate::kubernetes::store::K8sStore,
+    sandbox_id: SandboxId,
+    k8s: &KubernetesState,
+    pod: &SandboxPodView,
+    expected: &crate::controllers::substrate::kubernetes::store::SandboxExecutionRow,
+) -> Result<(), SubstrateError> {
+    let observed = pod.materialization_id();
+    let same_execution = pod.name() == expected.pod_name
+        && super::restore::pod_matches_execution_generation(pod, sandbox_id, expected.generation);
+    let obsolete = same_execution
+        && store
+            .obsolete_materialization_matches(
+                sandbox_id,
+                expected,
+                observed.as_ref().ok().copied().flatten(),
+            )
+            .await?;
+    let matches = if obsolete {
+        // An annotation can change on the same Pod UID. Do not delete if its
+        // materialization evidence changed since the observation we checked.
+        if pod.resource_version().is_none() {
+            return Err(SubstrateError::Unavailable {
+                message: "obsolete pod cleanup requires an observed resource version".into(),
+            });
+        }
+        true
+    } else {
+        match expected.materialization_id {
+            Some(token) => {
+                same_execution && observed.as_ref().is_ok_and(|value| *value == Some(token))
+            }
+            None => match expected.observed_pod_uid.as_deref() {
+                // A known UID authorizes cleanup even if the annotation is
+                // damaged. Invalid annotations never authorize legacy adoption.
+                Some(uid) => pod.uid() == Some(uid),
+                None => {
+                    same_execution
+                        && matches!(observed, Ok(None))
+                        && store.legacy_cleanup_matches(sandbox_id, expected).await?
+                }
+            },
+        }
+    };
+    if !matches {
+        return Err(SubstrateError::Unavailable {
+            message: "stale-pod cleanup no longer owns the observed pod".into(),
+        });
+    }
+    delete_observed_pod(k8s, pod).await
+}
+
+async fn delete_observed_pod(
+    k8s: &KubernetesState,
+    pod: &SandboxPodView,
+) -> Result<(), SubstrateError> {
+    let uid = pod.uid().ok_or_else(|| SubstrateError::Unavailable {
+        message: "pod cleanup requires an observed UID".into(),
+    })?;
+    let pods: Api<Pod> = Api::namespaced(k8s.client.clone(), &k8s.sandbox_namespace);
+    let params = DeleteParams {
+        preconditions: Some(kube::api::Preconditions {
+            uid: Some(uid.to_owned()),
+            resource_version: pod.resource_version().map(str::to_owned),
+        }),
+        ..Default::default()
+    };
+    match timeout(
+        k8s.k8s_blocking_delete_timeout,
+        retry_kube_delete_throttling("materialization_cleanup", || {
+            pods.delete(pod.name(), &params)
+        }),
+    )
+    .await
+    {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(error)) if is_not_found_error(&error) => Ok(()),
+        Ok(Err(KubeError::Api(response))) if response.code == 409 => {
+            Err(SubstrateError::Unavailable {
+                message: "pod changed before cleanup; re-observe before retrying".into(),
+            })
+        }
+        Ok(Err(error)) => Err(kube_error_for_substrate(
+            "delete materialization pod",
+            error,
+        )),
+        Err(_) => Err(SubstrateError::Unavailable {
+            message: "materialization pod cleanup timed out".into(),
+        }),
+    }
 }
 
 /// Names of this sandbox's live pods from generations **strictly older** than

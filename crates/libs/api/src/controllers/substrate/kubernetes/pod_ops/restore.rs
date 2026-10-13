@@ -163,11 +163,15 @@ impl KubernetesSubstrate {
         };
         match self
             .store
-            .persist_pod_metadata(
+            .persist_observed_pod_metadata(
                 sandbox_uuid,
                 execution.generation,
                 identity.pod_uid.as_deref(),
                 Some(identity.pod_ip.as_str()),
+                pod.as_ref()
+                    .map(|pod| pod.materialization_id())
+                    .transpose()?
+                    .flatten(),
             )
             .await?
         {

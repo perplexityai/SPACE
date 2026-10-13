@@ -131,7 +131,13 @@ impl AdmissionPoolFixture {
                 })
                 .await?;
             store
-                .mark_slot_ready(slot.id, &pod_uid, &pod_ip, &node_name)
+                .mark_slot_ready(
+                    slot.id,
+                    &pod_uid,
+                    &pod_ip,
+                    &node_name,
+                    &pplx_space_common_core::types::K8sNodeUid::parse("original-worker-uid")?,
+                )
                 .await?;
             slots.push(FixtureSlot {
                 id: slot.id,

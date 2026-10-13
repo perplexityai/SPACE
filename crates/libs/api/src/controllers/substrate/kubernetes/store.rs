@@ -56,6 +56,37 @@ mod suspend;
 pub(super) struct K8sStore {
     pool: PgPool,
     namespace: String,
+    materialization_mode: MaterializationMode,
+}
+
+/// Deploy compatible writers everywhere before enabling token creation. Once a
+/// token exists, both modes preserve its fence; rolling back needs the same rule.
+#[derive(Clone, Copy)]
+pub(super) enum MaterializationMode {
+    Compatibility,
+    Fenced,
+}
+impl MaterializationMode {
+    pub(super) fn from_env() -> Result<Self, SubstrateError> {
+        match std::env::var("SPACE_POD_MATERIALIZATION_MODE") {
+            Err(std::env::VarError::NotPresent) => Ok(Self::Compatibility),
+            Ok(value) if value == "compatibility" => Ok(Self::Compatibility),
+            Ok(value) if value == "fenced" => Ok(Self::Fenced),
+            _ => Err(SubstrateError::Failed {
+                message: "SPACE_POD_MATERIALIZATION_MODE must be compatibility or fenced".into(),
+            }),
+        }
+    }
+    fn initial_token(self) -> Option<pplx_space_common_core::types::PodMaterializationId> {
+        matches!(self, Self::Fenced).then(pplx_space_common_core::types::PodMaterializationId::new)
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, sqlx::FromRow)]
+pub(super) struct ClaimedMaterialization {
+    pub materialization_id: Option<pplx_space_common_core::types::PodMaterializationId>,
+    #[sqlx(try_from = "String")]
+    pub state: ActiveExecutionState,
 }
 
 /// Where a sandbox's pod landed. Groups the identity columns
@@ -63,8 +94,12 @@ pub(super) struct K8sStore {
 /// the retry disposition keeps its signature under clippy's
 /// `too_many_arguments` ceiling, as `PodProxyWaitTarget` does for the
 /// proxy-reachability wait.
+#[derive(Clone, Copy)]
 pub(super) struct PodNodePlacement<'a> {
     pub sandbox_id: SandboxId,
+    pub pod_name: &'a str,
+    pub pod_uid: Option<&'a str>,
+    pub materialization_id: Option<pplx_space_common_core::types::PodMaterializationId>,
     pub node_name: &'a str,
     pub node_uid: &'a str,
     pub node_id: NodeId,
@@ -315,6 +350,8 @@ pub(super) struct SandboxExecutionRow {
     pub(super) generation: i64,
     pub(super) pod_name: String,
     pub(super) pod_materialized: bool,
+    pub(super) materialization_id: Option<pplx_space_common_core::types::PodMaterializationId>,
+    pub(super) observed_pod_uid: Option<String>,
     #[sqlx(try_from = "String")]
     pub(super) state: ActiveExecutionState,
     pub(super) create_age_expired: bool,
@@ -368,7 +405,7 @@ fn normalize_pod_uid(value: Option<&str>) -> Option<&str> {
     value.map(str::trim).filter(|value| !value.is_empty())
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(super) struct SandboxExecutionClaim {
     pub(super) row: SandboxExecutionRow,
     pub(super) created: bool,
@@ -637,8 +674,16 @@ fn emit_started_suspend_recovery_event(
 }
 
 impl K8sStore {
-    pub(super) fn new(pool: PgPool, namespace: String) -> Self {
-        Self { pool, namespace }
+    pub(super) fn new(
+        pool: PgPool,
+        namespace: String,
+        materialization_mode: MaterializationMode,
+    ) -> Self {
+        Self {
+            pool,
+            namespace,
+            materialization_mode,
+        }
     }
 
     pub(super) fn pool(&self) -> &PgPool {

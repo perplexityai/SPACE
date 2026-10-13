@@ -60,6 +60,7 @@ impl K8sStore {
             StartedSuspendRecoveryOperation::TerminalPodCleanup,
             cause,
             PlacementClock::Bump,
+            None,
         )
         .await
     }
@@ -112,7 +113,7 @@ impl K8sStore {
 
     /// Fill in a `pod_uid` that was never persisted, and nothing else.
     ///
-    /// [`Self::persist_pod_metadata`] assigns rather than patches: it sets
+    /// [`Self::persist_observed_pod_metadata`] assigns rather than patches: it sets
     /// `pod_ip` to whatever it is handed and recomputes `state` from it, so
     /// calling it with a UID alone clears a live pod's IP and downgrades a
     /// `running` execution to `created`. This exists because the fence's
@@ -127,6 +128,7 @@ impl K8sStore {
         sandbox_id: SandboxId,
         identity: &ExecutionIdentity,
         pod_uid: &str,
+        materialization_id: Option<pplx_space_common_core::types::PodMaterializationId>,
     ) -> Result<bool, SubstrateError> {
         let (generation, activation_attempt_id, _, route_activation_id) =
             Self::identity_binds(identity);
@@ -138,13 +140,15 @@ impl K8sStore {
                 AND active
                 AND activation_attempt_id IS NOT DISTINCT FROM $3
                 AND NULLIF(BTRIM(pod_uid), '') IS NULL
-                AND route_activation_id IS NOT DISTINCT FROM $5"
+                AND route_activation_id IS NOT DISTINCT FROM $5
+                AND (materialization_id IS NULL OR materialization_id=$6)"
         ))
         .bind(sandbox_id)
         .bind(generation)
         .bind(activation_attempt_id)
         .bind(pod_uid)
         .bind(route_activation_id)
+        .bind(materialization_id)
         .execute(&self.pool)
         .await
         .db_context("failed to backfill pod uid")?;
@@ -226,6 +230,8 @@ impl K8sStore {
              SET pod_uid = NULL,
                  pod_ip = NULL,
                  k8s_node_name = NULL,
+                 k8s_node_uid = NULL,
+                 materialization_id = CASE WHEN materialization_id IS NOT NULL THEN space_uuid_v7() ELSE NULL END,
                  updated_at = NOW()
              WHERE sandbox_id = $1
                AND generation = $2
@@ -299,6 +305,7 @@ impl K8sStore {
             StartedSuspendRecoveryOperation::TerminalPodCleanup,
             PodTrackingCleanupCause::ExplicitTeardown,
             PlacementClock::Bump,
+            None,
         )
         .await
     }
@@ -306,16 +313,17 @@ impl K8sStore {
     pub(in crate::controllers::substrate::kubernetes) async fn cleanup_replaced_pod_tracking_if_generation(
         &self,
         sandbox_id: SandboxId,
-        generation: i64,
+        expected: &SandboxExecutionRow,
     ) -> Result<bool, SubstrateError> {
         self.finish_execution_and_clear_pod_tracking_if_generation(
             sandbox_id,
-            generation,
+            expected.generation,
             None,
             "replaced",
             StartedSuspendRecoveryOperation::StalePodReplacementCleanup,
             PodTrackingCleanupCause::ExplicitTeardown,
             PlacementClock::Bump,
+            Some(expected),
         )
         .await
     }
@@ -330,6 +338,7 @@ impl K8sStore {
         recovery_operation: StartedSuspendRecoveryOperation,
         cause: PodTrackingCleanupCause,
         placement_clock: PlacementClock,
+        expected_materialization: Option<&SandboxExecutionRow>,
     ) -> Result<bool, SubstrateError> {
         let mut tx = self
             .pool
@@ -339,6 +348,15 @@ impl K8sStore {
 
         if !Self::lock_sandbox_for_execution_mutation_in(&mut tx, sandbox_id).await? {
             return Ok(false);
+        }
+
+        if let Some(expected) = expected_materialization {
+            let matches: bool=sqlx::query_scalar(sql!("SELECT EXISTS(SELECT 1 FROM sandbox_k8s_executions WHERE sandbox_id=$1 AND generation=$2 AND active AND materialization_id IS NOT DISTINCT FROM $3 AND NULLIF(BTRIM(pod_uid), '') IS NOT DISTINCT FROM $4)"))
+                .bind(sandbox_id).bind(generation).bind(expected.materialization_id).bind(expected.observed_pod_uid.as_deref())
+                .fetch_one(&mut *tx).await.db_context("failed to fence stale materialization cleanup")?;
+            if !matches {
+                return Ok(false);
+            }
         }
 
         if cause == PodTrackingCleanupCause::MissingPodObservation

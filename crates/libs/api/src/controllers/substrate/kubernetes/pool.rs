@@ -542,9 +542,9 @@ pub(super) async fn persist_pooled_execution_claim(
     sqlx::query(sql!(
         "INSERT INTO sandbox_k8s_executions (
              sandbox_id, generation, pod_name, pod_namespace, pod_uid, pod_ip,
-             k8s_node_name, state, active, route_activation_id
+             k8s_node_name, k8s_node_uid, state, active, route_activation_id
          )
-         VALUES ($1, 1, $2, $3, $4, $5::inet, $6, 'running', TRUE, $7)"
+         VALUES ($1, 1, $2, $3, $4, $5::inet, $6, $8, 'running', TRUE, $7)"
     ))
     .bind(claim.sandbox_id)
     .bind(&source.pod_name)
@@ -553,6 +553,7 @@ pub(super) async fn persist_pooled_execution_claim(
     .bind(source.pod_ip.as_deref())
     .bind(source.k8s_node_name.as_deref())
     .bind(route_activation_id)
+    .bind(source.k8s_node_uid.as_ref())
     .execute(&mut **tx)
     .await
     .map_err(|err| db_contention_error("failed to bind pool execution", &err))?;

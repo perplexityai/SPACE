@@ -123,7 +123,11 @@ async fn postgres_store_with_max_connections(max_connections: u32) -> TestResult
     let db = pg_test_db_with_max_connections(max_connections).await?;
     let pool = db.pool.clone();
     Ok(PostgresStore {
-        store: K8sStore::new(pool.clone(), "space".to_string()),
+        store: K8sStore::new(
+            pool.clone(),
+            "space".to_string(),
+            crate::controllers::substrate::kubernetes::store::MaterializationMode::Fenced,
+        ),
         pool,
         _db: db,
     })
@@ -1606,6 +1610,7 @@ async fn abandon_unmaterialized_create_claim_serializes_with_lease_takeover() ->
                 generation,
                 Some(token_a),
                 None,
+                claim.row.materialization_id,
             )
             .await
     });
@@ -1642,6 +1647,7 @@ async fn abandon_unmaterialized_create_claim_serializes_with_lease_takeover() ->
                 generation,
                 Some(token_b),
                 None,
+                claim.row.materialization_id,
             )
             .await?,
         "the current lease owner B must still be able to retire the generation"
@@ -3512,6 +3518,7 @@ async fn abandon_unmaterialized_create_claim_is_fenced_by_restore_lease_token(
                 generation,
                 Some(token_a),
                 None,
+                claim.row.materialization_id,
             )
             .await?
     );
@@ -3533,6 +3540,7 @@ async fn abandon_unmaterialized_create_claim_is_fenced_by_restore_lease_token(
                 generation,
                 Some(token_b),
                 None,
+                claim.row.materialization_id,
             )
             .await?
     );
@@ -3606,6 +3614,17 @@ async fn reset_active_execution_to_creating_reopens_a_scheduled_pinned_claim(
             .reset_active_execution_to_creating_if_generation(sandbox_id, generation, None, None,)
             .await?
     );
+    assert!(
+        !fixture
+            .store
+            .abandon_unmaterialized_create_claim(sandbox_id, &claim)
+            .await?,
+        "predecessor cleanup is fenced"
+    );
+    let claim = fixture
+        .store
+        .ensure_active_execution_claim(sandbox_id)
+        .await?;
     assert!(
         fixture
             .store
@@ -4646,7 +4665,11 @@ async fn persist_pod_metadata_reports_noop_when_retirement_commits_mid_write(
     .await?;
 
     // Conn B: the persist, which must block behind A's row lock.
-    let store = K8sStore::new(fixture.pool.clone(), "space".to_string());
+    let store = K8sStore::new(
+        fixture.pool.clone(),
+        "space".to_string(),
+        crate::controllers::substrate::kubernetes::store::MaterializationMode::Fenced,
+    );
     let generation = execution.generation;
     let persist = tokio::spawn(async move {
         store
@@ -9055,7 +9078,11 @@ async fn a_contended_execution_guard_answers_retryable_not_failed() -> TestResul
         })
         .connect(&db.database_url)
         .await?;
-    let store = K8sStore::new(store_pool, "space".to_string());
+    let store = K8sStore::new(
+        store_pool,
+        "space".to_string(),
+        crate::controllers::substrate::kubernetes::store::MaterializationMode::Fenced,
+    );
     let typed = sandbox_id;
 
     let mut blocker = db.pool.begin().await?;
@@ -9185,7 +9212,11 @@ async fn placement_retryability_follows_the_operation_not_the_statement() -> Tes
         })
         .connect(&db.database_url)
         .await?;
-    let store = K8sStore::new(store_pool, "space".to_string());
+    let store = K8sStore::new(
+        store_pool,
+        "space".to_string(),
+        crate::controllers::substrate::kubernetes::store::MaterializationMode::Fenced,
+    );
     let node_id = NodeId::new();
 
     // Hold the row `lock_sandbox_for_execution_mutation_in` takes.
@@ -9200,7 +9231,10 @@ async fn placement_retryability_follows_the_operation_not_the_statement() -> Tes
     let persist = |retry| {
         store.persist_pod_node_placement_after_pod_exists(
             PodNodePlacement {
+                materialization_id: None,
                 sandbox_id,
+                pod_name: "observed-pod",
+                pod_uid: None,
                 node_name: "ip-10-0-0-1.ec2.internal",
                 node_uid: "11111111-1111-1111-1111-111111111111",
                 node_id,
@@ -9328,5 +9362,559 @@ async fn retired_pool_reserved_generation_moves_cold_create_past_the_pool_pod() 
         next.row.pod_name,
         pplx_space_common_core::kubernetes::sandbox_pod_name(sandbox_id, 3)
     );
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn execution_node_identity_is_bound_once() -> TestResult {
+    let fixture = postgres_store().await?;
+    for (recorded_name, recorded_uid, accepted) in [
+        (None, None, true),
+        (Some("worker-original"), Some("original-uid"), true),
+        (Some("worker-original"), None, false),
+        (Some("worker-original"), Some("older-uid"), false),
+        (Some("worker-other"), Some("original-uid"), false),
+    ] {
+        let sandbox = SandboxId::new();
+        let node = NodeId::new();
+        insert_sandbox(&fixture.pool, sandbox, "started").await?;
+        fixture.store.ensure_active_execution_row(sandbox).await?;
+        sqlx::query(sql!(
+            "UPDATE sandbox_k8s_executions SET k8s_node_name=$2,k8s_node_uid=$3 WHERE sandbox_id=$1"
+        ))
+        .bind(sandbox)
+        .bind(recorded_name)
+        .bind(recorded_uid)
+        .execute(&fixture.pool)
+        .await?;
+        let result = fixture
+            .store
+            .persist_pod_node_placement(
+                sandbox,
+                "worker-original",
+                "original-uid",
+                node,
+                NodeRole::Worker,
+                Some("10.0.0.9"),
+            )
+            .await;
+        assert_eq!(
+            result.is_ok(),
+            accepted,
+            "{recorded_name:?}/{recorded_uid:?}: {result:?}"
+        );
+        let stored: (Option<String>, Option<String>) = sqlx::query_as(sql!(
+            "SELECT k8s_node_name,k8s_node_uid FROM sandbox_k8s_executions WHERE sandbox_id=$1 AND active"
+        )).bind(sandbox).fetch_one(&fixture.pool).await?;
+        let expected = if recorded_name.is_none() {
+            (Some("worker-original"), Some("original-uid"))
+        } else {
+            (recorded_name, recorded_uid)
+        };
+        assert_eq!((stored.0.as_deref(), stored.1.as_deref()), expected);
+        // Each iteration needs a distinct registry name because it is unique.
+        sqlx::query(sql!("DELETE FROM node_k8s WHERE node_id=$1"))
+            .bind(node)
+            .execute(&fixture.pool)
+            .await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn stale_pod_observation_cannot_bind_a_successor_execution() -> TestResult {
+    let fixture = postgres_store().await?;
+    let sandbox_id = SandboxId::new();
+    insert_sandbox(&fixture.pool, sandbox_id, "started").await?;
+    fixture
+        .store
+        .ensure_active_execution_row(sandbox_id)
+        .await?;
+    let pod_name: String = sqlx::query_scalar(sql!(
+        "SELECT pod_name FROM sandbox_k8s_executions WHERE sandbox_id=$1 AND active"
+    ))
+    .bind(sandbox_id)
+    .fetch_one(&fixture.pool)
+    .await?;
+    for (observed_name, observed_uid) in [
+        ("retired-pod", None),
+        (pod_name.as_str(), Some("different-pod-uid")),
+    ] {
+        sqlx::query(sql!(
+            "UPDATE sandbox_k8s_executions SET pod_uid='current-pod-uid' WHERE sandbox_id=$1"
+        ))
+        .bind(sandbox_id)
+        .execute(&fixture.pool)
+        .await?;
+        let error = fixture
+            .store
+            .persist_pod_node_placement_after_pod_exists(
+                PodNodePlacement {
+                    materialization_id: None,
+                    sandbox_id,
+                    pod_name: observed_name,
+                    pod_uid: observed_uid,
+                    node_name: "worker-original",
+                    node_uid: "original-uid",
+                    node_id: NodeId::new(),
+                    role: NodeRole::Worker,
+                    address: Some("10.0.0.9"),
+                },
+                PlacementRetryDisposition::RetryConverges,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, SubstrateError::Unavailable { .. }));
+        let identity: Option<String> = sqlx::query_scalar(sql!(
+            "SELECT k8s_node_uid FROM sandbox_k8s_executions WHERE sandbox_id=$1 AND active"
+        ))
+        .bind(sandbox_id)
+        .fetch_one(&fixture.pool)
+        .await?;
+        assert!(identity.is_none());
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn materialization_token_fences_recreation_observation_and_cleanup() -> TestResult {
+    let fixture = postgres_store().await?;
+    let sandbox = SandboxId::new();
+    insert_sandbox(&fixture.pool, sandbox, "started").await?;
+    let predecessor = fixture.store.ensure_active_execution_row(sandbox).await?;
+    let original = predecessor.materialization_id.expect("new execution token");
+    // Retrying a create whose response was lost must retain the token.
+    assert_eq!(
+        fixture
+            .store
+            .claim_pod_materialization(sandbox, &predecessor, SandboxLifecycle::Started)
+            .await?,
+        Some(ClaimedMaterialization {
+            state: ActiveExecutionState::Creating,
+            materialization_id: Some(original)
+        })
+    );
+    assert!(
+        fixture
+            .store
+            .persist_observed_pod_metadata(
+                sandbox,
+                predecessor.generation,
+                Some("old-pod"),
+                None,
+                Some(original)
+            )
+            .await?
+            .is_some()
+    );
+    let node = NodeId::new();
+    fixture
+        .store
+        .persist_pod_node_placement(
+            sandbox,
+            "worker-before",
+            "before-uid",
+            node,
+            NodeRole::Worker,
+            Some("10.0.0.10"),
+        )
+        .await?;
+    let observed = fixture.store.ensure_active_execution_row(sandbox).await?;
+    let successor = fixture
+        .store
+        .claim_pod_materialization(sandbox, &observed, SandboxLifecycle::Started)
+        .await?
+        .expect("recreation claim")
+        .materialization_id
+        .expect("fenced token");
+    assert_ne!(successor, original);
+    let binding: (Option<String>, Option<String>) = sqlx::query_as(sql!("SELECT k8s_node_name,k8s_node_uid FROM sandbox_k8s_executions WHERE sandbox_id=$1 AND active"))
+        .bind(sandbox).fetch_one(&fixture.pool).await?;
+    assert_eq!(binding, (None, None));
+    // No stale observer, repeated old claim, or delayed cleanup can take over.
+    for token in [
+        None,
+        Some(original),
+        Some(pplx_space_common_core::types::PodMaterializationId::new()),
+    ] {
+        assert!(
+            fixture
+                .store
+                .persist_observed_pod_metadata(
+                    sandbox,
+                    predecessor.generation,
+                    Some("old-pod"),
+                    Some("10.0.0.1"),
+                    token
+                )
+                .await?
+                .is_none()
+        );
+    }
+    assert!(
+        fixture
+            .store
+            .claim_pod_materialization(sandbox, &observed, SandboxLifecycle::Started)
+            .await?
+            .is_none()
+    );
+    assert!(
+        !fixture
+            .store
+            .abandon_unmaterialized_create_claim_by_generation(
+                sandbox,
+                predecessor.generation,
+                None,
+                None,
+                Some(original)
+            )
+            .await?
+    );
+    assert!(
+        !fixture
+            .store
+            .cleanup_replaced_pod_tracking_if_generation(sandbox, &observed)
+            .await?
+    );
+    // Matching creator/409/GET-after-error evidence all shares one adoption rule.
+    assert!(
+        fixture
+            .store
+            .persist_observed_pod_metadata(
+                sandbox,
+                predecessor.generation,
+                Some("new-pod"),
+                None,
+                Some(successor)
+            )
+            .await?
+            .is_some()
+    );
+    assert!(
+        fixture
+            .store
+            .persist_observed_pod_metadata(
+                sandbox,
+                predecessor.generation,
+                Some("another-pod"),
+                None,
+                Some(successor)
+            )
+            .await?
+            .is_none()
+    );
+    fixture
+        .store
+        .persist_pod_node_placement(
+            sandbox,
+            "worker-after",
+            "after-uid",
+            NodeId::new(),
+            NodeRole::Worker,
+            Some("10.0.0.11"),
+        )
+        .await?;
+    let rebound: (String, String) = sqlx::query_as(sql!("SELECT k8s_node_name,k8s_node_uid FROM sandbox_k8s_executions WHERE sandbox_id=$1 AND active"))
+        .bind(sandbox).fetch_one(&fixture.pool).await?;
+    assert_eq!(rebound, ("worker-after".into(), "after-uid".into()));
+    assert!(
+        fixture
+            .store
+            .persist_pod_node_placement(
+                sandbox,
+                "worker-after",
+                "replacement-uid",
+                NodeId::new(),
+                NodeRole::Worker,
+                Some("10.0.0.11")
+            )
+            .await
+            .is_err()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn placement_releases_sandbox_before_repairing_node_inventory() -> TestResult {
+    let fixture = postgres_store_with_max_connections(3).await?;
+    let sandbox = SandboxId::new();
+    insert_sandbox(&fixture.pool, sandbox, "started").await?;
+    fixture.store.ensure_active_execution_row(sandbox).await?;
+    let node = NodeId::new();
+    fixture
+        .store
+        .persist_pod_node_placement(
+            sandbox,
+            "worker-lock-order",
+            "original-uid",
+            node,
+            NodeRole::Worker,
+            Some("192.0.2.10"),
+        )
+        .await?;
+    let mut terminator = fixture.pool.begin().await?;
+    let blocker: i32 = sqlx::query_scalar(sql!("SELECT pg_backend_pid()"))
+        .fetch_one(&mut *terminator)
+        .await?;
+    sqlx::query(sql!("SELECT id FROM nodes WHERE id=$1 FOR SHARE"))
+        .bind(node)
+        .fetch_one(&mut *terminator)
+        .await?;
+    let store = fixture.store.clone();
+    let placement = tokio::spawn(async move {
+        store
+            .persist_pod_node_placement(
+                sandbox,
+                "worker-lock-order",
+                "original-uid",
+                node,
+                NodeRole::Worker,
+                Some("192.0.2.11"),
+            )
+            .await
+    });
+    // Wait for the inventory address update to block on the terminator's node
+    // lock. At that point placement must have released its sandbox lock.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let waiting: bool = sqlx::query_scalar(sql!(
+                "SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid)))"
+            )).bind(blocker).fetch_one(&fixture.pool).await?;
+            if waiting { return Ok::<_, sqlx::Error>(()); }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await??;
+    sqlx::query(sql!("SET LOCAL lock_timeout='500ms'"))
+        .execute(&mut *terminator)
+        .await?;
+    let lock_result = sqlx::query(sql!("SELECT id FROM sandboxes WHERE id=$1 FOR UPDATE"))
+        .bind(sandbox)
+        .fetch_one(&mut *terminator)
+        .await;
+    terminator.rollback().await?;
+    placement.await??;
+    lock_result
+        .expect("node termination must acquire the sandbox while placement repairs inventory");
+    Ok(())
+}
+
+#[tokio::test]
+async fn compatibility_materialization_adopts_old_writer_pods_without_minting_identity()
+-> TestResult {
+    let fixture = postgres_store().await?;
+    let legacy = K8sStore::new(
+        fixture.pool.clone(),
+        "space".into(),
+        MaterializationMode::Compatibility,
+    );
+    let sandbox = SandboxId::new();
+    insert_sandbox(&fixture.pool, sandbox, "started").await?;
+    let initial = legacy.ensure_active_execution_row(sandbox).await?;
+    assert!(initial.materialization_id.is_none());
+    let claim = legacy
+        .claim_pod_materialization(sandbox, &initial, SandboxLifecycle::Started)
+        .await?
+        .unwrap();
+    assert!(claim.materialization_id.is_none());
+    // Simulate the old writer resetting a response-lost create, without knowing
+    // any new columns. Every rolling-deploy writer sees a pre-token lifetime.
+    sqlx::query(sql!(
+        "UPDATE sandbox_k8s_executions SET pod_uid=NULL,pod_ip=NULL,k8s_node_name='legacy-predecessor' WHERE sandbox_id=$1 AND active"
+    ))
+    .bind(sandbox)
+    .execute(&fixture.pool)
+    .await?;
+    // Historical writers could persist whitespace instead of NULL.
+    sqlx::query(sql!(
+        "UPDATE sandbox_k8s_executions SET pod_uid='  ' WHERE sandbox_id=$1 AND active"
+    ))
+    .bind(sandbox)
+    .execute(&fixture.pool)
+    .await?;
+    let observed = legacy.ensure_active_execution_row(sandbox).await?;
+    assert!(
+        observed.observed_pod_uid.is_none(),
+        "blank UID is unmaterialized"
+    );
+    assert!(legacy.legacy_cleanup_matches(sandbox, &observed).await?);
+    let retried = fixture
+        .store
+        .claim_pod_materialization(sandbox, &observed, SandboxLifecycle::Started)
+        .await?
+        .unwrap();
+    assert!(
+        retried.materialization_id.is_none(),
+        "enabling fences must preserve an unresolved legacy create"
+    );
+
+    assert!(
+        legacy
+            .persist_observed_pod_metadata(
+                sandbox,
+                observed.generation,
+                Some("legacy-pod"),
+                None,
+                None
+            )
+            .await?
+            .is_some()
+    );
+    assert!(
+        !legacy.legacy_cleanup_matches(sandbox, &observed).await?,
+        "delayed cleanup cannot claim an adopted pod"
+    );
+    legacy
+        .persist_pod_node_placement(
+            sandbox,
+            "legacy-worker",
+            "present-uid",
+            NodeId::new(),
+            NodeRole::Worker,
+            Some("192.0.2.10"),
+        )
+        .await?;
+    let historical: Option<String> = sqlx::query_scalar(sql!(
+        "SELECT k8s_node_uid FROM sandbox_k8s_executions WHERE sandbox_id=$1 AND active"
+    ))
+    .bind(sandbox)
+    .fetch_one(&fixture.pool)
+    .await?;
+    assert!(historical.is_none());
+    // Enable fences only after writer rollout. Then compatibility mode must
+    // still preserve them, rather than silently allowing an old observation.
+    let adopted = fixture.store.ensure_active_execution_row(sandbox).await?;
+    assert!(
+        fixture
+            .store
+            .claim_pod_materialization(sandbox, &adopted, SandboxLifecycle::Started)
+            .await?
+            .unwrap()
+            .materialization_id
+            .is_none(),
+        "legacy generations stay compatible through recreation"
+    );
+    fixture
+        .store
+        .finish_active_execution_if_generation(sandbox, adopted.generation, "replaced")
+        .await?;
+    let adopted = fixture.store.ensure_active_execution_row(sandbox).await?;
+    let fenced = fixture
+        .store
+        .claim_pod_materialization(sandbox, &adopted, SandboxLifecycle::Started)
+        .await?
+        .unwrap();
+    assert!(fenced.materialization_id.is_some());
+    assert!(!legacy.legacy_cleanup_matches(sandbox, &observed).await?);
+    assert!(
+        legacy
+            .persist_observed_pod_metadata(
+                sandbox,
+                observed.generation,
+                Some("legacy-pod"),
+                None,
+                None
+            )
+            .await?
+            .is_none()
+    );
+    let current = legacy.ensure_active_execution_row(sandbox).await?;
+    assert_eq!(
+        legacy
+            .claim_pod_materialization(sandbox, &current, SandboxLifecycle::Started)
+            .await?
+            .unwrap(),
+        fenced
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn pooled_successor_captures_fresh_identity_without_upgrading_legacy_creates() -> TestResult {
+    let fixture = postgres_store().await?;
+    for (mode, old_uid, pod_uid, fenced) in [
+        (
+            MaterializationMode::Fenced,
+            Some("pool-node-uid"),
+            Some("pool-pod"),
+            true,
+        ),
+        (
+            MaterializationMode::Compatibility,
+            Some("pool-node-uid"),
+            Some("pool-pod"),
+            false,
+        ),
+        (MaterializationMode::Fenced, None, Some("legacy-pod"), false),
+        (
+            MaterializationMode::Fenced,
+            Some("pool-node-uid"),
+            None,
+            false,
+        ),
+    ] {
+        let sandbox = SandboxId::new();
+        let pod_name = format!("pool-{sandbox}");
+        insert_sandbox(&fixture.pool, sandbox, "started").await?;
+        // The pool writer binds a known Pod/Node incarnation without a token.
+        sqlx::query(sql!("INSERT INTO sandbox_k8s_executions
+            (sandbox_id,generation,pod_name,pod_namespace,pod_uid,k8s_node_name,k8s_node_uid,state,active)
+            VALUES ($1,1,$4,'space',$2,'pool-node',$3,'running',TRUE)"))
+            .bind(sandbox).bind(pod_uid).bind(old_uid).bind(&pod_name).execute(&fixture.pool).await?;
+        let store = K8sStore::new(fixture.pool.clone(), "space".into(), mode);
+        let prior = store.ensure_active_execution_row(sandbox).await?;
+        let successor = store
+            .claim_pod_materialization(sandbox, &prior, SandboxLifecycle::Started)
+            .await?
+            .unwrap();
+        assert_eq!(successor.materialization_id.is_some(), fenced);
+        let current = store.ensure_active_execution_row(sandbox).await?;
+        assert_eq!(
+            store
+                .claim_pod_materialization(sandbox, &current, SandboxLifecycle::Started)
+                .await?
+                .unwrap(),
+            successor,
+            "a lost create response must reuse the successor's token"
+        );
+        store
+            .persist_observed_pod_metadata(
+                sandbox,
+                1,
+                Some("successor-pod"),
+                None,
+                successor.materialization_id,
+            )
+            .await?;
+        store
+            .persist_pod_node_placement_after_pod_exists(
+                PodNodePlacement {
+                    sandbox_id: sandbox,
+                    pod_name: &pod_name,
+                    pod_uid: Some("successor-pod"),
+                    materialization_id: successor.materialization_id,
+                    node_name: &format!("successor-{sandbox}"),
+                    node_uid: "successor-node-uid",
+                    node_id: NodeId::new(),
+                    role: NodeRole::Worker,
+                    address: Some("192.0.2.20"),
+                },
+                PlacementRetryDisposition::RetryConverges,
+            )
+            .await?;
+        let bound: Option<String> = sqlx::query_scalar(sql!(
+            "SELECT k8s_node_uid FROM sandbox_k8s_executions WHERE sandbox_id=$1 AND active"
+        ))
+        .bind(sandbox)
+        .fetch_one(&fixture.pool)
+        .await?;
+        assert_eq!(bound.as_deref(), fenced.then_some("successor-node-uid"));
+        assert!(
+            store
+                .claim_pod_materialization(sandbox, &prior, SandboxLifecycle::Started)
+                .await?
+                .is_none(),
+            "a delayed predecessor cannot clear the successor's identity"
+        );
+    }
     Ok(())
 }

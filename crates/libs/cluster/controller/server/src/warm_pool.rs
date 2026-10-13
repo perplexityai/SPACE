@@ -15,7 +15,7 @@ use k8s_openapi::api::core::v1::{Node, Pod};
 use kube::{
     Api, Client, Error as KubeError,
     api::{DeleteParams, ListParams, Patch, PatchParams, PostParams},
-    runtime::reflector::Store,
+    runtime::reflector::{ObjectRef, Store},
 };
 use pplx_space_api::controllers::substrate::kubernetes::{SandboxPodKey, SandboxPodView};
 use pplx_space_api::controllers::substrate::{
@@ -35,7 +35,7 @@ use pplx_space_common_core::{
         TEMPLATE_PRESENT_LABEL_VALUE, template_build_presence_label_key,
         template_write_annotation_key_for,
     },
-    types::{SandboxId, TemplateArtifactDigest, TemplateReference},
+    types::{K8sNodeUid, SandboxId, TemplateArtifactDigest, TemplateReference},
 };
 use pplx_space_common_svc::space_api_route::wait_ready_lifecycle_request;
 use pplx_space_metrics::warm_pool::{
@@ -1752,52 +1752,69 @@ impl Reconciler {
             };
             let pod = pod.as_ref();
 
-            match claimable_slot_metadata(&slot, pod, &self.ready_probe, &content_hash).await {
-                ClaimableSlotMetadata::Ready(metadata) => {
-                    self.timed_postgres(
-                        "mark-slot-ready",
-                        self.store.mark_slot_ready(
-                            slot.id,
-                            &metadata.uid,
-                            &metadata.pod_ip,
-                            &metadata.node_name,
-                        ),
-                    )
-                    .await?;
-                    emit_promote_attempt(&content_hash, PromoteOutcome::Promoted);
-                    tracing::info!(
-                        config_id = %config.id,
-                        content_hash = %content_hash,
-                        slot = %slot.id,
-                        pod = %slot.pod_name,
-                        pod_ip = %metadata.pod_ip,
-                        "warm pool: slot promoted"
-                    );
-                    summary.marked_ready_slots += 1;
-                    continue;
+            // Snapshot incarnation before the asynchronous readiness probe. A
+            // missing binding blocks promotion, but never timeout cleanup.
+            let node_uid = pod
+                .node_name()
+                .and_then(|name| cached_node_uid(&self.node_store, name));
+            if let Some(node_uid) = node_uid {
+                match claimable_slot_metadata(&slot, pod, &self.ready_probe, &content_hash).await {
+                    ClaimableSlotMetadata::Ready(metadata) => {
+                        if cached_node_uid(&self.node_store, &metadata.node_name).as_ref()
+                            != Some(&node_uid)
+                        {
+                            tracing::warn!(slot_id = %slot.id, "warm slot node changed during readiness probe; deferring promotion");
+                        } else {
+                            self.timed_postgres(
+                                "mark-slot-ready",
+                                self.store.mark_slot_ready(
+                                    slot.id,
+                                    &metadata.uid,
+                                    &metadata.pod_ip,
+                                    &metadata.node_name,
+                                    &node_uid,
+                                ),
+                            )
+                            .await?;
+                            emit_promote_attempt(&content_hash, PromoteOutcome::Promoted);
+                            tracing::info!(
+                                config_id = %config.id,
+                                content_hash = %content_hash,
+                                slot = %slot.id,
+                                pod = %slot.pod_name,
+                                pod_ip = %metadata.pod_ip,
+                                "warm pool: slot promoted"
+                            );
+                            summary.marked_ready_slots += 1;
+                            continue;
+                        }
+                    }
+                    ClaimableSlotMetadata::PodNotReady => {
+                        emit_promote_attempt(&content_hash, PromoteOutcome::PodNotReady);
+                        tracing::info!(
+                            config_id = %config.id,
+                            content_hash = %content_hash,
+                            slot = %slot.id,
+                            pod = %slot.pod_name,
+                            pod_ip = %pod_ip_for_log(pod),
+                            "warm pool: slot promotion skipped because pod is not ready"
+                        );
+                    }
+                    ClaimableSlotMetadata::ProbeFailed(metadata) => {
+                        emit_promote_attempt(&content_hash, PromoteOutcome::ProbeFailed);
+                        tracing::info!(
+                            config_id = %config.id,
+                            content_hash = %content_hash,
+                            slot = %slot.id,
+                            pod = %slot.pod_name,
+                            pod_ip = %metadata.pod_ip,
+                            "warm pool: slot promotion skipped because readiness probe failed"
+                        );
+                    }
                 }
-                ClaimableSlotMetadata::PodNotReady => {
-                    emit_promote_attempt(&content_hash, PromoteOutcome::PodNotReady);
-                    tracing::info!(
-                        config_id = %config.id,
-                        content_hash = %content_hash,
-                        slot = %slot.id,
-                        pod = %slot.pod_name,
-                        pod_ip = %pod_ip_for_log(pod),
-                        "warm pool: slot promotion skipped because pod is not ready"
-                    );
-                }
-                ClaimableSlotMetadata::ProbeFailed(metadata) => {
-                    emit_promote_attempt(&content_hash, PromoteOutcome::ProbeFailed);
-                    tracing::info!(
-                        config_id = %config.id,
-                        content_hash = %content_hash,
-                        slot = %slot.id,
-                        pod = %slot.pod_name,
-                        pod_ip = %metadata.pod_ip,
-                        "warm pool: slot promotion skipped because readiness probe failed"
-                    );
-                }
+            } else {
+                tracing::debug!(slot_id = %slot.id, pod = %slot.pod_name,
+                    "warm slot promotion waiting for node identity in reflector");
             }
 
             if should_delete_unready_warming_pod(pod, &slot, self.warming_slot_timeout)
@@ -2754,6 +2771,11 @@ fn is_not_found_error(err: &TimedIoError<KubeError>) -> bool {
 
 fn should_cleanup_warming_slot_after_create_error(err: &TimedIoError<KubeError>) -> bool {
     !matches!(err, TimedIoError::Timeout(_))
+}
+
+fn cached_node_uid(node_store: &Store<Node>, name: &str) -> Option<K8sNodeUid> {
+    let node = node_store.get(&ObjectRef::new(name))?;
+    K8sNodeUid::parse(node.metadata.uid.as_deref()?).ok()
 }
 
 fn cached_cordoned_node_names(node_store: &Store<Node>) -> HashSet<String> {

@@ -116,11 +116,12 @@ impl KubernetesSubstrate {
             let pod_ip_string = pod_ip.map(|ip| ip.to_string());
             match self
                 .store
-                .persist_pod_metadata(
+                .persist_observed_pod_metadata(
                     sandbox_uuid,
                     generation,
                     pod_uid.as_deref(),
                     pod_ip_string.as_deref(),
+                    pod.materialization_id()?,
                 )
                 .await
             {

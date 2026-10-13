@@ -172,11 +172,14 @@ impl KubernetesSubstrate {
         if let Err(mismatch) = fence.observed().reconcile(&current) {
             if mismatch == PodFenceMismatch::PodIdentityUnverified
                 && let Some(observed_uid) = live_pod.as_deref().and_then(SandboxPodView::uid)
+                && let Some(Ok(materialization_id)) =
+                    live_pod.as_ref().map(|pod| pod.materialization_id())
             {
                 self.hydrate_materialized_pod_uid(
                     sandbox_id,
                     &current_execution_identity(&active, live_pod.as_deref()),
                     observed_uid,
+                    materialization_id,
                 )
                 .await;
             }
@@ -253,13 +256,17 @@ impl KubernetesSubstrate {
         sandbox_id: SandboxId,
         identity: &ExecutionIdentity,
         observed_uid: &str,
+        materialization_id: Option<pplx_space_common_core::types::PodMaterializationId>,
     ) {
         match self
             .store
-            .backfill_missing_pod_uid(sandbox_id, identity, observed_uid)
+            .backfill_missing_pod_uid(sandbox_id, identity, observed_uid, materialization_id)
             .await
         {
-            Ok(_) => tracing::info!(
+            Ok(false) => {
+                tracing::debug!(sandbox_id = %sandbox_id, "pod UID hydration did not match the current materialization")
+            }
+            Ok(true) => tracing::info!(
                 sandbox_id = %sandbox_id,
                 generation = ?identity.generation,
                 "recorded the pod uid a name-only fence could not verify; the next sweep \
@@ -479,9 +486,16 @@ impl KubernetesSubstrate {
                             message: format!("failed to re-read an unfenceable sandbox pod: {err}"),
                         })?
             {
-                if let Some(observed_uid) = materialized.uid() {
-                    self.hydrate_materialized_pod_uid(sandbox_id, &fenced.identity, observed_uid)
-                        .await;
+                if let Some(observed_uid) = materialized.uid()
+                    && let Ok(materialization_id) = materialized.materialization_id()
+                {
+                    self.hydrate_materialized_pod_uid(
+                        sandbox_id,
+                        &fenced.identity,
+                        observed_uid,
+                        materialization_id,
+                    )
+                    .await;
                 }
                 return Ok(self.refuse_fenced_teardown(
                     sandbox_id,

@@ -54,7 +54,7 @@ impl K8sStore {
         sandbox_id: SandboxId,
     ) -> Result<Option<SandboxExecutionRow>, SubstrateError> {
         sqlx::query_as::<_, SandboxExecutionRow>(sql!(
-            "SELECT generation, pod_name,
+            "SELECT generation, pod_name, materialization_id, NULLIF(BTRIM(pod_uid), '') AS observed_pod_uid,
                     NULLIF(BTRIM(pod_uid), '') IS NOT NULL AS pod_materialized,
                     state,
                     updated_at <= NOW() - make_interval(secs => $2) AS create_age_expired,
@@ -88,11 +88,11 @@ impl K8sStore {
 
         let row = sqlx::query_as::<_, SandboxExecutionRow>(sql!(
             "INSERT INTO sandbox_k8s_executions (
-                 sandbox_id, generation, pod_name, pod_namespace, state, active
+                 sandbox_id, generation, pod_name, pod_namespace, state, active, materialization_id
              )
-             VALUES ($1, $2, $3, $4, 'creating', TRUE)
+             VALUES ($1, $2, $3, $4, 'creating', TRUE, $5)
              ON CONFLICT DO NOTHING
-             RETURNING generation, pod_name, FALSE AS pod_materialized, state,
+             RETURNING generation, pod_name, materialization_id, NULLIF(BTRIM(pod_uid), '') AS observed_pod_uid, FALSE AS pod_materialized, state,
                        FALSE AS create_age_expired, activation_attempt_id,
                        route_activation_id"
         ))
@@ -100,6 +100,7 @@ impl K8sStore {
         .bind(generation)
         .bind(&pod_name)
         .bind(&self.namespace)
+        .bind(self.materialization_mode.initial_token())
         .fetch_optional(&mut *conn)
         .await
         .db_context("failed to insert Kubernetes execution row")?;
@@ -201,32 +202,58 @@ impl K8sStore {
             .transpose()
     }
 
+    /// Bind a newly scheduled execution. Legacy node names remain mutable
+    /// placement hints when neither token nor incarnation was ever recorded;
+    /// an old writer can retain that hint while recreating the pod elsewhere.
+    /// Refreshing the hint never attaches today's UID to historical state.
     pub(super) async fn update_active_execution_node_name(
         &self,
         conn: &mut PgConnection,
         sandbox_id: SandboxId,
         node_name: &str,
+        node_uid: &str,
     ) -> Result<bool, SubstrateError> {
-        sqlx::query_scalar::<_, bool>(sql!(
-            "WITH updated AS (
-                UPDATE sandbox_k8s_executions
-                SET k8s_node_name = $1::TEXT,
+        sqlx::query(sql!(
+            "UPDATE sandbox_k8s_executions
+                SET k8s_node_name = $1,
+                    k8s_node_uid = CASE WHEN materialization_id IS NOT NULL THEN $3 ELSE NULL END,
                     updated_at = CASE WHEN state = 'recovering' THEN updated_at ELSE NOW() END
-                WHERE sandbox_id = $2 AND active
-                  AND k8s_node_name IS DISTINCT FROM $1::TEXT
-                RETURNING 1
-             )
-             SELECT EXISTS (
-                SELECT 1
-                FROM sandbox_k8s_executions
-                WHERE sandbox_id = $2 AND active
-             )"
+              WHERE sandbox_id = $2 AND active
+                AND (k8s_node_name IS NULL OR
+                     (materialization_id IS NULL AND k8s_node_uid IS NULL AND k8s_node_name <> $1))"
         ))
         .bind(node_name)
         .bind(sandbox_id)
-        .fetch_one(conn)
+        .bind(node_uid)
+        .execute(&mut *conn)
         .await
-        .db_context("failed to persist sandbox pod node name")
+        .db_context("failed to bind sandbox pod node identity")?;
+        let matches: bool = sqlx::query_scalar(sql!(
+            "SELECT EXISTS (SELECT 1 FROM sandbox_k8s_executions
+              WHERE sandbox_id = $1 AND active AND k8s_node_name = $2
+                AND (k8s_node_uid = $3 OR (k8s_node_uid IS NULL AND materialization_id IS NULL)))"
+        ))
+        .bind(sandbox_id)
+        .bind(node_name)
+        .bind(node_uid)
+        .fetch_one(&mut *conn)
+        .await
+        .db_context("failed to check sandbox pod node identity")?;
+        if !matches {
+            let active: bool = sqlx::query_scalar(sql!(
+                "SELECT EXISTS (SELECT 1 FROM sandbox_k8s_executions WHERE sandbox_id=$1 AND active)"
+            ))
+            .bind(sandbox_id).fetch_one(conn).await
+            .db_context("failed to check active execution after identity mismatch")?;
+            if active {
+                return Err(SubstrateError::Unavailable {
+                    message:
+                        "observed pod node differs from the execution's original node identity"
+                            .to_string(),
+                });
+            }
+        }
+        Ok(matches)
     }
 
     pub(super) async fn finish_active_execution_in(
@@ -890,6 +917,7 @@ impl K8sStore {
             claim.row.generation,
             None,
             claim.row.activation_attempt_id,
+            claim.row.materialization_id,
         )
         .await
     }
@@ -921,6 +949,7 @@ impl K8sStore {
         generation: i64,
         restore_lease_token: Option<Uuid>,
         activation_attempt_id: Option<pplx_space_common_core::types::SandboxActivationAttemptId>,
+        materialization_id: Option<pplx_space_common_core::types::PodMaterializationId>,
     ) -> Result<bool, SubstrateError> {
         let mut tx = self
             .pool
@@ -943,6 +972,7 @@ impl K8sStore {
                AND active
                AND generation = $2
                AND activation_attempt_id IS NOT DISTINCT FROM $3
+               AND materialization_id IS NOT DISTINCT FROM $4
                AND state = 'creating'
                AND pod_uid IS NULL
                AND pod_ip IS NULL"
@@ -950,6 +980,7 @@ impl K8sStore {
         .bind(sandbox_id)
         .bind(generation)
         .bind(activation_attempt_id)
+        .bind(materialization_id)
         .execute(&mut *tx)
         .await
         .db_context("failed to abandon Kubernetes create claim")?
@@ -1009,13 +1040,14 @@ impl K8sStore {
     /// [`Self::abandon_unmaterialized_create_claim_by_generation`]) and scoped
     /// to a not-yet-routable row (`pod_ip IS NULL`), so a successor another
     /// attempt already materialized to a running pod is never clobbered.
-    pub(in crate::controllers::substrate::kubernetes) async fn reset_active_execution_to_creating_if_generation(
+    pub(in crate::controllers::substrate::kubernetes) async fn reset_pod_materialization(
         &self,
         sandbox_id: SandboxId,
         generation: i64,
         restore_lease_token: Option<Uuid>,
         activation_attempt_id: Option<pplx_space_common_core::types::SandboxActivationAttemptId>,
-    ) -> Result<bool, SubstrateError> {
+        materialization_id: Option<pplx_space_common_core::types::PodMaterializationId>,
+    ) -> Result<Option<ClaimedMaterialization>, SubstrateError> {
         let mut tx = self
             .pool
             .begin()
@@ -1025,11 +1057,13 @@ impl K8sStore {
             tx.commit()
                 .await
                 .db_context("failed to commit create claim reset transaction")?;
-            return Ok(false);
+            return Ok(None);
         }
-        let reset = sqlx::query(sql!(
+        let next =
+            materialization_id.map(|_| pplx_space_common_core::types::PodMaterializationId::new());
+        let reset = sqlx::query_as(sql!(
             "UPDATE sandbox_k8s_executions
-             SET pod_uid = NULL,
+             SET pod_uid = NULL, k8s_node_name=NULL, k8s_node_uid=NULL, materialization_id=$5,
                  pod_ip = NULL,
                  state = 'creating',
                  updated_at = NOW()
@@ -1038,20 +1072,45 @@ impl K8sStore {
                AND generation = $2
                AND activation_attempt_id IS NOT DISTINCT FROM $3
                AND pod_ip IS NULL
-               AND state IN ('creating', 'created')"
+               AND state IN ('creating', 'created')
+               AND materialization_id IS NOT DISTINCT FROM $4
+             RETURNING materialization_id, state"
         ))
         .bind(sandbox_id)
         .bind(generation)
         .bind(activation_attempt_id)
-        .execute(&mut *tx)
+        .bind(materialization_id)
+        .bind(next)
+        .fetch_optional(&mut *tx)
         .await
-        .db_context("failed to reset create claim to creating")?
-        .rows_affected()
-            > 0;
+        .db_context("failed to reset create claim to creating")?;
         tx.commit()
             .await
             .db_context("failed to commit create claim reset transaction")?;
         Ok(reset)
+    }
+
+    #[cfg(test)]
+    pub(in crate::controllers::substrate::kubernetes) async fn reset_active_execution_to_creating_if_generation(
+        &self,
+        sandbox_id: SandboxId,
+        generation: i64,
+        restore_lease_token: Option<Uuid>,
+        activation_attempt_id: Option<SandboxActivationAttemptId>,
+    ) -> Result<bool, SubstrateError> {
+        let id = sqlx::query_scalar(sql!("SELECT materialization_id FROM sandbox_k8s_executions WHERE sandbox_id=$1 AND generation=$2"))
+            .bind(sandbox_id).bind(generation).fetch_optional(&self.pool).await
+            .db_context("read fixture materialization")?.flatten();
+        Ok(self
+            .reset_pod_materialization(
+                sandbox_id,
+                generation,
+                restore_lease_token,
+                activation_attempt_id,
+                id,
+            )
+            .await?
+            .is_some())
     }
 
     pub(in crate::controllers::substrate::kubernetes) async fn active_execution_is_generation(

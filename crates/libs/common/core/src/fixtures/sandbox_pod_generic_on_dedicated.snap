@@ -1,6 +1,5 @@
 ---
 source: crates/libs/common/core/src/k8s/tests.rs
-assertion_line: 817
 expression: pod
 ---
 apiVersion: v1
@@ -14,6 +13,7 @@ metadata:
     space.pplx.net/disk-io-max-bandwidth-mib-per-sec: "100"
     space.pplx.net/disk-io-max-operations-per-sec: "1000"
     space.pplx.net/execution-generation: "6"
+    space.pplx.net/materialization-id: 019f8000-0000-7000-8000-0000000000ab
     space.pplx.net/memory-mib: "8192"
     space.pplx.net/network-policy: "{\"version\":\"v1\",\"egress\":{\"default_action\":\"deny\",\"allow\":[],\"deny\":[]}}"
     space.pplx.net/network-policy-authority: cluster

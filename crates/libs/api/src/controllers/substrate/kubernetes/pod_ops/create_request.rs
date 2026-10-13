@@ -168,6 +168,7 @@ impl KubernetesSubstrate {
             sandbox_id: sandbox.id,
             execution_generation: execution.generation,
             activation_attempt_id: execution.bootstrap_route_activation_id(),
+            materialization_id: execution.materialization_id,
             template: sandbox_template_name(sandbox),
             content_hash: sandbox.content_hash.as_deref(),
             env: &sandbox.env.0,

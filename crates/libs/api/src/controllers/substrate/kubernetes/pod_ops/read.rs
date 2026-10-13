@@ -174,6 +174,9 @@ impl KubernetesSubstrate {
             .persist_pod_node_placement_after_pod_exists(
                 PodNodePlacement {
                     sandbox_id,
+                    pod_name: pod.name(),
+                    pod_uid: pod.uid(),
+                    materialization_id: pod.materialization_id()?,
                     node_name,
                     node_uid,
                     node_id,
@@ -426,11 +429,12 @@ impl KubernetesSubstrate {
         {
             match self
                 .store
-                .persist_pod_metadata(
+                .persist_observed_pod_metadata(
                     sandbox_id,
                     row.generation,
                     pod_uid.as_deref(),
                     pod_ip_string.as_deref(),
+                    pod.materialization_id()?,
                 )
                 .await
             {

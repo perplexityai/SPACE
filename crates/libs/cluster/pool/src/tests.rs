@@ -1,3 +1,4 @@
+use pplx_space_common_core::sql;
 use pplx_space_common_core::types::{OrgId, UserId};
 
 use std::time::Duration;
@@ -620,7 +621,13 @@ async fn insert_ready_slot(
     let slot = fixture.store.insert_warming_slot(slot).await?;
     fixture
         .store
-        .mark_slot_ready(slot.id, "pod-uid", pod_ip, "worker-1")
+        .mark_slot_ready(
+            slot.id,
+            "pod-uid",
+            pod_ip,
+            "worker-1",
+            &pplx_space_common_core::types::K8sNodeUid::parse("original-worker-uid")?,
+        )
         .await?;
     Ok(slot)
 }
@@ -765,7 +772,13 @@ async fn autoscale_configs_prepares_republished_exact_release_without_observed_d
         .await?;
     fixture
         .store
-        .mark_slot_ready(previous_slot.id, "pod-uid", "10.90.0.30", "worker-1")
+        .mark_slot_ready(
+            previous_slot.id,
+            "pod-uid",
+            "10.90.0.30",
+            "worker-1",
+            &pplx_space_common_core::types::K8sNodeUid::parse("original-worker-uid")?,
+        )
         .await?;
 
     sqlx::query(
@@ -2442,7 +2455,13 @@ async fn store_mark_slot_ready_returns_typed_error_when_slot_not_warming() -> Te
     // act
     let err = fixture
         .store
-        .mark_slot_ready(slot.id, "pod-uid", "10.90.0.8", "worker-1")
+        .mark_slot_ready(
+            slot.id,
+            "pod-uid",
+            "10.90.0.8",
+            "worker-1",
+            &pplx_space_common_core::types::K8sNodeUid::parse("original-worker-uid")?,
+        )
         .await
         .unwrap_err();
 
@@ -3345,11 +3364,23 @@ async fn store_claim_ready_slot_only_locks_slots() -> TestResult {
         .await?;
     fixture
         .store
-        .mark_slot_ready(first.id, "first-pod-uid", "10.90.0.8", "worker-1")
+        .mark_slot_ready(
+            first.id,
+            "first-pod-uid",
+            "10.90.0.8",
+            "worker-1",
+            &pplx_space_common_core::types::K8sNodeUid::parse("original-worker-uid")?,
+        )
         .await?;
     fixture
         .store
-        .mark_slot_ready(second.id, "second-pod-uid", "10.90.0.9", "worker-1")
+        .mark_slot_ready(
+            second.id,
+            "second-pod-uid",
+            "10.90.0.9",
+            "worker-1",
+            &pplx_space_common_core::types::K8sNodeUid::parse("original-worker-uid")?,
+        )
         .await?;
 
     let mut first_tx = fixture.pool.begin().await?;
@@ -3704,7 +3735,13 @@ async fn store_bind_source_reads_locked_identity_and_normalizes_pod_uid() -> Tes
         .await?;
     fixture
         .store
-        .mark_slot_ready(slot.id, "  ", "10.90.0.31", "worker-1")
+        .mark_slot_ready(
+            slot.id,
+            "  ",
+            "10.90.0.31",
+            "worker-1",
+            &pplx_space_common_core::types::K8sNodeUid::parse("original-worker-uid")?,
+        )
         .await?;
     let mut claim_tx = fixture.pool.begin().await?;
     WarmPoolStore::claim_ready_slot(
@@ -3736,6 +3773,39 @@ async fn store_bind_source_reads_locked_identity_and_normalizes_pod_uid() -> Tes
     assert_eq!(source.pod_ip.as_deref(), Some("10.90.0.31"));
     assert_eq!(source.k8s_node_name.as_deref(), Some("worker-1"));
     assert!(missing.is_none());
+    assert_eq!(
+        source.k8s_node_uid.as_ref().map(|uid| uid.as_str()),
+        Some("original-worker-uid")
+    );
+    let replacement = pplx_space_common_core::types::K8sNodeUid::parse("replacement-worker-uid")?;
+    fixture
+        .store
+        .mark_slot_ready(
+            slot.id,
+            "replacement-pod",
+            "10.90.0.32",
+            "worker-1",
+            &replacement,
+        )
+        .await
+        .expect_err("a ready slot cannot replace its captured node identity");
+    // Old pool writers leave unknown identity; adoption must not fill it from
+    // the registry at claim time.
+    sqlx::query(sql!(
+        "UPDATE kubernetes_pool_slots SET k8s_node_uid=NULL WHERE id=$1"
+    ))
+    .bind(slot.id)
+    .execute(&fixture.pool)
+    .await?;
+    let mut tx = fixture.pool.begin().await?;
+    assert!(
+        WarmPoolStore::bind_source(&mut tx, claim_id, reserved_sandbox_id)
+            .await?
+            .unwrap()
+            .k8s_node_uid
+            .is_none()
+    );
+    tx.rollback().await?;
 
     Ok(())
 }

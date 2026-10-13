@@ -13,6 +13,7 @@ metadata:
     space.pplx.net/disk-io-max-bandwidth-mib-per-sec: "100"
     space.pplx.net/disk-io-max-operations-per-sec: "1000"
     space.pplx.net/execution-generation: "2"
+    space.pplx.net/materialization-id: 019f8000-0000-7000-8000-0000000000ab
     space.pplx.net/memory-mib: "8192"
     space.pplx.net/pool-config-id: 019e5f38-c76e-7e22-9b2f-e389cc9dc6b3
     space.pplx.net/pool-slot-id: 019e5f38-c338-7c13-a8d4-587fd9fd8dd5

@@ -286,7 +286,7 @@ impl K8sStore {
     }
 }
 
-async fn is_node_k8s_tombstoned(
+pub(super) async fn is_node_k8s_tombstoned(
     conn: &mut PgConnection,
     node_id: NodeId,
     op: &str,

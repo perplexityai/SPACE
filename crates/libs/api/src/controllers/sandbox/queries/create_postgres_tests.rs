@@ -3133,7 +3133,7 @@ async fn admission_claim_executes_and_runs_under_the_claimed_id(
     let node_id = NodeId::new();
     insert_node(&fixture.db.pool, node_id).await?;
     sqlx::query(sql!(
-        "INSERT INTO node_k8s (node_id, k8s_node_name) VALUES ($1, $2)"
+        "INSERT INTO node_k8s (node_id, k8s_node_name, k8s_node_uid) VALUES ($1, $2, 'replacement-worker-uid')"
     ))
     .bind(node_id)
     .bind(&slot.node_name)
@@ -3239,6 +3239,17 @@ async fn admission_claim_executes_and_runs_under_the_claimed_id(
         .response
         .expect("the admitted slot is adopted, not rebuilt cold");
     assert_eq!(sandbox.id, slot.reserved_sandbox_id);
+    let execution_uid: Option<String> = sqlx::query_scalar(sql!(
+        "SELECT k8s_node_uid FROM sandbox_k8s_executions WHERE sandbox_id=$1 AND active"
+    ))
+    .bind(sandbox.id)
+    .fetch_one(&fixture.db.pool)
+    .await?;
+    assert_eq!(
+        execution_uid.as_deref(),
+        Some("original-worker-uid"),
+        "pool adoption copies the ready slot's identity, never today's registry UID"
+    );
     assert_eq!(
         *substrate.prepared.lock().unwrap(),
         vec![(slot.reserved_sandbox_id, true)]

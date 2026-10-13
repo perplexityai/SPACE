@@ -848,9 +848,13 @@ impl KubernetesSubstrate {
     ) -> Result<Option<Self>, SubstrateError> {
         match KubernetesState::try_from_env().await {
             Ok(Some(k8s)) => {
+                let store = K8sStore::new(
+                    pool.clone(),
+                    k8s.sandbox_namespace.clone(),
+                    store::MaterializationMode::from_env()?,
+                );
                 let (pod_store, pod_network_slots, pod_events, pod_reflector_ready) =
                     pod_reflector::start(k8s.client.clone(), k8s.sandbox_namespace.clone());
-                let store = K8sStore::new(pool.clone(), k8s.sandbox_namespace.clone());
                 // Read before `k8s` is moved into the struct below.
                 let node_group_placement = NodeGroupPlacementResolver::new(
                     pool.clone(),

@@ -5,8 +5,8 @@ use std::{
 };
 
 use pplx_space_common_core::types::{
-    DEFAULT_DISK_IO_MAX_BANDWIDTH_MIB_PER_SEC, DEFAULT_DISK_IO_MAX_OPERATIONS_PER_SEC, MemorySize,
-    SandboxId, VcpuCount,
+    DEFAULT_DISK_IO_MAX_BANDWIDTH_MIB_PER_SEC, DEFAULT_DISK_IO_MAX_OPERATIONS_PER_SEC, K8sNodeUid,
+    MemorySize, SandboxId, VcpuCount,
 };
 use sqlx::{PgConnection, PgPool, Postgres, Transaction};
 use uuid::Uuid;
@@ -905,6 +905,7 @@ impl WarmPoolStore {
         pod_uid: &str,
         pod_ip: &str,
         k8s_node_name: &str,
+        k8s_node_uid: &K8sNodeUid,
     ) -> Result<PoolSlot> {
         let ready_state = PoolSlotState::Warming.mark_ready()?;
         let row = sqlx::query_as::<_, PoolSlotRow>(sql!(
@@ -913,6 +914,7 @@ impl WarmPoolStore {
                  pod_uid = $3,
                  pod_ip = $4::inet,
                  k8s_node_name = $5,
+                 k8s_node_uid = $6,
                  ready_at = COALESCE(ready_at, NOW()),
                  updated_at = NOW()
              WHERE id = $1
@@ -928,6 +930,7 @@ impl WarmPoolStore {
         .bind(pod_uid)
         .bind(pod_ip)
         .bind(k8s_node_name)
+        .bind(k8s_node_uid)
         .fetch_optional(&self.pool)
         .await?
         .ok_or(PoolError::SlotNotWarming { slot_id })?;
@@ -1315,7 +1318,8 @@ impl WarmPoolStore {
     ) -> Result<Option<ClaimedSlotBindSource>> {
         let source = sqlx::query_as::<_, ClaimedSlotBindSource>(sql!(
             "SELECT pod_name, pod_namespace, NULLIF(BTRIM(pod_uid), '') AS pod_uid,
-                    host(pod_ip) AS pod_ip, k8s_node_name
+                    host(pod_ip) AS pod_ip, k8s_node_name,
+                    NULLIF(BTRIM(k8s_node_uid), '') AS k8s_node_uid
              FROM kubernetes_pool_slots
              WHERE claim_id = $1
                AND reserved_sandbox_id = $2
