@@ -2194,7 +2194,8 @@ pub struct SubstrateCapabilities {
     /// fallthrough create takes a configured or policy pool shape, and
     /// otherwise vCPU and memory the request left unset come from the
     /// template's build shape. Without it, the requested shape goes to the
-    /// node unchanged.
+    /// node unchanged, except that Direct's one-shot create cannot carry vCPU
+    /// or memory (see the [`direct`] module doc).
     pub resolves_cold_create_shape: bool,
     /// Create requests may carry a Kubernetes node-pool placement pin.
     pub supports_node_pool_placement: bool,

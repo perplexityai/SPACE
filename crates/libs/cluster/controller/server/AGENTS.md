@@ -22,6 +22,12 @@ Every table named here is in the control-plane Postgres store.
 - Read a knob a deployment must change with a production `EnvConfig` reader
   (`src/env_config.rs`); its `test_*` readers return the default unless
   `test-hooks` is compiled in.
+- Scope SQL to a substrate's rows with `managed_by = $n`, never a
+  `'k8s'`/`'space'` literal, bound from `substrate.managed_by()` when it scopes
+  to the running substrate's rows, or a fixed `SubstrateKind` when it targets
+  one substrate (the Kubernetes arm of `run_reconcilers`;
+  `tombstone_retention`'s Direct tombstones). For what Direct lacks, see the
+  [Direct substrate contract](../../../api/src/controllers/substrate/AGENTS.md#direct-substrate-contract).
 - `stuck_container_creating_gc` reads the `orphaned_sandboxes` and
   transient-lifecycle sweeper configs and runs only when both would retire
   the rows of the pods it deletes; changing those readers changes its gate.

@@ -1,3 +1,52 @@
+//! The Direct substrate: [`DirectSubstrate`] dials each worker's node-api at
+//! `node_direct.node_api_endpoint`, with no sandbox pods. The rules for
+//! changing it are in this directory's `AGENTS.md`. Below is what it does
+//! today: a selection, not a complete classification.
+//!
+//! # Operations
+//!
+//! - Create/delete, start, suspend/restore and wake go through
+//!   [`SubstrateAdapter`]. Stop, kill, pause/resume and checkpoint go through
+//!   the shared controller over Direct's runtime clients, which never recreate
+//!   an execution.
+//! - Warm-pool claims adopt node-side; custom vcpu/memory or encrypted claims
+//!   go cold. Admission-time pool slot claims always miss.
+//! - [`SubstrateError::Unsupported`]: node-pool placement, forks and cluster
+//!   pool configs.
+//! - No-ops returning `None` or nothing: `sandbox_ip`, `access_sandbox_ip`,
+//!   `list_inventory_nodes` (Postgres is the inventory),
+//!   `retire_fence_mismatch` and `observe_pod_identities`.
+//!   `retire_execution` ignores its fence, but still stops the sandbox and
+//!   clears its routing.
+//! - Direct-only: the node registry and the template pull and delete routes in
+//!   `routes/admin/node_maintenance.rs` (501 on Kubernetes).
+//! - No drain or evacuation. After drain-state validation, admin `:drain`,
+//!   `:undrain`, `:cordon` and `:uncordon` return 502 on a Direct node;
+//!   `:drain` still commits `drain_phase='draining'`, which nothing advances.
+//!
+//! # Kubernetes-only reconcilers
+//!
+//! The cluster controller's `run_reconcilers` starts its drain, orphan,
+//! failed-row repair and node-sync loops only for Kubernetes. The loops it
+//! starts for both substrates include the public-operation dispatcher, which
+//! retries transient failures of the create, lifecycle and delete operations
+//! it executes. Direct reaches `retire_execution` only through the
+//! transient-lifecycle sweeper's best-effort `cleanup_after_sweep`, and the
+//! sweeper's failed-cleanup retry does nothing unless the running substrate is
+//! Kubernetes, so nothing retries a failed Direct retire.
+//!
+//! # Known gaps
+//!
+//! Both succeed silently today:
+//!
+//! - One-shot create (`use_one_shot_create`) does not forward requested vCPU
+//!   or memory overrides: sbx-mgr's `CreateRequest` has no fields for them, so
+//!   autostart uses node-side defaults and memory policy while
+//!   `public.sandboxes` records the requested values. Disk size is forwarded.
+//! - `retire_execution` never enqueues the stopped-disk backup that
+//!   [`SubstrateAdapter::retire_execution`] documents; the Kubernetes teardown
+//!   does.
+
 use pplx_space_common_core::sql;
 use pplx_space_common_svc::sql::contention;
 use std::fmt;
@@ -3768,8 +3817,8 @@ impl SubstrateAdapter for DirectSubstrate {
         let (_, _, mut client) = self.worker_client_for_sandbox(sandbox_id).await?;
 
         // Unlike `delete_execution`, the stop is the whole operation here, so
-        // its outcome must propagate: a failure keeps the caller's retry loop
-        // (e.g. the cluster-controller failed-cleanup pass) re-driving it.
+        // its outcome must propagate to the caller. Nothing retries a failed
+        // Direct retire: the failed-cleanup pass skips every substrate but Kubernetes.
         client
             .stop_sandbox(pplx_space_sbx_mgr_client::proto::StopRequest {
                 sandbox_id: sandbox_id.to_string(),
