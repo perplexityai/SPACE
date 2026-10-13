@@ -6451,8 +6451,17 @@ async fn durable_suspend_snapshot_artifact_requires_this_suspends_snapshot(
             .await?;
         assert_eq!(found, accepted.then_some(artifact), "{case}");
         if accepted {
-            // The suspend commit accepts the recovered identity as it would
-            // the node's published one.
+            // The handoff then runs as for the node's published identity:
+            // nothing is committed yet, the commit takes the recovered
+            // artifact, and finishing leaves the sandbox suspended.
+            assert_eq!(
+                fixture
+                    .store
+                    .committed_suspend_artifact(sandbox_id, generation, &pod_uid)
+                    .await?,
+                None,
+                "{case}"
+            );
             fixture
                 .store
                 .persist_or_accept_suspend_commit(sandbox_id, generation, &pod_uid, artifact)
@@ -6463,6 +6472,44 @@ async fn durable_suspend_snapshot_artifact_requires_this_suspends_snapshot(
                     .committed_suspend_artifact(sandbox_id, generation, &pod_uid)
                     .await?,
                 Some(artifact),
+                "{case}"
+            );
+            fixture
+                .store
+                .finish_suspended_execution(sandbox_id, generation, &pod_uid, artifact)
+                .await?;
+            let (lifecycle, placement, marker, execution_active, execution_state): (
+                String,
+                String,
+                Option<Uuid>,
+                bool,
+                String,
+            ) = sqlx::query_as(sql!(
+                "SELECT s.lifecycle, s.placement, s.current_local_artifact_id, e.active, e.state
+                   FROM sandboxes s
+                   JOIN sandbox_k8s_executions e
+                     ON e.sandbox_id = s.id AND e.generation = $2
+                  WHERE s.id = $1"
+            ))
+            .bind(sandbox_id)
+            .bind(generation.get())
+            .fetch_one(&fixture.pool)
+            .await?;
+            assert_eq!(
+                (
+                    lifecycle.as_str(),
+                    placement.as_str(),
+                    marker,
+                    execution_active,
+                    execution_state.as_str()
+                ),
+                (
+                    "suspended",
+                    "unplaced",
+                    Some(artifact.id.as_uuid()),
+                    false,
+                    "suspended"
+                ),
                 "{case}"
             );
         }
