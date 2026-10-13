@@ -7,6 +7,9 @@
 //! derived from `SandboxState::can_transition_to`: `update_state` deliberately
 //! has no expected-state predicate, so the grids record which writes it applies
 //! today, including edges the state machine forbids.
+//!
+//! The same grids and row diffs drive `update_state_from` with every state
+//! expected, which must answer every cell exactly as `update_state` does.
 
 use pplx_space_common_core::types::{
     SandboxCleanupEpisodeId, SandboxId, SandboxQuarantineReasonCode,
@@ -20,14 +23,15 @@ use super::state_write_fixtures::{
 };
 use crate::db::{
     CleanupCompletion, CleanupEpisodeRequestOutcome, CleanupEpisodeSpec, SandboxStateWriteOutcome,
-    begin_teardown_suspend, insert_cleanup_episode, mark_suspending_quarantined,
-    request_cleanup_episode, set_cleanup_intent, test_conn, update_state,
+    StateSet, StateWriteOutcome, StateWriteRefusal, begin_teardown_suspend, insert_cleanup_episode,
+    mark_suspending_quarantined, request_cleanup_episode, set_cleanup_intent, test_conn,
+    update_state, update_state_from_states,
 };
 use crate::state::SandboxState;
 
 /// The grids' row and column order. Wildcard-free, so a new lifecycle state
 /// does not compile until every grid has a row and a column for it.
-const fn index(state: SandboxState) -> usize {
+pub(super) const fn index(state: SandboxState) -> usize {
     match state {
         SandboxState::Creating => 0,
         SandboxState::Created => 1,
@@ -52,10 +56,10 @@ const fn index(state: SandboxState) -> usize {
 
 /// `A` applied, `Q` blocked by quarantine, `S` superseded by cleanup
 /// ownership, `X` rejected before reading the row (`InvalidQuery`).
-type Grid = [&'static str; 18];
+pub(super) type Grid = [&'static str; 18];
 
 /// No cleanup intent and no cleanup episode.
-const PLAIN: Grid = [
+pub(super) const PLAIN: Grid = [
     // to:         cre crd stg std stp spd del pau psd res chk ssg ssd rst crq crf qua fai
     /* creating */
     "A   A   A   A   A   A   A   A   A   A   A   A   A   A   A   A   X   X",
@@ -139,7 +143,7 @@ const QUARANTINE_EPISODE: &str =
 const MISSING: &str = "M   M   M   M   M   M   M   M   M   M   M   M   M   M   M   M   X   X";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Expected {
+pub(super) enum Expected {
     Applied,
     Quarantine,
     Superseded,
@@ -147,7 +151,7 @@ enum Expected {
     Rejected,
 }
 
-fn cell(row: &str, to: SandboxState) -> Expected {
+pub(super) fn cell(row: &str, to: SandboxState) -> Expected {
     let cells: Vec<&str> = row.split_whitespace().collect();
     assert_eq!(cells.len(), 18, "grid row {row:?}");
     match cells[index(to)] {
@@ -161,7 +165,7 @@ fn cell(row: &str, to: SandboxState) -> Expected {
 }
 
 #[derive(Clone, Copy, Debug)]
-enum Shape {
+pub(super) enum Shape {
     Plain,
     DeleteRowIntent,
     ArmedCreateEpisode,
@@ -239,7 +243,7 @@ impl Shape {
 
 /// Which transition receipt a seeded row carries relative to the target.
 #[derive(Clone, Copy, Debug)]
-enum Receipt {
+pub(super) enum Receipt {
     /// A receipt for `to` itself when the table admits one, which an applied
     /// write keeps; otherwise a `started` receipt, which it clears.
     ForTarget,
@@ -249,9 +253,9 @@ enum Receipt {
 }
 
 impl Receipt {
-    const ALL: [Self; 2] = [Self::ForTarget, Self::ForAnotherState];
+    pub(super) const ALL: [Self; 2] = [Self::ForTarget, Self::ForAnotherState];
 
-    fn target(self, to: SandboxState) -> SandboxState {
+    pub(super) fn target(self, to: SandboxState) -> SandboxState {
         let receipt_capable = match to {
             SandboxState::Created
             | SandboxState::Started
@@ -286,7 +290,12 @@ impl Receipt {
 /// a deletion fails), a failure reason, a transition receipt for `receipt`, a
 /// remote restore's columns when `from` is `restoring`, and backdated
 /// timestamps.
-fn seed(conn: &Connection, shape: Shape, from: SandboxState, receipt: SandboxState) -> String {
+pub(super) fn seed(
+    conn: &Connection,
+    shape: Shape,
+    from: SandboxState,
+    receipt: SandboxState,
+) -> String {
     let id = insert_row(conn, SandboxState::Paused);
     begin_teardown_suspend(conn, &id, generation(7)).unwrap();
     shape.install(conn, &id);
@@ -297,9 +306,10 @@ fn seed(conn: &Connection, shape: Shape, from: SandboxState, receipt: SandboxSta
     id
 }
 
-/// The row diff an applied `update_state(to)` makes to a [`seed`] row whose
-/// receipt targets `receipt`.
-fn applied_diff(
+/// The row diff an applied generic write of `to` makes to a [`seed`] row whose
+/// receipt targets `receipt`. The teardown job's failure is the deletion side
+/// effect; every other change is to the sandbox row.
+pub(super) fn applied_diff(
     id: &str,
     from: SandboxState,
     to: SandboxState,
@@ -319,47 +329,118 @@ fn applied_diff(
     if receipt != to {
         cells.extend(receipt_cleared(receipt));
     }
-    ExpectedDiff::new().sandbox(id, cells)
+    let diff = ExpectedDiff::new().sandbox(id, cells);
+    if to != SandboxState::Deleting {
+        return diff;
+    }
+    diff.updated(
+        "jobs",
+        ("subject_id", id),
+        [
+            ("status", text("failed")),
+            ("error_kind", text("permanent")),
+            ("error", text("sandbox is deleting")),
+            ("completed_at", Cell::Fresh),
+        ],
+    )
 }
 
-fn assert_outcome(
-    case: &str,
-    result: rusqlite::Result<SandboxStateWriteOutcome>,
-    expected: Expected,
-) {
-    match (expected, result) {
-        (Expected::Applied, Ok(SandboxStateWriteOutcome::Applied))
-        | (Expected::Quarantine, Ok(SandboxStateWriteOutcome::BlockedByQuarantine))
-        | (Expected::Superseded, Ok(SandboxStateWriteOutcome::SupersededByCleanupEpisode))
-        | (Expected::Missing, Ok(SandboxStateWriteOutcome::Missing))
-        | (Expected::Rejected, Err(rusqlite::Error::InvalidQuery)) => {}
-        (expected, result) => panic!("{case}: expected {expected:?}, got {result:?}"),
+/// A generic writer the grids characterize.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum Writer {
+    UpdateState,
+    /// `update_state_from` with every state expected, standalone or inside a
+    /// caller's transaction.
+    UpdateStateFromAll {
+        in_transaction: bool,
+    },
+}
+
+impl Writer {
+    /// Write `to` and name the outcome in the grids' terms. `seeded` is the
+    /// row's state, which `update_state_from` must report as found or as the
+    /// applied write's origin.
+    fn write(
+        self,
+        case: &str,
+        conn: &Connection,
+        id: &str,
+        seeded: Option<SandboxState>,
+        to: SandboxState,
+    ) -> Expected {
+        match self {
+            Self::UpdateState => match update_state(conn, id, to) {
+                Ok(SandboxStateWriteOutcome::Applied) => Expected::Applied,
+                Ok(SandboxStateWriteOutcome::BlockedByQuarantine) => Expected::Quarantine,
+                Ok(SandboxStateWriteOutcome::SupersededByCleanupEpisode) => Expected::Superseded,
+                Ok(SandboxStateWriteOutcome::Missing) => Expected::Missing,
+                Err(rusqlite::Error::InvalidQuery) => Expected::Rejected,
+                Err(error) => panic!("{case}: {error}"),
+            },
+            Self::UpdateStateFromAll { in_transaction } => {
+                match write_from(conn, id, StateSet::ALL, to, in_transaction) {
+                    Ok(StateWriteOutcome::Applied { from }) if Some(from) == seeded => {
+                        Expected::Applied
+                    }
+                    Ok(StateWriteOutcome::Refused {
+                        found,
+                        refusal: StateWriteRefusal::Quarantined,
+                    }) if Some(found) == seeded => Expected::Quarantine,
+                    Ok(StateWriteOutcome::Refused {
+                        found,
+                        refusal: StateWriteRefusal::CleanupOwned,
+                    }) if Some(found) == seeded => Expected::Superseded,
+                    Ok(StateWriteOutcome::Missing) if seeded.is_none() => Expected::Missing,
+                    Err(rusqlite::Error::InvalidQuery) => Expected::Rejected,
+                    other => panic!("{case}: seeded {seeded:?}, got {other:?}"),
+                }
+            }
+        }
     }
+}
+
+/// `update_state_from` over `from`, standalone or inside a caller's
+/// transaction that commits afterwards.
+pub(super) fn write_from(
+    conn: &Connection,
+    id: &str,
+    from: StateSet,
+    to: SandboxState,
+    in_transaction: bool,
+) -> rusqlite::Result<StateWriteOutcome> {
+    if !in_transaction {
+        return update_state_from_states(conn, id, from, to);
+    }
+    let tx = conn.unchecked_transaction()?;
+    let outcome = update_state_from_states(&tx, id, from, to)?;
+    tx.commit()?;
+    Ok(outcome)
 }
 
 /// Run one write and assert both its outcome and its row diff: an applied
 /// write changes exactly `applied`, any other outcome changes nothing.
 fn check(
+    writer: Writer,
     case: &str,
     conn: &Connection,
     id: &str,
-    to: SandboxState,
+    (seeded, to): (Option<SandboxState>, SandboxState),
     expected: Expected,
     applied: ExpectedDiff,
 ) {
+    let case = format!("{writer:?}, {case}");
     let before: Snapshot = snapshot(conn);
     let start = test_start();
-    let result = update_state(conn, id, to);
-    assert_outcome(case, result, expected);
+    let outcome = writer.write(&case, conn, id, seeded, to);
+    assert_eq!(outcome, expected, "{case}");
     if expected == Expected::Applied {
-        assert_diff(case, &before, &snapshot(conn), start, &applied);
+        assert_diff(&case, &before, &snapshot(conn), start, &applied);
     } else {
-        assert_unchanged(case, &before, conn);
+        assert_unchanged(&case, &before, conn);
     }
 }
 
-#[test]
-fn generic_state_write_outcomes_cover_every_lifecycle_pair_and_cleanup_shape() {
+pub(super) fn sweep_lifecycle_pairs_and_cleanup_shapes(writer: Writer) {
     for (shape, receipt_kind) in Shape::ALL
         .into_iter()
         .flat_map(|shape| Receipt::ALL.map(|receipt| (shape, receipt)))
@@ -371,30 +452,22 @@ fn generic_state_write_outcomes_cover_every_lifecycle_pair_and_cleanup_shape() {
                 let conn = test_conn();
                 let id = seed(&conn, shape, from, receipt);
                 let expected = cell(shape.grid()[index(from)], to);
-                // The teardown job's failure is `update_state`'s deletion side
-                // effect; every other change is to the sandbox row.
-                let job_failure = expected == Expected::Applied && to == SandboxState::Deleting;
-                let mut applied = applied_diff(&id, from, to, receipt);
-                if job_failure {
-                    applied = applied.updated(
-                        "jobs",
-                        ("subject_id", &id),
-                        [
-                            ("status", text("failed")),
-                            ("error_kind", text("permanent")),
-                            ("error", text("sandbox is deleting")),
-                            ("completed_at", Cell::Fresh),
-                        ],
-                    );
-                }
-                check(&case, &conn, &id, to, expected, applied);
+                let applied = applied_diff(&id, from, to, receipt);
+                check(
+                    writer,
+                    &case,
+                    &conn,
+                    &id,
+                    (Some(from), to),
+                    expected,
+                    applied,
+                );
             }
         }
     }
 }
 
-#[test]
-fn generic_state_write_outcomes_over_a_quarantine_episode_and_a_missing_row() {
+pub(super) fn sweep_quarantine_episode_and_missing_row(writer: Writer) {
     for to in SandboxState::all() {
         let case = format!("quarantine episode: quarantined -> {to}");
         let conn = test_conn();
@@ -413,20 +486,39 @@ fn generic_state_write_outcomes_over_a_quarantine_episode_and_a_missing_row() {
                 ("failure_reason", NULL),
             ],
         );
-        check(&case, &conn, &id, to, cell(QUARANTINE_EPISODE, to), applied);
+        check(
+            writer,
+            &case,
+            &conn,
+            &id,
+            (Some(SandboxState::Quarantined), to),
+            cell(QUARANTINE_EPISODE, to),
+            applied,
+        );
 
         let case = format!("missing row -> {to}");
         let conn = test_conn();
         let id = SandboxId::new().to_string();
         check(
+            writer,
             &case,
             &conn,
             &id,
-            to,
+            (None, to),
             cell(MISSING, to),
             ExpectedDiff::new(),
         );
     }
+}
+
+#[test]
+fn generic_state_write_outcomes_cover_every_lifecycle_pair_and_cleanup_shape() {
+    sweep_lifecycle_pairs_and_cleanup_shapes(Writer::UpdateState);
+}
+
+#[test]
+fn generic_state_write_outcomes_over_a_quarantine_episode_and_a_missing_row() {
+    sweep_quarantine_episode_and_missing_row(Writer::UpdateState);
 }
 
 #[test]

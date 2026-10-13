@@ -78,7 +78,7 @@
 "crates/libs/sbx/mgr/server/src/db/cleanup_episodes.rs" = 1833
 "crates/libs/sbx/mgr/server/src/db/quarantine_recovery.rs" = 1042
 "crates/libs/sbx/mgr/server/src/db/sandboxes.rs" = 1553
-"crates/libs/sbx/mgr/server/src/db/state_transitions.rs" = 1156
+"crates/libs/sbx/mgr/server/src/db/state_transitions.rs" = 1140
 "crates/libs/sbx/mgr/server/src/run.rs" = 1101
 "crates/libs/sbx/mgr/server/src/sandbox_eviction.rs" = 1273
 "crates/libs/sbx/mgr/server/src/service/activation_support.rs" = 1592

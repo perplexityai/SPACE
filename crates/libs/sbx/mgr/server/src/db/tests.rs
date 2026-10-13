@@ -10025,5 +10025,7 @@ mod accepted_shapes_single_statement;
 mod cleanup_quarantine_refusal;
 mod local_network_policy_clear;
 pub(crate) mod state_write_fixtures;
+mod state_write_table;
 mod thin_writer_coverage;
+mod update_state_from;
 mod update_state_matrix;

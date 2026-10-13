@@ -110,47 +110,25 @@ pub fn update_state(
     let previous_state_value = previous_state
         .as_deref()
         .and_then(|state| state.parse::<SandboxState>().ok());
-    if generic_writer_transition_blocked(previous_state_value, state) {
-        tracing::warn!(
-            sandbox_id = %id,
-            target_state = %state,
-            "ignored generic sandbox state update because sandbox is quarantined"
-        );
-        return Ok(SandboxStateWriteOutcome::BlockedByQuarantine);
-    }
-    if cleanup_episode(conn, id)?
-        .is_some_and(|episode| !episode.completion.deletes_row() || episode.requested_at.is_some())
-        || (matches!(
-            previous_state_value,
-            Some(
-                SandboxState::Deleting
-                    | SandboxState::CleanupRequired
-                    | SandboxState::CleanupFailed
-            )
-        ) && state != SandboxState::Deleting
-            && cleanup_intent_current(conn, id, CleanupCompletion::DeleteRow)?)
-        || (matches!(
-            previous_state_value,
-            Some(
-                SandboxState::Stopping
-                    | SandboxState::CleanupRequired
-                    | SandboxState::CleanupFailed
-            )
-        ) && matches!(
-            state,
-            SandboxState::Started
-                | SandboxState::Paused
-                | SandboxState::Pausing
-                | SandboxState::Resuming
-                | SandboxState::Checkpointing
-        ))
-    {
-        tracing::warn!(
-            sandbox_id = %id,
-            target_state = %state,
-            "ignored generic sandbox state update because cleanup owns the transition"
-        );
-        return Ok(SandboxStateWriteOutcome::SupersededByCleanupEpisode);
+    match generic_state_write_refusal(conn, id, previous_state_value, state)? {
+        Some(StateWriteRefusal::Quarantined) => {
+            tracing::warn!(
+                sandbox_id = %id,
+                target_state = %state,
+                "ignored generic sandbox state update because sandbox is quarantined"
+            );
+            return Ok(SandboxStateWriteOutcome::BlockedByQuarantine);
+        }
+        // The generic guards never answer `FromState`.
+        Some(StateWriteRefusal::CleanupOwned | StateWriteRefusal::FromState) => {
+            tracing::warn!(
+                sandbox_id = %id,
+                target_state = %state,
+                "ignored generic sandbox state update because cleanup owns the transition"
+            );
+            return Ok(SandboxStateWriteOutcome::SupersededByCleanupEpisode);
+        }
+        None => {}
     }
 
     let changed = conn.execute(

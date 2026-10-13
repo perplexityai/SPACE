@@ -2,10 +2,15 @@
 
 ## Changes
 
-- Write `sandboxes.state` only through `src/db` writers. A new transition uses
-  or adds a compare-and-set writer in `src/db`; no generic writer compares
-  against the caller's observed state. A refused write must leave every row
-  unchanged.
+- Write `sandboxes.state` only through `src/db` writers. A new transition
+  calls `update_state_from` with its edge, or adds a specialized
+  compare-and-set writer in `src/db`. Do not add `update_state` callers: it
+  overwrites any state its cleanup and quarantine guards admit. Record the
+  edge in `src/db/state_write.rs`, and add any new disagreement with
+  `can_transition_to`, with a reason, to `ALLOWLIST` in
+  `src/db/tests/state_write_table.rs`. Nothing checks the table against the
+  writers; the `&'static Edge` argument does that at call sites. A refused
+  write must leave every row unchanged.
 - Foreign keys are off: register a new sandbox child table in
   `delete_sandbox_child_rows` (`src/db.rs`).
 - `src/service/adapter.rs` implements the gRPC trait; most handler bodies live
