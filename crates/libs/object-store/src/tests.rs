@@ -758,6 +758,119 @@ fn ranged_stand_in(
     })
 }
 
+#[tokio::test]
+async fn cancelled_download_keeps_its_chunk_charged_until_the_writer_exits() {
+    use crate::test_support::{Recorder, credentials, serve, store, target};
+    use std::io::Write;
+
+    struct Admission;
+    #[async_trait]
+    impl DecodeAdmission for Admission {
+        async fn admit(&self, _: u64) -> Result<Option<DecodeGuard>, DecodeAdmissionError> {
+            Ok(None)
+        }
+    }
+
+    struct BlockingSink {
+        file: std::fs::File,
+        entered: Option<tokio::sync::oneshot::Sender<()>>,
+        release: std::sync::mpsc::Receiver<()>,
+        exited: Option<tokio::sync::oneshot::Sender<()>>,
+    }
+    impl Write for BlockingSink {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if let Some(entered) = self.entered.take() {
+                let _ = entered.send(());
+                self.release
+                    .recv_timeout(Duration::from_secs(5))
+                    .map_err(std::io::Error::other)?;
+            }
+            self.file.write(bytes)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.file.flush()
+        }
+    }
+    impl FinishingWrite for BlockingSink {
+        fn finish(mut self: Box<Self>) -> std::io::Result<bool> {
+            self.flush()?;
+            Ok(false)
+        }
+    }
+    impl Drop for BlockingSink {
+        fn drop(&mut self) {
+            if let Some(exited) = self.exited.take() {
+                let _ = exited.send(());
+            }
+        }
+    }
+
+    const CHUNK: usize = 256 * 1024;
+    let endpoint = serve(ranged_stand_in(
+        Bytes::from(vec![42; 2 * CHUNK]),
+        String::new(),
+        BodyFault::Truncate,
+        0,
+        Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+    ))
+    .await;
+    let mut store = store(
+        S3Timeouts::resolve(|_| None),
+        Duration::from_secs(1),
+        &Arc::new(Recorder::default()),
+    );
+    store.download_chunk_size = CHUNK;
+    let budget = Arc::new(Semaphore::new(1));
+    store.download_reader_concurrency = 2;
+    store.download_buffer_permits = budget.clone();
+    let directory = tempfile::tempdir().unwrap();
+    let destination = directory.path().join("download");
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let (exited_tx, exited_rx) = tokio::sync::oneshot::channel();
+    let channels = std::sync::Mutex::new(Some((entered_tx, release_rx, exited_tx)));
+    let download = tokio::spawn(async move {
+        let wrap = move |file| -> Box<dyn FinishingWrite> {
+            let (entered, release, exited) = channels.lock().unwrap().take().unwrap();
+            Box::new(BlockingSink {
+                file,
+                entered: Some(entered),
+                release,
+                exited: Some(exited),
+            })
+        };
+        store
+            .get_file_streamed(
+                &credentials(),
+                target(&endpoint),
+                &destination,
+                StreamDecode {
+                    admission: &Admission,
+                    wrap_writer: &wrap,
+                },
+            )
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), entered_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    download.abort();
+    assert!(matches!(download.await, Err(error) if error.is_cancelled()));
+    let released_early = budget.available_permits() != 0;
+    release_tx.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), exited_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        !released_early,
+        "detached writer still owns the buffered input bytes"
+    );
+    assert_eq!(budget.available_permits(), 1);
+    assert!(!directory.path().join("download").exists());
+}
+
 struct RangedDownload {
     result: Result<u64, ObjectStoreError>,
     expected: Bytes,

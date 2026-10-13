@@ -1553,6 +1553,10 @@ impl S3ObjectStore {
             while let Some((chunk, permit)) = window.pop_ready() {
                 let write_started_at = Instant::now();
                 writer = tokio::task::spawn_blocking(move || {
+                    // Cancellation cannot release budget while this detached
+                    // worker still owns input. Drop bytes before their charge.
+                    let _permit = permit;
+                    let chunk = chunk;
                     writer.write_chunk(&chunk)?;
                     Ok::<_, std::io::Error>(writer)
                 })
@@ -1561,10 +1565,6 @@ impl S3ObjectStore {
                 sequential_writer_ms = sequential_writer_ms.saturating_add(
                     u64::try_from(write_started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
                 );
-                // The chunk's bytes are on disk (or in page cache in the
-                // buffered fallback); return its share of the process-wide
-                // buffer budget.
-                drop(permit);
             }
         }
 
