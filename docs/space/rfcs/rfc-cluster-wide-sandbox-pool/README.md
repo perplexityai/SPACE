@@ -1,20 +1,14 @@
-# RFC: Cluster-wide sandbox pool
+# RFC: Cluster Wide Sandbox Pool
 
-Date: May 1, 2026
+date: May 1, 2026
 
-Author: Nick Dujay
+author: @Nick Dujay
 
-Status: implemented and extended. This is the original design record. For how
-to configure and use warm pools today, see
-[Warm pools](../../warm-pools.md). Later work added rolling
-warm-pool policies, admission-time claims for native creates, encryption-aware
-pools and additional slot states. The config table also gained
-`managed_by`, `encryptable`, disk and disk-I/O columns; the metric names below were also replaced by
-the `warm_pool.*` metrics in that guide.
+status: ready for review
 
 ## Problem
 
-SPACE Kubernetes sandbox create still pays too much setup cost on the request path: pod creation, scheduling, CNI/IP propagation, shim startup, node-local VM work, and proxy readiness. Traced creates took seconds, well above the sub-second create latency that hosted sandbox services offer.
+SPACE Kubernetes sandbox create still pays too much setup cost on the request path: pod creation, scheduling, CNI/IP propagation, shim startup, node-local VM work, and proxy readiness. Recent SPACE traces are around seconds.
 
 This RFC proposes a small MVP to prove one hypothesis: **if a pod and paused warm VM already exist before demand, API create can become a fast claim instead of a full Kubernetes startup path.**
 
@@ -113,30 +107,11 @@ A slot is `ready` only when:
 
 ## Data Model
 
-Two tables. `kubernetes_pool_configs` holds the admin-editable config rows
-described in [MVP Scope](#mvp-scope); `kubernetes_pool_slots` holds pool
-inventory for each config.
-
-```
-kubernetes_pool_configs
-- id UUID PRIMARY KEY
-- template_release_id UUID NOT NULL REFERENCES template_releases(id)
-- vcpu INT NOT NULL
-- memory_mib INT NOT NULL
-- target_ready_slots INT NOT NULL
-- refill_per_tick INT NOT NULL
-- max_warming_slots INT NOT NULL
-- namespace TEXT NOT NULL
-- enabled BOOLEAN NOT NULL DEFAULT false
-- created_at TIMESTAMPTZ NOT NULL
-- updated_at TIMESTAMPTZ NOT NULL
-```
+One table:
 
 ```
 kubernetes_pool_slots
 - id UUID PRIMARY KEY
-- config_id UUID NOT NULL REFERENCES kubernetes_pool_configs(id)
-- template_release_id UUID NOT NULL
 - reserved_sandbox_id UUID NOT NULL UNIQUE
 - template_name TEXT NOT NULL
 - content_hash TEXT NOT NULL
@@ -326,4 +301,4 @@ If the MVP proves the latency hypothesis, then revisit:
 
 ## Recommendation
 
-Build the MVP as a controlled experiment. Do not build the full cluster-wide pool platform until the MVP proves that ready paused pods move create latency close enough to that sub-second target to justify the added operational surface.
+Build the MVP as a controlled experiment. Do not build the full cluster-wide pool platform until the MVP proves that ready paused pods move create latency close enough to a sub-second baseline to justify the added operational surface.
