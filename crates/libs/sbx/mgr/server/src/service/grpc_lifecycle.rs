@@ -17,7 +17,8 @@ use super::recovery::SuspendSnapshotPublicationRecoveryOrigin;
 use super::suspend_snapshot_publication::{
     SuspendSnapshotPublicationDecision, canonical_suspend_snapshot_dir,
     classify_suspend_snapshot_publication, publish_suspend_snapshot_dir,
-    suspend_snapshot_staging_dir, suspend_snapshot_staging_parent_dir,
+    read_encrypted_capture_record, remove_encrypted_capture_record, suspend_snapshot_staging_dir,
+    suspend_snapshot_staging_parent_dir, write_encrypted_capture_record,
 };
 use super::tail_support::*;
 use super::validation::optional_positive_or_default;
@@ -51,7 +52,7 @@ use self::artifact_backup::{
 pub(super) use self::artifact_backup::{
     reupload_precondition_for_cluster_api_env, reupload_resolution_to_config,
 };
-use self::backup_submission::suspend_snapshot_metadata;
+use self::backup_submission::suspend_artifact_metadata;
 #[cfg(test)]
 use self::pause_resume::{PauseReconciliationOutcome, pause_reconciliation_outcome};
 use self::pause_resume::{pause_with_reconciliation, prepare_guest_for_pause};

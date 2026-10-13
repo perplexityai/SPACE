@@ -4,6 +4,23 @@
 
 use super::*;
 
+/// Sidecar metadata of the suspend capture `local_artifact_id`.
+pub(super) fn suspend_artifact_metadata(
+    sandbox: &crate::db::SandboxRow,
+    format: pplx_space_sbx_mgr_client::proto::SuspendSnapshotFormat,
+    local_artifact_id: LocalArtifactId,
+    encrypted: bool,
+    rootfs_send_source_id: Option<uuid::Uuid>,
+) -> Result<crate::snapshot_upload::SnapshotMeta, Status> {
+    let mut metadata = suspend_snapshot_metadata(sandbox, format)?;
+    metadata.local_artifact_id = Some(local_artifact_id);
+    metadata.artifact_kind = Some(ArtifactKind::Full);
+    metadata.artifact_origin = Some(ArtifactOrigin::Suspend);
+    metadata.encrypted = encrypted;
+    metadata.rootfs_send_source_id = rootfs_send_source_id;
+    Ok(metadata)
+}
+
 pub(super) fn suspend_snapshot_metadata(
     sandbox: &crate::db::SandboxRow,
     format: pplx_space_sbx_mgr_client::proto::SuspendSnapshotFormat,

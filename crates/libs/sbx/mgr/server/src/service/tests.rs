@@ -14641,6 +14641,128 @@ pub(crate) mod service_tests {
         assert!(!staging.exists());
     }
 
+    /// A finished encrypted capture whose volume did not seal: only its
+    /// record exists in staging.
+    fn record_unsealed_encrypted_capture(
+        sandbox_dir: &std::path::Path,
+    ) -> (LocalArtifactId, std::path::PathBuf) {
+        let capture = LocalArtifactId::new();
+        let staging = suspend_snapshot_staging_dir(sandbox_dir, capture);
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::write(
+            staging.join(crate::service::suspend_snapshot_publication::ENCRYPTED_CAPTURE_RECORD),
+            b"{}",
+        )
+        .unwrap();
+        (capture, staging)
+    }
+
+    #[tokio::test]
+    async fn unsealed_encrypted_capture_survives_restart_and_publishes_once_sealed() {
+        let conn = crate::db::test_conn();
+        let id = SandboxId::new().to_string();
+        insert_suspending_resuspend(&conn, &id);
+        let cache = tempfile::tempdir().unwrap();
+        let sandbox_dir = cache.path().join(&id);
+        let (capture, staging) = record_unsealed_encrypted_capture(&sandbox_dir);
+        let service = service_with_runtime_liveness(conn, false);
+
+        // The live seal failure keeps the capture for recovery.
+        let disposition = service.record_suspend_snapshot_publication_failure_after_staging(
+            &id,
+            &sandbox_dir,
+            &staging,
+            "seal/stage encrypted snapshot volume failed: device busy",
+            &Default::default(),
+        );
+        assert_eq!(disposition, SuspendSnapshotStagingDisposition::Preserve);
+        let row = service.lookup_sandbox(&id).unwrap();
+        assert_eq!(row.state, SandboxState::Suspending);
+        assert!(row.failure_reason.is_none());
+
+        // Neither a restart nor a periodic pass gives the capture up while
+        // its seal is pending.
+        let startup = service
+            .recover_prelaunch_startup_states_in(cache.path(), &Default::default())
+            .unwrap();
+        assert_eq!(
+            startup[0].outcome,
+            crate::db::StartupRecoveryOutcome::Deferred
+        );
+        service
+            .recover_deferred_suspend_publications_in(
+                cache.path(),
+                vec![service.lookup_sandbox(&id).unwrap()],
+                &CancellationToken::new(),
+                &Default::default(),
+            )
+            .unwrap();
+        let row = service.lookup_sandbox(&id).unwrap();
+        assert_eq!(row.state, SandboxState::Suspending);
+        assert_eq!(row.current_local_artifact_id, None);
+        assert!(staging.exists());
+
+        // A later seal stages the artifacts and sidecar. Even if the process
+        // dies before dropping the record, the plaintext recovery path then
+        // publishes that exact capture.
+        write_full_suspend_artifact(&staging, &id, capture, b"sealed-capture");
+        service
+            .recover_deferred_suspend_publications_in(
+                cache.path(),
+                vec![service.lookup_sandbox(&id).unwrap()],
+                &CancellationToken::new(),
+                &Default::default(),
+            )
+            .unwrap();
+        let row = service.lookup_sandbox(&id).unwrap();
+        assert_eq!(row.state, SandboxState::CleanupRequired);
+        assert_eq!(row.current_local_artifact_id, Some(capture));
+        assert_eq!(
+            row.cleanup_completion,
+            Some(CleanupCompletion::MarkSuspended)
+        );
+    }
+
+    #[tokio::test]
+    async fn unsealed_encrypted_capture_quarantines_as_an_only_copy_after_its_retry_window() {
+        let conn = crate::db::test_conn();
+        let id = SandboxId::new().to_string();
+        insert_suspending_resuspend(&conn, &id);
+        let cache = tempfile::tempdir().unwrap();
+        let sandbox_dir = cache.path().join(&id);
+        let (_, staging) = record_unsealed_encrypted_capture(&sandbox_dir);
+        std::fs::File::options()
+            .write(true)
+            .open(
+                staging
+                    .join(crate::service::suspend_snapshot_publication::ENCRYPTED_CAPTURE_RECORD),
+            )
+            .unwrap()
+            .set_modified(
+                std::time::SystemTime::now()
+                    - crate::service::suspend_snapshot_publication::ENCRYPTED_SEAL_RETRY_WINDOW
+                    - std::time::Duration::from_secs(60),
+            )
+            .unwrap();
+        let service = service_with_runtime_liveness(conn, false);
+
+        service
+            .recover_deferred_suspend_publications_in(
+                cache.path(),
+                vec![service.lookup_sandbox(&id).unwrap()],
+                &CancellationToken::new(),
+                &Default::default(),
+            )
+            .unwrap();
+        let row = service.lookup_sandbox(&id).unwrap();
+        assert_eq!(row.state, SandboxState::Quarantined);
+        assert_eq!(
+            row.failure_reason.as_deref(),
+            Some(crate::db::SUSPEND_PUBLISH_FAILED_NO_ARTIFACT_RUNTIME_GONE)
+        );
+        assert!(staging.exists(), "the unsealed capture must be retained");
+    }
+
     #[tokio::test]
     async fn periodic_suspend_recovery_follows_node_manager_for_a_deferred_capture() {
         use crate::retained_source::{FakeInspector, RetainedSourceCheck};
