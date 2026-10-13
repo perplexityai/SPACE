@@ -75,6 +75,7 @@ mod restore_transfer_scopes;
 mod sandboxes;
 mod startup_recovery;
 mod state_transitions;
+mod state_write;
 mod teardown_suspend;
 pub use auto_lifecycle::*;
 pub use cleanup_episodes::*;
@@ -88,6 +89,7 @@ pub use restore_transfer_scopes::*;
 pub use sandboxes::*;
 pub use startup_recovery::*;
 pub use state_transitions::*;
+pub use state_write::*;
 pub use teardown_suspend::*;
 
 // Most of the no-progress vocabulary is durable: its rendered form is persisted
