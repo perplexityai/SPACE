@@ -150,7 +150,14 @@ impl ClusterApiService {
         // Intersect grants, not node IDs: both migration peers may hold the release.
         let rows = self
             .template_releases_store
-            .find_by_hash(&release.template_name, &hash, bare_hash, caller_org, scope)
+            .find_by_hash(
+                &release.template_name,
+                &hash,
+                bare_hash,
+                caller_org,
+                scope,
+                false,
+            )
             .await
             .map_err(|error| Status::internal(format!("authorize delegated release: {error}")))?;
         if !rows

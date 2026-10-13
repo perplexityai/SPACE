@@ -936,7 +936,8 @@ async fn find_release(
 ) -> Result<ResolvedRelease, FindReleaseError> {
     let started = Instant::now();
     let generic_only = trigger.is_prefetch();
-    let result = find_release_with_requirement(name, req_hash, req_tag, None, generic_only, None).await;
+    let result =
+        find_release_with_requirement(name, req_hash, req_tag, None, generic_only, None).await;
     let result_label = match &result {
         Ok(_) => "ok",
         Err(FindReleaseError::NotFound) => "not_found",

@@ -753,19 +753,19 @@ async fn retained_instance_permission_recovery_and_repair_preserve_disk() {
 }
 
 #[rstest::rstest]
+#[case::missing(None)]
+#[case::wrong(Some(TemplateLookupScope::Cluster))]
+#[case::matching(Some(TemplateLookupScope::LocalExecution))]
 #[tokio::test]
 async fn template_resolver_requires_scope_acknowledgement(
-    #[values(false, true)] acknowledged: bool,
+    #[case] acknowledgement: Option<TemplateLookupScope>,
 ) {
     use crate::template_resolver::fake::FakeTemplateResolver;
     use pplx_space_template_mgr_client::proto::{GetTemplateResponse, TemplateRef};
 
     let directory = tempfile::tempdir().unwrap();
     let template_dir = directory.path().to_str().unwrap().to_owned();
-    let scope = TemplateLookupScope::Sandbox {
-        id: SandboxId::new(),
-        caller_node: None,
-    };
+    let scope = TemplateLookupScope::LocalExecution;
     let response_dir = template_dir.clone();
     let templates = FakeTemplateResolver::new(move || {
         let mut response = tonic::Response::new(GetTemplateResponse {
@@ -775,8 +775,8 @@ async fn template_resolver_requires_scope_acknowledgement(
             auto_lifecycle_authority: pplx_space_net_common::proto::PolicyAuthority::Local as i32,
             ..Default::default()
         });
-        if acknowledged {
-            scope.acknowledge(&mut response);
+        if let Some(acknowledgement) = acknowledgement {
+            acknowledgement.acknowledge(&mut response);
         }
         Ok(response)
     });
@@ -791,7 +791,7 @@ async fn template_resolver_requires_scope_acknowledgement(
     )
     .await;
 
-    if acknowledged {
+    if acknowledgement == Some(scope) {
         assert_eq!(result.unwrap().template_dir, template_dir);
     } else {
         let error = result.err().expect("unacknowledged scope must be rejected");

@@ -126,7 +126,10 @@ impl TemplateBuild {
     fn resolver(&self, build: &str) -> Arc<FakeTemplateResolver> {
         let response = self.response(build);
         Arc::new(FakeTemplateResolver::new(move || {
-            Ok(tonic::Response::new(response.clone()))
+            let mut response = tonic::Response::new(response.clone());
+            pplx_space_common_svc::template_lookup::TemplateLookupScope::LocalExecution
+                .acknowledge(&mut response);
+            Ok(response)
         }))
     }
 }

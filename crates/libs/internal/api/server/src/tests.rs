@@ -3686,6 +3686,7 @@ async fn placed_sandbox_unlocks_private_release_for_its_node_only() -> TestResul
     ] {
         let mut request = node_scoped_request(
             FindTemplateReleaseByHashRequest {
+                generic_only: false,
                 template_name: "private-base".into(),
                 hash: hash.clone(),
                 caller_org_id: asserted_org.map(|org| org.to_string()),
@@ -3731,6 +3732,7 @@ async fn placed_sandbox_unlocks_private_release_for_its_node_only() -> TestResul
     ] {
         let mut request = node_scoped_request(
             FindTemplateReleaseByHashRequest {
+                generic_only: false,
                 template_name: "private-base".into(),
                 hash: hash.clone(),
                 caller_org_id: None,
