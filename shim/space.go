@@ -287,6 +287,7 @@ type task struct {
 	id                  string
 	sandboxID           string // sbx-manager sandbox ID (only set for pod sandbox tasks)
 	executionGeneration int64  // canonical Kubernetes execution generation from the OCI annotation
+	traceparent         string // create's serialized trace context, which teardown spans link to
 	generationTeardown  bool   // final durable-teardown policy captured from the pod contract
 	sandboxDetached     bool   // teardown was released without mutating a newer execution
 	legacyStopIssued    bool   // this task initiated the stop preceding legacy deletion
@@ -459,6 +460,7 @@ func (s *spaceTaskService) Create(ctx context.Context, r *taskAPI.CreateTaskRequ
 		createSpanOpts...,
 	)
 	defer func() { span.End(retErr) }()
+	t.traceparent = spec.traceparent()
 
 	joinedCgroup, err := joinPodCgroup(r.Bundle)
 	if err != nil {
@@ -1235,12 +1237,13 @@ func (s *spaceTaskService) Delete(ctx context.Context, r *taskAPI.DeleteRequest)
 	}
 	needsTeardown := t.sandboxID != "" && !t.sandboxDetached
 	sandboxID := t.sandboxID
+	traceparent := t.traceparent
 	s.mu.Unlock()
 
 	// Only a sandbox task is traced: starting a span initializes the exporter,
 	// which a container-share shim does not need.
 	if sandboxID != "" {
-		span, spanCtx := startSpan(ctx, "shim.delete",
+		span, spanCtx := startLinkedSpan(ctx, "shim.delete", traceparent,
 			attribute.String("task_id", r.ID),
 			attribute.String("sandbox_id", sandboxID),
 			attribute.Bool("needs_teardown", needsTeardown),
@@ -1307,7 +1310,7 @@ func (s *spaceTaskService) State(ctx context.Context, r *taskAPI.StateRequest) (
 	}, nil
 }
 
-func (s *spaceTaskService) Kill(ctx context.Context, r *taskAPI.KillRequest) (*ptypes.Empty, error) {
+func (s *spaceTaskService) Kill(ctx context.Context, r *taskAPI.KillRequest) (_ *ptypes.Empty, retErr error) {
 	s.mu.Lock()
 	logShim("Kill: id=%s exec_id=%s signal=%d", r.ID, r.ExecID, r.Signal)
 
@@ -1329,7 +1332,22 @@ func (s *spaceTaskService) Kill(ctx context.Context, r *taskAPI.KillRequest) (*p
 		return &ptypes.Empty{}, nil
 	}
 	needsTeardown := t.sandboxID != "" && !t.sandboxDetached
+	sandboxID := t.sandboxID
+	traceparent := t.traceparent
 	s.mu.Unlock()
+
+	// Teardown starts here, so a refused or failed one shows as this span's
+	// error. Only a sandbox task is traced, as in Delete.
+	if sandboxID != "" {
+		span, spanCtx := startLinkedSpan(ctx, "shim.kill", traceparent,
+			attribute.String("task_id", r.ID),
+			attribute.String("sandbox_id", sandboxID),
+			attribute.Int64("signal", int64(r.Signal)),
+			attribute.Bool("needs_teardown", needsTeardown),
+		)
+		ctx = spanCtx
+		defer func() { span.End(retErr) }()
+	}
 
 	// A pod task may stop only after its exact execution has a remotely durable
 	// suspend or has been superseded. Any inconclusive outcome leaves the task

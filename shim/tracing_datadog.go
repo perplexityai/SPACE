@@ -51,6 +51,23 @@ func (datadogTracePipeline) start(ctx context.Context, name string, attrs ...att
 	return datadogSpan{span}, ctx
 }
 
+func (datadogTracePipeline) startLinked(ctx context.Context, name string, carrier propagation.MapCarrier, attrs ...attribute.KeyValue) (shimSpan, context.Context) {
+	opts := make([]tracer.StartSpanOption, 0, len(attrs)+1)
+	for _, attr := range attrs {
+		opts = append(opts, tracer.Tag(string(attr.Key), attr.Value.AsInterface()))
+	}
+	if linked, err := tracer.Extract(tracer.TextMapCarrier(carrier)); err == nil && linked != nil {
+		opts = append(opts, tracer.WithSpanLinks([]tracer.SpanLink{{
+			TraceID:     linked.TraceIDLower(),
+			TraceIDHigh: linked.TraceIDUpper(),
+			SpanID:      linked.SpanID(),
+		}}))
+	}
+	// No ChildOf: the span is a root of its own trace.
+	span := tracer.StartSpan(name, opts...)
+	return datadogSpan{span}, tracer.ContextWithSpan(ctx, span)
+}
+
 func (s datadogSpan) SetAttributes(attrs ...attribute.KeyValue) {
 	for _, attr := range attrs {
 		s.span.SetTag(string(attr.Key), attr.Value.AsInterface())

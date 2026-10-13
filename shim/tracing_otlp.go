@@ -64,6 +64,18 @@ func (p *otlpTracePipeline) start(ctx context.Context, name string, attrs ...att
 	))
 	return otlpSpan{span}, ctx
 }
+func (p *otlpTracePipeline) startLinked(ctx context.Context, name string, carrier propagation.MapCarrier, attrs ...attribute.KeyValue) (shimSpan, context.Context) {
+	opts := []trace.SpanStartOption{
+		trace.WithNewRoot(),
+		trace.WithAttributes(attrs...),
+		trace.WithAttributes(attribute.String("operation.name", name), attribute.String("resource.name", name)),
+	}
+	if linked := trace.SpanContextFromContext(tracePropagation.Extract(context.Background(), carrier)); linked.IsValid() {
+		opts = append(opts, trace.WithLinks(trace.Link{SpanContext: linked}))
+	}
+	ctx, span := p.tracer.Start(ctx, name, opts...)
+	return otlpSpan{span}, ctx
+}
 func (s otlpSpan) End(err error) {
 	if err != nil {
 		s.RecordError(err)
