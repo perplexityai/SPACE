@@ -388,11 +388,10 @@ are draining during a rollover.
 
 This design merges two RFCs:
 
-- [Cluster-wide sandbox pool](../rfcs/2026-05-01-cluster-wide-sandbox-pool.md)
-  proposed the single-config MVP: slot contract, claim path and controller
-  loop.
-- [Warm-pool release preparation](../rfcs/2026-05-27-warm-pool-release-preparation.md)
-  added rolling policies, release retention and detaching.
+- Cluster-wide sandbox pool (May 2026) proposed the single-config MVP: slot
+  contract, claim path and controller loop.
+- Warm-pool release preparation (May 2026) added rolling policies, release
+  retention and detaching.
 
 Since those RFCs, the slot lifecycle has gained `bound` and `cleanup_pending`,
 the controller runs under leader election, configs carry encryption and disk

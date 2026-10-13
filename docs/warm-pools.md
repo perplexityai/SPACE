@@ -184,7 +184,5 @@ Upgrade every `space-cluster-controller` replica before turning this on; see
   `get` and `--disabled`.
 - [Observability](observability.md): the `warm_pool.slots` and
   `warm_pool.create_path.duration_ms` metrics show pool size and hits.
-- [Cluster-wide sandbox pool RFC](space/rfcs/2026-05-01-cluster-wide-sandbox-pool.md):
-  the original design.
-- [Warm-pool release preparation RFC](space/rfcs/2026-05-27-warm-pool-release-preparation.md):
-  the design for rolling policies.
+- [Warm-pool design](space/design/warm-pools.md): how slots, claims, the
+  controller and rolling policies work.
