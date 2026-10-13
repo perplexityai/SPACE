@@ -124,6 +124,11 @@ jobs:
       # Pull requests only: archcheck writes its findings as rdjson, offline
       # from the clippy step's caches, even when clippy failed. Exit 1 means
       # required findings, which reviewdog decides on; anything else fails.
+      # no_new_entries compares with the baseline of the base: the first
+      # parent of the synthetic merge (fetch-depth 0 above), once
+      # resolve-migration-base.sh has checked the second is this pull
+      # request. If the base has no baseline, an empty one; if it can't be
+      # resolved, a warning and no comparison.
       - name: Check repository structure
         id: archcheck
         if: >-
@@ -133,15 +138,30 @@ jobs:
           CARGO_DIR: ${{ runner.temp }}/space-cargo
           SCCACHE_DIR: ${{ runner.temp }}/space-sccache
           SCCACHE_SIZE: ${{ matrix.rust_cache_size }}
+          PULL_REQUEST_HEAD: ${{ github.event.pull_request.head.sha }}
         run: |
           status=0
           docker run --rm --volume "${GITHUB_WORKSPACE}:/workspace" --workdir /workspace \
             --volume "${CARGO_DIR}/registry:/usr/local/cargo/registry" --volume "${CARGO_DIR}/git:/usr/local/cargo/git" \
             --volume "${SCCACHE_DIR}:/sccache" --env SCCACHE_DIR=/sccache --env SCCACHE_CACHE_SIZE="${SCCACHE_SIZE}" \
             --env SCCACHE_BASEDIRS=/workspace --env CARGO_INCREMENTAL=0 --env CARGO_NET_OFFLINE=true \
-            --env CARGO_TARGET_DIR=target/buildkite-lint "space-ci:${GITHUB_SHA}" bash -c '
+            --env CARGO_TARGET_DIR=target/buildkite-lint --env PULL_REQUEST_HEAD "space-ci:${GITHUB_SHA}" bash -c '
               sccache --start-server >/dev/null 2>&1 && export RUSTC_WRAPPER=sccache
-              mkdir -p target && exec cargo arch --format rdjson >target/archcheck.rdjson' || status=$?
+              mkdir -p target && git config --global --add safe.directory /workspace
+              base_file=target/archcheck-base-baseline.toml base_args=()
+              if base="$(bash ci/scripts/resolve-migration-base.sh "" "${PULL_REQUEST_HEAD}")"; then
+                if ! git cat-file -e "${base}:architecture-baseline.toml" 2>/dev/null; then
+                  echo "archcheck: ${base} has no architecture-baseline.toml; comparing with an empty one"
+                  : >"${base_file}" && base_args=(--base-baseline "${base_file}")
+                elif git show "${base}:architecture-baseline.toml" >"${base_file}"; then
+                  echo "archcheck: comparing with architecture-baseline.toml from ${base}"
+                  base_args=(--base-baseline "${base_file}")
+                fi
+              fi
+              if ((${#base_args[@]} == 0)); then
+                echo "::warning title=archcheck::Could not read the base baseline; file_size.no_new_entries is skipped."
+              fi
+              exec cargo arch --format rdjson "${base_args[@]}" >target/archcheck.rdjson' || status=$?
           if ((status > 1)); then echo "::error title=archcheck::cargo arch exited ${status}; see above."; exit 1; fi
 
       - name: Set up reviewdog
