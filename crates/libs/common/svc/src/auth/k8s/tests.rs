@@ -41,6 +41,53 @@ fn test_k8s_config() -> K8sTokenAuthConfig {
 }
 
 #[tokio::test]
+async fn token_review_node_binding_survives_cache_and_never_appears_for_incomplete_tokens() {
+    let fields = [
+        ("authentication.kubernetes.io/pod-name", "worker-daemon"),
+        ("authentication.kubernetes.io/pod-uid", "pod-a"),
+        ("authentication.kubernetes.io/node-name", "worker-a"),
+        ("authentication.kubernetes.io/node-uid", "node-a"),
+    ];
+    for missing in 0..=fields.len() {
+        let mut status = accepted_token_review_status("space-node-api");
+        status.user.as_mut().unwrap().extra = Some(
+            fields
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| *index != missing)
+                .map(|(_, (key, value))| (key.to_string(), vec![value.to_string()]))
+                .collect(),
+        );
+        let (reviewer, calls) = reviewer_returning_status(test_k8s_config(), status);
+        for _ in 0..2 {
+            let caller = reviewer
+                .authenticate(
+                    NodeRole::Worker,
+                    AuthSurface::Normal,
+                    "/space.node.api.v1.WorkerApi/GetSandboxState",
+                    &projected_token(),
+                )
+                .await
+                .unwrap();
+            if missing == fields.len() {
+                let identity = caller
+                    .kubernetes_pod()
+                    .expect("complete TokenReview binding");
+                assert_eq!(identity.namespace(), "space");
+                assert_eq!(identity.service_account(), "space-api");
+                assert_eq!(identity.pod_name().as_str(), "worker-daemon");
+                assert_eq!(identity.pod_uid().as_str(), "pod-a");
+                assert_eq!(identity.node_name().as_str(), "worker-a");
+                assert_eq!(identity.node_uid().as_str(), "node-a");
+            } else {
+                assert!(caller.kubernetes_pod().is_none());
+            }
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[tokio::test]
 async fn data_plane_identity_cannot_reuse_guest_authority_for_control_or_transfer() {
     for username in [
         "system:serviceaccount:space:space-data-plane",
@@ -172,6 +219,7 @@ fn cache_key(token: &str, audience: &str) -> TokenCacheKey {
 fn accepted_cache_entry(username: &str, expires_at: Instant) -> CachedTokenReview {
     CachedTokenReview {
         result: CachedTokenReviewResult::Accepted {
+            pod: None,
             username: username.to_string(),
         },
         expires_at,
@@ -575,6 +623,7 @@ fn cache_token_review_result_evicts_earliest_expiring_entry_at_capacity() {
         &mut cache,
         inserted.clone(),
         CachedTokenReviewResult::Accepted {
+            pod: None,
             username: "third-sa".to_string(),
         },
         now + Duration::from_secs(20),
@@ -993,6 +1042,7 @@ async fn concurrent_cache_inserts_at_capacity_do_not_panic() {
             reviewer.cache_result(
                 cache_key(&format!("token-{index}"), "space-node-api"),
                 CachedTokenReviewResult::Accepted {
+                    pod: None,
                     username: format!("system:serviceaccount:space:space-api-{index}"),
                 },
                 Instant::now() + Duration::from_secs(30),
@@ -1015,7 +1065,7 @@ fn validate_token_review_status_accepts_confirmed_audience() {
     )
     .unwrap();
 
-    assert_eq!(username, "system:serviceaccount:space:space-api");
+    assert_eq!(username.username, "system:serviceaccount:space:space-api");
 }
 
 #[test]

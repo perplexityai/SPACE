@@ -12,6 +12,8 @@ use tower::{Layer, Service};
 use crate::space_api_route::SPACE_API_BRIDGE_CALLER_POLICY_METADATA_KEY;
 
 pub mod build;
+mod node_identity;
+pub use node_identity::{NodeIdentityVerification, verify_node_bound_caller};
 
 #[cfg(all(feature = "k8s", any(test, feature = "test-support")))]
 pub mod test_support;
@@ -285,10 +287,45 @@ struct NodeApiAuthenticator {
 /// without re-parsing or trusting caller-controlled metadata.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NodeApiAuthenticatedCaller {
+    kubernetes_pod: Option<KubernetesPodIdentity>,
     wait_ready_lifecycle_authority: WaitReadyLifecycleAuthority,
     network_policy_authority: NetworkPolicyMutationAuthority,
     data_plane_session_refresh_authority: DataPlaneSessionRefreshAuthority,
     template_release_read_authority: TemplateReleaseReadAuthority,
+}
+
+/// Pod and node binding returned by an audience-checked Kubernetes TokenReview.
+/// This records token provenance; consumers still validate current pod, node,
+/// peer address, and operation ownership before granting node-scoped writes.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KubernetesPodIdentity {
+    namespace: String,
+    service_account: String,
+    pod_name: pplx_space_common_core::types::PodName,
+    pod_uid: pplx_space_common_core::types::PodUid,
+    node_name: pplx_space_common_core::types::K8sNodeName,
+    node_uid: pplx_space_common_core::types::K8sNodeUid,
+}
+
+impl KubernetesPodIdentity {
+    pub fn namespace(&self) -> &str {
+        &self.namespace
+    }
+    pub fn service_account(&self) -> &str {
+        &self.service_account
+    }
+    pub fn pod_name(&self) -> &pplx_space_common_core::types::PodName {
+        &self.pod_name
+    }
+    pub fn pod_uid(&self) -> &pplx_space_common_core::types::PodUid {
+        &self.pod_uid
+    }
+    pub fn node_name(&self) -> &pplx_space_common_core::types::K8sNodeName {
+        &self.node_name
+    }
+    pub fn node_uid(&self) -> &pplx_space_common_core::types::K8sNodeUid {
+        &self.node_uid
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -356,6 +393,10 @@ enum KubernetesAuthenticationMode {
 }
 
 impl NodeApiAuthenticatedCaller {
+    pub fn kubernetes_pod(&self) -> Option<&KubernetesPodIdentity> {
+        self.kubernetes_pod.as_ref()
+    }
+
     const fn static_token(mode: KubernetesAuthenticationMode) -> Self {
         // In a static-only deployment (no Kubernetes auth) the shared internal
         // token is the trust boundary, so it retains full authority. Once
@@ -385,6 +426,7 @@ impl NodeApiAuthenticatedCaller {
             ),
         };
         Self {
+            kubernetes_pod: None,
             wait_ready_lifecycle_authority,
             network_policy_authority,
             data_plane_session_refresh_authority,
@@ -399,6 +441,7 @@ impl NodeApiAuthenticatedCaller {
         data_plane_session_refresh_authority: DataPlaneSessionRefreshAuthority,
     ) -> Self {
         Self {
+            kubernetes_pod: None,
             wait_ready_lifecycle_authority,
             network_policy_authority,
             data_plane_session_refresh_authority,
@@ -411,6 +454,7 @@ impl NodeApiAuthenticatedCaller {
     #[cfg(any(test, feature = "test-support"))]
     pub const fn data_plane_edge_for_test() -> Self {
         Self {
+            kubernetes_pod: None,
             wait_ready_lifecycle_authority: WaitReadyLifecycleAuthority::Denied,
             network_policy_authority: NetworkPolicyMutationAuthority::Denied,
             data_plane_session_refresh_authority: DataPlaneSessionRefreshAuthority::Granted,
@@ -422,6 +466,7 @@ impl NodeApiAuthenticatedCaller {
     #[cfg(any(test, feature = "test-support"))]
     pub const fn unprivileged_workload_for_test() -> Self {
         Self {
+            kubernetes_pod: None,
             wait_ready_lifecycle_authority: WaitReadyLifecycleAuthority::Denied,
             network_policy_authority: NetworkPolicyMutationAuthority::Denied,
             data_plane_session_refresh_authority: DataPlaneSessionRefreshAuthority::Denied,

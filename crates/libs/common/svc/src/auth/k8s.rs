@@ -256,8 +256,8 @@ impl K8sTokenReviewer {
                 }
             }
         };
-        let username = match self.review_token(token, policy.audience).await {
-            Ok(username) => username,
+        let reviewed = match self.review_token(token, policy.audience).await {
+            Ok(reviewed) => reviewed,
             Err(TokenReviewFailure::Rejected { reason }) => {
                 self.cache_result(
                     key.clone(),
@@ -295,13 +295,16 @@ impl K8sTokenReviewer {
             self.cache_result(
                 key.clone(),
                 CachedTokenReviewResult::Accepted {
-                    username: username.clone(),
+                    username: reviewed.username.clone(),
+                    pod: reviewed.pod.clone(),
                 },
                 expires_at,
             );
         }
-        self.authorize_username(&policy, surface, method, &username, true)?;
-        Ok(policy.authenticated_caller(&username))
+        self.authorize_username(&policy, surface, method, &reviewed.username, true)?;
+        let mut caller = policy.authenticated_caller(&reviewed.username);
+        caller.kubernetes_pod = reviewed.pod;
+        Ok(caller)
     }
 
     fn cached_result(&self, key: &TokenCacheKey) -> Option<CachedTokenReviewResult> {
@@ -326,10 +329,14 @@ impl K8sTokenReviewer {
         cached: CachedTokenReviewResult,
     ) -> Result<NodeApiAuthenticatedCaller, Status> {
         match cached {
-            CachedTokenReviewResult::Accepted { username } => {
+            CachedTokenReviewResult::Accepted { username, pod } => {
                 pplx_space_metrics::auth::token_review_cache("hit_authenticated");
                 self.authorize_username(policy, surface, method, &username, false)?;
-                Ok(policy.authenticated_caller(&username))
+                {
+                    let mut caller = policy.authenticated_caller(&username);
+                    caller.kubernetes_pod = pod;
+                    Ok(caller)
+                }
             }
             CachedTokenReviewResult::Rejected { reason } => {
                 pplx_space_metrics::auth::token_review_cache("hit_deny");
@@ -435,7 +442,7 @@ impl K8sTokenReviewer {
         &self,
         token: &str,
         audience: &str,
-    ) -> Result<String, TokenReviewFailure> {
+    ) -> Result<ReviewedToken, TokenReviewFailure> {
         let review = TokenReview {
             metadata: Default::default(),
             spec: TokenReviewSpec {
@@ -808,8 +815,13 @@ struct CachedTokenReview {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum CachedTokenReviewResult {
-    Accepted { username: String },
-    Rejected { reason: TokenReviewRejectReason },
+    Accepted {
+        username: String,
+        pod: Option<super::KubernetesPodIdentity>,
+    },
+    Rejected {
+        reason: TokenReviewRejectReason,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -948,7 +960,7 @@ fn jwt_exp_cache_deadline(token: &str, now: Instant, now_system: SystemTime) -> 
 fn validate_token_review_status(
     status: Option<TokenReviewStatus>,
     audience: &str,
-) -> Result<String, TokenReviewFailure> {
+) -> Result<ReviewedToken, TokenReviewFailure> {
     let status = status.ok_or(TokenReviewFailure::Rejected {
         reason: TokenReviewRejectReason::MissingStatus,
     })?;
@@ -975,12 +987,52 @@ fn validate_token_review_status(
             reason: TokenReviewRejectReason::AudienceMismatch,
         });
     }
-    status
-        .user
-        .and_then(|user| user.username)
-        .ok_or(TokenReviewFailure::Rejected {
-            reason: TokenReviewRejectReason::MissingUser,
-        })
+    let user = status.user.ok_or(TokenReviewFailure::Rejected {
+        reason: TokenReviewRejectReason::MissingUser,
+    })?;
+    let username = user.username.ok_or(TokenReviewFailure::Rejected {
+        reason: TokenReviewRejectReason::MissingUser,
+    })?;
+    let pod = reviewed_pod_identity(&username, user.extra.as_ref());
+    Ok(ReviewedToken { username, pod })
+}
+
+#[derive(Debug)]
+struct ReviewedToken {
+    username: String,
+    pod: Option<super::KubernetesPodIdentity>,
+}
+
+fn reviewed_pod_identity(
+    username: &str,
+    extra: Option<&std::collections::BTreeMap<String, Vec<String>>>,
+) -> Option<super::KubernetesPodIdentity> {
+    let mut account = username.strip_prefix("system:serviceaccount:")?.split(':');
+    let namespace = account.next()?.to_owned();
+    let service_account = account.next()?.to_owned();
+    if namespace.is_empty() || service_account.is_empty() || account.next().is_some() {
+        return None;
+    }
+    let value = |key: &str| match extra?.get(key)?.as_slice() {
+        [value] if !value.is_empty() => Some(value.as_str()),
+        _ => None,
+    };
+    Some(super::KubernetesPodIdentity {
+        namespace,
+        service_account,
+        pod_name: value("authentication.kubernetes.io/pod-name")?
+            .parse()
+            .ok()?,
+        pod_uid: value("authentication.kubernetes.io/pod-uid")?
+            .parse()
+            .ok()?,
+        node_name: value("authentication.kubernetes.io/node-name")?
+            .parse()
+            .ok()?,
+        node_uid: value("authentication.kubernetes.io/node-uid")?
+            .parse()
+            .ok()?,
+    })
 }
 
 fn token_digest(token: &str) -> [u8; 32] {
