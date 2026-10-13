@@ -124,9 +124,9 @@ jobs:
       # Pull requests only: archcheck writes its findings as rdjson, offline
       # from the clippy step's caches, even when clippy failed. Exit 1 means
       # required findings, which reviewdog decides on; anything else fails.
-      # no_new_entries compares with the baseline of the base: the first
-      # parent of the synthetic merge (fetch-depth 0 above), once
-      # resolve-migration-base.sh has checked the second is this pull
+      # no_new_entries and no_raised_caps compare with the baseline of the
+      # base: the first parent of the synthetic merge (fetch-depth 0 above),
+      # once resolve-migration-base.sh has checked the second is this pull
       # request. If the base has no baseline, an empty one; if it can't be
       # resolved, a warning and no comparison.
       - name: Check repository structure
@@ -159,7 +159,7 @@ jobs:
                 fi
               fi
               if ((${#base_args[@]} == 0)); then
-                echo "::warning title=archcheck::Could not read the base baseline; file_size.no_new_entries is skipped."
+                echo "::warning title=archcheck::Could not resolve the base baseline; no_new_entries and no_raised_caps are skipped."
               fi
               exec cargo arch --format rdjson "${base_args[@]}" >target/archcheck.rdjson' || status=$?
           if ((status > 1)); then echo "::error title=archcheck::cargo arch exited ${status}; see above."; exit 1; fi

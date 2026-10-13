@@ -31,8 +31,8 @@ usage: archcheck [--root <path>] [--format human|rdjson]
                       summary on stderr
   --base-baseline <path>
                       the base branch's architecture-baseline.toml, which
-                      file_size.no_new_entries compares against (skipped
-                      without it)
+                      file_size.no_new_entries and no_raised_caps compare
+                      with (skipped without it)
   --write-baseline    update or remove the entries of architecture-baseline.toml
                       to match the current tree; never adds one";
 
@@ -50,6 +50,8 @@ enum UsageError {
     UnexpectedValue(String),
     #[error("unexpected argument {0:?}")]
     UnexpectedArgument(String),
+    #[error("--base-baseline cannot be combined with --write-baseline")]
+    BaseBaselineWithWriteBaseline,
     #[error(transparent)]
     Format(#[from] UnknownFormatError),
 }
@@ -117,11 +119,11 @@ fn run(options: Options) -> Result<ExitCode, RunError> {
 
     let mut ctx = Context::load(&root)?;
     if let Some(path) = &options.base_baseline {
-        ctx.base_baseline = Some(Baseline::load(path)?);
+        ctx.base_baseline = Baseline::load_base(path)?;
     }
     let findings = check(&ctx);
     let report = render(options.format, &findings, ctx.files.len());
-    // One line per skipped behaviour, after the summary line.
+    // A line per skip, or warning about a skip, after the summary line.
     let skipped: String = skipped(&ctx)
         .iter()
         .map(|line| format!("archcheck: {line}\n"))
@@ -185,6 +187,9 @@ fn parse_args(args: impl Iterator<Item = OsString>) -> Result<Option<Options>, U
             "--write-baseline" => return Err(UsageError::UnexpectedValue(flag.clone())),
             other => return Err(UsageError::UnexpectedArgument(other.to_owned())),
         }
+    }
+    if options.write_baseline && options.base_baseline.is_some() {
+        return Err(UsageError::BaseBaselineWithWriteBaseline);
     }
     Ok(Some(options))
 }

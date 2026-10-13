@@ -9,8 +9,8 @@ use crate::{baseline::Baseline, context::Context, finding::Finding};
 pub trait Rule {
     fn check(&self, ctx: &Context) -> Vec<Finding>;
 
-    /// Behaviours this context cannot check, each as one line such as
-    /// `file_size.no_new_entries skipped (…)`.
+    /// Behaviours this context cannot check, as one line per reason, such as
+    /// `file_size.no_new_entries and … skipped (…)`.
     fn skipped(&self, _ctx: &Context) -> Vec<String> {
         Vec::new()
     }

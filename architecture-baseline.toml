@@ -3,7 +3,8 @@
 # crates/tools/archcheck/README.md.
 #
 # [file_size] maps each production Rust file over the code-line limit to its cap,
-# the code-line count it had when listed. Only remove entries or lower caps.
+# the code-line count it had when listed. Only remove entries or lower caps: a
+# pull request that adds an entry or raises a cap is reported.
 
 [file_size]
 "crates/apps/local/node-mgr/svc/src/service.rs" = 1258

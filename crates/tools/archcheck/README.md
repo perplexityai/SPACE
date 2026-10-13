@@ -8,7 +8,7 @@ tolerates for now are listed in
 ```sh
 cargo arch                         # human-readable report
 cargo arch --format rdjson         # reviewdog Diagnostic Format, for CI
-cargo arch --base-baseline <path>  # also report entries the base's baseline lacks
+cargo arch --base-baseline <path>  # also compare with the base branch's baseline
 cargo arch --write-baseline        # update the baseline's entries; never adds one
 cargo arch --root <path>           # check another checkout
 ```
@@ -30,18 +30,28 @@ configuration, usage or I/O error.
   --check` rejects such files). A leading byte order mark is ignored. Block
   comments and attributes count.
 
-`file_size` limits production files to `limit` code lines, with four
+`file_size` limits production files to `limit` code lines, with five
 behaviours:
 
 - `no_crossing`: a file outside the baseline is over the limit;
-- `no_new_entries`: the baseline has an entry that the base branch's copy,
-  given with `--base-baseline <path>`, lacks, so the baseline is no way around
-  `no_crossing`. Raised or lowered caps and removed entries don't count.
-  Without the flag (the local default) it is skipped, and the summary says so;
+- `no_new_entries`: the baseline has an entry that the base branch's copy
+  lacks (a renamed file counts as added);
+- `no_raised_caps`: an entry's cap is higher than in the base branch's copy;
 - `listed_no_growth`: a listed file grew past its cap;
 - `stale_entries`: an entry can be lowered or removed, because its file shrank,
   is at or under the limit, or no longer exists (or the key names no
   production file).
+
+`no_new_entries` and `no_raised_caps` compare with the base branch's copy of
+the baseline, given with `--base-baseline <path>`, so that the baseline is no
+way around the limit.
+Lowered caps and removed entries are silent. Only that copy's `[file_size]`
+table is read, and other tables and keys are ignored, so a pull request can
+change the baseline's schema. If the copy can't be read, archcheck exits 2.
+If it isn't TOML, or its `[file_size]` isn't a table of integers, both
+behaviours are skipped with a warning. Without the flag (the local default)
+they are skipped too. Either way, one line after the summary line says so: on
+stdout for `human`, on stderr for `rdjson`.
 
 ## Configuration and modes
 
@@ -49,7 +59,7 @@ Each behaviour has a `mode`: `advisory` findings are reported, `required` ones
 also fail the check, so behaviours can graduate one at a time. Unknown keys,
 sections or modes, a missing file, bad TOML, and `members` with globs or with
 empty, `.` or `..` components exit 2. So does a `--base-baseline` that can't
-be read or parsed.
+be read, or one combined with `--write-baseline`.
 
 ## Baseline
 
@@ -58,8 +68,11 @@ entries and the tree: an entry whose file is still over the limit gets the
 file's current count as its cap, and the other entries are removed. It never
 adds an entry. It prints `not added: <path> (N code lines); …` for each file
 over the limit without one instead: split the file, or, for a deliberate
-exception, add the entry by hand, which `no_new_entries` then reports. The old
-file must parse. Entries should only be removed or lowered. The inventory walks
+exception, add the entry by hand, which `no_new_entries` then reports. Raised
+caps are written too, and `no_raised_caps` reports each of them. It reads the
+existing file with the strict parser, so a missing or invalid baseline exits 2:
+it can't create one from scratch. Entries should only be removed or lowered.
+The inventory walks
 the filesystem, so untracked `.rs` files under `src/` are counted too: check
 `git status` before `--write-baseline`.
 
@@ -73,8 +86,8 @@ On pull requests, the Rust clippy job in
 merge's first parent, the base branch, or an empty file if the base has none.
 If the base can't be resolved, the step warns and runs without the flag. Each
 finding is a diagnostic with code `<rule>.<behaviour>` on line 1 of its file,
-with the path exactly as it is; a new entry, and a stale entry for a deleted
-file, point at the entry's line in the baseline. Required findings are
+with the path exactly as it is; a new entry, a raised cap, and a stale entry
+for a deleted file point at the entry's line in the baseline. Required findings are
 `ERROR`, advisory ones `WARNING`.
 
 - `-filter-mode=file` reports findings in the files the pull request changes.

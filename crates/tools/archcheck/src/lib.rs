@@ -12,7 +12,7 @@ pub mod finding;
 pub mod report;
 pub mod rules;
 
-pub use baseline::{BASELINE_FILE, Baseline, WriteBaselineError};
+pub use baseline::{BASELINE_FILE, BaseBaseline, Baseline, WriteBaselineError};
 pub use config::{ArchitectureConfig, CONFIG_FILE, Mode};
 pub use context::{Context, LoadError, ProductionFile};
 pub use finding::{Finding, Location};

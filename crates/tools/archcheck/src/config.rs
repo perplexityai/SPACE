@@ -30,6 +30,7 @@ pub struct FileSizeConfig {
     pub limit: usize,
     pub no_crossing: BehaviourConfig,
     pub no_new_entries: BehaviourConfig,
+    pub no_raised_caps: BehaviourConfig,
     pub listed_no_growth: BehaviourConfig,
     pub stale_entries: BehaviourConfig,
 }
