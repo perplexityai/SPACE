@@ -1,0 +1,440 @@
+//! Every outcome of the generic node-local SQLite `sandboxes.state` writer,
+//! `update_state`, over all 18×18 `(from, to)` lifecycle pairs and each
+//! cleanup-ownership shape that changes its answer, once with a transition
+//! receipt for the target and once with a receipt for another state.
+//!
+//! The expected outcomes are written out below as one grid per shape, not
+//! derived from `SandboxState::can_transition_to`: `update_state` deliberately
+//! has no expected-state predicate, so the grids record which writes it applies
+//! today, including edges the state machine forbids.
+
+use pplx_space_common_core::types::{
+    SandboxCleanupEpisodeId, SandboxId, SandboxQuarantineReasonCode,
+};
+use rusqlite::Connection;
+
+use super::state_write_fixtures::{
+    Cell, ExpectedDiff, NULL, Snapshot, assert_diff, assert_unchanged, backdate, force_state,
+    generation, insert_row, receipt_cleared, seed_receipt, set_failure_reason, snapshot,
+    test_start, text,
+};
+use crate::db::{
+    CleanupCompletion, CleanupEpisodeRequestOutcome, CleanupEpisodeSpec, SandboxStateWriteOutcome,
+    begin_teardown_suspend, insert_cleanup_episode, mark_suspending_quarantined,
+    request_cleanup_episode, set_cleanup_intent, test_conn, update_state,
+};
+use crate::state::SandboxState;
+
+/// The grids' row and column order. Wildcard-free, so a new lifecycle state
+/// does not compile until every grid has a row and a column for it.
+const fn index(state: SandboxState) -> usize {
+    match state {
+        SandboxState::Creating => 0,
+        SandboxState::Created => 1,
+        SandboxState::Starting => 2,
+        SandboxState::Started => 3,
+        SandboxState::Stopping => 4,
+        SandboxState::Stopped => 5,
+        SandboxState::Deleting => 6,
+        SandboxState::Pausing => 7,
+        SandboxState::Paused => 8,
+        SandboxState::Resuming => 9,
+        SandboxState::Checkpointing => 10,
+        SandboxState::Suspending => 11,
+        SandboxState::Suspended => 12,
+        SandboxState::Restoring => 13,
+        SandboxState::CleanupRequired => 14,
+        SandboxState::CleanupFailed => 15,
+        SandboxState::Quarantined => 16,
+        SandboxState::Failed => 17,
+    }
+}
+
+/// `A` applied, `Q` blocked by quarantine, `S` superseded by cleanup
+/// ownership, `X` rejected before reading the row (`InvalidQuery`).
+type Grid = [&'static str; 18];
+
+/// No cleanup intent and no cleanup episode.
+const PLAIN: Grid = [
+    // to:         cre crd stg std stp spd del pau psd res chk ssg ssd rst crq crf qua fai
+    /* creating */
+    "A   A   A   A   A   A   A   A   A   A   A   A   A   A   A   A   X   X",
+    /* created  */ "A   A   A   A   A   A   A   A   A   A   A   A   A   A   A   A   X   X",
+    /* starting */ "A   A   A   A   A   A   A   A   A   A   A   A   A   A   A   A   X   X",
+    /* started  */ "A   A   A   A   A   A   A   A   A   A   A   A   A   A   A   A   X   X",
+    /* stopping */ "A   A   A   S   A   A   A   S   S   S   S   A   A   A   A   A   X   X",
+    /* stopped  */ "A   A   A   A   A   A   A   A   A   A   A   A   A   A   A   A   X   X",
+    /* deleting */ "S   S   S   S   S   S   A   S   S   S   S   S   S   S   S   S   X   X",
+    /* pausing  */ "A   A   A   A   A   A   A   A   A   A   A   A   A   A   A   A   X   X",
+    /* paused   */ "A   A   A   A   A   A   A   A   A   A   A   A   A   A   A   A   X   X",
+    /* resuming */ "A   A   A   A   A   A   A   A   A   A   A   A   A   A   A   A   X   X",
+    /* checkpt  */ "A   A   A   A   A   A   A   A   A   A   A   A   A   A   A   A   X   X",
+    /* susping  */ "A   A   A   A   A   A   A   A   A   A   A   A   A   A   A   A   X   X",
+    /* susped   */ "A   A   A   A   A   A   A   A   A   A   A   A   A   A   A   A   X   X",
+    /* restorng */ "A   A   A   A   A   A   A   A   A   A   A   A   A   A   A   A   X   X",
+    /* clean_rq */ "A   A   A   S   A   A   A   S   S   S   S   A   A   A   A   A   X   X",
+    /* clean_fl */ "A   A   A   S   A   A   A   S   S   S   S   A   A   A   A   A   X   X",
+    /* quarant  */ "Q   Q   Q   Q   Q   Q   A   Q   Q   Q   Q   Q   Q   Q   Q   Q   X   X",
+    /* failed   */ "A   A   A   A   A   A   A   A   A   A   A   A   A   A   A   A   X   X",
+];
+
+/// A `delete_row` row intent with no episode. The armed create episode, which
+/// also owns a `delete_row` intent, deliberately answers identically: create
+/// completion relies on writing through it.
+const DELETE_ROW_INTENT: Grid = [
+    // to:         cre crd stg std stp spd del pau psd res chk ssg ssd rst crq crf qua fai
+    /* creating */
+    "A   A   A   A   A   A   A   A   A   A   A   A   A   A   A   A   X   X",
+    /* created  */ "A   A   A   A   A   A   A   A   A   A   A   A   A   A   A   A   X   X",
+    /* starting */ "A   A   A   A   A   A   A   A   A   A   A   A   A   A   A   A   X   X",
+    /* started  */ "A   A   A   A   A   A   A   A   A   A   A   A   A   A   A   A   X   X",
+    /* stopping */ "A   A   A   S   A   A   A   S   S   S   S   A   A   A   A   A   X   X",
+    /* stopped  */ "A   A   A   A   A   A   A   A   A   A   A   A   A   A   A   A   X   X",
+    /* deleting */ "S   S   S   S   S   S   A   S   S   S   S   S   S   S   S   S   X   X",
+    /* pausing  */ "A   A   A   A   A   A   A   A   A   A   A   A   A   A   A   A   X   X",
+    /* paused   */ "A   A   A   A   A   A   A   A   A   A   A   A   A   A   A   A   X   X",
+    /* resuming */ "A   A   A   A   A   A   A   A   A   A   A   A   A   A   A   A   X   X",
+    /* checkpt  */ "A   A   A   A   A   A   A   A   A   A   A   A   A   A   A   A   X   X",
+    /* susping  */ "A   A   A   A   A   A   A   A   A   A   A   A   A   A   A   A   X   X",
+    /* susped   */ "A   A   A   A   A   A   A   A   A   A   A   A   A   A   A   A   X   X",
+    /* restorng */ "A   A   A   A   A   A   A   A   A   A   A   A   A   A   A   A   X   X",
+    /* clean_rq */ "S   S   S   S   S   S   A   S   S   S   S   S   S   S   S   S   X   X",
+    /* clean_fl */ "S   S   S   S   S   S   A   S   S   S   S   S   S   S   S   S   X   X",
+    /* quarant  */ "Q   Q   Q   Q   Q   Q   A   Q   Q   Q   Q   Q   Q   Q   Q   Q   X   X",
+    /* failed   */ "A   A   A   A   A   A   A   A   A   A   A   A   A   A   A   A   X   X",
+];
+
+/// An episode that does not delete the row (an armed cold-start `mark_stopped`
+/// episode) or that has been requested: cleanup owns every target, deletion
+/// included, except that quarantine answers first.
+const CLEANUP_OWNED: Grid = [
+    // to:         cre crd stg std stp spd del pau psd res chk ssg ssd rst crq crf qua fai
+    /* creating */
+    "S   S   S   S   S   S   S   S   S   S   S   S   S   S   S   S   X   X",
+    /* created  */ "S   S   S   S   S   S   S   S   S   S   S   S   S   S   S   S   X   X",
+    /* starting */ "S   S   S   S   S   S   S   S   S   S   S   S   S   S   S   S   X   X",
+    /* started  */ "S   S   S   S   S   S   S   S   S   S   S   S   S   S   S   S   X   X",
+    /* stopping */ "S   S   S   S   S   S   S   S   S   S   S   S   S   S   S   S   X   X",
+    /* stopped  */ "S   S   S   S   S   S   S   S   S   S   S   S   S   S   S   S   X   X",
+    /* deleting */ "S   S   S   S   S   S   S   S   S   S   S   S   S   S   S   S   X   X",
+    /* pausing  */ "S   S   S   S   S   S   S   S   S   S   S   S   S   S   S   S   X   X",
+    /* paused   */ "S   S   S   S   S   S   S   S   S   S   S   S   S   S   S   S   X   X",
+    /* resuming */ "S   S   S   S   S   S   S   S   S   S   S   S   S   S   S   S   X   X",
+    /* checkpt  */ "S   S   S   S   S   S   S   S   S   S   S   S   S   S   S   S   X   X",
+    /* susping  */ "S   S   S   S   S   S   S   S   S   S   S   S   S   S   S   S   X   X",
+    /* susped   */ "S   S   S   S   S   S   S   S   S   S   S   S   S   S   S   S   X   X",
+    /* restorng */ "S   S   S   S   S   S   S   S   S   S   S   S   S   S   S   S   X   X",
+    /* clean_rq */ "S   S   S   S   S   S   S   S   S   S   S   S   S   S   S   S   X   X",
+    /* clean_fl */ "S   S   S   S   S   S   S   S   S   S   S   S   S   S   S   S   X   X",
+    /* quarant  */ "Q   Q   Q   Q   Q   Q   S   Q   Q   Q   Q   Q   Q   Q   Q   Q   X   X",
+    /* failed   */ "S   S   S   S   S   S   S   S   S   S   S   S   S   S   S   S   X   X",
+];
+
+/// A row the production quarantine writer moved to `quarantined`, with its
+/// `sandbox_quarantine_*` episode: only deletion passes.
+const QUARANTINE_EPISODE: &str =
+    "Q   Q   Q   Q   Q   Q   A   Q   Q   Q   Q   Q   Q   Q   Q   Q   X   X";
+
+/// No row at all.
+const MISSING: &str = "M   M   M   M   M   M   M   M   M   M   M   M   M   M   M   M   X   X";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Expected {
+    Applied,
+    Quarantine,
+    Superseded,
+    Missing,
+    Rejected,
+}
+
+fn cell(row: &str, to: SandboxState) -> Expected {
+    let cells: Vec<&str> = row.split_whitespace().collect();
+    assert_eq!(cells.len(), 18, "grid row {row:?}");
+    match cells[index(to)] {
+        "A" => Expected::Applied,
+        "Q" => Expected::Quarantine,
+        "S" => Expected::Superseded,
+        "M" => Expected::Missing,
+        "X" => Expected::Rejected,
+        other => panic!("unknown grid cell {other:?}"),
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Shape {
+    Plain,
+    DeleteRowIntent,
+    ArmedCreateEpisode,
+    ArmedActivationEpisode,
+    RequestedCreateEpisode,
+}
+
+impl Shape {
+    const ALL: [Self; 5] = [
+        Self::Plain,
+        Self::DeleteRowIntent,
+        Self::ArmedCreateEpisode,
+        Self::ArmedActivationEpisode,
+        Self::RequestedCreateEpisode,
+    ];
+
+    fn grid(self) -> &'static Grid {
+        match self {
+            Self::Plain => &PLAIN,
+            Self::DeleteRowIntent | Self::ArmedCreateEpisode => &DELETE_ROW_INTENT,
+            Self::ArmedActivationEpisode | Self::RequestedCreateEpisode => &CLEANUP_OWNED,
+        }
+    }
+
+    /// The cleanup intent and episode, installed while the row is still
+    /// `suspending` so the production writers that create them accept it.
+    fn install(self, conn: &Connection, id: &str) {
+        let create_episode = CleanupEpisodeSpec {
+            id: SandboxCleanupEpisodeId::new(),
+            completion: CleanupCompletion::DeleteRow,
+            keep_filesystem: false,
+            entered_from_state: None,
+            activation_state: SandboxState::Creating,
+            execution_generation: None,
+            activation_attempt_id: None,
+        };
+        match self {
+            Self::Plain => {}
+            Self::DeleteRowIntent => {
+                assert!(set_cleanup_intent(conn, id, false, CleanupCompletion::DeleteRow).unwrap());
+            }
+            Self::ArmedCreateEpisode => insert_cleanup_episode(conn, id, create_episode).unwrap(),
+            Self::ArmedActivationEpisode => insert_cleanup_episode(
+                conn,
+                id,
+                CleanupEpisodeSpec {
+                    id: SandboxCleanupEpisodeId::new(),
+                    completion: CleanupCompletion::MarkStopped,
+                    keep_filesystem: true,
+                    entered_from_state: Some(SandboxState::Stopped),
+                    activation_state: SandboxState::Starting,
+                    execution_generation: None,
+                    activation_attempt_id: None,
+                },
+            )
+            .unwrap(),
+            Self::RequestedCreateEpisode => {
+                let cleanup_id = create_episode.id;
+                insert_cleanup_episode(conn, id, create_episode).unwrap();
+                assert_eq!(
+                    request_cleanup_episode(
+                        conn,
+                        id,
+                        cleanup_id,
+                        SandboxQuarantineReasonCode::CreateInterrupted,
+                        "create interrupted",
+                    )
+                    .unwrap(),
+                    CleanupEpisodeRequestOutcome::Requested
+                );
+            }
+        }
+    }
+}
+
+/// Which transition receipt a seeded row carries relative to the target.
+#[derive(Clone, Copy, Debug)]
+enum Receipt {
+    /// A receipt for `to` itself when the table admits one, which an applied
+    /// write keeps; otherwise a `started` receipt, which it clears.
+    ForTarget,
+    /// A receipt for another receipt-capable state, which an applied write
+    /// clears.
+    ForAnotherState,
+}
+
+impl Receipt {
+    const ALL: [Self; 2] = [Self::ForTarget, Self::ForAnotherState];
+
+    fn target(self, to: SandboxState) -> SandboxState {
+        let receipt_capable = match to {
+            SandboxState::Created
+            | SandboxState::Started
+            | SandboxState::Paused
+            | SandboxState::Stopped
+            | SandboxState::Suspended => true,
+            SandboxState::Creating
+            | SandboxState::Starting
+            | SandboxState::Stopping
+            | SandboxState::Deleting
+            | SandboxState::Pausing
+            | SandboxState::Resuming
+            | SandboxState::Checkpointing
+            | SandboxState::Suspending
+            | SandboxState::Restoring
+            | SandboxState::CleanupRequired
+            | SandboxState::CleanupFailed
+            | SandboxState::Quarantined
+            | SandboxState::Failed => false,
+        };
+        match self {
+            Self::ForTarget if receipt_capable => to,
+            Self::ForTarget | Self::ForAnotherState if to != SandboxState::Started => {
+                SandboxState::Started
+            }
+            Self::ForTarget | Self::ForAnotherState => SandboxState::Stopped,
+        }
+    }
+}
+
+/// A row in `from` carrying `shape`, an active teardown-suspend job (which only
+/// a deletion fails), a failure reason, a transition receipt for `receipt`, a
+/// remote restore's columns when `from` is `restoring`, and backdated
+/// timestamps.
+fn seed(conn: &Connection, shape: Shape, from: SandboxState, receipt: SandboxState) -> String {
+    let id = insert_row(conn, SandboxState::Paused);
+    begin_teardown_suspend(conn, &id, generation(7)).unwrap();
+    shape.install(conn, &id);
+    force_state(conn, &id, from);
+    set_failure_reason(conn, &id, "seeded failure");
+    seed_receipt(conn, &id, receipt);
+    backdate(conn, &id);
+    id
+}
+
+/// The row diff an applied `update_state(to)` makes to a [`seed`] row whose
+/// receipt targets `receipt`.
+fn applied_diff(
+    id: &str,
+    from: SandboxState,
+    to: SandboxState,
+    receipt: SandboxState,
+) -> ExpectedDiff {
+    let mut cells: Vec<(&'static str, Cell)> =
+        vec![("updated_at", Cell::NowText), ("failure_reason", NULL)];
+    if from != to {
+        cells.push(("state", text(to.as_str())));
+        cells.push(("state_changed_at", Cell::NowText));
+    }
+    if from == SandboxState::Restoring && to != SandboxState::Restoring {
+        cells.push(("restore_origin", NULL));
+        cells.push(("restore_phase", NULL));
+        cells.push(("restore_storage_uri", NULL));
+    }
+    if receipt != to {
+        cells.extend(receipt_cleared(receipt));
+    }
+    ExpectedDiff::new().sandbox(id, cells)
+}
+
+fn assert_outcome(
+    case: &str,
+    result: rusqlite::Result<SandboxStateWriteOutcome>,
+    expected: Expected,
+) {
+    match (expected, result) {
+        (Expected::Applied, Ok(SandboxStateWriteOutcome::Applied))
+        | (Expected::Quarantine, Ok(SandboxStateWriteOutcome::BlockedByQuarantine))
+        | (Expected::Superseded, Ok(SandboxStateWriteOutcome::SupersededByCleanupEpisode))
+        | (Expected::Missing, Ok(SandboxStateWriteOutcome::Missing))
+        | (Expected::Rejected, Err(rusqlite::Error::InvalidQuery)) => {}
+        (expected, result) => panic!("{case}: expected {expected:?}, got {result:?}"),
+    }
+}
+
+/// Run one write and assert both its outcome and its row diff: an applied
+/// write changes exactly `applied`, any other outcome changes nothing.
+fn check(
+    case: &str,
+    conn: &Connection,
+    id: &str,
+    to: SandboxState,
+    expected: Expected,
+    applied: ExpectedDiff,
+) {
+    let before: Snapshot = snapshot(conn);
+    let start = test_start();
+    let result = update_state(conn, id, to);
+    assert_outcome(case, result, expected);
+    if expected == Expected::Applied {
+        assert_diff(case, &before, &snapshot(conn), start, &applied);
+    } else {
+        assert_unchanged(case, &before, conn);
+    }
+}
+
+#[test]
+fn generic_state_write_outcomes_cover_every_lifecycle_pair_and_cleanup_shape() {
+    for (shape, receipt_kind) in Shape::ALL
+        .into_iter()
+        .flat_map(|shape| Receipt::ALL.map(|receipt| (shape, receipt)))
+    {
+        for from in SandboxState::all() {
+            for to in SandboxState::all() {
+                let receipt = receipt_kind.target(to);
+                let case = format!("{shape:?}, {receipt} receipt: {from} -> {to}");
+                let conn = test_conn();
+                let id = seed(&conn, shape, from, receipt);
+                let expected = cell(shape.grid()[index(from)], to);
+                // The teardown job's failure is `update_state`'s deletion side
+                // effect; every other change is to the sandbox row.
+                let job_failure = expected == Expected::Applied && to == SandboxState::Deleting;
+                let mut applied = applied_diff(&id, from, to, receipt);
+                if job_failure {
+                    applied = applied.updated(
+                        "jobs",
+                        ("subject_id", &id),
+                        [
+                            ("status", text("failed")),
+                            ("error_kind", text("permanent")),
+                            ("error", text("sandbox is deleting")),
+                            ("completed_at", Cell::Fresh),
+                        ],
+                    );
+                }
+                check(&case, &conn, &id, to, expected, applied);
+            }
+        }
+    }
+}
+
+#[test]
+fn generic_state_write_outcomes_over_a_quarantine_episode_and_a_missing_row() {
+    for to in SandboxState::all() {
+        let case = format!("quarantine episode: quarantined -> {to}");
+        let conn = test_conn();
+        let id = insert_row(&conn, SandboxState::Paused);
+        begin_teardown_suspend(&conn, &id, generation(7)).unwrap();
+        assert!(mark_suspending_quarantined(&conn, &id, "suspend publication failed").unwrap());
+        backdate(&conn, &id);
+        // Entering quarantine already failed the teardown job, so a deletion
+        // changes only the row and keeps the quarantine episode.
+        let applied = ExpectedDiff::new().sandbox(
+            &id,
+            [
+                ("state", text("deleting")),
+                ("state_changed_at", Cell::NowText),
+                ("updated_at", Cell::NowText),
+                ("failure_reason", NULL),
+            ],
+        );
+        check(&case, &conn, &id, to, cell(QUARANTINE_EPISODE, to), applied);
+
+        let case = format!("missing row -> {to}");
+        let conn = test_conn();
+        let id = SandboxId::new().to_string();
+        check(
+            &case,
+            &conn,
+            &id,
+            to,
+            cell(MISSING, to),
+            ExpectedDiff::new(),
+        );
+    }
+}
+
+#[test]
+fn every_lifecycle_state_has_one_grid_position() {
+    let mut seen = [false; 18];
+    for state in SandboxState::all() {
+        assert!(!seen[index(state)], "{state} shares a grid position");
+        seen[index(state)] = true;
+    }
+    assert!(seen.iter().all(|seen| *seen));
+}
