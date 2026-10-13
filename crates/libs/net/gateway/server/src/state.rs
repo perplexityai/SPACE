@@ -825,6 +825,10 @@ impl GatewayNetworkState {
                                     deny_ips = deny_counts.ips,
                                     deny_cidrs = deny_counts.cidrs,
                                     reason = reason.as_str(),
+                                    // Effective mode for this install. Every
+                                    // install (refresh, self-hydration, restore)
+                                    // logs this line, so it tracks mode changes.
+                                    tls_interception_mode = policy.tls_interception.as_str(),
                                     // The rendered destination strings are NOT
                                     // logged: policy destinations are tenant-
                                     // authored and a hostname can carry arbitrary
