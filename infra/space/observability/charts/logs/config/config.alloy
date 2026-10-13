@@ -23,6 +23,15 @@ discovery.relabel "eligible_pods" {
     action = "drop"
   }
 {{- end }}
+  // Plain-text output, such as an init container's, has no JSON `service`.
+  // Name such a stream after its container, in the form SPACE services use,
+  // so every stream has one; a line's own JSON `service` replaces it below.
+  rule {
+    source_labels = ["__path__"]
+    regex = ".*/[^/]+/(?:space-)?([^/]+)/[^/]+"
+    target_label = "service"
+    replacement = "space-$1"
+  }
 }
 loki.source.file "pods" {
   targets = discovery.relabel.eligible_pods.output
@@ -81,6 +90,8 @@ loki.process "space" {
   stage.json {
     expressions = {service = "service", environment = "env", cluster = "cluster_id", event_time = "timestamp"}
   }
+  // A label is set only from a value the line carries, so a container's
+  // fallback `service` stays when the line has none.
   stage.labels {
     values = {service = "", environment = "", cluster = ""}
   }
