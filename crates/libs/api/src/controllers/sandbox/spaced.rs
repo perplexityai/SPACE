@@ -937,9 +937,7 @@ macro_rules! spaced_client_call {
                     .await?
                 }
                 Err(err) => {
-                    if let SpacedRuntimeCallError::Status(status) = &err {
-                        self.retire_after_transport_failure(status);
-                    }
+                    self.retire_after_call_failure(&err);
                     return Err(err.into());
                 }
             };
@@ -996,9 +994,7 @@ macro_rules! spaced_stream_open_call {
                     .await?
                 }
                 Err(err) => {
-                    if let SpacedRuntimeCallError::Status(status) = &err {
-                        self.retire_after_transport_failure(status);
-                    }
+                    self.retire_after_call_failure(&err);
                     return Err(err.into());
                 }
             };
@@ -1010,6 +1006,14 @@ macro_rules! spaced_stream_open_call {
 fn should_retry_node_api_stream_open(status: &tonic::Status) -> bool {
     pplx_space_node_api_client::is_node_api_draining_status(status)
         || is_tonic_transport_close_status(status)
+}
+
+/// A failure after which later calls should reach the pod over a new
+/// connection: a drain or a closed transport, or a timeout, which is how a
+/// peer lost without closing the socket looks.
+fn should_retire_kept_connection(status: &tonic::Status) -> bool {
+    should_retry_node_api_stream_open(status)
+        || matches!(status.code(), Code::DeadlineExceeded | Code::Cancelled)
 }
 
 fn is_tonic_transport_close_status(status: &tonic::Status) -> bool {
@@ -1042,8 +1046,18 @@ impl SpacedSandboxClient {
     /// later calls need a new connection. The connection usually closed
     /// already, which retires it anyway; a draining node-api keeps it open.
     fn retire_after_transport_failure(&self, status: &tonic::Status) {
-        if should_retry_node_api_stream_open(status) {
+        if should_retire_kept_connection(status) {
             self.client.retire_kept_connection();
+        }
+    }
+
+    /// [`Self::retire_after_transport_failure`], plus a call that ran out its
+    /// budget: a peer that vanished without closing the socket shows up as a
+    /// timeout, and the next caller's dial is what notices it is gone.
+    fn retire_after_call_failure(&self, err: &SpacedRuntimeCallError) {
+        match err {
+            SpacedRuntimeCallError::Status(status) => self.retire_after_transport_failure(status),
+            SpacedRuntimeCallError::Timeout(_) => self.client.retire_kept_connection(),
         }
     }
 

@@ -274,3 +274,24 @@ async fn reconnect_node_api_is_blocked_by_access_drain_gate() -> TestResult {
     );
     Ok(())
 }
+
+#[test]
+fn a_kept_connection_is_retired_after_a_timeout_or_transport_close_only() {
+    // A timeout is how a peer lost without closing the socket looks, so the
+    // next caller dials and finds out; application errors keep the channel.
+    for status in [
+        tonic::Status::deadline_exceeded("deadline exceeded"),
+        tonic::Status::cancelled("Timeout expired"),
+        tonic::Status::unavailable(pplx_space_node_api_client::NODE_API_DRAINING_MESSAGE),
+        tonic::Status::unavailable("connection reset"),
+    ] {
+        assert!(should_retire_kept_connection(&status), "{status:?}");
+    }
+    for status in [
+        tonic::Status::not_found("no such file"),
+        tonic::Status::unavailable("backend overloaded"),
+        tonic::Status::permission_denied("denied"),
+    ] {
+        assert!(!should_retire_kept_connection(&status), "{status:?}");
+    }
+}
