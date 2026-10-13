@@ -824,6 +824,18 @@ function ControlButtons({ sandbox, onAction, busy }: {
     primary = false,
   ) => {
     const allowed = enabled && !observedOnly && !poolSlot;
+    const button = (
+      <Button
+        size="small"
+        danger={danger}
+        type={primary ? 'primary' : 'default'}
+        icon={icon}
+        disabled={!allowed || busy}
+        onClick={action === 'kill' ? undefined : () => onAction(action)}
+      >
+        {label}
+      </Button>
+    );
     return (
       <Tooltip
         key={action}
@@ -835,16 +847,18 @@ function ControlButtons({ sandbox, onAction, busy }: {
               : (!enabled ? `Cannot ${label.toLowerCase()} in ${s || 'unknown'} state` : label)
         }
       >
-        <Button
-          size="small"
-          danger={danger}
-          type={primary ? 'primary' : 'default'}
-          icon={icon}
-          disabled={!allowed || busy}
-          onClick={() => onAction(action)}
-        >
-          {label}
-        </Button>
+        {action === 'kill' ? (
+          <Popconfirm
+            title="Kill this sandbox?"
+            okText="Kill"
+            cancelText="Cancel"
+            okButtonProps={{ danger: true }}
+            onConfirm={() => onAction('kill')}
+            disabled={!allowed || busy}
+          >
+            {button}
+          </Popconfirm>
+        ) : button}
       </Tooltip>
     );
   };
