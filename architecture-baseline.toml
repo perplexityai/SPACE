@@ -17,7 +17,7 @@
 "crates/libs/api/src/controllers/substrate/kubernetes/adapter/substrate_adapter.rs" = 2467
 "crates/libs/api/src/controllers/substrate/kubernetes/execution.rs" = 1670
 "crates/libs/api/src/controllers/substrate/kubernetes/pod_ops/ensure_pod.rs" = 1111
-"crates/libs/api/src/controllers/substrate/kubernetes/support.rs" = 1020
+"crates/libs/api/src/controllers/substrate/kubernetes/support.rs" = 1018
 "crates/libs/api/src/controllers/substrate/mod.rs" = 2771
 "crates/libs/api/src/fork_operation_executor.rs" = 1755
 "crates/libs/api/src/public_operations.rs" = 1787
@@ -29,6 +29,7 @@
 "crates/libs/api/src/routes/public/sandboxes.rs" = 1245
 "crates/libs/build/mgr/src/lib.rs" = 2063
 "crates/libs/build/mgr/src/oci/containerd.rs" = 1084
+"crates/libs/build/mgr/src/recipe.rs" = 1037
 "crates/libs/cluster/controller/server/src/node_drain/mod.rs" = 1686
 "crates/libs/cluster/controller/server/src/node_drain/store.rs" = 1893
 "crates/libs/cluster/controller/server/src/orphaned_sandboxes.rs" = 1581
@@ -38,8 +39,9 @@
 "crates/libs/common/core/src/k8s.rs" = 1147
 "crates/libs/common/core/src/types/sandbox.rs" = 1953
 "crates/libs/common/jobs/src/worker.rs" = 1621
+"crates/libs/common/svc/src/bootstrap.rs" = 1063
 "crates/libs/credential/mgr/server/src/run.rs" = 1130
-"crates/libs/credential/mgr/server/src/service.rs" = 1229
+"crates/libs/credential/mgr/server/src/service.rs" = 1052
 "crates/libs/data/plane/server/src/ecw_files.rs" = 1521
 "crates/libs/data/plane/server/src/ecw_process.rs" = 1615
 "crates/libs/data/plane/server/src/lib.rs" = 1550
@@ -70,9 +72,10 @@
 "crates/libs/node/runtime/core/src/runtime_inventory/diagnostic.rs" = 1207
 "crates/libs/node/runtime/supervisor/src/service.rs" = 1002
 "crates/libs/object-store/src/lib.rs" = 1810
+"crates/libs/observability/src/lib.rs" = 1063
 "crates/libs/public/api/src/lib.rs" = 1793
 "crates/libs/sbx/mgr/server/src/auto_lifecycle_delete_receipts/db.rs" = 1158
-"crates/libs/sbx/mgr/server/src/db/cleanup_episodes.rs" = 1841
+"crates/libs/sbx/mgr/server/src/db/cleanup_episodes.rs" = 1833
 "crates/libs/sbx/mgr/server/src/db/quarantine_recovery.rs" = 1042
 "crates/libs/sbx/mgr/server/src/db/sandboxes.rs" = 1553
 "crates/libs/sbx/mgr/server/src/db/state_transitions.rs" = 1156
@@ -80,7 +83,7 @@
 "crates/libs/sbx/mgr/server/src/sandbox_eviction.rs" = 1273
 "crates/libs/sbx/mgr/server/src/service/activation_support.rs" = 1592
 "crates/libs/sbx/mgr/server/src/service/auth_lookup.rs" = 1237
-"crates/libs/sbx/mgr/server/src/service/cache_cleanup.rs" = 1457
+"crates/libs/sbx/mgr/server/src/service/cache_cleanup.rs" = 1455
 "crates/libs/sbx/mgr/server/src/service/cleanup.rs" = 2704
 "crates/libs/sbx/mgr/server/src/service/create.rs" = 1195
 "crates/libs/sbx/mgr/server/src/service/grpc_core.rs" = 1087
@@ -104,5 +107,5 @@
 "crates/libs/template/mgr/src/db.rs" = 1276
 "crates/libs/template/mgr/src/service.rs" = 1871
 "crates/libs/template/mgr/src/volume.rs" = 2294
-"crates/libs/vol/mgr/server/src/executor.rs" = 4828
+"crates/libs/vol/mgr/server/src/executor.rs" = 4820
 "crates/libs/vol/mgr/server/src/service.rs" = 1696

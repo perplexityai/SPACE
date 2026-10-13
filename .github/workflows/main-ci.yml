@@ -8,6 +8,14 @@ on:
 permissions:
   contents: read
 
+# GitHub occasionally delivers two push events for one main commit. Run the
+# second after the first instead of beside it: in parallel both find the
+# commit's images unpublished, both build, and the second push fails on the
+# immutable tag. Queued, it finds them published and skips the build.
+concurrency:
+  group: main-ci-${{ github.sha }}
+  cancel-in-progress: false
+
 jobs:
   # The only job that writes the CI image. Pull requests, the merge queue, and
   # the other main jobs read it; each builds it locally until this job has
@@ -119,6 +127,13 @@ jobs:
     with:
       publish: true
 
+  # Every kernel input is pinned in templates/firecracker/kernel (source
+  # commit, base config digest, Ubuntu base digest and package snapshot) or in
+  # this file, so a build that passed for one hash of them passes again. A
+  # cached marker records each passing hash; main commits that change none of
+  # it skip the ~30-minute rebuild and its dependence on snapshot.ubuntu.com.
+  # A failing change never saves a marker, so it fails every main run until
+  # fixed. An evicted marker only costs one rebuild.
   guest_kernel:
     if: github.repository == 'perplexityai/SPACE'
     name: Build and QEMU-smoke guest kernel
@@ -131,7 +146,20 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      - name: Look for a passing build of these kernel inputs
+        id: kernel_pass
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .guest-kernel-pass
+          key: guest-kernel-pass-v1-${{ hashFiles('templates/firecracker/kernel/**', '.github/workflows/main-ci.yml') }}
+          lookup-only: true
+
+      - name: Reuse the passing build of these kernel inputs
+        if: steps.kernel_pass.outputs.cache-hit == 'true'
+        run: echo "These kernel inputs already built and smoke-booted on main; skipping the rebuild."
+
       - name: Build and smoke-boot the guest kernel without publishing
+        if: steps.kernel_pass.outputs.cache-hit != 'true'
         run: |
           set -euo pipefail
           kernel_version=6.1.155
@@ -149,6 +177,14 @@ jobs:
           )
           templates/firecracker/kernel/smoke-boot.sh \
             "${artifact_dir}/vmlinux.bin" "${kernel_version}"
+          echo "${GITHUB_SHA}" > .guest-kernel-pass
+
+      - name: Record the passing build of these kernel inputs
+        if: steps.kernel_pass.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .guest-kernel-pass
+          key: ${{ steps.kernel_pass.outputs.cache-primary-key }}
 
   kind_smoke:
     if: github.repository == 'perplexityai/SPACE'
