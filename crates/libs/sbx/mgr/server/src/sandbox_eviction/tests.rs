@@ -1238,7 +1238,7 @@ async fn eviction_proofs_use_known_identities_and_fail_closed() {
         let artifact_id = LocalArtifactId::new();
         insert_sandbox(&conn, &sandbox_id, "suspended", 0);
         insert_pinned_artifact(&conn, &sandbox_id, &artifact_id.to_string(), None);
-        let service = SandboxManagerService::new(conn);
+        let service = SandboxManagerService::for_test(conn);
         let pin = PinnedArtifact {
             artifact_id,
             artifact_kind: pplx_space_common_core::types::ArtifactKind::Full,
