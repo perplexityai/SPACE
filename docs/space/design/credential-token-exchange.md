@@ -132,6 +132,10 @@ becoming ready. When it is unset the authority wires no storage authorization
 store and every request fails with `FAILED_PRECONDITION`, so a deployment
 without a storage-vend role issues no storage credentials. Leaving the role
 unset is also the emergency stop for all storage credential issuance.
+The retired `SPACE_CREDMGR_SCOPED_EXCHANGE_TOKEN_MODE` no longer selects
+behavior. A retained `disabled` value alongside a vend role fails startup so an
+upgrade cannot reverse that emergency stop; other retained values only log a
+warning.
 
 Every request needs a JWT or UDS caller identity. A static-token TCP transport
 resolves as `Plaintext`, which is never authorized. Callers that omit

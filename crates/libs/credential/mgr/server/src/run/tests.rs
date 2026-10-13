@@ -21,6 +21,21 @@ fn storage_vend_role_is_optional_but_must_be_valid_when_set() {
     );
 }
 
+/// Upgrading an authority that kept the retired `disabled` emergency stop must
+/// not silently start issuing; every other retained or absent value is inert.
+#[test]
+fn retired_disabled_mode_with_a_vend_role_fails_startup() {
+    assert!(matches!(
+        check_retired_exchange_token_mode(Ok("disabled".to_string()), true),
+        Err(RunCredmgrError::RetiredExchangeDisabled)
+    ));
+    check_retired_exchange_token_mode(Ok("disabled".to_string()), false).unwrap();
+    for retained in ["legacy", "mixed", "enforce"] {
+        check_retired_exchange_token_mode(Ok(retained.to_string()), true).unwrap();
+    }
+    check_retired_exchange_token_mode(Err(std::env::VarError::NotPresent), true).unwrap();
+}
+
 /// A node-local run configuration with the binary's defaults, so each test
 /// names only the field it is about.
 fn node_local_config() -> CredmgrRunConfig {

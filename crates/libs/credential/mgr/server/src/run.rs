@@ -59,6 +59,9 @@ const SOCKET_GROUP: &str = group_names::SPACE_SBXCLIENTS;
 pub const SERVICE_NAME: &str = "space-credential-manager";
 const IN_MEMORY_KEK_ENABLED_ENV: &str = "SPACE_CREDMGR_IN_MEMORY_KEK_ENABLED";
 const STORAGE_VEND_ROLE_ENV: &str = "SPACE_CREDMGR_S3_VEND_ROLE_ARN";
+/// Retired rollout switch. Read only so a retained `disabled` emergency stop
+/// cannot be silently reversed by upgrading to a build without modes.
+const RETIRED_EXCHANGE_TOKEN_MODE_ENV: &str = "SPACE_CREDMGR_SCOPED_EXCHANGE_TOKEN_MODE";
 const PLATFORM_KEK_IDENTIFIER_ENV: &str = "SPACE_PLATFORM_KEK_IDENTIFIER";
 // Hard-coded so two instances on the same host cannot be configured to use
 // different mutex files and both acquire concurrently.
@@ -132,6 +135,12 @@ pub enum RunCredmgrError {
     InvalidStorageVendRole,
     #[error("{STORAGE_VEND_ROLE_ENV} requires DATABASE_URL")]
     StorageVendRoleMissingDatabase,
+    #[error(
+        "{RETIRED_EXCHANGE_TOKEN_MODE_ENV}=disabled is no longer supported and would not stop \
+         issuance; unset {STORAGE_VEND_ROLE_ENV} to keep storage credential exchange off, \
+         then remove {RETIRED_EXCHANGE_TOKEN_MODE_ENV}"
+    )]
+    RetiredExchangeDisabled,
     #[error("--tls-cert/--tls-key require --tcp-listen")]
     TlsWithoutTcpListen,
     #[error("--tls-cert and --tls-key must be set together")]
@@ -508,6 +517,10 @@ async fn initialize_authority_service(
     peer_process_check_mode: PeerProcessCheckMode,
 ) -> Result<CredentialManagerService, RunCredmgrError> {
     let storage_vend_role = resolve_storage_vend_role(std::env::var(STORAGE_VEND_ROLE_ENV))?;
+    check_retired_exchange_token_mode(
+        std::env::var(RETIRED_EXCHANGE_TOKEN_MODE_ENV),
+        storage_vend_role.is_some(),
+    )?;
     // Database access is what enables the Encrypt/Decrypt RPCs (cmk_id →
     // KEK row resolution) and, below, the intermediate-key-broker blob store.
     // The control-plane deployment sets DATABASE_URL; node-local deployments
@@ -720,6 +733,27 @@ async fn initialize_authority_service(
     }
 
     Ok(service)
+}
+
+/// The retired mode switch no longer selects behavior. A retained `disabled`
+/// alongside a vend role was an emergency stop that this build would reverse,
+/// so it fails startup; any other retained value only warns.
+fn check_retired_exchange_token_mode(
+    configured: Result<String, std::env::VarError>,
+    storage_vend_role_configured: bool,
+) -> Result<(), RunCredmgrError> {
+    let Ok(raw) = configured else {
+        return Ok(());
+    };
+    if raw == "disabled" && storage_vend_role_configured {
+        return Err(RunCredmgrError::RetiredExchangeDisabled);
+    }
+    tracing::warn!(
+        env = RETIRED_EXCHANGE_TOKEN_MODE_ENV,
+        value = %raw,
+        "retired storage exchange mode is ignored; every exchange uses the scoped contract"
+    );
+    Ok(())
 }
 
 /// An unset role leaves storage credential exchange off; a set role must be
