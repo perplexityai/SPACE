@@ -257,9 +257,117 @@ struct InitialNetworkState {
     network_rx_bytes: u64,
 }
 
+/// How long after launch host-control may not know this gateway yet.
+/// sandbox-manager registers a gateway's process only once its launch returns,
+/// so a pull before then is refused as from an unknown caller. Within the
+/// window, and up to [`MAX_PENDING_ATTEMPTS`] pulls, such a refusal is pending
+/// registration; after either, a refusal is a failure.
+const REGISTRATION_WINDOW: Duration = Duration::from_secs(10);
+const MAX_PENDING_ATTEMPTS: u32 = 40;
+/// The backoff between pending pulls: doubling from the first to the cap, each
+/// wait drawn uniformly below it (full jitter). Every pull costs host-control a
+/// connection's work and a database read behind the lock that registration
+/// itself takes, so retries must thin out rather than compete with it.
+const PENDING_RETRY_INITIAL: Duration = Duration::from_millis(10);
+const PENDING_RETRY_CAP: Duration = Duration::from_millis(250);
+
+impl HydrateNetworkStateError {
+    /// Host-control refused the caller: it is not the registered gateway of
+    /// any sandbox, which is also the answer before registration.
+    fn is_unregistered_caller(&self) -> bool {
+        matches!(
+            self,
+            Self::GetNetworkPolicy { source, .. } if source.code() == tonic::Code::PermissionDenied
+        )
+    }
+}
+
+/// When a refused pull is still pending registration, and what ends a wait.
+struct RegistrationWait {
+    launched_at: tokio::time::Instant,
+    /// Set by the owner's first control call, which follows its registration
+    /// of this gateway: a pending pull retries at once instead of waiting out
+    /// its backoff.
+    owner_contacted: tokio::sync::watch::Receiver<bool>,
+    /// Draws a wait at or below a backoff bound: [`jittered`] in production.
+    jitter: fn(Duration) -> Duration,
+}
+
+/// Run `pull`, retrying while host-control does not know this gateway yet,
+/// within [`REGISTRATION_WINDOW`] and [`MAX_PENDING_ATTEMPTS`]. The first pull
+/// is immediate; later ones back off with jitter, and the owner's first call
+/// cuts the current wait short. Only an error the window does not cover is
+/// returned.
+async fn pull_once_registered<T, F, Fut>(
+    mut wait: RegistrationWait,
+    mut pull: F,
+) -> Result<T, HydrateNetworkStateError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, HydrateNetworkStateError>>,
+{
+    let mut backoff = PENDING_RETRY_INITIAL;
+    let mut attempts = 0_u32;
+    loop {
+        attempts += 1;
+        match pull().await {
+            Err(error)
+                if error.is_unregistered_caller()
+                    && attempts < MAX_PENDING_ATTEMPTS
+                    && wait.launched_at.elapsed() < REGISTRATION_WINDOW =>
+            {
+                tracing::debug!(%error, attempts, "host-control does not know this net-gateway yet; retrying");
+                let pause = (wait.jitter)(backoff);
+                backoff = backoff.saturating_mul(2).min(PENDING_RETRY_CAP);
+                if *wait.owner_contacted.borrow() {
+                    tokio::time::sleep(pause).await;
+                } else {
+                    tokio::select! {
+                        () = tokio::time::sleep(pause) => {}
+                        _ = wait.owner_contacted.wait_for(|contacted| *contacted) => {}
+                    }
+                }
+            }
+            result => return result,
+        }
+    }
+}
+
+fn jittered(bound: Duration) -> Duration {
+    use rand::RngExt as _;
+    let micros = u64::try_from(bound.as_micros()).unwrap_or(u64::MAX);
+    Duration::from_micros(rand::rng().random_range(0..=micros))
+}
+
 async fn pull_initial_network_state(
     sandbox_id: &str,
+    wait: RegistrationWait,
 ) -> Result<InitialNetworkState, HydrateNetworkStateError> {
+    hydrate_network_state(
+        sandbox_id,
+        wait,
+        connect_host_control(sandbox_id),
+        |client| pull_network_state(sandbox_id, client),
+    )
+    .await
+}
+
+/// Connect, then pull through [`pull_once_registered`] on that one connection,
+/// reporting the outcome as sandbox events: one start, then one completion or
+/// one failure. Every pending pull reuses the connection, since each new one
+/// would cost host-control a handshake while it is registering this gateway.
+async fn hydrate_network_state<C, Connect, F, Fut>(
+    sandbox_id: &str,
+    wait: RegistrationWait,
+    connect: Connect,
+    mut pull: F,
+) -> Result<InitialNetworkState, HydrateNetworkStateError>
+where
+    C: Clone,
+    Connect: std::future::Future<Output = Result<C, HydrateNetworkStateError>>,
+    F: FnMut(C) -> Fut,
+    Fut: std::future::Future<Output = Result<InitialNetworkState, HydrateNetworkStateError>>,
+{
     let details = || SandboxEventDetails::default().operation("initial_policy_hydration");
     emit_sandbox_event(
         sandbox_id,
@@ -267,7 +375,10 @@ async fn pull_initial_network_state(
         SandboxEventSource::NetGateway,
         details(),
     );
-    let result = pull_initial_network_state_inner(sandbox_id).await;
+    let result = match connect.await {
+        Ok(client) => pull_once_registered(wait, || pull(client.clone())).await,
+        Err(error) => Err(error),
+    };
     match &result {
         Ok(state) => emit_sandbox_event(
             sandbox_id,
@@ -287,9 +398,10 @@ async fn pull_initial_network_state(
     result
 }
 
-async fn pull_initial_network_state_inner(
-    sandbox_id: &str,
-) -> Result<InitialNetworkState, HydrateNetworkStateError> {
+type HostControl =
+    HostControlClient<pplx_space_common_grpc::GrpcClientTrace<tonic::transport::Channel>>;
+
+async fn connect_host_control(sandbox_id: &str) -> Result<HostControl, HydrateNetworkStateError> {
     let socket = std::path::Path::new(
         pplx_space_common_core::host::linux::paths::SANDBOX_HOST_CONTROL_SOCKET,
     );
@@ -299,9 +411,15 @@ async fn pull_initial_network_state_inner(
             sandbox_id: sandbox_id.to_string(),
             source,
         })?;
-    let mut client = HostControlClient::new(
+    Ok(HostControlClient::new(
         pplx_space_common_svc::bootstrap::wrap_grpc_client_channel(channel),
-    );
+    ))
+}
+
+async fn pull_network_state(
+    sandbox_id: &str,
+    mut client: HostControl,
+) -> Result<InitialNetworkState, HydrateNetworkStateError> {
     let response = client
         .get_network_policy(GetNetworkPolicyRequest {})
         .await
@@ -323,12 +441,22 @@ async fn pull_initial_network_state_inner(
     })
 }
 
-fn make_policy_loader(sandbox_id: String, stats: Arc<ProxyStats>) -> PolicyLoader {
+fn make_policy_loader(
+    sandbox_id: String,
+    stats: Arc<ProxyStats>,
+    owner_contacted: tokio::sync::watch::Receiver<bool>,
+) -> PolicyLoader {
+    let launched_at = tokio::time::Instant::now();
     Arc::new(move || {
         let sandbox_id = sandbox_id.clone();
         let stats = stats.clone();
+        let wait = RegistrationWait {
+            launched_at,
+            owner_contacted: owner_contacted.clone(),
+            jitter: jittered,
+        };
         Box::pin(async move {
-            let pulled = pull_initial_network_state(&sandbox_id)
+            let pulled = pull_initial_network_state(&sandbox_id, wait)
                 .await
                 .map_err(|error| error.to_string())?;
             stats.merge_persisted_network_bytes(pulled.network_tx_bytes, pulled.network_rx_bytes);
@@ -469,7 +597,11 @@ pub async fn run(
         reserved_dns_cancellation.clone(),
     )
     .with_readiness_metrics();
-    let policy_loader = make_policy_loader(config.sandbox_id.clone(), stats.clone());
+    let policy_loader = make_policy_loader(
+        config.sandbox_id.clone(),
+        stats.clone(),
+        network_state.owner_contact(),
+    );
     let trusted_sandbox_id =
         config
             .sandbox_id

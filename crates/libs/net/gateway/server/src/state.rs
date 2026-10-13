@@ -236,6 +236,7 @@ pub struct GatewayNetworkState {
     reserved_dns_cancellation: ReservedDnsCancellation,
     traffic_gate: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
     readiness_observer: Option<Arc<StartupTiming>>,
+    owner_contacted: Arc<watch::Sender<bool>>,
 }
 
 #[derive(Clone, Debug)]
@@ -376,7 +377,20 @@ impl GatewayNetworkState {
             dns_allow_cache: DnsAllowCache::default(),
             tcp_connections: DnsAttributedTcpTracker::default(),
             reserved_dns_cancellation: ReservedDnsCancellation::default(),
+            owner_contacted: Arc::new(watch::channel(false).0),
         }
+    }
+
+    /// Record that the owning sandbox-manager has called this gateway's control
+    /// socket. The owner registers the gateway's process with host-control
+    /// before it calls, so from now on a policy pull is authorized.
+    pub fn record_owner_contact(&self) {
+        self.owner_contacted.send_replace(true);
+    }
+
+    /// Whether, and when, the owner first called; see [`Self::record_owner_contact`].
+    pub fn owner_contact(&self) -> watch::Receiver<bool> {
+        self.owner_contacted.subscribe()
     }
 
     pub async fn snapshot(&self) -> NetworkStateSnapshot {

@@ -5978,6 +5978,7 @@ dependencies = [
  "pplx-space-spaced-common",
  "pplx-space-test-env",
  "prost",
+ "rand 0.10.2",
  "rcgen",
  "rustls",
  "socket2",

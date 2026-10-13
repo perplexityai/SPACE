@@ -319,6 +319,7 @@ impl NetGatewayControl for NetGatewayControlService {
         request: Request<RefreshNetworkPolicyRequest>,
     ) -> Result<Response<RefreshNetworkPolicyResponse>, Status> {
         self.authorize_peer(&request, "RefreshNetworkPolicy")?;
+        self.network_state.record_owner_contact();
         let req = request.into_inner();
         let expected_policy_ref = parse_expected_policy_ref(&req.expected_policy_ref)?;
         let reason = NetworkStateReason::from_external(&req.reason);
@@ -345,6 +346,7 @@ impl NetGatewayControl for NetGatewayControlService {
         request: Request<SetNoIdentityRequest>,
     ) -> Result<Response<SetNoIdentityResponse>, Status> {
         self.authorize_peer(&request, "SetNoIdentity")?;
+        self.network_state.record_owner_contact();
         let req = request.into_inner();
         let snapshot = self
             .network_state

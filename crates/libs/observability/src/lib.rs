@@ -33,6 +33,15 @@ mod traces;
 
 const RUSQLITE_QUERY_TARGET: &str = "rusqlite::query";
 const SQLX_ACQUIRE_TARGET: &str = "sqlx::pool::acquire";
+/// libdd's shared runtime warns, once per exporter worker, that its
+/// `BasicRuntime` ignores restart-on-fork. datadog-opentelemetry 0.5.2 builds
+/// its trace exporter with libdd's default (restart after fork) on that
+/// runtime, so every process starting the native tracer logged it; SPACE has no
+/// setting that changes it, and no SPACE process forks with the tracer running.
+/// A log filter sees only the callsite, not the message, so the whole module's
+/// WARN level is dropped: in libdd-shared-runtime 3.0.0 this notice is its only
+/// WARN. Recheck that on a libdd upgrade.
+const LIBDD_BASIC_RUNTIME_TARGET: &str = "libdd_shared_runtime::shared_runtime::basic";
 const SQLX_QUERY_TARGET: &str = "sqlx::query";
 
 /// Canonical metric name for successful SQLx pool-acquire duration.
@@ -1103,6 +1112,11 @@ fn should_format_event(metadata: &tracing::Metadata<'_>) -> bool {
     // slow-acquire signal, so it must stay in service logs.
     if metadata.target() == SQLX_ACQUIRE_TARGET {
         return *metadata.level() <= tracing::Level::WARN;
+    }
+    // The module's only WARN is the restart-on-fork notice; its ERROR, a
+    // worker that failed to shut down, still reaches logs.
+    if metadata.target() == LIBDD_BASIC_RUNTIME_TARGET {
+        return *metadata.level() == tracing::Level::ERROR;
     }
     should_format_target(metadata.target())
 }
