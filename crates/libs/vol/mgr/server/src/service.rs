@@ -1143,11 +1143,16 @@ impl VolumeManager for VolumeManagerService {
         let subject = parse_request_subject(&req.subject_id)?;
         self.authorize_sandbox_subject(&peer, &subject, "push_file")?;
         parse_uri(&req.s3_uri)?;
-        let job_id = submit_push(&self.worker, &self.staging, &req).await?;
-        drop(admission);
         let job = self
             .worker
-            .wait_for_job(&job_id, self.worker.worst_case_runtime())
+            .submit_and_wait(
+                async {
+                    let job_id = submit_push(&self.worker, &self.staging, &req).await;
+                    drop(admission);
+                    job_id
+                },
+                self.worker.worst_case_runtime(),
+            )
             .await?;
         if job.status == "completed" {
             Ok(Response::new(PushFileResponse {
@@ -1177,11 +1182,16 @@ impl VolumeManager for VolumeManagerService {
         parse_uri(&req.s3_uri)?;
         let artifact = effective_pull_snapshot_artifact(&req)?;
         let assignment = self.materialization_assignment(&subject, [artifact]);
-        let job_id = submit_pull(&self.worker, &req, assignment)?;
-        drop(admission);
         let job = self
             .worker
-            .wait_for_job(&job_id, self.worker.worst_case_runtime())
+            .submit_and_wait(
+                async {
+                    let job_id = submit_pull(&self.worker, &req, assignment);
+                    drop(admission);
+                    job_id
+                },
+                self.worker.worst_case_runtime(),
+            )
             .await?;
         if job.status == "completed" {
             Ok(Response::new(PullFileResponse {

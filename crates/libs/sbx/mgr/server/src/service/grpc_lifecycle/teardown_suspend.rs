@@ -915,36 +915,38 @@ impl SandboxManagerService {
         {
             return self.verify_teardown_suspend_backup_ownership(sandbox, &backup);
         }
-        let job_id = match persisted_job {
-            Some(job)
-                if !job.is_terminal()
-                    || !teardown_backup_failure_requires_new_attempt(job.failure) =>
-            {
-                job.job_id
-            }
-            _ => match self
-                .enqueue_suspend_artifact_backup(
-                    sandbox,
-                    backup.artifact.local_artifact_id,
-                    &backup.artifact.local_path,
-                    backup.format,
-                    Some(&artifact_dedup_key),
-                )
-                .await
-                .map_err(|error| {
-                    teardown_artifact_backup_status(error, backup.artifact.local_artifact_id)
-                })? {
-                SubmitSuspendSnapshotOutcome::Enqueued { job_id, .. } => job_id,
-                SubmitSuspendSnapshotOutcome::NoUploadConfig => {
-                    return Err(Status::failed_precondition(
-                        "generation suspend requires a configured snapshot upload destination",
-                    ));
+        let submission = async {
+            match persisted_job {
+                Some(job)
+                    if !job.is_terminal()
+                        || !teardown_backup_failure_requires_new_attempt(job.failure) =>
+                {
+                    Ok(job.job_id)
                 }
-            },
+                _ => match self
+                    .enqueue_suspend_artifact_backup(
+                        sandbox,
+                        backup.artifact.local_artifact_id,
+                        &backup.artifact.local_path,
+                        backup.format,
+                        Some(&artifact_dedup_key),
+                    )
+                    .await
+                    .map_err(|error| {
+                        teardown_artifact_backup_status(error, backup.artifact.local_artifact_id)
+                    })? {
+                    SubmitSuspendSnapshotOutcome::Enqueued { job_id, .. } => Ok(job_id),
+                    SubmitSuspendSnapshotOutcome::NoUploadConfig => {
+                        Err(Status::failed_precondition(
+                            "generation suspend requires a configured snapshot upload destination",
+                        ))
+                    }
+                },
+            }
         };
         let job = self
             .snapshot_upload_worker
-            .wait_for_job(&job_id, self.snapshot_upload_worker.worst_case_runtime())
+            .submit_and_wait(submission, self.snapshot_upload_worker.worst_case_runtime())
             .await?;
         if !job.is_terminal() || job.failure.is_some() {
             if matches!(

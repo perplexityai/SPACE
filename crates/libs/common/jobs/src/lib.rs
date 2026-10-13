@@ -266,9 +266,10 @@ pub struct Job {
     pub created_at: String,
     pub started_at: Option<String>,
     pub completed_at: Option<String>,
-    /// W3C `traceparent` captured from the submitting span. Restored on every
-    /// execute attempt so retries and recovery after a process restart stay
-    /// linked under the same Datadog trace as the originating RPC.
+    /// W3C `traceparent` captured from the submitting span. Every execute
+    /// attempt that does not run under a waiting submitter links to it, so
+    /// retries and recovery after a process restart stay linked to the
+    /// originating RPC.
     pub traceparent: Option<String>,
     /// Worker process that currently owns this job lease, when the worker is
     /// running in opt-in leased mode.

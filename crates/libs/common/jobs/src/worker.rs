@@ -19,6 +19,60 @@ use completion::CompletionWaiters;
 /// Default cadence for [`BackgroundWorker::run_queue_metrics`].
 const DEFAULT_QUEUE_METRICS_INTERVAL: Duration = Duration::from_secs(10);
 const DB_MUTEX_POISONED: &str = "common jobs database mutex poisoned";
+const AWAITING_SUBMITTERS_POISONED: &str = "common jobs awaiting-submitter mutex poisoned";
+
+type AwaitingSubmitters = Arc<Mutex<HashMap<JobId, tracing::Span>>>;
+
+tokio::task_local! {
+    /// The registration of a [`BackgroundWorker::submit_and_wait`] call, for
+    /// the jobs its submission creates on that worker.
+    static AWAITING_SUBMITTER: Arc<AwaitingRegistration>;
+}
+
+/// One [`BackgroundWorker::submit_and_wait`] call's waiting span, registered
+/// for each job its submission creates. Dropping the registration, when the
+/// call returns, fails, or is cancelled, removes exactly the jobs it
+/// registered; a deduplicated submission registers nothing, so it never
+/// removes another waiter's job.
+struct AwaitingRegistration {
+    submitters: AwaitingSubmitters,
+    span: tracing::Span,
+    job_ids: Mutex<Vec<JobId>>,
+}
+
+impl AwaitingRegistration {
+    /// Infallible: the job's row is already inserted, so a failure here would
+    /// report a submitted job as rejected.
+    fn register(&self, job_id: JobId) {
+        let mut submitters = self
+            .submitters
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut job_ids = self
+            .job_ids
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        submitters.insert(job_id, self.span.clone());
+        job_ids.push(job_id);
+    }
+}
+
+impl Drop for AwaitingRegistration {
+    fn drop(&mut self) {
+        let job_ids = std::mem::take(
+            self.job_ids
+                .get_mut()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        let mut submitters = self
+            .submitters
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for job_id in &job_ids {
+            submitters.remove(job_id);
+        }
+    }
+}
 
 pub const COMPLETED_JOB_RETENTION: Duration = Duration::from_secs(4 * 24 * 60 * 60);
 pub const FAILED_JOB_RETENTION: Duration = Duration::from_secs(10 * 24 * 60 * 60);
@@ -320,6 +374,10 @@ pub struct BackgroundWorker<E> {
     stopping: CancellationToken,
     completion_waiters: CompletionWaiters,
     cancellation_tokens: Arc<Mutex<HashMap<JobId, CancellationToken>>>,
+    /// The waiting submitter's span for each job a
+    /// [`submit_and_wait`](Self::submit_and_wait) call created, held only
+    /// while it waits.
+    awaiting_submitters: AwaitingSubmitters,
     job_timeout: Duration,
     max_attempts: i32,
     lease: Option<LeaseConfig>,
@@ -394,6 +452,7 @@ impl<E: JobExecutor> BackgroundWorker<E> {
             stopping: CancellationToken::new(),
             completion_waiters: CompletionWaiters::default(),
             cancellation_tokens: Arc::new(Mutex::new(HashMap::new())),
+            awaiting_submitters: Arc::new(Mutex::new(HashMap::new())),
             job_timeout: config.job_timeout,
             max_attempts: config.max_attempts,
             lease: config.lease,
@@ -856,6 +915,14 @@ impl<E: JobExecutor> BackgroundWorker<E> {
                 admission_band.active_jobs
             )));
         }
+        // Registered before the database lock is released, so no claim of the
+        // new row can miss its waiting submitter.
+        if let Ok(Some(registration)) = AWAITING_SUBMITTER.try_with(|registration| {
+            Arc::ptr_eq(&registration.submitters, &self.awaiting_submitters)
+                .then(|| registration.clone())
+        }) {
+            registration.register(job_id);
+        }
         drop(conn);
 
         pplx_space_metrics::jobs::submitted(kind, "miss");
@@ -883,6 +950,34 @@ impl<E: JobExecutor> BackgroundWorker<E> {
         self.scheduler_for(kind)
             .raise_waiting_priority(job_id, priority);
         Ok(())
+    }
+
+    /// Run `submission`, which submits one job through this worker, then
+    /// [`wait_for_job`](Self::wait_for_job) for the job it returns.
+    ///
+    /// A job the submission creates runs as a child of the current span, a
+    /// real in-process parent for work the caller is waiting on. Any other job
+    /// starts its own trace with a link to its submitter (see
+    /// `execute_claimed_job`), and so does a deduplicated submission, whose job
+    /// another submitter created.
+    pub async fn submit_and_wait<F>(&self, submission: F, timeout: Duration) -> Result<Job, Status>
+    where
+        F: Future<Output = Result<JobId, Status>>,
+    {
+        // Attempts started while the caller waited keep their parent. Once the
+        // call ends, however it ends, a retry, or a job still queued when it
+        // gave up, starts its own trace.
+        let registration = Arc::new(AwaitingRegistration {
+            submitters: self.awaiting_submitters.clone(),
+            span: tracing::Span::current(),
+            job_ids: Mutex::default(),
+        });
+        let job_id = AWAITING_SUBMITTER
+            .scope(registration.clone(), submission)
+            .await?;
+        let job = self.wait_for_job(&job_id, timeout).await;
+        drop(registration);
+        job
     }
 
     /// Block until the persisted job reaches a terminal state or the timeout elapses.
@@ -1378,7 +1473,22 @@ impl<E: JobExecutor> BackgroundWorker<E> {
         pplx_space_metrics::jobs::started(&job.kind, job.attempts);
 
         let operation_name = format!("job.{}", job.kind);
+        // A submitter waiting in `submit_and_wait` is the job's parent. Any
+        // other job is a root linked to the trace context saved at submission.
+        // Parenting it on that saved context would hold a still-running
+        // submitter's trace open for work it does not wait for, and make a
+        // submitter that has returned the parent of a span that outlives it.
+        // The clone keeps the submitter's span, and so its ID, alive until the
+        // child holds it.
+        let submitter = self
+            .awaiting_submitters
+            .lock()
+            .expect(AWAITING_SUBMITTERS_POISONED)
+            .get(&job.job_id)
+            .cloned();
+        let parent = submitter.as_ref().and_then(tracing::Span::id);
         let job_span = tracing::info_span!(
+            parent: parent.clone(),
             "job.execute",
             otel.kind = "internal",
             otel.name = %operation_name,
@@ -1394,8 +1504,11 @@ impl<E: JobExecutor> BackgroundWorker<E> {
             otel.status_code = tracing::field::Empty,
             error = tracing::field::Empty,
         );
-        if let Some(traceparent) = job.traceparent.as_deref() {
-            pplx_space_observability::trace_propagation::set_span_parent_from_traceparent(
+        drop(submitter);
+        if parent.is_none()
+            && let Some(traceparent) = job.traceparent.as_deref()
+        {
+            pplx_space_observability::trace_propagation::link_span_from_traceparent(
                 &job_span,
                 traceparent,
             );
@@ -1854,6 +1967,9 @@ fn is_constraint_violation(error: &rusqlite::Error) -> bool {
             if sqlite_error.code == rusqlite::ErrorCode::ConstraintViolation
     )
 }
+
+#[cfg(test)]
+mod submit_and_wait_tests;
 
 #[cfg(test)]
 mod wait_for_job_tests;
