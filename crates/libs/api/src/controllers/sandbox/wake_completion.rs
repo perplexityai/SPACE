@@ -41,7 +41,7 @@ use pplx_space_sandbox_store as sandbox_store;
 use sqlx::PgPool;
 use tokio::sync::Semaphore;
 
-use crate::controllers::substrate::Substrate;
+use crate::controllers::substrate::{Substrate, SubstrateCapabilities};
 
 /// How often the redrive re-checks the row and re-attempts hydration. The
 /// node-side restore this waits on takes seconds to low tens of seconds;
@@ -78,25 +78,27 @@ pub(super) fn redrive_budget() -> Duration {
 }
 
 /// Whether the cancellation shield applies to this wake: only restore-shaped
-/// wakes (`suspended`/`restoring` pre-wake lifecycle) on the Kubernetes
-/// substrate. Everything else keeps existing semantics:
-/// * the direct substrate's restore never flips the row out of `suspended`
-///   mid-flight, so a cancelled direct restore leaves an already-recoverable
-///   state;
+/// wakes (`suspended`/`restoring` pre-wake lifecycle) on a substrate that
+/// leaves `restoring -> started` to the caller's completion CAS (Kubernetes).
+/// Everything else keeps existing semantics:
+/// * the direct substrate does not guarantee this: its worker-local
+///   wake leaves the pre-wake lifecycle (`suspended`, or `restoring` kept by
+///   an earlier lease restore) for the completion CAS, and its lease restore
+///   writes `started` itself, so a cancelled direct wake leaves `suspended`,
+///   `started`, or a `restoring` row that a later restore reclaims once any
+///   lease expires;
 /// * pause/resume and stop/start wakes don't take the restore claim and have
 ///   no execution to hydrate — their (much rarer) cancellation class is a
 ///   separate piece of work.
-pub(super) fn shield_applies(substrate: &Substrate, pre_wake_lifecycle: SandboxLifecycle) -> bool {
+pub(super) fn shield_applies(
+    capabilities: SubstrateCapabilities,
+    pre_wake_lifecycle: SandboxLifecycle,
+) -> bool {
     let restore_shaped = matches!(
         pre_wake_lifecycle,
         SandboxLifecycle::Suspended | SandboxLifecycle::Restoring
     );
-    let kubernetes = match substrate {
-        Substrate::Direct(_) => false,
-        #[cfg(feature = "kubernetes")]
-        Substrate::Kubernetes(_) => true,
-    };
-    restore_shaped && kubernetes
+    restore_shaped && capabilities.caller_completes_claimed_restore
 }
 
 /// Drop-guard that owns the boxed redrive future while the wake handler is

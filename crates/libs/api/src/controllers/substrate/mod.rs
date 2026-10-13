@@ -2132,6 +2132,70 @@ impl RecoveryCharge {
     }
 }
 
+/// How the substrate addresses a node for node-api calls: which field of a
+/// [`NodeApiTarget`] must be present. Must match the field the substrate's
+/// [`SubstrateAdapter::resolve_node_api_endpoint`] requires.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NodeAddressing {
+    /// The node row's stored node-api endpoint (`direct_endpoint`).
+    DirectEndpoint,
+    /// An opaque substrate node identifier (`substrate_node_id`) that the
+    /// substrate resolves to an endpoint.
+    SubstrateNodeId,
+}
+
+/// Static facts about what a substrate supports. Shared code reads these
+/// instead of matching on which substrate is active. Each substrate returns
+/// one of the constants below; behavior that needs the substrate to act stays
+/// a [`SubstrateAdapter`] method.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubstrateCapabilities {
+    /// Every restore-shaped wake (from `suspended` or `restoring`) claims
+    /// `restoring` before its node call and leaves `restoring -> started` to
+    /// the caller's completion CAS. The caller can then treat a `suspended`
+    /// row at completion as a newer, finalized suspend and fence it, and must
+    /// shield that CAS against request cancellation.
+    ///
+    /// `false` does not mean the substrate's rows are never `restoring`.
+    /// Direct's worker-local wake leaves its pre-wake lifecycle (`suspended`,
+    /// or `restoring` kept by an earlier lease restore) for the completion CAS
+    /// to advance; its lease restore claims `restoring` and writes `started`
+    /// itself.
+    pub caller_completes_claimed_restore: bool,
+    /// How node-api targets are addressed.
+    pub node_addressing: NodeAddressing,
+    /// Nodes live in the admin API's node registry: they are registered,
+    /// updated and deleted there, and their templates are pulled and deleted
+    /// there, rather than discovered by the substrate.
+    pub registers_nodes_via_admin_api: bool,
+    /// The control plane resolves a cold Firecracker create's shape: a
+    /// fallthrough create takes a configured or policy pool shape, and
+    /// otherwise vCPU and memory the request left unset come from the
+    /// template's build shape. Without it, the requested shape goes to the
+    /// node unchanged.
+    pub resolves_cold_create_shape: bool,
+    /// Create requests may carry a Kubernetes node-pool placement pin.
+    pub supports_node_pool_placement: bool,
+}
+
+impl SubstrateCapabilities {
+    pub const DIRECT: Self = Self {
+        caller_completes_claimed_restore: false,
+        node_addressing: NodeAddressing::DirectEndpoint,
+        registers_nodes_via_admin_api: true,
+        resolves_cold_create_shape: false,
+        supports_node_pool_placement: false,
+    };
+
+    pub const KUBERNETES: Self = Self {
+        caller_completes_claimed_restore: true,
+        node_addressing: NodeAddressing::SubstrateNodeId,
+        registers_nodes_via_admin_api: false,
+        resolves_cold_create_shape: true,
+        supports_node_pool_placement: true,
+    };
+}
+
 #[allow(async_fn_in_trait)]
 pub trait SubstrateAdapter: Send + Sync {
     /// Stable label written to control-plane metadata for this substrate.
@@ -2140,10 +2204,9 @@ pub trait SubstrateAdapter: Send + Sync {
     /// execution binding, not this label.
     fn managed_by(&self) -> &'static str;
 
-    /// Whether create requests may carry a Kubernetes node-pool placement pin.
-    fn supports_node_pool_placement(&self) -> bool {
-        false
-    }
+    /// What this substrate supports. Required, so every substrate (and the
+    /// `Substrate` forwarding impl) states its answer.
+    fn capabilities(&self) -> SubstrateCapabilities;
 
     /// Create the active execution object for a newly-created sandbox.
     ///
@@ -3235,11 +3298,11 @@ impl SubstrateAdapter for Substrate {
         }
     }
 
-    fn supports_node_pool_placement(&self) -> bool {
+    fn capabilities(&self) -> SubstrateCapabilities {
         match self {
-            Self::Direct(substrate) => substrate.supports_node_pool_placement(),
+            Self::Direct(substrate) => substrate.capabilities(),
             #[cfg(feature = "kubernetes")]
-            Self::Kubernetes(substrate) => substrate.supports_node_pool_placement(),
+            Self::Kubernetes(substrate) => substrate.capabilities(),
         }
     }
 

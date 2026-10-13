@@ -532,3 +532,108 @@ fn admin_sandbox_reads_keep_the_controller_contention_disposition() {
         "the non-contention path must still run the call site's log; it is the only record"
     );
 }
+
+/// With placement enabled, an admin create pinned to a node pool is refused
+/// on a substrate without node-pool placement (Direct) and accepted, with the
+/// pin persisted in the queued create, on one that has it (Kubernetes).
+#[tokio::test]
+async fn admin_pinned_create_follows_the_running_substrate() -> TestResult {
+    // Turn the placement gate on, and keep the substrate `AppState::from_pool`
+    // chooses from the process environment Direct whatever the host sets.
+    if !pplx_space_test_env::enter_test_process(&[
+        (
+            pplx_space_common_core::env::SANDBOX_ALLOW_PLACEMENT_ENV,
+            Some(std::ffi::OsStr::new("true")),
+        ),
+        (
+            "SPACE_K8S_CONTROL_PLANE",
+            Some(std::ffi::OsStr::new("false")),
+        ),
+    ]) {
+        return Ok(());
+    }
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let actor = sqlx::query_as::<_, crate::models::User>(sql!(
+        "SELECT u.*
+         FROM users u
+         JOIN clusters c ON c.managing_org_id = u.org_id
+         WHERE c.singleton
+           AND u.role = 'organization_admin'
+         ORDER BY u.id
+         LIMIT 1"
+    ))
+    .fetch_one(&db.pool)
+    .await?;
+    let direct = AppState::from_pool(db.pool.clone()).await?;
+    assert_eq!(direct.sandbox_controller.managed_by(), "space");
+
+    #[cfg_attr(not(feature = "kubernetes"), allow(unused_mut))]
+    let mut cases = vec![(direct, StatusCode::BAD_REQUEST)];
+    #[cfg(feature = "kubernetes")]
+    {
+        let mut kubernetes = AppState::from_pool(db.pool.clone()).await?;
+        kubernetes.sandbox_controller = crate::controllers::sandbox::SandboxController::new(
+            crate::controllers::substrate::Substrate::Kubernetes(Box::new(
+                crate::controllers::substrate::kubernetes::tests::substrate_with_store(
+                    db.pool.clone(),
+                ),
+            )),
+        );
+        cases.push((kubernetes, StatusCode::ACCEPTED));
+    }
+
+    for (state, expected_status) in cases {
+        let substrate = state.sandbox_controller.managed_by();
+        let org_id = seed_org(&db.pool).await?;
+        seed_user(&db.pool, OrgId::from_uuid(org_id)).await?;
+        let request = serde_json::from_value(serde_json::json!({
+            "org_id": org_id,
+            "sandbox": {
+                "name": null,
+                "template": "seed",
+                "runtime": "fc",
+                "env": {},
+                "metadata": {},
+                "resources": null
+            },
+            "node_pool": "isolated-test-pool"
+        }))?;
+        let mut headers = HeaderMap::new();
+        headers.insert("idempotency-key", Uuid::now_v7().to_string().parse()?);
+
+        let response = create_sandbox(
+            State(state.clone()),
+            Extension(AuthUser(actor.clone())),
+            headers,
+            AdminCreateJson(request),
+        )
+        .await;
+
+        assert_eq!(response.status(), expected_status, "{substrate} substrate");
+        let persisted_pins: Vec<Option<String>> = sqlx::query_scalar(sql!(
+            "SELECT payload_json->>'node_pool' FROM public_operations WHERE org_id = $1"
+        ))
+        .bind(org_id)
+        .fetch_all(&db.pool)
+        .await?;
+        if expected_status == StatusCode::ACCEPTED {
+            assert_eq!(
+                persisted_pins,
+                [Some("isolated-test-pool".to_owned())],
+                "{substrate} substrate"
+            );
+        } else {
+            let body: serde_json::Value = serde_json::from_slice(
+                &axum::body::to_bytes(response.into_body(), 100_000).await?,
+            )?;
+            assert_eq!(
+                body["error"], "sandbox node-pool placement requires the Kubernetes substrate",
+                "{substrate} substrate"
+            );
+            assert!(persisted_pins.is_empty(), "{substrate} substrate");
+        }
+    }
+    Ok(())
+}

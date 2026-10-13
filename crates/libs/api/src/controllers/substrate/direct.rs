@@ -27,7 +27,8 @@ use super::{
     ExecutionBinding, NodeApiTarget, NodeInventoryEntry, OwnedNodeApiTarget, PooledExecutionClaim,
     PooledExecutionClaimAttempt, PooledExecutionClaimRequest, PooledExecutionPoolShape,
     RetireExecutionOutcome, RetireExecutionRequest, RuntimeClient, SubstrateAdapter,
-    SubstrateError, connect_builder, connect_worker, node_api_endpoint, substrate_db_error,
+    SubstrateCapabilities, SubstrateError, connect_builder, connect_worker, node_api_endpoint,
+    substrate_db_error,
 };
 use crate::controllers::auto_lifecycle::policy_to_proto;
 use crate::controllers::{ControllerError, db_contention_error};
@@ -3085,6 +3086,10 @@ impl DirectSubstrate {
 impl SubstrateAdapter for DirectSubstrate {
     fn managed_by(&self) -> &'static str {
         "space"
+    }
+
+    fn capabilities(&self) -> SubstrateCapabilities {
+        SubstrateCapabilities::DIRECT
     }
 
     fn pool_eligible_for_request(

@@ -428,8 +428,14 @@ fn ensure_template_capable_node(
     Ok(())
 }
 
-fn require_direct_substrate(state: &AppState) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
-    if state.sandbox_controller.managed_by() != "space" {
+fn require_admin_node_registry(
+    state: &AppState,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    if !state
+        .sandbox_controller
+        .substrate_capabilities()
+        .registers_nodes_via_admin_api
+    {
         return Err(api_error(
             StatusCode::NOT_IMPLEMENTED,
             "direct node registry is only available for the direct/self-managed substrate",
@@ -995,7 +1001,7 @@ pub async fn create_node(
     if let Err(err) = require_managing_org_admin(&state.pool, &actor).await {
         return err.into_response();
     }
-    if let Err(err) = require_direct_substrate(&state) {
+    if let Err(err) = require_admin_node_registry(&state) {
         return err.into_response();
     }
     let role = req.role;
@@ -1189,7 +1195,7 @@ pub async fn update_node(
     if let Err(err) = require_managing_org_admin(&state.pool, &actor).await {
         return err.into_response();
     }
-    if let Err(err) = require_direct_substrate(&state) {
+    if let Err(err) = require_admin_node_registry(&state) {
         return err.into_response();
     }
     if let Some(metadata) = req.metadata.as_ref()
@@ -1326,7 +1332,7 @@ pub async fn delete_node(
     if let Err(err) = require_managing_org_admin(&state.pool, &actor).await {
         return err.into_response();
     }
-    if let Err(err) = require_direct_substrate(&state) {
+    if let Err(err) = require_admin_node_registry(&state) {
         return err.into_response();
     }
 
@@ -1578,7 +1584,7 @@ pub async fn pull_node_template(
     if let Err(err) = require_managing_org_admin(&state.pool, &actor).await {
         return err.into_response();
     }
-    if let Err(err) = require_direct_substrate(&state) {
+    if let Err(err) = require_admin_node_registry(&state) {
         return err.into_response();
     }
 
@@ -1709,7 +1715,7 @@ pub async fn delete_node_template(
     if let Err(err) = require_managing_org_admin(&state.pool, &actor).await {
         return err.into_response();
     }
-    if let Err(err) = require_direct_substrate(&state) {
+    if let Err(err) = require_admin_node_registry(&state) {
         return err.into_response();
     }
 

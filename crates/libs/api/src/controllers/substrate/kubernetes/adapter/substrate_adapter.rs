@@ -7,8 +7,8 @@ impl SubstrateAdapter for KubernetesSubstrate {
         "k8s"
     }
 
-    fn supports_node_pool_placement(&self) -> bool {
-        true
+    fn capabilities(&self) -> SubstrateCapabilities {
+        SubstrateCapabilities::KUBERNETES
     }
 
     async fn create_execution<'a>(

@@ -361,11 +361,13 @@ enum PublishedSuspendFence {
 }
 
 impl PublishedSuspendFence {
-    fn for_substrate(substrate: &crate::controllers::substrate::Substrate) -> Self {
-        match substrate {
-            crate::controllers::substrate::Substrate::Direct(_) => Self::DirectRestoreBaseline,
-            #[cfg(feature = "kubernetes")]
-            crate::controllers::substrate::Substrate::Kubernetes(_) => Self::Enforced,
+    fn for_capabilities(
+        capabilities: crate::controllers::substrate::SubstrateCapabilities,
+    ) -> Self {
+        if capabilities.caller_completes_claimed_restore {
+            Self::Enforced
+        } else {
+            Self::DirectRestoreBaseline
         }
     }
 }
@@ -375,10 +377,13 @@ impl PublishedSuspendFence {
 /// A suspend claim can land after the node finishes waking but before this
 /// control-plane write. In that case the node-side wake succeeded, so callers
 /// may continue, but this stale completion must not replace `suspending` with
-/// `started`. Kubernetes also fences a finalized `suspended` state. Direct
-/// restores retain `suspended` as their owned baseline because that substrate
-/// does not claim `restoring` before its node call. Other CAS losses retain the
-/// existing error behavior.
+/// `started`. A substrate whose restore-shaped wakes claim `restoring` before
+/// the node call and leave `restoring -> started` to this CAS (Kubernetes)
+/// also fences a finalized `suspended` state. Direct does not: its
+/// worker-local wake leaves its pre-wake lifecycle (`suspended`, or
+/// `restoring` kept by an earlier lease restore) for this CAS to advance, and
+/// its lease restore writes `started` before returning.
+/// Other CAS losses retain the existing error behavior.
 async fn complete_wake_lifecycle(
     pool: &PgPool,
     sandbox_id: SandboxId,
@@ -1659,7 +1664,9 @@ impl SandboxController {
                     if sandbox
                         .lifecycle
                         .parse::<SandboxLifecycle>()
-                        .is_ok_and(|lc| wake_completion::shield_applies(&self.substrate, lc))
+                        .is_ok_and(|lc| {
+                            wake_completion::shield_applies(self.substrate.capabilities(), lc)
+                        })
                     {
                         completion_guard.arm(wake_completion::wake_completion_redrive(
                             pool.clone(),
@@ -1735,7 +1742,7 @@ impl SandboxController {
                     // completion must never overwrite if a stop, delete, or
                     // newer suspend wins while substrate work is in flight.
                     let published_suspend_fence =
-                        PublishedSuspendFence::for_substrate(&self.substrate);
+                        PublishedSuspendFence::for_capabilities(self.substrate.capabilities());
                     let cas_result =
                         complete_wake_lifecycle(pool, id, published_suspend_fence).await;
                     // Explicit exit either way from here (Ok, cas-lost, or DB
@@ -1826,7 +1833,9 @@ impl SandboxController {
                     if sandbox
                         .lifecycle
                         .parse::<SandboxLifecycle>()
-                        .is_ok_and(|lc| wake_completion::shield_applies(&self.substrate, lc))
+                        .is_ok_and(|lc| {
+                            wake_completion::shield_applies(self.substrate.capabilities(), lc)
+                        })
                     {
                         completion_guard.arm(wake_completion::wake_completion_redrive(
                             pool.clone(),
@@ -1875,20 +1884,21 @@ impl SandboxController {
                     // Refuse to overwrite a terminal, teardown, or newer
                     // suspend lifecycle.
                     // We can't guard on `lifecycle = 'restoring'` alone
-                    // because the two substrates enter restore from different
+                    // because the two substrates reach this CAS from different
                     // lifecycles: the Kubernetes substrate's
                     // `begin_restore_lifecycle` flips
                     // `suspended -> restoring` before the substrate call, so
                     // the row sits in `restoring` during the slow part; the
-                    // direct substrate's `restore_execution` doesn't touch
-                    // lifecycle at all, so the row sits in `suspended` for the
-                    // duration. The terminal-state exclusion is the only
+                    // direct substrate's `restore_execution` claims
+                    // `restoring` under its own lease and writes `started`
+                    // itself before returning, so the row is already
+                    // `started` here. The terminal-state exclusion is the only
                     // predicate that catches "sweeper landed" uniformly across
                     // substrates. On race-loss we surface a 5xx so the caller
                     // re-issues rather than silently observing a `started` row
                     // pointing at a deleted execution.
                     let published_suspend_fence =
-                        PublishedSuspendFence::for_substrate(&self.substrate);
+                        PublishedSuspendFence::for_capabilities(self.substrate.capabilities());
                     let cas_result =
                         complete_wake_lifecycle(pool, id, published_suspend_fence).await;
                     // Explicit exit either way from here — see the Wake arm.

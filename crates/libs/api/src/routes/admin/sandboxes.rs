@@ -242,7 +242,10 @@ pub async fn create_sandbox(
         &state.pool,
         request,
         &idempotency_key,
-        state.sandbox_controller.supports_node_pool_placement(),
+        state
+            .sandbox_controller
+            .substrate_capabilities()
+            .supports_node_pool_placement,
     )
     .await
     {

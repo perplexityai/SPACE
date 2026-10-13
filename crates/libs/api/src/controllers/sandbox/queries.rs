@@ -4,7 +4,7 @@ use super::*;
 use crate::controllers::substrate::{
     AdmissionPoolClaim, AdmittedPoolClaim, AdmittedPoolClaimLookup, CreateBootMode,
     PooledClaimRefusal, PooledExecutionClaim, PooledExecutionClaimRequest,
-    PooledExecutionPoolShape, PooledPrepareFailureCleanup,
+    PooledExecutionPoolShape, PooledPrepareFailureCleanup, SubstrateCapabilities,
 };
 use crate::controllers::{db_contention_error, internal_error, pool_store_error};
 use crate::reconcile_queue::finalize_sandbox_db_delete_tx;
@@ -566,7 +566,7 @@ struct KubernetesPoolAssignment {
 }
 
 struct ColdCreateShapeInput<'a> {
-    managed_by: &'static str,
+    capabilities: SubstrateCapabilities,
     runtime: RuntimeKind,
     boot_mode: CreateBootMode,
     template: &'a TemplateName,
@@ -594,7 +594,7 @@ async fn resolve_cold_create_resources(
     input: ColdCreateShapeInput<'_>,
 ) -> Result<(SandboxResources, DiskIoLimits), ControllerError> {
     let ColdCreateShapeInput {
-        managed_by,
+        capabilities,
         runtime,
         boot_mode,
         template,
@@ -603,7 +603,7 @@ async fn resolve_cold_create_resources(
         requested,
         restoring,
     } = input;
-    if managed_by != "k8s" || runtime != RuntimeKind::Firecracker {
+    if !capabilities.resolves_cold_create_shape || runtime != RuntimeKind::Firecracker {
         return Ok((requested, DiskIoLimits::default()));
     }
     if boot_mode == CreateBootMode::Fallthrough
@@ -1318,7 +1318,7 @@ impl SandboxController {
         let (resources, disk_io_limits) = resolve_cold_create_resources(
             pool,
             ColdCreateShapeInput {
-                managed_by: self.substrate.managed_by(),
+                capabilities: self.substrate.capabilities(),
                 runtime,
                 boot_mode,
                 template: &template_name,

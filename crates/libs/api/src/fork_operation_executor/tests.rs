@@ -649,14 +649,14 @@ mod cold_copy_tests {
 #[test]
 fn kubernetes_copy_target_requires_a_substrate_node_id() {
     assert!(!active_copy_node_target_is_complete(
-        CopyNodeEndpointRequirement::SubstrateNodeId,
+        NodeAddressing::SubstrateNodeId,
         true,
         true,
         true,
         false,
     ));
     assert!(active_copy_node_target_is_complete(
-        CopyNodeEndpointRequirement::SubstrateNodeId,
+        NodeAddressing::SubstrateNodeId,
         true,
         true,
         true,
@@ -667,7 +667,7 @@ fn kubernetes_copy_target_requires_a_substrate_node_id() {
 #[test]
 fn direct_copy_target_accepts_a_direct_endpoint() {
     assert!(active_copy_node_target_is_complete(
-        CopyNodeEndpointRequirement::DirectEndpoint,
+        NodeAddressing::DirectEndpoint,
         true,
         true,
         true,

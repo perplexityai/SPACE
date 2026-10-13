@@ -126,3 +126,47 @@ async fn wake_completion_cas_outcome_for_every_prior_lifecycle() -> TestResult {
     }
     Ok(())
 }
+
+/// The wake and restore arms pick the fence from the running substrate. On a
+/// row still `suspended` at completion, Kubernetes, whose restore leaves
+/// `restoring -> started` to this CAS, defers to it as a newer suspend; Direct,
+/// whose worker-local wake keeps `suspended` as its baseline, advances it.
+#[tokio::test(flavor = "current_thread")]
+async fn wake_completion_fence_follows_the_running_substrate() -> TestResult {
+    use crate::controllers::substrate::{Substrate, direct::DirectSubstrate};
+
+    let db = pg_test_db().await?;
+    let pool = &db.pool;
+
+    #[cfg_attr(not(feature = "kubernetes"), allow(unused_mut))]
+    let mut cases = vec![(
+        Substrate::Direct(Box::new(DirectSubstrate::new(pool.clone()))),
+        "started",
+    )];
+    #[cfg(feature = "kubernetes")]
+    cases.push((
+        Substrate::Kubernetes(Box::new(
+            crate::controllers::substrate::kubernetes::tests::substrate_with_store(pool.clone()),
+        )),
+        "suspended",
+    ));
+
+    for (substrate, expected) in cases {
+        let sandbox_id = SandboxId::new();
+        insert_sandbox(pool, sandbox_id, "suspended").await?;
+
+        let fence = PublishedSuspendFence::for_capabilities(substrate.capabilities());
+        complete_wake_lifecycle(pool, sandbox_id, fence).await?;
+
+        let lifecycle = lifecycle_and_placement(pool, sandbox_id)
+            .await?
+            .map(|(lifecycle, _)| lifecycle);
+        assert_eq!(
+            lifecycle.as_deref(),
+            Some(expected),
+            "{} substrate",
+            substrate.managed_by()
+        );
+    }
+    Ok(())
+}

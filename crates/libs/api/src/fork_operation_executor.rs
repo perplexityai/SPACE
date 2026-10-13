@@ -18,7 +18,9 @@ use pplx_space_public_api::{
 };
 use sqlx::PgPool;
 
-use crate::controllers::substrate::{OwnedNodeApiTarget, SnapshotRef, Substrate, SubstrateAdapter};
+use crate::controllers::substrate::{
+    NodeAddressing, OwnedNodeApiTarget, SnapshotRef, Substrate, SubstrateAdapter,
+};
 use crate::controllers::{
     ControllerError,
     sandbox::{
@@ -44,28 +46,14 @@ const MAX_BACKUP_ATTEMPTS: u8 = 3;
 const CLAIM_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 const EXTERNAL_WORK_DEADLINE: Duration = Duration::from_secs(600);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CopyNodeEndpointRequirement {
-    DirectEndpoint,
-    SubstrateNodeId,
-}
-
 struct SuccessfulForkTargetRecord {
     target_id: SandboxId,
     result: ForkTargetOutcome,
     snapshot_id: Option<SnapshotId>,
 }
 
-fn copy_node_endpoint_requirement(substrate: &Substrate) -> CopyNodeEndpointRequirement {
-    match substrate {
-        Substrate::Direct(_) => CopyNodeEndpointRequirement::DirectEndpoint,
-        #[cfg(feature = "kubernetes")]
-        Substrate::Kubernetes(_) => CopyNodeEndpointRequirement::SubstrateNodeId,
-    }
-}
-
 fn active_copy_node_target_is_complete(
-    endpoint_requirement: CopyNodeEndpointRequirement,
+    node_addressing: NodeAddressing,
     managed_by_present: bool,
     role_present: bool,
     direct_endpoint_present: bool,
@@ -73,9 +61,9 @@ fn active_copy_node_target_is_complete(
 ) -> bool {
     managed_by_present
         && role_present
-        && match endpoint_requirement {
-            CopyNodeEndpointRequirement::DirectEndpoint => direct_endpoint_present,
-            CopyNodeEndpointRequirement::SubstrateNodeId => substrate_node_id_present,
+        && match node_addressing {
+            NodeAddressing::DirectEndpoint => direct_endpoint_present,
+            NodeAddressing::SubstrateNodeId => substrate_node_id_present,
         }
 }
 
@@ -800,7 +788,7 @@ impl ForkSandboxOperationExecutor {
                 .map_err(ForkExecutionError::retry_error)?
                 .ok_or_else(|| ForkExecutionError::not_found("source sandbox disappeared"))?;
             let active_target_is_complete = active_copy_node_target_is_complete(
-                copy_node_endpoint_requirement(&self.substrate),
+                self.substrate.capabilities().node_addressing,
                 source.active_node_managed_by.is_some(),
                 source.active_node_role.is_some(),
                 source.active_node_address.is_some(),

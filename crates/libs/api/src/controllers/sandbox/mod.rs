@@ -1122,8 +1122,8 @@ impl SandboxController {
         self.substrate.managed_by()
     }
 
-    pub fn supports_node_pool_placement(&self) -> bool {
-        self.substrate.supports_node_pool_placement()
+    pub fn substrate_capabilities(&self) -> super::substrate::SubstrateCapabilities {
+        self.substrate.capabilities()
     }
 
     pub async fn set_node_schedulability(
