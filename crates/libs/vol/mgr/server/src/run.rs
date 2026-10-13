@@ -253,6 +253,8 @@ pub struct VolmgrRunConfig {
     pub transfer_timeout: Duration,
     /// Maximum retry attempts before a transfer job is permanently failed.
     pub transfer_max_attempts: i32,
+    /// Push dependency outage retry budget, measured from transfer creation.
+    pub dependency_retry_budget: Duration,
     /// How long to wait for in-flight RPCs after SIGTERM.
     pub server_drain_timeout: Duration,
     /// How long to wait for outstanding transfers before the gRPC server stops.
@@ -504,6 +506,7 @@ pub async fn run(
             transfer_timeout: config.transfer_timeout,
             max_attempts: config.transfer_max_attempts,
             executor: TransferExecutorConfig {
+                dependency_retry_budget: Some(config.dependency_retry_budget),
                 compress: config.compress,
                 snapshot_upload_mode: config.snapshot_upload_mode.clone(),
                 stream_decode_pulls: config.stream_decode_pulls,

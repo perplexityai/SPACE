@@ -3,6 +3,51 @@ use pplx_space_metrics::object_store::S3AttemptFailureKind;
 use std::io::SeekFrom;
 use tokio::io::AsyncSeekExt;
 
+#[tokio::test]
+async fn upload_dependency_errors_preserve_typed_outage_evidence() {
+    use crate::test_support::{Recorder, credentials, every_class, serve, store};
+    for (status, dependency) in [
+        (http::StatusCode::SERVICE_UNAVAILABLE, true),
+        (http::StatusCode::TOO_MANY_REQUESTS, true),
+        (http::StatusCode::FORBIDDEN, false),
+        (http::StatusCode::BAD_REQUEST, false),
+    ] {
+        let endpoint = serve(axum::Router::new().fallback(move || async move {
+            (
+                status,
+                "<Error><Code>SyntheticFailure</Code><Message>synthetic</Message></Error>",
+            )
+        }))
+        .await;
+        let recorder = std::sync::Arc::new(Recorder::default());
+        let store = store(
+            every_class(Duration::from_secs(1), Duration::from_secs(5)),
+            Duration::from_secs(1),
+            &recorder,
+        );
+        let target = ObjectTarget {
+            bucket: "synthetic-bucket",
+            key: "suspend/memory",
+            region: "us-east-1",
+            endpoint: Some(&endpoint),
+            path_style: true,
+        };
+        let error = store
+            .put_bytes(
+                &credentials(),
+                target,
+                bytes::Bytes::from_static(b"capture"),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            matches!(error, ObjectStoreError::DependencyUnavailable(_)),
+            dependency,
+            "{status}: {error}"
+        );
+    }
+}
+
 fn _assert_object() {
     fn assert<T: ObjectStore>() {}
     assert::<S3ObjectStore>();

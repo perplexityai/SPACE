@@ -249,7 +249,7 @@ async fn operation_timeout_bounds_an_attempt_that_never_answers() {
     let elapsed = started_at.elapsed();
 
     assert!(
-        matches!(result, Err(ObjectStoreError::Put(_))),
+        matches!(result, Err(ObjectStoreError::DependencyUnavailable(_))),
         "{result:?}"
     );
     assert!(elapsed >= operation_timeout, "{elapsed:?}");
@@ -294,7 +294,7 @@ async fn stalled_upload_is_cut_and_retried() {
         .await;
 
     assert!(
-        matches!(result, Err(ObjectStoreError::Put(_))),
+        matches!(result, Err(ObjectStoreError::DependencyUnavailable(_))),
         "{result:?}"
     );
     assert_eq!(requests.load(Ordering::SeqCst), 3);

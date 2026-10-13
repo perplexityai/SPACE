@@ -32,6 +32,39 @@ failures are eligible only when volume-manager still reports a failed member
 transfer for the exact artifact. Missing transfer history is not recovery
 authority; such cases still require an explicit operator recovery decision.
 
+### Volume-manager dependency-outage budget
+
+Push jobs use a six-hour dependency retry budget measured from durable transfer
+creation time. Configure it with
+`--dependency-retry-budget-secs` /
+`SPACE_VOLMGR_DEPENDENCY_RETRY_BUDGET_SECS`; zero restores the ordinary attempt
+budget. Library callers can supply `VolmgrRunConfig.dependency_retry_budget`
+or `TransferExecutorConfig.dependency_retry_budget`.
+
+This covers credential exchange (including an authority's failed STS
+assumption), S3 transport/timeout errors, throttling, and S3 server failures.
+Credential RPCs have a 30-second bound so a hung exchange cannot consume a full
+transfer-attempt timeout before being classified. Explicit credential
+authentication/authorization/input errors retain the ordinary retry budget,
+as do local file/codec errors and pulls. Existing permanent errors stay permanent.
+An authority's `FailedPrecondition` does not distinguish a temporarily failed
+STS assumption from every configuration fault; those exchange errors use the
+time budget and may require operator repair.
+
+The deadline is derived from the persisted creation timestamp on every attempt
+and survives restart. Time spent queued counts against it. Backoff is still the
+common jobs schedule, capped at five minutes; this does not keep an execution
+slot occupied while waiting for the dependency to recover.
+
+Cleanup uses the same deadline decision as the worker: a scheduled dependency
+retry retains its staged input even after attempt five. On final failure,
+normal staged-copy cleanup is unchanged, including the restart orphan sweep.
+Only the volume-manager copy is removed, not the independent sandbox-manager
+published artifact. The generation re-drive preflight must still prove that
+original artifact exists and is usable; it does not recover a lost node or
+discarded capture. Synchronous transfer waiters retain their existing timeout
+and may return while the durable retry continues.
+
 Volume-manager can feed its zstd encoder directly into the object store's
 bounded multipart uploader. For a compressed artifact of size C, this avoids
 writing a C-byte temporary file and reading it again for MD5 and upload. It

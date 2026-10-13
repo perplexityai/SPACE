@@ -90,6 +90,7 @@ fn common_object_parent_stays_within_one_artifact_directory() {
 
 #[derive(Default)]
 pub(super) struct MockObjectStore {
+    put_dependency_failure: bool,
     heads: Mutex<VecDeque<Option<ObjectMeta>>>,
     body: Vec<u8>,
     head_calls: AtomicUsize,
@@ -103,6 +104,7 @@ impl MockObjectStore {
         body: impl Into<Vec<u8>>,
     ) -> Self {
         Self {
+            put_dependency_failure: false,
             heads: Mutex::new(heads.into_iter().collect()),
             body: body.into(),
             head_calls: AtomicUsize::new(0),
@@ -168,6 +170,11 @@ impl ObjectStore for MockObjectStore {
         // so a test can simulate a put that "succeeds" yet leaves a
         // truncated object behind.
         self.put_calls.fetch_add(1, Ordering::SeqCst);
+        if self.put_dependency_failure {
+            return Err(ObjectStoreError::DependencyUnavailable(
+                "synthetic S3 connect timeout".into(),
+            ));
+        }
         let len = tokio::fs::metadata(src).await?.len();
         Ok(len)
     }
@@ -956,6 +963,99 @@ pub(super) fn test_job(kind: &str) -> Job {
         lease_owner: None,
         priority: Default::default(),
     }
+}
+
+#[tokio::test]
+async fn dependency_outage_survives_five_attempts_without_losing_the_source() {
+    let dir = tempfile::tempdir().unwrap();
+    let original = dir.path().join("memory");
+    let staged = dir.path().join("staged");
+    std::fs::write(&original, b"immutable suspend bytes").unwrap();
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    for (budget, age, expected_exhausted) in [
+        (None, "-5 hours", false),
+        (None, "-7 hours", true),
+        (Some(std::time::Duration::ZERO), "-5 hours", true),
+        (
+            Some(std::time::Duration::from_secs(8 * 60 * 60)),
+            "-7 hours",
+            false,
+        ),
+    ] {
+        let mut store = MockObjectStore::new([], Vec::new());
+        store.put_dependency_failure = true;
+        let executor = TransferExecutor::new_for_test(
+            TransferExecutorConfig {
+                dependency_retry_budget: budget,
+                static_credentials: Some(test_creds()),
+                ..Default::default()
+            },
+            Arc::new(store),
+        );
+        std::fs::copy(&original, &staged).unwrap();
+        let mut payload = push_payload(&original);
+        payload.staged_path = Some(staged.to_string_lossy().into_owned());
+        let mut job = test_job("push");
+        job.attempts = 5;
+        job.max_attempts = 5;
+        job.created_at = conn
+            .query_row("SELECT datetime('now', ?1)", [age], |row| row.get(0))
+            .unwrap();
+        job.payload = payload.to_json();
+        let error = executor
+            .execute(&job, CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.retry_budget_exhausted(&job),
+            expected_exhausted,
+            "{age}: {error}"
+        );
+        assert_eq!(
+            staged.exists(),
+            !expected_exhausted,
+            "a pending retry must retain its staged input"
+        );
+        assert_eq!(
+            std::fs::read(&original).unwrap(),
+            b"immutable suspend bytes",
+            "terminal cleanup must not delete the independent sandbox-manager artifact"
+        );
+    }
+}
+
+#[test]
+fn credential_outage_budget_does_not_extend_non_transient_or_pull_errors() {
+    let executor = test_executor(Arc::new(MockObjectStore::default()));
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    let mut job = test_job("push");
+    job.created_at = conn
+        .query_row("SELECT datetime('now', '-5 hours')", [], |row| row.get(0))
+        .unwrap();
+    job.attempts = 5;
+    job.max_attempts = 5;
+    for (code, exhausted) in [
+        (tonic::Code::FailedPrecondition, false),
+        (tonic::Code::Unavailable, false),
+        (tonic::Code::Internal, false),
+        (tonic::Code::PermissionDenied, true),
+        (tonic::Code::Unauthenticated, true),
+        (tonic::Code::InvalidArgument, true),
+        (tonic::Code::NotFound, true),
+        (tonic::Code::OutOfRange, true),
+        (tonic::Code::Unimplemented, true),
+        (tonic::Code::DataLoss, true),
+    ] {
+        let error =
+            executor.credential_error(&job, tonic::Status::new(code, "synthetic exchange failure"));
+        assert_eq!(error.retry_budget_exhausted(&job), exhausted, "{code:?}");
+    }
+    job.kind = "pull".into();
+    assert!(
+        executor
+            .credential_error(&job, tonic::Status::unavailable("offline"))
+            .retry_budget_exhausted(&job)
+    );
 }
 
 #[derive(Clone, Default)]

@@ -124,6 +124,10 @@ pub struct ObjectMeta {
 /// Errors raised by [`ObjectStore`] implementations.
 #[derive(Debug, thiserror::Error)]
 pub enum ObjectStoreError {
+    /// Typed transport, throttling, or server-outage evidence from the SDK.
+    /// Local input/construction errors retain their operation-specific variant.
+    #[error("object-store dependency unavailable: {0}")]
+    DependencyUnavailable(String),
     #[error("local I/O error: {0}")]
     Io(#[from] std::io::Error),
     #[error("S3 head_object failed: {0}")]
@@ -660,6 +664,24 @@ where
     }
 }
 
+fn with_s3_dependency<E>(err: &S3SdkError<E>, fallback: ObjectStoreError) -> ObjectStoreError
+where
+    E: ProvideErrorMetadata,
+{
+    let classification = classify_s3_sdk_error(err);
+    if matches!(
+        classification.kind,
+        S3ErrorKind::Timeout | S3ErrorKind::Dispatch | S3ErrorKind::RateLimited
+    ) || classification
+        .http_status
+        .is_some_and(|status| status >= 500)
+    {
+        ObjectStoreError::DependencyUnavailable(fallback.to_string())
+    } else {
+        fallback
+    }
+}
+
 fn fallback_s3_error_code<E>(err: &S3SdkError<E>, http_status: Option<u16>) -> &'static str {
     match err {
         SdkError::ConstructionFailure(_) => "construction",
@@ -924,8 +946,9 @@ impl ObjectStore for S3ObjectStore {
                 if let Some(error) = classify_terminal_s3_error(&err, target.key) {
                     return Err(error);
                 }
-                Err(ObjectStoreError::Head(
-                    DisplayErrorContext(&err).to_string(),
+                Err(with_s3_dependency(
+                    &err,
+                    ObjectStoreError::Head(DisplayErrorContext(&err).to_string()),
                 ))
             }
         }
@@ -964,7 +987,10 @@ impl ObjectStore for S3ObjectStore {
             .await
             .map_err(|err| {
                 observe_s3_error(S3Operation::PutObject, target.bucket, target.key, &err);
-                ObjectStoreError::Put(DisplayErrorContext(&err).to_string())
+                with_s3_dependency(
+                    &err,
+                    ObjectStoreError::Put(DisplayErrorContext(&err).to_string()),
+                )
             })?;
         Ok(())
     }
@@ -1059,7 +1085,7 @@ impl ObjectStore for S3ObjectStore {
                         error,
                         "single put upload failed"
                     );
-                    ObjectStoreError::Put(error)
+                    with_s3_dependency(&err, ObjectStoreError::Put(error))
                 })?;
             return Ok(size);
         }
@@ -1092,7 +1118,10 @@ impl ObjectStore for S3ObjectStore {
                     target.key,
                     &err,
                 );
-                ObjectStoreError::Multipart(DisplayErrorContext(&err).to_string())
+                with_s3_dependency(
+                    &err,
+                    ObjectStoreError::Multipart(DisplayErrorContext(&err).to_string()),
+                )
             })?;
         let upload_id = create
             .upload_id()
@@ -1141,7 +1170,10 @@ impl ObjectStore for S3ObjectStore {
                     target.key,
                     &err,
                 );
-                ObjectStoreError::Multipart(DisplayErrorContext(&err).to_string())
+                with_s3_dependency(
+                    &err,
+                    ObjectStoreError::Multipart(DisplayErrorContext(&err).to_string()),
+                )
             })?;
         abort.disarm();
         info!(
@@ -1691,7 +1723,7 @@ impl S3ObjectStore {
                             error,
                             "multipart part upload failed"
                         );
-                        ObjectStoreError::Multipart(error)
+                        with_s3_dependency(&err, ObjectStoreError::Multipart(error))
                     })?;
 
                 resp.e_tag()

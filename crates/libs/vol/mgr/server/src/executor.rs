@@ -3471,6 +3471,9 @@ fn codec_admission_closed(closed: CodecAdmissionClosed) -> JobError {
 /// constructor stays narrow.
 #[derive(Clone, Default)]
 pub struct TransferExecutorConfig {
+    /// Push dependency outage budget, measured from durable job creation.
+    /// None uses six hours; zero preserves the ordinary attempt-count budget.
+    pub dependency_retry_budget: Option<std::time::Duration>,
     /// Compress snapshot files with zstd before uploading to S3.
     pub compress: bool,
     /// Deployment upload policy with one shared streaming-buffer budget.
@@ -3505,6 +3508,64 @@ pub struct TransferExecutorConfig {
 }
 
 impl TransferExecutor {
+    fn dependency_error(&self, job: &Job, message: impl std::fmt::Display) -> JobError {
+        let budget = self
+            .config
+            .dependency_retry_budget
+            .unwrap_or(std::time::Duration::from_secs(6 * 60 * 60));
+        if budget.is_zero()
+            || !matches!(
+                job.kind.as_str(),
+                "push" | "push_artifact" | "push_btrfs_send"
+            )
+        {
+            return JobError::retriable(message);
+        }
+        JobError::retriable_for(job, budget, message)
+    }
+
+    fn credential_error(&self, job: &Job, error: tonic::Status) -> JobError {
+        let message = format!("credential exchange failed: {error}");
+        match error.code() {
+            // The authority may report a failed STS role assumption as
+            // FailedPrecondition. That is not necessarily invalid local input.
+            tonic::Code::Unavailable
+            | tonic::Code::DeadlineExceeded
+            | tonic::Code::ResourceExhausted
+            | tonic::Code::Internal
+            | tonic::Code::Unknown
+            | tonic::Code::Cancelled
+            | tonic::Code::Aborted
+            | tonic::Code::FailedPrecondition => self.dependency_error(job, message),
+            _ => JobError::retriable(message),
+        }
+    }
+
+    async fn exchange_job_credentials(
+        &self,
+        job: &Job,
+        bucket: &str,
+        prefix: &str,
+        directory: bool,
+        subject: &SubjectId,
+        access: StorageAccess,
+    ) -> Result<pplx_space_object_store::ObjectCredentials, JobError> {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            exchange_credentials(bucket, prefix, directory, subject, access),
+        )
+        .await
+        .map_err(|_| self.dependency_error(job, "credential exchange timed out"))?
+        .map_err(|error| self.credential_error(job, error))
+    }
+
+    fn object_store_error(&self, job: &Job, error: &ObjectStoreError) -> JobError {
+        match error {
+            ObjectStoreError::DependencyUnavailable(message) => self.dependency_error(job, message),
+            _ => classify(error),
+        }
+    }
+
     pub fn new(config: TransferExecutorConfig, shadow_staging_dir: PathBuf) -> Self {
         Self::with_store(config, Arc::new(S3ObjectStore::new()), shadow_staging_dir)
     }
@@ -4117,9 +4178,17 @@ impl TransferExecutor {
         };
         let creds = match &self.config.static_credentials {
             Some(creds) => creds.clone(),
-            None => exchange_credentials(&uri.bucket, &uri.key_prefix, false, &subject, access)
-                .await
-                .map_err(|e| JobError::Retriable(format!("credential exchange failed: {e}")))?,
+            None => {
+                self.exchange_job_credentials(
+                    job,
+                    &uri.bucket,
+                    &uri.key_prefix,
+                    false,
+                    &subject,
+                    access,
+                )
+                .await?
+            }
         };
 
         let target = ObjectTarget {
@@ -4266,9 +4335,9 @@ impl TransferExecutor {
                     ArtifactKind::Push => StorageAccess::ReadWrite,
                     ArtifactKind::Pull => StorageAccess::Read,
                 };
-                let creds = exchange_credentials(&uri.bucket, &prefix, true, &subject, access)
-                    .await
-                    .map_err(|e| JobError::Retriable(format!("credential exchange failed: {e}")))?;
+                let creds = self
+                    .exchange_job_credentials(job, &uri.bucket, &prefix, true, &subject, access)
+                    .await?;
                 creds_by_bucket.insert(uri.bucket.clone(), creds);
             }
         }
@@ -4374,14 +4443,16 @@ impl TransferExecutor {
 
         let mut total: i64 = 0;
         let mut permanent: Vec<(&str, JobError)> = Vec::new();
-        let mut retriable: Vec<String> = Vec::new();
+        let mut retriable: Vec<(String, JobError)> = Vec::new();
         for (entry, result) in art.entries.iter().zip(results) {
             match result {
                 Ok(bytes) => total += bytes,
                 Err(error) if error.kind() == JobFailureKind::Permanent => {
                     permanent.push((&entry.role, error));
                 }
-                Err(error) => retriable.push(format!("{}: {}", entry.role, error.message())),
+                Err(error) => {
+                    retriable.push((format!("{}: {}", entry.role, error.message()), error))
+                }
             }
         }
 
@@ -4400,10 +4471,33 @@ impl TransferExecutor {
                 None => JobError::Permanent(message),
             })
         } else if !retriable.is_empty() {
-            Err(JobError::Retriable(format!(
+            let message = format!(
                 "artifact entry failed: {}",
-                retriable.join("; ")
-            )))
+                retriable
+                    .iter()
+                    .map(|(message, _)| message.as_str())
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            );
+            let deadlines = retriable
+                .iter()
+                .filter_map(|(_, error)| match error {
+                    JobError::RetriableUntil { deadline, .. } => Some(*deadline),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            // Do not let a dependency failure extend a sibling's unrelated
+            // local/error budget. Pure outage fan-outs preserve the deadline.
+            Err(
+                match deadlines.into_iter().min().filter(|_| {
+                    retriable
+                        .iter()
+                        .all(|(_, error)| matches!(error, JobError::RetriableUntil { .. }))
+                }) {
+                    Some(deadline) => JobError::RetriableUntil { message, deadline },
+                    None => JobError::retriable(message),
+                },
+            )
         } else {
             Ok(total)
         };
@@ -4414,11 +4508,12 @@ impl TransferExecutor {
         // next attempt can re-read them (deleting them would turn one transient
         // blip into a permanent "source file inaccessible" on every sibling).
         // Delete only when the artifact as a whole is done — success, a
-        // permanent failure, or a retriable failure on the last attempt.
-        let last_attempt = job.attempts >= job.max_attempts;
+        // permanent failure, or an exhausted count/time retry budget.
         let terminal = match &outcome {
             Ok(_) => true,
-            Err(error) => error.kind() == JobFailureKind::Permanent || last_attempt,
+            Err(error) => {
+                error.kind() == JobFailureKind::Permanent || error.retry_budget_exhausted(job)
+            }
         };
         if terminal {
             for entry in &art.entries {
@@ -4872,9 +4967,9 @@ impl TransferExecutor {
                             "uploaded object missing after put: {}",
                             target.key
                         ))),
-                        Err(e) => Err(classify(&e)),
+                        Err(e) => Err(self.object_store_error(job, &e)),
                     },
-                    Err(e) => Err(classify(&e)),
+                    Err(e) => Err(self.object_store_error(job, &e)),
                 }
             }
         };
@@ -4898,9 +4993,9 @@ impl TransferExecutor {
 
     /// Remove the staged source file once the upload has reached a state
     /// from which it will not be re-tried. A Retriable error on an attempt
-    /// that still has budget left keeps the file around so the next try
-    /// reads the same bytes; the last-attempt case (or a Permanent /
-    /// success) removes it. The startup [`cleanup_orphans`] sweep is the
+    /// that still has count/time budget left keeps the file around so the next
+    /// try reads the same bytes; exhaustion (or a Permanent / success)
+    /// removes it. The startup [`cleanup_orphans`] sweep is the
     /// safety net for process crashes between these branches.
     ///
     /// [`cleanup_orphans`]: crate::staging::cleanup_orphans
@@ -4913,10 +5008,11 @@ impl TransferExecutor {
         let Some(ref staged) = p.staged_path else {
             return;
         };
-        let last_attempt = job.attempts >= job.max_attempts;
         let terminal = match result {
             Ok(_) => true,
-            Err(error) => error.kind() == JobFailureKind::Permanent || last_attempt,
+            Err(error) => {
+                error.kind() == JobFailureKind::Permanent || error.retry_budget_exhausted(job)
+            }
         };
         if !terminal {
             return;

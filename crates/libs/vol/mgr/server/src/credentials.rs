@@ -77,7 +77,7 @@ pub async fn exchange_credentials(
             requested_expires_in: Some(STORAGE_SESSION_TTL_SECONDS),
         })
         .await
-        .map_err(|e| Status::internal(format!("credmgr exchange_token failed: {e}")))?
+        .map_err(|e| Status::new(e.code(), format!("credmgr exchange_token failed: {e}")))?
         .into_inner();
     match resp.payload.as_mut() {
         Some(exchange_token_response::Payload::AwsCredentials(c)) => Ok(ObjectCredentials {

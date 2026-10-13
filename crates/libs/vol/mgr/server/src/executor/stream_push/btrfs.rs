@@ -184,7 +184,7 @@ impl TransferExecutor {
                 .put_stream(creds, target, source, config.budget.clone(), options)
                 .await
                 .map_err(|error| match error {
-                    StreamingUploadError::Store(error) => classify(&error),
+                    StreamingUploadError::Store(error) => self.object_store_error(job, &error),
                     StreamingUploadError::InvalidConfiguration(_)
                     | StreamingUploadError::SizeLimit { .. } => {
                         JobError::Permanent(error.to_string())
@@ -235,7 +235,7 @@ impl TransferExecutor {
             self.store
                 .put_file(creds, target, temp.path())
                 .await
-                .map_err(|error| classify(&error))?;
+                .map_err(|error| self.object_store_error(job, &error))?;
             (logical, wire)
         };
         if uses_streaming {
@@ -276,7 +276,7 @@ impl TransferExecutor {
             Ok(_) => Err(JobError::Retriable(
                 "btrfs upload HEAD length mismatch or missing object".into(),
             )),
-            Err(error) => Err(classify(&error)),
+            Err(error) => Err(self.object_store_error(job, &error)),
         }
     }
 }

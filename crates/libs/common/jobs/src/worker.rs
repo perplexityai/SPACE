@@ -395,6 +395,8 @@ impl<E: JobExecutor> BackgroundWorker<E> {
     /// persistence can exceed this budget while SQLite is unavailable: a
     /// synchronous waiter may time out, but the worker retains the successful
     /// result and execution ownership until it can commit or is superseded.
+    /// Executor-selected time-based retry budgets can also outlive this
+    /// attempt-count waiter budget. A waiter timeout never cancels durable work.
     pub fn worst_case_runtime(&self) -> Duration {
         let attempts = self.max_attempts.max(1).cast_unsigned();
         let timeouts = self
@@ -1538,7 +1540,7 @@ impl<E: JobExecutor> BackgroundWorker<E> {
                                 max_attempts = job.max_attempts,
                                 "job failed (retriable)"
                             );
-                            if job.attempts >= job.max_attempts {
+                            if e.retry_budget_exhausted(&job) {
                                 "exhausted"
                             } else {
                                 "retriable"
@@ -1707,6 +1709,7 @@ impl<E: JobExecutor> BackgroundWorker<E> {
     }
 
     async fn handle_failure(&self, job: &Job, lease_owner: Option<&str>, err: JobError) {
+        let retries_exhausted = err.retry_budget_exhausted(job);
         let failure_kind = err.kind();
         let failure_reason = err.failure_reason();
         let message = err.message().to_string();
@@ -1734,14 +1737,14 @@ impl<E: JobExecutor> BackgroundWorker<E> {
                 self.notify_completion(&job.job_id);
             }
             JobFailureKind::Retriable => {
-                if job.attempts >= job.max_attempts {
+                if retries_exhausted {
                     tracing::error!(
                         job_id = %job.job_id,
                         kind = %job.kind,
                         subject_id = ?job.subject_id,
                         attempts = job.attempts,
                         error = %message,
-                        "job failed after exhausting all retry attempts"
+                        "job retry budget exhausted"
                     );
                     let result = {
                         let conn = self.lock_db_for_background();

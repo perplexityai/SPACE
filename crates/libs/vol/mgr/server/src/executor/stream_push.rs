@@ -190,7 +190,7 @@ impl TransferExecutor {
             .await
             .map_err(|error| {
                 match error {
-                    StreamingUploadError::Store(error) => classify(&error),
+                    StreamingUploadError::Store(error) => self.object_store_error(job, &error),
                     StreamingUploadError::InvalidConfiguration(_)
                     | StreamingUploadError::SizeLimit { .. } => {
                         JobError::Permanent(format!("stream snapshot upload: {error}"))
@@ -229,7 +229,7 @@ impl TransferExecutor {
                 "uploaded object missing after put: {}",
                 target.key
             ))),
-            Err(error) => Err(classify(&error)),
+            Err(error) => Err(self.object_store_error(job, &error)),
         }
     }
 }

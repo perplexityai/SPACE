@@ -309,6 +309,14 @@ pub enum JobError {
     /// with exponential backoff up to `max_attempts`.
     #[error("{0}")]
     Retriable(String),
+    /// A dependency outage uses an absolute retry deadline rather than the
+    /// attempt count. Reconstruct it from durable job creation time so process
+    /// restarts cannot replenish the budget.
+    #[error("{message}")]
+    RetriableUntil {
+        message: String,
+        deadline: jiff::Timestamp,
+    },
     /// Execution yielded at a restart-safe boundary. The job returns to
     /// `pending` without consuming an attempt and is not restarted by the
     /// shutting-down worker.
@@ -321,6 +329,7 @@ impl JobError {
         match self {
             Self::Permanent(message)
             | Self::PermanentWithReason { message, .. }
+            | Self::RetriableUntil { message, .. }
             | Self::Retriable(message) => message,
             Self::YieldedForRestart => "job execution yielded for restart",
         }
@@ -329,14 +338,19 @@ impl JobError {
     pub const fn kind(&self) -> JobFailureKind {
         match self {
             Self::Permanent(_) | Self::PermanentWithReason { .. } => JobFailureKind::Permanent,
-            Self::Retriable(_) | Self::YieldedForRestart => JobFailureKind::Retriable,
+            Self::Retriable(_) | Self::RetriableUntil { .. } | Self::YieldedForRestart => {
+                JobFailureKind::Retriable
+            }
         }
     }
 
     pub const fn failure_reason(&self) -> Option<JobFailureReason> {
         match self {
             Self::PermanentWithReason { reason, .. } => Some(*reason),
-            Self::Permanent(_) | Self::Retriable(_) | Self::YieldedForRestart => None,
+            Self::Permanent(_)
+            | Self::Retriable(_)
+            | Self::RetriableUntil { .. }
+            | Self::YieldedForRestart => None,
         }
     }
 
@@ -363,6 +377,39 @@ impl JobError {
     /// Shorthand for `JobError::Retriable(msg.to_string())`.
     pub fn retriable(msg: impl std::fmt::Display) -> Self {
         Self::Retriable(msg.to_string())
+    }
+
+    /// A malformed historical timestamp retains the ordinary attempt budget,
+    /// never an unbounded retry. The deadline is stable across restarts.
+    pub fn retriable_for(
+        job: &Job,
+        budget: std::time::Duration,
+        message: impl std::fmt::Display,
+    ) -> Self {
+        let deadline = jiff::civil::DateTime::strptime("%Y-%m-%d %H:%M:%S", &job.created_at)
+            .ok()
+            .and_then(|created| created.to_zoned(jiff::tz::TimeZone::UTC).ok())
+            .and_then(|created| created.timestamp().checked_add(budget).ok());
+        match deadline {
+            Some(deadline) => Self::RetriableUntil {
+                message: message.to_string(),
+                deadline,
+            },
+            None => {
+                tracing::warn!(job_id = %job.job_id, "cannot compute dependency retry deadline; using attempt budget");
+                Self::retriable(message)
+            }
+        }
+    }
+
+    /// Shared by the worker and executor-owned staged-file cleanup. They must
+    /// agree about exhaustion or a scheduled retry can lose its source.
+    pub fn retry_budget_exhausted(&self, job: &Job) -> bool {
+        match self {
+            Self::RetriableUntil { deadline, .. } => jiff::Timestamp::now() >= *deadline,
+            Self::YieldedForRestart => false,
+            _ => job.attempts >= job.max_attempts,
+        }
     }
 }
 

@@ -23,7 +23,7 @@ use tokio_util::sync::{CancellationToken, DropGuard};
 
 use crate::{
     AbortGuard, ObjectCredentials, ObjectStore, ObjectStoreError, ObjectTarget, S3ObjectStore,
-    S3Operation, content_md5, observe_s3_error,
+    S3Operation, content_md5, observe_s3_error, with_s3_dependency,
 };
 
 const MIB: usize = 1024 * 1024;
@@ -388,7 +388,10 @@ impl S3ObjectStore {
                 .await
                 .map_err(|err| {
                     observe_s3_error(S3Operation::PutObject, target.bucket, target.key, &err);
-                    ObjectStoreError::Put(DisplayErrorContext(&err).to_string())
+                    with_s3_dependency(
+                        &err,
+                        ObjectStoreError::Put(DisplayErrorContext(&err).to_string()),
+                    )
                 })?;
             return Ok(size);
         }
@@ -408,7 +411,10 @@ impl S3ObjectStore {
                     target.key,
                     &err,
                 );
-                ObjectStoreError::Multipart(DisplayErrorContext(&err).to_string())
+                with_s3_dependency(
+                    &err,
+                    ObjectStoreError::Multipart(DisplayErrorContext(&err).to_string()),
+                )
             })?;
         let upload_id = created
             .upload_id()
@@ -480,7 +486,10 @@ impl S3ObjectStore {
                     target.key,
                     &err,
                 );
-                ObjectStoreError::Multipart(DisplayErrorContext(&err).to_string())
+                with_s3_dependency(
+                    &err,
+                    ObjectStoreError::Multipart(DisplayErrorContext(&err).to_string()),
+                )
             })?;
         abort.take().expect("created upload is guarded").disarm();
         Ok(total)
@@ -510,7 +519,10 @@ impl S3ObjectStore {
             .await
             .map_err(|err| {
                 observe_s3_error(S3Operation::UploadPart, target.bucket, target.key, &err);
-                ObjectStoreError::Multipart(DisplayErrorContext(&err).to_string())
+                with_s3_dependency(
+                    &err,
+                    ObjectStoreError::Multipart(DisplayErrorContext(&err).to_string()),
+                )
             })?;
         let etag = uploaded
             .e_tag()

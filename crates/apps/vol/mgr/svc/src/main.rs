@@ -126,6 +126,13 @@ struct Cli {
     /// Maximum retry attempts before a transfer job is permanently failed.
     #[arg(long, default_value_t = DEFAULT_TRANSFER_MAX_ATTEMPTS)]
     transfer_max_attempts: i32,
+    /// Push credential/S3 dependency retry budget from transfer creation; zero uses attempts.
+    #[arg(
+        long,
+        env = "SPACE_VOLMGR_DEPENDENCY_RETRY_BUDGET_SECS",
+        default_value_t = 21600
+    )]
+    dependency_retry_budget_secs: u64,
 
     /// How long to wait for in-flight RPCs after SIGTERM, in seconds.
     #[arg(long, default_value_t = DEFAULT_SERVER_DRAIN_TIMEOUT_SECS)]
@@ -178,6 +185,7 @@ impl TryFrom<Cli> for VolmgrRunConfig {
             pull_priority_bands: cli.pull_priority_bands,
             transfer_timeout: Duration::from_secs(cli.transfer_timeout_secs),
             transfer_max_attempts: cli.transfer_max_attempts,
+            dependency_retry_budget: Duration::from_secs(cli.dependency_retry_budget_secs),
             server_drain_timeout: Duration::from_secs(cli.server_drain_timeout_secs),
             transfer_drain_timeout: Duration::from_secs(cli.drain_timeout_secs),
             compress: cli.compress,

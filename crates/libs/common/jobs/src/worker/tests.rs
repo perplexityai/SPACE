@@ -44,6 +44,60 @@ async fn guarded_submission_refusal_neither_inserts_nor_reuses_work() {
     assert_eq!(jobs[0].job_id, existing);
 }
 
+#[tokio::test(start_paused = true)]
+async fn dependency_deadline_not_attempt_count_controls_durable_retry() {
+    for timed in [false, true] {
+        let conn = Connection::open_in_memory().unwrap();
+        init_test_schema(&conn);
+        let id = insert_pending(&conn, "push");
+        conn.execute("UPDATE jobs SET max_attempts = 5 WHERE job_id = ?1", [id])
+            .unwrap();
+        let worker = BackgroundWorker::new(
+            Arc::new(Mutex::new(conn)),
+            TestExecutor::blocking(),
+            WorkerConfig::new(1, Duration::from_secs(30), 5),
+        );
+        for attempt in 1..=5 {
+            let job = {
+                let conn = worker.lock_db_for_status().unwrap();
+                assert!(db::mark_job_running(&conn, &id).unwrap());
+                db::get_job(&conn, &id).unwrap().unwrap()
+            };
+            assert_eq!(job.attempts, attempt);
+            let error = if timed {
+                JobError::retriable_for(
+                    &job,
+                    Duration::from_secs(6 * 60 * 60),
+                    "dependency unavailable",
+                )
+            } else {
+                JobError::retriable("ordinary retry")
+            };
+            worker.handle_failure(&job, None, error).await;
+        }
+        let job = worker.get_job(&id).unwrap().unwrap();
+        assert_eq!(job.status, if timed { "pending" } else { "failed" });
+        if timed {
+            let job = {
+                let conn = worker.lock_db_for_status().unwrap();
+                db::mark_job_running(&conn, &id).unwrap();
+                db::get_job(&conn, &id).unwrap().unwrap()
+            };
+            worker
+                .handle_failure(
+                    &job,
+                    None,
+                    JobError::RetriableUntil {
+                        message: "outage budget exhausted".into(),
+                        deadline: jiff::Timestamp::UNIX_EPOCH,
+                    },
+                )
+                .await;
+            assert_eq!(worker.get_job(&id).unwrap().unwrap().status, "failed");
+        }
+    }
+}
+
 impl TestExecutor {
     fn blocking() -> Self {
         Self {

@@ -5404,6 +5404,7 @@ name = "pplx-space-common-jobs"
 version = "0.8.0"
 dependencies = [
  "async-trait",
+ "jiff",
  "pplx-space-common-core",
  "pplx-space-metrics",
  "pplx-space-observability",
