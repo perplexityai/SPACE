@@ -233,6 +233,10 @@ cache_skeleton() {
     "$CACHE_DIR/firecracker/sandboxes" \
     "$CACHE_DIR/firecracker/.volmgr-staging"
   install -d -m 0755 -o 0 -g 0 "$CACHE_DIR/firecracker/jails"
+  for build_root in "$CACHE_DIR/firecracker/builds/oci" "$CACHE_DIR/firecracker/builds/seed-cache"; do
+    [[ ! -L "$build_root" ]] || die "Refusing linked build directory: $build_root"
+    install -d -m 00755 -o 0 -g 0 "$build_root"
+  done
 }
 
 cache() {

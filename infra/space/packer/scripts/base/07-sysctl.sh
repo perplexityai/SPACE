@@ -216,6 +216,10 @@ chmod 0775 \
 # create entries there, but cannot rename away the root-owned kernel and asset
 # roots beneath them.
 chmod 1775 /space/cache /space/cache/firecracker /space/cache/firecracker/builds
+for build_root in /space/cache/firecracker/builds/{oci,seed-cache}; do
+  [[ ! -L "$build_root" ]] || { echo "Refusing linked build directory: $build_root" >&2; exit 1; }
+  install -d -m 00755 -o 0 -g 0 "$build_root"
+done
 
 # ── Runtime manager ────────────────────────────────────────────────────────
 # Node-manager creates a separate managed store at startup; do not relocate

@@ -81,7 +81,6 @@ const TEMPLATE_ARTIFACT_HEADROOM_MB: u32 = 512;
 const DEFAULT_BUILD_VM_ROOTFS_SIZE_MB: u32 = 20 * 1024;
 const SCRATCH_SOURCE_TYPE_UBUNTU_MINIMAL_CLOUD_SQUASHFS: &str = "ubuntu-minimal-cloud-squashfs";
 const SCRATCH_GUEST_ARTIFACT_SUBDIR: &str = "data/spaced";
-const SCRATCH_OUTPUT_ARTIFACTS: &[&str] = &["rootfs.ext4", "metadata.json"];
 const BUNDLED_BUILD_SEED_SCRIPT: &str = include_str!("../scripts/build-seed.sh");
 const BUNDLED_ROOTFS_BUILDER_SCRIPT: &str =
     include_str!("../../../../../templates/firecracker/seed/rootfs-builder.sh");
@@ -1268,6 +1267,8 @@ impl TemplateBuilder {
         let mut cmd = tokio::process::Command::new("/bin/bash");
         cmd.arg(scratch_script_path(&scripts.helper));
         cmd.arg("--id").arg(template_id);
+        cmd.arg("--pubkey").arg("/root/.ssh/sandbox_ed25519.pub");
+        cmd.env("SPACE_SEED_OUTPUT_GROUP", group_names::SPACE_CACHE_RW);
         cmd.env("SPACE_SEED_OUTPUT_DIR", &final_output_dir);
         cmd.env("SPACE_SEED_CACHE_DIR", &cache_dir);
         cmd.env(
@@ -1306,8 +1307,6 @@ impl TemplateBuilder {
         .await?;
 
         build_phase(template_id, BuildPhase::NormalizeScratchOutput, async {
-            normalize_scratch_output_permissions(&final_output_dir)?;
-            grant_template_cache_group_access(&format!("{TEMPLATE_DIR}/{template_id}"))?;
             page_cache::advise_path_dontneed(
                 &Path::new(&final_output_dir).join("rootfs.ext4"),
                 "scratch build rootfs output",
@@ -1662,78 +1661,6 @@ fn workspace_package_version(cargo_toml_path: &Path) -> Result<Option<String>, B
         .and_then(|package| package.get("version"))
         .and_then(toml::Value::as_str)
         .map(ToOwned::to_owned))
-}
-
-fn normalize_scratch_output_permissions(output_dir: &str) -> Result<(), BuildError> {
-    let cache_owner = format!("root:{}", group_names::SPACE_CACHE_RW);
-    let targets = scratch_output_permission_targets(Path::new(output_dir))?;
-    for target in targets {
-        let status = command_as_root("chown")
-            .arg(&cache_owner)
-            .arg(&target)
-            .status()
-            .map_err(|source| BuildError::Io {
-                operation: "normalize scratch output permissions",
-                source,
-            })?;
-        if !status.success() {
-            return Err(BuildError::CommandFailed {
-                operation: "normalize scratch output permissions",
-            });
-        }
-
-        let status = command_as_root("chmod")
-            .arg("g+w")
-            .arg(&target)
-            .status()
-            .map_err(|source| BuildError::Io {
-                operation: "normalize scratch output permissions",
-                source,
-            })?;
-        if !status.success() {
-            return Err(BuildError::CommandFailed {
-                operation: "normalize scratch output permissions",
-            });
-        }
-    }
-    Ok(())
-}
-
-fn scratch_output_permission_targets(output_dir: &Path) -> Result<Vec<PathBuf>, BuildError> {
-    let mut targets = Vec::with_capacity(SCRATCH_OUTPUT_ARTIFACTS.len() + 1);
-    let output_metadata = fs::symlink_metadata(output_dir).map_err(|source| BuildError::Io {
-        operation: "stat scratch output directory",
-        source,
-    })?;
-    if !output_metadata.is_dir() {
-        return Err(BuildError::message(format!(
-            "scratch output path is not a directory: {}",
-            output_dir.display()
-        )));
-    }
-    targets.push(output_dir.to_path_buf());
-
-    for artifact in SCRATCH_OUTPUT_ARTIFACTS {
-        let path = output_dir.join(artifact);
-        match fs::symlink_metadata(&path) {
-            Ok(metadata) if metadata.is_file() => targets.push(path),
-            Ok(_) => {
-                return Err(BuildError::message(format!(
-                    "scratch output artifact is not a regular file: {}",
-                    path.display()
-                )));
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(source) => {
-                return Err(BuildError::Io {
-                    operation: "stat scratch output artifact",
-                    source,
-                });
-            }
-        }
-    }
-
-    Ok(targets)
 }
 
 fn configure_guest_apt_mirror(ssh: &SshSession) -> Result<(), SshError> {
@@ -2310,9 +2237,6 @@ fn now_iso8601() -> String {
 
 #[cfg(test)]
 mod build_staging_tests;
-
-#[cfg(test)]
-mod scratch_output_tests;
 
 #[cfg(all(test, target_os = "linux"))]
 mod scratch_script_tests;

@@ -35,6 +35,59 @@ if [[ $EUID -ne 0 ]]; then
     /bin/bash "$0" "$@"
 fi
 
+# Walk from / and keep each directory open as cwd before using its children.
+# Physical-path checks reject redirects even when a shared entry is exchanged.
+enter_directory() {
+  local target="$1" create="$2" expected="" part
+  local -a parts
+  IFS=/ read -r -a parts <<< "$target"
+  cd /
+  for part in "${parts[@]}"; do
+    [[ -z "$part" ]] && continue
+    expected="${expected}/$part"
+    if [[ "$create" == yes && ! -e "$part" && ! -L "$part" ]]; then
+      mkdir -m 0755 -- "$part"
+    fi
+    cd -P -- "$part"
+    if [[ "$(pwd -P)" != "$expected" ]]; then
+      echo "ERROR: directory path was redirected: $target" >&2
+      exit 1
+    fi
+  done
+}
+
+prepare_root_directory() (
+  local target="$1" kind="$2" expected="" part owner mode
+  local -a parts
+  IFS=/ read -r -a parts <<< "$target"
+  cd /
+  for part in "${parts[@]}"; do
+    [[ -z "$part" ]] && continue
+    read -r owner mode < <(stat -c '%u %a' .)
+    if [[ "$owner" != 0 ]] || (( (8#$mode & 0022) != 0 && (8#$mode & 01000) == 0 )); then
+      echo "ERROR: unsafe parent of $kind directory: $target" >&2
+      exit 1
+    fi
+    expected="${expected}/$part"
+    if [[ ! -e "$part" && ! -L "$part" ]]; then
+      mkdir -m 0755 -- "$part"
+    fi
+    cd -P -- "$part"
+    if [[ "$(pwd -P)" != "$expected" ]]; then
+      echo "ERROR: redirected $kind directory: $target" >&2
+      exit 1
+    fi
+  done
+  read -r owner mode < <(stat -c '%u %a' .)
+  if [[ "$owner" != 0 ]] || { [[ "$kind" == staging ]] && (( (8#$mode & 0022) != 0 )); }; then
+    echo "ERROR: unsafe $kind directory: $target" >&2
+    exit 1
+  fi
+  if [[ "$kind" == cache ]]; then
+    install -d -m 00755 -o 0 -g 0 .
+  fi
+)
+
 ID="seed"
 PROFILE="release"
 FORCE=""
@@ -116,7 +169,8 @@ esac
 echo "Architecture: ${ARCH} (containerd: ${CONTAINER_PLATFORM}, rust: ${RUST_TARGET})"
 
 OUTDIR="${SPACE_SEED_OUTPUT_DIR:-${REPO_ROOT}/templates/firecracker/seed/output/${ID}}"
-CACHEDIR="${SPACE_SEED_CACHE_DIR:-${REPO_ROOT}/templates/firecracker/seed/.cache}"
+CACHEDIR="$(realpath -ms -- "${SPACE_SEED_CACHE_DIR:-/space/cache/firecracker/builds/seed-cache}")"
+OUTDIR="$(realpath -ms -- "$OUTDIR")"
 GUEST_BINS=(spaced-svc spaced)
 # containerd rejects container IDs longer than 76 characters. Embedding the raw
 # template ID made the name depend on both the ID length and the PID digit count,
@@ -131,8 +185,10 @@ ROOTFS_BUILDER_STAGE_PATH=""
 
 # containerd needs host-visible paths, so use the shared root-owned runtime
 # directory. mktemp creates a 0700 bundle even with a permissive caller umask.
-install -d -m 0750 -o 0 -g 0 /space/run/build-manager
-BUNDLE_DIR="$(mktemp -d /space/run/build-manager/space-seed-build.XXXXXX)"
+STAGE_ROOT="$(realpath -ms -- "${SPACE_SEED_STAGE_ROOT:-/space/run/build-manager}")"
+prepare_root_directory "$STAGE_ROOT" staging
+prepare_root_directory "$CACHEDIR" cache
+BUNDLE_DIR="$(mktemp -d "$STAGE_ROOT/space-seed-build.XXXXXX")"
 cleanup_container() {
   ctr tasks rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
   ctr containers rm "$CONTAINER_NAME" >/dev/null 2>&1 || true
@@ -143,7 +199,8 @@ trap cleanup_container EXIT
 INPUT_DIR="${BUNDLE_DIR}/inputs"
 GUEST_BIN_STAGE_DIR="${BUNDLE_DIR}/guest-bin"
 ROOTFS_BUILDER_STAGE_PATH="${BUNDLE_DIR}/rootfs-builder.sh"
-mkdir -p "$OUTDIR" "$CACHEDIR" "$INPUT_DIR" "$GUEST_BIN_STAGE_DIR"
+BUILD_OUTPUT="${BUNDLE_DIR}/output"
+mkdir -p "$BUILD_OUTPUT" "$INPUT_DIR" "$GUEST_BIN_STAGE_DIR"
 
 if [[ ! -f "$ROOTFS_BUILDER_SCRIPT" ]]; then
   echo "ERROR: rootfs builder script not found at ${ROOTFS_BUILDER_SCRIPT}" >&2
@@ -344,7 +401,7 @@ echo "=== Pulling builder image via containerd ==="
 ctr images pull --platform "${CONTAINER_PLATFORM}" "${IMAGE_REF}"
 
 MOUNTS=(
-  "--mount" "type=bind,src=${OUTDIR},dst=/output,options=rbind:rw"
+  "--mount" "type=bind,src=${BUILD_OUTPUT},dst=/output,options=rbind:rw"
   "--mount" "type=bind,src=${CACHEDIR},dst=/cache,options=rbind:rw"
   "--mount" "type=bind,src=${ROOTFS_BUILDER_STAGE_PATH},dst=/workspace/rootfs-builder.sh,options=rbind:ro"
   "--mount" "type=bind,src=${INPUT_DIR},dst=/workspace/inputs,options=rbind:ro"
@@ -392,9 +449,49 @@ exec /bin/bash /workspace/rootfs-builder.sh "$@"
 ' "${RUN_ARGS[@]}"
 
 echo ""
-echo "=== Build complete ==="
-ls -lh "${OUTDIR}/"
-cat "${OUTDIR}/metadata.json"
+# Publish only the completed artifacts, with the destination pinned by cwd.
+# --force replaces leaf entries; mv -T never follows a destination symlink.
+(
+  for artifact in rootfs.ext4 metadata.json; do
+    [[ -f "$BUILD_OUTPUT/$artifact" && ! -L "$BUILD_OUTPUT/$artifact" ]] || {
+      echo "ERROR: build artifact is not a regular file: $artifact" >&2
+      exit 1
+    }
+  done
+  enter_directory "$(dirname "$OUTDIR")" yes
+  if [[ -n "${SPACE_SEED_OUTPUT_GROUP:-}" ]]; then
+    chown "root:${SPACE_SEED_OUTPUT_GROUP}" .
+    chmod g+w .
+    chown "root:${SPACE_SEED_OUTPUT_GROUP}" "$BUILD_OUTPUT/rootfs.ext4" "$BUILD_OUTPUT/metadata.json"
+    chmod g+w "$BUILD_OUTPUT/rootfs.ext4" "$BUILD_OUTPUT/metadata.json"
+  fi
+  output_name="$(basename "$OUTDIR")"
+  if [[ ! -e "$output_name" || -L "$output_name" ]]; then
+    mkdir -m 0700 -- "$output_name"
+  fi
+  cd -P -- "$output_name"
+  # Standalone sudo callers may retry in their own existing output directory.
+  allowed_output_owner=0
+  if [[ -z "${SPACE_SEED_OUTPUT_GROUP:-}" ]]; then
+    allowed_output_owner="${SUDO_UID:-0}"
+  fi
+  output_owner="$(stat -c %u .)"
+  if [[ "$(pwd -P)" != "$OUTDIR" ]] ||
+    { [[ "$output_owner" != 0 && "$output_owner" != "$allowed_output_owner" ]]; }; then
+    echo "ERROR: unsafe output directory: $OUTDIR" >&2
+    exit 1
+  fi
+  for artifact in rootfs.ext4 metadata.json; do
+    mv -T -- "$BUILD_OUTPUT/$artifact" "./$artifact"
+  done
+  if [[ -n "${SPACE_SEED_OUTPUT_GROUP:-}" ]]; then
+    chown "root:${SPACE_SEED_OUTPUT_GROUP}" .
+    chmod 2775 .
+  else
+    chmod go+rx .
+  fi
+)
+echo "=== Build complete: ${OUTDIR} ==="
 if [[ -z "${SPACE_SEED_OUTPUT_DIR:-}" ]]; then
   echo ""
   echo "If you are running this helper directly, register the result with:"

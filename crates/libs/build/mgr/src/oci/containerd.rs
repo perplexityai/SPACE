@@ -1,5 +1,6 @@
 use std::ffi::OsString;
 use std::fs;
+use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, LazyLock};
@@ -1122,8 +1123,24 @@ async fn run_pull_with_budget(
     }
 }
 
+pub(super) fn prepare_cache_directory(cache_dir: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(cache_dir)?;
+    let metadata = fs::symlink_metadata(cache_dir)?;
+    // The deployed caller is root; unprivileged fixtures own their private cache.
+    if !metadata.is_dir()
+        || metadata.uid() != nix::unistd::geteuid().as_raw()
+        || metadata.mode() & 0o022 != 0
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "OCI cache must be an owned directory writable only by its owner",
+        ));
+    }
+    Ok(())
+}
+
 fn create_mount_directory(cache_dir: &Path) -> Result<PathBuf, OciBuildError> {
-    fs::create_dir_all(cache_dir).map_err(|source| OciBuildError::File {
+    prepare_cache_directory(cache_dir).map_err(|source| OciBuildError::File {
         operation: OciFileOperation::CreateMountDirectory,
         path: cache_dir.to_path_buf(),
         source,

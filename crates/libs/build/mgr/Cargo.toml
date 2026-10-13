@@ -25,6 +25,7 @@ aws-sdk-ecr = { workspace = true, optional = true, features = ["behavior-version
 bytes = { workspace = true }
 hex = { workspace = true }
 jiff = { workspace = true }
+nix = { workspace = true, features = ["user"] }
 oci-spec = { workspace = true, features = ["image"] }
 object = { workspace = true }
 reqwest = { workspace = true, features = ["query"] }

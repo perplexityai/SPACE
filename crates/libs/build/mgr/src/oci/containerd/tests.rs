@@ -1275,3 +1275,27 @@ async fn real_containerd_exposes_a_flattened_read_only_rootfs(
 
     rootfs.unmount().await.expect("unmount real OCI image");
 }
+
+#[test]
+fn oci_cache_rejects_redirects_and_shared_or_foreign_directories() {
+    use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+    let root = tempfile::tempdir().expect("fixture");
+    let cache = root.path().join("cache");
+    prepare_cache_directory(&cache).expect("create owned cache");
+    prepare_cache_directory(&cache).expect("reuse owned cache");
+    for mode in [0o775, 0o757] {
+        fs::set_permissions(&cache, fs::Permissions::from_mode(mode)).expect("share cache");
+        assert!(prepare_cache_directory(&cache).is_err());
+    }
+    fs::set_permissions(&cache, fs::Permissions::from_mode(0o755)).expect("restore cache");
+    let alias = root.path().join("alias");
+    symlink(&cache, &alias).expect("cache alias");
+    assert!(prepare_cache_directory(&alias).is_err());
+    assert_eq!(fs::read_dir(&cache).expect("cache contents").count(), 0);
+    if nix::unistd::geteuid().is_root() {
+        nix::unistd::chown(&cache, Some(nix::unistd::Uid::from_raw(65534)), None)
+            .expect("foreign cache");
+        assert!(prepare_cache_directory(&cache).is_err());
+    }
+}

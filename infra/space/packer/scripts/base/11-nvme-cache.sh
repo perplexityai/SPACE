@@ -199,6 +199,10 @@ for tree in /space/cache/firecracker/kernels /space/cache/firecracker/assets; do
   find "$tree" -xdev -type f -exec chmod u=rw,go=r,ug-s,a-t {} +
 done
 chmod +t /space/cache /space/cache/firecracker /space/cache/firecracker/builds
+for build_root in /space/cache/firecracker/builds/{oci,seed-cache}; do
+  [[ ! -L "$build_root" ]] || { echo "Refusing linked build directory: $build_root" >&2; exit 1; }
+  install -d -m 00755 -o 0 -g 0 "$build_root"
+done
 
 echo "Mounted /space/cache on NVMe instance store (btrfs RAID0)"
 df -Th /space/cache

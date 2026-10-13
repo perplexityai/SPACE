@@ -86,6 +86,10 @@ mount_space_cache_nvme_if_available() {
   chown root:root /space/cache/firecracker/jails
   chmod 0755 /space/cache/firecracker/jails
   chmod +t /space/cache /space/cache/firecracker /space/cache/firecracker/builds
+  for build_root in /space/cache/firecracker/builds/{oci,seed-cache}; do
+    [[ ! -L "$build_root" ]] || { echo "Refusing linked build directory: $build_root" >&2; exit 1; }
+    install -d -m 00755 -o 0 -g 0 "$build_root"
+  done
   df -Th /space/cache
 }
 

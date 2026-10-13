@@ -70,7 +70,6 @@ spec:
             - -ec
             - |
               install -d -m 0750 -o 0 -g 0 /space/run/build-manager
-              chmod +t /space/cache /space/cache/firecracker /space/cache/firecracker/builds
               exec /opt/space/bin/space-db-migrator build-manager --database-path {{ $db }} up
           securityContext:
             runAsUser: 0
@@ -80,7 +79,6 @@ spec:
               drop: ["ALL"]
           volumeMounts:
             {{- include "space-node-service.mount.run" . | nindent 12 }}
-            {{- include "space-node-service.mount.cache" (dict "propagation" "None") | nindent 12 }}
       containers:
         - name: build-manager
           {{- include "space-node-service.image" . | nindent 10 }}
