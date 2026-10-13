@@ -287,7 +287,7 @@ async fn cluster_api_channel(
             // contract by proving the configured Service address is reachable
             // before reporting this client as connected.
             transport
-                .endpoint(cluster_api_endpoint(uri.clone()))
+                .connect_endpoint(cluster_api_endpoint(uri.clone()))
                 .map_err(ConnectClusterApiError::InternalTransport)?
                 .connect()
                 .await
@@ -360,15 +360,15 @@ async fn rotating_channel(
     uri: Uri,
     transport: pplx_space_common_grpc::internal_transport::ClientTransport,
 ) -> Result<RotatingChannel, ConnectClusterApiError> {
-    RotatingChannel::connect(
-        CLUSTER_API_SERVICE_NAME,
-        transport
-            .endpoint(cluster_api_endpoint(uri))
-            .map_err(ConnectClusterApiError::InternalTransport)?,
-        pplx_space_common_grpc::max_connection_age_from_env(),
-    )
-    .await
-    .map_err(ConnectClusterApiError::Transport)
+    transport
+        .connect_endpoint(cluster_api_endpoint(uri))
+        .map_err(ConnectClusterApiError::InternalTransport)?
+        .connect_rotating(
+            CLUSTER_API_SERVICE_NAME,
+            pplx_space_common_grpc::max_connection_age_from_env(),
+        )
+        .await
+        .map_err(ConnectClusterApiError::Transport)
 }
 
 fn client_with_interceptor(

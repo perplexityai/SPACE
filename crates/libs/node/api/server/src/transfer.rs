@@ -117,7 +117,7 @@ async fn connect_remote(
             let token = crate::auth::required_space_bearer_token(
                 pplx_space_common_svc::bearer_token::SpaceBearerToken::NodeApi,
             )?;
-            let endpoint = pplx_space_common_grpc::internal_transport::client_endpoint(
+            let endpoint = pplx_space_common_grpc::internal_transport::client_connect_endpoint(
                 pplx_space_common_grpc::internal_transport::Service::NodeApi,
                 endpoint,
             )

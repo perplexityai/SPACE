@@ -187,7 +187,7 @@ fn lazy_channel(endpoint: String) -> Result<Channel, ConnectError> {
         Endpoint::from_shared(internal_transport::qualify_endpoint(&endpoint))?.tcp_nodelay(true);
     Ok(
         ClientTransport::from_env_sync(Service::BuildManager, endpoint.uri())?
-            .endpoint(endpoint)?
+            .connect_endpoint(endpoint)?
             .connect_lazy(),
     )
 }

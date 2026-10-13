@@ -3897,21 +3897,12 @@ pub fn node_api_channel(
     ))
 }
 
-/// [`node_api_transport`] for the TCP connect helpers, carrying the TLS
-/// handshake bound the transport applies.
+/// Apply the node-api internal transport to `endpoint` for the TCP connect
+/// helpers, carrying the TLS handshake bound the transport applies.
 async fn node_api_connect_endpoint(
     endpoint: Endpoint,
 ) -> Result<pplx_space_common_grpc::internal_transport::ConnectEndpoint, ControllerError> {
     pplx_space_common_grpc::internal_transport::client_connect_endpoint(
-        pplx_space_common_grpc::internal_transport::Service::NodeApi,
-        endpoint,
-    )
-    .await
-    .map_err(ControllerError::node_api_transport)
-}
-
-async fn node_api_transport(endpoint: Endpoint) -> Result<Endpoint, ControllerError> {
-    pplx_space_common_grpc::internal_transport::client_endpoint(
         pplx_space_common_grpc::internal_transport::Service::NodeApi,
         endpoint,
     )

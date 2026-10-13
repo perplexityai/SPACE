@@ -2085,7 +2085,7 @@ async fn build_cluster_api_client(
             .tcp_nodelay(true)
             .connect_timeout(CLUSTER_CONNECT_TIMEOUT)
             .timeout(CLUSTER_RPC_TIMEOUT);
-        let channel = pplx_space_common_grpc::internal_transport::client_endpoint(
+        let channel = pplx_space_common_grpc::internal_transport::client_connect_endpoint(
             pplx_space_common_grpc::internal_transport::Service::ClusterApi,
             endpoint,
         )

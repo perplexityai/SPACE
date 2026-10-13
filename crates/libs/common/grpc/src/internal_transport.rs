@@ -236,6 +236,10 @@ impl ClientTransport {
             _ => Err(TransportError::Scheme),
         }
     }
+    /// Apply this transport to `endpoint` for a channel tonic dials itself,
+    /// such as a balanced channel's. Its connect-phase failures carry no
+    /// [`crate::ConnectPhaseError`]; connect through
+    /// [`Self::connect_endpoint`] wherever SPACE's TCP connector can dial.
     pub fn endpoint(&self, endpoint: Endpoint) -> Result<Endpoint, TransportError> {
         Ok(self.connect_endpoint(endpoint)?.endpoint)
     }
@@ -272,6 +276,33 @@ pub struct ConnectEndpoint {
 }
 
 impl ConnectEndpoint {
+    /// [`crate::connect_tcp_channel`] with this endpoint's handshake bound.
+    pub async fn connect(self) -> Result<tonic::transport::Channel, tonic::transport::Error> {
+        crate::connect_tcp_channel(self.endpoint, self.tls_handshake_timeout).await
+    }
+
+    /// [`crate::connect_tcp_channel_lazy`] with this endpoint's handshake
+    /// bound.
+    pub fn connect_lazy(self) -> tonic::transport::Channel {
+        crate::connect_tcp_channel_lazy(self.endpoint, self.tls_handshake_timeout)
+    }
+
+    /// [`crate::RotatingChannel::connect`] with this endpoint's handshake
+    /// bound.
+    pub async fn connect_rotating(
+        self,
+        service_name: &'static str,
+        max_age: Option<std::time::Duration>,
+    ) -> Result<crate::RotatingChannel, tonic::transport::Error> {
+        crate::RotatingChannel::connect(
+            service_name,
+            self.endpoint,
+            self.tls_handshake_timeout,
+            max_age,
+        )
+        .await
+    }
+
     /// [`crate::connect_tcp_channel_with_retry`] with this endpoint's
     /// handshake bound.
     pub async fn connect_with_retry(
@@ -338,6 +369,7 @@ impl ConnectEndpoint {
     }
 }
 
+/// See [`ClientTransport::endpoint`].
 pub async fn client_endpoint(
     service: Service,
     endpoint: Endpoint,

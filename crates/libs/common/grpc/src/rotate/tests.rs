@@ -100,7 +100,7 @@ async fn an_aged_channel_redials_without_failing_requests() {
 
 async fn connect(addr: SocketAddr, max_age: Option<Duration>) -> RotatingChannel {
     let endpoint = Endpoint::from_shared(format!("http://{addr}")).expect("endpoint");
-    RotatingChannel::connect("test", endpoint, max_age)
+    RotatingChannel::connect("test", endpoint, None, max_age)
         .await
         .expect("connect")
 }

@@ -463,16 +463,15 @@ pub(super) async fn build_backend_channels(
     endpoint: &str,
     pool_size: usize,
 ) -> Result<Vec<Channel>, pplx_space_common_grpc::internal_transport::TransportError> {
-    let endpoint = Endpoint::from_shared(normalize_backend_endpoint(endpoint)?)?;
-    let endpoint = pplx_space_common_grpc::internal_transport::client_endpoint(
+    let endpoint = pplx_space_node_api_client::configure_node_api_endpoint(
+        Endpoint::from_shared(normalize_backend_endpoint(endpoint)?)?,
+        pplx_space_node_api_client::NodeApiEndpointConfig::default(),
+    );
+    let endpoint = pplx_space_common_grpc::internal_transport::client_connect_endpoint(
         pplx_space_common_grpc::internal_transport::Service::NodeApi,
         endpoint,
     )
     .await?;
-    let endpoint = pplx_space_node_api_client::configure_node_api_endpoint(
-        endpoint,
-        pplx_space_node_api_client::NodeApiEndpointConfig::default(),
-    );
     Ok((0..pool_size)
         .map(|_| endpoint.clone().connect_lazy())
         .collect())

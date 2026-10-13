@@ -322,6 +322,41 @@ async fn stalled_tcp_attempts_end_within_the_budget_and_one_attempt_cap() {
     );
 }
 
+/// A loopback listener whose SYNs Linux drops, so a dial to it neither
+/// connects nor fails before its own bound: Linux drops a SYN to a listener
+/// whose accept queue is full, which stands in for a peer that is gone or a
+/// SYN pinned to a stale conntrack entry.
+#[cfg(target_os = "linux")]
+struct Blackhole {
+    address: std::net::SocketAddr,
+    _listener: tokio::net::TcpListener,
+    _queued: Vec<tokio::net::TcpStream>,
+}
+
+#[cfg(target_os = "linux")]
+impl Blackhole {
+    async fn bind(address: std::net::SocketAddr) -> Self {
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.set_reuseaddr(true).unwrap();
+        socket.bind(address).unwrap();
+        let listener = socket.listen(2).unwrap();
+        let address = listener.local_addr().unwrap();
+        // Linux counts the accept queue full only once it holds more than the
+        // backlog, so three unaccepted connections fill it. Dialing them one at
+        // a time keeps at most one handshake pending, so the SYN queue never
+        // counts as full and the setup does not depend on SYN cookies.
+        let mut queued = Vec::new();
+        for _ in 0..3 {
+            queued.push(tokio::net::TcpStream::connect(address).await.unwrap());
+        }
+        Self {
+            address,
+            _listener: listener,
+            _queued: queued,
+        }
+    }
+}
+
 // An endpoint that sets no dial bound is dialed with the default one the
 // attempt cap is sized from: a dial whose SYN is never answered fails with the
 // dial bound's `TimedOut` and is redialed, instead of holding its attempt
@@ -331,18 +366,8 @@ async fn stalled_tcp_attempts_end_within_the_budget_and_one_attempt_cap() {
 #[cfg(target_os = "linux")]
 #[tokio::test(start_paused = true)]
 async fn an_endpoint_without_a_dial_bound_is_redialed_at_the_default_one() {
-    let socket = tokio::net::TcpSocket::new_v4().unwrap();
-    socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
-    let listener = socket.listen(2).unwrap();
-    let address = listener.local_addr().unwrap();
-    // Linux counts the accept queue full only once it holds more than the
-    // backlog, so three unaccepted connections fill it. Dialing them one at a
-    // time keeps at most one handshake pending, so the SYN queue never counts
-    // as full and the setup does not depend on SYN cookies.
-    let mut queued = Vec::new();
-    for _ in 0..3 {
-        queued.push(tokio::net::TcpStream::connect(address).await.unwrap());
-    }
+    let blackhole = Blackhole::bind("127.0.0.1:0".parse().unwrap()).await;
+    let address = blackhole.address;
     let endpoint = tonic::transport::Endpoint::from_shared(format!("http://{address}")).unwrap();
     assert_eq!(endpoint.get_connect_timeout(), None);
 
@@ -379,7 +404,7 @@ async fn an_endpoint_without_a_dial_bound_is_redialed_at_the_default_one() {
     });
     assert!(timed_out, "the dial bound did not fire: {error:?}");
     assert!(retries > 0, "the failed dial was not redialed");
-    drop(queued);
+    drop(blackhole);
 }
 
 #[cfg(feature = "internal-tls")]
@@ -580,5 +605,323 @@ async fn a_watched_dial_applies_tls_and_its_handshake_bound() {
         started.elapsed(),
         handshake_bound,
     );
+    silent_peer.abort();
+}
+
+fn status_chain(
+    status: &tonic::Status,
+) -> impl Iterator<Item = &(dyn std::error::Error + 'static)> {
+    std::iter::successors(std::error::Error::source(status), |error| error.source())
+}
+
+fn is_marked(status: &tonic::Status) -> bool {
+    status_chain(status).any(|error| error.is::<crate::ConnectPhaseError>())
+}
+
+fn has_io_error(status: &tonic::Status, kind: std::io::ErrorKind) -> bool {
+    status_chain(status).any(|error| {
+        error
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|error| error.kind() == kind)
+    })
+}
+
+/// A health check without a deadline, so only a transport bound can end it.
+fn unbounded_health_request() -> Request<tonic_health::pb::HealthCheckRequest> {
+    Request::new(tonic_health::pb::HealthCheckRequest::default())
+}
+
+async fn health_check_status(channel: tonic::transport::Channel) -> tonic::Status {
+    HealthClient::new(channel)
+        .check(unbounded_health_request())
+        .await
+        .expect_err("the health check must fail")
+}
+
+// A lazy channel's dial that its bound times out fails the RPC before any
+// request bytes exist, and the connector says so: the failure is replay-safe
+// although its cause is a bare `TimedOut`. Under the paused clock the dial
+// bound fires before the kernel's own SYN retries could end the dial.
+#[cfg(target_os = "linux")]
+#[tokio::test(start_paused = true)]
+async fn a_lazy_channels_timed_out_dial_is_a_client_connect_failure() {
+    let blackhole = Blackhole::bind("127.0.0.1:0".parse().unwrap()).await;
+    let endpoint = tonic::transport::Endpoint::from_shared(format!("http://{}", blackhole.address))
+        .unwrap()
+        .connect_timeout(Duration::from_secs(1));
+
+    let status = health_check_status(super::connect_tcp_channel_lazy(endpoint, None)).await;
+    assert!(
+        has_io_error(&status, std::io::ErrorKind::TimedOut),
+        "{status:?}"
+    );
+    assert!(is_marked(&status), "{status:?}");
+    assert!(crate::is_client_connect_failure(&status), "{status:?}");
+}
+
+// The same timed-out dial through tonic's own connector carries only the bare
+// `TimedOut`, which an established connection that gives up on a request it
+// already sent reports too, so it proves nothing.
+#[cfg(target_os = "linux")]
+#[tokio::test(start_paused = true)]
+async fn an_unmarked_timed_out_dial_is_not_a_client_connect_failure() {
+    let blackhole = Blackhole::bind("127.0.0.1:0".parse().unwrap()).await;
+    let endpoint = tonic::transport::Endpoint::from_shared(format!("http://{}", blackhole.address))
+        .unwrap()
+        .connect_timeout(Duration::from_secs(1));
+
+    let status = health_check_status(endpoint.connect_lazy()).await;
+    assert!(
+        has_io_error(&status, std::io::ErrorKind::TimedOut),
+        "{status:?}"
+    );
+    assert!(!crate::is_client_connect_failure(&status), "{status:?}");
+}
+
+// A refused dial is a connect failure through either connector: the refusal
+// itself proves the dial failed.
+#[tokio::test]
+async fn a_refused_dial_is_a_client_connect_failure_through_either_connector() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    drop(listener);
+    let endpoint = tonic::transport::Endpoint::from_shared(format!("http://{address}"))
+        .unwrap()
+        .connect_timeout(Duration::from_secs(1));
+
+    for (connector, channel) in [
+        (
+            "space",
+            super::connect_tcp_channel_lazy(endpoint.clone(), None),
+        ),
+        ("tonic", endpoint.connect_lazy()),
+    ] {
+        let status = health_check_status(channel).await;
+        assert!(
+            crate::is_client_connect_failure(&status),
+            "{connector}: {status:?}"
+        );
+    }
+}
+
+// A kept channel whose redial never connects fails the RPC that waited for it
+// with the connector's marker, so the redials it retries leave the failure
+// replay-safe. The peer's address turns into a blackhole once it stops.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_kept_channels_redial_that_never_connects_is_a_client_connect_failure() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (stop, server) = serve_tcp_health(listener).await;
+    let endpoint = tonic::transport::Endpoint::from_shared(format!("http://{address}")).unwrap();
+    let channel = super::connect_tcp_channel_with_retrying_redials(
+        "test-backend",
+        endpoint,
+        Duration::from_millis(100),
+        None,
+        stalled_tcp_policy(Duration::from_millis(500)),
+    )
+    .await
+    .expect("first dial");
+    let mut client = HealthClient::new(channel);
+    client.check(health_request()).await.expect("served");
+
+    stop.send(()).unwrap();
+    server.await.unwrap();
+    let blackhole = Blackhole::bind(address).await;
+    let status = client
+        .check(unbounded_health_request())
+        .await
+        .expect_err("nothing answers the redial");
+    assert!(
+        has_io_error(&status, std::io::ErrorKind::TimedOut),
+        "{status:?}"
+    );
+    assert!(is_marked(&status), "{status:?}");
+    assert!(crate::is_client_connect_failure(&status), "{status:?}");
+    drop(blackhole);
+}
+
+/// A loopback peer that reads the HTTP/2 preface and each frame of every
+/// connection until a request's HEADERS, then drops the connection, resetting
+/// it when `reset`. Returns its address and how many requests it read.
+async fn request_dropping_peer(
+    reset: bool,
+) -> (
+    std::net::SocketAddr,
+    std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    tokio::task::JoinHandle<()>,
+) {
+    use tokio::io::AsyncReadExt as _;
+
+    const HTTP2_PREFACE_LEN: usize = 24;
+    const HTTP2_FRAME_HEADER_LEN: usize = 9;
+    const HTTP2_HEADERS_FRAME: u8 = 0x1;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let seen = requests.clone();
+    let peer = tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut preface = [0; HTTP2_PREFACE_LEN];
+            if stream.read_exact(&mut preface).await.is_err() {
+                continue;
+            }
+            loop {
+                let mut header = [0; HTTP2_FRAME_HEADER_LEN];
+                if stream.read_exact(&mut header).await.is_err() {
+                    break;
+                }
+                let length = u32::from_be_bytes([0, header[0], header[1], header[2]]) as usize;
+                let mut payload = vec![0; length];
+                if stream.read_exact(&mut payload).await.is_err() {
+                    break;
+                }
+                if header[3] == HTTP2_HEADERS_FRAME {
+                    seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if reset {
+                        stream.set_zero_linger().unwrap();
+                    }
+                    break;
+                }
+            }
+        }
+    });
+    (address, requests, peer)
+}
+
+// An RPC whose connection dies after the peer read it was sent and may have
+// run: its failure is local, but it is no connect failure, whether the peer
+// closes the connection or resets it.
+#[tokio::test]
+async fn an_rpc_whose_connection_dies_after_it_was_sent_is_not_a_client_connect_failure() {
+    for reset in [false, true] {
+        let (address, requests, peer) = request_dropping_peer(reset).await;
+        let endpoint = tonic::transport::Endpoint::from_shared(format!("http://{address}"))
+            .unwrap()
+            .connect_timeout(Duration::from_secs(1));
+
+        let status = health_check_status(super::connect_tcp_channel_lazy(endpoint, None)).await;
+        assert!(
+            requests.load(std::sync::atomic::Ordering::SeqCst) > 0,
+            "reset {reset}: the peer never read the request: {status:?}"
+        );
+        assert!(
+            std::error::Error::source(&status).is_some(),
+            "reset {reset}: the failure must be local: {status:?}"
+        );
+        assert!(
+            !crate::is_client_connect_failure(&status),
+            "reset {reset}: {status:?}"
+        );
+        peer.abort();
+    }
+}
+
+/// A health service that answers every check with `UNAVAILABLE` and `message`.
+struct UnavailableHealth(&'static str);
+
+#[tonic::async_trait]
+impl tonic_health::pb::health_server::Health for UnavailableHealth {
+    async fn check(
+        &self,
+        _request: Request<tonic_health::pb::HealthCheckRequest>,
+    ) -> Result<tonic::Response<tonic_health::pb::HealthCheckResponse>, tonic::Status> {
+        Err(tonic::Status::unavailable(self.0))
+    }
+
+    type WatchStream =
+        tokio_stream::Empty<Result<tonic_health::pb::HealthCheckResponse, tonic::Status>>;
+
+    async fn watch(
+        &self,
+        _request: Request<tonic_health::pb::HealthCheckRequest>,
+    ) -> Result<tonic::Response<Self::WatchStream>, tonic::Status> {
+        Err(tonic::Status::unimplemented("watch"))
+    }
+}
+
+// A peer's `UNAVAILABLE` arrives over a working connection, whatever its
+// message says about connecting.
+#[tokio::test]
+async fn a_peers_unavailable_that_reads_like_a_connect_failure_is_not_one() {
+    for message in [
+        "tcp connect error: Connection refused (os error 111)",
+        "tcp connect error: connection timed out",
+        "dns error: failed to lookup address information",
+    ] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let server = tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(tonic_health::pb::health_server::HealthServer::new(
+                    UnavailableHealth(message),
+                ))
+                .serve_with_incoming_shutdown(
+                    tokio_stream::wrappers::TcpListenerStream::new(listener),
+                    async move {
+                        let _ = shutdown_rx.await;
+                    },
+                ),
+        );
+        let endpoint = tonic::transport::Endpoint::from_shared(format!("http://{address}"))
+            .unwrap()
+            .connect_timeout(Duration::from_secs(1));
+
+        let status = health_check_status(super::connect_tcp_channel_lazy(endpoint, None)).await;
+        assert_eq!(status.code(), tonic::Code::Unavailable, "{status:?}");
+        assert_eq!(status.message(), message);
+        assert!(!crate::is_client_connect_failure(&status), "{status:?}");
+        shutdown_tx.send(()).unwrap();
+        server.await.unwrap().unwrap();
+    }
+}
+
+// A TLS handshake runs on the connection the dial established, after the
+// connector returned it, so its timeout carries no marker and stays
+// ambiguous. That the handshake's own bound ends it, not a whole-connect
+// bound cut to the dial's, shows a lazy internal-RPC channel keeps both.
+#[cfg(feature = "internal-tls")]
+#[tokio::test]
+async fn a_lazy_internal_rpc_channels_tls_handshake_timeout_is_not_a_client_connect_failure() {
+    use crate::internal_transport::{CA_ENV, ClientTransport, Service};
+
+    install_crypto_provider();
+    let (address, silent_peer) = silent_tls_peer().await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut env = TestEnvironment::default();
+    env.0
+        .insert(CA_ENV, write_test_ca(dir.path()).into_os_string());
+    let handshake_bound = Duration::from_secs(1);
+    let endpoint = tonic::transport::Endpoint::from_shared(format!("https://{address}"))
+        .unwrap()
+        .connect_timeout(Duration::from_millis(500));
+    let channel = ClientTransport::from_environment_with_tls_handshake_timeout(
+        Service::NodeApi,
+        endpoint.uri(),
+        &env,
+        handshake_bound,
+    )
+    .await
+    .unwrap()
+    .connect_endpoint(endpoint)
+    .unwrap()
+    .connect_lazy();
+
+    let started = tokio::time::Instant::now();
+    let status = tokio::time::timeout(Duration::from_secs(60), health_check_status(channel))
+        .await
+        .expect("an unanswered TLS handshake must be bounded");
+    let elapsed = started.elapsed();
+    assert!(
+        status_chain(&status).any(|error| error.to_string().contains("TLS handshake timeout")),
+        "{status:?}"
+    );
+    assert!(elapsed >= handshake_bound, "failed after {elapsed:?}");
+    assert!(!is_marked(&status), "{status:?}");
+    assert!(!crate::is_client_connect_failure(&status), "{status:?}");
     silent_peer.abort();
 }

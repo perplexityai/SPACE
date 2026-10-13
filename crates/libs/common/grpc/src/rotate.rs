@@ -94,22 +94,30 @@ pub struct RotatingChannel {
 }
 
 impl RotatingChannel {
-    /// Dials `endpoint`, redialing it whenever the connection reaches
-    /// `max_age`. `None` (or zero) never rotates.
+    /// Dials `endpoint` through [`crate::connect_tcp_channel`], redialing it
+    /// whenever the connection reaches `max_age`. `None` (or zero) never
+    /// rotates. `tls_handshake_timeout` is the bound the endpoint's TLS config
+    /// sets, or `None` for plaintext; internal-RPC callers connect through
+    /// `internal_transport::ConnectEndpoint::connect_rotating` instead.
     ///
     /// The first dial is eager and its failure is the caller's, exactly as with
     /// [`Endpoint::connect`]; only later rotations are backgrounded.
     pub async fn connect(
         service_name: &'static str,
         endpoint: Endpoint,
+        tls_handshake_timeout: Option<Duration>,
         max_age: Option<Duration>,
     ) -> Result<Self, tonic::transport::Error> {
-        let channel = endpoint.connect().await?;
+        let channel = crate::connect_tcp_channel(endpoint.clone(), tls_handshake_timeout).await?;
         // A zero age would redial on every request, so it reads as "off" like
         // the absent case rather than as an interval.
         let rotation = max_age
             .filter(|max_age| !max_age.is_zero())
-            .map(|max_age| Rotation { endpoint, max_age });
+            .map(|max_age| Rotation {
+                endpoint,
+                tls_handshake_timeout,
+                max_age,
+            });
         Ok(Self::new(service_name, rotation, channel))
     }
 
@@ -191,6 +199,7 @@ struct Shared {
 
 struct Rotation {
     endpoint: Endpoint,
+    tls_handshake_timeout: Option<Duration>,
     max_age: Duration,
 }
 
@@ -223,14 +232,20 @@ impl Shared {
         };
         state.rotating = true;
         let endpoint = rotation.endpoint.clone();
+        let tls_handshake_timeout = rotation.tls_handshake_timeout;
         let max_age = rotation.max_age;
         drop(state);
-        runtime.spawn(Arc::clone(self).rotate(endpoint, max_age));
+        runtime.spawn(Arc::clone(self).rotate(endpoint, tls_handshake_timeout, max_age));
         channel
     }
 
-    async fn rotate(self: Arc<Self>, endpoint: Endpoint, max_age: Duration) {
-        let dialed = endpoint.connect().await;
+    async fn rotate(
+        self: Arc<Self>,
+        endpoint: Endpoint,
+        tls_handshake_timeout: Option<Duration>,
+        max_age: Duration,
+    ) {
+        let dialed = crate::connect_tcp_channel(endpoint, tls_handshake_timeout).await;
         let mut state = lock(&self.state);
         match dialed {
             Ok(channel) => {

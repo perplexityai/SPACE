@@ -132,8 +132,14 @@ pub fn should_reconnect_status(status: &Status) -> bool {
 }
 
 /// True when the failure was generated client-side while connecting, before
-/// any request bytes were transmitted — the local transport error chain
-/// contains an [`std::io::Error`] whose kind proves the dial itself failed.
+/// any request bytes were transmitted: the local transport error chain
+/// contains a [`crate::ConnectPhaseError`], which SPACE's TCP connector puts
+/// on every failure to resolve or dial its peer, or an [`std::io::Error`]
+/// whose kind (`ConnectionRefused`, or `NotFound` for an absent Unix socket)
+/// proves the dial itself failed. A bare `TimedOut` proves nothing: the
+/// kernel also reports it when an established connection gives up
+/// retransmitting a request it already sent. TLS failures carry no marker and
+/// do not count.
 ///
 /// This is a typed check, not text matching: a `Status` decoded from wire
 /// trailers carries no local error source chain, so a server echoing
@@ -146,6 +152,9 @@ pub fn is_client_connect_failure(status: &Status) -> bool {
     }
     let mut source = std::error::Error::source(status);
     while let Some(error) = source {
+        if error.is::<crate::ConnectPhaseError>() {
+            return true;
+        }
         if let Some(io_error) = error.downcast_ref::<std::io::Error>() {
             return matches!(
                 io_error.kind(),

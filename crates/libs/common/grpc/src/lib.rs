@@ -60,7 +60,8 @@ mod trace;
 
 pub use client::GrpcClient;
 pub use connect::{
-    TcpConnectError, UdsConnectError, connect_tcp_channel_with_retry,
+    ConnectPhaseError, TcpConnectError, UdsConnectError, connect_tcp_channel,
+    connect_tcp_channel_lazy, connect_tcp_channel_with_retry,
     connect_tcp_channel_with_retry_watched, connect_tcp_channel_with_retrying_redials,
     connect_uds_channel, connect_uds_channel_lazy, connect_uds_channel_with_endpoint,
     connect_uds_channel_with_endpoint_with_retry, connect_uds_channel_with_retry,

@@ -44,7 +44,7 @@ impl RemoteIngressActivation {
             .await
             .map_err(|error| Status::failed_precondition(error.to_string()))?;
         let channel = transport
-            .endpoint(endpoint)
+            .connect_endpoint(endpoint)
             .map_err(|error| Status::failed_precondition(error.to_string()))?
             .connect_lazy();
         Ok(Self {

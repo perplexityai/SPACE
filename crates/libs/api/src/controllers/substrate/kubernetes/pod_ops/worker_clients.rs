@@ -38,7 +38,7 @@ impl KubernetesSubstrate {
             crate::controllers::substrate::NODE_RPC_TIMEOUT,
         )
         .ok()?;
-        crate::controllers::substrate::node_api_transport(endpoint)
+        crate::controllers::substrate::node_api_connect_endpoint(endpoint)
             .await
             .ok()?
             .connect()

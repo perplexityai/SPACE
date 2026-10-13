@@ -291,7 +291,7 @@ impl NodeApiClient {
                         )
                     })
                     .await?;
-                Ok(transport.endpoint(endpoint)?.connect().await?)
+                Ok(transport.connect_endpoint(endpoint)?.connect().await?)
             })
         });
         Self::from_connect_fn(service_name, connect)

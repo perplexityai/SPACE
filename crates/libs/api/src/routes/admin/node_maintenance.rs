@@ -529,9 +529,10 @@ async fn verify_node_endpoint(
             pplx_space_common_grpc::internal_transport::Service::NodeApi
         }
     };
-    let endpoint = pplx_space_common_grpc::internal_transport::client_endpoint(service, endpoint)
-        .await
-        .map_err(|error| api_error(StatusCode::BAD_GATEWAY, error.to_string()))?;
+    let endpoint =
+        pplx_space_common_grpc::internal_transport::client_connect_endpoint(service, endpoint)
+            .await
+            .map_err(|error| api_error(StatusCode::BAD_GATEWAY, error.to_string()))?;
     let channel = endpoint.connect().await.map_err(|err| {
         api_error(
             StatusCode::BAD_GATEWAY,

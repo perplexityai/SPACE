@@ -40,6 +40,23 @@ pub enum TcpConnectError {
     },
 }
 
+/// Marks a failure of SPACE's TCP connector: resolving the target's name or
+/// dialing it failed, so no connection existed and no request bytes were sent.
+/// The connector's own error is the [`source`](std::error::Error::source), so
+/// a check for an [`std::io::Error`] kind still finds it, and the message is
+/// the source's, as with tonic's own `ConnectError`. Only the connector
+/// constructs it. TLS, when the endpoint configures it, runs on the connection
+/// the dial returned, so its failures never carry this marker.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct ConnectPhaseError(#[source] Box<dyn std::error::Error + Send + Sync>);
+
+impl ConnectPhaseError {
+    fn new(source: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> Self {
+        Self(source.into())
+    }
+}
+
 /// What a TCP connect attempt allows for name resolution, which runs before
 /// the TCP dial and which no tonic timeout bounds.
 const NAME_RESOLUTION_ALLOWANCE: std::time::Duration = std::time::Duration::from_secs(3);
@@ -250,9 +267,9 @@ pub fn connect_uds_channel_lazy(
 /// most `max_elapsed` plus one attempt cap. With
 /// [`crate::DEFAULT_TCP_GRPC_CONNECT_RETRY_POLICY`] and a 3s
 /// `connect_timeout`: 31s with the 15s internal-transport handshake bound, 19s
-/// with a 3s one, 16s for plaintext. The returned channel's later reconnects
-/// are outside the cap and budget; only the dial bound and the TLS config's
-/// own timeout bound them.
+/// with a 3s one, 16s for plaintext. Every dial, the first and the returned
+/// channel's later reconnects, goes through [`connect_tcp_channel`], whose
+/// bounds those reconnects keep; they are outside the retry budget.
 pub async fn connect_tcp_channel_with_retry(
     service_name: &'static str,
     target: impl AsRef<str>,
@@ -272,7 +289,11 @@ pub async fn connect_tcp_channel_with_retry(
         attempt_cap,
         || {
             let endpoint = endpoint.clone();
-            async move { endpoint.connect().await.map_err(TcpConnectError::from) }
+            async move {
+                connect_tcp_channel(endpoint, tls_handshake_timeout)
+                    .await
+                    .map_err(TcpConnectError::from)
+            }
         },
     )
     .await
@@ -398,7 +419,9 @@ where
 /// Internal-RPC callers must connect through
 /// `internal_transport::ConnectEndpoint::connect_with_retrying_redials`
 /// instead, which passes the bound its transport applied. Each whole dial or
-/// redial is bounded at [`retrying_redial_bound`].
+/// redial is bounded at [`retrying_redial_bound`]. A dial or redial whose
+/// attempts all fail, or are abandoned at their cap, fails with a
+/// [`ConnectPhaseError`], as one through [`connect_tcp_channel`] does.
 pub async fn connect_tcp_channel_with_retrying_redials(
     service_name: &'static str,
     endpoint: tonic::transport::Endpoint,
@@ -406,6 +429,8 @@ pub async fn connect_tcp_channel_with_retrying_redials(
     tls_handshake_timeout: Option<std::time::Duration>,
     retry_policy: GrpcRetryPolicy,
 ) -> Result<tonic::transport::Channel, tonic::transport::Error> {
+    let mut http = endpoint_http_connector(&endpoint);
+    http.set_connect_timeout(Some(attempt_timeout));
     // The connector bounds each attempt; the endpoint's bound covers the
     // retries and the TLS handshake after them.
     let endpoint = endpoint.connect_timeout(retrying_redial_bound(
@@ -413,10 +438,6 @@ pub async fn connect_tcp_channel_with_retrying_redials(
         attempt_timeout,
         tls_handshake_timeout,
     ));
-    let mut http = hyper_util::client::legacy::connect::HttpConnector::new();
-    http.enforce_http(false);
-    http.set_nodelay(true);
-    http.set_connect_timeout(Some(attempt_timeout));
     endpoint
         .connect_with_connector(RetryingTcpConnector {
             http,
@@ -454,7 +475,7 @@ struct RetryingTcpConnector {
 impl tower::Service<http::Uri> for RetryingTcpConnector {
     type Response =
         <hyper_util::client::legacy::connect::HttpConnector as tower::Service<http::Uri>>::Response;
-    type Error = Box<dyn std::error::Error + Send + Sync>;
+    type Error = ConnectPhaseError;
     type Future = std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send>,
     >;
@@ -463,7 +484,7 @@ impl tower::Service<http::Uri> for RetryingTcpConnector {
         &mut self,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Result<(), Self::Error>> {
-        self.http.poll_ready(cx).map_err(Into::into)
+        self.http.poll_ready(cx).map_err(ConnectPhaseError::new)
     }
 
     fn call(&mut self, uri: http::Uri) -> Self::Future {
@@ -475,13 +496,120 @@ impl tower::Service<http::Uri> for RetryingTcpConnector {
         } = self.clone();
         Box::pin(async move {
             let target = uri.to_string();
-            retry_tcp_connect(service_name, &target, retry_policy, attempt_cap, || {
-                let mut http = http.clone();
-                let uri = uri.clone();
-                async move { Ok(tower::Service::call(&mut http, uri).await?) }
-            })
+            // An abandoned attempt never got past the lookup and dial either.
+            retry_tcp_connect::<_, Box<dyn std::error::Error + Send + Sync>, _, _>(
+                service_name,
+                &target,
+                retry_policy,
+                attempt_cap,
+                || {
+                    let mut http = http.clone();
+                    let uri = uri.clone();
+                    async move { Ok(tower::Service::call(&mut http, uri).await?) }
+                },
+            )
             .await
+            .map_err(ConnectPhaseError::new)
         })
+    }
+}
+
+/// Connect a TCP channel through SPACE's TCP connector, which resolves and
+/// dials the peer and fails with a [`ConnectPhaseError`] when either step
+/// does, on the first dial and every later redial. An RPC that such a redial
+/// fails therefore carries the marker, which
+/// [`crate::is_client_connect_failure`] reads as proof that it was never sent.
+/// Internal-RPC callers connect through
+/// `internal_transport::ConnectEndpoint::connect` instead, which passes the
+/// handshake bound its transport applied.
+///
+/// The endpoint's settings apply as [`tonic::transport::Endpoint::connect`]
+/// applies them, its `connect_timeout` bounding the TCP dial alone.
+/// `tls_handshake_timeout` must be the bound the endpoint's TLS config sets
+/// (`None` for plaintext): tonic bounds a custom connector's whole connect,
+/// TLS included, at the endpoint's `connect_timeout`, so an endpoint with a
+/// dial bound is given a 3s name-resolution allowance plus that bound plus
+/// `tls_handshake_timeout` for the whole connect instead, and neither the dial
+/// nor the handshake is cut short. An endpoint without a dial bound gets no
+/// whole-connect bound, as with `Endpoint::connect`.
+pub async fn connect_tcp_channel(
+    endpoint: tonic::transport::Endpoint,
+    tls_handshake_timeout: Option<std::time::Duration>,
+) -> Result<tonic::transport::Channel, tonic::transport::Error> {
+    let (endpoint, connector) = tcp_connector(endpoint, tls_handshake_timeout);
+    endpoint.connect_with_connector(connector).await
+}
+
+/// [`connect_tcp_channel`] for a channel that dials when an RPC first needs
+/// it.
+pub fn connect_tcp_channel_lazy(
+    endpoint: tonic::transport::Endpoint,
+    tls_handshake_timeout: Option<std::time::Duration>,
+) -> tonic::transport::Channel {
+    let (endpoint, connector) = tcp_connector(endpoint, tls_handshake_timeout);
+    endpoint.connect_with_connector_lazy(connector)
+}
+
+/// SPACE's TCP connector for `endpoint`, and the endpoint to hand tonic with
+/// it: see [`connect_tcp_channel`].
+fn tcp_connector(
+    endpoint: tonic::transport::Endpoint,
+    tls_handshake_timeout: Option<std::time::Duration>,
+) -> (tonic::transport::Endpoint, TcpConnector) {
+    let connector = TcpConnector {
+        http: endpoint_http_connector(&endpoint),
+    };
+    let endpoint = match endpoint.get_connect_timeout() {
+        Some(dial_timeout) => {
+            endpoint.connect_timeout(tcp_attempt_cap(dial_timeout, tls_handshake_timeout))
+        }
+        None => endpoint,
+    };
+    (endpoint, connector)
+}
+
+/// hyper-util's `HttpConnector` configured from `endpoint` as tonic's
+/// `Endpoint::connect` configures it. Tonic has no getter for an endpoint's
+/// local address; SPACE sets none, so the connector keeps the default, which
+/// lets the kernel choose, as tonic would.
+fn endpoint_http_connector(
+    endpoint: &tonic::transport::Endpoint,
+) -> hyper_util::client::legacy::connect::HttpConnector {
+    let mut http = hyper_util::client::legacy::connect::HttpConnector::new();
+    http.enforce_http(false);
+    http.set_nodelay(endpoint.get_tcp_nodelay());
+    http.set_keepalive(endpoint.get_tcp_keepalive());
+    http.set_keepalive_interval(endpoint.get_tcp_keepalive_interval());
+    http.set_keepalive_retries(endpoint.get_tcp_keepalive_retries());
+    http.set_connect_timeout(endpoint.get_connect_timeout());
+    http
+}
+
+/// Resolves and dials like hyper-util's `HttpConnector`, which it wraps, and
+/// marks every error with [`ConnectPhaseError`].
+#[derive(Clone)]
+struct TcpConnector {
+    http: hyper_util::client::legacy::connect::HttpConnector,
+}
+
+impl tower::Service<http::Uri> for TcpConnector {
+    type Response =
+        <hyper_util::client::legacy::connect::HttpConnector as tower::Service<http::Uri>>::Response;
+    type Error = ConnectPhaseError;
+    type Future = std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send>,
+    >;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        self.http.poll_ready(cx).map_err(ConnectPhaseError::new)
+    }
+
+    fn call(&mut self, uri: http::Uri) -> Self::Future {
+        let connecting = tower::Service::call(&mut self.http, uri);
+        Box::pin(async move { connecting.await.map_err(ConnectPhaseError::new) })
     }
 }
 
