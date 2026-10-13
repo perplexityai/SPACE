@@ -351,8 +351,9 @@ where
 }
 
 /// The span fields a JSON log line inherits when the event does not set them:
-/// the identifiers a reader filters one sandbox's or one request's lines by.
-const CORRELATION_FIELDS: [&str; 2] = ["sandbox_id", "request_id"];
+/// the identifiers a reader filters one sandbox's, one request's or one
+/// public operation's lines by.
+const CORRELATION_FIELDS: [&str; 3] = ["sandbox_id", "request_id", "operation_id"];
 
 /// [`CORRELATION_FIELDS`] values a span carries, kept in its extensions by
 /// [`SpanCorrelationLayer`].
@@ -360,6 +361,7 @@ const CORRELATION_FIELDS: [&str; 2] = ["sandbox_id", "request_id"];
 struct SpanCorrelation {
     sandbox_id: Option<String>,
     request_id: Option<String>,
+    operation_id: Option<String>,
 }
 
 impl SpanCorrelation {
@@ -367,6 +369,7 @@ impl SpanCorrelation {
         match field {
             "sandbox_id" => Some(&mut self.sandbox_id),
             "request_id" => Some(&mut self.request_id),
+            "operation_id" => Some(&mut self.operation_id),
             _ => None,
         }
     }
@@ -375,6 +378,7 @@ impl SpanCorrelation {
         [
             ("sandbox_id", self.sandbox_id.as_deref()),
             ("request_id", self.request_id.as_deref()),
+            ("operation_id", self.operation_id.as_deref()),
         ]
     }
 
@@ -383,12 +387,16 @@ impl SpanCorrelation {
         let Self {
             sandbox_id,
             request_id,
+            operation_id,
         } = recorded;
         if sandbox_id.is_some() {
             self.sandbox_id = sandbox_id;
         }
         if request_id.is_some() {
             self.request_id = request_id;
+        }
+        if operation_id.is_some() {
+            self.operation_id = operation_id;
         }
     }
 
