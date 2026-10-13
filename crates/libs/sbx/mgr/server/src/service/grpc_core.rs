@@ -170,10 +170,6 @@ impl SandboxManagerService {
     ) -> Result<Response<CreateResponse>, Status> {
         let peer = self.authorize_peer(&request, "Create", ALLOW_SANDBOX_OPERATOR_OR_TMPLMGR)?;
         let span = tracing::info_span!("sbxmgr.create", template = %request.get_ref().template);
-        pplx_space_observability::trace_propagation::set_span_parent_context_from(
-            &span,
-            request.metadata(),
-        );
         let publish_node_state = !should_skip_node_publish(&request);
         let result = async move {
             let req = request.get_ref();
@@ -546,10 +542,6 @@ impl SandboxManagerService {
             initial_state = tracing::field::Empty,
             has_rootfs = tracing::field::Empty,
             has_snapshot = tracing::field::Empty,
-        );
-        pplx_space_observability::trace_propagation::set_span_parent_context_from(
-            &span,
-            request.metadata(),
         );
         let sandbox_id = req.sandbox_id.clone();
         let publish_node_state = !should_skip_node_publish(&request);
