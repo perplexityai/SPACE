@@ -11,6 +11,7 @@ on:
       - space_smoke/**
       - Tiltfile
       - docker/Dockerfile.rust-build-kind
+      - docker/Dockerfile.worker
       - crates/libs/sbx/mgr/server/src/service/activation_support.rs
       - infra/space/observability/**
       - crates/libs/observability/**
