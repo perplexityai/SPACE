@@ -7,6 +7,7 @@
 
 - [Running SPACE](running-space.md)
   - [Install and configure locally](installation.md)
+  - [Warm pools and base snapshots](warm-pools.md)
   - [Observability](observability.md)
   - [Troubleshooting](troubleshooting.md)
 

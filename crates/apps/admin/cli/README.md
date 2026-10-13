@@ -26,6 +26,9 @@ space-admin-cli warm-pool update --template NAME@sha256:... --vcpu N ...
 resolution is client-side via `GET /admin/api/v1/nodes` and surfaces every match
 when the prefix is ambiguous.
 
+For when creates can claim a warm-pool slot, rolling warm-pool policies, and
+node-local base snapshots, see [Warm pools and base snapshots](../../../../docs/warm-pools.md).
+
 ## Install
 
 ```bash

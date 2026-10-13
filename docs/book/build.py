@@ -20,6 +20,7 @@ CHAPTERS = (
     "first-sandbox.md",
     "running-space.md",
     "installation.md",
+    "warm-pools.md",
     "observability.md",
     "troubleshooting.md",
     "development-overview.md",

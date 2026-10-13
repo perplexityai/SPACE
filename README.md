@@ -40,6 +40,7 @@ Read the hosted [Guide](https://space.docs.perplexity.ai/guide/index.html) and [
 | [Versioning and compatibility](docs/versioning.md) | Release progression, supported guests, service stability, and upgrade/rollback requirements. |
 | [Architecture](docs/architecture.md) | How templates, sandboxes, processes, sessions, and operations relate; what pause and suspend preserve; how the services fit together. |
 | [Installation and configuration](docs/installation.md) | Host prerequisites, local Kind deployment, configuration defaults, authentication, verification, and teardown. |
+| [Warm pools and base snapshots](docs/warm-pools.md) | Keep booted sandboxes ready on Kubernetes or a single node, choose a shape that creates can claim, and verify pool hits. |
 | [Operator CLI](crates/apps/admin/cli/README.md) | API access, port forwarding, `space-admin-cli login`, nodes, warm pools, and system-template builds. |
 | [Your first sandbox](docs/first-sandbox.md) | A complete API workflow, command customization, output handling, inspection, and deletion. |
 | [E2B Compatibility Wrapper](docs/ecw.md) | Configure ECW, create a compatibility API key, use the tested E2B Python SDK, and understand supported behavior and limitations. |
