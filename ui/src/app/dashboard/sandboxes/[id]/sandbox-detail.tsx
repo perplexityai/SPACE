@@ -824,6 +824,7 @@ function ControlButtons({ sandbox, onAction, busy }: {
     primary = false,
   ) => {
     const allowed = enabled && !observedOnly && !poolSlot;
+    const requiresConfirmation = action === 'kill' || action === 'stop';
     const button = (
       <Button
         size="small"
@@ -831,7 +832,7 @@ function ControlButtons({ sandbox, onAction, busy }: {
         type={primary ? 'primary' : 'default'}
         icon={icon}
         disabled={!allowed || busy}
-        onClick={action === 'kill' ? undefined : () => onAction(action)}
+        onClick={requiresConfirmation ? undefined : () => onAction(action)}
       >
         {label}
       </Button>
@@ -847,13 +848,17 @@ function ControlButtons({ sandbox, onAction, busy }: {
               : (!enabled ? `Cannot ${label.toLowerCase()} in ${s || 'unknown'} state` : label)
         }
       >
-        {action === 'kill' ? (
+        {requiresConfirmation ? (
           <Popconfirm
-            title="Kill this sandbox?"
-            okText="Kill"
+            title={action === 'stop' ? `Stop sandbox ${sandboxLabelOrId(sandbox.id)}?` : 'Kill this sandbox?'}
+            description={action === 'stop' ? 'Stopping interrupts current execution without guaranteeing a snapshot.' : undefined}
+            okText={label}
             cancelText="Cancel"
             okButtonProps={{ danger: true }}
-            onConfirm={() => onAction('kill')}
+            onConfirm={() => {
+              if (action === 'stop' && (!allowed || busy)) return;
+              return onAction(action);
+            }}
             disabled={!allowed || busy}
           >
             {button}
