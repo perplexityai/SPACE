@@ -2875,3 +2875,6 @@ impl BeforeStopFlush {
         }
     }
 }
+
+#[cfg(test)]
+mod stop_admission_tests;

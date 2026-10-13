@@ -10019,5 +10019,11 @@ fn teardown_suspend_reconciliation_skips_healthy_and_retained_jobs_and_bounds_cl
     }
 }
 
+mod accepted_shapes_cleanup_episodes;
+mod accepted_shapes_quarantine;
+mod accepted_shapes_single_statement;
 mod cleanup_quarantine_refusal;
 mod local_network_policy_clear;
+pub(crate) mod state_write_fixtures;
+mod thin_writer_coverage;
+mod update_state_matrix;
