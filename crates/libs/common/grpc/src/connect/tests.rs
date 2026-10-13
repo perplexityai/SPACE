@@ -233,6 +233,66 @@ async fn stalled_tcp_attempts_end_within_the_budget_and_one_attempt_cap() {
     );
 }
 
+// An endpoint that sets no dial bound is dialed with the default one the
+// attempt cap is sized from: a dial whose SYN is never answered fails with the
+// dial bound's `TimedOut` and is redialed, instead of holding its attempt
+// until the cap abandons it. Under the paused clock the kernel cannot time the
+// dial out first. Linux drops a SYN to a listener whose accept queue is full,
+// which stands in for a SYN pinned to a stale conntrack entry.
+#[cfg(target_os = "linux")]
+#[tokio::test(start_paused = true)]
+async fn an_endpoint_without_a_dial_bound_is_redialed_at_the_default_one() {
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let listener = socket.listen(2).unwrap();
+    let address = listener.local_addr().unwrap();
+    // Linux counts the accept queue full only once it holds more than the
+    // backlog, so three unaccepted connections fill it. Dialing them one at a
+    // time keeps at most one handshake pending, so the SYN queue never counts
+    // as full and the setup does not depend on SYN cookies.
+    let mut queued = Vec::new();
+    for _ in 0..3 {
+        queued.push(tokio::net::TcpStream::connect(address).await.unwrap());
+    }
+    let endpoint = tonic::transport::Endpoint::from_shared(format!("http://{address}")).unwrap();
+    assert_eq!(endpoint.get_connect_timeout(), None);
+
+    let retries = pplx_space_metrics::test_capture::capture_counters_guard();
+    let result = tokio::time::timeout(
+        Duration::from_secs(60),
+        super::connect_tcp_channel_with_retry(
+            "blackhole",
+            address.to_string(),
+            endpoint,
+            None,
+            crate::DEFAULT_TCP_GRPC_CONNECT_RETRY_POLICY,
+        ),
+    )
+    .await
+    .expect("an unanswered dial must be bounded");
+    let retries = retries
+        .finish()
+        .into_iter()
+        .filter(|counter| counter.name == "grpc.client.retry")
+        .count();
+    let error = match result {
+        Err(error @ super::TcpConnectError::Transport(_)) => error,
+        other => panic!("expected the dial bound to fail the dial: {other:?}"),
+    };
+    let timed_out = std::iter::successors(
+        Some(&error as &(dyn std::error::Error + 'static)),
+        |error| error.source(),
+    )
+    .any(|error| {
+        error
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|error| error.kind() == std::io::ErrorKind::TimedOut)
+    });
+    assert!(timed_out, "the dial bound did not fire: {error:?}");
+    assert!(retries > 0, "the failed dial was not redialed");
+    drop(queued);
+}
+
 #[cfg(feature = "internal-tls")]
 #[derive(Default)]
 struct TestEnvironment(std::collections::HashMap<&'static str, std::ffi::OsString>);

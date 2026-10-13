@@ -28,7 +28,7 @@ pub const SERVER_TLS_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duratio
 /// seconds absorb a short queue; no client bound can guarantee a handshake
 /// while a listener stays saturated.
 pub const CLIENT_TLS_HANDSHAKE_TIMEOUT: std::time::Duration =
-    std::time::Duration::from_secs(SERVER_TLS_HANDSHAKE_TIMEOUT.as_secs() + 5);
+    SERVER_TLS_HANDSHAKE_TIMEOUT.saturating_add(std::time::Duration::from_secs(5));
 
 #[derive(Clone, Copy, Debug)]
 pub enum Service {
@@ -307,21 +307,17 @@ impl ConnectEndpoint {
         )
         .await
     }
-}
 
-/// The longest a [`ConnectEndpoint::connect_with_retrying_redials`] dial or
-/// redial of any internal-RPC endpoint may take: [`crate::retrying_redial_bound`]
-/// with the handshake bound [`ClientTransport`] applies to HTTPS. A plaintext
-/// dial ends sooner on its own.
-pub fn retrying_redial_bound(
-    retry_policy: crate::GrpcRetryPolicy,
-    attempt_timeout: std::time::Duration,
-) -> std::time::Duration {
-    crate::retrying_redial_bound(
-        retry_policy,
-        attempt_timeout,
-        Some(CLIENT_TLS_HANDSHAKE_TIMEOUT),
-    )
+    /// The longest a [`Self::connect_with_retrying_redials`] dial or redial
+    /// with these arguments may take: [`crate::retrying_redial_bound`] with
+    /// this endpoint's handshake bound.
+    pub fn retrying_redial_bound(
+        &self,
+        retry_policy: crate::GrpcRetryPolicy,
+        attempt_timeout: std::time::Duration,
+    ) -> std::time::Duration {
+        crate::retrying_redial_bound(retry_policy, attempt_timeout, self.tls_handshake_timeout)
+    }
 }
 
 pub async fn client_endpoint(
