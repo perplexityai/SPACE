@@ -5,7 +5,8 @@
 //! following the per-table store convention: executor-generic free functions,
 //! a typed record, `sql!` locators, and a small error enum. Verbs
 //! so far: [`get`], [`update_desired_state`],
-//! [`any_undescribed_artifact_owner`], [`network_policy_inputs_placed_on`].
+//! [`any_undescribed_artifact_owner`], [`network_policy_inputs_placed_on`],
+//! [`snapshot_storage_placed_on`].
 //!
 //! # Boundaries
 //!
@@ -201,6 +202,37 @@ pub async fn network_policy_inputs_placed_on(
     .fetch_all(executor)
     .await?;
     Ok(rows)
+}
+
+/// The snapshot storage of one sandbox's organization, read by the node that
+/// holds the sandbox. `org_storage_uri` is `None` when the organization has
+/// no override and the deployment default applies.
+#[derive(Clone, Debug, sqlx::FromRow)]
+pub struct SandboxSnapshotStorage {
+    pub org_storage_uri: Option<String>,
+}
+
+/// The organization snapshot storage of `sandbox_id`, when that sandbox is
+/// placed on one of `node_ids`: active there, or the target of a pending
+/// migration or restore. A sandbox placed elsewhere is `None`, not an error:
+/// the caller is a node asking about its own set.
+pub async fn snapshot_storage_placed_on(
+    executor: impl sqlx::PgExecutor<'_>,
+    sandbox_id: SandboxId,
+    node_ids: &[NodeId],
+) -> Result<Option<SandboxSnapshotStorage>, SandboxStoreError> {
+    let row = sqlx::query_as::<_, SandboxSnapshotStorage>(sql!(
+        "SELECT o.snapshot_base_object_storage_uri AS org_storage_uri
+         FROM sandboxes s
+         JOIN organizations o ON o.id = s.org_id
+         WHERE s.id = $1
+           AND (s.active_node_id = ANY($2) OR s.target_node_id = ANY($2))"
+    ))
+    .bind(sandbox_id)
+    .bind(node_ids)
+    .fetch_optional(executor)
+    .await?;
+    Ok(row)
 }
 
 /// One of `candidates` that this node may still be holding local bytes for, if

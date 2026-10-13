@@ -660,6 +660,96 @@ pub async fn artifact_digests(
         .collect()
 }
 
+/// Reading a ready artifact's storage location failed. A malformed stored
+/// row surfaces as a `sqlx::Error` decode failure, like every other typed
+/// column.
+#[derive(Debug, thiserror::Error)]
+pub enum ReadyArtifactLocationError {
+    #[error(transparent)]
+    Database(#[from] sqlx::Error),
+}
+
+/// Where a `ready` snapshot's bytes live, as a restoring node needs it: the
+/// catalog row, the storage connection string of its location, and the byte
+/// count the upload reported.
+#[derive(Clone, Debug, Eq, PartialEq, FromRow)]
+pub struct ReadyArtifactLocation {
+    pub snapshot_id: SnapshotId,
+    pub storage_connection_string: String,
+    pub size_bytes: Option<i64>,
+}
+
+/// The newest `ready` suspend snapshot of `sandbox_id`, when that sandbox is
+/// placed on one of `node_ids`: active there, or the target of a pending
+/// migration or restore. A sandbox placed elsewhere reads as absent, not as
+/// an error: the caller is a node asking about its own set.
+///
+/// `timestamp` is the row's immutable creation time, so the newest row is the
+/// suspend attempt that started most recently and reached `ready`. Rows in
+/// `creating`, `failed` or `deleting` are invisible, which keeps a mid-flight
+/// upload, or a row claimed for prune, out of restore.
+pub async fn latest_ready_suspend_location_placed_on(
+    executor: impl sqlx::PgExecutor<'_>,
+    sandbox_id: SandboxId,
+    node_ids: &[NodeId],
+) -> Result<Option<ReadyArtifactLocation>, ReadyArtifactLocationError> {
+    let row = sqlx::query_as::<_, ReadyArtifactLocation>(sql!(
+        "SELECT s.id AS snapshot_id,
+                ssl.storage_connection_string,
+                s.size_bytes
+         FROM snapshots s
+         JOIN snapshot_storage_locations ssl ON ssl.snapshot_id = s.id
+         JOIN sandboxes sb ON sb.id = s.sandbox_id
+         WHERE s.sandbox_id = $1
+           AND (sb.active_node_id = ANY($2) OR sb.target_node_id = ANY($2))
+           AND s.type = 'full'
+           AND (s.artifact_origin IS NULL OR s.artifact_origin = 'suspend')
+           AND s.state = 'ready'
+         ORDER BY s.timestamp DESC
+         LIMIT 1"
+    ))
+    .bind(sandbox_id)
+    .bind(node_ids)
+    .fetch_optional(executor)
+    .await?;
+    Ok(row)
+}
+
+/// The newest `ready` backup of the exact local artifact
+/// (`sandbox_id`, `local_artifact_id`, `artifact_kind`), when that sandbox is
+/// placed on one of `node_ids`. Same placement and absence semantics as
+/// [`latest_ready_suspend_location_placed_on`].
+pub async fn ready_backup_location_placed_on(
+    executor: impl sqlx::PgExecutor<'_>,
+    sandbox_id: SandboxId,
+    local_artifact_id: LocalArtifactId,
+    artifact_kind: ArtifactKind,
+    node_ids: &[NodeId],
+) -> Result<Option<ReadyArtifactLocation>, ReadyArtifactLocationError> {
+    let row = sqlx::query_as::<_, ReadyArtifactLocation>(sql!(
+        "SELECT s.id AS snapshot_id,
+                ssl.storage_connection_string,
+                s.size_bytes
+         FROM snapshots s
+         JOIN snapshot_storage_locations ssl ON ssl.snapshot_id = s.id
+         JOIN sandboxes sb ON sb.id = s.sandbox_id
+         WHERE s.sandbox_id = $1
+           AND (sb.active_node_id = ANY($4) OR sb.target_node_id = ANY($4))
+           AND s.local_artifact_id = $2
+           AND s.artifact_kind = $3
+           AND s.state = 'ready'
+         ORDER BY s.timestamp DESC
+         LIMIT 1"
+    ))
+    .bind(sandbox_id)
+    .bind(local_artifact_id.as_uuid())
+    .bind(artifact_kind.as_str())
+    .bind(node_ids)
+    .fetch_optional(executor)
+    .await?;
+    Ok(row)
+}
+
 /// Fetch one snapshot catalog row by id.
 ///
 /// Returns the same typed model for every read. `None` means no row has this id.

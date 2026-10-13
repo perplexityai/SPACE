@@ -3620,6 +3620,205 @@ async fn placed_sandbox_unlocks_private_release_for_its_node_only() -> TestResul
     Ok(())
 }
 
+/// A node reads a sandbox's suspend snapshot location, exact artifact backup
+/// location and organization snapshot storage only while the sandbox is
+/// placed on it: active there, or as the target of a pending migration or
+/// restore. Another node reads `NotFound`, and a request with no remote
+/// address is refused.
+#[tokio::test(flavor = "current_thread")]
+async fn placed_sandbox_locations_resolve_for_its_node_only() -> TestResult {
+    let Some(fixture) = cluster_fixture().await? else {
+        return Ok(());
+    };
+    let pool = &fixture.service.pool;
+    let worker_a_ip = std::net::Ipv4Addr::new(10, 0, 0, 40);
+    let worker_b_ip = std::net::Ipv4Addr::new(10, 0, 0, 41);
+    let worker_a = insert_k8s_node(pool, worker_a_ip, "worker").await?;
+    let worker_b = insert_k8s_node(pool, worker_b_ip, "worker").await?;
+
+    let sandbox_id = SandboxId::new();
+    sqlx::query(sql!(
+        "INSERT INTO sandboxes (
+             id, user_id, org_id, managed_by, lifecycle, placement,
+             active_node_id, target_node_id, command_ready_pending,
+             network_policy_generation
+         )
+         VALUES ($1, $2::uuid, $3::uuid, 'k8s', 'started', 'on_node', $4, $4, TRUE, 1)"
+    ))
+    .bind(sandbox_id)
+    .bind(SEEDED_USER_ID)
+    .bind(SEEDED_ORG_ID)
+    .bind(worker_a)
+    .execute(pool)
+    .await?;
+    sqlx::query(sql!(
+        "UPDATE organizations
+         SET snapshot_base_object_storage_uri = 's3://org-snapshots/base'
+         WHERE id = $1::uuid"
+    ))
+    .bind(SEEDED_ORG_ID)
+    .execute(pool)
+    .await?;
+
+    // The hosting node registers a ready suspend snapshot and a ready backup
+    // of a stopped rootfs, the two artifacts a restore looks up.
+    let suspend_attempt = SnapshotId::new();
+    begin_artifact_backup_from_node(
+        &fixture.service,
+        std::net::IpAddr::V4(worker_a_ip),
+        sandbox_id,
+        LocalArtifactId::new(),
+        suspend_attempt,
+        pplx_space_sbx_mgr_client::proto::ArtifactKind::Full,
+        pplx_space_sbx_mgr_client::proto::ArtifactOrigin::Suspend,
+    )
+    .await?;
+    finalize_ready_from_node(&fixture.service, worker_a_ip, suspend_attempt).await?;
+    let disk_artifact = LocalArtifactId::new();
+    let disk_attempt = SnapshotId::new();
+    begin_artifact_backup_from_node(
+        &fixture.service,
+        std::net::IpAddr::V4(worker_a_ip),
+        sandbox_id,
+        disk_artifact,
+        disk_attempt,
+        pplx_space_sbx_mgr_client::proto::ArtifactKind::Disk,
+        pplx_space_sbx_mgr_client::proto::ArtifactOrigin::Stop,
+    )
+    .await?;
+    finalize_ready_from_node(&fixture.service, worker_a_ip, disk_attempt).await?;
+    // Finalizing the suspend snapshot projects the sandbox as suspended and
+    // releases its active placement. Pin it back on the hosting node so the
+    // placement under test is the one written below, not that projection.
+    sqlx::query(sql!(
+        "UPDATE sandboxes
+         SET lifecycle = 'started', placement = 'on_node',
+             active_node_id = $2, target_node_id = $2
+         WHERE id = $1"
+    ))
+    .bind(sandbox_id)
+    .bind(worker_a)
+    .execute(pool)
+    .await?;
+
+    let reads = |node_ip: Option<std::net::Ipv4Addr>| {
+        let service = &fixture.service;
+        async move {
+            let suspend = service
+                .get_suspend_snapshot_location(maybe_from_node(
+                    GetSuspendSnapshotLocationRequest {
+                        sandbox_id: sandbox_id.to_string(),
+                    },
+                    node_ip,
+                ))
+                .await
+                .map(|response| response.into_inner().snapshot_id);
+            let backup = service
+                .get_artifact_backup_location(maybe_from_node(
+                    GetArtifactBackupLocationRequest {
+                        sandbox_id: sandbox_id.to_string(),
+                        local_artifact_id: disk_artifact.to_string(),
+                        artifact_kind: pplx_space_sbx_mgr_client::proto::ArtifactKind::Disk as i32,
+                    },
+                    node_ip,
+                ))
+                .await
+                .map(|response| response.into_inner().backup_attempt_id);
+            let storage = service
+                .get_sandbox_snapshot_storage_uri(maybe_from_node(
+                    GetSandboxSnapshotStorageUriRequest {
+                        sandbox_id: sandbox_id.to_string(),
+                    },
+                    node_ip,
+                ))
+                .await
+                .map(|response| response.into_inner().storage_uri);
+            (suspend, backup, storage)
+        }
+    };
+    /// The suspend snapshot id, the backup attempt id and the organization
+    /// storage URI, as one node read them.
+    type LocationReads = (
+        Result<String, tonic::Status>,
+        Result<String, tonic::Status>,
+        Result<Option<String>, tonic::Status>,
+    );
+    let codes = |results: &LocationReads| {
+        [
+            results.0.as_ref().err().map(tonic::Status::code),
+            results.1.as_ref().err().map(tonic::Status::code),
+            results.2.as_ref().err().map(tonic::Status::code),
+        ]
+    };
+
+    let (suspend, backup, storage) = reads(Some(worker_a_ip)).await;
+    assert_eq!(suspend?, suspend_attempt.to_string());
+    assert_eq!(backup?, disk_attempt.to_string());
+    assert_eq!(storage?.as_deref(), Some("s3://org-snapshots/base"));
+    assert_eq!(
+        codes(&reads(Some(worker_b_ip)).await),
+        [Some(tonic::Code::NotFound); 3]
+    );
+    assert_eq!(
+        codes(&reads(None).await),
+        [Some(tonic::Code::PermissionDenied); 3]
+    );
+
+    // A pending migration or restore is a target placement: the destination
+    // reads before it becomes active, and the source keeps access while it
+    // still hosts the sandbox.
+    sqlx::query(sql!(
+        "UPDATE sandboxes SET target_node_id = $2 WHERE id = $1"
+    ))
+    .bind(sandbox_id)
+    .bind(worker_b)
+    .execute(pool)
+    .await?;
+    assert_eq!(codes(&reads(Some(worker_a_ip)).await), [None; 3]);
+    assert_eq!(codes(&reads(Some(worker_b_ip)).await), [None; 3]);
+    sqlx::query(sql!(
+        "UPDATE sandboxes SET active_node_id = $2 WHERE id = $1"
+    ))
+    .bind(sandbox_id)
+    .bind(worker_b)
+    .execute(pool)
+    .await?;
+    assert_eq!(
+        codes(&reads(Some(worker_a_ip)).await),
+        [Some(tonic::Code::NotFound); 3]
+    );
+    Ok(())
+}
+
+/// A request from `node_ip` when given, otherwise one with no remote address.
+fn maybe_from_node<T>(message: T, node_ip: Option<std::net::Ipv4Addr>) -> Request<T> {
+    match node_ip {
+        Some(node_ip) => request_from_node(message, std::net::IpAddr::V4(node_ip)),
+        None => Request::new(message),
+    }
+}
+
+/// Finalize `snapshot_id` as `ready` from the node at `node_ip`.
+async fn finalize_ready_from_node(
+    service: &ClusterApiService,
+    node_ip: std::net::Ipv4Addr,
+    snapshot_id: SnapshotId,
+) -> Result<(), tonic::Status> {
+    service
+        .finalize_artifact_backup(request_from_node(
+            FinalizeArtifactBackupRequest {
+                backup_attempt_id: snapshot_id.to_string(),
+                target_state: SuspendSnapshotTerminalState::Ready as i32,
+                bytes_uploaded: 4096,
+                failure_reason: None,
+                artifact_digests: Vec::new(),
+            },
+            std::net::IpAddr::V4(node_ip),
+        ))
+        .await
+        .map(|_| ())
+}
+
 /// A pre-dispatch build grant lets registered builder nodes resolve the base
 /// it names while it is fresh, with no `template_build_jobs` row at all: the
 /// API writes the grant before `StartBuild`, and the builder that takes the
@@ -4171,15 +4370,19 @@ async fn finalize(
         .map(|_| ())
 }
 
-/// Helper to call `GetSuspendSnapshotLocation` for assertions.
+/// Helper to call `GetSuspendSnapshotLocation` for assertions, from the node
+/// the seeded sandboxes are placed on.
 async fn get_location(
     service: &ClusterApiService,
     sandbox_id: SandboxId,
 ) -> Result<GetSuspendSnapshotLocationResponse, tonic::Status> {
     service
-        .get_suspend_snapshot_location(Request::new(GetSuspendSnapshotLocationRequest {
-            sandbox_id: sandbox_id.to_string(),
-        }))
+        .get_suspend_snapshot_location(request_from_node(
+            GetSuspendSnapshotLocationRequest {
+                sandbox_id: sandbox_id.to_string(),
+            },
+            TEST_WORKER_IP,
+        ))
         .await
         .map(|r| r.into_inner())
 }
@@ -4970,11 +5173,14 @@ async fn get_artifact_location(
     artifact_kind: pplx_space_sbx_mgr_client::proto::ArtifactKind,
 ) -> Result<GetArtifactBackupLocationResponse, tonic::Status> {
     service
-        .get_artifact_backup_location(Request::new(GetArtifactBackupLocationRequest {
-            sandbox_id: sandbox_id.to_string(),
-            local_artifact_id: local_artifact_id.to_string(),
-            artifact_kind: artifact_kind as i32,
-        }))
+        .get_artifact_backup_location(request_from_node(
+            GetArtifactBackupLocationRequest {
+                sandbox_id: sandbox_id.to_string(),
+                local_artifact_id: local_artifact_id.to_string(),
+                artifact_kind: artifact_kind as i32,
+            },
+            TEST_WORKER_IP,
+        ))
         .await
         .map(|response| response.into_inner())
 }
