@@ -1690,6 +1690,13 @@ impl ClusterApi for ClusterApiService {
         ClusterApiService::get_artifact_backup_location(self, request).await
     }
 
+    async fn check_sandbox_backup(
+        &self,
+        request: Request<CheckSandboxBackupRequest>,
+    ) -> Result<Response<CheckSandboxBackupResponse>, Status> {
+        ClusterApiService::check_sandbox_backup(self, request).await
+    }
+
     async fn get_quarantine_recovery_plan(
         &self,
         request: Request<GetQuarantineRecoveryPlanRequest>,

@@ -66,25 +66,26 @@ use crate::proto::FacetRef;
 use crate::proto::cluster_api_server::ClusterApi;
 use crate::proto::{
     BeginArtifactBackupRequest, BeginArtifactBackupResponse, BindDataPlaneSessionProcessRequest,
-    BindDataPlaneSessionProcessResponse, ClaimNodeReconcileRefsRequest,
-    ClaimNodeReconcileRefsResponse, CompleteNodeReconcileRefsRequest,
-    CompleteNodeReconcileRefsResponse, CreateSystemTemplatePublicationGrantRequest,
-    CreateSystemTemplatePublicationGrantResponse, FinalizeArtifactBackupRequest,
-    FinalizeArtifactBackupResponse, FindTemplateReleaseByHashRequest, FindTemplateReleaseRequest,
-    FindTemplateReleaseResponse, GetArtifactBackupLocationRequest,
-    GetArtifactBackupLocationResponse, GetDataPlaneOrgRevocationEpochRequest,
-    GetDataPlaneOrgRevocationEpochResponse, GetDataPlaneSessionRevocationStateRequest,
-    GetDataPlaneSessionRevocationStateResponse, GetNodeNetworkPolicyStateRequest,
-    GetNodeNetworkPolicyStateResponse, GetNodeSandboxDesiredStateRequest,
-    GetNodeSandboxDesiredStateResponse, GetNodeTemplateBaseSnapshotPolicyStateRequest,
-    GetNodeTemplateBaseSnapshotPolicyStateResponse, GetNodeTemplateDesiredStateRequest,
-    GetNodeTemplateDesiredStateResponse, GetQuarantineRecoveryPlanRequest,
-    GetQuarantineRecoveryPlanResponse, GetSandboxRuntimeAccessRequest,
-    GetSandboxRuntimeAccessResponse, GetSandboxSnapshotStorageUriRequest,
-    GetSandboxSnapshotStorageUriResponse, GetSuspendSnapshotLocationRequest,
-    GetSuspendSnapshotLocationResponse, ListLatestTemplateReleasesEntry,
-    ListLatestTemplateReleasesRequest, ListLatestTemplateReleasesResponse, ListNodesRequest,
-    ListNodesResponse, ListWarmPoolTemplateReleasesRequest, ListWarmPoolTemplateReleasesResponse,
+    BindDataPlaneSessionProcessResponse, CheckSandboxBackupRequest, CheckSandboxBackupResponse,
+    ClaimNodeReconcileRefsRequest, ClaimNodeReconcileRefsResponse,
+    CompleteNodeReconcileRefsRequest, CompleteNodeReconcileRefsResponse,
+    CreateSystemTemplatePublicationGrantRequest, CreateSystemTemplatePublicationGrantResponse,
+    FinalizeArtifactBackupRequest, FinalizeArtifactBackupResponse,
+    FindTemplateReleaseByHashRequest, FindTemplateReleaseRequest, FindTemplateReleaseResponse,
+    GetArtifactBackupLocationRequest, GetArtifactBackupLocationResponse,
+    GetDataPlaneOrgRevocationEpochRequest, GetDataPlaneOrgRevocationEpochResponse,
+    GetDataPlaneSessionRevocationStateRequest, GetDataPlaneSessionRevocationStateResponse,
+    GetNodeNetworkPolicyStateRequest, GetNodeNetworkPolicyStateResponse,
+    GetNodeSandboxDesiredStateRequest, GetNodeSandboxDesiredStateResponse,
+    GetNodeTemplateBaseSnapshotPolicyStateRequest, GetNodeTemplateBaseSnapshotPolicyStateResponse,
+    GetNodeTemplateDesiredStateRequest, GetNodeTemplateDesiredStateResponse,
+    GetQuarantineRecoveryPlanRequest, GetQuarantineRecoveryPlanResponse,
+    GetSandboxRuntimeAccessRequest, GetSandboxRuntimeAccessResponse,
+    GetSandboxSnapshotStorageUriRequest, GetSandboxSnapshotStorageUriResponse,
+    GetSuspendSnapshotLocationRequest, GetSuspendSnapshotLocationResponse,
+    ListLatestTemplateReleasesEntry, ListLatestTemplateReleasesRequest,
+    ListLatestTemplateReleasesResponse, ListNodesRequest, ListNodesResponse,
+    ListWarmPoolTemplateReleasesRequest, ListWarmPoolTemplateReleasesResponse,
     NetworkPolicyTargetRef, NodeCtlStatus, NodeRecord, NodeRole as ProtoNodeRole,
     NodeSchedulingStatus, PublishNodeStateRequest, PublishNodeStateResponse,
     PublishSandboxPortExposureStatesRequest, PublishSandboxPortExposureStatesResponse,
@@ -965,6 +966,43 @@ impl ClusterApiService {
             bytes_uploaded: row.size_bytes.unwrap_or(0),
             artifact_digests,
         }))
+    }
+
+    pub(crate) async fn check_sandbox_backup(
+        &self,
+        request: Request<CheckSandboxBackupRequest>,
+    ) -> Result<Response<CheckSandboxBackupResponse>, Status> {
+        // Former hosts retain local caches after placement moves. Permit a
+        // registered node to check a known identity, but keep all location
+        // reads placement-scoped: eviction needs no storage credentials.
+        if self.caller_node_ids(&request).await?.is_empty() {
+            return Err(Status::permission_denied("caller is not a registered node"));
+        }
+        let req = request.into_inner();
+        let sandbox_id = SandboxId::from_str(req.sandbox_id.trim())
+            .map_err(|e| Status::invalid_argument(format!("invalid sandbox_id: {e}")))?;
+        let ready = match req.artifact {
+            Some(crate::proto::check_sandbox_backup_request::Artifact::LocalArtifact(artifact)) => {
+                let artifact_id = LocalArtifactId::from_str(artifact.local_artifact_id.trim())
+                    .map_err(|e| {
+                        Status::invalid_argument(format!("invalid local_artifact_id: {e}"))
+                    })?;
+                let kind = artifact_kind_from_proto(artifact.artifact_kind).ok_or_else(|| {
+                    Status::invalid_argument("artifact_kind must be DISK or FULL")
+                })?;
+                snapshot_store::artifact_backup_ready(&self.pool, sandbox_id, artifact_id, kind)
+                    .await
+            }
+            Some(crate::proto::check_sandbox_backup_request::Artifact::SuspendSnapshotId(id)) => {
+                let snapshot_id = SnapshotId::from_str(id.trim()).map_err(|e| {
+                    Status::invalid_argument(format!("invalid suspend_snapshot_id: {e}"))
+                })?;
+                snapshot_store::is_latest_ready_suspend(&self.pool, sandbox_id, snapshot_id).await
+            }
+            None => return Err(Status::invalid_argument("artifact identity is required")),
+        }
+        .map_err(|e| Status::internal(format!("check sandbox backup: {e}")))?;
+        Ok(Response::new(CheckSandboxBackupResponse { ready }))
     }
 
     pub(crate) async fn get_quarantine_recovery_plan(

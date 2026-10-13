@@ -166,6 +166,11 @@ service ClusterApi {
   rpc TouchArtifactBackup(TouchArtifactBackupRequest) returns (TouchArtifactBackupResponse);
   rpc GetArtifactBackupLocation(GetArtifactBackupLocationRequest) returns (GetArtifactBackupLocationResponse);
 
+  // Eviction proof for bytes a registered node already holds, including
+  // after the sandbox moves elsewhere. Checks only the supplied identity;
+  // returns no storage credentials or discovered artifact identities.
+  rpc CheckSandboxBackup(CheckSandboxBackupRequest) returns (CheckSandboxBackupResponse);
+
   // Return a read-only, generation-fenced plan for automatic recovery of the
   // caller's currently assigned quarantine episode. The plan identity is the
   // central quarantine episode id; the node echoes it in its transition
@@ -1067,6 +1072,25 @@ message TouchArtifactBackupRequest {
 }
 
 message TouchArtifactBackupResponse {}
+
+message CheckSandboxBackupRequest {
+  string sandbox_id = 1;
+  oneof artifact {
+    LocalArtifactBackupIdentity local_artifact = 2;
+    // Legacy unpinned cache: true only if this is the latest ready suspend
+    // attempt, not merely an older attempt that still has a ready backup.
+    string suspend_snapshot_id = 3;
+  }
+}
+
+message LocalArtifactBackupIdentity {
+  string local_artifact_id = 1;
+  space.sandbox.manager.v1.ArtifactKind artifact_kind = 2;
+}
+
+message CheckSandboxBackupResponse {
+  bool ready = 1;
+}
 
 message GetArtifactBackupLocationRequest {
   // Select a ready remote copy only for this exact immutable local artifact.

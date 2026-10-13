@@ -750,6 +750,67 @@ pub async fn ready_backup_location_placed_on(
     Ok(row)
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum CheckBackupError {
+    #[error(transparent)]
+    Database(#[from] sqlx::Error),
+}
+
+/// Whether these exact immutable bytes have a usable ready backup. This is
+/// placement-independent so a former hosting node can release its local copy;
+/// it discloses neither the backup identity nor its storage credentials.
+pub async fn artifact_backup_ready(
+    executor: impl sqlx::PgExecutor<'_>,
+    sandbox_id: SandboxId,
+    local_artifact_id: LocalArtifactId,
+    artifact_kind: ArtifactKind,
+) -> Result<bool, CheckBackupError> {
+    Ok(sqlx::query_scalar(sql!(
+        "SELECT EXISTS (
+             SELECT 1
+             FROM snapshots s
+             JOIN snapshot_storage_locations ssl ON ssl.snapshot_id = s.id
+             WHERE s.sandbox_id = $1
+               AND s.local_artifact_id = $2
+               AND s.artifact_kind = $3
+               AND s.state = 'ready'
+               AND ssl.orphaned_at IS NULL
+         )"
+    ))
+    .bind(sandbox_id)
+    .bind(local_artifact_id.as_uuid())
+    .bind(artifact_kind.as_str())
+    .fetch_one(executor)
+    .await?)
+}
+
+/// Legacy eviction proof: the supplied upload generation must still be the
+/// latest ready suspend attempt. Readiness of an older attempt alone cannot
+/// prove which generation an unpinned local cache contains.
+pub async fn is_latest_ready_suspend(
+    executor: impl sqlx::PgExecutor<'_>,
+    sandbox_id: SandboxId,
+    snapshot_id: SnapshotId,
+) -> Result<bool, CheckBackupError> {
+    Ok(sqlx::query_scalar(sql!(
+        "SELECT COALESCE((
+             SELECT s.id = $2 AND ssl.orphaned_at IS NULL
+             FROM snapshots s
+             JOIN snapshot_storage_locations ssl ON ssl.snapshot_id = s.id
+             WHERE s.sandbox_id = $1
+               AND s.type = 'full'
+               AND (s.artifact_origin IS NULL OR s.artifact_origin = 'suspend')
+               AND s.state = 'ready'
+             ORDER BY s.timestamp DESC
+             LIMIT 1
+         ), FALSE)"
+    ))
+    .bind(sandbox_id)
+    .bind(snapshot_id)
+    .fetch_one(executor)
+    .await?)
+}
+
 /// Fetch one snapshot catalog row by id.
 ///
 /// Returns the same typed model for every read. `None` means no row has this id.

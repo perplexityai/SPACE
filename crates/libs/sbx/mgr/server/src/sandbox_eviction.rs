@@ -5,8 +5,8 @@
 //! The snapshot reaper (`crate::snapshot_gc`) only deletes unpinned
 //! artifact residue; a suspended sandbox resident on the node pins its
 //! current suspend artifact and keeps its whole cache directory —
-//! `instance/` rootfs subvolume included — until the sandbox is deleted
-//! or restored elsewhere. On long-lived nodes that population dominates
+//! `instance/` rootfs subvolume included — even after a restore elsewhere.
+//! On long-lived nodes that population dominates
 //! disk usage. This loop removes the **entire local presence** of such a
 //! sandbox (cache dir + node-local DB rows) when it is safe:
 //!
@@ -39,7 +39,7 @@
 //!    `FinalizeArtifactBackup(READY)`, which requires every per-file
 //!    transfer to have completed) — or, when the marker is absent (e.g.
 //!    the bytes were restored *from* S3 and never re-uploaded), by a
-//!    `GetArtifactBackupLocation` lookup keyed on the exact artifact
+//!    `CheckSandboxBackup` lookup keyed on the exact artifact
 //!    id. Job journals and timestamps are never consulted for pinned
 //!    rows — they are not evidence about these bytes.
 //!
@@ -47,7 +47,7 @@
 //!    Pre-artifact-tracking sandboxes have no pin, so the best identity
 //!    is the newest `snapshot_upload` job's `payload.snapshot_id`.
 //!    Evictable only when that **equals** the cluster's latest ready
-//!    snapshot (`GetSuspendSnapshotLocation`) AND the sandbox's last
+//!    snapshot (confirmed by `CheckSandboxBackup`) AND the sandbox's last
 //!    state transition is not later than that job's creation (plus
 //!    slack) — proving no later suspend exists whose backup enqueue
 //!    silently failed. UUIDv7 *ordering* is never eviction evidence:
@@ -427,9 +427,6 @@ pub(crate) fn decide(
     evidence: &LocalEvidence,
     sandbox_updated_at_secs: u64,
 ) -> PreDecision {
-    let Some(cluster) = cluster_latest else {
-        return PreDecision::Skip(SkipReason::NoReadyBackup);
-    };
     match evidence {
         LocalEvidence::Pinned(pinned) if pinned.backup_marker => {
             PreDecision::Evict(EvictReason::LatestBackedIdle)
@@ -441,10 +438,11 @@ pub(crate) fn decide(
         }
         LocalEvidence::Unpinned {
             latest_job: Some(job),
-        } => match cluster.cmp(&job.snapshot_id) {
-            std::cmp::Ordering::Less => PreDecision::Skip(SkipReason::LocalNewerThanBackup),
-            std::cmp::Ordering::Greater => PreDecision::Skip(SkipReason::GenerationUnproven),
-            std::cmp::Ordering::Equal => {
+        } => match cluster_latest.map(|cluster| cluster.cmp(&job.snapshot_id)) {
+            None => PreDecision::Skip(SkipReason::NoReadyBackup),
+            Some(std::cmp::Ordering::Less) => PreDecision::Skip(SkipReason::LocalNewerThanBackup),
+            Some(std::cmp::Ordering::Greater) => PreDecision::Skip(SkipReason::GenerationUnproven),
+            Some(std::cmp::Ordering::Equal) => {
                 if sandbox_updated_at_secs
                     <= job
                         .created_at_secs
@@ -965,9 +963,8 @@ pub(crate) fn emit_eviction_event(
     );
 }
 
-/// Ask the cluster for a ready backup of **exactly** the pinned
-/// artifact id (`GetArtifactBackupLocation`: "select a ready remote
-/// copy only for this exact immutable local artifact"). On success the
+/// Check the cluster for a ready backup of **exactly** the pinned
+/// artifact id without reading its storage location. On success the
 /// local `backup_completed_at` marker is stamped best-effort so the
 /// next tick proves locally — this is the path restored-from-S3 copies
 /// take, since restore never stamps the marker. Returns `Ok(true)` on
@@ -979,20 +976,26 @@ async fn prove_pinned_artifact(
     sandbox_id: &str,
     pinned: &PinnedArtifact,
 ) -> Result<bool, SkipReason> {
-    let req = pplx_space_node_api_client::proto::GetArtifactBackupLocationRequest {
-        sandbox_id: sandbox_id.to_string(),
-        local_artifact_id: pinned.artifact_id.to_string(),
-        artifact_kind: match pinned.artifact_kind {
-            pplx_space_common_core::types::ArtifactKind::Disk => {
-                pplx_space_sbx_mgr_client::proto::ArtifactKind::Disk as i32
-            }
-            pplx_space_common_core::types::ArtifactKind::Full => {
-                pplx_space_sbx_mgr_client::proto::ArtifactKind::Full as i32
-            }
-        },
+    use pplx_space_node_api_client::proto::{
+        CheckSandboxBackupRequest, LocalArtifactBackupIdentity,
+        check_sandbox_backup_request::Artifact,
     };
-    match cluster.get_artifact_backup_location(req).await {
-        Ok(_) => {
+    let req = CheckSandboxBackupRequest {
+        sandbox_id: sandbox_id.to_string(),
+        artifact: Some(Artifact::LocalArtifact(LocalArtifactBackupIdentity {
+            local_artifact_id: pinned.artifact_id.to_string(),
+            artifact_kind: match pinned.artifact_kind {
+                pplx_space_common_core::types::ArtifactKind::Disk => {
+                    pplx_space_sbx_mgr_client::proto::ArtifactKind::Disk as i32
+                }
+                pplx_space_common_core::types::ArtifactKind::Full => {
+                    pplx_space_sbx_mgr_client::proto::ArtifactKind::Full as i32
+                }
+            },
+        })),
+    };
+    match cluster.check_sandbox_backup(req).await {
+        Ok(response) if response.get_ref().ready => {
             let service = service.clone();
             let artifact_id = pinned.artifact_id;
             let stamp = tokio::task::spawn_blocking(move || {
@@ -1016,18 +1019,46 @@ async fn prove_pinned_artifact(
             }
             Ok(true)
         }
-        Err(status) if status.code() == tonic::Code::NotFound => Ok(false),
+        Ok(_) => Ok(false),
         Err(status) => {
             warn!(
                 sandbox_id,
                 local_artifact_id = %pinned.artifact_id,
                 code = %status.code(),
                 message = %status.message(),
-                "sandbox eviction: GetArtifactBackupLocation failed",
+                "sandbox eviction: CheckSandboxBackup failed",
             );
             Err(classify_rpc_failure(&status))
         }
     }
+}
+
+/// Only legacy caches need the latest suspend generation. Pinned caches use
+/// their own marker or exact-artifact proof and must not depend on a snapshot
+/// location read that becomes forbidden when the sandbox moves elsewhere.
+async fn legacy_ready_generation(
+    cluster: &mut pplx_space_node_api_client::cluster::AuthenticatedClusterApiClient,
+    sandbox_id: &str,
+    evidence: &LocalEvidence,
+) -> Result<Option<SnapshotId>, tonic::Status> {
+    use pplx_space_node_api_client::proto::{
+        CheckSandboxBackupRequest, check_sandbox_backup_request::Artifact,
+    };
+    let LocalEvidence::Unpinned {
+        latest_job: Some(job),
+    } = evidence
+    else {
+        return Ok(None);
+    };
+    let ready = cluster
+        .check_sandbox_backup(CheckSandboxBackupRequest {
+            sandbox_id: sandbox_id.to_string(),
+            artifact: Some(Artifact::SuspendSnapshotId(job.snapshot_id.to_string())),
+        })
+        .await?
+        .into_inner()
+        .ready;
+    Ok(ready.then_some(job.snapshot_id))
 }
 
 fn classify_reupload_failure(
@@ -1352,57 +1383,31 @@ async fn evict_tick(
             continue;
         }
 
-        let cluster_latest = match cluster
-            .get_suspend_snapshot_location(
-                pplx_space_node_api_client::proto::GetSuspendSnapshotLocationRequest {
-                    sandbox_id: sandbox_id.clone(),
-                },
-            )
-            .await
-        {
-            Ok(resp) => match resp.get_ref().snapshot_id.trim().parse::<SnapshotId>() {
-                Ok(id) => Some(id),
-                Err(error) => {
+        let cluster_latest =
+            match legacy_ready_generation(&mut cluster, &sandbox_id, &evidence).await {
+                Ok(generation) => generation,
+                Err(status) => {
                     warn!(
                         sandbox_id = %sandbox_id,
-                        snapshot_id = %resp.get_ref().snapshot_id,
-                        %error,
-                        "sandbox eviction: unparseable cluster snapshot id",
+                        code = %status.code(),
+                        message = %status.message(),
+                        "sandbox eviction: CheckSandboxBackup failed",
                     );
-                    record_continuing_candidate_skip(
+                    let reason = classify_rpc_failure(&status);
+                    let flow = record_candidate_skip(
                         &mut report,
                         scan_state,
                         &sandbox_id,
                         cursor,
-                        SkipReason::RpcError,
+                        reason,
                         scan_started,
                     );
+                    if flow == CandidateFlow::Stop {
+                        break;
+                    }
                     continue;
                 }
-            },
-            Err(status) if status.code() == tonic::Code::NotFound => None,
-            Err(status) => {
-                warn!(
-                    sandbox_id = %sandbox_id,
-                    code = %status.code(),
-                    message = %status.message(),
-                    "sandbox eviction: GetSuspendSnapshotLocation failed",
-                );
-                let reason = classify_rpc_failure(&status);
-                let flow = record_candidate_skip(
-                    &mut report,
-                    scan_state,
-                    &sandbox_id,
-                    cursor,
-                    reason,
-                    scan_started,
-                );
-                if flow == CandidateFlow::Stop {
-                    break;
-                }
-                continue;
-            }
-        };
+            };
 
         let suspend_age = suspend_time_witness(&evidence);
         let reason = match decide(cluster_latest, &evidence, updated_at_secs) {

@@ -3627,6 +3627,7 @@ async fn placed_sandbox_unlocks_private_release_for_its_node_only() -> TestResul
 /// address is refused.
 #[tokio::test(flavor = "current_thread")]
 async fn placed_sandbox_locations_resolve_for_its_node_only() -> TestResult {
+    use crate::proto::{LocalArtifactBackupIdentity, check_sandbox_backup_request::Artifact};
     let Some(fixture) = cluster_fixture().await? else {
         return Ok(());
     };
@@ -3663,11 +3664,12 @@ async fn placed_sandbox_locations_resolve_for_its_node_only() -> TestResult {
     // The hosting node registers a ready suspend snapshot and a ready backup
     // of a stopped rootfs, the two artifacts a restore looks up.
     let suspend_attempt = SnapshotId::new();
+    let suspend_artifact = LocalArtifactId::new();
     begin_artifact_backup_from_node(
         &fixture.service,
         std::net::IpAddr::V4(worker_a_ip),
         sandbox_id,
-        LocalArtifactId::new(),
+        suspend_artifact,
         suspend_attempt,
         pplx_space_sbx_mgr_client::proto::ArtifactKind::Full,
         pplx_space_sbx_mgr_client::proto::ArtifactOrigin::Suspend,
@@ -3786,6 +3788,162 @@ async fn placed_sandbox_locations_resolve_for_its_node_only() -> TestResult {
     assert_eq!(
         codes(&reads(Some(worker_a_ip)).await),
         [Some(tonic::Code::NotFound); 3]
+    );
+
+    // The former host still needs to evict its retained cache. Exact backup
+    // proofs remain available after relocation without reopening URI reads.
+    let exact = |id: LocalArtifactId, kind| {
+        Artifact::LocalArtifact(LocalArtifactBackupIdentity {
+            local_artifact_id: id.to_string(),
+            artifact_kind: kind,
+        })
+    };
+    let full = pplx_space_sbx_mgr_client::proto::ArtifactKind::Full as i32;
+    let disk = pplx_space_sbx_mgr_client::proto::ArtifactKind::Disk as i32;
+    let check = |sandbox: SandboxId, artifact: Artifact, node_ip| {
+        let service = &fixture.service;
+        async move {
+            service
+                .check_sandbox_backup(maybe_from_node(
+                    CheckSandboxBackupRequest {
+                        sandbox_id: sandbox.to_string(),
+                        artifact: Some(artifact),
+                    },
+                    node_ip,
+                ))
+                .await
+                .map(|response| response.into_inner().ready)
+        }
+    };
+    for artifact in [
+        exact(suspend_artifact, full),
+        exact(disk_artifact, disk),
+        Artifact::SuspendSnapshotId(suspend_attempt.to_string()),
+    ] {
+        assert!(check(sandbox_id, artifact.clone(), Some(worker_a_ip)).await?);
+        assert!(!check(SandboxId::new(), artifact.clone(), Some(worker_a_ip)).await?);
+        for remote in [None, Some(std::net::Ipv4Addr::new(10, 0, 0, 42))] {
+            assert_eq!(
+                check(sandbox_id, artifact.clone(), remote)
+                    .await
+                    .unwrap_err()
+                    .code(),
+                tonic::Code::PermissionDenied,
+            );
+        }
+    }
+    for artifact in [
+        exact(LocalArtifactId::new(), full),
+        exact(suspend_artifact, disk),
+        exact(disk_artifact, full),
+        Artifact::SuspendSnapshotId(disk_attempt.to_string()),
+        Artifact::SuspendSnapshotId(SnapshotId::new().to_string()),
+    ] {
+        assert!(!check(sandbox_id, artifact, Some(worker_a_ip)).await?);
+    }
+    for artifact in [
+        None,
+        Some(exact(suspend_artifact, 0)),
+        Some(Artifact::SuspendSnapshotId("invalid".to_string())),
+        Some(Artifact::LocalArtifact(LocalArtifactBackupIdentity {
+            local_artifact_id: "invalid".to_string(),
+            artifact_kind: full,
+        })),
+    ] {
+        let status = fixture
+            .service
+            .check_sandbox_backup(maybe_from_node(
+                CheckSandboxBackupRequest {
+                    sandbox_id: sandbox_id.to_string(),
+                    artifact,
+                },
+                Some(worker_a_ip),
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    }
+
+    // Legacy proof must reject an older ready attempt, while an immutable
+    // pinned artifact can still use that same durable backup.
+    sqlx::query(sql!(
+        "UPDATE snapshots SET timestamp = NOW() - INTERVAL '1 hour' WHERE id = $1"
+    ))
+    .bind(suspend_attempt)
+    .execute(pool)
+    .await?;
+    let newer_attempt = SnapshotId::new();
+    let newer_artifact = LocalArtifactId::new();
+    begin_artifact_backup_from_node(
+        &fixture.service,
+        std::net::IpAddr::V4(worker_b_ip),
+        sandbox_id,
+        newer_artifact,
+        newer_attempt,
+        pplx_space_sbx_mgr_client::proto::ArtifactKind::Full,
+        pplx_space_sbx_mgr_client::proto::ArtifactOrigin::Suspend,
+    )
+    .await?;
+    finalize_ready_from_node(&fixture.service, worker_b_ip, newer_attempt).await?;
+    assert!(
+        !check(
+            sandbox_id,
+            Artifact::SuspendSnapshotId(suspend_attempt.to_string()),
+            Some(worker_a_ip)
+        )
+        .await?
+    );
+    assert!(check(sandbox_id, exact(suspend_artifact, full), Some(worker_a_ip)).await?);
+    assert!(
+        check(
+            sandbox_id,
+            Artifact::SuspendSnapshotId(newer_attempt.to_string()),
+            Some(worker_a_ip)
+        )
+        .await?
+    );
+    for state in ["creating", "failed", "deleting"] {
+        sqlx::query(sql!("UPDATE snapshots SET state = $2 WHERE id = $1"))
+            .bind(newer_attempt)
+            .bind(state)
+            .execute(pool)
+            .await?;
+        assert!(!check(sandbox_id, exact(newer_artifact, full), Some(worker_a_ip)).await?);
+        assert!(
+            !check(
+                sandbox_id,
+                Artifact::SuspendSnapshotId(newer_attempt.to_string()),
+                Some(worker_a_ip)
+            )
+            .await?
+        );
+    }
+    sqlx::query(sql!("UPDATE snapshots SET state = 'ready' WHERE id = $1"))
+        .bind(newer_attempt)
+        .execute(pool)
+        .await?;
+    sqlx::query(sql!(
+        "UPDATE snapshot_storage_locations SET orphaned_at = NOW() WHERE snapshot_id = $1"
+    ))
+    .bind(newer_attempt)
+    .execute(pool)
+    .await?;
+    assert!(!check(sandbox_id, exact(newer_artifact, full), Some(worker_a_ip)).await?);
+    assert!(
+        !check(
+            sandbox_id,
+            Artifact::SuspendSnapshotId(suspend_attempt.to_string()),
+            Some(worker_a_ip)
+        )
+        .await?
+    );
+    assert!(
+        !check(
+            sandbox_id,
+            Artifact::SuspendSnapshotId(newer_attempt.to_string()),
+            Some(worker_a_ip)
+        )
+        .await?
     );
     Ok(())
 }
