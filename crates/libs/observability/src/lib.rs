@@ -1280,15 +1280,6 @@ pub mod trace_propagation {
     }
 
     /// Extract an OpenTelemetry context from incoming gRPC metadata and attach
-    /// it as the parent of the current `tracing` span.
-    pub fn attach_parent_context_from(metadata: &MetadataMap) {
-        let cx = opentelemetry::global::get_text_map_propagator(|propagator| {
-            propagator.extract(&MetadataExtractor(metadata))
-        });
-        let _ = tracing::Span::current().set_parent(cx);
-    }
-
-    /// Extract an OpenTelemetry context from incoming gRPC metadata and attach
     /// it as the parent of an explicit span before that span is entered.
     pub fn set_span_parent_context_from(span: &tracing::Span, metadata: &MetadataMap) {
         let cx = opentelemetry::global::get_text_map_propagator(|propagator| {
@@ -1358,19 +1349,6 @@ pub mod trace_propagation {
         });
         carrier.remove("traceparent")
     }
-
-    /// Build an OpenTelemetry context from a W3C traceparent string and attach
-    /// it as the parent of the current `tracing` span. Mirror of
-    /// `current_traceparent` for the consumer side.
-    pub fn attach_parent_from_traceparent(traceparent: &str) {
-        use std::collections::HashMap;
-        let mut carrier: HashMap<String, String> = HashMap::new();
-        carrier.insert("traceparent".to_string(), traceparent.to_string());
-        let cx = opentelemetry::global::get_text_map_propagator(|propagator| {
-            propagator.extract(&carrier)
-        });
-        let _ = tracing::Span::current().set_parent(cx);
-    }
 }
 
 #[cfg(not(feature = "otel"))]
@@ -1379,7 +1357,6 @@ pub mod trace_propagation {
     /// type so callers don't need a direct tonic dep guard.
     pub fn inject_current_context<T>(_metadata: &mut T) {}
     pub fn inject_current_context_into_headers<T>(_headers: &mut T) {}
-    pub fn attach_parent_context_from<T>(_metadata: &T) {}
     pub fn set_span_parent_context_from<T>(_span: &tracing::Span, _metadata: &T) {}
     pub fn set_span_parent_from_headers<T>(_span: &tracing::Span, _headers: &T) {}
     pub fn set_span_parent_from_traceparent(_span: &tracing::Span, _traceparent: &str) {}
@@ -1390,7 +1367,6 @@ pub mod trace_propagation {
     pub fn current_traceparent() -> Option<String> {
         None
     }
-    pub fn attach_parent_from_traceparent(_traceparent: &str) {}
 }
 
 #[cfg(all(test, feature = "otel"))]
