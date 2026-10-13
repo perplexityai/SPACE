@@ -5,9 +5,7 @@ use super::activation_support::{
     space_api_route_identity_to_wire, spawn_restore_state_transition,
 };
 use super::cache_cleanup::ensure_sandbox_cache_root;
-use super::cleanup_support::{
-    ActivationCleanupSpec, CleanupCompletion, read_node_execution_fence, require_state_write,
-};
+use super::cleanup_support::{ActivationCleanupSpec, CleanupCompletion, read_node_execution_fence};
 use super::create_support::*;
 use super::network_runtime::*;
 use super::spaced_bridge::*;
@@ -416,9 +414,9 @@ impl SandboxManagerService {
 
         let update_result = {
             let db = self.db_conn()?;
-            crate::db::update_state(&db, &id, SandboxState::Created)
+            write_create_completed(&db, &id)
         };
-        if let Err(status) = require_state_write(update_result, "complete sandbox create") {
+        if let Err(status) = update_result {
             create_cleanup.cleanup_after_failure(
                 SandboxQuarantineReasonCode::CreateInterrupted,
                 status.message(),
@@ -528,11 +526,9 @@ impl SandboxManagerService {
             {
                 let update_result = {
                     let db = self.db_conn()?;
-                    crate::db::update_state(&db, &id, SandboxState::Suspended)
+                    write_base_snapshot_create_completed(&db, &id)
                 };
-                if let Err(status) =
-                    require_state_write(update_result, "complete restored sandbox create")
-                {
+                if let Err(status) = update_result {
                     create_cleanup.cleanup_after_failure(
                         SandboxQuarantineReasonCode::CreateInterrupted,
                         status.message(),

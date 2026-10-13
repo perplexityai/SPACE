@@ -356,7 +356,7 @@ pub(crate) fn assert_unchanged(case: &str, before: &Snapshot, conn: &Connection)
 }
 
 /// Insert a plain sandbox row in `state`.
-pub(super) fn insert_row(conn: &Connection, state: SandboxState) -> String {
+pub(crate) fn insert_row(conn: &Connection, state: SandboxState) -> String {
     let sandbox_id = SandboxId::new();
     let id = sandbox_id.to_string();
     insert_test_sandbox(
@@ -373,7 +373,7 @@ pub(super) fn insert_row(conn: &Connection, state: SandboxState) -> String {
 /// Move a seeded row to `state` without any writer's side effects. A
 /// `restoring` row carries a remote restore's three restore columns, which the
 /// table's `CHECK` ties to that state.
-pub(super) fn force_state(conn: &Connection, id: &str, state: SandboxState) {
+pub(crate) fn force_state(conn: &Connection, id: &str, state: SandboxState) {
     let restoring = state == SandboxState::Restoring;
     conn.execute(
         "UPDATE sandboxes
@@ -395,7 +395,7 @@ pub(super) fn restore_source() -> pplx_space_common_core::types::ExactStorageUri
 }
 
 /// Backdate every timestamp a writer may stamp, so a fresh stamp is visible.
-pub(super) fn backdate(conn: &Connection, id: &str) {
+pub(crate) fn backdate(conn: &Connection, id: &str) {
     conn.execute(
         "UPDATE sandboxes SET state_changed_at = '1', updated_at = '1' WHERE id = ?1",
         params![id],
@@ -488,7 +488,7 @@ pub(super) fn runtime_cleared(retained: &[&str]) -> Vec<(&'static str, Cell)> {
 /// A transition receipt targeting `target`, in the kind the table's `CHECK`
 /// admits for it: an activation completion for created, started and paused,
 /// otherwise an activation rollback.
-pub(super) fn seed_receipt(conn: &Connection, id: &str, target: SandboxState) {
+pub(crate) fn seed_receipt(conn: &Connection, id: &str, target: SandboxState) {
     let (kind, reason) = match target {
         SandboxState::Created | SandboxState::Started | SandboxState::Paused => {
             ("activation_completed", None)
@@ -528,7 +528,7 @@ pub(super) fn receipt_cleared(target: SandboxState) -> Vec<(&'static str, Cell)>
     cells
 }
 
-pub(super) fn set_failure_reason(conn: &Connection, id: &str, reason: &str) {
+pub(crate) fn set_failure_reason(conn: &Connection, id: &str, reason: &str) {
     conn.execute(
         "UPDATE sandboxes SET failure_reason = ?2 WHERE id = ?1",
         params![id, reason],
@@ -744,7 +744,7 @@ pub(super) fn insert_creating_with(
     (id, cleanup_id)
 }
 
-pub(super) fn insert_creating(
+pub(crate) fn insert_creating(
     conn: &Connection,
     completion: CleanupCompletion,
 ) -> (String, SandboxCleanupEpisodeId) {

@@ -238,10 +238,6 @@ pub(super) fn require_state_write(
 /// error is `Internal`. Every refusal is `Aborted`: a from-state refusal
 /// reports the state another transition left the row in, and a generic-guard
 /// refusal or a missing row keeps `update_state`'s message.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the update_state_from conversions adopt it")
-)]
 pub(super) fn require_state_write_from(
     result: rusqlite::Result<crate::db::StateWriteOutcome>,
     context: &'static str,
@@ -255,10 +251,6 @@ pub(super) fn require_state_write_from(
 /// Why an `update_state_from` write did not apply. A caller that answers one
 /// case differently matches it and passes the rest to
 /// [`StateWriteRejected::into_status`].
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the update_state_from conversions adopt it")
-)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum StateWriteRejected {
     /// Another transition moved the row outside the edge's source states.
@@ -275,20 +267,12 @@ pub(super) enum StateWriteRejected {
 }
 
 /// The generic guards `update_state` and `update_state_from` share.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the update_state_from conversions adopt it")
-)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum StateWriteGuard {
     Quarantined,
     CleanupOwned,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the update_state_from conversions adopt it")
-)]
 pub(super) fn state_write_result(
     outcome: crate::db::StateWriteOutcome,
 ) -> Result<SandboxState, StateWriteRejected> {
@@ -317,10 +301,6 @@ pub(super) fn state_write_result(
     }
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the update_state_from conversions adopt it")
-)]
 impl StateWriteRejected {
     pub(super) fn into_status(self, context: &str) -> Status {
         use crate::db::{SandboxStateWriteNotApplied, SandboxStateWriteOutcome};

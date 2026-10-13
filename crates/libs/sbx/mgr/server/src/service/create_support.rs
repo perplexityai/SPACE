@@ -1,4 +1,5 @@
 use super::activation_support::space_api_route_identity_to_wire;
+use super::cleanup_support::{StateWriteRejected, require_state_write_from, state_write_result};
 use super::template_snapshot_support::compute_partial_sha256;
 use super::validation::{
     TemplateRuntimeDefaults, reject_incompatible_template_arch,
@@ -285,6 +286,78 @@ pub(super) fn template_create_hash(
     }
 }
 
+/// Create completion's node-local SQLite `sandboxes.state` write,
+/// `creating → created`. Create holds no lock between its insert and this
+/// write, so a row a Stop moved to `stopping` refuses it, and the Stop keeps
+/// the row.
+pub(super) fn write_create_completed(db: &rusqlite::Connection, id: &str) -> Result<(), Status> {
+    let edge = &crate::db::edges::CREATE_COMPLETE;
+    require_state_write_from(
+        crate::db::update_state_from(db, id, edge),
+        "complete sandbox create",
+    )
+}
+
+/// Base-snapshot create's node-local SQLite `sandboxes.state` write after its
+/// own `created` write, `created → suspended`, refused like
+/// [`write_create_completed`].
+pub(super) fn write_base_snapshot_create_completed(
+    db: &rusqlite::Connection,
+    id: &str,
+) -> Result<(), Status> {
+    let edge = &crate::db::edges::CREATE_BASE_SNAPSHOT_COMPLETE;
+    require_state_write_from(
+        crate::db::update_state_from(db, id, edge),
+        "complete restored sandbox create",
+    )
+}
+
+fn warm_start_refused(id: &str, found: SandboxState) -> Status {
+    Status::failed_precondition(format!(
+        "cannot start sandbox {id} from a warm snapshot while local state is {found}; \
+         expected suspended, created or stopped"
+    ))
+}
+
+/// Admit a warm-snapshot Start only of a row read in its node-local SQLite
+/// `sandboxes.state` as a restage source or already `suspended`, before it
+/// stages the base snapshot into the sandbox's suspend snapshot directory,
+/// which restore treats as local suspend evidence. The restage write checks
+/// again: a row can move while the snapshot is staged.
+pub(super) fn admit_warm_start(sandbox: &crate::db::SandboxRow) -> Result<(), Status> {
+    if sandbox.state == SandboxState::Suspended
+        || crate::db::edges::WARM_START_RESTAGE
+            .from()
+            .contains(sandbox.state)
+    {
+        Ok(())
+    } else {
+        Err(warm_start_refused(&sandbox.id, sandbox.state))
+    }
+}
+
+/// Warm-snapshot Start's node-local SQLite `sandboxes.state` write after it
+/// staged the base snapshot, `created` or `stopped` → `suspended`, so the
+/// checkpoint restore can claim the row. A row that moved to `suspended` in
+/// the meantime needs no write. A row another transition moved anywhere else
+/// is `FailedPrecondition`, as [`admit_warm_start`] answers it; a generic-guard
+/// refusal or a missing row keeps `require_state_write_from`'s `Aborted`.
+pub(super) fn write_warm_start_restaged(db: &rusqlite::Connection, id: &str) -> Result<(), Status> {
+    const CONTEXT: &str = "prepare recovered sandbox restore";
+    let outcome = crate::db::update_state_from(db, id, &crate::db::edges::WARM_START_RESTAGE)
+        .map_err(|error| Status::internal(format!("{CONTEXT}: {error}")))?;
+    match state_write_result(outcome) {
+        Ok(_)
+        | Err(StateWriteRejected::FromState {
+            found: SandboxState::Suspended,
+        }) => Ok(()),
+        Err(StateWriteRejected::FromState { found }) => Err(warm_start_refused(id, found)),
+        Err(rejected) => Err(rejected.into_status(CONTEXT)),
+    }
+}
+
+#[cfg(test)]
+mod state_write_tests;
 #[cfg(test)]
 mod tests;
 

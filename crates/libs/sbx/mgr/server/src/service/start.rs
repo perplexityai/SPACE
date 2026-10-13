@@ -11,17 +11,15 @@ use super::activation_support::{
     space_api_route_identity_from_start_request, space_api_route_identity_to_wire,
     spawn_wait_ready_state_transition, wait_ready_and_mark_started, wake_target_state_from_proto,
 };
-use super::cleanup_support::{
-    ActivationCleanupSpec, read_node_execution_fence, require_state_write,
-};
+use super::cleanup_support::{ActivationCleanupSpec, read_node_execution_fence};
 use super::create::StartFromCheckpointLaunch;
 use super::create_support::{
     CheckpointRestoreRetryAction, GUEST_GATEWAY, GUEST_IP, RestoredSnapshotProvenance,
-    RuntimeActivatedEvent, SUSPEND_CHECKPOINT, checkpoint_restore_retry_action,
+    RuntimeActivatedEvent, SUSPEND_CHECKPOINT, admit_warm_start, checkpoint_restore_retry_action,
     checkpoint_start_response_for_existing_started_sandbox, emit_runtime_activated_event,
     guest_console_logs_enabled, resolve_template_paths_for_start, sandbox_rootfs_exists,
     stage_base_snapshot_runtime_metadata, template_runtime_defaults_for_sandbox_start,
-    template_source_for_sandbox_prepare,
+    template_source_for_sandbox_prepare, write_warm_start_restaged,
 };
 use super::network_runtime::{
     launch_net_gateway_via_node, net_gateway_launch_config, register_net_gateway_launch,
@@ -1352,6 +1350,7 @@ impl SandboxManagerService {
         if !ctx.from_warm {
             return Ok(None);
         }
+        admit_warm_start(sandbox)?;
 
         self.ensure_snapshot_restore_supported("start_from_warm")?;
         tracing::Span::current().record(
@@ -1426,10 +1425,7 @@ impl SandboxManagerService {
 
         if sandbox.state != SandboxState::Suspended {
             let db = self.db_conn()?;
-            require_state_write(
-                crate::db::update_state(&db, &sandbox.id, SandboxState::Suspended),
-                "prepare recovered sandbox restore",
-            )?;
+            write_warm_start_restaged(&db, &sandbox.id)?;
         }
 
         let sandbox = self.lookup_sandbox(&sandbox.id)?;

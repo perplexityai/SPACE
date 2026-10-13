@@ -181,10 +181,10 @@ edge_table! {
     /// pool clone) and `transfer::reserve_import` insert a `creating` row with
     /// an armed cleanup episode.
     CREATE_INSERT: Request, INSERT => Creating;
-    /// `create_with_id`: `update_state(Created)`.
+    /// `create_with_id` through `write_create_completed`.
     CREATE_COMPLETE: Completion, of(&[Creating]) => Created;
-    /// `create_with_id` in base-snapshot mode: `update_state(Suspended)`
-    /// after its own `created` write.
+    /// `create_with_id` in base-snapshot mode, through
+    /// `write_base_snapshot_create_completed` after its own `created` write.
     CREATE_BASE_SNAPSHOT_COMPLETE: Completion, of(&[Created]) => Suspended;
     /// `complete_pool_clone` and `complete_import`, under their armed
     /// episodes.
@@ -200,8 +200,8 @@ edge_table! {
     /// `begin_activation_with_route_evidence(Restore)` from
     /// `start_from_checkpoint`.
     RESTORE_BEGIN: Request, of(&[Suspended]) => Restoring;
-    /// `try_start_from_warm_snapshot`: `update_state(Suspended)` when the row
-    /// is not already `suspended`, before the cold path.
+    /// `try_start_from_warm_snapshot` through `write_warm_start_restaged`
+    /// when the row is not already `suspended`, before the cold path.
     WARM_START_RESTAGE: Request, of(&[Created, Stopped]) => Suspended;
     /// `insert_restoring_sandbox_row_from_snapshot` through
     /// `restore_adopt_orphan_or_insert_sandbox_in_transaction`: a
@@ -432,19 +432,6 @@ edge_table! {
     /// `resume_after_wake_lock`'s policy-free `update_state(Resuming)` after
     /// a Stop completed during the pre-wake policy refresh.
     RESUME_BEGIN_AFTER_STOP: KnownRace, of(&[Stopped]) => Resuming;
-    /// `try_start_from_warm_snapshot`'s `update_state(Suspended)`. An
-    /// empty-checkpoint warm Start rejects only `failed` before it, so it
-    /// writes from every state the generic guards admit, with no concurrency
-    /// needed; a row with a current activation episode answers
-    /// `CleanupOwned` instead.
-    WARM_START_UNVALIDATED: KnownRace,
-        StateSet::ALL
-            .without(Created)
-            .without(Stopped)
-            .without(Suspended)
-            .without(Deleting)
-            .without(Quarantined)
-            .without(Failed) => Suspended;
     /// The full process-snapshot rollback's `update_state(Suspended)` after a
     /// Stop admitted while it restaged the snapshot. Its own stop leaves no
     /// runtime, so the second Stop is reached only in the window between
