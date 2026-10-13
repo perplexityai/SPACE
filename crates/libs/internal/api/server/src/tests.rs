@@ -3624,10 +3624,14 @@ async fn placed_sandbox_unlocks_private_release_for_its_node_only() -> TestResul
 /// location and organization snapshot storage only while the sandbox is
 /// placed on it: active there, or as the target of a pending migration or
 /// restore. Another node reads `NotFound`, and a request with no remote
-/// address is refused.
+/// address is refused. A former host can still ask whether an identity it
+/// holds is backed up, and learns only that.
 #[tokio::test(flavor = "current_thread")]
 async fn placed_sandbox_locations_resolve_for_its_node_only() -> TestResult {
-    use crate::proto::{LocalArtifactBackupIdentity, check_sandbox_backup_request::Artifact};
+    use crate::proto::{
+        BackupReadinessQuery, LocalArtifactBackupIdentity, backup_readiness_query::Artifact,
+    };
+    use prost::Message as _;
     let Some(fixture) = cluster_fixture().await? else {
         return Ok(());
     };
@@ -3721,11 +3725,19 @@ async fn placed_sandbox_locations_resolve_for_its_node_only() -> TestResult {
                         sandbox_id: sandbox_id.to_string(),
                         local_artifact_id: disk_artifact.to_string(),
                         artifact_kind: pplx_space_sbx_mgr_client::proto::ArtifactKind::Disk as i32,
+                        readiness: None,
                     },
                     node_ip,
                 ))
                 .await
-                .map(|response| response.into_inner().backup_attempt_id);
+                .map(|response| {
+                    let response = response.into_inner();
+                    assert_eq!(
+                        response.ready, None,
+                        "a location reply is not a readiness reply"
+                    );
+                    response.backup_attempt_id
+                });
             let storage = service
                 .get_sandbox_snapshot_storage_uri(maybe_from_node(
                     GetSandboxSnapshotStorageUriRequest {
@@ -3800,25 +3812,36 @@ async fn placed_sandbox_locations_resolve_for_its_node_only() -> TestResult {
     };
     let full = pplx_space_sbx_mgr_client::proto::ArtifactKind::Full as i32;
     let disk = pplx_space_sbx_mgr_client::proto::ArtifactKind::Disk as i32;
+    let readiness =
+        |sandbox: SandboxId, artifact: Option<Artifact>| GetArtifactBackupLocationRequest {
+            sandbox_id: sandbox.to_string(),
+            readiness: Some(BackupReadinessQuery { artifact }),
+            ..Default::default()
+        };
     let check = |sandbox: SandboxId, artifact: Artifact, node_ip| {
         let service = &fixture.service;
+        let request = readiness(sandbox, Some(artifact));
         async move {
-            service
-                .check_sandbox_backup(maybe_from_node(
-                    CheckSandboxBackupRequest {
-                        sandbox_id: sandbox.to_string(),
-                        artifact: Some(artifact),
-                    },
-                    node_ip,
-                ))
-                .await
-                .map(|response| response.into_inner().ready)
+            let response = service
+                .get_artifact_backup_location(maybe_from_node(request, node_ip))
+                .await?
+                .into_inner();
+            // A readiness reply carries no identity, location or digests,
+            // whatever its answer.
+            assert_eq!(
+                response,
+                GetArtifactBackupLocationResponse {
+                    ready: response.ready,
+                    ..Default::default()
+                }
+            );
+            Ok::<_, tonic::Status>(response.ready.expect("a readiness reply sets ready"))
         }
     };
     for artifact in [
         exact(suspend_artifact, full),
         exact(disk_artifact, disk),
-        Artifact::SuspendSnapshotId(suspend_attempt.to_string()),
+        Artifact::LatestReadySuspendSnapshotId(suspend_attempt.to_string()),
     ] {
         assert!(check(sandbox_id, artifact.clone(), Some(worker_a_ip)).await?);
         assert!(!check(SandboxId::new(), artifact.clone(), Some(worker_a_ip)).await?);
@@ -3836,36 +3859,93 @@ async fn placed_sandbox_locations_resolve_for_its_node_only() -> TestResult {
         exact(LocalArtifactId::new(), full),
         exact(suspend_artifact, disk),
         exact(disk_artifact, full),
-        Artifact::SuspendSnapshotId(disk_attempt.to_string()),
-        Artifact::SuspendSnapshotId(SnapshotId::new().to_string()),
+        Artifact::LatestReadySuspendSnapshotId(disk_attempt.to_string()),
+        Artifact::LatestReadySuspendSnapshotId(SnapshotId::new().to_string()),
     ] {
         assert!(!check(sandbox_id, artifact, Some(worker_a_ip)).await?);
     }
-    for artifact in [
-        None,
-        Some(exact(suspend_artifact, 0)),
-        Some(Artifact::SuspendSnapshotId("invalid".to_string())),
-        Some(Artifact::LocalArtifact(LocalArtifactBackupIdentity {
-            local_artifact_id: "invalid".to_string(),
-            artifact_kind: full,
-        })),
+    // A readiness query names its identity only inside `readiness`; mixing it
+    // with the location fields is refused, as are empty or invalid identities.
+    let mixed_id = GetArtifactBackupLocationRequest {
+        local_artifact_id: disk_artifact.to_string(),
+        ..readiness(sandbox_id, Some(exact(disk_artifact, disk)))
+    };
+    let mixed_kind = GetArtifactBackupLocationRequest {
+        artifact_kind: disk,
+        ..readiness(sandbox_id, Some(exact(disk_artifact, disk)))
+    };
+    for request in [
+        mixed_id,
+        mixed_kind,
+        readiness(sandbox_id, None),
+        readiness(sandbox_id, Some(exact(suspend_artifact, 0))),
+        readiness(
+            sandbox_id,
+            Some(Artifact::LatestReadySuspendSnapshotId(
+                "invalid".to_string(),
+            )),
+        ),
+        readiness(
+            sandbox_id,
+            Some(Artifact::LocalArtifact(LocalArtifactBackupIdentity {
+                local_artifact_id: "invalid".to_string(),
+                artifact_kind: full,
+            })),
+        ),
     ] {
         let status = fixture
             .service
-            .check_sandbox_backup(maybe_from_node(
-                CheckSandboxBackupRequest {
-                    sandbox_id: sandbox_id.to_string(),
-                    artifact,
-                },
-                Some(worker_a_ip),
-            ))
+            .get_artifact_backup_location(maybe_from_node(request, Some(worker_a_ip)))
             .await
             .unwrap_err();
         assert_eq!(status.code(), tonic::Code::InvalidArgument);
     }
 
-    // Legacy proof must reject an older ready attempt, while an immutable
-    // pinned artifact can still use that same durable backup.
+    // Rolling upgrade: a server that predates `readiness` decodes only
+    // fields 1-3. A location request keeps identical bytes, and a readiness
+    // query reaches it with an empty artifact id, which its location path
+    // (the validation kept here) rejects before any lookup.
+    let location = GetArtifactBackupLocationRequest {
+        sandbox_id: sandbox_id.to_string(),
+        local_artifact_id: disk_artifact.to_string(),
+        artifact_kind: disk,
+        readiness: None,
+    };
+    assert_eq!(
+        location.encode_to_vec(),
+        LocationOnlyRequest {
+            sandbox_id: location.sandbox_id.clone(),
+            local_artifact_id: location.local_artifact_id.clone(),
+            artifact_kind: disk,
+        }
+        .encode_to_vec()
+    );
+    for artifact in [
+        exact(disk_artifact, disk),
+        Artifact::LatestReadySuspendSnapshotId(suspend_attempt.to_string()),
+    ] {
+        let wire = readiness(sandbox_id, Some(artifact)).encode_to_vec();
+        let seen_by_old_server = LocationOnlyRequest::decode(wire.as_slice())?;
+        assert_eq!(
+            seen_by_old_server,
+            LocationOnlyRequest {
+                sandbox_id: sandbox_id.to_string(),
+                ..Default::default()
+            }
+        );
+        let request = GetArtifactBackupLocationRequest::decode(
+            seen_by_old_server.encode_to_vec().as_slice(),
+        )?;
+        let status = fixture
+            .service
+            .get_artifact_backup_location(maybe_from_node(request, Some(worker_a_ip)))
+            .await
+            .unwrap_err();
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    }
+
+    // An unpinned cache's proof must reject an older ready attempt, while an
+    // immutable pinned artifact can still use that same durable backup.
     sqlx::query(sql!(
         "UPDATE snapshots SET timestamp = NOW() - INTERVAL '1 hour' WHERE id = $1"
     ))
@@ -3888,7 +3968,7 @@ async fn placed_sandbox_locations_resolve_for_its_node_only() -> TestResult {
     assert!(
         !check(
             sandbox_id,
-            Artifact::SuspendSnapshotId(suspend_attempt.to_string()),
+            Artifact::LatestReadySuspendSnapshotId(suspend_attempt.to_string()),
             Some(worker_a_ip)
         )
         .await?
@@ -3897,7 +3977,7 @@ async fn placed_sandbox_locations_resolve_for_its_node_only() -> TestResult {
     assert!(
         check(
             sandbox_id,
-            Artifact::SuspendSnapshotId(newer_attempt.to_string()),
+            Artifact::LatestReadySuspendSnapshotId(newer_attempt.to_string()),
             Some(worker_a_ip)
         )
         .await?
@@ -3912,7 +3992,7 @@ async fn placed_sandbox_locations_resolve_for_its_node_only() -> TestResult {
         assert!(
             !check(
                 sandbox_id,
-                Artifact::SuspendSnapshotId(newer_attempt.to_string()),
+                Artifact::LatestReadySuspendSnapshotId(newer_attempt.to_string()),
                 Some(worker_a_ip)
             )
             .await?
@@ -3932,7 +4012,7 @@ async fn placed_sandbox_locations_resolve_for_its_node_only() -> TestResult {
     assert!(
         !check(
             sandbox_id,
-            Artifact::SuspendSnapshotId(suspend_attempt.to_string()),
+            Artifact::LatestReadySuspendSnapshotId(suspend_attempt.to_string()),
             Some(worker_a_ip)
         )
         .await?
@@ -3940,12 +4020,24 @@ async fn placed_sandbox_locations_resolve_for_its_node_only() -> TestResult {
     assert!(
         !check(
             sandbox_id,
-            Artifact::SuspendSnapshotId(newer_attempt.to_string()),
+            Artifact::LatestReadySuspendSnapshotId(newer_attempt.to_string()),
             Some(worker_a_ip)
         )
         .await?
     );
     Ok(())
+}
+
+/// `GetArtifactBackupLocationRequest` as decoded by a server that predates
+/// its readiness query.
+#[derive(Clone, PartialEq, prost::Message)]
+struct LocationOnlyRequest {
+    #[prost(string, tag = "1")]
+    sandbox_id: String,
+    #[prost(string, tag = "2")]
+    local_artifact_id: String,
+    #[prost(int32, tag = "3")]
+    artifact_kind: i32,
 }
 
 /// A request from `node_ip` when given, otherwise one with no remote address.
@@ -5336,6 +5428,7 @@ async fn get_artifact_location(
                 sandbox_id: sandbox_id.to_string(),
                 local_artifact_id: local_artifact_id.to_string(),
                 artifact_kind: artifact_kind as i32,
+                readiness: None,
             },
             TEST_WORKER_IP,
         ))

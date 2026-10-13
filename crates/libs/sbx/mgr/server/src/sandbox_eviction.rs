@@ -39,7 +39,7 @@
 //!    `FinalizeArtifactBackup(READY)`, which requires every per-file
 //!    transfer to have completed) — or, when the marker is absent (e.g.
 //!    the bytes were restored *from* S3 and never re-uploaded), by a
-//!    `CheckSandboxBackup` lookup keyed on the exact artifact
+//!    `GetArtifactBackupLocation` readiness query keyed on the exact artifact
 //!    id. Job journals and timestamps are never consulted for pinned
 //!    rows — they are not evidence about these bytes.
 //!
@@ -47,7 +47,7 @@
 //!    Pre-artifact-tracking sandboxes have no pin, so the best identity
 //!    is the newest `snapshot_upload` job's `payload.snapshot_id`.
 //!    Evictable only when that **equals** the cluster's latest ready
-//!    snapshot (confirmed by `CheckSandboxBackup`) AND the sandbox's last
+//!    snapshot (confirmed by a readiness query) AND the sandbox's last
 //!    state transition is not later than that job's creation (plus
 //!    slack) — proving no later suspend exists whose backup enqueue
 //!    silently failed. UUIDv7 *ordering* is never eviction evidence:
@@ -977,88 +977,115 @@ async fn prove_pinned_artifact(
     pinned: &PinnedArtifact,
 ) -> Result<bool, SkipReason> {
     use pplx_space_node_api_client::proto::{
-        CheckSandboxBackupRequest, LocalArtifactBackupIdentity,
-        check_sandbox_backup_request::Artifact,
+        LocalArtifactBackupIdentity, backup_readiness_query::Artifact,
     };
-    let req = CheckSandboxBackupRequest {
-        sandbox_id: sandbox_id.to_string(),
-        artifact: Some(Artifact::LocalArtifact(LocalArtifactBackupIdentity {
-            local_artifact_id: pinned.artifact_id.to_string(),
-            artifact_kind: match pinned.artifact_kind {
-                pplx_space_common_core::types::ArtifactKind::Disk => {
-                    pplx_space_sbx_mgr_client::proto::ArtifactKind::Disk as i32
-                }
-                pplx_space_common_core::types::ArtifactKind::Full => {
-                    pplx_space_sbx_mgr_client::proto::ArtifactKind::Full as i32
-                }
-            },
-        })),
-    };
-    match cluster.check_sandbox_backup(req).await {
-        Ok(response) if response.get_ref().ready => {
-            let service = service.clone();
-            let artifact_id = pinned.artifact_id;
-            let stamp = tokio::task::spawn_blocking(move || {
-                let conn = service.db_conn().map_err(|error| error.to_string())?;
-                crate::db::mark_local_artifact_backup_completed(&conn, &artifact_id.to_string())
-                    .map_err(|error| error.to_string())
-            })
-            .await;
-            let stamp_error = match stamp {
-                Ok(Ok(())) => None,
-                Ok(Err(error)) => Some(error.to_string()),
-                Err(join_error) => Some(join_error.to_string()),
-            };
-            if let Some(error) = stamp_error {
-                warn!(
-                    sandbox_id,
-                    local_artifact_id = %pinned.artifact_id,
-                    error,
-                    "sandbox eviction: failed to stamp backup marker after exact-artifact proof; next tick re-proves via RPC",
-                );
+    let artifact = Artifact::LocalArtifact(LocalArtifactBackupIdentity {
+        local_artifact_id: pinned.artifact_id.to_string(),
+        artifact_kind: match pinned.artifact_kind {
+            pplx_space_common_core::types::ArtifactKind::Disk => {
+                pplx_space_sbx_mgr_client::proto::ArtifactKind::Disk as i32
             }
-            Ok(true)
-        }
-        Ok(_) => Ok(false),
-        Err(status) => {
-            warn!(
-                sandbox_id,
-                local_artifact_id = %pinned.artifact_id,
-                code = %status.code(),
-                message = %status.message(),
-                "sandbox eviction: CheckSandboxBackup failed",
-            );
-            Err(classify_rpc_failure(&status))
-        }
+            pplx_space_common_core::types::ArtifactKind::Full => {
+                pplx_space_sbx_mgr_client::proto::ArtifactKind::Full as i32
+            }
+        },
+    });
+    if !backup_ready(cluster, sandbox_id, artifact).await? {
+        return Ok(false);
     }
+    let service = service.clone();
+    let artifact_id = pinned.artifact_id;
+    let stamp = tokio::task::spawn_blocking(move || {
+        let conn = service.db_conn().map_err(|error| error.to_string())?;
+        crate::db::mark_local_artifact_backup_completed(&conn, &artifact_id.to_string())
+            .map_err(|error| error.to_string())
+    })
+    .await;
+    let stamp_error = match stamp {
+        Ok(Ok(())) => None,
+        Ok(Err(error)) => Some(error.to_string()),
+        Err(join_error) => Some(join_error.to_string()),
+    };
+    if let Some(error) = stamp_error {
+        warn!(
+            sandbox_id,
+            local_artifact_id = %pinned.artifact_id,
+            error,
+            "sandbox eviction: failed to stamp backup marker after exact-artifact proof; next tick re-proves via RPC",
+        );
+    }
+    Ok(true)
 }
 
-/// Only legacy caches need the latest suspend generation. Pinned caches use
-/// their own marker or exact-artifact proof and must not depend on a snapshot
-/// location read that becomes forbidden when the sandbox moves elsewhere.
-async fn legacy_ready_generation(
+/// The newest local upload generation of an unpinned cache, when the cluster
+/// confirms it is still the latest ready suspend attempt. Pinned caches use
+/// their own marker or exact-artifact proof and skip this query.
+async fn ready_unpinned_suspend_generation(
     cluster: &mut pplx_space_node_api_client::cluster::AuthenticatedClusterApiClient,
     sandbox_id: &str,
     evidence: &LocalEvidence,
-) -> Result<Option<SnapshotId>, tonic::Status> {
-    use pplx_space_node_api_client::proto::{
-        CheckSandboxBackupRequest, check_sandbox_backup_request::Artifact,
-    };
+) -> Result<Option<SnapshotId>, SkipReason> {
+    use pplx_space_node_api_client::proto::backup_readiness_query::Artifact;
     let LocalEvidence::Unpinned {
         latest_job: Some(job),
     } = evidence
     else {
         return Ok(None);
     };
-    let ready = cluster
-        .check_sandbox_backup(CheckSandboxBackupRequest {
-            sandbox_id: sandbox_id.to_string(),
-            artifact: Some(Artifact::SuspendSnapshotId(job.snapshot_id.to_string())),
-        })
-        .await?
-        .into_inner()
-        .ready;
+    let artifact = Artifact::LatestReadySuspendSnapshotId(job.snapshot_id.to_string());
+    let ready = backup_ready(cluster, sandbox_id, artifact).await?;
     Ok(ready.then_some(job.snapshot_id))
+}
+
+/// Ask the cluster whether an identity this node already holds is backed
+/// up, without reading any storage location. The identity rides only in the
+/// readiness query, so a server without readiness support rejects the empty
+/// top-level artifact id instead of answering with a location. Only a bare
+/// `ready` reply is evidence: an absent `ready` or any location payload is
+/// unusable, and like an RPC failure it retains the cache.
+async fn backup_ready(
+    cluster: &mut pplx_space_node_api_client::cluster::AuthenticatedClusterApiClient,
+    sandbox_id: &str,
+    artifact: pplx_space_node_api_client::proto::backup_readiness_query::Artifact,
+) -> Result<bool, SkipReason> {
+    use pplx_space_node_api_client::proto::{
+        BackupReadinessQuery, GetArtifactBackupLocationRequest, GetArtifactBackupLocationResponse,
+    };
+    let request = GetArtifactBackupLocationRequest {
+        sandbox_id: sandbox_id.to_string(),
+        readiness: Some(BackupReadinessQuery {
+            artifact: Some(artifact),
+        }),
+        ..Default::default()
+    };
+    match cluster.get_artifact_backup_location(request).await {
+        Ok(response) => {
+            let response = response.into_inner();
+            let bare = GetArtifactBackupLocationResponse {
+                ready: response.ready,
+                ..Default::default()
+            };
+            match response.ready {
+                Some(ready) if response == bare => Ok(ready),
+                _ => {
+                    warn!(
+                        sandbox_id,
+                        "sandbox eviction: backup readiness reply is not a bare acknowledgement",
+                    );
+                    Err(SkipReason::RpcError)
+                }
+            }
+        }
+        Err(status) => {
+            warn!(
+                sandbox_id,
+                code = %status.code(),
+                message = %status.message(),
+                "sandbox eviction: backup readiness query failed",
+            );
+            Err(classify_rpc_failure(&status))
+        }
+    }
 }
 
 fn classify_reupload_failure(
@@ -1384,16 +1411,9 @@ async fn evict_tick(
         }
 
         let cluster_latest =
-            match legacy_ready_generation(&mut cluster, &sandbox_id, &evidence).await {
+            match ready_unpinned_suspend_generation(&mut cluster, &sandbox_id, &evidence).await {
                 Ok(generation) => generation,
-                Err(status) => {
-                    warn!(
-                        sandbox_id = %sandbox_id,
-                        code = %status.code(),
-                        message = %status.message(),
-                        "sandbox eviction: CheckSandboxBackup failed",
-                    );
-                    let reason = classify_rpc_failure(&status);
+                Err(reason) => {
                     let flow = record_candidate_skip(
                         &mut report,
                         scan_state,

@@ -164,12 +164,11 @@ service ClusterApi {
   rpc BeginArtifactBackup(BeginArtifactBackupRequest) returns (BeginArtifactBackupResponse);
   rpc FinalizeArtifactBackup(FinalizeArtifactBackupRequest) returns (FinalizeArtifactBackupResponse);
   rpc TouchArtifactBackup(TouchArtifactBackupRequest) returns (TouchArtifactBackupResponse);
+  // Two request shapes. A location request reads where a ready backup lives,
+  // only for a node the sandbox is placed on. A readiness query lets any
+  // registered node, including a former host after relocation, ask whether
+  // an identity it already holds is backed up; the reply is only `ready`.
   rpc GetArtifactBackupLocation(GetArtifactBackupLocationRequest) returns (GetArtifactBackupLocationResponse);
-
-  // Eviction proof for bytes a registered node already holds, including
-  // after the sandbox moves elsewhere. Checks only the supplied identity;
-  // returns no storage credentials or discovered artifact identities.
-  rpc CheckSandboxBackup(CheckSandboxBackupRequest) returns (CheckSandboxBackupResponse);
 
   // Return a read-only, generation-fenced plan for automatic recovery of the
   // caller's currently assigned quarantine episode. The plan identity is the
@@ -1073,30 +1072,32 @@ message TouchArtifactBackupRequest {
 
 message TouchArtifactBackupResponse {}
 
-message CheckSandboxBackupRequest {
+message GetArtifactBackupLocationRequest {
+  // Select a ready remote copy only for this exact immutable local artifact.
   string sandbox_id = 1;
+  string local_artifact_id = 2;
+  space.sandbox.manager.v1.ArtifactKind artifact_kind = 3;
+  // Set for a readiness query, which leaves `local_artifact_id` empty and
+  // `artifact_kind` unspecified. A server without readiness support ignores
+  // this field and rejects the empty artifact id instead of returning a
+  // location.
+  BackupReadinessQuery readiness = 4;
+}
+
+message BackupReadinessQuery {
   oneof artifact {
-    LocalArtifactBackupIdentity local_artifact = 2;
-    // Legacy unpinned cache: true only if this is the latest ready suspend
-    // attempt, not merely an older attempt that still has a ready backup.
-    string suspend_snapshot_id = 3;
+    // Ready when these exact immutable bytes have a ready, non-orphaned
+    // backup.
+    LocalArtifactBackupIdentity local_artifact = 1;
+    // An unpinned cache's suspend attempt. Ready only while it is still the
+    // latest ready full suspend, not merely an older attempt with a backup.
+    string latest_ready_suspend_snapshot_id = 2;
   }
 }
 
 message LocalArtifactBackupIdentity {
   string local_artifact_id = 1;
   space.sandbox.manager.v1.ArtifactKind artifact_kind = 2;
-}
-
-message CheckSandboxBackupResponse {
-  bool ready = 1;
-}
-
-message GetArtifactBackupLocationRequest {
-  // Select a ready remote copy only for this exact immutable local artifact.
-  string sandbox_id = 1;
-  string local_artifact_id = 2;
-  space.sandbox.manager.v1.ArtifactKind artifact_kind = 3;
 }
 
 message GetArtifactBackupLocationResponse {
@@ -1107,6 +1108,8 @@ message GetArtifactBackupLocationResponse {
   int64 bytes_uploaded = 5;
   // Empty for attempts finalized before digests were recorded.
   repeated SnapshotArtifactDigest artifact_digests = 6;
+  // Set only in reply to a readiness query; every other field is then empty.
+  optional bool ready = 7;
 }
 
 message GetQuarantineRecoveryPlanRequest {

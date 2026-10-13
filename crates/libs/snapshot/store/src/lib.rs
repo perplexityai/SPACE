@@ -784,9 +784,10 @@ pub async fn artifact_backup_ready(
     .await?)
 }
 
-/// Legacy eviction proof: the supplied upload generation must still be the
-/// latest ready suspend attempt. Readiness of an older attempt alone cannot
-/// prove which generation an unpinned local cache contains.
+/// Whether `snapshot_id` is still the latest ready suspend attempt of
+/// `sandbox_id`, with a live storage location. This is the proof an unpinned
+/// local cache needs: a ready backup of an older attempt cannot show which
+/// generation that cache contains.
 pub async fn is_latest_ready_suspend(
     executor: impl sqlx::PgExecutor<'_>,
     sandbox_id: SandboxId,

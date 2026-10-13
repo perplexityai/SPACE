@@ -66,26 +66,25 @@ use crate::proto::FacetRef;
 use crate::proto::cluster_api_server::ClusterApi;
 use crate::proto::{
     BeginArtifactBackupRequest, BeginArtifactBackupResponse, BindDataPlaneSessionProcessRequest,
-    BindDataPlaneSessionProcessResponse, CheckSandboxBackupRequest, CheckSandboxBackupResponse,
-    ClaimNodeReconcileRefsRequest, ClaimNodeReconcileRefsResponse,
-    CompleteNodeReconcileRefsRequest, CompleteNodeReconcileRefsResponse,
-    CreateSystemTemplatePublicationGrantRequest, CreateSystemTemplatePublicationGrantResponse,
-    FinalizeArtifactBackupRequest, FinalizeArtifactBackupResponse,
-    FindTemplateReleaseByHashRequest, FindTemplateReleaseRequest, FindTemplateReleaseResponse,
-    GetArtifactBackupLocationRequest, GetArtifactBackupLocationResponse,
-    GetDataPlaneOrgRevocationEpochRequest, GetDataPlaneOrgRevocationEpochResponse,
-    GetDataPlaneSessionRevocationStateRequest, GetDataPlaneSessionRevocationStateResponse,
-    GetNodeNetworkPolicyStateRequest, GetNodeNetworkPolicyStateResponse,
-    GetNodeSandboxDesiredStateRequest, GetNodeSandboxDesiredStateResponse,
-    GetNodeTemplateBaseSnapshotPolicyStateRequest, GetNodeTemplateBaseSnapshotPolicyStateResponse,
-    GetNodeTemplateDesiredStateRequest, GetNodeTemplateDesiredStateResponse,
-    GetQuarantineRecoveryPlanRequest, GetQuarantineRecoveryPlanResponse,
-    GetSandboxRuntimeAccessRequest, GetSandboxRuntimeAccessResponse,
-    GetSandboxSnapshotStorageUriRequest, GetSandboxSnapshotStorageUriResponse,
-    GetSuspendSnapshotLocationRequest, GetSuspendSnapshotLocationResponse,
-    ListLatestTemplateReleasesEntry, ListLatestTemplateReleasesRequest,
-    ListLatestTemplateReleasesResponse, ListNodesRequest, ListNodesResponse,
-    ListWarmPoolTemplateReleasesRequest, ListWarmPoolTemplateReleasesResponse,
+    BindDataPlaneSessionProcessResponse, ClaimNodeReconcileRefsRequest,
+    ClaimNodeReconcileRefsResponse, CompleteNodeReconcileRefsRequest,
+    CompleteNodeReconcileRefsResponse, CreateSystemTemplatePublicationGrantRequest,
+    CreateSystemTemplatePublicationGrantResponse, FinalizeArtifactBackupRequest,
+    FinalizeArtifactBackupResponse, FindTemplateReleaseByHashRequest, FindTemplateReleaseRequest,
+    FindTemplateReleaseResponse, GetArtifactBackupLocationRequest,
+    GetArtifactBackupLocationResponse, GetDataPlaneOrgRevocationEpochRequest,
+    GetDataPlaneOrgRevocationEpochResponse, GetDataPlaneSessionRevocationStateRequest,
+    GetDataPlaneSessionRevocationStateResponse, GetNodeNetworkPolicyStateRequest,
+    GetNodeNetworkPolicyStateResponse, GetNodeSandboxDesiredStateRequest,
+    GetNodeSandboxDesiredStateResponse, GetNodeTemplateBaseSnapshotPolicyStateRequest,
+    GetNodeTemplateBaseSnapshotPolicyStateResponse, GetNodeTemplateDesiredStateRequest,
+    GetNodeTemplateDesiredStateResponse, GetQuarantineRecoveryPlanRequest,
+    GetQuarantineRecoveryPlanResponse, GetSandboxRuntimeAccessRequest,
+    GetSandboxRuntimeAccessResponse, GetSandboxSnapshotStorageUriRequest,
+    GetSandboxSnapshotStorageUriResponse, GetSuspendSnapshotLocationRequest,
+    GetSuspendSnapshotLocationResponse, ListLatestTemplateReleasesEntry,
+    ListLatestTemplateReleasesRequest, ListLatestTemplateReleasesResponse, ListNodesRequest,
+    ListNodesResponse, ListWarmPoolTemplateReleasesRequest, ListWarmPoolTemplateReleasesResponse,
     NetworkPolicyTargetRef, NodeCtlStatus, NodeRecord, NodeRole as ProtoNodeRole,
     NodeSchedulingStatus, PublishNodeStateRequest, PublishNodeStateResponse,
     PublishSandboxPortExposureStatesRequest, PublishSandboxPortExposureStatesResponse,
@@ -414,6 +413,77 @@ impl SnapshotSandboxRow {
                 .with_template(template_id, content_hash),
         )
     }
+}
+
+/// What a `GetArtifactBackupLocation` request asks. The two wire shapes are
+/// told apart before any lookup, so a readiness query cannot select a
+/// storage location.
+enum ArtifactBackupQuery {
+    /// Where the ready backup of this exact local artifact lives.
+    Location(LocalArtifactId, ArtifactKind),
+    Readiness(BackupReadiness),
+}
+
+/// An identity the calling node already holds, to prove backed up.
+enum BackupReadiness {
+    /// These exact immutable bytes have a ready, non-orphaned backup.
+    Artifact(LocalArtifactId, ArtifactKind),
+    /// An unpinned cache's suspend attempt is still the latest ready one.
+    LatestReadySuspend(SnapshotId),
+}
+
+fn parse_artifact_backup_query(
+    req: GetArtifactBackupLocationRequest,
+) -> Result<(SandboxId, ArtifactBackupQuery), Status> {
+    use crate::proto::backup_readiness_query::Artifact;
+    let sandbox_id = SandboxId::from_str(req.sandbox_id.trim())
+        .map_err(|e| Status::invalid_argument(format!("invalid sandbox_id: {e}")))?;
+    let parse_artifact = |local_artifact_id: &str, artifact_kind| {
+        let local_artifact_id = LocalArtifactId::from_str(local_artifact_id.trim())
+            .map_err(|e| Status::invalid_argument(format!("invalid local_artifact_id: {e}")))?;
+        let artifact_kind = artifact_kind_from_proto(artifact_kind)
+            .ok_or_else(|| Status::invalid_argument("artifact_kind must be DISK or FULL"))?;
+        Ok::<_, Status>((local_artifact_id, artifact_kind))
+    };
+    let Some(readiness) = req.readiness else {
+        let (local_artifact_id, artifact_kind) =
+            parse_artifact(&req.local_artifact_id, req.artifact_kind)?;
+        return Ok((
+            sandbox_id,
+            ArtifactBackupQuery::Location(local_artifact_id, artifact_kind),
+        ));
+    };
+    // A readiness query names its identity only inside `readiness`, which is
+    // what makes a server without readiness support reject it.
+    if !req.local_artifact_id.is_empty()
+        || req.artifact_kind != pplx_space_sbx_mgr_client::proto::ArtifactKind::Unspecified as i32
+    {
+        return Err(Status::invalid_argument(
+            "a readiness query must leave local_artifact_id and artifact_kind unset",
+        ));
+    }
+    let readiness = match readiness.artifact {
+        Some(Artifact::LocalArtifact(identity)) => {
+            let (local_artifact_id, artifact_kind) =
+                parse_artifact(&identity.local_artifact_id, identity.artifact_kind)?;
+            BackupReadiness::Artifact(local_artifact_id, artifact_kind)
+        }
+        Some(Artifact::LatestReadySuspendSnapshotId(snapshot_id)) => {
+            BackupReadiness::LatestReadySuspend(SnapshotId::from_str(snapshot_id.trim()).map_err(
+                |e| {
+                    Status::invalid_argument(format!(
+                        "invalid latest_ready_suspend_snapshot_id: {e}"
+                    ))
+                },
+            )?)
+        }
+        None => {
+            return Err(Status::invalid_argument(
+                "readiness artifact identity is required",
+            ));
+        }
+    };
+    Ok((sandbox_id, ArtifactBackupQuery::Readiness(readiness)))
 }
 
 /// Parse the digests a node reports at finalize: one entry per artifact.
@@ -930,13 +1000,17 @@ impl ClusterApiService {
         request: Request<GetArtifactBackupLocationRequest>,
     ) -> Result<Response<GetArtifactBackupLocationResponse>, Status> {
         let node_ids = self.caller_node_ids(&request).await?;
-        let req = request.into_inner();
-        let sandbox_id = SandboxId::from_str(req.sandbox_id.trim())
-            .map_err(|e| Status::invalid_argument(format!("invalid sandbox_id: {e}")))?;
-        let local_artifact_id = LocalArtifactId::from_str(req.local_artifact_id.trim())
-            .map_err(|e| Status::invalid_argument(format!("invalid local_artifact_id: {e}")))?;
-        let artifact_kind = artifact_kind_from_proto(req.artifact_kind)
-            .ok_or_else(|| Status::invalid_argument("artifact_kind must be DISK or FULL"))?;
+        let (sandbox_id, query) = parse_artifact_backup_query(request.into_inner())?;
+        let (local_artifact_id, artifact_kind) = match query {
+            ArtifactBackupQuery::Location(local_artifact_id, artifact_kind) => {
+                (local_artifact_id, artifact_kind)
+            }
+            ArtifactBackupQuery::Readiness(readiness) => {
+                return self
+                    .artifact_backup_readiness(sandbox_id, &node_ids, readiness)
+                    .await;
+            }
+        };
 
         let mut tx = self.begin_restore_lookup().await?;
 
@@ -965,44 +1039,42 @@ impl ClusterApiService {
             storage_uri: row.storage_connection_string,
             bytes_uploaded: row.size_bytes.unwrap_or(0),
             artifact_digests,
+            ready: None,
         }))
     }
 
-    pub(crate) async fn check_sandbox_backup(
+    /// Answer a readiness query with `ready` alone. Former hosts retain local
+    /// caches after placement moves, so any registered node may ask about an
+    /// identity it already holds; location reads stay placement-scoped, and
+    /// eviction needs no storage credentials.
+    async fn artifact_backup_readiness(
         &self,
-        request: Request<CheckSandboxBackupRequest>,
-    ) -> Result<Response<CheckSandboxBackupResponse>, Status> {
-        // Former hosts retain local caches after placement moves. Permit a
-        // registered node to check a known identity, but keep all location
-        // reads placement-scoped: eviction needs no storage credentials.
-        if self.caller_node_ids(&request).await?.is_empty() {
+        sandbox_id: SandboxId,
+        node_ids: &[NodeId],
+        readiness: BackupReadiness,
+    ) -> Result<Response<GetArtifactBackupLocationResponse>, Status> {
+        if node_ids.is_empty() {
             return Err(Status::permission_denied("caller is not a registered node"));
         }
-        let req = request.into_inner();
-        let sandbox_id = SandboxId::from_str(req.sandbox_id.trim())
-            .map_err(|e| Status::invalid_argument(format!("invalid sandbox_id: {e}")))?;
-        let ready = match req.artifact {
-            Some(crate::proto::check_sandbox_backup_request::Artifact::LocalArtifact(artifact)) => {
-                let artifact_id = LocalArtifactId::from_str(artifact.local_artifact_id.trim())
-                    .map_err(|e| {
-                        Status::invalid_argument(format!("invalid local_artifact_id: {e}"))
-                    })?;
-                let kind = artifact_kind_from_proto(artifact.artifact_kind).ok_or_else(|| {
-                    Status::invalid_argument("artifact_kind must be DISK or FULL")
-                })?;
-                snapshot_store::artifact_backup_ready(&self.pool, sandbox_id, artifact_id, kind)
-                    .await
+        let ready = match readiness {
+            BackupReadiness::Artifact(local_artifact_id, artifact_kind) => {
+                snapshot_store::artifact_backup_ready(
+                    &self.pool,
+                    sandbox_id,
+                    local_artifact_id,
+                    artifact_kind,
+                )
+                .await
             }
-            Some(crate::proto::check_sandbox_backup_request::Artifact::SuspendSnapshotId(id)) => {
-                let snapshot_id = SnapshotId::from_str(id.trim()).map_err(|e| {
-                    Status::invalid_argument(format!("invalid suspend_snapshot_id: {e}"))
-                })?;
+            BackupReadiness::LatestReadySuspend(snapshot_id) => {
                 snapshot_store::is_latest_ready_suspend(&self.pool, sandbox_id, snapshot_id).await
             }
-            None => return Err(Status::invalid_argument("artifact identity is required")),
         }
-        .map_err(|e| Status::internal(format!("check sandbox backup: {e}")))?;
-        Ok(Response::new(CheckSandboxBackupResponse { ready }))
+        .map_err(|e| Status::internal(format!("artifact backup readiness: {e}")))?;
+        Ok(Response::new(GetArtifactBackupLocationResponse {
+            ready: Some(ready),
+            ..Default::default()
+        }))
     }
 
     pub(crate) async fn get_quarantine_recovery_plan(

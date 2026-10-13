@@ -548,6 +548,7 @@ impl SandboxManagerService {
                     crate::proto::ArtifactKind::Full as i32
                 }
             },
+            readiness: None,
         };
 
         match client.get_artifact_backup_location(request).await {
