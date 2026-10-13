@@ -23,7 +23,7 @@
 # build that fails ends the bring-up with that resource's log instead of
 # consuming the timeout; a Tilt bound to a deleted cluster is restarted.
 #
-# Public entry points: `bootstrap_kind_stack`, plus
+# Public entry points: `bootstrap_kind_stack`, `kind_stack_prepare_cluster`, plus
 # `kind_stack_sweep_stale_node_tombstones`, `kind_stack_psql`, and
 # `kind_stack_ensure_redis` for suites that have to repeat a bring-up step in
 # their own setup or cleanup.
@@ -863,26 +863,16 @@ bootstrap_kind_stack__load_mirrored_chart_images() {
     fi
 }
 
-bootstrap_kind_stack__bring_up() {
-    # Always run the port-owner guard, even under SKIP_BOOTSTRAP — the
-    # whole point is that the smoke test is destructive against
-    # whatever cluster `$API_URL` points at.
+# Prepare the same cluster as the full bootstrap, without starting Tilt or
+# requiring Rust artifacts. CI can do this while its producer compiles.
+kind_stack_prepare_cluster() {
+    kind_stack_assert_smoke_prereqs
+    kind_stack_assert_cluster_mounts
     bootstrap_kind_stack__assert_port_owner
+    bootstrap_kind_stack__prepare_cluster
+}
 
-    if [[ "${SKIP_BOOTSTRAP:-0}" == "1" ]]; then
-        echo "[bootstrap] SKIP_BOOTSTRAP=1; assuming kind+tilt are already running"
-        return
-    fi
-
-    # curl is listed because this lib polls `/healthz` itself, not only because
-    # the bring-up commands need it.
-    for bin in curl kind kubectl tilt; do
-        if ! command -v "$bin" >/dev/null 2>&1; then
-            echo "ERROR: required bring-up command not found: $bin (or set SKIP_BOOTSTRAP=1)" >&2
-            exit 1
-        fi
-    done
-
+bootstrap_kind_stack__prepare_cluster() {
     # `kind create` reads static YAML, so the host paths it bind-mounts are
     # resolved and stamped in here the same way
     # `infra/space/kind/scripts/bootstrap.sh` does it — including staging the
@@ -967,6 +957,29 @@ bootstrap_kind_stack__bring_up() {
         bash "$REPO_ROOT/infra/space/kind/scripts/check-node-layout.sh" \
             "$KIND_CLUSTER" || exit 1
     fi
+}
+
+bootstrap_kind_stack__bring_up() {
+    # Always run the port-owner guard, even under SKIP_BOOTSTRAP — the
+    # whole point is that the smoke test is destructive against
+    # whatever cluster `$API_URL` points at.
+    bootstrap_kind_stack__assert_port_owner
+
+    if [[ "${SKIP_BOOTSTRAP:-0}" == "1" ]]; then
+        echo "[bootstrap] SKIP_BOOTSTRAP=1; assuming kind+tilt are already running"
+        return
+    fi
+
+    # curl is listed because this lib polls `/healthz` itself, not only because
+    # the bring-up commands need it.
+    for bin in curl kind kubectl tilt; do
+        if ! command -v "$bin" >/dev/null 2>&1; then
+            echo "ERROR: required bring-up command not found: $bin (or set SKIP_BOOTSTRAP=1)" >&2
+            exit 1
+        fi
+    done
+
+    bootstrap_kind_stack__prepare_cluster
 
     # The two-axis decision: api-server reachable? tilt running?
     #

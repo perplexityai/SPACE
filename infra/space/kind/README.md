@@ -109,6 +109,20 @@ isolated runners. Each runner boots its own Kind stack, proves the baseline,
 and runs its assigned typed scenarios serially. Cluster-wide fault injection
 must never run concurrently on a shared stack. Every shard must pass.
 
+The shards prepare their node image, vendor mounts, cluster, and chart-image
+preloads while the Rust producer compiles. Application startup remains behind
+the verified artifact handoff; preparation never starts Tilt or compiles Rust.
+The manifest identifies the repository, source commit, run, producer attempt,
+archive digest, and Docker image ID. Failed-jobs-only reruns may use the nearest
+successful producer from the same run, with the same source verification. A
+failed producer, expired artifact, or mismatched identity fails closed instead
+of compiling separately on each shard.
+
+Overlap needs runner capacity for the producer and four prepared shards. This
+does not add shard jobs or enlarge the cross-run cache, but runners start
+earlier. Verify both producer queue time and main CI completion time after a
+workflow change; shorter setup steps alone do not prove a faster critical path.
+
 `scripts/tests/smoke-kind-typed.sh all INDEX/COUNT` partitions the eligible ECW
 and native inventories independently, after the normal backend, template, and
 quarantine filters. `space_smoke/sharding.py` assigns longest scenarios first

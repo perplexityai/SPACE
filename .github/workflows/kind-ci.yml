@@ -4,8 +4,8 @@ on:
   workflow_call:
 
 # The caller owns permissions: kind-pull-ci.yml grants contents:read and
-# packages:read; main-ci.yml grants packages:write to this call. Never elevate
-# a PR token here.
+# packages:read and actions:read; main-ci.yml grants packages:write to this call.
+# Actions reads only inspect a producer in this run; never elevate a PR writer.
 
 # Cancel superseded PR validation, but keep every main commit's evidence.
 concurrency:
@@ -18,10 +18,6 @@ jobs:
     name: Build shared Kind Rust artifacts
     runs-on: ubuntu-24.04-16core
     timeout-minutes: 60
-    outputs:
-      image_id: ${{ steps.export.outputs.image_id }}
-      source_sha: ${{ steps.export.outputs.source_sha }}
-      artifact_name: ${{ steps.export.outputs.artifact_name }}
     steps:
       - name: Check out SPACE
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -69,19 +65,17 @@ jobs:
         run: bash infra/space/kind/scripts/build-rust-artifacts.sh
 
       - name: Export the exact-commit artifact image
-        id: export
         run: |
           set -euo pipefail
-          echo "source_sha=$(git rev-parse HEAD)" >>"${GITHUB_OUTPUT}"
-          echo "artifact_name=kind-rust-${GITHUB_SHA}-${GITHUB_RUN_ATTEMPT}" >>"${GITHUB_OUTPUT}"
-          echo "image_id=$(docker image inspect -f '{{.Id}}' space-rust-build-kind:local)" >>"${GITHUB_OUTPUT}"
-          docker image save space-rust-build-kind:local | gzip -1 >"${RUNNER_TEMP}/kind-rust.tar.gz"
+          install -d "${RUNNER_TEMP}/kind-rust"
+          docker image save space-rust-build-kind:local | gzip -1 >"${RUNNER_TEMP}/kind-rust/kind-rust.tar.gz"
+          python3 infra/space/kind/scripts/rust-artifact-handoff.py record "${RUNNER_TEMP}/kind-rust"
 
       - name: Upload the image for this run's isolated shards
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: ${{ steps.export.outputs.artifact_name }}
-          path: ${{ runner.temp }}/kind-rust.tar.gz
+          name: kind-rust-${{ github.sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/kind-rust/
           compression-level: 0
           if-no-files-found: error
           retention-days: 1
@@ -103,8 +97,8 @@ jobs:
   smoke:
     if: github.repository == 'perplexityai/SPACE'
     name: Kind / Firecracker smoke (${{ matrix.shard }}/4)
-    needs: rust_artifacts
     permissions:
+      actions: read
       contents: read
       packages: read
     strategy:
@@ -123,8 +117,6 @@ jobs:
       # rather than inherited so a default change cannot alter the shards
       # silently.
       SPACE_KIND_TELEMETRY_MODE: otel
-      SPACE_KIND_PREBUILT_RUST_IMAGE_ID: ${{ needs.rust_artifacts.outputs.image_id }}
-      SPACE_KIND_PREBUILT_RUST_SHA: ${{ needs.rust_artifacts.outputs.source_sha }}
     runs-on: ubuntu-24.04-16core
     timeout-minutes: 180
     steps:
@@ -200,12 +192,6 @@ jobs:
           source scripts/lib/space-smoke-prereqs.sh
           space_smoke_prepare_encrypted_targets
 
-      - name: Download this run's Rust artifact image
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: ${{ needs.rust_artifacts.outputs.artifact_name }}
-          path: ${{ runner.temp }}/kind-rust
-
       # The sandbox worker and builder nodes boot this image, which bakes in the
       # node layer (btrfs /space/cache, cgroup subtree, loop devices). Main CI
       # publishes each content-addressed tag; until then, or if the pull fails,
@@ -214,11 +200,25 @@ jobs:
       - name: Provide the SPACE Kind node image
         run: bash infra/space/kind/scripts/kind-node-image.sh ensure
 
+      # Stays on this shard's runner: no cluster or mutable test state crosses
+      # jobs. Rust-independent setup now overlaps the shared producer.
+      - name: Prepare Kind while the Rust producer builds
+        run: bash infra/space/kind/scripts/prepare-cluster.sh
+
+      - name: Wait for this attempt's Rust producer
+        timeout-minutes: 70
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 infra/space/kind/scripts/rust-artifact-handoff.py wait
+
+      - name: Download this attempt's Rust artifact image
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: kind-rust-${{ github.sha }}-${{ env.SPACE_KIND_RUST_PRODUCER_ATTEMPT }}
+          path: ${{ runner.temp }}/kind-rust
+
       - name: Load and verify the shared Rust artifact image
-        run: |
-          set -euo pipefail
-          gzip -dc "${RUNNER_TEMP}/kind-rust/kind-rust.tar.gz" | docker image load
-          bash infra/space/kind/scripts/build-rust-artifacts.sh
+        run: python3 infra/space/kind/scripts/rust-artifact-handoff.py load "${RUNNER_TEMP}/kind-rust"
 
       # DATA_PLANE_URL makes the bring-up wait for the public data plane as well as the API.
       # The data plane's ReplicaSet reaches ready a few minutes after the API on a cold
