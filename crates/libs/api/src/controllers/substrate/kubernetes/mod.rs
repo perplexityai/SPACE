@@ -48,6 +48,7 @@ mod budgets;
 mod caches;
 mod cancel_rate_tracker;
 mod pod_reflector;
+mod pod_worker_channels;
 mod restore_waiters;
 mod sandbox_pod_view;
 mod store;
@@ -353,6 +354,14 @@ impl PodIp {
     fn socket_addr(self, port: u16) -> SocketAddr {
         SocketAddr::new(self.0, port)
     }
+}
+
+/// A sandbox pod's address and the pod instance it belongs to.
+#[derive(Clone, Debug)]
+struct ResolvedPodInstance {
+    ip: PodIp,
+    pod_uid: Option<PodUid>,
+    generation: i64,
 }
 
 impl std::fmt::Display for PodIp {
@@ -814,6 +823,8 @@ pub struct KubernetesSubstrate {
     /// expand every replica's pool to its cap. Cross-pod arbitration stays
     /// with the DB lease; this only bounds contenders to one per pod.
     wake_coalescer: WakeCoalescer,
+    /// Node-api channels kept per sandbox pod instance for runtime RPCs.
+    pod_worker_channels: Arc<pod_worker_channels::PodWorkerChannels>,
     /// Resolves each pod build's node-group candidate set. Gated by
     /// `sandbox_pod_config.node_group_placement`
     /// (`SPACE_SANDBOX_NODE_GROUP_PLACEMENT`, default off), in which case it
@@ -862,6 +873,7 @@ impl KubernetesSubstrate {
                         shutdown_token.clone(),
                         task_tracker.clone(),
                     ),
+                    pod_worker_channels: Arc::default(),
                     wake_coalescer: Arc::new(
                         pplx_space_common_work_coalescer::WorkCoalescer::with_tracker(
                             task_tracker.clone(),

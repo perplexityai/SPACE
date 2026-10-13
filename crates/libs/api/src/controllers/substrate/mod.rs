@@ -86,6 +86,8 @@ type RuntimeTransport = GrpcClientTrace<InterceptedService<Channel, SpaceBearerI
 pub struct RuntimeClient {
     worker: WorkerApiClient<RuntimeTransport>,
     channel: Channel,
+    /// Set when `channel` is a cached channel that other callers share.
+    kept: Option<pplx_space_common_grpc::ConnectionWatch>,
 }
 
 impl RuntimeClient {
@@ -94,6 +96,26 @@ impl RuntimeClient {
         Self {
             worker: WorkerApiClient::new(transport),
             channel,
+            kept: None,
+        }
+    }
+
+    /// A client on a channel a cache keeps while `watch` is open.
+    #[cfg(feature = "kubernetes")]
+    fn kept(channel: Channel, watch: pplx_space_common_grpc::ConnectionWatch) -> Self {
+        Self {
+            kept: Some(watch),
+            ..Self::new(channel)
+        }
+    }
+
+    /// Stop handing this client's cached channel to later callers, so the
+    /// next one dials afresh. Call it when the peer showed that new calls
+    /// should reach a new connection, such as a draining node-api; this
+    /// client and its clones keep working. A no-op for an uncached channel.
+    pub(crate) fn retire_kept_connection(&self) {
+        if let Some(watch) = &self.kept {
+            watch.close();
         }
     }
 
@@ -3938,6 +3960,25 @@ pub async fn connect_worker(endpoint: Endpoint) -> Result<RuntimeClient, Control
             ControllerError::service_unavailable(format!("node-api not reachable: {err}"))
         })?;
     Ok(RuntimeClient::new(channel))
+}
+
+/// [`connect_worker`] for a channel a cache keeps: the same dial, plus the
+/// watch that closes once the connection it was dialed with ends.
+#[cfg(feature = "kubernetes")]
+async fn connect_worker_watched(
+    endpoint: Endpoint,
+) -> Result<(Channel, pplx_space_common_grpc::ConnectionWatch), ControllerError> {
+    node_api_connect_endpoint(endpoint)
+        .await?
+        .connect_with_retry_watched(
+            "worker-node-api",
+            "worker-node-api",
+            pplx_space_common_grpc::DEFAULT_TCP_GRPC_CONNECT_RETRY_POLICY,
+        )
+        .await
+        .map_err(|err| {
+            ControllerError::service_unavailable(format!("node-api not reachable: {err}"))
+        })
 }
 
 pub async fn connect_worker_internal(

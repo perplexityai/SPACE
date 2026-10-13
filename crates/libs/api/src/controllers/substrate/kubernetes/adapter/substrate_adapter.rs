@@ -1477,11 +1477,11 @@ impl SubstrateAdapter for KubernetesSubstrate {
             .require_sandbox(sandbox_id)
             .await
             .map_err(ControllerError::from)?;
-        if let Some(pod_ip) = self
-            .resolve_pod_ip(sandbox_id)
+        if let Some(pod) = self
+            .resolve_pod_instance(sandbox_id)
             .await
             .map_err(ControllerError::from)?
-            && let Ok(client) = self.worker_client_for_pod_ip(pod_ip).await
+            && let Ok(client) = self.kept_worker_client(&pod).await
         {
             return Ok(client);
         }
@@ -1533,15 +1533,15 @@ impl SubstrateAdapter for KubernetesSubstrate {
         &self,
         sandbox_id: SandboxId,
     ) -> Result<Option<RuntimeClient>, ControllerError> {
-        let Some(pod_ip) = self
-            .resolve_pod_ip(sandbox_id)
+        let Some(pod) = self
+            .resolve_pod_instance(sandbox_id)
             .await
             .map_err(ControllerError::from)?
         else {
             return Ok(None);
         };
 
-        match self.worker_client_for_pod_ip(pod_ip).await {
+        match self.kept_worker_client(&pod).await {
             Ok(client) => Ok(Some(client)),
             Err(_) => Ok(None),
         }
@@ -1587,11 +1587,12 @@ impl SubstrateAdapter for KubernetesSubstrate {
             return connect_worker(binding.binding.runtime_endpoint).await;
         }
 
-        if let Some(pod_ip) = self
-            .resolve_pod_ip(sandbox.id)
+        if let Some(pod) = self
+            .resolve_pod_instance(sandbox.id)
             .await
             .map_err(ControllerError::from)?
         {
+            let pod_ip = pod.ip;
             // A preserved slow create was reported `started` before its guest
             // command API was confirmed ready. Force a (bounded) command-ready
             // confirmation on first access so a data-plane op can't reach a
@@ -1640,7 +1641,7 @@ impl SubstrateAdapter for KubernetesSubstrate {
                     }
                 }
             }
-            if let Ok(client) = self.worker_client_for_pod_ip(pod_ip).await {
+            if let Ok(client) = self.kept_worker_client(&pod).await {
                 return Ok(client);
             }
         }

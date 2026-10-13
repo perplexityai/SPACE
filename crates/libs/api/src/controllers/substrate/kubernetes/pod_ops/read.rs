@@ -231,6 +231,18 @@ impl KubernetesSubstrate {
         &self,
         sandbox_id: SandboxId,
     ) -> Result<Option<PodIp>, SubstrateError> {
+        Ok(self
+            .resolve_pod_instance(sandbox_id)
+            .await?
+            .map(|pod| pod.ip))
+    }
+
+    /// [`Self::resolve_pod_ip`], with the identity of the pod the address
+    /// belongs to.
+    pub(in crate::controllers::substrate::kubernetes) async fn resolve_pod_instance(
+        &self,
+        sandbox_id: SandboxId,
+    ) -> Result<Option<ResolvedPodInstance>, SubstrateError> {
         let Some(row) = self.store.active_execution_status(sandbox_id).await? else {
             return Ok(None);
         };
@@ -450,6 +462,10 @@ impl KubernetesSubstrate {
             }
         }
 
-        Ok(pod_ip)
+        Ok(pod_ip.map(|ip| ResolvedPodInstance {
+            ip,
+            pod_uid: pod_uid.as_deref().and_then(|uid| PodUid::parse(uid).ok()),
+            generation: row.generation,
+        }))
     }
 }

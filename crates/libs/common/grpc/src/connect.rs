@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 
+use crate::connection_watch::{ConnectionWatch, WatchedTcpConnector};
 use crate::policy::GrpcRetryPolicy;
 use tracing::Instrument as _;
 
@@ -272,6 +273,53 @@ pub async fn connect_tcp_channel_with_retry(
         || {
             let endpoint = endpoint.clone();
             async move { endpoint.connect().await.map_err(TcpConnectError::from) }
+        },
+    )
+    .await
+}
+
+/// [`connect_tcp_channel_with_retry`] for a channel meant to be kept per peer
+/// instance: the same attempts, caps, retries, spans and metrics, and a
+/// [`ConnectionWatch`] that closes once the connection the channel was dialed
+/// with ends. A cache that hands the channel out only while the watch is open
+/// gives each caller either that live connection or a fresh dial whose
+/// failure it sees, as it would without the cache. The channel itself still
+/// redials after its connection drops, for callers already holding it.
+///
+/// Internal-RPC callers must connect through
+/// `internal_transport::ConnectEndpoint::connect_with_retry_watched`.
+pub async fn connect_tcp_channel_with_retry_watched(
+    service_name: &'static str,
+    target: impl AsRef<str>,
+    endpoint: tonic::transport::Endpoint,
+    tls_handshake_timeout: Option<std::time::Duration>,
+    retry_policy: GrpcRetryPolicy,
+) -> Result<(tonic::transport::Channel, ConnectionWatch), TcpConnectError> {
+    let dial_timeout = endpoint
+        .get_connect_timeout()
+        .unwrap_or(DEFAULT_TCP_DIAL_TIMEOUT);
+    // A custom connector's `connect_timeout` bounds the TCP dial and TLS
+    // together; the connector bounds the dial alone, as `Endpoint::connect`
+    // does, so this bound only has to leave the handshake its own share.
+    let endpoint =
+        endpoint.connect_timeout(dial_timeout + tls_handshake_timeout.unwrap_or_default());
+    let attempt_cap = tcp_attempt_cap(dial_timeout, tls_handshake_timeout);
+    retry_tcp_connect(
+        service_name,
+        target.as_ref(),
+        retry_policy,
+        attempt_cap,
+        || {
+            let endpoint = endpoint.clone();
+            async move {
+                let watch = ConnectionWatch::default();
+                let connector = WatchedTcpConnector::new(&endpoint, dial_timeout, watch.clone());
+                let channel = endpoint
+                    .connect_with_connector(connector)
+                    .await
+                    .map_err(TcpConnectError::from)?;
+                Ok::<_, TcpConnectError>((channel, watch))
+            }
         },
     )
     .await

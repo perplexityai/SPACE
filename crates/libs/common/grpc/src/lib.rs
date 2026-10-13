@@ -33,10 +33,12 @@ pub const BULK_HTTP2_MAX_FRAME_SIZE: u32 = 256 * 1024;
 mod active_requests;
 mod client;
 mod connect;
+mod connection_watch;
 mod context;
 mod deadline;
 mod forward;
 mod idempotency;
+pub use connection_watch::ConnectionWatch;
 mod policy;
 mod preface;
 pub use preface::PrefaceDeadline;
@@ -59,9 +61,10 @@ mod trace;
 pub use client::GrpcClient;
 pub use connect::{
     TcpConnectError, UdsConnectError, connect_tcp_channel_with_retry,
-    connect_tcp_channel_with_retrying_redials, connect_uds_channel, connect_uds_channel_lazy,
-    connect_uds_channel_with_endpoint, connect_uds_channel_with_endpoint_with_retry,
-    connect_uds_channel_with_retry, retrying_redial_bound,
+    connect_tcp_channel_with_retry_watched, connect_tcp_channel_with_retrying_redials,
+    connect_uds_channel, connect_uds_channel_lazy, connect_uds_channel_with_endpoint,
+    connect_uds_channel_with_endpoint_with_retry, connect_uds_channel_with_retry,
+    retrying_redial_bound,
 };
 pub use context::GrpcRetryContext;
 pub use idempotency::generated_idempotency_key;

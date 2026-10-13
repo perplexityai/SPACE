@@ -290,6 +290,24 @@ impl ConnectEndpoint {
         .await
     }
 
+    /// [`crate::connect_tcp_channel_with_retry_watched`] with this endpoint's
+    /// handshake bound.
+    pub async fn connect_with_retry_watched(
+        self,
+        service_name: &'static str,
+        target: impl AsRef<str>,
+        retry_policy: crate::GrpcRetryPolicy,
+    ) -> Result<(tonic::transport::Channel, crate::ConnectionWatch), crate::TcpConnectError> {
+        crate::connect_tcp_channel_with_retry_watched(
+            service_name,
+            target,
+            self.endpoint,
+            self.tls_handshake_timeout,
+            retry_policy,
+        )
+        .await
+    }
+
     /// [`crate::connect_tcp_channel_with_retrying_redials`] with this
     /// endpoint's handshake bound.
     pub async fn connect_with_retrying_redials(

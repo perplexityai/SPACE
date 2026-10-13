@@ -936,7 +936,12 @@ macro_rules! spaced_client_call {
                     )
                     .await?
                 }
-                Err(err) => return Err(err.into()),
+                Err(err) => {
+                    if let SpacedRuntimeCallError::Status(status) = &err {
+                        self.retire_after_transport_failure(status);
+                    }
+                    return Err(err.into());
+                }
             };
             Ok(response.into_inner())
         }
@@ -954,7 +959,10 @@ macro_rules! spaced_unbounded_stream_open_call {
                     let runtime_request = self.runtime_request(request)?;
                     self.client.$method(runtime_request).await?
                 }
-                Err(status) => return Err(status.into()),
+                Err(status) => {
+                    self.retire_after_transport_failure(&status);
+                    return Err(status.into());
+                }
             };
             Ok(response.into_inner())
         }
@@ -987,7 +995,12 @@ macro_rules! spaced_stream_open_call {
                     )
                     .await?
                 }
-                Err(err) => return Err(err.into()),
+                Err(err) => {
+                    if let SpacedRuntimeCallError::Status(status) = &err {
+                        self.retire_after_transport_failure(status);
+                    }
+                    return Err(err.into());
+                }
             };
             Ok(response.into_inner())
         }
@@ -1025,12 +1038,26 @@ impl SpacedSandboxClient {
         Ok(request)
     }
 
+    /// Stop sharing this request's cached channel after a failure that shows
+    /// later calls need a new connection. The connection usually closed
+    /// already, which retires it anyway; a draining node-api keeps it open.
+    fn retire_after_transport_failure(&self, status: &tonic::Status) {
+        if should_retry_node_api_stream_open(status) {
+            self.client.retire_kept_connection();
+        }
+    }
+
     async fn reconnect_node_api(&mut self) -> Result<(), ControllerError> {
         // A mid-stream reconnect normally re-attaches to the existing live pod
         // (free — the dormant-entrypoint charge no-ops for a live lifecycle, so
         // the original wake isn't double-counted). But if the reconnect finds
         // the pod gone and recreates it, that is a fresh activation, so enforce
         // recovery admission rather than exempting the whole path.
+        //
+        // Every reconnect follows a draining node-api or a closed transport,
+        // so a cached channel to the same pod must not be handed back: retire
+        // it and dial afresh, as a reconnect always has.
+        self.client.retire_kept_connection();
         self.client = connect_spaced_runtime_client(
             &self.substrate,
             self.cluster_admission.as_ref(),
@@ -1081,7 +1108,10 @@ impl SpacedSandboxClient {
                 let runtime_request = self.runtime_request(request)?;
                 self.client.spaced_write_batch(runtime_request).await?
             }
-            Err(status) => return Err(status.into()),
+            Err(status) => {
+                self.retire_after_transport_failure(&status);
+                return Err(status.into());
+            }
         };
         Ok(response.into_inner())
     }
@@ -1181,11 +1211,13 @@ impl SpacedSandboxClient {
         S: Stream<Item = SpacedWriteRequest> + Send + 'static,
     {
         let runtime_request = self.runtime_request(request)?;
-        Ok(self
-            .client
-            .spaced_write(runtime_request)
-            .await?
-            .into_inner())
+        match self.client.spaced_write(runtime_request).await {
+            Ok(response) => Ok(response.into_inner()),
+            Err(status) => {
+                self.retire_after_transport_failure(&status);
+                Err(status.into())
+            }
+        }
     }
     spaced_stream_open_call!(
         spaced_watch,
@@ -1205,7 +1237,10 @@ impl SpacedSandboxClient {
                 let runtime_request = self.runtime_request(request)?;
                 self.client.spaced_wait_ready(runtime_request).await?
             }
-            Err(status) => return Err(status.into()),
+            Err(status) => {
+                self.retire_after_transport_failure(&status);
+                return Err(status.into());
+            }
         };
         Ok(response.into_inner())
     }

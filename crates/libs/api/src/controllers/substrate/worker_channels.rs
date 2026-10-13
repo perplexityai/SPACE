@@ -7,9 +7,11 @@
 //! one per worker serves every caller, and it redials after its connection
 //! drops with the same retries as a first dial.
 //!
-//! Only direct workers are kept: a direct node's endpoint is stable. The
-//! Kubernetes substrate dials a sandbox's pod for each call, because that dial
-//! is also how it learns that the pod is gone and needs recovery.
+//! These channels are for direct workers, whose endpoint is stable. The
+//! Kubernetes substrate keeps its sandbox pods' channels differently, per pod
+//! instance and only while the dialed connection is open, because a failed
+//! dial is also how it learns that a pod is gone and needs recovery; see
+//! `kubernetes::pod_worker_channels`.
 //!
 //! Each worker has one entry, created by its first caller, holding one dial
 //! that every caller shares, success or failure: concurrent callers neither

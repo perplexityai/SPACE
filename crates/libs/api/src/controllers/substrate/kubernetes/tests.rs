@@ -231,6 +231,7 @@ mod kubernetes_tests {
                 shutdown_token.clone(),
                 task_tracker.clone(),
             ),
+            pod_worker_channels: Arc::default(),
             wake_coalescer: Arc::new(
                 pplx_space_common_work_coalescer::WorkCoalescer::with_tracker(task_tracker.clone()),
             ),
@@ -1927,6 +1928,7 @@ mod kubernetes_tests {
                 shutdown_token.clone(),
                 task_tracker.clone(),
             ),
+            pod_worker_channels: Arc::default(),
             wake_coalescer: Arc::new(
                 pplx_space_common_work_coalescer::WorkCoalescer::with_tracker(task_tracker.clone()),
             ),
@@ -8911,6 +8913,7 @@ mod kubernetes_tests {
                 shutdown_token.clone(),
                 task_tracker.clone(),
             ),
+            pod_worker_channels: Arc::default(),
             wake_coalescer: Arc::new(
                 pplx_space_common_work_coalescer::WorkCoalescer::with_tracker(task_tracker.clone()),
             ),

@@ -25,6 +25,29 @@ impl KubernetesSubstrate {
         connect_worker(endpoint).await
     }
 
+    /// [`Self::worker_client_for_pod_ip`] on the channel kept for `pod`'s
+    /// instance while its connection is open; see
+    /// [`super::pod_worker_channels`]. A failed dial fails the same way.
+    pub(super) async fn kept_worker_client(
+        &self,
+        pod: &ResolvedPodInstance,
+    ) -> Result<RuntimeClient, ControllerError> {
+        let port = self.k8s.sandbox_proxy_port;
+        let key = super::pod_worker_channels::PodWorkerKey {
+            addr: pod.ip.socket_addr(port),
+            pod_uid: pod.pod_uid.clone(),
+            generation: pod.generation,
+        };
+        let pod_ip = pod.ip;
+        self.pod_worker_channels
+            .client(key, async move {
+                let endpoint =
+                    Self::endpoint_for_pod_ip(pod_ip, port).map_err(ControllerError::from)?;
+                crate::controllers::substrate::connect_worker_watched(endpoint).await
+            })
+            .await
+    }
+
     pub(super) fn should_allow_access_recovery(
         sandbox: &Sandbox,
         activity: ExecutionActivityKind,

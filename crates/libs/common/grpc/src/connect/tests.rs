@@ -171,6 +171,95 @@ async fn a_kept_tcp_channel_waits_for_its_peer_to_come_back() {
     server.await.unwrap();
 }
 
+// A watched channel's watch stays open while its connection serves calls and
+// closes once the peer goes away, without any call having to fail first.
+#[tokio::test]
+async fn a_watched_channel_reports_when_its_peer_closes_the_connection() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (stop, server) = serve_tcp_health(listener).await;
+    let endpoint = tonic::transport::Endpoint::from_shared(format!("http://{address}"))
+        .unwrap()
+        .connect_timeout(Duration::from_secs(1));
+    let (channel, watch) = super::connect_tcp_channel_with_retry_watched(
+        "test-backend",
+        address.to_string(),
+        endpoint,
+        None,
+        crate::DEFAULT_TCP_GRPC_CONNECT_RETRY_POLICY,
+    )
+    .await
+    .expect("first dial");
+    let mut client = HealthClient::new(channel);
+    for _ in 0..3 {
+        client.check(health_request()).await.expect("served");
+    }
+    assert!(!watch.is_closed(), "calls reuse the open connection");
+
+    stop.send(()).unwrap();
+    server.await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !watch.is_closed() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the watch closes with the connection");
+}
+
+// A holder can retire a connection on its own evidence; every clone sees it.
+#[tokio::test]
+async fn closing_a_watch_is_seen_by_every_clone() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (stop, server) = serve_tcp_health(listener).await;
+    let endpoint = tonic::transport::Endpoint::from_shared(format!("http://{address}")).unwrap();
+    let (channel, watch) = super::connect_tcp_channel_with_retry_watched(
+        "test-backend",
+        address.to_string(),
+        endpoint,
+        None,
+        crate::DEFAULT_TCP_GRPC_CONNECT_RETRY_POLICY,
+    )
+    .await
+    .expect("first dial");
+    let kept = watch.clone();
+    watch.close();
+    assert!(kept.is_closed());
+    // Retiring it does not break the channel for a caller already holding it.
+    HealthClient::new(channel)
+        .check(health_request())
+        .await
+        .expect("still served");
+    stop.send(()).unwrap();
+    server.await.unwrap();
+}
+
+// A dial that cannot connect fails like the unwatched helper, so a caller
+// that keeps channels sees the same error it would without keeping them.
+#[tokio::test]
+async fn a_watched_dial_to_a_closed_port_fails() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    drop(listener);
+    let endpoint = tonic::transport::Endpoint::from_shared(format!("http://{address}"))
+        .unwrap()
+        .connect_timeout(Duration::from_millis(200));
+    let error = super::connect_tcp_channel_with_retry_watched(
+        "test-backend",
+        address.to_string(),
+        endpoint,
+        None,
+        stalled_tcp_policy(Duration::from_millis(500)),
+    )
+    .await
+    .expect_err("nothing listens");
+    assert!(
+        matches!(error, super::TcpConnectError::Transport(_)),
+        "{error:?}"
+    );
+}
+
 fn stalled_tcp_policy(budget: Duration) -> crate::GrpcRetryPolicy {
     crate::GrpcRetryPolicy {
         max_elapsed: budget,
@@ -449,5 +538,47 @@ async fn an_internal_rpc_connect_fails_at_its_transports_handshake_bound() {
     .await
     .expect("an unanswered TLS handshake must be bounded");
     assert_failed_at_handshake_bound(result, started.elapsed(), handshake_bound);
+    silent_peer.abort();
+}
+
+// A watched dial layers the endpoint's TLS on its own connector, and gives
+// the handshake the same bound as an unwatched dial: a peer that never answers
+// the ClientHello fails with the handshake bound's cause, not an earlier cut.
+#[cfg(feature = "internal-tls")]
+#[tokio::test]
+async fn a_watched_dial_applies_tls_and_its_handshake_bound() {
+    install_crypto_provider();
+    let (address, silent_peer) = silent_tls_peer().await;
+    let dir = tempfile::tempdir().unwrap();
+    let ca = std::fs::read(write_test_ca(dir.path())).unwrap();
+    let handshake_bound = Duration::from_secs(4);
+    let endpoint = tonic::transport::Endpoint::from_shared(format!("https://{address}"))
+        .unwrap()
+        .connect_timeout(Duration::from_millis(500))
+        .tls_config(
+            tonic::transport::ClientTlsConfig::new()
+                .ca_certificate(tonic::transport::Certificate::from_pem(ca))
+                .timeout(handshake_bound),
+        )
+        .unwrap();
+
+    let started = tokio::time::Instant::now();
+    let result = tokio::time::timeout(
+        Duration::from_secs(60),
+        super::connect_tcp_channel_with_retry_watched(
+            "silent-tls",
+            address.to_string(),
+            endpoint,
+            Some(handshake_bound),
+            crate::GrpcRetryPolicy::none(),
+        ),
+    )
+    .await
+    .expect("an unanswered TLS handshake must be bounded");
+    assert_failed_at_handshake_bound(
+        result.map(|(channel, _watch)| channel),
+        started.elapsed(),
+        handshake_bound,
+    );
     silent_peer.abort();
 }
