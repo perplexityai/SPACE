@@ -366,14 +366,14 @@ helm_apply space "$KIND_DIR/charts/space-redis-local"
 log "waiting for redis Deployment to be ready"
 kubectl --context "$KCTX" -n "$NAMESPACE" rollout status deploy/space-redis --timeout="${TIMEOUT}s"
 
-# api-server. The initContainer runs the control-plane migrator against the
-# now-ready postgres. The main container is gated on /readyz, which only
-# turns 200 after the K8s pod reflector's initial LIST completes (empty list
-# is fine at this stage — no node-api pods yet).
 # The sandbox namespace's NetworkPolicies, before the API can create the first
 # sandbox pod there.
 helm_apply space "$KIND_DIR/charts/space-sandbox-network-policy"
 
+# api-server. The initContainer runs the control-plane migrator against the
+# now-ready postgres. The main container is gated on /readyz, which only
+# turns 200 after the K8s pod reflector's initial LIST completes (empty list
+# is fine at this stage — no node-api pods yet).
 helm_apply space "$KIND_DIR/charts/space-api-local"
 log "waiting for space-api Deployment to be ready (initContainer runs migrations)"
 kubectl --context "$KCTX" -n "$NAMESPACE" rollout status deploy/space-api --timeout="${TIMEOUT}s"
