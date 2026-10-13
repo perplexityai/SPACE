@@ -128,6 +128,10 @@ pub struct AutoLifecycleCoordinator {
     /// the wake and is rejected as superseded. Bounded by sandboxes resident
     /// on this node; entries drop in [`Self::remove_sandbox`].
     last_wake_completed: Arc<dashmap::DashMap<String, std::time::Instant>>,
+    /// A test's two-phase rendezvous before auto-lifecycle Stop writes a
+    /// `suspended` row, so the test can move the row in between.
+    #[cfg(test)]
+    pub(crate) suspended_stop_barrier: Arc<std::sync::Mutex<Option<Arc<tokio::sync::Barrier>>>>,
 }
 
 impl AutoLifecycleCoordinator {

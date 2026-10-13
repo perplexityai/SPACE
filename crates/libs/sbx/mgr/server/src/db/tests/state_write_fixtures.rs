@@ -411,7 +411,7 @@ pub(super) const RUNTIME_EXECUTION_GENERATION: i64 = 7;
 pub(super) const RUNTIME_ACTIVATION_ATTEMPT: &str = "019a0000-0000-7000-8000-000000000001";
 pub(super) const RUNTIME_POD_UID: &str = "pod-uid-1";
 
-pub(super) fn seed_runtime(conn: &Connection, id: &str) {
+pub(crate) fn seed_runtime(conn: &Connection, id: &str) {
     conn.execute(
         "UPDATE sandboxes
             SET uid = 2001, slot = 1, guest_cid = 3, pid = 4242,

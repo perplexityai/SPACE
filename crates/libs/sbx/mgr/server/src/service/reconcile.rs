@@ -1,5 +1,5 @@
 use super::activation_support::auto_lifecycle_request;
-use super::cleanup_support::require_state_write;
+use super::cleanup_support::{StateWriteRejected, state_write_result};
 use super::grpc_lifecycle::SuspendRequestContext;
 use super::network_runtime::*;
 use super::*;
@@ -490,11 +490,10 @@ impl SandboxManagerService {
                         .await?;
                     }
                     SandboxState::Suspended => {
-                        let db = self.db_conn()?;
-                        require_state_write(
-                            crate::db::update_state(&db, &sandbox.id, SandboxState::Stopped),
-                            "reconcile suspended sandbox to stopped",
-                        )?;
+                        let stopped = self.stop_suspended_for_auto_lifecycle(&sandbox.id).await?;
+                        if !stopped {
+                            return Ok(());
+                        }
                     }
                     _ => {}
                 }
@@ -540,6 +539,49 @@ impl SandboxManagerService {
             .map_err(|e| Status::internal(format!("db auto_lifecycle_state update failed: {e}")))?;
         drop(wake_guard);
         Ok(())
+    }
+
+    /// Auto-lifecycle Stop of a `suspended` row writes the node-local SQLite
+    /// `sandboxes.state` directly: no VM runs, so no RPC is involved. It holds
+    /// only the wake lock, which Stop and Delete admission and eviction do not
+    /// take, so the row can leave `suspended` between the caller's re-read and
+    /// this write. The write then refuses and this returns `false`: the caller
+    /// skips the transition without recording it, and the next scan
+    /// re-evaluates the row in its new state.
+    async fn stop_suspended_for_auto_lifecycle(&self, sandbox_id: &str) -> Result<bool, Status> {
+        const CONTEXT: &str = "reconcile suspended sandbox to stopped";
+        let edge = &crate::db::edges::AUTO_LIFECYCLE_STOP_SUSPENDED;
+        #[cfg(test)]
+        {
+            let barrier = self
+                .auto_lifecycle
+                .suspended_stop_barrier
+                .lock()
+                .unwrap()
+                .clone();
+            if let Some(barrier) = barrier {
+                barrier.wait().await;
+                barrier.wait().await;
+            }
+        }
+        let outcome = crate::db::update_state_from(&*self.db_conn()?, sandbox_id, edge)
+            .map_err(|error| Status::internal(format!("{CONTEXT}: {error}")))?;
+        match state_write_result(outcome) {
+            Ok(_) => Ok(true),
+            Err(
+                StateWriteRejected::FromState { found } | StateWriteRejected::Guard { found, .. },
+            ) if !edge.from().contains(found) => {
+                tracing::info!(
+                    sandbox_id,
+                    state = %found,
+                    "skipping due auto-lifecycle Stop: the sandbox left suspended before its \
+                     state write; nothing recorded"
+                );
+                Ok(false)
+            }
+            // A guard refusal of a row still `suspended`, or a missing row.
+            Err(rejected) => Err(rejected.into_status(CONTEXT)),
+        }
     }
 
     /// Push a gated row's scan deadline out by

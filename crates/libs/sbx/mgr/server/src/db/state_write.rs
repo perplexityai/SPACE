@@ -299,8 +299,8 @@ edge_table! {
     /// `complete_row_intent_cleanup_for_job(MarkStopped)` and
     /// `publish_stopped_artifact`.
     STOP_COMPLETE: Completion, of(&[Stopping]) => Stopped;
-    /// `run_due_auto_lifecycle`'s idle Stop of a `suspended` row:
-    /// `update_state(Stopped)`, which bypasses every RPC.
+    /// `run_due_auto_lifecycle`'s idle Stop of a `suspended` row through
+    /// `stop_suspended_for_auto_lifecycle`, which bypasses every RPC.
     AUTO_LIFECYCLE_STOP_SUSPENDED: Request, of(&[Suspended]) => Stopped;
     /// Delete admission: `admit_lifecycle_cleanup_fenced` through
     /// `update_state_superseding_activation_in_transaction(Deleting)`, from
@@ -390,12 +390,12 @@ edge_table! {
 
     // Startup and inventory repair.
 
-    /// `recover_interrupted_create`: `update_state(Created)`.
+    /// `recover_interrupted_create`, through `require_startup_state_write`.
     INTERRUPTED_CREATE_RECOVERY: Recovery, of(&[Creating]) => Created;
-    /// `recover_unlaunched_start`: `update_state(Stopped)` when a rootfs
-    /// exists.
+    /// `recover_unlaunched_start`, through `require_startup_state_write`,
+    /// when a rootfs exists.
     UNLAUNCHED_START_RECOVERY_STOPPED: Recovery, of(&[Starting]) => Stopped;
-    /// `recover_unlaunched_start`: `update_state(Created)` otherwise.
+    /// `recover_unlaunched_start` otherwise.
     UNLAUNCHED_START_RECOVERY_CREATED: Recovery, of(&[Starting]) => Created;
     /// `recover_interrupted_pause_state` from startup pause recovery.
     INTERRUPTED_PAUSE_RECOVERY_STARTED: Recovery, of(&[Pausing]) => Started;
@@ -409,7 +409,7 @@ edge_table! {
     /// `rollback_suspending_to_paused` from startup suspend recovery when the
     /// VM is live without a usable artifact.
     STARTUP_SUSPEND_ROLLBACK: Recovery, of(&[Suspending]) => Paused;
-    /// `recover_interrupted_startup_states`' `update_state(Suspended)`, and
+    /// `recover_interrupted_startup_states`, and
     /// `publish_orphan_quarantine_recovered_artifact`.
     INTERRUPTED_RESTORE_RECOVERY: Recovery, of(&[Restoring]) => Suspended;
     /// Orphan materialization: `insert_sandbox` of a `cleanup_required` row,

@@ -11,6 +11,7 @@ use super::suspend_snapshot_publication::{
     self, SuspendSnapshotPublicationDecision, canonical_suspend_snapshot_dir,
 };
 use super::*;
+use crate::db::{edges, require_startup_state_write};
 use futures_util::{StreamExt, stream};
 use orphan_dispatch::AdmittedRecoveryKind;
 use pplx_space_common_core::types::{
@@ -188,8 +189,6 @@ pub enum StartupRecoveryError {
     Database(#[from] rusqlite::Error),
     #[error("failed to inspect interrupted suspend snapshot publication: {0}")]
     SuspendSnapshot(#[from] suspend_snapshot_publication::SuspendSnapshotPublicationError),
-    #[error(transparent)]
-    StateWrite(#[from] crate::db::SandboxStateWriteNotApplied),
     #[error("failed to quarantine sandbox during startup recovery: {0}")]
     MarkQuarantined(#[from] crate::db::MarkQuarantinedError),
     #[error("startup recovery found an invalid sandbox ID: {0}")]
@@ -1131,7 +1130,7 @@ impl SandboxManagerService {
 
         {
             let db = self.startup_recovery_db()?;
-            crate::db::update_state(&db, &row.id, SandboxState::Created)?.require_applied()?;
+            require_startup_state_write(&db, &row.id, &edges::INTERRUPTED_CREATE_RECOVERY)?;
         }
         Ok(crate::db::StartupRecoveryRecord {
             id: row.id,
@@ -1158,8 +1157,8 @@ impl SandboxManagerService {
                 outcome: crate::db::StartupRecoveryOutcome::Deferred,
             });
         }
-        let target_state = if sandbox_rootfs_exists_in(cache_dir, &row.id) {
-            SandboxState::Stopped
+        let edge = if sandbox_rootfs_exists_in(cache_dir, &row.id) {
+            &edges::UNLAUNCHED_START_RECOVERY_STOPPED
         } else {
             if let Err(error) = ensure_sandbox_cache_root_in(cache_dir, &row.id) {
                 tracing::warn!(
@@ -1173,17 +1172,17 @@ impl SandboxManagerService {
                     outcome: crate::db::StartupRecoveryOutcome::Deferred,
                 });
             }
-            SandboxState::Created
+            &edges::UNLAUNCHED_START_RECOVERY_CREATED
         };
 
         {
             let db = self.startup_recovery_db()?;
-            crate::db::update_state(&db, &row.id, target_state)?.require_applied()?;
+            require_startup_state_write(&db, &row.id, edge)?;
         }
         Ok(crate::db::StartupRecoveryRecord {
             id: row.id,
             previous_state: row.state,
-            outcome: crate::db::StartupRecoveryOutcome::State(target_state),
+            outcome: crate::db::StartupRecoveryOutcome::State(edge.to()),
         })
     }
 

@@ -309,8 +309,14 @@ pub fn recover_interrupted_startup_states(
                     },
                 });
             } else if row.state == SandboxState::Restoring {
-                let outcome = update_state(conn, &row.id, SandboxState::Suspended)?;
-                if !outcome.is_applied() {
+                let outcome =
+                    update_state_from(conn, &row.id, &edges::INTERRUPTED_RESTORE_RECOVERY)?;
+                if !matches!(outcome, StateWriteOutcome::Applied { .. }) {
+                    tracing::warn!(
+                        sandbox_id = %row.id,
+                        ?outcome,
+                        "startup recovery left an interrupted restore in place"
+                    );
                     continue;
                 }
                 recovered.push(StartupRecoveryRecord {
@@ -365,4 +371,31 @@ pub enum RecoverStartupStatesError {
     CleanupRequest(#[from] RequestCleanupEpisodeError),
     #[error("armed cleanup episode has unsupported activation state {0}")]
     UnsupportedActivationState(SandboxState),
+    #[error("startup recovery write {edge} was not applied: {outcome:?}")]
+    StateWriteNotApplied {
+        edge: &'static str,
+        outcome: StateWriteOutcome,
+    },
+}
+
+/// [`update_state_from`] for a startup recovery writer that requires its
+/// write. Startup recovery runs before sbx-manager binds its sockets and
+/// before it starts its background loops. Service construction already
+/// spawned the snapshot scheduler and watchdog workers, but they act only on
+/// sandboxes registered with them, and runtime-registration recovery
+/// registers sandboxes only after these writes. So nothing else can move the
+/// node-local SQLite `sandboxes.state` row after recovery read it: any outcome
+/// but `Applied` fails recovery.
+pub fn require_startup_state_write(
+    conn: &Connection,
+    id: &str,
+    edge: &'static Edge,
+) -> std::result::Result<(), RecoverStartupStatesError> {
+    match update_state_from(conn, id, edge)? {
+        StateWriteOutcome::Applied { .. } => Ok(()),
+        outcome => Err(RecoverStartupStatesError::StateWriteNotApplied {
+            edge: edge.name(),
+            outcome,
+        }),
+    }
 }

@@ -795,3 +795,161 @@ async fn network_policy_queue_survives_panics_and_retries_the_failed_sandbox() {
         .await
         .expect("a sandbox panic must not stop the queue");
 }
+
+const STOP_WRITE_WAIT: Duration = Duration::from_secs(30);
+
+/// Run one due auto-lifecycle Stop of the `suspended` row `id`, applying
+/// `move_row` between its re-read of the row and its node-local SQLite
+/// `sandboxes.state` write. Returns the run's result and the database as
+/// `move_row` left it.
+async fn stop_suspended_with_concurrent_write(
+    service: &SandboxManagerService,
+    id: &str,
+    move_row: impl FnOnce(&rusqlite::Connection),
+) -> (
+    Result<(), Status>,
+    crate::db::tests::state_write_fixtures::Snapshot,
+) {
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+    *service
+        .auto_lifecycle
+        .suspended_stop_barrier
+        .lock()
+        .unwrap() = Some(Arc::clone(&barrier));
+    let run = tokio::spawn({
+        let service = service.clone();
+        let id = id.to_owned();
+        async move { service.run_due_auto_lifecycle(&id).await }
+    });
+    tokio::time::timeout(STOP_WRITE_WAIT, barrier.wait())
+        .await
+        .expect("auto-lifecycle Stop reaches its state write");
+    let before = {
+        let db = service.db.lock().unwrap();
+        move_row(&db);
+        crate::db::tests::state_write_fixtures::snapshot(&db)
+    };
+    tokio::time::timeout(STOP_WRITE_WAIT, barrier.wait())
+        .await
+        .expect("auto-lifecycle Stop resumes");
+    let result = tokio::time::timeout(STOP_WRITE_WAIT, run)
+        .await
+        .expect("auto-lifecycle Stop finishes")
+        .expect("auto-lifecycle Stop does not panic");
+    (result, before)
+}
+
+fn isolated_service(scratch: &std::path::Path) -> SandboxManagerService {
+    SandboxManagerService::new_with_options(
+        crate::db::test_conn(),
+        SandboxManagerServiceOptions::for_test_in(scratch),
+    )
+}
+
+/// Auto-lifecycle Stop of a `suspended` row holds only the wake lock, which
+/// Stop and Delete admission and eviction do not take, so the row can change
+/// between the Stop's re-read and its write. The write applies only over a
+/// row still `suspended`; a row in any other state keeps it, and the due
+/// transition is neither recorded nor reported as an error.
+#[tokio::test]
+async fn auto_lifecycle_stop_writes_only_over_a_still_suspended_row() {
+    for moved_to in SandboxState::all() {
+        // Wildcard-free, so a new lifecycle state does not compile until it
+        // is placed.
+        let stops = match moved_to {
+            SandboxState::Suspended => true,
+            SandboxState::Creating
+            | SandboxState::Created
+            | SandboxState::Starting
+            | SandboxState::Started
+            | SandboxState::Stopping
+            | SandboxState::Stopped
+            | SandboxState::Deleting
+            | SandboxState::Pausing
+            | SandboxState::Paused
+            | SandboxState::Resuming
+            | SandboxState::Checkpointing
+            | SandboxState::Suspending
+            | SandboxState::Restoring
+            | SandboxState::CleanupRequired
+            | SandboxState::CleanupFailed
+            | SandboxState::Quarantined
+            | SandboxState::Failed => false,
+        };
+        let case = format!("moved to {moved_to}");
+        let scratch = tempfile::tempdir().unwrap();
+        let service = isolated_service(scratch.path());
+        let id = SandboxId::new().to_string();
+        insert_due_suspended_sandbox(&service, &id, 10);
+
+        let (result, before) = stop_suspended_with_concurrent_write(&service, &id, |db| {
+            crate::db::tests::state_write_fixtures::force_state(db, &id, moved_to);
+        })
+        .await;
+
+        assert!(result.is_ok(), "{case}: {result:?}");
+        let db = service.db.lock().unwrap();
+        if stops {
+            let row = crate::db::get_sandbox(&db, &id).unwrap().unwrap();
+            assert_eq!(row.state, SandboxState::Stopped, "{case}");
+            assert_eq!(
+                row.auto_lifecycle_state.next_auto_event_at, None,
+                "{case}: the Stop stage is recorded as fired"
+            );
+        } else {
+            crate::db::tests::state_write_fixtures::assert_unchanged(&case, &before, &db);
+        }
+    }
+}
+
+/// Stop admits a `suspended` row only while its runtime is live: in the
+/// window between Stop's runtime gate and its cleanup fence, or with a leaked
+/// runtime. A Stop admitted between auto-lifecycle Stop's re-read and its
+/// write keeps its `stopping` row, so the Stop's own completion settles
+/// `stopped` and clears the runtime it stopped.
+#[tokio::test]
+async fn stop_admitted_during_auto_lifecycle_stop_keeps_its_completion() {
+    let scratch = tempfile::tempdir().unwrap();
+    let service = isolated_service(scratch.path());
+    let id = SandboxId::new().to_string();
+    insert_due_suspended_sandbox(&service, &id, 10);
+    crate::db::tests::state_write_fixtures::seed_runtime(&service.db.lock().unwrap(), &id);
+
+    let (result, before) = stop_suspended_with_concurrent_write(&service, &id, |db| {
+        // Stop admission's state write. A blocking Stop persists no intent.
+        let admission = crate::db::immediate_transaction(db).unwrap();
+        crate::db::update_state_superseding_activation_in_transaction(
+            &admission,
+            &id,
+            SandboxState::Stopping,
+        )
+        .unwrap();
+        admission.commit().unwrap();
+    })
+    .await;
+
+    assert!(result.is_ok(), "{result:?}");
+    let db = service.db.lock().unwrap();
+    crate::db::tests::state_write_fixtures::assert_unchanged(
+        "auto-lifecycle Stop after Stop admission",
+        &before,
+        &db,
+    );
+    // Without a job id the completion reports `Applied` even for a row it
+    // does not own, so the row itself is the evidence.
+    crate::db::complete_row_intent_cleanup_for_job(
+        &db,
+        &id,
+        crate::db::CleanupCompletion::MarkStopped,
+        None,
+        None,
+        None,
+    )
+    .unwrap();
+    let row = crate::db::get_sandbox(&db, &id).unwrap().unwrap();
+    assert_eq!(row.state, SandboxState::Stopped);
+    assert_eq!(
+        row.pid, None,
+        "the Stop's completion clears the runtime it stopped"
+    );
+}
