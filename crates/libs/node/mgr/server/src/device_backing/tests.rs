@@ -216,8 +216,21 @@ async fn pinned_devices_survive_replacement_and_encrypted_reopen() {
                 b"encrypted snapshot"
             );
         }
+        // On reopen, a holder outside the unmount keeps the lazily detached
+        // filesystem alive past `cryptsetup close`'s own remove retries; the
+        // seal must wait for it rather than fail.
+        let holder = (!fresh).then(|| {
+            let held = File::open(mount.join("memory")).unwrap();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_secs(7));
+                drop(held);
+            })
+        });
         encrypted_volume::release(&sandbox_id, "test", &mount)
             .await
             .unwrap();
+        if let Some(holder) = holder {
+            holder.join().unwrap();
+        }
     }
 }

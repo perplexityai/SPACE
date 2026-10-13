@@ -208,3 +208,36 @@ fn mount_identity_judges_the_visible_topmost_mount() {
         "the last mountinfo entry is the visible stacked mount"
     );
 }
+
+#[tokio::test(start_paused = true)]
+async fn release_waits_for_the_detached_filesystem_within_a_bound() {
+    use std::{cell::Cell, time::Duration};
+    let poll = Duration::from_millis(100);
+    let budget = Duration::from_secs(10);
+    // (probe answers, then repeated forever; observed idle; virtual time spent)
+    let cases: [(&[u64], u64, bool, Duration); 3] = [
+        (&[], 0, true, Duration::ZERO),
+        (&[1, 1, 1], 0, true, 3 * poll),
+        (&[], 1, false, budget),
+    ];
+    for (answers, then, idle, spent) in cases {
+        let calls = Cell::new(0);
+        let started = tokio::time::Instant::now();
+        let observed = wait_until_unopened(
+            "sbxvol-test",
+            || {
+                let call = calls.replace(calls.get() + 1);
+                let open = answers.get(call).copied().unwrap_or(then);
+                async move { Ok::<_, DmCryptError>(open) }
+            },
+            budget,
+            poll,
+        )
+        .await;
+        assert_eq!(
+            (observed, started.elapsed()),
+            (idle, spent),
+            "{answers:?} then {then}"
+        );
+    }
+}

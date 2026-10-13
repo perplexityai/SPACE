@@ -64,6 +64,16 @@ const MIN_VOLUME_BYTES: u64 = 256 * 1024 * 1024;
 /// metadata. Sparse, so generous costs nothing until written.
 const VOLUME_HEADROOM_BYTES: u64 = 64 * 1024 * 1024;
 
+/// How long [`release`] waits, after the lazy unmount, for the kernel to drop
+/// the detached btrfs's hold on the mapping before closing it. That hold is
+/// usually gone within milliseconds, but a transient reference outside
+/// node-manager can keep it for several seconds, past `cryptsetup close`'s own
+/// remove retries. Bounded so a holder that never lets go still reaches the
+/// close and its existing failure path instead of pinning the sandbox's device
+/// lock and a lifecycle permit.
+const MAPPER_IDLE_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+const MAPPER_IDLE_POLL: std::time::Duration = std::time::Duration::from_millis(100);
+
 /// A mounted encrypted volume. `mount_dir` is where the caller reads/writes the
 /// (transparently compressed + encrypted) files.
 #[derive(Debug, Clone)]
@@ -323,6 +333,55 @@ async fn unmount_mapper_mounts(mapper: &str) -> Result<(), DmCryptError> {
         ReleaseDevice::DetachMount(&point).run().await?;
     }
     Ok(())
+}
+
+/// The mapping's device-mapper open count.
+async fn mapper_open_count(mapper: &str) -> Result<u64, DmCryptError> {
+    let out = run(
+        "dmsetup",
+        &["info", "-c", "--noheadings", "-o", "open", mapper],
+    )
+    .await?;
+    let out = String::from_utf8_lossy(&out);
+    out.trim().parse().map_err(|_| DmCryptError::Command {
+        cmd: format!("dmsetup info -c --noheadings -o open {mapper}"),
+        stderr: format!("unparseable open count: {:?}", out.trim()),
+    })
+}
+
+/// Poll `open_count` until it reports zero, `budget` elapses, or the probe
+/// fails. Returns whether the device was observed idle. Never an error: the
+/// close that follows reports the device's real state either way.
+async fn wait_until_unopened<F, Fut>(
+    mapper: &str,
+    mut open_count: F,
+    budget: std::time::Duration,
+    poll: std::time::Duration,
+) -> bool
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<u64, DmCryptError>>,
+{
+    let started = tokio::time::Instant::now();
+    loop {
+        match open_count().await {
+            Ok(0) => return true,
+            Ok(open) if started.elapsed() >= budget => {
+                tracing::warn!(
+                    mapper,
+                    open,
+                    ?budget,
+                    "encrypted-volume mapping still open after unmount"
+                );
+                return false;
+            }
+            Ok(_) => tokio::time::sleep(poll).await,
+            Err(error) => {
+                tracing::warn!(mapper, %error, "encrypted-volume open-count probe failed");
+                return false;
+            }
+        }
+    }
 }
 
 /// Positively confirm `dir` is no longer a mountpoint (absent from mountinfo).
@@ -674,6 +733,16 @@ pub async fn release(
         // Already closed.
         MapperIdentity::Absent => {}
         MapperIdentity::Present(_) => {
+            // `umount -l` returns once the mounts are detached, not once the
+            // filesystem is gone; closing while it still holds the mapping
+            // fails a seal whose data `sync -f` already made durable.
+            wait_until_unopened(
+                &mapper,
+                || mapper_open_count(&mapper),
+                MAPPER_IDLE_BUDGET,
+                MAPPER_IDLE_POLL,
+            )
+            .await;
             if let Err(error) = ReleaseDevice::Crypt(&mapper).run().await {
                 // An open fd (a cancelled capture's Firecracker) can hold the
                 // device. Free the NAME so the next prepare isn't wedged, but
