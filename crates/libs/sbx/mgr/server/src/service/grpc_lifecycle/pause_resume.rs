@@ -53,6 +53,10 @@ async fn reconcile_state_after_unconfirmed_pause(
     outcome
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each argument is an independent pause input; the node-manager client and connector are injected"
+)]
 pub(super) async fn pause_with_reconciliation(
     node_client: &mut NodeManagerGrpcClient,
     execution_fence: Option<pplx_space_node_mgr_client::proto::ExecutionFence>,
