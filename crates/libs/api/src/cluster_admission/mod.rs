@@ -31,7 +31,7 @@ use crate::controllers::substrate::{
 
 mod redis_bucket;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 use redis_bucket::{ConsumeOutcome, RedisTokenBucket};
 

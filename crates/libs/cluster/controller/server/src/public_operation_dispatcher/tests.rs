@@ -687,6 +687,8 @@ async fn native_executor_requeues_create_when_cluster_admission_rejects() -> Tes
         attempts: 1,
         claim_generation: 1,
     };
+    // Direct is only a placeholder: admission sees zero eligible nodes, as it would
+    // from a synced, empty Kubernetes node cache, and rejects before any create.
     let substrate = Substrate::Direct(Box::new(
         pplx_space_api::controllers::substrate::direct::DirectSubstrate::new(db.pool.clone()),
     ));
@@ -790,6 +792,7 @@ async fn native_executor_persists_exemptions_on_policy_update_and_template_reset
         .bind(org_id)
         .execute(&db.pool)
         .await?;
+        // Direct is only a placeholder here: this test never reaches the substrate.
         let substrate = Substrate::Direct(Box::new(
             pplx_space_api::controllers::substrate::direct::DirectSubstrate::new(db.pool.clone()),
         ));

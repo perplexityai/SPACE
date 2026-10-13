@@ -314,6 +314,7 @@ async fn wake_refuses_teardown_and_terminal_lifecycles_before_admission() -> Tes
 async fn non_lifecycle_actions_are_bad_requests_and_write_nothing() -> TestResult {
     let db = pg_test_db_with_max_connections(2).await?;
     let pool = &db.pool;
+    // Direct is only a placeholder here: this test never reaches the substrate.
     let controller = direct_controller(pool);
     let internal_labels = [
         SandboxAction::Access,
@@ -366,6 +367,7 @@ async fn non_lifecycle_actions_are_bad_requests_and_write_nothing() -> TestResul
 async fn drain_gated_actions_conflict_and_leave_the_row() -> TestResult {
     let db = pg_test_db_with_max_connections(3).await?;
     let pool = &db.pool;
+    // Direct is only a placeholder here: this test never reaches the substrate.
     let controller = direct_controller(pool);
     let node_id = NodeId::new();
     sqlx::query(sql!(
@@ -933,6 +935,8 @@ async fn stop_and_kill_on_a_draining_node_still_reach_the_worker() -> TestResult
 async fn untracked_start_and_restore_validate_then_charge_admission() -> TestResult {
     let db = pg_test_db_with_max_connections(3).await?;
     let pool = &db.pool;
+    // Direct is only a placeholder capacity source: it reports zero eligible nodes,
+    // as a synced, empty Kubernetes node cache would.
     let controller = controller_with_empty_cluster_admission(pool);
 
     for action in [SandboxAction::Start, SandboxAction::Restore] {
@@ -1070,6 +1074,7 @@ async fn insert_observed_state(
 async fn observed_only_delete_without_an_observation_is_not_found() -> TestResult {
     let db = pg_test_db_with_max_connections(2).await?;
     let pool = &db.pool;
+    // Direct is only a placeholder here: this test never reaches the substrate.
     let controller = direct_controller(pool);
 
     let error = controller

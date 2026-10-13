@@ -210,6 +210,8 @@ async fn rejected_activation_emits_no_orphaned_requested_event() -> TestResult {
         .await?
         .expect("sandbox row exists");
 
+    // Direct is only a placeholder capacity source: it reports zero eligible nodes,
+    // as a synced, empty Kubernetes node cache would.
     let make_substrate = || {
         crate::controllers::substrate::Substrate::Direct(Box::new(
             crate::controllers::substrate::direct::DirectSubstrate::new(db.pool.clone()),
@@ -535,6 +537,8 @@ async fn invalid_activation_options_reject_before_admission_and_requested_event(
 
     // Admission that would reject (empty cluster) — the invalid request must
     // still fail with a 400 before this ever runs.
+    // Direct is only a placeholder capacity source: it reports zero eligible nodes,
+    // as a synced, empty Kubernetes node cache would.
     let make_substrate = || {
         crate::controllers::substrate::Substrate::Direct(Box::new(
             crate::controllers::substrate::direct::DirectSubstrate::new(db.pool.clone()),

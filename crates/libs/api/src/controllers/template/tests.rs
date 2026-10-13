@@ -386,6 +386,7 @@ async fn template_controller_fixture() -> TestDbResult<TemplateControllerFixture
     .execute(&db.pool)
     .await?;
     let store = TemplateBuildJobsStore::new(db.pool.clone());
+    // Direct is only a placeholder: the tests using this fixture never reach the substrate.
     let substrate = Substrate::Direct(Box::new(
         crate::controllers::substrate::direct::DirectSubstrate::new(db.pool.clone()),
     ));

@@ -4218,4 +4218,6 @@ fn ensure_direct_create_supported(fork_disk_restore: bool) -> Result<(), Substra
 }
 
 #[cfg(test)]
+mod cluster_admission_tests;
+#[cfg(test)]
 mod tests;

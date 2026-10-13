@@ -240,6 +240,7 @@ async fn reconnect_node_api_is_blocked_by_access_drain_gate() -> TestResult {
     let db = pg_test_db().await?;
     let node_api = start_fake_reconnect_node_api().await?;
     let sandbox = insert_direct_sandbox_on_node(&db.pool, node_api.addr, Some("draining")).await?;
+    // Direct is only a placeholder here: this test never reaches the substrate.
     let substrate = Substrate::Direct(Box::new(
         crate::controllers::substrate::direct::DirectSubstrate::new(db.pool.clone()),
     ));

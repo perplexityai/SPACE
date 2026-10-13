@@ -57,6 +57,9 @@ fn claimed_create_operation_for(
     }
 }
 
+// Direct is only a placeholder for the existing-row tests, which never reach the
+// substrate. The admitted re-execution test's `sandbox_k8s_executions` check can
+// only fail on Kubernetes.
 fn direct_sandbox_controller(pool: &PgPool) -> SandboxController {
     SandboxController::new(crate::controllers::substrate::Substrate::Direct(Box::new(
         crate::controllers::substrate::direct::DirectSubstrate::new(pool.clone()),

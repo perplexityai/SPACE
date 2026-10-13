@@ -5932,6 +5932,8 @@ mod kubernetes_tests {
     /// bucket needed.
     fn rejecting_admission(pool: &PgPool) -> crate::cluster_admission::ClusterSandboxAdmission {
         crate::cluster_admission::ClusterSandboxAdmission::with_config(
+            // Direct is only a placeholder capacity source: it reports zero eligible nodes,
+            // as a synced, empty Kubernetes node cache would.
             crate::controllers::substrate::Substrate::Direct(Box::new(
                 crate::controllers::substrate::direct::DirectSubstrate::new(pool.clone()),
             )),
@@ -9403,6 +9405,8 @@ mod kubernetes_tests {
         );
         let admission = std::sync::Arc::new(
             crate::cluster_admission::ClusterSandboxAdmission::with_config(
+                // Direct is only a placeholder capacity source: it reports zero eligible nodes,
+                // as a synced, empty Kubernetes node cache would.
                 Substrate::Direct(Box::new(
                     crate::controllers::substrate::direct::DirectSubstrate::new(pool),
                 )),
@@ -9465,6 +9469,8 @@ mod kubernetes_tests {
         );
         let admission = std::sync::Arc::new(
             crate::cluster_admission::ClusterSandboxAdmission::with_config(
+                // Direct is only a placeholder capacity source: it reports zero eligible nodes,
+                // as a synced, empty Kubernetes node cache would.
                 Substrate::Direct(Box::new(
                     crate::controllers::substrate::direct::DirectSubstrate::new(pool.clone()),
                 )),
@@ -9607,6 +9613,8 @@ mod kubernetes_tests {
         )));
         let admission = std::sync::Arc::new(
             crate::cluster_admission::ClusterSandboxAdmission::with_config(
+                // Direct is only a placeholder capacity source: it reports zero eligible nodes,
+                // as a synced, empty Kubernetes node cache would.
                 Substrate::Direct(Box::new(
                     crate::controllers::substrate::direct::DirectSubstrate::new(pool.clone()),
                 )),
@@ -9668,6 +9676,8 @@ mod kubernetes_tests {
             mock_kubernetes_client(Arc::clone(&captured_pod_creates)),
         )));
         let admission = crate::cluster_admission::ClusterSandboxAdmission::with_config(
+            // Direct is only a placeholder capacity source: it reports zero eligible nodes,
+            // as a synced, empty Kubernetes node cache would.
             Substrate::Direct(Box::new(
                 crate::controllers::substrate::direct::DirectSubstrate::new(pool.clone()),
             )),

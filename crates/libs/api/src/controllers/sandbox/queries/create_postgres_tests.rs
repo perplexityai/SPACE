@@ -494,6 +494,7 @@ fn test_federated_owner(upstream_org_id: &str) -> TestResult<FederatedOwner> {
     })
 }
 
+// Direct is only a placeholder: no test using this depends on substrate behavior.
 fn direct_sandbox_controller(pool: &PgPool) -> SandboxController {
     SandboxController::new(crate::controllers::substrate::Substrate::Direct(Box::new(
         crate::controllers::substrate::direct::DirectSubstrate::new(pool.clone()),

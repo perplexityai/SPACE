@@ -155,6 +155,7 @@ fn reconcile_stage_test_reconciler_inner() -> Reconciler {
         },
         node_store,
         store: WarmPoolStore::new(postgres.clone()),
+        // Direct is only a placeholder: the tests using this never reach the substrate.
         substrate: Arc::new(Substrate::Direct(Box::new(DirectSubstrate::new(postgres)))),
         namespace: "space".to_string(),
         pod_config: pool_pod_config(),
@@ -205,6 +206,7 @@ fn reconcile_test_reconciler(
         },
         node_store,
         store,
+        // Direct is only a placeholder: the tests using this never reach the substrate.
         substrate: Arc::new(Substrate::Direct(Box::new(DirectSubstrate::new(postgres)))),
         namespace: "space".to_string(),
         pod_config: pool_pod_config(),
@@ -879,6 +881,7 @@ async fn observe_warming_slots_retries_not_started_probe_and_promotes_slot() -> 
         },
         node_store,
         store: store.clone(),
+        // Direct is only a placeholder here: this test never reaches the substrate.
         substrate: Arc::new(Substrate::Direct(Box::new(DirectSubstrate::new(
             db.pool.clone(),
         )))),
@@ -971,6 +974,7 @@ async fn observe_warming_slots_keeps_young_slot_missing_from_cache() -> TestResu
         },
         node_store,
         store: store.clone(),
+        // Direct is only a placeholder here: this test never reaches the substrate.
         substrate: Arc::new(Substrate::Direct(Box::new(DirectSubstrate::new(
             db.pool.clone(),
         )))),
@@ -1328,6 +1332,7 @@ async fn reconcile_once_starts_preparing_republished_exact_release() -> TestResu
         },
         node_store,
         store: store.clone(),
+        // Direct is only a placeholder here: this test never reaches the substrate.
         substrate: Arc::new(Substrate::Direct(Box::new(DirectSubstrate::new(
             db.pool.clone(),
         )))),

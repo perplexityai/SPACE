@@ -70,6 +70,7 @@ fn metadata_request(metadata: Option<SandboxMetadata>) -> UpdateSandboxRequest {
     }
 }
 
+// Direct is only a placeholder: the tests using this never reach the substrate.
 fn direct_sandbox_controller(pool: &PgPool) -> SandboxController {
     SandboxController::new(crate::controllers::substrate::Substrate::Direct(Box::new(
         crate::controllers::substrate::direct::DirectSubstrate::new(pool.clone()),
