@@ -528,6 +528,7 @@ impl PublicOperationStore {
         org_id: OrgId,
         target_id: &str,
         payload_json: serde_json::Value,
+        traceparent: Option<String>,
     ) -> Result<CreatePublicOperationResult, PublicOperationStoreError> {
         let lock_key = format!("{org_id}:{target_id}");
         let mut tx = self.pool.begin().await?;
@@ -569,6 +570,7 @@ impl PublicOperationStore {
                 target_id: Some(target_id),
                 payload_json,
                 idempotency: None,
+                traceparent,
             },
         )
         .await?;
@@ -686,7 +688,8 @@ impl PublicOperationStore {
                        target_id,
                        payload_json,
                        attempts,
-                       claim_generation"
+                       claim_generation,
+                       traceparent"
         ))
         .bind(operation_id.as_uuid())
         .bind(&claim_token)
@@ -855,6 +858,16 @@ pub struct CreatePublicOperation<'a> {
     pub target_id: Option<&'a str>,
     pub payload_json: serde_json::Value,
     pub idempotency: Option<CreatePublicOperationIdempotency<'a>>,
+    /// The W3C traceparent of the request creating the operation, usually
+    /// [`request_traceparent`], so each attempt to execute it links back to
+    /// the request. A value that is not a valid traceparent is not stored.
+    pub traceparent: Option<String>,
+}
+
+/// The current request's W3C traceparent, for a [`CreatePublicOperation`].
+pub fn request_traceparent() -> Option<String> {
+    pplx_space_observability::trace_propagation::current_traceparent()
+        .filter(|traceparent| pplx_space_observability::is_storable_traceparent(traceparent))
 }
 
 #[derive(Debug, Clone)]
@@ -1039,6 +1052,26 @@ pub struct ClaimedPublicOperation {
     pub payload: serde_json::Value,
     pub attempts: i32,
     pub claim_generation: i64,
+    /// The W3C traceparent of the request that created the operation, which
+    /// each attempt links to. `None` for an operation created outside a
+    /// traced request or before the column existed.
+    pub traceparent: Option<String>,
+}
+
+impl ClaimedPublicOperation {
+    /// The canonical `sandbox_id` telemetry value, the bare UUID, of the
+    /// sandbox the operation targets. Public operations name it by its
+    /// `sbx_<uuid>` target id and a fork by its source's bare UUID; a target
+    /// that names no sandbox yields `None`, which leaves the field off the
+    /// span or log line.
+    pub fn sandbox_id(&self) -> Option<String> {
+        let target_id = self.target_id.as_deref()?;
+        let sandbox_id = match target_id.parse::<pplx_space_public_api::PublicSandboxId>() {
+            Ok(public_id) => SandboxId::from(public_id),
+            Err(_) => target_id.parse::<SandboxId>().ok()?,
+        };
+        Some(sandbox_id.to_string())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1190,11 +1223,13 @@ pub async fn create_operation_tx(
              target_type,
              target_id,
              payload_json,
-             gc_after
+             gc_after,
+             traceparent
          )
          VALUES (
              $1, $2, $3, $4, $5, $6, $7, $8,
-             NOW() + ($9::TEXT || ' days')::INTERVAL
+             NOW() + ($9::TEXT || ' days')::INTERVAL,
+             $10
          )"
     ))
     .bind(operation_id.as_uuid())
@@ -1206,6 +1241,12 @@ pub async fn create_operation_tx(
     .bind(input.target_id)
     .bind(Json(input.payload_json))
     .bind(DEFAULT_OPERATION_GC_DAYS.to_string())
+    .bind(
+        input
+            .traceparent
+            .as_deref()
+            .filter(|traceparent| pplx_space_observability::is_storable_traceparent(traceparent)),
+    )
     .execute(&mut **tx)
     .await?;
 
@@ -1315,7 +1356,8 @@ async fn claim_operations(
                    o.target_id,
                    o.payload_json,
                    o.attempts,
-                   o.claim_generation"
+                   o.claim_generation,
+                   o.traceparent"
     ))
     .bind(i64::from(input.limit))
     .bind(duration_secs_i64(input.claim_stale_after))
@@ -1790,6 +1832,7 @@ struct ClaimedPublicOperationRow {
     payload_json: Json<serde_json::Value>,
     attempts: i32,
     claim_generation: i64,
+    traceparent: Option<String>,
 }
 
 #[derive(Debug, FromRow)]
@@ -1964,6 +2007,9 @@ impl TryFrom<ClaimedPublicOperationRow> for ClaimedPublicOperation {
             payload: row.payload_json.0,
             attempts: row.attempts,
             claim_generation: row.claim_generation,
+            traceparent: row.traceparent.filter(|traceparent| {
+                pplx_space_observability::is_storable_traceparent(traceparent)
+            }),
         })
     }
 }

@@ -300,17 +300,8 @@ impl UpdateSandboxOperationExecutor {
     }
 }
 
-/// The canonical `sandbox_id` telemetry value, the bare UUID, of the sandbox
-/// an operation targets. Public operations name it by its `sbx_<uuid>` target
-/// id; a target that names no sandbox yields `None`, which leaves the field
-/// off the span or log line.
 fn operation_sandbox_id(operation: &ClaimedPublicOperation) -> Option<String> {
-    let target_id = operation.target_id.as_deref()?;
-    let sandbox_id = match target_id.parse::<PublicSandboxId>() {
-        Ok(public_id) => SandboxId::from(public_id),
-        Err(_) => target_id.parse::<SandboxId>().ok()?,
-    };
-    Some(sandbox_id.to_string())
+    operation.sandbox_id()
 }
 
 #[derive(Clone)]

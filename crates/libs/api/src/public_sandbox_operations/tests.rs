@@ -27,6 +27,7 @@ fn claimed_create_operation() -> ClaimedPublicOperation {
         payload: serde_json::json!({}),
         attempts: 1,
         claim_generation: 1,
+        traceparent: None,
     }
 }
 
@@ -54,6 +55,7 @@ fn claimed_create_operation_for(
         .into_json(),
         attempts: 1,
         claim_generation: 1,
+        traceparent: None,
     }
 }
 
@@ -634,6 +636,7 @@ async fn create_executor_retries_unpinned_transient_substrate_failure() {
         .into_json(),
         attempts: 1,
         claim_generation: 1,
+        traceparent: None,
     };
     let controller =
         SandboxController::new(crate::controllers::substrate::Substrate::Direct(Box::new(

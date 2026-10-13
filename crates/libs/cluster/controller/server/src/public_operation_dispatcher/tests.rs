@@ -155,6 +155,7 @@ async fn tick_fails_operation_after_retry_budget() -> TestResult {
             target_id: Some("sbx_retry_budget"),
             payload_json: serde_json::json!({}),
             idempotency: None,
+            traceparent: None,
         })
         .await?
     {
@@ -202,6 +203,7 @@ async fn tick_does_not_exhaust_backpressure_retries() -> TestResult {
             target_id: Some("sbx_backpressure"),
             payload_json: serde_json::json!({}),
             idempotency: None,
+            traceparent: None,
         })
         .await?
     {
@@ -507,6 +509,7 @@ async fn tick_does_not_exhaust_workflow_progress_requeues() -> TestResult {
             target_id: Some("sbx_fork_progress"),
             payload_json: serde_json::json!({}),
             idempotency: None,
+            traceparent: None,
         })
         .await?
     {
@@ -686,6 +689,7 @@ async fn native_executor_requeues_create_when_cluster_admission_rejects() -> Tes
         .into_json(),
         attempts: 1,
         claim_generation: 1,
+        traceparent: None,
     };
     // Direct is only a placeholder: admission sees zero eligible nodes, as it would
     // from a synced, empty Kubernetes node cache, and rejects before any create.
@@ -840,6 +844,7 @@ async fn native_executor_persists_exemptions_on_policy_update_and_template_reset
                 .into_json(),
                 attempts: 1,
                 claim_generation: 1,
+                traceparent: None,
             };
             let mut first_generation = None;
             for _ in 0..2 {
@@ -1000,6 +1005,7 @@ async fn create_queued_operation(
             target_id: Some(target_id),
             payload_json: serde_json::json!({}),
             idempotency: None,
+            traceparent: None,
         })
         .await?
     {

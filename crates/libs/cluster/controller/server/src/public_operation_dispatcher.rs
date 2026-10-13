@@ -24,6 +24,7 @@ use std::sync::Arc;
 use tokio::task::JoinSet;
 use tokio::time::MissedTickBehavior;
 use tokio_util::sync::CancellationToken;
+use tracing::Instrument as _;
 
 use crate::env_config;
 
@@ -401,13 +402,17 @@ pub async fn run<E>(
                     Ok(claim) => {
                         let claimed = claim.operations.len();
                         for operation in claim.operations {
-                            in_flight.spawn(execute_claimed_operation(
-                                store.clone(),
-                                executor.clone(),
-                                claim.claim_token.clone(),
-                                execution_config,
-                                operation,
-                            ));
+                            let span = execution_span(&operation);
+                            in_flight.spawn(
+                                execute_claimed_operation(
+                                    store.clone(),
+                                    executor.clone(),
+                                    claim.claim_token.clone(),
+                                    execution_config,
+                                    operation,
+                                )
+                                .instrument(span),
+                            );
                         }
                         if claimed > 0 {
                             tracing::debug!(
@@ -525,6 +530,7 @@ where
 
     let execution_config = OperationExecutionConfig::from(config);
     let mut executions = stream::iter(claim.operations.into_iter().map(|operation| {
+        let span = execution_span(&operation);
         execute_claimed_operation(
             store.clone(),
             executor.clone(),
@@ -532,6 +538,7 @@ where
             execution_config,
             operation,
         )
+        .instrument(span)
     }))
     .buffer_unordered(config.execution_concurrency.max(1));
 
@@ -540,6 +547,52 @@ where
     }
 
     Ok(report)
+}
+
+/// The root span of one claimed attempt of an operation, linked to the
+/// request that created it.
+///
+/// Each attempt is a trace of its own rather than a child of the request.
+/// Operations that share a caller's trace, such as parallel deletes or forks
+/// one agent request fans out, run concurrently in this process; under the
+/// native Datadog tracer a second span parented on a remote context of a trace
+/// the process already has open splits that trace. And an operation retried
+/// for as long as its admission keeps it waiting would grow one request's
+/// trace without bound. The link names the request instead, and the span is
+/// sampled as the request was. It is a consumer span, as for any queued
+/// message.
+///
+/// A link is not searchable, so the span records the request's trace id as
+/// `origin_trace_id`, with the operation's `operation_id` and `sandbox_id`:
+/// a request's operations are found by any of them. An operation saved
+/// without context links to nothing.
+fn execution_span(operation: &ClaimedPublicOperation) -> tracing::Span {
+    let operation_name = format!("operation.{}", operation.kind.as_str());
+    let span = tracing::info_span!(
+        parent: None,
+        "public_operation.execute",
+        otel.kind = "consumer",
+        otel.name = %operation_name,
+        "operation.name" = "public_operation.execute",
+        "resource.name" = operation.kind.as_str(),
+        operation_id = %operation.id,
+        operation_kind = operation.kind.as_str(),
+        api_product = operation.api_product.as_str(),
+        attempt = operation.attempts,
+        claim_generation = operation.claim_generation,
+        sandbox_id = operation.sandbox_id(),
+        origin_trace_id = tracing::field::Empty,
+        origin_sampled = tracing::field::Empty,
+        otel.status_code = tracing::field::Empty,
+        otel.status_description = tracing::field::Empty,
+    );
+    if let Some(traceparent) = operation.traceparent.as_deref() {
+        pplx_space_common_svc::observability::trace_propagation::link_root_to_origins(
+            &span,
+            [traceparent],
+        );
+    }
+    span
 }
 
 async fn execute_claimed_operation<E>(
@@ -613,6 +666,9 @@ where
                 .terminal_error_code
                 .unwrap_or(PublicErrorCode::Internal);
             let terminal_error_label = terminal_error_code.as_str().to_string();
+            let span = tracing::Span::current();
+            span.record("otel.status_code", "ERROR");
+            span.record("otel.status_description", terminal_error_label.as_str());
             let updated = store
                 .fail_claimed_operation(FailClaimedPublicOperation {
                     claim_token,

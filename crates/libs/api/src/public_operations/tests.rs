@@ -41,6 +41,7 @@ async fn fork_operation_kind_persists_in_native_scope() -> TestResult {
                 key: &key,
                 request_fingerprint: &fingerprint,
             }),
+            traceparent: None,
         })
         .await?;
     let CreatePublicOperationResult::Created(operation_id) = result else {
@@ -82,6 +83,7 @@ async fn create_operation_idempotency_reuses_matching_fingerprint() -> TestResul
             key: &key,
             request_fingerprint: &fingerprint,
         }),
+        traceparent: None,
     };
 
     let created = store.create_operation(input.clone()).await?;
@@ -126,6 +128,7 @@ async fn create_operation_reuses_key_after_idempotency_retention_expires() -> Te
             key: &key,
             request_fingerprint: &fingerprint,
         }),
+        traceparent: None,
     };
 
     let first_operation_id = store
@@ -186,6 +189,7 @@ async fn create_operation_idempotency_rejects_fingerprint_mismatch() -> TestResu
             key: &key,
             request_fingerprint: &first,
         }),
+        traceparent: None,
     };
     let created = store.create_operation(input).await?;
     let CreatePublicOperationResult::Created(operation_id) = created else {
@@ -200,6 +204,7 @@ async fn create_operation_idempotency_rejects_fingerprint_mismatch() -> TestResu
                 key: &key,
                 request_fingerprint: &second,
             }),
+            traceparent: None,
             ..CreatePublicOperation {
                 org_id: OrgId::from_uuid(org_id),
                 actor_user_id: Some(UserId::from_uuid(actor_id)),
@@ -209,6 +214,7 @@ async fn create_operation_idempotency_rejects_fingerprint_mismatch() -> TestResu
                 target_id: None,
                 payload_json: serde_json::json!({}),
                 idempotency: None,
+                traceparent: None,
             }
         })
         .await?;
@@ -290,6 +296,7 @@ fn delete_operation_input(org_id: OrgId, target_id: &str) -> CreatePublicOperati
         target_id: Some(target_id),
         payload_json: serde_json::json!({"action": "delete"}),
         idempotency: None,
+        traceparent: None,
     }
 }
 
@@ -307,11 +314,13 @@ async fn active_sandbox_deletes_coalesce_per_tenant_and_target() -> TestResult {
             OrgId::from_uuid(org_id),
             &target_id,
             serde_json::json!({"action": "delete"}),
+            None,
         ),
         store.create_or_join_active_sandbox_delete(
             OrgId::from_uuid(org_id),
             &target_id,
             serde_json::json!({"action": "delete"}),
+            None,
         ),
     );
     let ids = [first?, second?].map(|result| match result {
@@ -326,6 +335,7 @@ async fn active_sandbox_deletes_coalesce_per_tenant_and_target() -> TestResult {
             OrgId::from_uuid(org_id),
             &other_target,
             serde_json::json!({"action": "delete"}),
+            None,
         )
         .await?
     {
@@ -338,6 +348,7 @@ async fn active_sandbox_deletes_coalesce_per_tenant_and_target() -> TestResult {
             OrgId::from_uuid(other_org_id),
             &target_id,
             serde_json::json!({"action": "delete"}),
+            None,
         )
         .await?
     {
@@ -374,6 +385,7 @@ async fn queued_delete_survives_observer_loss_and_reaches_authoritative_finality
             OrgId::from_uuid(org_id),
             &target_id,
             serde_json::json!({"action": "delete"}),
+            None,
         )
         .await?
     {
@@ -535,6 +547,7 @@ async fn operation_events_are_tenant_scoped() -> TestResult {
             target_id: Some("sbx_demo"),
             payload_json: serde_json::json!({}),
             idempotency: None,
+            traceparent: None,
         })
         .await?
     else {
@@ -554,6 +567,54 @@ async fn operation_events_are_tenant_scoped() -> TestResult {
             .await?
             .is_none()
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn claimed_operation_returns_the_traceparent_it_was_created_with() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let org_id = OrgId::from_uuid(seed_org(&db.pool).await?);
+    let store = PublicOperationStore::new(db.pool.clone());
+    let traceparent = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
+    let traced_target = PublicSandboxId::new().to_string();
+    let invalid_target = PublicSandboxId::new().to_string();
+    let traced = store
+        .create_operation(CreatePublicOperation {
+            traceparent: Some(traceparent.to_string()),
+            ..delete_operation_input(org_id, &traced_target)
+        })
+        .await?
+        .expect_created();
+    // Trace context is validated before it is stored, not by the column.
+    let invalid = store
+        .create_operation(CreatePublicOperation {
+            traceparent: Some("00-not-a-traceparent".to_string()),
+            ..delete_operation_input(org_id, &invalid_target)
+        })
+        .await?
+        .expect_created();
+
+    let claim = store
+        .claim_operations(ClaimPublicOperations {
+            limit: 10,
+            claim_stale_after: Duration::from_secs(60),
+            claimable_kinds: &[OperationKind::DeleteSandbox],
+        })
+        .await?;
+
+    let claimed = |id| {
+        claim
+            .operations
+            .iter()
+            .find(|operation| operation.id == id)
+            .expect("both operations are claimed")
+            .traceparent
+            .as_deref()
+    };
+    assert_eq!(claimed(traced), Some(traceparent));
+    assert_eq!(claimed(invalid), None);
     Ok(())
 }
 
@@ -916,6 +977,7 @@ async fn gc_expired_removes_terminal_operations_and_idempotency_records() -> Tes
                 key: &key,
                 request_fingerprint: &fingerprint,
             }),
+            traceparent: None,
         })
         .await?
         .expect_created();
@@ -1020,6 +1082,7 @@ async fn gc_expired_removes_live_idempotency_references_before_operations() -> T
                 key: &key,
                 request_fingerprint: &fingerprint,
             }),
+            traceparent: None,
         })
         .await?
         .expect_created();
@@ -1090,6 +1153,7 @@ async fn create_test_operation(
             target_id: Some("sbx_demo"),
             payload_json: serde_json::json!({}),
             idempotency: None,
+            traceparent: None,
         })
         .await
 }
@@ -1117,6 +1181,7 @@ async fn create_idempotent_test_operation(
                 key: &key,
                 request_fingerprint: &fingerprint,
             }),
+            traceparent: None,
         })
         .await
 }
@@ -1248,6 +1313,7 @@ async fn create_fork_operation(
                 "requested_count": 1,
             }),
             idempotency: None,
+            traceparent: None,
         })
         .await?;
     match result {
@@ -1379,6 +1445,7 @@ async fn operation_admission_serializes_the_pre_insert_idempotency_window() -> T
             target_id: Some("source-sandbox"),
             payload_json: serde_json::json!({}),
             idempotency: Some(idempotency.clone()),
+            traceparent: None,
         })
         .await?;
     let CreatePublicOperationResult::Created(operation_id) = created else {
@@ -1465,6 +1532,7 @@ async fn terminal_fork_failure_scrubs_the_claimed_federated_grant() -> TestResul
                 }
             }),
             idempotency: None,
+            traceparent: None,
         })
         .await?;
     let CreateClaimedPublicOperationResult::Claimed {

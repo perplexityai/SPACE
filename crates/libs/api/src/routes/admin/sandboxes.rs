@@ -367,6 +367,7 @@ async fn create_sandbox_for_org(
                 key: idempotency_key,
                 request_fingerprint: &fingerprint,
             }),
+            traceparent: crate::public_operations::request_traceparent(),
         })
         .await
         .map_err(|error| {
@@ -711,6 +712,7 @@ async fn enqueue_admin_update_operation(
                 key: idempotency_key,
                 request_fingerprint: &fingerprint,
             }),
+            traceparent: crate::public_operations::request_traceparent(),
         })
         .await
         .map_err(|error| {
@@ -814,6 +816,7 @@ async fn enqueue_admin_lifecycle_operation(
                 key: idempotency_key,
                 request_fingerprint: &fingerprint,
             }),
+            traceparent: crate::public_operations::request_traceparent(),
         })
         .await
         .map_err(|error| {

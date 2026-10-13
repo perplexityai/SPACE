@@ -980,6 +980,7 @@ fn fork_operation_input<'a>(
             key: input.idempotency_key,
             request_fingerprint: &prepared.fingerprint,
         }),
+        traceparent: crate::public_operations::request_traceparent(),
     }
 }
 

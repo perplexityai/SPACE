@@ -1212,6 +1212,27 @@ pub fn elapsed_ms(started_at: Instant) -> f64 {
 
 // gRPC trace-context propagation via W3C traceparent headers. Compiled only
 // when an OpenTelemetry pipeline is compiled; otherwise the stubs below are no-ops.
+/// Whether `value` is a W3C `traceparent` SPACE stores for later work: version
+/// `00`, a non-zero 32-hex-digit trace id, a non-zero 16-hex-digit parent id,
+/// and two hex digits of flags, in lowercase. Stored trace context is
+/// validated here rather than by a database constraint.
+pub fn is_storable_traceparent(value: &str) -> bool {
+    let lowercase_hex = |field: &str| {
+        field
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    };
+    let id = |field: &str, len: usize| {
+        field.len() == len && lowercase_hex(field) && field.bytes().any(|byte| byte != b'0')
+    };
+    let mut fields = value.split('-');
+    matches!(
+        (fields.next(), fields.next(), fields.next(), fields.next(), fields.next()),
+        (Some("00"), Some(trace_id), Some(parent_id), Some(flags), None)
+            if id(trace_id, 32) && id(parent_id, 16) && flags.len() == 2 && lowercase_hex(flags)
+    )
+}
+
 /// The most origins [`trace_propagation::link_root_to_origins`] links to one
 /// span. A pass that serves more records how many it left out instead.
 pub const MAX_ORIGIN_LINKS: usize = 8;
@@ -1512,3 +1533,6 @@ mod trace_parity_fixture;
 
 #[cfg(test)]
 mod log_filter_tests;
+
+#[cfg(test)]
+mod traceparent_tests;

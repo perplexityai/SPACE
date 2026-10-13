@@ -1089,6 +1089,7 @@ pub async fn delete_template(
                 key: &idempotency_key,
                 request_fingerprint: &fingerprint,
             }),
+            traceparent: crate::public_operations::request_traceparent(),
         })
         .await
     {

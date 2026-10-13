@@ -159,6 +159,7 @@ async fn operation_event_stream_stops_when_operation_state_is_terminal() -> Test
             target_id: Some("sbx_terminal"),
             payload_json: serde_json::json!({}),
             idempotency: None,
+            traceparent: None,
         })
         .await?
     else {

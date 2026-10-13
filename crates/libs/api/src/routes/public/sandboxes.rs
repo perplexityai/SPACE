@@ -207,6 +207,7 @@ pub(crate) async fn create_native_sandbox_operation(
                 }
                 .into_json(),
                 idempotency: Some(idempotency.clone()),
+                traceparent: crate::public_operations::request_traceparent(),
             }
         };
 
@@ -601,6 +602,7 @@ pub async fn update_sandbox(
                 key: &idempotency_key,
                 request_fingerprint: &fingerprint,
             }),
+            traceparent: crate::public_operations::request_traceparent(),
         })
         .await?;
 
@@ -790,6 +792,7 @@ async fn enqueue_lifecycle_operation(
             target_id: Some(&sandbox_id_string),
             payload_json,
             idempotency: Some(idempotency),
+            traceparent: crate::public_operations::request_traceparent(),
         })
         .await?;
 

@@ -525,7 +525,12 @@ pub(super) async fn delete_sandbox(
     let created = store
         // The scope check above authorizes the caller; the store anchors and
         // coalesces the operation under the sandbox's owning organization.
-        .create_or_join_active_sandbox_delete(sandbox.org_id, &target_id, payload)
+        .create_or_join_active_sandbox_delete(
+            sandbox.org_id,
+            &target_id,
+            payload,
+            crate::public_operations::request_traceparent(),
+        )
         .await
         .map_err(|error| {
             tracing::error!(
@@ -536,8 +541,17 @@ pub(super) async fn delete_sandbox(
             delete_admission_error(&error)
         })?;
     let operation_id = match created {
-        CreatePublicOperationResult::Created(operation_id)
-        | CreatePublicOperationResult::Existing(operation_id) => operation_id,
+        CreatePublicOperationResult::Created(operation_id) => operation_id,
+        CreatePublicOperationResult::Existing(operation_id) => {
+            // The joined delete's attempts link to the request that created
+            // it, not to this one; this request finds them by its id.
+            pplx_space_observability::trace_propagation::set_span_attribute(
+                &tracing::Span::current(),
+                "operation_id",
+                &operation_id.to_string(),
+            );
+            operation_id
+        }
         CreatePublicOperationResult::IdempotencyConflict { .. }
         | CreatePublicOperationResult::AdmissionDenied => {
             return Err(E2bApiError::internal("Internal server error"));

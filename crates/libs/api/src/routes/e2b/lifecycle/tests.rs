@@ -275,6 +275,7 @@ mod delete {
                 OrgId::from_uuid(SEED_ORG_ID),
                 &sandbox_id.to_string(),
                 payload,
+                None,
             )
             .await?
         {
@@ -366,6 +367,7 @@ mod delete {
                 OrgId::from_uuid(SEED_ORG_ID),
                 &PublicSandboxId::new().to_string(),
                 serde_json::json!({}),
+                None,
             )
             .await
             .expect_err("an unreachable database cannot admit a delete");
