@@ -1,5 +1,7 @@
 # Configuration reference
 
+[Documentation](../README.md)
+
 Every `SPACE_*` environment variable listed here is a supported operator
 setting. Variables that are not listed are not read by release binaries.
 "Unset" means the built-in default applies. Variables marked **required** make

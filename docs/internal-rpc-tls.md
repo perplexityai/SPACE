@@ -1,5 +1,7 @@
 # Internal RPC TLS
 
+[Documentation](../README.md)
+
 ClusterApi, NodeApi and BuildManager TCP listeners and callers require authenticated TLS by
 default. Unix-domain socket calls continue to use their existing peer-identity
 controls. Existing RPC bearer and sandbox route-capability checks still apply.

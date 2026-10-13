@@ -33,7 +33,7 @@ Follow [Installation and configuration](docs/installation.md) to deploy SPACE in
 
 ## Documentation
 
-Read the hosted [Guide](https://space.docs.perplexity.ai/guide/index.html) and [API Reference](https://space.docs.perplexity.ai/api/index.html) online. The links below point to source documentation in this checkout.
+Read the hosted [Guide](https://space.docs.perplexity.ai/guide/index.html) and [API Reference](https://space.docs.perplexity.ai/api/index.html) online. Both update automatically after changes merge. The links below point to source documentation in this checkout.
 
 | Guide | What you will learn |
 |---|---|

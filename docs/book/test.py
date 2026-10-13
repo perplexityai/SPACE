@@ -83,6 +83,20 @@ class GuideTests(unittest.TestCase):
         self.assertFalse(config["build"]["create-missing"])
         self.assertFalse(list(self.output.rglob("*.md")))
 
+    def test_every_top_level_page_is_classified(self):
+        tracked = build.git("ls-files", "docs/*.md").splitlines()
+        pages = {Path(name).name for name in tracked if Path(name).parent == Path("docs")}
+        published = {name for name in build.CHAPTERS if build.chapter_source(name).parent == build.ROOT / "docs"}
+        self.assertEqual(len(build.CHAPTERS), len(set(build.CHAPTERS)))
+        self.assertFalse(published & set(build.UNPUBLISHED))
+        self.assertTrue(all(build.UNPUBLISHED.values()))
+        self.assertEqual(
+            pages - published - set(build.UNPUBLISHED), set(),
+            "Add new docs pages to docs/book/SUMMARY.md, or list them in "
+            "UNPUBLISHED in docs/book/build.py with a reason.",
+        )
+        self.assertEqual(set(build.UNPUBLISHED) - pages, set())
+
     def test_canonical_development_and_contributing(self):
         readme = (build.ROOT / "README.md").read_text()
         development = readme.split("## Development\n", 1)[1].split("\n## ", 1)[0]

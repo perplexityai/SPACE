@@ -1,5 +1,7 @@
 # Native template startup
 
+[Documentation](../README.md)
+
 A template can declare up to 16 named foreground applications to start concurrently
 at boot. The builder compiles validated app declarations into one systemd unit per app,
 stored with a TOML inspection copy in `/etc/space/apps/`. These files are ordinary

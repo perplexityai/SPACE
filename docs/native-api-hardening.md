@@ -1,5 +1,7 @@
 # Native API smoke coverage
 
+[Documentation](../README.md)
+
 Native API correctness, concurrency, and recovery checks are part of the ordinary
 typed `space_smoke.scenarios` inventory. Scenario modules contain their workloads
 and assertions directly; shared HTTP, concurrency, identity, and recovery

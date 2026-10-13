@@ -1,5 +1,7 @@
 # Full network policies through ECW
 
+[Documentation](../README.md)
+
 ECW create requests can carry a complete native `NetworkPolicyV1` JSON document
 in the string metadata field `network.policy`. This bridge lets SDK callers
 construct one policy for ECW and native create without server-side feature

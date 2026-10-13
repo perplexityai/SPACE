@@ -11,6 +11,10 @@ Start with `docs/architecture.md` for the system overview and the owning
 crate's documentation for detailed contracts. Setup and first-use guidance
 live in `docs/installation.md` and `docs/first-sandbox.md`.
 
+The hosted guide publishes the pages listed in `docs/book/SUMMARY.md` after
+they merge. Add each new top-level `docs/*.md` page there, or list it in
+`UNPUBLISHED` in `docs/book/build.py` with a reason.
+
 Some documents predate current code. Treat divergence as a finding to resolve,
 not automatic proof that the document is stale. Localized `AGENTS.md` files add
 constraints for their subtrees.

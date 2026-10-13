@@ -13,23 +13,18 @@ from urllib.parse import unquote, urlsplit, urlunsplit
 
 ROOT = Path(__file__).resolve().parents[2]
 OUTPUT = ROOT / "target/docs/guide"
-# Explicit publication boundary. No recursive copies from docs/.
-CHAPTERS = (
-    "introduction.md",
-    "using-api.md",
-    "first-sandbox.md",
-    "running-space.md",
-    "installation.md",
-    "observability.md",
-    "troubleshooting.md",
-    "warm-pools.md",
-    "base-snapshots.md",
-    "development-overview.md",
-    "architecture.md",
-    "versioning.md",
-    "development.md",
-    "contributing.md",
-)
+SUMMARY = ROOT / "docs/book/SUMMARY.md"
+# Explicit publication boundary: exactly the chapters linked from SUMMARY.md.
+# No recursive copies from docs/.
+CHAPTERS = tuple(re.findall(r"\]\(([^)]+)\)", SUMMARY.read_text()))
+# Top-level docs/*.md pages deliberately left out of the guide. Every other
+# top-level page must appear in SUMMARY.md, so a new page cannot silently miss
+# the published guide.
+UNPUBLISHED = {
+    "falcon-egress.md": "deployment-specific integration with pending renames",
+    "runtime-manager-catalog.md": "prototype; artifacts are not selectable yet",
+    "snapshot-upload-streaming.md": "implementation notes and measurements",
+}
 ASSETS = ("navigation.css", "page-toc.js", "mermaid-init.js")
 LIBRARY_ASSETS = {
     "mermaid.min.js": "target/docs/diagram/mermaid.min.js",

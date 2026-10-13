@@ -1,5 +1,7 @@
 # Deployment-configured TLS interception exemptions
 
+[Documentation](../README.md)
+
 TLS interception currently terminates TLS and parses the decrypted stream as
 HTTP. Non-HTTP TLS protocols (for example TURN-over-TLS) can therefore receive
 an HTTP 400 response and a closed connection. Deployment-configured exemptions
