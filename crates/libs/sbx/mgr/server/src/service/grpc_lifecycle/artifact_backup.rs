@@ -921,6 +921,7 @@ impl SandboxManagerService {
             .submit_artifact_backup(
                 &sandbox,
                 ArtifactBackupSubmission {
+                    execution_generation: None,
                     local_artifact_id: artifact.local_artifact_id,
                     artifact_kind: artifact.artifact_kind,
                     artifact_origin: artifact.artifact_origin,
@@ -1129,6 +1130,7 @@ impl SandboxManagerService {
             .submit_artifact_backup(
                 &sandbox,
                 ArtifactBackupSubmission {
+                    execution_generation: None,
                     local_artifact_id,
                     artifact_kind: pplx_space_common_core::types::ArtifactKind::Full,
                     artifact_origin: pplx_space_common_core::types::ArtifactOrigin::Suspend,

@@ -3,6 +3,108 @@ use pplx_space_common_core::types::LocalArtifactId;
 
 use super::*;
 
+#[derive(Clone)]
+struct ExhaustedTransfer;
+
+impl tonic::server::NamedService for ExhaustedTransfer {
+    const NAME: &'static str = "space.volume.manager.v1.VolumeManager";
+}
+
+impl tonic::server::UnaryService<GetTransferJobRequest> for ExhaustedTransfer {
+    type Response = pplx_space_volmgr_client::proto::GetTransferJobResponse;
+    type Future = std::future::Ready<Result<tonic::Response<Self::Response>, tonic::Status>>;
+
+    fn call(&mut self, request: tonic::Request<GetTransferJobRequest>) -> Self::Future {
+        std::future::ready(Ok(tonic::Response::new(Self::Response {
+            job: Some(pplx_space_volmgr_client::proto::TransferJob {
+                job_id: request.into_inner().job_id,
+                status: TransferJobStatus::Failed as i32,
+                error: Some("credential exchange failed: storage role unavailable".into()),
+                ..Default::default()
+            }),
+        })))
+    }
+}
+
+impl<B> tower::Service<http::Request<B>> for ExhaustedTransfer
+where
+    B: http_body::Body + Send + 'static,
+    B::Error: Into<tonic::codegen::StdError> + Send + 'static,
+{
+    type Response = http::Response<tonic::body::Body>;
+    type Error = std::convert::Infallible;
+    type Future = futures_util::future::BoxFuture<'static, Result<Self::Response, Self::Error>>;
+
+    fn poll_ready(
+        &mut self,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, request: http::Request<B>) -> Self::Future {
+        assert!(request.uri().path().ends_with("/GetTransferJob"));
+        Box::pin(async move {
+            let mut grpc = tonic::server::Grpc::new(tonic_prost::ProstCodec::default());
+            Ok(grpc.unary(ExhaustedTransfer, request).await)
+        })
+    }
+}
+
+/// Exercise the actual transfer observation RPC, not a classifier fed an error
+/// string. Exhausted credential attempts must leave the generation driver a
+/// retriable outcome; the gate preserves the old outcome until safe rollout.
+#[tokio::test]
+async fn exhausted_credential_transfer_can_be_redriven() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let stop = tokio_util::sync::CancellationToken::new();
+    let server = tokio::spawn(
+        tonic::transport::Server::builder()
+            .add_service(ExhaustedTransfer)
+            .serve_with_incoming_shutdown(
+                tokio_stream::wrappers::TcpListenerStream::new(listener),
+                stop.clone().cancelled_owned(),
+            ),
+    );
+    for enabled in [false, true] {
+        let channel = tonic::transport::Endpoint::from_shared(endpoint.clone())
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        let client = pplx_space_volmgr_client::VolumeManagerClient::new(
+            pplx_space_common_svc::bootstrap::wrap_grpc_client_channel(channel),
+        );
+        assert!(
+            has_failed_transfer_with_client(&[JobId::new()], client.clone())
+                .await
+                .unwrap()
+        );
+        assert!(
+            !has_failed_transfer_with_client(&[], client.clone())
+                .await
+                .unwrap()
+        );
+        let error = poll_artifact_job(
+            "synthetic-sandbox",
+            JobId::new(),
+            client,
+            tokio_util::sync::CancellationToken::new(),
+            enabled,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error.kind() == pplx_space_common_jobs::JobFailureKind::Retriable,
+            enabled,
+            "an exhausted credential upload must not permanently strand its suspend: {error}"
+        );
+    }
+    stop.cancel();
+    server.await.unwrap().unwrap();
+}
+
 fn job_fixture(kind: &str, payload: String) -> Job {
     Job {
         job_id: JobId::new(),
@@ -35,6 +137,7 @@ async fn upload_executor_converges_unstaged_metadata_failure() {
     payload.includes_metadata_job = false;
     payload.metadata_staging_dir = Some(metadata_dir.clone());
     let executor = SnapshotUploadExecutor {
+        redrive_failed_transfers: false,
         db: std::sync::Arc::new(std::sync::Mutex::new(open_backfill_test_db())),
         drain_state: crate::service::tests::closed_drain_for_test(),
         node_manager: crate::node_manager_transport::NodeManagerConnector::host(),
@@ -92,7 +195,7 @@ async fn cancelled_transfer_poll_yields_before_connecting() {
     let cancellation = tokio_util::sync::CancellationToken::new();
     cancellation.cancel();
 
-    let error = wait_for_artifact_job("sandbox", &JobId::new(), cancellation)
+    let error = wait_for_artifact_job("sandbox", &JobId::new(), cancellation, false)
         .await
         .unwrap_err();
 
@@ -117,6 +220,7 @@ async fn stalled_transfer_probe_is_bounded_without_cancelling_remote_work() {
         JobId::new(),
         client,
         cancellation.clone(),
+        false,
     ));
     // Accept the connection but never answer its HTTP/2 handshake or request.
     let (_connection, _) = listener.accept().await.unwrap();
@@ -181,6 +285,7 @@ fn refund_interrupted_running_attempts_only_touches_running_snapshot_upload_jobs
 #[tokio::test]
 async fn executor_rejects_non_snapshot_upload_job_kind() {
     let executor = SnapshotUploadExecutor {
+        redrive_failed_transfers: false,
         db: std::sync::Arc::new(std::sync::Mutex::new(
             rusqlite::Connection::open_in_memory().unwrap(),
         )),
@@ -214,6 +319,7 @@ async fn executor_requires_begin_before_volume_staging() {
         return;
     }
     let executor = SnapshotUploadExecutor {
+        redrive_failed_transfers: false,
         db: std::sync::Arc::new(std::sync::Mutex::new(
             rusqlite::Connection::open_in_memory().unwrap(),
         )),
@@ -362,6 +468,7 @@ fn ready_backup_keeps_completed_evidence_when_bookkeeping_misses_execution_deadl
             std::sync::Arc::clone(&db),
             ReadyBackupExecutor {
                 executor: SnapshotUploadExecutor {
+                    redrive_failed_transfers: false,
                     db: std::sync::Arc::clone(&db),
                     drain_state: std::sync::Arc::new(crate::service::drain::DrainState::default()),
                     node_manager: crate::node_manager_transport::NodeManagerConnector::host(),
@@ -1135,6 +1242,7 @@ fn ready_backup_returns_before_the_retained_source_is_inspected() {
     let db = std::sync::Arc::new(std::sync::Mutex::new(conn));
     let gate = std::sync::Arc::new(tokio::sync::Notify::new());
     let executor = SnapshotUploadExecutor {
+        redrive_failed_transfers: false,
         db: std::sync::Arc::clone(&db),
         drain_state: std::sync::Arc::new(crate::service::drain::DrainState::default()),
         node_manager: crate::node_manager_transport::NodeManagerConnector::host(),

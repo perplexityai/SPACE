@@ -408,6 +408,7 @@ pub struct SandboxManagerService {
     gateway_authority: gateway_authority::GatewayAuthority,
     /// S3 upload config for suspend snapshots. `None` means uploads are disabled.
     snapshot_upload_config: Option<Arc<crate::snapshot_upload::SnapshotUploadConfig>>,
+    suspend_backup_redrive_enabled: bool,
     /// Durable worker that drives the poll → metadata → register tail of the
     /// suspend-snapshot pipeline. Persists in sbx-mgr's local SQLite so a
     /// mid-flight process restart resumes the upload instead of orphaning it.
@@ -1732,6 +1733,8 @@ impl SandboxManagerService {
             ),
             gateway_caller_client: options.node_manager.lazy(),
             gateway_authority,
+            suspend_backup_redrive_enabled:
+                crate::snapshot_upload_jobs::suspend_backup_redrive_enabled(),
             snapshot_upload_config: {
                 let cfg = crate::snapshot_upload::SnapshotUploadConfig::from_env();
                 if cfg.is_none() {

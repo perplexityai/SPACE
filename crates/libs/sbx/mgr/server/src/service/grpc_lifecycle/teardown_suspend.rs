@@ -897,6 +897,7 @@ impl SandboxManagerService {
         sandbox: &crate::db::SandboxRow,
         backup: TeardownSuspendBackup<'_>,
     ) -> Result<(), Status> {
+        self.ensure_teardown_suspend_backup_source(sandbox, &backup)?;
         let artifact_dedup_key = backup.artifact.local_artifact_id.to_string();
         let persisted_job = self.snapshot_upload_worker.find_job_by_dedup_key(
             crate::snapshot_upload_jobs::SNAPSHOT_UPLOAD_JOB_KIND,
@@ -915,32 +916,139 @@ impl SandboxManagerService {
         {
             return self.verify_teardown_suspend_backup_ownership(sandbox, &backup);
         }
+        let persisted_job_was_failed = persisted_job
+            .as_ref()
+            .is_some_and(|job| job.failure.is_some());
+        let mut failed_transfer = false;
+        if self.suspend_backup_redrive_enabled
+            && let Some(job) = persisted_job.as_ref()
+            && job.is_terminal()
+            && matches!(
+                job.failure,
+                Some(pplx_space_common_jobs::JobFailure::Permanent { .. })
+            )
+        {
+            let payload = job
+                .payload_as::<crate::snapshot_upload::SnapshotUploadJobs>()
+                .map_err(|error| {
+                    Status::failed_precondition(format!("cannot inspect failed backup: {error}"))
+                })?;
+            if payload.meta.local_artifact_id == Some(backup.artifact.local_artifact_id)
+                && payload.meta.sandbox_id == sandbox.id
+            {
+                failed_transfer = crate::snapshot_upload_jobs::has_failed_transfer(&payload)
+                    .await
+                    .map_err(|error| Status::unavailable(error.to_string()))?;
+            }
+        }
         let job_id = match persisted_job {
             Some(job)
                 if !job.is_terminal()
-                    || !teardown_backup_failure_requires_new_attempt(job.failure) =>
+                    || (!failed_transfer
+                        && !teardown_backup_failure_requires_new_attempt(job.failure)) =>
             {
                 job.job_id
             }
-            _ => match self
-                .enqueue_suspend_artifact_backup(
-                    sandbox,
-                    backup.artifact.local_artifact_id,
-                    &backup.artifact.local_path,
-                    backup.format,
-                    Some(&artifact_dedup_key),
-                )
-                .await
-                .map_err(|error| {
-                    teardown_artifact_backup_status(error, backup.artifact.local_artifact_id)
-                })? {
-                SubmitSuspendSnapshotOutcome::Enqueued { job_id, .. } => job_id,
-                SubmitSuspendSnapshotOutcome::NoUploadConfig => {
-                    return Err(Status::failed_precondition(
-                        "generation suspend requires a configured snapshot upload destination",
-                    ));
+            _ => {
+                if self.suspend_backup_redrive_enabled {
+                    // The immutable published artifact, not vol-mgr's disposable
+                    // per-attempt reflink, is the source of a new attempt. Use
+                    // exactly the operator enqueue preflight; failed inspection
+                    // is not permission to publish a partial capture.
+                    let validation = async {
+                        let metadata_path = std::path::Path::new(&backup.artifact.local_path)
+                            .join(crate::snapshot_upload::SNAPSHOT_METADATA_FILENAME);
+                        let bytes = tokio::fs::read(&metadata_path).await.map_err(|error| {
+                            if error.kind() == std::io::ErrorKind::NotFound {
+                                Status::failed_precondition(
+                                    "local suspend artifact metadata is missing",
+                                )
+                            } else {
+                                Status::internal(format!(
+                                    "cannot verify local suspend metadata: {error}"
+                                ))
+                            }
+                        })?;
+                        let meta: crate::snapshot_upload::SnapshotMeta =
+                            serde_json::from_slice(&bytes).map_err(|error| {
+                                Status::failed_precondition(format!(
+                                    "local suspend metadata is invalid: {error}"
+                                ))
+                            })?;
+                        if meta.sandbox_id != sandbox.id
+                            || meta
+                                .local_artifact_id
+                                .is_some_and(|id| id != backup.artifact.local_artifact_id)
+                        {
+                            return Err(Status::failed_precondition(
+                                "local suspend metadata does not identify the owned artifact",
+                            ));
+                        }
+                        super::artifact_backup::require_artifact_backup_files(
+                            self.retained_source_inspector.as_ref(),
+                            &sandbox.id,
+                            &backup.artifact.local_path,
+                            backup.artifact.artifact_kind,
+                            super::artifact_backup::artifact_backup_format(backup.artifact)?,
+                            super::artifact_backup::BackupFilesPolicy::Backup {
+                                full_current_instance: false,
+                            },
+                        )
+                        .await
+                    }
+                    .await;
+                    if let Err(error) = validation {
+                        tracing::error!(
+                            sandbox_id = %sandbox.id,
+                            execution_generation = %backup.execution_generation,
+                            local_artifact_id = %backup.artifact.local_artifact_id,
+                            %error,
+                            "suspend backup cannot be re-driven: local artifact unavailable or unverified"
+                        );
+                        if error.code() == tonic::Code::FailedPrecondition {
+                            let db = self.db_conn()?;
+                            crate::db::fail_teardown_suspend_artifact_unavailable(
+                                &db,
+                                &sandbox.id,
+                                backup.execution_generation,
+                                backup.artifact.local_artifact_id,
+                            )
+                            .map_err(|error| {
+                                Status::internal(format!(
+                                    "persist unavailable suspend artifact: {error}"
+                                ))
+                            })?;
+                        }
+                        return Err(error);
+                    }
+                    // Inspection may await node-manager. Never submit based on
+                    // the generation or artifact observed before that await.
+                    self.ensure_teardown_suspend_backup_source(sandbox, &backup)?;
                 }
-            },
+                if persisted_job_was_failed {
+                    pplx_space_metrics::snapshot::backup_redrive();
+                }
+                match self
+                    .enqueue_suspend_artifact_backup(
+                        sandbox,
+                        backup.artifact.local_artifact_id,
+                        &backup.artifact.local_path,
+                        backup.format,
+                        Some(&artifact_dedup_key),
+                        Some(backup.execution_generation),
+                    )
+                    .await
+                    .map_err(|error| {
+                        teardown_artifact_backup_status(error, backup.artifact.local_artifact_id)
+                    })? {
+                    SubmitSuspendSnapshotOutcome::Enqueued { job_id, .. } => job_id,
+                    SubmitSuspendSnapshotOutcome::NoUploadConfig => {
+                        return Err(Status::failed_precondition(
+                            "generation suspend requires a configured snapshot upload destination",
+                        ));
+                    }
+                }
+            }
         };
         let job = self
             .snapshot_upload_worker
@@ -979,6 +1087,29 @@ impl SandboxManagerService {
             })?;
         }
         self.verify_teardown_suspend_backup_ownership(sandbox, &backup)
+    }
+
+    fn ensure_teardown_suspend_backup_source(
+        &self,
+        sandbox: &crate::db::SandboxRow,
+        backup: &TeardownSuspendBackup<'_>,
+    ) -> Result<(), Status> {
+        let db = self.db_conn()?;
+        let owned = crate::db::teardown_suspend_owns_backup_source(
+            &db,
+            &sandbox.id,
+            backup.execution_generation,
+            backup.artifact.local_artifact_id,
+            &backup.artifact.local_path,
+        )
+        .map_err(|error| Status::internal(format!("read suspend ownership: {error}")))?;
+        if owned {
+            Ok(())
+        } else {
+            Err(Status::aborted(
+                "generation suspend no longer owns backup source",
+            ))
+        }
     }
 
     fn verify_teardown_suspend_backup_ownership(

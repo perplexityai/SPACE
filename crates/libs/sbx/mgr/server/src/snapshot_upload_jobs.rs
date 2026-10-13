@@ -20,7 +20,10 @@
 //!    skip this step.
 //! 2. Concurrently polls all vol-mgr jobs — every VM artifact and the
 //!    `snapshot.json` metadata document — to a terminal
-//!    state. Any permanent vol-mgr failure → [`JobError::Permanent`]; any
+//!    state. With generation re-drive enabled, a failed full suspend transfer
+//!    exhausts this attempt as retriable so the generation owner can validate
+//!    its local source and start a fresh attempt. Other permanent vol-mgr
+//!    failures → [`JobError::Permanent`]; any
 //!    transient transport/RPC failure → [`JobError::Retriable`].
 //! 3. Calls `ClusterApi.FinalizeArtifactBackup` with `target_state=READY`
 //!    only once *all* of those uploads succeed, so the row never becomes
@@ -60,6 +63,16 @@ const JOB_TIMEOUT: Duration = Duration::from_secs(7200);
 const MAX_ATTEMPTS: i32 = 5;
 const TRANSFER_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Keep disabled until the cluster's generation-fenced backup admission is deployed.
+pub(crate) fn suspend_backup_redrive_enabled() -> bool {
+    pplx_space_common_core::env::env_flag(
+        std::env::var("SPACE_SUSPEND_BACKUP_REDRIVE_ENABLED")
+            .ok()
+            .as_deref(),
+        false,
+    )
+}
+
 /// Build a `BackgroundWorker` configured for the snapshot-upload pipeline.
 /// Caller owns the `rusqlite::Connection` (it lives alongside the rest of
 /// sbx-mgr's SQLite state) and is responsible for calling
@@ -78,6 +91,7 @@ pub(crate) fn build_worker(
         .with_kind_concurrency(SNAPSHOT_UPLOAD_JOB_KIND, DEFAULT_CONCURRENCY)
         .with_recovery_job_kind(SNAPSHOT_UPLOAD_JOB_KIND);
     let executor = SnapshotUploadExecutor {
+        redrive_failed_transfers: suspend_backup_redrive_enabled(),
         db: std::sync::Arc::clone(&db),
         drain_state,
         retained_source_inspector: std::sync::Arc::new(
@@ -106,6 +120,7 @@ pub fn refund_interrupted_running_attempts(conn: &rusqlite::Connection) -> rusql
 /// same lock hold.
 #[derive(Clone)]
 pub struct SnapshotUploadExecutor {
+    redrive_failed_transfers: bool,
     db: std::sync::Arc<std::sync::Mutex<rusqlite::Connection>>,
     drain_state: std::sync::Arc<crate::service::drain::DrainState>,
     /// Sizes a retained source before its stream is reclaimed, so the local
@@ -142,6 +157,14 @@ impl JobExecutor for SnapshotUploadExecutor {
             .artifact_origin
             .map(|origin| origin.as_str())
             .unwrap_or("suspend");
+        let redrive_failed_transfers = self.redrive_failed_transfers
+            && payload
+                .meta
+                .artifact_origin
+                .unwrap_or(pplx_space_common_core::types::ArtifactOrigin::Suspend)
+                == pplx_space_common_core::types::ArtifactOrigin::Suspend
+            && artifact_kind_from_meta(&payload.meta)
+                == pplx_space_common_core::types::ArtifactKind::Full;
 
         if job.attempts == 1
             && let Some(duration_ms) = job
@@ -188,12 +211,14 @@ impl JobExecutor for SnapshotUploadExecutor {
         // a failure here is logged and never gates the upload.
         touch_with_cluster_api(&snapshot_id).await;
 
-        let results = join_all(
-            payload
-                .job_ids
-                .iter()
-                .map(|job_id| wait_for_artifact_job(&sandbox_id, job_id, cancellation.clone())),
-        )
+        let results = join_all(payload.job_ids.iter().map(|job_id| {
+            wait_for_artifact_job(
+                &sandbox_id,
+                job_id,
+                cancellation.clone(),
+                redrive_failed_transfers,
+            )
+        }))
         .await;
 
         // Per-job upload bytes in transfer-submission order: the
@@ -235,7 +260,14 @@ impl JobExecutor for SnapshotUploadExecutor {
                     .map_err(JobError::retriable)?;
             payload.job_ids.push(metadata_job);
             persist_submitted_transfer_ids(&self.db, &job.job_id, &payload)?;
-            match wait_for_artifact_job(&sandbox_id, &metadata_job, cancellation.clone()).await {
+            match wait_for_artifact_job(
+                &sandbox_id,
+                &metadata_job,
+                cancellation.clone(),
+                redrive_failed_transfers,
+            )
+            .await
+            {
                 Ok(observation) => artifact_results.push(observation),
                 Err(error) => {
                     if matches!(error, JobError::Permanent(_)) {
@@ -859,6 +891,7 @@ async fn wait_for_artifact_job(
     sandbox_id: &str,
     job_id: &JobId,
     cancellation: tokio_util::sync::CancellationToken,
+    redrive_failed_transfers: bool,
 ) -> Result<ArtifactTransferObservation, JobError> {
     // One reconnecting channel per artifact attempt, not a fresh connection
     // on every poll. These are observation-only requests: timing out does not
@@ -871,7 +904,14 @@ async fn wait_for_artifact_job(
                 .map_err(|e| JobError::retriable(format!("vol-mgr connect ({job_id}): {e}")))?
         }
     };
-    poll_artifact_job(sandbox_id, *job_id, client, cancellation).await
+    poll_artifact_job(
+        sandbox_id,
+        *job_id,
+        client,
+        cancellation,
+        redrive_failed_transfers,
+    )
+    .await
 }
 
 /// Probe interval after the first pending answer. A teardown suspend holds its
@@ -882,6 +922,61 @@ async fn wait_for_artifact_job(
 const ARTIFACT_POLL_INITIAL: Duration = Duration::from_millis(100);
 const ARTIFACT_POLL_MAX: Duration = Duration::from_millis(500);
 
+/// Old binaries recorded transfer failure as a permanent snapshot-job error.
+/// Recover only from live typed transfer evidence, never historical error text
+/// (which could instead describe a cluster admission/finalization refusal).
+pub(crate) async fn has_failed_transfer(payload: &SnapshotUploadJobs) -> Result<bool, JobError> {
+    if payload.job_ids.is_empty() {
+        return Ok(false);
+    }
+    let client = tokio::time::timeout(
+        TRANSFER_PROBE_TIMEOUT,
+        pplx_space_volmgr_client::connect(VOLMGR_SOCKET),
+    )
+    .await
+    .map_err(|_| JobError::retriable("vol-mgr failed-transfer probe connect timed out"))?
+    .map_err(|error| JobError::retriable(format!("vol-mgr failed-transfer probe: {error}")))?;
+    has_failed_transfer_with_client(&payload.job_ids, client).await
+}
+
+async fn has_failed_transfer_with_client(
+    job_ids: &[JobId],
+    client: pplx_space_volmgr_client::ConnectedVolumeManagerClient,
+) -> Result<bool, JobError> {
+    let probes = job_ids.iter().map(|id| {
+        let mut client = client.clone();
+        async move {
+            let response = tokio::time::timeout(
+                TRANSFER_PROBE_TIMEOUT,
+                client.get_transfer_job(GetTransferJobRequest {
+                    job_id: id.to_string(),
+                }),
+            )
+            .await
+            .map_err(|_| JobError::retriable("vol-mgr failed-transfer probe timed out"))?
+            .map_err(|error| {
+                JobError::retriable(format!("vol-mgr failed-transfer probe: {error}"))
+            })?;
+            Ok::<_, JobError>(
+                response
+                    .into_inner()
+                    .job
+                    .is_some_and(|job| job.status == TransferJobStatus::Failed as i32),
+            )
+        }
+    });
+    let results = join_all(probes).await;
+    // One proven failed member makes the old attempt unrecoverable even when
+    // a sibling's status is temporarily unavailable.
+    if results.iter().any(|result| matches!(result, Ok(true))) {
+        return Ok(true);
+    }
+    for result in results {
+        result?;
+    }
+    Ok(false)
+}
+
 fn next_artifact_poll_interval(interval: Duration) -> Duration {
     (interval * 2).min(ARTIFACT_POLL_MAX)
 }
@@ -891,6 +986,7 @@ async fn poll_artifact_job(
     job_id: JobId,
     mut client: pplx_space_volmgr_client::ConnectedVolumeManagerClient,
     cancellation: tokio_util::sync::CancellationToken,
+    redrive_failed_transfers: bool,
 ) -> Result<ArtifactTransferObservation, JobError> {
     let mut interval = ARTIFACT_POLL_INITIAL;
     loop {
@@ -952,10 +1048,17 @@ async fn poll_artifact_job(
                         .transfer_job_id(job_id.to_string())
                         .error(error.clone()),
                 );
-                return Err(JobError::permanent(format!(
-                    "vol-mgr job {job_id} failed permanently: {}",
-                    error
-                )));
+                let message = format!("vol-mgr job {job_id} failed: {error}");
+                // A failed transfer is terminal for this immutable attempt,
+                // not necessarily for the captured generation. Exhaust the
+                // bounded observation budget as retriable so its generation
+                // driver can validate the retained artifact and submit a new
+                // attempt through the normal, fenced admission path.
+                return Err(if redrive_failed_transfers {
+                    JobError::retriable(message)
+                } else {
+                    JobError::permanent(message)
+                });
             }
             _ => {
                 tokio::select! {

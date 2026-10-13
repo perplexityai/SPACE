@@ -157,7 +157,9 @@ async fn teardown_reuses_ready_backup_but_waits_for_active_local_upload() {
             let status = crate::db::teardown_suspend_status(&db, &sandbox_id.to_string())
                 .unwrap()
                 .unwrap();
-            assert!(status.backup_completed);
+            // A stale caller is now rejected before remote lookup and must not
+            // mutate the current generation's durability, even if S3 is ready.
+            assert_eq!(status.backup_completed, !superseded);
             assert!(
                 pplx_space_common_jobs::db::list_jobs(&db, Some(&sandbox_id.to_string()), None, 0)
                     .unwrap()

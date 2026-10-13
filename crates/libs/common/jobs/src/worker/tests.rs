@@ -14,6 +14,36 @@ struct TestExecutor {
     should_block: Arc<AtomicBool>,
 }
 
+#[tokio::test]
+async fn guarded_submission_refusal_neither_inserts_nor_reuses_work() {
+    let conn = Connection::open_in_memory().unwrap();
+    init_test_schema(&conn);
+    let worker = BackgroundWorker::new(
+        Arc::new(Mutex::new(conn)),
+        TestExecutor::blocking(),
+        WorkerConfig::new(1, Duration::from_secs(30), 1),
+    );
+    let existing = worker
+        .submit("backup", "{}", Some("sandbox"), Some("artifact"))
+        .unwrap();
+    for key in ["artifact", "new-artifact"] {
+        let error = worker
+            .submit_json_guarded(
+                "backup",
+                &serde_json::json!({}),
+                Some("sandbox"),
+                Some(key),
+                |_| Err(Status::aborted("generation retired")),
+            )
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::Aborted);
+    }
+    let conn = worker.lock_db_for_status().unwrap();
+    let jobs = db::list_jobs(&conn, Some("sandbox"), None, 0).unwrap();
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].job_id, existing);
+}
+
 impl TestExecutor {
     fn blocking() -> Self {
         Self {

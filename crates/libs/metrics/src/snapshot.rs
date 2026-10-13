@@ -38,6 +38,11 @@ use std::time::Instant;
 
 use crate::emit::{counter, elapsed_ms, gauge, tag, timing_ms};
 
+/// A fresh submission attempt, not an observation or an individual vol-mgr retry.
+pub fn backup_redrive() {
+    counter("snapshot.backup.redrive", 1, &[]);
+}
+
 pub fn delivery_duration_ms(
     stage: &str,
     origin: &str,

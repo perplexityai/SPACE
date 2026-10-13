@@ -350,6 +350,225 @@ fn write_artifact(dir: &std::path::Path, sandbox_id: &str, files: &[&str]) {
 }
 
 #[tokio::test]
+async fn exhausted_suspend_backup_admits_only_the_owned_valid_artifact() {
+    use crate::service::tests::service_tests::insert_stranded_teardown_suspend_sandbox;
+    use pplx_space_common_core::types::{ExecutionGeneration, JobId};
+    use pplx_space_common_jobs::db as jobs;
+    let root = tempfile::tempdir().unwrap();
+    let token_path = root.path().join("absent-token");
+    if !pplx_space_test_env::enter_test_process(&cluster_api_env(
+        LOOPBACK_ENDPOINT,
+        STATIC_TOKEN,
+        &token_path,
+    )) {
+        return;
+    }
+    for case in [
+        "valid",
+        "missing",
+        "invalid_metadata",
+        "stale_generation",
+        "newer_runtime",
+        "retired",
+        "wrong_artifact",
+    ] {
+        let conn = crate::db::test_conn();
+        let id = SandboxId::new();
+        let generation = ExecutionGeneration::new(7).unwrap();
+        let artifact_id = insert_stranded_teardown_suspend_sandbox(&conn, id, generation);
+        let path = root.path().join(case);
+        write_artifact(
+            &path,
+            &id.to_string(),
+            &["vmstate", "memory", "rootfs.ext4"],
+        );
+        conn.execute(
+            "UPDATE local_artifacts SET local_path = ?1 WHERE local_artifact_id = ?2",
+            rusqlite::params![path.to_str().unwrap(), artifact_id.to_string()],
+        )
+        .unwrap();
+        let mut artifact = crate::db::get_local_artifact(&conn, artifact_id)
+            .unwrap()
+            .unwrap();
+        let sandbox = crate::db::get_sandbox(&conn, &id.to_string())
+            .unwrap()
+            .unwrap();
+        let old_job = JobId::new();
+        jobs::insert_job(
+            &conn,
+            jobs::InsertJob {
+                job_id: &old_job,
+                kind: crate::snapshot_upload_jobs::SNAPSHOT_UPLOAD_JOB_KIND,
+                payload: "{}",
+                subject_id: Some(&id.to_string()),
+                dedup_key: Some(&artifact_id.to_string()),
+                max_attempts: 5,
+                traceparent: None,
+                priority: Default::default(),
+            },
+        )
+        .unwrap();
+        jobs::mark_job_running(&conn, &old_job).unwrap();
+        jobs::fail_running_job_retriable_exhausted(&conn, &old_job, "failed transfer").unwrap();
+        if case == "missing" {
+            std::fs::remove_file(path.join("memory")).unwrap();
+        }
+        if case == "invalid_metadata" {
+            std::fs::write(
+                path.join(crate::snapshot_upload::SNAPSHOT_METADATA_FILENAME),
+                b"{",
+            )
+            .unwrap();
+        }
+        if case == "retired" {
+            crate::db::fail_teardown_suspend_operation(
+                &conn,
+                &id.to_string(),
+                generation,
+                crate::db::TeardownSuspendFailure::Deleted,
+            )
+            .unwrap();
+        }
+        if case == "newer_runtime" {
+            conn.execute(
+                "UPDATE sandboxes SET space_api_route_execution_generation = 8 WHERE id = ?1",
+                [id.to_string()],
+            )
+            .unwrap();
+        }
+        if case == "wrong_artifact" {
+            artifact.local_artifact_id = LocalArtifactId::new();
+        }
+        let mut service = SandboxManagerService::new(conn);
+        service.suspend_backup_redrive_enabled = true;
+        service.snapshot_upload_config = Some(Arc::new(upload_config("synthetic-backups")));
+        let error = service
+            .ensure_teardown_suspend_backup(
+                &sandbox,
+                super::TeardownSuspendBackup {
+                    execution_generation: if case == "stale_generation" {
+                        ExecutionGeneration::new(6).unwrap()
+                    } else {
+                        generation
+                    },
+                    artifact: &artifact,
+                    format: SuspendSnapshotFormat::Full,
+                },
+            )
+            .await
+            .unwrap_err();
+        // The injected missing token refuses registration after admission. No
+        // node-manager, volume-manager or ambient cluster connection is used.
+        assert_eq!(
+            snapshot_upload_jobs(&service, &id.to_string()),
+            if case == "valid" { 2 } else { 1 },
+            "{case}: {error}"
+        );
+        if case == "valid" {
+            let job = service
+                .snapshot_upload_worker
+                .find_job_by_dedup_key(
+                    crate::snapshot_upload_jobs::SNAPSHOT_UPLOAD_JOB_KIND,
+                    &artifact_id.to_string(),
+                )
+                .unwrap()
+                .unwrap();
+            assert_ne!(job.job_id, old_job);
+            let payload = job
+                .payload_as::<crate::snapshot_upload::SnapshotUploadJobs>()
+                .unwrap();
+            assert_eq!(payload.meta.local_artifact_id, Some(artifact_id));
+            assert_eq!(payload.snapshot_dir, path);
+        } else if matches!(case, "missing" | "invalid_metadata") {
+            let db = service.db_conn().unwrap();
+            assert_eq!(
+                crate::db::latest_teardown_suspend_operation(&db, &id.to_string())
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                crate::db::TeardownSuspendOperationStatus::Failed,
+                "{case}: unavailable artifact must remain terminal",
+            );
+        } else {
+            assert_eq!(error.code(), tonic::Code::Aborted, "{case}");
+        }
+    }
+}
+
+#[test]
+fn suspend_redrive_backoff_is_durable_capped_and_generation_fenced() {
+    use crate::service::tests::service_tests::insert_stranded_teardown_suspend_sandbox;
+    use pplx_space_common_core::types::ExecutionGeneration;
+    let conn = crate::db::test_conn();
+    let id = SandboxId::new().to_string();
+    let generation = ExecutionGeneration::new(7).unwrap();
+    insert_stranded_teardown_suspend_sandbox(&conn, id.parse().unwrap(), generation);
+    let operation = crate::db::latest_teardown_suspend_operation(&conn, &id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        crate::db::due_teardown_suspend_redrives(&conn).unwrap(),
+        vec![(id.clone(), generation)]
+    );
+    for delay in [30, 60, 120, 240, 480, 900, 900] {
+        crate::db::defer_teardown_suspend_retry(&conn, &id, generation, "unavailable").unwrap();
+        let remaining: i64 = conn
+            .query_row(
+                "SELECT unixepoch(next_attempt_at) - unixepoch('now') FROM jobs WHERE job_id = ?1",
+                [operation.job_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            (delay - 1..=delay).contains(&remaining),
+            "{remaining} != {delay}"
+        );
+        assert!(!crate::db::teardown_suspend_retry_due(&conn, &id, generation).unwrap());
+        assert!(
+            crate::db::due_teardown_suspend_redrives(&conn)
+                .unwrap()
+                .is_empty()
+        );
+    }
+    let before = pplx_space_common_jobs::db::get_job(&conn, &operation.job_id)
+        .unwrap()
+        .unwrap();
+    crate::db::defer_teardown_suspend_retry(
+        &conn,
+        &id,
+        ExecutionGeneration::new(6).unwrap(),
+        "stale",
+    )
+    .unwrap();
+    let after = pplx_space_common_jobs::db::get_job(&conn, &operation.job_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(before.attempts, after.attempts);
+    assert_eq!(before.error, after.error);
+    conn.execute(
+        "UPDATE jobs SET next_attempt_at = datetime('now', '-1 second') WHERE job_id = ?1",
+        [operation.job_id],
+    )
+    .unwrap();
+    assert_eq!(
+        crate::db::due_teardown_suspend_redrives(&conn).unwrap(),
+        vec![(id.clone(), generation)]
+    );
+    crate::db::fail_teardown_suspend_operation(
+        &conn,
+        &id,
+        generation,
+        crate::db::TeardownSuspendFailure::Deleted,
+    )
+    .unwrap();
+    assert!(
+        crate::db::due_teardown_suspend_redrives(&conn)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
 async fn durable_artifact_backup_persists_the_submitted_artifact_identity() {
     // A regressed handoff that began the backup remotely would stop at the
     // unreadable cluster-api token instead of using ambient host wiring.
@@ -447,6 +666,7 @@ async fn durable_artifact_backup_persists_the_submitted_artifact_identity() {
             .submit_artifact_backup(
                 &sandbox,
                 ArtifactBackupSubmission {
+                    execution_generation: None,
                     local_artifact_id,
                     artifact_kind: case.kind,
                     artifact_origin: case.origin,

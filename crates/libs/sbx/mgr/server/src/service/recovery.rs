@@ -2319,6 +2319,22 @@ impl SandboxManagerService {
                 Ok(_) => {},
                 Err(error) => tracing::warn!(%error, "teardown suspend job reconciliation failed; will retry"),
             }
+            if service.suspend_backup_redrive_enabled {
+                match service.storage(|db| {
+                    crate::db::due_teardown_suspend_redrives(db)
+                        .map_err(|error| Status::internal(format!("discover suspend backup retries: {error}")))
+                }).await {
+                    Ok(candidates) => {
+                        for (id, generation) in candidates {
+                            match id.parse() {
+                                Ok(id) => { service.spawn_teardown_suspend_driver(id, generation, SandboxEventTrigger::System); }
+                                Err(error) => tracing::error!(sandbox_id = id, %error, "invalid sandbox identity in suspend retry job"),
+                            }
+                        }
+                    }
+                    Err(error) => tracing::warn!(%error, "suspend backup retry discovery failed; will retry"),
+                }
+            }
             let mut cursor = std::mem::take(&mut recovery_cursor);
             let candidates = match service.storage(move |db| {
                 let rows = crate::db::periodic_lifecycle_recovery_batch(db, &mut cursor)

@@ -20,6 +20,7 @@ pub(crate) enum TeardownSuspendFailure {
     Quarantined,
     Failed,
     BackupUnavailable,
+    ArtifactUnavailable,
     Reconciled,
 }
 
@@ -32,6 +33,9 @@ impl TeardownSuspendFailure {
             Self::Quarantined => "sandbox is quarantined",
             Self::Failed => "generation suspend permanently failed",
             Self::BackupUnavailable => "backup cannot complete: cluster-api sandbox not found",
+            Self::ArtifactUnavailable => {
+                "backup cannot complete: local suspend artifact unavailable"
+            }
             Self::Reconciled => {
                 "teardown suspend reconciled: sandbox missing, deleting or quarantined"
             }
@@ -43,6 +47,39 @@ impl std::fmt::Display for TeardownSuspendFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
     }
+}
+
+/// Caller holds the local database lock through job admission. Checking the
+/// captured artifact as well as the operation prevents a late retry from
+/// publishing the next execution's bytes.
+pub(crate) fn teardown_suspend_owns_backup_source(
+    conn: &Connection,
+    id: &str,
+    generation: ExecutionGeneration,
+    artifact_id: LocalArtifactId,
+    local_path: &str,
+) -> Result<bool> {
+    use crate::state::SandboxState;
+    if super::runtime_execution_generation(conn, id)?.is_some_and(|current| current > generation) {
+        return Ok(false);
+    }
+    Ok(
+        super::teardown_suspend_status(conn, id)?.is_some_and(|status| {
+            matches!(
+                status.state,
+                SandboxState::Suspending
+                    | SandboxState::Suspended
+                    | SandboxState::CleanupRequired
+                    | SandboxState::CleanupFailed
+            ) && status.operation.is_some_and(|operation| {
+                operation.status.is_active() && operation.execution_generation == generation
+            }) && status.artifact.is_some_and(|artifact| {
+                artifact.local_artifact_id == artifact_id
+                    && artifact.sandbox_id == id
+                    && artifact.local_path == local_path
+            })
+        }),
+    )
 }
 
 /// A recovered resident may start a fresh attempt; retained artifacts and
@@ -89,6 +126,21 @@ pub(crate) fn fail_teardown_suspend_backup_operation(
         id,
         generation,
         TeardownSuspendFailure::BackupUnavailable,
+        Some(failed_artifact),
+    )
+}
+
+pub(crate) fn fail_teardown_suspend_artifact_unavailable(
+    conn: &Connection,
+    id: &str,
+    generation: ExecutionGeneration,
+    failed_artifact: LocalArtifactId,
+) -> Result<bool> {
+    fail_operation(
+        conn,
+        id,
+        generation,
+        TeardownSuspendFailure::ArtifactUnavailable,
         Some(failed_artifact),
     )
 }
@@ -195,10 +247,10 @@ pub(crate) fn reconcile_terminal_teardown_suspend_jobs(conn: &Connection) -> Res
     Ok(jobs.len())
 }
 
-const TEARDOWN_SUSPEND_RETRY_DELAY_SECS: i64 = 30;
-
 /// Persist retry pacing on the generation's existing job, so daemon restarts
 /// and frequent shim polls cannot turn a blocked backup into a tight loop.
+/// These jobs have no BackgroundWorker; after the initial running claim,
+/// attempts counts failed driver runs.
 pub(crate) fn defer_teardown_suspend_retry(
     conn: &Connection,
     id: &str,
@@ -210,10 +262,12 @@ pub(crate) fn defer_teardown_suspend_retry(
     {
         conn.execute(
             sql!(
-                "UPDATE jobs SET next_attempt_at = datetime('now', '+' || ?3 || ' seconds'), error = ?2
+                "UPDATE jobs SET
+                 next_attempt_at = datetime('now', '+' || min(900, 30 * (1 << min(max(attempts - 1, 0), 5))) || ' seconds'),
+                 attempts = min(attempts + 1, 30), error = ?2
               WHERE job_id = ?1 AND status IN ('pending', 'running')"
             ),
-            params![operation.job_id, error, TEARDOWN_SUSPEND_RETRY_DELAY_SECS],
+            params![operation.job_id, error],
         )?;
     }
     Ok(())
@@ -238,4 +292,29 @@ pub(crate) fn teardown_suspend_retry_due(
         params![operation.job_id],
         |row| row.get(0),
     )
+}
+
+/// Bounded discovery for retries whose original RPC/shim has disappeared.
+/// Running drivers are deduplicated by the service's existing driver slots.
+pub(crate) fn due_teardown_suspend_redrives(
+    conn: &Connection,
+) -> Result<Vec<(String, ExecutionGeneration)>> {
+    let mut statement = conn.prepare(sql!(
+        "SELECT subject_id FROM jobs
+         WHERE kind = ?1 AND status IN ('pending', 'running')
+           AND (next_attempt_at IS NULL OR next_attempt_at <= datetime('now'))
+         ORDER BY next_attempt_at, created_at LIMIT 128"
+    ))?;
+    let ids = statement
+        .query_map([super::TEARDOWN_SUSPEND_JOB_KIND], |row| {
+            row.get::<_, String>(0)
+        })?
+        .collect::<Result<Vec<_>>>()?;
+    ids.into_iter()
+        .filter_map(|id| match active_teardown_suspend_operation(conn, &id) {
+            Ok(Some(operation)) => Some(Ok((id, operation.execution_generation))),
+            Ok(None) => None,
+            Err(error) => Some(Err(error)),
+        })
+        .collect()
 }

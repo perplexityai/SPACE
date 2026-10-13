@@ -317,6 +317,7 @@ struct ArtifactBackupSubmission<'a> {
     format: pplx_space_sbx_mgr_client::proto::SuspendSnapshotFormat,
     dedup_key: Option<&'a str>,
     handoff: ArtifactBackupHandoff,
+    execution_generation: Option<ExecutionGeneration>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

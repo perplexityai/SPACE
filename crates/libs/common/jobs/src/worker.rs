@@ -635,6 +635,31 @@ impl<E: JobExecutor> BackgroundWorker<E> {
         )
     }
 
+    /// Check caller-owned state under the same database lock as durable job
+    /// admission. Refusal performs no insert or deduplication side effects.
+    pub fn submit_json_guarded<T: serde::Serialize>(
+        &self,
+        kind: &str,
+        payload: &T,
+        subject_id: Option<&str>,
+        dedup_key: Option<&str>,
+        admit: impl FnOnce(&rusqlite::Connection) -> Result<(), Status>,
+    ) -> Result<JobId, Status> {
+        let json = serde_json::to_string(payload)
+            .map_err(|error| Status::invalid_argument(format!("encode job payload: {error}")))?;
+        self.submit_with_options_guarded(
+            kind,
+            &json,
+            subject_id,
+            dedup_key,
+            SubmitOptions {
+                priority: JobPriority::default(),
+                duplicate_policy: DuplicatePolicy::ReuseExisting,
+            },
+            admit,
+        )
+    }
+
     pub fn submit_json_with_priority<T: serde::Serialize>(
         &self,
         kind: &str,
@@ -726,11 +751,24 @@ impl<E: JobExecutor> BackgroundWorker<E> {
         dedup_key: Option<&str>,
         options: SubmitOptions,
     ) -> Result<JobId, Status> {
+        self.submit_with_options_guarded(kind, payload, subject_id, dedup_key, options, |_| Ok(()))
+    }
+
+    fn submit_with_options_guarded(
+        &self,
+        kind: &str,
+        payload: &str,
+        subject_id: Option<&str>,
+        dedup_key: Option<&str>,
+        options: SubmitOptions,
+        admit: impl FnOnce(&rusqlite::Connection) -> Result<(), Status>,
+    ) -> Result<JobId, Status> {
         let SubmitOptions {
             priority,
             duplicate_policy,
         } = options;
         let conn = self.lock_db_for_status()?;
+        admit(&conn)?;
 
         let existing = match (dedup_key, duplicate_policy) {
             (Some(dk), DuplicatePolicy::ReuseExistingOrCompleted) => {

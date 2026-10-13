@@ -74,6 +74,7 @@ impl SandboxManagerService {
         self.submit_artifact_backup(
             sandbox,
             ArtifactBackupSubmission {
+                execution_generation: None,
                 local_artifact_id,
                 artifact_kind: pplx_space_common_core::types::ArtifactKind::Full,
                 artifact_origin: pplx_space_common_core::types::ArtifactOrigin::Suspend,
@@ -223,6 +224,7 @@ impl SandboxManagerService {
             format,
             dedup_key,
             handoff,
+            execution_generation,
         } = submission;
         let config: &crate::snapshot_upload::SnapshotUploadConfig = match request_override {
             Some(c) => c,
@@ -297,13 +299,33 @@ impl SandboxManagerService {
         )
         .map_err(|error| format!("prepare snapshot upload intent failed: {error}"))?;
         let mut storage_uri = jobs.storage_uri.clone();
+        let source_artifact_id = local_artifact_id;
         let local_artifact_id = local_artifact_id.to_string();
 
-        let job_id = match self.snapshot_upload_worker.submit_json(
+        let job_id = match self.snapshot_upload_worker.submit_json_guarded(
             crate::snapshot_upload_jobs::SNAPSHOT_UPLOAD_JOB_KIND,
             &jobs,
             Some(&sandbox.id),
             dedup_key,
+            |db| {
+                if let Some(generation) = execution_generation
+                    && !crate::db::teardown_suspend_owns_backup_source(
+                        db,
+                        &sandbox.id,
+                        generation,
+                        source_artifact_id,
+                        snapshot_dir,
+                    )
+                    .map_err(|error| {
+                        Status::internal(format!("read suspend backup ownership: {error}"))
+                    })?
+                {
+                    return Err(Status::aborted(
+                        "generation suspend no longer owns backup source",
+                    ));
+                }
+                Ok(())
+            },
         ) {
             Ok(id) => id,
             Err(e) => {
@@ -476,6 +498,7 @@ impl SandboxManagerService {
         snapshot_dir: &str,
         format: pplx_space_sbx_mgr_client::proto::SuspendSnapshotFormat,
         dedup_key: Option<&str>,
+        execution_generation: Option<ExecutionGeneration>,
     ) -> Result<SubmitSuspendSnapshotOutcome, ArtifactBackupSubmissionError> {
         let request_override = match self.resolve_org_snapshot_upload_config(&sandbox.id).await {
             OrgSnapshotConfigResolution::Resolved(config) => Some(config),
@@ -503,6 +526,7 @@ impl SandboxManagerService {
                 format,
                 dedup_key,
                 handoff: ArtifactBackupHandoff::TeardownFence,
+                execution_generation,
             },
         )
         .await

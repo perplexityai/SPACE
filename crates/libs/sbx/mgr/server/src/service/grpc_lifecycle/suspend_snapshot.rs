@@ -965,6 +965,7 @@ impl SandboxManagerService {
                         &snapshot_dir_string,
                         published_format,
                         None,
+                        None,
                     )
                     .await
                     .map_err(|error| artifact_backup_fence_status(error.to_string()));

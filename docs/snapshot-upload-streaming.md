@@ -1,5 +1,37 @@
 # Snapshot upload streaming
 
+## Retrying failed generation-suspend backups
+
+`SPACE_SUSPEND_BACKUP_REDRIVE_ENABLED` on sandbox-manager defaults to `false`.
+Do not enable it until the cluster API enforces execution-generation admission
+for new backup attempts. Local ownership cannot detect an execution retired
+only in the control plane while its worker still holds the old suspend job.
+
+When enabled, a terminal failed volume-manager transfer exhausts the
+snapshot-upload worker's bounded observation retries as a **retriable** failure,
+not a permanent generation failure. The generation driver then uses the normal
+artifact-backup submission path to allocate a fresh backup attempt. It verifies
+the published local artifact and checks the generation and artifact again
+atomically with local job admission. Missing or invalid local captures remain
+terminal; failed I/O or retained-source inspection is not evidence of data loss.
+Cluster registration and finalization refusals are not reclassified.
+
+The generation driver's persisted retry delay doubles from 30 seconds to a
+15-minute cap, surviving daemon restarts and caller polling. Periodic lifecycle
+recovery discovers due generation jobs even when the original caller is gone,
+using the existing bounded, deduplicated driver pool. The
+`snapshot.backup.redrive` counter counts re-drive submission attempts, not polls or
+individual file-transfer retries. A non-durable-generation age gauge is not
+provided by this change.
+
+Volume-manager's per-attempt staged copies are disposable. Re-drive uses the
+separate immutable artifact registered with sandbox-manager, not a failed
+transfer's staging path. If that artifact has been removed, this feature does
+not reconstruct it or mark it durable. Historical permanent snapshot-upload
+failures are eligible only when volume-manager still reports a failed member
+transfer for the exact artifact. Missing transfer history is not recovery
+authority; such cases still require an explicit operator recovery decision.
+
 Volume-manager can feed its zstd encoder directly into the object store's
 bounded multipart uploader. For a compressed artifact of size C, this avoids
 writing a C-byte temporary file and reading it again for MD5 and upload. It
