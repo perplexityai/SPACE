@@ -66,6 +66,8 @@ prepare_root_directory() (
     read -r owner mode < <(stat -c '%u %a' .)
     if [[ "$owner" != 0 ]] || (( (8#$mode & 0022) != 0 && (8#$mode & 01000) == 0 )); then
       echo "ERROR: unsafe parent of $kind directory: $target" >&2
+      echo "  $(pwd -P) is owned by uid $owner with mode $mode; it must be root-owned and either sticky or not group/other-writable." >&2
+      echo "  Apply the node cache layout from the provisioning scripts (sticky /space/cache, firecracker and builds) before running scratch builds." >&2
       exit 1
     fi
     expected="${expected}/$part"
@@ -80,7 +82,10 @@ prepare_root_directory() (
   done
   read -r owner mode < <(stat -c '%u %a' .)
   if [[ "$owner" != 0 ]] || { [[ "$kind" == staging ]] && (( (8#$mode & 0022) != 0 )); }; then
+    local requirement="root-owned"
+    [[ "$kind" != staging ]] || requirement="root-owned and not group/other-writable"
     echo "ERROR: unsafe $kind directory: $target" >&2
+    echo "  It is owned by uid $owner with mode $mode; it must be $requirement." >&2
     exit 1
   fi
   if [[ "$kind" == cache ]]; then
