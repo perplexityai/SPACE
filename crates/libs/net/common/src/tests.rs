@@ -158,6 +158,93 @@ fn platform_egress_hard_deny_reserved_ranges_before_open_policy() {
 }
 
 #[test]
+fn dns_evidence_cannot_authorize_non_public_addresses() {
+    // An allowed name only vouches for public addresses.
+    let closed = NetworkPolicyV1 {
+        version: NetworkPolicyVersion::V1,
+        tls_interception: TlsInterception::Off,
+        tls_interception_exemptions: Vec::new(),
+        network_credential_rules: vec![],
+        egress: EgressPolicyV1::new(
+            EgressDefaultAction::Deny,
+            vec![
+                EgressDestinationV1::Domain("allowed.example".parse().unwrap()),
+                EgressDestinationV1::Cidr("172.20.0.0/16".parse().unwrap()),
+            ],
+            vec![],
+        )
+        .unwrap(),
+    };
+    for ip in [
+        "0.1.2.3",
+        "10.0.3.7",
+        "::ffff:10.0.3.7",
+        "100.64.0.9",
+        "100.127.255.254",
+        "172.16.0.1",
+        "192.0.0.8",
+        "192.168.1.1",
+        "198.18.0.1",
+        "224.0.0.251",
+        "255.255.255.255",
+        "::",
+        "64:ff9b:1::a00:1",
+        "fd00::1",
+        "fec0::1",
+        "ff02::1",
+    ] {
+        let ip: IpAddr = ip.parse().unwrap();
+        assert!(is_non_public_dns_answer_ip(ip), "{ip} should be non-public");
+        assert_eq!(
+            closed.egress_decision_for_ip_with_dns_allow(ip, true),
+            EgressDecision::Deny {
+                reason: DenyReason::Default,
+            },
+            "DNS evidence must not authorize {ip}"
+        );
+    }
+
+    // An explicit address allow is the opt-in.
+    assert_eq!(
+        closed.egress_decision_for_ip_with_dns_allow("172.20.1.1".parse().unwrap(), true),
+        EgressDecision::Allow
+    );
+    // Public addresses, including the documentation ranges tests rely on,
+    // still accept DNS evidence.
+    for ip in [
+        "1.1.1.1",
+        "100.63.255.255",
+        "100.128.0.0",
+        "192.0.2.10",
+        "2606:4700::1111",
+    ] {
+        let ip: IpAddr = ip.parse().unwrap();
+        assert!(!is_non_public_dns_answer_ip(ip), "{ip} should be public");
+        assert_eq!(
+            closed.egress_decision_for_ip_with_dns_allow(ip, true),
+            EgressDecision::Allow,
+            "DNS evidence should still authorize {ip}"
+        );
+    }
+    // An open default is unchanged: the guest could already reach these by address.
+    assert_eq!(
+        NetworkPolicyV1::allow_all()
+            .egress_decision_for_ip_with_dns_allow("10.0.3.7".parse().unwrap(), true),
+        EgressDecision::Allow
+    );
+}
+
+#[test]
+fn parsed_non_public_dns_answer_cidrs_cover_public_metadata() {
+    let parsed = parsed_non_public_dns_answer_cidrs();
+    assert_eq!(parsed.len(), NON_PUBLIC_DNS_ANSWER_CIDRS.len());
+    for ((range, cidr), metadata) in parsed.iter().zip(NON_PUBLIC_DNS_ANSWER_CIDRS) {
+        assert_eq!(range.id, metadata.id);
+        assert_eq!(cidr.to_string(), metadata.cidr);
+    }
+}
+
+#[test]
 fn parsed_platform_egress_hard_deny_cover_public_metadata() {
     let parsed = parsed_platform_egress_hard_deny_cidrs();
 

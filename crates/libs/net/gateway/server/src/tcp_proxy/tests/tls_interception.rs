@@ -190,13 +190,15 @@ async fn interception_exemptions_relay_original_tls_only_after_admission() {
             true,
             false,
         ),
+        // The harness listener is only reachable at 0.0.0.0, which is not a
+        // public address, so DNS evidence alone must not admit it.
         (
             "DNS-bound host",
             false,
             Some("sensor.example.test"),
             false,
             false,
-            true,
+            false,
         ),
         (
             "unattributed host",
@@ -319,14 +321,20 @@ async fn interception_exemptions_relay_original_tls_only_after_admission() {
         }
         let (network_state, installed) = ready_policy(policy).await;
         let dns_allow_cache = DnsAllowCache::default();
-        if matches!(
-            name,
-            "exempt host" | "DNS-bound host" | "bound host with IP allow"
-        ) {
+        if matches!(name, "exempt host" | "bound host with IP allow") {
             assert!(dns_allow_cache.observe_response(
                 &dns_a_response("sensor.example.test", [0, 0, 0, 0], 60),
                 &installed,
             ));
+        }
+        if name == "DNS-bound host" {
+            assert!(
+                !dns_allow_cache.observe_response(
+                    &dns_a_response("sensor.example.test", [0, 0, 0, 0], 60),
+                    &installed,
+                ),
+                "an allowed name must not vouch for a non-public address"
+            );
         }
         if name == "wrong address on open policy" {
             assert!(dns_allow_cache.observe_response(

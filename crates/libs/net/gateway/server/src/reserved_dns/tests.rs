@@ -341,6 +341,81 @@ async fn response_keeps_only_reachable_allowed_addresses_and_clamps_ttl() {
 }
 
 #[tokio::test]
+async fn private_answers_for_allowed_names_need_an_explicit_address_allow() {
+    // Whoever controls an allowed zone can point it at a VPC, node
+    // or pod address. Those answers must not reach the guest unless an
+    // explicit address rule (or an open default) already permits them.
+    let resolver = Arc::new(RecordedResolver::with_answer(|question| ResolverAnswer {
+        question: question.clone(),
+        code: ResponseCode::NoError,
+        answers: vec![
+            Record::from_rdata(question.name.clone(), 60, RData::A(A::new(10, 0, 3, 7))),
+            Record::from_rdata(question.name.clone(), 60, RData::A(A::new(100, 64, 0, 9))),
+            Record::from_rdata(question.name.clone(), 60, RData::A(A::new(192, 0, 2, 10))),
+        ],
+        valid_until: Instant::now() + Duration::from_secs(60),
+    }));
+    let core = resolver.core();
+    let a_answers = |wire: &[u8]| -> Vec<Ipv4Addr> {
+        Message::from_vec(wire)
+            .unwrap()
+            .answers
+            .iter()
+            .filter_map(|answer| match answer.data {
+                RData::A(address) => Some(address.0),
+                _ => None,
+            })
+            .collect()
+    };
+
+    let closed = policy(
+        EgressDefaultAction::Deny,
+        &[destination("8.8.8.8"), destination("allowed.example")],
+        &[],
+    );
+    let reply = resolve_wire(
+        &core,
+        "8.8.8.8",
+        &query("allowed.example", RecordType::A),
+        &closed,
+    )
+    .await;
+    assert_eq!(response_code(&reply), ResponseCode::NoError);
+    assert_eq!(a_answers(&reply), vec![Ipv4Addr::new(192, 0, 2, 10)]);
+
+    let opted_in = policy(
+        EgressDefaultAction::Deny,
+        &[
+            destination("8.8.8.8"),
+            destination("allowed.example"),
+            destination("10.0.3.0/24"),
+        ],
+        &[],
+    );
+    let reply = resolve_wire(
+        &core,
+        "8.8.8.8",
+        &query("allowed.example", RecordType::A),
+        &opted_in,
+    )
+    .await;
+    assert_eq!(
+        a_answers(&reply),
+        vec![Ipv4Addr::new(10, 0, 3, 7), Ipv4Addr::new(192, 0, 2, 10)]
+    );
+
+    let open = policy(EgressDefaultAction::Allow, &[], &[]);
+    let reply = resolve_wire(
+        &core,
+        "8.8.8.8",
+        &query("allowed.example", RecordType::A),
+        &open,
+    )
+    .await;
+    assert_eq!(a_answers(&reply).len(), 3);
+}
+
+#[tokio::test]
 async fn negative_answers_and_sanitization_failures_preserve_response_codes() {
     let empty = ResolverAnswer {
         question: Query::query(Name::from_ascii("allowed.example.").unwrap(), RecordType::A),

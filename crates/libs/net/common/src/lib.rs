@@ -144,6 +144,130 @@ pub const PLATFORM_EGRESS_HARD_DENY_CIDRS: &[PlatformEgressHardDenyCidr] = &[
     IPV6_LINK_LOCAL,
 ];
 
+/// A non-public address range that DNS evidence alone can never authorize.
+///
+/// Unlike [`PLATFORM_EGRESS_HARD_DENY_CIDRS`], these are not absolute: an
+/// explicit IP or CIDR allow rule still opts a destination in. What they
+/// remove is the ability of an allowed *name* to vouch for a private address.
+/// Without this, a guest that controls records in an allowed exact or wildcard
+/// zone can point that name at a VPC, node, pod, service or CGNAT address and
+/// have the gateway connect there on its behalf.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NonPublicAddressRange {
+    pub id: &'static str,
+    pub cidr: &'static str,
+    pub description: &'static str,
+}
+
+/// Ranges that require an explicit address allow before the gateway will
+/// connect to them on the strength of a DNS answer. Loopback and link-local
+/// are omitted because [`PLATFORM_EGRESS_HARD_DENY_CIDRS`] already denies them
+/// outright.
+pub const NON_PUBLIC_DNS_ANSWER_CIDRS: &[NonPublicAddressRange] = &[
+    NonPublicAddressRange {
+        id: "this-network",
+        cidr: "0.0.0.0/8",
+        description: "RFC 791 \"this network\"",
+    },
+    NonPublicAddressRange {
+        id: "rfc1918-10",
+        cidr: "10.0.0.0/8",
+        description: "RFC 1918 private range",
+    },
+    NonPublicAddressRange {
+        id: "cgnat",
+        cidr: "100.64.0.0/10",
+        description: "RFC 6598 shared address space (CGNAT, EKS pod/node ranges)",
+    },
+    NonPublicAddressRange {
+        id: "rfc1918-172",
+        cidr: "172.16.0.0/12",
+        description: "RFC 1918 private range",
+    },
+    NonPublicAddressRange {
+        id: "ietf-protocol-assignments",
+        cidr: "192.0.0.0/24",
+        description: "RFC 6890 IETF protocol assignments",
+    },
+    NonPublicAddressRange {
+        id: "rfc1918-192",
+        cidr: "192.168.0.0/16",
+        description: "RFC 1918 private range",
+    },
+    NonPublicAddressRange {
+        id: "benchmarking",
+        cidr: "198.18.0.0/15",
+        description: "RFC 2544 benchmarking range",
+    },
+    NonPublicAddressRange {
+        id: "ipv4-multicast",
+        cidr: "224.0.0.0/4",
+        description: "IPv4 multicast",
+    },
+    NonPublicAddressRange {
+        id: "ipv4-reserved",
+        cidr: "240.0.0.0/4",
+        description: "RFC 1112 reserved range, including limited broadcast",
+    },
+    NonPublicAddressRange {
+        id: "ipv6-unspecified",
+        cidr: "::/128",
+        description: "IPv6 unspecified address",
+    },
+    NonPublicAddressRange {
+        id: "nat64-local",
+        cidr: "64:ff9b:1::/48",
+        description: "RFC 8215 local-use NAT64 prefix",
+    },
+    NonPublicAddressRange {
+        id: "ipv6-ula",
+        cidr: "fc00::/7",
+        description: "RFC 4193 unique local addresses",
+    },
+    NonPublicAddressRange {
+        id: "ipv6-site-local",
+        cidr: "fec0::/10",
+        description: "deprecated IPv6 site-local range",
+    },
+    NonPublicAddressRange {
+        id: "ipv6-multicast",
+        cidr: "ff00::/8",
+        description: "IPv6 multicast",
+    },
+];
+
+static PARSED_NON_PUBLIC_DNS_ANSWER_CIDRS: OnceLock<Vec<(&'static NonPublicAddressRange, IpCidr)>> =
+    OnceLock::new();
+
+/// The non-public range containing `ip`, if any. IPv4-mapped IPv6 inputs are
+/// normalized first, so `::ffff:10.0.0.1` matches `rfc1918-10`.
+pub fn non_public_dns_answer_range_for_ip(ip: IpAddr) -> Option<&'static NonPublicAddressRange> {
+    let ip = normalize_ip(ip);
+    parsed_non_public_dns_answer_cidrs()
+        .iter()
+        .find_map(|(range, cidr)| cidr.contains(ip).then_some(*range))
+}
+
+/// True when DNS evidence alone must not authorize egress to `ip`.
+pub fn is_non_public_dns_answer_ip(ip: IpAddr) -> bool {
+    non_public_dns_answer_range_for_ip(ip).is_some()
+}
+
+fn parsed_non_public_dns_answer_cidrs() -> &'static [(&'static NonPublicAddressRange, IpCidr)] {
+    PARSED_NON_PUBLIC_DNS_ANSWER_CIDRS.get_or_init(|| {
+        NON_PUBLIC_DNS_ANSWER_CIDRS
+            .iter()
+            .map(|range| {
+                let cidr = range
+                    .cidr
+                    .parse::<IpCidr>()
+                    .expect("static non-public DNS answer CIDR must be valid");
+                (range, cidr)
+            })
+            .collect()
+    })
+}
+
 const GUEST_LINK_LOCAL_CARVE_OUT: (Ipv4Addr, u8) = (Ipv4Addr::new(169, 254, 0, 20), 30);
 static PARSED_PLATFORM_EGRESS_HARD_DENY_CIDRS: OnceLock<
     Vec<(&'static PlatformEgressHardDenyCidr, IpCidr)>,
@@ -475,7 +599,10 @@ impl NetworkPolicyV1 {
             EgressAddressMatch::NoMatch => {}
         }
 
-        if dns_allowed_ip {
+        // DNS evidence can only vouch for public addresses. A name in an
+        // allowed zone can be pointed anywhere by whoever controls that zone,
+        // so private destinations need an explicit address allow.
+        if dns_allowed_ip && !is_non_public_dns_answer_ip(ip) {
             return EgressDecision::Allow;
         }
 

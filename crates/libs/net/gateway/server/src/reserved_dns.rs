@@ -18,7 +18,9 @@ use hickory_resolver::proto::rr::rdata::CNAME;
 use hickory_resolver::proto::rr::{DNSClass, Name, RData, Record, RecordType};
 use hickory_resolver::proto::serialize::binary::{BinDecodable, BinDecoder};
 use parking_lot::Mutex;
-use pplx_space_net_common::{DomainName, EgressAddressMatch, NetworkPolicyV1};
+use pplx_space_net_common::{
+    DomainName, EgressAddressMatch, NetworkPolicyV1, is_non_public_dns_answer_ip,
+};
 use tokio::net::{TcpSocket, TcpStream, UdpSocket};
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
@@ -778,11 +780,22 @@ fn sanitize_resolver_answer(
     })
 }
 
+/// Whether an upstream answer address may be returned to the guest.
+///
+/// A non-public address with no explicit allow is dropped unless the policy's
+/// default already lets the guest reach it by address. Otherwise a guest who
+/// controls an allowed zone could use the answer to reach VPC, node, pod or
+/// service addresses. The egress decision enforces the same rule,
+/// so this is defense in depth that also gives the guest a clean
+/// `AddressDenied` instead of a connection that will be refused.
 fn answer_address_allowed(policy: &NetworkPolicyV1, address: IpAddr) -> bool {
-    matches!(
-        policy.egress_match_for_ip(address),
-        EgressAddressMatch::ExplicitAllow | EgressAddressMatch::NoMatch
-    )
+    match policy.egress_match_for_ip(address) {
+        EgressAddressMatch::ExplicitAllow => true,
+        EgressAddressMatch::NoMatch => {
+            !is_non_public_dns_answer_ip(address) || policy.default_action().allows_egress()
+        }
+        EgressAddressMatch::PlatformGuardrail { .. } | EgressAddressMatch::ExplicitDeny => false,
+    }
 }
 
 fn response_message(request: &GuestRequest, code: ResponseCode) -> Message {
