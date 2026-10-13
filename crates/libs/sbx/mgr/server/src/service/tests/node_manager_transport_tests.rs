@@ -121,17 +121,57 @@ async fn fatal_kill_signal_failure_still_schedules_admitted_cleanup() {
     assert_eq!(node_manager.calls(), ["StopProcess", "CleanupSandbox"]);
 }
 
-#[tokio::test]
-async fn expired_encrypted_capture_is_quarantined_without_a_seal_attempt() {
+/// A suspending encrypted row whose capture was recorded `age` ago and never
+/// sealed: its staging holds only the record, built from real metadata.
+fn record_encrypted_capture(
+    conn: &rusqlite::Connection,
+    cache: &Path,
+    id: &str,
+    age: std::time::Duration,
+) -> (LocalArtifactId, std::path::PathBuf) {
     use crate::service::suspend_snapshot_publication as publication;
+    insert_test_sandbox(conn, id, SandboxState::Suspending);
+    conn.execute(
+        "UPDATE sandboxes SET volume_encryption = 1 WHERE id = ?1",
+        [id],
+    )
+    .unwrap();
+    let capture = LocalArtifactId::new();
+    let staging = publication::suspend_snapshot_staging_dir(&cache.join(id), capture);
+    publication::write_full_suspend_artifact(&staging, id, capture, b"captured");
+    let mut metadata: crate::snapshot_upload::SnapshotMeta = serde_json::from_slice(
+        &std::fs::read(staging.join(crate::snapshot_upload::SNAPSHOT_METADATA_FILENAME)).unwrap(),
+    )
+    .unwrap();
+    metadata.encrypted = true;
+    std::fs::remove_dir_all(&staging).unwrap();
+    std::fs::create_dir_all(&staging).unwrap();
+    publication::write_encrypted_capture_record(&staging, &metadata).unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(staging.join(publication::ENCRYPTED_CAPTURE_RECORD))
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() - age)
+        .unwrap();
+    (capture, staging)
+}
+
+/// A node-manager whose release refuses `refusals` times, then seals by
+/// staging both ciphertext artifacts.
+fn sealing_node_manager(refusals: usize) -> crate::node_manager_transport::fake::ServedNodeManager {
     use pplx_space_node_mgr_client::proto::{
         ReleaseEncryptedVolumeRequest, ReleaseEncryptedVolumeResponse,
     };
-    // The holder is gone: a seal attempted now would stage the ciphertext.
-    let node_manager = FakeNodeManager::default()
+    let remaining = Arc::new(Mutex::new(refusals));
+    FakeNodeManager::default()
         .unary(
             "ReleaseEncryptedVolume",
-            |request: ReleaseEncryptedVolumeRequest| {
+            move |request: ReleaseEncryptedVolumeRequest| {
+                let mut remaining = remaining.lock().unwrap();
+                if *remaining > 0 {
+                    *remaining -= 1;
+                    return Err(Status::internal("device or resource busy"));
+                }
                 for name in ["snapshot.luks", "cow.luks"] {
                     std::fs::write(Path::new(&request.stage_dir).join(name), b"ciphertext")
                         .unwrap();
@@ -139,47 +179,99 @@ async fn expired_encrypted_capture_is_quarantined_without_a_seal_attempt() {
                 Ok(ReleaseEncryptedVolumeResponse::default())
             },
         )
-        .serve();
-    let conn = crate::db::test_conn();
-    let id = SandboxId::new().to_string();
-    insert_test_sandbox(&conn, &id, SandboxState::Suspending);
-    conn.execute(
-        "UPDATE sandboxes SET volume_encryption = 1 WHERE id = ?1",
-        [&id],
-    )
-    .unwrap();
-    let cache = tempfile::tempdir().unwrap();
-    let capture = LocalArtifactId::new();
-    let staging = publication::suspend_snapshot_staging_dir(&cache.path().join(&id), capture);
-    publication::write_full_suspend_artifact(&staging, &id, capture, b"captured");
-    let sidecar = staging.join(crate::snapshot_upload::SNAPSHOT_METADATA_FILENAME);
-    let mut metadata: crate::snapshot_upload::SnapshotMeta =
-        serde_json::from_slice(&std::fs::read(&sidecar).unwrap()).unwrap();
-    metadata.encrypted = true;
-    std::fs::remove_file(sidecar).unwrap();
-    publication::write_encrypted_capture_record(&staging, &metadata).unwrap();
-    std::fs::File::options()
-        .write(true)
-        .open(staging.join(publication::ENCRYPTED_CAPTURE_RECORD))
-        .unwrap()
-        .set_modified(
-            std::time::SystemTime::now()
-                - publication::ENCRYPTED_SEAL_RETRY_WINDOW
-                - std::time::Duration::from_secs(60),
-        )
-        .unwrap();
-    let sockets = tempfile::tempdir().unwrap();
-    let service = service_with_node_manager(conn, node_manager.connector(), sockets.path());
+        .serve()
+}
 
+/// One periodic publication-recovery pass over the row.
+async fn recover_batch(service: &SandboxManagerService, cache: &Path, id: &str) {
     service
         .recover_deferred_suspend_publication_batch(
-            cache.path(),
-            vec![service.lookup_sandbox(&id).unwrap()],
+            cache,
+            vec![service.lookup_sandbox(id).unwrap()],
             &CancellationToken::new(),
             &mut Default::default(),
             (),
         )
         .await;
+}
+
+#[tokio::test]
+async fn unsealed_encrypted_capture_survives_restart_and_publishes_once_sealed() {
+    use crate::service::suspend_snapshot_publication as publication;
+    let node_manager = sealing_node_manager(1);
+    let conn = crate::db::test_conn();
+    let id = SandboxId::new().to_string();
+    let cache = tempfile::tempdir().unwrap();
+    let (capture, staging) =
+        record_encrypted_capture(&conn, cache.path(), &id, std::time::Duration::ZERO);
+    let sockets = tempfile::tempdir().unwrap();
+    let service = service_with_node_manager(conn, node_manager.connector(), sockets.path());
+
+    // The live seal failure, a restart and a refused retry all keep it.
+    let disposition = service.record_suspend_snapshot_publication_failure_after_staging(
+        &id,
+        &cache.path().join(&id),
+        &staging,
+        "seal/stage encrypted snapshot volume failed: device busy",
+        &Default::default(),
+    );
+    assert_eq!(
+        disposition,
+        crate::service::grpc_lifecycle::SuspendSnapshotStagingDisposition::Preserve
+    );
+    let startup = service
+        .recover_prelaunch_startup_states_in(cache.path(), &Default::default())
+        .unwrap();
+    assert_eq!(
+        startup[0].outcome,
+        crate::db::StartupRecoveryOutcome::Deferred
+    );
+    recover_batch(&service, cache.path(), &id).await;
+    let row = service.lookup_sandbox(&id).unwrap();
+    assert_eq!(row.state, SandboxState::Suspending);
+    assert!(staging.join(publication::ENCRYPTED_CAPTURE_RECORD).exists());
+
+    // Once the holder exits, the next pass seals and publishes that capture.
+    recover_batch(&service, cache.path(), &id).await;
+    assert_eq!(
+        node_manager.calls(),
+        ["ReleaseEncryptedVolume", "ReleaseEncryptedVolume"]
+    );
+    let row = service.lookup_sandbox(&id).unwrap();
+    assert_eq!(row.state, SandboxState::CleanupRequired);
+    assert_eq!(row.current_local_artifact_id, Some(capture));
+    let published = publication::canonical_suspend_snapshot_dir(&cache.path().join(&id));
+    assert!(
+        !published
+            .join(publication::ENCRYPTED_CAPTURE_RECORD)
+            .exists()
+    );
+    let sidecar: crate::snapshot_upload::SnapshotMeta = serde_json::from_slice(
+        &std::fs::read(published.join(crate::snapshot_upload::SNAPSHOT_METADATA_FILENAME)).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(sidecar.local_artifact_id, Some(capture));
+    assert!(sidecar.encrypted);
+}
+
+#[tokio::test]
+async fn expired_encrypted_capture_is_quarantined_without_a_seal_attempt() {
+    use crate::service::suspend_snapshot_publication as publication;
+    // The holder is gone: a seal attempted now would succeed.
+    let node_manager = sealing_node_manager(0);
+    let conn = crate::db::test_conn();
+    let id = SandboxId::new().to_string();
+    let cache = tempfile::tempdir().unwrap();
+    let (_, staging) = record_encrypted_capture(
+        &conn,
+        cache.path(),
+        &id,
+        publication::ENCRYPTED_SEAL_RETRY_WINDOW + std::time::Duration::from_secs(60),
+    );
+    let sockets = tempfile::tempdir().unwrap();
+    let service = service_with_node_manager(conn, node_manager.connector(), sockets.path());
+
+    recover_batch(&service, cache.path(), &id).await;
 
     assert!(
         node_manager.calls().is_empty(),
