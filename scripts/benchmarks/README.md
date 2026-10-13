@@ -94,3 +94,90 @@ restore. Suspend has just written that file, so it is usually still in the host
 page cache, but under memory pressure the read can warm pages that restore then
 reads. Use `--no-compressed-size` for runs where restore timing matters more
 than compressed size.
+
+## Cross-node reconnect benchmark
+
+`bench-sbx-xnode.py` is Stage 2 of the balloon experiment. It measures how long
+it takes to reconnect to a suspended sandbox on a different worker, which has
+to download the snapshot from object storage. Stage 1 cannot measure this
+because it runs on one worker.
+
+It runs from an operator machine on a small pool of dedicated workers. It needs
+two things:
+
+- An ECW API key (`$E2B_API_KEY`) and domain. Wake-ups go through ECW connect,
+  the same path Computer uses, so the server-side
+  `sandbox.reconnect.duration_ms` metric records every sample.
+- A kubectl context for the pool's cluster. The harness cordons pool workers
+  and reads their sandbox-manager logs.
+
+Each block runs one variant, with one template, for `--block-minutes`:
+
+1. Reservoir sandboxes are created, run their workload, and are suspended.
+   After that the running population and bystanders are created. Every
+   sandbox gets the Stage 1 correctness pattern.
+2. One pool worker at a time is the source. It is cordoned, and only
+   sandboxes suspended on it are woken, so each restore lands on another
+   worker. The source rotates every `--rotate-seconds`. A sandbox is not
+   woken until `--portable-wait-s` after its suspend. With `--database-url`,
+   it also waits for the API's restore-portability check. Before the snapshot
+   reaches object storage, the API sends the restore back to the source and
+   ignores the cordon.
+3. Wake-ups arrive at random at `--rate` per minute (`--load loaded`), or one
+   at a time every `--quiet-interval-s` (`--load quiet`). Each wake-up is
+   paired with the suspend of a sandbox on a target worker, right after its
+   workload ends. This makes uploads compete with downloads and refills the
+   reservoir.
+4. Reconnect time runs from the ECW connect request to the first `true`
+   command returning, timed on the operator machine. The guest pattern is then
+   re-hashed (`verify_ms`, untimed). Bystanders run `true` every
+   `--probe-interval-s` (foreground metric F1).
+5. After the block, every worker is schedulable again. The harness reads the
+   sandbox-manager `runtime_activated` events and records where each restore
+   landed and whether it downloaded its snapshot (`wake_placement` rows). Then
+   it deletes the block's sandboxes.
+
+The harness only cordons nodes listed in `--nodes`. It refuses to start if one
+of them is already cordoned. It writes `cordon.state` before cordoning a node,
+and it uncordons on exit, including Ctrl-C. If a run dies, run it again with
+the same `--output-dir` and `--repair`.
+
+```sh
+export E2B_API_KEY=...
+scripts/benchmarks/bench-sbx-xnode.py \
+  --context <kube-context> --nodes ip-10-0-1-1,ip-10-0-2-2,ip-10-0-3-3 \
+  --domain <ecw-domain> --sandbox-namespace <ns> --node-namespace <ns> \
+  --variant baseline=bench-balloon-baseline \
+  --variant reporting=bench-balloon-reporting \
+  --load loaded --rate 20 --blocks-per-variant 4 \
+  --output-dir ./bench-results/xnode-run1 --dry-run
+
+python3 scripts/benchmarks/bench-sbx-xnode-summary.py \
+  ./bench-results/xnode-run1/results.jsonl --baseline baseline
+```
+
+`--dry-run` prints the block order and the expected number of measured wake-ups
+for each variant. Blocks alternate forward and reversed passes, for example
+baseline, reporting, reporting, baseline. Use `--order` to set the order by
+hand. To calibrate `--rate`, run baseline-only blocks and raise the rate until
+staging p95 reaches 15 s and writeback wait reaches 0.5 s in Datadog.
+
+The summary counts only `cross_node_download` samples. It drops the first
+`--warmup-minutes` of each block. It scores failures at the wake timeout in a
+failure-inclusive p95. It compares each variant with the baseline using 98.3%
+bootstrap intervals and the Metrics Spec decision rules:
+
+- `stop_now`: a correctness failure.
+- `regression_stop`: reconnect p99 or bystander p95 is more than 5% worse.
+- `inconclusive`: fewer than 2,000 samples or 4 blocks, or the interval
+  includes zero.
+- `proceed_pending_cause`: p95 improves by at least max(10%, 1 s) and every
+  variant block beats its nearest baseline block.
+- `stop`: anything else.
+
+`proceed_pending_cause` still needs one cause metric (bytes, codec wait,
+writeback wait, or disk pressure) to move the same way in Datadog. The summary
+cannot check that. Quiet runs are report-only.
+
+The harness does not yet collect the fio probe (F2), balloon statistics,
+per-VM memory, or disk and btrfs metrics.
