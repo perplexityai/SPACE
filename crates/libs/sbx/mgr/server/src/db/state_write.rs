@@ -225,8 +225,8 @@ edge_table! {
 
     // Pause and resident resume.
 
-    /// `pause` and the suspend auto-pause, after `transition(Pausing)` on the
-    /// read.
+    /// `pause` after `transition(Pausing)` on the read, and the suspend
+    /// auto-pause after reading `started`.
     PAUSE_BEGIN: Request, of(&[Started]) => Pausing;
     /// `pause` and the suspend auto-pause, after node-manager confirms the
     /// pause.

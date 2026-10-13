@@ -224,6 +224,13 @@ pub(super) async fn service_cleanup_via_node_with_options(
 
 pub(super) use crate::db::CleanupCompletion;
 
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the update_state parity tests call it; production writes use update_state_from"
+    )
+)]
 pub(super) fn require_state_write(
     result: rusqlite::Result<crate::db::SandboxStateWriteOutcome>,
     context: &'static str,

@@ -10,9 +10,7 @@ use super::activation_support::{
 use super::cleanup::{
     AsyncCleanupRequest, CleanupAdmission, CleanupDispatchDisposition, SynchronousCleanupRequest,
 };
-use super::cleanup_support::{
-    CleanupCompletion, CleanupLockTryResult, OwnedCleanupFenceGuard, require_state_write,
-};
+use super::cleanup_support::{CleanupCompletion, CleanupLockTryResult, OwnedCleanupFenceGuard};
 use super::create_support::SUSPEND_CHECKPOINT;
 use super::network_runtime::*;
 use super::recovery::SuspendSnapshotPublicationRecoveryOrigin;
@@ -54,9 +52,9 @@ pub(super) use self::artifact_backup::{
     reupload_precondition_for_cluster_api_env, reupload_resolution_to_config,
 };
 use self::backup_submission::suspend_snapshot_metadata;
-use self::pause_resume::pause_with_reconciliation;
 #[cfg(test)]
 use self::pause_resume::{PauseReconciliationOutcome, pause_reconciliation_outcome};
+use self::pause_resume::{pause_with_reconciliation, prepare_guest_for_pause};
 #[cfg(test)]
 pub(super) use self::suspend::classify_suspend_after_wake;
 use self::suspend::emit_suspend_failed_event;

@@ -37,7 +37,7 @@ fn roll_back_pause_best_effort(
 }
 
 #[cfg(test)]
-type GuestPreparation = Arc<
+pub(super) type GuestPreparation = Arc<
     dyn Fn(
             String,
         ) -> futures_util::future::BoxFuture<
@@ -49,13 +49,13 @@ type GuestPreparation = Arc<
 
 #[cfg(test)]
 tokio::task_local! {
-    /// Replaces pause's guest snapshot preparation, which dials the host's
-    /// per-sandbox spaced-host socket, and lets a test act between pause's
-    /// state writes.
-    static GUEST_PREPARATION: GuestPreparation;
+    /// Replaces the guest snapshot preparation of pause and the suspend
+    /// auto-pause, which dials the host's per-sandbox spaced-host socket, and
+    /// lets a test act between their state writes.
+    pub(super) static GUEST_PREPARATION: GuestPreparation;
 }
 
-async fn prepare_guest_for_pause(
+pub(super) async fn prepare_guest_for_pause(
     sandbox_id: &str,
     budget: GuestSnapshotPreparationBudget,
 ) -> Result<(), crate::guest_filesystem_flush::GuestFlushError> {

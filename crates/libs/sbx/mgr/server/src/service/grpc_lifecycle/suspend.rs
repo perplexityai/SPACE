@@ -2,7 +2,7 @@
 //! and suspend preparation once the locks are held.
 
 use super::*;
-use crate::service::cleanup_support::StateWriteRejected;
+use crate::service::cleanup_support::{StateWriteRejected, require_state_write_from};
 
 fn completed_suspend_retry_response(
     sandbox: &crate::db::SandboxRow,
@@ -354,22 +354,26 @@ impl SandboxManagerService {
                 Status::internal(error)
             })?;
             self.ensure_teardown_suspend_owner_for_durability(&sandbox.id, context.durability)?;
+            // The locks held here do not exclude a writer that takes none of
+            // them, such as warm-snapshot Start, so each auto-pause write names
+            // the state it expects instead of overwriting whatever it finds.
             {
                 let db = self.db_conn()?;
-                require_state_write(
-                    crate::db::update_state(&db, &sandbox.id, SandboxState::Pausing),
+                require_state_write_from(
+                    crate::db::update_state_from(&db, &sandbox.id, &crate::db::edges::PAUSE_BEGIN),
                     "begin checkpoint pause",
                 )?;
             }
             self.watchdog.record_lifecycle_edge(&sandbox.id).await;
             let guest_preparation_budget = context.guest_preparation_budget();
-            if let Err(e) =
-                prepare_guest_for_vm_snapshot_via_spaced_host(&sandbox.id, guest_preparation_budget)
-                    .await
-            {
+            if let Err(e) = prepare_guest_for_pause(&sandbox.id, guest_preparation_budget).await {
                 let db = self.db_conn()?;
-                if let Err(error) = require_state_write(
-                    crate::db::update_state(&db, &sandbox.id, SandboxState::Started),
+                if let Err(error) = require_state_write_from(
+                    crate::db::update_state_from(
+                        &db,
+                        &sandbox.id,
+                        &crate::db::edges::PAUSE_ROLLBACK,
+                    ),
                     "roll back checkpoint pause preparation",
                 ) {
                     tracing::warn!(sandbox_id = %sandbox.id, %error, "failed to roll back checkpoint pause state");
@@ -442,8 +446,12 @@ impl SandboxManagerService {
             }
             {
                 let db = self.db_conn()?;
-                require_state_write(
-                    crate::db::update_state(&db, &sandbox.id, SandboxState::Paused),
+                require_state_write_from(
+                    crate::db::update_state_from(
+                        &db,
+                        &sandbox.id,
+                        &crate::db::edges::PAUSE_COMPLETE,
+                    ),
                     "complete checkpoint pause",
                 )?;
             }
@@ -528,3 +536,6 @@ impl SandboxManagerService {
         Ok((blocking_local_artifact_id, publication))
     }
 }
+
+#[cfg(test)]
+mod tests;
