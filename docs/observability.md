@@ -294,6 +294,49 @@ SQLite migration pool's wait is counted in the PostgreSQL pool metric. Set
 Sidecars and guest workers inherit `SPACE_TRACE_FILTER`, so a child exports the
 same span set as its parent.
 
+## Datadog trace chunks
+
+The native Datadog tracer sends the spans a process records for one trace as a
+chunk. SPACE leaves partial flush off, so a chunk is sent when the process's
+count of the trace's open spans reaches zero, and a span is top-level when its
+parent is not in its chunk or belongs to another service. A count that reaches
+zero early sends the chunk early: every span of the trace that ends afterward
+arrives in a chunk of its own, as a top-level span with its own trace metrics,
+and need not carry the trace's sampling decision. OTLP backends assemble spans
+by ID and show the same trace intact, so this shows only on the native path.
+
+Spans are parented so that each request is counted once in each process it
+reaches:
+
+- A request's server span is the only span parented on the caller's
+  extracted context. Handler spans are ordinary children of the server span,
+  created in its scope; a handler never extracts the caller's context again.
+- Work that outlives the request, or is saved and run later, starts a new root
+  with a span link to the context that started it.
+- A job its submitter waits for runs as a child of the waiting span, through
+  `BackgroundWorker::submit_and_wait`. Any other job is a linked root.
+
+One case remains that SPACE cannot fix. datadog-opentelemetry 0.5.2 counts no
+span whose parent is remote when the process already has that trace open
+(`TraceRegistry::register_local_root_span`), yet that span's end still lowers
+the count. Two requests of one trace that overlap in one process, concurrent
+calls or a call back into a process whose request is still open, therefore
+still fragment under native Datadog until the tracer counts that span.
+
+A change to span parenting, propagation or the trace exporter is validated by
+a Fake Intake capture in Datadog mode
+(`SPACE_KIND_TELEMETRY_MODE=datadog SPACE_KIND_DATADOG_MODE=fakeintake`) of a
+sandbox lifecycle; see
+[the Kind capture](../infra/space/kind/README.md#datadog-optional). The check
+is bounded by the traces that window produced. It fails when the capture holds
+no SPACE trace, or when a span other than a server or consumer span has its
+parent in another process, or shares the remote parent of a request span in
+its own process: SPACE parented work on remote context. It reports, without
+failing, each service's chunks split by the upstream miscount above. A span
+parented on context its own process saved looks the same in the chunks, so
+the split report, not the failure, shows it. A capture whose workloads export
+traces any other way is not checked.
+
 ## Datadog addresses
 
 The native paths keep their existing defaults. DogStatsD goes to

@@ -497,6 +497,13 @@ ten-second DogStatsD bucket. Normalized metrics include that bucket (which can
 contain up to nine seconds of earlier activity); logs use the exact timestamp.
 Raw payloads are retained for interpreting boundary and late-arrival effects.
 
+When the workloads export traces through the native Datadog tracer, capture
+then checks the SPACE traces it received. With the evidence already written,
+it fails if there are none or if SPACE parented a span other than a request's
+entry span on remote context, and it reports the chunks the tracer split.
+`space-trace-chunks.json` holds the examples and counts; see
+[Datadog trace chunks](../../../docs/observability.md#datadog-trace-chunks).
+
 The three-state smoke specification, pinned inputs, measured results and
 guest/worker coverage limits are recorded with the run's evidence rather than
 in this repository.

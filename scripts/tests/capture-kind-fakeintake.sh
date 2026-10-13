@@ -10,6 +10,11 @@
 # payloads emitted before the window from arriving after the reset and being
 # misattributed to the next phase. Background Agent and Kubernetes telemetry is
 # still expected; comparison summaries select only SPACE signals.
+#
+# When the workloads export traces through the native Datadog tracer, capture
+# then fails, after writing everything, when it holds no SPACE trace or SPACE
+# parented a span on remote context; see
+# scripts/tests/observability/datadog_trace_chunks.py.
 set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -35,7 +40,7 @@ EOF
 
 require_tools() {
   local tool
-  for tool in curl git jq kubectl; do
+  for tool in "$@"; do
     command -v "$tool" >/dev/null 2>&1 || {
       echo "ERROR: required command not found: $tool" >&2
       exit 1
@@ -172,9 +177,16 @@ capture() { # phase window
   mv "$prepared_state" "$output/prepare.json"
 
   echo "$output"
+  if jq -e '[.[].telemetry_env[] | select(.name == "SPACE_TRACE_EXPORTER"
+      and .value != "off") | .value] | unique == ["datadog"]' \
+    "$output/workloads.json" >/dev/null; then
+    require_tools python3 zstd
+    python3 "$SCRIPT_DIR/observability/datadog_trace_chunks.py" \
+      "$output/traces-raw.json" "$output/space-trace-chunks.json"
+  fi
 }
 
-require_tools
+require_tools curl git jq kubectl
 case "${1:-}" in
   prepare)
     [[ $# -eq 1 ]] || { usage >&2; exit 2; }
