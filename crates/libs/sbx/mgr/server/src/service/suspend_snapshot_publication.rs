@@ -1046,6 +1046,8 @@ pub(super) fn find_complete_suspend_snapshot_staging_dir(
         })
         .collect::<Vec<_>>();
     paths.sort();
+    let now = std::time::SystemTime::now();
+    let mut awaiting_seal = None;
     for path in paths {
         match validate_complete_suspend_snapshot_dir(&path, verdicts) {
             Ok(local_artifact_id) => {
@@ -1057,11 +1059,10 @@ pub(super) fn find_complete_suspend_snapshot_staging_dir(
             // Skipping an unverified staging generation could pick a sibling
             // or conclude that no usable artifact exists.
             Err(error) if error.is_inconclusive() => return Err(error.into()),
-            // A finished capture whose seal can still succeed is not missing.
-            Err(_) if encrypted_seal_pending(&path, std::time::SystemTime::now()) => {
-                return Err(SuspendSnapshotPublicationError::EncryptedSealPending {
-                    staging_dir: path_label(&path),
-                });
+            // A finished capture whose seal can still succeed is not missing,
+            // but a later complete capture supersedes it.
+            Err(_) if encrypted_seal_pending(&path, now) => {
+                awaiting_seal.get_or_insert(path);
             }
             Err(error) => {
                 tracing::warn!(
@@ -1072,7 +1073,12 @@ pub(super) fn find_complete_suspend_snapshot_staging_dir(
             }
         }
     }
-    Ok(None)
+    match awaiting_seal {
+        Some(path) => Err(SuspendSnapshotPublicationError::EncryptedSealPending {
+            staging_dir: path_label(&path),
+        }),
+        None => Ok(None),
+    }
 }
 
 pub(super) fn find_suspend_snapshot_staging_residue(
