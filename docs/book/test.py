@@ -66,22 +66,66 @@ class GuideTests(unittest.TestCase):
                 source = Path(name)
                 (root / source).parent.mkdir(parents=True, exist_ok=True)
                 shutil.copyfile(build.ROOT / source, root / source)
+            theme = root / "docs/site/theme"
+            theme.mkdir(parents=True)
+            for name in build.THEME_ASSETS:
+                shutil.copyfile(build.ROOT / "docs/site/theme" / name, theme / name)
             (root / "docs/operator-secret.md").write_text("DO_NOT_PUBLISH")
+            (theme / "unapproved.css").write_text("DO_NOT_PUBLISH")
             stage = Path(temp) / "stage"
             with patch.object(build, "ROOT", root):
                 build.stage_sources(stage)
             self.assertEqual(
                 {file.relative_to(stage).as_posix() for file in stage.rglob("*") if file.is_file()},
                 {"book.toml", "src/SUMMARY.md", *build.ASSETS, *build.LIBRARY_ASSETS,
+                 *(f"theme/{name}" for name in build.THEME_ASSETS),
                  *(f"src/{name}" for name in build.CHAPTERS)},
             )
             with patch.object(build, "ROOT", root):
                 for name in build.CHAPTERS:
                     self.assertEqual((stage / "src" / name).read_text(), build.chapter_markdown(name))
+            for name in build.THEME_ASSETS:
+                original = (theme / name).read_bytes()
+                with self.subTest(asset=name, failure="missing"):
+                    (theme / name).unlink()
+                    with self.assertRaisesRegex(ValueError, "Missing or unsafe theme asset"):
+                        build.stage_theme_assets(root, Path(temp) / "rejected")
+                    (theme / name).write_bytes(original)
+                with self.subTest(asset=name, failure="symlink"):
+                    (theme / name).unlink()
+                    (theme / name).symlink_to(stage / "theme" / name)
+                    with self.assertRaisesRegex(ValueError, "Missing or unsafe theme asset"):
+                        build.stage_theme_assets(root, Path(temp) / "rejected")
+                    (theme / name).unlink()
+                    (theme / name).write_bytes(original)
+                if name != "assets.json":
+                    with self.subTest(asset=name, failure="changed"):
+                        (theme / name).write_bytes(original + b"changed")
+                        with self.assertRaisesRegex(ValueError, "Changed theme asset"):
+                            build.stage_theme_assets(root, Path(temp) / "rejected")
+                        (theme / name).write_bytes(original)
+            original = (theme / "assets.json").read_bytes()
+            for name in ("unapproved.css", "../outside", str(theme / "curiosity.css")):
+                with self.subTest(manifest_entry=name):
+                    manifest = json.loads(original)
+                    manifest["files"][name] = "unused"
+                    (theme / "assets.json").write_text(json.dumps(manifest))
+                    with self.assertRaisesRegex(ValueError, "Unexpected theme asset manifest"):
+                        build.stage_theme_assets(root, Path(temp) / "rejected")
+            (theme / "assets.json").write_bytes(original)
+            alias = Path(temp) / "alias"
+            alias.symlink_to(stage / "theme", target_is_directory=True)
+            with self.assertRaisesRegex(ValueError, "unsafe theme destination"):
+                build.stage_theme_assets(root, alias)
         config = tomllib.loads((build.ROOT / "docs/book/book.toml").read_text())
         self.assertFalse(config["build"]["use-default-preprocessors"])
         self.assertFalse(config["build"]["create-missing"])
         self.assertFalse(list(self.output.rglob("*.md")))
+        metadata = json.loads((self.output / "build.json").read_text())
+        for name in build.THEME_ASSETS:
+            expected = (build.ROOT / "docs/site/theme" / name).read_bytes()
+            self.assertEqual((self.output / "theme" / name).read_bytes(), expected)
+            self.assertEqual(metadata["files"][f"theme/{name}"], sha256(expected).hexdigest())
 
     def test_every_top_level_page_is_classified(self):
         tracked = build.git("ls-files", "docs/*.md").splitlines()

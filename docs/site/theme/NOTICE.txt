@@ -1,0 +1,10 @@
+Inter 4.1
+Copyright (c) 2016 The Inter Project Authors (https://github.com/rsms/inter)
+
+InterVariable.woff2 and InterVariable-Italic.woff2 are unmodified files from:
+https://github.com/rsms/inter/releases/download/v4.1/Inter-4.1.zip
+Archive SHA-256: 9883fdd4a49d4fb66bd8177ba6625ef9a64aa45899767dde3d36aa425756b11e
+
+The font software is licensed under the SIL Open Font License 1.1.
+The complete license and copyright notice are in LICENSE-Inter.txt.
+The documentation stylesheet is covered by SPACE's Apache-2.0 license.

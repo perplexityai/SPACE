@@ -79,6 +79,9 @@ for (const file of readdirSync(resolve(here, 'node_modules/redoc/bundles'))) {
 cpSync(resolve(here, 'node_modules/redoc/LICENSE'), resolve(output, 'REDOC-LICENSE'));
 cpSync(resolve(here, 'reference.css'), resolve(output, 'reference.css'));
 cpSync(resolve(here, 'schema-navigation.js'), resolve(output, 'schema-navigation.js'));
+const themeFiles = JSON.parse(execFileSync('python3', [
+  resolve(root, 'docs/site/theme_assets.py'), resolve(output, 'theme'),
+], { encoding: 'utf8' }));
 const options = JSON.parse(readFileSync(resolve(here, 'redoc-options.json')));
 // Presentation only: avoid JS rounding int64 bounds. Preserve the exact bound
 // in the field description; the downloaded document remains byte-identical.
@@ -161,8 +164,11 @@ writeFileSync(resolve(output, 'index.html'), `<!doctype html>
 <footer><a href="build.json">Build details</a></footer>
 <script src="redoc.standalone.js"></script><script src="schema-navigation.js"></script><script src="reference.js"></script>
 </body></html>\n`);
-metadata.files = Object.fromEntries(readdirSync(output).map(file => [
-  file, createHash('sha256').update(readFileSync(resolve(output, file))).digest('hex'),
-]));
+metadata.files = {
+  ...Object.fromEntries(readdirSync(output).filter(file => file !== 'theme').map(file => [
+    file, createHash('sha256').update(readFileSync(resolve(output, file))).digest('hex'),
+  ])),
+  ...Object.fromEntries(Object.entries(themeFiles).map(([file, hash]) => [`theme/${file}`, hash])),
+};
 writeFileSync(resolve(output, 'build.json'), `${JSON.stringify(metadata, null, 2)}\n`);
 console.log(`Built ${operations.length} operations from ${commit}${metadata.dirty ? ' (dirty)' : ''} in target/docs/api`);

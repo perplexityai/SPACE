@@ -1,0 +1,30 @@
+/* Shared documentation primitives; each renderer opts into their use. */
+@font-face {
+  font-family: "Inter";
+  src: url("InterVariable.woff2") format("woff2");
+  font-style: normal;
+  font-weight: 100 900;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "Inter";
+  src: url("InterVariable-Italic.woff2") format("woff2");
+  font-style: italic;
+  font-weight: 100 900;
+  font-display: swap;
+}
+
+:root {
+  --docs-font-body: "Inter", system-ui, sans-serif;
+  --docs-font-code: ui-monospace, SFMono-Regular, Consolas, monospace;
+  --docs-color-background: #f7f9f9;
+  --docs-color-surface: #ffffff;
+  --docs-color-text: #263333;
+  --docs-color-muted: #526565;
+  --docs-color-accent: #176f72;
+  --docs-color-border: #dce5e5;
+  --docs-header-height: 64px;
+  --docs-utility-height: 48px;
+  --docs-sidebar-width: 248px;
+}

@@ -8,11 +8,15 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 from urllib.parse import unquote, urlsplit, urlunsplit
 
 ROOT = Path(__file__).resolve().parents[2]
 OUTPUT = ROOT / "target/docs/guide"
+sys.path.insert(0, str(ROOT / "docs/site"))
+from theme_assets import ASSETS as THEME_ASSETS, stage_theme_assets
+
 SUMMARY = ROOT / "docs/book/SUMMARY.md"
 # Explicit publication boundary: exactly the chapters linked from SUMMARY.md.
 # No recursive copies from docs/.
@@ -66,6 +70,7 @@ def stage_sources(stage):
         shutil.copyfile(ROOT / "docs/book" / asset, stage / asset)
     for asset, source in LIBRARY_ASSETS.items():
         shutil.copyfile(ROOT / source, stage / asset)
+    stage_theme_assets(ROOT, stage / "theme")
     for chapter in CHAPTERS:
         (stage / "src" / chapter).write_text(chapter_markdown(chapter))
 
@@ -160,6 +165,9 @@ def build():
         rendered = stage / "book"
         for asset in LIBRARY_ASSETS:
             shutil.copyfile(stage / asset, rendered / asset)
+        (rendered / "theme").mkdir(exist_ok=True)
+        for asset in THEME_ASSETS:
+            shutil.copyfile(stage / "theme" / asset, rendered / "theme" / asset)
         for name in ("toc.html", "toc.js"):
             page = rendered / name
             html = sidebar_links(page.read_text(), rendered, commit, name == "toc.html")
