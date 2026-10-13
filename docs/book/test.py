@@ -149,6 +149,7 @@ class GuideTests(unittest.TestCase):
                 "observability.html",
                 "troubleshooting.html",
                 "warm-pools.html",
+                "base-snapshots.html",
             ],
             "development-overview.html": ["architecture.html", "development.html", "contributing.html"],
         }.items():

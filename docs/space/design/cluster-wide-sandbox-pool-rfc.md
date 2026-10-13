@@ -6,9 +6,10 @@ Author: Nick Dujay
 
 Status: implemented and extended. This is the original design record. For how
 to configure and use warm pools today, see
-[Warm pools and base snapshots](../../warm-pools.md). Later work added rolling
+[Warm pools](../../warm-pools.md). Later work added rolling
 warm-pool policies, admission-time claims for native creates, encryption-aware
-pools and additional slot states; the metric names below were also replaced by
+pools and additional slot states. The config table also gained
+`managed_by`, `encryptable`, disk and disk-I/O columns; the metric names below were also replaced by
 the `warm_pool.*` metrics in that guide.
 
 ## Problem
@@ -112,11 +113,30 @@ A slot is `ready` only when:
 
 ## Data Model
 
-One table:
+Two tables. `kubernetes_pool_configs` holds the admin-editable config rows
+described in [MVP Scope](#mvp-scope); `kubernetes_pool_slots` holds pool
+inventory for each config.
+
+```
+kubernetes_pool_configs
+- id UUID PRIMARY KEY
+- template_release_id UUID NOT NULL REFERENCES template_releases(id)
+- vcpu INT NOT NULL
+- memory_mib INT NOT NULL
+- target_ready_slots INT NOT NULL
+- refill_per_tick INT NOT NULL
+- max_warming_slots INT NOT NULL
+- namespace TEXT NOT NULL
+- enabled BOOLEAN NOT NULL DEFAULT false
+- created_at TIMESTAMPTZ NOT NULL
+- updated_at TIMESTAMPTZ NOT NULL
+```
 
 ```
 kubernetes_pool_slots
 - id UUID PRIMARY KEY
+- config_id UUID NOT NULL REFERENCES kubernetes_pool_configs(id)
+- template_release_id UUID NOT NULL
 - reserved_sandbox_id UUID NOT NULL UNIQUE
 - template_name TEXT NOT NULL
 - content_hash TEXT NOT NULL
