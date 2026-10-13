@@ -33,7 +33,7 @@ fn trace_exporter_resolution_covers_every_selector_and_capability() {
         ("otlp", DATADOG, false, Ok(TraceExporter::Otlp)),
         ("off", DATADOG, true, Ok(TraceExporter::Off)),
         ("off", NO_TELEMETRY, false, Ok(TraceExporter::Off)),
-        // journald is a metrics-only legacy sink; it is not a trace exporter.
+        // journald is not a trace exporter.
         ("journald", DATADOG, true, Err("invalid")),
         // An uncompiled or unknown selector is a configuration error.
         ("datadog", OTEL_ONLY, true, Err("unavailable")),

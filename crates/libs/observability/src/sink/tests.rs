@@ -1,5 +1,5 @@
 use super::{
-    MetricsSinkChoice, ObservabilityError, Selection, all_metric_tags, build_constant_tags,
+    MetricsSinkChoice, ObservabilityError, Selection, build_constant_tags,
     resolve_metrics_sink_choice, validate_metrics_sink_env,
 };
 
@@ -17,7 +17,7 @@ fn resolve(
 }
 
 /// `auto` resolves Datadog, then OTLP when an endpoint says where to send it,
-/// then off. It never selects journald; an explicit journald still works.
+/// then off.
 #[test]
 fn metrics_sink_resolution_covers_every_selector_and_capability() {
     for (raw, capabilities, endpoint, expected) in [
@@ -46,25 +46,10 @@ fn metrics_sink_resolution_covers_every_selector_and_capability() {
         (Some("otlp"), OTEL_ONLY, false, Ok(MetricsSinkChoice::Otlp)),
         (Some("off"), DATADOG, true, Ok(MetricsSinkChoice::Off)),
         (Some("off"), NO_TELEMETRY, false, Ok(MetricsSinkChoice::Off)),
-        // Legacy journald stays available by explicit request only.
-        (
-            Some("journald"),
-            DATADOG,
-            true,
-            Ok(MetricsSinkChoice::Journald),
-        ),
-        (
-            Some("journald"),
-            NO_TELEMETRY,
-            false,
-            Ok(MetricsSinkChoice::Journald),
-        ),
-        (
-            Some("journald"),
-            OTEL_ONLY,
-            true,
-            Ok(MetricsSinkChoice::Journald),
-        ),
+        // journald was removed; naming it is a configuration error.
+        (Some("journald"), DATADOG, true, Err("invalid")),
+        (Some("journald"), OTEL_ONLY, true, Err("invalid")),
+        (Some("journald"), NO_TELEMETRY, false, Err("invalid")),
         // An uncompiled or unknown selector is a configuration error.
         (Some("datadog"), OTEL_ONLY, true, Err("datadog-unavailable")),
         (
@@ -185,18 +170,8 @@ fn dd_only_constant_tags_preserve_empty_and_whitespace_bytes() {
         _ => None,
     });
     assert_eq!(
-        all_metric_tags(&build_constant_tags(&identity, Some("cluster".into())), &[]),
+        build_constant_tags(&identity, Some("cluster".into())).join(","),
         "env: prod ,service:  ,version:,cluster_id:cluster"
-    );
-}
-
-#[test]
-fn metric_tags_join_constant_tags_first() {
-    let constant_tags = vec!["env:dev".to_string(), "service:api".to_string()];
-    let tags = vec!["result:success".to_string(), "template:seed".to_string()];
-    assert_eq!(
-        all_metric_tags(&constant_tags, &tags),
-        "env:dev,service:api,result:success,template:seed"
     );
 }
 
@@ -210,7 +185,6 @@ fn auto_is_exempt_from_startup_validation() {
     for choice in [
         MetricsSinkChoice::Otlp,
         MetricsSinkChoice::Datadog,
-        MetricsSinkChoice::Journald,
         MetricsSinkChoice::Off,
     ] {
         validate_metrics_sink_env(choice, Selection::Auto)
@@ -218,11 +192,7 @@ fn auto_is_exempt_from_startup_validation() {
     }
     // A sink other than OTLP has no environment-derived half to reject, so an
     // explicit selection of one is equally safe.
-    for choice in [
-        MetricsSinkChoice::Datadog,
-        MetricsSinkChoice::Journald,
-        MetricsSinkChoice::Off,
-    ] {
+    for choice in [MetricsSinkChoice::Datadog, MetricsSinkChoice::Off] {
         validate_metrics_sink_env(choice, Selection::Explicit)
             .unwrap_or_else(|error| panic!("{choice:?} has nothing to validate: {error}"));
     }

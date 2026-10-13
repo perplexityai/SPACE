@@ -104,7 +104,6 @@ fn sidecars_inherit_metrics_transport_without_inheriting_unrelated_environment()
         Some(" "),
         Some("auto"),
         Some("datadog"),
-        Some("journald"),
         Some("otlp"),
         Some("off"),
     ] {

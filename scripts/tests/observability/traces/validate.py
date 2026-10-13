@@ -113,7 +113,7 @@ def main():
     env = trace_fixture.clean_environment()
     env.update(
         SPACE_TRACE_EXPORTER="otlp",
-        SPACE_METRICS_SINK="journald",
+        SPACE_METRICS_SINK="off",
         SPACE_TRACE_PARITY_MODE="basic",
         OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=args.endpoint,
         OTEL_TRACES_SAMPLER="always_on",

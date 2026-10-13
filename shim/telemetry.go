@@ -57,8 +57,6 @@ func configuredMetricsSink() (metricsSinkChoice, error) {
 		return metricsOTLP, nil
 	case "off":
 		return metricsOff, nil
-	case "journald":
-		return "", fmt.Errorf("SPACE_METRICS_SINK=journald is not supported by the Go shim; use datadog, otlp, or off")
 	default:
 		return "", fmt.Errorf("invalid SPACE_METRICS_SINK %q; expected auto, datadog, otlp, or off", raw)
 	}

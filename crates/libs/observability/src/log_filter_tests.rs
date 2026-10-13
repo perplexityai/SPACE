@@ -118,7 +118,6 @@ fn log_filters_apply_in_every_format_without_trace_export() {
 fn query_events_feed_tracing_without_becoming_logs() {
     assert!(!super::should_format_target(super::SQLX_QUERY_TARGET));
     assert!(!super::should_format_target(super::RUSQLITE_QUERY_TARGET));
-    assert!(!super::should_format_target(super::METRICS_TARGET));
     assert!(super::should_format_target("space::startup"));
 }
 

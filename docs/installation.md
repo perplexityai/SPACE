@@ -369,8 +369,7 @@ metrics endpoint default. The protocol must be `grpc`, and nonblank
 `OTEL_EXPORTER_OTLP_METRICS_HEADERS` or `OTEL_EXPORTER_OTLP_HEADERS` are rejected.
 A configuration that cannot work fails the shim's startup, naming the setting
 that is wrong and never its value. Only an explicit `otlp` reaches those
-checks: `auto` means DogStatsD in every shim build. The shim does not support
-Rust's `journald` metrics sink.
+checks: `auto` means DogStatsD in every shim build.
 
 Metrics and traces share identity settings, resolved `SPACE_*` first, then
 OpenTelemetry, then Datadog: `SPACE_SERVICE_NAME`, `SPACE_ENV` and

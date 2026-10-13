@@ -178,7 +178,7 @@ async fn identity_worker_command_does_not_inherit_parent_environment() {
         }
     }
 
-    for metrics_sink in ["auto", "datadog", "journald", "off", "otlp"] {
+    for metrics_sink in ["auto", "datadog", "off", "otlp"] {
         let mut command = {
             let mut env = pplx_space_test_env::TestEnv::default();
             env.set("SPACE_METRICS_SINK", metrics_sink);

@@ -557,7 +557,7 @@ async fn disabled_process_mode_emits_no_otlp_request() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn process_selection_exports_only_to_the_selected_metrics_sink() {
     // Every child is given an OTLP endpoint, so auto resolves Datadog when
-    // compiled in and OTLP otherwise. It never resolves journald.
+    // compiled in and OTLP otherwise.
     let default_sink = if cfg!(feature = "datadog") {
         "datadog"
     } else if cfg!(feature = "otlp-metrics") {
@@ -569,7 +569,6 @@ async fn process_selection_exports_only_to_the_selected_metrics_sink() {
         (None, "selection", default_sink),
         (Some("auto"), "selection", default_sink),
         (Some("otlp"), "selection", "otlp"),
-        (Some("journald"), "selection", "journald"),
         (Some("off"), "selection", "off"),
         // A valid endpoint the exporter cannot use at runtime still starts.
         (Some("otlp"), "no-runtime", "off"),
@@ -680,6 +679,33 @@ async fn process_selection_exports_only_to_the_selected_metrics_sink() {
             );
         }
     }
+}
+
+/// journald is no longer a metrics sink. A deployment that still names it must
+/// fail startup instead of running with metrics silently off.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn removed_journald_selector_fails_startup() {
+    let receiver = Receiver::start().await;
+    let mut command = child_command(
+        "selection",
+        &receiver.endpoint,
+        "journald-fixture",
+        Some("journald"),
+    );
+    let output =
+        tokio::task::spawn_blocking(move || command.output().expect("run journald fixture"))
+            .await
+            .expect("join journald fixture");
+    assert!(
+        !output.status.success(),
+        "SPACE_METRICS_SINK=journald must fail startup: {output:?}"
+    );
+    let stderr = String::from_utf8(output.stderr).expect("UTF-8 fixture stderr");
+    assert!(
+        stderr.contains(r#"InvalidMetricsSink { raw: "journald" }"#),
+        "error must name the rejected selector, got {stderr}"
+    );
+    assert_eq!(receiver.request_count(), 0);
 }
 
 /// A selector that can never work must fail telemetry initialization, so a

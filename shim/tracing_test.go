@@ -46,7 +46,7 @@ func TestTraceExporterResolution(t *testing.T) {
 		{"off with native adapter", "off", true, true, traceOff, false},
 		{"off without native adapter", "off", false, false, traceOff, false},
 		{"normalized auto", " AUTO \t", true, false, traceDatadog, false},
-		// journald is a metrics-only legacy sink, never a trace exporter.
+		// journald is not a trace exporter.
 		{"journald", "journald", true, true, "", true},
 		{"empty", "", true, false, "", true},
 		{"invalid", "typo", true, false, "", true},

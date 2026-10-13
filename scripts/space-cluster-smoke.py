@@ -35,8 +35,7 @@ Configuration is environment-only, because the caller is a Job spec:
     SPACE_SMOKE_SUMMARY_PATH    write the JSON run summary here as well
     SPACE_SMOKE_SLACK_WEBHOOK_URL   post the summary to Slack when set
     SPACE_SMOKE_SLACK_NOTIFY    on-failure (default) or always
-    SPACE_METRICS_SINK         auto/datadog (default), otlp, or off;
-                                journald is unsupported and disables metrics
+    SPACE_METRICS_SINK         auto/datadog (default), otlp, or off
     DD_AGENT_HOST/DD_DOGSTATSD_PORT  DogStatsD address; no host means no metrics
     OTEL_EXPORTER_OTLP_METRICS_ENDPOINT  OTLP endpoint, falling back to
                                 OTEL_EXPORTER_OTLP_ENDPOINT; no default
@@ -640,10 +639,6 @@ def configured_metrics_sink(environment: Mapping[str, str]) -> str:
         return "datadog"
     if sink in {"otlp", "off"}:
         return sink
-    if sink == "journald":
-        raise ValueError(
-            "SPACE_METRICS_SINK=journald is not supported by the smoke runner; use datadog, otlp, or off"
-        )
     raise ValueError(
         f"invalid SPACE_METRICS_SINK {raw!r}; expected auto, datadog, otlp, or off"
     )

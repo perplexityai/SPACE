@@ -36,11 +36,10 @@ Rust metrics:
 | unset / `auto` | DogStatsD | OTLP with a metrics endpoint, else off | off |
 | `datadog` | DogStatsD | configuration error | configuration error |
 | `otlp` | OTLP | OTLP | configuration error |
-| `journald` | journald | journald | journald |
 | `off` | off | off | off |
 
-`auto` no longer falls back to journald on a build without `datadog`. Journald
-is still available, but only when it is asked for by name.
+`journald` is no longer a metrics sink. Naming it is a configuration error, the
+same as any unknown selector.
 
 Every Go shim build compiles in both native Datadog clients, so the shim has
 one column:
@@ -51,7 +50,6 @@ one column:
 | `datadog` | native Datadog | DogStatsD |
 | `otlp` | OTLP | OTLP |
 | `off` | off | off |
-| `journald` | configuration error | configuration error |
 
 The shim therefore cannot reach the OTLP branch of `auto`; it is reachable in
 a Rust binary built with `otel` and no `datadog`.
@@ -95,8 +93,7 @@ either way. The process starts, the exporter retries in the background, and the
 failure appears as a log line.
 
 Nothing falls back to a different backend. A rejected OTLP configuration does
-not turn into DogStatsD, and an unreachable Collector does not turn into
-journald — a degraded signal is off, not redirected.
+not turn into DogStatsD — a degraded signal is off, not redirected.
 
 ## Identity
 
@@ -367,7 +364,7 @@ resolved metrics sink and trace exporter before logging is installed. Native
 Datadog selects `Legacy`, including automatic selection in builds with both
 features even when an OTLP endpoint is configured. If either destination is
 native Datadog, shared logs and spans retain Legacy attribution. Otherwise an
-OTLP destination selects `Otel`; off/journald-only processes retain Legacy.
+OTLP destination selects `Otel`; processes with both signals off retain Legacy.
 Exporter connection failure does not change this choice.
 
 In Legacy mode, explicit JSON event `service` values retain their original
@@ -597,9 +594,8 @@ instead.
 | no metrics endpoint | `missing OTLP endpoint; set OTEL_EXPORTER_OTLP_METRICS_ENDPOINT or OTEL_EXPORTER_OTLP_ENDPOINT` |
 | a bad cadence | `OTEL_METRIC_EXPORT_INTERVAL must be a positive whole number of milliseconds` |
 | an unknown temporality | `OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE must be cumulative, delta, or lowmemory, got "monotonic"` |
-| an unknown selector | `invalid SPACE_METRICS_SINK="dogstatsd"; expected one of: auto, datadog, journald, otlp, off`; `invalid SPACE_TRACE_EXPORTER="dd"; expected auto, datadog, otlp, or off` |
+| an unknown selector | `invalid SPACE_METRICS_SINK="dogstatsd"; expected one of: auto, datadog, otlp, off`; `invalid SPACE_TRACE_EXPORTER="dd"; expected auto, datadog, otlp, or off` |
 | a selector the build cannot serve | `SPACE_METRICS_SINK="datadog" requires the datadog feature`; `trace exporter otlp requires the otel feature` |
-| `journald` in the shim | `SPACE_METRICS_SINK=journald is not supported by the Go shim; use datadog, otlp, or off` |
 | a bad trace filter | `invalid SPACE_TRACE_FILTER; expected tracing EnvFilter syntax` |
 
 Service-level initialization adds its own prefix, such as

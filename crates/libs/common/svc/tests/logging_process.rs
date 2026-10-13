@@ -128,7 +128,7 @@ fn service_logging_is_portable_and_preserves_disclosure_boundaries() {
 
     // Native Datadog must retain the pre-attribution wire contract even when
     // an OTLP endpoint is configured and both capabilities are compiled in.
-    let mut modes = vec![("off", false), ("journald", false)];
+    let mut modes = vec![("off", false)];
     if cfg!(feature = "otel") {
         modes.push(("otlp", true));
     }
@@ -435,7 +435,6 @@ async fn logging_child() {
     );
     tracing::info!(target: "rusqlite::query", "suppressed fixture");
     tracing::info!(target: "sqlx::query", "suppressed fixture");
-    tracing::info!(target: "space::metrics", "suppressed fixture");
     tracing::info!(target: "sqlx::pool::acquire", "suppressed fixture");
     tracing::warn!(target: "sqlx::pool::acquire", "slow acquire fixture");
 }

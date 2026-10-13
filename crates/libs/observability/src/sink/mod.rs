@@ -1,22 +1,23 @@
 #[cfg(feature = "datadog")]
 mod datadog;
-mod journald;
 #[cfg(feature = "otlp-metrics")]
 mod otlp;
 
 use pplx_space_common_core::types::process_cluster_id;
 
 use crate::{ObservabilityError, identity::Identity, selection::Selection};
-use journald::JournaldSink;
 
 #[cfg(feature = "datadog")]
 use datadog::DatadogSink;
 #[cfg(feature = "otlp-metrics")]
 use otlp::{OtlpEnvConfig, OtlpSink};
 
+#[cfg_attr(
+    not(feature = "otlp-metrics"),
+    expect(dead_code, reason = "only exporting sinks read metrics")
+)]
 const METRICS_NAMESPACE: &str = "space";
 const METRICS_SINK_ENV: &str = "SPACE_METRICS_SINK";
-pub const METRICS_TARGET: &str = "space::metrics";
 
 pub(super) trait MetricSink: Send + Sync {
     fn label(&self) -> &'static str;
@@ -28,6 +29,10 @@ pub(super) trait MetricSink: Send + Sync {
     fn shutdown(&self) {}
 }
 
+#[cfg_attr(
+    not(feature = "otlp-metrics"),
+    expect(dead_code, reason = "only exporting sinks read metrics")
+)]
 pub(super) struct Metric<'a> {
     pub name: &'a str,
     pub kind: MetricKind,
@@ -49,6 +54,10 @@ pub(super) enum MetricUnit {
     Milliseconds,
 }
 
+#[cfg_attr(
+    not(feature = "otlp-metrics"),
+    expect(dead_code, reason = "only exporting sinks read metrics")
+)]
 #[derive(Clone, Copy, Debug)]
 pub(super) enum MetricValue {
     Unsigned(u64),
@@ -58,7 +67,6 @@ pub(super) enum MetricValue {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum MetricsSinkChoice {
     Datadog,
-    Journald,
     Otlp,
     Off,
 }
@@ -67,7 +75,6 @@ pub(super) enum MetricsSinkChoice {
 enum MetricsSinkMode {
     Auto,
     Datadog,
-    Journald,
     Otlp,
     Off,
 }
@@ -79,7 +86,6 @@ impl MetricsSinkMode {
         match raw.trim().to_ascii_lowercase().as_str() {
             "auto" => Some(Self::Auto),
             "datadog" => Some(Self::Datadog),
-            "journald" => Some(Self::Journald),
             "otlp" => Some(Self::Otlp),
             "off" => Some(Self::Off),
             _ => None,
@@ -138,10 +144,6 @@ pub(super) fn build_metrics_sink(
 ) -> Box<dyn MetricSink> {
     match choice {
         MetricsSinkChoice::Datadog => build_datadog_sink(constant_tags),
-        MetricsSinkChoice::Journald => Box::new(JournaldSink::new(
-            METRICS_NAMESPACE.to_string(),
-            constant_tags,
-        )),
         MetricsSinkChoice::Otlp => build_otlp_sink(identity, constant_tags),
         MetricsSinkChoice::Off => Box::new(OffSink),
     }
@@ -210,8 +212,7 @@ pub(super) fn resolve_metrics_sink_choice(
     match mode {
         MetricsSinkMode::Auto if datadog_enabled => Ok(MetricsSinkChoice::Datadog),
         // Shared Rust/Go contract: native Datadog when compiled in, otherwise
-        // OTLP when an endpoint says where to send it, otherwise off. `auto`
-        // never selects journald; an explicit journald still works.
+        // OTLP when an endpoint says where to send it, otherwise off.
         MetricsSinkMode::Auto if otlp_metrics_enabled && otlp_endpoint_configured => {
             Ok(MetricsSinkChoice::Otlp)
         }
@@ -220,7 +221,6 @@ pub(super) fn resolve_metrics_sink_choice(
         MetricsSinkMode::Datadog => Err(ObservabilityError::DatadogMetricsSinkUnavailable {
             raw: raw.unwrap_or("datadog").to_string(),
         }),
-        MetricsSinkMode::Journald => Ok(MetricsSinkChoice::Journald),
         MetricsSinkMode::Otlp if otlp_metrics_enabled => Ok(MetricsSinkChoice::Otlp),
         MetricsSinkMode::Otlp => Err(ObservabilityError::OtlpMetricsSinkUnavailable {
             raw: raw.unwrap_or("otlp").to_string(),
@@ -295,12 +295,6 @@ fn build_constant_tags(identity: &Identity, cluster_id: Option<String>) -> Vec<S
         constant_tags.push(format!("cluster_id:{cluster_id}"));
     }
     constant_tags
-}
-
-fn all_metric_tags(constant_tags: &[String], tags: &[String]) -> String {
-    let mut all_tags = constant_tags.to_vec();
-    all_tags.extend_from_slice(tags);
-    all_tags.join(",")
 }
 
 #[cfg(test)]

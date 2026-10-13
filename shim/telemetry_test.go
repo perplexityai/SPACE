@@ -160,7 +160,7 @@ func TestMetricsConfigurationValidation(t *testing.T) {
 		{"datadog", map[string]string{"SPACE_METRICS_SINK": "datadog"}, "", true},
 		{"off", map[string]string{"SPACE_METRICS_SINK": "off"}, "", true},
 		{
-			"journald is not supported by the shim",
+			"removed journald selector",
 			map[string]string{"SPACE_METRICS_SINK": "journald"},
 			"SPACE_METRICS_SINK", false,
 		},
