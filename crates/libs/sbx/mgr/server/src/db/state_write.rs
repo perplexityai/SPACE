@@ -13,8 +13,7 @@
 //! - A specialized compare-and-set writer's from-set is its SQL predicate,
 //!   narrowed to the states its production callers reach.
 //! - A generic `update_state` caller writes from any state the generic guards
-//!   admit. Its edge lists the states the caller relies on, and
-//!   [`EdgeKind::KnownRace`] edges list the other states it can overwrite.
+//!   admit. Its edge lists the states the caller relies on.
 //! - An empty from-set is an insert: no row existed.
 //! - A write over a row already in the target state changes no state and has
 //!   no edge.
@@ -110,11 +109,6 @@ pub enum EdgeKind {
     Compensation,
     /// Startup, inventory, quarantine or cleanup repair.
     Recovery,
-    /// A stale or unvalidated write a generic `update_state` caller can make:
-    /// a concurrent transition moved the row after the caller read it, or the
-    /// caller never checked the state. Not intended, and `update_state_from`
-    /// refuses to take one: converting the caller removes the edge.
-    KnownRace,
 }
 
 /// One family of persisted transitions: every state in `from` to `to`.
@@ -231,14 +225,15 @@ edge_table! {
 
     // Pause and resident resume.
 
-    /// `pause` and the suspend auto-pause: `update_state(Pausing)` after
-    /// `transition(Pausing)` on the read.
+    /// `pause` and the suspend auto-pause, after `transition(Pausing)` on the
+    /// read.
     PAUSE_BEGIN: Request, of(&[Started]) => Pausing;
-    /// `pause` and the suspend auto-pause: `update_state(Paused)`.
+    /// `pause` and the suspend auto-pause, after node-manager confirms the
+    /// pause.
     PAUSE_COMPLETE: Completion, of(&[Pausing]) => Paused;
-    /// `update_state(Started)` after a failed guest preparation in `pause`
-    /// and the suspend auto-pause; `update_state_best_effort(Started)` after a
-    /// node connect failure and in `pause_with_reconciliation`.
+    /// `pause` and the suspend auto-pause after a failed guest preparation;
+    /// `pause` after a node connect failure, and `pause_with_reconciliation`,
+    /// best effort.
     PAUSE_ROLLBACK: Compensation, of(&[Pausing]) => Started;
     /// `begin_resident_resume_with_policy`, and `begin_resident_resume`'s
     /// `update_state_from` without an activation policy.
@@ -425,14 +420,6 @@ edge_table! {
     /// `restore_adopt_orphan_or_insert_sandbox_in_transaction`'s insert
     /// branch from orphan materialization of an interrupted restore.
     ORPHAN_RESTORE_INSERT: Recovery, INSERT => Restoring;
-
-    // Known races.
-
-    /// Pause rollback (`update_state(Started)`, best effort or not) after a
-    /// concurrent Stop settled `stopped`.
-    PAUSE_ROLLBACK_AFTER_STOP: KnownRace, of(&[Stopped]) => Started;
-    /// Pause completion (`update_state(Paused)`) after a concurrent Stop.
-    PAUSE_COMPLETE_AFTER_STOP: KnownRace, of(&[Stopped]) => Paused;
 }
 
 pub use edges::EDGES;
@@ -522,8 +509,8 @@ pub enum StateWriteOutcome {
 /// autocommit it opens its own `IMMEDIATE` transaction, so the guard reads,
 /// the write and the job failure commit together; it never nests one.
 ///
-/// Inserts and [`EdgeKind::KnownRace`] edges, and targets `update_state`
-/// rejects (`quarantined`, `failed`), are `InvalidQuery`. A write that matches
+/// Inserts, and targets `update_state` rejects (`quarantined`, `failed`), are
+/// `InvalidQuery`. A write that matches
 /// no row although the row was read in a source state is
 /// `StatementChangedRows(0)`.
 pub fn update_state_from(
@@ -531,7 +518,7 @@ pub fn update_state_from(
     id: &str,
     edge: &'static Edge,
 ) -> Result<StateWriteOutcome> {
-    if edge.kind == EdgeKind::KnownRace || edge.from.is_empty() {
+    if edge.from.is_empty() {
         return Err(rusqlite::Error::InvalidQuery);
     }
     write_state_from(conn, id, edge.from, edge.to)

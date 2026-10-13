@@ -1816,42 +1816,6 @@ fn node_manager_failure_is_terminal(code: tonic::Code) -> bool {
     }
 }
 
-pub(super) fn update_state_best_effort(
-    db: &Arc<Mutex<rusqlite::Connection>>,
-    sandbox_id: &str,
-    state: SandboxState,
-) {
-    let updated = {
-        let Ok(db) = crate::node_state_sync::connection_or_signal_failure(db) else {
-            return;
-        };
-        match crate::db::update_state(&db, sandbox_id, state) {
-            Ok(outcome) if outcome.is_applied() => true,
-            Ok(outcome) => {
-                tracing::warn!(
-                    sandbox_id,
-                    state = state.as_str(),
-                    %outcome,
-                    "sandbox state write was superseded"
-                );
-                false
-            }
-            Err(error) => {
-                tracing::warn!(
-                    sandbox_id,
-                    state = state.as_str(),
-                    %error,
-                    "failed to update sandbox state"
-                );
-                false
-            }
-        }
-    };
-    if updated {
-        mark_sandbox_dirty(db, sandbox_id);
-    }
-}
-
 pub(super) async fn notify_resume_via_spaced_host(
     sandbox_id: &str,
     reason: pplx_space_spaced_host_client::proto::ResumeReason,

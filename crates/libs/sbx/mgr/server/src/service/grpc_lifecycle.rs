@@ -5,7 +5,7 @@ use super::activation_support::{
     grpc_timeout_budget, operation_activation_attempt_id_from_wire, sandbox_event_trigger,
     space_api_route_identity_for_runtime_activation,
     space_api_route_identity_from_wake_start_context, space_api_route_identity_to_wire,
-    update_state_best_effort, wake_target_state_from_proto,
+    wake_target_state_from_proto,
 };
 use super::cleanup::{
     AsyncCleanupRequest, CleanupAdmission, CleanupDispatchDisposition, SynchronousCleanupRequest,

@@ -2,6 +2,7 @@
 //! and suspend preparation once the locks are held.
 
 use super::*;
+use crate::service::cleanup_support::StateWriteRejected;
 
 fn completed_suspend_retry_response(
     sandbox: &crate::db::SandboxRow,
@@ -396,7 +397,7 @@ impl SandboxManagerService {
                 .id
                 .parse::<SandboxId>()
                 .map_err(|error| Status::internal(format!("invalid sandbox ID: {error}")))?;
-            let pause_state = pause_with_reconciliation(
+            let pause_result = pause_with_reconciliation(
                 &mut node_client,
                 sandbox.node_execution_fence(),
                 &self.db,
@@ -407,8 +408,20 @@ impl SandboxManagerService {
                 self.config.balloon_hint_timeout_ms,
             )
             .await;
-            if pause_state != SandboxState::Paused {
+            // Fail closed: a rejection means another operation owns the row,
+            // so only pause's own confirmed `paused` lets suspend continue.
+            if pause_result != Ok(SandboxState::Paused) {
                 self.watchdog.record_lifecycle_edge(&sandbox.id).await;
+                // Report the state the row was left in. A missing row is never
+                // a rejection here: its rollback reads as `started`.
+                let pause_state = match pause_result {
+                    Ok(state) => state,
+                    Err(
+                        StateWriteRejected::FromState { found }
+                        | StateWriteRejected::Guard { found, .. },
+                    ) => found,
+                    Err(StateWriteRejected::Missing) => SandboxState::Started,
+                };
                 let reason = format!("auto-pause failed; sandbox reconciled to {pause_state}");
                 pplx_space_metrics::snapshot::create_failed(
                     create_kind,

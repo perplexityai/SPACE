@@ -11,8 +11,7 @@ use super::update_state_matrix::{
     sweep_lifecycle_pairs_and_cleanup_shapes, sweep_quarantine_episode_and_missing_row, write_from,
 };
 use crate::db::{
-    EDGES, EdgeKind, StateSet, StateWriteOutcome, StateWriteRefusal, edges, test_conn,
-    update_state_from,
+    EDGES, StateSet, StateWriteOutcome, StateWriteRefusal, edges, test_conn, update_state_from,
 };
 use crate::state::SandboxState;
 
@@ -108,8 +107,7 @@ fn a_from_set_without_the_row_state_refuses_and_keeps_every_row() {
 }
 
 fn writable(edge: &crate::db::Edge) -> bool {
-    edge.kind() != EdgeKind::KnownRace
-        && !edge.from().is_empty()
+    !edge.from().is_empty()
         && !matches!(edge.to(), SandboxState::Quarantined | SandboxState::Failed)
 }
 
@@ -137,25 +135,15 @@ fn an_edge_writes_its_target_only_from_its_sources() {
     }
 }
 
-/// Known races, inserts and quarantine or failure targets are refused before
-/// the row is read. Known races are tried over a source the generic guards
-/// admit; inserts and quarantine targets over `started`.
+/// Inserts and quarantine or failure targets are refused before the row is
+/// read. Each is tried over `started`.
 #[test]
-fn known_race_insert_and_rejected_target_edges_are_refused() {
+fn insert_and_rejected_target_edges_are_refused() {
     let refused: Vec<_> = EDGES.iter().filter(|edge| !writable(edge)).collect();
-    assert!(
-        refused
-            .iter()
-            .any(|edge| edge.kind() == EdgeKind::KnownRace)
-    );
     assert!(refused.iter().any(|edge| edge.from().is_empty()));
     for edge in refused {
         let to = edge.to();
-        let from = edge
-            .from()
-            .iter()
-            .find(|from| cell(PLAIN[index(*from)], to) == Expected::Applied)
-            .unwrap_or(SandboxState::Started);
+        let from = SandboxState::Started;
         let case = format!("{}: {from} -> {to}", edge.name());
         let conn = test_conn();
         let id = seed(

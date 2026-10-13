@@ -327,9 +327,9 @@ impl StateWriteRejected {
     }
 }
 
-/// `update_state_best_effort` for [`crate::db::update_state_from`]: a refusal
-/// or an error is logged and leaves the row as it is, and only an applied
-/// write marks the sandbox dirty. `None` is a poisoned connection or a
+/// The best-effort form of [`crate::db::update_state_from`]: a refusal or an
+/// error is logged and leaves the row as it is, and only an applied write
+/// marks the sandbox dirty. `None` is a poisoned connection or a
 /// database error.
 pub(super) fn update_state_from_best_effort(
     db: &Arc<Mutex<rusqlite::Connection>>,

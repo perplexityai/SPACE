@@ -81,7 +81,7 @@
 "crates/libs/sbx/mgr/server/src/db/state_transitions.rs" = 1140
 "crates/libs/sbx/mgr/server/src/run.rs" = 1101
 "crates/libs/sbx/mgr/server/src/sandbox_eviction.rs" = 1273
-"crates/libs/sbx/mgr/server/src/service/activation_support.rs" = 1592
+"crates/libs/sbx/mgr/server/src/service/activation_support.rs" = 1574
 "crates/libs/sbx/mgr/server/src/service/auth_lookup.rs" = 1221
 "crates/libs/sbx/mgr/server/src/service/cache_cleanup.rs" = 1455
 "crates/libs/sbx/mgr/server/src/service/cleanup.rs" = 2704

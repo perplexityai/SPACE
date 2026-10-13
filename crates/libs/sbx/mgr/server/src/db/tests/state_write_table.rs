@@ -14,11 +14,11 @@ use crate::state::SandboxState::{self, *};
 enum Disagreement {
     /// A request edge writes the pair; `can_transition_to` forbids it.
     RequestForbidden,
-    /// Only completion, compensation, recovery or known-race edges write the
-    /// pair; `can_transition_to` forbids it.
+    /// Only completion, compensation or recovery edges write the pair;
+    /// `can_transition_to` forbids it.
     WriteForbidden,
     /// `can_transition_to` allows the pair, but only completion,
-    /// compensation, recovery or known-race edges write it.
+    /// compensation or recovery edges write it.
     AllowedNotRequested,
     /// `can_transition_to` allows the pair; no writer implements it.
     AllowedUnwritten,
@@ -64,9 +64,7 @@ const ALLOWLIST: &[(SandboxState, SandboxState, Disagreement, &str)] = &[
     (Stopping,        CleanupRequired, WriteForbidden,      "an interrupted stop is handed to cleanup"),
     (Stopping,        CleanupFailed,   WriteForbidden,      "stop cleanup failed"),
     (Stopping,        Quarantined,     AllowedNotRequested, RECOVERY_QUARANTINE),
-    (Stopped,         Started,         WriteForbidden,      "known race: pause rollback after Stop"),
     (Stopped,         Stopping,        RequestForbidden,    STOP_SETTLED_SOURCE),
-    (Stopped,         Paused,          WriteForbidden,      "known race: pause completion after Stop"),
     (Stopped,         Suspended,       RequestForbidden,    "warm start and process-snapshot rollback restage a stopped row"),
     (Stopped,         Quarantined,     AllowedUnwritten,    NO_QUARANTINE_WRITER),
     (Deleting,        CleanupRequired, WriteForbidden,      "an interrupted delete is handed to cleanup"),

@@ -2,10 +2,69 @@
 //! that suspend preparation reuses.
 
 use super::*;
+use crate::db::{Edge, edges};
+use crate::service::cleanup_support::{
+    StateWriteRejected, require_state_write_from, state_write_result, update_state_from_best_effort,
+};
 
 const PAUSE_RECONCILIATION_ATTEMPTS: usize = 3;
 
 const PAUSE_RECONCILIATION_BACKOFF: Duration = Duration::from_millis(100);
+
+/// Whether `rejected` found the row outside `edge`'s source states: another
+/// operation, such as a Stop the cleanup fence admitted while pause held only
+/// the artifact lock, moved the node-local SQLite `sandboxes.state` after
+/// pause read it, and now owns the row. Decided on the found state, because
+/// the generic guards answer a `stopping` row before the from-set does.
+fn superseded(rejected: StateWriteRejected, edge: &Edge) -> bool {
+    match rejected {
+        StateWriteRejected::FromState { .. } => true,
+        StateWriteRejected::Guard { found, .. } => !edge.from().contains(found),
+        StateWriteRejected::Missing => false,
+    }
+}
+
+/// Roll a `pausing` row back to `started`, best effort. Returns the rejection
+/// when another operation moved the row out of `pausing`.
+fn roll_back_pause_best_effort(
+    db: &Arc<Mutex<rusqlite::Connection>>,
+    sandbox_id: &str,
+) -> Option<StateWriteRejected> {
+    let edge = &edges::PAUSE_ROLLBACK;
+    let rejected =
+        state_write_result(update_state_from_best_effort(db, sandbox_id, edge)?).err()?;
+    superseded(rejected, edge).then_some(rejected)
+}
+
+#[cfg(test)]
+type GuestPreparation = Arc<
+    dyn Fn(
+            String,
+        ) -> futures_util::future::BoxFuture<
+            'static,
+            Result<(), crate::guest_filesystem_flush::GuestFlushError>,
+        > + Send
+        + Sync,
+>;
+
+#[cfg(test)]
+tokio::task_local! {
+    /// Replaces pause's guest snapshot preparation, which dials the host's
+    /// per-sandbox spaced-host socket, and lets a test act between pause's
+    /// state writes.
+    static GUEST_PREPARATION: GuestPreparation;
+}
+
+async fn prepare_guest_for_pause(
+    sandbox_id: &str,
+    budget: GuestSnapshotPreparationBudget,
+) -> Result<(), crate::guest_filesystem_flush::GuestFlushError> {
+    #[cfg(test)]
+    if let Ok(prepare) = GUEST_PREPARATION.try_with(Clone::clone) {
+        return prepare(sandbox_id.to_owned()).await;
+    }
+    prepare_guest_for_vm_snapshot_via_spaced_host(sandbox_id, budget).await
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum PauseReconciliationOutcome {
@@ -53,6 +112,12 @@ async fn reconcile_state_after_unconfirmed_pause(
     outcome
 }
 
+/// Pause the VM of a `pausing` row, reconciling unconfirmed responses against
+/// the observed VM state. Returns `paused` for the caller to complete, or the
+/// state the row was left in: `started` after a rollback, or `quarantined`
+/// when the VM state stays unknown. `Err` is the rejection when the rollback
+/// or the quarantine finds that another operation moved the row out of
+/// `pausing`; that operation owns the row.
 #[expect(
     clippy::too_many_arguments,
     reason = "each argument is an independent pause input; the node-manager client and connector are injected"
@@ -66,7 +131,7 @@ pub(super) async fn pause_with_reconciliation(
     guest_preparation_budget: GuestSnapshotPreparationBudget,
     node_manager: &crate::node_manager_transport::NodeManagerConnector,
     balloon_hint_timeout_ms: Option<std::num::NonZeroU32>,
-) -> SandboxState {
+) -> Result<SandboxState, StateWriteRejected> {
     let sandbox_id_string = sandbox_id.to_string();
     let mut last_reason = None;
     for attempt in 0..PAUSE_RECONCILIATION_ATTEMPTS {
@@ -82,7 +147,7 @@ pub(super) async fn pause_with_reconciliation(
             })
             .await
         {
-            Ok(_) => return SandboxState::Paused,
+            Ok(_) => return Ok(SandboxState::Paused),
             Err(error) => {
                 let reason = format!("{reason_context}: {error}");
                 last_reason = Some(reason.clone());
@@ -92,12 +157,14 @@ pub(super) async fn pause_with_reconciliation(
                 let retry_requires_prepare =
                     matches!(&outcome, PauseReconciliationOutcome::Running);
                 match outcome {
-                    PauseReconciliationOutcome::Paused => return SandboxState::Paused,
+                    PauseReconciliationOutcome::Paused => return Ok(SandboxState::Paused),
                     PauseReconciliationOutcome::Running
                         if attempt + 1 == PAUSE_RECONCILIATION_ATTEMPTS =>
                     {
-                        update_state_best_effort(db, &sandbox_id_string, SandboxState::Started);
-                        return SandboxState::Started;
+                        return match roll_back_pause_best_effort(db, &sandbox_id_string) {
+                            Some(rejected) => Err(rejected),
+                            None => Ok(SandboxState::Started),
+                        };
                     }
                     PauseReconciliationOutcome::Running => {}
                     PauseReconciliationOutcome::Unknown(detail) => {
@@ -106,19 +173,19 @@ pub(super) async fn pause_with_reconciliation(
                 }
                 if attempt + 1 < PAUSE_RECONCILIATION_ATTEMPTS
                     && retry_requires_prepare
-                    && let Err(error) = prepare_guest_for_vm_snapshot_via_spaced_host(
-                        &sandbox_id_string,
-                        guest_preparation_budget,
-                    )
-                    .await
+                    && let Err(error) =
+                        prepare_guest_for_pause(&sandbox_id_string, guest_preparation_budget).await
                 {
-                    update_state_best_effort(db, &sandbox_id_string, SandboxState::Started);
+                    let superseded = roll_back_pause_best_effort(db, &sandbox_id_string);
                     tracing::warn!(
                         sandbox_id = %sandbox_id,
                         %error,
                         "pause retry guest preparation failed"
                     );
-                    return SandboxState::Started;
+                    return match superseded {
+                        Some(rejected) => Err(rejected),
+                        None => Ok(SandboxState::Started),
+                    };
                 }
             }
         }
@@ -128,14 +195,33 @@ pub(super) async fn pause_with_reconciliation(
     }
 
     let reason = last_reason.unwrap_or_else(|| reason_context.to_string());
-    mark_quarantined_best_effort(
+    if !mark_quarantined_best_effort(
         db,
         &sandbox_id_string,
         SandboxState::Pausing,
         SandboxQuarantineReasonCode::PauseFailed,
         &reason,
-    );
-    SandboxState::Quarantined
+    ) {
+        // The quarantine compare-and-set refuses a row that left `pausing`,
+        // which is how a Stop that killed the VM mid-pause surfaces here. It
+        // answers false only when its own write did not apply, so a
+        // `quarantined` row was quarantined by another writer. A failed read
+        // or a missing row still reports pause's quarantine.
+        let found = crate::node_state_sync::connection_or_signal_failure(db)
+            .ok()
+            .and_then(|db| {
+                crate::db::get_sandbox(&db, &sandbox_id_string)
+                    .ok()
+                    .flatten()
+            })
+            .map(|row| row.state);
+        if let Some(found) = found
+            && found != SandboxState::Pausing
+        {
+            return Err(StateWriteRejected::FromState { found });
+        }
+    }
+    Ok(SandboxState::Quarantined)
 }
 
 impl SandboxManagerService {
@@ -170,26 +256,38 @@ impl SandboxManagerService {
             .map_err(Status::from)?;
 
         {
+            // `lookup_sandbox` and this write take the database mutex
+            // separately, so another worker (cleanup admission's blocking
+            // task) can commit in between. The edge's `started` from-set
+            // refuses whatever it left.
             let db = self.db_conn()?;
-            require_state_write(
-                crate::db::update_state(&db, &sandbox.id, SandboxState::Pausing),
+            require_state_write_from(
+                crate::db::update_state_from(&db, &sandbox.id, &edges::PAUSE_BEGIN),
                 "begin pause",
             )?;
         }
         self.watchdog.record_lifecycle_edge(&sandbox.id).await;
 
-        if let Err(e) = prepare_guest_for_vm_snapshot_via_spaced_host(
-            &sandbox.id,
-            GuestSnapshotPreparationBudget::Standard,
-        )
-        .await
+        if let Err(e) =
+            prepare_guest_for_pause(&sandbox.id, GuestSnapshotPreparationBudget::Standard).await
         {
+            const CONTEXT: &str = "roll back failed pause preparation";
             let db = self.db_conn()?;
-            if let Err(error) = require_state_write(
-                crate::db::update_state(&db, &sandbox.id, SandboxState::Started),
-                "roll back failed pause preparation",
-            ) {
-                tracing::warn!(sandbox_id = %sandbox.id, %error, "failed to roll back pause state");
+            let edge = &edges::PAUSE_ROLLBACK;
+            match crate::db::update_state_from(&db, &sandbox.id, edge).map(state_write_result) {
+                Ok(Ok(_)) => {}
+                // Guest preparation fails when a concurrent Stop kills the
+                // VM; that Stop, not the preparation, decided the outcome.
+                Ok(Err(rejected)) if superseded(rejected, edge) => {
+                    return Err(rejected.into_status(CONTEXT));
+                }
+                Ok(Err(rejected)) => {
+                    let error = rejected.into_status(CONTEXT);
+                    tracing::warn!(sandbox_id = %sandbox.id, %error, "failed to roll back pause state");
+                }
+                Err(error) => {
+                    tracing::warn!(sandbox_id = %sandbox.id, %error, "failed to roll back pause state");
+                }
             }
             return Err(Status::internal(format!(
                 "guest snapshot preparation before pause failed: {e}"
@@ -199,7 +297,11 @@ impl SandboxManagerService {
         let mut node_client = match connect_node(&self.node_manager).await {
             Ok(node_client) => node_client,
             Err(e) => {
-                update_state_best_effort(&self.db, &sandbox.id, SandboxState::Started);
+                if let Some(rejected) = roll_back_pause_best_effort(&self.db, &sandbox.id) {
+                    return Err(
+                        rejected.into_status("roll back pause after node-manager connect failure")
+                    );
+                }
                 return Err(Status::internal(format!(
                     "cannot connect to node-manager: {e}"
                 )));
@@ -221,8 +323,12 @@ impl SandboxManagerService {
             None,
         )
         .await;
-        if pause_state != SandboxState::Paused {
+        if pause_state != Ok(SandboxState::Paused) {
             self.watchdog.record_lifecycle_edge(&sandbox.id).await;
+        }
+        let pause_state =
+            pause_state.map_err(|rejected| rejected.into_status("reconcile unconfirmed pause"))?;
+        if pause_state != SandboxState::Paused {
             return Err(Status::internal(format!(
                 "pause failed; sandbox reconciled to {pause_state}"
             )));
@@ -230,8 +336,8 @@ impl SandboxManagerService {
 
         {
             let db = self.db_conn()?;
-            require_state_write(
-                crate::db::update_state(&db, &sandbox.id, SandboxState::Paused),
+            require_state_write_from(
+                crate::db::update_state_from(&db, &sandbox.id, &edges::PAUSE_COMPLETE),
                 "complete pause",
             )?;
         }
@@ -540,3 +646,6 @@ impl SandboxManagerService {
         Ok(response)
     }
 }
+
+#[cfg(test)]
+mod supersession_tests;

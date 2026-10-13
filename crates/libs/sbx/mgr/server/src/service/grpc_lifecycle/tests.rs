@@ -2011,7 +2011,7 @@ async fn confirmed_node_pause_reports_paused_and_carries_the_execution_fence() {
 
     stop.cancel();
     server.await.unwrap().unwrap();
-    assert_eq!(state, SandboxState::Paused);
+    assert_eq!(state, Ok(SandboxState::Paused));
     // Every node call carries the caller's execution fence so node-manager
     // can refuse a pause aimed at a replaced execution.
     let requests = node_manager.requests.lock().unwrap();
