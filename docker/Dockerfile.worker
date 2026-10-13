@@ -15,6 +15,23 @@ ARG AWS_CLI_IMAGE=public.ecr.aws/aws-cli/aws-cli:2.27.41
 FROM ${SPACE_RUST_BUILD_IMAGE} AS rust-build
 FROM ${AWS_CLI_IMAGE} AS aws-cli
 
+FROM public.ecr.aws/ubuntu/ubuntu:24.04 AS space-e2fsprogs
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      gcc make libc6-dev curl ca-certificates xz-utils \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN curl --fail --show-error --location --retry 5 \
+      https://mirrors.edge.kernel.org/pub/linux/kernel/people/tytso/e2fsprogs/v1.47.4/e2fsprogs-1.47.4.tar.xz \
+      -o /tmp/e2fsprogs.tar.xz \
+    && echo 'fd5bf388cbdbe006a3d3b318d983b2948382440acc85a87f1e7d108653e8db0b  /tmp/e2fsprogs.tar.xz' | sha256sum -c - \
+    && tar -C /tmp -xJf /tmp/e2fsprogs.tar.xz \
+    && cd /tmp/e2fsprogs-1.47.4 \
+    && ./configure --prefix=/opt/space/e2fsprogs --disable-elf-shlibs --disable-uuidd \
+    && make -j"$(nproc)" \
+    && make install
+
 FROM public.ecr.aws/ubuntu/ubuntu:24.04
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
@@ -69,6 +86,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       procps \
       ca-certificates \
     && rm -rf /var/lib/apt/lists/*
+
+# Link the filesystem libraries into these tools; retain the distro libraries
+# used by unrelated tools such as mount, findmnt and btrfs.
+COPY --from=space-e2fsprogs \
+    /opt/space/e2fsprogs/sbin/e2fsck \
+    /opt/space/e2fsprogs/sbin/resize2fs \
+    /opt/space/e2fsprogs/sbin/dumpe2fs \
+    /opt/space/e2fsprogs/sbin/tune2fs \
+    /usr/local/sbin/
+RUN test "$(command -v e2fsck)" = /usr/local/sbin/e2fsck && e2fsck -V
 
 # node-manager init can stage an immutable, digest-pinned guest kernel from the
 # cluster bootstrap bucket. Copy the authenticated AWS CLI from its pinned
