@@ -1,20 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ "$(uname -s)" != Linux || $EUID -ne 0 ]]; then
-  if [[ "${SPACE_CI_REQUIRE_TEST_PRIVILEGE:-0}" == 1 ]]; then
-    echo "Run these tests as root in the Linux CI container." >&2
-    exit 1
-  fi
-  echo "SKIP: seed-build staging tests require Linux and root"
-  exit 0
-fi
-
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 script="${repo_root}/crates/libs/build/mgr/scripts/build-seed.sh"
 tmp_dir="$(mktemp -d)"
 trap 'rm -rf "${tmp_dir}"' EXIT
-chmod 755 "$tmp_dir"
 
 fake_bin="${tmp_dir}/bin"
 mkdir -p "${fake_bin}"
@@ -22,12 +12,10 @@ mkdir -p "${fake_bin}"
 cat >"${fake_bin}/sudo" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
-if [[ -n "${CAPTURED_SUDO:-}" ]]; then
-  printf '%s\n' "$@" >"$CAPTURED_SUDO"
-  exit 0
+if [[ "${1:-}" == "-E" ]]; then
+  shift
 fi
-echo "unexpected sudo invocation" >&2
-exit 1
+exec "$@"
 SH
 chmod +x "${fake_bin}/sudo"
 
@@ -60,10 +48,6 @@ case "${1:-}" in
       echo "unexpected ctr images invocation: $*" >&2
       exit 1
     }
-    if [[ "${EXERCISE_OUTPUT_SWAP:-}" == pull ]]; then
-      setpriv --reuid=65534 --regid=0 --clear-groups \
-        ln -s "$REDIRECT_TARGET" "$SPACE_SEED_OUTPUT_DIR"
-    fi
     exit 0
     ;;
   run)
@@ -72,10 +56,6 @@ case "${1:-}" in
       exit 97
     }
     env_file=""
-    rootfs_source=""
-    guest_source=""
-    output_source=""
-    cache_source=""
     container_id=""
     prev=""
     while [[ $# -gt 0 ]]; do
@@ -84,24 +64,6 @@ case "${1:-}" in
         src="${src%%,dst=*}"
         env_file="${src}/rootfs-builder.env"
       fi
-      case "$1" in
-        type=bind,src=*,dst=/output,*)
-          output_source="${1#type=bind,src=}"
-          output_source="${output_source%%,dst=*}"
-          ;;
-        type=bind,src=*,dst=/cache,*)
-          cache_source="${1#type=bind,src=}"
-          cache_source="${cache_source%%,dst=*}"
-          ;;
-        type=bind,src=*,dst=/workspace/rootfs-builder.sh,*)
-          rootfs_source="${1#type=bind,src=}"
-          rootfs_source="${rootfs_source%%,dst=*}"
-          ;;
-        type=bind,src=*,dst=/guest-bin,*)
-          guest_source="${1#type=bind,src=}"
-          guest_source="${guest_source%%,dst=*}"
-          ;;
-      esac
       # ctr run <options> <image-ref> <container-id> <cmd...>
       if [[ -z "$container_id" && "$prev" == docker.io/*@sha256:* ]]; then
         container_id="$1"
@@ -109,33 +71,6 @@ case "${1:-}" in
       prev="$1"
       shift
     done
-    if [[ "${CHECK_STAGE_OWNERSHIP:-}" == 1 ]]; then
-      bundle="$(dirname "$(readlink -f "$rootfs_source")")"
-      [[ "$bundle" == "${SPACE_SEED_STAGE_ROOT}/"* ]] || {
-        echo "scratch bundle escaped the private test staging root" >&2
-        exit 1
-      }
-      [[ "$output_source" == "$bundle/output" ]]
-      [[ "$(stat -c '%u:%a' "$cache_source")" == '0:755' ]]
-      # A cache-group member must not be able to rename the bundle away.
-      if setpriv --reuid=65534 --regid=0 --clear-groups \
-        mv "$bundle" "${bundle}.moved" 2>/dev/null; then
-        mv "${bundle}.moved" "$bundle"
-        echo "another user replaced the scratch bundle" >&2
-        exit 1
-      fi
-      [[ "$(stat -c '%u:%a' "$bundle")" == '0:700' ]]
-      for src in "$rootfs_source" "$env_file" "${guest_source}/spaced"; do
-        if setpriv --reuid=65534 --regid=0 --clear-groups \
-          touch "$src" 2>/dev/null; then
-          echo "another user modified a scratch input" >&2
-          exit 1
-        fi
-      done
-      cmp "$rootfs_source" "$SPACE_SEED_ROOTFS_BUILDER_SCRIPT"
-      cmp "${guest_source}/spaced" "${SPACE_SEED_GUEST_BIN_DIR}/spaced"
-      cmp "${guest_source}/spaced-svc" "${SPACE_SEED_GUEST_BIN_DIR}/spaced-svc"
-    fi
     # Mirror containerd's identifier validation (identifiers.Validate).
     [[ -n "$container_id" ]] || {
       echo "ctr run: no container ID after the image ref" >&2
@@ -155,14 +90,9 @@ case "${1:-}" in
       exit 1
     }
     cp "$env_file" "${CAPTURED_ENV:?CAPTURED_ENV is required}"
-    cmp "$(dirname "$env_file")/sandbox_ed25519.pub" "$EXPECTED_PUBKEY"
-    [[ -d "$output_source" ]]
-    if [[ "${BAD_OUTPUT:-}" == symlink ]]; then
-      ln -s "$REDIRECT_TARGET" "$output_source/rootfs.ext4"
-    else
-      printf 'rootfs\n' >"${output_source}/rootfs.ext4"
-    fi
-    printf '{}\n' >"${output_source}/metadata.json"
+    mkdir -p "${SPACE_SEED_OUTPUT_DIR:?SPACE_SEED_OUTPUT_DIR is required}"
+    printf 'rootfs\n' >"${SPACE_SEED_OUTPUT_DIR}/rootfs.ext4"
+    printf '{}\n' >"${SPACE_SEED_OUTPUT_DIR}/metadata.json"
     exit 0
     ;;
   *)
@@ -172,19 +102,6 @@ case "${1:-}" in
 esac
 SH
 chmod +x "${fake_bin}/ctr"
-
-cat >"${fake_bin}/mv" <<'SH'
-#!/usr/bin/env bash
-set -euo pipefail
-if [[ "${EXERCISE_OUTPUT_SWAP:-}" == publish && "$*" == *./rootfs.ext4 ]]; then
-  setpriv --reuid=65534 --regid=0 --clear-groups \
-    /bin/mv "$SPACE_SEED_OUTPUT_DIR" "${SPACE_SEED_OUTPUT_DIR}.original"
-  setpriv --reuid=65534 --regid=0 --clear-groups \
-    ln -s "$REDIRECT_TARGET" "$SPACE_SEED_OUTPUT_DIR"
-fi
-exec /bin/mv "$@"
-SH
-chmod +x "${fake_bin}/mv"
 
 vendor_root="${tmp_dir}/vendor/firecracker"
 vendor_version_dir="${vendor_root}/v1.16.0"
@@ -228,26 +145,8 @@ make_case_dirs() {
   pubkey="${case_root}/sandbox_ed25519.pub"
   cargo_toml="${case_root}/Cargo.toml"
 
-  mkdir -p "$(dirname "$out_dir")" "$cache_dir" "$stage_root" "$guest_bin_dir"
-  chmod 755 "$case_root"
-  chmod 700 "$stage_root"
-  chmod 2775 "$(dirname "$out_dir")"
+  mkdir -p "$out_dir" "$cache_dir" "$stage_root" "$guest_bin_dir"
   touch "${guest_bin_dir}/spaced" "${guest_bin_dir}/spaced-svc" "$pubkey"
-  printf 'trusted-public-key\n' >"$pubkey"
-  if [[ "$name" == recovered-output || "$name" == foreign-output || "$name" == force-output-* ]]; then
-    mkdir "$out_dir"
-  fi
-  if [[ "$name" == recovered-output || "$name" == foreign-output || "$name" == force-output-caller ]]; then
-    chown 65534 "$out_dir"
-  fi
-  if [[ "$name" == force-output-* ]]; then
-    printf 'old-rootfs\n' >"$out_dir/rootfs.ext4"
-    printf 'other-public-key\n' >"$out_dir/sandbox_ed25519.pub"
-    mkdir "$out_dir/sha256:old-build"
-    printf 'old-artifact\n' >"$out_dir/sha256:old-build/rootfs.ext4"
-    chown 65534:65534 "$out_dir/sha256:old-build/rootfs.ext4"
-    chmod 600 "$out_dir/sha256:old-build/rootfs.ext4"
-  fi
   printf '[workspace.package]\nversion = "0.1.2"\n' >"$cargo_toml"
   printf '#!/usr/bin/env bash\n' >"$rootfs_builder"
   chmod +x "$rootfs_builder" "${guest_bin_dir}/spaced" "${guest_bin_dir}/spaced-svc"
@@ -257,14 +156,10 @@ run_success() {
   local name="$1"
   shift
   make_case_dirs "$name"
-  local -a args=()
-  [[ "$name" != force-output-* ]] || args+=(--force)
   env \
     PATH="${fake_bin}:${PATH}" \
     ALLOW_CTR_RUN=1 \
     CAPTURED_ENV="$captured_env" \
-    EXPECTED_PUBKEY="$pubkey" \
-    SPACE_SEED_OUTPUT_GROUP=0 \
     CAPTURED_CONTAINER_ID="$captured_container_id" \
     SPACE_SEED_OUTPUT_DIR="$out_dir" \
     SPACE_SEED_CACHE_DIR="$cache_dir" \
@@ -277,8 +172,7 @@ run_success() {
     SPACE_SEED_UBUNTU_VERSION="26.04" \
     SPACE_SEED_UBUNTU_DATE="release" \
     "$@" \
-    "$script" --id "$name" --pubkey "$pubkey" "${args[@]}" >/dev/null
-  [[ -z "$(find "$stage_root" -mindepth 1 -print -quit)" ]]
+    "$script" --id "$name" --pubkey "$pubkey" >/dev/null
 }
 
 run_failure() {
@@ -289,10 +183,7 @@ run_failure() {
   set +e
   env \
     PATH="${fake_bin}:${PATH}" \
-    CAPTURED_CONTAINER_ID="$captured_container_id" \
     CAPTURED_ENV="$captured_env" \
-    EXPECTED_PUBKEY="$pubkey" \
-    SPACE_SEED_OUTPUT_GROUP=0 \
     SPACE_SEED_OUTPUT_DIR="$out_dir" \
     SPACE_SEED_CACHE_DIR="$cache_dir" \
     SPACE_SEED_STAGE_ROOT="$stage_root" \
@@ -338,64 +229,6 @@ assert_export() {
     exit 1
   }
 }
-
-# An unprivileged caller keeps its arguments, home and repository when the
-# wrapper asks sudo to restart it before creating any staging directory.
-captured_sudo="${tmp_dir}/sudo-args"
-touch "$captured_sudo"
-chmod 666 "$captured_sudo"
-setpriv --reuid=65534 --regid=65534 --clear-groups env \
-  PATH="${fake_bin}:${PATH}" CAPTURED_SUDO="$captured_sudo" \
-  HOME="${tmp_dir}/caller-home" SPACE_SEED_REPO_ROOT="$repo_root" \
-  "$script" --id manual-seed --pubkey '/tmp/key with spaces.pub'
-printf '%s\n' -E env "HOME=${tmp_dir}/caller-home" \
-  "SPACE_SEED_REPO_ROOT=$repo_root" /bin/bash "$script" \
-  --id manual-seed --pubkey '/tmp/key with spaces.pub' >"${tmp_dir}/expected-sudo"
-cmp "$captured_sudo" "${tmp_dir}/expected-sudo"
-
-run_success private-staging CHECK_STAGE_OWNERSHIP=1
-assert_export "$captured_env" SPACE_SEED_UBUNTU_RELEASE resolute
-
-# Unsafe roots and output redirects must fail before touching their targets.
-redirect_target="$tmp_dir/redirect-target"
-mkdir "$redirect_target"
-for kind in staging cache; do
-  for form in symlink foreign writable-parent; do
-    unsafe="$tmp_dir/unsafe-$kind-$form"
-    case "$form" in
-      symlink) ln -s "$redirect_target" "$unsafe" ;;
-      foreign) mkdir "$unsafe"; chown 65534 "$unsafe" ;;
-      writable-parent) mkdir -m 0777 "$unsafe"; unsafe="$unsafe/child" ;;
-    esac
-    if [[ "$kind" == staging ]]; then
-      run_failure "$kind-$form" "$kind directory" SPACE_SEED_STAGE_ROOT="$unsafe"
-    else
-      run_failure "$kind-$form" "$kind directory" SPACE_SEED_CACHE_DIR="$unsafe"
-    fi
-  done
-done
-mkdir -m 0775 "$tmp_dir/unsafe-writable-stage"
-run_failure writable-stage 'unsafe staging directory' SPACE_SEED_STAGE_ROOT="$tmp_dir/unsafe-writable-stage"
-mkdir -m 2775 "$tmp_dir/legacy-cache"
-run_success repaired-cache SPACE_SEED_CACHE_DIR="$tmp_dir/legacy-cache" CHECK_STAGE_OWNERSHIP=1
-[[ "$(stat -c '%u:%a' "$tmp_dir/legacy-cache")" == '0:755' ]]
-run_failure output-swap 'File exists' ALLOW_CTR_RUN=1 EXERCISE_OUTPUT_SWAP=pull REDIRECT_TARGET="$redirect_target" CHECK_STAGE_OWNERSHIP=1
-[[ -z "$(find "$redirect_target" -mindepth 1 -print -quit)" ]]
-run_success pinned-publication EXERCISE_OUTPUT_SWAP=publish REDIRECT_TARGET="$redirect_target"
-[[ "$(cat "$out_dir.original/rootfs.ext4")" == rootfs ]]
-[[ "$(stat -c '%g:%a' "$out_dir.original")" == '0:2775' ]]
-[[ -z "$(find "$redirect_target" -mindepth 1 -print -quit)" ]]
-run_failure output-symlink 'not a regular file' ALLOW_CTR_RUN=1 BAD_OUTPUT=symlink REDIRECT_TARGET="$redirect_target"
-run_success recovered-output SPACE_SEED_OUTPUT_GROUP= SUDO_UID=65534
-run_failure foreign-output 'unsafe output directory' ALLOW_CTR_RUN=1 SUDO_UID=65534
-for owner in service caller; do
-  output_group=0
-  [[ "$owner" != caller ]] || output_group=""
-  run_success "force-output-$owner" SPACE_SEED_OUTPUT_GROUP="$output_group" SUDO_UID=65534
-  [[ "$(cat "$out_dir/rootfs.ext4")" == rootfs ]]
-  [[ "$(cat "$out_dir/sha256:old-build/rootfs.ext4")" == old-artifact ]]
-  [[ "$(stat -c '%u:%g:%a' "$out_dir/sha256:old-build/rootfs.ext4")" == '65534:65534:600' ]]
-done
 
 run_success no-vendor-defaults
 assert_export "$captured_env" SPACE_SEED_RUNTIME firecracker

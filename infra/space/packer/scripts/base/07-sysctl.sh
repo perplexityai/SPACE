@@ -211,15 +211,12 @@ for gate in capability-v1.lock admission-v1.lock work-v1.lock; do
 done
 chmod 0775 \
   /space/cache/firecracker/templates \
-  /space/cache/firecracker/sandboxes
-# The shared cache and build parents are also sticky: the cache services can still
+  /space/cache/firecracker/sandboxes \
+  /space/cache/firecracker/builds
+# The two shared cache parents are also sticky: the cache services can still
 # create entries there, but cannot rename away the root-owned kernel and asset
 # roots beneath them.
-chmod 1775 /space/cache /space/cache/firecracker /space/cache/firecracker/builds
-for build_root in /space/cache/firecracker/builds/{oci,seed-cache}; do
-  [[ ! -L "$build_root" ]] || { echo "Refusing linked build directory: $build_root" >&2; exit 1; }
-  install -d -m 00755 -o 0 -g 0 "$build_root"
-done
+chmod 1775 /space/cache /space/cache/firecracker
 
 # ── Runtime manager ────────────────────────────────────────────────────────
 # Node-manager creates a separate managed store at startup; do not relocate

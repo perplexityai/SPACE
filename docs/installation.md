@@ -503,15 +503,6 @@ leave restore parents or downloaded files inaccessible across the identities.
 Validate retained transfers, snapshot restore, and fork with the intended image
 and filesystem settings before changing identities.
 
-build-manager refuses to run a scratch (seed) template build unless
-`/space/cache`, `/space/cache/firecracker` and `/space/cache/firecracker/builds`
-are root-owned and sticky (or not group-writable), and `builds/oci` and
-`builds/seed-cache` are root-owned. The provisioning scripts for each
-substrate lay that out; when upgrading, roll the node layout before or with
-the build-manager image, or scratch builds on nodes that still carry the old
-layout fail closed with `unsafe parent of cache directory` until the node is
-re-provisioned.
-
 Changing an existing node's identity requires separate migration tooling and
 deployment orchestration. Stop and drain the predecessor, preserve and acquire
 its existing service-lock inode, and transfer only volume-manager's retained

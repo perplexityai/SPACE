@@ -221,22 +221,19 @@ mount_cache_image() {
 
 # The cache directories packer bakes and 11-nvme-cache.sh recreates after it
 # mounts the instance store: setgid dirs the space-cache-rw services (sbxmgr,
-# tmplmgr, volmgr) write, root-owned jails. Shared cache and build parents are
-# sticky so entries stay under their creator's control.
+# tmplmgr, volmgr) write, root-owned jails. The two shared parents are also
+# sticky, so those services cannot rename away the root-owned kernel and asset
+# roots staged beneath them.
 cache_skeleton() {
   local cache_rw_gid
   cache_rw_gid="$(space_expected_gid_for_group space-cache-rw)"
-  install -d -m 3775 -o 0 -g "$cache_rw_gid" \
-    "$CACHE_DIR" "$CACHE_DIR/firecracker" "$CACHE_DIR/firecracker/builds"
+  install -d -m 3775 -o 0 -g "$cache_rw_gid" "$CACHE_DIR" "$CACHE_DIR/firecracker"
   install -d -m 2775 -o 0 -g "$cache_rw_gid" \
     "$CACHE_DIR/firecracker/templates" \
     "$CACHE_DIR/firecracker/sandboxes" \
+    "$CACHE_DIR/firecracker/builds" \
     "$CACHE_DIR/firecracker/.volmgr-staging"
   install -d -m 0755 -o 0 -g 0 "$CACHE_DIR/firecracker/jails"
-  for build_root in "$CACHE_DIR/firecracker/builds/oci" "$CACHE_DIR/firecracker/builds/seed-cache"; do
-    [[ ! -L "$build_root" ]] || die "Refusing linked build directory: $build_root"
-    install -d -m 00755 -o 0 -g 0 "$build_root"
-  done
 }
 
 cache() {

@@ -5052,7 +5052,6 @@ dependencies = [
  "bytes",
  "hex",
  "jiff",
- "nix 0.31.3",
  "object",
  "oci-spec",
  "pplx-space-build-mgr-client",

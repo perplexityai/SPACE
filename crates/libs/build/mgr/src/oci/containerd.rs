@@ -1,6 +1,5 @@
 use std::ffi::OsString;
 use std::fs;
-use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, LazyLock};
@@ -1123,64 +1122,8 @@ async fn run_pull_with_budget(
     }
 }
 
-pub(super) fn prepare_cache_directory(cache_dir: &Path) -> std::io::Result<()> {
-    // An explicit mode keeps the directory 0755 under any umask; create_dir_all
-    // would yield 0775 under umask 002 and fail the check below.
-    fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o755)
-        .create(cache_dir)?;
-    let owner = nix::unistd::geteuid().as_raw();
-    let metadata = fs::symlink_metadata(cache_dir)?;
-    // The deployed caller is root; unprivileged fixtures own their private cache.
-    if !metadata.is_dir() || metadata.uid() != owner || metadata.mode() & 0o022 != 0 {
-        return Err(cache_directory_error(
-            cache_dir,
-            &metadata,
-            "OCI cache must be a directory owned by the caller and writable only by its owner",
-        ));
-    }
-    // The workspace is then created by path, so every parent must keep another
-    // account from renaming the cache away first: root-owned (or the caller's
-    // own, for fixtures) and either sticky or not group/other-writable.
-    for parent in cache_dir
-        .ancestors()
-        .skip(1)
-        .take_while(|parent| !parent.as_os_str().is_empty())
-    {
-        let parent_metadata = fs::metadata(parent)?;
-        let mode = parent_metadata.mode();
-        let trusted_owner = parent_metadata.uid() == 0 || parent_metadata.uid() == owner;
-        if !parent_metadata.is_dir() || !trusted_owner || (mode & 0o022 != 0 && mode & 0o1000 == 0)
-        {
-            return Err(cache_directory_error(
-                parent,
-                &parent_metadata,
-                "OCI cache parent must be root-owned and sticky or not group/other-writable",
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn cache_directory_error(
-    path: &Path,
-    metadata: &fs::Metadata,
-    requirement: &str,
-) -> std::io::Error {
-    std::io::Error::new(
-        std::io::ErrorKind::PermissionDenied,
-        format!(
-            "{requirement}: {} is owned by uid {} with mode {:o}",
-            path.display(),
-            metadata.uid(),
-            metadata.mode() & 0o7777
-        ),
-    )
-}
-
 fn create_mount_directory(cache_dir: &Path) -> Result<PathBuf, OciBuildError> {
-    prepare_cache_directory(cache_dir).map_err(|source| OciBuildError::File {
+    fs::create_dir_all(cache_dir).map_err(|source| OciBuildError::File {
         operation: OciFileOperation::CreateMountDirectory,
         path: cache_dir.to_path_buf(),
         source,

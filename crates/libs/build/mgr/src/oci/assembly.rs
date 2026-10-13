@@ -92,13 +92,6 @@ struct RootfsAssemblyRequest<'a> {
 }
 
 fn assemble(request: RootfsAssemblyRequest<'_>) -> Result<(), RootfsAssemblyError> {
-    super::containerd::prepare_cache_directory(request.cache_dir).map_err(|source| {
-        RootfsAssemblyError::Io {
-            operation: RootfsAssemblyOperation::CreateWorkspace,
-            path: request.cache_dir.to_path_buf(),
-            source,
-        }
-    })?;
     let workspace = tempfile::Builder::new()
         .prefix("space-oci-assembly-")
         .tempdir_in(request.cache_dir)
