@@ -234,6 +234,163 @@ pub(super) fn require_state_write(
         .map_err(|error| Status::aborted(format!("{context}: {error}")))
 }
 
+/// [`require_state_write`] for [`crate::db::update_state_from`]. A database
+/// error is `Internal`. Every refusal is `Aborted`: a from-state refusal
+/// reports the state another transition left the row in, and a generic-guard
+/// refusal or a missing row keeps `update_state`'s message.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "the update_state_from conversions adopt it")
+)]
+pub(super) fn require_state_write_from(
+    result: rusqlite::Result<crate::db::StateWriteOutcome>,
+    context: &'static str,
+) -> Result<(), Status> {
+    let outcome = result.map_err(|error| Status::internal(format!("{context}: {error}")))?;
+    state_write_result(outcome)
+        .map(drop)
+        .map_err(|rejected| rejected.into_status(context))
+}
+
+/// Why an `update_state_from` write did not apply. A caller that answers one
+/// case differently matches it and passes the rest to
+/// [`StateWriteRejected::into_status`].
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "the update_state_from conversions adopt it")
+)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum StateWriteRejected {
+    /// Another transition moved the row outside the edge's source states.
+    FromState {
+        found: SandboxState,
+    },
+    /// A generic guard refused, as it refuses `update_state`. The guards
+    /// answer first, so `found` may also be outside the edge's source states.
+    Guard {
+        refusal: StateWriteGuard,
+        found: SandboxState,
+    },
+    Missing,
+}
+
+/// The generic guards `update_state` and `update_state_from` share.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "the update_state_from conversions adopt it")
+)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum StateWriteGuard {
+    Quarantined,
+    CleanupOwned,
+}
+
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "the update_state_from conversions adopt it")
+)]
+pub(super) fn state_write_result(
+    outcome: crate::db::StateWriteOutcome,
+) -> Result<SandboxState, StateWriteRejected> {
+    use crate::db::{StateWriteOutcome, StateWriteRefusal};
+    match outcome {
+        StateWriteOutcome::Applied { from } => Ok(from),
+        StateWriteOutcome::Refused {
+            found,
+            refusal: StateWriteRefusal::FromState,
+        } => Err(StateWriteRejected::FromState { found }),
+        StateWriteOutcome::Refused {
+            found,
+            refusal: StateWriteRefusal::Quarantined,
+        } => Err(StateWriteRejected::Guard {
+            refusal: StateWriteGuard::Quarantined,
+            found,
+        }),
+        StateWriteOutcome::Refused {
+            found,
+            refusal: StateWriteRefusal::CleanupOwned,
+        } => Err(StateWriteRejected::Guard {
+            refusal: StateWriteGuard::CleanupOwned,
+            found,
+        }),
+        StateWriteOutcome::Missing => Err(StateWriteRejected::Missing),
+    }
+}
+
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "the update_state_from conversions adopt it")
+)]
+impl StateWriteRejected {
+    pub(super) fn into_status(self, context: &str) -> Status {
+        use crate::db::{SandboxStateWriteNotApplied, SandboxStateWriteOutcome};
+        let outcome = match self {
+            Self::FromState { found } => {
+                return Status::aborted(format!(
+                    "{context}: sandbox state write was superseded: sandbox is {found}"
+                ));
+            }
+            Self::Guard {
+                refusal: StateWriteGuard::Quarantined,
+                ..
+            } => SandboxStateWriteOutcome::BlockedByQuarantine,
+            Self::Guard {
+                refusal: StateWriteGuard::CleanupOwned,
+                ..
+            } => SandboxStateWriteOutcome::SupersededByCleanupEpisode,
+            Self::Missing => SandboxStateWriteOutcome::Missing,
+        };
+        Status::aborted(format!(
+            "{context}: {}",
+            SandboxStateWriteNotApplied { outcome }
+        ))
+    }
+}
+
+/// `update_state_best_effort` for [`crate::db::update_state_from`]: a refusal
+/// or an error is logged and leaves the row as it is, and only an applied
+/// write marks the sandbox dirty. `None` is a poisoned connection or a
+/// database error.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "the update_state_from conversions adopt it")
+)]
+pub(super) fn update_state_from_best_effort(
+    db: &Arc<Mutex<rusqlite::Connection>>,
+    sandbox_id: &str,
+    edge: &'static crate::db::Edge,
+) -> Option<crate::db::StateWriteOutcome> {
+    use crate::db::StateWriteOutcome;
+    let outcome = {
+        let db = crate::node_state_sync::connection_or_signal_failure(db).ok()?;
+        crate::db::update_state_from(&db, sandbox_id, edge)
+    };
+    match outcome {
+        Ok(outcome @ StateWriteOutcome::Applied { .. }) => {
+            mark_sandbox_dirty(db, sandbox_id);
+            Some(outcome)
+        }
+        Ok(outcome @ (StateWriteOutcome::Refused { .. } | StateWriteOutcome::Missing)) => {
+            tracing::warn!(
+                sandbox_id,
+                state = edge.to().as_str(),
+                ?outcome,
+                "sandbox state write was superseded"
+            );
+            Some(outcome)
+        }
+        Err(error) => {
+            tracing::warn!(
+                sandbox_id,
+                state = edge.to().as_str(),
+                %error,
+                "failed to update sandbox state"
+            );
+            None
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(super) struct ActivationCleanupSpec {
     pub(super) cleanup_id: SandboxCleanupEpisodeId,
@@ -489,3 +646,6 @@ pub(super) struct CleanupRecoveryTarget {
     pub(super) completion: CleanupCompletion,
     pub(super) cleanup_id: Option<SandboxCleanupEpisodeId>,
 }
+
+#[cfg(test)]
+mod tests;

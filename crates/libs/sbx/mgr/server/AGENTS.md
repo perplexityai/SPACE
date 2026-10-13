@@ -10,7 +10,11 @@
   `can_transition_to`, with a reason, to `ALLOWLIST` in
   `src/db/tests/state_write_table.rs`. Nothing checks the table against the
   writers; the `&'static Edge` argument does that at call sites. A refused
-  write must leave every row unchanged.
+  write must leave every row unchanged. Map an `update_state_from` outcome to
+  a status with `require_state_write_from`, or write it best effort with
+  `update_state_from_best_effort` (`src/service/cleanup_support.rs`); a caller
+  that answers one case differently matches `state_write_result` and passes
+  the rest to `into_status`.
 - Foreign keys are off: register a new sandbox child table in
   `delete_sandbox_child_rows` (`src/db.rs`).
 - `src/service/adapter.rs` implements the gRPC trait; most handler bodies live
