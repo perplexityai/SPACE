@@ -339,7 +339,7 @@ else
   log "AWS creds unset — optional credmgr AWS integrations stay disabled."
 fi
 
-# Postgres first; the api-server's migrate initContainer blocks on it. Wait
+# Postgres first; the space-db-migrate Job blocks on it. Wait
 # for it to be ready BEFORE installing other charts that try to talk to it,
 # so initContainer / Job retries don't waste backoff slots.
 helm_apply space "$KIND_DIR/charts/space-postgres"
@@ -370,12 +370,22 @@ kubectl --context "$KCTX" -n "$NAMESPACE" rollout status deploy/space-redis --ti
 # sandbox pod there.
 helm_apply space "$KIND_DIR/charts/space-sandbox-network-policy"
 
-# api-server. The initContainer runs the control-plane migrator against the
-# now-ready postgres. The main container is gated on /readyz, which only
-# turns 200 after the K8s pod reflector's initial LIST completes (empty list
-# is fine at this stage — no node-api pods yet).
+# The control-plane migrations run once, as the api chart's space-db-migrate
+# Job, against the now-ready postgres before any API replica starts. A Job's
+# pod template is immutable, so the previous run's Job is replaced.
+kubectl --context "$KCTX" -n "$NAMESPACE" delete job space-db-migrate --ignore-not-found >/dev/null
+helm template space "$KIND_DIR/charts/space-api-local" --namespace "$NAMESPACE" \
+  ${TELEMETRY_HELM_ARGS[@]+"${TELEMETRY_HELM_ARGS[@]}"} --show-only templates/migrate-job.yaml \
+  | kubectl --context "$KCTX" apply -n "$NAMESPACE" --validate=false -f -
+log "waiting for the space-db-migrate Job (control-plane migrations)"
+kubectl --context "$KCTX" -n "$NAMESPACE" wait --for=condition=complete \
+  job/space-db-migrate --timeout="${TIMEOUT}s" >/dev/null
+
+# api-server. The main container is gated on /readyz, which only turns 200
+# after the K8s pod reflector's initial LIST completes (empty list is fine at
+# this stage — no node-api pods yet).
 helm_apply space "$KIND_DIR/charts/space-api-local"
-log "waiting for space-api Deployment to be ready (initContainer runs migrations)"
+log "waiting for space-api Deployment to be ready"
 kubectl --context "$KCTX" -n "$NAMESPACE" rollout status deploy/space-api --timeout="${TIMEOUT}s"
 
 SPACE_CONSOLE_PASSWORD="$CONSOLE_PASSWORD" bash "$KIND_DIR/scripts/provision-local-console.sh"

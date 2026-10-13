@@ -28,7 +28,7 @@ kubectl --context kind-space-local -n space get events \
   --sort-by=.metadata.creationTimestamp
 kubectl --context kind-space-local -n space logs job/space-seed-publish
 kubectl --context kind-space-local -n space \
-  logs deployment/space-api -c migrate
+  logs job/space-db-migrate -c migrate
 tilt logs provision-local-console --tail 50
 ```
 

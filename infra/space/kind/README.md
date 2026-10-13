@@ -673,9 +673,9 @@ Log in as `root@local` with the initial password (`password` by default). Set `S
 
 ### Recovering from an unbundled migration version
 
-On a long-lived task-owned bench, `space-api` may refuse to start because the
-database contains an applied migration version that the current binary does not
-bundle. This can happen when a branch applies a queued migration before its
+On a long-lived task-owned bench, the `space-db-migrate` Job may fail, and
+`space-api` never start, because the database contains an applied migration
+version that the current binary does not bundle. This can happen when a branch applies a queued migration before its
 timestamp changes on merge. No later build can satisfy the orphaned version.
 
 After confirming `kind-space-local` is the intended disposable cluster, reset
@@ -684,8 +684,9 @@ the local control-plane database and republish `seed:latest`:
 ```bash
 kubectl delete statefulset space-postgres -n space --context kind-space-local
 kubectl delete pvc data-space-postgres-0 -n space --context kind-space-local
-kubectl delete job space-seed-publish -n space --context kind-space-local
+kubectl delete job space-seed-publish space-db-migrate -n space --context kind-space-local
 tilt trigger space-postgres
+tilt trigger space-db-migrate
 tilt trigger space-api
 tilt trigger space-seed-publish
 ```
@@ -853,10 +854,14 @@ load-balanced entry, scaled on load.
   so every path runs against more than one replica; three so the worst case of
   both tiers at their 1 CPU / 512 MiB limits stays within a 16-core runner's
   infra node. Their Deployments roll one replica at a time rather than
-  `Recreate`. The UI chart pins one replica, so it has no autoscaler. Each API
-  replica still runs the migration init containers, so a fresh cluster's two
-  replicas run them side by side; a deployment runs them once, as a
-  provisioning Job.
+  `Recreate`. The UI chart pins one replica, so it has no autoscaler.
+- **Migrations** run once per rollout, as the `space-db-migrate` Job, before
+  any API replica starts, the way a deployment's provisioning Job runs them
+  ahead of its application releases; the replicas no longer each run them.
+  The migrator asks for this: it serializes on a session advisory lock, but a
+  competing runner can turn a retried lock race into a failed run
+  (`crates/libs/db/migrator/src/migration_retry.rs`). Tilt makes `space-api`
+  wait for the Job and bootstrap waits for it before applying the API.
 - **cluster-controller** runs two replicas with leader election on: the Lease
   holder runs every reconciler and the other stands by, Ready, to take over.
   `smoke-kind-leader-election-brownout.sh` exercises the handoff.

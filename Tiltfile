@@ -478,7 +478,7 @@ if DATADOG_MODE == "fakeintake":
         labels = ["observability"],
     )
 
-# Postgres first; the api-server's migrate initContainer blocks on it.
+# Postgres first; the space-db-migrate Job blocks on it.
 k8s_yaml(helm_release("space", "infra/space/kind/charts/space-postgres"))
 k8s_resource(
     "space-postgres",
@@ -491,7 +491,7 @@ k8s_resource(
 # lands.
 SPACE_API_DEPS = ["space-postgres", "label-kind-workers", "label-kind-infra",
                   "advertise-kind-worker-network-slots", "install-space-shim",
-                  "internal-rpc-tls", "space-sandbox-network-policy"]
+                  "internal-rpc-tls", "space-sandbox-network-policy", "space-db-migrate"]
 # No port_forward: localhost:8080 is the cluster's host port mapping onto the
 # space-api-entry NodePort (kind-cluster.yaml.tmpl), which spreads connections
 # across the autoscaled replicas as a deployment's load balancer does.
@@ -500,6 +500,14 @@ k8s_resource(
     "space-api",
     labels = ["control-plane"],
     resource_deps = SPACE_API_DEPS,
+)
+# The control-plane migrations, once, before any API replica starts (the
+# chart's space-db-migrate Job), as a deployment runs them ahead of its
+# application releases.
+k8s_resource(
+    "space-db-migrate",
+    labels = ["data"],
+    resource_deps = ["space-postgres", "label-kind-infra"],
 )
 # The dedicated admin API, its own process (--surface admin).
 k8s_resource(

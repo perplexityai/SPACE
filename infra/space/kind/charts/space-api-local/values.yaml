@@ -70,13 +70,14 @@ spaceApiRouteToken:
 
 clusterId: "kind-local"
 
-# Migrator runs as an initContainer before the api-server starts. It reuses
-# the same image (the api bundle ships space-db-migrator + space-api-svc).
+# The migrator runs once, as the space-db-migrate Job (templates/migrate-job.yaml),
+# before the api-server starts. It reuses the same image (the api bundle ships
+# space-db-migrator + space-api-svc).
 migrate:
   enabled: true
 
 postgres:
-  # Dev-default managed-login passwords. bootstrap-roles (initContainer)
+  # Dev-default managed-login passwords. bootstrap-roles (the migrate Job)
   # provisions the roles with these; the services connect as space_user and
   # space_creds using the same values.
   managedUserPassword: space-dev-user

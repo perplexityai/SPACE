@@ -3,8 +3,9 @@ One Deployment per API surface the process serves, as deployed: `shared`, the
 public, admin and E2B roots on one host, which every client and harness call
 here addresses; and, with admin.enabled, `admin`, the dedicated admin API
 (`--surface admin`, crates/apps/api/svc/src/main.rs) in its own process. Only
-the shared Deployment runs the migrations and the ingress activation listener,
-and only it is behind the space-api Service.
+the shared Deployment runs the ingress activation listener, and only it is
+behind the space-api Service. Neither runs the migrations: the space-db-migrate
+Job (migrate-job.yaml) does, once, before either starts.
 */ -}}
 {{- range $surface := list "shared" "admin" }}
 {{- if or (eq $surface "shared") $.Values.admin.enabled }}
@@ -65,50 +66,6 @@ spec:
       # listener's own identity and nobody else.
       securityContext:
         fsGroup: 952
-      {{- if and $shared .Values.migrate.enabled }}
-      initContainers:
-        # bootstrap-roles is convergent and brackets the migrations: the
-        # pre-run creates the managed logins (space_user, space_creds, …)
-        # the services connect as, and the post-run grants them on any
-        # tables the migrations just created. The kind Postgres connection
-        # string authenticates as the image-created superuser, which can
-        # create roles.
-        - name: bootstrap-roles
-          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
-          imagePullPolicy: {{ .Values.image.pullPolicy }}
-          command:
-            - /space/bin/space-db-migrator
-            - bootstrap-roles
-            - --database-url
-            - $(POSTGRES_CONNECTION_STRING)
-          env:
-{{ include "space-api-local.bootstrapRolesEnv" . | indent 12 }}
-        - name: migrate
-          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
-          imagePullPolicy: {{ .Values.image.pullPolicy }}
-          command:
-            - /space/bin/space-db-migrator
-            - control-plane
-            - --database-url
-            - $(POSTGRES_CONNECTION_STRING)
-            - up
-          env:
-            - name: POSTGRES_CONNECTION_STRING
-              valueFrom:
-                secretKeyRef:
-                  name: space-postgres
-                  key: POSTGRES_CONNECTION_STRING
-        - name: bootstrap-roles-grants
-          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
-          imagePullPolicy: {{ .Values.image.pullPolicy }}
-          command:
-            - /space/bin/space-db-migrator
-            - bootstrap-roles
-            - --database-url
-            - $(POSTGRES_CONNECTION_STRING)
-          env:
-{{ include "space-api-local.bootstrapRolesEnv" . | indent 12 }}
-      {{- end }}
       containers:
         - name: api
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
