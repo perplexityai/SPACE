@@ -190,7 +190,7 @@ chown root:root /space/cache/firecracker/jails
 chmod 0755 /space/cache/firecracker/jails
 # Kernel and asset roots are staged by root and read by launches: keep them
 # root-only after the cache-wide group grant above, which also made their files
-# group-writable. The two shared parents are sticky so the cache services
+# group-writable. The shared cache and build parents are sticky so cache services
 # cannot rename those roots away.
 for tree in /space/cache/firecracker/kernels /space/cache/firecracker/assets; do
   [[ -d "$tree" && ! -L "$tree" ]] || continue
@@ -198,7 +198,7 @@ for tree in /space/cache/firecracker/kernels /space/cache/firecracker/assets; do
   find "$tree" -xdev -type d -exec chmod u=rwx,go=rx,ug-s,a-t {} +
   find "$tree" -xdev -type f -exec chmod u=rw,go=r,ug-s,a-t {} +
 done
-chmod +t /space/cache /space/cache/firecracker
+chmod +t /space/cache /space/cache/firecracker /space/cache/firecracker/builds
 
 echo "Mounted /space/cache on NVMe instance store (btrfs RAID0)"
 df -Th /space/cache

@@ -1,10 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+if [[ "$(uname -s)" != Linux || $EUID -ne 0 ]]; then
+  echo "Run these tests as root in the Linux CI container." >&2
+  exit 1
+fi
+
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 script="${repo_root}/crates/libs/build/mgr/scripts/build-seed.sh"
 tmp_dir="$(mktemp -d)"
 trap 'rm -rf "${tmp_dir}"' EXIT
+chmod 755 "$tmp_dir"
 
 fake_bin="${tmp_dir}/bin"
 mkdir -p "${fake_bin}"
@@ -12,10 +18,12 @@ mkdir -p "${fake_bin}"
 cat >"${fake_bin}/sudo" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
-if [[ "${1:-}" == "-E" ]]; then
-  shift
+if [[ -n "${CAPTURED_SUDO:-}" ]]; then
+  printf '%s\n' "$@" >"$CAPTURED_SUDO"
+  exit 0
 fi
-exec "$@"
+echo "unexpected sudo invocation" >&2
+exit 1
 SH
 chmod +x "${fake_bin}/sudo"
 
@@ -56,6 +64,8 @@ case "${1:-}" in
       exit 97
     }
     env_file=""
+    rootfs_source=""
+    guest_source=""
     container_id=""
     prev=""
     while [[ $# -gt 0 ]]; do
@@ -64,6 +74,16 @@ case "${1:-}" in
         src="${src%%,dst=*}"
         env_file="${src}/rootfs-builder.env"
       fi
+      case "$1" in
+        type=bind,src=*,dst=/workspace/rootfs-builder.sh,*)
+          rootfs_source="${1#type=bind,src=}"
+          rootfs_source="${rootfs_source%%,dst=*}"
+          ;;
+        type=bind,src=*,dst=/guest-bin,*)
+          guest_source="${1#type=bind,src=}"
+          guest_source="${guest_source%%,dst=*}"
+          ;;
+      esac
       # ctr run <options> <image-ref> <container-id> <cmd...>
       if [[ -z "$container_id" && "$prev" == docker.io/*@sha256:* ]]; then
         container_id="$1"
@@ -71,6 +91,27 @@ case "${1:-}" in
       prev="$1"
       shift
     done
+    if [[ "${CHECK_STAGE_OWNERSHIP:-}" == 1 ]]; then
+      bundle="$(dirname "$(readlink -f "$rootfs_source")")"
+      # A cache-group member must not be able to rename the bundle away.
+      if setpriv --reuid=65534 --regid=0 --clear-groups \
+        mv "$bundle" "${bundle}.moved" 2>/dev/null; then
+        mv "${bundle}.moved" "$bundle"
+        echo "another user replaced the scratch bundle" >&2
+        exit 1
+      fi
+      [[ "$(stat -c '%u:%a' "$bundle")" == '0:700' ]]
+      for src in "$rootfs_source" "$env_file" "${guest_source}/spaced"; do
+        if setpriv --reuid=65534 --regid=0 --clear-groups \
+          touch "$src" 2>/dev/null; then
+          echo "another user modified a scratch input" >&2
+          exit 1
+        fi
+      done
+      cmp "$rootfs_source" "$SPACE_SEED_ROOTFS_BUILDER_SCRIPT"
+      cmp "${guest_source}/spaced" "${SPACE_SEED_GUEST_BIN_DIR}/spaced"
+      cmp "${guest_source}/spaced-svc" "${SPACE_SEED_GUEST_BIN_DIR}/spaced-svc"
+    fi
     # Mirror containerd's identifier validation (identifiers.Validate).
     [[ -n "$container_id" ]] || {
       echo "ctr run: no container ID after the image ref" >&2
@@ -146,6 +187,8 @@ make_case_dirs() {
   cargo_toml="${case_root}/Cargo.toml"
 
   mkdir -p "$out_dir" "$cache_dir" "$stage_root" "$guest_bin_dir"
+  chmod 755 "$case_root"
+  chmod 775 "$stage_root"
   touch "${guest_bin_dir}/spaced" "${guest_bin_dir}/spaced-svc" "$pubkey"
   printf '[workspace.package]\nversion = "0.1.2"\n' >"$cargo_toml"
   printf '#!/usr/bin/env bash\n' >"$rootfs_builder"
@@ -229,6 +272,23 @@ assert_export() {
     exit 1
   }
 }
+
+# An unprivileged caller keeps its arguments, home and repository when the
+# wrapper asks sudo to restart it before creating any staging directory.
+captured_sudo="${tmp_dir}/sudo-args"
+touch "$captured_sudo"
+chmod 666 "$captured_sudo"
+setpriv --reuid=65534 --regid=65534 --clear-groups env \
+  PATH="${fake_bin}:${PATH}" CAPTURED_SUDO="$captured_sudo" \
+  HOME="${tmp_dir}/caller-home" SPACE_SEED_REPO_ROOT="$repo_root" \
+  "$script" --id manual-seed --pubkey '/tmp/key with spaces.pub'
+printf '%s\n' -E env "HOME=${tmp_dir}/caller-home" \
+  "SPACE_SEED_REPO_ROOT=$repo_root" /bin/bash "$script" \
+  --id manual-seed --pubkey '/tmp/key with spaces.pub' >"${tmp_dir}/expected-sudo"
+cmp "$captured_sudo" "${tmp_dir}/expected-sudo"
+
+run_success private-staging CHECK_STAGE_OWNERSHIP=1
+assert_export "$captured_env" SPACE_SEED_UBUNTU_RELEASE resolute
 
 run_success no-vendor-defaults
 assert_export "$captured_env" SPACE_SEED_RUNTIME firecracker

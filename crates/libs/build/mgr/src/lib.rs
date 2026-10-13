@@ -15,8 +15,9 @@ mod vm;
 use std::fmt;
 use std::fs;
 use std::future::Future;
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
+use std::io::Write as _;
+use std::os::fd::AsRawFd as _;
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::str::FromStr;
@@ -80,7 +81,6 @@ const TEMPLATE_ARTIFACT_HEADROOM_MB: u32 = 512;
 const DEFAULT_BUILD_VM_ROOTFS_SIZE_MB: u32 = 20 * 1024;
 const SCRATCH_SOURCE_TYPE_UBUNTU_MINIMAL_CLOUD_SQUASHFS: &str = "ubuntu-minimal-cloud-squashfs";
 const SCRATCH_GUEST_ARTIFACT_SUBDIR: &str = "data/spaced";
-const SCRATCH_SCRIPT_STAGE_SUBDIR: &str = "builds/scratch-scripts";
 const SCRATCH_OUTPUT_ARTIFACTS: &[&str] = &["rootfs.ext4", "metadata.json"];
 const BUNDLED_BUILD_SEED_SCRIPT: &str = include_str!("../scripts/build-seed.sh");
 const BUNDLED_ROOTFS_BUILDER_SCRIPT: &str =
@@ -94,8 +94,8 @@ pub struct TemplateBuilder {
 
 struct ScratchScriptBundle {
     _tempdir: TempDir,
-    helper_path: PathBuf,
-    rootfs_builder_path: PathBuf,
+    helper: tempfile::NamedTempFile,
+    rootfs_builder: tempfile::NamedTempFile,
 }
 
 pub struct BuildOutcome {
@@ -1237,9 +1237,7 @@ impl TemplateBuilder {
         job_id: &JobId,
         recipe: &Recipe,
     ) -> Result<BuildOutcome, BuildError> {
-        let scripts = write_scratch_scripts()?;
-        let helper_path = scripts.helper_path.clone();
-        let rootfs_builder_path = scripts.rootfs_builder_path.clone();
+        let scripts = write_scratch_scripts(Path::new("/run"))?;
         let staging_dir_name = build_staging_dir_name(job_id);
         let final_output_dir = format!("{TEMPLATE_DIR}/{template_id}/{staging_dir_name}");
         // Bound for its Drop: reaps the staging dir when this function
@@ -1267,7 +1265,8 @@ impl TemplateBuilder {
             source.release, source.version, SCRATCH_SOURCE_TYPE_UBUNTU_MINIMAL_CLOUD_SQUASHFS
         );
 
-        let mut cmd = tokio::process::Command::new(&helper_path);
+        let mut cmd = tokio::process::Command::new("/bin/bash");
+        cmd.arg(scratch_script_path(&scripts.helper));
         cmd.arg("--id").arg(template_id);
         cmd.env("SPACE_SEED_OUTPUT_DIR", &final_output_dir);
         cmd.env("SPACE_SEED_CACHE_DIR", &cache_dir);
@@ -1280,7 +1279,10 @@ impl TemplateBuilder {
         cmd.env("SPACE_SEED_UBUNTU_DATE", &source.date);
         cmd.env("SPACE_SEED_SPACED_VERSION", &spaced_version);
         cmd.env("SPACE_SEED_GUEST_BIN_DIR", &guest_bin_dir);
-        cmd.env("SPACE_SEED_ROOTFS_BUILDER_SCRIPT", &rootfs_builder_path);
+        cmd.env(
+            "SPACE_SEED_ROOTFS_BUILDER_SCRIPT",
+            scratch_script_path(&scripts.rootfs_builder),
+        );
         configure_scratch_guest_kernel(&mut cmd, guest_kernel.as_ref());
         if let Some(cargo_toml) = workspace_cargo_toml {
             cmd.env("SPACE_SEED_CARGO_TOML", cargo_toml);
@@ -1519,54 +1521,46 @@ fn validate_scratch_recipe(recipe: &Recipe) -> Result<(), BuildError> {
     Ok(())
 }
 
-fn write_scratch_scripts() -> Result<ScratchScriptBundle, BuildError> {
-    let scratch_script_root =
-        Path::new(pplx_space_common_core::host::linux::paths::FIRECRACKER_CACHE_DIR)
-            .join(SCRATCH_SCRIPT_STAGE_SUBDIR);
-    fs::create_dir_all(&scratch_script_root).map_err(|source| BuildError::Io {
-        operation: "create scratch script staging dir",
-        source,
-    })?;
+fn write_scratch_scripts(stage_root: &Path) -> Result<ScratchScriptBundle, BuildError> {
     let tempdir = tempfile::Builder::new()
         .prefix("space-builder-scratch-")
-        .tempdir_in(&scratch_script_root)
+        .permissions(fs::Permissions::from_mode(0o700))
+        .tempdir_in(stage_root)
         .map_err(|source| BuildError::Io {
             operation: "create scratch script bundle dir",
             source,
         })?;
-    let helper_path = tempdir.path().join("build-seed.sh");
-    let rootfs_builder_path = tempdir.path().join("rootfs-builder.sh");
-
-    write_executable_script(&helper_path, BUNDLED_BUILD_SEED_SCRIPT)?;
-    write_executable_script(&rootfs_builder_path, BUNDLED_ROOTFS_BUILDER_SCRIPT)?;
+    let helper = write_scratch_script(tempdir.path(), BUNDLED_BUILD_SEED_SCRIPT)?;
+    let rootfs_builder = write_scratch_script(tempdir.path(), BUNDLED_ROOTFS_BUILDER_SCRIPT)?;
 
     Ok(ScratchScriptBundle {
         _tempdir: tempdir,
-        helper_path,
-        rootfs_builder_path,
+        helper,
+        rootfs_builder,
     })
 }
 
-fn write_executable_script(path: &Path, contents: &str) -> Result<(), BuildError> {
-    fs::write(path, contents).map_err(|source| BuildError::Io {
-        operation: "write bundled scratch script",
-        source,
-    })?;
-    #[cfg(unix)]
-    {
-        let mut perms = fs::metadata(path)
-            .map_err(|source| BuildError::Io {
-                operation: "stat bundled scratch script",
-                source,
-            })?
-            .permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(path, perms).map_err(|source| BuildError::Io {
-            operation: "chmod bundled scratch script",
+fn write_scratch_script(
+    directory: &Path,
+    contents: &str,
+) -> Result<tempfile::NamedTempFile, BuildError> {
+    let mut script =
+        tempfile::NamedTempFile::new_in(directory).map_err(|source| BuildError::Io {
+            operation: "create bundled scratch script",
             source,
         })?;
-    }
-    Ok(())
+    script
+        .write_all(contents.as_bytes())
+        .map_err(|source| BuildError::Io {
+            operation: "write bundled scratch script",
+            source,
+        })?;
+    Ok(script)
+}
+
+fn scratch_script_path(script: &tempfile::NamedTempFile) -> PathBuf {
+    // The parent owns the descriptor until bash exits; CLOEXEC need not be cleared.
+    format!("/proc/{}/fd/{}", std::process::id(), script.as_raw_fd()).into()
 }
 
 fn scratch_guest_bin_dir() -> Result<PathBuf, BuildError> {
@@ -2319,6 +2313,9 @@ mod build_staging_tests;
 
 #[cfg(test)]
 mod scratch_output_tests;
+
+#[cfg(all(test, target_os = "linux"))]
+mod scratch_script_tests;
 
 #[cfg(test)]
 mod scratch_guest_kernel_tests;

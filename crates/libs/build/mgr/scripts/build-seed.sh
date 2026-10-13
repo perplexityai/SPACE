@@ -29,6 +29,12 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="${SPACE_SEED_REPO_ROOT:-$(cd "${SCRIPT_DIR}/../../../.." 2>/dev/null && pwd || true)}"
 ROOTFS_BUILDER_SCRIPT="${SPACE_SEED_ROOTFS_BUILDER_SCRIPT:-${REPO_ROOT}/templates/firecracker/seed/rootfs-builder.sh}"
 
+# Stage with the same identity that asks containerd to mount the inputs.
+if [[ $EUID -ne 0 ]]; then
+  exec sudo -E env "HOME=${HOME:-}" "SPACE_SEED_REPO_ROOT=$REPO_ROOT" \
+    /bin/bash "$0" "$@"
+fi
+
 ID="seed"
 PROFILE="release"
 FORCE=""
@@ -118,20 +124,26 @@ GUEST_BINS=(spaced-svc spaced)
 # digest keeps the name unique per ID and bounded (19 + 16 + 1 + <=7 digits).
 CONTAINER_ID_DIGEST="$(printf '%s' "$ID" | sha256sum | cut -c1-16)"
 CONTAINER_NAME="space-seed-builder-${CONTAINER_ID_DIGEST}-$$"
-STAGE_ROOT="${SPACE_SEED_STAGE_ROOT:-$(dirname "${CACHEDIR}")/scratch-bundles}"
 BUNDLE_DIR=""
 INPUT_DIR=""
 GUEST_BIN_STAGE_DIR=""
 ROOTFS_BUILDER_STAGE_PATH=""
 
-mkdir -p "$OUTDIR" "$CACHEDIR" "$STAGE_ROOT"
+# containerd needs host-visible paths, so use the shared root-owned runtime
+# directory. mktemp creates a 0700 bundle even with a permissive caller umask.
+install -d -m 0750 -o 0 -g 0 /space/run/build-manager
+BUNDLE_DIR="$(mktemp -d /space/run/build-manager/space-seed-build.XXXXXX)"
+cleanup_container() {
+  ctr tasks rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
+  ctr containers rm "$CONTAINER_NAME" >/dev/null 2>&1 || true
+  rm -rf "$BUNDLE_DIR"
+}
+trap cleanup_container EXIT
 
-BUNDLE_DIR="$(mktemp -d "${STAGE_ROOT}/space-seed-build.XXXXXX")"
 INPUT_DIR="${BUNDLE_DIR}/inputs"
 GUEST_BIN_STAGE_DIR="${BUNDLE_DIR}/guest-bin"
 ROOTFS_BUILDER_STAGE_PATH="${BUNDLE_DIR}/rootfs-builder.sh"
-
-mkdir -p "$INPUT_DIR" "$GUEST_BIN_STAGE_DIR"
+mkdir -p "$OUTDIR" "$CACHEDIR" "$INPUT_DIR" "$GUEST_BIN_STAGE_DIR"
 
 if [[ ! -f "$ROOTFS_BUILDER_SCRIPT" ]]; then
   echo "ERROR: rootfs builder script not found at ${ROOTFS_BUILDER_SCRIPT}" >&2
@@ -146,21 +158,7 @@ if [[ -f "${OUTDIR}/rootfs.ext4" && -z "$FORCE" ]]; then
   exit 1
 fi
 
-CTR=()
-if [[ $EUID -eq 0 ]]; then
-  CTR=(ctr)
-else
-  CTR=(sudo -E ctr)
-fi
-
-cleanup_container() {
-  "${CTR[@]}" tasks rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
-  "${CTR[@]}" containers rm "$CONTAINER_NAME" >/dev/null 2>&1 || true
-  rm -rf "$BUNDLE_DIR"
-}
-trap cleanup_container EXIT
-
-if ! "${CTR[@]}" version >/dev/null 2>&1; then
+if ! ctr version >/dev/null 2>&1; then
   echo "ERROR: ctr cannot talk to containerd. Is containerd running locally?" >&2
   exit 1
 fi
@@ -343,7 +341,7 @@ fi
 echo "Guest binaries (${PROFILE}): ${GUEST_BINS[*]}"
 
 echo "=== Pulling builder image via containerd ==="
-"${CTR[@]}" images pull --platform "${CONTAINER_PLATFORM}" "${IMAGE_REF}"
+ctr images pull --platform "${CONTAINER_PLATFORM}" "${IMAGE_REF}"
 
 MOUNTS=(
   "--mount" "type=bind,src=${OUTDIR},dst=/output,options=rbind:rw"
@@ -359,7 +357,7 @@ if [[ -n "$FORCE" ]]; then
 fi
 
 echo "=== Building seed template '${ID}' with ctr ==="
-"${CTR[@]}" run \
+ctr run \
   --rm \
   --privileged \
   --net-host \

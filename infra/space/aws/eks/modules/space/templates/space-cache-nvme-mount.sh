@@ -85,6 +85,7 @@ mount_space_cache_nvme_if_available() {
   chmod -R 2775 /space/cache
   chown root:root /space/cache/firecracker/jails
   chmod 0755 /space/cache/firecracker/jails
+  chmod +t /space/cache /space/cache/firecracker /space/cache/firecracker/builds
   df -Th /space/cache
 }
 
