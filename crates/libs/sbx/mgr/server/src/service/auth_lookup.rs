@@ -2,7 +2,6 @@ use super::activation_support::{
     GuestActivityKind, IdentityFreeDirectActivationAuthority, configure_process_env_for_activation,
     spawn_resume_clock_sync, wait_ready_guest_uptime_ms, wait_ready_via_spaced_host,
 };
-use super::cleanup_support::require_state_write;
 use super::create_support::*;
 use super::network_policy::EffectiveNetworkPolicy;
 use super::network_runtime::{network_policy_refresh_error_to_status, refresh_network_policy};
@@ -26,6 +25,7 @@ use pplx_space_metrics::sandbox::worker::SpaceApiRouteTokenAuthorizationResult;
 use pplx_space_net_common::{EffectiveNetworkPolicyRef, NetworkPolicy};
 use tonic::metadata::MetadataMap;
 
+mod resume_begin;
 #[cfg(test)]
 mod tests;
 
@@ -790,30 +790,8 @@ impl SandboxManagerService {
         // policy is unchanged.
         self.apply_network_policy_before_wake(sandbox_id, "resume")
             .await?;
-
-        {
-            let db = self.db_conn()?;
-            if let Some((policy, generation)) = activation_policy {
-                if !crate::db::begin_resident_resume_with_policy(
-                    &db,
-                    &sandbox.id,
-                    generation,
-                    policy,
-                )
-                .map_err(|error| {
-                    Status::internal(format!("resume policy admission failed: {error}"))
-                })? {
-                    return Err(Status::failed_precondition(
-                        "resident execution changed before resume",
-                    ));
-                }
-            } else {
-                require_state_write(
-                    crate::db::update_state(&db, &sandbox.id, SandboxState::Resuming),
-                    "begin resident resume",
-                )?;
-            }
-        }
+        self.begin_resident_resume(&sandbox.id, activation_policy)
+            .await?;
         self.watchdog.record_lifecycle_edge(&sandbox.id).await;
 
         let mut node_client = connect_node(&self.node_manager)

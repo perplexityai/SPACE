@@ -240,8 +240,8 @@ edge_table! {
     /// and the suspend auto-pause; `update_state_best_effort(Started)` after a
     /// node connect failure and in `pause_with_reconciliation`.
     PAUSE_ROLLBACK: Compensation, of(&[Pausing]) => Started;
-    /// `begin_resident_resume_with_policy`, and `resume_after_wake_lock`'s
-    /// `update_state(Resuming)` without an activation policy.
+    /// `begin_resident_resume_with_policy`, and `begin_resident_resume`'s
+    /// `update_state_from` without an activation policy.
     RESUME_BEGIN: Request, of(&[Paused]) => Resuming;
     /// `restore_resident_resume_state(Started)` through
     /// `rollback_activation_state`.
@@ -429,9 +429,6 @@ edge_table! {
     PAUSE_ROLLBACK_AFTER_STOP: KnownRace, of(&[Stopped]) => Started;
     /// Pause completion (`update_state(Paused)`) after a concurrent Stop.
     PAUSE_COMPLETE_AFTER_STOP: KnownRace, of(&[Stopped]) => Paused;
-    /// `resume_after_wake_lock`'s policy-free `update_state(Resuming)` after
-    /// a Stop completed during the pre-wake policy refresh.
-    RESUME_BEGIN_AFTER_STOP: KnownRace, of(&[Stopped]) => Resuming;
     /// The full process-snapshot rollback's `update_state(Suspended)` after a
     /// Stop admitted while it restaged the snapshot. Its own stop leaves no
     /// runtime, so the second Stop is reached only in the window between

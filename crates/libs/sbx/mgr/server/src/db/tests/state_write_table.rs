@@ -68,7 +68,6 @@ const ALLOWLIST: &[(SandboxState, SandboxState, Disagreement, &str)] = &[
     (Stopped,         Started,         WriteForbidden,      "known race: pause rollback after Stop"),
     (Stopped,         Stopping,        RequestForbidden,    STOP_SETTLED_SOURCE),
     (Stopped,         Paused,          WriteForbidden,      "known races: pause and template-snapshot completion after Stop"),
-    (Stopped,         Resuming,        WriteForbidden,      "known race: policy-free resume after Stop"),
     (Stopped,         Suspended,       RequestForbidden,    "warm start and process-snapshot rollback restage a stopped row"),
     (Stopped,         Quarantined,     AllowedUnwritten,    NO_QUARANTINE_WRITER),
     (Deleting,        CleanupRequired, WriteForbidden,      "an interrupted delete is handed to cleanup"),
