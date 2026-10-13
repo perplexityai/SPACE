@@ -1233,6 +1233,29 @@ pub fn is_storable_traceparent(value: &str) -> bool {
     )
 }
 
+/// The valid traceparents among `traceparents`, sampled ones first, each group
+/// in the order given.
+///
+/// [`trace_propagation::link_root_to_origins`] links only the first
+/// [`MAX_ORIGIN_LINKS`], and a root is kept only when an origin it links to
+/// was sampled. Putting sampled origins first means that a root with any
+/// sampled origin always links one, however many unsampled origins precede it,
+/// so a kept request keeps the work it caused.
+pub fn sampled_origins_first<'a>(traceparents: impl IntoIterator<Item = &'a str>) -> Vec<&'a str> {
+    let (mut sampled, unsampled): (Vec<_>, Vec<_>) = traceparents
+        .into_iter()
+        .filter(|traceparent| is_storable_traceparent(traceparent))
+        .partition(|traceparent| {
+            traceparent
+                .rsplit('-')
+                .next()
+                .and_then(|flags| u8::from_str_radix(flags, 16).ok())
+                .is_some_and(|flags| flags & 0x01 == 0x01)
+        });
+    sampled.extend(unsampled);
+    sampled
+}
+
 /// The most origins [`trace_propagation::link_root_to_origins`] links to one
 /// span. A pass that serves more records how many it left out instead.
 pub const MAX_ORIGIN_LINKS: usize = 8;
@@ -1410,11 +1433,11 @@ pub mod trace_propagation {
     /// (and `links.dropped`, when more origins than [`MAX_ORIGIN_LINKS`] can
     /// arrive); recording a field the span does not declare does nothing.
     ///
-    /// Origins are linked in the order given, most relevant first, up
-    /// to [`MAX_ORIGIN_LINKS`]. A value that is not a valid W3C traceparent is
-    /// skipped. `origin_trace_id` names the first linked origin, so a search
-    /// can find the root by the origin's trace id; a link carries no
-    /// attribute of its own. `origin_sampled` is true when any linked origin
+    /// Origins are linked sampled first, then in the order given (see
+    /// [`super::sampled_origins_first`]), up to [`MAX_ORIGIN_LINKS`]. A value
+    /// that is not a valid W3C traceparent is skipped. `origin_trace_id` names
+    /// the first linked origin, so a search can find the root by the origin's
+    /// trace id; a link carries no attribute of its own. `origin_sampled` is true when any linked origin
     /// was sampled: SPACE's samplers keep such a root and drop a root whose
     /// origins were all unsampled. Returns how many origins were linked.
     pub fn link_root_to_origins<'a>(
@@ -1424,7 +1447,7 @@ pub mod trace_propagation {
         let mut linked = 0_usize;
         let mut dropped = 0_usize;
         let mut sampled = false;
-        for traceparent in traceparents {
+        for traceparent in super::sampled_origins_first(traceparents) {
             let Some(context) = span_context_from_traceparent(traceparent) else {
                 continue;
             };

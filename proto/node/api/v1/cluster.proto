@@ -780,6 +780,12 @@ message ClaimNodeReconcileRefsRequest {
 message ClaimNodeReconcileRefsResponse {
   repeated FacetRef refs = 1;
   string claim_token = 2;
+  // The distinct W3C traceparents saved with the claimed refs: the trace
+  // context of the writers that queued them, in the order the claim picked the
+  // refs (longest queued first, then facet, then element). The pass that
+  // applies the refs links to at most eight, sampled ones first, then in this
+  // order. Refs queued without trace context add none.
+  repeated string origin_traceparents = 3;
 }
 
 message FailedNodeReconcileRef {

@@ -203,6 +203,41 @@ pub(super) struct QueuedFacetRefRow {
     pub(super) element: Option<String>,
 }
 
+/// The distinct valid traceparents saved with claimed refs, in the order the
+/// claim picked the refs: longest queued first, by `requested_at`, then facet
+/// and element. A traceparent shared by several refs takes its first ref's
+/// place.
+pub(super) fn claimed_origin_traceparents(rows: &[ClaimedFacetRefRow]) -> Vec<String> {
+    let mut picked = rows.iter().collect::<Vec<_>>();
+    picked.sort_by(|left, right| {
+        (left.requested_at, &left.facet, &left.element).cmp(&(
+            right.requested_at,
+            &right.facet,
+            &right.element,
+        ))
+    });
+    let mut seen = std::collections::HashSet::new();
+    picked
+        .into_iter()
+        .filter_map(|row| row.traceparent.as_deref())
+        .filter(|traceparent| {
+            pplx_space_common_svc::observability::is_storable_traceparent(traceparent)
+        })
+        .filter(|traceparent| seen.insert(*traceparent))
+        .map(str::to_string)
+        .collect()
+}
+
+/// A claimed ref, its saved trace context, and when it was first queued:
+/// the claim's own ordering key.
+#[derive(Debug, Clone, FromRow)]
+pub(super) struct ClaimedFacetRefRow {
+    pub(super) facet: String,
+    pub(super) element: Option<String>,
+    pub(super) traceparent: Option<String>,
+    pub(super) requested_at: time::OffsetDateTime,
+}
+
 pub(super) fn proto_facet(value: ReconcileFacet) -> ProtoReconcileFacet {
     match value {
         ReconcileFacet::NetworkPolicy => ProtoReconcileFacet::NetworkPolicy,

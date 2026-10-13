@@ -1301,9 +1301,9 @@ impl ClusterApi for ClusterApiService {
         };
 
         let claim_token = format!("{}-{}", origin.id, Uuid::now_v7());
-        let rows = sqlx::query_as::<_, QueuedFacetRefRow>(sql!(
+        let rows = sqlx::query_as::<_, ClaimedFacetRefRow>(sql!(
             "WITH picked AS (
-                 SELECT node_id, facet, element
+                 SELECT node_id, facet, element, requested_at
                  FROM node_reconcile_queue
                  WHERE node_id = $1
                    AND next_attempt_at <= NOW()
@@ -1325,7 +1325,10 @@ impl ClusterApi for ClusterApiService {
              WHERE q.node_id = picked.node_id
                AND q.facet = picked.facet
                AND q.element = picked.element
-             RETURNING q.facet, NULLIF(q.element, '') AS element"
+             RETURNING q.facet,
+                       NULLIF(q.element, '') AS element,
+                       q.traceparent,
+                       picked.requested_at"
         ))
         .bind(origin.id)
         .bind(limit)
@@ -1335,14 +1338,21 @@ impl ClusterApi for ClusterApiService {
         .await
         .map_err(|err| Status::internal(format!("claim node reconcile refs: {err}")))?;
 
+        let origin_traceparents = claimed_origin_traceparents(&rows);
         let refs = rows
             .into_iter()
-            .map(queued_facet_ref_to_proto)
+            .map(|row| {
+                queued_facet_ref_to_proto(QueuedFacetRefRow {
+                    facet: row.facet,
+                    element: row.element,
+                })
+            })
             .collect::<Result<Vec<_>, _>>()?;
 
         Ok(Response::new(ClaimNodeReconcileRefsResponse {
             refs,
             claim_token,
+            origin_traceparents,
         }))
     }
 

@@ -6,7 +6,7 @@ mod postgres_tests {
 
     use pplx_space_common_core::types::SnapshotId;
     use pplx_space_db_test_fixtures::{
-        insert_pool_slot_receipt, pg_test_db, pool_slot_receipt_state,
+        insert_pool_slot_receipt, insert_ready_worker_node, pg_test_db, pool_slot_receipt_state,
     };
 
     use super::*;
@@ -149,6 +149,66 @@ mod postgres_tests {
             "snapshot_id should be NULL after orphan"
         );
         assert!(orphan.1.is_some(), "orphaned_at should be stamped");
+        Ok(())
+    }
+
+    async fn saved_traceparent(
+        pool: &PgPool,
+        node_id: NodeId,
+        element: &str,
+    ) -> Result<Option<String>, sqlx::Error> {
+        sqlx::query_scalar(sql!(
+            "SELECT traceparent FROM node_reconcile_queue
+             WHERE node_id = $1 AND facet = 'network-policy' AND element = $2"
+        ))
+        .bind(node_id)
+        .bind(element)
+        .fetch_one(pool)
+        .await
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn queued_ref_keeps_the_latest_writer_traceparent() -> TestResult {
+        let db = pg_test_db().await?;
+        let node_id = NodeId::new();
+        insert_ready_worker_node(&db.pool, node_id).await?;
+        let element = format!("sandbox:{}", SandboxId::new());
+        let first = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
+        let second = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-00";
+        let node_ids = [node_id];
+        let facets = ["network-policy".to_string()];
+        let queue = |traceparent: Option<&'static str>| {
+            upsert_node_reconcile_refs(
+                &db.pool,
+                &node_ids,
+                &facets,
+                std::slice::from_ref(&element),
+                traceparent,
+            )
+        };
+
+        queue(Some(first)).await?;
+        assert_eq!(
+            saved_traceparent(&db.pool, node_id, &element)
+                .await?
+                .as_deref(),
+            Some(first)
+        );
+        // A writer without trace context coalesces without erasing it.
+        queue(None).await?;
+        assert_eq!(
+            saved_traceparent(&db.pool, node_id, &element)
+                .await?
+                .as_deref(),
+            Some(first)
+        );
+        queue(Some(second)).await?;
+        assert_eq!(
+            saved_traceparent(&db.pool, node_id, &element)
+                .await?
+                .as_deref(),
+            Some(second)
+        );
         Ok(())
     }
 

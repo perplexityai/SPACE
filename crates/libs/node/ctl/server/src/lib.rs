@@ -294,6 +294,92 @@ pub(crate) enum WorkItem {
 struct ClusterReconcileClaim {
     claim_token: String,
     refs: Vec<dirty_state::FacetRef>,
+    /// The saved trace context of the writers that queued the refs, in the
+    /// order the claim picked the refs.
+    origins: Vec<String>,
+    /// The canonical ids of the sandboxes the refs name.
+    sandbox_ids: BTreeSet<String>,
+}
+
+/// The most sandbox ids a pass root lists.
+const PASS_SANDBOX_IDS_MAX: usize = 16;
+
+/// A count as a span attribute. tracing-opentelemetry records an unsigned
+/// value as its debug string, so counts are recorded signed to stay numeric.
+fn span_count(count: usize) -> i64 {
+    i64::try_from(count).unwrap_or(i64::MAX)
+}
+
+/// The root span of a node-ctl pass over one claim of cluster reconcile refs.
+///
+/// A claim whose refs saved the trace context of the writers that queued
+/// them, a request's context included, runs under a root that links to those
+/// writers, is sampled as they were, and parents the claim's facet
+/// `node_ctl.reconcile` spans and its completion RPC. A claim of refs that no
+/// traced writer queued is background work and runs under no root unless it
+/// fails: whether it fails is known only once it has run, so its failure is
+/// reported by a childless root that records the outcome. An idle trigger or
+/// timer tick claims nothing and emits nothing.
+struct ClusterPass;
+
+impl ClusterPass {
+    fn span(
+        node_id: &str,
+        cause: &'static str,
+        refs: usize,
+        sandbox_ids: &BTreeSet<String>,
+    ) -> tracing::Span {
+        let span = tracing::info_span!(
+            parent: None,
+            "node_ctl.pass",
+            cause,
+            node_id = %node_id,
+            refs = span_count(refs),
+            failed = tracing::field::Empty,
+            sandbox_id = tracing::field::Empty,
+            sandbox_ids = tracing::field::Empty,
+            sandbox_ids.dropped = tracing::field::Empty,
+            origin_trace_id = tracing::field::Empty,
+            origin_sampled = tracing::field::Empty,
+            links.dropped = tracing::field::Empty,
+            otel.status_code = tracing::field::Empty,
+            otel.status_description = tracing::field::Empty,
+        );
+        // One sandbox is the common case, and `sandbox_id` is the field every
+        // sandbox's telemetry query uses; the capped list serves a pass over
+        // several.
+        if sandbox_ids.len() == 1
+            && let Some(sandbox_id) = sandbox_ids.first()
+        {
+            span.record("sandbox_id", sandbox_id.as_str());
+        }
+        if !sandbox_ids.is_empty() {
+            let listed = sandbox_ids
+                .iter()
+                .take(PASS_SANDBOX_IDS_MAX)
+                .map(String::as_str)
+                .collect::<Vec<_>>();
+            span.record("sandbox_ids", listed.join(",").as_str());
+        }
+        if sandbox_ids.len() > PASS_SANDBOX_IDS_MAX {
+            span.record(
+                "sandbox_ids.dropped",
+                span_count(sandbox_ids.len() - PASS_SANDBOX_IDS_MAX),
+            );
+        }
+        span
+    }
+
+    fn record_outcome(span: &tracing::Span, refs: usize, failed: usize) {
+        span.record("failed", span_count(failed));
+        if failed > 0 {
+            span.record("otel.status_code", "ERROR");
+            span.record(
+                "otel.status_description",
+                format!("{failed} of {refs} claimed reconcile refs did not complete").as_str(),
+            );
+        }
+    }
 }
 
 struct SchedulingSnapshot {
@@ -935,11 +1021,10 @@ impl NodeCtlWorker {
                         shutdown_token.child_token(),
                     )
                     .await;
+                    // The timer is the backstop for refs no trigger delivered.
                     if let Some(claim) = self.claim_cluster_reconcile_refs().await {
-                        let report = self
-                            .run_inbound_reconcile(claim.refs.clone(), shutdown_token.child_token())
+                        self.apply_cluster_claim("timer", claim, shutdown_token.child_token())
                             .await;
-                        self.complete_cluster_reconcile_refs(claim, report).await;
                     }
                     self.run_outbound_sync(
                         facets::periodic_outbound_refs(),
@@ -983,10 +1068,8 @@ impl NodeCtlWorker {
             let Some(claim) = self.claim_cluster_reconcile_refs().await else {
                 break;
             };
-            let report = self
-                .run_inbound_reconcile(claim.refs.clone(), shutdown_token.child_token())
+            self.apply_cluster_claim("trigger", claim, shutdown_token.child_token())
                 .await;
-            self.complete_cluster_reconcile_refs(claim, report).await;
             if batch_index + 1 == CLUSTER_RECONCILE_DRAIN_MAX_BATCHES {
                 force_follow_up = true;
             }
@@ -1636,6 +1719,11 @@ impl NodeCtlWorker {
         {
             Ok(response) => {
                 let response = response.into_inner();
+                let sandbox_ids = response
+                    .refs
+                    .iter()
+                    .filter_map(claimed_ref_sandbox_id)
+                    .collect::<BTreeSet<_>>();
                 let refs = response
                     .refs
                     .into_iter()
@@ -1655,6 +1743,8 @@ impl NodeCtlWorker {
                     Some(ClusterReconcileClaim {
                         claim_token: response.claim_token,
                         refs,
+                        origins: response.origin_traceparents,
+                        sandbox_ids,
                     })
                 }
             }
@@ -1665,22 +1755,77 @@ impl NodeCtlWorker {
         }
     }
 
+    /// Apply one claim of cluster refs and complete it, under the pass root
+    /// [`ClusterPass`] describes.
+    async fn apply_cluster_claim(
+        &self,
+        cause: &'static str,
+        mut claim: ClusterReconcileClaim,
+        shutdown_token: CancellationToken,
+    ) {
+        let refs = claim.refs.len();
+        let sandbox_ids = std::mem::take(&mut claim.sandbox_ids);
+        let origins = std::mem::take(&mut claim.origins);
+        let span = (!origins.is_empty()).then(|| {
+            let span = ClusterPass::span(&self.node_id, cause, refs, &sandbox_ids);
+            pplx_space_common_svc::observability::trace_propagation::link_root_to_origins(
+                &span,
+                origins.iter().map(String::as_str),
+            );
+            span
+        });
+        match span {
+            Some(span) => {
+                let failed = self
+                    .run_and_complete_cluster_claim(claim, shutdown_token)
+                    .instrument(span.clone())
+                    .await;
+                ClusterPass::record_outcome(&span, refs, failed);
+            }
+            None => {
+                let failed = self
+                    .run_and_complete_cluster_claim(claim, shutdown_token)
+                    .await;
+                if failed > 0 {
+                    let span = ClusterPass::span(&self.node_id, cause, refs, &sandbox_ids);
+                    ClusterPass::record_outcome(&span, refs, failed);
+                }
+            }
+        }
+    }
+
+    async fn run_and_complete_cluster_claim(
+        &self,
+        claim: ClusterReconcileClaim,
+        shutdown_token: CancellationToken,
+    ) -> usize {
+        let report = self
+            .run_inbound_reconcile(claim.refs.clone(), shutdown_token)
+            .await;
+        self.complete_cluster_reconcile_refs(claim, report).await
+    }
+
+    /// Report each claimed ref's outcome. Returns how many refs did not
+    /// complete: those that failed, or every ref when the completion could
+    /// not be sent and the claim is left to expire.
     async fn complete_cluster_reconcile_refs(
         &self,
         claim: ClusterReconcileClaim,
         report: BTreeMap<facets::FacetKind, Result<InboundFacetResult, String>>,
-    ) {
+    ) -> usize {
         if claim.claim_token.is_empty() || claim.refs.is_empty() {
-            return;
+            return 0;
         }
 
+        let refs = claim.refs.len();
         let (succeeded, failed) = partition_completed_refs(claim.refs, &report);
+        let failed_refs = refs.saturating_sub(succeeded.len());
 
         let mut client = match connect_cluster_api().await {
             Ok(client) => client,
             Err(error) => {
                 tracing::warn!(%error, "failed to connect to cluster API for queued reconcile completion");
-                return;
+                return refs;
             }
         };
         if let Err(error) = client
@@ -1694,7 +1839,9 @@ impl NodeCtlWorker {
             .await
         {
             tracing::warn!(%error, "failed to complete queued reconcile refs");
+            return refs;
         }
+        failed_refs
     }
 
     fn mark_reconcile_finished_for(
@@ -1815,6 +1962,23 @@ fn group_refs(refs: Vec<dirty_state::FacetRef>) -> BTreeMap<facets::FacetKind, f
 
 fn proto_facet_ref(reference: &dirty_state::FacetRef) -> Result<ProtoFacetRef, String> {
     reference.to_proto()
+}
+
+/// The canonical id of the sandbox a claimed ref names, if it names one.
+fn claimed_ref_sandbox_id(reference: &ProtoFacetRef) -> Option<String> {
+    use pplx_space_node_api_client::proto::{facet_ref, network_policy_target_ref};
+    let sandbox_id = match reference.element.as_ref()? {
+        facet_ref::Element::SandboxId(sandbox_id) => sandbox_id,
+        facet_ref::Element::NetworkPolicyTarget(target) => match target.target.as_ref()? {
+            network_policy_target_ref::Target::SandboxId(sandbox_id) => sandbox_id,
+            network_policy_target_ref::Target::Template(_) => return None,
+        },
+        facet_ref::Element::Template(_) => return None,
+    };
+    sandbox_id
+        .parse::<pplx_space_common_core::types::SandboxId>()
+        .ok()
+        .map(|sandbox_id| sandbox_id.to_string())
 }
 
 fn partition_completed_refs(
