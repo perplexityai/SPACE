@@ -628,13 +628,25 @@ impl SandboxManagerService {
             cursor = next_cursor;
             for due in selected {
                 let service = self.clone();
-                tasks.spawn(due.sandbox_id, async move {
-                    if let Err(error) = service.run_due_auto_lifecycle(&due.storage_id).await {
-                        service
-                            .handle_auto_lifecycle_error(&due.storage_id, due.sandbox_id, &error)
-                            .await;
+                // Each due transition is a root of its own: the scheduler, not
+                // a request, caused it, so it links to nothing.
+                let span =
+                    super::drain::detached_trace_span("AutoLifecycle", &due.sandbox_id.to_string());
+                tasks.spawn(
+                    due.sandbox_id,
+                    async move {
+                        if let Err(error) = service.run_due_auto_lifecycle(&due.storage_id).await {
+                            service
+                                .handle_auto_lifecycle_error(
+                                    &due.storage_id,
+                                    due.sandbox_id,
+                                    &error,
+                                )
+                                .await;
+                        }
                     }
-                });
+                    .instrument(span),
+                );
             }
         }
         tracing::info!(

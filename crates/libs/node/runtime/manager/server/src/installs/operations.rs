@@ -408,9 +408,13 @@ impl Installer {
 
     async fn enqueue(&self, request: InstallOperation) -> Result<Operation, SubmitOperationError> {
         let submitting = self.clone();
-        let job_id = tokio::task::spawn_blocking(move || submitting.submit(&request))
-            .await?
-            .map_err(SubmitOperationError::Submit)?;
+        // The blocking thread has no current span; carry the caller's, so the
+        // job saves the request's trace context.
+        let span = tracing::Span::current();
+        let job_id =
+            tokio::task::spawn_blocking(move || span.in_scope(|| submitting.submit(&request)))
+                .await?
+                .map_err(SubmitOperationError::Submit)?;
         Ok(self.lookup(job_id).await?)
     }
 

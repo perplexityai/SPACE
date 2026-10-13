@@ -84,7 +84,7 @@ use pplx_space_volmgr_client::{
 use tokio::sync::Notify;
 use tonic::Status;
 use tonic::transport::Channel;
-use tracing::{debug, info, warn};
+use tracing::{Instrument as _, debug, info, warn};
 
 /// Concrete client type returned by `pplx_space_volmgr_client::connect`.
 /// The vol-mgr client now wraps the gRPC `Channel` in `GrpcClientTrace`
@@ -484,20 +484,25 @@ impl VolumePuller {
                 let storage_uris = storage_uris.clone();
                 let base_tags = base_tags.clone();
                 let background_worker = self.background_worker.clone();
-                tokio::spawn(async move {
-                    let mut path_taken = PullPath::FreshPull;
-                    let outcome = pull_resolved_owner(
-                        db,
-                        &name,
-                        &resolved_hash,
-                        &storage_uris,
-                        &base_tags,
-                        &mut path_taken,
-                        background_worker.as_ref(),
-                    )
-                    .await;
-                    guard.finish(PullTaskResult::new(&outcome, path_taken));
-                });
+                // The caller that starts the pull waits for it below, so the
+                // pull runs under that caller's span.
+                tokio::spawn(
+                    async move {
+                        let mut path_taken = PullPath::FreshPull;
+                        let outcome = pull_resolved_owner(
+                            db,
+                            &name,
+                            &resolved_hash,
+                            &storage_uris,
+                            &base_tags,
+                            &mut path_taken,
+                            background_worker.as_ref(),
+                        )
+                        .await;
+                        guard.finish(PullTaskResult::new(&outcome, path_taken));
+                    }
+                    .in_current_span(),
+                );
             } else {
                 info!(
                     template = %name,

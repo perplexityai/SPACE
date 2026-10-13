@@ -8,6 +8,7 @@ use std::{sync::Arc, time::Duration};
 use tokio::sync::Semaphore;
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use tonic::Status;
+use tracing::Instrument as _;
 
 struct Activator {
     backend: Arc<dyn AccessBackend>,
@@ -60,15 +61,19 @@ impl ActivationOwners {
             .map_err(|_| Status::resource_exhausted("ingress activation capacity exhausted"))?;
         // Dropping this JoinHandle only detaches the waiter. The task retains
         // the permit and runs the existing substrate owner through publication.
+        // The waiter normally awaits it, so it runs under the waiter's span.
         self.tasks
-            .spawn(async move {
-                let _permit = permit;
-                let result = backend.access(id).await;
-                if let Err(error) = &result {
-                    tracing::warn!(sandbox_id = %id, %error, "ingress access activation failed");
+            .spawn(
+                async move {
+                    let _permit = permit;
+                    let result = backend.access(id).await;
+                    if let Err(error) = &result {
+                        tracing::warn!(sandbox_id = %id, %error, "ingress access activation failed");
+                    }
+                    result
                 }
-                result
-            })
+                .in_current_span(),
+            )
             .await
             .map_err(|error| Status::internal(format!("ingress activation task failed: {error}")))?
     }

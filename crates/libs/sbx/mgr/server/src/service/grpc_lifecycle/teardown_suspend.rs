@@ -516,31 +516,39 @@ impl SandboxManagerService {
         };
         let service = self.clone();
         let shutdown_token = self.shutdown_token.clone();
-        self.task_tracker.spawn(async move {
-            let _driver_slot = driver_slot;
-            tokio::select! {
-                _ = shutdown_token.cancelled() => {
-                    tracing::info!(
-                        %sandbox_id,
-                        "stopped generation suspend driver during service shutdown"
-                    );
-                }
-                result = service.drive_teardown_suspend(
-                    sandbox_id,
-                    execution_generation,
-                    event_trigger,
-                ) => {
-                    if let Err(error) = result {
-                        tracing::warn!(
+        // The driver outlives the RPC that admits it, so it is a root linked
+        // to that RPC, and the backup job it waits for runs under it.
+        let span =
+            super::super::drain::detached_trace_span("TeardownSuspend", &sandbox_id.to_string());
+        self.task_tracker.spawn(
+            async move {
+                let _driver_slot = driver_slot;
+                tokio::select! {
+                    _ = shutdown_token.cancelled() => {
+                        tracing::info!(
                             %sandbox_id,
-                            code = %error.code(),
-                            error = %error.message(),
-                            "generation suspend did not become durable"
+                            "stopped generation suspend driver during service shutdown"
                         );
+                    }
+                    result = service.drive_teardown_suspend(
+                        sandbox_id,
+                        execution_generation,
+                        event_trigger,
+                    ) => {
+                        if let Err(error) = result {
+                            tracing::warn!(
+                                %sandbox_id,
+                                code = %error.code(),
+                                error = %error.message(),
+                                "generation suspend did not become durable"
+                            );
+                            super::super::drain::record_detached_failure(error.message());
+                        }
                     }
                 }
             }
-        });
+            .instrument(span),
+        );
         TeardownSuspendDriverAdmission::Started
     }
 
