@@ -369,6 +369,52 @@ reaches:
   with a span link to the context that started it.
 - A job its submitter waits for runs as a child of the waiting span, through
   `BackgroundWorker::submit_and_wait`. Any other job is a linked root.
+- A public operation saves the `traceparent` of the request that created
+  it, and each claimed attempt runs in the cluster controller as a fresh
+  `public_operation.execute` root, a consumer span with one link to that
+  request. It is not a child of the request: operations that share one
+  caller's trace run concurrently in the dispatcher, where the native Datadog
+  tracer would split that trace, and an operation retried for as long as its
+  admission keeps it waiting would grow the request's trace without bound. A
+  request's operations are found by `origin_trace_id` (the request's trace
+  id), `operation_id` or `sandbox_id`, or through the link; they are not
+  inside the request's trace. The executor's work and its node calls are
+  children of the attempt.
+- Reconciliation is fan-in: one pass applies refs that many writers queued.
+  Each ref saves its latest writer's `traceparent`, and a pass is a root that
+  links to the saved contexts of the refs it claimed.
+
+A root that links to the context that caused it records that context's trace
+id as `origin_trace_id`, since a link is not searchable, and whether it was
+sampled as `origin_sampled`. Its sampling follows that origin: it is kept when
+any origin it links to was sampled and dropped when none was, so a kept
+request keeps the work it caused. A root with no origin, and every span with a
+parent, keeps the configured sampler. Under OTLP the sampler that
+`OTEL_TRACES_SAMPLER` selects is wrapped to read the root's links. The native
+Datadog sampler cannot be wrapped and does not read links, so two sampling
+rules on `origin_sampled`, ahead of the ones `DD_TRACE_SAMPLING_RULES`
+configures, keep (`1.0`) or drop (`0.0`) such a root. A root links to at
+most eight origins, sampled ones first, so one with any sampled origin always
+links it and is kept. Datadog's rate limit (`DD_TRACE_RATE_LIMIT`) still
+applies to a kept root, and sampling rules sent
+by Remote Configuration replace the whole list, these two included.
+
+A node-ctl `node_ctl.pass` root covers one claim of cluster reconcile refs,
+from a trigger or the 60-second timer (`cause`). It exists only for a claim
+whose refs saved trace context, which it links to sampled first, then in the
+order the claim picked the refs (longest queued first), at most eight,
+counting the rest in `links.dropped`; it parents the claim's facet
+`node_ctl.reconcile` spans and completion RPC, and records `refs` and
+`failed`. A claim of refs that no traced writer queued is background work and
+gets no root, unless it fails: whether it fails is known only once it has run,
+so a childless `node_ctl.pass` reports the failure afterward. A tick that
+claims nothing emits nothing.
+
+Every asynchronous root records the `sandbox_id` of the sandbox it works on:
+an operation's target, a job's subject, a detached task's sandbox. A pass
+records `sandbox_id` when its refs name one sandbox, and `sandbox_ids`, a
+comma-separated list of at most sixteen, whenever they name any, with the
+rest counted in `sandbox_ids.dropped`.
 
 One case remains that SPACE cannot fix. datadog-opentelemetry 0.5.2 counts no
 span whose parent is remote when the process already has that trace open
@@ -561,7 +607,11 @@ non-blank of `x-request-id` and `x-correlation-id`, accepted only as at most
 returns that id in `x-request-id`, or, when the caller sent none or one that
 was dropped, a fresh `req_<uuid>` it records instead. gRPC server spans apply
 the same rule to their `request_id`. A JSON log line written inside the
-request inherits it, as it does `sandbox_id`.
+request inherits it, as it does `sandbox_id` and a public operation's
+`operation_id`. To follow a request into the work it caused, use its trace
+ID: the response's `traceparent` names it, log lines carry it as `trace_id`,
+and linked roots, an operation's attempts included, record it as
+`origin_trace_id`.
 
 Each HTTP response also carries a W3C `traceparent` header naming its
 `http.server` span, so a client can report the trace ID of any request it
