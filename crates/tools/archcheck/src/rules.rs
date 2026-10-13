@@ -9,9 +9,18 @@ use crate::{baseline::Baseline, context::Context, finding::Finding};
 pub trait Rule {
     fn check(&self, ctx: &Context) -> Vec<Finding>;
 
-    /// Fills this rule's table for `--write-baseline`. Rules without a
-    /// baseline keep the default.
-    fn update_baseline(&self, _ctx: &Context, _baseline: &mut Baseline) {}
+    /// Behaviours this context cannot check, each as one line such as
+    /// `file_size.no_new_entries skipped (…)`.
+    fn skipped(&self, _ctx: &Context) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// Fills this rule's table for `--write-baseline` from the entries in
+    /// `ctx.baseline`, and returns one line per violation it did not add.
+    /// Rules without a baseline keep the default.
+    fn update_baseline(&self, _ctx: &Context, _baseline: &mut Baseline) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 /// Every rule, in reporting order. Register a new rule here.

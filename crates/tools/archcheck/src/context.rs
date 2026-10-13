@@ -67,6 +67,9 @@ pub struct ProductionFile {
 pub struct Context {
     pub config: ArchitectureConfig,
     pub baseline: Baseline,
+    /// The base branch's baseline, from `--base-baseline`. Behaviours that
+    /// compare against it are skipped without it.
+    pub base_baseline: Option<Baseline>,
     /// Every production Rust file of the root `Cargo.toml`'s workspace
     /// members, sorted by path.
     pub files: Vec<ProductionFile>,
@@ -85,6 +88,7 @@ impl Context {
         Ok(Self {
             config,
             baseline,
+            base_baseline: None,
             files,
         })
     }

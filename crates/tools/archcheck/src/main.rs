@@ -13,23 +13,28 @@ use std::{
 };
 
 use pplx_space_archcheck::{
-    BASELINE_FILE, Context, LoadError, WriteBaselineError, check,
+    BASELINE_FILE, Baseline, Context, LoadError, WriteBaselineError, check,
     context::find_workspace_root,
     report::{Format, UnknownFormatError, render, summary},
-    write_baseline,
+    skipped, write_baseline,
 };
 use thiserror::Error;
 
 const USAGE: &str = "\
 usage: archcheck [--root <path>] [--format human|rdjson]
+                 [--base-baseline <path>]
        archcheck [--root <path>] --write-baseline
 
   --root <path>       repository root (default: the Cargo workspace containing
                       the current directory)
   --format <format>   human (default), or rdjson for reviewdog, with the
-                      summary line on stderr
-  --write-baseline    regenerate architecture-baseline.toml from the current
-                      tree";
+                      summary on stderr
+  --base-baseline <path>
+                      the base branch's architecture-baseline.toml, which
+                      file_size.no_new_entries compares against (skipped
+                      without it)
+  --write-baseline    update or remove the entries of architecture-baseline.toml
+                      to match the current tree; never adds one";
 
 const EXIT_REQUIRED_FINDINGS: u8 = 1;
 const EXIT_ERROR: u8 = 2;
@@ -64,6 +69,7 @@ enum RunError {
 struct Options {
     root: Option<PathBuf>,
     format: Format,
+    base_baseline: Option<PathBuf>,
     write_baseline: bool,
 }
 
@@ -92,26 +98,41 @@ fn run(options: Options) -> Result<ExitCode, RunError> {
     };
 
     if options.write_baseline {
-        let baseline = write_baseline(&root)?;
+        let written = write_baseline(&root)?;
+        let not_added: String = written
+            .not_added
+            .iter()
+            .map(|line| format!("{line}\n"))
+            .collect();
         write(
             io::stdout(),
             format_args!(
-                "archcheck: wrote {} file_size entries to {}\n",
-                baseline.file_size.len(),
+                "{not_added}archcheck: wrote {} file_size entries to {}\n",
+                written.baseline.file_size.len(),
                 root.join(BASELINE_FILE).display()
             ),
         )?;
         return Ok(ExitCode::SUCCESS);
     }
 
-    let ctx = Context::load(&root)?;
+    let mut ctx = Context::load(&root)?;
+    if let Some(path) = &options.base_baseline {
+        ctx.base_baseline = Some(Baseline::load(path)?);
+    }
     let findings = check(&ctx);
     let report = render(options.format, &findings, ctx.files.len());
-    write(io::stdout(), format_args!("{report}"))?;
+    // One line per skipped behaviour, after the summary line.
+    let skipped: String = skipped(&ctx)
+        .iter()
+        .map(|line| format!("archcheck: {line}\n"))
+        .collect();
     if options.format == Format::Rdjson {
         // stdout holds only the document.
+        write(io::stdout(), format_args!("{report}"))?;
         let summary = summary(&findings, ctx.files.len());
-        write(io::stderr(), format_args!("{summary}\n"))?;
+        write(io::stderr(), format_args!("{summary}\n{skipped}"))?;
+    } else {
+        write(io::stdout(), format_args!("{report}{skipped}"))?;
     }
     if findings.iter().any(|finding| finding.mode.is_required()) {
         Ok(ExitCode::from(EXIT_REQUIRED_FINDINGS))
@@ -139,6 +160,7 @@ fn parse_args(args: impl Iterator<Item = OsString>) -> Result<Option<Options>, U
     let mut options = Options {
         root: None,
         format: Format::Human,
+        base_baseline: None,
         write_baseline: false,
     };
     let mut args = args.map(|arg| arg.into_string().map_err(UsageError::NonUtf8Argument));
@@ -158,6 +180,7 @@ fn parse_args(args: impl Iterator<Item = OsString>) -> Result<Option<Options>, U
             "-h" | "--help" => return Ok(None),
             "--root" => options.root = Some(PathBuf::from(value()?)),
             "--format" => options.format = value()?.parse()?,
+            "--base-baseline" => options.base_baseline = Some(PathBuf::from(value()?)),
             "--write-baseline" if inline_value.is_none() => options.write_baseline = true,
             "--write-baseline" => return Err(UsageError::UnexpectedValue(flag.clone())),
             other => return Err(UsageError::UnexpectedArgument(other.to_owned())),

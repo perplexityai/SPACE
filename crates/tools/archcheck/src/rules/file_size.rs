@@ -1,10 +1,12 @@
 //! A code-line limit on production Rust files.
 //!
 //! `no_crossing` keeps files outside the baseline under the limit;
-//! `listed_no_growth` keeps every baseline entry from growing past its cap;
-//! `stale_entries` asks for an entry to be lowered or removed once its file
-//! shrinks, falls under the limit, or is gone. The last two are separate so
-//! that requiring no growth does not also fail the change that shrinks a file.
+//! `no_new_entries` reports entries a pull request adds to the baseline, so
+//! the baseline is not a way around `no_crossing`; `listed_no_growth` keeps
+//! every baseline entry from growing past its cap; `stale_entries` asks for
+//! an entry to be lowered or removed once its file shrinks, falls under the
+//! limit, or is gone. The last two are separate so that requiring no growth
+//! does not also fail the change that shrinks a file.
 
 use crate::{
     baseline::{BASELINE_FILE, Baseline},
@@ -18,6 +20,7 @@ pub struct FileSize;
 
 const RULE: &str = "file_size";
 const NO_CROSSING: &str = "no_crossing";
+const NO_NEW_ENTRIES: &str = "no_new_entries";
 const LISTED_NO_GROWTH: &str = "listed_no_growth";
 const STALE_ENTRIES: &str = "stale_entries";
 
@@ -45,6 +48,28 @@ impl Rule for FileSize {
             }
         }
 
+        if let Some(base) = &ctx.base_baseline {
+            let mode = config.no_new_entries.mode;
+            for path in caps
+                .keys()
+                .filter(|path| !base.file_size.contains_key(*path))
+            {
+                findings.push(Finding {
+                    location: entry_location(ctx, path),
+                    ..finding(
+                        NO_NEW_ENTRIES,
+                        mode,
+                        path,
+                        format!(
+                            " was added to {BASELINE_FILE}; new files must stay under the {}-line \
+                             limit. Split the file instead.",
+                            thousands(limit),
+                        ),
+                    )
+                });
+            }
+        }
+
         let growth_mode = config.listed_no_growth.mode;
         let stale_mode = config.stale_entries.mode;
         let mut stale = Vec::new();
@@ -52,10 +77,7 @@ impl Rule for FileSize {
             match ctx.file(path).map(|file| file.code_lines) {
                 // The file is gone, so the finding points at its entry.
                 None => stale.push(Finding {
-                    location: Location {
-                        path: BASELINE_FILE.to_owned(),
-                        line: ctx.baseline.file_size_lines.get(path).copied().unwrap_or(1),
-                    },
+                    location: entry_location(ctx, path),
                     ..finding(
                         STALE_ENTRIES,
                         stale_mode,
@@ -107,14 +129,43 @@ impl Rule for FileSize {
         findings
     }
 
-    fn update_baseline(&self, ctx: &Context, baseline: &mut Baseline) {
+    fn skipped(&self, ctx: &Context) -> Vec<String> {
+        match ctx.base_baseline {
+            Some(_) => Vec::new(),
+            None => vec![format!(
+                "{RULE}.{NO_NEW_ENTRIES} skipped (no --base-baseline given)"
+            )],
+        }
+    }
+
+    /// Keeps each listed file still over the limit, at its current size. A
+    /// file without an entry is not added: that takes a hand-written entry,
+    /// which `no_new_entries` then reports.
+    fn update_baseline(&self, ctx: &Context, baseline: &mut Baseline) -> Vec<String> {
         let limit = ctx.config.rules.file_size.limit;
-        baseline.file_size = ctx
-            .files
-            .iter()
-            .filter(|file| file.code_lines > limit)
-            .map(|file| (file.path.clone(), file.code_lines))
-            .collect();
+        let mut not_added = Vec::new();
+        for file in ctx.files.iter().filter(|file| file.code_lines > limit) {
+            if ctx.baseline.file_size.contains_key(&file.path) {
+                baseline
+                    .file_size
+                    .insert(file.path.clone(), file.code_lines);
+            } else {
+                not_added.push(format!(
+                    "not added: {} ({} code lines); split it, or add an entry by hand if this is \
+                     a deliberate exception",
+                    file.path, file.code_lines
+                ));
+            }
+        }
+        not_added
+    }
+}
+
+/// An entry's line in the baseline, for findings about the entry itself.
+fn entry_location(ctx: &Context, path: &str) -> Location {
+    Location {
+        path: BASELINE_FILE.to_owned(),
+        line: ctx.baseline.file_size_lines.get(path).copied().unwrap_or(1),
     }
 }
 

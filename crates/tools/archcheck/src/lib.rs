@@ -27,16 +27,35 @@ pub fn check(ctx: &Context) -> Vec<Finding> {
         .collect()
 }
 
-/// Regenerates `architecture-baseline.toml` from the current tree.
-///
-/// The existing baseline is neither read nor required, so this also recovers
-/// from a baseline that no longer parses. Returns the baseline it wrote.
-pub fn write_baseline(root: &Path) -> Result<Baseline, WriteBaselineError> {
-    let ctx = Context::load_with_baseline(root, Baseline::default())?;
+/// One line per behaviour [`check`] skipped for lack of an input.
+pub fn skipped(ctx: &Context) -> Vec<String> {
+    rules::registered()
+        .iter()
+        .flat_map(|rule| rule.skipped(ctx))
+        .collect()
+}
+
+/// What [`write_baseline`] wrote, and the violations it left out.
+#[derive(Debug)]
+pub struct WrittenBaseline {
+    pub baseline: Baseline,
+    /// One line per violation without an entry, such as `not added: …`.
+    pub not_added: Vec<String>,
+}
+
+/// Rewrites `architecture-baseline.toml` from the current tree: entries
+/// still in violation are kept and updated, the rest are removed, and none
+/// are added.
+pub fn write_baseline(root: &Path) -> Result<WrittenBaseline, WriteBaselineError> {
+    let ctx = Context::load(root)?;
     let mut baseline = Baseline::default();
+    let mut not_added = Vec::new();
     for rule in rules::registered() {
-        rule.update_baseline(&ctx, &mut baseline);
+        not_added.extend(rule.update_baseline(&ctx, &mut baseline));
     }
     baseline.write(&root.join(BASELINE_FILE))?;
-    Ok(baseline)
+    Ok(WrittenBaseline {
+        baseline,
+        not_added,
+    })
 }
