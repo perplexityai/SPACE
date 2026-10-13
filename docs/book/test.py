@@ -146,9 +146,9 @@ class GuideTests(unittest.TestCase):
             "using-api.html": ["first-sandbox.html", "installation.html"],
             "running-space.html": [
                 "installation.html",
-                "warm-pools.html",
                 "observability.html",
                 "troubleshooting.html",
+                "warm-pools.html",
             ],
             "development-overview.html": ["architecture.html", "development.html", "contributing.html"],
         }.items():
