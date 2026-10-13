@@ -14,8 +14,8 @@ import re
 from capture import query, save
 
 COUNTER = "space_node_mgr_loop_devices_created_total"
-GAUGE = "space_node_mgr_cleanup_operation_in_flight_ratio"
-TIMING = "space_sandbox_state_convergence_duration_ms_milliseconds"
+GAUGE = "space_node_mgr_cleanup_operation_in_flight"
+TIMING = "space_sandbox_state_convergence_duration_milliseconds"
 STATE = "space_sandbox_guest_vcpu_count"
 CREATED = "space_sandbox_api_created_total"
 

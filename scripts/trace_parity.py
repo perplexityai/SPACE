@@ -123,8 +123,20 @@ def canonical_trees(
             if parent not in by_id:
                 raise ValueError(f"{mode}: missing parent for {key}")
             children.setdefault(parent, []).append(key)
+    # Each request saves a job that runs as its own root, linked to the
+    # request; only the request roots carry the workload case.
+    jobs = [key for key in roots if "parity.case" not in fields(by_id[key])]
+    roots = [key for key in roots if key not in jobs]
     if len(roots) != 2 or len({key[0] for key in roots}) != 2:
         raise ValueError(f"{mode}: expected two distinct complete traces")
+    # Only the Rust workload saves a job.
+    expected_jobs = 2 if service == SERVICE else 0
+    if len(jobs) != expected_jobs or any(
+        by_id[key]["resource_name"] != "parity" for key in jobs
+    ):
+        raise ValueError(f"{mode}: expected one linked job root per request")
+    if {key[0] for key in jobs} & {key[0] for key in roots}:
+        raise ValueError(f"{mode}: a linked job joined its request's trace")
     cases = Counter(fields(by_id[key]).get("parity.case") for key in roots)
     if cases != Counter({"success": 1, "error": 1}):
         raise ValueError(f"{mode}: missing success/error workload")
@@ -168,7 +180,8 @@ def canonical_trees(
         return result
 
     trees = sorted(
-        (visit(key) for key in roots), key=lambda x: json.dumps(x, sort_keys=True)
+        (visit(key) for key in roots + jobs),
+        key=lambda x: json.dumps(x, sort_keys=True),
     )
     if len(visited) != len(spans):
         raise ValueError(f"{mode}: spans disconnected from roots")

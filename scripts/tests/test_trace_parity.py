@@ -15,26 +15,36 @@ def backend_rows(mode, offset=0):
     for trace, case in enumerate(("success", "error"), start=1):
         for index in range(7):
             span_id = offset + trace * 100 + index
+            # The last span is the request's saved job: a root of its own trace.
+            job = index == 6
+            attributes = {
+                "operation_name": "http.server",
+                "error": int(case == "error" and index == 0),
+            }
+            if not job:
+                attributes["parity.case"] = case
             rows.append(
                 {
                     "id": str(span_id),
                     "attributes": {
-                        "trace_id": str(offset + trace),
+                        "trace_id": str(offset + trace + (50 if job else 0)),
                         "span_id": str(span_id),
-                        "parent_id": "0" if index == 0 else str(offset + trace * 100),
+                        "parent_id": "0"
+                        if index == 0 or job
+                        else str(offset + trace * 100),
                         "service": parity.SERVICE,
                         "env": "local-test",
                         "host": "fixture",
-                        "resource_name": "root" if index == 0 else f"child-{index}",
+                        "resource_name": "root"
+                        if index == 0
+                        else "parity"
+                        if job
+                        else f"child-{index}",
                         "type": "web" if index == 0 else "custom",
                         "start_timestamp": "2026-01-01T00:00:00Z",
                         "end_timestamp": "2026-01-01T00:00:00.001Z",
                         "tags": [f"version:{mode}"],
-                        "attributes": {
-                            "operation_name": "http.server",
-                            "parity.case": case,
-                            "error": int(case == "error" and index == 0),
-                        },
+                        "attributes": attributes,
                     },
                 }
             )

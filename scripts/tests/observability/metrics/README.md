@@ -121,8 +121,8 @@ No application names or counter `.count` / `.count_v2` suffixes are introduced.
 | --- | --- | --- |
 | `space.node_mgr.loop_devices.created` | `space_node_mgr_loop_devices_created_total` | dimensionless counter |
 | `space.sandbox.api.created` | `space_sandbox_api_created_total` | dimensionless counter |
-| `space.node_mgr.cleanup_operation.in_flight` | `space_node_mgr_cleanup_operation_in_flight_ratio` | OTLP `1`; absolute count, despite translator's `_ratio` label |
-| `space.sandbox.state_convergence.duration_ms` | `space_sandbox_state_convergence_duration_ms_milliseconds` | milliseconds; **not converted to seconds** |
+| `space.node_mgr.cleanup_operation.in_flight` | `space_node_mgr_cleanup_operation_in_flight` | absolute count; no unit, so no suffix |
+| `space.sandbox.state_convergence.duration_ms` | `space_sandbox_state_convergence_duration_milliseconds` | milliseconds; **not converted to seconds** |
 | `space.sandbox.guest.vcpu_count` | `space_sandbox_guest_vcpu_count` | dimensionless sample distribution, **not a gauge** |
 
 Resource promotion is an allowlist: `service.name`, `service.instance.id`,
@@ -146,10 +146,10 @@ The optional test-only Grafana contract dashboard includes these checks; the cap
 space_node_mgr_loop_devices_created_total{kind="kernel_device"}
 rate(space_node_mgr_loop_devices_created_total{kind="kernel_device"}[1m])
 resets(space_node_mgr_loop_devices_created_total[15m])
-space_node_mgr_cleanup_operation_in_flight_ratio
-histogram_count(space_sandbox_state_convergence_duration_ms_milliseconds)
-histogram_sum(space_sandbox_state_convergence_duration_ms_milliseconds)
-histogram_quantile(0.95, space_sandbox_state_convergence_duration_ms_milliseconds)
+space_node_mgr_cleanup_operation_in_flight
+histogram_count(space_sandbox_state_convergence_duration_milliseconds)
+histogram_sum(space_sandbox_state_convergence_duration_milliseconds)
+histogram_quantile(0.95, space_sandbox_state_convergence_duration_milliseconds)
 histogram_count(space_sandbox_guest_vcpu_count)
 histogram_sum(space_sandbox_guest_vcpu_count)
 histogram_quantile(0.95, space_sandbox_guest_vcpu_count)

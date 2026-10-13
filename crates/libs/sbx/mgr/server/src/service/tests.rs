@@ -8373,6 +8373,16 @@ pub(crate) mod service_tests {
         let sandbox_id = typed_sandbox_id.to_string();
         insert_test_sandbox(&conn, &sandbox_id, SandboxState::Stopping);
         let service = SandboxManagerService::for_test(conn);
+        // Park the retry attempt at node dispatch so its start is a signal and
+        // the row it would rewrite stays as the failure persisted it.
+        let (started, mut starts) = tokio::sync::mpsc::channel(1);
+        *service.cleanup_executor.dispatch.lock().unwrap() = Some(Arc::new(move |id, _| {
+            let started = started.clone();
+            Box::pin(async move {
+                started.send(id).await.unwrap();
+                std::future::pending().await
+            })
+        }));
         let capture = SandboxEventCapture::default();
         let subscriber = tracing_subscriber::registry().with(capture.clone());
         let guard = tracing::subscriber::set_default(subscriber);
@@ -8386,13 +8396,12 @@ pub(crate) mod service_tests {
         );
         drop(guard);
 
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while !service.cleanup_executor.active.contains_key(&sandbox_id) {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("blocking cleanup failure must start a live retry runner");
+        let dispatched = tokio::time::timeout(Duration::from_secs(30), starts.recv())
+            .await
+            .expect("blocking cleanup failure must start a live retry runner")
+            .unwrap();
+        assert_eq!(dispatched, sandbox_id);
+        assert!(service.cleanup_executor.active.contains_key(&sandbox_id));
 
         let conn = service.db.lock().unwrap();
         let row = crate::db::get_sandbox(&conn, &sandbox_id).unwrap().unwrap();

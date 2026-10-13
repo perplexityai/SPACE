@@ -147,7 +147,7 @@ resizing. Do not horizontally scale without stream affinity and a state design.
 Prometheus explicitly enables its OTLP receiver. Translation remains
 `UnderscoreEscapingWithSuffixes`: dots become underscores and Prometheus adds
 unit/type suffixes (for example `space_node_mgr_loop_devices_created_total` and
-`space_sandbox_state_convergence_duration_ms_milliseconds`). Application names
+`space_sandbox_state_convergence_duration_milliseconds`). Application names
 do not change. Preserve exponential histograms as native
 histograms; do not flatten them. The exact resource promotion, identity,
 10 s export cadence, gauge staleness and histogram/query limitations are in

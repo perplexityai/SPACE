@@ -29,8 +29,10 @@ The operator check reuses `trace_fixture.build_fixture`, builds with
 `cargo test --locked -p pplx-space-observability --features datadog-otel --lib
 --no-run --message-format=json`, and runs the existing fixture with OTLP and
 `always_on` **only in that isolated process**. It searches Tempo by a unique
-synthetic version, fetches both full records and verifies exact span count,
-parent edges, names/kinds, statuses, typed attributes and resource identity.
+synthetic version, fetches all four records (two requests and the job each
+saved, which runs as its own root linked to its request's root) and verifies
+exact span count, parent edges, links, names/kinds, statuses, typed attributes
+and resource identity.
 All assertions use Tempo's HTTP API; neither the chart nor this check needs Grafana.
 The fixture synthesizes DB events; it does not call an actual database.
 No new exporter or production bypass is introduced. Raw JSON, build output,

@@ -127,7 +127,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "space_node_mgr_cleanup_operation_in_flight_ratio{service_version=~\"$version\"}",
+          "expr": "space_node_mgr_cleanup_operation_in_flight{service_version=~\"$version\"}",
           "datasource": {
             "type": "prometheus",
             "uid": "space-prometheus"
@@ -163,7 +163,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "histogram_count(space_sandbox_state_convergence_duration_ms_milliseconds{service_version=~\"$version\"})",
+          "expr": "histogram_count(space_sandbox_state_convergence_duration_milliseconds{service_version=~\"$version\"})",
           "datasource": {
             "type": "prometheus",
             "uid": "space-prometheus"
@@ -208,7 +208,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "histogram_avg(space_sandbox_state_convergence_duration_ms_milliseconds{service_version=~\"$version\"})",
+          "expr": "histogram_avg(space_sandbox_state_convergence_duration_milliseconds{service_version=~\"$version\"})",
           "datasource": {
             "type": "prometheus",
             "uid": "space-prometheus"
@@ -217,7 +217,7 @@
         },
         {
           "refId": "B",
-          "expr": "histogram_quantile(0.5, space_sandbox_state_convergence_duration_ms_milliseconds{service_version=~\"$version\"})",
+          "expr": "histogram_quantile(0.5, space_sandbox_state_convergence_duration_milliseconds{service_version=~\"$version\"})",
           "datasource": {
             "type": "prometheus",
             "uid": "space-prometheus"
@@ -226,7 +226,7 @@
         },
         {
           "refId": "C",
-          "expr": "histogram_quantile(0.95, space_sandbox_state_convergence_duration_ms_milliseconds{service_version=~\"$version\"})",
+          "expr": "histogram_quantile(0.95, space_sandbox_state_convergence_duration_milliseconds{service_version=~\"$version\"})",
           "datasource": {
             "type": "prometheus",
             "uid": "space-prometheus"
@@ -307,7 +307,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "histogram_sum(space_sandbox_state_convergence_duration_ms_milliseconds{service_version=~\"$version\"})",
+          "expr": "histogram_sum(space_sandbox_state_convergence_duration_milliseconds{service_version=~\"$version\"})",
           "datasource": {
             "type": "prometheus",
             "uid": "space-prometheus"

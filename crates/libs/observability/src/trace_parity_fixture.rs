@@ -244,6 +244,8 @@ fn workload(failed: bool) {
         );
         drop(redis);
     }
+    // Saved work runs as a fresh root linked to the request that saved it, as
+    // the jobs worker does.
     let job = tracing::info_span!(
         parent: None,
         "job.execute",
@@ -254,7 +256,7 @@ fn workload(failed: bool) {
         job.kind = "parity",
         otel.status_code = "OK",
     );
-    crate::trace_propagation::set_span_parent_from_traceparent(&job, &saved_parent);
+    crate::trace_propagation::link_span_from_traceparent(&job, &saved_parent);
     drop(job);
     drop(root);
 }

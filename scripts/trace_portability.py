@@ -115,15 +115,26 @@ def validate(rows, version, expected):
             raise ValueError("duplicate span")
         by_id[key] = span
     roots = []
+    linked = []
     for key, span in by_id.items():
         parent = span.get("parentSpanId")
         if parent and any(base64.b64decode(parent)):
             if (key[0], parent) not in by_id:
                 raise ValueError(f"{version}: broken parent chain for {span['name']}")
+        elif span.get("links"):
+            linked.append(span)
         else:
             roots.append(span)
     if len(roots) != 2 or len({span["traceId"] for span in roots}) != 2:
         raise ValueError(f"{version}: expected two complete traces")
+    # Saved work starts its own trace with a link to the request that saved it.
+    request_roots = {(span["traceId"], span["spanId"]) for span in roots}
+    for span in linked:
+        targets = {(link["traceId"], link["spanId"]) for link in span["links"]}
+        if len(span["links"]) != 1 or not targets <= request_roots:
+            raise ValueError(f"{version}: {span['name']} is not linked to a request root")
+        if span["traceId"] in {key[0] for key in request_roots}:
+            raise ValueError(f"{version}: linked {span['name']} joined its request's trace")
     if sorted(
         attributes(s.get("attributes", [])).get("parity.case") for s in roots
     ) != ["error", "success"]:
