@@ -636,6 +636,40 @@ fn job_to_proto(job: pplx_space_common_jobs::Job) -> Result<TransferJob, Status>
         "cancelled" => TransferJobStatus::Cancelled,
         _ => TransferJobStatus::Unspecified,
     };
+    let logical_artifact_digests = if status == TransferJobStatus::Completed {
+        #[derive(serde::Deserialize)]
+        struct Completion {
+            #[serde(default)]
+            logical_artifact_digests: Vec<crate::executor::logical_digest::LogicalArtifactDigest>,
+        }
+        let proofs = match serde_json::from_str::<Completion>(&job.payload) {
+            Ok(completion) => completion.logical_artifact_digests,
+            Err(error) => {
+                // Optional proof schemas can outlive the binary that wrote
+                // them after rollback. Keep durable completion observable;
+                // consumers requiring proofs must still refuse missing evidence.
+                tracing::warn!(job_id = %job.job_id, error = %error,
+                    "transfer completed but logical proofs could not be decoded");
+                Vec::new()
+            }
+        };
+        proofs
+            .into_iter()
+            .map(
+                |proof| pplx_space_volmgr_client::proto::LogicalArtifactDigest {
+                    artifact: pplx_space_volmgr_client::snapshot_artifact_to_proto(proof.artifact)
+                        as i32,
+                    digest: proof.digest.to_string(),
+                    size_bytes: proof.size_bytes,
+                    metadata_binding_digest: proof
+                        .metadata_binding_digest
+                        .map(|digest| digest.to_string()),
+                },
+            )
+            .collect()
+    } else {
+        Vec::new()
+    };
     Ok(TransferJob {
         job_id: job.job_id.to_string(),
         status: transfer_job_status_code(status),
@@ -649,6 +683,7 @@ fn job_to_proto(job: pplx_space_common_jobs::Job) -> Result<TransferJob, Status>
         started_at: job.started_at,
         completed_at: job.completed_at,
         transfer_scope_id,
+        logical_artifact_digests,
     })
 }
 

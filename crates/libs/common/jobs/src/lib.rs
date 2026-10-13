@@ -366,6 +366,15 @@ impl JobError {
     }
 }
 
+/// A successful execution and an optional service-owned payload containing its
+/// completion evidence. The worker publishes both in the same fenced SQLite
+/// transition; partial or superseded executions never publish their evidence.
+#[derive(Debug)]
+pub struct JobCompletion {
+    pub bytes_processed: i64,
+    pub payload: Option<String>,
+}
+
 /// Defines the execution logic for a job kind.
 ///
 /// Implementations must be `Clone` + `Send` + `Sync` + `'static` so they
@@ -378,6 +387,21 @@ pub trait JobExecutor: Clone + Send + Sync + 'static {
         job: &Job,
         cancellation: tokio_util::sync::CancellationToken,
     ) -> Result<i64, JobError>;
+
+    /// Executors that produce durable evidence may return an updated payload.
+    /// Existing executors preserve their intent payload unchanged.
+    async fn execute_with_completion(
+        &self,
+        job: &Job,
+        cancellation: tokio_util::sync::CancellationToken,
+    ) -> Result<JobCompletion, JobError> {
+        self.execute(job, cancellation)
+            .await
+            .map(|bytes_processed| JobCompletion {
+                bytes_processed,
+                payload: None,
+            })
+    }
 
     /// Remove executor-owned partial state after cancellation. This runs only
     /// after the execute future has stopped, so cleanup cannot race a writer.

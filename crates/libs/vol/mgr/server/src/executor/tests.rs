@@ -1123,8 +1123,11 @@ async fn push_rejects_truncated_durable_object() {
             &payload,
             &test_creds(),
             test_target(),
-            None,
-            CancellationToken::new(),
+            PushReadContext {
+                resolved_dek: None,
+                cancellation: CancellationToken::new(),
+                digest: None,
+            },
         )
         .await;
 
@@ -1161,8 +1164,11 @@ async fn push_accepts_fully_durable_object() {
             &payload,
             &test_creds(),
             test_target(),
-            None,
-            CancellationToken::new(),
+            PushReadContext {
+                resolved_dek: None,
+                cancellation: CancellationToken::new(),
+                digest: None,
+            },
         )
         .await
         .expect("a fully durable object must finalize successfully");
@@ -4484,7 +4490,19 @@ async fn stage_encrypted_temp_returns_partial_enc_path_on_aad_derivation_error()
     // `compress = false` so the test exercises the AAD-derivation
     // failure before any zstd init; the early-Err path is the same
     // regardless of the compress branch.
-    let result = stage_encrypted_temp(&job, &p, &enc, &post_compress, false, None, None).await;
+    let result = stage_encrypted_temp(
+        &job,
+        &p,
+        &enc,
+        &post_compress,
+        false,
+        None,
+        TransformInput {
+            codec_permit: None,
+            digest: None,
+        },
+    )
+    .await;
     let (partial_enc_path, err) =
         result.expect_err("template subject must fail derive_artifact_aads");
     assert_eq!(
@@ -4895,4 +4913,84 @@ fn benchmark_production_shaped_sparse_accounting_with_metrics() {
         accounting_cpu_us / 1_000,
         outstanding_metric_calls.load(Ordering::Relaxed),
     );
+}
+
+#[tokio::test]
+async fn logical_upload_proof_survives_raw_compressed_and_encrypted_transforms() {
+    use pplx_space_common_core::types::Digest as ContentDigest;
+    use sha2::{Digest as _, Sha256};
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("memory");
+    let bytes = b"the exact retained guest memory";
+    tokio::fs::write(&source, bytes).await.unwrap();
+    let expected = ContentDigest::sha256(Sha256::digest(bytes).into());
+    let payload = push_payload(&source);
+    let store = Arc::new(MockObjectStore::new(
+        [Some(ObjectMeta {
+            size: bytes.len() as u64,
+            etag: None,
+        })],
+        Vec::new(),
+    ));
+    let mut job = test_job("push");
+    job.payload = payload.to_json();
+    let completion = test_executor(store)
+        .execute_with_completion(&job, CancellationToken::new())
+        .await
+        .unwrap();
+    let body: serde_json::Value =
+        serde_json::from_str(completion.payload.as_deref().unwrap()).unwrap();
+    let proofs: Vec<LogicalArtifactDigest> =
+        serde_json::from_value(body["logical_artifact_digests"].clone()).unwrap();
+    assert_eq!(proofs.len(), 1);
+    assert_eq!(proofs[0].digest, expected);
+    assert_eq!(proofs[0].size_bytes, bytes.len() as u64);
+    let sink = DigestSink::default();
+    let (compressed, _) = compress_to_temp(
+        &source,
+        TransformInput {
+            codec_permit: None,
+            digest: Some(sink.clone()),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        zstd::decode_all(std::fs::File::open(compressed).unwrap()).unwrap(),
+        bytes
+    );
+    assert_eq!(sink.completed().unwrap().0, expected);
+    let mut payload = payload;
+    payload.artifact_id = Some("019e9000-0000-7000-8000-000000000001".into());
+    payload.entry_role = Some("memfile".into());
+    let encryption = TransferEncryption {
+        organization_id: "019e31d9-79a6-7132-b90f-007f1c62ddea".parse().unwrap(),
+        provider: KekProvider::InMemory,
+        master_key_identifier: "test/key-1".parse().unwrap(),
+        wrapped_dek: vec![0; 16],
+    };
+    for compress in [false, true] {
+        let sink = DigestSink::default();
+        let encrypted = stage_encrypted_temp(
+            &job,
+            &payload,
+            &encryption,
+            &source,
+            compress,
+            Some(&[7; 32]),
+            TransformInput {
+                codec_permit: None,
+                digest: Some(sink.clone()),
+            },
+        )
+        .await
+        .unwrap();
+        assert_ne!(std::fs::read(encrypted).unwrap(), bytes);
+        assert_eq!(
+            sink.completed().unwrap().0,
+            expected,
+            "logical hash precedes both transforms"
+        );
+        assert_eq!(sink.completed().unwrap().1, bytes.len() as u64);
+    }
 }

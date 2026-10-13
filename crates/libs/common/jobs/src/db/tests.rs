@@ -489,3 +489,66 @@ fn serialized_listing_skips_blocked_subjects() {
     let parallel = list_due_pending_jobs(&conn, 10, SubjectConcurrency::Parallel).unwrap();
     assert_eq!(parallel.len(), 2);
 }
+
+#[test]
+fn completion_evidence_is_atomic_and_fenced() {
+    for leased in [false, true] {
+        let conn = mem_conn();
+        let id = fixture_job_id("content-proof");
+        insert_job(
+            &conn,
+            InsertJob {
+                job_id: &id,
+                kind: "push",
+                payload: "{\"source\":\"owned\"}",
+                subject_id: None,
+                dedup_key: None,
+                max_attempts: 3,
+                traceparent: None,
+                priority: JobPriority::default(),
+            },
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE jobs SET status='running',attempts=2,lease_owner='current' WHERE job_id=?1",
+            [id],
+        )
+        .unwrap();
+        let complete = |owner, attempt, payload| {
+            if leased {
+                complete_leased_job_with_payload(
+                    &conn,
+                    &id,
+                    owner,
+                    Some(attempt),
+                    14,
+                    Some(payload),
+                )
+            } else {
+                complete_job_attempt_with_payload(&conn, &id, attempt, 14, Some(payload))
+            }
+        };
+        assert!(!complete("previous", 1, "wrong-proof").unwrap());
+        assert!(!complete("current", 1, "stale-attempt-proof").unwrap());
+        let unchanged = get_job(&conn, &id).unwrap().unwrap();
+        assert_eq!(unchanged.status, "running");
+        assert_eq!(unchanged.payload, "{\"source\":\"owned\"}");
+        assert!(
+            complete(
+                "current",
+                2,
+                "{\"source\":\"owned\",\"proof\":\"verified\"}"
+            )
+            .unwrap()
+        );
+        let completed = get_job(&conn, &id).unwrap().unwrap();
+        assert_eq!(completed.status, "completed");
+        assert_eq!(completed.bytes_processed, 14);
+        assert!(completed.payload.contains("verified"));
+        assert!(!complete("current", 2, "replacement-proof").unwrap());
+        assert_eq!(
+            get_job(&conn, &id).unwrap().unwrap().payload,
+            completed.payload
+        );
+    }
+}

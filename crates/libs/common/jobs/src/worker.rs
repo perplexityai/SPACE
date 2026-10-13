@@ -1426,9 +1426,11 @@ impl<E: JobExecutor> BackgroundWorker<E> {
                 self.finish_cancelled_job(job).await;
                 return;
             }
-            let result =
-                tokio::time::timeout(self.job_timeout, self.executor.execute(&job, cancellation))
-                    .await;
+            let result = tokio::time::timeout(
+                self.job_timeout,
+                self.executor.execute_with_completion(&job, cancellation),
+            )
+            .await;
             self.cancellation_tokens
                 .lock()
                 .expect("common jobs cancellation mutex poisoned")
@@ -1448,8 +1450,12 @@ impl<E: JobExecutor> BackgroundWorker<E> {
             }
 
             match result {
-                Ok(Ok(bytes)) => {
-                    if self.complete_job(&job, lease_owner.as_deref(), bytes).await {
+                Ok(Ok(completion)) => {
+                    let bytes = completion.bytes_processed;
+                    if self
+                        .complete_job(&job, lease_owner.as_deref(), &completion)
+                        .await
+                    {
                         span.record("otel.status_code", "OK");
                         tracing::info!(
                             job_id = %job.job_id,
@@ -1567,14 +1573,32 @@ impl<E: JobExecutor> BackgroundWorker<E> {
     /// remote work; abandoning this write strands nonleased running rows.
     /// A persistent database outage has no completion deadline. Bounded drain
     /// must report non-quiescence rather than dropping this ownership.
-    async fn complete_job(&self, job: &Job, lease_owner: Option<&str>, bytes: i64) -> bool {
+    async fn complete_job(
+        &self,
+        job: &Job,
+        lease_owner: Option<&str>,
+        completion: &crate::JobCompletion,
+    ) -> bool {
         let mut retry_delay = Duration::from_secs(1);
         loop {
             let result = {
                 let conn = self.lock_db_for_background();
                 match lease_owner {
-                    Some(owner) => db::complete_leased_job(&conn, &job.job_id, owner, bytes),
-                    None => db::complete_job_attempt(&conn, &job.job_id, job.attempts, bytes),
+                    Some(owner) => db::complete_leased_job_with_payload(
+                        &conn,
+                        &job.job_id,
+                        owner,
+                        Some(job.attempts),
+                        completion.bytes_processed,
+                        completion.payload.as_deref(),
+                    ),
+                    None => db::complete_job_attempt_with_payload(
+                        &conn,
+                        &job.job_id,
+                        job.attempts,
+                        completion.bytes_processed,
+                        completion.payload.as_deref(),
+                    ),
                 }
             };
             match result {

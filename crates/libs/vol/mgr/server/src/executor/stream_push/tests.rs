@@ -294,9 +294,15 @@ async fn ordinary_and_luks_retry_from_staging_and_verify_actual_wire_size() {
             .unwrap();
         source.write_all(&bytes[60 * MIB..68 * MIB]).unwrap();
         drop(source);
-        let (temp, logical_size) = compress_to_temp(Path::new(payload.upload_source()), None)
-            .await
-            .unwrap();
+        let (temp, logical_size) = compress_to_temp(
+            Path::new(payload.upload_source()),
+            TransformInput {
+                codec_permit: None,
+                digest: None,
+            },
+        )
+        .await
+        .unwrap();
         assert_eq!(logical_size, bytes.len() as u64);
         let file_encoded = tokio::fs::read(&temp).await.unwrap();
         tokio::fs::remove_file(temp).await.unwrap();
@@ -304,7 +310,14 @@ async fn ordinary_and_luks_retry_from_staging_and_verify_actual_wire_size() {
         let creates_before = server.recorded.lock().unwrap().creates;
         server.short_head.store(true, Ordering::SeqCst);
         server.retry_part.store(true, Ordering::SeqCst);
-        let first = push(&executor(), &server, &payload, CancellationToken::new()).await;
+        let mut proof_executor = executor();
+        let collection = Arc::new(std::sync::Mutex::new(Vec::new()));
+        proof_executor.logical_digests = Some(collection.clone());
+        let first = push(&proof_executor, &server, &payload, CancellationToken::new()).await;
+        assert!(
+            collection.lock().unwrap().is_empty(),
+            "failed object verification cannot publish a content proof"
+        );
         assert!(matches!(first, Err(JobError::Retriable(_))));
         assert!(
             Path::new(payload.upload_source()).exists(),
@@ -320,15 +333,30 @@ async fn ordinary_and_luks_retry_from_staging_and_verify_actual_wire_size() {
         server.short_head.store(false, Ordering::SeqCst);
         let restored = TransferPayload::from_json(&persisted).unwrap();
         assert_eq!(
-            push(&executor(), &server, &restored, CancellationToken::new())
-                .await
-                .unwrap(),
+            push(
+                &proof_executor,
+                &server,
+                &restored,
+                CancellationToken::new()
+            )
+            .await
+            .unwrap(),
             bytes.len() as i64
         );
         assert!(
             !Path::new(payload.upload_source()).exists(),
             "only verified terminal success cleans staging"
         );
+        let proofs = collection.lock().unwrap();
+        assert_eq!(proofs.len(), 1);
+        assert_eq!(proofs[0].artifact, artifact);
+        assert_eq!(proofs[0].size_bytes, bytes.len() as u64);
+        use sha2::Digest as _;
+        assert_eq!(
+            proofs[0].digest,
+            pplx_space_common_core::types::Digest::sha256(sha2::Sha256::digest(&bytes).into())
+        );
+        drop(proofs);
         let state = server.recorded.lock().unwrap();
         assert_eq!(
             state.creates,
@@ -370,6 +398,7 @@ async fn deterministic_stream_failures_are_permanent_and_join_the_producer() {
                 &test_creds(),
                 server.target(),
                 StreamPushAttempt {
+                    digest: None,
                     uploader: executor.store.streaming_upload().unwrap(),
                     config: executor.stream_push.as_ref().unwrap(),
                     options: StreamingUploadOptions::new(5 * MIB, 2, max_bytes as u64).unwrap(),
@@ -538,7 +567,7 @@ async fn producer_error_after_eof_never_completes_an_object() {
     std::fs::write(&path, synthetic_bytes(6 * MIB)).unwrap();
     let executor = executor();
     let source = compression_source(
-        std::fs::File::open(path).unwrap(),
+        DigestReader::new(std::fs::File::open(path).unwrap(), None),
         7 * MIB as u64,
         ProducerAdmission {
             codec: executor
@@ -620,8 +649,11 @@ async fn compatibility_paths_keep_file_uploads_and_small_sources_bypass_codec_qu
                 &payload,
                 &test_creds(),
                 super::super::tests::test_target(),
-                None,
-                CancellationToken::new()
+                PushReadContext {
+                    resolved_dek: None,
+                    cancellation: CancellationToken::new(),
+                    digest: None
+                },
             )
             .await
             .unwrap(),

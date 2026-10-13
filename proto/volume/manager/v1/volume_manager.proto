@@ -411,6 +411,15 @@ enum TransferJobStatus {
     TRANSFER_JOB_STATUS_CANCELLED   = 6;
 }
 
+// Proof over the exact source reads before transport transforms. Published
+// atomically with COMPLETED; absent for old jobs and non-snapshot transfers.
+message LogicalArtifactDigest {
+    SnapshotArtifact artifact = 1;
+    string digest = 2; // sha256:<64 lowercase hex>
+    uint64 size_bytes = 3;
+    optional string metadata_binding_digest = 4;
+}
+
 message TransferJob {
     string            job_id            = 1;
     TransferJobStatus status            = 2;
@@ -425,6 +434,7 @@ message TransferJob {
     optional string   started_at        = 10;
     optional string   completed_at      = 11;
     optional string   transfer_scope_id = 12;
+    repeated LogicalArtifactDigest logical_artifact_digests = 13;
 }
 
 message GetTransferJobRequest {

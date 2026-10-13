@@ -1649,3 +1649,27 @@ fn classify_artifact_retry_rejects_divergent_wrap_on_pull() {
         .is_some()
     );
 }
+
+#[test]
+fn completed_transfer_status_survives_unreadable_optional_proofs() {
+    let known = serde_json::json!({"logical_artifact_digests":[{
+        "artifact":"memory", "digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "size_bytes":7
+    }]});
+    for (payload, proofs) in [
+        (known.to_string(), 1),
+        ("{}".into(), 0),
+        (known.to_string().replace("memory", "future_artifact"), 0),
+        ("{malformed".into(), 0),
+    ] {
+        let mut job = persisted_job("completed", &sample_artifact());
+        job.payload = payload;
+        job.bytes_processed = 7;
+        let response = job_to_proto(job).expect("optional proofs cannot hide durable completion");
+        assert_eq!(
+            response.status,
+            transfer_job_status_code(TransferJobStatus::Completed)
+        );
+        assert_eq!(response.bytes_transferred, 7);
+        assert_eq!(response.logical_artifact_digests.len(), proofs);
+    }
+}
