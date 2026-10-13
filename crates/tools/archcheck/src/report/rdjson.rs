@@ -74,7 +74,7 @@ pub fn render(findings: &[Finding]) -> String {
                     Mode::Required => "ERROR",
                 },
                 code: Code {
-                    value: format!("{}.{}", finding.rule, finding.behaviour),
+                    value: finding.code(),
                 },
             })
             .collect(),

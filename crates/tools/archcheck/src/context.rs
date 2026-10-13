@@ -53,13 +53,19 @@ pub enum LoadError {
     NonUtf8Path { path: PathBuf },
     #[error("no Cargo.toml with a [workspace] table found at or above {start}")]
     NoWorkspaceRoot { start: PathBuf },
+    #[error(
+        "{path}: [pattern_ratchet.{instance}] names no instance in {CONFIG_FILE}; remove that \
+         table, or rename it if the instance was renamed"
+    )]
+    UnknownBaselineInstance { path: PathBuf, instance: String },
 }
 
-/// A production Rust file and its code-line count.
+/// A production Rust file, its text and its code-line count.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProductionFile {
     /// Repository-relative, `/`-separated.
     pub path: String,
+    pub text: String,
     pub code_lines: usize,
 }
 
@@ -82,7 +88,20 @@ impl Context {
     }
 
     pub fn load_with_baseline(root: &Path, baseline: Baseline) -> Result<Self, LoadError> {
-        let config = parse_toml(&root.join(CONFIG_FILE))?;
+        let config: ArchitectureConfig = parse_toml(&root.join(CONFIG_FILE))?;
+        // A table for an instance that no longer exists would never be
+        // checked, so it cannot silently outlive its configuration.
+        let instances = &config.rules.pattern_ratchet;
+        if let Some(instance) = baseline
+            .pattern_ratchet
+            .keys()
+            .find(|instance| !instances.contains_key(instance.as_str()))
+        {
+            return Err(LoadError::UnknownBaselineInstance {
+                path: root.join(BASELINE_FILE),
+                instance: instance.clone(),
+            });
+        }
         let members = load_members(&root.join(ROOT_MANIFEST))?;
         let files = production_files(root, &members)?;
         Ok(Self {
@@ -127,17 +146,27 @@ pub fn is_test_directory(name: &OsStr) -> bool {
     name == "tests"
 }
 
-/// Lines that are non-empty after trimming and do not start with `//`. Line,
-/// doc and inner-doc comments are free; block comments and attributes count.
-/// Lines end at LF or CRLF, where rustc ends a `//` comment and counts line
-/// numbers; a lone CR, U+2028 or U+2029 ends nothing, so a CR-only file is one
-/// line. A leading byte order mark is not part of the first line.
+/// The number of [`code_lines`] in `text`.
 pub fn count_code_lines(text: &str) -> usize {
+    code_lines(text).count()
+}
+
+/// Each code line of `text`, untrimmed and without its line ending, with its
+/// 1-based line number. A code line is non-empty after trimming and does not
+/// start with `//`: line, doc and inner-doc comments are free; block comments
+/// and attributes count. Lines end at LF or CRLF, where rustc ends a `//`
+/// comment and counts line numbers; a lone CR, U+2028 or U+2029 ends nothing,
+/// so a CR-only file is one line. A leading byte order mark is not part of the
+/// first line.
+pub fn code_lines(text: &str) -> impl Iterator<Item = (usize, &str)> {
     let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     text.lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty() && !line.starts_with("//"))
-        .count()
+        .enumerate()
+        .map(|(index, line)| (index + 1, line))
+        .filter(|(_, line)| {
+            let line = line.trim();
+            !line.is_empty() && !line.starts_with("//")
+        })
 }
 
 pub(crate) fn read(path: &Path) -> Result<String, LoadError> {
@@ -229,8 +258,10 @@ fn production_files(root: &Path, members: &[String]) -> Result<Vec<ProductionFil
     let mut files = paths
         .into_iter()
         .map(|path| {
+            let text = read(&path)?;
             Ok(ProductionFile {
-                code_lines: count_code_lines(&read(&path)?),
+                code_lines: count_code_lines(&text),
+                text,
                 path: relative_path(root, &path)?,
             })
         })

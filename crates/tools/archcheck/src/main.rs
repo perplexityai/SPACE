@@ -16,25 +16,29 @@ use pplx_space_archcheck::{
     BASELINE_FILE, Baseline, Context, LoadError, WriteBaselineError, check,
     context::find_workspace_root,
     report::{Format, UnknownFormatError, render, summary},
-    skipped, write_baseline,
+    skipped, write_baseline, write_baseline_table,
 };
 use thiserror::Error;
 
 const USAGE: &str = "\
 usage: archcheck [--root <path>] [--format human|rdjson]
                  [--base-baseline <path>]
-       archcheck [--root <path>] --write-baseline
+       archcheck [--root <path>] --write-baseline[=<table>]
 
   --root <path>       repository root (default: the Cargo workspace containing
                       the current directory)
   --format <format>   human (default), or rdjson for reviewdog, with the
                       summary on stderr
   --base-baseline <path>
-                      the base branch's architecture-baseline.toml, which
-                      file_size.no_new_entries and no_raised_caps compare
+                      the base branch's architecture-baseline.toml, which the
+                      no_new_entries and no_raised_caps behaviours compare
                       with (skipped without it)
-  --write-baseline    update or remove the entries of architecture-baseline.toml
-                      to match the current tree; never adds one";
+  --write-baseline[=<table>]
+                      update or remove the entries of architecture-baseline.toml
+                      to match the current tree, or with =<table> (file_size or
+                      pattern_ratchet.<instance>) only that table's, keeping
+                      the others. It lists each violation without an entry,
+                      with the entries to add by hand, and never adds one";
 
 const EXIT_REQUIRED_FINDINGS: u8 = 1;
 const EXIT_ERROR: u8 = 2;
@@ -46,10 +50,10 @@ enum UsageError {
     NonUtf8Argument(OsString),
     #[error("{0} needs a value")]
     MissingValue(String),
-    #[error("{0} takes no value")]
-    UnexpectedValue(String),
     #[error("unexpected argument {0:?}")]
     UnexpectedArgument(String),
+    #[error("unexpected argument {0:?}; name a table as --write-baseline={0}")]
+    WriteBaselineTable(String),
     #[error("--base-baseline cannot be combined with --write-baseline")]
     BaseBaselineWithWriteBaseline,
     #[error(transparent)]
@@ -64,6 +68,8 @@ enum RunError {
     Load(#[from] LoadError),
     #[error(transparent)]
     WriteBaseline(#[from] WriteBaselineError),
+    #[error("could not list the entries not added: {0}")]
+    NotAddedEntries(#[from] toml::ser::Error),
     #[error("could not write the output: {0}")]
     Output(#[source] io::Error),
 }
@@ -72,7 +78,13 @@ struct Options {
     root: Option<PathBuf>,
     format: Format,
     base_baseline: Option<PathBuf>,
-    write_baseline: bool,
+    write_baseline: Option<WriteBaseline>,
+}
+
+/// `--write-baseline`, of every table or of the one named.
+enum WriteBaseline {
+    All,
+    Table(String),
 }
 
 fn main() -> ExitCode {
@@ -99,21 +111,55 @@ fn run(options: Options) -> Result<ExitCode, RunError> {
         None => find_workspace_root(&env::current_dir().map_err(RunError::CurrentDir)?)?,
     };
 
-    if options.write_baseline {
-        let written = write_baseline(&root)?;
+    if let Some(scope) = options.write_baseline {
+        let (written, tables, kept) = match scope {
+            WriteBaseline::All => {
+                let written = write_baseline(&root)?;
+                let tables = written.baseline.table_names();
+                (written, tables, "")
+            }
+            WriteBaseline::Table(table) => (
+                write_baseline_table(&root, &table)?,
+                vec![table],
+                "; other tables kept",
+            ),
+        };
         let not_added: String = written
             .not_added
             .iter()
             .map(|line| format!("{line}\n"))
             .collect();
-        write(
-            io::stdout(),
-            format_args!(
-                "{not_added}archcheck: wrote {} file_size entries to {}\n",
-                written.baseline.file_size.len(),
-                root.join(BASELINE_FILE).display()
+        let path = root.join(BASELINE_FILE);
+        let counts: Vec<String> = tables
+            .iter()
+            .filter_map(|table| {
+                let entries = written.baseline.table(table)?.len();
+                Some(format!("{entries} {table}"))
+            })
+            .collect();
+        let wrote = match tables.as_slice() {
+            [table] if counts.is_empty() => format!(
+                "archcheck: {} has no [{table}] table, which only a hand edit adds; left it alone",
+                path.display()
             ),
-        )?;
+            _ => format!(
+                "archcheck: wrote {} entries to {}{kept}",
+                counts.join(", "),
+                path.display()
+            ),
+        };
+        // Pasted inside its table, an entry is a deliberate exception, which
+        // no_new_entries reports on the pull request.
+        let entries = if written.not_added_entries.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "archcheck: the entries not added, for a deliberate exception added by hand \
+                 (no_new_entries reports it):\n{}",
+                written.not_added_toml()?
+            )
+        };
+        write(io::stdout(), format_args!("{not_added}{wrote}\n{entries}"))?;
         return Ok(ExitCode::SUCCESS);
     }
 
@@ -163,9 +209,11 @@ fn parse_args(args: impl Iterator<Item = OsString>) -> Result<Option<Options>, U
         root: None,
         format: Format::Human,
         base_baseline: None,
-        write_baseline: false,
+        write_baseline: None,
     };
-    let mut args = args.map(|arg| arg.into_string().map_err(UsageError::NonUtf8Argument));
+    let mut args = args
+        .map(|arg| arg.into_string().map_err(UsageError::NonUtf8Argument))
+        .peekable();
     while let Some(arg) = args.next() {
         let arg = arg?;
         let (flag, inline_value) = match arg.split_once('=') {
@@ -183,12 +231,23 @@ fn parse_args(args: impl Iterator<Item = OsString>) -> Result<Option<Options>, U
             "--root" => options.root = Some(PathBuf::from(value()?)),
             "--format" => options.format = value()?.parse()?,
             "--base-baseline" => options.base_baseline = Some(PathBuf::from(value()?)),
-            "--write-baseline" if inline_value.is_none() => options.write_baseline = true,
-            "--write-baseline" => return Err(UsageError::UnexpectedValue(flag.clone())),
+            // A table is only ever given after `=`, so a following argument
+            // is never taken as one; after a bare `--write-baseline`, the
+            // error says how to name it.
+            "--write-baseline" => {
+                if inline_value.is_none()
+                    && let Some(Ok(next)) =
+                        args.next_if(|arg| arg.as_ref().is_ok_and(|arg| !arg.starts_with('-')))
+                {
+                    return Err(UsageError::WriteBaselineTable(next));
+                }
+                options.write_baseline =
+                    Some(inline_value.map_or(WriteBaseline::All, WriteBaseline::Table));
+            }
             other => return Err(UsageError::UnexpectedArgument(other.to_owned())),
         }
     }
-    if options.write_baseline && options.base_baseline.is_some() {
+    if options.write_baseline.is_some() && options.base_baseline.is_some() {
         return Err(UsageError::BaseBaselineWithWriteBaseline);
     }
     Ok(Some(options))

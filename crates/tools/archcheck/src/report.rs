@@ -10,7 +10,8 @@ use crate::finding::Finding;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Format {
-    /// Findings grouped by rule and behaviour, then a one-line summary.
+    /// Findings grouped by code (`<rule>[.<instance>].<behaviour>`) and mode,
+    /// then a one-line summary.
     Human,
     /// One reviewdog Diagnostic Format (rdjson) document.
     Rdjson,
@@ -32,8 +33,8 @@ impl FromStr for Format {
     }
 }
 
-/// `findings` in [`crate::check`] order, which keeps each rule's behaviours
-/// contiguous.
+/// `findings` in [`crate::check`] order, which keeps each rule's (or rule
+/// instance's) behaviours contiguous.
 pub fn render(format: Format, findings: &[Finding], files_checked: usize) -> String {
     match format {
         Format::Human => human(findings, files_checked),
@@ -45,13 +46,10 @@ fn human(findings: &[Finding], files_checked: usize) -> String {
     let mut out = String::new();
     let mut group = None;
     for finding in findings {
-        let key = (finding.rule, finding.behaviour, finding.mode);
-        if group != Some(key) {
+        let key = (finding.code(), finding.mode);
+        if group.as_ref() != Some(&key) {
+            out.push_str(&format!("{} ({}):\n", key.0, key.1));
             group = Some(key);
-            out.push_str(&format!(
-                "{}.{} ({}):\n",
-                finding.rule, finding.behaviour, finding.mode
-            ));
         }
         out.push_str(&format!("  {}\n", finding.message()));
     }

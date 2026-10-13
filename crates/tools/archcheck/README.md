@@ -6,11 +6,12 @@ tolerates for now are listed in
 [`architecture-baseline.toml`](../../../architecture-baseline.toml).
 
 ```sh
-cargo arch                         # human-readable report
-cargo arch --format rdjson         # reviewdog Diagnostic Format, for CI
-cargo arch --base-baseline <path>  # also compare with the base branch's baseline
-cargo arch --write-baseline        # update the baseline's entries; never adds one
-cargo arch --root <path>           # check another checkout
+cargo arch                           # human-readable report
+cargo arch --format rdjson           # reviewdog Diagnostic Format, for CI
+cargo arch --base-baseline <path>    # also compare with the base branch's baseline
+cargo arch --write-baseline          # update the baseline's entries; never adds one
+cargo arch --write-baseline=<table>  # update one table's entries, keeping the others
+cargo arch --root <path>             # check another checkout
 ```
 
 Without `--root`, it checks the Cargo workspace containing the current
@@ -46,35 +47,145 @@ behaviours:
 the baseline, given with `--base-baseline <path>`, so that the baseline is no
 way around the limit.
 Lowered caps and removed entries are silent. Only that copy's `[file_size]`
-table is read, and other tables and keys are ignored, so a pull request can
-change the baseline's schema. If the copy can't be read, archcheck exits 2.
+table is read here, and other tables and keys are ignored, so a pull request
+can change the baseline's schema. If the copy can't be read, archcheck exits 2.
 If it isn't TOML, or its `[file_size]` isn't a table of integers, both
 behaviours are skipped with a warning. Without the flag (the local default)
 they are skipped too. Either way, one line after the summary line says so: on
 stdout for `human`, on stderr for `rdjson`.
 
+`pattern_ratchet` is a lint: it counts, per production file, the code lines
+that mention a name, and ratchets those counts. It has any number of named
+instances, each with its own patterns, allowed paths, modes and baseline
+table:
+
+```toml
+[rules.pattern_ratchet.<instance>]
+patterns = ['\bsome_name\b']     # regexes, matched against each code line
+allow = ["crates/x/src/owner.rs", "crates/x/src/owner/**"]
+
+[rules.pattern_ratchet.<instance>.no_crossing]
+mode = "advisory"
+# ...and no_new_entries, no_raised_caps, listed_no_growth and stale_entries,
+# as for file_size
+```
+
+It counts mentions, not uses. A code line matches if any pattern matches
+anywhere in it, so a string literal, an error message, a log line or a
+trailing comment that only names an identifier counts the same as code that
+uses it; several matches on one line count once. A name built at run time,
+such as with `format!`, does not match, and only production `.rs` files are
+read, so text in other files under `src/`, such as SQL loaded with
+`include_str!`, is not counted either; moving a match into such a file shows
+up as a `stale_entries` finding on the file it left, not a `no_crossing` one.
+Nor are files outside workspace members' `src/` read: for example,
+`scripts/admin/prune_cluster_artifacts.py` and
+`scripts/benchmarks/admin-node-inventory.sql` name `direct_tables`' tables
+today, and no behaviour sees them. Use `\b` around a
+name so that longer identifiers containing it do not match. Patterns are
+case-sensitive unless they use an inline `(?i)` flag. `allow` globs match
+repository-relative paths: `*` and `?` stay within one path component and
+`**` spans any number. Files they match are never counted.
+
+- `no_crossing`: a file outside the allowed paths and the instance's baseline
+  table has a matching line;
+- `no_new_entries`: the instance's table has an entry that the base branch's
+  copy of that table lacks (a renamed file counts as added);
+- `no_raised_caps`: an entry's cap is higher than in the base branch's copy
+  of the table;
+- `listed_no_growth`: a listed file has more matching lines than its cap;
+- `stale_entries`: an entry can be lowered or removed, because its file has
+  fewer matching lines, none, is now allowed, or no longer exists.
+
+`no_new_entries` and `no_raised_caps` compare with the base branch's copy as
+`file_size`'s do. Each instance reads only its own `[pattern_ratchet.<instance>]`
+table from that copy, leniently: a table for an instance that is not
+configured, such as one this pull request renamed or removed, is ignored, with
+a line after the summary (`base baseline has [pattern_ratchet.<instance>],
+which is not configured; skipped`) so that the removal shows in the log; a
+missing table has no entries, so every entry of the instance's own table is
+new. If the instance's table, or `pattern_ratchet` itself, isn't a table of
+integers, that instance's two behaviours are skipped with a warning, and the
+other tables are still compared. If the copy isn't TOML at all, one warning
+line names every comparison skipped, `file_size`'s and each instance's.
+Without `--base-baseline`, they are skipped, one line per instance after the
+summary line. Loosening an instance in
+`ARCHITECTURE.toml`, by widening `allow` or narrowing `patterns`, is not
+reported by any behaviour: review such changes.
+
+An instance name is lowercase ASCII letters, digits and underscores, starting
+with a letter. Adding an instance takes configuration and a baseline table, no
+code changes:
+
+1. Add its tables to `ARCHITECTURE.toml`, with a comment saying why.
+2. Run `cargo arch --write-baseline=pattern_ratchet.<instance>`. The baseline
+   has no table for the instance, so it is left alone, and the command lists
+   every file outside the allowed paths that matches today as `not added`,
+   followed by those entries as TOML.
+3. Add the table to `architecture-baseline.toml` by hand: paste the listed
+   entries, or, if no file matches, add an empty `[pattern_ratchet.<instance>]`
+   or none at all. Review each entry.
+4. Commit both files. On the pull request, `no_new_entries` reports each
+   entry, since the base branch's copy has no table for the instance: that is
+   expected for a deliberate new instance.
+
 ## Configuration and modes
 
 Each behaviour has a `mode`: `advisory` findings are reported, `required` ones
 also fail the check, so behaviours can graduate one at a time. Unknown keys,
-sections or modes, a missing file, bad TOML, and `members` with globs or with
-empty, `.` or `..` components exit 2. So does a `--base-baseline` that can't
-be read, or one combined with `--write-baseline`.
+sections or modes, a missing file, bad TOML, an invalid regex, glob or instance
+name, an empty `patterns` list, a baseline table for an instance that is not
+configured, and `members` with globs or with empty, `.` or `..` components
+exit 2. So does a `--base-baseline` that can't be read, or one combined with
+`--write-baseline`.
 
 ## Baseline
 
+Each table maps a repository-relative path to its cap, the count it had when
+listed: under `[file_size]`, each production file over the limit, with its
+code-line count; under `[pattern_ratchet.<instance>]`, each production file
+outside the instance's allowed paths with a matching line, with its count of
+matching lines. Entries should only be removed or lowered.
+
 `cargo arch --write-baseline` rewrites `architecture-baseline.toml` from its
-entries and the tree: an entry whose file is still over the limit gets the
-file's current count as its cap, and the other entries are removed. It never
-adds an entry. It prints `not added: <path> (N code lines); …` for each file
-over the limit without one instead: split the file, or, for a deliberate
-exception, add the entry by hand, which `no_new_entries` then reports. Raised
+entries and the tree. An entry still in violation gets its current count as
+its cap: under `[file_size]`, a file still over the limit; under
+`[pattern_ratchet.<instance>]`, a file outside the allowed paths that still has
+a matching line. The other entries are removed. It never adds an entry, or a
+`[pattern_ratchet.<instance>]` table the file lacks (`[file_size]` is always
+written, empty if the file had none). It prints `not added: <path> (N code lines); …` for each
+file over the limit without an entry instead, and `not added: <path> (N code
+lines matching the <instance> patterns); …` for each matching file without
+one, then, after its summary line, the entries they would need, as TOML, one
+block per table, each after a comment saying where it goes. For a table the
+file has, the block has no header and its comment says to add the entries
+inside that table, below its header: pasted at the end of the file, they would
+land in whichever table comes last. For a table the file lacks, the block
+starts with the table's header and goes at the end of the file. Fix the file,
+or, for a deliberate exception, add the entry by hand, inside its table, which
+`no_new_entries` then reports. Raised
 caps are written too, and `no_raised_caps` reports each of them. It reads the
 existing file with the strict parser, so a missing or invalid baseline exits 2:
-it can't create one from scratch. Entries should only be removed or lowered.
-The inventory walks
-the filesystem, so untracked `.rs` files under `src/` are counted too: check
-`git status` before `--write-baseline`.
+it can't create one from scratch.
+
+`cargo arch --write-baseline=<table>`, with `<table>` either `file_size` or
+`pattern_ratchet.<instance>` for a configured instance, does the same for that
+table alone and keeps every other table as the existing baseline has it,
+printing only that table's `not added` lines and entries. Use it when adding
+or changing one rule, so that other tables are left alone. If the file has no
+`[pattern_ratchet.<instance>]` table for it, the table is not created and the
+file is left alone (see adding an
+instance, above). Other tables come out byte-identical if the file is in
+generated form (as written by archcheck); hand-added comments, quoting or key
+order are normalized. As for the unscoped form, the existing baseline must
+exist and pass the checks `cargo arch` makes, including that every
+`[pattern_ratchet.<instance>]` table names a configured instance; otherwise, as
+for an unknown table, it exits 2 and leaves the file alone. The table is only
+taken after `=`: `--write-baseline` alone is always the unscoped write, and an
+argument after it that is not a flag is a usage error.
+
+The inventory walks the filesystem, so untracked `.rs` files under `src/` are
+counted too: check `git status` before `--write-baseline`.
 
 ## In CI
 
@@ -85,12 +196,17 @@ On pull requests, the Rust clippy job in
 `-reporter=github-pr-annotations`. The file is the baseline of the synthetic
 merge's first parent, the base branch, or an empty file if the base has none.
 If the base can't be resolved, the step warns and runs without the flag. Each
-finding is a diagnostic with code `<rule>.<behaviour>` on line 1 of its file,
-with the path exactly as it is; a new entry, a raised cap, and a stale entry
-for a deleted file point at the entry's line in the baseline. Required findings are
-`ERROR`, advisory ones `WARNING`.
+finding is a diagnostic with code `<rule>.<behaviour>`, or
+`<rule>.<instance>.<behaviour>` for a rule with instances, on line 1 of its
+file, with the path exactly as it is. A new entry, a raised cap, and a stale
+entry for a deleted file point at the entry's line in the baseline instead.
+`pattern_ratchet`'s `no_crossing`, `listed_no_growth` and shrank
+`stale_entries` findings point at the file's first matching line; one for a
+file with no matches left, at its line 1. Required findings are `ERROR`,
+advisory ones `WARNING`.
 
-- `-filter-mode=file` reports findings in the files the pull request changes.
+- `-filter-mode=file` reports findings in the files the pull request changes,
+  so one on a line of the baseline shows only when the baseline changes.
 - `-filter-mode=nofilter` reports every finding when the pull request changes
   `ARCHITECTURE.toml`, the baseline, the root `Cargo.toml` or anything under
   `crates/tools/archcheck/` (by old or new name), or when its file list can't
@@ -98,15 +214,40 @@ for a deleted file point at the entry's line in the baseline. Required findings 
 - reviewdog fails once it has written 10 annotations, whatever their severity.
   So advisory findings get one run that never fails the step, and required
   findings a second run with `-fail-level=error` that does.
+- Findings are annotated in report order, every `file_size` finding first. So
+  with 10 or more advisory findings to show, later ones, such as the
+  `pattern_ratchet` `no_new_entries` and `no_raised_caps` findings of a pull
+  request that edits a pattern table (which also turns on `nofilter`), are
+  not annotated. Annotations are not the full inventory: every finding is in
+  the step's log and its rdjson output, or run `cargo arch`.
 
 Only annotations are filtered. Once a behaviour is `required`,
 `tests/repository.rs` fails on any required finding anywhere in the tree.
 
 ## Adding a rule
 
+A new instance of `pattern_ratchet` is configuration, not a new rule (see
+above). For a new kind of check:
+
 1. Add a module under `src/rules/` with a type that implements `Rule`.
 2. Add its configuration to `RulesConfig` in `src/config.rs`, with one
    `BehaviourConfig` per behaviour, and its table to `ARCHITECTURE.toml`.
-3. If it tolerates existing violations, add a table to `Baseline` and
-   implement `Rule::update_baseline`, which never adds entries.
+3. If it tolerates existing violations, implement `Rule::update_baseline`,
+   which never adds entries or creates instance tables, and add its table in
+   `src/baseline.rs`:
+   - a field in `Baseline`, and a `#[serde(default)]` field in `BaselineFile`
+     read by `Baseline::load` (`BaselineFile` denies unknown fields, so a
+     table it does not know makes the next check exit 2);
+   - its name in `TableName`, `Baseline::table_names`, `Baseline::table` and
+     `Baseline::replace_table`, and in the tables `write_baseline_table`
+     (`src/lib.rs`) accepts, which `--write-baseline=<table>` and the
+     `--write-baseline` summary in `src/main.rs` use;
+   - if it compares with the base branch's copy, a lenient reading of its
+     table in `Baseline::load_base` and an accessor on `BaseBaseline`, so
+     that a table that does not parse skips only its own comparisons, and
+     `Rule::base_comparisons`, which names them in the one warning for a copy
+     that isn't TOML;
+   - for a rule with instances, a check in `Context::load_with_baseline`
+     (`src/context.rs`) that each baseline table names a configured instance,
+     as `pattern_ratchet` has.
 4. Register it in `rules::registered()` and add test cases to `tests/cli.rs`.

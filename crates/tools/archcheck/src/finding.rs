@@ -4,6 +4,8 @@ use crate::config::Mode;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Finding {
     pub rule: &'static str,
+    /// The instance of a rule configured as several named instances.
+    pub instance: Option<String>,
     pub behaviour: &'static str,
     pub path: String,
     /// The rest of the message after the path, such as `": 1200 code lines…"`.
@@ -13,9 +15,9 @@ pub struct Finding {
     pub location: Location,
 }
 
-/// A repository-relative file and a 1-based line in it: line 1 of the file a
-/// finding is about, or, for a baseline entry whose file is gone, the entry's
-/// line in the baseline.
+/// A repository-relative file and a 1-based line in it: the line a finding is
+/// about, line 1 of its file when it is about the whole file, or, for a
+/// finding about a baseline entry itself, the entry's line in the baseline.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Location {
     pub path: String,
@@ -23,6 +25,14 @@ pub struct Location {
 }
 
 impl Finding {
+    /// `<rule>.<behaviour>`, or `<rule>.<instance>.<behaviour>`.
+    pub fn code(&self) -> String {
+        match &self.instance {
+            Some(instance) => format!("{}.{instance}.{}", self.rule, self.behaviour),
+            None => format!("{}.{}", self.rule, self.behaviour),
+        }
+    }
+
     /// The path followed by the detail, as one sentence.
     pub fn message(&self) -> String {
         format!("{}{}", self.path, self.detail)

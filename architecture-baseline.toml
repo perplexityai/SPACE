@@ -1,10 +1,12 @@
 # Existing violations of the rules in ARCHITECTURE.toml, tolerated until fixed.
-# Updated by `cargo arch --write-baseline`, which never adds an entry; see
-# crates/tools/archcheck/README.md.
+# Updated by `cargo arch --write-baseline[=<table>]`, which never adds an entry
+# or a [pattern_ratchet.*] table; see crates/tools/archcheck/README.md.
 #
 # [file_size] maps each production Rust file over the code-line limit to its cap,
-# the code-line count it had when listed. Only remove entries or lower caps: a
-# pull request that adds an entry or raises a cap is reported.
+# the code-line count it had when listed. [pattern_ratchet.<instance>] maps each
+# production Rust file outside the instance's allowed paths to its cap on code
+# lines matching its patterns. Only remove entries or lower caps: a pull request
+# that adds an entry or raises a cap is reported.
 
 [file_size]
 "crates/apps/local/node-mgr/svc/src/service.rs" = 1258
@@ -106,3 +108,19 @@
 "crates/libs/template/mgr/src/volume.rs" = 2294
 "crates/libs/vol/mgr/server/src/executor.rs" = 4828
 "crates/libs/vol/mgr/server/src/service.rs" = 1696
+
+[pattern_ratchet.direct_tables]
+"crates/libs/api/src/controllers/sandbox/responses.rs" = 4
+"crates/libs/api/src/controllers/sandbox/spaced.rs" = 1
+"crates/libs/api/src/public_template_operations.rs" = 1
+"crates/libs/api/src/routes/admin/node_maintenance.rs" = 7
+"crates/libs/api/src/routes/admin/node_store.rs" = 1
+"crates/libs/api/src/routes/admin/templates.rs" = 1
+"crates/libs/api/src/routes/public/sandboxes.rs" = 1
+"crates/libs/cluster/controller/server/src/node_drain/store.rs" = 1
+"crates/libs/cluster/controller/server/src/tombstone_retention.rs" = 2
+"crates/libs/cluster/trigger-queue/src/lib.rs" = 1
+"crates/libs/internal/api/server/src/data_plane_sessions.rs" = 7
+"crates/libs/internal/api/server/src/lib.rs" = 1
+"crates/libs/internal/api/server/src/published_state.rs" = 4
+"crates/libs/sandbox/store/src/lib.rs" = 2

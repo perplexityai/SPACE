@@ -10,11 +10,11 @@
 //! does not also fail the change that shrinks a file.
 
 use crate::{
-    baseline::{BASELINE_FILE, BaseBaseline, Baseline},
+    baseline::{BASELINE_FILE, Baseline},
     config::Mode,
     context::Context,
     finding::{Finding, Location},
-    rules::Rule,
+    rules::{NotAdded, Rule},
 };
 
 pub struct FileSize;
@@ -50,12 +50,9 @@ impl Rule for FileSize {
             }
         }
 
-        if let BaseBaseline::Loaded(base) = &ctx.base_baseline {
+        if let Ok(base) = ctx.base_baseline.file_size() {
             let mode = config.no_new_entries.mode;
-            for path in caps
-                .keys()
-                .filter(|path| !base.file_size.contains_key(*path))
-            {
+            for path in caps.keys().filter(|path| !base.contains_key(*path)) {
                 findings.push(entry_finding(
                     ctx,
                     NO_NEW_ENTRIES,
@@ -71,7 +68,7 @@ impl Rule for FileSize {
             }
             let mode = config.no_raised_caps.mode;
             for (path, &cap) in caps {
-                if let Some(&base_cap) = base.file_size.get(path)
+                if let Some(&base_cap) = base.get(path)
                     && cap > base_cap
                 {
                     findings.push(entry_finding(
@@ -146,28 +143,21 @@ impl Rule for FileSize {
     }
 
     fn skipped(&self, ctx: &Context) -> Vec<String> {
-        let behaviours = format!("{RULE}.{NO_NEW_ENTRIES} and {RULE}.{NO_RAISED_CAPS} skipped");
-        match &ctx.base_baseline {
-            BaseBaseline::Loaded(_) => Vec::new(),
-            BaseBaseline::NotGiven => vec![format!("{behaviours} (no --base-baseline given)")],
-            BaseBaseline::Unusable { path, line, error } => {
-                let at = line
-                    .map(|line| format!(" at line {line}"))
-                    .unwrap_or_default();
-                vec![format!(
-                    "warning: could not parse {}{at}: {}; {behaviours}",
-                    path.display(),
-                    error.message(),
-                )]
-            }
+        match ctx.base_baseline.file_size() {
+            Ok(_) => Vec::new(),
+            Err(skip) => vec![skip.message(&format!("{} skipped", base_comparisons()))],
         }
+    }
+
+    fn base_comparisons(&self, _ctx: &Context) -> Vec<String> {
+        vec![base_comparisons()]
     }
 
     /// Keeps each listed file still over the limit, at its current size,
     /// even above its cap, which `no_raised_caps` then reports. A file without
     /// an entry is not added: that takes a hand-written entry, which
     /// `no_new_entries` then reports.
-    fn update_baseline(&self, ctx: &Context, baseline: &mut Baseline) -> Vec<String> {
+    fn update_baseline(&self, ctx: &Context, baseline: &mut Baseline) -> Vec<NotAdded> {
         let limit = ctx.config.rules.file_size.limit;
         let mut not_added = Vec::new();
         for file in ctx.files.iter().filter(|file| file.code_lines > limit) {
@@ -176,11 +166,16 @@ impl Rule for FileSize {
                     .file_size
                     .insert(file.path.clone(), file.code_lines);
             } else {
-                not_added.push(format!(
-                    "not added: {} ({} code lines); split it, or add an entry by hand if this is \
-                     a deliberate exception",
-                    file.path, file.code_lines
-                ));
+                not_added.push(NotAdded {
+                    table: RULE.to_owned(),
+                    path: file.path.clone(),
+                    count: file.code_lines,
+                    line: format!(
+                        "not added: {} ({} code lines); split it, or add an entry by hand if this \
+                         is a deliberate exception",
+                        file.path, file.code_lines
+                    ),
+                });
             }
         }
         not_added
@@ -204,10 +199,16 @@ fn entry_finding(
     }
 }
 
+/// The behaviours that compare with the base branch's copy.
+fn base_comparisons() -> String {
+    format!("{RULE}.{NO_NEW_ENTRIES} and {RULE}.{NO_RAISED_CAPS}")
+}
+
 /// A finding shown on line 1 of the file it is about.
 fn finding(behaviour: &'static str, mode: Mode, path: &str, detail: String) -> Finding {
     Finding {
         rule: RULE,
+        instance: None,
         behaviour,
         path: path.to_owned(),
         detail,

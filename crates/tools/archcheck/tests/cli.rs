@@ -685,6 +685,10 @@ fn configuration_errors() {
             "[workspace]\nmembers = [\"crates/a\", {member:?}]\n"
         ))
     };
+    let instance = |patterns: &[&str], allow: &[&str]| {
+        format!("{advisory}{}", ratchet("old", patterns, allow, ADVISORY))
+    };
+    let valid_instance = instance(&[r"\bold_table\b"], &["crates/a/**"]);
     let parse = "could not parse";
     let glob = "contains glob characters";
     let unnormalized = "has an empty, `.` or `..` component";
@@ -720,6 +724,59 @@ fn configuration_errors() {
             parse,
         ),
         ("unparseable", CONFIG, text("[rules.file_size\n"), parse),
+        (
+            "bad regex",
+            CONFIG,
+            Some(instance(&["(old_table"], &[])),
+            "regex parse error",
+        ),
+        (
+            "no patterns",
+            CONFIG,
+            Some(instance(&[], &[])),
+            "patterns must list at least one regex",
+        ),
+        (
+            "bad glob",
+            CONFIG,
+            Some(instance(&["old_table"], &["crates/{a"])),
+            "error parsing glob 'crates/{a'",
+        ),
+        (
+            "unknown instance key",
+            CONFIG,
+            Some(valid_instance.replace("allow = [", "alow = []\nallow = [")),
+            "unknown field `alow`",
+        ),
+        (
+            "unknown instance behaviour key",
+            CONFIG,
+            Some(format!(
+                "{valid_instance}[rules.pattern_ratchet.old.no_crossing.extra]\n"
+            )),
+            parse,
+        ),
+        (
+            "missing instance behaviour",
+            CONFIG,
+            Some(valid_instance.replace(
+                "[rules.pattern_ratchet.old.stale_entries]\nmode = \"advisory\"\n",
+                "",
+            )),
+            "missing field `stale_entries`",
+        ),
+        (
+            "missing patterns",
+            CONFIG,
+            Some(valid_instance.replace("patterns = ['\\bold_table\\b']\n", "")),
+            "missing field `patterns`",
+        ),
+        (
+            "instance name",
+            CONFIG,
+            Some(valid_instance.replace("pattern_ratchet.old", "pattern_ratchet.Old")),
+            "instance name \"Old\" must be",
+        ),
         ("missing", CONFIG, None, "could not read"),
         (
             "unknown baseline section",
@@ -734,6 +791,18 @@ fn configuration_errors() {
             parse,
         ),
         ("missing baseline", BASELINE, None, "could not read"),
+        (
+            "baseline table for no instance",
+            BASELINE,
+            text("[file_size]\n[pattern_ratchet.gone]\n"),
+            "[pattern_ratchet.gone] names no instance in ARCHITECTURE.toml",
+        ),
+        (
+            "non-integer pattern_ratchet cap",
+            BASELINE,
+            text("[file_size]\n[pattern_ratchet.old]\n\"crates/a/src/lib.rs\" = \"1\"\n"),
+            parse,
+        ),
         (
             "glob member",
             MANIFEST,
@@ -808,6 +877,16 @@ fn configuration_errors() {
             "ARCHITECTURE.toml",
             "[rules.file_size\n",
             "could not parse ",
+        ),
+        (
+            "ARCHITECTURE.toml",
+            &instance(&["(old_table"], &[]),
+            "regex parse error",
+        ),
+        (
+            "ARCHITECTURE.toml",
+            &instance(&["old_table"], &["crates/{a"]),
+            "error parsing glob",
         ),
         (
             "Cargo.toml",
@@ -1176,11 +1255,6 @@ fn arguments() {
             2,
             "archcheck: unexpected argument",
         ),
-        (
-            &["--write-baseline=yes"],
-            2,
-            "archcheck: --write-baseline takes no value",
-        ),
     ];
     for (args, code, stderr) in cases {
         let run = run(ws.path(), args);
@@ -1263,4 +1337,1600 @@ fn output_write_errors_exit_2() {
         .status()
         .expect("run archcheck");
     assert_eq!(status.code(), Some(2));
+}
+
+/// The behaviours of `file_size` and of each `pattern_ratchet` instance, in
+/// reporting order.
+const BEHAVIOURS: [&str; 5] = [
+    "no_crossing",
+    "no_new_entries",
+    "no_raised_caps",
+    "listed_no_growth",
+    "stale_entries",
+];
+
+const REQUIRED: [&str; 5] = ["required"; 5];
+
+/// A `[rules.pattern_ratchet.<instance>]` table, with the mode of each of
+/// [`BEHAVIOURS`] in `modes`.
+fn ratchet(instance: &str, patterns: &[&str], allow: &[&str], modes: [&str; 5]) -> String {
+    let list = |items: &[&str]| {
+        items
+            .iter()
+            .map(|item| format!("'{item}'"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let table = format!("[rules.pattern_ratchet.{instance}");
+    let behaviours: String = BEHAVIOURS
+        .iter()
+        .zip(modes)
+        .map(|(behaviour, mode)| format!("{table}.{behaviour}]\nmode = \"{mode}\"\n"))
+        .collect();
+    format!(
+        "{table}]\npatterns = [{}]\nallow = [{}]\n{behaviours}",
+        list(patterns),
+        list(allow),
+    )
+}
+
+/// `ARCHITECTURE.toml` with advisory `file_size` and one instance, `old`,
+/// restricting `old_table` and, in any case, `old_log` to
+/// `crates/a/src/allowed.rs`, `crates/a/src/allowed/**` and
+/// `crates/b/src/*.rs`.
+fn old_tables_config(modes: [&str; 5]) -> String {
+    format!(
+        "{}{}",
+        config(ADVISORY),
+        ratchet(
+            "old",
+            &[r"\bold_table\b", r"(?i)\bold_log\b"],
+            &[
+                "crates/a/src/allowed.rs",
+                "crates/a/src/allowed/**",
+                "crates/b/src/*.rs"
+            ],
+            modes,
+        ),
+    )
+}
+
+/// An empty `[file_size]` table and one `[pattern_ratchet.<instance>]` table
+/// per entry of `tables`.
+fn ratchet_baseline(tables: &[(&str, &[(&str, usize)])]) -> String {
+    let mut text = baseline(&[]);
+    for (instance, entries) in tables {
+        text.push_str(&format!("[pattern_ratchet.{instance}]\n"));
+        for (path, cap) in *entries {
+            text.push_str(&format!("{path:?} = {cap}\n"));
+        }
+    }
+    text
+}
+
+/// `(code, message)` of every `pattern_ratchet` finding, in reporting order.
+fn ratchet_findings(root: &Path) -> Vec<(String, String)> {
+    let ctx = Context::load(root).expect("the workspace loads");
+    check(&ctx)
+        .into_iter()
+        .filter(|finding| finding.rule == "pattern_ratchet")
+        .map(|finding| (finding.code(), finding.message()))
+        .collect()
+}
+
+/// What a `--write-baseline` run printed.
+struct WriteOutput<'a> {
+    not_added: Vec<&'a str>,
+    summary: &'a str,
+    /// The TOML of the entries not added, after its heading line.
+    entries: String,
+}
+
+fn write_output(stdout: &str) -> WriteOutput<'_> {
+    let mut lines = stdout.lines().peekable();
+    let mut not_added = Vec::new();
+    while let Some(line) = lines.next_if(|line| !line.starts_with("archcheck: ")) {
+        not_added.push(line);
+    }
+    let summary = lines.next().expect("a summary line");
+    let entries = match lines.next() {
+        None => String::new(),
+        Some(heading) => {
+            assert_eq!(
+                heading,
+                "archcheck: the entries not added, for a deliberate exception added by hand \
+                 (no_new_entries reports it):"
+            );
+            lines.map(|line| format!("{line}\n")).collect()
+        }
+    };
+    WriteOutput {
+        not_added,
+        summary,
+        entries,
+    }
+}
+
+/// The comment `--write-baseline` prints before entries for `table`, which
+/// the baseline has.
+fn inside(table: &str) -> String {
+    format!(
+        "# add inside the existing [{table}] table, below its header; not at the end of the \
+         file, which may be another table\n"
+    )
+}
+
+/// `baseline` with `entries`, as `--write-baseline` printed them, pasted
+/// where each block's comment says: inside the existing table it names,
+/// below its header, or at the end of the file for a new table.
+fn paste_entries(baseline: &str, entries: &str) -> String {
+    const INSIDE: &str = "# add inside the existing [";
+    const NEW: &str = "# add as a new table, header included, at the end of the file\n";
+    let mut text = baseline.to_owned();
+    let mut lines = entries.split_inclusive('\n').peekable();
+    while let Some(comment) = lines.next() {
+        let mut block = String::new();
+        while let Some(line) = lines.next_if(|line| !line.starts_with('#')) {
+            block.push_str(line);
+        }
+        if comment == NEW {
+            text.push_str(&block);
+            continue;
+        }
+        let (table, _) = comment
+            .strip_prefix(INSIDE)
+            .and_then(|rest| rest.split_once(']'))
+            .expect("each block starts with a comment saying where it goes");
+        let header = format!("[{table}]\n");
+        let at = text
+            .find(&header)
+            .expect("the baseline has the table the comment names");
+        text.insert_str(at + header.len(), &block);
+    }
+    text
+}
+
+/// One row per situation for the `old` instance: baseline entries, files,
+/// and the expected `(behaviour, start of message)` of each finding.
+#[test]
+fn pattern_ratchet_behaviours() {
+    const LISTED: &str = "crates/a/src/listed.rs";
+    const NEW: &str = "crates/b/src/sub/new.rs";
+    type Entries<'a> = &'a [(&'a str, usize)];
+    type Files<'a> = &'a [(&'a str, &'a str)];
+    type Case<'a> = (&'a str, Entries<'a>, Files<'a>, &'a [(&'a str, &'a str)]);
+    let cases: &[Case] = &[
+        (
+            "a new file with matching lines",
+            &[],
+            &[(
+                NEW,
+                "fn f() {}\nlet t = \"old_table\";\n\nlet l = old_log;\n",
+            )],
+            &[(
+                "no_crossing",
+                "crates/b/src/sub/new.rs: 2 code lines match the old patterns, first on line 2, \
+                 outside the paths [rules.pattern_ratchet.old] in ARCHITECTURE.toml allows. Move \
+                 that code behind an allowed path. If the file was renamed, move its entry in \
+                 [pattern_ratchet.old] in architecture-baseline.toml to the new path; \
+                 no_new_entries reports the moved entry as new, for a reviewer to accept.",
+            )],
+        ),
+        (
+            "a line matching several patterns, several times, counts once",
+            &[],
+            &[(NEW, "old_table old_log old_table\n")],
+            &[(
+                "no_crossing",
+                "crates/b/src/sub/new.rs: 1 code line matches the old",
+            )],
+        ),
+        (
+            "only whole identifiers match, case-sensitively by default",
+            &[],
+            &[(
+                NEW,
+                "old_table_id\nmy_old_table\nold_tables\nOLD_TABLE\nOLD_LOGS\n",
+            )],
+            &[],
+        ),
+        (
+            "a (?i) pattern matches in any case",
+            &[],
+            &[(NEW, "OLD_LOG\nOld_Log\n")],
+            &[(
+                "no_crossing",
+                "crates/b/src/sub/new.rs: 2 code lines match the old patterns, first on line 1,",
+            )],
+        ),
+        (
+            "qualified and quoted names are whole identifiers",
+            &[],
+            &[(NEW, "\"SELECT * FROM public.old_table\"\n")],
+            &[(
+                "no_crossing",
+                "crates/b/src/sub/new.rs: 1 code line matches",
+            )],
+        ),
+        (
+            "comment lines do not count",
+            &[],
+            &[(NEW, "// old_table\n/// old_table\n  //! old_log\n")],
+            &[],
+        ),
+        (
+            "a trailing comment is part of its code line",
+            &[],
+            &[(NEW, "// old_table\nlet x = 1; // old_table\n")],
+            &[(
+                "no_crossing",
+                "crates/b/src/sub/new.rs: 1 code line matches the old patterns, first on line 2,",
+            )],
+        ),
+        (
+            "allowed paths may match",
+            &[],
+            &[
+                ("crates/a/src/allowed.rs", "old_table\n"),
+                ("crates/a/src/allowed/deep/x.rs", "old_table\n"),
+                ("crates/b/src/top.rs", "old_table\n"),
+            ],
+            &[],
+        ),
+        (
+            "near misses of the allowed paths may not",
+            &[],
+            &[
+                ("crates/a/src/allowed_more.rs", "old_table\n"),
+                ("crates/b/src/sub/x.rs", "old_table\n"),
+            ],
+            &[
+                ("no_crossing", "crates/a/src/allowed_more.rs: 1 code line"),
+                ("no_crossing", "crates/b/src/sub/x.rs: 1 code line"),
+            ],
+        ),
+        (
+            "test files are not production files",
+            &[],
+            &[
+                ("crates/a/src/tests.rs", "old_table\n"),
+                ("crates/a/src/x_tests.rs", "old_table\n"),
+                ("crates/a/src/m/tests/mod.rs", "old_table\n"),
+                ("crates/a/tests/it.rs", "old_table\n"),
+            ],
+            &[],
+        ),
+        (
+            "a listed file gained a matching line",
+            &[(LISTED, 1)],
+            &[(LISTED, "old_table\nold_log\n")],
+            &[(
+                "listed_no_growth",
+                "crates/a/src/listed.rs grew from 1 to 2 code lines matching the old patterns. \
+                 Once this rule is required, move new matches behind an allowed path.",
+            )],
+        ),
+        (
+            "a listed file at its cap",
+            &[(LISTED, 2)],
+            &[(LISTED, "old_table\nold_log\n")],
+            &[],
+        ),
+        (
+            "a listed file lost a matching line",
+            &[(LISTED, 2)],
+            &[(LISTED, "old_table\n")],
+            &[(
+                "stale_entries",
+                "crates/a/src/listed.rs shrank from 2 to 1 code lines matching the old patterns. \
+                 Lower its cap in [pattern_ratchet.old] in architecture-baseline.toml to 1.",
+            )],
+        ),
+        (
+            "a listed file has no matching lines left",
+            &[(LISTED, 2)],
+            &[(LISTED, "// old_table\n")],
+            &[(
+                "stale_entries",
+                "crates/a/src/listed.rs has no code lines left matching the old patterns outside \
+                 its allowed paths. Remove it from [pattern_ratchet.old] in \
+                 architecture-baseline.toml.",
+            )],
+        ),
+        (
+            "a listed file is now allowed",
+            &[("crates/a/src/allowed.rs", 1)],
+            &[("crates/a/src/allowed.rs", "old_table\n")],
+            &[(
+                "stale_entries",
+                "crates/a/src/allowed.rs has no code lines left",
+            )],
+        ),
+        (
+            "a listed file is gone",
+            &[(LISTED, 1)],
+            &[],
+            &[(
+                "stale_entries",
+                "crates/a/src/listed.rs: listed in [pattern_ratchet.old] in \
+                 architecture-baseline.toml but no longer a production Rust file. Remove the \
+                 entry; a renamed file is checked under its new path.",
+            )],
+        ),
+        (
+            "a listed file became a test file",
+            &[(LISTED, 1)],
+            &[("crates/a/src/listed_tests.rs", "old_table\n")],
+            &[("stale_entries", "crates/a/src/listed.rs: listed in")],
+        ),
+        (
+            "a listed file was renamed",
+            &[(LISTED, 1)],
+            &[(NEW, "old_table\n")],
+            &[
+                (
+                    "no_crossing",
+                    "crates/b/src/sub/new.rs: 1 code line matches",
+                ),
+                ("stale_entries", "crates/a/src/listed.rs: listed in"),
+            ],
+        ),
+    ];
+    for (name, entries, files, expected) in cases {
+        let mut files: Vec<(&str, String)> = files
+            .iter()
+            .map(|(path, text)| (*path, (*text).to_owned()))
+            .collect();
+        files.push(("ARCHITECTURE.toml", old_tables_config(ADVISORY)));
+        files.push((
+            "architecture-baseline.toml",
+            ratchet_baseline(&[("old", entries)]),
+        ));
+        let ws = workspace(&files);
+
+        let found = ratchet_findings(ws.path());
+
+        assert_eq!(found.len(), expected.len(), "{name}: {found:#?}");
+        for ((code, message), (want_behaviour, want_message)) in found.iter().zip(*expected) {
+            assert_eq!(
+                code,
+                &format!("pattern_ratchet.old.{want_behaviour}"),
+                "{name}"
+            );
+            assert!(message.starts_with(want_message), "{name}: {message}");
+        }
+    }
+}
+
+/// One finding per behaviour, each reported in its own mode; only required
+/// findings exit 1. Against the base branch's copy, gone.rs is a new entry
+/// and grew.rs's cap was raised from 1 to 2.
+#[test]
+fn pattern_ratchet_modes_and_exit_codes() {
+    let files = |modes: [&str; 5]| {
+        vec![
+            ("ARCHITECTURE.toml", old_tables_config(modes)),
+            (
+                "architecture-baseline.toml",
+                ratchet_baseline(&[(
+                    "old",
+                    &[("crates/a/src/gone.rs", 1), ("crates/a/src/grew.rs", 2)],
+                )]),
+            ),
+            (
+                "base.toml",
+                ratchet_baseline(&[("old", &[("crates/a/src/grew.rs", 1)])]),
+            ),
+            (
+                "crates/a/src/grew.rs",
+                "old_table\nold_log\nold_table\n".to_owned(),
+            ),
+            ("crates/b/src/sub/new.rs", "old_table\n".to_owned()),
+        ]
+    };
+    let mut cases = vec![(ADVISORY, 0)];
+    for required in 0..BEHAVIOURS.len() {
+        let mut modes = ADVISORY;
+        modes[required] = "required";
+        cases.push((modes, 1));
+    }
+    for (modes, expected) in cases {
+        let ws = workspace(&files(modes));
+        let base = ws.path().join("base.toml");
+
+        let run = run(ws.path(), &["--base-baseline", base.to_str().unwrap()]);
+
+        assert_eq!(
+            run.code, expected,
+            "{modes:?}: {}{}",
+            run.stdout, run.stderr
+        );
+        let headings: Vec<&str> = run
+            .stdout
+            .lines()
+            .filter(|line| line.starts_with("pattern_ratchet."))
+            .collect();
+        let expected: Vec<String> = BEHAVIOURS
+            .iter()
+            .zip(modes)
+            .map(|(behaviour, mode)| format!("pattern_ratchet.old.{behaviour} ({mode}):"))
+            .collect();
+        assert_eq!(headings, expected);
+    }
+
+    let mut modes = ADVISORY;
+    modes[3] = "required";
+    let ws = workspace(&files(modes));
+    let growth = "crates/a/src/grew.rs grew from 2 to 3 code lines matching the old patterns. \
+                  Move new matches behind an allowed path.";
+    assert!(
+        ratchet_findings(ws.path())
+            .iter()
+            .any(|(_, message)| message == growth)
+    );
+}
+
+/// `no_new_entries` and `no_raised_caps` compare each instance's table with
+/// the base branch's copy of it, read leniently and on its own: a table for
+/// another instance is ignored, and one that does not parse skips only that
+/// instance's comparisons, with a warning. The baseline lists
+/// `crates/a/src/listed.rs` (cap 2) and `crates/a/src/kept.rs` (cap 1), at
+/// their counts.
+#[test]
+fn pattern_ratchet_base_baseline() {
+    const LISTED: &str = "crates/a/src/listed.rs";
+    let new = "pattern_ratchet.old.no_new_entries";
+    let raised = "pattern_ratchet.old.no_raised_caps";
+    // The line's skipped comparisons, for `codes` separated by ", ".
+    let both = |codes: &str| {
+        let comparisons: Vec<String> = codes
+            .split(", ")
+            .map(|code| format!("{code}.no_new_entries and {code}.no_raised_caps"))
+            .collect();
+        format!("{} skipped", comparisons.join(", "))
+    };
+    // Name, base copy, finding codes, (code, position) of each skip, and
+    // the base's tables for instances that are not configured.
+    type Case<'a> = (
+        &'a str,
+        Option<&'a str>,
+        &'a [&'a str],
+        &'a [(&'a str, &'a str)],
+        &'a [&'a str],
+    );
+    let cases: &[Case] = &[
+        (
+            "the same entries and caps",
+            Some(
+                "[pattern_ratchet.old]\n\"crates/a/src/listed.rs\" = 2\n\"crates/a/src/kept.rs\" = 1\n",
+            ),
+            &[],
+            &[],
+            &[],
+        ),
+        (
+            "a new entry",
+            Some("[pattern_ratchet.old]\n\"crates/a/src/kept.rs\" = 1\n"),
+            &[new],
+            &[],
+            &[],
+        ),
+        (
+            "a raised cap",
+            Some(
+                "[pattern_ratchet.old]\n\"crates/a/src/listed.rs\" = 1\n\"crates/a/src/kept.rs\" = 1\n",
+            ),
+            &[raised],
+            &[],
+            &[],
+        ),
+        (
+            "a lowered cap and a removed entry",
+            Some(
+                "[pattern_ratchet.old]\n\"crates/a/src/listed.rs\" = 3\n\"crates/a/src/kept.rs\" = 1\n\
+                 \"crates/a/src/gone.rs\" = 4\n",
+            ),
+            &[],
+            &[],
+            &[],
+        ),
+        (
+            "no table for the instance",
+            Some("[file_size]\n"),
+            &[new, new],
+            &[],
+            &[],
+        ),
+        (
+            "the instance renamed: the old name's table is ignored",
+            Some(
+                "[pattern_ratchet.older]\n\"crates/a/src/listed.rs\" = 2\n\"crates/a/src/kept.rs\" = 1\n",
+            ),
+            &[new, new],
+            &[],
+            &["older"],
+        ),
+        (
+            "a table that does not parse, for an instance not configured",
+            Some(
+                "[pattern_ratchet.gone]\n\"x\" = \"1\"\n[pattern_ratchet.old]\n\
+                 \"crates/a/src/listed.rs\" = 2\n\"crates/a/src/kept.rs\" = 1\n",
+            ),
+            &[],
+            &[],
+            &["gone"],
+        ),
+        (
+            "the instance's table does not parse",
+            Some(
+                "[pattern_ratchet.old]\n\"crates/a/src/kept.rs\" = 1\n\"crates/a/src/listed.rs\" = \"2\"\n",
+            ),
+            &[],
+            &[("pattern_ratchet.old", "at line 3")],
+            &[],
+        ),
+        (
+            "[file_size] does not parse: only file_size is skipped",
+            Some("[file_size]\n\"x\" = -1\n[pattern_ratchet.old]\n\"crates/a/src/kept.rs\" = 1\n"),
+            &[new],
+            &[("file_size", "at line 2")],
+            &[],
+        ),
+        (
+            "pattern_ratchet is not a table",
+            Some("pattern_ratchet = 3\n"),
+            &[],
+            &[("pattern_ratchet.old", "at line 1")],
+            &[],
+        ),
+        (
+            "the instance is not a table",
+            Some("[pattern_ratchet]\nold = 3\n"),
+            &[],
+            &[("pattern_ratchet.old", "at line 2")],
+            &[],
+        ),
+        (
+            "not TOML",
+            Some("[pattern_ratchet\n"),
+            &[],
+            // One line for both tables, not one each.
+            &[("file_size, pattern_ratchet.old", "at line 1")],
+            &[],
+        ),
+        (
+            "no --base-baseline",
+            None,
+            &[],
+            &[("file_size", ""), ("pattern_ratchet.old", "")],
+            &[],
+        ),
+    ];
+    for (name, base, expected, problems, ignored) in cases {
+        let ws = workspace(&[
+            ("ARCHITECTURE.toml", old_tables_config(ADVISORY)),
+            (
+                "architecture-baseline.toml",
+                ratchet_baseline(&[("old", &[(LISTED, 2), ("crates/a/src/kept.rs", 1)])]),
+            ),
+            (LISTED, "old_table\nold_log\n".to_owned()),
+            ("crates/a/src/kept.rs", "old_table\n".to_owned()),
+        ]);
+
+        let ctx = load(ws.path(), *base);
+
+        let found: Vec<String> = check(&ctx).iter().map(|finding| finding.code()).collect();
+        assert_eq!(found, *expected, "{name}");
+        let path = ws.path().join("base-baseline.toml");
+        let (info, skipped): (Vec<String>, Vec<String>) = skipped(&ctx)
+            .into_iter()
+            .partition(|line| line.starts_with("base baseline has "));
+        let expected_info: Vec<String> = ignored
+            .iter()
+            .map(|instance| {
+                format!(
+                    "base baseline has [pattern_ratchet.{instance}], which is not configured; \
+                     skipped"
+                )
+            })
+            .collect();
+        assert_eq!(info, expected_info, "{name}");
+        assert_eq!(skipped.len(), problems.len(), "{name}: {skipped:?}");
+        for (line, (code, at)) in skipped.iter().zip(*problems) {
+            match base {
+                None => assert_eq!(
+                    *line,
+                    format!("{} (no --base-baseline given)", both(code)),
+                    "{name}"
+                ),
+                Some(_) => assert!(
+                    line.starts_with(&format!(
+                        "warning: could not parse {} {at}: ",
+                        path.display()
+                    )) && line.ends_with(&format!("; {}", both(code)))
+                        && !line.contains('\n'),
+                    "{name}: {line}"
+                ),
+            }
+        }
+    }
+
+    // The messages, for a new entry and a raised cap.
+    let ws = workspace(&[
+        ("ARCHITECTURE.toml", old_tables_config(ADVISORY)),
+        (
+            "architecture-baseline.toml",
+            ratchet_baseline(&[("old", &[(LISTED, 2), ("crates/a/src/kept.rs", 1)])]),
+        ),
+        (LISTED, "old_table\nold_log\n".to_owned()),
+        ("crates/a/src/kept.rs", "old_table\n".to_owned()),
+    ]);
+    let found = findings_against(
+        ws.path(),
+        Some("[pattern_ratchet.old]\n\"crates/a/src/listed.rs\" = 1\n"),
+    );
+    assert_eq!(
+        found,
+        [
+            (
+                "no_new_entries",
+                "crates/a/src/kept.rs is in [pattern_ratchet.old] in architecture-baseline.toml \
+                 but not in the base branch's copy; files outside the paths \
+                 [rules.pattern_ratchet.old] in ARCHITECTURE.toml allows can't be added (a \
+                 renamed file counts as added). Move that code behind an allowed path instead."
+                    .to_owned()
+            ),
+            (
+                "no_raised_caps",
+                "crates/a/src/listed.rs: cap raised from 1 to 2 in [pattern_ratchet.old] in \
+                 architecture-baseline.toml; caps should only go down. Move that code behind an \
+                 allowed path instead."
+                    .to_owned()
+            ),
+        ]
+    );
+}
+
+/// Each instance reads only its own patterns, allowed paths, modes and
+/// baseline table, and reports under its own code.
+#[test]
+fn pattern_ratchet_instances_are_independent() {
+    let files = |w: &str| {
+        vec![
+            (
+                "ARCHITECTURE.toml",
+                format!(
+                    "{}{}{}",
+                    config(ADVISORY),
+                    ratchet("alpha", &[r"\balpha_table\b"], &["crates/a/**"], ADVISORY,),
+                    ratchet(
+                        "beta",
+                        &[r"\bbeta_table\b"],
+                        &["crates/a/src/beta_home.rs"],
+                        ["advisory", "advisory", "advisory", "required", "advisory"],
+                    ),
+                ),
+            ),
+            (
+                "architecture-baseline.toml",
+                ratchet_baseline(&[
+                    ("alpha", &[("crates/b/src/y.rs", 3)]),
+                    ("beta", &[("crates/b/src/w.rs", 1)]),
+                ]),
+            ),
+            // alpha allows it; beta does not.
+            (
+                "crates/a/src/x.rs",
+                "alpha_table\nbeta_table\nbeta_table\n".to_owned(),
+            ),
+            // At alpha's cap; alpha's entry does not cover beta.
+            (
+                "crates/b/src/y.rs",
+                "alpha_table\nalpha_table\nalpha_table\nbeta_table\n".to_owned(),
+            ),
+            ("crates/b/src/z.rs", "alpha_table\n".to_owned()),
+            ("crates/b/src/w.rs", w.to_owned()),
+        ]
+    };
+    let ws = workspace(&files("beta_table\nbeta_table\n"));
+
+    let run_grown = run(ws.path(), &[]);
+
+    assert_eq!(
+        run_grown.code, 1,
+        "{}{}",
+        run_grown.stdout, run_grown.stderr
+    );
+    let headings: Vec<&str> = run_grown
+        .stdout
+        .lines()
+        .filter(|line| line.starts_with("pattern_ratchet."))
+        .collect();
+    assert_eq!(
+        headings,
+        [
+            "pattern_ratchet.alpha.no_crossing (advisory):",
+            "pattern_ratchet.beta.no_crossing (advisory):",
+            "pattern_ratchet.beta.listed_no_growth (required):",
+        ]
+    );
+    let found: Vec<(String, String)> = ratchet_findings(ws.path())
+        .into_iter()
+        .map(|(code, message)| (code, message.split(" outside").next().unwrap().to_owned()))
+        .collect();
+    let finding = |code: &str, message: &str| (code.to_owned(), message.to_owned());
+    assert_eq!(
+        found,
+        [
+            finding(
+                "pattern_ratchet.alpha.no_crossing",
+                "crates/b/src/z.rs: 1 code line matches the alpha patterns, first on line 1,",
+            ),
+            finding(
+                "pattern_ratchet.beta.no_crossing",
+                "crates/a/src/x.rs: 2 code lines match the beta patterns, first on line 2,",
+            ),
+            finding(
+                "pattern_ratchet.beta.no_crossing",
+                "crates/b/src/y.rs: 1 code line matches the beta patterns, first on line 4,",
+            ),
+            finding(
+                "pattern_ratchet.beta.listed_no_growth",
+                "crates/b/src/w.rs grew from 1 to 2 code lines matching the beta patterns. Move \
+                 new matches behind an allowed path.",
+            ),
+        ]
+    );
+
+    // Without beta's required finding, alpha's advisory one does not fail.
+    let ws = workspace(&files("beta_table\n"));
+    let run_at_cap = run(ws.path(), &[]);
+    assert_eq!(
+        run_at_cap.code, 0,
+        "{}{}",
+        run_at_cap.stdout, run_at_cap.stderr
+    );
+    assert!(
+        run_at_cap
+            .stdout
+            .contains("pattern_ratchet.alpha.no_crossing (advisory):"),
+        "{}",
+        run_at_cap.stdout
+    );
+}
+
+/// `--write-baseline` updates every existing table of both rules, empty or
+/// not: an entry still matching gets its current count, an entry at zero,
+/// now allowed or whose file is gone is removed, and a matching file without
+/// an entry is listed, not added.
+#[test]
+fn pattern_ratchet_write_baseline() {
+    let ws = workspace(&[
+        (
+            "ARCHITECTURE.toml",
+            format!(
+                "{}{}",
+                old_tables_config(REQUIRED),
+                ratchet("unused", &[r"\bnowhere\b"], &[], REQUIRED,),
+            ),
+        ),
+        (
+            "architecture-baseline.toml",
+            "[file_size]\n\"crates/b/src/sub/big.rs\" = 6\n\
+             [pattern_ratchet.old]\n\"crates/a/src/z.rs\" = 1\n\"crates/a/src/one.rs\" = 3\n\
+             \"crates/a/src/none.rs\" = 1\n\"crates/a/src/allowed.rs\" = 1\n\
+             \"crates/a/src/gone.rs\" = 1\n\"crates/b/src/sub/big.rs\" = 2\n\
+             [pattern_ratchet.unused]\n"
+                .to_owned(),
+        ),
+        (
+            "crates/a/src/z.rs",
+            "old_table\n// old_log\nold_log\n".to_owned(),
+        ),
+        ("crates/a/src/one.rs", "old_log\n".to_owned()),
+        ("crates/a/src/none.rs", "old_tables\n".to_owned()),
+        ("crates/a/src/allowed.rs", "old_table\n".to_owned()),
+        ("crates/a/src/tests.rs", "old_table\n".to_owned()),
+        // Over the file_size limit, with matching lines.
+        (
+            "crates/b/src/sub/big.rs",
+            format!("old_table\nold_log\n{}", code(LIMIT)),
+        ),
+        ("crates/a/src/new.rs", "old_table\nOLD_LOG\n".to_owned()),
+    ]);
+
+    let wrote = run(ws.path(), &["--write-baseline"]);
+
+    assert_eq!(wrote.code, 0, "{}", wrote.stderr);
+    let output = write_output(&wrote.stdout);
+    assert_eq!(
+        output.not_added,
+        [
+            "not added: crates/a/src/new.rs (2 code lines matching the old patterns); move them \
+          behind an allowed path, or add an entry by hand if this is a deliberate exception"
+        ]
+    );
+    assert!(
+        output.summary.starts_with(
+            "archcheck: wrote 1 file_size, 3 pattern_ratchet.old, 0 pattern_ratchet.unused \
+             entries to "
+        ),
+        "{}",
+        wrote.stdout
+    );
+    assert_eq!(
+        output.entries,
+        format!(
+            "{}\"crates/a/src/new.rs\" = 2\n",
+            inside("pattern_ratchet.old")
+        )
+    );
+    let written = fs::read_to_string(ws.path().join("architecture-baseline.toml")).unwrap();
+    let body: String = written
+        .lines()
+        .filter(|line| !line.starts_with('#') && !line.is_empty())
+        .map(|line| format!("{line}\n"))
+        .collect();
+    assert_eq!(
+        body,
+        "[file_size]\n\"crates/b/src/sub/big.rs\" = 7\n[pattern_ratchet.old]\n\
+         \"crates/a/src/one.rs\" = 1\n\"crates/a/src/z.rs\" = 2\n\
+         \"crates/b/src/sub/big.rs\" = 2\n[pattern_ratchet.unused]\n"
+    );
+    // Only the file left out is still a finding.
+    let checked = run(ws.path(), &[]);
+    assert_eq!(checked.code, 1, "{}{}", checked.stdout, checked.stderr);
+    assert_eq!(codes(ws.path()), ["pattern_ratchet.old.no_crossing"]);
+}
+
+/// Neither form of `--write-baseline` creates the table of an instance the
+/// baseline has none for: its matching files are listed, with the table to
+/// add by hand, and the scoped form leaves the file alone.
+#[test]
+fn pattern_ratchet_write_creates_no_table() {
+    const BASELINE: &str = "architecture-baseline.toml";
+    let generated = "[file_size]\n[pattern_ratchet.old]\n\"crates/a/src/o.rs\" = 1\n";
+    let hint = "architecture-baseline.toml has no [pattern_ratchet.fresh] table; for a new \
+                instance, add the table and its entries by hand";
+    let not_added = [
+        format!("not added: crates/a/src/f.rs (1 code line matching the fresh patterns); {hint}"),
+        format!("not added: crates/b/src/g.rs (2 code lines matching the fresh patterns); {hint}"),
+    ];
+    let entries = "# add as a new table, header included, at the end of the file\n\
+                   [pattern_ratchet.fresh]\n\"crates/a/src/f.rs\" = 1\n\"crates/b/src/g.rs\" = 2\n";
+    for scoped in [false, true] {
+        let ws = workspace(&[
+            (
+                "ARCHITECTURE.toml",
+                format!(
+                    "{}{}",
+                    old_tables_config(ADVISORY),
+                    ratchet("fresh", &[r"\bfresh_table\b"], &[], ADVISORY),
+                ),
+            ),
+            (BASELINE, generated.to_owned()),
+            ("crates/a/src/o.rs", "old_table\n".to_owned()),
+            ("crates/a/src/f.rs", "fresh_table\n".to_owned()),
+            ("crates/b/src/g.rs", "fresh_table\nfresh_table\n".to_owned()),
+        ]);
+        let args: &[&str] = if scoped {
+            &["--write-baseline=pattern_ratchet.fresh"]
+        } else {
+            &["--write-baseline"]
+        };
+
+        let wrote = run(ws.path(), args);
+
+        assert_eq!(wrote.code, 0, "{args:?}: {}", wrote.stderr);
+        let output = write_output(&wrote.stdout);
+        assert_eq!(output.not_added, not_added, "{args:?}");
+        let summary = if scoped {
+            format!(
+                "archcheck: {} has no [pattern_ratchet.fresh] table, which only a hand edit \
+                 adds; left it alone",
+                ws.path().join(BASELINE).display()
+            )
+        } else {
+            format!(
+                "archcheck: wrote 0 file_size, 1 pattern_ratchet.old entries to {}",
+                ws.path().join(BASELINE).display()
+            )
+        };
+        assert_eq!(output.summary, summary, "{args:?}");
+        assert_eq!(output.entries, entries, "{args:?}");
+        let written = fs::read_to_string(ws.path().join(BASELINE)).unwrap();
+        assert!(
+            !written.contains("[pattern_ratchet.fresh]"),
+            "{args:?}: {written}"
+        );
+        if scoped {
+            assert_eq!(written, generated);
+        }
+        assert_eq!(
+            codes(ws.path()),
+            [
+                "pattern_ratchet.fresh.no_crossing",
+                "pattern_ratchet.fresh.no_crossing"
+            ],
+            "{args:?}"
+        );
+
+        // The listed entries, pasted as a new table, are what the instance
+        // then tolerates.
+        fs::write(ws.path().join(BASELINE), paste_entries(&written, entries)).unwrap();
+        assert_eq!(codes(ws.path()), Vec::<String>::new(), "{args:?}");
+    }
+}
+
+/// `no_crossing`, `listed_no_growth` and a shrank `stale_entries` point at
+/// the file's first matching line, and a `stale_entries` for a file without
+/// matches at its line 1, so that a pull request changing only the file sees
+/// them; `no_new_entries`, `no_raised_caps` and a `stale_entries` for a file
+/// that is gone point at the entry's line in the baseline.
+#[test]
+fn pattern_ratchet_rdjson() {
+    let mut modes = ADVISORY;
+    modes[0] = "required";
+    let ws = workspace(&[
+        ("ARCHITECTURE.toml", old_tables_config(modes)),
+        (
+            "architecture-baseline.toml",
+            "[file_size]\n\n[pattern_ratchet.old]\n\"crates/a/src/grew.rs\" = 1\n\
+             'crates/a/src/gone.rs' = 3\n\"crates/a/src/shrank.rs\" = 3\n\
+             \"crates/a/src/none.rs\" = 1\n"
+                .to_owned(),
+        ),
+        (
+            "crates/a/src/grew.rs",
+            "fn f() {}\nold_table\nold_log\n".to_owned(),
+        ),
+        ("crates/a/src/shrank.rs", "\nold_table\n".to_owned()),
+        ("crates/a/src/none.rs", "old_tables\n".to_owned()),
+        (
+            "crates/b/src/sub/new.rs",
+            "fn f() {}\n// old_table\nold_log\n".to_owned(),
+        ),
+    ]);
+    let base = "[pattern_ratchet.old]\n\"crates/a/src/grew.rs\" = 1\n\
+                \"crates/a/src/gone.rs\" = 3\n\"crates/a/src/shrank.rs\" = 2\n";
+
+    let document = rdjson(ws.path(), Some(base));
+
+    let found: Vec<(&str, &str, u64, &str)> = document["diagnostics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|diagnostic| {
+            (
+                diagnostic["code"]["value"].as_str().unwrap(),
+                diagnostic["location"]["path"].as_str().unwrap(),
+                diagnostic["location"]["range"]["start"]["line"]
+                    .as_u64()
+                    .unwrap(),
+                diagnostic["severity"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    const BASELINE: &str = "architecture-baseline.toml";
+    assert_eq!(
+        found,
+        [
+            (
+                "pattern_ratchet.old.no_crossing",
+                "crates/b/src/sub/new.rs",
+                3,
+                "ERROR"
+            ),
+            ("pattern_ratchet.old.no_new_entries", BASELINE, 7, "WARNING"),
+            ("pattern_ratchet.old.no_raised_caps", BASELINE, 6, "WARNING"),
+            (
+                "pattern_ratchet.old.listed_no_growth",
+                "crates/a/src/grew.rs",
+                2,
+                "WARNING"
+            ),
+            ("pattern_ratchet.old.stale_entries", BASELINE, 5, "WARNING"),
+            (
+                "pattern_ratchet.old.stale_entries",
+                "crates/a/src/none.rs",
+                1,
+                "WARNING"
+            ),
+            (
+                "pattern_ratchet.old.stale_entries",
+                "crates/a/src/shrank.rs",
+                2,
+                "WARNING"
+            ),
+        ]
+    );
+}
+
+/// The `[name]` table of a baseline file, from its header line up to the
+/// next table's.
+fn table_section(text: &str, name: &str) -> String {
+    let header = format!("[{name}]");
+    let mut lines = text
+        .split_inclusive('\n')
+        .skip_while(|line| line.trim_end() != header);
+    let first = lines.next().expect("the baseline has the table");
+    let rest = lines.take_while(|line| !line.starts_with('['));
+    std::iter::once(first).chain(rest).collect()
+}
+
+/// The codes of every finding, in reporting order.
+fn codes(root: &Path) -> Vec<String> {
+    check(&Context::load(root).expect("the workspace loads"))
+        .iter()
+        .map(|finding| finding.code())
+        .collect()
+}
+
+/// `--write-baseline=<table>` updates only that table, listing only its
+/// files left out; the others stay byte for byte as they were, drifted caps
+/// included.
+#[test]
+fn pattern_ratchet_scoped_write_baseline() {
+    const BASELINE: &str = "architecture-baseline.toml";
+    let ws = workspace(&[
+        (
+            "ARCHITECTURE.toml",
+            format!(
+                "{}{}",
+                old_tables_config(ADVISORY),
+                ratchet("other", &[r"\bother_table\b"], &[], ADVISORY,),
+            ),
+        ),
+        (
+            BASELINE,
+            "[file_size]\n\"crates/a/src/big.rs\" = 6\n\
+             [pattern_ratchet.old]\n\"crates/a/src/shrinks.rs\" = 2\n\
+             [pattern_ratchet.other]\n\"crates/b/src/sub/o.rs\" = 1\n"
+                .to_owned(),
+        ),
+        ("crates/a/src/big.rs", code(LIMIT + 1)),
+        ("crates/a/src/shrinks.rs", "old_table\nold_log\n".to_owned()),
+        ("crates/b/src/sub/o.rs", "other_table\n".to_owned()),
+    ]);
+    // In generated form, so that kept tables can be compared byte for byte.
+    let generated = run(ws.path(), &["--write-baseline"]);
+    assert_eq!(generated.code, 0, "{}", generated.stderr);
+    assert!(
+        generated.stdout.starts_with(
+            "archcheck: wrote 1 file_size, 1 pattern_ratchet.old, 1 pattern_ratchet.other \
+             entries to "
+        ),
+        "{}",
+        generated.stdout
+    );
+    // Every table drifts: big.rs grows past its cap, shrinks.rs loses a
+    // matching line, a new file matches `old`, o.rs gains an `other` line,
+    // and a new file is over the limit.
+    fs::write(ws.path().join("crates/a/src/big.rs"), code(LIMIT + 3)).unwrap();
+    fs::write(ws.path().join("crates/a/src/shrinks.rs"), "old_table\n").unwrap();
+    fs::write(ws.path().join("crates/b/src/sub/new.rs"), "old_log\n").unwrap();
+    fs::write(
+        ws.path().join("crates/b/src/sub/o.rs"),
+        "other_table\nother_table\n",
+    )
+    .unwrap();
+    fs::write(ws.path().join("crates/a/src/huge.rs"), code(LIMIT + 2)).unwrap();
+    let before = fs::read_to_string(ws.path().join(BASELINE)).unwrap();
+    assert_eq!(
+        table_section(&before, "file_size"),
+        "[file_size]\n\"crates/a/src/big.rs\" = 6\n\n"
+    );
+
+    let wrote = run(ws.path(), &["--write-baseline=pattern_ratchet.old"]);
+
+    assert_eq!(wrote.code, 0, "{}", wrote.stderr);
+    let output = write_output(&wrote.stdout);
+    assert_eq!(
+        output.not_added,
+        [
+            "not added: crates/b/src/sub/new.rs (1 code line matching the old patterns); move \
+          them behind an allowed path, or add an entry by hand if this is a deliberate exception"
+        ]
+    );
+    assert!(
+        output
+            .summary
+            .starts_with("archcheck: wrote 1 pattern_ratchet.old entries to ")
+            && output.summary.ends_with("; other tables kept"),
+        "{}",
+        wrote.stdout
+    );
+    assert_eq!(
+        output.entries,
+        format!(
+            "{}\"crates/b/src/sub/new.rs\" = 1\n",
+            inside("pattern_ratchet.old")
+        )
+    );
+    let after = fs::read_to_string(ws.path().join(BASELINE)).unwrap();
+    assert_eq!(
+        table_section(&after, "pattern_ratchet.old"),
+        "[pattern_ratchet.old]\n\"crates/a/src/shrinks.rs\" = 1\n\n"
+    );
+    for kept in ["file_size", "pattern_ratchet.other"] {
+        assert_eq!(table_section(&after, kept), table_section(&before, kept));
+    }
+    assert_eq!(
+        codes(ws.path()),
+        [
+            "file_size.no_crossing",
+            "file_size.listed_no_growth",
+            "pattern_ratchet.old.no_crossing",
+            "pattern_ratchet.other.listed_no_growth"
+        ]
+    );
+
+    // The other way round, with `old` drifted again: file_size is
+    // updated and both instance tables are kept.
+    fs::write(
+        ws.path().join("crates/a/src/shrinks.rs"),
+        "old_table\nold_log\n",
+    )
+    .unwrap();
+    let wrote = run(ws.path(), &["--write-baseline=file_size"]);
+    assert_eq!(wrote.code, 0, "{}", wrote.stderr);
+    let output = write_output(&wrote.stdout);
+    assert_eq!(
+        output.not_added,
+        [
+            "not added: crates/a/src/huge.rs (7 code lines); split it, or add an entry by hand if \
+          this is a deliberate exception"
+        ]
+    );
+    assert!(
+        output
+            .summary
+            .starts_with("archcheck: wrote 1 file_size entries to "),
+        "{}",
+        wrote.stdout
+    );
+    assert_eq!(
+        output.entries,
+        format!("{}\"crates/a/src/huge.rs\" = 7\n", inside("file_size"))
+    );
+    let after_file_size = fs::read_to_string(ws.path().join(BASELINE)).unwrap();
+    assert_eq!(
+        table_section(&after_file_size, "file_size"),
+        "[file_size]\n\"crates/a/src/big.rs\" = 8\n\n"
+    );
+    for kept in ["pattern_ratchet.old", "pattern_ratchet.other"] {
+        assert_eq!(
+            table_section(&after_file_size, kept),
+            table_section(&after, kept)
+        );
+    }
+    assert_eq!(
+        codes(ws.path()),
+        [
+            "file_size.no_crossing",
+            "pattern_ratchet.old.no_crossing",
+            "pattern_ratchet.old.listed_no_growth",
+            "pattern_ratchet.other.listed_no_growth"
+        ]
+    );
+
+    // An unknown table, or a baseline that does not parse, exits 2 and
+    // leaves the file alone.
+    for table in ["pattern_ratchet.nope", "file_sizes", "pattern_ratchet", ""] {
+        let failed = run(ws.path(), &[&format!("--write-baseline={table}")]);
+        assert_eq!(failed.code, 2, "{table}: {}", failed.stdout);
+        assert!(
+            failed.stderr.starts_with(&format!(
+                "archcheck: error: no baseline table {table:?}; expected one of: file_size, \
+                 pattern_ratchet.old, pattern_ratchet.other"
+            )),
+            "{table}: {}",
+            failed.stderr
+        );
+        assert_eq!(
+            fs::read_to_string(ws.path().join(BASELINE)).unwrap(),
+            after_file_size
+        );
+    }
+    fs::write(ws.path().join(BASELINE), "not toml").unwrap();
+    let failed = run(ws.path(), &["--write-baseline=file_size"]);
+    assert_eq!(failed.code, 2, "{}", failed.stdout);
+    assert!(
+        failed.stderr.contains("could not parse"),
+        "{}",
+        failed.stderr
+    );
+    assert_eq!(
+        fs::read_to_string(ws.path().join(BASELINE)).unwrap(),
+        "not toml"
+    );
+}
+
+/// A scoped write of an existing but empty table updates it like any other,
+/// so it stays empty and a matching file is listed, not added, with entries
+/// to paste inside that table. It is not the last table, so entries pasted
+/// at the end of the file would land in another one.
+#[test]
+fn pattern_ratchet_scoped_write_keeps_an_empty_table() {
+    const BASELINE: &str = "architecture-baseline.toml";
+    let ws = workspace(&[
+        (
+            "ARCHITECTURE.toml",
+            format!(
+                "{}{}",
+                old_tables_config(REQUIRED),
+                ratchet("other", &[r"\bother_table\b"], &[], REQUIRED),
+            ),
+        ),
+        (
+            BASELINE,
+            "[file_size]\n[pattern_ratchet.old]\n[pattern_ratchet.other]\n".to_owned(),
+        ),
+        ("crates/a/src/n.rs", "old_table\n".to_owned()),
+    ]);
+
+    let wrote = run(ws.path(), &["--write-baseline=pattern_ratchet.old"]);
+
+    assert_eq!(wrote.code, 0, "{}", wrote.stderr);
+    let output = write_output(&wrote.stdout);
+    assert_eq!(
+        output.not_added,
+        [
+            "not added: crates/a/src/n.rs (1 code line matching the old patterns); move them \
+          behind an allowed path, or add an entry by hand if this is a deliberate exception"
+        ]
+    );
+    assert!(
+        output
+            .summary
+            .starts_with("archcheck: wrote 0 pattern_ratchet.old entries to ")
+            && output.summary.ends_with("; other tables kept"),
+        "{}",
+        wrote.stdout
+    );
+    assert_eq!(
+        output.entries,
+        format!(
+            "{}\"crates/a/src/n.rs\" = 1\n",
+            inside("pattern_ratchet.old")
+        )
+    );
+    let after = fs::read_to_string(ws.path().join(BASELINE)).unwrap();
+    assert_eq!(
+        table_section(&after, "pattern_ratchet.old"),
+        "[pattern_ratchet.old]\n\n"
+    );
+    assert!(after.ends_with("[pattern_ratchet.other]\n"), "{after}");
+    assert_eq!(codes(ws.path()), ["pattern_ratchet.old.no_crossing"]);
+
+    // Pasted inside the existing table, as the comment says, the entries
+    // parse and are what that table then tolerates.
+    fs::write(
+        ws.path().join(BASELINE),
+        paste_entries(&after, &output.entries),
+    )
+    .unwrap();
+    assert_eq!(codes(ws.path()), Vec::<String>::new());
+}
+
+/// The unscoped write lists the entries of every table, each block saying
+/// where it goes; pasted there, each lands in its own table, though the
+/// tables they name are first, in the middle and missing, not last.
+#[test]
+fn write_baseline_entries_paste_into_their_tables() {
+    const BASELINE: &str = "architecture-baseline.toml";
+    let ws = workspace(&[
+        (
+            "ARCHITECTURE.toml",
+            format!(
+                "{}{}{}",
+                old_tables_config(REQUIRED),
+                ratchet("fresh", &[r"\bfresh_table\b"], &[], REQUIRED),
+                ratchet("zz", &[r"\bzz_table\b"], &[], REQUIRED),
+            ),
+        ),
+        (
+            BASELINE,
+            "[file_size]\n\"crates/a/src/big.rs\" = 6\n[pattern_ratchet.old]\n\
+             \"crates/a/src/o.rs\" = 1\n[pattern_ratchet.zz]\n\"crates/a/src/z.rs\" = 1\n"
+                .to_owned(),
+        ),
+        ("crates/a/src/big.rs", code(6)),
+        ("crates/a/src/huge.rs", code(7)),
+        ("crates/a/src/o.rs", "old_table\n".to_owned()),
+        ("crates/a/src/n.rs", "old_table\n".to_owned()),
+        ("crates/a/src/z.rs", "zz_table\n".to_owned()),
+        ("crates/a/src/f.rs", "fresh_table\n".to_owned()),
+    ]);
+
+    let wrote = run(ws.path(), &["--write-baseline"]);
+
+    assert_eq!(wrote.code, 0, "{}", wrote.stderr);
+    let output = write_output(&wrote.stdout);
+    assert_eq!(output.not_added.len(), 3, "{}", wrote.stdout);
+    assert_eq!(
+        output.entries,
+        format!(
+            "{}\"crates/a/src/huge.rs\" = 7\n\
+             # add as a new table, header included, at the end of the file\n\
+             [pattern_ratchet.fresh]\n\"crates/a/src/f.rs\" = 1\n\
+             {}\"crates/a/src/n.rs\" = 1\n",
+            inside("file_size"),
+            inside("pattern_ratchet.old"),
+        )
+    );
+    let written = fs::read_to_string(ws.path().join(BASELINE)).unwrap();
+    assert_eq!(
+        codes(ws.path()),
+        [
+            "file_size.no_crossing",
+            "pattern_ratchet.fresh.no_crossing",
+            "pattern_ratchet.old.no_crossing"
+        ]
+    );
+
+    fs::write(
+        ws.path().join(BASELINE),
+        paste_entries(&written, &output.entries),
+    )
+    .unwrap();
+    assert_eq!(codes(ws.path()), Vec::<String>::new());
+    let pasted = Baseline::load(&ws.path().join(BASELINE)).expect("the pasted baseline loads");
+    assert_eq!(
+        pasted.table_names(),
+        [
+            "file_size",
+            "pattern_ratchet.fresh",
+            "pattern_ratchet.old",
+            "pattern_ratchet.zz"
+        ]
+    );
+    assert_eq!(
+        pasted
+            .table("pattern_ratchet.zz")
+            .unwrap()
+            .keys()
+            .collect::<Vec<_>>(),
+        ["crates/a/src/z.rs"]
+    );
+}
+
+/// Either form of `--write-baseline` refuses, exits 2 and leaves the file
+/// alone when the existing baseline has a table for an instance that is no
+/// longer configured, or does not exist.
+#[test]
+fn pattern_ratchet_write_baseline_errors() {
+    const BASELINE: &str = "architecture-baseline.toml";
+    let stale = "[file_size]\n[pattern_ratchet.foo]\n\"crates/a/src/x.rs\" = 1\n";
+    let ws = workspace(&[
+        (
+            "ARCHITECTURE.toml",
+            format!(
+                "{}{}",
+                config(ADVISORY),
+                ratchet("bar", &[r"\bold_table\b"], &[], ADVISORY,),
+            ),
+        ),
+        (BASELINE, stale.to_owned()),
+        ("crates/a/src/x.rs", "old_table\n".to_owned()),
+    ]);
+    let forms: [&[&str]; 2] = [
+        &["--write-baseline=pattern_ratchet.bar"],
+        &["--write-baseline"],
+    ];
+
+    for args in forms {
+        let renamed = run(ws.path(), args);
+
+        assert_eq!(renamed.code, 2, "{args:?}: {}", renamed.stdout);
+        assert!(
+            renamed.stderr.contains(
+                "[pattern_ratchet.foo] names no instance in ARCHITECTURE.toml; remove that \
+                 table, or rename it if the instance was renamed"
+            ),
+            "{args:?}: {}",
+            renamed.stderr
+        );
+        assert_eq!(fs::read_to_string(ws.path().join(BASELINE)).unwrap(), stale);
+    }
+
+    fs::remove_file(ws.path().join(BASELINE)).unwrap();
+    for args in forms {
+        let missing = run(ws.path(), args);
+        assert_eq!(missing.code, 2, "{args:?}: {}", missing.stdout);
+        assert!(
+            missing
+                .stderr
+                .starts_with("archcheck: error: could not read ")
+                && missing.stderr.contains("architecture-baseline.toml"),
+            "{args:?}: {}",
+            missing.stderr
+        );
+        assert!(!ws.path().join(BASELINE).exists(), "{args:?}");
+    }
+}
+
+/// A table is only taken as `--write-baseline=<table>`: `--write-baseline`
+/// alone is the unscoped write, whatever follows it, and an argument after it
+/// that is not a flag is an error rather than a table, with a hint unless
+/// `=` already named one.
+#[test]
+fn write_baseline_takes_a_table_only_after_equals() {
+    let ws = workspace(&[("ARCHITECTURE.toml", old_tables_config(ADVISORY))]);
+    let baseline = ws.path().join("architecture-baseline.toml");
+    let archcheck = |args: &[&std::ffi::OsStr]| {
+        let output = Command::new(env!("CARGO_BIN_EXE_archcheck"))
+            .args(args)
+            .output()
+            .expect("run archcheck");
+        Run {
+            code: output.status.code().expect("an exit status"),
+            stdout: String::from_utf8(output.stdout).expect("UTF-8 stdout"),
+            stderr: String::from_utf8(output.stderr).expect("UTF-8 stderr"),
+        }
+    };
+
+    for table in ["file_size", "pattern_ratchet.old"] {
+        let before = fs::read_to_string(&baseline).unwrap();
+        let failed = run(ws.path(), &["--write-baseline", table]);
+        assert_eq!(failed.code, 2, "{table}: {}", failed.stdout);
+        assert!(
+            failed.stderr.starts_with(&format!(
+                "archcheck: unexpected argument {table:?}; name a table as \
+                 --write-baseline={table}\nusage: archcheck "
+            )),
+            "{table}: {}",
+            failed.stderr
+        );
+        assert_eq!(failed.stdout, "", "{table}");
+        assert_eq!(fs::read_to_string(&baseline).unwrap(), before, "{table}");
+    }
+    let before = fs::read_to_string(&baseline).unwrap();
+    let failed = run(ws.path(), &["--write-baseline=file_size", "extra"]);
+    assert_eq!(failed.code, 2, "{}", failed.stdout);
+    assert!(
+        failed
+            .stderr
+            .starts_with("archcheck: unexpected argument \"extra\"\nusage: archcheck "),
+        "{}",
+        failed.stderr
+    );
+    assert_eq!(fs::read_to_string(&baseline).unwrap(), before);
+
+    let unscoped = [
+        archcheck(&[
+            "--root".as_ref(),
+            ws.path().as_os_str(),
+            "--write-baseline".as_ref(),
+            "--format".as_ref(),
+            "human".as_ref(),
+        ]),
+        archcheck(&[
+            "--write-baseline".as_ref(),
+            "--root".as_ref(),
+            ws.path().as_os_str(),
+        ]),
+    ];
+    for run in unscoped {
+        assert_eq!(run.code, 0, "{}", run.stderr);
+        assert!(
+            run.stdout
+                .starts_with("archcheck: wrote 0 file_size entries to ")
+                && !run.stdout.contains("other tables kept"),
+            "{}",
+            run.stdout
+        );
+    }
+}
+
+/// A configured instance without a baseline table tolerates nothing, as with
+/// an empty table.
+#[test]
+fn pattern_ratchet_without_a_baseline_table() {
+    for (text, expected) in [("old_table\n", 1), ("old_tables\n", 0)] {
+        let found = |baseline: String| {
+            let ws = workspace(&[
+                ("ARCHITECTURE.toml", old_tables_config(ADVISORY)),
+                ("architecture-baseline.toml", baseline),
+                ("crates/b/src/sub/new.rs", text.to_owned()),
+            ]);
+            ratchet_findings(ws.path())
+        };
+
+        let without_table = found(baseline(&[]));
+
+        assert_eq!(
+            without_table.len(),
+            expected,
+            "{text:?}: {without_table:#?}"
+        );
+        assert!(
+            without_table
+                .iter()
+                .all(|(code, _)| code == "pattern_ratchet.old.no_crossing")
+        );
+        assert_eq!(without_table, found(ratchet_baseline(&[("old", &[])])));
+    }
+}
+
+/// Instance names are lowercase ASCII letters, digits and underscores,
+/// starting with a letter.
+#[test]
+fn pattern_ratchet_instance_names() {
+    let cases = [
+        ("a", true),
+        ("a_2", true),
+        ("old_tables", true),
+        ("a-b", false),
+        ("2a", false),
+        ("", false),
+        ("A", false),
+        ("a.b", false),
+        ("_a", false),
+    ];
+    for (name, accepted) in cases {
+        let ws = workspace(&[(
+            "ARCHITECTURE.toml",
+            format!(
+                "{}{}",
+                config(ADVISORY),
+                ratchet(&format!("{name:?}"), &["x"], &[], ADVISORY,),
+            ),
+        )]);
+
+        let loaded = Context::load(ws.path());
+
+        match loaded {
+            Ok(_) => assert!(accepted, "{name:?} was accepted"),
+            Err(error) => {
+                let error = error.to_string();
+                assert!(!accepted, "{name:?}: {error}");
+                assert!(
+                    error.contains(&format!("instance name {name:?} must be")),
+                    "{name:?}: {error}"
+                );
+            }
+        }
+    }
+}
+
+/// An invalid regex or glob is reported at its line and column in
+/// `ARCHITECTURE.toml`.
+#[test]
+fn pattern_ratchet_errors_point_at_the_line() {
+    let cases = [
+        (
+            &["(old_table"][..],
+            &[][..],
+            "patterns",
+            "regex parse error",
+        ),
+        (
+            &["old_table"][..],
+            &["crates/{a"][..],
+            "allow",
+            "error parsing glob",
+        ),
+    ];
+    for (patterns, allow, key, problem) in cases {
+        let text = format!(
+            "{}{}",
+            config(ADVISORY),
+            ratchet("old", patterns, allow, ADVISORY),
+        );
+        let line = 1 + text
+            .lines()
+            .position(|line| line.starts_with(&format!("{key} = ")))
+            .unwrap();
+        let column = key.len() + " = ".len() + 1;
+        let ws = workspace(&[("ARCHITECTURE.toml", text)]);
+
+        let error = Context::load(ws.path()).unwrap_err().to_string();
+
+        assert!(
+            error.contains(&format!("at line {line}, column {column}")),
+            "{key}: {error}"
+        );
+        assert!(error.contains(problem), "{key}: {error}");
+    }
 }

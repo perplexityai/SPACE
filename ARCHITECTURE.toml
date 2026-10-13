@@ -17,3 +17,32 @@ mode = "advisory"
 
 [rules.file_size.stale_entries]       # entries whose file shrank, fell under the limit, or is gone
 mode = "advisory"
+
+# Direct-only control-plane Postgres tables belong to the Direct substrate;
+# existing users outside it are baselined until moved behind it. Postgres folds
+# unquoted identifiers, so the names match in any case.
+[rules.pattern_ratchet.direct_tables]
+patterns = [
+  '(?i)\bnode_direct\b',
+  '(?i)\bsandbox_direct_route_identities\b',
+  '(?i)\bsandbox_direct_route_provenance\b',
+]
+allow = [
+  "crates/libs/api/src/controllers/substrate/direct.rs",
+  "crates/libs/api/src/controllers/substrate/direct/**",
+]
+
+[rules.pattern_ratchet.direct_tables.no_crossing]       # only allowed and listed files may match
+mode = "advisory"
+
+[rules.pattern_ratchet.direct_tables.no_new_entries]    # a pull request may not add entries to the baseline
+mode = "advisory"
+
+[rules.pattern_ratchet.direct_tables.no_raised_caps]    # a pull request may not raise a cap in the baseline
+mode = "advisory"
+
+[rules.pattern_ratchet.direct_tables.listed_no_growth]  # listed files may not gain matching lines
+mode = "advisory"
+
+[rules.pattern_ratchet.direct_tables.stale_entries]     # entries with fewer matches, none, or gone
+mode = "advisory"

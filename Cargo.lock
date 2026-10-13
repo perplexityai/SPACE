@@ -5019,6 +5019,8 @@ dependencies = [
 name = "pplx-space-archcheck"
 version = "0.8.0"
 dependencies = [
+ "globset",
+ "regex",
  "serde",
  "serde_json",
  "tempfile",
