@@ -71,6 +71,12 @@ spec:
       ports:
         - protocol: TCP
           port: 9800
+    # The dedicated admin API (space-admin-api, `--surface admin`) needs no
+    # rule: its sandbox actions only enqueue an operation
+    # (enqueue_admin_lifecycle_operation in
+    # crates/libs/api/src/routes/admin/sandboxes.rs), which the elected
+    # cluster-controller's dispatcher executes, and its reads come from the
+    # database (tracked_response, crates/libs/api/src/controllers/sandbox/queries.rs).
     # Nothing else dials a sandbox pod. internal-api and the data plane reach
     # the node's host-network node-api at the node's address
     # (node_api_backend_endpoint in
