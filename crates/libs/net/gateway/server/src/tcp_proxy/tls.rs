@@ -1,26 +1,21 @@
-//! Verified TLS transport. HTTP authorization owns every upstream I/O boundary.
+//! Verified TLS transport and ALPN. Callers authorize before establishing the origin.
 
 use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
 use rustls::pki_types::ServerName;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::net::TcpStream;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 use tracing::Instrument;
 
 use super::accounting::{Attempt, Outcome};
-use super::http_host::{HostBinding, MeteredIo};
-use super::{TcpProxy, relay, tls_http};
+use super::transport;
 use crate::certificates::{CertificateError, CertificateLease};
-use crate::egress::AdmittedTcp;
-use crate::stats::ProxyStats;
 use crate::tls_interception::{
-    Admission, HandshakePermit, Refused, TlsHandshakeLeg, TlsInterception, TlsInterceptionError,
+    Admission, HandshakePermit, Refused, TlsHandshakeLeg, TlsInterception,
 };
 use crate::tls_sni::{ClientAlpnOffer, HttpAlpn};
 
@@ -28,7 +23,7 @@ const HANDSHAKE_BUDGET: Duration = Duration::from_secs(10);
 
 // Display is safe for telemetry; Debug and source chains may contain guest names.
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum TlsTransportError {
+pub(super) enum TlsTransportError {
     #[error("TLS handshake capacity exhausted")]
     Capacity,
     #[error("TLS connection setup exceeded its ten-second deadline")]
@@ -54,33 +49,14 @@ pub(crate) enum TlsTransportError {
     Downstream(#[source] io::Error),
     #[error("upstream connect or TLS verification failed ({kind:?})", kind = .0.kind())]
     Upstream(#[source] io::Error),
-    #[error("HTTP connection failed")]
-    Http(#[from] hyper::Error),
-}
-
-// hyper-util's auto server erases the error type. Recover it at the boundary
-// to preserve HTTP diagnostics and socket error kinds.
-impl From<Box<dyn std::error::Error + Send + Sync>> for TlsTransportError {
-    fn from(error: Box<dyn std::error::Error + Send + Sync>) -> Self {
-        let error = match error.downcast::<hyper::Error>() {
-            Ok(error) => return Self::Http(*error),
-            Err(error) => error,
-        };
-        Self::Downstream(match error.downcast::<io::Error>() {
-            Ok(error) => *error,
-            Err(error) => io::Error::other(error),
-        })
-    }
+    #[error("origin TCP connect failed")]
+    Connect(#[from] transport::Error),
 }
 
 impl TlsTransportError {
     pub(super) fn record(&self, stage: &'static str) {
         let failure = self.failure();
-        let http = match self {
-            Self::Http(error) => HttpFailure::classify(error),
-            _ => HttpFailure::NOT_HTTP,
-        };
-        let io_kind = self.io_error().map(io::Error::kind).or(http.io_kind);
+        let io_kind = self.io_error().map(io::Error::kind);
         tracing::error!(
             telemetry_type = "gateway_boundary_failure",
             stage,
@@ -89,14 +65,11 @@ impl TlsTransportError {
             io_kind = ?io_kind,
             tls_alert = failure.alert,
             certificate_validation_reason = failure.certificate,
-            http_reason = http.reason,
-            h2_reason = http.h2_reason,
-            h2_origin = http.h2_origin,
             "inspected connection failed"
         );
     }
 
-    pub(crate) const fn as_str(&self) -> &'static str {
+    pub(super) const fn as_str(&self) -> &'static str {
         match self {
             Self::Capacity => "tls_capacity",
             Self::Timeout => "tls_timeout",
@@ -107,13 +80,15 @@ impl TlsTransportError {
             Self::Certificate(_) | Self::Configuration(_) => "tls_configuration_error",
             Self::Downstream(_) => "tls_downstream_error",
             Self::Upstream(_) => "tls_upstream_error",
-            Self::Http(_) => "http_connection_error",
+            Self::Connect(_) => "upstream_connect_error",
         }
     }
 
     fn io_error(&self) -> Option<&io::Error> {
         match self {
-            Self::Downstream(error) | Self::Upstream(error) => Some(error),
+            Self::Downstream(error)
+            | Self::Upstream(error)
+            | Self::Connect(transport::Error::Io(error)) => Some(error),
             _ => None,
         }
     }
@@ -128,115 +103,10 @@ impl TlsTransportError {
             Self::Protocol => TlsFailure::new("alpn_mismatch"),
             Self::Certificate(_) => TlsFailure::new("certificate_material"),
             Self::Configuration(_) => TlsFailure::new("configuration"),
-            Self::Downstream(error) | Self::Upstream(error) => {
-                tls_failure_from_io(error).unwrap_or_else(|| TlsFailure::new("io"))
-            }
-            Self::Http(_) => TlsFailure::new("http"),
+            Self::Downstream(_) | Self::Upstream(_) => TlsFailure::new("io"),
+            Self::Connect(transport::Error::Timeout) => TlsFailure::new("timeout"),
+            Self::Connect(transport::Error::Io(_)) => TlsFailure::new("io"),
         }
-    }
-}
-
-/// Bounded HTTP failure class. Hyper's `Display` and source chain can carry
-/// peer-supplied text, so only enum-like fields leave this type.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct HttpFailure {
-    pub(super) reason: &'static str,
-    /// Socket error kind found anywhere in the cause chain, including inside h2.
-    pub(super) io_kind: Option<io::ErrorKind>,
-    /// RFC 9113 error code, when HTTP/2 produced the failure.
-    pub(super) h2_reason: Option<&'static str>,
-    /// Who raised the HTTP/2 error: `remote` (peer frame), `local` (hyper/h2
-    /// user API) or `library` (h2 detected a peer protocol violation).
-    pub(super) h2_origin: Option<&'static str>,
-}
-
-impl HttpFailure {
-    const NOT_HTTP: Self = Self {
-        reason: "not_http",
-        io_kind: None,
-        h2_reason: None,
-        h2_origin: None,
-    };
-
-    /// Ordered from hyper's own predicates to cause-chain inspection so the
-    /// historical `parse`/`timeout`/`cancelled`/`incomplete_message`/`closed`
-    /// buckets keep their meaning; only the old `protocol` catch-all splits.
-    pub(super) fn classify(error: &hyper::Error) -> Self {
-        let h2 = cause::<h2::Error>(error);
-        let io_kind = cause::<io::Error>(error)
-            .or_else(|| h2.and_then(h2::Error::get_io))
-            .map(io::Error::kind);
-        let reason = if error.is_parse() {
-            "parse"
-        } else if error.is_timeout() {
-            "timeout"
-        } else if error.is_canceled() {
-            "cancelled"
-        } else if error.is_incomplete_message() {
-            "incomplete_message"
-        } else if error.is_closed() {
-            "closed"
-        } else if error.is_body_write_aborted() {
-            "body_write_aborted"
-        } else if error.is_shutdown() {
-            "shutdown"
-        } else if error.is_user() {
-            "user"
-        } else if h2.is_some() {
-            "h2"
-        } else if io_kind.is_some() {
-            "io"
-        } else {
-            "other"
-        };
-        Self {
-            reason,
-            io_kind,
-            h2_reason: h2.and_then(h2::Error::reason).map(h2_reason),
-            h2_origin: h2.map(|error| {
-                if error.is_remote() {
-                    "remote"
-                } else if error.is_library() {
-                    "library"
-                } else {
-                    "local"
-                }
-            }),
-        }
-    }
-}
-
-/// First error of type `T` in `error`'s source chain, including `error` itself.
-fn cause<'a, T: std::error::Error + 'static>(
-    error: &'a (dyn std::error::Error + 'static),
-) -> Option<&'a T> {
-    let mut current = Some(error);
-    while let Some(error) = current {
-        if let Some(found) = error.downcast_ref::<T>() {
-            return Some(found);
-        }
-        current = error.source();
-    }
-    None
-}
-
-const fn h2_reason(reason: h2::Reason) -> &'static str {
-    match reason {
-        h2::Reason::NO_ERROR => "no_error",
-        h2::Reason::PROTOCOL_ERROR => "protocol_error",
-        h2::Reason::INTERNAL_ERROR => "internal_error",
-        h2::Reason::FLOW_CONTROL_ERROR => "flow_control_error",
-        h2::Reason::SETTINGS_TIMEOUT => "settings_timeout",
-        h2::Reason::STREAM_CLOSED => "stream_closed",
-        h2::Reason::FRAME_SIZE_ERROR => "frame_size_error",
-        h2::Reason::REFUSED_STREAM => "refused_stream",
-        h2::Reason::CANCEL => "cancel",
-        h2::Reason::COMPRESSION_ERROR => "compression_error",
-        h2::Reason::CONNECT_ERROR => "connect_error",
-        h2::Reason::ENHANCE_YOUR_CALM => "enhance_your_calm",
-        h2::Reason::INADEQUATE_SECURITY => "inadequate_security",
-        h2::Reason::HTTP_1_1_REQUIRED => "http_1_1_required",
-        _ => "unknown",
     }
 }
 
@@ -260,120 +130,27 @@ impl TlsFailure {
     }
 }
 
-/// A peer's alert is the only signal that separates a guest refusing the
-/// interception CA from every other handshake failure, so the classes that
-/// name a trust decision have to reach metrics rather than logs alone.
-const fn alert_class(alert: rustls::AlertDescription) -> &'static str {
-    match alert {
-        rustls::AlertDescription::UnknownCA => "unknown_ca",
-        rustls::AlertDescription::BadCertificate => "bad_certificate",
-        rustls::AlertDescription::CertificateUnknown => "certificate_unknown",
-        rustls::AlertDescription::CertificateExpired => "certificate_expired",
-        rustls::AlertDescription::CertificateRevoked => "certificate_revoked",
-        rustls::AlertDescription::HandshakeFailure => "handshake_failure",
-        rustls::AlertDescription::ProtocolVersion => "protocol_version",
-        _ => "other",
+fn negotiated(alpn: Option<&[u8]>) -> Result<HttpAlpn, TlsTransportError> {
+    match selected_alpn(alpn)? {
+        // TLS clients predating ALPN still use HTTP/1.1. Hyper parses their
+        // application bytes; this never selects an opaque relay.
+        None | Some(HttpAlpn::Http1) => Ok(HttpAlpn::Http1),
+        Some(HttpAlpn::Http2) => Ok(HttpAlpn::Http2),
     }
 }
 
-fn tls_failure_from_io(error: &io::Error) -> Option<TlsFailure> {
-    error
-        .get_ref()?
-        .downcast_ref::<rustls::Error>()
-        .map(tls_failure_from_rustls)
-}
-
-fn tls_failure_from_rustls(error: &rustls::Error) -> TlsFailure {
-    match error {
-        rustls::Error::AlertReceived(alert) => TlsFailure {
-            reason: "peer_alert",
-            alert: alert.as_str().or(Some("unknown")),
-            alert_class: alert_class(*alert),
-            certificate: None,
-        },
-        rustls::Error::InvalidCertificate(certificate) => TlsFailure {
-            reason: certificate_reason(certificate),
-            alert: None,
-            alert_class: "none",
-            certificate: Some(certificate_reason(certificate)),
-        },
-        rustls::Error::NoApplicationProtocol => TlsFailure::new("alpn_mismatch"),
-        _ => TlsFailure::new("protocol"),
-    }
-}
-
-fn certificate_reason(error: &rustls::CertificateError) -> &'static str {
-    match error {
-        rustls::CertificateError::UnknownIssuer => "unknown_issuer",
-        rustls::CertificateError::Expired | rustls::CertificateError::ExpiredContext { .. } => {
-            "expired"
+fn negotiated_upstream(
+    client_alpn: ClientAlpnOffer,
+    selected: Option<HttpAlpn>,
+) -> Result<HttpAlpn, TlsTransportError> {
+    match selected {
+        Some(protocol) if client_alpn.supports(protocol) => Ok(protocol),
+        // An origin that ignores ALPN is legacy HTTP/1.1 only when the
+        // guest advertised that fallback or sent no ALPN itself.
+        None if client_alpn == ClientAlpnOffer::NoAlpn || client_alpn.supports(HttpAlpn::Http1) => {
+            Ok(HttpAlpn::Http1)
         }
-        rustls::CertificateError::NotValidYet
-        | rustls::CertificateError::NotValidYetContext { .. } => "not_valid_yet",
-        rustls::CertificateError::NotValidForName
-        | rustls::CertificateError::NotValidForNameContext { .. } => "name_mismatch",
-        rustls::CertificateError::Revoked => "revoked",
-        _ => "invalid_certificate",
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum HttpProtocol {
-    Http1,
-    Http2,
-}
-
-impl HttpProtocol {
-    pub(super) fn negotiated(alpn: Option<&[u8]>) -> Result<Self, TlsTransportError> {
-        match selected_alpn(alpn)? {
-            // TLS clients predating ALPN still use HTTP/1.1. Hyper parses their
-            // application bytes; this never selects an opaque relay.
-            None | Some(HttpAlpn::Http1) => Ok(Self::Http1),
-            Some(HttpAlpn::Http2) => Ok(Self::Http2),
-        }
-    }
-
-    fn negotiated_upstream(
-        client_alpn: ClientAlpnOffer,
-        selected: Option<HttpAlpn>,
-    ) -> Result<Self, TlsTransportError> {
-        match selected {
-            Some(protocol) if client_alpn.supports(protocol) => Ok(protocol.into()),
-            // An origin that ignores ALPN is legacy HTTP/1.1 only when the
-            // guest advertised that fallback or sent no ALPN itself.
-            None if client_alpn == ClientAlpnOffer::NoAlpn
-                || client_alpn.supports(HttpAlpn::Http1) =>
-            {
-                Ok(Self::Http1)
-            }
-            _ => Err(TlsTransportError::Protocol),
-        }
-    }
-
-    /// The protocol hyper actually parsed a request with. This, not the ALPN
-    /// result, decides how the request is forwarded.
-    pub(super) fn of(version: http::Version) -> Self {
-        if version == http::Version::HTTP_2 {
-            Self::Http2
-        } else {
-            Self::Http1
-        }
-    }
-
-    pub(super) const fn as_str(self) -> &'static str {
-        match self {
-            Self::Http1 => "http1",
-            Self::Http2 => "http2",
-        }
-    }
-}
-
-impl From<HttpAlpn> for HttpProtocol {
-    fn from(protocol: HttpAlpn) -> Self {
-        match protocol {
-            HttpAlpn::Http1 => Self::Http1,
-            HttpAlpn::Http2 => Self::Http2,
-        }
+        _ => Err(TlsTransportError::Protocol),
     }
 }
 
@@ -382,115 +159,12 @@ fn selected_alpn(alpn: Option<&[u8]>) -> Result<Option<HttpAlpn>, TlsTransportEr
         .transpose()
 }
 
-impl TcpProxy {
-    /// Each TLS handshake waits for a shared pool permit and then completes
-    /// within one ten-second budget that includes the wait.
-    /// The complete HTTP/stream lifetime is fenced by the certificate lease;
-    /// upstream setup happens only after a request passes authority and policy.
-    pub(super) async fn terminate_tls(
-        &self,
-        client: TcpStream,
-        admitted: AdmittedTcp,
-        lease: Arc<CertificateLease>,
-        client_alpn: ClientAlpnOffer,
-    ) -> Result<(), TlsInterceptionError> {
-        let span = tracing::info_span!(
-            "tls.server",
-            sandbox_id = self.sandbox_id,
-            destination_port = admitted.destination().port(),
-            negotiated = tracing::field::Empty,
-            protocol = tracing::field::Empty,
-            policy_ref = tracing::field::Empty,
-            handshake_queue_ms = tracing::field::Empty,
-            otel.status_code = "ERROR",
-        );
-        async {
-            tracing::Span::current().record(
-                "policy_ref",
-                &self.network_state.snapshot().await.installed_policy_ref,
-            );
-            let destination = admitted.destination();
-            if destination.port() != lease.port() {
-                return Err(TlsTransportError::Target.into());
-            }
-            let accounting = WireAccounting::new(self.stats.clone());
-            let operation = async {
-                // ALPN is telemetry here. `tls_http::serve` detects the
-                // version from the guest's first bytes and records `protocol`
-                // once the first request arrives.
-                let (downstream, negotiated) =
-                    accept(client, &lease, &self.tls_interception).await?;
-                tracing::Span::current().record("negotiated", negotiated.as_str());
-                let binding = HostBinding::new(
-                    self.sandbox_id,
-                    destination,
-                    self.network_state.clone(),
-                    self.dns_allow_cache.clone(),
-                );
-                let interception = self.tls_interception.clone();
-                let upstream_lease = lease.clone();
-                let wire_read = accounting.read.clone();
-                let wire_written = accounting.written.clone();
-                let connect = move |guest_protocol| async move {
-                    let origin = async {
-                        Ok(MeteredIo {
-                            inner: relay::connect(destination).await?,
-                            read: wire_read,
-                            written: wire_written,
-                        })
-                    };
-                    let offer = upstream_alpn_offer(client_alpn, guest_protocol);
-                    connect(origin, &upstream_lease, &interception, offer).await
-                };
-                tls_http::serve(downstream, binding, lease.clone(), connect).await
-            };
-            let result = tokio::select! {
-                biased;
-                // These look identical to a client but have different
-                // operators: shutdown is ours to schedule, while an
-                // invalidated lease is the policy, identity or CA layer
-                // changing underneath a live session.
-                () = self.shutdown_token.cancelled() => Err(TlsTransportError::Withdrawn),
-                () = lease.invalidated() => Err(TlsTransportError::Invalidated),
-                result = operation => result,
-            };
-            if result.is_ok() {
-                tracing::Span::current().record("otel.status_code", "OK");
-            } else if let Err(error) = &result {
-                error.record("tls_session");
-            }
-            result.map_err(Into::into)
-        }
-        .instrument(span)
-        .await
-    }
-}
-
-/// ALPN to offer the origin given what the guest turned out to speak.
-///
-/// The origin leg mirrors the guest's ClientHello offer, except that a guest
-/// which offered h2 and then spoke HTTP/1.1 (Go's `net/http` dialing an
-/// `https://` forward proxy) gets an HTTP/1.1-only upstream. The gateway can
-/// only tunnel CONNECT over an HTTP/1.1 origin leg, and offering h2 there
-/// would let an h2-preferring proxy turn the CONNECT into `invalid_connect`.
-/// Guests without ALPN and genuine h2 guests are unchanged.
-pub(super) fn upstream_alpn_offer(
-    client_alpn: ClientAlpnOffer,
-    guest_protocol: HttpProtocol,
-) -> ClientAlpnOffer {
-    if guest_protocol == HttpProtocol::Http1 && client_alpn.supports(HttpAlpn::Http2) {
-        ClientAlpnOffer::Http1
-    } else {
-        client_alpn
-    }
-}
-
 /// The presented leaf and actual SNI must name the same authorized target.
 pub(super) async fn accept<S>(
     stream: S,
     lease: &CertificateLease,
     interception: &TlsInterception,
-) -> Result<(TlsIo<tokio_rustls::server::TlsStream<S>>, HttpProtocol), TlsTransportError>
+) -> Result<(TlsIo<tokio_rustls::server::TlsStream<S>>, HttpAlpn), TlsTransportError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -523,7 +197,7 @@ where
         if actual_name.as_ref() != Some(lease.host()) {
             return Err(TlsTransportError::Target);
         }
-        let protocol = HttpProtocol::negotiated(downstream.get_ref().1.alpn_protocol())?;
+        let protocol = negotiated(downstream.get_ref().1.alpn_protocol())?;
         Ok((
             TlsIo::new(downstream, TlsHandshakeLeg::ClientToNetgw),
             protocol,
@@ -538,11 +212,11 @@ where
 /// The ten-second budget includes the permit wait, transport setup and the
 /// complete handshake.
 pub(super) async fn connect<S>(
-    transport: impl std::future::Future<Output = io::Result<S>>,
+    transport: impl std::future::Future<Output = Result<S, transport::Error>>,
     lease: &CertificateLease,
     interception: &TlsInterception,
     client_alpn: ClientAlpnOffer,
-) -> Result<(TlsIo<tokio_rustls::client::TlsStream<S>>, HttpProtocol), TlsTransportError>
+) -> Result<(TlsIo<tokio_rustls::client::TlsStream<S>>, HttpAlpn), TlsTransportError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -562,7 +236,7 @@ where
             if !lease.is_usable() {
                 return Err(TlsTransportError::Invalidated);
             }
-            transport.await.map_err(TlsTransportError::Upstream)
+            transport.await.map_err(TlsTransportError::Connect)
         })
         .await
         {
@@ -597,7 +271,7 @@ where
                 .await
                 .map_err(TlsTransportError::Upstream)?;
             let selected = selected_alpn(upstream.get_ref().1.alpn_protocol())?;
-            let upstream_protocol = HttpProtocol::negotiated_upstream(client_alpn, selected)?;
+            let upstream_protocol = negotiated_upstream(client_alpn, selected)?;
             if !lease.is_usable() {
                 return Err(TlsTransportError::Invalidated);
             }
@@ -793,7 +467,7 @@ impl Drop for HandshakeAttempt {
     }
 }
 
-/// Reports Rustls protocol failures from an established connection regardless
+/// Reports native I/O failures from an established TLS connection regardless
 /// of whether Hyper or an upgraded tunnel currently owns the stream.
 pub(super) struct TlsIo<T> {
     inner: T,
@@ -814,9 +488,7 @@ impl<T> TlsIo<T> {
         if self.error_reported {
             return;
         }
-        let Some(failure) = tls_failure_from_io(error) else {
-            return;
-        };
+        let failure = TlsFailure::new("io");
         self.error_reported = true;
         pplx_space_metrics::gateway::tls_connection_error(self.leg.as_str(), failure.reason);
         tracing::warn!(
@@ -890,33 +562,6 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for TlsIo<T> {
             self.record_error("write_vectored", error);
         }
         result
-    }
-}
-
-/// Account origin-facing wire bytes on every exit, including cancellation.
-struct WireAccounting {
-    stats: Arc<ProxyStats>,
-    read: Arc<AtomicU64>,
-    written: Arc<AtomicU64>,
-}
-
-impl WireAccounting {
-    fn new(stats: Arc<ProxyStats>) -> Self {
-        Self {
-            stats,
-            read: Arc::new(AtomicU64::new(0)),
-            written: Arc::new(AtomicU64::new(0)),
-        }
-    }
-}
-
-impl Drop for WireAccounting {
-    fn drop(&mut self) {
-        let tx = self.written.load(Ordering::Relaxed);
-        let rx = self.read.load(Ordering::Relaxed);
-        self.stats.add_network_bytes(tx, rx);
-        pplx_space_metrics::gateway::tcp_bytes("tx", tx);
-        pplx_space_metrics::gateway::tcp_bytes("rx", rx);
     }
 }
 

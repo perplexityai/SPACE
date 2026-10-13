@@ -25,13 +25,16 @@ use tracing::Instrument;
 use super::accounting::{Attempt, Outcome};
 use super::http_host::HostBinding;
 use super::routing_headers::{SanitizedBody, SanitizedRequest};
-use super::tls::{HttpProtocol, TlsTransportError};
+use super::tls::TlsTransportError;
 use crate::certificates::CertificateLease;
+use crate::tls_sni::HttpAlpn;
+pub(super) use error::HttpError;
+pub(super) use error::http_reason;
 
 mod connect;
 mod credentials;
+mod error;
 mod forward;
-mod leg;
 mod upgrade;
 
 type Body = Either<ForwardingBody, Empty<Bytes>>;
@@ -168,7 +171,7 @@ pub(super) async fn serve<C, F, Fut, U>(
     binding: HostBinding,
     lease: Arc<CertificateLease>,
     connect: F,
-) -> Result<(), TlsTransportError>
+) -> Result<(), HttpError>
 where
     C: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     F: FnOnce(HttpProtocol) -> Fut + Send + 'static,
@@ -215,7 +218,7 @@ where
     session.shutdown.cancel();
     session.tasks.close();
     session.tasks.wait().await;
-    result.map_err(TlsTransportError::from)
+    result.map_err(HttpError::from)
 }
 
 fn guest_http_builder() -> auto::Builder<TokioExecutor> {
@@ -248,7 +251,7 @@ where
     /// The origin leg is established lazily, by the first request that passes
     /// authorization. `guest_protocol` is that request's HTTP version so the
     /// upstream ALPN offer can match what the guest actually speaks.
-    async fn sender(&self, guest_protocol: HttpProtocol) -> Result<&Sender, TlsTransportError> {
+    async fn sender(&self, guest_protocol: HttpProtocol) -> Result<&Sender, HttpError> {
         self.upstream
             .get_or_try_init(|| async {
                 // A failed or cancelled initializer has consumed the connector.
@@ -259,7 +262,7 @@ where
                     .lock()
                     .await
                     .take()
-                    .ok_or(TlsTransportError::Invalidated)?;
+                    .ok_or(HttpError::Cancelled)?;
                 let (io, protocol) = connect(guest_protocol).await?;
                 let io = TokioIo::new(UpstreamIo {
                     inner: io,
@@ -308,15 +311,12 @@ where
                     result = connection => {
                         if let Err(error) = result {
                             // Hyper Display can contain peer-supplied text.
-                            let failure = super::tls::HttpFailure::classify(&error);
+                            let failure = http_reason(&error);
                             tracing::info!(
                                 stage = "upstream_http",
                                 parse = error.is_parse(),
                                 closed = error.is_closed(),
-                                http_reason = failure.reason,
-                                io_kind = ?failure.io_kind,
-                                h2_reason = failure.h2_reason,
-                                h2_origin = failure.h2_origin,
+                                http_reason = failure,
                                 "inspected HTTP connection ended"
                             );
                         }
@@ -412,3 +412,37 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for UpstreamIo<T> {
 
 #[cfg(test)]
 mod tests;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum HttpProtocol {
+    Http1,
+    Http2,
+}
+
+impl HttpProtocol {
+    /// The protocol hyper actually parsed a request with. This, not the ALPN
+    /// result, decides how the request is forwarded.
+    pub(super) fn of(version: http::Version) -> Self {
+        if version == http::Version::HTTP_2 {
+            Self::Http2
+        } else {
+            Self::Http1
+        }
+    }
+
+    pub(super) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Http1 => "http1",
+            Self::Http2 => "http2",
+        }
+    }
+}
+
+impl From<HttpAlpn> for HttpProtocol {
+    fn from(protocol: HttpAlpn) -> Self {
+        match protocol {
+            HttpAlpn::Http1 => Self::Http1,
+            HttpAlpn::Http2 => Self::Http2,
+        }
+    }
+}

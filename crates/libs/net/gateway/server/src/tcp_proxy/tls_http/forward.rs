@@ -70,7 +70,7 @@ where
             Err(error) => {
                 forwarding.finish(Outcome::Error, "upstream_http");
                 self.draining.cancel();
-                TlsTransportError::Http(error).record("upstream_request");
+                HttpError::Protocol(error).record("upstream_request");
                 return self.refuse(protocol, "upstream_http_error", StatusCode::BAD_GATEWAY);
             }
         };
@@ -107,8 +107,14 @@ where
                 }
                 Self::record(protocol, handshake.as_str(), response.status());
                 self.upgrades.spawn(
-                    upgrade::relay(guest, origin, self.shutdown.clone(), protocol.as_str())
-                        .in_current_span(),
+                    upgrade::relay(
+                        guest,
+                        origin,
+                        self.shutdown.clone(),
+                        protocol.as_str(),
+                        upgrade::Kind::WebSocket,
+                    )
+                    .in_current_span(),
                 );
                 forwarding.finish(Outcome::Success, "response_headers");
                 response.map(|_| Either::Right(Empty::new()))
@@ -127,7 +133,7 @@ where
             Err(error) => {
                 forwarding.finish(Outcome::Error, "upstream_http");
                 self.draining.cancel();
-                TlsTransportError::Http(error).record("upstream_request");
+                HttpError::Protocol(error).record("upstream_request");
                 self.refuse(protocol, "upstream_http_error", StatusCode::BAD_GATEWAY)
             }
         }

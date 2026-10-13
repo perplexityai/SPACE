@@ -11,8 +11,8 @@ use hyper_util::rt::TokioIo;
 use tokio_util::sync::CancellationToken;
 
 use super::super::accounting::{Attempt, Outcome};
+use super::super::relay::{self, RelayFault};
 use super::SanitizedRequest;
-use super::leg::{RelayFault, RelayWitness};
 
 pub(super) enum Handshake {
     WebSocket { accept: HeaderValue },
@@ -102,88 +102,114 @@ fn websocket_headers(
         })
 }
 
-pub(super) async fn relay(
+#[derive(Clone, Copy)]
+pub(super) enum Kind {
+    WebSocket,
+    Connect,
+}
+
+#[derive(Debug, thiserror::Error)]
+enum HandoffError {
+    #[error("downstream HTTP upgrade failed")]
+    Downstream(#[source] hyper::Error),
+    #[error("upstream HTTP upgrade failed")]
+    Upstream(#[source] hyper::Error),
+    #[error("HTTP upgrade deadline elapsed")]
+    Timeout,
+    #[error("HTTP session ended")]
+    Cancelled,
+}
+
+/// Capture the deadline before returning the handshake response to Hyper.
+pub(super) fn relay(
     guest: OnUpgrade,
     origin: OnUpgrade,
     shutdown: CancellationToken,
     protocol: &'static str,
-) {
-    let mut forwarding = Attempt::forwarding(protocol, "relay");
-    let witness = RelayWitness::default();
+    kind: Kind,
+) -> impl std::future::Future<Output = ()> + Send {
     let started_at = tokio::time::Instant::now();
-    let operation = async {
-        let (guest, origin) = tokio::time::timeout(Duration::from_secs(10), async {
-            tokio::try_join!(guest, origin)
-        })
-        .await
-        .map_err(|_| "upgrade_timeout")?
-        .map_err(|_| "upgrade_failed")?;
-        let mut guest = witness.guest(TokioIo::new(guest));
-        let mut origin = witness.origin(TokioIo::new(origin));
-        // Polling bounds inactivity to 60–70 seconds without unbounded buffers
-        // or per-byte notifications. The enclosing lease caps total lifetime.
-        let idle = async {
-            let mut bytes = 0;
-            let mut last_progress = tokio::time::Instant::now();
-            loop {
-                tokio::time::sleep(Duration::from_secs(10)).await;
-                let (guest_bytes, origin_bytes) = witness.bytes();
-                let current = guest_bytes + origin_bytes;
-                if current != bytes {
-                    last_progress = tokio::time::Instant::now();
-                    bytes = current;
+    let (budget, idle, binding) = match kind {
+        Kind::WebSocket => (
+            Duration::from_secs(10),
+            Some(Duration::from_secs(60)),
+            "tls_http",
+        ),
+        Kind::Connect => (super::HEADER_TIMEOUT, None, "tls_connect"),
+    };
+    let deadline = started_at + budget;
+    async move {
+        let mut forwarding = Attempt::forwarding(protocol, "relay");
+        let handoff = tokio::select! {
+            biased;
+            () = shutdown.cancelled() => Err(HandoffError::Cancelled),
+            result = tokio::time::timeout_at(deadline, async {
+                tokio::try_join!(
+                    async { guest.await.map_err(HandoffError::Downstream) },
+                    async { origin.await.map_err(HandoffError::Upstream) },
+                )
+            }) => result.unwrap_or(Err(HandoffError::Timeout)),
+        };
+        let (outcome, first_eof, fault, read) = match handoff {
+            Err(error) => {
+                let (outcome, status) = match &error {
+                    HandoffError::Cancelled => ("session_ended", Outcome::Cancelled),
+                    HandoffError::Timeout => ("upgrade_timeout", Outcome::Error),
+                    HandoffError::Downstream(_) | HandoffError::Upstream(_) => {
+                        ("upgrade_failed", Outcome::Error)
+                    }
+                };
+                if let HandoffError::Downstream(error) | HandoffError::Upstream(error) = &error {
+                    tracing::info!(
+                        http_reason = super::http_reason(error),
+                        "HTTP upgrade handoff failed"
+                    );
                 }
-                if last_progress.elapsed() >= Duration::from_secs(60) {
-                    return;
-                }
+                forwarding.finish(status, outcome);
+                (outcome, "none", None, (0, 0))
+            }
+            Ok((guest, origin)) => {
+                let report =
+                    relay::run(TokioIo::new(guest), TokioIo::new(origin), &shutdown, idle).await;
+                let (status, outcome) = match &report.result {
+                    Ok(()) => (
+                        Outcome::Success,
+                        match kind {
+                            Kind::WebSocket => "upgrade_complete",
+                            Kind::Connect => "connect_complete",
+                        },
+                    ),
+                    Err(relay::Error::Cancelled) => (Outcome::Cancelled, "session_ended"),
+                    Err(relay::Error::Idle) => (Outcome::Success, "upgrade_idle_timeout"),
+                    Err(relay::Error::Io(error)) => {
+                        tracing::info!(io_kind = ?error.kind(), raw_os_error = error.raw_os_error(), "HTTP upgrade relay failed");
+                        (
+                            Outcome::Error,
+                            report.fault.map_or("relay_io", RelayFault::as_str),
+                        )
+                    }
+                };
+                forwarding.finish(status, outcome);
+                (outcome, report.first_eof, report.fault, report.read)
             }
         };
-        tokio::select! {
-            () = idle => Err("upgrade_idle_timeout"),
-            result = tokio::io::copy_bidirectional(&mut guest, &mut origin) => result
-                .map(|_| ())
-                // Name the peer that failed instead of one opaque label.
-                .map_err(|_| witness.fault().map_or("upgrade_io_failed", RelayFault::as_str)),
-        }
-    };
-    let outcome = tokio::select! {
-        biased;
-        () = shutdown.cancelled() => {
-            forwarding.finish(Outcome::Cancelled, "session_ended");
-            "upgrade_cancelled"
-        },
-        result = operation => match result {
-            Ok(()) => {
-                forwarding.finish(Outcome::Success, "websocket_complete");
-                "upgrade_complete"
-            }
-            Err("upgrade_idle_timeout") => {
-                forwarding.finish(Outcome::Success, "idle_timeout");
-                "upgrade_idle_timeout"
-            }
-            Err(outcome) => {
-                forwarding.finish(Outcome::Error, outcome);
-                outcome
-            }
-        },
-    };
-    let (guest_bytes, origin_bytes) = witness.bytes();
-    pplx_space_metrics::gateway::domain_binding("tcp", "tls_http", outcome, None);
-    pplx_space_metrics::gateway::relay_duration_ms(
-        protocol,
-        outcome,
-        witness.closed_by(),
-        started_at.elapsed().as_secs_f64() * 1_000.0,
-    );
-    tracing::info!(
-        boundary = "forwarding",
-        protocol,
-        operation = "relay",
-        outcome,
-        closed_by = witness.closed_by(),
-        fault = witness.fault().map(RelayFault::as_str),
-        guest_bytes,
-        origin_bytes,
-        "inspected HTTP upgrade ended"
-    );
+        pplx_space_metrics::gateway::domain_binding("tcp", binding, outcome, None);
+        pplx_space_metrics::gateway::relay_duration_ms(
+            protocol,
+            outcome,
+            first_eof,
+            started_at.elapsed().as_secs_f64() * 1_000.0,
+        );
+        tracing::info!(
+            boundary = "forwarding",
+            protocol,
+            operation = "relay",
+            outcome,
+            first_eof,
+            fault = fault.map(RelayFault::as_str),
+            guest_bytes = read.0,
+            origin_bytes = read.1,
+            "HTTP upgrade relay ended"
+        );
+    }
 }

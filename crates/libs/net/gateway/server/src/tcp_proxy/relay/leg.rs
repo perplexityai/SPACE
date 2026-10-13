@@ -7,15 +7,15 @@
 
 use std::io;
 use std::pin::Pin;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 /// Which peer of a relay an observation came from.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum Side {
+pub(in crate::tcp_proxy) enum Side {
     Guest,
     Origin,
 }
@@ -39,17 +39,18 @@ enum Operation {
 
 /// The first I/O failure in a relay, as a bounded `side_operation` label.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct RelayFault {
+pub(in crate::tcp_proxy) struct RelayFault {
     side: Side,
     operation: Operation,
 }
 
 impl RelayFault {
-    pub(super) const fn side(self) -> Side {
+    #[cfg(test)]
+    pub(in crate::tcp_proxy) const fn side(self) -> Side {
         self.side
     }
 
-    pub(super) const fn as_str(self) -> &'static str {
+    pub(in crate::tcp_proxy) const fn as_str(self) -> &'static str {
         match (self.side, self.operation) {
             (Side::Guest, Operation::Read) => "guest_read",
             (Side::Guest, Operation::Write) => "guest_write",
@@ -64,60 +65,73 @@ impl RelayFault {
 }
 
 /// Shared first-fault and first-close cells. Both legs write to the same cells
-/// so the winner is the peer that actually failed or closed first, rather than
-/// whichever side the caller happens to inspect first.
-#[derive(Clone, Default)]
-pub(super) struct RelayWitness {
-    fault: Arc<OnceLock<RelayFault>>,
-    closed_by: Arc<OnceLock<Side>>,
-    guest_bytes: Arc<AtomicU64>,
-    origin_bytes: Arc<AtomicU64>,
+/// so EOF describes the first observation by the relay, not causal ownership
+/// of the connection close. Borrowed cells remain readable after cancellation.
+#[derive(Default)]
+pub(in crate::tcp_proxy) struct RelayWitness {
+    fault: OnceLock<RelayFault>,
+    closed_by: OnceLock<Side>,
+    guest_bytes: AtomicU64,
+    origin_bytes: AtomicU64,
+    guest_written: AtomicU64,
+    origin_written: AtomicU64,
 }
 
 impl RelayWitness {
-    pub(super) fn fault(&self) -> Option<RelayFault> {
+    pub(in crate::tcp_proxy) fn fault(&self) -> Option<RelayFault> {
         self.fault.get().copied()
     }
 
     /// `none` until one peer reaches end-of-stream, so a relay torn down by
     /// shutdown is not misreported as a peer-initiated close.
-    pub(super) fn closed_by(&self) -> &'static str {
+    pub(in crate::tcp_proxy) fn closed_by(&self) -> &'static str {
         self.closed_by.get().map_or("none", |side| side.as_str())
     }
 
-    pub(super) fn bytes(&self) -> (u64, u64) {
+    pub(in crate::tcp_proxy) fn bytes(&self) -> (u64, u64) {
         (
             self.guest_bytes.load(Ordering::Relaxed),
             self.origin_bytes.load(Ordering::Relaxed),
         )
     }
 
-    pub(super) fn guest<T>(&self, inner: T) -> RelayLeg<T> {
-        self.leg(inner, Side::Guest, self.guest_bytes.clone())
+    pub(in crate::tcp_proxy) fn written(&self) -> (u64, u64) {
+        (
+            self.origin_written.load(Ordering::Relaxed),
+            self.guest_written.load(Ordering::Relaxed),
+        )
     }
 
-    pub(super) fn origin<T>(&self, inner: T) -> RelayLeg<T> {
-        self.leg(inner, Side::Origin, self.origin_bytes.clone())
-    }
-
-    fn leg<T>(&self, inner: T, side: Side, bytes: Arc<AtomicU64>) -> RelayLeg<T> {
+    pub(in crate::tcp_proxy) fn guest<T>(&self, inner: T) -> RelayLeg<'_, T> {
         RelayLeg {
             inner,
-            side,
-            bytes,
-            witness: self.clone(),
+            side: Side::Guest,
+            bytes: &self.guest_bytes,
+            written: &self.guest_written,
+            witness: self,
+        }
+    }
+
+    pub(in crate::tcp_proxy) fn origin<T>(&self, inner: T) -> RelayLeg<'_, T> {
+        RelayLeg {
+            inner,
+            side: Side::Origin,
+            bytes: &self.origin_bytes,
+            written: &self.origin_written,
+            witness: self,
         }
     }
 }
 
-pub(super) struct RelayLeg<T> {
+pub(in crate::tcp_proxy) struct RelayLeg<'a, T> {
     inner: T,
     side: Side,
-    bytes: Arc<AtomicU64>,
-    witness: RelayWitness,
+    bytes: &'a AtomicU64,
+    written: &'a AtomicU64,
+    witness: &'a RelayWitness,
 }
 
-impl<T> RelayLeg<T> {
+impl<T> RelayLeg<'_, T> {
     fn note(&self, operation: Operation, result: &Poll<io::Result<impl Sized>>) {
         if let Poll::Ready(Err(_)) = result {
             let _ = self.witness.fault.set(RelayFault {
@@ -128,7 +142,7 @@ impl<T> RelayLeg<T> {
     }
 }
 
-impl<T: AsyncRead + Unpin> AsyncRead for RelayLeg<T> {
+impl<T: AsyncRead + Unpin> AsyncRead for RelayLeg<'_, T> {
     fn poll_read(
         mut self: Pin<&mut Self>,
         context: &mut Context<'_>,
@@ -148,13 +162,16 @@ impl<T: AsyncRead + Unpin> AsyncRead for RelayLeg<T> {
     }
 }
 
-impl<T: AsyncWrite + Unpin> AsyncWrite for RelayLeg<T> {
+impl<T: AsyncWrite + Unpin> AsyncWrite for RelayLeg<'_, T> {
     fn poll_write(
         mut self: Pin<&mut Self>,
         context: &mut Context<'_>,
         buffer: &[u8],
     ) -> Poll<io::Result<usize>> {
         let result = Pin::new(&mut self.inner).poll_write(context, buffer);
+        if let Poll::Ready(Ok(written)) = result {
+            self.written.fetch_add(written as u64, Ordering::Relaxed);
+        }
         self.note(Operation::Write, &result);
         result
     }

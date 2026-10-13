@@ -115,7 +115,7 @@ impl BindingOutcome {
 #[derive(Debug, thiserror::Error)]
 pub(super) enum Failure {
     #[error("TCP connect failed: {0}")]
-    Connect(#[source] io::Error),
+    Connect(#[source] super::transport::Error),
     #[error("HTTP/1 handshake failed: {0}")]
     UpstreamHttp(#[source] hyper::Error),
     #[error("guest HTTP failed")]
@@ -143,7 +143,7 @@ pub(super) async fn serve<C, F, Fut, U>(
 where
     C: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     F: FnOnce(SocketAddr) -> Fut + Send + 'static,
-    Fut: Future<Output = io::Result<U>> + Send + 'static,
+    Fut: Future<Output = Result<U, super::transport::Error>> + Send + 'static,
     U: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let wire_tx = Arc::new(AtomicU64::new(0));
@@ -222,7 +222,7 @@ async fn forward<F, Fut, U>(
 ) -> (Response<ForwardBody>, BindingOutcome, Option<Failure>)
 where
     F: FnOnce(SocketAddr) -> Fut + Send + 'static,
-    Fut: Future<Output = io::Result<U>> + Send + 'static,
+    Fut: Future<Output = Result<U, super::transport::Error>> + Send + 'static,
     U: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let authorization: Result<Authority, BindingOutcome> = async {
@@ -259,7 +259,7 @@ where
         Err(error) => {
             let outcome = BindingOutcome::UpstreamFailed;
             let (failure, error_kind) = match &error {
-                Failure::Connect(error) => ("connect", Some(error.kind())),
+                Failure::Connect(error) => ("connect", error.io_kind()),
                 Failure::UpstreamHttp(_) => ("http_handshake", None),
                 Failure::GuestHttp => ("guest_http", None),
             };
@@ -316,7 +316,7 @@ async fn connect_upstream<F, Fut, U>(
 ) -> Result<&mut client::SendRequest<SanitizedBody<ForwardBody>>, Failure>
 where
     F: FnOnce(SocketAddr) -> Fut,
-    Fut: Future<Output = io::Result<U>>,
+    Fut: Future<Output = Result<U, super::transport::Error>>,
     U: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     match std::mem::replace(upstream, Upstream::Failed) {
@@ -342,17 +342,21 @@ where
             *upstream = Upstream::Connected(sender);
         }
         Upstream::Failed => {
-            return Err(Failure::Connect(io::Error::new(
-                io::ErrorKind::NotConnected,
-                "upstream connection is unavailable",
-            )));
+            return Err(Failure::Connect(
+                io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "upstream connection is unavailable",
+                )
+                .into(),
+            ));
         }
     }
     match upstream {
         Upstream::Connected(sender) => Ok(sender),
-        Upstream::Pending(_) | Upstream::Failed => Err(Failure::Connect(io::Error::other(
-            "upstream connection state transition did not install a sender",
-        ))),
+        Upstream::Pending(_) | Upstream::Failed => Err(Failure::Connect(
+            io::Error::other("upstream connection state transition did not install a sender")
+                .into(),
+        )),
     }
 }
 

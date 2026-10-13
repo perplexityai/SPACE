@@ -157,8 +157,6 @@ pub(crate) enum TlsInterceptionError {
     Timeout,
     #[error("certificate acquisition failed ({code:?})", code = .0.code())]
     CertificateRequest(#[source] tonic::Status),
-    #[error("TLS transport failed: {0}")]
-    Transport(#[from] crate::tcp_proxy::tls::TlsTransportError),
 }
 
 impl TlsInterceptionError {
@@ -168,7 +166,6 @@ impl TlsInterceptionError {
             Self::MissingServerName(_) => "missing_sni",
             Self::Timeout => "timeout",
             Self::CertificateRequest(_) => "certificate_error",
-            Self::Transport(error) => error.as_str(),
         }
     }
 }

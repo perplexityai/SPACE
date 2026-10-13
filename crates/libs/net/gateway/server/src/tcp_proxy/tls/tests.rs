@@ -3,7 +3,8 @@ use std::sync::{Arc, Mutex};
 use pplx_space_observability::test_capture::{CapturedEvent, RecordingVisitor};
 use tracing_subscriber::layer::SubscriberExt;
 
-use super::{HttpProtocol, TlsTransportError, upstream_alpn_offer};
+use super::super::{inspected::upstream_alpn_offer, tls_http::HttpProtocol};
+use super::TlsTransportError;
 use crate::tls_sni::{ClientAlpnOffer, HttpAlpn};
 
 /// The origin leg follows the guest's ClientHello unless the guest offered h2
@@ -38,7 +39,7 @@ fn origin_alpn_offer_matches_what_the_guest_actually_speaks() {
 fn upstream_protocol_requires_guest_compatibility() {
     use ClientAlpnOffer as Offer;
     use HttpAlpn as Alpn;
-    use HttpProtocol as Http;
+    use HttpAlpn as Http;
 
     for (offered, selected, expected) in [
         (Offer::NoAlpn, None, Some(Http::Http1)),
@@ -59,7 +60,7 @@ fn upstream_protocol_requires_guest_compatibility() {
         (Offer::Unavailable, None, None),
         (Offer::Unsupported, None, None),
     ] {
-        let result = HttpProtocol::negotiated_upstream(offered, selected);
+        let result = super::negotiated_upstream(offered, selected);
         assert_eq!(
             result.as_ref().ok().copied(),
             expected,
@@ -116,7 +117,7 @@ fn tls_diagnostics_do_not_export_the_guest_hostname() {
         let outcome = error.as_str();
         assert!(std::error::Error::source(&error).is_some());
         assert!(!error.to_string().contains(hostname));
-        let message = crate::tls_interception::TlsInterceptionError::from(error).to_string();
+        let message = super::super::tls_http::HttpError::from(error).to_string();
         assert!(!message.contains(hostname), "{outcome}: {message}");
     }
 
@@ -141,7 +142,7 @@ mod http_failure {
     use hyper_util::rt::{TokioExecutor, TokioIo};
     use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 
-    use super::super::HttpFailure;
+    use super::super::super::tls_http::http_reason;
 
     /// Delivers one request, then fails every write the way a guest reset does.
     struct ResetAfterRequest(&'static [u8]);
@@ -183,7 +184,7 @@ mod http_failure {
     }
 
     #[tokio::test]
-    async fn guest_socket_reset_is_io_with_its_kind() {
+    async fn opaque_socket_error_does_not_claim_a_native_kind() {
         let io = ResetAfterRequest(b"GET / HTTP/1.1\r\nhost: a\r\n\r\n");
         let error = hyper::server::conn::http1::Builder::new()
             .serve_connection(
@@ -192,10 +193,8 @@ mod http_failure {
             )
             .await
             .expect_err("writes fail");
-        let failure = HttpFailure::classify(&error);
-        assert_eq!(failure.reason, "io");
-        assert_eq!(failure.io_kind, Some(io::ErrorKind::ConnectionReset));
-        assert_eq!(failure.h2_reason, None);
+        let failure = http_reason(&error);
+        assert_eq!(failure, "other");
     }
 
     #[tokio::test]
@@ -215,13 +214,12 @@ mod http_failure {
             .await
             .unwrap();
         let error = serve.await.expect_err("body stream fails");
-        let failure = HttpFailure::classify(&error);
-        assert_eq!(failure.reason, "user");
-        assert_eq!(failure.h2_reason, None);
+        let failure = http_reason(&error);
+        assert_eq!(failure, "user");
     }
 
     #[tokio::test]
-    async fn h2_peer_violation_reports_code_and_origin() {
+    async fn opaque_h2_error_does_not_claim_a_code_or_origin() {
         let (mut client, server) = tokio::io::duplex(4096);
         let serve = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
             .serve_connection(
@@ -236,10 +234,8 @@ mod http_failure {
         wire.extend_from_slice(&[0, 0, 8, 0x6, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0]);
         client.write_all(&wire).await.unwrap();
         let error = task.await.unwrap().expect_err("peer violated h2");
-        let failure = HttpFailure::classify(&error);
-        assert_eq!(failure.reason, "h2");
-        assert_eq!(failure.h2_reason, Some("protocol_error"));
-        assert_eq!(failure.h2_origin, Some("library"));
+        let failure = http_reason(&error);
+        assert_eq!(failure, "other");
     }
 
     #[tokio::test]
@@ -254,6 +250,6 @@ mod http_failure {
             .await
             .unwrap();
         let error = serve.await.expect_err("garbage request");
-        assert_eq!(HttpFailure::classify(&error).reason, "parse");
+        assert_eq!(http_reason(&error), "parse");
     }
 }

@@ -1,62 +1,80 @@
-//! Carrying one admitted flow to its destination.
+//! Relay established streams. Dialing and HTTP upgrade handoff happen before entry.
+use std::{io, time::Duration};
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio_util::sync::CancellationToken;
 
-use std::io;
-use std::net::SocketAddr;
-use std::time::Duration;
+mod leg;
+pub(super) use leg::RelayFault;
+use leg::RelayWitness;
 
-use tokio::io::copy_bidirectional;
-use tokio::net::TcpStream;
-
-use crate::orig_dst;
-
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// Which half of the relay failed.
-pub(super) enum Failure {
-    Connect(io::Error),
-    Copy(io::Error),
+#[derive(Debug, thiserror::Error)]
+pub(super) enum Error {
+    #[error("relay cancelled")]
+    Cancelled,
+    #[error("relay idle deadline elapsed")]
+    Idle,
+    #[error("relay I/O failed ({kind:?})", kind = .0.kind())]
+    Io(#[source] io::Error),
 }
 
-/// Dial `dst` and shuttle bytes until both directions close. Returns the wire
-/// bytes carried, guest-to-destination first.
-pub(super) async fn run(mut client: TcpStream, dst: SocketAddr) -> Result<(u64, u64), Failure> {
-    let mut upstream = connect(dst).await.map_err(Failure::Connect)?;
-    copy_bidirectional(&mut client, &mut upstream)
-        .await
-        .map_err(Failure::Copy)
+pub(super) struct Report {
+    pub result: Result<(), Error>,
+    /// Bytes read from each peer, including data still buffered at cancellation.
+    pub read: (u64, u64),
+    /// Bytes successfully written, downstream-to-upstream first.
+    pub written: (u64, u64),
+    pub fault: Option<RelayFault>,
+    /// First observed EOF, not the initiator of a connection close.
+    pub first_eof: &'static str,
 }
 
-/// `SO_MARK` keeps the reply from being re-captured by this gateway's own TPROXY
-/// rule, which would otherwise make it connect to itself.
-pub(super) async fn connect(dst: SocketAddr) -> io::Result<TcpStream> {
-    let socket = socket2::Socket::new(
-        socket2::Domain::IPV4,
-        socket2::Type::STREAM,
-        Some(socket2::Protocol::TCP),
-    )?;
-    orig_dst::set_so_mark(&socket, pplx_space_net_gateway_client::OUTBOUND_MARK)?;
-    socket.set_nonblocking(true)?;
-    match socket.connect(&dst.into()) {
-        Ok(()) => {}
-        Err(error) if connect_in_progress(&error) => {}
-        Err(error) => return Err(error),
+pub(super) async fn run<D, U>(
+    downstream: D,
+    upstream: U,
+    shutdown: &CancellationToken,
+    idle_timeout: Option<Duration>,
+) -> Report
+where
+    D: AsyncRead + AsyncWrite + Unpin,
+    U: AsyncRead + AsyncWrite + Unpin,
+{
+    let witness = RelayWitness::default();
+    let result = {
+        let mut downstream = witness.guest(downstream);
+        let mut upstream = witness.origin(upstream);
+        let idle = async {
+            let Some(timeout) = idle_timeout else {
+                return std::future::pending().await;
+            };
+            let mut bytes = (0, 0);
+            let mut last_progress = tokio::time::Instant::now();
+            loop {
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                let current = witness.bytes();
+                if current != bytes {
+                    bytes = current;
+                    last_progress = tokio::time::Instant::now();
+                }
+                if last_progress.elapsed() >= timeout {
+                    return;
+                }
+            }
+        };
+        tokio::select! {
+            biased;
+            () = shutdown.cancelled() => Err(Error::Cancelled),
+            () = idle => Err(Error::Idle),
+            result = tokio::io::copy_bidirectional(&mut downstream, &mut upstream) => result.map(|_| ()).map_err(Error::Io),
+        }
+    };
+    Report {
+        result,
+        read: witness.bytes(),
+        written: witness.written(),
+        fault: witness.fault(),
+        first_eof: witness.closed_by(),
     }
-
-    // A non-blocking connect signals completion by becoming writable, and
-    // reports failure only through SO_ERROR — a failed connect is writable too.
-    let upstream = TcpStream::from_std(std::net::TcpStream::from(socket))?;
-    tokio::time::timeout(CONNECT_TIMEOUT, upstream.writable())
-        .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "TCP connect timed out"))??;
-    match upstream.take_error()? {
-        Some(error) => Err(error),
-        None => Ok(upstream),
-    }
 }
 
-fn connect_in_progress(error: &io::Error) -> bool {
-    matches!(
-        error.raw_os_error(),
-        Some(libc::EINPROGRESS) | Some(libc::EALREADY)
-    ) || error.kind() == io::ErrorKind::WouldBlock
-}
+#[cfg(test)]
+mod tests;

@@ -130,10 +130,13 @@ async fn failed_plaintext_connect() -> FailedPlaintextConnect {
         async move {
             proxy
                 .host_bound_http(gateway_guest, destination, |destination| async move {
-                    Err::<DuplexStream, _>(io::Error::new(
-                        io::ErrorKind::ConnectionRefused,
-                        format!("test connect refusal to {destination}"),
-                    ))
+                    Err::<DuplexStream, _>(
+                        io::Error::new(
+                            io::ErrorKind::ConnectionRefused,
+                            format!("test connect refusal to {destination}"),
+                        )
+                        .into(),
+                    )
                 })
                 .await
         }
@@ -781,10 +784,9 @@ async fn record_emits_one_connection_metric_and_reports_every_failure_outcome() 
             DenyReason::Default,
         ))),
         FlowOutcome::Rejected(Rejection::Admission(TcpAdmissionDenial::PolicyChanged)),
-        FlowOutcome::RelayFailed(RelayFailure::Connect(io::Error::new(
-            io::ErrorKind::ConnectionRefused,
-            "test connect failure",
-        ))),
+        FlowOutcome::RelayFailed(RelayFailure::Connect(
+            io::Error::new(io::ErrorKind::ConnectionRefused, "test connect failure").into(),
+        )),
         FlowOutcome::RelayFailed(RelayFailure::PlaintextUpstreamHttp),
         FlowOutcome::RelayFailed(RelayFailure::PlaintextGuestHttp),
         FlowOutcome::Rejected(Rejection::TlsInterception(TlsInterceptionError::Timeout)),
