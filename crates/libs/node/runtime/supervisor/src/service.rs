@@ -624,6 +624,7 @@ impl RuntimeSupervisorService {
                     gid: req.gid,
                     fc_config_path: &req.fc_config_path,
                     fc_log_path: &req.fc_log_path,
+                    fc_metrics_path: &req.fc_metrics_path,
                     fc_console_path: &req.fc_console_path,
                     cgroup_limits: &cgroup_limits,
                 })

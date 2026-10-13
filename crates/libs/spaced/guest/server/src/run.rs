@@ -89,6 +89,9 @@ pub fn run(config: SpacedGuestRunConfig) -> Result<(), RunSpacedGuestError> {
                         source,
                     }
                 })?;
+            // The guest's own logs reach no collector; the host's health probe
+            // drains its WARN and ERROR callsites over the bridge instead.
+            pplx_space_common_svc::observability::warning_tap::enable();
             let shutdown = pplx_space_common_svc::shutdown_token();
             let result = serve(config, shutdown).await;
             if tokio::time::timeout(

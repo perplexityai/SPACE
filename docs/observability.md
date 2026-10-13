@@ -327,6 +327,25 @@ Periodic gRPC polls outside these rules still open a trace per call: dropping
 one end to end needs the caller to propagate a not-sampled context, which is
 the sampler's decision rather than the span layer's.
 
+## S3 client spans
+
+Every S3 operation SPACE issues through the shared S3 HTTP client, the object
+store's and those of snapshot storage and the runtime manager's kernel source,
+gets one `s3.client` span named `S3.<Operation>`. It covers the operation's
+retries and backoff; `s3.attempts` counts the requests, and each failed attempt
+is logged and counted where the client tracks attempts. The span carries
+`s3.outcome` (`ok`, `not_found`, `error`, `abandoned`), `http.status_class` of
+the last response, and `s3.request.bytes` and `s3.response.bytes` when the
+messages declare a length. A failure sets status ERROR and records why as
+`s3.failure_kind`, from a fixed set (`transport`, `connect_timeout`,
+`timeout`, `throttled`, `http_5xx`, `access_denied`, `http_4xx`,
+`service_error`, `abandoned`, `no_result`, `other`), which is also its status
+description; the SDK's and the server's error text, which can quote a key, is
+never recorded. No bucket, key, upload id or range is recorded either. A
+ranged download's chunk keeps its own `S3.GetObject.range` span, which covers
+reading the chunk's body as well, so each chunk shows that span with this
+request span inside it.
+
 ## Datadog trace chunks
 
 The native Datadog tracer sends the spans a process records for one trace as a
@@ -464,6 +483,48 @@ Before shared initialization, caller-owned logging uses Legacy without caching
 that fallback, preserving the historical Datadog-default behavior while allowing
 later OTLP initialization. Legacy is a migration bridge for production Datadog
 continuity; remove it after native Datadog consumers migrate.
+
+## Firecracker and guest diagnostics
+
+Firecracker and the guest's spaced write nowhere a collector reads, so
+sandbox-manager reads what they produce on its node and re-emits it.
+
+Firecracker writes a metrics flush every 60 seconds to a FIFO node-manager
+creates in its jail. Firecracker opens it non-blocking, so a flush the reader
+has not drained is dropped and counted rather than stalling the VMM. These
+node-wide metrics carry no sandbox id:
+
+| Metric | Type | Tags |
+| --- | --- | --- |
+| `sandbox.firecracker.errors` | counter | `component` (`block`, `net`, `vsock`, `vcpu`, `vmm`, `seccomp`, `signal`), `error` (the Firecracker field) |
+| `sandbox.firecracker.block.mean_latency_ms` | timing, one sample per sandbox and flush with block requests | `op` (`read`, `write`) |
+| `sandbox.firecracker.operation.duration_ms` | timing, once per VM pause, resume, snapshot load or create a flush reports | `operation` |
+| `sandbox.firecracker.metrics.flushes` | counter | `outcome` (`parsed`, `unparsable`, `oversized`) |
+| `sandbox.firecracker.telemetry_dropped` | counter, flushes or log lines Firecracker could not write | `stream` (`metrics`, `log`) |
+| `sandbox.vm.diagnostics` | counter, forwarded WARN and ERROR diagnostics | `source` (`firecracker`, `guest`), `level`, `outcome` (`logged`, `rate_limited`, `dropped_in_guest`) |
+
+The `error` values are listed in `crates/libs/metrics/src/sandbox/vm.rs`.
+
+Firecracker's WARN and ERROR log lines are re-logged by sandbox-manager as
+`firecracker warning` or `firecracker error` with `sandbox_id` and the line in
+`firecracker_message`, at most 20 in a burst and then one every 15 seconds per
+sandbox; `suppressed_since_last` counts the lines skipped. A line can carry
+guest-written values, so it is cut to 512 bytes and its control characters
+are replaced. INFO and DEBUG lines are not forwarded.
+
+spaced records its own WARN and ERROR callsites (level, target, source file and
+line, and a count), never message text or field values, which can carry a
+user's command, path or output. The health probe drains them over the bridge's
+`Ping` about every 24 seconds, and sandbox-manager logs up to four per drain as
+`spaced guest diagnostic` with `sandbox_id` and `guest_level`, `guest_target`,
+`guest_file`, `guest_line` and `guest_count`, at WARN whatever the guest's
+level. The guest is tenant-controlled: the host decodes at most 16 KiB of a
+`Ping` answer, reads at most 32 entries, clamps each count and bounds and
+strips each string. What a restored guest had recorded happened in the
+sandbox its snapshot came from: the guest discards it on a snapshot-restore
+resume notice, and since a restore that ends paused sends none, sandbox-manager
+also drops the first drain after every restore. A guest that predates the
+field sends none.
 
 ## Sandbox identity
 

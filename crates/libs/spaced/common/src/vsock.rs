@@ -59,6 +59,11 @@ pub fn bind_vsock(port: u32) -> std::io::Result<tokio_vsock::VsockListener> {
 pub const BRIDGE_HOST_VSOCK_PORT: u32 = 5001;
 pub const BRIDGE_GUEST_VSOCK_PORT: u32 = 5002;
 
+/// The largest bridge-guest `Ping` response a host decodes. A drain carries at
+/// most a few dozen callsites, a few kilobytes; the guest is tenant-controlled,
+/// so without a bound a single answer could cost the host megabytes to decode.
+pub const BRIDGE_GUEST_PING_MAX_DECODE_BYTES: usize = 16 * 1024;
+
 pub fn firecracker_vsock_port_path(
     vsock_uds_path: &std::path::Path,
     port: u32,

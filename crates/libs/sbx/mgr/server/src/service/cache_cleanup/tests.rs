@@ -468,6 +468,11 @@ async fn inventory_retires_registries_atomically_and_retries_busy_registrations(
         "stopped row must retain its policy obligation"
     );
     service.watchdog.rearm_sandbox_from_db(&id).await;
+    let jail = tempfile::tempdir().unwrap();
+    service
+        .watchdog
+        .vm_outputs_for_test()
+        .attach_at(&id, 1, jail.path().to_path_buf());
     service
         .snapshot_scheduler
         .add_sandbox(id.clone(), "seed".into())
@@ -509,6 +514,7 @@ async fn inventory_retires_registries_atomically_and_retries_busy_registrations(
             .is_some()
     );
     assert!(service.watchdog.get_health(&id).await.is_some());
+    assert!(service.watchdog.vm_outputs_for_test().is_attached(&id));
     drop(busy);
 
     assert_eq!(reconcile().removed_ids.len(), 1);
@@ -519,6 +525,7 @@ async fn inventory_retires_registries_atomically_and_retries_busy_registrations(
     );
     assert!(service.watchdog.get_health(&id).await.is_none());
     assert!(service.watchdog.sidecar_info_for_test(&id).await.is_none());
+    assert!(!service.watchdog.vm_outputs_for_test().is_attached(&id));
     assert!(!service.snapshot_scheduler.is_active(&id).await);
     assert!(
         service

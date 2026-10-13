@@ -531,7 +531,7 @@ impl Process for MockBridgeGuest {
 #[tonic::async_trait]
 impl Meta for MockBridgeGuest {
     async fn ping(&self, _request: Request<PingRequest>) -> Result<Response<PingResponse>, Status> {
-        Ok(Response::new(PingResponse {}))
+        Ok(Response::new(PingResponse::default()))
     }
 
     async fn wait_ready(

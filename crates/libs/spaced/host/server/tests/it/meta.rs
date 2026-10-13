@@ -9,7 +9,7 @@ use pplx_space_spaced_common::proto::bridge_guest::{
     ConfigureProcessEnvRequest as BridgeGuestConfigureProcessEnvRequest,
     ConfigureProcessEnvResponse as BridgeGuestConfigureProcessEnvResponse,
     FlushFilesystemsRequest as BridgeGuestFlushFilesystemsRequest,
-    FlushFilesystemsResponse as BridgeGuestFlushFilesystemsResponse,
+    FlushFilesystemsResponse as BridgeGuestFlushFilesystemsResponse, GuestDiagnosticCallsite,
     NotifyResumeRequest as BridgeGuestNotifyResumeRequest,
     NotifyResumeResponse as BridgeGuestNotifyResumeResponse, PingRequest as BridgeGuestPingRequest,
     PingResponse as BridgeGuestPingResponse, WaitReadyRequest as BridgeGuestWaitReadyRequest,
@@ -37,6 +37,7 @@ struct ReadyWaitGuest {
     response_delay: Duration,
     response_errors: Arc<std::sync::Mutex<std::collections::VecDeque<tonic::Code>>>,
     flush_deadlines: Option<Arc<std::sync::Mutex<Vec<Duration>>>>,
+    ping_callsites: usize,
 }
 
 struct ActiveWaitReadyCall(Arc<AtomicUsize>);
@@ -53,7 +54,18 @@ impl BridgeGuestMeta for ReadyWaitGuest {
         &self,
         _request: Request<BridgeGuestPingRequest>,
     ) -> Result<Response<BridgeGuestPingResponse>, Status> {
-        Ok(Response::new(BridgeGuestPingResponse {}))
+        Ok(Response::new(BridgeGuestPingResponse {
+            diagnostics: (0..self.ping_callsites)
+                .map(|_| GuestDiagnosticCallsite {
+                    level: "warn".to_string(),
+                    target: "guest::target".repeat(4),
+                    file: "src/lib.rs".to_string(),
+                    line: 1,
+                    count: 1,
+                })
+                .collect(),
+            diagnostics_dropped: 0,
+        }))
     }
 
     async fn wait_ready(
@@ -121,6 +133,7 @@ impl ReadyWaitGuest {
             response_delay: Duration::ZERO,
             response_errors: Arc::default(),
             flush_deadlines: None,
+            ping_callsites: 0,
         }
     }
 
@@ -949,5 +962,33 @@ async fn failed_environment_dispatch_invalidates_channel_without_replaying() {
             "next caller must use a new guest channel"
         );
         server.abort();
+    }
+}
+
+/// The guest is tenant-controlled, so the host decodes at most a bounded Ping
+/// answer: a drain-sized answer is accepted, a much larger one refused.
+#[tokio::test]
+async fn guest_ping_answer_is_decoded_only_up_to_its_bound() {
+    for (callsites, accepted) in [(32, true), (4_000, false)] {
+        let temp_dir = tempfile::tempdir().expect("temp dir created");
+        let bridge_guest_socket_path = temp_dir.path().join("spaced-bridge-guest.sock");
+        let bridge_task = ReadyWaitGuest {
+            ping_callsites: callsites,
+            ..ReadyWaitGuest::new(Arc::new(AtomicUsize::new(0)))
+        }
+        .start(bridge_guest_socket_path.clone())
+        .await;
+        let fixture = HostFixture::start(Some(bridge_guest_socket_path)).await;
+        let client = fixture.client().await;
+
+        let result = client.ping_guest().await;
+        assert_eq!(
+            result.is_ok(),
+            accepted,
+            "{callsites} callsites: {result:?}"
+        );
+
+        fixture.stop().await;
+        bridge_task.abort();
     }
 }

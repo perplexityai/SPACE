@@ -757,6 +757,7 @@ fn s3_base_config(
         // names none is still bounded.
         .timeout_config(timeouts.request.timeout_config())
         .interceptor(observer)
+        .interceptor(pplx_space_s3_http_client::S3ClientSpans)
 }
 
 impl S3ObjectStore {

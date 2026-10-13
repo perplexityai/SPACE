@@ -28,7 +28,7 @@ async fn bridge_guest_wait_ready_returns_guest_readiness() {
     let service_task = tokio::spawn(service.run());
     let mut client = connect_bridge_guest(bridge_guest_socket).await;
     client
-        .ping(BridgeGuestPingRequest {})
+        .ping(BridgeGuestPingRequest::default())
         .await
         .expect("bridge guest ping response");
 
@@ -288,7 +288,7 @@ async fn bridge_guest_recycles_incomplete_http2_connections() {
     let service_task = tokio::spawn(service.run());
     let mut healthy = connect_bridge_guest(guest_socket.clone()).await;
     healthy
-        .ping(BridgeGuestPingRequest {})
+        .ping(BridgeGuestPingRequest::default())
         .await
         .expect("healthy ping");
 
@@ -324,18 +324,81 @@ async fn bridge_guest_recycles_incomplete_http2_connections() {
             .await
             .expect("connection recycled while stalled peers remain open");
         BridgeGuestClient::new(channel)
-            .ping(BridgeGuestPingRequest {})
+            .ping(BridgeGuestPingRequest::default())
             .await
             .expect("new guest ping");
     })
     .await
     .expect("preface expiry releases admission capacity");
     healthy
-        .ping(BridgeGuestPingRequest {})
+        .ping(BridgeGuestPingRequest::default())
         .await
         .expect("healthy peer preserved");
     drop(stalled);
     drop(healthy);
+    shutdown.cancel();
+    service_task
+        .await
+        .expect("service joined")
+        .expect("service stopped");
+}
+
+/// A guest restored from a snapshot forgets the diagnostics it was recorded
+/// with: they fired in the sandbox the snapshot came from. A suspend-resume of
+/// the same sandbox keeps them.
+#[tokio::test]
+async fn bridge_guest_snapshot_restore_discards_recorded_diagnostics() {
+    use pplx_space_spaced_common::proto::bridge_guest::{NotifyResumeRequest, ResumeReason};
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    let _subscriber = tracing::subscriber::set_default(
+        tracing_subscriber::registry()
+            .with(pplx_space_observability::warning_tap::layer_for_test()),
+    );
+    pplx_space_observability::warning_tap::enable();
+    let temp_dir = tempfile::tempdir().expect("temp dir created");
+    let bridge_host_socket = temp_dir.path().join("spaced-bridge-host.sock");
+    let bridge_guest_socket = temp_dir.path().join("spaced-bridge-guest.sock");
+    start_mock_bridge_host(bridge_host_socket.clone()).await;
+    let (service, shutdown) =
+        create_ready_guest_service(bridge_host_socket, None, Some(bridge_guest_socket.clone()));
+    let service_task = tokio::spawn(service.run());
+    let mut client = BridgeGuestClient::new(connect_uds(bridge_guest_socket).await);
+
+    for (reason, retained) in [
+        (ResumeReason::SuspendResume, true),
+        (ResumeReason::SnapshotRestore, false),
+    ] {
+        tracing::warn!("recorded before the guest resumed");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch");
+        client
+            .notify_resume(NotifyResumeRequest {
+                reason: reason.into(),
+                host_time: Some(prost_types::Timestamp {
+                    seconds: i64::try_from(now.as_secs()).expect("seconds fit"),
+                    nanos: 0,
+                }),
+            })
+            .await
+            .expect("notify resume");
+        let drained = client
+            .ping(BridgeGuestPingRequest {
+                drain_diagnostics: true,
+            })
+            .await
+            .expect("drain")
+            .into_inner();
+        // Only this test's callsite counts: an unprivileged clock sync warns
+        // after the discard.
+        let ours = drained
+            .diagnostics
+            .iter()
+            .any(|callsite| callsite.file == file!());
+        assert_eq!(ours, retained, "{reason:?}");
+    }
+
     shutdown.cancel();
     service_task
         .await

@@ -1301,6 +1301,9 @@ impl SandboxManagerService {
                 sandbox_id = %id
             ))
             .await;
+        // Whatever the restore's final state, paused included: the guest's
+        // first diagnostics drain is the snapshot's, not this sandbox's.
+        self.watchdog.mark_restored_from_snapshot(id);
 
         // Resume snapshot scheduling if enabled
         if sandbox.snapshots_enabled && sandbox.pool_template.is_none() {

@@ -576,7 +576,22 @@ impl ExpiryTask {
                 return;
             };
             let now = Instant::now();
+            let cached = cache.len();
             cache.retain(|_, slot| slot.deadline() > now);
+            let expired = cached.saturating_sub(cache.len());
+            // A span only for a pass that evicted something; the task wakes on
+            // every cache change.
+            if expired > 0 {
+                let span = tracing::info_span!(
+                    parent: None,
+                    "credmgr.intermediate_key_cache.expire",
+                    otel.kind = "internal",
+                    "operation.name" = "credmgr.intermediate_key_cache.expire",
+                    expired,
+                    remaining = cache.len(),
+                );
+                drop(span);
+            }
             let next_deadline = cache.iter().map(|entry| entry.value().deadline()).min();
             drop(cache);
 

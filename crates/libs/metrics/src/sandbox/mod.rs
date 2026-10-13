@@ -4,6 +4,7 @@ pub mod admission;
 pub mod api;
 pub mod publication;
 pub mod restore;
+pub mod vm;
 pub mod worker;
 
 fn sandbox_tags(backend: &str, template: Option<&str>, result: &str) -> Vec<String> {

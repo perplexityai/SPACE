@@ -57,8 +57,31 @@ service Filesystem {
   rpc GetModifiedFiles(space.spaced.operations.v1.GetModifiedFilesRequest) returns (space.spaced.operations.v1.GetModifiedFilesResponse);
 }
 
-message PingRequest {}
-message PingResponse {}
+message PingRequest {
+  // Ask the guest to hand over, and forget, the WARN and ERROR callsites it
+  // recorded since the previous draining Ping. Exactly one host caller, the
+  // sandbox manager's health probe, drains; other callers leave it unset.
+  bool drain_diagnostics = 1;
+}
+message PingResponse {
+  // spaced's own WARN and ERROR callsites since the previous draining Ping, by
+  // identity only. Never message text or field values, which can carry a
+  // user's command, path or output. Empty from guests that predate it.
+  repeated GuestDiagnosticCallsite diagnostics = 1;
+  // Events at callsites past the guest's bound, counted but not listed.
+  uint64 diagnostics_dropped = 2;
+}
+
+message GuestDiagnosticCallsite {
+  // "warn" or "error".
+  string level = 1;
+  // The tracing target, such as a Rust module path.
+  string target = 2;
+  string file = 3;
+  uint32 line = 4;
+  // Events at this callsite since the previous drain.
+  uint64 count = 5;
+}
 
 message WaitReadyRequest { google.protobuf.Duration timeout = 1; }
 message WaitReadyResponse {

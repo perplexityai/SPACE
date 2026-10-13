@@ -30,6 +30,7 @@ mod sqlx_otel;
 #[cfg(any(test, feature = "test-capture"))]
 pub mod test_capture;
 mod traces;
+pub mod warning_tap;
 
 const RUSQLITE_QUERY_TARGET: &str = "rusqlite::query";
 const SQLX_ACQUIRE_TARGET: &str = "sqlx::pool::acquire";
@@ -1045,9 +1046,11 @@ where
 {
     // Installed for every format so the formatter's filter has one subscriber
     // type; only the JSON format reads what it keeps.
-    let subscriber = subscriber.with(
-        SpanCorrelationLayer.with_filter(correlation_filter(log_filter.clone(), trace_filter)),
-    );
+    let subscriber = subscriber
+        .with(
+            SpanCorrelationLayer.with_filter(correlation_filter(log_filter.clone(), trace_filter)),
+        )
+        .with(warning_tap::WarningTapLayer.with_filter(tracing::level_filters::LevelFilter::WARN));
     // We rely on tracing-subscriber's default writer (stdout). The caller
     // computed `use_ansi` against stdout's TTY status so the fd we write and
     // the fd we test agree.

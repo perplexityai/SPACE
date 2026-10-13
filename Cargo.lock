@@ -6609,6 +6609,8 @@ version = "0.8.0"
 dependencies = [
  "aws-smithy-http-client",
  "aws-smithy-runtime-api",
+ "aws-smithy-types",
+ "tracing",
 ]
 
 [[package]]
@@ -6914,6 +6916,7 @@ dependencies = [
  "pplx-space-common-grpc",
  "pplx-space-common-svc",
  "pplx-space-metrics",
+ "pplx-space-observability",
  "pplx-space-spaced-common",
  "pplx-space-spaced-guest-client",
  "pplx-space-test-env",
@@ -6929,6 +6932,7 @@ dependencies = [
  "tonic",
  "tower",
  "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 

@@ -28,7 +28,7 @@ use aws_sdk_s3::types::{Delete, ObjectIdentifier};
 use aws_smithy_types::error::display::DisplayErrorContext;
 use aws_types::SdkConfig;
 use pplx_space_common_core::types::StorageUri;
-use pplx_space_s3_http_client::{DEFAULT_POOL_IDLE_TIMEOUT, s3_http_client};
+use pplx_space_s3_http_client::{DEFAULT_POOL_IDLE_TIMEOUT, S3ClientSpans, s3_http_client};
 
 use super::{DeletePrefixError, DeletePrefixOutcome, StorageBackend};
 
@@ -100,6 +100,7 @@ impl S3StorageBackend {
     pub fn from_sdk_config(sdk_config: &SdkConfig) -> Self {
         let config = aws_sdk_s3::config::Builder::from(sdk_config)
             .http_client(s3_http_client(DEFAULT_POOL_IDLE_TIMEOUT))
+            .interceptor(S3ClientSpans)
             .build();
         Self::new(Arc::new(Client::from_conf(config)))
     }

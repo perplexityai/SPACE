@@ -37,11 +37,12 @@ use pplx_space_spaced_common::proto::bridge_guest::process_server::{Process, Pro
 use pplx_space_spaced_common::proto::bridge_guest::{
     ClockSyncStatus, CloseStdinRequest, CloseStdinResponse, ConfigureProcessEnvRequest,
     ConfigureProcessEnvResponse, ConnectProcessRequest, FileChunk, FileInfo,
-    FlushFilesystemsRequest, FlushFilesystemsResponse, ListProcessesRequest, NotifyResumeRequest,
-    NotifyResumeResponse, PingRequest as BridgeGuestPingRequest,
-    PingResponse as BridgeGuestPingResponse, ProcessEvent, ProcessInfo, PtySize, ResizePtyRequest,
-    ResizePtyResponse, SendInputRequest, SendInputResponse, SendSignalRequest, SendSignalResponse,
-    StartRequest, WaitReadyRequest as BridgeGuestWaitReadyRequest,
+    FlushFilesystemsRequest, FlushFilesystemsResponse, GuestDiagnosticCallsite,
+    ListProcessesRequest, NotifyResumeRequest, NotifyResumeResponse,
+    PingRequest as BridgeGuestPingRequest, PingResponse as BridgeGuestPingResponse, ProcessEvent,
+    ProcessInfo, PtySize, ResizePtyRequest, ResizePtyResponse, SendInputRequest, SendInputResponse,
+    SendSignalRequest, SendSignalResponse, StartRequest,
+    WaitReadyRequest as BridgeGuestWaitReadyRequest,
     WaitReadyResponse as BridgeGuestWaitReadyResponse,
 };
 use pplx_space_spaced_common::proto::bridge_host::meta_client::MetaClient as BridgeHostClient;

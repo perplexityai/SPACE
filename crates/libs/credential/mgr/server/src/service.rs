@@ -1245,15 +1245,61 @@ async fn assume_s3_vend_role(
     session_policy: &str,
     ttl_seconds: u32,
 ) -> Result<AwsCredentials, Status> {
+    use tracing::Instrument as _;
     let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
-    let provider = aws_config::sts::AssumeRoleProvider::builder(role_arn)
-        .session_name("space-storage-exchange")
-        .session_length(Duration::from_secs(u64::from(ttl_seconds)))
-        .policy(session_policy)
-        .configure(&config)
-        .build()
-        .await;
-    let creds = provider.provide_credentials().await.map_err(|e| {
+    let span = tracing::info_span!(
+        "sts.client",
+        otel.kind = "client",
+        otel.name = "STS.AssumeRole",
+        otel.status_code = tracing::field::Empty,
+        otel.status_description = tracing::field::Empty,
+        "operation.name" = "sts.client",
+        rpc.system = "aws-api",
+        rpc.service = "STS",
+        rpc.method = "AssumeRole",
+    );
+    let assumed = async {
+        aws_config::sts::AssumeRoleProvider::builder(role_arn)
+            .session_name("space-storage-exchange")
+            .session_length(Duration::from_secs(u64::from(ttl_seconds)))
+            .policy(session_policy)
+            .configure(&config)
+            .build()
+            .await
+            .provide_credentials()
+            .await
+    }
+    .instrument(span.clone())
+    .await;
+    match &assumed {
+        Ok(_) => {
+            span.record("otel.status_code", "OK");
+        }
+        // A fixed kind, not the provider's text, which can quote the role ARN.
+        Err(error) => {
+            let kind = match error {
+                aws_credential_types::provider::error::CredentialsError::CredentialsNotLoaded(
+                    _,
+                ) => "not_loaded",
+                aws_credential_types::provider::error::CredentialsError::ProviderTimedOut(_) => {
+                    "timeout"
+                }
+                aws_credential_types::provider::error::CredentialsError::InvalidConfiguration(
+                    _,
+                ) => "invalid_configuration",
+                aws_credential_types::provider::error::CredentialsError::ProviderError(_) => {
+                    "provider_error"
+                }
+                _ => "other",
+            };
+            span.record("otel.status_code", "ERROR");
+            span.record(
+                "otel.status_description",
+                format!("STS AssumeRole failed: {kind}").as_str(),
+            );
+        }
+    }
+    let creds = assumed.map_err(|e| {
         tracing::warn!(error = %e, "storage role assumption failed");
         Status::failed_precondition("failed to assume the configured storage role")
     })?;

@@ -196,6 +196,7 @@ pub struct JailerLaunch<'a> {
     pub gid: u32,
     pub fc_config_path: &'a str,
     pub fc_log_path: &'a str,
+    pub fc_metrics_path: &'a str,
     pub fc_console_path: &'a str,
     pub cgroup_limits: &'a crate::cgroup::CgroupLimits,
 }

@@ -43,6 +43,11 @@ message LaunchFirecrackerRequest {
   string fc_console_path = 10;
   CgroupLimits cgroup_limits = 11;
   string execution_id = 12;
+  // A FIFO inside the jail, relative to its root, that Firecracker writes its
+  // metrics flushes to. Empty means no metrics output: Firecracker would create
+  // a regular file at a missing path, so the caller sets this only after it has
+  // created the FIFO.
+  string fc_metrics_path = 13;
 }
 
 message LaunchFirecrackerResponse {

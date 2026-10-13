@@ -37,6 +37,7 @@ pub mod snapshot_upload_jobs;
 pub mod state;
 pub mod template_resolver;
 mod transfer_directory;
+mod vm_diagnostics;
 pub mod watchdog;
 
 pub use pplx_space_sbx_mgr_client::{

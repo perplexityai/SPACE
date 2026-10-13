@@ -486,7 +486,7 @@ impl SpacedHostService {
             BRIDGE_GUEST_PROBE_TIMEOUT,
             "bridge guest ping timed out",
             async {
-                let (mut client, _) = self.connect_bridge_guest().await.map_err(|error| {
+                let (client, _) = self.connect_bridge_guest().await.map_err(|error| {
                     host_relay_status(
                         Status::unavailable(error.to_string()),
                         "bridge_guest_ping",
@@ -494,7 +494,10 @@ impl SpacedHostService {
                     )
                 })?;
                 client
-                    .ping(BridgeGuestPingRequest {})
+                    .max_decoding_message_size(
+                        pplx_space_spaced_common::BRIDGE_GUEST_PING_MAX_DECODE_BYTES,
+                    )
+                    .ping(BridgeGuestPingRequest::default())
                     .await
                     .map(|_| ())
                     .map_err(|status| {
@@ -1015,7 +1018,14 @@ impl SpacedHostService {
         self.call_bridge_guest(
             "bridge_guest_ping",
             BridgeGuestOperationBudget::RuntimeMetadata,
-            |mut client| async move { client.ping(BridgeGuestPingRequest {}).await },
+            |client| async move {
+                client
+                    .max_decoding_message_size(
+                        pplx_space_spaced_common::BRIDGE_GUEST_PING_MAX_DECODE_BYTES,
+                    )
+                    .ping(BridgeGuestPingRequest::default())
+                    .await
+            },
         )
         .await
         .map(|_| ())

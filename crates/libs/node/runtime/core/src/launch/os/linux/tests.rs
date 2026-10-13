@@ -135,6 +135,7 @@ fn jailer_args_keep_existing_launch_contract() {
         gid: 200000,
         fc_config_path: "/vm-config.json",
         fc_log_path: "/fc.log",
+        fc_metrics_path: "",
         cgroup_limits: &CgroupLimits::default(),
         daemonize: true,
     });
@@ -167,6 +168,7 @@ fn jailer_args_keep_existing_launch_contract() {
         gid: 200000,
         fc_config_path: "/vm-config.json",
         fc_log_path: "/fc.log",
+        fc_metrics_path: "",
         cgroup_limits: &CgroupLimits::default(),
         daemonize: false,
     });

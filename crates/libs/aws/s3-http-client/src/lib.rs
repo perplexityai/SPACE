@@ -6,11 +6,15 @@
 //! "connection closed before message completed". Pass [`s3_http_client`] to
 //! `http_client` on every S3 client config or `SdkConfig` loader.
 
+mod client_span;
+
 use std::time::Duration;
 
 use aws_smithy_http_client::proxy::ProxyConfig;
 use aws_smithy_http_client::{Builder, ConnectorBuilder, tls};
 use aws_smithy_runtime_api::client::http::SharedHttpClient;
+
+pub use client_span::S3ClientSpans;
 
 /// How long an idle pooled connection stays eligible for reuse. S3
 /// (us-east-1, measured 2026-10) closes an idle HTTPS keep-alive connection

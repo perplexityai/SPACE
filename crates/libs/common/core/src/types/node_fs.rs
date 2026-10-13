@@ -43,6 +43,10 @@ pub const SANDBOX_CACHE_DIR: &str = "/space/cache/firecracker/sandboxes";
 pub const FORK_COPY_STAGING_DIR_NAME: &str = ".fork-copies";
 /// Firecracker jail directory root.
 pub const FIRECRACKER_JAIL_DIR: &str = "/space/cache/firecracker/jails";
+/// Firecracker's log file, in its jail root.
+pub const FIRECRACKER_LOG_FILE: &str = "fc.log";
+/// The FIFO Firecracker writes its metrics flushes to, in its jail root.
+pub const FIRECRACKER_METRICS_FIFO: &str = "fc-metrics.fifo";
 /// Template artifact directory root.
 pub const TEMPLATE_DIR: &str = "/space/cache/firecracker/templates";
 

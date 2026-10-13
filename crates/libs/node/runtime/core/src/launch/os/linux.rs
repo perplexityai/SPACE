@@ -279,6 +279,7 @@ pub struct JailerLaunch<'a> {
     pub gid: u32,
     pub fc_config_path: &'a str,
     pub fc_log_path: &'a str,
+    pub fc_metrics_path: &'a str,
     pub fc_console_path: &'a str,
     pub cgroup_limits: &'a crate::cgroup::CgroupLimits,
 }
@@ -514,6 +515,7 @@ pub fn launch_via_jailer(config: JailerLaunch<'_>) -> Result<u32, String> {
         gid,
         fc_config_path,
         fc_log_path,
+        fc_metrics_path,
         fc_console_path,
         cgroup_limits,
     } = config;
@@ -528,6 +530,7 @@ pub fn launch_via_jailer(config: JailerLaunch<'_>) -> Result<u32, String> {
         gid,
         fc_config_path,
         fc_log_path,
+        fc_metrics_path,
         cgroup_limits,
         daemonize: true,
     });
@@ -597,6 +600,7 @@ struct JailerArgs<'a> {
     gid: u32,
     fc_config_path: &'a str,
     fc_log_path: &'a str,
+    fc_metrics_path: &'a str,
     cgroup_limits: &'a crate::cgroup::CgroupLimits,
     daemonize: bool,
 }
@@ -611,6 +615,7 @@ fn jailer_args(config: JailerArgs<'_>) -> Vec<String> {
         gid,
         fc_config_path,
         fc_log_path,
+        fc_metrics_path,
         cgroup_limits,
         daemonize,
     } = config;
@@ -657,12 +662,18 @@ fn jailer_args(config: JailerArgs<'_>) -> Vec<String> {
         args.extend(["--config-file".to_string(), fc_config_path.to_string()]);
     }
     if !fc_log_path.is_empty() {
+        // The level prefix lets sandbox-manager forward WARN and ERROR lines
+        // without forwarding the INFO lines around them.
         args.extend([
             "--log-path".to_string(),
             fc_log_path.to_string(),
             "--level".to_string(),
             "Info".to_string(),
+            "--show-level".to_string(),
         ]);
+    }
+    if !fc_metrics_path.is_empty() {
+        args.extend(["--metrics-path".to_string(), fc_metrics_path.to_string()]);
     }
     args
 }

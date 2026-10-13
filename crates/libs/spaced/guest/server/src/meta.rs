@@ -210,13 +210,30 @@ fn require_activity_state(state: LocalActivityState) -> Result<LocalActivityStat
 impl BridgeGuestMeta for SpacedGuestService {
     async fn ping(
         &self,
-        _request: Request<BridgeGuestPingRequest>,
+        request: Request<BridgeGuestPingRequest>,
     ) -> Result<Response<BridgeGuestPingResponse>, Status> {
         tracing::debug!(
             command = "bridge_guest_ping",
             "spaced bridge guest command succeeded"
         );
-        Ok(Response::new(BridgeGuestPingResponse {}))
+        if !request.into_inner().drain_diagnostics {
+            return Ok(Response::new(BridgeGuestPingResponse::default()));
+        }
+        let drained = pplx_space_observability::warning_tap::drain();
+        Ok(Response::new(BridgeGuestPingResponse {
+            diagnostics: drained
+                .callsites
+                .into_iter()
+                .map(|callsite| GuestDiagnosticCallsite {
+                    level: callsite.level.as_str().to_string(),
+                    target: callsite.target.to_string(),
+                    file: callsite.file.to_string(),
+                    line: callsite.line,
+                    count: callsite.count,
+                })
+                .collect(),
+            diagnostics_dropped: drained.dropped,
+        }))
     }
 
     async fn wait_ready(
@@ -262,6 +279,11 @@ impl BridgeGuestMeta for SpacedGuestService {
                 .map_err(|_| Status::invalid_argument("unknown resume_reason"))?;
         if reason == pplx_space_spaced_common::proto::bridge_guest::ResumeReason::Unspecified {
             return Err(Status::invalid_argument("resume_reason is required"));
+        }
+        // A restored guest's diagnostics record came with the snapshot: they
+        // happened in the sandbox it was taken from.
+        if reason == pplx_space_spaced_common::proto::bridge_guest::ResumeReason::SnapshotRestore {
+            pplx_space_observability::warning_tap::discard();
         }
         let clock_sync_status = sync_guest_clock(request.host_time)?;
         let ready = *self.inner.ready.borrow();

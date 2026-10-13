@@ -2,6 +2,7 @@ use super::cleanup_helpers::*;
 use super::validation::*;
 use super::*;
 use pplx_space_common_core::host::linux::paths;
+use pplx_space_common_core::host::linux::paths::{FIRECRACKER_LOG_FILE, FIRECRACKER_METRICS_FIFO};
 use pplx_space_common_core::sandbox_storage::{validate_rootfs_bytes, validate_rootfs_mib};
 use pplx_space_node_runtime_core::runtime_inventory::{
     ExecutionResolver, ExecutionSelectionMode, RuntimeFileRole, boot_component_role,
@@ -493,10 +494,31 @@ impl NodeManagerService {
 
         // For snapshot restore: start FC idle (no config, just API socket)
         // For normal boot: start FC with config file
-        let (fc_config, fc_log) = if req.snapshot_restore {
-            ("", "/fc.log")
+        let fc_config = if req.snapshot_restore {
+            ""
         } else {
-            ("/vm-config.json", "/fc.log")
+            "/vm-config.json"
+        };
+        let fc_log = format!("/{FIRECRACKER_LOG_FILE}");
+        // Firecracker writes its metrics flushes to a FIFO that sandbox-manager
+        // reads. Created after the chown above, which would hand its group to
+        // the sandbox. Best effort: a launch without one has no Firecracker
+        // metrics, and Firecracker is told about it only once it exists.
+        let metrics_fifo = format!("{jail_root}/{FIRECRACKER_METRICS_FIFO}");
+        let fc_metrics = match spawn_lifecycle_blocking(&_lifecycle_permit, move || {
+            create_firecracker_metrics_fifo(Path::new(&metrics_fifo), sandbox_uid)
+        })
+        .await
+        {
+            Ok(Ok(())) => format!("/{FIRECRACKER_METRICS_FIFO}"),
+            Ok(Err(error)) => {
+                tracing::warn!(sandbox_id, %error, "launching without Firecracker metrics");
+                String::new()
+            }
+            Err(error) => {
+                tracing::warn!(sandbox_id, %error, "launching without Firecracker metrics");
+                String::new()
+            }
         };
         let fc_console = if self.guest_console_logs {
             format!("{RUN_DIR}/{sandbox_id}/guest-console.log")
@@ -519,7 +541,8 @@ impl NodeManagerService {
                     uid: sandbox_uid,
                     gid: sandbox_uid,
                     fc_config_path: fc_config.to_string(),
-                    fc_log_path: fc_log.to_string(),
+                    fc_log_path: fc_log,
+                    fc_metrics_path: fc_metrics,
                     fc_console_path: fc_console.clone(),
                     cgroup_limits: Some(self.launch_cgroup_limits(req)),
                 },
@@ -977,3 +1000,22 @@ fn run_rootfs_resize_command(
 
 #[cfg(test)]
 mod tests;
+
+/// Create the metrics FIFO owned by the sandbox's Firecracker user, which
+/// opens it read-write and non-blocking so a full pipe drops a flush rather
+/// than stalling the VMM, and readable by sandbox-manager's group.
+fn create_firecracker_metrics_fifo(path: &Path, sandbox_uid: u32) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let sbxmgr_gid = pplx_space_common_core::host::linux::identities::groups::SPACE_SBXMGR.gid;
+    nix::unistd::mkfifo(path, nix::sys::stat::Mode::from_bits_truncate(0o600))?;
+    let configured = std::os::unix::fs::lchown(path, Some(sandbox_uid), Some(sbxmgr_gid))
+        .and_then(|()| std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o640)));
+    if let Err(error) = configured {
+        // Firecracker must not start with a FIFO it cannot open.
+        if let Err(remove_error) = std::fs::remove_file(path) {
+            tracing::warn!(path = %path.display(), error = %remove_error, "cannot remove unusable metrics FIFO");
+        }
+        return Err(error);
+    }
+    Ok(())
+}

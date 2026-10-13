@@ -691,6 +691,8 @@ pub struct SandboxWatchdog {
     expected_route_verification_key_generation: Arc<AtomicU64>,
     feature_flags: pplx_space_feature_flags::FeatureFlagClient,
     node_manager: NodeManagerConnector,
+    vm_outputs: crate::vm_diagnostics::VmOutputReaders,
+    restored_guests: crate::vm_diagnostics::RestoredGuests,
 }
 
 #[derive(Clone, Default)]
@@ -774,6 +776,7 @@ impl SandboxWatchdog {
             shutdown_token.clone(),
             drain_state,
         );
+        let restored_guests = crate::vm_diagnostics::RestoredGuests::default();
         let health = composed_health_loop(
             state.clone(),
             sidecars.clone(),
@@ -783,6 +786,7 @@ impl SandboxWatchdog {
             lifecycle_epochs,
             shutdown_token.child_token(),
             node_manager.clone(),
+            restored_guests.clone(),
         );
         task_tracker.spawn(async move {
             let _guard = health_guard;
@@ -796,6 +800,8 @@ impl SandboxWatchdog {
             expected_route_verification_key_generation,
             feature_flags,
             node_manager,
+            vm_outputs: crate::vm_diagnostics::VmOutputReaders::new(shutdown_token.child_token()),
+            restored_guests,
         }
     }
 
@@ -834,6 +840,7 @@ impl SandboxWatchdog {
 
     pub async fn add_sandbox(&self, info: SidecarInfo) {
         let id = info.sandbox_id.clone();
+        self.vm_outputs.attach(&id, info.runtime_pid).await;
         let network_tx_bytes = info.network_tx_bytes;
         let network_rx_bytes = info.network_rx_bytes;
         {
@@ -914,11 +921,24 @@ impl SandboxWatchdog {
     }
 
     #[cfg(test)]
+    pub(crate) fn vm_outputs_for_test(&self) -> &crate::vm_diagnostics::VmOutputReaders {
+        &self.vm_outputs
+    }
+
+    #[cfg(test)]
     pub(crate) async fn sidecar_info_for_test(&self, sandbox_id: &str) -> Option<SidecarInfo> {
         self.sidecars.lock().await.get(sandbox_id).cloned()
     }
 
+    /// Note that this sandbox's guest was just restored from a snapshot, so its
+    /// next diagnostics drain is the snapshot's ([`crate::vm_diagnostics::RestoredGuests`]).
+    pub(crate) fn mark_restored_from_snapshot(&self, sandbox_id: &str) {
+        self.restored_guests.mark(sandbox_id);
+    }
+
     pub async fn remove_sandbox(&self, sandbox_id: &str) {
+        self.vm_outputs.detach(sandbox_id);
+        self.restored_guests.forget(sandbox_id);
         let committed_pid = self
             .sidecars
             .lock()
@@ -954,10 +974,14 @@ impl SandboxWatchdog {
     ) -> Option<impl FnOnce() + use<'a>> {
         let mut health = self.state.try_lock().ok()?;
         let mut sidecars = self.sidecars.try_lock().ok()?;
+        let vm_outputs = &self.vm_outputs;
+        let restored_guests = &self.restored_guests;
         let sandbox_id = sandbox_id.to_owned();
         Some(move || {
             health.remove(&sandbox_id);
             sidecars.remove(&sandbox_id);
+            vm_outputs.detach(&sandbox_id);
+            restored_guests.forget(&sandbox_id);
         })
     }
 
@@ -2146,6 +2170,7 @@ async fn composed_health_loop(
     lifecycle_epochs: HealthLifecycleEpochs,
     shutdown_token: CancellationToken,
     node_manager: NodeManagerConnector,
+    restored_guests: crate::vm_diagnostics::RestoredGuests,
 ) {
     let mut interval = tokio::time::interval(HEALTH_SCHEDULER_TICK);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -2233,9 +2258,16 @@ async fn composed_health_loop(
                 diagnostics::report_transition(&evidence_queue, &transition);
             }
             let node_manager = node_manager.clone();
+            let restored_guests = restored_guests.clone();
             pending.spawn(async move {
-                let result =
-                    probe_composed_health(&sandbox_id, &info, lifecycle, &node_manager).await;
+                let result = probe_composed_health(
+                    &sandbox_id,
+                    &info,
+                    lifecycle,
+                    &node_manager,
+                    &restored_guests,
+                )
+                .await;
                 (sandbox_id, lifecycle, lifecycle_epoch, result)
             });
         }
@@ -2290,10 +2322,11 @@ async fn probe_composed_health(
     info: &SidecarInfo,
     lifecycle: Option<crate::state::SandboxState>,
     node_manager: &NodeManagerConnector,
+    restored_guests: &crate::vm_diagnostics::RestoredGuests,
 ) -> ComposedProbeResult {
     let firecracker = probe_firecracker_health(sandbox_id, lifecycle, node_manager);
     let spaced_host = probe_spaced_host_health(sandbox_id);
-    let spaced_guest = probe_spaced_guest_health(info, lifecycle);
+    let spaced_guest = probe_spaced_guest_health(info, lifecycle, restored_guests);
     let net_gateway = probe_net_gateway_health(sandbox_id);
     let (firecracker, spaced_host, spaced_guest, net_gateway) =
         tokio::join!(firecracker, spaced_host, spaced_guest, net_gateway);
@@ -2397,6 +2430,7 @@ async fn probe_spaced_host_health(sandbox_id: &str) -> HealthObservation {
 async fn probe_spaced_guest_health(
     info: &SidecarInfo,
     lifecycle: Option<crate::state::SandboxState>,
+    restored_guests: &crate::vm_diagnostics::RestoredGuests,
 ) -> HealthObservation {
     let started = Instant::now();
     if lifecycle == Some(crate::state::SandboxState::Paused) {
@@ -2438,13 +2472,27 @@ async fn probe_spaced_guest_health(
             .await
             .map_err(|error| error.to_string())?;
         let mut client =
-            pplx_space_spaced_common::proto::bridge_guest::meta_client::MetaClient::new(channel);
+            pplx_space_spaced_common::proto::bridge_guest::meta_client::MetaClient::new(channel)
+                .max_decoding_message_size(
+                    pplx_space_spaced_common::BRIDGE_GUEST_PING_MAX_DECODE_BYTES,
+                );
+        // This probe is the one host caller that drains the guest's
+        // diagnostics; spaced-host's own pings leave them in place.
         client
-            .ping(pplx_space_spaced_common::proto::bridge_guest::PingRequest {})
+            .ping(pplx_space_spaced_common::proto::bridge_guest::PingRequest {
+                drain_diagnostics: true,
+            })
             .await
             .map_err(|error| error.to_string())
     })
     .await;
+    if let Ok(Ok(response)) = &result {
+        crate::vm_diagnostics::forward_guest_diagnostics(
+            &info.sandbox_id,
+            response.get_ref(),
+            restored_guests,
+        );
+    }
     observation_from_probe_result(started, result, "pong")
 }
 
