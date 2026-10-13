@@ -1288,6 +1288,16 @@ pub mod trace_propagation {
         let _ = span.set_parent(cx);
     }
 
+    /// Whether incoming HTTP headers carry a valid trace context, that is,
+    /// whether the caller's request is being traced.
+    pub fn headers_carry_trace_context(headers: &HeaderMap) -> bool {
+        use opentelemetry::trace::TraceContextExt;
+        let cx = opentelemetry::global::get_text_map_propagator(|propagator| {
+            propagator.extract(&HeaderExtractor(headers))
+        });
+        cx.span().span_context().is_valid()
+    }
+
     /// Extract an OpenTelemetry context from incoming HTTP headers and attach
     /// it as the parent of an explicit span before that span is entered.
     pub fn set_span_parent_from_headers(span: &tracing::Span, headers: &HeaderMap) {
@@ -1325,6 +1335,20 @@ pub mod trace_propagation {
         }
     }
 
+    /// Whether the current span carries a valid trace context, that is, whether
+    /// a span opened now would join a trace rather than start one.
+    ///
+    /// Client wrappers use this to keep background calls, made with no request
+    /// in scope, from opening a root trace per successful call.
+    pub fn has_traced_current_span() -> bool {
+        use opentelemetry::trace::TraceContextExt;
+        tracing::Span::current()
+            .context()
+            .span()
+            .span_context()
+            .is_valid()
+    }
+
     /// Serialize an explicit tracing span's OpenTelemetry context as W3C
     /// traceparent. This is useful when the child work happens on another task.
     pub fn traceparent_for_span(span: &tracing::Span) -> Option<String> {
@@ -1359,8 +1383,14 @@ pub mod trace_propagation {
     pub fn inject_current_context_into_headers<T>(_headers: &mut T) {}
     pub fn set_span_parent_context_from<T>(_span: &tracing::Span, _metadata: &T) {}
     pub fn set_span_parent_from_headers<T>(_span: &tracing::Span, _headers: &T) {}
+    pub fn headers_carry_trace_context<T>(_headers: &T) -> bool {
+        false
+    }
     pub fn set_span_parent_from_traceparent(_span: &tracing::Span, _traceparent: &str) {}
     pub fn link_span_from_traceparent(_span: &tracing::Span, _traceparent: &str) {}
+    pub fn has_traced_current_span() -> bool {
+        false
+    }
     pub fn traceparent_for_span(_span: &tracing::Span) -> Option<String> {
         None
     }

@@ -607,12 +607,29 @@ pub trait HttpSpanMetadata: Clone + Send + Sync + 'static {
         _span: &tracing::Span,
     ) {
     }
+
+    /// Whether this request gets no `http.server` span: by default a probe
+    /// ([`is_probe_request`]). A surface that also serves user traffic on the
+    /// probe paths overrides this so that traffic stays traced.
+    fn is_untraced(&self, method: &Method, _headers: &HeaderMap, raw_path: &str) -> bool {
+        is_probe_request(method, raw_path)
+    }
+}
+
+/// A kubelet or load-balancer probe: a GET of one of [`UNTRACED_HTTP_PATHS`].
+pub fn is_probe_request(method: &Method, raw_path: &str) -> bool {
+    method == Method::GET && UNTRACED_HTTP_PATHS.contains(&raw_path)
 }
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct DefaultHttpSpanMetadata;
 
 impl HttpSpanMetadata for DefaultHttpSpanMetadata {}
+
+/// Probe endpoints whose GETs get no `http.server` span by default. Kubelets
+/// and load balancers call them every few seconds, so their traces would
+/// outnumber every request's, and monitors already exclude them.
+const UNTRACED_HTTP_PATHS: [&str; 4] = ["/health", "/healthz", "/readyz", "/livez"];
 
 #[derive(Clone, Debug)]
 pub struct HttpServerMakeSpan<M = DefaultHttpSpanMetadata> {
@@ -641,6 +658,12 @@ where
     fn make_span(&mut self, request: &HttpRequest<B>) -> tracing::Span {
         let method = request.method();
         let raw_path = request.uri().path();
+        if self
+            .metadata
+            .is_untraced(method, request.headers(), raw_path)
+        {
+            return tracing::Span::none();
+        }
         let matched_route = request
             .extensions()
             .get::<MatchedPath>()
@@ -924,6 +947,14 @@ pub struct GrpcMakeSpan;
 impl<B> MakeSpan<B> for GrpcMakeSpan {
     fn make_span(&mut self, request: &HttpRequest<B>) -> tracing::Span {
         let path = request.uri().path();
+        // A health check traced by its caller keeps its server span.
+        if pplx_space_common_grpc::is_untraced_grpc_path(path)
+            && !pplx_space_observability::trace_propagation::headers_carry_trace_context(
+                request.headers(),
+            )
+        {
+            return tracing::Span::none();
+        }
         let (rpc_service, rpc_method) = parse_grpc_path(path);
         let server_service = current_service_name();
         let client_service =

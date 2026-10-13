@@ -251,12 +251,28 @@ fn grpc_application_status_classifier() -> GrpcErrorsAsFailures {
         .with_success(GrpcCode::Unauthenticated)
 }
 
+/// Whether this gRPC path is a health check, whose calls get no span unless
+/// they run inside a traced request.
+///
+/// Kubelet probes, load balancers and capability polls call it every few
+/// seconds with no request in scope; their traces would outnumber every
+/// request's, and monitors already exclude them. A check a request makes, such
+/// as a wake path's capability probe, keeps its client and server spans.
+pub fn is_untraced_grpc_path(path: &str) -> bool {
+    path.starts_with("/grpc.health.v1.Health/")
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct GrpcClientMakeSpan;
 
 impl<B> MakeSpan<B> for GrpcClientMakeSpan {
     fn make_span(&mut self, request: &Request<B>) -> tracing::Span {
         let path = request.uri().path();
+        if is_untraced_grpc_path(path)
+            && !pplx_space_observability::trace_propagation::has_traced_current_span()
+        {
+            return tracing::Span::none();
+        }
         let (rpc_service, rpc_method) = parse_grpc_path(path);
         let otel_name = format!("{rpc_service}/{rpc_method}");
 

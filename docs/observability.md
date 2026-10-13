@@ -294,6 +294,39 @@ SQLite migration pool's wait is counted in the PostgreSQL pool metric. Set
 Sidecars and guest workers inherit `SPACE_TRACE_FILTER`, so a child exports the
 same span set as its parent.
 
+## Untraced background traffic
+
+Some calls repeat every few seconds and almost always succeed, and a root trace
+for each would outnumber every request's. They are left untraced, whatever the
+filter:
+
+- `grpc.health.v1.Health` calls made outside a traced request: on the client,
+  with no traced span current; on the server, with no trace context from the
+  caller. A health check a request makes, such as a wake path's capability
+  probe, keeps both spans.
+- GET requests for `/health`, `/healthz`, `/readyz` and `/livez`. Probes report
+  their own result. The data plane keeps every request to a sandbox host
+  traced whatever its path: a sandbox app's `/health` is the sandbox's own
+  traffic.
+- A `grpc.client.connect` made while no traced span is current, that is a
+  background dial, records a span only when it fails, as a root carrying the
+  error. A dial inside a traced request is that request's child, as before.
+- A Kubernetes read (`get`, `list`, `watch`) made while no traced span is
+  current records a `kubernetes.client` span only when it fails: an error, an
+  error status, a response body that fails, or a call dropped before its body
+  completes, as by a caller's timeout. A single-object `get`'s 404 is an
+  existence check's answer, and a watch its consumer drops has not failed. The
+  span opens when the failure is known and carries the call's latency as
+  `k8s.duration_ms`. Writes keep their spans, because a write is a change.
+- The cluster-controller's leadership lease records `kubernetes.client` spans
+  only for failed calls, renewals included; a 409 on its create or replace is a
+  lost race, not a failure. A tick that acquires or loses leadership records
+  `leader_election.change`.
+
+Periodic gRPC polls outside these rules still open a trace per call: dropping
+one end to end needs the caller to propagate a not-sampled context, which is
+the sampler's decision rather than the span layer's.
+
 ## Datadog trace chunks
 
 The native Datadog tracer sends the spans a process records for one trace as a

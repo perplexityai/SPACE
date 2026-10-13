@@ -691,6 +691,19 @@ impl HttpSpanMetadata for DataPlaneHttpSpanMetadata {
             span.record("session_id", session_id);
         }
     }
+
+    /// A sandbox-host request is the sandbox's own traffic, proxied to its
+    /// service port or envd, so it stays traced whatever its path: a sandbox
+    /// app's `/health` can wake, restore or fail like any other request.
+    fn is_untraced(
+        &self,
+        method: &axum::http::Method,
+        headers: &HeaderMap,
+        raw_path: &str,
+    ) -> bool {
+        self.ecw_hosts.parse_sandbox_host(headers).is_none()
+            && pplx_space_common_svc::is_probe_request(method, raw_path)
+    }
 }
 
 async fn ecw_service_proxy(

@@ -79,6 +79,8 @@ pub enum RunClusterControllerError {
     CredentialsPool(#[source] pplx_space_common_svc::sql::DatabaseConnectOptionsError),
     #[error("substrate init failed: {0}")]
     Substrate(#[source] pplx_space_api::controllers::substrate::SubstrateError),
+    #[error("failed to build the leadership lease client: {0}")]
+    LeaseClient(#[source] kube::Error),
     /// The leadership lease could not be reached for longer than the liveness
     /// budget. Retrying in-process would not recover a wedged client.
     #[error("{SERVICE_NAME} leadership lease unreachable; exiting to restart")]
@@ -143,8 +145,14 @@ pub async fn run(
     let authority: leader_election::ReconcilerAuthority<leader_election::KubeLeaseStore> =
         match &substrate {
             Substrate::Kubernetes(kube) if le_config.enabled => {
+                // Renewals and standby polls are the idle steady state, so the
+                // lease gets a client that records spans only for failures.
+                let lease_client =
+                    pplx_space_common_svc::kube_client::failure_traced_kube_client_from_env()
+                        .await
+                        .map_err(RunClusterControllerError::LeaseClient)?;
                 let store = std::sync::Arc::new(leader_election::KubeLeaseStore::new(
-                    kube.k8s.client.clone(),
+                    lease_client,
                     &config.lease_namespace,
                 ));
                 tracing::info!(

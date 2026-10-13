@@ -107,17 +107,17 @@ where
     let mut retry_index = 0;
 
     loop {
-        let connect_span = connect_span(
+        let connect_span = ConnectSpan::start(
             service_name,
             "Connect",
             "uds",
-            &socket_path.display(),
+            socket_path.display().to_string(),
             retry_index,
         );
         let remaining = retry_policy
             .max_elapsed
             .saturating_sub(started_at.elapsed());
-        let result = tokio::time::timeout(remaining, connect().instrument(connect_span.clone()))
+        let result = tokio::time::timeout(remaining, connect().instrument(connect_span.span()))
             .await
             .unwrap_or_else(|_| {
                 Err(UdsConnectError::Timeout {
@@ -128,11 +128,11 @@ where
             });
         match result {
             Ok(channel) => {
-                record_connect_ok(&connect_span);
+                connect_span.record_ok();
                 return Ok(channel);
             }
             Err(error) => {
-                record_connect_error(&connect_span, &error);
+                connect_span.record_error(&error);
                 let Some(delay) = retry_policy.backoff_delay(retry_index) else {
                     log_uds_connect_exhausted(
                         service_name,
@@ -345,8 +345,14 @@ where
     let started_at = tokio::time::Instant::now();
     let mut retry_index = 0;
     loop {
-        let connect_span = connect_span(service_name, "Connect", "tcp", &target, retry_index);
-        let outcome = tokio::time::timeout(attempt_cap, attempt().instrument(connect_span.clone()))
+        let connect_span = ConnectSpan::start(
+            service_name,
+            "Connect",
+            "tcp",
+            target.to_owned(),
+            retry_index,
+        );
+        let outcome = tokio::time::timeout(attempt_cap, attempt().instrument(connect_span.span()))
             .await
             .unwrap_or_else(|_| {
                 Err(E::from(TcpConnectError::AttemptTimeout {
@@ -357,12 +363,12 @@ where
             });
         let error = match outcome {
             Ok(connected) => {
-                record_connect_ok(&connect_span);
+                connect_span.record_ok();
                 return Ok(connected);
             }
             Err(error) => error,
         };
-        record_connect_error(&connect_span, &error);
+        connect_span.record_error(&error);
         let elapsed = started_at.elapsed();
         let delay = retry_policy.backoff_delay(retry_index).filter(|delay| {
             elapsed < retry_policy.max_elapsed
@@ -485,36 +491,77 @@ impl tower::Service<http::Uri> for RetryingTcpConnector {
     }
 }
 
-fn connect_span(
+/// One connect attempt's `grpc.client.connect` span.
+///
+/// An attempt made inside a traced span is that span's child. A background
+/// dial, with no traced span current, records nothing when it connects, so a
+/// reconnecting loop does not open a root trace per dial; when it fails, a
+/// root span records the error.
+struct ConnectSpan {
     service_name: &'static str,
     command: &'static str,
     transport: &'static str,
-    target: &dyn std::fmt::Display,
+    target: String,
     retry_index: usize,
-) -> tracing::Span {
-    pplx_space_observability::with_peer_service!(tracing::info_span!(
-        "grpc.client.connect",
-        otel.kind = "client",
-        otel.name = "grpc.client.connect",
-        otel.status_code = tracing::field::Empty,
-        otel.status_description = tracing::field::Empty,
-        "operation.name" = "grpc.client.connect",
-        peer.service = service_name,
-        command,
-        transport,
-        target = %target,
-        retry = retry_index,
-    ))
+    span: tracing::Span,
 }
 
-fn record_connect_ok(span: &tracing::Span) {
-    span.record("otel.status_code", "OK");
-}
+impl ConnectSpan {
+    fn start(
+        service_name: &'static str,
+        command: &'static str,
+        transport: &'static str,
+        target: String,
+        retry_index: usize,
+    ) -> Self {
+        let mut connect = Self {
+            service_name,
+            command,
+            transport,
+            target,
+            retry_index,
+            span: tracing::Span::none(),
+        };
+        if pplx_space_observability::trace_propagation::has_traced_current_span() {
+            connect.span = connect.open();
+        }
+        connect
+    }
 
-fn record_connect_error(span: &tracing::Span, error: &dyn std::fmt::Display) {
-    let description = error.to_string();
-    span.record("otel.status_code", "ERROR");
-    span.record("otel.status_description", description.as_str());
+    fn open(&self) -> tracing::Span {
+        pplx_space_observability::with_peer_service!(tracing::info_span!(
+            "grpc.client.connect",
+            otel.kind = "client",
+            otel.name = "grpc.client.connect",
+            otel.status_code = tracing::field::Empty,
+            otel.status_description = tracing::field::Empty,
+            "operation.name" = "grpc.client.connect",
+            peer.service = self.service_name,
+            command = self.command,
+            transport = self.transport,
+            target = %self.target,
+            retry = self.retry_index,
+        ))
+    }
+
+    fn span(&self) -> tracing::Span {
+        self.span.clone()
+    }
+
+    fn record_ok(&self) {
+        self.span.record("otel.status_code", "OK");
+    }
+
+    fn record_error(&self, error: &dyn std::fmt::Display) {
+        let span = if self.span.is_none() {
+            self.open()
+        } else {
+            self.span.clone()
+        };
+        let description = error.to_string();
+        span.record("otel.status_code", "ERROR");
+        span.record("otel.status_description", description.as_str());
+    }
 }
 
 fn log_uds_connect_exhausted(
