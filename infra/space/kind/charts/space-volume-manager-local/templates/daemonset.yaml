@@ -13,12 +13,9 @@ spec:
     matchLabels:
       {{- include "space-node-service.selectorLabels" $ctx | nindent 6 }}
   # Delete first: volume-manager holds /space/run/volume-manager/service.mutex
-  # and a successor under the same identity could take it over passively, but
-  # this chart runs the separate space-volmgr identity, and a cluster whose
-  # earlier release ran the legacy one would otherwise start a successor that
-  # can never acquire the predecessor's lock (docs/installation.md,
-  # "Separating volume-manager's credential identity"). Kind nodes are fresh
-  # per cluster, so the first start finds no retained state to hand over.
+  # and runs as space-volmgr. Nodes created with a different account must be
+  # recreated, not upgraded in place (docs/installation.md, "Volume-manager
+  # identity and credentials"). Fresh Kind nodes have no retained state.
   {{- include "space-node-service.updateStrategy" (dict "strategy" "deleteFirst") | nindent 2 }}
   template:
     metadata:
@@ -32,14 +29,14 @@ spec:
       serviceAccountName: {{ include "space-node-service.name" $ctx }}
       automountServiceAccountToken: false
       terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds | int }}
-      # The separate volume-manager identity: space-volmgr (UID 964) with
+      # The volume-manager account: space-volmgr (UID 964) with
       # SPACE_VOLUME_MANAGER_GROUPS, the production shape. node-manager's
       # btrfs send-lease RPCs authorize this principal and no other
       # (crates/libs/node/mgr/server/src/service/btrfs_send_transport.rs), so
       # deferred btrfs-send capture depends on it. Credentials come through
       # credential-manager's volume socket, the only listener that admits this
-      # identity (docs/installation.md, "Separating volume-manager's
-      # credential identity"); Kind's static object-store credentials bypass
+      # identity (docs/installation.md, "Volume-manager identity and
+      # credentials"); Kind's static object-store credentials bypass
       # the token exchange, but DEK issue and unwrap still use it.
       securityContext:
         {{- include "space-node-service.runAs" (dict "ctx" . "user" "SPACE_VOLMGR" "groups" "SPACE_VOLUME_MANAGER_GROUPS") | nindent 8 }}

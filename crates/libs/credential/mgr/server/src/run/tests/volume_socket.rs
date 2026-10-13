@@ -259,12 +259,20 @@ async fn exercise_peer(uid: u32) {
         }
         assert_eq!(calls.lock().unwrap().len(), forwarded);
     } else if uid == users::SPACE_SBXMGR.uid {
-        for method in ["ExchangeToken", "IssueDek", "UnwrapDek"] {
+        assert_eq!(
+            call(&mut standard, "ExchangeToken").await,
+            Code::PermissionDenied,
+            "sandbox-manager is not a storage-token consumer"
+        );
+        assert_eq!(calls.lock().unwrap().len(), forwarded);
+        for method in ["IssueDek", "UnwrapDek"] {
             assert_eq!(
                 call(&mut standard, method).await,
                 Code::Aborted,
-                "legacy volume peer: {method}"
+                "sandbox-manager retains data-key access: {method}"
             );
+            forwarded += 1;
+            assert_eq!(calls.lock().unwrap().len(), forwarded);
         }
         assert_eq!(
             call(&mut standard, "IssueIntermediateCertificate").await,

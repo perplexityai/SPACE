@@ -190,7 +190,6 @@ fn peer_request(uid: u32) -> Request<ResolveRequest> {
 fn exchange_forwarding_overwrites_untrusted_actor_claims() {
     for (uid, expected_actor) in [
         (users::SPACE_VOLMGR.uid, ClientService::VolumeManager),
-        (users::SPACE_SBXMGR.uid, ClientService::VolumeManager),
         (users::SPACE_TMPLMGR.uid, ClientService::TemplateManager),
     ] {
         let caller = ResolvedCaller::UdsPeer(PeerIdentity::new(uid, uid, Some(1)));
@@ -208,13 +207,15 @@ fn exchange_forwarding_overwrites_untrusted_actor_claims() {
         );
     }
 
-    let root = ResolvedCaller::UdsPeer(PeerIdentity::new(0, 0, Some(1)));
-    assert_eq!(
-        forwarded_exchange_request(&root, ExchangeTokenRequest::default())
-            .unwrap_err()
-            .code(),
-        Code::PermissionDenied
-    );
+    for uid in [0, users::SPACE_SBXMGR.uid] {
+        let caller = ResolvedCaller::UdsPeer(PeerIdentity::new(uid, uid, Some(1)));
+        assert_eq!(
+            forwarded_exchange_request(&caller, ExchangeTokenRequest::default())
+                .unwrap_err()
+                .code(),
+            Code::PermissionDenied
+        );
+    }
 }
 
 #[tokio::test]

@@ -480,7 +480,6 @@ fn actor_claims_are_accepted_only_from_the_node_agent() {
 
     for (uid, expected_actor) in [
         (users::SPACE_VOLMGR.uid, ClientService::VolumeManager),
-        (users::SPACE_SBXMGR.uid, ClientService::VolumeManager),
         (users::SPACE_TMPLMGR.uid, ClientService::TemplateManager),
     ] {
         let peer =
@@ -494,6 +493,15 @@ fn actor_claims_are_accepted_only_from_the_node_agent() {
         assert!(matches!(
             parse_request(&peer, request.clone()).unwrap_err(),
             StorageExchangeError::ActorSpoofing
+        ));
+    }
+
+    for uid in [0, users::SPACE_SBXMGR.uid] {
+        let peer =
+            ResolvedCaller::UdsPeer(pplx_space_common_svc::PeerIdentity::new(uid, uid, None));
+        assert!(matches!(
+            parse_request(&peer, template_request(&template, STORAGE_READ_SCOPE)).unwrap_err(),
+            StorageExchangeError::UnauthorizedActor
         ));
     }
 

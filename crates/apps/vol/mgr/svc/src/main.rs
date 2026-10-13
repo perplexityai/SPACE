@@ -1,6 +1,4 @@
 mod credential_probe;
-#[cfg(target_os = "linux")]
-mod identity_handoff;
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -29,20 +27,6 @@ use pplx_space_volmgr::{
     disable_version_flag = true
 )]
 struct Cli {
-    /// Prepare retained node files for the selected identity, then exit (root only).
-    #[cfg(target_os = "linux")]
-    #[arg(
-        long,
-        value_enum,
-        conflicts_with_all = ["check_volume_credentials", "db", "socket", "staging_dir"]
-    )]
-    prepare_volume_identity: Option<identity_handoff::Identity>,
-
-    /// Require this retained identity under the service lock before preparing files.
-    #[cfg(target_os = "linux")]
-    #[arg(long, value_enum, requires = "prepare_volume_identity")]
-    expected_volume_identity: Option<identity_handoff::Identity>,
-
     /// Verify the restricted production credential listener without minting secrets.
     #[arg(long)]
     check_volume_credentials: bool,
@@ -65,7 +49,6 @@ struct Cli {
     /// Maximum time to remain ready while waiting for the predecessor's
     /// service mutex. After this budget, the process becomes NotReady and
     /// continues waiting.
-    /// With --prepare-volume-identity, expiry instead fails the handoff.
     #[arg(long, default_value_t = DEFAULT_SERVICE_MUTEX_TIMEOUT_SECS)]
     service_mutex_timeout_secs: u64,
 
@@ -207,15 +190,6 @@ fn snapshot_upload_mode(
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    #[cfg(target_os = "linux")]
-    if let Some(identity) = cli.prepare_volume_identity {
-        return identity_handoff::prepare(
-            std::path::Path::new("/space"),
-            identity,
-            Duration::from_secs(cli.service_mutex_timeout_secs),
-            cli.expected_volume_identity,
-        );
-    }
     pplx_space_common_svc::tokio_runtime::build_multi_thread_runtime()
         .context("failed to configure volume-manager Tokio runtime")?
         .block_on(async {
@@ -233,5 +207,5 @@ fn main() -> anyhow::Result<()> {
         })
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(test)]
 mod tests;

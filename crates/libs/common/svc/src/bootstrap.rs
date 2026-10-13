@@ -426,23 +426,6 @@ fn unix_socket_staging_shape(path: &Path) -> Option<(usize, &'static [u8])> {
     (len > 0).then_some((len, prefix))
 }
 
-/// Whether a filename has the staging shape used to replace this socket.
-///
-/// This classifies names only. Cleanup must separately verify the inode type,
-/// ownership and exclusivity of the directory before removing an entry.
-pub fn is_unix_socket_staging_name(path: &Path, name: &std::ffi::OsStr) -> bool {
-    let Some((len, prefix)) = unix_socket_staging_shape(path) else {
-        return false;
-    };
-    let bytes = name.as_bytes();
-    bytes.len() == len
-        && bytes.strip_prefix(prefix).is_some_and(|nonce| {
-            nonce
-                .iter()
-                .all(|byte| SOCKET_NONCE_ALPHABET.contains(byte))
-        })
-}
-
 fn unix_socket_staging_path_for_attempt(
     path: &Path,
     seed: Uuid,
