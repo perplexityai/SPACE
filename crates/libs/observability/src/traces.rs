@@ -5,6 +5,8 @@ use std::{fmt, str::FromStr};
 #[cfg(feature = "otel")]
 mod operation_names;
 #[cfg(feature = "otel")]
+mod origin_sampling;
+#[cfg(feature = "otel")]
 mod status_messages;
 
 #[derive(Debug, thiserror::Error)]
@@ -135,7 +137,11 @@ pub(crate) fn build_provider(
         #[cfg(feature = "datadog")]
         TraceExporter::Datadog => {
             let mut builder = datadog_opentelemetry::configuration::Config::builder();
-            let mut config = builder.set_service(identity.service_name().to_string());
+            // Read before `set_trace_sampling_rules`, which replaces them.
+            let configured_rules = builder.build().trace_sampling_rules().to_vec();
+            let mut config = builder
+                .set_service(identity.service_name().to_string())
+                .set_trace_sampling_rules(origin_sampling::datadog_rules(&configured_rules));
             if let Some(env) = identity.trace_environment() {
                 config = config.set_env(env.to_string());
             }
@@ -196,8 +202,11 @@ fn build_otlp_provider(
         .with_endpoint(endpoint)
         .build()
         .map_err(TraceInitError::Exporter)?;
-    // The upstream builder honors OTEL_TRACES_SAMPLER and OTEL_BSP_*.
+    // The upstream builder honors OTEL_BSP_*; the sampler keeps the one
+    // OTEL_TRACES_SAMPLER selects for every span that does not follow an
+    // origin.
     Ok(SdkTracerProvider::builder()
+        .with_sampler(origin_sampling::FollowOrigin::from_env())
         .with_batch_exporter(status_messages::StatusMessages::new(
             operation_names::OperationNames::new(exporter),
         ))

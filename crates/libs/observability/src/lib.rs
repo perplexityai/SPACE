@@ -1204,6 +1204,10 @@ pub fn elapsed_ms(started_at: Instant) -> f64 {
 
 // gRPC trace-context propagation via W3C traceparent headers. Compiled only
 // when an OpenTelemetry pipeline is compiled; otherwise the stubs below are no-ops.
+/// The most origins [`trace_propagation::link_root_to_origins`] links to one
+/// span. A pass that serves more records how many it left out instead.
+pub const MAX_ORIGIN_LINKS: usize = 8;
+
 #[cfg(feature = "otel")]
 pub mod trace_propagation {
     use http::HeaderMap;
@@ -1366,6 +1370,75 @@ pub mod trace_propagation {
             .is_valid()
     }
 
+    /// Link a root span to the context of the work that caused it, such as
+    /// the request that persisted the intent the root applies, and make its
+    /// sampling follow that context.
+    ///
+    /// Call it after creating `span` with `parent: None` and before entering
+    /// it, creating a child of it, or reading its context: the sampler decides
+    /// when the span starts, and sees only the links and fields given to it by
+    /// then. The span must declare `origin_trace_id` and `origin_sampled`
+    /// (and `links.dropped`, when more origins than [`MAX_ORIGIN_LINKS`] can
+    /// arrive); recording a field the span does not declare does nothing.
+    ///
+    /// Origins are linked in the order given, most relevant first, up
+    /// to [`MAX_ORIGIN_LINKS`]. A value that is not a valid W3C traceparent is
+    /// skipped. `origin_trace_id` names the first linked origin, so a search
+    /// can find the root by the origin's trace id; a link carries no
+    /// attribute of its own. `origin_sampled` is true when any linked origin
+    /// was sampled: SPACE's samplers keep such a root and drop a root whose
+    /// origins were all unsampled. Returns how many origins were linked.
+    pub fn link_root_to_origins<'a>(
+        span: &tracing::Span,
+        traceparents: impl IntoIterator<Item = &'a str>,
+    ) -> usize {
+        let mut linked = 0_usize;
+        let mut dropped = 0_usize;
+        let mut sampled = false;
+        for traceparent in traceparents {
+            let Some(context) = span_context_from_traceparent(traceparent) else {
+                continue;
+            };
+            if linked == super::MAX_ORIGIN_LINKS {
+                dropped += 1;
+                continue;
+            }
+            if linked == 0 {
+                span.record("origin_trace_id", context.trace_id().to_string().as_str());
+            }
+            sampled |= context.is_sampled();
+            span.add_link(context);
+            linked += 1;
+        }
+        if linked > 0 {
+            span.record("origin_sampled", sampled);
+        }
+        if dropped > 0 {
+            span.record("links.dropped", i64::try_from(dropped).unwrap_or(i64::MAX));
+        }
+        linked
+    }
+
+    /// Set a string attribute on a span that did not declare it as a field,
+    /// such as a caller's span that a shared library annotates. Only the
+    /// exported span carries it: logs do not see it.
+    pub fn set_span_attribute(span: &tracing::Span, key: &'static str, value: &str) {
+        span.set_attribute(key, value.to_string());
+    }
+
+    fn span_context_from_traceparent(
+        traceparent: &str,
+    ) -> Option<opentelemetry::trace::SpanContext> {
+        use opentelemetry::trace::TraceContextExt;
+        let carrier =
+            std::collections::HashMap::from([("traceparent".to_string(), traceparent.to_string())]);
+        let cx = opentelemetry::global::get_text_map_propagator(|propagator| {
+            propagator.extract(&carrier)
+        });
+        let context = cx.span().span_context().clone();
+        context.is_valid().then_some(context)
+    }
+
     /// Serialize an explicit tracing span's OpenTelemetry context as W3C
     /// traceparent. This is useful when the child work happens on another task.
     pub fn traceparent_for_span(span: &tracing::Span) -> Option<String> {
@@ -1407,6 +1480,13 @@ pub mod trace_propagation {
     pub fn link_span_from_traceparent(_span: &tracing::Span, _traceparent: &str) {}
     pub fn has_traced_current_span() -> bool {
         false
+    }
+    pub fn set_span_attribute(_span: &tracing::Span, _key: &'static str, _value: &str) {}
+    pub fn link_root_to_origins<'a>(
+        _span: &tracing::Span,
+        _traceparents: impl IntoIterator<Item = &'a str>,
+    ) -> usize {
+        0
     }
     pub fn traceparent_for_span(_span: &tracing::Span) -> Option<String> {
         None

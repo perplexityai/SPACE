@@ -151,8 +151,9 @@ pub struct StartupRecoveryLease {
 /// trace and flushes it in fragments. The link names the request instead.
 ///
 /// A link carries no attributes and log lines do not follow it, so the root
-/// records the sandbox's canonical `sandbox_id` and the request's
-/// `request_id` itself; the sandbox's telemetry queries find it by them.
+/// records the sandbox's canonical `sandbox_id`, the request's `request_id`
+/// and the request's trace id as `origin_trace_id` itself; the sandbox's
+/// telemetry queries find it by them. It is sampled as the request was.
 pub(super) fn detached_trace_span(work: &'static str, sandbox_id: &str) -> tracing::Span {
     let span = tracing::info_span!(
         parent: None,
@@ -162,6 +163,8 @@ pub(super) fn detached_trace_span(work: &'static str, sandbox_id: &str) -> traci
         otel.status_description = tracing::field::Empty,
         sandbox_id = tracing::field::Empty,
         request_id = tracing::field::Empty,
+        origin_trace_id = tracing::field::Empty,
+        origin_sampled = tracing::field::Empty,
     );
     pplx_space_common_svc::record_sandbox_id(&span, sandbox_id);
     if let Some(request_id) = pplx_space_observability::current_request_id() {
@@ -170,9 +173,9 @@ pub(super) fn detached_trace_span(work: &'static str, sandbox_id: &str) -> traci
     if let Some(traceparent) =
         pplx_space_observability::trace_propagation::traceparent_for_span(&tracing::Span::current())
     {
-        pplx_space_observability::trace_propagation::link_span_from_traceparent(
+        pplx_space_observability::trace_propagation::link_root_to_origins(
             &span,
-            &traceparent,
+            [traceparent.as_str()],
         );
     }
     span

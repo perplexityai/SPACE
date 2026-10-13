@@ -335,6 +335,19 @@ fn priority_band_metric_label(min_priority: Option<JobPriority>) -> String {
 /// The bare sandbox UUID a `sandbox:<uuid>` subject names: the canonical
 /// `sandbox_id` that every service's spans and logs carry, so a sandbox's
 /// jobs are found by the same value as the rest of its telemetry.
+/// Name the job a deduplicated submission joined on the submitter's span. The
+/// job runs in the trace of the submission that created it, so this is how
+/// the submitter's trace finds it.
+fn record_deduplicated_submission(job_id: &JobId) {
+    let span = tracing::Span::current();
+    pplx_space_observability::trace_propagation::set_span_attribute(
+        &span,
+        "job.id",
+        &job_id.to_string(),
+    );
+    pplx_space_observability::trace_propagation::set_span_attribute(&span, "job.dedup", "hit");
+}
+
 fn subject_sandbox_id(subject_id: Option<&str>) -> Option<String> {
     match subject_id?.parse::<SubjectId>().ok()? {
         SubjectId::Sandbox(sandbox_id) => Some(sandbox_id.to_string()),
@@ -827,6 +840,7 @@ impl<E: JobExecutor> BackgroundWorker<E> {
             self.promote_deduplicated(&conn, kind, &existing, priority)?;
             tracing::debug!(job_id = %existing, kind, "job deduplicated");
             pplx_space_metrics::jobs::submitted(kind, "hit");
+            record_deduplicated_submission(&existing);
             return Ok(existing);
         }
 
@@ -875,6 +889,7 @@ impl<E: JobExecutor> BackgroundWorker<E> {
                     self.promote_deduplicated(&conn, kind, &existing, priority)?;
                     tracing::debug!(job_id = %existing, kind, "job deduplicated after insert race");
                     pplx_space_metrics::jobs::submitted(kind, "hit");
+                    record_deduplicated_submission(&existing);
                     return Ok(existing);
                 }
                 return Err(Status::internal(format!("db insert failed: {error}")));
@@ -898,6 +913,7 @@ impl<E: JobExecutor> BackgroundWorker<E> {
                 self.promote_deduplicated(&conn, kind, &existing, priority)?;
                 tracing::debug!(job_id = %existing, kind, "job deduplicated at admission limit");
                 pplx_space_metrics::jobs::submitted(kind, "hit");
+                record_deduplicated_submission(&existing);
                 return Ok(existing);
             }
             let priority_band = admission_band.metric_label();
@@ -1503,14 +1519,18 @@ impl<E: JobExecutor> BackgroundWorker<E> {
             job.max_attempts = job.max_attempts,
             otel.status_code = tracing::field::Empty,
             error = tracing::field::Empty,
+            origin_trace_id = tracing::field::Empty,
+            origin_sampled = tracing::field::Empty,
         );
         drop(submitter);
+        // The root records its submitter's trace id, which a link does not
+        // make searchable, and is sampled as the submitter was.
         if parent.is_none()
             && let Some(traceparent) = job.traceparent.as_deref()
         {
-            pplx_space_observability::trace_propagation::link_span_from_traceparent(
+            pplx_space_observability::trace_propagation::link_root_to_origins(
                 &job_span,
-                traceparent,
+                [traceparent],
             );
         }
 
