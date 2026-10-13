@@ -422,3 +422,88 @@ async fn interrupted_update_is_observed_not_resent() -> TestResult {
     }
     Ok(())
 }
+
+// A worker whose address stops answering SYNs fails a request in the pooled
+// pod client's redial, before any bytes exist. SPACE's TCP connector marks
+// that failure, so it is untransmitted and `RuntimeClient::call` replays it
+// exactly once, on the fresh client the probe resolves, which reaches the
+// restarted worker; the access deadline update then applies.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "current_thread")]
+async fn a_blackholed_worker_redial_is_untransmitted_and_replayed_once() -> TestResult {
+    if !crate::test_support::enter_sim_worker_process() {
+        return Ok(());
+    }
+    let placeholder = TcpListener::bind("127.0.0.1:0").await?;
+    let fixture = Fixture::new(&placeholder.local_addr()?.to_string()).await?;
+    drop(placeholder);
+    let worker = start_worker(fixture.sandbox).await?;
+    let backend: std::net::SocketAddr = worker.endpoint().parse()?;
+    let front = RestartingFront::start(backend).await?;
+    let front_addr = front.addr;
+    let client = crate::controllers::substrate::connect_worker(
+        tonic::transport::Endpoint::from_shared(format!("http://{front_addr}"))?
+            .connect_timeout(Duration::from_millis(500)),
+    )
+    .await?;
+    front.stop().await;
+    // Let the client observe the closed connection, so the next request
+    // redials instead of racing the close.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let blackhole = pplx_space_common_grpc::test_support::Blackhole::bind(front_addr).await?;
+    fixture.move_worker(worker.endpoint()).await?;
+    let state_request = || {
+        tonic::Request::new(pplx_space_sbx_mgr_client::proto::StateRequest {
+            sandbox_ids: vec![fixture.sandbox.to_string()],
+        })
+    };
+
+    let status = client
+        .clone()
+        .sandbox_state(state_request())
+        .await
+        .expect_err("nothing answers the redial");
+    // A timed-out dial, not a refused one, so only the connector's marker can
+    // prove the request was never sent.
+    let timed_out =
+        std::iter::successors(std::error::Error::source(&status), |error| error.source()).any(
+            |error| {
+                error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::TimedOut)
+            },
+        );
+    assert!(timed_out, "{status:?}");
+    assert_eq!(
+        classify_access_idle_send_failure(&status),
+        AccessIdleSendFailure::Untransmitted,
+        "{status:?}"
+    );
+
+    let mut attempts = 0;
+    let state = client
+        .clone()
+        .call(
+            &fixture.controller.substrate,
+            fixture.sandbox,
+            tokio::time::Instant::now() + Duration::from_secs(10),
+            state_request(),
+            |mut client, request| {
+                attempts += 1;
+                async move { client.sandbox_state(request).await }
+            },
+        )
+        .await?
+        .into_inner();
+    assert_eq!(attempts, 2, "one attempt, then one replay");
+    assert_eq!(state.sandboxes[0].execution_generation, Some(GENERATION));
+
+    let until = timestamp(jiff::Timestamp::now().as_second() + 900);
+    fixture
+        .send(client, AccessIdleOperation::ExtendUntil(until))
+        .await?;
+    let record = worker.state().get(&fixture.sandbox.to_string()).await?;
+    assert_eq!(record.access_extended_until, Some(until.seconds));
+    drop(blackhole);
+    Ok(())
+}

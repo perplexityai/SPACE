@@ -102,6 +102,7 @@ pplx-space-common-core = { workspace = true, features = ["serde", "sqlx", "test-
 insta = { workspace = true, features = ["json", "yaml", "redactions"] }
 jsonschema = { workspace = true }
 pplx-space-common-svc = { workspace = true, features = ["test-support"] }
+pplx-space-common-grpc = { workspace = true, features = ["internal-tls", "test-support"] }
 pplx-space-db-test-fixtures = { workspace = true }
 pplx-space-metrics = { workspace = true, features = ["test-capture"] }
 pplx-space-observability = { workspace = true, features = ["test-capture"] }

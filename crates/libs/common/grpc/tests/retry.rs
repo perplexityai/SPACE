@@ -740,6 +740,27 @@ fn client_connect_failure_requires_a_local_error_chain() {
     )));
 }
 
+// A local `UNAVAILABLE` whose cause is a connection that broke, gave up or
+// closed after the request went out proves nothing about transmission, as
+// tonic reports a peer that stops answering keep-alives after reading the
+// request: only a dial failure, or the connector's marker, is one.
+#[test]
+fn a_broken_connection_under_a_local_unavailable_is_not_a_client_connect_failure() {
+    use pplx_space_common_grpc::is_client_connect_failure;
+
+    for kind in [
+        std::io::ErrorKind::ConnectionReset,
+        std::io::ErrorKind::ConnectionAborted,
+        std::io::ErrorKind::BrokenPipe,
+        std::io::ErrorKind::TimedOut,
+        std::io::ErrorKind::UnexpectedEof,
+    ] {
+        let mut status = Status::unavailable("transport error");
+        status.set_source(Arc::new(std::io::Error::from(kind)));
+        assert!(!is_client_connect_failure(&status), "{kind:?}");
+    }
+}
+
 // A refusal made before the request started carries a retry hint for the
 // caller. Neither retry path loops on it, even when the policy would accept
 // the hint and the caller's own predicate would retry the code.

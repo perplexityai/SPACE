@@ -13,6 +13,7 @@ workspace = true
 [features]
 default = []
 internal-tls = ["tonic/tls-aws-lc", "tokio/fs", "dep:futures-core", "dep:tokio-util"]
+test-support = []
 
 [dependencies]
 futures-core = { workspace = true, optional = true }

@@ -322,41 +322,6 @@ async fn stalled_tcp_attempts_end_within_the_budget_and_one_attempt_cap() {
     );
 }
 
-/// A loopback listener whose SYNs Linux drops, so a dial to it neither
-/// connects nor fails before its own bound: Linux drops a SYN to a listener
-/// whose accept queue is full, which stands in for a peer that is gone or a
-/// SYN pinned to a stale conntrack entry.
-#[cfg(target_os = "linux")]
-struct Blackhole {
-    address: std::net::SocketAddr,
-    _listener: tokio::net::TcpListener,
-    _queued: Vec<tokio::net::TcpStream>,
-}
-
-#[cfg(target_os = "linux")]
-impl Blackhole {
-    async fn bind(address: std::net::SocketAddr) -> Self {
-        let socket = tokio::net::TcpSocket::new_v4().unwrap();
-        socket.set_reuseaddr(true).unwrap();
-        socket.bind(address).unwrap();
-        let listener = socket.listen(2).unwrap();
-        let address = listener.local_addr().unwrap();
-        // Linux counts the accept queue full only once it holds more than the
-        // backlog, so three unaccepted connections fill it. Dialing them one at
-        // a time keeps at most one handshake pending, so the SYN queue never
-        // counts as full and the setup does not depend on SYN cookies.
-        let mut queued = Vec::new();
-        for _ in 0..3 {
-            queued.push(tokio::net::TcpStream::connect(address).await.unwrap());
-        }
-        Self {
-            address,
-            _listener: listener,
-            _queued: queued,
-        }
-    }
-}
-
 // An endpoint that sets no dial bound is dialed with the default one the
 // attempt cap is sized from: a dial whose SYN is never answered fails with the
 // dial bound's `TimedOut` and is redialed, instead of holding its attempt
@@ -366,8 +331,10 @@ impl Blackhole {
 #[cfg(target_os = "linux")]
 #[tokio::test(start_paused = true)]
 async fn an_endpoint_without_a_dial_bound_is_redialed_at_the_default_one() {
-    let blackhole = Blackhole::bind("127.0.0.1:0".parse().unwrap()).await;
-    let address = blackhole.address;
+    let blackhole = crate::test_support::Blackhole::bind("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+    let address = blackhole.address();
     let endpoint = tonic::transport::Endpoint::from_shared(format!("http://{address}")).unwrap();
     assert_eq!(endpoint.get_connect_timeout(), None);
 
@@ -645,12 +612,16 @@ async fn health_check_status(channel: tonic::transport::Channel) -> tonic::Statu
 #[cfg(target_os = "linux")]
 #[tokio::test(start_paused = true)]
 async fn a_lazy_channels_timed_out_dial_is_a_client_connect_failure() {
-    let blackhole = Blackhole::bind("127.0.0.1:0".parse().unwrap()).await;
-    let endpoint = tonic::transport::Endpoint::from_shared(format!("http://{}", blackhole.address))
-        .unwrap()
-        .connect_timeout(Duration::from_secs(1));
+    let blackhole = crate::test_support::Blackhole::bind("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+    let endpoint =
+        tonic::transport::Endpoint::from_shared(format!("http://{}", blackhole.address()))
+            .unwrap()
+            .connect_timeout(Duration::from_secs(1));
 
-    let status = health_check_status(super::connect_tcp_channel_lazy(endpoint, None)).await;
+    let status =
+        health_check_status(super::connect_tcp_channel_lazy(endpoint, None).unwrap()).await;
     assert!(
         has_io_error(&status, std::io::ErrorKind::TimedOut),
         "{status:?}"
@@ -665,10 +636,13 @@ async fn a_lazy_channels_timed_out_dial_is_a_client_connect_failure() {
 #[cfg(target_os = "linux")]
 #[tokio::test(start_paused = true)]
 async fn an_unmarked_timed_out_dial_is_not_a_client_connect_failure() {
-    let blackhole = Blackhole::bind("127.0.0.1:0".parse().unwrap()).await;
-    let endpoint = tonic::transport::Endpoint::from_shared(format!("http://{}", blackhole.address))
-        .unwrap()
-        .connect_timeout(Duration::from_secs(1));
+    let blackhole = crate::test_support::Blackhole::bind("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+    let endpoint =
+        tonic::transport::Endpoint::from_shared(format!("http://{}", blackhole.address()))
+            .unwrap()
+            .connect_timeout(Duration::from_secs(1));
 
     let status = health_check_status(endpoint.connect_lazy()).await;
     assert!(
@@ -692,7 +666,7 @@ async fn a_refused_dial_is_a_client_connect_failure_through_either_connector() {
     for (connector, channel) in [
         (
             "space",
-            super::connect_tcp_channel_lazy(endpoint.clone(), None),
+            super::connect_tcp_channel_lazy(endpoint.clone(), None).unwrap(),
         ),
         ("tonic", endpoint.connect_lazy()),
     ] {
@@ -728,7 +702,7 @@ async fn a_kept_channels_redial_that_never_connects_is_a_client_connect_failure(
 
     stop.send(()).unwrap();
     server.await.unwrap();
-    let blackhole = Blackhole::bind(address).await;
+    let blackhole = crate::test_support::Blackhole::bind(address).await.unwrap();
     let status = client
         .check(unbounded_health_request())
         .await
@@ -742,11 +716,21 @@ async fn a_kept_channels_redial_that_never_connects_is_a_client_connect_failure(
     drop(blackhole);
 }
 
+/// What [`request_reading_peer`] does with a connection once it has read a
+/// request's HEADERS.
+#[derive(Clone, Copy, Debug)]
+enum AfterRequest {
+    Close,
+    Reset,
+    /// Keep the connection open and answer nothing, PINGs included.
+    Hold,
+}
+
 /// A loopback peer that reads the HTTP/2 preface and each frame of every
-/// connection until a request's HEADERS, then drops the connection, resetting
-/// it when `reset`. Returns its address and how many requests it read.
-async fn request_dropping_peer(
-    reset: bool,
+/// connection until a request's HEADERS, then treats the connection as
+/// `after` says. Returns its address and how many requests it read.
+async fn request_reading_peer(
+    after: AfterRequest,
 ) -> (
     std::net::SocketAddr,
     std::sync::Arc<std::sync::atomic::AtomicUsize>,
@@ -763,6 +747,7 @@ async fn request_dropping_peer(
     let requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let seen = requests.clone();
     let peer = tokio::spawn(async move {
+        let mut held = Vec::new();
         loop {
             let (mut stream, _) = listener.accept().await.unwrap();
             let mut preface = [0; HTTP2_PREFACE_LEN];
@@ -781,8 +766,10 @@ async fn request_dropping_peer(
                 }
                 if header[3] == HTTP2_HEADERS_FRAME {
                     seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    if reset {
-                        stream.set_zero_linger().unwrap();
+                    match after {
+                        AfterRequest::Close => {}
+                        AfterRequest::Reset => stream.set_zero_linger().unwrap(),
+                        AfterRequest::Hold => held.push(stream),
                     }
                     break;
                 }
@@ -792,32 +779,68 @@ async fn request_dropping_peer(
     (address, requests, peer)
 }
 
+/// Assert that `status`, from an RPC `peer` read, failed locally but is no
+/// connect failure.
+fn assert_sent_and_not_a_connect_failure(
+    label: &str,
+    status: &tonic::Status,
+    requests: &std::sync::atomic::AtomicUsize,
+) {
+    assert!(
+        requests.load(std::sync::atomic::Ordering::SeqCst) > 0,
+        "{label}: the peer never read the request: {status:?}"
+    );
+    assert!(
+        std::error::Error::source(status).is_some(),
+        "{label}: the failure must be local: {status:?}"
+    );
+    assert!(
+        !crate::is_client_connect_failure(status),
+        "{label}: {status:?}"
+    );
+}
+
 // An RPC whose connection dies after the peer read it was sent and may have
 // run: its failure is local, but it is no connect failure, whether the peer
 // closes the connection or resets it.
 #[tokio::test]
 async fn an_rpc_whose_connection_dies_after_it_was_sent_is_not_a_client_connect_failure() {
-    for reset in [false, true] {
-        let (address, requests, peer) = request_dropping_peer(reset).await;
+    for after in [AfterRequest::Close, AfterRequest::Reset] {
+        let (address, requests, peer) = request_reading_peer(after).await;
         let endpoint = tonic::transport::Endpoint::from_shared(format!("http://{address}"))
             .unwrap()
             .connect_timeout(Duration::from_secs(1));
 
-        let status = health_check_status(super::connect_tcp_channel_lazy(endpoint, None)).await;
-        assert!(
-            requests.load(std::sync::atomic::Ordering::SeqCst) > 0,
-            "reset {reset}: the peer never read the request: {status:?}"
-        );
-        assert!(
-            std::error::Error::source(&status).is_some(),
-            "reset {reset}: the failure must be local: {status:?}"
-        );
-        assert!(
-            !crate::is_client_connect_failure(&status),
-            "reset {reset}: {status:?}"
-        );
+        let status =
+            health_check_status(super::connect_tcp_channel_lazy(endpoint, None).unwrap()).await;
+        assert_sent_and_not_a_connect_failure(&format!("{after:?}"), &status, &requests);
         peer.abort();
     }
+}
+
+// A request the peer read, on a connection that then goes silent, fails when
+// the client's HTTP/2 keep-alive gives up. Tonic reports that local failure
+// as `UNAVAILABLE`, the code a connect failure has too, so only the chain can
+// tell that the request was sent. This waits out a real keep-alive: a paused
+// clock could expire it before the peer read the request.
+#[tokio::test]
+async fn a_sent_rpc_whose_connection_goes_silent_is_not_a_client_connect_failure() {
+    let (address, requests, peer) = request_reading_peer(AfterRequest::Hold).await;
+    let endpoint = tonic::transport::Endpoint::from_shared(format!("http://{address}"))
+        .unwrap()
+        .connect_timeout(Duration::from_secs(1))
+        .http2_keep_alive_interval(Duration::from_millis(200))
+        .keep_alive_timeout(Duration::from_millis(200));
+
+    let status = tokio::time::timeout(
+        Duration::from_secs(60),
+        health_check_status(super::connect_tcp_channel_lazy(endpoint, None).unwrap()),
+    )
+    .await
+    .expect("the keep-alive must end the RPC");
+    assert_eq!(status.code(), tonic::Code::Unavailable, "{status:?}");
+    assert_sent_and_not_a_connect_failure("silent", &status, &requests);
+    peer.abort();
 }
 
 /// A health service that answers every check with `UNAVAILABLE` and `message`.
@@ -871,7 +894,8 @@ async fn a_peers_unavailable_that_reads_like_a_connect_failure_is_not_one() {
             .unwrap()
             .connect_timeout(Duration::from_secs(1));
 
-        let status = health_check_status(super::connect_tcp_channel_lazy(endpoint, None)).await;
+        let status =
+            health_check_status(super::connect_tcp_channel_lazy(endpoint, None).unwrap()).await;
         assert_eq!(status.code(), tonic::Code::Unavailable, "{status:?}");
         assert_eq!(status.message(), message);
         assert!(!crate::is_client_connect_failure(&status), "{status:?}");
@@ -924,4 +948,171 @@ async fn a_lazy_internal_rpc_channels_tls_handshake_timeout_is_not_a_client_conn
     assert!(!is_marked(&status), "{status:?}");
     assert!(!crate::is_client_connect_failure(&status), "{status:?}");
     silent_peer.abort();
+}
+
+/// A resolver whose lookups never finish, as with a DNS server that does not
+/// answer.
+#[derive(Clone)]
+struct StalledResolver;
+
+impl tower::Service<hyper_util::client::legacy::connect::dns::Name> for StalledResolver {
+    type Response = std::vec::IntoIter<std::net::SocketAddr>;
+    type Error = std::io::Error;
+    type Future = std::future::Pending<Result<Self::Response, Self::Error>>;
+
+    fn poll_ready(
+        &mut self,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, _name: hyper_util::client::legacy::connect::dns::Name) -> Self::Future {
+        std::future::pending()
+    }
+}
+
+/// An endpoint whose host name only [`StalledResolver`] is asked about, and
+/// SPACE's TCP connector for it over that resolver.
+fn stalled_lookup_connector(
+    dial_timeout: Duration,
+) -> (
+    tonic::transport::Endpoint,
+    super::TcpConnector<hyper_util::client::legacy::connect::HttpConnector<StalledResolver>>,
+) {
+    let endpoint = tonic::transport::Endpoint::from_static("http://stalled.invalid:50051")
+        .connect_timeout(dial_timeout);
+    super::tcp_connector(
+        endpoint,
+        None,
+        hyper_util::client::legacy::connect::HttpConnector::new_with_resolver(StalledResolver),
+    )
+}
+
+// A lookup no DNS server answers fails the RPC when the connector's own bound
+// on name resolution and the dial expires, before tonic's whole-connect
+// backstop could: the status is a marked `UNAVAILABLE`, not an unmarked
+// `UNKNOWN`, so it is replay-safe.
+#[tokio::test(start_paused = true)]
+async fn a_stalled_name_resolution_is_a_marked_client_connect_failure() {
+    let dial_timeout = Duration::from_secs(1);
+    let (endpoint, connector) = stalled_lookup_connector(dial_timeout);
+
+    let started = tokio::time::Instant::now();
+    let status = health_check_status(endpoint.connect_with_connector_lazy(connector)).await;
+    assert_eq!(status.code(), tonic::Code::Unavailable, "{status:?}");
+    assert!(is_marked(&status), "{status:?}");
+    assert!(crate::is_client_connect_failure(&status), "{status:?}");
+    assert_eq!(started.elapsed(), super::connect_phase_bound(dial_timeout));
+}
+
+// In a retried connect, a stalled lookup fails its attempt with the
+// connector's marked cause rather than as an attempt abandoned at its cap.
+#[tokio::test(start_paused = true)]
+async fn a_retried_connects_stalled_lookup_fails_with_its_own_cause() {
+    let dial_timeout = Duration::from_secs(1);
+    let (endpoint, connector) = stalled_lookup_connector(dial_timeout);
+
+    let result = super::retry_tcp_connect(
+        "stalled-lookup",
+        "stalled.invalid:50051",
+        crate::GrpcRetryPolicy::none(),
+        super::tcp_attempt_cap(dial_timeout, None),
+        || {
+            let endpoint = endpoint.clone();
+            let connector = connector.clone();
+            async move {
+                endpoint
+                    .connect_with_connector(connector)
+                    .await
+                    .map_err(super::TcpConnectError::from)
+            }
+        },
+    )
+    .await;
+    let error = match result {
+        Err(error @ super::TcpConnectError::Transport(_)) => error,
+        other => panic!("expected the connect-phase bound to fail the attempt: {other:?}"),
+    };
+    let marked = std::iter::successors(
+        Some(&error as &(dyn std::error::Error + 'static)),
+        |error| error.source(),
+    )
+    .any(|error| error.is::<crate::ConnectPhaseError>());
+    assert!(marked, "{error:?}");
+}
+
+// A lazy channel whose endpoint sets no dial bound is given the default one,
+// so a dial no peer answers fails with the dial bound's own marked
+// `TimedOut` instead of hanging. Under the paused clock the kernel cannot
+// time the dial out first.
+#[cfg(target_os = "linux")]
+#[tokio::test(start_paused = true)]
+async fn a_lazy_channel_without_a_dial_bound_is_given_the_default_one() {
+    let blackhole = crate::test_support::Blackhole::bind("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+    let endpoint =
+        tonic::transport::Endpoint::from_shared(format!("http://{}", blackhole.address())).unwrap();
+    assert_eq!(endpoint.get_connect_timeout(), None);
+
+    let status = tokio::time::timeout(
+        Duration::from_secs(60),
+        health_check_status(super::connect_tcp_channel_lazy(endpoint, None).unwrap()),
+    )
+    .await
+    .expect("an unanswered dial must be bounded");
+    assert!(
+        has_io_error(&status, std::io::ErrorKind::TimedOut),
+        "{status:?}"
+    );
+    assert!(crate::is_client_connect_failure(&status), "{status:?}");
+}
+
+// Every SPACE TCP connect refuses, before any dial, an https endpoint whose
+// handshake bound it was not told and a Unix-socket endpoint, which it would
+// otherwise bound wrongly or resolve as the host `tonic`.
+#[tokio::test]
+async fn a_tcp_connect_refuses_endpoints_it_would_dial_wrongly() {
+    use super::TcpEndpointError::{MissingTlsHandshakeBound, UnixSocket};
+
+    for (uri, refusal) in [
+        ("https://127.0.0.1:1", MissingTlsHandshakeBound),
+        ("unix:///nonexistent/space-test.sock", UnixSocket),
+    ] {
+        let endpoint = tonic::transport::Endpoint::from_static(uri);
+        let label = format!("{uri}: expected {refusal:?}");
+        let is_refusal = |error: &super::TcpEndpointError| {
+            std::mem::discriminant(error) == std::mem::discriminant(&refusal)
+        };
+        assert!(
+            matches!(super::connect_tcp_channel_lazy(endpoint.clone(), None), Err(ref error) if is_refusal(error)),
+            "{label}"
+        );
+        assert!(
+            matches!(super::connect_tcp_channel(endpoint.clone(), None).await, Err(super::TcpChannelError::Endpoint(ref error)) if is_refusal(error)),
+            "{label}"
+        );
+        assert!(
+            matches!(
+                super::connect_tcp_channel_with_retry("refused", uri, endpoint.clone(), None, crate::GrpcRetryPolicy::none()).await,
+                Err(super::TcpConnectError::Endpoint(ref error)) if is_refusal(error)
+            ),
+            "{label}"
+        );
+        assert!(
+            matches!(
+                super::connect_tcp_channel_with_retrying_redials("refused", endpoint.clone(), Duration::from_secs(1), None, crate::GrpcRetryPolicy::none()).await,
+                Err(super::TcpChannelError::Endpoint(ref error)) if is_refusal(error)
+            ),
+            "{label}"
+        );
+        assert!(
+            matches!(
+                crate::RotatingChannel::connect("refused", endpoint, None, None).await,
+                Err(super::TcpChannelError::Endpoint(ref error)) if is_refusal(error)
+            ),
+            "{label}"
+        );
+    }
 }

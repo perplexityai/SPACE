@@ -194,7 +194,7 @@ async fn authenticated_rpc() -> TestResult<AuthenticatedRpc> {
     let token_path = std::path::PathBuf::from(
         std::env::var_os("SPACE_BUILD_MANAGER_TOKEN_PATH").expect("test child token path"),
     );
-    let channel = pplx_space_common_grpc::internal_transport::client_endpoint(
+    let channel = pplx_space_common_grpc::internal_transport::client_connect_endpoint(
         pplx_space_common_grpc::internal_transport::Service::BuildManager,
         tonic::transport::Endpoint::from_shared(endpoint.clone())?,
     )

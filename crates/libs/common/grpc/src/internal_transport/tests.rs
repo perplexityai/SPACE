@@ -54,6 +54,22 @@ async fn plaintext_requires_explicit_development_opt_in_and_partial_tls_never_do
     ));
 }
 
+// A Unix-socket endpoint reports an http fallback URI, so even a development
+// transport that allows plaintext must not hand it to the TCP connector.
+#[tokio::test]
+async fn a_unix_socket_endpoint_is_not_an_internal_rpc_tcp_endpoint() {
+    let mut env = Env::default();
+    env.put(INSECURE_DEV_ENV, "true");
+    let endpoint = Endpoint::from_static("unix:///nonexistent/space-test.sock");
+    let transport = ClientTransport::from_environment(Service::NodeApi, endpoint.uri(), &env)
+        .await
+        .unwrap();
+    assert!(matches!(
+        transport.connect_endpoint(endpoint),
+        Err(TransportError::Scheme)
+    ));
+}
+
 #[tokio::test]
 async fn authenticates_discovered_server_before_any_bearer_is_sent() {
     // Service bootstrap selects AWS-LC. This isolated fixture also needs an

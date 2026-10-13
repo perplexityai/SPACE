@@ -97,8 +97,10 @@ impl RotatingChannel {
     /// Dials `endpoint` through [`crate::connect_tcp_channel`], redialing it
     /// whenever the connection reaches `max_age`. `None` (or zero) never
     /// rotates. `tls_handshake_timeout` is the bound the endpoint's TLS config
-    /// sets, or `None` for plaintext; internal-RPC callers connect through
-    /// `internal_transport::ConnectEndpoint::connect_rotating` instead.
+    /// sets, or `None` for plaintext; an `https` endpoint without it fails with
+    /// [`crate::TcpChannelError::Endpoint`]. Internal-RPC callers connect
+    /// through `internal_transport::ConnectEndpoint::connect_rotating`
+    /// instead.
     ///
     /// The first dial is eager and its failure is the caller's, exactly as with
     /// [`Endpoint::connect`]; only later rotations are backgrounded.
@@ -107,8 +109,21 @@ impl RotatingChannel {
         endpoint: Endpoint,
         tls_handshake_timeout: Option<Duration>,
         max_age: Option<Duration>,
+    ) -> Result<Self, crate::TcpChannelError> {
+        crate::connect::check_tcp_endpoint(&endpoint, tls_handshake_timeout)?;
+        Ok(Self::connect_tcp(service_name, endpoint, tls_handshake_timeout, max_age).await?)
+    }
+
+    /// [`Self::connect`] for an endpoint already known to be a TCP endpoint
+    /// whose `https` scheme, if any, comes with its handshake bound.
+    pub(crate) async fn connect_tcp(
+        service_name: &'static str,
+        endpoint: Endpoint,
+        tls_handshake_timeout: Option<Duration>,
+        max_age: Option<Duration>,
     ) -> Result<Self, tonic::transport::Error> {
-        let channel = crate::connect_tcp_channel(endpoint.clone(), tls_handshake_timeout).await?;
+        let channel =
+            crate::connect::dial_tcp_channel(endpoint.clone(), tls_handshake_timeout).await?;
         // A zero age would redial on every request, so it reads as "off" like
         // the absent case rather than as an interval.
         let rotation = max_age
@@ -245,7 +260,7 @@ impl Shared {
         tls_handshake_timeout: Option<Duration>,
         max_age: Duration,
     ) {
-        let dialed = crate::connect_tcp_channel(endpoint, tls_handshake_timeout).await;
+        let dialed = crate::connect::dial_tcp_channel(endpoint, tls_handshake_timeout).await;
         let mut state = lock(&self.state);
         match dialed {
             Ok(channel) => {

@@ -56,12 +56,14 @@ pub use sandbox_trace::{
     record_sandbox_id,
 };
 mod status;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
 mod trace;
 
 pub use client::GrpcClient;
 pub use connect::{
-    ConnectPhaseError, TcpConnectError, UdsConnectError, connect_tcp_channel,
-    connect_tcp_channel_lazy, connect_tcp_channel_with_retry,
+    ConnectPhaseError, TcpChannelError, TcpConnectError, TcpEndpointError, UdsConnectError,
+    connect_tcp_channel, connect_tcp_channel_lazy, connect_tcp_channel_with_retry,
     connect_tcp_channel_with_retry_watched, connect_tcp_channel_with_retrying_redials,
     connect_uds_channel, connect_uds_channel_lazy, connect_uds_channel_with_endpoint,
     connect_uds_channel_with_endpoint_with_retry, connect_uds_channel_with_retry,
