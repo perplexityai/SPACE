@@ -3,7 +3,7 @@ use pplx_space_common_core::types::NodeId;
 use pplx_space_common_core::sql;
 use std::time::Duration;
 
-use pplx_space_common_core::types::{TemplateDesiredState, TemplateName};
+use pplx_space_common_core::types::{SubstrateKind, TemplateDesiredState, TemplateName};
 use pplx_space_public_api::{
     OperationState, PublicErrorCode, PublicOperationResult, PublicTemplateOperationResult,
 };
@@ -200,11 +200,12 @@ async fn nodes_with_template_inventory(
          LEFT JOIN node_direct nd ON nd.node_id = n.id
          WHERE nti.template_name = $1
            AND (
-             n.managed_by != 'space'
+             n.managed_by != $2
              OR (nd.node_id IS NOT NULL AND nd.deleted_at IS NULL)
            )"
     ))
     .bind(template.as_str())
+    .bind(SubstrateKind::Space)
     .fetch_all(pool)
     .await
 }

@@ -13,7 +13,8 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use pplx_space_build_mgr_client::proto as build_proto;
 use pplx_space_cluster_pool::WarmPoolStore;
 use pplx_space_common_core::types::{
-    IdempotencyKey, SystemTemplate, TemplateDesiredState, TemplateId, TemplateName, TemplateTag,
+    IdempotencyKey, SubstrateKind, SystemTemplate, TemplateDesiredState, TemplateId, TemplateName,
+    TemplateTag,
 };
 use pplx_space_net_common::NetworkPolicyV1;
 use pplx_space_public_api::{
@@ -525,10 +526,11 @@ async fn reconcile_target_node_ids(
          LEFT JOIN node_direct nd ON nd.node_id = n.id
          WHERE n.role IN ('worker', 'builder')
            AND (
-             n.managed_by != 'space'
+             n.managed_by != $1
              OR (nd.node_id IS NOT NULL AND nd.deleted_at IS NULL)
            )"
     ))
+    .bind(SubstrateKind::Space)
     .fetch_all(&mut **tx)
     .await
 }

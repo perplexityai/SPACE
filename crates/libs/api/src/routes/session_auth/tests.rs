@@ -39,6 +39,22 @@ fn substrate_serializes_as_ui_contract() -> TestResult {
     Ok(())
 }
 
+#[test]
+fn console_substrate_is_kubernetes_only_for_the_kubernetes_label() {
+    for (managed_by, expected) in [
+        ("k8s", ConsoleSubstrate::K8s),
+        ("space", ConsoleSubstrate::Space),
+        ("kubernetes", ConsoleSubstrate::Space),
+        ("", ConsoleSubstrate::Space),
+    ] {
+        assert_eq!(
+            ConsoleSubstrate::from_managed_by(managed_by),
+            expected,
+            "{managed_by:?}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn login_creates_uuid_v7_session_and_delete_revokes_it() -> TestResult {
     let db = pg_test_db().await?;

@@ -9,7 +9,7 @@ use axum::{
 };
 use futures_util::{StreamExt, stream};
 use pplx_space_common_core::types::NodeId;
-use pplx_space_common_core::types::{NodeManagedBy, NodeRole, TemplateName};
+use pplx_space_common_core::types::{NodeManagedBy, NodeRole, SubstrateKind, TemplateName};
 use pplx_space_common_svc::{
     bearer_token::SpaceBearerToken,
     types::{FACET_NETWORK_POLICY, ReconcileFacet, ReconcileReason},
@@ -1039,7 +1039,7 @@ pub async fn create_node(
            FROM node_direct nd
            JOIN nodes n ON n.id = nd.node_id
            WHERE nd.deleted_at IS NOT NULL
-             AND n.managed_by = 'space'
+             AND n.managed_by = $10
              AND (
                n.id = $1
                OR ($8::BOOL AND nd.node_api_endpoint = $6)
@@ -1054,7 +1054,7 @@ pub async fn create_node(
            UPDATE nodes n
            SET address = NULLIF($3, '')::INET,
              role = $4,
-             managed_by = 'space',
+             managed_by = $10,
              state = COALESCE($5, 'registered'),
              last_heartbeat = CASE
                  WHEN $9::BOOL THEN NOW()
@@ -1109,6 +1109,7 @@ pub async fn create_node(
     .bind(sqlx::types::Json(&req.metadata))
     .bind(reuse_deleted_by_endpoint)
     .bind(req.verify)
+    .bind(SubstrateKind::Space)
     .fetch_optional(&state.pool)
     .await;
 
@@ -1128,7 +1129,7 @@ pub async fn create_node(
                $1,
                NULLIF($3, '')::INET,
                $4,
-               'space',
+               $9,
                COALESCE($5, 'registered'),
                CASE WHEN $8::BOOL THEN NOW() ELSE NULL END
            )
@@ -1175,6 +1176,7 @@ pub async fn create_node(
     .bind(&endpoint)
     .bind(sqlx::types::Json(&req.metadata))
     .bind(req.verify)
+    .bind(SubstrateKind::Space)
     .fetch_one(&state.pool)
     .await;
 
@@ -1263,7 +1265,7 @@ pub async fn update_node(
                    ELSE n.last_heartbeat
                END
            WHERE n.id = $7
-             AND n.managed_by = 'space'
+             AND n.managed_by = $9
            RETURNING n.id,
                      host(n.address) AS address,
                      n.role,
@@ -1312,6 +1314,7 @@ pub async fn update_node(
     .bind(req.metadata.as_ref().map(sqlx::types::Json))
     .bind(id)
     .bind(req.verify)
+    .bind(SubstrateKind::Space)
     .fetch_optional(&state.pool)
     .await;
 
@@ -1350,7 +1353,7 @@ async fn hard_delete_direct_node(pool: &sqlx::PgPool, id: NodeId) -> Result<u64,
     let result = sqlx::query(sql!(
         "DELETE FROM nodes n
          WHERE n.id = $1
-           AND n.managed_by = 'space'
+           AND n.managed_by = $2
            AND EXISTS (
                SELECT 1
                FROM node_direct nd
@@ -1358,6 +1361,7 @@ async fn hard_delete_direct_node(pool: &sqlx::PgPool, id: NodeId) -> Result<u64,
            )"
     ))
     .bind(id)
+    .bind(SubstrateKind::Space)
     .execute(pool)
     .await?;
     Ok(result.rows_affected())

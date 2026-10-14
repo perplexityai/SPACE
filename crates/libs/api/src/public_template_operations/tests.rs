@@ -15,6 +15,7 @@ async fn template_delete_inventory_query_uses_direct_node_deleted_state() -> Tes
     let active_direct_node = NodeId::new();
     let deleted_direct_node = NodeId::new();
     let k8s_node = NodeId::new();
+    let retired_k8s_node = NodeId::new();
 
     insert_node(&db.pool, active_direct_node, "worker", "space", 10).await?;
     insert_direct_node(&db.pool, active_direct_node, false).await?;
@@ -27,9 +28,14 @@ async fn template_delete_inventory_query_uses_direct_node_deleted_state() -> Tes
     insert_node(&db.pool, k8s_node, "worker", "k8s", 12).await?;
     insert_inventory(&db.pool, k8s_node, &template).await?;
 
+    // A retired registry row excludes only Direct nodes.
+    insert_node(&db.pool, retired_k8s_node, "worker", "k8s", 13).await?;
+    insert_direct_node(&db.pool, retired_k8s_node, true).await?;
+    insert_inventory(&db.pool, retired_k8s_node, &template).await?;
+
     let mut nodes = nodes_with_template_inventory(&db.pool, &template).await?;
     nodes.sort_unstable();
-    let mut expected = vec![active_direct_node, k8s_node];
+    let mut expected = vec![active_direct_node, k8s_node, retired_k8s_node];
     expected.sort_unstable();
     assert_eq!(nodes, expected);
 

@@ -22,6 +22,8 @@ pub(crate) use kubernetes_tests::{
     substrate_with_unreachable_store,
 };
 
+mod substrate_scope;
+
 mod kubernetes_tests {
 
     use pplx_space_common_core::types::{LocalArtifactId, SandboxId, UserId};

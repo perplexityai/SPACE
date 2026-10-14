@@ -2,6 +2,7 @@
 //! tombstone checks.
 
 use super::*;
+use pplx_space_common_core::types::SubstrateKind;
 
 impl K8sStore {
     pub(in crate::controllers::substrate::kubernetes) async fn persist_k8s_node_inventory(
@@ -60,7 +61,7 @@ impl K8sStore {
                  FROM nodes AS candidate
                  JOIN node_k8s AS candidate_k8s
                    ON candidate_k8s.node_id = candidate.id
-                 WHERE candidate.managed_by = 'k8s'
+                 WHERE candidate.managed_by = $4
                    AND candidate.state = 'ready'
                    AND candidate.drain_phase IS NULL
                    AND NOT (candidate_k8s.k8s_node_name = ANY($1::TEXT[]))
@@ -80,7 +81,7 @@ impl K8sStore {
              JOIN candidates AS candidate
                ON candidate.id = nk.node_id
              WHERE n.id = candidate.id
-               AND n.managed_by = 'k8s'
+               AND n.managed_by = $4
                AND n.state = 'ready'
                AND n.drain_phase IS NULL
                AND n.last_heartbeat IS NOT DISTINCT FROM candidate.last_heartbeat
@@ -90,6 +91,7 @@ impl K8sStore {
         .bind(live_node_names)
         .bind(missing_grace_secs)
         .bind(i64::from(max_per_tick))
+        .bind(SubstrateKind::Kubernetes)
         .fetch_all(&self.pool)
         .await
         .db_context("failed to demote unobserved Kubernetes nodes")?;
@@ -139,13 +141,13 @@ impl K8sStore {
         let node_changed = sqlx::query_scalar::<_, bool>(sql!(
             "WITH upsert AS (
                  INSERT INTO nodes (id, address, role, managed_by, state)
-                 VALUES ($1, $2::INET, $3, 'k8s', $4)
+                 VALUES ($1, $2::INET, $3, $6, $4)
                  ON CONFLICT (id) DO UPDATE
                  SET address = COALESCE(EXCLUDED.address, nodes.address),
                      role = EXCLUDED.role,
                      managed_by = EXCLUDED.managed_by,
                      state = CASE WHEN $5 THEN EXCLUDED.state ELSE nodes.state END
-                 WHERE nodes.managed_by = 'k8s'
+                 WHERE nodes.managed_by = $6
                    AND (
                      nodes.address IS DISTINCT FROM COALESCE(EXCLUDED.address, nodes.address)
                      OR nodes.role IS DISTINCT FROM EXCLUDED.role
@@ -157,7 +159,7 @@ impl K8sStore {
              UNION ALL
              SELECT FALSE FROM nodes
              WHERE id = $1
-               AND managed_by = 'k8s'
+               AND managed_by = $6
                AND NOT EXISTS (SELECT 1 FROM upsert)"
         ))
         .bind(node_id)
@@ -165,6 +167,7 @@ impl K8sStore {
         .bind(role.as_str())
         .bind(state)
         .bind(manage_state)
+        .bind(SubstrateKind::Kubernetes)
         .fetch_optional(&mut *conn)
         .await
         .db_context("failed to upsert Kubernetes node registry")?;
@@ -184,9 +187,10 @@ impl K8sStore {
                 // should abort the caller, so re-check node ownership with a
                 // fresh statement snapshot before erroring.
                 let existing_is_k8s = sqlx::query_scalar::<_, bool>(sql!(
-                    "SELECT TRUE FROM nodes WHERE id = $1 AND managed_by = 'k8s'"
+                    "SELECT TRUE FROM nodes WHERE id = $1 AND managed_by = $2"
                 ))
                 .bind(node_id)
+                .bind(SubstrateKind::Kubernetes)
                 .fetch_optional(&mut *conn)
                 .await
                 .db_context("failed to re-check Kubernetes node ownership")?

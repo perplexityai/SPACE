@@ -11,6 +11,8 @@ use pplx_space_db_test_fixtures::{
     SEED_ORG_ID, SEED_USER_ID, TestDbResult, insert_ready_worker_node, pg_test_db,
 };
 
+mod substrate_scope;
+
 const INTERNAL_FAILURE_REASON: &str = "guest health probe timed out: internal socket detail";
 const CURRENT_EXECUTION_GENERATION: i64 = 7;
 const CURRENT_POD_UID: &str = "pod-attempt-a";

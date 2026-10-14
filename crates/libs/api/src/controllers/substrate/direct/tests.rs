@@ -8,6 +8,8 @@ use pplx_space_db_test_fixtures::{TestDb, try_pg_test_db_with_max_connections};
 use pplx_space_node_api_sim::{SandboxRecord, SimState, SimWorkerHarness};
 use sqlx::PgPool;
 
+mod substrate_scope;
+
 #[test]
 fn direct_create_rejects_fork_disk_restore() {
     let error = ensure_direct_create_supported(true).unwrap_err();

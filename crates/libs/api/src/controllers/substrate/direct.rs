@@ -56,7 +56,7 @@ use pplx_space_common_core::types::{
     ArtifactOrigin, AutoLifecyclePolicy, ExecutionGeneration, ExecutionGenerationParseError,
     NodeId, NodeManagedBy, NodeRole as SpaceNodeRole, PodUid, PodUidParseError, PolicyAuthority,
     RouteGeneration, RouteGenerationParseError, SandboxActivationAttemptId, SandboxId,
-    SandboxLifecycle, SandboxRouteIdentity, SandboxRouteIdentityInvariantError,
+    SandboxLifecycle, SandboxRouteIdentity, SandboxRouteIdentityInvariantError, SubstrateKind,
 };
 use pplx_space_net_common::{NetworkPolicyV1, proto::NetworkPolicyV1 as NetworkPolicyProto};
 use pplx_space_sandbox_portability::{
@@ -1516,7 +1516,7 @@ impl DirectSubstrate {
              FROM nodes n
              JOIN node_direct nd ON nd.node_id = n.id
              JOIN node_status_snapshots nss ON nss.node_id = n.id
-             WHERE n.managed_by = 'space'
+             WHERE n.managed_by = $2
                AND n.role = $1
                AND nd.deleted_at IS NULL
                AND COALESCE(n.state, 'registered') = 'registered'
@@ -1526,6 +1526,7 @@ impl DirectSubstrate {
              ORDER BY random()"
         ))
         .bind(role)
+        .bind(SubstrateKind::Space)
         .fetch_all(&self.pool)
         .await
         .db_context_with(|| format!("failed to select cached-ready {role} node"))
@@ -1555,13 +1556,14 @@ impl DirectSubstrate {
              FROM nodes n
              JOIN node_direct nd ON nd.node_id = n.id
              LEFT JOIN node_status_snapshots nss ON nss.node_id = n.id
-             WHERE n.managed_by = 'space'
+             WHERE n.managed_by = $1
                AND n.role = 'worker'
                AND nd.deleted_at IS NULL
                AND COALESCE(n.state, 'registered') = 'registered'
                AND COALESCE(nss.reachable, TRUE) IS TRUE
                AND COALESCE(nss.scheduling_status, 'ready') NOT IN ('full', 'draining', 'unavailable')"),
         )
+        .bind(SubstrateKind::Space)
         .fetch_one(&self.pool)
         .await
         .db_context("failed to count eligible direct start nodes")?;
@@ -1582,7 +1584,7 @@ impl DirectSubstrate {
              JOIN node_direct nd ON nd.node_id = n.id
              JOIN node_status_snapshots nss ON nss.node_id = n.id
              JOIN node_template_inventory nti ON nti.node_id = n.id
-             WHERE n.managed_by = 'space'
+             WHERE n.managed_by = $5
                AND n.role = 'worker'
                AND nd.deleted_at IS NULL
                AND COALESCE(n.state, 'registered') = 'registered'
@@ -1649,6 +1651,7 @@ impl DirectSubstrate {
         .bind(content_hash)
         .bind(runtime)
         .bind(require_base_snapshot)
+        .bind(SubstrateKind::Space)
         .fetch_all(&self.pool)
         .await
         .db_context("failed to select cached-ready worker node")?;
@@ -1663,7 +1666,7 @@ impl DirectSubstrate {
              JOIN node_direct nd ON nd.node_id = n.id
              JOIN node_template_inventory nti ON nti.node_id = n.id
              LEFT JOIN node_status_snapshots nss ON nss.node_id = n.id
-             WHERE n.managed_by = 'space'
+             WHERE n.managed_by = $5
                AND n.role = 'worker'
                AND nd.deleted_at IS NULL
                AND COALESCE(n.state, 'registered') = 'registered'
@@ -1729,6 +1732,7 @@ impl DirectSubstrate {
         .bind(content_hash)
         .bind(runtime)
         .bind(require_base_snapshot)
+        .bind(SubstrateKind::Space)
         .fetch_all(&self.pool)
         .await
         .db_context("failed to select last-known worker node")?;
@@ -1758,7 +1762,7 @@ impl DirectSubstrate {
              FROM nodes n
              JOIN node_direct nd ON nd.node_id = n.id
              JOIN node_status_snapshots nss ON nss.node_id = n.id
-             WHERE n.managed_by = 'space'
+             WHERE n.managed_by = $2
                AND n.role = 'worker'
                AND nd.deleted_at IS NULL
                AND COALESCE(n.state, 'registered') = 'registered'
@@ -1779,6 +1783,7 @@ impl DirectSubstrate {
              ORDER BY random()"
         ))
         .bind(runtime)
+        .bind(SubstrateKind::Space)
         .fetch_all(&self.pool)
         .await
         .db_context("failed to select pull-on-create worker node")
@@ -1796,7 +1801,7 @@ impl DirectSubstrate {
              JOIN node_direct nd ON nd.node_id = n.id
              JOIN node_status_snapshots nss ON nss.node_id = n.id
              JOIN node_template_inventory nti ON nti.node_id = n.id
-             WHERE n.managed_by = 'space'
+             WHERE n.managed_by = $4
                AND n.role = 'worker'
                AND nd.deleted_at IS NULL
                AND COALESCE(n.state, 'registered') = 'registered'
@@ -1845,6 +1850,7 @@ impl DirectSubstrate {
         .bind(template)
         .bind(content_hash)
         .bind(runtime)
+        .bind(SubstrateKind::Space)
         .fetch_all(&self.pool)
         .await
         .map_err(|err| db_contention_error("failed to select direct pool candidates", &err))
@@ -1944,12 +1950,13 @@ impl DirectSubstrate {
              JOIN nodes n ON n.id = s.active_node_id
              JOIN node_direct nd ON nd.node_id = n.id
              WHERE s.id = $1
-               AND n.managed_by = 'space'
+               AND n.managed_by = $2
                AND n.role = 'worker'
                AND nd.deleted_at IS NULL
              LIMIT 1"
         ))
         .bind(sandbox_id.as_uuid())
+        .bind(SubstrateKind::Space)
         .fetch_optional(&self.pool)
         .await
         .db_context_with(|| format!("failed to load worker placement for sandbox {sandbox_id}"))?
@@ -1968,12 +1975,13 @@ impl DirectSubstrate {
              JOIN nodes n ON n.id = COALESCE(s.target_node_id, s.active_node_id)
              JOIN node_direct nd ON nd.node_id = n.id
              WHERE s.id = $1
-               AND n.managed_by = 'space'
+               AND n.managed_by = $2
                AND n.role = 'worker'
                AND nd.deleted_at IS NULL
              LIMIT 1"
         ))
         .bind(sandbox_id.as_uuid())
+        .bind(SubstrateKind::Space)
         .fetch_optional(&self.pool)
         .await
         .db_context_with(|| {
@@ -2002,12 +2010,13 @@ impl DirectSubstrate {
              FROM nodes n
              JOIN node_direct nd ON nd.node_id = n.id
              WHERE n.id = $1
-               AND n.managed_by = 'space'
+               AND n.managed_by = $2
                AND n.role = 'worker'
                AND nd.deleted_at IS NULL
              LIMIT 1"
         ))
         .bind(node_id)
+        .bind(SubstrateKind::Space)
         .fetch_optional(&self.pool)
         .await
         .db_context_with(|| format!("failed to load direct worker node {node_id}"))?
@@ -2095,7 +2104,7 @@ impl DirectSubstrate {
              JOIN node_direct nd ON nd.node_id = n.id
              JOIN node_status_snapshots nss ON nss.node_id = n.id
              WHERE s.id = $1
-               AND n.managed_by = 'space'
+               AND n.managed_by = $2
                AND n.role = 'worker'
                AND nd.deleted_at IS NULL
                AND COALESCE(n.state, 'registered') = 'registered'
@@ -2157,6 +2166,7 @@ impl DirectSubstrate {
             sqlx::AssertSqlSafe(sql!(source_query.as_str())),
         )
         .bind(sandbox_id.as_uuid())
+        .bind(SubstrateKind::Space)
         .fetch_all(&self.pool)
         .await
         .db_context("failed to select direct source restore candidate")?;
@@ -2207,7 +2217,7 @@ impl DirectSubstrate {
              JOIN nodes n ON n.id IS DISTINCT FROM latest_snapshot.source_node_id
              JOIN node_direct nd ON nd.node_id = n.id
              JOIN node_status_snapshots nss ON nss.node_id = n.id
-             WHERE n.managed_by = 'space'
+             WHERE n.managed_by = $3
                AND n.role = 'worker'
                AND nd.deleted_at IS NULL
                AND COALESCE(n.state, 'registered') = 'registered'
@@ -2282,6 +2292,7 @@ impl DirectSubstrate {
         )
         .bind(sandbox_id.as_uuid())
         .bind(DIRECT_REMOTE_RESTORE_CANDIDATE_LIMIT)
+        .bind(SubstrateKind::Space)
         .fetch_all(&self.pool)
         .await
         .db_context("failed to select direct remote restore candidates")?;
@@ -4197,12 +4208,13 @@ impl SubstrateAdapter for DirectSubstrate {
              FROM nodes n
              JOIN node_direct nd ON nd.node_id = n.id
              WHERE n.id = $1
-               AND n.managed_by = 'space'
+               AND n.managed_by = $2
                AND n.role = 'builder'
                AND nd.deleted_at IS NULL
              LIMIT 1"
         ))
         .bind(node_id.as_uuid())
+        .bind(SubstrateKind::Space)
         .fetch_optional(&self.pool)
         .await
         .map_err(|error| {

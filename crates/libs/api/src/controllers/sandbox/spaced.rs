@@ -2,7 +2,7 @@ use super::*;
 use axum::http::StatusCode;
 use pplx_space_common_core::types::{
     ExecutionGeneration, GuestUserName, NodeManagedBy, PodUid, RouteGeneration,
-    SandboxActivationAttemptId, SandboxId, SandboxRouteIdentity,
+    SandboxActivationAttemptId, SandboxId, SandboxRouteIdentity, SubstrateKind,
 };
 use pplx_space_common_svc::space_api_route_ed25519::{
     SpaceApiRouteEd25519Authority, SpaceApiRouteEd25519Token, insert_space_api_route_ed25519_token,
@@ -72,7 +72,12 @@ impl SandboxController {
             // the pod back anyway, re-opening the lost-pod bypass. Only genuine
             // "not assigned / unreachable" errors should reach the wake path.
             Err(err) if err.status() == StatusCode::TOO_MANY_REQUESTS => Err(err),
-            Err(_) if sandbox.managed_by == "k8s" => {
+            Err(_)
+                if matches!(
+                    sandbox.managed_by.parse::<SubstrateKind>(),
+                    Ok(SubstrateKind::Kubernetes)
+                ) =>
+            {
                 // Fallback wake for a dormant sandbox (the non-recovering
                 // `runtime_client` path errored). `wake_execution` spends a real
                 // node slot for a suspended (Restore) or created (Cold) sandbox.

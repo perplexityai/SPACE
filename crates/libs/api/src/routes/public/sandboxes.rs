@@ -13,7 +13,9 @@ use axum::{
         sse::{Event, KeepAlive, Sse},
     },
 };
-use pplx_space_common_core::types::{AutoLifecyclePolicy, IdempotencyKey, SandboxLifecycle};
+use pplx_space_common_core::types::{
+    AutoLifecyclePolicy, IdempotencyKey, SandboxLifecycle, SubstrateKind,
+};
 use pplx_space_common_svc::types::{
     FACET_SANDBOX_DESIRED_STATE, SANDBOX_FAILURE_ACTIVATION_ATTEMPT_ID_KEY,
     SANDBOX_FAILURE_EPISODE_KEY, SANDBOX_FAILURE_EXECUTION_GENERATION_KEY,
@@ -905,7 +907,7 @@ const PUBLIC_SANDBOX_SELECT: &str = "SELECT s.id,
                 AND LOWER(TRIM(sos.status)) = 'failed'
                 AND (
                     (
-                        s.managed_by = 'k8s'
+                        s.managed_by = $6
                         AND EXISTS (
                             SELECT 1
                             FROM sandbox_k8s_executions execution
@@ -923,7 +925,7 @@ const PUBLIC_SANDBOX_SELECT: &str = "SELECT s.id,
                         )
                     )
                     OR (
-                        s.managed_by = 'space'
+                        s.managed_by = $7
                         AND direct_route.sandbox_id IS NOT NULL
                         AND failure_observation.observed_payload
                             -> $2::TEXT
@@ -969,22 +971,22 @@ fn public_sandbox_query(query: PublicSandboxQuery) -> sqlx::AssertSqlSafe<String
     // resources are NotFound and must not consume a list page's lookahead.
     let suffix = match query {
         PublicSandboxQuery::ById => {
-            "WHERE s.id = $6 AND s.org_id = $7 AND s.lifecycle <> 'deleted'"
+            "WHERE s.id = $8 AND s.org_id = $9 AND s.lifecycle <> 'deleted'"
         }
         PublicSandboxQuery::Page => {
-            "WHERE s.org_id = $6
+            "WHERE s.org_id = $8
                AND s.lifecycle <> 'deleted'
-               AND (($10::UUID IS NOT NULL AND s.user_id = $10)
-                 OR ($10::UUID IS NULL AND EXISTS (
+               AND (($12::UUID IS NOT NULL AND s.user_id = $12)
+                 OR ($12::UUID IS NULL AND EXISTS (
                      SELECT 1 FROM users owner WHERE owner.id = s.user_id
                        AND owner.owner_source = 'local'
                  )))
                AND (
-                   $7::TIMESTAMPTZ IS NULL
-                   OR (s.created_at, s.id) < ($7::TIMESTAMPTZ, $8::UUID)
+                   $9::TIMESTAMPTZ IS NULL
+                   OR (s.created_at, s.id) < ($9::TIMESTAMPTZ, $10::UUID)
                )
              ORDER BY s.created_at DESC, s.id DESC
-             LIMIT $9"
+             LIMIT $11"
         }
     };
     sqlx::AssertSqlSafe(sql!(format!("{PUBLIC_SANDBOX_SELECT}\n{suffix}")))
@@ -1001,6 +1003,8 @@ async fn fetch_public_sandbox(
         .bind(SANDBOX_FAILURE_EXECUTION_GENERATION_KEY)
         .bind(SANDBOX_FAILURE_POD_UID_KEY)
         .bind(SANDBOX_FAILURE_ACTIVATION_ATTEMPT_ID_KEY)
+        .bind(SubstrateKind::Kubernetes)
+        .bind(SubstrateKind::Space)
         .bind(sandbox_id.as_uuid())
         .bind(org_id)
         .fetch_optional(pool)
@@ -1023,6 +1027,8 @@ async fn fetch_sandboxes_page(
         .bind(SANDBOX_FAILURE_EXECUTION_GENERATION_KEY)
         .bind(SANDBOX_FAILURE_POD_UID_KEY)
         .bind(SANDBOX_FAILURE_ACTIVATION_ATTEMPT_ID_KEY)
+        .bind(SubstrateKind::Kubernetes)
+        .bind(SubstrateKind::Space)
         .bind(org_id)
         .bind(cursor_created_at)
         .bind(cursor_id)

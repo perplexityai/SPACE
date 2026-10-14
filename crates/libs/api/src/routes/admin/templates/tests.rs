@@ -7,6 +7,7 @@ use pplx_space_db_test_fixtures::pg_test_db;
 use pplx_space_test_env::TestResult;
 
 mod native_build;
+mod substrate_scope;
 
 const KERNEL_VERSION: &str = "vmlinux-6.1.200-custom";
 const KERNEL_DIGEST: &str =

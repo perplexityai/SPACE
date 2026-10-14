@@ -5,6 +5,8 @@ use pplx_space_db_test_fixtures::try_pg_test_db;
 
 use pplx_space_test_env::TestResult;
 
+mod substrate_scope;
+
 async fn row_count(pool: &sqlx::PgPool, table: &str, node_id: NodeId) -> Result<i64, sqlx::Error> {
     let query = match table {
         "node_direct" => "SELECT COUNT(*) FROM node_direct WHERE node_id = $1",

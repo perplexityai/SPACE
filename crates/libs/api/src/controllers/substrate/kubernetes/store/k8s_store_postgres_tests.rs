@@ -11,6 +11,7 @@ use super::*;
 use pplx_space_test_env::TestResult;
 
 mod stopped_restore_selector_tests;
+mod substrate_scope_tests;
 use stopped_restore_selector_tests::{
     stopped_disk_selector_agrees_with_the_retention_never_prune_guard,
     stopped_disk_selector_ignores_a_full_artifact_and_a_foreign_disk_artifact,

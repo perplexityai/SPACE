@@ -6,7 +6,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{delete, get, post},
 };
-use pplx_space_common_core::sql;
+use pplx_space_common_core::{sql, types::SubstrateKind};
 use serde::Serialize;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -29,9 +29,9 @@ enum ConsoleSubstrate {
 
 impl ConsoleSubstrate {
     fn from_managed_by(managed_by: &str) -> Self {
-        match managed_by {
-            "k8s" => Self::K8s,
-            _ => Self::Space,
+        match managed_by.parse::<SubstrateKind>() {
+            Ok(SubstrateKind::Kubernetes) => Self::K8s,
+            Ok(SubstrateKind::Space) | Err(_) => Self::Space,
         }
     }
 }
