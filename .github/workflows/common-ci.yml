@@ -62,10 +62,49 @@ jobs:
         with:
           node-version: '22.23.3'
 
+      # Package caches: a run downloads only the packages its lockfile
+      # changed. Main saves each ecosystem's cache under its lockfile's hash
+      # from one job; every job that installs those packages restores it.
+      # Pull requests and the merge queue fall back to the newest copy for an
+      # older lockfile and fetch the difference. Main takes only its exact
+      # lockfile's copy, so on a change it downloads the full set and the saved
+      # copy never accumulates packages the lockfile dropped. A miss or a
+      # failed restore only costs the download (ci/scripts/package-cache.sh),
+      # and Main CI deletes superseded copies. This job saves npm's.
+      - &restore-npm-cache
+        name: Restore the npm cache
+        id: restore-npm-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.npm
+          key: space-packages-v1-${{ runner.os }}-${{ runner.arch }}-npm-${{ hashFiles('docs/api/package-lock.json') }}
+          restore-keys: >-
+            ${{ github.event_name != 'push' && format('space-packages-v1-{0}-{1}-npm-', runner.os, runner.arch) || '' }}
+
+      - &prepare-npm-cache
+        name: Prepare the npm cache
+        env:
+          MATCHED_KEY: ${{ steps.restore-npm-cache.outputs.cache-matched-key }}
+        run: bash ci/scripts/package-cache.sh restored npm "${HOME}/.npm" "${MATCHED_KEY}"
+
       - name: Build and check the guide
         run: |
           bash scripts/build-guide-docs.sh
           python3 docs/book/test.py
+
+      - &report-npm-cache
+        name: Report the npm cache
+        if: always()
+        run: bash ci/scripts/package-cache.sh report npm "${HOME}/.npm"
+
+      - name: Save the npm cache
+        if: >-
+          success() && github.event_name == 'push' && github.ref == 'refs/heads/main' &&
+          steps.restore-npm-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.npm
+          key: ${{ steps.restore-npm-cache.outputs.cache-primary-key }}
 
   api_reference:
     if: github.repository == 'perplexityai/SPACE'
@@ -78,12 +117,36 @@ jobs:
         with:
           persist-credentials: false
 
+      # The SPACE Guide saves the npm cache, which the two jobs' identical
+      # `npm ci` share, and Rust tests the Cargo registry.
       - name: Set up documentation tooling
         uses: actions/setup-node@6044e13b5dc448c55e2357c09f80417699197238 # v6.2.0
         with:
           node-version: '22.23.3'
-          cache: npm
-          cache-dependency-path: docs/api/package-lock.json
+
+      - *restore-npm-cache
+
+      - *prepare-npm-cache
+
+      - &restore-cargo-registry
+        name: Restore the Cargo registry
+        id: restore-cargo-registry
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          # Cargo unpacks sources from the .crate archives on demand, and
+          # resolves a complete Cargo.lock offline from the index's cache.
+          path: |
+            ${{ runner.temp }}/cargo-home/registry/cache
+            ${{ runner.temp }}/cargo-home/registry/index
+          key: space-packages-v1-${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: >-
+            ${{ github.event_name != 'push' && format('space-packages-v1-{0}-{1}-cargo-', runner.os, runner.arch) || '' }}
+
+      - &prepare-cargo-registry
+        name: Prepare the Cargo registry
+        env:
+          MATCHED_KEY: ${{ steps.restore-cargo-registry.outputs.cache-matched-key }}
+        run: bash ci/scripts/package-cache.sh restored cargo "${RUNNER_TEMP}/cargo-home/registry" "${MATCHED_KEY}"
 
       - *install-mdbook
 
@@ -98,8 +161,16 @@ jobs:
       - name: Build guide and API
         env:
           SPACE_API_DOCS_RUST_IMAGE: space-ci:${{ github.sha }}
+          SPACE_API_DOCS_CARGO_REGISTRY: ${{ runner.temp }}/cargo-home/registry
           SPACE_DOCS_NPM_CI_DONE: '1'
         run: bash scripts/build-docs.sh
+
+      - *report-npm-cache
+
+      - &report-cargo-registry
+        name: Report the Cargo registry
+        if: always()
+        run: bash ci/scripts/package-cache.sh report cargo "${RUNNER_TEMP}/cargo-home/registry"
 
       - name: Check standalone outputs and the combined site
         run: |
@@ -129,6 +200,12 @@ jobs:
         with:
           persist-credentials: false
 
+      # Both tools read every package's manifest through `cargo metadata`,
+      # which downloads every crate in Cargo.lock.
+      - *restore-cargo-registry
+
+      - *prepare-cargo-registry
+
       # cargo-vet and cargo-deny are pinned in ci/Dockerfile.ci and ship in the
       # CI image, so this job no longer compiles them on every run.
       - name: Get the CI image
@@ -139,13 +216,17 @@ jobs:
       - name: Verify third-party Rust dependencies
         run: >-
           docker run --rm --volume "${GITHUB_WORKSPACE}:/workspace" --workdir /workspace
+          --volume "${RUNNER_TEMP}/cargo-home/registry:/usr/local/cargo/registry"
           "space-ci:${GITHUB_SHA}" cargo vet --locked
 
       - name: Check Rust advisories, licenses, and sources
         run: >-
           docker run --rm --volume "${GITHUB_WORKSPACE}:/workspace" --workdir /workspace
+          --volume "${RUNNER_TEMP}/cargo-home/registry:/usr/local/cargo/registry"
           "space-ci:${GITHUB_SHA}"
           cargo deny --locked --all-features check advisories licenses sources
+
+      - *report-cargo-registry
 
   validation:
     if: github.repository == 'perplexityai/SPACE'
@@ -177,6 +258,7 @@ jobs:
             rust_cache_size: 4G
             rust_cache_refresh_misses: 20
             rust_target_cache: true
+            cargo_registry: save
             # Only this runner gains from it: on the standard runners the
             # prefetch slows the concurrent CI image pull by more than it saves.
             prefetch_crates: true
@@ -187,6 +269,7 @@ jobs:
             docker_access: false
             host_network: false
             privileged: false
+            go_modules: save
             timeout: 30
           - name: Python tests
             command: bash ci/scripts/run-python-tests.sh
@@ -194,6 +277,8 @@ jobs:
             docker_access: true
             host_network: true
             privileged: false
+            uv_cache: python
+            uv_cache_save: true
             timeout: 30
           - name: Shell tests
             command: bash ci/scripts/run-shell-tests.sh
@@ -201,6 +286,7 @@ jobs:
             docker_access: false
             host_network: false
             privileged: false
+            uv_cache: python
             timeout: 30
           - name: Migration guards
             command: >-
@@ -218,6 +304,7 @@ jobs:
             docker_access: false
             host_network: false
             privileged: false
+            uv_cache: python
             timeout: 15
           - name: Gateway traffic
             command: >-
@@ -234,6 +321,9 @@ jobs:
             rust_cache_key: gateway
             rust_cache_size: 1G
             rust_cache_refresh_misses: 20
+            cargo_registry: restore
+            uv_cache: gateway
+            uv_cache_save: true
             timeout: 45
 
     steps:
@@ -256,11 +346,77 @@ jobs:
           bash ci/scripts/background-step.sh start ci-image
           bash ci/scripts/ci-image.sh ensure "space-ci:${GITHUB_SHA}"
 
-      # Download the crates meanwhile with the runner's own Cargo, into the
-      # registry the job container mounts; its `cargo fetch --locked` then only
-      # checks them. Cargo shares one registry across versions, as on any
-      # machine with several toolchains. This only saves time: if it fails, the
-      # container's fetch downloads everything, as before.
+      # The package caches, as in the SPACE Guide job. An entry restores the
+      # ones it sets among cargo_registry, go_modules and uv_cache; the one
+      # entry whose cargo_registry or go_modules is `save`, or that sets
+      # uv_cache_save, saves that cache on main. uv has two caches because no
+      # job installs the other's packages: Python tests' also serves the shell
+      # tests and migration guards, and Gateway traffic installs its own
+      # requirements.
+      - name: Restore the Cargo registry
+        id: restore-cargo-registry
+        if: matrix.cargo_registry
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ${{ runner.temp }}/cargo-home/registry/cache
+            ${{ runner.temp }}/cargo-home/registry/index
+          key: space-packages-v1-${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: >-
+            ${{ github.event_name != 'push' && format('space-packages-v1-{0}-{1}-cargo-', runner.os, runner.arch) || '' }}
+
+      - name: Restore the Go module cache
+        id: restore-go-modules
+        if: matrix.go_modules
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          # Only the downloaded archives: Go extracts a module from its zip
+          # without the network.
+          path: ${{ runner.temp }}/go-mod/cache/download
+          key: space-packages-v1-${{ runner.os }}-${{ runner.arch }}-go-${{ hashFiles('shim/go.mod', 'shim/go.sum') }}
+          restore-keys: >-
+            ${{ github.event_name != 'push' && format('space-packages-v1-{0}-{1}-go-', runner.os, runner.arch) || '' }}
+
+      - name: Restore the uv cache
+        id: restore-uv-cache
+        if: matrix.uv_cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/uv-cache
+          key: >-
+            space-packages-v1-${{ runner.os }}-${{ runner.arch }}-uv-${{ matrix.uv_cache }}-${{
+            hashFiles('uv.lock', 'ci/scripts/run-python-tests.sh', 'scripts/netgtw/traffic/requirements.txt') }}
+          restore-keys: >-
+            ${{ github.event_name != 'push' &&
+            format('space-packages-v1-{0}-{1}-uv-{2}-', runner.os, runner.arch, matrix.uv_cache) || '' }}
+
+      - name: Prepare the package caches
+        if: matrix.cargo_registry || matrix.go_modules || matrix.uv_cache
+        env:
+          CARGO_REGISTRY: ${{ matrix.cargo_registry }}
+          CARGO_KEY: ${{ steps.restore-cargo-registry.outputs.cache-matched-key }}
+          GO_MODULES: ${{ matrix.go_modules }}
+          GO_KEY: ${{ steps.restore-go-modules.outputs.cache-matched-key }}
+          UV_CACHE: ${{ matrix.uv_cache }}
+          UV_KEY: ${{ steps.restore-uv-cache.outputs.cache-matched-key }}
+        run: |
+          set -euo pipefail
+          if [[ -n "${CARGO_REGISTRY}" ]]; then
+            bash ci/scripts/package-cache.sh restored cargo "${RUNNER_TEMP}/cargo-home/registry" "${CARGO_KEY}"
+          fi
+          if [[ -n "${GO_MODULES}" ]]; then
+            bash ci/scripts/package-cache.sh restored go "${RUNNER_TEMP}/go-mod" "${GO_KEY}"
+          fi
+          if [[ -n "${UV_CACHE}" ]]; then
+            bash ci/scripts/package-cache.sh restored uv "${RUNNER_TEMP}/uv-cache" "${UV_KEY}"
+          fi
+
+      # Download the crates the restored registry lacks meanwhile with the
+      # runner's own Cargo, into the registry the job container mounts; its
+      # `cargo fetch --locked` then only checks them. Cargo shares one registry
+      # across versions, as on any machine with several toolchains. This only
+      # saves time: if it fails, the container's fetch downloads them, as
+      # before.
       - name: Start fetching the Rust dependencies
         if: matrix.prefetch_crates == true
         run: >-
@@ -434,19 +590,27 @@ jobs:
           SPACE_CI_SCCACHE_RUN_DIR: ${{ runner.temp }}/space-sccache-run
           SPACE_CI_SCCACHE_SIZE: ${{ matrix.rust_cache_size }}
           SPACE_CI_CARGO_REGISTRY: ${{ runner.temp }}/cargo-home/registry
+          SPACE_CI_GO_MOD_CACHE: ${{ runner.temp }}/go-mod
+          SPACE_CI_UV_CACHE: ${{ runner.temp }}/uv-cache
         run: |
           set -euo pipefail
 
           # Mount Cargo's registry, under the CI image's CARGO_HOME, from the
-          # runner. It holds any crates prefetched above, and it keeps their
-          # tens of thousands of unpacked source files out of the container,
-          # which --rm would otherwise delete one by one before the step ends.
-          mkdir -p "${SPACE_CI_CARGO_REGISTRY}"
+          # runner. It holds any crates restored or prefetched above, and it
+          # keeps their tens of thousands of unpacked source files out of the
+          # container, which --rm would otherwise delete one by one before the
+          # step ends. Go's module cache and uv's cache come from the runner
+          # too, with what the steps above restored.
+          mkdir -p "${SPACE_CI_CARGO_REGISTRY}" "${SPACE_CI_GO_MOD_CACHE}" "${SPACE_CI_UV_CACHE}"
           docker_args=(
             --rm
             --volume "${GITHUB_WORKSPACE}:/workspace"
             --volume "${SPACE_CI_CARGO_REGISTRY}:/usr/local/cargo/registry"
+            --volume "${SPACE_CI_GO_MOD_CACHE}:/go-mod-cache"
+            --volume "${SPACE_CI_UV_CACHE}:/uv-cache"
             --workdir /workspace
+            --env GOMODCACHE=/go-mod-cache
+            --env UV_CACHE_DIR=/uv-cache
             --env CI=true
             --env CARGO_INCREMENTAL=0
             --env GITHUB_ACTIONS=true
@@ -652,3 +816,69 @@ jobs:
         with:
           path: ${{ runner.temp }}/space-target-parts
           key: ${{ steps.target-key.outputs.key }}
+
+      - name: Report the package caches
+        if: always() && (matrix.cargo_registry || matrix.go_modules || matrix.uv_cache)
+        env:
+          CARGO_REGISTRY: ${{ matrix.cargo_registry }}
+          GO_MODULES: ${{ matrix.go_modules }}
+          UV_CACHE: ${{ matrix.uv_cache }}
+        run: |
+          if [[ -n "${CARGO_REGISTRY}" ]]; then
+            bash ci/scripts/package-cache.sh report cargo "${RUNNER_TEMP}/cargo-home/registry"
+          fi
+          if [[ -n "${GO_MODULES}" ]]; then
+            bash ci/scripts/package-cache.sh report go "${RUNNER_TEMP}/go-mod"
+          fi
+          if [[ -n "${UV_CACHE}" ]]; then
+            bash ci/scripts/package-cache.sh report uv "${RUNNER_TEMP}/uv-cache"
+          fi
+
+      # Each package cache holds exactly its lockfile's packages, so a key
+      # that was restored exactly is never saved again.
+      - name: Save the Cargo registry
+        if: >-
+          success() && matrix.cargo_registry == 'save' &&
+          github.event_name == 'push' && github.ref == 'refs/heads/main' &&
+          steps.restore-cargo-registry.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ${{ runner.temp }}/cargo-home/registry/cache
+            ${{ runner.temp }}/cargo-home/registry/index
+          key: ${{ steps.restore-cargo-registry.outputs.cache-primary-key }}
+
+      - name: Save the Go module cache
+        if: >-
+          success() && matrix.go_modules == 'save' &&
+          github.event_name == 'push' && github.ref == 'refs/heads/main' &&
+          steps.restore-go-modules.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/go-mod/cache/download
+          key: ${{ steps.restore-go-modules.outputs.cache-primary-key }}
+
+      # The job container wrote the cache as root. Pruning drops what uv only
+      # used while it ran, such as the environments `uv run --with` builds, and
+      # keeps the downloaded wheels: `uv cache prune --ci` would drop those too,
+      # and the next run would fetch them all from PyPI again.
+      - name: Prepare the uv cache for upload
+        id: prepare-uv-cache
+        if: >-
+          success() && matrix.uv_cache_save == true &&
+          github.event_name == 'push' && github.ref == 'refs/heads/main' &&
+          steps.restore-uv-cache.outputs.cache-hit != 'true'
+        env:
+          SPACE_CI_UV_CACHE: ${{ runner.temp }}/uv-cache
+        run: |
+          set -euo pipefail
+          docker run --rm --volume "${SPACE_CI_UV_CACHE}:/uv-cache" --env UV_CACHE_DIR=/uv-cache \
+            "space-ci:${GITHUB_SHA}" uv cache prune
+          du -sh "${SPACE_CI_UV_CACHE}"
+
+      - name: Save the uv cache
+        if: steps.prepare-uv-cache.outcome == 'success'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/uv-cache
+          key: ${{ steps.restore-uv-cache.outputs.cache-primary-key }}

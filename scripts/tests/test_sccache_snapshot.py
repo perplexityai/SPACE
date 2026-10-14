@@ -118,6 +118,20 @@ class SupersededTest(unittest.TestCase):
         )
         self.assertEqual(sorted(c["id"] for c in snapshot.superseded(caches)), [1, 100])
 
+    def test_keeps_only_the_newest_package_cache_of_each_ecosystem(self) -> None:
+        packages = "space-packages-v1-Linux-X64"
+        caches = [
+            cache(1, f"{packages}-cargo-{OTHER_HASH}", "2026-09-25T00:00:00Z"),
+            cache(2, f"{packages}-cargo-{HASH}", "2026-09-26T00:00:00Z"),
+            cache(3, f"{packages}-uv-python-{OTHER_HASH}", "2026-09-26T05:00:00Z"),
+            cache(4, f"{packages}-uv-python-{HASH}", "2026-09-26T01:00:00Z"),
+            cache(5, f"{packages}-uv-gateway-{HASH}", "2026-09-24T00:00:00Z"),
+            cache(6, f"space-packages-v1-Linux-ARM64-cargo-{OTHER_HASH}", "2026-09-20T00:00:00Z"),
+            # Not a package cache key: kept, whatever its age.
+            cache(7, f"{packages}-cargo-not-a-hash", "2026-09-01T00:00:00Z"),
+        ]
+        self.assertEqual(sorted(c["id"] for c in snapshot.superseded(caches)), [1, 4])
+
     def test_leaves_a_lone_snapshot_alone(self) -> None:
         only = cache(1, f"space-sccache-v1-Linux-X64-clippy-{HASH}-1-1", "2026-09-26T00:00:00Z")
         self.assertEqual(snapshot.superseded([only]), [])

@@ -72,7 +72,15 @@ environment="$REPO_ROOT/target/gateway-traffic/venv"
 if [[ ! -x $environment/bin/python ]]; then
   "$uv_bin" venv --python python3 "$environment"
 fi
-"$uv_bin" pip sync --python "$environment/bin/python" "$SCRIPT_DIR/requirements.txt"
+# Install from uv's cache first. Online, uv revalidates each package's index
+# page once its few-minute freshness lapses, even when every wheel is cached,
+# so an index outage would fail an unchanged lockfile. Only an install that
+# needs something the cache lacks goes to the index.
+if "$uv_bin" pip sync --offline --quiet --python "$environment/bin/python" "$SCRIPT_DIR/requirements.txt" 2>/dev/null; then
+  echo "Installed the traffic harness's packages from uv's cache."
+else
+  "$uv_bin" pip sync --python "$environment/bin/python" "$SCRIPT_DIR/requirements.txt"
+fi
 # Match the other Rust jobs' cache normalization across Buildkite checkouts.
 export SCCACHE_BASEDIRS="${SCCACHE_BASEDIRS:-$REPO_ROOT}"
 target_dir=${CARGO_TARGET_DIR:-$REPO_ROOT/target}

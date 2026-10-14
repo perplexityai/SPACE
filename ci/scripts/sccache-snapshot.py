@@ -11,7 +11,8 @@ merge queue restore the newest snapshot and never save.
           `trim` step outputs; every event logs it, only main acts on it
   prune   delete every snapshot on a ref except the newest of each job family;
           Cargo target-directory snapshots (ci/scripts/rust-target-cache.sh)
-          keep the newest of each recent build-inputs hash instead
+          keep the newest of each recent build-inputs hash instead, and package
+          caches (ci/scripts/package-cache.sh) the newest of each ecosystem
 """
 
 from __future__ import annotations
@@ -44,6 +45,12 @@ TARGET_KEY = re.compile(
     rf"^(?P<family>{re.escape(TARGET_KEY_PREFIX)}.+)-(?P<inputs>[0-9a-f]{{16}})-[0-9a-f]{{16}}-[0-9]+-[0-9]+$"
 )
 TARGET_INPUTS_KEPT = 3
+# Package caches: <family>-<lockfile hash>, where the family names one
+# ecosystem's cache. Main saves one per lockfile; pull requests and the merge
+# queue fall back to the newest, so an older one only serves a branch that has
+# not rebased, which then fetches the difference.
+PACKAGE_KEY_PREFIX = "space-packages-v1-"
+PACKAGE_KEY = re.compile(rf"^(?P<family>{re.escape(PACKAGE_KEY_PREFIX)}.+)-[0-9a-f]{{64}}$")
 
 
 @dataclass(frozen=True)
@@ -114,15 +121,15 @@ def created_at(cache: Mapping) -> datetime:
 def superseded(caches: Iterable[Mapping]) -> list[Mapping]:
     """Return the snapshots to delete.
 
-    That is all but the most recently created compiler cache of each family,
-    and all but the most recently created target directory of each of a
-    family's TARGET_INPUTS_KEPT most recent build-inputs hashes.
+    That is all but the most recently created compiler cache or package cache
+    of each family, and all but the most recently created target directory of
+    each of a family's TARGET_INPUTS_KEPT most recent build-inputs hashes.
     """
     newest: set[tuple[str, str]] = set()
     kept_inputs: dict[str, int] = {}
     stale = []
     for cache in sorted(caches, key=lambda c: (created_at(c), c["id"]), reverse=True):
-        if match := SNAPSHOT_KEY.match(cache["key"]):
+        if match := SNAPSHOT_KEY.match(cache["key"]) or PACKAGE_KEY.match(cache["key"]):
             family, inputs = match["family"], None
         elif match := TARGET_KEY.match(cache["key"]):
             family, inputs = match["family"], match["inputs"]
@@ -159,7 +166,7 @@ def github(method: str, path: str, token: str) -> dict | None:
 
 def list_snapshots(repository: str, ref: str, token: str) -> list[dict]:
     caches: list[dict] = []
-    for prefix in (KEY_PREFIX, TARGET_KEY_PREFIX):
+    for prefix in (KEY_PREFIX, TARGET_KEY_PREFIX, PACKAGE_KEY_PREFIX):
         page = 1
         while True:
             query = urllib.parse.urlencode(
@@ -210,7 +217,7 @@ def run_prune(args: argparse.Namespace) -> int:
     token = os.environ["GH_TOKEN"]
     snapshots = list_snapshots(args.repository, args.ref, token)
     stale = superseded(snapshots)
-    print(f"{len(snapshots)} Rust compiler-cache snapshots on {args.ref}; {len(stale)} superseded")
+    print(f"{len(snapshots)} Rust and package cache snapshots on {args.ref}; {len(stale)} superseded")
     for cache in stale:
         size_gb = cache.get("size_in_bytes", 0) / 1e9
         print(f"Delete {cache['key']} ({size_gb:.2f} GB, created {cache['created_at']})")

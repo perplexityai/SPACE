@@ -15,7 +15,13 @@ export CARGO_PROFILE_DEV_DEBUG=0
 export CARGO_INCREMENTAL=0
 if [[ -n "${SPACE_API_DOCS_RUST_IMAGE:-}" ]]; then
   # CI uses the repository-owned Rust/protoc image; no daemon is needed locally.
-  docker run --rm --volume "$root:/workspace" --workdir /workspace \
+  # SPACE_API_DOCS_CARGO_REGISTRY optionally mounts a host Cargo registry, so
+  # the build reads crates CI already restored instead of downloading them.
+  registry_args=()
+  if [[ -n "${SPACE_API_DOCS_CARGO_REGISTRY:-}" ]]; then
+    registry_args=(--volume "$SPACE_API_DOCS_CARGO_REGISTRY:/usr/local/cargo/registry")
+  fi
+  docker run --rm --volume "$root:/workspace" ${registry_args[@]+"${registry_args[@]}"} --workdir /workspace \
     --env CARGO_PROFILE_DEV_DEBUG=0 \
     --env CARGO_INCREMENTAL=0 \
     "$SPACE_API_DOCS_RUST_IMAGE" \

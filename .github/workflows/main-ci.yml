@@ -196,13 +196,15 @@ jobs:
 
   # Rust jobs on main save each compiler-cache refresh under a new key, and
   # restores take only the newest snapshot of a job, or of a job's build inputs
-  # for Cargo target directories. Delete the older ones so they do not fill the
-  # repository's cache quota. Only this job holds actions:write. It is not
-  # required by space-ci: a failed deletion leaves every check correct, and the
-  # next main run retries it.
+  # for Cargo target directories. Package caches (Cargo registry, Go modules,
+  # uv, npm) get a new key per lockfile, and pull requests fall back to the
+  # newest. Delete the older ones so they do not fill the repository's cache
+  # quota. Only this job holds actions:write. It is not required by space-ci: a
+  # failed deletion leaves every check correct, and the next main run retries
+  # it.
   rust_cache_cleanup:
     if: ${{ !cancelled() && github.repository == 'perplexityai/SPACE' }}
-    name: Delete superseded Rust compiler caches
+    name: Delete superseded Rust and package caches
     needs:
       - rust_static
       - common
@@ -217,7 +219,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Delete superseded Rust compiler caches
+      - name: Delete superseded Rust and package caches
         env:
           GH_TOKEN: ${{ github.token }}
         run: python3 ci/scripts/sccache-snapshot.py prune --repository "${GITHUB_REPOSITORY}" --ref "${GITHUB_REF}"
