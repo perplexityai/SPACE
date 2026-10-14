@@ -6,8 +6,8 @@
 # never fails the check; the builder starts from the mirrored BuildKit image,
 # else its source, else Docker's own builder; a build that fails fetching from
 # the mirror or the cache, or stalls importing the cache, runs once more without
-# them, as does the rest of the run; and the input hash covers each file's
-# executable bit.
+# them, as does the rest of the run, on another builder after a stall; and the
+# input hash covers each file's executable bit.
 set -euo pipefail
 
 KERNEL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../templates/firecracker/kernel" && pwd)"
@@ -140,14 +140,15 @@ fail() {
     FAILURES=$((FAILURES + 1))
 }
 
-# run <registry references> <args>...: runs the script with no builder yet,
-# leaving its output in ${WORK_DIR}/out and its docker calls in
-# ${WORK_DIR}/calls.
+# run <registry references> <args>...: runs the script with no builder yet, or
+# with the caller's when PRESET_BUILDER is set, leaving its output in
+# ${WORK_DIR}/out and its docker calls in ${WORK_DIR}/calls.
 run() {
     local registry="$1"
     shift
     : >"${WORK_DIR}/calls"
     : >"${WORK_DIR}/builders"
+    [ -z "${PRESET_BUILDER:-}" ] || echo "space-guest-kernel caller-image" >"${WORK_DIR}/builders"
     printf '%s\n' "${registry}" >"${WORK_DIR}/registry"
     PATH="${TEST_PATH:-${WORK_DIR}/bin:${PATH}}" FAKE_CALLS="${WORK_DIR}/calls" \
         FAKE_REGISTRY="${WORK_DIR}/registry" FAKE_BUILDERS="${WORK_DIR}/builders" \
@@ -256,6 +257,7 @@ FAKE_FETCH_FAILS=1 run "${MIRRORS}"$'\n'"${CACHES}" publish ||
 said "::warning::The build failed or stalled taking layers from the image mirror or the toolchain cache" ||
     fail "a failed fetch from the mirror was not reported"
 [ "$(calls '--target export')" = 2 ] || fail "a failed fetch from the mirror was not retried once"
+[ "$(calls '^buildx rm ')" = 0 ] || fail "a failed fetch, not a stall, replaced the builder"
 [ "$(grep -e '--target export' "${WORK_DIR}/calls" | tail -n 1 | grep -cE -e '--(cache-from|build-context)=')" = 0 ] ||
     fail "the retry still used the mirror or the cache"
 recorded || fail "a build retried without the mirror was not recorded"
@@ -269,11 +271,25 @@ without_external_after() {
 FAKE_STALL=external-build run "${MIRRORS}"$'\n'"${CACHES}" publish ||
     fail "a stalled mirror and cache failed the check: $(cat "${WORK_DIR}/out")"
 [ "$(calls '--target export')" = 2 ] || fail "a stalled kernel build was not retried without the mirror and cache"
+[ "$(calls '^buildx rm space-guest-kernel')$(calls '^buildx create ')" = 12 ] ||
+    fail "the builder that held the stalled build was not replaced: $(grep '^buildx' "${WORK_DIR}/calls")"
+[ "$(grep -e '--target export' "${WORK_DIR}/calls" | tail -n 1 | grep -c -e '--builder=space-guest-kernel')" = 1 ] ||
+    fail "the retry did not run on the new builder"
 [ "$(calls '^build .*--target smoke')" = 1 ] || fail "the smoke build stalled again instead of going without them"
 without_external_after '^build .*--target smoke' || fail "the smoke build after the fallback used the mirror or cache"
 without_external_after 'cache-to' || fail "the exports after the fallback used the mirror or cache"
 said "Saved the smoke layers" || fail "the run did not finish its exports after the fallback"
 recorded || fail "a run that fell back was not recorded"
+
+PRESET_BUILDER=1 FAKE_STALL=external-build run "${MIRRORS}"$'\n'"${CACHES}" publish ||
+    fail "a stall on the caller's builder failed the check: $(cat "${WORK_DIR}/out")"
+[ "$(calls '^buildx rm ')" = 0 ] || fail "the caller's builder was removed"
+[ "$(grep -e '--target export' "${WORK_DIR}/calls" | tail -n 1 | grep -c -e '--builder=')" = 0 ] ||
+    fail "the retry stayed on the caller's builder that held the stalled build"
+[ "$(grep -e '--target smoke' "${WORK_DIR}/calls" | grep -c -e '--builder=')" = 0 ] ||
+    fail "the smoke build went back to the caller's builder"
+[ "$(calls 'cache-to')" = 0 ] || fail "Docker's own builder tried to export the cache after the fallback"
+recorded || fail "a run that left the caller's builder was not recorded"
 
 FAKE_STALL=external-build run "${MIRRORS}" publish ||
     fail "a stalled mirror without a cache failed the check: $(cat "${WORK_DIR}/out")"

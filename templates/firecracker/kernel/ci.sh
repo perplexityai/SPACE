@@ -33,7 +33,7 @@
 # the mirror has it (ci/scripts/mirror-images.sh build-contexts). A build that
 # takes layers from the mirror or the cache has a deadline. If it fails
 # fetching from them or overruns, it runs once more without either, and so does
-# every later build and export of the run.
+# every later build and export of the run; after an overrun, on a new builder.
 #
 # GHCR_TOKEN, when set, logs in to the registry first.
 # SPACE_GUEST_KERNEL_CI_REPOSITORY overrides the repository, and
@@ -67,10 +67,11 @@ BUILDKIT_IMAGE="moby/buildkit:v0.32.2@sha256:28a898719c18a33f4e8000685287fa36fd0
 #   builder: the mirrored BuildKit image stalls (60 + 180 + 60 s), the source
 #   starts                                                   7 min
 #   kernel build with the mirror and cache, cut off         60 min
+#   a new builder for the retry (60 s, then as above)        8 min
 #   the same build, cold, without them                     ~45 min
 #   smoke build, without them since the fallback           ~10 min
 #   two cache exports, two tag checks and the marker push   17 min
-# About 147 minutes.
+# About 155 minutes.
 REGISTRY_TIMEOUT_SECONDS="${SPACE_GUEST_KERNEL_REGISTRY_TIMEOUT_SECONDS:-60}"
 WRITE_TIMEOUT_SECONDS="${SPACE_GUEST_KERNEL_WRITE_TIMEOUT_SECONDS:-300}"
 BUILD_TIMEOUT_SECONDS="${SPACE_GUEST_KERNEL_BUILD_TIMEOUT_SECONDS:-3600}"
@@ -80,6 +81,8 @@ FETCH_FAILURE='^ERROR:.*(httpReadSeeker|could not fetch content descriptor|faile
 TIMEOUT_BIN="$(command -v timeout || command -v gtimeout || true)"
 BUILDER_OPTION=""
 CACHE_EXPORT=false
+# Whether this run started the builder, and so may remove it.
+OWN_BUILDER=false
 # Set once a build has fallen back; every later build and export then goes
 # without the mirror and the cache too.
 WITHOUT_EXTERNAL=false
@@ -167,6 +170,7 @@ select_builder() {
     if docker buildx inspect "${BUILDER}" >/dev/null 2>&1; then
         BUILDER_OPTION="--builder=${BUILDER}"
         CACHE_EXPORT=true
+        OWN_BUILDER=false
         return 0
     fi
     for image in $(mirrored_buildkit) "${BUILDKIT_IMAGE}"; do
@@ -176,19 +180,40 @@ select_builder() {
             echo "Started the ${BUILDER} builder from ${image}"
             BUILDER_OPTION="--builder=${BUILDER}"
             CACHE_EXPORT=true
+            OWN_BUILDER=true
             return 0
         fi
         echo "::warning::Could not start the ${BUILDER} builder from ${image}"
         with_deadline 60 docker buildx rm "${BUILDER}" >/dev/null 2>&1 || true
     done
+    BUILDER_OPTION=""
+    CACHE_EXPORT=false
+    OWN_BUILDER=false
     echo "::warning::Building on Docker's own builder, which reads the toolchain cache but cannot save it"
 }
 
-# The docker build options of every build here, one per line: the builder, the
-# mirrored base, and each cache tag that exists.
+# A build cut off by its deadline can leave BuildKit holding the stalled
+# download, and the same digests built again on that builder wait for it. So
+# the retry goes to another builder: a new one in place of one this run
+# started, else Docker's own. The new one has no layers yet, so the retry is
+# cold.
+replace_builder() {
+    [ -n "${BUILDER_OPTION}" ] || return 0
+    if [ "${OWN_BUILDER}" = true ]; then
+        echo "::warning::Replacing the ${BUILDER} builder, which may still hold the stalled download"
+        with_deadline 60 docker buildx rm "${BUILDER}" >/dev/null 2>&1 || true
+        select_builder
+    else
+        BUILDER_OPTION=""
+        CACHE_EXPORT=false
+        echo "::warning::Leaving the ${BUILDER} builder, which may still hold the stalled download, for Docker's own builder, which reads the toolchain cache but cannot save it"
+    fi
+}
+
+# The docker build options of every build here, one per line, but the
+# builder's: the mirrored base, and each cache tag that exists.
 build_options() {
     local target
-    [ -z "${BUILDER_OPTION}" ] || printf '%s\n' "${BUILDER_OPTION}"
     with_deadline "$((2 * REGISTRY_TIMEOUT_SECONDS))" \
         bash "${REPO_ROOT}/ci/scripts/mirror-images.sh" build-contexts "${SCRIPT_DIR}/Dockerfile" ||
         echo "::warning::Building from the Dockerfile's own base; the image mirror lookup failed or overran" >&2
@@ -204,9 +229,10 @@ without_external() {
     grep -Ev '^--(cache-from|build-context)=' <<<"$1" || true
 }
 
-# The options of a build or export: without the mirror and the cache once a
-# build has fallen back.
+# The options of a build or export: the current builder's, then the given
+# ones, without the mirror and the cache once a build has fallen back.
 effective() {
+    [ -z "${BUILDER_OPTION}" ] || printf '%s\n' "${BUILDER_OPTION}"
     if [ "${WITHOUT_EXTERNAL}" = true ]; then without_external "$1"; else printf '%s\n' "$1"; fi
 }
 
@@ -221,8 +247,8 @@ effective() {
 # docker client that outlives the deadline would hold a pipe open, and the wait
 # for it would have none.
 attempt() {
-    local deadline="$1" options log follower status=0
-    options="$(effective "$2")"
+    local deadline="$1" requested="$2" options log follower status=0
+    options="$(effective "${requested}")"
     shift 2
     log="$(mktemp)"
     if [[ "${options}" == *--cache-from=* || "${options}" == *--build-context=* ]]; then
@@ -237,8 +263,11 @@ attempt() {
             grep '^ERROR:' "${log}" | tail -n 1 | grep -Eq "${FETCH_FAILURE}"; }; then
             echo "::warning::The build failed or stalled taking layers from the image mirror or the toolchain cache; building once more, and for the rest of this run, without them"
             WITHOUT_EXTERNAL=true
+            if [ "${status}" -eq 124 ] || [ "${status}" -eq 137 ]; then
+                replace_builder
+            fi
             status=0
-            env KERNEL_DOCKER_BUILD_OPTIONS="$(without_external "${options}")" "$@" || status=$?
+            env KERNEL_DOCKER_BUILD_OPTIONS="$(effective "${requested}")" "$@" || status=$?
         fi
     else
         env KERNEL_DOCKER_BUILD_OPTIONS="${options}" "$@" || status=$?
