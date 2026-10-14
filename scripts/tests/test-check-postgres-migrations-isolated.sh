@@ -240,6 +240,8 @@ cp "${script}" "${work_repo}/scripts/check-postgres-migrations-isolated.sh"
 cp "${repo_root}/scripts/check_postgres_partial_indexes.py" "${work_repo}/scripts/"
 mkdir -p "${work_repo}/ci/scripts"
 cp "${repo_root}/ci/scripts/ensure-uv.sh" "${work_repo}/ci/scripts/"
+mkdir -p "${work_repo}/ci/scripts/lib"
+cp "${repo_root}/ci/scripts/lib/uv-run.sh" "${work_repo}/ci/scripts/lib/"
 
 git -C "${work_repo}" init --quiet --initial-branch=main
 git -C "${work_repo}" config user.email test@example.com

@@ -63,48 +63,78 @@ jobs:
           node-version: '22.23.3'
 
       # Package caches: a run downloads only the packages its lockfile
-      # changed. Main saves each ecosystem's cache under its lockfile's hash
-      # from one job; every job that installs those packages restores it.
-      # Pull requests and the merge queue fall back to the newest copy for an
-      # older lockfile and fetch the difference. Main takes only its exact
-      # lockfile's copy, so on a change it downloads the full set and the saved
-      # copy never accumulates packages the lockfile dropped. A miss or a
-      # failed restore only costs the download (ci/scripts/package-cache.sh),
-      # and Main CI deletes superseded copies. This job saves npm's.
+      # changed. Each ecosystem's cache is keyed on its lockfile's hash and the
+      # run, and every job restores the newest copy for its lockfile, else the
+      # newest of the ecosystem, and fetches the difference. One job saves each
+      # cache, on main only: when it restored no copy for this lockfile, or had
+      # to complete the copy for it. It first trims the copy to the lockfile,
+      # so the cache does not grow with every change, and Main CI deletes all
+      # but the newest two copies. A stalled restore gives up after
+      # SEGMENT_DOWNLOAD_TIMEOUT_MINS, and a miss, a failed restore or a
+      # damaged archive only costs a download (ci/scripts/package-cache.py).
+      # This job saves npm's.
+      - &name-npm-cache
+        name: Name the npm cache
+        id: npm-cache-key
+        env:
+          FAMILY: space-packages-v1-${{ runner.os }}-${{ runner.arch }}-npm
+          LOCK: ${{ hashFiles('docs/api/package-lock.json') }}
+        run: &name-package-cache |
+          {
+            echo "family=${FAMILY}-"
+            echo "lock=${FAMILY}-${LOCK}-"
+            echo "key=${FAMILY}-${LOCK}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          } >>"${GITHUB_OUTPUT}"
+
       - &restore-npm-cache
         name: Restore the npm cache
         id: restore-npm-cache
+        continue-on-error: true
+        timeout-minutes: 5
+        env:
+          SEGMENT_DOWNLOAD_TIMEOUT_MINS: '3'
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.npm
-          key: space-packages-v1-${{ runner.os }}-${{ runner.arch }}-npm-${{ hashFiles('docs/api/package-lock.json') }}
-          restore-keys: >-
-            ${{ github.event_name != 'push' && format('space-packages-v1-{0}-{1}-npm-', runner.os, runner.arch) || '' }}
+          key: ${{ steps.npm-cache-key.outputs.key }}
+          restore-keys: |
+            ${{ steps.npm-cache-key.outputs.lock }}
+            ${{ steps.npm-cache-key.outputs.family }}
 
       - &prepare-npm-cache
         name: Prepare the npm cache
         env:
           MATCHED_KEY: ${{ steps.restore-npm-cache.outputs.cache-matched-key }}
-        run: bash ci/scripts/package-cache.sh restored npm "${HOME}/.npm" "${MATCHED_KEY}"
+        run: python3 ci/scripts/package-cache.py restored npm "${HOME}/.npm" "${MATCHED_KEY}"
 
       - name: Build and check the guide
         run: |
           bash scripts/build-guide-docs.sh
           python3 docs/book/test.py
 
-      - &report-npm-cache
-        name: Report the npm cache
+      - name: Report the npm cache
+        id: report-npm-cache
         if: always()
-        run: bash ci/scripts/package-cache.sh report npm "${HOME}/.npm"
+        env:
+          KEY: ${{ steps.npm-cache-key.outputs.key }}
+          MATCHED_KEY: ${{ steps.restore-npm-cache.outputs.cache-matched-key }}
+        run: >-
+          python3 ci/scripts/package-cache.py report npm "${HOME}/.npm"
+          --decide "${KEY}" --matched-key "${MATCHED_KEY}"
 
-      - name: Save the npm cache
+      - name: Prepare the npm cache for upload
+        id: prepare-npm-upload
         if: >-
           success() && github.event_name == 'push' && github.ref == 'refs/heads/main' &&
-          steps.restore-npm-cache.outputs.cache-hit != 'true'
+          steps.report-npm-cache.outputs.npm-save == 'true'
+        run: python3 ci/scripts/package-cache.py trim npm "${HOME}/.npm" docs/api/package-lock.json
+
+      - name: Save the npm cache
+        if: steps.prepare-npm-upload.outcome == 'success'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.npm
-          key: ${{ steps.restore-npm-cache.outputs.cache-primary-key }}
+          key: ${{ steps.npm-cache-key.outputs.key }}
 
   api_reference:
     if: github.repository == 'perplexityai/SPACE'
@@ -124,13 +154,27 @@ jobs:
         with:
           node-version: '22.23.3'
 
+      - *name-npm-cache
+
       - *restore-npm-cache
 
       - *prepare-npm-cache
 
+      - &name-cargo-registry
+        name: Name the Cargo registry cache
+        id: cargo-registry-key
+        env:
+          FAMILY: space-packages-v1-${{ runner.os }}-${{ runner.arch }}-cargo
+          LOCK: ${{ hashFiles('Cargo.lock') }}
+        run: *name-package-cache
+
       - &restore-cargo-registry
         name: Restore the Cargo registry
         id: restore-cargo-registry
+        continue-on-error: true
+        timeout-minutes: 5
+        env:
+          SEGMENT_DOWNLOAD_TIMEOUT_MINS: '3'
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           # Cargo unpacks sources from the .crate archives on demand, and
@@ -138,15 +182,20 @@ jobs:
           path: |
             ${{ runner.temp }}/cargo-home/registry/cache
             ${{ runner.temp }}/cargo-home/registry/index
-          key: space-packages-v1-${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('Cargo.lock') }}
-          restore-keys: >-
-            ${{ github.event_name != 'push' && format('space-packages-v1-{0}-{1}-cargo-', runner.os, runner.arch) || '' }}
+          key: ${{ steps.cargo-registry-key.outputs.key }}
+          restore-keys: |
+            ${{ steps.cargo-registry-key.outputs.lock }}
+            ${{ steps.cargo-registry-key.outputs.family }}
 
+      # Cargo takes a .crate in its registry as downloaded, so a damaged one
+      # would fail every build; one whose checksum is not Cargo.lock's goes.
       - &prepare-cargo-registry
         name: Prepare the Cargo registry
         env:
           MATCHED_KEY: ${{ steps.restore-cargo-registry.outputs.cache-matched-key }}
-        run: bash ci/scripts/package-cache.sh restored cargo "${RUNNER_TEMP}/cargo-home/registry" "${MATCHED_KEY}"
+        run: >-
+          python3 ci/scripts/package-cache.py restored cargo "${RUNNER_TEMP}/cargo-home/registry"
+          "${MATCHED_KEY}" --lockfile Cargo.lock
 
       - *install-mdbook
 
@@ -156,7 +205,7 @@ jobs:
         run: bash ci/scripts/ci-image.sh ensure "space-ci:${GITHUB_SHA}"
 
       - name: Install documentation dependencies
-        run: npm ci --prefix docs/api --ignore-scripts --no-fund
+        run: npm ci --prefix docs/api --ignore-scripts --no-fund --no-audit
 
       - name: Build guide and API
         env:
@@ -165,12 +214,14 @@ jobs:
           SPACE_DOCS_NPM_CI_DONE: '1'
         run: bash scripts/build-docs.sh
 
-      - *report-npm-cache
+      - name: Report the npm cache
+        if: always()
+        run: python3 ci/scripts/package-cache.py report npm "${HOME}/.npm"
 
       - &report-cargo-registry
         name: Report the Cargo registry
         if: always()
-        run: bash ci/scripts/package-cache.sh report cargo "${RUNNER_TEMP}/cargo-home/registry"
+        run: python3 ci/scripts/package-cache.py report cargo "${RUNNER_TEMP}/cargo-home/registry"
 
       - name: Check standalone outputs and the combined site
         run: |
@@ -202,6 +253,8 @@ jobs:
 
       # Both tools read every package's manifest through `cargo metadata`,
       # which downloads every crate in Cargo.lock.
+      - *name-cargo-registry
+
       - *restore-cargo-registry
 
       - *prepare-cargo-registry
@@ -304,7 +357,6 @@ jobs:
             docker_access: false
             host_network: false
             privileged: false
-            uv_cache: python
             timeout: 15
           - name: Gateway traffic
             command: >-
@@ -351,45 +403,87 @@ jobs:
       # entry whose cargo_registry or go_modules is `save`, or that sets
       # uv_cache_save, saves that cache on main. uv has two caches because no
       # job installs the other's packages: Python tests' also serves the shell
-      # tests and migration guards, and Gateway traffic installs its own
-      # requirements.
+      # tests, and Gateway traffic installs its own requirements. Each is keyed
+      # on its own inputs and on uv's release, whose cache layout is its own.
+      # The migration guards use uv only for a changed migration, whose checks
+      # need packages neither cache holds.
+      - name: Name the package caches
+        id: package-cache-keys
+        if: matrix.cargo_registry || matrix.go_modules || matrix.uv_cache
+        env:
+          PREFIX: space-packages-v1-${{ runner.os }}-${{ runner.arch }}
+          CARGO_LOCK: ${{ hashFiles('Cargo.lock') }}
+          GO_LOCK: ${{ hashFiles('shim/go.mod', 'shim/go.sum') }}
+          UV_CACHE: ${{ matrix.uv_cache }}
+          UV_LOCK: >-
+            ${{ matrix.uv_cache == 'gateway' && hashFiles('scripts/netgtw/traffic/requirements.txt') ||
+            hashFiles('uv.lock', 'pyproject.toml', 'ci/scripts/run-python-tests.sh') }}
+        run: |
+          set -euo pipefail
+          uv_version="$(sed -n 's/^ARG UV_VERSION=//p' ci/Dockerfile.ci)"
+          name() {
+            echo "$1-family=$2-"
+            echo "$1-lock=$2-$3-"
+            echo "$1-key=$2-$3-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          }
+          {
+            name cargo "${PREFIX}-cargo" "${CARGO_LOCK}"
+            name go "${PREFIX}-go" "${GO_LOCK}"
+            name uv "${PREFIX}-uv-${UV_CACHE}-${uv_version:-unknown}" "${UV_LOCK}"
+          } >>"${GITHUB_OUTPUT}"
+
       - name: Restore the Cargo registry
         id: restore-cargo-registry
         if: matrix.cargo_registry
+        continue-on-error: true
+        timeout-minutes: 5
+        env:
+          SEGMENT_DOWNLOAD_TIMEOUT_MINS: '3'
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ${{ runner.temp }}/cargo-home/registry/cache
             ${{ runner.temp }}/cargo-home/registry/index
-          key: space-packages-v1-${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('Cargo.lock') }}
-          restore-keys: >-
-            ${{ github.event_name != 'push' && format('space-packages-v1-{0}-{1}-cargo-', runner.os, runner.arch) || '' }}
+          key: ${{ steps.package-cache-keys.outputs.cargo-key }}
+          restore-keys: |
+            ${{ steps.package-cache-keys.outputs.cargo-lock }}
+            ${{ steps.package-cache-keys.outputs.cargo-family }}
 
       - name: Restore the Go module cache
         id: restore-go-modules
         if: matrix.go_modules
+        continue-on-error: true
+        timeout-minutes: 5
+        env:
+          SEGMENT_DOWNLOAD_TIMEOUT_MINS: '3'
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           # Only the downloaded archives: Go extracts a module from its zip
           # without the network.
           path: ${{ runner.temp }}/go-mod/cache/download
-          key: space-packages-v1-${{ runner.os }}-${{ runner.arch }}-go-${{ hashFiles('shim/go.mod', 'shim/go.sum') }}
-          restore-keys: >-
-            ${{ github.event_name != 'push' && format('space-packages-v1-{0}-{1}-go-', runner.os, runner.arch) || '' }}
+          key: ${{ steps.package-cache-keys.outputs.go-key }}
+          restore-keys: |
+            ${{ steps.package-cache-keys.outputs.go-lock }}
+            ${{ steps.package-cache-keys.outputs.go-family }}
 
       - name: Restore the uv cache
         id: restore-uv-cache
         if: matrix.uv_cache
+        continue-on-error: true
+        timeout-minutes: 5
+        env:
+          SEGMENT_DOWNLOAD_TIMEOUT_MINS: '3'
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/uv-cache
-          key: >-
-            space-packages-v1-${{ runner.os }}-${{ runner.arch }}-uv-${{ matrix.uv_cache }}-${{
-            hashFiles('uv.lock', 'ci/scripts/run-python-tests.sh', 'scripts/netgtw/traffic/requirements.txt') }}
-          restore-keys: >-
-            ${{ github.event_name != 'push' &&
-            format('space-packages-v1-{0}-{1}-uv-{2}-', runner.os, runner.arch, matrix.uv_cache) || '' }}
+          key: ${{ steps.package-cache-keys.outputs.uv-key }}
+          restore-keys: |
+            ${{ steps.package-cache-keys.outputs.uv-lock }}
+            ${{ steps.package-cache-keys.outputs.uv-family }}
 
+      # Cargo and Go take an archive in their cache as downloaded, so a damaged
+      # one would fail every build; one whose checksum is not the lockfile's
+      # goes.
       - name: Prepare the package caches
         if: matrix.cargo_registry || matrix.go_modules || matrix.uv_cache
         env:
@@ -402,13 +496,15 @@ jobs:
         run: |
           set -euo pipefail
           if [[ -n "${CARGO_REGISTRY}" ]]; then
-            bash ci/scripts/package-cache.sh restored cargo "${RUNNER_TEMP}/cargo-home/registry" "${CARGO_KEY}"
+            python3 ci/scripts/package-cache.py restored cargo "${RUNNER_TEMP}/cargo-home/registry" \
+              "${CARGO_KEY}" --lockfile Cargo.lock
           fi
           if [[ -n "${GO_MODULES}" ]]; then
-            bash ci/scripts/package-cache.sh restored go "${RUNNER_TEMP}/go-mod" "${GO_KEY}"
+            python3 ci/scripts/package-cache.py restored go "${RUNNER_TEMP}/go-mod" "${GO_KEY}" \
+              --lockfile shim/go.sum
           fi
           if [[ -n "${UV_CACHE}" ]]; then
-            bash ci/scripts/package-cache.sh restored uv "${RUNNER_TEMP}/uv-cache" "${UV_KEY}"
+            python3 ci/scripts/package-cache.py restored uv "${RUNNER_TEMP}/uv-cache" "${UV_KEY}"
           fi
 
       # Download the crates the restored registry lacks meanwhile with the
@@ -818,67 +914,99 @@ jobs:
           key: ${{ steps.target-key.outputs.key }}
 
       - name: Report the package caches
+        id: report-package-caches
         if: always() && (matrix.cargo_registry || matrix.go_modules || matrix.uv_cache)
         env:
           CARGO_REGISTRY: ${{ matrix.cargo_registry }}
+          CARGO_KEY: ${{ steps.package-cache-keys.outputs.cargo-key }}
+          CARGO_MATCHED_KEY: ${{ steps.restore-cargo-registry.outputs.cache-matched-key }}
           GO_MODULES: ${{ matrix.go_modules }}
+          GO_KEY: ${{ steps.package-cache-keys.outputs.go-key }}
+          GO_MATCHED_KEY: ${{ steps.restore-go-modules.outputs.cache-matched-key }}
           UV_CACHE: ${{ matrix.uv_cache }}
+          UV_SAVE: ${{ matrix.uv_cache_save == true }}
+          UV_KEY: ${{ steps.package-cache-keys.outputs.uv-key }}
+          UV_MATCHED_KEY: ${{ steps.restore-uv-cache.outputs.cache-matched-key }}
         run: |
+          report() {
+            local kind="$1" dir="$2" save="$3" key="$4" matched_key="$5"
+            if [[ "${save}" == true ]]; then
+              python3 ci/scripts/package-cache.py report "${kind}" "${dir}" --decide "${key}" --matched-key "${matched_key}"
+            else
+              python3 ci/scripts/package-cache.py report "${kind}" "${dir}"
+            fi
+          }
           if [[ -n "${CARGO_REGISTRY}" ]]; then
-            bash ci/scripts/package-cache.sh report cargo "${RUNNER_TEMP}/cargo-home/registry"
+            report cargo "${RUNNER_TEMP}/cargo-home/registry" "$([[ "${CARGO_REGISTRY}" == save ]] && echo true)" \
+              "${CARGO_KEY}" "${CARGO_MATCHED_KEY}"
           fi
           if [[ -n "${GO_MODULES}" ]]; then
-            bash ci/scripts/package-cache.sh report go "${RUNNER_TEMP}/go-mod"
+            report go "${RUNNER_TEMP}/go-mod" "$([[ "${GO_MODULES}" == save ]] && echo true)" "${GO_KEY}" "${GO_MATCHED_KEY}"
           fi
           if [[ -n "${UV_CACHE}" ]]; then
-            bash ci/scripts/package-cache.sh report uv "${RUNNER_TEMP}/uv-cache"
+            report uv "${RUNNER_TEMP}/uv-cache" "${UV_SAVE}" "${UV_KEY}" "${UV_MATCHED_KEY}"
           fi
 
-      # Each package cache holds exactly its lockfile's packages, so a key
-      # that was restored exactly is never saved again.
+      # The job containers wrote the Go and uv caches as root. The copy saved
+      # holds only what the current lockfile lists: Cargo and Go drop what it
+      # no longer lists, and uv's prune drops what uv used only while it ran,
+      # such as the environments `uv run --with` builds. uv's copy keeps the
+      # downloaded wheels: `uv cache prune --ci` would drop those too, and the
+      # next run would fetch them all from PyPI again. What uv keeps of older
+      # lockfiles lasts until uv's next release starts a new family.
+      - name: Prepare the package caches for upload
+        id: prepare-package-upload
+        if: >-
+          success() && github.event_name == 'push' && github.ref == 'refs/heads/main' &&
+          (steps.report-package-caches.outputs.cargo-save == 'true' ||
+          steps.report-package-caches.outputs.go-save == 'true' ||
+          steps.report-package-caches.outputs.uv-save == 'true')
+        env:
+          CARGO_SAVE: ${{ steps.report-package-caches.outputs.cargo-save }}
+          GO_SAVE: ${{ steps.report-package-caches.outputs.go-save }}
+          UV_SAVE: ${{ steps.report-package-caches.outputs.uv-save }}
+          SPACE_CI_GO_MOD_CACHE: ${{ runner.temp }}/go-mod
+          SPACE_CI_UV_CACHE: ${{ runner.temp }}/uv-cache
+        run: |
+          set -euo pipefail
+          if [[ "${CARGO_SAVE}" == true ]]; then
+            python3 ci/scripts/package-cache.py trim cargo "${RUNNER_TEMP}/cargo-home/registry" Cargo.lock
+          fi
+          if [[ "${GO_SAVE}" == true ]]; then
+            sudo chown -R "$(id -u):$(id -g)" "${SPACE_CI_GO_MOD_CACHE}/cache/download"
+            python3 ci/scripts/package-cache.py trim go "${SPACE_CI_GO_MOD_CACHE}" shim/go.sum
+          fi
+          if [[ "${UV_SAVE}" == true ]]; then
+            docker run --rm --volume "${SPACE_CI_UV_CACHE}:/uv-cache" --env UV_CACHE_DIR=/uv-cache \
+              "space-ci:${GITHUB_SHA}" uv cache prune
+            du -sh "${SPACE_CI_UV_CACHE}"
+          fi
+
       - name: Save the Cargo registry
         if: >-
-          success() && matrix.cargo_registry == 'save' &&
-          github.event_name == 'push' && github.ref == 'refs/heads/main' &&
-          steps.restore-cargo-registry.outputs.cache-hit != 'true'
+          steps.prepare-package-upload.outcome == 'success' &&
+          steps.report-package-caches.outputs.cargo-save == 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ${{ runner.temp }}/cargo-home/registry/cache
             ${{ runner.temp }}/cargo-home/registry/index
-          key: ${{ steps.restore-cargo-registry.outputs.cache-primary-key }}
+          key: ${{ steps.package-cache-keys.outputs.cargo-key }}
 
       - name: Save the Go module cache
         if: >-
-          success() && matrix.go_modules == 'save' &&
-          github.event_name == 'push' && github.ref == 'refs/heads/main' &&
-          steps.restore-go-modules.outputs.cache-hit != 'true'
+          steps.prepare-package-upload.outcome == 'success' &&
+          steps.report-package-caches.outputs.go-save == 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/go-mod/cache/download
-          key: ${{ steps.restore-go-modules.outputs.cache-primary-key }}
-
-      # The job container wrote the cache as root. Pruning drops what uv only
-      # used while it ran, such as the environments `uv run --with` builds, and
-      # keeps the downloaded wheels: `uv cache prune --ci` would drop those too,
-      # and the next run would fetch them all from PyPI again.
-      - name: Prepare the uv cache for upload
-        id: prepare-uv-cache
-        if: >-
-          success() && matrix.uv_cache_save == true &&
-          github.event_name == 'push' && github.ref == 'refs/heads/main' &&
-          steps.restore-uv-cache.outputs.cache-hit != 'true'
-        env:
-          SPACE_CI_UV_CACHE: ${{ runner.temp }}/uv-cache
-        run: |
-          set -euo pipefail
-          docker run --rm --volume "${SPACE_CI_UV_CACHE}:/uv-cache" --env UV_CACHE_DIR=/uv-cache \
-            "space-ci:${GITHUB_SHA}" uv cache prune
-          du -sh "${SPACE_CI_UV_CACHE}"
+          key: ${{ steps.package-cache-keys.outputs.go-key }}
 
       - name: Save the uv cache
-        if: steps.prepare-uv-cache.outcome == 'success'
+        if: >-
+          steps.prepare-package-upload.outcome == 'success' &&
+          steps.report-package-caches.outputs.uv-save == 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/uv-cache
-          key: ${{ steps.restore-uv-cache.outputs.cache-primary-key }}
+          key: ${{ steps.package-cache-keys.outputs.uv-key }}

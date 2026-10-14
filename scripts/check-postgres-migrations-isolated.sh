@@ -563,7 +563,8 @@ is_comment_only_migration() {
   [[ "${comparison_uses_merge_base}" == true && -f "${file}" ]] || return 1
   git cat-file -e "${comparison_base_commit}:${file}" 2>/dev/null || return 1
   uv_bin="$(bash "${repo_root}/ci/scripts/ensure-uv.sh")" || return 1
-  git show "${comparison_base_commit}:${file}" | "${uv_bin}" run --script \
+  source "${repo_root}/ci/scripts/lib/uv-run.sh"
+  git show "${comparison_base_commit}:${file}" | space_uv_run "${uv_bin}" --script -- \
     "${repo_root}/scripts/check_postgres_partial_indexes.py" --comment-only "${file}"
 }
 

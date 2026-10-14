@@ -54,23 +54,43 @@ jobs:
       # Common CI's Rust tests job saves the crates on main; see the package
       # caches in common-ci.yml. The path matches theirs, which the cache's
       # version includes.
+      - name: Name the Cargo registry cache
+        id: cargo-registry-key
+        if: matrix.cargo_registry
+        env:
+          FAMILY: space-packages-v1-${{ runner.os }}-${{ runner.arch }}-cargo
+          LOCK: ${{ hashFiles('Cargo.lock') }}
+        run: |
+          {
+            echo "family=${FAMILY}-"
+            echo "lock=${FAMILY}-${LOCK}-"
+            echo "key=${FAMILY}-${LOCK}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          } >>"${GITHUB_OUTPUT}"
+
       - name: Restore the Cargo registry
         id: restore-cargo-registry
         if: matrix.cargo_registry
+        continue-on-error: true
+        timeout-minutes: 5
+        env:
+          SEGMENT_DOWNLOAD_TIMEOUT_MINS: '3'
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ${{ runner.temp }}/cargo-home/registry/cache
             ${{ runner.temp }}/cargo-home/registry/index
-          key: space-packages-v1-${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('Cargo.lock') }}
-          restore-keys: >-
-            ${{ github.event_name != 'push' && format('space-packages-v1-{0}-{1}-cargo-', runner.os, runner.arch) || '' }}
+          key: ${{ steps.cargo-registry-key.outputs.key }}
+          restore-keys: |
+            ${{ steps.cargo-registry-key.outputs.lock }}
+            ${{ steps.cargo-registry-key.outputs.family }}
 
       - name: Prepare the Cargo registry
         if: matrix.cargo_registry
         env:
           MATCHED_KEY: ${{ steps.restore-cargo-registry.outputs.cache-matched-key }}
-        run: bash ci/scripts/package-cache.sh restored cargo "${RUNNER_TEMP}/cargo-home/registry" "${MATCHED_KEY}"
+        run: >-
+          python3 ci/scripts/package-cache.py restored cargo "${RUNNER_TEMP}/cargo-home/registry"
+          "${MATCHED_KEY}" --lockfile Cargo.lock
 
       # Keep Clippy's compiler outputs separate from the test graph: the two
       # modes use different rustc invocations and cannot reliably share keys.
@@ -224,7 +244,7 @@ jobs:
 
       - name: Report the Cargo registry
         if: always() && matrix.cargo_registry
-        run: bash ci/scripts/package-cache.sh report cargo "${RUNNER_TEMP}/cargo-home/registry"
+        run: python3 ci/scripts/package-cache.py report cargo "${RUNNER_TEMP}/cargo-home/registry"
 
       - name: Decide whether to refresh the Rust compiler cache
         id: refresh-rust-cache

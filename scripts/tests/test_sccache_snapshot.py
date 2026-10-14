@@ -118,19 +118,33 @@ class SupersededTest(unittest.TestCase):
         )
         self.assertEqual(sorted(c["id"] for c in snapshot.superseded(caches)), [1, 100])
 
-    def test_keeps_only_the_newest_package_cache_of_each_ecosystem(self) -> None:
+    def test_keeps_the_two_newest_package_caches_of_each_ecosystem(self) -> None:
         packages = "space-packages-v1-Linux-X64"
         caches = [
-            cache(1, f"{packages}-cargo-{OTHER_HASH}", "2026-09-25T00:00:00Z"),
-            cache(2, f"{packages}-cargo-{HASH}", "2026-09-26T00:00:00Z"),
-            cache(3, f"{packages}-uv-python-{OTHER_HASH}", "2026-09-26T05:00:00Z"),
-            cache(4, f"{packages}-uv-python-{HASH}", "2026-09-26T01:00:00Z"),
-            cache(5, f"{packages}-uv-gateway-{HASH}", "2026-09-24T00:00:00Z"),
-            cache(6, f"space-packages-v1-Linux-ARM64-cargo-{OTHER_HASH}", "2026-09-20T00:00:00Z"),
+            cache(1, f"{packages}-cargo-{OTHER_HASH}-100-1", "2026-09-25T00:00:00Z"),
+            cache(2, f"{packages}-cargo-{HASH}-200-1", "2026-09-26T00:00:00Z"),
+            cache(3, f"{packages}-cargo-{HASH}-300-1", "2026-09-27T00:00:00Z"),
+            cache(4, f"{packages}-uv-python-0.12.18-{HASH}-200-1", "2026-09-26T01:00:00Z"),
+            cache(5, f"{packages}-uv-python-0.12.18-{OTHER_HASH}-100-1", "2026-09-25T01:00:00Z"),
+            cache(6, f"{packages}-uv-python-0.12.18-{OTHER_HASH}-50-1", "2026-09-24T01:00:00Z"),
+            cache(7, f"{packages}-uv-gateway-0.12.18-{HASH}-200-1", "2026-09-24T00:00:00Z"),
+            cache(8, f"space-packages-v1-Linux-ARM64-cargo-{OTHER_HASH}-1-1", "2026-09-20T00:00:00Z"),
             # Not a package cache key: kept, whatever its age.
-            cache(7, f"{packages}-cargo-not-a-hash", "2026-09-01T00:00:00Z"),
+            cache(9, f"{packages}-cargo-{HASH}", "2026-09-01T00:00:00Z"),
         ]
-        self.assertEqual(sorted(c["id"] for c in snapshot.superseded(caches)), [1, 4])
+        self.assertEqual(sorted(c["id"] for c in snapshot.superseded(caches)), [1, 6])
+
+    def test_keeps_the_current_lockfile_when_an_older_commit_saves_last(self) -> None:
+        # Main runs of two commits overlap: the newer commit, with a new
+        # lockfile, saves first, then the older commit saves its own lockfile's
+        # copy. The current lockfile's copy is no longer the newest.
+        packages = "space-packages-v1-Linux-X64-cargo"
+        caches = [
+            cache(1, f"{packages}-{OTHER_HASH}-100-1", "2026-09-25T00:00:00Z"),
+            cache(2, f"{packages}-{HASH}-102-1", "2026-09-26T00:00:00Z"),
+            cache(3, f"{packages}-{OTHER_HASH}-101-1", "2026-09-26T00:05:00Z"),
+        ]
+        self.assertEqual([c["id"] for c in snapshot.superseded(caches)], [1])
 
     def test_leaves_a_lone_snapshot_alone(self) -> None:
         only = cache(1, f"space-sccache-v1-Linux-X64-clippy-{HASH}-1-1", "2026-09-26T00:00:00Z")

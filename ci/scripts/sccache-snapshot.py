@@ -45,12 +45,17 @@ TARGET_KEY = re.compile(
     rf"^(?P<family>{re.escape(TARGET_KEY_PREFIX)}.+)-(?P<inputs>[0-9a-f]{{16}})-[0-9a-f]{{16}}-[0-9]+-[0-9]+$"
 )
 TARGET_INPUTS_KEPT = 3
-# Package caches: <family>-<lockfile hash>, where the family names one
-# ecosystem's cache. Main saves one per lockfile; pull requests and the merge
-# queue fall back to the newest, so an older one only serves a branch that has
-# not rebased, which then fetches the difference.
+# Package caches (ci/scripts/package-cache.py): <family>-<lockfile hash>-<run
+# id>-<run attempt>, where the family names one ecosystem's cache. Restores take
+# the newest for their lockfile, else the newest of the family, so an older one
+# only serves a branch that has not rebased, which then fetches the difference.
+# The newest two are kept: main runs of different commits overlap, and an older
+# commit that saves last would otherwise delete the current lockfile's copy.
 PACKAGE_KEY_PREFIX = "space-packages-v1-"
-PACKAGE_KEY = re.compile(rf"^(?P<family>{re.escape(PACKAGE_KEY_PREFIX)}.+)-[0-9a-f]{{64}}$")
+PACKAGE_KEY = re.compile(
+    rf"^(?P<family>{re.escape(PACKAGE_KEY_PREFIX)}.+)-[0-9a-f]{{64}}-[0-9]+-[0-9]+$"
+)
+PACKAGE_COPIES_KEPT = 2
 
 
 @dataclass(frozen=True)
@@ -121,15 +126,24 @@ def created_at(cache: Mapping) -> datetime:
 def superseded(caches: Iterable[Mapping]) -> list[Mapping]:
     """Return the snapshots to delete.
 
-    That is all but the most recently created compiler cache or package cache
-    of each family, and all but the most recently created target directory of
-    each of a family's TARGET_INPUTS_KEPT most recent build-inputs hashes.
+    That is all but the most recently created compiler cache of each family,
+    all but the PACKAGE_COPIES_KEPT most recently created package caches of
+    each family, and all but the most recently created target directory of each
+    of a family's TARGET_INPUTS_KEPT most recent build-inputs hashes.
     """
     newest: set[tuple[str, str]] = set()
     kept_inputs: dict[str, int] = {}
+    kept_packages: dict[str, int] = {}
     stale = []
     for cache in sorted(caches, key=lambda c: (created_at(c), c["id"]), reverse=True):
-        if match := SNAPSHOT_KEY.match(cache["key"]) or PACKAGE_KEY.match(cache["key"]):
+        if match := PACKAGE_KEY.match(cache["key"]):
+            family = match["family"]
+            if kept_packages.get(family, 0) == PACKAGE_COPIES_KEPT:
+                stale.append(cache)
+            else:
+                kept_packages[family] = kept_packages.get(family, 0) + 1
+            continue
+        if match := SNAPSHOT_KEY.match(cache["key"]):
             family, inputs = match["family"], None
         elif match := TARGET_KEY.match(cache["key"]):
             family, inputs = match["family"], match["inputs"]

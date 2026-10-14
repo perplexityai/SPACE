@@ -311,7 +311,8 @@ is_comment_only_migration() {
   base="$(git merge-base "$(base_ref)" HEAD 2>/dev/null)" || return 1
   git cat-file -e "${base}:${file}" 2>/dev/null || return 1
   uv_bin="$(bash "${repo_root}/ci/scripts/ensure-uv.sh")" || return 1
-  git show "${base}:${file}" | "${uv_bin}" run --script \
+  source "${repo_root}/ci/scripts/lib/uv-run.sh"
+  git show "${base}:${file}" | space_uv_run "${uv_bin}" --script -- \
     "${repo_root}/scripts/check_postgres_partial_indexes.py" --comment-only "${file}"
 }
 
@@ -349,7 +350,8 @@ if ((${#up_files[@]} != 0)); then
 fi
 
 uv_bin="$(bash "${repo_root}/ci/scripts/ensure-uv.sh")"
-"${uv_bin}" run --script "${repo_root}/scripts/check_postgres_partial_indexes.py" \
+source "${repo_root}/ci/scripts/lib/uv-run.sh"
+space_uv_run "${uv_bin}" --script -- "${repo_root}/scripts/check_postgres_partial_indexes.py" \
   "${changed_files[@]}"
 
 if ((${#up_files[@]} != 0)); then

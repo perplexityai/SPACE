@@ -22,7 +22,9 @@ trap 'rm -rf "${tmp_dir}"' EXIT
 # local runs use it as committed (--frozen).
 uv_lock_mode=--frozen
 if [ -n "${CI:-}" ]; then uv_lock_mode=--locked; fi
-"${uv_bin}" run "${uv_lock_mode}" --with pglast==7.10 "${partial_index_checker_test}"
+# shellcheck source=../../ci/scripts/lib/uv-run.sh
+source "${repo_root}/ci/scripts/lib/uv-run.sh"
+space_uv_run "${uv_bin}" "${uv_lock_mode}" --with pglast==7.10 -- "${partial_index_checker_test}"
 
 write_migration_pair() {
   local repo="$1"
@@ -182,6 +184,8 @@ cat >"${work_repo}/ci/scripts/ensure-uv.sh" <<'SH'
 printf '%s\n' "${TEST_UV_BIN:?}"
 SH
 chmod +x "${work_repo}/ci/scripts/ensure-uv.sh"
+mkdir -p "${work_repo}/ci/scripts/lib"
+cp "${repo_root}/ci/scripts/lib/uv-run.sh" "${work_repo}/ci/scripts/lib/"
 
 git -C "${work_repo}" init --quiet --initial-branch=main
 git -C "${work_repo}" config user.email test@example.com
@@ -328,6 +332,8 @@ cat >"${stale_remote}/ci/scripts/ensure-uv.sh" <<'SH'
 printf '%s\n' "${TEST_UV_BIN:?}"
 SH
 chmod +x "${stale_remote}/ci/scripts/ensure-uv.sh"
+mkdir -p "${stale_remote}/ci/scripts/lib"
+cp "${repo_root}/ci/scripts/lib/uv-run.sh" "${stale_remote}/ci/scripts/lib/"
 
 git -C "${stale_remote}" init --quiet --initial-branch=main
 git -C "${stale_remote}" config user.email test@example.com
@@ -618,6 +624,8 @@ cat >"${shallow_remote}/ci/scripts/ensure-uv.sh" <<'SH'
 printf '%s\n' "${TEST_UV_BIN:?}"
 SH
 chmod +x "${shallow_remote}/ci/scripts/ensure-uv.sh"
+mkdir -p "${shallow_remote}/ci/scripts/lib"
+cp "${repo_root}/ci/scripts/lib/uv-run.sh" "${shallow_remote}/ci/scripts/lib/"
 git -C "${shallow_remote}" init --quiet --initial-branch=main
 git -C "${shallow_remote}" config user.email test@example.com
 git -C "${shallow_remote}" config user.name "Migration Squawk Test"

@@ -14,7 +14,7 @@ if [[ "$(mdbook --version)" != "mdbook v$version" ]]; then
 fi
 node -e 'const [major, minor] = process.versions.node.split(".").map(Number); if (major < 22 || (major === 22 && minor < 12)) throw new Error("Node.js 22.12+ is required");'
 if [[ "${SPACE_DOCS_NPM_CI_DONE:-}" != 1 ]]; then
-  npm ci --prefix docs/api --ignore-scripts --no-fund
+  npm ci --prefix docs/api --ignore-scripts --no-fund --no-audit
 fi
 node docs/book/bundle-mermaid.mjs
 python3 docs/book/build.py

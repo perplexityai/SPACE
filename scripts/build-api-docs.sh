@@ -34,6 +34,6 @@ else
 fi
 # The combined build already installed the shared lockfile for Mermaid.
 if [[ "${SPACE_DOCS_NPM_CI_DONE:-}" != 1 ]]; then
-  npm ci --prefix docs/api --ignore-scripts --no-fund
+  npm ci --prefix docs/api --ignore-scripts --no-fund --no-audit
 fi
 node docs/api/build.mjs "$spec"
