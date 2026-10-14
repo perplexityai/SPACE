@@ -54,6 +54,7 @@ impl Intercept for S3ClientSpans {
             return Ok(());
         }
         let name = cfg.load::<Metadata>().map_or("unknown", Metadata::name);
+        let existence_check = is_existence_check(name);
         let span = tracing::info_span!(
             "s3.client",
             otel.kind = "client",
@@ -75,6 +76,7 @@ impl Intercept for S3ClientSpans {
         cfg.interceptor_state()
             .store_put(OperationSpan(Arc::new(Mutex::new(Operation {
                 span,
+                existence_check,
                 attempts: 1,
                 last_status: None,
                 finished: false,
@@ -115,7 +117,7 @@ impl Intercept for S3ClientSpans {
             let last_status = operation.last_status;
             match context.output_or_error() {
                 Some(Ok(_)) => operation.finish(Outcome::Ok, None),
-                Some(Err(_)) if last_status == Some(404) => {
+                Some(Err(_)) if last_status == Some(404) && operation.existence_check => {
                     operation.finish(Outcome::NotFound, None);
                 }
                 Some(Err(error)) => {
@@ -131,8 +133,8 @@ impl Intercept for S3ClientSpans {
 #[derive(Clone, Copy)]
 enum Outcome {
     Ok,
-    /// A 404, which callers such as an existence check treat as an answer,
-    /// so the span is not marked failed.
+    /// A 404 from an existence check ([`is_existence_check`]), which its
+    /// caller treats as an answer, so the span is not marked failed.
     NotFound,
     Error,
     /// The operation timeout fired, or the caller dropped the request.
@@ -166,6 +168,7 @@ impl Storable for OperationSpan {
 #[derive(Debug)]
 struct Operation {
     span: tracing::Span,
+    existence_check: bool,
     attempts: u32,
     last_status: Option<u16>,
     finished: bool,
@@ -208,6 +211,12 @@ impl Drop for Operation {
     }
 }
 
+/// Operations whose 404 answers whether the object exists. Any other
+/// operation's 404, such as `NoSuchUpload` or `NoSuchBucket`, fails it.
+fn is_existence_check(operation: &str) -> bool {
+    matches!(operation, "HeadObject" | "GetObject")
+}
+
 fn status_class(status: u16) -> &'static str {
     match status {
         100..=199 => "1xx",
@@ -237,6 +246,7 @@ fn failure_kind(error: &OrchestratorError<Error>, last_status: Option<u16>) -> &
         Some(429 | 503) => "throttled",
         Some(500..=599) => "http_5xx",
         Some(403) => "access_denied",
+        Some(404) => "not_found",
         Some(400..=499) => "http_4xx",
         _ if error.is_operation_error() => "service_error",
         _ => "other",

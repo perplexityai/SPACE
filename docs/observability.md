@@ -336,9 +336,11 @@ retries and backoff; `s3.attempts` counts the requests, and each failed attempt
 is logged and counted where the client tracks attempts. The span carries
 `s3.outcome` (`ok`, `not_found`, `error`, `abandoned`), `http.status_class` of
 the last response, and `s3.request.bytes` and `s3.response.bytes` when the
-messages declare a length. A failure sets status ERROR and records why as
+messages declare a length. `not_found` is reserved for a `HeadObject` or
+`GetObject` 404, an existence check's answer, and keeps status OK; any other
+operation's 404 fails it. A failure sets status ERROR and records why as
 `s3.failure_kind`, from a fixed set (`transport`, `connect_timeout`,
-`timeout`, `throttled`, `http_5xx`, `access_denied`, `http_4xx`,
+`timeout`, `throttled`, `http_5xx`, `access_denied`, `not_found`, `http_4xx`,
 `service_error`, `abandoned`, `no_result`, `other`), which is also its status
 description; the SDK's and the server's error text, which can quote a key, is
 never recorded. No bucket, key, upload id or range is recorded either. A
