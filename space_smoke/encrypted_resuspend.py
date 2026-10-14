@@ -2,16 +2,11 @@
 
 from __future__ import annotations
 
-import json
 import time
 import uuid
 from dataclasses import dataclass, field
-from http.client import HTTPException
-from urllib.error import HTTPError
-from urllib.request import Request
 
 from space_smoke.capabilities import KindEnvironment
-from space_smoke.native import _URL_OPEN
 from space_smoke.runtime import ScenarioContext, SmokeConfigurationError
 
 
@@ -114,33 +109,3 @@ def prepare_byok_identity(
     user_pending = False
     evidence["user_id"] = user_id
     return ByokIdentity(org_id, user_id, email, password)
-
-
-def open_byok_session(api_url: str, identity: ByokIdentity, *, timeout: float) -> str:
-    """Log in as the BYOK member so native creates are owned by its organization.
-
-    The native API authenticates sessions rather than ECW API keys. Deleting
-    the member during identity cleanup ends the session with it.
-    """
-    request = Request(
-        api_url.rstrip("/") + "/auth/v1/sessions",
-        data=json.dumps({"email": identity.email, "password": identity.password}).encode(),
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    try:
-        with _URL_OPEN(request, timeout=timeout) as response:
-            session = json.loads(response.read() or b"null")
-    except HTTPError as error:
-        status = error.code
-        error.close()
-        raise SmokeConfigurationError(f"BYOK session login failed with HTTP {status}") from None
-    except (OSError, ValueError, HTTPException) as error:
-        # The request body carries the member's password.
-        raise SmokeConfigurationError(
-            f"BYOK session login failed ({type(error).__name__})"
-        ) from None
-    token = session.get("token") if isinstance(session, dict) else None
-    if not isinstance(token, str) or not token:
-        raise SmokeConfigurationError("BYOK session login omitted its credential")
-    return token

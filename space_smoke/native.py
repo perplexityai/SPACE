@@ -7,7 +7,7 @@ import json
 import time
 import uuid
 from collections.abc import Collection, Iterator, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import BinaryIO, cast
 from urllib.error import HTTPError
 from urllib.parse import quote, urlencode, urljoin, urlsplit
@@ -72,6 +72,28 @@ class NativeSandboxFactory:
     @property
     def config(self) -> NativeConfig:
         return self._config
+
+    def as_member(self, email: str, password: str) -> NativeSandboxFactory:
+        """Log in as an organization member and act as that member.
+
+        Native creates are owned by the caller's organization, so a session is
+        how a scenario creates sandboxes under that organization's policy. A
+        failure names only its type: the request carries the password.
+        """
+        try:
+            session = self._json_request(
+                "POST",
+                "/auth/v1/sessions",
+                body={"email": email, "password": password},
+                expected_status=200,
+                authenticated=False,
+            )
+            token = _required_string(session, "token")
+        except Exception as error:
+            raise RuntimeError(
+                f"Native session login failed ({type(error).__name__})"
+            ) from None
+        return NativeSandboxFactory(replace(self._config, token=token))
 
     def create(
         self, metadata: Mapping[str, str] | None = None
@@ -544,11 +566,11 @@ class NativeSandboxFactory:
         mutation: str | None = None,
         expected_status: int,
         timeout: float | None = None,
+        authenticated: bool = True,
     ) -> dict[str, object]:
-        headers = {
-            "Accept": "application/json",
-            "Authorization": f"Bearer {self._config.token}",
-        }
+        headers = {"Accept": "application/json"}
+        if authenticated:
+            headers["Authorization"] = f"Bearer {self._config.token}"
         if mutation is not None:
             headers["Idempotency-Key"] = f"space-smoke-{mutation}-{uuid.uuid4().hex}"
         data = None

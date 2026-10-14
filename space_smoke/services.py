@@ -9,7 +9,7 @@ import shutil
 import time
 import uuid
 from collections.abc import Callable, Iterable, Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from functools import partial
 from typing import Any, Protocol, TypeVar, cast
 
@@ -43,11 +43,7 @@ from space_smoke.capabilities import (
     WarmPoolCandidate,
 )
 from space_smoke.config import SandboxConfig
-from space_smoke.encrypted_resuspend import (
-    ByokIdentity,
-    open_byok_session,
-    prepare_byok_identity,
-)
+from space_smoke.encrypted_resuspend import ByokIdentity, prepare_byok_identity
 from space_smoke.fixtures import (
     SANDBOX_CLEANUP_ATTEMPTS,
     SANDBOX_CLEANUP_RETRY_SECONDS,
@@ -302,6 +298,11 @@ class SmokeServices:
             sandbox,
             sandboxes,
             _sandbox_timeout=sandbox_config.timeout,
+            _encrypted_resuspend_control=(
+                cast(EncryptedResuspendControl, kind)
+                if kind is not None and fixture_type is KindEcw
+                else None
+            ),
         )
         if isinstance(fixture, KindEcw):
             # `fixture` requires kind (enforced above); the harness provides
@@ -309,7 +310,6 @@ class SmokeServices:
             fixture._retention_control = cast(Any, kind)
             fixture._cold_create_observer = cast(Any, kind)
             fixture._cross_node_control = cast(Any, kind)
-            fixture._encrypted_resuspend_control = cast(Any, kind)
             fixture._concurrent_restore_control = cast(Any, kind)
             fixture._rate_limiter_control = cast(Any, kind)
             fixture._node_group_control = cast(Any, kind)
@@ -363,16 +363,7 @@ class SmokeServices:
                 byok_identity = prepare_byok_identity(context, kind)
                 # The sandbox delete below is deferred after the identity
                 # cleanup, so it runs first and with this member's session.
-                native = NativeSandboxFactory(
-                    replace(
-                        native.config,
-                        token=open_byok_session(
-                            native.config.api_url,
-                            byok_identity,
-                            timeout=native.config.request_timeout_seconds,
-                        ),
-                    )
-                )
+                native = native.as_member(byok_identity.email, byok_identity.password)
         run_metadata = {
             "space_smoke_scenario": scenario_id,
             "space_smoke_run": uuid.uuid4().hex,
@@ -410,10 +401,8 @@ class SmokeServices:
             _local_cleanup_control=(
                 cast(ColdEvictionControl, kind) if kind is not None else None
             ),
-            _encrypted_restore_control=(
-                cast(EncryptedResuspendControl, kind)
-                if kind is not None and sandbox_config.kind_byok
-                else None
+            _encrypted_resuspend_control=(
+                cast(EncryptedResuspendControl, kind) if kind is not None else None
             ),
             _processes=cast(ProcessSandbox, sandboxes[0]),
         )

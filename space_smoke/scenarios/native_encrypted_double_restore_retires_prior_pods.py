@@ -26,7 +26,7 @@ def encrypted_double_restore_retires_prior_pods(
     """A BYOK sandbox survives suspend, restore, suspend and restore with its
     file intact, and each restore leaves only the serving execution's pod."""
 
-    encrypted = test.encrypted_restore
+    encrypted = test.encrypted_resuspend
     marker = f"{MARKER}-{test.sandbox.sandbox_id}"
 
     with test.phase("write a file before the first suspend"):

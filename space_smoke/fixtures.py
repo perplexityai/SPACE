@@ -838,7 +838,7 @@ class CommandSandboxFixture:
     _resident_lifecycle: ResidentLifecycleSandbox | None = None
     _stoppable_lifecycle: StoppableLifecycleSandbox | None = None
     _local_cleanup_control: ColdEvictionControl | None = None
-    _encrypted_restore_control: EncryptedResuspendControl | None = None
+    _encrypted_resuspend_control: EncryptedResuspendControl | None = None
     _processes: ProcessSandbox | None = None
 
     fixture_name: ClassVar[str] = "command_sandbox"
@@ -859,14 +859,14 @@ class CommandSandboxFixture:
         return SandboxCollection(self._context, self._sandboxes)
 
     @property
-    def encrypted_restore(self) -> EncryptedResuspendAssertions:
-        """Assertions for a run-owned BYOK sandbox's suspend and restore cycles."""
+    def encrypted_resuspend(self) -> EncryptedResuspendAssertions:
+        """Assertions for a BYOK sandbox's encrypted suspend and restore cycles."""
 
-        if self._encrypted_restore_control is None:
+        if self._encrypted_resuspend_control is None:
             raise SmokeConfigurationError(
-                "encrypted restore control requires kind_byok on the kind backend"
+                "encrypted re-suspend control is only available on the kind backend"
             )
-        return EncryptedResuspendAssertions(self, self._encrypted_restore_control)
+        return EncryptedResuspendAssertions(self, self._encrypted_resuspend_control)
 
     def phase(self, name: str) -> AbstractContextManager[None]:
         return self._context.phase(name)
@@ -2822,23 +2822,6 @@ class KindEcw(Ecw):
                 self, self._cross_node_control, self._context.scope
             )
         return self._cross_node_assertions
-
-    _encrypted_resuspend_control: EncryptedResuspendControl | None = None
-    _encrypted_resuspend_assertions: EncryptedResuspendAssertions | None = None
-
-    @property
-    def encrypted_resuspend(self) -> EncryptedResuspendAssertions:
-        """Assertions for an encrypted restore followed by another suspend."""
-
-        if self._encrypted_resuspend_control is None:
-            raise SmokeConfigurationError(
-                "encrypted re-suspend control is only available on the kind backend"
-            )
-        if self._encrypted_resuspend_assertions is None:
-            self._encrypted_resuspend_assertions = EncryptedResuspendAssertions(
-                self, self._encrypted_resuspend_control
-            )
-        return self._encrypted_resuspend_assertions
 
     _suspend_codec_control: SuspendCodecControl | None = None
     _suspend_codec_assertions: SuspendCodecAssertions | None = None
