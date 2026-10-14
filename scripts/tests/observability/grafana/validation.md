@@ -51,11 +51,13 @@ Prometheus held **69 API series across 30 metric families** at the final query.
 
 ## Actual queries and labels
 
-Exact stored totals, evaluated at Unix time `1790189176`:
+Exact stored totals, evaluated at Unix time `1790189176`. The run predates
+the OTLP sink dropping the doubled unit, so it queried
+`..._latency_ms_milliseconds`; the names below are the current ones.
 
 ```promql
 sum by (result, status_code) (
-  histogram_count(space_sandbox_api_latency_ms_milliseconds{
+  histogram_count(space_sandbox_api_latency_milliseconds{
     service_name="space-api", op="create"
   })
 )
@@ -67,14 +69,14 @@ sum by (outcome) (
 # connected: 8; wake_submitted: 1
 
 histogram_quantile(0.90, sum(rate(
-  space_sandbox_api_latency_ms_milliseconds{
+  space_sandbox_api_latency_milliseconds{
     service_name="space-api", op="create", result="success"
   }[5m]
 )))
 ```
 
 Reconnect latency uses native histogram
-`space_sandbox_reconnect_duration_ms_milliseconds`. Observed identity labels:
+`space_sandbox_reconnect_duration_milliseconds`. Observed identity labels:
 `deployment_environment_name="kind-local"`, `cluster_id="kind-local"`,
 `service_name="space-api"`, `service_version="stack-7c051315-after-otel"`,
 `instance="space-api-5694fc964f-4mmkt:1"`, plus promoted pod/node identity.
