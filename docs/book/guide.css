@@ -67,8 +67,12 @@ html, button, input { font-family: var(--docs-font-body); }
 #page-wrapper #menu-bar .icon-button { padding: 0; }
 #page-wrapper #menu-bar i { padding-inline: 12px; }
 .sidebar { top: calc(var(--docs-header-height) + var(--docs-utility-height)); border-right: 1px solid var(--table-border-color); }
-.sidebar .sidebar-scrollbox { padding: 16px; }
-.chapter-item > a:not(.toggle) { flex: 1; padding: 4px 8px; border-radius: 4px; }
+.sidebar .sidebar-scrollbox { padding: 24px 16px; }
+.chapter { margin-block: 0; }
+.chapter > .chapter-item:not(.affix) { margin-block-start: 20px; }
+.chapter .section .chapter-item { margin-block-start: 4px; }
+.chapter-item > a:not(.toggle) { flex: 1; padding: 6px 8px; border-radius: 4px; }
+.chapter-item > a:hover { background: var(--docs-color-soft); }
 .chapter-item > a.active { background: var(--docs-color-soft); font-weight: 600; }
 #sidebar-toggle-anchor:checked ~ .page-wrapper { margin-inline-start: var(--sidebar-width); transform: none; }
 .page { margin-top: calc(var(--docs-header-height) + var(--docs-utility-height)); padding-top: 28px; }

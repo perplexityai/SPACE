@@ -20,6 +20,11 @@ renderer keeps its native reading controls in the utility row without a repeated
 section title. Both use the shared heading weight and tracking, and a soft
 palette background marks the selected navigation entry.
 
+The Guide sidebar separates chapter groups from their indented child pages.
+Only the active chapter gains smaller H2 links for navigating within the page;
+these share the chapter links' hover background and keyboard focus treatment.
+The sidebar remains scrollable, and mdBook owns its chapter links and controls.
+
 Both sections load `system-theme.js` before their content. It selects the system
 color preference once per page load and ignores legacy mdBook theme choices.
 There is no theme switcher. When the system preference changes, the shared script

@@ -1,8 +1,9 @@
 .chapter li.has-page-toc { display: block; }
-.chapter li.has-page-toc > .page-toc { display: block; margin: 0.4em 0 0.8em; padding-left: 16px; list-style: none; }
-.chapter .page-toc a { font-size: 0.9em; }
+.chapter li.has-page-toc > .page-toc { display: block; width: auto; margin: 4px 0 12px; padding-inline-start: 16px; list-style: none; }
+.chapter .page-toc a { padding: 4px 8px; border-radius: 4px; font-size: 12px; line-height: 1.6; }
+.chapter .page-toc a:hover { background: var(--docs-color-soft); }
 .docs-build { margin-top: 4rem; font-size: 0.8em; }
-#sidebar a:focus-visible { outline: 2px solid currentColor; outline-offset: 2px; }
+#sidebar a:focus-visible { outline: 2px solid var(--sidebar-active); outline-offset: 2px; }
 .mermaid-diagram { margin: 2rem 0; overflow: auto; padding: 1rem; }
 .mermaid-diagram:focus-visible { outline: 2px solid var(--fg); outline-offset: 2px; }
 .mermaid-diagram svg { display: block; margin: auto; min-width: 480px; max-width: 100%; height: auto; }
