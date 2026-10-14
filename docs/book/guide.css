@@ -8,9 +8,9 @@
 }
 
 .light, html:not(.js) {
-    --bg: var(--docs-color-background);
+    --bg: var(--docs-color-surface);
     --fg: var(--docs-color-text);
-    --sidebar-bg: var(--docs-color-surface);
+    --sidebar-bg: var(--docs-color-background);
     --sidebar-fg: var(--docs-color-muted);
     --sidebar-active: var(--docs-color-accent);
     --sidebar-spacer: var(--docs-color-border);
@@ -49,6 +49,7 @@ html, button, input { font-family: var(--docs-font-body); }
     background: var(--sidebar-bg);
     border-bottom: 1px solid var(--table-border-color);
 }
+.light .docs-header, html:not(.js) .docs-header { background: var(--docs-color-surface); }
 .docs-header a { color: var(--fg); text-decoration: none; }
 .docs-brand { font-size: 20px; font-weight: 700; letter-spacing: .04em; }
 .docs-sections { display: flex; align-self: stretch; gap: 28px; }
@@ -77,6 +78,7 @@ html, button, input { font-family: var(--docs-font-body); }
     flex-wrap: nowrap;
     border-bottom: 1px solid var(--table-border-color);
 }
+.light #page-wrapper #menu-bar, html:not(.js) #page-wrapper #menu-bar { background: var(--docs-color-background); }
 .menu-title { font-size: 14px; font-weight: 500; }
 .sidebar { top: calc(var(--docs-header-height) + var(--docs-utility-height)); border-right: 1px solid var(--table-border-color); }
 .sidebar .sidebar-scrollbox { padding: 16px; }
