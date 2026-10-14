@@ -233,8 +233,10 @@ fn status_class(status: u16) -> &'static str {
 /// resource ARN that names one.
 fn failure_kind(error: &OrchestratorError<Error>, last_status: Option<u16>) -> &'static str {
     if let Some(connector) = error.as_connector_error() {
+        // The connector reports its connect and its response read timeouts
+        // alike, so this does not say which one fired.
         return if connector.is_timeout() {
-            "connect_timeout"
+            "connector_timeout"
         } else {
             "transport"
         };

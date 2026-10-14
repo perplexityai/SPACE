@@ -339,7 +339,7 @@ the last response, and `s3.request.bytes` and `s3.response.bytes` when the
 messages declare a length. `not_found` is reserved for a `HeadObject` or
 `GetObject` 404, an existence check's answer, and keeps status OK; any other
 operation's 404 fails it. A failure sets status ERROR and records why as
-`s3.failure_kind`, from a fixed set (`transport`, `connect_timeout`,
+`s3.failure_kind`, from a fixed set (`transport`, `connector_timeout`,
 `timeout`, `throttled`, `http_5xx`, `access_denied`, `not_found`, `http_4xx`,
 `service_error`, `abandoned`, `no_result`, `other`), which is also its status
 description; the SDK's and the server's error text, which can quote a key, is
