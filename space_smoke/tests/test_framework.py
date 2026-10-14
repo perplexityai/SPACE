@@ -160,6 +160,7 @@ runpy.run_module("space_smoke", run_name="__main__")
                 "local.template_cache_lru_eviction_reclaims",
                 "local.template_startup_recovery_decision_table",
                 "native.aws_secret_network_credential_injection",
+                "native.encrypted_double_restore_retires_prior_pods",
                 "native.resident_pause",
                 "native.stopped_restart_preserves_rootfs",
                 "native_concurrency.command_idempotency",

@@ -1413,6 +1413,10 @@ class EncryptedResuspendControl(RestoreStateRead, Protocol):
         """Force-clear only deleting pods whose containers all exited successfully."""
         ...
 
+    def sandbox_pods(self, sandbox_id: str) -> list[SandboxPodView]:
+        """The sandbox's execution pods by label, including terminating ones."""
+        ...
+
 
 class SandboxEventRead(Protocol):
     """Read sbx-manager's structured sandbox events from its pods' logs."""

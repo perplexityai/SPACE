@@ -97,6 +97,9 @@ _DURATION_SECONDS = {
         "ecw.sandbox_delete": 3,
         "ecw.sandbox_info": 4,
         "ecw.sandbox_list_pagination": 9,
+        # Estimate until a bench run refreshes it: two encrypted suspend and
+        # restore cycles, each waiting for its upload and pod retirement.
+        "native.encrypted_double_restore_retires_prior_pods": 90,
         "native.resident_pause": 5,
         "native_contract.command_validation": 6,
         "native_contract.idempotency_conflict": 5,

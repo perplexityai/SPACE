@@ -9,7 +9,7 @@ import shutil
 import time
 import uuid
 from collections.abc import Callable, Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import partial
 from typing import Any, Protocol, TypeVar, cast
 
@@ -32,6 +32,7 @@ from space_smoke.capabilities import (
     EcwSandboxDeleteRetryable,
     EcwSandboxes,
     EcwSandboxPages,
+    EncryptedResuspendControl,
     KindEnvironment,
     NetworkConfig,
     ProcessSandbox,
@@ -42,7 +43,11 @@ from space_smoke.capabilities import (
     WarmPoolCandidate,
 )
 from space_smoke.config import SandboxConfig
-from space_smoke.encrypted_resuspend import prepare_byok_identity
+from space_smoke.encrypted_resuspend import (
+    ByokIdentity,
+    open_byok_session,
+    prepare_byok_identity,
+)
 from space_smoke.fixtures import (
     SANDBOX_CLEANUP_ATTEMPTS,
     SANDBOX_CLEANUP_RETRY_SECONDS,
@@ -184,7 +189,7 @@ class SmokeServices:
         if kind is not None:
             with context.phase("bootstrap kind stack"):
                 kind.bootstrap()
-        byok_identity: tuple[str, str] | None = None
+        byok_identity: ByokIdentity | None = None
         if sandbox_config.kind_byok:
             if kind is None or fixture_type is not KindEcw or not self.owns_api_key:
                 raise SmokeConfigurationError(
@@ -209,7 +214,9 @@ class SmokeServices:
                     kind.seed_api_key(self.api_key)
                 else:
                     kind.seed_api_key(
-                        self.api_key, org_id=byok_identity[0], user_id=byok_identity[1]
+                        self.api_key,
+                        org_id=byok_identity.org_id,
+                        user_id=byok_identity.user_id,
                     )
         template = self.template_override or sandbox_config.template
         before_create = None
@@ -346,6 +353,26 @@ class SmokeServices:
         if self.native is None:
             raise SmokeConfigurationError("Native client is unavailable")
         native = self.native
+        kind = self.kind
+        if sandbox_config.kind_byok:
+            if kind is None or not isinstance(native, NativeSandboxFactory):
+                raise SmokeConfigurationError(
+                    "native BYOK setup requires the kind backend and a native client"
+                )
+            with context.phase("enroll run-owned BYOK organization"):
+                byok_identity = prepare_byok_identity(context, kind)
+                # The sandbox delete below is deferred after the identity
+                # cleanup, so it runs first and with this member's session.
+                native = NativeSandboxFactory(
+                    replace(
+                        native.config,
+                        token=open_byok_session(
+                            native.config.api_url,
+                            byok_identity,
+                            timeout=native.config.request_timeout_seconds,
+                        ),
+                    )
+                )
         run_metadata = {
             "space_smoke_scenario": scenario_id,
             "space_smoke_run": uuid.uuid4().hex,
@@ -381,7 +408,12 @@ class SmokeServices:
             _resident_lifecycle=cast(ResidentLifecycleSandbox, sandboxes[0]),
             _stoppable_lifecycle=cast(StoppableLifecycleSandbox, sandboxes[0]),
             _local_cleanup_control=(
-                cast(ColdEvictionControl, self.kind) if self.kind is not None else None
+                cast(ColdEvictionControl, kind) if kind is not None else None
+            ),
+            _encrypted_restore_control=(
+                cast(EncryptedResuspendControl, kind)
+                if kind is not None and sandbox_config.kind_byok
+                else None
             ),
             _processes=cast(ProcessSandbox, sandboxes[0]),
         )

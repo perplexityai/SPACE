@@ -838,6 +838,7 @@ class CommandSandboxFixture:
     _resident_lifecycle: ResidentLifecycleSandbox | None = None
     _stoppable_lifecycle: StoppableLifecycleSandbox | None = None
     _local_cleanup_control: ColdEvictionControl | None = None
+    _encrypted_restore_control: EncryptedResuspendControl | None = None
     _processes: ProcessSandbox | None = None
 
     fixture_name: ClassVar[str] = "command_sandbox"
@@ -856,6 +857,16 @@ class CommandSandboxFixture:
                 "this fixture does not provide sandbox collection operations"
             )
         return SandboxCollection(self._context, self._sandboxes)
+
+    @property
+    def encrypted_restore(self) -> EncryptedResuspendAssertions:
+        """Assertions for a run-owned BYOK sandbox's suspend and restore cycles."""
+
+        if self._encrypted_restore_control is None:
+            raise SmokeConfigurationError(
+                "encrypted restore control requires kind_byok on the kind backend"
+            )
+        return EncryptedResuspendAssertions(self, self._encrypted_restore_control)
 
     def phase(self, name: str) -> AbstractContextManager[None]:
         return self._context.phase(name)
@@ -2916,30 +2927,33 @@ class EncryptedResuspendAssertions:
     """Prove that re-suspend updates the existing sparse encrypted memory base."""
 
     MAX_DIFF_ALLOCATION_BYTES = 1024**3
+    PRIOR_EXECUTION_RETIREMENT_SECONDS = 60
 
     def __init__(
         self,
-        fixture: KindEcw,
+        fixture: CommandSandboxFixture,
         control: EncryptedResuspendControl,
     ) -> None:
         self._fixture = fixture
         self._control = control
+        # Kind reads take the bare UUID; the native API prefixes it.
+        self._sandbox_id = fixture.sandbox.sandbox_id.removeprefix("sbx_")
 
     def current_node(self) -> str:
         placement = self._control.sandbox_pod_placement(
-            self._fixture.sandbox.sandbox_id
+            self._sandbox_id
         )
         self._fixture.verify(
             placement is not None,
             "encrypted sandbox has no single bound execution pod",
-            sandbox_id=self._fixture.sandbox.sandbox_id,
+            sandbox_id=self._sandbox_id,
         )
         assert placement is not None
         return placement.node_name
 
     def sealed_snapshot(self, node_name: str) -> EncryptedSnapshotObservation:
         observation = self._control.encrypted_snapshot_observation(
-            self._fixture.sandbox.sandbox_id, node_name
+            self._sandbox_id, node_name
         )
         self._fixture.verify(
             observation.allocated_bytes < observation.logical_bytes
@@ -2963,7 +2977,7 @@ class EncryptedResuspendAssertions:
 
     def clear_completed_pods(self) -> tuple[str, ...]:
         cleared = self._control.clear_completed_sandbox_pods(
-            self._fixture.sandbox.sandbox_id
+            self._sandbox_id
         )
         self._fixture.record("force_cleared_completed_pods", list(cleared))
         return cleared
@@ -2982,6 +2996,33 @@ class EncryptedResuspendAssertions:
             second_node=second.node_name,
         )
         self._fixture.record("encrypted_snapshot_luks_uuid", second.luks_uuid)
+
+    def expect_prior_executions_retired(self) -> None:
+        """Only the serving execution's pod remains after a restore.
+
+        Each suspended execution's pod is removed once its shim has proof the
+        suspend is durable. A pod left Terminating blocks the next restore of
+        the same sandbox, so it must not outlive the restore that replaced it.
+        """
+
+        deadline = time.monotonic() + self.PRIOR_EXECUTION_RETIREMENT_SECONDS
+        while True:
+            pods = self._control.sandbox_pods(self._sandbox_id)
+            serving = [pod for pod in pods if pod.phase == "Running" and not pod.deleting]
+            if len(serving) == 1 and len(pods) == 1:
+                self._fixture.record(
+                    "serving_execution_generation", serving[0].execution_generation
+                )
+                return
+            if time.monotonic() >= deadline:
+                self._fixture.verify(
+                    False,
+                    "a prior encrypted execution's pod outlived the restore that replaced it",
+                    sandbox_id=self._sandbox_id,
+                    pods=[asdict(pod) for pod in pods],
+                    waited_seconds=self.PRIOR_EXECUTION_RETIREMENT_SECONDS,
+                )
+            time.sleep(1)
 
 
 class TemplateCacheAssertions:
