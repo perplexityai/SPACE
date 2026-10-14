@@ -13,7 +13,7 @@ Please report security issues privately using either of the following
 channels:
 
 - Web: [Report a vulnerability](https://github.com/perplexityai/SPACE/security/advisories/new)
-- Email: [security@perplexity.ai](mailto:security@perplexity.ai)
+- Email: [space-team@perplexity.ai](mailto:space-team@perplexity.ai)
 - Please include the following information:
   - Affected SPACE version, branch, or commit
   - Type of vulnerability and affected component
