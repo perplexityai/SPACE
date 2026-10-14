@@ -297,12 +297,26 @@ kind_host_paths__require() {
 # companion shape test rejects the idioms outright so the failure names the
 # cause rather than a count mismatch.
 kind_config_mounts() {
+  kind_config_node_mounts "$1" | cut -f2,3
+}
+
+# The same pairs, each after the image of the node that mounts it (empty when
+# that node names none): "<image>\t<containerPath>\t<hostPath>". The one
+# parser behind kind_config_mounts, with the same shape limits, plus that a
+# node's `image:` key sits at its own top level, as kind's config has it.
+kind_config_node_mounts() {
   sed -e 's/[[:space:]]\{1,\}#.*$//' "$1" \
     | awk -F': *' '
+        /^[[:space:]]*-[[:space:]]*role:/           { image = "" }
+        /^[[:space:]]*image:/ {
+          # The whole value: an image reference has colons of its own.
+          image = $0
+          sub(/^[[:space:]]*image:[[:space:]]*/, "", image)
+        }
         /^[[:space:]]*-?[[:space:]]*hostPath:/      { host = $2 }
         /^[[:space:]]*-?[[:space:]]*containerPath:/ { container = $2 }
         host != "" && container != "" {
-          print container "\t" host
+          print image "\t" container "\t" host
           host = ""
           container = ""
         }

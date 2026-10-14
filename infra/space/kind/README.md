@@ -841,14 +841,21 @@ the documented path still names something real and current.
 
 The node images preload kind's add-on images (kindnetd and the local-path
 provisioner from Docker Hub, the control-plane images from registry.k8s.io) in
-`/var/lib/containerd`, which the `SPACE_KIND_DATA_ROOT` mount hides. So before
-`kind create`, [`scripts/seed-node-containerd.sh`](scripts/seed-node-containerd.sh)
-copies each node image's `/var/lib/containerd` into that node's directory if
-the directory is absent or empty, about 430 MB per node. A directory that
-holds anything, such as the cache a deleted cluster leaves, is not touched.
-Without the copy, a fresh host's kubelets pull every add-on again, and while
-Docker Hub is unreachable no node becomes Ready. When a copy fails, the
-directory is left empty and the kubelets pull as before.
+`/var/lib/containerd`, which the `SPACE_KIND_DATA_ROOT` mount hides. Without a
+copy of them, a fresh host's kubelets pull every add-on again, and while
+Docker Hub is unreachable no node becomes Ready. So before `kind create`,
+[`scripts/seed-node-containerd.sh`](scripts/seed-node-containerd.sh) copies
+each node image's `/var/lib/containerd` into that node's directory if the
+directory is absent or empty. That is the image's stock preload, the same set
+on every node, about 430 MB each.
+- The copy goes into a staging directory beside the target and is renamed
+  onto it only when complete and only while the target is still empty.
+- Seeds of one directory take turns under a lock.
+- A directory that holds anything, such as the cache a deleted cluster leaves,
+  is never touched.
+- A seed that fails, is killed, or overlaps another bring-up leaves the
+  directory as it found it, and the kubelets pull as before.
+
 `SPACE_KIND_SEED_CONTAINERD=0` turns the copy off.
 
 `scripts/lib/kind-host-paths.sh` resolves the vendor path for both staging and

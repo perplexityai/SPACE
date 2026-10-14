@@ -952,6 +952,19 @@ class HostPathExtractionTests(unittest.TestCase):
         )
         self.assertEqual(sorted(pairs), expected_pairs)
 
+        # And each pair's node image, which seed-node-containerd.sh copies a
+        # node's containerd directory from.
+        triples = run_bash(
+            f"kind_config_node_mounts {shell_quote(str(dest))}",
+            env=base_env("/home/test-user"),
+        ).stdout.splitlines()
+        expected_triples = sorted(
+            f"{node.get('image', '')}\t{mount['containerPath']}\t{mount['hostPath']}"
+            for node in config["nodes"]
+            for mount in node.get("extraMounts", [])
+        )
+        self.assertEqual(sorted(triples), expected_triples)
+
     def test_no_template_host_path_is_an_absolute_home_literal(self) -> None:
         # A hostPath written out by hand is the single edit that re-splits the
         # harness, and it would render identically on the devbox reviewing it.
