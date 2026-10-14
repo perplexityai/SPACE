@@ -464,48 +464,59 @@ async fn concurrent_http2_streams_keep_credential_decisions_request_local() {
 }
 
 #[tokio::test]
-async fn policy_change_during_origin_setup_never_forwards_buffered_credentials() {
+async fn policy_change_during_origin_setup_never_reaches_origin() {
     use tokio::io::AsyncReadExt;
 
-    let (state, provider) = credential_provider(true).await;
-    let lease = provider
-        .get("allowed.test".parse().unwrap(), 443)
+    for request in [
+        credential_request(http::Method::GET, "/v1/items"),
+        Request::connect("allowed.test:443")
+            .header(header::HOST, "allowed.test:443")
+            .body(())
+            .unwrap(),
+    ] {
+        let method = request.method().clone();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let (state, provider) = credential_provider(true).await;
+            let lease = provider
+                .get("allowed.test".parse().unwrap(), 443)
+                .await
+                .unwrap();
+            let binding =
+                HostBinding::new("test", "93.184.216.34:443".parse().unwrap(), state.clone());
+            let (origin, mut origin_peer) = tokio::io::duplex(4096);
+            let (connect_started_tx, connect_started_rx) = tokio::sync::oneshot::channel();
+            let (connect_release_tx, connect_release_rx) = tokio::sync::oneshot::channel();
+            let (guest, guest_peer) = tokio::io::duplex(4096);
+            let gateway = tokio::spawn(serve(guest, binding, lease, move |_| async move {
+                connect_started_tx.send(()).unwrap();
+                connect_release_rx.await.unwrap();
+                Ok((origin, HttpProtocol::Http1))
+            }));
+            let (mut sender, connection) =
+                http1::handshake(TokioIo::new(guest_peer)).await.unwrap();
+            let client = tokio::spawn(connection.with_upgrades());
+            let request = request.map(|_| Empty::<Bytes>::new());
+            let response = tokio::spawn(async move { sender.send_request(request).await.unwrap() });
+
+            connect_started_rx.await.unwrap();
+            state
+                .set_no_identity(crate::state::NetworkStateReason::NoIdentity)
+                .await;
+            connect_release_tx.send(()).unwrap();
+
+            let mut byte = [0];
+            assert_eq!(
+                origin_peer.read(&mut byte).await.unwrap(),
+                0,
+                "the invalidated {method} must close the origin without sending request bytes"
+            );
+            assert_eq!(response.await.unwrap().status(), StatusCode::FORBIDDEN);
+            client.await.unwrap().unwrap();
+            gateway.await.unwrap().unwrap();
+        })
         .await
-        .unwrap();
-    let binding = HostBinding::new("test", "93.184.216.34:443".parse().unwrap(), state.clone());
-    let (origin, mut origin_peer) = tokio::io::duplex(4096);
-    let (connect_started_tx, connect_started_rx) = tokio::sync::oneshot::channel();
-    let (connect_release_tx, connect_release_rx) = tokio::sync::oneshot::channel();
-    let (guest, guest_peer) = tokio::io::duplex(4096);
-    let gateway = tokio::spawn(serve(guest, binding, lease, move |_| async move {
-        let _ = connect_started_tx.send(());
-        let _ = connect_release_rx.await;
-        Ok((origin, HttpProtocol::Http1))
-    }));
-    let (mut sender, connection) = http1::handshake(TokioIo::new(guest_peer)).await.unwrap();
-    let client = tokio::spawn(connection);
-    let request = credential_request(http::Method::GET, "/v1/items").map(|_| Empty::<Bytes>::new());
-    let response = tokio::spawn(async move { sender.send_request(request).await.unwrap() });
-
-    connect_started_rx.await.unwrap();
-    state
-        .set_no_identity(crate::state::NetworkStateReason::NoIdentity)
-        .await;
-    connect_release_tx.send(()).unwrap();
-
-    assert_eq!(response.await.unwrap().status(), StatusCode::FORBIDDEN);
-    let mut byte = [0];
-    let observed = tokio::time::timeout(
-        Duration::from_millis(100),
-        origin_peer.read_exact(&mut byte),
-    )
-    .await;
-    assert!(
-        !matches!(observed, Ok(Ok(_))),
-        "the invalidated request must not reach the origin"
-    );
-    client.abort();
-    gateway.abort();
+        .unwrap_or_else(|_| panic!("{method} did not finish after policy invalidation"));
+    }
 }
 
 async fn fixture() -> (
