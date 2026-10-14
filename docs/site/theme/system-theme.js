@@ -1,5 +1,7 @@
-// Choose once per page load so the shell and renderer keep the same palette.
+// Reinitialize the shell and renderer together when the system palette changes.
 (() => {
   const root = document.documentElement;
-  root.dataset.docsTheme = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+  const preference = window.matchMedia('(prefers-color-scheme: dark)');
+  root.dataset.docsTheme = preference.matches ? 'dark' : 'light';
+  preference.addEventListener('change', () => window.location.reload());
 })();

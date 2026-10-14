@@ -8,12 +8,13 @@ const script = readFileSync(join(__dirname, 'theme/system-theme.js'), 'utf8');
 
 function browser(dark, saved, blocked = false) {
   const listeners = [];
+  let reloads = 0;
   const media = { matches: dark, addEventListener: (_, callback) => listeners.push(callback) };
   const storage = new Map([['mdbook-theme', saved]]);
   const root = { dataset: {} };
   const context = {
     document: { documentElement: root },
-    window: { matchMedia: () => media },
+    window: { matchMedia: () => media, location: { reload: () => reloads++ } },
     get localStorage() {
       if (blocked) throw new Error('Storage is unavailable');
       return { getItem: key => storage.get(key) ?? null };
@@ -21,7 +22,11 @@ function browser(dark, saved, blocked = false) {
   };
   return {
     root,
-    load: () => vm.runInNewContext(script, context),
+    get reloads() { return reloads; },
+    load() {
+      listeners.length = 0;
+      vm.runInNewContext(script, context);
+    },
     changeSystem(value) {
       media.matches = value;
       for (const listener of listeners) listener({ matches: value });
@@ -38,14 +43,19 @@ test('system preference wins over legacy Guide theme choices', () => {
   }
 });
 
-test('an open page keeps its mode until the next load', () => {
+test('system changes reload the page to select the new mode', () => {
   for (const dark of [false, true]) {
     const page = browser(dark, null);
     page.load();
+    assert.equal(page.reloads, 0);
     page.changeSystem(!dark);
+    assert.equal(page.reloads, 1);
     assert.equal(page.root.dataset.docsTheme, dark ? 'dark' : 'light');
     page.load();
     assert.equal(page.root.dataset.docsTheme, dark ? 'light' : 'dark');
+    assert.equal(page.reloads, 1);
+    page.changeSystem(dark);
+    assert.equal(page.reloads, 2);
   }
 });
 

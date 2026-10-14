@@ -13,9 +13,9 @@ under `--docs-dark-*` in that stylesheet. Code keeps a monospace font.
 
 Both sections load `system-theme.js` before their content. It selects the system
 color preference once per page load and ignores legacy mdBook theme choices.
-There is no theme switcher. A system preference change takes effect on the next
-navigation or refresh; the API renderer and shell keep their palette for the
-current page. The stylesheet also follows the system when scripts are disabled.
+There is no theme switcher. When the system preference changes, the shared script
+reloads the page so the API renderer and shell initialize with the same palette.
+The stylesheet also follows the system when scripts are disabled.
 
 The Guide's `docs/book/guide.css` adapts the shell while preserving mdBook's
 toolbar, highlighting, and reading controls. Only the named `index.hbs`,
