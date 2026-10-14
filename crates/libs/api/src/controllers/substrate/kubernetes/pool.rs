@@ -457,7 +457,7 @@ async fn claim_ready_pool_slot(
                 template_release_id,
                 namespace,
                 Some((pool_vcpu, pool_memory)),
-                request.volume_encryption,
+                false,
             )
             .await
             .map_err(|err| pool_store_error("failed to resolve pool shape", &err))?;
@@ -472,7 +472,7 @@ async fn claim_ready_pool_slot(
                     pool_memory,
                     namespace,
                     claim_id,
-                    request.volume_encryption,
+                    false,
                 )
                 .await,
                 Some(pool_shape_from_domain(shape)),
@@ -484,7 +484,7 @@ async fn claim_ready_pool_slot(
                 template_release_id,
                 namespace,
                 claim_id,
-                request.volume_encryption,
+                false,
             )
             .await
             .map_err(|err| pool_store_error("failed to claim pool slot", &err))?;
@@ -496,7 +496,7 @@ async fn claim_ready_pool_slot(
                 template_release_id,
                 namespace,
                 None,
-                request.volume_encryption,
+                false,
             )
             .await
             .map(|shape| shape.map(pool_shape_from_domain))

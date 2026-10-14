@@ -753,6 +753,36 @@ func TestSandboxOwner(t *testing.T) {
 	}
 }
 
+func TestSandboxPoolMember(t *testing.T) {
+	const slot = "00000000-0000-7000-8000-000000000001"
+	const config = "00000000-0000-7000-8000-000000000002"
+	tests := []struct {
+		name        string
+		annotations map[string]string
+		want        bool
+		wantErr     bool
+	}{
+		{name: "ordinary sandbox"},
+		{name: "pool member", annotations: map[string]string{sandboxPoolSlotIDAnnotation: slot, sandboxPoolConfigIDAnnotation: config}, want: true},
+		{name: "missing config", annotations: map[string]string{sandboxPoolSlotIDAnnotation: slot}, wantErr: true},
+		{name: "missing slot", annotations: map[string]string{sandboxPoolConfigIDAnnotation: config}, wantErr: true},
+		{name: "invalid slot", annotations: map[string]string{sandboxPoolSlotIDAnnotation: "invalid", sandboxPoolConfigIDAnnotation: config}, wantErr: true},
+		{name: "invalid config", annotations: map[string]string{sandboxPoolSlotIDAnnotation: slot, sandboxPoolConfigIDAnnotation: "invalid"}, wantErr: true},
+		{name: "empty identity", annotations: map[string]string{sandboxPoolSlotIDAnnotation: "", sandboxPoolConfigIDAnnotation: ""}, wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			spec := &ociSpec{Annotations: tt.annotations}
+
+			got, err := spec.sandboxPoolMember()
+
+			if (err != nil) != tt.wantErr || got != tt.want {
+				t.Fatalf("sandboxPoolMember() = (%v, %v), want (%v, error=%v)", got, err, tt.want, tt.wantErr)
+			}
+		})
+	}
+}
+
 func TestSandboxVolumeEncryption(t *testing.T) {
 	tests := []struct {
 		name        string

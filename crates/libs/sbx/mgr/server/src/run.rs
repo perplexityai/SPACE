@@ -1061,6 +1061,12 @@ pub async fn run(
         )
         .await;
     let sandbox_shutdown = {
+        health_reporter
+            .set_service_status(
+                pplx_space_sbx_mgr_client::ENCRYPTED_POOL_ADOPTION_HEALTH_SERVICE,
+                tonic_health::ServingStatus::Serving,
+            )
+            .await;
         let token = production_shutdown_token.clone();
         async move { token.cancelled().await }
     };

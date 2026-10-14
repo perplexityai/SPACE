@@ -359,6 +359,13 @@ impl SandboxManagerService {
             Status::permission_denied(format!("{operation} requires a SPACE API route token"))
         })?;
         validate_route_token_ed25519_target(&claims, sandbox_id, operation, allowed_purposes)?;
+        if crate::db::pool_adoption::guest_access_blocked(&*self.db_conn()?, sandbox_id)
+            .map_err(|error| Status::internal(format!("db error: {error}")))?
+        {
+            return Err(Status::failed_precondition(
+                "encrypted pool adoption must complete before guest access",
+            ));
+        }
         Ok(SpaceApiBridgeRouteAuthorization::verified(
             operation, claims,
         ))
@@ -756,6 +763,7 @@ impl SandboxManagerService {
         ready_timeout_secs: u32,
     ) -> Result<(), Status> {
         let resume_t0 = tokio::time::Instant::now();
+        self.require_completed_pool_adoption(sandbox_id)?;
 
         // Validate the sandbox is actually resumable before doing any work, so a
         // Resume on a non-resumable row (e.g. Stopped) still fails fast with

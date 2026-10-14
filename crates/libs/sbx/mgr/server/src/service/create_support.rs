@@ -125,7 +125,7 @@ impl SandboxManagerService {
         // change at adoption. Skip ineligible donors before testing occupancy so
         // valid caller intent follows the same fallback whether the pool is full
         // or empty. A rootfs resize additionally requires a cold create.
-        let eligible_mode = if req.rootfs_size_mb.is_some() {
+        let eligible_mode = if req.rootfs_size_mb.is_some() || req.encryptable_pool_member {
             BootMode::Cold
         } else if requested_mode == BootMode::Pool
             && (requested_id.is_some()

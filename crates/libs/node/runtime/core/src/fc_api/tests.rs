@@ -102,49 +102,63 @@ fn drive_rate_limiter_request_matches_firecracker_contract() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn a_drive_rate_limiter_update_patches_the_drive() {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let dir = tempfile::tempdir().unwrap();
-    let socket = dir.path().join("firecracker.socket");
-    let listener = tokio::net::UnixListener::bind(&socket).unwrap();
-    let firecracker = tokio::spawn(async move {
-        let (mut stream, _) = listener.accept().await.unwrap();
-        let mut request = Vec::new();
-        let mut chunk = [0_u8; 4096];
-        let (head, body) = loop {
-            let read = stream.read(&mut chunk).await.unwrap();
-            assert_ne!(read, 0, "client closed before sending a whole request");
-            request.extend_from_slice(&chunk[..read]);
-            let text = String::from_utf8(request.clone()).unwrap();
-            if let Some((head, body)) = text.split_once("\r\n\r\n") {
-                let length = head
-                    .lines()
-                    .find_map(|line| line.strip_prefix("content-length: "))
-                    .unwrap()
-                    .parse::<usize>()
-                    .unwrap();
-                if body.len() == length {
-                    break (head.to_string(), body.to_string());
+async fn drive_updates_patch_the_existing_device() {
+    for change_path in [false, true] {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("firecracker.socket");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let firecracker = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 4096];
+            let (head, body) = loop {
+                let read = stream.read(&mut chunk).await.unwrap();
+                assert_ne!(read, 0, "client closed before sending a whole request");
+                request.extend_from_slice(&chunk[..read]);
+                let text = String::from_utf8(request.clone()).unwrap();
+                if let Some((head, body)) = text.split_once("\r\n\r\n") {
+                    let length = head
+                        .lines()
+                        .find_map(|line| line.strip_prefix("content-length: "))
+                        .unwrap()
+                        .parse::<usize>()
+                        .unwrap();
+                    if body.len() == length {
+                        break (head.to_string(), body.to_string());
+                    }
                 }
-            }
-        };
-        stream
-            .write_all(b"HTTP/1.1 204 No Content\r\n\r\n")
-            .await
-            .unwrap();
-        (head, body)
-    });
+            };
+            stream
+                .write_all(b"HTTP/1.1 204 No Content\r\n\r\n")
+                .await
+                .unwrap();
+            (head, body)
+        });
 
-    FcApiClient::new(&socket)
-        .update_drive_rate_limiter("rootfs", &rootfs_limiter())
-        .await
-        .unwrap();
-    let (head, body) = firecracker.await.unwrap();
-    assert_eq!(head.lines().next(), Some("PATCH /drives/rootfs HTTP/1.1"));
-    assert_eq!(
-        serde_json::from_str::<serde_json::Value>(&body).unwrap(),
-        drive_rate_limiter_request_body("rootfs", &rootfs_limiter())
-    );
+        let client = FcApiClient::new(&socket);
+        if change_path {
+            client
+                .update_drive_path("rootfs", "/rootfs.ext4")
+                .await
+                .unwrap();
+        } else {
+            client
+                .update_drive_rate_limiter("rootfs", &rootfs_limiter())
+                .await
+                .unwrap();
+        }
+        let (head, body) = firecracker.await.unwrap();
+        assert_eq!(head.lines().next(), Some("PATCH /drives/rootfs HTTP/1.1"));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&body).unwrap(),
+            if change_path {
+                serde_json::json!({"drive_id":"rootfs", "path_on_host":"/rootfs.ext4"})
+            } else {
+                drive_rate_limiter_request_body("rootfs", &rootfs_limiter())
+            }
+        );
+    }
 }
 
 #[test]

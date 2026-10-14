@@ -756,6 +756,7 @@ impl SandboxManagerService {
         blocking: bool,
         activity: Option<GuestActivityKind>,
     ) -> Result<Response<WakeResponse>, Status> {
+        self.require_completed_pool_adoption(&sandbox_id)?;
         let transition = if blocking {
             let initial_state = self.lookup_sandbox(&sandbox_id)?.state;
 

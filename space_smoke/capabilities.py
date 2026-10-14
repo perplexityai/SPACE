@@ -59,6 +59,7 @@ class WarmPoolCandidate:
     slot_id: str
     node_name: str
     state: str
+    vm_pid: int
 
 
 class WarmPoolObserver(Protocol):

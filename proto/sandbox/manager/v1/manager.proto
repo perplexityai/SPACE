@@ -383,14 +383,16 @@ message CreateRequest {
   // sandbox's lifetime — stamped by the control plane at create from the
   // owner org's enrollment, honored fail-closed by every subsequent
   // start/suspend/restore without re-deciding. Mutually exclusive with
-  // pool_template: pool members are always plaintext (encrypted sandboxes
-  // bypass warm pools at the API).
+  // pool_template. Encryptable members acquire this flag through adoption,
+  // after the writable layer has been encrypted and before customer activation.
   bool volume_encryption = 22;
   optional space.net.gateway.v1.SpaceApiRouteIdentity route_identity = 26;
   // Effective immutable disk-I/O assignment resolved by the control plane.
   // Older callers omit these and receive the platform defaults.
   optional uint64 disk_io_max_operations_per_sec = 28;
   optional uint64 disk_io_max_bandwidth_mib_per_sec = 29;
+  // Internal pool-fill intent; retain a pre-boot origin for claim-time encryption.
+  bool encryptable_pool_member = 30;
 }
 
 message CreateResponse {
@@ -1356,11 +1358,23 @@ message AdoptPoolSandboxRequest {
   space.net.policy.v1.PolicyAuthority auto_lifecycle_authority = 12;
   // Identity assigned to the claimed sandbox; idle pool donors have none.
   optional space.net.gateway.v1.SpaceApiRouteIdentity route_identity = 14;
+  // Exact pool claim, including its organization and immutable storage mode.
+  optional ClaimedPoolSandbox claimed_sandbox = 15;
+  reserved 16;
+  reserved "encryption";
+}
+message ClaimedPoolSandbox {
+  string sandbox_id = 1;
+  string claim_id = 2;
+  string expected_org_id = 3;
+  bool volume_encryption = 4;
 }
 message AdoptPoolSandboxResponse {
   string sandbox_id = 1;
   // Authoritative identity installed while claiming the donor.
   optional space.net.gateway.v1.SpaceApiRouteIdentity route_identity = 2;
+  optional string claim_id = 3;
+  bool volume_encryption = 4;
 }
 
 message WaitRequest {

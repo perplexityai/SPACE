@@ -154,8 +154,7 @@ struct PooledCreateInput<'a> {
     federated_owner: Option<&'a crate::federated_identity::FederatedOwner>,
     federated_service_grant: Option<&'a crate::federated_identity::FederatedServiceGrant>,
     /// This create will produce an encrypted sandbox (org enrollment ∧ the
-    /// global volume-encryption switch). See the pool bypass in
-    /// `try_create_from_pool_with_substrate` for why these cold-create today.
+    /// global volume-encryption switch), applied during pool adoption.
     volume_encryption: bool,
 }
 
@@ -1030,9 +1029,7 @@ impl SandboxController {
     /// Fails closed: anything this cannot establish here (the org's row, its
     /// encryption setting, the runtime, the template release, the lifecycle
     /// policy) answers ineligible, and the create runs cold as it would
-    /// without admission. An org with encryption enabled is always
-    /// ineligible, whatever the cluster's encryption opt-in says, because
-    /// every warm-pool slot is plaintext.
+    /// without admission. Encryption is applied when the claimed VM is adopted.
     pub async fn plan_admission_pool_claim(
         &self,
         pool: &PgPool,
@@ -1053,8 +1050,11 @@ impl SandboxController {
             return AdmissionPoolPlan::Ineligible;
         };
         match org_encryption_flag(pool, org_id).await {
-            Ok(Some(false)) => {}
-            Ok(Some(true) | None) => return AdmissionPoolPlan::Ineligible,
+            Ok(Some(true)) if !byok_volume_encryption_engaged() => {
+                return AdmissionPoolPlan::Ineligible;
+            }
+            Ok(Some(_)) => {}
+            Ok(None) => return AdmissionPoolPlan::Ineligible,
             Err(error) => {
                 tracing::warn!(
                     %error,
@@ -1062,7 +1062,7 @@ impl SandboxController {
                 );
                 return AdmissionPoolPlan::Ineligible;
             }
-        }
+        };
         let template_reference = create_template_reference(req);
         let Ok(resolved_template) = self
             .resolve_create_template(pool, &template_reference, runtime, org_id)
@@ -1227,7 +1227,7 @@ impl SandboxController {
         )?;
 
         // Immutable per-sandbox encryption stamp: decided exactly once, here.
-        // It gates the pool bypass below, lands on the control-plane row, and
+        // It lands on the control-plane row before adoption requests the DEK and
         // rides the substrate create to the node row.
         let volume_encryption =
             org_byok_enabled(pool, create_owner.org_id).await? && byok_volume_encryption_engaged();
@@ -1837,21 +1837,6 @@ impl SandboxController {
         input: PooledCreateInput<'_>,
         claim_duration_nanos: Arc<AtomicU64>,
     ) -> Result<PoolCreateResult, ControllerError> {
-        // A warm member already runs on a plaintext rootfs and dm-crypt is set
-        // up pre-boot, so adoption cannot encrypt it in place; an encryptable
-        // member is only safe to adopt once claim-time re-homing stamps and
-        // applies volume_encryption. Until that orchestration exists, encrypted
-        // creates always cold-create, recorded as a direct cold create rather
-        // than a pool miss.
-        if input.volume_encryption {
-            tracing::debug!(
-                org_id = %input.create_owner.org_id,
-                template = input.template,
-                "BYOK create: bypassing warm pool, cold-creating an encrypted sandbox"
-            );
-            return Ok(PoolCreateResult::cold(PoolCreateObservation::cold_direct()));
-        }
-
         // A warm-pool slot is booted under its own pre-reserved sandbox ID
         // (pod name, pod metadata, and guest runtime all carry it), and
         // adoption returns that ID. When the caller has already published the
@@ -2423,10 +2408,7 @@ impl SandboxController {
             AdmittedPoolClaimLookup::Adoptable { claim, pool_shape } => (*claim, pool_shape),
         };
 
-        if claim.sandbox_id != input.planned_sandbox_id
-            || input.volume_encryption
-            || !adoption_eligible
-        {
+        if claim.sandbox_id != input.planned_sandbox_id || !adoption_eligible {
             tracing::info!(
                 sandbox_id = %input.planned_sandbox_id,
                 claim_id = %claim.claim_id,
@@ -2832,44 +2814,30 @@ async fn insert_pooled_sandbox(
             ControllerError::internal(format!("failed to serialize network policy: {error}"))
         })?;
 
-    sqlx::query(sql!(
-        "INSERT INTO sandboxes (
-             id, name, user_id, org_id, managed_by, lifecycle, placement,
-             active_node_id, target_node_id, placement_changed_at,
-             template_id, content_hash, vcpu, memory_mib, disk_mib,
-             disk_io_max_operations_per_sec,
-             disk_io_max_bandwidth_mib_per_sec, env, metadata,
-             auto_lifecycle_json, network_policy_override_json, network_policy_generation
-         )
-         VALUES (
-             $1, $2, $3, $4, $5, 'paused', 'on_node',
-             $6, $6, NOW(),
-             $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, 1
-         )"
-    ))
-    .bind(claim.sandbox_id)
-    .bind(&input.req.name)
-    .bind(create_owner.user_id)
-    .bind(create_owner.org_id)
-    .bind(managed_by)
-    .bind(claim.active_node_id)
-    .bind(input.template)
-    .bind(&claim.content_hash)
-    .bind(vcpu_i32)
-    .bind(memory_mib_i32)
-    .bind(disk_mib_i32)
-    .bind(i64::try_from(claim.disk_io_limits.max_operations_per_sec()).unwrap_or(i64::MAX))
-    .bind(i64::try_from(claim.disk_io_limits.max_bandwidth_mib_per_sec()).unwrap_or(i64::MAX))
-    .bind(sqlx::types::Json(input.env))
-    .bind(sqlx::types::Json(&input.req.metadata))
-    .bind(sqlx::types::Json(input.auto_lifecycle))
-    .bind(network_policy_override_json)
-    .execute(&mut **tx)
+    pplx_space_sandbox_store::insert_pooled(
+        &mut **tx,
+        pplx_space_sandbox_store::PooledSandboxCreate {
+            id: claim.sandbox_id,
+            name: input.req.name.as_deref(),
+            user_id: create_owner.user_id,
+            org_id: create_owner.org_id,
+            managed_by,
+            node_id: claim.active_node_id,
+            template: input.template,
+            content_hash: &claim.content_hash,
+            vcpu: vcpu_i32,
+            memory_mib: memory_mib_i32,
+            disk_mib: disk_mib_i32,
+            disk_io_limits: claim.disk_io_limits,
+            env: input.env,
+            metadata: &input.req.metadata,
+            auto_lifecycle: input.auto_lifecycle,
+            network_policy_override: network_policy_override_json,
+            volume_encryption: input.volume_encryption,
+        },
+    )
     .await
-    // Classified like its five siblings in this transaction. The
-    // post-side-effect hazard is handled once by the caller, which applies
-    // `demoted_after_side_effect` — see `try_create_from_pool`.
-    .map_err(|err| db_contention_error("failed to insert pooled sandbox", &err))?;
+    .map_err(|err| db_contention_error("failed to insert pooled sandbox", &err.into()))?;
 
     Ok(claim.sandbox_id)
 }

@@ -1,10 +1,10 @@
 //! Per-sandbox encrypted live rootfs: dm-crypt over a dm-snapshot COW.
 //!
 //! Goal: every byte the guest writes to its rootfs lands **encrypted** on the
-//! node disk, from the first write, **without** giving up the near-instant
+//! node disk, from activation, **without** giving up the near-instant
 //! reflink cold start or btrfs-send diff snapshots — and with **zero**
-//! overhead for non-BYOK sandboxes (the caller simply never invokes this
-//! module for them).
+//! device-mapper overhead for non-BYOK sandboxes. Pool preparation only
+//! retains a pre-boot reflink; adoption encrypts the changes before activation.
 //!
 //! # Layering
 //!
@@ -71,6 +71,11 @@ use std::process::Command;
 
 use crate::device_backing::{self, Backing, LoopDevice};
 use pplx_space_common_core::types::SandboxId;
+
+mod pool_adoption;
+pub(crate) use pool_adoption::{
+    POOL_ROOTFS_FILE, encrypt_pool_rootfs, prepare_pool_drive_switch, retain_pool_origin,
+};
 
 /// Bytes of the *decrypted* COW mapper zeroed before a FRESH dm-snapshot is
 /// created over it, so the kernel sees a clean exception store rather than
@@ -438,6 +443,10 @@ pub async fn release(sandbox_id: &SandboxId, origin_path: &Path) -> Result<(), D
     if dm_exists(&composite).await? {
         ReleaseDevice::Snapshot(&composite).run().await?;
     }
+    let seed = format!("{composite}-seed");
+    if dm_exists(&seed).await? {
+        ReleaseDevice::Snapshot(&seed).run().await?;
+    }
     if dm_exists(&cow).await? {
         ReleaseDevice::Crypt(&cow).run().await?;
     }
@@ -734,36 +743,9 @@ const SECTOR_BYTES: u64 = 512;
 #[cfg(test)]
 mod tests;
 
-/// Backing file for a warm-pool member's plaintext COW. Deliberately a
-/// different name from [`ROOTFS_COW_FILE`]'s `cow.luks`: the pinned COW probe decides
-/// format-vs-open from on-disk state, and a plaintext file at the encrypted
-/// path would read as "never formatted" and be silently LUKS-formatted by a
-/// later prepare, destroying the member's exception store.
-///
-/// Presence contract: this file survives on disk only once its exception
-/// store has been activated by the kernel — a fresh create's failure unwind
-/// deletes it. Its presence therefore means "this member has committed COW
-/// state", which is what sbx-mgr's degrade decision and its
-/// suspend/snapshot veto for plaintext composite sandboxes key on.
+/// Earlier pool layouts stored writes here. Its presence vetoes plaintext
+/// adoption or capture, since the ordinary rootfs would omit those writes.
 pub(crate) const POOL_COW_FILE: &str = "cow.plain";
-
-/// First bytes of dm-snapshot's persistent exception-store header: the
-/// little-endian on-disk encoding of the kernel's `SNAP_MAGIC` (0x70416e53),
-/// which reads as `SnAp`. The kernel writes it when it activates a fresh
-/// (all-zero) store, so a `cow.plain` carrying it holds live exception
-/// metadata.
-const SNAPSHOT_STORE_MAGIC: [u8; 4] = *b"SnAp";
-
-/// Whether a COW backing file's first bytes carry a dm-snapshot persistent
-/// store header. This is the plaintext analogue of the pinned COW probe's
-/// format-vs-open decision: a store the kernel has activated MUST be opened
-/// as-is — re-zeroing its header would orphan every remapped chunk and
-/// silently revert the guest to the template.
-fn has_persistent_snapshot_store(prefix: &[u8]) -> bool {
-    prefix
-        .get(..SNAPSHOT_STORE_MAGIC.len())
-        .is_some_and(|head| head == SNAPSHOT_STORE_MAGIC)
-}
 
 /// All loop devices currently backing `file` (`losetup -j`). A file can be
 /// attached more than once — e.g. a crashed prepare retried before anything
@@ -798,186 +780,6 @@ async fn loops_for_file(file: &Path) -> Result<Vec<LoopDevice>, DmCryptError> {
             .collect()
     })
     .await
-}
-
-/// Tear down the plaintext-COW composite stack: composite snapshot, then
-/// every loop attached to the COW and origin backing files, in dependency
-/// order. Best-effort against absent devices and idempotent, mirroring
-/// [`release`] for the encrypted stack.
-///
-/// `remove_cow` additionally deletes `cow.plain`. That is correct ONLY for a
-/// fresh create's unwind, where the store was never activated: per the
-/// [`POOL_COW_FILE`] presence contract, an activated store's file must
-/// survive its device stack.
-async fn release_plaintext(
-    sandbox_id: &SandboxId,
-    origin_path: &Path,
-    cow_path: &Path,
-    remove_cow: bool,
-) -> Result<(), DmCryptError> {
-    let composite = composite_name(sandbox_id);
-    if dm_exists(&composite).await? {
-        ReleaseDevice::Snapshot(&composite).run().await?;
-    }
-    for lo in loops_for_file(cow_path).await? {
-        ReleaseDevice::Loop(&lo.path().to_string_lossy())
-            .run()
-            .await?;
-    }
-    for lo in loops_for_file(origin_path).await? {
-        ReleaseDevice::Loop(&lo.path().to_string_lossy())
-            .run()
-            .await?;
-    }
-    if remove_cow {
-        let path = cow_path.to_owned();
-        device_backing::blocking(move || device_backing::unlink(&path)).await?;
-    }
-    Ok(())
-}
-
-/// Bring up the dm-snapshot composite over a **plaintext** COW: the shape a
-/// warm-pool member boots on before it has an owner.
-///
-/// The plaintext COW is a bare loop device rather than a dm-crypt mapper.
-/// Encryption is immutable for a sandbox; no in-place conversion is supported.
-///
-/// Idempotent: a live composite is handed back as-is, and a persisted COW
-/// (stop→start, node-manager restart) is opened rather than re-initialized.
-/// Any mid-build failure unwinds every device created, plus the COW file
-/// itself when its store was never activated.
-///
-/// `encrypted_cow_path` is the sandbox's `cow.luks` location, checked only to
-/// refuse the call: an encrypted sandbox restarting down the plaintext arm
-/// means the caller's encryption view of the sandbox is stale, and
-/// building a fresh plaintext COW here would orphan the encrypted one —
-/// silently downgrading the sandbox to plaintext-at-rest.
-pub async fn prepare_plaintext_snapshot(
-    sandbox_id: &SandboxId,
-    origin_path: &Path,
-    cow_path: &Path,
-    encrypted_cow_path: &Path,
-) -> Result<PreparedRootfs, DmCryptError> {
-    let origin = {
-        let path = origin_path.to_owned();
-        device_backing::blocking(move || Backing::require(Backing::open(&path, false)?)).await?
-    };
-    // Fail closed on the canonical encrypted COW's PRESENCE, not on
-    // `cryptsetup isLuks` succeeding: per the re-home's staging protocol the
-    // canonical name exists only once a re-home committed, and a probe that
-    // treats an I/O or tooling failure as "no encrypted COW" would build a
-    // plaintext COW over the committed one — exactly the orphaning this
-    // guard exists to prevent.
-    match tokio::fs::try_exists(encrypted_cow_path).await {
-        Ok(false) => {}
-        Ok(true) => {
-            return Err(DmCryptError::InvalidParams(format!(
-                "sandbox already has an encrypted COW at {encrypted_cow_path:?}; \
-                 refusing a plaintext prepare that would orphan it"
-            )));
-        }
-        Err(source) => {
-            return Err(DmCryptError::Io {
-                cmd: format!("stat {}", encrypted_cow_path.display()),
-                source,
-            });
-        }
-    }
-    let composite = composite_name(sandbox_id);
-    let mapper_path = PathBuf::from(format!("/dev/mapper/{composite}"));
-
-    verify_kernel_support().await?;
-    if dm_exists(&composite).await? {
-        return reuse_live_composite(&composite, origin, mapper_path).await;
-    }
-
-    release_plaintext(sandbox_id, origin_path, cow_path, false).await?;
-    let (cow, fresh) = {
-        let path = cow_path.to_owned();
-        device_backing::blocking(move || {
-            use std::os::unix::fs::FileExt;
-            let cow = match Backing::open(&path, true)? {
-                Some(file) => file,
-                None => Backing::create(&path)?,
-            };
-            let mut prefix = [0; 4];
-            let length = cow.file.read_at(&mut prefix, 0)?;
-            let fresh = length != prefix.len() || !has_persistent_snapshot_store(&prefix);
-            Ok((cow, fresh))
-        })
-        .await?
-    };
-
-    match build_plaintext_stack(sandbox_id, origin, cow, fresh).await {
-        Ok(()) => Ok(PreparedRootfs { mapper_path }),
-        Err(e) => {
-            // Best-effort unwind; surface the original error, not the
-            // cleanup's — but a failed unwind is exactly the loop/mapper leak
-            // the delete-time sweep can no longer find once the COW file is
-            // gone, so it gets its own log line rather than a silent discard.
-            if let Err(cleanup) = release_plaintext(sandbox_id, origin_path, cow_path, fresh).await
-            {
-                tracing::warn!(
-                    %sandbox_id,
-                    error = %cleanup,
-                    "plaintext snapshot rootfs unwind failed; devices may be leaked"
-                );
-            }
-            Err(e)
-        }
-    }
-}
-
-/// The ordered plaintext-stack build steps, factored out so
-/// [`prepare_plaintext_snapshot`] can wrap them in a single unwind-on-error
-/// (the same shape [`prepare`] gives [`build_stack`]).
-async fn build_plaintext_stack(
-    sandbox_id: &SandboxId,
-    origin: Backing,
-    cow: Backing,
-    fresh: bool,
-) -> Result<(), DmCryptError> {
-    let composite = composite_name(sandbox_id);
-
-    let origin_loop = device_backing::blocking(move || LoopDevice::attach(&origin, true)).await?;
-    let origin_sectors = blockdev_sectors(origin_loop.path()).await?;
-    let origin_bytes = origin_sectors.saturating_mul(SECTOR_BYTES);
-    let cow_loop = device_backing::blocking(move || {
-        if fresh {
-            cow.resize(cow_backing_size_bytes(origin_bytes))?;
-        }
-        LoopDevice::attach(&cow, false)
-    })
-    .await?;
-
-    // FRESH ONLY: a fresh exception store must read as zeroes or dm-snapshot
-    // rejects it as corrupt metadata (a recycled backing file could hold
-    // anything). On open, the store header IS the data — zeroing it would
-    // orphan every remapped chunk.
-    if fresh {
-        run_bounded(
-            "dd",
-            &[
-                "if=/dev/zero",
-                &format!("of={}", cow_loop.path().to_string_lossy()),
-                "bs=1M",
-                &format!("count={}", FRESH_COW_ZERO_PREFIX_BYTES / (1024 * 1024)),
-                "conv=fsync",
-            ],
-            FREEZE_COMMAND_BUDGET,
-        )
-        .await?;
-    }
-
-    let table = snapshot_table(
-        origin_sectors,
-        &origin_loop.path().to_string_lossy(),
-        &cow_loop.path().to_string_lossy(),
-    );
-    run("dmsetup", &["create", &composite, "--table", &table]).await?;
-    run_bounded("dmsetup", &["mknodes", &composite], FREEZE_COMMAND_BUDGET).await?;
-
-    Ok(())
 }
 
 /// Parse a dm `major:minor` device reference — the form `dmsetup table` and

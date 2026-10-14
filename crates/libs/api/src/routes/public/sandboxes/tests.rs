@@ -1394,10 +1394,14 @@ mod admission_pool_claim {
         Ok(())
     }
 
-    /// Every slot is plaintext, so an org with encryption enabled never gets
-    /// one, whatever the cluster's encryption opt-in says.
     #[tokio::test(flavor = "current_thread")]
-    async fn an_encrypted_org_never_gets_a_plaintext_slot() -> TestDbResult<()> {
+    async fn an_encrypted_org_claims_an_ordinary_pool_slot() -> TestDbResult<()> {
+        if !pplx_space_test_env::enter_test_process(&[(
+            "SPACE_BYOK_VOLUME_ENCRYPTION",
+            Some(std::ffi::OsStr::new("true")),
+        )]) {
+            return Ok(());
+        }
         let fixture = AdmissionPoolFixture::new(1).await?;
         fixture.enable_org_encryption().await?;
         let controller = fixture.controller();
@@ -1409,19 +1413,21 @@ mod admission_pool_claim {
         let counters = capture.finish();
 
         let slot = &fixture.slots[0];
-        assert_ne!(
+        assert_eq!(
             response.sandbox_id,
             PublicSandboxId::from(slot.reserved_sandbox_id)
         );
-        assert_eq!(
-            fixture.payload(response.operation_id).await?.pool_claim,
-            None
-        );
+        let claim = fixture
+            .payload(response.operation_id)
+            .await?
+            .pool_claim
+            .expect("BYOK claims the ordinary slot");
+        assert_eq!(claim.pool_slot_id, slot.id);
         assert_eq!(
             fixture.slot_state(slot.id).await?,
-            ("ready".to_string(), None)
+            ("claimed".to_string(), Some(claim.claim_id))
         );
-        assert_eq!(admission_outcomes(&counters), vec!["outcome:ineligible"]);
+        assert_eq!(admission_outcomes(&counters), vec!["outcome:hit"]);
         Ok(())
     }
 

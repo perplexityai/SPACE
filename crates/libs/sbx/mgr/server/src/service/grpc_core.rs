@@ -133,6 +133,7 @@ pub(super) fn pool_adoption_request(
     content_hash: Option<String>,
 ) -> AdoptPoolSandboxRequest {
     AdoptPoolSandboxRequest {
+        claimed_sandbox: None,
         template,
         owner,
         env: req.env.clone(),

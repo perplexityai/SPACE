@@ -44,6 +44,8 @@ use crate::{encrypted_volume, rootfs_dmcrypt};
 
 use super::{ALLOW_NODE_ADMIN_OR_SBXMGR, NodeManagerService};
 
+mod pool_drive_switch;
+
 /// Plaintext, reflinked-from-template rootfs file inside `instance/` — the
 /// dm-snapshot origin of the encrypted rootfs.
 const ROOTFS_ORIGIN_FILE: &str = "rootfs.ext4";
@@ -140,33 +142,70 @@ impl NodeManagerService {
         // credmgr (issued+persisted on the first volume, loaded thereafter).
         // The caller never handles a KEK or wrap; credmgr owns org→KEK
         // resolution, the wrap storage, and the AAD.
-        let plaintext_dek = fetch_sandbox_volume_dek(&sandbox_id, None)
+        let adoption = req
+            .pool_adoption
+            .as_ref()
+            .map(|adoption| {
+                let claim_id = uuid::Uuid::parse_str(&adoption.claim_id)
+                    .map_err(|_| Status::invalid_argument("invalid pool claim ID"))?;
+                let org_id = adoption
+                    .expected_org_id
+                    .parse::<OrgId>()
+                    .map_err(|_| Status::invalid_argument("invalid expected organization"))?;
+                if restore_cow_source.is_some() {
+                    return Err(Status::invalid_argument(
+                        "pool adoption cannot restore a COW",
+                    ));
+                }
+                Ok::<_, Status>((claim_id, org_id))
+            })
+            .transpose()?;
+
+        if adoption.is_some() {
+            require_paused_pool_vm(&sandbox_id).await?;
+        }
+        let plaintext_dek = fetch_sandbox_volume_dek(&sandbox_id, adoption.map(|(_, org)| org))
             .await
             .inspect_err(|_| metric.failed(pplx_space_metrics::byok::PHASE_DEK))?;
 
-        let prepared = rootfs_dmcrypt::prepare(rootfs_dmcrypt::PrepareParams {
-            sandbox_id,
-            origin_path,
-            cow_path,
-            restore_cow_source,
-            // The COW is sized from the measured origin device; there is no
-            // caller-supplied size to cross-check.
-            rootfs_size_bytes: 0,
-            dek: &plaintext_dek,
-        })
-        .await;
+        let prepared = if adoption.is_some() {
+            let drive = rootfs_dmcrypt::prepare_pool_drive_switch(sandbox_id, origin_path.clone())
+                .await
+                .map_err(|e| Status::internal(format!("prepare pool drive switch: {e}")))?;
+            pool_drive_switch::switch(&sandbox_id, &drive.mapper_path).await?;
+            rootfs_dmcrypt::encrypt_pool_rootfs(
+                sandbox_id,
+                origin_path,
+                instance_dir.join(rootfs_dmcrypt::POOL_ROOTFS_FILE),
+                cow_path,
+                &plaintext_dek,
+            )
+            .await
+        } else {
+            rootfs_dmcrypt::prepare(rootfs_dmcrypt::PrepareParams {
+                sandbox_id,
+                origin_path,
+                cow_path,
+                restore_cow_source,
+                // The COW is sized from the measured origin device; there is no
+                // caller-supplied size to cross-check.
+                rootfs_size_bytes: 0,
+                dek: &plaintext_dek,
+            })
+            .await
+        };
         let prepared = record_outcome(&metric, prepared)?;
         // plaintext_dek drops here → Zeroizing scrubs it; cryptsetup already
         // loaded the key into the kernel keyring.
 
         Ok(Response::new(PrepareEncryptedRootfsResponse {
             mapper_path: prepared.mapper_path.to_string_lossy().into_owned(),
+            adopted_claim_id: adoption.map(|(claim, _)| claim.to_string()),
         }))
     }
 
-    /// Warm-pool member shape: the same composite, over a plaintext COW.
-    /// No DEK is fetched — at fill time the member has no owner, so there is
-    /// no org whose key could be used.
+    /// Keep a reflink of the original rootfs for a later BYOK claim. The warm
+    /// VM writes its ordinary file and needs no device-mapper stack.
     pub(super) async fn prepare_snapshot_rootfs(
         &self,
         request: Request<PrepareSnapshotRootfsRequest>,
@@ -197,24 +236,11 @@ impl NodeManagerService {
         &self,
         sandbox_id: SandboxId,
     ) -> Result<Response<PrepareSnapshotRootfsResponse>, Status> {
-        // Counted before any request validation so the attempted/failed rate
-        // covers parameter rejections too; the guard's drop arm records them.
-        // The caller degrades a failure here to the plaintext rootfs file
-        // with only a warn log, so this series is the ONLY place a node whose
-        // pool fills all fail is visible.
         let metric = DeviceOpMetric::prepare(pplx_space_metrics::byok::OP_POOL_ROOTFS);
         let instance_dir = PathBuf::from(paths::sandbox_instance_dir(&sandbox_id.to_string()));
 
         let origin_path = instance_dir.join(ROOTFS_ORIGIN_FILE);
-        let cow_path = instance_dir.join(rootfs_dmcrypt::POOL_COW_FILE);
-        let encrypted_cow_path = instance_dir.join(ROOTFS_COW_FILE);
-        let result = rootfs_dmcrypt::prepare_plaintext_snapshot(
-            &sandbox_id,
-            &origin_path,
-            &cow_path,
-            &encrypted_cow_path,
-        )
-        .await;
+        let result = rootfs_dmcrypt::retain_pool_origin(origin_path).await;
         let prepared = record_outcome(&metric, result)?;
 
         Ok(Response::new(PrepareSnapshotRootfsResponse {
@@ -742,3 +768,23 @@ fn record_outcome<T>(
 
 #[cfg(test)]
 mod tests;
+
+async fn require_paused_pool_vm(sandbox_id: &SandboxId) -> Result<(), Status> {
+    let socket = format!(
+        "{}/firecracker/{sandbox_id}/root/firecracker.sock",
+        super::JAIL_DIR
+    );
+    let state = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        crate::fc_api::FcApiClient::new(socket).get_vm_state(),
+    )
+    .await
+    .map_err(|_| Status::deadline_exceeded("pool VM-state probe timed out"))?
+    .map_err(|e| Status::unavailable(format!("pool VM-state probe failed: {e}")))?;
+    if state != pplx_space_node_runtime_core::fc_api::FirecrackerVmState::Paused {
+        return Err(Status::failed_precondition(
+            "pool VM must be paused before encryption",
+        ));
+    }
+    Ok(())
+}

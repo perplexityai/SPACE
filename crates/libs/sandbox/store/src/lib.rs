@@ -70,6 +70,8 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 pub mod fork_source_lifecycle;
+mod pooled_create;
+pub use pooled_create::{PooledSandboxCreate, insert_pooled};
 
 /// The `sandboxes.metadata` document: caller-supplied labels, untyped by
 /// design. Distinct from the validated `SandboxMetadata` newtype in

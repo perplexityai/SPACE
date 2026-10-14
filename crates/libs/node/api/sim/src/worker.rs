@@ -2051,6 +2051,8 @@ impl WorkerApiInternal for SimWorkerApiInternalService {
             .await
             .map_err(map_state_error)?;
         Ok(Response::new(sbx::AdoptPoolSandboxResponse {
+            claim_id: None,
+            volume_encryption: false,
             sandbox_id: record.sandbox_id,
             route_identity: Some(identity),
         }))

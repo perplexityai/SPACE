@@ -20,6 +20,14 @@ async fn sandbox_baseline_refuses_down_without_changing_shared_jobs_or_history()
     let path = directory.path().join("sandbox.sqlite");
     let database = sqlite_sandbox_manager();
     migrate_sqlite_up(database, &path).await.unwrap();
+    for _ in database.migrator.iter().filter(|migration| {
+        migration.migration_type.is_up_migration()
+            && migration.version > pplx_space_common_svc::sql::baselines::PUBLIC_SQLITE_BASELINE
+    }) {
+        rollback_last_sqlite_database(database, &path, &COMMON_SCHEMA_MIGRATOR)
+            .await
+            .unwrap();
+    }
     let conn = Connection::open(&path).unwrap();
     conn.execute(
         "INSERT INTO jobs (job_id, kind, status) VALUES ('cancelled-witness', 'test', 'cancelled')",

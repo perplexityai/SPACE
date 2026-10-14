@@ -18,6 +18,8 @@ use super::validation::{
 };
 use super::*;
 
+mod encrypted;
+
 pub(super) async fn run_pool_donor_gateway_rollback<IF, IFut, PF, PFut>(
     restore_identity: IF,
     restore_policy: PF,
@@ -167,6 +169,12 @@ impl SandboxManagerService {
         request: Request<AdoptPoolSandboxRequest>,
     ) -> Result<Response<AdoptPoolSandboxResponse>, Status> {
         let peer = self.authorize_peer(&request, "AdoptPoolSandbox", ALLOW_SANDBOX_POOL_ADOPT)?;
+        if request.get_ref().claimed_sandbox.is_some() {
+            let owner = Self::authorize_sandbox_owner_label(&peer, &request.get_ref().owner)?;
+            return self
+                .adopt_claimed_pool_sandbox(request.into_inner(), owner)
+                .await;
+        }
         let req = request.get_ref();
         let template = &req.template;
         let owner = &req.owner;
@@ -382,6 +390,8 @@ impl SandboxManagerService {
 
                 Ok(Response::new(AdoptPoolSandboxResponse {
                     sandbox_id: id.clone(),
+                    claim_id: None,
+                    volume_encryption: false,
                     route_identity: space_api_route_identity_to_wire(
                         &adopted.space_api_route_identity,
                     ),

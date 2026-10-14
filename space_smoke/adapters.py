@@ -892,6 +892,10 @@ class KindHarness:
             raise SmokeConfigurationError(
                 "warm-pool sandbox state output was not recognized"
             )
+        process = re.search(r"firecracker\s*[│┆|]\s*(\d+)\s*[│┆|]", output)
+        if process is None:
+            row = next((line for line in output.splitlines() if "firecracker" in line), "missing row")
+            raise SmokeConfigurationError(f"warm-pool Firecracker PID was not recognized: {row!r}")
         return WarmPoolCandidate(
             sandbox_id,
             pod_name,
@@ -900,6 +904,7 @@ class KindHarness:
             slot_id,
             node_name,
             match.group(1),
+            int(process.group(1)),
         )
 
     def warm_pool_candidate(self, config_id: str) -> WarmPoolCandidate:
@@ -2076,6 +2081,7 @@ ON CONFLICT (key_hash) DO NOTHING;
                     "--grace-period=0",
                     "--force",
                     "--wait=false",
+                    "--ignore-not-found=true",
                     timeout=15,
                     namespace=KIND_SANDBOX_NAMESPACE,
                 ),
@@ -3783,7 +3789,47 @@ ON CONFLICT (key_hash) DO NOTHING;
 
         return self._deployment_env_literals(self._public_api_deployment(), keys)
 
-    def _apply_public_api_env(self, values: Mapping[str, str | None], action: str) -> None:
+    def native_pool_claim_env(self) -> dict[str, dict[str, object] | None]:
+        """Capture provider references as well as literals for exact fixture restoration."""
+        name = self._public_api_deployment()
+        entries = json.loads(_require_ok(
+            self.kubectl("get", "deploy", name, "-o", "jsonpath={.spec.template.spec.containers[0].env}"),
+            "capture native pool claim environment",
+        ))
+        return {
+            key: next((entry for entry in entries if entry.get("name") == key), None)
+            for key in ("SPACE_NATIVE_CREATE_POOL_CLAIM_ENABLED", "EPPO_BASE_URL", "EPPO_SDK_KEY")
+        }
+
+    def set_native_pool_claim_env(self, values: Mapping[str, str | dict[str, object] | None]) -> None:
+        """Set or restore the native admission gate with a caller-owned flag fixture."""
+        self._require_isolated_kind("native pool claim fixture")
+        allowed = {"SPACE_NATIVE_CREATE_POOL_CLAIM_ENABLED", "EPPO_BASE_URL", "EPPO_SDK_KEY"}
+        if set(values) - allowed:
+            raise ValueError("refusing unrelated native pool claim environment")
+        entries = []
+        for key, value in values.items():
+            if isinstance(value, dict):
+                if value.get("name") != key or set(value) - {"name", "value", "valueFrom"}:
+                    raise ValueError("invalid captured environment entry")
+                entries.append({"value": None, "valueFrom": None, **value})
+            elif value is None:
+                entries.append({"name": key, "$patch": "delete"})
+            else:
+                entries.append({"name": key, "value": value, "valueFrom": None})
+        name = self._public_api_deployment()
+        patch = {"spec": {"template": {"spec": {"containers": [
+            {"name": self._public_api_container(name), "env": entries}
+        ]}}}}
+        _require_ok(
+            self.kubectl("patch", "deploy", name, "--type=strategic", "-p", json.dumps(patch), timeout=30),
+            "configure native pool claim fixture",
+        )
+        self.wait_public_api_rollout(timeout=240)
+
+    def _apply_public_api_env(
+        self, values: Mapping[str, str | None], action: str,
+    ) -> None:
         from space_smoke.rate_limiters import LIMITER_ENV_KEYS
 
         unknown = sorted(set(values) - set(LIMITER_ENV_KEYS))

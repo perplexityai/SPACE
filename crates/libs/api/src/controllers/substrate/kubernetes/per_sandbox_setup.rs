@@ -80,10 +80,7 @@ pub(super) struct PerSandboxSetup {
     pub auto_lifecycle: AutoLifecyclePolicy,
     pub network_policy: NetworkPolicySetup,
     pub node_fs: NodeFilesystemSetup,
-    /// BYOK: immutable encrypted-volumes flag for the sandbox. Cold creates
-    /// carry the control plane's create-time stamp; warm-pool adoption is
-    /// always `false` (encrypted creates bypass the pool at the API, and a
-    /// running plaintext pool VM cannot be encrypted at adoption).
+    /// Encryption must be installed before the sandbox is activated.
     pub volume_encryption: bool,
     pub disk_io_limits: DiskIoLimits,
 }
@@ -139,13 +136,6 @@ impl PerSandboxSetup {
         request: &PooledExecutionClaimRequest<'_>,
         claim: &crate::controllers::substrate::PooledExecutionClaim,
     ) -> Self {
-        // Tripwire for the change that lifts the encrypted-create pool bypass:
-        // adoption cannot apply encryption to an already-booted member, so the
-        // re-homing orchestration must replace this hardcoded plaintext setup.
-        debug_assert!(
-            !request.volume_encryption,
-            "encrypted creates must bypass the warm pool until claim-time re-homing exists"
-        );
         Self::resolve(
             request.actor,
             EnvMap::try_from(request.env.clone())
@@ -153,9 +143,7 @@ impl PerSandboxSetup {
             request.auto_lifecycle,
             request.network_policy_override,
             request.template_network_policy,
-            // Pool members are always plaintext; encrypted creates bypass the
-            // pool at the API before a claim is ever attempted.
-            false,
+            request.volume_encryption,
             claim.disk_io_limits,
         )
     }

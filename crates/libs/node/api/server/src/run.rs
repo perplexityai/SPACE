@@ -811,6 +811,12 @@ pub async fn run(
                 );
                 let operation_receipt_capability_task = spawn_sandbox_manager_capability_bridge(
                     pplx_space_sbx_mgr_client::OPERATION_ACTIVATION_RECEIPT_HEALTH_SERVICE,
+                    health_reporter.clone(),
+                    PathBuf::from(pplx_space_sbx_mgr_client::SOCKET_PATH),
+                    shutdown_token.clone(),
+                );
+                let encrypted_pool_capability_task = spawn_sandbox_manager_capability_bridge(
+                    pplx_space_sbx_mgr_client::ENCRYPTED_POOL_ADOPTION_HEALTH_SERVICE,
                     health_reporter,
                     PathBuf::from(pplx_space_sbx_mgr_client::SOCKET_PATH),
                     shutdown_token.clone(),
@@ -857,6 +863,9 @@ pub async fn run(
                     .await;
                 shutdown_token.cancel();
                 let _ = operation_receipt_capability_task.await;
+                if let Err(error) = encrypted_pool_capability_task.await {
+                    tracing::warn!(%error, "encrypted pool capability bridge failed");
+                }
                 if let Err(error) = activation_policy_capability_task.await {
                     tracing::warn!(%error, "activation policy capability bridge failed");
                 }

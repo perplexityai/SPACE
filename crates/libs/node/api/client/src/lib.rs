@@ -563,6 +563,7 @@ impl<'a> WorkerApiInternalClient<'a> {
 
     node_api_internal_unary_methods! {
         wake_sandbox, proto::worker_api_internal_client::WorkerApiInternalClient::new, pplx_space_sbx_mgr_client::proto::WakeRequest, pplx_space_sbx_mgr_client::proto::WakeResponse;
+        adopt_pool_sandbox, proto::worker_api_internal_client::WorkerApiInternalClient::new, pplx_space_sbx_mgr_client::proto::AdoptPoolSandboxRequest, pplx_space_sbx_mgr_client::proto::AdoptPoolSandboxResponse;
     }
 }
 

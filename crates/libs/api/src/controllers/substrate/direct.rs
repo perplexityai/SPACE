@@ -2931,6 +2931,7 @@ impl DirectSubstrate {
                             autostart: one_shot_create,
                             pool_template: None,
                             volume_encryption: request.volume_encryption,
+                            encryptable_pool_member: false,
                             boot_mode,
                             blocking: one_shot_create,
                             sandbox_id: Some(sandbox_id.to_string()),
@@ -3175,6 +3176,7 @@ impl SubstrateAdapter for DirectSubstrate {
             let mut client = runtime.internal_client();
             let response = client
                 .adopt_pool_sandbox(pplx_space_sbx_mgr_client::proto::AdoptPoolSandboxRequest {
+                    claimed_sandbox: None,
                     template: request.template.to_string(),
                     owner: request.actor.sandbox_owner.to_string(),
                     env: request

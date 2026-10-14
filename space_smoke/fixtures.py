@@ -2525,6 +2525,7 @@ class KindEcw(Ecw):
             and before.pod_uid == after.pod_uid
             and before.config_id == after.config_id
             and before.slot_id == after.slot_id
+            and before.vm_pid == after.vm_pid
         )
         self.verify(
             claimed_started_member,
@@ -2537,6 +2538,8 @@ class KindEcw(Ecw):
             warm_pool_node=before.node_name,
             preclaim_sandbox_state=before.state,
             claimed_pod_state=after.state,
+            preclaim_vm_pid=before.vm_pid,
+            claimed_vm_pid=after.vm_pid,
         )
 
     _retention_control: ClusterRetentionControl | None = None

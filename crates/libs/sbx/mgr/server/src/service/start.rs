@@ -1484,6 +1484,7 @@ impl SandboxManagerService {
         identity_free_direct_authority: IdentityFreeDirectActivationAuthority,
     ) -> Result<Response<StartResponse>, Status> {
         let sandbox_id = &req.sandbox_id;
+        self.require_completed_pool_adoption(sandbox_id)?;
         let mut start_ctx = StartSandboxContext::from_request(&req)?;
         start_ctx.identity_free_direct_authority = identity_free_direct_authority;
         let req_vcpu = start_ctx.req_vcpu;
@@ -2166,76 +2167,32 @@ impl SandboxManagerService {
                     return Err(status);
                 }
             }
-        } else if crate::rootfs_encryption::pool_plain_cow_exists(id) {
-            // Warm-pool member: boot on the dm-snapshot composite over a
-            // plaintext COW so a later claim can re-home that COW onto an
-            // org-keyed LUKS one without cold-creating. A surviving cow.plain
-            // selects this arm regardless of pool_template — a claimed member
-            // (pool_template cleared at claim) must keep riding the COW that
-            // holds its writes, and prepare re-opens a persisted store
-            // idempotently.
-            //
-            // Failing closed on every error would strand a member that is
-            // still perfectly usable on the plaintext file, so a preparation
-            // failure degrades to it — but ONLY when the failure proves no
-            // device stack can survive node-side AND the sandbox has no
-            // committed COW state to abandon. Booting the file over a live
-            // composite mutates the composite's read-only origin underneath
-            // it; booting it past an existing COW (cow.plain, or cow.luks
-            // from an unstamped re-home) silently rolls back every write the
-            // guest made through it.
-            match crate::rootfs_encryption::prepare_snapshot_rootfs(
+        } else if self.is_encryptable_pool_member(id)? {
+            // Keep an immutable reflink for claim-time delta capture. Firecracker
+            // still boots the ordinary rootfs file; plaintext claims keep it.
+            if let Err(error) = crate::rootfs_encryption::prepare_snapshot_rootfs(
                 id,
                 execution_fence,
                 &self.node_manager,
             )
-            .instrument(tracing::info_span!(
-                "sbxmgr.start.pool_snapshot_rootfs_prepare",
-                sandbox_id = %id
-            ))
             .await
             {
-                Ok(path) => Some(path),
-                Err(e)
-                    if e.degrade_to_rootfs_file_is_safe()
-                        && !crate::rootfs_encryption::committed_cow_state_exists(id) =>
-                {
-                    tracing::warn!(
-                        sandbox_id = %id,
-                        error = %e,
-                        "pool snapshot rootfs preparation failed; booting on the template file"
-                    );
-                    None
-                }
-                Err(e) => {
-                    settle_net_gateway_launch_task(
-                        netgtw_task,
-                        id,
-                        "pool-snapshot-rootfs-prepare-failed",
-                    )
-                    .await;
-                    let reason = format!(
-                        "pool snapshot rootfs preparation failed and the rootfs file is not \
-                         safe to boot (possible surviving composite or committed COW state): {e}"
-                    );
-                    activation_cleanup.cleanup_after_failure(
-                        ActivationFailureStage::ColdPrepare.reason_code(),
-                        reason.clone(),
-                    );
-                    return Err(Status::internal(reason));
-                }
+                settle_net_gateway_launch_task(netgtw_task, id, "pool-origin-prepare-failed").await;
+                let reason = format!("prepare warm rootfs origin: {error}");
+                activation_cleanup.cleanup_after_failure(
+                    ActivationFailureStage::ColdPrepare.reason_code(),
+                    reason.clone(),
+                );
+                return Err(Status::internal(reason));
             }
-        } else if crate::rootfs_encryption::rehomed_encrypted_cow_exists(id) {
-            // A committed claim-time re-home whose volume_encryption stamp
-            // has not landed: the guest's writes live in cow.luks, and only
-            // the encrypted arm knows how to boot them. Booting the bare
-            // rootfs file here would orphan those writes AND mutate the
-            // origin the encrypted COW's exception store references. Fail
-            // closed until the claim path stamps the row.
-            settle_net_gateway_launch_task(netgtw_task, id, "unstamped-rehomed-cow").await;
+            None
+        } else if crate::rootfs_encryption::committed_cow_state_exists(id) {
+            // An incomplete switch or an older COW layout cannot boot the bare
+            // origin: it omits writes and may still back a live snapshot target.
+            settle_net_gateway_launch_task(netgtw_task, id, "uncommitted-pool-disk").await;
             let reason = format!(
-                "sandbox {id} carries an encrypted rootfs COW but is not stamped \
-                 volume_encryption; refusing to boot the plaintext rootfs file over it"
+                "sandbox {id} carries pool disk adoption state without volume_encryption; \
+                 refusing to boot the plaintext origin"
             );
             activation_cleanup.cleanup_after_failure(
                 ActivationFailureStage::ColdPrepare.reason_code(),

@@ -2194,12 +2194,7 @@ async fn postgres_terminal_pooled_prepare_failure_transfers_claim_to_cleanup() -
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn postgres_byok_org_bypasses_warm_pool_and_cold_creates() -> TestResult {
-    // A BYOK org must cold-create with an encrypted rootfs: a running warm
-    // pool VM is already on a plaintext rootfs and dm-crypt is set up
-    // pre-boot, so it cannot be encrypted at adoption. Even with a claimable,
-    // prepare-ready pool slot, the create must bypass the pool entirely and
-    // fall through to the cold path (Ok(None)), never touching the pool.
+async fn postgres_encrypted_create_can_adopt_an_encryptable_pool() -> TestResult {
     let db = pg_test_db().await?;
     let actor = insert_actor(&db.pool).await?;
     let node_id = NodeId::new();
@@ -2230,17 +2225,16 @@ async fn postgres_byok_org_bypasses_warm_pool_and_cold_creates() -> TestResult {
     sqlx::query(sql!(
         "INSERT INTO kubernetes_pool_configs (
              id, template_release_id, vcpu, memory_mib, target_ready_slots,
-             refill_per_tick, max_warming_slots, namespace, enabled
+             refill_per_tick, max_warming_slots, namespace, enabled, encryptable
          )
-         VALUES ($1, $2, 4, 2048, 3, 1, 1, 'space', true)"
+         VALUES ($1, $2, 4, 2048, 3, 1, 1, 'space', true, true)"
     ))
     .bind(pool_config_id)
     .bind(release_id)
     .execute(&db.pool)
     .await?;
 
-    // A ready claim with a successful prepare is available, so a non-BYOK
-    // create here would adopt the pool slot. The BYOK org must not.
+    // This substrate supplies an encryptable claim and acknowledges setup.
     let substrate = RetryingPoolSubstrate::new(
         db.pool.clone(),
         pool_config_id,
@@ -2260,15 +2254,15 @@ async fn postgres_byok_org_bypasses_warm_pool_and_cold_creates() -> TestResult {
     )
     .await?;
 
-    assert!(
-        response.response.is_none(),
-        "BYOK org must cold-create, not adopt a plaintext warm-pool sandbox"
-    );
-    assert_eq!(
-        substrate.claim_calls(),
-        0,
-        "BYOK org must not touch the warm pool"
-    );
+    assert!(response.response.is_some());
+    assert_eq!(substrate.claim_calls(), 1);
+    let encrypted: bool = sqlx::query_scalar(sql!(
+        "SELECT volume_encryption FROM sandboxes WHERE id = $1"
+    ))
+    .bind(sandbox_id)
+    .fetch_one(&db.pool)
+    .await?;
+    assert!(encrypted);
 
     Ok(())
 }
@@ -2470,47 +2464,52 @@ impl AdmittedCreateFixture {
 
 #[tokio::test(flavor = "current_thread")]
 async fn postgres_admitted_pool_claim_adopts_the_claimed_slot_under_its_id() -> TestResult {
-    let fixture = AdmittedCreateFixture::new().await?;
-    let admitted = fixture.admitted();
-    let substrate = fixture
-        .substrate()
-        .with_admitted_lookup(AdmittedPoolClaimLookup::Adoptable {
-            claim: Box::new(fixture.claim(admitted)),
-            pool_shape: PooledExecutionPoolShape::new(4, 2048, Default::default()),
-        });
+    for encrypted in [false, true] {
+        let fixture = AdmittedCreateFixture::new().await?;
+        let admitted = fixture.admitted();
+        let substrate =
+            fixture
+                .substrate()
+                .with_admitted_lookup(AdmittedPoolClaimLookup::Adoptable {
+                    claim: Box::new(fixture.claim(admitted)),
+                    pool_shape: PooledExecutionPoolShape::new(4, 2048, Default::default()),
+                });
 
-    let result = fixture.run(&substrate, admitted, false).await?;
+        let result = fixture.run(&substrate, admitted, encrypted).await?;
 
-    let response = result
-        .response
-        .expect("an adoptable admitted slot is adopted");
-    assert_eq!(response.id, fixture.sandbox_id);
-    assert_eq!(substrate.admitted_lookup_calls(), 1);
-    assert_eq!(
-        substrate.claim_calls(),
-        0,
-        "an admitted create must never claim a different slot"
-    );
-    assert_eq!(
-        substrate.prepare_wait_until_ready(),
-        vec![true],
-        "adoption waits for readiness even when the request does not"
-    );
-    let (lifecycle, active_node_id): (String, Option<NodeId>) = sqlx::query_as(sql!(
-        "SELECT lifecycle, active_node_id FROM sandboxes WHERE id = $1"
-    ))
-    .bind(fixture.sandbox_id)
-    .fetch_one(&fixture.db.pool)
-    .await?;
-    assert_eq!(lifecycle, "started");
-    assert_eq!(active_node_id, Some(fixture.node_id));
-    let executions: Vec<(i64, bool)> = sqlx::query_as(sql!(
-        "SELECT generation, active FROM sandbox_k8s_executions WHERE sandbox_id = $1"
-    ))
-    .bind(fixture.sandbox_id)
-    .fetch_all(&fixture.db.pool)
-    .await?;
-    assert_eq!(executions, vec![(1, true)]);
+        let response = result
+            .response
+            .expect("an adoptable admitted slot is adopted");
+        assert_eq!(response.id, fixture.sandbox_id);
+        assert_eq!(substrate.admitted_lookup_calls(), 1);
+        assert_eq!(
+            substrate.claim_calls(),
+            0,
+            "an admitted create must never claim a different slot"
+        );
+        assert_eq!(
+            substrate.prepare_wait_until_ready(),
+            vec![true],
+            "adoption waits for readiness even when the request does not"
+        );
+        let (lifecycle, active_node_id, volume_encryption): (String, Option<NodeId>, bool) =
+            sqlx::query_as(sql!(
+                "SELECT lifecycle, active_node_id, volume_encryption FROM sandboxes WHERE id = $1"
+            ))
+            .bind(fixture.sandbox_id)
+            .fetch_one(&fixture.db.pool)
+            .await?;
+        assert_eq!(lifecycle, "started");
+        assert_eq!(volume_encryption, encrypted);
+        assert_eq!(active_node_id, Some(fixture.node_id));
+        let executions: Vec<(i64, bool)> = sqlx::query_as(sql!(
+            "SELECT generation, active FROM sandbox_k8s_executions WHERE sandbox_id = $1"
+        ))
+        .bind(fixture.sandbox_id)
+        .fetch_all(&fixture.db.pool)
+        .await?;
+        assert_eq!(executions, vec![(1, true)]);
+    }
 
     Ok(())
 }
@@ -2561,20 +2560,21 @@ async fn postgres_admitted_pool_claim_waits_while_a_slot_holds_the_id() -> TestR
 
 #[tokio::test(flavor = "current_thread")]
 async fn postgres_admitted_pool_claim_releases_a_slot_it_may_not_adopt() -> TestResult {
-    // An encrypted create can never adopt a plaintext warm member. The slot
-    // is given back to the pool for collection rather than adopted, and the
-    // create waits for it before building cold.
+    // An admitted claim naming a different sandbox must be retired before
+    // the create builds cold under its already published ID.
     let fixture = AdmittedCreateFixture::new().await?;
     let admitted = fixture.admitted();
+    let mut mismatched = fixture.claim(admitted);
+    mismatched.sandbox_id = SandboxId::new();
     let substrate = fixture
         .substrate()
         .with_admitted_lookup(AdmittedPoolClaimLookup::Adoptable {
-            claim: Box::new(fixture.claim(admitted)),
+            claim: Box::new(mismatched),
             pool_shape: PooledExecutionPoolShape::new(4, 2048, Default::default()),
         });
 
     let error = match fixture.run(&substrate, admitted, true).await {
-        Ok(_) => panic!("an encrypted create must not adopt"),
+        Ok(_) => panic!("a mismatched sandbox must not be adopted"),
         Err(error) => error,
     };
 

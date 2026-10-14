@@ -140,6 +140,7 @@ runpy.run_module("space_smoke", run_name="__main__")
                 "local.deferred_btrfs_send_capture_restores_cross_node",
                 "local.ecw_template_build_from_oci_boots",
                 "local.encrypted_resuspend_preserves_cow",
+                "local.encrypted_warm_pool",
                 "local.forced_drain_evacuates_sandbox",
                 "local.gentle_drain_leaves_sandbox_resident",
                 "local.node_ctl_fence_refuses_and_reconciles",

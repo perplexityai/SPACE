@@ -143,6 +143,16 @@ impl FcApiClient {
             .await
     }
 
+    /// Replace a live drive's backing file without replacing the guest device.
+    pub async fn update_drive_path(&self, drive_id: &str, path: &str) -> Result<(), FcApiError> {
+        self.request(
+            "PATCH",
+            &format!("/drives/{drive_id}"),
+            &serde_json::json!({"drive_id": drive_id, "path_on_host": path}),
+        )
+        .await
+    }
+
     /// Query the VM state.
     pub async fn get_vm_state(&self) -> Result<FirecrackerVmState, FcApiError> {
         let v = self.get_json("/").await?;

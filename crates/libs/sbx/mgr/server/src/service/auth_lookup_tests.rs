@@ -70,7 +70,7 @@ fn fixture_with_claims(
     )
     .unwrap();
     let service = SandboxManagerService::new_with_options(
-        rusqlite::Connection::open_in_memory().unwrap(),
+        crate::db::test_conn(),
         SandboxManagerServiceOptions {
             route_ed25519_verification_bundle: Some(Arc::new(bundle)),
             ..SandboxManagerServiceOptions::for_test()
@@ -79,6 +79,31 @@ fn fixture_with_claims(
     let mut request = tonic::Request::new(());
     insert_space_api_route_ed25519_token(request.metadata_mut(), &token).unwrap();
     (service, sandbox_id, identity, request)
+}
+
+#[tokio::test]
+async fn encrypted_pool_member_refuses_guest_routes_before_adoption() {
+    if !crate::service::tests::enter_route_test_process(&[]) {
+        return;
+    }
+    let (service, sandbox_id, _, request) = fixture();
+    let id = sandbox_id.to_string();
+    {
+        let db = service.db_conn().unwrap();
+        crate::service::tests::service_tests::insert_test_sandbox(&db, &id, SandboxState::Started);
+        crate::db::pool_adoption::register(&db, &id).unwrap();
+    }
+
+    let error = service
+        .prepare_space_api_bridge(&request, &id, SpacedRpc::PingGuest)
+        .expect_err("an unadopted pool member must refuse a valid guest route");
+
+    assert_eq!(error.code(), Code::FailedPrecondition);
+    assert!(
+        error
+            .message()
+            .contains("encrypted pool adoption must complete")
+    );
 }
 
 #[tokio::test]

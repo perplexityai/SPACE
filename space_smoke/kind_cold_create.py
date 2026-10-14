@@ -116,7 +116,7 @@ class KindColdCreateSetup:
             rows = [
                 row
                 for row in self.admin("GET", "warm-pools")
-                if row["template_release_id"] == release["id"]
+                if row["template_release_id"] == release["id"] and row.get("encryptable") is not True
             ]
             _seal(
                 directory / f"inventory-{uuid.uuid4().hex}.json",

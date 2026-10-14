@@ -718,6 +718,78 @@ pub(crate) mod service_tests {
     }
 
     #[tokio::test]
+    async fn pool_adoption_completes_plain_claims_and_replays_completed_claims() {
+        for (encrypted, completed) in [(false, false), (false, true), (true, true)] {
+            let conn = crate::db::test_conn();
+            let id = SandboxId::new().to_string();
+            let claim = uuid::Uuid::now_v7();
+            let org = pplx_space_common_core::types::OrgId::new();
+            let claim_receipt = crate::db::pool_adoption::PoolClaim {
+                id: claim,
+                org_id: org,
+                volume_encryption: encrypted,
+            };
+            let mut request = pool_adoption_request(None);
+            let owner = SandboxOwner::parse(request.owner.clone()).unwrap();
+            insert_test_sandbox(&conn, &id, SandboxState::Paused);
+            crate::db::update_user(
+                &conn,
+                &id,
+                &pplx_space_common_core::types::ROOT_SANDBOX_OWNER,
+            )
+            .unwrap();
+            crate::db::pool_adoption::register(&conn, &id).unwrap();
+            if completed {
+                assert!(
+                    crate::db::pool_adoption::begin(
+                        &conn,
+                        &id,
+                        claim_receipt,
+                        &owner,
+                        &BTreeMap::new()
+                    )
+                    .unwrap()
+                );
+                assert!(crate::db::pool_adoption::complete(&conn, &id, claim_receipt).unwrap());
+                crate::db::update_state(&conn, &id, SandboxState::Started)
+                    .unwrap()
+                    .require_applied()
+                    .unwrap();
+            }
+            request.content_hash = Some("hash".to_string());
+            request.claimed_sandbox = Some(crate::proto::ClaimedPoolSandbox {
+                sandbox_id: id.clone(),
+                claim_id: claim.to_string(),
+                expected_org_id: org.to_string(),
+                volume_encryption: encrypted,
+            });
+            let service = service_for_teardown_test(conn);
+
+            let response = service
+                .adopt_pool_sandbox(internal_request(request))
+                .await
+                .unwrap()
+                .into_inner();
+
+            assert_eq!(response.sandbox_id, id);
+            assert_eq!(response.claim_id, Some(claim.to_string()));
+            assert_eq!(response.volume_encryption, encrypted);
+            assert!(
+                !crate::db::pool_adoption::guest_access_blocked(&service.db.lock().unwrap(), &id)
+                    .unwrap()
+            );
+            assert_eq!(
+                service.lookup_sandbox(&id).unwrap().state,
+                if completed {
+                    SandboxState::Started
+                } else {
+                    SandboxState::Paused
+                }
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn pool_adoption_persists_complete_direct_route_identity() {
         let conn = crate::db::test_conn();
         let sandbox_id = SandboxId::new();

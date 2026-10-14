@@ -320,26 +320,10 @@ service NodeManager {
   rpc ReleaseEncryptedVolume(ReleaseEncryptedVolumeRequest)
       returns (ReleaseEncryptedVolumeResponse);
 
-  // Bring up the same dm-snapshot composite as PrepareEncryptedRootfs but
-  // with a PLAINTEXT COW: the shape a warm-pool member boots on before it
-  // has an owner. No org exists at fill time, so no DEK can be issued and
-  // no LUKS container can be formatted; the composite still routes every
-  // guest write to the COW, which is what lets the COW be re-homed onto an
-  // encrypted one at claim without touching the booted guest's rootfs.
-  //
-  // Idempotent: a live composite is handed back as-is, and a stop→start
-  // re-opens the persisted COW (detected by its dm-snapshot store header)
-  // rather than re-initializing it. Any mid-build failure unwinds the
-  // devices it created; `cow.plain` survives on disk only once its store
-  // has been activated, so its presence means "this member has committed
-  // COW state".
-  //
-  // A member that is claimed by a non-BYOK org keeps this COW — and until
-  // the claim path collapses or re-homes it, such a sandbox cannot
-  // suspend or snapshot: the plaintext artifact set captures only the
-  // origin file, so capturing a composite-backed sandbox would silently
-  // drop every write in the COW. sbx-mgr enforces that as a
-  // FAILED_PRECONDITION veto keyed on `cow.plain`'s presence.
+  // Retain a pre-boot reflink for later claim-time encryption. The warm VM
+  // boots the ordinary rootfs file without a device-mapper stack. Plaintext
+  // claims retain this origin until sandbox cleanup; encrypted adoption switches
+  // the paused VM's drive through PrepareEncryptedRootfs.
   rpc PrepareSnapshotRootfs(PrepareSnapshotRootfsRequest)
       returns (PrepareSnapshotRootfsResponse);
 
@@ -1176,11 +1160,19 @@ message PrepareEncryptedRootfsRequest {
   // fresh create and on a same-node restore (the COW was kept in place).
   optional string restore_cow_source = 2;
   ExecutionFence execution_fence = 3;
+  // Convert a paused pool member's disk; mutually exclusive with restore.
+  optional PoolRootfsAdoption pool_adoption = 4;
+}
+
+message PoolRootfsAdoption {
+  string claim_id = 1;
+  string expected_org_id = 2;
 }
 
 message PrepareEncryptedRootfsResponse {
   // /dev/mapper/<composite> for Firecracker path_on_host.
   string mapper_path = 1;
+  optional string adopted_claim_id = 2;
 }
 
 message PrepareSnapshotRootfsRequest {
@@ -1189,8 +1181,7 @@ message PrepareSnapshotRootfsRequest {
 }
 
 message PrepareSnapshotRootfsResponse {
-  // /dev/mapper/<composite> for Firecracker path_on_host — the same shape
-  // PrepareEncryptedRootfs returns, so the caller's boot path is identical.
+  // Legacy field name: the ordinary rootfs path, not a block device.
   string mapper_path = 1;
 }
 

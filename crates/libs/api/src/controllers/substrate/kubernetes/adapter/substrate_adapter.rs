@@ -2687,6 +2687,7 @@ impl SubstrateAdapter for KubernetesSubstrate {
         self.apply_adopted_per_sandbox_setup(
             &mut node_api,
             claim,
+            request.template,
             setup,
             network_policy_generation,
         )

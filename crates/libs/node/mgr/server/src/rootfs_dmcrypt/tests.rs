@@ -91,25 +91,6 @@ fn snapshot_table_is_well_formed() {
     );
 }
 
-/// Stop→start regression: an existing `cow.plain` whose store the kernel has
-/// activated must read as initialized (open, don't zero), while every
-/// never-activated shape — zeros, garbage, short — must read as fresh.
-/// Re-zeroing an activated store orphans every remapped chunk and silently
-/// reverts the guest to the template.
-#[test]
-fn snapshot_store_magic_separates_open_from_initialize() {
-    // The kernel writes SNAP_MAGIC 0x70416e53 little-endian: "SnAp" on disk.
-    assert!(has_persistent_snapshot_store(b"SnAp\x01\x00\x00\x00"));
-    assert!(has_persistent_snapshot_store(&0x70416e53u32.to_le_bytes()));
-
-    // A fresh truncate reads as zeros; a recycled file as garbage; a crash
-    // between truncate and activation as a short/empty file. All fresh.
-    assert!(!has_persistent_snapshot_store(&[0u8; 4096]));
-    assert!(!has_persistent_snapshot_store(b"LUKS\xba\xbe"));
-    assert!(!has_persistent_snapshot_store(b"Sn"));
-    assert!(!has_persistent_snapshot_store(b""));
-}
-
 /// The freeze/recovery invariant: every command from suspend through resume
 /// runs on a bounded runner that KILLS a wedged child — otherwise one wedged
 /// invocation holds the per-sandbox device lock and leaves guest I/O frozen

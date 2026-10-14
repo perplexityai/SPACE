@@ -69,6 +69,7 @@ mod eviction;
 mod local_artifacts;
 mod network_policy;
 mod pool;
+pub(crate) mod pool_adoption;
 mod quarantine;
 mod quarantine_recovery;
 mod restore_transfer_scopes;

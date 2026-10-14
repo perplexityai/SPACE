@@ -509,6 +509,7 @@ fn build_vm_create_request(
         autostart: false,
         pool_template: None,
         volume_encryption: false,
+        encryptable_pool_member: false,
         boot_mode: 1, // BOOT_MODE_COLD: build sandboxes mutate and resize disk state.
         blocking: false,
         sandbox_id: None,

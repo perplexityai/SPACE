@@ -7,12 +7,9 @@
 //! encrypted-path failure is a HARD error: silently booting a BYOK-mandated
 //! sandbox on a plaintext rootfs would be an at-rest breach.
 //!
-//! The warm-pool member shape below is different: it is a *device-shape*
-//! choice for plaintext sandboxes (a composite whose COW a claim can later
-//! re-home), not an encryption decision, so its failures degrade to the
-//! plaintext rootfs file — but only when [`PoolRootfsPrepareError`] proves the
-//! file is safe to boot (see `degrade_to_rootfs_file_is_safe`) and the
-//! sandbox has no committed COW state to abandon.
+//! Warm-pool members retain a pre-boot reflink but keep writing their ordinary
+//! rootfs file. BYOK adoption captures the difference and switches the live
+//! Firecracker drive to its encrypted device before guest access is enabled.
 
 /// Prepare the encrypted rootfs device for an encrypted sandbox. Returns the
 /// mapper path to thread into `LaunchSandboxRequest.rootfs_block_device_path`.
@@ -61,6 +58,7 @@ pub(crate) async fn prepare_encrypted_rootfs(
                 execution_fence: Some(execution_fence.into()),
                 sandbox_id: sandbox_id.to_string(),
                 restore_cow_source: restore_cow_source.map(str::to_string),
+                pool_adoption: None,
             },
         )
         .await
@@ -69,11 +67,8 @@ pub(crate) async fn prepare_encrypted_rootfs(
     Ok(prepared.mapper_path)
 }
 
-/// Backing file name of a member's plaintext COW inside `instance/`. Owned by
-/// node-manager (`rootfs_dmcrypt::POOL_COW_FILE`); duplicated here because
-/// sbx-mgr only ever stats it. Presence contract: node-manager guarantees the
-/// file survives on disk only once its exception store has been activated, so
-/// its presence means guest writes live in the COW and ONLY in the COW.
+/// Earlier pool layouts kept writes outside the ordinary rootfs. Their
+/// plaintext COW must still prevent a capture that would lose those writes.
 const POOL_COW_FILE: &str = "cow.plain";
 
 /// Name of the encrypted rootfs COW inside `instance/`. Owned by node-manager
@@ -91,12 +86,7 @@ fn instance_file_exists(sandbox_id: &str, name: &str) -> bool {
         .exists()
 }
 
-/// Whether the sandbox has a committed plaintext pool COW on disk. Per the
-/// [`POOL_COW_FILE`] presence contract, a surviving `cow.plain` means guest
-/// writes live in the COW and only there. Besides guarding against plaintext
-/// capture and file boots, this re-selects the composite shape on restart
-/// regardless of pool_template: a claimed member (pool_template cleared)
-/// must keep riding the COW that holds its writes.
+/// Reject plaintext capture of members left by the earlier pool disk layout.
 pub(crate) fn pool_plain_cow_exists(sandbox_id: &str) -> bool {
     instance_file_exists(sandbox_id, POOL_COW_FILE)
 }
@@ -110,70 +100,23 @@ pub(crate) fn rehomed_encrypted_cow_exists(sandbox_id: &str) -> bool {
     instance_file_exists(sandbox_id, REHOMED_COW_FILE)
 }
 
-/// Committed COW state that plaintext handling would silently abandon:
-/// booting the bare rootfs file, or capturing a plaintext-format snapshot,
-/// reads only the origin — the guest's writes live in whichever COW exists
-/// (`cow.plain` pre-claim, `cow.luks` after an unstamped re-home) and would
-/// be rolled back.
+/// A partial drive switch retains the old file under pool-rootfs.ext4. Capturing
+/// only the new canonical origin would silently drop the warm VM's writes.
 pub(crate) fn committed_cow_state_exists(sandbox_id: &str) -> bool {
-    pool_plain_cow_exists(sandbox_id) || rehomed_encrypted_cow_exists(sandbox_id)
+    pool_plain_cow_exists(sandbox_id)
+        || rehomed_encrypted_cow_exists(sandbox_id)
+        || instance_file_exists(sandbox_id, "pool-rootfs.ext4")
 }
 
-/// A pool-rootfs prepare failure, split by what it implies about node-side
-/// state: the degrade decision in the start path must not boot the bare
-/// rootfs file while a device stack may exist underneath it.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum PoolRootfsPrepareError {
-    /// node-manager was never reached; nothing can have been built.
     #[error("node-manager connect for snapshot rootfs: {0}")]
     Connect(#[from] pplx_space_node_mgr_client::ConnectError),
-    /// node-manager answered the RPC (or the transport failed after it was
-    /// sent — see `degrade_to_rootfs_file_is_safe`).
     #[error("node-manager PrepareSnapshotRootfs ({code:?}): {message}", code = .0.code(), message = .0.message())]
     Rpc(tonic::Status),
 }
 
-impl PoolRootfsPrepareError {
-    /// Whether booting the sandbox on the bare rootfs file is safe after this
-    /// failure. Safe only when node-manager was never reached or answered
-    /// with a verdict it reaches BEFORE touching devices (or after a
-    /// guaranteed unwind of them). Two classes stay unsafe:
-    /// - transport-class failures (deadline, connection reset, cancellation)
-    ///   may hide a prepare that SUCCEEDED node-side;
-    /// - `Internal` means a command/IO failure whose best-effort unwind may
-    ///   itself have failed, or a panicked preparation task with no unwind
-    ///   at all — devices may survive.
-    ///
-    /// Booting the file over a surviving composite mutates its read-only
-    /// origin, and the next start reuses an exception store that no longer
-    /// matches it — silent rootfs corruption. Fail the start instead; the
-    /// fill retries and the prepare is idempotent. (The caller additionally
-    /// refuses to degrade whenever committed COW state is on disk; this
-    /// classification is the belt for states that check cannot see.)
-    pub(crate) fn degrade_to_rootfs_file_is_safe(&self) -> bool {
-        match self {
-            Self::Connect(_) => true,
-            Self::Rpc(status) => matches!(
-                status.code(),
-                tonic::Code::InvalidArgument
-                    | tonic::Code::FailedPrecondition
-                    | tonic::Code::ResourceExhausted
-                    | tonic::Code::Unimplemented
-                    | tonic::Code::PermissionDenied
-                    | tonic::Code::Unauthenticated
-                    | tonic::Code::NotFound
-            ),
-        }
-    }
-}
-
-/// Prepare the warm-pool member rootfs: the same dm-snapshot composite the
-/// encrypted path builds, but over a plaintext COW.
-///
-/// No DEK is involved — a member has no owner yet, so there is no org key to
-/// format one with. The point of the shape is that every guest write lands in
-/// the COW, which is what lets a claim swap the COW for a LUKS one under the
-/// running guest instead of having to cold-create an encrypted sandbox.
+/// Retain the pre-boot reflink used to reconstruct a warm VM's disk changes.
 pub(crate) async fn prepare_snapshot_rootfs(
     sandbox_id: &str,
     execution_fence: pplx_space_node_mgr_client::execution_fence::ExecutionFence,

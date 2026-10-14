@@ -283,6 +283,14 @@ impl SandboxManagerService {
             default_network_policy_authority,
         } = args;
         let template = &req.template;
+        if req.encryptable_pool_member
+            && (req.volume_encryption
+                || sandbox_owner != &pplx_space_common_core::types::ROOT_SANDBOX_OWNER)
+        {
+            return Err(Status::invalid_argument(
+                "encryptable pool members must be unencrypted and root-owned",
+            ));
+        }
         let runtime = &req.runtime;
         let sandbox_id = SandboxId::from_str(&id)
             .map_err(|e| Status::invalid_argument(format!("invalid sandbox id: {e}")))?;
@@ -393,6 +401,11 @@ impl SandboxManagerService {
                 open_route_activation.as_ref(),
             )
             .map_err(|e| Status::internal(format!("db insert failed: {e}")))?;
+            if req.encryptable_pool_member {
+                crate::db::pool_adoption::register(&db, &id).map_err(|e| {
+                    Status::internal(format!("register encryptable pool member: {e}"))
+                })?;
+            }
         }
         let create_cleanup = self.activation_cleanup_guard(
             &id,

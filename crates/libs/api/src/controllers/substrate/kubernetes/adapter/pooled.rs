@@ -181,10 +181,10 @@ impl KubernetesSubstrate {
         &self,
         client: &mut NodeApiClient,
         claim: &PooledExecutionClaim,
+        template: &str,
         setup: PerSandboxSetup,
         network_policy_generation: u64,
     ) -> Result<(), ControllerError> {
-        let mut client = RetryingWorkerApiClient::new(client);
         let sandbox_id = claim.sandbox_id;
         let PerSandboxSetup {
             sandbox_owner,
@@ -194,10 +194,7 @@ impl KubernetesSubstrate {
             auto_lifecycle,
             network_policy,
             node_fs,
-            // Always false for adoption (pool members are plaintext by
-            // construction and encrypted creates bypass the pool); nothing to
-            // apply to the already-booted pod.
-            volume_encryption: _,
+            volume_encryption,
             disk_io_limits: _,
         } = setup;
         // The pool pod's user_id/org_id annotations carry the pool's identity;
@@ -221,50 +218,100 @@ impl KubernetesSubstrate {
         // to the adopter and replace process env before wake.
         let env_count = process_env.as_map().len();
         let process_env = std::collections::HashMap::<String, String>::from(process_env);
-        client
-            .update_sandbox(
-                pplx_space_sbx_mgr_client::proto::UpdateRequest {
-                    sandbox_id: claim.sandbox_id.to_string(),
-                    vcpu: None,
-                    memory_mib: None,
-                    pids_max: None,
-                    expected_current_owner: Some(
-                        pplx_space_common_core::types::ROOT_SANDBOX_OWNER
-                            .as_str()
-                            .to_string(),
-                    ),
-                    owner: Some(sandbox_owner.as_str().to_string()),
-                    process_env,
-                    replace_process_env: true,
-                },
+        let supported = client
+            .health_service_serving(
+                pplx_space_sbx_mgr_client::ENCRYPTED_POOL_ADOPTION_HEALTH_SERVICE,
                 WARM_POOL_SETUP_RPC_TIMEOUT,
             )
-            .instrument(tracing::info_span!(
-                "substrate.k8s.pool.update_sandbox_metadata.client",
-                sandbox_id = %sandbox_id,
-                env_count,
-            ))
             .await
-            .map_err(|err| {
-                if err.code() == Code::FailedPrecondition {
-                    ControllerError::conflict(format!(
-                        "pooled sandbox metadata update failed: {err}"
-                    ))
-                } else if pooled_metadata_update_error_is_reclaimable(&err) {
-                    ControllerError::service_unavailable(format!(
-                        "pooled sandbox metadata update failed: {err}"
-                    ))
-                } else if err.code() == Code::Cancelled {
-                    ControllerError::new(
-                        axum::http::StatusCode::REQUEST_TIMEOUT,
-                        format!("pooled sandbox metadata update failed: {err}"),
-                    )
-                } else {
-                    ControllerError::internal(format!(
-                        "pooled sandbox metadata update failed: {err}"
-                    ))
-                }
+            .map_err(|e| {
+                ControllerError::service_unavailable(format!("encrypted pool capability: {e}"))
             })?;
+        if volume_encryption && !supported {
+            return Err(ControllerError::service_unavailable(
+                "worker cannot adopt encrypted pool members",
+            ));
+        }
+        if supported {
+            let mut internal = RetryingWorkerApiInternalClient::new(client);
+            let response = internal
+                .adopt_pool_sandbox(
+                    pplx_space_sbx_mgr_client::proto::AdoptPoolSandboxRequest {
+                        template: template.to_string(),
+                        owner: sandbox_owner.to_string(),
+                        content_hash: Some(claim.content_hash.clone()),
+                        env: process_env.clone(),
+                        claimed_sandbox: Some(
+                            pplx_space_sbx_mgr_client::proto::ClaimedPoolSandbox {
+                                sandbox_id: sandbox_id.to_string(),
+                                claim_id: claim.claim_id.to_string(),
+                                expected_org_id: org_id.to_string(),
+                                volume_encryption,
+                            },
+                        ),
+                        ..Default::default()
+                    },
+                    WARM_POOL_SETUP_RPC_TIMEOUT,
+                )
+                .await
+                .map_err(|e| {
+                    ControllerError::service_unavailable(format!("encrypted pool adoption: {e}"))
+                })?
+                .into_inner();
+            if response.sandbox_id != sandbox_id.to_string()
+                || response.claim_id != Some(claim.claim_id.to_string())
+                || response.volume_encryption != volume_encryption
+            {
+                return Err(ControllerError::service_unavailable(
+                    "worker did not acknowledge this encrypted pool claim",
+                ));
+            }
+        }
+        let mut client = RetryingWorkerApiClient::new(client);
+        if !supported {
+            client
+                .update_sandbox(
+                    pplx_space_sbx_mgr_client::proto::UpdateRequest {
+                        sandbox_id: claim.sandbox_id.to_string(),
+                        vcpu: None,
+                        memory_mib: None,
+                        pids_max: None,
+                        expected_current_owner: Some(
+                            pplx_space_common_core::types::ROOT_SANDBOX_OWNER.to_string(),
+                        ),
+                        owner: Some(sandbox_owner.as_str().to_string()),
+                        process_env,
+                        replace_process_env: true,
+                    },
+                    WARM_POOL_SETUP_RPC_TIMEOUT,
+                )
+                .instrument(tracing::info_span!(
+                    "substrate.k8s.pool.update_sandbox_metadata.client",
+                    sandbox_id = %sandbox_id,
+                    env_count,
+                ))
+                .await
+                .map_err(|err| {
+                    if err.code() == Code::FailedPrecondition {
+                        ControllerError::conflict(format!(
+                            "pooled sandbox metadata update failed: {err}"
+                        ))
+                    } else if pooled_metadata_update_error_is_reclaimable(&err) {
+                        ControllerError::service_unavailable(format!(
+                            "pooled sandbox metadata update failed: {err}"
+                        ))
+                    } else if err.code() == Code::Cancelled {
+                        ControllerError::new(
+                            axum::http::StatusCode::REQUEST_TIMEOUT,
+                            format!("pooled sandbox metadata update failed: {err}"),
+                        )
+                    } else {
+                        ControllerError::internal(format!(
+                            "pooled sandbox metadata update failed: {err}"
+                        ))
+                    }
+                })?;
+        }
 
         // Step: network policy. Apply the effective policy to sbx-mgr's local DB
         // before waking the sandbox.

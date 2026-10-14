@@ -1,3 +1,4 @@
+mod pool_adoption;
 mod state_writer_refusal;
 
 use super::*;

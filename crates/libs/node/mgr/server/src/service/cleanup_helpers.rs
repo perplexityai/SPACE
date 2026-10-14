@@ -1281,7 +1281,7 @@ fn teardown_encrypted_volumes_with(
                 continue;
             }
         };
-        if target == "snapshot" {
+        if matches!(target.as_str(), "snapshot" | "linear") {
             snapshots.push(name);
         } else {
             crypts.push(name);
@@ -1482,6 +1482,7 @@ fn host_device_stack_exists(
 
 fn mapper_belongs_to_sandbox(name: &str, sandbox_id: &str) -> bool {
     name == format!("sbxroot-{sandbox_id}")
+        || name == format!("sbxroot-{sandbox_id}-seed")
         || name == format!("sbxroot-{sandbox_id}-cow")
         || name.starts_with(&format!("sbxvol-{sandbox_id}-"))
 }

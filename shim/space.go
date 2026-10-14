@@ -84,6 +84,8 @@ const (
 	sandboxOwnerAnnotation                       = "space.pplx.net/sandbox-owner"
 	sandboxUserAnnotation                        = "space.pplx.net/sandbox-user"
 	sandboxVolumeEncryptionAnnotation            = "space.pplx.net/volume-encryption"
+	sandboxPoolSlotIDAnnotation                  = "space.pplx.net/pool-slot-id"
+	sandboxPoolConfigIDAnnotation                = "space.pplx.net/pool-config-id"
 	kubernetesPodUIDAnnotation                   = "io.kubernetes.pod.uid"
 	kubernetesCriSandboxUIDAnnotation            = "io.kubernetes.cri.sandbox-uid"
 
@@ -612,7 +614,12 @@ func (s *spaceTaskService) Create(ctx context.Context, r *taskAPI.CreateTaskRequ
 		emitShimStepError("create", "parse_volume_encryption", "parse_volume_encryption", err)
 		return nil, status.Errorf(codes.InvalidArgument, "parse sandbox volume encryption: %v", err)
 	}
+	encryptablePoolMember, err := spec.sandboxPoolMember()
+	if err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "parse pool member: %v", err)
+	}
 	createReq := &pb.CreateRequest{
+		EncryptablePoolMember:   encryptablePoolMember,
 		Template:                sandboxTemplate,
 		Owner:                   sandboxOwner,
 		Runtime:                 runtime,
@@ -2250,6 +2257,20 @@ func sandboxCreateBootMode(rootfsSizeMb *uint32) pb.BootMode {
 		return pb.BootMode_BOOT_MODE_COLD
 	}
 	return pb.BootMode_BOOT_MODE_UNSPECIFIED
+}
+
+func (s *ociSpec) sandboxPoolMember() (bool, error) {
+	_, hasSlot := s.Annotations[sandboxPoolSlotIDAnnotation]
+	_, hasConfig := s.Annotations[sandboxPoolConfigIDAnnotation]
+	if !hasSlot && !hasConfig {
+		return false, nil
+	}
+	for _, key := range []string{sandboxPoolSlotIDAnnotation, sandboxPoolConfigIDAnnotation} {
+		if _, err := uuid.Parse(strings.TrimSpace(s.Annotations[key])); err != nil {
+			return false, fmt.Errorf("%s must be a UUID: %w", key, err)
+		}
+	}
+	return true, nil
 }
 
 // sandboxVolumeEncryption reads the BYOK immutable encrypted-volumes flag.

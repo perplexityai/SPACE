@@ -305,6 +305,7 @@ async fn do_create_from_base(
             autostart: false,
             pool_template: Some(template.to_string()),
             volume_encryption: false,
+            encryptable_pool_member: false,
             // Prefer a prepared snapshot; resolve_boot_mode falls through to cold
             // when required apps prevented this digest's snapshot publication.
             boot_mode: if from_snapshot {

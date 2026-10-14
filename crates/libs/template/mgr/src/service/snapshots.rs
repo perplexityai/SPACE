@@ -57,6 +57,7 @@ fn base_snapshot_create_request(
         autostart: false,
         pool_template: None,
         volume_encryption: false,
+        encryptable_pool_member: false,
         boot_mode: pplx_space_sbx_mgr_client::proto::BootMode::Cold.into(),
         blocking: false,
         sandbox_id: None,

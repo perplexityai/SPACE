@@ -116,6 +116,8 @@ pub const TEARDOWN_SUSPEND_BACKUP_PERMANENTLY_FAILED_REASON: &str =
     "teardown_suspend_backup_permanently_failed";
 pub const PROCESS_OUTPUT_CURSOR_HEALTH_SERVICE: &str =
     "space.sandbox-manager.capability.process-output-cursor.v1";
+pub const ENCRYPTED_POOL_ADOPTION_HEALTH_SERVICE: &str =
+    "space.sandbox-manager.capability.encrypted-pool-adoption.v1";
 /// Start can install the supplied cluster policy before runtime activation.
 pub const ACTIVATION_POLICY_HEALTH_SERVICE: &str =
     "space.sandbox-manager.capability.activation-policy.v1";

@@ -122,6 +122,7 @@ fn local_create_request(
         autostart: input.autostart,
         pool_template: None,
         volume_encryption: false,
+        encryptable_pool_member: false,
         boot_mode: boot_mode.into(),
         blocking: input.blocking,
         sandbox_id: None,
