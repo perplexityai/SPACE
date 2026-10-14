@@ -86,38 +86,84 @@ space_kind_cache_flags() {
   CACHE_FLAGS=("${CACHE_FROM_FLAGS[@]}" "${CACHE_TO_FLAGS[@]}")
 }
 
+# Set MIRROR_FLAGS to the --build-context options that take <dockerfile>'s
+# listed bases from the GHCR mirror (ci/scripts/mirror-images.sh; none unless
+# SPACE_CI_IMAGE_MIRROR is set), and MIRROR_MISSING to 1 when a listed base got
+# none because its mirror copy could not be reached, which that script reports
+# with a "Building from <name> at its source" warning (passed through here).
+# Layers built from such a base's source get keys no mirrored build computes.
+# shellcheck disable=SC2034 # MIRROR_FLAGS and MIRROR_MISSING are read by the callers
+space_kind_mirror_contexts() {
+  local out err
+  out="$(mktemp)"
+  err="$(mktemp)"
+  bash "$(dirname "${BASH_SOURCE[0]}")/../../../../ci/scripts/mirror-images.sh" build-contexts "$1" \
+    >"$out" 2>"$err" || true
+  cat "$err" >&2
+  mapfile -t MIRROR_FLAGS <"$out"
+  MIRROR_MISSING=0
+  if grep -q ' at its source; ' "$err"; then MIRROR_MISSING=1; fi
+  rm -f "$out" "$err"
+}
+
 # A build that could not read a layer blob a manifest named: missing,
 # unreadable or corrupt. BuildKit reports it the same way for an imported
 # cache's layers and for a mirrored base image's.
 SPACE_KIND_LAYER_READ_FAILURE='^ERROR:.*(httpReadSeeker|could not fetch content descriptor|unexpected commit digest|failed size validation)'
 
-# Run `docker build <import options> <args>`, where the first argument counts
-# the import options that follow it. Reading the cache can fail after its
-# manifest loaded: a layer it names is missing, corrupt or unreachable, and
-# the build stops at the first step that needs it. Such a build runs once more
-# without the imports, so a broken cache entry costs a cold build and never
-# the build. Every other failure, and a repeat of this one, stands. The
-# build's stdout and stderr are passed through unchanged.
+# The registry references a build's optional options name, one per line: the
+# repository of each cache import (type=registry,ref=<repository>:<scope>) and
+# the image of each mirrored base (--build-context=<name>=docker-image://<image>@<digest>).
+space_kind__optional_sources() {
+  local option
+  for option in "$@"; do
+    case "$option" in
+      type=registry,ref=*) option="${option#type=registry,ref=}"; printf '%s\n' "${option%:*}" ;;
+      *=docker-image://*) option="${option#*=docker-image://}"; printf '%s\n' "${option%@*}" ;;
+    esac
+  done
+}
+
+# Run `docker build <optional options> <args>`, where the first argument counts
+# the optional options that follow it: the cache imports and the mirrored base
+# images (docker-image:// build contexts), which only make a build cheaper or
+# take its bases from a held copy. Reading either can fail after its manifest
+# loaded: a layer it names is missing, corrupt or unreachable, and the build
+# stops at the first step that needs it. Such a build runs once more without
+# the optional options, so that its bases resolve from their FROM sources and
+# every layer is built cold; a broken copy costs a cold build and never the
+# build. The retry follows a failure to read a layer, or a failure whose error
+# names the cache repository or a mirrored image. Every other failure, and a
+# repeat of this one, stands. Other build contexts, such as a local directory,
+# belong in <args> and are kept. stdout and stderr pass through unchanged.
 space_kind_build_reading_cache() {
-  local - count=$1 log status=0
+  local - count=$1 log status=0 retry="" source
   set -o pipefail
   shift
-  local -a imports=("${@:1:count}")
+  local -a optional=("${@:1:count}")
   shift "$count"
   if (( count == 0 )); then
     docker build "$@"
     return
   fi
   log="$(mktemp)"
-  { docker build "${imports[@]}" "$@" 2>&1 1>&3 3>&- | tee "$log" >&2 3>&-; } 3>&1 || status=$?
-  if (( status != 0 )) && grep -qE "$SPACE_KIND_LAYER_READ_FAILURE" "$log"; then
-    printf 'build cache: could not read a cached layer; building again without the cache\n' >&2
+  { docker build "${optional[@]}" "$@" 2>&1 1>&3 3>&- | tee "$log" >&2 3>&-; } 3>&1 || status=$?
+  if (( status != 0 )); then
+    if grep -qE "$SPACE_KIND_LAYER_READ_FAILURE" "$log"; then
+      retry=1
+    else
+      while IFS= read -r source; do
+        grep '^ERROR:' "$log" | grep -qF -- "$source" && retry=1
+      done < <(space_kind__optional_sources "${optional[@]}")
+    fi
+  fi
+  rm -f "$log"
+  if [[ -n "$retry" ]]; then
+    printf 'build cache: could not read the build cache or a mirrored base; building again from the sources\n' >&2
     [[ "${GITHUB_ACTIONS:-}" != true ]] \
-      || printf '::warning::A Kind build could not read a cached layer and was rebuilt without the cache\n' >&2
-    rm -f "$log"
+      || printf '::warning::A Kind build could not read the build cache or a mirrored base and was rebuilt from the sources\n' >&2
     docker build "$@"
     return
   fi
-  rm -f "$log"
   return "$status"
 }

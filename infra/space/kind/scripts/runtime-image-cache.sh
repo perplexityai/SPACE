@@ -24,7 +24,8 @@
 #       Build <image> from its Dockerfile with its mirrored bases and the
 #       options that import its stages (never an export), then the given
 #       arguments, which are relative to the repository root. A build that
-#       fails reading a cached layer is built again without the cache.
+#       fails reading the cache or a mirrored base is built again without
+#       either, from the Dockerfile's own FROM sources.
 #   bash infra/space/kind/scripts/runtime-image-cache.sh publish
 #       Main CI (SPACE_KIND_BUILD_CACHE_WRITE=1): build every cached stage,
 #       and the seed builder's, and export them; a failed export fails. With
@@ -67,7 +68,7 @@ scope() { # image stage
 # from the mirror; a base the mirror lacks, or every base outside CI, comes
 # from its source.
 mirror_flags() {
-  mapfile -t MIRROR_FLAGS < <(bash ci/scripts/mirror-images.sh build-contexts "$1")
+  space_kind_mirror_contexts "$1"
 }
 
 build() {
@@ -82,13 +83,15 @@ build() {
     imports+=("${CACHE_FROM_FLAGS[@]}")
   done
   mirror_flags "${fields[1]}"
-  space_kind_build_reading_cache "${#imports[@]}" "${imports[@]}" \
-    -f "${fields[1]}" "${MIRROR_FLAGS[@]}" "$@"
+  space_kind_build_reading_cache $(( ${#imports[@]} + ${#MIRROR_FLAGS[@]} )) \
+    "${imports[@]}" "${MIRROR_FLAGS[@]}" -f "${fields[1]}" "$@"
 }
 
 # Build each stage on its own, with no output but the cache. A failure leaves
 # that scope as main last wrote it and does not stop the others; readers of a
-# stale or missing scope build those layers cold.
+# stale or missing scope build those layers cold. A broken import is dropped
+# on a retry, but the mirrored bases are kept: layers built from the bases'
+# sources would carry keys no reader computes.
 publish() {
   local entry dockerfile stage failures=0
   local -a fields
@@ -99,6 +102,13 @@ publish() {
     (( ${#fields[@]} > 2 )) || continue
     dockerfile=${fields[1]}
     mirror_flags "$dockerfile"
+    # Exporting layers built from a base's source would replace main's tags
+    # with layers that no mirrored build matches; keep the old tags instead.
+    if (( MIRROR_MISSING )); then
+      warn "a mirrored base of $dockerfile was unavailable; its stages keep main's previous layers"
+      failures=$((failures + 1))
+      continue
+    fi
     for stage in "${fields[@]:2}"; do
       space_kind_cache_flags "$(scope "${fields[0]}" "$stage")" --fail-on-export-error \
         || die "invalid build cache configuration"

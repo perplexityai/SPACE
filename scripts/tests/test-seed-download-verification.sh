@@ -20,17 +20,25 @@ printf 'older release\n' > "$work/source/payload"
 mksquashfs "$work/source" "$work/stale.squashfs" -noappend -processors 1 >/dev/null
 printf 'verified payload\n' > "$work/source/payload"
 
+# reuse=1 is the Kind seed build's SPACE_SEED_REUSE_SIGNED_CHECKSUMS=1; the
+# production default leaves it unset.
 extract() { # case_dir signer
-  bash -c 'source "$1"; shift; extract_verified_squashfs "$@"' bash \
+  SPACE_SEED_REUSE_SIGNED_CHECKSUMS="$reuse" bash -c 'source "$1"; shift; extract_verified_squashfs "$@"' bash \
     "$builder" "file://$1/upstream" image.squashfs "$1/cache" \
     "$1/extracted" "$work/keyring.gpg" "$2"
 }
 
-# offline: a cache that holds the release's signed checksums and its image
-# needs no upstream at all. cached-sums-tampered: cached checksums that fail
-# their signature are replaced from upstream. stale-release: another release's
-# signed checksums, cached with its image, do not vouch for this release.
-for scenario in download cache stale-cache signature manifest signer checksum missing duplicate corrupt-download corrupt-cache corrupt-cache-and-download offline cached-sums-tampered stale-release; do
+# With reuse: offline, a cache that holds the release's signed checksums and
+# its image needs no upstream at all; cached-sums-tampered, cached checksums
+# that fail their signature are replaced from upstream; stale-release, another
+# release's signed checksums, cached with its image, do not vouch for this
+# release. Without reuse (production): planted-older-release, an older
+# release's validly signed checksums and image planted where this release's
+# would be cached do not replace this release's image, and no run writes
+# checksums into the cache.
+for scenario in download cache stale-cache signature manifest signer checksum missing duplicate corrupt-download corrupt-cache corrupt-cache-and-download offline cached-sums-tampered stale-release planted-older-release; do
+  reuse=0
+  case "$scenario" in offline|cached-sums-tampered|stale-release) reuse=1 ;; esac
   case_dir="$work/$scenario"
   mkdir -p "$case_dir/upstream" "$case_dir/cache"
   cp "$work/image.squashfs" "$case_dir/upstream/image.squashfs"
@@ -39,17 +47,24 @@ for scenario in download cache stale-cache signature manifest signer checksum mi
   expected_status=1
   case "$scenario" in
     download|offline|cached-sums-tampered) expected_status=0 ;;
-    stale-release)
+    stale-release|planted-older-release)
       expected_status=0
       mkdir "$case_dir/old"
       cp "$work/stale.squashfs" "$case_dir/old/image.squashfs"
       printf '%s  %s\n' "$(sha256sum "$work/stale.squashfs" | cut -d ' ' -f 1)" image.squashfs > "$case_dir/old/SHA256SUMS"
       gpg --homedir "$work/keys" --batch --detach-sign "$case_dir/old/SHA256SUMS"
       mv "$case_dir/old/SHA256SUMS.sig" "$case_dir/old/SHA256SUMS.gpg"
-      bash -c 'source "$1"; shift; fetch_verified_squashfs "$@"' bash \
-        "$builder" "file://$case_dir/old" image.squashfs "$case_dir/cache" \
-        "$work/keyring.gpg" "$signer" "" > "$case_dir/prime.log" 2>&1 \
-        || { cat "$case_dir/prime.log" >&2; exit 1; }
+      if [[ "$scenario" == stale-release ]]; then
+        SPACE_SEED_REUSE_SIGNED_CHECKSUMS=1 bash -c 'source "$1"; shift; fetch_verified_squashfs "$@"' bash \
+          "$builder" "file://$case_dir/old" image.squashfs "$case_dir/cache" \
+          "$work/keyring.gpg" "$signer" "" > "$case_dir/prime.log" 2>&1 \
+          || { cat "$case_dir/prime.log" >&2; exit 1; }
+      else
+        planted="$case_dir/cache/sums/$case_dir/upstream"
+        mkdir -p "$planted"
+        cp "$case_dir/old/SHA256SUMS" "$case_dir/old/SHA256SUMS.gpg" "$planted/"
+        cp "$work/stale.squashfs" "$case_dir/cache/image.squashfs"
+      fi
       ;;
     cache)
       expected_status=0
@@ -107,8 +122,14 @@ for scenario in download cache stale-cache signature manifest signer checksum mi
     cmp "$work/image.squashfs" "$case_dir/cache/image.squashfs"
     if [[ "$scenario" == offline ]]; then
       grep -q "Using cached signed checksums" "$case_dir/log"
-    elif [[ -d "$case_dir/upstream" ]]; then
+    elif [[ "$reuse" == 1 ]]; then
       cmp "$case_dir/upstream/SHA256SUMS" "$case_dir/cache/sums/$case_dir/upstream/SHA256SUMS"
+    elif grep -q "Using cached signed checksums" "$case_dir/log"; then
+      echo "$scenario: a production run read cached checksums" >&2
+      exit 1
+    elif [[ "$scenario" != planted-older-release && -e "$case_dir/cache/sums" ]]; then
+      echo "$scenario: a production run wrote checksums into the cache" >&2
+      exit 1
     fi
   else
     if [[ "$status" == 0 || -e "$case_dir/extracted" ]]; then

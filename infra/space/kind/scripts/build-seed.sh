@@ -93,14 +93,24 @@ done
 # repository's GHCR mirror (ci/mirrored-images.txt); elsewhere this adds nothing.
 # The cache options import the builder's layers, and export them only when
 # the caller enables writes; main takes its bases from the mirror the same
-# way, so the layers' keys agree. A build that fails reading a cached layer is
-# built again without the imports.
+# way, so the layers' keys agree. A build that fails reading the cache or the
+# mirrored base is built again without either; main's export keeps the
+# mirrored base, so it never writes layers no reader would match.
 seed_builder_build() {
-  local -a mirror
-  mapfile -t mirror < <(bash "$REPO_ROOT/ci/scripts/mirror-images.sh" build-contexts "$SEED_DIR/Dockerfile")
+  local -a mirror optional
+  space_kind_mirror_contexts "$SEED_DIR/Dockerfile"
+  mirror=("${MIRROR_FLAGS[@]}")
   space_kind_cache_flags "$(space_kind_layer_scope seed-builder)" "${SEED_CACHE_OPTION[@]}" \
     || die "invalid build cache configuration"
-  space_kind_build_reading_cache "${#CACHE_FROM_FLAGS[@]}" "${CACHE_FROM_FLAGS[@]}" \
+  if (( ${#CACHE_TO_FLAGS[@]} && MIRROR_MISSING )); then
+    die "the mirrored seed builder base was unavailable; not exporting layers no mirrored build would match"
+  fi
+  optional=("${CACHE_FROM_FLAGS[@]}")
+  if (( ${#CACHE_TO_FLAGS[@]} == 0 )); then
+    optional+=("${mirror[@]}")
+    mirror=()
+  fi
+  space_kind_build_reading_cache "${#optional[@]}" "${optional[@]}" \
     "${mirror[@]}" "${CACHE_TO_FLAGS[@]}" \
     --build-arg "SPACE_SEED_UBUNTU_RELEASE=$SEED_UBUNTU_RELEASE" \
     --build-arg "SPACE_SEED_UBUNTU_VERSION=$SEED_UBUNTU_VERSION" \
@@ -220,6 +230,7 @@ docker run --rm --privileged \
   -e "SPACE_SEED_STATE_FORMAT_VERSION=$SEED_STATE_FORMAT_VERSION" \
   -e "SPACE_SEED_KERNEL_VERSION=$SEED_KERNEL_VERSION" \
   -e "SPACE_SEED_KERNEL_DIGEST=$SEED_KERNEL_DIGEST" \
+  -e SPACE_SEED_REUSE_SIGNED_CHECKSUMS=1 \
   space-seed-builder:local --id seed --force
 
 [[ -f "$OUT_DIR/rootfs.ext4" && -f "$OUT_DIR/metadata.json" ]] \

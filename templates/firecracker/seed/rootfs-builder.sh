@@ -40,14 +40,20 @@ seed_image_source() {
 }
 
 # Print the SHA-256 that base_url's SHA256SUMS, signed by the pinned signer,
-# lists for name. A cache_dir that exists keeps the signed checksums under the
-# release's URL, so a later run verifies the same signature without a download.
-# Every run authenticates the release, whichever copy it reads.
+# lists for name. Every run downloads the dated SHA256SUMS, so a cache entry
+# cannot change which image a build accepts: a valid signature proves the file
+# is Canonical's, not that it belongs to this date.
+#
+# SPACE_SEED_REUSE_SIGNED_CHECKSUMS=1 (the Kind seed build, whose cache only
+# the build itself and main CI's build cache fill) keeps the signed checksums
+# in an existing cache_dir under the release's URL and verifies that copy
+# instead, so a cached release builds with cloud-images.ubuntu.com
+# unreachable. The production build manager's persistent cache never sets it.
 verified_checksum() (
   set -euo pipefail
   local base_url="$1" name="$2" cache_dir="$3" keyring="$4" signer="$5"
-  local verify_dir checksum file downloaded="" cache_tmp=""
-  local sums_cache="${cache_dir}/sums/${base_url#*://}"
+  local verify_dir checksum file downloaded="" cache_tmp="" sums_cache=""
+  [[ "${SPACE_SEED_REUSE_SIGNED_CHECKSUMS:-0}" != 1 ]] || sums_cache="${cache_dir}/sums/${base_url#*://}"
   verify_dir="$(mktemp -d)"
   trap 'rm -rf "$verify_dir"; [[ -z "$cache_tmp" ]] || rm -f "$cache_tmp"' EXIT
 
@@ -60,7 +66,7 @@ verified_checksum() (
       ' "${verify_dir}/status"
   }
 
-  if [[ -f "${sums_cache}/SHA256SUMS" && -f "${sums_cache}/SHA256SUMS.gpg" ]]; then
+  if [[ -n "$sums_cache" && -f "${sums_cache}/SHA256SUMS" && -f "${sums_cache}/SHA256SUMS.gpg" ]]; then
     cp "${sums_cache}/SHA256SUMS" "${sums_cache}/SHA256SUMS.gpg" "$verify_dir/"
     if signed_by_pinned_signer; then
       echo "Using cached signed checksums: ${sums_cache}" >&2
@@ -84,7 +90,7 @@ verified_checksum() (
     echo "ERROR: expected exactly one SHA-256 for ${name}" >&2
     exit 1
   fi
-  if [[ -n "$downloaded" && -d "$cache_dir" ]]; then
+  if [[ -n "$sums_cache" && -n "$downloaded" && -d "$cache_dir" ]]; then
     mkdir -p "$sums_cache"
     for file in SHA256SUMS SHA256SUMS.gpg; do
       cache_tmp="$(mktemp "${sums_cache}/.${file}.XXXXXX")"

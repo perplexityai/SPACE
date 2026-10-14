@@ -7,9 +7,10 @@ RUN apt-get update && apt-get install -y \
 COPY rootfs-builder.sh /usr/local/bin/
 RUN chmod +x /usr/local/bin/rootfs-builder.sh
 
-# The recipe's dated Ubuntu cloud image as a builder cache directory
-# (rootfs-builder.sh's /cache): the signed checksums, then the image they
-# list, each verified by the builder's own code. The image's layer is keyed by
+# The recipe's dated Ubuntu cloud image as a Kind builder cache directory
+# (rootfs-builder.sh's /cache with SPACE_SEED_REUSE_SIGNED_CHECKSUMS=1): the
+# signed checksums, then the image they list, each verified by the builder's
+# own code. The image's layer is keyed by
 # the release and by the signed checksums it was verified against.
 # infra/space/kind/scripts/build-seed.sh exports this stage so a Kind seed
 # build downloads nothing the build cache already holds.
@@ -17,7 +18,7 @@ FROM builder AS cloud-image-checksums
 ARG SPACE_SEED_UBUNTU_RELEASE
 ARG SPACE_SEED_UBUNTU_VERSION
 ARG SPACE_SEED_UBUNTU_DATE
-RUN mkdir /cloud-image && bash -c 'source /usr/local/bin/rootfs-builder.sh \
+RUN mkdir /cloud-image && SPACE_SEED_REUSE_SIGNED_CHECKSUMS=1 bash -c 'source /usr/local/bin/rootfs-builder.sh \
     && seed_image_source "$SPACE_SEED_UBUNTU_RELEASE" "$SPACE_SEED_UBUNTU_VERSION" "$SPACE_SEED_UBUNTU_DATE" "$(uname -m)" \
     && verified_checksum "$SEED_IMAGE_BASE_URL" "$SEED_IMAGE_NAME" /cloud-image "$SEED_IMAGE_KEYRING" "$SEED_IMAGE_SIGNER"'
 
@@ -26,7 +27,7 @@ ARG SPACE_SEED_UBUNTU_RELEASE
 ARG SPACE_SEED_UBUNTU_VERSION
 ARG SPACE_SEED_UBUNTU_DATE
 COPY --from=cloud-image-checksums /cloud-image/ /cloud-image/
-RUN bash -c 'source /usr/local/bin/rootfs-builder.sh \
+RUN SPACE_SEED_REUSE_SIGNED_CHECKSUMS=1 bash -c 'source /usr/local/bin/rootfs-builder.sh \
     && seed_image_source "$SPACE_SEED_UBUNTU_RELEASE" "$SPACE_SEED_UBUNTU_VERSION" "$SPACE_SEED_UBUNTU_DATE" "$(uname -m)" \
     && fetch_verified_squashfs "$SEED_IMAGE_BASE_URL" "$SEED_IMAGE_NAME" /cloud-image "$SEED_IMAGE_KEYRING" "$SEED_IMAGE_SIGNER" ""'
 

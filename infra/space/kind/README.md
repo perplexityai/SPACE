@@ -197,16 +197,24 @@ smoke environment and `deps` for the UI's `npm ci`), and each stage has its own
 lists them and runs every runtime image build, for Tilt and `build-images.sh`
 alike. The seed builder's tag, `kind-seed-builder-e<epoch>`, also holds the
 recipe's dated Ubuntu cloud image with its signed checksums, which
-`rootfs-builder.sh` verifies again before use. The copies of a commit's
+`rootfs-builder.sh` verifies again before use. Only the Kind seed build reuses
+cached checksums (`SPACE_SEED_REUSE_SIGNED_CHECKSUMS=1`); the production build
+manager still downloads the dated `SHA256SUMS` on every run, so its persistent
+cache cannot change which image a seed is built from. The copies of a commit's
 binaries are never exported.
 
-Only main's `runtime_image_cache` job writes these tags, after all four shards
-of that commit have passed and only while the commit is still the tip of
-main. A failed export marks that job failed, without failing the run, and
-leaves the previous layers.
-The shards read them with `SPACE_KIND_BUILD_CACHE_REPOSITORY` and build any
-missing layer cold. A build that cannot read a layer the cache names (a
-missing or corrupt blob) is built again once without the cache.
+Only `kind_runtime_image_cache` in `main-ci.yml` writes these tags, after
+all four Kind shards of that commit have passed; `space-ci` does not require
+it, and a failed export leaves the previous layers. It skips the stages of a
+Dockerfile whose mirrored base it could not reach, since layers built from
+the base's source would match no reader. Runs of successive main commits are
+not ordered, so an older run that finishes last can put back its layers for
+the stages that changed in between, until the next push exports again.
+The shards read the tags with `SPACE_KIND_BUILD_CACHE_REPOSITORY` and build
+any missing layer cold. A build that cannot read a layer the cache or a
+mirrored base names (a missing or corrupt blob), or whose error names the
+cache repository or a mirrored image, is built once more without the cache
+and with its bases from their FROM sources.
 
 A layer stays in use while its inputs are unchanged, even one captured while
 an archive served a broken package. To retire every runtime and seed builder

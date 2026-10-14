@@ -15,11 +15,16 @@
 #   6. `build` adds the image's Dockerfile, its mirrored bases and an import
 #      per stage, never an export, even with writes enabled; an image without
 #      stages imports nothing, and an unknown image is an error.
-#   7. A build that fails reading a cached layer runs once more without the
-#      imports; any other failure stands, after one attempt.
+#   7. A build that fails reading a cached layer or a mirrored base, or whose
+#      error names the cache repository or a mirrored image, runs once more
+#      without the imports and the mirrored bases, keeping its other build
+#      contexts; any other failure stands, after one attempt.
 #   8. publish builds each cached stage by itself into the cache only, with
 #      that stage's scope, then the seed builder's stages, with export errors
-#      failing; a failed build fails publish without stopping the others.
+#      failing; a failed build fails publish without stopping the others. Its
+#      retry drops a broken import but keeps the mirrored bases, and a
+#      Dockerfile whose listed base the mirror could not provide is not
+#      exported at all.
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -107,11 +112,22 @@ mkdir -p "$stubs"
 cat >"$stubs/docker" <<'STUB'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >>"$DOCKER_LOG"
+if [[ "$1" == buildx && "${STUB_MODE:-}" == mirror-down ]]; then exit 1; fi
 [[ "$1" == build ]] || exit 0
 case "${STUB_MODE:-ok}" in
     read-fail)
         if [[ "$*" == *--cache-from* ]]; then
             echo "ERROR: failed to solve: failed to copy: httpReadSeeker: failed open: content not found" >&2
+            exit 1
+        fi ;;
+    mirror-read-fail)
+        if [[ "$*" == *=docker-image://* ]]; then
+            echo "ERROR: failed to solve: failed to copy: httpReadSeeker: failed open: could not fetch content descriptor from remote: not found" >&2
+            exit 1
+        fi ;;
+    mirror-named-fail)
+        if [[ "$*" == *=docker-image://* ]]; then
+            echo "ERROR: failed to solve: ghcr.io/example-owner/mirror@sha256:0: failed to resolve source metadata: unexpected status 500" >&2
             exit 1
         fi ;;
     fail)
@@ -138,7 +154,7 @@ builds() { grep '^build ' "$log" || true; }
 mirror_context="--build-context=public.ecr.aws/docker/library/debian:bookworm-slim=docker-image://ghcr.io/example-owner/mirror@$digest"
 run_build SPACE_KIND_BUILD_CACHE_REPOSITORY="$repository" SPACE_CI_IMAGE_MIRROR=ghcr -- space-api -t img . \
     || fail "build space-api failed" "$(cat "$work/err")"
-expected="build --cache-from type=registry,ref=$repository:kind-api-smoke-build-e1 --cache-from type=registry,ref=$repository:kind-api-runtime-deps-e1 -f docker/Dockerfile.api $mirror_context -t img ."
+expected="build --cache-from type=registry,ref=$repository:kind-api-smoke-build-e1 --cache-from type=registry,ref=$repository:kind-api-runtime-deps-e1 $mirror_context -f docker/Dockerfile.api -t img ."
 [[ "$(builds)" == "$expected" ]] || fail "space-api must import both stages and take its mirrored bases" "$(builds)"
 run_build SPACE_KIND_BUILD_CACHE_REPOSITORY="$repository" SPACE_KIND_BUILD_CACHE_WRITE=1 "${main_push[@]}" -- space-worker . \
     || fail "build must not refuse a build with writes enabled" "$(cat "$work/err")"
@@ -148,7 +164,7 @@ run_build -- space-api . || fail "build without a repository failed" "$(cat "$wo
 [[ "$(builds)" == "build -f docker/Dockerfile.api ." ]] || fail "build without a repository must import nothing" "$(builds)"
 run_build SPACE_KIND_BUILD_CACHE_REPOSITORY="$repository" SPACE_CI_IMAGE_MIRROR=ghcr -- space-kind-key-broker . \
     || fail "build of an image without stages failed" "$(cat "$work/err")"
-[[ "$(builds)" == "build -f docker/Dockerfile.kind-key-broker $mirror_context ." ]] \
+[[ "$(builds)" == "build $mirror_context -f docker/Dockerfile.kind-key-broker ." ]] \
     || fail "an image without cached stages must import nothing and still take its mirrored bases" "$(builds)"
 run_build SPACE_KIND_BUILD_CACHE_REPOSITORY="$repository" -- space-unknown . \
     && fail "an image the table does not declare must be an error"
@@ -159,10 +175,19 @@ run_build SPACE_KIND_BUILD_CACHE_REPOSITORY="$repository" STUB_MODE=read-fail --
 expected="build --cache-from type=registry,ref=$repository:kind-data-plane-runtime-deps-e1 -f docker/Dockerfile.data-plane .
 build -f docker/Dockerfile.data-plane ."
 [[ "$(builds)" == "$expected" ]] || fail "the retry must drop exactly the imports" "$(builds)"
-grep -q "building again without the cache" "$work/err" || fail "the retry must say why" "$(cat "$work/err")"
+grep -q "building again from the sources" "$work/err" || fail "the retry must say why" "$(cat "$work/err")"
 run_build SPACE_KIND_BUILD_CACHE_REPOSITORY="$repository" STUB_MODE=fail -- space-data-plane . \
     && fail "a genuine build failure must fail the build"
 [[ "$(builds | wc -l)" -eq 1 ]] || fail "a genuine build failure must not be retried" "$(builds)"
+
+for mode in mirror-read-fail mirror-named-fail; do
+    run_build SPACE_CI_IMAGE_MIRROR=ghcr STUB_MODE=$mode -- space-seed-publish --build-context seed=/tmp/seed . \
+        || fail "$mode: a build whose mirrored base fails must succeed from the sources" "$(cat "$work/err")"
+    expected="build $mirror_context -f docker/Dockerfile.seed-publish --build-context seed=/tmp/seed .
+build -f docker/Dockerfile.seed-publish --build-context seed=/tmp/seed ."
+    [[ "$(builds)" == "$expected" ]] \
+        || fail "$mode: the retry must drop the mirrored bases and keep the local context" "$(builds)"
+done
 
 # Case 8: publish.
 publish() { # env...
@@ -195,5 +220,26 @@ grep -q "Dockerfile.kind-key-broker" "$log" && fail "an image without cached sta
 publish STUB_MODE=fail && fail "publish must fail when its builds or exports fail"
 [[ "$(builds | wc -l)" -eq 8 ]] || fail "a failed build must not stop the others" "$(builds)"
 grep -q "keeps main's previous layers" "$work/err" || fail "a failed export must say what it leaves" "$(cat "$work/err")"
+: >"$log"
+env -i PATH="$stubs:$PATH" HOME="$work" DOCKER_LOG="$log" SPACE_MIRRORED_IMAGES="$mirrors" SPACE_CI_IMAGE_MIRROR=ghcr \
+    SPACE_KIND_BUILD_CACHE_REPOSITORY="$repository" SPACE_KIND_BUILD_CACHE_WRITE=1 "${main_push[@]}" STUB_MODE=read-fail \
+    bash "$script" publish >/dev/null 2>"$work/err" || fail "publish must survive a broken import" "$(cat "$work/err")"
+retry="$(builds | grep -- "-f docker/Dockerfile.data-plane " | sed -n 2p)"
+[[ "$retry" == "build -f docker/Dockerfile.data-plane --target runtime-deps --output type=cacheonly $mirror_context $(export_of kind-data-plane-runtime-deps-e1) ." ]] \
+    || fail "publish's retry must drop the import and keep the mirrored base" "$(builds)"
+
+# A listed base whose mirror copy is unreachable: its Dockerfiles' stages keep
+# main's tags; the others are still exported.
+: >"$log"
+env -i PATH="$stubs:$PATH" HOME="$work" DOCKER_LOG="$log" SPACE_MIRRORED_IMAGES="$mirrors" SPACE_CI_IMAGE_MIRROR=ghcr \
+    SPACE_KIND_BUILD_CACHE_REPOSITORY="$repository" SPACE_KIND_BUILD_CACHE_WRITE=1 "${main_push[@]}" STUB_MODE=mirror-down \
+    bash "$script" publish >/dev/null 2>"$work/err" && fail "publish must fail when a mirrored base is unavailable"
+expected="docker/Dockerfile.worker
+docker/Dockerfile.ui
+/seed"
+[[ "$(builds | grep -oE 'docker/Dockerfile\.[a-z-]+|/seed$' | uniq)" == "$expected" ]] \
+    || fail "only Dockerfiles whose mirrored bases were all available may be exported" "$(builds)"
+grep -q "a mirrored base of docker/Dockerfile.api was unavailable" "$work/err" \
+    || fail "a skipped export must say why" "$(cat "$work/err")"
 
 exit "$status"

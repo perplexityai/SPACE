@@ -195,6 +195,65 @@ jobs:
       packages: write
     uses: ./.github/workflows/kind-ci.yml
 
+  # The only job that writes the Kind runtime images' and the seed builder's
+  # tags in ghcr.io/perplexityai/space-kind-build-cache, which every Kind
+  # shard's bring-up imports (infra/space/kind/scripts/runtime-image-cache.sh).
+  # It exports only after all four shards of this commit passed, so a layer
+  # that broke the smoke is not published. It rebuilds a changed stage from
+  # upstream at its own time, though: a layer broken then stays in use until
+  # SPACE_KIND_LAYER_CACHE_EPOCH (infra/space/kind/lib/build-cache.sh) is
+  # bumped. Runs of successive commits are not ordered, so an older one that
+  # finishes last can put its layers back until the next push exports again.
+  # Kind CI builds whatever its tags lack cold, so space-ci does not require
+  # this job, and a failed export leaves the previous layers.
+  kind_runtime_image_cache:
+    if: github.repository == 'perplexityai/SPACE' && needs.kind_smoke.result == 'success'
+    name: Export the Kind runtime image cache
+    needs: kind_smoke
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    continue-on-error: true
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Check out SPACE
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # As in kind-ci.yml: the default Docker build driver exports a registry
+      # cache only with the containerd image store.
+      - name: Enable the containerd image store for cache export
+        run: |
+          set -euo pipefail
+          sudo install -d -m 0755 /etc/docker
+          if [[ -s /etc/docker/daemon.json ]]; then
+            sudo jq '.features["containerd-snapshotter"] = true' /etc/docker/daemon.json \
+              | sudo tee /etc/docker/daemon.json.new >/dev/null
+            sudo mv /etc/docker/daemon.json.new /etc/docker/daemon.json
+          else
+            echo '{"features":{"containerd-snapshotter":true}}' | sudo tee /etc/docker/daemon.json >/dev/null
+          fi
+          sudo systemctl restart docker
+          if ! docker info --format '{{json .DriverStatus}}' | grep -q 'io.containerd.snapshotter'; then
+            echo "::error::The containerd image store did not activate; BuildKit cache export requires it"
+            exit 1
+          fi
+
+      # Reads the third-party image mirror and writes the cache.
+      - name: Log in to GHCR
+        env:
+          GHCR_TOKEN: ${{ github.token }}
+        run: printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+
+      - name: Export the runtime images' and the seed builder's cached stages
+        env:
+          SPACE_CI_IMAGE_MIRROR: ghcr
+          SPACE_KIND_BUILD_CACHE_REPOSITORY: ghcr.io/perplexityai/space-kind-build-cache
+          SPACE_KIND_BUILD_CACHE_WRITE: '1'
+        run: bash infra/space/kind/scripts/runtime-image-cache.sh publish
+
   # Rust jobs on main save each compiler-cache refresh under a new key, and
   # restores take only the newest snapshot of a job, or of a job's build inputs
   # for Cargo target directories. Delete the older ones so they do not fill the
