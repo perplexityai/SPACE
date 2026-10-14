@@ -6,7 +6,7 @@ fn source_identity_is_required_before_touching_retained_subvolumes() {
     let root = dir.path().canonicalize().unwrap();
     std::fs::create_dir(root.join(DIRECTORY)).unwrap();
     let expected = Uuid::now_v7();
-    for (version, identity) in [(2, expected), (1, Uuid::now_v7())] {
+    for (version, identity) in [(3, expected), (1, Uuid::now_v7()), (2, Uuid::now_v7())] {
         let manifest = Manifest {
             version,
             source_id: identity,
@@ -89,13 +89,15 @@ fn retained_source_regenerates_after_producer_deletion_and_receives_on_same_file
         return;
     };
     assert!(nix::unistd::geteuid().is_root());
+    let receiver = tempfile::tempdir_in(&root).unwrap();
     let temp = tempfile::tempdir_in(root).unwrap();
     let root = temp.path().canonicalize().unwrap();
     let directory = trusted_paths::open_directory(&root).unwrap();
     btrfs::create(&directory, "template".as_ref()).unwrap();
     let template = artifact_fs::directory(&directory, "template".as_ref()).unwrap();
     std::fs::write(root.join("template/rootfs.ext4"), b"original template").unwrap();
-    btrfs::stamp(&template, Uuid::now_v7()).unwrap();
+    let received_uuid = Uuid::now_v7();
+    btrfs::stamp(&template, received_uuid).unwrap();
     btrfs::set_readonly(&template, true).unwrap();
     btrfs::snapshot(&template, &directory, "instance".as_ref(), false).unwrap();
     let instance = artifact_fs::directory(&directory, "instance".as_ref()).unwrap();
@@ -111,15 +113,22 @@ fn retained_source_regenerates_after_producer_deletion_and_receives_on_same_file
     std::fs::create_dir(root.join("snapshot")).unwrap();
     let snapshot = root.join("snapshot");
     let id = capture(&snapshot, &root.join("template"), &root.join("instance")).unwrap();
+    // The receiving node's own install of the same template build, outside
+    // the cache tree that slot retirement rewrites below.
+    let receiver = trusted_paths::open_directory(receiver.path()).unwrap();
+    stamped_template_copy(&template, &receiver, "template", received_uuid);
     artifact_fs::remove_at(&directory, "instance".as_ref()).unwrap();
     artifact_fs::remove_at(&directory, "template".as_ref()).unwrap();
     drop((template, instance));
-    // Capture writes a version 1 manifest; inspection reads the retained
+    // Capture writes a version 2 manifest and seals the private parent
+    // without the template's received UUID; inspection reads the retained
     // image length without the producer or template.
     let manifest: serde_json::Value =
         serde_json::from_slice(&std::fs::read(snapshot.join(DIRECTORY).join(MANIFEST)).unwrap())
             .unwrap();
-    assert_eq!(manifest["version"], 1);
+    assert_eq!(manifest["version"], UNSTAMPED_PARENT_VERSION);
+    assert_eq!(manifest["received_uuid"], received_uuid.to_string());
+    assert_eq!(received_uuid_holders(&root, received_uuid), 1);
     assert_eq!(inspect(&snapshot, id).unwrap(), expected.len() as u64);
     assert_eq!(
         inspect(&snapshot, Uuid::now_v7()).unwrap_err().code(),
@@ -220,5 +229,208 @@ fn retained_source_regenerates_after_producer_deletion_and_receives_on_same_file
     assert_eq!(
         inspect(&snapshot, id).unwrap_err().code(),
         tonic::Code::NotFound
+    );
+    artifact_fs::remove_at(&receiver, "template".as_ref()).unwrap();
+}
+
+#[cfg(target_os = "linux")]
+fn stamped_template_copy(template: &File, directory: &File, name: &str, received_uuid: Uuid) {
+    btrfs::snapshot(template, directory, name.as_ref(), false).unwrap();
+    let copy = artifact_fs::directory(directory, name.as_ref()).unwrap();
+    btrfs::stamp(&copy, received_uuid).unwrap();
+    btrfs::set_readonly(&copy, true).unwrap();
+}
+
+/// Subvolumes on `root`'s filesystem listed under `received_uuid` in the UUID
+/// tree item that `btrfs receive` searches for an incremental parent.
+#[cfg(target_os = "linux")]
+fn received_uuid_holders(root: &Path, received_uuid: Uuid) -> usize {
+    let output = std::process::Command::new("btrfs")
+        .args(["subvolume", "list", "-a", "-R"])
+        .arg(root)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let needle = format!("received_uuid {received_uuid} ");
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|line| line.contains(&needle))
+        .count()
+}
+
+#[cfg(target_os = "linux")]
+fn receive_materialized(root: &Path, directory: &File, artifact: &Path, id: Uuid) -> Vec<u8> {
+    materialize(artifact, id, None).unwrap();
+    let received = root.join("received");
+    std::fs::create_dir(&received).unwrap();
+    let output = std::process::Command::new("btrfs")
+        .arg("receive")
+        .arg(&received)
+        .stdin(File::open(artifact.join("rootfs.btrfs-send")).unwrap())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let bytes = std::fs::read(received.join("instance.ro/rootfs.ext4")).unwrap();
+    artifact_fs::remove_at(directory, "received".as_ref()).unwrap();
+    std::fs::remove_file(artifact.join("rootfs.btrfs-send")).unwrap();
+    bytes
+}
+
+/// `btrfs receive` reads the template's received-UUID item through a fixed
+/// 3992-byte search buffer, so it finds no parent once more than 495
+/// subvolumes carry that UUID. Retained sources must not add holders.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires root and an explicitly supplied disposable btrfs fixture directory"]
+fn retained_sources_keep_the_template_receivable_past_the_uuid_item_search_limit() {
+    let Some(root) = std::env::var_os("SPACE_NODEMGR_TEST_BTRFS_DIR") else {
+        eprintln!("not opted in: SPACE_NODEMGR_TEST_BTRFS_DIR is unset");
+        return;
+    };
+    assert!(nix::unistd::geteuid().is_root());
+    let temp = tempfile::tempdir_in(root).unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let directory = trusted_paths::open_directory(&root).unwrap();
+    btrfs::create(&directory, "template".as_ref()).unwrap();
+    let template = artifact_fs::directory(&directory, "template".as_ref()).unwrap();
+    std::fs::write(root.join("template/rootfs.ext4"), b"original template").unwrap();
+    let received_uuid = Uuid::now_v7();
+    btrfs::stamp(&template, received_uuid).unwrap();
+    btrfs::set_readonly(&template, true).unwrap();
+    btrfs::snapshot(&template, &directory, "instance".as_ref(), false).unwrap();
+    let expected = b"suspended rootfs";
+    std::fs::write(root.join("instance/rootfs.ext4"), expected).unwrap();
+    let mut captured = Vec::new();
+    for index in 0..500 {
+        let artifact = root.join(format!("snapshot-{index}"));
+        std::fs::create_dir(&artifact).unwrap();
+        let id = capture(&artifact, &root.join("template"), &root.join("instance")).unwrap();
+        captured.push((artifact, id));
+    }
+    assert_eq!(received_uuid_holders(&root, received_uuid), 1);
+    // The same-filesystem receive resolves the template, the only holder; a
+    // stamped private parent per capture would make it 501 and fail here.
+    let (artifact, id) = &captured[0];
+    assert_eq!(
+        receive_materialized(&root, &directory, artifact, *id),
+        expected
+    );
+    assert_eq!(received_uuid_holders(&root, received_uuid), 1);
+}
+
+/// Bundles captured before this change carry the received UUID on the
+/// private parent. They stay readable, and restaging one seals the copy
+/// without it.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires root and an explicitly supplied disposable btrfs fixture directory"]
+fn stamped_parent_bundles_stay_sendable_and_restage_unstamped() {
+    let Some(root) = std::env::var_os("SPACE_NODEMGR_TEST_BTRFS_DIR") else {
+        eprintln!("not opted in: SPACE_NODEMGR_TEST_BTRFS_DIR is unset");
+        return;
+    };
+    assert!(nix::unistd::geteuid().is_root());
+    let temp = tempfile::tempdir_in(root).unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let directory = trusted_paths::open_directory(&root).unwrap();
+    btrfs::create(&directory, "template".as_ref()).unwrap();
+    let template = artifact_fs::directory(&directory, "template".as_ref()).unwrap();
+    std::fs::write(root.join("template/rootfs.ext4"), b"original template").unwrap();
+    let received_uuid = Uuid::now_v7();
+    btrfs::stamp(&template, received_uuid).unwrap();
+    btrfs::set_readonly(&template, true).unwrap();
+    btrfs::snapshot(&template, &directory, "instance".as_ref(), false).unwrap();
+    let instance = artifact_fs::directory(&directory, "instance".as_ref()).unwrap();
+    let expected = b"suspended rootfs";
+    std::fs::write(root.join("instance/rootfs.ext4"), expected).unwrap();
+    // A version 1 bundle as earlier releases captured it.
+    let legacy = root.join("legacy");
+    std::fs::create_dir_all(legacy.join(DIRECTORY)).unwrap();
+    let bundle = trusted_paths::open_directory(&legacy.join(DIRECTORY)).unwrap();
+    stamped_template_copy(&template, &bundle, "parent", received_uuid);
+    btrfs::snapshot(&instance, &bundle, "source".as_ref(), true).unwrap();
+    let uuid_of = |name: &str| {
+        btrfs::info(&artifact_fs::directory(&bundle, name.as_ref()).unwrap())
+            .unwrap()
+            .1
+            .uuid
+            .unwrap()
+    };
+    let id = Uuid::now_v7();
+    let manifest = Manifest {
+        version: STAMPED_PARENT_VERSION,
+        source_id: id,
+        source_uuid: uuid_of("source"),
+        parent_uuid: uuid_of("parent"),
+        received_uuid,
+    };
+    std::fs::write(
+        legacy.join(DIRECTORY).join(MANIFEST),
+        serde_json::to_vec(&manifest).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(received_uuid_holders(&root, received_uuid), 2);
+    assert_eq!(inspect(&legacy, id).unwrap(), expected.len() as u64);
+    assert_eq!(
+        receive_materialized(&root, &directory, &legacy, id),
+        expected
+    );
+    // A version 2 manifest over the stamped parent is a lineage mismatch.
+    let mismatched = Manifest {
+        version: UNSTAMPED_PARENT_VERSION,
+        ..manifest
+    };
+    std::fs::write(
+        legacy.join(DIRECTORY).join(MANIFEST),
+        serde_json::to_vec(&mismatched).unwrap(),
+    )
+    .unwrap();
+    let artifact = trusted_paths::open_directory(&legacy).unwrap();
+    assert!(matches!(
+        SendSource::open(&artifact, id),
+        Err(SourceError::LineageMismatch)
+    ));
+    std::fs::write(
+        legacy.join(DIRECTORY).join(MANIFEST),
+        serde_json::to_vec(&Manifest {
+            version: STAMPED_PARENT_VERSION,
+            ..mismatched
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    // Restaging, as a send lease does, writes an unstamped version 2 copy.
+    let source = SendSource::open(&artifact, id).unwrap();
+    let restaged = root.join("restaged");
+    std::fs::create_dir(&restaged).unwrap();
+    let restaged_dir = trusted_paths::open_directory(&restaged).unwrap();
+    let lease = Uuid::now_v7();
+    capture_open(
+        &restaged_dir,
+        &source.parent,
+        &source.source,
+        lease,
+        source.received_uuid,
+    )
+    .unwrap();
+    drop(source);
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(restaged.join(DIRECTORY).join(MANIFEST)).unwrap())
+            .unwrap();
+    assert_eq!(manifest["version"], UNSTAMPED_PARENT_VERSION);
+    assert_eq!(received_uuid_holders(&root, received_uuid), 2);
+    artifact_fs::remove_at(&directory, "legacy".as_ref()).unwrap();
+    assert_eq!(received_uuid_holders(&root, received_uuid), 1);
+    assert_eq!(
+        receive_materialized(&root, &directory, &restaged, lease),
+        expected
     );
 }
