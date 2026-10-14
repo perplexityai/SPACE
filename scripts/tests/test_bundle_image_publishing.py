@@ -1,6 +1,8 @@
 """Building bundle images in GitHub Actions and publishing them to ECR from `main`."""
 
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import subprocess
@@ -568,42 +570,48 @@ class EcrLoginRetryTests(unittest.TestCase):
 
 class BuildxPushRetryTests(unittest.TestCase):
     """Runs a stand-in for `docker buildx build` that fails `failures` times,
-    or for as long as its arguments carry an external cache with `cache_error`."""
+    or for as long as its arguments still carry a cache import or a mirror
+    build context, with `source_error`, and records each attempt's arguments."""
 
     def run_buildx(
         self,
         error: str,
         failures: int,
         *,
-        cache_error: str = "",
+        source_error: str = "",
+        success_log: str = "",
         args: tuple = (),
         published=None,
     ):
         with tempfile.TemporaryDirectory() as tmp_dir:
-            count = Path(tmp_dir) / "count"
+            calls = Path(tmp_dir) / "calls"
             script = (
-                "import pathlib, sys\n"
-                f"count = pathlib.Path({str(count)!r})\n"
-                "attempt = int(count.read_text()) + 1 if count.exists() else 1\n"
-                "count.write_text(str(attempt))\n"
-                f"if {cache_error!r} and '--cache-from' in sys.argv:\n"
-                f"    sys.stderr.write({cache_error!r} + '\\n')\n"
+                "import json, pathlib, sys\n"
+                f"calls = pathlib.Path({str(calls)!r})\n"
+                "with calls.open('a') as f: f.write(json.dumps(sys.argv[1:]) + '\\n')\n"
+                "attempt = len(calls.read_text().splitlines())\n"
+                "sources = any(a == '--cache-from' or 'docker-image://' in a for a in sys.argv)\n"
+                f"if {source_error!r} and sources:\n"
+                f"    sys.stderr.write({source_error!r} + '\\n')\n"
                 "    sys.exit(1)\n"
                 f"if attempt <= {failures}:\n"
                 f"    sys.stderr.write({error!r} + '\\n')\n"
                 "    sys.exit(1)\n"
+                f"sys.stderr.write({success_log!r})\n"
             )
+            self.stdout = io.StringIO()
             with (
                 mock.patch.object(bundle_builds.time, "sleep"),
                 mock.patch.object(sys, "stderr", new=tempfile.TemporaryFile("w+")),
+                contextlib.redirect_stdout(self.stdout),
             ):
                 try:
                     bundle_builds.run_buildx_command(
                         [sys.executable, "-c", script, *args], published=published
                     )
                 finally:
-                    attempts = int(count.read_text())
-        return attempts
+                    self.calls = [json.loads(line) for line in calls.read_text().splitlines()]
+        return len(self.calls)
 
     def test_a_dropped_push_is_retried(self) -> None:
         error = (
@@ -632,31 +640,102 @@ class BuildxPushRetryTests(unittest.TestCase):
     def test_paths_in_the_command_are_accepted(self) -> None:
         self.assertEqual(self.run_buildx("", failures=0, args=(Path("/context"),)), 1)
 
-    CACHE_FETCH_ERROR = (
+    READ_ERROR = (
         "ERROR: failed to build: failed to solve: failed to copy: httpReadSeeker: "
         f"failed open: could not fetch content descriptor sha256:{'c' * 64} "
         "(application/vnd.oci.image.layer.v1.tar+gzip) from remote: not found"
     )
-    CACHE_ARGS = (
+    # As BuildKit reports a cache layer it could not read while pushing.
+    PUSH_READ_ERROR = (
+        f"ERROR: failed to build: failed to solve: failed to push {REGISTRY}/space/ui:{A}: "
+        "failed to copy: httpReadSeeker: failed open: could not fetch content "
+        f"descriptor sha256:{'c' * 64} (application/vnd.oci.image.layer.v1.tar+gzip) "
+        "from remote: not found"
+    )
+    CACHE_TO = f"type=registry,ref={CACHE_REPOSITORY}:ui-buildcache-image,mode=max"
+    MIRROR_CONTEXT = (
+        "--build-context=public.ecr.aws/docker/library/debian:bookworm-slim="
+        f"docker-image://ghcr.io/example/mirror@sha256:{'d' * 64}"
+    )
+    LOCAL_CONTEXT = ("--build-context", "space-rust-artifact-api=/tmp/artifacts")
+    SOURCES = (
         "--cache-from", f"type=registry,ref={CACHE_REPOSITORY}:ui-buildcache-image",
-        "--cache-to", f"type=registry,ref={CACHE_REPOSITORY}:ui-buildcache-image,mode=max",
+        "--cache-to", CACHE_TO, MIRROR_CONTEXT, *LOCAL_CONTEXT,
     )
 
-    def test_a_damaged_cache_falls_back_to_a_build_without_it(self) -> None:
+    def test_a_damaged_cache_or_mirror_falls_back_to_the_sources(self) -> None:
+        attempts = self.run_buildx("", failures=0, source_error=self.READ_ERROR, args=self.SOURCES)
+
+        self.assertEqual(attempts, 2)
+        retry = self.calls[1]
+        self.assertNotIn("--cache-from", retry)
+        self.assertFalse(any("docker-image://" in arg for arg in retry))
+        # The export stays, so a rebuild on main replaces the damaged cache, and
+        # local contexts such as the Rust artifacts stay too.
+        self.assertEqual(option_values(retry, "--cache-to"), [self.CACHE_TO])
+        self.assertEqual(option_values(retry, "--build-context"), [self.LOCAL_CONTEXT[1]])
+        self.assertIn("::warning::", self.stdout.getvalue())
+
+    def test_the_fallback_drops_registry_sources_in_either_spelling(self) -> None:
+        mirror = f"base=docker-image://ghcr.io/example/mirror@sha256:{'d' * 64}"
+        command = [
+            "build", "--cache-from", "type=registry,ref=a", "--cache-from=type=registry,ref=b",
+            "--build-context", mirror, f"--build-context={mirror}",
+            *self.LOCAL_CONTEXT, "--cache-to", self.CACHE_TO, ".",
+        ]
+
+        self.assertEqual(
+            bundle_builds.without_external_sources(command),
+            ["build", *self.LOCAL_CONTEXT, "--cache-to", self.CACHE_TO, "."],
+        )
+
+    def test_a_damaged_mirror_alone_falls_back_to_the_sources(self) -> None:
         attempts = self.run_buildx(
-            "", failures=0, cache_error=self.CACHE_FETCH_ERROR, args=self.CACHE_ARGS
+            "", failures=0, source_error=self.READ_ERROR, args=(self.MIRROR_CONTEXT,)
         )
 
         self.assertEqual(attempts, 2)
 
-    def test_a_fetch_failure_without_an_external_cache_still_fails(self) -> None:
-        with self.assertRaises(subprocess.CalledProcessError):
-            self.run_buildx(self.CACHE_FETCH_ERROR, failures=1)
+    def test_a_cache_layer_unreadable_at_push_falls_back(self) -> None:
+        attempts = self.run_buildx(
+            "", failures=0, source_error=self.PUSH_READ_ERROR, args=self.SOURCES
+        )
 
-    def test_a_failed_build_step_with_a_cache_still_fails(self) -> None:
+        self.assertEqual(attempts, 2)
+
+    def test_a_push_unreadable_but_stored_is_not_rebuilt(self) -> None:
+        attempts = self.run_buildx(
+            "", failures=0, source_error=self.PUSH_READ_ERROR, args=self.SOURCES,
+            published=lambda: True,
+        )
+
+        self.assertEqual(attempts, 1)
+
+    def test_a_read_failure_without_external_sources_still_fails(self) -> None:
+        with self.assertRaises(subprocess.CalledProcessError):
+            self.run_buildx(self.READ_ERROR, failures=1)
+        self.assertEqual(len(self.calls), 1)
+
+    def test_a_failed_build_step_with_external_sources_still_fails(self) -> None:
         error = 'ERROR: failed to build: failed to solve: process "/bin/sh -c false" did not complete successfully: exit code: 1'
         with self.assertRaises(subprocess.CalledProcessError):
-            self.run_buildx(error, failures=1, args=self.CACHE_ARGS)
+            self.run_buildx(error, failures=1, args=self.SOURCES)
+        self.assertEqual(len(self.calls), 1)
+
+    def test_a_failed_cache_export_is_reported(self) -> None:
+        log = (
+            "#13 exporting cache to registry\n"
+            "#13 preparing build cache for export 0.2s done\n"
+            "#13 ERROR: error writing layer blob: failed to do request: connection refused\n"
+        )
+        self.assertEqual(self.run_buildx("", failures=0, success_log=log), 1)
+        self.assertIn("::warning::Exporting the layer cache failed", self.stdout.getvalue())
+        self.assertIn("error writing layer blob", self.stdout.getvalue())
+
+    def test_a_successful_export_is_quiet(self) -> None:
+        log = "#13 exporting cache to registry\n#13 DONE 1.0s\n#14 ERROR: unrelated\n"
+        self.run_buildx("", failures=0, success_log=log)
+        self.assertNotIn("::warning::", self.stdout.getvalue())
 
     def test_a_failed_build_step_is_not_retried(self) -> None:
         error = "ERROR: failed to solve: process \"/bin/sh -c apt-get update\" did not complete successfully: exit code: 100"
@@ -749,11 +828,73 @@ class BuildkitMirrorTests(unittest.TestCase):
         self.assertEqual(images, [self.MIRRORED, bundle_builds.BUILDKIT_IMAGE])
         self.assertTrue(builder.buildx_builder_name)
 
+    def test_each_image_gets_a_builder_name_of_its_own(self) -> None:
+        # Docker as it behaves when a create times out after registering the
+        # builder and its removal fails too: that name stays taken.
+        env = {**github_main_env(), "SPACE_CI_IMAGE_MIRROR": "ghcr"}
+        builders: set[str] = set()
+        removed: list[str] = []
+
+        def fake_run(args, **kwargs):
+            args = list(args)
+            if args[:3] == ["docker", "buildx", "create"]:
+                name = args[args.index("--name") + 1]
+                if name in builders:
+                    return subprocess.CompletedProcess(args, 1, "", "existing instance")
+                builders.add(name)
+                if self.MIRRORED in args[args.index("--driver-opt") + 1]:
+                    raise subprocess.TimeoutExpired(args, kwargs["timeout"])
+            if args[:3] == ["docker", "buildx", "rm"]:
+                removed.append(args[-1])
+                if len(removed) == 1:
+                    return subprocess.CompletedProcess(args, 1, "", "daemon busy")
+                builders.discard(args[-1])
+            return subprocess.CompletedProcess(args, 0, "", "")
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            listing = Path(tmp_dir) / "mirrored-images.txt"
+            listing.write_text(
+                f"{bundle_builds.BUILDKIT_IMAGE} {self.MIRROR_DIGEST} ghcr.io/example/mirror:buildkit\n"
+            )
+            with (
+                mock.patch.dict(os.environ, {**env, "SPACE_MIRRORED_IMAGES": str(listing)}, clear=True),
+                mock.patch.object(bundle_builds, "run", side_effect=fake_run),
+            ):
+                builder = bundle_builds.BundleBuilder(["ui"])
+                builder.setup_buildx_builder()
+                started = builder.buildx_builder_name
+                builder.cleanup_buildx_builder()
+
+        self.assertTrue(started)
+        self.assertNotEqual(removed[0], started)
+        self.assertEqual(builders, set())
+
     def test_builds_outside_github_ci_use_the_source(self) -> None:
         self.assertEqual(
             self.setup_builder(github_main_env(), failing_images=set()),
             [bundle_builds.BUILDKIT_IMAGE],
         )
+
+
+class MirrorLookupTests(unittest.TestCase):
+    def test_a_hung_mirror_lookup_builds_from_the_from_images(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            hanging = Path(tmp_dir) / "mirror-images.sh"
+            hanging.write_text("exec sleep 30\n")
+            stdout = io.StringIO()
+            with (
+                mock.patch.dict(os.environ, {"SPACE_CI_IMAGE_MIRROR": "ghcr"}),
+                mock.patch.object(bundle_builds, "MIRROR_IMAGES_SCRIPT", hanging),
+                mock.patch.object(bundle_builds, "MIRROR_LOOKUP_TIMEOUT_SECONDS", 1),
+                contextlib.redirect_stdout(stdout),
+            ):
+                contexts = bundle_builds.BundleBuilder.mirrored_base_image_contexts(
+                    ["docker", "buildx", "build", "--file", "Dockerfile"]
+                )
+
+        self.assertEqual(contexts, [])
+        self.assertIn("::warning::Looking up the mirrored bases of Dockerfile timed out", stdout.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()

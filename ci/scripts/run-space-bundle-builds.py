@@ -71,6 +71,9 @@ REGISTRY_LOOKUP_TIMEOUT_SECONDS = 60
 BUILDX_CREATE_TIMEOUT_SECONDS = 60
 BUILDX_BOOTSTRAP_TIMEOUT_SECONDS = 180
 BUILDX_RM_TIMEOUT_SECONDS = 60
+# Bounds mirror-images.sh's lookup of a Dockerfile's mirrored bases, which
+# inspects each one in the mirror; past it, the build uses the FROM images.
+MIRROR_LOOKUP_TIMEOUT_SECONDS = 120
 # Downstream builder subclasses still read these during their compatibility transition.
 MAIN_HISTORY_DEPTH = 100
 MAIN_HISTORY_READ_ATTEMPTS = 3
@@ -87,13 +90,19 @@ TRANSIENT_PUSH_FAILURE_PATTERN = re.compile(
     r"|\b50[0234] (?:Internal Server Error|Bad Gateway|Service Unavailable|Gateway Timeout)\b)",
     re.IGNORECASE,
 )
-# A build that failed fetching a layer blob rather than running a step. When
-# the build imports an external cache, the blob may be the cache's: its
-# manifest was found, but a layer is missing, unreadable or corrupt.
-REMOTE_FETCH_FAILURE_PATTERN = re.compile(
-    r"^ERROR:.*(?:httpReadSeeker|could not fetch content descriptor|failed to copy:"
-    r"|unexpected status code|failed to verify|blob unknown)"
+# A build that could not read a layer blob a manifest named: missing,
+# unreadable or corrupt. BuildKit reports it the same way while building and,
+# for layers it took from a cache, while pushing ("failed to push ...:
+# httpReadSeeker: ..."). The blob may belong to an imported cache or to a
+# mirrored base image.
+LAYER_READ_FAILURE_PATTERN = re.compile(
+    r"^ERROR:.*(?:httpReadSeeker|could not fetch content descriptor"
+    r"|unexpected commit digest|failed size validation)"
 )
+# The progress lines of BuildKit's cache export, which logs its failures even
+# when `ignore-error=true` keeps them from failing the build.
+CACHE_EXPORT_VERTEX_PATTERN = re.compile(r"^#(\d+) exporting cache\b")
+VERTEX_ERROR_PATTERN = re.compile(r"^#(\d+) ERROR: (.*)")
 # Answers a retry cannot change: rejected, expired or missing credentials.
 REGISTRY_AUTH_FAILURE_PATTERN = re.compile(
     r"(?:\b40[013] (?:Bad Request|Unauthorized|Forbidden)\b|unauthorized|denied"
@@ -296,16 +305,27 @@ def mirrored_image_ref(name: str) -> str | None:
     return None
 
 
-def without_external_cache(command: Sequence[str]) -> list[str]:
-    """The command without its --cache-from and --cache-to options."""
+def without_external_sources(command: Sequence[str]) -> list[str]:
+    """The command without its cache imports and registry build contexts.
+
+    The build then takes every layer from the Dockerfile's own sources. Cache
+    exports stay, so a rebuild on main replaces a damaged cache; local build
+    contexts, such as the Rust artifacts, stay too.
+    """
     result: list[str] = []
-    skip = False
-    for arg in command:
-        if skip:
-            skip = False
-        elif arg in {"--cache-from", "--cache-to"}:
-            skip = True
-        elif not arg.startswith(("--cache-from=", "--cache-to=")):
+    args = iter(command)
+    for arg in args:
+        if arg == "--cache-from":
+            next(args, None)
+        elif arg == "--build-context":
+            value = next(args, "")
+            if "=docker-image://" not in value:
+                result.extend([arg, value])
+        elif arg.startswith("--cache-from=") or (
+            arg.startswith("--build-context=") and "=docker-image://" in arg
+        ):
+            continue
+        else:
             result.append(arg)
     return result
 
@@ -319,11 +339,13 @@ def run_buildx_command(
 ) -> subprocess.CompletedProcess[str]:
     """Run a buildx build, retrying registry rate limits and dropped pushes.
 
-    A build that imports an external cache and then fails to fetch a layer
-    runs once more without external cache, so a damaged or unreachable cache
-    costs a cold build rather than the job. `published`, when given, says
-    whether a push the build reported as failed has reached the registry
-    anyway; a retry would then collide with the immutable tag it wrote.
+    A build that fails reading a layer while it imports a cache or takes a
+    base from a registry build context (GitHub CI's mirror) runs once more
+    without either, so a damaged or unreachable copy costs a cold build from
+    the sources rather than the job. `published`, when given, says whether a
+    push the build reported as failed has reached the registry anyway; a
+    retry would then collide with the immutable tag it wrote. A cache export
+    that failed is reported as a warning, since it does not fail the build.
     """
     command = [str(arg) for arg in args]
     delay_seconds = BUILDX_RATE_LIMIT_INITIAL_DELAY_SECONDS
@@ -332,7 +354,9 @@ def run_buildx_command(
     while True:
         print(f"+ {shlex.join(command)}", file=sys.stderr, flush=True)
         retryable = False
-        fetch_failed = False
+        read_failed = False
+        export_vertices: set[str] = set()
+        export_error = ""
         with subprocess.Popen(
             command,
             text=True,
@@ -350,21 +374,35 @@ def run_buildx_command(
                     or REGISTRY_RATE_LIMIT_PATTERN.search(line) is not None
                     or TRANSIENT_PUSH_FAILURE_PATTERN.search(line) is not None
                 )
-                fetch_failed = fetch_failed or (
-                    REMOTE_FETCH_FAILURE_PATTERN.search(line) is not None
-                    and "failed to push" not in line
-                )
+                read_failed = read_failed or LAYER_READ_FAILURE_PATTERN.search(line) is not None
+                if match := CACHE_EXPORT_VERTEX_PATTERN.match(line):
+                    export_vertices.add(match.group(1))
+                elif (match := VERTEX_ERROR_PATTERN.match(line)) and match.group(1) in export_vertices:
+                    export_error = match.group(2).strip()
             returncode = process.wait()
 
         if returncode == 0:
+            if export_error:
+                print(
+                    f"::warning::Exporting the layer cache failed, so later runs reuse "
+                    f"an older cache or build cold: {export_error}"
+                )
             return subprocess.CompletedProcess(command, returncode)
-        if fetch_failed and "--cache-from" in command:
+        fallback = without_external_sources(command)
+        if read_failed and fallback != command:
+            if published is not None and published():
+                print(
+                    "Buildx reported a failed push, but the registry holds the image; "
+                    "not pushing again.",
+                    file=sys.stderr,
+                )
+                return subprocess.CompletedProcess(command, 0)
             print(
-                "--- :warning: The build failed fetching a layer while importing an "
-                "external cache; building once more without external cache.",
-                file=sys.stderr,
+                "::warning::The build could not read a layer from the layer cache or "
+                "the image mirror; building once more from the Dockerfile's sources "
+                "without them."
             )
-            command = without_external_cache(command)
+            command = fallback
             continue
         if not retryable:
             raise subprocess.CalledProcessError(returncode, command)
@@ -611,6 +649,7 @@ class BundleBuilder:
         self._targets: list[Target] | None = None
         self.ecr_logged_in_hosts: set[str] = set()
         self.buildx_builder_name = ""
+        self._abandoned_builders: list[str] = []
         self.disable_external_cache = False
         self._branch_name: str | None = None
         self._uv_bin: str | None = None
@@ -1285,18 +1324,18 @@ class BundleBuilder:
         return [mirrored, BUILDKIT_IMAGE] if mirrored else [BUILDKIT_IMAGE]
 
     @staticmethod
-    def remove_buildx_builder(name: str) -> None:
+    def remove_buildx_builder(name: str) -> bool:
         try:
-            run(
+            return run(
                 ["docker", "buildx", "rm", "--force", name],
                 check=False,
                 timeout=BUILDX_RM_TIMEOUT_SECONDS,
-            )
+            ).returncode == 0
         except subprocess.TimeoutExpired:
             print(f"--- :warning: Removing buildx builder {name} timed out.")
+            return False
 
-    @classmethod
-    def start_buildx_builder(cls, name: str, image: str) -> bool:
+    def start_buildx_builder(self, name: str, image: str) -> bool:
         create = [
             "docker",
             "buildx",
@@ -1322,8 +1361,10 @@ class BundleBuilder:
                 print(f"--- :warning: {step.capitalize()} timed out after {timeout}s.")
             if failed:
                 print(f"--- :warning: Failed to {step} buildx builder {name} from {image}.")
-                if step == "bootstrap":
-                    cls.remove_buildx_builder(name)
+                # A create that timed out may still have registered the builder;
+                # one that can't be removed now is removed again at cleanup.
+                if not self.remove_buildx_builder(name):
+                    self._abandoned_builders.append(name)
                 return False
         return True
 
@@ -1331,8 +1372,10 @@ class BundleBuilder:
         if not self.should_use_explicit_buildx_builder() or self.buildx_builder_name:
             return
 
-        name = f"space-bundle-{random.randint(1000, 9999)}{random.randint(1000, 9999)}"
         for image in self.buildkit_images():
+            # A fresh name per image, so a builder a failed attempt couldn't
+            # remove doesn't block the next one.
+            name = f"space-bundle-{random.randint(1000, 9999)}{random.randint(1000, 9999)}"
             print(f"--- :docker: Creating buildx builder {name} from {image}")
             if self.start_buildx_builder(name, image):
                 self.buildx_builder_name = name
@@ -1360,6 +1403,9 @@ class BundleBuilder:
         if self.buildx_builder_name:
             self.remove_buildx_builder(self.buildx_builder_name)
             self.buildx_builder_name = ""
+        for name in self._abandoned_builders:
+            self.remove_buildx_builder(name)
+        self._abandoned_builders.clear()
         for temporary_directory in self._temporary_directories:
             temporary_directory.cleanup()
         self._temporary_directories.clear()
@@ -1444,10 +1490,18 @@ class BundleBuilder:
         if not os.environ.get("SPACE_CI_IMAGE_MIRROR") or "--file" not in command:
             return []
         dockerfile = command[list(command).index("--file") + 1]
-        result = run(
-            ["bash", str(MIRROR_IMAGES_SCRIPT), "build-contexts", dockerfile],
-            capture=True,
-        )
+        try:
+            result = run(
+                ["bash", str(MIRROR_IMAGES_SCRIPT), "build-contexts", dockerfile],
+                capture=True,
+                timeout=MIRROR_LOOKUP_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired:
+            print(
+                f"::warning::Looking up the mirrored bases of {dockerfile} timed out "
+                f"after {MIRROR_LOOKUP_TIMEOUT_SECONDS}s; building from its FROM images."
+            )
+            return []
         sys.stderr.write(result.stderr)
         return result.stdout.split()
 

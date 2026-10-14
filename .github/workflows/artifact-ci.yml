@@ -92,12 +92,13 @@ jobs:
           persist-credentials: false
 
       # For the image mirror and the layer cache. Both fall back to the
-      # sources when GHCR is unavailable, so a failed login only warns.
+      # sources when GHCR is unavailable, so a failed or stalled login only
+      # warns.
       - name: Log in to GHCR
         env:
           GHCR_TOKEN: ${{ github.token }}
         run: |
-          printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin ||
+          printf '%s' "$GHCR_TOKEN" | timeout 60 docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin ||
             echo "::warning::Could not log in to ghcr.io; the build takes its bases and layers from the sources"
 
       # Used for the registry login at the start of the build and the push at
