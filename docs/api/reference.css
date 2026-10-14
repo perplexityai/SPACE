@@ -15,7 +15,6 @@ a { color: var(--docs-color-accent); }
   background: var(--docs-color-background);
   font-size: 13px;
 }
-.docs-utility-links { display: flex; gap: 24px; }
 .docs-utility a { text-decoration: none; }
 .docs-utility a:hover { text-decoration: underline; }
 #reference { padding-top: calc(var(--docs-header-height) + var(--docs-utility-height)); }
@@ -25,6 +24,10 @@ a { color: var(--docs-color-accent); }
 /* Group labels need full opacity for contrast with the muted sidebar palette. */
 #reference .menu-content [data-item-id^="group/"] > label { opacity: 1; }
 #reference .api-content { min-width: 0; }
+/* The release version lives in the shared header; retain any other API metadata. */
+#reference .api-info > h1 { display: none; }
+#reference .api-info,
+#reference .api-content > div:has(> div > .api-info) { padding-block: 0; }
 /* Keep wide field tables accessible inside the native content column. */
 #reference .api-content table { display: block; max-width: 100%; overflow-x: auto; }
 footer { padding: 24px 32px; font-size: 13px; }
@@ -47,6 +50,5 @@ footer { padding: 24px 32px; font-size: 13px; }
 
 @media screen and (max-width: 620px) {
   .docs-utility { padding-inline: 20px; font-size: 12px; }
-  .docs-utility-links { gap: 16px; }
   #reference h1 { font-size: 26px; }
 }

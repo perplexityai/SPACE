@@ -149,18 +149,6 @@ Redoc.init(spec, referenceTheme(${JSON.stringify(options)}), document.getElement
   if (error) { document.body.dataset.renderError = String(error); throw error; }
   enhanceSchemaNavigation(${JSON.stringify(schemaCatalog)}, document.querySelector('.docs-utility').getBoundingClientRect().bottom);
   initializeDocsMenu();
-  // The outer utility links use browser anchors rather than Redoc's scroller.
-  document.querySelectorAll('.docs-utility a[href^="#"]').forEach(link => {
-    link.addEventListener('click', event => {
-      if (event.defaultPrevented || event.button !== 0 || event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) return;
-      requestAnimationFrame(() => {
-        const target = document.getElementById(decodeURIComponent(link.hash.slice(1)));
-        if (!target) return;
-        const offset = document.querySelector('.docs-utility').getBoundingClientRect().bottom;
-        window.scrollTo(0, window.scrollY + target.getBoundingClientRect().top + 1 - offset);
-      });
-    });
-  });
   document.body.dataset.renderReady = 'true';
 });\n`);
 writeFileSync(resolve(output, 'index.html'), `<!doctype html>
@@ -175,13 +163,13 @@ writeFileSync(resolve(output, 'index.html'), `<!doctype html>
 <button class="docs-menu-toggle" type="button" aria-label="Toggle navigation" aria-expanded="false" aria-controls="reference-menu" hidden>
 <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M4 6h16M4 12h16M4 18h16" fill="none" stroke="currentColor" stroke-width="2"/></svg>
 </button>
-<a class="docs-brand" href="https://github.com/perplexityai/SPACE/blob/${commit}/docs/introduction.md"><strong>SPACE</strong> Docs</a>
+<a class="docs-brand" href="https://github.com/perplexityai/SPACE/blob/${commit}/docs/introduction.md"><strong>SPACE</strong> ${md.utils.escapeHtml(spec.info.version)}</a>
 </div>
 <nav class="docs-sections" aria-label="Documentation sections">
 <a href="https://github.com/perplexityai/SPACE/blob/${commit}/docs/introduction.md">Guide</a>
 <a href="index.html" aria-current="page">API reference</a></nav></header>
 <nav class="docs-utility" aria-label="API reading controls">
-<div class="docs-utility-links"><a href="#section/Overview">Overview</a><a href="#tag/Sandboxes">Endpoints</a><a href="openapi.json" download>Download OpenAPI</a></div></nav>
+<a href="openapi.json" download>Download OpenAPI</a></nav>
 <template id="overview">${overview}</template>
 <section id="reference" aria-label="Endpoint reference"></section>
 <footer><a href="build.json">Build details</a></footer>

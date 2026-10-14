@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import tomllib
 from urllib.parse import unquote, urlsplit, urlunsplit
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -152,6 +153,9 @@ def build():
     with tempfile.TemporaryDirectory(prefix="guide-", dir=OUTPUT.parent) as temp:
         stage = Path(temp)
         stage_sources(stage)
+        version = tomllib.loads((ROOT / "Cargo.toml").read_text())["workspace"]["package"]["version"]
+        header = stage / "theme/header.hbs"
+        header.write_text(header.read_text().replace("{{ space_version }}", escape(version)))
         subprocess.run(["mdbook", "build", str(stage)], check=True)
         rendered = stage / "book"
         for asset in (*LIBRARY_ASSETS, "LICENSE-mdBook.txt"):
