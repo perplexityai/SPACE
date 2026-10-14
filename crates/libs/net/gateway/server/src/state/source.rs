@@ -13,7 +13,7 @@ use pplx_space_net_common::{
     proto::NetworkPolicyV1 as NetworkPolicyProto,
 };
 use pplx_space_spaced_common::proto::host_control::{
-    GetNetworkPolicyRequest, host_control_client::HostControlClient,
+    GetNetworkPolicyRequest, GetNetworkPolicyResponse, host_control_client::HostControlClient,
 };
 
 use super::credentials::{InvalidNetworkCredentialSnapshot, NetworkCredentialSnapshot};
@@ -83,7 +83,7 @@ fn network_policy_from_host_control_proto(
 struct InitialNetworkState {
     policy: NetworkPolicyV1,
     network_credentials: NetworkCredentialSnapshot,
-    policy_ref: String,
+    policy_ref: EffectiveNetworkPolicyRef,
     network_tx_bytes: u64,
     network_rx_bytes: u64,
 }
@@ -216,7 +216,7 @@ where
             SandboxEventType::NetworkPolicyEnforcementCompleted,
             SandboxEventSource::NetGateway,
             details()
-                .installed_network_policy_ref(state.policy_ref.clone())
+                .installed_network_policy_ref(state.policy_ref.to_string())
                 .result("policy_hydrated"),
         ),
         Err(error) => emit_sandbox_event(
@@ -255,17 +255,7 @@ async fn pull_network_state(
         .await
         .map_err(|source| HydrateNetworkStateError::GetNetworkPolicy { sandbox_id, source })?
         .into_inner();
-    let policy = network_policy_from_host_control_proto(response.effective_policy.as_ref())?;
-    let network_credentials =
-        NetworkCredentialSnapshot::from_wire(response.network_credentials, &policy)
-            .map_err(NetworkPolicyFromHostControlError::InvalidNetworkCredentials)?;
-    Ok(InitialNetworkState {
-        policy,
-        network_credentials,
-        policy_ref: response.effective_policy_ref,
-        network_tx_bytes: response.network_tx_bytes,
-        network_rx_bytes: response.network_rx_bytes,
-    })
+    InitialNetworkState::from_host_control(response)
 }
 
 pub(crate) fn host_control_policy_loader(
@@ -284,24 +274,40 @@ pub(crate) fn host_control_policy_loader(
         Box::pin(async move {
             let pulled = pull_initial_network_state(sandbox_id, wait).await?;
             stats.merge_persisted_network_bytes(pulled.network_tx_bytes, pulled.network_rx_bytes);
-            pulled.into_policy()
+            Ok(pulled.into_policy())
         })
     })
 }
 
 impl InitialNetworkState {
-    fn into_policy(self) -> Result<PulledNetworkPolicy, HydrateNetworkStateError> {
-        let policy_ref = self.policy_ref.parse().map_err(|source| {
+    fn from_host_control(
+        response: GetNetworkPolicyResponse,
+    ) -> Result<Self, HydrateNetworkStateError> {
+        let policy = network_policy_from_host_control_proto(response.effective_policy.as_ref())?;
+        let network_credentials =
+            NetworkCredentialSnapshot::from_wire(response.network_credentials, &policy)
+                .map_err(NetworkPolicyFromHostControlError::InvalidNetworkCredentials)?;
+        let policy_ref = response.effective_policy_ref.parse().map_err(|source| {
             HydrateNetworkStateError::InvalidReference {
-                reference: self.policy_ref,
+                reference: response.effective_policy_ref,
                 source,
             }
         })?;
-        Ok(PulledNetworkPolicy {
-            policy: self.policy,
+        Ok(Self {
+            policy,
+            network_credentials,
             policy_ref,
-            network_credentials: self.network_credentials,
+            network_tx_bytes: response.network_tx_bytes,
+            network_rx_bytes: response.network_rx_bytes,
         })
+    }
+
+    fn into_policy(self) -> PulledNetworkPolicy {
+        PulledNetworkPolicy {
+            policy: self.policy,
+            policy_ref: self.policy_ref,
+            network_credentials: self.network_credentials,
+        }
     }
 }
 

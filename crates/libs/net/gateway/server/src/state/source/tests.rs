@@ -5,16 +5,29 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 fn network_policy_loader_requires_v1_and_a_valid_reference() {
     let v1 = NetworkPolicyV1::deny_all();
     let v1_proto = NetworkPolicyProto::from(&v1);
+    let response = GetNetworkPolicyResponse {
+        effective_policy: Some(v1_proto),
+        effective_policy_ref: EffectiveNetworkPolicyRef::no_identity().to_string(),
+        ..Default::default()
+    };
 
     assert_eq!(
-        network_policy_from_host_control_proto(Some(&v1_proto)).unwrap(),
-        v1.clone(),
+        InitialNetworkState::from_host_control(response.clone())
+            .unwrap()
+            .into_policy()
+            .policy,
+        v1,
         "the V1 host-control field hydrates the gateway"
     );
 
     assert!(matches!(
-        network_policy_from_host_control_proto(None),
-        Err(NetworkPolicyFromHostControlError::MissingV1Policy)
+        InitialNetworkState::from_host_control(GetNetworkPolicyResponse {
+            effective_policy: None,
+            ..response.clone()
+        }),
+        Err(HydrateNetworkStateError::Policy(
+            NetworkPolicyFromHostControlError::MissingV1Policy
+        ))
     ));
 
     for (reference, expected) in [
@@ -24,15 +37,12 @@ fn network_policy_loader_requires_v1_and_a_valid_reference() {
             EffectiveNetworkPolicyRefParseError::InvalidFormat,
         ),
     ] {
-        let error = InitialNetworkState {
-            policy: v1.clone(),
-            network_credentials: Default::default(),
-            policy_ref: reference.to_owned(),
-            network_tx_bytes: 0,
-            network_rx_bytes: 0,
-        }
-        .into_policy()
-        .unwrap_err();
+        let error = InitialNetworkState::from_host_control(GetNetworkPolicyResponse {
+            effective_policy_ref: reference.to_owned(),
+            ..response.clone()
+        })
+        .err()
+        .expect("host-control responses must reject invalid references before hydration succeeds");
         assert_eq!(
             std::error::Error::source(&error)
                 .unwrap()
@@ -92,7 +102,7 @@ async fn initial_hydration_treats_refusal_before_registration_as_pending() {
                         Ok(InitialNetworkState {
                             policy: NetworkPolicyV1::allow_all(),
                             network_credentials: Default::default(),
-                            policy_ref: String::new(),
+                            policy_ref: EffectiveNetworkPolicyRef::no_identity(),
                             network_tx_bytes: 0,
                             network_rx_bytes: 0,
                         })
