@@ -11,13 +11,13 @@ use std::ffi::OsStr;
 use std::sync::{Arc, Mutex};
 use tokio_stream::wrappers::TcpListenerStream;
 
-const TEMPLATE: &str = "prefetch-catalog-fixture";
+pub(crate) const TEMPLATE: &str = "prefetch-catalog-fixture";
 const TOKEN: &str = "synthetic-prefetch-catalog-token";
 const CHILD_ENDPOINT: &str = "SPACE_TEST_PREFETCH_CATALOG_ENDPOINT";
 
-struct Catalog {
-    endpoint: String,
-    token_file: tempfile::NamedTempFile,
+pub(crate) struct Catalog {
+    pub(crate) endpoint: String,
+    pub(crate) token_file: tempfile::NamedTempFile,
     server: tokio::task::JoinHandle<()>,
     _database: pplx_space_db_test_fixtures::TestDb,
 }
@@ -37,7 +37,7 @@ fn publisher<T>(body: T) -> tonic::Request<T> {
 }
 
 impl Catalog {
-    async fn start(visibility: TemplateVisibility) -> TestResult<Self> {
+    pub(crate) async fn start(visibility: TemplateVisibility) -> TestResult<Self> {
         let database = pplx_space_db_test_fixtures::pg_test_db().await?;
         let mut service = ClusterApiService::new(database.pool.clone());
         // The shared PostgreSQL fixture owns this synthetic organization.

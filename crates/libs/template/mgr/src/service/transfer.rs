@@ -95,12 +95,12 @@ impl TemplateManagerService {
             )));
         }
 
-        let bdir = build_dir(template_id, &content_hash);
+        let build_path = build_artifacts_dir(&self.artifact_store.root, template_id, &content_hash);
+        let bdir = build_path.to_string_lossy().into_owned();
         let include_snapshot = req.include_snapshot;
         let snapshot_dimensions =
             optional_snapshot_dimensions(req.snapshot_vcpu, req.snapshot_memory_mib)?;
 
-        let build_path = PathBuf::from(&bdir);
         let metadata_json = std::fs::read(build_path.join("metadata.json")).unwrap_or_default();
         let manifest_json = std::fs::read(build_path.join("manifest.json")).unwrap_or_default();
         let manifest: pplx_space_common_core::types::TemplateManifest =

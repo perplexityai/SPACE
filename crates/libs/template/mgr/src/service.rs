@@ -1462,7 +1462,7 @@ impl TemplateManagerService {
     }
 
     #[cfg(test)]
-    fn new_with_template_root(
+    pub(crate) fn new_with_template_root(
         conn: rusqlite::Connection,
         root: impl Into<PathBuf>,
     ) -> Result<Self, rusqlite::Error> {

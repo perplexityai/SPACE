@@ -36,11 +36,13 @@ NODE_API_INTERNAL_AUDIENCE="${NODE_API_INTERNAL_AUDIENCE:-space-node-api-interna
 # Which client ServiceAccounts node-api accepts on the NodeApi surface.
 # space-api is the caller under test; the controller and cluster-api entries
 # keep the local wiring aligned with the deployed node-api allowlist.
-NODE_API_ALLOWED_SAS="${NODE_API_ALLOWED_SAS:-space-api,space-cluster-controller,space-cluster-api}"
+NODE_API_ALLOWED_SAS="${NODE_API_ALLOWED_SAS:-space-api,space-cluster-controller,space-cluster-api,${NODE_API_SA}}"
 # Exact subset authorized for tokenless SpacedWaitReady lifecycle probes.
 NODE_API_TRUSTED_WAIT_READY_SAS="${NODE_API_TRUSTED_WAIT_READY_SAS:-space-api,space-cluster-controller}"
 # Independent subset authorized to supply network/auto-lifecycle policy and generations.
 NODE_API_TRUSTED_POLICY_SAS="${NODE_API_TRUSTED_POLICY_SAS:-space-api,space-cluster-controller}"
+# API initiates pulls; node-api exports from the source on behalf of the target.
+NODE_API_TEMPLATE_TRANSFER_SAS="${NODE_API_TEMPLATE_TRANSFER_SAS:-space-api,${NODE_API_SA}}"
 # nodeApiInternal accepts space-api (control-plane request path) and
 # space-cluster-controller (warm-pool WorkerApiInternal/WakeSandbox). Mirrors the
 # node-api chart allowlist.

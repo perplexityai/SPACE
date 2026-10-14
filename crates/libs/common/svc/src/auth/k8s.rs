@@ -33,6 +33,8 @@ const SPACE_NODE_API_AUTH_TRUSTED_WAIT_READY_SERVICE_ACCOUNTS_ENV: &str =
     "SPACE_NODE_API_AUTH_TRUSTED_WAIT_READY_SERVICE_ACCOUNTS";
 const SPACE_NODE_API_AUTH_TRUSTED_POLICY_SERVICE_ACCOUNTS_ENV: &str =
     "SPACE_NODE_API_AUTH_TRUSTED_POLICY_SERVICE_ACCOUNTS";
+const SPACE_NODE_API_AUTH_TEMPLATE_TRANSFER_SERVICE_ACCOUNTS_ENV: &str =
+    "SPACE_NODE_API_AUTH_TEMPLATE_TRANSFER_SERVICE_ACCOUNTS";
 const SPACE_NODE_API_INTERNAL_AUTH_ALLOWED_SERVICE_ACCOUNTS_ENV: &str =
     "SPACE_NODE_API_INTERNAL_AUTH_ALLOWED_SERVICE_ACCOUNTS";
 const SPACE_CLUSTER_API_AUTH_ALLOWED_SERVICE_ACCOUNTS_ENV: &str =
@@ -560,7 +562,7 @@ impl K8sTokenAuthConfig {
                 SPACE_NODE_API_AUTH_TRUSTED_POLICY_SERVICE_ACCOUNTS_ENV,
             ),
             template_transfer_usernames: qualified_env_set(
-                "SPACE_NODE_API_AUTH_TEMPLATE_TRANSFER_SERVICE_ACCOUNTS",
+                SPACE_NODE_API_AUTH_TEMPLATE_TRANSFER_SERVICE_ACCOUNTS_ENV,
             ),
             node_api_internal_allowed_usernames: qualified_env_set(
                 SPACE_NODE_API_INTERNAL_AUTH_ALLOWED_SERVICE_ACCOUNTS_ENV,
@@ -582,6 +584,14 @@ impl K8sTokenAuthConfig {
     }
 
     pub(super) fn validate_for_role(&self, role: NodeRole) -> Result<(), AuthConfigError> {
+        if matches!(role, NodeRole::Worker | NodeRole::Builder)
+            && self.template_transfer_usernames.is_empty()
+        {
+            tracing::warn!(
+                setting = SPACE_NODE_API_AUTH_TEMPLATE_TRANSFER_SERVICE_ACCOUNTS_ENV,
+                "template transfer allowlist is empty; peer template transfers are disabled"
+            );
+        }
         if role == NodeRole::Worker && self.node_api_trusted_wait_ready_usernames.is_empty() {
             return Err(AuthConfigError::TrustedWaitReadyServiceAccountsMissing);
         }

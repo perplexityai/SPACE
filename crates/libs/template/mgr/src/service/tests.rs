@@ -7,6 +7,8 @@ use pplx_space_observability::test_capture::{CapturedEventsLayer, field_value};
 use std::{path::Path, sync::Arc};
 use tracing_subscriber::layer::SubscriberExt as _;
 
+mod export;
+
 #[tokio::test(flavor = "current_thread")]
 async fn background_loop_observer_contains_inner_panic() {
     let layer = CapturedEventsLayer::new().with_event_filter(|fields| {

@@ -260,7 +260,9 @@ pub async fn pull_template(
         snapshot_memory_mib: None,
     };
     let export_err = |e: Status| match e.code() {
-        tonic::Code::NotFound => Status::not_found(format!("{remote_addr}: {}", e.message())),
+        tonic::Code::NotFound | tonic::Code::PermissionDenied | tonic::Code::Unauthenticated => {
+            Status::new(e.code(), format!("{remote_addr}: {}", e.message()))
+        }
         _ => Status::unavailable(format!("export from {remote_addr} failed: {e}")),
     };
 

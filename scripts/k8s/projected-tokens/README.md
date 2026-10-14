@@ -73,6 +73,14 @@ RPCs they call. Policy trust is independent of the WaitReady trust set.
 The setup projects both normal and internal audience tokens into space-api; the
 internal token is required for policy-bearing pool adoption.
 
+Peer template transfers require the independent
+`SPACE_NODE_API_AUTH_TEMPLATE_TRANSFER_SERVICE_ACCOUNTS` allowlist. This setup
+uses `NODE_API_TEMPLATE_TRANSFER_SAS`, defaulting to `space-api,space-node-api`:
+the API initiates pulls and the receiving node-api requests exports from peers.
+Both must also be admitted by `NODE_API_ALLOWED_SAS`. An empty transfer list
+disables transfers and emits a startup warning; deployments without peer
+transfers may intentionally leave it empty.
+
 Shared static-token fallback cannot mutate policy when Kubernetes auth is enabled.
 Static-only deployments retain that authority. Policy-bearing cold creation,
 internal pool adoption, and worker/builder template updates require a trusted
