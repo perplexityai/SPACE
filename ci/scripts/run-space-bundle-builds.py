@@ -330,6 +330,36 @@ def without_external_sources(command: Sequence[str]) -> list[str]:
     return result
 
 
+def external_source_names(command: Sequence[str]) -> list[str]:
+    """How BuildKit's errors name the registries the command's cache imports
+    and registry build contexts read: each repository by reference and by its
+    registry API URL. A failure naming one, such as resolving a mirrored
+    base's metadata, is that copy's failure, not the build's.
+    """
+    names: list[str] = []
+    args = list(command)
+    for index, arg in enumerate(args):
+        if arg in {"--cache-from", "--build-context"} and index + 1 < len(args):
+            value = args[index + 1]
+        elif arg.startswith(("--cache-from=", "--build-context=")):
+            value = arg.split("=", 1)[1]
+        else:
+            continue
+        if "=docker-image://" in value:
+            ref = value.split("=docker-image://", 1)[1]
+        else:
+            refs = [part[4:] for part in value.split(",") if part.startswith("ref=")]
+            if not refs:
+                continue
+            ref = refs[0]
+        repository = ref.split("@", 1)[0]
+        host, _, path = repository.partition("/")
+        if ":" in path.rsplit("/", 1)[-1]:
+            path = path.rsplit(":", 1)[0]
+        names.extend([f"{host}/{path}", f"{host}/v2/{path}/"])
+    return names
+
+
 def run_buildx_command(
     args: Sequence[str],
     *,
@@ -340,8 +370,8 @@ def run_buildx_command(
     """Run a buildx build, retrying registry rate limits and dropped pushes.
 
     A build that fails reading a layer while it imports a cache or takes a
-    base from a registry build context (GitHub CI's mirror) runs once more
-    without either, so a damaged or unreachable copy costs a cold build from
+    base from a registry build context (GitHub CI's mirror), or fails with an
+    error that names one of those registries, runs once more without either, so a damaged or unreachable copy costs a cold build from
     the sources rather than the job. `published`, when given, says whether a
     push the build reported as failed has reached the registry anyway; a
     retry would then collide with the immutable tag it wrote. A cache export
@@ -354,7 +384,8 @@ def run_buildx_command(
     while True:
         print(f"+ {shlex.join(command)}", file=sys.stderr, flush=True)
         retryable = False
-        read_failed = False
+        source_failed = False
+        sources = external_source_names(command)
         export_vertices: set[str] = set()
         export_error = ""
         with subprocess.Popen(
@@ -374,7 +405,11 @@ def run_buildx_command(
                     or REGISTRY_RATE_LIMIT_PATTERN.search(line) is not None
                     or TRANSIENT_PUSH_FAILURE_PATTERN.search(line) is not None
                 )
-                read_failed = read_failed or LAYER_READ_FAILURE_PATTERN.search(line) is not None
+                source_failed = (
+                    source_failed
+                    or LAYER_READ_FAILURE_PATTERN.search(line) is not None
+                    or (line.startswith("ERROR:") and any(name in line for name in sources))
+                )
                 if match := CACHE_EXPORT_VERTEX_PATTERN.match(line):
                     export_vertices.add(match.group(1))
                 elif (match := VERTEX_ERROR_PATTERN.match(line)) and match.group(1) in export_vertices:
@@ -389,7 +424,7 @@ def run_buildx_command(
                 )
             return subprocess.CompletedProcess(command, returncode)
         fallback = without_external_sources(command)
-        if read_failed and fallback != command:
+        if source_failed and fallback != command:
             if published is not None and published():
                 print(
                     "Buildx reported a failed push, but the registry holds the image; "
@@ -398,9 +433,9 @@ def run_buildx_command(
                 )
                 return subprocess.CompletedProcess(command, 0)
             print(
-                "::warning::The build could not read a layer from the layer cache or "
-                "the image mirror; building once more from the Dockerfile's sources "
-                "without them."
+                "::warning::The build could not use the layer cache or the image "
+                "mirror; building once more from the Dockerfile's sources without "
+                "them."
             )
             command = fallback
             continue
@@ -1874,8 +1909,10 @@ class BundleBuilder:
         print(f"--- :docker: {self.cache_mode_message()}")
         print(f"--- :docker: {self.targets_message()}")
         self.wait_for_docker()
-        self.setup_buildx_builder()
         try:
+            # Inside the try, so builders a failed setup left are removed even
+            # when a publishing build then exits.
+            self.setup_buildx_builder()
             if self.should_publish_bundle_images() or self.uses_target_cache():
                 self.ensure_ecr_login()
             for feature in self.features:

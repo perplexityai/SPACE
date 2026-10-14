@@ -689,6 +689,41 @@ class BuildxPushRetryTests(unittest.TestCase):
             ["build", *self.LOCAL_CONTEXT, "--cache-to", self.CACHE_TO, "."],
         )
 
+    MIRROR_METADATA_FAILURE = (
+        "ERROR: failed to build: failed to solve: public.ecr.aws/docker/library/debian:bookworm-slim: "
+        f"failed to resolve source metadata for ghcr.io/example/mirror@sha256:{'d' * 64}: {{}}"
+    )
+
+    def test_a_mirror_metadata_failure_falls_back_to_the_sources(self) -> None:
+        manifest = f"https://ghcr.io/v2/example/mirror/manifests/sha256:{'d' * 64}"
+        for name, cause in (
+            ("TLS timeout", f'failed to do request: Head "{manifest}": net/http: TLS handshake timeout'),
+            ("rate limit", f"unexpected status from HEAD request to {manifest}: 429 Too Many Requests"),
+        ):
+            with self.subTest(name):
+                attempts = self.run_buildx(
+                    "", failures=0,
+                    source_error=self.MIRROR_METADATA_FAILURE.format(cause),
+                    args=(self.MIRROR_CONTEXT,),
+                )
+                # Once with the mirror, once without: not five times with it.
+                self.assertEqual(attempts, 2)
+                self.assertFalse(any("docker-image://" in arg for arg in self.calls[1]))
+
+    def test_errors_name_external_sources_by_reference_and_url(self) -> None:
+        command = [
+            "--cache-from", f"type=registry,ref={CACHE_REPOSITORY}:ui-buildcache-image",
+            self.MIRROR_CONTEXT, *self.LOCAL_CONTEXT, "--cache-to", self.CACHE_TO,
+        ]
+
+        self.assertEqual(
+            bundle_builds.external_source_names(command),
+            [
+                CACHE_REPOSITORY, "ghcr.io/v2/example/space-bundle-cache/",
+                "ghcr.io/example/mirror", "ghcr.io/v2/example/mirror/",
+            ],
+        )
+
     def test_a_damaged_mirror_alone_falls_back_to_the_sources(self) -> None:
         attempts = self.run_buildx(
             "", failures=0, source_error=self.READ_ERROR, args=(self.MIRROR_CONTEXT,)
@@ -867,6 +902,46 @@ class BuildkitMirrorTests(unittest.TestCase):
 
         self.assertTrue(started)
         self.assertNotEqual(removed[0], started)
+        self.assertEqual(builders, set())
+
+    def test_a_publishing_build_removes_its_failed_builders_before_exiting(self) -> None:
+        env = {**github_main_env(), "SPACE_CI_IMAGE_MIRROR": "ghcr"}
+        builders: set[str] = set()
+        rm_calls: list[str] = []
+
+        def fake_run(args, **kwargs):
+            args = list(args)
+            if args[:3] == ["docker", "buildx", "create"]:
+                builders.add(args[args.index("--name") + 1])
+            if args[:3] == ["docker", "buildx", "inspect"]:
+                return subprocess.CompletedProcess(args, 1, "", "pull failed")
+            if args[:3] == ["docker", "buildx", "rm"]:
+                rm_calls.append(args[-1])
+                # Each builder's first removal fails, as when the daemon is busy.
+                if rm_calls.count(args[-1]) == 1:
+                    return subprocess.CompletedProcess(args, 1, "", "daemon busy")
+                builders.discard(args[-1])
+            return subprocess.CompletedProcess(args, 0, "", "")
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            listing = Path(tmp_dir) / "mirrored-images.txt"
+            listing.write_text(
+                f"{bundle_builds.BUILDKIT_IMAGE} {self.MIRROR_DIGEST} ghcr.io/example/mirror:buildkit\n"
+            )
+            with (
+                mock.patch.dict(os.environ, {**env, "SPACE_MIRRORED_IMAGES": str(listing)}, clear=True),
+                mock.patch.object(bundle_builds, "run", side_effect=fake_run),
+            ):
+                builder = bundle_builds.BundleBuilder(["ui"])
+                with (
+                    mock.patch.object(builder, "wait_for_docker"),
+                    mock.patch.object(builder, "build_space_bundle_feature") as build,
+                    self.assertRaisesRegex(SystemExit, "Couldn't start the pinned BuildKit builder"),
+                ):
+                    builder.execute()
+
+        build.assert_not_called()
+        self.assertEqual(len(set(rm_calls)), 2)
         self.assertEqual(builders, set())
 
     def test_builds_outside_github_ci_use_the_source(self) -> None:
