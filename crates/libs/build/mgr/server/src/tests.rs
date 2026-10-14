@@ -600,6 +600,7 @@ async fn build_publish_carries_publication_authority() -> TestResult {
     let org = TemplateOrg::parse("018f0000-0000-7000-8000-000000000002")?;
     let grant = SystemPublicationGrantId::new();
     for publication in [
+        TemplatePublication::Tenant { org, grant: None },
         TemplatePublication::Tenant {
             org,
             grant: Some(TenantPublicationGrantId::new()),
