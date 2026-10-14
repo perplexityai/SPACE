@@ -292,21 +292,28 @@ advisory ones `WARNING`.
   rest. First come all `no_new_entries` and `no_raised_caps` findings: they
   compare with the base's copy by table and key, so they include the entries
   of a renamed or split pattern table even though those lines are unchanged.
+  `crate_names.policy_changed` findings, which compare with the base's
+  `ARCHITECTURE.toml`, come with them, although the report lists them last.
   Then come findings in the files the pull request changes (old or new name),
   and stale entries in the baseline for files it changes, such as files it
-  deletes. Each group keeps report order. With `file`, this changes nothing
-  that is shown. The step logs how many own advisory findings reviewdog will
-  show under the step's filter mode (with `file`, none in a file renamed
-  without edits); with more than 10, it says in the step summary that at
-  most 10 are annotated. Annotations are not the full inventory: every
-  finding is in the step's log and its rdjson output, or run `cargo arch`.
+  deletes, or, in `[crate_names]`, for a crate whose `Cargo.toml` it changes,
+  at the entry's member path. Each group keeps report order. With `file`, this
+  changes nothing that is shown. Required findings are annotated from the
+  report as it is, in their own run. The step logs how many own advisory
+  findings reviewdog will show under the step's filter mode (with `file`,
+  none in a file renamed without edits); with more than 10, it says in the
+  step summary that at most 10 are annotated. Annotations are not the full
+  inventory: every finding is in the step's log and its rdjson output, or run
+  `cargo arch`.
 
 A new catch-all crate's finding is on its own `Cargo.toml`, a file the pull
 request adds, so it is annotated in either mode and its `ERROR` fails the job.
-The same holds for a crate moved to a listed name's new path or a renamed
-library, whose manifest the pull request changes; a self-listed entry or a
-changed `allow` changes the baseline or `ARCHITECTURE.toml`, which switches to
-`nofilter`.
+So is a renamed library's, whose manifest the pull request edits. Moving a
+listed crate changes the root `Cargo.toml`'s `members`, where every listed
+crate is today, and a self-listed entry or a changed `allow` changes the
+baseline or `ARCHITECTURE.toml`: each switches to `nofilter`. A listed crate
+that is only a path dependency, moved without editing its manifest, would not
+be annotated with `file`; `tests/repository.rs` still fails on it.
 
 Only annotations are filtered. Once a behaviour is `required`,
 `tests/repository.rs` fails on any required finding anywhere in the tree.

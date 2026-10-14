@@ -168,11 +168,14 @@ jobs:
       # Pull requests only: archcheck writes its findings as rdjson, offline
       # from the clippy step's caches, even when clippy failed. Exit 1 means
       # required findings, which reviewdog decides on; anything else fails.
-      # no_new_entries and no_raised_caps compare with the baseline of the
-      # base: the first parent of the synthetic merge (fetch-depth 0 above),
-      # once resolve-migration-base.sh has checked the second is this pull
-      # request. If the base has no baseline, an empty one; if it can't be
-      # resolved, a warning and no comparison.
+      # The base is the first parent of the synthetic merge (fetch-depth 0
+      # above), once resolve-migration-base.sh has checked the second is this
+      # pull request. no_new_entries, no_raised_caps and crate_names.no_new
+      # compare with its architecture-baseline.toml, and
+      # crate_names.policy_changed with its ARCHITECTURE.toml; an empty file
+      # stands in for one the base lacks. If the base can't be resolved, a
+      # warning: the first two and policy_changed are skipped, and no_new
+      # allows only the crates listed when it was added.
       - name: Check repository structure
         id: archcheck
         if: >-
@@ -192,19 +195,33 @@ jobs:
             --env CARGO_TARGET_DIR=target/buildkite-lint --env PULL_REQUEST_HEAD "space-ci:${GITHUB_SHA}" bash -c '
               sccache --start-server >/dev/null 2>&1 && export RUSTC_WRAPPER=sccache
               mkdir -p target && git config --global --add safe.directory /workspace
-              base_file=target/archcheck-base-baseline.toml base_args=()
-              if base="$(bash ci/scripts/resolve-migration-base.sh "" "${PULL_REQUEST_HEAD}")"; then
-                if ! git cat-file -e "${base}:architecture-baseline.toml" 2>/dev/null; then
-                  echo "archcheck: ${base} has no architecture-baseline.toml; comparing with an empty one"
-                  : >"${base_file}" && base_args=(--base-baseline "${base_file}")
-                elif git show "${base}:architecture-baseline.toml" >"${base_file}"; then
-                  echo "archcheck: comparing with architecture-baseline.toml from ${base}"
-                  base_args=(--base-baseline "${base_file}")
+              base_args=() missing=()
+              # Passes the base copy of a file, or an empty file if the base has none.
+              base_copy() {
+                local file="target/archcheck-base-$2"
+                if ! git cat-file -e "${base}:$2" 2>/dev/null; then
+                  echo "archcheck: ${base} has no $2; comparing with an empty one"
+                  : >"${file}" && base_args+=("--$1" "${file}")
+                elif git show "${base}:$2" >"${file}"; then
+                  echo "archcheck: comparing with $2 from ${base}"
+                  base_args+=("--$1" "${file}")
+                else
+                  missing+=("$2")
                 fi
+              }
+              if base="$(bash ci/scripts/resolve-migration-base.sh "" "${PULL_REQUEST_HEAD}")"; then
+                base_copy base-baseline architecture-baseline.toml
+                base_copy base-architecture ARCHITECTURE.toml
+              else
+                missing=(architecture-baseline.toml ARCHITECTURE.toml)
               fi
-              if ((${#base_args[@]} == 0)); then
-                echo "::warning title=archcheck::Could not resolve the base baseline; no_new_entries and no_raised_caps are skipped."
-              fi
+              for file in "${missing[@]}"; do
+                case "${file}" in
+                  architecture-baseline.toml) skipped="no_new_entries and no_raised_caps are skipped, and crate_names.no_new allows only the crates listed when it was added" ;;
+                  ARCHITECTURE.toml) skipped="crate_names.policy_changed is skipped" ;;
+                esac
+                echo "::warning title=archcheck::Could not read the base ${file}; ${skipped}."
+              done
               exec cargo arch --format rdjson "${base_args[@]}" >target/archcheck.rdjson' || status=$?
           if ((status > 1)); then echo "::error title=archcheck::cargo arch exited ${status}; see above."; exit 1; fi
 
