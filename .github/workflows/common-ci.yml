@@ -512,7 +512,7 @@ jobs:
 
       # The nextest group `privileged`: 39 tests that need root, CAP_SYS_ADMIN,
       # a seccomp profile allowing pidfd_getfd, or a Docker socket, or whose
-      # root path differs, and 12 opt-in tests that return early because
+      # root path differs, and 14 opt-in tests that return early because
       # neither step opts them in. Also the M1 generator check. They run the binaries the step above built, whatever its result,
       # without compiling; the script returns anything it creates as root to
       # the runner user. No host network: the setup scripts and testcontainers

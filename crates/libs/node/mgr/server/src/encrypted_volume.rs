@@ -52,8 +52,25 @@ use crate::rootfs_dmcrypt::{
 
 use crate::device_backing::{self, Backing, LoopDevice};
 
+mod busy_holders;
 #[cfg(any(target_os = "linux", test))]
 mod mount_identity;
+
+/// Backoff between `cryptsetup close` attempts the kernel refuses as busy.
+///
+/// Each refused attempt spends about 5 s in libdevmapper's own remove-ioctl
+/// retries, so a close that stays busy gives up after about 29 s. Holder
+/// collection at the first and the last refusal adds up to about 10 s each
+/// ([`busy_holders::collect`]), so a busy close takes at most about 50 s
+/// before the mapping is force-freed, all of it under the caller's
+/// device-stack lock. A `cryptsetup` that hangs is bounded per attempt by
+/// [`crate::host_command::MUTATION_BUDGET`].
+const CLOSE_BUSY_RETRY_DELAYS: [std::time::Duration; 4] = [
+    std::time::Duration::from_millis(250),
+    std::time::Duration::from_millis(500),
+    std::time::Duration::from_secs(1),
+    std::time::Duration::from_secs(2),
+];
 
 /// btrfs needs a floor of real space for its metadata even when the backing
 /// file is sparse; 256 MiB clears the historical ~109 MiB minimum with room
@@ -338,10 +355,192 @@ async fn confirm_not_mounted(dir: &Path) -> Result<(), DmCryptError> {
     Ok(())
 }
 
+/// How a close retries and observes busy refusals. Production code uses
+/// [`CloseRetry::DEFAULT`]; tests shorten the schedule and inspect the holder
+/// reports.
+struct CloseRetry<'a> {
+    delays: &'a [std::time::Duration],
+    observe: &'a (dyn Fn(&busy_holders::BusyHolderReport) + Sync),
+}
+
+impl CloseRetry<'static> {
+    const DEFAULT: Self = Self {
+        delays: &CLOSE_BUSY_RETRY_DELAYS,
+        observe: &ignore_report,
+    };
+}
+
+fn ignore_report(_: &busy_holders::BusyHolderReport) {}
+
+/// Run `close` until it succeeds, fails for a reason other than busy, or the
+/// `delays` schedule is exhausted. `record` runs at the first busy refusal,
+/// while the holder is most likely still present, and at the last one,
+/// immediately before the caller force-frees the mapping. It receives the
+/// 1-based attempt number and whether the attempt was the last. Returns the
+/// number of attempts made.
+async fn close_with_busy_retry<Close, CloseFut, Record, RecordFut>(
+    mut close: Close,
+    delays: &[std::time::Duration],
+    mut record: Record,
+) -> Result<usize, DmCryptError>
+where
+    Close: FnMut() -> CloseFut,
+    CloseFut: std::future::Future<Output = Result<(), DmCryptError>>,
+    Record: FnMut(usize, bool, &DmCryptError) -> RecordFut,
+    RecordFut: std::future::Future<Output = ()>,
+{
+    use pplx_space_metrics::byok;
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        let error = match close().await {
+            Ok(()) => {
+                if attempt > 1 {
+                    byok::volume_close_busy(byok::CLOSE_BUSY_RECOVERED);
+                }
+                return Ok(attempt);
+            }
+            Err(error @ DmCryptError::Busy { .. }) => error,
+            Err(error) => {
+                if attempt > 1 {
+                    byok::volume_close_busy(byok::CLOSE_BUSY_FAILED);
+                }
+                return Err(error);
+            }
+        };
+        let delay = delays.get(attempt - 1).copied();
+        if attempt == 1 || delay.is_none() {
+            record(attempt, delay.is_none(), &error).await;
+        }
+        let Some(delay) = delay else {
+            byok::volume_close_busy(byok::CLOSE_BUSY_EXHAUSTED);
+            return Err(error);
+        };
+        tokio::time::sleep(delay).await;
+    }
+}
+
+/// Close a crypt mapping, retrying a busy refusal in case the holder is
+/// transient, and recording holder evidence as [`close_with_busy_retry`]
+/// describes.
+async fn close_mapper(
+    device: &busy_holders::BusyDevice,
+    retry: &CloseRetry<'_>,
+) -> Result<(), DmCryptError> {
+    let attempts = close_with_busy_retry(
+        || ReleaseDevice::Crypt(&device.mapper).run(),
+        retry.delays,
+        |attempt, final_attempt, error| {
+            let error = last_stderr_line(error);
+            async move {
+                let report = busy_holders::collect(device).await;
+                log_busy_holders(device, attempt, final_attempt, &error, &report);
+                (retry.observe)(&report);
+            }
+        },
+    )
+    .await?;
+    if attempts > 1 {
+        tracing::info!(
+            mapper = %device.mapper,
+            attempts,
+            "encrypted-volume close succeeded after busy retries"
+        );
+    }
+    Ok(())
+}
+
+/// A busy refusal's stderr repeats libdevmapper's 25 remove retries; the last
+/// line carries the reason.
+fn last_stderr_line(error: &DmCryptError) -> String {
+    match error {
+        DmCryptError::Command { cmd, stderr } | DmCryptError::Busy { cmd, stderr } => {
+            let reason = stderr
+                .lines()
+                .rev()
+                .map(str::trim)
+                .find(|line| !line.is_empty())
+                .unwrap_or_default();
+            format!("`{cmd}`: {reason}")
+        }
+        error => error.to_string(),
+    }
+}
+
+fn log_busy_holders(
+    device: &busy_holders::BusyDevice,
+    attempt: usize,
+    final_attempt: bool,
+    error: &str,
+    report: &busy_holders::BusyHolderReport,
+) {
+    tracing::warn!(
+        mapper = %device.mapper,
+        attempt,
+        final_attempt,
+        error,
+        open_count = ?report.open_count,
+        sysfs_holders = %report.sysfs_holders_summary(),
+        filesystem_alive = ?report.filesystem_alive,
+        mount_namespaces = %report.namespaces_summary(),
+        open_files = %report.files_summary(),
+        dmsetup_info = %report.dmsetup_info,
+        truncated = report.truncated,
+        scan_error = report.scan_error.as_deref(),
+        "encrypted-volume close refused as busy; recorded device holders"
+    );
+}
+
+/// The volume's identity for holder diagnostics, recorded while node-manager
+/// still has it mounted: once `release` has unmounted it, nothing in this
+/// namespace names the filesystem. Best-effort: a failed probe leaves a field
+/// unset and never fails the release.
+async fn record_busy_device(mapper: &str) -> busy_holders::BusyDevice {
+    let mut device = busy_holders::BusyDevice {
+        mapper: mapper.to_string(),
+        block: crypt_mapper_numbers(mapper).await.ok(),
+        ..busy_holders::BusyDevice::default()
+    };
+    let Ok(mountinfo) = read_mountinfo().await else {
+        return device;
+    };
+    let mounts: Vec<_> = mountinfo
+        .lines()
+        .filter_map(busy_holders::parse_mountinfo_line)
+        .filter(|mount| busy_holders::is_volume_mount(mount, &device, None))
+        .collect();
+    device.superblock = mounts
+        .iter()
+        .filter_map(|mount| mount.numbers)
+        .find(|numbers| Some(*numbers) != device.block);
+    device.mount_ids = mounts.iter().map(|mount| mount.id).collect();
+    #[cfg(target_os = "linux")]
+    if let Some(latest) = mounts.last() {
+        use std::os::unix::fs::MetadataExt;
+
+        let (dir, mount_id) = (PathBuf::from(latest.point), latest.id);
+        (device.fsid, device.file_dev) = tokio::task::spawn_blocking(move || {
+            let fsid = mount_identity::btrfs_fsid(&dir, mount_id).ok();
+            let file_dev = std::fs::metadata(&dir)
+                .ok()
+                .map(|metadata| (libc::major(metadata.dev()), libc::minor(metadata.dev())));
+            (fsid, file_dev)
+        })
+        .await
+        .unwrap_or_default();
+    }
+    device
+}
+
 /// Free a mapping whose regular close is refused by an open holder: rename it
-/// out of the way (the name is reusable immediately), arm a deferred remove,
-/// and arm loop autoclear. `--noudevsync` because state-changing dmsetup ops
-/// hang on udev cookies on these hosts.
+/// out of the way, arm a deferred remove, and arm loop autoclear. The name is
+/// reusable immediately, but the dm UUID is not: cryptsetup derives it from
+/// the LUKS UUID and the original name (`CRYPT-LUKS2-<uuid>-<name>`), and the
+/// renamed device keeps it until the holder exits and the deferred remove
+/// completes. Until then only a fresh format, which gets a new LUKS UUID, can
+/// reuse the name; [`explain_leaked_mapping`] reports the reopen case.
+/// `--noudevsync` because state-changing dmsetup ops hang on udev cookies on
+/// these hosts.
 async fn force_free_mapper(mapper: &str) {
     let loop_dev = match run("dmsetup", &["deps", "-o", "devname", mapper]).await {
         Ok(out) => loop_dep(&String::from_utf8_lossy(&out)),
@@ -395,8 +594,9 @@ async fn reconcile_stale_mapper(
     // A renamed mapper makes any surviving `/dev/dm-N` mounts undiscoverable
     // by this name. Do not close, force-free, or retry until every mountpoint
     // was successfully detached.
+    let device = record_busy_device(mapper).await;
     unmount_mapper_mounts(mapper).await?;
-    if ReleaseDevice::Crypt(mapper).run().await.is_err() {
+    if close_mapper(&device, &CloseRetry::DEFAULT).await.is_err() {
         force_free_mapper(mapper).await;
     }
     Ok(true)
@@ -604,7 +804,11 @@ async fn build_volume(
             false
         };
         if !reconciled {
-            return Err(error);
+            return Err(if fresh {
+                error
+            } else {
+                explain_leaked_mapping(mapper, error).await
+            });
         }
         run_with_stdin("cryptsetup", &open_args, dek).await?;
     }
@@ -614,6 +818,91 @@ async fn build_volume(
     }
 
     mount_mapper(mapper, mount_dir).await
+}
+
+/// `mount -o remount,ro` the filesystem mounted at `point`, and confirm its
+/// superblock is read-only. Best-effort: any failure is `false`, which only
+/// means the volume can't be sealed read-only.
+async fn remount_read_only(point: &str) -> bool {
+    if let Err(error) = run("mount", &["-o", "remount,ro", point]).await {
+        tracing::info!(
+            point,
+            error = last_stderr_line(&error),
+            "encrypted volume not remounted read-only"
+        );
+        return false;
+    }
+    read_mountinfo()
+        .await
+        .is_ok_and(|mountinfo| superblock_read_only(&mountinfo, point))
+}
+
+/// Does mountinfo show the superblock of the visible mount at `point` as
+/// read-only? This is the superblock options field (after the source), not
+/// the per-mount options, which a remount without `bind` doesn't change.
+fn superblock_read_only(mountinfo: &str, point: &str) -> bool {
+    mountinfo
+        .lines()
+        .filter_map(|line| {
+            let (head, tail) = line.split_once(" - ")?;
+            (head.split_whitespace().nth(4)? == point).then_some(tail)
+        })
+        .next_back()
+        .and_then(|tail| tail.split_whitespace().nth(2))
+        .is_some_and(|options| options.split(',').any(|option| option == "ro"))
+}
+
+/// Set the mapping's dm device read-only and confirm it. A `write(2)` to a
+/// read-only block device fails with EPERM, so a raw opener of the dm device
+/// can't change the backing either. The loop device is deliberately left
+/// writable: its read-only flag survives detach, so it would poison the next
+/// volume that attaches the same loop number. Only dm-crypt opens it, and
+/// dm-crypt has nothing to write once the filesystem and the dm device are
+/// read-only. A dm device is created afresh on every open, so its flag can't
+/// leak.
+async fn dm_device_read_only(mapper: &str) -> bool {
+    let device = format!("/dev/mapper/{mapper}");
+    let read_only = run("blockdev", &["--setro", &device]).await.is_ok()
+        && run("blockdev", &["--getro", &device])
+            .await
+            .is_ok_and(|out| String::from_utf8_lossy(&out).trim() == "1");
+    if !read_only {
+        tracing::warn!(device, "encrypted-volume dm device not set read-only");
+    }
+    read_only
+}
+
+/// Reopening a backing under `mapper` fails while an earlier force-freed
+/// mapping of the same backing still holds its dm UUID (see
+/// [`force_free_mapper`]). Name that cause, so the failure reads as waiting
+/// for a holder rather than as a damaged volume. The error stays a
+/// [`DmCryptError::Command`], which callers retry.
+async fn explain_leaked_mapping(mapper: &str, error: DmCryptError) -> DmCryptError {
+    let Ok(names) = run(
+        "dmsetup",
+        &["info", "--columns", "--noheadings", "-o", "name"],
+    )
+    .await
+    else {
+        return error;
+    };
+    let prefix = format!("{mapper}-leak-");
+    let names = String::from_utf8_lossy(&names);
+    let Some(leak) = names
+        .lines()
+        .map(str::trim)
+        .find(|name| name.starts_with(&prefix))
+    else {
+        return error;
+    };
+    DmCryptError::Command {
+        cmd: format!("cryptsetup open {mapper}"),
+        stderr: format!(
+            "force-freed mapping {leak} still holds this volume's dm UUID until its holder \
+             exits; retry later ({})",
+            last_stderr_line(&error)
+        ),
+    }
 }
 
 async fn mount_mapper(mapper: &str, mount_dir: &Path) -> Result<(), DmCryptError> {
@@ -639,15 +928,33 @@ async fn mount_mapper(mapper: &str, mount_dir: &Path) -> Result<(), DmCryptError
 /// Tear down an encrypted volume: unmount then close the dm-crypt device.
 /// Best-effort and idempotent. Leaves the backing file for the caller to
 /// delete (sandbox cleanup / dir reclaim removes it).
+///
+/// `Ok` means the backing is sealed: flushed, and either closed, or, when a
+/// holder outlives every close attempt, unwritable. In that case the
+/// filesystem's superblock and the dm device were verified read-only
+/// before the mapping was force-freed, and the mapping disappears when the
+/// holder exits. Reopening the same backing fails retryably until then (see
+/// [`explain_leaked_mapping`]).
 pub async fn release(
     sandbox_id: &SandboxId,
     volume_name: &str,
     mount_dir: &Path,
 ) -> Result<(), DmCryptError> {
+    release_with(sandbox_id, volume_name, mount_dir, &CloseRetry::DEFAULT).await
+}
+
+async fn release_with(
+    sandbox_id: &SandboxId,
+    volume_name: &str,
+    mount_dir: &Path,
+    retry: &CloseRetry<'_>,
+) -> Result<(), DmCryptError> {
     let mapper = mapper_name(sandbox_id, volume_name);
     // Release is the seal-safety gate: it may report Ok ONLY after positively
-    // confirming every mountpoint is gone AND the mapper is closed. Anything
-    // unconfirmed is retryable, never a success the caller stages as sealed.
+    // confirming every mountpoint is gone AND either the mapper is closed or
+    // nothing can still write the backing (see `seal_read_only` below).
+    // Anything unconfirmed is retryable, never a success the caller stages as
+    // sealed.
     //
     // Durability gate: flush the inner btrfs to the encrypted backing device
     // BEFORE detaching or closing it. `unmount_mapper_mounts` uses a lazy
@@ -667,20 +974,59 @@ pub async fn release(
     if let Some(point) = points.first() {
         run("sync", &["-f", point]).await?;
     }
+    // Make the superblock read-only before the unmount, while this namespace
+    // can still name it. It applies in every namespace holding a copy, so a
+    // holder that outlives the close below can't change the flushed bytes.
+    // Refused (EBUSY) while any file is open for writing; then the volume is
+    // not sealed read-only and a busy close fails the release as before.
+    let read_only = match points.first() {
+        Some(point) => remount_read_only(point).await,
+        None => false,
+    };
+    // Holder diagnostics need the identity the unmount below removes.
+    let recorded = if points.is_empty() {
+        busy_holders::BusyDevice {
+            mapper: mapper.clone(),
+            ..busy_holders::BusyDevice::default()
+        }
+    } else {
+        record_busy_device(&mapper).await
+    };
     // Stack order: unmount every mountpoint (canonical dir + any jail bind),
     // propagating any unmount/mountinfo failure.
     unmount_mapper_mounts(&mapper).await?;
     match mapper_identity(&mapper).await {
         // Already closed.
         MapperIdentity::Absent => {}
-        MapperIdentity::Present(_) => {
-            if let Err(error) = ReleaseDevice::Crypt(&mapper).run().await {
-                // An open fd (a cancelled capture's Firecracker) can hold the
-                // device. Free the NAME so the next prepare isn't wedged, but
-                // still fail: the volume was not sealed.
-                tracing::warn!(%mapper, %error, "encrypted-volume close refused; force-freeing mapping");
+        MapperIdentity::Present(block) => {
+            let device = busy_holders::BusyDevice {
+                block: Some(block),
+                ..recorded
+            };
+            if let Err(error) = close_mapper(&device, retry).await {
+                // An open fd (a cancelled capture's Firecracker) or a mount
+                // copy in another mount namespace can hold the device; the
+                // holders were recorded above. Free the NAME so the next
+                // prepare isn't wedged. The volume is sealed anyway when the
+                // holder can no longer write it: the superblock went
+                // read-only above, and the dm device goes read-only here.
+                let sealed = read_only
+                    && matches!(error, DmCryptError::Busy { .. })
+                    && dm_device_read_only(&mapper).await;
                 force_free_mapper(&mapper).await;
-                return Err(error);
+                if !sealed {
+                    tracing::warn!(
+                        %mapper,
+                        error = last_stderr_line(&error),
+                        "encrypted-volume close refused; force-freeing mapping"
+                    );
+                    return Err(error);
+                }
+                tracing::warn!(
+                    %mapper,
+                    error = last_stderr_line(&error),
+                    "encrypted-volume close refused; sealed read-only and force-freed mapping"
+                );
             }
         }
         // Unknown probe: never claim the mapper closed.

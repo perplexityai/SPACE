@@ -60,6 +60,13 @@ pub const PHASE_DEVICE: &str = "device";
 /// the step a suspend's durability depends on next.
 pub const PHASE_STAGE: &str = "stage";
 
+/// A busy encrypted-volume close succeeded on a later attempt.
+pub const CLOSE_BUSY_RECOVERED: &str = "recovered";
+/// Every attempt was refused as busy; the caller force-frees the mapping.
+pub const CLOSE_BUSY_EXHAUSTED: &str = "exhausted";
+/// A retry after a busy refusal failed for another reason.
+pub const CLOSE_BUSY_FAILED: &str = "failed";
+
 /// credmgr was not reachable at all (socket missing, peer down).
 pub const DEK_UNREACHABLE: &str = "unreachable";
 /// credmgr answered and refused: org not enrolled, KEK revoked, purpose
@@ -117,6 +124,18 @@ pub fn device_release_failed(op: &str, phase: &str) {
         1,
         &[tag("op", op), tag("phase", phase)],
     );
+}
+
+/// An encrypted-volume close was refused as busy at least once, bucketed by
+/// `outcome`: [`CLOSE_BUSY_RECOVERED`], [`CLOSE_BUSY_EXHAUSTED`] or
+/// [`CLOSE_BUSY_FAILED`].
+///
+/// A close is refused when something outside node-manager's mount table
+/// still holds the device. `recovered` measures how often the retry
+/// schedule outlasts a transient holder; `exhausted` counts the closes that
+/// end in a force-freed mapping, and for a suspend, an unsealed snapshot.
+pub fn volume_close_busy(outcome: &str) {
+    counter("byok.volume_close.busy", 1, &[tag("outcome", outcome)]);
 }
 
 /// A volume-DEK fetch from credmgr was attempted.

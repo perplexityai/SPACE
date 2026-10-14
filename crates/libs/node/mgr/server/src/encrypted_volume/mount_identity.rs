@@ -27,6 +27,31 @@ fn single_device(devices: &Path) -> io::Result<(u32, u32)> {
 
 #[cfg(target_os = "linux")]
 pub(super) fn btrfs_device(dir: &Path, expected_mount_id: u64) -> io::Result<(u32, u32)> {
+    let (num_devices, fsid) = btrfs_fs_info(dir, expected_mount_id)?;
+    if num_devices != 1 {
+        return Err(io::Error::other("expected a single-device snapshot volume"));
+    }
+    single_device(&btrfs_sysfs_dir(fsid).join("devices"))
+}
+
+/// The btrfs filesystem UUID of the mount at `dir`.
+#[cfg(target_os = "linux")]
+pub(super) fn btrfs_fsid(dir: &Path, expected_mount_id: u64) -> io::Result<uuid::Uuid> {
+    btrfs_fs_info(dir, expected_mount_id).map(|(_, fsid)| fsid)
+}
+
+/// `/sys/fs/btrfs/<fsid>`: present while any mount, in any namespace, or any
+/// open file still holds the filesystem's superblock, and removed when the
+/// superblock is torn down.
+#[cfg(target_os = "linux")]
+pub(super) fn btrfs_sysfs_dir(fsid: uuid::Uuid) -> std::path::PathBuf {
+    Path::new("/sys/fs/btrfs").join(fsid.to_string())
+}
+
+/// Device count and fsid from `BTRFS_IOC_FS_INFO` on the mount at `dir`,
+/// provided that mount is still `expected_mount_id`.
+#[cfg(target_os = "linux")]
+fn btrfs_fs_info(dir: &Path, expected_mount_id: u64) -> io::Result<(u64, uuid::Uuid)> {
     use std::os::fd::AsRawFd;
 
     let mount = crate::service::trusted_paths::open_directory(dir).map_err(io::Error::other)?;
@@ -34,10 +59,7 @@ pub(super) fn btrfs_device(dir: &Path, expected_mount_id: u64) -> io::Result<(u3
     // from mountinfo's superblock number. Mount ID identifies the opened mount
     // itself and remains pinned by this fd throughout the filesystem ioctl.
     let fdinfo = std::fs::read_to_string(format!("/proc/self/fdinfo/{}", mount.as_raw_fd()))?;
-    let opened_mount_id = fdinfo.lines().find_map(|line| {
-        line.strip_prefix("mnt_id:")
-            .and_then(|value| value.trim().parse::<u64>().ok())
-    });
+    let opened_mount_id = super::busy_holders::parse_fdinfo_mount_id(&fdinfo);
     if opened_mount_id != Some(expected_mount_id) {
         return Err(io::Error::other(
             "mount changed during backing-device lookup",
@@ -64,13 +86,7 @@ pub(super) fn btrfs_device(dir: &Path, expected_mount_id: u64) -> io::Result<(u3
     if unsafe { libc::ioctl(mount.as_raw_fd(), 0x8400_941fu32 as _, &mut info) } == -1 {
         return Err(io::Error::last_os_error());
     }
-    if info.num_devices != 1 {
-        return Err(io::Error::other("expected a single-device snapshot volume"));
-    }
-    let devices = Path::new("/sys/fs/btrfs")
-        .join(uuid::Uuid::from_bytes(info.fsid).to_string())
-        .join("devices");
-    single_device(&devices)
+    Ok((info.num_devices, uuid::Uuid::from_bytes(info.fsid)))
 }
 
 #[cfg(test)]

@@ -139,14 +139,16 @@ spec:
             {{- include "space-node-service.mount.clusterApiToken" . | nindent 12 }}
             {{- include "space-node-service.mount.rpcCa" . | nindent 12 }}
             {{- include "space-node-service.mount.rpcIdentity" . | nindent 12 }}
-            # No propagation: build-manager reads only plain files and
-            # subvolumes under /space/cache (the build sandbox's rootfs, its
-            # own work dirs), none of them mounted by someone else after it
-            # starts, and its OCI-rootfs, assembly and snapshot-view mounts
-            # under /space/cache/firecracker/builds must stay in this pod's
-            # mount namespace, never in the node's mount table
-            # (crates/libs/build/mgr/src/oci/{assembly,containerd}.rs).
-            {{- include "space-node-service.mount.cache" (dict "propagation" "None") | nindent 12 }}
+            # HostToContainer: build-manager's OCI-rootfs, assembly and
+            # snapshot-view mounts under /space/cache/firecracker/builds must
+            # stay in this pod's mount namespace, never in the node's mount
+            # table (crates/libs/build/mgr/src/oci/{assembly,containerd}.rs),
+            # and a slave mount never propagates outward. It must not be None:
+            # that gives the pod a private copy of every mount under
+            # /space/cache when it starts, encrypted snapshot volumes
+            # included, and node-manager's unmount can't reach the copy, so
+            # the volume's dm-crypt close stays busy for the pod's lifetime.
+            {{- include "space-node-service.mount.cache" (dict) | nindent 12 }}
             # HostToContainer: each build VM's network-namespace handle is a
             # bind mount node-manager makes on the node after build-manager
             # started (crates/libs/node/mgr/server/src/net/linux.rs); without

@@ -620,7 +620,8 @@ fn dmcrypt_error_to_status(e: rootfs_dmcrypt::DmCryptError) -> Status {
         DmCryptError::InvalidParams(msg) => Status::invalid_argument(msg),
         DmCryptError::KernelUnsupported(msg) => Status::failed_precondition(msg),
         DmCryptError::InsufficientDisk(msg) => Status::resource_exhausted(msg),
-        e @ (DmCryptError::Command { .. } | DmCryptError::Io { .. }) => {
+        e
+        @ (DmCryptError::Command { .. } | DmCryptError::Busy { .. } | DmCryptError::Io { .. }) => {
             Status::internal(e.to_string())
         }
     }
@@ -639,7 +640,9 @@ fn dmcrypt_error_phase(e: &rootfs_dmcrypt::DmCryptError) -> &'static str {
         DmCryptError::KernelUnsupported(_) => byok::PHASE_KERNEL,
         DmCryptError::InvalidParams(_) => byok::PHASE_PARAMS,
         DmCryptError::InsufficientDisk(_) => byok::PHASE_DISK,
-        DmCryptError::Command { .. } | DmCryptError::Io { .. } => byok::PHASE_DEVICE,
+        DmCryptError::Command { .. } | DmCryptError::Busy { .. } | DmCryptError::Io { .. } => {
+            byok::PHASE_DEVICE
+        }
     }
 }
 

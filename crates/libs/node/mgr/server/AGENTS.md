@@ -11,8 +11,9 @@
 - Pin privileged inputs before mutating or mounting them
   (`src/service/trusted_paths.rs`). Mutate pinned subvolumes through the
   pinned-descriptor helpers (`src/btrfs.rs`, `src/clone_cleanup.rs`); where
-  the CLI is unavoidable, bind it to the pinned descriptor in a private mount
-  namespace, as `src/service/artifact_fs/receive.rs` does.
+  the CLI is unavoidable, bind it to the pinned descriptor in its own mount
+  namespace, as `src/service/artifact_fs/receive.rs` does. Make that
+  namespace a slave, not private, so node-manager's unmounts still reach it.
 - Host tools run through `src/host_command.rs`, and `nft` mutations through
   `src/firewall.rs`. Exceptions: the startup runtime-supervisor activator
   (`src/run.rs`) and the non-Linux `src/net/fallback.rs`.

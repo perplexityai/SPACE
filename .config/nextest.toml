@@ -70,7 +70,7 @@ priority = 10
 max-threads = 8
 
 [[profile.default.overrides]]
-# 51 tests: 39 that exercise privilege in CI, and 12 opt-in tests that return
+# 53 tests: 39 that exercise privilege in CI, and 14 opt-in tests that return
 # early there because neither CI step opts them in.
 #
 # Root alone: identity_handoff, clone_tree, transfer_directory, the credmgr
@@ -90,7 +90,7 @@ max-threads = 8
 # Root only for an incidental step, until the test loses it: the net-gateway
 # exemption test's relay sets SO_MARK (CAP_NET_RAW).
 #
-# The 12 opt-in tests assert root, need kernel capabilities, or escalate once
+# The 14 opt-in tests assert root, need kernel capabilities, or escalate once
 # opted in, and return early in either half while unset: the loop-device test
 # (it adds devices to the running kernel), the node-mgr btrfs fixtures, the
 # containment benchmark, and build-mgr's real containerd and OCI assembly
@@ -103,8 +103,10 @@ or (package(pplx-space-node-mgr) and test(=service::gateway_isolation::tests::is
 or (package(pplx-space-node-mgr) and test(=service::encrypted_volumes::tests::ciphertext_publication_is_readable_without_exposing_private_backings))
 or (package(pplx-space-node-mgr) and test(=service::permission_tree::tests::owned_walk_prunes_snapshots_and_never_mutates_link_targets))
 or (package(pplx-space-node-mgr) and test(=device_backing::tests::pinned_devices_survive_replacement_and_encrypted_reopen))
+or (package(pplx-space-node-mgr) and test(=encrypted_volume::tests::busy_close_reports_its_holders_and_recovers))
 or (package(pplx-space-node-mgr) and test(=service::artifact_fs::tests::btrfs_pinned_operations_survive_path_replacement_and_nested_cleanup))
 or (package(pplx-space-node-mgr) and test(=service::artifact_fs::receive::tests::receive_keeps_destination_identity_through_scrub_and_publication))
+or (package(pplx-space-node-mgr) and test(=service::artifact_fs::receive::tests::receiver_namespace_follows_host_unmounts_and_stays_contained))
 or (package(pplx-space-node-mgr) and test(=service::btrfs_send_source::tests::retained_source_regenerates_after_producer_deletion_and_receives_on_same_filesystem))
 or (package(pplx-space-node-mgr) and test(=service::btrfs_send_transport::tests::durable_lease_survives_producer_removal_and_cancelled_grpc_reader))
 or (package(pplx-space-node-mgr) and test(=service::prepared_rootfs::tests::prepared_instance_and_clone_use_real_btrfs_subvolumes))

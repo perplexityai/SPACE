@@ -78,6 +78,23 @@ fn configure_receiver(
     command: &mut std::process::Command,
     directory: &File,
 ) -> std::io::Result<()> {
+    command.args(["receive", "--chroot", "-m", "/space/cache", "--", "/tmp"]);
+    attach_destination_at_tmp(command, directory)
+}
+
+/// Run `command` in its own mount namespace with `directory` bound at `/tmp`.
+///
+/// The namespace's other mounts are slaves of node-manager's: an unmount in
+/// node-manager propagates in, so a receive that started while an encrypted
+/// volume was mounted can't keep that volume busy after its release. This
+/// relies on node-manager's `/space/cache` being a shared (Bidirectional)
+/// mount; under a private parent the copy would stay. Nothing mounted here
+/// propagates out, and `/tmp` is private.
+#[cfg(target_os = "linux")]
+fn attach_destination_at_tmp(
+    command: &mut std::process::Command,
+    directory: &File,
+) -> std::io::Result<()> {
     use std::ffi::CStr;
     use std::os::unix::process::CommandExt;
 
@@ -95,18 +112,18 @@ fn configure_receiver(
             | OpenTreeFlags::OPEN_TREE_CLOEXEC
             | OpenTreeFlags::AT_EMPTY_PATH,
     )?;
-    command.args(["receive", "--chroot", "-m", "/space/cache", "--", "/tmp"]);
     // The hook performs only namespace/mount syscalls on preallocated
     // C strings. The captured detached tree remains owned until exec; the
-    // attached mount owns the directory thereafter. Private propagation keeps
-    // the /tmp mount strictly child-local, including on Kubernetes hosts.
+    // attached mount owns the directory thereafter. Slave propagation keeps
+    // the /tmp mount child-local, including on Kubernetes hosts, while host
+    // unmounts still reach this namespace.
     let attach = move || {
         unshare(CloneFlags::CLONE_NEWNS)?;
         mount(
             None::<&CStr>,
             c"/",
             None::<&CStr>,
-            MsFlags::MS_REC | MsFlags::MS_PRIVATE,
+            MsFlags::MS_REC | MsFlags::MS_SLAVE,
             None::<&CStr>,
         )?;
         move_mount(

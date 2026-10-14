@@ -130,3 +130,36 @@ async fn bounded_runner_kills_and_reports_a_wedged_command() {
         "the error must name the timeout: {err}"
     );
 }
+
+/// Only `cryptsetup close`'s busy exit status classifies as busy: neither a
+/// busy-sounding message nor the same status from another tool does.
+#[test]
+fn only_cryptsetup_close_exit_five_is_busy() {
+    use std::os::unix::process::ExitStatusExt;
+    fn failing(
+        code: i32,
+        stderr: &'static str,
+    ) -> impl FnOnce(&mut Command, std::time::Duration, &[u8]) -> std::io::Result<std::process::Output>
+    {
+        move |_, _, _| {
+            Ok(std::process::Output {
+                status: std::process::ExitStatus::from_raw(code << 8),
+                stdout: Vec::new(),
+                stderr: stderr.into(),
+            })
+        }
+    }
+    const IN_USE: &str = "Device x is still in use.";
+    assert!(matches!(
+        ReleaseDevice::Crypt("x").blocking_with(failing(5, IN_USE)),
+        Err(DmCryptError::Busy { .. })
+    ));
+    assert!(matches!(
+        ReleaseDevice::Crypt("x").blocking_with(failing(1, IN_USE)),
+        Err(DmCryptError::Command { .. })
+    ));
+    assert!(matches!(
+        ReleaseDevice::Loop("/dev/loop0").blocking_with(failing(5, "busy")),
+        Err(DmCryptError::Command { .. })
+    ));
+}

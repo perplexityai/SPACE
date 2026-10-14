@@ -123,7 +123,7 @@ pub(crate) fn luks_format_args(backing: &str) -> Vec<&str> {
 /// Errors from preparing or releasing an encrypted rootfs. One variant per
 /// failure class so the caller (sbx-mgr) can decide retry vs. fail-closed:
 /// `KernelUnsupported` and `InvalidParams` are permanent, `InsufficientDisk`
-/// is operator-actionable, and `Command`/`Io` are the transient-ish rest.
+/// is operator-actionable, and `Command`/`Busy`/`Io` are the transient-ish rest.
 #[derive(Debug, thiserror::Error)]
 pub enum DmCryptError {
     /// The running kernel can't provide dm-snapshot and/or dm-crypt.
@@ -139,6 +139,10 @@ pub enum DmCryptError {
     /// A `losetup`/`cryptsetup`/`dmsetup`/`blockdev`/`dd` invocation failed.
     #[error("command `{cmd}` failed: {stderr}")]
     Command { cmd: String, stderr: String },
+    /// `cryptsetup close` refused because the device is still in use, as
+    /// reported by its exit status rather than its message.
+    #[error("command `{cmd}` failed: {stderr}")]
+    Busy { cmd: String, stderr: String },
     /// A spawn / I/O failure invoking a tool or writing the key to stdin.
     #[error("io running `{cmd}`: {source}")]
     Io {
@@ -236,6 +240,27 @@ pub(crate) fn checked_output_with(
         &[u8],
     ) -> std::io::Result<std::process::Output>,
 ) -> Result<Vec<u8>, DmCryptError> {
+    checked_output_classified(command, input, budget, output, None)
+}
+
+/// `cryptsetup`'s documented exit status for "device already exists or device
+/// is busy". A close cannot produce "already exists", so for a close it means
+/// busy.
+const CRYPTSETUP_EXIT_BUSY: i32 = 5;
+
+/// [`checked_output_with`], reporting a failure whose exit status is
+/// `busy_exit` as [`DmCryptError::Busy`].
+fn checked_output_classified(
+    command: &mut Command,
+    input: &[u8],
+    budget: std::time::Duration,
+    output: impl FnOnce(
+        &mut Command,
+        std::time::Duration,
+        &[u8],
+    ) -> std::io::Result<std::process::Output>,
+    busy_exit: Option<i32>,
+) -> Result<Vec<u8>, DmCryptError> {
     let label = format!(
         "{} {}",
         command.get_program().to_string_lossy(),
@@ -250,9 +275,11 @@ pub(crate) fn checked_output_with(
         source,
     })?;
     if !out.status.success() {
-        return Err(DmCryptError::Command {
-            cmd: label,
-            stderr: String::from_utf8_lossy(&out.stderr).trim().to_string(),
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        return Err(if busy_exit.is_some() && out.status.code() == busy_exit {
+            DmCryptError::Busy { cmd: label, stderr }
+        } else {
+            DmCryptError::Command { cmd: label, stderr }
         });
     }
     Ok(out.stdout)
@@ -281,6 +308,10 @@ impl ReleaseDevice<'_> {
         }
     }
 
+    fn busy_exit(&self) -> Option<i32> {
+        matches!(self, Self::Crypt(_)).then_some(CRYPTSETUP_EXIT_BUSY)
+    }
+
     pub(crate) fn blocking_with(
         self,
         output: impl FnOnce(
@@ -289,21 +320,41 @@ impl ReleaseDevice<'_> {
             &[u8],
         ) -> std::io::Result<std::process::Output>,
     ) -> Result<(), DmCryptError> {
+        let busy_exit = self.busy_exit();
         let (program, args) = self.command();
         let mut command = Command::new(program);
         command.args(args);
-        checked_output_with(
+        checked_output_classified(
             &mut command,
             &[],
             crate::host_command::MUTATION_BUDGET,
             output,
+            busy_exit,
         )
         .map(|_| ())
     }
 
     pub(crate) async fn run(self) -> Result<(), DmCryptError> {
+        let busy_exit = self.busy_exit();
         let (program, args) = self.command();
-        run(program, &args).await.map(|_| ())
+        let label = format!("{program} {}", args.join(" "));
+        let mut command = Command::new(program);
+        command.args(args);
+        tokio::task::spawn_blocking(move || {
+            checked_output_classified(
+                &mut command,
+                &[],
+                crate::host_command::MUTATION_BUDGET,
+                crate::host_command::output,
+                busy_exit,
+            )
+        })
+        .await
+        .map_err(|error| DmCryptError::Io {
+            cmd: label,
+            source: std::io::Error::other(error),
+        })?
+        .map(|_| ())
     }
 }
 
