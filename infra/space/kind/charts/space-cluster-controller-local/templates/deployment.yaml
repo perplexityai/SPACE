@@ -72,12 +72,12 @@ spec:
             - name: POSTGRES_CONNECTION_STRING
               valueFrom:
                 secretKeyRef:
-                  name: space-postgres
+                  name: {{ .Values.postgres.secretName | default "space-postgres" }}
                   key: POSTGRES_CONNECTION_STRING
             - name: SPACE_DB_USER_PASSWORD
-              value: {{ .Values.postgres.managedUserPassword | quote }}
+              {{- include "space-cluster.dbPassword" (dict "ctx" . "role" "USER" "value" .Values.postgres.managedUserPassword) | nindent 14 }}
             - name: SPACE_DB_CREDS_PASSWORD
-              value: {{ .Values.postgres.managedCredentialsPassword | quote }}
+              {{- include "space-cluster.dbPassword" (dict "ctx" . "role" "CREDS" "value" .Values.postgres.managedCredentialsPassword) | nindent 14 }}
             # The public-operation dispatcher executes sandbox creates in this
             # process, so the create-time volume_encryption stamp reads the
             # BYOK switch here too (same value as the api chart).

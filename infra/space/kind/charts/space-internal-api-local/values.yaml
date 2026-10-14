@@ -53,6 +53,9 @@ spaceApiRouteToken:
 clusterId: "kind-local"
 
 postgres:
+  # Secret with the managed role passwords (SPACE_DB_BOOTSTRAP_<ROLE>_PASSWORD
+  # keys). Empty uses the Kind development passwords below.
+  rolesSecretName: ""
   secretName: space-postgres
   secretKey: POSTGRES_CONNECTION_STRING
   # Dev-default space_user password; the role is provisioned by the api

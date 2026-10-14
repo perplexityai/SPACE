@@ -1,0 +1,122 @@
+# One values file for both releases (README.md). Copy it, replace every
+# example value, and pass it to install.sh with -f.
+#
+# The anchors (&...) only save repetition: each subchart reads its own copy.
+
+global:
+  observability:
+    # "off", datadog or otlp (space-kind-telemetry README). datadog and otlp
+    # need node-local receivers: install.sh installs them from
+    # infra/space/observability/charts/space-observability when present, with
+    # this same file, which then also carries that chart's settings
+    # (README.md, Values).
+    mode: "off"
+    environment: example
+    cluster: example-cluster
+    datadog:
+      dogstatsdPort: 8125
+      apmPort: 8126
+    otlp:
+      nodeLocalPort: 4317
+      protocol: grpc
+      traceSampler: ""
+
+x-cluster-id: &clusterId example-cluster
+
+x-image: &worker-image
+  repository: registry.example.com/space/space-worker
+  tag: "0.0.0-example"
+  pullPolicy: IfNotPresent
+
+x-db: &db
+  # POSTGRES_CONNECTION_STRING and the five SPACE_DB_BOOTSTRAP_<ROLE>_PASSWORD
+  # keys (README.md, Secrets).
+  secretName: space-postgres
+  rolesSecretName: space-db-roles
+
+x-node: &node
+  objectStore:
+    credentialsSecretName: space-object-store
+    endpoint: https://object-store.example.com
+    region: us-east-1
+
+space-api-local:
+  clusterId: *clusterId
+  image:
+    repository: registry.example.com/space/space-api
+    tag: "0.0.0-example"
+  postgres: *db
+  # Absolute URL clients use to reach the data plane entry Service.
+  dataPlanePublicUrl: ""
+  entry:
+    type: ClusterIP
+
+space-internal-api-local:
+  clusterId: *clusterId
+  image: *worker-image
+  postgres: *db
+
+space-credmgr-authority-local:
+  clusterId: *clusterId
+  image: *worker-image
+  postgres: *db
+  keyBroker:
+    url: https://key-broker.example.com:443
+    tokenSecretName: space-key-broker-token
+    caSecretName: space-key-broker-ca
+    tenantNamespace: urn:example:org
+    grantScheme: urn:example:grant:v1
+
+space-data-plane-local:
+  image:
+    repository: registry.example.com/space/space-data-plane
+    tag: "0.0.0-example"
+  entry:
+    type: ClusterIP
+
+space-cluster-controller-local:
+  clusterId: *clusterId
+  image:
+    repository: registry.example.com/space/space-cluster-controller
+    tag: "0.0.0-example"
+  postgres: *db
+  snapshotEndpoint: https://object-store.example.com
+  snapshotRegion: us-east-1
+  snapshotBucket: snapshots
+  snapshotCredentialsSecretName: space-object-store
+
+space-sandbox-network-policy:
+  # Every private range sandboxes must not reach: pod, Service and node CIDRs
+  # included (README.md, Network policy).
+  internetExcept:
+    - 10.0.0.0/8
+    - 100.64.0.0/10
+    - 172.16.0.0/12
+    - 192.168.0.0/16
+    - 169.254.0.0/16
+
+space-node-manager-local: &node-chart
+  clusterId: *clusterId
+  image: *worker-image
+  node: *node
+space-runtime-manager-local: *node-chart
+space-volume-manager-local: *node-chart
+space-credential-manager-local: *node-chart
+space-template-manager-local: *node-chart
+space-sandbox-manager-local:
+  clusterId: *clusterId
+  image: *worker-image
+  node: *node
+  # Where suspend snapshots are uploaded (volume-manager performs it).
+  snapshots:
+    bucket: snapshots
+    region: us-east-1
+    endpoint: https://object-store.example.com
+space-node-ctl-local: *node-chart
+space-node-api-local: *node-chart
+space-build-manager-local:
+  clusterId: *clusterId
+  image: *worker-image
+  node: *node
+  objectStore:
+    bucket: templates

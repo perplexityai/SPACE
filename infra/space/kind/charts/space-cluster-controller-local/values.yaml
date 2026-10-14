@@ -77,6 +77,11 @@ spaceApiRouteToken:
     issuer: SPACE_API_ROUTE_ED25519_ISSUER
 
 postgres:
+  # Secret with the managed role passwords (SPACE_DB_BOOTSTRAP_<ROLE>_PASSWORD
+  # keys). Empty uses the Kind development passwords below.
+  rolesSecretName: ""
+  # Secret holding POSTGRES_CONNECTION_STRING.
+  secretName: space-postgres
   # Dev-default managed-login passwords; the roles are provisioned by the
   # api chart's bootstrap-roles initContainer with the same values.
   managedUserPassword: space-dev-user

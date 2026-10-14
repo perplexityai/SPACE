@@ -1,0 +1,74 @@
+apiVersion: v2
+name: space-cluster
+description: >-
+  Installs the existing SPACE Kind charts on a caller-provided Kubernetes
+  cluster, one release per node role. Metadata and values only; every resource
+  template is the subchart's own.
+type: application
+version: 0.1.0
+appVersion: "0.8.0"
+# ValidatingAdmissionPolicy (admissionregistration.k8s.io/v1) is GA in 1.30.
+kubeVersion: ">=1.30.0-0"
+# charts/<name> are symlinks to these directories, so no `helm dependency
+# build` is needed (the Kind charts load their libraries the same way).
+dependencies:
+  - name: space-api-local
+    version: 0.1.0
+    repository: "file://../../kind/charts/space-api-local"
+    condition: controlPlane.enabled
+  - name: space-internal-api-local
+    version: 0.1.0
+    repository: "file://../../kind/charts/space-internal-api-local"
+    condition: controlPlane.enabled
+  - name: space-credmgr-authority-local
+    version: 0.1.0
+    repository: "file://../../kind/charts/space-credmgr-authority-local"
+    condition: controlPlane.enabled
+  - name: space-data-plane-local
+    version: 0.1.0
+    repository: "file://../../kind/charts/space-data-plane-local"
+    condition: controlPlane.enabled
+  - name: space-cluster-controller-local
+    version: 0.1.0
+    repository: "file://../../kind/charts/space-cluster-controller-local"
+    condition: controlPlane.enabled
+  - name: space-sandbox-network-policy
+    version: 0.1.0
+    repository: "file://../../kind/charts/space-sandbox-network-policy"
+    condition: controlPlane.enabled
+  - name: space-node-manager-local
+    version: 0.1.0
+    repository: "file://../../kind/charts/space-node-manager-local"
+    condition: nodeServices.enabled
+  - name: space-runtime-manager-local
+    version: 0.1.0
+    repository: "file://../../kind/charts/space-runtime-manager-local"
+    condition: nodeServices.enabled
+  - name: space-volume-manager-local
+    version: 0.1.0
+    repository: "file://../../kind/charts/space-volume-manager-local"
+    condition: nodeServices.enabled
+  - name: space-credential-manager-local
+    version: 0.1.0
+    repository: "file://../../kind/charts/space-credential-manager-local"
+    condition: nodeServices.enabled
+  - name: space-template-manager-local
+    version: 0.1.0
+    repository: "file://../../kind/charts/space-template-manager-local"
+    condition: nodeServices.enabled
+  - name: space-sandbox-manager-local
+    version: 0.1.0
+    repository: "file://../../kind/charts/space-sandbox-manager-local"
+    condition: nodeServices.enabled
+  - name: space-node-ctl-local
+    version: 0.1.0
+    repository: "file://../../kind/charts/space-node-ctl-local"
+    condition: nodeServices.enabled
+  - name: space-node-api-local
+    version: 0.1.0
+    repository: "file://../../kind/charts/space-node-api-local"
+    condition: nodeServices.enabled
+  - name: space-build-manager-local
+    version: 0.1.0
+    repository: "file://../../kind/charts/space-build-manager-local"
+    condition: buildManager.enabled

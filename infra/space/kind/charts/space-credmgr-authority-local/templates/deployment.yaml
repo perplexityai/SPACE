@@ -156,7 +156,7 @@ spec:
                   name: {{ .Values.postgres.secretName }}
                   key: {{ .Values.postgres.secretKey }}
             - name: SPACE_DB_CREDS_PASSWORD
-              value: {{ .Values.postgres.managedCredentialsPassword | quote }}
+              {{- include "space-cluster.dbPassword" (dict "ctx" . "role" "CREDS" "value" .Values.postgres.managedCredentialsPassword) | nindent 14 }}
             # The platform KEK comes from the intermediate-key broker, the
             # production provider path (crates/libs/credential/mgr/server/src/run.rs):
             # the authority mints each org's intermediate key there on its
@@ -174,6 +174,11 @@ spec:
               value: {{ .Values.keyBroker.url | quote }}
             - name: SPACE_CREDMGR_INTERMEDIATE_KEY_BROKER_TOKEN_FILE
               value: /var/run/space-key-broker/token
+            {{- if .Values.keyBroker.caSecretName }}
+            # The CA bundle an https broker endpoint requires (run.rs).
+            - name: SPACE_CREDMGR_INTERMEDIATE_KEY_BROKER_TLS_CA
+              value: /var/run/space-key-broker-ca/ca.crt
+            {{- end }}
             # The durable tenant binding sent with every key request, and the
             # scheme of the authorization evidence a federated org's request
             # would carry; Kind's orgs are local and send none
@@ -244,6 +249,11 @@ spec:
             - name: key-broker-token
               mountPath: /var/run/space-key-broker
               readOnly: true
+            {{- if .Values.keyBroker.caSecretName }}
+            - name: key-broker-ca
+              mountPath: /var/run/space-key-broker-ca
+              readOnly: true
+            {{- end }}
           {{- with .Values.resources }}
           resources:
             {{- toYaml . | nindent 12 }}
@@ -259,6 +269,11 @@ spec:
           secret:
             secretName: {{ .Values.keyBroker.tokenSecretName }}
             defaultMode: 0440
+        {{- if .Values.keyBroker.caSecretName }}
+        - name: key-broker-ca
+          secret:
+            secretName: {{ .Values.keyBroker.caSecretName }}
+        {{- end }}
 ---
 apiVersion: v1
 kind: Service

@@ -20,6 +20,9 @@ service:
 # kube-proxy balances per connection.
 entry:
   name: space-data-plane-entry
+  # Service type. nodePort applies only to NodePort; a cluster outside Kind
+  # picks its own exposure (infra/space/cluster).
+  type: NodePort
   nodePort: 30090
 
 # As the API's (space-api-local values.yaml): two replicas at least, three at

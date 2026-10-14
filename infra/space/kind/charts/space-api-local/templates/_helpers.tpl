@@ -8,16 +8,16 @@ consumed by a service.
 - name: POSTGRES_CONNECTION_STRING
   valueFrom:
     secretKeyRef:
-      name: space-postgres
+      name: {{ .Values.postgres.secretName | default "space-postgres" }}
       key: POSTGRES_CONNECTION_STRING
 - name: SPACE_DB_BOOTSTRAP_SUPERADMIN_PASSWORD
-  value: {{ .Values.postgres.bootstrapSuperadminPassword | quote }}
+  {{- include "space-cluster.dbPassword" (dict "ctx" . "role" "SUPERADMIN" "value" .Values.postgres.bootstrapSuperadminPassword) | nindent 2 }}
 - name: SPACE_DB_BOOTSTRAP_USER_PASSWORD
-  value: {{ .Values.postgres.managedUserPassword | quote }}
+  {{- include "space-cluster.dbPassword" (dict "ctx" . "role" "USER" "value" .Values.postgres.managedUserPassword) | nindent 2 }}
 - name: SPACE_DB_BOOTSTRAP_RO_PASSWORD
-  value: {{ .Values.postgres.bootstrapReadOnlyPassword | quote }}
+  {{- include "space-cluster.dbPassword" (dict "ctx" . "role" "RO" "value" .Values.postgres.bootstrapReadOnlyPassword) | nindent 2 }}
 - name: SPACE_DB_BOOTSTRAP_MIGRATOR_PASSWORD
-  value: {{ .Values.postgres.bootstrapMigratorPassword | quote }}
+  {{- include "space-cluster.dbPassword" (dict "ctx" . "role" "MIGRATOR" "value" .Values.postgres.bootstrapMigratorPassword) | nindent 2 }}
 - name: SPACE_DB_BOOTSTRAP_CREDS_PASSWORD
-  value: {{ .Values.postgres.managedCredentialsPassword | quote }}
+  {{- include "space-cluster.dbPassword" (dict "ctx" . "role" "CREDS" "value" .Values.postgres.managedCredentialsPassword) | nindent 2 }}
 {{- end }}

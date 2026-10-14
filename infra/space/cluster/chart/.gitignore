@@ -1,0 +1,2 @@
+# Archives `helm dependency build` would write next to the symlinked subcharts.
+charts/*.tgz

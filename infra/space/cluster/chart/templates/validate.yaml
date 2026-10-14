@@ -1,0 +1,131 @@
+{{- /*
+Renders nothing. Fails the render when the caller's values leave a Kind
+development value in place, or when the release does not have its role's
+shape. Only values the caller supplied are visible here (a subchart's own
+defaults are not), which is the point: each listed input must be supplied.
+*/ -}}
+{{- $v := .Values -}}
+{{- $fail := list -}}
+
+{{- $o := ($v.global | default dict).observability -}}
+{{- if not (kindIs "map" $o) -}}
+{{- $fail = append $fail "global.observability is required (mode, environment, cluster; space-kind-telemetry README)" -}}
+{{- else if kindIs "bool" $o.mode -}}
+{{- $fail = append $fail "global.observability.mode must be quoted: bare YAML off is the boolean false" -}}
+{{- else if not $o.mode -}}
+{{- $fail = append $fail "global.observability.mode is required: off, datadog or otlp" -}}
+{{- end -}}
+
+{{- $controlPlane := list "space-api-local" "space-internal-api-local" "space-credmgr-authority-local" "space-data-plane-local" "space-cluster-controller-local" -}}
+{{- $nodeServices := list "space-node-manager-local" "space-runtime-manager-local" "space-volume-manager-local" "space-credential-manager-local" "space-template-manager-local" "space-sandbox-manager-local" "space-node-ctl-local" "space-node-api-local" -}}
+{{- $nodeCharts := $nodeServices -}}
+{{- if $v.buildManager.enabled -}}
+{{- $nodeCharts = append $nodeCharts "space-build-manager-local" -}}
+{{- end -}}
+
+{{- /* Role shape. */ -}}
+{{- if eq $v.role "worker" -}}
+{{- if $v.buildManager.enabled -}}
+{{- $fail = append $fail "role worker: buildManager.enabled must be false (build-manager runs in the space-builder release)" -}}
+{{- end -}}
+{{- else if eq $v.role "builder" -}}
+{{- if $v.controlPlane.enabled -}}
+{{- $fail = append $fail "role builder: controlPlane.enabled must be false (the control plane runs in the space release)" -}}
+{{- end -}}
+{{- if not $v.buildManager.enabled -}}
+{{- $fail = append $fail "role builder: buildManager.enabled must be true" -}}
+{{- end -}}
+{{- if ne .Release.Name "space-builder" -}}
+{{- $fail = append $fail (printf "role builder installs as release space-builder, not %s" .Release.Name) -}}
+{{- end -}}
+{{- $nodeApi := index $v "space-node-api-local" | default dict -}}
+{{- if or (ne (toString $nodeApi.serviceName) "space-builder-node-api") (ne (toString $nodeApi.buildManagerEndpoint) "https://space-builder-build-manager:9900") -}}
+{{- $fail = append $fail "role builder: space-node-api-local serviceName/buildManagerEndpoint must stay as values-builder.yaml sets them" -}}
+{{- end -}}
+{{- else -}}
+{{- $fail = append $fail (printf "role must be worker or builder, got %q" (toString $v.role)) -}}
+{{- end -}}
+{{- if and (eq $v.role "worker") (ne .Release.Name "space") -}}
+{{- $fail = append $fail (printf "role worker installs as release space, not %s" .Release.Name) -}}
+{{- end -}}
+
+{{- $enabled := list -}}
+{{- if $v.controlPlane.enabled -}}{{- $enabled = concat $enabled $controlPlane -}}{{- end -}}
+{{- if $v.nodeServices.enabled -}}{{- $enabled = concat $enabled $nodeServices -}}{{- end -}}
+{{- if $v.buildManager.enabled -}}{{- $enabled = append $enabled "space-build-manager-local" -}}{{- end -}}
+
+{{- /* Images and cluster identity, for every enabled subchart. */ -}}
+{{- $clusterIds := list -}}
+{{- range $c := $enabled -}}
+{{- $s := index $v $c | default dict -}}
+{{- $img := $s.image | default dict -}}
+{{- if or (not $img.repository) (not $img.tag) (eq (toString $img.tag) "local") -}}
+{{- $fail = append $fail (printf "%s.image.repository and image.tag are required (a published image, not the Kind tag local)" $c) -}}
+{{- end -}}
+{{- if and (has $c $nodeCharts) (ne (toString (($s.node | default dict).role | default "worker")) (toString $v.role)) -}}
+{{- $fail = append $fail (printf "%s.node.role must equal role %s" $c (toString $v.role)) -}}
+{{- end -}}
+{{- if eq $c "space-data-plane-local" -}}
+{{- /* The data plane reports no cluster id. */ -}}
+{{- else if or (not $s.clusterId) (eq (toString $s.clusterId) "kind-local") -}}
+{{- $fail = append $fail (printf "%s.clusterId is required and must not be kind-local" $c) -}}
+{{- else -}}
+{{- $clusterIds = append $clusterIds (toString $s.clusterId) -}}
+{{- end -}}
+{{- end -}}
+{{- if gt (len (uniq $clusterIds)) 1 -}}
+{{- $fail = append $fail (printf "every subchart's clusterId must be the same, got %s" (join ", " (uniq $clusterIds))) -}}
+{{- end -}}
+
+{{- /* Control plane: Secrets, database roles and the key broker. */ -}}
+{{- if $v.controlPlane.enabled -}}
+{{- $api := index $v "space-api-local" | default dict -}}
+{{- if ($api.secrets | default dict).create -}}
+{{- $fail = append $fail "space-api-local.secrets.create must be false: its Secrets hold development tokens and keys" -}}
+{{- end -}}
+{{- range $c := list "space-api-local" "space-internal-api-local" "space-cluster-controller-local" "space-credmgr-authority-local" -}}
+{{- if not ((index $v $c | default dict).postgres | default dict).rolesSecretName -}}
+{{- $fail = append $fail (printf "%s.postgres.rolesSecretName is required: without it the chart uses the Kind development passwords" $c) -}}
+{{- end -}}
+{{- end -}}
+{{- $kb := ((index $v "space-credmgr-authority-local" | default dict).keyBroker | default dict) -}}
+{{- if or (not (hasPrefix "https://" (toString $kb.url))) (contains "space-kind-key-broker" (toString $kb.url)) -}}
+{{- $fail = append $fail "space-credmgr-authority-local.keyBroker.url must be the caller's https broker endpoint (the Kind broker is not installed)" -}}
+{{- end -}}
+{{- if not $kb.caSecretName -}}
+{{- $fail = append $fail "space-credmgr-authority-local.keyBroker.caSecretName is required for an https broker" -}}
+{{- end -}}
+{{- if or (not $kb.tokenSecretName) (eq (toString $kb.tokenSecretName) "space-kind-key-broker-token") -}}
+{{- $fail = append $fail "space-credmgr-authority-local.keyBroker.tokenSecretName is required and must not be the Kind broker's" -}}
+{{- end -}}
+{{- range $k := list "tenantNamespace" "grantScheme" -}}
+{{- $x := toString (index $kb $k | default "") -}}
+{{- if or (not $x) (contains "kind-local" $x) -}}
+{{- $fail = append $fail (printf "space-credmgr-authority-local.keyBroker.%s is required and must not be the Kind value" $k) -}}
+{{- end -}}
+{{- end -}}
+{{- $cc := index $v "space-cluster-controller-local" | default dict -}}
+{{- if or (not $cc.snapshotEndpoint) (eq (toString $cc.snapshotEndpoint) "http://object-store:8333") -}}
+{{- $fail = append $fail "space-cluster-controller-local.snapshotEndpoint is required (the Kind object store is not installed)" -}}
+{{- end -}}
+{{- end -}}
+
+{{- /* Node services: the object store. */ -}}
+{{- range $c := $enabled -}}
+{{- if has $c $nodeCharts -}}
+{{- $os := (((index $v $c | default dict).node | default dict).objectStore | default dict) -}}
+{{- if or (not $os.endpoint) (eq (toString $os.endpoint) "http://object-store:8333") -}}
+{{- $fail = append $fail (printf "%s.node.objectStore.endpoint is required (the Kind object store is not installed)" $c) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- if $v.nodeServices.enabled -}}
+{{- $snap := ((index $v "space-sandbox-manager-local" | default dict).snapshots | default dict) -}}
+{{- if or (not $snap.endpoint) (eq (toString $snap.endpoint) "http://object-store:8333") -}}
+{{- $fail = append $fail "space-sandbox-manager-local.snapshots.endpoint is required (the Kind object store is not installed)" -}}
+{{- end -}}
+{{- end -}}
+
+{{- if $fail -}}
+{{- fail (printf "\ninfra/space/cluster values are incomplete:\n- %s" (join "\n- " $fail)) -}}
+{{- end -}}

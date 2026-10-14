@@ -1,0 +1,35 @@
+# Defaults of the `space` release: the control plane and the worker node
+# services. The `space-builder` release adds values-builder.yaml before the
+# caller's values file (install.sh). Values here only switch Kind-only parts of
+# the subcharts off; everything the cluster supplies (images, Secrets,
+# endpoints, telemetry) comes from the caller's file, and templates/validate.yaml
+# fails the render when it is missing (README.md).
+
+# worker or builder. Every node subchart's node.role must match.
+role: worker
+
+controlPlane:
+  enabled: true
+nodeServices:
+  enabled: true
+buildManager:
+  enabled: false
+
+space-api-local:
+  # install.sh runs the space-db-migrate Job from this chart before the
+  # release, as bootstrap.sh does; a Job owned by the release could not be
+  # replaced on the next upgrade (its pod template is immutable).
+  migrate:
+    enabled: false
+  # The caller creates space-internal, space-route-signing and
+  # space-route-verification; the subchart's are development values.
+  secrets:
+    create: false
+  entry:
+    type: ClusterIP
+  ecwHosts: ""
+
+space-data-plane-local:
+  entry:
+    type: ClusterIP
+  ecwHosts: ""

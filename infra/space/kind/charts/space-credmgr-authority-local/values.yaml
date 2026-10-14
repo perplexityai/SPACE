@@ -27,6 +27,9 @@ service:
   port: 9810
 
 postgres:
+  # Secret with the managed role passwords (SPACE_DB_BOOTSTRAP_<ROLE>_PASSWORD
+  # keys). Empty uses the Kind development passwords below.
+  rolesSecretName: ""
   secretName: space-postgres
   secretKey: POSTGRES_CONNECTION_STRING
   # credential-manager's pool connects as space_creds; the role is
@@ -62,6 +65,9 @@ keyBroker:
   tokenSecretName: space-kind-key-broker-token
   tenantNamespace: urn:space:kind-local:org
   grantScheme: urn:space:kind-local:grant:v1
+  # Secret with the broker's CA bundle under ca.crt. Required for an https
+  # url; the Kind broker is plaintext, so empty mounts nothing.
+  caSecretName: ""
 
 # Two replicas, as the EKS module runs on clusters with live authority traffic
 # (infra/space/aws/eks/modules/space/variables.tf). They share no process

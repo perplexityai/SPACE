@@ -132,7 +132,7 @@ spec:
                   name: {{ .Values.postgres.secretName }}
                   key: {{ .Values.postgres.secretKey }}
             - name: SPACE_DB_USER_PASSWORD
-              value: {{ .Values.postgres.managedUserPassword | quote }}
+              {{- include "space-cluster.dbPassword" (dict "ctx" . "role" "USER" "value" .Values.postgres.managedUserPassword) | nindent 14 }}
             - name: SPACE_INTERNAL_TOKEN
               valueFrom:
                 secretKeyRef:

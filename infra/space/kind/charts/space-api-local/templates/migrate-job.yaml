@@ -58,7 +58,7 @@ spec:
             - name: POSTGRES_CONNECTION_STRING
               valueFrom:
                 secretKeyRef:
-                  name: space-postgres
+                  name: {{ .Values.postgres.secretName | default "space-postgres" }}
                   key: POSTGRES_CONNECTION_STRING
       containers:
         - name: bootstrap-roles-grants

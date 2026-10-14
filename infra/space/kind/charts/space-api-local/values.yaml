@@ -21,6 +21,9 @@ service:
 # carries the ingress activation port.
 entry:
   name: space-api-entry
+  # Service type. nodePort applies only to NodePort; a cluster outside Kind
+  # picks its own exposure (infra/space/cluster).
+  type: NodePort
   nodePort: 30080
 
 # Replicas follow load, as production's do. Two at least, so every request
@@ -46,6 +49,12 @@ admin:
   enabled: true
   replicas: 1
   serviceName: space-admin-api
+
+# Render the three Secrets in templates/secret.yaml (development tokens and a
+# development route-signing key). Off outside Kind, where the caller creates
+# them under the names below.
+secrets:
+  create: true
 
 internal:
   secretName: space-internal
@@ -77,6 +86,11 @@ migrate:
   enabled: true
 
 postgres:
+  # Secret holding POSTGRES_CONNECTION_STRING.
+  secretName: space-postgres
+  # Secret with every managed role password (SPACE_DB_BOOTSTRAP_<ROLE>_PASSWORD
+  # keys). Empty uses the Kind development passwords below.
+  rolesSecretName: ""
   # Dev-default managed-login passwords. bootstrap-roles (the migrate Job)
   # provisions the roles with these; the services connect as space_user and
   # space_creds using the same values.

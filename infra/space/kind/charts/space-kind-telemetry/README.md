@@ -115,3 +115,10 @@ The same step writes a root-only `/space/config/shim-telemetry.env` for a
 cluster shim wrapper to source. The existing Kind shim installer
 (`scripts/install-shim.sh`) still follows `scripts/telemetry_config.py`; it
 does not consume this cluster file.
+
+## Cluster install helpers
+
+`templates/_cluster.tpl` holds `space-cluster.dbPassword` for the install path
+in `infra/space/cluster`. It takes a managed role password from
+`postgres.rolesSecretName` when that is set, and otherwise renders the Kind
+development default inline.

@@ -1,0 +1,51 @@
+# The `space-builder` release: the node services on the builder pool, plus
+# build-manager, and no control plane. install.sh passes this file before the
+# caller's values, so it carries only the role and the role-specific settings
+# of the Kind charts' own values-builder.yaml files; templates/validate.yaml
+# rejects a caller file that changes the role's shape.
+role: builder
+
+controlPlane:
+  enabled: false
+nodeServices:
+  enabled: true
+buildManager:
+  enabled: true
+
+space-node-manager-local:
+  node:
+    role: builder
+space-runtime-manager-local:
+  node:
+    role: builder
+space-volume-manager-local:
+  node:
+    role: builder
+space-credential-manager-local:
+  node:
+    role: builder
+space-template-manager-local:
+  node:
+    role: builder
+  # kind/charts/space-template-manager-local/values-builder.yaml
+  templateCache: null
+space-sandbox-manager-local:
+  node:
+    role: builder
+  # kind/charts/space-sandbox-manager-local/values-builder.yaml
+  networkCredentials:
+    enabled: false
+  sandboxEviction: null
+  snapshotReaper: null
+space-node-ctl-local:
+  node:
+    role: builder
+space-node-api-local:
+  node:
+    role: builder
+  # kind/charts/space-node-api-local/values-builder.yaml
+  serviceName: space-builder-node-api
+  buildManagerEndpoint: https://space-builder-build-manager:9900
+space-build-manager-local:
+  node:
+    role: builder
