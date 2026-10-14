@@ -120,6 +120,15 @@ rejects the Kind value itself.
 {{- if or (not $cc.snapshotEndpoint) (eq (toString $cc.snapshotEndpoint) "http://object-store:8333") -}}
 {{- $fail = append $fail "space-cluster-controller-local.snapshotEndpoint is required (the Kind object store is not installed)" -}}
 {{- end -}}
+{{- /* The rate limiters' Redis is optional; this installer provides none. */ -}}
+{{- $apiRedis := toString (($api.redis | default dict).url | default "") -}}
+{{- $ccRedis := toString (($cc.redis | default dict).url | default "") -}}
+{{- if or (contains "space-redis" $apiRedis) (contains "space-redis" $ccRedis) -}}
+{{- $fail = append $fail "redis.url must not name the Kind store space-redis (this installer does not install Redis): leave it empty or name the caller's store" -}}
+{{- end -}}
+{{- if ne $apiRedis $ccRedis -}}
+{{- $fail = append $fail "space-api-local.redis.url and space-cluster-controller-local.redis.url must be the same: both consume the cluster activation bucket" -}}
+{{- end -}}
 {{- end -}}
 
 {{- /* Node services: the object store. */ -}}

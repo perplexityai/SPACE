@@ -180,6 +180,11 @@ spec:
             # `api.clusterActivationAdmission.enabled`.
             - name: SPACE_CLUSTER_ACTIVATION_ADMISSION_ENABLED
               value: {{ .Values.clusterActivationAdmission.enabled | quote }}
+            {{- if .Values.redis.url }}
+            # The limiter's shared store; see `redis` in values.yaml.
+            - name: SPACE_REDIS_URL
+              value: {{ .Values.redis.url | quote }}
+            {{- end }}
             {{- range $name, $reconciler := .Values.reconcilers }}
             {{- range $key, $value := (default (dict) $reconciler.env) }}
             {{- if ne $key "SPACE_SNAPSHOT_RETENTION_SWEEPER_MIN_AGE_SECS" }}

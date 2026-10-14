@@ -18,6 +18,16 @@ clusterId: "kind-local"
 clusterActivationAdmission:
   enabled: ""
 
+# The activation limiter's store. The public-operation dispatcher
+# (`NativePublicOperationExecutor::new`) builds its limiter from
+# `ClusterSandboxAdmissionConfig::from_env`, which reads SPACE_REDIS_URL;
+# without it this copy admits every queued activation as `misconfigured`.
+# **Must equal `redis.url` in `charts/space-api-local/values.yaml`**: both
+# copies consume from one bucket key, so a second store would double the
+# cluster's rate. This process runs no per-client concurrency limiter.
+redis:
+  url: "redis://space-redis:6379"
+
 # Telemetry defaults come from the space-kind-telemetry library.
 telemetry: {}
 

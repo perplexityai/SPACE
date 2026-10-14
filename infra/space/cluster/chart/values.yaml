@@ -28,6 +28,18 @@ space-api-local:
   entry:
     type: ClusterIP
   ecwHosts: ""
+  # This installer provisions no Redis, so the rate limiters' store is off
+  # unless the caller names one (values.example.yaml): an unset URL renders no
+  # SPACE_REDIS_URL and both limiters fail open, as they did before Kind turned
+  # its store on. templates/validate.yaml refuses the Kind endpoint and a
+  # URL that differs from space-cluster-controller-local's.
+  redis:
+    url: ""
+
+space-cluster-controller-local:
+  # Shares the API's cluster-activation bucket, so it names the same store.
+  redis:
+    url: ""
 
 space-data-plane-local:
   entry:

@@ -48,9 +48,12 @@ spec:
             - name: redis
               containerPort: {{ .Values.service.port }}
               protocol: TCP
+          # Ready once the server answers PING, not merely once its port
+          # accepts connections: the limiters fail open on any store error, so
+          # a ready endpoint should be one that serves their commands.
           readinessProbe:
-            tcpSocket:
-              port: redis
+            exec:
+              command: ["redis-cli", "-p", "{{ .Values.service.port }}", "ping"]
             initialDelaySeconds: 2
             periodSeconds: 5
           livenessProbe:

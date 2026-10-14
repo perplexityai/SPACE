@@ -513,10 +513,12 @@ k8s_resource(
 
 # API server.
 # Per-sandbox pods need the shim wired into containerd before the first create
-# lands.
+# lands, and the rate limiters' store should answer before the first create
+# reaches them (they would admit it open, not fail it).
 SPACE_API_DEPS = ["space-postgres", "label-kind-workers", "label-kind-infra",
                   "advertise-kind-worker-network-slots", "install-space-shim",
-                  "internal-rpc-tls", "space-sandbox-network-policy", "space-db-migrate"]
+                  "internal-rpc-tls", "space-sandbox-network-policy", "space-db-migrate",
+                  "space-redis"]
 # No port_forward: localhost:8080 is the cluster's host port mapping onto the
 # space-api-entry NodePort (kind-cluster.yaml.tmpl), which spreads connections
 # across the autoscaled replicas as a deployment's load balancer does.
@@ -644,9 +646,9 @@ k8s_resource(
 )
 
 # Redis: shared store for the two API rate limiters (cluster activation
-# admission + per-client concurrency). Public docker.io image pulled directly by
-# the kind nodes (no `kind load`). Idle unless SPACE_REDIS_URL points at it; the
-# rate-limiter smoke (scripts/tests/smoke-kind-rate-limiters.sh) wires it up.
+# admission + per-client concurrency), which space-api, space-admin-api and
+# space-cluster-controller reach through SPACE_REDIS_URL. Public docker.io image
+# pulled directly by the kind nodes (no `kind load`). space-api waits for it.
 k8s_yaml(helm_release("space", "infra/space/kind/charts/space-redis-local"))
 k8s_resource(
     "space-redis",

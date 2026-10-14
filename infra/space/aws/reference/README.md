@@ -158,8 +158,9 @@ retagged image. They run in the `space` namespace, and each writes a Secret a
 SPACE deployment can read. `space-postgres` holds `POSTGRES_USER`,
 `POSTGRES_PASSWORD`, `POSTGRES_DB` and `POSTGRES_CONNECTION_STRING`, the same
 Secret and keys SPACE's services read in the Kind harness. `space-valkey`
-holds `SPACE_REDIS_URL`, the variable SPACE's API reads its rate-limiter store
-from; Kind sets that variable directly rather than from a Secret.
+holds `SPACE_REDIS_URL`, the variable SPACE's API and cluster-controller read
+their rate-limiter store from; the Kind charts render that variable as a
+literal on the API, admin API and cluster-controller rather than from a Secret.
 Terraform generates both passwords and keeps them in `addons/` state.
 
 Valkey holds SPACE's rate-limiter counters, a guardrail rather than a source

@@ -589,6 +589,27 @@ class SmokeServices:
         )
 
 
+def repair_orphaned_kind_faults(environment: Mapping[str, str]) -> bool:
+    """On the kind backend, undo a limiter fault an earlier run left, or refuse.
+
+    Runs before every scenario, whatever its fixture: a scenario that takes no
+    Lease would otherwise run against shrunk caps or a store scaled to zero.
+    """
+
+    values = dict(environment)
+    if values.get("SPACE_SMOKE_BACKEND", KIND_BACKEND) != KIND_BACKEND:
+        return False
+    harness = KindHarness(
+        SubprocessExecutor(base_env=values),
+        KindConfig(
+            cluster=values.get("KIND_CLUSTER", "space-local"),
+            api_url=values.get("API_URL", "http://127.0.0.1:8080"),
+        ),
+        environment=values,
+    )
+    return harness.repair_orphaned_limiter_faults()
+
+
 @dataclass(frozen=True)
 class _NativeScenarioSandboxes:
     factory: CommandSandboxFactory

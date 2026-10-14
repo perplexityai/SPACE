@@ -50,6 +50,11 @@ space-api-local:
   dataPlanePublicUrl: ""
   entry:
     type: ClusterIP
+  # Optional: the rate limiters' Redis, which this installer does not provide.
+  # Leave it unset to run without rate limiting; set the same URL under
+  # space-cluster-controller-local, which shares the activation bucket.
+  # redis:
+  #   url: rediss://redis.example.com:6379
 
 space-internal-api-local:
   clusterId: *clusterId
@@ -84,6 +89,8 @@ space-cluster-controller-local:
   snapshotRegion: us-east-1
   snapshotBucket: snapshots
   snapshotCredentialsSecretName: space-object-store
+  # redis:
+  #   url: rediss://redis.example.com:6379   # the same URL as space-api-local
 
 space-sandbox-network-policy:
   # Every private range sandboxes must not reach: pod, Service and node CIDRs

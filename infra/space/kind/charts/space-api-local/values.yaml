@@ -170,10 +170,34 @@ dataPlanePublicUrl: ""
 # default the binary ships. Writing a value here would be a copy of a Rust
 # constant with nothing linking the two, and would silently override it the day
 # it changes. The client-concurrency mode accepts `off` as the hard off.
+#
+# The one exception is the client-concurrency mode, which deployments pin to
+# `observe` rather than inherit: it is their configured value, not a copy of
+# the binary's default, and it stays `observe` if that default ever moves.
+# Observe needs no allowlist to classify traffic: an id outside
+# SPACE_API_CLIENT_CONCURRENCY_KNOWN_CLIENTS, or none, lands in the shared
+# `unspecified` bucket, which is metered like any other
+# (`ClientKey::classify` in crates/libs/api/src/client_concurrency), so the
+# allowlist stays at its empty default.
 clusterActivationAdmission:
   enabled: ""
 clientConcurrency:
-  mode: ""
+  mode: "observe"
+
+# The store both limiters keep their state in: the space-redis Deployment
+# (charts/space-redis-local). Each limiter reads SPACE_REDIS_URL when the
+# process builds its state, above the `--surface` branch
+# (`AppState::from_pools_with_lifecycle`), so the admin API reads it too:
+# `ClusterSandboxAdmissionConfig::from_env` and
+# `ClientConcurrencyConfig::from_env`. Without it both fail open as
+# `misconfigured`. Plaintext `redis://`, unlike a deployment's
+# `rediss://`: the clients trust only the webpki roots (the
+# `tls-rustls-webpki-roots` feature in the workspace Cargo.toml), so they
+# would refuse a per-cluster CA. Must equal `redis.url` in the
+# cluster-controller chart, whose copy of the activation limiter shares the
+# bucket.
+redis:
+  url: "redis://space-redis:6379"
 
 eppo:
   secretName: ""

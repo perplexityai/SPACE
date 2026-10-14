@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import contextlib
 import hashlib
 import importlib
 import ipaddress
@@ -217,6 +218,68 @@ def _lease_document(output: str) -> dict[str, object]:
     return document
 
 
+def _lease_annotations(document: Mapping[str, object]) -> Mapping[str, object]:
+    metadata = document.get("metadata")
+    annotations = metadata.get("annotations") if isinstance(metadata, dict) else None
+    return annotations if isinstance(annotations, dict) else {}
+
+
+def _require_limiter_env_keys(values: Mapping[str, object]) -> None:
+    from space_smoke.rate_limiters import LIMITER_ENV_KEYS
+
+    unknown = sorted(set(values) - set(LIMITER_ENV_KEYS))
+    if unknown:
+        raise ValueError(f"refusing non-limiter public API env keys: {unknown}")
+
+
+def _recorded_limiter_env(recorded: str) -> dict[str, str | None]:
+    """The standing limiter env a Lease recorded, refused unless every entry is restorable."""
+
+    try:
+        standing = json.loads(recorded)
+    except json.JSONDecodeError as error:
+        raise SmokeConfigurationError("the recorded limiter env is not JSON") from error
+    if not isinstance(standing, dict) or not all(
+        value is None or (isinstance(value, str) and (not value or _LIMITER_ENV_VALUE.fullmatch(value)))
+        for value in standing.values()
+    ):
+        raise SmokeConfigurationError("the recorded limiter env holds a value a restore cannot write")
+    _require_limiter_env_keys(standing)
+    return standing
+
+
+def _holder_process_gone(holder: object) -> bool:
+    """True only for a holder that was a process of this user on this host and has exited.
+
+    A smoke killed mid-fault leaves its Lease live for the full duration; a
+    successor that can prove the holder dead need not wait that out. Any doubt
+    (another host or user, a malformed identity, a live or reused pid) is
+    treated as alive.
+    """
+
+    if not isinstance(holder, str):
+        return False
+    fields = dict(part.partition("=")[::2] for part in holder.split(";"))
+    pid = fields.get("pid", "")
+    if (
+        fields.get("uid") != str(os.getuid())
+        or fields.get("host") != socket.gethostname()
+        or not pid.isdigit()
+    ):
+        return False
+    try:
+        os.kill(int(pid), 0)
+    except ProcessLookupError:
+        return True
+    except OSError:
+        return False
+    return False
+
+
+def _json_pointer_token(key: str) -> str:
+    return key.replace("~", "~0").replace("/", "~1")
+
+
 def _lease_parts(
     document: Mapping[str, object],
 ) -> tuple[dict[str, object], dict[str, object]]:
@@ -329,9 +392,20 @@ KIND_BUILDER_SERVICE = "space-builder-node-api"
 BUILDER_ROUTING_LABEL = "space.pplx.net/routing-smoke"
 OCI_BUILD_CACHE_DIR = "/space/cache/firecracker/builds/oci"
 CONTAINERD_BUILDS_NAMESPACE = "space-builds"
-# The worker-cordon Lease records which node its holder cordoned, so a takeover
-# of an expired Lease can uncordon it. Nothing in SPACE itself ever uncordons.
+# The worker-cordon Lease records which node its holder cordoned, so the next
+# holder can uncordon it if that holder never did. Nothing in SPACE itself ever
+# uncordons.
 CORDONED_NODE_ANNOTATION = "space.pplx.net/smoke-cordoned-node"
+# The public-API mutation Lease records what the rate-limiter scenario is about
+# to change before it changes it: the limiter env the public API Deployment
+# held (JSON, null for unset) and the Redis replica count it scales down from.
+# A record is cleared only once its restore succeeded. The next holder of the
+# Lease puts back whatever is still recorded, and every Kind scenario run first
+# makes sure nothing is (`repair_orphaned_limiter_faults`), so a run killed or
+# failing mid-fault does not leave later scenarios on smoke-sized caps or
+# without the limiters' store.
+LIMITER_ENV_ANNOTATION = "space.pplx.net/smoke-limiter-env"
+REDIS_REPLICAS_ANNOTATION = "space.pplx.net/smoke-redis-replicas"
 DRAIN_KEEP_ANNOTATION = "space.pplx.net/drain-keep"
 NODE_GROUP_BOUNDARY_LABEL = "node-restriction.kubernetes.io/space-node-group"
 NODE_GROUP_GATE_ENV = "SPACE_SANDBOX_NODE_GROUP_PLACEMENT"
@@ -668,6 +742,7 @@ class KindHarness:
         self.environment = dict(environment or os.environ)
         self._retention_lease_ownership: _LeaseOwnership | None = None
         self._cordon_lease_ownership: _LeaseOwnership | None = None
+        self._public_api_lease_ownership: _LeaseOwnership | None = None
         # The public API autoscaler's bounds before `scale_public_api` pinned
         # them: (name, uid, minReplicas, maxReplicas).
         self._public_api_autoscaler_bounds: tuple[str, str, int, int] | None = None
@@ -1058,19 +1133,27 @@ class KindHarness:
         name: str,
         subject: str,
         *,
-        on_expired_takeover: Callable[[Mapping[str, object], _LeaseOwnership], None]
-        | None = None,
+        repair: Callable[[Mapping[str, object], _LeaseOwnership], None] | None = None,
     ) -> _LeaseOwnership:
         """Create or take over `name`; refuse while another live holder exists.
 
-        `on_expired_takeover` runs with the dead holder's document and the new
-        ownership only AFTER the resourceVersion-guarded patch has succeeded.
-        Two contenders can both read the same expired Lease; running repairs
-        before the patch would let the loser undo a fault the winner has since
-        started. The callback must fence its own writes on `ownership`.
+        `repair` runs with the previous document and the new ownership on every
+        acquisition of an existing Lease, released or expired, and only AFTER
+        the resourceVersion-guarded patch has succeeded. A holder whose cleanup
+        failed releases with its records still on the Lease, so a released
+        Lease is no proof that nothing is left to undo. Two contenders can both
+        read the same Lease; running repairs before the patch would let the
+        loser undo a fault the winner has since started. The callback must
+        fence its own writes on `ownership`. A Lease with a repair may also be
+        taken over from a holder `_holder_process_gone` proves dead, since the
+        repair undoes what that holder left. If the repair fails, the Lease is
+        released with its records for the next holder to retry.
         """
 
-        holder = f"uid={os.getuid()};pid={os.getpid()};token={secrets.token_hex(16)}"
+        holder = (
+            f"uid={os.getuid()};pid={os.getpid()};host={socket.gethostname()};"
+            f"token={secrets.token_hex(16)}"
+        )
         acquired_at = datetime.now(UTC)
         spec = {
             "holderIdentity": holder,
@@ -1119,22 +1202,25 @@ class KindHarness:
                     )
                 if acquired_at < _parse_kube_timestamp(renewed) + timedelta(
                     seconds=duration
-                ):
+                ) and not (repair is not None and _holder_process_gone(current_holder)):
                     raise SmokeConfigurationError(
                         f"another smoke holds the {subject} Lease on this kind "
                         f"cluster (owner {current_holder})"
                     )
             previous = lease
             lease = self._replace_lease_spec(name, metadata, spec, subject=subject)
-            took_over = bool(current_holder) and on_expired_takeover is not None
 
         metadata, _ = _lease_parts(lease)
         ownership = _LeaseOwnership(
             name=name, uid=metadata["uid"], holder=holder, subject=subject
         )
-        if observed.returncode == 0 and took_over:
-            assert on_expired_takeover is not None
-            on_expired_takeover(previous, ownership)
+        if observed.returncode == 0 and repair is not None:
+            try:
+                repair(previous, ownership)
+            except BaseException:
+                with contextlib.suppress(Exception):
+                    self._release_lease(ownership)
+                raise
         return ownership
 
     def _release_lease(self, ownership: _LeaseOwnership) -> None:
@@ -1158,7 +1244,9 @@ class KindHarness:
             ownership.name, metadata, released, subject=ownership.subject
         )
 
-    def _assert_lease_owned(self, ownership: _LeaseOwnership, action: str) -> None:
+    def _assert_lease_owned(
+        self, ownership: _LeaseOwnership, action: str
+    ) -> tuple[dict[str, object], dict[str, object]]:
         current = self.kubectl("get", "lease", ownership.name, "-o", "json")
         if current.returncode != 0:
             raise SmokeConfigurationError(
@@ -1181,6 +1269,59 @@ class KindHarness:
             raise SmokeConfigurationError(
                 f"refusing {action} without the caller's live mutation Lease "
                 f"({ownership.subject})"
+            )
+        return metadata, spec
+
+    def _renew_lease(
+        self,
+        ownership: _LeaseOwnership,
+        action: str,
+        annotations: Mapping[str, str | None] | None = None,
+    ) -> None:
+        """Renew our live Lease and set or clear `annotations` in one guarded patch.
+
+        Callers renew right before each write a successor could own. A runner
+        stopped past its Lease's expiry may resume after a successor took over
+        and repaired its records; the patch tests uid, resourceVersion and
+        holder, so that runner fails here instead of undoing the successor's
+        fault or erasing its records, and a renewed Lease cannot expire under
+        the write that follows.
+        """
+
+        metadata, _ = self._assert_lease_owned(ownership, action)
+        existing = metadata.get("annotations")
+        existing = existing if isinstance(existing, dict) else None
+        patch: list[dict[str, object]] = [
+            {"op": "test", "path": "/metadata/uid", "value": metadata["uid"]},
+            {
+                "op": "test",
+                "path": "/metadata/resourceVersion",
+                "value": metadata["resourceVersion"],
+            },
+            {"op": "test", "path": "/spec/holderIdentity", "value": ownership.holder},
+            {
+                "op": "add",
+                "path": "/spec/renewTime",
+                "value": _kube_timestamp(datetime.now(UTC)),
+            },
+        ]
+        for key, value in (annotations or {}).items():
+            path = f"/metadata/annotations/{_json_pointer_token(key)}"
+            if value is None:
+                if existing is not None and key in existing:
+                    patch.append({"op": "remove", "path": path})
+                continue
+            if existing is None:
+                patch.append({"op": "add", "path": "/metadata/annotations", "value": {}})
+                existing = {}
+            patch.append({"op": "add", "path": path, "value": value})
+        result = self.kubectl(
+            "patch", "lease", ownership.name, "--type=json", "--patch", json.dumps(patch)
+        )
+        if result.returncode != 0:
+            raise SmokeConfigurationError(
+                f"{ownership.subject} Lease changed under {action}; refusing to write: "
+                f"{result.detail() or '<no output>'}"
             )
 
     def _annotate_lease(self, name: str, key: str, value: str | None) -> None:
@@ -1494,11 +1635,11 @@ ON CONFLICT (key_hash) DO NOTHING;
         def repair_orphaned_cordon(
             previous: Mapping[str, object], ownership: _LeaseOwnership
         ) -> None:
-            # The dead holder recorded the node it cordoned; nothing in SPACE
-            # ever uncordons, so undo it. This runs only after we own the
-            # Lease, and re-checks that ownership right before the write, so a
-            # contender that lost the takeover can never uncordon the winner's
-            # fault.
+            # A previous holder that died, or whose uncordon failed, left the
+            # node it cordoned recorded; nothing in SPACE ever uncordons, so
+            # undo it. This runs only after we own the Lease, and re-checks
+            # that ownership right before the write, so a contender that lost
+            # the takeover can never uncordon the winner's fault.
             metadata = previous.get("metadata")
             annotations = (
                 metadata.get("annotations") if isinstance(metadata, dict) else None
@@ -1517,7 +1658,7 @@ ON CONFLICT (key_hash) DO NOTHING;
                 self._annotate_lease(name, CORDONED_NODE_ANNOTATION, None)
 
         ownership = self._acquire_named_mutation_lease(
-            name, "worker cordon mutation", on_expired_takeover=repair_orphaned_cordon
+            name, "worker cordon mutation", repair=repair_orphaned_cordon
         )
         self._cordon_lease_ownership = ownership
 
@@ -3790,12 +3931,106 @@ ON CONFLICT (key_hash) DO NOTHING;
 
     # --- rate limiters -----------------------------------------------------
 
-    def acquire_public_api_mutation(self) -> Callable[[], None]:
+    def _public_api_lease_name(self) -> str:
         context_hash = hashlib.sha256(self.config.context.encode()).hexdigest()[:16]
+        return f"space-smoke-public-api-{context_hash}"
+
+    def acquire_public_api_mutation(self) -> Callable[[], None]:
         ownership = self._acquire_named_mutation_lease(
-            f"space-smoke-public-api-{context_hash}", "public API deployment mutation"
+            self._public_api_lease_name(),
+            "public API deployment mutation",
+            repair=self._repair_recorded_limiter_faults,
         )
-        return lambda: self._release_lease(ownership)
+        self._public_api_lease_ownership = ownership
+
+        def release() -> None:
+            self._release_lease(ownership)
+            if self._public_api_lease_ownership is ownership:
+                self._public_api_lease_ownership = None
+
+        return release
+
+    def _repair_recorded_limiter_faults(
+        self, previous: Mapping[str, object], ownership: _LeaseOwnership
+    ) -> None:
+        # A previous holder recorded what it changed before changing it, and
+        # clears a record only after the restore succeeded. Every write here
+        # renews the Lease first, so a contender that lost the acquisition
+        # never undoes the winner's fault.
+        annotations = _lease_annotations(previous)
+        recorded_replicas = annotations.get(REDIS_REPLICAS_ANNOTATION)
+        if isinstance(recorded_replicas, str) and recorded_replicas:
+            if not recorded_replicas.isdigit():
+                raise SmokeConfigurationError("the recorded Redis replica count is not a count")
+            self._renew_lease(ownership, "an orphaned Redis scale-down repair")
+            self._scale_redis_deployment(max(int(recorded_replicas), 1))
+            self.wait_redis_rollout(timeout=120)
+            self._renew_lease(
+                ownership, "clearing the Redis record", {REDIS_REPLICAS_ANNOTATION: None}
+            )
+        recorded_env = annotations.get(LIMITER_ENV_ANNOTATION)
+        if isinstance(recorded_env, str) and recorded_env:
+            standing = _recorded_limiter_env(recorded_env)
+            self._renew_lease(ownership, "an orphaned limiter env repair")
+            self._apply_public_api_env(
+                standing, "restore the limiter env a previous smoke Lease holder left"
+            )
+            self._renew_lease(
+                ownership, "clearing the limiter env record", {LIMITER_ENV_ANNOTATION: None}
+            )
+
+    def repair_orphaned_limiter_faults(self) -> bool:
+        """Undo a limiter fault an earlier run left recorded, or refuse to proceed.
+
+        Every Kind scenario runs this first: a run killed while Redis was down
+        or the caps were shrunk leaves its records on the public-API mutation
+        Lease, and only the three scenarios that take that Lease would repair
+        them. One Lease read when nothing is recorded. A recorded fault is
+        repaired by acquiring the Lease, which is possible once it is released,
+        expired or held by a holder proven dead; a live holder is a smoke
+        mid-fault, and the caller must not run against it. True if a repair ran.
+        """
+
+        contexts = self.executor.run(["kubectl", "config", "get-contexts", "-o", "name"], timeout=15)
+        if contexts.returncode == 0 and self.config.context not in contexts.stdout.split():
+            # No cluster yet: the run bootstraps a fresh one, which has no faults.
+            return False
+        observed = self.kubectl("get", "lease", self._public_api_lease_name(), "-o", "json", timeout=15)
+        if observed.returncode != 0:
+            if "notfound" in observed.detail().lower():
+                return False
+            raise SmokeConfigurationError(
+                "could not inspect the public API mutation Lease for an orphaned limiter fault: "
+                f"{observed.detail() or '<no output>'}"
+            )
+        document = _lease_document(observed.stdout)
+        annotations = _lease_annotations(document)
+        if not any(annotations.get(key) for key in (LIMITER_ENV_ANNOTATION, REDIS_REPLICAS_ANNOTATION)):
+            return False
+        try:
+            release = self.acquire_public_api_mutation()
+        except SmokeConfigurationError as error:
+            _, spec = _lease_parts(document)
+            raise SmokeConfigurationError(
+                "refusing to run while the public API mutation Lease records a limiter fault "
+                f"(holder {spec.get('holderIdentity') or '<none>'}): {error}"
+            ) from error
+        release()
+        return True
+
+    def _held_public_api_lease(self, action: str) -> _LeaseOwnership:
+        ownership = self._public_api_lease_ownership
+        if ownership is None:
+            raise SmokeConfigurationError(
+                f"refusing {action} without the caller's live mutation Lease"
+            )
+        return ownership
+
+    def _lease_annotation(self, ownership: _LeaseOwnership, key: str) -> str | None:
+        current = self.kubectl("get", "lease", ownership.name, "-o", "json")
+        _require_ok(current, f"read the {ownership.subject} Lease")
+        value = _lease_annotations(_lease_document(current.stdout)).get(key)
+        return value if isinstance(value, str) and value else None
 
     def _public_api_container(self, name: str) -> str:
         container = _require_ok(
@@ -3819,11 +4054,7 @@ ON CONFLICT (key_hash) DO NOTHING;
         return self._deployment_env_literals(self._public_api_deployment(), keys)
 
     def _apply_public_api_env(self, values: Mapping[str, str | None], action: str) -> None:
-        from space_smoke.rate_limiters import LIMITER_ENV_KEYS
-
-        unknown = sorted(set(values) - set(LIMITER_ENV_KEYS))
-        if unknown:
-            raise ValueError(f"refusing non-limiter public API env keys: {unknown}")
+        _require_limiter_env_keys(values)
         self._require_isolated_kind("public API env override")
         assignments = [
             f"{key}-" if value is None else f"{key}={value}" for key, value in values.items()
@@ -3839,13 +4070,40 @@ ON CONFLICT (key_hash) DO NOTHING;
         self.wait_public_api_rollout(timeout=240)
 
     def set_public_api_env(self, overrides: Mapping[str, str]) -> None:
+        from space_smoke.rate_limiters import LIMITER_ENV_KEYS
+
         for key, value in overrides.items():
             if not _LIMITER_ENV_VALUE.fullmatch(value):
                 raise ValueError(f"refusing limiter env value {value!r} for {key}")
+        _require_limiter_env_keys(overrides)
+        action = "a public API limiter override"
+        ownership = self._held_public_api_lease(action)
+        # Record first, and only the first time: a run that dies between here
+        # and the write leaves a record of values still standing, which the
+        # next holder restores to no effect, and a second override in the same
+        # run must not record the first one's values as standing.
+        record: dict[str, str | None] = {}
+        if self._lease_annotation(ownership, LIMITER_ENV_ANNOTATION) is None:
+            standing = self.public_api_env(LIMITER_ENV_KEYS)
+            record[LIMITER_ENV_ANNOTATION] = json.dumps(standing, sort_keys=True)
+        self._renew_lease(ownership, action, record)
         self._apply_public_api_env(overrides, "set the public API limiter env")
 
     def restore_public_api_env(self, standing: Mapping[str, str | None]) -> None:
+        """Put the standing env back, then clear its record; both only while the Lease is ours.
+
+        A runner that lost its Lease refuses: the successor that took it over
+        has already restored the record, and may have a fault of its own up.
+        A failed restore keeps the record for the next holder.
+        """
+
+        action = "restoring the public API limiter env"
+        ownership = self._held_public_api_lease(action)
+        self._renew_lease(ownership, action)
         self._apply_public_api_env(standing, "restore the public API limiter env")
+        self._renew_lease(
+            ownership, "clearing the limiter env record", {LIMITER_ENV_ANNOTATION: None}
+        )
 
     def wait_public_api_ready(self, *, timeout: float) -> None:
         """`/readyz`, not `/healthz`: readiness gates the Service on the reflector's initial LIST."""
@@ -3873,22 +4131,42 @@ ON CONFLICT (key_hash) DO NOTHING;
         return int(previous) if previous.isdigit() else 1
 
     def scale_redis(self, replicas: int) -> int:
+        """Scale the limiters' store, only while the public-API Lease is ours.
+
+        Every Kind API, admin API and cluster-controller replica runs its
+        limiters against this store, so scaling it to zero is recorded on the
+        Lease first, where the next holder scales it back if this run does
+        not. A runner that lost its Lease refuses either way, so it cannot
+        undo or erase a successor's fault.
+        """
+
         self._require_isolated_kind("Redis scaling")
         if replicas < 0 or replicas > 1:
             raise ValueError(f"refusing to scale Redis to {replicas} replicas")
-        previous = _require_ok(
-            self.kubectl(
-                "get", "deploy", KIND_REDIS_DEPLOYMENT, "-o", "jsonpath={.spec.replicas}", timeout=15
-            ),
-            "read Redis replicas",
-        ).strip()
+        action = f"scaling Redis to {replicas}"
+        ownership = self._held_public_api_lease(action)
+        previous = self.redis_replicas()
+        if replicas == 0:
+            record: dict[str, str | None] = {}
+            if self._lease_annotation(ownership, REDIS_REPLICAS_ANNOTATION) is None:
+                record[REDIS_REPLICAS_ANNOTATION] = str(previous)
+            self._renew_lease(ownership, action, record)
+            self._scale_redis_deployment(0)
+        else:
+            self._renew_lease(ownership, action)
+            self._scale_redis_deployment(replicas)
+            self._renew_lease(
+                ownership, "clearing the Redis record", {REDIS_REPLICAS_ANNOTATION: None}
+            )
+        return previous
+
+    def _scale_redis_deployment(self, replicas: int) -> None:
         _require_ok(
             self.kubectl(
                 "scale", f"deploy/{KIND_REDIS_DEPLOYMENT}", f"--replicas={replicas}", timeout=30
             ),
             f"scale Redis to {replicas}",
         )
-        return int(previous) if previous.isdigit() else 1
 
     def wait_redis_unreachable(self, *, timeout: float) -> None:
         """Pod gone, endpoints empty, then a settle so the API's pooled connection dies."""

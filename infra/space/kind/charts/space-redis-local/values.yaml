@@ -1,7 +1,7 @@
 # Redis for Kind's cluster activation and per-client concurrency limiters.
-# Both use SPACE_REDIS_URL. This chart provides a local store for
-# scripts/tests/smoke-kind-rate-limiters.sh; without a configured URL the
-# limiters fail open and this pod idles.
+# space-api, space-admin-api and space-cluster-controller reach it through
+# SPACE_REDIS_URL (their charts' `redis.url`), as deployed services reach
+# theirs, so every Kind run exercises both limiters against a real store.
 #
 # Single-node, in-memory only (no RDB/AOF persistence): the limiter state is a
 # guardrail, not a source of truth, and a wiped store just refills the buckets.
@@ -14,7 +14,7 @@ image:
 datadogTeam: team-space
 
 service:
-  # DNS name the api-server reaches via SPACE_REDIS_URL=redis://space-redis:6379.
+  # DNS name in the API and cluster-controller charts' `redis.url`.
   name: space-redis
   port: 6379
 

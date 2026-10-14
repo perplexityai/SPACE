@@ -374,8 +374,9 @@ log "waiting for object-store Deployment to be ready"
 kubectl --context "$KCTX" -n "$NAMESPACE" rollout status deploy/space-object-store --timeout="${TIMEOUT}s"
 
 # Redis — shared store for the API rate limiters (cluster activation admission
-# + per-client concurrency). Idle unless SPACE_REDIS_URL points at it; the
-# rate-limiter smoke (scripts/tests/smoke-kind-rate-limiters.sh) wires that up.
+# + per-client concurrency), which space-api, space-admin-api and
+# space-cluster-controller reach through SPACE_REDIS_URL. Ready before any of
+# them starts, so the first create meets the limiters, not their fail-open arm.
 helm_apply space "$KIND_DIR/charts/space-redis-local"
 log "waiting for redis Deployment to be ready"
 kubectl --context "$KCTX" -n "$NAMESPACE" rollout status deploy/space-redis --timeout="${TIMEOUT}s"
