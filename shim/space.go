@@ -460,7 +460,7 @@ func (s *spaceTaskService) Create(ctx context.Context, r *taskAPI.CreateTaskRequ
 		createSpanOpts...,
 	)
 	defer func() { span.End(retErr) }()
-	t.traceparent = spec.traceparent()
+	t.traceparent = serializedTraceparent(ctx)
 
 	joinedCgroup, err := joinPodCgroup(r.Bundle)
 	if err != nil {

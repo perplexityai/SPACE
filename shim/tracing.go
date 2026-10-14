@@ -162,6 +162,14 @@ func startSpanWithRemoteParent(ctx context.Context, name, traceparent string, at
 	return pipeline.start(ctx, name, attrs...)
 }
 
+// The W3C traceparent of ctx's current span, or "" when tracing is off or no
+// span is current.
+func serializedTraceparent(ctx context.Context) string {
+	carrier := propagation.MapCarrier{}
+	initTracer().inject(ctx, carrier)
+	return carrier["traceparent"]
+}
+
 func injectTraceMetadata(ctx context.Context, pipeline tracePipeline) context.Context {
 	carrier := propagation.MapCarrier{}
 	pipeline.inject(ctx, carrier)
