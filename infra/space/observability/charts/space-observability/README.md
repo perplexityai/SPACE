@@ -163,11 +163,15 @@ which must be in `spaceNamespaces`. The rest send from the node's own address:
 | Producer | Runs as | Admitted by default |
 | --- | --- | --- |
 | `space-node-manager`, its host runtime-supervisor (`/space/config/space.env`) | root | where the CNI exempts traffic from a pod's own node |
-| containerd shim (wrapper written by `space-shim-installer`) | root (containerd) | same |
+| containerd shim (wrapper installed by `infra/space/cluster/install-shim.sh`) | root (containerd) | same |
 | `space-node-api`, `space-node-ctl`, `space-sandbox-manager`, `space-template-manager` | non-root UIDs | where the CNI exempts all of a pod's own node, not only root |
 
 kindnet (Kind's default CNI) exempts only root processes, so on Kind the four
 non-root services are refused until their nodes' addresses are host peers.
+Builder releases use the same services with the `space-builder-` prefix.
+The shim wrapper reads `/space/config/shim-telemetry.env`, written by
+node-manager's host environment init container; the runtime supervisor reads
+`/space/config/space.env`.
 Other CNIs differ; test with a non-root host-network pod before relying on the
 exemption. To admit them, list the node addresses, and only those, in
 `nodeLocal.hostPeers` (and `datadog.hostPeers` in datadog mode):
