@@ -1372,52 +1372,34 @@ impl SandboxController {
 
         // Store the resolved hash as the sandbox's immutable build pin; wake and restore
         // keep using it even if a tag moves later.
+        let insert = pplx_space_sandbox_store::SandboxCreate {
+            id: sandbox_uuid,
+            name: req.name.as_deref(),
+            user_id: create_owner.user_id,
+            org_id: create_owner.org_id,
+            managed_by: self.substrate.managed_by(),
+            template,
+            content_hash: &resolved_content_hash,
+            vcpu: resources.vcpu.map(|value| value as i32),
+            memory_mib: resources.memory_mib.map(|value| value as i32),
+            disk_mib: resources.disk_mib.map(|value| value as i32),
+            disk_io_limits,
+            env: &env,
+            metadata: &req.metadata,
+            auto_lifecycle: &auto_lifecycle,
+            network_policy_override_json: network_policy_override_json.as_ref(),
+        };
         match (federated_owner, federated_service_grant) {
             (None, None) => {
-                sqlx::query(sql!(
-                    "INSERT INTO sandboxes (
-                         id, name, user_id, org_id, managed_by, lifecycle, placement,
-                         template_id, content_hash, vcpu, memory_mib, disk_mib,
-                         disk_io_max_operations_per_sec,
-                         disk_io_max_bandwidth_mib_per_sec, env,
-                         metadata, auto_lifecycle_json, network_policy_override_json,
-                         network_policy_generation, volume_encryption,
-                         restore_lease_token, restore_lease_expires_at,
-                         preserve_local_artifact_on_restore_failure
-                     ) VALUES (
-                         $1, $2, $3, $4, $5,
-                         CASE WHEN $18::uuid IS NULL THEN 'creating' ELSE 'restoring' END,
-                         'unplaced', $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, 1, $17,
-                         $18,
-                         CASE WHEN $18::uuid IS NULL
-                              THEN NULL
-                              ELSE NOW() + make_interval(secs => $19::double precision)
-                         END,
-                         $18::uuid IS NOT NULL
-                     )"
-                ))
-                .bind(sandbox_uuid)
-                .bind(&req.name)
-                .bind(create_owner.user_id)
-                .bind(create_owner.org_id)
-                .bind(self.substrate.managed_by())
-                .bind(template)
-                .bind(&resolved_content_hash)
-                .bind(resources.vcpu.map(|value| value as i32))
-                .bind(resources.memory_mib.map(|value| value as i32))
-                .bind(resources.disk_mib.map(|value| value as i32))
-                .bind(i64::try_from(disk_io_limits.max_operations_per_sec()).unwrap_or(i64::MAX))
-                .bind(i64::try_from(disk_io_limits.max_bandwidth_mib_per_sec()).unwrap_or(i64::MAX))
-                .bind(sqlx::types::Json(&env))
-                .bind(sqlx::types::Json(&req.metadata))
-                .bind(sqlx::types::Json(&auto_lifecycle))
-                .bind(network_policy_override_json)
-                .bind(volume_encryption)
-                .bind(restore_operation_id.map(|operation_id| operation_id.as_uuid()))
-                .bind(i64::from(restore_lease_seconds))
-                .execute(pool)
+                pplx_space_sandbox_store::insert_unplaced(
+                    pool,
+                    &insert,
+                    volume_encryption,
+                    restore_operation_id.map(|operation_id| operation_id.as_uuid()),
+                    i64::from(restore_lease_seconds),
+                )
                 .await
-                .map_err(sandbox_insert_error)?;
+                .map_err(|err| sandbox_insert_error(err.into()))?;
             }
             (Some(owner), Some(grant)) => {
                 let mut tx = pool.begin().await.map_err(|err| {
@@ -1426,50 +1408,15 @@ impl SandboxController {
                         &err,
                     )
                 })?;
-                sqlx::query(sql!(
-                    "INSERT INTO sandboxes (
-                         id, name, user_id, org_id, managed_by, lifecycle, placement,
-                         template_id, content_hash, vcpu, memory_mib, disk_mib,
-                         disk_io_max_operations_per_sec,
-                         disk_io_max_bandwidth_mib_per_sec, env,
-                         metadata, auto_lifecycle_json, network_policy_override_json,
-                         network_policy_generation, volume_encryption,
-                         restore_lease_token, restore_lease_expires_at,
-                         preserve_local_artifact_on_restore_failure
-                     ) VALUES (
-                         $1, $2, $3, $4, $5,
-                         CASE WHEN $18::uuid IS NULL THEN 'creating' ELSE 'restoring' END,
-                         'unplaced', $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, 1, $17,
-                         $18,
-                         CASE WHEN $18::uuid IS NULL
-                              THEN NULL
-                              ELSE NOW() + make_interval(secs => $19::double precision)
-                         END,
-                         $18::uuid IS NOT NULL
-                     )"
-                ))
-                .bind(sandbox_uuid)
-                .bind(&req.name)
-                .bind(create_owner.user_id)
-                .bind(create_owner.org_id)
-                .bind(self.substrate.managed_by())
-                .bind(template)
-                .bind(&resolved_content_hash)
-                .bind(resources.vcpu.map(|value| value as i32))
-                .bind(resources.memory_mib.map(|value| value as i32))
-                .bind(resources.disk_mib.map(|value| value as i32))
-                .bind(i64::try_from(disk_io_limits.max_operations_per_sec()).unwrap_or(i64::MAX))
-                .bind(i64::try_from(disk_io_limits.max_bandwidth_mib_per_sec()).unwrap_or(i64::MAX))
-                .bind(sqlx::types::Json(&env))
-                .bind(sqlx::types::Json(&req.metadata))
-                .bind(sqlx::types::Json(&auto_lifecycle))
-                .bind(network_policy_override_json)
-                .bind(volume_encryption)
-                .bind(restore_operation_id.map(|operation_id| operation_id.as_uuid()))
-                .bind(i64::from(restore_lease_seconds))
-                .execute(&mut *tx)
+                pplx_space_sandbox_store::insert_unplaced(
+                    &mut *tx,
+                    &insert,
+                    volume_encryption,
+                    restore_operation_id.map(|operation_id| operation_id.as_uuid()),
+                    i64::from(restore_lease_seconds),
+                )
                 .await
-                .map_err(sandbox_insert_error)?;
+                .map_err(|err| sandbox_insert_error(err.into()))?;
                 crate::federated_identity::upsert_sandbox_federated_service_grant_tx(
                     &mut tx,
                     sandbox_uuid,
@@ -2877,44 +2824,32 @@ async fn insert_pooled_sandbox(
             ControllerError::internal(format!("failed to serialize network policy: {error}"))
         })?;
 
-    sqlx::query(sql!(
-        "INSERT INTO sandboxes (
-             id, name, user_id, org_id, managed_by, lifecycle, placement,
-             active_node_id, target_node_id, placement_changed_at,
-             template_id, content_hash, vcpu, memory_mib, disk_mib,
-             disk_io_max_operations_per_sec,
-             disk_io_max_bandwidth_mib_per_sec, env, metadata,
-             auto_lifecycle_json, network_policy_override_json, network_policy_generation
-         )
-         VALUES (
-             $1, $2, $3, $4, $5, 'paused', 'on_node',
-             $6, $6, NOW(),
-             $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, 1
-         )"
-    ))
-    .bind(claim.sandbox_id)
-    .bind(&input.req.name)
-    .bind(create_owner.user_id)
-    .bind(create_owner.org_id)
-    .bind(managed_by)
-    .bind(claim.active_node_id)
-    .bind(input.template)
-    .bind(&claim.content_hash)
-    .bind(vcpu_i32)
-    .bind(memory_mib_i32)
-    .bind(disk_mib_i32)
-    .bind(i64::try_from(claim.disk_io_limits.max_operations_per_sec()).unwrap_or(i64::MAX))
-    .bind(i64::try_from(claim.disk_io_limits.max_bandwidth_mib_per_sec()).unwrap_or(i64::MAX))
-    .bind(sqlx::types::Json(input.env))
-    .bind(sqlx::types::Json(&input.req.metadata))
-    .bind(sqlx::types::Json(input.auto_lifecycle))
-    .bind(network_policy_override_json)
-    .execute(&mut **tx)
+    pplx_space_sandbox_store::insert_pooled(
+        &mut **tx,
+        &pplx_space_sandbox_store::SandboxCreate {
+            id: claim.sandbox_id,
+            name: input.req.name.as_deref(),
+            user_id: create_owner.user_id,
+            org_id: create_owner.org_id,
+            managed_by,
+            template: input.template,
+            content_hash: &claim.content_hash,
+            vcpu: vcpu_i32,
+            memory_mib: memory_mib_i32,
+            disk_mib: disk_mib_i32,
+            disk_io_limits: claim.disk_io_limits,
+            env: input.env,
+            metadata: &input.req.metadata,
+            auto_lifecycle: input.auto_lifecycle,
+            network_policy_override_json: network_policy_override_json.as_ref(),
+        },
+        claim.active_node_id,
+    )
     .await
     // Classified like its five siblings in this transaction. The
     // post-side-effect hazard is handled once by the caller, which applies
     // `demoted_after_side_effect` — see `try_create_from_pool`.
-    .map_err(|err| db_contention_error("failed to insert pooled sandbox", &err))?;
+    .map_err(|err| db_contention_error("failed to insert pooled sandbox", &err.into()))?;
 
     Ok(claim.sandbox_id)
 }

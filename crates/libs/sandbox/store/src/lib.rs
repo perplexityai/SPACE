@@ -69,7 +69,10 @@ use sqlx::types::JsonValue;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+mod create;
 pub mod fork_source_lifecycle;
+
+pub use create::{SandboxCreate, insert_pooled, insert_unplaced};
 
 /// The `sandboxes.metadata` document: caller-supplied labels, untyped by
 /// design. Distinct from the validated `SandboxMetadata` newtype in
