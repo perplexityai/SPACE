@@ -40,3 +40,32 @@ impl Blackhole {
         self.address
     }
 }
+
+/// The loop every retried TCP connect runs (attempt cap, backoff, budget,
+/// spans, retry metric and logs, and the observer of
+/// [`crate::connect_tcp_channel_with_retry_observed`]) over attempts the
+/// caller supplies, so a test can make them fail, stall or succeed on cue
+/// instead of depending on when the kernel completes a dial.
+pub async fn retry_tcp_connect<T, E, F, Fut>(
+    service_name: &'static str,
+    target: &str,
+    retry_policy: crate::GrpcRetryPolicy,
+    attempt_cap: std::time::Duration,
+    attempt: F,
+    on_retry: impl FnMut(&crate::TcpConnectRetry<'_, E>),
+) -> Result<T, E>
+where
+    E: std::fmt::Display + From<crate::TcpConnectError>,
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, E>>,
+{
+    crate::connect::retry_tcp_connect_observed(
+        service_name,
+        target,
+        retry_policy,
+        attempt_cap,
+        attempt,
+        on_retry,
+    )
+    .await
+}

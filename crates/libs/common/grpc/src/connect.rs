@@ -503,7 +503,7 @@ where
 
 /// [`retry_tcp_connect`] that hands `on_retry` each failed attempt before its
 /// redial.
-async fn retry_tcp_connect_observed<T, E, F, Fut>(
+pub(crate) async fn retry_tcp_connect_observed<T, E, F, Fut>(
     service_name: &'static str,
     target: &str,
     retry_policy: GrpcRetryPolicy,
