@@ -30,7 +30,7 @@ UNPUBLISHED = {
     "snapshot-upload-streaming.md": "implementation notes and measurements",
 }
 ASSETS = ("guide.css", "navigation.css", "page-toc.js", "mermaid-init.js", "LICENSE-mdBook.txt")
-TEMPLATES = ("header.hbs", "toc.js.hbs")
+TEMPLATES = ("index.hbs", "header.hbs", "toc.js.hbs")
 LIBRARY_ASSETS = {
     "mermaid.min.js": "target/docs/diagram/mermaid.min.js",
     "MERMAID-LICENSES.txt": "target/docs/diagram/MERMAID-LICENSES.txt",

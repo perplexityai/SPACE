@@ -7,21 +7,34 @@ for the common allowlist and hash checks. Standalone API builds also require
 Python 3 for this staging step. The Guide loads the stylesheet through mdBook's
 additional CSS configuration; the API Reference loads it from its HTML page.
 
-`curiosity.css` provides font faces, semantic light-palette variables and shared
-layout dimensions. Consumers choose where to apply them; code keeps a monospace
-font and Guide colors stay scoped to its Light theme.
+`curiosity.css` provides font faces, shared layout dimensions, and semantic
+Curiosity Light and Dark colors. The dark palette is provisional; its values live
+under `--docs-dark-*` in that stylesheet. Code keeps a monospace font.
+
+Both sections load `system-theme.js` before their content. It selects the system
+color preference once per page load and ignores legacy mdBook theme choices.
+There is no theme switcher. A system preference change takes effect on the next
+navigation or refresh; the API renderer and shell keep their palette for the
+current page. The stylesheet also follows the system when scripts are disabled.
 
 The Guide's `docs/book/guide.css` adapts the shell while preserving mdBook's
-toolbar and theme choices. Only the named `header.hbs` and `toc.js.hbs` templates
-are staged from `docs/book/theme/`. The TOC override is based on mdBook 0.4.52
+toolbar, highlighting, and reading controls. Only the named `index.hbs`,
+`header.hbs`, and `toc.js.hbs` templates are staged from `docs/book/theme/`.
+The index override is based on mdBook 0.4.52. It loads the shared theme before
+content, uses the selected mode for both native defaults, and leaves hidden
+controller hooks for native highlighting with no selectable themes. This keeps
+legacy saved choices from overriding the selected mode.
+Review these changes against the public upstream template when upgrading.
+The TOC override is based on mdBook 0.4.52
 and only guards optional sidebar-scroll storage; review it against the native
 template when upgrading mdBook. Chapter navigation uses the native footer links.
 `docs/book/LICENSE-mdBook.txt` preserves its MPL 2.0 license in the Guide output.
 
 The API Reference uses Redoc's supported `redoc-options.json` theme and
 scroll-offset settings, with its shell in `docs/api/reference.css`. Its theme
-uses literal palette colors because Redoc computes derived colors during
-initialization; keep those values aligned with `curiosity.css`. Native API
+reads resolved palette colors from the shared stylesheet through
+`docs/api/reference-theme.js`, because Redoc computes derived colors during
+initialization. Native API
 navigation and inline samples stay with Redoc; the builder preserves the raw
 OpenAPI download.
 
@@ -29,7 +42,7 @@ The fonts and `LICENSE-Inter.txt` are unmodified files from the
 [official Inter 4.1 release](https://github.com/rsms/inter/releases/tag/v4.1).
 `LICENSE-Inter.txt` contains their copyright notice and full OFL 1.1 license.
 `assets.json` records the release source and archive hash, and pins the
-stylesheet, fonts and license by SHA-256. Both output
+stylesheet, system preference script, fonts and license by SHA-256. Both output
 manifests also hash this manifest. Builders reject a missing, changed or
 symlinked asset and an unexpected manifest entry. Builds use only
 local assets; they do not download a replacement font or stylesheet.

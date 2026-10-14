@@ -16,6 +16,7 @@
 }
 
 :root {
+  color-scheme: light;
   --docs-font-body: "Inter", system-ui, sans-serif;
   --docs-font-code: ui-monospace, SFMono-Regular, Consolas, monospace;
   --docs-color-background: #f7f9f9;
@@ -24,7 +25,63 @@
   --docs-color-muted: #526565;
   --docs-color-accent: #176f72;
   --docs-color-border: #dce5e5;
+  --docs-color-inline-code: rgba(38, 50, 56, .05);
+  --docs-color-nested: #fafafa;
+  --docs-color-success: #1d8127;
+  --docs-color-error: #d41f1c;
+  --docs-color-warning: #ffa500;
+  --docs-color-info: #186c8e;
+  --docs-color-code-background: #263238;
+  --docs-color-code-text: #ffffff;
+
+  /* Provisional dark palette; replace these values when the palette is finalized. */
+  --docs-dark-background: #1c2525;
+  --docs-dark-surface: #151c1c;
+  --docs-dark-text: #e6eded;
+  --docs-dark-muted: #a5b6b6;
+  --docs-dark-accent: #8bd2ce;
+  --docs-dark-border: #344444;
+  --docs-dark-inline-code: #253333;
+  --docs-dark-success: #8bd49c;
+  --docs-dark-error: #ffaaaa;
+  --docs-dark-warning: #e9c86b;
+  --docs-dark-info: #86c9e8;
   --docs-header-height: 64px;
   --docs-utility-height: 48px;
   --docs-sidebar-width: 248px;
+}
+
+:root[data-docs-theme="dark"] {
+  color-scheme: dark;
+  --docs-color-background: var(--docs-dark-background);
+  --docs-color-surface: var(--docs-dark-surface);
+  --docs-color-text: var(--docs-dark-text);
+  --docs-color-muted: var(--docs-dark-muted);
+  --docs-color-accent: var(--docs-dark-accent);
+  --docs-color-border: var(--docs-dark-border);
+  --docs-color-inline-code: var(--docs-dark-inline-code);
+  --docs-color-nested: var(--docs-dark-background);
+  --docs-color-success: var(--docs-dark-success);
+  --docs-color-error: var(--docs-dark-error);
+  --docs-color-warning: var(--docs-dark-warning);
+  --docs-color-info: var(--docs-dark-info);
+}
+
+/* Honor the system preference before scripts run and when scripts are disabled. */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-docs-theme]) {
+    color-scheme: dark;
+    --docs-color-background: var(--docs-dark-background);
+    --docs-color-surface: var(--docs-dark-surface);
+    --docs-color-text: var(--docs-dark-text);
+    --docs-color-muted: var(--docs-dark-muted);
+    --docs-color-accent: var(--docs-dark-accent);
+    --docs-color-border: var(--docs-dark-border);
+    --docs-color-inline-code: var(--docs-dark-inline-code);
+    --docs-color-nested: var(--docs-dark-background);
+    --docs-color-success: var(--docs-dark-success);
+    --docs-color-error: var(--docs-dark-error);
+    --docs-color-warning: var(--docs-dark-warning);
+    --docs-color-info: var(--docs-dark-info);
+  }
 }

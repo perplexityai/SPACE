@@ -43,6 +43,12 @@ class Page(HTMLParser):
 
 
 class GuideTests(unittest.TestCase):
+    def test_system_preference_policy(self):
+        subprocess.run(
+            ["node", "--test", str(build.ROOT / "docs/site/test_theme.cjs")],
+            check=True, capture_output=True, text=True,
+        )
+
     @classmethod
     def setUpClass(cls):
         cls.output = build.OUTPUT

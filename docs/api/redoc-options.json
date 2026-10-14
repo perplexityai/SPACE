@@ -20,17 +20,9 @@
     },
     "spacing": { "sectionHorizontal": 32, "sectionVertical": 28 },
     "sidebar": {
-      "width": "248px",
-      "backgroundColor": "#f7f9f9",
-      "textColor": "#526565",
-      "activeTextColor": "#176f72"
+      "width": "248px"
     },
-    "rightPanel": { "backgroundColor": "#ffffff", "textColor": "#fff" },
-    "codeBlock": { "backgroundColor": "#263238" },
     "colors": {
-      "primary": { "main": "#176f72" },
-      "text": { "primary": "#263333", "secondary": "#526565" },
-      "border": { "light": "#dce5e5", "dark": "#526565" },
       "responses": {
         "success": { "tabTextColor": "#a0fbaa" },
         "error": { "tabTextColor": "#ffaaaa" }
@@ -41,10 +33,8 @@
       "lineHeight": "1.65em",
       "fontFamily": "var(--docs-font-body)",
       "headings": { "fontFamily": "var(--docs-font-body)", "fontWeight": "600", "lineHeight": "1.25em" },
-      "code": { "fontFamily": "var(--docs-font-code)", "color": "#263333" },
-      "links": { "color": "#176f72", "visited": "#176f72", "hover": "#176f72", "hoverTextDecoration": "underline" }
-    },
-    "schema": { "typeNameColor": "#176f72", "linesColor": "#dce5e5" },
-    "fab": { "backgroundColor": "#176f72", "color": "#ffffff" }
+      "code": { "fontFamily": "var(--docs-font-code)" },
+      "links": { "hoverTextDecoration": "underline" }
+    }
   }
 }

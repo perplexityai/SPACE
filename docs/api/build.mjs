@@ -79,6 +79,7 @@ for (const file of readdirSync(resolve(here, 'node_modules/redoc/bundles'))) {
 cpSync(resolve(here, 'node_modules/redoc/LICENSE'), resolve(output, 'REDOC-LICENSE'));
 cpSync(resolve(here, 'reference.css'), resolve(output, 'reference.css'));
 cpSync(resolve(here, 'schema-navigation.js'), resolve(output, 'schema-navigation.js'));
+cpSync(resolve(here, 'reference-theme.js'), resolve(output, 'reference-theme.js'));
 const themeFiles = JSON.parse(execFileSync('python3', [
   resolve(root, 'docs/site/theme_assets.py'), resolve(output, 'theme'),
 ], { encoding: 'utf8' }));
@@ -144,7 +145,7 @@ writeFileSync(resolve(output, 'reference.js'),
 // Keep authored HTML in the document so combined builds can localize its
 // pinned source links without changing the API contract or renderer bundle.
 spec.info.description = '# Overview\\n\\n' + document.getElementById('overview').innerHTML + '\\n\\n' + spec.info.description;
-Redoc.init(spec, ${JSON.stringify(options)}, document.getElementById('reference'), error => {
+Redoc.init(spec, referenceTheme(${JSON.stringify(options)}), document.getElementById('reference'), error => {
   if (error) { document.body.dataset.renderError = String(error); throw error; }
   enhanceSchemaNavigation(${JSON.stringify(schemaCatalog)}, document.querySelector('.docs-utility').getBoundingClientRect().bottom);
   // The outer utility links use browser anchors rather than Redoc's scroller.
@@ -166,6 +167,7 @@ writeFileSync(resolve(output, 'index.html'), `<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'none'; worker-src blob:; base-uri 'none'; form-action 'none'">
 <title>SPACE API</title><link rel="stylesheet" href="theme/curiosity.css"><link rel="stylesheet" href="reference.css">
+<script src="theme/system-theme.js"></script>
 </head><body>
 <header class="docs-header">
 <a class="docs-brand" href="https://github.com/perplexityai/SPACE/blob/${commit}/docs/introduction.md">SPACE</a>
@@ -179,7 +181,7 @@ writeFileSync(resolve(output, 'index.html'), `<!doctype html>
 <template id="overview">${overview}</template>
 <section id="reference" aria-label="Endpoint reference"></section>
 <footer><a href="build.json">Build details</a></footer>
-<script src="redoc.standalone.js"></script><script src="schema-navigation.js"></script><script src="reference.js"></script>
+<script src="redoc.standalone.js"></script><script src="reference-theme.js"></script><script src="schema-navigation.js"></script><script src="reference.js"></script>
 </body></html>\n`);
 metadata.files = {
   ...Object.fromEntries(readdirSync(output).filter(file => file !== 'theme').map(file => [
