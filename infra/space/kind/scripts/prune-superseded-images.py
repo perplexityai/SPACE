@@ -21,7 +21,9 @@ An image is removed only when all of these hold:
 
 Anything else, third-party images included, is left alone. Pruning is skipped
 while the Tilt serving this cluster has a build pending or in progress, because
-a just-loaded image is not deployed yet.
+a just-loaded image is not deployed yet, and checked again before each removal,
+stopping the pass as soon as Tilt has begun one. The sizes it logs are what
+`crictl images` reports, the image content; the unpacked layers free more.
 
 Usage:
   prune-superseded-images.py                  # one pass (bootstrap.sh)
@@ -50,12 +52,15 @@ IMAGES_LIB = KIND_DIR / "lib/space-images.sh"
 OPT_OUT = "SPACE_KIND_PRUNE_SUPERSEDED_IMAGES"
 TITLE_LABEL = "org.opencontainers.image.title"
 LOCAL_TAG = "local"
-# Where every node keeps the store, the bind mount from $SPACE_KIND_DATA_ROOT.
-NODE_STORE = "/var/lib/containerd"
 # The workload kinds whose pod templates name images. A ReplicaSet scaled to
 # zero is a Deployment's rollback history, not a current reference.
 WORKLOAD_KINDS = "pods,deployments,replicasets,statefulsets,daemonsets,jobs,cronjobs"
 TILT_BUSY = ("pending", "in_progress")
+# While a pass left a superseded image behind (a container still held it, or
+# its removal failed), the watcher runs another pass after this many ticks even
+# if no reference changed: nothing it fingerprints moves when that container
+# goes away.
+RETRY_TICKS = 10
 
 
 class PruneError(RuntimeError):
@@ -342,14 +347,6 @@ class Pruner:
             raise PruneError(f"kind cluster {self.cluster} has no nodes")
         return sorted(nodes)
 
-    def store_bytes(self, node: str) -> int | None:
-        try:
-            return int(
-                run(["docker", "exec", node, "du", "-sxb", NODE_STORE]).split()[0]
-            )
-        except (PruneError, ValueError, IndexError):
-            return None
-
     def title(self, node: str, image_id: str) -> str | None:
         try:
             info = run_json(
@@ -360,9 +357,27 @@ class Pruner:
         config = (((info.get("info") or {}).get("imageSpec") or {}).get("config")) or {}
         return (config.get("Labels") or {}).get(TITLE_LABEL)
 
+    def assert_tilt_unchanged(self, view: TiltView | None, current: set[str]) -> None:
+        """Raise when the Tilt this pass started from has begun an update.
+
+        Its new build is loaded before it is deployed, so nothing may be
+        removed from then on. Checked before every removal.
+        """
+        if view is None:
+            return
+        again = self.tilt()
+        if again is None or again.busy or not again.refs <= current:
+            raise PruneError("Tilt started an update; stopping")
+
     def prune_node(
         self, node: str, repos: frozenset[str], current: set[str], view: TiltView | None
-    ) -> tuple[int, int]:
+    ) -> tuple[int, int, bool]:
+        """Remove one node's superseded images.
+
+        Returns the count removed, their summed image size, and whether a
+        superseded image stayed behind because a container held it or its
+        removal failed.
+        """
         images = parse_images(
             run_json(["docker", "exec", node, "crictl", "images", "-o", "json"])
         )
@@ -371,64 +386,71 @@ class Pruner:
         )
         images = [
             Image(image.id, image.refs, image.size, self.title(node, image.id))
-            if not image.refs and image.id not in in_use_ids
+            if not image.refs
             else image
             for image in images
         ]
         doomed = superseded(images, repos, current | in_use_refs, in_use_ids)
+        held = len(superseded(images, repos, current, set())) > len(doomed)
         if not doomed:
-            return 0, 0
+            return 0, 0, held
         if self.dry_run:
             log(f"{node}: would remove {len(doomed)} superseded image(s):")
             for image in doomed:
                 log(f"  {image.describe()}")
-            return len(doomed), 0
-        # A build may have started while this node was read. Its image is not
-        # deployed yet, so stop rather than remove anything Tilt now has.
-        if view is not None:
-            again = self.tilt()
-            if again is None or again.busy or not again.refs <= current:
-                raise PruneError(f"Tilt started an update; stopping before {node}")
-        before = self.store_bytes(node)
-        removed = []
-        for image in doomed:
-            try:
-                run(["docker", "exec", node, "crictl", "rmi", image.id])
-                removed.append(image)
-            except PruneError as error:
-                log(f"WARNING: {node}: could not remove {image.describe()}: {error}")
-        after = self.store_bytes(node)
-        freed = before - after if before is not None and after is not None else 0
-        log(
-            f"{node}: removed {len(removed)} superseded image(s), "
-            f"freed {human(max(freed, 0))} of the node store:"
-        )
-        for image in removed:
-            log(f"  {image.describe()}")
-        return len(removed), max(freed, 0)
+            return len(doomed), sum(image.size for image in doomed), held
+        removed: list[Image] = []
+        failed = False
+        try:
+            for image in doomed:
+                self.assert_tilt_unchanged(view, current)
+                try:
+                    run(["docker", "exec", node, "crictl", "rmi", image.id])
+                    removed.append(image)
+                except PruneError as error:
+                    failed = True
+                    log(
+                        f"WARNING: {node}: could not remove {image.describe()}: {error}"
+                    )
+        finally:
+            # Also when Tilt stopped the pass part-way: say what is gone.
+            if removed:
+                log(
+                    f"{node}: removed {len(removed)} superseded image(s), "
+                    f"{human(sum(image.size for image in removed))} of image content:"
+                )
+                for image in removed:
+                    log(f"  {image.describe()}")
+        return len(removed), sum(image.size for image in removed), held or failed
 
-    def prune(self) -> bool:
-        """One pass over every node. False when it stood down."""
+    def prune(self) -> bool | None:
+        """One pass over every node.
+
+        None when it stood down for a busy Tilt; otherwise whether a
+        superseded image stayed behind, for the watcher to retry.
+        """
         view = self.tilt()
         if view is not None and view.busy:
             log(
                 f"Tilt is updating {', '.join(view.busy)}; not pruning until it settles"
             )
-            return False
+            return None
         names = local_image_names()
         repos = space_repositories(names)
         current = self.current_refs(names, view)
         total_images = total_bytes = 0
+        left_behind = False
         for node in self.nodes():
-            count, freed = self.prune_node(node, repos, current, view)
+            count, size, held = self.prune_node(node, repos, current, view)
             total_images += count
-            total_bytes += freed
+            total_bytes += size
+            left_behind |= held
         if total_images and not self.dry_run:
             log(
                 f"removed {total_images} superseded SPACE image(s) in total, "
-                f"freeing {human(total_bytes)} under $SPACE_KIND_DATA_ROOT"
+                f"{human(total_bytes)} of image content under $SPACE_KIND_DATA_ROOT"
             )
-        return True
+        return left_behind
 
     def fingerprint(self) -> str | None:
         """What a new pass would see as current, or None while Tilt is busy."""
@@ -444,18 +466,29 @@ class Pruner:
         )
         return hashlib.sha256("\n".join(refs).encode()).hexdigest()
 
+    def tick(self, state: WatchState) -> None:
+        """One watcher round: prune when the references changed, or when the
+        last pass left something behind and RETRY_TICKS rounds have passed."""
+        seen = self.fingerprint()
+        state.since += 1
+        due = state.left_behind and state.since >= RETRY_TICKS
+        if seen is None or (seen == state.last and not due):
+            return
+        left_behind = self.prune()
+        if left_behind is not None:
+            state.last, state.left_behind, state.since = seen, left_behind, 0
+
     def watch(self, interval: int) -> None:
         """Prune whenever the current references change and Tilt is idle.
 
         A finished rollout changes them too (its old pods go), so the build it
         replaced is removed once nothing uses it.
         """
-        last = warned = None
+        state = WatchState()
+        warned = None
         while True:
             try:
-                seen = self.fingerprint()
-                if seen is not None and seen != last and self.prune():
-                    last = seen
+                self.tick(state)
                 warned = None
             except PruneError as error:
                 # Once per distinct cause: Tilt takes a while to connect.
@@ -465,6 +498,13 @@ class Pruner:
             time.sleep(interval)
 
 
+@dataclass
+class WatchState:
+    last: str | None = None
+    left_behind: bool = False
+    since: int = 0
+
+
 def human(count: int) -> str:
     value = float(count)
     for unit in ("B", "KiB", "MiB"):
@@ -472,6 +512,13 @@ def human(count: int) -> str:
             return f"{count} B" if unit == "B" else f"{value:.1f} {unit}"
         value /= 1024
     return f"{value:.1f} GiB"
+
+
+def positive_seconds(value: str) -> int:
+    seconds = int(value)
+    if seconds < 1:
+        raise argparse.ArgumentTypeError("must be at least 1 second")
+    return seconds
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -490,14 +537,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument(
         "--watch",
-        type=int,
+        type=positive_seconds,
         metavar="SECONDS",
         help="keep running, pruning after each settled Tilt update (implies a Tilt is required)",
     )
     args = parser.parse_args(argv)
     if os.environ.get(OPT_OUT, "1") == "0":
         log(f"superseded-image pruning is off ({OPT_OUT}=0)")
-        if args.watch:
+        if args.watch is not None:
             # A Tilt serve_cmd that exits shows as an error; idle instead.
             while True:
                 time.sleep(3600)
@@ -509,7 +556,7 @@ def main(argv: list[str] | None = None) -> int:
         require_tilt=args.watch is not None,
         dry_run=args.dry_run,
     )
-    if args.watch:
+    if args.watch is not None:
         pruner.watch(args.watch)
     try:
         pruner.prune()

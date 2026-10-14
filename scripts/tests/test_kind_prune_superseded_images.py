@@ -4,6 +4,7 @@ Never touches a cluster: `crictl`, `kubectl`, `kind` and `tilt` answers are
 canned, in the shapes those tools print.
 """
 
+import copy
 import importlib.util
 import json
 import pathlib
@@ -347,11 +348,13 @@ NODES = ["space-local-control-plane", "space-local-worker"]
 
 
 class FakeCommands:
-    def __init__(self, tilt=None, kubectl_fails=False):
+    def __init__(self, tilt=None, kubectl_fails=False, after_rmi=None):
         self.tilt = tilt
         self.kubectl_fails = kubectl_fails
+        self.after_rmi = after_rmi
+        self.ps = copy.deepcopy(CRICTL_PS)
         self.removed = {node: [] for node in NODES}
-        self.store = {node: 10_000_000_000 for node in NODES}
+        self.image_lists = 0
 
     def __call__(self, args, timeout=60):
         match args:
@@ -368,11 +371,12 @@ class FakeCommands:
                     raise prune.PruneError("tilt: connection refused")
                 return json.dumps(self.tilt[what])
             case ["docker", "exec", node, "crictl", "images", "-o", "json"]:
+                self.image_lists += 1
                 gone = set(self.removed[node])
                 images = [i for i in CRICTL_IMAGES["images"] if i["id"] not in gone]
                 return json.dumps({"images": images})
             case ["docker", "exec", _, "crictl", "ps", "-a", "-o", "json"]:
-                return json.dumps(CRICTL_PS)
+                return json.dumps(self.ps)
             case ["docker", "exec", _, "crictl", "inspecti", "-o", "json", image]:
                 labels = {prune.TITLE_LABEL: TITLES[image]} if image in TITLES else None
                 return json.dumps(
@@ -380,10 +384,9 @@ class FakeCommands:
                 )
             case ["docker", "exec", node, "crictl", "rmi", image]:
                 self.removed[node].append(image)
-                self.store[node] -= 100_000_000
+                if self.after_rmi:
+                    self.after_rmi(self)
                 return ""
-            case ["docker", "exec", node, "du", "-sxb", prune.NODE_STORE]:
-                return f"{self.store[node]}\t{prune.NODE_STORE}\n"
         raise AssertionError(f"unexpected command: {args}")
 
 
@@ -418,7 +421,8 @@ def test_pass_removes_on_every_node_and_reports_space(monkeypatch, capsys):
         assert set(fake.removed[node]) == {image_id(n) for n in (2, 4, 5, 15, 16)}
     output = capsys.readouterr().out
     assert (
-        "space-local-worker: removed 5 superseded image(s), freed 476.8 MiB" in output
+        "space-local-worker: removed 5 superseded image(s), "
+        "1005.2 MiB of image content:" in output
     )
     assert "space-worker:tilt-0000000000000004" in output
     assert "space-api (untagged " in output
@@ -517,3 +521,70 @@ def test_watch_passes_only_when_space_references_change(monkeypatch):
     # And nothing is decided while Tilt is updating.
     fake.tilt = tilt_state(busy=("space-ui",))
     assert pruner.fingerprint() is None
+
+
+def test_tilt_turning_busy_between_removals_stops_the_pass(monkeypatch, capsys):
+    # The first removal starts a Tilt update; nothing after it may go, on this
+    # node or the next.
+    def start_update(fake):
+        fake.tilt = tilt_state(busy=("space-api",))
+
+    fake = FakeCommands(tilt=tilt_state(), after_rmi=start_update)
+    assert pass_with(monkeypatch, fake) == 1
+    assert sum(len(images) for images in fake.removed.values()) == 1
+    output = capsys.readouterr().out
+    # What did go is still reported.
+    assert f"{NODES[0]}: removed 1 superseded image(s)" in output
+    assert "Tilt started an update" in output
+
+
+def test_tilt_building_a_new_image_between_removals_stops_the_pass(monkeypatch):
+    # Not busy any more, but its image map names a build this pass never saw.
+    def new_build(fake):
+        fake.tilt = tilt_state(
+            images=("space-ui:tilt-0000000000000014", "space-api:tilt-new")
+        )
+
+    fake = FakeCommands(tilt=tilt_state(), after_rmi=new_build)
+    assert pass_with(monkeypatch, fake) == 1
+    assert sum(len(images) for images in fake.removed.values()) == 1
+
+
+def test_watch_retries_an_image_a_container_held(monkeypatch):
+    fake = FakeCommands(tilt=tilt_state())
+    monkeypatch.setattr(prune, "run", fake)
+    monkeypatch.setattr(prune.shutil, "which", lambda _: "/usr/bin/tilt")
+    pruner = prune.Pruner("space-local", "10350", None, True, False)
+    state = prune.WatchState()
+    held = image_id(6)  # untagged seed publisher an exited container still uses
+
+    pruner.tick(state)
+    assert all(held not in images for images in fake.removed.values())
+    assert state.left_behind
+
+    # The container goes; no reference changes, so the fingerprint cannot see it.
+    fake.ps = {"containers": []}
+    for _ in range(prune.RETRY_TICKS - 1):
+        pruner.tick(state)
+        assert all(held not in images for images in fake.removed.values())
+    pruner.tick(state)
+    assert all(held in images for images in fake.removed.values())
+    assert not state.left_behind
+
+    # Nothing left behind: idle ticks read no node.
+    lists = fake.image_lists
+    for _ in range(3 * prune.RETRY_TICKS):
+        pruner.tick(state)
+    assert fake.image_lists == lists
+
+
+@pytest.mark.parametrize("seconds", ["0", "-5"])
+def test_watch_interval_must_be_positive(seconds, capsys, monkeypatch):
+    def never(*_):
+        raise AssertionError("the watcher started")
+
+    monkeypatch.setattr(prune.Pruner, "watch", never)
+    with pytest.raises(SystemExit) as exit:
+        prune.main(["--watch", seconds])
+    assert exit.value.code == 2
+    assert "must be at least 1 second" in capsys.readouterr().err

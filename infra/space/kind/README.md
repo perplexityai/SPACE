@@ -800,9 +800,12 @@ all of these hold:
 - No container on that node uses it, running or exited.
 
 It stands down while that Tilt has an update pending or in progress, because a
-build it just loaded is not deployed yet, and removes nothing when it cannot
-read the cluster. It prints nothing when nothing is superseded; otherwise it
-logs each image it removes and the space that freed on each node.
+build it just loaded is not deployed yet, checks again before every removal,
+and removes nothing when it cannot read the cluster. It prints nothing when
+nothing is superseded; otherwise it logs each image it removes and their total
+image size per node, as `crictl images` reports it (unpacked layers free more).
+The Tilt resource retries an image a container still held every few minutes
+until it is gone.
 Third-party images, and images of repositories the harness no longer builds,
 are never touched. `--dry-run` lists what it would remove;
 `SPACE_KIND_PRUNE_SUPERSEDED_IMAGES=0` turns it off on both paths.
