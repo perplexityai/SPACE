@@ -11,6 +11,12 @@ use sqlx::PgExecutor;
 #[error("system publication grant storage failed: {0}")]
 pub(super) struct GrantStorageError(#[from] sqlx::Error);
 
+impl GrantStorageError {
+    pub(super) fn as_sql(&self) -> &sqlx::Error {
+        &self.0
+    }
+}
+
 /// Whether this build's grant is fresh and names its publication target.
 pub(super) async fn covers(
     executor: impl PgExecutor<'_>,

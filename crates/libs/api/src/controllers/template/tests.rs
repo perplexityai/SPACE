@@ -852,8 +852,8 @@ async fn failed_acceptance_revokes_only_its_publication_grant(
         )
         .await;
 
-    // Older gateways may omit builder identity during the preparation rollout.
-    let accepted = matches!(failure, AcceptanceFailure::MissingBuilder);
+    // Legacy system responses may omit builder identity; tenant grants require it.
+    let accepted = system && matches!(failure, AcceptanceFailure::MissingBuilder);
     assert_eq!(result.is_ok(), accepted);
     let job = fixture
         .store
