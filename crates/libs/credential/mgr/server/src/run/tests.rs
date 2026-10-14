@@ -885,3 +885,78 @@ async fn an_agent_that_gives_up_stops_its_health_server() {
     );
     assert!(!shutdown_token.is_cancelled());
 }
+
+// A startup abandoned while the agent waits, its task aborted while the
+// runtime keeps running, takes its health server with it, rather than
+// leaving liveness answering for an agent that is gone.
+#[tokio::test]
+async fn dropping_a_waiting_agent_stops_its_health_server() {
+    let dir = tempdir().unwrap();
+    let health = dir.path().join("health.sock");
+    let mutex_path = dir.path().join("service.mutex");
+    let config = CredmgrRunConfig {
+        role: CredmgrRole::Agent,
+        health_socket_path: Some(health.clone()),
+        ..node_local_config()
+    };
+    let starting = tokio::spawn(async move {
+        let authority = GatedAuthority::default();
+        let _ = start_agent(
+            &config,
+            &CancellationToken::new(),
+            &mutex_path,
+            &authority,
+            |_| {},
+        )
+        .await;
+    });
+    wait_for_path(&health).await;
+    assert_eq!(
+        local_health(&health, "liveness").await,
+        Ok(ServingStatus::Serving)
+    );
+
+    starting.abort();
+    assert!(starting.await.unwrap_err().is_cancelled());
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while local_health(&health, "liveness").await.is_ok() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the health server outlived its dropped startup"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+// Activation takes the early health server over: it keeps answering after
+// the startup future that bound it has returned.
+#[tokio::test]
+async fn an_activated_agent_keeps_its_health_server() {
+    let dir = tempdir().unwrap();
+    let health = dir.path().join("health.sock");
+    let config = CredmgrRunConfig {
+        role: CredmgrRole::Agent,
+        health_socket_path: Some(health.clone()),
+        ..node_local_config()
+    };
+    let authority = GatedAuthority::default();
+    authority.open.notify_one();
+
+    let (_, node_local) = start_agent(
+        &config,
+        &CancellationToken::new(),
+        &dir.path().join("service.mutex"),
+        &authority,
+        |_| {},
+    )
+    .await
+    .expect("the agent starts")
+    .expect("nothing holds the service mutex");
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        local_health(&health, "liveness").await,
+        Ok(ServingStatus::Serving)
+    );
+    drop(node_local);
+}

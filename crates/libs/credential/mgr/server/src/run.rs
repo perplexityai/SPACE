@@ -1388,7 +1388,8 @@ async fn connect_agent_upstream<U: AgentUpstream>(
 /// the agent waits for its authority and the pod is not Ready before it can
 /// serve. Once connected, the agent publishes passive readiness and activates
 /// as every node-local service does. A failed or cancelled wait stops the
-/// health server before returning.
+/// health server before returning, and so does dropping the future before
+/// activation.
 async fn start_agent<U: AgentUpstream>(
     config: &CredmgrRunConfig,
     shutdown_token: &CancellationToken,
@@ -1404,6 +1405,10 @@ async fn start_agent<U: AgentUpstream>(
         health_shutdown.clone(),
     )
     .map_err(RunCredmgrError::HealthSocket)?;
+    // Until activation takes the health server over, dropping this future
+    // (an aborted task, an elapsed timeout) must stop it too; nothing else
+    // would, and it would keep answering liveness for an agent that is gone.
+    let health_guard = health_shutdown.clone().drop_guard();
     let client = match connect_agent_upstream(upstream, shutdown_token, report).await {
         Ok(Some(client)) => client,
         stopped => {
@@ -1420,7 +1425,10 @@ async fn start_agent<U: AgentUpstream>(
     )
     .await
     {
-        Ok(Some(node_local)) => Ok(Some((client, node_local))),
+        Ok(Some(node_local)) => {
+            health_guard.disarm();
+            Ok(Some((client, node_local)))
+        }
         Ok(None) => Ok(None),
         Err(error) => {
             health_shutdown.cancel();
