@@ -25,7 +25,9 @@
 #   build    build the reference locally, whatever is present
 #   publish  push the reference to GHCR unless it is already there (main CI)
 #
-# GHCR_TOKEN, when set, logs in to the registry first.
+# GHCR_TOKEN, when set, logs in to the registry first. The login and the pull
+# end after SPACE_DOCKER_PULL_TIMEOUT_SECONDS (default 300), so a stalled
+# registry costs a local build rather than the job.
 # SPACE_KIND_NODE_IMAGE_REPOSITORY overrides the repository. Builds take the
 # base from the repository's third-party image mirror when SPACE_CI_IMAGE_MIRROR
 # is set and the mirror has it (ci/mirrored-images.txt), as the CI image does;
@@ -87,12 +89,16 @@ base_ref() {
 # does not resolve locally. The Dockerfile pins the multi-platform index, and
 # the mirror holds that index's linux/amd64 manifest, so the copy `ensure`
 # pulls from the mirror resolves under the manifest's digest and not the
-# index's. Outside GitHub CI the config keeps the index, so kind takes the
-# host's platform.
+# index's. Only the containerd image store resolves that tag and digest to a
+# copy pulled from another repository, and Kind CI enables it; on the classic
+# store `kind create` pulls the manifest from the source. Outside GitHub CI the
+# config keeps the index, so kind takes the host's platform.
 cluster_base_ref() {
-  local base
+  local base pinned
   base="$(base_ref)"
-  if [[ -n "${SPACE_CI_IMAGE_MIRROR:-}" ]] && bash "${MIRROR_IMAGES}" pinned "${base}"; then
+  # Captured, so a list that fails after printing cannot add a second line.
+  if [[ -n "${SPACE_CI_IMAGE_MIRROR:-}" ]] && pinned="$(bash "${MIRROR_IMAGES}" pinned "${base}")"; then
+    printf '%s\n' "${pinned}"
     return 0
   fi
   printf '%s\n' "${base}"
@@ -109,14 +115,25 @@ ensure_cluster_base() {
   fi
   bash "${MIRROR_IMAGES}" pull "$(base_ref)" >&2 || true
   if ! docker image inspect "${ref}" >/dev/null 2>&1; then
-    log "WARNING: ${ref} is not local; kind create pulls it from its source"
+    log "WARNING: ${ref} is not local; kind create pulls it from its source" \
+      "(on the classic image store a copy from the mirror does not resolve under that name)"
   fi
+}
+
+# A registry command bounded by the CI helpers' deadline. Sourced on first use,
+# so `ref` and `inputs` need nothing but this script and the image's inputs.
+with_deadline() {
+  if ! declare -F space_with_deadline >/dev/null; then
+    # shellcheck source=../../../../ci/scripts/lib/test-deps.sh
+    source "${REPO_ROOT}/ci/scripts/lib/test-deps.sh"
+  fi
+  space_with_deadline "$@"
 }
 
 registry_login() {
   [ -n "${GHCR_TOKEN:-}" ] || return 0
   printf '%s' "${GHCR_TOKEN}" |
-    docker login "${REPOSITORY%%/*}" --username "${GITHUB_ACTOR:-space-ci}" \
+    with_deadline 60 docker login "${REPOSITORY%%/*}" --username "${GITHUB_ACTOR:-space-ci}" \
       --password-stdin >/dev/null
 }
 
@@ -158,7 +175,8 @@ ensure() {
     if ! registry_login; then
       log "WARNING: could not log in to ${REPOSITORY%%/*}; the pull below may fail"
     fi
-    if error="$(docker pull --quiet "${ref}" 2>&1 >/dev/null)"; then
+    if error="$(with_deadline "${SPACE_DOCKER_PULL_TIMEOUT_SECONDS:-300}" \
+      docker pull --quiet "${ref}" 2>&1 >/dev/null)"; then
       log "pulled the published ${ref}"
     else
       log "building ${ref} locally; it is not published or not reachable: ${error%%$'\n'*}"

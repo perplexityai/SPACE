@@ -26,18 +26,39 @@ PINNED_MIRROR="ghcr.io/example/mirror@${PINNED_DIGEST}"
 mkdir -p "${WORK_DIR}/bin"
 cat >"${WORK_DIR}/bin/docker" <<'SH'
 #!/usr/bin/env bash
-# Pullable references are listed in FAKE_PULLABLE; the registry's manifests,
-# which imagetools inspects and creates, are the lines of FAKE_REGISTRY.
+# Pullable references are listed in FAKE_PULLABLE, and a pull of one listed
+# in FAKE_HANG never answers; the registry's manifests, which imagetools
+# inspects and creates, are the lines of FAKE_REGISTRY. FAKE_SERVES lists
+# name=digest pairs: the linux/amd64 digest each upstream name serves, as an
+# index for a name pinned by digest and as a single manifest otherwise.
 printf '%s\n' "$*" >>"${FAKE_CALLS}"
 case "$1 ${2:-} ${3:-}" in
     "login "*) cat >/dev/null ;;
     "image inspect "*) exit 1 ;;
     "pull "*)
         ref="${*: -1}"
+        [[ " ${FAKE_HANG:-} " != *" ${ref} "* ]] || exec sleep 60
         [[ " ${FAKE_PULLABLE:-} " == *" ${ref} "* ]] || { echo "manifest unknown: ${ref}" >&2; exit 1; }
         ;;
     "tag "*) [[ "${*: -1}" != *@* ]] || { echo "refusing to create a tag with a digest reference" >&2; exit 1; } ;;
-    "buildx imagetools inspect") grep -qxF "${*: -1}" "${FAKE_REGISTRY}" ;;
+    "buildx imagetools inspect")
+        name="${*: -1}"
+        if [ "${4:-}" = --format ]; then
+            for pair in ${FAKE_SERVES:-}; do
+                [ "${pair%=*}" = "${name}" ] || continue
+                if [[ "${name}" == *@* ]]; then
+                    printf '{"manifests":[{"digest":"sha256:arm","platform":{"os":"linux","architecture":"arm64"}},'
+                    printf '{"digest":"%s","platform":{"os":"linux","architecture":"amd64"}}]}\n' "${pair##*=}"
+                else
+                    printf '{"digest":"%s"}\n' "${pair##*=}"
+                fi
+                exit 0
+            done
+            echo "not found: ${name}" >&2
+            exit 1
+        fi
+        grep -qxF "${name}" "${FAKE_REGISTRY}"
+        ;;
     "buildx imagetools create")
         [ -z "${FAKE_CREATE_FAILS:-}" ] || exit 1
         [[ " ${FAKE_UNREACHABLE:-} " != *" ${*: -1} "* ]] || exit 1
@@ -90,6 +111,15 @@ grep -q "Could not pull" "${WORK_DIR}/out" && fail "a successful fallback still 
 run "${OTHER}" "" pull "${NAME}" || fail "the fallback to another repository exited nonzero"
 called "tag ${OTHER} ${NAME}" || fail "the fallback did not try the other repository's digest"
 
+if command -v timeout >/dev/null 2>&1; then
+    started="${SECONDS}"
+    FAKE_HANG="${MIRROR}" SPACE_DOCKER_PULL_TIMEOUT_SECONDS=1 run "${ORIGIN}" "" pull "${NAME}" ||
+        fail "a mirror that never answers failed the job"
+    [ $((SECONDS - started)) -lt 15 ] || fail "a mirror that never answers held the pull for $((SECONDS - started)) s"
+    called "tag ${ORIGIN} ${NAME}" || fail "a mirror that never answers did not fall back to the source"
+    grep -q "no answer within 1 s" "${WORK_DIR}/out" || fail "the fallback did not say the mirror timed out"
+fi
+
 run "" "" pull "${NAME}" || fail "a pull with every registry down failed the job"
 grep -q "^tag " "${WORK_DIR}/calls" && fail "an image was tagged although no pull succeeded"
 
@@ -138,6 +168,19 @@ called "buildx imagetools create --prefer-index=false --tag ${DESTINATION} ${ORI
 FAKE_UNREACHABLE="${ORIGIN}" run "" "${PINNED_MIRROR}" publish || fail "publish failed although another repository had the digest"
 called "buildx imagetools create --prefer-index=false --tag ${DESTINATION} ${OTHER}" ||
     fail "publish did not copy from the other repository when the first failed"
+
+STALE="sha256:$(printf 'e%.0s' {1..64})"
+FAKE_SERVES="${PINNED_NAME}=${STALE}" run "" "${MIRROR}"$'\n'"${PINNED_MIRROR}" publish &&
+    fail "publish accepted a name pinned to an index that does not serve the listed digest"
+grep -q "::error::${PINNED_NAME} serves ${STALE}" "${WORK_DIR}/out" ||
+    fail "publish did not name the digest the bumped index serves: $(cat "${WORK_DIR}/out")"
+FAKE_SERVES="${PINNED_NAME}=${PINNED_DIGEST}" run "" "${MIRROR}"$'\n'"${PINNED_MIRROR}" publish ||
+    fail "publish refused an index that serves the listed digest: $(cat "${WORK_DIR}/out")"
+FAKE_SERVES="${NAME}=${STALE}" run "" "${PINNED_MIRROR}" publish ||
+    fail "publish refused a digest whose tag has since moved"
+grep -q "::warning::${NAME} now serves ${STALE}" "${WORK_DIR}/out" || fail "publish did not warn that the tag moved"
+called "buildx imagetools create --prefer-index=false --tag ${DESTINATION} ${ORIGIN}" ||
+    fail "publish did not copy a pinned digest whose tag has since moved"
 
 FAKE_CREATE_DIGEST="sha256:$(printf 'b%.0s' {1..64})" run "" "${PINNED_MIRROR}" publish &&
     fail "publish accepted a copy that changed the digest"

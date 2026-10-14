@@ -32,7 +32,14 @@
 #        ci/scripts/mirror-images.sh pinned <name>
 #
 # GHCR_TOKEN, when set, logs in to ghcr.io first; the package is private while
-# the repository is. SPACE_MIRRORED_IMAGES overrides the list.
+# the repository is. SPACE_MIRRORED_IMAGES overrides the list. The login and
+# each pull end after SPACE_DOCKER_PULL_TIMEOUT_SECONDS (default 300), so a
+# stalled mirror falls back to the source instead of holding the job.
+#
+# The mirror holds each listed digest for linux/amd64, the platform GitHub CI
+# runs. Before copying a digest, and on every run for a name pinned by digest,
+# publish checks that the name serves that digest for linux/amd64, so that a
+# name bumped without its digest does not leave CI on the old image.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -40,6 +47,7 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 LIST="${SPACE_MIRRORED_IMAGES:-${REPO_ROOT}/ci/mirrored-images.txt}"
 COPY_ATTEMPTS="${SPACE_MIRROR_COPY_ATTEMPTS:-5}"
 COPY_RETRY_DELAY_SECONDS="${SPACE_MIRROR_COPY_RETRY_DELAY_SECONDS:-10}"
+PULL_TIMEOUT_SECONDS="${SPACE_DOCKER_PULL_TIMEOUT_SECONDS:-300}"
 # shellcheck source=lib/test-deps.sh
 source "${SCRIPT_DIR}/lib/test-deps.sh"
 
@@ -70,7 +78,8 @@ entries() {
 registry_login() {
     [ -n "${GHCR_TOKEN:-}" ] || return 0
     printf '%s' "${GHCR_TOKEN}" |
-        docker login ghcr.io --username "${GITHUB_ACTOR:-space-ci}" --password-stdin >/dev/null
+        space_with_deadline 60 docker login ghcr.io --username "${GITHUB_ACTOR:-space-ci}" \
+            --password-stdin >/dev/null
 }
 
 mirrored() {
@@ -78,7 +87,7 @@ mirrored() {
 }
 
 pull() {
-    local listed image entry name mirror sources source error started
+    local listed image entry name mirror sources source error status started
     listed="$(entries)"
     if ! registry_login; then
         echo "::warning::Could not log in to ghcr.io; the mirror pulls below may fail"
@@ -93,11 +102,15 @@ pull() {
         # A tag cannot carry a digest; a name pinned by digest keeps its tag.
         name="${name%%@*}"
         started="${SECONDS}"
-        if error="$(docker pull --quiet "${mirror}" 2>&1 >/dev/null)"; then
+        status=0
+        error="$(space_with_deadline "${PULL_TIMEOUT_SECONDS}" docker pull --quiet "${mirror}" 2>&1 >/dev/null)" ||
+            status=$?
+        if [ "${status}" -eq 0 ]; then
             docker tag "${mirror}" "${name}"
             echo "Pulled ${name} from ${mirror} in $((SECONDS - started)) s"
             continue
         fi
+        [ "${status}" -ne 124 ] || error="no answer within ${PULL_TIMEOUT_SECONDS} s"
         echo "::warning::Pulling ${name} from its source; ${mirror} is unavailable: ${error%%$'\n'*}"
         for source in ${sources}; do
             started="${SECONDS}"
@@ -157,15 +170,50 @@ copy_with_retries() {
     done
 }
 
+# The digest a name serves for linux/amd64: its entry for that platform when
+# the name is an index, else the name's own manifest.
+platform_digest() {
+    docker buildx imagetools inspect --format '{{json .Manifest}}' "$1" |
+        jq -r 'if .manifests then
+                ([.manifests[] | select(.platform.os == "linux" and .platform.architecture == "amd64")
+                  | .digest][0] // empty)
+            else .digest end'
+}
+
+# Fail when a name pinned by digest does not serve the listed digest for
+# linux/amd64: the line was bumped without it. A tag can legitimately move
+# after its line was written, and an unreadable name proves nothing, so those
+# only warn.
+check_listed_digest() {
+    local name="$1" digest="$2" served
+    if ! served="$(platform_digest "${name}" 2>/dev/null)" || [ -z "${served}" ]; then
+        echo "::warning::Could not check that ${name} serves ${digest} for linux/amd64"
+        return 0
+    fi
+    [ "${served}" != "${digest}" ] || return 0
+    if [[ "${name}" == *@* ]]; then
+        echo "::error::${name} serves ${served} for linux/amd64, not the listed ${digest}"
+        return 1
+    fi
+    echo "::warning::${name} now serves ${served} for linux/amd64, not the listed ${digest}; its tag has moved"
+}
+
 publish() {
     local listed name mirror destination sources failures=0
     listed="$(entries)"
     registry_login
     while read -r name mirror destination sources; do
         [ -n "${name}" ] || continue
+        if [[ "${name}" == *@* ]] && ! check_listed_digest "${name}" "${mirror#*@}"; then
+            failures=$((failures + 1))
+            continue
+        fi
         if mirrored "${mirror}"; then
             echo "${name} is already mirrored as ${mirror}"
             continue
+        fi
+        if [[ "${name}" != *@* ]]; then
+            check_listed_digest "${name}" "${mirror#*@}"
         fi
         # shellcheck disable=SC2086 # sources are digest references without spaces
         if ! copy_with_retries "${destination}" ${sources}; then

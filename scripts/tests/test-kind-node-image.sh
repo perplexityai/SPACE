@@ -71,6 +71,13 @@ export SPACE_MIRRORED_IMAGES="$work/mirrored-images.txt"
   || fail "outside GitHub CI the cluster does not run the pinned base"
 [[ "$(SPACE_CI_IMAGE_MIRROR=ghcr bash "$image_script" cluster-base)" == "$mirrored_base" ]] \
   || fail "in GitHub CI the cluster does not name the mirrored digest of the base"
+# A malformed line after the base's: the list is rejected, and the config
+# still gets one reference, the base's own.
+cp "$work/mirrored-images.txt" "$work/malformed-images.txt"
+echo "registry.example/unpinned sha256:short ghcr.io/example/mirror" >>"$work/malformed-images.txt"
+[[ "$(SPACE_MIRRORED_IMAGES="$work/malformed-images.txt" SPACE_CI_IMAGE_MIRROR=ghcr \
+  bash "$image_script" cluster-base 2>/dev/null)" == "$base" ]] \
+  || fail "a malformed list did not leave the cluster on exactly the pinned base"
 
 # The rendered space-local config: SPACE nodes on the image, the rest on its
 # base. Arguments after the expected base go to env (options first).

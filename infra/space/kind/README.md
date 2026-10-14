@@ -1755,7 +1755,9 @@ set, `ensure` also pulls that base for the control-plane and infra nodes from
 the mirror, falling back to its source, and the renderer names it by the digest
 the mirror holds: the index's linux/amd64 manifest, the only digest the pulled
 copy resolves under, so `kind create` uses it instead of pulling the index from
-Docker Hub. Elsewhere the config names the index and kind pulls it. A package
+Docker Hub. That lookup needs Docker's containerd image store, which Kind CI
+enables; on the classic store `kind create` pulls the manifest from Docker Hub
+as before. Elsewhere the config names the index and kind pulls it. A package
 administrator has to make the `space-kind-node` package public for bring-ups
 outside CI to pull it; until then they build it, with the same result.
 
