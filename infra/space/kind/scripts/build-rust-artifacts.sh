@@ -65,10 +65,11 @@
 #                                   (default: ~/.space-devbox/kind/rust-artifacts)
 #   SPACE_KIND_RUNTIME_LIBC_IMAGE   image whose glibc the guard compares against
 #                                   (default: the runtime Dockerfiles' bookworm base)
-#   SPACE_KIND_BUILD_CACHE_REPOSITORY  optional GHCR repository for layer imports;
-#                                     unset leaves local builds unchanged
+#   SPACE_KIND_BUILD_CACHE_REPOSITORY  optional registry layer cache; unset leaves
+#                                     local builds unchanged
 #   SPACE_KIND_BUILD_CACHE_WRITE       1 exports layers (trusted main CI only);
 #                                     default 0 imports without exporting
+#                                     (both: infra/space/kind/lib/build-cache.sh)
 # In Actions, the exposed runtime also imports existing GHA layers until the
 # registry cache is seeded and public. It never exports to the Actions cache.
 set -euo pipefail
@@ -94,6 +95,9 @@ PROFILE="${SPACE_KIND_RUST_PROFILE:-release}"
 # Dockerfiles are debian:bookworm-slim (glibc 2.36); the worker is ubuntu:24.04
 # (2.39), so bookworm is the binding constraint for the shared artifact set.
 RUNTIME_LIBC_IMAGE="${SPACE_KIND_RUNTIME_LIBC_IMAGE:-public.ecr.aws/docker/library/debian:bookworm-slim}"
+
+# shellcheck source=../lib/build-cache.sh
+source "$REPO_ROOT/infra/space/kind/lib/build-cache.sh"
 
 log() { printf '[rust-artifacts] %s\n' "$*"; }
 die() { printf '[rust-artifacts] ERROR: %s\n' "$*" >&2; exit 1; }
@@ -139,34 +143,10 @@ decide_mode() {
 
 # ── Shared images ─────────────────────────────────────────────────────────────
 
-# Populate an argument array rather than word-splitting registry configuration.
-# CI enables the containerd image store for the default Docker build driver.
-# Imports are optional performance hints; unavailable caches cause cold builds.
-# Only trusted main writes. Token permissions are enforced by workflow callers,
-# not by these environment checks. Each image owns one stable tag.
+# The registry layer cache options (CACHE_FLAGS) for one scope; see the library
+# for the repository and write rules. Each image owns one stable tag.
 docker_cache_flags() {
-  local scope=$1 repository="${SPACE_KIND_BUILD_CACHE_REPOSITORY:-}"
-  local write="${SPACE_KIND_BUILD_CACHE_WRITE:-0}"
-  CACHE_FLAGS=()
-  [[ "$write" == 0 || "$write" == 1 ]] || die "SPACE_KIND_BUILD_CACHE_WRITE must be 0 or 1"
-  if [[ -z "$repository" ]]; then
-    [[ "$write" == 0 ]] || die "cache writes require SPACE_KIND_BUILD_CACHE_REPOSITORY"
-    return
-  fi
-  [[ "$repository" =~ ^ghcr\.io/[a-z0-9][a-z0-9._-]*/[a-z0-9][a-z0-9._-]*$ ]] \
-    || die "cache repository must be a lowercase ghcr.io/owner/package without a tag"
-  CACHE_FLAGS=(--cache-from "type=registry,ref=$repository:$scope")
-  # Read the old scopes during migration, without consuming more shared quota
-  # or making PRs wait for an export. Bound an unavailable service's lookup.
-  if [[ "${GITHUB_ACTIONS:-}" == true && -n "${ACTIONS_RUNTIME_TOKEN:-}" ]]; then
-    CACHE_FLAGS+=(--cache-from "type=gha,scope=$scope,timeout=60s")
-  fi
-  if [[ "$write" == 1 ]]; then
-    [[ "${GITHUB_ACTIONS:-}" == true && "${GITHUB_EVENT_NAME:-}" == push \
-      && "${GITHUB_REF:-}" == refs/heads/main && "${GITHUB_REPOSITORY:-}" == perplexityai/SPACE ]] \
-      || die "cache writes are restricted to perplexityai/SPACE main push CI"
-    CACHE_FLAGS+=(--cache-to "type=registry,ref=$repository:$scope,mode=max,image-manifest=true,oci-mediatypes=true,ignore-error=true")
-  fi
+  space_kind_cache_flags "$1" || die "invalid build cache configuration"
 }
 
 # In GitHub CI (SPACE_CI_IMAGE_MIRROR set), the --build-context options that

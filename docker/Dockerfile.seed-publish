@@ -41,10 +41,9 @@ RUN set -eux; \
       tar -xzf /grpcurl.tar.gz -C /; \
       chmod 0755 /grpcurl
 
-FROM public.ecr.aws/docker/library/debian:bookworm-slim
-
-LABEL org.opencontainers.image.title="space-seed-publish"
-LABEL org.opencontainers.image.description="SPACE local kind seed template publisher (S3 upload + ClusterApi release registration)."
+# The publisher's tools, before the seed and the SPACE files: the dependency
+# layers the Kind build cache keeps (infra/space/kind/scripts/runtime-image-cache.sh).
+FROM public.ecr.aws/docker/library/debian:bookworm-slim AS runtime-deps
 
 # awscli talks the real S3 protocol to the object store (sigv4, path-style).
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -52,6 +51,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=grpcurl-downloader /grpcurl /usr/local/bin/grpcurl
+
+FROM runtime-deps
+
+LABEL org.opencontainers.image.title="space-seed-publish"
+LABEL org.opencontainers.image.description="SPACE local kind seed template publisher (S3 upload + ClusterApi release registration)."
 
 # ClusterApi proto tree — grpcurl encodes the RPCs from source protos, so the
 # publish path speaks the same wire contract the Rust clients compile in.

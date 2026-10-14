@@ -32,11 +32,10 @@ RUN curl --fail --show-error --location --retry 5 \
     && make -j"$(nproc)" \
     && make install
 
-FROM public.ecr.aws/ubuntu/ubuntu:24.04
+# The image up to its SPACE binaries: the dependency layers the Kind build cache
+# keeps (infra/space/kind/scripts/runtime-image-cache.sh).
+FROM public.ecr.aws/ubuntu/ubuntu:24.04 AS runtime-deps
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
-
-LABEL org.opencontainers.image.title="space-worker"
-LABEL org.opencontainers.image.description="SPACE worker node services (node-manager + sandbox-manager)"
 
 # SPACE groups — must match the host GIDs from the AMI's 07-sysctl.sh.
 # Node-manager needs these for socket permissions (getgrnam). Volume-manager
@@ -102,6 +101,11 @@ RUN test "$(command -v e2fsck)" = /usr/local/sbin/e2fsck && e2fsck -V
 # upstream image instead of relying on expiring presigned URLs.
 COPY --from=aws-cli /usr/local/aws-cli /usr/local/aws-cli
 RUN ln -s /usr/local/aws-cli/v2/current/bin/aws /usr/local/bin/aws
+
+FROM runtime-deps
+
+LABEL org.opencontainers.image.title="space-worker"
+LABEL org.opencontainers.image.description="SPACE worker node services (node-manager + sandbox-manager)"
 
 # SPACE binaries
 # Guest spaced artifacts are packaged for seed image injection only; they are

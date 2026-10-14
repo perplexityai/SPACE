@@ -183,6 +183,14 @@ def pull_base_images(*dockerfiles):
 def mirrored_bases(dockerfile):
     return "$(bash ci/scripts/mirror-images.sh build-contexts {})".format(dockerfile)
 
+# With SPACE_KIND_BUILD_CACHE_REPOSITORY set, as in Kind CI, a build imports
+# its image's dependency stages from the registry layer cache main CI writes,
+# so an unchanged package list downloads nothing; see
+# infra/space/kind/scripts/runtime-image-cache.sh. Elsewhere this expands to
+# nothing. A miss or an unreachable cache builds those layers cold.
+def cached_layers(image):
+    return "$(bash infra/space/kind/scripts/runtime-image-cache.sh cache-from {})".format(image)
+
 # Up to eight updates at once instead of Tilt's default three. Every Rust image
 # waits on the artifact lock anyway, so the default mostly kept image builds and
 # kind loads that could overlap in three strict waves after the compile: 124-176 s
@@ -202,11 +210,12 @@ def rust_runtime_image(name, dockerfile, runtime_deps):
     cmd = " && ".join([
         pull_base_images(dockerfile),
         RUST_ARTIFACT_BUILD,
-        ("docker build -t $EXPECTED_REF -f {dockerfile} {mirrored} " +
+        ("docker build -t $EXPECTED_REF -f {dockerfile} {mirrored} {cached} " +
          "--build-arg SPACE_RUST_BUILD_IMAGE={rust_image} " +
          "--build-arg SPACE_GIT_SHA={git_sha} .").format(
             dockerfile = dockerfile,
             mirrored = mirrored_bases(dockerfile),
+            cached = cached_layers(name),
             rust_image = RUST_ARTIFACT_IMAGE,
             git_sha = KIND_GIT_SHA,
         ),
@@ -260,9 +269,10 @@ custom_build(
         # manifest list, which `kind load docker-image` cannot ingest
         # ("content digest ... not found").
         ("docker build --provenance=false --sbom=false -t $EXPECTED_REF " +
-         "-f docker/Dockerfile.worker {} " +
+         "-f docker/Dockerfile.worker {} {} " +
          "--build-arg SPACE_RUST_BUILD_IMAGE={} --build-arg SPACE_GIT_SHA={} .").format(
-            mirrored_bases("docker/Dockerfile.worker"), RUST_ARTIFACT_IMAGE, KIND_GIT_SHA),
+            mirrored_bases("docker/Dockerfile.worker"), cached_layers("space-worker"),
+            RUST_ARTIFACT_IMAGE, KIND_GIT_SHA),
     ]),
     deps = RUST_ARTIFACT_DEPS + [
             "docker/Dockerfile.worker",
@@ -290,6 +300,7 @@ custom_build(
         "SPACE_RUST_BUILD_IMAGE={} bash infra/space/kind/scripts/build-seed.sh".format(RUST_ARTIFACT_IMAGE),
         ("docker build --provenance=false --sbom=false -t $EXPECTED_REF " +
          "-f docker/Dockerfile.seed-publish " + mirrored_bases("docker/Dockerfile.seed-publish") + " " +
+         cached_layers("space-seed-publish") + " " +
          "--build-context seed=$HOME/.space-devbox/kind/seed/build ."),
     ]),
     deps = RUST_ARTIFACT_DEPS + [
@@ -310,7 +321,7 @@ custom_build(
     command = " && ".join([
         pull_base_images("docker/Dockerfile.ui"),
         ("docker build -t $EXPECTED_REF -f docker/Dockerfile.ui " +
-         mirrored_bases("docker/Dockerfile.ui") + " " +
+         mirrored_bases("docker/Dockerfile.ui") + " " + cached_layers("space-ui") + " " +
          "--build-arg NEXT_PUBLIC_API_URL=http://space-api:8080 ."),
     ]),
     deps = ["docker/Dockerfile.ui", "ui"],

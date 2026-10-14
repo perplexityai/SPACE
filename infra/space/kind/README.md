@@ -187,6 +187,24 @@ Rollout:
 This removes cache export from the PR build path, not from main, and does not
 change smoke scenario coverage, timeout budgets, or runner capacity.
 
+The same package holds the dependency layers of the images each shard's Tilt
+bring-up builds, so an unchanged package list, lockfile or download is not
+fetched again from Debian, Ubuntu, npm, PyPI, GitHub releases or kernel.org.
+Each runtime Dockerfile ends those layers at a named stage before its first
+SPACE binary, script or seed (`runtime-deps`, plus `smoke-build` for the API's
+smoke environment and `deps` for the UI's `npm ci`), and each stage has its own
+`kind-<image>-<stage>` tag; `infra/space/kind/scripts/runtime-image-cache.sh`
+lists them. The seed builder's tag, `kind-seed-builder`, also holds the
+recipe's dated Ubuntu cloud image with its signed checksums, which
+`rootfs-builder.sh` verifies again before use. The copies of a commit's
+binaries are never exported. Only the main push's `runtime_image_cache` job
+writes these tags; the shards read them with `SPACE_KIND_BUILD_CACHE_REPOSITORY`
+and build any missing layer cold. The seed's in-chroot package installation
+still reaches the Ubuntu archive. A local bring-up reads the same tags when
+`SPACE_KIND_BUILD_CACHE_REPOSITORY` names a reachable cache (main's package, or
+a registry on the loopback interface, `localhost:<port>/<name>`), and builds as
+before otherwise.
+
 ### Scripted steps
 
 The same first-time steps with the validation suites, for CI and scripted fixture setup

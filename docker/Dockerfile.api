@@ -13,7 +13,7 @@ FROM ghcr.io/astral-sh/uv:0.9.9@sha256:f6e3549ed287fee0ddde2460a2a74a2d74366f84b
 # able to fail on a PyPI blip. The requirement list is derived from the suites'
 # own PEP 723 headers and the space_smoke lock rather than written down, so a
 # suite that changes a pin moves this environment with it.
-FROM public.ecr.aws/docker/library/debian:bookworm-slim AS smoke-build
+FROM public.ecr.aws/docker/library/debian:bookworm-slim AS smoke-base
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates \
@@ -22,6 +22,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=uv /uv /uvx /usr/local/bin/
+
+FROM smoke-base AS smoke-requirements
 
 WORKDIR /src
 COPY pyproject.toml uv.lock ./
@@ -32,13 +34,22 @@ COPY scripts/space-cluster-smoke.py scripts/smoke-image-requirements.py ./script
 RUN uv export --frozen --no-hashes --no-emit-project --format requirements-txt \
       > /tmp/project-requirements.txt \
     && python3 scripts/smoke-image-requirements.py \
-      --project-requirements /tmp/project-requirements.txt > /tmp/requirements.txt \
-    && python3 -m venv /space/smoke/venv \
+      --project-requirements /tmp/project-requirements.txt > /tmp/requirements.txt
+
+# Installed from the derived list alone, so the environment's layer is keyed by
+# the requirements rather than by every suite file: an edit that changes no pin
+# reuses it from the build cache instead of downloading it again.
+FROM smoke-base AS smoke-build
+
+COPY --from=smoke-requirements /tmp/requirements.txt /tmp/requirements.txt
+RUN python3 -m venv /space/smoke/venv \
     && /space/smoke/venv/bin/pip install \
       --no-cache-dir --disable-pip-version-check --require-virtualenv \
       -r /tmp/requirements.txt
 
-FROM public.ecr.aws/docker/library/debian:bookworm-slim
+# Everything before the image's own files, which the Kind build cache keeps
+# (infra/space/kind/scripts/runtime-image-cache.sh).
+FROM public.ecr.aws/docker/library/debian:bookworm-slim AS runtime-deps
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
       bash \
@@ -50,6 +61,8 @@ RUN groupadd --system --gid 952 space-api \
     && useradd --system --uid 952 --gid 952 --create-home --home-dir /space space-api
 
 WORKDIR /space
+
+FROM runtime-deps
 
 LABEL org.opencontainers.image.title="space-api"
 LABEL org.opencontainers.image.description="Deployable SPACE API image."

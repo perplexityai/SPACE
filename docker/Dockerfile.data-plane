@@ -1,7 +1,9 @@
 ARG SPACE_RUST_BUILD_IMAGE=space-rust-build-data-plane:local
 FROM ${SPACE_RUST_BUILD_IMAGE} AS rust-build
 
-FROM public.ecr.aws/docker/library/debian:bookworm-slim
+# Everything before the image's own files, which the Kind build cache keeps
+# (infra/space/kind/scripts/runtime-image-cache.sh).
+FROM public.ecr.aws/docker/library/debian:bookworm-slim AS runtime-deps
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates \
@@ -11,6 +13,8 @@ RUN groupadd --system --gid 954 space-data-plane \
     && useradd --system --uid 954 --gid 954 --create-home --home-dir /space space-data-plane
 
 WORKDIR /space
+
+FROM runtime-deps
 
 LABEL org.opencontainers.image.title="space-data-plane"
 LABEL org.opencontainers.image.description="Deployable SPACE public data-plane stream gateway."

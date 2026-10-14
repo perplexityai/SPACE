@@ -1,7 +1,9 @@
 ARG SPACE_RUST_BUILD_IMAGE=space-rust-build-cluster-controller:local
 FROM ${SPACE_RUST_BUILD_IMAGE} AS rust-build
 
-FROM public.ecr.aws/docker/library/debian:bookworm-slim
+# Everything before the image's own files, which the Kind build cache keeps
+# (infra/space/kind/scripts/runtime-image-cache.sh).
+FROM public.ecr.aws/docker/library/debian:bookworm-slim AS runtime-deps
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
       bash \
@@ -12,6 +14,8 @@ RUN groupadd --system --gid 953 space-cluster-controller \
     && useradd --system --uid 953 --gid 953 --create-home --home-dir /space space-cluster-controller
 
 WORKDIR /space
+
+FROM runtime-deps
 
 LABEL org.opencontainers.image.title="space-cluster-controller"
 LABEL org.opencontainers.image.description="Deployable SPACE cluster-controller image hosting cluster-singleton reconciler loops."

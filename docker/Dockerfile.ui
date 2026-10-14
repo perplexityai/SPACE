@@ -1,6 +1,18 @@
-FROM public.ecr.aws/docker/library/node:22-bookworm AS builder
+FROM public.ecr.aws/docker/library/node:22-bookworm AS deps
 
 ENV NEXT_TELEMETRY_DISABLED=1
+
+WORKDIR /workspace/ui
+
+COPY ui/package.json ui/package-lock.json ./
+
+RUN npm ci
+
+# The installed dependencies, ahead of the build arguments and the sources:
+# the layers the Kind build cache keeps
+# (infra/space/kind/scripts/runtime-image-cache.sh), reused by every build
+# whose lockfile is unchanged.
+FROM deps AS builder
 
 # next.config.js evaluates `process.env.NEXT_PUBLIC_API_URL` ONCE at build
 # time and bakes the resulting `rewrites()` destination into
@@ -19,12 +31,6 @@ ENV NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL}
 # browser ever crossing origins.
 ARG NEXT_PUBLIC_DATA_PLANE_URL=http://localhost:8090
 ENV NEXT_PUBLIC_DATA_PLANE_URL=${NEXT_PUBLIC_DATA_PLANE_URL}
-
-WORKDIR /workspace/ui
-
-COPY ui/package.json ui/package-lock.json ./
-
-RUN npm ci
 
 COPY ui/ ./
 

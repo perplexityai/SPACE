@@ -94,6 +94,33 @@ jobs:
           delete-only-untagged-versions: 'true'
           min-versions-to-keep: 10
 
+  # Exports the dependency stages of the runtime images and the seed builder
+  # that every shard's Tilt bring-up imports (runtime-image-cache.sh). Only a
+  # main push runs it. A failed export leaves the previous layers in place,
+  # and the shards build whatever misses cold, so it never fails the run.
+  runtime_image_cache:
+    if: github.repository == 'perplexityai/SPACE' && github.event_name == 'push' && github.ref == 'refs/heads/main'
+    name: Export the Kind runtime image cache
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    continue-on-error: true
+    steps:
+      - name: Check out SPACE
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - *enable-containerd-store
+
+      - *ghcr-login
+
+      - name: Export the runtime images' and the seed builder's cached stages
+        env:
+          SPACE_CI_IMAGE_MIRROR: ghcr
+          SPACE_KIND_BUILD_CACHE_REPOSITORY: ghcr.io/perplexityai/space-kind-build-cache
+          SPACE_KIND_BUILD_CACHE_WRITE: '1'
+        run: bash infra/space/kind/scripts/runtime-image-cache.sh publish
+
   smoke:
     if: github.repository == 'perplexityai/SPACE'
     name: Kind / Firecracker smoke (${{ matrix.shard }}/4)
@@ -110,6 +137,9 @@ jobs:
       # images come from the GHCR mirror; see ci/mirrored-images.txt.
       SPACE_CI_IMAGE_MIRROR: ghcr
       SPACE_KIND_RUST_ARTIFACTS: prebuilt
+      # The runtime images and the seed import their dependency layers from
+      # the cache main writes; a miss builds them cold. Never written here.
+      SPACE_KIND_BUILD_CACHE_REPOSITORY: ghcr.io/perplexityai/space-kind-build-cache
       # The shards explicitly select the devbox `otel` profile, with the
       # local metrics, traces and logs backends installed from the mirror and
       # every service exporting to them. The scenarios run with telemetry on,
