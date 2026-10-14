@@ -2,11 +2,18 @@
 
 mod file_size;
 mod pattern_ratchet;
+mod ratchet;
 
-use crate::{baseline::Baseline, context::Context, finding::Finding};
+pub(crate) use file_size::FileSize;
+pub(crate) use pattern_ratchet::PatternRatchet;
+pub(crate) use ratchet::CountRule;
+
+use crate::{baseline::Baseline, config::RulesConfig, context::Context, finding::Finding};
 
 /// A rule reads its `[rules.<name>]` table from `ctx.config` and names
 /// itself, and the instance if it has several, in each [`Finding`] it returns.
+/// A rule whose baseline tables cap a count per file implements
+/// [`ratchet::CountRule`] instead.
 pub trait Rule {
     fn check(&self, ctx: &Context) -> Vec<Finding>;
 
@@ -23,6 +30,19 @@ pub trait Rule {
     /// file_size.no_raised_caps`.
     fn base_comparisons(&self, _ctx: &Context) -> Vec<String> {
         Vec::new()
+    }
+
+    /// The baseline tables `config` gives this rule, by the name
+    /// `--write-baseline=<table>` takes. A table no rule names is a
+    /// configuration error.
+    fn tables(&self, _config: &RulesConfig) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// The `<rule>` this rule's baseline tables are named for, if it has any:
+    /// [`Baseline::load_base`] must read them from the base branch's copy.
+    fn baseline_rule(&self) -> Option<&'static str> {
+        None
     }
 
     /// Fills this rule's tables for `--write-baseline` from the entries in
@@ -47,10 +67,15 @@ pub struct NotAdded {
     pub line: String,
 }
 
+/// Every rule's baseline tables, in reporting order.
+pub fn tables(config: &RulesConfig) -> Vec<String> {
+    registered()
+        .iter()
+        .flat_map(|rule| rule.tables(config))
+        .collect()
+}
+
 /// Every rule, in reporting order. Register a new rule here.
 pub fn registered() -> Vec<Box<dyn Rule>> {
-    vec![
-        Box::new(file_size::FileSize),
-        Box::new(pattern_ratchet::PatternRatchet),
-    ]
+    vec![Box::new(FileSize), Box::new(PatternRatchet)]
 }

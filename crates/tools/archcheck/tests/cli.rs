@@ -1991,6 +1991,133 @@ fn pattern_ratchet_base_baseline() {
     );
 }
 
+/// `ARCHITECTURE.toml` with advisory `file_size` and instances restricting
+/// `<instance>_table`, with no allowed paths.
+fn instances_config(instances: &[&str]) -> String {
+    let mut text = config(ADVISORY);
+    for instance in instances {
+        text.push_str(&ratchet(
+            instance,
+            &[&format!(r"\b{instance}_table\b")],
+            &[],
+            ADVISORY,
+        ));
+    }
+    text
+}
+
+/// A base table that does not parse skips its own instance's comparisons
+/// only: another configured instance is still compared, and reports both a
+/// new entry and a raised cap.
+#[test]
+fn pattern_ratchet_base_table_that_does_not_parse_skips_only_its_instance() {
+    let ws = workspace(&[
+        ("ARCHITECTURE.toml", instances_config(&["alpha", "beta"])),
+        (
+            "architecture-baseline.toml",
+            ratchet_baseline(&[
+                ("alpha", &[("crates/a/src/a.rs", 1)]),
+                (
+                    "beta",
+                    &[("crates/a/src/b.rs", 2), ("crates/a/src/c.rs", 1)],
+                ),
+            ]),
+        ),
+        ("crates/a/src/a.rs", "alpha_table\n".to_owned()),
+        ("crates/a/src/b.rs", "beta_table\nbeta_table\n".to_owned()),
+        ("crates/a/src/c.rs", "beta_table\n".to_owned()),
+    ]);
+    let base = "[pattern_ratchet.alpha]\n\"crates/a/src/a.rs\" = \"1\"\n\
+                [pattern_ratchet.beta]\n\"crates/a/src/b.rs\" = 1\n";
+
+    let ctx = load(ws.path(), Some(base));
+
+    let found: Vec<(String, String)> = check(&ctx)
+        .iter()
+        .map(|finding| (finding.code(), finding.path.clone()))
+        .collect();
+    assert_eq!(
+        found,
+        [
+            (
+                "pattern_ratchet.beta.no_new_entries".to_owned(),
+                "crates/a/src/c.rs".to_owned()
+            ),
+            (
+                "pattern_ratchet.beta.no_raised_caps".to_owned(),
+                "crates/a/src/b.rs".to_owned()
+            ),
+        ]
+    );
+    let path = ws.path().join("base-baseline.toml");
+    assert_eq!(
+        skipped(&ctx),
+        [format!(
+            "warning: could not parse {} at line 2: invalid type: string \"1\", expected usize; \
+             pattern_ratchet.alpha.no_new_entries and pattern_ratchet.alpha.no_raised_caps \
+             skipped",
+            path.display()
+        )]
+    );
+}
+
+/// The skip lines, in order: `file_size`'s, then each configured instance's,
+/// in configuration order, then one per table of an instance that is not
+/// configured, in name order, whatever the order of the base copy.
+#[test]
+fn skip_lines_come_in_rule_then_instance_order() {
+    let ws = workspace(&[
+        (
+            "ARCHITECTURE.toml",
+            instances_config(&["alpha", "beta", "gamma"]),
+        ),
+        (
+            "architecture-baseline.toml",
+            ratchet_baseline(&[("alpha", &[]), ("beta", &[]), ("gamma", &[])]),
+        ),
+    ]);
+    let base = "[pattern_ratchet.zeta]\n\
+                [pattern_ratchet.gamma]\n\"a\" = -2\n\
+                [pattern_ratchet.beta]\n\
+                [pattern_ratchet.delta]\nx = \"y\"\n\
+                [pattern_ratchet.alpha]\n\"a\" = \"1\"\n\
+                [file_size]\n\"x\" = -1\n";
+
+    let ctx = load(ws.path(), Some(base));
+
+    let path = ws.path().join("base-baseline.toml");
+    let warning = |line: usize, error: &str, code: &str| {
+        format!(
+            "warning: could not parse {} at line {line}: {error}; {code}.no_new_entries and \
+             {code}.no_raised_caps skipped",
+            path.display()
+        )
+    };
+    assert_eq!(
+        skipped(&ctx),
+        [
+            warning(
+                10,
+                "invalid value: integer `-1`, expected usize",
+                "file_size"
+            ),
+            warning(
+                8,
+                "invalid type: string \"1\", expected usize",
+                "pattern_ratchet.alpha"
+            ),
+            warning(
+                3,
+                "invalid value: integer `-2`, expected usize",
+                "pattern_ratchet.gamma"
+            ),
+            "base baseline has [pattern_ratchet.delta], which is not configured; skipped"
+                .to_owned(),
+            "base baseline has [pattern_ratchet.zeta], which is not configured; skipped".to_owned(),
+        ]
+    );
+}
+
 /// Each instance reads only its own patterns, allowed paths, modes and
 /// baseline table, and reports under its own code.
 #[test]

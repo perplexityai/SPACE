@@ -229,25 +229,33 @@ Only annotations are filtered. Once a behaviour is `required`,
 A new instance of `pattern_ratchet` is configuration, not a new rule (see
 above). For a new kind of check:
 
-1. Add a module under `src/rules/` with a type that implements `Rule`.
+1. Add a module under `src/rules/`. A rule that caps a count per file in a
+   baseline table, as both rules do, implements `CountRule`
+   (`src/rules/ratchet.rs`): one `CountRatchet` per table, whose `measure`
+   gives a violating file's count and the line findings about it point at,
+   and whose wording the findings and `not added` lines are built from. The
+   five behaviours, finding locations, the comparisons with the base
+   branch's copy, the skip lines, and `--write-baseline` (update or remove,
+   never add) come with it. Any other check implements `Rule`; if it has a
+   baseline table, it also implements `Rule::tables`, without which the
+   baseline's table is rejected as naming no instance, and
+   `Rule::update_baseline`, which never adds an entry; if it compares with
+   the base branch's copy, `Rule::baseline_rule`, `Rule::skipped` and
+   `Rule::base_comparisons` too: without `Rule::baseline_rule`, a table
+   `Baseline::load_base` does not read gets skip lines, not exit 2.
 2. Add its configuration to `RulesConfig` in `src/config.rs`, with one
    `BehaviourConfig` per behaviour, and its table to `ARCHITECTURE.toml`.
-3. If it tolerates existing violations, implement `Rule::update_baseline`,
-   which never adds entries or creates instance tables, and add its table in
-   `src/baseline.rs`:
-   - a field in `Baseline`, and a `#[serde(default)]` field in `BaselineFile`
-     read by `Baseline::load` (`BaselineFile` denies unknown fields, so a
-     table it does not know makes the next check exit 2);
-   - its name in `TableName`, `Baseline::table_names`, `Baseline::table` and
-     `Baseline::replace_table`, and in the tables `write_baseline_table`
-     (`src/lib.rs`) accepts, which `--write-baseline=<table>` and the
-     `--write-baseline` summary in `src/main.rs` use;
-   - if it compares with the base branch's copy, a lenient reading of its
-     table in `Baseline::load_base` and an accessor on `BaseBaseline`, so
-     that a table that does not parse skips only its own comparisons, and
-     `Rule::base_comparisons`, which names them in the one warning for a copy
-     that isn't TOML;
-   - for a rule with instances, a check in `Context::load_with_baseline`
-     (`src/context.rs`) that each baseline table names a configured instance,
-     as `pattern_ratchet` has.
+3. For a rule with a baseline table, in `src/baseline.rs`:
+   - add a `#[serde(default)]` field to `BaselineFile`, read into the tables
+     in `Baseline::from_file` under the rule's name (`BaselineFile` denies
+     unknown fields, so a table it does not know makes the next check exit
+     2);
+   - read the rule's own key from the parsed document in
+     `Baseline::load_base`, on its own, as for `pattern_ratchet`, and record
+     the rule as read; a registered rule that is not read makes every
+     `--base-baseline` run whose base copy is TOML exit 2. Do not add a
+     field to `BaseBaselineFile`, which reads `[file_size]` alone: a second
+     field there would let one table that does not parse skip both rules'
+     comparisons;
+   - describe the table in the generated header, `HEADER`.
 4. Register it in `rules::registered()` and add test cases to `tests/cli.rs`.

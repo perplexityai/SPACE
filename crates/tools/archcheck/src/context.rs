@@ -12,6 +12,7 @@ use thiserror::Error;
 use crate::{
     baseline::{BASELINE_FILE, BaseBaseline, Baseline},
     config::{ArchitectureConfig, CONFIG_FILE},
+    rules,
 };
 
 /// The root manifest, whose `[workspace] members` decide which files are
@@ -53,11 +54,21 @@ pub enum LoadError {
     NonUtf8Path { path: PathBuf },
     #[error("no Cargo.toml with a [workspace] table found at or above {start}")]
     NoWorkspaceRoot { start: PathBuf },
+    /// The wording is for a rule with instances: every other rule's
+    /// configuration is required, so only a table of a rule with instances
+    /// can name none.
     #[error(
-        "{path}: [pattern_ratchet.{instance}] names no instance in {CONFIG_FILE}; remove that \
-         table, or rename it if the instance was renamed"
+        "{path}: [{table}] names no instance in {CONFIG_FILE}; remove that table, or rename it if \
+         the instance was renamed"
     )]
-    UnknownBaselineInstance { path: PathBuf, instance: String },
+    UnknownBaselineTable { path: PathBuf, table: String },
+    /// A rule's tables must be read from a base baseline, or every entry of
+    /// them would compare as new.
+    #[error(
+        "{path}: archcheck does not read the [{rule}] tables of a base baseline; read them in \
+         Baseline::load_base"
+    )]
+    UnreadBaseTables { path: PathBuf, rule: &'static str },
 }
 
 /// A production Rust file, its text and its code-line count.
@@ -91,15 +102,15 @@ impl Context {
         let config: ArchitectureConfig = parse_toml(&root.join(CONFIG_FILE))?;
         // A table for an instance that no longer exists would never be
         // checked, so it cannot silently outlive its configuration.
-        let instances = &config.rules.pattern_ratchet;
-        if let Some(instance) = baseline
-            .pattern_ratchet
-            .keys()
-            .find(|instance| !instances.contains_key(instance.as_str()))
+        let configured = rules::tables(&config.rules);
+        if let Some(table) = baseline
+            .table_names()
+            .into_iter()
+            .find(|table| !configured.contains(table))
         {
-            return Err(LoadError::UnknownBaselineInstance {
+            return Err(LoadError::UnknownBaselineTable {
                 path: root.join(BASELINE_FILE),
-                instance: instance.clone(),
+                table,
             });
         }
         let members = load_members(&root.join(ROOT_MANIFEST))?;

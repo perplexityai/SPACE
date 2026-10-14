@@ -85,15 +85,7 @@ pub fn write_baseline_table(
     table: &str,
 ) -> Result<WrittenBaseline, WriteBaselineError> {
     let ctx = Context::load(root)?;
-    let known: Vec<String> = std::iter::once("file_size".to_owned())
-        .chain(
-            ctx.config
-                .rules
-                .pattern_ratchet
-                .keys()
-                .map(|instance| format!("pattern_ratchet.{instance}")),
-        )
-        .collect();
+    let known = rules::tables(&ctx.config.rules);
     if !known.iter().any(|name| name == table) {
         return Err(WriteBaselineError::UnknownTable {
             table: table.to_owned(),
