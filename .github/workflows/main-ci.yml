@@ -224,21 +224,16 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: python3 ci/scripts/sccache-snapshot.py prune --repository "${GITHUB_REPOSITORY}" --ref "${GITHUB_REF}"
 
-      # Keep the copies for main's newest inputs, not this run's: main runs of
-      # several commits overlap and save out of order, and an older commit's
-      # run must not delete what the newest commit restores.
-      - name: Fetch main's newest commit
-        id: main-tip
-        if: ${{ !cancelled() }}
-        run: git fetch --no-tags --depth=1 origin main
-
+      # It keeps the copies for main's newest inputs, not this run's: main runs
+      # of several commits overlap and save out of order, and an older
+      # commit's run must not delete what the newest commit restores.
       - name: Delete superseded package caches
-        if: ${{ !cancelled() && steps.main-tip.outcome == 'success' }}
+        if: ${{ !cancelled() }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: >-
           python3 ci/scripts/package-cache.py prune --repository "${GITHUB_REPOSITORY}" --ref "${GITHUB_REF}"
-          --tree FETCH_HEAD
+          --remote origin --branch main
 
   space-ci:
     if: always() && github.repository == 'perplexityai/SPACE'

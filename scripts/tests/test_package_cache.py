@@ -137,6 +137,26 @@ class RestoredTest(CacheTest):
         self.assertIn("::warning::Could not check the restored cargo packages", output)
         self.assertEqual(list(registry.iterdir()), [])
 
+    def test_rewrites_a_wrong_or_missing_ziphash_of_a_verified_zip(self) -> None:
+        # Go trusts the sidecar and fails on one that disagrees with go.sum.
+        gomod = self.tmp / "go-mod"
+        download = gomod / "cache/download"
+        zips = {}
+        for module in ("example.com/wrong", "example.com/missing", "example.com/right"):
+            zips[module] = go_zip(download / module / "@v/v1.0.0.zip", f"{module}@v1.0.0", {"a.go": b"package a\n"})
+        hashes = {module: cache.go_zip_hash(path) for module, path in zips.items()}
+        write(download / "example.com/wrong/@v/v1.0.0.ziphash", "h1:" + "A" * 43 + "=", old=True)
+        write(download / "example.com/right/@v/v1.0.0.ziphash", hashes["example.com/right"], old=True)
+        gosum = write(self.tmp / "go.sum", "".join(f"{m} v1.0.0 {h}\n" for m, h in hashes.items()))
+        output = run("restored", "go", str(gomod), KEY, "--lockfile", str(gosum))
+        self.assertIn("Rewrote example.com/wrong/@v/v1.0.0.ziphash", output)
+        self.assertIn("Rewrote example.com/missing/@v/v1.0.0.ziphash", output)
+        self.assertNotIn("example.com/right", output)
+        for module, digest in hashes.items():
+            self.assertEqual((download / module / "@v/v1.0.0.ziphash").read_text(), digest)
+        self.assertTrue(all(path.exists() for path in zips.values()))
+        self.assertEqual((gomod.parent / "go-mod.restored").read_text().strip(), "2")
+
     def test_go_hash_matches_gos_own(self) -> None:
         # The go.sum entry Go computed for this public module's go.mod.
         self.assertEqual(
@@ -350,7 +370,14 @@ class PruneTest(unittest.TestCase):
         ]
         self.assertEqual(self.stale(caches, [current]), [3])
 
-    def run_prune(self, caches: list[dict], read) -> tuple[str, list[int]]:
+    # The cleanup fetched main at 19:30; entries are created at 19:<minute>.
+    FETCHED_AT = cache.datetime(2026, 10, 14, 19, 30, tzinfo=cache.timezone.utc)
+
+    @staticmethod
+    def read(path: str) -> bytes | None:
+        return b"ARG UV_VERSION=0.12.18\n" if path == "ci/Dockerfile.ci" else b"inputs"
+
+    def run_prune(self, caches: list[dict], read=None, tip: str | None = "tip", tip_after: str | None = "tip"):
         deleted: list[int] = []
 
         def github(method: str, path: str, token: str):
@@ -364,13 +391,15 @@ class PruneTest(unittest.TestCase):
 
         env = {"GH_TOKEN": "token", "RUNNER_OS": "Linux", "RUNNER_ARCH": "X64"}
         with mock.patch.dict(os.environ, env), mock.patch.object(cache, "github", github), \
-                mock.patch.object(cache, "tree_reader", lambda tree: read):
-            output = run("prune", "--repository", "example/repo", "--ref", "refs/heads/main", "--tree", "tip")
+                mock.patch.object(cache, "tree_reader", lambda tree: read or self.read), \
+                mock.patch.object(cache, "fetch_tip", lambda remote, branch: tip), \
+                mock.patch.object(cache, "remote_tip", lambda remote, branch: tip_after), \
+                mock.patch.object(cache, "now", lambda: self.FETCHED_AT):
+            output = run("prune", "--repository", "example/repo", "--ref", "refs/heads/main")
         return output, sorted(deleted)
 
     def test_prune_deletes_only_superseded_copies(self) -> None:
-        read = lambda path: b"ARG UV_VERSION=0.12.18\n" if path == "ci/Dockerfile.ci" else b"inputs"
-        current = cache.lock_prefix("cargo", "Linux", "X64", read)
+        current = cache.lock_prefix("cargo", "Linux", "X64", self.read)
         other = f"{self.CARGO}-{'a' * 64}-"
         caches = [
             self.entry(1, current + "100-1", 10),
@@ -378,16 +407,73 @@ class PruneTest(unittest.TestCase):
             self.entry(3, other + "98-1", 8),
             self.entry(404, other + "97-1", 7),
         ]
-        output, deleted = self.run_prune(caches, read)
+        output, deleted = self.run_prune(caches)
         self.assertEqual(deleted, [3])
-        self.assertIn("4 package caches on refs/heads/main; 2 superseded", output)
+        self.assertIn("4 package caches on refs/heads/main, 0 too recent to judge; 2 superseded", output)
 
-    def test_prune_deletes_nothing_without_mains_inputs(self) -> None:
+    def test_prune_deletes_nothing_when_mains_tree_cannot_be_read(self) -> None:
         caches = [self.entry(n, f"{self.CARGO}-{'a' * 64}-{n}-1", n) for n in range(1, 5)]
-        output, deleted = self.run_prune(caches, lambda path: None)
+        output, deleted = self.run_prune(caches, tip=None)
         self.assertEqual(deleted, [])
-        self.assertIn("Deleting no package caches", output)
+        self.assertIn("could not read main's newest commit", output)
 
+    def test_prune_still_prunes_when_an_input_file_is_missing(self) -> None:
+        # A family whose input was renamed hashes it as missing, as `key` does,
+        # and the other families are pruned as usual.
+        read = lambda path: None if path == "scripts/netgtw/traffic/requirements.txt" else self.read(path)
+        github_output = Path(tempfile.mkdtemp()) / "github-output"
+        self.addCleanup(lambda: __import__("shutil").rmtree(github_output.parent, ignore_errors=True))
+        env = {"GITHUB_OUTPUT": str(github_output), "RUNNER_OS": "Linux", "RUNNER_ARCH": "X64"}
+        with mock.patch.dict(os.environ, env), mock.patch.object(cache, "tree_reader", lambda tree: read):
+            run("key", "uv-gateway")
+        keyed = dict(line.split("=", 1) for line in github_output.read_text().splitlines())["lock"]
+        self.assertEqual(keyed, cache.lock_prefix("uv-gateway", "Linux", "X64", read))
+        current = cache.lock_prefix("cargo", "Linux", "X64", read)
+        other = f"{self.CARGO}-{'a' * 64}-"
+        caches = [self.entry(1, current + "100-1", 10), self.entry(2, other + "99-1", 9), self.entry(3, other + "98-1", 8)]
+        _, deleted = self.run_prune(caches, read=read)
+        self.assertEqual(deleted, [3])
+
+    def test_prune_ignores_copies_saved_after_it_fetched_main(self) -> None:
+        # Main was fetched at B. Then C landed and saved, and the older A saved
+        # too, both after the fetch: neither is deleted, and B's is kept.
+        b = cache.lock_prefix("cargo", "Linux", "X64", self.read)
+        a, c = f"{self.CARGO}-{'a' * 64}-", f"{self.CARGO}-{'c' * 64}-"
+        caches = [
+            self.entry(1, b + "102-1", 10),
+            self.entry(2, f"{self.CARGO}-{'d' * 64}-90-1", 5),
+            self.entry(3, f"{self.CARGO}-{'e' * 64}-80-1", 4),
+            self.entry(4, c + "103-1", 31),
+            self.entry(5, a + "101-1", 32),
+            self.entry(6, f"{self.CARGO}-{'f' * 64}-104-1", 28),  # Within the clock-skew margin.
+        ]
+        output, deleted = self.run_prune(caches)
+        self.assertEqual(deleted, [3])
+        self.assertIn("3 too recent to judge", output)
+
+    def test_fetch_tip_reads_a_real_remote(self) -> None:
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: __import__("shutil").rmtree(tmp, ignore_errors=True))
+        git = lambda cwd, *args: cache.subprocess.run(["git", "-C", str(cwd), *args], check=True, capture_output=True)
+        git(tmp, "init", "-q", "-b", "main", "remote")
+        write(tmp / "remote/Cargo.lock", "lock")
+        git(tmp / "remote", "add", "Cargo.lock")
+        git(tmp / "remote", "-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-q", "-m", "x")
+        git(tmp, "init", "-q", "clone")
+        with contextlib.chdir(tmp / "clone"):
+            tip = cache.fetch_tip(str(tmp / "remote"), "main")
+            self.assertEqual(tip, cache.remote_tip(str(tmp / "remote"), "main"))
+            self.assertEqual(cache.tree_reader(tip)("Cargo.lock"), b"lock")
+            self.assertIsNone(cache.tree_reader(tip)("go.sum"))
+            self.assertIsNone(cache.fetch_tip(str(tmp / "remote"), "absent"))
+
+    def test_prune_deletes_nothing_when_main_moves_during_the_cleanup(self) -> None:
+        current = cache.lock_prefix("cargo", "Linux", "X64", self.read)
+        other = f"{self.CARGO}-{'a' * 64}-"
+        caches = [self.entry(1, current + "100-1", 10), self.entry(2, other + "99-1", 9), self.entry(3, other + "98-1", 8)]
+        output, deleted = self.run_prune(caches, tip_after="newer")
+        self.assertEqual(deleted, [])
+        self.assertIn("main moved to newer during the cleanup", output)
 
 if __name__ == "__main__":
     unittest.main()

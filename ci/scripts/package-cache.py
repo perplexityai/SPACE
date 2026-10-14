@@ -30,8 +30,10 @@ from upstream as before.
             every lockfile change. uv's copies are pruned by uv itself (see
             common-ci.yml).
   prune     on main: deletes superseded copies. In each ecosystem, across uv
-            releases, it keeps the newest copy for the inputs main has now,
-            whichever run saved last, and the newest OTHERS_KEPT others.
+            releases, it keeps the newest copy for the inputs main's newest
+            commit has, whichever run saved last, and the newest OTHERS_KEPT
+            others. It ignores copies saved after it fetched main, and deletes
+            nothing if main moved meanwhile or its tree cannot be read.
 
 <dir> is the Cargo registry (CARGO_HOME/registry), GOMODCACHE, UV_CACHE_DIR or
 npm's cache. The time mark sits beside <dir>, outside what is cached.
@@ -54,7 +56,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Iterable, Mapping
 
@@ -92,6 +94,7 @@ PACKAGE_KEY = re.compile(
     r"(?:-uv[^-]+)?-[0-9a-f]{64}-[0-9]+-[0-9]+$"
 )
 OTHERS_KEPT = 1
+SETTLE_MARGIN = timedelta(minutes=5)
 
 
 def tree_reader(tree: str | None) -> Callable[[str], bytes | None]:
@@ -324,15 +327,31 @@ def go_versions(root: Path) -> Iterable[tuple[str, str, Path]]:
 
 
 def verify_go(root: Path, gosum: Path) -> list[Path]:
-    """Delete the module zips and go.mod files whose hash differs from go.sum's."""
+    """Delete the module zips and go.mod files whose hash differs from go.sum's.
+
+    Go also trusts a zip's .ziphash sidecar, and fails on one that disagrees
+    with go.sum without downloading the module again. A verified zip's sidecar
+    is rewritten with its hash when it is missing, unreadable or wrong, and
+    returned among the repairs.
+    """
     sums = go_sums(gosum)
     damaged = []
+    rewritten = []
     for module, version, path in list(go_versions(root)):
         expected = sums.get((module, version), {})
         if path.suffix == ".zip" and "zip" in expected:
             if go_zip_hash(path) != expected["zip"]:
                 damaged.append(path)
                 damaged.append(path.with_suffix(".ziphash"))
+                continue
+            sidecar = path.with_suffix(".ziphash")
+            try:
+                recorded = sidecar.read_text(encoding="utf-8").strip()
+            except (OSError, UnicodeDecodeError):
+                recorded = None
+            if recorded != expected["zip"]:
+                sidecar.write_text(expected["zip"], encoding="utf-8")
+                rewritten.append(sidecar)
         elif path.suffix == ".mod" and "mod" in expected:
             try:
                 content = path.read_bytes()
@@ -342,7 +361,7 @@ def verify_go(root: Path, gosum: Path) -> list[Path]:
                 damaged.append(path)
     for path in damaged:
         path.unlink(missing_ok=True)
-    return [p for p in damaged if p.suffix != ".ziphash"]
+    return [p for p in damaged if p.suffix != ".ziphash"] + rewritten
 
 
 def trim_go(root: Path, gosum: Path) -> list[Path]:
@@ -413,8 +432,13 @@ def run_restored(args: argparse.Namespace) -> int:
                 damaged = []
                 repaired = -1
             for path in damaged:
-                print(f"::warning::Deleted {path.name} from the restored {args.kind} packages: "
-                      "its checksum is not the lockfile's, so the job downloads it again.")
+                if path.suffix == ".ziphash":
+                    module = path.parent.parent.relative_to(root / "cache" / "download")
+                    print(f"::warning::Rewrote {module}/@v/{path.name} in the restored go "
+                          "packages with its verified archive's hash, which go.sum lists.")
+                else:
+                    print(f"::warning::Deleted {path.name} from the restored {args.kind} packages: "
+                          "its checksum is not the lockfile's, so the job downloads it again.")
             repaired = repaired or len(damaged)
     else:
         print(f"No {args.kind} package cache was restored; this job fetches its packages from upstream.")
@@ -567,15 +591,39 @@ def github(method: str, path: str, token: str) -> dict | None:
     return json.loads(body) if body else None
 
 
+def git(*args: str) -> str | None:
+    result = subprocess.run(["git", *args], capture_output=True, text=True)
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
+def fetch_tip(remote: str, branch: str) -> str | None:
+    """Fetch the branch's newest commit and return it."""
+    if git("fetch", "--no-tags", "--depth=1", remote, branch) is None:
+        return None
+    commit = git("rev-parse", "--verify", "FETCH_HEAD^{commit}")
+    # Its inputs are read from the tree; a missing input file is hashed as
+    # `key` hashes it, but an unreadable tree tells no copies apart.
+    return commit if commit and git("rev-parse", "--verify", f"{commit}^{{tree}}") else None
+
+
+def remote_tip(remote: str, branch: str) -> str | None:
+    listing = git("ls-remote", remote, f"refs/heads/{branch}")
+    return listing.split()[0] if listing else None
+
+
+def now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
 def run_prune(args: argparse.Namespace) -> int:
     token = os.environ["GH_TOKEN"]
-    read = tree_reader(args.tree)
-    os_name, arch = os.environ.get("RUNNER_OS", "Linux"), os.environ.get("RUNNER_ARCH", "X64")
-    unreadable = [path for family in FAMILIES for path in FAMILIES[family] if read(path) is None]
-    if unreadable:
-        # Without main's inputs, the copies it restores cannot be told apart.
-        print(f"::warning::Deleting no package caches: {args.tree} lacks {', '.join(unreadable)}.")
+    fetched_at = now()
+    tip = fetch_tip(args.remote, args.branch)
+    if tip is None:
+        print(f"::warning::Deleting no package caches: could not read {args.branch}'s newest commit.")
         return 0
+    read = tree_reader(tip)
+    os_name, arch = os.environ.get("RUNNER_OS", "Linux"), os.environ.get("RUNNER_ARCH", "X64")
     current = [lock_prefix(family, os_name, arch, read) for family in FAMILIES]
     caches: list[dict] = []
     for page in range(1, 100):
@@ -584,10 +632,23 @@ def run_prune(args: argparse.Namespace) -> int:
         caches.extend(batch)
         if len(batch) < 100:
             break
-    stale = superseded(caches, current)
-    print(f"{len(caches)} package caches on {args.ref}; {len(stale)} superseded. Kept for {args.tree}:")
+    # A copy saved after the fetch may be for a newer commit's inputs, which
+    # this run cannot see; a margin covers the clocks' skew. Such copies are
+    # neither deleted nor counted, and a later run judges them.
+    settled = [c for c in caches if created_at(c) < fetched_at - SETTLE_MARGIN]
+    stale = superseded(settled, current)
+    print(
+        f"{len(caches)} package caches on {args.ref}, {len(caches) - len(settled)} too recent to judge; "
+        f"{len(stale)} superseded. Kept for {args.branch} at {tip}:"
+    )
     for prefix in current:
         print(f"  {prefix}*")
+    # The newest commit's inputs decide what is kept, so a commit that landed
+    # meanwhile, and may have saved its own copy, leaves the deletions to the
+    # next run.
+    if (moved := remote_tip(args.remote, args.branch)) != tip:
+        print(f"::warning::Deleting no package caches: {args.branch} moved to {moved} during the cleanup.")
+        return 0
     for cache in stale:
         print(f"Delete {cache['key']} ({cache.get('size_in_bytes', 0) / 1e6:.0f} MB, created {cache['created_at']})")
         try:
@@ -611,7 +672,8 @@ def main(argv: list[str]) -> int:
     prune = commands.add_parser("prune")
     prune.add_argument("--repository", required=True)
     prune.add_argument("--ref", required=True)
-    prune.add_argument("--tree", required=True, help="the commit whose inputs' copies are kept")
+    prune.add_argument("--remote", default="origin")
+    prune.add_argument("--branch", default="main", help="the branch whose newest inputs' copies are kept")
     prune.set_defaults(run=run_prune)
 
     restored = commands.add_parser("restored")

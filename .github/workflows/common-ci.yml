@@ -349,6 +349,7 @@ jobs:
             docker_access: false
             host_network: false
             privileged: false
+            uv_cache: shell
             timeout: 15
           - name: Gateway traffic
             command: >-
@@ -393,10 +394,10 @@ jobs:
       # The package caches, as in the SPACE Guide job. An entry restores the
       # ones it sets among cargo_registry, go_modules and uv_cache; the one
       # entry whose cargo_registry or go_modules is `save`, or that sets
-      # uv_cache_save, saves that cache on main. Each uv-using entry has its
-      # own uv family, which it saves, because none installs another's
-      # packages. The migration guards use uv only for a changed migration,
-      # whose checks need packages no cache holds.
+      # uv_cache_save, saves that cache on main. Each uv family has its own
+      # inputs, because no job installs another's packages. The migration
+      # guards restore the shell tests' family, whose inputs are their
+      # checkers', and use it only for a changed migration.
       - name: Name the package caches
         id: package-cache-keys
         if: matrix.cargo_registry || matrix.go_modules || matrix.uv_cache
