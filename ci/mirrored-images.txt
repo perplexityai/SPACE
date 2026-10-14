@@ -58,7 +58,8 @@ ubuntu:24.04@sha256:496754492fb28b4d3049432f2ca787449331e23fb14f0dd3fffea86bf5a9
 ubuntu:26.04@sha256:da6fc2be547864451aa253836dd926da33623312df4a9a243e35dc877c378a78 sha256:61ebaa5cc23ca45450db85eac015435199ec569e28ec222ea13f2aed2110b8a6 ghcr.io/perplexityai/space-ci-mirror:ubuntu-26.04
 
 # Base of the SPACE Kind node image, infra/space/kind/node/Dockerfile
-# (infra/space/kind/scripts/kind-node-image.sh builds it from this copy).
+# (infra/space/kind/scripts/kind-node-image.sh builds it from this copy), and
+# the image the Kind control-plane and infra nodes run (its `ensure` pulls it).
 kindest/node:v1.34.0@sha256:7416a61b42b1662ca6ca89f02028ac133a309a2a30ba309614e8ec94d976dc5a sha256:ede5bb6984830375d264e41b7169d03643f586d3e35316bf5229eaeb12bb18e0 ghcr.io/perplexityai/space-ci-mirror:kindest-node-v1.34.0
 
 # Images the Kind charts run (infra/space/kind/charts/*/values.yaml), which

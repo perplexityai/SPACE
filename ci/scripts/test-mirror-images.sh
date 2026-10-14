@@ -2,7 +2,8 @@
 # Regression test for ci/scripts/mirror-images.sh against a fake docker: jobs
 # take the mirror by digest, fall back to the source's digest, and never fail
 # for a missing image; builds get a build context only for a mirrored image
-# their Dockerfile names; publish copies only missing digests, from another
+# their Dockerfile names; pinned names the copy a pull leaves by the digest it
+# pulled; publish copies only missing digests, from another
 # repository when the first fails, and fails when the copy does not keep the
 # source's digest.
 set -euo pipefail
@@ -118,6 +119,14 @@ SPACE_CI_IMAGE_MIRROR="" run "" "${MIRROR}" build-contexts "${WORK_DIR}/Dockerfi
 
 run "" "" listed "${NAME}" || fail "listed rejected a listed name"
 run "" "" listed "${NAME%:*}:17" && fail "listed accepted an unlisted name"
+
+run "" "" pinned "${NAME}" || fail "pinned rejected a listed name"
+[ "$(cat "${WORK_DIR}/out")" = "${NAME}@${DIGEST}" ] || fail "pinned did not pin the tag: $(cat "${WORK_DIR}/out")"
+run "" "" pinned "${PINNED_NAME}" || fail "pinned rejected a digest-pinned name"
+[ "$(cat "${WORK_DIR}/out")" = "${PINNED_NAME%%@*}@${PINNED_DIGEST}" ] ||
+    fail "pinned did not replace the name's digest with the pulled one: $(cat "${WORK_DIR}/out")"
+run "" "" pinned "${NAME%:*}:17" && fail "pinned accepted an unlisted name"
+[ -s "${WORK_DIR}/out" ] && fail "pinned printed a reference for an unlisted name"
 
 run "" "${MIRROR}"$'\n'"${PINNED_MIRROR}" publish || fail "publish of mirrored digests exited nonzero"
 grep -q "imagetools create" "${WORK_DIR}/calls" && fail "publish copied a digest already mirrored"

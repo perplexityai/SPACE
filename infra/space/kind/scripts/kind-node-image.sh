@@ -9,11 +9,19 @@
 #
 #   ref      print the image reference for the current tree
 #   base     print the pinned kindest/node base (the Dockerfile's FROM)
+#   cluster-base
+#            print the kindest/node the cluster config names for the nodes
+#            that do not run the SPACE image: the base, or, when
+#            SPACE_CI_IMAGE_MIRROR is set, the base's tag pinned to the digest
+#            the mirror holds, which `ensure` pulls (see cluster_base_ref)
 #   inputs   print the files the tag covers, one per line
 #   ensure   make the reference available locally: use a local image with that
 #            tag, else pull it from GHCR, else build it. Main CI publishes each
 #            new tag, so a registry miss (a tag main has not published yet, or
-#            no access) costs a local build, never a failed bring-up.
+#            no access) costs a local build, never a failed bring-up. When
+#            SPACE_CI_IMAGE_MIRROR is set, also take cluster-base from the
+#            mirror, or else from its source, so `kind create` does not pull it
+#            from Docker Hub; if both fail, `kind create` pulls it as before.
 #   build    build the reference locally, whatever is present
 #   publish  push the reference to GHCR unless it is already there (main CI)
 #
@@ -26,6 +34,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../../../.." && pwd)"
+MIRROR_IMAGES="${REPO_ROOT}/ci/scripts/mirror-images.sh"
 REPOSITORY="${SPACE_KIND_NODE_IMAGE_REPOSITORY:-ghcr.io/perplexityai/space-kind-node}"
 SOURCE_URL="https://github.com/perplexityai/SPACE"
 DOCKERFILE=infra/space/kind/node/Dockerfile
@@ -74,6 +83,36 @@ base_ref() {
   awk 'toupper($1) == "FROM" { print $2; exit }' "${REPO_ROOT}/${DOCKERFILE}"
 }
 
+# `kind create` pulls a node image only when the reference the config gives it
+# does not resolve locally. The Dockerfile pins the multi-platform index, and
+# the mirror holds that index's linux/amd64 manifest, so the copy `ensure`
+# pulls from the mirror resolves under the manifest's digest and not the
+# index's. Outside GitHub CI the config keeps the index, so kind takes the
+# host's platform.
+cluster_base_ref() {
+  local base
+  base="$(base_ref)"
+  if [[ -n "${SPACE_CI_IMAGE_MIRROR:-}" ]] && bash "${MIRROR_IMAGES}" pinned "${base}"; then
+    return 0
+  fi
+  printf '%s\n' "${base}"
+}
+
+# Never fails: whatever this leaves missing, `kind create` pulls itself.
+ensure_cluster_base() {
+  local ref
+  [[ -n "${SPACE_CI_IMAGE_MIRROR:-}" ]] || return 0
+  ref="$(cluster_base_ref)"
+  if docker image inspect "${ref}" >/dev/null 2>&1; then
+    log "using the local ${ref}"
+    return 0
+  fi
+  bash "${MIRROR_IMAGES}" pull "$(base_ref)" >&2 || true
+  if ! docker image inspect "${ref}" >/dev/null 2>&1; then
+    log "WARNING: ${ref} is not local; kind create pulls it from its source"
+  fi
+}
+
 registry_login() {
   [ -n "${GHCR_TOKEN:-}" ] || return 0
   printf '%s' "${GHCR_TOKEN}" |
@@ -91,7 +130,7 @@ stage_context() {
 
 # The --build-context options that take the Dockerfile's base from the mirror.
 mirrored_base() {
-  bash "${REPO_ROOT}/ci/scripts/mirror-images.sh" build-contexts "${REPO_ROOT}/${DOCKERFILE}"
+  bash "${MIRROR_IMAGES}" build-contexts "${REPO_ROOT}/${DOCKERFILE}"
 }
 
 build_local() {
@@ -111,6 +150,7 @@ build_local() {
 
 ensure() {
   local ref error
+  ensure_cluster_base
   ref="$(image_ref)"
   if docker image inspect "${ref}" >/dev/null 2>&1; then
     log "using the local ${ref}"
@@ -157,12 +197,13 @@ publish() {
 case "${1:-}" in
   ref) image_ref ;;
   base) base_ref ;;
+  cluster-base) cluster_base_ref ;;
   inputs) printf '%s\n' "${INPUTS[@]}" ;;
   ensure) ensure ;;
   build) build_local && image_ref ;;
   publish) publish ;;
   *)
-    echo "usage: $0 ref|base|inputs|ensure|build|publish" >&2
+    echo "usage: $0 ref|base|cluster-base|inputs|ensure|build|publish" >&2
     exit 2
     ;;
 esac

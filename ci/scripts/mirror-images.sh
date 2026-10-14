@@ -18,11 +18,18 @@
 #   Dockerfile. An image the mirror lacks gets no option, so its build pulls
 #   the source as before. It prints nothing unless SPACE_CI_IMAGE_MIRROR is
 #   set, so builders outside GitHub CI are unchanged.
+# - `pinned` prints the name `pull` tags, pinned to the digest it pulls. On the
+#   containerd image store a tag with a digest resolves to a local image of
+#   that name and digest, so a tool that is given this reference and pulls only
+#   what is missing, as `kind create` does, uses the copy `pull` took. The
+#   listed name's own digest can pin a multi-platform index, which that copy
+#   does not answer to.
 #
 # Usage: ci/scripts/mirror-images.sh publish
 #        ci/scripts/mirror-images.sh pull <name>...
 #        ci/scripts/mirror-images.sh build-contexts <dockerfile>...
 #        ci/scripts/mirror-images.sh listed <name>
+#        ci/scripts/mirror-images.sh pinned <name>
 #
 # GHCR_TOKEN, when set, logs in to ghcr.io first; the package is private while
 # the repository is. SPACE_MIRRORED_IMAGES overrides the list.
@@ -194,8 +201,17 @@ case "${1:-}" in
         [ $# -eq 2 ] || { echo "usage: $0 listed <name>" >&2; exit 2; }
         entries | awk -v name="$2" '$1 == name { found = 1 } END { exit !found }'
         ;;
+    pinned)
+        [ $# -eq 2 ] || { echo "usage: $0 pinned <name>" >&2; exit 2; }
+        entries | awk -v name="$2" '$1 == name && !found {
+            found = 1
+            sub(/@.*/, "", $1)
+            sub(/^[^@]*@/, "", $2)
+            print $1 "@" $2
+        } END { exit !found }'
+        ;;
     *)
-        echo "usage: $0 publish|pull <name>...|build-contexts <dockerfile>...|listed <name>" >&2
+        echo "usage: $0 publish|pull <name>...|build-contexts <dockerfile>...|listed <name>|pinned <name>" >&2
         exit 2
         ;;
 esac

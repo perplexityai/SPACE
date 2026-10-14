@@ -1750,7 +1750,12 @@ warm Docker cache). Both bring-up paths run it before `kind create`, and the
 renderer writes the tag into the cluster config. Main CI publishes each new tag
 once; Kind CI jobs pull it and fall back to a build. Builds take the
 `kindest/node` base from the third-party image mirror (`ci/mirrored-images.txt`)
-when `SPACE_CI_IMAGE_MIRROR` is set, and from the source otherwise. A package
+when `SPACE_CI_IMAGE_MIRROR` is set, and from the source otherwise. With it
+set, `ensure` also pulls that base for the control-plane and infra nodes from
+the mirror, falling back to its source, and the renderer names it by the digest
+the mirror holds: the index's linux/amd64 manifest, the only digest the pulled
+copy resolves under, so `kind create` uses it instead of pulling the index from
+Docker Hub. Elsewhere the config names the index and kind pulls it. A package
 administrator has to make the `space-kind-node` package public for bring-ups
 outside CI to pull it; until then they build it, with the same result.
 

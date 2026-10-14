@@ -60,26 +60,92 @@ base="$(bash "$image_script" base)"
 bash "$repo_root/ci/scripts/mirror-images.sh" listed "$base" \
   || fail "$base is not in ci/mirrored-images.txt"
 
-# The rendered space-local config: SPACE nodes on the image, the rest on its base.
+# In GitHub CI the other nodes name the base by the digest the mirror holds,
+# the one a pull from the mirror resolves under; elsewhere by the base's own
+# pin. The list is synthetic, so the mirrored digest is known here.
+mirror_digest="sha256:$(printf 'b%.0s' {1..64})"
+printf '%s %s ghcr.io/example/mirror:kindest-node\n' "$base" "$mirror_digest" >"$work/mirrored-images.txt"
+mirrored_base="${base%%@*}@$mirror_digest"
+export SPACE_MIRRORED_IMAGES="$work/mirrored-images.txt"
+[[ "$(env -u SPACE_CI_IMAGE_MIRROR bash "$image_script" cluster-base)" == "$base" ]] \
+  || fail "outside GitHub CI the cluster does not run the pinned base"
+[[ "$(SPACE_CI_IMAGE_MIRROR=ghcr bash "$image_script" cluster-base)" == "$mirrored_base" ]] \
+  || fail "in GitHub CI the cluster does not name the mirrored digest of the base"
+
+# The rendered space-local config: SPACE nodes on the image, the rest on its
+# base. Arguments after the expected base go to env (options first).
 rendered="$work/kind-cluster.yaml"
-# shellcheck disable=SC2016 # expanded by the inner shell
-env -u SPACE_KIND_NODE_IMAGE -u SPACE_KIND_BASE_NODE_IMAGE HOME="$work/home" bash -c \
-  'source "$1"; kind_render_cluster_config "$2" "$3"' _ \
-  "$repo_root/infra/space/kind/scripts/lib/kind-host-paths.sh" \
-  "$repo_root/infra/space/kind/kind-cluster.yaml.tmpl" "$rendered"
-images="$(awk '
-  /^  - role:/ { if (role != "") print role, pool, image; role = $3; pool = "-"; image = "-" }
-  /^    image:/ { image = $2 }
-  /space.pplx.net\/node-pool:/ { pool = $2 }
-  END { print role, pool, image }' "$rendered")"
-while read -r role pool image; do
-  case "$pool" in
-    sandbox | builder) want="$ref" ;;
-    *) want="$base" ;;
-  esac
-  [[ "$image" == "$want" ]] || fail "the $role node in pool $pool renders image $image, not $want"
-done <<<"$images"
-[[ "$(grep -c "image: $ref\$" "$rendered")" == 4 ]] || fail "expected four SPACE nodes on $ref"
+check_render() {
+  local base_want="$1" images role pool image want
+  shift
+  # shellcheck disable=SC2016 # expanded by the inner shell
+  env -u SPACE_KIND_NODE_IMAGE -u SPACE_KIND_BASE_NODE_IMAGE "$@" HOME="$work/home" bash -c \
+    'source "$1"; kind_render_cluster_config "$2" "$3"' _ \
+    "$repo_root/infra/space/kind/scripts/lib/kind-host-paths.sh" \
+    "$repo_root/infra/space/kind/kind-cluster.yaml.tmpl" "$rendered"
+  images="$(awk '
+    /^  - role:/ { if (role != "") print role, pool, image; role = $3; pool = "-"; image = "-" }
+    /^    image:/ { image = $2 }
+    /space.pplx.net\/node-pool:/ { pool = $2 }
+    END { print role, pool, image }' "$rendered")"
+  while read -r role pool image; do
+    case "$pool" in
+      sandbox | builder) want="$ref" ;;
+      *) want="$base_want" ;;
+    esac
+    [[ "$image" == "$want" ]] || fail "the $role node in pool $pool renders image $image, not $want"
+  done <<<"$images"
+  [[ "$(grep -c "image: $ref\$" "$rendered")" == 4 ]] || fail "expected four SPACE nodes on $ref"
+}
+check_render "$base" -u SPACE_CI_IMAGE_MIRROR
+check_render "$mirrored_base" SPACE_CI_IMAGE_MIRROR=ghcr
+
+# ── ensure takes the cluster's base from the mirror in GitHub CI ─────────────
+# A docker that has the SPACE node image, pulls what FAKE_PULLABLE lists, and
+# resolves a tag with a digest as the containerd image store does: to the
+# image tagged with that name, if it was pulled by that digest.
+mkdir -p "$work/ensure-bin"
+cat >"$work/ensure-bin/docker" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"$FAKE_CALLS"
+case "$1 $2" in
+  "image inspect") [[ "$3" == "$FAKE_NODE_REF" ]] || grep -qxF -- "$3" "$FAKE_LOCAL" ;;
+  "pull "*)
+    [[ " ${FAKE_PULLABLE:-} " == *" ${*: -1} "* ]] || { echo "unreachable: ${*: -1}" >&2; exit 1; }
+    echo "${*: -1}" >>"$FAKE_LOCAL"
+    ;;
+  "tag "*) printf '%s\n%s@%s\n' "$3" "$3" "${2#*@}" >>"$FAKE_LOCAL" ;;
+  *) echo "unexpected docker call: $*" >&2; exit 99 ;;
+esac
+EOF
+chmod +x "$work/ensure-bin/docker"
+mirror_ref="ghcr.io/example/mirror@$mirror_digest"
+source_ref="${base%%:*}@$mirror_digest"
+# Arguments go to env (options first).
+run_ensure() {
+  : >"$work/calls"
+  : >"$work/local"
+  env -u GHCR_TOKEN "$@" PATH="$work/ensure-bin:$PATH" FAKE_CALLS="$work/calls" FAKE_LOCAL="$work/local" \
+    FAKE_NODE_REF="$ref" SPACE_DOCKER_PULL_ATTEMPTS=1 \
+    bash "$image_script" ensure >"$work/out" 2>"$work/err"
+}
+run_ensure SPACE_CI_IMAGE_MIRROR=ghcr FAKE_PULLABLE="$mirror_ref" \
+  || fail "ensure from the mirror failed: $(cat "$work/err")"
+[[ "$(cat "$work/out")" == "$ref" ]] || fail "ensure printed more than the node image: $(cat "$work/out")"
+grep -qxF "tag $mirror_ref ${base%%@*}" "$work/calls" || fail "ensure did not take the base from the mirror"
+grep -qxF -- "$mirrored_base" "$work/local" \
+  || fail "the mirrored base does not resolve under the name the cluster config gives it"
+grep -qxF "pull $source_ref" "$work/calls" && fail "ensure pulled the base from its source although the mirror had it"
+run_ensure SPACE_CI_IMAGE_MIRROR=ghcr FAKE_PULLABLE="$source_ref" \
+  || fail "ensure from the source failed: $(cat "$work/err")"
+grep -qxF "tag $source_ref ${base%%@*}" "$work/calls" || fail "ensure did not fall back to the source's digest"
+run_ensure SPACE_CI_IMAGE_MIRROR=ghcr FAKE_PULLABLE= \
+  || fail "ensure failed although kind create can still pull the base: $(cat "$work/err")"
+[[ "$(cat "$work/out")" == "$ref" ]] || fail "ensure printed more than the node image: $(cat "$work/out")"
+grep -q "kind create pulls it" "$work/err" || fail "ensure did not say that kind create pulls the base"
+run_ensure -u SPACE_CI_IMAGE_MIRROR FAKE_PULLABLE="$mirror_ref" || fail "ensure outside GitHub CI failed"
+grep -q "^pull " "$work/calls" && fail "ensure pulled the base outside GitHub CI"
+unset SPACE_MIRRORED_IMAGES
 
 # ── check-kind-node-image.sh ─────────────────────────────────────────────────
 # Stubs: one cluster with two SPACE nodes whose image labels come from
@@ -119,4 +185,4 @@ fi
 grep -q "runs SPACE Kind node image 0123456789abcdef; this tree builds ${ref##*:}" "$work/out" \
   || fail "the stale-image refusal does not name both tags: $(cat "$work/out")"
 
-echo "ok: the Kind node image tag covers exactly its inputs, every config names it or its base, and clusters on another node image are refused with the remedy"
+echo "ok: the Kind node image tag covers exactly its inputs, every config names it or its base, CI takes the base from the mirror, and clusters on another node image are refused with the remedy"
