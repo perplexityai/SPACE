@@ -214,12 +214,21 @@ advisory ones `WARNING`.
 - reviewdog fails once it has written 10 annotations, whatever their severity.
   So advisory findings get one run that never fails the step, and required
   findings a second run with `-fail-level=error` that does.
-- Findings are annotated in report order, every `file_size` finding first. So
-  with 10 or more advisory findings to show, later ones, such as the
-  `pattern_ratchet` `no_new_entries` and `no_raised_caps` findings of a pull
-  request that edits a pattern table (which also turns on `nofilter`), are
-  not annotated. Annotations are not the full inventory: every finding is in
-  the step's log and its rdjson output, or run `cargo arch`.
+- GitHub shows a step's first 10 warning annotations, and the report lists
+  every `file_size` finding first. So
+  [`order-archcheck-findings.sh`](../../../ci/scripts/order-archcheck-findings.sh)
+  hands the advisory run the pull request's own findings first, then the
+  rest. First come all `no_new_entries` and `no_raised_caps` findings: they
+  compare with the base's copy by table and key, so they include the entries
+  of a renamed or split pattern table even though those lines are unchanged.
+  Then come findings in the files the pull request changes (old or new name),
+  and stale entries in the baseline for files it changes, such as files it
+  deletes. Each group keeps report order. With `file`, this changes nothing
+  that is shown. The step logs how many own advisory findings reviewdog will
+  show under the step's filter mode (with `file`, none in a file renamed
+  without edits); with more than 10, it says in the step summary that at
+  most 10 are annotated. Annotations are not the full inventory: every
+  finding is in the step's log and its rdjson output, or run `cargo arch`.
 
 Only annotations are filtered. Once a behaviour is `required`,
 `tests/repository.rs` fails on any required finding anywhere in the tree.

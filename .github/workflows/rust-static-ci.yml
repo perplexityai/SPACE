@@ -174,7 +174,9 @@ jobs:
       # rules or archcheck itself (old or new names), or its file list can't
       # be read in full.
       # reviewdog fails after 10 annotations of any severity, so advisory
-      # findings get a run of their own that never fails the step.
+      # findings get a run of their own that never fails the step. GitHub
+      # shows a step's first 10 warnings, so that run puts the pull request's
+      # own findings first (see order-archcheck-findings.sh).
       - name: Annotate repository structure findings
         if: ${{ !cancelled() && steps.archcheck.outcome == 'success' }}
         env:
@@ -184,21 +186,36 @@ jobs:
           CHANGED_FILES: ${{ github.event.pull_request.changed_files }}
         run: |
           set -euo pipefail
-          mode="nofilter"
-          if pages="$(gh api --paginate "repos/${GITHUB_REPOSITORY}/pulls/${PULL_REQUEST}/files?per_page=100" --jq \
-            '"\(length) \(any(.[] | .filename, .previous_filename // empty;
-              IN("ARCHITECTURE.toml", "architecture-baseline.toml", "Cargo.toml") or startswith("crates/tools/archcheck/")))"')" &&
-            awk -v n="${CHANGED_FILES}" '{ l += $1; r = r || $2 == "true" } END { exit r || l != n }' <<<"${pages}"; then
+          mode="nofilter" files="${RUNNER_TEMP}/archcheck-pull-request-files.json"
+          # One or more JSON arrays of files (gh may merge pages); none if the
+          # call fails, so the ordering still runs.
+          if { gh api --paginate "repos/${GITHUB_REPOSITORY}/pulls/${PULL_REQUEST}/files?per_page=100" >"${files}" ||
+            { echo '[]' >"${files}"; false; }; } &&
+            jq -se --argjson n "${CHANGED_FILES}" 'add // [] | length == $n and all(.[] | .filename, .previous_filename // empty;
+              IN("ARCHITECTURE.toml", "architecture-baseline.toml", "Cargo.toml") or startswith("crates/tools/archcheck/") | not)' \
+              "${files}" >/dev/null; then
             mode="file"
           fi
           echo "archcheck: -filter-mode=${mode}"
+          ordered="${RUNNER_TEMP}/archcheck-ordered.rdjson"
+          order() { bash ci/scripts/order-archcheck-findings.sh "$@" target/archcheck.rdjson "${files}"; }
+          if order >"${ordered}" && own="$(order --own="${mode}" | jq '[.diagnostics[] | select(.severity != "ERROR")] | length')"; then
+            echo "archcheck: ${own} advisory findings in this pull request's changes, annotated first"
+            if ((own > 10)); then
+              echo "archcheck: at most 10 of the ${own} advisory findings in this pull request's changes are annotated; run cargo arch." |
+                tee -a "${GITHUB_STEP_SUMMARY}"
+            fi
+          else
+            echo "archcheck: could not order the findings; annotating them in report order"
+            cp target/archcheck.rdjson "${ordered}"
+          fi
           annotate() {
-            jq ".diagnostics |= map(select($1))" target/archcheck.rdjson |
+            jq ".diagnostics |= map(select($1))" "$3" |
               reviewdog -f=rdjson -name=archcheck -reporter=github-pr-annotations -filter-mode="${mode}" -fail-level="$2"
           }
-          annotate '.severity != "ERROR"' none ||
+          annotate '.severity != "ERROR"' none "${ordered}" ||
             echo "::warning title=archcheck::Not every advisory finding was annotated; run cargo arch."
-          annotate '.severity == "ERROR"' error
+          annotate '.severity == "ERROR"' error target/archcheck.rdjson
 
       - name: Decide whether to refresh the Rust compiler cache
         id: refresh-rust-cache
