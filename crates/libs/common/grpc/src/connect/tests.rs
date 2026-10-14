@@ -488,26 +488,23 @@ async fn a_tls_peer_that_never_answers_fails_the_connect_at_its_handshake_bound(
     silent_peer.abort();
 }
 
-// An internal-RPC connect to a peer that never answers the ClientHello fails
-// with the handshake bound the transport's own TLS config applies, which is
-// the bound the attempt cap is sized from: here it outlasts the dial and
-// name-resolution shares, so the cap must count it for its cause to surface.
+/// An internal-RPC connect endpoint for `address` whose transport's TLS
+/// config bounds the handshake at `handshake_bound`, with the CA it trusts
+/// written to `dir`.
 #[cfg(feature = "internal-tls")]
-#[tokio::test]
-async fn an_internal_rpc_connect_fails_at_its_transports_handshake_bound() {
+async fn internal_rpc_connect_endpoint(
+    address: std::net::SocketAddr,
+    dir: &Path,
+    handshake_bound: Duration,
+) -> crate::internal_transport::ConnectEndpoint {
     use crate::internal_transport::{CA_ENV, ClientTransport, Service};
 
-    install_crypto_provider();
-    let (address, silent_peer) = silent_tls_peer().await;
-    let dir = tempfile::tempdir().unwrap();
     let mut env = TestEnvironment::default();
-    env.0
-        .insert(CA_ENV, write_test_ca(dir.path()).into_os_string());
-    let handshake_bound = Duration::from_secs(4);
+    env.0.insert(CA_ENV, write_test_ca(dir).into_os_string());
     let endpoint = tonic::transport::Endpoint::from_shared(format!("https://{address}"))
         .unwrap()
         .connect_timeout(Duration::from_millis(500));
-    let endpoint = ClientTransport::from_environment_with_tls_handshake_timeout(
+    ClientTransport::from_environment_with_tls_handshake_timeout(
         Service::NodeApi,
         endpoint.uri(),
         &env,
@@ -516,7 +513,21 @@ async fn an_internal_rpc_connect_fails_at_its_transports_handshake_bound() {
     .await
     .unwrap()
     .connect_endpoint(endpoint)
-    .unwrap();
+    .unwrap()
+}
+
+// An internal-RPC connect to a peer that never answers the ClientHello fails
+// with the handshake bound the transport's own TLS config applies, which is
+// the bound the attempt cap is sized from: here it outlasts the dial and
+// name-resolution shares, so the cap must count it for its cause to surface.
+#[cfg(feature = "internal-tls")]
+#[tokio::test]
+async fn an_internal_rpc_connect_fails_at_its_transports_handshake_bound() {
+    install_crypto_provider();
+    let (address, silent_peer) = silent_tls_peer().await;
+    let dir = tempfile::tempdir().unwrap();
+    let handshake_bound = Duration::from_secs(4);
+    let endpoint = internal_rpc_connect_endpoint(address, dir.path(), handshake_bound).await;
 
     let started = tokio::time::Instant::now();
     let result = tokio::time::timeout(
@@ -530,6 +541,36 @@ async fn an_internal_rpc_connect_fails_at_its_transports_handshake_bound() {
     .await
     .expect("an unanswered TLS handshake must be bounded");
     assert_failed_at_handshake_bound(result, started.elapsed(), handshake_bound);
+    silent_peer.abort();
+}
+
+// A watched internal-RPC connect is given the transport's handshake bound the
+// same way, so a kept channel's attempt cap leaves the handshake its share.
+#[cfg(feature = "internal-tls")]
+#[tokio::test]
+async fn a_watched_internal_rpc_connect_fails_at_its_transports_handshake_bound() {
+    install_crypto_provider();
+    let (address, silent_peer) = silent_tls_peer().await;
+    let dir = tempfile::tempdir().unwrap();
+    let handshake_bound = Duration::from_secs(4);
+    let endpoint = internal_rpc_connect_endpoint(address, dir.path(), handshake_bound).await;
+
+    let started = tokio::time::Instant::now();
+    let result = tokio::time::timeout(
+        Duration::from_secs(60),
+        endpoint.connect_with_retry_watched(
+            "silent-internal-rpc",
+            address.to_string(),
+            crate::GrpcRetryPolicy::none(),
+        ),
+    )
+    .await
+    .expect("an unanswered TLS handshake must be bounded");
+    assert_failed_at_handshake_bound(
+        result.map(|(channel, _watch)| channel),
+        started.elapsed(),
+        handshake_bound,
+    );
     silent_peer.abort();
 }
 
@@ -714,6 +755,95 @@ async fn a_kept_channels_redial_that_never_connects_is_a_client_connect_failure(
     assert!(is_marked(&status), "{status:?}");
     assert!(crate::is_client_connect_failure(&status), "{status:?}");
     drop(blackhole);
+}
+
+// A watched channel dials through SPACE's TCP connector too. Its watch still
+// closes once the connection it was dialed with ends, and the redial that a
+// holder's next RPC makes, which never connects, fails at the dial bound with
+// the connector's marker, so the failure is replay-safe. The peer's address
+// turns into a blackhole once it stops.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_watched_channels_connect_phase_timeout_is_a_client_connect_failure() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (stop, server) = serve_tcp_health(listener).await;
+    let endpoint = tonic::transport::Endpoint::from_shared(format!("http://{address}"))
+        .unwrap()
+        .connect_timeout(Duration::from_millis(200));
+    let (channel, watch) = super::connect_tcp_channel_with_retry_watched(
+        "test-backend",
+        address.to_string(),
+        endpoint,
+        None,
+        crate::GrpcRetryPolicy::none(),
+    )
+    .await
+    .expect("first dial");
+    let mut client = HealthClient::new(channel);
+    client.check(health_request()).await.expect("served");
+    assert!(!watch.is_closed(), "the dialed connection is open");
+
+    stop.send(()).unwrap();
+    server.await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !watch.is_closed() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the watch closes with the connection");
+    let blackhole = crate::test_support::Blackhole::bind(address).await.unwrap();
+    let status = tokio::time::timeout(
+        Duration::from_secs(60),
+        client.check(unbounded_health_request()),
+    )
+    .await
+    .expect("an unanswered redial must be bounded")
+    .expect_err("nothing answers the redial");
+    assert!(
+        has_io_error(&status, std::io::ErrorKind::TimedOut),
+        "{status:?}"
+    );
+    assert!(is_marked(&status), "{status:?}");
+    assert!(crate::is_client_connect_failure(&status), "{status:?}");
+    assert!(watch.is_closed(), "a closed watch never reopens");
+    drop(blackhole);
+}
+
+// A watched first dial that never connects fails with the connector's marked
+// dial timeout, not as an attempt abandoned at its cap. Under the paused clock
+// the dial bound fires before the kernel's own SYN retries could end the dial.
+#[cfg(target_os = "linux")]
+#[tokio::test(start_paused = true)]
+async fn a_watched_dial_that_never_connects_fails_in_its_connect_phase() {
+    let blackhole = crate::test_support::Blackhole::bind("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+    let endpoint =
+        tonic::transport::Endpoint::from_shared(format!("http://{}", blackhole.address()))
+            .unwrap()
+            .connect_timeout(Duration::from_secs(1));
+
+    let error = super::connect_tcp_channel_with_retry_watched(
+        "test-backend",
+        blackhole.address().to_string(),
+        endpoint,
+        None,
+        crate::GrpcRetryPolicy::none(),
+    )
+    .await
+    .expect_err("nothing answers the dial");
+    let error = match error {
+        error @ super::TcpConnectError::Transport(_) => error,
+        other => panic!("expected the dial bound to fail the attempt: {other:?}"),
+    };
+    let marked = std::iter::successors(
+        Some(&error as &(dyn std::error::Error + 'static)),
+        |error| error.source(),
+    )
+    .any(|error| error.is::<crate::ConnectPhaseError>());
+    assert!(marked, "{error:?}");
 }
 
 /// What [`request_reading_peer`] does with a connection once it has read a
@@ -1042,6 +1172,50 @@ async fn a_retried_connects_stalled_lookup_fails_with_its_own_cause() {
     assert!(marked, "{error:?}");
 }
 
+// A watched dial bounds a stalled lookup the same way: the attempt fails with
+// the connector's marked cause, before the attempt cap or tonic's
+// whole-connect backstop could end it unmarked.
+#[tokio::test(start_paused = true)]
+async fn a_watched_dials_stalled_lookup_fails_with_its_own_cause() {
+    let dial_timeout = Duration::from_secs(1);
+    let endpoint = tonic::transport::Endpoint::from_static("http://stalled.invalid:50051")
+        .connect_timeout(dial_timeout);
+
+    let started = tokio::time::Instant::now();
+    let result = super::retry_tcp_connect(
+        "stalled-lookup",
+        "stalled.invalid:50051",
+        crate::GrpcRetryPolicy::none(),
+        super::tcp_attempt_cap(dial_timeout, None),
+        || {
+            let endpoint = endpoint.clone();
+            async move {
+                super::dial_watched_tcp_channel(
+                    endpoint,
+                    None,
+                    hyper_util::client::legacy::connect::HttpConnector::new_with_resolver(
+                        StalledResolver,
+                    ),
+                )
+                .await
+                .map_err(super::TcpConnectError::from)
+            }
+        },
+    )
+    .await;
+    let error = match result {
+        Err(error @ super::TcpConnectError::Transport(_)) => error,
+        other => panic!("expected the connect-phase bound to fail the attempt: {other:?}"),
+    };
+    let marked = std::iter::successors(
+        Some(&error as &(dyn std::error::Error + 'static)),
+        |error| error.source(),
+    )
+    .any(|error| error.is::<crate::ConnectPhaseError>());
+    assert!(marked, "{error:?}");
+    assert_eq!(started.elapsed(), super::connect_phase_bound(dial_timeout));
+}
+
 // A lazy channel whose endpoint sets no dial bound is given the default one,
 // so a dial no peer answers fails with the dial bound's own marked
 // `TimedOut` instead of hanging. Under the paused clock the kernel cannot
@@ -1096,6 +1270,13 @@ async fn a_tcp_connect_refuses_endpoints_it_would_dial_wrongly() {
         assert!(
             matches!(
                 super::connect_tcp_channel_with_retry("refused", uri, endpoint.clone(), None, crate::GrpcRetryPolicy::none()).await,
+                Err(super::TcpConnectError::Endpoint(ref error)) if is_refusal(error)
+            ),
+            "{label}"
+        );
+        assert!(
+            matches!(
+                super::connect_tcp_channel_with_retry_watched("refused", uri, endpoint.clone(), None, crate::GrpcRetryPolicy::none()).await,
                 Err(super::TcpConnectError::Endpoint(ref error)) if is_refusal(error)
             ),
             "{label}"

@@ -393,12 +393,14 @@ pub async fn connect_tcp_channel_with_retry(
 }
 
 /// [`connect_tcp_channel_with_retry`] for a channel meant to be kept per peer
-/// instance: the same attempts, caps, retries, spans and metrics, and a
-/// [`ConnectionWatch`] that closes once the connection the channel was dialed
-/// with ends. A cache that hands the channel out only while the watch is open
-/// gives each caller either that live connection or a fresh dial whose
-/// failure it sees, as it would without the cache. The channel itself still
-/// redials after its connection drops, for callers already holding it.
+/// instance: the same endpoint checks, attempts, bounds, retries, spans and
+/// metrics, and a [`ConnectionWatch`] that closes once the connection the
+/// channel was dialed with ends. A cache that hands the channel out only while
+/// the watch is open gives each caller either that live connection or a fresh
+/// dial whose failure it sees, as it would without the cache. The channel
+/// itself still redials after its connection drops, for callers already
+/// holding it, through the same SPACE TCP connector, so a redial that never
+/// connects fails its RPC with a [`ConnectPhaseError`] too.
 ///
 /// Internal-RPC callers must connect through
 /// `internal_transport::ConnectEndpoint::connect_with_retry_watched`.
@@ -409,14 +411,11 @@ pub async fn connect_tcp_channel_with_retry_watched(
     tls_handshake_timeout: Option<std::time::Duration>,
     retry_policy: GrpcRetryPolicy,
 ) -> Result<(tonic::transport::Channel, ConnectionWatch), TcpConnectError> {
+    check_tcp_endpoint(&endpoint, tls_handshake_timeout)?;
     let dial_timeout = endpoint
         .get_connect_timeout()
         .unwrap_or(DEFAULT_TCP_DIAL_TIMEOUT);
-    // A custom connector's `connect_timeout` bounds the TCP dial and TLS
-    // together; the connector bounds the dial alone, as `Endpoint::connect`
-    // does, so this bound only has to leave the handshake its own share.
-    let endpoint =
-        endpoint.connect_timeout(dial_timeout + tls_handshake_timeout.unwrap_or_default());
+    let endpoint = endpoint.connect_timeout(dial_timeout);
     let attempt_cap = tcp_attempt_cap(dial_timeout, tls_handshake_timeout);
     retry_tcp_connect(
         service_name,
@@ -426,13 +425,13 @@ pub async fn connect_tcp_channel_with_retry_watched(
         || {
             let endpoint = endpoint.clone();
             async move {
-                let watch = ConnectionWatch::default();
-                let connector = WatchedTcpConnector::new(&endpoint, dial_timeout, watch.clone());
-                let channel = endpoint
-                    .connect_with_connector(connector)
-                    .await
-                    .map_err(TcpConnectError::from)?;
-                Ok::<_, TcpConnectError>((channel, watch))
+                dial_watched_tcp_channel(
+                    endpoint,
+                    tls_handshake_timeout,
+                    hyper_util::client::legacy::connect::HttpConnector::new(),
+                )
+                .await
+                .map_err(TcpConnectError::from)
             }
         },
     )
@@ -689,6 +688,32 @@ pub(crate) async fn dial_tcp_channel(
         hyper_util::client::legacy::connect::HttpConnector::new(),
     );
     endpoint.connect_with_connector(connector).await
+}
+
+/// [`dial_tcp_channel`] over `http` through SPACE's TCP connector wrapped in
+/// a [`WatchedTcpConnector`], and the watch its connections close.
+async fn dial_watched_tcp_channel<R>(
+    endpoint: tonic::transport::Endpoint,
+    tls_handshake_timeout: Option<std::time::Duration>,
+    http: hyper_util::client::legacy::connect::HttpConnector<R>,
+) -> Result<(tonic::transport::Channel, ConnectionWatch), tonic::transport::Error>
+where
+    R: tower::Service<
+            hyper_util::client::legacy::connect::dns::Name,
+            Response: Iterator<Item = std::net::SocketAddr>,
+            Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+            Future: Send,
+        > + Clone
+        + Send
+        + Sync
+        + 'static,
+{
+    let watch = ConnectionWatch::default();
+    let (endpoint, connector) = tcp_connector(endpoint, tls_handshake_timeout, http);
+    let channel = endpoint
+        .connect_with_connector(WatchedTcpConnector::new(connector, watch.clone()))
+        .await?;
+    Ok((channel, watch))
 }
 
 /// [`connect_tcp_channel_lazy`] for an endpoint already known to be a TCP

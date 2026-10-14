@@ -16,7 +16,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
 
-use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioIo;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
@@ -91,46 +90,39 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for WatchedStream<T> {
     }
 }
 
-/// The TCP connector tonic builds for an endpoint, whose streams close
-/// `watch` when dropped. Every connection the channel opens shares the watch,
-/// so it closes with the first one and stays closed.
+/// SPACE's TCP connector `tcp`, whose streams close `watch` when dropped.
+/// Every connection the channel opens shares the watch, so it closes with the
+/// first one and stays closed. Dials, their bounds and their errors are
+/// `tcp`'s own, so a failed dial keeps its connect-phase marker.
 #[derive(Clone)]
-pub(crate) struct WatchedTcpConnector {
-    http: HttpConnector,
+pub(crate) struct WatchedTcpConnector<C> {
+    tcp: C,
     watch: ConnectionWatch,
 }
 
-impl WatchedTcpConnector {
-    /// Dial like `endpoint.connect()` would: the endpoint's TCP options and
-    /// `dial_timeout` for the TCP connect alone.
-    pub(crate) fn new(
-        endpoint: &tonic::transport::Endpoint,
-        dial_timeout: std::time::Duration,
-        watch: ConnectionWatch,
-    ) -> Self {
-        let mut http = HttpConnector::new();
-        http.enforce_http(false);
-        http.set_nodelay(endpoint.get_tcp_nodelay());
-        http.set_keepalive(endpoint.get_tcp_keepalive());
-        http.set_keepalive_interval(endpoint.get_tcp_keepalive_interval());
-        http.set_keepalive_retries(endpoint.get_tcp_keepalive_retries());
-        http.set_connect_timeout(Some(dial_timeout));
-        Self { http, watch }
+impl<C> WatchedTcpConnector<C> {
+    pub(crate) fn new(tcp: C, watch: ConnectionWatch) -> Self {
+        Self { tcp, watch }
     }
 }
 
-impl tower::Service<http::Uri> for WatchedTcpConnector {
-    type Response = TokioIo<WatchedStream<tokio::net::TcpStream>>;
-    type Error = Box<dyn std::error::Error + Send + Sync>;
+impl<C, T> tower::Service<http::Uri> for WatchedTcpConnector<C>
+where
+    C: tower::Service<http::Uri, Response = TokioIo<T>>,
+    C::Future: Send + 'static,
+    T: Send + 'static,
+{
+    type Response = TokioIo<WatchedStream<T>>;
+    type Error = C::Error;
     type Future =
         Pin<Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send>>;
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        self.http.poll_ready(cx).map_err(Into::into)
+        self.tcp.poll_ready(cx)
     }
 
     fn call(&mut self, uri: http::Uri) -> Self::Future {
-        let connecting = self.http.call(uri);
+        let connecting = self.tcp.call(uri);
         let watch = self.watch.clone();
         Box::pin(async move {
             let stream = connecting.await?.into_inner();
