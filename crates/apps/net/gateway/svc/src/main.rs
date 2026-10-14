@@ -1,9 +1,12 @@
-use pplx_space_common_core::types::NodeManagedBy;
+use std::path::PathBuf;
+
+use anyhow::Context;
+use clap::Parser;
+use pplx_space_common_core::types::{NodeManagedBy, SandboxId, SpaceApiRouteIdentity};
 use pplx_space_net_common::DomainName;
+use pplx_space_net_gateway::InitialPolicyState;
 use pplx_space_net_gateway::tcp_proxy::TcpDomainAuthorizationMode;
 use pplx_space_net_gateway::{NetGatewayRunConfig, SERVICE_NAME};
-
-use clap::Parser;
 
 #[derive(Parser)]
 #[command(
@@ -19,11 +22,11 @@ struct Cli {
 
     /// Unix socket path for the control service (sbx-manager connects here)
     #[arg(long)]
-    socket: String,
+    socket: PathBuf,
 
     /// Sandbox ID this gateway is managing
     #[arg(long)]
-    sandbox_id: String,
+    sandbox_id: SandboxId,
 
     /// Inherited TCP listener FD (created by node-manager with `IP_TRANSPARENT`)
     #[arg(long)]
@@ -90,34 +93,68 @@ struct Cli {
     substrate_kind: Option<NodeManagedBy>,
 }
 
-impl From<Cli> for NetGatewayRunConfig {
-    fn from(cli: Cli) -> Self {
-        Self {
-            socket_path: cli.socket,
-            sandbox_id: cli.sandbox_id,
-            tcp_fd: cli.tcp_fd,
-            udp_fd: cli.udp_fd,
-            no_identity: cli.no_identity,
-            known_egress_domains: cli.known_egress_domains,
-            route_generation: cli.route_generation,
-            current_node_id: cli.current_node_id,
-            execution_generation: cli.execution_generation,
-            pod_uid: cli.pod_uid,
-            activation_attempt_id: cli.activation_attempt_id,
-            substrate_kind: cli.substrate_kind,
+impl Cli {
+    fn into_config(self) -> anyhow::Result<NetGatewayRunConfig> {
+        let route_identity = self.route_identity()?;
+        Ok(NetGatewayRunConfig {
+            socket_path: self.socket,
+            sandbox_id: self.sandbox_id,
+            tcp_fd: self.tcp_fd,
+            udp_fd: self.udp_fd,
+            initial_policy_state: if self.no_identity {
+                InitialPolicyState::NoIdentity
+            } else {
+                InitialPolicyState::PendingPolicy
+            },
+            known_egress_domains: self.known_egress_domains,
+            route_identity,
+        })
+    }
+
+    fn route_identity(&self) -> anyhow::Result<Option<SpaceApiRouteIdentity>> {
+        if self.route_generation.is_none()
+            && self.current_node_id.is_none()
+            && self.execution_generation.is_none()
+            && self.pod_uid.is_none()
+            && self.activation_attempt_id.is_none()
+            && self.substrate_kind.is_none()
+        {
+            return Ok(None);
         }
+        use pplx_space_net_gateway::proto::{SandboxSubstrateKind, SpaceApiRouteIdentity};
+        pplx_space_net_gateway::ingress::route_identity_from_proto(Some(SpaceApiRouteIdentity {
+            sandbox_id: Some(self.sandbox_id.to_string()),
+            route_generation: self.route_generation,
+            current_node_id: self.current_node_id.clone(),
+            substrate_kind: match self.substrate_kind {
+                None => SandboxSubstrateKind::Unspecified as i32,
+                Some(NodeManagedBy::Space) => SandboxSubstrateKind::Direct as i32,
+                Some(NodeManagedBy::Kubernetes) => SandboxSubstrateKind::Kubernetes as i32,
+            },
+            execution_generation: self
+                .execution_generation
+                .map(i64::try_from)
+                .transpose()
+                .context("invalid ServicePort execution generation")?,
+            pod_uid: self.pod_uid.clone(),
+            activation_attempt_id: self.activation_attempt_id.clone(),
+        }))
+        .context("invalid ServicePort route identity")
     }
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let cli = Cli::parse();
+    let config = Cli::parse().into_config()?;
     let telemetry = pplx_space_common_svc::init_service_with_log_context(
         SERVICE_NAME,
-        pplx_space_common_svc::LogContext::default().with_sandbox_id(cli.sandbox_id.clone()),
+        pplx_space_common_svc::LogContext::default().with_sandbox_id(config.sandbox_id.to_string()),
     )?;
     let shutdown_token = pplx_space_common_svc::shutdown_token();
-    let result = pplx_space_net_gateway::run(cli.into(), shutdown_token).await;
+    let result = pplx_space_net_gateway::run(config, shutdown_token).await;
     pplx_space_common_svc::shutdown_telemetry(telemetry).await;
     Ok(result?)
 }
+
+#[cfg(test)]
+mod tests;

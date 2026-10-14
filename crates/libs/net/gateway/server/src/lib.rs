@@ -25,6 +25,6 @@ pub use pplx_space_net_gateway_client::orig_dst;
 pub use pplx_space_net_gateway_client::proto;
 pub use pplx_space_net_gateway_client::{TCP_PROXY_PORT, UDP_MAPPING_TIMEOUT_SECS, UDP_PROXY_PORT};
 pub use run::{
-    HydrateNetworkStateError, NetGatewayRunConfig, NetworkPolicyFromHostControlError,
-    RunNetGatewayError, SERVICE_NAME, run,
+    HydrateNetworkStateError, InitialPolicyState, NetGatewayRunConfig,
+    NetworkPolicyFromHostControlError, RunNetGatewayError, SERVICE_NAME, run,
 };
