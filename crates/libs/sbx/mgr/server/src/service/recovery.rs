@@ -200,6 +200,8 @@ pub(super) enum SuspendSnapshotPublicationRecoveryOrigin {
     StartupRecovery,
     PeriodicRecovery,
     LivePublishFailure,
+    /// The teardown driver resuming its own interrupted publication.
+    TeardownRetry,
 }
 
 impl SuspendSnapshotPublicationRecoveryOrigin {
@@ -208,6 +210,7 @@ impl SuspendSnapshotPublicationRecoveryOrigin {
             Self::StartupRecovery => "startup_recovery",
             Self::PeriodicRecovery => "periodic_recovery",
             Self::LivePublishFailure => "live_publish_failure_recovery",
+            Self::TeardownRetry => "teardown_retry_recovery",
         }
     }
 
@@ -216,6 +219,7 @@ impl SuspendSnapshotPublicationRecoveryOrigin {
             Self::StartupRecovery => "startup_recovery_runtime_live",
             Self::PeriodicRecovery => "periodic_recovery_runtime_live",
             Self::LivePublishFailure => "live_publish_failure_runtime_live",
+            Self::TeardownRetry => "teardown_retry_runtime_live",
         }
     }
 }
@@ -879,7 +883,7 @@ impl SandboxManagerService {
         Ok(())
     }
 
-    fn recover_interrupted_suspend_snapshot_publication(
+    pub(super) fn recover_interrupted_suspend_snapshot_publication(
         &self,
         cache_dir: &Path,
         row: crate::db::SandboxRow,

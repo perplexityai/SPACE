@@ -209,3 +209,100 @@ async fn failed_teardown_defers_repeated_polls_without_holding_driver_capacity()
     service.task_tracker.close();
     service.task_tracker.wait().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn teardown_retry_seals_publishes_backs_up_and_completes_the_same_capture() {
+    use crate::service::tests::node_manager_transport_tests::{
+        record_encrypted_capture_in, sealing_node_manager_builder,
+    };
+    use crate::service::tests::service_tests::insert_stranded_teardown_suspend_sandbox;
+    use pplx_space_common_core::types::ExecutionGeneration;
+    use pplx_space_node_mgr_client::proto::{CleanupSandboxRequest, CleanupSandboxResponse};
+    use std::ffi::OsStr;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let stop = tokio_util::sync::CancellationToken::new();
+    let server = tokio::spawn(
+        tonic::transport::Server::builder()
+            .add_service(ReadyBackup)
+            .serve_with_incoming_shutdown(
+                tokio_stream::wrappers::TcpListenerStream::new(listener),
+                stop.clone().cancelled_owned(),
+            ),
+    );
+    let token = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(token.path(), "synthetic-backup-test-token").unwrap();
+    let child = pplx_space_test_env::enter_test_process(&[
+        ("SPACE_INTERNAL_RPC_INSECURE_DEV", Some(OsStr::new("1"))),
+        (
+            pplx_space_node_api_client::cluster::CLUSTER_API_ENDPOINT_ENV,
+            Some(OsStr::new(&endpoint)),
+        ),
+        (
+            pplx_space_common_svc::bearer_token::SPACE_CLUSTER_API_TOKEN_PATH_ENV,
+            Some(token.path().as_os_str()),
+        ),
+    ]);
+    if child {
+        let conn = crate::db::test_conn();
+        let sandbox_id = SandboxId::new();
+        let id = sandbox_id.to_string();
+        let generation = ExecutionGeneration::new(7).unwrap();
+        insert_stranded_teardown_suspend_sandbox(&conn, sandbox_id, generation);
+        // The generation's capture stopped the runtime but did not seal.
+        conn.execute(
+            "UPDATE sandboxes SET volume_encryption = 1, current_local_artifact_id = NULL,
+                 current_local_artifact_kind = NULL, current_local_artifact_origin = NULL
+             WHERE id = ?1",
+            [&id],
+        )
+        .unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let (capture, _) =
+            record_encrypted_capture_in(cache.path(), &id, std::time::Duration::ZERO, true);
+        let node_manager = sealing_node_manager_builder(1)
+            .unary("CleanupSandbox", |_: CleanupSandboxRequest| {
+                Ok(CleanupSandboxResponse::default())
+            })
+            .serve();
+        let service = SandboxManagerService::new_with_options(
+            conn,
+            SandboxManagerServiceOptions {
+                node_manager: node_manager.connector(),
+                ..SandboxManagerServiceOptions::for_test()
+            },
+        );
+        let drive = || {
+            service.drive_teardown_suspend_in(
+                sandbox_id,
+                generation,
+                SandboxEventTrigger::System,
+                cache.path(),
+            )
+        };
+
+        // The holder is still there: the retry keeps the capture pending.
+        let error = drive().await.unwrap_err();
+        assert_eq!(error.code(), tonic::Code::Unavailable, "{error}");
+        assert_eq!(
+            service.lookup_sandbox(&id).unwrap().state,
+            SandboxState::Suspending
+        );
+
+        // The next retry seals, publishes, backs up and completes teardown.
+        drive().await.unwrap();
+        let row = service.lookup_sandbox(&id).unwrap();
+        assert_eq!(row.state, SandboxState::Suspended);
+        assert_eq!(row.current_local_artifact_id, Some(capture));
+        let db = service.db.lock().unwrap();
+        assert!(
+            crate::db::teardown_suspend_status(&db, &id)
+                .unwrap()
+                .unwrap()
+                .is_durable_for(generation)
+        );
+    }
+    stop.cancel();
+    server.await.unwrap().unwrap();
+}

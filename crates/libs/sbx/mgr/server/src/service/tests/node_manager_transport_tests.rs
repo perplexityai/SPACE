@@ -130,13 +130,24 @@ fn record_encrypted_capture(
     age: std::time::Duration,
     committed: bool,
 ) -> (LocalArtifactId, std::path::PathBuf) {
-    use crate::service::suspend_snapshot_publication as publication;
     insert_test_sandbox(conn, id, SandboxState::Suspending);
     conn.execute(
         "UPDATE sandboxes SET volume_encryption = 1 WHERE id = ?1",
         [id],
     )
     .unwrap();
+    record_encrypted_capture_in(cache, id, age, committed)
+}
+
+/// The staging of an encrypted capture of `id` recorded `age` ago and never
+/// sealed, under `cache`.
+pub(crate) fn record_encrypted_capture_in(
+    cache: &Path,
+    id: &str,
+    age: std::time::Duration,
+    committed: bool,
+) -> (LocalArtifactId, std::path::PathBuf) {
+    use crate::service::suspend_snapshot_publication as publication;
     let capture = LocalArtifactId::new();
     let staging = publication::suspend_snapshot_staging_dir(&cache.join(id), capture);
     publication::write_full_suspend_artifact(&staging, id, capture, b"captured");
@@ -164,27 +175,28 @@ fn record_encrypted_capture(
 /// A node-manager whose release refuses `refusals` times, then seals by
 /// staging both ciphertext artifacts.
 fn sealing_node_manager(refusals: usize) -> crate::node_manager_transport::fake::ServedNodeManager {
+    sealing_node_manager_builder(refusals).serve()
+}
+
+pub(crate) fn sealing_node_manager_builder(refusals: usize) -> FakeNodeManager {
     use pplx_space_node_mgr_client::proto::{
         ReleaseEncryptedVolumeRequest, ReleaseEncryptedVolumeResponse,
     };
     let remaining = Arc::new(Mutex::new(refusals));
-    FakeNodeManager::default()
-        .unary(
-            "ReleaseEncryptedVolume",
-            move |request: ReleaseEncryptedVolumeRequest| {
-                let mut remaining = remaining.lock().unwrap();
-                if *remaining > 0 {
-                    *remaining -= 1;
-                    return Err(Status::internal("device or resource busy"));
-                }
-                for name in ["snapshot.luks", "cow.luks"] {
-                    std::fs::write(Path::new(&request.stage_dir).join(name), b"ciphertext")
-                        .unwrap();
-                }
-                Ok(ReleaseEncryptedVolumeResponse::default())
-            },
-        )
-        .serve()
+    FakeNodeManager::default().unary(
+        "ReleaseEncryptedVolume",
+        move |request: ReleaseEncryptedVolumeRequest| {
+            let mut remaining = remaining.lock().unwrap();
+            if *remaining > 0 {
+                *remaining -= 1;
+                return Err(Status::internal("device or resource busy"));
+            }
+            for name in ["snapshot.luks", "cow.luks"] {
+                std::fs::write(Path::new(&request.stage_dir).join(name), b"ciphertext").unwrap();
+            }
+            Ok(ReleaseEncryptedVolumeResponse::default())
+        },
+    )
 }
 
 /// One periodic publication-recovery pass over the row, including the seal

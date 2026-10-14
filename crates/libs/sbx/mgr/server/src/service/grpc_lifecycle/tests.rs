@@ -2669,3 +2669,44 @@ async fn teardown_suspend_driver_completes_a_generation_whose_artifact_is_alread
     }
     drain_service_tasks(&service).await;
 }
+
+#[tokio::test]
+async fn teardown_suspend_without_a_capture_quarantines_as_an_only_copy() {
+    use crate::service::tests::service_tests::insert_stranded_teardown_suspend_sandbox;
+    use pplx_space_common_core::types::ExecutionGeneration;
+    let conn = crate::db::test_conn();
+    let sandbox_id = SandboxId::new();
+    let generation = ExecutionGeneration::new(7).unwrap();
+    insert_stranded_teardown_suspend_sandbox(&conn, sandbox_id, generation);
+    // The publication stopped the runtime before anything was staged.
+    conn.execute(
+        "UPDATE sandboxes SET current_local_artifact_id = NULL,
+             current_local_artifact_kind = NULL, current_local_artifact_origin = NULL
+         WHERE id = ?1",
+        [sandbox_id.to_string()],
+    )
+    .unwrap();
+    let service = SandboxManagerService::for_test(conn);
+
+    service
+        .drive_teardown_suspend(sandbox_id, generation, SandboxEventTrigger::System)
+        .await
+        .unwrap_err();
+
+    let db = service.db.lock().unwrap();
+    let row = crate::db::get_sandbox(&db, &sandbox_id.to_string())
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.state, SandboxState::Quarantined);
+    assert_eq!(
+        row.failure_reason.as_deref(),
+        Some(crate::db::SUSPEND_PUBLISH_FAILED_NO_ARTIFACT_RUNTIME_GONE)
+    );
+    assert_eq!(
+        crate::db::latest_teardown_suspend_operation(&db, &sandbox_id.to_string())
+            .unwrap()
+            .unwrap()
+            .status,
+        crate::db::TeardownSuspendOperationStatus::Failed
+    );
+}

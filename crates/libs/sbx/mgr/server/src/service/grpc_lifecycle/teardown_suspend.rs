@@ -164,6 +164,12 @@ fn teardown_failed_backup_artifact(status: &Status) -> Option<LocalArtifactId> {
     ))
 }
 
+/// The wake and artifact locks the teardown driver holds for its whole run.
+type TeardownSuspendLocks = (
+    crate::auto_lifecycle::LifecycleMutexGuard,
+    crate::auto_lifecycle::LifecycleMutexGuard,
+);
+
 impl SandboxManagerService {
     pub(in crate::service) async fn prepare_teardown_suspend(
         &self,
@@ -558,9 +564,32 @@ impl SandboxManagerService {
         execution_generation: pplx_space_common_core::types::ExecutionGeneration,
         event_trigger: SandboxEventTrigger,
     ) -> Result<(), Status> {
+        self.drive_teardown_suspend_in(
+            sandbox_id,
+            execution_generation,
+            event_trigger,
+            std::path::Path::new(CACHE_DIR),
+        )
+        .await
+    }
+
+    /// [`Self::drive_teardown_suspend`] with the sandbox cache rooted at
+    /// `cache_dir`, which only tests change.
+    pub(super) async fn drive_teardown_suspend_in(
+        &self,
+        sandbox_id: SandboxId,
+        execution_generation: pplx_space_common_core::types::ExecutionGeneration,
+        event_trigger: SandboxEventTrigger,
+        cache_dir: &std::path::Path,
+    ) -> Result<(), Status> {
         let _state_writer = self.state_writer_lease("PrepareTeardownSuspendBackground")?;
         let result = self
-            .drive_teardown_suspend_inner(sandbox_id, execution_generation, event_trigger)
+            .drive_teardown_suspend_inner(
+                sandbox_id,
+                execution_generation,
+                event_trigger,
+                cache_dir,
+            )
             .await;
         if let Err(error) = &result {
             // Registration can also return NotFound for its source node. Confirm
@@ -659,6 +688,7 @@ impl SandboxManagerService {
         sandbox_id: SandboxId,
         execution_generation: pplx_space_common_core::types::ExecutionGeneration,
         event_trigger: SandboxEventTrigger,
+        cache_dir: &std::path::Path,
     ) -> Result<(), Status> {
         let sandbox_id_string = sandbox_id.to_string();
         let wake_lock = self.auto_lifecycle.wake_lock(&sandbox_id_string);
@@ -683,6 +713,35 @@ impl SandboxManagerService {
             return Ok(());
         }
         self.ensure_teardown_suspend_owner(&sandbox_id_string, execution_generation)?;
+        // A publication this generation began but could not finish (an
+        // encrypted capture that did not seal) resumes through the same
+        // recovery as any interrupted publication, which registers the staged
+        // artifact under this generation. The artifact arm below then backs
+        // it up and finalizes the runtime.
+        let (wake_guard, artifact_guard, status) =
+            if status.state == SandboxState::Suspending && status.artifact.is_none() {
+                let (wake_guard, artifact_guard) = self
+                    .recover_teardown_suspend_publication(
+                        &sandbox_id_string,
+                        cache_dir,
+                        (wake_guard, artifact_guard),
+                    )
+                    .await?;
+                let status = {
+                    let db = self.db_conn()?;
+                    crate::db::teardown_suspend_status(&db, &sandbox_id_string)
+                        .map_err(|error| Status::internal(format!("db error: {error}")))?
+                        .ok_or_else(|| Status::not_found("sandbox record no longer exists"))?
+                };
+                if status.state == SandboxState::Suspending && status.artifact.is_none() {
+                    return Err(Status::unavailable(
+                        "teardown suspend publication is still pending",
+                    ));
+                }
+                (wake_guard, artifact_guard, status)
+            } else {
+                (wake_guard, artifact_guard, status)
+            };
         let active_generation = Some(execution_generation);
         let result: Result<(), Status> = match (status.state, status.artifact) {
             (SandboxState::Started | SandboxState::Paused, _) => {
@@ -756,6 +815,59 @@ impl SandboxManagerService {
             event_trigger,
         )?;
         Ok(())
+    }
+
+    /// Seal a recorded encrypted capture, then run the interrupted-publication
+    /// recovery the periodic pass uses, with retained-source verdicts and off
+    /// the async workers as it does. The row's locks, its cleanup fence and a
+    /// state-writer lease move into the blocking work, so a shutdown that
+    /// drops this future cannot release them under a live publish. The locks
+    /// come back once it finishes. A still-pending artifact leaves the row
+    /// suspending, and the driver's deferred retry comes back here.
+    async fn recover_teardown_suspend_publication(
+        &self,
+        sandbox_id: &str,
+        cache_dir: &std::path::Path,
+        locks: TeardownSuspendLocks,
+    ) -> Result<TeardownSuspendLocks, Status> {
+        let CleanupLockTryResult::Acquired(cleanup) = self.try_cleanup_fence(sandbox_id) else {
+            return Err(Status::unavailable("sandbox cleanup is in progress"));
+        };
+        let sandbox = self.lookup_sandbox(sandbox_id)?;
+        self.seal_recorded_encrypted_capture(&sandbox, cache_dir)
+            .await
+            .map_err(|error| {
+                Status::unavailable(format!(
+                    "encrypted suspend capture is still unsealed: {error}"
+                ))
+            })?;
+        // Periodic recovery skips teardown-owned rows, so a deferred
+        // btrfs-send capture's retained source is inspected only here.
+        let verdicts = self
+            .inspect_retained_sources_in(vec![cache_dir.join(sandbox_id)], &mut Default::default())
+            .await;
+        let state_writer = self.state_writer_lease("TeardownSuspendPublicationRecovery")?;
+        let (service, cache_dir) = (self.clone(), cache_dir.to_path_buf());
+        let (recovered, locks) = tokio::task::spawn_blocking(move || {
+            let _fences = (cleanup, state_writer);
+            let recovered = service.recover_interrupted_suspend_snapshot_publication(
+                &cache_dir,
+                sandbox,
+                SuspendSnapshotPublicationRecoveryOrigin::TeardownRetry,
+                &verdicts,
+            );
+            (recovered, locks)
+        })
+        .await
+        .map_err(|error| {
+            Status::internal(format!("suspend publication recovery task failed: {error}"))
+        })?;
+        recovered.map_err(|error| {
+            Status::unavailable(format!(
+                "interrupted suspend publication remains deferred: {error}"
+            ))
+        })?;
+        Ok(locks)
     }
 
     fn ensure_teardown_suspend_owner(
