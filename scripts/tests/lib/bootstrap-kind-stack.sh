@@ -968,6 +968,9 @@ bootstrap_kind_stack__prepare_cluster() {
             rm -f "$kind_stack_config"
             return 1
         fi
+        # The add-on images each node image preloads, into the empty
+        # containerd directories the config mounts over them. Never fails.
+        bash "$REPO_ROOT/infra/space/kind/scripts/seed-node-containerd.sh" "$kind_stack_config"
         echo "[bootstrap] kind cluster '$KIND_CLUSTER' not found; creating from $kind_stack_config"
         # Tested in the `if`, not followed by `$?`: a caller running under
         # `set -e` would exit on the failure before the cleanup and the

@@ -212,6 +212,9 @@ else
   # local build.
   log "providing the SPACE Kind node image"
   bash "$KIND_DIR/scripts/kind-node-image.sh" ensure >/dev/null
+  # The config mounts an empty containerd directory over each node image's
+  # preloaded add-on images; copy them in so the kubelets do not pull them.
+  bash "$KIND_DIR/scripts/seed-node-containerd.sh" "$SPACE_KIND_CONFIG"
   log "creating kind cluster '$KIND_CLUSTER' from $SPACE_KIND_CONFIG"
   kind create cluster --name "$KIND_CLUSTER" --config "$SPACE_KIND_CONFIG"
 fi
