@@ -55,7 +55,7 @@ impl Catalog {
                 template_name: TEMPLATE.into(),
                 runtime: "fc".into(),
                 hash: format!("sha256:{}", "a".repeat(64)),
-                tags: vec!["latest".into()],
+                tags: vec!["latest".into(), "stable".into()],
                 org_id,
                 ..Default::default()
             }))

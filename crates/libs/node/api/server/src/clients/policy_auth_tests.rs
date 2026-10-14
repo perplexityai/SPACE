@@ -346,12 +346,21 @@ async fn backend_with_scope(
                 );
             }
             if let Some(scope) = scope {
-                *scope.lock().expect("scope recorder lock") = request.headers()
+                *scope.lock().expect("scope recorder lock") = request
+                    .headers()
                     .get("x-space-template-lookup-scope")
                     .map(|value| value.to_str().expect("ASCII scope header").to_owned());
             }
             calls.fetch_add(1, Ordering::SeqCst);
+            let lookup_scope = request
+                .headers()
+                .get("x-space-template-lookup-scope")
+                .cloned();
             let payload = if request.uri().path().ends_with("/GetTemplate") {
+                assert!(
+                    lookup_scope.is_some(),
+                    "cache probes must carry authenticated scope"
+                );
                 use prost::Message;
                 tmpl::GetTemplateResponse {
                     template: Some(tmpl::TemplateRef {
@@ -373,9 +382,13 @@ async fn backend_with_scope(
                     .to_be_bytes(),
             );
             frame.extend(payload);
-            http::Response::builder()
+            let mut response = http::Response::builder()
                 .header("content-type", "application/grpc")
-                .header("grpc-status", "0")
+                .header("grpc-status", "0");
+            if let Some(scope) = lookup_scope {
+                response = response.header("x-space-template-lookup-scope", scope);
+            }
+            response
                 .body(Body::from(frame))
                 .expect("valid gRPC acknowledgement")
         }

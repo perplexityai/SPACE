@@ -23,7 +23,15 @@ impl TemplateManagerService {
             .get_template_resolving(
                 request,
                 async |name, hash, tag, org| {
-                    crate::volume::find_release_in_scope(name, hash, tag, org, scope).await
+                    // Local cache authority is not a catalog delegation. Online
+                    // resolution still uses this service's authenticated catalog scope.
+                    let catalog_scope = match scope {
+                        Some(TemplateLookupScope::LocalExecution) => {
+                            Some(TemplateLookupScope::Cluster)
+                        }
+                        scope => scope,
+                    };
+                    crate::volume::find_release_in_scope(name, hash, tag, org, catalog_scope).await
                 },
                 async |name, release| {
                     self.volume_puller

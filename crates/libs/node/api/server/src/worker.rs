@@ -1318,11 +1318,12 @@ impl WorkerApi for WorkerApiService {
 
     async fn pull_template(
         &self,
-        r: Request<crate::proto::PullTemplateRequest>,
+        mut r: Request<crate::proto::PullTemplateRequest>,
     ) -> Result<Response<crate::proto::PullTemplateResponse>, Status> {
         pplx_space_common_svc::auth::template_transfer::require_template_transfer_authority(&r)?;
+        let scope = crate::template_lookup::bind_caller_scope(&mut r)?;
         let req = r.into_inner();
-        let resp = crate::transfer::pull_template(&mut self.clients.tmpl(), &req).await?;
+        let resp = crate::transfer::pull_template(&mut self.clients.tmpl(), &req, scope).await?;
         Ok(Response::new(resp))
     }
 
