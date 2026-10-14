@@ -53,10 +53,13 @@ if [ -x "${LOCAL_UV_BIN}" ] && [ "$(uv_version_of "${LOCAL_UV_BIN}")" = "${UV_VE
     exit 0
 fi
 
-# A uv on PATH, such as the CI image's, is used as it is, unless
-# SPACE_UV_VERSION asks for another release.
+# A uv on PATH, such as the CI image's, is used only at the pinned release
+# when CI is set, so a runner whose host uv is another release still runs the
+# pinned one. Elsewhere a uv on PATH is used as it is, unless SPACE_UV_VERSION
+# asks for another release.
 if path_uv="$(command -v uv)" &&
-    { [ -z "${SPACE_UV_VERSION:-}" ] || [ "$(uv_version_of "${path_uv}")" = "${UV_VERSION}" ]; }; then
+    { { [ -z "${CI:-}" ] && [ -z "${SPACE_UV_VERSION:-}" ]; } ||
+        [ "$(uv_version_of "${path_uv}")" = "${UV_VERSION}" ]; }; then
     printf '%s\n' "${path_uv}"
     exit 0
 fi

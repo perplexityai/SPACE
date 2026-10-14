@@ -3,7 +3,8 @@
 # the pinned release only at its checksum, takes it from GitHub when Astral's
 # mirror fails, installs nothing from an archive that fails the checksum,
 # replaces a ci/bin/uv of another release, uses a uv on PATH unless another
-# release is asked for, and refuses a version override without its checksum.
+# release is asked for or, with CI set, it is not the pinned one, and refuses a
+# version override without its checksum.
 set -euo pipefail
 
 SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/ensure-uv.sh"
@@ -85,19 +86,36 @@ fail() {
     FAILURES=$((FAILURES + 1))
 }
 
-# A uv already on PATH, at another release.
+# The script with its default pin moved to the fake release, so a run without
+# SPACE_UV_VERSION can install the pinned release from the fake archive.
+# shellcheck disable=SC2016 # matches the script's own ${SPACE_UV_VERSION:-...}
+PINNED="$(sed -n 's/^UV_VERSION="${SPACE_UV_VERSION:-\([^}]*\)}"$/\1/p' "${SCRIPT}")"
+[ -n "${PINNED}" ] || { echo "FAIL: no default pin in ${SCRIPT}" >&2; exit 1; }
+FAKE_PIN_SCRIPT="${WORK_DIR}/ensure-uv-fake-pin.sh"
+sed -E -e "/^UV_VERSION=/s/:-${PINNED}}\"$/:-${VERSION}}\"/" \
+    -e "s/^( +uv_sha256=)[0-9a-f]{64}$/\1${SHA256}/" "${SCRIPT}" >"${FAKE_PIN_SCRIPT}"
+if ! grep -qF ":-${VERSION}}" "${FAKE_PIN_SCRIPT}" || ! grep -qE "^ +uv_sha256=${SHA256}$" "${FAKE_PIN_SCRIPT}"; then
+    echo "FAIL: could not move the default pin of ${SCRIPT}" >&2
+    exit 1
+fi
+
+# A uv already on PATH, at another release, and one at the default pin.
 mkdir -p "${WORK_DIR}/path-uv"
 printf '#!/usr/bin/env bash\necho "uv 0.0.2"\n' >"${WORK_DIR}/path-uv/uv"
 chmod +x "${WORK_DIR}/path-uv/uv"
+mkdir -p "${WORK_DIR}/path-uv-pinned"
+printf '#!/usr/bin/env bash\necho "uv %s"\n' "${PINNED}" >"${WORK_DIR}/path-uv-pinned/uv"
+chmod +x "${WORK_DIR}/path-uv-pinned/uv"
 
-# run <repo> <body> <down hosts> [VAR=value...]: runs a copy of the script in
-# <repo>, with EXTRA_PATH before its tools, leaving its stdout in out, its
-# stderr in err, and the URLs it fetched in calls, all under WORK_DIR.
+# run <repo> <body> <down hosts> [VAR=value...]: runs a copy of the script, or
+# of SOURCE when set, in <repo>, with EXTRA_PATH before its tools, leaving its
+# stdout in out, its stderr in err, and the URLs it fetched in calls, all under
+# WORK_DIR.
 run() {
     local repo="$1" body="$2" down="$3"
     shift 3
     mkdir -p "${repo}/ci/scripts"
-    cp "${SCRIPT}" "${repo}/ci/scripts/ensure-uv.sh"
+    cp "${SOURCE:-${SCRIPT}}" "${repo}/ci/scripts/ensure-uv.sh"
     : >"${WORK_DIR}/calls"
     env -i HOME="${WORK_DIR}" PATH="${EXTRA_PATH:+${EXTRA_PATH}:}${WORK_DIR}/bin:${WORK_DIR}/tools" \
         FAKE_CALLS="${WORK_DIR}/calls" FAKE_BODY="${body}" FAKE_DOWN_HOSTS="${down}" \
@@ -134,11 +152,29 @@ run "${repo}" "${WORK_DIR}/uv.tar.gz" "" SPACE_UV_VERSION="${VERSION}" SPACE_UV_
     fail "replacing another release exited nonzero"
 [ "$("${repo}/ci/bin/uv" --version)" = "uv ${VERSION}" ] || fail "ci/bin/uv of another release was kept"
 
-# Without a version override, a uv on PATH is used as it is.
-EXTRA_PATH="${WORK_DIR}/path-uv" run "${WORK_DIR}/repo-path" "${WORK_DIR}/uv.tar.gz" "" ||
+# Without CI or a version override, a uv on PATH at another release is used
+# as it is.
+SOURCE="${FAKE_PIN_SCRIPT}" EXTRA_PATH="${WORK_DIR}/path-uv" run "${WORK_DIR}/repo-path" "${WORK_DIR}/uv.tar.gz" "" ||
     fail "a uv on PATH was not accepted"
 [ "$(cat "${WORK_DIR}/out")" = "${WORK_DIR}/path-uv/uv" ] || fail "printed $(cat "${WORK_DIR}/out"), not the uv on PATH"
 [ ! -s "${WORK_DIR}/calls" ] || fail "a uv on PATH still downloaded $(cat "${WORK_DIR}/calls")"
+
+# With CI set, a uv on PATH at another release is passed over and the pinned
+# release is installed.
+repo="${WORK_DIR}/repo-ci"
+SOURCE="${FAKE_PIN_SCRIPT}" EXTRA_PATH="${WORK_DIR}/path-uv" run "${repo}" "${WORK_DIR}/uv.tar.gz" "" CI=true ||
+    fail "CI with a uv on PATH at another release exited nonzero: $(cat "${WORK_DIR}/err")"
+[ "$(cat "${WORK_DIR}/out")" = "${repo}/ci/bin/uv" ] ||
+    fail "CI printed $(cat "${WORK_DIR}/out"), not the pinned release in ci/bin"
+[ -x "${repo}/ci/bin/uv" ] && [ "$("${repo}/ci/bin/uv" --version)" = "uv ${VERSION}" ] ||
+    fail "CI did not install the pinned release"
+
+# With CI set, a uv on PATH at the pinned release is used without a download.
+EXTRA_PATH="${WORK_DIR}/path-uv-pinned" run "${WORK_DIR}/repo-ci-pinned" "${WORK_DIR}/uv.tar.gz" "" CI=true ||
+    fail "CI with the pinned uv on PATH exited nonzero: $(cat "${WORK_DIR}/err")"
+[ "$(cat "${WORK_DIR}/out")" = "${WORK_DIR}/path-uv-pinned/uv" ] ||
+    fail "CI printed $(cat "${WORK_DIR}/out"), not the pinned uv on PATH"
+[ ! -s "${WORK_DIR}/calls" ] || fail "CI with the pinned uv on PATH downloaded $(cat "${WORK_DIR}/calls")"
 
 # An override for another release passes over a uv on PATH at a different
 # one and installs the release asked for.

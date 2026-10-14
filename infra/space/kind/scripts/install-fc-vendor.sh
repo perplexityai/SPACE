@@ -57,6 +57,7 @@ IMAGE_VENDOR_ROOT="${SPACE_IMAGE_VENDOR_ROOT:-/opt/space/vendor}"
 
 log() { printf '[install-fc-vendor] %s\n' "$*"; }
 die() { printf '[install-fc-vendor] ERROR: %s\n' "$*" >&2; exit 1; }
+warn() { printf '[install-fc-vendor] WARNING: %s\n' "$*" >&2; }
 
 require_bin() {
   for bin in "$@"; do
@@ -325,7 +326,10 @@ download_kernel() {
 }
 
 if kernel_current; then
-  printf '%s %s\n' "$KERNEL_SHA256" "$(kernel_fingerprint "$kernel_dir/vmlinux.bin")" >"$kernel_stamp"
+  # The kernel is verified, so a stamp that cannot be refreshed costs only a
+  # hash on the next run, not this one.
+  printf '%s %s\n' "$KERNEL_SHA256" "$(kernel_fingerprint "$kernel_dir/vmlinux.bin")" >"$kernel_stamp" \
+    || warn "could not refresh $kernel_stamp; the next run hashes $kernel_dir/vmlinux.bin again"
   log "vmlinux already present at $kernel_dir/vmlinux.bin (sha256 $KERNEL_SHA256)"
 else
   if [[ -e "$kernel_dir/vmlinux.bin" ]]; then

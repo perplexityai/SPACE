@@ -1855,6 +1855,23 @@ class InstallerAgreementTests(unittest.TestCase):
         self.assertTrue((self.kernel_dir / ".vmlinux.bin.sha256").is_dir())
         self.assertEqual(self.run_installer("--check")[0].returncode, 0)
 
+    def test_a_failed_stamp_refresh_of_a_present_kernel_only_warns(self) -> None:
+        # A directory where the stamp goes: the present kernel is verified by
+        # hashing it, and refreshing the stamp then fails.
+        self.install()
+        stamp = self.kernel_dir / ".vmlinux.bin.sha256"
+        stamp.unlink()
+        stamp.mkdir()
+
+        result, calls = self.run_installer()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("WARNING: could not refresh", result.stderr)
+        self.assertIn("the next run hashes", result.stderr)
+        self.assertIn("vmlinux already present", result.stdout)
+        self.assertEqual(calls, [])
+        self.assertEqual((self.kernel_dir / "vmlinux.bin").read_bytes(), FAKE_KERNEL)
+
     def test_installers_sharing_a_root_never_stamp_the_other_ones_kernel(self) -> None:
         """Two pins at once: one installer replaces the kernel between the other's rename and stamp.
 
