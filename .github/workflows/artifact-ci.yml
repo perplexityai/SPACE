@@ -71,7 +71,9 @@ jobs:
       # kind, rather than in the Actions cache, whose size limit evicted them
       # and other jobs' entries. Only main writes them; any other run reuses
       # main's layers without spending minutes exporting layers no later run
-      # reads. A missing or unreachable cache only makes the build cold.
+      # reads. A missing, unreachable or damaged cache only makes the build
+      # cold. When two main runs overlap, the older may write last; the next
+      # main push rewrites it, so that costs one push's changed layers once.
       SPACE_BUNDLE_CACHE: >-
         ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' &&
         'enabled' || 'read-only' }}
@@ -130,6 +132,32 @@ jobs:
         # on the host after the push credentials exist. BuildKit is pinned by
         # digest in the script, which takes it from the image mirror first.
         run: python3 ci/scripts/run-space-bundle-builds.py "${FEATURE}"
+
+  # Only the bundle builds' cache package is pruned, never release images.
+  # Every main push leaves the previous version of each feature's image and
+  # Rust tags untagged; keep the newest twelve, about one push's worth, for
+  # readers still pulling an older manifest. A reader whose version is pruned
+  # mid-build rebuilds without the cache. This never runs outside a main push.
+  prune_bundle_cache:
+    if: >-
+      ${{ !cancelled() && github.repository == 'perplexityai/SPACE' &&
+      github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    name: Prune superseded bundle layer caches
+    needs: bundle_images
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      packages: write
+    steps:
+      - name: Retain twelve superseded cache versions
+        continue-on-error: true
+        uses: actions/delete-package-versions@e5bc658cc4c965c472efe991f8beea3981499c55 # v5
+        with:
+          owner: perplexityai
+          package-name: space-bundle-cache
+          package-type: container
+          delete-only-untagged-versions: 'true'
+          min-versions-to-keep: 12
 
   shim_artifact:
     if: github.repository == 'perplexityai/SPACE'

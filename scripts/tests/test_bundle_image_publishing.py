@@ -421,37 +421,69 @@ class RegistryCacheTests(unittest.TestCase):
             ("outside GitHub Actions", {"GITHUB_ACTIONS": ""}),
         ):
             env = {**github_main_env(), **change}
-            with self.subTest(name), self.assertRaises(SystemExit):
+            with (
+                self.subTest(name),
+                self.assertRaisesRegex(SystemExit, "Only main push CI in perplexityai/SPACE"),
+            ):
                 self.build_image(env, FakeRegistry([]))
 
     def test_the_cache_repository_must_be_untagged(self) -> None:
         for value in (f"{CACHE_REPOSITORY}:latest", f"{CACHE_REPOSITORY}@sha256:{'a' * 64}", "Ghcr.io/x/y", "cache"):
             env = {**github_dispatch_env(), "SPACE_BUNDLE_CACHE_REPOSITORY": value}
-            with self.subTest(value), self.assertRaises(SystemExit):
+            with (
+                self.subTest(value),
+                self.assertRaisesRegex(SystemExit, "Invalid SPACE_BUNDLE_CACHE_REPOSITORY"),
+            ):
                 self.build_image(env, FakeRegistry([]))
 
-    def test_rust_dependencies_are_cached_once_per_content(self) -> None:
-        with mock.patch.dict(os.environ, github_main_env(), clear=True):
+    def rust_cache_options(self, env: dict[str, str], tags: list[str], digest: str = "a" * 64):
+        registry = FakeRegistry(tags)
+        with mock.patch.dict(os.environ, env, clear=True):
             builder = bundle_builds.BundleBuilder(["data-plane"])
-            tag = f"data-plane-{builder.rust_dependency_cache_tag('data-plane')}"
-        ref = f"{CACHE_REPOSITORY}:{tag}"
-        for name, tags, cache_from, cache_to in (
-            ("missing", [], [], [f"type=registry,ref={ref}{self.CACHE_TO_SUFFIX}"]),
-            ("present", [tag], [f"type=registry,ref={ref}"], []),
+            command: list[str] = []
+            with (
+                mock.patch.object(builder, "rust_dependency_digest", return_value=digest),
+                mock.patch.object(bundle_builds, "registry_ref_exists", side_effect=registry.exists),
+                mock.patch.object(builder, "image_tag_exists") as ecr_lookup,
+            ):
+                builder.append_rust_dependency_cache(command, "data-plane")
+        ecr_lookup.assert_not_called()
+        return option_values(command, "--cache-from"), option_values(command, "--cache-to")
+
+    def test_main_refreshes_one_rolling_rust_cache(self) -> None:
+        ref = f"{CACHE_REPOSITORY}:data-plane-buildcache-rust"
+        for name, tags, cache_from in (
+            ("missing", [], []),
+            ("present", ["data-plane-buildcache-rust"], [f"type=registry,ref={ref}"]),
         ):
-            registry = FakeRegistry(tags)
+            with self.subTest(name):
+                self.assertEqual(
+                    self.rust_cache_options(github_main_env(), tags),
+                    (cache_from, [f"type=registry,ref={ref}{self.CACHE_TO_SUFFIX}"]),
+                )
+
+    def test_a_dependency_change_still_imports_the_previous_rust_layers(self) -> None:
+        tags = ["data-plane-buildcache-rust"]
+        before = self.rust_cache_options(github_dispatch_env(), tags, digest="a" * 64)
+        after = self.rust_cache_options(github_dispatch_env(), tags, digest="b" * 64)
+
+        self.assertEqual(before, after)
+        self.assertEqual(
+            after, ([f"type=registry,ref={CACHE_REPOSITORY}:data-plane-buildcache-rust"], [])
+        )
+
+    def test_a_main_build_warns_when_its_cache_was_not_written(self) -> None:
+        command = ["--cache-to", f"type=registry,ref={CACHE_REPOSITORY}:ui-buildcache-image"]
+        for name, written, warned in (("written", True, False), ("missing", False, True)):
             with (
                 self.subTest(name),
                 mock.patch.dict(os.environ, github_main_env(), clear=True),
+                mock.patch.object(bundle_builds, "registry_ref_exists", return_value=written),
+                mock.patch("builtins.print") as printed,
             ):
-                builder = bundle_builds.BundleBuilder(["data-plane"])
-                command: list[str] = []
-                with mock.patch.object(
-                    bundle_builds, "registry_ref_exists", side_effect=registry.exists
-                ):
-                    builder.append_rust_dependency_cache(command, "data-plane")
-                self.assertEqual(option_values(command, "--cache-from"), cache_from)
-                self.assertEqual(option_values(command, "--cache-to"), cache_to)
+                bundle_builds.BundleBuilder(["ui"]).check_cache_written(command, "ui", "image")
+            messages = [str(call.args[0]) for call in printed.call_args_list]
+            self.assertEqual(any(m.startswith("::warning::") for m in messages), warned)
 
     def test_an_unreachable_registry_is_a_cache_miss(self) -> None:
         for name, outcome in (
@@ -506,6 +538,26 @@ class EcrLoginRetryTests(unittest.TestCase):
         with self.assertRaises(subprocess.CalledProcessError):
             self.log_in([(1, refused), (0, "")])
 
+    def test_a_hung_call_is_a_failed_attempt(self) -> None:
+        hung = subprocess.TimeoutExpired(["docker", "login"], 30)
+        outcomes = [hung, subprocess.CompletedProcess([], 0, "", "")]
+
+        def fake_run(args, **kwargs):
+            self.assertEqual(kwargs["timeout"], bundle_builds.REGISTRY_COMMAND_TIMEOUT_SECONDS)
+            outcome = outcomes.pop(0)
+            if isinstance(outcome, BaseException):
+                raise outcome
+            return outcome
+
+        with (
+            mock.patch.object(bundle_builds, "run", side_effect=fake_run),
+            mock.patch.object(bundle_builds.time, "sleep") as sleep,
+        ):
+            bundle_builds.run_registry_command(["docker", "login"], description="Logging in")
+
+        self.assertEqual(outcomes, [])
+        sleep.assert_called_once_with(bundle_builds.ECR_LOGIN_INITIAL_DELAY_SECONDS)
+
     def test_retries_are_bounded(self) -> None:
         attempts = bundle_builds.ECR_LOGIN_MAX_ATTEMPTS
         with self.assertRaises(SystemExit) as raised:
@@ -515,9 +567,18 @@ class EcrLoginRetryTests(unittest.TestCase):
 
 
 class BuildxPushRetryTests(unittest.TestCase):
-    """Runs a stand-in for `docker buildx build` that fails until its attempts run out."""
+    """Runs a stand-in for `docker buildx build` that fails `failures` times,
+    or for as long as its arguments carry an external cache with `cache_error`."""
 
-    def run_buildx(self, error: str, failures: int):
+    def run_buildx(
+        self,
+        error: str,
+        failures: int,
+        *,
+        cache_error: str = "",
+        args: tuple = (),
+        published=None,
+    ):
         with tempfile.TemporaryDirectory() as tmp_dir:
             count = Path(tmp_dir) / "count"
             script = (
@@ -525,6 +586,9 @@ class BuildxPushRetryTests(unittest.TestCase):
                 f"count = pathlib.Path({str(count)!r})\n"
                 "attempt = int(count.read_text()) + 1 if count.exists() else 1\n"
                 "count.write_text(str(attempt))\n"
+                f"if {cache_error!r} and '--cache-from' in sys.argv:\n"
+                f"    sys.stderr.write({cache_error!r} + '\\n')\n"
+                "    sys.exit(1)\n"
                 f"if attempt <= {failures}:\n"
                 f"    sys.stderr.write({error!r} + '\\n')\n"
                 "    sys.exit(1)\n"
@@ -534,7 +598,9 @@ class BuildxPushRetryTests(unittest.TestCase):
                 mock.patch.object(sys, "stderr", new=tempfile.TemporaryFile("w+")),
             ):
                 try:
-                    bundle_builds.run_buildx_command([sys.executable, "-c", script])
+                    bundle_builds.run_buildx_command(
+                        [sys.executable, "-c", script, *args], published=published
+                    )
                 finally:
                     attempts = int(count.read_text())
         return attempts
@@ -554,6 +620,43 @@ class BuildxPushRetryTests(unittest.TestCase):
         )
         with self.assertRaises(subprocess.CalledProcessError):
             self.run_buildx(error, failures=1)
+
+    def test_a_push_that_reached_the_registry_is_not_repeated(self) -> None:
+        error = (
+            f"ERROR: failed to solve: failed to push {REGISTRY}/space/ui:{A}: "
+            "unexpected status: 502 Bad Gateway"
+        )
+
+        self.assertEqual(self.run_buildx(error, failures=5, published=lambda: True), 1)
+
+    def test_paths_in_the_command_are_accepted(self) -> None:
+        self.assertEqual(self.run_buildx("", failures=0, args=(Path("/context"),)), 1)
+
+    CACHE_FETCH_ERROR = (
+        "ERROR: failed to build: failed to solve: failed to copy: httpReadSeeker: "
+        f"failed open: could not fetch content descriptor sha256:{'c' * 64} "
+        "(application/vnd.oci.image.layer.v1.tar+gzip) from remote: not found"
+    )
+    CACHE_ARGS = (
+        "--cache-from", f"type=registry,ref={CACHE_REPOSITORY}:ui-buildcache-image",
+        "--cache-to", f"type=registry,ref={CACHE_REPOSITORY}:ui-buildcache-image,mode=max",
+    )
+
+    def test_a_damaged_cache_falls_back_to_a_build_without_it(self) -> None:
+        attempts = self.run_buildx(
+            "", failures=0, cache_error=self.CACHE_FETCH_ERROR, args=self.CACHE_ARGS
+        )
+
+        self.assertEqual(attempts, 2)
+
+    def test_a_fetch_failure_without_an_external_cache_still_fails(self) -> None:
+        with self.assertRaises(subprocess.CalledProcessError):
+            self.run_buildx(self.CACHE_FETCH_ERROR, failures=1)
+
+    def test_a_failed_build_step_with_a_cache_still_fails(self) -> None:
+        error = 'ERROR: failed to build: failed to solve: process "/bin/sh -c false" did not complete successfully: exit code: 1'
+        with self.assertRaises(subprocess.CalledProcessError):
+            self.run_buildx(error, failures=1, args=self.CACHE_ARGS)
 
     def test_a_failed_build_step_is_not_retried(self) -> None:
         error = "ERROR: failed to solve: process \"/bin/sh -c apt-get update\" did not complete successfully: exit code: 100"
@@ -619,6 +722,32 @@ class BuildkitMirrorTests(unittest.TestCase):
 
         self.assertEqual(self.builder.buildx_builder_name, "")
         self.assertTrue(self.builder.disable_external_cache)
+
+    def test_a_stalled_mirror_pull_moves_on_to_the_source(self) -> None:
+        env = {**github_main_env(), "SPACE_CI_IMAGE_MIRROR": "ghcr"}
+        images: list[str] = []
+
+        def fake_run(args, **kwargs):
+            args = list(args)
+            self.assertIsNotNone(kwargs.get("timeout"))
+            if args[:3] == ["docker", "buildx", "create"]:
+                images.append(args[args.index("--driver-opt") + 1].removeprefix("image="))
+            if args[:3] == ["docker", "buildx", "inspect"] and images[-1] == self.MIRRORED:
+                raise subprocess.TimeoutExpired(args, kwargs["timeout"])
+            return subprocess.CompletedProcess(args, 0, "", "")
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            listing = Path(tmp_dir) / "mirrored-images.txt"
+            listing.write_text(
+                f"{bundle_builds.BUILDKIT_IMAGE} {self.MIRROR_DIGEST} ghcr.io/example/mirror:buildkit\n"
+            )
+            with mock.patch.dict(os.environ, {**env, "SPACE_MIRRORED_IMAGES": str(listing)}, clear=True):
+                builder = bundle_builds.BundleBuilder(["ui"])
+                with mock.patch.object(bundle_builds, "run", side_effect=fake_run):
+                    builder.setup_buildx_builder()
+
+        self.assertEqual(images, [self.MIRRORED, bundle_builds.BUILDKIT_IMAGE])
+        self.assertTrue(builder.buildx_builder_name)
 
     def test_builds_outside_github_ci_use_the_source(self) -> None:
         self.assertEqual(
