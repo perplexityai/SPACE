@@ -63,6 +63,56 @@ spec:
         # supervisor yet, and the init below starts it with this file.
         - name: kind-node-env
           {{- include "space-node-service.image" . | nindent 10 }}
+          {{- if (include "space-kind-telemetry.observability" . | fromJson).enabled }}
+          # global.observability (space-kind-telemetry README): the node's
+          # bootstrap may own other lines of space.env, so this replaces only
+          # the names any mode sets and keeps the rest. It also writes the
+          # same settings, shell-quoted, to shim-telemetry.env for a shim
+          # wrapper to read at each shim start.
+          command:
+            - /bin/bash
+            - -ec
+            - |
+              env_file=/space/config/space.env
+              shim_file=/space/config/shim-telemetry.env
+              owned=" {{ include "space-kind-telemetry.ownedEnvNames" . }} "
+              current=(SPACE_CLUSTER_ID SPACE_K8S_NODE_NAME {{ include "space-kind-telemetry.envNames" . }})
+              kept=
+              if [[ -f $env_file ]]; then
+                while IFS= read -r line || [[ -n $line ]]; do
+                  name=${line%%=*}
+                  if [[ $line == *=* && $owned == *" $name "* ]]; then continue; fi
+                  kept+="$line"$'\n'
+                done <"$env_file"
+              fi
+              written="$kept$(for name in "${current[@]}"; do printf '%s=%s\n' "$name" "${!name}"; done)"
+              shim=$(
+                for name in "${current[@]}"; do
+                  if [[ ${!name} == *"'"* || ${!name} == *$'\n'* ]]; then
+                    echo "node-env: $name is not representable in $shim_file" >&2; exit 1
+                  fi
+                  printf "export %s='%s'\n" "$name" "${!name}"
+                done
+              )
+              if [[ ! -f $shim_file || "$(<"$shim_file")" != "$shim" ]]; then
+                printf '%s\n' "$shim" >"$shim_file.tmp"
+                chmod 0600 "$shim_file.tmp"
+                mv -f "$shim_file.tmp" "$shim_file"
+                echo "node-env: wrote $shim_file"
+              fi
+              if [[ -f $env_file && "$(<"$env_file")" == "$written" ]]; then
+                echo "node-env: $env_file unchanged"
+                exit 0
+              fi
+              printf '%s\n' "$written" >"$env_file.tmp"
+              chmod 0600 "$env_file.tmp"
+              mv -f "$env_file.tmp" "$env_file"
+              echo "node-env: wrote $env_file"
+              if [[ -d /space/run/runtime-supervisor ]]; then
+                touch /space/run/runtime-supervisor/restart-required
+                echo "node-env: marked runtime-supervisor for restart"
+              fi
+          {{- else }}
           command:
             - /bin/bash
             - -ec
@@ -98,6 +148,7 @@ spec:
                 touch /space/run/runtime-supervisor/restart-required
                 echo "kind-node-env: marked runtime-supervisor for restart"
               fi
+          {{- end }}
           # Root for the root-owned node paths it writes, and nothing more.
           securityContext:
             runAsUser: 0
@@ -115,10 +166,12 @@ spec:
                 fieldRef:
                   fieldPath: spec.nodeName
             {{- include "space-kind-telemetry.env" . | nindent 12 }}
+            {{- if not (include "space-kind-telemetry.observability" . | fromJson).enabled }}
             - name: NODE_OTLP_METRICS_ENDPOINT
               value: {{ .Values.telemetry.nodeOtlpMetricsEndpoint | quote }}
             - name: NODE_OTLP_TRACES_ENDPOINT
               value: {{ .Values.telemetry.nodeOtlpTracesEndpoint | quote }}
+            {{- end }}
           volumeMounts:
             - name: space-config
               mountPath: /space/config

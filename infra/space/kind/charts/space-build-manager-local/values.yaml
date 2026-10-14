@@ -34,7 +34,8 @@ terminationGracePeriodSeconds: 7500
 
 # Overrides SPACE_TRACE_EXPORTER for build-manager. Kept off on the local
 # bench: recipe descriptions omit user inputs, but other build failures can
-# still contain guest output. Empty leaves the normal resolution in place.
+# still contain guest output. An explicit empty string leaves the normal
+# resolution in place; null and bare YAML off keep traces disabled.
 traceExporter: "off"
 
 blob:

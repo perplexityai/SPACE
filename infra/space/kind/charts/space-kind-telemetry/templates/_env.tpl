@@ -1,10 +1,10 @@
 {{/*
 Workload identity and exporter inputs for one SPACE container.
 
-Two input paths, chosen by whether `global.observability` exists:
+Two input paths, chosen by whether `global.observability` is set:
 
-- Absent (every Kind bring-up): the Kind profile's `telemetry` values, below in
-  `space-kind-telemetry.env.kind`, exactly as before.
+- Absent or null (every Kind bring-up): the Kind profile's `telemetry` values,
+  below in `space-kind-telemetry.env.kind`, exactly as before.
 - Present: the cluster path, `space-kind-telemetry.env.cluster`, driven only by
   `global.observability` (README). Of the `telemetry` values only `version`
   and a trace-exporter veto (`traceExporter: off`) apply there.
@@ -70,12 +70,12 @@ Context: the chart root, or any dict whose `Values` carries `telemetry`,
 
 {{/*
 `global.observability` validated, with defaults applied, as JSON. `enabled` is
-false when the key is absent. Fails the render on any value a producer would
-reject or misroute, so a bad setting never reaches an install.
+false when the key is absent or null. Fails the render on any value a producer
+would reject or misroute, so a bad setting never reaches an install.
 */}}
 {{- define "space-kind-telemetry.observability" -}}
 {{- $global := .Values.global | default dict -}}
-{{- if not (hasKey $global "observability") -}}
+{{- if or (not (hasKey $global "observability")) (kindIs "invalid" $global.observability) -}}
 {{- dict "enabled" false | toJson -}}
 {{- else -}}
 {{- $in := $global.observability -}}
@@ -116,6 +116,11 @@ reject or misroute, so a bad setting never reaches an install.
 {{- end -}}
 {{- $_ := set $ports $path (atoi $text) -}}
 {{- end -}}
+{{- /* The shim and host sidecars in the current producer images use 8126.
+       Do not advertise a port override that only reaches pod exporters. */ -}}
+{{- if and (eq $mode "datadog") (ne (get $ports "datadog.apmPort") 8126) -}}
+{{- fail "global.observability.datadog.apmPort must be 8126 until all host producers support a configurable APM port" -}}
+{{- end -}}
 {{- /* The Rust metrics sink and the shim export OTLP over gRPC only
        (crates/libs/observability/src/sink/otlp.rs, shim/otlp.go). */ -}}
 {{- if ne (toString $o.otlp.protocol) "grpc" -}}
@@ -143,7 +148,7 @@ Cluster path. One mode for every signal:
   off      SPACE_METRICS_SINK and SPACE_TRACE_EXPORTER off, DD_TRACE_ENABLED
            false, no Agent address and no endpoint.
   datadog  The Datadog sinks, to the Agent on the pod's node (status.hostIP)
-           at the configured DogStatsD and APM ports.
+           at the configured DogStatsD port and APM port 8126.
   otlp     OTLP/gRPC to a Collector on the pod's node,
            http://$(NODE_IP):<nodeLocalPort>, with cumulative metric
            temporality for the Rust services. NODE_IP precedes the endpoints
@@ -163,12 +168,20 @@ metrics follow the mode.
 {{- $chartTrace := .Values.telemetry.traceExporter -}}
 {{- $traceOff := or (eq $o.mode "off") (eq (toString $chartTrace) "off") (and (kindIs "bool" $chartTrace) (not $chartTrace)) -}}
 {{- $traces := ternary "off" $o.mode $traceOff -}}
+{{- $attributes := list -}}
+{{- with $o.environment -}}{{- $attributes = append $attributes (printf "deployment.environment.name=%s" .) -}}{{- end -}}
+{{- with $version -}}{{- $attributes = append $attributes (printf "service.version=%s" .) -}}{{- end -}}
+{{- with $o.cluster -}}{{- $attributes = append $attributes (printf "k8s.cluster.name=%s" .) -}}{{- end -}}
+{{- with $o.environment }}
 - name: SPACE_ENV
-  value: {{ $o.environment | quote }}
+  value: {{ . | quote }}
+{{- end }}
 - name: SPACE_VERSION
   value: {{ $version | quote }}
+{{- if $attributes }}
 - name: OTEL_RESOURCE_ATTRIBUTES
-  value: {{ printf "deployment.environment.name=%s,service.version=%s,k8s.cluster.name=%s" $o.environment $version $o.cluster | quote }}
+  value: {{ join "," $attributes | quote }}
+{{- end }}
 - name: SPACE_METRICS_SINK
   value: {{ $o.mode | quote }}
 - name: SPACE_TRACE_EXPORTER
@@ -233,6 +246,32 @@ input to the endpoints, not a producer setting, and is left out.
 {{- end -}}
 {{- end -}}
 {{- join " " $names -}}
+{{- end -}}
+
+{{/*
+Every name a host environment writer owns on the global.observability path:
+the names `space-kind-telemetry.env` sets in any mode (with a trace sampler),
+plus the Kind profile's endpoint names, so switching mode clears what the
+previous one wrote. Space-separated.
+*/}}
+{{- define "space-kind-telemetry.ownedEnvNames" -}}
+{{- $names := list "SPACE_CLUSTER_ID" "SPACE_K8S_NODE_NAME" "DD_TRACE_AGENT_PORT" "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT" "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT" "OTEL_TRACES_SAMPLER" -}}
+{{- range $mode := list "off" "datadog" "otlp" -}}
+{{- $v := deepCopy $.Values -}}
+{{- /* Names only: a placeholder identity keeps mode off valid without one. */ -}}
+{{- $o := mergeOverwrite (dict "environment" "names" "cluster" "names") (deepCopy $v.global.observability) (dict "mode" $mode) -}}
+{{- if not $o.environment -}}{{- $_ := set $o "environment" "names" -}}{{- end -}}
+{{- if not $o.cluster -}}{{- $_ := set $o "cluster" "names" -}}{{- end -}}
+{{- /* Enumerating names must not activate an unused APM override in off/otlp. */ -}}
+{{- $_ := set $o "datadog" (mergeOverwrite (deepCopy ($o.datadog | default dict)) (dict "apmPort" 8126)) -}}
+{{- $_ := set $o "otlp" (mergeOverwrite (deepCopy ($o.otlp | default dict)) (dict "traceSampler" "always_on")) -}}
+{{- $_ = set $v.global "observability" $o -}}
+{{- $_ = set $v "telemetry" (mergeOverwrite (deepCopy ($v.telemetry | default dict)) (dict "traceExporter" "")) -}}
+{{- range (splitList " " (include "space-kind-telemetry.envNames" (dict "Values" $v))) -}}
+{{- $names = append $names . -}}
+{{- end -}}
+{{- end -}}
+{{- join " " (uniq $names) -}}
 {{- end -}}
 
 {{/* The profile owns only SPACE workload collection, not a foreign Agent. */}}

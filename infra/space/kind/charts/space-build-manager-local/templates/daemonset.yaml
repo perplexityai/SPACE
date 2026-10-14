@@ -5,9 +5,19 @@
 {{- if le (int .Values.terminationGracePeriodSeconds) (int .Values.drainTimeoutSeconds) -}}
 {{- fail "terminationGracePeriodSeconds must exceed drainTimeoutSeconds" -}}
 {{- end -}}
-{{- /* build-manager's own trace exporter override, on a copy of the values
-       the shared telemetry environment reads. */ -}}
-{{- $envCtx := dict "Values" (mergeOverwrite (deepCopy .Values) (dict "telemetry" (dict "traceExporter" (.Values.traceExporter | default .Values.telemetry.traceExporter)))) -}}
+{{- /* Preserve the explicit trace veto: YAML reads bare off as false, which
+       `default` would discard. Null must not remove the safe default either;
+       only an explicit empty string asks for the shared selector. */ -}}
+{{- $traceExporter := "off" -}}
+{{- if hasKey .Values "traceExporter" -}}
+{{- $traceExporter = .Values.traceExporter -}}
+{{- if or (kindIs "invalid" $traceExporter) (and (kindIs "bool" $traceExporter) (not $traceExporter)) -}}
+{{- $traceExporter = "off" -}}
+{{- else if eq (toString $traceExporter) "" -}}
+{{- $traceExporter = .Values.telemetry.traceExporter -}}
+{{- end -}}
+{{- end -}}
+{{- $envCtx := dict "Values" (mergeOverwrite (deepCopy .Values) (dict "telemetry" (dict "traceExporter" $traceExporter))) -}}
 {{- $db := "/space/run/build-manager/build-manager.db" -}}
 {{- include "space-node-service.serviceAccount" $ctx }}
 ---
