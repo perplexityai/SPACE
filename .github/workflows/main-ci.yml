@@ -168,7 +168,12 @@ jobs:
     name: Build and QEMU-smoke guest kernel
     needs: guest_kernel_inputs
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
+    # A marker hit takes a minute and a cold build about 30. The worst case
+    # with Docker Hub and snapshot.ubuntu.com working, GHCR answering manifests
+    # but stalling every download, costs about 147 minutes: each deadline in
+    # ci.sh runs out once, then the kernel and smoke images build cold. The
+    # budget is itemized in templates/firecracker/kernel/ci.sh.
+    timeout-minutes: 180
     concurrency:
       group: guest-kernel-${{ needs.guest_kernel_inputs.outputs.hash }}
       cancel-in-progress: false

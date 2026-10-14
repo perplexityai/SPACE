@@ -6,7 +6,8 @@
 # never fails the check; the builder starts from the mirrored BuildKit image,
 # else its source, else Docker's own builder; a build that fails fetching from
 # the mirror or the cache, or stalls importing the cache, runs once more without
-# them; and the input hash covers each file's executable bit.
+# them, as does the rest of the run; and the input hash covers each file's
+# executable bit.
 set -euo pipefail
 
 KERNEL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../templates/firecracker/kernel" && pwd)"
@@ -26,10 +27,12 @@ cat >"${WORK_DIR}/bin/docker" <<'SH'
 # The registry's references are the lines of FAKE_REGISTRY, the builders those
 # of FAKE_BUILDERS ("<name> <image>"). FAKE_LOOKUP_ERROR is the error of every
 # lookup; FAKE_STALL lists the operations that never answer (lookup, export,
-# push, cached-build); FAKE_BAD_BUILDKIT lists BuildKit images that do not
-# start. FAKE_BUILD_FAILS fails the kernel build in its own step,
-# FAKE_FETCH_FAILS fails each build that uses the mirror or the cache, and
-# FAKE_EXPORT_DROPS makes cache exports succeed without writing the tag.
+# push, and external-build: any build that uses the mirror or the cache); FAKE_BAD_BUILDKIT lists BuildKit
+# images that do not start. FAKE_BUILD_FAILS fails the kernel build in its own
+# step, after an earlier error line that reads like a fetch failure;
+# FAKE_FETCH_FAILS fails each build that uses the mirror or the cache;
+# FAKE_EXPORT_FAILS fails cache exports, and FAKE_EXPORT_DROPS makes them
+# succeed without writing the tag.
 printf '%s\n' "$*" >>"${FAKE_CALLS}"
 stalls() { [[ " ${FAKE_STALL:-} " == *" $1 "* ]]; }
 # option <name> <args>...: prints the value of --name=value or --name value.
@@ -68,6 +71,12 @@ case "$1 ${2:-} ${3:-}" in
         cache_to="$(option --cache-to "$@")"
         if [ -n "${cache_to}" ]; then
             ! stalls export || exec sleep 30
+            # As BuildKit does, ignore-error=true turns a failed export into success.
+            if [ -n "${FAKE_EXPORT_FAILS:-}" ]; then
+                [[ "${cache_to}" == *ignore-error=true* ]] && exit 0
+                echo "ERROR: failed to push cache" >&2
+                exit 1
+            fi
             [ -n "${FAKE_EXPORT_DROPS:-}" ] || { ref="${cache_to#*ref=}"; printf '%s\n' "${ref%%,*}" >>"${FAKE_REGISTRY}"; }
         fi
         ;;
@@ -78,7 +87,7 @@ case "$1 ${2:-} ${3:-}" in
         ;;
     "build "*)
         if external "$@"; then
-            [[ " $* " != *" --cache-from="* ]] || ! stalls cached-build || exec sleep 30
+            ! stalls external-build || exec sleep 30
             if [ -n "${FAKE_FETCH_FAILS:-}" ]; then
                 echo "ERROR: failed to build: failed to solve: failed to copy: httpReadSeeker: failed open: unexpected status code 502 Bad Gateway" >&2
                 exit 1
@@ -86,6 +95,7 @@ case "$1 ${2:-} ${3:-}" in
         fi
         if [[ " $* " == *" --target export "* ]]; then
             if [ -n "${FAKE_BUILD_FAILS:-}" ]; then
+                echo "ERROR: failed to do request: an earlier, recovered fetch" >&2
                 echo 'ERROR: failed to build: failed to solve: process "/bin/sh -c ./build-kernel.sh" did not complete successfully: exit code: 2' >&2
                 exit 1
             fi
@@ -161,7 +171,7 @@ MIRRORS="${MIRROR}"$'\n'"${BUILDKIT_MIRROR}"
 # A copy of the directory in its own repository, to change a file's mode.
 copy="${WORK_DIR}/repo/templates/firecracker/kernel"
 mkdir -p "${copy}"
-cp -p "${KERNEL_DIR}"/* "${KERNEL_DIR}/.gitignore" "${copy}/"
+git -C "${KERNEL_DIR}" ls-files | while IFS= read -r file; do cp -p "${KERNEL_DIR}/${file}" "${copy}/"; done
 git -C "${WORK_DIR}/repo" init --quiet
 copy_hash="$(bash "${copy}/ci.sh" hash)"
 chmod -x "${copy}/build-kernel.sh"
@@ -250,9 +260,59 @@ said "::warning::The build failed or stalled taking layers from the image mirror
     fail "the retry still used the mirror or the cache"
 recorded || fail "a build retried without the mirror was not recorded"
 
-FAKE_STALL=cached-build run "${MIRRORS}"$'\n'"${CACHES}" publish ||
-    fail "a stalled cache import failed the check: $(cat "${WORK_DIR}/out")"
-[ "$(calls '--target export')" = 2 ] || fail "a stalled cache import was not retried without the cache"
+# without_external_after <pattern>: the calls matching it all came after the
+# fallback, without the mirror and the cache.
+without_external_after() {
+    [ "$(grep -e "$1" "${WORK_DIR}/calls" | grep -cE -e '--(cache-from|build-context)=')" = 0 ]
+}
+
+FAKE_STALL=external-build run "${MIRRORS}"$'\n'"${CACHES}" publish ||
+    fail "a stalled mirror and cache failed the check: $(cat "${WORK_DIR}/out")"
+[ "$(calls '--target export')" = 2 ] || fail "a stalled kernel build was not retried without the mirror and cache"
+[ "$(calls '^build .*--target smoke')" = 1 ] || fail "the smoke build stalled again instead of going without them"
+without_external_after '^build .*--target smoke' || fail "the smoke build after the fallback used the mirror or cache"
+without_external_after 'cache-to' || fail "the exports after the fallback used the mirror or cache"
+said "Saved the smoke layers" || fail "the run did not finish its exports after the fallback"
+recorded || fail "a run that fell back was not recorded"
+
+FAKE_STALL=external-build run "${MIRRORS}" publish ||
+    fail "a stalled mirror without a cache failed the check: $(cat "${WORK_DIR}/out")"
+[ "$(calls '--target export')" = 2 ] || fail "a build with only the mirror had no deadline"
+without_external_after '^build .*--target smoke' || fail "the smoke build after a mirror-only fallback used the mirror"
+
+# attempt_with <command>: runs the script's attempt on the command with the
+# cache and a one-second deadline, in a subshell, leaving its output in
+# ${WORK_DIR}/out and the seconds it took in ${WORK_DIR}/took.
+attempt_with() {
+    local started="${SECONDS}" status=0
+    (
+        # shellcheck disable=SC1090,SC1091 # the script under test
+        source "${SCRIPT}"
+        attempt 1 "--cache-from=type=registry,ref=${REPOSITORY}:toolchain-cache" bash -c "$1"
+    ) >"${WORK_DIR}/out" 2>&1 || status=$?
+    echo "$((SECONDS - started))" >"${WORK_DIR}/took"
+    return "${status}"
+}
+# Each stalls only while the cache is in use, as a stalled import does.
+# shellcheck disable=SC2016 # expanded by the command's own shell
+CACHED_ONLY='[[ "${KERNEL_DOCKER_BUILD_OPTIONS}" != *--cache-from=* ]] ||'
+
+# A build that ignores SIGTERM is killed 10 s later, and timeout exits 137.
+attempt_with "${CACHED_ONLY} { trap '' TERM; sleep 30; }; echo built" ||
+    fail "a build killed after its deadline failed: $(cat "${WORK_DIR}/out")"
+said "built" || fail "a build killed after its deadline (exit 137) was not retried"
+
+# A docker client that outlives its shell must not hold the attempt.
+attempt_with "${CACHED_ONLY} { (trap '' TERM; exec sleep 30) & sleep 30; }; echo built" ||
+    fail "a build whose client outlived it failed: $(cat "${WORK_DIR}/out")"
+said "built" || fail "a build whose client outlived it was not retried"
+[ "$(cat "${WORK_DIR}/took")" -lt 10 ] ||
+    fail "a client that outlived its build held the attempt for $(cat "${WORK_DIR}/took") s"
+
+FAKE_EXPORT_FAILS=1 run "${MIRRORS}"$'\n'"${CACHES}" publish || fail "a failing cache export failed the check"
+said "::warning::Could not save the toolchain layers to ${REPOSITORY}:toolchain-cache" ||
+    fail "a failed export over an existing tag was not reported"
+said "Saved the toolchain layers" && fail "a failed export over an existing tag was reported as saved"
 
 FAKE_EXPORT_DROPS=1 run "${MIRRORS}" publish || fail "a dropped cache export failed the check"
 said "::warning::The toolchain layers were not saved: ${REPOSITORY}:toolchain-cache does not exist after the export" ||

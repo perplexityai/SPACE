@@ -63,10 +63,11 @@ A build does not select a fleet default or change an existing template's kernel.
 Main CI runs `ci.sh publish`, which builds the default kernel and smoke-boots it
 unless a pass of this directory's exact contents is already recorded in GHCR.
 Any file in this directory, with its executable bit, is part of that record's
-key, so keep everything the check depends on here. Registry problems never fail
-the check: lookups and writes have deadlines and only warn, and a build that
-fails fetching from the image mirror or the toolchain cache runs once more
-without them. `build.sh` and `smoke-boot.sh` take extra Docker build
+key, so keep everything the check depends on here. While Docker Hub and
+snapshot.ubuntu.com work, a registry problem costs time but not the check:
+lookups and writes have deadlines and only warn, and a build that fails or
+stalls taking layers from the image mirror or the toolchain cache runs once
+more without them, as does the rest of the run. `build.sh` and `smoke-boot.sh` take extra Docker build
 options from `KERNEL_DOCKER_BUILD_OPTIONS`; `ci.sh` uses it for its builder, the
 mirrored Ubuntu base and the toolchain cache. Run `ci.sh check` for the same
 check without writing anything.

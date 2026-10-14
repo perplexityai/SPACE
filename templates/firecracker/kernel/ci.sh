@@ -17,10 +17,11 @@
 #   publish  as check, and after a build also save the toolchain cache and,
 #            after a pass, the marker (Main CI only)
 #
-# Nothing optional can fail or stall the check. Every registry call outside the
-# builds has a deadline; any failed or timed-out marker lookup builds, and a
-# failed or timed-out write is a warning. A failing build never writes the
-# marker, so a broken change fails every run until it is fixed.
+# Registry trouble alone costs time, not the check, while Docker Hub and
+# snapshot.ubuntu.com work. Every registry call outside the builds has a
+# deadline; any failed or timed-out marker lookup builds, and a failed or
+# timed-out write is a warning. A failing build never writes the marker, so a
+# broken change fails every run until it is fixed.
 #
 # Builds run on a docker-container builder, started from the pinned BuildKit
 # image in the third-party image mirror, else from Docker Hub, else on Docker's
@@ -30,8 +31,9 @@
 # compile, which the marker covers, so it stays the size of the packages. The
 # Ubuntu base comes from the image mirror when SPACE_CI_IMAGE_MIRROR is set and
 # the mirror has it (ci/scripts/mirror-images.sh build-contexts). A build that
-# fails fetching from the mirror or the cache, or that stalls while importing
-# the cache, runs once more without either.
+# takes layers from the mirror or the cache has a deadline. If it fails
+# fetching from them or overruns, it runs once more without either, and so does
+# every later build and export of the run.
 #
 # GHCR_TOKEN, when set, logs in to the registry first.
 # SPACE_GUEST_KERNEL_CI_REPOSITORY overrides the repository, and
@@ -53,18 +55,34 @@ BUILDER="${SPACE_GUEST_KERNEL_BUILDER:-space-guest-kernel}"
 # The BuildKit daemon of the builder, pinned rather than pulled by a mutable
 # tag; ci/mirrored-images.txt lists it under this name.
 BUILDKIT_IMAGE="moby/buildkit:v0.32.2@sha256:28a898719c18a33f4e8000685287fa36fd0dd9560c6440227d3a732d79bb41d8"
-# Each lookup, login and mirror probe; each cache export and the marker push;
-# and each build that imports the cache, which a cache hit keeps far shorter
-# (the smoke image's build gets half).
+# Deadlines: each lookup, login and mirror probe; each cache export and the
+# marker push; and each kernel build that takes layers from the mirror or the
+# cache (the smoke image's build gets half). A kernel build normally takes
+# about 30 minutes cold and far less from the cache.
+#
+# The budget against the job's timeout-minutes (180, main-ci.yml), for the worst
+# case: GHCR answers manifests but stalls every download, while Docker Hub and
+# snapshot.ubuntu.com work.
+#   login, marker lookup, mirror probes, cache-tag probes   8 min at most
+#   builder: the mirrored BuildKit image stalls (60 + 180 + 60 s), the source
+#   starts                                                   7 min
+#   kernel build with the mirror and cache, cut off         60 min
+#   the same build, cold, without them                     ~45 min
+#   smoke build, without them since the fallback           ~10 min
+#   two cache exports, two tag checks and the marker push   17 min
+# About 147 minutes.
 REGISTRY_TIMEOUT_SECONDS="${SPACE_GUEST_KERNEL_REGISTRY_TIMEOUT_SECONDS:-60}"
 WRITE_TIMEOUT_SECONDS="${SPACE_GUEST_KERNEL_WRITE_TIMEOUT_SECONDS:-300}"
 BUILD_TIMEOUT_SECONDS="${SPACE_GUEST_KERNEL_BUILD_TIMEOUT_SECONDS:-3600}"
-# The last line of a build that failed fetching from a registry rather than in
+# The final error of a build that failed fetching from a registry rather than in
 # one of its own steps: an unreachable, refused, truncated or corrupt transfer.
 FETCH_FAILURE='^ERROR:.*(httpReadSeeker|could not fetch content descriptor|failed to copy:|unexpected status|failed to verify|blob unknown|failed to do request|failed to resolve source metadata|i/o timeout|connection reset|connection refused|TLS handshake timeout|unexpected EOF|no such host|context deadline exceeded)'
 TIMEOUT_BIN="$(command -v timeout || command -v gtimeout || true)"
 BUILDER_OPTION=""
 CACHE_EXPORT=false
+# Set once a build has fallen back; every later build and export then goes
+# without the mirror and the cache too.
+WITHOUT_EXTERNAL=false
 OUTPUT_ROOT=""
 trap '[ -z "${OUTPUT_ROOT}" ] || rm -rf "${OUTPUT_ROOT}"' EXIT
 
@@ -181,44 +199,68 @@ build_options() {
     done
 }
 
+# without_external <options>: the options without the mirror and the cache.
+without_external() {
+    grep -Ev '^--(cache-from|build-context)=' <<<"$1" || true
+}
+
+# The options of a build or export: without the mirror and the cache once a
+# build has fallen back.
+effective() {
+    if [ "${WITHOUT_EXTERNAL}" = true ]; then without_external "$1"; else printf '%s\n' "$1"; fi
+}
+
 # attempt <deadline> <options> <command>...: run a build command with
-# KERNEL_DOCKER_BUILD_OPTIONS=<options>, within the deadline if it imports the
-# cache: a cache hit is predictable, a cold build (a new snapshot) is not. If it
-# took anything from the mirror or the cache and then failed fetching from a
-# registry or overran, it runs once more without either and without a deadline.
+# KERNEL_DOCKER_BUILD_OPTIONS=<options>, within the deadline if it takes layers
+# from the mirror or the cache. If it then failed fetching from them, or overran
+# (timeout exits 124, or 137 once it has to kill), it runs once more without
+# either and without a deadline, and so does every later build of the run. A
+# failure in one of the build's own steps fails without a retry.
+#
+# The output goes to a file that a follower prints, not through a pipe: a
+# docker client that outlives the deadline would hold a pipe open, and the wait
+# for it would have none.
 attempt() {
-    local deadline="$1" options="$2" log status=0
+    local deadline="$1" options log follower status=0
+    options="$(effective "$2")"
     shift 2
     log="$(mktemp)"
-    if [[ "${options}" == *--cache-from=* ]]; then
-        with_deadline "${deadline}" env KERNEL_DOCKER_BUILD_OPTIONS="${options}" "$@" 2>&1 | tee "${log}"
-    else
-        env KERNEL_DOCKER_BUILD_OPTIONS="${options}" "$@" 2>&1 | tee "${log}"
-    fi
-    status="${PIPESTATUS[0]}"
-    if [ "${status}" -ne 0 ] && [[ "${options}" == *--cache-from=* || "${options}" == *--build-context=* ]] &&
-        { [ "${status}" -eq 124 ] || grep -Eq "${FETCH_FAILURE}" "${log}"; }; then
-        echo "::warning::The build failed or stalled taking layers from the image mirror or the toolchain cache; building once more without them"
-        status=0
-        env KERNEL_DOCKER_BUILD_OPTIONS="$(grep -Ev '^--(cache-from|build-context)=' <<<"${options}")" "$@" ||
+    if [[ "${options}" == *--cache-from=* || "${options}" == *--build-context=* ]]; then
+        tail -f "${log}" &
+        follower=$!
+        with_deadline "${deadline}" env KERNEL_DOCKER_BUILD_OPTIONS="${options}" "$@" >>"${log}" 2>&1 ||
             status=$?
+        sleep 1
+        kill "${follower}" 2>/dev/null || true
+        wait "${follower}" 2>/dev/null || true
+        if [ "${status}" -ne 0 ] && { [ "${status}" -eq 124 ] || [ "${status}" -eq 137 ] ||
+            grep '^ERROR:' "${log}" | tail -n 1 | grep -Eq "${FETCH_FAILURE}"; }; then
+            echo "::warning::The build failed or stalled taking layers from the image mirror or the toolchain cache; building once more, and for the rest of this run, without them"
+            WITHOUT_EXTERNAL=true
+            status=0
+            env KERNEL_DOCKER_BUILD_OPTIONS="$(without_external "${options}")" "$@" || status=$?
+        fi
+    else
+        env KERNEL_DOCKER_BUILD_OPTIONS="${options}" "$@" || status=$?
     fi
     rm -f "${log}"
     return "${status}"
 }
 
 # Export the given toolchain stages' layers to their cache tags, then check that
-# each tag exists. The layers are already built, so a deadline only cuts off a
-# stalled push; an export failure is reported, not fatal.
+# each tag exists, which only a first save can fail. The layers are already
+# built, so a deadline only cuts off a stalled push. An export failure fails the
+# export, without ignore-error, and is reported, not fatal.
 save_toolchain_caches() {
-    local options="$1" target
+    local options target
+    options="$(effective "$1")"
     shift
     for target in "$@"; do
         echo "Saving the ${target} layers to ${REPOSITORY}:${target}-cache"
         # shellcheck disable=SC2086 # one option per line, none containing spaces
         if ! with_deadline "${WRITE_TIMEOUT_SECONDS}" docker buildx build ${options} \
             --platform linux/amd64 --target "${target}" \
-            --cache-to "type=registry,ref=${REPOSITORY}:${target}-cache,mode=max,oci-mediatypes=true,ignore-error=true" \
+            --cache-to "type=registry,ref=${REPOSITORY}:${target}-cache,mode=max,oci-mediatypes=true" \
             --output type=cacheonly "${SCRIPT_DIR}"; then
             echo "::warning::Could not save the ${target} layers to ${REPOSITORY}:${target}-cache"
         elif with_deadline "${REGISTRY_TIMEOUT_SECONDS}" \
@@ -304,12 +346,14 @@ run() {
     fi
 }
 
-case "${1:-}" in
-    hash) input_hash ;;
-    check) run false ;;
-    publish) run true ;;
-    *)
-        echo "usage: $0 hash|check|publish" >&2
-        exit 2
-        ;;
-esac
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    case "${1:-}" in
+        hash) input_hash ;;
+        check) run false ;;
+        publish) run true ;;
+        *)
+            echo "usage: $0 hash|check|publish" >&2
+            exit 2
+            ;;
+    esac
+fi
