@@ -75,6 +75,6 @@ pplx-space-node-api-sim = { workspace = true }
 pplx-space-test-env = { workspace = true }
 rstest = { workspace = true }
 tempfile = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
 tokio-stream = { workspace = true, features = ["net"] }
 tonic = { workspace = true }
