@@ -84,6 +84,7 @@ fi
 # Secret).
 obs_chart=$here/../observability/charts/space-observability
 obs=
+obs_available=false
 problem() { # $1 message: a warning for --template, fatal for an install
   if [[ $template == true ]]; then log "warning: $1"; else echo "install.sh: $1" >&2; exit 1; fi
 }
@@ -91,6 +92,7 @@ if [[ -f $obs_chart/Chart.yaml ]]; then
   helm dependency build "$obs_chart" >/dev/null
   obs_args=(space-observability "$obs_chart" --namespace "$obs_namespace" -f "$values")
   obs=$(render "${obs_args[@]}")
+  obs_available=true
 elif [[ $mode != off ]]; then
   problem "mode $mode needs node-local receivers, and $obs_chart is not in this tree; use mode off"
 fi
@@ -123,7 +125,7 @@ if [[ $template == true ]]; then
   printf '# space-db-migrate Job (applied first, outside both releases)\n%s\n' "$migrate"
   printf -- '---\n# release space\n%s\n' "$worker"
   printf -- '---\n# release space-builder\n%s\n' "$builder"
-  if [[ -n $obs ]]; then
+  if [[ $obs_available == true ]]; then
     printf -- '---\n# release space-observability (namespace %s)\n%s\n' "$obs_namespace" "$obs"
   fi
   exit 0
@@ -151,7 +153,7 @@ missing=()
 # Sandbox pods run with runtimeClassName space (README.md, Prerequisites).
 handler=$(k get runtimeclass space -o 'jsonpath={.handler}' 2>/dev/null || true)
 [[ $handler == space ]] || missing+=("runtimeclass/space with handler space (infra/space/kind/manifests/runtimeclass.yaml)")
-if [[ -z $obs && $mode == off ]] \
+if [[ $obs_available == false && $mode == off ]] \
     && helm status space-observability --kube-context "$context" --namespace "$obs_namespace" >/dev/null 2>&1; then
   echo "install.sh: release space-observability exists in $obs_namespace, but this tree has no chart to reconcile it for mode off; run from the tree that installed it" >&2
   exit 1
@@ -162,7 +164,7 @@ done
 for s in $needed; do
   k -n "$namespace" get secret "$s" >/dev/null 2>&1 || missing+=("secret/$namespace/$s")
 done
-if [[ -n $obs ]]; then
+if [[ $obs_available == true ]]; then
   k get namespace "$obs_namespace" >/dev/null 2>&1 || missing+=("namespace/$obs_namespace")
   obs_created=$(objects <<<"$obs" | awk -F/ '$1 == "Secret" { print $3 }' | sort -u)
   for s in $(comm -23 <(secret_refs <<<"$obs") <(printf '%s\n' "$obs_created")); do
@@ -175,7 +177,7 @@ if ((${#missing[@]})); then
   exit 1
 fi
 
-if [[ -n $obs ]]; then
+if [[ $obs_available == true ]]; then
   log "reconciling node-local receivers (mode $mode) as space-observability in $obs_namespace"
   helm upgrade --install "${obs_args[@]}" --kube-context "$context" --wait --timeout "$timeout"
 fi
