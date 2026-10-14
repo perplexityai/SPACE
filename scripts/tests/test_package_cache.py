@@ -1,5 +1,5 @@
 """Exercise ci/scripts/package-cache.py on fixture caches: what a failed restore,
-a damaged archive, a lockfile change and a partial copy each do."""
+a damaged archive, a lockfile change, a partial copy and pruning each do."""
 
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ import sys
 import tempfile
 import unittest
 import zipfile
+import zlib
 from pathlib import Path
 from unittest import mock
 
@@ -108,6 +109,34 @@ class RestoredTest(CacheTest):
         run("restored", "go", str(gomod), KEY, "--lockfile", str(gosum))
         self.assertEqual(sorted(p.name for p in at_v.iterdir()), ["v1.0.0.zip", "v1.0.0.ziphash"])
 
+    def test_drops_a_go_zip_whose_compressed_data_is_damaged(self) -> None:
+        gomod = self.tmp / "go-mod"
+        at_v = gomod / "cache/download/example.com/a/@v"
+        content = bytes(range(256)) * 64
+        path = at_v / "v1.0.0.zip"
+        path.parent.mkdir(parents=True)
+        with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as archive:
+            archive.writestr("example.com/a@v1.0.0/a.go", content)
+        gosum = write(self.tmp / "go.sum", f"example.com/a v1.0.0 {cache.go_zip_hash(path)}\n")
+        # Keep the central directory intact and break the DEFLATE stream.
+        data = bytearray(path.read_bytes())
+        start = data.index(b"a.go") + len(b"a.go")
+        data[start : start + 40] = b"\xff" * 40
+        path.write_bytes(bytes(data))
+        with self.assertRaises(zlib.error):
+            zipfile.ZipFile(path).read("example.com/a@v1.0.0/a.go")
+        output = run("restored", "go", str(gomod), KEY, "--lockfile", str(gosum))
+        self.assertIn("Deleted v1.0.0.zip", output)
+        self.assertFalse(path.exists())
+
+    def test_empties_the_cache_when_checking_it_fails(self) -> None:
+        registry = self.tmp / "registry"
+        write(registry / "cache/index.example/kept-1.0.0.crate", old=True)
+        unreadable = write(self.tmp / "Cargo.lock", "not = [toml")
+        output = run("restored", "cargo", str(registry), KEY, "--lockfile", str(unreadable))
+        self.assertIn("::warning::Could not check the restored cargo packages", output)
+        self.assertEqual(list(registry.iterdir()), [])
+
     def test_go_hash_matches_gos_own(self) -> None:
         # The go.sum entry Go computed for this public module's go.mod.
         self.assertEqual(
@@ -126,10 +155,13 @@ class ReportTest(CacheTest):
 
     def test_counts_only_what_a_fetch_added_after_the_restore(self) -> None:
         cases = {
-            "cargo": ("cache/index.example/old-1.0.0.crate", ["cache/index.example/new-1.0.0.crate"],
-                      ["src/index.example/new-1.0.0/lib.rs"]),
-            "go": ("cache/download/example.com/a/@v/v1.0.0.zip", ["cache/download/example.com/b/@v/v1.0.0.zip"],
-                   ["cache/download/example.com/b/@v/v1.0.0.mod", "example.com/b@v1.0.0/b.go"]),
+            # An index entry counts: a copy without it is incomplete.
+            "cargo": ("cache/index.example/old-1.0.0.crate", ["cache/index.example/new-1.0.0.crate",
+                      "index/index.example/.cache/ne/w/new"], ["src/index.example/new-1.0.0/lib.rs"]),
+            "go": ("cache/download/example.com/a/@v/v1.0.0.zip", ["cache/download/example.com/b/@v/v1.0.0.zip",
+                   "cache/download/example.com/b/@v/v1.0.0.mod", "cache/download/example.com/b/@v/v1.0.0.info"],
+                   ["cache/download/example.com/b/@v/v1.0.0.ziphash", "cache/download/sumdb/x/latest",
+                    "example.com/b@v1.0.0/b.go"]),
             # A local build or an assembled environment is not a download.
             "uv": ("wheels-v6/pypi/old/1.0-py3-none-any.http", ["wheels-v6/pypi/new/1.0-py3-none-any.http",
                    "sdists-v9/pypi/sdist/1.0/a.http"], ["archive-v0/built/pkg/__init__.py",
@@ -154,7 +186,7 @@ class ReportTest(CacheTest):
         self.assertEqual(outputs, "cargo-save=true\n")
         other = f"space-packages-v1-Linux-X64-cargo-{'b' * 64}-100-1"
         output, outputs = self.report("cargo", root, "--decide", KEY, "--matched-key", other)
-        self.assertIn("saved for another lockfile", output)
+        self.assertIn("saved for other inputs", output)
         self.assertEqual(outputs, "cargo-save=true\n")
 
     def test_refreshes_this_lockfiles_copy_only_when_it_was_incomplete(self) -> None:
@@ -167,6 +199,28 @@ class ReportTest(CacheTest):
         write(root / "cache/index.example/evicted-1.0.0.crate")
         output, outputs = self.report("cargo", root, "--decide", KEY, "--matched-key", this_lockfile)
         self.assertIn("lacked 1 crates", output)
+        self.assertEqual(outputs, "cargo-save=true\n")
+
+    def test_refreshes_a_copy_whose_metadata_it_repaired(self) -> None:
+        # A damaged go.mod is deleted and fetched again, with no new archive.
+        gomod = self.tmp / "go-mod"
+        at_v = gomod / "cache/download/example.com/a/@v"
+        write(at_v / "v1.0.0.mod", b"module damaged\n", old=True)
+        good = cache.go_hash1([("go.mod", b"module example.com/a\n")])
+        gosum = write(self.tmp / "go.sum", f"example.com/a v1.0.0/go.mod {good}\n")
+        this_lockfile = f"space-packages-v1-Linux-X64-cargo-{'a' * 64}-100-1"
+        run("restored", "go", str(gomod), this_lockfile, "--lockfile", str(gosum))
+        self.assertFalse((at_v / "v1.0.0.mod").exists())
+        output, outputs = self.report("go", gomod, "--decide", KEY, "--matched-key", this_lockfile)
+        self.assertIn("1 damaged files in the copy for these inputs were replaced", output)
+        self.assertEqual(outputs, "go-save=true\n")
+
+    def test_saves_a_copy_it_could_not_check(self) -> None:
+        registry = self.tmp / "registry"
+        this_lockfile = f"space-packages-v1-Linux-X64-cargo-{'a' * 64}-100-1"
+        run("restored", "cargo", str(registry), this_lockfile, "--lockfile", str(write(self.tmp / "Cargo.lock", "[")))
+        output, outputs = self.report("cargo", registry, "--decide", KEY, "--matched-key", this_lockfile)
+        self.assertIn("could not be checked", output)
         self.assertEqual(outputs, "cargo-save=true\n")
 
     def test_never_fails_for_a_cache_that_was_never_prepared(self) -> None:
@@ -227,6 +281,112 @@ class TrimTest(CacheTest):
         npm_run.assert_called_once_with(["npm", "cache", "verify", "--cache", str(npm)], check=True)
         self.assertEqual((npm / "_cacache/index-v5/aa/mixed").read_text(), entry(kept) + "\n")
         self.assertFalse((npm / "_cacache/index-v5/bb/old").exists())
+
+
+class KeyTest(CacheTest):
+    def test_names_a_family_from_its_inputs_and_uv_release(self) -> None:
+        def tree(files: dict[str, str]):
+            return lambda path: files[path].encode() if path in files else None
+
+        base = {"uv.lock": "a", "pyproject.toml": "b", "ci/scripts/run-python-tests.sh": "c",
+                "ci/Dockerfile.ci": "FROM x\nARG UV_VERSION=0.12.18\n"}
+        prefix = cache.lock_prefix("uv-python", "Linux", "X64", tree(base))
+        self.assertTrue(prefix.startswith("space-packages-v1-Linux-X64-uv-python-uv0.12.18-"))
+        self.assertTrue(cache.PACKAGE_KEY.match(prefix + "1-1"))
+        # Another family's input, or the Dockerfile's other lines, leave it alone.
+        unrelated = {**base, "scripts/netgtw/traffic/requirements.txt": "x", "ci/Dockerfile.ci": base["ci/Dockerfile.ci"] + "RUN y\n"}
+        self.assertEqual(cache.lock_prefix("uv-python", "Linux", "X64", tree(unrelated)), prefix)
+        self.assertNotEqual(cache.lock_prefix("uv-python", "Linux", "X64", tree({**base, "uv.lock": "z"})), prefix)
+        bumped = {**base, "ci/Dockerfile.ci": "ARG UV_VERSION=0.13.0\n"}
+        self.assertIn("-uv-python-uv0.13.0-", cache.lock_prefix("uv-python", "Linux", "X64", tree(bumped)))
+
+    def test_writes_the_step_outputs(self) -> None:
+        github_output = self.tmp / "github-output"
+        env = {"GITHUB_OUTPUT": str(github_output), "RUNNER_OS": "Linux", "RUNNER_ARCH": "X64",
+               "GITHUB_RUN_ID": "300", "GITHUB_RUN_ATTEMPT": "2"}
+        with mock.patch.dict(os.environ, env), mock.patch.object(cache, "tree_reader", lambda tree: lambda path: b"x"):
+            run("key", "cargo", "--output-prefix", "cargo-")
+        outputs = dict(line.split("=", 1) for line in github_output.read_text().splitlines())
+        self.assertEqual(outputs["cargo-family"], "space-packages-v1-Linux-X64-cargo-")
+        self.assertTrue(outputs["cargo-key"].startswith(outputs["cargo-lock"]))
+        self.assertTrue(outputs["cargo-key"].endswith("-300-2"))
+
+
+class PruneTest(unittest.TestCase):
+    CARGO = "space-packages-v1-Linux-X64-cargo"
+    UV = "space-packages-v1-Linux-X64-uv-python"
+
+    @staticmethod
+    def entry(cache_id: int, key: str, minute: int) -> dict:
+        return {"id": cache_id, "key": key, "created_at": f"2026-10-14T19:{minute:02d}:00Z"}
+
+    def stale(self, caches: list[dict], current: list[str]) -> list[int]:
+        return sorted(c["id"] for c in cache.superseded(caches, current))
+
+    def test_keeps_the_current_inputs_when_three_overlapping_runs_save_out_of_order(self) -> None:
+        # Main lands A, B and C; C's run saves first, then B's, then A's.
+        a, b, c = (f"{self.CARGO}-{h * 64}-" for h in "abc")
+        caches = [self.entry(1, c + "103-1", 10), self.entry(2, b + "102-1", 11), self.entry(3, a + "101-1", 12)]
+        self.assertEqual(self.stale(caches, [c]), [2])
+
+    def test_keeps_the_newest_copy_of_the_current_inputs_and_one_other(self) -> None:
+        a, c = f"{self.CARGO}-{'a' * 64}-", f"{self.CARGO}-{'c' * 64}-"
+        caches = [
+            self.entry(1, c + "100-1", 10),
+            self.entry(2, c + "105-1", 15),  # A refresh of the current inputs' copy.
+            self.entry(3, a + "90-1", 5),
+            self.entry(4, f"{self.CARGO}-{'b' * 64}-95-1", 7),
+            self.entry(5, "space-sccache-v1-Linux-X64-tests-" + "d" * 64 + "-1-1", 1),
+        ]
+        self.assertEqual(self.stale(caches, [c]), [1, 3])
+
+    def test_groups_uv_copies_across_releases(self) -> None:
+        current = f"{self.UV}-uv0.12.18-{'c' * 64}-"
+        caches = [
+            self.entry(1, current + "100-1", 10),
+            self.entry(2, f"{self.UV}-uv0.11.28-{'c' * 64}-90-1", 9),
+            self.entry(3, f"{self.UV}-uv0.11.27-{'c' * 64}-80-1", 8),
+            self.entry(4, f"space-packages-v1-Linux-X64-uv-shell-uv0.11.28-{'c' * 64}-80-1", 8),
+        ]
+        self.assertEqual(self.stale(caches, [current]), [3])
+
+    def run_prune(self, caches: list[dict], read) -> tuple[str, list[int]]:
+        deleted: list[int] = []
+
+        def github(method: str, path: str, token: str):
+            if method == "GET":
+                return {"actions_caches": caches}
+            cache_id = int(path.rsplit("/", 1)[1])
+            if cache_id == 404:  # Another main run deleted it first.
+                raise cache.urllib.error.HTTPError(path, 404, "Not Found", {}, None)
+            deleted.append(cache_id)
+            return None
+
+        env = {"GH_TOKEN": "token", "RUNNER_OS": "Linux", "RUNNER_ARCH": "X64"}
+        with mock.patch.dict(os.environ, env), mock.patch.object(cache, "github", github), \
+                mock.patch.object(cache, "tree_reader", lambda tree: read):
+            output = run("prune", "--repository", "example/repo", "--ref", "refs/heads/main", "--tree", "tip")
+        return output, sorted(deleted)
+
+    def test_prune_deletes_only_superseded_copies(self) -> None:
+        read = lambda path: b"ARG UV_VERSION=0.12.18\n" if path == "ci/Dockerfile.ci" else b"inputs"
+        current = cache.lock_prefix("cargo", "Linux", "X64", read)
+        other = f"{self.CARGO}-{'a' * 64}-"
+        caches = [
+            self.entry(1, current + "100-1", 10),
+            self.entry(2, other + "99-1", 9),
+            self.entry(3, other + "98-1", 8),
+            self.entry(404, other + "97-1", 7),
+        ]
+        output, deleted = self.run_prune(caches, read)
+        self.assertEqual(deleted, [3])
+        self.assertIn("4 package caches on refs/heads/main; 2 superseded", output)
+
+    def test_prune_deletes_nothing_without_mains_inputs(self) -> None:
+        caches = [self.entry(n, f"{self.CARGO}-{'a' * 64}-{n}-1", n) for n in range(1, 5)]
+        output, deleted = self.run_prune(caches, lambda path: None)
+        self.assertEqual(deleted, [])
+        self.assertIn("Deleting no package caches", output)
 
 
 if __name__ == "__main__":

@@ -8,7 +8,7 @@
 # cache from main (see common-ci.yml), so the environment is first prepared
 # offline, by a command that runs nothing. If that works the run is offline;
 # otherwise it goes to the index as before. The command itself runs once, so a
-# failing test never runs twice.
+# failing test never runs twice. Each call logs which way it ran to stderr.
 #
 # space_uv_run <uv> [uv run options...] -- <command> [args...]
 #   With --script among the options, <command> is the script, and its
@@ -37,8 +37,10 @@ space_uv_run() {
         prepared=true
     fi
     if [[ "${prepared}" == true ]]; then
+        echo "uv: running $1 offline, from uv's cache" >&2
         "${uv_bin}" run --offline ${options[@]+"${options[@]}"} "$@"
     else
+        echo "uv: uv's cache lacks part of $1's environment; resolving against the package index" >&2
         "${uv_bin}" run ${options[@]+"${options[@]}"} "$@"
     fi
 }

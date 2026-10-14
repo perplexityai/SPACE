@@ -1,31 +1,37 @@
 #!/usr/bin/env python3
-"""Prepare, report and trim a package cache restored from GitHub's Actions cache.
+"""Name, prepare, report, trim and prune the package caches CI keeps in GitHub's Actions cache.
 
 A CI job restores Cargo's registry, Go's module download cache, uv's cache or
-npm's cache, so it downloads only the packages its lockfile changed. Keys are
-<family>-<lockfile hash>-<run id>-<run attempt>, restored by the prefix
-<family>-<lockfile hash>- and then <family>-: the newest copy for this lockfile,
-else the newest for any. Only one job per cache saves it, and only on main. A
-missing or unusable copy only makes a job slower: the tools fetch whatever is
-absent from upstream as before.
+npm's cache, so it downloads only the packages its lockfile changed. FAMILIES
+lists each cache and the files its packages come from. Keys are
+<family>-<inputs hash>-<run id>-<run attempt>, restored by the prefix
+<family>-<inputs hash>- and then <family>-: the newest copy for these inputs,
+else the newest of the family. A uv family also names uv's release, whose cache
+layout is its own. Only one job per cache saves it, and only on main. A missing
+or unusable copy only makes a job slower: the tools fetch whatever is absent
+from upstream as before.
 
+  key       writes a family's `family`, `lock` and `key` step outputs.
   restored  after the restore and before anything reads the cache. When no key
             matched, nothing was restored or the restore failed, possibly after
             unpacking part of an archive, so the directory is emptied. Then
             drops any Cargo or Go archive whose checksum the lockfile does not
             vouch for: both tools take an archive in their cache as downloaded,
             and a damaged one fails every build instead of costing a download.
-            Finally marks the time, which `report` compares against.
-  report    prints the cache's size and the packages the job added since
+            If the check itself fails, the directory is emptied too. Finally
+            marks the time, which `report` compares against.
+  report    prints the cache's size and the files the job added since
             `restored`. With --decide it also decides whether main saves the
-            cache: when it was restored for another lockfile, or not at all, or
-            when the job had to add packages to this lockfile's copy because
-            that copy was incomplete. Writes the `<kind>-save` step output;
-            only main acts on it. Never fails.
-  trim      before main saves a copy restored for another lockfile: deletes the
-            Cargo, Go or npm packages the current lockfile no longer lists, so
-            the copy does not grow with every lockfile change. uv's copies are
-            pruned by uv itself (see common-ci.yml).
+            cache: when it was restored for other inputs, or not at all, or when
+            this job had to repair or complete the copy for its inputs. Writes
+            the `<kind>-save` step output; only main acts on it. Never fails.
+  trim      before main saves a copy: deletes the Cargo, Go or npm packages the
+            current lockfile no longer lists, so the copy does not grow with
+            every lockfile change. uv's copies are pruned by uv itself (see
+            common-ci.yml).
+  prune     on main: deletes superseded copies. In each ecosystem, across uv
+            releases, it keeps the newest copy for the inputs main has now,
+            whichever run saved last, and the newest OTHERS_KEPT others.
 
 <dir> is the Cargo registry (CARGO_HOME/registry), GOMODCACHE, UV_CACHE_DIR or
 npm's cache. The time mark sits beside <dir>, outside what is cached.
@@ -38,22 +44,91 @@ import base64
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 import time
 import tomllib
+import urllib.error
+import urllib.parse
+import urllib.request
 import zipfile
+from datetime import datetime
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable, Mapping
 
 KINDS = ("cargo", "go", "uv", "npm")
 UNITS = {
-    "cargo": "crates",
-    "go": "module archives",
+    "cargo": "crates and index entries",
+    "go": "module files",
     "uv": "downloaded distributions",
     "npm": "cache entries",
 }
+
+KEY_PREFIX = "space-packages-v1-"
+# Each cache and the files whose contents decide its packages. The uv families
+# are separate because no job installs another's packages: the Python tests'
+# project and test environment, the shell tests' migration checkers (PEP 723
+# headers and a `--with`), and the Gateway traffic harness's requirements.
+FAMILIES = {
+    "cargo": ("Cargo.lock",),
+    "go": ("shim/go.mod", "shim/go.sum"),
+    "npm": ("docs/api/package-lock.json",),
+    "uv-python": ("uv.lock", "pyproject.toml", "ci/scripts/run-python-tests.sh"),
+    "uv-shell": (
+        "uv.lock",
+        "pyproject.toml",
+        "scripts/check_postgres_partial_indexes.py",
+        "scripts/tests/test-check-postgres-migrations-squawk.sh",
+    ),
+    "uv-gateway": ("scripts/netgtw/traffic/requirements.txt",),
+}
+UV_RELEASE_FILE = "ci/Dockerfile.ci"
+# <ecosystem group>[-uv<release>]-<inputs hash>-<run id>-<run attempt>.
+PACKAGE_KEY = re.compile(
+    rf"^(?P<group>{re.escape(KEY_PREFIX)}[^-]+-[^-]+-"
+    rf"(?:{'|'.join(re.escape(f) for f in sorted(FAMILIES, key=len, reverse=True))}))"
+    r"(?:-uv[^-]+)?-[0-9a-f]{64}-[0-9]+-[0-9]+$"
+)
+OTHERS_KEPT = 1
+
+
+def tree_reader(tree: str | None) -> Callable[[str], bytes | None]:
+    """Read a repository file from the working tree, or from a Git tree-ish."""
+
+    def read(path: str) -> bytes | None:
+        if tree is None:
+            try:
+                return Path(path).read_bytes()
+            except OSError:
+                return None
+        result = subprocess.run(["git", "show", f"{tree}:{path}"], capture_output=True)
+        return result.stdout if result.returncode == 0 else None
+
+    return read
+
+
+def family_prefix(family: str, os_name: str, arch: str, read: Callable[[str], bytes | None]) -> str:
+    prefix = f"{KEY_PREFIX}{os_name}-{arch}-{family}"
+    if family.startswith("uv-"):
+        dockerfile = (read(UV_RELEASE_FILE) or b"").decode("utf-8", "replace")
+        release = re.search(r"^ARG UV_VERSION=(\S+)", dockerfile, re.M)
+        prefix += f"-uv{release[1] if release else 'unknown'}"
+    return prefix + "-"
+
+
+def inputs_hash(family: str, read: Callable[[str], bytes | None]) -> str:
+    digest = hashlib.sha256()
+    for path in FAMILIES[family]:
+        content = read(path)
+        digest.update(path.encode() + b"\0")
+        digest.update(hashlib.sha256(content).digest() if content is not None else b"missing")
+    return digest.hexdigest()
+
+
+def lock_prefix(family: str, os_name: str, arch: str, read: Callable[[str], bytes | None]) -> str:
+    return f"{family_prefix(family, os_name, arch, read)}{inputs_hash(family, read)}-"
 
 
 def marker(root: Path) -> Path:
@@ -76,11 +151,23 @@ def files_under(path: Path, pattern: str = "*") -> Iterable[Path]:
 
 
 def added_files(kind: str, root: Path, since: float) -> list[Path]:
-    """The files a fetch writes for each package, newer than `since`."""
+    """The files a fetch writes for each package, newer than `since`.
+
+    Cargo's index entries and Go's .mod and .info files count too: a copy that
+    lacks one is incomplete, though the job fetches no archive for it.
+    """
     if kind == "cargo":
-        candidates = files_under(root / "cache", "*.crate")
+        candidates = (
+            p
+            for p in [*files_under(root / "cache", "*.crate"), *files_under(root / "index")]
+            if p.suffix == ".crate" or ".cache" in p.parts
+        )
     elif kind == "go":
-        candidates = files_under(root / "cache" / "download", "*.zip")
+        candidates = (
+            p
+            for p in files_under(root / "cache" / "download")
+            if p.suffix in (".zip", ".mod", ".info") and "sumdb" not in p.parts
+        )
     elif kind == "uv":
         # uv records each wheel or source distribution it downloads in a .http
         # entry under its wheel and source-distribution buckets. Wheels it
@@ -212,6 +299,7 @@ def go_hash1(files: Iterable[tuple[str, bytes]]) -> str:
 
 
 def go_zip_hash(path: Path) -> str | None:
+    """The zip's go.sum hash, or None if any part of it cannot be read."""
     try:
         with zipfile.ZipFile(path) as archive:
             return go_hash1(
@@ -219,7 +307,7 @@ def go_zip_hash(path: Path) -> str | None:
                 for info in archive.infolist()
                 if not info.is_dir()
             )
-    except (OSError, zipfile.BadZipFile, ValueError):
+    except Exception:  # Damaged compressed data raises zlib.error, EOFError, ...
         return None
 
 
@@ -246,7 +334,11 @@ def verify_go(root: Path, gosum: Path) -> list[Path]:
                 damaged.append(path)
                 damaged.append(path.with_suffix(".ziphash"))
         elif path.suffix == ".mod" and "mod" in expected:
-            if go_hash1([("go.mod", path.read_bytes())]) != expected["mod"]:
+            try:
+                content = path.read_bytes()
+            except OSError:
+                content = None
+            if content is None or go_hash1([("go.mod", content)]) != expected["mod"]:
                 damaged.append(path)
     for path in damaged:
         path.unlink(missing_ok=True)
@@ -307,36 +399,52 @@ def trim_npm(root: Path, lockfile: Path) -> list[str]:
 
 def run_restored(args: argparse.Namespace) -> int:
     root = Path(args.dir)
+    repaired = 0
     if args.matched_key:
         print(f"Restored the {args.kind} packages from {args.matched_key}.")
         if args.lockfile and args.kind in ("cargo", "go"):
             verify = verify_cargo if args.kind == "cargo" else verify_go
-            damaged = verify(root, Path(args.lockfile))
+            try:
+                damaged = verify(root, Path(args.lockfile))
+            except Exception as error:
+                print(f"::warning::Could not check the restored {args.kind} packages ({error}); "
+                      "this job fetches its packages from upstream.")
+                shutil.rmtree(root, ignore_errors=True)
+                damaged = []
+                repaired = -1
             for path in damaged:
                 print(f"::warning::Deleted {path.name} from the restored {args.kind} packages: "
                       "its checksum is not the lockfile's, so the job downloads it again.")
+            repaired = repaired or len(damaged)
     else:
         print(f"No {args.kind} package cache was restored; this job fetches its packages from upstream.")
         shutil.rmtree(root, ignore_errors=True)
     root.mkdir(parents=True, exist_ok=True)
-    # A restore keeps the mtimes of the run that saved the cache, so backdating
+    # The mark records the repairs, which make main save a corrected copy. A
+    # restore keeps the mtimes of the run that saved the cache, so backdating
     # the mark by a second never counts a restored file, and it does count a
     # file the filesystem's coarse clock stamps with the mark's own time.
     mark = marker(root)
-    mark.touch()
+    mark.write_text(f"{repaired}\n", encoding="utf-8")
     now = time.time() - 1
     os.utime(mark, (now, now))
     return 0
 
 
-def decide(matched_key: str, key_prefix: str, added: int, unit: str) -> tuple[bool, str]:
+def decide(
+    matched_key: str, key_prefix: str, added: int, repaired: int, unit: str
+) -> tuple[bool, str]:
     if not matched_key:
         return True, "nothing was restored"
     if not matched_key.startswith(key_prefix):
-        return True, f"it restored {matched_key}, saved for another lockfile"
+        return True, f"it restored {matched_key}, saved for other inputs"
+    if repaired < 0:
+        return True, "the copy for these inputs could not be checked"
+    if repaired:
+        return True, f"{repaired} damaged files in the copy for these inputs were replaced"
     if added:
-        return True, f"the copy for this lockfile lacked {added} {unit}"
-    return False, "the copy for this lockfile already held every package"
+        return True, f"the copy for these inputs lacked {added} {unit}"
+    return False, "the copy for these inputs already held every package"
 
 
 def run_report(args: argparse.Namespace) -> int:
@@ -354,6 +462,10 @@ def report(args: argparse.Namespace) -> int:
         print(f"The {args.kind} package cache in {root} was never prepared.")
         return 0
     added = len(added_files(args.kind, root, mark.stat().st_mtime))
+    try:
+        repaired = int(mark.read_text(encoding="utf-8").strip() or 0)
+    except ValueError:
+        repaired = 0
     size = human(size_of(cached_paths(args.kind, root)))
     unit = UNITS[args.kind]
     print(f"The {args.kind} package cache holds {size}; this job added {added} {unit} to it.")
@@ -361,7 +473,7 @@ def report(args: argparse.Namespace) -> int:
         return 0
     # The key is <family>-<lockfile hash>-<run id>-<run attempt>.
     key_prefix = args.decide.rsplit("-", 2)[0] + "-"
-    save, reason = decide(args.matched_key, key_prefix, added, unit)
+    save, reason = decide(args.matched_key, key_prefix, added, repaired, unit)
     main_push = (
         os.environ.get("GITHUB_EVENT_NAME") == "push"
         and os.environ.get("GITHUB_REF") == "refs/heads/main"
@@ -389,9 +501,118 @@ def run_trim(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_key(args: argparse.Namespace) -> int:
+    read = tree_reader(None)
+    os_name, arch = os.environ.get("RUNNER_OS", "Linux"), os.environ.get("RUNNER_ARCH", "X64")
+    family = family_prefix(args.family, os_name, arch, read)
+    lock = lock_prefix(args.family, os_name, arch, read)
+    run = f"{os.environ.get('GITHUB_RUN_ID', '0')}-{os.environ.get('GITHUB_RUN_ATTEMPT', '1')}"
+    outputs = {"family": family, "lock": lock, "key": f"{lock}{run}"}
+    lines = "".join(f"{args.output_prefix}{name}={value}\n" for name, value in outputs.items())
+    print(lines, end="")
+    if output := os.environ.get("GITHUB_OUTPUT"):
+        with open(output, "a", encoding="utf-8") as output_file:
+            output_file.write(lines)
+    return 0
+
+
+def created_at(cache: Mapping) -> datetime:
+    return datetime.fromisoformat(cache["created_at"].replace("Z", "+00:00"))
+
+
+def superseded(caches: Iterable[Mapping], current: Iterable[str]) -> list[Mapping]:
+    """Return the package caches to delete.
+
+    In each ecosystem, across uv releases: all but the newest copy for each
+    `current` lock prefix and the OTHERS_KEPT newest copies for other inputs.
+    The current inputs' copy is kept whichever run saved it last, so main runs
+    that overlap and save out of order cannot delete it.
+    """
+    current = tuple(current)
+    kept_current: set[str] = set()
+    kept_others: dict[str, int] = {}
+    stale = []
+    for cache in sorted(caches, key=lambda c: (created_at(c), c["id"]), reverse=True):
+        match = PACKAGE_KEY.match(cache["key"])
+        if not match:
+            continue
+        prefix = next((p for p in current if cache["key"].startswith(p)), None)
+        if prefix is not None:
+            if prefix in kept_current:
+                stale.append(cache)
+            else:
+                kept_current.add(prefix)
+            continue
+        group = match["group"]
+        if kept_others.get(group, 0) >= OTHERS_KEPT:
+            stale.append(cache)
+        else:
+            kept_others[group] = kept_others.get(group, 0) + 1
+    return stale
+
+
+def github(method: str, path: str, token: str) -> dict | None:
+    api = os.environ.get("GITHUB_API_URL", "https://api.github.com")
+    request = urllib.request.Request(
+        f"{api}{path}",
+        method=method,
+        headers={
+            "Accept": "application/vnd.github+json",
+            "Authorization": f"Bearer {token}",
+            "X-GitHub-Api-Version": "2022-11-28",
+        },
+    )
+    with urllib.request.urlopen(request, timeout=30) as response:
+        body = response.read()
+    return json.loads(body) if body else None
+
+
+def run_prune(args: argparse.Namespace) -> int:
+    token = os.environ["GH_TOKEN"]
+    read = tree_reader(args.tree)
+    os_name, arch = os.environ.get("RUNNER_OS", "Linux"), os.environ.get("RUNNER_ARCH", "X64")
+    unreadable = [path for family in FAMILIES for path in FAMILIES[family] if read(path) is None]
+    if unreadable:
+        # Without main's inputs, the copies it restores cannot be told apart.
+        print(f"::warning::Deleting no package caches: {args.tree} lacks {', '.join(unreadable)}.")
+        return 0
+    current = [lock_prefix(family, os_name, arch, read) for family in FAMILIES]
+    caches: list[dict] = []
+    for page in range(1, 100):
+        query = urllib.parse.urlencode({"key": KEY_PREFIX, "ref": args.ref, "per_page": 100, "page": page})
+        batch = github("GET", f"/repos/{args.repository}/actions/caches?{query}", token)["actions_caches"]
+        caches.extend(batch)
+        if len(batch) < 100:
+            break
+    stale = superseded(caches, current)
+    print(f"{len(caches)} package caches on {args.ref}; {len(stale)} superseded. Kept for {args.tree}:")
+    for prefix in current:
+        print(f"  {prefix}*")
+    for cache in stale:
+        print(f"Delete {cache['key']} ({cache.get('size_in_bytes', 0) / 1e6:.0f} MB, created {cache['created_at']})")
+        try:
+            github("DELETE", f"/repos/{args.repository}/actions/caches/{cache['id']}", token)
+        except urllib.error.HTTPError as error:
+            # Another main run may have deleted it first.
+            if error.code != 404:
+                raise
+    return 0
+
+
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     commands = parser.add_subparsers(dest="command", required=True)
+
+    key = commands.add_parser("key")
+    key.add_argument("family", choices=sorted(FAMILIES))
+    key.add_argument("--output-prefix", default="", help="prefix for the step outputs' names")
+    key.set_defaults(run=run_key)
+
+    prune = commands.add_parser("prune")
+    prune.add_argument("--repository", required=True)
+    prune.add_argument("--ref", required=True)
+    prune.add_argument("--tree", required=True, help="the commit whose inputs' copies are kept")
+    prune.set_defaults(run=run_prune)
 
     restored = commands.add_parser("restored")
     restored.add_argument("kind", choices=KINDS)
@@ -414,7 +635,7 @@ def main(argv: list[str]) -> int:
     trim.set_defaults(run=run_trim)
 
     args = parser.parse_args(argv)
-    if not args.dir.rstrip("/"):
+    if hasattr(args, "dir") and not args.dir.rstrip("/"):
         parser.error("the cache directory must not be empty or /")
     return args.run(args)
 

@@ -197,12 +197,11 @@ jobs:
   # Rust jobs on main save each compiler-cache refresh under a new key, and
   # restores take only the newest snapshot of a job, or of a job's build inputs
   # for Cargo target directories. Package caches (Cargo registry, Go modules,
-  # uv, npm) are saved under a new key when their lockfile changes or a copy
-  # was incomplete, and restores take the newest; the newest two are kept,
-  # since overlapping main runs can save out of order. Delete the older ones so
-  # they do not fill the repository's cache quota. Only this job holds actions:write. It is not required by space-ci: a
-  # failed deletion leaves every check correct, and the next main run retries
-  # it.
+  # uv, npm) are saved under a new key when their inputs change or a copy was
+  # incomplete; see ci/scripts/package-cache.py. Delete the older ones so they
+  # do not fill the repository's cache quota. Only this job holds
+  # actions:write. It is not required by space-ci: a failed deletion leaves
+  # every check correct, and the next main run retries it.
   rust_cache_cleanup:
     if: ${{ !cancelled() && github.repository == 'perplexityai/SPACE' }}
     name: Delete superseded Rust and package caches
@@ -220,10 +219,26 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Delete superseded Rust and package caches
+      - name: Delete superseded Rust compiler caches
         env:
           GH_TOKEN: ${{ github.token }}
         run: python3 ci/scripts/sccache-snapshot.py prune --repository "${GITHUB_REPOSITORY}" --ref "${GITHUB_REF}"
+
+      # Keep the copies for main's newest inputs, not this run's: main runs of
+      # several commits overlap and save out of order, and an older commit's
+      # run must not delete what the newest commit restores.
+      - name: Fetch main's newest commit
+        id: main-tip
+        if: ${{ !cancelled() }}
+        run: git fetch --no-tags --depth=1 origin main
+
+      - name: Delete superseded package caches
+        if: ${{ !cancelled() && steps.main-tip.outcome == 'success' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          python3 ci/scripts/package-cache.py prune --repository "${GITHUB_REPOSITORY}" --ref "${GITHUB_REF}"
+          --tree FETCH_HEAD
 
   space-ci:
     if: always() && github.repository == 'perplexityai/SPACE'

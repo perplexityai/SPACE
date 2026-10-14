@@ -57,15 +57,7 @@ jobs:
       - name: Name the Cargo registry cache
         id: cargo-registry-key
         if: matrix.cargo_registry
-        env:
-          FAMILY: space-packages-v1-${{ runner.os }}-${{ runner.arch }}-cargo
-          LOCK: ${{ hashFiles('Cargo.lock') }}
-        run: |
-          {
-            echo "family=${FAMILY}-"
-            echo "lock=${FAMILY}-${LOCK}-"
-            echo "key=${FAMILY}-${LOCK}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          } >>"${GITHUB_OUTPUT}"
+        run: python3 ci/scripts/package-cache.py key cargo
 
       - name: Restore the Cargo registry
         id: restore-cargo-registry

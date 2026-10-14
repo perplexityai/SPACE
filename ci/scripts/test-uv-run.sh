@@ -40,17 +40,19 @@ expect_calls() {
 }
 
 : >"${FAKE_CALLS}"
-FAKE_CACHED=1 space_uv_run "${uv}" --locked --with pkg==1.0 -- test.py </dev/null
+log="$(FAKE_CACHED=1 space_uv_run "${uv}" --locked --with pkg==1.0 -- test.py 2>&1 </dev/null)"
+[[ "${log}" == "uv: running test.py offline, from uv's cache" ]] || fail "unexpected log: ${log}"
 expect_calls "[run][--offline][--quiet][--locked][--with][pkg==1.0][python][-c][]
 [run][--offline][--locked][--with][pkg==1.0][test.py]"
 
-FAKE_CACHED=0 space_uv_run "${uv}" --locked --with pkg==1.0 -- test.py </dev/null
+log="$(FAKE_CACHED=0 space_uv_run "${uv}" --locked --with pkg==1.0 -- test.py 2>&1 </dev/null)"
+[[ "${log}" == *"resolving against the package index" ]] || fail "unexpected log: ${log}"
 expect_calls "[run][--offline][--quiet][--locked][--with][pkg==1.0][python][-c][]
 [run][--locked][--with][pkg==1.0][test.py]"
 
 # A script's environment is prepared with `uv sync --script`, and the
 # preparation leaves the command's stdin to the command.
-output="$(echo piped | FAKE_CACHED=1 space_uv_run "${uv}" --script -- check.py --flag)"
+output="$(echo piped | FAKE_CACHED=1 space_uv_run "${uv}" --script -- check.py --flag 2>/dev/null)"
 [[ "${output}" == piped ]] || fail "the command did not read its stdin: ${output}"
 expect_calls "[sync][--offline][--quiet][--script][check.py]
 [run][--offline][--script][check.py][--flag]"
@@ -58,7 +60,7 @@ expect_calls "[sync][--offline][--quiet][--script][check.py]
 # A failing command runs once and its status is the call's.
 for cached in 1 0; do
     status=0
-    FAKE_CACHED="${cached}" FAKE_STATUS=3 space_uv_run "${uv}" --script -- check.py </dev/null || status=$?
+    FAKE_CACHED="${cached}" FAKE_STATUS=3 space_uv_run "${uv}" --script -- check.py </dev/null 2>/dev/null || status=$?
     [[ "${status}" == 3 ]] || fail "expected status 3 with FAKE_CACHED=${cached}, got ${status}"
     [[ "$(grep -c '^\[run\]' "${FAKE_CALLS}")" == 1 ]] || fail "the failing command ran more than once"
     : >"${FAKE_CALLS}"
