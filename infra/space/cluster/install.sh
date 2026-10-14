@@ -97,11 +97,16 @@ elif [[ $mode != off ]]; then
   problem "mode $mode needs node-local receivers, and $obs_chart is not in this tree; use mode off"
 fi
 
-# kind/namespace/name of every rendered object; cluster-scoped objects get
-# namespace "-". Helm's output puts kind and metadata at the top level.
+# kind/namespace/name of every rendered object. Namespaced objects may omit
+# metadata.namespace and inherit their Helm release's namespace. The cluster
+# scoped kinds used by these charts retain namespace "-".
 objects() {
-  awk -v ns="$namespace" '
-    function flush() { if (k != "") print k "/" (n_s == "" ? "-" : n_s) "/" nm; k = ""; nm = ""; n_s = ""; inmeta = 0 }
+  awk -v ns="${1:-$namespace}" '
+    function flush() {
+      cluster = k ~ /^(Namespace|ClusterRole|ClusterRoleBinding|ValidatingAdmissionPolicy|ValidatingAdmissionPolicyBinding|RuntimeClass)$/
+      if (k != "") print k "/" (cluster ? "-" : (n_s == "" ? ns : n_s)) "/" nm
+      k = ""; nm = ""; n_s = ""; inmeta = 0
+    }
     /^---/ { flush(); next }
     /^kind: / { k = $2 }
     /^metadata:/ { inmeta = 1; next }
@@ -110,11 +115,11 @@ objects() {
     inmeta && /^  namespace: / && n_s == "" { n_s = $2 }
     END { flush() }'
 }
-if [[ $mode == otlp && -n $obs ]] && ! objects <<<"$obs" | grep -q "^DaemonSet/$obs_namespace/.*node-collector"; then
+if [[ $mode == otlp && -n $obs ]] && ! objects "$obs_namespace" <<<"$obs" | grep -q "^DaemonSet/$obs_namespace/.*node-collector"; then
   problem "mode otlp needs the node-local OTLP collector DaemonSet, which the space-observability render does not include"
 fi
 
-dupes=$( { objects <<<"$worker"; objects <<<"$builder"; objects <<<"$migrate"; objects <<<"$obs"; } | sort | uniq -d)
+dupes=$( { objects <<<"$worker"; objects <<<"$builder"; objects <<<"$migrate"; objects "$obs_namespace" <<<"$obs"; } | sort | uniq -d)
 if [[ -n $dupes ]]; then
   echo "install.sh: objects rendered by more than one release or twice:" >&2
   printf '  %s\n' $dupes >&2
@@ -166,7 +171,7 @@ for s in $needed; do
 done
 if [[ $obs_available == true ]]; then
   k get namespace "$obs_namespace" >/dev/null 2>&1 || missing+=("namespace/$obs_namespace")
-  obs_created=$(objects <<<"$obs" | awk -F/ '$1 == "Secret" { print $3 }' | sort -u)
+  obs_created=$(objects "$obs_namespace" <<<"$obs" | awk -F/ '$1 == "Secret" { print $3 }' | sort -u)
   for s in $(comm -23 <(secret_refs <<<"$obs") <(printf '%s\n' "$obs_created")); do
     k -n "$obs_namespace" get secret "$s" >/dev/null 2>&1 || missing+=("secret/$obs_namespace/$s")
   done
