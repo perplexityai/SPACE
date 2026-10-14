@@ -1693,8 +1693,12 @@ class InstallerAgreementTests(unittest.TestCase):
         return stub_dir, log
 
     def stub_mv(self) -> pathlib.Path:
-        """An `mv` on PATH that fails a move to a path ending in $FAKE_MV_FAIL_INTO,
-        and sleeps $FAKE_MV_SLEEP_AFTER seconds after a move to vmlinux.bin."""
+        """An `mv` on PATH that fails a move to a path ending in $FAKE_MV_FAIL_INTO.
+
+        After a move to vmlinux.bin it sleeps $FAKE_MV_SLEEP_AFTER seconds, and
+        with $FAKE_MV_BLOCK_STAMP set puts a directory where the stamp goes,
+        so the stamp write that follows fails.
+        """
         stub_dir = self.tmp / "mvbin"
         stub_dir.mkdir(exist_ok=True)
         stub = stub_dir / "mv"
@@ -1708,7 +1712,9 @@ class InstallerAgreementTests(unittest.TestCase):
                   exit 1
                 fi
                 {shell_quote(shutil.which("mv") or "/bin/mv")} "$@" || exit
-                [[ "$dest" != */vmlinux.bin ]] || sleep "${{FAKE_MV_SLEEP_AFTER:-0}}"
+                [[ "$dest" == */vmlinux.bin ]] || exit 0
+                [[ -z "${{FAKE_MV_BLOCK_STAMP:-}}" ]] || mkdir "${{dest%/*}}/.vmlinux.bin.sha256"
+                sleep "${{FAKE_MV_SLEEP_AFTER:-0}}"
                 """
             )
         )
@@ -1837,14 +1843,17 @@ class InstallerAgreementTests(unittest.TestCase):
         self.assertEqual(self.run_installer("--check")[0].returncode, 0, "the previous kernel's pin no longer passes")
 
     def test_a_failed_stamp_write_fails_the_install(self) -> None:
-        self.kernel_dir.mkdir(parents=True)
-        # A directory where the stamp goes: neither removing nor writing it works.
-        (self.kernel_dir / ".vmlinux.bin.sha256").mkdir()
-
-        result, _ = self.run_installer()
+        # The stamp is removed and the verified kernel renamed into place; only
+        # writing the stamp then fails.
+        result, _ = self.run_installer(FAKE_MV_BLOCK_STAMP="1")
 
         self.assertNotEqual(result.returncode, 0)
+        self.assertIn("could not write", result.stderr)
         self.assertNotIn("installed at", result.stdout)
+        # The new kernel is in place, verified but unstamped: the next check hashes it.
+        self.assertEqual((self.kernel_dir / "vmlinux.bin").read_bytes(), FAKE_KERNEL)
+        self.assertTrue((self.kernel_dir / ".vmlinux.bin.sha256").is_dir())
+        self.assertEqual(self.run_installer("--check")[0].returncode, 0)
 
     def test_installers_sharing_a_root_never_stamp_the_other_ones_kernel(self) -> None:
         """Two pins at once: one installer replaces the kernel between the other's rename and stamp.

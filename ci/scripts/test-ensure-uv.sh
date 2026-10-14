@@ -33,8 +33,9 @@ else
 fi
 
 # Serves FAKE_BODY for every URL except those on a host in FAKE_DOWN_HOSTS,
-# which answer 503, or in FAKE_MISSING_HOSTS, which answer 404, as `curl -f`
-# with `-w '%{http_code}'` reports them.
+# which answer 503, FAKE_MISSING_HOSTS (404) or FAKE_FORBIDDEN_HOSTS (403), as
+# `curl -f` with `-w '%{http_code}'` reports them, or FAKE_BAD_CERT_HOSTS,
+# whose certificate does not verify (curl exit 60, no HTTP status).
 mkdir -p "${WORK_DIR}/bin"
 cat >"${WORK_DIR}/bin/curl" <<'SH'
 #!/usr/bin/env bash
@@ -53,6 +54,12 @@ host="${host%%/*}"
 answer() { [ -z "${format}" ] || printf '%s' "$1"; }
 if [[ " ${FAKE_MISSING_HOSTS:-} " == *" ${host} "* ]]; then
     answer 404; echo "curl: (22) 404 from ${host}" >&2; exit 22
+fi
+if [[ " ${FAKE_FORBIDDEN_HOSTS:-} " == *" ${host} "* ]]; then
+    answer 403; echo "curl: (22) 403 from ${host}" >&2; exit 22
+fi
+if [[ " ${FAKE_BAD_CERT_HOSTS:-} " == *" ${host} "* ]]; then
+    answer 000; echo "curl: (60) SSL certificate problem from ${host}" >&2; exit 60
 fi
 if [[ " ${FAKE_DOWN_HOSTS:-} " == *" ${host} "* ]]; then
     answer 503; echo "curl: (22) 503 from ${host}" >&2; exit 22
@@ -94,7 +101,8 @@ run() {
     : >"${WORK_DIR}/calls"
     env -i HOME="${WORK_DIR}" PATH="${EXTRA_PATH:+${EXTRA_PATH}:}${WORK_DIR}/bin:${WORK_DIR}/tools" \
         FAKE_CALLS="${WORK_DIR}/calls" FAKE_BODY="${body}" FAKE_DOWN_HOSTS="${down}" \
-        FAKE_MISSING_HOSTS="${MISSING_HOSTS:-}" \
+        FAKE_MISSING_HOSTS="${MISSING_HOSTS:-}" FAKE_FORBIDDEN_HOSTS="${FORBIDDEN_HOSTS:-}" \
+        FAKE_BAD_CERT_HOSTS="${BAD_CERT_HOSTS:-}" \
         SPACE_UV_INSTALL_ATTEMPTS=2 SPACE_UV_INSTALL_RETRY_DELAY_SECONDS=0 "$@" \
         bash "${repo}/ci/scripts/ensure-uv.sh" >"${WORK_DIR}/out" 2>"${WORK_DIR}/err"
 }
@@ -163,6 +171,27 @@ if MISSING_HOSTS="releases.astral.sh github.com" run "${WORK_DIR}/repo-missing" 
 fi
 [ "$(wc -l <"${WORK_DIR}/calls" | tr -d ' ')" = 2 ] || fail "a 404 from both hosts was retried: $(cat "${WORK_DIR}/calls")"
 grep -q "no host serves uv ${VERSION}" "${WORK_DIR}/err" || fail "the 404s were not reported: $(cat "${WORK_DIR}/err")"
+
+# A certificate that does not verify, or a 403, on both hosts: each host is
+# tried once, then the install fails.
+both="releases.astral.sh github.com"
+if BAD_CERT_HOSTS="${both}" run "${WORK_DIR}/repo-bad-cert" "${WORK_DIR}/uv.tar.gz" "" \
+    SPACE_UV_VERSION="${VERSION}" SPACE_UV_SHA256="${SHA256}"; then
+    fail "an install with no verifiable certificate succeeded"
+fi
+[ "$(wc -l <"${WORK_DIR}/calls" | tr -d ' ')" = 2 ] || fail "a certificate error on both hosts was retried: $(cat "${WORK_DIR}/calls")"
+if FORBIDDEN_HOSTS="${both}" run "${WORK_DIR}/repo-forbidden" "${WORK_DIR}/uv.tar.gz" "" \
+    SPACE_UV_VERSION="${VERSION}" SPACE_UV_SHA256="${SHA256}"; then
+    fail "an install both hosts refuse succeeded"
+fi
+[ "$(wc -l <"${WORK_DIR}/calls" | tr -d ' ')" = 2 ] || fail "a 403 from both hosts was retried: $(cat "${WORK_DIR}/calls")"
+
+# A 403 from one host and an outage of the other is retried.
+if FORBIDDEN_HOSTS=releases.astral.sh run "${WORK_DIR}/repo-forbidden-down" "${WORK_DIR}/uv.tar.gz" github.com \
+    SPACE_UV_VERSION="${VERSION}" SPACE_UV_SHA256="${SHA256}"; then
+    fail "an install with both hosts failing succeeded"
+fi
+[ "$(wc -l <"${WORK_DIR}/calls" | tr -d ' ')" = 4 ] || fail "a 503 beside a 403 was not retried: $(cat "${WORK_DIR}/calls")"
 
 # A 404 from one host and an outage of the other is still retried.
 if MISSING_HOSTS=releases.astral.sh run "${WORK_DIR}/repo-mixed" "${WORK_DIR}/uv.tar.gz" github.com \

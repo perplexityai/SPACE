@@ -89,9 +89,13 @@ trap 'rm -rf "${tmp_dir}"' EXIT
 
 # Astral's release mirror first and GitHub's release download second, which
 # is also the order of astral.sh's installer. Each attempt tries both, so an
-# outage of either host does not fail the job. Only an answer that could
-# change is retried: when no host failed transiently and every host answered
-# 404 or served one and the same other archive, the install fails at once.
+# outage of either host does not fail the job. Only a failure that could pass
+# on a retry is retried: a 408, 429 or 5xx, or a curl error a flaky network
+# causes (a DNS or connect failure, a timeout, a body cut short or reset, a
+# failed TLS handshake). When neither host failed that way, and none served an
+# archive other than the one the others served, the install fails at once: any
+# other HTTP error, a certificate that does not verify, or the same wrong
+# archive from both.
 urls=(
     "https://releases.astral.sh/github/uv/releases/download/${UV_VERSION}/uv-${uv_target}.tar.gz"
     "https://github.com/astral-sh/uv/releases/download/${UV_VERSION}/uv-${uv_target}.tar.gz"
@@ -110,7 +114,12 @@ for ((attempt = 1; ; attempt++)); do
             -w '%{http_code}' "${url}" -o "${archive}")" || status=$?
         if [ "${status}" -ne 0 ]; then
             echo "Could not download ${url} (curl exit ${status}, HTTP ${code})." >&2
-            [ "${code}" = 404 ] || transient=1
+            # curl -f exits 22 for an HTTP error, whose status then decides.
+            case "${status}:${code}" in
+                22:408 | 22:429 | 22:5??) transient=1 ;;
+                22:*) ;;
+                6:* | 7:* | 18:* | 28:* | 35:* | 52:* | 56:*) transient=1 ;;
+            esac
             continue
         fi
         actual="$(sha256 "${archive}")"

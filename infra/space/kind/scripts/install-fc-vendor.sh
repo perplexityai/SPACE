@@ -261,9 +261,11 @@ if command -v flock >/dev/null 2>&1; then
 fi
 
 # Install $kernel_tmp as the kernel if it is the pinned one; return 1 if its
-# checksum differs. Every other failure ends the run, with the previous kernel
-# still in place and no stamp claiming the new one: a rename replaces the old
-# file only once it succeeds, and the stamp is written after it.
+# checksum differs. Every other failure ends the run with no stamp vouching for
+# a file it was not computed from. Up to the rename, the previous kernel stays
+# in place, since a rename replaces it only once it succeeds; if only the stamp
+# write fails, the new, verified kernel is in place unstamped, and the next
+# run hashes it.
 kernel_tmp=""
 trap 'rm -f "${kernel_tmp:-}"' EXIT
 stage_kernel() {
