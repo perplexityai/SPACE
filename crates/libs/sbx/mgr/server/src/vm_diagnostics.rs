@@ -6,8 +6,9 @@
 //!
 //! - Firecracker's metrics flushes, from a FIFO node-manager creates in the
 //!   jail, become the node-wide `sandbox.firecracker.*` metrics.
-//! - Firecracker's WARN and ERROR log lines, tailed from its log file, are
-//!   re-logged here with `sandbox_id`. INFO and DEBUG lines are not.
+//! - Firecracker's ERROR log lines, tailed from its log file, are re-logged
+//!   here with `sandbox_id`. WARN, INFO and DEBUG lines are not; the
+//!   watchdog's failure-time tail of the file still captures them.
 //! - spaced's WARN and ERROR callsites arrive on the health probe's Ping and
 //!   are re-logged by [`forward_guest_diagnostics`].
 //!

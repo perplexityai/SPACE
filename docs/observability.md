@@ -503,16 +503,23 @@ node-wide metrics carry no sandbox id:
 | `sandbox.firecracker.operation.duration_ms` | timing, once per VM pause, resume, snapshot load or create a flush reports | `operation` |
 | `sandbox.firecracker.metrics.flushes` | counter | `outcome` (`parsed`, `unparsable`, `oversized`) |
 | `sandbox.firecracker.telemetry_dropped` | counter, flushes or log lines Firecracker could not write | `stream` (`metrics`, `log`) |
-| `sandbox.vm.diagnostics` | counter, forwarded WARN and ERROR diagnostics | `source` (`firecracker`, `guest`), `level`, `outcome` (`logged`, `rate_limited`, `dropped_in_guest`) |
+| `sandbox.vm.diagnostics` | counter, forwarded Firecracker ERROR lines and guest WARN and ERROR diagnostics | `source` (`firecracker`, `guest`), `level` (`warn`, `error`), `outcome` (`logged`, `rate_limited`, `dropped_in_guest`) |
 
 The `error` values are listed in `crates/libs/metrics/src/sandbox/vm.rs`.
+Firecracker's flow-control counters (`block` `no_avail_buffer`, `net`
+`no_rx_avail_buffer` and `no_tx_avail_buffer`) are not among them: they count
+times the guest had not yet posted a buffer, which the device retries, not
+failures.
 
-Firecracker's WARN and ERROR log lines are re-logged by sandbox-manager as
-`firecracker warning` or `firecracker error` with `sandbox_id` and the line in
-`firecracker_message`, at most 20 in a burst and then one every 15 seconds per
-sandbox; `suppressed_since_last` counts the lines skipped. A line can carry
+Firecracker's ERROR log lines are re-logged by sandbox-manager as
+`firecracker error` with `sandbox_id` and the line in `firecracker_message`, at
+most 20 in a burst and then one every 15 seconds per sandbox;
+`suppressed_since_last` counts the lines skipped. A line can carry
 guest-written values, so it is cut to 512 bytes and its control characters
-are replaced. INFO and DEBUG lines are not forwarded.
+are replaced. WARN, INFO and DEBUG lines are not forwarded; Firecracker warns
+on every snapshot restore. `sandbox.vm.diagnostics` is therefore not emitted
+with `source:firecracker` and `level:warn`. The watchdog's failure-time
+evidence still includes the tail of Firecracker's log, WARN lines included.
 
 spaced records its own WARN and ERROR callsites (level, target, source file and
 line, and a count), never message text or field values, which can carry a

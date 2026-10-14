@@ -1,8 +1,10 @@
 //! Firecracker's log file, written with `--show-level`:
 //! `<time> [<instance>:<thread>:<LEVEL>] <message>`.
 //!
-//! Only WARN and ERROR lines are re-logged. The file is regular, so reading it
-//! never affects the VMM; each poll reads at most [`MAX_READ_BYTES`].
+//! Only ERROR lines are re-logged. Firecracker warns on every snapshot restore,
+//! so WARN lines stay in the file, where the watchdog's failure-time tail of it
+//! still reads them. The file is regular, so reading it never affects the VMM;
+//! each poll reads at most [`MAX_READ_BYTES`].
 
 use std::io::SeekFrom;
 use std::path::PathBuf;
@@ -94,13 +96,13 @@ fn created_since(metadata: &std::fs::Metadata, instant: SystemTime) -> bool {
 }
 
 fn forward_line(sandbox_id: &str, line: &str, budget: &mut LogBudget) {
-    let Some((level, message)) = classify(line) else {
+    let Some(message) = error_message(line) else {
         return;
     };
     let Some(suppressed) = budget.admit() else {
         pplx_space_metrics::sandbox::vm::vm_diagnostics(
             VmDiagnosticSource::Firecracker,
-            level,
+            VmDiagnosticLevel::Error,
             VmDiagnosticOutcome::RateLimited,
             1,
         );
@@ -108,35 +110,22 @@ fn forward_line(sandbox_id: &str, line: &str, budget: &mut LogBudget) {
     };
     pplx_space_metrics::sandbox::vm::vm_diagnostics(
         VmDiagnosticSource::Firecracker,
-        level,
+        VmDiagnosticLevel::Error,
         VmDiagnosticOutcome::Logged,
         1,
     );
     let message = sanitized(message, MAX_MESSAGE_BYTES);
-    match level {
-        VmDiagnosticLevel::Warn => tracing::warn!(
-            sandbox_id,
-            firecracker_message = message.as_str(),
-            suppressed_since_last = suppressed,
-            "firecracker warning"
-        ),
-        VmDiagnosticLevel::Error => tracing::error!(
-            sandbox_id,
-            firecracker_message = message.as_str(),
-            suppressed_since_last = suppressed,
-            "firecracker error"
-        ),
-    }
+    tracing::error!(
+        sandbox_id,
+        firecracker_message = message.as_str(),
+        suppressed_since_last = suppressed,
+        "firecracker error"
+    );
 }
 
-/// The level and message of a WARN or ERROR line; `None` for every other line.
-fn classify(line: &str) -> Option<(VmDiagnosticLevel, &str)> {
+/// The message of an ERROR line; `None` for every other line.
+fn error_message(line: &str) -> Option<&str> {
     let (_, header_and_message) = line.split_once(" [")?;
     let (header, message) = header_and_message.split_once("] ")?;
-    let level = match header.rsplit(':').next()? {
-        "WARN" => VmDiagnosticLevel::Warn,
-        "ERROR" => VmDiagnosticLevel::Error,
-        _ => return None,
-    };
-    Some((level, message.trim_end()))
+    (header.rsplit(':').next()? == "ERROR").then(|| message.trim_end())
 }

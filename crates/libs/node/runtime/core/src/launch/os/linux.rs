@@ -662,8 +662,8 @@ fn jailer_args(config: JailerArgs<'_>) -> Vec<String> {
         args.extend(["--config-file".to_string(), fc_config_path.to_string()]);
     }
     if !fc_log_path.is_empty() {
-        // The level prefix lets sandbox-manager forward WARN and ERROR lines
-        // without forwarding the INFO lines around them.
+        // The level prefix lets sandbox-manager forward ERROR lines without
+        // forwarding the WARN and INFO lines around them.
         args.extend([
             "--log-path".to_string(),
             fc_log_path.to_string(),

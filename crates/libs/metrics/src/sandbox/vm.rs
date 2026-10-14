@@ -19,9 +19,10 @@
 //!   lines Firecracker could not write because the reader fell behind or the
 //!   write failed. Firecracker never blocks on its outputs; it counts these.
 //!   Tag `stream` = `metrics` | `log`.
-//! - `sandbox.vm.diagnostics` (counter): WARN and ERROR diagnostics forwarded
-//!   from Firecracker's log and from the guest's spaced. Tags `source`
-//!   (`firecracker` | `guest`), `level` (`warn` | `error`) and `outcome`:
+//! - `sandbox.vm.diagnostics` (counter): ERROR lines forwarded from
+//!   Firecracker's log, and WARN and ERROR diagnostics from the guest's spaced.
+//!   Tags `source` (`firecracker` | `guest`), `level` (`warn` | `error`; always
+//!   `error` for `firecracker`) and `outcome`:
 //!   `logged`, `rate_limited` (over the per-sandbox budget, counted but not
 //!   logged), or `dropped_in_guest` (past the guest's callsite bound, so its
 //!   level is reported as `warn`).
@@ -52,7 +53,9 @@ pub struct FirecrackerError {
 }
 
 /// Every Firecracker field exported as `sandbox.firecracker.errors`. The
-/// `error` tag can only take these values.
+/// `error` tag can only take these values. Flow-control counters such as
+/// `no_avail_buffer` are not errors: the guest has not posted a buffer yet, and
+/// the device retries.
 pub const FIRECRACKER_ERRORS: &[FirecrackerError] = &{
     use FirecrackerComponent::*;
     const fn e(component: FirecrackerComponent, error: &'static str) -> FirecrackerError {
@@ -64,8 +67,6 @@ pub const FIRECRACKER_ERRORS: &[FirecrackerError] = &{
         e(Block, "event_fails"),
         e(Block, "execute_fails"),
         e(Block, "invalid_reqs_count"),
-        // The guest posted no buffers: a guest that stopped servicing its queue.
-        e(Block, "no_avail_buffer"),
         e(Block, "update_fails"),
         e(Net, "activate_fails"),
         e(Net, "cfg_fails"),
@@ -76,8 +77,6 @@ pub const FIRECRACKER_ERRORS: &[FirecrackerError] = &{
         e(Net, "tap_write_fails"),
         e(Net, "tx_malformed_frames"),
         e(Net, "tx_spoofed_mac_count"),
-        e(Net, "no_rx_avail_buffer"),
-        e(Net, "no_tx_avail_buffer"),
         e(Vsock, "activate_fails"),
         e(Vsock, "cfg_fails"),
         e(Vsock, "conn_event_fails"),
