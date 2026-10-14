@@ -339,14 +339,14 @@ pub(super) async fn create_sandbox(
     )
     .await?;
     let federated_owner = federated_owner_ref(&federated);
-    let falcon_us2_egress =
-        super::translate::falcon_us2_egress_requested(&headers, federated_owner.is_some());
+    let falcon_egress =
+        super::translate::falcon_egress_requested(&headers, federated_owner.is_some());
     let federated_service_grant = request_federated_service_grant(&headers, federated_owner)?;
     let translated = translate_create_request(req)?;
     let mut federated_create =
         FederatedSandboxCreateContext::new(federated_owner, federated_service_grant.as_ref());
-    if falcon_us2_egress {
-        federated_create = federated_create.with_falcon_us2_egress();
+    if falcon_egress {
+        federated_create = federated_create.with_falcon_egress();
     }
     let native = match state
         .sandbox_controller

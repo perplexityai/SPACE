@@ -2,17 +2,15 @@
 
 [Documentation](../README.md)
 
-The ECW create header `X-Space-Falcon: us2` requests an operator-configured
+The ECW create header `X-Space-Falcon: true` requests an operator-configured
 Falcon destination bundle. Only authenticated federated creates can receive the overlay.
 The API has no built-in regional endpoints.
 
-**No renaming is included:** `X-Space-Falcon: us2`,
-`SPACE_FALCON_US2_EGRESS_DESTINATIONS`, and the `FalconUs2Egress` type retain
-compatibility names. They do not restrict the configured destinations to US-2.
-**TODO:** remove the US-2-specific names in a separate coordinated caller and
-configuration migration.
+The opt-in enables the configured bundle; it does not select a cloud region.
+Update callers and deployment configuration together with the API when upgrading
+from the former region-specific names. Those names are not accepted as aliases.
 
-Set `SPACE_FALCON_US2_EGRESS_DESTINATIONS` on the API process to a JSON array
+Set `SPACE_FALCON_EGRESS_DESTINATIONS` on the API process to a JSON array
 of IP addresses, CIDRs, and exact domain destinations. For example, using **synthetic values**:
 
 ```json

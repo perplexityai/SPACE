@@ -4865,21 +4865,27 @@ fn ecw_request_logs(events: &[CapturedEvent]) -> Vec<&[(String, String)]> {
 mod ecw_falcon_header {
     use axum::http::{HeaderMap, HeaderValue};
 
-    use super::super::translate::{ECW_FALCON_HEADER, falcon_us2_egress_requested};
+    use super::super::translate::{ECW_FALCON_HEADER, falcon_egress_requested};
 
     #[test]
-    fn accepts_only_federated_us2_requests() {
+    fn accepts_only_federated_true_requests() {
         let mut headers = HeaderMap::new();
-        assert!(!falcon_us2_egress_requested(&headers, true));
+        assert!(!falcon_egress_requested(&headers, true));
 
-        headers.insert(ECW_FALCON_HEADER, HeaderValue::from_static("us2"));
-        assert!(falcon_us2_egress_requested(&headers, true));
-        assert!(!falcon_us2_egress_requested(&headers, false));
-
-        headers.insert(ECW_FALCON_HEADER, HeaderValue::from_static("other"));
-        assert!(!falcon_us2_egress_requested(&headers, true));
+        for (value, expected) in [
+            ("true", true),
+            (" TRUE ", true),
+            ("false", false),
+            ("us2", false),
+            ("other", false),
+            ("", false),
+        ] {
+            headers.insert(ECW_FALCON_HEADER, HeaderValue::from_static(value));
+            assert_eq!(falcon_egress_requested(&headers, true), expected, "{value}");
+            assert!(!falcon_egress_requested(&headers, false), "{value}");
+        }
         headers.insert(ECW_FALCON_HEADER, HeaderValue::from_bytes(&[0xff]).unwrap());
-        assert!(!falcon_us2_egress_requested(&headers, true));
+        assert!(!falcon_egress_requested(&headers, true));
     }
 }
 

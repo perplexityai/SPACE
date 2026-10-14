@@ -8,7 +8,7 @@ fn composition_preserves_policy_and_deny_precedence(
     #[case] activation: Option<&str>,
     #[case] exemptions_enabled: bool,
 ) {
-    let egress = FalconUs2Egress::from_config(
+    let egress = FalconEgress::from_config(
         r#"[
             {"ip":"192.0.2.10"},
             {"ip":"192.0.2.11"},
@@ -140,7 +140,7 @@ fn composition_preserves_policy_and_deny_precedence(
         }));
         assert_eq!(egress.compose(&composed), composed);
         let disabled =
-            FalconUs2Egress::from_config(r#"[{"domain":"sensor.example.test"}]"#, None).unwrap();
+            FalconEgress::from_config(r#"[{"domain":"sensor.example.test"}]"#, None).unwrap();
         assert_eq!(disabled.compose(&composed), composed);
     }
 }
@@ -156,13 +156,13 @@ fn composition_preserves_policy_and_deny_precedence(
 #[case(r#"[{"cidr":"192.0.2.0/33"}]"#)]
 #[case(r#"[{"cidr":"2001:db8::/129"}]"#)]
 fn rejects_invalid_or_unsupported_configuration(#[case] raw: &str) {
-    FalconUs2Egress::from_config(raw, None).unwrap_err();
+    FalconEgress::from_config(raw, None).unwrap_err();
 }
 
 #[test]
 fn create_fallback_preserves_the_requested_overlay() {
     let configured =
-        FalconUs2Egress::from_config(r#"[{"domain":"sensor.example.test"}]"#, None).unwrap();
+        FalconEgress::from_config(r#"[{"domain":"sensor.example.test"}]"#, None).unwrap();
     assert!(for_create(false, Some(&configured)).is_none());
     assert!(for_create(true, None).is_none());
     let selected = for_create(true, Some(&configured)).unwrap();
@@ -173,7 +173,7 @@ fn create_fallback_preserves_the_requested_overlay() {
 fn rejects_invalid_exemption_activation() {
     for activation in ["", "1", "0", "TRUE", " false "] {
         assert!(matches!(
-            FalconUs2Egress::from_config(r#"[{"domain":"sensor.example.test"}]"#, Some(activation)),
+            FalconEgress::from_config(r#"[{"domain":"sensor.example.test"}]"#, Some(activation)),
             Err(FalconEgressConfigError::ExemptionsActivation(_))
         ));
     }

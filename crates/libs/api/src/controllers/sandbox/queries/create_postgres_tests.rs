@@ -3079,7 +3079,7 @@ async fn unconfigured_falcon_create_continues_to_database_access() -> TestResult
             &actor,
             &pooled_create_request("unconfigured-egress", None),
             SandboxApiMetricIdentity::native("create"),
-            FederatedSandboxCreateContext::new(Some(&owner), Some(&grant)).with_falcon_us2_egress(),
+            FederatedSandboxCreateContext::new(Some(&owner), Some(&grant)).with_falcon_egress(),
         )
         .await
         .unwrap_err();

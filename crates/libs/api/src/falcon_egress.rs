@@ -1,10 +1,8 @@
 //! Deployment-owned destinations for the existing Falcon create header.
 //!
-//! `SPACE_FALCON_US2_EGRESS_DESTINATIONS` is a JSON array of `ip`, `cidr`, and
+//! `SPACE_FALCON_EGRESS_DESTINATIONS` is a JSON array of `ip`, `cidr`, and
 //! exact `domain` destinations, parsed once at API startup. There is no built-in list.
-//! The `us2` header, environment variable, and type names remain for compatibility;
-//! they do not restrict the configured regions. No renaming is included here.
-//! TODO: remove US-2-specific names in a separate coordinated caller/config migration.
+//! `X-Space-Falcon: true` opts authenticated federated creates into this bundle.
 //! `SPACE_FALCON_TLS_INTERCEPTION_EXEMPTIONS_ENABLED` defaults to false and
 //! controls whether composition adds TLS exemptions for these destinations.
 //! Composition produces an ordinary [`NetworkPolicyV1`]; the gateway, shim,
@@ -12,11 +10,11 @@
 
 use pplx_space_net_common::{EgressDefaultAction, EgressDestinationV1, NetworkPolicyV1};
 
-const ENV: &str = "SPACE_FALCON_US2_EGRESS_DESTINATIONS";
+const ENV: &str = "SPACE_FALCON_EGRESS_DESTINATIONS";
 const EXEMPTIONS_ENV: &str = "SPACE_FALCON_TLS_INTERCEPTION_EXEMPTIONS_ENABLED";
 
 #[derive(Clone, Debug)]
-pub(crate) struct FalconUs2Egress {
+pub(crate) struct FalconEgress {
     destinations: Vec<EgressDestinationV1>,
     tls_interception_exemptions_enabled: bool,
 }
@@ -37,7 +35,7 @@ pub enum FalconEgressConfigError {
     UnsupportedDestination,
 }
 
-impl FalconUs2Egress {
+impl FalconEgress {
     pub(crate) fn from_env() -> Result<Option<Self>, FalconEgressConfigError> {
         let activation = match std::env::var(EXEMPTIONS_ENV) {
             Ok(raw) => Some(raw),
@@ -109,8 +107,8 @@ impl FalconUs2Egress {
 /// A missing optional sensor overlay must not block sandbox creation.
 pub(crate) fn for_create(
     requested: bool,
-    configured: Option<&FalconUs2Egress>,
-) -> Option<&FalconUs2Egress> {
+    configured: Option<&FalconEgress>,
+) -> Option<&FalconEgress> {
     use pplx_space_metrics::sandbox::admission::{FalconCreateOutcome, falcon_create};
 
     if !requested {
