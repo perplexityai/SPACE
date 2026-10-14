@@ -699,6 +699,11 @@ def otlp_endpoint_rejection(endpoint: str) -> str | None:
     works for every producer. Each message describes the requirement rather
     than repeating the value, which can embed credentials.
     """
+    # Keep the Kind profile and direct smoke entry points consistent. URL
+    # parsing can discard tabs/newlines, and Helm treats these separators as
+    # structure when a profile forwards an endpoint through --set.
+    if any(character.isspace() or character in ",\\{}" for character in endpoint):
+        return "must not contain whitespace or Helm value separators"
     # A valid endpoint is scheme, host, optional port and at most a bare "/",
     # so either marker is a rejection however empty it is. urlsplit reports an
     # empty query as "" and drops an empty fragment, so read the raw text.

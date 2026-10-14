@@ -442,13 +442,30 @@ and is refused. Existing Grafana configuration is retained in this reuse mode;
 it is not rewritten to query external receivers. Native transitions pause
 owned Alloy if present and leave all backend data intact.
 Before any automatic receiver installation, the log helper verifies the owned
-namespace, release chart identity, and stored manifest against this chart with
-its stored values. Pause/resume also dry-render the actual proposed Helm
-upgrade and refuse any value change except `alloy.enabled`, or any object change
-except adding/removing the known Alloy DaemonSet. Chart drift or a replaced
-release requires owner review instead of an automatic migration. Concurrent
-release changes detected before apply are refused; do not run competing Helm
-operations during a profile transition.
+namespace and release chart identity, not equality with the current checkout's
+render. Normal `logs/local.sh up` can upgrade a drifted chart or retry a failed
+owned release without deleting its data. It retains saved values, including
+image pins and storage overrides; adopting new Kind profile defaults is an
+explicit `up -f .../profiles/kind.yaml` operation with any custom overrides
+applied afterward. Inspect storage changes before doing that.
+
+Pause/resume retain the recorded non-Alloy manifests through a Helm
+post-renderer. Resume selects a collector from retained release history with
+matching backend resources, or uses the current chart only if those resources
+still match. If no compatible collector remains in history, run `up` to
+reconcile the owned chart rather than deleting its namespace. The actual
+proposed transition must still change only `alloy.enabled` and the known
+Alloy DaemonSet. Concurrent revision changes are refused, and Helm's pending
+operation locks are never stolen; inspect an interrupted operation and recover
+it through Helm, without deleting release records to bypass the lock.
+
+Healthy unchanged receiver renders do not create another Helm revision.
+`tilt down` skips receiver reconciliation entirely. Detached bootstrap uses
+`SPACE_TILT_DETACH_TIMEOUT` for context registration (60 seconds by default,
+at most 240); a timeout reports failure but leaves its detached Tilt process
+running. Cold initialization can continue in the background, and the normal
+blocking bootstrap still uses `BOOTSTRAP_TIMEOUT` for its longer readiness
+wait.
 
 With implicit local destinations, Rust workloads send metrics to
 `http://collector.space-metrics.svc.cluster.local:4317` and traces to

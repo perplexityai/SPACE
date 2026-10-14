@@ -92,9 +92,89 @@ helm_options() {
 # Helm flags appended after the parsed options.
 helm_upgrade() {
   local timeout=$1; shift
-  helm upgrade --install "$release" "$chart_dir" --kube-context "$context" \
-    --namespace "$namespace" --wait --timeout "$timeout" \
-    -f "$chart_dir/profiles/kind.yaml" "${helm_options[@]}" "$@"
+  local args=(upgrade --install "$release" "$chart_dir" --kube-context "$context"
+    --namespace "$namespace" --wait --timeout "$timeout"
+    -f "$chart_dir/profiles/kind.yaml" "${helm_options[@]}" "$@")
+  local listing state stored proposed comparison target healthy fresh
+  listing=$(helm list --all --filter "^$release$" --kube-context "$context" \
+    --namespace "$namespace" -o json) || return 1
+  state=$(printf '%s' "$listing" | python3 -c '
+import json,re,sys
+release, namespace = sys.argv[1:]
+entries = json.load(sys.stdin)
+if not entries:
+    print("absent")
+elif (len(entries) == 1 and entries[0].get("name") == release
+      and entries[0].get("namespace") == namespace
+      and re.fullmatch(re.escape(release) + r"-[0-9]+\.[0-9]+\.[0-9]+", entries[0].get("chart", ""))):
+    print(entries[0].get("status", "unknown"))
+else:
+    sys.exit("Refusing an unowned Helm release in the selected namespace")
+' "$release" "$namespace") || return 1
+  # An existing release records its Kind overlay and caller overrides. Keep
+  # those on reuse, but a first install must still receive the Kind overlay.
+  if [[ "$state" != absent && " ${helm_options[*]} " == *" --reset-then-reuse-values "* ]]; then
+    args=(upgrade --install "$release" "$chart_dir" --kube-context "$context"
+      --namespace "$namespace" --wait --timeout "$timeout" "${helm_options[@]}" "$@")
+  fi
+  if [[ "$state" == deployed ]]; then
+    stored=$(helm get manifest "$release" --kube-context "$context" --namespace "$namespace") || return 1
+    proposed=$(helm "${args[@]}" --dry-run=client -o json) || return 1
+    # Compare complete rendered resources, ignoring only Helm document framing.
+    # Keep manifests on stdin rather than exposing them in process arguments.
+    comparison=$(printf '%s\0%s' "$stored" "$proposed" | python3 -c '
+import collections,json,re,sys
+old, proposal = sys.stdin.read().split("\0", 1)
+def documents(value):
+    return collections.Counter(
+        re.sub(r"\A# Source: [^\n]*\n", "", part.strip())
+        for part in re.split(r"(?m)^---\s*$", value) if part.strip())
+desired = documents(json.loads(proposal)["manifest"])
+if documents(old) != desired:
+    print("different")
+else:
+    targets = []
+    for document in desired:
+        kind = re.search(r"(?m)^kind: (Deployment|DaemonSet|StatefulSet)$", document)
+        if kind:
+            name = re.search(r"(?m)^metadata:\n  name: ([^\n]+)$", document)
+            if not name:
+                print("different")
+                sys.exit(0)
+            targets.append(kind[1].lower() + "/" + name[1])
+    print("same")
+    print("\n".join(targets))
+') || return 1
+    if [[ "${comparison%%$'\n'*}" == same ]]; then
+      healthy=true
+      while IFS= read -r target; do
+        [[ -n "$target" && "$target" != same ]] || continue
+        if ! "${kube[@]}" -n "$namespace" rollout status "$target" --timeout=1s >/dev/null 2>&1; then
+          healthy=false
+          break
+        fi
+      done <<<"$comparison"
+      fresh=$(helm list --all --filter "^$release$" --kube-context "$context" \
+        --namespace "$namespace" -o json) || return 1
+      [[ "$fresh" == "$listing" ]] || {
+        echo "Helm release changed during reconciliation; retry without a competing operator" >&2
+        return 1
+      }
+      if [[ "$healthy" == true ]]; then
+        echo "$release: rendered resources unchanged"
+        return 0
+      fi
+    fi
+    fresh=$(helm list --all --filter "^$release$" --kube-context "$context" \
+      --namespace "$namespace" -o json) || return 1
+    [[ "$fresh" == "$listing" ]] || {
+      echo "Helm release changed during reconciliation; retry without a competing operator" >&2
+      return 1
+    }
+  fi
+  # Failed releases are retried normally. Helm retains its pending-operation
+  # lock; this helper never deletes release history or data to bypass it.
+  helm "${args[@]}"
 }
 
 # Namespace deletion destroys this release's local data, so require the caller

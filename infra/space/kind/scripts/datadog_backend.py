@@ -411,6 +411,10 @@ def stop(env):
     desired_env = {**env, **document}
     config = plan(desired_env)
     manifest = render(config)
+    # An unowned Agent must not change the watched intent either. Once this
+    # guard passes, persist local intent before apply so a transient API error
+    # cannot make a later Tilt reconciliation restart SaaS export.
+    guard_owner(config)
     descriptor, temporary = tempfile.mkstemp(prefix=path.name + ".", dir=path.parent)
     try:
         with os.fdopen(descriptor, "w") as stream:
@@ -425,7 +429,6 @@ def stop(env):
         if os.path.exists(temporary):
             os.unlink(temporary)
     # Tilt watches the same file, so its next reconciliation also stays local.
-    guard_owner(config)
     kube(config, "apply", "-f", "-", input=manifest)
     return verify(config)
 

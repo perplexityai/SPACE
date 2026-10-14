@@ -20,6 +20,7 @@ RELEASES = ("metrics", "logs", "traces", "grafana")
 HELM_STUB = r'''
 import json
 import os
+import subprocess
 import sys
 
 args = sys.argv[1:]
@@ -28,27 +29,40 @@ if os.getenv("STUB_LOG"):
         stream.write("helm " + " ".join(args) + "\n")
 service = "apiVersion: v1\nkind: Service\nmetadata:\n  name: loki\n"
 daemon = "apiVersion: apps/v1\nkind: DaemonSet\nmetadata:\n  name: alloy\nspec: {}\n"
-values = {"profile": "kind", "alloy": {"enabled": True}}
+paused = os.getenv("STUB_LOG_PAUSED") == "1"
+values = {"profile": "kind", "alloy": {"enabled": not paused}}
 def manifest(enabled):
     return service + ("---\n" + daemon if enabled else "")
 
 if args[0] == "list":
     state = os.getenv("STUB_LOG_RELEASE", "absent")
-    print(json.dumps([] if state == "absent" else [{
-        "name": "space-logs", "namespace": "space-logs", "status": "deployed",
+    logs = "^space-logs$" in args
+    print(json.dumps([] if state == "absent" or not logs else [{
+        "name": "space-logs", "namespace": "space-logs",
+        "status": os.getenv("STUB_LOG_STATUS", "deployed"),
         "chart": "foreign-1.0.0" if state == "foreign" else "space-logs-0.2.0",
-        "revision": "1",
+        "revision": "2" if paused else "1",
     }]))
 elif args[:2] == ["get", "manifest"]:
-    print(manifest(True))
+    stored = manifest(True if "--revision" in args else not paused)
+    if os.getenv("STUB_LOG_DRIFT"):
+        stored = stored.replace("name: loki", "name: loki\n  labels: {previous-chart: yes}")
+    print(stored)
 elif args[:2] == ["get", "values"]:
     print(json.dumps(values))
+elif args[0] == "history":
+    print(json.dumps([{"revision": 1, "status": "superseded", "chart": "space-logs-0.2.0"}]))
 elif args[0] == "template":
     print(manifest(json.load(sys.stdin)["alloy"]["enabled"]))
 elif args[0] == "upgrade" and "--dry-run=client" in args:
-    enabled = "alloy.enabled=true" in args
+    enabled = "alloy.enabled=false" not in args
     values["alloy"]["enabled"] = enabled
     proposed = manifest(enabled)
+    if "--post-renderer" in args:
+        proposed = subprocess.run(
+            [args[args.index("--post-renderer") + 1]], input=proposed,
+            capture_output=True, text=True, check=True,
+        ).stdout
     if os.getenv("STUB_NON_ALLOY_DELTA"):
         proposed = proposed.replace("name: loki", "name: replaced-storage")
     print(json.dumps({"manifest": proposed, "config": values}))
@@ -176,7 +190,8 @@ class HelperGuardTests(unittest.TestCase):
         # object in the proposed upgrade. Neither may reach a real mutation.
         cases = [(action, {"STUB_LOG_RELEASE": "foreign"})
                  for action in ("preflight", "up", "check", "pause", "resume")]
-        cases += [(action, {"STUB_LOG_RELEASE": "owned", "STUB_NON_ALLOY_DELTA": "1"})
+        cases += [(action, {"STUB_LOG_RELEASE": "owned", "STUB_NON_ALLOY_DELTA": "1",
+                            "STUB_LOG_PAUSED": "1" if action == "resume" else "0"})
                   for action in ("pause", "resume")]
         for action, extra in cases:
             result, log = self.run_helper("logs", action, **extra)
@@ -220,12 +235,31 @@ class HelperGuardTests(unittest.TestCase):
         _, log = self.run_helper("traces", "up", "--reuse-values")
         self.assertIn("--reset-then-reuse-values", log)
         self.assertNotIn(" --reuse-values", log)
-        for action in ("pause", "resume", "check"):
-            result, log = self.run_helper("logs", action, STUB_LOG_RELEASE="owned")
+        for action, paused, expected in (("pause", "0", 1), ("pause", "1", 0),
+                                          ("resume", "0", 0), ("resume", "1", 1),
+                                          ("check", "0", 0)):
+            for drift in ("", "1"):
+                result, log = self.run_helper(
+                    "logs", action, STUB_LOG_RELEASE="owned",
+                    STUB_LOG_PAUSED=paused, STUB_LOG_DRIFT=drift,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                actual = [line for line in log.splitlines()
+                          if line.startswith("helm upgrade") and "--dry-run" not in line]
+                self.assertEqual(len(actual), expected, log)
+        # An owned failed release is recoverable with normal up, not a reason
+        # to delete Loki data. A new checkout can also upgrade an old manifest.
+        for state, drift, expected in (("deployed", "", 0), ("deployed", "1", 1),
+                                        ("failed", "", 1)):
+            result, log = self.run_helper(
+                "logs", "up", STUB_LOG_RELEASE="owned",
+                STUB_LOG_STATUS=state, STUB_LOG_DRIFT=drift,
+            )
             self.assertEqual(result.returncode, 0, result.stderr)
             actual = [line for line in log.splitlines()
                       if line.startswith("helm upgrade") and "--dry-run" not in line]
-            self.assertEqual(len(actual), 0 if action == "check" else 1)
+            self.assertEqual(len(actual), expected, log)
+            self.assertNotIn("delete namespace", log)
 
     def test_native_profiles_do_not_create_missing_backends(self):
         for mode in ("datadog", "off"):
@@ -273,9 +307,7 @@ class HelperGuardTests(unittest.TestCase):
             line for line in log.splitlines()
             if line.startswith("helm upgrade") and "--dry-run" not in line
         ]
-        self.assertEqual(len(actual), 1)
-        self.assertIn("alloy.enabled=true", actual[0])
-        self.assertNotIn("--install", actual[0])
+        self.assertEqual(actual, [])
         self.assertNotIn("apply -f", log)
         self.assertNotIn("docker pull", log)
 
@@ -307,7 +339,7 @@ class HelperGuardTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn("get svc collector", log)
         self.assertNotIn("--install", log)
-        self.assertIn("alloy.enabled=true", log)
+        self.assertNotIn("helm upgrade", log)
 
     def test_foreign_logs_are_refused_before_image_loading_or_backend_installs(self):
         result, log = self.run_installer(

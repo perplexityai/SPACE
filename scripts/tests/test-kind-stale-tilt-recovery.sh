@@ -459,15 +459,21 @@ run_startup() {
     ) >"$work/result" 2>&1
 }
 
-work="$(mktemp -d)"
-if run_startup "$work" TEST_CONTEXT_AFTER=80 TEST_STARTUP_TIMEOUT=120; then
-    [[ "$(cat "$work/elapsed")" == 80 ]] \
-        || fail "startup must wait past the old 60s handshake for the selected context" "$(cat "$work/result")"
-else
-    fail "slow successful Tiltfile initialization must use the bootstrap budget" "$(cat "$work/result")"
-fi
-[[ ! -e "$work/unexpected-signal" ]] || fail "startup must not signal a process"
-rm -rf "$work"
+for detached in 0 1; do
+    work="$(mktemp -d)"
+    if run_startup "$work" TEST_CONTEXT_AFTER=80 TEST_STARTUP_TIMEOUT=120 \
+        KIND_STACK_DETACH="$detached" SPACE_TILT_DETACH_TIMEOUT=60; then
+        [[ "$detached" == 0 && "$(cat "$work/elapsed")" == 80 ]] \
+            || fail "only a blocking start may wait past the detached budget" "$(cat "$work/result")"
+    else
+        [[ "$detached" == 1 && "$(cat "$work/elapsed")" == 60 ]] \
+            || fail "detached registration must stop at its short bound" "$(cat "$work/result")"
+        grep -q "detached Tilt remains running" "$work/result" \
+            || fail "timeout must explain that the watcher is still running" "$(cat "$work/result")"
+    fi
+    [[ ! -e "$work/unexpected-signal" ]] || fail "startup must not signal a process"
+    rm -rf "$work"
+done
 
 for reason in dead evaluation; do
     work="$(mktemp -d)"
@@ -506,6 +512,13 @@ for invalid in 0 -1 abc; do
     [[ ! -e "$work/spawned" ]] || fail "invalid startup budget must fail before starting Tilt"
     rm -rf "$work"
 done
+
+work="$(mktemp -d)"
+if run_startup "$work" KIND_STACK_DETACH=1 SPACE_TILT_DETACH_TIMEOUT=241; then
+    fail "detached startup cannot exceed the setup-step deadline"
+fi
+[[ ! -e "$work/spawned" ]] || fail "oversized detached budget must fail before starting Tilt"
+rm -rf "$work"
 
 # Case 5: teardown stops a pidfile-less `tilt up` serving this cluster's
 # context, and leaves one serving another context alone. A real process stands

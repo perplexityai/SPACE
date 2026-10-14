@@ -225,17 +225,21 @@ def test_session_preflight_failure_does_not_mutate_or_roll_back(approved, monkey
         backend.session(approved, backend.plan(approved))
 
 
-@pytest.mark.parametrize("failure", ["apply", "concurrent_write"])
+@pytest.mark.parametrize("failure", ["apply", "concurrent_write", "ownership"])
 def test_stop_persists_local_intent_before_apply_even_if_apply_fails(
     approved, monkeypatch, failure
 ):
     path = Path(approved["SPACE_KIND_OBSERVABILITY_CONFIG"])
+    original = path.read_bytes()
     applied = []
 
     def kube(config, *args, **kwargs):
-        assert json.loads(path.read_text())["SPACE_KIND_DATADOG_MODE"] == "fakeintake"
         if args[0] == "get":
+            assert json.loads(path.read_text())["SPACE_KIND_DATADOG_MODE"] == "saas"
+            if failure == "ownership":
+                return '{"metadata": {}}'
             return ""
+        assert json.loads(path.read_text())["SPACE_KIND_DATADOG_MODE"] == "fakeintake"
         assert config["backend"] == "fakeintake"
         assert config["api_key_secret"] == backend.FAKE_SECRET
         assert "kind-dev-only-key" not in kwargs["input"]
@@ -243,7 +247,12 @@ def test_stop_persists_local_intent_before_apply_even_if_apply_fails(
         raise OSError("cluster temporarily unavailable")
 
     monkeypatch.setattr(backend, "kube", kube)
-    if failure == "concurrent_write":
+    if failure == "ownership":
+        with pytest.raises(ValueError, match="Refusing unowned"):
+            backend.stop(approved)
+        assert path.read_bytes() == original
+        assert not applied
+    elif failure == "concurrent_write":
         original_render = backend.render
 
         def render(config):

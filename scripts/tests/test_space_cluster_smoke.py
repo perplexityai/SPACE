@@ -620,6 +620,10 @@ def test_metrics_sink_selection(raw: str | None, expected: str | None) -> None:
         ),
         ({"ENDPOINT": "http://:4317"}, None, "must include a host"),
         ({"ENDPOINT": "http://collector:4317/v1/metrics"}, None, "must not include a path"),
+        ({"ENDPOINT": "http://col lector:4317"}, None, "whitespace or Helm value separators"),
+        ({"ENDPOINT": "http://collector,other:4317"}, None, "whitespace or Helm value separators"),
+        ({"ENDPOINT": "http://collector\\:4317"}, None, "whitespace or Helm value separators"),
+        ({"ENDPOINT": "http://{collector}:4317"}, None, "whitespace or Helm value separators"),
         # urlsplit reports an empty or unreadable port the same way it reports
         # none, so each of these once looked like a bare host.
         ({"ENDPOINT": "http://collector:65536"}, None, "port between 1 and 65535"),

@@ -33,11 +33,15 @@
 #   DATA_PLANE_URL    — optional data-plane health-check URL (e.g. http://localhost:8090)
 #   KIND_CLUSTER      — kind cluster name (e.g. space-local)
 #   SKIP_BOOTSTRAP=1  — skip everything; caller asserts stack is up
-#   BOOTSTRAP_TIMEOUT — per-stage seconds for Tilt initialization and API readiness
+#   BOOTSTRAP_TIMEOUT — per-stage seconds for blocking initialization/readiness
+#   SPACE_TILT_DETACH_TIMEOUT — registration wait for a detached start (default
+#                       60 seconds, at most 240). A timeout leaves the detached
+#                       watcher running; inspect its log and retry once ready.
 #   KIND_STACK_DETACH=1 — return as soon as the cluster exists and Tilt is
 #                       serving its selected context on :10350; do not wait
 #                       for the api-server, seed Job, or application rollouts.
-#                       Initial profile/backend setup still happens first.
+#                       Initial profile/backend setup still happens first, but
+#                       this call fails promptly if it is not registered yet.
 #                       `kind_stack_start_detached` is the entry point.
 #
 # Globals expected to be set by the caller before sourcing:
@@ -481,10 +485,17 @@ bootstrap_kind_stack__wait_for_api() {
 bootstrap_kind_stack__start_tilt() {
     local state_dir log pidfile tilt_pid
     local startup_timeout="${BOOTSTRAP_TIMEOUT:-1800}"
+    if [[ "${KIND_STACK_DETACH:-0}" == 1 ]]; then
+        startup_timeout="${SPACE_TILT_DETACH_TIMEOUT:-60}"
+    fi
     [[ "$startup_timeout" =~ ^[1-9][0-9]*$ ]] || {
-        echo "ERROR: BOOTSTRAP_TIMEOUT must be a positive integer number of seconds" >&2
+        echo "ERROR: Tilt startup timeout must be a positive integer number of seconds" >&2
         return 2
     }
+    if [[ "${KIND_STACK_DETACH:-0}" == 1 && "$startup_timeout" -gt 240 ]]; then
+        echo "ERROR: SPACE_TILT_DETACH_TIMEOUT must not exceed 240 seconds" >&2
+        return 2
+    fi
     state_dir="${SPACE_TILT_STATE_DIR:-$HOME/.space-devbox/kind}"
     log="${SPACE_TILT_LOG:-$state_dir/tilt-${KIND_CLUSTER}.log}"
     pidfile="${SPACE_TILT_PIDFILE:-$state_dir/tilt-${KIND_CLUSTER}.pid}"
@@ -515,7 +526,10 @@ bootstrap_kind_stack__start_tilt() {
     # Cluster registration follows Tiltfile evaluation. The selected profile
     # reconciles receivers before returning producer manifests, including image
     # loading and bounded Helm waits on a cold start. This is initialization,
-    # not a 60-second daemon-listen handshake; use the existing bootstrap budget.
+    # not merely a daemon-listen handshake. Blocking starts use the bootstrap
+    # budget; detached starts have a separate short bound so the caller is not
+    # held past its setup-step deadline. Never claim readiness without the
+    # selected context, and never kill the detached watcher on a timeout.
     local tilt_deadline=$(( $(date +%s) + startup_timeout ))
     local error="" evaluation_error now last_log_at=0
     while [[ $(date +%s) -lt $tilt_deadline ]]; do
@@ -545,6 +559,9 @@ bootstrap_kind_stack__start_tilt() {
     echo "ERROR: ${error:-tilt did not report context kind-${KIND_CLUSTER} on :10350 within ${startup_timeout}s}" >&2
     tail -n 60 "$log" >&2 || true
     echo "  inspect: $log" >&2
+    if [[ "${KIND_STACK_DETACH:-0}" == 1 ]] && kill -0 "$tilt_pid" 2>/dev/null; then
+        echo "  detached Tilt remains running; inspect initialization and retry when ready" >&2
+    fi
     return 1
 }
 
@@ -826,7 +843,9 @@ kind_stack_assert_cluster_mounts() {
 
 # Detached application bring-up: cluster created, Tilt started in its own
 # session and its selected context verified, then return. Initial profile
-# reconciliation still completes before that context is registered. Everything
+# reconciliation still completes before that context is registered. Registration
+# has a short independent bound; timeout is a failed readiness check, not a
+# request to stop the detached process. Everything
 # `bootstrap_kind_stack` additionally guarantees (api-server,
 # seed Job, rollouts) is left for Tilt to finish in the background; a later
 # `bootstrap_kind_stack` (any kind smoke) finds Tilt running and waits then.

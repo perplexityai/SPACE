@@ -95,7 +95,9 @@ for signal in ["metrics", "traces", "logs", "grafana", "common"]:
         watch_file("infra/space/kind/" + signal + "/local.sh")
         watch_file("infra/space/kind/" + signal + "/namespace.yaml")
 # Show progress while a cold profile loads images and waits for its receivers.
-local(["bash", "infra/space/kind/scripts/install-observability.sh"])
+# Teardown evaluates this file too; it must not install or resume receivers.
+if config.tilt_subcommand != "down":
+    local(["bash", "infra/space/kind/scripts/install-observability.sh"])
 
 if TELEMETRY_MODE == "otel":
     # Each backend on the port its own `local.sh ui` helper uses; bootstrap.sh

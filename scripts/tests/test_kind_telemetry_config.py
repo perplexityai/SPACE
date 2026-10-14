@@ -452,6 +452,11 @@ def test_empty_explicit_env_falls_back_to_the_legacy_variable():
         ("http://collector:4317/v1/traces", True),
         ("http://collector:4317?", True),
         ("http://collector:4317#", True),
+        ("http://collector:4317\t", True),
+        ("http://col lector:4317", True),
+        ("http://collector,other:4317", True),
+        ("http://collector\\:4317", True),
+        ("http://{collector}:4317", True),
     ],
 )
 def test_shim_endpoint_override_follows_the_shared_rule(endpoint, rejected) -> None:
