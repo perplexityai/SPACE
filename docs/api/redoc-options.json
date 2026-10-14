@@ -21,7 +21,7 @@
     "spacing": { "sectionHorizontal": 32, "sectionVertical": 28 },
     "sidebar": {
       "width": "248px",
-      "backgroundColor": "#ffffff",
+      "backgroundColor": "#f7f9f9",
       "textColor": "#526565",
       "activeTextColor": "#176f72"
     },

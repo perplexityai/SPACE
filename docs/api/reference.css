@@ -1,4 +1,4 @@
-body { margin: 0; color: var(--docs-color-text); background: var(--docs-color-background); font-family: var(--docs-font-body); }
+body { margin: 0; color: var(--docs-color-text); background: var(--docs-color-surface); font-family: var(--docs-font-body); }
 a { color: var(--docs-color-accent); }
 .docs-header {
   position: fixed;
