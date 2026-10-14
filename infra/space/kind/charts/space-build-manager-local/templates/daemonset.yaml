@@ -21,6 +21,10 @@
 {{- $db := "/space/run/build-manager/build-manager.db" -}}
 {{- include "space-node-service.serviceAccount" $ctx }}
 ---
+# build-manager reviews its caller's projected token (BuildTokenReviewer,
+# crates/libs/common/svc/src/auth/build/k8s.rs).
+{{ include "space-node-service.tokenReviewRbac" $ctx }}
+---
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
@@ -51,8 +55,13 @@ spec:
     spec:
       {{- include "space-node-service.nodeSelector" $ctx | nindent 6 }}
       serviceAccountName: {{ include "space-node-service.name" $ctx }}
-      # The ClusterApi token is projected below; no Kubernetes API access.
-      automountServiceAccountToken: false
+      # TokenReview needs the pod's own API credentials (the in-cluster
+      # config of traced_kube_client_from_env,
+      # crates/libs/common/svc/src/kube_client.rs), and the allowlists name
+      # accounts in the namespace read from the same mount (auth_namespace,
+      # crates/libs/common/svc/src/auth/k8s.rs). The account may only
+      # create TokenReviews (RBAC above).
+      automountServiceAccountToken: true
       # Pod network: build-manager needs nothing from the node's network
       # namespace. SSH into build VMs runs inside `nsenter --net` on the VM's
       # namespace handle (crates/libs/build/mgr/src/ssh.rs); its other peers
@@ -111,7 +120,24 @@ spec:
             # The BuildManager listener's TLS identity
             # (space-builder-build-manager, docs/internal-rpc-tls.md).
             {{- include "space-node-service.env.rpcIdentity" . | nindent 12 }}
+            # Still required at startup (run, crates/libs/build/mgr/server/src/run.rs),
+            # but with Kubernetes auth on it admits no caller (BuildAuthenticator,
+            # auth/build.rs).
             {{- include "space-node-service.env.internalToken" . | nindent 12 }}
+            # TokenReview of the caller's projected token, audience
+            # space-build-manager, with no static fallback, as deployed
+            # (BuildAuthLayer::from_env, crates/libs/common/svc/src/auth/build.rs;
+            # BuildSurface::Manager, auth/build/k8s.rs).
+            - name: SPACE_K8S_TOKEN_AUTH_ENABLED
+              value: "true"
+            - name: SPACE_K8S_TOKEN_AUTH_STATIC_FALLBACK_ENABLED
+              value: "false"
+            {{- range $name, $accounts := .Values.auth }}
+            {{- if $accounts }}
+            - name: {{ $name }}
+              value: {{ join "," $accounts | quote }}
+            {{- end }}
+            {{- end }}
             {{- include "space-node-service.env.diskAdmission" . | nindent 12 }}
             {{- include "space-node-service.env.objectStoreCredentials" . | nindent 12 }}
             - name: SPACE_OBJECT_STORE_BUCKET

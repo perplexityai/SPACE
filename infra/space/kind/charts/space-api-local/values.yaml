@@ -208,6 +208,10 @@ eppo:
 serviceAccount:
   name: space-api
 
+# Lifetime of the projected node-api tokens, as deployed; the kubelet
+# refreshes them at 80% of that.
+nodeApiTokenExpirationSeconds: 600
+
 # ServiceAccounts the ingress activation listener admits: internal-api, the
 # only route resolver that delegates cold wakes (RemoteIngressActivation).
 ingressActivation:

@@ -19,6 +19,78 @@ node: {}
 # sandbox traffic goes to each pod's host_ip:9800 instead.
 serviceName: space-worker-node-api
 
+# Kubernetes token auth: the ServiceAccounts each node-api surface admits,
+# rendered as the env vars of the same names (K8sTokenAuthConfig,
+# crates/libs/common/svc/src/auth/k8s.rs; names are qualified with
+# node-api's own namespace). These are the worker role's; values-builder.yaml
+# replaces them for builders. An empty list renders nothing.
+auth:
+  # WorkerApi and NodeInfo (audience space-node-api). The api's substrate,
+  # which the shared and admin api surfaces and the cluster-controller's
+  # operation dispatcher, warm-pool probe and trigger fan-out all run
+  # (crates/libs/api/src/controllers/substrate/mod.rs, substrate/kubernetes/,
+  # crates/libs/cluster/reconciler/src/trigger_fanout.rs); the data plane's
+  # guest calls (crates/libs/data/plane/server/src/native/protocol.rs);
+  # internal-api's service-port routes
+  # (crates/libs/internal/api/server/src/sandbox_service_ports.rs); and
+  # either role's node-api pulling a template it exports (connect_remote,
+  # crates/libs/node/api/server/src/transfer.rs).
+  SPACE_NODE_API_AUTH_ALLOWED_SERVICE_ACCOUNTS:
+    - space-api
+    - space-cluster-controller
+    - space-data-plane
+    - space-internal-api
+    - space-node-api
+    - space-builder-node-api
+  # WorkerApiInternal (audience space-node-api-internal): only the api's
+  # substrate dials it, from the api and the cluster-controller
+  # (internal_client, substrate/mod.rs;
+  # substrate/kubernetes/pod_ops/worker_clients.rs).
+  SPACE_NODE_API_INTERNAL_AUTH_ALLOWED_SERVICE_ACCOUNTS:
+    - space-api
+    - space-cluster-controller
+  # Lifecycle-probe SpacedWaitReady (classify_wait_ready_caller, worker.rs):
+  # the substrate's readiness waits and the cluster-controller's warm-pool
+  # probe. Required on a worker (validate_for_role, auth/k8s.rs).
+  SPACE_NODE_API_AUTH_TRUSTED_WAIT_READY_SERVICE_ACCOUNTS:
+    - space-api
+    - space-cluster-controller
+  # Caller-supplied network and auto-lifecycle policy, template and pool
+  # mutation (worker.rs, auth/template.rs): the substrate's creates, starts,
+  # wakes and policy updates. Required on both roles (validate_for_role).
+  SPACE_NODE_API_AUTH_TRUSTED_POLICY_SERVICE_ACCOUNTS:
+    - space-api
+    - space-cluster-controller
+  # The data plane is the guest bridge, confined to guest calls
+  # (guest_bridge_method, auth/k8s.rs). node-api adds it whatever this
+  # says (K8sTokenAuthConfig::from_environment); listed so the edge's
+  # restriction is visible.
+  # internal-api must not be here: its AllowPort is not a guest call.
+  SPACE_NODE_API_AUTH_GUEST_BRIDGE_SERVICE_ACCOUNTS:
+    - space-data-plane
+  # Peer template transfers: PullTemplate and NodeExportTemplate need this
+  # grant as well as admission above (require_template_transfer_authority and
+  # prepare_template_export,
+  # crates/libs/common/svc/src/auth/template_transfer.rs). With Kubernetes
+  # auth on, only these accounts get it (AuthPolicy::authenticated_caller,
+  # auth/k8s.rs), and an empty list refuses every transfer. A pull is started
+  # on the target as the api's account: its only in-tree caller, admin-api's
+  # pull_node_template (crates/libs/api/src/routes/admin/node_maintenance.rs),
+  # answers 501 on the Kubernetes substrate (require_admin_node_registry), so
+  # here a pull is an operator's direct PullTemplate call with a space-api
+  # token. The target's node-api, of either role, then asks the source for the
+  # export with its own token (connect_remote, transfer.rs).
+  SPACE_NODE_API_AUTH_TEMPLATE_TRANSFER_SERVICE_ACCOUNTS:
+    - space-api
+    - space-node-api
+    - space-builder-node-api
+
+# Lifetimes of the projected tokens node-api presents, as deployed: its
+# NodeApi token, and on builders its build-manager token, which outlasts a
+# build's longest call. The kubelet refreshes each at 80% of its lifetime.
+nodeApiTokenExpirationSeconds: 600
+buildManagerTokenExpirationSeconds: 7200
+
 # Builder role only: build-manager's node-local Service
 # (space-build-manager-local), whose name is the one its TLS leaf carries
 # (crates/libs/build/mgr/client/src/lib.rs).

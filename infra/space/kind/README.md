@@ -91,16 +91,12 @@ releases, or tags; this is unconditional and has no compatibility switch.
 Each node service runs under its own DaemonSet's ServiceAccount and projects its
 own ClusterApi token, and only build-manager's builder account
 (`space-builder-build-manager`) carries operator and tenant publisher authority
-(`clusterApiAuth` in the internal-api chart). The Kind node-api and build-manager
-listeners still accept the shared static token as trusted build authority: a
-worker can submit an operator build through that route even though ClusterApi
-rejects direct worker publication.
-
-The direct-registration tests prove ClusterApi's publisher checks, not end-to-end
-worker isolation. That also requires Kubernetes authentication on the builder
-listeners, with each system-build caller explicitly reviewed. Kind's static build
-credentials are a local development limitation and must not be used as a secure
-deployment model.
+(`clusterApiAuth` in the internal-api chart). The build path before publication
+is reviewed the same way: the builder node-api admits `BuildTemplate` only from
+the api's account, which holds both system and tenant build authority, and
+build-manager admits only the builder node-api's account. Neither listener
+accepts the shared static token, so a worker cannot submit a build through
+either (see [Service identities](#service-identities)).
 
 ## CI smoke partitions
 
@@ -942,6 +938,19 @@ inside a Kind node before starting a large build. Cold Rust builds can consume
 substantial space; the incremental artifact build keeps its `target/` under
 `$HOME` instead.
 
+### Kind apiserver timeouts during parallel builds
+
+Kind runs the whole control plane, apiserver and etcd, in one container that
+shares the host's CPU, memory and disk with the image builds and with Tilt's
+loads of every image into every node. When many of those run at once, etcd's
+write latency can spike until the apiserver stops answering: Tilt or `tilt ci`
+then fails on a Kind API liveness timeout, or the apiserver returns TLS
+handshake timeouts. Start Tilt with `SPACE_TILT_MAX_PARALLEL_UPDATES=1` (or `2`)
+in its environment to bound its parallel updates; the `Tiltfile` reads it into
+`update_settings(max_parallel_updates)`, defaults to 8, and `tilt up` has no flag
+for it. The bring-up is slower but keeps the control plane responsive. If the
+host is under-provisioned, give it more CPU and memory.
+
 ## Seed template
 
 The seed is built locally by the **production seed builder**
@@ -1159,8 +1168,8 @@ reflector use) and `app.kubernetes.io/part-of=space-node`.
 | template-manager | space-tmplmgr + SPACE_TEMPLATE_MANAGER_GROUPS | non-root, no capabilities, read-only rootfs, hostNetwork; `/space/cache` HostToContainer | btrfs work delegated to node-manager (`btrfs_via_nodemgr.rs`); host network because its template-release reads are scoped by source address (below) |
 | sandbox-manager | space-sbxmgr + SPACE_SANDBOX_MANAGER_GROUPS | non-root, no capabilities, read-only rootfs, hostPID, hostNetwork; `/space/cache` HostToContainer, `/space/etc` read-only | gateway callers are authorized by their host pid, and Firecracker pids go to the node's shim (`service/gateway_identity.rs`, `network_runtime.rs`); host network for its node-bound ClusterApi RPCs |
 | node-ctl | space-nodectl + SPACE_NODECTL_GROUPS | non-root, no capabilities, read-only rootfs, hostNetwork; its own ServiceAccount with Node RBAC, fenced by `node-fence.yaml` | the Kubernetes node-local controller; host network for its node-bound ClusterApi RPCs |
-| node-api | space-nodeapi + worker/builder groups | non-root, no capabilities, read-only rootfs, hostNetwork, port `grpc` 9800 | the API dials `host_ip:9800` and reads the `grpc` port; on builders it reaches build-manager through the node-local `space-builder-build-manager` Service and sleeps 5 s in preStop (below) |
-| build-manager | root | privileged, hostPID, pod network behind the node-local `space-builder-build-manager` Service (`internalTrafficPolicy: Local`); `/var/run/netns` and `/space/cache` HostToContainer, the node's containerd | loop and bind mounts for OCI assembly, `nsenter --net` into build VMs through netns handles node-manager mounts after it starts, `ctr` against the node's containerd (`crates/libs/build/mgr/src`); host PID to watch the build VM's host Firecracker pid exit (`vm.rs`); no host network: SSH into build VMs runs inside `nsenter --net` |
+| node-api | space-nodeapi + worker/builder groups | non-root, no capabilities, read-only rootfs, hostNetwork, port `grpc` 9800; its ServiceAccount's API credentials (TokenReview only) and projected node-api and, on builders, build-manager tokens | reviews callers' tokens; the API dials `host_ip:9800` and reads the `grpc` port; on builders it reaches build-manager through the node-local `space-builder-build-manager` Service and sleeps 5 s in preStop (below) |
+| build-manager | root | privileged, hostPID, pod network behind the node-local `space-builder-build-manager` Service (`internalTrafficPolicy: Local`); `/var/run/netns` and `/space/cache` HostToContainer, the node's containerd; its ServiceAccount's API credentials (TokenReview only) | reviews the builder node-api's token; loop and bind mounts for OCI assembly, `nsenter --net` into build VMs through netns handles node-manager mounts after it starts, `ctr` against the node's containerd (`crates/libs/build/mgr/src`); host PID to watch the build VM's host Firecracker pid exit (`vm.rs`); no host network: SSH into build VMs runs inside `nsenter --net` |
 | space-node-debug (Kind only) | root | privileged; `/space/run`, `/space/cache` HostToContainer, `/space/bin`, `/space/vendor`, `/run/containerd`, `/var/run/netns` HostToContainer read-only | the operator shell; see below |
 
 internal-api binds every node-bound ClusterApi RPC — `PublishNodeState`, the
@@ -1355,6 +1364,77 @@ broker and the authority and every replica serves every org, and so Kind's keys
 protect nothing. The authority runs two replicas and rolls one at a time. Agents
 started before the authority exit and are restarted until it answers.
 
+**node-api and build-manager authentication.** As deployed services do, both
+node-api roles and build-manager authenticate every caller by TokenReview of
+its projected ServiceAccount token, with the static fallback off
+(`SPACE_K8S_TOKEN_AUTH_ENABLED`, `SPACE_K8S_TOKEN_AUTH_STATIC_FALLBACK_ENABLED=false`).
+The shared `SPACE_INTERNAL_TOKEN` and `SPACE_INTERNAL_CONTROL_TOKEN` are still
+mounted, because the binaries require them at startup, but admit nobody. The
+audiences are the code's: `space-node-api` for WorkerApi, BuilderApi and
+NodeInfo, `space-node-api-internal` for WorkerApiInternal, and
+`space-build-manager`. Each surface admits the accounts the code shows calling
+it, set in `charts/space-node-api-local/values.yaml` (workers),
+`values-builder.yaml` (builders) and `charts/space-build-manager-local/values.yaml`.
+Nothing in Kind starts a peer template transfer by itself: the admin
+template-pull route serves only the direct substrate and answers 501 here, as on
+any Kubernetes deployment. An operator starts one with `PullTemplate` on the
+target node-api and a `space-api` token, and the transfer list admits that call
+and the target node-api's export request to the source:
+
+| Surface | Admits |
+|---|---|
+| worker WorkerApi, NodeInfo | `space-api` (shared and admin api), `space-cluster-controller`, `space-data-plane` (guest bridge, guest calls only), `space-internal-api`, both node-api accounts (template transfers) |
+| worker WorkerApiInternal | `space-api`, `space-cluster-controller` |
+| worker lifecycle-probe `SpacedWaitReady`, caller-supplied policy, template and pool mutation | `space-api`, `space-cluster-controller` |
+| builder BuilderApi, NodeInfo | `space-api`, `space-cluster-controller`, both node-api accounts |
+| builder `BuildTemplate` (system and tenant), policy, template deletion | `space-api` |
+| peer template transfers (`PullTemplate`, `NodeExportTemplate`), both roles | `space-api` (starts a pull), both node-api accounts (the target asks the source for the export) |
+| build-manager (system and tenant builds) | `space-builder-node-api` |
+
+Every caller mounts its tokens under `/var/run/space-auth` and names them with
+`SPACE_NODE_API_TOKEN_PATH`, `SPACE_NODE_API_INTERNAL_TOKEN_PATH` (api and
+cluster-controller) or `SPACE_BUILD_MANAGER_TOKEN_PATH` (builder node-api). An
+explicit path makes a missing token an error instead of a fall back to the
+static token. The tokens live 600 s, the builder's build-manager token 7200 s,
+and node services' ClusterApi and credential-manager tokens 600 s, as deployed;
+the kubelet refreshes each at 80% of its lifetime and the clients reread the
+file. node-api and build-manager mount their own ServiceAccount's API
+credentials, which may only create TokenReviews, and read the namespace their
+allowlists name from that mount, as a release binary does: no chart sets the
+`SPACE_K8S_TOKEN_AUTH_NAMESPACE` test hook. node-ctl's own authentication is
+unchanged.
+
+The smoke harness and the `space-node-debug` CLIs call neither surface: the
+harness drives the public API, and the shell's CLIs use node-local Unix
+sockets. An operator who calls build-manager directly with `space-buildmgr`
+does what they would on a deployed builder: mint a short-lived token for an
+admitted account with the build-manager audience, and give the CLI that token
+and the cluster's internal RPC CA. A job exists only in the node-local SQLite
+store of the build-manager that ran it, and the CLI's
+`space-builder-build-manager` Service is `internalTrafficPolicy: Local`, so ask
+from each builder's shell until one knows the job; the other answers
+`NotFound`. The job ID is the `job_id` the admin template build API returns:
+
+```bash
+k() { kubectl --context kind-space-local -n space "$@"; }
+job=<job-id>
+for builder in $(kubectl --context kind-space-local get nodes -l space.pplx.net/node-pool=builder \
+    -o jsonpath='{.items[*].metadata.name}'); do
+  shell=$(k get pods -l app.kubernetes.io/name=space-node-debug \
+    --field-selector spec.nodeName="$builder" -o jsonpath='{.items[0].metadata.name}')
+  k create token space-builder-node-api --audience space-build-manager --duration 10m \
+    | k exec -i "$shell" -c shell -- sh -c 'cat >/tmp/build-manager.token'
+  k get secret space-internal-rpc-ca -o jsonpath='{.data.ca\.crt}' | base64 -d \
+    | k exec -i "$shell" -c shell -- sh -c 'cat >/tmp/rpc-ca.crt'
+  k exec "$shell" -c shell -- env SPACE_BUILD_MANAGER_TOKEN_PATH=/tmp/build-manager.token \
+    SPACE_INTERNAL_RPC_TLS_CA=/tmp/rpc-ca.crt \
+    SPACE_BUILD_MANAGER_ENDPOINT=https://space-builder-build-manager:9900 \
+    space-buildmgr status --job-id "$job" && echo "ran on $builder" && break
+done
+```
+
+The public template build API needs none of this and is the supported path.
+
 **Internal RPC TLS.** Kind runs ClusterApi, NodeApi, BuildManager,
 IngressActivationApi and the credential-manager authority over authenticated
 TLS, as deployed services do
@@ -1381,8 +1461,9 @@ node-local `space-builder-build-manager` Service. The CA's key
 stays in the Kind-only `space-internal-rpc-ca-signing` Secret, which no workload
 mounts. The script restarts a listener whose identity it reissued, and every
 workload if the CA itself changed, because neither reloads them while running.
-TLS here is server-authenticated: bearer tokens still authorize callers, and
-internal-api's node-address check is unchanged. The api's ingress activation
+TLS here is server-authenticated: projected ServiceAccount tokens, reviewed by
+each listener, authorize callers (see node-api and build-manager authentication
+above), and internal-api's node-address check is unchanged. The api's ingress activation
 listener admits only internal-api's ServiceAccount, by TokenReview of its
 projected `space-cluster-api` token with no static fallback, as
 [Ingress activation delegation](../../../docs/internal-rpc-tls.md#ingress-activation-delegation)
@@ -1397,7 +1478,7 @@ asks of the hosting deployment.
 | `/space/cache` is btrfs on instance-store NVMe, reformatted on every boot | btrfs on a sparse loopback image at `/var/lib/space-cache.img` on the kind node (40 GiB, same code paths, less I/O headroom), mounted `nosuid,noatime` on the node's `/space/cache` by `space-cache.service`, which reformats it on every start of the node container, so like the NVMe it outlives pod restarts but not node restarts |
 | The node bootstrap installs a checksum-verified `containerd-shim-space-v2` before containerd starts, and registers the `space` runtime under `io.containerd.cri.v1.runtime` with a `CniConfDir` option | the node image registers the same runtime with the same options (in kind's version 2 config format, which containerd migrates to that plugin), so containerd loads it on its first start; the binary arrives after the cluster exists, copied onto each running sandbox worker by `install-shim.sh`, which checks its SHA-256 on the node. Installing it at boot would need the shim built and staged on a host path before `kind create` in every bring-up path |
 | Every node group's bootstrap sets kubelet `eventRecordQPS: 0` and `--fail-swap-on=false` | the same settings on sandbox workers and builders, baked into the node image as a kubelet `--config-dir` drop-in (`node/kubelet/50-space.conf`); the infra node runs the unmodified base image, so its kubelet keeps kind's event rate limit (`failSwapOn` is already `false` there). No sandbox pod runs on it, so none of their events pass through that limit |
-| Release binaries read no test hooks | every binary is built with `test-hooks`, and the charts set these hooks on every run: sandbox-manager's on-node snapshot reaper at target fraction 0, interval 15 s, grace 60 s and idle 120 s, against release values of 0.40, 300 s, 1800 s and 86400 s (`charts/space-sandbox-manager-local/values.yaml`, `snapshot_gc.rs`); template-manager's cache GC at interval 15 s and grace 60 s, against 300 s and 1800 s, and its prefetch latest-N at 1, against 5 (`charts/space-template-manager-local/values.yaml`, `eviction.rs`, `prefetch.rs`); the disk-admission reservation below; and api's and internal-api's TokenReview namespace, set to the release namespace that release builds read from the service-account mount. Scenarios shorten further hooks, such as the snapshot-retention sweeper's minimum age and the activation-admission burst, for their own run and restore them. The public-operation dispatcher's tick, claim limit and claim staleness stay at their release values |
+| Release binaries read no test hooks | every binary is built with `test-hooks`, and the charts set these hooks on every run: sandbox-manager's on-node snapshot reaper at target fraction 0, interval 15 s, grace 60 s and idle 120 s, against release values of 0.40, 300 s, 1800 s and 86400 s (`charts/space-sandbox-manager-local/values.yaml`, `snapshot_gc.rs`); template-manager's cache GC at interval 15 s and grace 60 s, against 300 s and 1800 s, and its prefetch latest-N at 1, against 5 (`charts/space-template-manager-local/values.yaml`, `eviction.rs`, `prefetch.rs`); and the disk-admission reservation below. Scenarios shorten further hooks, such as the snapshot-retention sweeper's minimum age and the activation-admission burst, for their own run and restore them. The public-operation dispatcher's tick, claim limit and claim staleness stay at their release values |
 | 8 GiB disk-admission reservation per cache allocation (release default) | 1 GiB through the `SPACE_NODE_DISK_ADMISSION_ALLOCATION_RESERVATION_BYTES` test hook, with the 1 GiB `MIN_AVAILABLE_BYTES` floor, so allocations fit the 40 GiB cache (`charts/space-node-service/values.yaml`) |
 | Postgres on RDS, secrets via ExternalSecrets / AWS Secrets Manager | In-cluster `space-postgres` StatefulSet, one pod on a 1 GiB volume, static Kubernetes Secrets |
 | PostgreSQL 17 | The same major version (`postgres:17`; CI takes it from the image mirror at a pinned digest) |
@@ -1420,6 +1501,7 @@ asks of the hosting deployment.
 | ALB ingress in front of api / data-plane / ui             | NodePort entry Services behind the cluster's host port mappings for api and data-plane (kube-proxy balances per connection); `kubectl port-forward` for the single-replica ui |
 | The runtime manager installs releases and kernels, which node-manager publishes into the root-owned store `/space/vendor/artifacts` | `/space/vendor` is a read-only host bind, so the runtime manager runs `--list-only`: listing and cache checks work, installs are off |
 | Operators run node-local CLIs from the node host's shell   | the same CLIs run in the Kind-only `space-node-debug` root shell DaemonSet     |
+| Release binaries, built without `test-hooks`              | binaries built with `test-hooks` (`docker/Dockerfile.rust-build-kind`), so smokes can shrink timers and flip scenario switches; no chart sets a hook for authentication, and the TokenReview listeners read their namespace from the ServiceAccount mount as release binaries do |
 | Build sizing, concurrency, and multipart sizes are configurable | 20 GiB default build disk, one concurrent build, and smaller multipart parts fit the 40 GiB local btrfs cache |
 
 `space-seed-publish` remains the bootstrap for `seed:latest`; it is not a

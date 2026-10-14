@@ -40,6 +40,10 @@ service:
   port: 9800
   type: ClusterIP
 
+# Lifetime of the projected node-api token, as deployed; the kubelet
+# refreshes it at 80% of that.
+nodeApiTokenExpirationSeconds: 600
+
 internal:
   secretName: space-internal
 

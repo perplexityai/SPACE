@@ -5,6 +5,11 @@
 {{- end -}}
 {{- include "space-node-service.serviceAccount" $ctx }}
 ---
+# node-api reviews every caller's projected ServiceAccount token
+# (K8sTokenReviewer, crates/libs/common/svc/src/auth/k8s.rs; and, on builders,
+# the BuildTemplate reviewer in auth/build/k8s.rs).
+{{ include "space-node-service.tokenReviewRbac" $ctx }}
+---
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
@@ -32,8 +37,13 @@ spec:
     spec:
       {{- include "space-node-service.nodeSelector" $ctx | nindent 6 }}
       serviceAccountName: {{ include "space-node-service.name" $ctx }}
-      # The ClusterApi token is projected below; no Kubernetes API access.
-      automountServiceAccountToken: false
+      # TokenReview needs the pod's own API credentials, found by the kube
+      # client's in-cluster config (traced_kube_client_from_env,
+      # crates/libs/common/svc/src/kube_client.rs), and the auth allowlists
+      # name accounts in the namespace read from the same mount
+      # (auth_namespace, crates/libs/common/svc/src/auth/k8s.rs). The
+      # account may only create TokenReviews (RBAC above).
+      automountServiceAccountToken: true
       # Host network: the API dials each node's node-api at host_ip:9800.
       # ClusterFirstWithHostNet keeps in-cluster DNS for ClusterApi and, on
       # builders, build-manager's node-local Service.
@@ -67,9 +77,11 @@ spec:
             # The NodeApi listener's TLS identity, the leaf every node-api on
             # the cluster shares (space-node-api, docs/internal-rpc-tls.md).
             {{- include "space-node-service.env.rpcIdentity" . | nindent 12 }}
-            # Static bearer tokens node-api's listeners require
-            # (crates/libs/node/api/server/src/run.rs); the worker role also
-            # protects WorkerApiInternal with the control token.
+            # The static bearer tokens node-api still requires at startup
+            # (run, run.rs; the worker role's WorkerApiInternal control
+            # token). With Kubernetes auth on and the fallback off, neither
+            # admits a caller (NodeApiAuthenticator::authenticate,
+            # crates/libs/common/svc/src/auth/mod.rs).
             {{- include "space-node-service.env.internalToken" . | nindent 12 }}
             {{- if eq $role "worker" }}
             - name: SPACE_INTERNAL_CONTROL_TOKEN
@@ -80,6 +92,35 @@ spec:
             {{- else }}
             - name: SPACE_BUILD_MANAGER_ENDPOINT
               value: {{ .Values.buildManagerEndpoint | quote }}
+            # node-api's own build-manager credential (BearerAuthInterceptor,
+            # crates/libs/build/mgr/client/src/lib.rs); build-manager
+            # admits this account by TokenReview with no static fallback.
+            - name: SPACE_BUILD_MANAGER_TOKEN_PATH
+              value: /var/run/space-auth/build-manager.token
+            {{- end }}
+            # node-api's own NodeApi credential, for the template transfers it
+            # pulls from a registered peer node-api of either role: it presents
+            # this token to the peer's NodeExportTemplate (connect_remote,
+            # crates/libs/node/api/server/src/transfer.rs).
+            - name: SPACE_NODE_API_TOKEN_PATH
+              value: /var/run/space-auth/node-api.token
+            # Kubernetes TokenReview auth on both listeners, with no static
+            # fallback, as deployed (NodeApiAuthConfig, auth/mod.rs;
+            # K8sTokenAuthConfig::from_environment, auth/k8s.rs). The
+            # audiences are the code's own: space-node-api for WorkerApi,
+            # BuilderApi and NodeInfo, space-node-api-internal for
+            # WorkerApiInternal (DEFAULT_NODE_API_AUDIENCE,
+            # DEFAULT_NODE_API_INTERNAL_AUDIENCE and K8sTokenAuthConfig::policy,
+            # auth/k8s.rs).
+            - name: SPACE_K8S_TOKEN_AUTH_ENABLED
+              value: "true"
+            - name: SPACE_K8S_TOKEN_AUTH_STATIC_FALLBACK_ENABLED
+              value: "false"
+            {{- range $name, $accounts := .Values.auth }}
+            {{- if $accounts }}
+            - name: {{ $name }}
+              value: {{ join "," $accounts | quote }}
+            {{- end }}
             {{- end }}
           {{- if eq $role "builder" }}
           # Leave the builder Service's endpoints before draining (values.yaml).
@@ -95,6 +136,9 @@ spec:
             {{- include "space-node-service.mount.rpcCa" . | nindent 12 }}
             {{- include "space-node-service.mount.rpcIdentity" . | nindent 12 }}
             {{- include "space-node-service.mount.private" . | nindent 12 }}
+            - name: space-auth
+              mountPath: /var/run/space-auth
+              readOnly: true
           {{- with .Values.resources }}
           resources:
             {{- toYaml . | nindent 12 }}
@@ -105,6 +149,22 @@ spec:
         {{- include "space-node-service.volume.rpcCa" . | nindent 8 }}
         {{- include "space-node-service.volume.rpcIdentity" (dict "secret" "space-node-api-tls") | nindent 8 }}
         {{- include "space-node-service.volume.private" . | nindent 8 }}
+        # Projected tokens node-api presents: to peer node-apis for
+        # transfers and, on builders, to build-manager.
+        - name: space-auth
+          projected:
+            defaultMode: 0444
+            sources:
+              - serviceAccountToken:
+                  path: node-api.token
+                  audience: space-node-api
+                  expirationSeconds: {{ .Values.nodeApiTokenExpirationSeconds | int }}
+              {{- if eq $role "builder" }}
+              - serviceAccountToken:
+                  path: build-manager.token
+                  audience: space-build-manager
+                  expirationSeconds: {{ .Values.buildManagerTokenExpirationSeconds | int }}
+              {{- end }}
 ---
 apiVersion: v1
 kind: Service

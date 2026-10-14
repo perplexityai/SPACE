@@ -46,6 +46,30 @@ space-node-api-local:
   # kind/charts/space-node-api-local/values-builder.yaml
   serviceName: space-builder-node-api
   buildManagerEndpoint: https://space-builder-build-manager:9900
+  # The builder's TokenReview allowlists, which replace the worker's
+  # (values.yaml), as the same file sets them; without the template-build
+  # grant every BuildTemplate call would be refused.
+  auth:
+    SPACE_NODE_API_AUTH_ALLOWED_SERVICE_ACCOUNTS:
+      - space-api
+      - space-cluster-controller
+      - space-node-api
+      - space-builder-node-api
+    SPACE_NODE_API_INTERNAL_AUTH_ALLOWED_SERVICE_ACCOUNTS: []
+    SPACE_NODE_API_AUTH_TRUSTED_WAIT_READY_SERVICE_ACCOUNTS: []
+    SPACE_NODE_API_AUTH_TRUSTED_POLICY_SERVICE_ACCOUNTS:
+      - space-api
+    SPACE_NODE_API_AUTH_GUEST_BRIDGE_SERVICE_ACCOUNTS: []
+    SPACE_NODE_API_AUTH_TEMPLATE_TRANSFER_SERVICE_ACCOUNTS:
+      - space-api
+      - space-node-api
+      - space-builder-node-api
+    SPACE_NODE_API_AUTH_TEMPLATE_BUILD_SERVICE_ACCOUNTS:
+      - space-api
+    SPACE_BUILD_AUTH_SYSTEM_SERVICE_ACCOUNTS:
+      - space-api
+    SPACE_BUILD_AUTH_TENANT_SERVICE_ACCOUNTS:
+      - space-api
 space-build-manager-local:
   node:
     role: builder

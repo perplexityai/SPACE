@@ -9,13 +9,6 @@ condition = "AND"
 paths = ['''^infra/space/kind/charts/space-api-local/values\.yaml$''']
 regexes = ['''^-----BEGIN[ ]PRIVATE KEY-----\r?\n[ \t]*MC4CAQAwBQYDK2VwBCIEIJ1hsZ3v/VpguoRK9JLsLMREScVpezJpGXA7rAMcrn9g\r?\n[ \t]*-----END[ ]PRIVATE KEY-----$''']
 
-[[allowlists]]
-description = "Negative TokenReview fixture with a literal fake signature"
-targetRules = ["jwt"]
-condition = "AND"
-paths = ['''^scripts/k8s/projected-tokens/02-test\.sh$''']
-regexes = ['''^eyJhbGciOiJSUzI1NiIsImtpZCI6ImJvZ3VzIn0[.]eyJzdWIiOiJmYWtlIiwiYXVkIjpbInNwYWNlLW5vZGUtYXBpIl19[.]ZmFrZXNpZ25hdHVyZQ$''']
-
 # Diff scans read context lines too, so edits near these fixtures surface it.
 [[allowlists]]
 description = "Synthetic credential-reference UUID shared by credential test fixtures"

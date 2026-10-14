@@ -58,6 +58,12 @@ spec:
               value: /etc/space-rpc-ca/ca.crt
             - name: SPACE_NODE_API_TLS_SERVER_NAME
               value: space-node-api
+            # The guest bridge's NodeApi credential (SpaceBearerToken::NodeApi,
+            # crates/libs/data/plane/server/src/native/protocol.rs); node-api
+            # admits it by TokenReview and confines it to guest calls. The data
+            # plane never calls WorkerApiInternal.
+            - name: SPACE_NODE_API_TOKEN_PATH
+              value: /var/run/space-auth/node-api.token
             # Datadog tracing — see datadog-agent-local chart.
             {{- include "space-kind-telemetry.env" . | nindent 12 }}
             - name: SPACE_K8S_POD_NAME
@@ -108,6 +114,9 @@ spec:
             - name: publication-token
               mountPath: /var/run/space-publication
               readOnly: true
+            - name: node-api-token
+              mountPath: /var/run/space-auth
+              readOnly: true
       volumes:
         - name: rpc-ca
           secret:
@@ -121,3 +130,11 @@ spec:
                   path: cluster-api.token
                   audience: space-cluster-api
                   expirationSeconds: 3600
+        - name: node-api-token
+          projected:
+            defaultMode: 0444
+            sources:
+              - serviceAccountToken:
+                  path: node-api.token
+                  audience: space-node-api
+                  expirationSeconds: {{ .Values.nodeApiTokenExpirationSeconds | int }}

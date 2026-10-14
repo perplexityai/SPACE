@@ -98,6 +98,15 @@ spec:
               value: space-node-api
             - name: SPACE_CLUSTER_API_TOKEN_PATH
               value: "/var/run/space-publication/cluster-api.token"
+            # The substrate's NodeApi credentials (SpaceBearerToken,
+            # crates/libs/common/svc/src/bearer_token.rs): one projected
+            # token per node-api surface, which node-api admits by TokenReview
+            # (space-node-api-local's auth allowlists). An explicit path makes a
+            # missing file an error rather than a fall back to the static token.
+            - name: SPACE_NODE_API_TOKEN_PATH
+              value: /var/run/space-auth/node-api.token
+            - name: SPACE_NODE_API_INTERNAL_TOKEN_PATH
+              value: /var/run/space-auth/node-api-internal.token
             # Datadog tracing: DD_AGENT_HOST routes via
             # status.hostIP to the node-local Agent selected by the backend
             # helper. OTLP comparisons require that receiver to be running.
@@ -248,11 +257,11 @@ spec:
             # activation delegation"): TokenReview with audience
             # space-cluster-api, no static fallback, and only the route
             # resolvers that have already authorized the request. No other
-            # api surface reads these settings.
+            # api surface reads these settings. The allowlist's namespace is
+            # the pod's own, read from its ServiceAccount mount
+            # (auth_namespace, crates/libs/common/svc/src/auth/k8s.rs).
             - name: SPACE_K8S_TOKEN_AUTH_ENABLED
               value: "true"
-            - name: SPACE_K8S_TOKEN_AUTH_NAMESPACE
-              value: {{ .Release.Namespace | quote }}
             - name: SPACE_K8S_TOKEN_AUTH_STATIC_FALLBACK_ENABLED
               value: "false"
             - name: SPACE_CLUSTER_API_AUTH_ALLOWED_SERVICE_ACCOUNTS
@@ -298,6 +307,9 @@ spec:
             - name: publication-token
               mountPath: /var/run/space-publication
               readOnly: true
+            - name: node-api-token
+              mountPath: /var/run/space-auth
+              readOnly: true
             - name: route-signing
               mountPath: /var/run/space-route-signing
               readOnly: true
@@ -323,6 +335,18 @@ spec:
                   path: cluster-api.token
                   audience: space-cluster-api
                   expirationSeconds: 3600
+        - name: node-api-token
+          projected:
+            defaultMode: 0444
+            sources:
+              - serviceAccountToken:
+                  path: node-api.token
+                  audience: space-node-api
+                  expirationSeconds: {{ .Values.nodeApiTokenExpirationSeconds | int }}
+              - serviceAccountToken:
+                  path: node-api-internal.token
+                  audience: space-node-api-internal
+                  expirationSeconds: {{ .Values.nodeApiTokenExpirationSeconds | int }}
         - name: route-signing
           secret:
             secretName: {{ .Values.spaceApiRouteToken.ed25519.signingSecretName }}

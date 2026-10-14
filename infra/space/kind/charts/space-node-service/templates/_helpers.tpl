@@ -308,7 +308,9 @@ pod's own mounts back to the node.
       - serviceAccountToken:
           path: credmgr.token
           audience: space-credential-manager
-          expirationSeconds: 3600
+          # The node services' deployed lifetime, as for the ClusterApi
+          # token below.
+          expirationSeconds: 600
       - secret:
           name: space-credmgr-authority-trust
           items:
@@ -335,6 +337,11 @@ a root listener reads it as owner.
     defaultMode: 0440
 {{- end -}}
 
+{{/*
+The 600 s lifetime is the node services' deployed one; the kubelet refreshes
+the file at 80% of it and the client rereads it (TOKEN_FILE_CACHE_TTL,
+bearer_token.rs).
+*/}}
 {{- define "space-node-service.volume.clusterApiToken" -}}
 - name: cluster-api-token
   projected:
@@ -343,7 +350,7 @@ a root listener reads it as owner.
       - serviceAccountToken:
           path: cluster-api.token
           audience: space-cluster-api
-          expirationSeconds: 3600
+          expirationSeconds: 600
 {{- end -}}
 
 {{- define "space-node-service.volume.routeVerification" -}}
@@ -448,6 +455,39 @@ dnsPolicy: ClusterFirstWithHostNet
 {{- define "space-node-service.podAnnotations" -}}
 ad.datadoghq.com/tags: '{"team":"{{ .ctx.Values.node.datadogTeam }}"}'
 {{ include "space-kind-telemetry.logAnnotations" .ctx }}
+{{- end -}}
+
+{{/*
+Lets the service's ServiceAccount create TokenReviews, which a listener that
+authenticates its callers' projected tokens issues for each one
+(crates/libs/common/svc/src/auth/k8s.rs, auth/build/k8s.rs). Nothing else.
+*/}}
+{{- define "space-node-service.tokenReviewRbac" -}}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "space-node-service.name" . }}-token-review
+  labels:
+    {{- include "space-node-service.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["authentication.k8s.io"]
+    resources: ["tokenreviews"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "space-node-service.name" . }}-token-review
+  labels:
+    {{- include "space-node-service.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "space-node-service.name" . }}-token-review
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "space-node-service.name" . }}
+    namespace: {{ .ctx.Release.Namespace }}
 {{- end -}}
 
 {{- define "space-node-service.serviceAccount" -}}

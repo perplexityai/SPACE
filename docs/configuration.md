@@ -334,10 +334,51 @@ authentication is enabled, static fallback has no transfer authority.
 Missing authentication context is denied. Local root/operator exports remain
 available through template-manager's Unix socket.
 
+A peer transfer has two callers, and each needs the grant and admission by
+`SPACE_NODE_API_AUTH_ALLOWED_SERVICE_ACCOUNTS` on the node it calls. The caller
+of `PullTemplate` on the target node starts it: the admin API's node
+template-pull route, which only the direct substrate serves, or an operator
+calling node-api directly. The target's node-api then calls
+`NodeExportTemplate` on the source node with its own `SPACE_NODE_API_TOKEN_PATH`
+token. List the account that starts pulls and the node-api account of every
+role that can be a target. An empty list disables peer
+transfers and node-api logs a startup warning. A deployment without peer
+transfers may leave it empty.
+
 Exact-digest export can use the local cache offline. An omitted digest resolves
 the requested catalog tag (default `latest`) and exports only that digest; a
 missing tag, unavailable catalog, or uncached resolved digest fails without
 falling back to a newer local build.
+
+### Policy authorization
+
+Before enabling Kubernetes authentication or upgrading an authenticated worker
+or builder, set `SPACE_NODE_API_AUTH_TRUSTED_POLICY_SERVICE_ACCOUNTS` to the
+service accounts that own policy intent. It must be nonempty on both roles or
+node-api refuses to start. These accounts must also be admitted by the normal
+and internal surface allowlists for the RPCs they call. Policy trust is
+independent of the `SpacedWaitReady` trust set. Policy-bearing pool adoption
+uses the internal surface, so its caller needs an internal-audience token.
+
+Shared static-token fallback cannot mutate policy when Kubernetes
+authentication is enabled; static-only deployments retain that authority.
+Policy-bearing cold creation, internal pool adoption, and worker and builder
+template updates require a trusted caller. Cold creation and pool adoption also
+require policy authority for a nonzero sandbox-policy generation, even without
+an override. Requests with no overrides and generation zero remain available to
+otherwise admitted callers and inherit the template's policy. Guest-bridge
+accounts already have separate method restrictions.
+
+`Local` policy is node-administrator-owned, including normal standalone use and
+operator overrides on cluster-managed nodes. It requires a root or Operator Unix
+socket peer. Forwarders such as node-api and node-ctl must run under their
+dedicated non-root identities: UID 0 is classified as Root before the
+service-account lookup.
+
+Forwarded imports carrying `Local` network or auto-lifecycle policy are
+rejected, and retrying does not help. To retain `Local` policy, an operator must
+review its ownership and perform the import through an authorized local peer;
+forwarding never relabels it.
 
 ## Database
 

@@ -55,6 +55,15 @@ spec:
               value: space-node-api
             - name: SPACE_CLUSTER_API_TOKEN_PATH
               value: "/var/run/space-publication/cluster-api.token"
+            # NodeApi credentials for the api substrate the operation
+            # dispatcher and warm-pool probe run, and the trigger fan-out
+            # (SpaceBearerToken, crates/libs/common/svc/src/bearer_token.rs):
+            # one projected token per node-api surface, admitted by TokenReview
+            # (space-node-api-local's auth allowlists).
+            - name: SPACE_NODE_API_TOKEN_PATH
+              value: /var/run/space-auth/node-api.token
+            - name: SPACE_NODE_API_INTERNAL_TOKEN_PATH
+              value: /var/run/space-auth/node-api-internal.token
             # Datadog tracing — see datadog-agent-local chart. DD_AGENT_HOST
             # routes to the node-local agent; absent the agent the tracer
             # drops spans silently.
@@ -213,6 +222,9 @@ spec:
             - name: publication-token
               mountPath: /var/run/space-publication
               readOnly: true
+            - name: node-api-token
+              mountPath: /var/run/space-auth
+              readOnly: true
             - name: route-signing
               mountPath: /var/run/space-route-signing
               readOnly: true
@@ -232,6 +244,18 @@ spec:
                   path: cluster-api.token
                   audience: space-cluster-api
                   expirationSeconds: 3600
+        - name: node-api-token
+          projected:
+            defaultMode: 0444
+            sources:
+              - serviceAccountToken:
+                  path: node-api.token
+                  audience: space-node-api
+                  expirationSeconds: {{ .Values.nodeApiTokenExpirationSeconds | int }}
+              - serviceAccountToken:
+                  path: node-api-internal.token
+                  audience: space-node-api-internal
+                  expirationSeconds: {{ .Values.nodeApiTokenExpirationSeconds | int }}
         - name: route-signing
           secret:
             secretName: {{ .Values.spaceApiRouteToken.ed25519.signingSecretName }}

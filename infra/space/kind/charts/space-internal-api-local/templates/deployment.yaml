@@ -60,6 +60,11 @@ spec:
               value: /etc/space-rpc-ca/ca.crt
             - name: SPACE_NODE_API_TLS_SERVER_NAME
               value: space-node-api
+            # internal-api's NodeApi credential for its service-port routes
+            # (crates/libs/internal/api/server/src/sandbox_service_ports.rs),
+            # admitted by TokenReview. It never calls WorkerApiInternal.
+            - name: SPACE_NODE_API_TOKEN_PATH
+              value: /var/run/space-auth/node-api.token
             - name: SPACE_K8S_CONTROL_PLANE
               value: "true"
             - name: SPACE_SANDBOX_NAMESPACE
@@ -76,10 +81,12 @@ spec:
               value: {{ .Values.k8s.sandboxNodeSelectorValue | quote }}
             - name: SPACE_INTERNAL_SECRET_NAME
               value: {{ .Values.internal.secretName | quote }}
+            # ClusterApi reviews callers' projected tokens with no static
+            # fallback. The allowlists below name accounts in the pod's own
+            # namespace, read from its ServiceAccount mount (auth_namespace,
+            # crates/libs/common/svc/src/auth/k8s.rs).
             - name: SPACE_K8S_TOKEN_AUTH_ENABLED
               value: "true"
-            - name: SPACE_K8S_TOKEN_AUTH_NAMESPACE
-              value: {{ .Release.Namespace | quote }}
             - name: SPACE_K8S_TOKEN_AUTH_STATIC_FALLBACK_ENABLED
               value: "false"
             # Each node service that calls ClusterApi authenticates with its
@@ -200,6 +207,9 @@ spec:
             - name: activation-token
               mountPath: /var/run/space-activation
               readOnly: true
+            - name: node-api-token
+              mountPath: /var/run/space-auth
+              readOnly: true
             - name: route-signing
               mountPath: /var/run/space-route-signing
               readOnly: true
@@ -223,6 +233,14 @@ spec:
                   path: cluster-api.token
                   audience: space-cluster-api
                   expirationSeconds: 3600
+        - name: node-api-token
+          projected:
+            defaultMode: 0444
+            sources:
+              - serviceAccountToken:
+                  path: node-api.token
+                  audience: space-node-api
+                  expirationSeconds: {{ .Values.nodeApiTokenExpirationSeconds | int }}
         - name: route-signing
           secret:
             secretName: {{ .Values.spaceApiRouteToken.ed25519.signingSecretName }}
