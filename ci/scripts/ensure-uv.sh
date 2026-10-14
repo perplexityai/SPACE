@@ -89,8 +89,9 @@ trap 'rm -rf "${tmp_dir}"' EXIT
 
 # Astral's release mirror first and GitHub's release download second, which
 # is also the order of astral.sh's installer. Each attempt tries both, so an
-# outage of either host does not fail the job; a checksum mismatch is retried
-# like a failed download.
+# outage of either host does not fail the job. Only an answer that could
+# change is retried: when no host failed transiently and every host answered
+# 404 or served one and the same other archive, the install fails at once.
 urls=(
     "https://releases.astral.sh/github/uv/releases/download/${UV_VERSION}/uv-${uv_target}.tar.gz"
     "https://github.com/astral-sh/uv/releases/download/${UV_VERSION}/uv-${uv_target}.tar.gz"
@@ -99,16 +100,27 @@ attempts="${SPACE_UV_INSTALL_ATTEMPTS:-3}"
 delay="${SPACE_UV_INSTALL_RETRY_DELAY_SECONDS:-5}"
 installed=""
 for ((attempt = 1; ; attempt++)); do
+    transient=""
+    mismatch=""
+    mismatches_differ=""
     for url in "${urls[@]}"; do
         rm -f "${archive}"
-        if ! curl --proto '=https' --tlsv1.2 -fsSL --connect-timeout 20 --max-time 300 \
-            "${url}" -o "${archive}"; then
-            echo "Could not download ${url}." >&2
+        status=0
+        code="$(curl --proto '=https' --tlsv1.2 -fsSL --connect-timeout 20 --max-time 300 \
+            -w '%{http_code}' "${url}" -o "${archive}")" || status=$?
+        if [ "${status}" -ne 0 ]; then
+            echo "Could not download ${url} (curl exit ${status}, HTTP ${code})." >&2
+            [ "${code}" = 404 ] || transient=1
             continue
         fi
         actual="$(sha256 "${archive}")"
         if [ "${actual}" != "${uv_sha256}" ]; then
             echo "${url} has sha256 ${actual}, not ${uv_sha256}." >&2
+            if [ -z "${mismatch}" ]; then
+                mismatch="${actual}"
+            elif [ "${actual}" != "${mismatch}" ]; then
+                mismatches_differ=1
+            fi
             continue
         fi
         tar -xzf "${archive}" -C "${tmp_dir}"
@@ -117,6 +129,10 @@ for ((attempt = 1; ; attempt++)); do
         installed=1
         break 2
     done
+    if [ -z "${transient}" ] && [ -z "${mismatches_differ}" ]; then
+        echo "Error: no host serves uv ${UV_VERSION} (uv-${uv_target}.tar.gz) at sha256 ${uv_sha256}." >&2
+        exit 1
+    fi
     if ((attempt >= attempts)); then
         break
     fi

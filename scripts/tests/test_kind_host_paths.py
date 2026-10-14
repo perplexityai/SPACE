@@ -1658,8 +1658,9 @@ class InstallerAgreementTests(unittest.TestCase):
     def serving_curl(self, body: bytes, codes: str = "200") -> tuple[pathlib.Path, pathlib.Path]:
         """A `curl` on PATH that records its argv and answers like `curl -w '%{http_code}'`.
 
-        Call N answers the Nth of `codes` (the last one repeats); a 200 writes
-        `body` to the -o file, and 000 is a timeout.
+        Call N answers the Nth of `codes` (the last one repeats), each an HTTP
+        status with an optional curl exit, `200:18` for a body cut short after
+        its status. A 200 writes `body` to the -o file; 000 alone is a timeout.
         """
         stub_dir = self.tmp / "curlbin"
         stub_dir.mkdir(exist_ok=True)
@@ -1674,23 +1675,54 @@ class InstallerAgreementTests(unittest.TestCase):
                 printf '%s\\n' "$*" >>{shell_quote(str(log))}
                 codes=({codes})
                 calls=$(wc -l <{shell_quote(str(log))})
-                code="${{codes[calls - 1]:-${{codes[-1]}}}}"
+                answer="${{codes[calls - 1]:-${{codes[-1]}}}}"
+                code="${{answer%%:*}}"
+                status=0
+                [[ "$answer" != *:* ]] || status="${{answer#*:}}"
+                [[ "$answer" != 000 ]] || status=28
                 while [[ $# -gt 0 ]]; do
                   if [[ "$1" == -o && "$code" == 200 ]]; then cp {shell_quote(str(self.tmp / "kernel-body"))} "$2"; fi
                   shift
                 done
                 printf '%s' "$code"
-                [[ "$code" != 000 ]] || exit 28
+                exit "$status"
                 """
             )
         )
         stub.chmod(0o755)
         return stub_dir, log
 
-    def run_installer(self, *args: str, body: bytes = b"", codes: str = "200", **overrides: str):
+    def stub_mv(self) -> pathlib.Path:
+        """An `mv` on PATH that fails a move to a path ending in $FAKE_MV_FAIL_INTO,
+        and sleeps $FAKE_MV_SLEEP_AFTER seconds after a move to vmlinux.bin."""
+        stub_dir = self.tmp / "mvbin"
+        stub_dir.mkdir(exist_ok=True)
+        stub = stub_dir / "mv"
+        stub.write_text(
+            textwrap.dedent(
+                f"""\
+                #!/usr/bin/env bash
+                dest="${{*: -1}}"
+                if [[ -n "${{FAKE_MV_FAIL_INTO:-}}" && "$dest" == *"$FAKE_MV_FAIL_INTO" ]]; then
+                  echo "mv: cannot move to $dest: Read-only file system" >&2
+                  exit 1
+                fi
+                {shell_quote(shutil.which("mv") or "/bin/mv")} "$@" || exit
+                [[ "$dest" != */vmlinux.bin ]] || sleep "${{FAKE_MV_SLEEP_AFTER:-0}}"
+                """
+            )
+        )
+        stub.chmod(0o755)
+        return stub_dir
+
+    def installer_env(self, codes: str = "200", body: bytes = b"", **overrides: str):
         stub_dir, log = self.serving_curl(body, codes)
         env = dict(self.env, **overrides)
-        env["PATH"] = f"{stub_dir}:{env['PATH']}"
+        env["PATH"] = f"{stub_dir}:{self.stub_mv()}:{env['PATH']}"
+        return env, log
+
+    def run_installer(self, *args: str, body: bytes = b"", codes: str = "200", **overrides: str):
+        env, log = self.installer_env(codes, body, **overrides)
         result = subprocess.run(
             ["bash", str(INSTALL_FC_VENDOR), *args],
             env=env,
@@ -1733,7 +1765,7 @@ class InstallerAgreementTests(unittest.TestCase):
 
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("not the pinned", result.stderr)
-        self.assertEqual(sorted(path.name for path in kernel_dir.iterdir()), [])
+        self.assertEqual(sorted(path.name for path in kernel_dir.iterdir()), [".vmlinux.bin.lock"])
 
     def test_a_missing_object_fails_without_retrying(self) -> None:
         result, calls, kernel_dir = self.download_kernel(b"", codes="404")
@@ -1741,7 +1773,7 @@ class InstallerAgreementTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("HTTP 404", result.stderr)
         self.assertEqual(len(calls), 1, calls)
-        self.assertEqual(sorted(path.name for path in kernel_dir.iterdir()), [])
+        self.assertEqual(sorted(path.name for path in kernel_dir.iterdir()), [".vmlinux.bin.lock"])
 
     def test_a_transient_failure_is_retried(self) -> None:
         body = b"pinned-kernel\n"
@@ -1752,6 +1784,105 @@ class InstallerAgreementTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(len(calls), 3, calls)
         self.assertEqual((kernel_dir / "vmlinux.bin").read_bytes(), body)
+
+    def test_a_body_cut_short_or_timed_out_after_its_status_is_retried(self) -> None:
+        # `%{http_code}` reports the 200 already received; curl's exit says the body failed.
+        body = b"pinned-kernel\n"
+        result, calls, kernel_dir = self.download_kernel(
+            body, codes="200:18 200:28 200", SPACE_FC_KERNEL_SHA256=hashlib.sha256(body).hexdigest()
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(calls), 3, calls)
+        self.assertEqual((kernel_dir / "vmlinux.bin").read_bytes(), body)
+
+    def test_a_certificate_failure_fails_without_retrying(self) -> None:
+        result, calls, kernel_dir = self.download_kernel(b"", codes="000:60")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("curl exit 60", result.stderr)
+        self.assertEqual(len(calls), 1, calls)
+        self.assertEqual(sorted(path.name for path in kernel_dir.iterdir()), [".vmlinux.bin.lock"])
+
+    def test_a_version_without_its_checksum_is_refused(self) -> None:
+        """Else it would pass as the default kernel on a host that has it staged."""
+        self.install()
+        env = dict(self.env)
+        del env["SPACE_FC_KERNEL_SHA256"]
+        env["SPACE_FC_KERNEL_VERSION"] = "6.1.999"
+        for args in (["--check"], []):
+            stub_dir, log = self.serving_curl(b"")
+            run_env = dict(env, PATH=f"{stub_dir}:{env['PATH']}")
+            result = subprocess.run(
+                ["bash", str(INSTALL_FC_VENDOR), *args], env=run_env, text=True, capture_output=True, check=False
+            )
+            self.assertNotEqual(result.returncode, 0, args)
+            self.assertIn("needs SPACE_FC_KERNEL_SHA256", result.stderr)
+            self.assertEqual(log.read_text(), "", "downloaded without a checksum")
+        self.assertEqual((self.kernel_dir / "vmlinux.bin").read_bytes(), FAKE_KERNEL)
+
+    def test_a_failed_rename_keeps_the_previous_kernel_and_fails(self) -> None:
+        self.install()
+        shutil.rmtree(self.image_vendor / "kernels")
+        body = b"newly-pinned-kernel\n"
+        new_pin = hashlib.sha256(body).hexdigest()
+
+        result, _ = self.run_installer(body=body, SPACE_FC_KERNEL_SHA256=new_pin, FAKE_MV_FAIL_INTO="/vmlinux.bin")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("could not move the verified kernel", result.stderr)
+        self.assertNotIn("installed at", result.stdout)
+        self.assertEqual((self.kernel_dir / "vmlinux.bin").read_bytes(), FAKE_KERNEL)
+        self.assertNotEqual(self.run_installer("--check", SPACE_FC_KERNEL_SHA256=new_pin)[0].returncode, 0)
+        self.assertEqual(self.run_installer("--check")[0].returncode, 0, "the previous kernel's pin no longer passes")
+
+    def test_a_failed_stamp_write_fails_the_install(self) -> None:
+        self.kernel_dir.mkdir(parents=True)
+        # A directory where the stamp goes: neither removing nor writing it works.
+        (self.kernel_dir / ".vmlinux.bin.sha256").mkdir()
+
+        result, _ = self.run_installer()
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("installed at", result.stdout)
+
+    def test_installers_sharing_a_root_never_stamp_the_other_ones_kernel(self) -> None:
+        """Two pins at once: one installer replaces the kernel between the other's rename and stamp.
+
+        The first stages kernel A and stalls right after renaming it into place;
+        the second, pinned to B, runs meanwhile. Whatever order they finish in,
+        `--check` may pass only for the kernel actually staged.
+        """
+        kernel_b = b"kernel-b\n"
+        pin_b = hashlib.sha256(kernel_b).hexdigest()
+        other = self.image_vendor / "kernels/vmlinux-6.1.1"
+        other.mkdir(parents=True)
+        (other / "vmlinux.bin").write_bytes(kernel_b)
+
+        env_a, _ = self.installer_env(FAKE_MV_SLEEP_AFTER="3")
+        first = subprocess.Popen(
+            ["bash", str(INSTALL_FC_VENDOR)], env=env_a, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        )
+        kernel = self.kernel_dir / "vmlinux.bin"
+        for _ in range(100):
+            if kernel.exists() and kernel.read_bytes() == FAKE_KERNEL:
+                break
+            subprocess.run(["sleep", "0.05"], check=True)
+        else:
+            first.kill()
+            self.fail("the first installer never renamed its kernel into place")
+
+        second, _ = self.run_installer(SPACE_FC_KERNEL_SHA256=pin_b)
+        first_out, first_err = first.communicate(timeout=60)
+
+        self.assertEqual(first.returncode, 0, first_err)
+        self.assertEqual(second.returncode, 0, second.stderr)
+        staged = kernel.read_bytes()
+        self.assertEqual(staged, kernel_b, "the second installer finished last")
+        self.assertEqual(self.run_installer("--check", SPACE_FC_KERNEL_SHA256=pin_b)[0].returncode, 0)
+        self.assertNotEqual(
+            self.run_installer("--check")[0].returncode, 0, "--check accepted kernel B under kernel A's pin"
+        )
 
     def test_a_present_kernel_that_is_not_the_pinned_one_is_replaced(self) -> None:
         # Staged from the image at FAKE_KERNEL's pin; then the pin moves.

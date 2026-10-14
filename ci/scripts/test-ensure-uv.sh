@@ -32,14 +32,17 @@ else
     SHA256="$(shasum -a 256 "${WORK_DIR}/uv.tar.gz" | awk '{ print $1 }')"
 fi
 
-# Serves FAKE_BODY for every URL except those on a host in FAKE_DOWN_HOSTS.
+# Serves FAKE_BODY for every URL except those on a host in FAKE_DOWN_HOSTS,
+# which answer 503, or in FAKE_MISSING_HOSTS, which answer 404, as `curl -f`
+# with `-w '%{http_code}'` reports them.
 mkdir -p "${WORK_DIR}/bin"
 cat >"${WORK_DIR}/bin/curl" <<'SH'
 #!/usr/bin/env bash
-url="" out=""
+url="" out="" format=""
 while [ $# -gt 0 ]; do
     case "$1" in
         -o) out="$2"; shift ;;
+        -w) format="$2"; shift ;;
         https://*) url="$1" ;;
     esac
     shift
@@ -47,8 +50,15 @@ done
 printf '%s\n' "${url}" >>"${FAKE_CALLS}"
 host="${url#https://}"
 host="${host%%/*}"
-[[ " ${FAKE_DOWN_HOSTS:-} " != *" ${host} "* ]] || { echo "curl: (22) 503 from ${host}" >&2; exit 22; }
+answer() { [ -z "${format}" ] || printf '%s' "$1"; }
+if [[ " ${FAKE_MISSING_HOSTS:-} " == *" ${host} "* ]]; then
+    answer 404; echo "curl: (22) 404 from ${host}" >&2; exit 22
+fi
+if [[ " ${FAKE_DOWN_HOSTS:-} " == *" ${host} "* ]]; then
+    answer 503; echo "curl: (22) 503 from ${host}" >&2; exit 22
+fi
 cp "${FAKE_BODY}" "${out}"
+answer 200
 SH
 chmod +x "${WORK_DIR}/bin/curl"
 
@@ -84,6 +94,7 @@ run() {
     : >"${WORK_DIR}/calls"
     env -i HOME="${WORK_DIR}" PATH="${EXTRA_PATH:+${EXTRA_PATH}:}${WORK_DIR}/bin:${WORK_DIR}/tools" \
         FAKE_CALLS="${WORK_DIR}/calls" FAKE_BODY="${body}" FAKE_DOWN_HOSTS="${down}" \
+        FAKE_MISSING_HOSTS="${MISSING_HOSTS:-}" \
         SPACE_UV_INSTALL_ATTEMPTS=2 SPACE_UV_INSTALL_RETRY_DELAY_SECONDS=0 "$@" \
         bash "${repo}/ci/scripts/ensure-uv.sh" >"${WORK_DIR}/out" 2>"${WORK_DIR}/err"
 }
@@ -134,16 +145,31 @@ EXTRA_PATH="${WORK_DIR}/path-uv" run "${WORK_DIR}/repo-override-path" "${WORK_DI
 [ "$(cat "${WORK_DIR}/out")" = "${WORK_DIR}/path-uv/uv" ] || fail "an override matching the uv on PATH was not taken from PATH"
 [ ! -s "${WORK_DIR}/calls" ] || fail "an override matching the uv on PATH downloaded $(cat "${WORK_DIR}/calls")"
 
-# Both hosts serve an archive that fails the checksum: every attempt tries
-# both, and nothing is installed.
+# Both hosts serve the same archive, which fails the checksum: a retry cannot
+# change that, so one attempt of both hosts fails, and nothing is installed.
 printf 'not the release\n' >"${WORK_DIR}/tampered.tar.gz"
 repo="${WORK_DIR}/repo-tampered"
 if run "${repo}" "${WORK_DIR}/tampered.tar.gz" "" SPACE_UV_VERSION="${VERSION}" SPACE_UV_SHA256="${SHA256}"; then
     fail "an archive that fails its checksum was accepted"
 fi
-[ "$(wc -l <"${WORK_DIR}/calls" | tr -d ' ')" = 4 ] || fail "expected 2 attempts of 2 hosts, got $(cat "${WORK_DIR}/calls")"
+[ "$(wc -l <"${WORK_DIR}/calls" | tr -d ' ')" = 2 ] || fail "expected 1 attempt of 2 hosts, got $(cat "${WORK_DIR}/calls")"
 [ ! -e "${repo}/ci/bin/uv" ] || fail "an archive that fails its checksum was installed"
 grep -q "has sha256" "${WORK_DIR}/err" || fail "the checksum mismatch was not reported: $(cat "${WORK_DIR}/err")"
+
+# Both hosts answer 404: one attempt, then a failure naming the release.
+if MISSING_HOSTS="releases.astral.sh github.com" run "${WORK_DIR}/repo-missing" "${WORK_DIR}/uv.tar.gz" "" \
+    SPACE_UV_VERSION="${VERSION}" SPACE_UV_SHA256="${SHA256}"; then
+    fail "a release neither host has was installed"
+fi
+[ "$(wc -l <"${WORK_DIR}/calls" | tr -d ' ')" = 2 ] || fail "a 404 from both hosts was retried: $(cat "${WORK_DIR}/calls")"
+grep -q "no host serves uv ${VERSION}" "${WORK_DIR}/err" || fail "the 404s were not reported: $(cat "${WORK_DIR}/err")"
+
+# A 404 from one host and an outage of the other is still retried.
+if MISSING_HOSTS=releases.astral.sh run "${WORK_DIR}/repo-mixed" "${WORK_DIR}/uv.tar.gz" github.com \
+    SPACE_UV_VERSION="${VERSION}" SPACE_UV_SHA256="${SHA256}"; then
+    fail "an install with both hosts failing succeeded"
+fi
+[ "$(wc -l <"${WORK_DIR}/calls" | tr -d ' ')" = 4 ] || fail "an outage was not retried: $(cat "${WORK_DIR}/calls")"
 
 # The default pin is checked too: this archive is not the pinned release.
 if run "${WORK_DIR}/repo-default" "${WORK_DIR}/uv.tar.gz" ""; then

@@ -214,8 +214,13 @@ No AWS credentials are needed anywhere in the default bring-up: the seed
 template is built locally by the production seed builder and published
 in-cluster (see "Seed template" below).
 
-`bootstrap.sh` auto-invokes `install-fc-vendor.sh` if the vendor tree is
-missing (so step 2 is optional in practice), and is otherwise idempotent: it
+`bootstrap.sh` auto-invokes `install-fc-vendor.sh` unless
+`install-fc-vendor.sh --check` finds the vendor tree staged: this Firecracker
+release, and the guest kernel at the sha256 the installer pins (set
+`SPACE_FC_KERNEL_VERSION` and `SPACE_FC_KERNEL_SHA256` together to change it).
+A missing tree, another Firecracker release, a missing kernel or any other
+kernel is staged again, so step 2 is optional in practice. It is otherwise
+idempotent: it
 creates the kind cluster (if missing) with the SPACE Kind node image on the
 sandbox workers and builders (see [The node layer](#the-node-layer)), labels
 nodes, advertises the `space.pplx.net/network-slots` extended resource,
@@ -733,7 +738,7 @@ hand-run `kind create`, use
 render private to that invocation — pass that to `kind create` rather than
 `$SPACE_KIND_CONFIG`, so a second run cannot replace the file between the two
 commands. Point `SPACE_VENDOR_ROOT` at a tree you staged elsewhere and
-`install-fc-vendor.sh`, the existence check, and the mount all follow it
+`install-fc-vendor.sh`, its `--check`, and the mount all follow it
 together.
 
 Once the script returns, the API and data plane answer on the cluster's own
