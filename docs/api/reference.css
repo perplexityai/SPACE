@@ -53,6 +53,10 @@ footer { padding: 24px 32px; font-size: 13px; }
 #reference [role="tabpanel"] { color: var(--docs-color-code-text); }
 #reference [role="tab"][aria-selected="true"] { background-color: var(--docs-color-surface); }
 #reference h3 { color: var(--docs-color-text); }
+/* Native section labels and uncolored arrows need the shared foreground too. */
+#reference h5 { color: var(--docs-color-muted); border-color: var(--docs-color-border); }
+#reference h5 span { color: var(--docs-color-muted); }
+#reference svg, #reference svg polygon { fill: currentColor; }
 .schema-context { max-width: 65ch; line-height: 1.6; }
 .schema-context p { margin: .5rem 0; }
 .schema-context code { font-size: .9em; }
