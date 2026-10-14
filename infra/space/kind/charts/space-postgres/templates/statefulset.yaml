@@ -18,6 +18,9 @@ spec:
     metadata:
       annotations:
         ad.datadoghq.com/tags: '{"team":"{{ .Values.datadogTeam }}"}'
+        # The init script and pg_hba.conf live in the ConfigMap; roll the pod
+        # when they change.
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
       labels:
         app.kubernetes.io/name: space-postgres
         app.kubernetes.io/instance: {{ .Release.Name }}
@@ -28,10 +31,48 @@ spec:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       terminationGracePeriodSeconds: 30
+      initContainers:
+        # A self-signed server certificate per pod start. Clients connect with
+        # sslmode=require, which encrypts without verifying the server, so no
+        # cluster CA is involved. The server refuses a key file that others
+        # can read or that neither root nor the database user owns, so the
+        # key is mode 0600 and chowned to the image's postgres account by
+        # name: its uid differs between the Debian and alpine images. The
+        # openssl CLI comes from the Debian image; the alpine images do not
+        # ship it.
+        - name: tls
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command:
+            - sh
+            - -ec
+            - |
+              umask 077
+              openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
+                -subj "/CN={{ .Values.service.name }}" \
+                -addext "subjectAltName=DNS:{{ .Values.service.name }},DNS:{{ .Values.service.name }}.{{ .Release.Namespace }}.svc,DNS:localhost,IP:127.0.0.1" \
+                -keyout /tls/tls.key -out /tls/tls.crt
+              chown postgres:postgres /tls/tls.key /tls/tls.crt
+          volumeMounts:
+            - name: tls
+              mountPath: /tls
       containers:
         - name: postgres
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - -c
+            - ssl=on
+            - -c
+            - ssl_cert_file=/var/run/space-postgres-tls/tls.crt
+            - -c
+            - ssl_key_file=/var/run/space-postgres-tls/tls.key
+            - -c
+            - hba_file=/etc/space-postgres/pg_hba.conf
+            - -c
+            - max_connections={{ .Values.server.maxConnections }}
+            - -c
+            - log_lock_waits={{ .Values.server.logLockWaits }}
           env:
             - name: POSTGRES_USER
               valueFrom:
@@ -48,6 +89,17 @@ spec:
                 secretKeyRef:
                   name: space-postgres
                   key: POSTGRES_DB
+            # Read by the managed-service init script (configmap.yaml).
+            - name: SPACE_DB_MASTER_USER
+              valueFrom:
+                secretKeyRef:
+                  name: space-postgres
+                  key: SPACE_DB_MASTER_USER
+            - name: SPACE_DB_MASTER_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: space-postgres
+                  key: SPACE_DB_MASTER_PASSWORD
             - name: PGDATA
               value: /var/lib/postgresql/data/pgdata
           ports:
@@ -67,10 +119,32 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /var/lib/postgresql/data
+            - name: tls
+              mountPath: /var/run/space-postgres-tls
+              readOnly: true
+            - name: config
+              mountPath: /etc/space-postgres/pg_hba.conf
+              subPath: pg_hba.conf
+              readOnly: true
+            - name: config
+              mountPath: /docker-entrypoint-initdb.d/10-managed-service-master.sh
+              subPath: 10-managed-service-master.sh
+              readOnly: true
           {{- with .Values.resources }}
           resources:
             {{- toYaml . | nindent 12 }}
           {{- end }}
+      volumes:
+        - name: tls
+          emptyDir:
+            medium: Memory
+            sizeLimit: 1Mi
+        - name: config
+          configMap:
+            name: {{ .Release.Name }}-postgres
+            # Executable, so the image's entrypoint runs the init script in
+            # its own shell rather than sourcing it into the entrypoint's.
+            defaultMode: 0555
   volumeClaimTemplates:
     - metadata:
         name: data

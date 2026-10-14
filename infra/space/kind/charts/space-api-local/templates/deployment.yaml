@@ -148,6 +148,8 @@ spec:
               {{- include "space-cluster.dbPassword" (dict "ctx" . "role" "USER" "value" .Values.postgres.managedUserPassword) | nindent 14 }}
             - name: SPACE_DB_CREDS_PASSWORD
               {{- include "space-cluster.dbPassword" (dict "ctx" . "role" "CREDS" "value" .Values.postgres.managedCredentialsPassword) | nindent 14 }}
+            - name: POSTGRES_POOL_MAX_CONNECTIONS
+              value: {{ .Values.postgres.poolMaxConnections | quote }}
             - name: SPACE_INTERNAL_TOKEN
               valueFrom:
                 secretKeyRef:

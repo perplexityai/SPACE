@@ -6,6 +6,12 @@
 # runner can turn a retried lock race into a failed run
 # (crates/libs/db/migrator/src/migration_retry.rs). Tilt makes space-api wait
 # for this Job, and bootstrap.sh waits for it before applying the API.
+#
+# It fails fast, as a deployment's migration Job does: one attempt, no pod
+# restarts, inside a deadline the migrator sizes its lock-retry window against
+# (--job-deadline-seconds, crates/libs/db/migrator/src/lib.rs). A failed run
+# stays Failed for an operator to read rather than being retried into a
+# different state; bootstrap.sh and Tilt replace the Job to run it again.
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -15,14 +21,15 @@ metadata:
     app.kubernetes.io/name: space-db-migrate
     app.kubernetes.io/instance: {{ .Release.Name }}
 spec:
-  backoffLimit: 6
+  backoffLimit: 0
+  activeDeadlineSeconds: {{ .Values.migrate.jobDeadlineSeconds }}
   template:
     metadata:
       labels:
         app.kubernetes.io/name: space-db-migrate
         app.kubernetes.io/instance: {{ .Release.Name }}
     spec:
-      restartPolicy: OnFailure
+      restartPolicy: Never
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
@@ -33,8 +40,9 @@ spec:
         # pre-run creates the managed logins (space_user, space_creds, …)
         # the services connect as, and the post-run grants them on any
         # tables the migrations just created. The kind Postgres connection
-        # string authenticates as the image-created superuser, which can
-        # create roles.
+        # string authenticates as the master user, which, as on a managed
+        # database, is not a superuser but can create roles (space-postgres
+        # chart, configmap.yaml).
         - name: bootstrap-roles
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
@@ -60,6 +68,10 @@ spec:
                 secretKeyRef:
                   name: {{ .Values.postgres.secretName | default "space-postgres" }}
                   key: POSTGRES_CONNECTION_STRING
+            # Kubernetes does not expose activeDeadlineSeconds to the
+            # container, so the Job passes its own.
+            - name: SPACE_DB_MIGRATE_JOB_DEADLINE_SECONDS
+              value: {{ .Values.migrate.jobDeadlineSeconds | quote }}
       containers:
         - name: bootstrap-roles-grants
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"

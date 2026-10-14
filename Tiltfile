@@ -55,6 +55,12 @@ local(["bash", "infra/space/kind/scripts/check-object-store-transition.sh", KIND
 # "Upgrading from the node-stack layout" in infra/space/kind/README.md.
 local(["bash", "infra/space/kind/scripts/check-node-layout.sh", KIND_CLUSTER], quiet = True)
 
+# A cluster whose Postgres data directory an earlier space-postgres chart
+# initialized (PostgreSQL 16) cannot run this chart's PostgreSQL 17; refuse it
+# with the database reset rather than crash-loop the pod. See "Recovering from
+# an unbundled migration version" in infra/space/kind/README.md.
+local(["bash", "infra/space/kind/scripts/check-postgres-data.sh", KIND_CLUSTER], quiet = True)
+
 # Select one metrics sink per process. The datadog and otel modes also select
 # the matching trace exporter; off disables both.
 # These local selectors do not activate any deployed environment.

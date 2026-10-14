@@ -59,8 +59,13 @@ postgres:
   secretName: space-postgres
   secretKey: POSTGRES_CONNECTION_STRING
   # Dev-default space_user password; the role is provisioned by the api
-  # chart's bootstrap-roles initContainer with the same value.
+  # chart's space-db-migrate Job (bootstrap-roles) with the same value.
   managedUserPassword: space-dev-user
+  # POSTGRES_POOL_MAX_CONNECTIONS for the general space_user pool
+  # (crates/libs/common/svc/src/sql/mod.rs); the template-visibility sideline
+  # pool keeps its own fixed cap. Somewhat above the binary's default of 25,
+  # as deployed. The space-postgres chart's max_connections holds it.
+  poolMaxConnections: 30
 
 nodeSelector:
   space.pplx.net/infra: "true"

@@ -197,6 +197,10 @@ if kind get clusters 2>/dev/null | grep -qx "$KIND_CLUSTER"; then
   # service, and its sandboxes, in one pod per node; stop rather than run both
   # layouts on a node.
   bash "$KIND_DIR/scripts/check-node-layout.sh" "$KIND_CLUSTER" || exit 1
+  # A database an earlier space-postgres chart initialized (PostgreSQL 16)
+  # cannot start under this chart's PostgreSQL 17; stop with the reset before
+  # the chart is applied rather than wait out its rollout.
+  bash "$KIND_DIR/scripts/check-postgres-data.sh" "$KIND_CLUSTER" || exit 1
 else
   # The sandbox workers and builders boot the SPACE Kind node image, which
   # bakes in the node layer a production node image provides (btrfs
@@ -387,9 +391,26 @@ kubectl --context "$KCTX" -n "$NAMESPACE" delete job space-db-migrate --ignore-n
 helm template space "$KIND_DIR/charts/space-api-local" --namespace "$NAMESPACE" \
   ${TELEMETRY_HELM_ARGS[@]+"${TELEMETRY_HELM_ARGS[@]}"} --show-only templates/migrate-job.yaml \
   | kubectl --context "$KCTX" apply -n "$NAMESPACE" --validate=false -f -
+# The Job makes one attempt (backoffLimit 0), so a failure is final: stop on
+# it with the Job's logs instead of waiting out the timeout for a completion
+# that cannot come. Rerunning bootstrap.sh replaces the Job above.
 log "waiting for the space-db-migrate Job (control-plane migrations)"
-kubectl --context "$KCTX" -n "$NAMESPACE" wait --for=condition=complete \
-  job/space-db-migrate --timeout="${TIMEOUT}s" >/dev/null
+migrate_deadline=$((SECONDS + TIMEOUT))
+while :; do
+  migrate_conditions="$(kubectl --context "$KCTX" -n "$NAMESPACE" get job space-db-migrate \
+    -o jsonpath='{range .status.conditions[?(@.status=="True")]}{.type}{" "}{end}')" \
+    || migrate_conditions=""
+  case " $migrate_conditions " in
+    *" Complete "*) break ;;
+    *" Failed "*)
+      kubectl --context "$KCTX" -n "$NAMESPACE" logs job/space-db-migrate \
+        --all-containers --prefix --tail=50 >&2 || true
+      die "the space-db-migrate Job failed; its logs are above"
+      ;;
+  esac
+  (( SECONDS < migrate_deadline )) || die "the space-db-migrate Job did not finish within ${TIMEOUT}s"
+  sleep 2
+done
 
 # api-server. The main container is gated on /readyz, which only turns 200
 # after the K8s pod reflector's initial LIST completes (empty list is fine at

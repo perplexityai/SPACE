@@ -653,10 +653,14 @@ kind_stack_psql_resolve_creds() {
     [[ -n "$KIND_STACK_PG_USER" && -n "$KIND_STACK_PG_DB" ]]
 }
 
+# Over loopback TLS rather than the pod's Unix socket: the server refuses
+# unencrypted TCP and the socket cannot encrypt, so sessions from this helper
+# show up encrypted in pg_stat_ssl like every other client's.
 kind_stack_psql() {
     kind_stack_psql_resolve_creds || return 1
     kubectl --context "kind-${KIND_CLUSTER}" -n "${NAMESPACE:-space}" \
         exec -i sts/space-postgres -- \
+        env PGHOST=127.0.0.1 PGSSLMODE=require \
         psql -U "$KIND_STACK_PG_USER" -d "$KIND_STACK_PG_DB" -tA -v ON_ERROR_STOP=1 "$@"
 }
 
@@ -841,6 +845,18 @@ kind_stack_assert_cluster_mounts() {
     rm -f "$expected"
 }
 
+# Refuse a cluster whose Postgres data directory an earlier space-postgres
+# chart initialized (PostgreSQL 16), before anything reads or applies it.
+# Beside the mount check, and for the same reason: under SKIP_BOOTSTRAP=1 such
+# a bench still runs the old server, which has no TLS, and the first
+# sslmode=require `kind_stack_psql` would fail without naming the cause.
+kind_stack_assert_postgres_data() {
+    # No cluster, nothing stale. Tested first, as the mount check does, so a
+    # box with no cluster never resolves the script's path.
+    kind get clusters 2>/dev/null | grep -qx "$KIND_CLUSTER" || return 0
+    bash "$REPO_ROOT/infra/space/kind/scripts/check-postgres-data.sh" "$KIND_CLUSTER" || exit 1
+}
+
 # Detached application bring-up: cluster created, Tilt started in its own
 # session and its selected context verified, then return. Initial profile
 # reconciliation still completes before that context is registered. Registration
@@ -857,12 +873,14 @@ kind_stack_assert_cluster_mounts() {
 kind_stack_start_detached() {
     kind_stack_assert_smoke_prereqs
     kind_stack_assert_cluster_mounts
+    kind_stack_assert_postgres_data
     KIND_STACK_DETACH=1 bootstrap_kind_stack__bring_up
 }
 
 bootstrap_kind_stack() {
     kind_stack_assert_smoke_prereqs
     kind_stack_assert_cluster_mounts
+    kind_stack_assert_postgres_data
     bootstrap_kind_stack__bring_up
     # Outside the bring-up, so it also runs under SKIP_BOOTSTRAP=1 — the mode
     # every devbox run uses once the stack is up, and therefore the mode in
@@ -919,6 +937,7 @@ bootstrap_kind_stack__load_mirrored_chart_images() {
 kind_stack_prepare_cluster() {
     kind_stack_assert_smoke_prereqs
     kind_stack_assert_cluster_mounts
+    kind_stack_assert_postgres_data
     bootstrap_kind_stack__assert_port_owner
     bootstrap_kind_stack__prepare_cluster
 }

@@ -868,6 +868,22 @@ tilt trigger space-seed-publish
 Deleting the publish Job is required because the database reset removes the
 template-release tags that resolve `seed:latest`.
 
+The same reset applies to a cluster whose database was created by an earlier
+revision of the `space-postgres` chart (PostgreSQL 16, superuser connection
+string): PostgreSQL 17 cannot start on that data directory, and the role
+setup the pod's init script provides runs only when it initializes an empty
+one. `bootstrap.sh`, the smoke suites' `scripts/tests/lib/bootstrap-kind-stack.sh`
+(under `SKIP_BOOTSTRAP=1` too) and the `Tiltfile` run
+`infra/space/kind/scripts/check-postgres-data.sh` before they apply anything
+or query the database. It reads the data directory's `PG_VERSION` on the node
+that holds the volume, so it answers the same whether the old server is still
+running or the new one is crash-looping, and on a mismatch it prints the reset
+commands and stops without changing anything (the scripts exit 1; Tilt
+reports a Tiltfile load error). Without Tilt, rerun `bootstrap.sh` (or the
+smoke suite) after the three `kubectl delete` commands above; a running Tilt
+reloads with `tilt trigger "(Tiltfile)"`. Recreating the cluster has the same
+effect.
+
 ### Diagnosing iteration disk pressure
 
 Every build loads its images into each Kind node's containerd store, which
@@ -977,7 +993,7 @@ kind cluster: space-local (kind-cluster.yaml.tmpl — 6 nodes)
 ├── worker2 [pool=sandbox, space-enabled=true]
 │   └── identical to worker
 ├── worker3 [pool=infra,    space.pplx.net/infra=true]
-│   ├── space-postgres        (StatefulSet)
+│   ├── space-postgres        (StatefulSet; PostgreSQL 17 serving TLS only, non-superuser master user)
 │   ├── space-object-store    (versitygw S3 gateway + bucket-init Job)
 │   ├── space-api             (Deployment, 2–3 replicas by HPA; SPACE_K8S_CONTROL_PLANE=true)
 │   ├── space-admin-api       (Deployment; the same binary on the dedicated admin surface)
@@ -1378,7 +1394,13 @@ asks of the hosting deployment.
 | One DaemonSet per node service, systemd watchdogs via k8s probes | One DaemonSet per node service and role from the Kind charts (`charts/space-<service>-local`), probed on each service's health socket; runtime-supervisor is the same host systemd unit node-manager's init container installs |
 | Node image (packer) provides `/space/cache`, the cgroup subtree, loop devices, device permissions, SPACE accounts and the `/space` skeleton before any pod starts | Sandbox workers and builders boot the SPACE Kind node image, which bakes in the same as systemd units that run before kubelet on every node start (see [The node layer](#the-node-layer)) |
 | `/space/cache` is btrfs on instance-store NVMe            | btrfs on a sparse loopback image at `/var/lib/space-cache.img` on the kind node (40 GiB, same code paths, less I/O headroom), mounted on the node's `/space/cache` by `space-cache.service`, so it outlives pod restarts like the NVMe does |
-| Postgres on RDS, secrets via ExternalSecrets / AWS Secrets Manager | In-cluster `space-postgres` StatefulSet, static Kubernetes Secrets             |
+| Postgres on RDS, secrets via ExternalSecrets / AWS Secrets Manager | In-cluster `space-postgres` StatefulSet, one pod on a 1 GiB volume, static Kubernetes Secrets |
+| PostgreSQL 17 | The same major version (`postgres:17`; CI takes it from the image mirror at a pinned digest) |
+| Every client connects with `sslmode=require`              | The same `sslmode=require` on every connection: the services and the migrate Job through the `space-postgres` Secret's connection string, and the harness's `psql` helpers over loopback TLS inside the pod. The certificate is self-signed per pod start, which `require` accepts because it does not verify the server. Kind's server also refuses unencrypted TCP, so no Kind client runs in plaintext and one that sets `sslmode=disable` fails. A client that omits `sslmode` still connects over TLS, because libpq and sqlx default to `prefer`, so Kind cannot catch a connection string that loses `sslmode=require` |
+| Bootstrap and migrations run as the managed service's master user, which is not a superuser but a member of `rds_superuser` | The same branch of `bootstrap-roles`: every connection string names `space_admin`, which has `CREATEDB CREATEROLE` and `rds_superuser` WITH ADMIN OPTION and owns the database. A stock server has none of that, so the pod's init script creates it, including the `rds_superuser` role itself and its `SET` privilege on `log_statement`, which a managed service grants that role and `bootstrap-roles` needs before writing passwords. The image's superuser remains, used only by the image's init and the harness's direct-state `psql` |
+| Per-service pools: the api tier far above the binary's default of 25, internal-api somewhat above it, every other service on the default; no connection pooler | `POSTGRES_POOL_MAX_CONNECTIONS` 100 for space-api and space-admin-api, 30 for internal-api, unset elsewhere; no pooler. `max_connections` (1400) holds every replica's pools at their HPA maxima plus a rollout surge, the migrate Job and headroom, so a service runs out of its own pool before the server refuses it. The pod's memory limit (8 GiB) is sized for that many backends rather than for the suites' usual load |
+| Server logs lock waits; the application roles' `lock_timeout` is off (`SPACE_DB_APP_LOCK_TIMEOUT` `0`) | `log_lock_waits = on`; `SPACE_DB_APP_LOCK_TIMEOUT` is unset, which leaves `lock_timeout` off the same way. Other server parameters are the image's defaults rather than a managed parameter group |
+| The migration Job fails fast: one attempt, no restarts, its deadline passed to the migrator | The same `space-db-migrate` Job shape (`backoffLimit: 0`, `restartPolicy: Never`, `activeDeadlineSeconds` = `SPACE_DB_MIGRATE_JOB_DEADLINE_SECONDS`), bootstrap-roles → migrate → bootstrap-roles. `bootstrap.sh` stops on a failed Job with its logs; rerunning it replaces the Job |
 | S3 for snapshots + template artifacts                     | In-cluster versitygw (real S3 protocol, sigv4, path-style)                    |
 | `space-credmgr-authority` Deployment whose platform KEK comes from an external intermediate-key broker, with TLS from its own certificate (`credmgr_authority_tls.tf`; the direct KMS backend is gone, `credmgr_authority_kms.tf`) | two replicas on the same broker path against the in-repo broker fixture (`space-kind-key-broker`), which derives keys instead of protecting them; TLS from a self-signed certificate `internal-rpc-tls.sh` issues per cluster |
 | Internal RPC CA and listener leaves issued by Terraform and synced by External Secrets (`internal_rpc_tls.tf`) | the same Secrets issued per cluster by `scripts/internal-rpc-tls.sh`; the ingress activation leaf names `space-api` rather than `space-ingress-activation` |

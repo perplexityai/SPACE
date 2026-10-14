@@ -944,6 +944,11 @@ class KindHarness:
             "-i",
             "space-postgres-0",
             "--",
+            # Loopback TLS, as kind_stack_psql connects: the server refuses
+            # unencrypted TCP.
+            "env",
+            "PGHOST=127.0.0.1",
+            "PGSSLMODE=require",
             "psql",
             "-U",
             "spaceuser",

@@ -1,0 +1,51 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}-postgres
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: space-postgres
+    app.kubernetes.io/instance: {{ .Release.Name }}
+data:
+  # Every TCP client must encrypt: an unencrypted connection matches no line
+  # and is refused, so no Kind client runs in plaintext and one that sets
+  # sslmode=disable fails. A client that omits sslmode still connects, over
+  # TLS: libpq and sqlx both default to prefer. The Unix socket serves only
+  # the image's init scripts; the in-pod harness and probes connect over
+  # loopback TLS.
+  pg_hba.conf: |
+    # TYPE   DATABASE  USER  ADDRESS       METHOD
+    local    all       all                 trust
+    hostssl  all       all   127.0.0.1/32  trust
+    hostssl  all       all   ::1/128       trust
+    hostssl  all       all   all           scram-sha-256
+  # Run once by the image's entrypoint when it initializes an empty data
+  # directory, as the image superuser. It provides what a managed service gives
+  # its master user, which bootstrap-roles' managed-service branch relies on
+  # (crates/libs/db/migrator/src/bootstrap_roles.rs):
+  # - rds_superuser exists, so converge_superadmin_attributes grants it to
+  #   space_superadmin instead of making that role a real superuser. The master
+  #   holds it WITH ADMIN OPTION, which that GRANT needs.
+  # - CREATEROLE, for ensure_roles and converge_memberships, and CREATEDB, which
+  #   a non-superuser needs to give space_superadmin CREATEDB.
+  # - SET on log_statement for rds_superuser: prepare_session mutes statement
+  #   logging before it writes role passwords and fails without it. A managed
+  #   service lets its rds_superuser set that parameter; stock PostgreSQL needs
+  #   the grant.
+  # - Ownership of the database, so the master owns schema public
+  #   (pg_database_owner) and can converge its privileges
+  #   (converge_schema_privileges), as a managed service's master owns the
+  #   database it creates.
+  10-managed-service-master.sh: |
+    #!/usr/bin/env bash
+    set -Eeuo pipefail
+    psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" \
+      --set=master_user="$SPACE_DB_MASTER_USER" \
+      --set=master_password="$SPACE_DB_MASTER_PASSWORD" \
+      --set=database="$POSTGRES_DB" <<'SQL'
+    CREATE ROLE rds_superuser NOLOGIN;
+    GRANT SET ON PARAMETER log_statement TO rds_superuser;
+    CREATE ROLE :"master_user" WITH LOGIN CREATEDB CREATEROLE PASSWORD :'master_password';
+    GRANT rds_superuser TO :"master_user" WITH ADMIN OPTION;
+    ALTER DATABASE :"database" OWNER TO :"master_user";
+    SQL
