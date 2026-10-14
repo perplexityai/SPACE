@@ -49,3 +49,56 @@ node, which cannot resolve cluster DNS either. Bring-up sets both.
 `telemetry.excludeDatadogLogs` adds a log-only exclusion to managed workload
 Pods in `otel` mode; the builder's command-output exclusion remains in every
 profile. Switching to Datadog pauses owned Alloy without deleting Loki data.
+
+## Cluster path: `global.observability`
+
+Kind bring-up never sets `global.observability`, and without it the chart
+renders exactly what the `telemetry` values above describe. A deployment
+outside Kind sets it instead, once for every SPACE chart, and then only
+`telemetry.version` (or the image tag) and a `telemetry.traceExporter` of
+`off` are read from `telemetry`:
+
+```yaml
+global:
+  observability:
+    mode: otlp            # off | datadog | otlp; required. Quote it: YAML reads bare off as false (accepted).
+    environment: staging  # SPACE_ENV, DD_ENV, deployment.environment.name; required unless off
+    cluster: cluster-a    # k8s.cluster.name and the kube_cluster_name Datadog tag; required unless off
+    datadog:
+      dogstatsdPort: 8125 # DD_DOGSTATSD_PORT
+      apmPort: 8126       # DD_TRACE_AGENT_PORT
+    otlp:
+      protocol: grpc      # the only protocol SPACE producers export
+      nodeLocalPort: 4317
+      traceSampler: ""    # OTEL_TRACES_SAMPLER when set
+```
+
+| Mode | Environment |
+| --- | --- |
+| `off` | `SPACE_METRICS_SINK` and `SPACE_TRACE_EXPORTER` `off`, `DD_TRACE_ENABLED=false`; no Agent address or OTLP endpoint |
+| `datadog` | Datadog sinks; `DD_AGENT_HOST` from `status.hostIP`, the two configured ports |
+| `otlp` | `NODE_IP` from `status.hostIP`, then both signal endpoints `http://$(NODE_IP):<nodeLocalPort>` over gRPC, with `cumulative` metric temporality for the Rust services |
+
+A chart that sets `telemetry.traceExporter: "off"` keeps traces off in every
+mode (`SPACE_TRACE_EXPORTER=off` and no trace endpoint, sampler or APM port;
+`DD_TRACE_ENABLED=false` in the `off` and `datadog` modes, where it is
+emitted) while its metrics follow the mode. `space-build-manager-local`
+does, because build errors can contain guest output. Other `telemetry`
+values do not apply on the cluster path.
+
+`NODE_IP` precedes the endpoints because the kubelet expands `$(NODE_IP)` only
+from earlier variables. The `otlp` mode expects an OTLP receiver on every
+node at `nodeLocalPort`; this chart does not provide one. An unknown mode, a
+protocol other than `grpc`, a port outside 1-65535, a missing environment or
+cluster, or a name containing anything but letters, digits and `._:/-` fails
+the render.
+
+`space-kind-telemetry.envNames` lists the variables `space-kind-telemetry.env`
+sets for the selected path and mode, for writers that copy a container's
+resolved environment to a host process.
+
+Not yet wired to the cluster path: the host runtime-supervisor's node
+environment, which `space-node-manager-local`'s `kind-node-env` writes from a
+fixed variable list and `telemetry.nodeOtlp*Endpoint`, and the containerd shim
+wrapper, which `scripts/install-shim.sh` writes from
+`scripts/telemetry_config.py`. Both still follow the Kind profile only.
