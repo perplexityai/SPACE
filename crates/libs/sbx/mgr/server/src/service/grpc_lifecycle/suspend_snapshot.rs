@@ -599,17 +599,19 @@ impl SandboxManagerService {
             // Keyed off the sandbox's immutable volume_encryption flag; `None` for
             // plaintext sandboxes — the plaintext producer below is then
             // byte-identical to before. A failure here is fail-closed.
-            // An encrypted capture's sidecar metadata depends only on the row,
-            // so build it while a failure can still roll back to paused.
+            // An encrypted capture's sidecar metadata depends only on the row.
+            // Build it and write the capture's record now, while a failure can
+            // still roll back to paused: once the capture stops the runtime, a
+            // failed seal is recoverable only through that record.
             let encrypted_capture_metadata = if sandbox.volume_encryption {
-                match suspend_artifact_metadata(
+                let metadata = match suspend_artifact_metadata(
                     &sandbox,
                     published_format,
                     local_artifact_id,
                     true,
                     None,
                 ) {
-                    Ok(metadata) => Some(metadata),
+                    Ok(metadata) => metadata,
                     Err(status) => {
                         let reason =
                             format!("local artifact metadata construction failed: {status}");
@@ -619,7 +621,14 @@ impl SandboxManagerService {
                         );
                         return Err(status);
                     }
+                };
+                if let Err(error) = prepare_encrypted_capture_record(&staging_dir, &metadata) {
+                    let reason = format!("record encrypted capture failed: {error}");
+                    self.record_suspend_snapshot_publication_failure_after_begin(&sandbox.id, &reason);
+                    record_artifact_stage_failure(&reason);
+                    return Err(Status::internal(reason));
                 }
+                Some(metadata)
             } else {
                 None
             };
@@ -747,15 +756,16 @@ impl SandboxManagerService {
             // for encrypted snapshots (there is no plaintext `rootfs.ext4` to diff).
             if let Some(metadata) = &encrypted_capture_metadata {
                 // The runtime is gone, so this capture now exists only in the
-                // volume. Record it before sealing, so a failed seal leaves a
-                // capture recovery can still seal and publish. Only a failed
-                // seal needs the record: if writing it fails, still seal, which
-                // also releases the volume.
-                if let Err(error) = write_encrypted_capture_record(&staging_dir, metadata) {
-                    tracing::warn!(
+                // volume. Commit its record before sealing, so a failed seal
+                // leaves a capture recovery can still seal and publish. The
+                // commit is a rename of the record written before the capture;
+                // if even that fails, the staging filesystem is failing, and
+                // sealing now is the capture's only chance.
+                if let Err(error) = commit_encrypted_capture_record(&staging_dir) {
+                    tracing::error!(
                         sandbox_id = %sandbox.id,
                         %error,
-                        "cannot record encrypted capture; a failed seal will not be recoverable"
+                        "cannot commit encrypted capture record; a failed seal will not be recoverable"
                     );
                 }
                 if let Err(error) = self

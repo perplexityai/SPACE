@@ -43,7 +43,15 @@ pub(super) const ENCRYPTED_CAPTURE_RECORD: &str = "encrypted-capture.json";
 pub(super) const ENCRYPTED_SEAL_RETRY_WINDOW: std::time::Duration =
     std::time::Duration::from_secs(6 * 60 * 60);
 
-pub(super) fn write_encrypted_capture_record(
+/// The record, written durably before the capture under a name recovery
+/// ignores. [`commit_encrypted_capture_record`] gives it the record's name
+/// once the capture has finished.
+const ENCRYPTED_CAPTURE_INTENT: &str = ".encrypted-capture.json.intent";
+
+/// Write the capture's record before the capture, while a failure can still
+/// roll back to paused. Nothing treats it as a record until it is committed,
+/// so an interrupted capture can never be sealed and published.
+pub(super) fn prepare_encrypted_capture_record(
     staging_dir: &Path,
     metadata: &crate::snapshot_upload::SnapshotMeta,
 ) -> std::io::Result<()> {
@@ -51,7 +59,7 @@ pub(super) fn write_encrypted_capture_record(
     crate::snapshot_upload::replace_file_durably(
         staging_dir,
         ".encrypted-capture.json.tmp",
-        ENCRYPTED_CAPTURE_RECORD,
+        ENCRYPTED_CAPTURE_INTENT,
         &json,
     )?;
     // The record is the only copy of the capture's identity: make the
@@ -63,6 +71,17 @@ pub(super) fn write_encrypted_capture_record(
         directory = parent.parent();
     }
     Ok(())
+}
+
+/// Mark the capture finished: a same-directory rename of the already
+/// durable record, then a directory sync. It writes no data, so it can fail
+/// only if the staging filesystem itself is failing.
+pub(super) fn commit_encrypted_capture_record(staging_dir: &Path) -> std::io::Result<()> {
+    std::fs::rename(
+        staging_dir.join(ENCRYPTED_CAPTURE_INTENT),
+        staging_dir.join(ENCRYPTED_CAPTURE_RECORD),
+    )?;
+    std::fs::File::open(staging_dir)?.sync_all()
 }
 
 pub(super) fn read_encrypted_capture_record(

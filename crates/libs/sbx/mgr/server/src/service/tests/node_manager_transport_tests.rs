@@ -128,6 +128,7 @@ fn record_encrypted_capture(
     cache: &Path,
     id: &str,
     age: std::time::Duration,
+    committed: bool,
 ) -> (LocalArtifactId, std::path::PathBuf) {
     use crate::service::suspend_snapshot_publication as publication;
     insert_test_sandbox(conn, id, SandboxState::Suspending);
@@ -146,7 +147,11 @@ fn record_encrypted_capture(
     metadata.encrypted = true;
     std::fs::remove_dir_all(&staging).unwrap();
     std::fs::create_dir_all(&staging).unwrap();
-    publication::write_encrypted_capture_record(&staging, &metadata).unwrap();
+    publication::prepare_encrypted_capture_record(&staging, &metadata).unwrap();
+    if !committed {
+        return (capture, staging);
+    }
+    publication::commit_encrypted_capture_record(&staging).unwrap();
     std::fs::File::options()
         .write(true)
         .open(staging.join(publication::ENCRYPTED_CAPTURE_RECORD))
@@ -209,7 +214,7 @@ async fn unsealed_encrypted_capture_survives_restart_and_publishes_once_sealed()
     let id = SandboxId::new().to_string();
     let cache = tempfile::tempdir().unwrap();
     let (capture, staging) =
-        record_encrypted_capture(&conn, cache.path(), &id, std::time::Duration::ZERO);
+        record_encrypted_capture(&conn, cache.path(), &id, std::time::Duration::ZERO, true);
     let service = service_with_node_manager(conn, node_manager.connector());
 
     // The live seal failure, a restart and a refused retry all keep it.
@@ -278,6 +283,7 @@ async fn expired_encrypted_capture_is_quarantined_without_a_seal_attempt() {
         cache.path(),
         &id,
         publication::ENCRYPTED_SEAL_RETRY_WINDOW + std::time::Duration::from_secs(60),
+        true,
     );
     let service = service_with_node_manager(conn, node_manager.connector());
 
@@ -304,7 +310,7 @@ async fn complete_staged_capture_publishes_past_an_older_unsealed_record() {
     let conn = crate::db::test_conn();
     let id = SandboxId::new().to_string();
     let cache = tempfile::tempdir().unwrap();
-    record_encrypted_capture(&conn, cache.path(), &id, std::time::Duration::ZERO);
+    record_encrypted_capture(&conn, cache.path(), &id, std::time::Duration::ZERO, true);
     let newer = LocalArtifactId::new();
     publication::write_full_suspend_artifact(
         &publication::suspend_snapshot_staging_dir(&cache.path().join(&id), newer),
@@ -323,4 +329,30 @@ async fn complete_staged_capture_publishes_past_an_older_unsealed_record() {
     let row = service.lookup_sandbox(&id).unwrap();
     assert_eq!(row.state, SandboxState::CleanupRequired);
     assert_eq!(row.current_local_artifact_id, Some(newer));
+}
+
+#[tokio::test]
+async fn uncommitted_encrypted_capture_record_is_never_sealed() {
+    // The capture never finished: only the record written before it exists.
+    let node_manager = sealing_node_manager(0);
+    let conn = crate::db::test_conn();
+    let id = SandboxId::new().to_string();
+    let cache = tempfile::tempdir().unwrap();
+    let (_, staging) =
+        record_encrypted_capture(&conn, cache.path(), &id, std::time::Duration::ZERO, false);
+    let service = service_with_node_manager(conn, node_manager.connector());
+
+    recover_batch(&service, cache.path(), &id).await;
+
+    assert!(
+        node_manager.calls().is_empty(),
+        "an unfinished capture must not be sealed"
+    );
+    let row = service.lookup_sandbox(&id).unwrap();
+    assert_eq!(row.state, SandboxState::Quarantined);
+    assert_eq!(
+        row.failure_reason.as_deref(),
+        Some(crate::db::SUSPEND_PUBLISH_FAILED_NO_ARTIFACT_RUNTIME_GONE)
+    );
+    assert!(staging.exists());
 }
