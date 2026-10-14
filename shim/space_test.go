@@ -1077,7 +1077,7 @@ func TestSandboxNetworkPolicyTLSInterceptionExemptions(t *testing.T) {
 		exemptions string
 		valid      bool
 	}{
-		{"all destinations", `[{"ip":"192.0.2.10"},{"cidr":"198.51.100.0/24"},{"domain":"sensor.example.test"},{"wildcard_domain":"example.test"}]`, true},
+		{"all destinations", `[{"ip":"192.0.2.10"},{"cidr":"198.51.100.0/24"},{"domain":"sensor.example.test"},{"wildcard_domain":"*.example.test"}]`, true},
 		{"empty destination", `[{}]`, false},
 		{"ambiguous destination", `[{"ip":"192.0.2.10","domain":"sensor.example.test"}]`, false},
 		{"wrong shape", `"sensor.example.test"`, false},
@@ -1115,7 +1115,7 @@ func TestSandboxNetworkPolicyTLSInterceptionExemptions(t *testing.T) {
 					{Destination: &netpb.EgressDestinationV1_Ip{Ip: "192.0.2.10"}},
 					{Destination: &netpb.EgressDestinationV1_Cidr{Cidr: "198.51.100.0/24"}},
 					{Destination: &netpb.EgressDestinationV1_Domain{Domain: "sensor.example.test"}},
-					{Destination: &netpb.EgressDestinationV1_WildcardDomain{WildcardDomain: "example.test"}},
+					{Destination: &netpb.EgressDestinationV1_WildcardDomain{WildcardDomain: "*.example.test"}},
 				},
 			}
 			if !proto.Equal(&received, want) {
