@@ -171,8 +171,7 @@ pub(crate) async fn local_provider_with_policy(
                     1,
                     "a".repeat(64),
                 )
-                .unwrap()
-                .to_string(),
+                .unwrap(),
                 network_credentials,
             })
         })
@@ -569,8 +568,7 @@ async fn owner_issues_over_host_control_after_assignment_and_stops_on_shutdown()
                     "sandbox-1",
                     "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
                 )
-                .unwrap()
-                .to_string(),
+                .unwrap(),
                 network_credentials: Default::default(),
             })
         })

@@ -156,8 +156,7 @@ async fn install_policy(state: &GatewayNetworkState, kind: PolicyKind) -> anyhow
         "netgtw-bench",
         BENCH_POLICY_SHA256,
     )
-    .context("bench policy ref must parse")?
-    .to_string();
+    .context("bench policy ref must parse")?;
     let loader: PolicyLoader = {
         let policy_ref = policy_ref.clone();
         Arc::new(move || {

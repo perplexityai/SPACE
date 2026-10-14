@@ -16,14 +16,16 @@ fn effective_network_policy_ref_round_trips_cluster() {
         serialized,
         format!("cluster:sandbox:sbx-1:generation:7:sha256:{hash}")
     );
-    assert_eq!(
-        serialized.parse::<EffectiveNetworkPolicyRef>().unwrap(),
-        policy_ref
-    );
-    assert!(effective_network_policy_refs_match(
-        &serialized,
-        &serialized
-    ));
+    for wire in [
+        serialized.clone(),
+        format!("cluster:sandbox:sbx-1:generation:0007:sha256:{hash}"),
+    ] {
+        let parsed = wire.parse::<EffectiveNetworkPolicyRef>().unwrap();
+        assert_eq!(parsed, policy_ref);
+        assert_eq!(parsed.to_string(), serialized);
+        assert!(effective_network_policy_refs_match(&wire, &serialized));
+        assert!(effective_network_policy_refs_match(&serialized, &wire));
+    }
     assert_eq!(
         effective_network_policy_ref_authority_label(&serialized),
         "cluster"
@@ -61,6 +63,23 @@ fn effective_network_policy_ref_round_trips_local_and_no_identity() {
 
 #[test]
 fn effective_network_policy_ref_rejects_malformed_values() {
+    let hash = "a".repeat(64);
+    for (owner, expected) in [
+        ("", EffectiveNetworkPolicyRefParseError::EmptyOwner),
+        ("sbx:1", EffectiveNetworkPolicyRefParseError::InvalidFormat),
+    ] {
+        for policy_ref in [
+            EffectiveNetworkPolicyRef::cluster(
+                EffectiveNetworkPolicyRefScope::Sandbox,
+                owner,
+                7,
+                &hash,
+            ),
+            EffectiveNetworkPolicyRef::local(EffectiveNetworkPolicyRefScope::Sandbox, owner, &hash),
+        ] {
+            assert_eq!(policy_ref, Err(expected), "owner: {owner:?}");
+        }
+    }
     "".parse::<EffectiveNetworkPolicyRef>().unwrap_err();
     "cluster:sandbox:sbx-1:generation:nope:sha256:aaaa"
         .parse::<EffectiveNetworkPolicyRef>()

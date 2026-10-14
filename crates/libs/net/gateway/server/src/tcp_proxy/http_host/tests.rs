@@ -58,8 +58,7 @@ fn policy_loader(policy: NetworkPolicyV1) -> PolicyLoader {
         "host-binding-test",
         "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
     )
-    .unwrap()
-    .to_string();
+    .unwrap();
     Arc::new(move || {
         let policy = policy.clone();
         let policy_ref = policy_ref.clone();

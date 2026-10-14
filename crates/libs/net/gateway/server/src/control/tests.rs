@@ -33,8 +33,7 @@ async fn control_rpcs_preserve_readiness_and_report_installed_tls_policy() {
         "sandbox-1",
         "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
     )
-    .unwrap()
-    .to_string();
+    .unwrap();
     for mode in [TlsInterception::Off, TlsInterception::On] {
         let ca_ready = Arc::new(AtomicBool::new(false));
         let state = GatewayNetworkState::pending_policy()
@@ -92,7 +91,7 @@ async fn control_rpcs_preserve_readiness_and_report_installed_tls_policy() {
             ca_ready.store(installed, Ordering::SeqCst);
             let refreshed = service
                 .refresh_network_policy(root_request(RefreshNetworkPolicyRequest {
-                    expected_policy_ref: policy_ref.clone(),
+                    expected_policy_ref: policy_ref.to_string(),
                     reason: "start".to_owned(),
                 }))
                 .await
@@ -122,7 +121,7 @@ async fn control_rpcs_preserve_readiness_and_report_installed_tls_policy() {
             for bytes in [refreshed.encode_to_vec(), observed.encode_to_vec()] {
                 let legacy = LegacyReadiness::decode(bytes.as_slice()).unwrap();
                 assert_eq!(legacy.state, 3, "{mode:?}, CA installed={installed}");
-                assert_eq!(legacy.installed_policy_ref, policy_ref);
+                assert_eq!(legacy.installed_policy_ref, policy_ref.to_string());
             }
             assert!(observed.last_error.is_empty());
             // The gate is reported on the side, on every readiness reply.

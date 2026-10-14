@@ -350,7 +350,7 @@ async fn install_test_policy(state: &GatewayNetworkState, policy: NetworkPolicyV
     let policy_ref =
         EffectiveNetworkPolicyRef::local(EffectiveNetworkPolicyRefScope::Sandbox, "sandbox-1", SHA)
             .unwrap();
-    let installed_ref = policy_ref.to_string();
+    let installed_ref = policy_ref.clone();
     let loader: crate::state::PolicyLoader = Arc::new(move || {
         let policy = policy.clone();
         let installed_ref = installed_ref.clone();

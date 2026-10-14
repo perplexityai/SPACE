@@ -1019,6 +1019,8 @@ pub fn effective_network_policy_ref_authority_label(policy_ref: &str) -> &'stati
 fn validate_policy_ref_owner(owner: &str) -> Result<(), EffectiveNetworkPolicyRefParseError> {
     if owner.is_empty() {
         Err(EffectiveNetworkPolicyRefParseError::EmptyOwner)
+    } else if owner.contains(':') {
+        Err(EffectiveNetworkPolicyRefParseError::InvalidFormat)
     } else {
         Ok(())
     }

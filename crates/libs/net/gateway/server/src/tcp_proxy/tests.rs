@@ -44,7 +44,7 @@ async fn install_policy(
         content_hash,
     )
     .unwrap();
-    let policy_ref = expected_policy_ref.to_string();
+    let policy_ref = expected_policy_ref.clone();
     let loader: crate::state::PolicyLoader = Arc::new(move || {
         let policy = policy.clone();
         let policy_ref = policy_ref.clone();
@@ -424,8 +424,14 @@ async fn failed_policy_refresh_cancels_established_tcp_connections() {
         &DnsAllowCache::default(),
         dns_attributed_shutdown.clone(),
     );
-    let failed_loader: crate::state::PolicyLoader =
-        Arc::new(|| Box::pin(async { Err("forced policy refresh failure".to_string()) }));
+    let failed_loader: crate::state::PolicyLoader = Arc::new(|| {
+        Box::pin(async {
+            Err(crate::state::HydrateNetworkStateError::GetNetworkPolicy {
+                sandbox_id: pplx_space_common_core::types::SandboxId::new(),
+                source: tonic::Status::unavailable("forced policy refresh failure"),
+            })
+        })
+    });
     let expected_policy_ref = EffectiveNetworkPolicyRef::local(
         EffectiveNetworkPolicyRefScope::Sandbox,
         "tcp-enforcement-test",
@@ -889,8 +895,7 @@ async fn devbox_full_proxy_run_extracts_sni_from_real_client() {
         "devbox-validation",
         "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
     )
-    .unwrap()
-    .to_string();
+    .unwrap();
     let state = GatewayNetworkState::pending_policy();
     let loader: crate::state::PolicyLoader = {
         let policy_ref = policy_ref.clone();

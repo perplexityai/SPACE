@@ -226,8 +226,14 @@ async fn ready_invalidation_cancels_open_reserved_tcp_connections() {
                     SHA,
                 )
                 .unwrap();
-                let loader: PolicyLoader =
-                    Arc::new(|| Box::pin(async { Err("unavailable".into()) }));
+                let loader: PolicyLoader = Arc::new(|| {
+                    Box::pin(async {
+                        Err(crate::state::HydrateNetworkStateError::GetNetworkPolicy {
+                            sandbox_id: pplx_space_common_core::types::SandboxId::new(),
+                            source: tonic::Status::unavailable("unavailable"),
+                        })
+                    })
+                });
                 let snapshot = state
                     .refresh(loader, Some(expected), NetworkStateReason::ControlRefresh)
                     .await;
@@ -261,7 +267,7 @@ async fn install_ready(state: GatewayNetworkState, policy: NetworkPolicyV1) -> G
     let policy_ref =
         EffectiveNetworkPolicyRef::local(EffectiveNetworkPolicyRefScope::Sandbox, "sandbox-1", SHA)
             .unwrap();
-    let installed_ref = policy_ref.to_string();
+    let installed_ref = policy_ref.clone();
     let loader: PolicyLoader = Arc::new(move || {
         let policy = policy.clone();
         let installed_ref = installed_ref.clone();

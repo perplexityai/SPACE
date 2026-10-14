@@ -85,9 +85,8 @@ async fn ready_network_state() -> GatewayNetworkState {
         "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
     )
     .expect("policy ref parses");
-    let policy_ref_string = policy_ref.to_string();
     let loader: crate::state::PolicyLoader = Arc::new(move || {
-        let policy_ref = policy_ref_string.clone();
+        let policy_ref = policy_ref.clone();
         Box::pin(async move {
             Ok(crate::state::PulledNetworkPolicy {
                 policy: pplx_space_net_common::NetworkPolicyV1::allow_all(),

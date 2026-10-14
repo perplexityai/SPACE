@@ -1,5 +1,8 @@
 use super::*;
+use pplx_space_common_core::types::CredentialReferenceId;
 use pplx_space_net_common::EffectiveNetworkPolicyRefScope;
+use std::future::Future;
+use std::pin::Pin;
 use tokio::sync::oneshot;
 
 fn tls_on_loader(pulls: Arc<AtomicU64>) -> PolicyLoader {
@@ -10,7 +13,7 @@ fn tls_on_loader(pulls: Arc<AtomicU64>) -> PolicyLoader {
             policy.tls_interception = pplx_space_net_common::TlsInterception::On;
             Ok(PulledNetworkPolicy {
                 policy,
-                policy_ref: test_policy_ref().to_string(),
+                policy_ref: test_policy_ref(),
                 network_credentials: Default::default(),
             })
         })
@@ -183,7 +186,7 @@ async fn changed_tls_policy_applies_to_subsequent_admissions() {
     )
     .unwrap();
     let loader: PolicyLoader = Arc::new({
-        let on_ref = on_ref.to_string();
+        let on_ref = on_ref.clone();
         move || {
             let on_ref = on_ref.clone();
             Box::pin(async move {
@@ -242,7 +245,7 @@ async fn network_credentials_are_bound_to_the_exact_installed_policy_generation(
     let first_ref = test_policy_ref();
     let loader: PolicyLoader = Arc::new(move || {
         let policy = policy.clone();
-        let policy_ref = first_ref.to_string();
+        let policy_ref = first_ref.clone();
         Box::pin(async move {
             let network_credentials = NetworkCredentialSnapshot::from_wire(
                 vec![ResolvedNetworkCredential {
@@ -288,65 +291,7 @@ async fn network_credentials_are_bound_to_the_exact_installed_policy_generation(
     assert!(state.with_network_credentials(&installed, |_| ()).is_err());
 }
 
-#[test]
-fn network_credential_snapshot_rejects_malformed_unauthorized_and_duplicate_entries() {
-    use pplx_space_credential_injection_core::proto::ResolvedNetworkCredential;
-    use pplx_space_net_common::{
-        CredentialHeaderBindingV1, NetworkCredentialDestinationV1, NetworkCredentialHttpMethodV1,
-        NetworkCredentialRuleV1,
-    };
-
-    let reference_id: CredentialReferenceId =
-        "018f1e9d-7b7a-7d3a-8000-000000000001".parse().unwrap();
-    let mut policy = pplx_space_net_common::NetworkPolicyV1::allow_all();
-    policy.tls_interception = pplx_space_net_common::TlsInterception::On;
-    policy.network_credential_rules = vec![NetworkCredentialRuleV1 {
-        rule_id: "api".into(),
-        destination: NetworkCredentialDestinationV1::new(
-            "api.example.com".parse().unwrap(),
-            None,
-            None,
-        )
-        .unwrap(),
-        credential_header_bindings: vec![CredentialHeaderBindingV1 {
-            header_name: "authorization".into(),
-            credential_reference_id: reference_id.as_uuid(),
-        }],
-        supported_http_methods: vec![NetworkCredentialHttpMethodV1::Get],
-    }];
-    let credential = |id: String| ResolvedNetworkCredential {
-        credential_reference_id: id,
-        value: b"Bearer test-only".to_vec(),
-    };
-
-    assert!(matches!(
-        NetworkCredentialSnapshot::from_wire(
-            vec![credential(reference_id.to_string().to_uppercase())],
-            &policy,
-        ),
-        Err(InvalidNetworkCredentialSnapshot::MalformedReferenceId)
-    ));
-    assert!(matches!(
-        NetworkCredentialSnapshot::from_wire(
-            vec![credential("018f1e9d-7b7a-7d3a-8000-000000000002".into())],
-            &policy,
-        ),
-        Err(InvalidNetworkCredentialSnapshot::UnauthorizedReferenceId)
-    ));
-    assert!(matches!(
-        NetworkCredentialSnapshot::from_wire(
-            vec![
-                credential(reference_id.to_string()),
-                credential(reference_id.to_string()),
-            ],
-            &policy,
-        ),
-        Err(InvalidNetworkCredentialSnapshot::DuplicateReferenceId)
-    ));
-}
-
 fn immediate_success_loader(policy_ref: EffectiveNetworkPolicyRef) -> PolicyLoader {
-    let policy_ref = policy_ref.to_string();
     Arc::new(move || {
         let policy_ref = policy_ref.clone();
         Box::pin(async move {
@@ -360,7 +305,6 @@ fn immediate_success_loader(policy_ref: EffectiveNetworkPolicyRef) -> PolicyLoad
 }
 
 fn v1_domain_allow_loader(policy_ref: EffectiveNetworkPolicyRef) -> PolicyLoader {
-    let policy_ref = policy_ref.to_string();
     Arc::new(move || {
         let policy_ref = policy_ref.clone();
         Box::pin(async move {
@@ -519,7 +463,67 @@ async fn policy_hydrates_ready_with_stable_ref_and_fails_closed_on_mismatch() {
 }
 
 fn immediate_error_loader(error: &'static str) -> PolicyLoader {
-    Arc::new(move || Box::pin(async move { Err::<PulledNetworkPolicy, String>(error.to_string()) }))
+    Arc::new(move || {
+        Box::pin(async move {
+            Err(HydrateNetworkStateError::GetNetworkPolicy {
+                sandbox_id: pplx_space_common_core::types::SandboxId::new(),
+                source: tonic::Status::unavailable(error),
+            })
+        })
+    })
+}
+
+#[tokio::test]
+async fn typed_load_failures_clear_policy_and_preserve_diagnostics() {
+    type FailureCase = (fn() -> HydrateNetworkStateError, &'static str);
+    let failures: [FailureCase; 2] = [
+        (
+            || HydrateNetworkStateError::InvalidReference {
+                reference: "invalid".to_owned(),
+                source: pplx_space_net_common::EffectiveNetworkPolicyRefParseError::InvalidFormat,
+            },
+            "policy ref is invalid: effective network policy ref has invalid format: invalid",
+        ),
+        (
+            || HydrateNetworkStateError::Policy(NetworkPolicyFromHostControlError::MissingV1Policy),
+            "host-control returned no V1 policy",
+        ),
+    ];
+    for (failure, message) in failures {
+        let state = GatewayNetworkState::pending_policy();
+        let installed_ref = test_policy_ref();
+        state
+            .refresh(
+                immediate_success_loader(installed_ref.clone()),
+                None,
+                NetworkStateReason::Startup,
+            )
+            .await;
+        let next_ref = EffectiveNetworkPolicyRef::local(
+            EffectiveNetworkPolicyRefScope::Sandbox,
+            "sandbox-1",
+            "f".repeat(64),
+        )
+        .unwrap();
+        let loader: PolicyLoader = Arc::new(move || Box::pin(async move { Err(failure()) }));
+        let snapshot = state
+            .refresh(loader, Some(next_ref), NetworkStateReason::ControlRefresh)
+            .await;
+
+        assert_eq!(snapshot.mode, NetworkState::PolicyError);
+        assert!(snapshot.policy.is_none());
+        assert_eq!(snapshot.installed_policy_ref, installed_ref.to_string());
+        assert_eq!(
+            snapshot.last_error_kind,
+            NetworkPolicyErrorKind::LoaderError
+        );
+        assert_eq!(snapshot.last_error, message);
+        assert_eq!(snapshot.consecutive_hydration_failures, 1);
+        assert!(matches!(
+            state.wait_for_tcp_policy().await,
+            TrafficPolicy::NotReady(PolicyNotReady::PolicyError)
+        ));
+    }
 }
 
 fn counting_success_loader(
@@ -527,7 +531,6 @@ fn counting_success_loader(
 ) -> (PolicyLoader, Arc<std::sync::atomic::AtomicUsize>) {
     let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let calls_for_loader = Arc::clone(&calls);
-    let policy_ref = policy_ref.to_string();
     let loader: PolicyLoader = Arc::new(move || {
         let policy_ref = policy_ref.clone();
         let calls = Arc::clone(&calls_for_loader);
@@ -609,7 +612,7 @@ async fn matching_policy_ref_reloads_the_complete_network_credential_snapshot() 
     let loader: PolicyLoader = Arc::new({
         let calls = calls.clone();
         let policy = policy.clone();
-        let policy_ref = test_policy_ref().to_string();
+        let policy_ref = test_policy_ref();
         move || {
             let generation = calls.fetch_add(1, SeqCst) + 1;
             let policy = policy.clone();
@@ -682,7 +685,6 @@ fn controlled_success_loader(
     let started_tx = Arc::new(std::sync::Mutex::new(Some(started_tx)));
     let (release_tx, release_rx) = oneshot::channel();
     let release_rx = Arc::new(std::sync::Mutex::new(Some(release_rx)));
-    let policy_ref = policy_ref.to_string();
 
     let loader = Arc::new(move || {
         let started_tx = Arc::clone(&started_tx);
@@ -705,7 +707,13 @@ fn controlled_success_loader(
                 policy_ref,
                 network_credentials: Default::default(),
             })
-        }) as Pin<Box<dyn Future<Output = Result<PulledNetworkPolicy, String>> + Send>>
+        })
+            as Pin<
+                Box<
+                    dyn Future<Output = Result<PulledNetworkPolicy, HydrateNetworkStateError>>
+                        + Send,
+                >,
+            >
     });
 
     (loader, started_rx, release_tx)

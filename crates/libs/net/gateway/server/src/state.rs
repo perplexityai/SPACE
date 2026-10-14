@@ -1,14 +1,9 @@
-use std::collections::{BTreeMap, BTreeSet};
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
 };
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use pplx_space_common_core::types::CredentialReferenceId;
-use pplx_space_credential_injection_core::proto::ResolvedNetworkCredential;
 use pplx_space_net_common::{
     EffectiveNetworkPolicyRef, NetworkPolicyV1, TlsInterception,
     effective_network_policy_ref_authority_label,
@@ -25,6 +20,13 @@ use crate::egress::DnsAttributedTcpTracker;
 
 use crate::proto::{NetworkPolicyErrorKind, NetworkState};
 
+mod credentials;
+pub use credentials::{InvalidNetworkCredentialSnapshot, NetworkCredentialSnapshot};
+mod source;
+pub(crate) use source::host_control_policy_loader;
+pub use source::{
+    HydrateNetworkStateError, NetworkPolicyFromHostControlError, PolicyLoader, PulledNetworkPolicy,
+};
 mod egress;
 pub use egress::ReservedDnsCancellation;
 mod startup_timing;
@@ -42,84 +44,6 @@ pub(crate) const READY_HYDRATION_RECHECK_INTERVAL: Duration = Duration::from_sec
 const POLICY_REF_MISMATCH_RECHECK_INTERVAL: Duration = Duration::from_secs(5);
 pub(crate) const MAX_HYDRATION_RETRY_BACKOFF: Duration = Duration::from_secs(5);
 pub(crate) const MAX_SELF_HYDRATION_RETRIES: u64 = 12;
-
-pub type PolicyLoader = Arc<
-    dyn Fn() -> Pin<Box<dyn Future<Output = Result<PulledNetworkPolicy, String>> + Send>>
-        + Send
-        + Sync,
->;
-
-#[derive(Debug)]
-pub struct PulledNetworkPolicy {
-    pub policy: NetworkPolicyV1,
-    pub policy_ref: String,
-    pub network_credentials: NetworkCredentialSnapshot,
-}
-
-#[derive(Default)]
-pub struct NetworkCredentialSnapshot {
-    values: BTreeMap<CredentialReferenceId, zeroize::Zeroizing<Vec<u8>>>,
-}
-
-impl std::fmt::Debug for NetworkCredentialSnapshot {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("NetworkCredentialSnapshot")
-            .field("credential_count", &self.values.len())
-            .finish()
-    }
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum InvalidNetworkCredentialSnapshot {
-    #[error("credential authority returned a malformed reference ID")]
-    MalformedReferenceId,
-    #[error("credential authority returned an unauthorized reference ID")]
-    UnauthorizedReferenceId,
-    #[error("credential authority returned a duplicate reference ID")]
-    DuplicateReferenceId,
-}
-
-impl NetworkCredentialSnapshot {
-    pub fn from_wire(
-        credentials: Vec<ResolvedNetworkCredential>,
-        policy: &NetworkPolicyV1,
-    ) -> Result<Self, InvalidNetworkCredentialSnapshot> {
-        let authorized: BTreeSet<_> = policy
-            .network_credential_rules
-            .iter()
-            .flat_map(|rule| rule.credential_header_bindings.iter())
-            .map(|binding| CredentialReferenceId::from_uuid(binding.credential_reference_id))
-            .collect();
-        let mut values = BTreeMap::new();
-        for mut credential in credentials {
-            let reference_id = credential
-                .credential_reference_id
-                .parse::<CredentialReferenceId>()
-                .map_err(|_| InvalidNetworkCredentialSnapshot::MalformedReferenceId)?;
-            if reference_id.to_string() != credential.credential_reference_id {
-                return Err(InvalidNetworkCredentialSnapshot::MalformedReferenceId);
-            }
-            if !authorized.contains(&reference_id) {
-                return Err(InvalidNetworkCredentialSnapshot::UnauthorizedReferenceId);
-            }
-            if values
-                .insert(
-                    reference_id,
-                    zeroize::Zeroizing::new(std::mem::take(&mut credential.value)),
-                )
-                .is_some()
-            {
-                return Err(InvalidNetworkCredentialSnapshot::DuplicateReferenceId);
-            }
-        }
-        Ok(Self { values })
-    }
-
-    pub(crate) fn value(&self, reference_id: CredentialReferenceId) -> Option<&[u8]> {
-        self.values.get(&reference_id).map(AsRef::as_ref)
-    }
-}
 
 #[derive(Clone, Debug)]
 pub struct NetworkStateSnapshot {
@@ -769,124 +693,107 @@ impl GatewayNetworkState {
                 }
                 inner.last_hydration_latency_ms = latency_ms;
                 match result {
+                    Ok(Ok(pulled))
+                        if pulled_ref_matches(&pulled.policy_ref, expected_policy_ref.as_ref()) =>
+                    {
+                        let policy = Arc::new(pulled.policy);
+                        let network_credentials = Arc::new(pulled.network_credentials);
+                        let (action, allow_counts, deny_counts) = policy_log_summary(&policy);
+                        self.reconcile_policy(&policy);
+                        set_mode(inner, NetworkState::Ready, reason);
+                        inner.policy = Some(Arc::clone(&policy));
+                        inner.network_credentials = Some(network_credentials);
+                        inner.installed_policy_ref = pulled.policy_ref.to_string();
+                        inner.last_error.clear();
+                        inner.last_error_kind = NetworkPolicyErrorKind::None;
+                        inner.current_retry_backoff_ms = 0;
+                        inner.consecutive_hydration_failures = 0;
+                        pplx_space_metrics::gateway::policy_hydration_latency(
+                            "success",
+                            latency_ms as f64,
+                        );
+                        pplx_space_metrics::gateway::policy_ref(
+                            pulled.policy_ref.authority_label(),
+                            inner.mode.as_str(),
+                        );
+                        info!(
+                            installed_policy_ref = %inner.installed_policy_ref,
+                            latency_ms,
+                            policy_version = "v1",
+                            action,
+                            allow_rules = allow_counts.total,
+                            allow_domains = allow_counts.domains,
+                            allow_wildcard_domains = allow_counts.wildcard_domains,
+                            allow_ips = allow_counts.ips,
+                            allow_cidrs = allow_counts.cidrs,
+                            deny_rules = deny_counts.total,
+                            deny_domains = deny_counts.domains,
+                            deny_wildcard_domains = deny_counts.wildcard_domains,
+                            deny_ips = deny_counts.ips,
+                            deny_cidrs = deny_counts.cidrs,
+                            reason = reason.as_str(),
+                            // Effective mode for this install. Every
+                            // install (refresh, self-hydration, restore)
+                            // logs this line, so it tracks mode changes.
+                            tls_interception_mode = policy.tls_interception.as_str(),
+                            // The rendered destination strings are NOT
+                            // logged: policy destinations are tenant-
+                            // authored and a hostname can carry arbitrary
+                            // encoded data, so emitting them on every
+                            // hydration would be an ungated log leak. The
+                            // per-class counts above are the bounded,
+                            // non-sensitive shape signal.
+                            "net-gateway policy hydration ready"
+                        );
+                    }
                     Ok(Ok(pulled)) => {
-                        let parsed_policy_ref =
-                            pulled.policy_ref.parse::<EffectiveNetworkPolicyRef>();
-                        match parsed_policy_ref {
-                            Ok(parsed_policy_ref)
-                                if pulled_ref_matches(
-                                    &parsed_policy_ref,
-                                    expected_policy_ref.as_ref(),
-                                ) =>
-                            {
-                                let policy = Arc::new(pulled.policy);
-                                let network_credentials = Arc::new(pulled.network_credentials);
-                                let (action, allow_counts, deny_counts) =
-                                    policy_log_summary(&policy);
-                                self.reconcile_policy(&policy);
-                                set_mode(inner, NetworkState::Ready, reason);
-                                inner.policy = Some(Arc::clone(&policy));
-                                inner.network_credentials = Some(network_credentials);
-                                inner.installed_policy_ref = pulled.policy_ref;
-                                inner.last_error.clear();
-                                inner.last_error_kind = NetworkPolicyErrorKind::None;
-                                inner.current_retry_backoff_ms = 0;
-                                inner.consecutive_hydration_failures = 0;
-                                pplx_space_metrics::gateway::policy_hydration_latency(
-                                    "success",
-                                    latency_ms as f64,
-                                );
-                                pplx_space_metrics::gateway::policy_ref(
-                                    parsed_policy_ref.authority_label(),
-                                    inner.mode.as_str(),
-                                );
-                                info!(
-                                    installed_policy_ref = %inner.installed_policy_ref,
-                                    latency_ms,
-                                    policy_version = "v1",
-                                    action,
-                                    allow_rules = allow_counts.total,
-                                    allow_domains = allow_counts.domains,
-                                    allow_wildcard_domains = allow_counts.wildcard_domains,
-                                    allow_ips = allow_counts.ips,
-                                    allow_cidrs = allow_counts.cidrs,
-                                    deny_rules = deny_counts.total,
-                                    deny_domains = deny_counts.domains,
-                                    deny_wildcard_domains = deny_counts.wildcard_domains,
-                                    deny_ips = deny_counts.ips,
-                                    deny_cidrs = deny_counts.cidrs,
-                                    reason = reason.as_str(),
-                                    // Effective mode for this install. Every
-                                    // install (refresh, self-hydration, restore)
-                                    // logs this line, so it tracks mode changes.
-                                    tls_interception_mode = policy.tls_interception.as_str(),
-                                    // The rendered destination strings are NOT
-                                    // logged: policy destinations are tenant-
-                                    // authored and a hostname can carry arbitrary
-                                    // encoded data, so emitting them on every
-                                    // hydration would be an ungated log leak. The
-                                    // per-class counts above are the bounded,
-                                    // non-sensitive shape signal.
-                                    "net-gateway policy hydration ready"
-                                );
-                            }
-                            Ok(parsed_policy_ref) => {
-                                set_mode(inner, NetworkState::PolicyError, reason);
-                                inner.policy = None;
-                                inner.network_credentials = None;
-                                inner.last_error = format!(
-                                    "policy ref mismatch: expected {}, got {}",
-                                    expected_ref_for_log, pulled.policy_ref
-                                );
-                                inner.last_error_kind = NetworkPolicyErrorKind::PolicyRefMismatch;
-                                inner.consecutive_hydration_failures =
-                                    inner.consecutive_hydration_failures.saturating_add(1);
-                                pplx_space_metrics::gateway::policy_hydration_error(
-                                    "policy_ref_mismatch",
-                                );
-                                pplx_space_metrics::gateway::policy_ref(
-                                    parsed_policy_ref.authority_label(),
-                                    inner.mode.as_str(),
-                                );
-                                warn!(
-                                    expected_policy_ref = %expected_ref_for_log,
-                                    installed_policy_ref = %pulled.policy_ref,
-                                    reason = reason.as_str(),
-                                    "net-gateway policy hydration returned mismatched policy"
-                                );
-                            }
-                            Err(error) => {
-                                set_mode(inner, NetworkState::PolicyError, reason);
-                                inner.policy = None;
-                                inner.network_credentials = None;
-                                inner.last_error = format!(
-                                    "policy ref is invalid: {error}: {}",
-                                    pulled.policy_ref
-                                );
-                                inner.last_error_kind = NetworkPolicyErrorKind::LoaderError;
-                                inner.consecutive_hydration_failures =
-                                    inner.consecutive_hydration_failures.saturating_add(1);
-                                pplx_space_metrics::gateway::policy_hydration_error(
-                                    "invalid_policy_ref",
-                                );
-                                pplx_space_metrics::gateway::policy_hydration_latency(
-                                    "error",
-                                    latency_ms as f64,
-                                );
-                                warn!(
-                                    last_error = %inner.last_error,
-                                    latency_ms,
-                                    reason = reason.as_str(),
-                                    "net-gateway policy hydration returned invalid policy ref"
-                                );
-                            }
-                        }
+                        set_mode(inner, NetworkState::PolicyError, reason);
+                        inner.policy = None;
+                        inner.network_credentials = None;
+                        inner.last_error = format!(
+                            "policy ref mismatch: expected {}, got {}",
+                            expected_ref_for_log, pulled.policy_ref
+                        );
+                        inner.last_error_kind = NetworkPolicyErrorKind::PolicyRefMismatch;
+                        inner.consecutive_hydration_failures =
+                            inner.consecutive_hydration_failures.saturating_add(1);
+                        pplx_space_metrics::gateway::policy_hydration_error("policy_ref_mismatch");
+                        pplx_space_metrics::gateway::policy_ref(
+                            pulled.policy_ref.authority_label(),
+                            inner.mode.as_str(),
+                        );
+                        warn!(
+                            expected_policy_ref = %expected_ref_for_log,
+                            installed_policy_ref = %pulled.policy_ref,
+                            reason = reason.as_str(),
+                            "net-gateway policy hydration returned mismatched policy"
+                        );
+                    }
+                    Ok(Err(error @ HydrateNetworkStateError::InvalidReference { .. })) => {
+                        set_mode(inner, NetworkState::PolicyError, reason);
+                        inner.policy = None;
+                        inner.network_credentials = None;
+                        inner.last_error = error.to_string();
+                        inner.last_error_kind = NetworkPolicyErrorKind::LoaderError;
+                        inner.consecutive_hydration_failures =
+                            inner.consecutive_hydration_failures.saturating_add(1);
+                        pplx_space_metrics::gateway::policy_hydration_error("invalid_policy_ref");
+                        pplx_space_metrics::gateway::policy_hydration_latency(
+                            "error",
+                            latency_ms as f64,
+                        );
+                        warn!(
+                            last_error = %inner.last_error,
+                            latency_ms,
+                            reason = reason.as_str(),
+                            "net-gateway policy hydration returned invalid policy ref"
+                        );
                     }
                     Ok(Err(error)) => {
                         set_mode(inner, NetworkState::PolicyError, reason);
                         inner.policy = None;
                         inner.network_credentials = None;
-                        inner.last_error = error;
+                        inner.last_error = error.to_string();
                         inner.last_error_kind = NetworkPolicyErrorKind::LoaderError;
                         inner.consecutive_hydration_failures =
                             inner.consecutive_hydration_failures.saturating_add(1);

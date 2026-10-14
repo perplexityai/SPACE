@@ -239,7 +239,7 @@ async fn exercise_recovery(restore: bool) {
     )
     .unwrap();
     let loader: PolicyLoader = Arc::new(move || {
-        let policy_ref = policy_ref.to_string();
+        let policy_ref = policy_ref.clone();
         Box::pin(async move {
             let mut policy = NetworkPolicyV1::allow_all();
             policy.tls_interception = TlsInterception::On;
