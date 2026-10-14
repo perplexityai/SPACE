@@ -116,7 +116,7 @@ build_space_seed_publish() {
   SPACE_RUST_BUILD_IMAGE="$RUST_ARTIFACT_IMAGE" \
     bash "$REPO_ROOT/infra/space/kind/scripts/build-seed.sh"
 
-  log "building runtime image: space-seed-publish:local"
+  log "building runtime image: space-seed-publish:local (docker/Dockerfile.seed-publish)"
   image_build space-seed-publish --provenance=false --sbom=false -t space-seed-publish:local \
     --build-context "seed=$SEED_OUTPUT_DIR" \
     .
@@ -129,7 +129,7 @@ build_space_seed_publish() {
 # .next/required-server-files.json; the local stack rendezvouses on the
 # in-cluster Service DNS (Tilt uses the same value).
 build_space_ui() {
-  log "building runtime image: space-ui:local"
+  log "building runtime image: space-ui:local (docker/Dockerfile.ui)"
   image_build space-ui --provenance=false --sbom=false -t space-ui:local \
     --build-arg NEXT_PUBLIC_API_URL=http://space-api:8080 \
     --build-arg NEXT_PUBLIC_DATA_PLANE_URL=http://space-data-plane:8090 \
